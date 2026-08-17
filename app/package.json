@@ -1,0 +1,30 @@
+{
+  "name": "agent-workbench",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Fenster fuer tmux-Sessions ueber den Steuermodus, mit Steuerkanal",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run build",
+    "start": "npm run build && electron ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "electron": "^40.10.6",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "@xterm/addon-canvas": "0.7.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-webgl": "0.18.0",
+    "@xterm/xterm": "^5.5.0",
+    "monaco-editor": "^0.56.0"
+  },
+  "allowScripts": {
+    "electron": true,
+    "esbuild": true
+  }
+}

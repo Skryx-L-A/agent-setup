@@ -1,0 +1,4 @@
+#!/bin/bash
+# n8n must run under Node 24 (isolated-vm ABI); global node stays 26.
+export PATH=/opt/homebrew/opt/node@24/bin:$PATH
+exec /opt/homebrew/opt/node@24/bin/node /opt/homebrew/lib/node_modules/n8n/bin/n8n "$@"

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Installation (der Nutzer selbst, nicht automatisch eingerichtet): diese Datei
+  nach ~/Library/LaunchAgents/agent-workbench.wb-session-sweep.plist kopieren,
+  dann `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/agent-workbench.wb-session-sweep.plist`
+  (oder `launchctl load ...` je nach macOS-Version). Voraussetzung ist, dass
+  shell/wb-session-sweep und shell/wb-session-close vorher nach
+  ~/.local/bin/ installiert sind, denn ProgramArguments zeigt auf den
+  installierten Pfad, nicht auf das Repo.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>agent-workbench.wb-session-sweep</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/.local/bin/wb-session-sweep</string>
+    <string>--quiet</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>4</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key><string>$HOME/.local/state/wb-session-sweep.launchd.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.local/state/wb-session-sweep.launchd.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>

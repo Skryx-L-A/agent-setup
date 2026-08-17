@@ -1,0 +1,67 @@
+#!/bin/bash
+# wb-result — print a worker's result file, local or on the other machine.
+#
+#   wb-result <name> [--on <mac|peer>]
+#
+# Exit codes (built for deadline loops):
+#   0  result is there — content on stdout
+#   1  not finished yet — note on stderr
+#   2  the target machine could not be reached
+#
+# Without --on the machine is looked up in the workbench state file
+# (`wb-state worker-machine`), so `wb-result SSH-foo` just works. The file is read
+# SERVER-SIDE (ssh … 'test -s … && cat …') and NEVER copied here: ~/.pi-workers/results/
+# is a flat namespace on both machines and already collides today (e.g. 'review'),
+# and latest.md is an ABSOLUTE symlink into the remote filesystem — a naive copy or
+# rsync without -L fetches a dead link. If caching is ever wanted, it belongs under
+# ~/.pi-workers/remote/<host>/<name>/, never in the flat results/ directory.
+set -u
+
+NAME=""; MACHINE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --on) MACHINE="${2:?Maschine (mac|peer)}"; shift 2 ;;
+    -*) echo "wb-result: unbekannte Option '$1'" >&2; exit 2 ;;
+    *) NAME="$1"; shift ;;
+  esac
+done
+[ -n "$NAME" ] || { echo "usage: wb-result <name> [--on <mac|peer>]" >&2; exit 2; }
+
+case "$(uname -s)" in Darwin) SELF=mac ;; *) SELF=peer ;; esac
+# No --on: ask the state file where this worker runs.
+[ -n "$MACHINE" ] || MACHINE=$("$HOME/.local/bin/wb-state" worker-machine "$NAME" 2>/dev/null || true)
+[ -n "$MACHINE" ] || MACHINE="$SELF"
+
+SHOWPATH="~/.pi-workers/results/$NAME/latest.md"
+
+# latest.md zeigt WAEHREND der Laufzeit auf ".laufend.md" statt auf das echte
+# Ergebnis (2026-08-16, pi-worker: Symlink-Falle) -- das ist absichtlich ein
+# lesbarer Platzhalter (Name/Modell/Startzeit/Zielpfad), damit ein Blick den
+# Zustand erkennt, statt auf die alte tote-Symlink-Zweideutigkeit zu treffen.
+# Ohne diese Fallunterscheidung waere ein LESBARER Platzhalter fuer -s
+# ununterscheidbar vom echten Ergebnis -- `wb-result` haette den Platzhalter
+# faelschlich als "fertig" gemeldet. Erkannt am Dateinamen (kein Datumsmuster
+# wie echte Ergebnisdateien), nicht am Inhalt.
+if [ "$MACHINE" = "$SELF" ]; then
+  f="$HOME/.pi-workers/results/$NAME/latest.md"
+  tgt="$(readlink "$f" 2>/dev/null || true)"
+  case "$tgt" in
+    *.laufend.md) : ;;
+    *) if [ -s "$f" ]; then cat "$f"; exit 0; fi ;;
+  esac
+  echo "wb-result: '$NAME' ist noch nicht fertig ($f fehlt oder ist leer)." >&2
+  exit 1
+fi
+
+# $HOME is expanded by the REMOTE shell; the double quotes survive spaces in a name.
+RFILE="\"\$HOME/.pi-workers/results/$NAME/latest.md\""
+RCMD="t=\$(readlink $RFILE 2>/dev/null); case \"\$t\" in *.laufend.md) exit 1 ;; esac; test -s $RFILE && cat $RFILE"
+out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$MACHINE" "$RCMD" 2>/dev/null)
+rc=$?
+if [ "$rc" = 0 ]; then printf '%s\n' "$out"; exit 0; fi
+if [ "$rc" = 255 ]; then
+  echo "wb-result: $MACHINE nicht erreichbar (ssh Exit 255) — Status von '$NAME' unbekannt." >&2
+  exit 2
+fi
+echo "wb-result: '$NAME' ist auf $MACHINE noch nicht fertig ($SHOWPATH fehlt oder ist leer)." >&2
+exit 1

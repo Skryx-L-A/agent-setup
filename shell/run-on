@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# run-on — cross-machine command runner with a resource / PROTECTED safety gate.
+#
+#   run-on <mac|peer> [--force] <command...>
+#
+# Runs a command on the target machine (locally if the target IS this machine,
+# else over ssh). BEFORE running, it reads `check-resources --guard` on the target
+# and REFUSES to launch a model / heavy GPU job that would risk displacing a
+# PROTECTED process (e.g. a protected service on peer) or when the target obviously lacks free
+# capacity. The actual judgment call is the orchestrator's (see role) — run-on is
+# only the safe execution primitive; --force overrides after that decision is made.
+#
+# Exit codes: 2 usage, 3 PROTECTED conflict, 4 insufficient resources / no data.
+set -euo pipefail
+
+usage(){ echo "usage: run-on <mac|peer> [--force] <command...>" >&2; exit 2; }
+
+TARGET="${1:-}"; shift || usage
+FORCE=0
+if [ "${1:-}" = "--force" ]; then FORCE=1; shift; fi
+[ $# -ge 1 ] || usage
+case "$TARGET" in mac|peer) ;; *) echo "run-on: target must be mac|peer" >&2; exit 2 ;; esac
+CMD="$*"
+
+case "$(uname -s)" in Darwin) SELF=mac ;; Linux) SELF=peer ;; *) SELF=unknown ;; esac
+
+MIN_VRAM_MIB=1024   # cuda target: below this, a heavy GPU launch is refused
+MIN_RAM_MIB=2048    # any target: below this free RAM, a heavy launch is refused
+
+# heavy = likely a model / GPU / big-media launch
+HEAVY_RE='(^|[[:space:]/])(ollama[[:space:]]+(run|serve|pull)|llama-server|llama-cli|llama-bench|bild|video|tts|stt|comfy|torchrun|mlx_|mflux|python[0-9.]*[[:space:]].*(train|torch|cuda|mlx|diffus))'
+is_heavy=0
+printf '%s' "$CMD" | grep -Eq "$HEAVY_RE" && is_heavy=1
+
+# --- read the target's guard snapshot ---
+if [ "$TARGET" = "$SELF" ]; then
+  GUARD="$("$HOME/.local/bin/check-resources" --guard 2>/dev/null || true)"
+else
+  GUARD="$(ssh "$TARGET" '$HOME/.local/bin/check-resources --guard' 2>/dev/null || true)"
+fi
+
+if [ -z "$GUARD" ]; then
+  if [ "$is_heavy" = 1 ] && [ "$FORCE" != 1 ]; then
+    echo "run-on: REFUSED — no check-resources data from $TARGET and command looks heavy." >&2
+    echo "  Install check-resources on $TARGET, or override with: run-on $TARGET --force <cmd>" >&2
+    exit 4
+  fi
+  echo "run-on: WARN — no check-resources data from $TARGET; running without a resource gate." >&2
+else
+  PROTECTED_ACTIVE=0; GPU_KIND=""; VRAM_FREE_MIB=0; RAM_FREE_MIB=0; PROTECTED_NAMES=""
+  eval "$(printf '%s\n' "$GUARD" | grep -E '^[A-Z_]+=')"
+  if [ "$FORCE" != 1 ] && [ "$is_heavy" = 1 ]; then
+    if [ "${PROTECTED_ACTIVE:-0}" = 1 ]; then
+      echo "run-on: REFUSED — PROTECTED process active on $TARGET: ${PROTECTED_NAMES:-?}." >&2
+      echo "  A model/heavy launch there risks displacing it — it is NEVER stopped eigenmächtig." >&2
+      echo "  Per orchestrator rule: ask the user first, else run on your own machine / find another way." >&2
+      echo "  Override only after that decision: run-on $TARGET --force <cmd>" >&2
+      exit 3
+    fi
+    if [ "$GPU_KIND" = cuda ] && [ "${VRAM_FREE_MIB:-0}" -lt "$MIN_VRAM_MIB" ]; then
+      echo "run-on: REFUSED — only ${VRAM_FREE_MIB} MiB VRAM free on $TARGET (< ${MIN_VRAM_MIB}); too little for a model launch." >&2
+      exit 4
+    fi
+    if [ "${RAM_FREE_MIB:-0}" -lt "$MIN_RAM_MIB" ]; then
+      echo "run-on: REFUSED — only ${RAM_FREE_MIB} MiB RAM free on $TARGET (< ${MIN_RAM_MIB})." >&2
+      exit 4
+    fi
+  fi
+fi
+
+# --- passed the gate → execute ---
+if [ "$TARGET" = "$SELF" ]; then
+  exec bash -lc "$CMD"
+else
+  exec ssh -t "$TARGET" "$CMD"
+fi

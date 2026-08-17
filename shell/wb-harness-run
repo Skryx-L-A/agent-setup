@@ -1,0 +1,646 @@
+#!/bin/bash
+# wb-harness-run — start a REGISTERED harness inside its tmux pane (SPEC-V3 C).
+#
+#   wb-harness-run --model <id> --role worker|orchestrator
+#                  [--effort <e>] [--dir <d>] [--name <n>] [--resume-args '<flags>']
+#
+# This is the shim that pi-worker/wb-code put into a pane instead of building a
+# command themselves: it asks `wb-state models resolve` for the start line (the
+# ONLY place that builds one), turns the secret PLACEHOLDERS into real values in
+# its OWN process environment, and execs. It is re-executable, which is what
+# @wb_cmd (wb-revive / the pane-died hook) needs.
+#
+# Why the detour instead of exporting the key before `tmux split-window`: a value
+# passed through a tmux option, an -e flag or any argv ends up in the process
+# list. Here the key exists only in the environment of the process that needs it —
+# never in argv, never in a tmux option, never in a file we write, never logged.
+# The lookup order is the contract from SPEC-V3 A.1 and matches wb-state's
+# presence check one for one: Keychain -> ~/.secrets-sync/api-keys/<provider>
+# (mode 600 enforced) -> environment variable. Change one, change both.
+#
+# Remote Control (Vorgabe des Nutzers 2026-08-05, orchestrator immer an, worker
+# immer aus): not handled here. --role is only forwarded to `wb-state models
+# resolve`, which already decides per role (harness id 'claude', see there) --
+# adding a second decision in this shim would be exactly the per-call-site
+# duplication that made the last rollout miss a start path. In today's actual
+# call graph this shim never builds a 'claude' cmd for role=orchestrator (wb-code
+# takes the direct path whenever the harness resolves to literal 'claude'); the
+# resolver still carries the rule for whichever REGISTERED harness reaches this
+# shim as 'claude' next.
+set -uo pipefail
+
+MODEL=""; ROLE="worker"; EFFORT=""; DIR=""; NAME=""; RESUME_ARGS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model)  MODEL="${2:?model id}"; shift 2 ;;
+    --role)   ROLE="${2:?worker|orchestrator}"; shift 2 ;;
+    --effort) EFFORT="${2:?effort}"; shift 2 ;;
+    --dir)    DIR="${2:?dir}"; shift 2 ;;
+    --name)   NAME="${2:?name}"; shift 2 ;;
+    --resume-args) RESUME_ARGS="${2:?flags}"; shift 2 ;;
+    *) echo "wb-harness-run: unbekannte Option '$1'" >&2; exit 1 ;;
+  esac
+done
+[ -n "$MODEL" ] || { echo "wb-harness-run: --model fehlt" >&2; exit 1; }
+
+ARGS=(models resolve "$MODEL" --role "$ROLE")
+[ -n "$EFFORT" ] && ARGS+=(--effort "$EFFORT")
+[ -n "$DIR" ] && ARGS+=(--dir "$DIR")
+[ -n "$NAME" ] && ARGS+=(--name "$NAME")
+RESOLVED="$("$HOME/.local/bin/wb-state" "${ARGS[@]}")" || {
+  echo "wb-harness-run: Start abgebrochen — siehe Fehler oben." >&2
+  exit 1
+}
+
+# One secret placeholder chain -> the value, or empty. Prints nothing but the
+# value itself, and only into the caller's variable.
+secret_value() {
+  local spec svc path mode var val
+  for spec in "$@"; do
+    case "$spec" in
+      @keychain:*)
+        svc="${spec#@keychain:}"
+        if command -v security >/dev/null 2>&1; then
+          val="$(security find-generic-password -s "$svc" -w 2>/dev/null || true)"
+          [ -n "$val" ] && { printf '%s' "$val"; return 0; }
+        fi ;;
+      @file:*)
+        path="${spec#@file:}"
+        if [ -e "$path" ]; then
+          # GNU zuerst, dann BSD -- dieselbe Reihenfolge wie in context-guard und
+          # wb-grid. Bei GNU ist `-f` KEIN Formatschalter, sondern "Dateisystem
+          # statt Datei": `stat -f %Lp <datei>` liest '%Lp' als zweiten Dateinamen,
+          # gibt fuer die echte Datei einen ganzen Dateisystem-Block auf stdout aus
+          # und endet mit 1. Die alte BSD-zuerst-Reihenfolge haengte diesen Block
+          # also vor den Mode, der Vergleich unten scheiterte immer, und damit
+          # startete auf Linux kein einziges Modell mit hinterlegtem Key.
+          mode="$(stat -c %a "$path" 2>/dev/null || stat -f %Lp "$path" 2>/dev/null || echo 777)"
+          case "$mode" in
+            600|400) ;;
+            *) echo "wb-harness-run: FEHLER — $path hat Mode $mode, verlangt 600. Key nicht gelesen." >&2
+               return 1 ;;
+          esac
+          val="$(head -1 "$path" | tr -d '\r\n')"
+          [ -n "$val" ] && { printf '%s' "$val"; return 0; }
+        fi ;;
+      @env:*)
+        var="${spec#@env:}"
+        val="$(printenv "$var" 2>/dev/null || true)"
+        [ -n "$val" ] && { printf '%s' "$val"; return 0; }
+        ;;
+    esac
+  done
+  return 1
+}
+
+CMD=""; HARNESS=""
+while IFS=$'\t' read -r key rest; do
+  case "$key" in
+    harness) HARNESS="$rest" ;;
+    cmd) CMD="$rest" ;;
+    env)
+      VAR="${rest%%$'\t'*}"; VALSPEC="${rest#*$'\t'}"
+      case "$VALSPEC" in
+        @keychain:*|@file:*|@env:*)
+          # split the chain on tabs and walk it in order
+          IFS=$'\t' read -r -a CHAIN <<<"$VALSPEC"
+          if SECRET="$(secret_value "${CHAIN[@]}")" && [ -n "$SECRET" ]; then
+            # A failing export must not fall through (no `set -e` here): an invalid
+            # variable name would otherwise start the CLI WITHOUT its key, and the
+            # auth error would only turn up inside the pane.
+            export "$VAR=$SECRET" || {
+              echo "wb-harness-run: FEHLER — '$VAR' ist kein gueltiger Variablenname; kein Start." >&2
+              exit 1; }
+            unset SECRET
+          else
+            echo "wb-harness-run: FEHLER — kein Key hinterlegt fuer \$$VAR; kein Start ohne Auth." >&2
+            exit 1
+          fi ;;
+        *) export "$VAR=$VALSPEC" || {
+             echo "wb-harness-run: FEHLER — '$VAR' ist kein gueltiger Variablenname; kein Start." >&2
+             exit 1; } ;;
+      esac ;;
+  esac
+done <<<"$RESOLVED"
+
+[ -n "$CMD" ] || { echo "wb-harness-run: resolve lieferte kein Startkommando." >&2; exit 1; }
+
+# --resume-args: die Fortsetzen-Flags des Harness, durchgereicht von wb-revive
+# (2026-08-06). Bis heute erreichte sie nichts von aussen, weil dieser Shim seine
+# innere Befehlszeile selbst baut — und genau das bleibt so. Der Grund dafuer steht
+# oben und aendert sich nicht: ein Provider-Key darf nie durch argv, eine tmux-Option
+# oder eine gespeicherte Kommandozeile reisen.
+#
+# Warum diese Flags trotzdem durchduerfen: sie stammen aus dem `resume`-Block des
+# Harness und tragen hoechstens eine Sitzungskennung. Das ist der Unterschied zum
+# Schluessel — kein Geheimnis, sondern eine Angabe, die ohnehin in der Registry steht
+# und die jeder lesen darf, der die Registry lesen darf.
+#
+# Und warum sie trotzdem geprueft werden: eine Zeichenkette, die hier ankommt, landet
+# in $CMD und damit in einem `eval`. Wer sie setzen kann, koennte sonst einen zweiten
+# Befehl anhaengen. Deshalb ist das hier KEIN Durchreichen, sondern ein Abgleich:
+# die uebergebene Folge muss WORTGLEICH `resume.args` oder `resume.fallbackArgs` des
+# Harness sein, wobei `{resumeId}` genau eine Kennung aus Buchstaben, Ziffern, Punkt,
+# Strich und Unterstrich vertritt. Alles andere wird verworfen — nicht abgelehnt:
+# der Start laeuft dann OHNE Fortsetzen weiter, weil ein Pane, der gar nicht
+# zurueckkommt, schlimmer ist als einer ohne seine Unterhaltung. Gesagt wird es.
+# Dieselbe Ueberlegung wie beim Effort: eine Behauptung in einer gespeicherten
+# Kommandozeile ist jederzeit wieder ausfuehrbar, also wird sie nie geglaubt,
+# sondern gegen die Registry gehalten.
+if [ -n "$RESUME_ARGS" ]; then
+  HJSON="$("$HOME/.local/bin/wb-state" harness get "$HARNESS" 2>/dev/null || true)"
+  NEUCMD=""
+  if [ -n "$HJSON" ] && [ "${HJSON:0:1}" = "{" ]; then
+    # Der Harness-Eintrag geht ueber argv, NICHT ueber stdin: bei `python3 - <<PY`
+    # ist stdin schon das Programm selbst, ein zusaetzliches Rohr davor kaeme nie an
+    # (gemessen 2026-08-06 -- der Eintrag galt dann als unlesbar und die Flags fielen
+    # still weg).
+    NEUCMD="$(/usr/bin/python3 - "$CMD" "$RESUME_ARGS" "$HJSON" <<'PY'
+# KEINE Apostrophe in diesem Rumpf: bash 3.2 zaehlt sie auch hier mit, weil das
+# Heredoc in einer Kommandosubstitution steht -- die Datei scheitert dann beim
+# Einlesen mit "unexpected EOF" (gemessen 2026-08-06 mit bash 3.2.57).
+import json, os, re, shlex, sys
+cmd, uebergeben, hjson = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    h = json.loads(hjson)
+except Exception:
+    sys.stderr.write("wb-harness-run: Harness-Eintrag nicht lesbar.\n"); sys.exit(2)
+res = h.get("resume") or {}
+try:
+    toks = shlex.split(uebergeben)
+except ValueError:
+    sys.stderr.write("wb-harness-run: --resume-args ist nicht zerlegbar.\n"); sys.exit(2)
+if not toks:
+    sys.exit(2)
+KENNUNG = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+def passt(vorlage):
+    if not vorlage or len(vorlage) != len(toks):
+        return False
+    for soll, ist in zip(vorlage, toks):
+        if soll == "{resumeId}":
+            if not KENNUNG.match(ist):
+                return False
+        elif soll != ist:
+            return False
+    return True
+
+if not (passt(res.get("args")) or passt(res.get("fallbackArgs"))):
+    sys.stderr.write("wb-harness-run: %r steht nicht im resume-Block von %s.\n"
+                     % (uebergeben, h.get("id")))
+    sys.exit(2)
+# Eingefuegt direkt hinter dem Programmnamen, nicht am Ende: das Fortsetzen von codex ist
+# ein UNTERBEFEHL ("resume --last"), und der steht hinter dem Programm, nicht hinter
+# den Argumenten.
+base = os.path.basename(os.path.expanduser(h.get("command") or ""))
+m = re.search(r"(?:^|[\s/])" + re.escape(base) + r"(?=\s)", cmd) if base else None
+if not m:
+    sys.stderr.write("wb-harness-run: %s steht nicht in der Startzeile.\n" % base)
+    sys.exit(2)
+# ... und hinter einem fuehrenden UNTERBEFEHL aus args, falls der Harness einen hat
+# (2026-08-08). goose wird als "goose session" gestartet, und sein Fortsetzen-Flag
+# gehoert HINTER diesen Unterbefehl: "goose -r session" lehnt der CLI mit
+# "unexpected argument -r found" ab (gemessen mit goose 1.45.0), waehrend
+# "goose session -r" laeuft. Genommen werden nur fuehrende Argumente, die weder mit
+# einem Strich beginnen noch einen Platzhalter tragen -- also genau das, was ein
+# Unterbefehl ist und kein Flag und kein eingesetzter Wert. Wird eines davon in der
+# Startzeile nicht wortwoertlich wiedergefunden (etwa weil es beim Bauen anders
+# gequotet wurde), bleibt es bei der alten Stelle: lieber die Einfuegung, die codex
+# seit je bekommt, als eine geratene Position.
+ende = m.end()
+for a in (h.get("args") or []):
+    if not a or a.startswith("-") or "{" in a:
+        break
+    m2 = re.match(r"\s+" + re.escape(shlex.quote(a)) + r"(?=\s|$)", cmd[ende:])
+    if not m2:
+        break
+    ende += m2.end()
+print(cmd[:ende] + " " + " ".join(shlex.quote(t) for t in toks) + cmd[ende:])
+PY
+)" || NEUCMD=""
+  fi
+  if [ -n "$NEUCMD" ]; then
+    CMD="$NEUCMD"
+  else
+    echo "wb-harness-run: Fortsetzen-Flags verworfen — der Start laeuft OHNE die vorige Unterhaltung weiter." >&2
+  fi
+fi
+
+# DER ROLLEN-GENERATOR (2026-08-06, Gestalt B). Drei Harnesses nehmen keinen
+# Rollen-Prompt als Flag entgegen, sondern lesen eine Datei: codex, opencode und agy.
+# Der Aufloeser meldet dafuer seit je "diese Datei muss der Generator vorher
+# geschrieben haben" — hier ist er. Ohne ihn weiss ein Worker auf diesen Harnesses
+# nichts vom Ergebnisprotokoll und ist ein Chat-Fenster statt eines Workers.
+#
+# Er sitzt an dieser Stelle, weil sie die einzig richtige ist: im Pane, unmittelbar
+# vor dem exec, mit Rolle und Arbeitsverzeichnis in der Hand. Frueher (beim Bauen der
+# Startzeile) waere der Abstand zum Start groesser, und genau in diesem Abstand
+# ueberschreibt ein zweiter Spawn die Datei des ersten.
+#
+# ZWEI WEGE, und der erste ist der gute:
+#   projectPath  Die Datei liegt im ARBEITSVERZEICHNIS des Workers. Weil jeder Worker
+#                seinen eigenen git-Arbeitsbaum hat (workerWorktrees, Vorgabe an),
+#                hat damit jeder seine eigene Datei — die Kollision entsteht gar
+#                nicht erst.
+#   path         Ein fester Ort im Heimatverzeichnis, GETEILT. Nur fuer Harnesses
+#                ohne Projektweg. Hier kann es kollidieren, deshalb die Sperre unten.
+#
+# Eine fremde Datei wird NIE ueberschrieben: unser Text steht zwischen zwei Marken,
+# alles andere bleibt stehen. Traegt die Datei die Marke einer ANDEREN Rolle, wird
+# der Start abgelehnt statt sie dem anderen unter den Fuessen wegzuziehen.
+if [ -n "$HARNESS" ]; then
+  HJSON2="$("$HOME/.local/bin/wb-state" harness get "$HARNESS" 2>/dev/null || true)"
+  if [ -n "$HJSON2" ] && [ "${HJSON2:0:1}" = "{" ]; then
+    ROLLENZIEL="$(/usr/bin/python3 - "$HJSON2" "$ROLE" "${DIR:-$PWD}" <<'PY'
+# KEINE Apostrophe in diesem Rumpf (siehe oben, bash 3.2).
+import json, os, re, sys
+hjson, role, workdir = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    h = json.loads(hjson)
+except Exception:
+    sys.exit(1)
+sp = h.get("systemPrompt") or {}
+if (sp.get("style") or "none") != "file":
+    sys.exit(1)                      # Flag-Wege brauchen keinen Generator
+quelle = sp.get(role)
+if not quelle:
+    sys.stderr.write("wb-harness-run: Harness %s hat keine Rollendatei fuer %s.\n"
+                     % (h.get("id"), role))
+    sys.exit(1)
+quelle = os.path.expanduser(quelle)
+if not os.path.exists(quelle):
+    sys.stderr.write("wb-harness-run: Rollendatei %s fehlt.\n" % quelle)
+    sys.exit(1)
+text = open(quelle, encoding="utf-8", errors="replace").read()
+
+projekt = sp.get("projectPath")
+if projekt:
+    ziel = os.path.join(workdir, projekt)
+    geteilt = False
+else:
+    ziel = os.path.expanduser(sp.get("path") or "")
+    geteilt = True
+if not ziel:
+    sys.exit(1)
+
+ANFANG = "<!-- wb-rolle %s anfang -->" % role
+ENDE = "<!-- wb-rolle %s ende -->" % role
+block = "%s\n%s\n%s\n" % (ANFANG, text.rstrip("\n"), ENDE)
+alt = ""
+if os.path.exists(ziel):
+    alt = open(ziel, encoding="utf-8", errors="replace").read()
+
+# Die Marke einer ANDEREN Rolle in derselben Datei: zwei Worker verschiedener Rolle
+# im selben Ziel. Der zweite wird abgelehnt, sichtbar, statt lautlos zu gewinnen.
+fremd = re.search(r"<!-- wb-rolle (\w+) anfang -->", alt)
+if fremd and fremd.group(1) != role:
+    sys.stderr.write(
+        "wb-harness-run: %s traegt bereits die Rolle %s -- dieser Start (%s) wuerde sie "
+        "ueberschreiben und wird abgelehnt. Beide Rollen im selben Ziel gehen nicht; der "
+        "Projektweg (systemPrompt.projectPath) gibt jedem Worker sein eigenes.\n"
+        % (ziel, fremd.group(1), role))
+    sys.exit(2)
+
+neu_angelegt = not os.path.exists(ziel)
+if ANFANG in alt:
+    kopf, rest = alt.split(ANFANG, 1)
+    _, schwanz = rest.split(ENDE, 1) if ENDE in rest else ("", "")
+    inhalt = kopf + block + schwanz.lstrip("\n")
+else:
+    inhalt = (alt.rstrip("\n") + "\n\n" if alt.strip() else "") + block
+os.makedirs(os.path.dirname(ziel) or ".", exist_ok=True)
+with open(ziel, "w", encoding="utf-8") as f:
+    f.write(inhalt)
+print("%s\t%s\t%s" % (ziel, "neu" if neu_angelegt else "ergaenzt",
+                      "geteilt" if geteilt else "projekt"))
+PY
+)"; RSTAT=$?
+    # NICHT mit `|| ROLLENZIEL=""` abfangen: dann waere $? immer 0 und die Ablehnung
+    # (Status 2) ginge verloren. Status 1 heisst nur "kein Generator noetig".
+    if [ "$RSTAT" -eq 2 ]; then
+      echo "wb-harness-run: kein Start ohne eigene Rolle." >&2
+      exit 1
+    fi
+    [ "$RSTAT" -eq 0 ] || ROLLENZIEL=""
+    if [ -n "$ROLLENZIEL" ]; then
+      ZPFAD="${ROLLENZIEL%%$'\t'*}"; ZREST="${ROLLENZIEL#*$'\t'}"
+      ZART="${ZREST%%$'\t'*}"
+      echo "wb-harness-run: Rolle '$ROLE' nach $ZPFAD geschrieben ($ZART)." >&2
+      # Eine von UNS angelegte Datei im Projekt gehoert nicht in den git-Status: sonst
+      # steht sie im Diff des Workers und wandert beim naechsten `git add -A` mit.
+      # Nur die selbst angelegte, nur lokal, nie ein Commit.
+      if [ "$ZART" = neu ] && [ "${ZREST##*$'\t'}" = projekt ]; then
+        GITDIR="$(cd "$(dirname "$ZPFAD")" 2>/dev/null && git rev-parse --git-dir 2>/dev/null || true)"
+        if [ -n "$GITDIR" ]; then
+          mkdir -p "$GITDIR/info" 2>/dev/null
+          grep -qxF "$(basename "$ZPFAD")" "$GITDIR/info/exclude" 2>/dev/null \
+            || echo "$(basename "$ZPFAD")" >> "$GITDIR/info/exclude" 2>/dev/null || true
+        fi
+      fi
+    fi
+
+    # DER VERTRAUENSSPEICHER (2026-08-07). agy fragt beim ersten Start in einem
+    # Verzeichnis "Do you trust the contents of this project?" und zeigt seine
+    # Eingabezeile erst nach der Antwort — auch mit --dangerously-skip-permissions.
+    # Weil jeder Worker seinen eigenen frischen Arbeitsbaum bekommt und das Vertrauen
+    # NICHT vererbt wird (gemessen: der Unterordner eines eingetragenen Ordners fragt
+    # erneut), faellt die Frage bei jedem Spawn erneut an.
+    #
+    # Beantwortet wird sie hier, VOR dem Start, durch einen Eintrag in der Liste, die
+    # der CLI selbst fuehrt (harness.trustStore) — dieselbe Zustimmung, die der Nutzer
+    # im Dialog geben wuerde, einmal aufgeschrieben statt jedes Mal blind bestaetigt.
+    # Blind bestaetigen waere die schlechtere Loesung: ein Enter auf eine Zeile, deren
+    # Wortlaut sich mit der naechsten Version aendert, trifft irgendwann den falschen
+    # Dialog — und genau das war der Fehler, der agy unbenutzbar gemacht hat.
+    #
+    # Schlaegt der Eintrag fehl, wird NICHT gestartet und gehofft: dann kommt der
+    # Dialog, das readyPattern des Harness trifft ihn nicht, und der Spawn scheitert
+    # nach 60s sichtbar. Deshalb ist ein Fehler hier eine Meldung und kein Abbruch.
+    #
+    # ZWEI STILE, weil zwei CLIs zwei Speicher fuehren (2026-08-08):
+    #   json-array    agy: eine JSON-Liste von Pfaden in einer Einstellungsdatei.
+    #   toml-section  codex: ein TOML-Abschnitt je Pfad in ~/.codex/config.toml,
+    #                 [projects."<pfad>"] mit trust_level = "trusted".
+    # Beide sitzen absichtlich in EINEM Rumpf: der Teil, auf den es ankommt — nichts
+    # kaputt machen, im Zweifel nichts schreiben, jeden Fehlschlag sagen und trotzdem
+    # starten — ist in beiden derselbe und darf nicht in zwei Kopien auseinanderlaufen.
+    /usr/bin/python3 - "$HJSON2" "${DIR:-$PWD}" <<'PY' >&2
+# KEINE Apostrophe in diesem Rumpf (siehe oben, bash 3.2).
+import json, os, re, sys, tempfile
+APOS = chr(39)                       # das Zeichen, das hier nicht stehen darf
+hjson, workdir = sys.argv[1], sys.argv[2]
+try:
+    h = json.loads(hjson)
+except Exception:
+    sys.exit(0)
+ts = h.get("trustStore") or {}
+stil = ts.get("style") or ""
+if stil not in ("json-array", "toml-section"):
+    sys.exit(0)                      # Harness ohne Vertrauensspeicher: nichts zu tun
+ziel = os.path.expanduser(ts.get("file") or "")
+if not ziel:
+    sys.exit(0)
+# WELCHE SCHREIBWEISE des Pfades eingetragen wird, sagt die Registry (pathForm),
+# nicht dieser Rumpf — denn die beiden CLIs sind sich darin nicht einig, und ein
+# Pfad in der falschen Schreibweise stuende in der Datei, ohne je zu treffen.
+#   logical (Vorgabe)  Der Pfad, WIE ER UEBERGEBEN WURDE. Der CLI startet mit
+#                      `cd <pfad>` und schreibt dieses logische PWD in seine Liste,
+#                      nicht den aufgeloesten (auf macOS ist /var ein Link auf
+#                      /private/var). So macht es agy, gemessen 2026-08-07.
+#   resolved           Der aufgeloeste Pfad, weil der CLI ihn selbst aufloest, bevor
+#                      er ihn hinschreibt: codex traegt /private/var/... ein, wo agy
+#                      /var/... eintraegt. Gemessen 2026-08-08.
+if (ts.get("pathForm") or "logical") == "resolved":
+    pfad = os.path.realpath(workdir)
+else:
+    pfad = workdir
+if not os.path.exists(ziel):
+    sys.stderr.write(
+        "wb-harness-run: %s gibt es nicht — das Arbeitsverzeichnis kann nicht als "
+        "vertraut eingetragen werden. Der CLI wird beim Start danach fragen.\n" % ziel)
+    sys.exit(0)
+
+
+def ersetze(text):
+    # Erst vollstaendig daneben schreiben, dann ersetzen: eine halb geschriebene
+    # Konfiguration nimmt dem CLI seine Anmeldung mit, nicht nur diesen einen Eintrag.
+    ordner = os.path.dirname(ziel) or "."
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=ordner, prefix=".wb-trust-")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, ziel)
+        tmp = None
+        return True
+    except Exception as e:
+        sys.stderr.write("wb-harness-run: %s nicht schreibbar (%s) — nichts eingetragen.\n"
+                         % (ziel, e))
+        return False
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def json_liste():
+    schluessel = ts.get("key") or ""
+    if not schluessel:
+        sys.exit(0)
+    # KOMMENTARKOPF (2026-08-08, fuer copilot). Die Datei ~/.copilot/config.json ist
+    # gueltiges JSONC und beginnt mit zwei Zeilen "// …", die der CLI selbst dorthin
+    # schreibt. json.load scheitert daran, und ohne diesen Zweig endete jeder Start mit
+    # "ist nicht lesbar" und danach mit dem Vertrauensdialog, den wir gerade vermeiden.
+    # Abgetrennt wird NUR der zusammenhaengende Block von Kommentarzeilen VOR dem ersten
+    # nicht-leeren Inhalt — genau die Form, die gemessen wurde. Kommentare mitten in der
+    # Datei bleiben unangetastet und lassen das Parsen wie bisher scheitern; ein Parser,
+    # der ueberall Kommentare herausschneidet, wuerde irgendwann ein "//" INNERHALB einer
+    # Zeichenkette treffen und die Datei stillschweigend verstuemmeln. Beim Schreiben
+    # kommt der Kopf woertlich wieder obenauf, damit die Datei aussieht wie zuvor.
+    # Nur mit trustStore.jsonc; agy (json-array ohne die Angabe) bleibt unberuehrt.
+    kopf = ""
+    try:
+        with open(ziel, encoding="utf-8") as f:
+            roh = f.read()
+        rumpf = roh
+        if ts.get("jsonc"):
+            zeilen = roh.split("\n")
+            i = 0
+            while i < len(zeilen) and (not zeilen[i].strip() or zeilen[i].lstrip().startswith("//")):
+                i += 1
+            kopf = "\n".join(zeilen[:i])
+            if kopf:
+                kopf += "\n"
+            rumpf = "\n".join(zeilen[i:])
+        daten = json.loads(rumpf) if rumpf.strip() else {}
+        if not isinstance(daten, dict):
+            raise ValueError("kein Objekt")
+    except Exception as e:
+        sys.stderr.write("wb-harness-run: %s ist nicht lesbar (%s) — nichts eingetragen.\n"
+                         % (ziel, e))
+        sys.exit(0)
+    liste = daten.get(schluessel)
+    if liste is None:
+        liste = []
+    elif not isinstance(liste, list):
+        sys.stderr.write("wb-harness-run: %s in %s ist keine Liste — nichts eingetragen.\n"
+                         % (schluessel, ziel))
+        sys.exit(0)
+    if pfad in liste:
+        sys.exit(0)
+    liste.append(pfad)
+    daten[schluessel] = liste
+    if ersetze(kopf + json.dumps(daten, indent=1, ensure_ascii=False) + "\n"):
+        sys.stderr.write("wb-harness-run: %s als vertrautes Verzeichnis in %s eingetragen.\n"
+                         % (pfad, ziel))
+
+
+# ---- toml-section ----------------------------------------------------------
+# GESCHRIEBEN WIRD ANGEHAENGT, nie mitten in der Datei. Grund: dieser Rumpf laeuft
+# unter /usr/bin/python3, und das ist auf macOS 15 die Systemversion 3.9 — sie hat
+# WEDER einen TOML-Schreiber noch tomllib zum Lesen (gemessen 2026-08-08:
+# "No module named tomllib"). Ein selbst gebauter Serialisierer muesste die ganze
+# Datei neu formulieren und verlore dabei Kommentare, Reihenfolge und alles, was wir
+# nicht kennen — in ~/.codex/config.toml stehen Anmeldung und Einstellungen. Ein
+# Abschnitt ist in TOML aber genau das anhaengbare Gebilde, das die Reihenfolge nicht
+# kennt: hinter allem anderen steht er so gut wie an jeder anderen Stelle.
+#
+# Bleibt die eine Gefahr, die ein Anhaengen hat: einen Abschnitt ZWEIMAL zu
+# definieren ist ungueltiges TOML, und eine ungueltige Konfiguration ist schlimmer
+# als der Dialog, den wir vermeiden wollen. Deshalb sucht kopf_vorhanden() nicht nur
+# den Wortlaut, den codex selbst schreibt, sondern deutet jeden Tabellenkopf der
+# Datei (Anfuehrungszeichen, Leerzeichen, Punkte im Pfad). Und weil kein Scanner ohne
+# Parser vollstaendig ist, kommt danach eine ABSICHTLICH GROBE zweite Sperre: steht
+# der Pfad irgendwo sonst im Text, wird NICHTS angehaengt. Beide Sperren koennen nur
+# in eine Richtung irren — zu viel erkennen. Dann kommt der Dialog und der Spawn
+# scheitert sichtbar. Zu wenig erkennen wuerde die Datei zerreissen; das kann nicht
+# passieren, weil jede Schreibweise des Eintrags den Pfad im Klartext enthaelt.
+KOPF = re.compile(r"^\s*\[\s*([^\[\]].*?)\s*\]\s*(?:#.*)?$")
+
+
+def zerlege(inneres):
+    # Zerlegt das Innere eines Tabellenkopfes in seine Namen: projects."a.b" wird
+    # [projects, a.b]. Punkte in Anfuehrungszeichen trennen nicht — genau darin
+    # unterscheidet sich [projects."a.b"] von [projects.a.b], und genau darum wird
+    # der Pfad beim Schreiben immer gequotet.
+    teile = []
+    cur = ""
+    q = None
+    esc = False
+    for c in inneres:
+        if q:
+            cur += c
+            if esc:
+                esc = False
+            elif c == "\\" and q == "\"":
+                esc = True
+            elif c == q:
+                q = None
+        elif c == "\"" or c == APOS:
+            q = c
+            cur += c
+        elif c == ".":
+            teile.append(cur)
+            cur = ""
+        else:
+            cur += c
+    if q:
+        return None                  # unbalanciert: nicht deutbar, also kein Treffer
+    teile.append(cur)
+    fertig = []
+    for t in teile:
+        t = t.strip()
+        if len(t) >= 2 and t[0] == "\"" and t[-1] == "\"":
+            try:
+                t = json.loads(t)    # dieselben Maskierungen wie ein TOML-Basic-String
+            except Exception:
+                return None
+        elif len(t) >= 2 and t[0] == APOS and t[-1] == APOS:
+            t = t[1:-1]
+        fertig.append(t)
+    return fertig
+
+
+def kopf_vorhanden(text, namen):
+    for zeile in text.splitlines():
+        m = KOPF.match(zeile)
+        if not m:
+            continue
+        if zerlege(m.group(1)) == namen:
+            return True
+    return False
+
+
+def toml_abschnitt():
+    tabelle = ts.get("table") or ""
+    schluessel = ts.get("key") or ""
+    wert = ts.get("value")
+    if not tabelle or not schluessel or wert is None:
+        sys.exit(0)
+    try:
+        with open(ziel, encoding="utf-8") as f:
+            alt = f.read()
+    except Exception as e:
+        sys.stderr.write("wb-harness-run: %s ist nicht lesbar (%s) — nichts eingetragen.\n"
+                         % (ziel, e))
+        sys.exit(0)
+    if kopf_vorhanden(alt, [tabelle, pfad]):
+        sys.exit(0)                  # steht schon drin, und bleibt unangetastet
+    if pfad in alt:
+        sys.stderr.write(
+            "wb-harness-run: %s steht schon in %s, aber nicht als Abschnitt [%s.\"...\"], "
+            "den ich deuten kann — es wird NICHTS angehaengt, weil eine zweite Definition "
+            "die Datei ungueltig machen wuerde. Der CLI kann beim Start fragen.\n"
+            % (pfad, ziel, tabelle))
+        sys.exit(0)
+    # Ist die Tabelle auf oberster Ebene als gewoehnlicher Wert belegt (projects = 5),
+    # waere ein Abschnitt darunter ein Widerspruch. Gesucht wird nur VOR dem ersten
+    # Tabellenkopf, denn nur dort steht die oberste Ebene.
+    for zeile in alt.splitlines():
+        if KOPF.match(zeile):
+            break
+        m = re.match(r"^\s*(\"?)([A-Za-z0-9_-]+)\1\s*[.=]", zeile)
+        if m and m.group(2) == tabelle:
+            sys.stderr.write(
+                "wb-harness-run: %s ist in %s ein Wert, keine Tabelle — nichts eingetragen.\n"
+                % (tabelle, ziel))
+            sys.exit(0)
+
+    def quote(s):
+        # Ein blanker TOML-Schluessel darf nur Buchstaben, Ziffern, Strich und
+        # Unterstrich tragen; alles andere wird gequotet. json.dumps liefert dabei
+        # genau die Maskierung, die ein TOML-Basic-String verlangt.
+        if re.match(r"^[A-Za-z0-9_-]+$", s):
+            return s
+        return json.dumps(s, ensure_ascii=False)
+
+    kopf = "[%s.%s]" % (quote(tabelle), json.dumps(pfad, ensure_ascii=False))
+    block = "%s\n%s = %s\n" % (kopf, quote(schluessel),
+                               json.dumps(wert, ensure_ascii=False))
+    if alt.strip():
+        neu = (alt if alt.endswith("\n") else alt + "\n") + "\n" + block
+    else:
+        neu = block
+    # Gegengelesen, bevor ersetzt wird: was wir anhaengen, muss unser eigener Deuter
+    # als genau diesen Pfad wiedererkennen. Das faengt einen Fehler in der Quotierung,
+    # bevor er in der Datei landet.
+    if not kopf_vorhanden(neu, [tabelle, pfad]):
+        sys.stderr.write("wb-harness-run: der Anhang traegt %s nicht als Abschnitt — "
+                         "%s bleibt unveraendert.\n" % (pfad, ziel))
+        sys.exit(0)
+    if ersetze(neu):
+        sys.stderr.write("wb-harness-run: %s als vertrautes Verzeichnis in %s eingetragen.\n"
+                         % (pfad, ziel))
+
+
+if stil == "json-array":
+    json_liste()
+else:
+    toml_abschnitt()
+PY
+
+    # DIE HOOK-INSTALLATION FUER DIE ZUORDNUNG (SPEC-V4 6.3 Punkt 4, 2026-08-11).
+    # Ausgelagert nach shell/wb-chat-hook-install (siehe dort fuer die volle
+    # Begruendung): der eingebaute claude-Zweig in shell/pi-worker (ENGINE=claude)
+    # laeuft NIE durch dieses Skript hier, ruft die Installation seit heute aber
+    # SELBST auf, direkt. Eine zweite Kopie dieses Blocks hier waere genau die
+    # Fehlerklasse, die zwei Stellen fuer eine Sache traegt. Repo-Fassung zuerst
+    # (damit eine Suite den Arbeitsstand prueft, nicht die installierte Kopie),
+    # gleiche Bauart wie wb-rolle/wb-pane-write.
+    CHATHOOK_INSTALL=""
+    for kandidat in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/wb-chat-hook-install" \
+                    "$HOME/.local/bin/wb-chat-hook-install"; do
+      [ -x "$kandidat" ] && { CHATHOOK_INSTALL="$kandidat"; break; }
+    done
+    if [ -n "$CHATHOOK_INSTALL" ]; then
+      "$CHATHOOK_INSTALL" "$HARNESS"
+    else
+      echo "wb-harness-run: wb-chat-hook-install nicht gefunden — keine Chat-Zuordnung eingetragen." >&2
+    fi
+  fi
+fi
+
+# Every workbench pane needs the workbench tools on PATH, otherwise the agent in it
+# cannot call wb-*/claude-worker/pi-worker — same reason wb-code does it for pi.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+
+eval "$CMD"

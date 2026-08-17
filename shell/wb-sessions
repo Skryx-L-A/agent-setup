@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""wb-sessions - findet und reaktiviert Claude-Sitzungen, deren Fenster weg ist.
+
+Anlass (2026-08-03): Nach einem Kill von aussen - jetsam bei Speicherdruck, ein
+WindowServer-Neustart - schliessen sich VS-Code-Fenster ohne Absturzbericht. Die
+Sitzung selbst ist dabei NIE verloren: Claude Code schreibt jeden Zug fortlaufend
+nach ~/.claude/projects/<pfad-slug>/<uuid>.jsonl. Verloren geht nur das Wissen,
+WELCHE Sitzung in dem verschwundenen Fenster lief - und ohne das findet man sie
+in einer Liste namenloser UUIDs nicht wieder.
+
+Dieses Werkzeug beantwortet genau die Frage: was lief zuletzt, wo, worum ging es.
+
+  wb-sessions                 die letzten 15 Sitzungen aller Projekte
+  wb-sessions <projekt>       nur Sitzungen, deren Pfad <projekt> enthaelt
+  wb-sessions --resume <n>    Sitzung Nr. n im richtigen Verzeichnis fortsetzen
+  wb-sessions --live          nur Sitzungen mit noch laufendem Prozess
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROJECTS = Path.home() / ".claude/projects"
+
+
+def first_prompt(path: Path) -> str:
+    """Erste echte Nutzer-Eingabe der Sitzung - sie benennt die Sitzung besser
+    als jede UUID. Befehls-Ausgaben und Systemhinweise zaehlen nicht."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for _ in range(400):
+                line = fh.readline()
+                if not line:
+                    break
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("type") != "user":
+                    continue
+                content = rec.get("message", {}).get("content")
+                if isinstance(content, list):
+                    content = " ".join(
+                        c.get("text", "") for c in content if isinstance(c, dict)
+                    )
+                if not isinstance(content, str):
+                    continue
+                text = " ".join(content.split())
+                if not text or text.startswith(("<", "Caveat:", "[Request")):
+                    continue
+                return text[:78]
+    except OSError:
+        pass
+    return "(kein Prompt gefunden)"
+
+
+def project_dir(slug: str) -> str:
+    """Aus dem Verzeichnis-Slug den echten Pfad zurueckgewinnen."""
+    return "/" + slug.lstrip("-").replace("-", "/")
+
+
+def live_pids() -> set[str]:
+    """Sitzungs-UUIDs, zu denen noch ein Prozess laeuft (offene Datei-Handles)."""
+    out = subprocess.run(
+        ["lsof", "-Fn", "-c", "claude"], capture_output=True, text=True
+    ).stdout
+    return {
+        Path(line[1:]).stem
+        for line in out.splitlines()
+        if line.startswith("n") and line.endswith(".jsonl")
+    }
+
+
+def main() -> int:
+    args = [a for a in sys.argv[1:]]
+    resume_idx = None
+    if "--resume" in args:
+        i = args.index("--resume")
+        resume_idx = int(args[i + 1])
+        del args[i : i + 2]
+    only_live = "--live" in args
+    args = [a for a in args if not a.startswith("--")]
+    needle = args[0].lower() if args else None
+
+    rows = []
+    for sess in PROJECTS.glob("*/*.jsonl"):
+        if needle and needle not in sess.parent.name.lower():
+            continue
+        try:
+            st = sess.stat()
+        except OSError:
+            continue
+        rows.append((st.st_mtime, st.st_size, sess))
+    rows.sort(reverse=True)
+
+    live = live_pids()
+    if only_live:
+        rows = [r for r in rows if r[2].stem in live]
+    rows = rows[:15]
+
+    if resume_idx is not None:
+        if not 1 <= resume_idx <= len(rows):
+            print(f"Nummer {resume_idx} gibt es nicht (1..{len(rows)}).", file=sys.stderr)
+            return 1
+        _, _, sess = rows[resume_idx - 1]
+        cwd = project_dir(sess.parent.name)
+        if not Path(cwd).is_dir():
+            print(f"Verzeichnis existiert nicht mehr: {cwd}", file=sys.stderr)
+            return 1
+        print(f"Setze fort in {cwd}\n")
+        os.chdir(cwd)
+        os.execvp("claude", ["claude", "--resume", sess.stem])
+
+    if not rows:
+        print("Keine Sitzungen gefunden.")
+        return 0
+
+    now = time.time()
+    print(f"{'Nr':>3}  {'zuletzt':>12}  {'MB':>5}  Projekt / erster Prompt")
+    print("-" * 100)
+    for n, (mtime, size, sess) in enumerate(rows, 1):
+        mins = (now - mtime) / 60
+        when = f"{mins:.0f} min" if mins < 90 else (
+            f"{mins/60:.1f} h" if mins < 2880 else f"{mins/1440:.0f} Tage")
+        mark = " *" if sess.stem in live else "  "
+        print(f"{n:>3}{mark}{when:>12}  {size/1048576:5.1f}  {project_dir(sess.parent.name)}")
+        print(f"        {first_prompt(sess)}")
+    print("\n* = Prozess laeuft noch.  Fortsetzen: wb-sessions --resume <Nr>")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,63 @@
+/* Die Ordneransicht (4c.2) mit eingebauter Inhaltssuche (4c.1). Dieselbe
+   Bildsprache wie die anderen beiden Schubladen. */
+/* Die Schublade steht IN der Reihe zwischen Sessionleiste und Buehne, nicht
+   darueber -- Vorgabe des Nutzers vom 05.08.: "so wie es auch rechts aussieht".
+   Als schwebende Flaeche lag sie ueber der Buehne und liess die linke Seite
+   wie zwei uebereinandergeschobene Leisten wirken. Jetzt endet die Buehne an
+   ihr, genau wie sie rechts an der Workerleiste endet. Zugeklappt ist sie
+   `display: none` und nimmt keine Breite -- das ersetzt die alte Schiebe-
+   Animation, die in der Reihe die Buehne bei jedem Bild neu vermessen haette. */
+.or-panel {
+  flex: 0 0 auto; width: min(480px, 45vw); height: 100%; box-sizing: border-box;
+  background: #14171c; border-right: 1px solid #262b34; color: #d8dee9;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  display: none; flex-direction: column;
+  overflow-wrap: anywhere;
+}
+.or-panel.offen { display: flex; }
+
+.or-kopf {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px; border-bottom: 1px solid #262b34; flex: 0 0 auto;
+}
+.or-titel { font-weight: 700; font-size: 13px; }
+.or-schliessen {
+  background: none; border: 0; color: #8b93a1; font-size: 18px; line-height: 1;
+  cursor: pointer; padding: 2px 6px;
+}
+.or-schliessen:hover { color: #d8dee9; }
+
+.or-suchleiste { padding: 8px 12px; border-bottom: 1px solid #262b34; flex: 0 0 auto; }
+.or-suche-eingabe {
+  display: block; width: 100%; box-sizing: border-box;
+  background: #0e1014; border: 1px solid #262b34; border-radius: 4px; color: #d8dee9;
+  font: inherit; padding: 5px 8px;
+}
+.or-suche-eingabe:focus { outline: none; border-color: #3a4351; }
+
+.or-inhalt { flex: 1 1 auto; overflow-y: auto; padding: 8px 0 16px; }
+.or-wurzel {
+  padding: 0 12px 8px; color: #8b93a1; font-size: 11px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.or-leer { color: #8b93a1; padding: 4px 12px; }
+
+.or-zeile { display: flex; align-items: center; gap: 5px; padding: 3px 10px; cursor: pointer; }
+.or-zeile:hover { background: #1e232b; }
+.or-pfeil { flex: 0 0 12px; color: #8b93a1; font-size: 10px; text-align: center; }
+.or-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; }
+.or-ordner .or-name { font-weight: 600; }
+.or-datei .or-name { color: #b9c0cc; }
+.or-zzusatz { color: #8b93a1; font-size: 10px; flex: 0 0 auto; }
+
+.or-treffer-zeile {
+  padding: 6px 12px; cursor: pointer; border-bottom: 1px solid #1a1e25;
+}
+.or-treffer-zeile:hover { background: #1e232b; }
+.or-treffer-kopf { display: flex; justify-content: space-between; gap: 8px; }
+.or-treffer-kopf .or-name { font-weight: 600; flex: 0 1 auto; }
+.or-zeilennr { color: #8b93a1; font-size: 10px; white-space: nowrap; }
+.or-treffer-text {
+  margin-top: 2px; color: #b9c0cc; font-size: 11px; white-space: pre-wrap;
+  max-height: 3.2em; overflow: hidden;
+}

@@ -1,0 +1,64 @@
+#!/bin/bash
+# wb-shot — screenshot ONE window, never the whole screen, without stealing focus.
+#
+# MAC-ONLY. Built on macOS `screencapture -l <windowid>` and a Swift helper that
+# reads the CoreGraphics window list; neither exists on Linux. Do NOT mirror this
+# to peer — it is in the repo for the Mac side of the script set only. It also needs
+# ~/.local/libexec/wb-windowlist.swift, which is not part of the repo.
+#
+#   wb-shot <pattern> <outfile.png>   capture the single window matching <pattern>
+#   wb-shot --list                    list capturable windows (id | app | title)
+#
+# Rule (der Nutzer, 2026-07-25): agents never record or screenshot the whole screen,
+# and never move his focus. `screencapture -l <windowid>` grabs exactly one window
+# and does NOT raise it; there is deliberately NO full-screen fallback here — an
+# ambiguous or missing match fails instead of capturing something unintended.
+# Launching an app for such a check: `open -g -na "<App>" --args …` (-g = no focus).
+#
+# Limitation, by design: the window list is on-screen windows of the CURRENT Space
+# only (CGWindowListOption.optionOnScreenOnly). A window on another Space or a
+# minimized one simply does not match, and this script then fails — that is the
+# safe outcome. Report it; never fall back to a full-screen capture.
+set -uo pipefail
+LIST=$HOME/.local/libexec/wb-windowlist.swift
+
+windows() { swift "$LIST" 2>/dev/null; }
+
+if [ "${1:-}" = "--list" ]; then
+  printf '%-8s %-22s %s\n' ID APP TITEL
+  windows | while IFS=$'\t' read -r id app title; do printf '%-8s %-22s %s\n' "$id" "$app" "$title"; done
+  exit 0
+fi
+
+PATTERN="${1:?usage: wb-shot <pattern> <outfile.png> | wb-shot --list}"
+OUT="${2:?Ausgabedatei fehlt}"
+
+matches=$(windows | grep -i -- "$PATTERN" || true)
+n=$(printf '%s' "$matches" | grep -c . || true)
+
+if [ "$n" -eq 0 ]; then
+  echo "wb-shot: kein Fenster passt auf '$PATTERN' — nichts aufgenommen (kein Vollbild-Fallback)." >&2
+  # Zwischen „gibt es nicht" und „liegt auf einem anderen Schreibtisch" liegt die
+  # ganze Diagnose. Die Fensterliste zeigt nur den AKTUELLEN Space; ein Treffer in der
+  # Prozessliste bei leerer Fensterliste heisst also fast immer: anderer Space oder
+  # minimiert. Am 2026-08-04 hat genau diese fehlende Unterscheidung dazu gefuehrt,
+  # dass zweimal in ein falsches Fenster getippt wurde — die Suche meldete nur
+  # „kein Fenster", und der Rest war Raterei.
+  if pgrep -fi -- "$PATTERN" >/dev/null 2>&1; then
+    echo "  Ein Prozess, auf den das Muster passt, LAEUFT allerdings. Die Fensterliste" >&2
+    echo "  zeigt nur den aktuellen Schreibtisch (Space) — das Fenster liegt vermutlich" >&2
+    echo "  auf einem anderen oder ist minimiert. Aufnehmen geht dann nicht; erst" >&2
+    echo "  dorthin wechseln. Blind per System Events zu tippen trifft das falsche Fenster." >&2
+  fi
+  exit 1
+fi
+if [ "$n" -gt 1 ]; then
+  echo "wb-shot: '$PATTERN' passt auf $n Fenster — praeziser werden, damit nichts Falsches aufgenommen wird:" >&2
+  printf '%s\n' "$matches" >&2
+  exit 2
+fi
+
+id=$(printf '%s' "$matches" | cut -f1)
+screencapture -x -o -l "$id" "$OUT" || { echo "wb-shot: screencapture fehlgeschlagen (Bildschirmaufnahme-Recht fuer das Terminal?)" >&2; exit 1; }
+[ -s "$OUT" ] || { echo "wb-shot: Datei leer — Fenster evtl. minimiert." >&2; exit 1; }
+echo "wb-shot: Fenster $id aufgenommen -> $OUT ($(wc -c < "$OUT") Bytes)"

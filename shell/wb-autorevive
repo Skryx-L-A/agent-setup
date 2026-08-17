@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# wb-autorevive — automatically bring a dead workbench claude pane back.
+#
+# Called by the tmux `pane-died` hook. Turns a jetsam/OOM-killed pane from a
+# silent, un-interactable "frozen" pane into a self-healing one: it respawns +
+# resumes the Claude session with no keypress.
+#
+# Three guards keep this safe instead of harmful:
+#   • LIVENESS GUARD — if the pane's process is still running (#{pane_dead}=0),
+#     stop. The pane-died hook only fires on a dead pane, so in the intended path
+#     this can never trigger; it is here because the hook is not the only way in.
+#     A hand-typed call, a wrongly registered hook or a copied command line all
+#     reach this script with a LIVE pane, and wb-revive's respawn-pane -k would
+#     kill a working Claude. Two independent entry points, two guards. This one
+#     never forces: wb-revive --force stays a deliberate, human decision.
+#   • MEMORY GUARD — if free memory is low (e.g. a big local model is loaded, or
+#     an OOM is still in progress), do NOT respawn. Restarting heavy panes into
+#     memory pressure just feeds the fire and risks a respawn storm. The pane is
+#     left dead; the user revives it manually (prefix + R) once memory is healthy.
+#   • CRASH-LOOP THROTTLE — if this pane was already auto-revived within the last
+#     THROTTLE_S seconds, stop. Prevents an endless respawn loop when Claude
+#     itself exits immediately (bad flag, corrupt session, etc.).
+#
+# On any skip the reason is logged and shown in the pane; nothing is hidden.
+#
+# EXIT-CODES — jeder Ausgang hat seinen eigenen (2026-08-15). Vorher endeten
+# "wiederbelebt", "wegen Speicher uebersprungen", "gedrosselt" und "kein Pane fuer uns"
+# alle mit 0: fuer den pane-died-Hook egal, fuer jeden anderen Aufrufer und fuer jeden
+# Test eine stille Luege — genau daran haing die flatterhafte Suite, die je nach freiem
+# Speicher der Maschine etwas anderes mass.
+#   0  wiederbelebt (der Code kommt von wb-revive)
+#   2  Pane nicht gefunden
+#   3  Pane laeuft noch, nichts getan
+#   4  uebersprungen: zu wenig freier Speicher, Pane bleibt tot
+#   5  uebersprungen: Drossel (kurz zuvor schon wiederbelebt)
+#   6  kein Workbench-Pane, nichts zu tun
+set -euo pipefail
+
+pane="${1:?pane id}"
+LOG=~/.local/state/wb-autorevive.log
+STATE=~/.local/state/wb-autorevive
+mkdir -p "$STATE" "$(dirname "$LOG")"
+
+MIN_FREE_PCT=20   # skip auto-revive below this much free memory
+THROTTLE_S=90     # min seconds between auto-revives of the same pane
+
+log() { printf '%s [%s] %s\n' "$(date '+%F %T')" "$pane" "$1" >>"$LOG"; }
+
+# Nur Workbench-Panes mit einer Wiederbelebungsquelle. Frueher stand hier ein
+# Teilzeichenketten-Vergleich auf *claude*, und der war in beide Richtungen falsch: tote
+# pi- und Registry-Worker blieben liegen ("not a claude pane"), waehrend jedes beliebige
+# Kommando mit "claude" irgendwo im Pfad als Treffer galt. Welcher Harness in dem Pane
+# steckt, entscheidet ohnehin wb-revive (pane_harness, mit Wortgrenzen und Registry) —
+# hier wird nur gefragt, ob der Pane ueberhaupt uns gehoert: ein von der Workbench
+# gesetztes @wb_cmd, oder eine Workbench-Markierung am Pane.
+wbcmd=$(tmux show-options -pqv -t "$pane" @wb_cmd 2>/dev/null || true)
+cmd="$wbcmd"
+[[ -z "$cmd" ]] && cmd=$(tmux display-message -p -t "$pane" '#{pane_start_command}' 2>/dev/null || true)
+prole=$(tmux show-options -pqv -t "$pane" @wb_role 2>/dev/null || true)
+pworker=$(tmux show-options -pqv -t "$pane" @wb_worker 2>/dev/null || true)
+if [[ -z "$cmd" ]] || { [[ -z "$wbcmd" ]] && [[ -z "$prole" ]] && [[ -z "$pworker" ]]; }; then
+  log "kein Workbench-Pane (weder @wb_cmd noch @wb_role/@wb_worker), skip"
+  exit 6
+fi
+
+# Liveness guard — before the throttle, so a live pane leaves no state behind
+# that would later throttle a genuine revive.
+dead=$(tmux display-message -p -t "$pane" '#{pane_dead}' 2>/dev/null || true)
+if [[ -z "$dead" ]]; then
+  log "pane not found, skip"
+  exit 2
+fi
+if [[ "$dead" != 1 ]]; then
+  log "pane still running (pane_dead=0), leaving it alone"
+  tmux display-message -t "$pane" "wb-autorevive: pane still running, nothing done" 2>/dev/null || true
+  exit 3
+fi
+
+# Crash-loop throttle (per pane).
+key="${STATE}/${pane//[^A-Za-z0-9]/_}"
+now=$(date +%s)
+if [[ -f "$key" ]]; then
+  last=$(cat "$key" 2>/dev/null || echo 0)
+  if (( now - last < THROTTLE_S )); then
+    log "throttled (revived $((now - last))s ago < ${THROTTLE_S}s), leaving dead"
+    tmux display-message -t "$pane" "wb-autorevive: throttled — revive manually with prefix+R"
+    exit 5
+  fi
+fi
+
+# Small jitter so a mass death (all panes at once) doesn't respawn in lockstep.
+sleep "0.$((RANDOM % 30 + 5))"
+
+# Memory guard. macOS: memory_pressure prints "System-wide memory free percentage: N%".
+# Linux has no memory_pressure at all — ohne den /proc/meminfo-Zweig bliebe `free` dort
+# LEER, der Waechter feuerte nie, und genau der Respawn-Sturm in ein OOM hinein ist das,
+# wogegen dieses Skript existiert. Beide Zweige, dieselbe Bedeutung: freies RAM in Prozent.
+#
+# Reihenfolge (2026-08-15): erst `memory_pressure` aus dem PATH, dann /proc/meminfo. Auf
+# Linux gibt es memory_pressure nicht, dort aendert das nichts — aber ein Test kann den
+# Waechter jetzt auf BEIDEN Systemen mit einem Schirm im PATH festnageln, statt vom freien
+# Speicher der Maschine abzuhaengen. Das war die Ursache der flatterhaften test-revive.sh:
+# die Suite prueft je nach Maschinenzustand etwas anderes, und niemand sah es, weil der
+# Ueberspringer denselben Rueckgabewert hatte wie der Erfolg.
+free=""
+if command -v memory_pressure >/dev/null 2>&1; then
+  free=$(memory_pressure 2>/dev/null | awk -F'[ %]+' '/free percentage/{print $(NF-1)}')
+elif [[ -r /proc/meminfo ]]; then
+  free=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{if(t>0) printf "%d", a*100/t}' /proc/meminfo)
+fi
+if [[ -n "$free" ]] && (( free < MIN_FREE_PCT )); then
+  log "memory low (${free}% free < ${MIN_FREE_PCT}%), leaving dead for manual revive"
+  tmux display-message -t "$pane" "wb-autorevive: memory low (${free}%) — revive manually (prefix+R) when clear"
+  exit 4
+fi
+
+echo "$now" >"$key"
+log "reviving (${free:-?}% free)"
+# $HOME instead of a hardcoded $HOME: the same script has to run on peer
+# ($HOME) once both machines share one script set. Same target, same behaviour.
+#
+# KEIN `exec` mehr (2026-08-16, Regression aus dem *claude*-Substring-Fix): `exec`
+# ERSETZT diesen Prozess durch wb-revive -- danach kann wb-autorevive nichts mehr in
+# $LOG schreiben, egal was wb-revive entscheidet. Seit tote pi-/Registry-Worker nicht
+# mehr an der alten Substring-Pruefung haengen bleiben (richtig so), erreichen sie
+# wb-revive jetzt auch dann, wenn dessen eigene Harness-Erkennung sie nicht kennt UND
+# @wb_role fehlt -- wb-revive lehnt dann korrekt mit "gehoert zu keinem registrierten
+# Harness und traegt keine @wb_role — nichts getan" ab (Exit 0), aber diese Begruendung
+# ging bisher nur an STDOUT, nie in $LOG. Reproduziert mit betriebslauf2.sh Fall 4a
+# (Pane mit @wb_cmd, aber ohne @wb_role): $AUTOLOG blieb ohne jede Zeile zu diesem
+# Ausgang. Ein Prozess mehr kostet das -- vertretbar fuer ein Skript, das ohnehin nur
+# beim Tod eines Panes einmal laeuft, nie in einer heissen Schleife.
+rc=0
+out=$("$HOME/.local/bin/wb-revive" "$pane" 2>&1) || rc=$?
+log "wb-revive rc=${rc}: ${out:-<keine Ausgabe>}"
+[ -n "$out" ] && printf '%s\n' "$out"
+exit "$rc"

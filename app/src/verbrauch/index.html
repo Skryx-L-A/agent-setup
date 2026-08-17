@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Dieselbe Strenge wie in den anderen Fenstern: nur das eigene Buendel, nichts aus dem
+         Netz, kein Rahmen. Diagramme entstehen als SVG im Fenster selbst -- eine Bibliothek von
+         aussen brauchte eine Ausnahme hier, und die gibt es nicht. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:"
+    />
+    <title>Agent Workbench — Usage</title>
+    <style>
+      /* Farben und Schrift der beiden anderen Fenster (app/src/sitzung/index.html), damit drei
+         Fenster desselben Programms wie drei Fenster desselben Programms aussehen. Dazu vier
+         Verbrauchsfarben -- eine je Tokenart --, die in Diagramm, Kachel und Legende
+         DIESELBEN sind: eine Farbe, die im Balken etwas anderes bedeutet als in der Tabelle,
+         waere schlimmer als gar keine. */
+      :root {
+        color-scheme: dark;
+        --grund: #101216;
+        --leiste: #171a20;
+        --linie: #262b34;
+        --schrift: #d8dee9;
+        --gedaempft: #8b93a1;
+        --laeuft: #46a758;
+        --will: #e0a020;
+        --aus: #d24c4c;
+        --fern: #6a7fd0;
+        --wahl: #222833;
+        --ein: #6a7fd0;
+        --raus: #46a758;
+        --cw: #e0a020;
+        --cr: #9a7ad4;
+      }
+      /* HELL UND DUNKEL (Farben durchreichen, 11.08.), dieselbe Mechanik wie in
+         den anderen Fenstern: `data-thema` traegt den von main/thema.ts
+         AUFGELOESTEN Wert ('hell'/'dunkel'), gesetzt in verbrauch.ts. Diese
+         Seite hat keine Zustandsfarben (keine Sitzungsmarken), nur das Thema
+         -- Ein/Aus/CW/CR sind eigene, feste Diagrammfarben und je einzeln auf
+         Kontrast zu Weiss gebracht (WCAG 4,5, siehe main/thema.ts). */
+      :root[data-thema='hell'] {
+        color-scheme: light;
+        --grund: #ffffff;
+        --leiste: #f4f5f7;
+        --linie: #d8dbe1;
+        --schrift: #1b1f27;
+        --gedaempft: #5c6472;
+        --laeuft: #22803c;
+        --will: #9a6600;
+        --aus: #b3261e;
+        --fern: #3355c4;
+        --wahl: #e4e8f4;
+        --ein: #3355c4;
+        --raus: #22803c;
+        --cw: #9a6600;
+        --cr: #6b3fa0;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--grund);
+        color: var(--schrift);
+      }
+      body {
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+
+      /* --- Kopf und Steuerung ------------------------------------------- */
+      #kopf {
+        flex: 0 0 auto;
+        padding: 14px 22px 8px;
+        border-bottom: 1px solid var(--linie);
+        background: var(--leiste);
+      }
+      #kopf h1 {
+        font-size: 16px;
+        font-weight: 600;
+        margin: 0 0 2px;
+      }
+      #kopf .unterzeile,
+      #kopf .stand {
+        color: var(--gedaempft);
+        margin: 0;
+      }
+      .reihe {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      .reihe .marke {
+        color: var(--gedaempft);
+        flex: 0 0 auto;
+      }
+
+      .knopf {
+        font: inherit;
+        background: transparent;
+        color: var(--schrift);
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 3px 10px;
+        cursor: pointer;
+        flex: 0 0 auto;
+      }
+      .knopf:hover:not(:disabled) {
+        background: #1e232b;
+      }
+      .knopf.gewaehlt {
+        border-color: var(--fern);
+        color: var(--fern);
+        background: var(--wahl);
+      }
+      .knopf:disabled {
+        color: #5d6675;
+        border-color: #333a45;
+        cursor: not-allowed;
+      }
+
+      /* --- Inhalt --------------------------------------------------------- */
+      #inhalt {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 4px 22px 24px;
+      }
+      section {
+        margin-top: 18px;
+      }
+      section > h2 {
+        font-size: 12px;
+        font-weight: 600;
+        margin: 0 0 6px;
+        padding-bottom: 3px;
+        border-bottom: 1px solid var(--linie);
+      }
+      .hinweis {
+        color: var(--gedaempft);
+        margin: 0 0 8px;
+      }
+      /* Ein Satz, der eine Zahl einschraenkt, steht NEBEN der Zahl -- nie als Fussnote am Ende
+         der Seite. Wer eine Fussnote lesen soll, hat die Zahl schon geglaubt. */
+      .einschraenkung {
+        color: var(--will);
+      }
+
+      /* --- Kacheln -------------------------------------------------------- */
+      .kacheln {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+      .kachel {
+        flex: 1 1 150px;
+        min-width: 140px;
+        border: 1px solid var(--linie);
+        border-left-width: 3px;
+        border-radius: 4px;
+        padding: 7px 10px 8px;
+        background: var(--leiste);
+      }
+      .kachel .titel {
+        color: var(--gedaempft);
+      }
+      .kachel .wert {
+        font-size: 17px;
+        margin-top: 1px;
+      }
+      .kachel .neben {
+        color: var(--gedaempft);
+      }
+      .kachel.ein { border-left-color: var(--ein); }
+      .kachel.raus { border-left-color: var(--raus); }
+      .kachel.cw { border-left-color: var(--cw); }
+      .kachel.cr { border-left-color: var(--cr); }
+      .kachel.summe { border-left-color: var(--schrift); }
+
+      /* --- Diagramme ------------------------------------------------------ */
+      .diagramme {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+      }
+      .diagramm {
+        flex: 1 1 380px;
+        min-width: 300px;
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 8px 10px 6px;
+        background: var(--leiste);
+      }
+      .diagramm .kopfzeile {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        color: var(--gedaempft);
+      }
+      .diagramm svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+      .legende {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        color: var(--gedaempft);
+        margin-top: 4px;
+      }
+      .legende .punkt {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 2px;
+        margin-right: 4px;
+        vertical-align: baseline;
+      }
+
+      /* --- Tabellen ------------------------------------------------------- */
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 3px 8px 3px 0;
+        border-bottom: 1px solid var(--linie);
+        vertical-align: top;
+      }
+      th {
+        color: var(--gedaempft);
+        font-weight: 400;
+        white-space: nowrap;
+      }
+      td.zahl,
+      th.zahl {
+        text-align: right;
+        white-space: nowrap;
+      }
+      tr:last-child td {
+        border-bottom: 0;
+      }
+      .fein {
+        color: var(--gedaempft);
+      }
+      .marke-art {
+        border: 1px solid var(--linie);
+        border-radius: 3px;
+        padding: 0 5px;
+        white-space: nowrap;
+        color: var(--gedaempft);
+      }
+      .marke-art.gemessen {
+        border-color: var(--laeuft);
+        color: var(--laeuft);
+      }
+      .marke-art.naeherung {
+        border-color: var(--will);
+        color: var(--will);
+      }
+      .marke-art.fehlt {
+        border-color: var(--aus);
+        color: var(--aus);
+      }
+      .mehr { color: var(--will); }
+      .weniger { color: var(--laeuft); }
+      .gleich { color: var(--gedaempft); }
+
+      #fehler {
+        border: 1px solid var(--aus);
+        border-radius: 4px;
+        padding: 10px 12px;
+        margin-top: 14px;
+        color: var(--aus);
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      #statuszeile {
+        flex: 0 0 auto;
+        border-top: 1px solid var(--linie);
+        background: var(--leiste);
+        padding: 5px 14px;
+        color: var(--gedaempft);
+        min-height: 17px;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <header id="kopf">
+      <h1 id="titel"></h1>
+      <p class="unterzeile" id="unterzeile"></p>
+      <p class="stand" id="stand"></p>
+      <div class="reihe" id="zeitraum"></div>
+      <div class="reihe" id="filter-harness"></div>
+      <div class="reihe" id="filter-modell"></div>
+    </header>
+    <main id="inhalt"></main>
+    <div id="statuszeile"></div>
+    <script src="verbrauch.js"></script>
+  </body>
+</html>

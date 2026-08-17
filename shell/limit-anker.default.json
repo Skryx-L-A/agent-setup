@@ -1,0 +1,15 @@
+{
+  "_comment": [
+    "Vorlage fuer ~/.claude/workbench/limit-anker.json.",
+    "Von Hand nachgerechnete Verbrauchsabschnitte, die wb-budget --limit-gewichte NICHT",
+    "automatisch aus limits.jsonl finden kann -- typisch: ein Fenster, das vor dem Beginn",
+    "von limits.jsonl lag, oder eines, das nur ueber eine externe Rechnung belegt ist.",
+    "Jeder Eintrag braucht 'feld' (five_hour_pct oder seven_day_pct), 'von'/'bis' (ISO-8601,",
+    "mit Zeitzonen-Offset), 'punkte' (beobachteter Prozentpunkt-Anstieg) und 'usd' (USD-",
+    "Aequivalent je Modell in diesem Zeitraum). Ein Anker OHNE bekannte Token-Aufschluesselung",
+    "geht nur in die USD-Basis ein, nicht in die beiden Token-Basen -- das ist normal.",
+    "wb-budget prueft vor der Benutzung gegen plan-historie.json, ob im ganzen Zeitraum",
+    "durchgehend derselbe Plan galt; sonst wird der Anker mit Begruendung uebersprungen."
+  ],
+  "anker": []
+}

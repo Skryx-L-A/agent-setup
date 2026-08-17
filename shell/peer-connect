@@ -1,0 +1,59 @@
+#!/bin/bash
+# peer-connect — an die Workbench auf peer, von ueberall, ohne Nachdenken.
+#
+# Warum es das gibt (2026-08-03): peer soll auch dann normal bedienbar sein, wenn der
+# Mac nicht im Heimnetz haengt — Cafe, Hotspot, unterwegs. Zwei Dinge machen das aus:
+#   - Tailscale liefert die Erreichbarkeit ohne offenen Port im Internet (WireGuard,
+#     auf beiden Maschinen als Systemdienst, Node-Keys ohne Ablauf).
+#   - mosh liefert die Bestaendigkeit: es ueberlebt IP-Wechsel und Ruhezustand, wo eine
+#     SSH-Sitzung abreisst. Zusammen mit tmux auf der Gegenseite heisst das: Deckel zu,
+#     Netz wechseln, Deckel auf, weiterarbeiten — die Worker laufen unbeirrt weiter.
+#
+#   peer-connect            an die Orchestrator-Session (wb-orch)
+#   peer-connect main       an die Befehls-Shell
+#   peer-connect --ssh      dasselbe ueber klassisches SSH statt mosh
+#   peer-connect --check    nur pruefen, ob der Weg steht (verbindet nicht)
+set -uo pipefail
+
+TARGET="${1:-wb-orch}"
+MODE=mosh
+case "${1:-}" in
+  --ssh)   MODE=ssh; TARGET="${2:-wb-orch}" ;;
+  --check) MODE=check ;;
+esac
+
+if [ "$MODE" = check ]; then
+  echo "== Tailscale hier =="
+  tailscale status --json 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin); s=d.get('Self',{})
+print('  Backend:', d.get('BackendState'), '| Online:', s.get('Online'))
+print('  KeyExpiry:', s.get('KeyExpiry') or 'None (laeuft nicht ab)')
+peer=[p for p in d.get('Peer',{}).values() if p.get('HostName','').lower()=='peer']
+if peer:
+    p=peer[0]
+    print('  peer:', 'online' if p.get('Online') else 'OFFLINE',
+          '|', (p.get('CurAddr') or 'ueber Relay (DERP)'))
+else:
+    print('  peer: nicht im Tailnet gefunden')
+" 2>/dev/null || echo "  tailscale nicht erreichbar"
+  echo "== Gegenseite =="
+  ssh -o ConnectTimeout=8 peer 'printf "  Host: %s\n" "$(hostname)"; printf "  sshd: %s | tailscaled: %s\n" "$(systemctl is-active sshd)" "$(systemctl is-active tailscaled)"; printf "  mosh-server: %s\n" "$(command -v mosh-server || echo FEHLT)"; printf "  tmux: %s\n" "$(tmux ls 2>/dev/null | cut -d: -f1 | tr "\n" " ")"' 2>&1 | head -6
+  echo "== hier =="
+  printf '  mosh: %s\n' "$(command -v mosh || echo FEHLT)"
+  exit 0
+fi
+
+# tmux-Session anlegen, falls sie fehlt, dann anhaengen. `new-session -A` macht beides
+# in einem Schritt und haengt an eine bestehende an, statt eine zweite zu erzeugen.
+REMOTE="tmux new-session -A -s $(printf %q "$TARGET")"
+
+case "$MODE" in
+  mosh)
+    command -v mosh >/dev/null 2>&1 || { echo "mosh fehlt hier — 'brew install mosh'." >&2; exit 1; }
+    exec mosh peer -- $REMOTE
+    ;;
+  ssh)
+    exec ssh -t peer "$REMOTE"
+    ;;
+esac

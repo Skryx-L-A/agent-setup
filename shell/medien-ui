@@ -1,0 +1,23 @@
+#!/bin/bash
+# medien-ui — startet die lokale Bild/Ton-Weboberfläche und öffnet den Browser.
+# Läuft komplett offline. Stoppen: medien-ui --stop
+set -euo pipefail
+
+URL="http://127.0.0.1:8799"
+# Signatur-Route: nur der Medien-UI-Server antwortet hier mit 200.
+PROBE="$URL/api/status"
+APP="$HOME/AI/medien-ui/app.py"
+
+if [[ "${1:-}" == "--stop" ]]; then
+  pkill -f "medien-ui/app.py" 2>/dev/null && echo "Medien-UI gestoppt." || echo "Läuft nicht."
+  exit 0
+fi
+
+if ! curl -sf -o /dev/null --max-time 1 "$PROBE"; then
+  nohup python3 "$APP" >> "$HOME/AI/medien-ui/server.log" 2>&1 &
+  for i in $(seq 1 20); do
+    curl -sf -o /dev/null --max-time 1 "$PROBE" && break
+    sleep 0.5
+  done
+fi
+open "$URL"

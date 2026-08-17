@@ -1,0 +1,236 @@
+#!/bin/bash
+# wb-nohup — der vorgeschriebene Weg, einen Hintergrundprozess abgeloest zu
+# starten. Ersetzt `nohup <befehl> & disown`.
+#
+# Anlass (2026-08-11): `wb-waisen` kann einem abgeloesten Prozess ansehen,
+# dass er KEIN Terminal mehr hat — das sagt aber nur „abgeloest", nicht
+# „verlassen". Ein Modellserver mit offenen Verbindungen sieht strukturell
+# GENAUSO aus wie ein vergessener; Verbindungen, CPU-Last und wachsender
+# Speicher sind bestenfalls Indizien, gemessen zu einem einzigen Zeitpunkt,
+# nie ein Beweis (siehe Kopfkommentar von `wb-waisen` fuer die ausfuehrliche
+# Begruendung samt zwei konkreten Gegenbeispielen). Die harte Auskunft
+# entsteht deshalb HIER, beim Start, nicht spaeter bei der Messung: wer einen
+# Prozess abloest, hinterlegt im selben Handgriff seinen EIGENTUEMER — PID,
+# Startbefehl, Startzeit, Worker-Name und der tmux-Pane, der ihn gestartet
+# hat. `wb-waisen` liest diesen Eintrag und prueft nur noch EINE Tatsache:
+# lebt der Pane noch? Das ersetzt Raten durch Nachsehen.
+#
+# Usage:
+#   wb-nohup <name> [--worker <name>] [--log <pfad>] -- <befehl> [args...]
+#
+#   <name>            kurzer Bezeichner fuer Registrierung und Log
+#                      (Default-Logpfad: ~/.local/state/wb-nohup/logs/<name>.log,
+#                      ein erneuter Lauf mit demselben Namen ueberschreibt ihn)
+#   --worker <name>    Worker-Name, falls er sich nicht aus dem Pane lesen
+#                      laesst (Vorgabe: @wb_worker des eigenen Panes)
+#   --log <pfad>       eigener Logpfad statt der Vorgabe
+#   --launchd <label>  Eigentuemer ist ein launchd-Job statt eines Panes
+#                      (auch ueber WB_EIGENTUEMER_LAUNCHD, siehe unten)
+#   --                 trennt wb-nohups eigene Optionen vom Befehl selbst
+#
+# Braucht einen tmux-Pane als Bezugspunkt ($TMUX gesetzt) -- ausserhalb eines
+# Workbench-Panes gibt es keinen Eigentuemer, den dieses Werkzeug festhalten
+# koennte, und ohne Pane waere die ganze Eintragung nur ein Attrappen-Eintrag.
+#
+# ZWEI HUERDEN FUER DIESEN WEG (Review 2026-08-13, S6, Entscheidung des
+# Orchestrators). Zuerst genuegte es, dass launchd das Label KENNT — damit
+# liess sich jeder fremde Dauerlaeufer als Eigentuemer eintragen
+# (`WB_EIGENTUEMER_LAUNCHD=com.apple.Finder` gemessen), und weil der Finder
+# immer laeuft, waere der Prozess dauerhaft von der Waisenpruefung
+# ausgenommen gewesen — eine UNBEFRISTETE Ausnahme, waehrend ein Pane
+# irgendwann stirbt. Deshalb jetzt: (1) nur eigene Jobs, Praefix
+# `agent-workbench.`; (2) der Job muss GERADE LAUFEN und seine PID muss ein
+# VORFAHRE dieses Aufrufs sein. Damit kann nur der Job selbst — ueber seine
+# eigene Prozesskette — sich als Eigentuemer eintragen lassen.
+#
+# ZWEITE EIGENTUEMER-ART: EIN LAUNCHD-JOB (2026-08-13). Mit dem
+# bedarfsweisen Modellserver-Proxy (wb-modell-proxy, gehalten von
+# agent-workbench.modell-proxy.plist) gibt es einen Starter, der nachweislich
+# KEIN Pane hat und trotzdem einen harten, nachpruefbaren Eigentuemer
+# besitzt: den launchd-Job selbst. Der Proxy reicht sein Label als
+# WB_EIGENTUEMER_LAUNCHD an ensureCmd weiter, `grug-server` ruft dieses
+# Werkzeug unveraendert auf, und die Registrierung traegt dann
+# "launchd_label" statt "pane". `wb-waisen` stellt dafuer dieselbe eine
+# Tatsachenfrage wie beim Pane, nur an launchd: LAEUFT dieser Job gerade
+# (hat er eine PID)? Nein -> der Prozess dahinter ist eine Waise. Das ist
+# keine Aufweichung der Regel, sondern ihre zweite Auspraegung: ohne Pane
+# UND ohne Label bleibt es beim harten Nein darunter.
+#
+# Registrierung unter ~/.local/state/wb-nohup/eigentuemer/<pid>.json, EINE
+# Datei je PID: {pid, name, befehl, worker, pane, socket_path, log,
+# gestartet, lstart_pruefwert}. `lstart_pruefwert` ist der exakte
+# `ps -o lstart=`-Wert der PID zum Startzeitpunkt — `wb-waisen` vergleicht ihn
+# spaeter erneut, damit ein WIEDERVERWENDETER PID (altes Verzeichnis, neuer,
+# fremder Prozess) nicht faelschlich als registriert durchgeht. `ps -o lstart=`
+# formatiert nach LC_TIME -- unter C.UTF-8 und unter z. B. de_DE liefert
+# dieselbe PID verschiedene Zeichenketten (unabhaengiger Pruefdurchgang
+# 2026-08-11, Befund 2). Deshalb IMMER `LC_ALL=C` um diesen Aufruf, hier UND
+# in wb-waisens lade_eigentuemer() -- sonst faellt der Vergleich still aus,
+# je nachdem, unter welcher Umgebung geschrieben und gelesen wird.
+# Geschrieben wird atomar (temporaere Datei + rename), wie das Haus es fuer
+# seine Zustandsdateien tut (siehe shell/wb-state, os.replace()) -- eine
+# Registrierung, die waehrend des Schreibens gelesen wird, soll nie halb
+# dastehen.
+#
+# LUECKE, bewusst nicht automatisch repariert (Befund 4, unabhaengiger
+# Pruefdurchgang 2026-08-11): registriert wird die PID des DIREKTEN Kindes
+# von `nohup`. Daemonisiert sich der gestartete Befehl selbst (klassisches
+# doppeltes Fork: das Kind startet den eigentlichen Dienst und beendet sich
+# selbst), beschreibt der Eintrag danach eine Leiche -- der ueberlebende
+# Enkel-Prozess hat eine ANDERE PID, die dieses Werkzeug nie erfaehrt, und
+# bleibt fuer immer unregistriert. Eine zweite, kurze Nachschau (unten) sagt
+# das WENIGSTENS laut an, kann es aber nicht reparieren: die neue PID ist
+# nirgends herzuleiten, ohne den Prozessbaum zu erraten.
+#
+# Gibt die PID auf stdout aus (fuer `PID=$(wb-nohup ... -- ...)`), eine
+# Kurzbestaetigung auf stderr. Schreibt NUR eine Registrierung, wenn der
+# Prozess nachweislich lebt -- ein sofort fehlgeschlagener Befehl hinterlaesst
+# keinen Eintrag.
+set -uo pipefail
+
+if [[ $# -eq 0 || "$1" == "-h" || "$1" == "--help" ]]; then
+  sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+fi
+
+NAME="$1"; shift
+WORKER=""
+LOG=""
+LAUNCHD_LABEL="${WB_EIGENTUEMER_LAUNCHD:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --worker) [ $# -ge 2 ] || { echo "wb-nohup: --worker braucht einen Namen" >&2; exit 2; }
+              WORKER="$2"; shift 2 ;;
+    --log)    [ $# -ge 2 ] || { echo "wb-nohup: --log braucht einen Pfad" >&2; exit 2; }
+              LOG="$2"; shift 2 ;;
+    --launchd) [ $# -ge 2 ] || { echo "wb-nohup: --launchd braucht ein Label" >&2; exit 2; }
+              LAUNCHD_LABEL="$2"; shift 2 ;;
+    --)       shift; break ;;
+    *) echo "wb-nohup: unbekannte Option '$1' (Befehl braucht ein '--' davor)" >&2; exit 2 ;;
+  esac
+done
+
+if [ $# -eq 0 ]; then
+  echo "wb-nohup: kein Befehl angegeben (nach '--')" >&2
+  exit 2
+fi
+
+# Ist <pid> ein Vorfahre DIESES Aufrufs? Die Kette wird ueber ps -o ppid=
+# hochgelaufen; 64 Schritte sind mehr als jede reale Prozesstiefe und
+# schuetzen zugleich gegen einen Zyklus aus wiederverwendeten PIDs.
+ist_vorfahre() {
+  local ziel="$1" p="$$" schritte=0
+  while [ -n "$p" ] && [ "$p" != "0" ] && [ "$schritte" -lt 64 ]; do
+    [ "$p" = "$ziel" ] && return 0
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    schritte=$((schritte + 1))
+  done
+  return 1
+}
+
+if [ -n "$LAUNCHD_LABEL" ]; then
+  # Eigentuemer ist ein launchd-Job (siehe Kopfkommentar). Zwei Huerden, beide
+  # nachgesehen statt geglaubt.
+  case "$LAUNCHD_LABEL" in
+    agent-workbench.*) ;;
+    *) echo "wb-nohup: als launchd-Eigentuemer sind nur eigene Jobs zugelassen (Praefix 'agent-workbench.') — '$LAUNCHD_LABEL' ist keiner." >&2
+       exit 2 ;;
+  esac
+  JOB_AUSGABE="$(launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null)" || JOB_AUSGABE=""
+  if [ -z "$JOB_AUSGABE" ]; then
+    echo "wb-nohup: launchd kennt den Job '$LAUNCHD_LABEL' in gui/$(id -u) nicht — kein Eigentuemer, kein Start." >&2
+    exit 2
+  fi
+  JOB_PID="$(printf '%s\n' "$JOB_AUSGABE" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -1)"
+  if [ -z "$JOB_PID" ]; then
+    echo "wb-nohup: der Job '$LAUNCHD_LABEL' laeuft gerade nicht (keine PID) — ein Eigentuemer, der nicht laeuft, ist keiner." >&2
+    exit 2
+  fi
+  if ! ist_vorfahre "$JOB_PID"; then
+    echo "wb-nohup: der Job '$LAUNCHD_LABEL' laeuft unter PID $JOB_PID, dieser Aufruf stammt aber nicht aus seiner Prozesskette — nur der Job selbst darf sich als Eigentuemer eintragen." >&2
+    exit 2
+  fi
+  SOCKET_PATH=""
+  PANE=""
+  [ -n "$WORKER" ] || WORKER="launchd:$LAUNCHD_LABEL"
+elif [ -z "${TMUX:-}" ] || [ -z "${TMUX_PANE:-}" ]; then
+  echo "wb-nohup: braucht einen tmux-Pane als Bezugspunkt (kein \$TMUX/\$TMUX_PANE gesetzt) — ausserhalb eines Workbench-Panes gibt es keinen Eigentuemer, den es festhalten koennte." >&2
+  echo "wb-nohup: laeuft der Starter unter launchd, nennt er seinen Job: --launchd <label> (oder WB_EIGENTUEMER_LAUNCHD)." >&2
+  exit 2
+else
+  SOCKET_PATH="${TMUX%%,*}"
+  PANE="$TMUX_PANE"
+  if [ -z "$WORKER" ]; then
+    WORKER="$(tmux -S "$SOCKET_PATH" display -p -t "$PANE" '#{@wb_worker}' 2>/dev/null)"
+    [ -n "$WORKER" ] || WORKER="unbekannt"
+  fi
+fi
+
+REGDIR="$HOME/.local/state/wb-nohup/eigentuemer"
+LOGDIR="$HOME/.local/state/wb-nohup/logs"
+mkdir -p "$REGDIR" "$LOGDIR" || { echo "wb-nohup: konnte Zustandsverzeichnis nicht anlegen" >&2; exit 2; }
+[ -n "$LOG" ] || LOG="$LOGDIR/$NAME.log"
+
+nohup "$@" >"$LOG" 2>&1 &
+PID=$!
+disown
+
+# Kurz nachsehen, ob der Prozess ueberhaupt lebt -- ein sofort fehlgeschlagener
+# Befehl (z. B. Binary nicht gefunden) soll keinen Registrierungs-Eintrag
+# hinterlassen. 0.3s reichen fuer einen Exec-Fehlschlag, ohne einen echten,
+# langsam hochfahrenden Server zu verpassen (der laeuft ohnehin laenger).
+sleep 0.3
+if ! ps -o pid= -p "$PID" >/dev/null 2>&1; then
+  echo "wb-nohup: '$*' ist sofort beendet (PID $PID lebt nicht mehr) — siehe $LOG. Keine Registrierung angelegt." >&2
+  exit 1
+fi
+
+LSTART="$(LC_ALL=C ps -o lstart= -p "$PID" 2>/dev/null)"
+REGFILE="$REGDIR/$PID.json"
+TMPFILE="$(mktemp "$REGDIR/.$PID.XXXXXX")" || { echo "wb-nohup: konnte keine temporaere Registrierungsdatei anlegen" >&2; TMPFILE=""; }
+if [ -n "$TMPFILE" ]; then
+  /usr/bin/python3 - "$TMPFILE" "$PID" "$NAME" "$WORKER" "$PANE" "$SOCKET_PATH" "$LOG" "$LSTART" "$LAUNCHD_LABEL" "$@" <<'PY'
+import datetime, json, sys
+tmpfile, pid, name, worker, pane, socket_path, log, lstart, launchd_label = sys.argv[1:10]
+befehl = sys.argv[10:]
+data = {
+    "pid": int(pid),
+    "name": name,
+    "befehl": befehl,
+    "worker": worker,
+    "pane": pane,
+    "socket_path": socket_path,
+    "launchd_label": launchd_label,
+    "log": log,
+    "gestartet": datetime.datetime.now().isoformat(timespec="seconds"),
+    "lstart_pruefwert": lstart,
+}
+with open(tmpfile, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+  if [ $? -eq 0 ]; then
+    mv -f "$TMPFILE" "$REGFILE" \
+      || echo "wb-nohup: konnte die Registrierung nicht an ihren Platz verschieben — der Prozess laeuft trotzdem weiter, aber unregistriert." >&2
+  else
+    rm -f "$TMPFILE"
+    echo "wb-nohup: Registrierung fuer PID $PID konnte nicht geschrieben werden — der Prozess laeuft trotzdem weiter, aber unregistriert." >&2
+  fi
+fi
+
+# Zweite, kurze Nachschau (Befund 4): ein sich selbst daemonisierendes
+# Programm (doppeltes Fork) beendet seinen direkten Elternprozess meist
+# innerhalb der ersten ein bis zwei Sekunden -- danach lebt nur noch ein
+# NICHT registrierter Enkel weiter. Reparieren kann diese Nachschau das
+# nicht (die neue PID ist nirgends herzuleiten), aber sie sagt es SOFORT an,
+# statt fuer immer stumm zu bleiben.
+sleep 1.2
+if ! ps -o pid= -p "$PID" >/dev/null 2>&1; then
+  echo "wb-nohup: WARNUNG — PID $PID (das Direktkind von nohup) ist bereits wieder beendet. Falls sich '$*' selbst daemonisiert (doppeltes Fork), lebt der eigentliche Prozess jetzt unter einer ANDEREN, nicht registrierten PID weiter; die Registrierung oben beschreibt dann eine Leiche und wird von wb-waisen beim naechsten Lauf als verwaist entfernt." >&2
+fi
+
+if [ -n "$LAUNCHD_LABEL" ]; then
+  echo "wb-nohup: PID $PID gestartet (name=$NAME worker=$WORKER launchd=$LAUNCHD_LABEL), Protokoll: $LOG" >&2
+else
+  echo "wb-nohup: PID $PID gestartet (name=$NAME worker=$WORKER pane=$PANE), Protokoll: $LOG" >&2
+fi
+echo "$PID"

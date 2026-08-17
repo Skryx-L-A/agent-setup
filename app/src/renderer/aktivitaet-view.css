@@ -1,0 +1,53 @@
+/* Die Aktivitaetsliste (4c.1). Dieselbe Bildsprache wie die Freigabe-Ansicht
+   (dunkle Schublade von rechts), aber blau statt gelb/blau gemischt: hier
+   will nichts etwas, hier steht nur, was gerade ist. */
+/* Die Schublade steht IN der Reihe zwischen Sessionleiste und Buehne, nicht
+   darueber -- Vorgabe des Nutzers vom 05.08.: "so wie es auch rechts aussieht".
+   Als schwebende Flaeche lag sie ueber der Buehne und liess die linke Seite
+   wie zwei uebereinandergeschobene Leisten wirken. Jetzt endet die Buehne an
+   ihr, genau wie sie rechts an der Workerleiste endet. Zugeklappt ist sie
+   `display: none` und nimmt keine Breite -- das ersetzt die alte Schiebe-
+   Animation, die in der Reihe die Buehne bei jedem Bild neu vermessen haette. */
+.ak-panel {
+  flex: 0 0 auto; width: min(480px, 45vw); height: 100%; box-sizing: border-box;
+  background: #14171c; border-right: 1px solid #262b34; color: #d8dee9;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  display: none; flex-direction: column;
+  overflow-wrap: anywhere;
+}
+.ak-panel.offen { display: flex; }
+
+.ak-kopf {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px; border-bottom: 1px solid #262b34; flex: 0 0 auto;
+}
+.ak-titel { font-weight: 700; font-size: 13px; }
+.ak-schliessen {
+  background: none; border: 0; color: #8b93a1; font-size: 18px; line-height: 1;
+  cursor: pointer; padding: 2px 6px;
+}
+.ak-schliessen:hover { color: #d8dee9; }
+
+.ak-inhalt { flex: 1 1 auto; overflow-y: auto; padding: 10px 12px 16px; }
+.ak-liste { display: flex; flex-direction: column; gap: 6px; }
+.ak-leer { color: #8b93a1; padding: 4px 0; }
+
+.ak-eintrag {
+  background: #1a1e25; border: 1px solid #262b34; border-radius: 6px; padding: 6px 10px;
+  cursor: pointer;
+}
+.ak-eintrag:hover { background: #1e232b; border-color: #333b48; }
+/* Der Eintrag, dessen Inhalt gerade "in der Mitte" offen ist -- ein zweiter
+   Klick auf GENAU diesen zeigt den Diff bzw. Auftrag+Ergebnis (V15/V18). */
+.ak-eintrag.ak-offen { border-color: #6a7fd0; box-shadow: inset 0 0 0 1px #6a7fd0; }
+.ak-status { color: #8b93a1; padding: 4px 0 0; font-size: 11px; }
+/* Ergebnisdateien (Worker) blau, Session-Aenderungen (git) gruenlich --
+   dieselbe Unterscheidung wie 'Urheber ist ein Worker oder eine Session'. */
+.ak-ergebnis { border-left: 3px solid #6a7fd0; }
+.ak-aenderung { border-left: 3px solid #46a758; }
+
+.ak-eintrag-kopf { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.ak-wer { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ak-wann { color: #8b93a1; font-size: 11px; white-space: nowrap; }
+.ak-datei { margin-top: 2px; color: #b9c0cc; }
+.ak-zusatz { color: #8b93a1; font-size: 11px; margin-top: 1px; }

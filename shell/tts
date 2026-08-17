@@ -1,0 +1,41 @@
+#!/bin/bash
+# tts — local text-to-speech for agents (mlx-audio, Apple Silicon).
+# Default: Kokoro (ENGLISH — the user's rule 2026-07-10: English is the default;
+# German only when he explicitly asks). Output WAV path is printed on stdout.
+#
+# Usage:
+#   tts "text"                     fast English default (Kokoro)
+#   tts --expressive "text"        expressive English (Chatterbox-Turbo)
+#   tts --de "text"                German (Qwen3-TTS) — ONLY on explicit request
+#   tts --model <hf-repo> "text"   any mlx-audio model
+#   tts --voice <voice> ...        pass a voice name through
+#   tts -o /path/prefix ...        output prefix (default /tmp/tts-<epoch>)
+#   tts --play ...                 play result via afplay
+set -euo pipefail
+
+VENV="$HOME/AI/audio-tools/.venv"
+MODEL="mlx-community/Kokoro-82M-bf16"
+OUT="/tmp/tts-$(date +%s)"
+VOICE=""; PLAY=0; TEXT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --expressive) MODEL="mlx-community/chatterbox-turbo-8bit"; shift ;;
+    --de) MODEL="mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"; shift ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --voice) VOICE="$2"; shift 2 ;;
+    -o) OUT="$2"; shift 2 ;;
+    --play) PLAY=1; shift ;;
+    *) TEXT="$1"; shift ;;
+  esac
+done
+[ -n "$TEXT" ] || { echo "usage: tts [--expressive|--de|--model M] [--voice V] [-o prefix] [--play] \"text\"" >&2; exit 2; }
+
+ARGS=(--model "$MODEL" --text "$TEXT" --file_prefix "$OUT")
+[ -n "$VOICE" ] && ARGS+=(--voice "$VOICE")
+"$VENV/bin/python" -m mlx_audio.tts.generate "${ARGS[@]}" >/dev/null 2>&1
+
+WAV="${OUT}_000.wav"
+[ -s "$WAV" ] || { echo "tts failed: no output ($MODEL)" >&2; exit 1; }
+echo "$WAV"
+if [ "$PLAY" = 1 ]; then afplay "$WAV"; fi

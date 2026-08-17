@@ -1,0 +1,19 @@
+# TEMPLATE. Replace __HOME__ before installing; see docs/SERVICES.md for the one-line sed.
+#
+# The Linux counterpart of launchd/agent-workbench.brain-backup.plist. Same script, same
+# job, started by the timer next to this file rather than on a calendar interval of its
+# own.
+#
+# Install, as the normal user:
+#   mkdir -p ~/.config/systemd/user
+#   cp agent-workbench-brain-backup.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agent-workbench-brain-backup.timer
+#   systemctl --user list-timers agent-workbench-brain-backup.timer   # verify
+
+[Unit]
+Description=Bundle the knowledge base
+
+[Service]
+Type=oneshot
+ExecStart=__HOME__/Knowledge/_meta/tools/backup-bundle.sh

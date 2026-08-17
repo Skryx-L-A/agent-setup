@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2560" height="1440" viewBox="0 0 2560 1440">
+  <defs>
+    <linearGradient id="putz" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"   stop-color="#E3D3B8"/>
+      <stop offset="0.6" stop-color="#EADCC4"/>
+      <stop offset="1"   stop-color="#D9C7AA"/>
+    </linearGradient>
+    <linearGradient id="licht" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0"   stop-color="#FFF6DE"/>
+      <stop offset="1"   stop-color="#F3E2BE"/>
+    </linearGradient>
+    <linearGradient id="strahl" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0"   stop-color="#FFF3D2" stop-opacity="0.72"/>
+      <stop offset="1"   stop-color="#FFF3D2" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="boden" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#B79876"/>
+      <stop offset="1" stop-color="#9C7E5E"/>
+    </linearGradient>
+  </defs>
+  <rect width="2560" height="1440" fill="url(#putz)"/>
+
+  <!-- window -->
+  <g transform="translate(1544 236)">
+    <rect x="-26" y="-26" width="612" height="716" rx="10" fill="#C9B694"/>
+    <rect x="0" y="0" width="560" height="664" fill="url(#licht)"/>
+    <g stroke="#C9B694" stroke-width="20">
+      <path d="M280 0 V664 M0 332 H560"/>
+    </g>
+    <rect x="0" y="0" width="560" height="664" fill="none" stroke="#B7A084" stroke-width="10"/>
+  </g>
+  <!-- light falling in -->
+  <polygon points="1518,236 2104,236 2560,1140 1180,1140" fill="url(#strahl)"/>
+
+  <!-- floor -->
+  <rect x="0" y="1140" width="2560" height="300" fill="url(#boden)"/>
+  <g stroke="#8E7154" stroke-width="4" opacity="0.55">
+    <path d="M0 1206 H2560 M0 1276 H2560 M0 1352 H2560"/>
+    <path d="M300 1140 V1440 M980 1140 V1440 M1660 1140 V1440 M2280 1140 V1440"/>
+  </g>
+  <rect x="0" y="1132" width="2560" height="18" fill="#8E7154"/>
+
+  <!-- plaster texture, a few faint patches -->
+  <g fill="#D5C2A4" opacity="0.5">
+    <ellipse cx="420"  cy="520" rx="220" ry="130"/>
+    <ellipse cx="980"  cy="880" rx="180" ry="90"/>
+    <ellipse cx="2340" cy="420" rx="160" ry="120"/>
+  </g>
+</svg>

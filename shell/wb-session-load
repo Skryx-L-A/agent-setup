@@ -1,0 +1,343 @@
+#!/usr/bin/python3
+# wb-session-load <spec-json> <cwd> <contextWindow>
+#
+# DER EINE LESER fuer den session-Block der Registry (2026-08-11), herausgezogen
+# aus shell/context-guard (Funktion session_load(), vormals ein inline Python-
+# Heredoc). Zwei Aufrufer, EIN Leser: die Kontextwache selbst (fuer ihre eigenen
+# Warn-/Kompaktier-Entscheidungen) und das Worker-Modell der Oberflaeche
+# (app/src/main/workerstate.ts, fuer contextPercent/contextTokens eines
+# Workers), damit dieselben sieben Formate nicht ein zweites Mal in TypeScript
+# entstehen -- genau die Doppelung (ein Leser in bash/Python UND einer in
+# TypeScript), die diese Werkbank am 06.08. teuer bezahlt hat.
+#
+# Warum jedes Format so und nicht anders gelesen wird, steht weiterhin in
+# shell/context-guard direkt vor der Funktion session_load() -- die Begruendung
+# gehoert zur Kontextwache und ihrer Messung, nicht zu diesem Skript.
+#
+# VERTRAG: gelesen wird NUR, was das Werkzeug selbst als Tokenzahl aufgeschrieben
+# hat, nie aus einer Dateigroesse geschaetzt. Bei jedem Zweifel (Datei fehlt,
+# aelter als maxAgeSec, zwei lebende Sitzungen im selben Verzeichnis, kein
+# Nenner) wird NICHTS ausgegeben -- keine Zeile auf stdout, Exitcode 0. Wer
+# aufruft, muss eine leere Ausgabe als "unbekannt" behandeln, nie als 0 %.
+#
+# AUSGABE bei Erfolg: eine Zeile "<belegte Tokens> <Prozent> <Fenster>", drei
+# Ganzzahlen. Das Fenster ist NICHT immer das uebergebene <contextWindow>: bei
+# codex-rollout steht der Nenner IN der Sitzungsdatei selbst (info.
+# model_context_window) und gilt dann statt des uebergebenen Werts -- wer diese
+# Ausgabe weiterverwendet, soll den Nenner zeigen, der die Prozentzahl wirklich
+# ergeben hat, nie einen zweiten, der zufaellig daneben in der Registry steht.
+import glob, json, os, re, sys, time
+
+spec = json.loads(sys.argv[1]); cwd = sys.argv[2]
+win = int(sys.argv[3]) if sys.argv[3].isdigit() else 0
+fmt = spec.get("format") or ""
+path = os.path.expanduser(spec.get("ort") or "")
+# Aelter als das: die Datei gehoert vermutlich nicht zu diesem Pane, sondern zu einem
+# frueheren Lauf im selben Verzeichnis. Lieber blind als eine fremde Zahl.
+max_age = int(spec.get("maxAgeSec") or 43200)
+now = time.time()
+
+def tail(path, n=400000):
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        fh.seek(max(0, size - n))
+        chunk = fh.read().decode("utf-8", "replace")
+    return chunk.split("\n", 1)[1] if size > n else chunk
+
+def sag(used, window):
+    if not used or not window or window <= 0:
+        sys.exit(0)
+    print("%d %d %d" % (used, max(0, min(100, used * 100 // window)), window))
+    sys.exit(0)
+
+if fmt == "codex-rollout":
+    real = os.path.realpath(cwd)
+    cands = []
+    for f in glob.glob(path):
+        try:
+            # Erst das Alter, DANN erst oeffnen: codex legt je Sitzung eine Datei an, und
+            # das Verzeichnis waechst monatelang. Der Guard fragt bei jedem Poll — ohne
+            # diese Vorauswahl waeren das je Poll so viele Dateioeffnungen, wie jemals
+            # codex-Sitzungen liefen.
+            if now - os.path.getmtime(f) > max_age:
+                continue
+            with open(f, "rb") as fh:
+                meta = json.loads(fh.readline().decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if meta.get("type") != "session_meta":
+            continue
+        c = (meta.get("payload") or {}).get("cwd") or ""
+        try:
+            if not c or os.path.realpath(c) != real:
+                continue
+            cands.append((os.path.getmtime(f), f))
+        except Exception:
+            continue
+    if not cands:
+        sys.exit(0)
+    cands.sort(reverse=True)
+    # ZWEI lebende Sitzungen im selben Verzeichnis: welche zu diesem Pane gehoert, ist aus
+    # der Datei nicht zu entscheiden. Dann lieber blind melden — dieselbe Regel wie bei
+    # transcript_load(), wo eine falsche NIEDRIGE Zahl die Warnung still verschluckt hat.
+    if len(cands) > 1 and now - cands[1][0] < 300:
+        sys.exit(0)
+    used = window = None
+    for line in reversed(tail(cands[0][1]).split("\n")):
+        if '"token_count"' not in line:
+            continue
+        try:
+            p = json.loads(line.strip()).get("payload") or {}
+        except Exception:
+            continue
+        info = p.get("info")
+        if p.get("type") != "token_count" or not isinstance(info, dict):
+            continue        # bei erschoepftem Kontingent steht hier info: null
+        used = (info.get("last_token_usage") or {}).get("total_tokens")
+        window = info.get("model_context_window")
+        if used and window:
+            break
+        used = None
+    sag(used, window)
+
+if fmt == "aider-chat-history":
+    f = os.path.join(cwd, path)
+    try:
+        if now - os.path.getmtime(f) > max_age:
+            sys.exit(0)
+        chunk = tail(f)
+    except Exception:
+        sys.exit(0)
+    i = chunk.rfind("\n# aider chat started at ")
+    if i >= 0:
+        chunk = chunk[i:]      # nur die laufende Sitzung
+    hits = re.findall(r"Tokens: *([0-9.]+) *([kKmM]?) *sent", chunk)
+    if not hits:
+        sys.exit(0)            # noch kein Zug abgeschlossen: keine Zahl, keine Erfindung
+    n, u = hits[-1]
+    used = int(float(n) * {"k": 1000, "m": 1000000}.get(u.lower(), 1))
+    sag(used, win)
+
+if fmt == "crush-sqlite":
+    import sqlite3
+    f = os.path.join(cwd, path)
+    try:
+        if now - os.path.getmtime(f) > max_age:
+            sys.exit(0)
+    except Exception:
+        sys.exit(0)
+    # file:...?mode=ro — der Guard fasst eine fremde, LAUFENDE Datenbank an. Nur lesen
+    # zu wollen genuegt nicht: eine normal geoeffnete SQLite-Verbindung legt bei Bedarf
+    # Journal- und WAL-Dateien an und kann sperren. mode=ro verbietet das, immutable=1
+    # waere dagegen falsch — die Datei aendert sich waehrend wir lesen, das ist ja der
+    # Sinn. Ein Fehlschlag (gesperrt, halb geschrieben, kaputt) liefert NICHTS, statt
+    # den Pane mit einer Zahl aus einem inkonsistenten Zustand zu versorgen.
+    con = None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % f, uri=True, timeout=1.0)
+        row = con.execute(
+            "select prompt_tokens + completion_tokens from sessions "
+            "order by updated_at desc limit 1").fetchone()
+    except Exception:
+        sys.exit(0)
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+    # Vor dem ersten abgeschlossenen Zug steht dort 0. Das ist keine Messung, sondern
+    # "noch nichts passiert" — und sag() verwirft die 0 ohnehin, weil eine 0 hier von
+    # einem Lesefehler nicht zu unterscheiden waere.
+    if not row or not row[0]:
+        sys.exit(0)
+    sag(int(row[0]), win)
+
+if fmt == "gptme-jsonl":
+    real = os.path.realpath(cwd)
+    cands = []
+    for f in glob.glob(path):
+        try:
+            # Erst das Alter, DANN erst der Symlink: der Ordner waechst mit jeder
+            # Unterhaltung, die je gelaufen ist, und der Guard fragt bei jedem Poll.
+            # Dieselbe Vorauswahl wie bei codex-rollout, aus demselben Grund.
+            if now - os.path.getmtime(f) > max_age:
+                continue
+            ws = os.path.join(os.path.dirname(f), "workspace")
+            if os.path.realpath(ws) != real:
+                continue
+            cands.append((os.path.getmtime(f), f))
+        except Exception:
+            continue
+    if not cands:
+        sys.exit(0)
+    cands.sort(reverse=True)
+    # ZWEI lebende Unterhaltungen im selben Verzeichnis: welche zu diesem Pane gehoert,
+    # ist von aussen nicht zu entscheiden. Dann lieber blind melden — dieselbe Regel wie
+    # bei codex-rollout. Im Normalbetrieb tritt der Fall nicht ein, weil jeder Worker
+    # seinen eigenen Arbeitsbaum bekommt.
+    if len(cands) > 1 and now - cands[1][0] < 300:
+        sys.exit(0)
+    used = None
+    for line in reversed(tail(cands[0][1]).split("\n")):
+        line = line.strip()
+        if '"usage"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue        # halbe Zeile am Anfang des Ausschnitts, oder gerade geschrieben
+        if d.get("role") != "assistant":
+            continue
+        u = (d.get("metadata") or {}).get("usage") or {}
+        i, o = u.get("input_tokens"), u.get("output_tokens")
+        if isinstance(i, int) and i > 0:
+            # input + output: was beim naechsten Zug wieder hineingeht. Dieselbe Summe,
+            # die crush in seiner Seitenleiste anzeigt (prompt + completion).
+            used = i + (o if isinstance(o, int) else 0)
+            break
+    # Vor dem ersten abgeschlossenen Zug steht keine Nutzung in der Datei. Das ist
+    # "noch nichts passiert" und keine Null — sag() verwirft eine 0 ohnehin.
+    sag(used, win)
+
+if fmt == "copilot-sqlite":
+    import sqlite3
+    try:
+        if now - os.path.getmtime(path) > max_age:
+            sys.exit(0)
+    except Exception:
+        sys.exit(0)
+    # Beide Schreibweisen werden gefragt: die Copilot CLI traegt den AUFGELOESTEN Pfad ein
+    # (/private/var/... dort, wo der Pane /var/... heisst), aber ein Verzeichnis ohne
+    # Symlink darin sieht in beiden Formen gleich aus, und die Abfrage soll nicht davon
+    # abhaengen, ob zufaellig einer im Spiel ist.
+    wege = [cwd]
+    real = os.path.realpath(cwd)
+    if real != cwd:
+        wege.append(real)
+    con = None
+    try:
+        # mode=ro aus demselben Grund wie bei crush: die Datei gehoert einem laufenden
+        # Prozess, und eine gewoehnliche Verbindung legt bei Bedarf Journal- und
+        # WAL-Dateien an. Ein Fehlschlag liefert NICHTS statt einer Zahl aus einem
+        # inkonsistenten Zustand.
+        con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=1.0)
+        frage = ",".join("?" for _ in wege)
+        # ZWEI lebende Sitzungen im selben Verzeichnis: welche zu diesem Pane gehoert, ist
+        # von aussen nicht zu entscheiden — dieselbe Regel wie bei codex-rollout.
+        sitzungen = con.execute(
+            "select id, updated_at from sessions where cwd in (%s) "
+            "order by updated_at desc limit 2" % frage, wege).fetchall()
+        if not sitzungen:
+            sys.exit(0)
+        if len(sitzungen) > 1:
+            # Beide heute noch angefasst? Dann lieber blind melden.
+            heute = [s for s in sitzungen if (s[1] or "")[:10] == (sitzungen[0][1] or "")[:10]]
+            if len(heute) > 1:
+                sys.exit(0)
+        row = con.execute(
+            "select input_tokens, output_tokens from assistant_usage_events "
+            "where session_id = ? order by id desc limit 1", (sitzungen[0][0],)).fetchone()
+    except Exception:
+        sys.exit(0)
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+    if not row or not row[0]:
+        sys.exit(0)      # vor dem ersten abgeschlossenen Zug steht hier nichts
+    sag(int(row[0]) + int(row[1] or 0), win)
+
+if fmt == "openhands-state":
+    real = os.path.realpath(cwd)
+    cands = []
+    for f in glob.glob(path):
+        try:
+            # Erst das Alter, DANN erst oeffnen — dieselbe Vorauswahl wie bei
+            # codex-rollout, hier aber noch wichtiger: base_state.json traegt den
+            # Systemprompt und alle geladenen Skills mit und war in der Messung
+            # 388 kB gross. Ein Tail hilft nicht, die Zahlen stehen in EINEM
+            # JSON-Objekt; gelesen wird deshalb nur, was frisch genug ist.
+            if now - os.path.getmtime(f) > max_age:
+                continue
+            with open(f, "rb") as fh:
+                d = json.loads(fh.read().decode("utf-8", "replace"))
+        except Exception:
+            continue        # halb geschrieben, kaputt, oder gerade ersetzt
+        c = (d.get("workspace") or {}).get("working_dir") or ""
+        try:
+            if not c or os.path.realpath(c) != real:
+                continue
+        except Exception:
+            continue
+        cands.append((os.path.getmtime(f), f, d))
+    if not cands:
+        sys.exit(0)
+    cands.sort(key=lambda t: t[0], reverse=True)
+    # ZWEI lebende Unterhaltungen im selben Verzeichnis: dieselbe Regel wie ueberall
+    # hier — lieber blind als die Zahl eines fremden Panes.
+    if len(cands) > 1 and now - cands[1][0] < 300:
+        sys.exit(0)
+    m = ((cands[0][2].get("stats") or {}).get("usage_to_metrics") or {}).get("agent") or {}
+    used = None
+    for e in reversed(m.get("token_usages") or []):
+        i, o = e.get("prompt_tokens"), e.get("completion_tokens")
+        if isinstance(i, int) and i > 0:
+            # prompt + completion wie bei crush, gptme und copilot: was beim naechsten
+            # Zug wieder hineingeht. Die Fusszeile von OpenHands zeigt nur den ersten
+            # der beiden Summanden (gemessen: 'ctx 11.88K' zu prompt_tokens 11878).
+            used = i + (o if isinstance(o, int) else 0)
+            break
+    # accumulated_token_usage daneben ist die SUMME ueber alle Zuege und waere hier
+    # falsch: nach drei Zuegen stuende dort das Dreifache des Kontextstands.
+    sag(used, win)
+
+if fmt == "cline-sessions":
+    real = os.path.realpath(cwd)
+    cands = []
+    for f in glob.glob(path):
+        # Der Glob trifft beide Dateien des Ordners; die Nachrichten kommen gleich
+        # ueber ihre Sitzung, nicht ueber sich selbst.
+        if f.endswith(".messages.json"):
+            continue
+        try:
+            if now - os.path.getmtime(f) > max_age:
+                continue
+            with open(f, "rb") as fh:
+                d = json.loads(fh.read().decode("utf-8", "replace"))
+        except Exception:
+            continue
+        c = d.get("cwd") or ""
+        try:
+            if not c or os.path.realpath(c) != real:
+                continue
+        except Exception:
+            continue
+        cands.append((os.path.getmtime(f), f))
+    if not cands:
+        sys.exit(0)
+    cands.sort(reverse=True)
+    if len(cands) > 1 and now - cands[1][0] < 300:
+        sys.exit(0)
+    # Die Nachrichtendatei heisst wie die Sitzungsdatei mit '.messages' davor. Der
+    # Weg ueber den Namen und nicht ueber das Feld messages_path aus der Datei ist
+    # Absicht: einen Pfad, den eine fremde Datei nennt, oeffnet der Guard nicht.
+    # Heisst sie einmal anders, findet er nichts — das ist die sichere Richtung.
+    mp = cands[0][1][:-len(".json")] + ".messages.json"
+    try:
+        with open(mp, "rb") as fh:
+            msgs = json.loads(fh.read().decode("utf-8", "replace")).get("messages") or []
+    except Exception:
+        sys.exit(0)
+    used = None
+    for e in reversed(msgs):
+        me = e.get("metrics") or {}
+        i, o = me.get("inputTokens"), me.get("outputTokens")
+        if isinstance(i, int) and i > 0:
+            # in + out wie bei crush, gptme und copilot. Die Fusszeile der CLI zeigt
+            # nur den ersten (gemessen: '(3,673)' zu inputTokens 3673).
+            used = i + (o if isinstance(o, int) else 0)
+            break
+    sag(used, win)

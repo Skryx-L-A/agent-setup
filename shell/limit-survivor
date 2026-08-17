@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""limit-survivor — überlebt das Rate-Limit für Claude-Panes in wb-*-tmux-Sessions.
+
+Läuft alle paar Minuten (Cron auf peer, launchd auf dem Mac). Für jeden Claude-Pane:
+erkennt die Rate-Limit-Meldung, liest die darin genannte RESET-ZEIT, und schickt den
+Resume-Prompt **erst nachdem diese Zeit vorbei ist** — pro Reset-Fenster genau einmal.
+
+Warum das so streng ist (Vorfall 2026-07-25): die erste Fassung feuerte alle 20 Minuten
+blind, solange irgendwo im Pane-Text "limit" stand. Ergebnis: vier "weiter"-Nachrichten in
+eine Session, deren Limit noch gar nicht zurückgesetzt war, plus Tastatureingaben in einen
+ssh-Pane, der die Worker der anderen Maschine nur ANZEIGTE. Vier Ursachen, hier alle vier
+geschlossen:
+
+  1. Keine Reset-Zeit-Auswertung  -> wird jetzt geparst; vor dem Reset passiert NICHTS.
+  2. Treffer im Scrollback        -> die Meldung zählt nur, wenn danach keine neue
+                                     Assistenten-Ausgabe steht (sonst lief die Session
+                                     längst weiter und die Meldung ist Historie).
+  3. Falsche Panes                -> Panes, deren Kommando ssh/bash/zsh/sh/tmux ist, sind
+                                     Anzeige-Panes, keine Claude-Sessions. Übersprungen.
+  4. Feuern mitten im Zug         -> nur wenn der Pane idle ist (kein "esc to interrupt").
+
+Ein Reset-Fenster wird über ein Statefile je Pane genau einmal bedient.
+"""
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+STATE_DIR = Path.home() / ".local/state/limit-survivor"
+LOG = STATE_DIR / "log"
+RESUME = ("weiter — setze deine aktuelle Aufgabe fort "
+          "(automatischer Resume nach Rate-Limit durch limit-survivor)")
+
+DISPLAY_ONLY = {"ssh", "bash", "zsh", "sh", "tmux", "mosh", "et", "fish"}
+
+# "You've hit your session limit · resets 6:50pm (Europe/Madrid)"
+LIMIT_RE = re.compile(
+    r"(?:hit your (?:session|usage) limit|usage limit reached|limit reached)"
+    r".*?resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?"
+    r"(?:\s*\(([^)]+)\))?",
+    re.IGNORECASE,
+)
+# "esc to interrupt", der laufende Spinner ("Meandering… (3m 53s)") und der Hinweis, der nur
+# waehrend eines laufenden Zuges eingeblendet wird. Gemessen 2026-07-25: allein auf
+# "esc to interrupt" zu pruefen reicht NICHT — arbeitende Panes zeigen es nicht immer.
+BUSY_RE = re.compile(r"esc to interrupt|…\s*\(\d+[hms]|Tip: Use /btw", re.IGNORECASE)
+ASSISTANT_RE = re.compile(r"^\s*[⏺●]")   # ⏺ bzw. ●
+
+
+def tmux(*args: str) -> str:
+    exe = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
+    try:
+        return subprocess.run([exe, *args], capture_output=True, text=True,
+                              timeout=20).stdout
+    except Exception:
+        return ""
+
+
+def log(msg: str) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a", encoding="utf-8") as fh:
+        fh.write(f"{datetime.now().strftime('%F %T')} {msg}\n")
+
+
+def parse_reset(hh, mm, ampm, tzname, now):
+    """Reset-Zeitpunkt aus der Meldung. None, wenn nicht eindeutig lesbar."""
+    try:
+        tz = ZoneInfo(tzname) if tzname else now.tzinfo
+    except Exception:
+        tz = now.tzinfo
+    hour, minute = int(hh), int(mm) if mm else 0
+    if ampm:
+        low = ampm.lower()
+        if low == "pm" and hour != 12:
+            hour += 12
+        elif low == "am" and hour == 12:
+            hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    local_now = now.astimezone(tz)
+    reset = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    # >12 h in der Zukunft = gestern gemeint; >12 h in der Vergangenheit = morgen gemeint.
+    if reset - local_now > timedelta(hours=12):
+        reset -= timedelta(days=1)
+    elif local_now - reset > timedelta(hours=12):
+        reset += timedelta(days=1)
+    return reset.astimezone(now.tzinfo)
+
+
+def claude_panes():
+    out = tmux("list-panes", "-a", "-F",
+               "#{session_name}\t#{pane_id}\t#{pane_current_command}")
+    panes: list[str] = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        session, pane, cmd = parts
+        if not session.startswith("wb-"):
+            continue
+        if cmd.strip().lower() in DISPLAY_ONLY:
+            continue
+        # Gruppierte -view-Sessions zeigen denselben Pane; jede pane_id nur einmal.
+        if pane not in panes:
+            panes.append(pane)
+    return panes
+
+
+def main() -> int:
+    now = datetime.now().astimezone()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    dry = "--dry-run" in sys.argv
+
+    for pane in claude_panes():
+        text = tmux("capture-pane", "-p", "-t", pane, "-S", "-60")
+        if not text:
+            continue
+        lines = text.splitlines()
+
+        hit = None
+        for idx, line in enumerate(lines):
+            m = LIMIT_RE.search(line)
+            if m:
+                hit = (idx, m, line)
+        if hit is None:
+            continue
+        idx, m, line = hit
+
+        if any(ASSISTANT_RE.match(l) for l in lines[idx + 1:]):
+            if dry:
+                print(f"{pane}: Meldung ist Scrollback (Ausgabe danach) — kein Resume")
+            continue
+
+        if BUSY_RE.search(text):
+            if dry:
+                print(f"{pane}: Pane arbeitet gerade — kein Resume")
+            continue
+
+        reset = parse_reset(m.group(1), m.group(2), m.group(3), m.group(4), now)
+        if reset is None:
+            log(f"{pane}: Reset-Zeit nicht lesbar aus {line.strip()!r} — kein Resume")
+            continue
+
+        if now < reset:
+            wait = int((reset - now).total_seconds() // 60)
+            msg = f"{pane}: Limit aktiv, Reset {reset:%H:%M} — warte noch {wait} min"
+            log(msg)
+            if dry:
+                print(msg)
+            continue
+
+        stamp = STATE_DIR / f"{pane.replace('%', 'p')}.done"
+        key = reset.isoformat()
+        if stamp.exists() and stamp.read_text(encoding="utf-8").strip() == key:
+            if dry:
+                print(f"{pane}: Reset-Fenster {reset:%H:%M} schon bedient")
+            continue
+
+        if dry:
+            print(f"{pane}: WUERDE Resume senden (Reset war {reset:%F %H:%M})")
+            continue
+
+        tmux("send-keys", "-t", pane, RESUME)
+        time.sleep(1)
+        tmux("send-keys", "-t", pane, "Enter")
+        stamp.write_text(key, encoding="utf-8")
+        log(f"{pane}: Resume gesendet (Reset war {reset:%F %H:%M})")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

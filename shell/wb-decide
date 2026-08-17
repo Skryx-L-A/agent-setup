@@ -1,0 +1,114 @@
+#!/bin/bash
+# wb-decide — the ORCHESTRATOR decides a worker's request for a sub-worker.
+#
+#   wb-decide <antrags-datei> approve|reject <ein-satz-begruendung>
+#
+# Writes <antrag>.decision, updates the decision column of
+# ~/.pi-workers/requests/log.tsv and, on approve, prints the ready-to-run spawn
+# command. It NEVER spawns anything itself: deciding and executing both stay with
+# the orchestrator, so an approval is always a deliberate second step.
+set -u
+
+REQ="${1:?Antrags-Datei}"; ACTION="${2:?approve|reject}"; shift 2
+REASON="$*"
+LOG="$HOME/.pi-workers/requests/log.tsv"
+
+[ -f "$REQ" ] || { echo "wb-decide: Antrag nicht gefunden: $REQ" >&2; exit 2; }
+case "$ACTION" in approve|reject) ;; *) echo "wb-decide: '$ACTION' ist weder approve noch reject." >&2; exit 2 ;; esac
+[ -n "$REASON" ] || { echo "wb-decide: Begruendung fehlt (ein Satz genuegt, sie steht spaeter in der Auswertung)." >&2; exit 2; }
+if [ -e "$REQ.decision" ]; then
+  echo "wb-decide: bereits entschieden — $REQ.decision:" >&2
+  cat "$REQ.decision" >&2
+  exit 2
+fi
+
+# Erst LESEN, dann entscheiden. Der Antrag wird vollstaendig ausgewertet, bevor
+# irgendetwas geschrieben wird — sonst steht die Entscheidung fest und der Rest des
+# Werkzeugs stirbt daran (Befund 2026-08-15, nachgestellt mit kaputtem JSON: ".decision:
+# approved" lag auf der Platte, waehrend das Skript an einer nicht gesetzten Variablen
+# abbrach; die Logzeile blieb 'pending', und den Spawn-Befehl bekam nie jemand zu sehen).
+FELDER="$(/usr/bin/python3 - "$REQ" <<'PY'
+import json, shlex, sys
+try:
+    r = json.load(open(sys.argv[1]))
+    if not isinstance(r, dict):
+        raise ValueError("kein JSON-Objekt")
+except Exception as e:
+    sys.stderr.write("%s\n" % e)
+    sys.exit(1)
+for k in ("ts", "parent", "child_name", "child_model", "child_effort", "dir", "task"):
+    print("R_%s=%s" % (k.upper(), shlex.quote(str(r.get(k) or ""))))
+print("R_FILES=%s" % shlex.quote(", ".join(r.get("files") or [])))
+PY
+)" || { echo "wb-decide: Antrag '$REQ' laesst sich nicht lesen — nichts entschieden, nichts geschrieben." >&2; exit 2; }
+eval "$FELDER"
+for feld in R_TS R_PARENT R_CHILD_NAME; do
+  eval "wert=\"\${$feld:-}\""
+  [ -n "$wert" ] || { echo "wb-decide: Antrag '$REQ' ist unvollstaendig ($feld fehlt) — nichts entschieden, nichts geschrieben." >&2; exit 2; }
+done
+
+# Past tense, identical to the log column — wb-request greps '^decision: approved'
+# to find children that are still running.
+[ "$ACTION" = approve ] && DECIDED=approved || DECIDED=rejected
+{
+  echo "decision: $DECIDED"
+  echo "at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "reason: $REASON"
+} > "$REQ.decision"
+
+# decision column (7) of the matching row — matched on ts + parent, which is unique.
+if [ -f "$LOG" ]; then
+  /usr/bin/python3 - "$LOG" "$R_TS" "$R_PARENT" "$ACTION" <<'PY'
+import os, sys, tempfile, fcntl
+log, ts, parent, action = sys.argv[1:5]
+lock = open(log + ".lock", "w")
+fcntl.flock(lock, fcntl.LOCK_EX)
+try:
+    rows = [l.rstrip("\n").split("\t") for l in open(log) if l.strip()]
+    hit = 0
+    for r in rows:
+        while len(r) < 10:
+            r.append("")
+        if r[0] == ts and r[1] == parent:
+            r[6] = "approved" if action == "approve" else "rejected"
+            hit += 1
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(log))
+    with os.fdopen(fd, "w") as fh:
+        for r in rows:
+            fh.write("\t".join(r) + "\n")
+    # mkstemp() erzeugt IMMER 0600, unabhaengig vom umask -- ohne dies wird log.tsv bei
+    # JEDER Entscheidung ein Stueck enger, bis nur noch der Eigentuemer lesen kann, obwohl
+    # nichts das je beabsichtigt hat (2026-08-16, bugjagd shell/niedrig, reproduziert: 644
+    # vor dem Aufruf, 600 danach). Der bestehende Modus der Datei bleibt einfach erhalten.
+    try:
+        os.chmod(tmp, os.stat(log).st_mode & 0o777)
+    except OSError:
+        pass
+    os.replace(tmp, log)
+    if hit == 0:
+        sys.stderr.write("wb-decide: WARNUNG — keine passende Zeile in log.tsv (ts=%s parent=%s).\n" % (ts, parent))
+finally:
+    fcntl.flock(lock, fcntl.LOCK_UN)
+PY
+fi
+
+if [ "$ACTION" = reject ]; then
+  echo "Abgelehnt: $REQ"
+  echo "Begruendung: $REASON"
+  exit 0
+fi
+
+MODELARG="$R_CHILD_MODEL"
+[ -n "$R_CHILD_EFFORT" ] && MODELARG="$R_CHILD_MODEL:$R_CHILD_EFFORT"
+case "$R_CHILD_MODEL" in
+  claude*|opus*|sonnet*|haiku*|fable*) TOOL="claude-worker" ;;
+  *) TOOL="pi-worker" ;;
+esac
+
+echo "Genehmigt: $REQ"
+echo "Begruendung: $REASON"
+[ -n "$R_FILES" ] && echo "Dateien laut Antrag: $R_FILES"
+echo
+echo "Starten (der Orchestrator fuehrt das aus, nichts passiert automatisch):"
+printf '%s %s %s %s %s\n' "$TOOL" "$(printf %q "$R_CHILD_NAME")" "$(printf %q "$MODELARG")" \
+  "$(printf %q "$R_DIR")" "$(printf %q "$R_TASK")"

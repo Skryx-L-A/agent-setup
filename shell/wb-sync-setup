@@ -1,0 +1,315 @@
+#!/bin/bash
+# wb-sync-setup — gleicht das Claude-Setup zwischen Mac und peer ab.
+#
+# Anlass (2026-08-03): Ein Audit auf peer fand, dass die Maschine beim Setup weit
+# zurueckhing — `~/.claude/regeln/` gab es dort gar nicht, drei neue Werkzeuge fehlten,
+# `context-guard` war die Fassung vom 25.07., zwei Hooks fehlten. Der Vault wird per git
+# und Syncthing abgeglichen, das Setup dagegen von Hand, also gar nicht. Das hier macht
+# den Abgleich wiederholbar statt einmalig.
+#
+#   wb-sync-setup            zeigt, was auseinanderlaeuft (aendert NICHTS)
+#   wb-sync-setup --apply    kopiert die Unterschiede zur anderen Maschine
+#   wb-sync-setup --to peer  Ziel erzwingen (Default: die jeweils ANDERE Maschine)
+#
+# WAS NICHT SYNCHRONISIERT WIRD, und warum:
+#   - `~/.claude/settings.json`: enthaelt maschinenabhaengige Pfade und Hook-Listen.
+#     Der Abgleich zeigt Unterschiede an, kopiert die Datei aber nie — ein blind
+#     ueberschriebenes settings.json kann die Zielmaschine handlungsunfaehig machen.
+#   - `CLAUDE.md`: traegt oben die Maschinenbeschreibung ("Machine: MacBook Pro ..." bzw.
+#     "Machine: Peer-Rechner ..."). Wird nur GEMELDET, nie kopiert.
+#   - `IDENTITY.md`, alles unter `90-secrets/`: per Definition maschinenlokal.
+set -uo pipefail
+
+case "$(uname -s)" in Darwin) SELF=mac; OTHER=peer ;; *) SELF=peer; OTHER=mac ;; esac
+APPLY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --to) OTHER="${2:?Ziel}"; shift ;;
+    *) echo "unbekannt: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+[ "$OTHER" = "$SELF" ] && { echo "Ziel ist diese Maschine selbst." >&2; exit 1; }
+
+# Was abgeglichen wird: Werkzeuge, Hooks, Regeldateien, Rollen.
+FILES=(
+  ".local/bin/wb-consistency" ".local/bin/wb-consistency.config.json"
+  ".local/bin/wb-hygiene" ".local/bin/wb-dod" ".local/bin/brain-maintain"
+  ".local/bin/context-guard" ".local/bin/pi-worker" ".local/bin/claude-worker"
+  ".local/bin/wb-instructions" ".local/bin/claude-md-lint" ".local/bin/status-freshness"
+  # 2026-08-10: wb-kontingent MUSS mit. Fehlt es auf einer Maschine, laeuft der Spawn dort
+  # stillschweigend OHNE Kontingent-Pruefung weiter -- also genau der Fehler, gegen den es
+  # gebaut wurde, nur unsichtbar.
+  ".local/bin/wb-kontingent"
+  # 2026-08-10: wb-messung lag bis heute in keinem Repo -- auf peer fehlte es, waehrend
+  # regeln/messungen.md es dort als Werkzeug nannte. Jetzt versioniert und ausgerollt.
+  ".local/bin/wb-messung"
+  # 2026-08-03 dazugekommen: bis dahin standen diese zehn auf keiner Liste und liefen
+  # auf peer entweder gar nicht oder in einer Fassung vom 25.07. — bei `wb-state` waren
+  # das 543 gegen 2.496 Zeilen. Alle zehn sind maschinen-unabhaengig; wo eine Maschine
+  # gemeint ist, entscheidet der Code das selbst (`wb-state` liest `platform.system()`,
+  # die Registry liegt ohnehin je Maschine unter ~/.claude/workbench/models.json).
+  ".local/bin/wb-state" ".local/bin/wb-code" ".local/bin/wb-grid" ".local/bin/wb-revive"
+  ".local/bin/wb-workers-window" ".local/bin/wb-session-close" ".local/bin/wb-session-sweep"
+  ".local/bin/wb-sessions" ".local/bin/wb-harness-probe" ".local/bin/wb-harness-run"
+  ".local/bin/wb-budget" ".local/bin/wb-sync-setup"
+  # 2026-08-04 dazugekommen: Nacht-Session baute elf neue Werkzeuge, keins davon auf
+  # der Liste. Alle elf sind maschinen-unabhaengig (tmux/ssh/Python, kein OS-Zweig noetig
+  # ausser dem, den sie schon selbst per $HOME/uname behandeln).
+  ".local/bin/wb-agent" ".local/bin/wb-autorevive" ".local/bin/wb-close"
+  ".local/bin/wb-decide" ".local/bin/wb-doctor" ".local/bin/wb-pi"
+  ".local/bin/wb-request" ".local/bin/wb-result" ".local/bin/wb-session-delete"
+  ".local/bin/wb-ssh-worker" ".local/bin/wb-worker-tab"
+  # 2026-08-04, zweiter Nachtrag: zwei weitere standen weder auf dieser Liste noch in der
+  # NICHT-hier-Begruendung darunter — gefunden, weil wb-consistency auf peer erstmals lief
+  # und sie als tote Verweise meldete. wb-session-orphan ist der Teil der Kette, den der
+  # Wachprozess nach einem geschlossenen Fenster aufruft; ohne ihn kann "Fenster zu =
+  # Session zu" auf peer gar nicht greifen. wb-window schickt die vscode://-URI und ist
+  # nicht macOS-eigen (peer faehrt dasselbe VS Code mit derselben Extension).
+  ".local/bin/wb-session-orphan" ".local/bin/wb-window"
+  # 2026-08-04, dritter Nachtrag: die Worktree-Isolierung je Worker. Maschinen-
+  # unabhaengig (git plus $HOME), und sie MUSS drueben stehen — claude-worker und
+  # pi-worker rufen sie auf beiden Maschinen auf; fehlt sie auf peer, arbeiten die
+  # Worker dort stillschweigend weiter im gemeinsamen Baum.
+  ".local/bin/wb-worktree"
+  # 2026-08-13: die Sichtbarkeit ueber die Maschinengrenze. Sie MUSS auf BEIDEN
+  # Maschinen liegen — der Weg ist symmetrisch: wer einen Worker startet, sagt der
+  # anderen Maschine Bescheid (`--announce`), und wer die Ansage bekommt, baut den
+  # Spiegel. Fehlt das Werkzeug drueben, bleibt genau die Richtung stumm, wegen der
+  # es gebaut wurde: ein auf peer gestarteter Worker im Mac-Worker-Tab.
+  ".local/bin/wb-remote-view"
+  # 2026-08-07: die beiden Werkzeuge, die die Haertung von Rollenquelle und Freigaben
+  # traegt. Maschinen-unabhaengig (tmux, ps, python3). Sie MUESSEN drueben stehen:
+  # pi-worker ruft wb-rolle beim Spawn, und ohne wb-freigabe gibt es auf der anderen
+  # Maschine keinen Weg mehr, eine angehaltene Rueckfrage freizugeben.
+  ".local/bin/wb-rolle" ".local/bin/wb-freigabe"
+  # 2026-08-11, aus der Nacht mit zwei Kernel-Paniken: die vier Werkzeuge gegen
+  # verwaiste Hintergrundprozesse und gegen das Zusammentreffen zweier grosser
+  # GPU-Nutzer. Maschinen-unabhaengig geschrieben (ps, lsof/launchctl bzw. deren
+  # Ausfall wird gemeldet statt geraten). Sie MUESSEN drueben stehen: peer laedt
+  # dieselben Modelle, und ein Belegungsbuch, das nur eine Maschine kennt, ist
+  # kein Belegungsbuch. `wb-waisen` sagt auf einem Nicht-macOS-System ausdruecklich,
+  # dass es nicht geprueft hat, statt "nichts gefunden" zu behaupten.
+  ".local/bin/wb-nohup" ".local/bin/wb-waisen"
+  ".local/bin/wb-belegung" ".local/bin/wb-post"
+  # 2026-08-08: der Ausroller fuer Harness-Konfigurationsdateien und die beiden
+  # Vorlagen, die er ausrollt. Die Vorlagen sind DATEN und trotzdem hier richtig —
+  # sie liegen im Repo unter shell/ und gehoeren damit nach ~/.local/bin wie jede
+  # andere Datei dieses Verzeichnisses (so sucht wb-harness-config sie auch).
+  # Genau dieser Eintrag ist der Grund, warum es die Sache gibt: crushrc.default und
+  # kimi-config.default.toml standen bis heute auf keiner Liste, und auf peer lagen
+  # ihre Ziele nur deshalb richtig, weil der Nutzer sie von Hand nachgezogen hat.
+  # Kopiert wird die VORLAGE, nicht das Ziel unter ~/.config bzw. ~/.kimi: was dort
+  # liegt, kann der Nutzer angepasst haben, und das entscheidet drueben
+  # `wb-harness-config apply` — es sichert vorher und laesst Angepasstes stehen.
+  ".local/bin/wb-harness-config"
+  ".local/bin/crushrc.default" ".local/bin/kimi-config.default.toml"
+  # NICHT hier: wb-shot (macOS `screencapture` plus Swift-Helfer, im Skript selbst als
+  # MAC-ONLY vermerkt), <ein eigenes Mailwerkzeug> (macOS-spezifischer Versandweg),
+  # <ein eigenes Mailwerkzeug> (einmaliger launchd-Job dieser Maschine, 2026-08-08),
+  # wb-shot-remote (ruft von HIER aus peer — auf peer selbst sinnlos) und peer-connect
+  # (ruft von HIER aus peer, `ssh peer`/`mosh peer` fest verdrahtet — auf peer gestartet
+  # waere das ein Selbstaufruf). peer-shot steht bewusst auf KEINER Seite dieser Liste:
+  # es lebt nur in ~/AI/claude-workbench/shell/, nicht in ~/.local/bin, Shebang fest auf
+  # `$HOME/.local/bin/peer-shot-py3` und KWin/Wayland-DBus — kann auf dem Mac
+  # nicht laufen. Dieses Werkzeug kennt aber nur EINE Richtung (SELF -> OTHER, je nachdem
+  # von wo es gestartet wird) und keine "nur dorthin"-Markierung — von peer aus gestartet
+  # wuerde ein Eintrag hier peer-shot blind auf den Mac schieben. Deshalb bleibt es
+  # unlisted statt falsch eingetragen; ein Zwei-Richtungs-Sync bräuchte ein eigenes Feld.
+  ".claude/hooks/bash-guard-screencapture.sh" ".claude/hooks/bash-guard-snapshot.sh"
+  ".claude/hooks/bash-guard-commit-trailer.sh" ".claude/hooks/media-cloud-guard.sh"
+  ".claude/hooks/bash-guard-secrets.sh" ".claude/hooks/bash-guard-kill-pattern.sh"
+  ".claude/hooks/bash-guard-live-config.sh" ".claude/hooks/push-gate-worker.sh"
+  ".claude/hooks/media-cloud-domains.txt" ".claude/hooks/snapshot-guard-exempt.conf"
+  # 2026-08-04: in settings.json (PreToolUse/SessionStart/SessionEnd/PreCompact/
+  # ConfigChange) verdrahtet, standen aber nicht auf der Liste — auf peer liefen diese
+  # Hooks damit entweder gar nicht oder gegen eine veraltete Fassung.
+  ".claude/hooks/bash-guard.py" ".claude/hooks/configchange-guard.sh"
+  ".claude/hooks/sessionend-orphan-check.sh" ".claude/hooks/sessionstart-baseline.sh"
+  ".claude/hooks/precompact-handoff-gate.sh"
+  # 2026-08-04: der Hook, der einen roten Testlauf beim Sessionstart meldet, stand hier
+  # nicht — gefunden, weil test-testsuite-status-hook.sh auf peer rot war, wo es die Datei
+  # gar nicht gab. Der Eintrag in settings.json bleibt Handarbeit: die Datei ist geteilt,
+  # settings.json ist maschinenabhaengig und wird von diesem Werkzeug nur gemeldet.
+  ".claude/hooks/sessionstart-testsuite-status.sh"
+  # 2026-08-04, dritter Nachtrag: derselbe Fehler waere hier fast noch einmal passiert --
+  # der Hook, der einen roten oder ueberfaelligen wb-hygiene-Lauf beim Sessionstart
+  # meldet, kam zusammen mit wb-hygienes eigener Statusdatei-Erweiterung dazu. Gleich
+  # eingetragen statt wie beim Testsuite-Hook erst nachtraeglich gefunden.
+  ".claude/hooks/sessionstart-hygiene-status.sh"
+  # 2026-08-11, vierter Nachtrag zu genau demselben Fehler: der Hook, der die
+  # LEBENDE Unterhaltungs-Kennung in die Zustandsdatei schreibt (jedes /clear
+  # beginnt eine neue, und ohne ihn setzt eine Wiederherstellung die
+  # monatealte fort). Gleich hier eingetragen statt spaeter gesucht. Er
+  # braucht `wb-state` mit dem Unterbefehl `by-tmux` -- das ist dieselbe
+  # Liste weiter oben, also kommen beide zusammen; ein Ausrollen, das nur den
+  # Hook nimmt, laesst ihn still ins Leere laufen. Der Eintrag in
+  # settings.json bleibt wie bei den drei Geschwistern Handarbeit.
+  ".claude/hooks/sessionstart-claude-session.sh"
+  # Und die Testsuiten der Hooks selbst: run-all.sh zieht ~/.claude/hooks/tests/test-*.sh
+  # mit, wenn der Ordner da ist. Auf peer war er leer, deshalb lief dort ein Testlauf mit
+  # 33 statt 37 Suiten — vier Prueflinge weniger, ohne dass die Tabelle es sagte. Gerade
+  # die Guard-Paritaet gehoert auf BEIDE Maschinen, denn sie prueft, dass die Hooks
+  # ueberall gleich urteilen.
+  ".claude/hooks/tests/test-guard-parity.sh" ".claude/hooks/tests/test-guard-parity2.sh"
+  ".claude/hooks/tests/test-hooks.sh" ".claude/hooks/tests/test-new-guards.sh"
+  # Die Python-Fassung des Medien-Guards. Nur die .sh-Fassung stand hier, obwohl
+  # test-guard-parity2.sh die beiden GEGENEINANDER prueft: auf peer fehlte die .py-Datei,
+  # und der Vergleich verglich elf von fuenfzehn Faellen gegen "Datei nicht gefunden".
+  ".claude/hooks/media-cloud-guard.py"
+)
+# .claude/skills bewusst NICHT dabei: auf peer liegen die project-kit-Skills einzeln
+# unter ~/.claude/skills/ (47 Stueck), auf dem Mac kommen dieselben als Plugin. Zwei
+# Installationsformen, kein Rueckstand - ein Sync wuerde hier Chaos stiften statt Ordnung.
+DIRS=( ".claude/regeln" ".claude/hooks/lib" )
+# Nur melden, nie kopieren.
+REPORT_ONLY=( ".claude/settings.json" ".claude/CLAUDE.md"
+              ".claude/roles/orchestrator.md" ".claude/roles/agent.md" )
+
+# NUR DORTHIN (2026-08-13): Dateien, die im REPO liegen und ausschliesslich auf EINE
+# Maschine gehoeren — auf dieser hier soll es sie gar nicht geben. Bis heute konnte
+# dieses Werkzeug so etwas nicht: es vergleicht ausschliesslich Pfade unterhalb von
+# `$HOME` und ueberspringt still, was lokal fehlt (`[ "$l" = MISSING ] && continue`).
+# `orch-launch` ist genau dieser Fall — es lag jahrelang NUR auf peer und in keinem
+# Repo; seit heute ist es unter `peer-port/orch-launch` versioniert, hat aber ohne diese
+# Liste keinen Weg zurueck auf die Maschine, fuer die es gemacht ist. Dasselbe Loch
+# benennt der Kommentar zu `peer-shot` schon laenger.
+#
+# Format je Eintrag: "<zielmaschine>|<pfad im repo>|<zielpfad relativ zu $HOME>".
+REMOTE_ONLY=( "peer|peer-port/orch-launch|.local/bin/orch-launch" )
+
+# Wo liegt das Repo? Die installierte Fassung dieses Skripts liegt in ~/.local/bin, das
+# Repo also nicht daneben. WB_REPO gewinnt (die Testsuite und ein Arbeitsbaum setzen es),
+# sonst der Ordner ueber diesem Skript, falls er wie das Repo aussieht, sonst der
+# Hauptbaum.
+if [ -z "${WB_REPO:-}" ]; then
+  _selfdir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+  if [ -d "$_selfdir/../shell" ] && [ -d "$_selfdir/../peer-port" ]; then
+    WB_REPO="$(cd "$_selfdir/.." && pwd)"
+  else
+    WB_REPO="$HOME/AI/claude-workbench"
+  fi
+fi
+
+hash_local()  { [ -f "$HOME/$1" ] && shasum -a 256 "$HOME/$1" 2>/dev/null | cut -d' ' -f1 || echo MISSING; }
+hash_remote() { ssh "$OTHER" "test -f \$HOME/$1 && sha256sum \$HOME/$1 2>/dev/null | cut -d' ' -f1 || echo MISSING" 2>/dev/null; }
+
+echo "Abgleich $SELF -> $OTHER"
+echo
+
+diffs=(); missing=()
+for f in "${FILES[@]}"; do
+  l=$(hash_local "$f"); r=$(hash_remote "$f")
+  [ "$l" = MISSING ] && continue          # was es hier nicht gibt, wird nicht verteilt
+  if [ "$r" = MISSING ]; then
+    echo "  FEHLT dort   $f"; missing+=("$f")
+  elif [ "$l" != "$r" ]; then
+    echo "  ABWEICHEND   $f"; diffs+=("$f")
+  fi
+done
+
+# Verzeichnisse werden ueber den INHALT verglichen, nicht ueber die Dateizahl:
+# eine geaenderte Datei aendert die Anzahl nicht. Gemessen am 2026-08-03 —
+# `regeln/worker-panes.md` lief zwischen den Maschinen um zwei Absaetze
+# auseinander, und dieses Werkzeug meldete "Nichts zu tun".
+# Beide Seiten liefern "<datei>  <hash>", je Zeile eine Datei, gleich sortiert.
+# Kein Shell-Loop ueber ssh: `ssh host 'skript' arg` haengt das Argument einfach
+# an die Kommandozeile an, es wird NICHT zu $0/$1 wie bei `sh -c` (gemessen —
+# der erste Anlauf meldete deshalb "FEHLT dort" fuer ein Verzeichnis, das dort
+# vollstaendig vorhanden war).
+manifest_local()  { # $1 = relativer Pfad
+  ( cd "$HOME/$1" 2>/dev/null || exit 0; find . -type f ! -path './__pycache__/*' ! -name '*.pyc' -exec shasum -a 256 {} + 2>/dev/null ) \
+    | awk '{h=$1; sub(/^\.\//,"",$2); print $2"  "h}' | LC_ALL=C sort
+}
+manifest_remote() { # $1 = relativer Pfad
+  ssh "$OTHER" "cd \$HOME/$1 2>/dev/null && find . -type f ! -path './__pycache__/*' ! -name '*.pyc' -exec sha256sum {} + 2>/dev/null" 2>/dev/null \
+    | awk '{h=$1; sub(/^\.\//,"",$2); print $2"  "h}' | LC_ALL=C sort
+}
+
+for d in "${DIRS[@]}"; do
+  [ -d "$HOME/$d" ] || continue
+  lman="$(manifest_local "$d")"
+  rman="$(manifest_remote "$d")"
+  ln=$(printf '%s\n' "$lman" | grep -c .)
+  if [ -z "$rman" ]; then
+    echo "  FEHLT dort   $d/  ($ln Dateien hier)"; missing+=("$d")
+  elif [ "$lman" != "$rman" ]; then
+    # Welche Dateien genau — sonst steht da nur "irgendwas ist anders".
+    abw="$(diff <(printf '%s\n' "$lman") <(printf '%s\n' "$rman") 2>/dev/null \
+           | awk '/^</{print $2}' | LC_ALL=C sort -u | tr '\n' ' ')"
+    echo "  ABWEICHEND   $d/  — ${abw:-Inhalt weicht ab}"; diffs+=("$d")
+  fi
+done
+
+# Nur-dorthin-Dateien: Quelle ist das Repo, Ziel ist eine bestimmte Maschine. Sie
+# stehen in einer EIGENEN Liste, weil der Vergleich oben zwei Annahmen macht, die hier
+# beide nicht gelten: dass die Quelle unter $HOME liegt und dass beide Maschinen
+# dieselbe Datei haben wollen.
+remote_only_todo=()
+for e in ${REMOTE_ONLY[@]+"${REMOTE_ONLY[@]}"}; do
+  ziel="${e%%|*}"; rest="${e#*|}"; quelle="${rest%%|*}"; zielpfad="${rest#*|}"
+  [ "$ziel" = "$OTHER" ] || continue
+  # Kein Repo gefunden: dann gibt es hier nichts zu sagen. Eine Meldung waere reines
+  # Rauschen in jedem Lauf, der ausserhalb eines Arbeitsbaums stattfindet, und der
+  # Zustand ist genau der von vorher — nur-dorthin-Dateien wandern dann nicht mit.
+  [ -d "$WB_REPO" ] || continue
+  if [ ! -f "$WB_REPO/$quelle" ]; then
+    echo "  FEHLT hier   $quelle (im Repo $WB_REPO) — nichts zu uebertragen"
+    continue
+  fi
+  l=$(shasum -a 256 "$WB_REPO/$quelle" 2>/dev/null | cut -d' ' -f1)
+  r=$(hash_remote "$zielpfad")
+  if [ "$r" = MISSING ]; then
+    echo "  FEHLT dort   $zielpfad  (nur dorthin, aus $quelle)"; remote_only_todo+=("$e")
+  elif [ "$l" != "$r" ]; then
+    echo "  ABWEICHEND   $zielpfad  (nur dorthin, aus $quelle)"; remote_only_todo+=("$e")
+  fi
+done
+
+echo
+echo "Nur gemeldet, nie kopiert (maschinenabhaengig):"
+for f in "${REPORT_ONLY[@]}"; do
+  l=$(hash_local "$f"); r=$(hash_remote "$f")
+  [ "$l" = MISSING ] && continue
+  if [ "$r" = MISSING ]; then echo "  FEHLT dort   $f"
+  elif [ "$l" != "$r" ]; then echo "  ABWEICHEND   $f  — von Hand angleichen"
+  fi
+done
+
+n=$(( ${#diffs[@]} + ${#missing[@]} + ${#remote_only_todo[@]} ))
+echo
+if [ "$n" -eq 0 ]; then
+  echo "Nichts zu tun."
+  exit 0
+fi
+if [ "$APPLY" != 1 ]; then
+  echo "$n Posten. Zum Uebertragen: wb-sync-setup --apply"
+  exit 1
+fi
+
+echo "Uebertrage $n Posten nach $OTHER ..."
+# bash 3.2 (macOS) behandelt ein LEERES Array unter `set -u` als ungesetzt und
+# bricht ab — deshalb die +-Ersetzung, die bei leerem Array gar nichts einsetzt.
+for p in ${missing[@]+"${missing[@]}"} ${diffs[@]+"${diffs[@]}"}; do
+  if [ -d "$HOME/$p" ]; then
+    ssh "$OTHER" "mkdir -p \$HOME/$p" 2>/dev/null
+    scp -q -r "$HOME/$p/." "$OTHER:~/$p/" && echo "  ok  $p/"
+  else
+    ssh "$OTHER" "mkdir -p \$(dirname \$HOME/$p)" 2>/dev/null
+    scp -q "$HOME/$p" "$OTHER:~/$p" && echo "  ok  $p"
+    case "$p" in .local/bin/*|*.sh) ssh "$OTHER" "chmod +x \$HOME/$p" 2>/dev/null ;; esac
+  fi
+done
+for e in ${remote_only_todo[@]+"${remote_only_todo[@]}"}; do
+  rest="${e#*|}"; quelle="${rest%%|*}"; zielpfad="${rest#*|}"
+  ssh "$OTHER" "mkdir -p \$(dirname \$HOME/$zielpfad)" 2>/dev/null
+  scp -q "$WB_REPO/$quelle" "$OTHER:~/$zielpfad" || { echo "  FEHLER  $zielpfad"; continue; }
+  # Ausfuehrungsrecht ausdruecklich setzen: scp uebertraegt den Modus nicht zuverlassig,
+  # und eine Datei in ~/.local/bin ohne +x ist ein stiller Ausfall.
+  ssh "$OTHER" "chmod 755 \$HOME/$zielpfad" 2>/dev/null
+  echo "  ok  $zielpfad  (nur dorthin, aus $quelle)"
+done
+echo
+echo "Uebertragen. NICHT automatisch angeglichen: settings.json und CLAUDE.md —"
+echo "die tragen maschinenabhaengige Teile und wollen von Hand nachgezogen werden."

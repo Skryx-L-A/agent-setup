@@ -1,0 +1,15 @@
+{
+  "zweck": "Welches Anthropic-Abo wann galt. Eine Limit-Kalibrierung darf NIE ueber eine Plangrenze hinweg rechnen: ein Prozentpunkt bedeutet vorher und nachher eine andere Tokenmenge. Gepflegt von Hand, Quelle ist immer der Kontoinhaber.",
+  "wochenfenster": "Das Wochenlimit setzt montags um 14:00 Ortszeit zurueck (Europe/Berlin).",
+  "plaene": [
+    {
+      "plan": "unbekannt",
+      "label": "Beispiel -- durch den tatsaechlichen Plan ersetzen",
+      "von": "2026-08-09T00:00:00Z",
+      "bis": null,
+      "quelle": "Vorlage, noch nicht bestaetigt",
+      "genauigkeit": "Solange kein zweiter Eintrag feststeht, gilt dieser eine offene Eintrag ab dem angegebenen Datum."
+    }
+  ],
+  "frueher": "Daten von vor dem ersten Eintrag oben sind ohne bekanntes Wechseldatum fuer eine Kalibrierung unbrauchbar."
+}

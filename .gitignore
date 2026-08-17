@@ -1,0 +1,14 @@
+# Was ein Bau oder ein Lauf hinterlaesst. Nichts davon gehoert ins Repo.
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# Der Schritt aus INSTALL.md, der aus dem Programm ein macOS-Buendel macht.
+app/*.app/
+
+# Die Identitaetsdatei des Wissensspeichers steht auf jeder Maschine anders und
+# nennt einen Menschen. Sie wird ausgefuellt, nie eingecheckt.
+knowledge/IDENTITY.md

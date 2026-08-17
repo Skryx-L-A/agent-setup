@@ -1,0 +1,40 @@
+#!/bin/bash
+# wb-shot-remote — fenstergenaue Aufnahme auf peer (KDE Plasma 6 / Wayland), vom Mac aus
+# ausgeloest. Ruft das Gegenstueck `peer-shot` per SSH auf peer auf, holt NUR die
+# entstandene PNG-Datei per SCP herueber und loescht sie danach auf peer wieder.
+#
+# Rule (der Nutzer, 2026-07-25): agents never record or screenshot the whole screen,
+# and never move his focus. Die eigentliche Regel-Durchsetzung (kein Vollbild-
+# Fallback, mehrdeutiges Muster bricht ab, kein Treffer bricht ab) sitzt in
+# peer-shot selbst; dieses Skript reicht dessen Exitcodes unveraendert durch.
+#
+#   wb-shot-remote <titel-muster> <ziel.png>
+set -uo pipefail
+
+REMOTE=peer
+REMOTE_TOOL=$HOME/.local/bin/peer-shot
+
+usage() { echo "usage: wb-shot-remote <titel-muster> <ziel.png>" >&2; exit 1; }
+
+[ $# -eq 2 ] || usage
+PATTERN=$1
+DEST=$2
+REMOTE_TMP="/tmp/wb-shot-remote-$$-$RANDOM.png"
+
+CMD=$(printf '%q %q %q' "$REMOTE_TOOL" "$PATTERN" "$REMOTE_TMP")
+ssh "$REMOTE" "$CMD"
+rc=$?
+
+if [ $rc -ne 0 ]; then
+  exit $rc
+fi
+
+if ! scp -q "$REMOTE:$REMOTE_TMP" "$DEST"; then
+  echo "wb-shot-remote: scp fehlgeschlagen (Datei nicht entstanden oder Verbindung weg)." >&2
+  ssh "$REMOTE" "rm -f '$REMOTE_TMP'" >/dev/null 2>&1
+  exit 1
+fi
+
+ssh "$REMOTE" "rm -f '$REMOTE_TMP'"
+
+echo "wb-shot-remote: aufgenommen -> $DEST ($(wc -c < "$DEST" | tr -d ' ') Bytes)"

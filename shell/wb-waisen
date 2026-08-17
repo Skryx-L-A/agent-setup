@@ -1,0 +1,596 @@
+#!/bin/bash
+# wb-waisen — findet Hintergrundprozesse, deren Eigentümer nachweislich weg
+# ist, und trennt sie sauber von abgelösten Prozessen, die noch in Benutzung
+# sind. Beendet NICHTS — es misst und benennt, das Beenden bleibt eine
+# bewusste Entscheidung danach.
+#
+# ZWEI FUNDE AUS DERSELBEN NACHT (2026-08-11), BEIDE GEHÖREN HIERHIN:
+#
+# Fund 1, ein echter Waise: ein Worker startete einen Modellserver mit
+# `nohup ... & disown`, der Pane wurde geschlossen, der Prozess lief mit
+# 21,9 GB weiter und hing an seinem Port — weder `wb-close` noch `wb-doctor`
+# haben das bemerkt. Genau diesen Fall soll dieses Werkzeug fangen.
+#
+# Fund 2, ein Gegenbeweis der ERSTEN Fassung dieses Werkzeugs: Sie erkannte
+# einen Waisen allein an PPID=1 und fehlendem Terminal — und stufte damit
+# PID 82087 (`mlx_lm.server`, KAT-Coder, Port 8091) fälschlich als Waise ein.
+# Der Prozess gehörte zu einem laufenden Messlauf einer ANDEREN
+# Werkbank-Sitzung, hatte zum Messzeitpunkt zwei ESTABLISHED-Verbindungen von
+# 127.0.0.1, 14,6 % CPU und ein wachsendes Protokoll — er wurde BENUTZT. Hätte
+# jemand den vorgeschlagenen `kill 82087` ausgeführt, wäre eine fremde,
+# laufende Messung zerstört worden. Der Fehler in der Begründung: PPID=1 und
+# kein Terminal heißt „abgelöst", nicht „unbenutzt" — und GENAU diese
+# Prozesse werden absichtlich abgelöst gestartet, während ihr Besitzer
+# weiterlebt. Der nächtliche Vorfall (Fund 1) war deshalb ein Waise, weil sein
+# Besitzer WEG war, nicht weil der Prozess an PID 1 hing.
+#
+# DIE FOLGERUNG — zwei Wege zur Auskunft, in dieser Reihenfolge:
+#
+#   WEG A, EIGENTÜMER-EINTRAG (sicher, wenn vorhanden): Wer einen Prozess mit
+#   `wb-nohup` abgelöst startet (siehe dessen Kopfkommentar), hinterlegt im
+#   selben Handgriff einen Eintrag mit PID, Startbefehl, Startzeit,
+#   Worker-Name und dem tmux-Pane, der ihn gestartet hat
+#   (~/.local/state/wb-nohup/eigentuemer/<pid>.json). Findet sich ein
+#   PASSENDER Eintrag (siehe „PID-Wiederverwendung" unten), genügt EINE
+#   Tatsachenfrage: lebt der Pane noch (`tmux … display -p -t <pane>
+#   '#{pane_dead}'`)? Ja -> kein Fund, Klasse übersprungen. Nein -> Klasse
+#   `waise`. Der Eigentümer ist damit bestätigt tot — das allein reicht
+#   ABER NICHT für einen kill-Vorschlag (unabhängiger Prüfdurchgang
+#   2026-08-11, Befund 1: sonst wiederholt sich Fund 2 nur über den
+#   Eigentümer-Eintrag statt über PPID 1). Deshalb läuft für diese
+#   Kandidaten dieselbe Benutzungsmessung wie Weg B (unten); schlägt eines
+#   der drei Signale an, bleibt die Klasse `waise`, aber der `kill`-Vorschlag
+#   entfällt zugunsten der genannten Gegenstelle. Nur ein `waise`-Fund OHNE
+#   Benutzungssignal bekommt den `kill`-Vorschlag — das ist die einzige
+#   Ausgabe, die diese Klasse zum Beenden vorschlägt.
+#
+#   WEG B, KEIN EINTRAG (Verdacht, nie ein Vorschlag): Prozesse, die vor
+#   `wb-nohup` entstanden sind oder von Hand per rohem `nohup … & disown`
+#   gestartet wurden, haben keinen Eintrag. Für sie bleibt nur die MESSUNG —
+#   und genau die hat Fund 2 erzeugt. Drei billige, deutungsarme Signale,
+#   ODER-verknüpft, jedes für sich reicht für „benutzt":
+#     - offene ESTABLISHED-TCP-Verbindungen (lsof) — das direkte Gegenstück
+#       zu Fund 2.
+#     - CPU-Zeit bewegt sich in einem kurzen Messfenster (Standard 3 s,
+#       empirisch: ein aktiver Prozess zeigte messbare Bewegung schon nach
+#       1,5 s).
+#     - die residente Speichergröße WÄCHST im selben Fenster — das Gegenstück
+#       zum LADENDEN Modellserver: ein 34-GB-Modell hat zwischen Start und
+#       erster beantworteter Anfrage minutenlang WEDER Verbindung noch
+#       nennenswerte CPU-Last noch ein bewegtes Protokoll, erfüllt in dieser
+#       Zeit also jedes andere Merkmal eines Waisen — aber sein Speicher
+#       wächst, weil das Laden selbst die Zeit ist, in der er alt wird. Ein
+#       Mindestalter würde das NICHT retten (das Laden braucht ja Zeit); nur
+#       die Wachstumsmessung tut es.
+#   Trifft KEINES der drei zu, ist das Ergebnis Klasse `unregistriert` mit dem
+#   Vermerk „keine Anhaltspunkte" — IMMER NOCH KEIN kill-Vorschlag, denn diese
+#   Klasse beruht auf genau der Art Heuristik, die Fund 2 widerlegt hat.
+#   `unregistriert` ist selbst schon ein Befund (der Prozess wurde am
+#   vorgeschriebenen Startweg vorbeigebaut), nur ohne automatischen
+#   Beenden-Vorschlag.
+#
+# PID-WIEDERVERWENDUNG: Ein Eintrag gilt nur, wenn der `ps -o lstart=`-Wert
+# der PID JETZT exakt zu dem beim Start gespeicherten passt
+# (`lstart_pruefwert`). Sonst gehört die alte Registrierung zu einem längst
+# beendeten Prozess, dessen PID das Betriebssystem seither einem VÖLLIG
+# ANDEREN Prozess neu zugeteilt hat — ein Abgleich ohne diese Prüfung würde
+# den neuen, fremden Prozess fälschlich als registriert (und womöglich als
+# `waise`) ausgeben. Fehlt der Eintrag, fehlt Pane oder Socket darin, oder ist
+# `tmux` selbst nicht auffindbar, zählt das NICHT als Eintrag — der Kandidat
+# fällt auf Weg B zurück, nie automatisch auf „waise".
+#
+# WARUM NICHT ÜBER DEN ELTERNPROZESS (Grundlage der ERKENNUNG, nicht der
+# BEURTEILUNG). `disown` entfernt einen Prozess nur aus der Job-Tabelle der
+# Shell; verschwindet sein direkter Elternprozess — ob das nun der Pane
+# selbst ist oder, wie bei `wb-nohup`, ein kurzlebiges Start-Skript, das
+# gleich danach beendet —, adoptiert launchd (PID 1) ihn. Gemessen (eigener
+# tmux-Testsocket, `nohup sleep 600 & disown`, danach `tmux kill-session`):
+#   vorher:  PID 81107  PPID 81095  TTY ttys010
+#   nachher: PID 81107  PPID 1      TTY ??
+# Ebenfalls gemessen, und das ist der Punkt, den die erste Fassung übersah:
+# ÜBER `wb-nohup` gestartete Prozesse zeigen PPID=1/TTY=`??` FAST SOFORT,
+# UNABHÄNGIG davon, ob ihr Pane noch lebt — weil `wb-nohup` selbst der
+# direkte Elternprozess ist und gleich nach dem Start beendet wird. PPID=1
+# und fehlendes Terminal heißen deshalb nur noch „wird gesucht", nicht mehr
+# „ist ein Fund" — sie lösen Weg A/B aus, entscheiden aber nichts mehr
+# allein.
+#
+# WORAN EIN KANDIDAT ÜBERHAUPT ERST GESUCHT WIRD (Bedingungen 1-4, wie zuvor
+# — das ist reine DISKUSSION, keine Verurteilung):
+#   1. Kein kontrollierendes Terminal mehr (`ps -o tty=` liefert `??`).
+#   2. An launchd (PID 1) reparentet (`ps -o ppid=` liefert `1`).
+#   3. NICHT selbst ein von launchd verwalteter Dienst — geprüft gegen die
+#      PID-Spalte von `launchctl list`. Das hält `ollama serve`, die
+#      geteilten MCP-Server (`mcp-shared`, siehe regeln/prozess-hygiene.md)
+#      und die Electron-App draußen, obwohl auch sie PPID=1/TTY=`??` tragen:
+#      launchd kennt sie als eigene, dauerhafte Jobs. Der von Ollama selbst
+#      verwaltete `llama-server` hat PPID=<ollama-pid>, nicht 1, und fällt
+#      schon hier heraus — stirbt Ollama unerwartet und sein `llama-server`
+#      überlebt, reparentet er ebenfalls zu PID 1 und wird zu Recht gesucht.
+#   4. Die Befehlszeile passt zu einer der vier Kategorien aus dem
+#      ursprünglichen Auftrag (Muster unten in match_kategorie()):
+#      Modellserver, Playwright/Chromium im Kopflos-Betrieb,
+#      Entwicklungsserver, Tunnel.
+#
+# WAS DIESES WERKZEUG BEWUSST NICHT ERKENNT (lieber eine Lücke als ein
+# falscher Treffer — Standing Rule 2026-07-25):
+#   - Ein Messfenster sieht nie in die Zukunft: Ein WEG-B-Prozess zwischen
+#     zwei Anfragen — Verbindung gerade geschlossen, keine CPU-Arbeit gerade
+#     jetzt, Speicher schon voll geladen — kann für die Dauer eines
+#     Messfensters wie unbenutzt aussehen. Das ist der Grund, warum Weg B nie
+#     einen kill-Vorschlag macht, nur Weg A tut das.
+#   - Entwicklungsserver/Tunnel außerhalb der explizit gelisteten Namen
+#     (vite, webpack-dev-server, next dev, http-server, live-server, python
+#     -m http.server, flask run, uvicorn, gunicorn, caddy, ngrok,
+#     cloudflared, npm run dev) — offene Kategorie, bewusst nicht generisch
+#     über „lauscht auf einem Port" erkannt (träfe auch legitime, von Hand
+#     gestartete Dauerprozesse, die launchd nicht kennt).
+#   - `lt` (localtunnel) fehlt absichtlich, der Name ist zu generisch.
+#   - Ein Prozess, der seine Befehlszeile verschleiert (setproctitle o. Ä.).
+#   - Prozesse anderer Benutzer oder root (Geltungsbereich: eigene UID).
+#   - Nicht-macOS: Bedingung 3 beruht auf `launchctl`. Ein systemd-Nachbau auf
+#     peer wäre ungeprüft — das Werkzeug meldet dort ausdrücklich NICHTS
+#     (Exit 3), statt zu raten.
+#   - Fehlt `tmux` selbst im PATH, kann Weg A nicht geprüft werden — dann
+#     fällt JEDER Kandidat auf Weg B zurück, mit einem Hinweis dazu, statt
+#     einen Eigentümer stillschweigend für tot zu erklären.
+#
+# Usage:
+#   wb-waisen           Bericht für Menschen, in zwei Abschnitten (waise /
+#                        unregistriert)
+#   wb-waisen --lines   eine Zeile je Fund, maschinenlesbar:
+#                        PID|RSS_KB|ETIME|PORTS|KATEGORIE|KLASSE|DETAIL|BEFEHL
+#                        KLASSE ist "waise" oder "unregistriert". Bei "waise"
+#                        ist DETAIL immer ein Eigentümer-Beleg; enthält DETAIL
+#                        zusätzlich den Text "kein automatischer
+#                        kill-Vorschlag" (der Prozess ist gerade benutzt,
+#                        siehe Befund 1 im Kopfkommentar), ist KEIN
+#                        kill-Vorschlag angemessen — sonst schon. Bei
+#                        "unregistriert" ist DETAIL die Begründung der
+#                        Heuristik, nie ein Beenden-Vorschlag.
+#   wb-waisen --quiet   nur die Schlusszeile (Anzahl je Klasse)
+#   wb-waisen --nur-waisen
+#                        laesst sich mit --lines/--quiet kombinieren.
+#                        Weg B (Kandidaten OHNE Eigentuemer-Eintrag) wird
+#                        gar nicht erst aufgenommen -- kein Messfenster, kein
+#                        "unregistriert"-Fund, Exit-Code kennt nur noch 0/1.
+#                        Fuer Aufrufer, die ausschliesslich an bestaetigten
+#                        Waisen interessiert sind (siehe shell/wb-close), und
+#                        die das gemeinsame Messfenster sonst auch dann
+#                        zahlen, wenn nur FREMDE, unregistrierte Prozesse auf
+#                        der Maschine laufen (Befund 8, unabhaengiger
+#                        Pruefdurchgang 2026-08-11: 3,8s Wartezeit bei jedem
+#                        wb-close, verursacht von einem unregistrierten
+#                        Modellserver einer FREMDEN Sitzung). Weg-A-Kandidaten
+#                        mit totem Eigentuemer werden WEITERHIN gemessen (das
+#                        ist Befund 1, an der Korrektheit wird hier nicht
+#                        gespart) -- nur Weg B faellt weg.
+#
+# Exit: 0 = nichts gefunden, 1 = mindestens ein "waise" (harter Befund),
+#       2 = kein "waise", aber mindestens ein "unregistriert" (Verdacht,
+#           kommt unter --nur-waisen nie vor),
+#       3 = auf dieser Plattform nicht unterstützt.
+set -uo pipefail
+
+MODE="human"
+NUR_WAISEN=""
+for arg in "$@"; do
+  case "$arg" in
+    --lines) MODE="lines" ;;
+    --quiet) MODE="quiet" ;;
+    --nur-waisen) NUR_WAISEN=1 ;;
+    -h|--help) sed -n '2,172p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "wb-waisen: unbekannte Option '$arg'" >&2; exit 2 ;;
+  esac
+done
+
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "wb-waisen: nur auf macOS unterstützt (siehe Kopfkommentar) — auf diesem System ungeprüft." >&2
+  exit 3
+fi
+
+# tmux-Binary robust auflösen: unter einem knappen PATH (z. B. der
+# woechentliche wb-hygiene-Lauf via launchd ohne Login-Shell, PATH nur
+# /usr/bin:/bin:/usr/sbin:/sbin) fehlt /opt/homebrew/bin. `command -v`
+# allein findet tmux dort nicht -- gemessen (unabhaengiger Pruefdurchgang
+# 2026-08-11, Befund 3): unter genau diesem PATH lief Weg A ueberhaupt
+# nicht, die geplante Kontrolle kam ueber Verdachtsmomente nie hinaus.
+# Dieselbe Rueckfallliste wie shell/wb-consistency.config.json
+# (extra_path_dirs) -- Homebrew auf Apple Silicon UND Intel, dazu
+# generisches /usr/local. Fehlt tmux trotzdem, wird das unten VERMERKT
+# statt stillschweigend jeden Eigentümer fuer tot zu erklaeren (siehe
+# Kopfkommentar).
+TMUX_BIN="${TMUX_BIN:-$(command -v tmux 2>/dev/null || true)}"
+if [ -z "$TMUX_BIN" ]; then
+  for _tmux_dir in /opt/homebrew/bin /opt/homebrew/sbin /usr/local/bin /usr/local/sbin; do
+    if [ -x "$_tmux_dir/tmux" ]; then
+      TMUX_BIN="$_tmux_dir/tmux"
+      break
+    fi
+  done
+  unset _tmux_dir
+fi
+TMUX_FEHLT=""
+[ -n "$TMUX_BIN" ] || TMUX_FEHLT=1
+
+MEINE_UID="$(id -u)"
+REGDIR="$HOME/.local/state/wb-nohup/eigentuemer"
+SLEEP_SEK=3
+
+# launchd-verwaltete PIDs einmal einsammeln (Bedingung 3).
+# Aufruf ohne Fork (Befund 2026-08-16): die Kandidaten-Schleife unten prueft
+# das fuer JEDEN Prozess mit PPID 1 und ohne TTY -- auf dieser Maschine oft
+# 400-600 Stueck. `printf | grep` startet dafuer zwei Subprozesse PRO Aufruf;
+# gemessen 0,93s allein fuer 479 Aufrufe. Das faellt an, BEVOR --nur-waisen
+# ueberhaupt greifen kann (das filtert erst die spaeteren Fund-Listen, nicht
+# diese Vor-Pruefung) -- deshalb blieb `--nur-waisen` trotz uebersprungenem
+# Messfenster nah an dessen 3s-Kosten. Der `case`-Mustervergleich unten laeuft
+# rein im laufenden Bash-Prozess, ohne Subprozess.
+LAUNCHD_PIDS=$'\n'"$(launchctl list 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/{print $1}')"$'\n'
+ist_launchd_dienst() {
+  case "$LAUNCHD_PIDS" in
+    *$'\n'"$1"$'\n'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# match_kategorie <befehl> -> druckt das Etikett, Rueckgabe 0 bei Treffer.
+# Bash 3.2 (macOS) kennt keine assoziativen Arrays, daher eine Funktion statt
+# einer Tabelle (wie shell/wb-close es fuer denselben Umstand kommentiert).
+match_kategorie() {
+  local cmd="$1"
+  if [[ "$cmd" =~ mlx_lm\.server ]] || [[ "$cmd" =~ mlx_lm[[:space:]]+serve ]]; then
+    echo "Modellserver (mlx_lm.server)"; return 0
+  fi
+  if [[ "$cmd" =~ (^|/)llama-server([[:space:]]|$) ]]; then
+    echo "Modellserver (llama-server)"; return 0
+  fi
+  if [[ "$cmd" =~ (^|/)headless_shell([[:space:]]|$) ]]; then
+    echo "Headless-Browser (Chrome headless_shell)"; return 0
+  fi
+  if [[ "$cmd" =~ /(ms-playwright|puppeteer)/ ]] && [[ "$cmd" =~ --headless ]]; then
+    echo "Headless-Browser (Playwright/Puppeteer)"; return 0
+  fi
+  if [[ "$cmd" =~ (^|/)(vite|webpack-dev-server|http-server|live-server|caddy)([[:space:]]|$) ]]; then
+    echo "Entwicklungsserver"; return 0
+  fi
+  if [[ "$cmd" =~ (^|/)next[[:space:]]+dev([[:space:]]|$) ]]; then
+    echo "Entwicklungsserver (next dev)"; return 0
+  fi
+  if [[ "$cmd" =~ npm[[:space:]].*run[[:space:]]+dev([[:space:]]|$) ]]; then
+    echo "Entwicklungsserver (npm run dev)"; return 0
+  fi
+  if [[ "$cmd" =~ python3?[[:space:]].*-m[[:space:]]+http\.server ]]; then
+    echo "Entwicklungsserver (python -m http.server)"; return 0
+  fi
+  if [[ "$cmd" =~ flask[[:space:]]+run ]]; then
+    echo "Entwicklungsserver (flask run)"; return 0
+  fi
+  if [[ "$cmd" =~ (^|/)(uvicorn|gunicorn)([[:space:]]|$) ]]; then
+    echo "Entwicklungsserver (${BASH_REMATCH[2]})"; return 0
+  fi
+  if [[ "$cmd" =~ (^|/)(ngrok|cloudflared)([[:space:]]|$) ]]; then
+    echo "Tunnel (${BASH_REMATCH[2]})"; return 0
+  fi
+  return 1
+}
+
+# Nur TCP-LISTEN-Ports (fuer die Anzeige) — kein Ausschlussgrund, wenn leer.
+ports_von() {
+  lsof -nP -iTCP -sTCP:LISTEN -a -p "$1" 2>/dev/null \
+    | awk 'NR>1{print $9}' | sed 's/.*://' | sort -un | paste -sd, -
+}
+
+# ESTABLISHED-Verbindungen -> "N|gegenstelle1,gegenstelle2,...". Das direkte
+# Gegenstueck zu Fund 2: eine offene ESTABLISHED-Verbindung heisst benutzt.
+etablierte_verbindungen_von() {
+  local pid="$1" out n remotes
+  out="$(lsof -nP -iTCP -a -p "$pid" -sTCP:ESTABLISHED 2>/dev/null | awk 'NR>1{print $9}' | sed 's/.*->//')"
+  n="$(printf '%s\n' "$out" | grep -c . || true)"
+  remotes="$(printf '%s\n' "$out" | sort -u | paste -sd, -)"
+  printf '%s|%s' "${n:-0}" "$remotes"
+}
+
+rss_lesbar() {
+  local kb="$1"
+  if [ "${kb#-}" -ge 1048576 ] 2>/dev/null; then
+    awk -v k="$kb" 'BEGIN{printf "%.1f GB", k/1048576}'
+  else
+    awk -v k="$kb" 'BEGIN{printf "%.0f MB", k/1024}'
+  fi
+}
+
+# ps -o time= liefert MM:SS.hh oder H:MM:SS.hh -> Sekunden mit Nachkommastellen.
+zeit_zu_sekunden() {
+  awk -v t="$1" 'BEGIN{
+    n=split(t, a, ":")
+    if (n==2) printf "%.2f", a[1]*60+a[2]
+    else if (n==3) printf "%.2f", a[1]*3600+a[2]*60+a[3]
+    else print "0.00"
+  }'
+}
+
+# Lebt der Pane des Eigentuemers noch? Wichtig: `tmux … display -p -t
+# <nicht-existenter-pane>` liefert auf dieser Maschine (tmux 3.7b) Exit 0 UND
+# LEERE Ausgabe statt eines Fehlers (gemessen 2026-08-11, Server lebt, Pane/
+# Session weg) — deshalb wird auf den STRING "0" verglichen, nie auf den
+# Rueckgabewert.
+pane_ist_lebendig() {
+  [ -n "$TMUX_BIN" ] || return 1
+  [ "$("$TMUX_BIN" -S "$1" display -p -t "$2" '#{pane_dead}' 2>/dev/null)" = "0" ]
+}
+
+# Zweite Eigentuemer-Art (2026-08-13, siehe wb-nohup --launchd): der Starter
+# ist ein launchd-Job. Die Tatsachenfrage ist dieselbe wie beim Pane, nur an
+# launchd gestellt — und sie lautet ausdruecklich "laeuft er GERADE", nicht
+# "ist er geladen". Ein sockelaktivierter Job wie agent-workbench.modell-proxy
+# bleibt naemlich fuer immer geladen (launchd haelt nur den Socket), waehrend
+# sein Prozess zwischen zwei Anfragen gar nicht existiert. Genau dann ist ein
+# ueberlebender Modellserver dahinter eine Waise: ein lebender Proxy wuerde
+# ihn entweder bedienen oder beenden.
+#
+# Nur EIGENE Jobs zaehlen (Review 2026-08-13, S6): ein Eintrag, der einen
+# fremden Dauerlaeufer wie com.apple.Finder als Eigentuemer nennt, bekaeme
+# sonst eine unbefristete Ausnahme von dieser Pruefung. `wb-nohup` laesst
+# solche Labels gar nicht erst eintragen; hier steht dieselbe Schranke noch
+# einmal, weil eine von Hand geschriebene Registrierung diesen Weg sonst
+# umginge.
+launchd_job_laeuft() {
+  local label="$1" aus
+  [ -n "$label" ] || return 1
+  case "$label" in agent-workbench.*) ;; *) return 1 ;; esac
+  aus="$(launchctl print "gui/$(id -u)/$label" 2>/dev/null)" || return 1
+  printf '%s\n' "$aus" | grep -qE '^[[:space:]]*(pid = [0-9]+|state = running)'
+}
+
+# lade_eigentuemer <pid> -> setzt EIG_WORKER/EIG_PANE/EIG_SOCKET/
+# EIG_GESTARTET/EIG_NAME/EIG_LAUNCHD/EIG_BEFEHL, Rueckgabe 0 nur bei einem GUELTIGEN,
+# zu genau dieser PID passenden Eintrag (siehe „PID-Wiederverwendung" oben).
+lade_eigentuemer() {
+  local pid="$1" f="$REGDIR/$1.json" jetzt ausgabe
+  [ -f "$f" ] || return 1
+  # LC_ALL=C: `ps -o lstart=` formatiert nach LC_TIME (unabhaengiger
+  # Pruefdurchgang 2026-08-11, Befund 2) -- unter C.UTF-8 und z. B. de_DE
+  # liefert dieselbe PID verschiedene Zeichenketten. Wird die Registrierung
+  # unter der einen Umgebung geschrieben (siehe wb-nohup, dort dieselbe
+  # Festlegung) und hier unter einer anderen gelesen, schlaegt der Vergleich
+  # sonst still fehl -- der Kandidat faellt dann faelschlich auf Weg B
+  # zurueck statt als gueltig registriert zu gelten.
+  jetzt="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)"
+  ausgabe="$(/usr/bin/python3 - "$f" "$jetzt" <<'PY'
+import json, sys
+f, lstart_jetzt = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(f))
+except Exception:
+    sys.exit(1)
+if d.get("lstart_pruefwert") != lstart_jetzt:
+    sys.exit(1)
+pane, socket_path = d.get("pane") or "", d.get("socket_path") or ""
+label = d.get("launchd_label") or ""
+# Gueltig ist ein Eintrag mit Pane UND Socket -- oder einer mit launchd-Label
+# (zweite Eigentuemer-Art, siehe launchd_job_laeuft weiter oben).
+if not label and (not pane or not socket_path):
+    sys.exit(1)
+befehl = " ".join(d.get("befehl") or [])
+# befehl bleibt das LETZTE Feld -- er ist das einzige, das selbst ein '|'
+# enthalten kann, und `read` schiebt Ueberzaehliges in die letzte Variable.
+print("%s|%s|%s|%s|%s|%s|%s" % (d.get("worker") or "unbekannt", pane, socket_path,
+                                 d.get("gestartet") or "", d.get("name") or "", label, befehl))
+PY
+)"
+  [ -n "$ausgabe" ] || return 1
+  IFS='|' read -r EIG_WORKER EIG_PANE EIG_SOCKET EIG_GESTARTET EIG_NAME EIG_LAUNCHD EIG_BEFEHL <<< "$ausgabe"
+  return 0
+}
+
+# == Ein einziger ps-Durchlauf ueber alle Prozesse (~443 hier, <50ms) ========
+# -ww erzwingt die volle Befehlszeile. -a/-x zusammen mit -p waehlen auf
+# BSD-ps NICHT die Schnittmenge, sondern die Vereinigung (gemessen) — deshalb
+# ein voller Sweep ohne -p, gefiltert in bash. ALLE_PIDS haelt JEDE gesehene
+# PID fest (fuer das Aufraeumen verwaister Registrierungen unten), CANDIDATES
+# nur die, die Bedingungen 1-4 erfuellen.
+ALLE_PIDS=""
+CANDIDATES=""
+while IFS=$'\t' read -r uid pid ppid tty rss etime cmd; do
+  [ -n "$pid" ] || continue
+  ALLE_PIDS="${ALLE_PIDS}${pid}"$'\n'
+  [ "$uid" = "$MEINE_UID" ] || continue
+  [ "$tty" = "??" ] || continue
+  [ "$ppid" = "1" ] || continue
+  ist_launchd_dienst "$pid" && continue
+  kategorie="$(match_kategorie "$cmd")" || continue
+  CANDIDATES="${CANDIDATES}${pid}|${rss}|${etime}|${kategorie}|${cmd}"$'\n'
+done < <(ps -axwwo uid=,pid=,ppid=,tty=,rss=,etime=,command= \
+          | awk 'BEGIN{OFS="\t"} {
+              uid=$1; pid=$2; ppid=$3; tty=$4; rss=$5; etime=$6;
+              cmd=""; for(i=7;i<=NF;i++){cmd=cmd $i (i<NF?" ":"")}
+              print uid,pid,ppid,tty,rss,etime,cmd
+            }')
+
+# == Verwaiste Registrierungen aufraeumen ====================================
+# Ein Eintrag, dessen PID gar nicht mehr existiert (der Prozess ist normal
+# beendet, seine Registrierung wurde nie geloescht), wird entfernt. Das ist
+# die einzige SCHREIBENDE Handlung dieses Werkzeugs, und sie betrifft nur die
+# eigene Buchhaltung unter ~/.local/state/wb-nohup — nie einen Prozess.
+# Liefert der ps-Durchlauf oben ausnahmsweise NICHTS (Befund 5, unabhaengiger
+# Pruefdurchgang 2026-08-11), ist ALLE_PIDS leer -- ohne diese Wache wuerde
+# der Schleifenrumpf dann JEDE Registrierung loeschen, nicht nur verwaiste.
+# Kostet keine Sicherheit (es wird nie ein Prozess angefasst), nur die
+# Auskunft ueber echte Waisen -- aber genau die soll dieses Werkzeug liefern.
+if [ -d "$REGDIR" ] && [ -n "$ALLE_PIDS" ]; then
+  for f in "$REGDIR"/*.json; do
+    [ -e "$f" ] || continue
+    p="$(basename "$f" .json)"
+    printf '%s\n' "$ALLE_PIDS" | grep -qx "$p" || rm -f "$f"
+  done
+fi
+
+# == Kandidaten auf Weg A (Eigentuemer-Eintrag) pruefen ======================
+# Ein toter Eigentuemer ist NUR die halbe Antwort (unabhaengiger
+# Pruefdurchgang 2026-08-11, Befund 1): fruehere Fassung schlug hier sofort
+# kill vor, ohne je zu pruefen, ob der Prozess GERADE benutzt wird -- exakt
+# der Fehler aus Fund 2 im Kopfkommentar, nur ueber den Eigentuemer-Eintrag
+# statt ueber PPID 1 wiederholt. Ein Kandidat mit totem Eigentuemer laeuft
+# deshalb erst durch dasselbe Messfenster wie Weg B (unten); die Klasse
+# bleibt "waise" (der Eigentuemer IST tot, das bleibt wahr), aber der
+# kill-Vorschlag entfaellt, wenn eines der drei Signale anschlaegt -- die
+# Gegenstelle wird dann stattdessen genannt.
+WAISE_TOT_META=""
+UNREG_META=""
+while IFS='|' read -r pid rss etime kategorie cmd; do
+  [ -n "$pid" ] || continue
+  # Ein Eintrag mit launchd-Label braucht kein tmux -- deshalb wird Weg A
+  # nur dann wegen fehlendem tmux uebersprungen, wenn der Eintrag wirklich
+  # einen Pane als Eigentuemer nennt (Pruefung unten, nach dem Laden).
+  if lade_eigentuemer "$pid"; then
+    if [ -n "$EIG_LAUNCHD" ]; then
+      if launchd_job_laeuft "$EIG_LAUNCHD"; then
+        continue   # Eigentuemer lebt -- kein Fund
+      fi
+      detail="Eigentuemer: launchd-Job '$EIG_LAUNCHD' (laeuft nicht) — gestartet $EIG_GESTARTET als '$EIG_NAME'"
+    elif [ -n "$TMUX_FEHLT" ]; then
+      # tmux fehlt: der Pane ist nicht nachpruefbar, also wird hier NICHTS
+      # behauptet -- der Kandidat faellt wie bisher auf Weg B zurueck.
+      [ -n "$NUR_WAISEN" ] || UNREG_META="${UNREG_META}${pid}|${rss}|${etime}|${kategorie}|${cmd}"$'\n'
+      continue
+    elif pane_ist_lebendig "$EIG_SOCKET" "$EIG_PANE"; then
+      continue   # Eigentuemer lebt -- kein Fund
+    else
+      detail="Eigentuemer: Worker '$EIG_WORKER', Pane $EIG_PANE (tot) — gestartet $EIG_GESTARTET als '$EIG_NAME'"
+    fi
+    WAISE_TOT_META="${WAISE_TOT_META}${pid}|${rss}|${etime}|${kategorie}|${cmd}|${detail}"$'\n'
+  elif [ -z "$NUR_WAISEN" ]; then
+    UNREG_META="${UNREG_META}${pid}|${rss}|${etime}|${kategorie}|${cmd}"$'\n'
+  fi   # --nur-waisen (Befund 8): Weg-B-Kandidaten werden gar nicht erst
+       # aufgenommen -- wer nur an bestaetigten Waisen interessiert ist
+       # (wb-close), zahlt das gemeinsame Messfenster unten nicht fuer
+       # Kandidaten, die er ohnehin nie ausgibt.
+done <<EOF
+$CANDIDATES
+EOF
+
+# == Gemeinsames Messfenster: Weg-A-Kandidaten mit totem Eigentuemer UND
+#    Weg-B-Kandidaten teilen sich EINEN Schlaf statt je einem eigenen -- die
+#    Gesamtlaufzeit haengt nicht von der Anzahl der Kandidaten ab. Wird
+#    uebersprungen, wenn keine Seite etwas zu pruefen hat.
+WAISEN_LINES=""
+UNREG_LINES=""
+if [ -n "$WAISE_TOT_META" ] || [ -n "$UNREG_META" ]; then
+  VORHER=""
+  while IFS='|' read -r pid rest; do
+    [ -n "$pid" ] || continue
+    zt="$(ps -o time= -p "$pid" 2>/dev/null | tr -d ' ')"
+    rs="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
+    VORHER="${VORHER}${pid}|${zt}|${rs}"$'\n'
+  done <<EOF
+$(printf '%s%s' "$WAISE_TOT_META" "$UNREG_META")
+EOF
+
+  sleep "$SLEEP_SEK"
+
+  # miss_grund <pid> -> setzt GRUND ("benutzt — ..." oder "keine
+  # Anhaltspunkte...") und RSS_NEU. Dieselbe Messung fuer Weg A und Weg B --
+  # sonst kehrt Fund 2 auf dem jeweils ungeprueften Weg zurueck.
+  miss_grund() {
+    local pid="$1" zt_v_zeile zeit_v rss_v zeit_n rss_n verb verb_n verb_remote delta_zeit delta_rss
+    zt_v_zeile="$(printf '%s\n' "$VORHER" | awk -F'|' -v p="$pid" '$1==p{print;exit}')"
+    IFS='|' read -r _ zeit_v rss_v <<< "$zt_v_zeile"
+    zeit_n="$(ps -o time= -p "$pid" 2>/dev/null | tr -d ' ')"
+    rss_n="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
+    verb="$(etablierte_verbindungen_von "$pid")"
+    IFS='|' read -r verb_n verb_remote <<< "$verb"
+    delta_zeit="$(awk -v a="$(zeit_zu_sekunden "${zeit_v:-0:00.00}")" -v b="$(zeit_zu_sekunden "${zeit_n:-0:00.00}")" 'BEGIN{printf "%.2f", b-a}')"
+    delta_rss=$(( ${rss_n:-0} - ${rss_v:-0} ))
+    RSS_NEU="${rss_n:-0}"
+    if [ "${verb_n:-0}" -gt 0 ] 2>/dev/null; then
+      GRUND="benutzt — $verb_n offene ESTABLISHED-Verbindung(en) von ${verb_remote:-unbekannt}"
+    elif awk -v d="$delta_zeit" 'BEGIN{exit !(d>0.05)}'; then
+      GRUND="benutzt — CPU-Zeit bewegt sich (+${delta_zeit}s in ${SLEEP_SEK}s)"
+    elif [ "$delta_rss" -gt 1024 ] 2>/dev/null; then
+      GRUND="benutzt — Speicher waechst (+$(rss_lesbar "$delta_rss") in ${SLEEP_SEK}s, vermutlich laedt der Prozess noch)"
+    else
+      GRUND="keine Anhaltspunkte fuer Benutzung im Messfenster (${SLEEP_SEK}s) — kein automatischer kill-Vorschlag, von Hand pruefen"
+    fi
+  }
+
+  if [ -n "$WAISE_TOT_META" ]; then
+    while IFS='|' read -r pid rss etime kategorie cmd detail; do
+      [ -n "$pid" ] || continue
+      miss_grund "$pid"
+      ports="$(ports_von "$pid")"
+      case "$GRUND" in
+        benutzt*) detail="${detail} — ${GRUND}; kein automatischer kill-Vorschlag" ;;
+        *) : ;;   # keine Anhaltspunkte -- Eigentuemer-Beleg bleibt unveraendert, kill bleibt angemessen
+      esac
+      WAISEN_LINES="${WAISEN_LINES}${pid}|${RSS_NEU:-$rss}|${etime}|${ports}|${kategorie}|waise|${detail}|${cmd}"$'\n'
+    done <<EOF
+$WAISE_TOT_META
+EOF
+  fi
+
+  if [ -n "$UNREG_META" ]; then
+    while IFS='|' read -r pid rss etime kategorie cmd; do
+      [ -n "$pid" ] || continue
+      miss_grund "$pid"
+      ports="$(ports_von "$pid")"
+      UNREG_LINES="${UNREG_LINES}${pid}|${RSS_NEU:-$rss}|${etime}|${ports}|${kategorie}|unregistriert|${GRUND}|${cmd}"$'\n'
+    done <<EOF
+$UNREG_META
+EOF
+  fi
+fi
+
+anzahl_waisen="$(printf '%s\n' "$WAISEN_LINES" | grep -c . || true)"
+anzahl_unreg="$(printf '%s\n' "$UNREG_LINES" | grep -c . || true)"
+
+case "$MODE" in
+  lines)
+    printf '%s' "$WAISEN_LINES"
+    printf '%s' "$UNREG_LINES"
+    ;;
+  quiet)
+    echo "wb-waisen: $anzahl_waisen Waise(n), $anzahl_unreg unregistriert(e Verdachtsfall/-fälle)."
+    ;;
+  human)
+    echo "== wb-waisen: Hintergrundprozesse ohne bestaetigten lebenden Besitzer =="
+    if [ -n "$TMUX_FEHLT" ]; then
+      echo "  hinweis  tmux nicht auffindbar — Eigentuemer-Registrierung (Weg A) wird nicht geprueft, nur die Verdachtsmomente (Weg B)"
+    fi
+    if [ "$anzahl_waisen" -eq 0 ]; then
+      echo "  ok       keine bestaetigten Waisen (Eigentuemer-Pane lebt oder existiert nicht)"
+    else
+      printf '%s\n' "$WAISEN_LINES" | while IFS='|' read -r pid rss etime ports kategorie klasse detail cmd; do
+        [ -n "$pid" ] || continue
+        printf '  WAISE    PID %s — %s — %s, läuft seit %s%s\n' \
+          "$pid" "$kategorie" "$(rss_lesbar "$rss")" "$etime" "${ports:+, Port(e) $ports}"
+        printf '           %s\n' "$detail"
+        printf '           Befehl:  %s\n' "$cmd"
+        case "$detail" in
+          *"kein automatischer kill-Vorschlag"*)
+            printf '           Kein automatischer Beenden-Vorschlag — der Eigentuemer ist zwar tot, aber der Prozess wird gerade benutzt (siehe oben), von Hand pruefen.\n' ;;
+          *) printf '           Beenden: kill %s\n' "$pid" ;;
+        esac
+      done
+    fi
+    echo
+    if [ "$anzahl_unreg" -eq 0 ]; then
+      echo "  ok       keine unregistrierten Verdachtsfaelle"
+    else
+      printf '%s\n' "$UNREG_LINES" | while IFS='|' read -r pid rss etime ports kategorie klasse detail cmd; do
+        [ -n "$pid" ] || continue
+        printf '  UNREGISTRIERT  PID %s — %s — %s, läuft seit %s%s\n' \
+          "$pid" "$kategorie" "$(rss_lesbar "$rss")" "$etime" "${ports:+, Port(e) $ports}"
+        printf '           %s\n' "$detail"
+        printf '           Befehl: %s\n' "$cmd"
+        printf '           Kein automatischer Beenden-Vorschlag — kein Eigentuemer-Eintrag, von Hand pruefen.\n'
+      done
+    fi
+    echo
+    echo "wb-waisen: $anzahl_waisen Waise(n), $anzahl_unreg unregistriert(e Verdachtsfall/-fälle)."
+    ;;
+esac
+
+[ "$anzahl_waisen" -gt 0 ] && exit 1
+[ "$anzahl_unreg" -gt 0 ] && exit 2
+exit 0

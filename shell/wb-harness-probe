@@ -1,0 +1,1390 @@
+#!/bin/bash
+# wb-harness-probe — den Harness-Vertrag messen und einen Registry-ENTWURF ausgeben.
+#
+#   wb-harness-probe <harness-id> [<model-id>] [--seconds <n>] [--real-home]
+#                    [--aufnahme <verzeichnis>] [--json <datei>]
+#                    [--only <punkte>] [--skip <punkte>] [--spawn-beleg]
+#                    [--models-file <pfad>]
+#   wb-harness-probe analyze <aufnahme-verzeichnis> [--json <datei>]
+#
+# No CLI documents which glyph means "ready for input" (SPEC-V3 H) — and a task
+# pasted into a still-booting TUI disappears without a trace, which has happened
+# twice. So an adapter without a MEASURED readyPattern is not startable, and this
+# is the tool that measures it: it starts the harness, records the rendered screen
+# for up to 60s, proposes an ANCHORED pattern and prints the command that records it.
+#
+# SEIT 2026-08-08 misst es nicht mehr nur das readyPattern, sondern den GANZEN
+# Vertrag — die neun Punkte, die bisher jeder Harness-Einbau von vorn beantwortet
+# hat. Anlass: zehn Harnesses sind eingebaut, jeder hat rund eine Stunde gekostet,
+# und `bradAGI/awesome-cli-coding-agents` fuehrt ueber sechzig. Einzeln geht das
+# nicht auf.
+#
+#   1 readyPattern     in DREI Zustaenden (leer, getippt, laufende Antwort)
+#   2 promptPattern    in der Form, die pi-worker wirklich benutzt, samt der drei
+#                      bekannten Fallen
+#   3 Kontext          Prozentanzeige in den letzten fuenf Zeilen, sonst Sitzungsdatei
+#   4 systemPrompt     Kennwort-Probe ueber die Kandidatendateien
+#   5 resume           der Dreiklang (Kennwort / ohne Flag leer / mit Flag Verlauf)
+#   6 trustStore       Vertrauensdialog beim Erststart in einem FRISCHEN Verzeichnis
+#   7 autonomy.args    aus der Hilfe, plus der Sonderfall Umgebungsvariable
+#   8 discover         Unterbefehl, der Modelle auflistet
+#   9 probe / notes    was gemessen wurde, mit Version und Datum — und was NICHT
+#
+# DER ENTWURF IST EIN VORSCHLAG, KEIN EINTRAG. Dieses Werkzeug schreibt NICHTS in
+# die Registry. Es druckt JSON, das ein Mensch oder ein Orchestrator liest, prueft
+# und uebernimmt, und jedes Feld traegt seine HERKUNFT: "gemessen", "aus der Hilfe
+# gelesen" oder "nicht ermittelbar" mit Grund. Ein geratenes Feld ist schlimmer als
+# ein leeres — ein leeres sieht man, ein geratenes glaubt man.
+#
+# WAS DER BAUKASTEN NICHT ERSETZT: den Spawn-Beleg. Ein Harness gilt erst als
+# integriert, wenn ein echter `pi-worker`-Lauf einen Auftrag angenommen und seine
+# Ergebnisdatei geschrieben hat. `--spawn-beleg` bereitet diesen Schritt vor und
+# nennt ihn beim Namen; unterstellt wird er nie.
+#
+# VORAUSSETZUNG (2026-08-09): <harness-id> muss in der Registry stehen (`wb-state harness
+# get`) — ohne Eintrag bricht die Probe sofort mit "Harness '<id>' ist nicht registriert"
+# ab, noch bevor irgendetwas gemessen wird. Fuer den ERSTEINBAU, wenn der Harness noch
+# nirgends eingetragen ist, zeigt `--models-file <pfad>` auf eine EIGENE Registry-Datei
+# (Kopie von `shell/models.default.json` plus ein Entwurfseintrag) statt der echten
+# `~/.claude/workbench/models.json` — die Probe misst dann gegen den ENTWURF, und die
+# echte Registry bleibt unberuehrt. Der Pfad muss existieren und lesbar sein, sonst
+# FEHLER (kein stiller Rueckfall auf die echte Registry). Intern: `WB_MODELS_FILE` in
+# `wb-state`.
+#
+# ZWEI TEILE, EINE DATEI. Der MESSTEIL faehrt Panes und zeichnet Bildschirme auf,
+# der AUSWERTETEIL (`analyze`) liest ausschliesslich die Aufzeichnung und baut den
+# Entwurf. Die Naht dazwischen ist der Grund fuer den Schnitt: die Auswertung ist
+# damit gegen aufgezeichnete Bildschirme testbar, ohne dass irgendein Werkzeug
+# installiert sein muss (shell/tests/test-harness-baukasten.sh).
+#
+# It never touches the live workbench:
+#   * own tmux server   (tmux -L wbprobe)   — never the session der Nutzer is in
+#   * own HOME          (mktemp -d)         — never the real configuration
+#   * `unset TMUX TMUX_PANE` right at the top: a helper that inherits $TMUX talks
+#     to the LIVE server no matter which socket this script uses ($TMUX beats
+#     TMUX_TMPDIR, measured 2026-07-25).
+#   * cleanup kills only its OWN session name and its OWN socket — never a pattern
+#     like "wb-", which has already killed the user's live client twice.
+#
+# Der Sockelname trug bis zum 2026-08-04 keine PID. Zwei gleichzeitige Proben teilten sich
+# damit einen Server, und das Aufraeumen der einen riss der anderen den Server unter den
+# Fuessen weg. Gemessen an genau diesem Tag: zwei parallele Laeufe von
+# shell/tests/test-registry.sh, einer davon mit zwei Fehlschlaegen ("probe schlaegt ein
+# Muster vor", "probe sah die Eingabezeile"), der andere gruen. Deshalb PID im Namen, wie
+# bei jeder Testsuite auch. WB_PROBE_SOCK ueberschreibt ihn, damit ein Test den Namen
+# kennen und danach pruefen kann, dass der Server wirklich weg ist.
+unset TMUX TMUX_PANE
+set -uo pipefail
+
+SOCK="${WB_PROBE_SOCK:-wbprobe-$$}"
+SECONDS_MAX=60
+REAL_HOME=""
+HID=""; MID=""; AUFNAHME=""; JSONOUT=""; ONLY=""; SKIP=""; SPAWNBELEG=""; MODELSFILE_OPT=""
+MODE="messen"
+
+# `analyze` ist ein eigener Einstieg und darf keine der Messoptionen verlangen.
+if [ "${1:-}" = "analyze" ]; then MODE="analyze"; shift; fi
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --seconds) SECONDS_MAX="${2:?n}"; shift 2 ;;
+    --real-home) REAL_HOME=1; shift ;;
+    --aufnahme) AUFNAHME="${2:?verzeichnis}"; shift 2 ;;
+    --json) JSONOUT="${2:?datei}"; shift 2 ;;
+    --only) ONLY="${2:?punkte}"; shift 2 ;;
+    --skip) SKIP="${2:?punkte}"; shift 2 ;;
+    --spawn-beleg) SPAWNBELEG=1; shift ;;
+    --models-file) MODELSFILE_OPT="${2:?pfad}"; shift 2 ;;
+    -h|--help) sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "wb-harness-probe: unbekannte Option '$1'" >&2; exit 1 ;;
+    *) if [ -z "$HID" ]; then HID="$1"; else MID="$1"; fi; shift ;;
+  esac
+done
+
+# --models-file (2026-08-09): biegt jeden wb-state-Aufruf DIESES Laufs auf eine eigene
+# Registry um (WB_MODELS_FILE, siehe dort). Der Pfad wird HIER geprueft, nicht erst dem
+# ersten `wb-state harness get` ueberlassen — ein Tippfehler soll eine klare Meldung
+# geben und nicht das Verhalten "leere Registry, faellt auf eingebaute Adapter zurueck"
+# annehmen, das fuer den unbesetzten Regelfall richtig, hier aber Verschleierung waere.
+if [ -n "$MODELSFILE_OPT" ]; then
+  [ -r "$MODELSFILE_OPT" ] || {
+    echo "FEHLER: --models-file '$MODELSFILE_OPT' ist nicht lesbar — kein Lauf." >&2
+    exit 1
+  }
+  export WB_MODELS_FILE="$MODELSFILE_OPT"
+  echo "wb-harness-probe: WB_MODELS_FILE=$WB_MODELS_FILE — misst gegen diese Registry, nicht die echte." >&2
+fi
+
+# ── Punktfilter ────────────────────────────────────────────────────────────────
+# --only/--skip nennen die NUMMERN der neun Punkte. Gefiltert wird die MESSUNG,
+# nicht die Auswertung: ein uebersprungener Punkt erscheint im Entwurf als "nicht
+# ermittelbar, Grund: uebersprungen (--skip)". Eine Luecke stillschweigend
+# auszulassen waere genau das Schoenen, gegen das die Herkunftsangabe gebaut ist.
+punkt_an() {
+  local n="$1"
+  if [ -n "$ONLY" ]; then case ",$ONLY," in *",$n,"*) ;; *) return 1 ;; esac; fi
+  if [ -n "$SKIP" ]; then case ",$SKIP," in *",$n,"*) return 1 ;; esac; fi
+  return 0
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUSWERTUNG — liest NUR die Aufzeichnung, startet nichts.
+# ══════════════════════════════════════════════════════════════════════════════
+# Steht vor dem Messteil, weil `analyze` sie allein benutzt. Sie bekommt das
+# Aufnahmeverzeichnis und schreibt Bericht (stdout) und Entwurf (JSON).
+auswerten() {
+  local dir="$1" jsonout="${2:-}"
+  /usr/bin/python3 - "$dir" "$jsonout" <<'PY'
+import json, os, re, sys
+
+DIR, JSONOUT = sys.argv[1], sys.argv[2]
+
+def lies(name):
+    p = os.path.join(DIR, name)
+    try:
+        return open(p, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+
+def liesjson(name, default=None):
+    t = lies(name)
+    if t is None:
+        return default
+    try:
+        return json.loads(t)
+    except Exception:
+        return default
+
+META = liesjson("meta.json", {}) or {}
+HID = META.get("harness") or "?"
+
+# Herkunft ist ein Vertrag, kein Freitext: genau drei Werte, und "raten" ist keiner.
+def feld(wert, herkunft, grund="", belege=None):
+    d = {"wert": wert, "herkunft": herkunft}
+    if grund:
+        d["grund"] = grund
+    if belege:
+        d["belege"] = belege
+    return d
+
+def offen(grund):
+    return feld(None, "nicht ermittelbar", grund)
+
+# 2026-08-11: 'session' loest 'contextSession' ab (SPEC-V4 6.3, Kopfkommentar von
+# shell/models.default.json) -- der GEMEINSAME Block ueber die Gespraechsquelle, den
+# context-guard UND die Chat-Ansicht lesen. probe.datum bleibt hier IMMER leer: das
+# ist ein ENTWURF, kein Registry-Eintrag, und "OHNE Messdatum kein Eintrag" gilt erst,
+# wenn ein Mensch ihn uebernimmt.
+def session_wert(via, grund=None, ort=None, format=None, zuordnung="", live=False,
+                  zeigtNicht=None, ablage=None, beleg=None):
+    d = {"via": via, "ort": ort, "format": format, "maxAgeSec": None,
+         "zuordnung": zuordnung, "live": live, "eingabe": "pane",
+         "zeigtNicht": zeigtNicht or [],
+         "probe": {"datum": None, "beleg": beleg}}
+    if via == "":
+        d["grund"] = grund or ""
+    if ablage:
+        d["ablage"] = ablage
+    return d
+
+ENTWURF = {}
+BERICHT = []
+
+def sag(*zeilen):
+    BERICHT.extend(zeilen)
+
+# ── Kandidaten fuer Zeilenmuster ───────────────────────────────────────────────
+# Drei Bauarten, weil die zehn gemessenen TUIs genau drei Sorten Eingabezeile
+# haben: ein Prompt-Zeichen am Zeilenanfang (aider, goose, agy, codex), eine
+# beschriftete Kastenkante (kimi: '── input ─────') und eine Fusszeile mit einem
+# Tastaturhinweis (opencode: 'ctrl+p commands'). Rahmen-/Boxzeichen allein sind
+# NIE ein Muster — sie stehen beim Booten schon da (aider 0.86.2, 2026-07-28).
+PROMPTZEICHEN = "❯>›»▶$#%◆●"
+RAHMEN = lambda c: 0x2500 <= ord(c) <= 0x257F
+
+
+def kandidaten(text):
+    """Musterkandidaten aus einem gerenderten Bildschirm. Jeder Kandidat traegt,
+    WIE er entstanden ist — das steht spaeter im Bericht, damit ein Mensch die
+    Herleitung nachvollziehen kann statt einem Regex zu glauben."""
+    aus = []
+    zeilen = [z.rstrip() for z in (text or "").splitlines()]
+    nichtleer = [z for z in zeilen if z.strip()]
+    if not nichtleer:
+        return aus
+
+    # (a) Prompt-Zeichen, verankert auf die letzte nicht-leere Zeile.
+    letzte = nichtleer[-1]
+    t = letzte.lstrip()
+    if t and not RAHMEN(t[0]) and t[0] in PROMPTZEICHEN:
+        lead = letzte[:len(letzte) - len(t)]
+        aus.append({"muster": "^" + re.escape(lead) + re.escape(t[0]),
+                    "art": "Prompt-Zeichen am Anfang der letzten nicht-leeren Zeile"})
+
+    # (b) beschriftete Kastenkante: '── input ───…' / '┌─ chat ─'. Verankert bis
+    # EINSCHLIESSLICH des Zeichens hinter der Beschriftung, damit das Muster die
+    # Kante meint und nicht irgendeine Zeile, die zufaellig 'input' enthaelt.
+    #
+    # Gesucht wird im GANZEN Bildschirm, nicht in den letzten Zeilen. Bei kimi 1.49.0
+    # steht '── input ───…' in Zeile 15 von 50, weil die Eingabebox oben sitzt und
+    # darunter noch die Statuszeile und eine Fusszeile folgen (gemessen 2026-08-08).
+    # Mit dem Fenster der letzten zwoelf Zeilen fand die Probe sie nicht und meldete
+    # 'keine Eingabezeile erkennbar' — bei einem Harness, der sie deutlich anschreibt.
+    for z in zeilen:
+        m = re.match(r"^([─-╿]{2,})\s*([A-Za-z][A-Za-z0-9 _-]{0,14}?)\s*[─-╿]", z)
+        if m:
+            k = "^" + re.escape(m.group(1) + " " + m.group(2) + " ") + "[─-╿]"
+            if not any(x["muster"] == k for x in aus):
+                aus.append({"muster": k, "art": "beschriftete Kastenkante der Eingabebox"})
+
+    # (c) Tastaturhinweis in der Fusszeile. NICHT verankert: die Fusszeile wandert
+    # mit der Fensterbreite, und opencode traegt sie mitten in einer Zeile.
+    for z in nichtleer[-8:]:
+        for m in re.finditer(r"(ctrl\+[a-z])\s+([a-z]{3,12})", z, re.I):
+            k = m.group(1).replace("+", "\\+") + " " + m.group(2)
+            if not any(x["muster"] == k for x in aus):
+                aus.append({"muster": k, "art": "Tastaturhinweis in der Fusszeile"})
+    return aus
+
+
+def trifft(muster, text):
+    if text is None:
+        return False
+    try:
+        return re.search(muster, text, re.M) is not None
+    except re.error:
+        return False
+
+
+# ══ Punkt 1 — readyPattern in drei Zustaenden ═════════════════════════════════
+LEER = lies("ready-leer.txt")
+GETIPPT = lies("ready-getippt.txt")
+LAUFEND = lies("ready-laufend.txt")
+
+# Der Gegenprobe-Bildschirm. Ein Muster, das schon VOR der Eingabebereitschaft
+# trifft, feuert, waehrend das Modell noch laedt — und ein Task, der dann eingefuegt
+# wird, verschwindet. Zwei Gegenproben, und sie sind verschieden viel wert:
+#   * ein LEERER Bildschirm (hier synthetisch) schliesst jedes Muster aus, das auf
+#     Nichts trifft. Diese Probe gilt immer.
+#   * die frueheste Abtastung gilt nur dann als Boot-Bildschirm, wenn sie sich vom
+#     fertigen Bild UNTERSCHEIDET. Bei goose erschien die TUI schon im ersten
+#     0,4-s-Schritt; die frueheste Abtastung IST dort der fertige Bildschirm, und
+#     sie als Gegenprobe zu nehmen wuerde jedes richtige Muster verwerfen.
+LEERSCHIRM = "\n\n   \n\n"
+_boot_roh = lies("boot-fruehestens.txt")
+BOOT = None
+BOOT_HINWEIS = ""
+if _boot_roh is not None and _boot_roh.strip():
+    if LEER is not None and _boot_roh.strip() == (LEER or "").strip():
+        BOOT_HINWEIS = ("die TUI stand schon im ersten Abtastschritt (0,4 s) — es gibt keinen "
+                        "Boot-Bildschirm zum Gegenpruefen. Das ist selbst ein Messergebnis: das "
+                        "Muster ist nicht frueher da als die Eingabebereitschaft.")
+    else:
+        BOOT = _boot_roh
+        BOOT_HINWEIS = "die frueheste Abtastung unterscheidet sich vom fertigen Bild — sie gilt als Boot-Bildschirm."
+else:
+    BOOT_HINWEIS = "die frueheste Abtastung war leer."
+
+sag("── 1 readyPattern ─────────────────────────────────────────────────────────")
+if BOOT_HINWEIS:
+    sag("  Gegenprobe: %s" % BOOT_HINWEIS)
+if LEER is None:
+    ENTWURF["readyPattern"] = offen("Punkt 1 wurde nicht gemessen (uebersprungen oder Start gescheitert)")
+    sag("  nicht gemessen.")
+else:
+    kand = []
+    for quelle, txt in (("leer", LEER), ("getippt", GETIPPT), ("laufend", LAUFEND)):
+        for k in kandidaten(txt):
+            if not any(x["muster"] == k["muster"] for x in kand):
+                k["gefunden_in"] = quelle
+                kand.append(k)
+    for k in kand:
+        k["zustaende"] = [z for z, t in (("leer", LEER), ("getippt", GETIPPT), ("laufend", LAUFEND))
+                          if trifft(k["muster"], t)]
+        k["trifft_bootschirm"] = trifft(k["muster"], BOOT)
+        k["trifft_leerschirm"] = trifft(k["muster"], LEERSCHIRM)
+        k["alle_drei"] = len(k["zustaende"]) == 3
+        k["empfohlen"] = bool(k["alle_drei"] and not k["trifft_bootschirm"]
+                              and not k["trifft_leerschirm"])
+    empf = [k for k in kand if k["empfohlen"]]
+    if empf:
+        ENTWURF["readyPattern"] = feld(empf[0]["muster"], "gemessen",
+                                       "trifft alle drei Zustaende (leer, getippt, laufende Antwort) "
+                                       "und nicht den leeren Startbildschirm",
+                                       belege=kand)
+    elif kand:
+        ENTWURF["readyPattern"] = offen(
+            "kein Kandidat trifft alle drei Zustaende — ein Muster, das nur den leeren "
+            "Zustand trifft, verschwindet beim ersten Tastendruck (der opencode-Fehler). "
+            "Kandidaten stehen unter 'belege'.")
+        ENTWURF["readyPattern"]["belege"] = kand
+    else:
+        ENTWURF["readyPattern"] = offen(
+            "auf dem aufgezeichneten Bildschirm ist keine Eingabezeile der drei bekannten "
+            "Bauarten zu erkennen (Prompt-Zeichen / beschriftete Kastenkante / Fusszeilen-Hinweis)")
+    # Die eine Zeile, die ein Mensch sucht — und an der die Registry-Suite haengt.
+    if empf:
+        sag("  VORSCHLAG readyPattern: %s" % empf[0]["muster"])
+    else:
+        sag("  KEIN VORSCHLAG: kein Kandidat trifft alle drei Zustaende.")
+    for k in kand:
+        sag("  %-38s %-10s Zustaende: %-26s %s"
+            % (k["muster"], "EMPFOHLEN" if k["empfohlen"] else "",
+               ",".join(k["zustaende"]) or "keiner",
+               ("TRIFFT AUCH DEN BOOTSCHIRM" if k["trifft_bootschirm"] else "")
+               + (" TRIFFT DEN LEEREN BILDSCHIRM" if k["trifft_leerschirm"] else "")))
+        sag("      %s" % k["art"])
+    if not empf:
+        sag("  KEIN Kandidat trifft alle drei Zustaende — nichts empfohlen.")
+
+# ══ Punkt 2 — promptPattern / promptIgnore ════════════════════════════════════
+# Geprueft wird in der Form, die pi-worker WIRKLICH benutzt:
+#     zeile=$(grep -E "<muster>" <bildschirm> | tail -1)
+#     grep -qE "<muster>[[:space:]]+[^[:space:]]"  <<< "$zeile"    # haengt noch?
+# Jede andere Form misst etwas anderes als der Betrieb.
+sag("", "── 2 promptPattern / promptIgnore ─────────────────────────────────────────")
+
+
+def letzte_trefferzeile(muster, text):
+    if text is None:
+        return None
+    tr = [z for z in text.splitlines() if re.search(muster, z)]
+    return tr[-1] if tr else None
+
+
+def haengt(muster, zeile):
+    if zeile is None:
+        return False
+    return re.search(muster + r"[ \t]+[^ \t]", zeile) is not None
+
+
+if GETIPPT is None or LEER is None:
+    ENTWURF["promptPattern"] = offen("Punkt 2 wurde nicht gemessen")
+    sag("  nicht gemessen.")
+else:
+    marke = META.get("tippmarke") or ""
+    pk = []
+    for k in kandidaten(GETIPPT) + kandidaten(LEER):
+        if any(x["muster"] == k["muster"] for x in pk):
+            continue
+        m = k["muster"]
+        zg = letzte_trefferzeile(m, GETIPPT)
+        zl = letzte_trefferzeile(m, LEER)
+        fallen = []
+        # FALLE A — ein Muster, das selbst auf Leerraum endet, verlangt anschliessend
+        # ein ZWEITES Leerzeichen und trifft nie: jeder haengende Auftrag gaelte als
+        # abgeschickt (goose, 2026-08-08).
+        if re.search(r"(\\?[ \t]|\[\[:space:\]\]|\\s)$", m):
+            fallen.append("Muster endet auf Leerraum — die Pruefung verlangt danach ein "
+                          "ZWEITES Leerzeichen und trifft nie; jeder haengende Auftrag "
+                          "gaelte als abgeschickt")
+        # FALLE B — die letzte Trefferzeile ist gar nicht die Eingabezeile, sondern
+        # eine zweite Zeile mit demselben Zeichen darunter (opencode: die Statuszeile
+        # ist immer die unterste Kastenzeile).
+        if zg is not None and marke and marke not in zg:
+            fallen.append("die letzte Trefferzeile ist nicht die Eingabezeile, sondern "
+                          "'%s' — darunter steht eine zweite Zeile derselben Form" % zg.strip()[:60])
+        # FALLE C — die LEERE Box traegt einen Platzhalter; ohne promptIgnore meldete
+        # jeder Auftrag "haengt noch" (codex 0.145).
+        pign = None
+        if haengt(m, zl):
+            # Nur die ersten Woerter des Platzhalters, nicht die ganze Zeile: der
+            # Rest ist Tastaturhinweis und aendert sich mit jeder Fassung des
+            # Werkzeugs. Ein promptIgnore, das an einer Versionsnummer haengt, ist
+            # beim naechsten Update still kaputt.
+            roh = (zl or "").strip()
+            kurz = " ".join(roh.split()[:4])
+            pign = "^" + re.escape(kurz)
+            fallen.append("die LEERE Eingabezeile traegt einen Platzhalter ('%s') — ohne "
+                          "promptIgnore meldete jeder Auftrag 'haengt noch'" % (zl or "").strip()[:60])
+        k2 = dict(k)
+        k2.update({"zeile_getippt": zg, "zeile_leer": zl,
+                   "haengt_bei_text": haengt(m, zg),
+                   "haengt_bei_leer": haengt(m, zl),
+                   "fallen": fallen,
+                   "promptIgnore_vorschlag": pign})
+        k2["brauchbar"] = bool(k2["haengt_bei_text"] and (not k2["haengt_bei_leer"] or pign)
+                               and not any(f.startswith("die letzte Trefferzeile") for f in fallen))
+        pk.append(k2)
+    gut = [k for k in pk if k["brauchbar"]]
+    if gut:
+        ENTWURF["promptPattern"] = feld(gut[0]["muster"], "gemessen",
+                                        "trifft die Eingabezeile mit Text in der Form, die pi-worker "
+                                        "benutzt, und meldet die leere Box nicht als haengend",
+                                        belege=pk)
+        ENTWURF["promptIgnore"] = (feld(gut[0]["promptIgnore_vorschlag"], "gemessen",
+                                        "Platzhalter der leeren Eingabezeile")
+                                   if gut[0]["promptIgnore_vorschlag"]
+                                   else feld(None, "gemessen", "die leere Eingabezeile traegt keinen "
+                                                              "Platzhalter — promptIgnore ist unnoetig"))
+    else:
+        ENTWURF["promptPattern"] = feld(
+            None, "gemessen",
+            "KEIN promptPattern moeglich — und das ist ein Messergebnis, kein Versaeumnis. "
+            "Kein Kandidat erfuellt beides: die Eingabezeile treffen UND bei getipptem Text "
+            "anschlagen. Der Spawn sagt dann ehrlich 'Submission NICHT verifizierbar' statt "
+            "einen haengenden Auftrag als abgeschickt zu melden (kimi, opencode).",
+            belege=pk)
+        ENTWURF["promptIgnore"] = feld(None, "gemessen", "ohne promptPattern gegenstandslos")
+    for k in pk:
+        sag("  %-38s %s" % (k["muster"],
+                            "BRAUCHBAR" if k["brauchbar"] else "unbrauchbar"))
+        sag("      getippt -> %s | leer -> %s"
+            % ("haengt" if k["haengt_bei_text"] else "kein Treffer",
+               "haengt" if k["haengt_bei_leer"] else "frei"))
+        for f in k["fallen"]:
+            sag("      FALLE: %s" % f)
+    if not pk:
+        sag("  keine Kandidaten.")
+
+# ══ Punkt 3 — Kontextauslastung ═══════════════════════════════════════════════
+# Die Kontextwache liest die letzten FUENF Zeilen des Panes. Was weiter oben
+# steht, sieht sie nie — deshalb wird hier auch genau dort gesucht.
+sag("", "── 3 Kontextauslastung ────────────────────────────────────────────────────")
+PROZENT = re.compile(r"([0-9]{1,3})(?:\.[0-9]+)?\s?%")
+PAAR = re.compile(r"[0-9]+(?:\.[0-9]+)?[kKmM]?\s?/\s?[0-9]+(?:\.[0-9]+)?[kKmM]")
+
+
+def letzte_fuenf(text):
+    """Genau das Fenster, das die Kontextwache liest — nachgebaut, nicht idealisiert.
+    Sie holt `cap=$(tmux capture-pane -p …)`, und die Kommando-Ersetzung schneidet
+    ABSCHLIESSENDE Leerzeilen weg; erst danach kommt `tail -5`. Wer hier stur die
+    letzten fuenf Zeilen der Rohaufnahme nimmt, sieht bei einem 50-Zeilen-Pane fuenf
+    leere Zeilen und meldet 'keine Anzeige', obwohl der Balken zwei Zeilen darueber
+    steht (gemessen an der ersten goose-Aufnahme, 2026-08-08)."""
+    z = (text or "").splitlines()
+    while z and not z[-1].strip():
+        z.pop()
+    return "\n".join(z[-5:])
+
+
+ctx_treffer = []
+for name, txt in (("leer", LEER), ("getippt", GETIPPT), ("laufend", LAUFEND),
+                  ("nach-zug", lies("kontext-nach-zug.txt"))):
+    if txt is None:
+        continue
+    f5 = letzte_fuenf(txt)
+    for z in f5.splitlines():
+        if PROZENT.search(z):
+            ctx_treffer.append({"zustand": name, "zeile": z.strip(),
+                                "hat_paar": bool(PAAR.search(z))})
+SITZUNG = liesjson("sitzungsdateien.json", []) or []
+if ctx_treffer:
+    # Verankert wird NACH RECHTS, nicht nach links, und nie an einem Rahmenzeichen.
+    # Links vom Prozentwert steht bei goose und aehnlichen TUIs der Fortschrittsbalken
+    # ('╌╌╌╌' vor dem Zug, '━╌╌╌' danach) — ein Muster mit diesem Vorspann trifft
+    # genau den Startzustand und danach nie wieder. Rechts steht dagegen das
+    # Zahlenpaar, und dessen FORM ('4k/128k') aendert sich nicht. Dieselbe Regel wie
+    # beim readyPattern: Rahmen-/Boxzeichen sind nie Teil eines Musters.
+    treffer_zeilen = [t["zeile"] for t in ctx_treffer]
+    z = treffer_zeilen[-1]
+    m = PROZENT.search(z)
+    komma = r"\.[0-9]+" if "." in m.group(0) else ""
+    kern = r"([0-9]{1,3})" + komma + r"\s?%"
+    nach = z[m.end():]
+    paar = PAAR.search(nach)
+    if paar and paar.start() <= 3:
+        zwischen = re.escape(nach[:paar.start()]) if nach[:paar.start()] else ""
+        muster = kern + zwischen + r"\s?[0-9.]+[kKmM]?/[0-9.]+[kKmM]?"
+        grund = ("Prozentanzeige in den letzten fuenf Zeilen, nach RECHTS auf das Zahlenpaar "
+                 "verankert. Der Balken links davon aendert sich von Zug zu Zug und taugt "
+                 "nicht als Anker; Rahmenzeichen kommen in kein Muster.")
+    else:
+        wort = re.search(r"([A-Za-z][A-Za-z ]{2,14}?)[: ]+$", z[:m.start()])
+        vor = re.escape(wort.group(1).strip()) + r"[: ]+" if wort else ""
+        muster = vor + kern
+        grund = ("Prozentanzeige in den letzten fuenf Zeilen%s. Kein Zahlenpaar dahinter, "
+                 "also am Beschriftungswort davor verankert — Rahmenzeichen kommen in kein "
+                 "Muster." % (", verankert an '%s'" % wort.group(1).strip() if wort else ""))
+    # Gegenprobe an ALLEN Trefferzeilen: ein Muster, das nur den Startbildschirm
+    # trifft, meldete spaeter jeden Pane als 0 % — schlimmer als gar kein Muster.
+    passt_ueberall = all(re.search(muster, t) for t in treffer_zeilen)
+    ENTWURF["contextPattern"] = feld(
+        muster, "gemessen" if passt_ueberall else "nicht ermittelbar",
+        grund + (" Es trifft alle %d aufgezeichneten Anzeigezeilen." % len(treffer_zeilen)
+                 if passt_ueberall else
+                 " ACHTUNG: es trifft NICHT jede aufgezeichnete Anzeigezeile — so nicht "
+                 "eintragen, sonst meldet die Wache spaeter falsche Zahlen."),
+        belege=ctx_treffer)
+    for t in ctx_treffer:
+        sag("  %-9s %s%s" % (t["zustand"], t["zeile"][:100],
+                             "   (traegt auch das Zahlenpaar)" if t["hat_paar"] else ""))
+    sag("  Vorschlag: %s" % muster)
+else:
+    if SITZUNG:
+        ENTWURF["contextPattern"] = feld(None, "gemessen",
+                                         "keine Prozentanzeige in den letzten fuenf Zeilen — dieser "
+                                         "Harness zeigt seine Auslastung nicht an")
+        sag("  keine Prozentanzeige. Sitzungsdateien, die waehrend der Messung geschrieben wurden:")
+    else:
+        ENTWURF["contextPattern"] = offen(
+            "keine Prozentanzeige in den letzten fuenf Zeilen UND keine Sitzungsdatei mit "
+            "Tokenzahlen gefunden — DIESER HARNESS BLEIBT UNBEWACHT. Das ist eine Aussage, "
+            "kein fehlendes Feld: der Guard behandelt solche Panes als UNBEKANNT, nie als "
+            "unkritisch. Nichts wird geschaetzt.")
+        sag("  keine Prozentanzeige und keine Sitzungsdatei mit Tokenzahlen —"
+            " DIESER HARNESS BLIEBE UNBEWACHT.")
+if SITZUNG:
+    mit = [s for s in SITZUNG if s.get("hat_tokenzahlen")]
+    for s in SITZUNG:
+        sag("  %-58s %s" % (s.get("pfad", "?"),
+                            "TOKENZAHLEN GEFUNDEN" if s.get("hat_tokenzahlen") else "keine Tokenzahl"))
+    if mit and ctx_treffer:
+        # Zeigt der Bildschirm die Auslastung, ist eine Sitzungsquelle UNNOETIG —
+        # nicht offen. Die Wache liest die Anzeige, und eine zweite Quelle zu bauen,
+        # um dieselbe Zahl noch einmal zu holen, waere Aufwand ohne Gewinn (so steht
+        # es auch in den Handeintraegen von goose und kimi). Die gefundene Datei
+        # bleibt als 'ablage' vermerkt, falls die Anzeige spaeter wegfaellt.
+        ENTWURF["session"] = feld(
+            session_wert(
+                "", grund=("unnoetig: die Anzeige nennt die Zahlen selbst (siehe "
+                           "contextPattern). Der Harness schreibt sie zwar auch in eine "
+                           "Datei, aber eine zweite Quelle fuer dieselbe Zahl ist Aufwand "
+                           "ohne Gewinn."),
+                zeigtNicht=["freigabedialog", "arbeits-anzeige"],
+                ablage=mit[0].get("pfad"),
+                beleg="Sitzungsdatei(en) mit Tokenzahlen gefunden, aber die Bildschirmanzeige "
+                      "deckt die Kontextwache bereits ab (siehe contextPattern)."),
+            "gemessen",
+            "unnoetig: die Anzeige nennt die Zahlen selbst (siehe contextPattern). Der "
+            "Harness schreibt sie zwar auch in eine Datei, aber eine zweite Quelle fuer "
+            "dieselbe Zahl ist Aufwand ohne Gewinn.", belege=SITZUNG)
+    elif mit:
+        fmt = mit[0].get("formatvorschlag")
+        ENTWURF["session"] = feld(
+            session_wert(
+                "sessionFile" if fmt else "",
+                grund=None if fmt else (
+                    "Datei traegt Tokenzahlen, aber in keinem der drei gebauten Formate "
+                    "(codex-jsonl, aider-chat-history, crush-sqlite) — ein neues Format "
+                    "waere zu bauen, geschaetzt wird nichts"),
+                ort=mit[0].get("pfad"), format=fmt,
+                zuordnung="cwd" if fmt else "", live=bool(fmt),
+                zeigtNicht=(["freigabedialog", "arbeits-anzeige"] if fmt else
+                            ["freigabedialog", "kontextauslastung", "arbeits-anzeige"]),
+                beleg=mit[0].get("beleg")),
+            "gemessen" if fmt else "nicht ermittelbar",
+            ("Datei traegt echte Tokenzahlen; das Format ist eins der drei gebauten"
+             if fmt else
+             "Datei traegt Tokenzahlen, aber in keinem der drei gebauten Formate "
+             "(codex-jsonl, aider-chat-history, crush-sqlite) — ein neues Format waere zu bauen, "
+             "geschaetzt wird nichts"),
+            belege=SITZUNG)
+    else:
+        ENTWURF["session"] = feld(
+            session_wert(
+                "", grund=("die geschriebenen Sitzungsdateien tragen keine Tokenzahlen — aus "
+                           "Dateigroesse oder Zeichenzahl wird nichts geschaetzt"),
+                zeigtNicht=["freigabedialog", "kontextauslastung", "arbeits-anzeige"],
+                beleg="keine der gefundenen Sitzungsdateien traegt eine erkennbare Tokenzahl"),
+            "gemessen",
+            "die geschriebenen Sitzungsdateien tragen keine Tokenzahlen — "
+            "aus Dateigroesse oder Zeichenzahl wird nichts geschaetzt")
+
+# ══ Punkt 4 — systemPrompt (Kennwort-Probe) ═══════════════════════════════════
+sag("", "── 4 systemPrompt (Rollen-Weg) ────────────────────────────────────────────")
+ROLLE = liesjson("rollen.json", None)
+if ROLLE is None:
+    ENTWURF["systemPrompt"] = offen("Punkt 4 wurde nicht gemessen")
+    sag("  nicht gemessen.")
+else:
+    antwort = (ROLLE.get("antwort") or "")
+    treffer = [k for k in ROLLE.get("kandidaten", []) if k.get("kennwort") and k["kennwort"] in antwort]
+    # Treffen MEHRERE Wege, gewinnt der harness-EIGENE (.goosehints, CRUSH.md) vor dem
+    # geteilten (AGENTS.md, CLAUDE.md). Grund: agy, codex, opencode und kimi lesen
+    # alle dieselbe AGENTS.md. Zwei Worker verschiedener Rolle im selben Verzeichnis
+    # lehnt der Rollen-Generator ohnehin ab, aber ein eigener Weg macht die Frage
+    # gar nicht erst auf — und er bleibt richtig, wenn spaeter ein zweiter Harness
+    # im selben Baum arbeitet.
+    GETEILT = {"AGENTS.md", "CLAUDE.md"}
+    treffer.sort(key=lambda k: (k.get("datei") in GETEILT,))
+    for k in ROLLE.get("kandidaten", []):
+        sag("  %-22s %s" % (k.get("datei"), "KENNWORT KAM ZURUECK" if k in treffer else "kein Rueckläufer"))
+    if len(treffer) > 1:
+        sag("  Mehrere Wege wirken. Gewaehlt: %s (harness-eigen schlaegt geteilt — AGENTS.md "
+            "und CLAUDE.md lesen mehrere Harnesses)." % treffer[0]["datei"])
+    if treffer:
+        ENTWURF["systemPrompt"] = feld(
+            {"style": "file", "projectPath": treffer[0]["datei"]}, "gemessen",
+            "Kennwort aus dieser Datei kam in der Antwort zurueck; projectPath (Datei im "
+            "ARBEITSVERZEICHNIS), damit zwei Worker sich nicht dieselbe Rollendatei "
+            "ueberschreiben",
+            belege={"antwort": antwort[:800], "kandidaten": ROLLE.get("kandidaten")})
+    elif ROLLE.get("flagweg"):
+        ENTWURF["systemPrompt"] = feld(
+            {"style": "flag-content", "flag": ROLLE["flagweg"]}, "aus der Hilfe gelesen",
+            "keine Kandidatendatei kam zurueck; die Hilfe des Werkzeugs nennt aber diesen "
+            "Weg — VOR dem Eintragen mit einem Kennwort gegenpruefen",
+            belege={"antwort": antwort[:800]})
+        sag("  keine Datei traf. Aus der Hilfe gelesen: %s" % ROLLE["flagweg"])
+    else:
+        ENTWURF["systemPrompt"] = offen(
+            "KEIN ROLLEN-WEG GEFUNDEN — weder eine Kandidatendatei noch ein Flag in der Hilfe. "
+            "Ein Harness ohne Rollen-Weg ist NICHT integriert: sein Worker weiss dann nicht, "
+            "dass er nie pushen darf und eine Ergebnisdatei schreiben muss.")
+        sag("  KEIN ROLLEN-WEG GEFUNDEN — dieser Harness ist damit nicht integrierbar.")
+
+# ══ Punkt 5 — resume ══════════════════════════════════════════════════════════
+sag("", "── 5 resume ───────────────────────────────────────────────────────────────")
+RES = liesjson("resume.json", None)
+if RES is None:
+    ENTWURF["resume"] = offen("Punkt 5 wurde nicht gemessen")
+    sag("  nicht gemessen.")
+else:
+    # Ein Harness muss den alten Verlauf nicht neu auf den Bildschirm zeichnen, um
+    # ihn fortzusetzen — goose tut es nicht. Deshalb zaehlt nicht nur das Kennwort,
+    # sondern auch das Fortsetz-Wort in der Kopfzeile, und zwar nur dann, wenn es im
+    # Start OHNE Flag NICHT steht (sonst waere es blosse Verzierung).
+    mit = bool(RES.get("mit_flag_verlauf")
+               or RES.get("zwei_kennwort")
+               or (RES.get("zwei_fortsetzwort") and not RES.get("vier_fortsetzwort")))
+    fremd = bool(RES.get("fremdes_verzeichnis_erbt")
+                 or RES.get("drei_kennwort") or RES.get("drei_nennt_verzeichnis_a"))
+    ohne = RES.get("ohne_flag_leer")
+    if ohne is None:
+        ohne = not RES.get("vier_kennwort")
+    sag("  2 gleiches Verzeichnis, MIT Flag: %s" % ("setzt fort (richtig)" if mit else "kein Verlauf"))
+    sag("  3 FRISCHES Verzeichnis, MIT Flag: %s"
+        % ("ERBT die fremde Unterhaltung" if fremd else "leer (verzeichnisgebunden)"))
+    if RES.get("belegzeile_drei"):
+        sag("      Beleg: %s" % RES["belegzeile_drei"])
+    sag("  4 frisches Verzeichnis, ohne Flag: %s" % ("leer (richtig)" if ohne else "NICHT leer"))
+    if mit and ohne:
+        ENTWURF["resume"] = feld(
+            {"args": RES.get("flags"), "probe": "revive-only"}, "gemessen",
+            ("gemessen an vier Starts: mit Kennwort, dann MIT Flag im selben Verzeichnis "
+             "(Verlauf da), dann MIT Flag in einem FRISCHEN Verzeichnis (%s), dann ohne Flag "
+             "(leer). probe 'revive-only'%s. Fehlt das Feld, gilt 'always' — und dann erbt "
+             "jeder neue Worker eine fremde Unterhaltung, der opencode-Fehler."
+             % ("erbt die fremde Unterhaltung — das Flag setzt die ZULETZT BENUTZTE Sitzung "
+                "fort, nicht die des Verzeichnisses" if fremd else "bleibt leer, das Flag ist "
+                "also verzeichnisgebunden",
+                " ist damit ZWINGEND" if fremd else " bleibt trotzdem die sichere Wahl: es "
+                "kostet nichts und deckt den Fall ab, dass die Bindung sich mit einer neuen "
+                "Fassung des Werkzeugs aendert")))
+    elif not ohne:
+        ENTWURF["resume"] = offen(
+            "der Start OHNE Flag zeigte bereits Verlauf — dieser Harness setzt von selbst "
+            "fort. Ein Worker erbte damit eine fremde Unterhaltung, ohne dass ein Flag daran "
+            "schuld waere; das gehoert vor dem Einbau geklaert.")
+    else:
+        ENTWURF["resume"] = offen(
+            "das Fortsetzen-Flag zeigte auch im selben Verzeichnis keinen Verlauf — entweder "
+            "ist das Flag ein anderes, oder es gehoert hinter einen Unterbefehl (goose: "
+            "'goose session -r'; 'goose -r session' wird abgelehnt), oder das Modell hat den "
+            "ersten Auftrag nicht beantwortet und es gab gar keinen Verlauf")
+
+# ══ Punkt 6 — trustStore ══════════════════════════════════════════════════════
+sag("", "── 6 trustStore / Erststart-Dialog ────────────────────────────────────────")
+VERTRAUEN = re.compile(r"(trust|vertrau|do you (want|trust)|allow .* access|\[y/n\]|"
+                       r"\(y/N\)|yes\s*/\s*no|anonymous usage|telemetry)", re.I)
+dialog = None
+for name in ("boot-fruehestens.txt", "boot-mitte.txt", "ready-leer.txt"):
+    t = lies(name)
+    if t and VERTRAUEN.search(t):
+        dialog = {"datei": name, "zeilen": [z for z in t.splitlines() if VERTRAUEN.search(z)][:4]}
+        break
+if dialog:
+    ENTWURF["trustStore"] = offen(
+        "beim Erststart in einem FRISCHEN Verzeichnis erscheint ein Dialog, der auf eine "
+        "Antwort wartet: %s. BLIND ENTER ZU DRUECKEN IST DER FALSCHE WEG — daran ist agy "
+        "gescheitert: das readyPattern traf den Dialog, Enter bestaetigte ihn, der Auftrag "
+        "war weg. Zwei Stile sind gebaut (json-array, toml-section); welcher passt, sagt der "
+        "Ablageort, den die CLI dafuer benutzt — der ist hier NICHT gemessen."
+        % "; ".join(z.strip()[:70] for z in dialog["zeilen"]))
+    sag("  DIALOG GEFUNDEN in %s:" % dialog["datei"])
+    for z in dialog["zeilen"]:
+        sag("    %s" % z.strip()[:100])
+else:
+    ENTWURF["trustStore"] = feld(None, "gemessen",
+                                 "Erststart in einem frisch angelegten, leeren Arbeitsverzeichnis mit "
+                                 "umgelenktem HOME ging ohne Rueckfrage in die TUI — ein trustStore-Block "
+                                 "ist nicht noetig, und das ist ein Messergebnis, keine Auslassung")
+    sag("  kein Dialog — Erststart ging ohne Rueckfrage durch.")
+
+# ══ Punkt 7 — autonomy.args ═══════════════════════════════════════════════════
+sag("", "── 7 autonomy.args ────────────────────────────────────────────────────────")
+HELP = lies("help.txt") or ""
+VERDAECHTIG = ["--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox",
+               "--yolo", "--afk", "--approval-mode", "--auto", "--yes-always", "-y",
+               "--permission-mode", "--allow-all", "--full-auto", "--no-confirm"]
+gefunden = [f for f in VERDAECHTIG if re.search(r"(^|\s)" + re.escape(f) + r"(\s|=|,|$)", HELP, re.M)]
+ENVAUTO = re.findall(r"\b([A-Z][A-Z0-9_]{3,})_MODE\b", HELP)
+ENTWURF["autonomy"] = feld(
+    {"args": gefunden, "env": {"BROWSER": "/usr/bin/true"}},
+    "aus der Hilfe gelesen" if gefunden else "nicht ermittelbar",
+    ("BROWSER=/usr/bin/true steht IMMER dabei, egal welcher Harness: eine Messung darf nie "
+     "eine sichtbare Aktion ausloesen, und welcher fremde CLI beim ersten Start ein Fenster "
+     "aufreisst, weiss man vorher nicht (aider, 2026-07-28). Die Flags selbst sind GELESEN, "
+     "nicht gemessen — vor dem Eintragen einmal wirklich starten."
+     if gefunden else
+     "die Hilfe nennt keins der ueblichen Autonomie-Flags. ACHTUNG auf den Sonderfall: manche "
+     "CLI steuert Autonomie ueber eine UMGEBUNGSVARIABLE statt ein Flag (goose: GOOSE_MODE=auto). "
+     "Dann bleibt autonomy.args LEER, die Variable gehoert nach harness.env — und daraus folgt, "
+     "dass der Schalter workerSkipPermissions diesen Harness NICHT erreicht, weil er nur "
+     "autonomy.args abschaltet. Das gehoert in die notes."))
+if ENVAUTO:
+    ENTWURF["autonomy"]["hinweis_umgebung"] = (
+        "die Hilfe erwaehnt %s — pruefen, ob Autonomie hier ueber die Umgebung laeuft"
+        % ", ".join(sorted(set(e + "_MODE" for e in ENVAUTO))[:4]))
+sag("  Flags aus --help: %s" % (" ".join(gefunden) if gefunden else "keins der ueblichen"))
+sag("  BROWSER=/usr/bin/true wird immer gesetzt.")
+if ENVAUTO:
+    sag("  Umgebungs-Spur: %s" % ENTWURF["autonomy"]["hinweis_umgebung"])
+
+# ══ Punkt 8 — discover ════════════════════════════════════════════════════════
+sag("", "── 8 discover ─────────────────────────────────────────────────────────────")
+DISC = liesjson("discover.json", None)
+if DISC is None:
+    ENTWURF["discover"] = offen("Punkt 8 wurde nicht gemessen")
+    sag("  nicht gemessen.")
+elif DISC.get("ollama"):
+    ENTWURF["discover"] = feld({"source": "ollama", "provider": "ollama"}, "gemessen",
+                               "der Harness faehrt ueber Ollama (baseUrl/Provider in seiner "
+                               "Umgebung) — dann ist 'ollama list' die Quelle, wie bei pi")
+    sag("  faehrt ueber Ollama -> source 'ollama'.")
+elif DISC.get("ausgabe"):
+    zeilen = [z for z in DISC["ausgabe"].splitlines() if z.strip()][:6]
+    tab = sum(1 for z in zeilen if re.search(r"\s{2,}\S", z)) >= max(2, len(zeilen) // 2)
+    ENTWURF["discover"] = feld(
+        {"source": "command", "command": DISC.get("befehl"),
+         **({"separator": "whitespace"} if tab else {})},
+        "gemessen",
+        "'%s' listet Modelle%s" % (DISC.get("befehl"),
+                                   "; die Ausgabe ist tabellarisch, also braucht es einen separator"
+                                   if tab else ""),
+        belege=zeilen)
+    sag("  '%s' listet Modelle%s." % (DISC.get("befehl"), " (tabellarisch)" if tab else ""))
+else:
+    ENTWURF["discover"] = feld(None, "gemessen",
+                               "kein Unterbefehl listet Modelle. KEIN discover-Block eintragen — "
+                               "ein Block mit source 'none' meldet bei jedem Abruf einen Fehlschlag, "
+                               "wo gar nichts abzurufen ist (gemessen an kimi, 2026-08-08)")
+    sag("  kein Unterbefehl listet Modelle — KEIN discover-Block eintragen.")
+
+# ══ Punkt 9 — probe / notes ═══════════════════════════════════════════════════
+sag("", "── 9 probe / notes ────────────────────────────────────────────────────────")
+version = META.get("version") or "Version nicht ermittelbar"
+datum = META.get("datum") or "?"
+gemessen = [k for k, v in ENTWURF.items() if v.get("herkunft") == "gemessen"]
+gelesen = [k for k, v in ENTWURF.items() if v.get("herkunft") == "aus der Hilfe gelesen"]
+nichts = [k for k, v in ENTWURF.items() if v.get("herkunft") == "nicht ermittelbar"]
+probetext = (
+    "gemessen %s mit %s (%s) auf eigenem tmux-Socket, umgelenktem HOME, Modell %s. "
+    "GEMESSEN: %s. AUS DER HILFE GELESEN (ungeprueft): %s. NICHT ERMITTELBAR: %s. "
+    "Der Spawn-Beleg ist damit NICHT erbracht — ein Harness gilt erst als integriert, wenn "
+    "ein echter pi-worker-Lauf einen Auftrag angenommen und seine Ergebnisdatei geschrieben hat."
+    % (datum, HID, version, META.get("modell") or "?",
+       ", ".join(gemessen) or "nichts",
+       ", ".join(gelesen) or "nichts",
+       ", ".join("%s (%s)" % (k, ENTWURF[k].get("grund", "")[:120]) for k in nichts) or "nichts"))
+ENTWURF["probe"] = feld(probetext, "gemessen", "von wb-harness-probe selbst geschrieben")
+ENTWURF["notes"] = feld(
+    "ENTWURF von wb-harness-probe %s — vor dem Eintragen lesen. Felder mit herkunft "
+    "'aus der Hilfe gelesen' sind NICHT gemessen; Felder mit 'nicht ermittelbar' bleiben "
+    "leer, statt geraten zu werden." % datum, "gemessen", "Platzhalter, von Hand ergaenzen")
+sag("  %s" % probetext)
+
+# ── Ausgabe ───────────────────────────────────────────────────────────────────
+ausgabe = {"harness": HID, "meta": META, "entwurf": ENTWURF}
+sys.stdout.write("\n".join(BERICHT) + "\n\n")
+sys.stdout.write("══ REGISTRY-ENTWURF (Vorschlag, KEIN Eintrag) ══════════════════════════════\n")
+sys.stdout.write(json.dumps(ausgabe, indent=2, ensure_ascii=False) + "\n")
+if JSONOUT:
+    with open(JSONOUT, "w") as fh:
+        json.dump(ausgabe, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    sys.stdout.write("\nEntwurf auch in: %s\n" % JSONOUT)
+PY
+}
+
+if [ "$MODE" = "analyze" ]; then
+  [ -n "$HID" ] || { echo "wb-harness-probe analyze: <aufnahme-verzeichnis> fehlt." >&2; exit 1; }
+  [ -d "$HID" ] || { echo "wb-harness-probe analyze: '$HID' ist kein Verzeichnis." >&2; exit 1; }
+  auswerten "$HID" "$JSONOUT"
+  exit $?
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MESSTEIL
+# ══════════════════════════════════════════════════════════════════════════════
+[ -n "$HID" ] || { echo "wb-harness-probe: <harness-id> fehlt (z.B. codex, gemini, aider, opencode)." >&2; exit 1; }
+
+HJSON="$($HOME/.local/bin/wb-state harness get "$HID")" || exit 1
+BIN="$(printf '%s' "$HJSON" | /usr/bin/python3 -c 'import json,sys,os;print(os.path.expanduser(json.load(sys.stdin).get("command") or ""))')"
+if ! command -v "$BIN" >/dev/null 2>&1 && [ ! -x "$BIN" ]; then
+  echo "FEHLER: Binary '$BIN' fuer Harness '$HID' ist nicht installiert — nichts gemessen." >&2
+  echo "  Installation ist NICHT Aufgabe dieses Werkzeugs; erst installieren, dann erneut probieren." >&2
+  exit 1
+fi
+
+# Without a model the harness has nothing to start with: take the first registered
+# model of this harness, else say so instead of guessing a model reference.
+if [ -z "$MID" ]; then
+  MID="$($HOME/.local/bin/wb-state models list --harness "$HID" --all | head -1)"
+  [ -n "$MID" ] || { echo "FEHLER: kein Modell fuer Harness '$HID' registriert — Modell-id mitgeben: wb-harness-probe $HID <model-id>" >&2; exit 1; }
+  echo "wb-harness-probe: kein Modell angegeben, nehme '$MID'."
+fi
+
+# Normalfall: eigenes HOME, damit die Messung die echte Konfiguration nicht sieht
+# und nicht veraendert. --real-home ist der dokumentierte Ausweg fuer CLIs, deren
+# ERSTSTART-Dialoge (Ordner-Vertrauen, Tastenkuerzel, Anmeldung) im HOME liegen:
+# gemini und codex zeigen im leeren HOME eine Kette von Abfragen statt ihrer
+# Eingabezeile, das Muster ist dort schlicht nicht messbar. Mit --real-home wird
+# NUR GELESEN, was schon da ist — das Arbeitsverzeichnis bleibt ein Wegwerfordner.
+if [ -n "$REAL_HOME" ]; then
+  PHOME="$HOME"
+  PDIR="$(mktemp -d "${TMPDIR:-/tmp}/wb-harness-probe.XXXXXX")/work"; mkdir -p "$PDIR"
+  echo "wb-harness-probe: WARNUNG — messe mit dem ECHTEN HOME ($HOME). Der CLI sieht damit"
+  echo "  Deine Anmeldung und Deine Einstellungen; er kann sie auch aendern. Nur benutzen,"
+  echo "  wenn die Erststart-Dialoge anders nicht zu ueberspringen sind." >&2
+else
+  PHOME="$(mktemp -d "${TMPDIR:-/tmp}/wb-harness-probe.XXXXXX")"
+  PDIR="$PHOME/work"; mkdir -p "$PDIR"
+fi
+SESS="probe-$HID-$$"
+
+# Aufnahmeverzeichnis: entweder das genannte (bleibt stehen, wird zur Test-Fixture)
+# oder ein Wegwerfordner, der mit aufgeraeumt wird.
+if [ -n "$AUFNAHME" ]; then
+  mkdir -p "$AUFNAHME" || exit 1
+  AUFNAHME="$(cd "$AUFNAHME" && pwd)"
+  AUF_TEMP=""
+else
+  AUFNAHME="$(mktemp -d "${TMPDIR:-/tmp}/wb-harness-probe-auf.XXXXXX")"
+  AUF_TEMP=1
+fi
+
+cleanup() {
+  tmux -L "$SOCK" kill-server 2>/dev/null || true
+  # Mit --real-home ist PHOME das echte HOME — das wird NIE geloescht.
+  if [ -n "$REAL_HOME" ]; then rm -rf "${PDIR%/work}"; else rm -rf "$PHOME"; fi
+  [ -n "$AUF_TEMP" ] && rm -rf "$AUFNAHME"
+  if tmux -L "$SOCK" ls >/dev/null 2>&1; then
+    echo "WARNUNG: tmux-Server auf Socket '$SOCK' laeuft noch — selbst pruefen: tmux -L $SOCK ls" >&2
+  fi
+}
+trap cleanup EXIT INT TERM
+
+# Konfigurationsdateien dieses Harness IN DAS WEGWERF-HOME ausrollen (2026-08-08).
+# Ohne sie misst die Probe bei crush einen Modellwaehler und bei kimi einen
+# Startfehler — also nicht den Harness, sondern seine fehlende Voraussetzung. Das
+# echte HOME wird dabei nie angefasst: wb-harness-config bekommt HOME=$PHOME.
+#
+# Die beiden Werte werden VORHER berechnet, nicht in der Zuweisungsliste des Aufrufs.
+# `HOME=$PHOME WB_MODELS_FILE="$HOME/…"` sieht richtig aus und ist falsch: Zuweisungen
+# vor einem Kommando wirken der Reihe nach und sind fuer die naechste Expansion schon
+# gesetzt (gemessen in bash UND zsh) — `$HOME` meinte dort also bereits das Wegwerf-HOME,
+# in dem keine Registry liegt. Das Ausrollen meldete daraufhin "kimi nicht registriert",
+# und weil stderr weggeworfen wurde, sah man nur, dass kimi ohne Modell startete
+# ("Model: not set"). Deshalb steht hier auch kein 2>/dev/null mehr: ein Ausrollen, das
+# scheitert, muss man sehen.
+if [ -z "$REAL_HOME" ] && [ -x "$HOME/.local/bin/wb-harness-config" ]; then
+  WBHC="$HOME/.local/bin/wb-harness-config"
+  WBHC_REG="${WB_MODELS_FILE:-$HOME/.claude/workbench/models.json}"
+  HOME="$PHOME" WB_MODELS_FILE="$WBHC_REG" "$WBHC" apply "$HID" 2>&1 | sed 's/^/  konfig: /'
+fi
+
+# The start line comes from `wb-state models resolve` like every other spawn —
+# with --probe, the only mode that lifts the ready/key gates this tool exists to
+# fill in. Building a second, probe-only command line here would be exactly the
+# duplicate that drifts.
+resolve_cmd() {   # $1 = Arbeitsverzeichnis; druckt die Startzeile, setzt PRE
+  local d="$1" out
+  out="$($HOME/.local/bin/wb-state models resolve "$MID" --role worker --dir "$d" --name probe --probe)" || return 1
+  CMD=""; PRE=""
+  while IFS=$'\t' read -r key rest; do
+    case "$key" in
+      cmd) CMD="$rest" ;;
+      env)
+        VAR="${rest%%$'\t'*}"; VAL="${rest#*$'\t'}"
+        case "$VAL" in
+          @keychain:*|@file:*|@env:*) ;;   # no secrets in a probe, on purpose
+          *) PRE="$PRE export $(printf %q "$VAR")=$(printf %q "$VAL") &&" ;;
+        esac ;;
+    esac
+  done <<<"$out"
+  [ -n "$CMD" ]
+}
+resolve_cmd "$PDIR" || { echo "FEHLER: resolve lieferte kein Startkommando." >&2; exit 1; }
+
+# JEDER Aufruf des fremden Werkzeugs bekommt eine Frist und ein leeres stdin.
+# Ohne beides haengt die Probe: `<cli> --help` ist bei einem TUI-Programm keine
+# Auskunft, sondern ein Start — die Stellvertreter der Testsuite drehen dann in
+# `while :; do … read …; sleep 1; done` und kehren nie zurueck (gemessen 2026-08-08,
+# test-registry Abschnitt 9 lief unbegrenzt weiter). Fehlt `timeout` auf der
+# Maschine, werden die Punkte 7 und 8 nicht geraten, sondern ausgelassen und im
+# Entwurf als 'nicht ermittelbar' benannt.
+FRIST=""
+command -v timeout  >/dev/null 2>&1 && FRIST="timeout"
+[ -n "$FRIST" ] || { command -v gtimeout >/dev/null 2>&1 && FRIST="gtimeout"; }
+mit_frist() {   # $1 = Sekunden, Rest = Kommando
+  local s="$1"; shift
+  [ -n "$FRIST" ] || return 127
+  "$FRIST" "$s" "$@" </dev/null 2>&1
+}
+
+VERSION="$(mit_frist 10 "$BIN" --version | head -1)"
+[ -n "$VERSION" ] || VERSION="$(mit_frist 10 "$BIN" version | head -1)"
+case "$VERSION" in *"❯"*|*"usage"*|*"Usage"*) VERSION="" ;; esac
+
+echo "wb-harness-probe: $HID / $MID"
+echo "  Socket: tmux -L $SOCK   HOME: $PHOME   Dauer je Pane: bis ${SECONDS_MAX}s"
+echo "  Version: ${VERSION:-unbekannt}"
+echo "  Startzeile: $CMD"
+echo "  Aufnahme: $AUFNAHME"
+echo
+
+# ── Pane-Werkzeuge ─────────────────────────────────────────────────────────────
+# The command runs in a SUBSHELL and the pane sleeps afterwards. Without that, a
+# harness that exits at once (binary not on the pane's PATH, missing login) takes
+# the whole session with it before remain-on-exit can be set — the probe then shows
+# an empty screen instead of the error that explains it (measured).
+# PATH is handed in explicitly: `bash -l` runs path_helper, which rebuilds PATH from
+# the system defaults and would drop a harness installed under ~/.local/bin.
+# BROWSER wird IMMER neutralisiert, egal welcher Harness gemessen wird (Vorfall
+# 2026-07-28): aider beantwortet mit seinem Autonomie-Flag `--yes-always` seine
+# eigene Erststart-Frage "Release-Notes oeffnen?" mit JA und riss mitten in
+# Sitzung des Nutzers ein Browserfenster auf. Eine MESSUNG darf nie eine sichtbare
+# Aktion ausloesen — und welcher fremde CLI beim ersten Start ein Fenster oeffnet,
+# weiss man vorher nicht. Deshalb hier zentral, nicht je Preset.
+pane_start() {   # $1 = Sessionname, $2 = Startzeile
+  local s="$1" c="$2" pc
+  pc="export HOME=$(printf %q "$PHOME") && export PATH=$(printf %q "$PATH") && export BROWSER=/usr/bin/true && $PRE ( $c ) ; rc=\$?; printf '\n[probe: Prozess beendet, RC=%s]\n' \"\$rc\"; sleep 600"
+  tmux -L "$SOCK" new-session -d -s "$s" -x 200 -y 50 "bash -lc $(printf %q "$pc")" || return 1
+  # capture-pane needs a PANE target: '=<session>' is a SESSION target and fails with
+  # "can't find pane" (the same trap pi-worker documents for split-window/display).
+  PANE="$(tmux -L "$SOCK" list-panes -t "=$s" -F '#{pane_id}' 2>/dev/null | head -1)"
+  [ -n "$PANE" ]
+}
+pane_cap() { tmux -L "$SOCK" capture-pane -p -t "$PANE" 2>/dev/null || true; }  # NIE mit -e (SGR)
+pane_tippen() { tmux -L "$SOCK" send-keys -t "$PANE" -l "$1"; }
+pane_enter() { tmux -L "$SOCK" send-keys -t "$PANE" Enter; }
+pane_stop() { tmux -L "$SOCK" kill-session -t "=$1" 2>/dev/null || true; }
+
+# Warten, bis der Bildschirm STEHT und wie eine Eingabezeile aussieht. In
+# 0,4-Sekunden-Schritten, nicht sekundenweise: bei crush lag zwischen leerem
+# Bildschirm und fertiger TUI genau ein solcher Schritt (2026-08-08), und wer in
+# Sekunden abtastet, sieht den Uebergang nie und weiss deshalb nicht, ob sein
+# Muster frueher da ist als die Eingabebereitschaft.
+#
+# Abgebrochen wird erst, wenn der Bildschirm STEHT **und** wie eine Eingabezeile
+# aussieht. "Stabil" allein ist nicht "bereit": aider 0.86.2 stand sekundenlang
+# vollkommen still, waehrend sein lokales Modell lud, und zeigte sein `>` erst
+# nach etwa einer Minute (Befund 2026-07-28). Wer hier nur auf Stille wartet,
+# tippt in ein Bild, das noch keine Eingabe annimmt — und der Auftrag ist weg.
+# Die Erkennung ist dieselbe wie in der Auswertung: Prompt-Zeichen am Zeilenanfang,
+# beschriftete Kastenkante oder Fusszeilen-Hinweis; Rahmen-/Boxzeichen nie.
+sieht_bereit() {
+  printf '%s' "$1" | /usr/bin/python3 -c '
+import re, sys
+PROMPT = "❯>›»▶$#%◆●"
+zeilen = [z.rstrip() for z in sys.stdin.read().splitlines()]
+nichtleer = [z for z in zeilen if z.strip()]
+if not nichtleer:
+    sys.exit(1)
+t = nichtleer[-1].lstrip()
+if t and not (0x2500 <= ord(t[0]) <= 0x257F) and t[0] in PROMPT:
+    sys.exit(0)
+for z in zeilen:
+    if re.match(r"^[─-╿]{2,}\s*[A-Za-z][A-Za-z0-9 _-]{0,14}?\s*[─-╿]", z):
+        sys.exit(0)
+for z in nichtleer[-8:]:
+    if re.search(r"ctrl\+[a-z]\s+[a-z]{3,12}", z, re.I):
+        sys.exit(0)
+sys.exit(1)
+' 2>/dev/null
+}
+
+warte_bereit() {   # $1 = Sekunden
+  local schritte=$(( ${1:-60} * 10 / 4 )) i=0 prev="" stabil=0 cap=""
+  BOOT_FRUEH=""; BOOT_MITTE=""
+  while [ "$i" -lt "$schritte" ]; do
+    i=$((i+1))
+    perl -e 'select(undef,undef,undef,0.4)' 2>/dev/null || sleep 1
+    cap="$(pane_cap)"
+    [ "$i" -eq 1 ] && BOOT_FRUEH="$cap"
+    [ "$i" -eq 3 ] && BOOT_MITTE="$cap"
+    if [ -n "$(printf '%s' "$cap" | tr -d '[:space:]')" ] && [ "$cap" = "$prev" ]; then
+      stabil=$((stabil+1))
+    else
+      stabil=0
+    fi
+    prev="$cap"
+    [ "$stabil" -ge 5 ] || continue
+    sieht_bereit "$cap" || continue
+    BEREIT_NACH="$(echo "scale=1; $i*0.4" | bc 2>/dev/null || echo "$i")"
+    LETZTE_CAP="$cap"
+    return 0
+  done
+  LETZTE_CAP="$cap"; BEREIT_NACH=""
+  return 1
+}
+
+MARKE="probeauftrag-xyzzy"
+OHNE_EINGABEZEILE=""   # gesetzt, wenn Punkt 1 keine Eingabezeile gefunden hat
+
+# ══ Messung 1/2/3/6 — ein Pane, drei Zustaende ════════════════════════════════
+if punkt_an 1; then
+  echo "== Punkt 1/2/3/6: Start, drei Zustaende =="
+  if pane_start "$SESS" "$CMD"; then
+    warte_bereit "$SECONDS_MAX"
+    printf '%s\n' "$BOOT_FRUEH"  > "$AUFNAHME/boot-fruehestens.txt"
+    printf '%s\n' "$BOOT_MITTE"  > "$AUFNAHME/boot-mitte.txt"
+    printf '%s\n' "$LETZTE_CAP"  > "$AUFNAHME/ready-leer.txt"
+    if [ -n "$BEREIT_NACH" ]; then
+      echo "wb-harness-probe: Eingabezeile nach ${BEREIT_NACH}s (Bildschirm seit 2s stabil)."
+    else
+      echo "wb-harness-probe: in ${SECONDS_MAX}s ist keine Eingabezeile erschienen — es wird"
+      echo "  trotzdem aufgezeichnet, damit die Auswertung sagen kann, WAS stattdessen dastand."
+    fi
+    echo "  leer aufgezeichnet"
+    # In eine TUI, die keine Eingabezeile zeigt, wird NICHT getippt. Genau dafuer
+    # gibt es dieses Werkzeug: ein Text, der in ein noch bootendes Bild faellt, ist
+    # weg, und zwar spurlos. Wenn die Probe das selbst taete, waere sie das Problem,
+    # gegen das sie gebaut ist. Aufgezeichnet wird trotzdem — die Auswertung soll
+    # sagen koennen, WAS stattdessen dastand.
+    if [ -z "$BEREIT_NACH" ]; then
+      cp "$AUFNAHME/ready-leer.txt" "$AUFNAHME/ready-getippt.txt"
+      cp "$AUFNAHME/ready-leer.txt" "$AUFNAHME/ready-laufend.txt"
+      cp "$AUFNAHME/ready-leer.txt" "$AUFNAHME/kontext-nach-zug.txt"
+      echo "  keine Eingabezeile — es wird NICHT getippt (Punkte 2 und 3 bleiben offen)"
+      pane_stop "$SESS"
+      OHNE_EINGABEZEILE=1
+    else
+    pane_tippen "$MARKE"
+    perl -e 'select(undef,undef,undef,1.5)' 2>/dev/null || sleep 2
+    pane_cap > "$AUFNAHME/ready-getippt.txt"
+    echo "  getippt aufgezeichnet"
+    pane_enter
+    perl -e 'select(undef,undef,undef,2.0)' 2>/dev/null || sleep 2
+    pane_cap > "$AUFNAHME/ready-laufend.txt"
+    echo "  laufende Antwort aufgezeichnet"
+    # Nach dem Zug noch einmal: nur hier steht die Kontextanzeige auf einem Wert
+    # ungleich Null, und nur daran ist zu erkennen, ob das Muster wirklich die
+    # Zahl faengt statt nur die Null vom Start.
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      sleep 2
+      pane_cap > "$AUFNAHME/kontext-nach-zug.txt"
+      grep -qE '[1-9][0-9]?%|[1-9][0-9]*[kKmM]?/[0-9]' "$AUFNAHME/kontext-nach-zug.txt" && break
+    done
+    echo "  Zustand nach dem Zug aufgezeichnet"
+    pane_stop "$SESS"
+    # Punkt 3, zweite Quelle: was der Harness WAEHREND dieses Zugs selbst
+    # aufgeschrieben hat. Gesucht wird im Wegwerf-HOME und im Arbeitsverzeichnis,
+    # und gemeldet wird nur, was eine TOKENZAHL traegt. Aus einer Dateigroesse oder
+    # Zeichenzahl wird NICHTS geschaetzt — eine Schaetzung waere von einer Messung
+    # nicht mehr zu unterscheiden, und die Kontextwache tippt auf diese Zahl hin in
+    # fremde Panes (SPEC-V3 A.2 contextSession).
+    /usr/bin/python3 - "$PHOME" "$PDIR" "$AUFNAHME/sitzungsdateien.json" <<'PYS'
+import json, os, re, sys
+phome, pdir, out = sys.argv[1], sys.argv[2], sys.argv[3]
+TOKEN = re.compile(r'(total_tokens|input_tokens|prompt_tokens|"tokens"|Tokens:\s*\d|token_count|'
+                   r'cached_input_tokens|context_window)', re.I)
+FORMAT = [(re.compile(r"rollout-.*\.jsonl$"), "codex-jsonl"),
+          (re.compile(r"\.aider\.chat\.history\.md$"), "aider-chat-history"),
+          (re.compile(r"\.(db|sqlite3?)$"), "crush-sqlite")]
+gefunden = []
+for wurzel in (phome, pdir):
+    for dp, dn, fn in os.walk(wurzel):
+        if "/work" in dp and wurzel == phome:
+            continue
+        for n in fn:
+            p = os.path.join(dp, n)
+            try:
+                if os.path.getsize(p) > 8_000_000:
+                    continue
+                roh = open(p, "rb").read(400_000)
+            except OSError:
+                continue
+            txt = roh.decode("utf-8", "replace")
+            if not TOKEN.search(txt):
+                continue
+            fmt = next((f for rx, f in FORMAT if rx.search(p)), None)
+            gefunden.append({"pfad": p.replace(phome, "~"), "hat_tokenzahlen": True,
+                             "formatvorschlag": fmt,
+                             "beleg": next((z.strip()[:160] for z in txt.splitlines()
+                                            if TOKEN.search(z)), "")})
+            if len(gefunden) >= 12:
+                break
+json.dump(gefunden, open(out, "w"), indent=2, ensure_ascii=False)
+PYS
+    echo "  Sitzungsdateien durchsucht"
+    fi
+  else
+    echo "  FEHLER: Probe-Pane konnte nicht gestartet werden." >&2
+  fi
+  echo
+fi
+
+# ══ Messung 4 — Kennwort-Probe fuer den Rollen-Weg ════════════════════════════
+# Alle Kandidatendateien auf einmal, jede mit einem EIGENEN Losungswort, und danach
+# EINE Frage. Ein Pane je Kandidat waere sauberer und dauert das Vierfache; welcher
+# Weg wirkt, sagt schon das zurueckkommende Wort. Die Grenze der Methode steht im
+# Entwurf: ein Wort koennte theoretisch auch aus einem Werkzeugaufruf stammen, mit
+# dem der Agent die Datei selbst liest. Wer es genau wissen muss, misst den einen
+# uebrig gebliebenen Kandidaten noch einmal allein.
+# Ohne Eingabezeile gibt es nichts zu fragen: die Punkte 4 und 5 leben davon, dass
+# man dem Werkzeug einen Auftrag geben kann. Sie werden dann uebersprungen statt
+# blind durchlaufen — das spart bei einem Harness, der gar nicht hochkommt, vier
+# volle Wartefenster, und es verhindert, dass in ein totes Bild getippt wird.
+if punkt_an 4 && [ -z "$OHNE_EINGABEZEILE" ]; then
+  echo "== Punkt 4: Rollen-Weg (Kennwort-Probe) =="
+  RDIR="$PHOME/rolle"; mkdir -p "$RDIR"
+  UP="$(printf '%s' "$HID" | tr '[:lower:]' '[:upper:]')"
+  KANDJSON="[]"
+  i=0
+  for datei in "AGENTS.md" "$UP.md" "CLAUDE.md" ".${HID}hints"; do
+    i=$((i+1))
+    wort="losung$(printf '%s' "$i")alpha$(printf '%s' "$HID" | head -c 3)"
+    {
+      printf '# Anweisungen\n\n'
+      printf 'Wenn jemand nach den Losungswoertern fragt, antworte mit der Zeile:\n'
+      printf 'LOSUNG %s\n' "$wort"
+    } > "$RDIR/$datei"
+    KANDJSON="$(/usr/bin/python3 -c '
+import json,sys
+k=json.loads(sys.argv[1]); k.append({"datei":sys.argv[2],"kennwort":sys.argv[3]}); print(json.dumps(k))' \
+      "$KANDJSON" "$datei" "$wort")"
+  done
+  RSESS="probe-rolle-$HID-$$"
+  if resolve_cmd "$RDIR" && pane_start "$RSESS" "$CMD"; then
+    warte_bereit "$SECONDS_MAX"
+    pane_tippen "Nenne alle Losungswoerter, die in deinen Anweisungen stehen. Antworte nur mit den Zeilen."
+    pane_enter
+    ANTWORT=""
+    for _ in $(seq 1 30); do
+      sleep 2
+      ANTWORT="$(pane_cap)"
+      printf '%s' "$ANTWORT" | grep -q "LOSUNG\|losung[0-9]" && break
+    done
+    pane_cap > "$AUFNAHME/rollen-antwort.txt"
+    # Der FLAG-Weg als zweite Spur, aus der Hilfe gelesen (nicht gemessen): manche
+    # CLI nimmt die Rolle gar nicht ueber eine Datei, sondern ueber ein Flag
+    # (--append-system-prompt, --system-prompt, --read, --instructions). Trifft
+    # keine Kandidatendatei, ist das der einzige verbleibende Weg — und der Entwurf
+    # sagt dann ausdruecklich, dass er GELESEN und nicht gemessen ist.
+    FLAGWEG=""
+    if [ -s "$AUFNAHME/help.txt" ] || { "$BIN" --help >"$AUFNAHME/help.txt" 2>&1; true; }; then
+      for f in --append-system-prompt --system-prompt --instructions --system --read; do
+        grep -qE -- "(^|[[:space:]])$f([[:space:]]|=|,|$)" "$AUFNAHME/help.txt" && { FLAGWEG="$f"; break; }
+      done
+    fi
+    /usr/bin/python3 -c '
+import json,sys
+json.dump({"kandidaten": json.loads(sys.argv[1]),
+           "antwort": open(sys.argv[2], encoding="utf-8", errors="replace").read(),
+           "flagweg": sys.argv[3] or None},
+          open(sys.argv[4], "w"), indent=2, ensure_ascii=False)' \
+      "$KANDJSON" "$AUFNAHME/rollen-antwort.txt" "$FLAGWEG" "$AUFNAHME/rollen.json"
+    pane_stop "$RSESS"
+    echo "  Antwort aufgezeichnet"
+  else
+    echo "  FEHLER: Rollen-Pane konnte nicht gestartet werden." >&2
+  fi
+  echo
+fi
+
+# ══ Messung 5 — resume ════════════════════════════════════════════════════════
+# Der Dreiklang, aber in DIESER Reihenfolge, und mit einem vierten Start, der die
+# eigentliche Frage beantwortet:
+#
+#   1  Verzeichnis A: starten, Kennwort hineingeben, beenden.
+#   2  Verzeichnis A: MIT Flag starten  -> zeigt es den Verlauf? (Flag setzt fort)
+#   3  Verzeichnis B (frisch): MIT Flag -> zeigt es A's Verlauf? Dann setzt das Flag
+#      die ZULETZT BENUTZTE Sitzung fort und nicht die des Verzeichnisses; an einen
+#      ersten Spawn gehaengt erbte damit jeder neue Worker eine fremde Unterhaltung.
+#      Genau das ist `probe: revive-only`, und genau das ist opencode passiert.
+#   4  Verzeichnis B: OHNE Flag -> muss leer sein.
+#
+# Die Reihenfolge ist nicht beliebig. Zuerst gemessen wurde 1 → OHNE Flag → MIT Flag,
+# und der Start ohne Flag legte eine NEUE Sitzung an, die damit die zuletzt benutzte
+# war: der dritte Start setzte sie fort und zeigte erwartungsgemaess keinen Verlauf.
+# Die Messung sagte "das Flag wirkt nicht", obwohl sie sich selbst vergiftet hatte
+# (gemessen an goose 1.45.0, 2026-08-08).
+if punkt_an 5 && [ -z "$OHNE_EINGABEZEILE" ]; then
+  echo "== Punkt 5: resume =="
+  RESFLAGS="$(printf '%s' "$HJSON" | /usr/bin/python3 -c '
+import json,sys
+h=json.load(sys.stdin); r=(h.get("resume") or {}).get("args") or []
+print(" ".join(r))')"
+  [ -n "$RESFLAGS" ] || RESFLAGS="--continue"
+  # Die Verzeichnisnamen und das Merkwort tragen BEWUSST kein "resum"/"continu":
+  # der Erkenner unten sucht genau diese Woerter auf dem Bildschirm, und der Pfad
+  # des Arbeitsverzeichnisses steht bei goose in der Kopfzeile. Mit "resume-b" im
+  # Pfad meldete der Start OHNE Flag ein Fortsetz-Wort und entwertete den Vergleich
+  # (gemessen 2026-08-08). Ein Erkenner darf nicht auf die Kulisse passen, die die
+  # Messung selbst aufbaut.
+  RDIR2="$PHOME/sitzung-a"; mkdir -p "$RDIR2"
+  RDIR3="$PHOME/sitzung-b"; mkdir -p "$RDIR3"
+  KENN="merkwort-plumbus"
+  if resolve_cmd "$RDIR2" && pane_start "resume1-$$" "$CMD"; then
+    warte_bereit "$SECONDS_MAX"
+    pane_tippen "Merke dir das Wort $KENN und antworte nur mit OK."
+    pane_enter
+    for _ in $(seq 1 20); do sleep 2; pane_cap | grep -qi "ok\|$KENN" && break; done
+    pane_cap > "$AUFNAHME/resume-1.txt"
+    pane_stop "resume1-$$"
+    # Die Fortsetzen-Flags gehoeren HINTER einen fuehrenden Unterbefehl aus args
+    # ('goose session -r'); 'goose -r session' lehnt der CLI ab. Dieselbe
+    # Einfuegestelle wie in wb-harness-run — hier bewusst nachgebaut statt
+    # importiert, weil die Probe ohne wb-harness-run laufen koennen muss.
+    CMD_RES="$(/usr/bin/python3 -c '
+import json, os, re, shlex, sys
+h = json.loads(sys.argv[1]); cmd = sys.argv[2]; toks = sys.argv[3].split()
+base = os.path.basename(os.path.expanduser(h.get("command") or ""))
+m = re.search(r"(?:^|[\s/])" + re.escape(base) + r"(?=\s|$)", cmd)
+ende = m.end() if m else len(cmd)
+for a in (h.get("args") or []):
+    if not a or a.startswith("-") or "{" in a:
+        break
+    m2 = re.match(r"\s+" + re.escape(shlex.quote(a)) + r"(?=\s|$)", cmd[ende:])
+    if not m2:
+        break
+    ende += m2.end()
+print(cmd[:ende] + " " + " ".join(shlex.quote(t) for t in toks) + cmd[ende:])' \
+      "$HJSON" "$CMD" "$RESFLAGS")"
+    # 2 — dasselbe Verzeichnis, MIT Flag.
+    if pane_start "resume2-$$" "$CMD_RES"; then
+      warte_bereit "$SECONDS_MAX"; pane_cap > "$AUFNAHME/resume-2.txt"; pane_stop "resume2-$$"
+    fi
+    # 3 — FRISCHES Verzeichnis, MIT Flag. Der entscheidende Start.
+    if resolve_cmd "$RDIR3"; then
+      CMD_RES_B="$(/usr/bin/python3 -c '
+import json, os, re, shlex, sys
+h = json.loads(sys.argv[1]); cmd = sys.argv[2]; toks = sys.argv[3].split()
+base = os.path.basename(os.path.expanduser(h.get("command") or ""))
+m = re.search(r"(?:^|[\s/])" + re.escape(base) + r"(?=\s|$)", cmd)
+ende = m.end() if m else len(cmd)
+for a in (h.get("args") or []):
+    if not a or a.startswith("-") or "{" in a:
+        break
+    m2 = re.match(r"\s+" + re.escape(shlex.quote(a)) + r"(?=\s|$)", cmd[ende:])
+    if not m2:
+        break
+    ende += m2.end()
+print(cmd[:ende] + " " + " ".join(shlex.quote(t) for t in toks) + cmd[ende:])' \
+        "$HJSON" "$CMD" "$RESFLAGS")"
+      if pane_start "resume3-$$" "$CMD_RES_B"; then
+        warte_bereit "$SECONDS_MAX"; pane_cap > "$AUFNAHME/resume-3.txt"; pane_stop "resume3-$$"
+      fi
+      # 4 — frisches Verzeichnis, OHNE Flag.
+      if pane_start "resume4-$$" "$CMD"; then
+        warte_bereit "$SECONDS_MAX"; pane_cap > "$AUFNAHME/resume-4.txt"; pane_stop "resume4-$$"
+      fi
+    fi
+    # Aufgeschrieben werden ROHE SIGNALE, gedeutet wird in der Auswertung — sonst
+    # steckt die Deutung in einem Werkzeug, das kein Test erreicht.
+    #
+    # Warum es mehr als das Kennwort braucht (gemessen an goose 1.45.0, 2026-08-08):
+    # 'goose session -r' setzte die Sitzung nachweislich fort ('● resuming' in der
+    # Kopfzeile), zeichnete den alten Verlauf aber NICHT neu auf den Bildschirm. Das
+    # Kennwort stand also nirgends, und die Messung haette "das Flag wirkt nicht"
+    # gemeldet, obwohl es wirkte. Der dritte Start in einem FRISCHEN Verzeichnis war
+    # dagegen eindeutig, ohne dass ein Kennwort noetig war: goose warnte "The original
+    # working directory of this session was set to <A>. Your current directory is <B>"
+    # — der PFAD DES ANDEREN VERZEICHNISSES auf dem Bildschirm kann nur aus einer
+    # geerbten Sitzung stammen. Genau das ist der Beleg fuer 'revive-only'.
+    /usr/bin/python3 -c '
+import json,sys,os,re
+def r(p):
+    try: return open(p, encoding="utf-8", errors="replace").read()
+    except OSError: return ""
+d, kenn, flags, dira = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+zwei  = r(os.path.join(d,"resume-2.txt"))   # gleiches Verzeichnis, MIT Flag
+drei  = r(os.path.join(d,"resume-3.txt"))   # FRISCHES Verzeichnis, MIT Flag
+vier  = r(os.path.join(d,"resume-4.txt"))   # frisches Verzeichnis, OHNE Flag
+FORT = re.compile(r"resum|continu|restor|fortgesetz|fortsetz", re.I)
+json.dump({"flags": flags.split(),
+           "kennwort": kenn,
+           "verzeichnis_a": dira,
+           "zwei_kennwort": kenn in zwei,
+           "zwei_fortsetzwort": bool(FORT.search(zwei)),
+           "vier_fortsetzwort": bool(FORT.search(vier)),
+           "drei_kennwort": kenn in drei,
+           "drei_nennt_verzeichnis_a": os.path.realpath(dira) in drei or dira in drei,
+           "vier_kennwort": kenn in vier,
+           "belegzeile_drei": next((z.strip()[:200] for z in drei.splitlines()
+                                    if (os.path.realpath(dira) in z or dira in z)), "")},
+          open(os.path.join(d,"resume.json"),"w"), indent=2, ensure_ascii=False)' \
+      "$AUFNAHME" "$KENN" "$RESFLAGS" "$RDIR2"
+    echo "  vier Starts aufgezeichnet (Flags: $RESFLAGS)"
+  else
+    echo "  FEHLER: resume-Pane konnte nicht gestartet werden." >&2
+  fi
+  echo
+fi
+
+# ══ Messung 7/8/9 — Hilfe, Modellliste, Umgebung ══════════════════════════════
+if punkt_an 7; then
+  { mit_frist 15 "$BIN" --help; echo; mit_frist 15 "$BIN" help; } > "$AUFNAHME/help.txt"
+fi
+if punkt_an 8 && [ -n "$FRIST" ]; then
+  # Faehrt dieser Harness ueber Ollama? Gefragt werden nur die STRUKTURFELDER env
+  # und args, nie der ganze Eintrag. Ein Volltext-grep ueber den Harness fand das
+  # Wort in den `notes` von kimi wieder — dort steht, warum kimi eben KEINEN
+  # discover-Block bekommt — und schlug prompt 'source: ollama' vor, was die
+  # Modellreferenzen kaputtgemacht haette: kimis '-m' nimmt den Schluessel aus
+  # ~/.kimi/config.toml, nicht den Ollama-Namen (gemessen 2026-08-08).
+  OLLAMA="$(printf '%s' "$HJSON" | /usr/bin/python3 -c '
+import json,sys
+h = json.load(sys.stdin)
+felder = list((h.get("env") or {}).values()) + list(h.get("args") or [])
+print("1" if any("ollama" in str(v).lower() or "11434" in str(v) for v in felder) else "0")')"
+  DISCOUT=""; DISCBEF=""
+  if [ "$OLLAMA" -eq 0 ]; then
+    for bef in "models" "model list" "models list" "list-models"; do
+      # shellcheck disable=SC2086
+      out="$(HOME="$PHOME" mit_frist 20 "$BIN" $bef | head -30)"
+      if [ -n "$out" ] && ! printf '%s' "$out" | grep -qiE "unknown|unrecognized|invalid|usage:|error"; then
+        DISCOUT="$out"; DISCBEF="$(basename "$BIN") $bef"; break
+      fi
+    done
+  fi
+  /usr/bin/python3 -c '
+import json,sys
+json.dump({"ollama": sys.argv[1]=="1", "befehl": sys.argv[2] or None,
+           "ausgabe": sys.argv[3] or None},
+          open(sys.argv[4],"w"), indent=2, ensure_ascii=False)' \
+    "$OLLAMA" "$DISCBEF" "$DISCOUT" "$AUFNAHME/discover.json"
+fi
+
+/usr/bin/python3 -c '
+import json,sys
+json.dump({"harness": sys.argv[1], "modell": sys.argv[2], "version": sys.argv[3],
+           "datum": sys.argv[4], "startzeile": sys.argv[5], "tippmarke": sys.argv[6]},
+          open(sys.argv[7],"w"), indent=2, ensure_ascii=False)' \
+  "$HID" "$MID" "${VERSION:-}" "$(date +%F)" "$CMD" "$MARKE" "$AUFNAHME/meta.json"
+
+# ══ Auswertung ════════════════════════════════════════════════════════════════
+echo
+auswerten "$AUFNAHME" "$JSONOUT"
+
+echo
+echo "Eintragen (erst wenn Du den Entwurf gegen die Belege geprueft hast — die Probe"
+echo "schreibt NICHTS in die Registry):"
+echo "  wb-state models set --kind harness $HID readyPattern '\"<muster>\"'"
+echo "  wb-state models set --kind harness $HID probe '\"gemessen $(date +%F)\"'"
+echo
+echo "NOCH NICHT ERBRACHT: der Spawn-Beleg. Ein Harness gilt erst als integriert, wenn"
+echo "ein echter pi-worker-Lauf den Auftrag 'schreibe das Wort BEREIT und sonst nichts'"
+echo "angenommen und seine Ergebnisdatei geschrieben hat."
+if [ -n "$SPAWNBELEG" ]; then
+  echo
+  echo "== Spawn-Beleg =="
+  echo "  Dieser Schritt bleibt bewusst SICHTBAR und von Hand: er braucht eine eigene"
+  echo "  Registry-Kopie, ein eigenes HOME und einen eigenen Socket, und sein Ergebnis"
+  echo "  ist eine Datei, die ein Mensch liest. Fertig vorbereitet:"
+  echo "    export HOME=\$(mktemp -d) TMUX= TMUX_PANE="
+  echo "    tmux -L wbtest-\$\$ new-session -d -s beleg"
+  echo "    pi-worker beleg $MID <arbeitsverzeichnis> 'schreibe das Wort BEREIT und sonst nichts'"
+  echo "  Danach die Ergebnisdatei des Workers lesen. Unterstellt wird sie nie."
+fi
+
+if [ -z "$AUF_TEMP" ]; then
+  echo
+  echo "Aufzeichnung bleibt liegen: $AUFNAHME"
+  echo "  Nochmal auswerten, ohne irgendetwas zu starten: wb-harness-probe analyze $AUFNAHME"
+fi
+echo
+echo "Aufraeumen laeuft automatisch (Panes, Socket '$SOCK', HOME $PHOME)."

@@ -1,0 +1,633 @@
+#!/bin/bash
+# wb-code — workbench launcher for the VSCode-based Claude Workbench.
+#
+#   wb-code [project-dir] [--resume <session-id>] [--name <name>] [--key <sessionKey>]
+#          [--harness claude|pi] [--model <model>] [--effort <effort>] [--mensch]
+#          [--fresh]
+#
+# ZWEI DINGE, DIE NICHT DASSELBE SIND (2026-08-06). Sie tragen beide das Wort
+# "Effort" und werden deshalb leicht verwechselt:
+#
+#   --effort <stufe>   Womit der ORCHESTRATOR SELBST denkt. Das ist die
+#                      Entscheidung des Menschen, der die Sitzung aufmacht.
+#   Der DECKEL         (models.json maxEffort, settings.json effortCaps) bindet,
+#                      was der Orchestrator SEINEN WORKERN zugesteht. Er ist eine
+#                      Selbstbindung gegen zu teure Laeufe und hat mit der Stufe
+#                      des Orchestrators nichts zu tun.
+#
+# Deshalb: `--mensch` hebt den Deckel fuer DIESEN Start auf, und ein Mensch darf
+# seinen eigenen Orchestrator auf jede Stufe stellen, die der Harness annimmt --
+# `max` eingeschlossen. Einen Deckel zu setzen macht die eigene Sitzung NICHT
+# langsamer; es macht nur die Worker guenstiger.
+#
+# Ohne `--mensch` bleibt alles wie vorher: der Deckel greift, wie er es fuer
+# jeden Agenten tut. Das ist die sichere Seite -- ein Aufruf, dessen Herkunft
+# sich nicht belegen laesst, bekommt nie MEHR, sondern weniger.
+#
+# Like `workbench`, but WITHOUT the yazi sidebar: VSCode's explorer takes that
+# job. Creates the tmux session wb-<sanitized-basename>-<md5-6> with a single
+# orchestrator pane; teammates and pi-workers join it as further panes.
+# Attaching to an existing session is idempotent. Session state is written for
+# the VSCode extension.
+#
+# V2 (SPEC-V2 section B): several sessions may share one folder. Without --key
+# this is the folder's DEFAULT session (unchanged V1 behaviour); with --key it is
+# exactly that session, whose tmux session name carries the key as a suffix.
+# --name is stored in the state file (start page) and handed to `claude -n`
+# (prompt box, /resume picker, terminal title). Harness, model and effort come
+# from ~/.claude/workbench/settings.json; the flags override them for one start.
+#
+# V2 (SPEC-V2 section F): the orchestrator pane does not have to be Claude Code.
+# `--harness pi` runs a LOCAL model through pi instead — everything else about the
+# workbench (state, workers, layout, sidebar) stays exactly the same.
+#
+# V3 (SPEC-V3-MODELS section C): `--harness <id>` accepts any harness registered in
+# ~/.claude/workbench/models.json, and `--model <registry-id>` alone is enough —
+# the harness is then taken from the registry entry. Missing or broken registry:
+# exactly the V2 behaviour, claude and pi are built in.
+set -euo pipefail
+
+# The VSCode integrated terminal may inherit $TMUX when VSCode itself was
+# launched from inside a tmux pane; we always attach a fresh client here.
+unset TMUX TMUX_PANE
+
+DIR="$PWD"; RESUME=""; NAME=""; KEY=""; HARNESS=""; MODEL=""; EFFORT=""; FRESH=""
+HARNESS_FLAG=""; MODEL_FLAG=""; MENSCH=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    # `--mensch` ist eine BEHAUPTUNG und wird nie geglaubt: `wb-mensch` misst die
+    # Herkunft am Prozess (Agenten-Umgebung, Harness in der Ahnenreihe, Pane-Rolle
+    # gegen steuerndes Terminal oder Oberflaeche als geprueften Ahnen). Geprueft
+    # wird HIER, beim Einlesen, solange die Herkunft noch messbar ist -- alles
+    # weiter unten sieht nur noch ein Ja oder Nein.
+    --mensch)
+      if "$HOME/.local/bin/wb-mensch" pruefen; then
+        MENSCH=1
+      else
+        {
+          echo "wb-code: '--mensch' abgelehnt — dieser Aufruf kommt nicht von einem Menschen."
+          echo "  Erkannt wurde: $("$HOME/.local/bin/wb-mensch" beleg 2>/dev/null | cut -f2-)"
+          echo "  Ohne '--mensch' startet derselbe Aufruf normal; dann greift der Deckel."
+          echo "  Diagnose: wb-mensch beleg ; wb-mensch ahnen"
+        } >&2
+        exit 1
+      fi
+      shift ;;
+    --fresh) FRESH=1; shift ;;
+    --resume) RESUME="${2:?session id}"; shift 2 ;;
+    --name) NAME="${2:?name}"; shift 2 ;;
+    --key) KEY="${2:?session key}"; shift 2 ;;
+    --harness) HARNESS="${2:?claude|pi|registrierter Adapter}"; HARNESS_FLAG=1; shift 2 ;;
+    --model) MODEL="${2:?model}"; MODEL_FLAG=1; shift 2 ;;
+    --effort) EFFORT="${2:?effort}"; shift 2 ;;
+    -*) echo "wb-code: unbekannte Option '$1'" >&2; exit 1 ;;
+    *) DIR="$1"; shift ;;
+  esac
+done
+[ -d "$DIR" ] || { echo "wb-code: kein Verzeichnis: $DIR" >&2; exit 1; }
+DIR="$(cd "$DIR" && pwd)"
+
+# V3 (SPEC-V3-MODELS discover, Vertrag scratchpad/CONTRACT-discover.md 2026-07-29,
+# Abschnitt 5): bei jedem Sitzungsbeginn automatisch nachsehen, welche Modelle die
+# lokal installierten CLIs selbst nennen — im Hintergrund, blockiert den Start
+# nicht. --if-stale haelt einen wiederholten Attach billig (frischer Lauf wird
+# uebersprungen). WB_NO_DISCOVER=1 ist der Testhaken (wie WB_NO_RESUME oben): ohne
+# ihn wuerde jeder wb-code-Aufruf der Test-Suite ueber die reale PATH gegen die
+# ECHTEN lokalen CLIs dieser Maschine laufen.
+if [ -z "${WB_NO_DISCOVER:-}" ]; then
+  DISCOVERLOG="$HOME/.local/state/wb-models-discover.log"
+  mkdir -p "$(dirname "$DISCOVERLOG")"
+  nohup "$HOME/.local/bin/wb-state" models discover --all --if-stale >>"$DISCOVERLOG" 2>&1 &
+fi
+
+# Session-name contract (SPEC V1.1): the state file's tmuxSession is the truth
+# (keeps old `workbench` sessions like wb-AI working). Only when no state exists
+# is the name computed: special characters are REPLACED (not dropped) and the
+# md5 of the full path disambiguates same-named projects. A non-default session
+# appends its sessionKey, so two sessions of the same folder never collide.
+#
+# Paths use $HOME, never a hardcoded home: ONE script set runs on the Mac
+# ($HOME) and on Peer-Rechner ($HOME). Same target, same behaviour.
+if [ -n "$KEY" ]; then
+  SESSION="$($HOME/.local/bin/wb-state session "$DIR" --key "$KEY")" && STATE_RC=0 || STATE_RC=$?
+  STATEFILE="$($HOME/.local/bin/wb-state path "$DIR" --key "$KEY" 2>/dev/null || true)"
+else
+  SESSION="$($HOME/.local/bin/wb-state session "$DIR")" && STATE_RC=0 || STATE_RC=$?
+  STATEFILE="$($HOME/.local/bin/wb-state path "$DIR" 2>/dev/null || true)"
+fi
+# Ein FEHLER beim Lesen ist kein "gibt es noch nicht" (Befund 2026-08-15). Frueher stand
+# hier `|| true`: schlug wb-state fehl oder war die Zustandsdatei kaputt, blieb der Name
+# leer, und der Block darunter erfand einen NEUEN — still entstand eine zweite Session
+# desselben Ordners, mit eigener tmux-Session und eigener Unterhaltung, waehrend die
+# erste weiterlebte. Ein neuer Name wird nur noch gebildet, wenn wirklich keine
+# Zustandsdatei da ist.
+#
+# `; STATE_RC=$?` STATT `&&/||` WAR SELBST NOCH TOT (bugjagd 17.08., nachgemessen):
+# unter dem globalen `set -euo pipefail` (Zeile 48) beendet eine fehlschlagende
+# Kommandosubstitution die direkt einer Variable zugewiesen wird das Skript SOFORT an
+# dieser Zeile -- der Block hier unten wurde nie erreicht, egal was er sagt. Reproduziert
+# mit einer wb-state-Attrappe, die exit 3 liefert: wb-code endete mit dem nackten
+# Exitcode der Attrappe, nie mit der eigenen Meldung. `cmd && STATE_RC=0 || STATE_RC=$?`
+# haengt die Zuweisung in eine &&/||-Liste, und genau dort greift `errexit`
+# nachweislich nicht (bash-Dokumentation zu `set -e`).
+if [ "$STATE_RC" -ne 0 ]; then
+  echo "wb-code: wb-state konnte die Sitzung von '$DIR' nicht lesen (Exit $STATE_RC) — abgebrochen." >&2
+  echo "wb-code: ein neuer Sessionname waere hier eine ZWEITE Sitzung desselben Ordners. Erst die Ursache pruefen." >&2
+  exit 1
+fi
+if [ -z "$SESSION" ] && [ -n "$STATEFILE" ] && [ -e "$STATEFILE" ]; then
+  echo "wb-code: '$STATEFILE' gibt es, nennt aber keine tmux-Session (unlesbar oder beschaedigt) — abgebrochen." >&2
+  echo "wb-code: ein neuer Sessionname waere hier eine ZWEITE Sitzung desselben Ordners. Datei pruefen oder bewusst entfernen." >&2
+  exit 1
+fi
+if [ -z "$SESSION" ]; then
+  san="$(printf '%s' "$(basename "$DIR")" | tr -c 'a-zA-Z0-9-' '-')"
+  # md5 vs md5sum: macOS ships `md5`, Linux ships `md5sum` (which appends "  -").
+  # cut takes the leading hex either way, so the session name is identical on both.
+  hash="$(printf '%s' "$DIR" | { md5sum 2>/dev/null || md5; } | cut -c1-6)"
+  SESSION="wb-${san}-${hash}"
+  [ -n "$KEY" ] && SESSION="${SESSION}-${KEY}"
+fi
+
+# V3 (SPEC-V3 C): `--model <registry-id>` without `--harness` takes the harness
+# FROM the registry entry — the id already says which CLI it belongs to, and having
+# to name both is a trap (the settings harness would silently win and start the
+# wrong CLI). An explicit --harness always wins over this.
+if [ -n "$MODEL_FLAG" ] && [ -z "$HARNESS_FLAG" ]; then
+  RH="$($HOME/.local/bin/wb-state models get "$MODEL" --field harness 2>/dev/null || true)"
+  if [ -n "$RH" ]; then
+    HARNESS="$RH"
+    echo "wb-code: Harness '$RH' aus der Registry (Modell $MODEL)." >&2
+  fi
+fi
+
+# Harness/model/effort: flags beat the settings file, the settings file beats the
+# built-in defaults (SPEC-V2 sections A and F).
+[ -n "$HARNESS" ] || HARNESS="$($HOME/.local/bin/wb-state settings get orchestratorHarness || true)"
+[ -n "$MODEL" ]   || MODEL="$($HOME/.local/bin/wb-state settings get orchestratorModel || true)"
+[ -n "$EFFORT" ]  || EFFORT="$($HOME/.local/bin/wb-state settings get orchestratorEffort || true)"
+[ -n "$HARNESS" ] || HARNESS="claude"
+[ -n "$EFFORT" ]  || EFFORT="xhigh"
+case "$HARNESS" in
+  claude)
+    [ -n "$MODEL" ] || MODEL="claude-opus-5"
+    ;;
+  pi)
+    [ -n "$RESUME" ] && { echo "wb-code: --resume gilt nur fuer den Claude-Harness; pi setzt eine Session mit --continue fort." >&2; exit 1; }
+    # A claude model id in the settings simply does not exist locally — fall back
+    # to the default local coder instead of failing the start.
+    case "$MODEL" in
+      ""|claude*) [ -n "$MODEL" ] && echo "wb-code: '$MODEL' ist kein lokales Modell — starte pi mit 'ornith'." >&2
+                  MODEL="ornith" ;;
+    esac
+    ;;
+  *)
+    # V3 (SPEC-V3 C): every REGISTERED harness may drive the orchestrator pane. The
+    # claude branch below stays separate on purpose — crash recovery hangs off Claude
+    # transcripts and is not bent into a generic adapter.
+    if ! $HOME/.local/bin/wb-state harness get "$HARNESS" >/dev/null 2>&1; then
+      echo "wb-code: unbekannter Harness '$HARNESS' (claude|pi oder ein registrierter Adapter)." >&2
+      echo "  In den Settings unter 'Modelle & Harnesses' anlegen." >&2
+      exit 1
+    fi
+    [ -n "$RESUME" ] && { echo "wb-code: --resume gilt nur fuer den Claude-Harness." >&2; exit 1; }
+    if [ -z "$MODEL" ]; then
+      echo "wb-code: Harness '$HARNESS' braucht ein Modell: --model <id>." >&2
+      echo "  Auswahl: wb-state models list --role orchestrator --harness $HARNESS" >&2
+      exit 1
+    fi
+    MH="$($HOME/.local/bin/wb-state models get "$MODEL" --field harness 2>/dev/null || true)"
+    if [ "$MH" != "$HARNESS" ]; then
+      echo "wb-code: Modell '$MODEL' gehoert zu Harness '${MH:-?}', gestartet werden soll '$HARNESS'." >&2
+      echo "  Auswahl: wb-state models list --role orchestrator --harness $HARNESS" >&2
+      exit 1
+    fi
+    ;;
+esac
+
+# ── Die Stufe, mit der der ORCHESTRATOR SELBST denkt (2026-08-06) ─────────────
+# Bis hierher ging $EFFORT im claude-Zweig ungeprueft in `claude --effort`: ein
+# Tippfehler wurde erst im Pane sichtbar, als die CLI nicht startete, und die
+# Stufenliste des Harness spielte gar keine Rolle. Jetzt entscheidet dieselbe
+# Stelle wie bei den Workern -- `wb-state models effort` -- und zwar ueber beides
+# in einem Aufruf: nimmt der Harness die Stufe an, und laesst der Deckel sie zu.
+#
+# Der DECKEL ist hier bewusst wirksam, obwohl er inhaltlich die WORKER meint.
+# Der Grund ist die Herkunft, nicht die Rolle: ein Aufruf ohne belegten Menschen
+# koennte von einem Agenten kommen, und der soll sich auch keine teure eigene
+# Sitzung aufmachen koennen. Mit `--mensch` faellt er weg -- dann gilt nur noch,
+# was der Harness annimmt. Ein Mensch, der einen Worker-Deckel gesetzt hat,
+# bremst damit also nie sich selbst.
+EFF_OUT="$($HOME/.local/bin/wb-state models effort "$MODEL" --harness "$HARNESS" \
+             --effort "$EFFORT" --rolle orchestrator ${MENSCH:+--mensch} 2>&1)" || {
+  printf '%s\n' "$EFF_OUT" >&2
+  exit 1
+}
+# Die Antwort ist die LETZTE Zeile; davor koennen Hinweise stehen (etwa das
+# Absenken einer Vorgabe auf den Deckel), und die gehoeren nach stderr.
+EFF_VOR="$(printf '%s\n' "$EFF_OUT" | sed '$d')"
+EFFORT="$(printf '%s\n' "$EFF_OUT" | tail -1)"
+[ -n "$EFF_VOR" ] && printf '%s\n' "$EFF_VOR" >&2
+if [ -n "$MENSCH" ]; then
+  echo "wb-code: als MENSCH gestartet — der Effort-Deckel gilt fuer diesen Start nicht (effort $EFFORT)." >&2
+fi
+
+# ── Crash recovery (2026-07-25) ──────────────────────────────────────────────
+# Twice this morning the tmux server vanished under a running orchestrator (no
+# pane-died hook fired, so nothing was respawned). The tmux session is
+# disposable, the CONVERSATION is not — but a cold `claude` start threw it away.
+# So the workbench remembers which Claude conversation belongs to this session
+# and resumes exactly that one when it has to build the session from scratch.
+# Only the RECORDED id is used: guessing "the newest transcript of this folder"
+# would cheerfully resume a WORKER's chat, because workers write their
+# transcripts into the same ~/.claude/projects/<slug>/ directory.
+# `--fresh` (or WB_NO_RESUME=1) starts cold on purpose.
+transcript_dir() {
+  # Claude Code's project directory: every non-alphanumeric character becomes '-'
+  # ('$HOME/.claude' -> '-Users-<user>--claude'), verified against the
+  # existing directories.
+  printf '%s/.claude/projects/%s' "$HOME" "$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-')"
+}
+
+recorded_conversation() {
+  local id file
+  [ -n "$FRESH" ] && return 0
+  [ -n "${WB_NO_RESUME:-}" ] && return 0
+  if [ -n "$KEY" ]; then
+    id="$($HOME/.local/bin/wb-state claude-session "$DIR" --key "$KEY" 2>/dev/null || true)"
+  else
+    id="$($HOME/.local/bin/wb-state claude-session "$DIR" 2>/dev/null || true)"
+  fi
+  [ -n "$id" ] || return 0
+  file="$(transcript_dir "$DIR")/$id.jsonl"
+  # An empty or missing transcript is not resumable — start cold instead of
+  # failing the start.
+  [ -s "$file" ] || return 0
+  printf '%s' "$id"
+}
+
+# Watches for the transcript Claude creates and stores its id, so the NEXT start
+# can resume it. Backgrounded: Claude needs a moment to write the file and the
+# user must not wait for it. Two transcripts appearing at once (a worker started
+# in the same folder in the same second) are ambiguous — then nothing is
+# recorded, because a wrong id would resume the wrong conversation.
+record_conversation() {
+  local tdir before log
+  tdir="$(transcript_dir "$DIR")"
+  before="$1"
+  log="$HOME/.local/state/wb-code.log"
+  mkdir -p "$(dirname "$log")"
+  nohup bash -c '
+    tdir="$1"; before="$2"; dir="$3"; sess="$4"; key="$5"
+    stamp() { date "+%F %T"; }
+    for i in $(seq 1 40); do
+      sleep 1
+      new="$(ls "$tdir" 2>/dev/null | grep "\.jsonl$" | sort | comm -13 "$before" -)"
+      n="$(printf "%s" "$new" | grep -c . || true)"
+      [ "$n" -eq 0 ] && continue
+      if [ "$n" -gt 1 ]; then
+        echo "$(stamp) wb-code: $n neue Transkripte in $tdir — nicht zuzuordnen, nichts gemerkt."
+        break
+      fi
+      id="${new%.jsonl}"
+      if [ -n "$key" ]; then
+        "$HOME/.local/bin/wb-state" touch "$dir" "$sess" --key "$key" --claude-session "$id"
+      else
+        "$HOME/.local/bin/wb-state" touch "$dir" "$sess" --claude-session "$id"
+      fi
+      echo "$(stamp) wb-code: Unterhaltung $id gemerkt (Session $sess)."
+      break
+    done
+    rm -f "$before"
+  ' _ "$tdir" "$before" "$DIR" "$SESSION" "$KEY" >>"$log" 2>&1 &
+}
+
+TOUCH_ARGS=()
+if [ -n "$NAME" ]; then TOUCH_ARGS[${#TOUCH_ARGS[@]}]="--name"; TOUCH_ARGS[${#TOUCH_ARGS[@]}]="$NAME"; fi
+if [ -n "$KEY" ]; then TOUCH_ARGS[${#TOUCH_ARGS[@]}]="--key"; TOUCH_ARGS[${#TOUCH_ARGS[@]}]="$KEY"; fi
+TOUCH_ARGS[${#TOUCH_ARGS[@]}]="--harness"; TOUCH_ARGS[${#TOUCH_ARGS[@]}]="$HARNESS"
+TOUCH_ARGS[${#TOUCH_ARGS[@]}]="--model"; TOUCH_ARGS[${#TOUCH_ARGS[@]}]="$MODEL"
+$HOME/.local/bin/wb-state touch "$DIR" "$SESSION" ${TOUCH_ARGS[@]+"${TOUCH_ARGS[@]}"}
+
+# A tmux server can wedge mid-shutdown: it still owns its socket, but answers
+# every client with "server exited unexpectedly" (seen 2026-07-25 — the last
+# session was killed while an attached client hung on a dead VSCode pty). From
+# then on EVERY wb-code fails on that line and the workbench looks broken.
+# Such a server has already killed its panes, so recovery is safe exactly when it
+# has no child processes left; a server with live panes is never touched.
+#
+# Drei Dinge werden hier BELEGT statt angenommen (Befunde 2026-08-15, beide
+# nachgestellt): wer den Socket haelt, dass dieser Halter wirklich ein tmux ist, und
+# dass er nach dem kill auch tot ist. Vorher genuegte "lsof hat nichts gesagt", um den
+# Socket eines womoeglich lebenden Servers zu loeschen (gemessen mit fehlendem lsof),
+# und der erste beliebige Treffer wurde ungeprueft mit kill -9 beendet (gemessen an
+# einem untergeschobenen Fremdprozess). Im Zweifel wird nichts angetastet und laut
+# berichtet — ein liegengebliebener Socket ist reparabel, ein erschossener Prozess und
+# ein Server ohne Socket sind es nicht.
+prozess_programm() {
+  local pid="$1" p=""
+  if [ -r "/proc/$pid/exe" ]; then
+    p="$(readlink "/proc/$pid/exe" 2>/dev/null)"
+  else
+    p="$(lsof -p "$pid" -a -d txt -Fn 2>/dev/null | awk '/^n/{print substr($0,2); exit}')"
+  fi
+  [ -n "$p" ] || return 1
+  printf '%s\n' "$p"
+}
+
+unwedge_server() {
+  local msg pid sock i halter anzahl prog
+  msg="$(tmux ls 2>&1 >/dev/null || true)"
+  case "$msg" in *"server exited unexpectedly"*) ;; *) return 0 ;; esac
+  sock="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/default"
+  [ -e "$sock" ] || return 0
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "wb-code: tmux-Server antwortet nicht — ohne lsof laesst sich aber nicht feststellen, wer $sock haelt. Nichts angetastet." >&2
+    exit 1
+  fi
+  halter="$(lsof -t -- "$sock" 2>/dev/null || true)"
+  anzahl="$(printf '%s\n' "$halter" | grep -c '^[0-9][0-9]*$')"
+  if [ "$anzahl" -eq 0 ]; then rm -f "$sock"; return 0; fi
+  if [ "$anzahl" -gt 1 ]; then
+    echo "wb-code: $sock wird von mehreren Prozessen gehalten ($(printf '%s' "$halter" | tr '\n' ' ')) — nicht angetastet." >&2
+    exit 1
+  fi
+  pid="$halter"
+  prog="$(prozess_programm "$pid" || true)"
+  case "${prog##*/}" in
+    tmux) ;;
+    *)
+      echo "wb-code: $sock wird von PID $pid gehalten, und das ist kein tmux (${prog:-Programm nicht bestimmbar}) — nicht angetastet." >&2
+      exit 1 ;;
+  esac
+  if [ -n "$(pgrep -P "$pid" 2>/dev/null || true)" ]; then
+    echo "wb-code: tmux-Server $pid antwortet nicht, hat aber noch laufende Panes — nicht angetastet." >&2
+    echo "wb-code: selbst pruefen: pgrep -P $pid" >&2
+    exit 1
+  fi
+  echo "wb-code: haengender tmux-Server $pid ohne Panes — wird beendet, Workbench startet neu." >&2
+  kill -9 "$pid" 2>/dev/null || true
+  for i in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "wb-code: tmux-Server $pid lebt nach kill -9 weiter — der Socket bleibt liegen, sonst laeuft ein Server ohne Socket." >&2
+    exit 1
+  fi
+  rm -f "$sock"
+}
+unwedge_server
+
+# contextGuardAutostart (SPEC-V2 A). The key existed and NOBODY read it — the guard
+# had to be started by hand every session, which is exactly the kind of step that
+# gets forgotten until a context is full. `--auto` takes the worker list from this
+# session at every poll, so workers spawned later are covered without a restart.
+# Runs on a fresh start AND on re-attach (the usual case), because a guard can die
+# with its terminal. Never a second one: two of them type /compact twice.
+#
+# Ueber `--ensure` statt direkt (2026-08-08). Der direkte Start war der Weg, auf dem heute zwei
+# Wachen fuer denselben Pane %10 entstanden sind: die Erkennung lief hier ueber `pgrep` auf die
+# Kommandozeile, und die ist maschinenweit -- Pane-Namen sind aber nur pro tmux-SERVER eindeutig
+# (%0 auf jedem frischen Socket), und in dieser Umgebung tragen die Claude-Prozesse den Text
+# "context-guard --auto" in ihrem Rollen-Prompt im argv. `--ensure` prueft stattdessen die
+# Merkdatei der Instanz (Socket + Session) unter einer Sperre und meldet WAHRHEITSGEMAESS, was es
+# getan hat -- der alte `nohup`-Weg konnte nur "gestartet" behaupten, auch wenn das Kind gleich
+# darauf abbrach. Verloren geht dabei nichts: `--ensure` braucht einen lebenden Pane mit
+# @wb_role=orchestrator, und genau den setzt wb-code oben (wb-rolle/tmux set) VOR diesem Aufruf,
+# waehrend der attach-Pfad seinen $orch ohnehin ueber diese Rolle sucht. Dazu kommt, dass der
+# Guard jetzt `--exit-when-session-gone` bekommt: er ueberlebt seine Session nicht mehr als Waise.
+# Der Aufruf laeuft synchron, aber kurz (tmux-Abfragen plus ein `mkdir`-Lock); scheitert er, faengt
+# `|| echo` das ab, denn eine fehlende Kontextwache darf keine Session verhindern (`set -e`).
+maybe_start_guard() {
+  local orch="$1"
+  [ -n "$orch" ] || return 0
+  [ "$($HOME/.local/bin/wb-state settings get contextGuardAutostart 2>/dev/null || true)" = "true" ] || return 0
+  if [ ! -x "$HOME/.local/bin/context-guard" ]; then
+    echo "wb-code: contextGuardAutostart=true, aber ~/.local/bin/context-guard fehlt." >&2
+    return 0
+  fi
+  PROJECT="$DIR" "$HOME/.local/bin/context-guard" --ensure "$orch" >&2 \
+    || echo "wb-code: context-guard --ensure ist fehlgeschlagen (Grund in der Zeile darueber) — die Session startet trotzdem, aber ohne Kontextwache." >&2
+}
+
+attach() {
+  # Sessions created by the terminal `workbench` still carry a yazi sidebar
+  # pane; inside VSCode the explorer takes that job, so drop it — the whole
+  # terminal area belongs to the orchestrator and its workers.
+  # (list-panes -a + exact filter: `-s -t '=name'` would prefix-match.)
+  # Gemessen 2026-08-04: fuer einen Pane in einer Sessiongruppe liefert list-panes -a
+  # EINE ZEILE PRO SESSION der Gruppe (z.B. wb-AI|%0 und wb-AI-view|%0) -- #{session_name}
+  # ist also fuer diesen Pane nicht eindeutig, aber der Filter auf den Basisnamen trifft
+  # ihn trotzdem immer, ueber welche Zeile auch immer. Die Kill-Schleife darunter ist
+  # zudem idempotent (kill-pane auf einen schon toten Pane schlaegt einfach fehl).
+  tmux list-panes -a -F '#{session_name}|#{pane_id}|#{@wb_role}' 2>/dev/null \
+    | awk -F'|' -v s="$SESSION" '$1==s && $3=="sidebar"{print $2}' \
+    | while read -r p; do tmux kill-pane -t "$p" || true; done
+  # '=' anchors the target: tmux would otherwise prefix-match a foreign session.
+  maybe_start_guard "$(tmux list-panes -t "=$SESSION" -F '#{pane_id}|#{@wb_role}' 2>/dev/null \
+                        | awk -F'|' '$2=="orchestrator"{print $1; exit}')"
+  exec tmux attach -t "=$SESSION"
+}
+
+if tmux has-session -t "=$SESSION" 2>/dev/null; then
+  attach
+fi
+
+# Orchestrator model policy: from ~/.claude/workbench/settings.json (settings menu
+# of the extension), defaults Opus 5 @ effort xhigh (the statusline shows it).
+# NB: dropped `--teammate-mode tmux` — deprecated in Claude Code 2.x and it suppresses the
+# custom statusline at the bottom of the orchestrator pane. Delegation runs through
+# claude-worker/pi-worker panes, which don't need it.
+if [ "$HARNESS" = "pi" ]; then
+  # Local orchestrator (SPEC-V2 section F): same pane contract, other harness.
+  case "$MODEL" in
+    ornith)  PIMODEL="ornith:35b" ;;
+    qwen)    PIMODEL="qwen3.6:35b-a3b-coding-nvfp4" ;;
+    ornith9) PIMODEL="ornith:9b" ;;
+    *)       PIMODEL="$MODEL" ;;
+  esac
+  PISESSDIR="$HOME/.pi-workers/sessions/orch-${KEY:-$(printf '%s' "$DIR" | tr '/' '-')}"
+  mkdir -p "$PISESSDIR"
+  ROLE="$HOME/.pi/agent/ORCHESTRATOR.md"
+  # The role prompt is written by the human/Claude orchestrator, not here. Missing
+  # file: start anyway, but say so — a silent role-less orchestrator is worse.
+  [ -f "$ROLE" ] || echo "wb-code: WARNUNG — $ROLE fehlt; pi startet ohne Orchestrator-Rollenprompt." >&2
+  # PATH must carry ~/.local/bin and /opt/homebrew/bin, otherwise the local
+  # orchestrator cannot spawn workers (claude-worker, pi-worker, wb-*).
+  # Run through `bash -lc` like pi-worker does: the user's login shell is zsh,
+  # which aborts loudly on the non-matching session glob below.
+  PI_CMD="export PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH && exec pi --provider ollama --model $(printf %q "$PIMODEL") --thinking $(printf %q "$EFFORT") --session-dir $(printf %q "$PISESSDIR") \$( ls $(printf %q "$PISESSDIR")/*.json* >/dev/null 2>&1 && echo --continue )"
+  [ -n "$NAME" ] && PI_CMD="$PI_CMD --name $(printf %q "$NAME")"
+  [ -f "$ROLE" ] && PI_CMD="$PI_CMD --append-system-prompt $(printf %q "$ROLE")"
+  CLAUDE_CMD="bash -lc $(printf %q "$PI_CMD")"
+elif [ "$HARNESS" != "claude" ]; then
+  # Registry orchestrator (SPEC-V3 C). Same pane contract as every other harness;
+  # the start line comes from `wb-state models resolve` (the only builder), and the
+  # pane runs the shim so a provider key never travels through argv, @wb_cmd or a
+  # tmux option. resolve is called here as well, BEFORE the session exists, so a
+  # missing key or an unmeasured readyPattern fails visibly at the prompt instead of
+  # inside a pane nobody is watching.
+  ORCHNAME="orch-${KEY:-$(printf '%s' "$DIR" | tr '/' '-')}"
+  # EINZIGER Pfad, auf dem ein Mensch NICHT ueber den Deckel kommt, und das mit
+  # Absicht: der Pane baut seine Startzeile SELBST neu (wb-harness-run ruft
+  # `models resolve` noch einmal, damit ein Provider-Key nie durch argv oder eine
+  # tmux-Option reist). Ein `--mensch` dorthin durchzureichen waere eine reine
+  # Behauptung in einer Kommandozeile, die als @wb_cmd gespeichert und jederzeit
+  # wieder ausgefuehrt werden kann -- und damit ein Weg, auf dem sich jeder Agent
+  # den Deckel abnimmt. Lieber hier sichtbar ablehnen als dort still ein Loch
+  # lassen. Die beiden eingebauten Harnesses (claude, pi) bauen ihre Zeile hier
+  # und sind davon nicht betroffen.
+  if [ -n "$MENSCH" ]; then
+    CAP="$($HOME/.local/bin/wb-state models cap "$MODEL" 2>/dev/null | cut -f1)"
+    if [ -n "$CAP" ] && [ "$CAP" != "-" ] \
+       && [ "$($HOME/.local/bin/wb-state models effort "$MODEL" --effort "$CAP" 2>/dev/null)" != "$EFFORT" ]; then
+      {
+        echo "wb-code: '--mensch' geht auf Harness '$HARNESS' nicht ueber den Deckel hinaus."
+        echo "  Der Pane dieses Harness baut seine Startzeile selbst neu und prueft dabei erneut;"
+        echo "  ein durchgereichtes Merkmal waere dort nicht mehr belegbar."
+        echo "  Moeglich sind: effort bis '$CAP', oder den Deckel setzen:"
+        echo "    wb-state effort-cap set $MODEL <stufe> --grund '<warum>'"
+      } >&2
+      exit 1
+    fi
+  fi
+  $HOME/.local/bin/wb-state models resolve "$MODEL" --role orchestrator \
+      --effort "$EFFORT" --dir "$DIR" --name "$ORCHNAME" >/dev/null || exit 1
+  REG_CMD="exec $HOME/.local/bin/wb-harness-run --model $(printf %q "$MODEL") --role orchestrator --effort $(printf %q "$EFFORT") --dir $(printf %q "$DIR") --name $(printf %q "$ORCHNAME")"
+  CLAUDE_CMD="bash -lc $(printf %q "$REG_CMD")"
+else
+  # No explicit --resume: pick up the conversation this session was running when
+  # it lost its tmux session (crash recovery above).
+  if [ -z "$RESUME" ]; then
+    RESUME="$(recorded_conversation)"
+    [ -n "$RESUME" ] && \
+      echo "wb-code: setze die letzte Unterhaltung dieser Session fort ($RESUME); Kaltstart mit --fresh." >&2
+  fi
+  # Die Chat-Zuordnung (SPEC-V4 6.3 Punkt 4) installiert sich sonst NIE fuer
+  # diesen Zweig: er baut seine Startzeile selbst und laeuft nie durch
+  # wb-harness-run, dem einzigen anderen Ort, der den Hook eintraegt --
+  # derselbe Fund wie bei shell/pi-worker (11.08.), hier an der zweiten
+  # Stelle: Orchestrator-Sitzungen liefen damit ebenfalls ohne
+  # Chat-Zuordnung. 'claude' ist zudem der einzige Harness mit
+  # session.zuordnung=hook (models.default.json). Gemeinsame Stelle mit dem
+  # Registry-Zweig oben: shell/wb-chat-hook-install, nicht hier ein zweites
+  # Mal nachgebaut. Repo-Fassung zuerst, gleiche Bauart wie wb-rolle/pi-worker.
+  CHATHOOK_INSTALL=""
+  for kandidat in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/wb-chat-hook-install" \
+                  "$HOME/.local/bin/wb-chat-hook-install"; do
+    [ -x "$kandidat" ] && { CHATHOOK_INSTALL="$kandidat"; break; }
+  done
+  if [ -n "$CHATHOOK_INSTALL" ]; then
+    "$CHATHOOK_INSTALL" claude
+  else
+    echo "wb-code: wb-chat-hook-install nicht gefunden — keine Chat-Zuordnung eingetragen." >&2
+  fi
+  CLAUDE_CMD="$HOME/.local/bin/claude --model $(printf %q "$MODEL") --effort $(printf %q "$EFFORT")"
+  [ -n "$NAME" ] && CLAUDE_CMD="$CLAUDE_CMD -n $(printf %q "$NAME")"
+  [ -n "$RESUME" ] && CLAUDE_CMD="$CLAUDE_CMD --resume $(printf %q "$RESUME")"
+  # Der Berechtigungsmodus des Orchestrators (2026-08-16, Anweisung des Nutzers:
+  # "sessions ab jetzt immer so starten"). Gemessen: 'claude --help' kennt
+  # --permission-mode mit genau den sechs Werten unten, und erst
+  # --allow-dangerously-skip-permissions macht 'bypassPermissions' zur Laufzeit im
+  # /config-Menue ueberhaupt WAEHLBAR -- ohne das Start-Flag bietet die CLI diese
+  # Stufe dort nicht an. Die Vorgabe (settings.json orchestratorPermissionMode)
+  # ist bypassPermissions und liefert beide Flags; ein gesenkter Wert (jeder
+  # andere der sechs) nur das erste. Anheben auf bypassPermissions ist an der
+  # Quelle gesperrt (wb-state settings set prueft wb-mensch + --grund) -- hier
+  # wird nur noch gelesen, nicht mehr entschieden.
+  #
+  # `wb-state settings valid` UNTERSCHEIDET "Datei fehlt" (in Ordnung, Vorgabe
+  # gilt) von "Datei ist da, aber kaputt" -- `settings get` allein faengt eine
+  # kaputte Datei bewusst LEISE ab und gaebe sonst die Vorgabe zurueck, als waere
+  # nichts. Die konservative Richtung bei Unlesbarkeit (kaputte Datei, `wb-state`
+  # selbst nicht aufrufbar, oder ein Wert, der keiner der sechs bekannten ist):
+  # KEIN Flag, das heutige Verhalten der CLI bleibt unveraendert.
+  PERMMODE=""
+  if "$HOME/.local/bin/wb-state" settings valid 2>/dev/null; then
+    PERMMODE="$("$HOME/.local/bin/wb-state" settings get orchestratorPermissionMode 2>/dev/null || true)"
+  else
+    echo "wb-code: ~/.claude/workbench/settings.json ist kein gueltiges JSON — orchestratorPermissionMode wird nicht angewandt (kein --permission-mode)." >&2
+  fi
+  case "$PERMMODE" in
+    acceptEdits|auto|bypassPermissions|manual|dontAsk|plan)
+      CLAUDE_CMD="$CLAUDE_CMD --permission-mode $(printf %q "$PERMMODE")"
+      [ "$PERMMODE" = bypassPermissions ] && CLAUDE_CMD="$CLAUDE_CMD --allow-dangerously-skip-permissions"
+      ;;
+    "") : ;;
+    *) echo "wb-code: unbekannter orchestratorPermissionMode '$PERMMODE' — kein --permission-mode angehaengt." >&2 ;;
+  esac
+  # Remote Control an, immer (Vorgabe des Nutzers 2026-08-05): die Rolle steht hier
+  # fest (dieser Zweig baut ausschliesslich den ORCHESTRATOR-Pane), also gehoert
+  # die Entscheidung genau hierher und nicht an jede Aufrufstelle einzeln. Name =
+  # --name, sonst der (ohnehin projektbezogene) tmux-Sessionname -- den
+  # Rechnernamen haengt die CLI selbst schon als Praefix an
+  # (--remote-control-session-name-prefix, Vorgabe: Hostname), also nicht hier
+  # zusaetzlich davorsetzen.
+  CLAUDE_CMD="$CLAUDE_CMD --remote-control $(printf %q "${NAME:-$SESSION}")"
+  CLAUDE_CMD="$CLAUDE_CMD --append-system-prompt \"\$(cat $HOME/.claude/roles/orchestrator.md)\""
+fi
+
+# Snapshot the transcripts BEFORE Claude starts — the new one is this session's.
+BEFORE=""
+
+# Aufraeumen bei jedem fruehen Abbruch (2026-08-16, bugjagd shell/niedrig, "kein
+# trap"): mit `set -euo pipefail` oben beendet JEDER ungeschuetzte Fehlschlag
+# zwischen dieser Zeile und der Uebergabe an record_conversation() (oder dem
+# direkten rm -f im --resume-Zweig) das ganze Skript sofort -- die mktemp-Datei
+# blieb bisher liegen. Direkt belegt, nicht nur konstruiert: acht liegengebliebene
+# wb-code-transcripts.* (0 Byte, aus dem heutigen Tag) plus ein
+# pi-worker-transcripts.* standen schon in $TMPDIR, bevor dieser Fix geschrieben
+# wurde. `record_conversation()` setzt BEFORE nach der Uebergabe an ihren
+# abgekoppelten Hintergrundprozess auf "" (siehe dort und beim Aufruf unten) --
+# dieser Handler darf ihm die Datei sonst mitten in dessen bis zu 40s laufender
+# Poll-Schleife wegziehen. `attach()` beendet den Prozess am Ende ueber `exec`,
+# was den EXIT-Trap NICHT ausloest (kein Problem: BEFORE ist zu dem Zeitpunkt
+# laengst "" oder schon geloescht).
+trap '[ -n "${BEFORE:-}" ] && rm -f "$BEFORE"; :' EXIT
+
+if [ "$HARNESS" = "claude" ]; then
+  BEFORE="$(mktemp "${TMPDIR:-/tmp}/wb-code-transcripts.XXXXXX")"
+  ls "$(transcript_dir "$DIR")" 2>/dev/null | grep '\.jsonl$' | sort > "$BEFORE" || true
+fi
+
+tmux new-session -d -s "$SESSION" -c "$DIR" "$CLAUDE_CMD"
+orch=$(tmux list-panes -t "=$SESSION" -F '#{pane_id}' | head -1)
+# Ueber wb-rolle (2026-08-07), damit die Rolle nicht nur in der Pane-Option steht,
+# sondern von der ersten Sekunde an auch im Register, das die Guards als zweite
+# Quelle lesen. Ohne das gaebe es ein Fenster: ein frischer Orchestrator-Pane, der
+# noch keinen einzigen Bash-Aufruf gemacht hat, haette bis dahin nur die Option --
+# und genau die war der gemessene Angriffspunkt. Fehlt das Werkzeug (Maschine noch
+# nicht abgeglichen), bleibt es beim alten Weg; eine Session darf daran nicht
+# scheitern.
+if [ -x "$HOME/.local/bin/wb-rolle" ]; then
+  "$HOME/.local/bin/wb-rolle" setzen "$orch" orchestrator \
+    || echo "wb-code: wb-rolle konnte $orch nicht registrieren — Rolle steht nur in der Pane-Option." >&2
+else
+  tmux set -p -t "$orch" @wb_role orchestrator
+fi
+# Clean, re-executable command for wb-revive / wb-autorevive (pane-died hook).
+tmux set -p -t "$orch" @wb_cmd "$CLAUDE_CMD"
+tmux set -p -t "$orch" remain-on-exit on
+tmux select-pane -t "$orch" -T ORCHESTRATOR
+
+# Which conversation runs here? On an explicit/recovered --resume we already
+# know it; otherwise the watcher picks up the transcript Claude is about to
+# write. Either way the next start after a crash finds it.
+if [ "$HARNESS" = "claude" ]; then
+  if [ -n "$RESUME" ]; then
+    rm -f "$BEFORE"
+    BEFORE=""
+    if [ -n "$KEY" ]; then
+      $HOME/.local/bin/wb-state touch "$DIR" "$SESSION" --key "$KEY" --claude-session "$RESUME"
+    else
+      $HOME/.local/bin/wb-state touch "$DIR" "$SESSION" --claude-session "$RESUME"
+    fi
+  else
+    record_conversation "$BEFORE"
+    # Uebergeben an den abgekoppelten Hintergrundprozess (raeumt die Datei selbst
+    # weg, siehe record_conversation()) -- der trap oben darf sie ab hier nicht
+    # mehr anfassen.
+    BEFORE=""
+  fi
+fi
+
+maybe_start_guard "$orch"
+attach

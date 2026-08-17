@@ -1,0 +1,74 @@
+{
+ "providers": {
+  "ollama": {
+   "baseUrl": "http://localhost:11434/v1",
+   "api": "openai-completions",
+   "apiKey": "ollama",
+   "compat": {
+    "supportsDeveloperRole": false
+   },
+   "models": [
+    {
+     "id": "ornith:35b-256k",
+     "name": "Ornith 35B (local, native engine, 200K ctx baked)",
+     "contextWindow": 262144
+    },
+    {
+     "id": "ornith:9b-256k",
+     "name": "Ornith 9B (local, cheap bulk, 200K ctx baked)",
+     "contextWindow": 262144
+    },
+    {
+     "id": "ornith-uncensored:35b-128k",
+     "name": "Ornith-1.0 35B Uncensored (local, Q6_K, 100K ctx baked)",
+     "contextWindow": 131072
+    },
+    {
+     "id": "qwen3.6-abliterated:35b-128k",
+     "name": "Qwen3.6-35B-A3B Abliterated (local, uncensored, Q6_K, 100K ctx baked)",
+     "contextWindow": 131072
+    },
+    {
+     "id": "huihui_ai/qwen3-coder-abliterated:30b-256k",
+     "name": "Qwen3-Coder-Abliterated 30B (local, uncensored, 200K ctx baked)",
+     "contextWindow": 262144
+    },
+    {
+     "id": "qwen3.6:35b-a3b-coding-nvfp4-256k",
+     "name": "Qwen3.6-35B-A3B Coding (local, 200K ctx baked)",
+     "contextWindow": 262144
+    },
+    {
+     "id": "qwen3.6:27b-coding-nvfp4-256k",
+     "name": "Qwen3.6-27B Coding (local, 200K ctx baked)",
+     "contextWindow": 262144
+    },
+    {
+     "id": "qwen3-vl:8b-256k",
+     "name": "Qwen3-VL 8B (local, vision, 200K ctx baked)",
+     "contextWindow": 262144
+    },
+    {
+     "id": "huihui_ai/qwen3-abliterated:4b-41k",
+     "name": "Qwen3-Abliterated 4B (local, uncensored bulk, 41K ctx baked -- native max 40960)",
+     "contextWindow": 40960
+    }
+   ]
+  },
+  "mlx-lokal": {
+   "baseUrl": "http://127.0.0.1:8080/v1",
+   "api": "openai-completions",
+   "apiKey": "mlx",
+   "compat": {
+    "supportsDeveloperRole": false
+   },
+   "models": [
+    {
+     "id": "$HOME/AI/mlx-models/grug-27b-mlx-q4",
+     "name": "grug-27b (local, MLX 4bit, hybrid attention, 128K ctx -- errechnet, nicht lastgetestet)",
+     "contextWindow": 131072
+    }
+   ]
+  }
+ }
+}

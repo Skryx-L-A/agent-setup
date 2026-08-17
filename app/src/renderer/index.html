@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- 'frame-src awb-seite:' ist der EINZIGE Zusatz fuer die uebernommenen Seiten
+         (Schritt 7). Sie sind vollstaendige Dokumente mit EIGENER CSP; laegen sie in
+         einem about:blank-Rahmen, erbten sie DIESE hier, und ihr 'script-src
+         nonce-...' waere wirkungslos -- die Seiten stuenden da, ohne dass ein Knopf
+         etwas taete (gemessen 05.08.). Mit eigenem Schema haben sie ihre eigene
+         Herkunft und ihre eigene CSP, so wie im Webview. 'script-src' bleibt hier
+         unangetastet streng: dieses Fenster fuehrt nur sein eigenes Buendel aus. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; frame-src awb-seite:" />
+    <title>Agent Workbench</title>
+    <link rel="stylesheet" href="renderer.css" />
+    <style>
+      /* Der Grundsatz aus 4b: so viel Flaeche wie moeglich fuer die Session.
+         Beide Leisten sind auf Symbole einklappbar, und das ist der Normalfall. */
+      :root {
+        color-scheme: dark;
+        --grund: #101216;
+        --leiste: #171a20;
+        --linie: #262b34;
+        --schrift: #d8dee9;
+        --gedaempft: #8b93a1;
+        --laeuft: #46a758;
+        --will: #e0a020;
+        --aus: #d24c4c;
+        --fern: #6a7fd0;
+        /* Schrift auf einer gefaerbten Flaeche. So dunkel, weil das Rot die
+           knappste der vier Farben ist: darauf traegt erst dieser Wert die
+           4,5 aus WCAG (gemessen 4,69; auf Gelb sind es 8,85). */
+        --tinte: #05070a;
+        --wahl: #222833;
+        /* Die vier SITZUNGSZUSTAENDE (Einstellungen, Seite "Aussehen"), anders
+           als die vier Farben oben: NICHT fest, sondern vom Menschen gewaehlt
+           und von main/thema.ts kontrastangepasst nachgezogen (`themaAnwenden`
+           unten). Die Werte hier sind nur die Vorgabe fuer den einen
+           Wimpernschlag vor dem ersten `awb:thema-neu`. `-tinte` ist die
+           Schrift auf der GEFUELLTEN Flaeche (.kuerzel), die zwei anderen
+           Farben sind fuer Punkt, Rand und Schrift auf der Fensterflaeche. */
+        --zustand-laeuft: #4ea1ff;
+        --zustand-laeuft-tinte: #05070a;
+        --zustand-wartet: #e0a33e;
+        --zustand-wartet-tinte: #05070a;
+        --zustand-fertig: #3fa66a;
+        --zustand-fertig-tinte: #05070a;
+        --zustand-tot: #c25b5b;
+        --zustand-tot-tinte: #05070a;
+      }
+      /* HELL UND DUNKEL (Farben durchreichen, 11.08.). Dieselbe Mechanik wie im
+         Einstellungsfenster (app/src/einstellungen/index.html): `data-thema`
+         traegt IMMER den AUFGELOESTEN Wert ('hell' oder 'dunkel', nie 'system')
+         -- main/thema.ts loest 'system' ueber `nativeTheme` auf, damit hier kein
+         Fenster raten muss. JEDE Farbe steht oben als Variable und wird hier
+         ueberschrieben; keine Regel im Rest der Datei nennt eine Farbe direkt. */
+      :root[data-thema='hell'] {
+        color-scheme: light;
+        --grund: #ffffff;
+        --leiste: #f4f5f7;
+        --linie: #d8dbe1;
+        --schrift: #1b1f27;
+        --gedaempft: #5c6472;
+        --laeuft: #22803c;
+        --will: #9a6600;
+        --aus: #b3261e;
+        --fern: #3355c4;
+        --tinte: #ffffff;
+        --wahl: #e4e8f4;
+      }
+      html, body { margin: 0; height: 100%; background: var(--grund); color: var(--schrift); overflow: hidden; }
+      body { font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+      #app { display: flex; height: 100vh; }
+
+      .leiste { background: var(--leiste); display: flex; flex-direction: column; flex: 0 0 auto; }
+      /* Die Trennlinie sitzt HINTER dem Griff, nicht davor. Sonst stand sie
+         zwischen Leiste und Griff, und die vier Pixel des Griffs zeigten in
+         der Farbe des Rumpfs zwischen Leiste und Schublade durch -- genau der
+         Spalt, der aussah wie zwei uebereinanderliegende Leisten. Jetzt lesen
+         sich Leiste und Griff als ein Stueck, und dahinter kommt eine Linie,
+         so wie rechts. */
+      #links { overflow: hidden; }
+      /* Der Platz der drei Schubladen. Leer nimmt er keine Breite, also ist er
+         auch nicht zu sehen; offen bestimmt die Schublade darin die Breite. */
+      #schublade { display: flex; flex: 0 0 auto; overflow: hidden; }
+      #rechts { border-left: 1px solid var(--linie); overflow: hidden; }
+
+      #griff, #griff-rechts { flex: 0 0 4px; cursor: col-resize; background: transparent; }
+      /* Der linke Griff traegt die Farbe der Leiste und die Linie an seinem
+         Ende: er gehoert optisch zur Leiste, nicht zum Spalt daneben. Sein
+         Gegenstueck rechts bleibt durchsichtig, weil dort die Buehne
+         durchscheint -- und die hat dieselbe Farbe wie der Rumpf. */
+      #griff { background: var(--leiste); border-right: 1px solid var(--linie); }
+      #griff:hover, #griff-rechts:hover { background: var(--linie); }
+
+      /* Beide Kaesten mit Knoepfen sind FLEX mit align-items: stretch. Ohne das
+         behaelt ein <button> seine eigene Inhaltsbreite -- er waechst nicht auf
+         die Leiste, und sein Symbol steht dann links statt auf der Mittelachse
+         der Kuerzel darueber. Genau daran hing die schiefe Sonne unten.
+         Oben keine Polsterung: die Leiste faengt buendig am Fensterrand an. */
+      .werkzeuge, #fuss { display: flex; flex-direction: column; align-items: stretch; }
+      .werkzeuge { padding: 0; }
+      .knopf {
+        display: flex; align-items: center; gap: 10px; min-height: 34px; padding: 0 8px;
+        color: var(--gedaempft); background: none; border: 0; cursor: pointer; text-align: left;
+        font: inherit; white-space: nowrap; overflow: hidden;
+      }
+      .knopf:hover { color: var(--schrift); }
+      .knopf svg { flex: 0 0 20px; }
+      .knopf .beschriftung { opacity: 0.85; }
+      .schmal .knopf { justify-content: center; padding: 0; }
+      .schmal .knopf .beschriftung { display: none; }
+
+      .trenner { height: 1px; background: var(--linie); margin: 6px 8px; }
+      .schmal .trenner { margin: 6px 10px; }
+
+      #sessions { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; padding: 2px 0; }
+      #fuss { padding-bottom: 6px; }
+
+      /* Ein Eintrag zeigt, was die Breite hergibt (A15). */
+      /* Die Marke der gewaehlten Zeile liegt als Innenschatten AUF dem Kasten
+         und nicht als Rand davor: ein Rand haette den Inhalt um zwei Pixel
+         nach rechts geschoben, und die Kuerzel staenden dann auf einer anderen
+         Mittelachse als die Symbole darueber und darunter. */
+      .eintrag {
+        display: flex; align-items: center; gap: 9px; padding: 3px 8px; cursor: pointer;
+        white-space: nowrap; overflow: hidden;
+      }
+      .eintrag:hover { background: #1e232b; }
+      .eintrag.gewaehlt { background: var(--wahl); box-shadow: inset 2px 0 0 var(--schrift); }
+      .eintrag.zieht { opacity: 0.4; }
+      .eintrag.ziel { border-top: 2px solid var(--schrift); }
+
+      /* Das Kuerzel traegt die Farbe als FLAECHE, nicht als Schrift: zwei fette
+         Buchstaben in einer Zustandsfarbe auf Dunkelgrau waren bei 12 Pixeln zu
+         schwach zu lesen. Die dunkle Tinte auf der hellen Flaeche hat gegen
+         jede der vier Farben mehr als das Achtfache an Kontrast. */
+      .kuerzel {
+        flex: 0 0 30px; height: 30px; border-radius: 7px; background: #21262f;
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 700; font-size: 13px; letter-spacing: 0.5px;
+      }
+      .kuerzel.fern { color: var(--tinte); background: var(--fern); }
+      /* Die drei ECHTEN Sitzungszustaende: Flaeche UND Tinte kommen aus den
+         Zustandsfarben (Einstellungen, Seite "Aussehen") -- die Tinte ist je
+         Farbe einzeln gerechnet (main/thema.ts, `tinteFuer`), nie fest, weil
+         eine frei gewaehlte Flaeche mal helle und mal dunkle Schrift braucht. */
+      .kuerzel.laeuft { color: var(--zustand-laeuft-tinte); background: var(--zustand-laeuft); }
+      .kuerzel.will { color: var(--zustand-wartet-tinte); background: var(--zustand-wartet); }
+      .kuerzel.aus { color: var(--zustand-tot-tinte); background: var(--zustand-tot); }
+      .kuerzel.ruhig { color: var(--gedaempft); background: #21262f; }
+      .punkt { flex: 0 0 9px; height: 9px; border-radius: 50%; }
+
+      /* CHAT-SITZUNGEN: IN DERSELBEN Liste wie die Terminal-Sitzungen und an
+         derselben Stelle (Punkt 4, 12.08.). Bis dahin standen sie in einem
+         eigenen Abschnitt hinter einem Trenner „Chat"; der ist weg, und mit ihm
+         die zweite Sortierregel. Was bleibt, ist das Kennzeichen: was hier
+         klickt, legt ein Gespraech auf die Buehne statt Kacheln. */
+      .chatmarke { flex: 0 0 auto; display: flex; align-items: center; color: var(--gedaempft); }
+      .eintrag.chat.laeuft .chatmarke { color: var(--zustand-laeuft); }
+      .texte { display: flex; flex-direction: column; overflow: hidden; }
+      .name { overflow: hidden; text-overflow: ellipsis; }
+      .zusatz { color: var(--gedaempft); font-size: 11px; }
+
+      /* V14: der Knopf einer wirklich toten Session -- klein, gedaempft, nur
+         auf Verlangen deutlich (A14: kein Dauerhinweis, der um Aufmerksamkeit
+         wirbt; die Zeile ist schon durch ihre Farbe als 'aus' erkennbar). */
+      .wiederherstellen {
+        flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
+        width: 22px; height: 22px; margin-left: auto; padding: 0; border-radius: 5px;
+        background: none; border: 0; color: var(--gedaempft); cursor: pointer;
+      }
+      .wiederherstellen:hover { color: var(--schrift); background: #262c37; }
+
+      .schmal .eintrag { justify-content: center; padding: 3px 0; gap: 0; }
+      .schmal .texte { display: none; }
+
+      .laeuft { color: var(--zustand-laeuft); } .laeuft-bg { background: var(--zustand-laeuft); }
+      .will { color: var(--zustand-wartet); } .will-bg { background: var(--zustand-wartet); }
+      .aus { color: var(--zustand-tot); } .aus-bg { background: var(--zustand-tot); }
+      /* Vierter Zustand aus F6: nicht erreichbar. Sichtbar verschieden von Rot,
+         zusaetzlich gestrichelt umrandet, damit die Unterscheidung auch ohne
+         Farbe traegt. */
+      .fern { color: var(--fern); } .fern-bg { background: var(--fern); }
+      /* Kein Zustand, sondern das Gegenteil davon: hier ist nichts mehr los. */
+      .ruhig { color: var(--gedaempft); } .ruhig-bg { background: var(--gedaempft); }
+      /* Auf der gefaerbten Flaeche traegt der Strich die Tinte, sonst waere er
+         blau auf blau und damit weg. */
+      .eintrag.zustand-unreachable .kuerzel { outline: 1px dashed var(--tinte); outline-offset: -4px; }
+      .eintrag.zustand-unreachable .punkt { box-shadow: 0 0 0 1px var(--fern); background: transparent; }
+
+      #mitte { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
+      /* Die Buehne ist dunkler als der Pane und der Pane hat eine Kante: sonst
+         ist nicht zu sehen, wo das Terminal aufhoert, und der Rand, den der
+         Unterschied der Seitenverhaeltnisse uebrig laesst, sieht aus wie ein
+         abgeschnittenes Bild statt wie ein Rahmen. */
+      /* Die Kante wird MITSKALIERT: bei Faktor 0,7 blieb von einem Pixel in
+         var(--linie) auf dem Foto #191d23 uebrig, und damit lasen sich Buehne
+         und Terminal als ein einziges dunkles Feld -- der Rand sah aus, als
+         finge das Terminal erst ein Fuenftel weiter unten an. Zwei Pixel in
+         einem helleren Ton ueberstehen die Verkleinerung. */
+      /* Der Pane FUELLT die Buehne. Keine Skalierung, kein Rand, keine Kante:
+         das Gitter ist genau so gross wie die Flaeche, und tmux bekommt
+         dieselben Zahlen. */
+      #buehne { flex: 1 1 auto; position: relative; overflow: hidden; background: var(--grund); }
+      /* Das Mass-Terminal misst nur die Zellgroesse und wird nicht gezeigt. */
+      #pane { position: absolute; inset: 0; visibility: hidden; pointer-events: none; }
+      /* Das Gitter: ein Kasten je Pane, gesetzt nach der Aufteilung von tmux. */
+      #gitter { position: absolute; inset: 0; }
+      /* DIE CHAT-SITZUNG (13.08.): sie liegt UEBER dem Gitter, nicht an seiner
+         Stelle. Eine Chat-Sitzung hat keinen Pane und keine tmux-Zellen -- die
+         Kachelrechnung darunter bleibt deshalb unangetastet, das Gitter behaelt
+         seine Groesse, und tmux bekommt weiter dieselben Zahlen. Deckend, weil
+         darunter ein Terminal weiterlaeuft, das hier nichts zu sagen hat.
+         z-index 6: ueber dem Gitter samt Pane-Namen (2) und der Lese-Ansicht
+         eines Panes (5), unter der Namensabfrage (7) und den uebernommenen
+         Seiten (30/40) -- ein Kasten, der eine Rueckfrage verdeckt, verschluckt
+         sie. */
+      #chatbuehne { position: absolute; inset: 0; z-index: 6; display: none; background: var(--grund); }
+      #chatbuehne.an { display: block; }
+      .panekasten { position: absolute; overflow: hidden; }
+      /* KEINE Bildlaufleiste. Sie lag ueber der letzten Spalte statt neben ihr,
+         und das letzte Zeichen einer vollen Zeile stand danach halb unter dem
+         Rand (alice, 06.08.; gemessen an 178 Zeichen auf 1393 Pixeln --
+         7,83 Pixel je Zelle, die Leiste nahm 6 davon). Gerollt wird mit dem
+         Rad, ein angeschnittenes Zeichen ist der schlechtere Tausch.
+         `display: none` statt Breite 0: xterm rechnet seine Leistenbreite aus
+         der Differenz von Ansichts- und Rollflaeche und setzt bei 0 seinen
+         Vorgabewert von 15 Pixeln ein. */
+      .panekasten .xterm-viewport::-webkit-scrollbar { display: none; }
+      .panekasten.aktiv { box-shadow: inset 0 0 0 1px #3a4351; }
+      /* Der Name des Panes in der Ecke -- die eine Auskunft, die nach dem
+         Wegfall der Kopfzeile gefehlt hat. Er nimmt keine eigene Zeile und
+         faengt keine Klicks ab.
+         Bei zehn Pixeln war er da, aber nicht zu lesen: 18 Pixel sind die
+         geforderten rund 80 Prozent mehr. Der Grund ist jetzt DECKEND statt
+         durchscheinend -- durch die alte Fassung schimmerte der Terminaltext,
+         und der Kontrast des Schildes hing davon ab, was zufaellig darunter
+         stand. Die gedaempfte Fassung bleibt deutlich ueber dem Ton der
+         Buehne, damit man sie nicht suchen muss. */
+      .panename {
+        position: absolute; right: 0; top: 0; z-index: 2; pointer-events: none;
+        padding: 0 7px; font-size: 15px; line-height: 22px; font-weight: 600;
+        color: #d5dbe6; background: #272d38;
+        border-left: 1px solid #3a4351; border-bottom: 1px solid #3a4351;
+        border-bottom-left-radius: 5px;
+      }
+      .panename.aktiv { color: #f2f5fa; background: #3f4a5a; border-color: #5a657a; }
+      /* Dasselbe Schild in einer anderen Ecke. Welche es wird, entscheidet der
+         Inhalt: das Schild geht dorthin, wo keine beschriebene Zelle liegt
+         (setzeEcke in renderer.ts). Nur die abgerundete Kante wandert mit --
+         sie zeigt immer ins Feld hinein. */
+      .panename.li {
+        left: 0; right: auto;
+        border-left: none; border-right: 1px solid #3a4351;
+        border-bottom-left-radius: 0; border-bottom-right-radius: 5px;
+      }
+      .panename.unten {
+        top: auto; bottom: 0;
+        border-bottom: none; border-top: 1px solid #3a4351;
+        border-bottom-left-radius: 0; border-top-left-radius: 5px;
+      }
+      .panename.unten.li { border-top-left-radius: 0; border-top-right-radius: 5px; }
+      /* Ein angeforderter Pane, den es nicht gibt. Er behaelt seinen Platz im
+         Gitter und sagt, warum er leer ist -- ein Worker, der ohne ein Wort
+         verschwindet, ist schlimmer als einer, der schlecht sitzt. */
+      .panefehlt {
+        position: absolute; overflow: hidden; display: flex;
+        align-items: center; justify-content: center; text-align: center;
+        padding: 0 12px; font-size: 13px; color: #8b93a3;
+        background: #14171c; box-shadow: inset 0 0 0 1px #262c36;
+      }
+      /* Die flache Fassung fuer einen Pane, der fuer das grosse Schild zu
+         niedrig ist. Immer noch groesser als die alten zehn Pixel. Der Abstand
+         zur grossen Fassung ist mit 15 Pixeln klein geworden -- gemeint ist
+         auch nur, dass ein niedriger Pane sein Schild BEHAELT statt es zu
+         verlieren, nicht ein zweiter Schriftgrad. */
+      .panename.flach { font-size: 13px; line-height: 18px; padding: 0 5px; }
+
+      /* Der Plus-Knopf traegt dieselbe Bildsprache wie die Werkzeuge oben,
+         steht aber bei den Sessions und ist deshalb etwas heller. */
+      .knopf.neu { color: #aab3c2; }
+      .knopf.neu:hover { color: #eaeef6; }
+
+      /* Das Feld fuer den neuen Namen einer Sitzung (Kontextmenue der linken
+         Leiste, „Namen ändern"). Ein Zeilenfeld ueber der Buehne statt eines
+         eigenen Fensters: gefragt wird EIN Wort, und es geht mit der Antwort
+         wieder zu. Geschrieben wird der Name nicht hier, sondern ueber
+         `wb-state` im Hauptprozess. */
+      #umbenennen {
+        position: absolute; left: 50%; top: 40px; transform: translateX(-50%);
+        z-index: 7; display: none; width: min(460px, 84%);
+        background: #1b1f26; border: 1px solid var(--linie); border-radius: 8px;
+        box-shadow: 0 12px 34px rgba(0,0,0,.45); color: var(--schrift);
+      }
+      #umbenennen.sichtbar { display: block; }
+      #umbenennen .kopf { padding: 9px 14px 0; font-weight: 600; }
+      #umbenennen .alt { padding: 2px 14px 0; font-size: 12px; color: #9aa3b2; word-break: break-all; }
+      #umbenennen .fuss { display: flex; gap: 8px; align-items: center; padding: 10px 14px 12px; }
+      #umbenennen input {
+        flex: 1 1 auto; min-width: 0; padding: 6px 9px; border-radius: 5px;
+        background: #12161c; border: 1px solid var(--linie); color: var(--schrift);
+      }
+      #umbenennen button {
+        padding: 6px 12px; border-radius: 5px; border: 1px solid var(--linie);
+        background: #2a3140; color: var(--schrift); cursor: pointer;
+      }
+      #umbenennen button.start { background: #2f5d3a; border-color: #3d7a4c; }
+
+      /* Was noch nicht gebaut ist, sagt das beim Klick -- ein Satz, kein
+         halbes Fenster. */
+      #notiz {
+        position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
+        /* Ueber der Chat-Sitzung (6): eine Meldung, die hinter dem Gespraech
+           liegt, ist keine Meldung. */
+        z-index: 8;
+        /* Ohne width bemisst der Browser den Platz erst ab der Mitte und bricht
+           den Satz zu frueh um. */
+        display: none; width: max-content; max-width: 80%; padding: 5px 12px; border-radius: 6px;
+        background: #222833; border: 1px solid var(--linie); color: var(--schrift);
+      }
+      #notiz.sichtbar { display: block; }
+
+      /* Faellt der Steuerkanal aus, entsteht das Fenster trotzdem -- und dann
+         muss man ihm ansehen, dass es keinen hat. Kein Ausblenden nach ein
+         paar Sekunden: der Zustand bleibt, also bleibt die Anzeige. */
+      #kanalwarnung {
+        position: absolute; left: 0; right: 0; top: 0; z-index: 4; display: none;
+        padding: 5px 10px; background: #4a1d1d; color: #ffdede;
+        border-bottom: 1px solid var(--aus); font-size: 12px;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      #kanalwarnung.sichtbar { display: block; }
+
+      /* Rechte Leiste: eingeklappt eine Punktreihe, aufgeklappt Namen, Zustand,
+         Auslastung (A8, A8a). */
+      #rechts.schmal { width: 40px; align-items: center; }
+      #rechts .zeile {
+        display: flex; align-items: center; gap: 8px; padding: 4px 8px; cursor: pointer;
+        white-space: nowrap; overflow: hidden; min-height: 26px;
+      }
+      #rechts .zeile:hover { background: #1e232b; }
+      #rechts .zeile.gewaehlt { background: var(--wahl); }
+      #rechts.schmal .zeile { justify-content: center; padding: 4px 0; }
+      #rechts.schmal .zeile .text { display: none; }
+      #rechts .text { display: flex; flex-direction: column; overflow: hidden; }
+      #rechts .last { color: var(--gedaempft); font-size: 11px; }
+
+      /* Eine Zeile je Eintrag: Marke, Name, Zustand daneben statt darunter.
+         Halb so hoch wie eine zweizeilige Fassung, nach dem Vorbild der
+         kleinen Tabs in VS Code. */
+      #rechts .zeile { min-height: 0; padding: 1px 8px; gap: 6px; }
+      #rechts .text { flex-direction: row; align-items: baseline; gap: 6px; }
+      #rechts .text > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      /* Wird es eng, weicht der Zustand und nicht der Name: ein abgeschnittenes
+         "Orchestrat…" ist teurer als ein abgeschnittenes "claude · 0 %". */
+      #rechts .text > div:first-child { flex: 0 1 auto; }
+      /* Wird es eng, weicht der Zustand zuerst; ganz verschwinden soll er aber
+         nicht, deshalb die Obergrenze bei gut der Haelfte der Zeile. Wer die
+         Herkunft ganz lesen will, zieht die Leiste breiter. */
+      #rechts .last { color: var(--gedaempft); font-size: 10px; flex: 0 100 auto; max-width: 55%; }
+      #rechts .rubrik { margin: 5px 8px 1px; }
+      #rechts.schmal .zeile { padding: 2px 0; }
+
+      /* Die Marke am Zeilenanfang -- drei Vorschlaege zur Wahl. Gemeinsam:
+         sie traegt ein bis zwei Zeichen und sagt damit auch eingeklappt, WER
+         der Eintrag ist. Ein Punkt sagte nur eine Farbe. */
+      #rechts .punkt {
+        flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
+        font-weight: 700; font-size: 9px; letter-spacing: 0.3px; line-height: 1;
+      }
+      /* Gewaehlt: dunkle Kachel, Zeichen in der Zustandsfarbe, und die Farbe
+         zusaetzlich als Streifen an der Kante. Trennt "wer" (Schrift) von
+         "wie" (Farbe) und bleibt in einer langen Liste am ruhigsten. */
+      #rechts .punkt {
+        position: relative; width: 22px; height: 15px; border-radius: 3px;
+        background: #21262f !important; padding-left: 3px;
+      }
+      #rechts .punkt::before {
+        content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+        border-radius: 3px 0 0 3px; background: var(--marke, currentColor);
+      }
+      /* Die Zustandsfarbe als eigene Groesse, damit sie auch dort verfuegbar
+         ist, wo die Schrift eine andere Farbe braucht als der Streifen. */
+      #rechts .punkt.laeuft { --marke: var(--zustand-laeuft); }
+      #rechts .punkt.will { --marke: var(--zustand-wartet); }
+      #rechts .punkt.aus { --marke: var(--zustand-tot); }
+      #rechts .punkt.fern { --marke: var(--fern); }
+      #rechts .punkt.ruhig { --marke: var(--gedaempft); }
+
+      /* Die ROLLE steckt in der Form der Marke, der ZUSTAND bleibt in ihrer
+         Farbe. Vorher trugen der Orchestrator und der Worker-Tab dieselbe
+         Farbe und unterschieden sich nur im Zeichen -- bei gleichem Zustand
+         war das kein Unterschied mehr (alice am 05.08.). Der Orchestrator
+         bekommt die GEFUELLTE Kachel mit dunkler Tinte, die Worker behalten
+         die dunkle Kachel mit dem farbigen Streifen. Gefuellt gegen umrandet
+         trennt auch dann noch, wenn beide dieselbe Zustandsfarbe tragen, und
+         es kostet keine zweite Farbe: die vier Zustandsfarben bleiben fuer
+         den Zustand reserviert. */
+      #rechts .zeile.orchestrator .punkt {
+        background: var(--marke, var(--gedaempft)) !important;
+        color: var(--tinte);
+      }
+      #rechts .zeile.orchestrator .punkt::before { display: none; }
+
+      /* Was unter einem Worker haengt, traegt eine Linie zu ihm: aufgezogen als
+         Winkel vor der Marke, eingeklappt als kurzer Strich darueber. Die
+         Zugehoerigkeit steht damit in der GEOMETRIE und nicht in einer Farbe --
+         die Farbe ist fuer den Zustand reserviert. */
+      /* DIESELBE Bildsprache gilt eine Stufe hoeher: die Worker eines Tabs
+         standen auf derselben senkrechten Achse wie der Tab selbst, und wer
+         Tab und Worker unterscheiden wollte, musste die Aufschrift lesen. Jetzt
+         ist es eine Ordnung ueber drei Ebenen -- Tab, Worker, Anhang -- mit
+         demselben Winkel und derselben Stufenweite von zwoelf Pixeln.
+         Fertige Worker sind ausgenommen: sie haengen unter ihrer Ueberschrift
+         und unter keinem Tab, ihr Winkel zeigte auf nichts.
+         Alles nur in der aufgezogenen Leiste: eingeklappt gibt es weder Worker
+         noch Anhang, dort IST der Tab die Einheit. */
+      #rechts:not(.schmal) .zeile.worker:not(.fertig),
+      #rechts .zeile.kind { position: relative; }
+      #rechts:not(.schmal) .zeile.worker:not(.fertig)::before,
+      #rechts .zeile.kind::before {
+        content: ''; position: absolute; left: 14px; top: 0; bottom: 50%; width: 1px; background: var(--linie);
+      }
+      #rechts:not(.schmal) .zeile.worker:not(.fertig)::after,
+      #rechts .zeile.kind::after {
+        content: ''; position: absolute; left: 14px; top: 50%; width: 5px; height: 1px; background: var(--linie);
+      }
+      /* Stufe 1: die Worker eines Tabs. */
+      #rechts:not(.schmal) .zeile.worker:not(.fertig) { padding-left: 22px; }
+      /* Stufe 2: Kind-Worker und Subagenten unter ihrem Worker. */
+      #rechts:not(.schmal) .zeile.kind { padding-left: 34px; }
+      #rechts:not(.schmal) .zeile.kind::before,
+      #rechts:not(.schmal) .zeile.kind::after { left: 26px; }
+      /* Stufe 3: was unter einem Kind-Worker haengt. */
+      #rechts:not(.schmal) .zeile.kind.tief { padding-left: 46px; }
+      #rechts:not(.schmal) .zeile.kind.tief::before,
+      #rechts:not(.schmal) .zeile.kind.tief::after { left: 38px; }
+      #rechts .zeile.kind .punkt { transform: scale(0.86); }
+      #rechts .anhang {
+        flex: 0 0 auto; font-size: 9px; color: var(--gedaempft);
+        background: #21262f; border-radius: 3px; padding: 0 4px;
+      }
+      #rechts .name { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
+      #rechts .name > span:first-child { overflow: hidden; text-overflow: ellipsis; }
+      /* Die Tab-Marke der eingeklappten Leiste: eine Zeile je Tab, nicht je
+         Worker. Sie ist etwas hoeher, weil sie fuer mehrere steht. */
+      #rechts.schmal .zeile.tabmarke { padding: 4px 0; }
+      #rechts.schmal .zeile.tabmarke.gewaehlt { background: var(--wahl); }
+      /* V19: Subagenten sichtbar, aber eingerueckt unter ihrem Worker und ohne
+         Platz in der Kapazitaetsrechnung. */
+      /* Subagenten und Kind-Worker stehen eingerueckt. Eingeklappt erscheinen
+         sie gar nicht mehr -- dort ist die Einheit der Tab. */
+      /* Die Einrueckung eines Subagenten kommt aus der Stufenleiter oben; hier
+         bleibt nur, was ihn sonst noch von einem Worker unterscheidet. Ein
+         Subagent OHNE bekannten Elternteil haengt unter nichts und bekommt
+         deshalb die Stufe eines Workers statt einen Winkel ins Leere. */
+      #rechts .zeile.subagent { opacity: 0.8; }
+      #rechts:not(.schmal) .zeile.subagent.ohne-eltern { padding-left: 22px; }
+      /* Fertige Worker stehen unter einer eigenen Ueberschrift, damit sie nicht
+         wie ein laufender Eintrag gelesen werden; eingeklappt bleibt von der
+         Ueberschrift die Linie uebrig. */
+      #rechts .rubrik {
+        display: flex; align-items: center; gap: 6px; margin: 8px 8px 2px;
+        color: var(--gedaempft); font-size: 11px; white-space: nowrap;
+      }
+      #rechts .rubrik::after { content: ''; flex: 1 1 auto; height: 1px; background: var(--linie); }
+      #rechts.schmal .rubrik { margin: 8px 8px 4px; }
+      #rechts.schmal .rubrik span { display: none; }
+      #rechts .zeile.fertig { cursor: default; }
+      #rechts .zeile.fertig .text { color: var(--gedaempft); }
+      /* Ohne Tabs bleibt kein Streifen stehen: die Reihe beginnt buendig am
+         oberen Fensterrand, statt hinter 13 leeren Pixeln anzufangen. */
+      #tabs { display: flex; flex-wrap: wrap; gap: 4px; padding: 6px; border-bottom: 1px solid var(--linie); }
+      #tabs:empty { display: none; }
+      /* Eingeklappt IST die Reihe der Tabwaehler -- die Knopfreihe daneben
+         zeigte dieselbe Auskunft ein zweites Mal und machte aus zwei Marken
+         wieder eine Perlenschnur. */
+      #rechts.schmal #tabs { display: none; }
+      #rechts.schmal #tabs { flex-direction: column; align-items: center; padding: 4px 0; }
+      .tab {
+        font: inherit; color: var(--gedaempft); background: #21262f; border: 0; border-radius: 4px;
+        padding: 1px 7px; cursor: pointer;
+      }
+      .tab.gewaehlt { color: var(--schrift); background: #333b48; }
+      #hinweis { padding: 6px 8px; color: var(--gedaempft); font-size: 11px; white-space: normal; }
+      #rechts.schmal #hinweis { display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="links" class="leiste schmal">
+        <div class="werkzeuge">
+          <button class="knopf" data-tot="ordner" title="Ordneransicht">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4">
+              <rect x="3" y="4.5" width="14" height="11.5" rx="1.5" /><path d="M3 8h14M7.5 8v8" />
+            </svg><span class="beschriftung">Ordner</span>
+          </button>
+          <button class="knopf" data-tot="aktivitaet" title="Aktivitaet">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4">
+              <circle cx="10" cy="10" r="6.5" /><path d="M10 6v4.2l2.8 1.7" />
+            </svg><span class="beschriftung">Aktivitaet</span>
+          </button>
+          <button class="knopf" data-tot="freigaben" title="Freigaben">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4">
+              <path d="M10 3.6 17 16H3z" stroke-linejoin="round" /><path d="M10 8.4v3.4M10 13.6v.9" />
+            </svg><span class="beschriftung">Freigaben</span>
+          </button>
+          <button class="knopf" data-tot="protokolle" title="Protokolle">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4">
+              <rect x="4" y="2.5" width="12" height="15" rx="1.3" /><path d="M7 6.5h6M7 9.5h6M7 12.5h4" />
+            </svg><span class="beschriftung">Protokolle</span>
+          </button>
+        </div>
+        <div class="trenner"></div>
+        <!-- Der Plus-Knopf steht UEBER den Sessions, weil er eine dazutut --
+             dieselbe Stelle, an der man sie danach sucht. -->
+        <button class="knopf neu" id="neue-session" title="Sitzungen: neu starten oder fortsetzen">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6">
+            <path d="M10 4.5v11M4.5 10h11" stroke-linecap="round" />
+          </svg><span class="beschriftung">Neue Session</span>
+        </button>
+        <div id="sessions"></div>
+        <div id="fuss">
+          <button class="knopf" data-tot="einstellungen" title="Einstellungen">
+            <!-- Ein Zahnrad, keine Sonne. Die alte Fassung war eine Nabe mit acht
+                 freistehenden Strahlen -- also genau das Sonnensymbol (alice
+                 am 05.08.). Jetzt ein geschlossener Umriss: Kopfkreis 8, Fusskreis
+                 6,1, acht Zaehne, dazu die Nabe. Der Umriss ist gerechnet, damit
+                 Flanken und Luecken gleich breit sind; von Hand gesetzte Zahlen
+                 lassen ein Zahnrad bei 20 Pixeln schief aussehen. -->
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+              <path d="M8.41 2.16A8 8 0 0 1 11.59 2.16L11.58 4.11A6.1 6.1 0 0 1 13.05 4.72L14.42 3.33A8 8 0 0 1 16.67 5.58L15.28 6.95A6.1 6.1 0 0 1 15.89 8.42L17.84 8.41A8 8 0 0 1 17.84 11.59L15.89 11.58A6.1 6.1 0 0 1 15.28 13.05L16.67 14.42A8 8 0 0 1 14.42 16.67L13.05 15.28A6.1 6.1 0 0 1 11.58 15.89L11.59 17.84A8 8 0 0 1 8.41 17.84L8.42 15.89A6.1 6.1 0 0 1 6.95 15.28L5.58 16.67A8 8 0 0 1 3.33 14.42L4.72 13.05A6.1 6.1 0 0 1 4.11 11.58L2.16 11.59A8 8 0 0 1 2.16 8.41L4.11 8.42A6.1 6.1 0 0 1 4.72 6.95L3.33 5.58A8 8 0 0 1 5.58 3.33L6.95 4.72A6.1 6.1 0 0 1 8.42 4.11L8.41 2.16Z" />
+              <circle cx="10" cy="10" r="2.6" />
+            </svg><span class="beschriftung">Einstellungen</span>
+          </button>
+        </div>
+      </div>
+      <!-- Die Schublade steht IN der Reihe, nicht darueber: Sessionleiste,
+           Griff, Schublade, Buehne. Damit ist die linke Seite spiegelgleich
+           zur rechten -- dort steht die Workerleiste ebenso in der Reihe und
+           die Buehne endet an ihr. Als schwebende Flaeche sah es aus, als
+           laegen zwei Leisten uebereinander (alice am 05.08.). Der Griff
+           bleibt neben der Leiste, die er zieht. -->
+      <div id="griff"></div>
+      <div id="schublade"></div>
+      <!-- Ohne Kopfzeile: die Flaeche gehoert der Session. Was dort stand,
+           steht im Steuerkanal (`awb-ctl state`) und als Kurzhinweis am Rand. -->
+      <div id="mitte">
+        <div id="buehne"><div id="pane"></div><div id="gitter"></div><div id="chatbuehne"></div><div id="notiz"></div><div id="kanalwarnung"></div>
+          <div id="umbenennen">
+            <div class="kopf">Sitzung umbenennen</div>
+            <div class="alt" id="umbenennen-alt"></div>
+            <div class="fuss">
+              <input id="umbenennen-feld" type="text" data-tipp="umbenennen" spellcheck="false" />
+              <button type="button" id="umbenennen-ok" class="start">Umbenennen</button>
+              <button type="button" id="umbenennen-ab">Abbrechen</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="griff-rechts"></div>
+      <div id="rechts" class="leiste schmal">
+        <div id="tabs"></div>
+        <div id="rechtsliste"></div>
+        <div id="hinweis"></div>
+      </div>
+    </div>
+    <script src="renderer.js"></script>
+  </body>
+</html>

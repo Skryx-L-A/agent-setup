@@ -1,0 +1,130 @@
+#!/bin/bash
+# wb-workers-window <session> [window-name] — make sure a worker-tab window of
+# a workbench session exists, with a placeholder pane while no worker runs yet.
+# [window-name] defaults to `workers` (the primary/only tab, unchanged behaviour
+# for every existing caller that omits it). Pass `workers-2`, `workers-3`, ...
+# to ensure an OVERFLOW tab once wb-grid's maxWorkerPanesPerTab capacity is
+# exceeded (2026-08-04) -- same mechanism, same placeholder contract, a
+# different window name.
+#
+# Why this exists (measured 2026-07-25, isolated socket): the worker tab attaches
+# to the GROUPED session `<sess>-view`, and sessions of a group share their
+# windows — including their destruction. Killing the last shared window destroys
+# BOTH sessions and, with the last session, the tmux server. Before the first
+# worker is spawned there is no `workers` window, so the group consists of the
+# ONE orchestrator window: the worker tab then shows the orchestrator's Claude
+# pane, and closing "its" window takes the orchestrator down with it.
+#
+# A permanent `workers` window fixes both halves: the group never has just one
+# window, and the tab shows what it promises instead of a second copy of the
+# orchestrator. An overflow window (`workers-2`, ...) does NOT need the same
+# danger fixed a second time -- the group already has >= 2 windows once one
+# exists, so it only needs the placeholder/existence contract, not its own
+# view-session-active-window handling (see point_view_at_workers below: only
+# ever steers the view session at the PRIMARY `workers` tab, never an overflow
+# one, so it does not fight over which window the tab currently shows).
+#
+# The placeholder pane is marked @wb_role placeholder. wb-grid never treats it as
+# a worker and removes it as soon as a real worker joins the window; wb-close only
+# ever closes @wb_role=worker panes, so it cannot hit it either.
+set -euo pipefail
+
+S="${1:?usage: wb-workers-window <tmux-session> [window-name]}"
+WNAME="${2:-workers}"
+
+# Eine SICHT-Session bekommt niemals eine eigene Sicht. Wird dieses Werkzeug mit
+# '<name>-view' aufgerufen, arbeitet es auf der BASIS weiter — sonst entstehen
+# Ketten wie 'wb-a project-view-view-view' (gemessen 2026-08-04: drei Glieder, alle
+# mit denselben Fenstern). Die Basis ist der Gruppenname; ohne Gruppe der Name
+# selbst ohne das Suffix, und zwar so oft, wie das Suffix vorkommt.
+#
+# Die Normalisierung ist BEDINGUNGSLOS (2026-08-04, zweiter Durchgang). Sie vorher
+# nur dann anzuwenden, wenn die Basis noch existiert, liess genau den gemessenen
+# Fall offen: die Basis war weg, der uebergebene Name blieb 'wb-X-view', die
+# Streu-Sicht selbst existierte aber — und der naechste Schritt haette 'wb-X-view'
+# als Basis fuer 'wb-X-view-view' benutzt. Ohne Basis gibt es hier nichts zu tun.
+case "$S" in
+  *-view)
+    base="$(tmux display -p -t "=$S" '#{session_group}' 2>/dev/null)"
+    case "${base:-}" in ''|=*) base="$S" ;; esac    # '=…' ist eine Streu-Sicht, keine Basis
+    while [ "${base%-view}" != "$base" ]; do base="${base%-view}"; done
+    [ "$base" != "$S" ] && echo "wb-workers-window: '$S' ist eine Sicht — arbeite auf '$base'." >&2
+    S="$base"
+    ;;
+esac
+
+# '=' anchors the target: tmux would otherwise prefix-match a foreign session.
+tmux has-session -t "=$S" 2>/dev/null || exit 0
+
+# Die GRUPPIERTE View-Session (der Worker-Tab) hat ihr EIGENES aktuelles Fenster.
+# Nach einem tmux-Neustart steht sie auf dem Orchestrator-Fenster, und jeder Client,
+# der sich neu anhaengt, uebernimmt das — der Worker-Tab zeigt dann den Orchestrator,
+# obwohl das workers-Fenster existiert. Am 2026-07-28/29 ist der Nutzer genau darueber
+# dreimal gestolpert. Deshalb wird die View-Session hier immer mitgezogen; das ist
+# idempotent und beruehrt seinen ORCHESTRATOR-Tab nicht (andere Session, anderes
+# aktuelles Fenster).
+#
+# Fehlt die View-Session ganz, wird sie hier ANGELEGT statt uebersprungen
+# (2026-08-04, nach des Nutzers „Ich habe keinen Worker-Tab, den ich sehe"): sie
+# entsteht sonst erst, wenn die Extension den Worker-Tab oeffnet — und nach einem
+# tmux-Neustart, wie ihn der Selbstabschuss vom 03.08. erzwungen hat, existiert sie
+# nicht mehr. Wer dann den Tab oeffnet, haengt an nichts. Eine losgeloeste,
+# gruppierte Session kostet nichts, teilt die Fenster der Basis und ist genau das,
+# woran der Tab sich anhaengt.
+point_view_at_workers() {
+  # Only the PRIMARY tab steers the view session's active window -- an overflow
+  # tab (workers-2, ...) must not fight the primary one over which window the
+  # worker tab currently shows (see header note).
+  [ "$WNAME" = "workers" ] || return 0
+  tmux list-windows -t "=$S" -F '#{window_name}' 2>/dev/null | grep -qx workers || return 0
+  tmux has-session -t "=$S-view" 2>/dev/null || {
+    # Die Existenzpruefung direkt davor ist der Kern der Sache: `new-session -t`
+    # auf eine FEHLENDE Basis scheitert nicht, sondern legt eine leere Session an,
+    # deren Gruppe die Zeichenkette '=<name>' ist (gemessen 2026-08-04).
+    tmux has-session -t "=$S" 2>/dev/null || return 0
+    tmux new-session -d -t "=$S" -s "$S-view" 2>/dev/null || return 0
+    # HIER STAND BIS ZUM 16.08. `tmux set -t "=$S-view" window-size latest`. Die Zeile
+    # hat nie gewirkt: `window-size` ist eine FENSTER-Option, und mit einer Session als
+    # Ziel scheitert der Aufruf ("no such window") -- `2>/dev/null || true` hat es
+    # verschluckt. Sie waere auch als korrekt geschriebene Zeile falsch: eine Sicht teilt
+    # die FENSTER ihrer Basis, die Option ist also dieselbe wie drueben.
+    #
+    # Wer eine Session spiegelt, darf ihre Fenstergroesse nicht diktieren -- geschuetzt
+    # wird das beim Anhaengen (`attach -f ignore-size` in wb-remote-view), nicht ueber
+    # eine Option, die in das gespiegelte Fenster hineingreift.
+
+    # Nachkontrolle: ist die Gruppe doch eine Zeichenkette geworden, war es eine
+    # Streu-Session — die wird sofort wieder entfernt, statt im Grid stehenzubleiben.
+    grp="$(tmux list-sessions -F '#{session_name}|#{session_group}' 2>/dev/null \
+           | awk -F'|' -v v="$S-view" '$1==v{print $2; exit}')"
+    case "${grp:-}" in
+      =*) tmux kill-session -t "=$S-view" 2>/dev/null; return 0 ;;
+    esac
+  }
+  tmux select-window -t "=$S-view:workers" 2>/dev/null || true
+}
+
+if tmux list-windows -t "=$S" -F '#{window_name}' 2>/dev/null | grep -qx "$WNAME"; then
+  point_view_at_workers
+  exit 0
+fi
+
+# -d: do not steal the focus of whoever runs this. The pane idles instead of
+# exiting, because an exiting pane would close the window again — and an
+# immediately closing window is exactly the state this script exists to prevent.
+# tmux runs the command through /bin/sh: no bashisms here. `printf %q` would
+# produce $'…' for the multi-line hint, which sh does not understand — the pane
+# died instantly and the window vanished (seen while writing this).
+HINT='\n  Noch kein Worker in dieser Session.\n\n'
+HINT="$HINT"'  Der Orchestrator startet sie mit claude-worker / pi-worker,\n'
+HINT="$HINT"'  sie erscheinen dann hier und dieser Hinweis verschwindet.\n\n'
+tmux new-window -d -t "=$S:" -n "$WNAME" \
+  "printf '$HINT'; while :; do sleep 3600; done"
+
+pane="$(tmux list-panes -t "=$S:$WNAME" -F '#{pane_id}' 2>/dev/null | head -1)"
+[ -n "$pane" ] || exit 0
+tmux set -p -t "$pane" @wb_role placeholder
+tmux select-pane -t "$pane" -T 'noch keine Worker'
+# global automatic-rename is on; the window must keep the contract name.
+tmux set-option -w -t "=$S:$WNAME" automatic-rename off 2>/dev/null || true
+point_view_at_workers

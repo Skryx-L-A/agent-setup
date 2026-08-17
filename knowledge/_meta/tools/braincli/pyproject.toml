@@ -1,0 +1,26 @@
+[project]
+name = "braincli"
+version = "0.1.0"
+description = "brain: CLI over the Knowledge vault + Gardener (search, gardener run/status, stats)"
+requires-python = ">=3.11"
+dependencies = ["gardener", "rank-bm25>=0.2"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv.sources]
+gardener = { path = "../gardener", editable = true }
+
+[project.scripts]
+brain = "braincli.cli:main"
+brain-extra-embed = "braincli.extra_embed:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["braincli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

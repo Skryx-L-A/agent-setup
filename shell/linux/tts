@@ -1,0 +1,62 @@
+#!/bin/bash
+# tts — local text-to-speech for agents. LINUX/CUDA port (RTX 4070 SUPER).
+# Same CLI as the macOS/mlx-audio version; engines swapped to their CUDA-native pkgs:
+#   Kokoro   -> hexgrad `kokoro` (PyTorch, tiny, <1 GB VRAM)   [default, ENGLISH]
+#   Chatterbox -> resemble-ai `chatterbox-tts` (PyTorch CUDA)  [--expressive]
+#   Qwen3-TTS -> `qwen-tts` (Qwen3-TTS-12Hz-0.6B-Base)         [--de, explicit only]
+# Default: Kokoro (ENGLISH — the user's rule 2026-07-10: English is the default;
+# German only when he explicitly asks). Output WAV path is printed on stdout.
+#
+# Usage:
+#   tts "text"                     fast English default (Kokoro)
+#   tts --expressive "text"        expressive English (Chatterbox)
+#   tts --de "text"                German (Qwen3-TTS) — ONLY on explicit request
+#   tts --model <id> "text"        override the model id for the selected engine
+#   tts --voice <voice> ...        pass a voice name through
+#   tts -o /path/prefix ...        output prefix (default /tmp/tts-<epoch>)
+#   tts --play ...                 play result via aplay/ffplay
+set -euo pipefail
+
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+
+VENV="$HOME/AI/media-linux/venvs/tts"
+GEN="$HOME/.local/bin/_tts_gen.py"
+
+ENGINE="kokoro"
+MODEL=""            # leer = Engine-Default; --model ueberschreibt gezielt
+OUT="/tmp/tts-$(date +%s)"
+VOICE=""; PLAY=0; TEXT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --expressive) ENGINE="chatterbox"; shift ;;
+    --de) ENGINE="qwen3"; shift ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --voice) VOICE="$2"; shift 2 ;;
+    -o) OUT="$2"; shift 2 ;;
+    --play) PLAY=1; shift ;;
+    *) TEXT="$1"; shift ;;
+  esac
+done
+[ -n "$TEXT" ] || { echo "usage: tts [--expressive|--de|--model M] [--voice V] [-o prefix] [--play] \"text\"" >&2; exit 2; }
+
+PY="$VENV/bin/python"
+[ -x "$PY" ] || { echo "Fehler: venv fehlt ($VENV). Erst linux/media-install.sh laufen lassen." >&2; exit 1; }
+# NOBARA-VERIFY 2026-07-19: the tts venv must be Python 3.12 (system 3.14 is too
+# new — kokoro pins numpy==1.26.4, which has no cp314 wheel). Build it with
+# `uv venv --python 3.12`. Kokoro's misaki G2P installs the spacy model
+# en_core_web_sm into the venv on first English use via uv, which needs
+# VIRTUAL_ENV set — so export it here (harmless once the model is present).
+export VIRTUAL_ENV="$VENV"
+
+ARGS=(--engine "$ENGINE" --text "$TEXT" --out-prefix "$OUT")
+[ -n "$MODEL" ] && ARGS+=(--model "$MODEL")
+[ -n "$VOICE" ] && ARGS+=(--voice "$VOICE")
+"$PY" "$GEN" "${ARGS[@]}" >/dev/null 2>&1
+
+WAV="${OUT}_000.wav"
+[ -s "$WAV" ] || { echo "tts failed: no output (engine=$ENGINE)" >&2; exit 1; }
+echo "$WAV"
+if [ "$PLAY" = 1 ]; then
+  (aplay "$WAV" >/dev/null 2>&1 || ffplay -nodisp -autoexit "$WAV" >/dev/null 2>&1) || true
+fi

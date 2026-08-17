@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# crushrc.default — gehoert nach ~/.config/crush/crushrc (Ausrollen: wb-sync-setup
+# bzw. von Hand kopieren). Ohne diese Datei kann die Werkbank crush kein Modell
+# bestellen; crush bleibt dann beim Start im Modellwaehler stehen und der Spawn
+# scheitert nach 60 s sichtbar (gemessen 2026-08-08, crush v0.88.1).
+#
+# NICHT INSTALLIERT: gehoert nicht nach ~/.local/bin -- diese Vorlage wird per
+# Definition an einen anderen Ort kopiert (siehe oben), wb-harness-config findet
+# sie notfalls auch direkt im Repo (Quellensuche, letzter Ort).
+#
+# WARUM ES DIESE DATEI GIBT. Die interaktive TUI von crush hat kein --model; nur der
+# nicht-interaktive Unterbefehl `crush run` kennt -m. Das Modell kommt also aus der
+# Konfiguration. Ein crushrc ist laut crushs eigener Doku ein Bash-Skript, das beim
+# Laden ausgefuehrt wird — damit kann es die Umgebung lesen, und die Umgebung ist
+# genau das, was `wb-state models resolve` je Spawn setzt (harness.env von 'crush',
+# mit {model} und {baseUrl:ollama} eingesetzt).
+#
+# Deshalb ist diese Datei STATISCH: fuer jedes Modell dieselbe. Es gibt nichts zu
+# erzeugen, nichts, was zwei gleichzeitige Spawns einander ueberschreiben koennten,
+# und keinen zusaetzlichen Generator in wb-harness-run.
+#
+# Sie ueberschreibt NICHTS: ohne WB_CRUSH_MODEL tut sie gar nichts, und ein von Hand
+# gestartetes `crush` verhaelt sich weiter genau so, wie es sich ohne sie verhielte.
+#
+# Die vier Variablen, alle aus harness.env von 'crush':
+#   WB_CRUSH_MODEL           z.B. ollama/ornith:9b — die crush-Schreibweise
+#                            provider/id. Der Teil vor dem Schraegstrich ist der
+#                            Providername, unter dem der Provider angelegt wird.
+#   WB_CRUSH_BASE_URL        Basis-URL des Providers OHNE /v1 (die Registry fuehrt
+#                            ollama als http://127.0.0.1:11434); /v1/ wird unten
+#                            angehaengt.
+#   WB_CRUSH_PROVIDER_TYPE   ollama | openai-compat | openai | anthropic — der
+#                            Providertyp, den crush kennt.
+#   WB_CRUSH_CONTEXT_WINDOW  Fenstergroesse in Token. Muss mit contextWindow des
+#                            Modells in der Registry uebereinstimmen, sonst rechnen
+#                            crushs Seitenleiste und die Kontextwache gegen
+#                            verschiedene Nenner.
+
+if [ -n "${WB_CRUSH_MODEL:-}" ]; then
+  provider add "${WB_CRUSH_MODEL%%/*}" \
+    --name "${WB_CRUSH_MODEL%%/*}" \
+    --type "${WB_CRUSH_PROVIDER_TYPE:-ollama}" \
+    --base-url "${WB_CRUSH_BASE_URL:-http://127.0.0.1:11434}/v1/" \
+    --discover-models false
+  model add "$WB_CRUSH_MODEL" \
+    --name "$WB_CRUSH_MODEL" \
+    --context-window "${WB_CRUSH_CONTEXT_WINDOW:-131072}"
+  # large ist das Arbeitsmodell, small benutzt crush zum Zusammenfassen. Beide auf
+  # dasselbe Modell: ein Worker soll nicht im Hintergrund ein zweites, nicht
+  # bestelltes Modell anfahren — bei einem lokalen Anbieter waere das ein zweiter
+  # Ladevorgang, bei einem Cloud-Anbieter ein nicht bestellter Aufruf.
+  model large "$WB_CRUSH_MODEL"
+  model small "$WB_CRUSH_MODEL"
+fi

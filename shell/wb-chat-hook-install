@@ -1,0 +1,327 @@
+#!/bin/bash
+# wb-chat-hook-install — installiert den SessionStart-Hook, der die
+# Chat-Ansicht einer Sitzung ihrem tmux-Pane zuordnet (SPEC-V4 6.3 Punkt 4).
+#
+#   wb-chat-hook-install <harness-id>
+#
+# AUSGELAGERT aus wb-harness-run (2026-08-11). Befund: der eingebaute
+# claude-Schnellpfad in shell/pi-worker (ENGINE=claude) baut seine
+# Startzeile SELBST und laeuft NIE durch wb-harness-run — nur der
+# Registry-Zweig (ENGINE=registry) tut das. Der Harness 'claude' ist aber
+# der einzige mit session.zuordnung=hook: die Installation lief seit ihrem
+# Bau also fuer JEDEN claude-Worker ins Leere, obwohl die vorhandenen Tests
+# gruen waren — sie riefen wb-harness-run direkt auf und pruefen damit den
+# MECHANISMUS, nie seinen Aufrufer.
+#
+# Jetzt gibt es die Installation nur noch HIER, einmal, und beide Zweige
+# von shell/pi-worker rufen sie: der Registry-Zweig weiterhin ueber
+# wb-harness-run (im Pane, unmittelbar vor dem exec), der eingebaute
+# claude-Zweig direkt aus pi-worker selbst, bevor die Startzeile gebaut
+# wird. Eine zweite Kopie dieses Blocks waere genau die Fehlerklasse, die
+# die Werkbank am 06.08. sieben tote Schalter gekostet hat.
+#
+# Liest den Registry-Eintrag des Harness ueber `wb-state harness get`,
+# schreibt bei Bedarf ~/.claude/workbench/chat-zuordnung.sh und traegt ihn
+# in die Hook-Konfiguration des Harness ein (session.hook in der
+# Registry). Idempotent, fremde Eintraege bleiben stehen; fehlt oder
+# klemmt die Zieldatei, wird NICHTS geschrieben und der Grund gemeldet —
+# nie stillschweigend. Ein Harness ohne session.zuordnung=hook oder ohne
+# lesbaren Registry-Eintrag tut nichts (Exit 0).
+set -uo pipefail
+HARNESS="${1:?wb-chat-hook-install: Harness-Id fehlt}"
+
+HJSON2="$("$HOME/.local/bin/wb-state" harness get "$HARNESS" 2>/dev/null || true)"
+# ERST PRUEFEN, DANN ANLEGEN (11.08., Befund der Nachlese): frueher stand die
+# Pruefung "wird dieser Harness ueberhaupt ueber einen Hook zugeordnet?" erst
+# im Python-Rumpf weiter unten, NACH dem mkdir/Heredoc-Schreiben von
+# chat-zuordnung.sh -- die Datei entstand dadurch fuer JEDEN Harness mit einem
+# lesbaren Registry-Eintrag, auch fuer die dreizehn, die sie nie benutzen ('
+# claude' ist der einzige mit session.zuordnung=hook). Reine Reihenfolge: fuer
+# 'claude' aendert sich nichts, fuer alle anderen entsteht die Datei jetzt gar
+# nicht erst.
+ZUORDNUNG_HOOK=""
+if [ -n "$HJSON2" ] && [ "${HJSON2:0:1}" = "{" ]; then
+    ZUORDNUNG_HOOK="$(/usr/bin/python3 -c '
+import json, sys
+try:
+    h = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+s = h.get("session") or {}
+if s.get("zuordnung") == "hook":
+    sys.stdout.write("ja")
+' "$HJSON2" 2>/dev/null)"
+fi
+if [ "$ZUORDNUNG_HOOK" = "ja" ]; then
+    # DIE HOOK-INSTALLATION FUER DIE ZUORDNUNG (SPEC-V4 6.3 Punkt 4, 2026-08-11).
+    #
+    # WOZU. Die Chat-Ansicht muss wissen, WELCHE Sitzung in DIESEM Pane laeuft.
+    # Ueber das Arbeitsverzeichnis geht das nur, solange dort eine einzige
+    # Sitzung lebt — im Worker-Grid ist zwei im selben Ordner der Normalfall,
+    # und dann liefert die Zuordnung bewusst nichts (chat/zuordnung.ts). Wo ein
+    # Harness Hooks hat, schreibt die Werkbank sich deshalb einen: er laeuft IM
+    # Prozess des Harness, sieht $TMUX_PANE und legt die Sitzungskennung als
+    # Pane-Option @wb_chat_session ab. Genau dort liest sie die Ansicht.
+    #
+    # WARUM HIER UND NICHT IN EINEM EIGENEN WERKZEUG: derselbe Mechanismus, den
+    # `configFiles` und `trustStore` schon benutzen — vor dem Start, mit Rolle
+    # und Arbeitsverzeichnis in der Hand, idempotent, und eine fremde Datei wird
+    # nie ueberschrieben. `codex` zeigt am eigenen Beispiel, dass es traegt: sein
+    # einziger Hook wurde von `jcode` installiert, nicht von Hand.
+    #
+    # BEI CODEX GEHOEREN ZWEI SCHRITTE DAZU (SPEC-V4 6.3 Punkt 4): hooks.json
+    # schreiben UND den trusted_hash in config.toml nachziehen, sonst laeuft der
+    # Hook still nicht. Der zweite Schritt braucht die Pruefsumme, die codex
+    # selbst bildet; sie steht deshalb als `session.hook.trustedHash` im
+    # Registry-Eintrag. Fehlt sie, wird der Hook trotzdem geschrieben und der
+    # fehlende Eintrag SICHTBAR gemeldet — ein still nicht laufender Hook ist
+    # genau der Fehler, den dieser Absatz verhindern soll.
+    CHATHOOK="$HOME/.claude/workbench/chat-zuordnung.sh"
+    mkdir -p "$HOME/.claude/workbench" 2>/dev/null
+    # Der Hakentext steht in einem Heredoc OHNE Kommandosubstitution drumherum:
+    # bash 3.2 zaehlt Apostrophe auch im Heredoc mit, sobald es in einem $( )
+    # steht, und dieses Skript traegt welche (siehe der Rumpf gleich unten).
+    cat > "$CHATHOOK.neu.$$" <<'SH'
+#!/bin/sh
+# Von wb-harness-run geschrieben (SPEC-V4 6.3 Punkt 4). Nicht von Hand aendern:
+# jeder Spawn schreibt diese Datei neu, sobald ihr Inhalt abweicht.
+#
+# Zweck: die Sitzungskennung des Harness an den Pane haengen, in dem er laeuft.
+# Der Hook laeuft IM Prozess des Harness und sieht deshalb $TMUX_PANE.
+# Er schreibt nichts ausser einer tmux-Option und endet immer mit 0.
+set -u
+[ -n "${TMUX_PANE:-}" ] || exit 0
+sid=$(cat | /usr/bin/python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if isinstance(d, dict):
+    for k in ("session_id", "sessionId", "conversation_id", "id"):
+        v = d.get(k)
+        if isinstance(v, str) and v:
+            sys.stdout.write(v)
+            break
+' 2>/dev/null)
+[ -n "$sid" ] || exit 0
+t=$(command -v tmux 2>/dev/null) || exit 0
+"$t" set-option -p -t "$TMUX_PANE" @wb_chat_session "$sid" >/dev/null 2>&1
+exit 0
+SH
+    if cmp -s "$CHATHOOK.neu.$$" "$CHATHOOK" 2>/dev/null; then
+      rm -f "$CHATHOOK.neu.$$"
+    else
+      mv -f "$CHATHOOK.neu.$$" "$CHATHOOK" 2>/dev/null && chmod 755 "$CHATHOOK" 2>/dev/null
+    fi
+    /usr/bin/python3 - "$HJSON2" "$CHATHOOK" <<'PY' >&2
+# KEINE Apostrophe in diesem Rumpf (siehe oben, bash 3.2).
+import json, os, re, sys, tempfile
+
+hjson, hookpfad = sys.argv[1], sys.argv[2]
+try:
+    h = json.loads(hjson)
+except Exception:
+    sys.exit(0)
+s = h.get("session") or {}
+if s.get("zuordnung") != "hook":
+    sys.exit(0)                      # dieser Harness wird anders zugeordnet
+spec = s.get("hook") or {}
+stil = spec.get("style") or ""
+if stil not in ("claude-settings-json", "codex-hooks-json"):
+    # Zuordnung ueber einen Hook VERLANGT, aber keine Angabe, wohin er gehoert:
+    # das ist eine Luecke in der Registry und keine, die still bleiben darf.
+    sys.stderr.write(
+        "wb-harness-run: %s wird ueber einen Hook zugeordnet, aber session.hook nennt keinen "
+        "Stil — die Chat-Ansicht kann diesen Pane nicht zuordnen.\n" % (h.get("id") or "?"))
+    sys.exit(0)
+ziel = os.path.expanduser(spec.get("file") or "")
+if not ziel:
+    sys.exit(0)
+ereignis = spec.get("event") or "SessionStart"
+matcher = spec.get("matcher") or "startup|resume|clear|compact"
+frist = spec.get("timeout") or 5
+befehl = hookpfad
+if not os.path.exists(hookpfad):
+    sys.stderr.write("wb-harness-run: %s fehlt — kein Hook eingetragen.\n" % hookpfad)
+    sys.exit(0)
+
+
+def ersetze(text):
+    # Erst vollstaendig daneben schreiben, dann ersetzen — dieselbe Vorsicht wie
+    # beim Vertrauensspeicher: eine halb geschriebene Konfiguration nimmt dem CLI
+    # seine Anmeldung mit, nicht nur diesen einen Eintrag.
+    ordner = os.path.dirname(ziel) or "."
+    tmp = None
+    try:
+        os.makedirs(ordner, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=ordner, prefix=".wb-hook-")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, ziel)
+        tmp = None
+        return True
+    except Exception as e:
+        sys.stderr.write("wb-harness-run: %s nicht schreibbar (%s) — kein Hook eingetragen.\n"
+                         % (ziel, e))
+        return False
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def json_hook():
+    # BEIDE Stile schreiben dieselbe Gestalt: hooks.<Ereignis> ist eine Liste von
+    # Gruppen, jede Gruppe hat einen matcher und eine Liste von Haken. Gemessen an
+    # der echten ~/.codex/hooks.json dieser Maschine (11.08.), die jcode angelegt
+    # hat, und an der Gestalt, die ~/.claude/settings.json fuehrt.
+    #
+    # claude-settings-json ist GLOBALE des Nutzers Konfiguration, an der JEDE seiner
+    # Claude-Sitzungen haengt (2026-08-11, harte Auflage) -- fehlt sie oder ist sie
+    # leer, wird NICHTS geschrieben und der Grund gemeldet, statt aus dem Nichts
+    # eine neue globale Konfiguration anzulegen. codex-hooks-json ist dagegen eine
+    # dedizierte, sonst leere Hook-Datei ohne diese Tragweite; sie darf weiterhin
+    # neu entstehen (unveraendertes Verhalten, siehe test-chat-hook-installation.sh
+    # Fall 4 -- codex' Vertrauensspeicher config.toml traegt die eigentliche
+    # Anmeldung und ist ueber toml_abschnitt() bereits ebenso geschuetzt).
+    kritisch = (stil == "claude-settings-json")
+    if kritisch and not os.path.exists(ziel):
+        sys.stderr.write("wb-harness-run: %s fehlt — kein Hook eingetragen (es wird keine neue "
+                         "globale Konfiguration aus dem Nichts angelegt).\n" % ziel)
+        return None
+    kopf = ""
+    try:
+        with open(ziel, encoding="utf-8") as f:
+            roh = f.read()
+    except Exception as e:
+        # Nicht-kritisch (codex): eine fehlende/unlesbare Datei startet leer und
+        # entsteht gleich neu -- unveraendertes Verhalten. Kritisch (claude): jede
+        # Leseausnahme (fehlt, keine Rechte, …) ist derselbe Fall wie oben -- lieber
+        # nichts schreiben als aus einem Lesefehler eine neue globale Datei machen.
+        if kritisch:
+            sys.stderr.write("wb-harness-run: %s ist nicht lesbar (%s) — kein Hook eingetragen.\n"
+                             % (ziel, e))
+            return None
+        roh = ""
+    if kritisch and not roh.strip():
+        sys.stderr.write("wb-harness-run: %s ist leer — kein Hook eingetragen (keine neue globale "
+                         "Konfiguration aus dem Nichts).\n" % ziel)
+        return None
+    rumpf = roh
+    if spec.get("jsonc"):
+        zeilen = roh.split("\n")
+        i = 0
+        while i < len(zeilen) and (not zeilen[i].strip() or zeilen[i].lstrip().startswith("//")):
+            i += 1
+        kopf = "\n".join(zeilen[:i])
+        if kopf:
+            kopf += "\n"
+        rumpf = "\n".join(zeilen[i:])
+    try:
+        daten = json.loads(rumpf) if rumpf.strip() else {}
+        if not isinstance(daten, dict):
+            raise ValueError("kein Objekt")
+    except Exception as e:
+        sys.stderr.write("wb-harness-run: %s ist nicht lesbar (%s) — kein Hook eingetragen.\n"
+                         % (ziel, e))
+        return None
+    haken = daten.setdefault("hooks", {})
+    if not isinstance(haken, dict):
+        sys.stderr.write("wb-harness-run: hooks in %s ist kein Objekt — kein Hook eingetragen.\n" % ziel)
+        return None
+    gruppen = haken.setdefault(ereignis, [])
+    if not isinstance(gruppen, list):
+        sys.stderr.write("wb-harness-run: hooks.%s in %s ist keine Liste — kein Hook eingetragen.\n"
+                         % (ereignis, ziel))
+        return None
+    # SCHON DA? Dann bleibt die Datei unangetastet. Verglichen wird der Befehl,
+    # nicht die ganze Gruppe: Frist und matcher darf ein Mensch nachschaerfen,
+    # ohne dass der naechste Spawn seinen Eintrag verdoppelt.
+    for gi, g in enumerate(gruppen):
+        if not isinstance(g, dict):
+            continue
+        for hi, e in enumerate(g.get("hooks") or []):
+            if isinstance(e, dict) and e.get("command") == befehl:
+                return (gi, hi, False)
+    gruppen.append({
+        "matcher": matcher,
+        "hooks": [{"type": "command", "command": befehl, "timeout": frist}],
+    })
+    text = kopf + json.dumps(daten, indent=2, ensure_ascii=False) + "\n"
+    if not ersetze(text):
+        return None
+    sys.stderr.write("wb-harness-run: Chat-Zuordnung als %s-Hook in %s eingetragen.\n"
+                     % (ereignis, ziel))
+    return (len(gruppen) - 1, 0, True)
+
+
+stelle = json_hook()
+if stelle is None:
+    sys.exit(0)
+gi, hi, neu = stelle
+
+if stil == "codex-hooks-json":
+    # SCHRITT ZWEI. codex fuehrt je Hook einen Vertrauenseintrag in config.toml:
+    #   [hooks.state."<pfad der hooks.json>:<ereignis>:<gruppe>:<index>"]
+    #   trusted_hash = "sha256:…"
+    # Gemessen an der echten Datei dieser Maschine (11.08.). OHNE diesen Eintrag
+    # laeuft der Hook still nicht — deshalb ist ein fehlender Eintrag hier eine
+    # Meldung und kein Schweigen.
+    #
+    # Die Pruefsumme bildet codex selbst, und ihre Bildungsregel ist von aussen
+    # nicht gemessen (neun Kandidaten aus Befehl, Eintrag und Serialisierung am
+    # 11.08. gegen den echten Wert gerechnet, keiner traf). Sie steht deshalb als
+    # session.hook.trustedHash in der Registry, wo eine Messung sie hinterlegen
+    # kann. Geraten wird sie nicht: ein falscher Hash ist so still wie keiner.
+    tziel = os.path.expanduser(spec.get("trustFile") or "")
+    tabelle = spec.get("trustTable") or "hooks.state"
+    # SCHREIBWEISE DES EREIGNISSES: codex trennt die Woerter mit einem
+    # Unterstrich, waehrend hooks.json sie zusammenschreibt. GEMESSEN an der
+    # echten config.toml dieser Maschine (11.08.): der Schluessel des von jcode
+    # installierten Hooks heisst ".../hooks.json:session_start:0:0", das
+    # Ereignis in hooks.json daneben "SessionStart".
+    ereignis_schluessel = re.sub(r"(?<!^)(?=[A-Z])", "_", ereignis).lower()
+    schluessel = "%s:%s:%d:%d" % (ziel, ereignis_schluessel, gi, hi)
+    hash_wert = spec.get("trustedHash") or ""
+    if not tziel:
+        sys.stderr.write("wb-harness-run: session.hook.trustFile fehlt — der Hook bleibt unvertraut "
+                         "und laeuft nicht.\n")
+        sys.exit(0)
+    try:
+        with open(tziel, encoding="utf-8") as f:
+            alt = f.read()
+    except Exception as e:
+        sys.stderr.write("wb-harness-run: %s ist nicht lesbar (%s) — der Hook bleibt unvertraut.\n"
+                         % (tziel, e))
+        sys.exit(0)
+    if schluessel in alt:
+        sys.exit(0)                  # steht schon drin, und bleibt unangetastet
+    if not hash_wert:
+        sys.stderr.write(
+            "wb-harness-run: der Hook steht in %s, aber %s traegt keinen trusted_hash fuer %s "
+            "(session.hook.trustedHash ist leer) — codex wird ihn NICHT ausfuehren.\n"
+            % (ziel, tziel, schluessel))
+        sys.exit(0)
+    if not re.match(r"^sha256:[0-9a-f]{64}$", hash_wert):
+        sys.stderr.write("wb-harness-run: session.hook.trustedHash ist keine sha256-Angabe — "
+                         "nichts eingetragen.\n")
+        sys.exit(0)
+    block = "\n[%s.%s]\ntrusted_hash = %s\n" % (
+        tabelle, json.dumps(schluessel, ensure_ascii=False), json.dumps(hash_wert, ensure_ascii=False))
+    neu_text = (alt if alt.endswith("\n") or not alt else alt + "\n") + block
+    ordner = os.path.dirname(tziel) or "."
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=ordner, prefix=".wb-trust-")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(neu_text)
+        os.replace(tmp, tziel)
+        tmp = None
+        sys.stderr.write("wb-harness-run: trusted_hash fuer den Chat-Hook in %s nachgezogen.\n" % tziel)
+    except Exception as e:
+        sys.stderr.write("wb-harness-run: %s nicht schreibbar (%s) — der Hook bleibt unvertraut.\n"
+                         % (tziel, e))
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+PY
+fi

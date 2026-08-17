@@ -1,0 +1,357 @@
+#!/bin/bash
+# wb-pane-write — die EINE Stelle, die entscheidet, wer in einen Pane tippen darf.
+#
+#   wb-pane-write darf      <pane>            Nur pruefen. Exit 0 = erlaubt, 77 = abgelehnt.
+#   wb-pane-write tippen    <pane>            Text auf stdin, wortwoertlich als Tastendruecke.
+#   wb-pane-write einfuegen <pane>            Text auf stdin, ueber load-buffer + paste-buffer -p.
+#   wb-pane-write taste     <pane> <name>     Eine benannte Taste (Enter, Escape, C-c).
+#   wb-pane-write beleg     <pane>            Diagnose: Rolle, Entscheidung, Begruendung.
+#
+# Der Server wird ueber -L/--socket oder WB_TMUX_SOCKET gewaehlt; ohne Angabe der
+# umgebende (der von $TMUX). Die Wahl ist ungefaehrlich: Rollenabfrage UND Schreiben
+# gehen an denselben Server, wer also einen fremden Server angibt, schreibt in dessen
+# eigene Panes und kommt an den hiesigen Orchestrator damit nicht heran.
+#
+# DIE REGEL (der Nutzer, 2026-08-06, woertlich): "ich will das niemand ausser mir und dem
+# kontext guard in den orchestrator chat promptet, alles andere soll funktionieren ohne
+# in den orchestrator chat prompten zu muessen".
+#
+#   1. Ein Pane, der NICHT @wb_role=orchestrator traegt, nimmt weiter alles an. Ohne das
+#      koennte der Orchestrator keine Auftraege mehr vergeben — pi-worker tippt in
+#      Worker-Panes, und das bleibt so.
+#   2. Ein Orchestrator-Pane nimmt nur zweierlei an: einen GEMESSENEN Menschen und den
+#      echten context-guard.
+#   3. FAIL-CLOSED. Laesst sich die Rolle eines Panes nicht bestimmen, gilt er als
+#      Orchestrator. Laesst sich die Herkunft nicht belegen, ist die Antwort Nein.
+#
+# WARUM DIE HERKUNFT GEMESSEN WIRD, NICHT GEGLAUBT
+# Dasselbe Prinzip wie in wb-mensch (siehe dort, "DAS MERKMAL WIRD GEMESSEN"): ein
+# Merkmal, das der Aufrufer selbst mitschickt — eine Umgebungsvariable, ein Schalter,
+# ein Name —, ist eine Behauptung. Deshalb gibt es hier KEINEN Schalter, der die
+# Pruefung aushebelt, und keine Variable, mit der sich jemand zum Guard erklaert.
+#
+#   Mensch:  wb-mensch pruefen. Dessen Positivpruefung (steuerndes Terminal, oder die
+#            Oberflaeche als nachgewiesener Ahne) liegt an Merkmalen, die ein Agent sich
+#            nicht anschreiben kann. Fehlt wb-mensch, gilt: kein Mensch.
+#   Guard:   ein Ahne dieses Prozesses FUEHRT die KANONISCHE Guard-Datei aus —
+#            verglichen ueber Geraet und Inode, nicht ueber den Namen. Kanonisch ist
+#            $HOME/.local/bin/context-guard, also genau die Fassung, die der
+#            Orchestrator installiert hat; ein zweites, selbst hingelegtes Skript mit
+#            demselben Namen hat eine andere Inode und zaehlt nicht. Wer diese Datei
+#            austauschen kann, hat den Zugriff ohnehin schon.
+#
+# WAS "AUSFUEHRT" HEISST, UND WARUM DIE KOMMANDOZEILE DAFUER NICHT REICHT
+# Bis 2026-08-15 genuegte JEDES Wort in der Kommandozeile eines Ahnen, das auf die
+# Guard-Datei zeigte. Gemessen und belegt (Bugjagd-Bericht, nachgestellt auf eigenem
+# Socket): `bash -c ': /pfad/context-guard ; wb-pane-write tippen <orch>'` kam durch,
+# obwohl diese Shell den Guard nie ausgefuehrt hat — die Regel war mit einem Wort
+# ausgehebelt. Geprueft wird deshalb das AUSGEFUEHRTE PROGRAMM des Ahnen (Linux:
+# /proc/<pid>/exe, macOS: der txt-Eintrag von lsof; `ps -o comm=` taugt NICHT, es
+# zeigt auf macOS argv[0] und damit bei `#!/usr/bin/env bash` bloss "bash") und
+# zusaetzlich nur ZWEI Stellen der Kommandozeile:
+#   argv[0] — die Guard-Datei ist selbst das ausgefuehrte Programm, oder
+#   argv[1] — die Skript-Stelle: der Kern legt beim Shebang den Interpreter nach
+#             argv[0] und die Skriptdatei nach argv[1] (gemessen auf macOS 2026-08-15:
+#             `/bin/bash /pfad/skript`). Dann muss das ausgefuehrte Programm genau der
+#             Interpreter sein, den die Shebang-Zeile der Guard-Datei nennt.
+# Alles ab argv[2] ist Text IM Kommando eines anderen Programms und zaehlt nicht mehr.
+# Der Interpreter wird ueber feste Verzeichnisse aufgeloest, nie ueber $PATH: der PATH
+# kommt vom Aufrufer, und wer ihn setzt, koennte sich sonst seinen eigenen "bash"
+# unterschieben.
+#
+# GRENZE, offen benannt (wie in wb-mensch): gegen einen Prozess, der seine Herkunft
+# AKTIV verwischt — `exec -a` mit dem Guard-Pfad als argv[0], eine geleerte Umgebung,
+# ein selbst aufgemachtes Pseudoterminal —, schuetzt das nicht; als derselbe Benutzer
+# gibt es dagegen in einer Shell kein Mittel. Abgewehrt wird der reale Fall, und der ist
+# der teure: ein Skript, ein Test, ein Werkzeug oder ein Agent, der einfach tippt.
+set -uo pipefail
+
+ABGELEHNT=77
+
+SOCKET="${WB_TMUX_SOCKET:-}"
+while true; do
+    case "${1:-}" in
+        -L|--socket) SOCKET="${2:?Socketname fehlt nach $1}"; shift 2 ;;
+        *) break ;;
+    esac
+done
+
+CMD="${1:-}"
+PANE="${2:-}"
+
+tm() {
+    if [ -n "$SOCKET" ]; then tmux -L "$SOCKET" "$@"; else tmux "$@"; fi
+}
+
+# --- Herkunft messen -------------------------------------------------------
+
+# Ahnenreihe mit vollstaendiger Kommandozeile, innerster Prozess zuerst.
+# `read` statt Parameter-Expansion aus demselben Grund wie in wb-mensch: `ps -o ppid=`
+# polstert die Spalte LINKS mit Leerzeichen, wodurch ${zeile%% *} leer wird und die
+# Kette nach zwei Prozessen abbricht.
+ahnen() {
+    local pid=${1:-$$} zeile ppid rest
+    while [ "$pid" -gt 1 ] 2>/dev/null; do
+        zeile=$(ps -o ppid=,args= -p "$pid" 2>/dev/null) || return 0
+        [ -n "$zeile" ] || return 0
+        read -r ppid rest <<<"$zeile"
+        printf '%s %s\n' "$pid" "$rest"
+        case "${ppid:-}" in ''|*[!0-9]*) return 0 ;; esac
+        pid=$ppid
+    done
+}
+
+# "Geraet:Inode" einer Datei. GNU vor BSD, wie ueberall in diesem Haus: bei GNU ist
+# `-f` kein Formatschalter, sondern "Dateisystem statt Datei", und die falsche
+# Reihenfolge liefert stillschweigend Unsinn.
+#
+# `-L` ist tragend und nicht Kosmetik: ohne den Schalter liest `stat` die Inode des
+# SYMLINKS statt die der Datei, auf die er zeigt. Beide Seiten des Vergleichs muessen
+# denselben Bezug haben, sonst faellt der Guard durch, sobald irgendwo im Weg ein
+# Symlink liegt -- gemessen 2026-08-06 an einem Test-HOME, dessen kanonische Guard-Datei
+# ein Symlink in den Arbeitsbaum war: der Guard wurde in seiner eigenen Suite abgelehnt.
+datei_kennung() {
+    [ -e "$1" ] || return 1
+    stat -L -c '%d:%i' "$1" 2>/dev/null || stat -L -f '%d:%i' "$1" 2>/dev/null
+}
+
+GUARD_PFAD="$HOME/.local/bin/context-guard"
+
+# Das AUSGEFUEHRTE Programm eines Prozesses, als Pfad. Linux hat /proc/<pid>/exe und
+# damit die Antwort direkt; macOS hat kein /proc, dort steht der Pfad im txt-Eintrag
+# von lsof (gemessen 2026-08-15: ~40 ms, und aufgerufen wird es nur fuer den einen
+# Ahnen, dessen Kommandozeile ueberhaupt in Frage kommt).
+prozess_programm() {
+    local pid="$1" p=""
+    if [ -r "/proc/$pid/exe" ]; then
+        p=$(readlink "/proc/$pid/exe" 2>/dev/null)
+    else
+        p=$(lsof -p "$pid" -a -d txt -Fn 2>/dev/null | awk '/^n/{print substr($0,2); exit}')
+    fi
+    [ -n "$p" ] || return 1
+    printf '%s\n' "$p"
+}
+
+# Kennungen der Interpreter, die die Guard-Datei laut ihrer Shebang-Zeile ausfuehren
+# wuerden. `#!/usr/bin/env bash` heisst: env sucht `bash` und ERSETZT sich damit, das
+# ausgefuehrte Programm ist am Ende bash und nicht env. Gesucht wird in festen
+# Verzeichnissen (siehe Kopf), und es duerfen mehrere sein — auf dieser Maschine
+# koennen /bin/bash und /opt/homebrew/bin/bash beide gemeint sein.
+interpreter_kennungen() {
+    local zeile erst zweit name d k
+    IFS= read -r zeile < "$GUARD_PFAD" 2>/dev/null || return 0
+    case "$zeile" in '#!'*) ;; *) return 0 ;; esac
+    read -r erst zweit _ <<<"${zeile#\#!}"
+    [ -n "${erst:-}" ] || return 0
+    case "${erst##*/}" in
+        env) name="${zweit:-}" ;;
+        *)   name="$erst" ;;
+    esac
+    [ -n "$name" ] || return 0
+    case "$name" in
+        /*) k=$(datei_kennung "$name") && printf '%s\n' "$k" ;;
+        *)  for d in /bin /usr/bin /usr/local/bin /opt/homebrew/bin; do
+                k=$(datei_kennung "$d/$name") && printf '%s\n' "$k"
+            done ;;
+    esac
+    return 0
+}
+
+# FUEHRT ein Ahne die kanonische Guard-Datei aus? Verglichen wird die Datei
+# (Geraet+Inode), nicht die Zeichenkette: ein gleichnamiges Skript woanders faellt
+# damit durch, ein Aufruf ueber einen Symlink oder einen anderen Pfad auf DIESELBE
+# Datei kommt durch. Die Begruendung fuer die zwei argv-Stellen und fuer die Pruefung
+# des ausgefuehrten Programms steht im Kopf.
+guard_ist_ahne() {
+    local ziel interp pid rest argv0 argv1 pos prog progk k
+    ziel=$(datei_kennung "$GUARD_PFAD") || return 1
+    interp=$(interpreter_kennungen)
+    while read -r pid rest; do
+        read -r argv0 argv1 _ <<<"$rest"
+        pos=""
+        if [ -n "${argv0:-}" ] && [ "$(datei_kennung "$argv0" 2>/dev/null)" = "$ziel" ]; then
+            pos=0
+        elif [ -n "${argv1:-}" ] && [ "$(datei_kennung "$argv1" 2>/dev/null)" = "$ziel" ]; then
+            pos=1
+        fi
+        [ -n "$pos" ] || continue
+        # Fail-closed: laesst sich das ausgefuehrte Programm nicht bestimmen, zaehlt
+        # der Ahne nicht — eine Kommandozeile allein ist kein Beleg mehr.
+        prog=$(prozess_programm "$pid") || continue
+        progk=$(datei_kennung "$prog") || continue
+        [ "$progk" = "$ziel" ] && return 0
+        [ "$pos" = 1 ] || continue
+        while IFS= read -r k; do
+            [ -n "$k" ] && [ "$k" = "$progk" ] && return 0
+        done <<EOF
+$interp
+EOF
+    done < <(ahnen)
+    return 1
+}
+
+MENSCH_GRUND=""
+ist_mensch() {
+    local beleg
+    if [ -x "$HOME/.local/bin/wb-mensch" ]; then
+        beleg=$("$HOME/.local/bin/wb-mensch" beleg 2>/dev/null)
+    elif command -v wb-mensch >/dev/null 2>&1; then
+        beleg=$(wb-mensch beleg 2>/dev/null)
+    else
+        MENSCH_GRUND="wb-mensch nicht gefunden — ohne Messung gilt: kein Mensch."
+        return 1
+    fi
+    MENSCH_GRUND="${beleg#*$'\t'}"
+    [ "${beleg%%$'\t'*}" = mensch ]
+}
+
+# --- Rolle des Panes -------------------------------------------------------
+
+# Zwei Quellen, strengste Lesart (Befund 2026-08-07, gemessen: die Pane-Option allein
+# durfte der Bewachte selbst umschreiben -- `tmux set -p -t <ziel> @wb_role worker`, und
+# danach lief derselbe Schreibversuch durch). Der Pane gilt als Orchestrator, sobald EINE
+# der beiden Quellen das sagt, und weiter auch dann, wenn keine etwas sagt. Ein
+# gefaelschtes Register kann damit nur verschaerfen, nie oeffnen.
+ROLLEN_PY=""
+for kandidat in "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/hooks/lib/rollen.py" \
+                "$HOME/.claude/hooks/lib/rollen.py"; do
+    [ -f "$kandidat" ] && { ROLLEN_PY="$kandidat"; break; }
+done
+
+ROLLE=""
+ROLLE_QUELLE=""
+rolle_lesen() {
+    local r reg=""
+    r=$(tm display -p -t "$PANE" '#{@wb_role}' 2>/dev/null) || r=""
+    if [ -n "$ROLLEN_PY" ]; then
+        if [ -n "$SOCKET" ]; then
+            reg=$(/usr/bin/python3 "$ROLLEN_PY" -L "$SOCKET" lesen "$PANE" 2>/dev/null \
+                  | awk -F'\t' '$1=="register"{print $2}')
+        else
+            reg=$(/usr/bin/python3 "$ROLLEN_PY" lesen "$PANE" 2>/dev/null \
+                  | awk -F'\t' '$1=="register"{print $2}')
+        fi
+    fi
+    if [ "$reg" = orchestrator ]; then
+        ROLLE=orchestrator
+        ROLLE_QUELLE="Register sagt orchestrator (Pane-Option: '${r:-leer}')"
+        return
+    fi
+    if [ "$r" = orchestrator ]; then
+        ROLLE=orchestrator
+        ROLLE_QUELLE="@wb_role=orchestrator"
+        return
+    fi
+    if [ -z "$r" ] && [ -z "$reg" ]; then
+        # Kein Pane, kein tmux, keine Markierung — jeder dieser Faelle ist ein
+        # Zweifelsfall, und ein Zweifelsfall ist ein Orchestrator.
+        ROLLE=orchestrator
+        ROLLE_QUELLE="nicht bestimmbar, fail-closed als Orchestrator behandelt"
+        return
+    fi
+    ROLLE="${reg:-$r}"
+    ROLLE_QUELLE="@wb_role=${r:-leer}, Register=${reg:-leer}"
+}
+
+ENTSCHEIDUNG=""
+GRUND=""
+entscheiden() {
+    rolle_lesen
+    if [ "$ROLLE" != orchestrator ]; then
+        ENTSCHEIDUNG=erlaubt
+        GRUND="Pane ist kein Orchestrator ($ROLLE_QUELLE) — Worker-Panes nehmen weiter alles an."
+        return 0
+    fi
+    if ist_mensch; then
+        ENTSCHEIDUNG=erlaubt
+        GRUND="gemessener Mensch — $MENSCH_GRUND"
+        return 0
+    fi
+    if guard_ist_ahne; then
+        ENTSCHEIDUNG=erlaubt
+        GRUND="der echte context-guard steht als Ahne in der Prozesskette ($GUARD_PFAD)."
+        return 0
+    fi
+    ENTSCHEIDUNG=abgelehnt
+    GRUND="weder ein gemessener Mensch ($MENSCH_GRUND) noch der context-guard ($GUARD_PFAD) in der Ahnenreihe."
+    return 1
+}
+
+# Die Ablehnung ist LAUT und sagt drei Dinge: wer, was, auf welchen Pane. Ohne diese
+# Zeile sucht man den Fehler an der Stelle, an der nichts ankam, statt an der, die ihn
+# ausgeloest hat.
+ablehnen() {
+    local verb="$1" kette
+    kette=$(ahnen | awk '{ printf "%s%s", (NR>1 ? " < " : ""), $0 } END { print "" }' | cut -c1-400)
+    {
+        printf 'wb-pane-write: ABGELEHNT — "%s" auf Pane %s (%s).\n' "$verb" "$PANE" "$ROLLE_QUELLE"
+        printf '  Aufrufer: PID %s, Ahnenreihe: %s\n' "$$" "$kette"
+        printf '  Grund: %s\n' "$GRUND"
+        printf '  In einen Orchestrator-Pane schreiben duerfen nur ein gemessener Mensch und der context-guard.\n'
+        printf '  Ergebnisse gehoeren nach ~/.pi-workers/results/, Freigaben nach ~/.pi-workers/requests/ — beides liest die Workbench von selbst.\n'
+    } >&2
+    exit "$ABGELEHNT"
+}
+
+case "$CMD" in
+    darf|tippen|einfuegen|taste|beleg) : ;;
+    ''|-h|--help)
+        sed -n '2,10p' "$0" >&2
+        exit 2 ;;
+    *)
+        echo "wb-pane-write: unbekanntes Kommando '$CMD' (darf|tippen|einfuegen|taste|beleg)" >&2
+        exit 2 ;;
+esac
+[ -n "$PANE" ] || { echo "wb-pane-write: Pane fehlt — 'wb-pane-write $CMD <pane>'" >&2; exit 2; }
+
+if [ "$CMD" = beleg ]; then
+    entscheiden || true
+    printf 'pane\t%s\nrolle\t%s\nentscheidung\t%s\ngrund\t%s\n' \
+        "$PANE" "$ROLLE_QUELLE" "$ENTSCHEIDUNG" "$GRUND"
+    exit 0
+fi
+
+entscheiden || ablehnen "$CMD"
+
+case "$CMD" in
+    darf)
+        exit 0 ;;
+    tippen)
+        # -l ist tragend, nicht Kosmetik (2026-08-16, bugjagd shell/niedrig): OHNE den
+        # Schalter deutet send-keys ein Argument, das komplett einem Tastennamen
+        # entspricht ("Enter", "Escape", "Tab", ...), als GENAU DIESE TASTE statt als
+        # Text -- reproduziert: send-keys -t <pane> "Enter" ohne -l loeste eine leere
+        # Zeile aus (die Buchstaben kamen nie an), mit -l stand "Enter" wortwoertlich in
+        # der Datei. Der Kopfkommentar von `tippen` verspricht "wortwoertlich als
+        # Tastendruecke" -- das gilt erst mit -l.
+        TEXT=$(cat)
+        tm send-keys -l -t "$PANE" "$TEXT" || { echo "wb-pane-write: send-keys an $PANE fehlgeschlagen." >&2; exit 1; }
+        ;;
+    einfuegen)
+        # Der Weg von pi-worker und dem Editor: kein Zeichen des Textes laeuft je durch
+        # die zeilenbasierte tmux-Befehlssyntax, und -p setzt den Klammer-Einfuege-Modus,
+        # damit die Ziel-Anwendung EIN Einfuegen liest statt Zeile fuer Zeile Tastendruecke.
+        BUF="wbpw-$$"
+        tm load-buffer -b "$BUF" - || { echo "wb-pane-write: load-buffer fehlgeschlagen." >&2; exit 1; }
+        # -d loescht den Puffer NUR bei erfolgreichem paste-buffer -- scheitert der
+        # Paste (ungueltiges Ziel-Pane, verschwunden), bleibt der benannte Puffer
+        # "wbpw-<pid>" sonst fuer immer stehen, mit dem vollen Auftragstext darin, lesbar
+        # fuer jeden mit Zugriff auf denselben tmux-Server (2026-08-16, bugjagd
+        # shell/niedrig, reproduziert: paste-buffer gegen ein nicht existierendes Pane
+        # schlaegt fehl, `tmux list-buffers` zeigt den Puffer danach unveraendert).
+        if ! tm paste-buffer -p -b "$BUF" -d -t "$PANE"; then
+            tm delete-buffer -b "$BUF" 2>/dev/null
+            echo "wb-pane-write: paste-buffer an $PANE fehlgeschlagen." >&2
+            exit 1
+        fi
+        ;;
+    taste)
+        NAME="${3:?usage: wb-pane-write taste <pane> <name>}"
+        case "$NAME" in
+            *[!A-Za-z0-9_^-]*|'')
+                echo "wb-pane-write: unzulaessiger Tastenname '$NAME'." >&2; exit 2 ;;
+        esac
+        tm send-keys -t "$PANE" "$NAME" || { echo "wb-pane-write: Taste $NAME an $PANE fehlgeschlagen." >&2; exit 1; }
+        ;;
+esac
+exit 0

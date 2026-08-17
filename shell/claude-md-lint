@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""claude-md-lint — Vorschlag-only-Check fuer ~/.claude/CLAUDE.md.
+
+WARUM: Die "Rule persistence"-Regel im Regelwerk selbst sorgt aktiv fuer Wachstum ("wird
+sofort... hier... persistiert") ohne eingebautes Gegengewicht. Dieses Werkzeug ist das
+Gegengewicht: Groesse/Wachstum, Regeln ohne Datum, moegliche Duplikate/Ueberschneidungen,
+und lange Vorfall-Absaetze (Postmortems im Fliesstext, die eigentlich als type:incident
+Vault-Note leben sollten — das Template dafuer existiert bereits, wird hier nur benutzt).
+
+WICHTIG — dieses Werkzeug aendert NIEMALS CLAUDE.md. Es liest die Datei nur. Regel des Nutzers
+"Nie bestehende Anweisungen loeschen" verbietet automatisches Kuerzen; jeder Vorschlag geht in
+eine separate Datei unter ~/.local/state/claude-md-lint/, nie in die Vault, nie in CLAUDE.md
+selbst. Kondensieren beim Ausfuellen zaehlt laut derselben Regel als Loeschen — deshalb schlaegt
+dieses Tool nur vor, es fuehrt nichts davon selbst aus.
+
+BENUTZUNG: claude-md-lint                 zeigt den Befund, schreibt NICHTS (Default)
+           claude-md-lint --write         schreibt zusaetzlich Groessen-Historie + Vorschlagsdatei
+                                            (Vorschlagsdatei nur NEU, wenn sich die Vorfall-
+                                            Absaetze seit dem letzten --write geaendert haben)
+           claude-md-lint --file <pfad>   anderer Zielpfad (z.B. zum Testen gegen eine Kopie)
+
+Heuristiken sind mechanisch, kein Sprachverstaendnis: "Duplikate" = gleicher normalisierter
+Regel-Titel. Das ist ein Fingerzeig fuer manuelle Pruefung, keine Garantie und kein Beweis
+eines echten Widerspruchs. Ein frueherer Zusatz-Check auf "inhaltliche Ueberschneidung" ueber
+gemeinsame seltene Woerter wurde nach Review wieder entfernt: er erzeugte ueberwiegend Rauschen
+aus haeufigen Allerweltswoertern (ein Werkzeug, dessen Ausgabe man ignoriert, ist schlechter als
+keins) — siehe N3 im Review vom 2026-07-28.
+"""
+
+import os
+import re
+import sys
+import json
+import hashlib
+import datetime
+
+STATE_DIR = os.path.expanduser("~/.local/state/claude-md-lint")
+DEFAULT_FILE = os.path.expanduser("~/.claude/CLAUDE.md")
+INCIDENT_TEMPLATE = os.path.expanduser("~/Knowledge/templates/incident.md")
+
+LONG_BLOCK_LINES = 6      # ab dieser Zeilenzahl gilt ein Vorfall-Block als "lang"
+
+
+def find_blocks(text):
+    """Zerlegt den Fliesstext in Top-Level-Bullet-Bloecke ("- **Titel...**: ...").
+
+    Ein Block beginnt bei einer Zeile, die an Spalte 0 mit "- " startet, und laeuft bis
+    (ausschliesslich) zur naechsten solchen Zeile, einer Ueberschrift ("#") oder Dateiende.
+    Code-Fences (```) werden uebersprungen, damit Beispieltext darin keine Bloecke erzeugt.
+    """
+    lines = text.split("\n")
+    blocks = []
+    current = []
+    start_line = None
+    in_fence = False
+
+    def flush():
+        if current:
+            blocks.append({"start": start_line, "text": "\n".join(current)})
+
+    for i, line in enumerate(lines, start=1):
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            if current:
+                current.append(line)
+            continue
+        if in_fence:
+            if current:
+                current.append(line)
+            continue
+        if re.match(r"^- ", line):
+            flush()
+            current = [line]
+            start_line = i
+        elif line.startswith("#"):
+            flush()
+            current = []
+            start_line = None
+        else:
+            if current:
+                current.append(line)
+    flush()
+    return blocks
+
+
+def extract_title(block_text):
+    m = re.search(r"\*\*([^*]+)\*\*", block_text)
+    if m:
+        return m.group(1).strip().rstrip(":").strip()
+    first_line = block_text.split("\n", 1)[0].lstrip("- ").strip()
+    words = first_line.split()
+    return " ".join(words[:8])
+
+
+def normalize_title(title):
+    t = re.sub(r"\(\d{4}-\d{2}-\d{2}[^)]*\)", "", title)
+    t = re.sub(r"[^a-zA-Z0-9äöüÄÖÜß ]", "", t)
+    t = re.sub(r"\s+", " ", t).strip().lower()
+    return t
+
+
+def slugify(title):
+    t = normalize_title(title)
+    for a, b in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        t = t.replace(a, b)
+    t = re.sub(r"[^a-z0-9 ]", "", t)
+    return re.sub(r"\s+", "-", t.strip())
+
+
+def has_date(block_text):
+    return bool(re.search(r"\(\d{4}-\d{2}-\d{2}", block_text))
+
+
+def is_incident_candidate(block_text, line_count):
+    return "vorfall" in block_text.lower() and line_count >= LONG_BLOCK_LINES
+
+
+def split_postmortem(block_text):
+    """Bestmoegliche, rein mechanische Aufteilung in die vier Postmortem-Felder.
+
+    Kein Verstehen des Inhalts — nur Suche nach ueblichen Signalwoertern im Fliesstext. Wo
+    nichts gefunden wird, bleibt das Feld ein expliziter Verweis auf den Rohtext, statt etwas
+    zu erfinden.
+    """
+    cues = {
+        "ursache": ["ursache:", "grund:", "grund war", "verursacht durch"],
+        "fix": ["fix:", "behoben durch", "loesung:"],
+        "lehre": ["lehre:", "daraus folgt", "kuenftig", "deshalb "],
+    }
+    lower = block_text.lower()
+    fields = {"was": None, "ursache": None, "fix": None, "lehre": None}
+    for key, markers in cues.items():
+        for marker in markers:
+            idx = lower.find(marker)
+            if idx != -1:
+                snippet = block_text[idx: idx + 240].split("\n\n")[0].strip()
+                fields[key] = snippet
+                break
+    fields["was"] = "<siehe Rohtext unten>"
+    for key in ("ursache", "fix", "lehre"):
+        if not fields[key]:
+            fields[key] = "<siehe Rohtext unten, manuell ergaenzen>"
+    return fields
+
+
+def build_incident_proposal(title, block_text, idx):
+    fields = split_postmortem(block_text)
+    note_title = slugify(title) or f"incident-{idx}"
+    today = datetime.date.today().isoformat()
+    note = f"""---
+title: {title.strip()}
+type: incident
+branch: 10-global
+created: {today}
+---
+
+Für künftige Sessions: <wann dieser Incident relevant wird — aus CLAUDE.md extrahiert, bitte
+beim Uebernehmen pruefen/praezisieren>.
+
+## Postmortem
+- **Was schiefging:** {fields['was']}
+- **Ursache:** {fields['ursache']}
+- **Fix:** {fields['fix']}
+- **Lehre:** {fields['lehre']}
+
+<!-- relates-to [[Projekt-MOC]] | relates-to [[Standing-Rule-Note]] -->
+
+## Rohtext aus CLAUDE.md (zum Redigieren, nicht 1:1 uebernehmen)
+```
+{block_text.strip()}
+```
+"""
+    replacement_line = f"- **{title.strip()}:** siehe [[{note_title}]]."
+    return note_title, note, replacement_line
+
+
+def main():
+    file_path = DEFAULT_FILE
+    write = False
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--file":
+            file_path = args[i + 1]
+            i += 2
+        elif args[i] == "--write":
+            write = True
+            i += 1
+        else:
+            print(f"claude-md-lint: unbekannte Option: {args[i]}", file=sys.stderr)
+            return 1
+
+    if not os.path.isfile(file_path):
+        print(f"claude-md-lint: {file_path} nicht gefunden.")
+        return 0
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    history_path = os.path.join(STATE_DIR, "history.jsonl")
+
+    char_count = len(text)
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+
+    # Default liest nur (kein Schreiben ueberraschend bei einem reinen Nachsehen-Aufruf, N2 im
+    # Review vom 2026-07-28). Nur mit --write wird ein neuer Historie-Punkt angehaengt.
+    prev = None
+    if os.path.isfile(history_path):
+        with open(history_path, "r", encoding="utf-8") as f:
+            lines = [l for l in f.read().splitlines() if l.strip()]
+        if lines:
+            prev = json.loads(lines[-1])
+
+    if write:
+        with open(history_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": now, "chars": char_count, "file": file_path}) + "\n")
+
+    mode_note = "" if write else "  (Lesemodus — nichts geschrieben; --write persistiert)"
+    print(f"claude-md-lint — {file_path}{mode_note}")
+    print()
+    print(f"Groesse: {char_count} Zeichen.")
+    if prev:
+        delta = char_count - prev["chars"]
+        pct = (delta / prev["chars"] * 100) if prev["chars"] else 0.0
+        sign = "+" if delta >= 0 else ""
+        print(f"  seit letztem Lauf ({prev['ts']}): {sign}{delta} Zeichen ({sign}{pct:.1f}%).")
+    else:
+        print("  keine Historie — erster Lauf, Baseline jetzt gespeichert.")
+
+    blocks = find_blocks(text)
+    print(f"\nGefundene Regel-Bloecke (Top-Level-Bullets): {len(blocks)}")
+
+    enriched = []
+    for b in blocks:
+        title = extract_title(b["text"])
+        norm = normalize_title(title)
+        line_count = b["text"].count("\n") + 1
+        enriched.append({
+            "start": b["start"],
+            "text": b["text"],
+            "title": title,
+            "norm": norm,
+            "line_count": line_count,
+            "has_date": has_date(b["text"]),
+        })
+
+    # --- Regeln ohne Datum ---
+    no_date = [e for e in enriched if not e["has_date"] and e["title"]]
+    print(f"\n== Regeln ohne Datum ({len(no_date)}) ==")
+    for e in no_date[:30]:
+        print(f"  Zeile {e['start']}: {e['title'][:90]}")
+    if len(no_date) > 30:
+        print(f"  ... und {len(no_date) - 30} weitere.")
+
+    # --- exakte Duplikate (gleicher normalisierter Titel) ---
+    by_norm = {}
+    for e in enriched:
+        if not e["norm"]:
+            continue
+        by_norm.setdefault(e["norm"], []).append(e)
+    dups = {k: v for k, v in by_norm.items() if len(v) > 1}
+    print(f"\n== Moegliche Duplikate, gleicher Regel-Titel ({len(dups)}) ==")
+    for norm, group in dups.items():
+        lines_str = ", ".join(f"Zeile {g['start']}" for g in group)
+        print(f"  \"{group[0]['title']}\" — {lines_str}")
+
+    # --- lange Vorfall-Absaetze -> Vorschlag als type:incident Vault-Note ---
+    incident_blocks = [e for e in enriched if is_incident_candidate(e["text"], e["line_count"])]
+    print(f"\n== Lange Vorfall-Absaetze, Vorschlag zur Auslagerung ({len(incident_blocks)}) ==")
+    if not incident_blocks:
+        print("  keine gefunden (Schwelle: Stichwort \"Vorfall\" + mindestens "
+              f"{LONG_BLOCK_LINES} Zeilen).")
+    else:
+        for e in incident_blocks:
+            print(f"  Zeile {e['start']} ({e['line_count']} Zeilen): \"{e['title'][:70]}\"")
+
+        content_hash = hashlib.sha256(
+            "\n\n".join(e["text"] for e in incident_blocks).encode("utf-8")
+        ).hexdigest()
+        hash_path = os.path.join(STATE_DIR, "last-incident-hash.txt")
+        pointer_path = os.path.join(STATE_DIR, "last-proposals-path.txt")
+
+        if not write:
+            print("  mit --write wird ein Vorschlag als Datei geschrieben (nur wenn sich die")
+            print("  Vorfall-Absaetze seit dem letzten --write-Lauf inhaltlich geaendert haben).")
+        else:
+            prev_hash = None
+            if os.path.isfile(hash_path):
+                with open(hash_path, "r", encoding="utf-8") as f:
+                    prev_hash = f.read().strip()
+            prev_path = None
+            if os.path.isfile(pointer_path):
+                with open(pointer_path, "r", encoding="utf-8") as f:
+                    prev_path = f.read().strip()
+
+            if prev_hash == content_hash and prev_path and os.path.isfile(prev_path):
+                print(f"\n  unveraendert seit dem letzten --write — keine neue Datei geschrieben.")
+                print(f"  weiterhin gueltig: {prev_path}")
+            else:
+                ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                proposals_path = os.path.join(STATE_DIR, f"proposals-{ts}.md")
+                parts = [
+                    f"# claude-md-lint Vorschlaege — {now}\n",
+                    "Vorschlag-only. Nichts hier ist in CLAUDE.md oder im Vault geschrieben worden.\n"
+                    "Jeder Abschnitt: fertiger Entwurf einer type:incident-Note (templates/incident.md-Form)\n"
+                    "plus die eine Ersatzzeile mit Wikilink, die in CLAUDE.md stehen bliebe.\n",
+                ]
+                for idx, e in enumerate(incident_blocks, start=1):
+                    note_title, note_md, replacement = build_incident_proposal(e["title"], e["text"], idx)
+                    parts.append(f"\n---\n\n## Vorschlag {idx}: {e['title'].strip()} (Zeile {e['start']})\n")
+                    parts.append(f"\n### Ersatzzeile fuer CLAUDE.md (manuell einsetzen, falls gewuenscht)\n")
+                    parts.append(f"```\n{replacement}\n```\n")
+                    parts.append(f"\n### Entwurf: {note_title}.md (nach ~/Knowledge/10-global/, manuell anlegen)\n")
+                    parts.append(f"```markdown\n{note_md}\n```\n")
+                with open(proposals_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(parts))
+                with open(hash_path, "w", encoding="utf-8") as f:
+                    f.write(content_hash)
+                with open(pointer_path, "w", encoding="utf-8") as f:
+                    f.write(proposals_path)
+                print(f"\n  neu (Inhalt geaendert oder erster --write): {proposals_path}")
+
+    if write:
+        print(f"\nHistorie-Log: {history_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

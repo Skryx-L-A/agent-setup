@@ -1,0 +1,4 @@
+#!/bin/sh
+# slop-detect — Anti-Slop-Detektor fuer Web-Quellcode (23 Regeln, kein Modell, kein Netz).
+# Quelle: ~/AI/design-tools/slop-detect (eigenes Werkzeug, Regel-IDEEN aus pbakaus/impeccable).
+exec node "$HOME/AI/design-tools/slop-detect/src/cli.mjs" "$@"

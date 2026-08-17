@@ -1,0 +1,295 @@
+#!/bin/bash
+# wb-hygiene — laesst die Pruefwerkzeuge laufen, die sonst niemand aufruft.
+#
+# Anlass (2026-08-03): `claude-md-lint` und `status-freshness` wurden beide gebaut,
+# "damit Veralten sichtbar wird, statt es der Disziplin zu ueberlassen" — und hingen
+# danach an keinem Hook und keinem Job. Am 03.08. meldete der Linter ungelesen +35,8 %
+# Wachstum seit dem 28.07., und 4 von 6 STATUS.md waren veraltet. Ein Werkzeug, das man
+# ausfuehren muss, wenn man daran denkt, ersetzt keine Disziplin, es braucht sie.
+#
+#   wb-hygiene            Bericht auf stdout, Exit 1 wenn etwas offen ist
+#   wb-hygiene --report   zusaetzlich nach ~/.local/state/wb-hygiene-report.md schreiben
+#
+# Gelesen wird der Bericht an zwei Stellen: vom launchd-Job (woechentlich) und von
+# Schritt 2b des session-end-Skills. Er aendert nichts und startet nichts.
+set -u
+
+BIN="$HOME/.local/bin"
+REPORT="$HOME/.local/state/wb-hygiene-report.md"
+STATUS="$HOME/.local/state/wb-hygiene-status.txt"
+WRITE=0
+[ "${1:-}" = "--report" ] && WRITE=1
+
+# Repo-Wurzel fest statt relativ zu $0: dieses Skript laeuft sowohl aus dem Repo
+# (shell/wb-hygiene) als auch als installierte Kopie (~/.local/bin/wb-hygiene) —
+# ein $(dirname "${BASH_SOURCE[0]}") waere im installierten Fall ~/.local/bin und
+# wuerde das Repo mit sich selbst vergleichen. Ueberschreibbar fuer Tests.
+REPO_SHELL="${WB_REPO_SHELL:-$HOME/AI/claude-workbench/shell}"
+# tmux legt seine Sockets unter TMUX_TMPDIR (falls gesetzt) an, sonst unter einem
+# festen Systempfad — dieselbe Ableitung wie tmux selbst, siehe `tmux -L x list-
+# sessions -F '#{socket_path}'`, gemessen 2026-08-04.
+# /private/tmp gibt es nur auf macOS; auf Linux legt tmux seine Sockets unter /tmp ab.
+# Bis zum 2026-08-04 stand hier /private/tmp fest, und der Abschnitt meldete auf peer
+# deshalb "kein tmux-Socketverzeichnis — nichts zu pruefen", waehrend dort 48 tote
+# Sockets aus drei Testlaeufen lagen. Ein Pruefer, der auf der halben Flotte nichts
+# sieht und trotzdem gruen meldet, ist schlimmer als keiner.
+if [ -n "${TMUX_TMPDIR:-}" ]; then
+  SOCKDIR="$TMUX_TMPDIR/tmux-$(id -u)"
+elif [ -d /private/tmp ]; then
+  SOCKDIR="/private/tmp/tmux-$(id -u)"
+else
+  SOCKDIR="/tmp/tmux-$(id -u)"
+fi
+
+# Obergrenzen aus session-end Schritt 2b. Werden sie ueberschritten, wird in der
+# laufenden Session ausgelagert — nicht vertagt.
+# 16000 statt der ursprünglich gesetzten 14000: drei Bloecke bleiben nach dem
+# Router-Umbau vom 03.08. bewusst in CLAUDE.md, weil sie keinen Ausloeser haben, an dem
+# man sie noch rechtzeitig nachschlagen koennte — der Vault-Abschnitt (gilt vor jeder
+# nicht-trivialen Aufgabe), die Prompt-Injection-Abwehr (der Schaden entsteht, sobald
+# fremder Text im Kontext liegt) und die Backtick-Regel (feuert bei jedem Bash-Aufruf).
+# Zusammen 4.100 Bytes. Eine Grenze, die diese drei nicht einrechnet, waere von Anfang
+# an unerreichbar und damit wertlos.
+# Die Grenze gilt fuer den ALLGEMEINEN Anteil, nicht fuer den maschinenspezifischen
+# (2026-08-04, nach Messung). Auf peer schlug sie an, ohne dass dort etwas aufzuraeumen
+# gewesen waere: die Aufteilung vom 03.08. ist dort laengst durchgefuehrt, und ein
+# satzweiser Abgleich beider Dateien gegen peers zwoelf Regeldateien fand genau EINEN
+# Satz, der doppelt steht (106 Bytes). Der Rest des Unterschieds ist Text, den es auf
+# dem Mac nicht geben KANN und der dort auch nicht hingehoert:
+#   CLAUDE.md      +1.447 Bytes — Maschinenbeschreibung und "Was auf DIESER Maschine
+#                                 anders ist" (1.038), die Regel "Peer-Rechner laeuft durch und
+#                                 bleibt erreichbar" (371), plus zwei Zeilen, in denen
+#                                 die andere Maschine der Mac ist statt peer.
+#   orchestrator.md +3.111 Bytes — der Werkzeug-Absatz samt peer-shot (1.845), die Notiz
+#                                 unter der Routing-Tabelle (337), der fehlende
+#                                 ~/.pi/agent/ORCHESTRATOR.md (278), 32 GB/12 GB statt
+#                                 48 GB (283), die Model-Policy im Kopf (186), zwei
+#                                 Verweisbaum-Zeilen (79), Fable-Credits (106).
+# Eine Grenze, die diesen Text mitzaehlt, ist auf peer unerreichbar und damit genauso
+# wertlos wie eine, die die drei Mac-Bloecke oben nicht einrechnet. Die peer-Werte sind
+# deshalb 16.000 plus der gemessene Unterschied, nicht ein gegriffener Aufschlag.
+case "$(uname -s)" in
+  Darwin) CAP_CLAUDE=16000; CAP_ORCH=16000 ;;
+  *)      CAP_CLAUDE=17447; CAP_ORCH=19111 ;;
+esac
+
+findings=0
+
+# wb-consistency laeuft GENAU EINMAL, und derselbe Lauf liefert Bericht UND Exit-Code.
+# Vorher lief es zweimal: einmal fuer den Bericht (im Unter-Prozess von `out=$(...)`, wo
+# sein Rueckgabewert verlorenging) und einmal spaeter mit --quiet nur fuer den
+# Exit-Code. Zwei Laeufe koennen verschiedene Antworten geben — ein Widerspruch, der
+# zwischendurch entsteht oder verschwindet, steht dann im Bericht und nicht im Status
+# oder umgekehrt, entgegen dem Kommentar weiter unten, der genau das ausschliesst
+# ("kein zweiter Aufruf der drei Werkzeuge"). --quiet unterdrueckt nur die Ausgabe, der
+# Rueckgabewert ist derselbe (wb-consistency:2013) — der Bericht-Lauf taugt also fuer
+# beides.
+CONS_DA=0; CONS_OUT=""; CONS_RC=0
+if [ -x "$BIN/wb-consistency" ]; then
+  CONS_DA=1
+  CONS_OUT="$("$BIN/wb-consistency" 2>&1)"; CONS_RC=$?
+fi
+
+# Eigene Variable aus demselben Grund wie CONS_OUT oben (2026-08-16, bugjagd
+# shell/niedrig): der VERALTET-Zaehler weiter unten muss NUR den Fund von
+# status-freshness treffen, nicht den ganzen Bericht -- gemessen an einem
+# konstruierten Bericht, in dem eine ANDERE Sektion zufaellig denselben
+# Wortlaut traegt: `grep -c 'VERALTET —'` ueber den vollen $out zaehlte 2 statt
+# der tatsaechlich 1 veralteten STATUS.md.
+FRESH_DA=0; FRESH_OUT=""
+if [ -x "$BIN/status-freshness" ]; then
+  FRESH_DA=1
+  FRESH_OUT="$("$BIN/status-freshness" 2>&1)"
+fi
+
+out=$(
+  echo "# Hygiene-Bericht — $(date '+%Y-%m-%d %H:%M')"
+  echo
+
+  echo "## Groesse der immer geladenen Dateien"
+  # Gemessen wird der HANDGEPFLEGTE Anteil: generierte Bloecke (wb-instructions sync)
+  # sind nicht durch Auslagern kuerzbar, und eine Grenze, die man nicht erreichen kann,
+  # wird nach zwei Wochen ueberlesen. Sie werden separat ausgewiesen, damit die Zahl
+  # trotzdem sichtbar bleibt.
+  for pair in "$HOME/.claude/CLAUDE.md:$CAP_CLAUDE" "$HOME/.claude/roles/orchestrator.md:$CAP_ORCH"; do
+    f="${pair%:*}"; cap="${pair##*:}"
+    [ -f "$f" ] || continue
+    n=$(wc -c < "$f" | tr -d ' ')
+    gen=$(awk '/<!-- wb:[a-z-]*:start -->/{i=1} i{c+=length($0)+1} /<!-- wb:[a-z-]*:end -->/{i=0} END{print c+0}' "$f")
+    own=$((n - gen))
+    if [ "$own" -gt "$cap" ]; then
+      echo "  UEBER GRENZE  $(basename "$f"): $own eigene Bytes (Grenze $cap) — auslagern nach ~/.claude/regeln/"
+    else
+      echo "  ok            $(basename "$f"): $own von $cap eigenen Bytes"
+    fi
+    [ "$gen" -gt 0 ] && echo "                (+ $gen Bytes generierter Block, nicht kuerzbar; Datei gesamt $n)"
+  done
+  echo
+
+  echo "## Widersprueche (wb-consistency)"
+  if [ "$CONS_DA" = 1 ]; then
+    printf '%s\n' "$CONS_OUT" | sed 's/^/  /'
+  else
+    echo "  wb-consistency nicht gefunden"
+  fi
+  echo
+
+  echo "## Wachstum der Regeldatei (claude-md-lint)"
+  if [ -x "$BIN/claude-md-lint" ]; then
+    "$BIN/claude-md-lint" 2>&1 | sed -n '1,8p' | sed 's/^/  /'
+  else
+    echo "  claude-md-lint nicht gefunden"
+  fi
+  echo
+
+  echo "## Veraltete Statusdateien (status-freshness)"
+  if [ "$FRESH_DA" = 1 ]; then
+    printf '%s\n' "$FRESH_OUT" | sed 's/^/  /'
+  else
+    echo "  status-freshness nicht gefunden"
+  fi
+  echo
+
+  # Anlass (2026-08-04): drei Werkzeuge lagen monatelang NUR unter ~/.local/bin —
+  # keine Historie, kein git diff, kein Zurueck. Reines Melden, nichts wird
+  # kopiert oder repariert (siehe Kopfkommentar).
+  echo "## Repo und Installation auseinander"
+  if [ ! -d "$REPO_SHELL" ]; then
+    echo "  Repo nicht gefunden unter $REPO_SHELL — Abschnitt uebersprungen"
+  else
+    drift=0
+    for f in "$REPO_SHELL"/*; do
+      [ -f "$f" ] && [ -x "$f" ] || continue
+      name="$(basename "$f")"
+      installiert="$BIN/$name"
+      if [ ! -e "$installiert" ]; then
+        echo "  nur im Repo, nicht installiert: $name"
+        drift=1
+      elif ! cmp -s "$f" "$installiert"; then
+        echo "  ABWEICHEND    $name"
+        drift=1
+      fi
+    done
+    [ "$drift" = 0 ] && echo "  ok            Repo und Installation stimmen ueberein"
+  fi
+  echo
+
+  # Anlass (2026-08-04): Diagnose von Hand haeuft tote Sockets an (68 an einem
+  # Abend gemessen) — sie entstehen ausserhalb der Testsuiten, ein Test-Fix
+  # loest das also nicht. Nur zaehlen, nichts loeschen: welche Datei welchem
+  # Testlauf gehoerte, weiss dieses Werkzeug nicht.
+  echo "## Liegengebliebene Test-Sockets"
+  if [ ! -d "$SOCKDIR" ]; then
+    echo "  kein tmux-Socketverzeichnis ($SOCKDIR) — nichts zu pruefen"
+  else
+    tot=0; lebendig=0
+    for s in "$SOCKDIR"/*; do
+      [ -S "$s" ] || continue
+      if tmux -S "$s" list-sessions >/dev/null 2>&1; then
+        lebendig=$((lebendig + 1))
+      else
+        tot=$((tot + 1))
+      fi
+    done
+    if [ "$tot" -gt 0 ]; then
+      echo "  $tot liegengebliebene Socket(s) ohne laufenden Server ($lebendig lebendig) — aufraeumen: rm unter $SOCKDIR"
+    else
+      echo "  ok            keine liegengebliebenen Test-Sockets ($lebendig lebendig)"
+    fi
+  fi
+)
+
+echo "$out"
+
+# Exit-Code aus den harten Kriterien: Groessengrenze und wb-consistency. Der Linter
+# und status-freshness melden Hinweise, keine Fehler — sie sollen den Job nicht
+# dauerhaft rot faerben und damit unlesbar machen.
+echo "$out" | grep -q 'UEBER GRENZE' && findings=1
+[ "$CONS_DA" = 1 ] && [ "$CONS_RC" -ne 0 ] && findings=1
+
+# Statusdatei fuer den SessionStart-Hook (2026-08-04, selber Anlass wie oben):
+# Bericht und Job-Exit-Code gab es schon, aber ohne maschinenlesbare Ablage
+# blieb ein rotes Ergebnis bis zum naechsten Montag unbemerkt -- selbes Muster
+# wie wb-testsuite-run/sessionstart-testsuite-status.sh. Eine Zahl je Pruefung,
+# aus genau den Zeilen extrahiert, die im Bericht oben ohnehin schon stehen --
+# kein zweiter Aufruf der drei Werkzeuge, keine Abweichung zwischen Bericht
+# und Statusdatei moeglich.
+#
+# Je Pruefung zwei Zustaende, die auseinandergehalten werden:
+#   * Werkzeug fehlt ("... nicht gefunden") -- ein bekannter, sauberer
+#     Zustand, keine Gegenprobe noetig, Zahl bleibt leer, parse_ok bleibt 1.
+#   * Werkzeug lief, aber die erwartete Kennzahl-Zeile taucht nicht auf --
+#     Format hat sich vermutlich geaendert (Gegenprobe schlaegt fehl), Zahl
+#     bleibt leer UND parse_ok faellt fuer die GESAMTE Datei auf 0, damit der
+#     Hook keine falsche Zahl vorspiegelt (selbe Regel wie bei
+#     wb-testsuite-run: lieber ehrlich unparsbar als eine erfundene Null).
+consistency_ok=1
+if printf '%s\n' "$out" | grep -q 'wb-consistency nicht gefunden'; then
+  consistency_count=""
+else
+  consistency_line=$(printf '%s\n' "$out" | grep -E 'wb-consistency: [0-9]+ Abweichung' | head -1)
+  if [ -n "$consistency_line" ]; then
+    consistency_count=$(printf '%s' "$consistency_line" | grep -oE '[0-9]+' | head -1)
+  else
+    consistency_count=""
+    consistency_ok=0
+  fi
+fi
+
+lint_ok=1
+if printf '%s\n' "$out" | grep -q 'claude-md-lint nicht gefunden'; then
+  lint_undated_count=""
+else
+  lint_line=$(printf '%s\n' "$out" | grep -E '== Regeln ohne Datum \([0-9]+\)' | head -1)
+  if [ -n "$lint_line" ]; then
+    lint_undated_count=$(printf '%s' "$lint_line" | grep -oE '[0-9]+' | head -1)
+  else
+    lint_undated_count=""
+    lint_ok=0
+  fi
+fi
+
+freshness_ok=1
+if [ "$FRESH_DA" != 1 ]; then
+  freshness_stale_count=""
+elif printf '%s\n' "$FRESH_OUT" | grep -q 'status-freshness — Vault:'; then
+  # $FRESH_OUT statt $out (2026-08-16, bugjagd shell/niedrig): siehe Begruendung bei
+  # der Erfassung von FRESH_OUT oben -- eine andere Sektion des Berichts darf diesen
+  # Zaehler nicht mehr aufblasen koennen.
+  freshness_stale_count=$(printf '%s\n' "$FRESH_OUT" | grep -c 'VERALTET —')
+else
+  freshness_stale_count=""
+  freshness_ok=0
+fi
+
+status_parse_ok=1
+[ "$consistency_ok" = 0 ] && status_parse_ok=0
+[ "$lint_ok" = 0 ] && status_parse_ok=0
+[ "$freshness_ok" = 0 ] && status_parse_ok=0
+if [ "$status_parse_ok" = 0 ]; then
+  consistency_count=""
+  lint_undated_count=""
+  freshness_stale_count=""
+fi
+
+if [ "$WRITE" = 1 ]; then
+  mkdir -p "$(dirname "$REPORT")"
+  printf '%s\n' "$out" > "$REPORT"
+  echo
+  echo "Bericht: $REPORT"
+
+  mkdir -p "$(dirname "$STATUS")"
+  {
+    echo "# wb-hygiene-status.txt -- von wb-hygiene geschrieben, siehe Kopfkommentar dort."
+    echo "ts_epoch=$(date +%s)"
+    echo "ts_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "parse_ok=$status_parse_ok"
+    echo "exit_code=$findings"
+    echo "consistency_count=$consistency_count"
+    echo "lint_undated_count=$lint_undated_count"
+    echo "freshness_stale_count=$freshness_stale_count"
+  } > "$STATUS.tmp" && mv "$STATUS.tmp" "$STATUS"
+  echo "Status: $STATUS"
+fi
+
+exit "$findings"

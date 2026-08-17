@@ -1,0 +1,251 @@
+#!/bin/bash
+# wb-session-delete --dir <projektordner> [--key <sessionKey>] [--yes] [--force]
+#
+# --force betrifft NUR das Schliessen der tmux-Session: es reicht `--force
+# --with-workers` an `wb-session-close` durch, hebt dort also die Client- und die
+# Worker-Pruefung auf. Gebraucht seit 2026-08-06 vom Fenster der Workbench: an
+# Sitzung des Nutzers haengt immer sein Terminal, und „Endgültig löschen" soll sofort
+# gehen, ohne sie vorher von Hand zu schliessen. Die Bremse davor ist die Rueckfrage
+# im Fenster. An der Loeschliste aendert --force NICHTS -- die Pfadpruefungen unten
+# gelten unveraendert, und die Sicherung wird genauso angelegt.
+#
+# Entfernt EINE fortsetzbare Workbench-Session mit allem, was zum Fortsetzen
+# gehoert — und nichts sonst.
+#
+# ENTFERNT WIRD:
+#   * die Zustandsdatei ~/.claude/workbench/sessions/<slug>[__<key>].json
+#     (in ihr stehen auch die Worker-Eintraege dieser Session; sie gehen damit mit)
+#   * die tmux-Session dieser Zustandsdatei, ueber `wb-session-close` — nie mit
+#     einem rohen kill, damit dessen Pruefungen (Client haengt dran, Worker laeuft)
+#     auch hier gelten
+#   * das Claude-Transkript GENAU DIESER Session:
+#     ~/.claude/projects/<pfad-slug>/<claudeSessionId>.jsonl
+#
+# NIE ANGEFASST WIRD (ausdrueckliche des Nutzers Abgrenzung, 2026-08-04):
+#   * irgendetwas im Knowledge-Vault (~/Knowledge) oder Brain-Material
+#   * irgendeine Datei des Projekts selbst, insbesondere keine Markdown-Datei
+#   * die Zustandsdatei oder das Transkript einer ANDEREN Session, auch nicht im
+#     selben Ordner
+#
+# Wie das durchgesetzt wird, statt nur versprochen: es gibt keinen Suchlauf und
+# kein Glob. Die Loeschliste wird aus genau zwei Werten gebaut — dem Dateinamen der
+# Zustandsdatei und der `claudeSessionId`, die IN dieser Datei steht. Jeder Pfad
+# laeuft danach durch pruefe_pfad(): er muss unterhalb eines der beiden erlaubten
+# Verzeichnisse liegen, die richtige Endung haben, und darf weder im Vault noch im
+# Projektordner liegen. Ein Pfad, der eine dieser Bedingungen verletzt, bricht den
+# ganzen Lauf ab — es wird dann nichts geloescht, auch nicht der Rest.
+#
+# Vor dem Loeschen wird alles nach ~/.local/trash-snapshots/<datum>-session-<name>/
+# kopiert (stehende Regel), und ohne --yes passiert ueberhaupt nichts: der Lauf
+# zeigt nur, was er entfernen wuerde.
+set -uo pipefail
+
+DIR=""; KEY=""; YES=""; FORCE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dir)   DIR="${2:?Projektordner}"; shift 2 ;;
+    --key)   KEY="${2:?sessionKey}"; shift 2 ;;
+    --yes)   YES=1; shift ;;
+    --force) FORCE=1; shift ;;
+    -h|--help) sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "wb-session-delete: unbekannte Option '$1'" >&2; exit 1 ;;
+  esac
+done
+[ -n "$DIR" ] || { echo "usage: wb-session-delete --dir <projektordner> [--key <sessionKey>] [--yes] [--force]" >&2; exit 1; }
+
+STATEDIR="$HOME/.claude/workbench/sessions"
+PROJDIR="$HOME/.claude/projects"
+VAULT="$HOME/Knowledge"
+
+# slug der Zustandsdatei: Projektpfad, '/' durch '-' ersetzt (wie wb-state).
+slug() { printf '%s' "$1" | tr '/' '-'; }
+# slug des Claude-Transkriptverzeichnisses: JEDES nicht-alphanumerische Zeichen
+# wird '-' ('$HOME/.claude' -> '-Users-<user>--claude').
+claude_slug() { printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-'; }
+
+if [ -n "$KEY" ]; then
+  case "$KEY" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+    *) echo "wb-session-delete: '$KEY' ist kein sessionKey (6 Hex-Zeichen)." >&2; exit 1 ;;
+  esac
+  FILE="$STATEDIR/$(slug "$DIR")__$KEY.json"
+else
+  FILE="$STATEDIR/$(slug "$DIR").json"
+fi
+
+[ -f "$FILE" ] || { echo "wb-session-delete: keine Session-Zustandsdatei '$FILE'." >&2; exit 1; }
+
+# Felder der Session lesen. Der 'dir' der Datei muss zum uebergebenen Ordner
+# passen — sonst zeigt der Name auf etwas anderes als der Inhalt, und dann wird
+# nichts geloescht.
+read_state() {
+  /usr/bin/python3 - "$FILE" <<'PY'
+import json, sys
+try:
+    st = json.load(open(sys.argv[1]))
+except Exception as exc:
+    print("ERR|%s" % exc); raise SystemExit(0)
+print("DIR|%s"  % (st.get("dir") or ""))
+print("NAME|%s" % (st.get("name") or ""))
+print("TMUX|%s" % (st.get("tmuxSession") or ""))
+print("CSES|%s" % (st.get("claudeSessionId") or ""))
+print("NWRK|%d" % len(st.get("workers") or []))
+PY
+}
+STATE="$(read_state)"
+case "$STATE" in ERR\|*) echo "wb-session-delete: ${STATE#ERR|}" >&2; exit 1 ;; esac
+feld() { printf '%s\n' "$STATE" | awk -F'|' -v k="$1" '$1==k{sub(/^[^|]*\|/,""); print; exit}'; }
+
+ST_DIR="$(feld DIR)"; ST_NAME="$(feld NAME)"; ST_TMUX="$(feld TMUX)"
+ST_CSES="$(feld CSES)"; ST_NWRK="$(feld NWRK)"
+
+if [ -n "$ST_DIR" ] && [ "$ST_DIR" != "$DIR" ]; then
+  echo "wb-session-delete: '$FILE' gehoert zu '$ST_DIR', nicht zu '$DIR' — verweigert." >&2
+  exit 1
+fi
+
+ANZEIGE="${ST_NAME:-$(basename "$DIR")}"
+
+# --- die einzige Stelle, an der ein Pfad in die Loeschliste kommt -------------
+# Erlaubt sind ausschliesslich: eine .json unterhalb des Sessionverzeichnisses und
+# eine .jsonl unterhalb des Claude-Projektverzeichnisses. Alles andere ist ein
+# Fehler im Aufbau der Liste, kein Sonderfall — der Lauf bricht dann ab.
+pruefe_pfad() {
+  local p="$1" art="$2"
+  case "$p" in
+    *..*) echo "wb-session-delete: Pfad enthaelt '..': $p" >&2; return 1 ;;
+  esac
+  case "$p" in
+    "$VAULT"/*|"$VAULT") echo "wb-session-delete: Pfad liegt im Vault: $p" >&2; return 1 ;;
+  esac
+  case "$p" in
+    "$DIR"/*|"$DIR") echo "wb-session-delete: Pfad liegt im Projektordner: $p" >&2; return 1 ;;
+  esac
+  case "$art" in
+    zustand)
+      case "$p" in
+        "$STATEDIR"/*.json) ;;
+        *) echo "wb-session-delete: '$p' ist keine Zustandsdatei unterhalb von $STATEDIR" >&2; return 1 ;;
+      esac ;;
+    transkript)
+      case "$p" in
+        "$PROJDIR"/*/*.jsonl) ;;
+        *) echo "wb-session-delete: '$p' ist kein Transkript unterhalb von $PROJDIR" >&2; return 1 ;;
+      esac ;;
+    *) echo "wb-session-delete: unbekannte Pfadart '$art'" >&2; return 1 ;;
+  esac
+  return 0
+}
+
+LISTE=()
+pruefe_pfad "$FILE" zustand || exit 1
+LISTE[${#LISTE[@]}]="$FILE"
+
+TRANSKRIPT=""
+if [ -n "$ST_CSES" ]; then
+  T="$PROJDIR/$(claude_slug "$DIR")/$ST_CSES.jsonl"
+  if [ -f "$T" ]; then
+    pruefe_pfad "$T" transkript || exit 1
+    TRANSKRIPT="$T"
+    LISTE[${#LISTE[@]}]="$T"
+  fi
+fi
+
+# --- Bericht ------------------------------------------------------------------
+echo "Session:      ${ANZEIGE}"
+echo "Ordner:       $DIR${KEY:+   (Schluessel $KEY)}"
+echo "Zustandsdatei: $FILE"
+if [ -n "$ST_TMUX" ]; then
+  if tmux has-session -t "=$ST_TMUX" 2>/dev/null; then
+    echo "tmux-Session:  $ST_TMUX (laeuft — wird ueber wb-session-close geschlossen)"
+  else
+    echo "tmux-Session:  $ST_TMUX (laeuft nicht mehr)"
+  fi
+else
+  echo "tmux-Session:  keine eingetragen"
+fi
+if [ -n "$TRANSKRIPT" ]; then
+  echo "Transkript:    $TRANSKRIPT"
+elif [ -n "$ST_CSES" ]; then
+  echo "Transkript:    $ST_CSES.jsonl — Datei nicht vorhanden, nichts zu loeschen"
+else
+  echo "Transkript:    keine claudeSessionId eingetragen; es wird KEIN Transkript geloescht"
+  echo "               (ohne die Id liesse sich nicht sagen, welche der Dateien im"
+  echo "                Projektverzeichnis zu dieser Session gehoert — geraten wird nicht)"
+fi
+echo "Worker-Eintraege: $ST_NWRK (stehen in der Zustandsdatei und gehen mit ihr)"
+echo "Unberuehrt:    Vault, Projektdateien, jede andere Session"
+
+if [ -z "$YES" ]; then
+  echo
+  echo "Nichts geloescht. Zum Loeschen denselben Aufruf mit --yes wiederholen."
+  exit 0
+fi
+
+# --- tmux zuerst: schlaegt das fehl, wird auch keine Datei angefasst ----------
+# Die Schalter fuer den ausdruecklichen Weg stehen in EINER Variablen, damit die
+# Basis-Session und ihre Sicht denselben Weg gehen. `--force` verlangt drueben
+# zusaetzlich WB_SESSION_CLOSE_CONFIRM mit genau dem Namen, der geschlossen wird.
+# Ein LEERES Array unter `set -u` ist auf der Bash dieses Shebangs (macOS
+# /bin/bash 3.2.57) ein Fehler, kein leeres Wort: `"${A[@]}"` bricht dort mit
+# "unbound variable" ab. Getroffen haette es genau den haeufigen Weg -- ohne
+# `--force`, also ohne einen einzigen Eintrag im Array -- und zwar BEVOR
+# ueberhaupt etwas geschlossen oder geloescht wird (2026-08-16 gemessen, gefunden
+# beim zweiten Fix-Durchgang der Bugjagd). Ein Platzhalter, den wb-session-close
+# ohnehin kennt, haelt das Array immer nicht-leer und aendert an seinem Verhalten
+# nichts; auf Bash 4.4+ waere die Sonderbehandlung unnoetig, aber sie schadet
+# dort auch nicht.
+CLOSE_ARGS=(--)
+[ -n "$FORCE" ] && CLOSE_ARGS=(--force --with-workers --)
+if [ -n "$ST_TMUX" ] && tmux has-session -t "=$ST_TMUX" 2>/dev/null; then
+  if ! WB_SESSION_CLOSE_CONFIRM="$ST_TMUX" "$HOME/.local/bin/wb-session-close" "${CLOSE_ARGS[@]}" "$ST_TMUX"; then
+    echo "wb-session-delete: die tmux-Session liess sich nicht schliessen — es wurde NICHTS geloescht." >&2
+    echo "  (Haengt ein Fenster daran oder laeuft ein Worker, erst das aufloesen — oder denselben Aufruf mit --force.)" >&2
+    exit 1
+  fi
+  # Die gruppierte Sicht ueberlebt die Basis nicht sinnvoll; ihre Fenster gehoerten
+  # der Basis. Falls sie stehen blieb, geht sie hier mit.
+  #
+  # Der Rueckgabewert wurde bislang verworfen (2026-08-16, bugjagd shell/niedrig):
+  # reproduziert mit einem wb-session-close-Stellvertreter, der die Basis schliesst,
+  # aber die Sicht ausdruecklich scheitern laesst -- die Zustandsdatei wurde trotzdem
+  # geloescht und "geloescht"/Exit 0 gemeldet, obwohl die Sicht mit denselben Fenstern
+  # (und einem eventuell laufenden Worker darin) weiterlief. Genau wie beim
+  # Basis-Schliessen oben: schlaegt es fehl, wird NICHTS angefasst.
+  if tmux has-session -t "=$ST_TMUX-view" 2>/dev/null; then
+    if ! WB_SESSION_CLOSE_CONFIRM="$ST_TMUX-view" "$HOME/.local/bin/wb-session-close" "${CLOSE_ARGS[@]}" "$ST_TMUX-view" >/dev/null 2>&1; then
+      echo "wb-session-delete: die gruppierte Sicht '$ST_TMUX-view' liess sich nicht schliessen — es wurde NICHTS geloescht." >&2
+      echo "  (Ihre Fenster sind dieselben wie die der Basis; erst sie aufloesen, oder denselben Aufruf mit --force.)" >&2
+      exit 1
+    fi
+  fi
+fi
+
+# --- Sicherung vor dem Loeschen (stehende Regel) ------------------------------
+SNAPNAME="$(printf '%s' "$ANZEIGE" | tr -c 'a-zA-Z0-9._-' '-')"
+SNAP="$HOME/.local/trash-snapshots/$(date +%Y%m%d)-session-$SNAPNAME"
+mkdir -p "$SNAP" || { echo "wb-session-delete: Sicherungsverzeichnis '$SNAP' nicht anlegbar — abgebrochen." >&2; exit 1; }
+for p in "${LISTE[@]}"; do
+  cp -p "$p" "$SNAP/$(basename "$p")" || {
+    echo "wb-session-delete: '$p' liess sich nicht sichern — es wurde NICHTS geloescht." >&2; exit 1; }
+done
+{
+  echo "# Geloeschte Workbench-Session: $ANZEIGE"
+  echo
+  echo "- Zeitpunkt: $(date '+%F %T')"
+  echo "- Ordner: $DIR"
+  [ -n "$KEY" ] && echo "- sessionKey: $KEY"
+  [ -n "$ST_TMUX" ] && echo "- tmux-Session: $ST_TMUX"
+  [ -n "$ST_CSES" ] && echo "- claudeSessionId: $ST_CSES"
+  echo
+  echo "Wiederherstellen: die gesicherten Dateien an ihre Stelle zurueckkopieren"
+  echo "(Zustandsdatei nach $STATEDIR/, Transkript nach $PROJDIR/$(claude_slug "$DIR")/),"
+  echo "danach erscheint die Session wieder auf der Startseite."
+} > "$SNAP/README.md"
+
+rc=0
+for p in "${LISTE[@]}"; do
+  if rm -f "$p"; then echo "geloescht: $p"; else echo "wb-session-delete: '$p' liess sich nicht loeschen." >&2; rc=1; fi
+done
+echo "Gesichert in: $SNAP"
+exit $rc

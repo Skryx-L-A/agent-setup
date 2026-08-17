@@ -1,0 +1,549 @@
+#!/usr/bin/env bash
+# wb-worktree — ein eigener git-Worktree je Worker.
+#
+# Anlass (Fremdvergleich 2026-08-04): von acht Konkurrenzprodukten legen fast alle
+# je Agent einen eigenen Arbeitsbaum an; bei uns arbeiteten mehrere Worker im
+# SELBEN Baum, und Kollisionen wurden allein durch abgegrenzte Auftraege
+# verhindert. Das ist Disziplin, keine Isolierung — in der Nacht zum 04.08. lief
+# ein `git add -A` mitten in die Arbeit von vier Workern.
+#
+# Aufbau:
+#   Worktree   ~/.pi-workers/worktrees/<worker>      (wie results/<worker>, sessions/<worker>)
+#   Zweig      wb/<worker>                            (eigener Namensraum, kollidiert nie mit einem Menschenzweig)
+#   Merkzettel ~/.pi-workers/worktrees/.meta/<worker> (Repo, Pfad, Zweig, Basis — Schluessel ist der Worker-Name)
+#
+#   wb-worktree ensure <worker> <dir>   Worktree anlegen/wiederverwenden; DRUCKT das
+#                                       Verzeichnis, in dem der Worker laufen soll.
+#                                       Faellt IMMER auf <dir> zurueck, wenn kein
+#                                       Worktree moeglich ist (kein git, kein Repo,
+#                                       abgeschaltet) — der Normalfall bricht nie.
+#                                       Verlinkt dabei app/node_modules auf den
+#                                       Hauptbaum, wenn der Hauptbaum eines hat und
+#                                       der neue/wiederverwendete Baum keins (siehe
+#                                       link_app_node_modules() unten) — Anlass war
+#                                       eine macOS-Meldung, die der Werkbank ein
+#                                       Aendern/Loeschen von Apps verweigerte,
+#                                       ausgeloest von einem `npm install`, das
+#                                       Electrons eigenes App-Buendel unter
+#                                       node_modules/electron/dist auspackte
+#                                       (2026-08-11).
+#   wb-worktree path <worker>           Pfad des Worktrees (leer + Exit 1, wenn keiner)
+#   wb-worktree check <worker>          Darf er weg? Exit 0 ja, 3 NEIN (Arbeit drin), 1 keiner da
+#   wb-worktree remove <worker> [--force]
+#                                       Aufraeumen. Ohne --force NIE, solange
+#                                       unbeachtete oder nicht uebernommene Arbeit drin
+#                                       steht. Mit --force zuerst Sicherungskopie nach
+#                                       ~/.local/trash-snapshots/, Zweig bleibt stehen.
+#   wb-worktree adopt <worker> [--commit]
+#                                       Arbeit in den Hauptbaum holen (Merge, siehe unten)
+#   wb-worktree diff <worker>           Was hat der Worker getan?
+#   wb-worktree list                    Alle Worktrees mit Zustand
+#
+# Abschaltbar: `wb-state settings set workerWorktrees false` — dann verhaelt sich
+# `ensure` wie frueher und gibt <dir> unveraendert zurueck. Vorgabe: an.
+#
+# KEIN DATENVERLUST, NIE. Vor jedem Entfernen wird auf zweierlei geprueft:
+# unbeachtete Aenderungen im Worktree (`git status --porcelain -uall`) UND Commits
+# auf dem Worker-Zweig, die der Basiszweig nicht enthaelt. Beides verweigert das
+# Entfernen; `--force` raeumt erst nach einer Sicherungskopie und laesst den Zweig
+# stehen (die Commits bleiben also auch dann erreichbar).
+#
+# DIE GEFAEHRLICHE STELLE beim Entfernen ist NICHT diese Pruefung, sondern die
+# eine Zeile in cmd_remove(), die den Worktree tatsaechlich loescht (Suche nach
+# "worktree remove" unten) — seit link_app_node_modules() (2026-08-11, siehe
+# unten fortgeschrieben 2026-08-12) kann app/node_modules im Worktree ein
+# SYMLINK auf den Hauptbaum sein (Rueckfallpfad), nicht nur ein echtes
+# Verzeichnis. Fuer den Symlink-Fall gilt: `rm -rf <pfad-auf-symlink>` loescht
+# nur den Verweis, aber `rm -rf <pfad-auf-symlink>/` (Schraegstrich am Ende!)
+# FOLGT dem Verweis und raeumt darin auf — gemessen (BSD rm, macOS): der
+# komplette Zielordner im Hauptbaum war danach weg, samt Inhalt. cmd_remove()
+# ruft dafuer ohnehin nie rm auf, sondern `git worktree remove`, und das
+# behandelt einen Symlink im Baum nachweislich als eigenen Eintrag, den es
+# entfernt, statt ihm zu folgen (nachgemessen, siehe Ergebnisdatei zu diesem
+# Befund) — SOLANGE niemand $MW_WT dort mit einem angehaengten "/" aufruft.
+# Genau das darf hier nie passieren.
+#
+# ZWEITER VORFALL (2026-08-12, Anlass fuer den APFS-Klon unten): der Symlink
+# selbst war schon das Risiko, ganz ohne rm-Falle. Ein Worker lief `npm ci` IN
+# einem Worktree, dessen app/node_modules noch der Symlink aus 2026-08-11 war
+# — npm raeumt vor der Installation den Zielordner leer, und weil ein Symlink
+# fuer jede Dateioperation transparent ist, traf das den Ordner im HAUPTBAUM,
+# nicht eine Kopie. Befund: leerer Ordner mit mtime = Startzeitpunkt des
+# Workers; der Hauptbaum brauchte danach selbst wieder `npm ci`. Deshalb
+# klont link_app_node_modules() jetzt per `cp -c -R` (APFS clonefile,
+# copy-on-write) statt zu verlinken: Schreibzugriffe im Worktree treffen dann
+# nur noch dessen eigene Kopie. Nur wenn das Klonen scheitert (kein APFS o.
+# aeh.), faellt die Funktion auf den Symlink von 2026-08-11 zurueck — MIT
+# Warnung nach stderr, dass darin kein npm ci/install laufen darf. Alles oben
+# zum Symlink-Fall (rm-Falle, `git worktree remove` bei $MW_WT ohne "/")
+# bleibt fuer diesen Rueckfallpfad unveraendert gueltig.
+set -uo pipefail
+
+ROOT="$HOME/.pi-workers/worktrees"
+METADIR="$ROOT/.meta"
+
+say()  { printf 'wb-worktree: %s\n' "$*" >&2; }
+usage(){ sed -n '2,79p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# Derselbe Namensfilter wie in pi-worker (dort mit Begruendung: aus dem Namen
+# werden Pfade gebaut, '../evil' hat sein Ergebnisverzeichnis einmal aus
+# results/ herausgelegt). Hier wird aus dem Namen ZUSAETZLICH ein Zweigname.
+valid_name() {
+  case "$1" in
+    ''|-*|*[!A-Za-z0-9_-]*) return 1 ;;
+  esac
+  return 0
+}
+
+worktrees_enabled() {
+  local v
+  v="$("$HOME/.local/bin/wb-state" settings get workerWorktrees 2>/dev/null)"
+  # Leere Antwort heisst: wb-state fehlt oder kennt den Schluessel nicht — dann
+  # gilt die Vorgabe (an). Nur ein ausdrueckliches 'false' schaltet ab.
+  [ "$v" != "false" ]
+}
+
+meta_file(){ printf '%s/%s' "$METADIR" "$1"; }
+meta_get() { # meta_get <worker> <schluessel>
+  local f; f="$(meta_file "$1")"
+  [ -f "$f" ] || return 1
+  sed -n "s/^$2=//p" "$f" | head -1
+}
+meta_write() { # meta_write <worker> <repo> <worktree> <branch> <base> <basecommit>
+  mkdir -p "$METADIR" || return 1
+  cat > "$(meta_file "$1")" <<EOF
+worker=$1
+repo=$2
+worktree=$3
+branch=$4
+base=$5
+basecommit=$6
+created=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
+}
+
+# Der HAUPTbaum des Repos, in dem <dir> liegt. `worktree list` nennt ihn immer
+# zuerst — das ist verlaesslicher als aus --git-common-dir zurueckzurechnen und
+# funktioniert auch, wenn <dir> selbst schon ein Worktree ist.
+main_worktree_of() { # main_worktree_of <dir>
+  git -C "$1" worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree /{sub(/^worktree /,""); print; exit}'
+}
+
+is_registered_worktree() { # is_registered_worktree <repo> <pfad>
+  git -C "$1" worktree list --porcelain 2>/dev/null \
+    | awk -v p="$2" '/^worktree /{sub(/^worktree /,""); if ($0==p) {found=1; exit}} END{exit !found}'
+}
+
+# link_app_node_modules <repo> <worktree> — klont app/node_modules im neuen
+# Worktree vom Hauptbaum, statt es dort per `npm install` neu auszupacken.
+# Anlass (2026-08-11): ein `npm install` in einem Worktree packte Electrons
+# eigenes App-Buendel aus (node_modules/electron/dist/Electron.app) und macOS
+# hat der Werkbank-App daraufhin ein "kann bis zum Beenden keine Apps
+# aktualisieren oder loeschen" angezeigt — jede App im selben Programmbuendel
+# faellt fuer diese Meldung auf die Werkbank zurueck. Eine zweite Folge
+# desselben Fehlens: die App-Testsuiten ueberspringen sich still, wenn
+# app/node_modules fehlt, und zwei Worker haben sich deshalb letzte Nacht von
+# Hand einen Symlink gelegt und wieder entfernt.
+#
+# Umbau (2026-08-12): urspruenglich verlinkte diese Funktion nur (`ln -s`).
+# Zweiter Vorfall (siehe Kopfkommentar): ein Worker lief `npm ci` GEGEN den
+# Symlink, und weil ein Symlink fuer Dateioperationen transparent ist, hat
+# npm beim Leeren vor der Neuinstallation den Ordner im HAUPTBAUM getroffen,
+# nicht eine eigene Kopie — Hauptbaum brauchte danach selbst wieder `npm ci`.
+# Jetzt wird per `cp -c -R` geklont (APFS clonefile(2), copy-on-write):
+# gemessen am echten Bestand (427 MB / 3096 Dateien) 0,47 s, praktisch kein
+# zusaetzlicher Plattenverbrauch, aber Schreibzugriffe im Worktree treffen ab
+# da an nur noch dessen eigene Kopie. `cp -c` faellt auf nicht-APFS-Zielen von
+# sich aus auf eine gewoehnliche (nicht Copy-on-Write) Kopie zurueck statt zu
+# scheitern — genau das wollen wir hier NICHT (voller Plattenverbrauch pro
+# Worker), darum laeuft vorab eine Vorprobe mit einer winzigen Testdatei im Zielvolumen:
+# schlaegt schon die Vorprobe fehl (Exit-Code, oder `cp` selbst fehlt/kennt
+# `-c` nicht wie GNU cp auf Linux), gilt Klonen als nicht verfuegbar, und die
+# Funktion faellt auf den Symlink von 2026-08-11 zurueck — MIT Warnung nach
+# stderr, dass darin kein npm ci/install laufen darf.
+#
+# Bedingungen, unter denen NICHTS passiert (keine der drei wird ueberschrieben):
+#   - der Hauptbaum hat selbst kein app/node_modules -> nichts zu klonen.
+#   - app/ existiert im neuen Worktree nicht (unversioniert/kein Projekt hier).
+#   - im Worktree liegt unter app/node_modules schon etwas — ob echtes
+#     Verzeichnis oder bereits ein Verweis, beides bleibt unangetastet.
+# Ziel ist IMMER $repo (der Hauptbaum, siehe main_worktree_of oben) — nie ein
+# anderer Worktree, und $repo ist an dieser Stelle bereits genau das.
+clonefile_available() {
+  # Vorprobe: legt eine winzige Testdatei im $dst-Elternverzeichnis an (also
+  # auf demselben Volume wie das eigentliche Ziel) und versucht, sie per
+  # `cp -c` zu klonen. Erst danach wissen wir, ob das Zielvolume Cloning
+  # unterstuetzt, ohne die grosse Kopie im Fehlerfall wieder wegwerfen zu
+  # muessen.
+  local parent="$1" probe_src probe_dst rc
+  probe_src="$(mktemp "$parent/.wb-clone-probe.XXXXXX" 2>/dev/null)" || return 1
+  probe_dst="${probe_src}.dst"
+  printf 'x' > "$probe_src" 2>/dev/null
+  cp -c "$probe_src" "$probe_dst" 2>/dev/null; rc=$?
+  rm -f "$probe_src" "$probe_dst" 2>/dev/null
+  return "$rc"
+}
+link_app_node_modules() {
+  local repo="$1" wt="$2" src dst
+  src="$repo/app/node_modules"
+  dst="$wt/app/node_modules"
+  [ -d "$src" ] || return 0
+  [ -d "$wt/app" ] || return 0
+  # -L zusaetzlich zu -e: ein bereits vorhandener (auch kaputter) Symlink soll
+  # genauso wenig ueberschrieben werden wie ein echtes Verzeichnis -- -e allein
+  # liefert bei einem kaputten Symlink faelschlich falsch.
+  if [ -e "$dst" ] || [ -L "$dst" ]; then
+    return 0
+  fi
+  if clonefile_available "$wt/app" && cp -c -R "$src" "$dst" 2>/dev/null; then
+    say "app/node_modules vom Hauptbaum geklont ($src, copy-on-write) — kein npm install noetig."
+    return 0
+  fi
+  rm -rf "$dst" 2>/dev/null
+  if ln -s "$src" "$dst" 2>/dev/null; then
+    say "Hinweis: app/node_modules liess sich nicht klonen (kein APFS o. ae.) — stattdessen auf den Hauptbaum verlinkt ($src). ACHTUNG: kein npm ci/install in diesem Verweis, das raeumt beim Neuinstallieren durch den Symlink hindurch im HAUPTBAUM auf."
+  else
+    say "Hinweis: app/node_modules liess sich weder klonen noch verlinken — 'npm install' bleibt noetig."
+  fi
+}
+
+# --- ensure ----------------------------------------------------------------
+# Druckt IMMER genau ein Verzeichnis auf stdout — das, in dem der Worker laufen
+# soll. Jeder Grund, warum es kein Worktree wurde, geht als Hinweis nach stderr.
+cmd_ensure() {
+  local name="${1:-}" dir="${2:-}"
+  [ -n "$name" ] && [ -n "$dir" ] || { say "ensure braucht <worker> und <dir>."; return 1; }
+
+  # Alles, was schiefgehen kann, endet in diesem Rueckfall — der Worker laeuft
+  # dann wie vor dieser Funktion, im uebergebenen Verzeichnis.
+  fallback() { printf '%s\n' "$dir"; [ -n "${1:-}" ] && say "$1 — '$name' laeuft ohne Worktree in $dir."; return 0; }
+
+  local wtpath="$ROOT/$name"
+  # Schon DRIN: idempotent und still. Trifft zu, wenn claude-worker den Pfad
+  # bereits ersetzt hat und pi-worker gleich noch einmal fragt.
+  case "$dir" in
+    "$wtpath"|"$wtpath"/*) printf '%s\n' "$dir"; return 0 ;;
+  esac
+
+  worktrees_enabled || { printf '%s\n' "$dir"; return 0; }   # abgeschaltet: still wie frueher
+  valid_name "$name" || { fallback "unzulaessiger Worker-Name '$name'"; return 0; }
+  [ -d "$dir" ] || { fallback "'$dir' ist kein Verzeichnis"; return 0; }
+  command -v git >/dev/null 2>&1 || { fallback "git ist hier nicht installiert"; return 0; }
+
+  local top repo
+  top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)"
+  [ -n "$top" ] || { fallback "'$dir' liegt in keinem git-Arbeitsbaum"; return 0; }
+  repo="$(main_worktree_of "$dir")"
+  [ -n "$repo" ] || repo="$top"
+  git -C "$repo" rev-parse --verify --quiet HEAD >/dev/null 2>&1 \
+    || { fallback "'$repo' hat noch keinen Commit (Worktree braucht HEAD)"; return 0; }
+
+  local branch="wb/$name" base basecommit
+  base="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null)"
+  basecommit="$(git -C "$repo" rev-parse HEAD 2>/dev/null)"
+
+  if is_registered_worktree "$repo" "$wtpath"; then
+    # Wiederverwendung: derselbe Worker-Name = derselbe Pane = derselbe Baum.
+    [ -f "$(meta_file "$name")" ] \
+      || meta_write "$name" "$repo" "$wtpath" \
+           "$(git -C "$wtpath" symbolic-ref --quiet --short HEAD 2>/dev/null || printf '%s' "$branch")" \
+           "${base:-HEAD}" "$basecommit"
+    say "'$name' arbeitet weiter im vorhandenen Worktree $wtpath."
+  elif [ -e "$wtpath" ]; then
+    # Etwas liegt dort, aber git kennt es nicht. NICHTS anfassen, nichts loeschen.
+    fallback "$wtpath existiert, ist aber kein angemeldeter Worktree von $repo"
+    return 0
+  else
+    mkdir -p "$ROOT" 2>/dev/null
+    local out rc
+    if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+      # Zweig gibt es schon (gleicher Worker-Name wie frueher) — er wird
+      # WIEDERVERWENDET, nie ueberschrieben: die alten Commits bleiben.
+      out="$(git -C "$repo" worktree add "$wtpath" "$branch" 2>&1)"; rc=$?
+    else
+      out="$(git -C "$repo" worktree add -b "$branch" "$wtpath" HEAD 2>&1)"; rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+      fallback "git worktree add fehlgeschlagen: $(printf '%s' "$out" | tr '\n' ' ')"
+      return 0
+    fi
+    meta_write "$name" "$repo" "$wtpath" "$branch" "${base:-HEAD}" "$basecommit"
+    say "'$name' arbeitet im Worktree $wtpath (Zweig $branch, aus ${base:-$basecommit})."
+    # Der Worktree steht auf HEAD. Was im Hauptbaum noch unbeachtet herumliegt,
+    # ist dort NICHT enthalten — das muss sichtbar sein, sonst sucht der Worker
+    # eine Aenderung, die er nie zu sehen bekommt.
+    local dirty
+    dirty="$(git -C "$repo" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    [ "${dirty:-0}" -gt 0 ] && say "Hinweis: der Hauptbaum hat $dirty unbeachtete Aenderung(en) — der Worktree steht auf HEAD und enthaelt sie nicht."
+    # Ein frischer Worktree ist ein Checkout: was NICHT versioniert ist, gibt es
+    # dort nicht. Ohne diesen Hinweis sucht ein Worker den Fehler in seinem Code,
+    # waehrend in Wahrheit nur `node_modules` fehlt.
+    local missing="" cand
+    for cand in node_modules .venv venv vendor target dist build .env; do
+      [ -e "$repo/$cand" ] && [ ! -e "$wtpath/$cand" ] && missing="$missing $cand"
+    done
+    [ -n "$missing" ] && say "Hinweis: unversionierte Ordner/Dateien fehlen im Worktree —$missing. Sie muessen dort neu erzeugt werden (Abhaengigkeiten installieren, bauen)."
+  fi
+
+  # Gilt fuer beide Zweige oben (wiederverwendet UND frisch angelegt) — auch ein
+  # laenger schon bestehender Worktree soll app/node_modules bekommen, sobald
+  # der Hauptbaum eines hat, ohne dass jemand ihn erst loeschen und neu anlegen
+  # muss. Baut nichts an, wenn schon etwas unter app/node_modules liegt.
+  link_app_node_modules "$repo" "$wtpath"
+
+  # Zeigte der Auftrag auf einen UNTERordner des Repos, laeuft der Worker auch im
+  # Worktree in genau diesem Unterordner — sonst faende er seine Dateien nicht.
+  local rel="${dir#$top}"; rel="${rel#/}"
+  if [ -n "$rel" ] && [ -d "$wtpath/$rel" ]; then
+    printf '%s\n' "$wtpath/$rel"
+  else
+    [ -n "$rel" ] && say "Hinweis: '$rel' gibt es im Worktree nicht (unversioniert?) — '$name' startet in $wtpath."
+    printf '%s\n' "$wtpath"
+  fi
+  return 0
+}
+
+# --- Zustand ---------------------------------------------------------------
+# Zwei getrennte Fragen, beide muessen mit NEIN beantwortet sein, bevor etwas
+# entfernt wird: liegt unbeachtete Arbeit im Baum, und traegt der Zweig Commits,
+# die anderswo noch nirgends stehen.
+dirty_lines() { # dirty_lines <worktree>
+  git -C "$1" status --porcelain --untracked-files=all 2>/dev/null
+}
+
+unmerged_count() { # unmerged_count <repo> <branch> <base> <basecommit>
+  local repo="$1" branch="$2" base="$3" basecommit="$4" ref=""
+  git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" || { printf '0'; return; }
+  if [ -n "$base" ] && git -C "$repo" show-ref --verify --quiet "refs/heads/$base"; then
+    ref="$base"
+  elif [ -n "$basecommit" ] && git -C "$repo" cat-file -e "$basecommit^{commit}" 2>/dev/null; then
+    # Basiszweig ist weg (umbenannt, geloescht): dann zaehlt der Stand, aus dem
+    # der Worktree entstanden ist. Konservativ — nach einer Uebernahme in einen
+    # ANDEREN Zweig meldet das weiterhin Commits, und lieber verweigern wir
+    # einmal zu oft, als Arbeit wegzuwerfen.
+    ref="$basecommit"
+  else
+    printf '99'; return   # nichts vergleichbar: gilt als "nicht uebernommen"
+  fi
+  git -C "$repo" rev-list --count "$ref..$branch" 2>/dev/null || printf '0'
+}
+
+load_meta() { # load_meta <worker> -> setzt MW_* ; 1 = kein Merkzettel
+  MW_NAME="$1"
+  MW_REPO="$(meta_get "$1" repo)" || return 1
+  MW_WT="$(meta_get "$1" worktree)"
+  MW_BRANCH="$(meta_get "$1" branch)"
+  MW_BASE="$(meta_get "$1" base)"
+  MW_BASECOMMIT="$(meta_get "$1" basecommit)"
+  [ -n "$MW_REPO" ] && [ -n "$MW_WT" ] || return 1
+  return 0
+}
+
+cmd_check() {
+  local name="${1:?worker}"
+  load_meta "$name" || { say "kein Worktree fuer '$name' vermerkt."; return 1; }
+  local d n
+  if [ ! -d "$MW_WT" ]; then
+    # Verzeichnis weg (von Hand geloescht): der ZWEIG kann trotzdem noch Arbeit
+    # tragen, und die zaehlt genauso.
+    say "Worktree-Verzeichnis $MW_WT ist nicht mehr da."
+    n="$(unmerged_count "$MW_REPO" "$MW_BRANCH" "$MW_BASE" "$MW_BASECOMMIT")"
+    if [ "${n:-0}" -gt 0 ]; then
+      say "'$name' hat aber $n Commit(s) auf $MW_BRANCH, die ${MW_BASE:-die Basis} nicht enthaelt."
+      return 3
+    fi
+    return 0
+  fi
+  d="$(dirty_lines "$MW_WT")"
+  n="$(unmerged_count "$MW_REPO" "$MW_BRANCH" "$MW_BASE" "$MW_BASECOMMIT")"
+  if [ -n "$d" ]; then
+    say "'$name' hat unbeachtete Aenderungen in $MW_WT:"
+    printf '%s\n' "$d" | head -20 >&2
+    [ "$(printf '%s\n' "$d" | wc -l | tr -d ' ')" -gt 20 ] && say "  … (gekuerzt)"
+    return 3
+  fi
+  if [ "${n:-0}" -gt 0 ]; then
+    say "'$name' hat $n Commit(s) auf $MW_BRANCH, die ${MW_BASE:-die Basis} nicht enthaelt."
+    return 3
+  fi
+  return 0
+}
+
+cmd_path() {
+  local name="${1:?worker}"
+  load_meta "$name" || return 1
+  [ -d "$MW_WT" ] || return 1
+  printf '%s\n' "$MW_WT"
+}
+
+# --- remove ----------------------------------------------------------------
+cmd_remove() {
+  local name="" force=0 a
+  for a in "$@"; do
+    case "$a" in
+      --force) force=1 ;;
+      -*) say "unbekannte Option '$a'"; return 1 ;;
+      *) [ -z "$name" ] && name="$a" ;;
+    esac
+  done
+  [ -n "$name" ] || { say "remove braucht <worker>."; return 1; }
+  load_meta "$name" || { say "kein Worktree fuer '$name' vermerkt — nichts zu tun."; return 1; }
+
+  local rc=0
+  cmd_check "$name" || rc=$?
+  if [ "$rc" -eq 3 ] && [ "$force" -eq 0 ]; then
+    say "BEHALTEN — $MW_WT wird NICHT entfernt, es steht Arbeit darin."
+    say "  ansehen:    wb-worktree diff $name"
+    say "  uebernehmen: wb-worktree adopt $name"
+    say "  wegwerfen:  wb-worktree remove $name --force   (legt vorher eine Kopie unter ~/.local/trash-snapshots/ an)"
+    return 3
+  fi
+
+  if [ "$force" -eq 1 ] && [ "$rc" -eq 3 ] && [ -d "$MW_WT" ]; then
+    # Hausregel: vor dem Ueberschreiben/Loeschen nicht-trivialer Daten eine Kopie.
+    local snap="$HOME/.local/trash-snapshots/$(date +%F)-worktree-$name"
+    mkdir -p "$snap" 2>/dev/null
+    if cp -R "$MW_WT" "$snap/" 2>/dev/null; then
+      say "Sicherungskopie: $snap/$(basename "$MW_WT")"
+    else
+      say "ABBRUCH — Sicherungskopie nach $snap ist fehlgeschlagen; es wird nichts entfernt."
+      return 1
+    fi
+  fi
+
+  # DIE GEFAEHRLICHE STELLE (siehe Kopfkommentar): $MW_WT geht hier OHNE
+  # angehaengtes "/" in `git worktree remove` -- mit einem Schraegstrich am
+  # Ende wuerde ein enthaltener Symlink (app/node_modules, siehe
+  # link_app_node_modules oben) nicht als Verweis geloescht, sondern es wuerde
+  # IHM GEFOLGT und im Hauptbaum aufgeraeumt. Diese Zeile nie mit "$MW_WT/" statt
+  # "$MW_WT" aendern.
+  local out grc=0
+  if [ -d "$MW_WT" ]; then
+    if [ "$force" -eq 1 ]; then
+      out="$(git -C "$MW_REPO" worktree remove --force "$MW_WT" 2>&1)" || grc=$?
+    else
+      out="$(git -C "$MW_REPO" worktree remove "$MW_WT" 2>&1)" || grc=$?
+    fi
+    if [ "$grc" -ne 0 ]; then
+      say "git worktree remove fehlgeschlagen: $(printf '%s' "$out" | tr '\n' ' ') — nichts entfernt."
+      return 1
+    fi
+  else
+    git -C "$MW_REPO" worktree prune >/dev/null 2>&1
+  fi
+
+  # Zweig nur loeschen, wenn git ihn selbst fuer vollstaendig zusammengefuehrt
+  # haelt ('-d', nie '-D'). Mit --force bleibt er IMMER stehen: er ist dann das
+  # Einzige, was die Commits noch traegt.
+  if [ "$force" -eq 0 ] && [ -n "$MW_BRANCH" ]; then
+    if git -C "$MW_REPO" branch -d "$MW_BRANCH" >/dev/null 2>&1; then
+      say "entfernt: $MW_WT (Zweig $MW_BRANCH geloescht)"
+    else
+      say "entfernt: $MW_WT (Zweig $MW_BRANCH bleibt stehen)"
+    fi
+  else
+    say "entfernt: $MW_WT (Zweig $MW_BRANCH bleibt stehen)"
+  fi
+  rm -f "$(meta_file "$name")"
+  return 0
+}
+
+# --- adopt -----------------------------------------------------------------
+# ENTSCHEIDUNG Merge statt Cherry-Pick: ein Merge ist wiederholbar (ein zweiter
+# Aufruf sagt "Already up to date", ein zweiter Cherry-Pick erzeugt Konflikte mit
+# sich selbst), er haelt fest, WOHER die Arbeit kam, und er kommt auch mit einem
+# Worker zurecht, der gar nicht oder unsauber committet hat — dessen Arbeitsstand
+# wird vorher auf dem Worker-Zweig gesichert, danach ist der Zweig der eine
+# Traeger. Cherry-Pick brauchte eine Commit-Auswahl, die niemand kennt, und
+# verdoppelt Commits.
+cmd_adopt() {
+  local name="" docommit=0 a
+  for a in "$@"; do
+    case "$a" in
+      --commit) docommit=1 ;;
+      -*) say "unbekannte Option '$a'"; return 1 ;;
+      *) [ -z "$name" ] && name="$a" ;;
+    esac
+  done
+  [ -n "$name" ] || { say "adopt braucht <worker>."; return 1; }
+  load_meta "$name" || { say "kein Worktree fuer '$name' vermerkt."; return 1; }
+
+  if [ -d "$MW_WT" ] && [ -n "$(dirty_lines "$MW_WT")" ]; then
+    # Erst sichern, dann uebernehmen: ein nicht committeter Stand kann sonst gar
+    # nicht in den Hauptbaum wandern.
+    local out crc=0
+    out="$(git -C "$MW_WT" add -A 2>&1 && git -C "$MW_WT" commit -q -m "wb-worktree: Arbeitsstand von $name" 2>&1)" || crc=$?
+    if [ "$crc" -ne 0 ]; then
+      say "der Arbeitsstand von '$name' liess sich nicht committen: $(printf '%s' "$out" | tr '\n' ' ')"
+      say "  Es wurde nichts uebernommen und nichts entfernt."
+      return 1
+    fi
+    say "Arbeitsstand von '$name' auf $MW_BRANCH gesichert."
+  fi
+
+  local target out rc
+  target="$(git -C "$MW_REPO" symbolic-ref --quiet --short HEAD 2>/dev/null || printf 'HEAD')"
+  if [ "$docommit" -eq 1 ]; then
+    out="$(git -C "$MW_REPO" merge --no-ff -m "Merge worker $name ($MW_BRANCH)" "$MW_BRANCH" 2>&1)"; rc=$?
+  else
+    out="$(git -C "$MW_REPO" merge --no-ff --no-commit "$MW_BRANCH" 2>&1)"; rc=$?
+  fi
+  printf '%s\n' "$out" >&2
+  if [ "$rc" -ne 0 ]; then
+    say "Merge von $MW_BRANCH nach $target ist NICHT durchgelaufen — im Hauptbaum ist nichts kaputt."
+    say "  Zustand ansehen: git -C $MW_REPO status ; abbrechen: git -C $MW_REPO merge --abort"
+    return 1
+  fi
+  if [ "$docommit" -eq 1 ]; then
+    say "'$name' ist in $target gemerged (Merge-Commit angelegt)."
+  else
+    say "'$name' liegt in $target bereit, NICHT committet — pruefen: git -C $MW_REPO diff --cached"
+    say "  committen: git -C $MW_REPO commit ; verwerfen: git -C $MW_REPO merge --abort"
+  fi
+  say "Danach aufraeumen: wb-worktree remove $name"
+  return 0
+}
+
+# --- diff / list -----------------------------------------------------------
+cmd_diff() {
+  local name="${1:?worker}"
+  load_meta "$name" || { say "kein Worktree fuer '$name' vermerkt."; return 1; }
+  printf 'Worker %s — Zweig %s, Worktree %s\n\n' "$name" "$MW_BRANCH" "$MW_WT"
+  printf -- '-- Commits gegenueber %s --\n' "${MW_BASE:-Basis}"
+  git -C "$MW_REPO" log --oneline "${MW_BASE:-$MW_BASECOMMIT}..$MW_BRANCH" 2>/dev/null || true
+  if [ -d "$MW_WT" ]; then
+    printf -- '\n-- Unbeachtete Aenderungen im Worktree --\n'
+    git -C "$MW_WT" status --short --untracked-files=all 2>/dev/null || true
+    printf -- '\n-- Umfang --\n'
+    git -C "$MW_WT" diff --stat 2>/dev/null || true
+  fi
+}
+
+cmd_list() {
+  printf '%-16s %-14s %-9s %-6s %s\n' WORKER ZWEIG ZUSTAND COMMITS WORKTREE
+  [ -d "$METADIR" ] || return 0
+  local f name state n
+  for f in "$METADIR"/*; do
+    [ -f "$f" ] || continue
+    name="$(basename "$f")"
+    load_meta "$name" || continue
+    if [ ! -d "$MW_WT" ]; then state="fehlt"
+    elif [ -n "$(dirty_lines "$MW_WT")" ]; then state="schmutzig"
+    else state="sauber"; fi
+    n="$(unmerged_count "$MW_REPO" "$MW_BRANCH" "$MW_BASE" "$MW_BASECOMMIT")"
+    printf '%-16s %-14s %-9s %-6s %s\n' "$name" "$MW_BRANCH" "$state" "${n:-0}" "$MW_WT"
+  done
+}
+
+case "${1:-}" in
+  ensure) shift; cmd_ensure "$@" ;;
+  path)   shift; cmd_path   "$@" ;;
+  check)  shift; cmd_check  "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  adopt)  shift; cmd_adopt  "$@" ;;
+  diff)   shift; cmd_diff   "$@" ;;
+  list)   shift; cmd_list   "$@" ;;
+  ''|-h|--help|help) usage; exit 1 ;;
+  *) say "unbekannter Unterbefehl '$1'"; usage; exit 1 ;;
+esac

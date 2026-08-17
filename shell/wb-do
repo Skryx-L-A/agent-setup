@@ -1,0 +1,155 @@
+#!/bin/bash
+# wb-do — einen Worker starten, ohne darueber nachdenken zu muessen.
+#
+#   wb-do [--modell <id[:effort]>] [--dir <verzeichnis>] [--on <mac|peer>] <name> <auftrag...>
+#
+# Warum es das gibt (2026-08-07): `claude-worker <name> <modell>[:effort] <dir>
+# <auftrag>` verlangt bei JEDEM Start drei Entscheidungen, die fast immer
+# dieselben sind. Sie stehen laengst in den Einstellungen (`workerModel`,
+# `workerEffort`) und in der Routing-Tabelle der Registry. `wb-do` nimmt sie von
+# dort und laesst das Verzeichnis das sein, in dem man ohnehin steht.
+#
+# Es baut NICHTS nach: der Start selbst geht durch `claude-worker` bzw.
+# `pi-worker`, samt allem, was dort haengt -- Deckel auf den Effort,
+# maxWorkers, Worktree-Isolierung, Sichtbarkeitswarnung, Zustellpruefung.
+# Die Modell- und Effort-Aufloesung macht `pi-worker` ueber `wb-state models
+# effort`; hier wird kein Wert zum zweiten Mal ausgerechnet.
+#
+# Und es sorgt dafuer, dass der EREIGNISSTROM bekannt ist: laeuft fuer diese
+# Session kein `wb-ereignisse`, sagt es das laut auf stderr, mit dem genauen
+# Befehl zum Starten. Der Start wird deswegen nicht verweigert -- aber ein
+# vergessener Beobachter darf nicht still bleiben, sonst merkt niemand, dass die
+# Fertigmeldung dieses Workers nirgends ankommen wird.
+set -u
+
+BIN="$HOME/.local/bin"
+HIER="$(cd "$(dirname "$0")" && pwd)"
+WBSTATE="$BIN/wb-state";       [ -x "$WBSTATE" ]   || WBSTATE="$HIER/wb-state"
+CWORKER="$BIN/claude-worker";  [ -x "$CWORKER" ]   || CWORKER="$HIER/claude-worker"
+PWORKER="$BIN/pi-worker";      [ -x "$PWORKER" ]   || PWORKER="$HIER/pi-worker"
+EREIGNIS="$BIN/wb-ereignisse"; [ -x "$EREIGNIS" ]  || EREIGNIS="$HIER/wb-ereignisse"
+STATE_BASE="$HOME/.local/state/wb-ereignisse"
+
+usage() {
+    cat <<'EOF'
+wb-do — einen Worker starten, Modell und Effort aus den Einstellungen.
+
+  wb-do [--modell <id[:effort]>] [--dir <verzeichnis>] [--on <mac|peer>] <name> <auftrag...>
+
+  --modell   Modell (und optional Effort) ausdruecklich, z. B. sonnet5:xhigh.
+             Ohne Angabe: workerModel/workerEffort aus den Einstellungen.
+  --dir      Arbeitsverzeichnis. Ohne Angabe: das aktuelle.
+  --on       Auf der anderen Maschine starten (wie bei claude-worker/pi-worker).
+
+Beispiel:  wb-do pruefer "Lies shell/wb-do und melde, was fehlt."
+EOF
+}
+
+MODELL=""; DIR=""; ONMACH=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --modell|--model) MODELL="${2:?--modell erwartet ein Modell}"; shift 2 ;;
+        --dir)            DIR="${2:?--dir erwartet ein Verzeichnis}"; shift 2 ;;
+        --on)             ONMACH="${2:?--on erwartet mac|peer}"; shift 2 ;;
+        -h|--help|--hilfe) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) echo "wb-do: unbekannte Option '$1'" >&2; usage >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+
+NAME="${1:-}"; [ $# -ge 1 ] && shift
+if [ -z "$NAME" ] || [ $# -eq 0 ]; then
+    echo "wb-do: Name und Auftrag fehlen." >&2
+    usage >&2
+    exit 2
+fi
+# Derselbe Namensraum wie in pi-worker: aus dem Namen werden Pfade unter
+# ~/.pi-workers/ gebaut. Hier abgefangen, damit die Meldung schon vor dem
+# Ereignisstrom-Hinweis kommt und nicht mittendrin.
+case "$NAME" in
+    ''|-*|*[!A-Za-z0-9_-]*)
+        echo "wb-do: unzulaessiger Worker-Name '$NAME' — erlaubt sind Buchstaben, Ziffern, '-' und '_'." >&2
+        exit 2 ;;
+esac
+
+[ -n "$DIR" ] || DIR="$PWD"
+if [ ! -d "$DIR" ]; then
+    echo "wb-do: Verzeichnis '$DIR' gibt es nicht." >&2
+    exit 2
+fi
+
+# ------------------------------------------------------- laeuft der Ereignisstrom?
+
+# Dieselbe Slug-Bildung wie in wb-ereignisse (Socketpfad UND Basis-Sessionname),
+# damit hier wirklich der Beobachter DIESER Session gesucht wird und nicht der
+# einer gleichnamigen Session auf einem anderen tmux-Server.
+base_session_name() {
+    local pane="$1" sess grp
+    sess=$(tmux display -p -t "$pane" '#{session_name}' 2>/dev/null)
+    grp=$(tmux display -p -t "$pane" '#{session_group}' 2>/dev/null)
+    printf '%s' "${grp:-$sess}"
+}
+
+ereignisstrom_pruefen() {
+    local sess pane sockpfad slug pid
+    sess="${WB_SESSION:-}"
+    if [ -z "$sess" ]; then
+        pane=$(tmux display -p '#{pane_id}' 2>/dev/null || true)
+        [ -n "$pane" ] && sess="$(base_session_name "$pane")"
+    fi
+    # Ohne tmux gibt es keine Session, fuer die ein Strom laufen koennte. Dann
+    # steht der Aufruf ohnehin ausserhalb der Werkbank -- kein Hinweis, kein Laerm.
+    [ -n "$sess" ] || return 0
+    sockpfad=$(tmux display -p '#{socket_path}' 2>/dev/null || true)
+    slug="$(printf '%s|%s' "${sockpfad:-kein-socket}" "$sess" | tr -c 'a-zA-Z0-9' '-')"
+    pid=$(cat "$STATE_BASE/$slug/pid" 2>/dev/null)
+    case "$pid" in
+        ''|*[!0-9]*) pid="" ;;
+        *) kill -0 "$pid" 2>/dev/null || pid="" ;;
+    esac
+    [ -n "$pid" ] && return 0
+    {
+        echo "WARNUNG: Fuer die Session '$sess' laeuft KEIN Ereignisstrom."
+        echo "         Ohne ihn meldet niemand, wenn '$NAME' fertig ist, eine Freigabe braucht,"
+        echo "         stillsteht oder verschwindet. So starten (als HINTERGRUNDBEFEHL, damit"
+        echo "         seine Zeilen als Benachrichtigung ankommen):"
+        echo
+        echo "           $EREIGNIS --session $sess"
+        echo
+    } >&2
+}
+ereignisstrom_pruefen
+
+# ------------------------------------------------------------------ Start
+
+# Ohne --modell: 'default' -- pi-worker liest dann workerModel/workerEffort aus
+# den Einstellungen. Diese Aufloesung steht dort und wird hier NICHT wiederholt;
+# eine zweite Stelle mit derselben Regel ist ein Widerspruch in Wartestellung.
+[ -n "$MODELL" ] || MODELL=default
+
+# Welches Werkzeug? Die Registry sagt, an welchem Harness ein Modell haengt.
+# Steht das Modell nicht darin (die eingebauten Kurznamen tun das nicht), fallen
+# die bekannten pi-Kurznamen an pi-worker, alles andere an claude-worker -- das
+# reicht die Registry-Namen ohnehin unveraendert an pi-worker weiter.
+WERKZEUG="$CWORKER"
+BASE="${MODELL%%:*}"
+case "$BASE" in
+    qwen|ornith|ornith9) WERKZEUG="$PWORKER" ;;
+    default|-|haiku45|sonnet5|opus5|opus48|fable5|haiku|sonnet|opus|fable) ;;
+    *)
+        HARNESS=$("$WBSTATE" models get "$BASE" --field harness 2>/dev/null)
+        [ "$HARNESS" = pi ] && WERKZEUG="$PWORKER"
+        ;;
+esac
+
+# `--on` steht bei beiden Werkzeugen ganz vorne, danach die drei Pflichtangaben
+# und der Auftragstext. Kein Array: unter `set -u` bricht bash 3.2 (macOS) an
+# einem leeren `"${ARGS[@]}"` ab.
+if [ -n "$ONMACH" ]; then
+    set -- --on "$ONMACH" "$NAME" "$MODELL" "$DIR" "$@"
+else
+    set -- "$NAME" "$MODELL" "$DIR" "$@"
+fi
+
+exec "$WERKZEUG" "$@"

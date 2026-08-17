@@ -1,0 +1,30 @@
+# Kimi CLI — Workbench-Konfiguration (angelegt 2026-08-08 beim Einbau des Harness).
+# Kimi loest Modelle NUR ueber diese Datei auf: `-m <schluessel>` meint den Schluessel
+# aus [models.<schluessel>], nicht den Namen des Modells beim Anbieter. Die modelRef der
+# Registry-Eintraege (kimi-ornith-9b, kimi-qwen3-1-7b) sind genau diese Schluessel.
+# Kein Schluesselmaterial in dieser Datei: der lokale Weg braucht keinen, api_key traegt
+# nur einen Platzhalter, weil das Feld laut Doku gesetzt sein muss.
+#
+# NICHT INSTALLIERT: gehoert nicht nach ~/.local/bin -- diese Vorlage wird per Definition
+# nach ~/.kimi/config.toml kopiert (wb-harness-config, Eintrag 'kimi'). TOML-Kommentare
+# sind Teil der Sprache (# ueberall erlaubt), diese Zeile aendert am ausgerollten Verhalten
+# nichts.
+default_model = "ollama-ornith-9b"
+default_thinking = false
+default_yolo = false
+telemetry = false
+
+[providers.ollama]
+type = "openai_legacy"
+base_url = "{baseUrl:ollama}/v1"
+api_key = "ollama"
+
+[models.ollama-ornith-9b]
+provider = "ollama"
+model = "ornith:9b"
+max_context_size = 262144
+
+[models.ollama-qwen3-1-7b]
+provider = "ollama"
+model = "qwen3:1.7b"
+max_context_size = 262144

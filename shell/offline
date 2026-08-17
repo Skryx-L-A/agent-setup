@@ -1,0 +1,6 @@
+#!/bin/bash
+# Run any command in HuggingFace offline mode — no network checks, cache only.
+# Usage: offline mflux-generate-z-image-turbo --prompt "..." ...
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+exec "$@"

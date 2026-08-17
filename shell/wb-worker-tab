@@ -1,0 +1,186 @@
+#!/bin/bash
+# wb-worker-tab <session> [--window <name>] [--no-attach] — haengt den
+# Worker-Tab an die richtige tmux-Session an, oder sagt verstaendlich, warum es
+# keine gibt.
+#
+# --window (2026-08-04): welches Worker-Tab-Fenster gezeigt wird — 'workers'
+# (Default, unveraendertes Verhalten jedes bestehenden Aufrufers) oder
+# 'workers-2', 'workers-3', ... Das Fenster selbst legt dieses Werkzeug fuer
+# ein Ueberlauf-Fenster NICHT an — das ist wb-grids Job, sobald
+# maxWorkerPanesPerTab ueberschritten wird (siehe shell/wb-grid). Wer hier ein
+# noch nicht existierendes Ueberlauf-Fenster verlangt, bekommt eine Erklaerung
+# und faellt auf 'workers' zurueck, statt auf ein Fenster zu zeigen, das es
+# nicht gibt — Regel 2 dieser Aufgabe: kein Tab, der ins Leere zeigt.
+#
+# Warum das ein eigenes Werkzeug ist (2026-08-04): dieselbe Logik stand vorher als
+# zehnzeilige Shell-Kette IN der VS-Code-Extension (`workerViewCommand`). Dort war
+# sie nicht ausfuehrbar zu testen — man konnte nur pruefen, ob die Zeichenkette die
+# erwarteten Teilstuecke enthaelt, nicht, was sie auf einem echten tmux-Server tut.
+# Genau in diesem blinden Fleck sind in einer Nacht drei Fehler entstanden:
+#
+#   1. `tmux new-session -d -t <fehlende-Basis> -s X` SCHEITERT NICHT. tmux legt
+#      stattdessen eine neue, leere Session an, deren '#{session_group}' die
+#      ZEICHENKETTE '=wb-…' ist. So entstanden 'wb-LocalAI-d0220f-view' und
+#      'wb-myproject-87cd2f-4ba4b4-view': Sicht-Sessions ohne Basis, in denen nur
+#      eine leere Shell stand. Der Worker-Tab zeigte nichts, waehrend die Worker
+#      liefen.
+#   2. Aus einer Sicht wurde eine Sicht ('wb-a project-view-view-view'), weil der
+#      Tab-Befehl mit dem Namen der SICHT statt dem der Basis lief.
+#   3. Ein gespeicherter Session-Schluessel ueberlebt seine tmux-Session; der Tab
+#      wartete danach 30 Sekunden auf eine tote Session und baute dann Fall 1.
+#
+# Dagegen hier drei Regeln, jede einzeln in shell/tests/test-worker-tab.sh geprueft:
+#   * Der uebergebene Name wird IMMER erst auf seine Basis normalisiert — ein
+#     '-view'-Suffix (auch mehrfach) faellt weg, bevor irgendetwas passiert.
+#   * Vor jedem 'new-session -t' wird die Existenz der Basis geprueft, und nach dem
+#     Anlegen wird die Gruppe kontrolliert: faengt sie mit '=' an, ist Fall 1
+#     eingetreten — die Streu-Session wird sofort wieder entfernt.
+#   * Gibt es die Basis nach der Wartezeit nicht, wird die neueste LAUFENDE Session
+#     desselben Ordners genommen; gibt es auch die nicht, endet der Tab in einer
+#     benutzbaren Shell MIT Erklaerung statt in einer stummen leeren.
+#
+# --no-attach richtet alles ein, haengt sich aber nicht an, und druckt
+# 'BASE=<name>' und 'VIEW=<name>'. Nur dafuer da, dass der Test dieselben Wege
+# geht wie der echte Tab, ohne einen Client zu binden.
+set -uo pipefail
+
+ATTACH=1
+SESSION=""
+WNAME="workers"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-attach) ATTACH=0; shift ;;
+    --window) WNAME="${2:?wb-worker-tab: --window braucht einen Namen}"; shift 2 ;;
+    --window=*) WNAME="${1#--window=}"; shift ;;
+    -h|--help) sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "wb-worker-tab: unbekannte Option '$1'" >&2; exit 1 ;;
+    *) SESSION="$1"; shift ;;
+  esac
+done
+[ -n "$SESSION" ] || { echo "usage: wb-worker-tab <session> [--window <name>] [--no-attach]" >&2; exit 1; }
+case "$WNAME" in
+  workers|workers-[0-9]*) ;;
+  *) echo "wb-worker-tab: unerwarteter Fenstername '$WNAME' (erwartet 'workers' oder 'workers-<N>')." >&2; exit 1 ;;
+esac
+
+# Wie lange auf die Basis-Session gewartet wird. wb-code braucht einen Moment, bis
+# es sie angelegt hat; laenger zu warten hilft nicht, sondern verlaengert nur die
+# Zeit, in der der Tab leer aussieht.
+WAIT_S="${WB_WORKER_TAB_WAIT:-30}"
+BIN="$HOME/.local/bin"
+
+# Eine Sicht ist nie die Basis einer weiteren Sicht: '-view' faellt weg, so oft es
+# vorkommt. 'wb-X-view-view' -> 'wb-X'.
+base_name() {
+  local s="$1"
+  while [ "${s%-view}" != "$s" ]; do s="${s%-view}"; done
+  printf '%s' "$s"
+}
+
+# Der Teil des Sessionnamens, der den ORDNER bezeichnet: 'wb-AI-b310aa-e8d13f' ->
+# 'wb-AI'. Ein 6-stelliger Hex-Teil ab der dritten Stelle ist ein Pfad-Hash oder ein
+# Session-Schluessel, alles davor gehoert zum Ordnernamen. Muss zu sessionPrefix()
+# in extension/src/terminal.ts passen.
+folder_prefix() {
+  printf '%s' "$1" | awk -F- '{
+    out=""; n=0
+    for (i = 1; i <= NF; i++) {
+      if (n >= 2 && $i ~ /^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/) break
+      out = (n == 0 ? $i : out "-" $i); n++
+    }
+    print out
+  }'
+}
+
+# Neueste laufende Session desselben Ordners. Ausgeschlossen sind Sichten (sonst
+# entstuende eine Sicht auf eine Sicht) und Streu-Sessions, deren Gruppe mit '='
+# beginnt (Fall 1 — die haben selbst keine Basis und taugen nicht als eine).
+newest_of_folder() {
+  local p="$1"
+  tmux list-sessions -F '#{session_created} #{session_name} #{session_group}' 2>/dev/null \
+  | sort -rn \
+  | awk -v p="$p" '
+      { n = $2; g = $3 }
+      n ~ /-view$/ { next }
+      substr(g, 1, 1) == "=" { next }
+      n == p || index(n, p "-") == 1 { print n; exit }'
+}
+
+BASE="$(base_name "$SESSION")"
+
+# Warten, aber begrenzt: die Basis kann gerade erst entstehen.
+i=0
+while [ "$i" -lt "$WAIT_S" ]; do
+  tmux has-session -t "=$BASE" 2>/dev/null && break
+  i=$((i + 1))
+  sleep 1
+done
+
+if ! tmux has-session -t "=$BASE" 2>/dev/null; then
+  ALT="$(newest_of_folder "$(folder_prefix "$BASE")")"
+  if [ -n "$ALT" ]; then
+    echo "wb-worker-tab: '$BASE' laeuft nicht mehr — haenge stattdessen an '$ALT' (neueste Session dieses Ordners)."
+    BASE="$ALT"
+  fi
+fi
+
+if ! tmux has-session -t "=$BASE" 2>/dev/null; then
+  echo "wb-worker-tab: keine laufende tmux-Session fuer diesen Ordner."
+  echo "  Der Worker-Tab bleibt leer, bis eine Session laeuft — starten mit: wb-code <ordner>"
+  [ "$ATTACH" -eq 1 ] || { echo "BASE="; echo "VIEW="; exit 0; }
+  exec "${SHELL:-/bin/bash}"
+fi
+
+VIEW="$BASE-view"
+
+# Das 'workers'-Fenster MUSS vor der Sicht da sein: Sessions einer Gruppe teilen
+# ihre Fenster einschliesslich deren Zerstoerung, eine Gruppe mit nur dem
+# Orchestrator-Fenster stirbt also ganz, wenn dieses Fenster zugeht (gemessen
+# 2026-07-25).
+[ -x "$BIN/wb-workers-window" ] && "$BIN/wb-workers-window" "$BASE" >/dev/null 2>&1
+
+if ! tmux has-session -t "=$VIEW" 2>/dev/null; then
+  # Die Existenzpruefung unmittelbar davor ist der Kern: ohne sie legt tmux eine
+  # Streu-Session an, statt zu scheitern.
+  if tmux has-session -t "=$BASE" 2>/dev/null; then
+    tmux new-session -d -t "=$BASE" -s "$VIEW" 2>/dev/null
+  fi
+fi
+
+# Nachkontrolle: eine Sicht, deren Gruppe mit '=' beginnt, haengt an einer
+# Zeichenkette statt an einer Session — genau der Befund vom 04.08. Sie wird sofort
+# entfernt, sonst bleibt sie als leere Shell im Grid stehen.
+GRP="$(tmux list-sessions -F '#{session_name}|#{session_group}' 2>/dev/null \
+       | awk -F'|' -v v="$VIEW" '$1==v{print $2; exit}')"
+case "${GRP:-}" in
+  =*)
+    echo "wb-worker-tab: '$VIEW' war an die Zeichenkette '$GRP' geknuepft statt an eine Session — wird entfernt." >&2
+    tmux kill-session -t "=$VIEW" 2>/dev/null
+    ;;
+esac
+
+if ! tmux has-session -t "=$VIEW" 2>/dev/null; then
+  echo "wb-worker-tab: Sicht '$VIEW' liess sich nicht anlegen — haenge direkt an '$BASE'." >&2
+  [ "$ATTACH" -eq 1 ] || { echo "BASE=$BASE"; echo "VIEW="; exit 0; }
+  exec tmux attach-session -t "=$BASE"
+fi
+
+# Ein Ueberlauf-Fenster ('workers-2', ...) wird hier NICHT angelegt — das ist
+# wb-grids Job. Verlangt jemand eines, das (noch) nicht existiert (Race
+# zwischen dem Poll der Extension und diesem Aufruf, oder ein veralteter
+# Aufrufer), faellt WNAME auf 'workers' zurueck statt auf ein leeres Fenster
+# zu zeigen: 'workers' existiert immer, siehe wb-workers-window oben.
+if [ "$WNAME" != workers ] \
+   && ! tmux list-windows -t "=$BASE" -F '#{window_name}' 2>/dev/null | grep -qx "$WNAME"; then
+  echo "wb-worker-tab: Fenster '$WNAME' gibt es (noch) nicht in '$BASE' — zeige stattdessen 'workers'." >&2
+  WNAME=workers
+fi
+
+# Best effort: fehlt das Fenster trotzdem, darf das den Attach nicht verhindern.
+tmux select-window -t "=$VIEW:$WNAME" 2>/dev/null
+
+if [ "$ATTACH" -eq 1 ]; then
+  exec tmux attach-session -t "=$VIEW"
+fi
+echo "BASE=$BASE"
+echo "VIEW=$VIEW"

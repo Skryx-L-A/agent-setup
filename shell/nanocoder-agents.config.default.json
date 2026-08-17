@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Gehoert nach ~/.config/nanocoder/agents.config.json (das Verzeichnis setzt der",
+    "Harness-Eintrag 'nanocoder' ueber NANOCODER_CONFIG_DIR).",
+    "",
+    "WOZU: Nanocoder haengt AGENTS.md aus dem Arbeitsverzeichnis nur dann an den",
+    "Systemprompt, wenn sein Tune-Profil nicht 'nano' ist -- und das Profil waehlt es",
+    "selbst anhand der Modellgroesse im Namen (bis 4B 'nano'). Gemessen 2026-08-08:",
+    "mit ornith:9b kam das Kennwort aus AGENTS.md zurueck, mit qwen3:1.7b nicht.",
+    "Der Weg hier haengt nicht am Profil und greift fuer jedes Modell.",
+    "",
+    "Der relative Pfad wird gegen das Arbeitsverzeichnis des Panes aufgeloest, also",
+    "je Worker gegen dessen eigene AGENTS.md. mode 'append' laesst den eingebauten",
+    "Systemprompt stehen und haengt die Rolle dahinter; 'replace' wuerde die",
+    "Werkzeug-Anleitung der CLI wegwerfen.",
+    "",
+    "Die Datei ist fuer jedes Modell dieselbe und muss nie erzeugt werden -- gleiche",
+    "Bauart wie shell/crushrc.default und shell/kimi-config.default.toml.",
+    "",
+    "NICHT INSTALLIERT: gehoert nicht nach ~/.local/bin -- diese Vorlage wird per Definition",
+    "nach ~/.config/nanocoder/agents.config.json kopiert (siehe oben)."
+  ],
+  "nanocoder": {
+    "systemPrompt": {
+      "file": "AGENTS.md",
+      "mode": "append"
+    }
+  }
+}

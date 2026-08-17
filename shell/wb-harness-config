@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""wb-harness-config -- rollt die Konfigurationsdateien aus, ohne die ein Harness nicht startet.
+
+  wb-harness-config [status] [<harness-id> ...]   Bericht, aendert nichts (Vorgabe)
+  wb-harness-config check   [<harness-id> ...]    wie status, aber Exit 1 bei fehlender Pflichtdatei
+  wb-harness-config apply   [<harness-id> ...]    legt fehlende Dateien an, idempotent
+  wb-harness-config apply --force …               ueberschreibt auch eine abgewichene Datei
+  wb-harness-config --json                        derselbe Befund als JSON (fuer wb-doctor)
+
+WARUM ES DAS GIBT (2026-08-08). Zwei Harnesses brauchen eine Datei AUSSERHALB des Repos,
+sonst startet ihr Worker nicht: crush bleibt ohne ~/.config/crush/crushrc im Modellwaehler
+stehen (der Spawn scheitert nach 60 s), und kimi loest ohne ~/.kimi/config.toml kein Modell
+auf. Bis heute stand diese Voraussetzung nur in `notes` und in einer Ergebnisdatei. Wer die
+Werkbank auf einer neuen Maschine aufsetzt, erfaehrt sie nicht -- auf peer war sie nur
+deshalb richtig, weil der Nutzer sie von Hand nachgezogen hat. Eine Startbedingung, die man
+nur aus einer Fussnote lernt, ist keine.
+
+Die Bedingung steht jetzt im Vertrag: `configFiles` im Harness-Eintrag (SPEC-V3-MODELS A.2)
+nennt Quelle, Ziel und Grund. Dieses Werkzeug legt die Dateien an ihren Platz, `wb-doctor`
+und `wb-state models check` melden eine fehlende, und `wb-state models resolve` verweigert
+den Spawn mit Klartext, statt ihn 60 Sekunden lang scheitern zu lassen.
+
+VIER FAELLE BEIM AUSROLLEN, und was jeder bedeutet:
+
+  FEHLT        am Ziel liegt nichts        -> kopieren. Nichts zu sichern.
+  GLEICH       Ziel == Quelle              -> nichts tun. Genau das macht `apply` idempotent.
+  VERALTET     Ziel == zuletzt ausgerollt  -> die Quelle hat sich geaendert, der Nutzer hat
+               (aber != Quelle)               die Datei nicht angefasst. Sichern, dann kopieren.
+  ABGEWICHEN   Ziel != Quelle und          -> NICHT anfassen, melden. Diesen Inhalt hat nie
+               != zuletzt ausgerollt          ein Ausrollen hinterlassen; er stammt vom Nutzer
+                                              oder vom Werkzeug selbst.
+
+Woher "zuletzt ausgerollt" kommt: aus ~/.local/state/wb-harness-config.json, wo jeder
+Kopiervorgang die Pruefsumme dessen hinterlaesst, was er geschrieben hat. Ohne diesen
+Merkposten liesse sich "der Nutzer hat es angepasst" von "die Quelle ist neuer" nicht
+unterscheiden, und ein Werkzeug, das beides verwechselt, ueberschreibt fremde Arbeit.
+
+WARUM ABGEWICHEN NICHT GEFRAGT, SONDERN GEMELDET WIRD (Entscheidung 2026-08-08). Der
+Auftrag liess die Wahl zwischen fragen, lassen-und-melden oder gegen den letzten Stand
+vergleichen. Gefragt wird nicht: dieses Werkzeug laeuft aus `wb-doctor`, aus einem
+Worker-Pane und aus einem Wartungslauf, und in keinem davon liest jemand eine Rueckfrage
+(Hausregel: nie fragen, nie warten). Der Vergleich gegen den zuletzt ausgerollten Stand
+loest den haeufigen Fall -- eine geaenderte Vorlage auf einer unberuehrten Datei -- ohne
+jedes Zutun; er bleibt oben stehen. Uebrig bleibt der Fall, in dem wirklich fremder Inhalt
+am Ziel liegt, und da ist Stehenlassen die einzige Antwort, die nichts vernichtet.
+`--force` ist der ausdrueckliche Ausweg und sichert vorher.
+
+GESICHERT WIRD IMMER, BEVOR ETWAS UEBERSCHRIEBEN WIRD: nach
+~/.local/trash-snapshots/<datum>-harness-config/<ziel-name>.<uhrzeit> (Hausregel: Snapshot
+vor destruktiven Operationen). Eine Datei, die nur angelegt wird, braucht keine Sicherung --
+da war nichts.
+
+QUELLENSUCHE. Die Vorlagen liegen im Repo unter `shell/` und werden wie jedes andere
+Werkzeug dorthin ausgerollt, wo `shell/` hingehoert: ~/.local/bin. Gesucht wird in dieser
+Reihenfolge: $WB_HARNESS_CONFIG_SRC (fuer Tests), das Verzeichnis dieses Skripts,
+~/.local/bin, ~/AI/claude-workbench/shell. Der erste Ort, an dem die Quelle liegt, gewinnt.
+"""
+
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+
+HOME = os.path.expanduser("~")
+MODELS_FILE = os.environ.get("WB_MODELS_FILE") or os.path.join(HOME, ".claude/workbench/models.json")
+STATE_FILE = os.path.join(HOME, ".local/state/wb-harness-config.json")
+SNAPSHOT_ROOT = os.path.join(HOME, ".local/trash-snapshots")
+SETTINGS_FILE = os.path.join(HOME, ".claude", "workbench", "settings.json")
+
+# Dieselbe Regel wie in shell/wb-state (ollama_baseurl) und app/src/main/einstellungen.ts
+# (ollamaEndpunkt): nur die FORM wird geprueft, ein leerer oder unsinniger Wert faellt
+# auf `fallback` zurueck statt eine kaputte Adresse auszuliefern. DIES HIER IST BEREITS
+# DIE DRITTE FASSUNG dieser Regel, absichtlich dupliziert statt importiert -- der Auftrag
+# verlangt Wiederverwendung, nicht Neuerfindung, aber ein direkter Import scheidet aus:
+# wb-state traegt seinen Python-Teil als Heredoc in einem Bash-Skript und ist kein
+# importierbares Modul, und app/src/main/einstellungen.ts ist TypeScript. Wer eine der
+# drei Fassungen aendert, aendert alle drei -- test-ollama-baseurl-paritaet.sh haelt sie
+# an denselben Eingaben zusammen.
+_OLLAMA_URL_RE = re.compile(r"^https?://[^\s/]+(/[^\s]*)?$")
+
+
+def read_setting(key, default):
+    try:
+        cfg = json.load(open(SETTINGS_FILE))
+        if isinstance(cfg, dict) and key in cfg and isinstance(cfg[key], type(default)):
+            return cfg[key]
+    except Exception:
+        pass
+    return default
+
+
+def ollama_baseurl(fallback):
+    roh = read_setting("ollamaEndpoint", "")
+    wert = roh.strip().rstrip("/") if isinstance(roh, str) else ""
+    if wert and _OLLAMA_URL_RE.match(wert):
+        return wert
+    return fallback
+
+
+def hp(p):
+    return os.path.expanduser(os.path.expandvars(p or ""))
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def source_roots():
+    """Wo die Vorlagen liegen duerfen, in der Reihenfolge, in der gesucht wird."""
+    roots = []
+    if os.environ.get("WB_HARNESS_CONFIG_SRC"):
+        roots.append(os.environ["WB_HARNESS_CONFIG_SRC"])
+    roots.append(os.path.dirname(os.path.abspath(__file__)))
+    roots.append(os.path.join(HOME, ".local/bin"))
+    roots.append(os.path.join(HOME, "AI/claude-workbench/shell"))
+    out = []
+    for r in roots:
+        r = hp(r)
+        if r not in out:
+            out.append(r)
+    return out
+
+
+def find_source(name):
+    for root in source_roots():
+        cand = os.path.join(root, name)
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def harnesses():
+    """Die Registry, mit derselben Fehlertoleranz wie ueberall: kaputte Datei ⇒ leer,
+    nie ein Absturz. Gelesen wird direkt, nicht ueber `wb-state harness get`: das
+    Unterkommando kennt nur EINEN Harness, und die Liste aller ist genau das, was hier
+    gebraucht wird."""
+    try:
+        data = json.load(open(MODELS_FILE))
+    except Exception:
+        return []
+    hs = data.get("harnesses")
+    return hs if isinstance(hs, list) else []
+
+
+def providers():
+    """Dieselbe Fehlertoleranz wie harnesses(): kaputte Datei ⇒ leer, nie ein Absturz."""
+    try:
+        data = json.load(open(MODELS_FILE))
+    except Exception:
+        return []
+    ps = data.get("providers")
+    return ps if isinstance(ps, list) else []
+
+
+def resolve_template(src):
+    """Liest eine Vorlage und loest {baseUrl:<provider>} auf -- dieselbe Ersetzung wie
+    in wb-state fuer die env-Platzhalter der Harness-Definitionen (dort mit demselben
+    Muster gegen PROVIDERS). Fuer 'ollama' greift ollama_baseurl() mit dem in der
+    Registry hinterlegten Wert als Rueckfallebene, damit eine Vorlage ohne gesetzten
+    ollamaEndpoint exakt die Auslieferung ausrollt. Eine Vorlage ohne Platzhalter kommt
+    byte-identisch zurueck.
+
+    Nur .json- und .toml-Vorlagen werden ueberhaupt angefasst: shell/crushrc.default
+    ERWAEHNT '{baseUrl:ollama}' woertlich in einem Bash-Kommentar (Dokumentation einer
+    ANDEREN Ersetzung, die wb-state auf harness.env anwendet, nicht auf diese Datei) --
+    eine reine Textersetzung ueber alle Vorlagen hinweg wuerde diesen Kommentar
+    veraendern, obwohl crushrc.default nie ausserhalb dieses Auftrags angefasst werden
+    sollte. Die Endungspruefung haelt jede Vorlage ausserhalb von cline/kimi exakt beim
+    alten Byte-Kopierverhalten."""
+    with open(src, "r", encoding="utf-8", newline="") as fh:
+        text = fh.read()
+    if not src.endswith((".json", ".toml")) or "{baseUrl:" not in text:
+        return text
+    for p in providers():
+        pid = p.get("id")
+        if not pid:
+            continue
+        bu = p.get("baseUrl") or ""
+        if pid == "ollama":
+            bu = ollama_baseurl(bu)
+        text = text.replace("{baseUrl:%s}" % pid, str(bu))
+    return text
+
+
+def read_state():
+    try:
+        data = json.load(open(STATE_FILE))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_state(state):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=2, ensure_ascii=False, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, STATE_FILE)
+
+
+def snapshot(target):
+    """Kopie nach ~/.local/trash-snapshots/<datum>-harness-config/, mit Uhrzeit im Namen,
+    damit zwei Laeufe am selben Tag einander nicht ueberschreiben."""
+    day = datetime.date.today().isoformat()
+    snapdir = os.path.join(SNAPSHOT_ROOT, "%s-harness-config" % day)
+    os.makedirs(snapdir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%H%M%S")
+    dest = os.path.join(snapdir, "%s.%s" % (os.path.basename(target), stamp))
+    shutil.copy2(target, dest)
+    return dest
+
+
+# ── Befund je Datei ────────────────────────────────────────────────────────────────
+def befund(hid, spec, state):
+    """Ein Eintrag aus configFiles, gegen die Wirklichkeit gehalten. Aendert nichts."""
+    name = (spec.get("source") or "").strip()
+    target = hp(spec.get("target") or "")
+    required = spec.get("required") is not False       # Vorgabe: Pflicht
+    r = {
+        "harness": hid,
+        "source": name,
+        "target": target,
+        "required": required,
+        "why": (spec.get("why") or "").strip(),
+        "sourcePath": None,
+        "status": None,
+        "detail": "",
+    }
+    if not name or not target:
+        r["status"] = "UNVOLLSTAENDIG"
+        r["detail"] = "configFiles-Eintrag ohne 'source' oder 'target'"
+        return r
+    src = find_source(name)
+    r["sourcePath"] = src
+    if not src:
+        r["status"] = "QUELLE-FEHLT"
+        r["detail"] = ("Vorlage '%s' liegt in keinem der gesuchten Verzeichnisse (%s)"
+                       % (name, ", ".join(source_roots())))
+        return r
+    if not os.path.exists(target):
+        r["status"] = "FEHLT"
+        r["detail"] = "am Ziel liegt nichts"
+        return r
+    tgt_hash = sha256(target)
+    # Verglichen wird gegen die AUFGELOESTE Vorlage, nicht gegen die rohe Datei im Repo:
+    # nach einer Ersetzung sind Ziel und rohe Vorlage zu Recht verschieden, und ein
+    # Vergleich gegen die rohe Fassung wuerde ein frisch ausgerolltes Ziel faelschlich
+    # als ABGEWICHEN melden.
+    if tgt_hash == hashlib.sha256(resolve_template(src).encode("utf-8")).hexdigest():
+        r["status"] = "GLEICH"
+        r["detail"] = "Ziel entspricht der Vorlage"
+        return r
+    letzte = (state.get(target) or {}).get("sha256")
+    if letzte and letzte == tgt_hash:
+        r["status"] = "VERALTET"
+        r["detail"] = "Ziel ist der zuletzt ausgerollte Stand, die Vorlage ist neuer"
+        return r
+    r["status"] = "ABGEWICHEN"
+    r["detail"] = ("Ziel weicht von der Vorlage ab und stammt aus keinem Ausrollen"
+                   + ("" if letzte else " (es ist ueberhaupt keins vermerkt)"))
+    return r
+
+
+def alle_befunde(nur=None):
+    state = read_state()
+    out = []
+    for h in harnesses():
+        hid = h.get("id") or "?"
+        if nur and hid not in nur:
+            continue
+        specs = h.get("configFiles")
+        if not isinstance(specs, list):
+            continue
+        for spec in specs:
+            if isinstance(spec, dict):
+                out.append(befund(hid, spec, state))
+    return out
+
+
+# ── Ausrollen ──────────────────────────────────────────────────────────────────────
+def apply_one(r, state, force):
+    """Kopiert, wo es richtig ist. Gibt (getan, zeile) zurueck."""
+    status, target, src = r["status"], r["target"], r["sourcePath"]
+    if status in ("GLEICH",):
+        # Auch hier den Merkposten setzen: eine von Hand richtig hingelegte Datei soll
+        # beim naechsten Vorlagenwechsel als 'veraltet' erkannt werden und nicht als
+        # 'abgewichen' stehenbleiben.
+        state[target] = {"sha256": sha256(target), "source": r["source"],
+                         "harness": r["harness"], "at": datetime.datetime.now().isoformat(timespec="seconds")}
+        return False, "unveraendert  %s" % target
+    if status in ("QUELLE-FEHLT", "UNVOLLSTAENDIG"):
+        return False, "NICHT MOEGLICH %s (%s)" % (target or r["source"], r["detail"])
+    if status == "ABGEWICHEN" and not force:
+        return False, ("STEHENGELASSEN %s -- %s. Uebernehmen: wb-harness-config apply "
+                       "--force %s (sichert vorher)" % (target, r["detail"], r["harness"]))
+    gesichert = ""
+    if os.path.exists(target):
+        gesichert = snapshot(target)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    aufgeloest = resolve_template(src)
+    with open(target, "w", encoding="utf-8", newline="") as fh:
+        fh.write(aufgeloest)
+    shutil.copymode(src, target)
+    state[target] = {"sha256": hashlib.sha256(aufgeloest.encode("utf-8")).hexdigest(), "source": r["source"],
+                     "harness": r["harness"], "at": datetime.datetime.now().isoformat(timespec="seconds")}
+    wort = {"FEHLT": "angelegt", "VERALTET": "erneuert", "ABGEWICHEN": "ersetzt (--force)"}[status]
+    return True, "%-16s %s%s" % (wort, target, ("  (Sicherung: %s)" % gesichert) if gesichert else "")
+
+
+def cmd_apply(nur, force):
+    state = read_state()
+    rs = alle_befunde(nur)
+    if not rs:
+        print("wb-harness-config: kein Harness mit configFiles -- nichts auszurollen.")
+        return 0
+    getan = 0
+    fehler = 0
+    for r in rs:
+        did, line = apply_one(r, state, force)
+        getan += 1 if did else 0
+        if line.startswith("NICHT MOEGLICH") or line.startswith("STEHENGELASSEN"):
+            fehler += 1
+        print("  " + line)
+    write_state(state)
+    print("wb-harness-config: %d Datei(en) geschrieben, %d offen." % (getan, fehler))
+    return 1 if fehler else 0
+
+
+# ── Bericht ────────────────────────────────────────────────────────────────────────
+ZEICHEN = {"GLEICH": "ok", "FEHLT": "FEHLT", "VERALTET": "veraltet",
+           "ABGEWICHEN": "abgewichen", "QUELLE-FEHLT": "QUELLE FEHLT",
+           "UNVOLLSTAENDIG": "unvollstaendig"}
+
+
+def cmd_status(nur, streng, als_json):
+    rs = alle_befunde(nur)
+    if als_json:
+        print(json.dumps(rs, indent=2, ensure_ascii=False))
+    else:
+        if not rs:
+            print("wb-harness-config: kein Harness mit configFiles -- nichts zu pruefen.")
+            return 0
+        for r in rs:
+            print("  %-12s %-8s %s" % (ZEICHEN.get(r["status"], r["status"]), r["harness"], r["target"]))
+            if r["status"] != "GLEICH":
+                print("               %s" % r["detail"])
+                if r["why"]:
+                    print("               Folge, wenn sie fehlt: %s" % r["why"])
+        offen = [r for r in rs if r["status"] != "GLEICH"]
+        if offen:
+            print("  Ausrollen: wb-harness-config apply")
+    # Exit 1 nur, wenn eine PFLICHT-Datei nicht benutzbar ist. Eine abgewichene Datei
+    # ist kein Startproblem -- der Harness findet dort etwas vor, nur eben nicht unser
+    # etwas; das wird gemeldet, nicht zum Fehler erklaert.
+    if streng and any(r["required"] and r["status"] in ("FEHLT", "QUELLE-FEHLT", "UNVOLLSTAENDIG")
+                      for r in rs):
+        return 1
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    force = False
+    als_json = False
+    rest = []
+    for a in argv:
+        if a == "--force":
+            force = True
+        elif a == "--json":
+            als_json = True
+        elif a.startswith("-"):
+            sys.stderr.write("wb-harness-config: unbekannte Option '%s'\n" % a)
+            return 1
+        else:
+            rest.append(a)
+    sub = "status"
+    if rest and rest[0] in ("status", "check", "apply"):
+        sub = rest.pop(0)
+    nur = set(rest) or None
+    if nur:
+        bekannt = {h.get("id") for h in harnesses()}
+        unbekannt = sorted(nur - bekannt)
+        if unbekannt:
+            sys.stderr.write("wb-harness-config: nicht registriert: %s\n" % " ".join(unbekannt))
+            return 1
+    if sub == "apply":
+        return cmd_apply(nur, force)
+    return cmd_status(nur, sub == "check", als_json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

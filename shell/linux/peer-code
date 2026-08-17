@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# peer-code [dir] — start/attach a Claude orchestrator session on THIS machine
+# (Peer-Rechner) in a chosen folder, workbench-style (grid + labeled panes + workers).
+# Used from the Mac VSCode workbench via the "peer — new session" terminal profile.
+set -euo pipefail
+DIR="${1:-}"
+if [ -z "$DIR" ]; then
+  echo "== Neue Claude-Session auf Peer-Rechner — Ordner wählen =="
+  mapfile -t opts < <(find "$HOME/AI" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+  i=1; for d in "${opts[@]}"; do printf "  %2d) %s\n" "$i" "${d/#$HOME/~}"; i=$((i+1)); done
+  printf "  %2d) (eigenen Pfad eingeben)\n" "$i"
+  printf "Auswahl [1-%d]: " "$i"; read -r choice
+  if [ "$choice" = "$i" ]; then printf "Pfad: "; read -r DIR; DIR="${DIR/#\~/$HOME}"
+  else DIR="${opts[$((choice-1))]:-}"; fi
+fi
+[ -n "$DIR" ] && [ -d "$DIR" ] || { echo "kein Verzeichnis: '$DIR'" >&2; exit 1; }
+exec "$HOME/.local/bin/wb-code" "$DIR"

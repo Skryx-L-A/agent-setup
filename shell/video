@@ -1,0 +1,63 @@
+#!/bin/bash
+# video — lokale Videogenerierung (LTX-2) mit einem Befehl, komplett offline-fähig.
+#
+#   video "Wellen brechen am Strand bei Sonnenuntergang"        Schnell (distilled)
+#   video --hq "eine Drohnenaufnahme über einem Wald"           Qualität (dauert deutlich länger)
+#   video --bild foto.png "Kamera zoomt langsam heraus"         Standbild animieren (beste Route:
+#                                                               erst 'bild', dann hier animieren)
+# Optionen:
+#   --sekunden N   Länge in Sekunden (Default 3, bei 24 fps)
+#   --seed N       reproduzierbar
+#   -o name.mp4    Ausgabedatei (Default ~/Movies/video-<datum>.mp4)
+#   --kein-open    nicht automatisch öffnen
+#
+# WICHTIG: braucht fast den ganzen RAM. Vorher große Ollama-Modelle stoppen:
+#   ollama ps        (zeigt geladene Modelle)
+#   ollama stop ornith:35b   (o.ä.)
+set -euo pipefail
+
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+
+LTX="$HOME/AI/ltx-2-mlx/.venv/bin/ltx-2-mlx"
+MODE="fast"; IMAGE=""; SECONDS_LEN=3; SEED=""; OUT=""; OPEN=1
+PROMPT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --hq)       MODE="hq"; shift ;;
+    --bild)     IMAGE="$2"; shift 2 ;;
+    --sekunden) SECONDS_LEN="$2"; shift 2 ;;
+    --seed)     SEED="$2"; shift 2 ;;
+    -o)         OUT="$2"; shift 2 ;;
+    --kein-open) OPEN=0; shift ;;
+    -h|--help)  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)          PROMPT="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$PROMPT" ]]; then
+  echo "Fehler: kein Prompt. Aufruf: video \"beschreibung der szene\"" >&2
+  exit 1
+fi
+
+if ollama ps 2>/dev/null | grep -qE ':(9b|35b|30b)'; then
+  echo "WARNUNG: großes Ollama-Modell geladen (RAM-Konflikt). Erst 'ollama stop <modell>'." >&2
+  exit 1
+fi
+
+[[ -z "$OUT" ]] && OUT="$HOME/Movies/video-$(date +%Y%m%d-%H%M%S).mp4"
+FRAMES=$(( SECONDS_LEN * 24 + 1 ))
+ARGS=(generate --prompt "$PROMPT" --frame-rate 24 -f "$FRAMES" --low-ram -o "$OUT")
+[[ -n "$SEED" ]] && ARGS+=(--seed "$SEED")
+[[ -n "$IMAGE" ]] && ARGS+=(--image "$IMAGE")
+if [[ "$MODE" == "hq" ]]; then
+  ARGS+=(--two-stages-hq)
+  echo "Qualitäts-Modus (two-stages-hq) — das dauert eine Weile ..."
+else
+  ARGS+=(--distilled)
+  echo "Schnell-Modus (distilled) ..."
+fi
+
+"$LTX" "${ARGS[@]}"
+echo "Fertig: $OUT"
+if [[ $OPEN -eq 1 ]]; then open "$OUT"; fi

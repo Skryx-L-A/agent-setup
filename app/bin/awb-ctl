@@ -1,0 +1,496 @@
+#!/usr/bin/env node
+// Kommandozeilen-Gegenstueck zum Steuerkanal (V5). Spricht den Unix-Socket des
+// laufenden Programms an und gibt die Antwort als JSON aus.
+//
+// Laeuft absichtlich ohne Bauschritt und ohne Abhaengigkeiten: das Werkzeug
+// soll auch dann noch da sein, wenn dist/ gerade neu gebaut wird.
+'use strict';
+
+const net = require('node:net');
+const os = require('node:os');
+const path = require('node:path');
+const { StringDecoder } = require('node:string_decoder');
+
+// Dieselbe Ableitung wie in src/main/config.ts (defaultControlSocketPath).
+// Die Testsuite vergleicht beide Ergebnisse, damit sie nicht auseinanderlaufen.
+function defaultSocketPath(env) {
+  if (env.AWB_CONTROL_SOCKET) return env.AWB_CONTROL_SOCKET;
+  const base = env.XDG_RUNTIME_DIR || os.tmpdir();
+  return path.join(base, `awb-${process.getuid ? process.getuid() : 0}.sock`);
+}
+
+function usage() {
+  process.stderr.write(
+    [
+      'Aufruf: awb-ctl [--socket <pfad>] <befehl> [argument]',
+      '',
+      '  ping                 Lebenszeichen',
+      '  state                Zustand des laufenden Programms',
+      '  get <feld>           ein Feld aus state, roh ausgegeben',
+      '  sessions             Sessionliste, Kapazitaet, gewaehlte Session',
+      '  ergebnisse           Ergebnisdateien pruefen; was dabei NEU war (V2)',
+      '  seite <name> [css]   uebernommene Seite zeichnen; optional zu einem',
+      '                       Abschnitt rollen (CSS-Auswahl)',
+      '  select <kennung>     Session waehlen (Kennung, Name oder tmux-Name)',
+      '  show-pane <%id>      diesen Pane zeichnen (gezoomt, fuellt die Flaeche)',
+      '  show-tab <%a,%b,..>  ALLE diese Panes nebeneinander zeichnen',
+      '  ui                   Zustand der Oberflaeche, wie sie gerade gezeichnet ist',
+      '  set-ui <feld=wert>   Oberflaeche stellen (sidebarWidth, rightExpanded,',
+      '                       showStopped, sort, workerTab, order=a,b,c)',
+      '  type <text>          Text in den gezeichneten Pane tippen',
+      '  key <name>           benannte Taste senden (Enter, C-c, Escape)',
+      '  flaeche <s>x<z>      Zeichenflaeche vorgeben; der Pane wird darauf gesetzt',
+      '  fenster <was> [sofort]  Fenster maximieren, vollbild oder',
+      '                       wiederherstellen; "sofort" antwortet MITTEN in der',
+      '                       Animation statt erst nach ihrem Ende',
+      '  einstellungen [seite]   das Einstellungsfenster bauen (NICHT zeigen) und',
+      '                       lesen; optional eine seiner sechs Seiten waehlen',
+      '                       (sitzungen, worker, aufsicht, modelle, maschinen,',
+      '                       programm)',
+      '  einstellungen-klick <css>  ein Bedienelement IM Einstellungsfenster anklicken',
+      '  einstellungen-eingabe <css> <wert>  in ein Feld schreiben und es verlassen',
+      '  einstellungen-blaettern <css>  eine lange Seite an diese Stelle rollen',
+      '  einstellungen-zustand <css>  ein Bedienelement LESEN, ohne es anzufassen',
+      '  einstellungen-schuss [seite] [datei]  Belegbild des Einstellungsfensters',
+      '  sitzung              das Sitzungsfenster hinter dem Plus bauen (NICHT',
+      '                       zeigen) und lesen: Gruppen, Zeilen, Status',
+      '  sitzung-klick <css>  ein Bedienelement IM Sitzungsfenster anklicken',
+      '                       (Sitzungszeile, Ausklapp-Knopf, Fortsetzen)',
+      '  sitzung-eingabe <css> <wert>  in ein Feld schreiben und es verlassen',
+      '  sitzung-zustand <css>  ein Bedienelement LESEN, ohne es anzufassen',
+      '  sitzung-schuss [datei]  Belegbild des Sitzungsfensters',
+      '  chat-liste           die Chat-Sitzungen auflisten',
+      '  chat-buehne          was gerade auf der Buehne liegt -- gefragt an',
+      '                       beiden Enden (Hauptprozess und Oberflaeche)',
+      '  chat-anlegen <ordner> [name] [modell] [modus]  eine Chat-Sitzung',
+      '                       anlegen, OHNE Ordnerdialog',
+      '  chat-stand <id> [json]  den Gespraechsstand auf der Buehne lesen',
+      '                       oder (mit json) einen fertigen einsetzen',
+      '  chat-text <id>       den sichtbaren Text der Chat-Sitzung lesen',
+      '  chat-zeiten <id> [leeren]  die gemessenen Zeichenzeiten lesen oder',
+      '                       zuruecksetzen (Beleg zu Befund B1)',
+      '  chat-klick <id> <css>  ein Bedienelement der Chat-Sitzung anklicken',
+      '  chat-marke <id> <css> [wert]  ein Element zeichnen und wiedererkennen',
+      '                       (Beleg zu Befund B1: wurde es neu gebaut?)',
+      '  chat-tippen <id> <text>  in das Eingabefeld tippen und abschicken',
+      '  chat-haken <id> <griff>  einen Testhaken der Buehne ziehen:',
+      '                       feld:<text> (schreiben ohne Abschicken),',
+      '                       taste:<key>, vervoll (was die Liste zeigt),',
+      '                       status (was die Statusleiste zeigt)',
+      '  chat-worker <id> [pane]  die Werkstatt dieser Sitzung lesen -- mit',
+      '                       <pane> ihren Worker auf die Buehne holen',
+      '  chat-schuss <id> [datei]  Belegbild des Hauptfensters mit dieser',
+      '                       Chat-Sitzung auf der Buehne',
+      '  rechtsklick <kennung>  ein contextmenu-Ereignis auf ihrer Zeile in der',
+      '                       Leiste ausloesen (synthetisch, klappt nichts auf)',
+      '  sitzung-menue <kennung>  das Kontextmenue dieser Sitzung LESEN (klappt',
+      '                       nichts auf -- das tut nur ein echter Rechtsklick)',
+      '  sitzung-menue-punkt <kennung> <punkt>  einen Menuepunkt ausloesen',
+      '                       (fortsetzen, umbenennen, ordner-zeigen, schliessen,',
+      '                       loeschen)',
+      '  umbenennen <kennung> <name>  eine Sitzung umbenennen (ruft wb-state touch)',
+      '  seiten-klick <css>   einen Knopf IN der uebernommenen Seite anklicken',
+      '  seiten-zustand       nur LESEN, was der Rahmen gerade zeigt (kein Neuzeichnen)',
+      '  seiten-fokus <css>   ein Feld im Rahmen gezielt fokussieren (nur fuer Tests)',
+      '  seiten-unfokus       ein fokussiertes Feld im Rahmen gezielt verlassen (nur fuer Tests)',
+      '  seiten-schliessen-klick  die echte Schliessen-Schaltflaeche im Rahmen anklicken (nur fuer Tests)',
+      '  seiten-nachricht <command>  einen Sofort-Plan wie eine Seite ausloesen, z.B. refresh (nur fuer Tests)',
+      '  plan-ausfuehren      den gezeigten Plan bestaetigen und ausfuehren',
+      '  klick <knopf>        auf einen Knopf ohne Ansicht klicken (ordner,',
+      '                       aktivitaet, freigaben, einstellungen, neue-session;',
+      '                       die letzten beiden BAUEN ihr Fenster, ohne es zu zeigen)',
+      '  editor <methode> [json-argument]',
+      '                       Testhaken des Editors rufen (window.__awbEditor)',
+      '  schreiben <ziel> [text]  Text in ein Eingabefeld schreiben (data-tipp),',
+      '                       z.B. "schreiben suche foo" fuer die Inhaltssuche',
+      '  freigaben            offene Antraege und angehaltene Worker (V20)',
+      '  entscheiden <datei> <approve|reject> <grund...>',
+      '                       einen Antrag entscheiden (ruft wb-decide)',
+      '  muster-entscheiden <schluessel> <approve|reject> <grund...>',
+      '                       einen angehaltenen Befehl der Rueckfrage-Stufe',
+      '                       einmalig freigeben oder ablehnen',
+      '  revive <kennung>     eine Session im Zustand stopped neu starten (V14,',
+      '                       ruft wb-code --resume; lehnt jeden anderen Zustand ab)',
+      '  treffer <x> <y>      wer an dieser Stelle den Zeiger faengt (Schichtprobe)',
+      '  neue-session <ordner> [name]  eine neue Session anlegen (ruft wb-code)',
+      '  fokus <weg|zurueck>  dem Fenster den Fokus nehmen oder geben (nur fuer',
+      '                       Tests: der Weg "andere Anwendung und zurueck")',
+      '  rad <%id> <n> [shift]  Rad-Ereignis auf einem Pane; meldet viewportY,',
+      '                       Pufferlaenge und ob die Anwendung die Maus verfolgt',
+      '  radmass <weg[,weg]> [pixel|zeilen|seiten] [zeilen] [zellhoehe]  wieviele ZEILEN diese',
+      '                       Rad-Ereignisse bewegen -- je Ereignis und in Summe',
+      '  rad-strom <%id> <weg[,weg]> [abstand-ms]  ein ganzer WISCH durch den echten',
+      '                       Eingabeweg (sendInputEvent, Trackpad-Kennzeichen):',
+      '                       meldet bewegte Zeilen und Ereignisse ohne Wirkung',
+      '  scroll-leistung <%id> [bilder] [raster]  Bildzeiten waehrend fortlaufendem',
+      '                       Hochrollen messen (Vorgabe 120 Bilder, 3 Rasterschritte)',
+      '  renderer-art <%id>   welcher Renderer auf diesem Pane zeichnet (webgl,',
+      '                       canvas oder dom)',
+      '  webgl-sperren        NUR FUER TESTS: WebGL fuer dieses Fenster unbrauchbar',
+      '                       machen, vor dem naechsten Pane-Aufbau -- damit sich',
+      '                       der Canvas-Rueckfall ausloesen laesst',
+      '  zwischenablage-auswahl <%pane> <an|aus>  NUR FUER TESTS: eine Auswahl',
+      '                       im Terminal setzen oder loeschen (clipfixtest)',
+      '  zwischenablage-taste <%pane> <taste> [shift]  NUR FUER TESTS: Strg(+Umschalt)',
+      '                       +<taste> auf dem Terminal ausloesen; meldet ob',
+      '                       verhindert und was danach an den Pane ging (clipfixtest)',
+      '  menu-stand           NUR FUER TESTS: existiert das Anwendungsmenue, welche',
+      '                       Rollen traegt sein Bearbeiten-Eintrag (clipfixtest)',
+      '  kontextmenu-fake <editierbar|%pane>  NUR FUER TESTS: ein contextmenu-',
+      '                       Ereignis synthetisch ausloesen (clipfixtest)',
+      '  kontextmenu-klick <kopieren|einfuegen>  NUR FUER TESTS: die click()-',
+      '                       Funktion eines Eintrags im zuletzt gebauten',
+      '                       Terminal-Kontextmenue direkt ausloesen (clipmenu)',
+      '  ordner [pfad]        Ordneransicht listen (leer = aktuelle Wurzel, 4c.2)',
+      '  ordner-oeffnen <pfad>  Datei im Programm des Menschen oeffnen',
+      '  aktivitaet           Aktivitaetsliste lesen (4c.1)',
+      '  aktivitaet-oeffnen <pfad>  Inhalt eines Eintrags lesen (V15/V18, erster Klick)',
+      '  aktivitaet-diff <pfad>  Diff eines Aenderung-Eintrags (V15, zweiter Klick)',
+      '  aktivitaet-auftrag <pfad>  Auftrag+Ergebnis eines Ergebnis-Eintrags (V18, zweiter Klick)',
+      '  protokolle           konfigurierte Protokoll-Liste lesen (V16)',
+      '  protokolle-oeffnen <pfad>  eine Protokoll-Datei lesen (V16)',
+      '  suche <text> [pfad]  Inhaltssuche (rg) unter der Wurzel',
+      '  reload               Fenster neu laden und wieder anhaengen',
+      '  focus-pane <%id>     Pane fokussieren und zeichnen',
+      '  shot [datei]         Selbstfoto als PNG schreiben',
+      '  quit                 Programm sauber beenden',
+      '  socket-path          aufgeloesten Socketpfad ausgeben',
+      '',
+    ].join('\n'),
+  );
+}
+
+function parse(argv) {
+  const rest = [];
+  let socket = null;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--socket') socket = argv[++i];
+    else if (argv[i].startsWith('--socket=')) socket = argv[i].slice(9);
+    else rest.push(argv[i]);
+  }
+  return { socket: socket || defaultSocketPath(process.env), args: rest };
+}
+
+function request(socketPath, payload) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(socketPath);
+    let buf = '';
+    // Ein Zeichen darf an einer Chunk-Grenze nicht zerbrechen.
+    //
+    // Die Antwort auf `get bufferText` ist der ganze Fensterinhalt -- bei 178
+    // Spalten und 58 Zeilen rund zwanzigtausend Zeichen, und die kommen ueber
+    // mehrere Chunks. Wurde jeder Chunk fuer sich uebersetzt, wurde ein
+    // Rahmenzeichen, das genau auf der Grenze lag, zu Ersatzzeichen. Das sah
+    // aus wie ein Fehler im Fenster und war einer im MESSWERKZEUG: gemessen
+    // zaehlte das Fenster in seinem eigenen Puffer null Ersatzzeichen,
+    // waehrend hier eins ankam. StringDecoder haelt die angefangene Folge bis
+    // zum naechsten Chunk fest.
+    const decoder = new StringDecoder('utf8');
+    const fail = (e) => {
+      sock.destroy();
+      reject(e);
+    };
+    sock.setTimeout(15000, () => fail(new Error(`keine Antwort von ${socketPath}`)));
+    sock.on('error', (e) => fail(new Error(`${socketPath}: ${e.message}`)));
+    sock.on('connect', () => sock.write(JSON.stringify(payload) + '\n'));
+    sock.on('data', (chunk) => {
+      buf += decoder.write(chunk);
+      const nl = buf.indexOf('\n');
+      if (nl < 0) return;
+      sock.end();
+      try {
+        resolve(JSON.parse(buf.slice(0, nl)));
+      } catch (e) {
+        reject(new Error(`unlesbare Antwort: ${buf.slice(0, nl)}`));
+      }
+    });
+  });
+}
+
+async function main() {
+  const { socket, args } = parse(process.argv.slice(2));
+  const cmd = args[0];
+  if (!cmd || cmd === '-h' || cmd === '--help') {
+    usage();
+    process.exit(cmd ? 0 : 2);
+  }
+  if (cmd === 'socket-path') {
+    process.stdout.write(socket + '\n');
+    return;
+  }
+
+  let payload;
+  if (cmd === 'get') {
+    if (!args[1]) throw new Error('get braucht einen Feldnamen');
+    payload = { cmd: 'state' };
+  } else if (cmd === 'focus-pane') {
+    if (!args[1]) throw new Error('focus-pane braucht eine Pane-Kennung');
+    payload = { cmd: 'focus-pane', pane: args[1] };
+  } else if (cmd === 'shot') {
+    payload = args[1] ? { cmd: 'shot', path: args[1] } : { cmd: 'shot' };
+  } else if (cmd === 'select') {
+    if (!args[1]) throw new Error('select braucht eine Kennung');
+    payload = { cmd: 'select', session: args[1] };
+  } else if (cmd === 'show-pane') {
+    if (!args[1]) throw new Error('show-pane braucht eine Pane-Kennung');
+    payload = { cmd: 'show-pane', pane: args[1] };
+  } else if (cmd === 'type') {
+    payload = { cmd: 'type', text: args.slice(1).join(' ') };
+  } else if (cmd === 'key') {
+    if (!args[1]) throw new Error('key braucht einen Tastennamen');
+    payload = { cmd: 'key', name: args[1] };
+  } else if (cmd === 'show-tab') {
+    if (!args[1]) throw new Error('show-tab braucht Pane-Kennungen, mit Komma getrennt');
+    payload = { cmd: 'show-tab', panes: args[1] };
+  } else if (cmd === 'flaeche') {
+    if (!args[1]) throw new Error('flaeche braucht <spalten>x<zeilen>');
+    const m = /^(\d+)x(\d+)$/.exec(args[1]);
+    if (!m) throw new Error(`flaeche erwartet <spalten>x<zeilen>, nicht '${args[1]}'`);
+    payload = { cmd: 'flaeche', cols: Number(m[1]), rows: Number(m[2]) };
+  } else if (cmd === 'fenster') {
+    if (!args[1]) throw new Error('fenster braucht maximieren, vollbild oder wiederherstellen');
+    payload = { cmd: 'fenster', was: args[1] };
+    if (args[2] === 'sofort') payload.warten = false;
+  } else if (cmd === 'seite') {
+    if (!args[1]) throw new Error('seite braucht einen Namen (start|einstellungen)');
+    payload = { cmd: 'seite', name: args[1] };
+    if (args[2]) payload.zu = args[2];
+  } else if (cmd === 'einstellungen') {
+    payload = args[1] ? { cmd: 'einstellungen', seite: args[1] } : { cmd: 'einstellungen' };
+  } else if (cmd === 'einstellungen-klick') {
+    if (!args[1]) throw new Error('einstellungen-klick braucht eine CSS-Auswahl');
+    payload = { cmd: 'einstellungen-klick', knopf: args[1] };
+  } else if (cmd === 'einstellungen-zustand') {
+    if (!args[1]) throw new Error('einstellungen-zustand braucht eine CSS-Auswahl');
+    payload = { cmd: 'einstellungen-zustand', knopf: args[1] };
+  } else if (cmd === 'einstellungen-blaettern') {
+    if (!args[1]) throw new Error('einstellungen-blaettern braucht eine CSS-Auswahl');
+    payload = { cmd: 'einstellungen-blaettern', knopf: args[1] };
+  } else if (cmd === 'einstellungen-eingabe') {
+    if (!args[1]) throw new Error('einstellungen-eingabe braucht eine CSS-Auswahl');
+    payload = { cmd: 'einstellungen-eingabe', knopf: args[1], wert: args[2] ?? '' };
+  } else if (cmd === 'einstellungen-schuss') {
+    payload = { cmd: 'einstellungen-schuss' };
+    if (args[1]) payload.seite = args[1];
+    if (args[2]) payload.datei = args[2];
+  } else if (cmd === 'sitzung') {
+    payload = { cmd: 'sitzung' };
+  } else if (cmd === 'sitzung-klick') {
+    if (!args[1]) throw new Error('sitzung-klick braucht eine CSS-Auswahl');
+    payload = { cmd: 'sitzung-klick', knopf: args[1] };
+  } else if (cmd === 'sitzung-zustand') {
+    if (!args[1]) throw new Error('sitzung-zustand braucht eine CSS-Auswahl');
+    payload = { cmd: 'sitzung-zustand', knopf: args[1] };
+  } else if (cmd === 'sitzung-eingabe') {
+    if (!args[1]) throw new Error('sitzung-eingabe braucht eine CSS-Auswahl');
+    payload = { cmd: 'sitzung-eingabe', knopf: args[1], wert: args[2] ?? '' };
+  } else if (cmd === 'chat-liste') {
+    payload = { cmd: 'chat-liste' };
+  } else if (cmd === 'chat-buehne') {
+    payload = { cmd: 'chat-buehne' };
+  } else if (cmd === 'chat-anlegen') {
+    if (!args[1]) throw new Error('chat-anlegen braucht einen Ordner');
+    payload = { cmd: 'chat-anlegen', ordner: args[1], name: args[2] ?? '', modell: args[3] ?? '', modus: args[4] ?? '' };
+  } else if (cmd === 'chat-stand') {
+    if (!args[1]) throw new Error('chat-stand braucht eine Chat-Kennung');
+    payload = { cmd: 'chat-stand', id: args[1] };
+    if (args[2]) {
+      // Der Stand kommt als JSON herein. Unlesbares wird hier abgefangen und
+      // nicht als „kein Gespraech" weitergereicht -- ein Tippfehler soll
+      // auffallen, nicht still eine leere Ansicht ergeben.
+      let g;
+      try { g = JSON.parse(args[2]); } catch (e) { throw new Error(`chat-stand: unlesbares JSON -- ${e.message}`); }
+      payload.gespraech = g;
+    }
+    if (args[3]) payload.sprache = args[3];
+  } else if (cmd === 'chat-zeiten') {
+    if (!args[1]) throw new Error('chat-zeiten braucht eine Chat-Kennung');
+    payload = { cmd: 'chat-zeiten', id: args[1] };
+    if (args[2] === 'leeren') payload.leeren = true;
+  } else if (cmd === 'chat-text') {
+    if (!args[1]) throw new Error('chat-text braucht eine Chat-Kennung');
+    payload = { cmd: 'chat-text', id: args[1] };
+  } else if (cmd === 'chat-klick') {
+    if (!args[1] || !args[2]) throw new Error('chat-klick braucht <kennung> <css>');
+    payload = { cmd: 'chat-klick', id: args[1], knopf: args[2] };
+  } else if (cmd === 'chat-marke') {
+    if (!args[1] || !args[2]) throw new Error('chat-marke braucht <kennung> <css> [wert]');
+    payload = { cmd: 'chat-marke', id: args[1], auswahl: args[2] };
+    if (args[3] !== undefined) payload.wert = args[3];
+  } else if (cmd === 'chat-tippen') {
+    if (!args[1]) throw new Error('chat-tippen braucht eine Chat-Kennung');
+    payload = { cmd: 'chat-tippen', id: args[1], text: args[2] ?? '' };
+  } else if (cmd === 'chat-haken') {
+    if (!args[1] || !args[2]) throw new Error('chat-haken braucht <kennung> <griff>');
+    payload = { cmd: 'chat-haken', id: args[1], griff: args[2] };
+  } else if (cmd === 'chat-worker') {
+    if (!args[1]) throw new Error('chat-worker braucht eine Chat-Kennung');
+    payload = { cmd: 'chat-worker', id: args[1] };
+    if (args[2]) payload.pane = args[2];
+  } else if (cmd === 'chat-schuss') {
+    if (!args[1]) throw new Error('chat-schuss braucht eine Chat-Kennung');
+    payload = { cmd: 'chat-schuss', id: args[1] };
+    if (args[2]) payload.datei = args[2];
+  } else if (cmd === 'rechtsklick') {
+    if (!args[1]) throw new Error('rechtsklick braucht eine Session-Kennung');
+    payload = { cmd: 'rechtsklick', session: args[1] };
+  } else if (cmd === 'sitzung-menue') {
+    if (!args[1]) throw new Error('sitzung-menue braucht eine Session-Kennung');
+    payload = { cmd: 'sitzung-menue', session: args[1] };
+  } else if (cmd === 'sitzung-menue-punkt') {
+    if (!args[1] || !args[2]) throw new Error('sitzung-menue-punkt braucht <kennung> <punkt>');
+    payload = { cmd: 'sitzung-menue-punkt', session: args[1], punkt: args[2] };
+  } else if (cmd === 'umbenennen') {
+    if (!args[1]) throw new Error('umbenennen braucht <kennung> <name>');
+    payload = { cmd: 'umbenennen', session: args[1], name: args.slice(2).join(' ') };
+  } else if (cmd === 'sitzung-schuss') {
+    payload = { cmd: 'sitzung-schuss' };
+    if (args[1]) payload.datei = args[1];
+  } else if (cmd === 'seiten-klick') {
+    if (!args[1]) throw new Error('seiten-klick braucht eine CSS-Auswahl');
+    payload = { cmd: 'seiten-klick', knopf: args[1] };
+  } else if (cmd === 'seiten-zustand') {
+    payload = { cmd: 'seiten-zustand' };
+  } else if (cmd === 'seiten-fokus') {
+    if (!args[1]) throw new Error('seiten-fokus braucht eine CSS-Auswahl');
+    payload = { cmd: 'seiten-fokus', knopf: args[1] };
+  } else if (cmd === 'seiten-unfokus') {
+    payload = { cmd: 'seiten-unfokus' };
+  } else if (cmd === 'seiten-schliessen-klick') {
+    payload = { cmd: 'seiten-schliessen-klick' };
+  } else if (cmd === 'seiten-nachricht') {
+    if (!args[1]) throw new Error('seiten-nachricht braucht einen command-Namen');
+    payload = { cmd: 'seiten-nachricht', command: args[1] };
+  } else if (cmd === 'klick') {
+    if (!args[1]) throw new Error('klick braucht einen Knopfnamen');
+    payload = { cmd: 'klick', knopf: args[1] };
+  } else if (cmd === 'editor') {
+    if (!args[1]) throw new Error('editor braucht einen Methodennamen');
+    payload = { cmd: 'editor', method: args[1] };
+    if (args[2] !== undefined) payload.arg = JSON.parse(args[2]);
+  } else if (cmd === 'schreiben') {
+    if (!args[1]) throw new Error('schreiben braucht <ziel> [text...]');
+    payload = { cmd: 'schreiben', ziel: args[1], text: args.slice(2).join(' ') };
+  } else if (cmd === 'entscheiden') {
+    if (!args[1] || !args[2]) throw new Error('entscheiden braucht <datei> <approve|reject> <grund...>');
+    payload = { cmd: 'entscheiden', path: args[1], action: args[2], reason: args.slice(3).join(' ') };
+  } else if (cmd === 'muster-entscheiden') {
+    if (!args[1] || !args[2]) throw new Error('muster-entscheiden braucht <schluessel> <approve|reject> <grund...>');
+    payload = { cmd: 'muster-entscheiden', schluessel: args[1], action: args[2], reason: args.slice(3).join(' ') };
+  } else if (cmd === 'revive') {
+    if (!args[1]) throw new Error('revive braucht eine Session-Kennung');
+    payload = { cmd: 'revive', id: args[1] };
+  } else if (cmd === 'neue-session') {
+    if (!args[1]) throw new Error('neue-session braucht einen Ordner');
+    payload = { cmd: 'neue-session', dir: args[1], name: args.slice(2).join(' ') };
+  } else if (cmd === 'fokus') {
+    if (args[1] !== 'weg' && args[1] !== 'zurueck') throw new Error("fokus braucht 'weg' oder 'zurueck'");
+    payload = { cmd: 'fokus', an: args[1] === 'zurueck' };
+  } else if (cmd === 'rad') {
+    if (!args[1] || args[2] === undefined) throw new Error('rad braucht <%pane> <schritte> [shift]');
+    payload = { cmd: 'rad', pane: args[1], schritte: Number(args[2]) };
+    if (args[3] === 'shift') payload.shift = true;
+  } else if (cmd === 'scroll-leistung') {
+    if (!args[1]) throw new Error('scroll-leistung braucht <%pane> [bilder] [raster]');
+    payload = { cmd: 'scroll-leistung', pane: args[1] };
+    if (args[2] !== undefined) payload.bilder = Number(args[2]);
+    if (args[3] !== undefined) payload.raster = Number(args[3]);
+  } else if (cmd === 'renderer-art') {
+    if (!args[1]) throw new Error('renderer-art braucht <%pane>');
+    payload = { cmd: 'renderer-art', pane: args[1] };
+  } else if (cmd === 'webgl-sperren') {
+    payload = { cmd: 'webgl-sperren' };
+  } else if (cmd === 'zwischenablage-auswahl') {
+    if (!args[1] || (args[2] !== 'an' && args[2] !== 'aus')) {
+      throw new Error("zwischenablage-auswahl braucht <%pane> <an|aus>");
+    }
+    payload = { cmd: 'zwischenablage-auswahl', pane: args[1], an: args[2] === 'an' };
+  } else if (cmd === 'zwischenablage-taste') {
+    if (!args[1] || !args[2]) throw new Error('zwischenablage-taste braucht <%pane> <taste> [shift]');
+    payload = { cmd: 'zwischenablage-taste', pane: args[1], taste: args[2] };
+    if (args[3] === 'shift') payload.shift = true;
+  } else if (cmd === 'menu-stand') {
+    payload = { cmd: 'menu-stand' };
+  } else if (cmd === 'kontextmenu-fake') {
+    if (!args[1]) throw new Error('kontextmenu-fake braucht <editierbar|%pane>');
+    payload = { cmd: 'kontextmenu-fake', ziel: args[1] };
+  } else if (cmd === 'kontextmenu-klick') {
+    if (args[1] !== 'kopieren' && args[1] !== 'einfuegen') {
+      throw new Error("kontextmenu-klick braucht <kopieren|einfuegen>");
+    }
+    payload = { cmd: 'kontextmenu-klick', eintrag: args[1] };
+  } else if (cmd === 'radmass') {
+    // Die Wege kommen als Komma-Liste, damit sich eine ganze Wischbewegung in
+    // einem Aufruf messen laesst: 'radmass 8,8,8,8 pixel'.
+    if (!args[1]) throw new Error('radmass braucht <weg[,weg...]> [pixel|zeilen|seiten] [zeilen-im-pane]');
+    payload = { cmd: 'radmass', deltas: String(args[1]).split(',').map(Number) };
+    if (args[2] === 'zeilen') payload.modus = 1;
+    else if (args[2] === 'seiten') payload.modus = 2;
+    if (args[3] !== undefined) payload.zeilen = Number(args[3]);
+    // Die Zellhoehe darf vorgegeben werden, damit eine Rechenprobe nicht an der
+    // Schrift haengt, mit der das Fenster gerade zeichnet.
+    if (args[4] !== undefined) payload.zellhoehe = Number(args[4]);
+  } else if (cmd === 'rad-strom') {
+    // Ein ganzer Wisch statt eines einzelnen Ereignisses, durch den echten
+    // Eingabeweg: 'rad-strom %3 -3,-3,-3,-3 8'.
+    if (!args[1] || !args[2]) throw new Error('rad-strom braucht <%pane> <weg[,weg...]> [abstand-ms] [block] [pause-ms]');
+    payload = { cmd: 'rad-strom', pane: args[1], deltas: String(args[2]).split(',').map(Number) };
+    if (args[3] !== undefined) payload.abstand = Number(args[3]);
+    if (args[4] !== undefined) payload.block = Number(args[4]);
+    if (args[5] !== undefined) payload.pause = Number(args[5]);
+  } else if (cmd === 'treffer') {
+    if (!args[1] || !args[2]) throw new Error('treffer braucht <x> <y> in CSS-Pixeln');
+    payload = { cmd: 'treffer', x: Number(args[1]), y: Number(args[2]) };
+  } else if (cmd === 'ordner') {
+    payload = { cmd: 'ordner', pfad: args[1] || '' };
+  } else if (cmd === 'ordner-oeffnen') {
+    if (!args[1]) throw new Error('ordner-oeffnen braucht einen Pfad');
+    payload = { cmd: 'ordner-oeffnen', pfad: args[1] };
+  } else if (cmd === 'aktivitaet-oeffnen') {
+    if (!args[1]) throw new Error('aktivitaet-oeffnen braucht einen Pfad');
+    payload = { cmd: 'aktivitaet-oeffnen', pfad: args[1] };
+  } else if (cmd === 'aktivitaet-diff') {
+    if (!args[1]) throw new Error('aktivitaet-diff braucht einen Pfad');
+    payload = { cmd: 'aktivitaet-diff', pfad: args[1] };
+  } else if (cmd === 'aktivitaet-auftrag') {
+    if (!args[1]) throw new Error('aktivitaet-auftrag braucht einen Pfad');
+    payload = { cmd: 'aktivitaet-auftrag', pfad: args[1] };
+  } else if (cmd === 'protokolle-oeffnen') {
+    if (!args[1]) throw new Error('protokolle-oeffnen braucht einen Pfad');
+    payload = { cmd: 'protokolle-oeffnen', pfad: args[1] };
+  } else if (cmd === 'suche') {
+    if (!args[1]) throw new Error('suche braucht einen Suchtext');
+    payload = { cmd: 'suche', query: args[1], pfad: args[2] || '' };
+  } else if (cmd === 'set-ui') {
+    payload = { cmd: 'set-ui' };
+    for (const paar of args.slice(1)) {
+      const i = paar.indexOf('=');
+      if (i < 0) throw new Error(`set-ui erwartet feld=wert, nicht '${paar}'`);
+      const feld = paar.slice(0, i);
+      const roh = paar.slice(i + 1);
+      if (feld === 'order') payload[feld] = roh ? roh.split(',') : [];
+      else if (roh === 'true' || roh === 'false') payload[feld] = roh === 'true';
+      else if (/^-?\d+$/.test(roh)) payload[feld] = Number(roh);
+      else payload[feld] = roh;
+    }
+  } else {
+    payload = { cmd };
+  }
+
+  const reply = await request(socket, payload);
+  if (!reply.ok) {
+    process.stderr.write(`Fehler: ${reply.error}\n`);
+    process.exit(1);
+  }
+  if (cmd === 'get') {
+    const value = reply[args[1]];
+    process.stdout.write((typeof value === 'object' ? JSON.stringify(value) : String(value)) + '\n');
+    return;
+  }
+  process.stdout.write(JSON.stringify(reply) + '\n');
+}
+
+main().catch((e) => {
+  process.stderr.write(`Fehler: ${e.message}\n`);
+  process.exit(1);
+});

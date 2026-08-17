@@ -1,0 +1,1188 @@
+#!/bin/bash
+# pi-worker — prompt a PERMANENT local pi chat agent (always-visible pane).
+#
+#   pi-worker [--mensch] <name> <qwen|ornith|ornith9|grug|model-id> <workdir> <task...>
+#
+# `--mensch` hebt den Effort-Deckel fuer DIESEN Start auf (2026-08-06). Es gilt
+# nur, wenn der Aufruf wirklich von einem Menschen kommt — geprueft von
+# `wb-mensch` an der Herkunft des Prozesses, nicht an dem, was der Aufruf
+# behauptet. Ein Agent aus einem Pane heraus wird abgewiesen.
+#
+# The agent's pane runs the interactive pi chat continuously — no mode
+# switches, ever. Tasks are injected as chat messages (bracketed paste);
+# every task carries an embedded protocol: the agent writes its result to
+#   ~/.pi-workers/results/<name>/<timestamp>.md   (symlink: latest.md)
+# and replies DONE. The orchestrator waits on that file WITH A DEADLINE
+# (never unbounded) and reads it. Same name = same pane = same context.
+#
+# Helpers: pi-worker <name> --interrupt   sends Escape to a stuck agent.
+#
+#   pi-worker --on <mac|peer> <name> <model> <workdir> <task...>
+# spawns the worker on the OTHER machine (name there and here: SSH-<name>) and
+# mirrors it into the local grid — see wb-ssh-worker. Without --on nothing changes.
+set -u
+
+if [ "${1:-}" = "--on" ]; then
+  ONMACHINE="${2:?Maschine (mac|peer)}"; shift 2
+  case "$(uname -s)" in Darwin) SELF=mac ;; *) SELF=peer ;; esac
+  [ "$ONMACHINE" = "$SELF" ] && { echo "pi-worker: --on gilt nur fuer eine ANDERE Maschine — '$ONMACHINE' ist diese hier. Ohne --on starten." >&2; exit 1; }
+  exec $HOME/.local/bin/wb-ssh-worker "$ONMACHINE" pi "$@"
+fi
+
+# Optionales Fertig-Kriterium VOR dem Namen (SPEC: wb-dod). Nur die Uebernahme
+# steht hier -- geschrieben wird es unten am Punkt der Task-Injektion.
+DOD=""
+if [ "${1:-}" = "--dod" ]; then
+  DOD="${2:?--dod erwartet ein Fertig-Kriterium}"; shift 2
+fi
+
+# ── Wer ruft hier? (2026-08-06) ───────────────────────────────────────────────
+# Der Effort-Deckel bindet den ORCHESTRATOR, nicht den Menschen. Startet ein
+# AGENT einen Worker, gilt der Deckel des Modells -- das ist die Selbstbindung
+# gegen zu teure Laeufe, und sie bleibt. Startet ein MENSCH, ueber die
+# Oberflaeche oder von Hand im Terminal, gilt sie nicht: er bekommt jede Stufe,
+# die der HARNESS annimmt.
+#
+# `--mensch` ist eine BEHAUPTUNG des Aufrufers und wird nie geglaubt. wb-mensch
+# misst die Herkunft am Prozess (Agenten-Umgebung, Harness in der Ahnenreihe,
+# Pane-Rolle, steuerndes Terminal, Oberflaeche als geprueften Ahnen) -- dasselbe
+# Prinzip, mit dem das Einstellungsfenster `isTrusted` benutzt: die Echtheit
+# haengt nicht am Absender, sondern an der Schicht, die sie aufpraegt. Ein Agent,
+# der das Merkmal im Code liest und mitschickt, kommt damit nicht durch.
+#
+# OHNE das Merkmal bleibt alles wie vorher: Deckel greift, `max` abgelehnt. Der
+# Rueckfall ist die sichere Seite -- ein Fehler an dieser Stelle darf nie in
+# Richtung "mehr erlaubt" ausfallen.
+MENSCH=""
+if [ "${1:-}" = "--mensch" ]; then
+  shift
+  if "$HOME/.local/bin/wb-mensch" pruefen; then
+    MENSCH=1
+  else
+    BELEG=$("$HOME/.local/bin/wb-mensch" beleg 2>/dev/null | cut -f2-)
+    {
+      echo "FEHLER: '--mensch' abgelehnt — dieser Aufruf kommt nicht von einem Menschen."
+      echo "  Erkannt wurde: ${BELEG:-kein Beleg}"
+      echo "  Der Effort-Deckel ist die Selbstbindung des Orchestrators. Ein Agent hebt sie"
+      echo "  nicht dadurch auf, dass er das Merkmal mitschickt."
+      echo "  Ohne '--mensch' laeuft derselbe Aufruf normal — dann greift der Deckel."
+      echo "  Diagnose: wb-mensch beleg ; wb-mensch ahnen"
+    } >&2
+    exit 1
+  fi
+fi
+
+NAME="${1:?worker name}"; shift
+
+# Der Name wird zu einem PFAD (Ergebnis- und Session-Verzeichnis) und zu einer
+# tmux-Option. Deshalb wird er geprueft, BEVOR irgendetwas davon entsteht: '../evil'
+# hat sein Ergebnisverzeichnis sonst nach ~/.pi-workers/evil gelegt, also aus
+# results/ heraus (Stress-Befund B05) — und wb-result haette es dort nie gefunden.
+case "$NAME" in
+  ''|-*|*[!A-Za-z0-9_-]*)
+    echo "FEHLER: unzulaessiger Worker-Name '$NAME'." >&2
+    echo "  Erlaubt sind Buchstaben, Ziffern, '-' und '_' (kein '/', kein '..', kein fuehrendes '-')." >&2
+    echo "  Grund: aus dem Namen werden Pfade unter ~/.pi-workers/ gebaut." >&2
+    exit 1 ;;
+esac
+
+LOGROOT="$HOME/.pi-workers"; RESDIR="$LOGROOT/results/$NAME"
+SESSDIR="$LOGROOT/sessions/$NAME"
+mkdir -p "$RESDIR" "$SESSDIR"
+
+# A bare NAME used to be searched across EVERY wb-* session on the machine
+# (2026-08-16, bugjagd shell/mittel, pi-worker:92-99): an unrelated OLD session
+# with a same-named worker pane silently wins -- `tmux list-sessions` order
+# decides, not intent. Reproduced: two independent wb-* sessions each with a
+# pane tagged @wb_worker=dup, the caller's own spawn lands in the OTHER
+# session's pane. Matches the vault incident "Worker-Namen kollidieren ueber
+# Session-Grenzen" (worker 'w-lauf' resumed yesterday's context in a session
+# nobody was watching). own_wb_session() (uses base_session_name, defined
+# below -- fine, it only has to exist by CALL time) scopes find_pane to the
+# caller's own session base, which still covers the SAME workbench's grouped
+# '<sess>-view' sibling (the intentional "one name = one pane across window
+# switches" case) without reaching into a different orchestrator's session.
+own_wb_session() {
+  local sess="$1" rep
+  rep=$(tmux list-panes -t "=$sess" -F '#{pane_id}' 2>/dev/null | head -1)
+  [ -n "$rep" ] && base_session_name "$rep"
+}
+find_pane() {
+  local own=""
+  if [ -n "${WB_SESSION:-}" ]; then
+    own="$(own_wb_session "$WB_SESSION" 2>/dev/null || true)"
+  elif [ -n "${TMUX_PANE:-}" ]; then
+    own="$(base_session_name "$TMUX_PANE" 2>/dev/null || true)"
+  fi
+  for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^wb-'); do
+    # '=' anchors the session name: wb-foo-1a2b3c is a PREFIX of wb-foo-1a2b3c-9f2a1c,
+    # and an unanchored target may match the wrong session.
+    if [ -n "$own" ]; then
+      [ "$(own_wb_session "$s" 2>/dev/null || true)" = "$own" ] || continue
+    fi
+    tmux list-panes -s -t "=$s" -F '#{pane_id} #{@wb_worker} #{pane_dead}' 2>/dev/null \
+      | awk -v n="$NAME" '$2==n{print $1" "$3; exit}'
+  done | head -1
+}
+
+# Warns when NOTHING on this tmux server displays the worker's window. Called on
+# every path that spawns, respawns or re-prompts a pane — not just on a fresh
+# spawn: the client situation changes over a session (layout switch, a closed
+# worker tab), and on 2026-07-25 four running workers were invisible to the user
+# for exactly that reason. Window IDs are compared across ALL clients, because
+# the extension's worker tab attaches through a GROUPED session ('<sess>-view')
+# whose client would not show up under `list-clients -t "=<sess>"`.
+visibility_guard() {
+  local p="$1" wid widx sess wname
+  [ -n "$p" ] || return 0
+  wid=$(tmux display -p -t "$p" '#{window_id}' 2>/dev/null || true)
+  [ -n "$wid" ] || return 0
+  tmux list-clients -F '#{window_id}' 2>/dev/null | grep -qx "$wid" && return 0
+  widx=$(tmux display -p -t "$p" '#{window_index}' 2>/dev/null || true)
+  sess=$(tmux display -p -t "$p" '#{session_name}' 2>/dev/null || true)
+  wname=$(tmux display -p -t "$p" '#{window_name}' 2>/dev/null || true)
+  {
+    echo "WARNUNG: Worker '$NAME' laeuft in Fenster '${wname:-?}' (Index ${widx:-?}) der Session ${sess:-?},"
+    echo "         aber KEIN Client zeigt dieses Fenster gerade an — er arbeitet unsichtbar."
+    echo "         So wird er sichtbar:"
+    echo "           1) im Terminal: tmux-Prefix + Fensterwechsel (Prefix ${widx:-2}, oder Prefix n)"
+    echo "           2) den Worker-Tab der Extension oeffnen ('Claude Workbench — Worker')"
+    echo "         Oder Layout zurueckstellen: wb-state settings set workerLayout split"
+  } >&2
+}
+
+# Jeder Tastendruck dieses Werkzeugs geht durch wb-pane-write (2026-08-06) -- die eine
+# Stelle, die entscheidet, wer in einen Pane schreiben darf. Fuer pi-worker aendert das
+# nichts am Betrieb: er tippt ausschliesslich in WORKER-Panes, und die nehmen weiter
+# alles an. Er geht trotzdem denselben Weg, damit es nicht zwei Fassungen der Regel gibt
+# und damit ein Fehlgriff -- ein Pane-Fund, der versehentlich den Orchestrator trifft --
+# abgelehnt statt ausgefuehrt wird. Ein Rueckfall auf `tmux send-keys` gibt es bewusst
+# nicht: er waere ein Loch, das offensteht, sobald jemand halb installiert.
+PANE_WRITE="$HOME/.local/bin/wb-pane-write"
+pane_fehlt() { echo "FEHLER: $PANE_WRITE fehlt — es wird NICHTS in einen Pane getippt." >&2; return 1; }
+pane_taste()     { [ -x "$PANE_WRITE" ] || pane_fehlt || return 1; "$PANE_WRITE" taste "$1" "$2"; }
+pane_einfuegen() { [ -x "$PANE_WRITE" ] || pane_fehlt || return 1; "$PANE_WRITE" einfuegen "$1"; }
+
+# Basis-Sessionname eines Panes, fuer alles, das ihn als STABILEN SCHLUESSEL
+# braucht (hier: die Registrierung im Zustandsdokument). `#{session_name}` ist
+# INSTABIL, sobald das Fenster in einer Sessiongruppe haengt ('<sess>' und
+# '<sess>-view' teilen sich dieselben Fenster): ein und derselbe Pane meldet je
+# nach Aufrufzeitpunkt mal die Basis, mal die '-view'-Schwester zurueck (gemessen
+# 2026-08-06 auf einem eigenen tmux-Socket -- `display -p -t <pane> '#{session_name}'`
+# fuer einen Pane der Basis 'wb-AI' antwortete 'wb-AI-view', obwohl der Pane ueber
+# `list-panes -t wb-AI` gefunden wurde). `#{session_group}` ist dagegen STABIL: fuer
+# BEIDE Mitglieder einer Gruppe ist es der Name der Basis (mitgemessen im selben
+# Lauf), und leer, solange die Session nie gruppiert wurde -- dann ist sie trivial
+# ihre eigene Basis. Uebernommen aus context-guard's identisch begruendetem
+# base_session_name() statt neu erfunden.
+base_session_name() {
+  local p="$1" sess grp
+  sess=$(tmux display -p -t "$p" '#{session_name}' 2>/dev/null || true)
+  grp=$(tmux display -p -t "$p" '#{session_group}' 2>/dev/null || true)
+  printf '%s' "${grp:-$sess}"
+}
+
+if [ "${1:-}" = "--interrupt" ]; then
+  info=$(find_pane); pane=${info%% *}
+  # A missing worker used to print nothing and exit 0 — the caller then believed
+  # Escape had been sent to a stuck agent that does not even exist.
+  if [ -z "$pane" ]; then
+    echo "FEHLER: kein Pane fuer Worker '$NAME' gefunden — kein Escape gesendet." >&2
+    exit 1
+  fi
+  pane_taste "$pane" Escape \
+    || { echo "FEHLER: Escape an Pane $pane ('$NAME') fehlgeschlagen." >&2; exit 1; }
+  echo "Escape an '$NAME' gesendet."
+  exit 0
+fi
+
+MODEL="${1:?model}"; WORKDIR="${2:?workdir}"; shift 2
+# Worktree-Isolierung (freigegeben 2026-08-04, gebaut in wb-worktree). Der Aufruf
+# steht auch hier und nicht nur in claude-worker, weil "jeder Worker seinen eigenen
+# Arbeitsbaum" sonst am lokalen Modell vorbeiginge: ein pi-Worker wird direkt hier
+# gespawnt und schreibt genauso Dateien. Doppelt ruft es niemand aus Versehen —
+# `ensure` gibt ein Verzeichnis, das schon der Worktree DIESES Workers ist,
+# unveraendert und still zurueck (der Weg ueber claude-worker). Faellt der
+# Worktree-Weg aus (kein git, kein Repo, Schalter aus), bleibt $WORKDIR stehen.
+ORIG_WORKDIR="$WORKDIR"
+if [ -x "$HOME/.local/bin/wb-worktree" ]; then
+  WT_DIR="$("$HOME/.local/bin/wb-worktree" ensure "$NAME" "$WORKDIR")" || WT_DIR=""
+  [ -n "$WT_DIR" ] && [ -d "$WT_DIR" ] && WORKDIR="$WT_DIR"
+fi
+# Vorspann fuer den injizierten Auftrag, wenn WIRKLICH ein eigener Worktree
+# darunterliegt (2026-08-11, Anlass: ein Worker bekam den Projektordner im
+# Auftragstext genannt, sass aber im Worktree, und hat seine Dateien gegen den
+# im Text genannten Hauptbaum aufgeloest — 'git merge' brach danach ab).
+#
+# Erkennung ueber den PFAD, nicht ueber "WT_DIR ist ein Verzeichnis": `ensure`
+# gibt im Abschaltfall (kein git, kein Repo, workerWorktrees=false) $WORKDIR
+# UNVERAENDERT zurueck, und das ist ebenfalls ein gueltiges Verzeichnis — das
+# waere sonst faelschlich als aktiver Worktree gezaehlt worden. Nur ein
+# Ergebnis unter $ROOT/$NAME (wb-worktree's eigene wtpath-Konstruktion) ist ein
+# echter Worktree. Der Zweigname ist dort per Konvention immer "wb/$NAME"
+# (siehe cmd_ensure in wb-worktree) — kein zweiter Aufruf noetig, um ihn zu lesen.
+VORSPANN=""
+case "${WT_DIR:-}" in
+  "$HOME/.pi-workers/worktrees/$NAME"|"$HOME/.pi-workers/worktrees/$NAME"/*)
+    WORKTREE_HAUPTBAUM="$(git -C "$ORIG_WORKDIR" worktree list --porcelain 2>/dev/null \
+      | awk '/^worktree /{sub(/^worktree /,""); print; exit}')"
+    if [ -n "$WORKTREE_HAUPTBAUM" ]; then
+      VORSPANN="[Arbeitsverzeichnis] Dieser Auftrag laeuft in einem eigenen Worktree: $WORKDIR (Zweig wb/$NAME). Jeder Pfad, den Du liest oder schreibst, liegt darunter. Der Hauptbaum $WORKTREE_HAUPTBAUM ist tabu — fasse ihn nicht an, auch wenn der Auftragstext ihn nennt.
+
+"
+    fi
+    ;;
+esac
+# `default` (and `-`) resolves the worker default from the settings menu
+# (SPEC-V2 D). Those two keys were written by the menu and read by NOBODY before.
+# The positional argument stays mandatory, so no existing call changes.
+if [ "$MODEL" = default ] || [ "$MODEL" = - ] || [ "$MODEL" = claude-default ]; then
+  dm=$("$HOME/.local/bin/wb-state" settings get workerModel 2>/dev/null || true)
+  de=$("$HOME/.local/bin/wb-state" settings get workerEffort 2>/dev/null || true)
+  if [ -z "$dm" ]; then
+    echo "FEHLER: Modell 'default' verlangt 'workerModel' in den Settings — dort steht nichts." >&2
+    echo "  Setzen: wb-state settings set workerModel sonnet5   (dazu workerEffort high)" >&2
+    exit 1
+  fi
+  case "$dm" in
+    haiku45|sonnet5|opus5|opus48|fable5|haiku|sonnet|opus|fable) dm="claude-$dm" ;;
+  esac
+  MODEL="$dm"; [ -n "$de" ] && MODEL="$dm:$de"
+  echo "pi-worker: Modell aus den Settings: $MODEL" >&2
+fi
+TASK="$*"
+ENGINE=pi; TITLE="pi:$NAME"
+# Provider fuer den schnellen pi-Pfad (case-Block unten). Ollama ist der
+# Normalfall; grug laeuft ueber den zweiten Anbieter aus ~/.pi/agent/models.json
+# (mlx_lm.server, siehe grug-server) und ueberschreibt diese Variable im
+# eigenen Zweig.
+PIPROVIDER=ollama
+# The rendered-pane pattern the ready-wait below looks for. The two built-in
+# harnesses share it (measured in production since V1); a REGISTRY harness brings
+# its own, which is why an adapter without a measured one cannot start at all
+# (SPEC-V3 A.2/H).
+READY_RE='❯|░|●'
+# ... and the pattern of the INPUT LINE, used to verify that the pasted task really
+# left the input box. Two different questions, two different patterns: aider is ready
+# at '>' and shows its unsent text after the same '>', Claude uses '❯'. Hard-coding
+# '❯' here made the check silently pass for every other harness — it found no input
+# line at all, concluded "empty, so it was sent" and printed "Submission verifiziert"
+# without having verified anything (Reviewer-Befund H1, 2026-07-28). An empty pattern
+# now means the spawn SAYS it could not verify.
+PROMPT_RE='^❯'
+# Platzhalter-Text, der in einer LEEREN Eingabezeile stehen darf (je Harness).
+# Der SCHNELLE Pfad (eingebaute claude-/pi-Aliase) fragt die Registry nicht, brauchte
+# den Wert aber genauso: ein BESCHAEFTIGTER Claude-Pane zeigt in der leeren Eingabe
+# "Press up to edit queued messages", und die Zustellpruefung las das als haengenden
+# Prompt — Nachricht war zugestellt, der Spawn meldete trotzdem FEHLER (gemessen
+# 2026-07-29, Pane %28). Derselbe Text steht als promptIgnore am Harness `claude`.
+PROMPT_IGNORE='^❯ Press up to edit queued messages'
+# Zweiter Absende-Weg je Harness (2026-08-09, SPEC-V3 A.2 altSubmit). Leer fuer die
+# eingebauten Pfade (claude, pi) und fuer jeden Registry-Harness ohne den Eintrag —
+# fuer die aendert sich am Absenden kein Zeichen. Nur der Registry-Zweig unten fuellt
+# beide Variablen, aus 'wb-state models resolve'. Befund, der den Eintrag noetig
+# machte: OpenHands schaltet bei einem MEHRZEILIGEN Einfuegevorgang (Auftrag, Leerzeile,
+# das [Protokoll]-Kommando, das JEDER Auftrag traegt) selbst in einen 'Multi-line'-
+# Eingabemodus um, kenntlich an einem Wechsel der Fusszeile — und darin fuegt Enter nur
+# eine neue Zeile ein, statt abzusenden. Ein zweiter, harness-EIGENER Absende-Schluessel
+# ersetzt Enter nur dann, wenn dessen ANKUENDIGUNG auf dem Bildschirm wirklich steht —
+# nie blind hinterhergeschickt: ein Harness, der laengst abgeschickt hat, saehe sonst
+# eine zweite Taste in seiner naechsten, leeren Eingabe landen (derselbe Fehler wie
+# "blind Enter druecken" im Vertrauensdialog, an dem agy gescheitert ist).
+ALTSUBMIT_TRIGGER=""
+ALTSUBMIT_KEY=""
+# claude models accept an optional effort suffix: claude-haiku:low, claude-fable:medium …
+EFFORT="${MODEL#*:}"; [ "$EFFORT" = "$MODEL" ] && EFFORT=""
+MODEL="${MODEL%%:*}"
+case "$MODEL" in
+  qwen)    MODEL="qwen3.6:35b-a3b-coding-nvfp4" ;;
+  ornith)  MODEL="ornith:35b" ;;
+  ornith9) MODEL="ornith:9b" ;;
+  grug)
+    # Token-freier Default-Coder seit 2026-08-11 (Messung: MLX 4bit schlaegt
+    # Ollama und llama.cpp auf beiden Achsen, siehe regeln/lokale-modelle.md).
+    # Der Server wird bei Bedarf gestartet, nie dauerhaft gehalten (kein
+    # LaunchAgent) — ein Worker gegen einen toten Server ist schlimmer als
+    # einer, der gar nicht startet, deshalb blockiert das hier synchron.
+    "$HOME/.local/bin/grug-server" ensure || {
+      echo "FEHLER: grug-server nicht bereit — pi-worker bricht ab, statt gegen einen toten Server zu starten." >&2
+      exit 1
+    }
+    PIPROVIDER=mlx-lokal
+    MODEL="$HOME/AI/mlx-models/grug-27b-mlx-q4"
+    ;;
+  claude|claude-sonnet|claude-sonnet5) ENGINE=claude; CMODEL="claude-sonnet-5" ;;
+  claude-haiku|claude-haiku45)         ENGINE=claude; CMODEL="claude-haiku-4-5" ;;
+  claude-fable|claude-fable5)          ENGINE=claude; CMODEL="claude-fable-5" ;;
+  claude-opus5)                        ENGINE=claude; CMODEL="claude-opus-5" ;;
+  claude-opus48)                       ENGINE=claude; CMODEL="claude-opus-4-8" ;;
+  claude-opus)                         ENGINE=claude; CMODEL="claude-opus-4-8" ;;
+  # No `*)` branch used to exist: a typo like `sonnet5x` became `claude-sonnet5x`,
+  # fell through every pattern, stayed ENGINE=pi and started pi against an Ollama
+  # model that does not exist — a worker that boots and fails later, silently.
+  claude*|Claude*)
+    # V3 (SPEC-V3 C): the built-in aliases above stay the fast path; an unknown id
+    # asks the REGISTRY before it becomes an error. Only when that is empty too does
+    # the old message stand.
+    if [ -n "$($HOME/.local/bin/wb-state models get "$MODEL" --field id 2>/dev/null || true)" ]; then
+      ENGINE=registry
+    else
+      # A20, Entscheidung des Nutzers vom 2026-08-06: Die Registry ist ein Katalog und
+      # kein Tuersteher. Ein Name, der sich als Claude-Modell ausgibt, startet auch
+      # dann, wenn wir ihn nicht kennen — ob es ihn gibt, sagt die CLI. Bis heute
+      # endete dieser Zweig mit einem Fehler, und ein Modell, das der Anbieter
+      # gestern ausgeliefert hat, war damit bis zur naechsten Registry-Pflege
+      # unbenutzbar. Was ein unbekanntes Modell NICHT bekommt, ist eine Empfehlung:
+      # keine Eignung, kein Kostenhinweis, keine Zeile in der Routing-Tabelle.
+      #
+      # GEMESSEN am selben Tag, und der Grund fuer den Hinweis unten: die CLI weist
+      # einen unbekannten Namen NICHT beim Start zurueck. Sie startet ihre
+      # Oberflaeche, zeigt ihn in der Statuszeile und wartet auf Eingaben; erst die
+      # erste Anfrage scheitert. Ein Tippfehler sieht also aus wie ein arbeitender
+      # Worker, bis das Ergebnis ausbleibt. Deshalb steht der Hinweis hier und nicht
+      # nur in der Dokumentation.
+      #
+      # Nur dieser Zweig ist offen. Ein Name OHNE 'claude'-Praefix landet weiterhin
+      # im Zweig darunter und wird abgelehnt, wenn ihn weder Registry noch Ollama
+      # kennen — sonst wuerde aus dem Tippfehler 'ornith9x' ein Claude-Start.
+      ENGINE=claude; CMODEL="$MODEL"; UNGEMESSEN=1
+      echo "HINWEIS: '$MODEL' steht nicht in der Registry — Start ohne Empfehlung und ohne" >&2
+      echo "  Eignungsangabe. Kennt die CLI den Namen nicht, scheitert erst die erste" >&2
+      echo "  Anfrage IM Pane, nicht der Start: dann bleibt das Ergebnis aus." >&2
+      echo "  Registrieren: wb-state models add … (dann gibt es auch Deckel und Eignung)." >&2
+    fi ;;
+  *)
+    # Registry first, THEN the raw-Ollama-id passthrough: a model somebody took the
+    # trouble to register must win over the same string happening to be installed in
+    # Ollama — otherwise its harness, effort caps and role filter would be skipped.
+    if [ -n "$($HOME/.local/bin/wb-state models get "$MODEL" --field id 2>/dev/null || true)" ]; then
+      ENGINE=registry
+    # A raw Ollama model id stays allowed (documented above), but only if it really
+    # exists here — otherwise it is a typo and must not start anything.
+    elif command -v ollama >/dev/null 2>&1 \
+       && ollama list 2>/dev/null | awk 'NR>1{print $1; sub(/:.*/,"",$1); print $1}' | grep -qx "$MODEL"; then
+      : # installed locally, pass it through
+    else
+      echo "FEHLER: unbekanntes Modell '$MODEL'." >&2
+      echo "  Lokal: qwen ornith ornith9 grug — oder eine installierte Ollama-ID ('ollama list')." >&2
+      echo "  Claude: haiku45 sonnet5 opus5 opus48 fable5 (ueber claude-worker)." >&2
+      echo "  Registriert: $($HOME/.local/bin/wb-state models list 2>/dev/null | tr '\n' ' ')" >&2
+      exit 1
+    fi ;;
+esac
+
+if [ "$ENGINE" = claude ]; then
+  TITLE="claude:$NAME"
+  # Welche Stufe wirklich gestartet wird, entscheidet EINE Stelle: wb-state. Bis
+  # zum 2026-08-06 stand die Pruefung hier ein zweites Mal in bash -- eine feste
+  # Vierer-Liste, eine unbedingte Ablehnung von `max` und ein eigener
+  # Rangvergleich gegen `maxEffort`. Drei Kopien einer Entscheidung, die woanders
+  # schon getroffen wird, und sie waren bereits auseinandergelaufen (der
+  # entfernte Kommentar nannte fable jahrelang mit einem Deckel, den die Registry
+  # nicht mehr trug). `models effort` beantwortet jetzt beides in einem Aufruf:
+  # nimmt der Harness die Stufe an, und laesst der Deckel sie zu.
+  #
+  # --mensch wird DURCHGEREICHT, nicht neu entschieden: geprueft wurde ganz oben,
+  # am Aufruf, wo die Herkunft noch messbar ist.
+  # `--harness claude` sagt, WOMIT dieses Modell laeuft, auch wenn es (noch) in
+  # keiner Registry steht: dieser Zweig ist der eingebaute schnelle Pfad, und ohne
+  # models.json gibt es zwar die eingebauten Adapter, aber keine eingebauten
+  # Modelleintraege. Ohne die Angabe scheiterte hier jeder claude-Worker einer
+  # Werkbank ohne Registry-Datei.
+  EFF_OUT="$($HOME/.local/bin/wb-state models effort "$CMODEL" --harness claude \
+              ${EFFORT:+--effort "$EFFORT"} ${MENSCH:+--mensch} 2>&1)" || {
+    printf '%s\n' "$EFF_OUT" >&2
+    exit 1
+  }
+  # Die Antwort ist die LETZTE Zeile: davor koennen Hinweise stehen (etwa das
+  # Absenken einer Vorgabe auf den Deckel), und die gehoeren nach stderr des
+  # Aufrufers, nicht in die Variable.
+  EFFORT="$(printf '%s\n' "$EFF_OUT" | tail -1)"
+  VOR="$(printf '%s\n' "$EFF_OUT" | sed '$d')"
+  [ -n "$VOR" ] && printf '%s\n' "$VOR" >&2
+  if [ -n "$MENSCH" ]; then
+    echo "pi-worker: als MENSCH gestartet — der Effort-Deckel gilt fuer diesen Start nicht (effort $EFFORT)." >&2
+  fi
+  # --dangerously-skip-permissions: workers run fully autonomous. settings.json
+  # defaultMode is NOT reliably inherited by these sessions, so it is set
+  # explicitly -- but since 2026-08-06 only when `workerSkipPermissions` says so.
+  # The key defaults to true, and an unreadable settings file also yields true:
+  # the fail-safe direction here is "keeps working as before", because switching
+  # it off means every worker stops at its own permission prompt and a night run
+  # stands until morning. Guards and the ask stage are untouched by this -- they
+  # hang off the hook, not off the CLI.
+  #
+  # Remote Control stays OFF here (Vorgabe 2026-08-05: Worker starten
+  # standardmaessig ohne). '--remote-control' is opt-in on the claude CLI --
+  # absent = off, no settings.json key and no env var can switch it on (checked
+  # 2026-08-05) -- so this is the inherited default, not a flag added below.
+  SKIPFLAG=" --dangerously-skip-permissions"
+  if [ "$("$HOME/.local/bin/wb-state" settings get workerSkipPermissions 2>/dev/null)" = "false" ]; then
+    SKIPFLAG=""
+    echo "pi-worker: workerSkipPermissions=false — dieser Worker haelt bei jedem Schreibzugriff an." >&2
+  fi
+  CFLAGS="--model $CMODEL --effort ${EFFORT:-medium}$SKIPFLAG"
+  # Die Chat-Zuordnung (SPEC-V4 6.3 Punkt 4) installiert sich sonst NIE fuer
+  # diesen Zweig: er baut seine Startzeile selbst und laeuft nie durch
+  # wb-harness-run, dem einzigen anderen Ort, der den Hook eintraegt. 'claude'
+  # ist zudem der einzige Harness mit session.zuordnung=hook (models.default.json) --
+  # ohne diesen Aufruf bekaeme die Chat-Ansicht fuer KEINE einzige Claude-Sitzung
+  # eine Sitzungskennung am Pane. Gemeinsame Stelle mit dem Registry-Zweig unten:
+  # shell/wb-chat-hook-install, nicht hier ein zweites Mal nachgebaut (siehe dort
+  # fuer die Begruendung). Repo-Fassung zuerst, gleiche Bauart wie wb-rolle.
+  CHATHOOK_INSTALL=""
+  for kandidat in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/wb-chat-hook-install" \
+                  "$HOME/.local/bin/wb-chat-hook-install"; do
+    [ -x "$kandidat" ] && { CHATHOOK_INSTALL="$kandidat"; break; }
+  done
+  if [ -n "$CHATHOOK_INSTALL" ]; then
+    "$CHATHOOK_INSTALL" claude
+  else
+    echo "pi-worker: wb-chat-hook-install nicht gefunden — keine Chat-Zuordnung eingetragen." >&2
+  fi
+  CHAT="cd $(printf %q "$WORKDIR") && exec $HOME/.local/bin/claude $CFLAGS --append-system-prompt \"\$(cat $HOME/.claude/roles/agent.md)\""
+elif [ "$ENGINE" = registry ]; then
+  # V3 (SPEC-V3 B/C): a registered model. `wb-state models resolve` is the ONLY
+  # place a start command is built — it also enforces the effort caps, the role
+  # filter, the machine list and refuses an adapter whose readyPattern was never
+  # measured. Everything below this branch (ready-wait, paste+enter verification,
+  # result protocol, visibility guard, maxWorkers, state entry) stays IDENTICAL for
+  # every harness; that is the contract the rest of the workbench hangs on.
+  RESOLVED="$($HOME/.local/bin/wb-state models resolve "$MODEL" --role worker \
+                ${EFFORT:+--effort "$EFFORT"} ${MENSCH:+--mensch} \
+                --dir "$WORKDIR" --name "$NAME")" || exit 1
+  rfield() { printf '%s\n' "$RESOLVED" | awk -F'\t' -v k="$1" '$1==k{print $2; exit}'; }
+  RHARNESS="$(rfield harness)"; READY_RE="$(rfield ready)"; REFFORT="$(rfield effort)"
+  PROMPT_RE="$(rfield prompt)"
+  PROMPT_IGNORE="$(rfield promptignore)"
+  ALTSUBMIT_TRIGGER="$(rfield altsubmittrigger)"
+  ALTSUBMIT_KEY="$(rfield altsubmitkey)"
+  [ -n "$RHARNESS" ] && [ -n "$READY_RE" ] || {
+    echo "FEHLER: resolve lieferte kein Harness/Ready-Muster fuer '$MODEL' — kein Spawn." >&2; exit 1; }
+  TITLE="$RHARNESS:$NAME"
+  # The pane runs the shim, not the resolved line itself: the API key must never
+  # pass through argv or a tmux option, and @wb_cmd stays re-executable (SPEC-V3 A.1).
+  CHAT="exec $HOME/.local/bin/wb-harness-run --model $(printf %q "$MODEL") --role worker --effort $(printf %q "$REFFORT") --dir $(printf %q "$WORKDIR") --name $(printf %q "$NAME")"
+else
+  # OLLAMA_HOST is pinned explicitly so the pane never depends on an inherited
+  # environment. NB (measured on peer 2026-07-25): pi does NOT read OLLAMA_HOST —
+  # it takes the endpoint from ~/.pi/agent/models.json (baseUrl). On peer that
+  # baseUrl points at 127.0.0.1:11434, which is an SSH tunnel to the Mac
+  # (mac-ollama-tunnel.service), so a "local" pi worker here runs on Mac hardware.
+  #
+  # 2026-08-11: die Adresse kommt jetzt aus den Einstellungen (ollamaEndpoint),
+  # nicht mehr fest aus dem Quelltext. Gelesen wird sie wie ueberall ueber
+  # `wb-state settings get` -- eine leere oder unsinnige Form (AUFLAGE des
+  # Auftrags: nie still alle lokalen Modelle abschalten) faellt auf denselben
+  # Wert zurueck, der bisher hier stand.
+  OLLAMA_ENDPOINT="$("$HOME/.local/bin/wb-state" settings get ollamaEndpoint 2>/dev/null)"
+  case "$OLLAMA_ENDPOINT" in
+    http://*|https://*) ;;
+    *) OLLAMA_ENDPOINT="http://127.0.0.1:11434" ;;
+  esac
+  CHAT="cd $(printf %q "$WORKDIR") && export PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH && export OLLAMA_HOST=$(printf %q "$OLLAMA_ENDPOINT") && exec pi --provider $(printf %q "$PIPROVIDER") --model $(printf %q "$MODEL") --session-dir $(printf %q "$SESSDIR") \$( ls $(printf %q "$SESSDIR")/*.json* >/dev/null 2>&1 && echo --continue ) --append-system-prompt \$HOME/.pi/agent/WORKER.md"
+fi
+
+# What the state file / sidebar records as this worker's kind: the harness that
+# actually runs in the pane (V2 wrote 'claude' or 'pi'; a registry worker writes its
+# own harness id, e.g. 'codex').
+KIND="$ENGINE"; [ "$ENGINE" = registry ] && KIND="${RHARNESS:-registry}"
+# Claude transcripts get recorded for the built-in claude engine AND for a REGISTRY
+# model whose harness is claude — same files, same crash attribution, so a registry
+# entry does not quietly lose it.
+CTRACK=""; { [ "$ENGINE" = claude ] || [ "${RHARNESS:-}" = claude ]; } && CTRACK=1
+
+# ── Kann diese Spur ueberhaupt liefern? (2026-08-10) ──────────────────────────
+# Anlass: ein codex-Worker wurde in ein seit dem 07.08. erschoepftes Monatslimit
+# gespawnt. Der Pane startete, nahm den Auftrag an und lief ins Leere -- ein
+# ganzer Zug fuer nichts, und gemerkt hat es erst der Mensch. Dasselbe gilt fuer
+# ein lokales Modell, das jemand aus Ollama geloescht hat.
+#
+# Die Frage steht hier und nicht weiter oben, weil erst hinter den ENGINE-Zweigen
+# feststeht, WELCHER Harness mit WELCHEM Modell laeuft. Sie steht vor find_pane,
+# damit sie auch den Weg deckt, der einen bestehenden Pane wiederverwendet: ein
+# erschoepftes Konto verschluckt eine Nachricht in einen lebenden Pane genauso.
+#
+# ZWEI GRENZEN, die `wb-kontingent` selbst einhaelt und die hier sichtbar bleiben
+# muessen: nur ein NACHWEIS sperrt (alles Unbekannte startet weiter), und
+# gelesen wird eine Zustandsdatei, keine frische Messung -- aufgefrischt wird
+# nur, was aelter als eine Stunde ist. Faellt das Werkzeug ganz aus (nicht
+# installiert, kaputt, kein python3), startet der Worker wie vorher: eine
+# Vorsichtspruefung, die selbst zum Ausfall wird, waere schlimmer als keine.
+if [ -z "${WB_KONTINGENT_SKIP:-}" ] && [ -x "$HOME/.local/bin/wb-kontingent" ]; then
+  KMODELL="$MODEL"; [ "$ENGINE" = claude ] && KMODELL="$CMODEL"
+  if ! "$HOME/.local/bin/wb-kontingent" pruefen "$KIND" "$KMODELL"; then
+    echo "FEHLER: Worker '$NAME' NICHT gestartet — die Begruendung steht in der Zeile darueber." >&2
+    echo "  Stand ansehen: wb-kontingent zeigen $KIND" >&2
+    exit 1
+  fi
+fi
+
+info=$(find_pane); pane=${info%% *}; dead=${info##* }
+
+# Transcript recording for CLAUDE workers (SPEC-V2 B), same mechanism wb-code uses for
+# the orchestrator's own conversation: not a shared function (wb-code carries this
+# session's crash-recovery logic and stays untouched per instruction), but the same
+# formulation and the same precautions, deliberately.
+transcript_dir() {   # Claude Code's project dir for a working directory
+  printf '%s/.claude/projects/%s' "$HOME" "$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-')"
+}
+
+# Snapshotted BEFORE any spawn/respawn decision below, so it is in place no matter
+# which branch actually starts a new claude process. Only meaningful for the claude
+# engine — pi never writes here.
+CS_BEFORE=""
+
+# Aufraeumen bei jedem fruehen Abbruch (2026-08-16, bugjagd shell/niedrig, "kein
+# trap"): EIN gemeinsamer Handler fuer CS_BEFORE hier UND MAXW_LOCK weiter unten --
+# reproduziert am simulierten TUI-Timeout-Abbruch (Zeile "Agent-TUI ... nicht
+# bereit"): die mktemp-Datei blieb bisher liegen, weil zwischen ihrer Entstehung
+# und ihrer geplanten Uebergabe an record_worker_conversation() viele `exit 1`
+# liegen (Ziel nicht bestimmbar, maxWorkers erreicht, Pane-Anlage schlaegt fehl,
+# TUI wird nie bereit, ...). EIN gemeinsamer Handler statt je einem eigenen `trap
+# ... EXIT`: bash kennt nur EINEN Handler je Signal, ein zweiter wuerde den ersten
+# stillschweigend ersetzen. Beide Variablen werden bei erfolgreicher Uebergabe
+# explizit auf "" gesetzt, danach tut dieser Handler nichts mehr -- entscheidend
+# bei CS_BEFORE: sobald record_worker_conversation() die Datei an einen
+# abgekoppelten Hintergrundprozess uebergeben hat, wuerde ein bedingungsloses
+# `rm -f` hier dessen bis zu 40s laufende Poll-Schleife sofort mit einer
+# fehlenden Datei abreissen lassen.
+pi_worker_cleanup() {
+  [ -n "${CS_BEFORE:-}" ] && rm -f "$CS_BEFORE"
+  [ -n "${MAXW_LOCK:-}" ] && rmdir "$MAXW_LOCK" 2>/dev/null
+  return 0
+}
+trap pi_worker_cleanup EXIT
+
+if [ -n "$CTRACK" ]; then
+  CS_BEFORE="$(mktemp "${TMPDIR:-/tmp}/pi-worker-transcripts.XXXXXX")"
+  ls "$(transcript_dir "$WORKDIR")" 2>/dev/null | grep '\.jsonl$' | sort > "$CS_BEFORE" || true
+fi
+
+# Backgrounded: Claude needs a moment to write the file, the caller must not wait.
+#
+# Matched by CONTENT, not by counting candidates (Reviewer-Befund 2, round 5 — the user's
+# call over the reviewer's proposed pane_pid check: `lsof` on the transcript does not
+# help, Claude does not hold the file open, measured while building wb-code's identical
+# mechanism). Two claude workers spawned into the SAME WORKDIR seconds apart used to be
+# misattributed: the round-4 "exactly one new file" rule only caught two transcripts
+# appearing within the SAME poll second, not "worker B's first poll sees exactly worker
+# A's brand-new file because A's message hasn't landed yet" -- the wrong id got recorded,
+# worse than no id, since it silently pointed the BLIND message at a stranger's chat.
+# Every spawn's first message embeds a marker no other spawn could produce: the exact
+# path of ITS OWN result file (already unique — timestamped, namespaced by worker name —
+# and already sent to every worker for its own protocol, not added for this). The
+# watcher greps every NEW candidate's raw content for that marker; only a transcript that
+# actually contains it gets recorded. None of the current candidates contain it yet
+# (message not delivered to the transcript on disk yet) -> keep polling, not give up —
+# the deadline is the only thing that gives up, and it records nothing.
+record_worker_conversation() {
+  local tdir before marker log
+  tdir="$(transcript_dir "$WORKDIR")"
+  before="$1"
+  marker="$2"
+  log="$HOME/.local/state/wb-code.log"   # same log wb-code's own watcher writes to
+  mkdir -p "$(dirname "$log")"
+  nohup bash -c '
+    tdir="$1"; before="$2"; name="$3"; engine="$4"; model="$5"; dir="$6"; sess="$7"; marker="$8"
+    stamp() { date "+%F %T"; }
+    for i in $(seq 1 40); do
+      sleep 1
+      new="$(ls "$tdir" 2>/dev/null | grep "\.jsonl$" | sort | comm -13 "$before" -)"
+      [ -z "$new" ] && continue
+      found=""
+      while IFS= read -r fname; do
+        [ -n "$fname" ] || continue
+        if grep -qF -- "$marker" "$tdir/$fname" 2>/dev/null; then
+          found="$fname"
+          break
+        fi
+      done <<EOFCANDIDATES
+$new
+EOFCANDIDATES
+      [ -z "$found" ] && continue
+      id="${found%.jsonl}"
+      "$HOME/.local/bin/wb-state" add-worker "$name" "$engine" "$model" "$dir" "$sess" --claude-session "$id"
+      echo "$(stamp) pi-worker: Unterhaltung $id gemerkt (Worker $name, per Marker positiv zugeordnet)."
+      break
+    done
+    rm -f "$before"
+  ' _ "$tdir" "$before" "$NAME" "$KIND" "$WBMODEL" "$WORKDIR" "$WBSESS" "$marker" >>"$log" 2>&1 &
+}
+
+# Symlink-Falle (2026-08-16): latest.md zeigte bisher SOFORT auf $RES -- die
+# Datei, die der Worker erst am ENDE schreibt. Bis dahin ist der Symlink ein
+# haengender Verweis: `cat`/`test -s latest.md` liefern nichts, ununterscheidbar
+# von "nie gespawnt" (repro: frischer Symlink auf eine noch nicht existierende
+# Datei -- `test -s` FALSE, `cat` "No such file or directory", genau wie bei
+# einem komplett fehlenden latest.md). Eine zweite Orchestrator-Session hat
+# deshalb zwei laengst fertige Ergebnisse fuer "nie gespawnt" gehalten.
+#
+# Jetzt zeigt latest.md waehrend der Laufzeit auf eine ECHTE, lesbare
+# Platzhalterdatei (Name/Modell/Startzeit/Zielpfad drinnen); diese Funktion
+# biegt ihn um, SOBALD $RES wirklich etwas enthaelt. $RES selbst wird davon nie
+# beruehrt -- die dokumentierte Deadline-Warteschleife `until [ -s "$RES" ];
+# do sleep 5; done` (siehe die Zeile, die sie am Ende dieses Skripts ausgibt)
+# haengt ausschliesslich an dieser einen Datei und aendert sich nicht.
+#
+# Abgekoppelt, mit einer GROSSZUEGIGEN, aber ENDLICHEN Frist (6 h im 15-s-Takt):
+# ein Worker darf lange laufen, aber ein fuer immer laufender Beobachter waere
+# selbst ein Prozess-Hygiene-Fehler. Gibt der Watcher auf, bleibt latest.md
+# schlicht beim Platzhalter stehen -- `wb-result` und die Deadline-Schleife
+# funktionieren trotzdem weiter (siehe wb-result, das den Platzhalter am Namen
+# erkennt und ihn nicht als "fertig" meldet).
+finalize_latest_when_done() {
+  local resdir res log
+  resdir="$1"; res="$2"
+  log="$HOME/.local/state/wb-code.log"
+  mkdir -p "$(dirname "$log")"
+  nohup bash -c '
+    resdir="$1"; res="$2"
+    stamp() { date "+%F %T"; }
+    for i in $(seq 1 1440); do
+      sleep 15
+      if [ -s "$res" ]; then
+        ln -sf "$res" "$resdir/latest.md"
+        echo "$(stamp) pi-worker: latest.md auf das Ergebnis umgebogen ($res)."
+        exit 0
+      fi
+    done
+    echo "$(stamp) pi-worker: Platzhalter-Beobachter fuer $res nach 6h aufgegeben -- latest.md bleibt der Platzhalter."
+  ' _ "$resdir" "$res" >>"$log" 2>&1 &
+}
+
+# DIE WORKBENCHES, IN DIE VON AUSSEN GESPAWNT WERDEN DARF.
+#
+# Seit dem 12.08. gibt es eine zweite Sorte `wb-*`-Session: die WERKSTATT einer
+# Chat-Sitzung der Workbench-Oberflaeche (app/src/main/chatwerkstatt.ts). Sie
+# traegt das Praefix, weil `find_pane` oben und `wb-close` darauf filtern -- und
+# genau dadurch wirkte sie auf die Ziel-Suche unten zurueck:
+#
+#   Stufe 4 verlangt GENAU EINE `wb-*`-Session. Sobald eine Chat-Sitzung offen
+#   war, waren es zwei, und ein `claude-worker` aus einem gewoehnlichen Terminal
+#   endete mit „Ziel-Workbench nicht eindeutig bestimmbar".
+#   Stufe 3 trifft schaerfer: hatte der Mensch gerade zu einem Chat-Worker
+#   gewechselt, war die WERKSTATT die angehaengte Session -- und ein danach von
+#   aussen gestarteter Worker landete in ihr statt in der Haupt-Workbench.
+#
+# Eine Werkstatt ist deshalb NUR ueber `WB_SESSION` erreichbar (Stufe 0), also
+# genau ueber den Weg, den die Chat-Sitzung selbst benutzt. Ihr eigener Pane
+# (Stufe 1) und die Ahnenreihe (Stufe 2) bleiben unberuehrt: wer wirklich DORT
+# sitzt, meint auch sie.
+#
+# ERKANNT WIRD SIE AN DER SESSION-OPTION `@wb_chat`, nicht am Namen. Der Name
+# faengt zwar mit `wb-chat-` an, aber `wb-code` baut fuer einen Ordner namens
+# `chat-foo` denselben Anfang -- eine echte Terminal-Sitzung waere damit
+# unsichtbar geworden. Die Option setzt nur, wer die Werkstatt anlegt.
+wb_kandidaten() {   # <nur angehaengte: 1|0>
+  tmux list-sessions -F '#{session_attached}	#{session_name}	#{@wb_chat}' 2>/dev/null \
+    | awk -F'\t' -v nur="$1" '$2 ~ /^wb-/ && $3 != "1" && (nur == 0 || $1 >= 1) { print $2 }'
+}
+
+# Die uebergangenen Werkstaetten -- nur fuer die Fehlermeldung.
+chat_werkstaetten() {
+  tmux list-sessions -F '#{session_name}	#{@wb_chat}' 2>/dev/null \
+    | awk -F'\t' '$2 == "1" { print $1 }'
+}
+
+find_caller_session() {
+  # walk our process ancestry: the caller (orchestrator) lives inside a tmux
+  # pane whose pane_pid is one of our ancestors — that pane's session wins.
+  local map pid ppid
+  map=$(tmux list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null)
+  pid=$$
+  while [ "$pid" -gt 1 ] 2>/dev/null; do
+    echo "$map" | awk -v p="$pid" '$1==p{print $2; exit}' | grep '^wb-' && return 0
+    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
+    [ -z "$ppid" ] && return 1
+    pid=$ppid
+  done
+  return 1
+}
+
+# Die Rolle setzt seit 2026-08-07 `wb-rolle`: es schreibt die Pane-Option UND den
+# Registereintrag, den die Guards als zweite, unabhaengige Quelle lesen. Der
+# Unterschied zum Angriff ist gemessen, nicht behauptet -- hier wird ein FREMDER,
+# gerade erst angelegter Pane markiert, fuer den es noch keinen Eintrag gibt; wer
+# seinen EIGENEN Pane hochstufen will, wird von wb-rolle abgelehnt.
+# Fehlt das Werkzeug (Maschine noch nicht abgeglichen), bleibt es beim alten Weg:
+# ein Spawn darf daran nicht scheitern, und die Pane-Option allein ist genau der
+# Stand von vorher, nie ein schwaecherer.
+markiere_rolle() {   # <pane> <rolle>
+  if [ -x "$HOME/.local/bin/wb-rolle" ]; then
+    "$HOME/.local/bin/wb-rolle" setzen "$1" "$2" \
+      || echo "pi-worker: wb-rolle konnte $1 nicht als $2 registrieren — Rolle steht nur in der Pane-Option." >&2
+  else
+    tmux set -p -t "$1" @wb_role "$2"
+  fi
+}
+
+if [ -z "$pane" ]; then
+  # spawn a fresh permanent chat pane in the RIGHT workbench:
+  # 0) $WB_SESSION if set   1) our own pane if inside tmux
+  # 2) the calling orchestrator's session
+  # 3) the attached wb-* session    4) the only wb-* session (else error)
+  # Stufen 3 und 4 uebergehen die Werkstaetten der Chat-Sitzungen; siehe
+  # `wb_kandidaten` oben.
+  # WB_SESSION is the explicit form for callers that have no tmux context at all
+  # (an ssh spawn has no TMUX_PANE, and a machine with several wb-* sessions cannot
+  # be guessed). '=' anchors it, since wb-foo-1a2b3c is a prefix of wb-foo-1a2b3c-9f2a1c.
+  TARGET=""
+  [ -n "${WB_SESSION:-}" ] && TARGET="=$WB_SESSION"
+  [ -z "$TARGET" ] && TARGET="${TMUX_PANE:-}"
+  [ -z "$TARGET" ] && TARGET=$(find_caller_session || true)
+  [ -z "$TARGET" ] && TARGET=$(wb_kandidaten 1 | head -1)
+  if [ -z "$TARGET" ]; then
+    n=$(wb_kandidaten 0 | grep -c . || true)
+    [ "$n" = "1" ] && TARGET=$(wb_kandidaten 0)
+  fi
+  if [ -z "$TARGET" ]; then
+    echo "FEHLER: Ziel-Workbench nicht eindeutig bestimmbar (keine/mehrere wb-* Sessions)."
+    # Sagen, WAS uebergangen wurde. Ohne diese Zeile sucht jemand nach einer
+    # zweiten Workbench, die es gar nicht gibt -- eine Chat-Werkstatt sieht in
+    # `tmux ls` aus wie eine.
+    wcount=$(chat_werkstaetten | grep -c . || true)
+    [ "${wcount:-0}" -gt 0 ] && \
+      echo "       ($wcount Chat-Werkstatt/-Werkstaetten uebergangen: $(chat_werkstaetten | tr '\n' ' ')— sie sind nur ueber WB_SESSION erreichbar.)" >&2
+    exit 1
+  fi
+  # `split-window -t` needs a PANE target, and a session name is not one: with '='
+  # it fails outright ("can't find pane: =wb-foo"), and `display -p -t "=<session>"`
+  # silently returns EMPTY (both measured on peer, tmux 3.5a, 2026-07-25). That hit
+  # the WB_SESSION path in "split" layout — the split failed, $pane stayed empty and
+  # the `tmux set -p -t ""` calls below then relabelled a FOREIGN pane (a second
+  # session's ORCHESTRATOR) as this worker. `list-panes -t` does resolve a session
+  # target, so normalise to a real pane id once, here, for both layouts.
+  case "$TARGET" in
+    %*) ;;
+    *)  resolved=$(tmux list-panes -t "$TARGET" -F '#{pane_id} #{pane_active}' 2>/dev/null | awk '$2==1{print $1; exit}')
+        [ -n "$resolved" ] || { echo "FEHLER: Ziel '$TARGET' hat keinen Pane — kein Spawn." >&2; exit 1; }
+        TARGET="$resolved" ;;
+  esac
+  # maxWorkers (SPEC-V2 A): this branch is reached ONLY for a genuine new spawn — a
+  # reused pane returns via `elif [ "$dead" = "1" ]` / the plain `else` below and
+  # never gets here, so reuse never counts against the cap. Counts `@wb_role=worker`
+  # panes in the resolved TARGET session; the cap fails loudly and BEFORE anything
+  # is created, never a silent no-op.
+  SESS_T=$(tmux display -p -t "$TARGET" '#{session_name}' 2>/dev/null || true)
+  # Count-then-create is a TOCTOU race without a lock (2026-08-16, bugjagd
+  # shell/mittel, pi-worker:673-700): two spawns that both read WCOUNT before
+  # either tags a new pane both see the same stale count and both pass.
+  # Reproduced: cap=8, 3 workers already running, 10 concurrent spawns each
+  # read '3/8' and all proceed — 11 tagged panes on the far side, cap blown by
+  # 3. mkdir is the one lock primitive shell and (elsewhere) Node can both
+  # take without a dependency (same reasoning as wb-grid's/wb-state's mkdir
+  # locks); self-heals after 10s so a killed spawn cannot wedge every future
+  # one. Scoped per SESS_T so spawns into different sessions never wait on
+  # each other. Held from the count through the new pane's @wb_role tag below
+  # -- released right after tagging, or by the EXIT trap on any early exit
+  # (maxWorkers refusal, failed split/new-window).
+  MAXW_LOCK=""
+  if [ -n "$SESS_T" ]; then
+    MAXW_LOCKDIR="$HOME/.local/state/wb-worker-maxw"
+    mkdir -p "$MAXW_LOCKDIR" 2>/dev/null || true
+    MAXW_LOCK="$MAXW_LOCKDIR/$(printf '%s' "$SESS_T" | tr -c 'a-zA-Z0-9' '-').lock"
+    MAXW_WAITED=0
+    while ! mkdir "$MAXW_LOCK" 2>/dev/null; do
+      MAXW_AGE=$(( $(date +%s) - $(stat -f %m "$MAXW_LOCK" 2>/dev/null || stat -c %Y "$MAXW_LOCK" 2>/dev/null || echo 0) ))
+      if [ "$MAXW_AGE" -ge 10 ]; then rm -rf "$MAXW_LOCK"; continue; fi
+      MAXW_WAITED=$((MAXW_WAITED + 1))
+      if [ "$MAXW_WAITED" -ge 100 ]; then
+        echo "FEHLER: maxWorkers-Sperre fuer Session $SESS_T haengt seit >10s — kein Spawn." >&2
+        exit 1
+      fi
+      sleep 0.1
+    done
+    # Kein eigener trap hier mehr (2026-08-16): pi_worker_cleanup() ist schon seit
+    # der CS_BEFORE-Einrichtung oben aktiv und deckt MAXW_LOCK mit ab -- ein zweiter
+    # `trap ... EXIT` wuerde ihn nur ersetzen, nicht ergaenzen.
+    MAXW=$($HOME/.local/bin/wb-state settings get maxWorkers 2>/dev/null || true)
+    # Der Sanitizer faengt jetzt auch absurd lange Zahlen ab: '99999999999999999999'
+    # besteht nur aus Ziffern, sprengt aber den Zahlenbereich der Shell, und '[ … -ge
+    # 1 ]' warf die rohe Meldung '[: … integer expression expected' in das Terminal
+    # des Orchestrators (Stress-Befund B16). Neun Stellen sind mehr als genug.
+    case "$MAXW" in
+      ''|*[!0-9]*) MAXW=8 ;;
+      ?????????*)  echo "WARNUNG: maxWorkers='$MAXW' ist keine benutzbare Zahl — es gilt 8." >&2
+                   MAXW=8 ;;
+      *) [ "$MAXW" -ge 1 ] || MAXW=8 ;;
+    esac
+    # DEAD panes excluded (Reviewer-Befund 4): remain-on-exit keeps a crashed/exited
+    # worker's pane standing with @wb_role=worker still set, so counting pane_dead=1
+    # panes toward the cap blocks a fresh spawn against slots nothing is using.
+    WCOUNT=$(tmux list-panes -s -t "=$SESS_T" -F '#{@wb_role}:#{pane_dead}' 2>/dev/null \
+      | awk -F: '$1=="worker" && $2=="0"' | wc -l | tr -d ' ')
+    if [ "$WCOUNT" -ge "$MAXW" ]; then
+      echo "FEHLER: maxWorkers erreicht ($WCOUNT/$MAXW, Setting 'maxWorkers') in Session $SESS_T — kein Spawn. Vorhandenen Worker schliessen (wb-close) oder maxWorkers in den Settings erhoehen." >&2
+      exit 1
+    fi
+  fi
+  # Worker layout (SPEC-V2 section C): "split" = V1, a pane in the orchestrator's
+  # window; "window" = all workers together in the session's window named
+  # `workers`, which is created on the first worker.
+  LAYOUT=$($HOME/.local/bin/wb-state settings get workerLayout 2>/dev/null || true)
+  [ -n "$LAYOUT" ] || LAYOUT=split
+  if [ "$LAYOUT" = window ]; then
+    # Target session by NAME. With WB_SESSION we already have it — asking tmux would
+    # even fail, because `display -p -t "=<session>"` is a PANE target and does not
+    # resolve a bare session ("can't find pane"). An empty name here used to fall back
+    # to tmux's "current session" and dropped the worker into a FOREIGN workbench, so
+    # this now fails loudly instead of guessing.
+    if [ -n "${WB_SESSION:-}" ]; then
+      WBSESS_T="$WB_SESSION"
+    else
+      WBSESS_T=$(tmux display -p -t "$TARGET" '#{session_name}' 2>/dev/null || true)
+    fi
+    [ -n "$WBSESS_T" ] && : || { echo "FEHLER: Zielsession fuer das 'workers'-Fenster nicht bestimmbar (TARGET='$TARGET'). Kein Spawn." >&2; exit 1; }
+    wwin=$(tmux list-windows -t "=$WBSESS_T" -F '#{window_id} #{window_name}' 2>/dev/null | awk '$2=="workers"{print $1; exit}')
+    if [ -n "$wwin" ]; then
+      wtgt=$(tmux list-panes -t "$wwin" -F '#{pane_id} #{pane_active}' 2>/dev/null | awk '$2==1{print $1; exit}')
+      # Verschwindet das 'workers'-Fenster zwischen den beiden Abfragen, bleibt $wtgt
+      # leer — und `split-window -t ""` schlaegt NICHT fehl, sondern trifft das aktive
+      # Pane der aktuellen Session, also womoeglich eine fremde Workbench (gemessen
+      # 2026-08-15 auf eigenem Socket: rc=0, ein Pane-Id wird zurueckgegeben, der Pane
+      # landet in einer anderen Session). Derselbe Fehlertyp wie beim leeren $TARGET
+      # weiter oben: lieber laut abbrechen als still am falschen Ort spawnen.
+      [ -n "$wtgt" ] || { echo "FEHLER: 'workers'-Fenster von '$WBSESS_T' hat kein aktives Pane mehr (Fenster verschwunden?). Kein Spawn." >&2; exit 1; }
+      pane=$(tmux split-window -d -t "$wtgt" -P -F '#{pane_id}' "bash -lc $(printf %q "$CHAT")")
+    else
+      pane=$(tmux new-window -d -t "=$WBSESS_T:" -n workers -P -F '#{pane_id}' "bash -lc $(printf %q "$CHAT")")
+      # global automatic-rename is on; the window must keep the contract name.
+      tmux set-option -w -t "$pane" automatic-rename off 2>/dev/null
+    fi
+  else
+    pane=$(tmux split-window -d -t "$TARGET" -P -F '#{pane_id}' "bash -lc $(printf %q "$CHAT")")
+  fi
+  # An empty $pane means the split/new-window above failed. `tmux set -p -t ""`
+  # does NOT error — it silently targets tmux's current pane, which is how a failed
+  # spawn used to overwrite a foreign orchestrator's @wb_role/@wb_worker. Never let
+  # an unknown pane be tagged; fail loudly instead.
+  [ -n "$pane" ] || { echo "FEHLER: Worker-Pane konnte nicht angelegt werden (Ziel '$TARGET') — nichts markiert, kein Spawn." >&2; exit 1; }
+  markiere_rolle "$pane" worker
+  tmux set -p -t "$pane" @wb_worker "$NAME"
+  tmux set -p -t "$pane" remain-on-exit on
+  tmux select-pane -t "$pane" -T "$TITLE"
+  $HOME/.local/bin/wb-grid "$pane"
+  # The new pane is tagged @wb_role=worker now, so the next spawn's count
+  # already includes it -- release the maxWorkers lock here, not earlier. Clearing
+  # the variable (not disarming the trap) leaves pi_worker_cleanup() in place for
+  # CS_BEFORE and any later abort path -- see its definition above.
+  if [ -n "$MAXW_LOCK" ]; then rmdir "$MAXW_LOCK" 2>/dev/null; MAXW_LOCK=""; fi
+  SPAWNED=1
+elif [ "$dead" = "1" ]; then
+  tmux respawn-pane -k -t "$pane" "bash -lc $(printf %q "$CHAT")"
+  # Nach einem respawn traegt der Pane eine neue pane_pid; der alte Registereintrag
+  # passt nicht mehr dazu und wird von den Guards verworfen (siehe hooks/lib/rollen.py).
+  # Deshalb hier neu eintragen, damit die zweite Rollenquelle nicht stillschweigend
+  # ausfaellt und nur noch die Pane-Option traegt.
+  markiere_rolle "$pane" worker
+  SPAWNED=1
+else
+  SPAWNED=0
+fi
+
+# register the worker in the workbench state file (VSCode sidebar reads it).
+# A failing wb-state must never kill the spawn, but it must not stay silent
+# either — otherwise workers never show up in the sidebar and nobody notices.
+# `claudeSessionId`/`machine` need no read-back before this call any more
+# (Reviewer-Befund 3, round 5): add-worker itself now PRESERVES either field when its
+# flag is omitted, falling back to whatever the existing entry already has. The
+# read-back that used to live here was exactly the kind of duplicate-of-the-SPEC logic
+# that drifts out of sync — removed, dead now that the real fix sits in wb-state.
+WBSESS=$(base_session_name "$pane")
+if [ "$ENGINE" = claude ]; then WBMODEL="$CMODEL:${EFFORT:-medium}"
+elif [ "$ENGINE" = registry ]; then WBMODEL="$MODEL:${REFFORT:-medium}"
+else WBMODEL="$MODEL"; fi
+$HOME/.local/bin/wb-state add-worker "$NAME" "$KIND" "$WBMODEL" "$WORKDIR" "$WBSESS" \
+  || echo "WARNUNG: wb-state add-worker fehlgeschlagen — '$NAME' fehlt in der Workbench-Sidebar." >&2
+
+# No watcher trigger here any more (Reviewer-Befund 2, round 5): it needs the marker
+# text below (this spawn's OWN result-file path), which is not known until $RES is
+# computed further down. CS_BEFORE stays untouched for a genuine new spawn; a reuse
+# never gets one (nothing new will ever appear to watch for), cleaned up right away.
+if [ -z "$CTRACK" ] || [ "$SPAWNED" != "1" ]; then
+  [ -n "$CS_BEFORE" ] && rm -f "$CS_BEFORE"
+  CS_BEFORE=""
+fi
+
+# Sichtbarkeit auf JEDEM Weg pruefen: frischer Spawn, respawn eines toten Panes
+# UND erneutes Prompten eines bestehenden Panes (SPAWNED=0). Vorher hing die
+# Warnung nur am Neuspawn im 'window'-Layout.
+visibility_guard "$pane"
+
+# Kontext-Guard an den Worker-Lebenszyklus koppeln (Entscheidung des Nutzers 2026-08-03):
+# beim Sessionstart laeuft absichtlich keiner (contextGuardAutostart bleibt false), aber ab
+# dem ERSTEN Worker einer -- ein voller Worker scheitert nicht, er wird still schlechter.
+# `--ensure` ist idempotent (es findet einen laufenden Guard dieser Session und startet dann
+# keinen zweiten), deshalb steht der Aufruf hier auf JEDEM Weg: frischer Spawn, respawn eines
+# toten Panes und erneutes Prompten eines bestehenden. Der so gestartete Guard beendet sich
+# selbst, sobald der letzte Worker der Session weg ist. Nichts davon darf einen Spawn
+# scheitern lassen -- Ausgabe nach stderr, Fehler werden geschluckt.
+$HOME/.local/bin/context-guard --ensure "$pane" >&2 || true
+
+# Sichtbarkeit ueber die Maschinengrenze (2026-08-13): ein Worker, der HIER entsteht,
+# soll im Worker-Tab der ANDEREN Maschine auftauchen, ohne dass jemand etwas tippt.
+# Der Aufruf steht bewusst an derselben Stelle wie `--ensure` — auf JEDEM Spawn-Weg,
+# also auch fuer die Worker, die `orch-launch` auf peer startet und die nie durch
+# `wb-ssh-worker` laufen (genau der Fall, der am 13.08. unsichtbar blieb). Er koppelt
+# sich sofort ab und ist gedrosselt; ein Spawn darf daran nie haengenbleiben oder
+# scheitern.
+[ -x "$HOME/.local/bin/wb-remote-view" ] \
+  && "$HOME/.local/bin/wb-remote-view" --announce >/dev/null 2>&1 || true
+
+# A freshly spawned pane needs its TUI to be READY, not just started: pasting
+# into a booting agent silently drops the task (seen twice). Wait until the
+# rendered pane shows its input prompt ('❯'), context bar ('░') or status line
+# ('●' — pi's bar in narrow panes), with a deadline. A reused, already-running
+# pane needs no wait.
+if [ "$SPAWNED" = "1" ]; then
+  d=$(( $(date +%s) + 60 ))
+  until tmux capture-pane -p -t "$pane" 2>/dev/null | grep -qE "$READY_RE"; do
+    [ "$(date +%s)" -gt "$d" ] && { echo "FEHLER: Agent-TUI in Pane $pane nicht bereit (60s) — Task NICHT gesendet."; exit 1; }
+    sleep 1
+  done
+  sleep 2
+fi
+
+if [ -z "$TASK" ]; then
+  [ -n "$CS_BEFORE" ] && rm -f "$CS_BEFORE"   # no message will ever carry a marker
+  echo "Chat-Agent '$NAME' ($MODEL) bereit in Pane $pane — keine Task übergeben."
+  exit 0
+fi
+
+TS="$(date +%Y%m%d-%H%M%S)"
+RES="$RESDIR/$TS.md"
+# latest.md zeigt WAEHREND der Laufzeit auf einen echten, lesbaren Platzhalter,
+# nicht direkt auf $RES (siehe finalize_latest_when_done oben fuer die volle
+# Begruendung) -- der Name ".laufend.md" ist absichtlich NICHT das
+# Datumsmuster echter Ergebnisdateien, das ist das Unterscheidungsmerkmal, das
+# wb-result benutzt.
+PLATZHALTER="$RESDIR/.laufend.md"
+{
+  printf '# Worker "%s" laeuft\n\n' "$NAME"
+  printf -- '- Modell: %s (%s)\n' "$MODEL" "$KIND"
+  printf -- '- Gestartet: %s\n' "$(date '+%F %T')"
+  printf -- '- Ziel-Ergebnisdatei (sobald fertig): %s\n\n' "$RES"
+  printf 'Noch kein Ergebnis -- diese Datei ist ein Platzhalter. `wb-result %s` meldet\n' "$NAME"
+  printf '"noch nicht fertig", solange dieser Platzhalter steht.\n'
+} > "$PLATZHALTER" 2>/dev/null || true
+ln -sf "$PLATZHALTER" "$RESDIR/latest.md"
+finalize_latest_when_done "$RESDIR" "$RES"
+
+# DER AUFTRAGSTEXT (2026-08-05, Schritt 9/V18). Das Auftragsbuch unten haelt
+# nur Zeitpunkt, Ergebnisdatei, Pane, Harness und Modell fest -- der Text
+# selbst geht in den Pane und ist danach vergessen. Ohne ihn laesst sich beim
+# Pruefen eines Ergebnisses nicht mehr sehen, WOFUER es die Antwort ist. Rein
+# additiv, neben der Ergebnisdatei, unter demselben Zeitstempel -- keine
+# bestehende Spalte des Auftragsbuchs aendert sich dadurch.
+printf '%s' "$TASK" > "$RESDIR/$TS.auftrag.txt" 2>/dev/null || true
+
+# DAS AUFTRAGSBUCH (2026-08-05). Ein neuer Ergebnispfad entsteht je AUFTRAG, nicht
+# je Spawn -- diese Zeilen laufen auch, wenn ein bestehender Pane wiederverwendet
+# wird. Bisher blieb davon nur der Symlink uebrig, und der sagt nur, WELCHE Datei
+# gemeint ist, nicht seit wann.
+#
+# Warum das noetig wurde: "Fertig" ist eine Eigenschaft des AUFTRAGS, nicht der
+# Datei. Ohne einen Zeitpunkt, ab dem der laufende Auftrag gilt, ist von aussen
+# nicht zu unterscheiden, ob eine gefuellte Ergebnisdatei diesen Auftrag abschliesst
+# oder vom vorigen stehengeblieben ist -- am 05.08. hat genau diese Verwechslung
+# dazu aufgefordert, einen arbeitenden Worker zu schliessen. Wer eine Aufgabe in
+# einen Pane schickt, haelt deshalb hier fest, WELCHER Auftrag das ist.
+#
+# Format: eine Zeile je Auftrag, tabgetrennt, nur angehaengt, nie umgeschrieben --
+# ts, Ergebnisdatei, Pane, Harness, Modell, und ob dieser Auftrag den Pane neu
+# angelegt hat. Der LETZTE Eintrag ist der laufende Auftrag.
+AUFTRAEGE="$RESDIR/auftraege.tsv"
+if [ ! -s "$AUFTRAEGE" ]; then
+  printf '# ts\tresult\tpane\tharness\tmodel\tspawned\n' >>"$AUFTRAEGE" 2>/dev/null || true
+fi
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RES" "$pane" "$KIND" "$MODEL" "${SPAWNED:-0}" \
+  >>"$AUFTRAEGE" 2>/dev/null || true
+
+# Fertig-Kriterium merken (pi-worker --dod), rein additiv: ohne das Flag passiert
+# hier nichts. Liegt neben latest.md, damit `wb-dod <name>` es ohne erneute Angabe
+# findet.
+[ -n "$DOD" ] && printf '%s\n' "$DOD" > "$RESDIR/.dod"
+
+MSG="${VORSPANN}$TASK
+
+[Protokoll — immer befolgen] Schreibe dein vollständiges Endergebnis als Markdown in die Datei $RES (WHAT/HOW-verified/OPEN). Antworte danach im Chat, letzte Zeile exakt: DONE"
+
+# $RES is embedded in $MSG above (unique per spawn: timestamped, namespaced by worker
+# name) -- it doubles as the marker record_worker_conversation greps new transcripts
+# for. Triggered here, not earlier, because this is the first point both the marker
+# AND the spawn/reuse decision are both known.
+if [ -n "$CTRACK" ] && [ "$SPAWNED" = "1" ] && [ -n "$CS_BEFORE" ]; then
+  record_worker_conversation "$CS_BEFORE" "$RES"
+  # Uebergeben an den abgekoppelten Hintergrundprozess (raeumt die Datei am Ende
+  # seiner eigenen bis zu 40s laufenden Poll-Schleife selbst weg, siehe dort) --
+  # pi_worker_cleanup() darf sie deshalb ab hier nicht mehr anfassen.
+  CS_BEFORE=""
+fi
+
+# Wie die Eingabezeile aussieht, BEVOR etwas eingefuegt wird (2026-08-06). Manche TUIs
+# zeigen in der leeren Zeile einen Vorschlag, und codex waehlt ihn beim Start aus einer
+# Liste — gemessen sind fuenf verschiedene. Eine feste Zeichenkette (promptIgnore) kann
+# das nicht fangen: sie trifft einen von fuenf, und in den uebrigen Faellen haelt die
+# Pruefung unten den Vorschlag fuer haengenden Text, tippt zweimal Enter nach und meldet
+# einen Fehlschlag, obwohl der Auftrag angekommen ist.
+# Der Vergleich mit DIESER Zeile loest das ohne Wortlaut: sieht die Eingabezeile hinterher
+# wieder so aus wie vorher, ist unser Text weg. Gemessen am selben Tag, dass der Vorschlag
+# INNERHALB einer Sitzung stabil bleibt: getippt, geloescht, derselbe Vorschlag zurueck.
+INBOX_VORHER=""
+[ -n "$PROMPT_RE" ] && INBOX_VORHER=$(tmux capture-pane -p -t "$pane" 2>/dev/null | grep -E "$PROMPT_RE" | tail -1)
+
+printf '%s' "$MSG" | pane_einfuegen "$pane" || exit 1
+# Hat das Einfuegen die Eingabezeile ueberhaupt VERAENDERT? Diese Frage entscheidet, ob
+# der Vergleich unten benutzt werden darf (2026-08-06, Befund aus test-registry.sh):
+# Ein Pane, dessen Zeile sich NIE aendert -- eine eingefrorene TUI mit altem Text im
+# Kasten --, saehe hinterher genauso aus wie vorher, und "wie vorher" hiesse dann
+# faelschlich "abgeschickt". Nur wenn der eingefuegte Text sichtbar geworden ist, sagt
+# seine Abwesenheit etwas aus.
+sleep 1
+INBOX_NACH_PASTE=""
+[ -n "$PROMPT_RE" ] && INBOX_NACH_PASTE=$(tmux capture-pane -p -t "$pane" 2>/dev/null | grep -E "$PROMPT_RE" | tail -1)
+# Text und Enter NIE im selben Atemzug: erst Paste rendern lassen, dann Enter,
+# dann VERIFIZIEREN dass die Inputbox leer ist (sonst haengt der Prompt unsichtbar).
+sleep 1
+# Der Bildschirm, wie er VOR dem Enter aussah. Nicht sein Inhalt zaehlt, nur ob er
+# sich danach noch bewegt (siehe die Schleife unten) -- dieselbe Pruefsumme, die
+# wb-ereignisse als Rueckfall benutzt, wenn ein Worker kein Transcript hat.
+CAP_VOR_ENTER="$(tmux capture-pane -p -t "$pane" 2>/dev/null)"
+BILD_VOR_ENTER="$(printf '%s' "$CAP_VOR_ENTER" | cksum 2>/dev/null | awk '{print $1"-"$2}')"
+# Absende-Taste: Enter, ausser der Bildschirm zeigt GERADE JETZT die eigene Ankuendigung
+# des Harness fuer seinen zweiten Weg (ALTSUBMIT_TRIGGER) — dann dessen Taste. Ohne
+# Ankuendigung bleibt es bei Enter, auch wenn der Harness einen altSubmit-Eintrag traegt:
+# die Ankuendigung, nicht der blosse Eintrag, entscheidet je Sendung neu.
+ABSENDE_TASTE=Enter
+if [ -n "$ALTSUBMIT_TRIGGER" ] && [ -n "$ALTSUBMIT_KEY" ] \
+   && printf '%s' "$CAP_VOR_ENTER" | grep -qE "$ALTSUBMIT_TRIGGER"; then
+  ABSENDE_TASTE="$ALTSUBMIT_KEY"
+  echo "pi-worker: Fusszeile zeigt den zweiten Absende-Weg dieses Harness an — sende '$ABSENDE_TASTE' statt Enter." >&2
+fi
+pane_taste "$pane" "$ABSENDE_TASTE" || exit 1
+
+# WIE LANGE GEWARTET WIRD, UND WORAN DAS HAENGT (2026-08-08).
+# Bis heute prüfte diese Stelle dreimal im Abstand von zwei Sekunden und tippte bei
+# JEDEM Fehlversuch erneut Enter. Sechs Sekunden reichen nicht: aider braucht laenger,
+# und weil aider den abgeschickten Auftrag mit demselben Zeichen wiederholt, mit dem
+# es seine Eingabezeile zeichnet ('>'), sah die letzte Treffer-Zeile waehrend der
+# Antwort aus wie haengender Text. Gemessen 2026-08-08 (aider 0.86.2, ollama/qwen3:1.7b,
+# eigener Socket, umgelenktes HOME): in Sekunde 1 und 2 haelt die alte Pruefung den
+# WIEDERHOLTEN Auftrag fuer einen haengenden Prompt, ab Sekunde 3 ist er weggescrollt.
+# Jeder Spawn endete so mit einer Fehlermeldung, obwohl der Auftrag angekommen war --
+# und, schlimmer als die Meldung, mit zusaetzlichen Tastendruecken in eine Sitzung, die
+# laengst arbeitete.
+#
+# Das Fenster haengt jetzt am Pane statt an drei festen Runden: bewegt sich der
+# Bildschirm, hat der Harness den Auftrag angenommen und arbeitet -- dann wird gewartet
+# und NICHT noch einmal Enter getippt. Erst ein EINGEFRORENER Pane, in dem der Text noch
+# in der Eingabezeile steht, rechtfertigt ein zweites Enter. Bewegung wird als
+# Pruefsumme des ganzen Pane gemessen, wie in wb-ereignisse: nicht der INHALT wird
+# bewertet (der Zustand eines Workers wird nie am Pane-Text abgelesen), nur dass sich
+# etwas geaendert hat.
+#
+# Die Zahlen, und warum sie so stehen:
+#   ABSENDE_STILLE=5   Sekunden voelliger Stille, bevor ein zweites Enter erlaubt ist.
+#                      Gemessen: das Neuzeichnen nach einem Paste ist in unter einer
+#                      Sekunde durch (claude in Sekunde 1 leer, aider in Sekunde 1
+#                      sichtbar bewegt). Fuenf Sekunden sind das Fuenffache davon.
+#   ABSENDE_ENTER_MAX=2 zusaetzliche Enter -- genau so viele tippte die alte Schleife
+#                      auch, bevor sie aufgab. Mehr Tastendruecke helfen einem Pane
+#                      nicht, der die Eingabe nicht annimmt.
+#   ABSENDE_FRIST=45   Sekunden Deckel fuer den Fall, dass der Pane sich zwar bewegt,
+#                      die Eingabezeile aber nicht frei wird. Gemessener Bedarf: aider
+#                      3 s, claude 1 s, der gemeldete Fehlschlag lag ueber 6 s -- 45 s
+#                      ist das Siebenfache des schlimmsten gemessenen Falls und haelt
+#                      einen Spawn trotzdem antwortbereit. Ein gemeinsamer Deckel und
+#                      kein Registry-Feld je Harness: die Arbeit nach dem Enter ist
+#                      Zeichnen, nicht Rechnen, und darin unterscheiden sich die
+#                      Harnesses nicht so, dass fuenf Zahlen besser waeren als eine.
+# Ein Schalter, der diese Pruefung abstellt, gibt es bewusst nicht.
+ABSENDE_STILLE=5
+ABSENDE_ENTER_MAX=2
+ABSENDE_FRIST=45
+submitted=""
+eingefroren=""
+if [ -n "$PROMPT_RE" ]; then
+  absende_ende=$(( $(date +%s) + ABSENDE_FRIST ))
+  letzte_summe="$BILD_VOR_ENTER"
+  stille=0
+  nachgetippt=0
+  while :; do
+    sleep 1
+    # Nur die Eingabezeile pruefen (letzte Zeile, die mit dem Prompt-Zeichen beginnt).
+    # Haengender Prompt: '❯ [Pasted text #1 ...]' oder '❯ <text>'. Leer = abgeschickt.
+    bild=$(tmux capture-pane -p -t "$pane" 2>/dev/null)
+    inbox=$(printf '%s\n' "$bild" | grep -E "$PROMPT_RE" | tail -1)
+    # Manche TUIs zeigen in der LEEREN Eingabezeile einen Platzhalter-Vorschlag
+    # (codex 0.145: "> Run /review on my current changes"). Der sieht wie hängender
+    # Text aus, ist aber das Gegenteil: die Box ist leer. Ohne diese Ausnahme meldete
+    # die Verifikation einen Fehlschlag, obwohl der Task angekommen war — gemessen
+    # 2026-07-28. `promptIgnore` je Harness beschreibt genau diese Zeilen.
+    if [ -n "$PROMPT_IGNORE" ] && printf '%s' "$inbox" | grep -qE "$PROMPT_IGNORE"; then
+      submitted=yes; break
+    fi
+    # Die Zeile sieht aus wie vor dem Einfuegen: unser Text ist weg, also abgeschickt.
+    # Das ist die Pruefung ohne Wortlaut (siehe INBOX_VORHER oben). Sie macht nichts
+    # weich: eine Zeile, die unseren Text noch traegt, ist eine ANDERE als die vorherige
+    # und faellt weiterhin in den Zweig darunter.
+    if [ -n "$INBOX_VORHER" ] && [ "$inbox" = "$INBOX_VORHER" ] \
+       && [ "$INBOX_NACH_PASTE" != "$INBOX_VORHER" ]; then
+      submitted=yes; break
+    fi
+    if ! printf '%s' "$inbox" | grep -qE "${PROMPT_RE}[[:space:]]+[^[:space:]]"; then
+      submitted=yes; break
+    fi
+    # Ab hier steht der Text noch in der Box. Die einzige Frage, die jetzt zaehlt:
+    # arbeitet der Pane, oder ist er stehengeblieben?
+    summe=$(printf '%s\n' "$bild" | cksum 2>/dev/null | awk '{print $1"-"$2}')
+    if [ "$summe" != "$letzte_summe" ]; then
+      stille=0; letzte_summe="$summe"
+    else
+      stille=$(( stille + 1 ))
+    fi
+    if [ "$stille" -ge "$ABSENDE_STILLE" ]; then
+      if [ "$nachgetippt" -lt "$ABSENDE_ENTER_MAX" ]; then
+        pane_taste "$pane" "$ABSENDE_TASTE"
+        nachgetippt=$(( nachgetippt + 1 )); stille=0
+      else
+        # Eingefroren und die Nachhilfe ist aufgebraucht: hier wird nichts mehr besser.
+        eingefroren=1; break
+      fi
+    fi
+    [ "$(date +%s)" -ge "$absende_ende" ] && break
+  done
+  if [ -z "$submitted" ] && [ -n "$eingefroren" ]; then
+    echo "FEHLER: Prompt haengt noch in der Inputbox von Pane $pane — der Bildschirm hat sich seit dem Absenden nicht mehr bewegt (${nachgetippt} zusaetzliche '${ABSENDE_TASTE}' ohne Wirkung). Manuell pruefen (tmux send-keys -t $pane $ABSENDE_TASTE)." >&2
+    exit 1
+  fi
+fi
+
+# Ohne gemessenes promptPattern wird NICHT behauptet, was nicht geprueft wurde: der
+# Task ist eingefuegt und Enter ist gesendet, aber ob die Inputbox leer ist, weiss
+# hier niemand. Genau diese Luecke hat schon zweimal einen Task still verschluckt —
+# mit einer Erfolgsmeldung darueber waere sie unauffindbar.
+if [ -n "$submitted" ]; then
+  echo "Task an Chat-Agent '$NAME' ($MODEL, Pane $pane) gesendet (Submission verifiziert)."
+elif [ -n "$PROMPT_RE" ]; then
+  # Der dritte Ausgang, neu am 2026-08-08: die Frist ist um, die Eingabezeile traegt den
+  # Text noch, aber der Pane BEWEGT sich. "Haengt" ist das nicht -- ein eingefrorener Pane
+  # waere oben schon als Fehler ausgestiegen. Behauptet wird deshalb weder das eine noch
+  # das andere. Kein zweites Enter ist hier getippt worden, und das ist der Punkt: in einen
+  # Auftrag, der laeuft, wird nicht hineingetippt.
+  echo "Task an Chat-Agent '$NAME' ($MODEL, Pane $pane) eingefuegt und '$ABSENDE_TASTE' gesendet —"
+  echo "  Submission NICHT verifiziert: die Eingabezeile traegt den Text nach ${ABSENDE_FRIST}s"
+  echo "  noch, der Pane arbeitet aber (Bildschirm bewegt sich). Keine weitere '$ABSENDE_TASTE' getippt."
+  echo "  Selbst ansehen: tmux capture-pane -p -t $pane"
+else
+  echo "Task an Chat-Agent '$NAME' ($MODEL, Pane $pane) eingefuegt und '$ABSENDE_TASTE' gesendet —"
+  echo "  Submission NICHT verifizierbar: Harness '${RHARNESS:-?}' hat kein gemessenes"
+  echo "  promptPattern. Messen: wb-harness-probe ${RHARNESS:-<harness>} ; danach"
+  echo "  wb-state models set --kind harness ${RHARNESS:-<harness>} promptPattern '\"<muster>\"'"
+  echo "  Bis dahin: Pane selbst ansehen, ob der Task wirklich abgeschickt wurde."
+fi
+echo "Ergebnis-Datei: $RES (latest.md zeigt bis dahin auf einen Platzhalter, danach auf diese Datei: $RESDIR/latest.md)"
+echo "Auftrag Nr. $(grep -cv '^#' "$AUFTRAEGE" 2>/dev/null || echo 1) fuer '$NAME' — Buch: $AUFTRAEGE"
+echo "Warten (mit Deadline!): until [ -s '$RES' ]; do sleep 5; done  — bei Stillstand: pi-worker $NAME --interrupt"

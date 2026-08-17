@@ -1,0 +1,866 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Dieselbe Strenge wie im Hauptfenster: dieses Fenster fuehrt nur sein
+         eigenes Buendel aus, holt nichts aus dem Netz und laesst keinen Rahmen
+         zu. Es gibt hier keine uebernommene Seite mehr, also auch kein
+         'frame-src'. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:"
+    />
+    <title>Agent Workbench — Settings</title>
+    <style>
+      /* Links eine schmale Seitenliste, rechts ein Stapel, je Seite Gruppen mit
+         Ueberschrift. Die Bauform stammt aus dem another service-Kontrollzentrum
+         (~/AI/a project/another service/center.py ab Zeile 373); die Farben sind die
+         dieser Oberflaeche (app/src/renderer/index.html, :root).
+
+         DREI EBENEN JE EINSTELLUNG, und sie haben hier ihre festen Plaetze
+         (Vorgabe des Nutzers vom 06.08.):
+           1  der kurze Name          -- .feld > .kopf > .name
+           2  die Zeile mit der Wirkung -- .feld > .desc, gedaempft, darunter
+           3  das Infozeichen         -- .infozeichen im Kopf, Text in #infolage
+
+         DAS INFOZEICHEN VERSCHIEBT NICHTS. Sein Text liegt in einer eigenen,
+         fest positionierten Lage ueber der Seite (#infolage) und nimmt im
+         Fluss keinen Platz ein -- kein Element weicht ihm aus, keine Zeile
+         rutscht. Das ist die stehende Regel aus der Nacht zum 06.08., und sie
+         gilt auch fuer das Rueckstell-Zeichen: das steht IMMER da und ist nur
+         stumpf, wenn der Wert auf der Vorgabe steht, statt zu erscheinen und
+         zu verschwinden. */
+      :root {
+        color-scheme: dark;
+        --grund: #101216;
+        --leiste: #171a20;
+        --linie: #262b34;
+        --schrift: #d8dee9;
+        --gedaempft: #8b93a1;
+        --laeuft: #46a758;
+        --will: #e0a020;
+        --aus: #d24c4c;
+        --fern: #6a7fd0;
+        --tinte: #05070a;
+        --wahl: #222833;
+        --erhoben: #1e232b;
+        --infogrund: #1b2029;
+        --vorsichtgrund: #1a1315;
+      }
+
+      /* HELL UND DUNKEL (11.08., Seite "Aussehen").
+         Das Merkmal `data-thema` setzt die Oberflaeche selbst, aus der
+         Einstellung `thema`. Es hat drei Werte: 'dunkel' (die Regeln oben),
+         'hell' (die Regeln hier) und 'system' -- letzteres bekommt die hellen
+         Farben nur, wenn das Betriebssystem hell steht, und folgt einer
+         Umstellung mitten in der Arbeit.
+
+         JEDE Farbe steht als Variable oben und wird hier ueberschrieben; keine
+         Regel weiter unten nennt eine Farbe direkt. Ohne diese Disziplin waere
+         ein zweites Thema ein Durchgang durch das ganze Stylesheet, und die
+         eine vergessene Stelle faellt erst dem Menschen auf, der sie sieht. */
+      :root[data-thema='hell'],
+      :root[data-thema='system'] {
+        color-scheme: dark;
+      }
+      :root[data-thema='hell'] {
+        color-scheme: light;
+        --grund: #ffffff;
+        --leiste: #f4f5f7;
+        --linie: #d8dbe1;
+        --schrift: #1b1f27;
+        --gedaempft: #5c6472;
+        --laeuft: #22803c;
+        --will: #9a6600;
+        --aus: #b3261e;
+        --fern: #3355c4;
+        --tinte: #ffffff;
+        --wahl: #e4e8f4;
+        --erhoben: #eceef2;
+        --infogrund: #ffffff;
+        --vorsichtgrund: #fdf2f1;
+      }
+      @media (prefers-color-scheme: light) {
+        :root[data-thema='system'] {
+          color-scheme: light;
+          --grund: #ffffff;
+          --leiste: #f4f5f7;
+          --linie: #d8dbe1;
+          --schrift: #1b1f27;
+          --gedaempft: #5c6472;
+          --laeuft: #22803c;
+          --will: #9a6600;
+          --aus: #b3261e;
+          --fern: #3355c4;
+          --tinte: #ffffff;
+          --wahl: #e4e8f4;
+          --erhoben: #eceef2;
+          --infogrund: #ffffff;
+          --vorsichtgrund: #fdf2f1;
+        }
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--grund);
+        color: var(--schrift);
+        overflow: hidden;
+      }
+      body {
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        display: flex;
+        flex-direction: column;
+      }
+
+      #rahmen {
+        display: flex;
+        flex: 1 1 auto;
+        min-height: 0;
+      }
+
+      /* --- links: die Seitenliste ------------------------------------- */
+      #seitenliste {
+        flex: 0 0 200px;
+        background: var(--leiste);
+        border-right: 1px solid var(--linie);
+        display: flex;
+        flex-direction: column;
+        overflow-y: auto;
+        padding: 10px 0 12px;
+      }
+      #seitenliste .kopfzeile {
+        padding: 4px 14px 10px;
+        font-weight: 600;
+        font-size: 13px;
+        letter-spacing: 0.02em;
+      }
+      #seitenliste button {
+        appearance: none;
+        background: transparent;
+        border: 0;
+        border-left: 2px solid transparent;
+        color: var(--gedaempft);
+        font: inherit;
+        text-align: left;
+        padding: 7px 14px;
+        cursor: pointer;
+      }
+      #seitenliste button:hover {
+        background: var(--erhoben);
+        color: var(--schrift);
+      }
+      #seitenliste button.gewaehlt {
+        background: var(--wahl);
+        border-left-color: var(--fern);
+        color: var(--schrift);
+        font-weight: 600;
+      }
+      #seitenliste button .zweitzeile {
+        display: block;
+        font-weight: 400;
+        font-size: 11px;
+        color: var(--gedaempft);
+      }
+
+      /* --- rechts: der Stapel ----------------------------------------- */
+      #stapel {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow-y: auto;
+        padding: 18px 26px 34px;
+      }
+      .seite {
+        display: none;
+        max-width: 100ch;
+      }
+      .seite.offen {
+        display: block;
+      }
+      .seite > h1 {
+        font-size: 16px;
+        font-weight: 600;
+        margin: 0 0 2px;
+      }
+      .seite > .unterzeile {
+        color: var(--gedaempft);
+        margin: 0 0 18px;
+      }
+
+      .gruppe {
+        border: 1px solid var(--linie);
+        border-radius: 6px;
+        padding: 4px 14px 12px;
+        margin: 0 0 16px;
+        background: var(--leiste);
+      }
+      .gruppe > h2 {
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        color: var(--gedaempft);
+        margin: 12px 0 8px;
+      }
+
+      /* Name (mit Infozeichen und Rueckstell-Zeichen) links, Bedienelement
+         rechts, die Wirkungszeile darunter ueber die volle Breite. Die
+         Beschreibung stand im ersten Versuch in der linken Spalte; sie brach
+         dort auf dreissig Zeichen um und machte aus zwei Zeilen Text eine
+         Saeule (am Bild gesehen, 05.08.). */
+      .feld {
+        display: grid;
+        grid-template-columns: minmax(180px, 290px) 1fr;
+        column-gap: 16px;
+        align-items: start;
+        padding: 10px 0;
+        border-top: 1px solid var(--linie);
+      }
+      .feld:first-of-type {
+        border-top: 0;
+      }
+      .feld > .kopf {
+        grid-column: 1;
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+      }
+      .feld > .kopf > .name {
+        font-weight: 600;
+      }
+      .feld > .steuer {
+        grid-column: 2;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px;
+      }
+      .feld > .desc {
+        grid-column: 1 / -1;
+        margin-top: 6px;
+      }
+      .desc {
+        color: var(--gedaempft);
+        font-weight: 400;
+        max-width: 92ch;
+      }
+      .feld.breit {
+        grid-template-columns: 1fr;
+      }
+      .feld.breit > .kopf,
+      .feld.breit > .steuer {
+        grid-column: 1;
+      }
+      .feld.breit > .steuer {
+        display: block;
+      }
+
+      /* Das Etikett rechts neben dem Bedienelement: WANN die Aenderung greift.
+         Es steht IMMER da, nicht erst nach dem Umlegen -- ein Etikett, das
+         auftaucht, verschiebt die Zeile, und ein Etikett ohne Ausweg erzieht
+         ohnehin dazu, es zu uebersehen. */
+      .etikett {
+        color: var(--gedaempft);
+        border: 1px dashed var(--linie);
+        border-radius: 3px;
+        padding: 0 6px;
+        white-space: nowrap;
+      }
+      .etikett.wartet {
+        border-color: var(--will);
+        color: var(--will);
+      }
+
+      /* --- das Infozeichen --------------------------------------------- */
+      .infozeichen {
+        font: inherit;
+        font-size: 10px;
+        line-height: 14px;
+        width: 15px;
+        height: 15px;
+        padding: 0;
+        border: 1px solid var(--linie);
+        border-radius: 50%;
+        background: transparent;
+        color: var(--gedaempft);
+        cursor: help;
+        flex: 0 0 auto;
+      }
+      .infozeichen:hover,
+      .infozeichen.offen {
+        border-color: var(--fern);
+        color: var(--schrift);
+      }
+      .zurueck {
+        font: inherit;
+        border: 0;
+        background: transparent;
+        color: var(--fern);
+        cursor: pointer;
+        padding: 0 2px;
+        flex: 0 0 auto;
+      }
+      .zurueck:disabled {
+        color: #333a45;
+        cursor: default;
+      }
+
+      /* Die Lage des Infotextes: fest positioniert, ausserhalb des Flusses.
+         Nichts darunter bewegt sich, wenn sie erscheint. */
+      #infolage {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 30;
+      }
+      #infotext {
+        position: absolute;
+        display: none;
+        max-width: 52ch;
+        background: var(--infogrund);
+        border: 1px solid var(--fern);
+        border-radius: 5px;
+        padding: 8px 10px;
+        color: var(--schrift);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+        pointer-events: none;
+      }
+      #infotext.offen {
+        display: block;
+      }
+
+      input[type='text'],
+      input[type='number'] {
+        font: inherit;
+        background: var(--grund);
+        color: var(--schrift);
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 5px 8px;
+        min-width: 200px;
+      }
+      input[type='number'] {
+        min-width: 84px;
+      }
+      input:focus {
+        outline: 1px solid var(--fern);
+        outline-offset: -1px;
+      }
+      input[type='checkbox'] {
+        width: 15px;
+        height: 15px;
+        accent-color: var(--laeuft);
+      }
+      .einheit {
+        color: var(--gedaempft);
+      }
+
+      /* --- Segmentleiste ----------------------------------------------- */
+      .segmente {
+        display: inline-flex;
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+      .segmente button {
+        font: inherit;
+        background: transparent;
+        color: var(--schrift);
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 5px 11px;
+        cursor: pointer;
+      }
+      .segmente button:hover:not(:disabled) {
+        background: var(--erhoben);
+      }
+      .segmente button.gewaehlt {
+        background: var(--wahl);
+        border-color: var(--fern);
+        font-weight: 600;
+      }
+      .segmente button:disabled {
+        color: var(--gedaempft);
+        border-style: dashed;
+        text-decoration: line-through;
+        cursor: not-allowed;
+      }
+
+      /* --- Modell-Liste ------------------------------------------------ */
+      .filterzeile {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-bottom: 6px;
+      }
+      .filterzeile button {
+        font: inherit;
+        background: transparent;
+        color: var(--gedaempft);
+        border: 1px solid var(--linie);
+        border-radius: 10px;
+        padding: 3px 10px;
+        cursor: pointer;
+      }
+      .filterzeile button.gewaehlt {
+        background: var(--wahl);
+        border-color: var(--fern);
+        color: var(--schrift);
+      }
+      .modellsuche {
+        width: 100%;
+        box-sizing: border-box;
+        margin-bottom: 6px;
+      }
+      .modelliste {
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        max-height: 230px;
+        overflow-y: auto;
+        background: var(--grund);
+      }
+      .modelleintrag {
+        display: block;
+        width: 100%;
+        text-align: left;
+        font: inherit;
+        background: transparent;
+        color: var(--schrift);
+        border: 0;
+        border-bottom: 1px solid var(--linie);
+        padding: 6px 10px;
+        cursor: pointer;
+      }
+      .modelleintrag:last-child {
+        border-bottom: 0;
+      }
+      .modelleintrag:hover {
+        background: var(--erhoben);
+      }
+      .modelleintrag.gewaehlt {
+        background: var(--wahl);
+      }
+      .modelleintrag .zeile1 {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .modelleintrag .kennung {
+        color: var(--gedaempft);
+      }
+      .modelleintrag .zeile2 {
+        color: var(--gedaempft);
+        margin-top: 1px;
+      }
+      .modelleintrag.gewaehlt .zeile1 {
+        font-weight: 600;
+      }
+      .marke {
+        display: inline-block;
+        border-radius: 3px;
+        padding: 0 5px;
+        margin-left: 6px;
+        color: var(--tinte);
+        font-weight: 600;
+      }
+      .marke.tot {
+        background: var(--aus);
+      }
+      .marke.deckel {
+        background: var(--will);
+      }
+      .leerhinweis {
+        color: var(--gedaempft);
+        padding: 10px 0;
+      }
+
+      /* --- Listen mit Zeilen (Muster, Guards, Maschinen) ---------------- */
+      .zeilen {
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        background: var(--grund);
+        margin-top: 4px;
+      }
+      .zeile {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        padding: 6px 10px;
+        border-bottom: 1px solid var(--linie);
+      }
+      .zeile:last-child {
+        border-bottom: 0;
+      }
+      .zeile.abgeschaltet .titel,
+      .zeile.abgeschaltet .grund {
+        color: #5d6675;
+      }
+      .zeile .titel {
+        font-weight: 600;
+        flex: 0 0 auto;
+      }
+      .zeile .grund {
+        color: var(--gedaempft);
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .zeile .rechts {
+        flex: 0 0 auto;
+        display: flex;
+        gap: 6px;
+        align-items: baseline;
+      }
+      .zeile .antwort {
+        color: var(--gedaempft);
+      }
+      .zeile .antwort.gut {
+        color: var(--laeuft);
+      }
+      .zeile .antwort.schlecht {
+        color: var(--aus);
+      }
+      .knopf {
+        font: inherit;
+        background: transparent;
+        color: var(--schrift);
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 3px 9px;
+        cursor: pointer;
+      }
+      .knopf:hover {
+        background: var(--erhoben);
+      }
+      .knopf.warnend {
+        border-color: var(--aus);
+        color: var(--aus);
+      }
+      .anlegen {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 8px;
+      }
+      .anlegen input[type='text'] {
+        min-width: 130px;
+        flex: 1 1 130px;
+      }
+
+      /* --- der abgesetzte Block fuer das, was ein Sicherungsnetz wegnimmt */
+      .vorsicht {
+        border: 1px solid var(--aus);
+        border-radius: 6px;
+        padding: 2px 14px 12px;
+        margin: 0 0 16px;
+        background: var(--vorsichtgrund);
+      }
+      .vorsicht > h2 {
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        color: var(--aus);
+        margin: 12px 0 8px;
+      }
+
+      /* --- die Seite, die auf eine andere Arbeit wartet ------------------ */
+      .reserviert {
+        border: 1px dashed var(--linie);
+        border-radius: 6px;
+        padding: 16px;
+        color: var(--gedaempft);
+        background: var(--leiste);
+      }
+      .reserviert strong {
+        color: var(--schrift);
+      }
+
+      /* --- Tabellen (Pfade, Protokolle) -------------------------------- */
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 4px;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 5px 8px;
+        border-bottom: 1px solid var(--linie);
+        vertical-align: top;
+      }
+      th {
+        color: var(--gedaempft);
+        font-weight: 600;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      tr:last-child td {
+        border-bottom: 0;
+      }
+      td.wert {
+        color: var(--gedaempft);
+        word-break: break-all;
+      }
+      /* Stufennamen sind Woerter, keine Pfade: sie brechen zwischen den Namen
+         um, nie mitten in einem. `break-all` machte aus "kennt keine Stufen"
+         ein "kennt keine S / tufen" (am Bild gesehen, 06.08.). */
+      td.stufenzelle {
+        color: var(--gedaempft);
+        word-break: normal;
+      }
+      code {
+        color: var(--schrift);
+        background: var(--grund);
+        border: 1px solid var(--linie);
+        border-radius: 3px;
+        padding: 0 4px;
+        /* Ein Eintrag der Ausschlussliste ist EIN Wort. Ohne das brach
+           `90-secrets` am Bindestrich um und stand in zwei Zeilen -- am Bild
+           gesehen, 05.08. */
+        white-space: nowrap;
+      }
+      .chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        margin-top: 4px;
+      }
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        border: 1px solid var(--linie);
+        border-radius: 3px;
+        background: var(--grund);
+        padding: 1px 3px 1px 6px;
+        white-space: nowrap;
+      }
+      .chip button {
+        font: inherit;
+        border: 0;
+        background: transparent;
+        color: var(--gedaempft);
+        cursor: pointer;
+        padding: 0 2px;
+      }
+      .chip button:hover {
+        color: var(--aus);
+      }
+
+      /* --- Fusszeile: was zuletzt geschrieben wurde -------------------- */
+      #statuszeile {
+        flex: 0 0 auto;
+        border-top: 1px solid var(--linie);
+        background: var(--leiste);
+        padding: 5px 14px;
+        color: var(--gedaempft);
+        min-height: 17px;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      #statuszeile.fehler {
+        color: var(--aus);
+      }
+      #statuszeile.gut {
+        color: var(--laeuft);
+      }
+
+      /* Die Rueckfrage fuer alles, was ein Sicherungsnetz wegnimmt. Sie nennt
+         die Folge in Klartext statt "Sind Sie sicher?". */
+      #rueckfrage {
+        position: fixed;
+        inset: 0;
+        z-index: 40;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: #0b0d11cc;
+      }
+      #rueckfrage.offen {
+        display: flex;
+      }
+      #rueckfrage .kasten {
+        background: var(--leiste);
+        border: 1px solid var(--aus);
+        border-radius: 6px;
+        padding: 14px 16px;
+        max-width: 64ch;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+      }
+      #rueckfrage .reihe {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+      }
+      #rueckfrage button {
+        font: inherit;
+        background: transparent;
+        color: var(--schrift);
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 5px 12px;
+        cursor: pointer;
+      }
+      #rueckfrage button.tun {
+        border-color: var(--aus);
+        color: var(--aus);
+      }
+      #rueckfrageGrund {
+        width: 100%;
+        box-sizing: border-box;
+        margin-top: 4px;
+      }
+      .warnzeile:empty {
+        display: none;
+      }
+      .warnzeile {
+        color: var(--will);
+      }
+
+      /* Eine Stufe ueber dem Deckel bleibt WAEHLBAR -- sie traegt nur eine
+         Markierung. Ein Deckel bindet den Orchestrator, nicht den Menschen. */
+      .segmente button.ueberDeckel {
+        border-color: var(--will);
+        border-style: dashed;
+      }
+      .segmente button.ueberDeckel.gewaehlt {
+        background: #2a2312;
+      }
+      .deckelzeile {
+        color: var(--gedaempft);
+        margin-top: 6px;
+      }
+      .deckelzeile b {
+        color: var(--will);
+        font-weight: 600;
+      }
+      select {
+        font: inherit;
+        background: var(--grund);
+        color: var(--schrift);
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 3px 6px;
+      }
+      td.gesetzt {
+        color: var(--will);
+      }
+
+      /* --- Klartext statt grauem Feld ---------------------------------- */
+      /* Wo etwas nicht geht, steht der GRUND -- nie ein abgeblendeter Schalter,
+         der so aussieht, als koennte er etwas. Stehende Regel dieses Hauses
+         (SPEC-V4 6.3, Punkt 6). */
+      .klartext {
+        color: var(--gedaempft);
+        border-left: 2px solid var(--linie);
+        padding: 2px 0 2px 10px;
+        margin: 8px 0 2px;
+        max-width: 92ch;
+      }
+
+      /* --- die Farben der Sitzungszustaende ----------------------------- */
+      .farben {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+        margin-top: 4px;
+      }
+      .farbe {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .farbe input[type='color'] {
+        width: 34px;
+        height: 22px;
+        padding: 0;
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        background: var(--grund);
+        cursor: pointer;
+      }
+
+      /* --- die zwei Rollen-Haken der Chat-Vorgabe ----------------------- */
+      .rollen {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+        margin-top: 4px;
+      }
+      .rolle {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      /* --- die Chat-Zelle der Programm-Tabelle -------------------------- */
+      .chatzelle {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 6px;
+      }
+      .chatzelle .grund {
+        color: var(--gedaempft);
+      }
+
+      /* --- die Wege einer Benachrichtigung ------------------------------ */
+      .wegwahl {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        color: var(--gedaempft);
+        margin-left: 8px;
+      }
+
+      /* --- Sichern, zuruecksetzen, uebertragen -------------------------- */
+      .sicherungsfeld {
+        width: 100%;
+        box-sizing: border-box;
+        font: inherit;
+        background: var(--grund);
+        color: var(--schrift);
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 6px 8px;
+        resize: vertical;
+      }
+      .sicherungsfeld:focus {
+        outline: 1px solid var(--fern);
+        outline-offset: -1px;
+      }
+      .textzeile {
+        min-width: 320px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="rahmen">
+      <nav id="seitenliste"><div class="kopfzeile">Einstellungen</div></nav>
+      <main id="stapel"></main>
+    </div>
+    <div id="statuszeile"></div>
+    <div id="infolage"><div id="infotext"></div></div>
+    <div id="rueckfrage">
+      <div class="kasten">
+        <div id="rueckfrageText"></div>
+        <!-- Das Grundfeld gehoert zur Rueckfrage und nicht zur Seite: es
+             erscheint mit dem Kasten, nicht statt eines Seiteninhalts, und
+             verschiebt deshalb nichts. Leer heisst: es wird nichts geaendert. -->
+        <div id="rueckfrageGrundZeile" hidden>
+          <label class="desc" for="rueckfrageGrund">Warum? Der Satz bleibt bei der Einstellung stehen.</label>
+          <input type="text" id="rueckfrageGrund" spellcheck="false" />
+        </div>
+        <div id="rueckfrageHinweis" class="warnzeile"></div>
+        <div class="reihe">
+          <button type="button" id="rueckfrageNein">Abbrechen</button>
+          <button type="button" class="tun" id="rueckfrageJa">Trotzdem tun</button>
+        </div>
+      </div>
+    </div>
+    <script src="einstellungen.js"></script>
+  </body>
+</html>

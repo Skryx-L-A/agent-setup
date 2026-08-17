@@ -1,0 +1,202 @@
+#!/bin/bash
+# wb-rolle — die EINE Stelle, die die Rolle eines Panes setzt.
+#
+#   wb-rolle setzen <pane> <rolle>   Pane-Option UND Register schreiben.
+#   wb-rolle lesen  <pane>           Beide Quellen und die wirksame Rolle.
+#   wb-rolle beleg  <pane> [rolle]   Warum ein `setzen` erlaubt waere oder nicht.
+#
+# Der Server wird ueber -L/--socket oder WB_TMUX_SOCKET gewaehlt; ohne Angabe der
+# umgebende (der von $TMUX) — dieselbe Wahl wie in wb-pane-write.
+#
+# WARUM ES DIESES WERKZEUG GIBT (Durchsicht 2026-08-07, gemessen)
+# `@wb_role` war eine tmux-Pane-Option, und der Bewachte durfte sie selbst schreiben.
+# Ein Worker, der `tmux set -p -t <orchestrator> @wb_role worker` ausfuehrte, durfte
+# danach in den Orchestrator-Chat tippen; loeschte er die Option auf seinem eigenen
+# Pane, durfte er pushen. Beides mit genau einem erlaubten Befehl davor. An dieser
+# einen Behauptung hingen drei Sicherungen: Push-Verbot, Schutz des Orchestrator-Panes
+# und das Kompaktier-Gate.
+#
+# Seitdem gilt: Die Hook-Kette lehnt JEDEN direkten Versuch ab, `@wb_role` zu setzen
+# oder zu loeschen (bash-guard.py, Guard `rolle`). Gesetzt wird sie nur noch hier, und
+# hier wird sie zusaetzlich in einem Register festgehalten (hooks/lib/rollen.py), das
+# als zweite, unabhaengige Quelle dient. Die Guards lesen BEIDE Quellen und nehmen die
+# STRENGSTE Lesart — eine einzelne Faelschung kann damit nie etwas oeffnen.
+#
+# WORAN SICH DER SPAWN VOM ANGRIFF UNTERSCHEIDET, gemessen statt geglaubt:
+#   pi-worker legt einen NEUEN Pane an und markiert ihn — ein fremder Pane, fuer den
+#   es noch keinen Eintrag gibt. Der Angriff dagegen will die Rolle des EIGENEN Panes
+#   (hochstufen) oder die eines Panes aendern, der schon einen Eintrag hat (den
+#   Orchestrator herabstufen). Also drei Regeln:
+#     1. Fremder Pane ohne Eintrag       -> erlaubt. Das ist der Spawn.
+#     2. Eigener Pane                    -> nur `worker` und `placeholder`, also nur
+#                                           EINSCHRAENKEND. Sich selbst zum
+#                                           Orchestrator zu erklaeren, geht nie.
+#     3. Vorhandener Eintrag, andere Rolle -> nur ein GEMESSENER Mensch (wb-mensch).
+#   "Eigener Pane" wird an der Prozesstabelle gemessen, nicht an $TMUX_PANE: die
+#   Variable ist eine Behauptung, die pane_pid eines Panes in der eigenen Ahnenreihe
+#   ist es nicht. Dasselbe Verfahren wie A3 in wb-mensch.
+#
+# GRENZE, offen benannt (wie in wb-mensch und wb-pane-write): Gegen einen Prozess,
+# der seine Herkunft aktiv verwischt, schuetzt auch das nicht. Abgewehrt wird der
+# gemessene Fall — der eine erlaubte Befehl, der bisher genuegte.
+set -uo pipefail
+
+ABGELEHNT=77
+
+SOCKET="${WB_TMUX_SOCKET:-}"
+while true; do
+    case "${1:-}" in
+        -L|--socket) SOCKET="${2:?Socketname fehlt nach $1}"; shift 2 ;;
+        *) break ;;
+    esac
+done
+
+CMD="${1:-}"
+PANE="${2:-}"
+ROLLE="${3:-}"
+
+tm() {
+    if [ -n "$SOCKET" ]; then tmux -L "$SOCKET" "$@"; else tmux "$@"; fi
+}
+
+# Das Register wird nicht ein zweites Mal nachgebaut: dieselbe Datei, die auch die
+# Hook-Kette liest. Repo-Fassung zuerst (dann prueft eine Suite den Arbeitsstand),
+# sonst die installierte.
+ROLLEN_PY=""
+for kandidat in "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/hooks/lib/rollen.py" \
+                "$HOME/.claude/hooks/lib/rollen.py"; do
+    [ -f "$kandidat" ] && { ROLLEN_PY="$kandidat"; break; }
+done
+[ -n "$ROLLEN_PY" ] || { echo "wb-rolle: hooks/lib/rollen.py nicht gefunden — ohne Register wird nichts gesetzt." >&2; exit 1; }
+
+register() {
+    if [ -n "$SOCKET" ]; then
+        /usr/bin/python3 "$ROLLEN_PY" -L "$SOCKET" "$@"
+    else
+        /usr/bin/python3 "$ROLLEN_PY" "$@"
+    fi
+}
+
+# --- Herkunft messen (gleiche Bauart wie wb-pane-write) --------------------
+
+ahnen() {
+    local pid=${1:-$$} zeile ppid rest
+    while [ "$pid" -gt 1 ] 2>/dev/null; do
+        zeile=$(ps -o ppid=,args= -p "$pid" 2>/dev/null) || return 0
+        [ -n "$zeile" ] || return 0
+        read -r ppid rest <<<"$zeile"
+        printf '%s %s\n' "$pid" "$rest"
+        case "${ppid:-}" in ''|*[!0-9]*) return 0 ;; esac
+        pid=$ppid
+    done
+}
+
+MENSCH_GRUND=""
+ist_mensch() {
+    local beleg
+    if [ -x "$HOME/.local/bin/wb-mensch" ]; then
+        beleg=$("$HOME/.local/bin/wb-mensch" beleg 2>/dev/null)
+    elif command -v wb-mensch >/dev/null 2>&1; then
+        beleg=$(wb-mensch beleg 2>/dev/null)
+    else
+        MENSCH_GRUND="wb-mensch nicht gefunden — ohne Messung gilt: kein Mensch."
+        return 1
+    fi
+    MENSCH_GRUND="${beleg#*$'\t'}"
+    [ "${beleg%%$'\t'*}" = mensch ]
+}
+
+# Ist der Ziel-Pane der eigene? Gemessen an der pane_pid, nicht an $TMUX_PANE.
+ist_eigener_pane() {
+    local ziel_pid pid
+    ziel_pid=$(tm display -p -t "$PANE" '#{pane_pid}' 2>/dev/null) || return 1
+    [ -n "$ziel_pid" ] || return 1
+    while read -r pid _; do
+        [ "$pid" = "$ziel_pid" ] && return 0
+    done < <(ahnen)
+    return 1
+}
+
+ENTSCHEIDUNG=""
+GRUND=""
+entscheiden() {
+    local vorhanden
+    vorhanden=$(register lesen "$PANE" 2>/dev/null | awk -F'\t' '$1=="register"{print $2}')
+    if [ -n "$vorhanden" ] && [ "$vorhanden" != "$ROLLE" ]; then
+        if ist_mensch; then
+            ENTSCHEIDUNG=erlaubt
+            GRUND="Eintrag steht schon auf '$vorhanden', geaendert von einem gemessenen Menschen — $MENSCH_GRUND"
+            return 0
+        fi
+        ENTSCHEIDUNG=abgelehnt
+        GRUND="Der Pane ist bereits als '$vorhanden' registriert. Eine bestehende Rolle aendert nur ein gemessener Mensch ($MENSCH_GRUND)."
+        return 1
+    fi
+    if ist_eigener_pane; then
+        case "$ROLLE" in
+            worker|placeholder)
+                ENTSCHEIDUNG=erlaubt
+                GRUND="eigener Pane, aber '$ROLLE' schraenkt nur ein."
+                return 0 ;;
+            *)
+                if ist_mensch; then
+                    ENTSCHEIDUNG=erlaubt
+                    GRUND="eigener Pane, '$ROLLE' von einem gemessenen Menschen — $MENSCH_GRUND"
+                    return 0
+                fi
+                ENTSCHEIDUNG=abgelehnt
+                GRUND="Der eigene Pane laesst sich nicht auf '$ROLLE' hochstufen — genau das war der gemessene Weg an Push-Verbot und Pane-Schutz vorbei ($MENSCH_GRUND)."
+                return 1 ;;
+        esac
+    fi
+    ENTSCHEIDUNG=erlaubt
+    GRUND="fremder Pane ohne bestehenden Eintrag — der Fall, den ein Spawn braucht."
+    return 0
+}
+
+gueltige_rolle() {
+    case "$1" in
+        worker|orchestrator|placeholder|agent) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+case "$CMD" in
+    setzen|lesen|beleg) : ;;
+    ''|-h|--help) sed -n '2,8p' "$0" >&2; exit 2 ;;
+    *) echo "wb-rolle: unbekanntes Kommando '$CMD' (setzen|lesen|beleg)" >&2; exit 2 ;;
+esac
+[ -n "$PANE" ] || { echo "wb-rolle: Pane fehlt — 'wb-rolle $CMD <pane>'" >&2; exit 2; }
+
+if [ "$CMD" = lesen ]; then
+    register lesen "$PANE"
+    exit 0
+fi
+
+[ -n "$ROLLE" ] || { echo "wb-rolle: Rolle fehlt — 'wb-rolle $CMD <pane> <rolle>'" >&2; exit 2; }
+gueltige_rolle "$ROLLE" || { echo "wb-rolle: unbekannte Rolle '$ROLLE' (worker|orchestrator|placeholder|agent)" >&2; exit 2; }
+
+if [ "$CMD" = beleg ]; then
+    entscheiden || true
+    printf 'pane\t%s\nrolle\t%s\nentscheidung\t%s\ngrund\t%s\n' "$PANE" "$ROLLE" "$ENTSCHEIDUNG" "$GRUND"
+    exit 0
+fi
+
+if ! entscheiden; then
+    {
+        printf 'wb-rolle: ABGELEHNT — "%s" auf Pane %s.\n' "$ROLLE" "$PANE"
+        printf '  Aufrufer: PID %s\n' "$$"
+        printf '  Grund: %s\n' "$GRUND"
+        printf '  Die Rolle eines Panes traegt das Push-Verbot, den Schutz des Orchestrator-Panes und das Kompaktier-Gate.\n'
+    } >&2
+    exit "$ABGELEHNT"
+fi
+
+# Reihenfolge: erst die Pane-Option (daran haengen Grid, wb-close, wb-doctor und die
+# Anzeige), dann das Register. Schlaegt das Register fehl, sagt es das laut — die
+# Option allein ist genau der Zustand, der sich als zu schwach erwiesen hat.
+tm set -p -t "$PANE" @wb_role "$ROLLE" || {
+    echo "wb-rolle: Pane-Option auf $PANE liess sich nicht setzen." >&2; exit 1; }
+register setzen "$PANE" "$ROLLE" "wb-rolle" \
+    || { echo "wb-rolle: Register-Eintrag fuer $PANE fehlgeschlagen — die Rolle steht nur in der Pane-Option." >&2; exit 1; }
+exit 0

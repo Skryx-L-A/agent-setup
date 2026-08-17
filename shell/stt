@@ -1,0 +1,37 @@
+#!/bin/bash
+# stt — local speech-to-text for agents (Apple Silicon).
+# Default: parakeet-mlx (fast, 25 languages incl. German, word-perfect DE).
+# --whisper: whisper-large-v3-turbo via mlx-whisper (99 languages, timestamps).
+# Transcript text is printed on stdout.
+#
+# Usage:
+#   stt file.wav                 fast default (parakeet)
+#   stt --whisper file.wav       whisper fallback (exotic languages)
+#   stt --timestamps file.wav    srt-style timestamps (whisper)
+set -euo pipefail
+
+VENV="$HOME/AI/audio-tools/.venv"
+ENGINE="parakeet"; TS=0; AUDIO=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --whisper) ENGINE="whisper"; shift ;;
+    --timestamps) ENGINE="whisper"; TS=1; shift ;;
+    *) AUDIO="$1"; shift ;;
+  esac
+done
+[ -f "${AUDIO:-}" ] || { echo "usage: stt [--whisper] [--timestamps] file.wav" >&2; exit 2; }
+
+TMPD=$(mktemp -d)
+trap 'rm -rf "$TMPD"' EXIT
+BASE=$(basename "${AUDIO%.*}")
+
+if [ "$ENGINE" = "parakeet" ]; then
+  "$HOME/.local/bin/parakeet-mlx" "$AUDIO" --output-dir "$TMPD" --output-format txt >/dev/null 2>&1
+  cat "$TMPD/$BASE.txt"
+else
+  FMT=txt; [ "$TS" = 1 ] && FMT=srt
+  "$VENV/bin/mlx_whisper" "$AUDIO" --model mlx-community/whisper-large-v3-turbo \
+    --output-dir "$TMPD" --output-name "$BASE" --output-format "$FMT" >/dev/null 2>&1
+  cat "$TMPD/$BASE.$FMT"
+fi

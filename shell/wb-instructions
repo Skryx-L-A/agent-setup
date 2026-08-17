@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+"""wb-instructions -- make the user's rules/roles/skills available to EVERY harness, not just
+Claude Code (SPEC-V3-MODELS.md section E).
+
+  wb-instructions sync [--dry-run] [--harness <id>] [--force]
+
+Canonical sources (never written by this tool, only read):
+  ~/.claude/CLAUDE.md
+  ~/.claude/roles/orchestrator.md
+  ~/.claude/roles/agent.md
+  ~/.claude/skills/*/SKILL.md
+
+For every non-Claude harness these three files get concatenated into ONE generated
+instructions file (each such CLI only auto-reads a single file -- no separate system-prompt
+slot, no native skill feature), with a small, table-driven set of Claude-Code-specific
+substitutions applied (see REPLACEMENTS below) and a skills index appended. Each generated
+file starts with a marker block (source paths, timestamp, SHA-256 of sources AND of its own
+body) so a second `sync` is a true no-op when nothing changed, and a hand-edited target is
+detected (content hash mismatch) and refused rather than silently overwritten.
+
+Separately, `sync` also drops a `<!-- wb:routing-table:start/end -->` marker pair around the
+existing worker-routing table in ~/.claude/CLAUDE.md and around the matching reference line in
+~/.claude/roles/orchestrator.md -- insertion only, not one other word touched -- so a future
+`wb-state models table` fill-in can keep that table current without hand edits.
+"""
+import argparse
+import datetime
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+HOME = os.environ.get("HOME") or os.path.expanduser("~")
+
+
+def hp(p):
+    """expand a ~/-relative path against $HOME (not the process's real home, so tests that set
+    HOME=$(mktemp -d) never touch the real files)."""
+    if p.startswith("~/"):
+        return os.path.join(HOME, p[2:])
+    return os.path.expanduser(p)
+
+
+SRC_CLAUDE = hp("~/.claude/CLAUDE.md")
+SRC_ORCH = hp("~/.claude/roles/orchestrator.md")
+SRC_AGENT = hp("~/.claude/roles/agent.md")
+SRC_SKILLS_DIR = hp("~/.claude/skills")
+AGENT_SKILLS_DIR = hp("~/.agent-skills")
+SNAPSHOT_ROOT = hp("~/.local/trash-snapshots")
+
+TOOL_SELF_PATH = "~/AI/claude-workbench/shell/wb-instructions"
+
+MARKER_RE = re.compile(r"\A<!-- wb-instructions:generated\n.*?\n-->\n", re.S)
+CONTENT_HASH_RE = re.compile(r"SHA-256 Inhalt \(nur der Text unterhalb dieser Marker-Zeilen\): ([0-9a-f]{64})")
+
+# ---------------------------------------------------------------------------
+# Harness registry: ONE data table, not scattered substitutions. `compact` is the
+# harness's own compaction keystroke (None = no confirmed manual command exists);
+# `compact_note` explains the confidence/caveat, sourced from
+# ~/.pi-workers/results/research-harness/latest.md (2026-07-28). Anything marked
+# UNVERIFIED in that research stays marked UNVERIFIED here -- never upgraded to fact.
+# ---------------------------------------------------------------------------
+HARNESSES = [
+    {
+        "id": "codex", "label": "OpenAI Codex CLI", "target": "~/.codex/AGENTS.md",
+        "compact": "/compact",
+        "compact_note": "aus Issues des offiziellen Repos, nicht aus der Doku - mittlere Konfidenz.",
+        "extra_note": "Websuche nur mit `--search`; der Spawner setzt das Flag bereits.",
+    },
+    {
+        "id": "agy", "label": "Antigravity CLI (Google)", "target": "~/.antigravity/AGENTS.md",
+        "compact": None,
+        "compact_note": "kein Kompaktierungsbefehl belegt (agy 1.1.8) - bei vollem Kontext neu ansetzen.",
+        "extra_note": ("Bringt `search_web` und `read_url_content` mit und ist damit die erste Wahl, "
+                       "wenn recherchiert oder eine Seite ausgelesen werden soll."),
+    },
+    {
+        "id": "opencode", "label": "opencode (Anomaly/sst)", "target": "~/.config/opencode/AGENTS.md",
+        "compact": "/compact",
+        "compact_note": "bestaetigt (opencode.ai/v2/docs/compaction; Alias `/summarize`), zusaetzlich Auto-Kompaktierung standardmaessig aktiv.",
+        "extra_note": None,
+    },
+    {
+        "id": "crush", "label": "Charm Crush", "target": "~/.config/crush/CRUSH.md",
+        "compact": "/summarize",
+        "compact_note": "bestaetigt (README); ein eigenes `/compact` ist nicht belegt.",
+        "extra_note": None,
+    },
+    {
+        "id": "goose", "label": "Block Goose", "target": "~/.config/goose/.goosehints",
+        "compact": "/compact",
+        "compact_note": "bestaetigt (\"compact and summarize the current conversation\").",
+        "extra_note": None,
+    },
+    {
+        "id": "aider", "label": "aider-chat", "target": "~/.aider/CONVENTIONS.md",
+        "compact": None,
+        "compact_note": "kein manuelles Kompaktierungskommando gefunden -- aider fasst den Verlauf automatisch "
+                         "ueber `--weak-model` zusammen, es gibt keine Tastenkombination dafuer.",
+        "extra_note": "aider laedt diese Datei NICHT automatisch (kein AGENTS.md-Aequivalent bestaetigt) -- "
+                      "sie muss mit `--read ~/.aider/CONVENTIONS.md` oder in `.aider.conf.yml` eingebunden werden.",
+    },
+    {
+        "id": "pi", "label": "pi (lokaler Harness)", "target": "~/.pi/agent/RULES.md",
+        "compact": "/compact",
+        "compact_note": "bestehende Konvention dieser Workbench, wie bei Claude Code.",
+        "extra_note": "Ergaenzt (ueberschreibt NICHT) die bereits handgepflegten ~/.pi/agent/WORKER.md und "
+                      "ORCHESTRATOR.md -- diese Datei ist die mechanisch uebersetzte Vollversion aller drei "
+                      "Quellen, fuer den Fall dass ein pi-Setup keine der beiden Rollendateien laedt.",
+    },
+]
+HARNESS_BY_ID = {h["id"]: h for h in HARNESSES}
+
+REGISTRY_HINT = (
+    "`claude-opus-5` (bzw. das fuer diesen Harness in der Registry hinterlegte Modell -- "
+    "siehe `wb-state models list`, Datei `~/.claude/workbench/models.json`)"
+)
+
+
+def _apply_replacements_raw(text, harness):
+    """The translation table (task requirement: a DATA table, not substitutions scattered
+    through the code). Exactly the three minimum substitutions from the task, nothing more:
+    1) /compact -> this harness's own compaction command (or an UNVERIFIED note).
+    2) ~/.claude/skills/ -> ~/.agent-skills/ (the harness-neutral mirror).
+    3) the self-referential Claude Code model id -> a pointer at the model registry.
+
+    The search pattern for (1) is the WHOLE backtick-wrapped token `` `/compact` `` (backticks
+    included), never the bare word -- the source always writes it as inline code. Replacing only
+    the bare word left the source's own surrounding backticks in place and wrapped a SECOND pair
+    of backticks (or a bracketed note that itself contains backticks) inside them, producing
+    broken nested-backtick markdown (found in review 2026-07-28, M1). Matching the full token and
+    replacing it outright avoids that: the replacement is either a single clean `` `cmd` `` span
+    or a plain bracketed note with no backticks of its own.
+    """
+    if harness["compact"]:
+        compact_repl = "`%s`" % harness["compact"]
+    else:
+        compact_repl = "[keine /compact-Entsprechung fuer %s -- %s]" % (harness["label"], harness["compact_note"])
+    out = text.replace("`/compact`", compact_repl)
+    out = out.replace("~/.claude/skills/", "~/.agent-skills/")
+    out = out.replace("`claude-opus-5`", REGISTRY_HINT)
+    return out
+
+
+def apply_replacements(text, harness):
+    """Wraps _apply_replacements_raw so the machine-generated routing-table block (between
+    <!-- wb:routing-table:start/end -->, once CLAUDE.md/orchestrator.md have been synced) is
+    passed through byte-for-byte. That block is DATA (model ids, table cells from `wb-state
+    models table`), not prose -- substituting inside it broke the table structure and could
+    rewrite a model id mid-cell (review 2026-07-28, M1). Everything outside the block still gets
+    the normal translation."""
+    m = ROUTING_BLOCK_RE.search(text)
+    if m is None:
+        return _apply_replacements_raw(text, harness)
+    return (_apply_replacements_raw(text[:m.start()], harness)
+            + text[m.start():m.end()]
+            + _apply_replacements_raw(text[m.end():], harness))
+
+
+def sha256_text(s):
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def read_text(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+# ---------------------------------------------------------------------------
+# Skills mirror + index
+# ---------------------------------------------------------------------------
+
+def parse_skill_frontmatter(text):
+    """Minimal YAML-frontmatter reader, only for the two keys we need: name, description.
+    Handles a folded block scalar (`description: >-` followed by indented lines) the way our
+    SKILL.md files actually use it, plus the plain one-line form."""
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}
+    block = text[4:end].splitlines()
+    result = {}
+    i = 0
+    while i < len(block):
+        line = block[i]
+        m = re.match(r"^([a-zA-Z_]+):\s*(.*)$", line)
+        if not m:
+            i += 1
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if val in (">-", ">", "|-", "|"):
+            parts = []
+            i += 1
+            while i < len(block) and (block[i].startswith("  ") or block[i].strip() == ""):
+                parts.append(block[i].strip())
+                i += 1
+            result[key] = " ".join(p for p in parts if p).strip()
+            continue
+        result[key] = val.strip('"').strip("'")
+        i += 1
+    return result
+
+
+def discover_skills():
+    skills = []
+    if not os.path.isdir(SRC_SKILLS_DIR):
+        return skills
+    for name in sorted(os.listdir(SRC_SKILLS_DIR)):
+        skill_dir = os.path.join(SRC_SKILLS_DIR, name)
+        skill_md = os.path.join(skill_dir, "SKILL.md")
+        if not os.path.isfile(skill_md):
+            continue
+        text = read_text(skill_md)
+        meta = parse_skill_frontmatter(text)
+        skills.append({
+            "name": meta.get("name", name),
+            "description": meta.get("description", "(keine description im Frontmatter gefunden)"),
+            "dir": skill_dir,
+            "skill_md_text": text,
+        })
+    return skills
+
+
+def render_skills_index(skills):
+    if not skills:
+        return "(keine Skills unter ~/.claude/skills/ gefunden.)\n"
+    lines = []
+    for s in skills:
+        lines.append("- **%s** -- `~/.agent-skills/%s/SKILL.md`" % (s["name"], s["name"]))
+        lines.append("  %s" % s["description"])
+    return "\n".join(lines) + "\n"
+
+
+def snapshot_before_overwrite(path, day_tag):
+    if not os.path.exists(path):
+        return None
+    snap_dir = os.path.join(SNAPSHOT_ROOT, "%s-wb-instructions" % day_tag)
+    os.makedirs(snap_dir, exist_ok=True)
+    dest = os.path.join(snap_dir, os.path.basename(path).lstrip(".") or "dotfile")
+    # avoid collisions between same-named files from different harnesses
+    base, ext = os.path.splitext(dest)
+    n = 1
+    while os.path.exists(dest):
+        dest = "%s.%d%s" % (base, n, ext)
+        n += 1
+    shutil.copy2(path, dest)
+    return dest
+
+
+def sync_skills_mirror(dry_run, day_tag, report):
+    skills = discover_skills()
+    for s in skills:
+        target_dir = os.path.join(AGENT_SKILLS_DIR, s["name"])
+        target_md = os.path.join(target_dir, "SKILL.md")
+        body = s["skill_md_text"]
+        body_hash = sha256_text(body)
+        marker = build_marker([SRC_SKILLS_DIR + "/" + s["name"] + "/SKILL.md"],
+                               {SRC_SKILLS_DIR + "/" + s["name"] + "/SKILL.md": sha256_text(body)},
+                               body_hash, now_generated_at_for(target_md, body_hash))
+        full = marker + body
+        status = write_generated(target_md, full, body_hash, dry_run, day_tag, force=False)
+        report.append(("skill:%s" % s["name"], status, target_md))
+        # accompanying files: verbatim mirror, no marker (scripts/binaries must stay byte-exact)
+        for root, _dirs, files in os.walk(s["dir"]):
+            for fn in files:
+                if fn == "SKILL.md" and root == s["dir"]:
+                    continue
+                src_file = os.path.join(root, fn)
+                rel = os.path.relpath(src_file, s["dir"])
+                dst_file = os.path.join(target_dir, rel)
+                with open(src_file, "rb") as f:
+                    src_bytes = f.read()
+                changed = True
+                if os.path.exists(dst_file):
+                    with open(dst_file, "rb") as f:
+                        changed = f.read() != src_bytes
+                if not changed:
+                    report.append(("skill-asset:%s/%s" % (s["name"], rel), "unchanged", dst_file))
+                    continue
+                if dry_run:
+                    report.append(("skill-asset:%s/%s" % (s["name"], rel), "would-write", dst_file))
+                    continue
+                os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+                snapshot_before_overwrite(dst_file, day_tag)
+                with open(dst_file, "wb") as f:
+                    f.write(src_bytes)
+                report.append(("skill-asset:%s/%s" % (s["name"], rel), "written", dst_file))
+    return skills
+
+
+# ---------------------------------------------------------------------------
+# Marker + conflict-safe writer for the 7 generated harness instruction files
+# (and, reusing the same mechanism, the skill mirrors)
+# ---------------------------------------------------------------------------
+
+def build_marker(source_paths, source_hashes, content_hash, generated_at):
+    lines = ["<!-- wb-instructions:generated"]
+    lines.append("Quelle(n): " + " ".join(source_paths))
+    lines.append("Zeitpunkt: " + generated_at)
+    lines.append("SHA-256 Quelle(n): " + " ".join(
+        "%s=%s" % (os.path.basename(p), source_hashes[p]) for p in source_paths))
+    lines.append("SHA-256 Inhalt (nur der Text unterhalb dieser Marker-Zeilen): " + content_hash)
+    lines.append("Erzeugt von: wb-instructions sync (%s)" % TOOL_SELF_PATH)
+    lines.append(
+        "WARNUNG: Handaenderungen unterhalb dieser Marker-Zeilen gehen beim naechsten "
+        "\"wb-instructions sync\" verloren. Aenderungen gehoeren in die Quelle(n) oben, nicht hierhin."
+    )
+    lines.append("-->")
+    return "\n".join(lines) + "\n"
+
+
+def check_target(target_path):
+    """Returns (status, body_on_disk_or_None). status in:
+    'new' (file absent), 'clean' (marker present, hash matches -- safe to regenerate/compare),
+    'conflict' (file exists but wasn't ours, or was hand-edited since)."""
+    if not os.path.exists(target_path):
+        return "new", None
+    disk = read_text(target_path)
+    m = MARKER_RE.match(disk)
+    if not m:
+        return "conflict", disk
+    body_on_disk = disk[m.end():]
+    hm = CONTENT_HASH_RE.search(m.group(0))
+    if not hm:
+        return "conflict", disk
+    if hm.group(1) != sha256_text(body_on_disk):
+        return "conflict", disk
+    return "clean", body_on_disk
+
+
+def now_generated_at_for(target_path, new_body_hash):
+    """Idempotency: only advance the timestamp when the body actually changes. If the target
+    already carries our marker with the SAME content hash, keep its old timestamp so re-running
+    sync with unchanged sources produces a byte-identical file (true no-op)."""
+    status, disk_body = check_target(target_path)
+    if status == "clean" and os.path.exists(target_path):
+        old_marker = MARKER_RE.match(read_text(target_path)).group(0)
+        old_hash = CONTENT_HASH_RE.search(old_marker).group(1)
+        if old_hash == new_body_hash:
+            tm = re.search(r"Zeitpunkt: (.*)", old_marker)
+            if tm:
+                return tm.group(1).strip()
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def write_generated(target_path, full_content, body_hash, dry_run, day_tag, force):
+    status, disk_body = check_target(target_path)
+    if status == "new":
+        if dry_run:
+            return "new"
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(full_content)
+        return "new"
+    if status == "conflict":
+        if not force:
+            return "conflict"
+        if dry_run:
+            return "conflict-would-force"
+        snapshot_before_overwrite(target_path, day_tag)
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(full_content)
+        return "conflict-forced"
+    # status == 'clean'
+    if disk_body == full_content[len(MARKER_RE.match(full_content).group(0)):]:
+        return "unchanged"
+    if dry_run:
+        return "would-update"
+    snapshot_before_overwrite(target_path, day_tag)
+    with open(target_path, "w", encoding="utf-8") as f:
+        f.write(full_content)
+    return "updated"
+
+
+# ---------------------------------------------------------------------------
+# Per-harness instruction file body
+# ---------------------------------------------------------------------------
+
+def render_harness_body(harness, claude_text, orch_text, agent_text, skills_index):
+    extra = ("\n" + harness["extra_note"] + "\n") if harness.get("extra_note") else ""
+    return (
+        "# %s -- Regeln, Rollen und Skills (uebersetzt aus Claude Code)\n\n"
+        "Diese Datei buendelt fuer diesen Harness alle drei kanonischen Quellen von des Nutzers\n"
+        "Workbench, weil %s nur EINE automatisch gelesene Instruktionsdatei kennt (kein natives\n"
+        "Skill-System, keine getrennte System-Prompt-Datei wie Claude Code): globale Regeln,\n"
+        "Orchestrator-Rolle und Worker/Agent-Rolle in einer Datei -- lies den Abschnitt, der zu\n"
+        "der Rolle passt, in der dieser Harness gerade laeuft. Ersetzungen fuer diesen Harness:\n"
+        "`/compact` -> %s (%s); `~/.claude/skills/` -> `~/.agent-skills/`; Claude-Modellnamen\n"
+        "tragen einen Hinweis auf die Modell-Registry. Alles andere ist vollstaendig und\n"
+        "unveraendert uebernommen -- Kuerzen gilt in dieser Workbench als Loeschen.\n"
+        "%s\n"
+        "## Teil 1 -- Globale Regeln (Quelle: ~/.claude/CLAUDE.md)\n\n"
+        "%s\n\n"
+        "## Teil 2 -- Orchestrator-Rolle (Quelle: ~/.claude/roles/orchestrator.md)\n\n"
+        "Gilt, wenn dieser Harness die Orchestrator-Session dieser Workbench faehrt.\n\n"
+        "%s\n\n"
+        "## Teil 3 -- Worker/Agent-Rolle (Quelle: ~/.claude/roles/agent.md)\n\n"
+        "Gilt, wenn dieser Harness als Worker in dieser Workbench laeuft.\n\n"
+        "%s\n\n"
+        "## Teil 4 -- Verfuegbare Skills (Spiegel unter ~/.agent-skills/)\n\n"
+        "%s kennt kein natives Skill-System wie Claude Code. BEVOR eine Aufgabe beginnt, die zu\n"
+        "einem der folgenden Skills passt, ERST die zugehoerige SKILL.md lesen -- sie enthaelt die\n"
+        "vollstaendige Anleitung; das ist fuer diesen Harness der Ersatz fuer Claudes eingebautes\n"
+        "Skill-Feature.\n\n"
+        "%s"
+        % (harness["label"], harness["label"],
+           harness["compact"] or "(kein Kommando)", harness["compact_note"],
+           extra,
+           claude_text, orch_text, agent_text,
+           harness["label"], skills_index)
+    )
+
+
+def read_regeln():
+    """The rule files CLAUDE.md points at since the 2026-08-03 router rebuild.
+
+    Claude Code reads them on demand, guided by the Verweisbaum. The other harnesses
+    have no such mechanism -- they get ONE instruction file -- so without this they
+    would silently end up with FEWER rules than before the rebuild. Bundling them is
+    what keeps 'Kuerzen gilt als Loeschen' true for those harnesses too.
+    """
+    d = hp("~/.claude/regeln")
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith(".md"):
+            continue
+        with open(os.path.join(d, fn), encoding="utf-8") as fh:
+            out.append((fn, fh.read()))
+    return out
+
+
+def render_regeln_section(harness, regeln):
+    if not regeln:
+        return ""
+    parts = [
+        "\n\n## Teil 5 -- Ausgelagerte Regeln (Quelle: ~/.claude/regeln/)\n\n"
+        "Claude Code laedt diese Dateien bei Bedarf ueber den Verweisbaum in Teil 1. %s hat\n"
+        "keinen solchen Mechanismus, deshalb stehen sie hier vollstaendig. Sie gelten\n"
+        "unveraendert -- der Ausloeser am Kopf jeder Datei sagt, wann die Regel greift.\n"
+        % harness["label"]
+    ]
+    for fn, text in regeln:
+        parts.append("\n### regeln/%s\n\n%s\n" % (fn, apply_replacements(text, harness)))
+    return "".join(parts)
+
+
+def sync_harness(harness, sources, source_hashes, skills_index, dry_run, day_tag, force):
+    claude_t = apply_replacements(sources["claude"], harness)
+    orch_t = apply_replacements(sources["orch"], harness)
+    agent_t = apply_replacements(sources["agent"], harness)
+    body = render_harness_body(harness, claude_t, orch_t, agent_t, skills_index)
+    body += render_regeln_section(harness, read_regeln())
+    body_hash = sha256_text(body)
+    target = hp(harness["target"])
+    generated_at = now_generated_at_for(target, body_hash)
+    marker = build_marker([SRC_CLAUDE, SRC_ORCH, SRC_AGENT], source_hashes, body_hash, generated_at)
+    full = marker + body
+    status = write_generated(target, full, body_hash, dry_run, day_tag, force)
+    return status, target, full
+
+
+# ---------------------------------------------------------------------------
+# Routing-table markers in the LIVE ~/.claude/CLAUDE.md and roles/orchestrator.md.
+#
+# HARD RULE (2026-07-28, after an incident: the first version of this function matched
+# the EXISTING hand-curated table and *replaced* the matched span with the generated
+# one -- losing the curated rows the moment a fill command became available): the two
+# marker comment lines are ALWAYS inserted as an EMPTY block at a fixed anchor point.
+# They never match against, wrap, or otherwise depend on any existing table text. The
+# generated content that later goes *between* the markers is purely additive -- it is
+# never allowed to consume or overwrite a single character outside that empty slot.
+#
+# Safety net on top of that: content between the markers only ever gets touched by this
+# tool if it is either still empty, OR carries this tool's own inner
+# "wb-instructions:generated SHA-256=..." tag with a hash that matches what follows it
+# (i.e. we recognise it as our own previous output). Anything else between the markers
+# -- including the ORIGINAL untagged output from the buggy first version of this
+# function -- counts as foreign content and is refused exactly like a hand-edited
+# target file: reported as a conflict, exit != 0, overridable with --force (snapshot
+# taken first, same as everywhere else in this tool).
+# ---------------------------------------------------------------------------
+
+ROUTING_START = "<!-- wb:routing-table:start -->"
+ROUTING_END = "<!-- wb:routing-table:end -->"
+ROUTING_BLOCK_RE = re.compile(
+    r"^([ \t]*)" + re.escape(ROUTING_START) + r"\n(.*?)^[ \t]*" + re.escape(ROUTING_END) + r"\n",
+    re.S | re.M)
+ROUTING_INNER_TAG_RE = re.compile(
+    r"\A[ \t]*<!-- wb-instructions:generated SHA-256=([0-9a-f]{64}) -->\n(.*)\Z", re.S)
+
+
+REPO_WB_STATE = "~/AI/claude-workbench/shell/wb-state"
+INSTALLED_WB_STATE = "~/.local/bin/wb-state"
+
+
+def check_wb_state_drift():
+    """Review 2026-07-28 (H3): the routing table this tool writes comes from whichever
+    `wb-state` resolves on PATH -- normally ~/.local/bin/wb-state -- which is a COPY of the repo
+    file, not the file itself. If someone edits shell/wb-state and forgets to redeploy the copy,
+    `wb-instructions sync` silently bakes an outdated table into every generated file without any
+    signal that it happened. Returns a warning string, or None if both files exist and match (or
+    either side is missing -- e.g. in an isolated test HOME, where this simply doesn't apply)."""
+    installed, repo = hp(INSTALLED_WB_STATE), hp(REPO_WB_STATE)
+    if not (os.path.isfile(installed) and os.path.isfile(repo)):
+        return None
+    with open(installed, "rb") as f:
+        installed_bytes = f.read()
+    with open(repo, "rb") as f:
+        repo_bytes = f.read()
+    if installed_bytes == repo_bytes:
+        return None
+    return (
+        "WARNUNG: %s (installiert, das die Worker tatsaechlich benutzen) und %s (Repo) "
+        "unterscheiden sich. Die Routing-Tabelle, die dieses \"sync\" gerade schreibt, kommt von "
+        "`wb-state models table` ueber PATH -- also von der INSTALLIERTEN Version -- und kann "
+        "damit von einer anderen Version stammen als die, gegen die claude-worker/pi-worker "
+        "wirklich spawnen. Fix: `cp %s %s` und `wb-instructions sync` danach erneut ausfuehren."
+        % (installed, repo, repo, installed)
+    )
+
+
+def fetch_routing_table_markdown():
+    """Calls the fill command ONLY if it is actually on PATH and the `models table`
+    subcommand actually works (SPEC-V3 B, built by a different worker). If it isn't
+    there yet, returns None and the caller leaves the marker block's content untouched."""
+    exe = shutil.which("wb-state")
+    if not exe:
+        return None, "wb-state nicht im PATH gefunden"
+    try:
+        r = subprocess.run([exe, "models", "table"], capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        return None, "wb-state models table fehlgeschlagen: %s" % e
+    if r.returncode != 0 or not r.stdout.strip():
+        return None, "wb-state models table lieferte keinen Output (exit %d): %s" % (
+            r.returncode, (r.stderr or "").strip()[:200])
+    return r.stdout.rstrip("\n"), None
+
+
+def routing_block_status(between_text):
+    """'empty' (nothing there yet -- safe to fill), 'ours' (our own tagged output, hash
+    matches -- safe to refresh), or 'foreign' (anything else -- never touch)."""
+    if between_text.strip() == "":
+        return "empty"
+    m = ROUTING_INNER_TAG_RE.match(between_text)
+    if m and m.group(1) == sha256_text(m.group(2)):
+        return "ours"
+    return "foreign"
+
+
+def build_routing_fill(table_md, indent):
+    """Empty string when there is nothing to fill with (fill command unavailable) --
+    NOT the same as 'foreign': an empty desired state compares equal to an already-empty
+    block, so a still-unavailable fill command keeps correctly reporting 'unchanged'."""
+    if not table_md:
+        return ""
+    rows = "\n".join((indent + line) if line else line for line in table_md.splitlines()) + "\n"
+    tag = "%s<!-- wb-instructions:generated SHA-256=%s -->\n" % (indent, sha256_text(rows))
+    return tag + rows
+
+
+def sync_routing_block(path, label, anchor_fn, table_md, table_err, dry_run, day_tag, force, report):
+    text = read_text(path)
+    m = ROUTING_BLOCK_RE.search(text)
+    if m is None:
+        # Phase A: pure insertion of an EMPTY block + a short note, at a FIXED anchor
+        # point that never depends on any existing table. Nothing before/after the
+        # anchor is touched.
+        insert_at, note = anchor_fn(text)
+        if insert_at is None:
+            report.append(("routing-table:%s" % label, "anchor-not-found", path))
+            return
+        indent = "  "
+        empty_block = "%s%s\n%s%s\n" % (indent, ROUTING_START, indent, ROUTING_END)
+        insertion = "%s%s\n%s" % (indent, note, empty_block)
+        if dry_run:
+            report.append(("routing-table:%s" % label, "would-insert-empty-block", path))
+            return
+        snapshot_before_overwrite(path, day_tag)
+        new_text = text[:insert_at] + insertion + text[insert_at:]
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        if not table_md:
+            # nothing to fill yet -- report once, don't fall through to a no-op Phase B
+            report.append(("routing-table:%s" % label,
+                            "inserted-empty-block (Fuellbefehl: %s)" % table_err, path))
+            return
+        report.append(("routing-table:%s" % label, "inserted-empty-block", path))
+        text, m = new_text, ROUTING_BLOCK_RE.search(new_text)
+
+    # Phase B: only ever touch the text strictly BETWEEN the two marker lines.
+    indent, between = m.group(1), m.group(2)
+    status = routing_block_status(between)
+    desired = build_routing_fill(table_md, indent)
+
+    if status == "foreign" and not force:
+        report.append(("routing-table:%s" % label, "conflict", path))
+        return "conflict"
+    if status != "foreign" and between == desired:
+        report.append(("routing-table:%s" % label,
+                        "unchanged" if not table_err else "unchanged (Fuellbefehl: %s)" % table_err,
+                        path))
+        return
+    if dry_run:
+        verb = "would-force-fill" if status == "foreign" else "would-fill"
+        report.append(("routing-table:%s" % label,
+                        verb if not table_err else "%s (Fuellbefehl: %s)" % (verb, table_err), path))
+        return "conflict-would-force" if status == "foreign" else None
+
+    snapshot_before_overwrite(path, day_tag)
+    new_region = "%s%s\n%s%s%s\n" % (indent, ROUTING_START, desired, indent, ROUTING_END)
+    new_text = text[:m.start()] + new_region + text[m.end():]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    verb = "conflict-forced" if status == "foreign" else ("filled" if desired else "left-empty")
+    report.append(("routing-table:%s" % label,
+                    verb if not table_err else "%s (%s)" % (verb, table_err), path))
+
+
+def claude_md_anchor(text):
+    anchor = "- **Effort ist ein Knopf**"
+    idx = text.find(anchor)
+    if idx == -1:
+        return None, None
+    note = ("<!-- Dieser Block wird von \"wb-instructions sync\" automatisch gefuellt/aktualisiert "
+            "-- die Routing-Tabelle OBEN bleibt Handarbeit und wird nie angefasst. -->")
+    return idx, note
+
+
+def orchestrator_md_anchor(text):
+    anchor = "- Modellwahl (Tabelle und HARD CAPS: CLAUDE.md) — Begründungen und Zusätze:\n"
+    idx = text.find(anchor)
+    if idx == -1:
+        return None, None
+    note = "<!-- Dieser Block wird von \"wb-instructions sync\" automatisch gefuellt/aktualisiert. -->"
+    return idx + len(anchor), note
+
+
+def sync_routing_markers(dry_run, day_tag, force, report):
+    table_md, table_err = fetch_routing_table_markdown()
+    conflicts = 0
+    # Only the ORCHESTRATOR role carries the generated table. Until 2026-08-03 it was
+    # written into CLAUDE.md as well; an orchestrator loads both files, so the block --
+    # 4.584 characters -- was paid for twice every session, and `sync` kept two copies
+    # alive that could drift. CLAUDE.md now holds a one-line pointer instead. Whoever
+    # re-adds SRC_CLAUDE here re-creates that duplication.
+    for path, label, anchor_fn in (
+        (SRC_ORCH, "orchestrator.md", orchestrator_md_anchor),
+    ):
+        result = sync_routing_block(path, label, anchor_fn, table_md, table_err,
+                                     dry_run, day_tag, force, report)
+        if result == "conflict":
+            conflicts += 1
+    return conflicts
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def cmd_sync(args):
+    for p in (SRC_CLAUDE, SRC_ORCH, SRC_AGENT):
+        if not os.path.isfile(p):
+            print("wb-instructions: Quelle fehlt: %s" % p, file=sys.stderr)
+            return 1
+    if args.harness and args.harness not in HARNESS_BY_ID:
+        print("wb-instructions: unbekannter Harness '%s'. Bekannt: %s"
+              % (args.harness, ", ".join(HARNESS_BY_ID)), file=sys.stderr)
+        return 1
+
+    drift_warning = check_wb_state_drift()
+    if drift_warning:
+        print(drift_warning, file=sys.stderr)
+
+    day_tag = datetime.date.today().isoformat()
+    report = []
+    conflicts = 0
+
+    # Routing markers run FIRST and, when not a dry-run, mutate the live CLAUDE.md/orchestrator.md
+    # in place. Reading the sources for the harness targets only AFTER this step is what makes a
+    # single `sync` call self-consistent: harness copies always reflect the CURRENT CLAUDE.md
+    # (markers included), so a second run has nothing left to change. Reading sources first would
+    # make every harness target one run stale relative to the routing-marker insertion.
+    conflicts += sync_routing_markers(args.dry_run, day_tag, args.force, report)
+
+    sources = {"claude": read_text(SRC_CLAUDE), "orch": read_text(SRC_ORCH), "agent": read_text(SRC_AGENT)}
+    source_hashes = {SRC_CLAUDE: sha256_text(sources["claude"]),
+                      SRC_ORCH: sha256_text(sources["orch"]),
+                      SRC_AGENT: sha256_text(sources["agent"])}
+    skills = discover_skills()
+    skills_index = render_skills_index(skills)
+    targets = [HARNESS_BY_ID[args.harness]] if args.harness else HARNESSES
+    for h in targets:
+        status, target, full = sync_harness(h, sources, source_hashes, skills_index,
+                                             args.dry_run, day_tag, args.force)
+        report.append((h["id"], status, target))
+        if status == "conflict":
+            conflicts += 1
+        if args.dry_run:
+            old = read_text(target) if os.path.exists(target) else ""
+            if old != full:
+                import difflib
+                diff = "".join(difflib.unified_diff(
+                    old.splitlines(True), full.splitlines(True),
+                    fromfile=target + " (aktuell)", tofile=target + " (neu)"))
+                if diff:
+                    print(diff)
+
+    sync_skills_mirror(args.dry_run, day_tag, report)
+
+    print("%-28s %-24s %s" % ("HARNESS/ZIEL", "STATUS", "DATEI"))
+    for name, status, target in report:
+        print("%-28s %-24s %s" % (name, status, target))
+
+    if conflicts and not args.force:
+        print("\n%d Zieldatei(en) von Hand geaendert -- NICHT ueberschrieben. "
+              "Mit --force ueberschreiben (Sicherungskopie geht vorher nach %s-wb-instructions/)."
+              % (conflicts, day_tag), file=sys.stderr)
+        return 1
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="wb-instructions")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("sync", help="Regeln/Rollen/Skills fuer alle registrierten Harnesses generieren")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--harness", default=None)
+    sp.add_argument("--force", action="store_true")
+    args = ap.parse_args()
+    if args.cmd == "sync":
+        sys.exit(cmd_sync(args))
+
+
+if __name__ == "__main__":
+    main()

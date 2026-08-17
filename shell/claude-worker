@@ -1,0 +1,104 @@
+#!/bin/bash
+# claude-worker [--mensch] <name> <haiku45|sonnet5|opus5|opus48|fable5>[:effort] <dir> <task...>
+# Permanent Claude chat agent pane (pi-worker mechanics). Model is REQUIRED.
+#
+# `--mensch` (2026-08-06) hebt den Effort-Deckel fuer diesen einen Start auf. Es
+# wird hier nur DURCHGEREICHT — entschieden wird es in pi-worker, wo `wb-mensch`
+# die Herkunft des Aufrufs misst. Das Merkmal steht ganz vorne, damit es auch die
+# beiden `exec`-Wege unten (andere Maschine, Settings-Vorgabe) unveraendert
+# mitnehmen.
+#
+# Routing (freigegeben 2026-07-25) — pick by TOTAL expected work:
+#   haiku45:low    mechanical (rename, config tweak, format, one obvious fix; 200K ctx only)
+#   sonnet5:high   short, well-specified coding, few files
+#   sonnet5:xhigh  larger but clear spec (cross-file refactor, test suite, doc sweep)
+#   opus5:xhigh    long/multi-step, debugging, design decisions, ambiguity
+#   opus5:high     independent reviewer pass
+#   opus48:xhigh   second opinion / A-B against known-good 4.8 behaviour
+#   opus5:xhigh    customer-facing VISUAL deliverables (landing page, customer
+#                  presentation, visual asset for a client) — since 2026-07-29 this
+#                  replaces fable5 there: higher design-arena website Elo at half the
+#                  price. The former fable self-service exception is REVOKED.
+#   fable5         NEVER without the user's explicit word, for any task. Effort cap
+#                  `high` (raised from medium 2026-07-30). Enforced in pi-worker,
+#                  which reads the cap from the model registry — not from this comment.
+# Effort cap is xhigh everywhere (never `max`). Legacy aliases haiku|sonnet|opus|fable
+# still work; `opus` stays pinned to 4.8 — write `opus5` for Opus 5.
+#
+# V3: any model REGISTERED in ~/.claude/workbench/models.json can be typed here too
+# (`claude-worker w1 gpt-5-codex <dir> <task>`), whatever harness it runs on. The
+# routing table above is generated from that registry: `wb-state models table`.
+#
+#   claude-worker --on <mac|peer> <name> <model>[:effort] <dir> <task...>
+# runs the worker on the OTHER machine and mirrors it into the local grid; it is
+# called SSH-<name> everywhere (pane, state file, result dir on the target).
+# Result: `wb-result SSH-<name>`. Without --on nothing changes.
+#
+# maxWorkers (SPEC-V2 A) is enforced in pi-worker, not duplicated here: this script
+# never creates a pane itself, it only ever execs onward (below, or into
+# wb-ssh-worker just above) — so pi-worker's check already covers every path that
+# actually spawns something, on whichever machine that turns out to be.
+MENSCHFLAG=""
+if [ "${1:-}" = "--mensch" ]; then MENSCHFLAG="--mensch"; shift; fi
+
+if [ "${1:-}" = "--on" ]; then
+  ONMACHINE="${2:?Maschine (mac|peer)}"; shift 2
+  case "$(uname -s)" in Darwin) SELF=mac ;; *) SELF=peer ;; esac
+  [ "$ONMACHINE" = "$SELF" ] && { echo "claude-worker: --on gilt nur fuer eine ANDERE Maschine — '$ONMACHINE' ist diese hier. Ohne --on starten." >&2; exit 1; }
+  # Auf der ANDEREN Maschine wird die Herkunft neu gemessen (die SSH-Sitzung dort
+  # ist ein anderer Prozessbaum), deshalb geht das Merkmal hier NICHT mit: es
+  # waere dort eine reine Behauptung ohne pruefbaren Ursprung. Wer auf der
+  # zweiten Maschine ueber dem Deckel starten will, tut das dort am Terminal.
+  [ -n "$MENSCHFLAG" ] && echo "claude-worker: '--mensch' gilt nicht ueber '--on' — die Herkunft ist auf der anderen Maschine nicht mehr pruefbar. Der Deckel greift dort normal." >&2
+  exec "$HOME/.local/bin/wb-ssh-worker" "$ONMACHINE" claude "$@"
+fi
+
+NAME="${1:?name}"; MODEL="${2:?model (haiku45|sonnet5|opus5|opus48|fable5[:effort]|default)}"; DIR="${3:?dir}"
+
+# defaultWorkerMachine (SPEC-V2 A): applies ONLY when no machine was given explicitly
+# (no --on — handled above and already returned) AND the name is not already an SSH
+# mirror (an explicit SSH-<name> already says exactly where the work happens). "local"
+# (the default) means today's behaviour: fall through to pi-worker unchanged.
+case "$NAME" in
+  SSH-*) ;;
+  *)
+    DEFMACH=$("$HOME/.local/bin/wb-state" settings get defaultWorkerMachine 2>/dev/null)
+    case "$DEFMACH" in mac|peer) ;; *) DEFMACH=local ;; esac
+    if [ "$DEFMACH" != local ]; then
+      case "$(uname -s)" in Darwin) SELF=mac ;; *) SELF=peer ;; esac
+      # Already on the configured default machine: nothing to redirect.
+      [ "$DEFMACH" = "$SELF" ] || exec "$HOME/.local/bin/wb-ssh-worker" "$DEFMACH" claude "$@"
+    fi
+    ;;
+esac
+
+# Worktree-Isolierung (freigegeben 2026-08-04): jeder Worker bekommt seinen eigenen
+# git-Arbeitsbaum und seinen eigenen Zweig, damit zwei Worker im selben Repo sich
+# nicht mehr gegenseitig in die Dateien laufen. Der Aufruf steht HIER, nach dem
+# Maschinen-Routing: ein Worker auf der ANDEREN Maschine hat seinen Worktree dort,
+# nicht hier, und beide `exec`-Pfade oben sind schon zurueckgekehrt.
+# `wb-worktree ensure` druckt IMMER ein benutzbares Verzeichnis — ohne git, ohne
+# Repo oder mit abgeschaltetem Schalter (workerWorktrees) faellt es auf $DIR
+# zurueck, mit einem Hinweis nach stderr. Der Normalfall kann daran nicht scheitern:
+# ein leeres Ergebnis oder ein Fehler laesst $DIR unveraendert.
+if [ -x "$HOME/.local/bin/wb-worktree" ]; then
+  WT_DIR="$("$HOME/.local/bin/wb-worktree" ensure "$NAME" "$DIR")" || WT_DIR=""
+  [ -n "$WT_DIR" ] && [ -d "$WT_DIR" ] && DIR="$WT_DIR"
+fi
+
+# `default` takes workerModel/workerEffort from the settings menu (resolved in
+# pi-worker, which owns the model table); it must NOT be prefixed with claude-.
+case "$MODEL" in
+  default|-) exec "$HOME/.local/bin/pi-worker" ${MENSCHFLAG:+"$MENSCHFLAG"} "$NAME" default "$DIR" "${@:4}" ;;
+esac
+# V3 (SPEC-V3 A.3): a REGISTRY model is typed exactly as it is registered
+# (`claude-worker w1 gpt-5-codex …`) and must NOT be prefixed either — `claude-`
+# in front of it would produce an id nobody knows. So only the built-in aliases
+# get the prefix; everything else goes through untouched and pi-worker decides in
+# order: alias -> registry -> installed Ollama id -> error.
+BASE="${MODEL%%:*}"
+case "$BASE" in
+  haiku45|sonnet5|opus5|opus48|fable5|haiku|sonnet|opus|fable)
+    exec "$HOME/.local/bin/pi-worker" ${MENSCHFLAG:+"$MENSCHFLAG"} "$NAME" "claude-$MODEL" "$DIR" "${@:4}" ;;
+esac
+exec "$HOME/.local/bin/pi-worker" ${MENSCHFLAG:+"$MENSCHFLAG"} "$NAME" "$MODEL" "$DIR" "${@:4}"

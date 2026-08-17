@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2560" height="1440" viewBox="0 0 2560 1440">
+  <defs>
+    <linearGradient id="feld" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#84AC7C"/>
+      <stop offset="1" stop-color="#6D9668"/>
+    </linearGradient>
+  </defs>
+  <!-- meadow the yard stands on -->
+  <path fill="url(#feld)" d="M0 1076 C 300 1042, 620 1092, 940 1068 C 1290 1042, 1560 1088, 1880 1066
+    C 2160 1046, 2360 1074, 2560 1058 L2560 1440 L0 1440 Z"/>
+  <!-- field seams -->
+  <g stroke="#7DA475" stroke-width="5" fill="none" opacity="0.7">
+    <path d="M-20 1140 C 400 1112, 900 1156, 1400 1128 C 1900 1100, 2200 1140, 2580 1120"/>
+    <path d="M-20 1214 C 460 1188, 980 1230, 1500 1200 C 1980 1172, 2260 1210, 2580 1192"/>
+  </g>
+
+  <!-- barn -->
+  <g transform="translate(1372 656)">
+    <path fill="#8E4636" d="M0 168 L232 60 L464 168 L464 200 L0 200 Z"/>
+    <rect x="26" y="196" width="412" height="228" fill="#B05B44"/>
+    <rect x="26" y="196" width="412" height="228" fill="none" stroke="#8E4636" stroke-width="8"/>
+    <path d="M26 196 L438 424 M438 196 L26 424" stroke="#8E4636" stroke-width="9" fill="none" opacity="0.5"/>
+    <rect x="178" y="286" width="108" height="138" fill="#6E3628"/>
+    <path d="M232 92 L262 118 L232 144 L202 118 Z" fill="#F2E3C6"/>
+  </g>
+  <!-- silo -->
+  <g transform="translate(1856 700)">
+    <rect x="0" y="46" width="112" height="330" fill="#D8CDB6"/>
+    <path d="M0 46 C 22 -4, 90 -4, 112 46 Z" fill="#9AA79B"/>
+    <g stroke="#C3B79E" stroke-width="4">
+      <path d="M0 130 H112 M0 214 H112 M0 298 H112"/>
+    </g>
+  </g>
+
+  <!-- trees -->
+  <g>
+    <g transform="translate(520 792)">
+      <rect x="34" y="196" width="26" height="112" fill="#7A5A44"/>
+      <circle cx="47" cy="150" r="112" fill="#5F8C5C"/>
+      <circle cx="-26" cy="192" r="76" fill="#6B996550"/>
+      <circle cx="118" cy="188" r="84" fill="#69985F"/>
+    </g>
+    <g transform="translate(940 866)">
+      <rect x="26" y="150" width="20" height="88" fill="#7A5A44"/>
+      <circle cx="36" cy="112" r="84" fill="#65915F"/>
+      <circle cx="96" cy="144" r="60" fill="#71A06A"/>
+    </g>
+    <g transform="translate(2216 812)">
+      <rect x="30" y="182" width="24" height="102" fill="#7A5A44"/>
+      <circle cx="42" cy="140" r="102" fill="#5F8C5C"/>
+      <circle cx="-18" cy="180" r="64" fill="#6B9965"/>
+    </g>
+  </g>
+
+  <!-- haystacks -->
+  <g fill="#D9BE7E">
+    <ellipse cx="700" cy="1146" rx="74" ry="46"/>
+    <ellipse cx="700" cy="1108" rx="58" ry="34"/>
+    <ellipse cx="838" cy="1170" rx="62" ry="38"/>
+  </g>
+</svg>

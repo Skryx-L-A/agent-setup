@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# orch-launch <name> <model> <dir> <task...>
+# Launch a Claude orchestrator into the dedicated 'wb-orch' tmux session and
+# arrange the workbench grid (orchestrator big on top, workers as columns below).
+# Workers the orchestrator spawns split into the same window; the tmux hooks
+# re-grid automatically. Run from the control shell ('main') so the command is visible.
+#
+# Same command also starts plain WORKERS into wb-orch (regeln/maschinen.md: "Orchestrator/
+# Worker IMMER mit orch-launch ... starten"). Only the very FIRST launch into an empty
+# wb-orch session is the orchestrator itself; every later call is a worker that pi-worker
+# already tagged @wb_role=worker correctly -- that tag must survive, not get overwritten.
+set -euo pipefail
+# tmux binary: never hardcode a machine-specific path (Linux /usr/bin vs Mac
+# /opt/homebrew/bin). $TMUX_BIN wins, else whatever is on PATH.
+T="${TMUX_BIN:-$(command -v tmux 2>/dev/null || true)}"
+[ -n "$T" ] || T=tmux
+#
+# VERSIONIERT SEIT 2026-08-13. Bis dahin lag dieses Skript NUR auf peer unter
+# ~/.local/bin/orch-launch und in keinem Repo -- eine Aenderung daran war damit weder
+# nachvollziehbar noch wiederherstellbar. Ausgeliefert wird es von hier nach
+# peer:~/.local/bin/orch-launch.
+NAME="${1:?name}"
+$T has-session -t wb-orch 2>/dev/null || $T new-session -d -s wb-orch -n orch
+# ANKER-FENSTER (2026-08-13, nach Befund des Nutzers „wb-orch existiert nach dem Ende des
+# Workers nicht mehr"). Der Prune weiter unten raeumt die Basis-Shell weg; danach besteht
+# wb-orch nur noch aus den Agenten-Panes. Endet der letzte davon, stirbt sein Fenster,
+# mit dem Fenster die Session und mit der Session die ganze Sicht darauf -- waehrend eine
+# Mac-Session denselben Fall ueberlebt, weil sie neben dem Orchestrator ein dauerhaftes
+# `workers`-Fenster mit einem Platzhalter-Pane haelt. `wb-workers-window` stellt genau
+# dieses Fenster her (Platzhalter mit @wb_role=placeholder, den weder der Prune unten
+# noch `wb-close` anfasst) und legt zugleich die gruppierte Sicht `wb-orch-view` an, an
+# der der Spiegel des Macs haengt (`wb-remote-view`).
+[ -x "$HOME/.local/bin/wb-workers-window" ] && "$HOME/.local/bin/wb-workers-window" wb-orch >/dev/null 2>&1
+pane=$($T list-panes -t wb-orch -F '#{pane_id}' | head -1)
+# Snapshot BEFORE the spawn: does wb-orch already have a LIVING orchestrator pane? If yes,
+# whatever pane this call creates is a worker and must stay tagged 'worker'. If no (empty or
+# brand-new session, or a crashed orchestrator with pane_dead=1), this call's pane becomes
+# the orchestrator -- the one case where the override below is correct.
+HAD_ORCH=$($T list-panes -s -t wb-orch -F '#{pane_id} #{@wb_role} #{pane_dead}' 2>/dev/null \
+           | awk '$2=="orchestrator" && $3=="0"{print $1; exit}')
+env TMUX_PANE="$pane" "$HOME/.local/bin/claude-worker" "$@"
+# Mark the orchestrator pane so wb-grid keeps it as the big top pane -- ONLY on the first
+# launch (HAD_ORCH above); a later call for a plain worker must NOT be promoted (measured
+# bug 2026-08-04: this used to run unconditionally on every call, see regeln/maschinen.md).
+# `-s` scans the WHOLE session (every window), not just the currently active one: pi-worker/
+# wb-grid can park a fresh worker pane in a separate "workers" window depending on
+# workerLayout, and a window-scoped list-panes silently misses it there -- also measured
+# 2026-08-04, and without `-s` even THIS first-launch promotion can silently no-op.
+if [ -z "$HAD_ORCH" ]; then
+  op=$($T list-panes -s -t wb-orch -F '#{pane_id} #{@wb_worker}' | awk -v n="$NAME" '$2==n{print $1; exit}')
+  [ -n "$op" ] && $T set -p -t "$op" @wb_role orchestrator
+fi
+# prune leftover base bash shells (no role) so only orchestrator + workers remain
+for p in $($T list-panes -t wb-orch -F '#{pane_id}|#{@wb_role}|#{pane_current_command}' | awk -F'|' '$2=="" && $3=="bash"{print $1}'); do
+  $T kill-pane -t "$p" 2>/dev/null || true
+done
+$T run-shell -b "$HOME/.local/bin/wb-grid $($T display -p -t wb-orch '#{window_id}')" 2>/dev/null || true
+# Dem Mac sagen, dass hier gerade ein Worker entstanden ist (2026-08-13). Ohne diese
+# Zeile bleibt genau die Richtung stumm, wegen der die Automatik gebaut wurde: ein hier
+# gestarteter Worker taucht im Mac-Worker-Tab erst auf, wenn dort jemand nachsieht.
+# Derselbe Aufruf steht auch in `pi-worker`; er ist gedrosselt, doppelt schadet also
+# nicht, und hier steht er, weil peers pi-worker aelter ist als der im Repo.
+# Abgekoppelt und fehlertolerant: ein Start darf daran nie scheitern.
+[ -x "$HOME/.local/bin/wb-remote-view" ] \
+  && "$HOME/.local/bin/wb-remote-view" --announce >/dev/null 2>&1 || true
