@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# bm — Basic Memory CLI over the ~/Knowledge vault.
+# Installed via `uv tool install basic-memory`; this wrapper just finds it on PATH.
+# (The Mac original hardcoded the uv-tool venv python; that path is machine-specific.)
+if command -v basic-memory >/dev/null 2>&1; then exec basic-memory "$@"; fi
+if command -v uvx >/dev/null 2>&1; then exec uvx basic-memory "$@"; fi
+echo "bm: basic-memory not found — install with: uv tool install basic-memory" >&2
+exit 127

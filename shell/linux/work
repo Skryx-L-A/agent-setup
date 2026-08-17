@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Attach to a persistent tmux session (create if missing).
+# Usage: work [session-name]   (default: main)
+# Inside it, run `claude` as usual; it survives SSH disconnects.
+session="${1:-main}"
+if [ -n "$TMUX" ]; then
+  # Already inside tmux: don't nest. Create the target if missing, then switch.
+  tmux has-session -t "$session" 2>/dev/null || tmux new-session -d -s "$session"
+  exec tmux switch-client -t "$session"
+else
+  # Outside tmux: attach to the session, creating it if needed.
+  exec tmux new-session -A -s "$session"
+fi

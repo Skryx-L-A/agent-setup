@@ -33,7 +33,7 @@ app/         the workbench itself — Electron main process, preload bridges, re
 extension/   16 modules the app imports rather than duplicates. They started life in a
              VS Code extension and still carry its directory name; there is exactly one copy
              of each, and this is it
-shell/       92 command-line tools and the default configuration files they read:
+shell/       97 command-line tools and the default configuration files they read:
              worker spawners, context guard, model registry, session management, budget and
              quota, cross-machine helpers, local media generation, knowledge-base maintenance.
              shell/linux/ holds the variants that need CUDA instead of Apple Silicon

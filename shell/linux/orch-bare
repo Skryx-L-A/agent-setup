@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# orch-bare <session> <dir> — start a BARE Claude orchestrator (Opus 4.8 @ xhigh,
+# orchestrator role, NO task submitted) in its own tmux session, for viewing in a
+# VSCode Remote-SSH window. A begin prompt is left UNSENT for the human to submit.
+# (orch-launch submits its task via claude-worker; this deliberately does not.)
+set -euo pipefail
+SESS="${1:?session}"; DIR="${2:?dir}"
+T=/usr/bin/tmux
+ROLE="$HOME/.claude/roles/orchestrator.md"
+CMD="$HOME/.local/bin/claude --model claude-opus-4-8 --effort xhigh --append-system-prompt \"\$(cat $ROLE)\""
+if $T has-session -t "=$SESS" 2>/dev/null; then echo "exists: $SESS"; exit 0; fi
+$T new-session -d -s "$SESS" -c "$DIR" "$CMD"
+pane=$($T list-panes -t "=$SESS" -F '#{pane_id}' | head -1)
+$T set -p -t "$pane" @wb_role orchestrator
+$T set -p -t "$pane" @wb_cmd "$CMD"
+$T set -p -t "$pane" remain-on-exit on
+$T select-pane -t "$pane" -T "A PROJECT M1 ORCHESTRATOR"
+echo "started session=$SESS pane=$pane dir=$DIR"

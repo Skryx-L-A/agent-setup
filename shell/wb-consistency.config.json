@@ -359,13 +359,14 @@
     ],
     "identifier_pattern": "\\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\\b",
     "fremd_pruefung": {
-      "_comment": "Sorte D, die Umkehrung von Sorte A: ein installiertes Werkzeug ohne Gegenstueck im Repo. paketmanager_verzeichnisse ist eine Liste von ORTEN, keine Liste von NAMEN -- Paketmanager kommen selten hinzu, eigene Werkzeuge fast woechentlich. Was hier NICHT steht, wird per Shebang-Merkmal erkannt (siehe _ist_skript im Quelltext), nicht ueber eine gepflegte Registrierung einzelner Programme.",
+      "_comment": "Sorte D, die Umkehrung von Sorte A: ein installiertes Werkzeug ohne Gegenstueck im Repo. paketmanager_verzeichnisse ist eine Liste von ORTEN, keine Liste von NAMEN -- Paketmanager kommen selten hinzu, eigene Werkzeuge fast woechentlich. Was hier NICHT ueber einen Ort erkannt wird, prueft installationsnachweis_globs ueber das RECORD der installierenden Distribution (noetig auf Linux: `pip install --user` legt Skripte ohne Symlink und ohne unterscheidbaren Ort direkt in ~/.local/bin -- gemessen 2026-08-17 auf peer, 40 von 48 Funden waren so ein Fall). Was danach noch uebrig ist, wird per Shebang-Merkmal erkannt (siehe _ist_skript im Quelltext), nicht ueber eine gepflegte Registrierung einzelner Programme. bekannt_zusatz_praefixe nennt zusaetzliche Repo-Verzeichnisse, deren Dateinamen ebenfalls als 'schon versioniert' zaehlen, auch wenn sie nicht direkt unter dem install_map-Ziel-Praefix liegen -- shell/linux/ ist auf der zweiten Maschine so ein Fall: eine Datei, die dort versioniert ist, aber nicht auch in shell/, ist trotzdem versioniert.",
       "ziel": "{BASE}/.local/bin",
       "paketmanager_verzeichnisse": [
         "{BASE}/.local/share/uv/tools",
         "{BASE}/.local/pipx/venvs",
         "{BASE}/.local/share/pipx",
         "{BASE}/.npm-global",
+        "{BASE}/.local/lib/node_modules",
         "{BASE}/.cargo/bin",
         "{BASE}/go/bin",
         "{BASE}/.rbenv",
@@ -380,6 +381,13 @@
         "/usr/bin",
         "/usr/sbin",
         "/bin"
+      ],
+      "installationsnachweis_globs": [
+        "{BASE}/.local/lib/python*/site-packages/*.dist-info/RECORD",
+        "{BASE}/Library/Python/*/lib/python/site-packages/*.dist-info/RECORD"
+      ],
+      "bekannt_zusatz_praefixe": [
+        "shell/linux/"
       ]
     }
   },
