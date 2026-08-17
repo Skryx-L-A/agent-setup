@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# framer-inspo — turn a website brief into a set of public Framer inspiration URLs.
+#
+# Framer (the website builder) has NO site-building CLI and NO public read API.
+# The only login-free way to use it for inspiration is its public galleries.
+# This script maps a niche/style brief to the right Framer gallery URLs so an
+# agent (or human) has a deterministic entry point to fetch + study real,
+# professionally designed Framer sites before building.
+#
+# Usage:
+#   framer-inspo "dark saas landing page for an AI startup"
+#   framer-inspo --list           # show all categories + styles
+#   framer-inspo --urls "minimal photographer portfolio"   # print only URLs (for scripts/agents)
+#   framer-inspo --help
+#
+# Verified 2026-06-14. Slugs from framer.com/gallery.
+
+set -euo pipefail
+
+BASE="https://www.framer.com"
+GAL="$BASE/gallery"
+MKT="$BASE/marketplace/templates/"
+
+CATEGORIES=(agency blog business ecommerce landing-page personal)
+STYLES=(animations colorful dark grid large-type minimal)
+
+print_help() {
+  cat <<'EOF'
+framer-inspo — Framer public-gallery inspiration resolver
+
+Framer has no build CLI / no public API. This maps a brief to its public,
+login-free galleries so you can fetch and study real Framer-designed sites.
+
+USAGE
+  framer-inspo "<brief>"            Resolve a brief -> human-readable URL set
+  framer-inspo --urls "<brief>"     Print only the URLs (one per line)
+  framer-inspo --list               List all categories and styles
+  framer-inspo --help               This help
+
+EXAMPLES
+  framer-inspo "dark animated SaaS landing page"
+  framer-inspo --urls "minimal photographer portfolio"
+  framer-inspo "colorful ecommerce store for sneakers"
+
+NOTES
+  - Showcase pages (gallery) = real published sites -> best for layout/motion ideas.
+  - Each gallery site and marketplace template has a public live demo
+    (usually <name>.framer.website) -> open it for the full experience.
+  - Use as INSPIRATION only: study patterns/tokens, never copy assets or code.
+EOF
+}
+
+list_all() {
+  echo "CATEGORIES (site type) -> $GAL/categories/<slug>/"
+  for c in "${CATEGORIES[@]}"; do printf '  %-13s %s\n' "$c" "$GAL/categories/$c/"; done
+  echo
+  echo "STYLES (look & feel) -> $GAL/styles/<slug>/"
+  for s in "${STYLES[@]}"; do printf '  %-13s %s\n' "$s" "$GAL/styles/$s/"; done
+}
+
+# --- map free text -> one category + matching styles ---------------------------
+resolve() {
+  local q; q="$(printf '%s' "$*" | tr '[:upper:]' '[:lower:]')"
+  local cat="landing-page"   # sensible default for "a website"
+
+  case "$q" in
+    *portfolio*|*photograph*|*designer*|*artist*|*resume*|*cv*|*personal*|*"about me"*) cat="personal" ;;
+    *agenc*|*studio*|*freelanc*) cat="agency" ;;
+    *shop*|*store*|*ecommerce*|*e-commerce*|*commerce*|*product*sale*|*sell*) cat="ecommerce" ;;
+    *blog*|*magazine*|*news*|*article*|*writer*|*content*|*newsletter*) cat="blog" ;;
+    *business*|*corporate*|*consult*|*finance*|*law*|*company*|*b2b*|*enterprise*) cat="business" ;;
+    *saas*|*startup*|*landing*|*app*|*software*|*marketing*|*product*|*launch*|*waitlist*) cat="landing-page" ;;
+  esac
+
+  local styles=()
+  case "$q" in *dark*|*night*|*black*) styles+=("dark") ;; esac
+  case "$q" in *colorful*|*vibrant*|*playful*|*bright*|*gradient*) styles+=("colorful") ;; esac
+  case "$q" in *minimal*|*clean*|*simple*|*elegant*|*whitespace*) styles+=("minimal") ;; esac
+  case "$q" in *anim*|*motion*|*interactive*|*scroll*|*parallax*|*3d*) styles+=("animations") ;; esac
+  case "$q" in *grid*|*bento*|*card*) styles+=("grid") ;; esac
+  case "$q" in *"big type"*|*"large type"*|*typograph*|*bold*|*editorial*) styles+=("large-type") ;; esac
+
+  # default styles if the brief named none
+  if [ "${#styles[@]}" -eq 0 ]; then styles=(minimal animations); fi
+
+  RES_CAT="$cat"
+  RES_STYLES=("${styles[@]}")
+}
+
+emit_urls() {
+  echo "$GAL/categories/$RES_CAT/"
+  for s in "${RES_STYLES[@]}"; do echo "$GAL/styles/$s/"; done
+  echo "$GAL/"
+  echo "$MKT"
+}
+
+# --- arg handling --------------------------------------------------------------
+case "${1:-}" in
+  ""|-h|--help) print_help; exit 0 ;;
+  --list)       list_all;    exit 0 ;;
+  --urls) shift; [ "$#" -gt 0 ] || { echo "need a brief" >&2; exit 1; }
+          resolve "$@"; emit_urls; exit 0 ;;
+esac
+
+resolve "$@"
+echo "Brief      : $*"
+echo "Category   : $RES_CAT"
+echo "Styles     : ${RES_STYLES[*]}"
+echo
+echo "Fetch / open these public Framer pages for inspiration:"
+echo
+echo "  Showcase (real sites, this type):"
+echo "    $GAL/categories/$RES_CAT/"
+echo "  Showcase (matching look & feel):"
+for s in "${RES_STYLES[@]}"; do echo "    $GAL/styles/$s/"; done
+echo "  All showcased sites:"
+echo "    $GAL/"
+echo "  Template marketplace (full multi-page designs w/ live demos):"
+echo "    $MKT"
+echo
+echo "Next: fetch these, pick 3-6 that fit, open each live demo, then study"
+echo "layout / section order / type scale / color / motion. Inspiration only."

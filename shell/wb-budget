@@ -1,0 +1,2035 @@
+#!/bin/bash
+# wb-budget — fortlaufendes Bild des Token-/Limit-Verbrauchs: 5h/Woche, Trend, Hochrechnung,
+#   Plan-Limit-Stand, und (--limit-kalibrierung) der empirische Umrechnungsfaktor zwischen
+#   Limit-Prozentpunkt, Tokens und USD-Aequivalent.
+#
+# WARUM: "spaet in einer schweren Woche" (Team-Groesse ans Restbudget anpassen) ist bisher
+#   Bauchgefuehl, keine Zahl. Dieses Tool macht daraus eine Zahl — aber NUR aus Quellen, die
+#   tatsaechlich vorliegen.
+#
+# DATENLAGE (Stand 2026-08-10, korrigiert):
+#   Seit dem 28.07. schreibt ~/.claude/statusline-command.sh die Plan-Limit-Prozente
+#   (rate_limits.five_hour/seven_day.used_percentage) bei JEDEM Render selbst persistent mit,
+#   nach ~/.claude/workbench/limits.jsonl (eine Zeile je Aenderung; Felder ts, session,
+#   five_hour_pct, seven_day_pct, five_hour_resets_at) und ~/.claude/workbench/limits-latest.json
+#   (nur der letzte Stand). Das ist die PRIMAERE Quelle fuer den Plan-Limit-Abschnitt unten und
+#   fuer --limit-kalibrierung. Frueher stand hier, diese Werte seien nur transient und ohne
+#   Aenderung an statusline-command.sh nicht zu bekommen — das stimmte bis zum 28.07., seither
+#   nicht mehr; dieses Skript suchte bis zum 10.08. am falschen Ort (s.u.) und meldete deshalb
+#   faelschlich "nicht verfuegbar".
+#
+#   Der alte --ingest-Pfad (~/.local/state/wb-budget/limits.jsonl) bleibt als ZWEITE, manuelle
+#   Quelle bestehen (Felder ts, five_hour_pct, seven_day_pct, resets_at) — er wird nur befuellt,
+#   wenn 'wb-budget --ingest' explizit mit einer Statusline-JSON auf stdin aufgerufen wird. Liegen
+#   beide Logs vor, gewinnt die juengere Zeile (Vergleich ueber ts).
+#
+#   Was daneben lokal und persistent vorliegt: die Session-Transkripte unter
+#   ~/.claude/projects/**/*.jsonl. Jede assistant-Nachricht traegt echte Token-Zahlen
+#   (message.usage: input_tokens/output_tokens/cache_creation_input_tokens/
+#   cache_read_input_tokens) mit Zeitstempel und Modellnamen. Darauf baut der Haupt-Report
+#   (5h/Woche/Trend/Hochrechnung, Rohzahlen ohne Dollarbetrag) ebenso auf wie
+#   --limit-kalibrierung und --limit-gewichte (die den Dollarbetrag ueber die Preistabelle
+#   unten dazurechnen).
+#
+# PLANHISTORIE (Stand 2026-08-10, Anweisung des Nutzers):
+#   Ein Limit-Prozentpunkt bedeutet unter einem Pro-Abo etwas anderes als unter Max 100 oder
+#   Max 200 -- die Toepfe sind verschieden gross. --limit-kalibrierung und --limit-gewichte
+#   lesen deshalb ~/.claude/workbench/plan-historie.json -- vom Nutzer gepflegt, NICHT von
+#   diesem Skript angelegt oder ueberschrieben -- und bilden NIE einen Abschnitt ueber eine
+#   Plangrenze hinweg; jede Ausgabe nennt den Plan. Format: {"plaene": [{"plan": "...",
+#   "von": "...", "bis": "...|null"}, ...]}, weitere Schluessel je Eintrag (label/quelle/
+#   genauigkeit) sind erlaubt und werden ignoriert. Fehlt die Datei, rechnen beide trotzdem,
+#   aber mit einer expliziten Warnung, dass die Zahlen nur gelten, solange im Zeitraum kein
+#   Wechsel stattfand. Vorlage (nur fuer eine neue Maschine, ersetzt NICHT die gepflegte
+#   Datei): shell/plan-historie.default.json.
+#
+#   Aktueller Stand laut dieser Datei: Plan "max-200", belegt (nicht nur angenommen) durchgehend
+#   seit Montag der Vorwoche vor dem 2026-08-03 und weiterhin laufend -- das Wochenfenster vom
+#   03.08. 14:00 bis 10.08. 14:00 liegt damit VOLLSTAENDIG in einem Plan.
+#
+#   Das Wochenlimit resettet nachweislich jeden Montag 14:00 Ortszeit (Europe/Berlin, DST-
+#   bewusst je nach Jahreszeit) -- eine bekannte, feste Kante, keine geratene. --limit-
+#   kalibrierung und --limit-gewichte trennen 7-Tage-Abschnitte deshalb zusaetzlich an dieser
+#   Kante statt sich allein auf den (durch gleichzeitige Sessions verrauschten) Ruecksprung im
+#   Prozentwert zu verlassen; seit Kurzem loggt statusline-command.sh zur Gegenprobe auch
+#   seven_day_resets_at mit.
+#
+# EXTERNE ANKER (Stand 2026-08-10): ~/.claude/workbench/limit-anker.json traegt von Hand
+#   nachgerechnete Abschnitte, die limits.jsonl nicht selbst hergibt -- z.B. ein Wochenfenster
+#   von VOR dessen Beginn. --limit-gewichte nimmt jeden Anker als zusaetzliche Gleichung auf,
+#   sofern plan-historie.json seinen ganzen Zeitraum als EINEN Plan bestaetigt; sonst wird er
+#   mit Begruendung uebersprungen. Ein Anker traegt nur ein USD-Aequivalent je Modell, keine
+#   Tokenaufschluesselung -- er zaehlt deshalb nur fuer die USD-Basis, nie fuer die Token-Basen.
+#   Vorlage: shell/limit-anker.default.json.
+#
+# BENUTZUNG:
+#   wb-budget                            Token-Report (5h/7d/Trend/Hochrechnung) + Plan-Limit-Stand
+#   wb-budget --ingest                   liest EINE Statusline-JSON von stdin, loggt rate_limits
+#                                          falls vorhanden (Aufruf z.B.:
+#                                          <statusline-json erzeugen> | wb-budget --ingest)
+#   wb-budget --limit-kalibrierung [--tage N]
+#                                         wie viele Tokens/USD stecken in einem Limit-Prozentpunkt —
+#                                          empirisch aus limits.jsonl + Transkripten der letzten
+#                                          N Tage (Default 14), nie aus einer festen Zahl im Code.
+#   wb-budget --limit-gewichte [--tage N]
+#                                         wie viele Limit-Punkte kostet ein Modell fuer sich
+#                                          genommen -- ein Gewicht je Modell statt eines
+#                                          Faktors fuer alle, gegen dieselben Abschnitte gelost.
+#   wb-budget --json [--tage N | --von ISO --bis ISO] [--harness a,b] [--modell x,y] [--sitzung id]
+#                                         der maschinenlesbare Bericht ueber ALLE belegten Quellen,
+#                                          nicht nur Claude -- Grundlage der Verbrauchsseite.
+#                                          Siehe MEHR ALS CLAUDE weiter unten.
+#
+# MEHR ALS CLAUDE (Stand 2026-08-11, Messung ~/.pi-workers/results/verbrauchdaten/):
+#   Der Standardbericht oben liest ausschliesslich ~/.claude/projects/**/*.jsonl und ist damit
+#   strukturell nur Claude. `--json` liest daneben die sechs weiteren Quellen, die auf dieser
+#   Maschine nachweislich echte Token je Nachricht mit Sitzungs- und Modellzuordnung fuehren:
+#     codex          ~/.codex/sessions/**/rollout-*.jsonl, Ereignis `token_count`
+#     pi             ~/.pi-workers/sessions/**/*.jsonl, message.usage
+#     opencode       ~/.local/share/opencode/opencode.db, Tabelle message, Spalte data (JSON)
+#     copilot        ~/.copilot/session-store.db, Tabelle assistant_usage_events
+#     copilot-cloud  dieselbe Datenbank -- die beiden sind NUR am Modellfeld zu unterscheiden
+#     openhands      ~/.openhands/conversations/<id>/base_state.json, stats.usage_to_metrics.agent
+#   Elf weitere Harnesses aus shell/models.default.json haben auf dieser Maschine keine oder keine
+#   lesbare Spur. Sie fallen NICHT still weg: `--json` fuehrt jeden von ihnen unter "luecken" mit
+#   dem gemessenen Grund, damit eine Anzeige die Luecke zeigen kann statt zu schweigen.
+#
+#   ZWEI GROESSEN, NIE EINE ZAHL. Ein API-Dollarpreis gilt nur, wo ein Anbieter pro Token
+#   abrechnet; die vier Abo-Harnesses zahlen stattdessen einen Kontingentanteil (Anthropic in
+#   Prozent des Zeitfensters, Copilot in AIC). `--json` weist deshalb je Modell ein `preis`-Objekt
+#   mit einem `art`-Feld aus -- "abo-aequivalent" (hypothetisch, NIE abgebucht), "katalogpreis"
+#   (Listenpreis eines Cloud-Anbieters), "harness-angabe" (der Harness hat selbst gerechnet) oder
+#   "kein-preis" -- und traegt den Kontingentstand getrennt daneben (aus `wb-kontingent`).
+#
+#   TOKEN JE SEKUNDE IST NICHT UEBERALL DASSELBE. Nur copilot/copilot-cloud tragen mit
+#   `inter_token_latency_ms` eine echte Generierungsrate. Ueberall sonst bleibt nur eine
+#   Wanduhr-Naeherung aus Zeitstempeln, die Denkzeit und Werkzeugpausen mitmisst (gemessen: zwei
+#   Nachrichten 0,662 s auseinander, zwei andere 9,256 s). Jede Rate traegt deshalb ein `art`-Feld
+#   ("gemessen" / "naeherung") und ihren Grund -- eine Zahl ohne diese Angabe waere eine Luege.
+
+set -u
+
+JQ=$(command -v jq || echo /opt/homebrew/bin/jq)
+STATE_DIR="$HOME/.local/state/wb-budget"
+LIMITS_LOG="$STATE_DIR/limits.jsonl"                       # alter --ingest-Pfad, manuell befuellt
+WORKBENCH_DIR="$HOME/.claude/workbench"
+WORKBENCH_LIMITS="$WORKBENCH_DIR/limits.jsonl"              # Betriebslog, seit 28.07. von statusline-command.sh
+mkdir -p "$STATE_DIR"
+
+if [ ! -x "$JQ" ] && ! command -v jq >/dev/null 2>&1; then
+  # Exit 0 waere hier eine Erfolgsmeldung an jeden Aufrufer, der den Rueckgabewert
+  # prueft -- ein Fehlschlag, der aus dieser Zeile herauskommt, ist keiner (bugjagd
+  # shell/hoch, 2026-08-15/17: mit '--ingest' verschluckt genau das den kompletten
+  # Datenpunkt, ohne dass ein automatischer Aufrufer es je erfaehrt).
+  echo "wb-budget: jq nicht gefunden — Report nicht moeglich." >&2
+  exit 1
+fi
+
+# --- --ingest: eine Statusline-JSON von stdin entgegennehmen, rate_limits loggen. ---
+if [ "${1:-}" = "--ingest" ]; then
+  input=$(cat)
+  has_limits=$(echo "$input" | "$JQ" -r 'if .rate_limits then "yes" else "no" end' 2>/dev/null)
+  if [ "$has_limits" != "yes" ]; then
+    echo "wb-budget: kein .rate_limits im Input gefunden — nichts geloggt."
+    exit 1
+  fi
+  echo "$input" | "$JQ" -c '{
+    ts: (now | todate),
+    five_hour_pct: .rate_limits.five_hour.used_percentage,
+    seven_day_pct: .rate_limits.seven_day.used_percentage,
+    resets_at: .rate_limits.five_hour.resets_at
+  }' >> "$LIMITS_LOG"
+  # $has_limits=="yes" nur heisst ".rate_limits ist wahr", nicht "ist ein Objekt" -- ein
+  # .rate_limits, das (durch einen kaputten Statusline-Aufrufer) ein STRING oder eine ZAHL ist,
+  # kommt trotzdem hier an. Die Extraktion oben bricht dann mit einem jq-Laufzeitfehler ("Cannot
+  # index string with...") ab, schreibt NICHTS in den Log, und ohne diese Pruefung lief das
+  # Skript unbeirrt weiter zur Erfolgsmeldung (2026-08-16, bugjagd shell/mittel, wb-budget:
+  # reproduziert mit '{"rate_limits":"oops"}' auf stdin: 0 Byte geloggt, Meldung trotzdem
+  # "Datenpunkt geloggt", Exit 0). PIPESTATUS[1] ist jq's eigener Exit-Code aus der Pipe direkt
+  # darueber -- `set -o pipefail` global zu setzen waere in einer 2000-Zeilen-Datei mit vielen
+  # anderen Pipes ein zu breiter Eingriff fuer diesen einen Fall.
+  JQ_RC=${PIPESTATUS[1]}
+  if [ "$JQ_RC" -ne 0 ]; then
+    echo "wb-budget: --ingest: jq-Fehler beim Erzeugen der Logzeile (rc=$JQ_RC) — NICHT geloggt." >&2
+    exit 1
+  fi
+  echo "wb-budget: Datenpunkt geloggt nach $LIMITS_LOG"
+  exit 0
+fi
+
+# --- --limit-kalibrierung [--tage N]: Tokens/USD je Limit-Prozentpunkt, empirisch. -----------
+#
+# Preistabelle fuer das API-Aequivalent, USD je Million Tokens (Ein-/Ausgabe). Stand 2026-08-10,
+# EINZIGER Ort im Skript, an dem Preise stehen — nie verstreut. cache_write zaehlt mit 1,25x dem
+# Eingabepreis, cache_read mit 0,1x dem Eingabepreis (unten in der Kalibrierung selbst gerechnet,
+# nicht hier). Ein Modellname, der hier fehlt, wird trotzdem gezaehlt und im Bericht als
+# "ohne Preis" ausgewiesen — nie stillschweigend mit 0 USD bewertet.
+#   claude-opus-5              5 / 25
+#   claude-opus-4-8            5 / 25
+#   claude-sonnet-5            3 / 15
+#   claude-haiku-4-5-20251001  1 / 5
+#   claude-fable-5             10 / 50
+#
+# Verfahren: aus limits.jsonl je Fenster (five_hour_pct, seven_day_pct) monotone Abschnitte
+# bilden — ein Ruecksprung des Prozentwerts beendet einen Abschnitt (Reset), ueber einen Reset
+# hinweg wird nie gerechnet. Ein Abschnitt unter 3 Prozentpunkten Anstieg wird verworfen (die
+# Ganzzahl-Aufloesung der geloggten Prozente waere sonst groesser als das Signal). Fuer jeden
+# ueberlebenden Abschnitt wird der Verbrauch aus den Transkripten im selben Zeitfenster summiert,
+# je Modell getrennt, daraus Tokens/Punkt (mit und ohne cache_read), USD/Punkt und der Modellmix.
+# Die Unsicherheit aus der Ganzzahl-Aufloesung (jede geloggte Prozentzahl ist per statusline-
+# command.sh abgeschnitten, nicht gerundet — der wahre Wert liegt im Intervall [x, x+1)) wird als
+# ±(100/Punkte)% mitgegeben, nicht als Zahl mit vier Nachkommastellen vorgetaeuscht.
+if [ "${1:-}" = "--limit-kalibrierung" ]; then
+  shift
+  TAGE=14
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --tage)
+        TAGE="${2:?wb-budget --limit-kalibrierung --tage <N>: Zahl fehlt}"
+        shift 2
+        ;;
+      *)
+        echo "wb-budget --limit-kalibrierung: unbekannte Option '$1'" >&2
+        exit 1
+        ;;
+    esac
+  done
+  case "$TAGE" in
+    ''|*[!0-9]*)
+      echo "wb-budget --limit-kalibrierung: --tage braucht eine positive Ganzzahl, nicht '$TAGE'" >&2
+      exit 1
+      ;;
+  esac
+
+  echo "wb-budget --limit-kalibrierung — Tokens/USD je Limit-Prozentpunkt (letzte ${TAGE}d, Quelle: $WORKBENCH_LIMITS)"
+  echo
+
+  if [ ! -s "$WORKBENCH_LIMITS" ]; then
+    echo "nicht verfuegbar — kein Log unter $WORKBENCH_LIMITS. Ohne diesen Betriebslog (seit"
+    echo "28.07. von statusline-command.sh geschrieben) gibt es keine Grundlage fuer eine"
+    echo "Kalibrierung."
+    exit 0
+  fi
+
+  /usr/bin/python3 - "$WORKBENCH_LIMITS" "$TAGE" "$HOME/.claude/projects" <<'PY'
+import glob, json, os, sys
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+LIMITS_PATH, TAGE, PROJECTS_DIR = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+
+# Preistabelle s. Kopfkommentar oben im Skript — hier nur die ausfuehrbare Form derselben Zahlen.
+PRICES = {
+    "claude-opus-5":             (5, 25),
+    "claude-opus-4-8":           (5, 25),
+    "claude-sonnet-5":           (3, 15),
+    "claude-haiku-4-5-20251001": (1, 5),
+    "claude-fable-5":            (10, 50),
+}
+CACHE_WRITE_FAKTOR = 1.25
+CACHE_READ_FAKTOR = 0.1
+PLAN_HISTORIE_PATH = os.path.expanduser("~/.claude/workbench/plan-historie.json")
+BERLIN = ZoneInfo("Europe/Berlin")
+
+FIELDS = [("five_hour_pct", "5-Stunden-Fenster"), ("seven_day_pct", "7-Tage-Fenster")]
+
+
+def parse_ts(s):
+    s = s.rstrip("Z")
+    if "." in s:
+        s = s.split(".")[0]
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+
+
+def parse_ts_offset(s):
+    # Fuer die Planhistorie: dort steht der Zeitstempel mit EXPLIZITEM Offset ("+02:00"), nicht
+    # nur als "Z" wie in limits.jsonl/den Transkripten -- Python 3.9 (dieses System) kennt
+    # fromisoformat("...Z") noch nicht, "...+00:00" aber schon, daher die Ersetzung.
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s).astimezone(timezone.utc).timestamp()
+
+
+def load_plan_historie():
+    # None = Datei fehlt/kaputt (loest die Warnung unten aus) -- ausdruecklich unterschieden
+    # von einer leeren, aber vorhandenen Historie. Format: ~/.claude/workbench/plan-historie.json
+    # ist Datei des Nutzers, von Hand gepflegt (shell/plan-historie.default.json dokumentiert
+    # dasselbe Format) -- {"plaene": [{"plan": "...", "von": "...", "bis": "...|null"}, ...]},
+    # weitere Schluessel je Eintrag (label/quelle/genauigkeit) sind erlaubt und werden ignoriert.
+    if not os.path.exists(PLAN_HISTORIE_PATH):
+        return None
+    try:
+        raw = json.load(open(PLAN_HISTORIE_PATH))
+        if isinstance(raw, dict):
+            raw = raw.get("plaene", [])
+    except Exception:
+        return None
+    out = []
+    for e in raw:
+        try:
+            out.append({
+                "von": parse_ts_offset(e["von"]),
+                "bis": parse_ts_offset(e["bis"]) if e.get("bis") else None,
+                "plan": e.get("plan") or "?",
+            })
+        except Exception:
+            continue
+    out.sort(key=lambda e: e["von"])
+    return out
+
+
+def plan_at(epoch, historie):
+    if not historie:
+        return "unbekannt (keine Planhistorie-Datei)"
+    for e in historie:
+        if epoch >= e["von"] and (e["bis"] is None or epoch < e["bis"]):
+            return e["plan"]
+    return "unbekannt (ausserhalb der Planhistorie)"
+
+
+def montags_1400_berlin(start_epoch, end_epoch):
+    # Das Wochenlimit resettet nachweislich jeden Montag 14:00 Ortszeit (Europe/Berlin,
+    # DST-bewusst) -- eine bekannte, feste Kante (Angabe des Nutzers, 2026-08-10), keine aus
+    # dem verrauschten Log geratene.
+    d = datetime.fromtimestamp(start_epoch, BERLIN)
+    d = (d - timedelta(days=d.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    out = []
+    while True:
+        kante = d.replace(hour=14, minute=0, second=0, microsecond=0).timestamp()
+        if kante > end_epoch + 86400:
+            break
+        if kante >= start_epoch - 7 * 86400:
+            out.append(kante)
+        d += timedelta(days=7)
+    return sorted(set(out))
+
+
+PLAN_HISTORIE = load_plan_historie()
+
+rows = []
+with open(LIMITS_PATH) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+            d["_epoch"] = parse_ts(d["ts"])
+        except Exception:
+            continue
+        rows.append(d)
+
+cutoff = datetime.now(timezone.utc).timestamp() - TAGE * 86400
+rows = [r for r in rows if r["_epoch"] >= cutoff]
+rows.sort(key=lambda r: r["_epoch"])
+
+if PLAN_HISTORIE is None:
+    print(f"WARNUNG: keine Planhistorie unter {PLAN_HISTORIE_PATH}. Die Zahlen unten gelten")
+    print("nur, solange im jeweiligen Zeitraum kein Tarifwechsel (Pro/Max 100/Max 200/...)")
+    print("stattfand -- ungeprueft, weil die Datei fehlt.")
+    print()
+
+if not rows:
+    print(f"keine verwertbaren Zeilen in den letzten {TAGE} Tagen in {LIMITS_PATH}.")
+    sys.exit(0)
+
+WEEKLY_KANTEN = montags_1400_berlin(rows[0]["_epoch"], datetime.now(timezone.utc).timestamp())
+
+
+def segments(field):
+    # Monotone Abschnitte je Fenster: ein Ruecksprung beendet den Abschnitt und eroeffnet den
+    # naechsten, ueber ihn hinweg wird nie gerechnet. Verglichen wird gegen den bisherigen
+    # SPITZENWERT des Abschnitts, nicht gegen die letzte einzelne Zeile: limits.jsonl wird von
+    # allen gleichzeitig laufenden Sessions gemeinsam beschrieben, und einzelne Zeilen zeigen
+    # dadurch haeufig ein Rauschen von ein paar Punkten nach unten und sofort wieder zurueck
+    # (gemessen am 09./10.08.2026: solche Ausreisser fallen nie unter ~80% des bisherigen
+    # Spitzenwerts). Erst ein Rueckfall auf UNTER DIE HAELFTE des Spitzenwerts zaehlt als
+    # echter Reset (ein echter Reset faellt auf nahe 0) -- alles dazwischen ist Rauschen und
+    # wird ignoriert, ohne den Abschnitt zu beenden oder den Spitzenwert zu veraendern.
+    #
+    # Zwei WEITERE Kanten beenden einen Abschnitt genauso wie ein Ruecksprung: ein Wechsel des
+    # Abo-Plans (verschiedene Toepfe, ein Prozentpunkt bedeutet je Plan etwas anderes) und, nur
+    # fuer das 7-Tage-Fenster, jede ueberschrittene Montag-14:00-Berlin-Kante (die bekannte
+    # Reset-Kante, robuster als der verrauschte Ruecksprung im 7-Tage-Prozentwert selbst).
+    segs, start, peak = [], None, None
+    for r in rows:
+        v = r.get(field)
+        if v is None:
+            continue
+        if start is None:
+            start = peak = r
+            continue
+        plan_wechsel = plan_at(r["_epoch"], PLAN_HISTORIE) != plan_at(peak["_epoch"], PLAN_HISTORIE)
+        montag_ueberschritten = field == "seven_day_pct" and any(
+            peak["_epoch"] < k <= r["_epoch"] for k in WEEKLY_KANTEN
+        )
+        if plan_wechsel or montag_ueberschritten:
+            segs.append((start, peak))
+            start = peak = r
+            continue
+        if v >= peak[field]:
+            peak = r
+        elif v < peak[field] / 2:
+            segs.append((start, peak))
+            start = peak = r
+    if start is not None:
+        segs.append((start, peak))
+    return [(s, l) for (s, l) in segs if (l[field] - s[field]) >= 3]
+
+
+def load_usage(start_epoch, end_epoch):
+    usage = {}
+    for path in glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl")):
+        try:
+            if os.path.getmtime(path) < start_epoch:
+                continue  # Datei zuletzt vor dem Fenster geschrieben -- kann nichts beitragen
+        except OSError:
+            continue
+        try:
+            with open(path, errors="ignore") as f:
+                for line in f:
+                    if '"usage"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if d.get("type") != "assistant":
+                        continue
+                    msg = d.get("message") or {}
+                    u = msg.get("usage")
+                    ts = d.get("timestamp")
+                    if not u or not ts:
+                        continue
+                    try:
+                        te = parse_ts(ts)
+                    except Exception:
+                        continue
+                    if te < start_epoch or te > end_epoch:
+                        continue
+                    model = msg.get("model") or "?"
+                    m = usage.setdefault(model, {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0})
+                    m["input"] += u.get("input_tokens") or 0
+                    m["output"] += u.get("output_tokens") or 0
+                    m["cache_write"] += u.get("cache_creation_input_tokens") or 0
+                    m["cache_read"] += u.get("cache_read_input_tokens") or 0
+        except OSError:
+            continue
+    return usage
+
+
+def usd(model, t):
+    if model not in PRICES:
+        return None
+    pin, pout = PRICES[model]
+    return (t["input"] / 1e6 * pin + t["output"] / 1e6 * pout
+            + t["cache_write"] / 1e6 * pin * CACHE_WRITE_FAKTOR
+            + t["cache_read"] / 1e6 * pin * CACHE_READ_FAKTOR)
+
+
+any_segment = False
+for field, label in FIELDS:
+    for (s, l) in segments(field):
+        any_segment = True
+        delta = l[field] - s[field]
+        start_e, end_e = s["_epoch"], l["_epoch"]
+        usage = load_usage(start_e, end_e)
+        total_mit_cache = sum(sum(t.values()) for t in usage.values())
+        total_ohne_cache = sum(t["input"] + t["output"] + t["cache_write"] for t in usage.values())
+        total_usd = sum(c for c in (usd(m, t) for m, t in usage.items()) if c is not None)
+        unsicherheit = round(100 / delta) if delta else 0
+
+        print(f"== {label}: {s['ts']} ({s[field]}%) -> {l['ts']} ({l[field]}%), "
+              f"+{delta} Punkte, Dauer {(end_e - start_e) / 3600:.1f}h ==")
+        print(f"  Plan: {plan_at(start_e, PLAN_HISTORIE)}")
+        if total_mit_cache == 0:
+            print("  keine Transkript-Tokens in diesem Fenster gefunden -- keine Kalibrierung moeglich.")
+            print()
+            continue
+        print(f"  Tokens/Punkt inkl. cache_read: {total_mit_cache / delta:.0f}")
+        print(f"  Tokens/Punkt ohne cache_read:  {total_ohne_cache / delta:.0f}")
+        print(f"  USD/Punkt (API-Aequivalent, nur Modelle mit Preiseintrag): "
+              f"{total_usd / delta:.2f}  (+/-{unsicherheit}% allein aus der Ganzzahl-Aufloesung)")
+        print(f"  Summe im Abschnitt: {total_usd:.2f} USD")
+        print("  Modellmix (Anteil an allen Tokens im Abschnitt):")
+        for model, t in sorted(usage.items(), key=lambda kv: -sum(kv[1].values())):
+            share = sum(t.values()) / total_mit_cache * 100 if total_mit_cache else 0
+            c = usd(model, t)
+            geld = f"{c:.2f} USD" if c is not None else "ohne Preis"
+            print(f"    {model}: {share:.1f}% der Tokens, {geld}")
+        print()
+
+if not any_segment:
+    print(f"keine Abschnitte mit mindestens 3 Prozentpunkten Anstieg in den letzten {TAGE} Tagen "
+          f"gefunden (zu kurze Log-Historie oder zu wenig Verbrauch je Fenster).")
+PY
+  exit 0
+fi
+
+# --- --limit-gewichte [--tage N]: ein Limit-Gewicht je Modell statt eines Faktors fuer alle. --
+#
+# Anlass (2026-08-10): zwei 5-Stunden-Abschnitte mit fast doppeltem USD/Punkt (22,93 gegen
+# 12,46), weil der Modellmix sich drehte (80% sonnet-5 gegen 74% opus-5). Ein einziger
+# blended Faktor gilt nur fuer den Mix, aus dem er gerechnet wurde -- unbrauchbar fuer jede
+# Vorhersage mit einem ANDEREN Mix. --limit-gewichte loest stattdessen fuer jedes Modell ein
+# eigenes Gewicht (Limit-Punkte je Verbrauchseinheit), gegen dieselben belastbaren Abschnitte
+# wie --limit-kalibrierung (Preistabelle, Reset-/Plan-/Montags-Erkennung: siehe dort, identisch
+# uebernommen).
+#
+# Verfahren: je Abschnitt und Modell ergibt die Summe der gewichteten Verbraeuche die
+# beobachteten Prozentpunkte -- ein lineares Gleichungssystem, bei gleich vielen Abschnitten
+# wie Modellen exakt bestimmt, bei mehr Abschnitten ueberbestimmt und per kleinste-Quadrate
+# (Normalgleichung, von Hand geloest -- kein numpy installiert) ausgeglichen. Negative Gewichte
+# werden ausgegeben, nie unterdrueckt, mit der Warnung, dass die Datenlage nicht reicht.
+#
+# "Belastbar" heisst hier zusaetzlich zur 3-Punkte-Schwelle: Dauer >= 5 Minuten. Begruendung
+# an den echten Daten vom 09./10.08.2026: die Abschnitte aus der chaotischen 7-Tage-Reset-
+# Uebergangsphase (mehrere Sessions sahen den Rollover zeitversetzt, der geloggte Wert sprang
+# innerhalb von Sekunden zwischen 0/76/94 Prozent) dauern hoechstens 69 Sekunden; die echten
+# 5-Stunden-Abschnitte mindestens 4680 Sekunden -- ein Abstand von rund dem 68-fachen. Eine
+# zweistellige Prozentpunktzahl eines Wochenlimits in wenigen Sekunden ist ausserdem physikalisch
+# nicht plausibel (dafuer muessten in Sekundenbruchteilen hunderte Millionen Tokens verarbeitet
+# worden sein). Kuerzere Abschnitte werden gezaehlt und genannt, aber nicht mitgerechnet.
+if [ "${1:-}" = "--limit-gewichte" ]; then
+  shift
+  TAGE=14
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --tage)
+        TAGE="${2:?wb-budget --limit-gewichte --tage <N>: Zahl fehlt}"
+        shift 2
+        ;;
+      *)
+        echo "wb-budget --limit-gewichte: unbekannte Option '$1'" >&2
+        exit 1
+        ;;
+    esac
+  done
+  case "$TAGE" in
+    ''|*[!0-9]*)
+      echo "wb-budget --limit-gewichte: --tage braucht eine positive Ganzzahl, nicht '$TAGE'" >&2
+      exit 1
+      ;;
+  esac
+
+  echo "wb-budget --limit-gewichte — Limit-Punkte je Modell (letzte ${TAGE}d, Quelle: $WORKBENCH_LIMITS)"
+  echo
+
+  if [ ! -s "$WORKBENCH_LIMITS" ]; then
+    echo "nicht verfuegbar — kein Log unter $WORKBENCH_LIMITS. Ohne diesen Betriebslog (seit"
+    echo "28.07. von statusline-command.sh geschrieben) gibt es keine Grundlage fuer eine"
+    echo "Kalibrierung."
+    exit 0
+  fi
+
+  /usr/bin/python3 - "$WORKBENCH_LIMITS" "$TAGE" "$HOME/.claude/projects" <<'PY'
+import glob, json, os, sys
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+LIMITS_PATH, TAGE, PROJECTS_DIR = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+
+# Preistabelle s. Kopfkommentar oben im Skript — hier nur die ausfuehrbare Form derselben Zahlen.
+PRICES = {
+    "claude-opus-5":             (5, 25),
+    "claude-opus-4-8":           (5, 25),
+    "claude-sonnet-5":           (3, 15),
+    "claude-haiku-4-5-20251001": (1, 5),
+    "claude-fable-5":            (10, 50),
+}
+CACHE_WRITE_FAKTOR = 1.25
+CACHE_READ_FAKTOR = 0.1
+PLAN_HISTORIE_PATH = os.path.expanduser("~/.claude/workbench/plan-historie.json")
+ANKER_PATH = os.path.expanduser("~/.claude/workbench/limit-anker.json")
+BERLIN = ZoneInfo("Europe/Berlin")
+BELASTBAR_SEKUNDEN = 300  # Begruendung im Kopfkommentar dieses Unterbefehls oben im Skript.
+
+FIELDS = [("five_hour_pct", "5-Stunden-Fenster"), ("seven_day_pct", "7-Tage-Fenster")]
+
+
+def parse_ts(s):
+    s = s.rstrip("Z")
+    if "." in s:
+        s = s.split(".")[0]
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+
+
+def parse_ts_offset(s):
+    # Fuer die Planhistorie: dort steht der Zeitstempel mit EXPLIZITEM Offset ("+02:00"), nicht
+    # nur als "Z" wie in limits.jsonl/den Transkripten -- Python 3.9 (dieses System) kennt
+    # fromisoformat("...Z") noch nicht, "...+00:00" aber schon, daher die Ersetzung.
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s).astimezone(timezone.utc).timestamp()
+
+
+def load_plan_historie():
+    # Format: ~/.claude/workbench/plan-historie.json ist Datei des Nutzers, von Hand gepflegt
+    # ({"plaene": [{"plan": "...", "von": "...", "bis": "...|null"}, ...]}, weitere Schluessel
+    # je Eintrag erlaubt und ignoriert) -- s. shell/plan-historie.default.json.
+    if not os.path.exists(PLAN_HISTORIE_PATH):
+        return None
+    try:
+        raw = json.load(open(PLAN_HISTORIE_PATH))
+        if isinstance(raw, dict):
+            raw = raw.get("plaene", [])
+    except Exception:
+        return None
+    out = []
+    for e in raw:
+        try:
+            out.append({
+                "von": parse_ts_offset(e["von"]),
+                "bis": parse_ts_offset(e["bis"]) if e.get("bis") else None,
+                "plan": e.get("plan") or "?",
+            })
+        except Exception:
+            continue
+    out.sort(key=lambda e: e["von"])
+    return out
+
+
+def plan_at(epoch, historie):
+    if not historie:
+        return "unbekannt (keine Planhistorie-Datei)"
+    for e in historie:
+        if epoch >= e["von"] and (e["bis"] is None or epoch < e["bis"]):
+            return e["plan"]
+    return "unbekannt (ausserhalb der Planhistorie)"
+
+
+def plan_konsistent(von, bis, historie):
+    # Prueft, ob EIN Plan den ganzen Zeitraum [von, bis) traegt -- an den Raendern und an jeder
+    # Plan-Historie-Kante, die dazwischen liegt. Fuer externe Anker (limit-anker.json): ein
+    # Wochenwert von vor limits.jsonl darf nur mitrechnen, wenn das hier bestaetigt ist.
+    if not historie:
+        return False, "keine Planhistorie -- nicht pruefbar"
+    punkte = {von, bis - 1}
+    for e in historie:
+        if von < e["von"] < bis:
+            punkte.add(e["von"])
+        if e["bis"] is not None and von < e["bis"] < bis:
+            punkte.add(e["bis"])
+    plaene = {plan_at(p, historie) for p in punkte}
+    if len(plaene) == 1:
+        return True, next(iter(plaene))
+    return False, "mischt Plaene: " + ", ".join(sorted(plaene))
+
+
+def montags_1400_berlin(start_epoch, end_epoch):
+    d = datetime.fromtimestamp(start_epoch, BERLIN)
+    d = (d - timedelta(days=d.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    out = []
+    while True:
+        kante = d.replace(hour=14, minute=0, second=0, microsecond=0).timestamp()
+        if kante > end_epoch + 86400:
+            break
+        if kante >= start_epoch - 7 * 86400:
+            out.append(kante)
+        d += timedelta(days=7)
+    return sorted(set(out))
+
+
+def load_anker():
+    # ~/.claude/workbench/limit-anker.json: von Hand nachgerechnete Verbrauchsabschnitte, die
+    # NICHT aus limits.jsonl automatisch erkennbar sind (typisch: ein Wochenfenster, das vor
+    # dem Beginn von limits.jsonl lag). Format: {"anker": [{"feld": "seven_day_pct", "von":
+    # "...", "bis": "...", "punkte": 94, "usd": {"claude-opus-5": 7015, ...}, "quelle": "..."}]}.
+    # Ohne Token-Aufschluesselung -- ein Anker liefert deshalb nur einen Beitrag zur
+    # USD-Basis, nie zu den beiden Token-Basen.
+    if not os.path.exists(ANKER_PATH):
+        return []
+    try:
+        raw = json.load(open(ANKER_PATH))
+        if isinstance(raw, dict):
+            raw = raw.get("anker", [])
+    except Exception:
+        return []
+    out = []
+    for e in raw:
+        try:
+            out.append({
+                "feld": e["feld"],
+                "von": parse_ts_offset(e["von"]),
+                "bis": parse_ts_offset(e["bis"]),
+                "von_iso": e["von"],
+                "bis_iso": e["bis"],
+                "punkte": float(e["punkte"]),
+                "usd": {k: float(v) for k, v in (e.get("usd") or {}).items()},
+                "quelle": e.get("quelle") or "?",
+            })
+        except Exception:
+            continue
+    return out
+
+
+PLAN_HISTORIE = load_plan_historie()
+ANKER = load_anker()
+
+rows = []
+with open(LIMITS_PATH) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+            d["_epoch"] = parse_ts(d["ts"])
+        except Exception:
+            continue
+        rows.append(d)
+
+cutoff = datetime.now(timezone.utc).timestamp() - TAGE * 86400
+rows = [r for r in rows if r["_epoch"] >= cutoff]
+rows.sort(key=lambda r: r["_epoch"])
+
+if PLAN_HISTORIE is None:
+    print(f"WARNUNG: keine Planhistorie unter {PLAN_HISTORIE_PATH}. Die Gewichte unten gelten")
+    print("nur, solange im jeweiligen Zeitraum kein Tarifwechsel (Pro/Max 100/Max 200/...)")
+    print("stattfand -- ungeprueft, weil die Datei fehlt.")
+    print()
+
+if not rows:
+    print(f"keine verwertbaren Zeilen in den letzten {TAGE} Tagen in {LIMITS_PATH}.")
+    sys.exit(0)
+
+WEEKLY_KANTEN = montags_1400_berlin(rows[0]["_epoch"], datetime.now(timezone.utc).timestamp())
+
+
+def segments(field):
+    # Identisch zu --limit-kalibrierung: Spitzenwert-Vergleich (Rauschtoleranz bis zur Haelfte
+    # des Spitzenwerts), zusaetzlich getrennt an Plan- und (nur 7-Tage-Fenster) Montags-Kanten.
+    segs, start, peak = [], None, None
+    for r in rows:
+        v = r.get(field)
+        if v is None:
+            continue
+        if start is None:
+            start = peak = r
+            continue
+        plan_wechsel = plan_at(r["_epoch"], PLAN_HISTORIE) != plan_at(peak["_epoch"], PLAN_HISTORIE)
+        montag_ueberschritten = field == "seven_day_pct" and any(
+            peak["_epoch"] < k <= r["_epoch"] for k in WEEKLY_KANTEN
+        )
+        if plan_wechsel or montag_ueberschritten:
+            segs.append((start, peak))
+            start = peak = r
+            continue
+        if v >= peak[field]:
+            peak = r
+        elif v < peak[field] / 2:
+            segs.append((start, peak))
+            start = peak = r
+    if start is not None:
+        segs.append((start, peak))
+    return [(s, l) for (s, l) in segs if (l[field] - s[field]) >= 3]
+
+
+def load_usage(start_epoch, end_epoch):
+    usage = {}
+    for path in glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl")):
+        try:
+            if os.path.getmtime(path) < start_epoch:
+                continue
+        except OSError:
+            continue
+        try:
+            with open(path, errors="ignore") as f:
+                for line in f:
+                    if '"usage"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if d.get("type") != "assistant":
+                        continue
+                    msg = d.get("message") or {}
+                    u = msg.get("usage")
+                    ts = d.get("timestamp")
+                    if not u or not ts:
+                        continue
+                    try:
+                        te = parse_ts(ts)
+                    except Exception:
+                        continue
+                    if te < start_epoch or te > end_epoch:
+                        continue
+                    model = msg.get("model") or "?"
+                    m = usage.setdefault(model, {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0})
+                    m["input"] += u.get("input_tokens") or 0
+                    m["output"] += u.get("output_tokens") or 0
+                    m["cache_write"] += u.get("cache_creation_input_tokens") or 0
+                    m["cache_read"] += u.get("cache_read_input_tokens") or 0
+        except OSError:
+            continue
+    return usage
+
+
+def usd(model, t):
+    if model not in PRICES:
+        return None
+    pin, pout = PRICES[model]
+    return (t["input"] / 1e6 * pin + t["output"] / 1e6 * pout
+            + t["cache_write"] / 1e6 * pin * CACHE_WRITE_FAKTOR
+            + t["cache_read"] / 1e6 * pin * CACHE_READ_FAKTOR)
+
+
+def solve_linear(A, b):
+    # Gauss-Jordan mit Teilpivotisierung, reine Python-Implementierung (kein numpy installiert).
+    # None = singulaer (Abschnitte nicht unabhaengig genug -- z.B. zu aehnlicher Modellmix).
+    n = len(A)
+    M = [row[:] + [b[i]] for i, row in enumerate(A)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(M[r][col]))
+        if abs(M[piv][col]) < 1e-9:
+            return None
+        M[col], M[piv] = M[piv], M[col]
+        p = M[col][col]
+        M[col] = [v / p for v in M[col]]
+        for r in range(n):
+            if r != col:
+                f = M[r][col]
+                M[r] = [M[r][k] - f * M[col][k] for k in range(n + 1)]
+    return [M[i][n] for i in range(n)]
+
+
+def least_squares(A, b, models):
+    # Normalgleichung A^T A x = A^T b. Bei quadratischem, invertierbarem A liefert das exakt
+    # dieselbe Loesung wie A x = b direkt -- ein Codepfad fuer exakt UND ueberbestimmt.
+    n = len(models)
+    m = len(A)
+    if m < n:
+        return None, f"unterbestimmt: {m} Gleichung(en) fuer {n} Modell(e)/Unbekannte"
+    AtA = [[sum(A[k][i] * A[k][j] for k in range(m)) for j in range(n)] for i in range(n)]
+    Atb = [sum(A[k][i] * b[k] for k in range(m)) for i in range(n)]
+    x = solve_linear(AtA, Atb)
+    if x is None:
+        return None, "Gleichungssystem singulaer -- Abschnitte sind nicht unabhaengig genug (zu aehnlicher Modellmix)"
+    return dict(zip(models, x)), None
+
+
+def zeige_basis(titel, basis_key, einheit, skala, kehrwert_einheit, segdata):
+    # Externe Anker (limit-anker.json) tragen keine Token-Daten -- fuer die beiden Token-Basen
+    # faellt ihr Eintrag hier einfach raus (leeres dict), statt als Nullzeile ("0*w=94") das
+    # Gleichungssystem zu verfaelschen.
+    verwendbar = [sd for sd in segdata if sd[basis_key]]
+    models = sorted({m for sd in verwendbar for m in sd[basis_key]})
+    print(f"  -- {titel} ({len(verwendbar)} Gleichung(en), {len(models)} Modell(e)) --")
+    if not models:
+        print("    keine Daten fuer diese Basis in den belastbaren Abschnitten.")
+        return
+    A = [[sd[basis_key].get(m, 0.0) for m in models] for sd in verwendbar]
+    b_ = [sd["delta"] for sd in verwendbar]
+    w, err = least_squares(A, b_, models)
+    if err:
+        print(f"    nicht loesbar: {err}")
+        return
+    neg = [m for m in models if w[m] < -1e-9]
+    for m in models:
+        je_einheit = w[m] * skala
+        kehrwert = (1.0 / w[m]) if abs(w[m]) > 1e-12 else float("inf")
+        print(f"    {m}: {je_einheit:.4f} Punkte je {einheit}  ({kehrwert:.2f} {kehrwert_einheit} bei reinem Verbrauch dieses Modells)")
+    if neg:
+        print(f"    WARNUNG negatives Gewicht bei {', '.join(neg)} -- kein brauchbares Ergebnis,")
+        print("    die Datenlage reicht nicht (Abschnitte zu wenige oder zu widerspruechlich).")
+    if len(verwendbar) - 1 < len(models):
+        print(f"    Kreuzprobe: nicht moeglich -- nach Entfernen eines Abschnitts blieben nur "
+              f"{len(verwendbar) - 1} Gleichung(en) fuer {len(models)} Modell(e) (unterbestimmt). "
+              f"Erst ab {len(models) + 1} Gleichungen in dieser Basis pruefbar.")
+    else:
+        for j, sd_out in enumerate(verwendbar):
+            rest = [sd for k, sd in enumerate(verwendbar) if k != j]
+            A2 = [[sd[basis_key].get(m, 0.0) for m in models] for sd in rest]
+            b2 = [sd["delta"] for sd in rest]
+            w2, err2 = least_squares(A2, b2, models)
+            if err2:
+                print(f"    Kreuzprobe ohne Abschnitt {sd_out['id']}: nicht loesbar ({err2})")
+            else:
+                werte = ", ".join(f"{m}={w2[m] * skala:.4f}" for m in models)
+                print(f"    Kreuzprobe ohne Abschnitt {sd_out['id']}: {werte} Punkte je {einheit}")
+
+
+alle_segdata = {}
+for field, label in FIELDS:
+    alle = segments(field)
+    belastbar = []
+    for (s, l) in alle:
+        dauer = l["_epoch"] - s["_epoch"]
+        if dauer >= BELASTBAR_SEKUNDEN:
+            belastbar.append((s, l, dauer))
+    anker_treffer = [a for a in ANKER if a["feld"] == field]
+
+    print(f"== {label} ==")
+    print(f"  {len(alle)} Abschnitt(e) mit mindestens 3 Punkten Anstieg gefunden, davon "
+          f"{len(belastbar)} belastbar (Dauer >= {BELASTBAR_SEKUNDEN}s = {BELASTBAR_SEKUNDEN // 60}min), "
+          f"dazu {len(anker_treffer)} externe(r) Anker aus {ANKER_PATH}.")
+    if not belastbar and not anker_treffer:
+        print("  keine Gewichte berechenbar.")
+        print()
+        continue
+
+    segdata = []
+    for i, (s, l, dauer) in enumerate(belastbar, 1):
+        delta = l[field] - s[field]
+        usage = load_usage(s["_epoch"], l["_epoch"])
+        usd_u, tok_incl, tok_ohne, unpriced = {}, {}, {}, []
+        for m, t in usage.items():
+            tok_incl[m] = float(sum(t.values()))
+            tok_ohne[m] = float(t["input"] + t["output"] + t["cache_write"])
+            c = usd(m, t)
+            if c is None:
+                if tok_incl[m] > 0:
+                    unpriced.append(m)
+            else:
+                usd_u[m] = c
+        plan = plan_at(s["_epoch"], PLAN_HISTORIE)
+        print(f"    {i}. {s['ts']} -> {l['ts']}, +{delta} Punkte, Dauer {dauer/3600:.1f}h, Plan: {plan}")
+        if unpriced:
+            print(f"       ohne Preis (nur in Token-Basis beruecksichtigt): {', '.join(sorted(set(unpriced)))}")
+        segdata.append({"id": str(i), "delta": delta, "usd": usd_u, "tok_incl": tok_incl, "tok_ohne": tok_ohne})
+
+    for j, a in enumerate(anker_treffer, 1):
+        eid = f"E{j}"
+        ok, info = plan_konsistent(a["von"], a["bis"], PLAN_HISTORIE)
+        if not ok:
+            print(f"    {eid}. extern {a['von_iso']} -> {a['bis_iso']}, +{a['punkte']:.0f} Punkte -- "
+                  f"NICHT verwendet ({info}).")
+            continue
+        print(f"    {eid}. extern {a['von_iso']} -> {a['bis_iso']}, +{a['punkte']:.0f} Punkte, "
+              f"Plan: {info} (durchgehend bestaetigt). Quelle: {a['quelle']}")
+        segdata.append({"id": eid, "delta": a["punkte"], "usd": dict(a["usd"]), "tok_incl": {}, "tok_ohne": {}})
+    alle_segdata[field] = segdata
+    print()
+
+    zeige_basis("Punkte je USD-Aequivalent", "usd", "USD", 1.0, "USD/Punkt", segdata)
+    zeige_basis("Punkte je Million Tokens, inkl. cache_read", "tok_incl", "Mio. Tokens", 1e6, "Tokens/Punkt", segdata)
+    zeige_basis("Punkte je Million Tokens, ohne cache_read", "tok_ohne", "Mio. Tokens", 1e6, "Tokens/Punkt", segdata)
+    n_models = len(sorted({m for sd in segdata for m in sd["tok_incl"]}))
+    n_tok_segs = len([sd for sd in segdata if sd["tok_incl"]])
+    print(f"  Aufteilung je Modell UND Tokenart (Eingabe/Ausgabe/Cache-Schreiben/Cache-Lesen)")
+    print(f"  nicht ausgewiesen: das braeuchte {n_models} Modell(e) x 4 Arten = {n_models*4} Unbekannte,")
+    print(f"  bei {n_tok_segs} Abschnitt(en) mit Token-Daten -- Datenlage reicht nicht annaehernd.")
+    print()
+
+# --- Kombiniert: die beiden belastbaren 5-Stunden-Abschnitte + der Wochenfenster-Anker in EIN
+# gemeinsames Gleichungssystem (Anweisung des Nutzers 2026-08-10, nachdem plan-historie.json den
+# Wochen-Anker als plan-rein bestaetigte). Setzt voraus, dass ein Limit-Punkt im 5-Stunden- und
+# im 7-Tage-Fenster dieselbe Tokenmenge bedeutet -- das ist NICHT geprueft, nur die einzige
+# Annahme, die einen direkten Vergleich ueberhaupt erlaubt. Nur die USD-Basis: der Anker hat
+# keine Token-Aufschluesselung.
+kombiniert = []
+for sd in alle_segdata.get("five_hour_pct", []):
+    if not sd["id"].startswith("E"):
+        kombiniert.append({**sd, "id": f"5h-{sd['id']}"})
+for sd in alle_segdata.get("seven_day_pct", []):
+    if sd["id"].startswith("E"):
+        kombiniert.append({**sd, "id": f"Wo-{sd['id']}"})
+
+if len(kombiniert) >= 2:
+    print("== Kombiniert: 5-Stunden-Abschnitte + Wochenfenster-Anker, EIN Punktemassstab angenommen ==")
+    for sd in kombiniert:
+        werte = ", ".join(f"{m}={v:.2f}" for m, v in sorted(sd["usd"].items()))
+        print(f"    {sd['id']}: +{sd['delta']:.0f} Punkte, USD-Verbrauch: {werte}")
+    print()
+    zeige_basis("Punkte je USD-Aequivalent (kombiniert)", "usd", "USD", 1.0, "USD/Punkt", kombiniert)
+    print()
+PY
+  exit 0
+fi
+
+# --- --json: der maschinenlesbare Bericht ueber alle belegten Quellen. -----------------------
+#
+# Siehe MEHR ALS CLAUDE im Kopfkommentar. Hier steht nur, was die Form betrifft:
+#
+#   * Aggregiert wird BEIM LESEN, nie ueber eine Liste aller Nachrichten. Im 7-Tage-Fenster
+#     stehen auf dieser Maschine ueber 14 Milliarden Cache-Lesetoken -- eine Zeile je Nachricht
+#     waeren Hunderttausende Objekte im Speicher fuer eine Ausgabe, die niemand einzeln liest.
+#   * Die Filter (--harness/--modell/--sitzung) greifen VOR der Summierung. Wer zwei Zeitraeume
+#     vergleichen will, ruft zweimal mit --von/--bis auf; ein eigener Vergleichsmodus waere eine
+#     zweite Wahrheit ueber dieselbe Frage.
+#   * Jede Quelle traegt ihren Zustand ("gelesen"/"leer"/"fehlt"/"unlesbar") und ihre Nachrichten-
+#     zahl mit. Eine Quelle, die nichts liefert, ist damit von einer Quelle unterscheidbar, die
+#     es nicht gibt.
+if [ "${1:-}" = "--json" ]; then
+  shift
+  TAGE=7
+  VON=""
+  BIS=""
+  F_HARNESS=""
+  F_MODELL=""
+  F_SITZUNG=""
+  OHNE_KONTINGENT=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --tage)     TAGE="${2:?wb-budget --json --tage <N>: Zahl fehlt}"; shift 2 ;;
+      --von)      VON="${2:?wb-budget --json --von <ISO>: Zeitpunkt fehlt}"; shift 2 ;;
+      --bis)      BIS="${2:?wb-budget --json --bis <ISO>: Zeitpunkt fehlt}"; shift 2 ;;
+      --harness)  F_HARNESS="${2:?wb-budget --json --harness <a,b>: Liste fehlt}"; shift 2 ;;
+      --modell)   F_MODELL="${2:?wb-budget --json --modell <a,b>: Liste fehlt}"; shift 2 ;;
+      --sitzung)  F_SITZUNG="${2:?wb-budget --json --sitzung <id,...>: Liste fehlt}"; shift 2 ;;
+      # Nur fuer Tests und fuer den Fall, dass wb-kontingent auf dieser Maschine fehlt: der
+      # Kontingentblock bleibt dann leer, statt den ganzen Bericht scheitern zu lassen.
+      --ohne-kontingent) OHNE_KONTINGENT=1; shift ;;
+      *) echo "wb-budget --json: unbekannte Option '$1'" >&2; exit 1 ;;
+    esac
+  done
+  case "$TAGE" in
+    ''|*[!0-9]*)
+      echo "wb-budget --json: --tage braucht eine positive Ganzzahl, nicht '$TAGE'" >&2
+      exit 1
+      ;;
+  esac
+
+  HIER="$(cd "$(dirname "$0")" && pwd)"
+  /usr/bin/python3 - "$TAGE" "$VON" "$BIS" "$F_HARNESS" "$F_MODELL" "$F_SITZUNG" \
+    "$OHNE_KONTINGENT" "$HIER/models.default.json" "$HIER/wb-kontingent" "$WORKBENCH_LIMITS" <<'PY'
+import glob, json, os, sqlite3, subprocess, sys
+from datetime import datetime, timezone
+
+(TAGE, VON_S, BIS_S, F_HARNESS, F_MODELL, F_SITZUNG,
+ OHNE_KONTINGENT, MODELS_JSON, KONTINGENT_BIN, LIMITS_PATH) = sys.argv[1:11]
+
+HOME = os.path.expanduser("~")
+
+# Die groesste Luecke zwischen zwei Nachrichten, die noch als Generierungszeit zaehlt. Ohne diese
+# Schranke wuerde jede Mittagspause zwischen zwei Antworten als Rechenzeit desselben Modells
+# gebucht und die Rate beliebig klein rechnen. 120 Sekunden ist eine SETZUNG, keine Messung: die
+# gemessenen echten Abstaende lagen bei 0,66 s und 9,26 s, eine Denkpause mit Werkzeugaufrufen
+# liegt darunter, eine menschliche Pause deutlich darueber. Laengere Luecken zaehlen weder im
+# Zaehler noch im Nenner mit -- die Rate beschreibt dann eben nur den gemessenen Teil.
+NAEHERUNG_LUECKE_MAX = 120.0
+
+
+def parse_iso(s):
+    """ISO-8601 zu Epoche. Python 3.9 (dieses System) kennt fromisoformat('...Z') noch nicht."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    if "." in s:
+        kopf, rest = s.split(".", 1)
+        vorz = ""
+        for z in ("+", "-"):
+            if z in rest:
+                i = rest.index(z)
+                vorz, rest = rest[i:], rest[:i]
+                break
+        s = kopf + vorz
+    try:
+        d = datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            d = datetime.strptime(s, "%Y-%m-%d")
+        except ValueError:
+            return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.timestamp()
+
+
+def iso(e):
+    return datetime.fromtimestamp(e, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def tag(e):
+    return datetime.fromtimestamp(e, timezone.utc).strftime("%Y-%m-%d")
+
+
+JETZT = datetime.now(timezone.utc).timestamp()
+BIS = parse_iso(BIS_S) or JETZT
+VON = parse_iso(VON_S)
+if VON is None:
+    VON = BIS - int(TAGE) * 86400
+
+
+def liste(s):
+    return set(x.strip() for x in (s or "").split(",") if x.strip())
+
+
+NUR_HARNESS, NUR_MODELL, NUR_SITZUNG = liste(F_HARNESS), liste(F_MODELL), liste(F_SITZUNG)
+
+# --- Die Registry, nur gelesen ---------------------------------------------------------------
+# Gebraucht wird sie fuer zweierlei: die Liste ALLER Harnesses (damit die Luecken vollstaendig
+# sind, nicht nur die zufaellig bekannten) und die Art des Anbieters je Harness (Abo, Cloud,
+# lokal) -- daran haengt, ob ein Dollarbetrag ueberhaupt ein Preis sein kann.
+HARNESS_ART = {}
+MODELL_HARNESS = {}
+ALLE_HARNESS = []
+try:
+    _reg = json.load(open(MODELS_JSON))
+    _kind = dict((p["id"], p.get("kind") or "?") for p in _reg.get("providers", []))
+    for h in _reg.get("harnesses", []):
+        ALLE_HARNESS.append(h["id"])
+    for m in _reg.get("models", []):
+        MODELL_HARNESS[m.get("id")] = m.get("harness")
+        if m.get("harness") and m.get("provider"):
+            HARNESS_ART.setdefault(m["harness"], _kind.get(m["provider"], "?"))
+except Exception:
+    pass
+if not ALLE_HARNESS:
+    ALLE_HARNESS = ["claude", "codex", "pi", "opencode", "copilot", "copilot-cloud", "openhands"]
+# Die eingebauten Claude-Kennungen stehen in keiner Registry-Datei (siehe einstellungsfenster.ts).
+HARNESS_ART.setdefault("claude", "subscription")
+
+# --- Die Sammelbecken ------------------------------------------------------------------------
+ARTEN = ("input", "output", "cache_write", "cache_read", "reasoning")
+
+
+def neu():
+    d = dict((a, 0) for a in ARTEN)
+    d["nachrichten"] = 0
+    return d
+
+
+gesamt = neu()
+je_harness = {}
+je_modell = {}
+je_sitzung = {}
+je_tag = {}
+# (harness, modell) -> Zaehler und Nenner beider Tempo-Arten, streng getrennt gehalten.
+tempo = {}
+# Was ein Harness selbst an Geld/Verbrauchseinheiten mitschreibt -- nie mit einem Katalogpreis
+# vermischt, deshalb ein eigenes Becken.
+eigen_usd = {}
+eigen_aiu = {}
+quellen = []
+
+
+def _add(ziel, tok):
+    for a in ARTEN:
+        ziel[a] += tok.get(a, 0)
+    ziel["nachrichten"] += 1
+
+
+def passt(harness, modell, sitzung):
+    if NUR_HARNESS and harness not in NUR_HARNESS:
+        return False
+    if NUR_MODELL and modell not in NUR_MODELL:
+        return False
+    if NUR_SITZUNG and sitzung not in NUR_SITZUNG:
+        return False
+    return True
+
+
+def buche(harness, modell, sitzung, worker, ts, tok, ordner=""):
+    """Eine Nachricht in alle Sichten einsortieren. Der Fensterschnitt sitzt hier, EINMAL."""
+    if ts is None or ts < VON or ts > BIS:
+        return False
+    modell = modell or "?"
+    sitzung = sitzung or "?"
+    if not passt(harness, modell, sitzung):
+        return False
+    _add(gesamt, tok)
+    _add(je_harness.setdefault(harness, neu()), tok)
+    _add(je_modell.setdefault((harness, modell), neu()), tok)
+    s = je_sitzung.setdefault((harness, sitzung), {"werte": neu(), "worker": worker or "",
+                                                   "ordner": ordner or "", "modelle": set(),
+                                                   "von": ts, "bis": ts})
+    _add(s["werte"], tok)
+    s["modelle"].add(modell)
+    s["von"] = min(s["von"], ts)
+    s["bis"] = max(s["bis"], ts)
+    if worker and not s["worker"]:
+        s["worker"] = worker
+    if ordner and not s["ordner"]:
+        s["ordner"] = ordner
+    _add(je_tag.setdefault((tag(ts), harness, modell), neu()), tok)
+    return True
+
+
+def _tempo(harness, modell):
+    return tempo.setdefault((harness, modell), {"gem_tokens": 0.0, "gem_sekunden": 0.0,
+                                                "nae_tokens": 0.0, "nae_sekunden": 0.0})
+
+
+def tempo_gemessen(harness, modell, ausgabe_tokens, sekunden):
+    if sekunden <= 0 or ausgabe_tokens <= 0:
+        return
+    t = _tempo(harness, modell)
+    t["gem_tokens"] += ausgabe_tokens
+    t["gem_sekunden"] += sekunden
+
+
+def tempo_naeherung(harness, modell, ausgabe_tokens, sekunden):
+    if sekunden <= 0 or sekunden > NAEHERUNG_LUECKE_MAX or ausgabe_tokens <= 0:
+        return
+    t = _tempo(harness, modell)
+    t["nae_tokens"] += ausgabe_tokens
+    t["nae_sekunden"] += sekunden
+
+
+def quelle(harness, pfad, zustand, nachrichten=0, hinweis=""):
+    quellen.append({"harness": harness, "pfad": pfad.replace(HOME, "~"), "zustand": zustand,
+                    "nachrichten": nachrichten, "hinweis": hinweis})
+
+
+# --- Quelle 1: claude ------------------------------------------------------------------------
+# Dieselben Felder und dieselbe Auswahl wie im Standardbericht oben (message.usage einer
+# assistant-Zeile). Der Dateiname IST die Sitzungskennung, der Projektordner traegt den Namen des
+# Worktrees und damit in diesem Haus den Workernamen.
+def lies_claude():
+    wurzel = os.path.join(HOME, ".claude", "projects")
+    if not os.path.isdir(wurzel):
+        quelle("claude", wurzel, "fehlt")
+        return
+    n = 0
+    letzte = {}
+    # AUCH DIE SUBAGENTEN (16.08.2026). Hier stand nur `*/*.jsonl`, und damit fehlte alles unter
+    # <projekt>/<sitzung>/subagents/agent-*.jsonl -- auf dieser Maschine 48 von 913 Dateien und
+    # gemessen 3,4 % der Tokens des laufenden Tages. Der Textbericht oben zaehlt sie seit jeher
+    # mit (er sucht per find in jeder Tiefe); dass beide Wege dieselbe Frage verschieden
+    # beantworten, war der Fehler. Ein Subagent verbraucht eigene Tokens -- sie stehen in seiner
+    # eigenen Datei, nicht in der des Elternteils, und fallen sonst unter den Tisch.
+    pfade = sorted(glob.glob(os.path.join(wurzel, "*", "*.jsonl"))
+                   + glob.glob(os.path.join(wurzel, "*", "*", "subagents", "*.jsonl")))
+    for pfad in pfade:
+        try:
+            if os.path.getmtime(pfad) < VON:
+                continue
+        except OSError:
+            continue
+        sitzung = os.path.basename(pfad)[:-6]
+        # Der PROJEKTORDNER ist das erste Stueck unter der Wurzel -- bei einer Subagenten-Datei
+        # liegen zwei weitere Ebenen dazwischen, und `dirname` naehme sonst "subagents".
+        ordner = os.path.relpath(pfad, wurzel).split(os.sep)[0]
+        # Der Projektordner ist ein Pfad mit Schraegstrichen als Bindestrich -- zurueckuebersetzen
+        # laesst er sich nicht eindeutig (ein Ordnername darf selbst Bindestriche tragen). Ein
+        # WORKERNAME steht nur dann sicher darin, wenn die Sitzung in einem Arbeitsbaum der
+        # Workbench lief; sonst bleibt das Feld leer und die Anzeige zeigt den Ordner. Geraten
+        # wird nichts: "das letzte Stueck hinter dem letzten Bindestrich" ergaebe bei
+        # `-Users-<user>` den Namen "<user>".
+        MARKE = "-pi-workers-worktrees-"
+        worker = ordner.split(MARKE, 1)[1] if MARKE in ordner else ""
+        try:
+            f = open(pfad, errors="ignore")
+        except OSError:
+            continue
+        with f:
+            for zeile in f:
+                if '"usage"' not in zeile:
+                    continue
+                try:
+                    d = json.loads(zeile)
+                except Exception:
+                    continue
+                if d.get("type") != "assistant":
+                    continue
+                msg = d.get("message") or {}
+                u = msg.get("usage")
+                ts = parse_iso(d.get("timestamp") or "")
+                if not u or ts is None:
+                    continue
+                modell = msg.get("model") or "?"
+                tok = {"input": u.get("input_tokens") or 0,
+                       "output": u.get("output_tokens") or 0,
+                       "cache_write": u.get("cache_creation_input_tokens") or 0,
+                       "cache_read": u.get("cache_read_input_tokens") or 0,
+                       "reasoning": 0}
+                if buche("claude", modell, sitzung, worker, ts, tok, ordner):
+                    n += 1
+                    vor = letzte.get(sitzung)
+                    if vor is not None:
+                        tempo_naeherung("claude", modell, tok["output"], ts - vor)
+                    letzte[sitzung] = ts
+    quelle("claude", wurzel, "gelesen" if n else "leer", n,
+           "Rate nur als Wanduhr-Naeherung: die Transkripte tragen keinen Zwischenstand waehrend "
+           "der Generierung, nur den Abstand zwischen fertigen Nachrichten.")
+
+
+# --- Quelle 2: codex -------------------------------------------------------------------------
+# Ein `token_count`-Ereignis je Antwortschritt; `last_token_usage` ist der Verbrauch DIESES
+# Schritts (`total_token_usage` waere kumulativ und wuerde beim Summieren doppelt zaehlen).
+# `input_tokens` enthaelt bei codex die zwischengespeicherten mit -- `cached_input_tokens` wird
+# deshalb abgezogen und getrennt als Cache-Lesen gefuehrt, sonst stuende dieselbe Menge zweimal
+# da. Das Modell steht nicht im Ereignis selbst, sondern im zuletzt vorausgegangenen
+# `turn_context`; ein Modellwechsel mitten in der Sitzung wird so richtig zugeordnet.
+def lies_codex():
+    wurzel = os.path.join(HOME, ".codex", "sessions")
+    if not os.path.isdir(wurzel):
+        quelle("codex", wurzel, "fehlt")
+        return
+    n = 0
+    for pfad in sorted(glob.glob(os.path.join(wurzel, "*", "*", "*", "rollout-*.jsonl"))):
+        try:
+            if os.path.getmtime(pfad) < VON:
+                continue
+        except OSError:
+            continue
+        sitzung = os.path.basename(pfad)[:-6]
+        worker = ""
+        ordner = ""
+        modell = "?"
+        vorher = None
+        try:
+            f = open(pfad, errors="ignore")
+        except OSError:
+            continue
+        with f:
+            for zeile in f:
+                try:
+                    d = json.loads(zeile)
+                except Exception:
+                    continue
+                p = d.get("payload") or {}
+                if not isinstance(p, dict):
+                    continue
+                if d.get("type") == "session_meta":
+                    sitzung = p.get("session_id") or sitzung
+                    ordner = (p.get("cwd") or "").rstrip("/") or ordner
+                    worker = os.path.basename(ordner) or worker
+                    continue
+                if d.get("type") == "turn_context" and p.get("model"):
+                    modell = p["model"]
+                    continue
+                if p.get("type") != "token_count":
+                    continue
+                info = p.get("info") or {}
+                u = info.get("last_token_usage") or {}
+                if not u:
+                    continue
+                ts = parse_iso(d.get("timestamp") or "")
+                cached = u.get("cached_input_tokens") or 0
+                tok = {"input": max(0, (u.get("input_tokens") or 0) - cached),
+                       "output": u.get("output_tokens") or 0,
+                       "cache_write": u.get("cache_write_input_tokens") or 0,
+                       "cache_read": cached,
+                       "reasoning": u.get("reasoning_output_tokens") or 0}
+                if buche("codex", modell, sitzung, worker, ts, tok, ordner):
+                    n += 1
+                    if vorher is not None:
+                        tempo_naeherung("codex", modell, tok["output"], ts - vorher)
+                    vorher = ts
+    quelle("codex", wurzel, "gelesen" if n else "leer", n,
+           "Rate als Naeherung aus den Abstaenden der token_count-Ereignisse -- sie fallen "
+           "waehrend der laufenden Antwort an, koennen aber einen Werkzeugaufruf einschliessen.")
+
+
+# --- Quelle 3: pi ----------------------------------------------------------------------------
+# Eine Zeile je Nachricht mit `message.usage`; der Ordnername IST der Workername (pi-worker legt
+# je Worker einen an). `usage.cost` rechnet pi selbst -- fuer lokale Modelle steht dort 0, was
+# stimmt und keine fehlende Angabe ist.
+def lies_pi():
+    wurzel = os.path.join(HOME, ".pi-workers", "sessions")
+    if not os.path.isdir(wurzel):
+        quelle("pi", wurzel, "fehlt")
+        return
+    n = 0
+    for pfad in sorted(glob.glob(os.path.join(wurzel, "*", "*.jsonl"))):
+        try:
+            if os.path.getmtime(pfad) < VON:
+                continue
+        except OSError:
+            continue
+        name = os.path.basename(pfad)[:-6]
+        sitzung = name.split("_", 1)[1] if "_" in name else name
+        worker = os.path.basename(os.path.dirname(pfad))
+        vorher = None
+        try:
+            f = open(pfad, errors="ignore")
+        except OSError:
+            continue
+        with f:
+            for zeile in f:
+                if '"usage"' not in zeile:
+                    continue
+                try:
+                    d = json.loads(zeile)
+                except Exception:
+                    continue
+                msg = d.get("message") or {}
+                u = msg.get("usage")
+                if not u or msg.get("role") != "assistant":
+                    continue
+                ts = parse_iso(d.get("timestamp") or "")
+                modell = msg.get("model") or "?"
+                tok = {"input": u.get("input") or 0,
+                       "output": u.get("output") or 0,
+                       "cache_write": u.get("cacheWrite") or 0,
+                       "cache_read": u.get("cacheRead") or 0,
+                       "reasoning": u.get("reasoning") or 0}
+                if buche("pi", modell, sitzung, worker, ts, tok, os.path.dirname(pfad)):
+                    n += 1
+                    kosten = u.get("cost") or {}
+                    if isinstance(kosten, dict) and kosten.get("total") is not None:
+                        eigen_usd[("pi", modell)] = eigen_usd.get(("pi", modell), 0.0) + float(kosten["total"])
+                    if vorher is not None:
+                        tempo_naeherung("pi", modell, tok["output"], ts - vorher)
+                    vorher = ts
+    quelle("pi", wurzel, "gelesen" if n else "leer", n,
+           "Rate als Wanduhr-Naeherung; pi schreibt die Generierungsdauer des Ollama-/MLX-"
+           "Backends nicht mit, nur die Tokenzahlen.")
+
+
+def sqlite_ro(pfad):
+    """Nur-lesend oeffnen -- die Datenbanken gehoeren laufenden Programmen, nicht diesem hier."""
+    return sqlite3.connect("file:%s?mode=ro" % pfad, uri=True, timeout=2.0)
+
+
+# --- Quelle 4: opencode ----------------------------------------------------------------------
+def lies_opencode():
+    pfad = os.path.join(HOME, ".local", "share", "opencode", "opencode.db")
+    if not os.path.exists(pfad):
+        quelle("opencode", pfad, "fehlt")
+        return
+    n = 0
+    try:
+        db = sqlite_ro(pfad)
+    except Exception as e:
+        quelle("opencode", pfad, "unlesbar", 0, str(e))
+        return
+    try:
+        zeilen = db.execute("SELECT session_id, data FROM message WHERE time_created >= ? "
+                            "AND time_created <= ?", (int(VON * 1000), int(BIS * 1000))).fetchall()
+    except Exception as e:
+        quelle("opencode", pfad, "unlesbar", 0, str(e))
+        db.close()
+        return
+    for sitzung, roh in zeilen:
+        try:
+            d = json.loads(roh)
+        except Exception:
+            continue
+        if d.get("role") != "assistant":
+            continue
+        t = d.get("tokens") or {}
+        cache = t.get("cache") or {}
+        zeit = d.get("time") or {}
+        ts = (zeit.get("created") or 0) / 1000.0
+        modell = d.get("modelID") or "?"
+        ordner = ((d.get("path") or {}).get("cwd") or "").rstrip("/")
+        worker = os.path.basename(ordner)
+        tok = {"input": t.get("input") or 0, "output": t.get("output") or 0,
+               "cache_write": cache.get("write") or 0, "cache_read": cache.get("read") or 0,
+               "reasoning": t.get("reasoning") or 0}
+        if buche("opencode", modell, sitzung, worker, ts, tok, ordner):
+            n += 1
+            if d.get("cost") is not None:
+                eigen_usd[("opencode", modell)] = eigen_usd.get(("opencode", modell), 0.0) + float(d["cost"])
+            fertig = zeit.get("completed")
+            if fertig:
+                tempo_naeherung("opencode", modell, tok["output"], (fertig - (zeit.get("created") or 0)) / 1000.0)
+    db.close()
+    quelle("opencode", pfad, "gelesen" if n else "leer", n,
+           "Rate als Naeherung aus time.created/time.completed -- je Datensatz genau ein "
+           "API-Aufruf, also ohne Werkzeugpausen, aber mit Netz- und Wartezeit.")
+
+
+# --- Quelle 5+6: copilot und copilot-cloud ---------------------------------------------------
+# EINE Datenbank fuer BEIDE. Unterschieden wird am Modellfeld: die Registry sagt, welches Modell
+# zu welchem der beiden Harnesses gehoert. Steht ein Modell dort nicht, entscheidet die Form des
+# Namens -- ein Ollama-Modellname traegt einen Doppelpunkt oder einen Schraegstrich, ein
+# Cloud-Modell nicht. Diese Rueckfalllinie wird im Hinweis der Quelle genannt, nicht verschwiegen.
+def lies_copilot():
+    pfad = os.path.join(HOME, ".copilot", "session-store.db")
+    if not os.path.exists(pfad):
+        quelle("copilot", pfad, "fehlt")
+        quelle("copilot-cloud", pfad, "fehlt")
+        return
+    n = {"copilot": 0, "copilot-cloud": 0}
+    geraten = set()
+    try:
+        db = sqlite_ro(pfad)
+        zeilen = db.execute(
+            "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, "
+            "cache_write_tokens, reasoning_tokens, total_nano_aiu, inter_token_latency_ms, "
+            "created_at FROM assistant_usage_events").fetchall()
+    except Exception as e:
+        quelle("copilot", pfad, "unlesbar", 0, str(e))
+        quelle("copilot-cloud", pfad, "unlesbar", 0, str(e))
+        return
+    for (sitzung, modell, ein, aus, cr, cw, res, aiu, ilat, erzeugt) in zeilen:
+        modell = modell or "?"
+        harness = MODELL_HARNESS.get(modell)
+        if harness not in ("copilot", "copilot-cloud"):
+            harness = "copilot" if (":" in modell or "/" in modell) else "copilot-cloud"
+            geraten.add(modell)
+        ts = parse_iso(erzeugt or "")
+        tok = {"input": ein or 0, "output": aus or 0, "cache_write": cw or 0,
+               "cache_read": cr or 0, "reasoning": res or 0}
+        if buche(harness, modell, sitzung, "", ts, tok):
+            n[harness] += 1
+            if aiu:
+                eigen_aiu[(harness, modell)] = eigen_aiu.get((harness, modell), 0.0) + float(aiu) / 1e9
+            # Die EINZIGE echte Generierungsrate in diesem ganzen Bericht: der mittlere Abstand
+            # zwischen zwei Ausgabe-Tokens waehrend des Streamens. Die Zeit bis zum ersten Token
+            # gehoert nicht dazu -- sie ist Wartezeit, keine Generierung.
+            if ilat and (aus or 0) > 1:
+                tempo_gemessen(harness, modell, aus, (aus - 1) * float(ilat) / 1000.0)
+    db.close()
+    hinweis = ("inter_token_latency_ms ist eine echte Generierungsrate, keine Wanduhrzeit.")
+    if geraten:
+        hinweis += (" Zuordnung zu copilot/copilot-cloud fuer %s aus der Form des Modellnamens "
+                    "geraten -- die Registry kennt sie nicht." % ", ".join(sorted(geraten)))
+    for h in ("copilot", "copilot-cloud"):
+        quelle(h, pfad, "gelesen" if n[h] else "leer", n[h], hinweis)
+
+
+# --- Quelle 7: openhands ---------------------------------------------------------------------
+# `token_usages` traegt keinen Zeitstempel, nur eine `response_id`. Dieselbe Kennung steht als
+# `llm_response_id` an den Ereignissen unter events/ -- darueber bekommt jede Nutzung ihre echte
+# Zeit. Findet sich keine, faellt sie auf die letzte Ereigniszeit der Unterhaltung zurueck; das
+# steht dann im Hinweis, statt eine erfundene Zeit zu setzen.
+def lies_openhands():
+    wurzel = os.path.join(HOME, ".openhands", "conversations")
+    if not os.path.isdir(wurzel):
+        quelle("openhands", wurzel, "fehlt")
+        return
+    n = 0
+    ohne_zeit = 0
+    for ordner in sorted(glob.glob(os.path.join(wurzel, "*"))):
+        zustand = os.path.join(ordner, "base_state.json")
+        if not os.path.exists(zustand):
+            continue
+        try:
+            d = json.load(open(zustand))
+        except Exception:
+            continue
+        agent = ((d.get("stats") or {}).get("usage_to_metrics") or {}).get("agent") or {}
+        nutzungen = agent.get("token_usages") or []
+        if not nutzungen:
+            continue
+        sitzung = os.path.basename(ordner)
+        arbeitsordner = str((d.get("workspace") or {}).get("working_dir") if isinstance(d.get("workspace"), dict) else (d.get("workspace") or "")).rstrip("/")
+        worker = os.path.basename(arbeitsordner)
+        zeiten = {}
+        letzte = None
+        for e in sorted(glob.glob(os.path.join(ordner, "events", "*.json"))):
+            try:
+                ev = json.load(open(e))
+            except Exception:
+                continue
+            ts = parse_iso(str(ev.get("timestamp") or ""))
+            if ts is None:
+                continue
+            letzte = ts if letzte is None else max(letzte, ts)
+            rid = ev.get("llm_response_id") or ev.get("response_id")
+            if rid:
+                zeiten[rid] = ts
+        dauer = {}
+        for l in (agent.get("response_latencies") or []):
+            if l.get("response_id"):
+                dauer[l["response_id"]] = l.get("latency")
+        for u in nutzungen:
+            rid = u.get("response_id")
+            ts = zeiten.get(rid)
+            if ts is None:
+                ts = letzte
+                ohne_zeit += 1
+            modell = u.get("model") or agent.get("model_name") or "?"
+            tok = {"input": u.get("prompt_tokens") or 0, "output": u.get("completion_tokens") or 0,
+                   "cache_write": u.get("cache_write_tokens") or 0,
+                   "cache_read": u.get("cache_read_tokens") or 0,
+                   "reasoning": u.get("reasoning_tokens") or 0}
+            if buche("openhands", modell, sitzung, worker, ts, tok, arbeitsordner):
+                n += 1
+                if dauer.get(rid):
+                    tempo_naeherung("openhands", modell, tok["output"], float(dauer[rid]))
+    hinweis = ("Rate aus response_latencies -- ob das reine Modellzeit oder die ganze Laufzeit "
+               "misst, ist ungeklaert (Messung 11.08.), deshalb Naeherung.")
+    if ohne_zeit:
+        hinweis += (" %d Nutzung(en) ohne passendes Ereignis auf die letzte Ereigniszeit ihrer "
+                    "Unterhaltung gelegt." % ohne_zeit)
+    quelle("openhands", wurzel, "gelesen" if n else "leer", n, hinweis)
+
+
+for _leser in (lies_claude, lies_codex, lies_pi, lies_opencode, lies_copilot, lies_openhands):
+    try:
+        _leser()
+    except Exception as e:
+        quelle(_leser.__name__.replace("lies_", ""), "?", "unlesbar", 0, "%s: %s" % (type(e).__name__, e))
+
+# --- Was NICHT messbar ist, und warum --------------------------------------------------------
+# Aus der Messung vom 11.08. (~/.pi-workers/results/verbrauchdaten/). Eine Anzeige, die fuer
+# claude Zahlen zeigt und fuer alles andere schweigt, laesst den Betrachter raten, ob nichts
+# verbraucht wurde oder nichts gemessen werden kann -- das sind zwei sehr verschiedene Auskuenfte.
+OHNE_QUELLE = {
+    "aider": "Kein Sitzungsprotokoll auf dieser Maschine -- nur analytics.json (Telemetrie, "
+             "abgeschaltet) und ein Preis-Cache. Faehigkeit unbelegt, nicht widerlegt.",
+    "crush": "Nur Konfigurationsdateien gefunden, keine Sitzung mit Inhalt.",
+    "qwen": "Nur Konfigurationsdateien gefunden, keine Sitzung mit Inhalt.",
+    "kimi": "Nur Konfigurationsdateien gefunden, keine Sitzung mit Inhalt.",
+    "gptme": "Sitzungsordner vorhanden, aber leer.",
+    "cline": "Nur eine Startmeldung im Log, keine Sitzung mit Inhalt.",
+    "goose": "Nur Konfigurationsdateien gefunden, keine Sitzung mit Inhalt.",
+    "nanocoder": "Keine einzige Sitzungs- oder Protokolldatei -- nur agents.config.json.",
+    "forge": "Tabelle conversations traegt eine passende Spalte metrics, hat aber 0 Zeilen. Ein "
+             "einziger echter Lauf wuerde zeigen, was darin steht.",
+    "agy": "Protokolliert binaer (Protobuf-artig) in conversations/<id>.db; ohne das Schema von "
+           "Google sind dort keine Token- oder Usage-Felder lesbar.",
+    "jcode": "Fuehrt nur ein Anwendungslog ohne Rollen und ohne Token.",
+}
+gelesen = set(q["harness"] for q in quellen)
+luecken = [{"harness": h, "grund": OHNE_QUELLE.get(h, "Keine Quelle bekannt.")}
+           for h in ALLE_HARNESS if h not in gelesen]
+
+# --- Preise ----------------------------------------------------------------------------------
+# ZWEI QUELLEN, beide lokal und ohne Netz:
+#   1. der LiteLLM-Preiscache, den aider mitfuehrt (2984 Eintraege, Listenpreise vieler
+#      Cloud-Anbieter). Wie frisch er ist, haengt allein daran, wann aider zuletzt online lief --
+#      das Alter der Datei reist deshalb als `preisstand` mit hinaus.
+#   2. die Tabelle im Kopf dieses Skripts, fuer die fuenf Claude-Kennungen. Sie ist ausdruecklich
+#      ein API-AEQUIVALENT: der Nutzer zahlt fuer sie ein Abo, kein Entgelt je Token.
+LITELLM_PATH = os.path.join(HOME, ".aider", "caches", "model_prices_and_context_window.json")
+LITELLM = {}
+LITELLM_STAND = ""
+try:
+    LITELLM = json.load(open(LITELLM_PATH))
+    LITELLM_STAND = iso(os.path.getmtime(LITELLM_PATH))
+except Exception:
+    LITELLM = {}
+
+API_AEQUIVALENT = {
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-sonnet-5": (3.0, 15.0),
+    "claude-haiku-4-5-20251001": (1.0, 5.0),
+    "claude-fable-5": (10.0, 50.0),
+}
+CACHE_WRITE_FAKTOR = 1.25
+CACHE_READ_FAKTOR = 0.1
+
+
+def preis(harness, modell, w):
+    """Das Preisobjekt eines Modells -- nie eine nackte Zahl, immer mit Art und Herkunft."""
+    art_anbieter = HARNESS_ART.get(harness, "?")
+    if (harness, modell) in eigen_usd:
+        return {"usd": round(eigen_usd[(harness, modell)], 6), "art": "harness-angabe",
+                "quelle": "der Harness rechnet den Betrag selbst mit",
+                "nie_abgebucht": art_anbieter in ("subscription", "local")}
+    kurz = modell.split("/")[-1]
+    eintrag = LITELLM.get(modell) or LITELLM.get(kurz)
+    if eintrag and eintrag.get("input_cost_per_token") is not None:
+        pin = float(eintrag.get("input_cost_per_token") or 0)
+        pout = float(eintrag.get("output_cost_per_token") or 0)
+        pcr = eintrag.get("cache_read_input_token_cost")
+        pcw = eintrag.get("cache_creation_input_token_cost")
+        betrag = (w["input"] * pin + w["output"] * pout
+                  + w["cache_write"] * (float(pcw) if pcw is not None else pin * CACHE_WRITE_FAKTOR)
+                  + w["cache_read"] * (float(pcr) if pcr is not None else pin * CACHE_READ_FAKTOR))
+        return {"usd": round(betrag, 6),
+                "art": "abo-aequivalent" if art_anbieter == "subscription" else "katalogpreis",
+                "quelle": "LiteLLM-Preiscache (%s, Stand %s)" % (LITELLM_PATH.replace(HOME, "~"),
+                                                                 LITELLM_STAND or "unbekannt"),
+                "nie_abgebucht": art_anbieter in ("subscription", "local")}
+    if modell in API_AEQUIVALENT:
+        pin, pout = API_AEQUIVALENT[modell]
+        betrag = (w["input"] / 1e6 * pin + w["output"] / 1e6 * pout
+                  + w["cache_write"] / 1e6 * pin * CACHE_WRITE_FAKTOR
+                  + w["cache_read"] / 1e6 * pin * CACHE_READ_FAKTOR)
+        return {"usd": round(betrag, 6), "art": "abo-aequivalent",
+                "quelle": "Preistabelle im Kopf von wb-budget",
+                "nie_abgebucht": True}
+    if art_anbieter == "local":
+        return {"usd": 0.0, "art": "kein-preis", "quelle": "lokales Modell -- kein Anbieter, "
+                "der abrechnet", "nie_abgebucht": True}
+    return {"usd": None, "art": "kein-preis", "quelle": "kein Preiseintrag gefunden",
+            "nie_abgebucht": None}
+
+
+def tempo_objekt(harness, modell):
+    t = tempo.get((harness, modell))
+    if not t:
+        return {"wert": None, "art": "unbekannt", "grund": "keine Zeitdaten in dieser Quelle"}
+    if t["gem_sekunden"] > 0:
+        return {"wert": round(t["gem_tokens"] / t["gem_sekunden"], 1), "art": "gemessen",
+                "grund": "aus inter_token_latency_ms -- der Abstand zwischen zwei Ausgabe-Tokens "
+                         "waehrend des Streamens, ohne Wartezeit bis zum ersten Token",
+                "sekunden": round(t["gem_sekunden"], 1)}
+    if t["nae_sekunden"] > 0:
+        return {"wert": round(t["nae_tokens"] / t["nae_sekunden"], 1), "art": "naeherung",
+                "grund": "Wanduhr aus Zeitstempeln: Denkzeit, Netz und Werkzeugpausen zaehlen "
+                         "mit. Luecken ueber %d s bleiben ganz aussen vor." % NAEHERUNG_LUECKE_MAX,
+                "sekunden": round(t["nae_sekunden"], 1)}
+    return {"wert": None, "art": "unbekannt", "grund": "keine verwertbaren Abstaende im Fenster"}
+
+
+# --- Der Stand am Limit, als Zeitreihe -------------------------------------------------------
+# Nicht jede Zeile: limits.jsonl wird bei JEDEM Zeichnen der Statusleiste fortgeschrieben und
+# traegt dieselbe Prozentzahl hundertfach. Behalten wird, wo sich etwas AENDERT -- und damit
+# insbesondere jeder Ruecksprung, der einen Ruecksetzpunkt anzeigt.
+limits = []
+if os.path.exists(LIMITS_PATH):
+    vorige = None
+    for zeile in open(LIMITS_PATH, errors="ignore"):
+        zeile = zeile.strip()
+        if not zeile:
+            continue
+        try:
+            d = json.loads(zeile)
+        except Exception:
+            continue
+        ts = parse_iso(d.get("ts") or "")
+        if ts is None or ts < VON or ts > BIS:
+            continue
+        punkt = {"ts": iso(ts), "five_hour_pct": d.get("five_hour_pct"),
+                 "seven_day_pct": d.get("seven_day_pct"),
+                 "five_hour_resets_at": d.get("five_hour_resets_at"),
+                 "seven_day_resets_at": d.get("seven_day_resets_at")}
+        schluessel = (punkt["five_hour_pct"], punkt["seven_day_pct"])
+        if schluessel != vorige:
+            limits.append(punkt)
+            vorige = schluessel
+    if limits:
+        limits[-1]["letzter"] = True
+
+# --- Der Kontingentstand, die zweite Groesse neben dem Preis ---------------------------------
+kontingent = {}
+if OHNE_KONTINGENT != "1" and os.path.exists(KONTINGENT_BIN):
+    try:
+        roh = subprocess.run([sys.executable, KONTINGENT_BIN, "zeigen", "--json"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+        kontingent = json.loads(roh.stdout.decode("utf-8", "replace"))
+    except Exception as e:
+        kontingent = {"fehler": "%s: %s" % (type(e).__name__, e)}
+
+# --- Ausgabe ---------------------------------------------------------------------------------
+def summe_ohne_cache_read(w):
+    return w["input"] + w["output"] + w["cache_write"]
+
+
+def reihe_modell(schluessel, w):
+    harness, modell = schluessel
+    z = {"harness": harness, "modell": modell}
+    z.update(w)
+    # Auch hier, wie in jeder anderen Sicht: die Summe OHNE Cache-Lesen steht mit im Datensatz.
+    # Sie erst in der Anzeige zu bilden hiesse, dieselbe Regel ein zweites Mal aufzuschreiben --
+    # und beim ersten Vergessen steht ein NaN in der Tabelle.
+    z["ohne_cache_read"] = summe_ohne_cache_read(w)
+    z["tempo"] = tempo_objekt(harness, modell)
+    z["preis"] = preis(harness, modell, w)
+    if (harness, modell) in eigen_aiu:
+        z["aiu"] = round(eigen_aiu[(harness, modell)], 6)
+    return z
+
+
+raus = {
+    "erzeugt": iso(JETZT),
+    "fenster": {"von": iso(VON), "bis": iso(BIS), "tage": round((BIS - VON) / 86400.0, 3)},
+    "filter": {"harness": sorted(NUR_HARNESS), "modell": sorted(NUR_MODELL),
+               "sitzung": sorted(NUR_SITZUNG)},
+    "gesamt": dict(gesamt, ohne_cache_read=summe_ohne_cache_read(gesamt)),
+    "je_harness": sorted(
+        [dict(w, harness=h, ohne_cache_read=summe_ohne_cache_read(w)) for h, w in je_harness.items()],
+        key=lambda z: -z["ohne_cache_read"]),
+    "je_modell": sorted([reihe_modell(k, w) for k, w in je_modell.items()],
+                        key=lambda z: -summe_ohne_cache_read(z)),
+    "je_sitzung": sorted(
+        [dict(s["werte"], harness=h, sitzung=sid, worker=s["worker"], ordner=s["ordner"],
+              modelle=sorted(s["modelle"]), von=iso(s["von"]), bis=iso(s["bis"]),
+              ohne_cache_read=summe_ohne_cache_read(s["werte"]))
+         for (h, sid), s in je_sitzung.items()],
+        key=lambda z: -z["ohne_cache_read"]),
+    # Je Tag, Harness UND Modell. Grob nach Harness allein waere kuerzer, aber dann liesse
+    # sich ein Modellfilter im Tagesverlauf nicht mehr anwenden -- die Anzeige muesste ihn
+    # dort stillschweigend fallenlassen und zeigte eine andere Menge als die Tabelle daneben.
+    "je_tag": sorted([dict(w, tag=t, harness=h, modell=m, ohne_cache_read=summe_ohne_cache_read(w))
+                      for (t, h, m), w in je_tag.items()],
+                     key=lambda z: (z["tag"], z["harness"], z["modell"])),
+    "limits": limits,
+    "kontingent": kontingent,
+    "quellen": quellen,
+    "luecken": luecken,
+}
+json.dump(raus, sys.stdout, ensure_ascii=False)
+sys.stdout.write("\n")
+PY
+  exit 0
+fi
+
+echo "wb-budget — Token-Verbrauch aus lokalen Session-Transkripten"
+echo
+
+# --- Transkripte einsammeln (nur letzte 8 Tage relevant fuer 5h/7d-Report). ------------------
+#
+# INKREMENTELL SEIT DEM 16.08.2026, und das ist der ganze Unterschied.
+#
+# Vorher: `cat` ueber alle Transkripte der letzten acht Tage in zwei jq-Laeufe -- bei jedem
+# Aufruf aufs Neue, egal wie wenig sich geaendert hatte. Auf dieser Maschine sind das 233 von
+# 913 Dateien und zusammen 1,8 GB; GEMESSEN im Worktree, drei Laeufe: 11,22 / 11,34 / 11,50 s.
+# Jetzt merkt sich das Skript je Datei, wie weit es sie gelesen hat, und liest nur das NEUE
+# nach; alles Gelesene liegt als Datensatz (Zeitstempel und vier Tokenzahlen) im Zwischenspeicher
+# unter ~/.local/state/wb-budget/usage-cache.json.
+#
+# WANN DER ZWISCHENSPEICHER VERWORFEN WIRD, damit er nie eine falsche Zahl konserviert:
+#   * Groesse UND mtime unveraendert  -> gar nicht geoeffnet (der haeufige Fall).
+#   * Gewachsen                       -> ab dem gemerkten Byte-Versatz weitergelesen.
+#   * Geschrumpft, oder der Versatz liegt hinter dem Dateiende (gedreht, neu geschrieben,
+#     abgeschnitten)                  -> Eintrag weg, Datei von vorn.
+#   * Ein angefangene letzte Zeile ohne Zeilenumbruch zaehlt NICHT mit, und der Versatz bleibt
+#     davor stehen -- sonst faellt genau die Nachricht heraus, die gerade geschrieben wird.
+#   * Eine unlesbare oder unerwartete Cache-Datei ist kein Fehler, sondern ein kalter Start.
+#
+# GEZAEHLT WIRD DASSELBE WIE VORHER: assistant-Zeilen mit message.usage; Zeilen ohne
+# verwertbaren Zeitstempel werden gezaehlt und auf stderr gemeldet, nie stillschweigend
+# weggelassen. cache_read (Cache-TREFFER) faellt weiterhin bewusst NICHT in die Tages-/
+# Hochrechnungssumme: es ist der mit Abstand billigste Posten und dominiert die Summe um
+# Groessenordnungen (real gemessen: an einem Tag 609 von 629 Mio Tokens in 5h waren cache_read)
+# -- eine Summe, die dadurch dominiert wird, misst im Wesentlichen Cache-Treffer statt Team-/
+# Verbrauchsgroesse. cache_read wird separat ausgewiesen (Transparenz), nie in "total"/
+# Hochrechnung mitgezaehlt.
+/usr/bin/python3 - "$HOME/.local/state/wb-budget/usage-cache.json" <<'PY'
+import json, os, sys, time
+
+CACHE = sys.argv[1]
+HOME = os.path.expanduser("~")
+WURZEL = os.path.join(HOME, ".claude", "projects")
+JETZT = time.time()
+FENSTER_TAGE = 8
+# Etwas mehr als das Fenster: der Bericht schaut hoechstens 7 Tage zurueck, der
+# Zwischenspeicher haelt 10 -- so kostet ein Lauf kurz nach Mitternacht keinen kalten Start.
+BEHALTEN_S = 10 * 86400
+
+
+def lade_cache():
+    try:
+        with open(CACHE) as fh:
+            d = json.load(fh)
+        if not isinstance(d, dict) or d.get("version") != 1:
+            return {}
+        dateien = d.get("dateien")
+        return dateien if isinstance(dateien, dict) else {}
+    except Exception:
+        # Kaputt, alt oder nicht da: ein kalter Start ist langsam, nie falsch.
+        return {}
+
+
+def sichere_cache(dateien):
+    schnitt = JETZT - BEHALTEN_S
+    schlank = {}
+    for pfad, e in dateien.items():
+        if e.get("mtime", 0) < schnitt:
+            continue
+        e = dict(e)
+        e["s"] = [r for r in e.get("s", []) if r[0] >= schnitt]
+        schlank[pfad] = e
+    try:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        tmp = "%s.%d.tmp" % (CACHE, os.getpid())
+        with open(tmp, "w") as fh:
+            json.dump({"version": 1, "dateien": schlank}, fh)
+        os.replace(tmp, CACHE)
+    except Exception:
+        # Ein nicht schreibbarer Zwischenspeicher macht den naechsten Lauf langsam, nicht falsch.
+        pass
+
+
+def parse_ts(s):
+    """ISO-8601 zu Epoche, ohne datetime -- dieselbe Auswahl wie die jq-Fassung vorher."""
+    if not s or len(s) < 19 or s[4] != "-" or s[7] != "-" or s[10] != "T":
+        return None
+    try:
+        jahr, monat, tag = int(s[0:4]), int(s[5:7]), int(s[8:10])
+        std, minute, sek = int(s[11:13]), int(s[14:16]), int(s[17:19])
+    except ValueError:
+        return None
+    rest = s[19:]
+    versatz = 0
+    if rest.startswith("."):
+        i = 1
+        while i < len(rest) and rest[i].isdigit():
+            i += 1
+        rest = rest[i:]
+    if rest and rest[0] in "+-" and len(rest) >= 6:
+        try:
+            versatz = (int(rest[1:3]) * 3600 + int(rest[4:6]) * 60) * (-1 if rest[0] == "+" else 1)
+        except ValueError:
+            return None
+    elif rest not in ("", "Z"):
+        return None
+    # calendar.timegm ohne den Import: die Formel steht in jeder Zeitrechnung so.
+    tage = (jahr - 1970) * 365 + (jahr - 1969) // 4 - (jahr - 1901) // 100 + (jahr - 1601) // 400
+    monatstage = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    if not 1 <= monat <= 12:
+        return None
+    tage += monatstage[monat - 1] + tag - 1
+    if monat > 2 and (jahr % 4 == 0 and (jahr % 100 != 0 or jahr % 400 == 0)):
+        tage += 1
+    return tage * 86400 + std * 3600 + minute * 60 + sek + versatz
+
+
+def lies_neu(pfad, ab):
+    """Ab dem Byte-Versatz weiterlesen. Gibt (Datensaetze, ohne_ts, usage_zeilen, neuer_versatz)."""
+    saetze, ohne_ts, usage, versatz = [], 0, 0, ab
+    with open(pfad, "rb") as fh:
+        fh.seek(ab)
+        for roh in fh:
+            if not roh.endswith(b"\n"):
+                # Angefangene Zeile: der Versatz bleibt davor stehen, beim naechsten Lauf
+                # wird sie vollstaendig gelesen.
+                break
+            versatz += len(roh)
+            if b'"usage"' not in roh:
+                continue
+            try:
+                d = json.loads(roh.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if d.get("type") != "assistant":
+                continue
+            msg = d.get("message") or {}
+            u = msg.get("usage")
+            if not u:
+                continue
+            usage += 1
+            ts = parse_ts(d.get("timestamp") or "")
+            if ts is None:
+                ohne_ts += 1
+                continue
+            saetze.append([ts,
+                           u.get("input_tokens") or 0,
+                           u.get("output_tokens") or 0,
+                           u.get("cache_creation_input_tokens") or 0,
+                           u.get("cache_read_input_tokens") or 0])
+    return saetze, ohne_ts, usage, versatz
+
+
+# --- Die Dateien des Fensters, in jeder Tiefe (auch die subagents/-Unterordner) --------------
+pfade = []
+for wurzel, _, namen in os.walk(WURZEL):
+    for n in namen:
+        if not n.endswith(".jsonl"):
+            continue
+        p = os.path.join(wurzel, n)
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if st.st_mtime >= JETZT - FENSTER_TAGE * 86400:
+            pfade.append((p, st))
+
+if not pfade:
+    print("keine Transkripte der letzten 8 Tage gefunden unter ~/.claude/projects — nichts zu zeigen.")
+    sys.exit(0)
+
+cache = lade_cache()
+saetze, ohne_ts_gesamt, usage_gesamt = [], 0, 0
+for pfad, st in pfade:
+    e = cache.get(pfad)
+    # Geschrumpft heisst: neu geschrieben, gedreht oder abgeschnitten -- der gemerkte Versatz
+    # zeigt dann in eine andere Datei als die, aus der er stammt. Also von vorn.
+    if isinstance(e, dict) and st.st_size < e.get("offset", 0):
+        e = None
+    if not isinstance(e, dict):
+        e = {"offset": 0, "size": 0, "mtime": 0, "usage": 0, "ohne_ts": 0, "s": []}
+    if e["size"] != st.st_size or e["mtime"] != st.st_mtime:
+        try:
+            neu, ohne, anz, versatz = lies_neu(pfad, e["offset"])
+        except OSError:
+            continue
+        e["s"] = e.get("s", []) + neu
+        e["ohne_ts"] = e.get("ohne_ts", 0) + ohne
+        e["usage"] = e.get("usage", 0) + anz
+        e["offset"] = versatz
+        e["size"] = st.st_size
+        e["mtime"] = st.st_mtime
+    cache[pfad] = e
+    saetze.extend(e["s"])
+    ohne_ts_gesamt += e.get("ohne_ts", 0)
+    usage_gesamt += e.get("usage", 0)
+
+sichere_cache(cache)
+
+if ohne_ts_gesamt > 0:
+    sys.stderr.write("Hinweis: %d von %d Nachrichten ohne verwertbaren Zeitstempel uebersprungen "
+                     "(nicht in den Zahlen unten).\n" % (ohne_ts_gesamt, usage_gesamt))
+
+# --- Die vier Sichten, aus denselben Datensaetzen wie vorher ---------------------------------
+T5 = JETZT - 5 * 3600
+T7 = JETZT - 7 * 86400
+TAGESBEGINN = JETZT - (JETZT % 86400)
+
+
+def fenster(ab):
+    z = [0, 0, 0, 0, 0]  # Nachrichten, input, output, cache_write, cache_read
+    for r in saetze:
+        if r[0] < ab:
+            continue
+        z[0] += 1
+        for i in range(1, 5):
+            z[i] += r[i]
+    return z
+
+
+def zeile(z):
+    return ("  Nachrichten: %d   input: %d   output: %d   cache_write: %d   cache_read: %d  "
+            "(cache_read separat, nicht in Trend/Hochrechnung)" % (z[0], z[1], z[2], z[3], z[4]))
+
+
+print("== letzte 5 Stunden ==")
+print(zeile(fenster(T5)))
+print()
+print("== letzte 7 Tage ==")
+print(zeile(fenster(T7)))
+print()
+print("== Trend, Tokens/Tag (input+output+cache_write, OHNE cache_read, UTC-Tagesgrenzen) ==")
+tage = {}
+for r in saetze:
+    if r[0] < T7:
+        continue
+    t = time.strftime("%Y-%m-%d", time.gmtime(r[0]))
+    w = tage.setdefault(t, [0, 0])
+    w[0] += r[1] + r[2] + r[3]
+    w[1] += r[4]
+for t in sorted(tage):
+    print("  %s: %d   (cache_read: %d)" % (t, tage[t][0], tage[t][1]))
+
+print()
+heute_total, heute_cache_read = 0, 0
+for r in saetze:
+    if r[0] < TAGESBEGINN:
+        continue
+    heute_total += r[1] + r[2] + r[3]
+    heute_cache_read += r[4]
+stunden = (JETZT % 86400) / 3600
+print("== Hochrechnung (heute, UTC) ==")
+if stunden < 0.25:
+    print("  zu frueh am UTC-Tag (%sh) fuer eine sinnvolle Hochrechnung." % stunden)
+else:
+    print("  bisher heute: %d Tokens (input+output+cache_write) in %sh ->" % (heute_total, stunden))
+    print("  Hochrechnung auf 24h: ~%.0f Tokens" % (heute_total / stunden * 24))
+    print("  (lineare Fortschreibung, cache_read AUSGESCHLOSSEN, keine Kenntnis eines Limits;")
+    print("   zum Vergleich, nicht mitgezaehlt: %d cache_read heute)" % heute_cache_read)
+PY
+
+# --- Plan-Limit-Prozente: Betriebslog (primaer) vs. --ingest-Log (manuell) -- juengere gewinnt. --
+echo
+echo "== Plan-Limit (% vom Anthropic-Limit) =="
+WB_LAST=""
+ING_LAST=""
+[ -s "$WORKBENCH_LIMITS" ] && WB_LAST=$("$JQ" -c -s '.[-1]' < "$WORKBENCH_LIMITS" 2>/dev/null)
+[ -s "$LIMITS_LOG" ] && ING_LAST=$("$JQ" -c -s '.[-1]' < "$LIMITS_LOG" 2>/dev/null)
+
+if [ -n "$WB_LAST" ] || [ -n "$ING_LAST" ]; then
+  WB_TS=""; ING_TS=""
+  [ -n "$WB_LAST" ] && WB_TS=$(echo "$WB_LAST" | "$JQ" -r '.ts // empty')
+  [ -n "$ING_LAST" ] && ING_TS=$(echo "$ING_LAST" | "$JQ" -r '.ts // empty')
+
+  # ts steht in beiden Logs als ISO-8601-UTC ("...Z") -- dafuer ist lexikografischer Vergleich
+  # gleichbedeutend mit chronologischem Vergleich, kein Datumsparsing noetig.
+  if [ -n "$WB_TS" ] && { [ -z "$ING_TS" ] || [[ "$WB_TS" > "$ING_TS" ]]; }; then
+    CHOSEN="$WB_LAST"; QUELLE="Betriebslog ($WORKBENCH_LIMITS)"
+    COUNT=$("$JQ" -s 'length' < "$WORKBENCH_LIMITS")
+    RESET_FIELD="five_hour_resets_at"
+  else
+    CHOSEN="$ING_LAST"; QUELLE="manueller Ingest ($LIMITS_LOG)"
+    COUNT=$("$JQ" -s 'length' < "$LIMITS_LOG")
+    RESET_FIELD="resets_at"
+  fi
+
+  RESET_EPOCH=$(echo "$CHOSEN" | "$JQ" -r --arg f "$RESET_FIELD" '.[$f] // empty')
+  RESET_HUMAN="unbekannt"
+  [ -n "$RESET_EPOCH" ] && RESET_HUMAN=$(date -r "$RESET_EPOCH" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || echo "$RESET_EPOCH")
+
+  echo "  $COUNT geloggte Datenpunkt(e), Quelle: $QUELLE. Letzter:"
+  echo "$CHOSEN" | "$JQ" -r --arg reset "$RESET_HUMAN" \
+    '"    Stand \(.ts): 5h=\(.five_hour_pct)%  7d=\(.seven_day_pct)%  Reset=\($reset)"'
+  echo "  Umrechnung Prozentpunkt -> Tokens/USD: 'wb-budget --limit-kalibrierung'"
+else
+  echo "  nicht verfuegbar — kein Log vorhanden. Weder $WORKBENCH_LIMITS (Betriebslog, seit 28.07."
+  echo "  von statusline-command.sh geschrieben) noch $LIMITS_LOG (manueller --ingest) existieren."
+  echo "  Manuell nachtragbar per 'wb-budget --ingest' mit einer Statusline-JSON auf stdin."
+fi

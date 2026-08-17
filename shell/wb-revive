@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# Revive a DEAD workbench pane, resuming its conversation.
+#
+# A pane SIGKILLed by jetsam/OOM stays as a dead pane (remain-on-exit on). We
+# respawn it with the same model/role/flags AND the resume flags of ITS harness.
+#
+# Welche Flags das sind, steht seit dem 2026-08-06 in der Registry (`resume` am
+# Harness) und nicht mehr in diesem Skript. Vorher stand hier eine Textersetzung auf
+# das Wort "claude " — die traf genau einen Harness, und der Registry-Block wirkte nur
+# beim ersten Spawn. Kann ein Harness nicht fortsetzen, kommt der Pane trotzdem
+# zurueck, aber leer, und die Meldung sagt warum.
+#
+# LIVENESS GUARD (2026-08-04). Until today this script respawned unconditionally,
+# and `respawn-pane -k` kills whatever runs in the pane — including a Claude that
+# was working. The way in is a single keystroke (prefix + R), so one misfire threw
+# away a running conversation. Measured, reproducible, not a near miss. Now every
+# path checks #{pane_dead} once, in guard_live(), immediately before the only
+# respawn-pane call. A live pane is left alone, says so, and exits 3 (distinct
+# from the 0 of a real revive) instead of doing nothing silently.
+#
+# Why --force exists anyway: the original trigger for this tool was a pane that
+# LOOKED frozen. That case turned out to be a dead pane behind remain-on-exit
+# (see the vault note of 2026-07-11), but a genuinely hung TUI — process alive,
+# terminal unresponsive — is real and has no other way out than a respawn. So the
+# case keeps a way in, just never the default one: --force plus a confirmation.
+# Interactively the confirmation is a [j/N] prompt; without a terminal (tmux
+# run-shell, hooks, scripts) --force additionally requires --yes. That way the
+# prefix + R binding, which has no tty, can never force-kill a live pane no
+# matter what a stray keypress does.
+#
+# Command source, in order of preference:
+#   1. @wb_cmd — the clean, re-executable command stored at spawn time by the
+#      workbench launchers. THIS is authoritative.
+#   2. #{pane_start_command} — tmux's *escaped display* form. Fallback only, for
+#      panes created before @wb_cmd existed. NOTE: this form does not round-trip
+#      cleanly for commands containing "$(cat ...)" and nested quotes — feeding it
+#      back to respawn-pane double-wraps the quoting and the respawn exits 1. That
+#      historical bug is exactly why @wb_cmd is now preferred.
+#
+# EINE Wiederbelebung je Pane (2026-08-15). Es gibt zwei Wege hierher — den
+# pane-died-Hook ueber wb-autorevive und den Tastendruck prefix + R — und beide sahen
+# denselben toten Pane. Der zweite `respawn-pane -k` beendet dann die Unterhaltung, die
+# der erste gerade fortgesetzt hat; die Drossel in wb-autorevive half nicht, sie entsteht
+# erst nach dem Jitter-Schlaf und kennt den anderen Weg gar nicht. Deshalb liegt die
+# Sperre HIER, an der einzigen Stelle, durch die beide Wege muessen: eine atomar
+# angelegte Sperrmarke je Pane UND tmux-Server, und die Lebend-Pruefung findet INNERHALB
+# der Sperre statt — wer als Zweiter kommt, sieht den bereits wiederbelebten Pane leben
+# und laesst ihn in Ruhe.
+#
+# Usage: wb-revive [--force [--yes]] [<pane-id>]
+# Exit:  0 respawned   3 pane still alive, nothing done   2 usage/unknown pane
+#        4 eine andere Wiederbelebung dieses Panes laeuft gerade
+#
+# Bound to: prefix + R   |   also called by wb-autorevive (pane-died hook)
+set -euo pipefail
+
+pane=""
+force=0
+confirmed=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force)   force=1 ;;
+    --yes|-y)  confirmed=1 ;;
+    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    -*)        printf 'wb-revive: unknown option %s\n' "$1" >&2; exit 2 ;;
+    *)         [ -z "$pane" ] && pane="$1" ;;
+  esac
+  shift
+done
+pane="${pane:-${TMUX_PANE:?no pane}}"
+
+# THE liveness guard — the one place that decides whether a respawn may happen.
+# Called immediately before the single respawn-pane below; nothing respawns
+# without passing through here.
+guard_live() {
+  local dead
+  dead=$(tmux display-message -p -t "$pane" '#{pane_dead}' 2>/dev/null || true)
+  if [ -z "$dead" ]; then
+    printf 'wb-revive: pane %s not found\n' "$pane" >&2
+    exit 2
+  fi
+  [ "$dead" = 1 ] && return 0   # dead pane: the normal, intended case
+
+  if [ "$force" -ne 1 ]; then
+    tmux display-message -t "$pane" "wb-revive: pane still running, nothing done (--force to override)" 2>/dev/null || true
+    echo "wb-revive: $pane is still running (pane_dead=0), nothing done. Use --force --yes to restart it anyway."
+    exit 3
+  fi
+
+  if [ "$confirmed" -ne 1 ]; then
+    if [ -t 0 ]; then
+      printf 'wb-revive: %s is still running. Kill the process and restart it? [j/N] ' "$pane" >&2
+      local answer=""
+      read -r answer || answer=""
+      case "$answer" in
+        j|J|ja|Ja|y|Y|yes|Yes) ;;
+        *) echo "wb-revive: aborted, nothing done" >&2; exit 3 ;;
+      esac
+    else
+      tmux display-message -t "$pane" "wb-revive: --force without a terminal also needs --yes" 2>/dev/null || true
+      echo "wb-revive: $pane is still running and --force was given without a terminal to confirm on. Add --yes if that is really what you want."
+      exit 3
+    fi
+  fi
+  tmux display-message -t "$pane" "wb-revive: --force on a LIVE pane" 2>/dev/null || true
+}
+
+# Welcher Harness laeuft in diesem Pane? Abgeleitet aus dem Startbefehl, weil kein
+# Spawner eine @wb_harness-Option setzt (nachgesehen 2026-08-06: wb-code, pi-worker,
+# wb-ssh-worker und wb-agent setzen nur @wb_role, @wb_worker und @wb_cmd). Zwei Formen,
+# mehr gibt es heute nicht:
+#   1. Registry-Weg — "... wb-harness-run --model <id> ...": der Harness steht am Modell.
+#   2. Eingebauter Weg — das Programm selbst in der Zeile: ".../claude " oder "exec pi ".
+# Leer heisst UNBEKANNT, nicht "kaputt": dann verhaelt sich alles wie vor der Registry.
+#
+# ZWEITE STELLE: dieselbe Funktion steht in shell/context-guard. Sie ist bewusst
+# doppelt und nicht in einer gemeinsamen Datei — ein drittes Skript waere ein
+# weiteres Ausrollteil, und faellt es aus, ist der Guard still blind. Wer eine der
+# beiden aendert, aendert beide; shell/tests/test-harness-wege.sh vergleicht sie
+# Zeichen fuer Zeichen gegeneinander und schlaegt sonst fehl.
+pane_harness() {   # <startbefehl> -> harness-id oder leer
+  local c="$1" mid=""
+  case "$c" in
+    *wb-harness-run*)
+      # Nur dieser Zweig braucht die Registry: der Harness haengt am Modell.
+      [ -x "$HOME/.local/bin/wb-state" ] || { printf ''; return; }
+      mid=$(printf '%s\n' "$c" | sed -nE 's/.*--model[= ]+([^ ]+).*/\1/p' | head -1)
+      [ -n "$mid" ] && "$HOME/.local/bin/wb-state" models get "$mid" --field harness 2>/dev/null
+      return ;;
+  esac
+  # Wortgrenze statt Teilzeichenkette: "--model claude-opus-5" ist KEIN claude-Aufruf,
+  # "/Users/x/.local/bin/claude --model …" und "exec pi --provider …" sind welche.
+  [[ "$c" =~ (^|[[:space:]/])claude([[:space:]]|$) ]] && { printf 'claude\n'; return; }
+  [[ "$c" =~ (^|[[:space:]/])pi([[:space:]]|$) ]]     && { printf 'pi\n';     return; }
+  printf ''
+}
+
+cmd=$(tmux show-options -pqv -t "$pane" @wb_cmd 2>/dev/null || true)
+[[ -z "$cmd" ]] && cmd=$(tmux display-message -p -t "$pane" '#{pane_start_command}')
+
+if [[ -z "$cmd" ]]; then
+  tmux display-message -t "$pane" "wb-revive: kein Startbefehl am Pane, nichts zu tun"
+  echo "wb-revive: $pane hat weder @wb_cmd noch ein pane_start_command — nichts getan."
+  exit 0
+fi
+
+hid="$(pane_harness "$cmd")"
+prole=$(tmux show-options -pqv -t "$pane" @wb_role 2>/dev/null || true)
+if [[ -z "$hid" && -z "$prole" ]]; then
+  # Weder ein bekannter Harness noch eine Workbench-Rolle: das ist ein fremder Pane.
+  # Frueher stand hier "not a claude pane" — dieselbe Entscheidung, nur trifft sie
+  # jetzt nur noch das, was wirklich nicht uns gehoert.
+  tmux display-message -t "$pane" "wb-revive: kein Workbench-Pane, nichts zu tun"
+  echo "wb-revive: $pane gehoert zu keinem registrierten Harness und traegt keine @wb_role — nichts getan."
+  exit 0
+fi
+
+# Resolve THIS pane's own conversation (2026-08-05). `--continue` resumes
+# whichever conversation was last active in the pane's cwd -- with several
+# sessions per folder (the normal case here, not the exception, see
+# ~/.claude/workbench/sessions/*.json today) that can be a DIFFERENT pane's
+# conversation. The state file whose `tmuxSession` matches THIS pane's tmux
+# session carries the right `claudeSessionId` (written by wb-code at start;
+# app/src/main/revive.ts uses the same field for the UI's own resume button).
+# Same STATEDIR path as wb-state/wb-doctor/wb-session-delete -- one truth, not
+# a second guess at the same folder. Anything short of a clean match (no
+# state dir, no matching file, unreadable JSON, no id) falls back to the old
+# --continue behaviour: an unattended revive with the second-best
+# conversation beats no revive at all.
+sess="$(tmux display -p -t "$pane" '#{session_name}' 2>/dev/null || true)"
+STATEDIR="$HOME/.claude/workbench/sessions"
+resume_id=""
+if [[ -n "$sess" ]]; then
+  resume_id="$(/usr/bin/python3 - "$STATEDIR" "$sess" <<'PY'
+import json, os, sys
+statedir, sess = sys.argv[1], sys.argv[2]
+try:
+    names = os.listdir(statedir)
+except OSError:
+    names = []
+for fn in sorted(names):
+    if not fn.endswith(".json"):
+        continue
+    try:
+        st = json.load(open(os.path.join(statedir, fn)))
+    except Exception:
+        continue
+    if st.get("tmuxSession") == sess:
+        csid = st.get("claudeSessionId")
+        if csid:
+            print(csid)
+        break
+PY
+)"
+fi
+
+# The id ends up inside a command string that tmux hands to a SHELL, so it is
+# checked before use: letters, digits, dot, dash, underscore -- everything a
+# real session id needs and nothing a shell would act on. The file is ours,
+# but this path runs unattended, and a state file is not a place to trust
+# blindly. Anything else falls back to --continue.
+if [[ -n "$resume_id" && ! "$resume_id" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+  tmux display-message -t "$pane" "wb-revive: unplausible session id, falling back to --continue" 2>/dev/null || true
+  resume_id=""
+fi
+
+# Der Weg zurueck steht in der Registry, nicht hier (2026-08-06). Bis heute stand an
+# dieser Stelle eine Textersetzung auf das Wort "claude " — damit konnte genau EIN
+# Harness wiederbelebt werden, und der `resume`-Block der Registry wirkte nur beim
+# ERSTEN Spawn, also dort, wo man ihn am wenigsten braucht.
+#
+# Gelesen wird `resume` des Harness dieses Panes:
+#   args          die Flags, die das Fortsetzen ausloesen
+#   fallbackArgs  was genommen wird, wenn {resumeId} nicht aufloesbar ist
+#   {resumeId}    Platzhalter fuer die Kennung DIESER Unterhaltung (claude)
+# `probe` interessiert hier nicht: dieses Skript IST der Wiederbelebungsfall.
+# Der Wert "revive-only" sagt umgekehrt `wb-state models resolve`, dass beim ersten
+# Spawn nichts angehaengt wird — resolve kennt nur "always" und "session-dir".
+resume_args=""
+resume_why=""
+if [[ -n "$hid" ]]; then
+  hjson="$("$HOME/.local/bin/wb-state" harness get "$hid" 2>/dev/null || true)"
+  if [[ -n "$hjson" && "$hjson" == \{* ]]; then
+    read -r hbase rspec <<<"$(printf '%s' "$hjson" | /usr/bin/python3 -c '
+import json, os, shlex, sys
+h = json.load(sys.stdin)
+res = h.get("resume") or {}
+base = os.path.basename(os.path.expanduser(h.get("command") or ""))
+args = res.get("args") or []
+print(base or "-", shlex.join(str(a) for a in args) if args else "")
+')"
+    resume_args="$rspec"
+    [ "$hbase" = "-" ] && hbase=""
+  fi
+fi
+
+if [[ "$cmd" == *"--continue"* || "$cmd" == *"--resume"* || "$cmd" == *"--restore-chat-history"* ]]; then
+  # Der Startbefehl bringt sein Fortsetzen selbst mit (der eingebaute pi-Weg baut es
+  # sich zur Laufzeit aus seinem Sitzungsordner). Nichts einfuegen, sonst steht es zweimal.
+  newcmd="$cmd"
+  resume_why="der Startbefehl setzt selbst fort"
+elif [[ -z "$resume_args" ]]; then
+  newcmd="$cmd"
+  resume_why="Harness '${hid:-unbekannt}' kennt kein Fortsetzen — der Pane kommt OHNE Unterhaltung zurueck"
+else
+  # {resumeId} aufloesen. Ohne plausible Kennung greift fallbackArgs; gibt es auch das
+  # nicht, wird NICHT geraten — dann kommt der Pane leer zurueck und sagt es.
+  if [[ "$resume_args" == *"{resumeId}"* ]]; then
+    if [[ -n "$resume_id" ]]; then
+      resume_args="${resume_args//\{resumeId\}/$resume_id}"
+    else
+      fb="$(printf '%s' "$hjson" | /usr/bin/python3 -c '
+import json, shlex, sys
+res = (json.load(sys.stdin).get("resume") or {}).get("fallbackArgs") or []
+print(shlex.join(str(a) for a in res) if res else "")
+')"
+      if [[ -n "$fb" ]]; then
+        resume_args="$fb"
+        resume_why="ohne Sitzungskennung, deshalb ${fb}"
+      else
+        resume_args=""
+        resume_why="keine Sitzungskennung und kein Ersatz — der Pane kommt OHNE Unterhaltung zurueck"
+      fi
+    fi
+  fi
+  if [[ -z "$resume_args" ]]; then
+    newcmd="$cmd"
+  else
+    # Zwei Wege, in dieser Reihenfolge:
+    #   1. Der eingebaute Weg — das Programm des Harness steht selbst in der Zeile.
+    #      Dann wird direkt dahinter eingefuegt, an einer Wortgrenze.
+    #   2. Der Registry-Weg — in der Zeile steht `wb-harness-run`, das seine innere
+    #      Befehlszeile selbst baut. Dorthin geht das Fortsetzen als `--resume-args`,
+    #      und der Shim haelt es gegen den `resume`-Block, bevor er es benutzt
+    #      (2026-08-06). Vorher endete dieser Fall damit, dass der Pane leer zurueckkam.
+    newcmd="$(/usr/bin/python3 - "$cmd" "${hbase:-}" "$resume_args" <<'PY'
+import re, shlex, sys
+cmd, base, args = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def einfuegen(anker, text):
+    if not anker:
+        return None
+    m = re.search(r'(?:^|[\s/])' + re.escape(anker) + r'(?=\s)', cmd)
+    if not m:
+        return None
+    return cmd[:m.end()] + " " + text + cmd[m.end():]
+
+neu = einfuegen(base, args)
+if neu is None:
+    neu = einfuegen("wb-harness-run", "--resume-args " + shlex.quote(args))
+if neu is None:
+    sys.exit(1)
+print(neu)
+PY
+)" || newcmd=""
+    if [[ -z "$newcmd" ]]; then
+      newcmd="$cmd"
+      resume_why="weder '${hbase:-?}' noch wb-harness-run stehen in der Startzeile — der Pane kommt OHNE Unterhaltung zurueck"
+    else
+      resume_why="fortgesetzt mit ${resume_args}"
+    fi
+  fi
+fi
+
+# Sperre zuerst, Lebend-Pruefung darin: siehe die Begruendung im Kopf.
+SPERRE=""
+sperre_frei() { [ -n "$SPERRE" ] && rmdir "$SPERRE" 2>/dev/null; SPERRE=""; }
+SPERRE_MAX_S=120   # aelter heisst: der Halter ist gestorben, die Marke wird uebernommen
+respawn_sperre() {
+  local basis sockel schluessel stempel alter
+  sockel="$(tmux display -p '#{socket_path}' 2>/dev/null || true)"
+  basis="$HOME/.local/state/wb-revive-locks"
+  mkdir -p "$basis" 2>/dev/null || return 0
+  # Pane-Ids sind nur je tmux-SERVER eindeutig (%0 gibt es auf jedem frischen Socket).
+  # Ohne den Socket im Schluessel wuerde eine Testsperre eine echte Wiederbelebung
+  # blockieren — derselbe Fehler wie bei der Wachen-Erkennung ueber `pgrep`.
+  schluessel="$basis/$(printf '%s%s' "${sockel:-default}" "$pane" | tr -c 'A-Za-z0-9' '_')"
+  if ! mkdir "$schluessel" 2>/dev/null; then
+    stempel="$(stat -c %Y "$schluessel" 2>/dev/null || stat -f %m "$schluessel" 2>/dev/null || echo 0)"
+    alter=$(( $(date +%s) - stempel ))
+    if [ "$alter" -lt "$SPERRE_MAX_S" ]; then
+      tmux display-message -t "$pane" "wb-revive: eine andere Wiederbelebung laeuft gerade" 2>/dev/null || true
+      echo "wb-revive: fuer $pane laeuft gerade eine andere Wiederbelebung (Sperre ${alter}s alt) — nichts getan."
+      exit 4
+    fi
+    touch "$schluessel" 2>/dev/null || true
+  fi
+  SPERRE="$schluessel"
+  trap sperre_frei EXIT
+}
+
+respawn_sperre
+guard_live
+tmux respawn-pane -k -t "$pane" "$newcmd"
+# Re-assert the CLEAN @wb_cmd so the next revive still has a good source
+# (respawn-pane overwrites pane_start_command with the --continue variant).
+tmux set -p -t "$pane" @wb_cmd "$cmd"
+# Ein Respawn passiert nach Absturz oder tmux-Neustart — genau dann fehlt das
+# dauerhafte `workers`-Fenster, weil es beim Sessionstart angelegt wird und einen
+# Serverneustart nicht ueberlebt. Ohne es hat die Session nur EIN Fenster, und der
+# Worker-Tab zeigt zwangslaeufig den Orchestrator (gemessen 2026-07-29).
+# ($sess already resolved above for the resume-id lookup -- same tmux session.)
+[ -n "$sess" ] && [ -x "$HOME/.local/bin/wb-workers-window" ] \
+  && "$HOME/.local/bin/wb-workers-window" "$sess" >/dev/null 2>&1 || true
+
+# Ein stiller Neuanfang, der aussieht wie eine Wiederbelebung, ist schlechter als ein
+# ehrliches "dieser Harness kann es nicht". Deshalb steht in der Meldung IMMER, was mit
+# der Unterhaltung passiert ist — in der Statuszeile und auf stdout.
+tmux display-message -t "$pane" "wb-revive [${hid:-?}]: ${resume_why}"
+echo "wb-revive: $pane neu gestartet (Harness ${hid:-unbekannt}) — ${resume_why}."

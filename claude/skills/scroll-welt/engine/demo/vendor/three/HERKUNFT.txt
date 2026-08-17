@@ -1,0 +1,3 @@
+three.js 0.185.1, MIT, aus dem npm-Paket "three" (build/three.module.min.js + build/three.core.min.js).
+Lizenz: siehe LICENSE in diesem Ordner. Hier abgelegt statt node_modules, damit die
+Demo ohne Installationsschritt laeuft; die Seite loest "three" ueber eine importmap hierher auf.

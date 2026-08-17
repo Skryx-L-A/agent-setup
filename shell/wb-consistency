@@ -1,0 +1,2140 @@
+#!/usr/bin/env python3
+"""wb-consistency — find contradicting rule-states before they cause damage.
+
+Compares claims that live in more than one place (model effort caps, generated
+routing-table blocks, tool references, skill descriptions vs. standing rules)
+and reports drift. Read-only: never writes anything. Exit 0 = clean, exit 1 =
+at least one finding.
+
+Usage:
+  wb-consistency [--quiet] [--base DIR] [--config FILE]
+
+--base and --config exist so the test fixture can point the whole tool at a
+throwaway directory instead of the real machine state (never test against
+real installed presets — 2026-07-29 rule). WB_CONSISTENCY_MACHINE_ID (env)
+overrides check3's machine-detection for the same reason — see
+current_machine_id().
+"""
+import argparse
+import ast
+import fnmatch
+import glob as globmod
+import hashlib
+import json
+import os
+import platform
+import re
+import sys
+import shutil
+import subprocess
+
+RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
+
+
+def load_config(path, base, repo=None):
+    """{BASE} ist das Heimatverzeichnis, {REPO} der Arbeitsbaum der Werkbank.
+
+    Zwei Platzhalter, weil zwei verschiedene Baeume geprueft werden: die Regel-
+    und Werkzeugdateien liegen unter $HOME (installiert), der QUELLTEXT der
+    Oberflaeche und der Skripte liegt im Repo. Check 6 braucht den Quelltext --
+    ein Schalter ist tot oder lebendig im Code, nicht in der Installation.
+    Beide sind ueber die Kommandozeile umlenkbar, damit ein Test seine eigene
+    Kopie pruefen kann und nie den echten Baum."""
+    with open(path, "r") as f:
+        raw = f.read()
+    raw = raw.replace("{BASE}", base)
+    raw = raw.replace("{REPO}", repo or os.path.expanduser("~/AI/claude-workbench"))
+    return json.loads(raw)
+
+
+MAX_SCAN_BYTES = 2_000_000  # rule/comment files are KB-sized; this excludes compiled binaries/bundles
+
+
+def is_probably_text(path):
+    try:
+        if os.path.getsize(path) > MAX_SCAN_BYTES:
+            return False
+        with open(path, "rb") as f:
+            chunk = f.read(8192)
+        return b"\x00" not in chunk
+    except OSError:
+        return False
+
+
+def expand_globs(patterns, exclude_substrings=()):
+    files = []
+    seen = set()
+    for pat in patterns:
+        for p in globmod.glob(pat, recursive=True):
+            if not os.path.isfile(p):
+                continue
+            if any(ex in p for ex in exclude_substrings):
+                continue
+            if p in seen:
+                continue
+            if not is_probably_text(p):
+                continue
+            seen.add(p)
+            files.append(p)
+    return sorted(files)
+
+
+def read_lines(path):
+    try:
+        with open(path, "r", errors="replace") as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
+
+
+COMMENT_RE = re.compile(r"^(\s*)#+ ?(.*)$")
+
+
+def strip_comment_markers(lines):
+    """Kommentarzeichen aus einer NICHT-Markdown-Datei entfernen, damit der Text
+    darin wie Prosa gelesen werden kann.
+
+    Warum das noetig ist (gemessen 2026-08-06): die Scan-Liste enthaelt
+    `{BASE}/.local/bin/*`, also die installierten Skripte -- und genau dort stehen
+    die meisten Cap-Behauptungen, als Kommentar im Kopf von `claude-worker`. Die
+    Blockbildung hielt jede Zeile, die mit '#' beginnt, fuer eine
+    Markdown-UEBERSCHRIFT und begann bei jeder einen neuen Block. Eine Behauptung,
+    die sich ueber zwei Kommentarzeilen zieht --
+
+        #   fable5   ... Effort cap
+        #            `high` (raised from medium)
+
+    -- zerfiel damit in zwei Bloecke, und der Modellname stand nie im selben Block
+    wie der Wert. Zusaetzlich haette das '#' zwischen 'cap' und '`high`' das Muster
+    gebrochen, das nur Leerraum dazwischen erlaubt. Die Pruefung war also
+    vorhanden und still blind, und zwar ausgerechnet fuer die Dateiart, in der die
+    Werkbank ihre Caps am haeufigsten behauptet.
+
+    Nur fuer Dateien ohne `.md`: in Markdown IST '#' eine Ueberschrift, und die
+    Blockbildung daran ist richtig."""
+    out = []
+    for line in lines:
+        m = COMMENT_RE.match(line)
+        out.append(m.group(1) + m.group(2) if m else line)
+    return out
+
+
+class Finding:
+    def __init__(self, check, file, line, claim, truth, severity="error"):
+        self.check = check
+        self.file = file
+        self.line = line
+        self.claim = claim
+        self.truth = truth
+        self.severity = severity  # "error" (counts toward exit 1), "hint" (informational only,
+        # unresolved ambiguity -- still needs a human read) or "expected" (informational only,
+        # resolved for certain by check3's machine_tool_map -- no ambiguity left)
+
+    def render(self):
+        return f"{self.file}:{self.line}: [{self.check}] behauptet: {self.claim} -- Wahrheit: {self.truth}"
+
+
+# --------------------------------------------------------------------------
+# Check 1 -- model effort caps: registry vs. everywhere else
+# --------------------------------------------------------------------------
+
+# "max" is itself a valid cap value AND the filler word in the phrase "max
+# effort = ..." -- the lookahead keeps that filler from being misread as a
+# claimed value.
+CAP_VALUE = r"(?:low|medium|high|xhigh|max)(?!\s*effort)"
+
+# Each pattern requires the value to sit directly next to an explicit cap
+# keyword/connector -- no loose "somewhere nearby" windows, those produced
+# false positives on prose that merely mentions "Effort-Cap" and "max" in
+# the same sentence without asserting a value for a specific model.
+CAP_CLAIM_PATTERNS = [
+    re.compile(rf"max\s*effort\s*=\s*`?(?P<cap>{CAP_VALUE})`?", re.I),
+    re.compile(rf"\bcap\s*`?(?P<cap>{CAP_VALUE})`?\b", re.I),
+    re.compile(rf"gedeckelt\s+auf\s+`?(?P<cap>{CAP_VALUE})`?", re.I),
+    re.compile(rf"auf\s+`?(?P<cap>{CAP_VALUE})`?\s+gedeckelt", re.I),
+    re.compile(rf"auf\s+`?(?P<cap>{CAP_VALUE})`?\s+angehoben", re.I),
+]
+
+HISTORICAL_PREFIX = re.compile(r"(von|from)\s*$", re.I)
+
+
+def build_model_variants(registry_models, extra_variants):
+    """model_alias -> sorted list of (variant_text) longest first."""
+    variants = {}
+    for m in registry_models:
+        alias = m.get("alias")
+        if not alias:
+            continue
+        vs = {alias}
+        vs.update(extra_variants.get(alias, []))
+        variants[alias] = sorted(vs, key=len, reverse=True)
+    return variants
+
+
+def starts_with_label(line, labels):
+    """Beginnt diese Zeile mit einem Modellnamen als LABEL? (2026-08-06)
+
+    Die Routing-Liste im Kopf von `claude-worker` ist eine Spaltenliste ohne
+    Aufzaehlungszeichen: links der Name, rechts die Prosa, und die Prosa laeuft
+    ueber mehrere Zeilen weiter.
+
+        haiku45:low    mechanical (rename, config tweak, ...)
+        fable5         NEVER without explicit word ... Effort cap
+                       `high` (raised from medium 2026-07-30).
+
+    Ohne diese Erkennung faellt die ganze Liste in EINEN Block, und die
+    Nachbarschaftspruefung paart die Behauptung dann mit dem falschen Modell
+    oder mit gar keinem. Ein Name am Zeilenanfang eroeffnet deshalb einen
+    Eintrag, genau wie ein Aufzaehlungszeichen.
+
+    Ein Label ist AUSGERICHTET: hinter ihm steht die Spaltenluecke (zwei oder
+    mehr Leerzeichen) oder das Zeilenende. Diese Bedingung ist der ganze
+    Unterschied zwischen einem Label und einem Satzanfang -- ohne sie eroeffnete
+    'Fable 5 liegt (1341 zu 1324, Stand 2026-07-29) ...' aus einer
+    Elo-Begruendung einen Eintrag und zerschnitt einen Absatz mitten im Satz
+    (gemessen 2026-08-06 an regeln/orchestrierung.md). Ein Effort-Suffix gehoert
+    zum Label ('haiku45:low'), ein einzelnes Leerzeichen mit Fliesstext dahinter
+    nicht."""
+    for lab in labels:
+        # \s{2,} = Spaltenluecke, $ = Label allein auf der Zeile.
+        if re.match(r"^\s*" + re.escape(lab) + r"(:[A-Za-z]+)?(\s{2,}|$)",
+                    line, re.I):
+            return True
+    return False
+
+
+def iter_bullet_blocks(lines, label_variants=()):
+    """Chunk markdown lines into top-level-bullet blocks (a new block starts
+    at a column-0 '-'/'*' bullet or a heading; continuation/nested lines are
+    folded in). Yields (start_line_1indexed, joined_text).
+
+    `label_variants` (2026-08-06, nur von check1 benutzt) laesst zusaetzlich eine
+    Zeile, die mit einem Modellnamen beginnt, einen Block eroeffnen -- siehe
+    starts_with_label. Ohne das Argument ist das Verhalten unveraendert, der
+    zweite Aufrufer (check4) bleibt also, wie er war."""
+    block_start = None
+    block_lines = []
+
+    def flush():
+        if block_lines:
+            yield_ = (block_start, " ".join(block_lines))
+            return yield_
+        return None
+
+    blocks = []
+    for i, line in enumerate(lines, start=1):
+        # allow indented bullets too (nested lists, e.g. "  - **...**") -- a
+        # column-0-only check let a whole indented section after a routing
+        # table collapse into one giant block and mis-pair unrelated clauses.
+        is_new = (bool(re.match(r"^\s*[-*]\s", line)) or bool(re.match(r"^#", line))
+                  or starts_with_label(line, label_variants))
+        # markdown table rows are DATA (preset/routing tables), not prose claims about
+        # a specific model -- fold them out like a blank line so a claim in one row
+        # can never get paired with a model name from an unrelated row.
+        is_table_row = bool(re.match(r"^\s*\|", line))
+        is_blank = not line.strip() or is_table_row
+        if is_blank:
+            if block_lines:
+                blocks.append((block_start, " ".join(block_lines)))
+            block_start, block_lines = None, []
+            continue
+        if is_new:
+            if block_lines:
+                blocks.append((block_start, " ".join(block_lines)))
+            block_start = i
+            block_lines = [line.strip()]
+        else:
+            if block_start is None:
+                block_start = i
+            block_lines.append(line.strip())
+    if block_lines:
+        blocks.append((block_start, " ".join(block_lines)))
+    return blocks
+
+
+def find_cap_claims_in_block(text):
+    """Return list of (start, end, cap_value), excluding ones that are
+    clearly the OLD value in a 'von X ... angehoben' / 'from X' clause."""
+    claims = []
+    for pat in CAP_CLAIM_PATTERNS:
+        for m in pat.finditer(text):
+            s, e = m.start("cap"), m.end("cap")
+            pre = text[max(0, s - 20):s]
+            if HISTORICAL_PREFIX.search(pre):
+                continue
+            claims.append((s, e, m.group("cap").lower()))
+    claims.sort(key=lambda t: t[0])
+    return claims
+
+
+def find_model_mentions(text, variants_by_alias):
+    """Return list of (start, end, alias) model mentions, using
+    longest-variant priority so a specific variant (e.g. 'ornith-9b') claims
+    its span before a shorter bare variant of a different model
+    (e.g. 'ornith') can."""
+    flat = []
+    for alias, vs in variants_by_alias.items():
+        for v in vs:
+            flat.append((alias, v))
+    flat.sort(key=lambda t: len(t[1]), reverse=True)
+
+    claimed = bytearray(len(text))
+    found = []
+    lower = text.lower()
+    for alias, variant in flat:
+        pat = re.compile(r"(?<![a-z0-9_])" + re.escape(variant.lower()) + r"(?![a-z0-9_])")
+        for m in pat.finditer(lower):
+            s, e = m.start(), m.end()
+            if any(claimed[s:e]):
+                continue
+            claimed[s:e] = b"\x01" * (e - s)
+            found.append((s, e, alias))
+    found.sort(key=lambda t: t[0])
+    return found
+
+
+PROXIMITY_WINDOW = 150
+SENTENCE_BOUNDARY = re.compile(r"[.;]\s")
+
+
+def trim_to_sentence_start(text, hard_start, pos):
+    """Move hard_start forward past the last sentence/clause boundary ('. '
+    or '; ') inside [hard_start, pos), so a model mentioned in an earlier,
+    unrelated sentence can't be pulled into this claim's window just
+    because it fits inside the raw character count."""
+    last_end = None
+    for m in SENTENCE_BOUNDARY.finditer(text, hard_start, pos):
+        last_end = m.end()
+    return last_end if last_end is not None else hard_start
+
+
+def pair_claims_with_models(claims, mentions, text, block_label=None):
+    """For each cap claim, attribute it to the model mention(s) immediately
+    before it (bounded by the previous claim and by the start of the current
+    sentence/clause, so 'fable ... = high; opus5 ... = xhigh' doesn't leak
+    fable into opus5's window, and an unrelated model named in the previous
+    sentence doesn't leak into this one), falling back to mentions
+    immediately after if none precede. A claim with no nearby model mention
+    at all is dropped rather than guessed at."""
+    pairs = []  # (alias, cap_value)
+    for i, (cstart, cend, cap) in enumerate(claims):
+        window_start = max(cstart - PROXIMITY_WINDOW, claims[i - 1][1] if i > 0 else 0)
+        window_start = trim_to_sentence_start(text, window_start, cstart)
+        before = [a for (s, e, a) in mentions if window_start <= s and e <= cstart]
+        if before:
+            for a in before:
+                pairs.append((a, cap))
+            continue
+        next_claim_start = claims[i + 1][0] if i + 1 < len(claims) else cend + PROXIMITY_WINDOW
+        window_end = min(cend + PROXIMITY_WINDOW, next_claim_start)
+        after = [a for (s, e, a) in mentions if cend <= s and e <= window_end]
+        if after:
+            for a in after:
+                pairs.append((a, cap))
+            continue
+        # LETZTER Rueckfall (2026-08-06): steht am ANFANG des Blocks ein Modellname
+        # als Label, ist er der Gegenstand des ganzen Eintrags -- auch ueber
+        # Satzgrenzen hinweg. Die Fenster- und Satzpruefungen oben sind fuer
+        # Fliesstext gebaut und schneiden bei
+        #     fable5   NEVER without explicit word, for any task. Effort cap `high`
+        # genau vor 'Effort cap' ab, wodurch der Name aus dem Fenster faellt und die
+        # Behauptung verworfen wird. In einer Spaltenliste ist das falsch: die Zeile
+        # HANDELT von fable5, ganz gleich wie viele Saetze dazwischenstehen. Nur als
+        # Rueckfall, damit ein naeher stehender Name weiterhin gewinnt.
+        if block_label:
+            pairs.append((block_label, cap))
+    return pairs
+
+
+def check1_model_caps(cfg, base):
+    # Fehlt der Konfigurationsblock, wird diese Pruefung UEBERSPRUNGEN statt
+    # abzustuerzen (2026-08-06). Die neueren Checks halten es schon so, und
+    # eine Teilkonfiguration ist ein legitimer Fall: ein Test richtet genau
+    # eine Pruefung auf sein Spielfeld und laesst die uebrigen weg.
+    c1 = cfg.get("check1_model_caps")
+    if not c1:
+        return []
+    registry_path = c1["registry_path"]
+    findings = []
+    try:
+        with open(registry_path) as f:
+            registry = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        return [Finding("MODELL-CAPS", registry_path, 0,
+                         "Registry lesbar", f"Registry nicht lesbar/kaputt: {e}")]
+
+    models = registry.get("models", [])
+    truth = {m["alias"]: m.get("maxEffort") for m in models if m.get("alias")}
+    variants = build_model_variants(models, c1.get("extra_model_name_variants", {}))
+    # Flache Liste aller Schreibweisen, laengste zuerst -- die Blockbildung fragt
+    # damit, ob eine Zeile mit einem Modellnamen ANFAENGT.
+    alle_varianten = sorted({v for vs in variants.values() for v in vs},
+                            key=len, reverse=True)
+
+    files = expand_globs(c1["scan_globs"], c1.get("exclude_substrings", ()))
+    files = [f for f in files if os.path.abspath(f) != os.path.abspath(registry_path)]
+
+    for path in files:
+        lines = read_lines(path)
+        if not lines:
+            continue
+        if not path.endswith(".md"):
+            lines = strip_comment_markers(lines)
+        for start_line, block_text in iter_bullet_blocks(lines, alle_varianten):
+            mentions = find_model_mentions(block_text, variants)
+            if not mentions:
+                continue
+            claims = find_cap_claims_in_block(block_text)
+            if not claims:
+                continue
+            # Ein Modellname GANZ AM ANFANG des Blocks ist sein Label (Spaltenliste).
+            block_label = next((a for (s, _e, a) in mentions if s == 0), None)
+            for alias, claimed_cap in pair_claims_with_models(claims, mentions,
+                                                              block_text, block_label):
+                real_cap = truth.get(alias)
+                if real_cap is None:
+                    continue
+                if claimed_cap != real_cap:
+                    findings.append(Finding(
+                        "MODELL-CAPS", path, start_line,
+                        f"`{alias}` max effort = `{claimed_cap}`",
+                        f"Registry ({registry_path}) sagt maxEffort=`{real_cap}` fuer {alias}",
+                    ))
+    return findings
+
+
+# --------------------------------------------------------------------------
+# Check 2 -- generated blocks: content/hash drift + double-loaded duplicates
+# --------------------------------------------------------------------------
+
+BLOCK_RE = re.compile(r"<!--\s*([\w:.\-]+):start\s*-->(.*?)<!--\s*\1:end\s*-->", re.S)
+HASH_RE = re.compile(r"SHA-256=([0-9a-fA-F]+)")
+
+
+def normalize_block(text):
+    return "\n".join(line.rstrip() for line in text.strip("\n").splitlines())
+
+
+def file_matches_group(path, group_files):
+    for pat in group_files:
+        if os.path.abspath(path) in (os.path.abspath(p) for p in globmod.glob(pat, recursive=True)):
+            return True
+    return False
+
+
+def check2_generated_blocks(cfg, base):
+    # Fehlt der Konfigurationsblock, wird diese Pruefung UEBERSPRUNGEN statt
+    # abzustuerzen (2026-08-06). Die neueren Checks halten es schon so, und
+    # eine Teilkonfiguration ist ein legitimer Fall: ein Test richtet genau
+    # eine Pruefung auf sein Spielfeld und laesst die uebrigen weg.
+    c2 = cfg.get("check2_generated_blocks")
+    if not c2:
+        return []
+    findings = []
+    files = expand_globs(c2["scan_globs"], c2.get("exclude_substrings", ()))
+
+    # marker -> list of dicts: file, line, content, hash
+    occurrences = {}
+    for path in files:
+        try:
+            with open(path, "r", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for m in BLOCK_RE.finditer(text):
+            marker = m.group(1)
+            block = m.group(2)
+            line = text[:m.start()].count("\n") + 1
+            hm = HASH_RE.search(block)
+            occurrences.setdefault(marker, []).append({
+                "file": path,
+                "line": line,
+                "content": normalize_block(block),
+                "hash": hm.group(1) if hm else None,
+            })
+
+    groups = c2.get("session_load_groups", [])
+
+    for marker, occs in occurrences.items():
+        # Only markers that carry a declared generator hash are meant to be a
+        # byte-identical copy distributed from one source (per spec: "tragen
+        # einen Generator-Hash im Kommentar"). A marker without one (e.g. a
+        # per-file gardener block) is not a synced copy and comparing it
+        # across files would just flag every project's own MOC against
+        # every other project's own MOC.
+        occs = [o for o in occs if o["hash"]]
+        if len(occs) < 2:
+            continue
+        for i in range(len(occs)):
+            for j in range(i + 1, len(occs)):
+                a, b = occs[i], occs[j]
+                if a["file"] == b["file"]:
+                    continue
+                same_content = a["content"] == b["content"]
+                same_hash = a["hash"] == b["hash"]
+                if not (same_content and same_hash):
+                    findings.append(Finding(
+                        "GENERIERTE-BLOECKE", a["file"], a["line"],
+                        f"Block '{marker}' (hash={a['hash']})",
+                        f"weicht ab von {b['file']}:{b['line']} (hash={b['hash']})",
+                    ))
+                if same_content:
+                    for grp in groups:
+                        if file_matches_group(a["file"], grp["files"]) and file_matches_group(b["file"], grp["files"]):
+                            findings.append(Finding(
+                                "GENERIERTE-BLOECKE-DOPPELT", a["file"], a["line"],
+                                f"Block '{marker}' identisch auch in {b['file']}:{b['line']}",
+                                f"beide Dateien laden in derselben Session ({grp['name']}) -- doppelt geladen, doppelt bezahlt",
+                            ))
+    return findings
+
+
+# --------------------------------------------------------------------------
+# Check 3 -- backticked command names that resolve nowhere
+# --------------------------------------------------------------------------
+
+FENCE_RE = re.compile(r"^\s*```")
+INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+COMMAND_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{1,40}$")
+
+
+LABEL_PREFIX_RE = re.compile(r"([A-Za-zäöüÄÖÜ]+)\s*\(?\s*$")
+
+
+def candidate_command(span):
+    span = span.strip()
+    if not span:
+        return None
+    parts = span.split(None, 1)
+    token = parts[0]
+    has_args = len(parts) > 1
+    has_hyphen = "-" in token
+    if not (has_hyphen or has_args):
+        return None
+    if not COMMAND_TOKEN_RE.match(token):
+        return None
+    if token.upper() == token and len(token) > 1:
+        # looks like an ENV VAR (e.g. PROJECT), not a command
+        return None
+    return token
+
+
+def build_search_path(extra_path_dirs):
+    """PATH fuer die which()-Suche unten: die echten Verzeichnisse des
+    Prozesses PLUS die konfigurierten extra_path_dirs vorneweg.
+
+    Befund 2026-08-10: `wb-consistency` laeuft ueber den woechentlichen
+    launchd-Job (siehe hooks/sessionstart-hygiene-status.sh), und launchd
+    startet ohne Login-Shell -- das Standard-PATH dort ist nur
+    /usr/bin:/bin:/usr/sbin:/sbin, ohne /opt/homebrew/bin. `tmux`, `ollama`,
+    `npm`, `uv`, `llama-server`, `llama-bench`, `rsvg-convert` und `pi` liegen
+    aber alle unter /opt/homebrew/bin (Apple Silicon Homebrew) -- 30 der 31
+    gemeldeten VERWEIS-INS-LEERE-Befunde vom selben Tag waren dieser eine
+    fehlende Ordner, nicht 30 verschiedene kaputte Regeldateien. Die Liste
+    kommt aus der Konfiguration (extra_path_dirs), nicht hartkodiert im Code
+    -- gleiches Prinzip wie tool_dirs/skill_dirs/machine_tool_map oben, ein
+    Pruefer haelt seine Ausnahmen extern (2026-08-03 Regel).
+    os.environ["PATH"] wird nur gelesen, nie veraendert -- ein anderer Check
+    in diesem Lauf soll die echte Prozessumgebung nicht anders vorfinden."""
+    real_path = os.environ.get("PATH", "")
+    return os.pathsep.join([d for d in extra_path_dirs if d] + ([real_path] if real_path else []))
+
+
+def tool_exists(name, tool_dirs, skill_dirs, registry_ids, search_path=None):
+    for d in tool_dirs:
+        # hooks are named in prose by their base name ("bash-guard-kill-pattern"),
+        # the file on disk carries a .sh suffix -- try both before giving up.
+        if os.path.isfile(os.path.join(d, name)) or os.path.isfile(os.path.join(d, name + ".sh")):
+            return True
+    for d in skill_dirs:
+        if os.path.isfile(os.path.join(d, name, "SKILL.md")):
+            return True
+    if name in registry_ids:
+        return True
+    return shutil.which(name, path=search_path) is not None
+
+
+def load_registry_identifiers(registry_path):
+    """Model ids/aliases/modelRefs referenced in prose (e.g. `claude-opus-5`)
+    are data identifiers, not filesystem tools -- don't flag them as
+    dangling refs just because they aren't in PATH."""
+    ids = set()
+    try:
+        with open(registry_path) as f:
+            registry = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return ids
+    for m in registry.get("models", []):
+        for key in ("id", "alias", "modelRef"):
+            v = m.get(key)
+            if v:
+                ids.add(v)
+    return ids
+
+
+def label_precedes(line, span_start):
+    """True if the text right before this backtick span looks like a label
+    ('Service `wb-gmail`', 'Dienst `foo`') rather than an invocation --
+    those name an identifier, they don't call a tool."""
+    pre = line[:span_start]
+    m = LABEL_PREFIX_RE.search(pre)
+    return m
+
+
+def current_machine_id(c3):
+    """Which machine is THIS process running on, as one of the ids used in
+    machine_tool_map (config, not code -- 2026-08-03 self-exemption rule).
+    WB_CONSISTENCY_MACHINE_ID overrides for tests, so the test fixture can
+    exercise both directions (this-machine / other-machine) from a single
+    real machine without SSH, without touching peer, and without faking
+    platform.system(). Falls back to "unknown" for any OS not listed in
+    machine_ids_by_os, so an unrecognized machine gets neither branch of the
+    machine-map logic and everything on it still runs through the older
+    marker-heuristic fallback below instead of silently misclassifying."""
+    override = os.environ.get("WB_CONSISTENCY_MACHINE_ID")
+    if override:
+        return override
+    machine_ids_by_os = c3.get("machine_ids_by_os", {})
+    return machine_ids_by_os.get(platform.system(), "unknown")
+
+
+def check3_dangling_refs(cfg, base):
+    # Fehlt der Konfigurationsblock, wird diese Pruefung UEBERSPRUNGEN statt
+    # abzustuerzen (2026-08-06). Die neueren Checks halten es schon so, und
+    # eine Teilkonfiguration ist ein legitimer Fall: ein Test richtet genau
+    # eine Pruefung auf sein Spielfeld und laesst die uebrigen weg.
+    c3 = cfg.get("check3_dangling_refs")
+    if not c3:
+        return []
+    findings = []
+    files = expand_globs(c3["scan_globs"])
+    tool_dirs = list(c3.get("tool_dirs", []))
+    skill_dirs = list(c3.get("skill_dirs", []))
+    registry_ids = load_registry_identifiers(c3["registry_path"]) if c3.get("registry_path") else set()
+    extra_path_dirs = list(c3.get("extra_path_dirs", []))
+    search_path = build_search_path(extra_path_dirs)
+    marker = c3.get("cross_machine_marker", "peer")
+    label_prefixes = {s.lower() for s in c3.get("label_prefixes_exclude", [])}
+    non_commands = {s.lower() for s in c3.get("known_non_commands", [])}
+    # Backticked identifiers that are real and correctly named, but name a
+    # tmux session / Syncthing folder / other non-filesystem thing -- never a
+    # tool to look up, so (unlike machine_tool_map below) they never produce
+    # a finding at all, exactly like known_non_commands above (Befund 2026-08-04:
+    # `wb-orch`, `secrets-sync`, `vault-secrets` were mis-flagged as dangling
+    # tool refs).
+    non_tool_identifiers = {
+        d["name"].lower() for d in c3.get("known_non_tool_identifiers", []) if d.get("name")
+    }
+    # Werkzeuge, die es per Konfiguration wirklich nur auf EINER Maschine gibt
+    # (Befund 2026-08-04: geteilte Regeldateien, aber nicht geteilte
+    # ~/.local/bin-Inhalte). tool_machine: lowercased tool name -> machine id.
+    machine_tool_map = c3.get("machine_tool_map", {})
+    tool_machine = {}
+    for machine_id, tools in machine_tool_map.items():
+        for t in tools:
+            tool_machine[t.lower()] = machine_id
+    current_machine = current_machine_id(c3)
+
+    for path in files:
+        lines = read_lines(path)
+        blocks = iter_bullet_blocks(lines)
+        in_fence = False
+        reported_on_line = set()
+        for lineno, line in enumerate(lines, start=1):
+            if FENCE_RE.match(line):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            if re.match(r"^\s*\|", line):
+                # markdown table row -- data cells (preset ids), not prose
+                continue
+            for m in INLINE_CODE_RE.finditer(line):
+                span = m.group(1)
+                cmd = candidate_command(span)
+                if not cmd:
+                    continue
+                if cmd.lower() in non_commands:
+                    continue
+                if cmd.lower() in non_tool_identifiers:
+                    continue
+                lp = label_precedes(line, m.start())
+                if lp and lp.group(1).lower() in label_prefixes:
+                    continue
+                if tool_exists(cmd, tool_dirs, skill_dirs, registry_ids, search_path=search_path):
+                    continue
+                key = (lineno, cmd)
+                if key in reported_on_line:
+                    continue
+                reported_on_line.add(key)
+
+                assigned_machine = tool_machine.get(cmd.lower())
+                if assigned_machine is not None:
+                    # The config already knows, for certain, which machine this
+                    # tool belongs to -- no need to guess from the word "peer"
+                    # showing up (or not) in the surrounding prose.
+                    if assigned_machine == current_machine:
+                        findings.append(Finding(
+                            "VERWEIS-INS-LEERE", path, lineno,
+                            f"`{cmd}` als aufzurufendes Werkzeug genannt",
+                            f"laut machine_tool_map auf dieser Maschine ('{current_machine}') "
+                            f"erwartet, aber nicht gefunden in {tool_dirs}, {skill_dirs} "
+                            f"oder PATH (inkl. {extra_path_dirs})",
+                            severity="error",
+                        ))
+                    else:
+                        findings.append(Finding(
+                            "VERWEIS-ANDERE-MASCHINE", path, lineno,
+                            f"`{cmd}` als aufzurufendes Werkzeug genannt",
+                            f"laut machine_tool_map nur auf Maschine '{assigned_machine}' erwartet "
+                            f"-- diese Maschine ist '{current_machine}', erwartetes Fehlen, kein Fehler",
+                            severity="expected",
+                        ))
+                    continue
+
+                # Fallback for anything NOT in machine_tool_map: the original
+                # 2026-08-03 heuristic (does the enclosing paragraph mention
+                # "peer" at all?) -- kept as-is, still the only signal for
+                # tool names the map doesn't know about yet.
+                # look at the whole enclosing bullet/paragraph block, not just
+                # this physical line -- prose wraps, and the "auf peer"
+                # mention is often one line up or down from the backticked name.
+                block_text = ""
+                for bstart, btext in blocks:
+                    if bstart <= lineno:
+                        block_text = btext
+                    else:
+                        break
+                hint = marker in block_text or marker in line
+                findings.append(Finding(
+                    "VERWEIS-INS-LEERE" if not hint else "VERWEIS-HINWEIS",
+                    path, lineno,
+                    f"`{cmd}` als aufzurufendes Werkzeug genannt",
+                    f"nicht gefunden in {tool_dirs}, {skill_dirs} oder PATH (inkl. {extra_path_dirs})" + (
+                        f" (Hinweis: Absatz erwaehnt '{marker}' -- evtl. nur auf der anderen Maschine)" if hint else ""
+                    ),
+                    severity="hint" if hint else "error",
+                ))
+    return findings
+
+
+# --------------------------------------------------------------------------
+# Check 4 -- skill descriptions vs. standing rules (conservative scaffold)
+# --------------------------------------------------------------------------
+
+def parse_frontmatter_description(text):
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    if end == -1:
+        return None
+    fm = text[3:end]
+    lines = fm.splitlines()
+    for idx, line in enumerate(lines):
+        m = re.match(r"^description:\s*(.*)$", line)
+        if not m:
+            continue
+        val = m.group(1).strip()
+        if val:
+            return val
+        # block scalar: following indented lines
+        collected = []
+        for cont in lines[idx + 1:]:
+            if re.match(r"^\S", cont):
+                break
+            collected.append(cont.strip())
+        return " ".join(collected)
+    return None
+
+
+def _ollama_bin():
+    """WB_CONSISTENCY_OLLAMA_BIN (env) ueberschreibt den Binaerpfad, damit ein
+    Test-Fixture eine Fake-'ollama' verwenden kann, ohne die echte Installation
+    und den echten Daemon zu beruehren -- gleiches Muster wie
+    WB_CONSISTENCY_MACHINE_ID bei current_machine_id()."""
+    return os.environ.get("WB_CONSISTENCY_OLLAMA_BIN", "ollama")
+
+
+def _ollama_available(timeout_sec):
+    """Einmal pro Lauf: antwortet der ollama-Client ueberhaupt? Kein laufender
+    Daemon oder ein fehlendes Binary heisst: Check 5 kann fuer Ollama-Eintraege
+    nichts Eigenes nachschlagen und faellt konservativ auf die plist zurueck."""
+    bin_path = _ollama_bin()
+    try:
+        r = subprocess.run([bin_path, "list"], capture_output=True, text=True, timeout=timeout_sec)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _ollama_baked_num_ctx(model_id, num_ctx_pattern, timeout_sec):
+    """Liest 'PARAMETER num_ctx N' aus 'ollama show <id> --modelfile'.
+
+    Rueckgabe (known, baked): known=False heisst Tag unbekannt oder der Aufruf
+    ist gescheitert -- der Aufrufer faellt dann auf die plist zurueck. known=True,
+    baked=None heisst: das Tag existiert, traegt aber KEIN eigenes num_ctx --
+    auch dann gilt weiterhin die plist. known=True, baked=N heisst: dieses Tag
+    hat ein eigenes eingebranntes num_ctx, GEGEN DAS wird geprueft, nicht mehr
+    gegen die plist (Anlass 2026-08-15: die -200k/-100k/-41k-Varianten aus dem
+    pictx-Kontextfenster-Auftrag trugen contextWindow-Werte ueber der plist und
+    waren trotzdem korrekt, weil ihr eigenes Ollama-Tag den groesseren Wert
+    tatsaechlich serviert -- Check 5 kannte diesen Unterschied bislang nicht)."""
+    try:
+        r = subprocess.run([_ollama_bin(), "show", model_id, "--modelfile"],
+                            capture_output=True, text=True, timeout=timeout_sec)
+    except Exception:
+        return False, None
+    if r.returncode != 0:
+        return False, None
+    m = re.search(num_ctx_pattern, r.stdout)
+    if not m:
+        return True, None
+    try:
+        return True, int(m.group(1))
+    except ValueError:
+        return True, None
+
+
+def _check_must_not_exceed_provider_aware(cf, pcfg, claim, base_truth, truth_file):
+    """Provider-bewusste Variante von must_not_exceed_files (2026-08-15).
+
+    Ein contextWindow-Wert in einer models.json-artigen Datei gehoert zu GENAU
+    einem Provider-Block (baseUrl) und optional einem Modell-Eintrag (id) --
+    beide stehen in derselben Datei vor dem jeweiligen Wert. Zwei Faelle:
+      * Provider ist nicht Ollama (baseUrl traegt nicht 'ollama_baseurl_marker',
+        z.B. mlx-lokal auf 8080 statt 11434): Check 5 gilt fuer diesen Provider
+        gar nicht -- eigene Konfigurationsdatei fuer ein anderes lokales
+        Backend, keine Ollama-plist-Vorgabe. Ergebnis: ein HINWEIS, keine
+        Abweichung.
+      * Provider ist Ollama: das zugehoerige Tag (id) wird per 'ollama show
+        --modelfile' auf ein eigenes num_ctx geprueft (siehe
+        _ollama_baked_num_ctx). Gefunden -> Vergleich gegen DIESEN Wert.
+        Nicht gefunden/unbekannt/ollama nicht erreichbar -> Vergleich wie
+        bisher gegen die plist, mit einem Hinweis dazu im Meldungstext.
+
+    Die Zustandsverfolgung (current_baseurl/current_id) ist eine einfache
+    Zeilen-Abfolge, kein JSON-Parser: in models.json steht 'baseUrl' immer vor
+    den Modellen eines Providers, und 'id' immer unmittelbar vor 'contextWindow'
+    desselben Modell-Objekts (siehe die Datei selbst) -- das reicht fuer diese
+    eine, bekannte Dateiform, ohne einen JSON-Baum mitzufuehren und dabei die
+    Zeilennummern zu verlieren, die die Meldung braucht. Die Annahme wird
+    seit 2026-08-15 nicht mehr nur geglaubt: ein Tag gilt fuer GENAU EINEN
+    contextWindow-Wert und wird danach verworfen, und Werte ohne eigenes Tag
+    bekommen einen Hinweis, statt stillschweigend unter dem Tag des vorigen
+    Modells geprueft zu werden (Reviewbefunde 15 und 17).
+
+    NICHT BEHANDELT, bewusst (Reviewbefund 18, heute nicht scharf): eine
+    baseUrl wie 'http://peer:11434/v1' traegt den Ollama-Marker, ihr Tag liegt
+    aber auf der ANDEREN Maschine. 'ollama show' scheitert dann lokal, der Lauf
+    meldet 'Tag unbekannt' und vergleicht gegen die LOKALE plist -- beides sagt
+    nichts ueber das entfernte Ziel aus. Solange die geprueften Dateien auf
+    localhost zeigen, kann der Fall nicht eintreten; wer hier einmal einen
+    entfernten Ollama-Endpunkt eintraegt, muss den Host aus der baseUrl
+    mitnehmen (OLLAMA_HOST fuer den show-Aufruf) oder den Wert ueberspringen.
+    Ein stiller Vergleich gegen die eigene plist waere in dem Fall die falsche
+    Antwort."""
+    findings = []
+    try:
+        with open(cf, "r", errors="replace") as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return findings
+
+    baseurl_re = re.compile(pcfg["baseurl_pattern"])
+    id_re = re.compile(pcfg["id_pattern"])
+    value_re = re.compile(claim["must_not_exceed_pattern"])
+    marker = pcfg["ollama_baseurl_marker"]
+    num_ctx_pattern = pcfg["num_ctx_pattern"]
+    timeout_sec = pcfg.get("show_timeout_sec", 10)
+
+    # Die Wahrheit EINMAL umwandeln, statt an drei Stellen blank `int()` zu
+    # rufen (Reviewbefund 16 vom 15.08.): faengt `truth_pattern` einmal etwas
+    # Nichtnumerisches, brach damit der ganze wb-consistency-Lauf ab, statt --
+    # wie im alten Pfad -- diese eine Behauptung auszulassen.
+    try:
+        truth_num = int(base_truth)
+    except (TypeError, ValueError):
+        return findings
+
+    ollama_ok = None
+    show_cache = {}
+    current_baseurl = None
+    current_id = None
+    # Gesammelt statt je Zeile gemeldet (Reviewbefund 17): ein Hinweis je
+    # contextWindow-Zeile skaliert mit der Modellzahl und uebertoent den Rest
+    # des Laufs. Schluessel ist die Basis-URL (None = noch keine gesehen).
+    nicht_ollama = {}
+    ohne_tag = []
+
+    for i, line in enumerate(lines, 1):
+        m = baseurl_re.search(line)
+        if m:
+            current_baseurl = m.group(1)
+            current_id = None
+            continue
+        m = id_re.search(line)
+        if m:
+            current_id = m.group(1)
+            continue
+        m = value_re.search(line)
+        if not m:
+            continue
+        try:
+            claimed = int(m.group(1))
+        except ValueError:
+            continue
+        # Das Tag gilt fuer GENAU DIESEN Wert. Ohne dieses Zuruecksetzen truege
+        # ein contextWindow ohne eigenes vorangehendes `id` das Tag des VORIGEN
+        # Modells -- und die Pruefung liefe gegen ein fremdes eingebranntes
+        # num_ctx, ohne dass irgendwo ein Fehler erschiene (Reviewbefund 15).
+        tag = current_id
+        current_id = None
+
+        if current_baseurl is None or marker not in current_baseurl:
+            nicht_ollama.setdefault(current_baseurl, []).append((i, claimed, tag))
+            continue
+
+        if ollama_ok is None:
+            ollama_ok = _ollama_available(timeout_sec)
+        if not ollama_ok:
+            if claimed > truth_num:
+                wer = f" (Tag `{tag}`)" if tag else ""
+                findings.append(Finding(
+                    "KONFIG-BEHAUPTUNG", cf, i,
+                    f"{claim['id']}: Wert `{claimed}`{wer} ueberschreitet das Servierte",
+                    f"{truth_file} serviert `{base_truth}` -- ollama nicht "
+                    f"erreichbar, konservativ gegen die plist geprueft",
+                ))
+            continue
+
+        if not tag:
+            # Ohne Tag laesst sich das eingebrannte num_ctx nicht abfragen. Die
+            # Pruefung gegen die plist bleibt (sie ist die konservative Seite),
+            # aber dass hier gar nicht je Modell geurteilt wurde, wird gesagt --
+            # gesammelt, nicht je Zeile (Reviewbefund 15/17).
+            ohne_tag.append((i, claimed))
+            known, baked = False, None
+        else:
+            if tag not in show_cache:
+                show_cache[tag] = _ollama_baked_num_ctx(tag, num_ctx_pattern, timeout_sec)
+            known, baked = show_cache[tag]
+
+        if not known:
+            if claimed > truth_num:
+                grund = (f"Tag `{tag}` bei 'ollama show' unbekannt" if tag
+                         else "kein Modell-Tag zu diesem Wert gefunden")
+                findings.append(Finding(
+                    "KONFIG-BEHAUPTUNG", cf, i,
+                    f"{claim['id']}: Wert `{claimed}` ueberschreitet das Servierte",
+                    f"{truth_file} serviert `{base_truth}` -- {grund}, "
+                    f"konservativ gegen die plist geprueft",
+                ))
+            continue
+
+        if baked is None:
+            if claimed > truth_num:
+                findings.append(Finding(
+                    "KONFIG-BEHAUPTUNG", cf, i,
+                    f"{claim['id']}: Wert `{claimed}` ueberschreitet das Servierte",
+                    f"{truth_file} serviert `{base_truth}` -- Tag `{tag}` "
+                    f"traegt kein eigenes num_ctx, geprueft gegen die plist",
+                ))
+            continue
+
+        if claimed > baked:
+            findings.append(Finding(
+                "KONFIG-BEHAUPTUNG", cf, i,
+                f"{claim['id']}: Wert `{claimed}` ueberschreitet das Servierte",
+                f"Tag `{tag}` hat eingebranntes `PARAMETER num_ctx {baked}` "
+                f"(ollama show {tag} --modelfile) -- stille Trunkierung droht",
+            ))
+
+    # Die gesammelten Hinweise, je Provider einer statt einer je Zeile.
+    for basis, treffer in nicht_ollama.items():
+        zeilen = ", ".join(str(z) for z, _, _ in treffer)
+        if basis is None:
+            grund = ("vor diesen Werten steht in der Datei noch keine Basis-URL -- "
+                     "ohne Provider laesst sich Check 5 nicht zuordnen")
+            wo = "ohne vorangehende Basis-URL"
+        else:
+            grund = ("Check 5 gilt nur fuer Ollama-Provider -- kein Ollama-Ziel, "
+                     "keine Pruefung gegen die plist")
+            wo = f"Provider `{basis}` (ohne '{marker}')"
+        findings.append(Finding(
+            "KONFIG-BEHAUPTUNG", cf, treffer[0][0],
+            f"{claim['id']}: {len(treffer)} contextWindow-Werte {wo}, Zeilen {zeilen}",
+            grund,
+            severity="hint",
+        ))
+    if ohne_tag:
+        zeilen = ", ".join(str(z) for z, _ in ohne_tag)
+        findings.append(Finding(
+            "KONFIG-BEHAUPTUNG", cf, ohne_tag[0][0],
+            f"{claim['id']}: {len(ohne_tag)} contextWindow-Werte ohne zugehoeriges Modell-Tag, "
+            f"Zeilen {zeilen}",
+            "ohne `id` vor dem Wert laesst sich kein 'ollama show' fragen -- "
+            "konservativ gegen die plist geprueft",
+            severity="hint",
+        ))
+    return findings
+
+
+def check5_config_claims(cfg, base):
+    """Regeltext behauptet einen Konfigurationswert -- stimmt er mit der Konfiguration?
+
+    Anlass (2026-08-03): Die Regel nannte OLLAMA_CONTEXT_LENGTH=131072 und verlangte, dass
+    pi's contextWindow darunter bleibt. Die plist stand seit dem 2026-07-19 auf 65536, acht
+    pi-Modelle waren auf 131072 deklariert. Ein Worker lief damit in stille Trunkierung --
+    zwei Wochen lang, ohne dass irgendwo ein Fehler erschien. Check 1 sah das nicht, weil er
+    nur Modell-Caps aus der Registry prueft.
+
+    Jede Behauptung steht in der externen Konfiguration (kein Hardcoding hier), mit: wo der
+    WAHRE Wert steht (Datei + Muster), wo er BEHAUPTET wird (Dateien + Muster) und optional
+    Dateien, deren Werte den wahren Wert nicht ueberschreiten duerfen.
+
+    Erweitert 2026-08-15: ein must_not_exceed_files-Eintrag kann statt eines blossen
+    Pfads ein Objekt mit 'file' + 'provider_aware' sein (siehe
+    _check_must_not_exceed_provider_aware) -- dann gilt die Pruefung nicht mehr pauschal
+    gegen die plist, sondern je Provider/Modell-Tag. Ein blosser String bleibt exakt das
+    alte Verhalten, unveraendert.
+    """
+    c5 = cfg.get("check5_config_claims")
+    if not c5:
+        return []
+    findings = []
+    for claim in c5.get("claims", []):
+        truth = None
+        try:
+            with open(claim["truth_file"], "r", errors="replace") as f:
+                m = re.search(claim["truth_pattern"], f.read())
+                if m:
+                    truth = m.group(1)
+        except OSError:
+            continue
+        if truth is None:
+            continue
+        for cf in claim.get("claim_files", []):
+            try:
+                with open(cf, "r", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for i, line in enumerate(text.split("\n"), 1):
+                m = re.search(claim["claim_pattern"], line)
+                if m and m.group(1) != truth:
+                    findings.append(Finding(
+                        "KONFIG-BEHAUPTUNG", cf, i,
+                        f"{claim['id']}: behauptet `{m.group(1)}`",
+                        f"{claim['truth_file']} sagt `{truth}`",
+                    ))
+        # Werte, die den wahren Wert nicht ueberschreiten duerfen
+        for lf in claim.get("must_not_exceed_files", []):
+            if isinstance(lf, dict):
+                pcfg = lf.get("provider_aware")
+                cf = lf.get("file")
+                if pcfg and cf:
+                    findings.extend(_check_must_not_exceed_provider_aware(
+                        cf, pcfg, claim, truth, claim["truth_file"]))
+                    continue
+                lf = cf  # Objekt ohne provider_aware -- 'file' traegt den blossen Pfad
+                if not lf:
+                    continue
+            try:
+                with open(lf, "r", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for i, line in enumerate(text.split("\n"), 1):
+                m = re.search(claim["must_not_exceed_pattern"], line)
+                if not m:
+                    continue
+                try:
+                    if int(m.group(1)) > int(truth):
+                        findings.append(Finding(
+                            "KONFIG-BEHAUPTUNG", lf, i,
+                            f"{claim['id']}: Wert `{m.group(1)}` ueberschreitet das Servierte",
+                            f"{claim['truth_file']} serviert `{truth}` -- "
+                            f"stille Trunkierung droht",
+                        ))
+                except ValueError:
+                    continue
+    return findings
+
+
+# --------------------------------------------------------------------------
+# Check 6 -- Einstellungs-Schalter: schreibt jemand, liest jemand, passt es?
+# --------------------------------------------------------------------------
+# Anlass (2026-08-06): Ein Reviewer fand in zwei Durchgaengen sieben tote oder
+# halbtote Schalter, immer nach demselben Muster -- das Menue schrieb einen
+# Schluessel, gelesen wurde ein anderer. `guardsDisabled` gegen `guards`:
+# vier Guard-Schalter taten nichts, und ein wirklich abgeschalteter Guard
+# erschien im Menue als "an". `contextGuardWatchOrchestrator` dasselbe.
+# `workerSkipPermissions`: ein Mensch nahm den Workern die Autonomie, und
+# pi-worker setzte das Flag weiter unbedingt.
+#
+# KEINER davon faellt in einem Test auf, und das ist die eigentliche Lehre. Jede
+# Seite ist fuer sich getestet: die eine prueft, dass geschrieben wird, die
+# andere, dass gelesen wird. Sie treffen sich nirgends. Gefunden wurden alle
+# sieben von Menschen, die drei Stellen von Hand verglichen haben.
+#
+# DIE SCHWIERIGE FRAGE IST "wer LIEST den Wert". Ein grep nach dem Namen findet
+# auch die Vorgabentabelle, die Kommentare und das Menue selbst -- dann sieht
+# jeder Schluessel benutzt aus und die Pruefung meldet nie etwas. Genau daran war
+# die Cap-Pruefung (Check 1) still gescheitert. Deshalb bekommt hier jede Datei
+# eine ROLLE, und die Rolle entscheidet, was ein Fund bedeutet:
+#
+#   MENUE   app/src/einstellungen/, extension/src/settings*.ts
+#           Schreibt und ZEIGT an. Ein Fund hier ist nie ein Leser -- das Menue
+#           liest den Wert nur, um das Feld zu fuellen. Wuerde das als Benutzung
+#           zaehlen, waere jeder tote Schalter automatisch lebendig.
+#   SPEICHER shell/wb-state
+#           Die DEFAULTS-Tabelle und die Pruef-Tabellen sind die DEKLARATION des
+#           Schluessels, keine Benutzung. Alles andere in der Datei ist Code, der
+#           mit dem Wert etwas tut.
+#   REST    alles uebrige in shell/, hooks/, app/src/, extension/src/
+#           Ein Fund ist ein Leser.
+#
+# Das ist keine Ausnahmeliste, sondern eine Rollenzuweisung: eine Ausnahmeliste
+# wuerde einzelne Schluessel von der Pruefung befreien, hier bekommt jede DATEI
+# eine Bedeutung, und jeder Schluessel laeuft durch dieselbe Regel.
+#
+# INDIREKTE Zugriffe kommen ueber zwei zusaetzliche Wege mit:
+#   * `settings get "$VAR"` / `settings set "$VAR"` mit einer Variablen -- dann
+#     zaehlen die Zuweisungen `VAR=<schluessel>` derselben Datei. So findet die
+#     Pruefung, dass `wb-state effort-cap set` den Schluessel `effortCaps`
+#     schreibt, obwohl der Name nie neben `settings set` steht.
+#   * ein blosses Vorkommen des Namens im REST -- `context-guard` liest
+#     `guardWorkerWarnPct` ueber eine Hilfsfunktion, der Name steht nur an der
+#     Aufrufstelle. Das ist grob, aber gefahrlos: das Universum besteht
+#     ausschliesslich aus Schluesseln, die irgendwo deklariert oder angeboten
+#     werden, und diese Namen kollidieren mit nichts.
+#
+# Datendateien (.json, .md, plist, Bilder) werden NICHT nach Lesern durchsucht.
+# Ein Name in einer Datei, die niemand ausfuehrt, ist eine Erwaehnung.
+
+# Rollen-Zuordnung. Bewusst als Glob-Muster in der Konfiguration und nicht hier
+# fest verdrahtet -- wer das Menue verschiebt, aendert eine Zeile in der Konfig.
+def _rolle(path, c6):
+    # Die Rolle haengt am Pfad IM ARBEITSBAUM, nicht am Heimatverzeichnis. Mit
+    # $HOME als Bezug lautete der relative Pfad
+    # '.pi-workers/worktrees/effort/app/src/einstellungen/...', kein menu_glob
+    # traf, und damit galt das Menue als LESER -- die Pruefung meldete 0 Befunde
+    # und sah dabei aus wie eine bestandene Pruefung. Genau die Sorte stiller
+    # Blindheit, gegen die sie gebaut ist (gemessen 2026-08-06).
+    rel = os.path.relpath(path, c6["repo_dir"])
+    for pat in c6.get("menu_globs", []):
+        if fnmatch.fnmatch(rel, pat):
+            return "menue"
+    if os.path.abspath(path) == os.path.abspath(c6["store_file"]):
+        return "speicher"
+    return "rest"
+
+
+CODE_SUFFIXE = (".ts", ".js", ".py", ".sh", "")     # "" = Skript ohne Endung
+
+
+def _ist_code(path):
+    _, ext = os.path.splitext(path)
+    return ext in CODE_SUFFIXE
+
+
+def _store_deklaration_spans(text):
+    """Zeilenbereiche in wb-state, die den Schluessel nur DEKLARIEREN."""
+    spans = []
+    m = re.search(r"^DEFAULTS = \{.*?^\}", text, re.S | re.M)
+    if m:
+        spans.append(m.span())
+    # Die Pruef-Tabellen (NUM/ENUM/BOOL/LIST/OBJ) nennen jeden Schluessel, den
+    # sie typisieren -- ebenfalls Deklaration.
+    for tm in re.finditer(r"^\s*(?:NUM|ENUM|BOOL|LIST|OBJ)\s*=\s*[\({\[].*?[\)}\]]\s*$",
+                          text, re.S | re.M):
+        spans.append(tm.span())
+    return spans
+
+
+def _in_span(pos, spans):
+    return any(a <= pos <= b for a, b in spans)
+
+
+def check6_settings_switches(cfg, base):
+    c6 = cfg.get("check6_settings_switches")
+    if not c6:
+        return []
+    store = c6["store_file"]
+    try:
+        store_text = open(store, errors="replace").read()
+    except OSError as e:
+        return [Finding("SCHALTER", store, 0, "Speicherdatei lesbar",
+                        f"{store} nicht lesbar: {e}")]
+
+    dateien = expand_globs(c6["scan_globs"], c6.get("exclude_substrings", ()))
+    dateien = [p for p in dateien if _ist_code(p)]
+
+    # ── Universum: was ueberhaupt ein Einstellungs-Schluessel IST ────────────
+    # Nur deklarierte oder angebotene Namen. Ohne diese Schranke faengt die
+    # Lesersuche jedes `settings.foo` und jedes `cfg.get("bar")` im ganzen Baum
+    # ein, und die Pruefung ertrinkt in Feldern, die mit den Einstellungen nichts
+    # zu tun haben (gemessen: 15 solcher Treffer, darunter `json`, `render`, `ts`).
+    universum, schreiber = set(), {}
+
+    def merke_schreiber(key, path, pos, text):
+        schreiber.setdefault(key, []).append(
+            (os.path.relpath(path, c6["repo_dir"]), text[:pos].count("\n") + 1))
+
+    m = re.search(r"^DEFAULTS = \{(.*?)^\}", store_text, re.S | re.M)
+    if m:
+        universum |= set(re.findall(r'^\s{4}"([A-Za-z][A-Za-z0-9_]*)":', m.group(1), re.M))
+    store_spans = _store_deklaration_spans(store_text)
+
+    # Ein `settings set <schluessel>` IM MENUE ist kein Programmaufruf, sondern
+    # ein dokumentierter Weg fuer den Menschen -- das Feld `logPaths` etwa steht
+    # dort als "Nur Anzeige. Aendern: wb-state settings set logPaths '[…]'".
+    # Das zaehlt trotzdem als Schreiber, und zwar mit Absicht: gemeint ist
+    # "irgendwo wird dieser Schluessel angeboten", und ein im Menue genannter
+    # Befehl ist ein Angebot. Ohne diese Lesart meldete die Pruefung jedes
+    # bewusst nur-per-CLI gepflegte Feld als Mangel, und wer sie dreimal
+    # unberechtigt sieht, schaltet sie ab.
+    SET_MUSTER = [re.compile(p) for p in c6["write_patterns"]]
+    GET_MUSTER = [re.compile(p) for p in c6["read_patterns"]]
+    # Der Schluessel steht nicht immer als Literal neben `settings set`. Zwei
+    # Formen kommen in dieser Werkbank wirklich vor:
+    #   shell   `"$0" settings set "$SKEY" …`   mit `SKEY=effortCaps` weiter oben
+    #   python  `subprocess.run([SELF, "settings", "set", KEY, …])` mit
+    #           `KEY = {"guard": "guards", …}[CMD]`
+    # Beide Male traegt eine VARIABLE den Namen. Ohne diese zwei Muster meldete
+    # die Pruefung `effortCaps`, `guards` und `kontextwache` als "unsichtbar
+    # verstellbar", obwohl `wb-state guard set …` genau dafuer da ist -- drei
+    # Fehlmeldungen, gemessen beim ersten Lauf.
+    VAR_SET = re.compile(r"settings\s+set\s+\"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?\"?")
+    VAR_GET = re.compile(r"settings\s+get\s+\"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?\"?")
+    ARGV_SET = re.compile(r"[\"']settings[\"']\s*,\s*[\"']set[\"']\s*,\s*([A-Za-z_][A-Za-z0-9_]*)")
+    ARGV_GET = re.compile(r"[\"']settings[\"']\s*,\s*[\"']get[\"']\s*,\s*([A-Za-z_][A-Za-z0-9_]*)")
+
+    def zuweisungen(text, var):
+        """Alle Namen, die dieser Variablen zugewiesen werden -- als blosses Wort
+        (shell) oder als Zeichenkette (python), jeweils auf der Zuweisungszeile.
+        Eine Zuweisung ueber mehrere Zeilen erfasst das nicht; kommt sie vor, ist
+        der Schluessel wieder unsichtbar und die Pruefung meldet ihn -- lieber so
+        herum als eine stille Luecke."""
+        for am in re.finditer(r"(?<![A-Za-z0-9_])" + re.escape(var) + r"\s*=\s*([^\n]*)", text):
+            zeile = am.group(1)
+            for lit in re.findall(r"[\"']([A-Za-z][A-Za-z0-9_]*)[\"']", zeile):
+                yield lit, am.start()
+            # Blosses Wort, wie es in einer case-Verzweigung steht:
+            #     effort-cap) SKEY=effortCaps ;;
+            # Der Abschluss darf `;;`, ein Kommentar oder das Zeilenende sein --
+            # ohne diese Endungen blieb `SKEY=effortCaps ;;` unerkannt, und der
+            # Schluessel galt als unsichtbar verstellbar, obwohl `wb-state
+            # effort-cap set` genau dafuer da ist.
+            bw = re.match(r"([A-Za-z][A-Za-z0-9_]*)\s*(?:;;|;|&&|\|\||#|$)", zeile.strip())
+            if bw:
+                yield bw.group(1), am.start()
+
+    var_leser = {}
+    for p in dateien:
+        try:
+            text = open(p, errors="replace").read()
+        except OSError:
+            continue
+        for pat in SET_MUSTER:
+            for mm in pat.finditer(text):
+                universum.add(mm.group(1))
+                merke_schreiber(mm.group(1), p, mm.start(), text)
+        # Im MENUE zaehlt jeder bekannte Schluessel als angeboten, egal durch
+        # welche Hilfsfunktion er dorthin kommt (2026-08-06, zweite Messung).
+        # Die Muster oben kennen `setze('x')` und `set('x')`; das Menue im
+        # Hauptzweig reicht den Schluessel inzwischen an Wrapper weiter --
+        # `stufenwahl(g1, 'orchestratorEffort', …)`, `chipListe(…,
+        # 'secretExcludePatterns', …)`. Gegen den Stand dort meldete die
+        # Pruefung deshalb drei Schluessel als unsichtbar, die in Wahrheit
+        # mitten im Menue stehen. Jedem neuen Wrapper hinterherzupflegen ist
+        # genau die Bruechigkeit, die den urspruenglichen Fehler unsichtbar
+        # gemacht hat.
+        #
+        # Diese Regel kann nur SCHREIBER hinzufuegen. Ein toter Schalter
+        # (Schreiber ohne Leser) bleibt davon unberuehrt -- gefunden wird er
+        # ueber die fehlenden LESER, und daran aendert ein zusaetzlicher
+        # Schreiber nichts. Weicher wird allein die Kategorie "unsichtbar
+        # verstellbar", und das ist die richtige Richtung: lieber eine Meldung
+        # zu wenig ueber ein Feld, das im Menue steht, als drei zu viel.
+        if _rolle(p, c6) == "menue":
+            for k in list(universum):
+                mm = re.search(r"[\"'`]" + re.escape(k) + r"[\"'`]", text)
+                if mm:
+                    merke_schreiber(k, p, mm.start(), text)
+        # Indirekt: der Schluessel reist in einer Variablen.
+        for var in set(VAR_SET.findall(text)) | set(ARGV_SET.findall(text)):
+            for key, pos in zuweisungen(text, var):
+                universum.add(key)
+                merke_schreiber(key, p, pos, text)
+        for var in set(VAR_GET.findall(text)) | set(ARGV_GET.findall(text)):
+            for key, pos in zuweisungen(text, var):
+                var_leser.setdefault(key, []).append(
+                    (os.path.relpath(p, c6["repo_dir"]), text[:pos].count("\n") + 1))
+
+    # ── Leser ───────────────────────────────────────────────────────────────
+    leser = dict(var_leser)
+    for p in dateien:
+        rolle = _rolle(p, c6)
+        if rolle == "menue":
+            continue                       # schreibt und zeigt an, benutzt nicht
+        try:
+            text = open(p, errors="replace").read()
+        except OSError:
+            continue
+        rel = os.path.relpath(p, c6["repo_dir"])
+        for k in universum:
+            for mm in re.finditer(r"(?<![A-Za-z0-9_])" + re.escape(k)
+                                  + r"(?![A-Za-z0-9_])", text):
+                if rolle == "speicher" and _in_span(mm.start(), store_spans):
+                    continue               # Deklaration, keine Benutzung
+                leser.setdefault(k, []).append((rel, text[:mm.start()].count("\n") + 1))
+                break                      # eine Fundstelle je Datei genuegt
+        # Zusaetzlich die ausdruecklichen Lese-Idiome, auch im Speicher.
+        for pat in GET_MUSTER:
+            for mm in pat.finditer(text):
+                if mm.group(1) in universum:
+                    leser.setdefault(mm.group(1), []).append(
+                        (rel, text[:mm.start()].count("\n") + 1))
+
+    def baeume(eintraege):
+        return sorted({e[0].split("/")[0] for e in eintraege})
+
+    findings = []
+    for k in sorted(universum):
+        s, l = schreiber.get(k, []), leser.get(k, [])
+        if s and not l:
+            ort, zeile = s[0]
+            findings.append(Finding(
+                "TOTER-SCHALTER", ort, zeile,
+                f"`{k}` wird geschrieben",
+                "niemand liest ihn -- der Schalter tut nichts. Entweder anschliessen "
+                "oder aus der Oberflaeche nehmen."))
+        elif l and not s:
+            ort, zeile = l[0]
+            findings.append(Finding(
+                "UNSICHTBAR-VERSTELLBAR", ort, zeile,
+                f"`{k}` wird gelesen und wirkt",
+                "kein Menue und kein Werkzeug schreibt ihn -- er laesst sich nur von "
+                "Hand in der Datei aendern."))
+        elif s and l:
+            sb, lb = baeume(s), baeume(l)
+            # Der Fall aus dem Befund: das Menue des NEUEN Programms schreibt,
+            # gelesen wird nur in der alten VS-Code-Erweiterung. Zwei getrennte
+            # Programme; wer den Haken in app/ setzt, aendert nichts an app/.
+            if "app" in sb and lb == ["extension"]:
+                ort, zeile = s[0]
+                findings.append(Finding(
+                    "SCHALTER-GETRENNT", ort, zeile,
+                    f"`{k}` wird im Menue von app/ geschrieben",
+                    "gelesen wird er ausschliesslich in extension/ -- zwei getrennte "
+                    "Programme. Im laufenden Programm bewirkt der Haken nichts."))
+    return findings
+
+
+# --------------------------------------------------------------------------
+# Check 7 -- auseinandergelaufene Kopien
+# --------------------------------------------------------------------------
+# Anlass (2026-08-06): Der Gesamtlauf brauchte vier Anlaeufe bis 76/76, und drei
+# der vier Ursachen waren dieselbe Klasse -- EINE SACHE LIEGT AN ZWEI ORTEN, eine
+# Seite wird gepflegt, die andere ist die wirksame, und beide sind fuer sich
+# gruen:
+#   * dem eingebauten claude-Adapter im Code fehlte der `resume`-Block; die echte
+#     Registry hatte ihn, jede Suite mit eigener Registry nicht.
+#   * die Musterliste war umgezogen, der Zeiger blieb stehen.
+#   * `run-all.sh` faehrt `~/.claude/hooks/tests/`, gepflegt wurde das Repo.
+# Dieselbe Klasse wie die sieben toten Schalter aus Check 6, eine Ebene hoeher.
+#
+# Drei Sorten, jede mit einer Regel, die aus der SACHE folgt statt aus einer Liste:
+#
+#   A INSTALLIERT GEGEN REPO. Was in `shell/` liegt, gehoert nach `~/.local/bin`;
+#     was in `hooks/` liegt, nach `~/.claude/hooks` (mit Unterverzeichnissen).
+#     WELCHE Dateien verglichen werden, sagt nicht eine Liste, sondern der
+#     Zielort: verglichen wird, was dort SCHON LIEGT. Damit traegt sich die
+#     Pruefung selbst fort -- eine neue Datei faellt beim ersten Ausrollen in die
+#     Menge und bleibt drin. Eine Datei, die nur im Repo lebt, wird gemeldet, bis
+#     sie den Grund dafuer SELBST traegt (Zeile `NICHT INSTALLIERT: <warum>` in
+#     ihrem Kopf) -- die Begruendung gehoert an die Datei, nicht in eine
+#     Ausnahmeliste im Pruefwerkzeug.
+#
+#   B WERKZEUG-AUSSAGEN. `shell/models.default.json` (Auslieferung), die echte
+#     `models.json` (gepflegt) und die eingebauten Adapter im Code von `wb-state`
+#     duerfen sich in den MODELLEN unterscheiden -- die echte traegt 86, die
+#     Vorlage 15. Was sie nicht duerfen, sind die Aussagen ueber ein WERKZEUG:
+#     wie es Effort annimmt, woran man erkennt, dass es bereit ist, wie es
+#     fortsetzt. Diese Felder sind gemessene Tatsachen, und eine Tatsache hat
+#     keine zwei Fassungen.
+#
+#   C BEWUSSTE DOPPELUNGEN OHNE PARITAETSTEST. Das Haus meldet gewollte Kopien
+#     im Text an, in einer festen Wendung, die auf die jeweils andere Stelle
+#     zeigt und zusagt, beide gleichzuhalten. Genau diese Anmeldung ist die
+#     Regel: wer sie schreibt, verspricht etwas, und ein Versprechen braucht
+#     einen Test. Gemeldet wird der angemeldete Bezeichner, den KEIN Test nennt.
+#
+#     DIE WENDUNG SELBST STEHT NICHT HIER, sondern in der Konfiguration
+#     (`marker_patterns`). Sie stand bis zum 2026-08-06 als Regex im Quelltext,
+#     und der Kommentar darueber erklaerte sie, indem er sie WOERTLICH zitierte
+#     -- damit passte der Erkenner auf seine eigene Beschreibung und meldete
+#     diese Datei. Das ist die Hausregel, die in den Koepfen der Suiten steht:
+#     ein Erkenner darf nicht auf seine eigene Beschreibung passen. Der Ausweg
+#     ist derselbe wie bei den Secret-Mustern -- was ein Erkenner SUCHT, gehoert
+#     in eine externe Konfiguration, nicht in seinen Quelltext. Eine Ausnahme
+#     fuer die eigene Datei waere der falsche Weg gewesen: ein Filter nimmt sich
+#     nie selbst von seiner Pruefung aus.
+#
+#     Aus demselben Grund werden nur CODE-Dateien nach Anmeldungen durchsucht.
+#     Eine Datendatei (.json) traegt keine Doppelung einer Implementierung, wohl
+#     aber -- als Konfiguration eines Erkenners -- dessen Vokabular. Das gilt
+#     fuer jede Datendatei gleich und ist keine Regel ueber eine bestimmte.
+
+NICHT_INSTALLIERT_RE = re.compile(r"NICHT[ _-]INSTALLIERT\s*:\s*(\S.*)")
+NICHT_VERSIONIERT_RE = re.compile(r"NICHT[ _-]VERSIONIERT\s*:\s*(\S.*)")
+
+
+def _installationsziel(rel, c7):
+    """Wohin diese Repo-Datei gehoert, oder None. Aus dem VERZEICHNIS abgeleitet,
+    nicht aus einer Paarliste -- eine Paarliste veraltet, ein Verzeichnis nicht."""
+    for prefix, ziel in c7["install_map"]:
+        if rel.startswith(prefix):
+            return os.path.join(ziel, rel[len(prefix):])
+    return None
+
+
+def _installiert_richtung(repo_datei, inst_datei, repo_dir):
+    """'veraltet' (Ausrollen vergessen) oder 'eigenmaechtig' (jemand hat an der
+    installierten Kopie gearbeitet) -- und woher wir das wissen.
+
+    Der belastbare Weg fuehrt ueber git: entspricht der installierte Inhalt IRGEND
+    EINEM frueheren Stand der Repo-Datei, dann ist er ein alter Stand, Punkt. Passt
+    er zu keinem, hat diesen Inhalt nie ein Commit getragen -- dann wurde an der
+    installierten Kopie gearbeitet, und das ist die gefaehrlichere Richtung, weil
+    die Arbeit beim naechsten Ausrollen verschwindet.
+
+    Ohne git bleibt die Aenderungszeit, und die ist nur ein Hinweis: sie wird
+    entsprechend gekennzeichnet."""
+    try:
+        inhalt = open(inst_datei, "rb").read()
+    except OSError:
+        return "unklar", "installierte Datei nicht lesbar"
+    rel = os.path.relpath(repo_datei, repo_dir)
+    try:
+        shas = subprocess.run(["git", "-C", repo_dir, "log", "--format=%H", "-40", "--", rel],
+                              capture_output=True, text=True, timeout=20).stdout.split()
+    except Exception:
+        shas = []
+    for sha in shas:
+        try:
+            alt = subprocess.run(["git", "-C", repo_dir, "show", "%s:%s" % (sha, rel)],
+                                 capture_output=True, timeout=20)
+        except Exception:
+            break
+        if alt.returncode == 0 and alt.stdout == inhalt:
+            return "veraltet", "der installierte Inhalt ist der Repo-Stand von %s" % sha[:9]
+    if shas:
+        return "eigenmaechtig", ("dieser Inhalt stand in keinem der letzten %d Commits "
+                                 "dieser Datei" % len(shas))
+    try:
+        neuer = os.path.getmtime(inst_datei) > os.path.getmtime(repo_datei)
+    except OSError:
+        return "unklar", "Zeitstempel nicht lesbar"
+    return ("eigenmaechtig" if neuer else "veraltet"), "nur nach Aenderungszeit geschlossen"
+
+
+def _ziel_fuer(rel, name, c7):
+    """Der Zielort dieser Datei, aus dem Verzeichnis UND dem Dateinamen abgeleitet.
+
+    Ein Eintrag der install_map ist [prefix, ziel] oder [prefix, ziel, muster].
+    Der erste passende gewinnt, deshalb stehen engere Eintraege zuerst. Das
+    Muster ist noetig, weil nicht jede Datei EINES Verzeichnisses am selben Ort
+    landet: `shell/*.plist` gehoert nach ~/Library/LaunchAgents, alles andere aus
+    `shell/` nach ~/.local/bin. Ohne diese Unterscheidung meldete die Pruefung
+    zwei launchd-Dateien als 'liegt nur im Repo', obwohl sie sehr wohl
+    installiert sind -- nur eben dort, wo launchd sie sucht (gemessen 2026-08-06)."""
+    for eintrag in c7["install_map"]:
+        prefix, ziel = eintrag[0], eintrag[1]
+        muster = eintrag[2] if len(eintrag) > 2 else None
+        if not rel.startswith(prefix):
+            continue
+        if muster and not fnmatch.fnmatch(name, muster):
+            continue
+        return ziel
+    return None
+
+
+def _sorte_a(c7, findings):
+    repo_dir = c7["repo_dir"]
+    gesehen = set()
+    for prefix, ziel_unbenutzt in [(e[0], e[1]) for e in c7["install_map"]]:
+        wurzel = os.path.join(repo_dir, prefix)
+        if not os.path.isdir(wurzel):
+            continue
+        for name in sorted(os.listdir(wurzel)):
+            repo_datei = os.path.join(wurzel, name)
+            if not os.path.isfile(repo_datei):
+                continue
+            if any(ex in repo_datei for ex in c7.get("exclude_substrings", ())):
+                continue
+            rel = os.path.join(prefix, name)
+            if rel in gesehen:
+                continue
+            gesehen.add(rel)
+            ziel = _ziel_fuer(rel, name, c7)
+            if ziel is None:
+                continue
+            inst_datei = os.path.join(ziel, name)
+            if not os.path.exists(inst_datei):
+                # Traegt die Datei ihre Begruendung selbst? Dann ist sie kein Befund.
+                kopf = "\n".join(read_lines(repo_datei)[:40])
+                if NICHT_INSTALLIERT_RE.search(kopf):
+                    continue
+                findings.append(Finding(
+                    "KOPIE-NUR-REPO", rel, 1,
+                    "liegt nur im Repo",
+                    "unter %s liegt nichts. Entweder ausrollen, oder die Datei sagt in "
+                    "ihrem Kopf selbst warum nicht: 'NICHT INSTALLIERT: <Begruendung>'."
+                    % ziel, severity="hint"))
+                continue
+            if open(repo_datei, "rb").read() == open(inst_datei, "rb").read():
+                continue
+            richtung, warum = _installiert_richtung(repo_datei, inst_datei, repo_dir)
+            if richtung == "veraltet":
+                findings.append(Finding(
+                    "KOPIE-VERALTET", rel, 1,
+                    "Repo und %s sind verschieden" % inst_datei,
+                    "die INSTALLIERTE Fassung ist ein alter Stand (%s) -- Ausrollen "
+                    "vergessen. Die Suiten fahren teils die installierte Fassung, also "
+                    "faellt das erst im Gesamtlauf auf." % warum))
+            elif richtung == "eigenmaechtig":
+                findings.append(Finding(
+                    "KOPIE-EIGENMAECHTIG", rel, 1,
+                    "Repo und %s sind verschieden" % inst_datei,
+                    "die INSTALLIERTE Fassung traegt Inhalt, den das Repo nicht kennt "
+                    "(%s) -- jemand hat an der installierten Kopie gearbeitet. Beim "
+                    "naechsten Ausrollen ist diese Arbeit weg." % warum))
+            else:
+                findings.append(Finding(
+                    "KOPIE-VERSCHIEDEN", rel, 1,
+                    "Repo und %s sind verschieden" % inst_datei,
+                    "Richtung nicht bestimmbar (%s)." % warum))
+
+
+def _harness_liste(quelle):
+    try:
+        if quelle.endswith(".json"):
+            return json.load(open(quelle)).get("harnesses") or []
+        # Die eingebauten Adapter stehen als Python-Literal im Code von wb-state.
+        m = re.search(r"^BUILTIN_HARNESSES = (\[.*?^\])", open(quelle, errors="replace").read(),
+                      re.S | re.M)
+        return ast.literal_eval(m.group(1)) if m else []
+    except Exception:
+        return []
+
+
+def _sorte_b(c7, findings):
+    felder = c7["tool_fact_fields"]
+    quellen = [(name, pfad) for name, pfad in c7["harness_sources"] if os.path.exists(pfad)]
+    gelesen = [(name, pfad, _harness_liste(pfad)) for name, pfad in quellen]
+    ids = sorted({h.get("id") for _n, _p, hs in gelesen for h in hs if h.get("id")})
+    for hid in ids:
+        for feld in felder:
+            werte = {}
+            for name, pfad, hs in gelesen:
+                h = next((x for x in hs if x.get("id") == hid), None)
+                if h is None or feld not in h:
+                    continue          # dieses Werkzeug kennt diese Ablage nicht
+                werte[name] = (h[feld], pfad)
+            if len(werte) < 2:
+                continue
+            fassungen = {json.dumps(v[0], sort_keys=True, ensure_ascii=False) for v in werte.values()}
+            if len(fassungen) < 2:
+                continue
+            wo = ", ".join("%s=%s" % (n, json.dumps(v[0], ensure_ascii=False)[:70])
+                           for n, v in sorted(werte.items()))
+            erste = sorted(werte.items())[0][1][1]
+            findings.append(Finding(
+                "WERKZEUG-AUSSAGE", erste, 1,
+                "`%s.%s` steht in %d Ablagen verschieden" % (hid, feld, len(werte)),
+                "eine gemessene Tatsache ueber ein Werkzeug hat keine zwei Fassungen: %s" % wo))
+
+
+def _sorte_c(c7, findings):
+    # Vokabular AUS DER KONFIGURATION. Ohne Muster wird nicht geraten, sondern
+    # nichts geprueft -- eine stumme Pruefung ist ehrlicher als eine, die sich
+    # ihre Suchbegriffe selbst ausdenkt.
+    muster = [re.compile(p) for p in c7.get("marker_patterns", [])]
+    bez_pat = c7.get("identifier_pattern")
+    if not muster or not bez_pat:
+        return
+    bez_re = re.compile(bez_pat)
+    test_text = ""
+    for pat in c7.get("test_globs", []):
+        for p in expand_globs([pat]):
+            test_text += "\n" + "\n".join(read_lines(p))
+    for pat in c7.get("marker_globs", []):
+        for p in expand_globs([pat], c7.get("exclude_substrings", ())):
+            if not _ist_code(p):
+                continue          # Datendateien tragen keine doppelte Implementierung
+            zeilen = read_lines(p)
+            for i, zeile in enumerate(zeilen, 1):
+                if not any(m.search(zeile) for m in muster):
+                    continue
+                # Der Bezeichner kann auf der Markerzeile oder der naechsten stehen.
+                block = zeile + " " + (zeilen[i] if i < len(zeilen) else "")
+                for bez in set(bez_re.findall(block)):
+                    if bez in test_text:
+                        continue
+                    findings.append(Finding(
+                        "DOPPELUNG-OHNE-TEST", os.path.relpath(p, c7["repo_dir"]), i,
+                        "meldet eine bewusste Doppelung an (`%s`)" % bez,
+                        "kein Test nennt `%s` -- die angemeldete Gleichhaltung prueft "
+                        "niemand nach. Die uebrigen angemeldeten Doppelungen des Hauses "
+                        "haben je einen Vergleichstest." % bez))
+
+
+# --------------------------------------------------------------------------
+# Sorte D -- installiert, aber nirgends im Repo (2026-08-17)
+# --------------------------------------------------------------------------
+# Anlass: 20 eigene Werkzeuge liefen monate- bis wochenlang aus ~/.local/bin,
+# ohne dass irgendein Test das je bemerkte -- Sorte A prueft nur Dateien, die
+# im Repo bereits STEHEN; ein Werkzeug, das nie aufgenommen wurde, faellt
+# durch kein Raster. Dieselbe Blindheit wie beim Veroeffentlichungs-Tor, das
+# 18 Tage lang nichts fand, weil es nur prueft, was ihm schon bekannt ist.
+#
+# Sorte D dreht Sorte A um: Ausgangspunkt ist der INSTALLATIONSORT, nicht das
+# Repo. Die schwierige Frage ist nicht "fehlt eine Datei", sondern "gehoert
+# diese Datei ueberhaupt hierher" -- unter ~/.local/bin liegen zusammen mit
+# den eigenen Werkzeugen ueber hundert von Paketmanagern verwaltete Programme
+# (uv, pipx, npm, cargo, Homebrew, der Claude-Code-Eigeninstaller, ...), und
+# die duerfen nicht als vermisste eigene Werkzeuge gemeldet werden.
+#
+# Die Trennung haengt an ZWEI messbaren Merkmalen, keiner Namensliste:
+#   1. _ist_paketverwaltet -- der REALE Pfad (nach Symlinks aufgeloest) liegt
+#      unter einem der konfigurierten Paketmanager-Verzeichnisse. uv/pipx/npm
+#      legen Symlinks dorthin, Homebrew verlinkt in den Cellar, der
+#      Claude-Code-Installer haelt seine eigenen Versionen unter
+#      ~/.local/share/claude. Eine Handvoll ORTE altert nicht wie eine Liste
+#      von NAMEN -- neue Paketmanager kommen selten hinzu, neue eigene
+#      Werkzeuge fast woechentlich.
+#   2. _ist_skript -- traegt eine Shebang-Zeile. Jedes der bisher geborgenen
+#      eigenen Werkzeuge ist ein von Hand geschriebenes Bash/Python/sh-Skript;
+#      ein kompiliertes Binary OHNE erkennbaren Paketmanager-Pfad (etwa ein
+#      `go install` direkt nach ~/.local/bin, gemessen an `agy`) faellt damit
+#      bewusst NICHT unter 'eigen' -- ohne Shebang ist die Herkunft nicht
+#      entscheidbar, und ein falscher Fund waere schlimmer als ein
+#      ausgelassener.
+# Beides zusammen ist notwendig: ohne (1) meldet die Pruefung jedes per uv/
+# pipx als Skript-Shim installierte Fremdprogramm; ohne (2) auch jedes
+# fremde Binary, das direkt (ohne Symlink) in ~/.local/bin landet.
+#
+# Wie bei Sorte A traegt eine bewusste Ausnahme ihre Begruendung an der
+# DATEI selbst ('NICHT VERSIONIERT: <warum>' in den ersten 40 Zeilen), nicht
+# in einer Ausnahmeliste hier.
+
+
+def _ist_paketverwaltet(pfad, fremd_verzeichnisse):
+    # Beide Seiten realpath()en, nicht nur pfad: macOS verlinkt /tmp und /var
+    # selbst auf /private/... -- ohne das aufzuloesen vergleicht der Praefix-
+    # Test einen aufgeloesten Pfad gegen einen unaufgeloesten und verfehlt jeden
+    # Treffer, dessen Heimatverzeichnis (oder ein Testverzeichnis) hinter so
+    # einem System-Symlink liegt.
+    real = os.path.realpath(pfad)
+    for d in fremd_verzeichnisse:
+        d_real = os.path.realpath(d)
+        if real == d_real or real.startswith(d_real.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _ist_skript(pfad):
+    try:
+        with open(pfad, "rb") as f:
+            kopf = f.read(4096)
+    except OSError:
+        return False
+    return b"\x00" not in kopf and kopf[:2] == b"#!"
+
+
+def _sorte_d(c7, findings, base):
+    d = c7.get("fremd_pruefung")
+    if not d:
+        return
+    ziel = d.get("ziel")
+    if not ziel or not os.path.isdir(ziel):
+        return
+    fremd_verzeichnisse = d.get("paketmanager_verzeichnisse", [])
+    repo_praefixe = [p for p, z in ((e[0], e[1]) for e in c7["install_map"]) if z == ziel]
+    bekannt = set()
+    for prefix in repo_praefixe:
+        wurzel = os.path.join(c7["repo_dir"], prefix)
+        if os.path.isdir(wurzel):
+            bekannt.update(os.listdir(wurzel))
+    for name in sorted(os.listdir(ziel)):
+        pfad = os.path.join(ziel, name)
+        if name in bekannt or not os.path.isfile(pfad):
+            continue
+        if any(ex in pfad for ex in c7.get("exclude_substrings", ())):
+            continue
+        if _ist_paketverwaltet(pfad, fremd_verzeichnisse):
+            continue
+        if not _ist_skript(pfad):
+            continue
+        kopf = "\n".join(read_lines(pfad)[:40])
+        if NICHT_VERSIONIERT_RE.search(kopf):
+            continue
+        findings.append(Finding(
+            "EIGEN-NICHT-IM-REPO", os.path.relpath(pfad, base), 1,
+            "liegt unter %s, aber nirgends im Repo" % ziel,
+            "Skript mit Shebang, keine Spur zu einem Paketmanager -- vermutlich von "
+            "Hand gebaut und nie aufgenommen. Entweder ins Repo aufnehmen, oder falls "
+            "es bewusst nur lokal bleiben soll, in den ersten 40 Zeilen selbst "
+            "vermerken: 'NICHT VERSIONIERT: <Begruendung>'.", severity="error"))
+
+
+def check7_kopien(cfg, base):
+    c7 = cfg.get("check7_kopien")
+    if not c7:
+        return []
+    findings = []
+    if not os.path.isdir(c7["repo_dir"]):
+        return [Finding("KOPIE-VERSCHIEDEN", c7["repo_dir"], 0, "Arbeitsbaum vorhanden",
+                        "Verzeichnis %s gibt es nicht -- nichts zu vergleichen."
+                        % c7["repo_dir"], severity="hint")]
+    _sorte_a(c7, findings)
+    _sorte_b(c7, findings)
+    _sorte_c(c7, findings)
+    _sorte_d(c7, findings, base)
+    return findings
+
+
+def check4_skill_vs_rules(cfg, base):
+    # Fehlt der Konfigurationsblock, wird diese Pruefung UEBERSPRUNGEN statt
+    # abzustuerzen (2026-08-06). Die neueren Checks halten es schon so, und
+    # eine Teilkonfiguration ist ein legitimer Fall: ein Test richtet genau
+    # eine Pruefung auf sein Spielfeld und laesst die uebrigen weg.
+    c4 = cfg.get("check4_skill_vs_rules")
+    if not c4:
+        return []
+    findings = []
+    # Standing rules aren't only in CLAUDE.md -- some (e.g. "workers don't spawn
+    # workers") live in roles/*.md, loaded into every worker session just the
+    # same. rule_text_globs (plural) covers both; "claude_md" (singular) stays
+    # as a fallback for an older config so this never hard-breaks on a stale file.
+    rule_globs = c4.get("rule_text_globs") or [c4["claude_md"]]
+    claude_md_text = ""
+    for pat in rule_globs:
+        for path in sorted(globmod.glob(pat)):
+            try:
+                with open(path, "r", errors="replace") as f:
+                    claude_md_text += f.read() + "\n"
+            except OSError:
+                continue
+
+    pairs = c4.get("rule_pairs", [])
+    skill_files = sorted(globmod.glob(c4["skills_glob"]))
+
+    for path in skill_files:
+        try:
+            with open(path, "r", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        desc = parse_frontmatter_description(text)
+        if not desc:
+            continue
+        for pair in pairs:
+            if not re.search(pair["description_pattern"], desc):
+                continue
+            if not re.search(pair["rule_pattern"], claude_md_text):
+                continue
+            findings.append(Finding(
+                "SKILL-VS-REGEL", path, 1,
+                f"description widerspricht Standing Rule '{pair['id']}': \"{desc[:140]}\"",
+                pair["explanation"],
+            ))
+    return findings
+
+
+# --------------------------------------------------------------------------
+# Check 8 -- eine Testsuite, die den LIVE-tmux-Server anspricht
+# --------------------------------------------------------------------------
+#
+# Anlass: Am 04.08. hat eine Testsuite in die laufende Sitzung getippt und dem
+# Orchestrator eine Anweisung untergeschoben. Die Abschirmung vom 06.08.
+# (`wb-pane-write`, Guard `pane-write` in bash-guard.py) faengt den Agenten, der
+# direkt `tmux send-keys` schreibt -- sie sieht aber NICHT, was ein aufgerufenes
+# Skript tut. Genau diese Luecke stand als offener Punkt im Ergebnis der
+# Abschirmung; diese Pruefung schliesst sie an der Quelle, statisch.
+#
+# Gesucht wird eine Datei unter shell/tests/ oder hooks/tests/, die `tmux`
+# aufruft, ohne den Server festzulegen: kein `-L`, kein `-S`, kein gesetztes
+# TMUX_TMPDIR. Ein solcher Aufruf landet auf dem Standard-Server -- also dort, wo
+# der Nutzer arbeitet.
+#
+# UEBLICHE HUELLEN WERDEN ERKANNT, sonst hagelt es Falsch-Positive: fast jede
+# Suite hier legt sich eine Funktion `tm() { tmux -L "$SOCKET" "$@"; }` an oder
+# haelt den Aufruf in einer Variablen. Erkannt werden deshalb
+#   * Funktionen, deren Rumpf tmux mit -L/-S ruft (der NAME gilt dann als sicher),
+#   * Variablen, deren Zuweisung tmux mit -L/-S enthaelt,
+#   * Variablen, die auf das tmux-BINARY zeigen ($REALTMUX, $TMUX_BIN): ihre
+#     Verwendungen werden wie `tmux` selbst geprueft, statt sie durchzuwinken.
+#
+# SCHWERE: fast immer nur ein HINWEIS. Ein Aufruf ohne Socket ist verdaechtig,
+# aber nicht beweisend -- eine Suite darf den Live-Server absichtlich LESEN
+# (test-context-guard-live-socket-unberuehrt.sh tut genau das, und das ist ihr
+# Zweck). Ein FEHLER wird daraus nur, wenn beides zusammenkommt: ein Verb, das
+# schreibt, UND ein Ziel, das den Live-Praefix im Wortlaut nennt. Dann ist nichts
+# mehr zu deuten.
+
+# Die echten tmux-Unterbefehle, Namen und Kurzformen -- erzeugt aus `tmux list-commands`
+# und hier festgeschrieben, damit die Pruefung ohne laufendes tmux dieselbe Antwort gibt.
+# Sie ist der Filter gegen PROSA: in diesen Dateien steht viel deutscher Fliesstext, in dem
+# das Wort "tmux" vorkommt ("tmux gibt dem Pane ...", "tmux hat geteilt"). Ohne diesen
+# Abgleich meldete die Pruefung jeden solchen Satz als Aufruf.
+TMUX_UNTERBEFEHLE = {
+    "attach", "attach-session", "bind", "bind-key", "break-pane", "breakp", "capture-pane",
+    "capturep", "choose-buffer", "choose-client", "choose-tree", "clear-history",
+    "clear-prompt-history", "clearhist", "clearphist", "clock-mode", "command-prompt",
+    "confirm", "confirm-before", "copy-mode", "customize-mode", "delete-buffer", "deleteb",
+    "detach", "detach-client", "display", "display-menu", "display-message",
+    "display-panes", "display-popup", "displayp", "find-window", "findw", "has",
+    "has-session", "if", "if-shell", "join-pane", "joinp", "kill-pane", "kill-server",
+    "kill-session", "kill-window", "killp", "killw", "last", "last-pane", "last-window",
+    "lastp", "link-window", "linkw", "list-buffers", "list-clients", "list-commands",
+    "list-keys", "list-panes", "list-sessions", "list-windows", "load-buffer", "loadb",
+    "lock", "lock-client", "lock-server", "lock-session", "lockc", "locks", "ls", "lsb",
+    "lsc", "lscm", "lsk", "lsp", "lsw", "menu", "move-pane", "move-window", "movep",
+    "movew", "new", "new-pane", "new-session", "new-window", "newp", "neww", "next",
+    "next-layout", "next-window", "nextl", "paste-buffer", "pasteb", "pipe-pane", "pipep",
+    "popup", "prev", "previous-layout", "previous-window", "prevl", "refresh",
+    "refresh-client", "rename", "rename-session", "rename-window", "renamew",
+    "resize-pane", "resize-window", "resizep", "resizew", "respawn-pane", "respawn-window",
+    "respawnp", "respawnw", "rotate-window", "rotatew", "run", "run-shell", "save-buffer",
+    "saveb", "select-layout", "select-pane", "select-window", "selectl", "selectp",
+    "selectw", "send", "send-keys", "send-prefix", "server-access", "set", "set-buffer",
+    "set-environment", "set-hook", "set-option", "set-window-option", "setb", "setenv",
+    "setw", "show", "show-buffer", "show-environment", "show-hooks", "show-messages",
+    "show-options", "show-prompt-history", "show-window-options", "showb", "showenv",
+    "showmsgs", "showphist", "showw", "source", "source-file", "split-window", "splitw",
+    "start", "start-server", "suspend-client", "suspendc", "swap-pane", "swap-window",
+    "swapp", "swapw", "switch-client", "switchc", "unbind", "unbind-key", "unlink-window",
+    "unlinkw", "wait", "wait-for",
+}
+
+# Verben, die im Ziel-Pane oder an der Sitzung etwas VERAENDERN.
+TMUX_SCHREIB_VERBEN = {
+    "send-keys", "send", "paste-buffer", "send-prefix", "load-buffer", "set-buffer",
+    "kill-server", "kill-session", "kill-pane", "kill-window", "respawn-pane",
+    "respawn-window", "new-session", "new-window", "split-window", "select-pane",
+    "select-window", "set-option", "set", "setw", "set-window-option", "rename-session",
+    "rename-window", "resize-pane", "resize-window", "swap-pane", "move-window",
+    "join-pane", "break-pane", "run-shell", "attach-session", "attach", "detach-client",
+    "source-file", "confirm-before", "display-menu", "bind-key", "bind", "unbind-key",
+}
+
+# Was vor dem eigentlichen Befehl stehen darf, ohne dass er ein anderer wird.
+TMUX_VORSPANN = {"env", "exec", "nohup", "sudo", "time", "builtin", "command", "eval", "then",
+                 "do", "else", "elif", "if", "while", "until", "!", "{", "("}
+
+# Trennzeichen, hinter denen ein NEUER Befehl anfaengt.
+_BEFEHLSTRENNER = re.compile(r"(\|\||&&|\||;|\$\(|`|\bthen\b|\bdo\b|\belse\b|\{)")
+
+_FUNKTION_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{?")
+_ZUWEISUNG_RE = re.compile(r"^\s*(?:export\s+|local\s+|declare\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_SOCKET_FLAGGE = re.compile(r"(?<![A-Za-z0-9_-])-[LS](?:\s|=|\"|'|\$)")
+# Ein Verweis auf das Binary, nicht auf einen Aufruf: `command -v tmux`, `which tmux`.
+_TMUX_SUCHE = re.compile(r"(?:command\s+-v|which|type\s+-p)\s+tmux\b")
+
+
+def _ohne_kommentar(zeile):
+    """Alles ab einem Rautezeichen weg, das ausserhalb von Anfuehrungszeichen steht."""
+    einfach = doppelt = False
+    for i, z in enumerate(zeile):
+        if z == "'" and not doppelt:
+            einfach = not einfach
+        elif z == '"' and not einfach:
+            doppelt = not doppelt
+        elif z == "#" and not einfach and not doppelt:
+            if i == 0 or zeile[i - 1] in " \t":
+                return zeile[:i]
+    return zeile
+
+
+def _huellen_sammeln(lines):
+    """Namen, hinter denen ein festgelegter Socket steckt, und Namen, die auf das
+    tmux-Binary zeigen. Zwei Listen, weil sie GEGENTEILIGES bedeuten: die erste
+    ist sicher, die zweite muss wie `tmux` selbst geprueft werden. Dazu die Namen
+    der PATH-Schirme (siehe unten), die dasselbe auf einem dritten Weg leisten.
+
+    Drittens die Zeilennummern des RUMPFES jeder erkannten Huelle. Ohne die meldete
+    die Pruefung die Huelle an sich selbst: eine Funktion, die den Socket setzt,
+    traegt in ihrem Rumpf einen tmux-Aufruf, und ein Zweig wie `else tmux "$@"`
+    steht dort ohne Socket, obwohl genau diese Funktion ihn setzt."""
+    sicher, aliasse, rumpfzeilen, schirme = set(), set(), set(), set()
+    i, n = 0, len(lines)
+    while i < n:
+        roh = _ohne_kommentar(lines[i])
+        m = _FUNKTION_RE.match(roh)
+        if m:
+            # Rumpf bis zur schliessenden Klammer einsammeln (einzeilig wie mehrzeilig).
+            rumpf, j = [roh], i
+            while j + 1 < n and roh.rstrip().endswith("{") is False and "}" not in roh:
+                j += 1
+                roh2 = _ohne_kommentar(lines[j])
+                rumpf.append(roh2)
+                if roh2.strip() in ("}", "};"):
+                    break
+                if j - i > 30:      # keine Funktion in dieser Sammlung ist so lang
+                    break
+            text = "\n".join(rumpf)
+            if "tmux" in text and _SOCKET_FLAGGE.search(text):
+                sicher.add(m.group(1))
+                rumpfzeilen.update(range(i + 1, j + 2))   # 1-basiert wie die Meldung
+            i += 1
+            continue
+        z = _ZUWEISUNG_RE.match(roh)
+        if z:
+            name, wert = z.group(1), z.group(2)
+            if "tmux" in wert and _SOCKET_FLAGGE.search(wert):
+                sicher.add(name)
+            elif _TMUX_SUCHE.search(wert) or re.search(r"[\"'/]tmux[\"']?\s*$", wert.strip()):
+                aliasse.add(name)
+        # DER PATH-SCHIRM. Mehrere Suiten legen ein Verzeichnis an, in dem ein
+        # ausfuehrbares `tmux` steht, das nichts tut als den echten tmux mit -L zu
+        # rufen -- und schieben dieses Verzeichnis in die PATH jedes Panes, den sie
+        # oeffnen (betriebslauf.sh, test-registry.sh, und die Reparatur, die nach dem
+        # Vorfall vom 04.08. genau dort eingebaut wurde). Ein Aufruf `tmux attach` in
+        # so einem Pane landet auf dem TESTSOCKET, obwohl in der Zeile kein -L steht.
+        # Ohne diese Erkennung meldete die Pruefung ausgerechnet die Reparatur als
+        # Fehler.
+        m2 = re.search(r">\s*[\"']?\$\{?(\w+)\}?/tmux\b", roh)
+        if m2:
+            # Der Rumpf des Schirms folgt in den naechsten Zeilen (Here-Dokument).
+            block = "\n".join(lines[i:i + 8])
+            if "tmux" in block and _SOCKET_FLAGGE.search(block):
+                schirme.add(m2.group(1))
+        i += 1
+    # Der Schirm wird selten direkt in die PATH gesetzt; ueblich ist eine zweite
+    # Variable, die ihn einsammelt (`PANE_PATH="$SHIM:$BIN:/usr/bin:..."`) und DIE
+    # dann in die PATH des Panes geht. Ein Durchgang ueber diese Weitergabe reicht
+    # fuer jedes Muster, das in diesen Suiten wirklich vorkommt.
+    if schirme:
+        for zeile in lines:
+            z = _ZUWEISUNG_RE.match(_ohne_kommentar(zeile))
+            if z and any(re.search(r"\$\{?%s\b" % re.escape(sch), z.group(2)) for sch in list(schirme)):
+                schirme.add(z.group(1))
+    return sicher, aliasse, rumpfzeilen, schirme
+
+
+def _in_anfuehrung(zeile, pos):
+    """Steht diese Stelle innerhalb von Anfuehrungszeichen?"""
+    einfach = doppelt = False
+    for i, z in enumerate(zeile[:pos]):
+        if z == "'" and not doppelt:
+            einfach = not einfach
+        elif z == '"' and not einfach:
+            doppelt = not doppelt
+    return einfach or doppelt
+
+
+def _tmux_aufrufe(zeile, sicher, aliasse, schirme=()):
+    """Die tmux-Aufrufe dieser Zeile, je als (befehlstext, unterbefehl, zitiert)."""
+    roh = _ohne_kommentar(zeile)
+    if "tmux" not in roh and not any(a in roh for a in aliasse):
+        return []
+    treffer = []
+    for teil in _BEFEHLSTRENNER.split(roh):
+        if not teil or not teil.strip():
+            continue
+        if _TMUX_SUCHE.search(teil):
+            continue
+        woerter = teil.strip().split()
+        k = 0
+        while k < len(woerter):
+            w = woerter[k].strip('"\'')
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w) or w in TMUX_VORSPANN:
+                k += 1
+                continue
+            break
+        if k >= len(woerter):
+            continue
+        kopf = woerter[k].strip('"\'')
+        name = kopf.lstrip("$").strip("{}")
+        basis = name.rsplit("/", 1)[-1]
+        if basis in sicher or name in sicher:
+            continue
+        if basis != "tmux" and name not in aliasse:
+            continue
+        rest = " ".join(woerter[k + 1:])
+        if _SOCKET_FLAGGE.search(rest):
+            continue
+        # Laeuft der Aufruf unter einem PATH-Schirm dieser Datei?
+        if any(re.search(r"PATH=[^\s]*\$\{?%s\b" % re.escape(sch), teil) for sch in schirme):
+            continue
+        unterbefehl = ""
+        for w in woerter[k + 1:]:
+            w = w.strip('"\'').rstrip(",.;:!?")
+            if w.startswith("-"):
+                continue
+            unterbefehl = w
+            break
+        # PROSA-FILTER. In diesen Dateien steht viel deutscher Fliesstext, in dem das
+        # Wort "tmux" vorkommt -- in Kommentaren, in Meldungen, in Zeichenketten, die
+        # `echo` ausgibt. Folgt darauf kein echter Unterbefehl, war es ein Satz und
+        # kein Aufruf. GRENZE, offen benannt: ein Aufruf, dessen Unterbefehl aus einer
+        # Variablen kommt (`tmux $CMD ...`), faellt damit ebenfalls heraus. Beides
+        # laesst sich hier nicht auseinanderhalten, und ein Hagel von Falsch-Positiven
+        # erzieht zum Wegsehen -- dann findet auch der echte Befund niemanden mehr.
+        if unterbefehl not in TMUX_UNTERBEFEHLE:
+            continue
+        zitiert = _in_anfuehrung(roh, roh.find(kopf) if kopf in roh else 0)
+        treffer.append((teil.strip(), unterbefehl, zitiert))
+    return treffer
+
+
+def _docstring_zeilen(path, lines):
+    """Zeilennummern, die in einer .py-Datei innerhalb eines dreifach zitierten
+    Textblocks liegen. Der Kopfkommentar von test-knopf-tastendruck.py erklaert
+    woertlich, warum der direkte Tastenweg dort NICHT taugt -- ohne diese Ausnahme
+    meldete die Pruefung ausgerechnet diese Erklaerung als Verstoss."""
+    if not path.endswith(".py"):
+        return set()
+    drin, marke, treffer = False, "", set()
+    for nr, zeile in enumerate(lines, 1):
+        rest = zeile
+        while rest:
+            if not drin:
+                pos3, pos1 = rest.find('"""'), rest.find("'''")
+                kandidaten = [x for x in (pos3, pos1) if x >= 0]
+                if not kandidaten:
+                    break
+                pos = min(kandidaten)
+                marke = rest[pos:pos + 3]
+                drin = True
+                rest = rest[pos + 3:]
+            else:
+                treffer.add(nr)
+                pos = rest.find(marke)
+                if pos < 0:
+                    break
+                drin = False
+                rest = rest[pos + 3:]
+        if drin:
+            treffer.add(nr)
+    return treffer
+
+
+# Der eine Weg, eine Datei stillzulegen -- und zwar SCHRIFTLICH, in ihr selbst.
+# Dieselbe Bauart wie 'NICHT INSTALLIERT:' in check7: keine Ausnahmeliste in einer
+# Konfiguration, die niemand mehr liest, sondern ein Satz im Kopf der Datei, den der
+# Naechste sieht, wenn er sie oeffnet. Eine Suite darf den Live-Server absichtlich
+# LESEN (test-context-guard-live-socket-unberuehrt.sh ist genau dafuer da) -- dann
+# gehoert der Grund dorthin, wo er gebraucht wird.
+LIVE_ABSICHT_RE = re.compile(r"LIVE-SOCKET ABSICHTLICH:\s*\S", re.I)
+
+
+def check8_test_socket(cfg, base):
+    c8 = cfg.get("check8_test_socket")
+    if not c8:
+        return []
+    praefix = c8.get("live_session_prefix", "wb-")
+    findings = []
+    for path in expand_globs(c8["test_globs"], c8.get("exclude_substrings", ())):
+        lines = read_lines(path)
+        if not lines:
+            continue
+        # Eine Datei, die TMUX_TMPDIR setzt, hat ihren Server ohnehin umgelenkt.
+        if any(re.search(r"\bTMUX_TMPDIR\s*=", _ohne_kommentar(l)) for l in lines):
+            continue
+        # Sagt die Datei in ihrem Kopf selbst, dass der Live-Server gemeint ist?
+        if LIVE_ABSICHT_RE.search("\n".join(lines[:40])):
+            continue
+        sicher, aliasse, rumpfzeilen, schirme = _huellen_sammeln(lines)
+        textzeilen = _docstring_zeilen(path, lines)
+        for nr, zeile in enumerate(lines, 1):
+            if nr in rumpfzeilen or nr in textzeilen:
+                continue
+            for befehl, unterbefehl, zitiert in _tmux_aufrufe(zeile, sicher, aliasse, schirme):
+                schreibt = unterbefehl in TMUX_SCHREIB_VERBEN
+                nennt_live = praefix in befehl
+                # In einer Zeichenkette ist ein Befehl nicht zwingend einer: die
+                # Guard-Suiten reichen Befehlszeilen als PRUEFDATEN weiter und fuehren
+                # sie nie aus (hooks/tests/test-hooks.sh haelt `tmux kill-session -t
+                # =wb-...` als Fall vor, den der Guard ablehnen SOLL). Von aussen sind
+                # Datum und Tat hier nicht zu unterscheiden, also faellt der Zweifel
+                # auf die leise Seite: gemeldet wird, aber nur als Hinweis.
+                if schreibt and nennt_live and not zitiert:
+                    findings.append(Finding(
+                        "TEST-LIVE-SOCKET", path, nr,
+                        "ruft `tmux %s` ohne -L/-S und nennt dabei den Live-Praefix "
+                        "'%s': %s" % (unterbefehl or "?", praefix, befehl[:160]),
+                        "das trifft den Standard-Server, auf dem der Nutzer arbeitet. Genau "
+                        "diese Klasse Fehler hat am 04.08. dem Orchestrator eine Anweisung "
+                        "untergeschoben. Ein Test gehoert auf einen eigenen Socket "
+                        "(tmux -L wbtest-<name>-$$).",
+                        severity="error"))
+                else:
+                    findings.append(Finding(
+                        "TEST-SOCKET-OFFEN", path, nr,
+                        "ruft tmux ohne -L/-S und ohne TMUX_TMPDIR%s%s: %s"
+                        % (" (%s)" % unterbefehl if unterbefehl else "",
+                           " -- steht in einer Zeichenkette, kann also auch Pruefdatum sein"
+                           if zitiert else "", befehl[:160]),
+                        "damit landet der Aufruf auf dem Standard-Server. Lesend ist das "
+                        "manchmal Absicht (eine Probe, die die Live-Sitzung gerade NICHT "
+                        "anfassen soll); schreibend ist es der Fehler vom 04.08. Nachsehen "
+                        "und entweder auf einen eigenen Socket legen oder im Kopf der Datei "
+                        "sagen, warum der Live-Server hier gemeint ist.",
+                        severity="hint"))
+    return findings
+
+
+# --------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--base", default=os.path.expanduser("~"))
+    ap.add_argument("--repo", default=os.path.expanduser("~/AI/claude-workbench"),
+                    help="Arbeitsbaum der Werkbank ({REPO} in der Konfiguration)")
+    ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "wb-consistency.config.json"))
+    args = ap.parse_args()
+
+    cfg = load_config(args.config, args.base, args.repo)
+
+    all_findings = []
+    all_findings += check1_model_caps(cfg, args.base)
+    all_findings += check2_generated_blocks(cfg, args.base)
+    all_findings += check3_dangling_refs(cfg, args.base)
+    all_findings += check4_skill_vs_rules(cfg, args.base)
+    all_findings += check5_config_claims(cfg, args.base)
+    all_findings += check6_settings_switches(cfg, args.base)
+    all_findings += check7_kopien(cfg, args.base)
+    all_findings += check8_test_socket(cfg, args.base)
+
+    if not args.quiet:
+        for f in all_findings:
+            print(f.render())
+
+    errors = [f for f in all_findings if f.severity == "error"]
+    hints = [f for f in all_findings if f.severity == "hint"]
+    expected = [f for f in all_findings if f.severity == "expected"]
+
+    n = len(errors)
+    by_check = {}
+    for f in errors:
+        by_check[f.check] = by_check.get(f.check, 0) + 1
+    summary_parts = ", ".join(f"{k}={v}" for k, v in sorted(by_check.items()))
+    hint_suffix = f" (+{len(hints)} Hinweis(e), zaehlen nicht als Fehler)" if hints else ""
+    expected_suffix = (
+        f" (+{len(expected)} auf anderer Maschine erwartet, zaehlen nicht als Fehler)" if expected else ""
+    )
+    if n == 0:
+        print(f"wb-consistency: 0 Abweichungen -- sauber.{hint_suffix}{expected_suffix}")
+    else:
+        print(f"wb-consistency: {n} Abweichung(en) -- {summary_parts}{hint_suffix}{expected_suffix}")
+
+    return 1 if n else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

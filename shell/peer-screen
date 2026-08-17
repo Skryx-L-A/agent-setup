@@ -1,0 +1,37 @@
+#!/bin/bash
+# Oeffnet Peers Bildschirme auf dem Mac — je Schirm ein eigenes Fenster.
+#
+#   peer-screen            beide Schirme
+#   peer-screen 1          nur DP-3   (2560x1440, Sunshine auf Port 47989)
+#   peer-screen 2          nur HDMI-A-5 (1920x1080, zweite Sunshine-Instanz auf 48989)
+#   peer-screen vollbild   Hauptschirm im Vollbild
+#
+# Warum dieser Aufbau:
+# - Nicht RDP: KRDP nimmt Mausklicks an und verwirft Tastatureingaben (KDE-Fehler 501262,
+#   offen). Auf dieser Maschine gemessen — Klick veraendert das Bild, jede Taste wirkungslos.
+# - Sunshine kodiert in Hardware ueber NVENC der 4070; KRDP konnte das mangels VAAPI-Encoder
+#   nicht und erzeugte einen H.264-Strom jenseits der Standardgrenze.
+# - Zwei Instanzen, weil Sunshine je Instanz genau einen Ausgang bedient (output_name).
+#   Die Ausgaenge werden als INDEX gesetzt (0 und 1); Verbindernamen wie HDMI-A-5 oder die
+#   Geraetenamen aus dem Protokoll findet Sunshine auf diesem NVIDIA-Wayland-Aufbau nicht.
+# - Der Startbefehl muss aus dem Programmbuendel kommen; das von Homebrew verlinkte
+#   'moonlight' findet seine Qt-Bausteine nicht.
+set -uo pipefail
+
+M=/Applications/Moonlight.app/Contents/MacOS/Moonlight
+HOST=$(awk -F': ' '/^Host fuer Moonlight: /{print $2; exit}' "$HOME/.secrets-sync/sunshine-peer.txt" 2>/dev/null)
+[ -n "${HOST:-}" ] || HOST=<peer-ip>
+
+start() { # $1=Port  $2=Anwendung  $3=Aufloesung  $4=Modus
+  nohup "$M" stream "$HOST:$1" "$2" "$3" --fps 60 --display-mode "$4" \
+    > "/tmp/moonlight-$1.log" 2>&1 &
+  echo "  $2 gestartet (PID $!)"
+}
+
+case "${1:-beide}" in
+  1)        start 47989 "Desktop" --1440 windowed ;;
+  2)        start 48989 "Desktop HDMI" --1080 windowed ;;
+  vollbild) start 47989 "Desktop" --1440 fullscreen ;;
+  beide)    start 47989 "Desktop" --1440 windowed; sleep 4; start 48989 "Desktop HDMI" --1080 windowed ;;
+  *) echo "Aufruf: peer-screen [1|2|beide|vollbild]"; exit 64 ;;
+esac

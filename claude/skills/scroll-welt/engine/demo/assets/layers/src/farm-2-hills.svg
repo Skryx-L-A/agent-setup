@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2560" height="1440" viewBox="0 0 2560 1440">
+  <!-- far ridge -->
+  <path fill="#A7BFA6" d="M0 880 C 260 790, 470 900, 700 872 C 940 842, 1090 742, 1330 786
+    C 1560 828, 1700 902, 1930 874 C 2160 846, 2330 790, 2560 838 L2560 1440 L0 1440 Z"/>
+  <!-- nearer ridge -->
+  <path fill="#8FB08B" d="M0 992 C 220 940, 400 1010, 620 986 C 880 958, 1040 880, 1290 920
+    C 1520 956, 1640 1024, 1900 998 C 2140 974, 2340 930, 2560 966 L2560 1440 L0 1440 Z"/>
+  <!-- hedgerows on the far ridge -->
+  <g fill="#8AA98A" opacity="0.85">
+    <ellipse cx="330"  cy="866" rx="34" ry="26"/>
+    <ellipse cx="372"  cy="874" rx="26" ry="20"/>
+    <ellipse cx="1150" cy="770" rx="40" ry="30"/>
+    <ellipse cx="1196" cy="780" rx="28" ry="22"/>
+    <ellipse cx="2088" cy="836" rx="36" ry="27"/>
+  </g>
+</svg>

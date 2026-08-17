@@ -1,0 +1,12 @@
+---
+title: IDENTITY.md.example
+type: reference
+permalink: main/identity-example
+---
+
+Vorlage für `IDENTITY.md` — kopiere diese Datei nach `IDENTITY.md` (Vault-Root) und fülle
+eigene Werte ein. `IDENTITY.md` selbst ist gitignored, wird NIE committed. Siehe
+[[shared-brain]] für den Mechanismus.
+
+- User: Max Mustermann, GitHub mustermann-dev, max@example.com.
+- Maschine: MacBook Air M2 16GB, macOS, User `max`. Projekte in `~/AI/`.

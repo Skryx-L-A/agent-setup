@@ -1,0 +1,22 @@
+#!/bin/bash
+# wb-pi — open an INTERACTIVE local pi agent (chat window) as a workbench pane.
+# Usage: wb-pi [qwen|ornith|ornith9]   (default: ornith)
+# NOTE: local model ids/quant depend on the machine's VRAM; on a 12 GB GPU a 35B
+# will not fit — pull a smaller Ollama model and adjust the aliases below / ~/.pi.
+set -u
+MODEL="${1:-ornith}"
+case "$MODEL" in
+  qwen)    MODEL="qwen3.6:35b-a3b-coding-nvfp4" ;;
+  ornith)  MODEL="ornith:35b" ;;
+  ornith9) MODEL="ornith:9b" ;;
+esac
+
+panes=$(tmux list-panes -F '#{pane_id} #{@wb_role}')
+target=$(echo "$panes" | awk '$2=="orchestrator"{print $1; exit}')
+[ -z "${target:-}" ] && target=$(echo "$panes" | awk '$2!="sidebar"{print $1; exit}')
+
+CMD="PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH pi --provider ollama --model '$MODEL' --append-system-prompt \$HOME/.pi/agent/WORKER.md; echo '── pi beendet — Pane bleibt offen ──'; exec bash"
+new=$(tmux split-window -v -t "${target:-}" -P -F '#{pane_id}' -c "#{pane_current_path}" "bash -lc $(printf %q "$CMD")")
+tmux set -p -t "$new" @wb_role worker
+tmux select-pane -t "$new" -T "pi-chat:${1:-ornith}"
+"$HOME/.local/bin/wb-grid"

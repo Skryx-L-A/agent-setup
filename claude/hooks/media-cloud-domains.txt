@@ -1,0 +1,25 @@
+# Bekannte Cloud-Bild-/Video-/Audio-API-Endpunkte, gegen die media-cloud-guard.sh
+# prueft. Ein Treffer WARNT nur (kein Block) und verweist auf bild/video/tts/stt
+# (~/.local/bin, lokal, offline-faehig). Eine Zeile pro Domain-Substring, "#"
+# leitet Kommentare ein. Liste bei Bedarf ergaenzen — Pflege ist bewusst als
+# eigene Datei ausgelagert (kein Redeploy des Hooks noetig).
+api.openai.com
+api.stability.ai
+api.replicate.com
+api.runwayml.com
+api.elevenlabs.io
+api.assemblyai.com
+api.deepgram.com
+api.d-id.com
+api.synthesia.io
+api.leonardo.ai
+generativelanguage.googleapis.com
+api.fal.ai
+fal.run
+api.higgsfield.ai
+api.midjourney.com
+api.luma.ai
+api.pika.art
+api.suno.ai
+api.play.ht
+api.murf.ai

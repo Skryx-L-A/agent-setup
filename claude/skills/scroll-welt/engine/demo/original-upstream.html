@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>scroll-welt — A/B-Referenz: dieselbe Konfiguration auf der Original-Engine</title>
+  <meta name="description" content="Eine unveraenderte scroll-world-Konfiguration (sections + connectors) auf der neuen Engine." />
+  <style>
+    :root, .sw-root {
+      --sw-bg: #F5EDE0;
+      --sw-ink: #241d2b;
+      --sw-ink-soft: #6a6072;
+      --sw-accent: #9B7EBD;
+    }
+  </style>
+</head>
+<body>
+  <div id="top"></div>
+  <div id="world"></div>
+
+  <!-- Nur die eine Zeile unterscheidet diese Seite von einer scroll-world-Seite:
+       scrub-engine.js ist gegen scrub-welt.js getauscht. Die Konfiguration
+       darunter ist unveraendert im Originalformat (sections + connectors) und
+       ruft mountScrollWorld auf, das die Engine als Alias mitbringt. -->
+  <script src="../scrub-engine.js"></script>
+  <script>
+    window.welt = mountScrollWorld(document.getElementById('world'), {
+      brand: { name: 'Pearl & Co.', href: '#top' },
+      cta: { label: 'Order now', href: '#finale' },
+      hint: 'scroll to fly in',
+      diveScroll: 1.3,
+      connScroll: 0.9,
+      sections: [
+        {
+          id: 'hof', label: 'The Yard',
+          still: 'assets/seams/hof-t0.png',
+          clip: 'assets/vid/hof-zur-werkstatt.mp4',
+          accent: '#8FB98A',
+          scroll: 1.6, linger: 0.45,
+          eyebrow: 'Where it starts',
+          title: 'The old yard.',
+          body: 'This page uses the original scroll-world config shape untouched.',
+          tags: ['sections', 'connectors', 'unchanged'],
+        },
+        {
+          id: 'finale', label: 'The Product',
+          still: 'assets/produkt-still.png',
+          clip: 'assets/vid/hof-zur-werkstatt.mp4',
+          accent: '#9B7EBD',
+          eyebrow: 'And it all pours into',
+          title: 'One perfect thing.',
+          body: 'Dives and connectors are normalised into the flat segment chain at mount time.',
+          tags: [],
+          cta: { primary: { label: 'Get started', href: '#' },
+                 secondary: { label: 'Gemischte Kette', href: 'index.html' } },
+        },
+      ],
+      connectors: [
+        'assets/vid/hof-zur-werkstatt.mp4',
+      ],
+    });
+  </script>
+</body>
+</html>

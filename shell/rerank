@@ -1,0 +1,27 @@
+#!$HOME/AI/audio-tools/.venv/bin/python
+"""rerank — local cross-encoder reranking for agents (brain/RAG search).
+
+Usage:
+  rerank "query" "doc one" "doc two" ...     ranked list on stdout (score TAB text)
+  echo -e "doc1\ndoc2" | rerank "query"      docs from stdin, one per line
+Model: BAAI/bge-reranker-v2-m3 (multilingual, cached locally after first run).
+"""
+import sys
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    query = sys.argv[1]
+    docs = sys.argv[2:] or [l.strip() for l in sys.stdin if l.strip()]
+    if not docs:
+        print("rerank: no documents given", file=sys.stderr)
+        sys.exit(2)
+    from sentence_transformers import CrossEncoder
+    model = CrossEncoder("BAAI/bge-reranker-v2-m3")
+    scores = model.predict([(query, d) for d in docs])
+    for score, doc in sorted(zip(scores, docs), reverse=True):
+        print(f"{score:.4f}\t{doc}")
+
+if __name__ == "__main__":
+    main()

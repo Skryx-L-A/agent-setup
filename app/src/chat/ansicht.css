@@ -1,0 +1,114 @@
+/* Die Chat-Ansicht (SPEC-V4 Abschnitt 6). Dieselbe Sprache wie der Rest der
+   Werkbank: dunkel, monospace, ruhige Farben, Gelb ist fuer "etwas will etwas"
+   reserviert.
+
+   SIE LIEGT UEBER DEM PANE, deshalb `position: absolute` im Pane-Kasten und
+   `display: none`, solange sie aus ist -- das Terminal darunter behaelt seine
+   Groesse, wird weiter gezeichnet und weiter ausgewertet. Waere die Ansicht ein
+   Geschwisterelement, das dem Terminal Platz nimmt, muesste xterm bei jedem
+   Umschalten neu vermessen werden, und die Bildschirmauswertung saehe eine
+   andere Groesse als tmux. */
+.chatansicht {
+  position: absolute; inset: 0; z-index: 5;
+  display: none; flex-direction: column;
+  background: #14171c; color: #d8dee9;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+.chatansicht.an { display: flex; }
+
+.chat-leiste {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border-bottom: 1px solid #262b34; background: #171b21;
+}
+.chat-titel { font-weight: 700; }
+
+/* Die drei Marken kommen aus der BILDSCHIRMAUSWERTUNG, nicht aus dem Protokoll
+   -- deshalb stehen sie oben und nicht im Verlauf: was der Pane weiss und die
+   Datei nicht, darf nicht zwischen zwei Absaetzen verschwinden. */
+.chat-marke {
+  padding: 1px 7px; border-radius: 9px; font-size: 11px;
+  border: 1px solid #2c323c; color: #8b93a1;
+}
+.chat-marke.freigabe { color: #1b1d22; background: #d7b955; border-color: #d7b955; font-weight: 700; }
+.chat-marke.last { color: #9aa4b2; }
+.chat-marke.last.unbekannt { color: #6b7280; font-style: italic; }
+.chat-marke.arbeitet { color: #7fb069; border-color: #3c5a34; }
+.chat-marke.ruhig { color: #6b7280; }
+/* Die Herkunft der Zuordnung: die eindeutigen Wege ruhig, der Rueckfall
+   sichtbar anders -- er kann bei zwei Sitzungen im selben Ordner danebengreifen,
+   und das soll man der Marke ansehen, ohne den Mauszeiger darauf zu halten. */
+.chat-marke.herkunft { color: #8b93a1; }
+.chat-marke.herkunft.ordner { color: #d7b955; border-color: #5a4f2a; font-style: italic; }
+
+.chat-knopf {
+  margin-left: auto; background: #1d222a; border: 1px solid #2c323c; color: #d8dee9;
+  font: inherit; padding: 2px 10px; border-radius: 4px; cursor: pointer;
+}
+.chat-knopf:hover { background: #242a34; }
+
+.chat-verlauf { flex: 1 1 auto; overflow-y: auto; padding: 10px 12px; }
+
+.chat-zeile { margin: 0 0 12px; }
+.chat-kopf { display: flex; gap: 8px; align-items: baseline; margin-bottom: 2px; }
+.chat-sprecher { font-weight: 700; font-size: 11px; }
+.chat-art, .chat-zeit { color: #6b7280; font-size: 10px; }
+.chat-text { white-space: pre-wrap; }
+
+.chat-zeile.rolle-mensch .chat-sprecher { color: #7aa2f7; }
+.chat-zeile.rolle-agent .chat-sprecher { color: #9ece6a; }
+.chat-zeile.rolle-system .chat-sprecher { color: #8b93a1; }
+.chat-zeile.rolle-werkzeug .chat-sprecher { color: #c0a36e; }
+
+/* Ueberlegungen und Werkzeugaufrufe sind Beiwerk: sie stehen da, aber sie
+   draengen sich nicht vor die Antwort. */
+.chat-zeile.art-denken .chat-text,
+.chat-zeile.art-werkzeug .chat-text { color: #8b93a1; }
+.chat-zeile.art-werkzeug .chat-text { font-size: 11px; }
+
+/* Der Bild-Platzhalter (chat/bildplatzhalter.ts): ein knapper, eigener Satz
+   statt Harness-Interna -- deshalb sichtbar anders als ein Gespraechsabsatz. */
+.chat-bild { color: #8b93a1; font-style: italic; }
+
+/* DER KLEINE MARKDOWN-RENDERER (chat/markdown.ts). Die Ansicht ist bereits
+   monospace und dunkel -- diese Regeln geben den Bloecken nur ihre eigene
+   Kontur, keine zweite Typografie. */
+.chat-text :is(.md-h, .md-p, .md-liste, .md-tabelle, .md-zitat, .md-code) { margin: 0 0 8px; }
+.chat-text > :last-child { margin-bottom: 0; }
+.chat-text .md-h { font-weight: 700; color: #e5e9f0; }
+.chat-text h1.md-h { font-size: 15px; }
+.chat-text h2.md-h { font-size: 14px; }
+.chat-text h3.md-h, .chat-text h4.md-h, .chat-text h5.md-h, .chat-text h6.md-h { font-size: 13px; }
+.chat-text code { background: #1d222a; border: 1px solid #262b34; border-radius: 3px; padding: 0 4px; }
+.chat-text .md-code { background: #1d222a; border: 1px solid #262b34; border-radius: 4px; padding: 8px 10px; overflow-x: auto; }
+.chat-text .md-code code { background: none; border: none; padding: 0; }
+.chat-text .md-liste { padding-left: 20px; }
+.chat-text .md-zitat { border-left: 2px solid #2c323c; padding-left: 10px; color: #a7afbd; }
+.chat-text .md-tabelle { border-collapse: collapse; }
+.chat-text .md-tabelle th, .chat-text .md-tabelle td {
+  border: 1px solid #262b34; padding: 3px 8px; text-align: left;
+}
+.chat-text .md-tabelle th { background: #1d222a; }
+
+/* Ein Nein bekommt Platz und einen ganzen Satz -- kein graues Feld
+   (SPEC-V4 6.3 Punkt 6). */
+.chat-grund { color: #8b93a1; padding: 24px 8px; max-width: 60ch; }
+
+.chat-fuss {
+  flex: 0 0 auto; display: flex; gap: 12px; justify-content: space-between;
+  padding: 4px 10px; border-top: 1px solid #262b34; color: #6b7280; font-size: 10px;
+}
+.chat-quelle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-hinweis { flex: 0 0 auto; }
+
+/* Der Griff zurueck ins Gespraech. Er sitzt in der Ecke des Panes, solange die
+   Ansicht aus ist -- ohne ihn gaebe es keinen Weg zurueck, sobald jemand einmal
+   auf Terminal gestellt hat. Klein und halbdurchsichtig: er nimmt dem Terminal
+   darunter nichts weg. */
+.chat-griff {
+  position: absolute; right: 6px; bottom: 4px; z-index: 4;
+  background: rgba(29, 34, 42, 0.82); border: 1px solid #2c323c; color: #8b93a1;
+  font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 1px 7px; border-radius: 9px; cursor: pointer; opacity: 0.55;
+}
+.chat-griff:hover { opacity: 1; color: #d8dee9; }

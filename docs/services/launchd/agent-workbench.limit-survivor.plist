@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE. Replace __HOME__ before loading; see docs/SERVICES.md for the one-line sed.
+
+  When an agent runs into its rate limit, the pane stops and stays stopped, even
+  though the limit expires at a time the message itself names. This job reads that
+  time and nudges the pane back to work once it has passed -- not before, not
+  repeatedly, and never into a pane that is only displaying a remote session.
+
+  Every five minutes is often enough: the job is a few lines of reading, and the
+  thing it waits for is measured in hours. `limit-survivor` ships in shell/.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>agent-workbench.limit-survivor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>__HOME__/.local/bin/limit-survivor</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/limit-survivor.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/limit-survivor.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

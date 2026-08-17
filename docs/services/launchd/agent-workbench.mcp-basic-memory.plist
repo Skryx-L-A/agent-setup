@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE. Replace __HOME__ before loading; see docs/SERVICES.md for the one-line sed.
+
+  ONE shared basic-memory MCP server for every agent session. Without it each session
+  starts its own stdio server: measured on a working machine, 21 processes holding
+  3.7 GB. Over HTTP they all talk to this single process instead. It binds 127.0.0.1
+  only, so nothing is reachable from outside the machine.
+
+  Requires the `basic-memory` command; it is not part of this repository.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>agent-workbench.mcp-basic-memory</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/basic-memory</string>
+    <string>mcp</string>
+    <string>--transport</string>
+    <string>streamable-http</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8766</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/mcp-shared/basic-memory.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/mcp-shared/basic-memory.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

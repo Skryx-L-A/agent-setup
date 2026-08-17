@@ -1,0 +1,973 @@
+#!/opt/homebrew/bin/python3
+# wb-modell-proxy — bedarfsweiser Vorschalt-Proxy fuer lokale Modellserver.
+#
+# WOFUER (2026-08-13, Entscheidung des Nutzers "nichts laeuft im Leerlauf"):
+# pi soll lokale MLX-Modelle (grug) benutzen koennen, ohne dass ein
+# Modellserver dauerhaft 15 GB haelt. Der Proxy loest das ohne eigenen
+# Dauerprozess: launchd haelt den LAUSCH-Socket (127.0.0.1:8080), dieses
+# Programm startet erst bei der ERSTEN Verbindung, faehrt dann per ensureCmd
+# den echten Backend-Server hoch (grug-server ensure, Port 8081) und reicht
+# den Verkehr roh durch. Nach idleMinutes ohne Verkehr laeuft stopCmd, und
+# wenn kein Backend mehr laeuft, beendet sich der Proxy selbst — launchd
+# re-armiert den Socket, der naechste Aufruf startet alles von vorn.
+# Leerlaufkosten: null Prozesse, nur ein Socket im Kernel.
+#
+# EIGENTUEMER IM SINNE DER PROZESS-HYGIENE ist die plist
+# agent-workbench.modell-proxy (shell/agent-workbench.modell-proxy.plist, installiert
+# nach ~/Library/LaunchAgents/). Wer diesen Prozess laufen sieht, hat ihn
+# nicht "vergessen": er gehoert launchd, endet von allein und wird ueber
+# `launchctl bootout gui/$(id -u)/agent-workbench.modell-proxy` abgeschaltet,
+# nicht per kill. Umgekehrt gilt: die Modellserver DAHINTER gehoeren weiter
+# ihrem eigenen Werkzeug (grug-server), und dieser Proxy beendet sie
+# verifiziert — er nimmt nie an, dass ein stopCmd gewirkt hat.
+#
+# FESTER INTERPRETER, kein `env python3` (Review 2026-08-13, S1/S2): unter
+# launchd stand `#!/usr/bin/env python3` auf /opt/homebrew/bin/python3 (3.14),
+# in der Testumgebung dagegen auf /usr/bin/python3 (3.9) — und genau zwischen
+# diesen beiden Fassungen hat `Server.wait_closed()` seine Bedeutung geaendert
+# (ab 3.12 wartet es auf ALLE offenen Verbindungs-Handler). Der Testbeleg galt
+# damit fuer ein anderes Programmverhalten als der Betrieb. Der Pfad steht
+# deshalb fest im Shebang; Tests rufen dieselbe Datei und damit denselben
+# Interpreter. Diese Datei ist ohnehin Mac-only (MLX/Metal).
+#
+# ABSCHALTWEG, in dieser Reihenfolge (Review S1/S3/S4): Beim Beenden wird
+# ZUERST das Backend gestoppt und erst danach auf die offenen Verbindungen
+# geachtet. Andersherum — erst `wait_closed()`, dann stoppen — bleibt eine
+# einzige ungenutzte Keep-Alive-Verbindung ewig stehen und der Modellserver
+# mit ihr; gemessen. Dieselbe Reihenfolge macht das Beenden auch gegen ein
+# SIGKILL nach 5 Sekunden robust: das SIGTERM an den Modellserver ist dann
+# laengst heraus.
+#
+# GENERISCH GEDACHT: ein Backend ist nichts als {Lauschport, Backendport,
+# ensureCmd, stopCmd, idleMinutes} in backends.json. Ein zweites Backend
+# (llama.cpp, vllm) braucht nur einen weiteren Eintrag dort plus einen
+# weiteren Socket-Eintrag in der plist — ein Prozess bedient alle Ports.
+#
+# PORTS (Stand 2026-08-13): 8080 = dieser Proxy (via launchd), 8081 =
+# grug-server/mlx_lm.server dahinter. pi's ~/.pi/agent/models.json zeigt
+# unveraendert auf 8080 und merkt vom Umbau nichts. 11434 (Ollama-Daemon)
+# und 8766/8767 (MCP) sind fremd und werden nie angefasst.
+#
+# Aufruf:
+#   wb-modell-proxy                 Sockets von launchd uebernehmen (Normalfall)
+#   wb-modell-proxy --selbst-binden selbst lauschen statt launchd (Test und
+#                                   Rueckfallweg als KeepAlive-Daemon)
+#   wb-modell-proxy --pruefen       Konfiguration lesen, ausgeben, beenden
+#   --konfig PFAD / --log PFAD      Vorgaben ueberschreiben (auch ueber
+#                                   WB_MODELL_PROXY_KONFIG / _LOG)
+#   WB_MODELL_PROXY_STDERR=1        Protokoll zusaetzlich nach stderr
+#
+# Nur Python-Standardbibliothek, kein Paket, kein Netz.
+
+import argparse
+import asyncio
+import ctypes
+import json
+import os
+import re
+import shlex
+import signal
+import socket
+import sys
+import time
+import traceback
+
+MINDEST_PYTHON = (3, 11)
+if sys.version_info < MINDEST_PYTHON:
+    sys.stderr.write(
+        "wb-modell-proxy: braucht Python %d.%d oder neuer, laeuft aber unter %s (%s).\n"
+        % (MINDEST_PYTHON[0], MINDEST_PYTHON[1],
+           ".".join(str(x) for x in sys.version_info[:3]), sys.executable)
+    )
+    raise SystemExit(2)
+
+VORGABE_KONFIG = "~/.config/wb-modell-proxy/backends.json"
+VORGABE_LOG = "~/.local/state/wb-modell-proxy/proxy.log"
+LOG_MAX_BYTES = 1024 * 1024
+PUFFER = 65536
+# Wartezeiten nach einem gescheiterten Startversuch (Review S8). Solange sie
+# laeuft, bekommt jeder Client SOFORT eine 503 mit dem letzten Grund, statt
+# hinter einem weiteren, ebenso aussichtslosen Versuch zu stehen.
+BACKOFF_STUFEN = (5.0, 15.0, 45.0, 120.0)
+
+
+class Protokoll:
+    """Anhaengendes Protokoll mit Groessendeckel: bei Ueberschreitung wandert
+    die Datei nach *.1 (genau eine Altfassung), danach wird neu begonnen."""
+
+    def __init__(self, pfad, max_bytes=LOG_MAX_BYTES):
+        self.pfad = pfad
+        self.max_bytes = max_bytes
+        try:
+            os.makedirs(os.path.dirname(pfad) or ".", exist_ok=True)
+        except OSError as e:
+            print("wb-modell-proxy: Protokollordner nicht anlegbar: %s" % e, file=sys.stderr)
+
+    def __call__(self, text):
+        zeile = "%s [%d] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), text)
+        try:
+            if os.path.exists(self.pfad) and os.path.getsize(self.pfad) + len(zeile) > self.max_bytes:
+                os.replace(self.pfad, self.pfad + ".1")
+            with open(self.pfad, "a", encoding="utf-8") as f:
+                f.write(zeile)
+        except OSError as e:
+            print("wb-modell-proxy: Protokoll %s nicht schreibbar: %s" % (self.pfad, e), file=sys.stderr)
+        if os.environ.get("WB_MODELL_PROXY_STDERR") == "1":
+            sys.stderr.write(zeile)
+            sys.stderr.flush()
+
+
+def stutze_launchd_log(pfad, max_bytes, log):
+    """Den Deckel fuer die launchd-Protokolldatei ziehen (Review S7).
+
+    stdout/stderr des Jobs gehen an eine Datei, die launchd OFFEN haelt —
+    umbenennen wuerde nichts bringen, weil launchds Deskriptor auf die alte
+    Inode zeigt und weiterschriebe. Deshalb: Inhalt einmal zur Seite legen
+    und die Datei AN ORT UND STELLE auf Laenge 0 kuerzen. Das passiert beim
+    Start des Proxys, also hoechstens so oft, wie es Kaltstarts gibt."""
+    try:
+        if not os.path.exists(pfad) or os.path.getsize(pfad) <= max_bytes:
+            return
+        with open(pfad, "rb") as q:
+            inhalt = q.read()
+        with open(pfad + ".1", "wb") as z:
+            z.write(inhalt)
+        os.truncate(pfad, 0)
+        log("launchd-Protokoll %s war groesser als %d Bytes — Inhalt nach %s.1 gesichert "
+            "und die Datei an Ort und Stelle gekuerzt." % (pfad, max_bytes, pfad))
+    except OSError as e:
+        log("launchd-Protokoll %s liess sich nicht kuerzen: %s" % (pfad, e))
+
+
+def launchd_sockets(name):
+    """Die von launchd gehaltenen Deskriptoren fuer <name> uebernehmen.
+
+    launch_activate_socket(3) liegt in libSystem und gibt einen mit malloc
+    angelegten int-Vektor zurueck, den der Aufrufer freigeben muss. Ein
+    Rueckgabewert ungleich 0 IST die errno (ESRCH: nicht von launchd
+    gestartet, ENOENT: dieser Socket-Name steht nicht in der plist)."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    fn = libc.launch_activate_socket
+    fn.argtypes = [
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    fn.restype = ctypes.c_int
+    libc.free.argtypes = [ctypes.c_void_p]
+    libc.free.restype = None
+
+    vektor = ctypes.POINTER(ctypes.c_int)()
+    anzahl = ctypes.c_size_t(0)
+    rc = fn(name.encode("utf-8"), ctypes.byref(vektor), ctypes.byref(anzahl))
+    if rc != 0:
+        raise OSError(rc, "launch_activate_socket('%s'): %s" % (name, os.strerror(rc)))
+    fds = [vektor[i] for i in range(anzahl.value)]
+    libc.free(vektor)
+    return fds
+
+
+class Backend:
+    def __init__(self, schluessel, cfg, log, launchd_label="", dauerfehler=""):
+        self.schluessel = str(schluessel)
+        self.log = log
+        # Wer unter launchd laeuft, hat keinen tmux-Pane — und damit nach der
+        # Prozess-Hygiene zunaechst keinen Eigentuemer fuer alles, was
+        # ensureCmd im Hintergrund startet. Deshalb reicht der Proxy sein
+        # eigenes launchd-Label an ensureCmd/stopCmd weiter: `wb-nohup`
+        # traegt es als Eigentuemer ein (--launchd), und `wb-waisen` prueft
+        # spaeter am Job statt am Pane, ob dieser Eigentuemer noch lebt.
+        # Ohne Label bleibt es bei wb-nohups hartem Nein — die Pruefung wird
+        # NICHT umgangen, sie bekommt eine zweite, ebenso pruefbare Quelle.
+        self.launchd_label = launchd_label
+        # Gesetzt, wenn dieser Eintrag ueberhaupt nicht betriebsfaehig ist
+        # (unlesbare Konfiguration, fehlendes Pflichtfeld). Der Socket wird
+        # dann trotzdem bedient — mit einer 503, die den Grund nennt, statt
+        # mit einem wortlosen Prozessende, hinter dem der Client haengt
+        # (Review S5).
+        self.dauerfehler = dauerfehler
+
+        cfg = cfg or {}
+        self.name = cfg.get("name") or self.schluessel
+        self.host = cfg.get("backendHost", "127.0.0.1")
+        self.port = int(cfg.get("backendPort") or 0)
+        self.lausch_host = cfg.get("listenHost", "127.0.0.1")
+        try:
+            self.lausch_port = int(cfg.get("listenPort", self.schluessel))
+        except (TypeError, ValueError):
+            self.lausch_port = 0
+        # Name des Socket-Eintrags im Sockets-Dict der plist. Vorgabe ist der
+        # Konfigschluessel (also der Lauschport); 'socketName' erlaubt einen
+        # sprechenden Namen in der plist, ohne die Konfiguration umzubauen.
+        self.socket_name = str(cfg.get("socketName") or self.schluessel)
+        self.ensure_cmd = cfg.get("ensureCmd") or ""
+        self.stop_cmd = cfg.get("stopCmd") or ""
+        # Betriebsbereitschaft wird auf HTTP-Ebene gemessen, nicht am
+        # angenommenen TCP-Verbindungsaufbau (Review S10): ein halb
+        # gestarteter oder wildfremder Prozess auf dem Backendport nimmt
+        # Verbindungen an, spricht aber kein HTTP — er darf nie als
+        # "laeuft schon" durchgehen. Gefordert ist nur eine gueltige
+        # Statuszeile; auch ein 404 beweist einen HTTP-Server.
+        self.health_pfad = cfg.get("healthPath", "/health")
+        self.health_frist = float(cfg.get("healthTimeoutSeconds", 3))
+        # Die ZWEITE Frage, und sie ist eine andere (Re-Review R2): "haelt
+        # ueberhaupt noch jemand den Port". Dafuer taugt HTTP nicht — ein
+        # Modellserver, der SIGTERM bekommen hat und 20 GB freigibt, antwortet
+        # nicht mehr, haelt den Port aber weiter. Gemessen wurde genau das:
+        # "gestoppt und geprueft — Port frei", waehrend lsof den Port belegt
+        # sah. Fuer diese Frage gibt es deshalb einen reinen
+        # TCP-Verbindungsversuch mit eigener, kurzer Frist.
+        self.port_frist = float(cfg.get("portProbeTimeoutSeconds", 2))
+        # Nur beenden, was dieser Proxy auch gestartet hat (2026-08-13, an
+        # einem lebenden Gegenbeispiel gelernt): waehrend der Reparaturrunde
+        # lief ein fremder Dauerlauf, der `grug-server` aus seinem EIGENEN
+        # Pane hochgefahren hatte und ihn zwischen seinen Fenstern selbst
+        # wieder stoppt. Der Proxy hatte sich nur eingeklinkt ("antwortet
+        # bereits") — haette ihn aber nach seiner Leerlaufzeit beendet und
+        # damit einen fremden Lauf abgeraeumt. Wer sich nur einklinkt, klinkt
+        # sich auch nur wieder aus. stopForeign=true stellt das ausdruecklich
+        # um, fuer den Fall, dass ein Backend niemanden sonst hat.
+        self.stop_foreign = bool(cfg.get("stopForeign", False))
+        self.idle_s = float(cfg.get("idleMinutes", 20)) * 60.0
+        # Harte Grenze fuer den Fall, dass ein Client eine Keep-Alive-
+        # Verbindung offen HAELT, ohne sie zu benutzen: eine offene
+        # Verbindung zaehlt als aktiv (so gefordert), aber sie darf 15 GB
+        # nicht unbegrenzt binden. Vorgabe: das Dreifache der Leerlaufzeit
+        # ohne einen einzigen Byte Verkehr.
+        hart = cfg.get("hardIdleMinutes")
+        self.hart_s = float(hart) * 60.0 if hart is not None else self.idle_s * 3.0
+        self.ensure_frist = float(cfg.get("ensureTimeoutSeconds", 300))
+        self.stop_frist = float(cfg.get("stopTimeoutSeconds", 120))
+        self.verbindungs_frist = float(cfg.get("connectTimeoutSeconds", 10))
+
+        self.bereit = False
+        self.aktiv = 0
+        self.letzte = time.monotonic()
+        self.sperre = asyncio.Lock()
+        # EIGENTUM: Hat DIESER Proxy den Prozess auf dem Backendport erzeugt?
+        #
+        # Bis zum Re-Review hing das am Merker "ensureCmd wurde ausgefuehrt" —
+        # und das ist eine andere Frage (Befund R1). `grug-server ensure` ist
+        # absichtlich idempotent: laeuft der Server schon, meldet es Erfolg und
+        # startet nichts. Verpasste die erste /health-Probe ihre Frist, weil
+        # das Modell gerade rechnete, hielt der Proxy ein fremdes Backend fuer
+        # abwesend, rief ensureCmd, bekam Exit 0 — und buchte es als eigenes
+        # ein. Gemessen: der Proxy beendete ein fremdes Backend.
+        #
+        # Entschieden wird deshalb UNMITTELBAR VOR dem ensureCmd, und mit dem
+        # reinen TCP-Verbindungsversuch statt mit HTTP: war der Backendport da
+        # schon belegt, hat ihn jemand anderes hochgefahren, und er bleibt
+        # fremd — auch wenn ensureCmd danach Erfolg meldet. War er frei, ist
+        # das, was danach dort lauscht, unseres.
+        #
+        # WEG 2, der damit NICHT verschwindet: ein fremder Starter faehrt das
+        # Backend hoch, waehrend unser ensureCmd unterwegs ist. Dann war der
+        # Port beim Beschluss frei, wir buchen Eigentum, und beendet wird am
+        # Ende womoeglich ein Prozess, den ein anderer gestartet hat. Das ist
+        # ohne eine Sperre, die sich BEIDE Starter teilen, nicht aufloesbar —
+        # und genau die gibt es fuer grug bereits: `wb-belegung` plus die
+        # Kennungsdatei von `grug-server`. Was hier gilt, ist deshalb bewusst:
+        # im Zweifel entscheidet der Zustand des Ports im Augenblick des
+        # Beschlusses. Das Fenster ist die Laufzeit von ensureCmd statt wie
+        # vorher "immer", und wer es ganz schliessen will, setzt fuer sein
+        # Backend stopForeign=false und startet es gar nicht erst von zwei
+        # Seiten.
+        #
+        # Abgebucht wird Eigentum an genau EINER Stelle: nach einem Stopp, der
+        # nachweislich gewirkt hat (der Port nimmt keine Verbindung mehr an).
+        # Absichtlich NICHT abgebucht wird es, wenn der Port zwar belegt ist,
+        # aber nicht antwortet — dieser Zustand sieht bei einem haengenden
+        # EIGENEN Backend genauso aus wie bei einem fremden, und in dem Fall
+        # ist es besser, sich weiter zustaendig zu fuehlen, als einen eigenen
+        # Prozess mit 15 GB stehen zu lassen.
+        self.eigen = False
+        self._ensure_kind = None
+        self.fehlversuche = 0
+        self.sperrzeit_bis = 0.0
+        self.letzter_fehler = ""
+
+    # ── Hilfen ──────────────────────────────────────────────────────────────
+    def beruehren(self):
+        self.letzte = time.monotonic()
+
+    async def _kommando(self, kommando, frist, was, merken=False):
+        try:
+            argv = shlex.split(kommando)
+        except ValueError as e:
+            return 1, "%sCmd '%s' ist nicht zerlegbar: %s" % (was, kommando, e)
+        if not argv:
+            return 1, "%sCmd ist leer" % was
+        umgebung = dict(os.environ)
+        if self.launchd_label:
+            umgebung["WB_EIGENTUEMER_LAUNCHD"] = self.launchd_label
+        try:
+            p = await asyncio.create_subprocess_exec(
+                *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                env=umgebung,
+            )
+        except OSError as e:
+            return 1, "%s laesst sich nicht starten: %s" % (kommando, e)
+        if merken:
+            self._ensure_kind = p
+        try:
+            aus, _ = await asyncio.wait_for(p.communicate(), timeout=frist)
+        except asyncio.TimeoutError:
+            try:
+                p.kill()
+            except ProcessLookupError:
+                pass
+            await p.wait()
+            return 1, "%s hat die Frist von %.0fs ueberschritten" % (kommando, frist)
+        finally:
+            if merken:
+                self._ensure_kind = None
+        text = (aus or b"").decode("utf-8", "replace").strip()
+        if p.returncode is None:
+            return 1, "%s wurde abgebrochen. %s" % (kommando, text)
+        if p.returncode < 0:
+            return 1, "%s wurde mit Signal %d abgebrochen. %s" % (kommando, -p.returncode, text)
+        return p.returncode, text
+
+    async def port_belegt(self, frist=None):
+        """Haelt ueberhaupt noch jemand den Backendport? (Re-Review R2)
+
+        Reiner TCP-Verbindungsversuch, kein Wort HTTP. Das ist die Frage
+        "ist es wirklich weg" — und sie hat eine andere Antwort als "ist es
+        bereit": ein sterbender Modellserver antwortet nicht mehr, haelt den
+        Port aber weiter, und ein Lauschsocket verschwindet erst mit seinem
+        Prozess. Dieselbe Probe beantwortet vor dem ensureCmd die Frage, ob
+        der Port schon jemandem gehoert (R1)."""
+        if self.port <= 0:
+            return False
+        frist = self.port_frist if frist is None else frist
+        try:
+            leser, schreiber = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port), timeout=frist
+            )
+        except (OSError, asyncio.TimeoutError):
+            return False
+        try:
+            schreiber.close()
+            await schreiber.wait_closed()
+        except (OSError, ConnectionError):
+            pass
+        return True
+
+    async def antwortet(self, frist=None):
+        """Antwortet auf dem Backendport ein echter HTTP-Server? (Review S10)
+
+        Nur fuer die Frage "ist es BEREIT". Fuer "ist es weg" siehe
+        port_belegt() — die beiden auseinanderzuhalten ist Befund R2."""
+        if self.port <= 0:
+            return False
+        frist = self.health_frist if frist is None else frist
+        try:
+            leser, schreiber = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port), timeout=frist
+            )
+        except (OSError, asyncio.TimeoutError):
+            return False
+        try:
+            anfrage = ("GET %s HTTP/1.0\r\nHost: %s:%d\r\n"
+                       "User-Agent: wb-modell-proxy\r\nConnection: close\r\n\r\n"
+                       % (self.health_pfad, self.host, self.port)).encode("ascii", "replace")
+            schreiber.write(anfrage)
+            await asyncio.wait_for(schreiber.drain(), timeout=frist)
+            zeile = await asyncio.wait_for(leser.readline(), timeout=frist)
+            return zeile.startswith(b"HTTP/")
+        except (OSError, ConnectionError, asyncio.TimeoutError):
+            return False
+        finally:
+            try:
+                schreiber.close()
+                await schreiber.wait_closed()
+            except (OSError, ConnectionError):
+                pass
+
+    # ── Start und Stopp ─────────────────────────────────────────────────────
+    async def sicherstellen(self):
+        """ensureCmd ausfuehren, falls noetig. Rueckgabe: None = bereit,
+        sonst ein Klartextgrund fuer den Client."""
+        rest = self.sperrzeit_bis - time.monotonic()
+        if rest > 0:
+            return ("der letzte Startversuch scheiterte (%s) — naechster Versuch "
+                    "fruehestens in %.0fs." % (self.letzter_fehler or "ohne Angabe", rest))
+        # Auf die Sperre wird nie unbefristet gewartet (Review S8): wer hier
+        # steht, wartet auf einen fremden ensure-Lauf, und der hat selbst eine
+        # Frist. Ein Puffer darauf, danach eine ehrliche 503.
+        sperr_frist = self.ensure_frist + 30.0
+        try:
+            await asyncio.wait_for(self.sperre.acquire(), timeout=sperr_frist)
+        except asyncio.TimeoutError:
+            return ("seit %.0fs wartet dieser Aufruf darauf, dass ein anderer Startversuch "
+                    "fuer '%s' fertig wird." % (sperr_frist, self.name))
+        try:
+            if self.bereit:
+                return None
+            if await self.antwortet():
+                self.log("%s: Backend auf %s:%d antwortet bereits auf %s — kein ensure noetig%s."
+                         % (self.name, self.host, self.port, self.health_pfad,
+                            "" if self.eigen else " (fremd, gehoert nicht diesem Proxy)"))
+                self.bereit = True
+                self.fehlversuche = 0
+                return None
+            # Eigentumsfrage, VOR dem ensureCmd und mit dem reinen
+            # TCP-Versuch (R1, ausfuehrlich bei self.eigen oben): haelt schon
+            # jemand den Port, ist das Backend fremd — dann darf auch ein
+            # ensureCmd mit Exit 0 daran nichts aendern, weil es idempotent
+            # ist und gar nichts gestartet haben muss.
+            schon_belegt = await self.port_belegt()
+            if schon_belegt:
+                self.log("%s: %s:%d ist belegt, antwortet aber nicht auf %s — ensure laeuft "
+                         "trotzdem, das Backend bleibt aber fremd (dieser Proxy hat es nicht erzeugt)."
+                         % (self.name, self.host, self.port, self.health_pfad))
+            else:
+                self.eigen = True
+            self.log("%s: Kaltstart — fuehre '%s' aus (Frist %.0fs)."
+                     % (self.name, self.ensure_cmd, self.ensure_frist))
+            t0 = time.monotonic()
+            rc, aus = await self._kommando(self.ensure_cmd, self.ensure_frist, "ensure", merken=True)
+            dauer = time.monotonic() - t0
+            if rc != 0:
+                grund = aus.strip().splitlines()[-1] if aus.strip() else "keine Ausgabe"
+                self.log("%s: ensure GESCHEITERT nach %.1fs (Exit %s): %s"
+                         % (self.name, dauer, rc, aus.replace("\n", " | ")))
+                return self._fehlversuch("'%s' scheiterte (Exit %s): %s"
+                                         % (self.ensure_cmd, rc, grund))
+            if not await self.antwortet():
+                self.log("%s: ensure meldete Erfolg nach %.1fs, aber %s:%d antwortet nicht auf %s."
+                         % (self.name, dauer, self.host, self.port, self.health_pfad))
+                return self._fehlversuch("'%s' meldete Erfolg, aber %s:%d antwortet nicht."
+                                         % (self.ensure_cmd, self.host, self.port))
+            self.log("%s: bereit nach %.1fs (Backend %s:%d)." % (self.name, dauer, self.host, self.port))
+            self.bereit = True
+            self.fehlversuche = 0
+            self.sperrzeit_bis = 0.0
+            self.letzter_fehler = ""
+            return None
+        finally:
+            self.sperre.release()
+
+    def _fehlversuch(self, grund):
+        self.fehlversuche += 1
+        warte = BACKOFF_STUFEN[min(self.fehlversuche, len(BACKOFF_STUFEN)) - 1]
+        self.sperrzeit_bis = time.monotonic() + warte
+        self.letzter_fehler = grund
+        self.log("%s: %d. Fehlversuch — naechster Startversuch fruehestens in %.0fs."
+                 % (self.name, self.fehlversuche, warte))
+        return grund
+
+    async def stoppen(self, grund, erzwingen=False, sperr_frist=None):
+        gesperrt = False
+        if sperr_frist is None:
+            await self.sperre.acquire()
+            gesperrt = True
+        else:
+            try:
+                await asyncio.wait_for(self.sperre.acquire(), timeout=sperr_frist)
+                gesperrt = True
+            except asyncio.TimeoutError:
+                self.log("%s: Sperre nach %.0fs nicht frei — der Stopp laeuft trotzdem, "
+                         "das Beenden des Backends hat Vorrang." % (self.name, sperr_frist))
+        try:
+            return await self._stoppen(grund, erzwingen)
+        finally:
+            if gesperrt:
+                self.sperre.release()
+
+    async def _stoppen(self, grund, erzwingen):
+        if not self.bereit and not (erzwingen and self.eigen):
+            return True
+        # Unter der Sperre noch einmal nachsehen (Review S3): zwischen dem
+        # Beschluss der Wache und diesem Punkt kann eine Anfrage eingetroffen
+        # sein. Sonst stirbt das Backend mitten in ihrer Antwort, und der
+        # Client sieht einen abgeschnittenen Strom als Erfolg.
+        if not erzwingen and self.aktiv > 0:
+            self.log("%s: Stopp abgeblasen — zwischenzeitlich %d offene Verbindung(en)."
+                     % (self.name, self.aktiv))
+            self.beruehren()
+            return False
+        if not self.eigen and not self.stop_foreign:
+            # Fremdes Backend: nur ausklinken, nicht beenden (siehe
+            # stopForeign oben). 'bereit' faellt trotzdem, damit sich der
+            # Proxy danach selbst beenden kann und kein Prozess im Leerlauf
+            # stehen bleibt — die naechste Anfrage klinkt sich neu ein.
+            if self.bereit:
+                self.log("%s: %s — aber %s:%d hat dieser Proxy nicht gestartet. Er klinkt sich "
+                         "nur aus und laesst es laufen; beenden muss es, wer es gestartet hat."
+                         % (self.name, grund, self.host, self.port))
+                self.bereit = False
+            return True
+        # 'bereit' faellt VOR dem stopCmd und vor jedem await. Eine neu
+        # eintreffende Anfrage laeuft damit in sicherstellen() gegen dieselbe
+        # Sperre und startet danach sauber kalt neu, statt in ein sterbendes
+        # Backend geleitet zu werden.
+        self.bereit = False
+        self.log("%s: %s — fuehre '%s' aus." % (self.name, grund, self.stop_cmd))
+        rc, aus = await self._kommando(self.stop_cmd, self.stop_frist, "stop")
+        # Geprueft wird mit dem reinen TCP-Versuch, nicht mit HTTP (R2): ein
+        # Prozess, der gerade 20 GB freigibt, antwortet nicht mehr und haelt
+        # den Port trotzdem. Solange hier jemand annimmt, sagt keine Zeile
+        # "frei" — und das Eigentum bleibt bestehen, denn zustaendig sind wir
+        # weiterhin.
+        noch_da = await self.port_belegt()
+        if noch_da:
+            self.log("%s: stop GESCHEITERT (Exit %s) — %s:%d ist weiterhin belegt, es haelt also "
+                     "noch jemand den Port. Das Backend bleibt eingebucht, naechster Versuch nach "
+                     "der Leerlaufzeit. Ausgabe: %s"
+                     % (self.name, rc, self.host, self.port, aus.replace("\n", " | ")))
+            self.beruehren()      # kein heisser Wiederholungslauf
+            return False
+        if rc != 0:
+            self.log("%s: stop meldete Exit %s, aber %s:%d nimmt keine Verbindung mehr an — gilt "
+                     "als beendet. Ausgabe: %s"
+                     % (self.name, rc, self.host, self.port, aus.replace("\n", " | ")))
+        else:
+            self.log("%s: gestoppt und geprueft — %s:%d nimmt keine Verbindung mehr an."
+                     % (self.name, self.host, self.port))
+        self.eigen = False
+        return True
+
+    async def abschalten(self):
+        """Der Abschaltweg (Review S1/S4). Zuerst einen noch laufenden
+        Startversuch abbrechen, dann stoppen, was laufen koennte — auch wenn
+        'bereit' nie True wurde."""
+        kind = self._ensure_kind
+        if kind is not None and kind.returncode is None:
+            self.log("%s: ein Startlauf ('%s') laeuft noch — er wird abgebrochen, damit das "
+                     "Beenden des Backends nicht hinter ihm wartet." % (self.name, self.ensure_cmd))
+            try:
+                kind.kill()
+                await asyncio.wait_for(kind.wait(), timeout=5)
+            except (ProcessLookupError, asyncio.TimeoutError):
+                pass
+            self.log("%s: HINWEIS — ein abgebrochener Startlauf kann Zustand ausserhalb des "
+                     "Backends hinterlassen (Belegungen, Sperrdateien). Nachsehen lohnt."
+                     % self.name)
+        if not (self.bereit or self.eigen):
+            return True
+        return await self.stoppen("Proxy endet", erzwingen=True, sperr_frist=2.0)
+
+    # ── Verkehr ─────────────────────────────────────────────────────────────
+    async def fehlerantwort(self, schreiber, grund):
+        rumpf = ("wb-modell-proxy: Backend '%s' konnte nicht gestartet werden.\n%s\n"
+                 % (self.name, grund)).encode("utf-8")
+        kopf = (
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n"
+            "\r\n" % len(rumpf)
+        ).encode("ascii")
+        try:
+            schreiber.write(kopf + rumpf)
+            await schreiber.drain()
+        except (OSError, ConnectionError):
+            pass
+
+    async def _kopieren(self, leser, schreiber):
+        try:
+            while True:
+                daten = await leser.read(PUFFER)
+                if not daten:
+                    break
+                schreiber.write(daten)
+                await schreiber.drain()
+                self.beruehren()
+        except (OSError, ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            try:
+                if schreiber.can_write_eof():
+                    schreiber.write_eof()
+            except (OSError, ConnectionError, RuntimeError):
+                pass
+
+    async def behandeln(self, klient_leser, klient_schreiber):
+        self.aktiv += 1
+        self.beruehren()
+        rueck_leser = rueck_schreiber = None
+        try:
+            if self.dauerfehler:
+                await self.fehlerantwort(klient_schreiber, self.dauerfehler)
+                return
+            if not self.bereit:
+                fehler = await self.sicherstellen()
+                if fehler:
+                    await self.fehlerantwort(klient_schreiber, fehler)
+                    return
+            try:
+                rueck_leser, rueck_schreiber = await asyncio.wait_for(
+                    asyncio.open_connection(self.host, self.port), timeout=self.verbindungs_frist
+                )
+            except (OSError, asyncio.TimeoutError):
+                # Backend ist unter uns weggestorben: einmal neu hochfahren,
+                # statt dem Client einen toten Port zu reichen.
+                self.log("%s: Backend %s:%d nicht erreichbar, obwohl eingebucht — starte neu."
+                         % (self.name, self.host, self.port))
+                self.bereit = False
+                fehler = await self.sicherstellen()
+                if fehler:
+                    await self.fehlerantwort(klient_schreiber, fehler)
+                    return
+                try:
+                    rueck_leser, rueck_schreiber = await asyncio.wait_for(
+                        asyncio.open_connection(self.host, self.port), timeout=self.verbindungs_frist
+                    )
+                except (OSError, asyncio.TimeoutError) as e:
+                    await self.fehlerantwort(
+                        klient_schreiber, "Backend %s:%d nicht erreichbar: %s" % (self.host, self.port, e)
+                    )
+                    return
+            await asyncio.gather(
+                self._kopieren(klient_leser, rueck_schreiber),
+                self._kopieren(rueck_leser, klient_schreiber),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                       # nie den Server mitreissen
+            self.log("%s: Verbindung abgebrochen: %r" % (self.name, e))
+        finally:
+            for w in (rueck_schreiber, klient_schreiber):
+                if w is None:
+                    continue
+                try:
+                    w.close()
+                except (OSError, ConnectionError):
+                    pass
+            self.aktiv -= 1
+            self.beruehren()
+
+
+def konfig_lesen(pfad):
+    with open(pfad, "r", encoding="utf-8") as f:
+        roh = json.load(f)
+    if not isinstance(roh, dict) or "backends" not in roh:
+        raise ValueError("%s: erwartet ein Objekt mit dem Schluessel 'backends'" % pfad)
+    if not isinstance(roh["backends"], dict) or not roh["backends"]:
+        raise ValueError("%s: 'backends' muss ein nicht-leeres Objekt sein "
+                         "(Schluessel = Lauschport)" % pfad)
+    return roh
+
+
+def eintrag_pruefen(pfad, schluessel, cfg):
+    """Gibt einen Klartextgrund zurueck, wenn dieser Eintrag nicht
+    betriebsfaehig ist — sonst einen leeren String."""
+    if not isinstance(cfg, dict):
+        return "%s: Backend '%s' ist kein Objekt" % (pfad, schluessel)
+    try:
+        int(cfg.get("listenPort", schluessel))
+    except (TypeError, ValueError):
+        return ("%s: Schluessel '%s' ist kein Lauschport (Zahl) und es steht kein "
+                "listenPort daneben" % (pfad, schluessel))
+    for pflicht in ("backendPort", "ensureCmd", "stopCmd"):
+        if not cfg.get(pflicht):
+            return "%s: Backend '%s' ohne '%s'" % (pfad, schluessel, pflicht)
+    try:
+        int(cfg["backendPort"])
+    except (TypeError, ValueError):
+        return "%s: Backend '%s' hat keinen numerischen backendPort" % (pfad, schluessel)
+    return ""
+
+
+def namen_pfad(logpfad):
+    return os.path.join(os.path.dirname(logpfad) or ".", "socketnamen.json")
+
+
+def namen_merken(logpfad, namen, log):
+    """Die zuletzt gueltigen Socketnamen festhalten.
+
+    Sie sind der einzige Weg, bei einer spaeter unlesbaren Konfiguration
+    ueberhaupt noch einen Socket von launchd abzuholen — und damit dem
+    Client eine 503 mit Grund zu geben, statt ihn haengen zu lassen
+    (Review S5)."""
+    try:
+        with open(namen_pfad(logpfad), "w", encoding="utf-8") as f:
+            json.dump({"namen": list(namen)}, f)
+    except OSError as e:
+        log("Socketnamen liessen sich nicht merken: %s" % e)
+
+
+def namen_lesen(logpfad, konfigpfad, log):
+    """Socketnamen fuer den Notbetrieb: erst die gemerkten, sonst das, was
+    sich aus der kaputten Konfiguration noch herauslesen laesst."""
+    namen = []
+    try:
+        with open(namen_pfad(logpfad), "r", encoding="utf-8") as f:
+            namen = [str(n) for n in (json.load(f).get("namen") or [])]
+    except (OSError, ValueError):
+        pass
+    if namen:
+        return namen
+    try:
+        with open(konfigpfad, "r", encoding="utf-8") as f:
+            text = f.read()
+        namen = re.findall(r'"socketName"\s*:\s*"([^"]+)"', text)
+    except OSError:
+        pass
+    if not namen:
+        log("Notbetrieb ohne bekannte Socketnamen — es kann kein Socket bedient werden.")
+    return namen
+
+
+async def waechter(backends, log, ende, tick, exit_idle):
+    while not ende.is_set():
+        try:
+            await asyncio.wait_for(ende.wait(), timeout=tick)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            jetzt = time.monotonic()
+            for b in backends.values():
+                # Auch ein Backend, das gerade nicht 'bereit' ist, bleibt hier
+                # in der Obhut, solange es UNSERES ist (R2): nach einem
+                # gescheiterten Stopp faellt 'bereit', das Eigentum aber
+                # nicht — sonst liefe ein eigener Modellserver unbeaufsichtigt
+                # weiter, und der Proxy beendete sich obendrein.
+                if not (b.bereit or b.eigen):
+                    continue
+                ruhe = jetzt - b.letzte
+                if b.aktiv == 0 and ruhe >= b.idle_s:
+                    await b.stoppen("Leerlauf seit %.0fs (Grenze %.0fs)" % (ruhe, b.idle_s),
+                                    erzwingen=not b.bereit)
+                elif b.aktiv > 0 and ruhe >= b.hart_s:
+                    await b.stoppen("harte Leerlaufgrenze: %d offene Verbindung(en), aber seit %.0fs "
+                                    "kein Byte Verkehr (Grenze %.0fs)" % (b.aktiv, ruhe, b.hart_s),
+                                    erzwingen=True)
+            if any(b.bereit or b.eigen for b in backends.values()):
+                continue
+            if sum(b.aktiv for b in backends.values()) > 0:
+                continue
+            juengste = max(b.letzte for b in backends.values())
+            if jetzt - juengste >= exit_idle:
+                log("kein Backend laeuft, keine Verbindung offen, %.0fs Ruhe — Proxy beendet sich. "
+                    "launchd re-armiert den Socket." % (jetzt - juengste))
+                ende.set()
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Auffangnetz (Review S9): ohne dieses stirbt die Wache still an
+            # einer unerwarteten Ausnahme, der Leerlauf-Stopp faellt aus, und
+            # der Proxy haelt die 15 bis 20 GB unbegrenzt.
+            log("Wache: unerwartete Ausnahme, Durchgang uebersprungen —\n%s" % traceback.format_exc())
+
+
+async def waechter_aufsicht(backends, log, ende, tick, exit_idle):
+    """Zweite Lage des Auffangnetzes: sollte die Wache trotz ihres eigenen
+    try/except enden, wird sie neu gestartet statt still zu fehlen."""
+    neustarts = 0
+    while not ende.is_set():
+        try:
+            await waechter(backends, log, ende, tick, exit_idle)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            neustarts += 1
+            log("Wache abgestuerzt (%d. Mal) — Neustart.\n%s" % (neustarts, traceback.format_exc()))
+            if neustarts >= 5:
+                log("Wache faellt wiederholt aus — der Leerlauf-Stopp ist nicht mehr verlaesslich. "
+                    "Proxy beendet sich, damit kein Backend unbeaufsichtigt weiterlaeuft.")
+                ende.set()
+                return
+            await asyncio.sleep(min(tick, 5.0))
+
+
+def backends_bauen(roh, konfigpfad, log, launchd_label):
+    backends = {}
+    for schluessel, cfg in roh["backends"].items():
+        grund = eintrag_pruefen(konfigpfad, schluessel, cfg)
+        if grund:
+            log("Eintrag unbrauchbar, wird nur noch mit 503 beantwortet: %s" % grund)
+        b = Backend(schluessel, cfg if isinstance(cfg, dict) else {}, log,
+                    launchd_label=launchd_label, dauerfehler=grund)
+        backends[b.schluessel] = b
+    return backends
+
+
+async def haupt(args):
+    log = Protokoll(args.log)
+    notbetrieb = ""
+    launchd_label = ""
+    tick, exit_idle = 5.0, 30.0
+    try:
+        roh = konfig_lesen(args.konfig)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        # Kein wortloses Ende (Review S5): launchd wuerde den Job bei jeder
+        # Verbindung neu starten, gedrosselt auf 10 Sekunden, und der Client
+        # bekaeme nie ein Byte. Stattdessen wird gelauscht und geantwortet.
+        notbetrieb = "Konfiguration unbrauchbar: %s" % e
+        log(notbetrieb + " — Notbetrieb: jede Verbindung bekommt eine 503 mit diesem Grund.")
+        roh = None
+
+    if roh is not None:
+        tick = float(roh.get("tickSeconds", 5))
+        exit_idle = float(roh.get("exitIdleSeconds", 30))
+        launchd_label = roh.get("launchdLabel") or ""
+        backends = backends_bauen(roh, args.konfig, log, launchd_label)
+        namen_merken(args.log, [b.socket_name for b in backends.values()], log)
+    else:
+        backends = {}
+        for name in namen_lesen(args.log, args.konfig, log):
+            b = Backend(name, {"name": name, "socketName": name}, log, dauerfehler=notbetrieb)
+            backends[b.schluessel] = b
+
+    if args.pruefen:
+        if notbetrieb:
+            print("wb-modell-proxy: %s" % notbetrieb)
+            return 2
+        for b in backends.values():
+            if b.dauerfehler:
+                print("%s: UNBRAUCHBAR — %s" % (b.name, b.dauerfehler))
+                continue
+            print("%s: lauscht %s:%d -> %s:%d | ensure=%s | stop=%s | health=%s (%.0fs) "
+                  "| portprobe=%.0fs | idle=%.1f min | hart=%.1f min | fremdes Backend %s"
+                  % (b.name, b.lausch_host, b.lausch_port, b.host, b.port,
+                     b.ensure_cmd, b.stop_cmd, b.health_pfad, b.health_frist, b.port_frist,
+                     b.idle_s / 60.0, b.hart_s / 60.0,
+                     "wird auch gestoppt" if b.stop_foreign else "wird nur ausgeklinkt"))
+        print("tickSeconds=%.2f exitIdleSeconds=%.1f launchdLabel=%s python=%s log=%s"
+              % (tick, exit_idle, launchd_label or "(keins)",
+                 ".".join(str(x) for x in sys.version_info[:3]), args.log))
+        return 0 if not any(b.dauerfehler for b in backends.values()) else 2
+
+    stutze_launchd_log(os.path.join(os.path.dirname(args.log) or ".", "launchd.log"),
+                       LOG_MAX_BYTES, log)
+
+    if not backends:
+        log("kein einziges Backend und kein gemerkter Socketname — es gibt nichts zu bedienen.")
+        print("wb-modell-proxy: nichts zu bedienen, siehe %s" % args.log, file=sys.stderr)
+        return 1
+
+    ende = asyncio.Event()
+    server = []
+    bedient = 0
+    for b in backends.values():
+        socks = []
+        if args.selbst_binden and b.lausch_port <= 0:
+            # Ohne launchd gibt es keinen Deskriptor von aussen, und ein
+            # nicht-numerischer Schluessel (im Notbetrieb ist das der
+            # SOCKETNAME, in der Auslieferung "grug") liefert keinen Port.
+            # Frueher band der Prozess dann Port 0, also einen zufaelligen,
+            # den nie jemand findet — lieber laut ablehnen.
+            log("%s: unter --selbst-binden braucht dieser Eintrag einen Lauschport; "
+                "'%s' ist keiner. Wer den Notbetrieb ohne launchd fahren will, gibt "
+                "'listenPort' an. Dieser Eintrag wird nicht bedient."
+                % (b.name, b.schluessel))
+            continue
+        if args.selbst_binden:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((b.lausch_host, b.lausch_port))
+                s.listen(128)
+            except OSError as e:
+                s.close()
+                log("%s: kann %s:%d nicht binden: %s — dieser Eintrag wird nicht bedient."
+                    % (b.name, b.lausch_host, b.lausch_port, e))
+                continue
+            socks.append(s)
+        else:
+            try:
+                fds = launchd_sockets(b.socket_name)
+            except OSError as e:
+                # Kein Grund, den ganzen Prozess zu beenden: die anderen
+                # Sockets werden weiter bedient (Review S5).
+                log("%s: %s — dieser Eintrag wird nicht bedient. Steht der Socketname "
+                    "'%s' im Sockets-Dict der plist?" % (b.name, e, b.socket_name))
+                continue
+            for fd in fds:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, fileno=fd)
+                s.setblocking(False)
+                socks.append(s)
+        for s in socks:
+            server.append(await asyncio.start_server(b.behandeln, sock=s))
+        bedient += 1
+        log("%s: lauscht auf %s:%d (%d Socket(s), %s)%s"
+            % (b.name, b.lausch_host, b.lausch_port, len(socks),
+               "selbst gebunden" if args.selbst_binden else "von launchd",
+               (", NOTBETRIEB: %s" % b.dauerfehler) if b.dauerfehler else
+               ", Backend %s:%d, Leerlauf %.1f min." % (b.host, b.port, b.idle_s / 60.0)))
+
+    if not server:
+        # Mehr als laut sein geht hier nicht: ohne einen einzigen Socket gibt
+        # es niemanden, dem man eine 503 schicken koennte. Also wenigstens
+        # aufschreiben, WARUM — im eigenen Protokoll und auf stderr, das unter
+        # launchd in launchd.log landet.
+        namen = ", ".join(sorted(b.socket_name for b in backends.values())) or "(keine)"
+        grund = ("kein einziger Socket konnte uebernommen werden — es gibt nichts zu bedienen. "
+                 "Konfiguration: %s. Versuchte Socketnamen: %s. Betriebsart: %s. "
+                 "Die Gruende je Eintrag stehen in den Zeilen darueber; typisch ist ein Name, "
+                 "der nicht im Sockets-Dict der plist steht, oder ein belegter Lauschport."
+                 % (args.konfig, namen,
+                    "--selbst-binden" if args.selbst_binden else "Sockets von launchd"))
+        log(grund)
+        print("wb-modell-proxy: %s Siehe %s" % (grund, args.log), file=sys.stderr)
+        return 1
+
+    schleife = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            schleife.add_signal_handler(sig, ende.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    wache = asyncio.create_task(waechter_aufsicht(backends, log, ende, tick, exit_idle))
+    await ende.wait()
+    wache.cancel()
+    try:
+        await wache
+    except asyncio.CancelledError:
+        pass
+
+    # ── Abschaltweg, Reihenfolge ist die Sache (Review S1/S4) ───────────────
+    # 1. Nichts Neues mehr annehmen.
+    for srv in server:
+        srv.close()
+    # 2. Backends ZUERST beenden. Vorher auf die offenen Verbindungen zu
+    #    warten hiesse, dass eine einzige ungenutzte Keep-Alive-Verbindung den
+    #    Modellserver ewig am Leben haelt; und ein SIGKILL nach 5 Sekunden
+    #    haette dann eine Waise mit 15 GB hinterlassen.
+    for b in backends.values():
+        try:
+            await b.abschalten()
+        except Exception:
+            log("%s: Abschalten scheiterte —\n%s" % (b.name, traceback.format_exc()))
+    # 3. Erst jetzt die Verbindungen abraeumen, und auch das nur befristet.
+    for srv in server:
+        if hasattr(srv, "close_clients"):
+            srv.close_clients()
+    for srv in server:
+        try:
+            await asyncio.wait_for(srv.wait_closed(), timeout=3.0)
+        except asyncio.TimeoutError:
+            if hasattr(srv, "abort_clients"):
+                srv.abort_clients()
+            try:
+                await asyncio.wait_for(srv.wait_closed(), timeout=2.0)
+            except asyncio.TimeoutError:
+                log("eine Verbindung liess sich nicht abraeumen — der Proxy endet trotzdem.")
+        except OSError:
+            pass
+    log("beendet.")
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(add_help=True, description="Bedarfsweiser Vorschalt-Proxy fuer lokale Modellserver.")
+    p.add_argument("--konfig", default=os.environ.get("WB_MODELL_PROXY_KONFIG") or os.path.expanduser(VORGABE_KONFIG))
+    p.add_argument("--log", default=os.environ.get("WB_MODELL_PROXY_LOG") or os.path.expanduser(VORGABE_LOG))
+    p.add_argument("--selbst-binden", dest="selbst_binden", action="store_true",
+                   help="selbst lauschen statt Sockets von launchd zu uebernehmen")
+    p.add_argument("--pruefen", action="store_true", help="Konfiguration lesen, ausgeben, beenden")
+    args = p.parse_args(argv)
+    try:
+        return asyncio.run(haupt(args))
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

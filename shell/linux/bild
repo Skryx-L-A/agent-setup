@@ -1,0 +1,219 @@
+#!/bin/bash
+# bild — lokale Bildgenerierung mit einem Befehl, komplett offline-fähig.
+# LINUX/CUDA-Port (RTX 4070 SUPER, 12 GB VRAM). IDENTISCHE CLI wie der Mac.
+# Backend: diffusers (CUDA) + bitsandbytes/GGUF-Quant + CPU-Offload. Siehe _bild_gen.py.
+# ACHTUNG: auf 12 GB VRAM zwingend kleinere Quants + Offload — deshalb langsamer als Mac.
+#
+#   bild "ein roter Apfel auf Holztisch"              Qualität (Default)
+#   bild --schnell "ein roter Apfel"                  Schnell
+#   bild --text "Ladenschild mit Text ROESTEREI NORD" Bester Text im Bild
+#   bild --unzensiert "..."                           UNZENSIERT: klein-9B + NSFW-LoRA
+#   bild --unzensiert-gross "..."                     UNZENSIERT: Qwen-Image + NSFW-LoRA
+#   bild --bearbeiten foto.png "give her a short bob" Foto bearbeiten (FLUX.2 klein Edit)
+#
+# Optionen:
+#   --bearbeiten DATEI     Quellbild bearbeiten; mehrfach = mehrere Referenzbilder
+#                          (das ERSTE Bild ist das zu bearbeitende)
+#   --edit-modell V        beste (Default) | sparsam; mit --unzensiert ergibt das
+#                          die vier Plätze beste/beste-frei/sparsam/sparsam-frei
+#   --breite N --hoehe N   Bildgröße (Default 1024x1024; beim Bearbeiten aus dem Quellbild)
+#   --maxkante N           Bearbeiten: längste Kante der Ausgabe (Default 1024)
+#   --schritte N           Sampling-Schritte (Default je Modus, Bearbeiten 28)
+#   --guidance N           Guidance/CFG (Default: Modellvorgabe)
+#   --seed N               reproduzierbar; MEHRFACH = mehrere Varianten in einem Lauf
+#   -o name                Ausgabedatei (Default ~/Pictures/bild-<datum>.png)
+#   --kein-open            Bild nach Generierung nicht öffnen
+#
+# Ergebnisse landen in ~/Pictures/. Läuft ohne Internet (Modelle sind lokal).
+set -euo pipefail
+
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+# 12-GB-Karte: Fragmentierung vermeiden, sonst OOM trotz Offload.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+VENV="$HOME/AI/media-linux/venvs/diffusers"
+GEN="$HOME/.local/bin/_bild_gen.py"
+
+# Modellpfade zentral — Wechsel auf eine andere Quantisierung ist eine Zeile.
+# Getrennt von den Mac-Gewichten: ~/AI/models-linux (Syncthing ignoriert das).
+MODELL_KLEIN9B="$HOME/AI/models-linux/FLUX.2-klein-9B"   # 4-bit bnb + CPU-Offload -> passt in 12 GB
+MODELL_KLEIN4B="$HOME/AI/models-linux/FLUX.2-klein-4B"   # 4-bit -> schnell, passt locker
+MODELL_QWEN="$HOME/AI/models-linux/Qwen-Image"            # + GGUF Q4_K_S (unten)
+QWEN_GGUF="$HOME/AI/models-linux/Qwen-Image-gguf/Qwen-Image-Q4_K_S.gguf"
+# LoRAs sind portabel (safetensors) — dieselben Dateien wie auf dem Mac.
+LORA_NSFW="$HOME/AI/loras/flux-klein9b-nsfw-v2.safetensors"
+LORA_NSFW_QWEN="$HOME/AI/loras/qwen-image-nsfw-lora.safetensors"
+
+# Edit-Modelle (Linux/CUDA, jeweils 12-GB-tauglich). FLUX.2 klein vereint Generierung
+# und Editing im selben Modell (Bild-Referenzen als Input) — kein separates Edit-Modell nötig.
+EDIT_9B="$MODELL_KLEIN9B"   # beste: 9B 4-bit + Offload
+EDIT_4B="$MODELL_KLEIN4B"   # sparsam: 4B 4-bit, schneller
+
+# EDIT_MODELLE — die vier Plätze des Bearbeiten-Modus. Felder:
+#   MODELL | LORA (leer=keine) | QUANT (leer=Modellvorgabe) | SCHRITTE.
+# Belegung analog Mac:
+#   * 9B-Basis ist ungefiltert -> unzensiert braucht keine LoRA (Feld bleibt leer,
+#     Prüfung auf Nobara noch offen).
+#   * 4B nur für den ZENSIERTEN Sparmodus (NSFW-Verdeckung wie auf dem Mac zu erwarten).
+edit_modell() {
+  case "$1" in
+    beste)        echo "$EDIT_9B||nf4|28" ;;  # A zensiert / beste
+    beste-frei)   echo "$EDIT_9B||nf4|28" ;;  # B unzensiert / beste (ohne LoRA)
+    sparsam)      echo "$EDIT_4B||nf4|12" ;;  # C zensiert / sparsam
+    sparsam-frei) echo "$EDIT_9B||nf4|14" ;;  # D unzensiert / sparsam (NICHT 4B!)
+    *)            echo "" ;;
+  esac
+}
+
+MODE="quality"
+EDIT_VARIANTE="beste"
+EDIT_PFAD=""       # eigene Pipeline: Modellordner direkt, ohne die Tabelle
+EDIT_LORA_ARG=""   # eigene Pipeline: LoRA direkt
+WIDTH=1024; HEIGHT=1024
+WIDTH_SET=0; HEIGHT_SET=0
+MAXKANTE=1024
+OUT=""; OPEN=1
+STEPS=""; GUIDANCE=""
+PROMPT=""
+FREI=0
+EDIT_IMAGES=()
+SEEDS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --schnell) MODE="fast"; shift ;;
+    --text)    MODE="text"; shift ;;
+    --unzensiert)       FREI=1; shift ;;
+    --unzensiert-gross) MODE="frei-gross"; shift ;;
+    --bearbeiten) EDIT_IMAGES+=("$2"); MODE="edit"; shift 2 ;;
+    --edit-modell) EDIT_VARIANTE="$2"; shift 2 ;;
+    --edit-pfad)   EDIT_PFAD="$2"; shift 2 ;;
+    --edit-lora)   EDIT_LORA_ARG="$2"; shift 2 ;;
+    --breite)  WIDTH="$2"; WIDTH_SET=1; shift 2 ;;
+    --hoehe)   HEIGHT="$2"; HEIGHT_SET=1; shift 2 ;;
+    --maxkante) MAXKANTE="$2"; shift 2 ;;
+    --schritte) STEPS="$2"; shift 2 ;;
+    --guidance) GUIDANCE="$2"; shift 2 ;;
+    --seed)    SEEDS+=("$2"); shift 2 ;;
+    -o)        OUT="$2"; shift 2 ;;
+    --kein-open) OPEN=0; shift ;;
+    -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)         PROMPT="$1"; shift ;;
+  esac
+done
+
+# --unzensiert allein ist der klein-9B-Modus; zusammen mit --bearbeiten schaltet
+# es nur die NSFW-LoRA zum Edit-Modell dazu.
+if [[ $FREI -eq 1 && "$MODE" != "edit" ]]; then
+  MODE="frei"
+fi
+
+if [[ -z "$PROMPT" ]]; then
+  echo "Fehler: kein Prompt. Aufruf: bild \"beschreibung des bildes\"" >&2
+  exit 1
+fi
+
+[[ -z "$OUT" ]] && OUT="$HOME/Pictures/bild-$(date +%Y%m%d-%H%M%S).png"
+mkdir -p "$(dirname "$OUT")"
+
+PY="$VENV/bin/python"
+[[ -x "$PY" ]] || { echo "Fehler: venv fehlt ($VENV). Erst linux/media-install.sh laufen lassen." >&2; exit 1; }
+
+# Gemeinsame Argumente an den Python-Treiber.
+COMMON=(--prompt "$PROMPT" --width "$WIDTH" --height "$HEIGHT" --output "$OUT")
+[[ ${#SEEDS[@]} -gt 0 ]] && COMMON+=(--seed "${SEEDS[@]}")
+[[ -n "$GUIDANCE" ]] && COMMON+=(--guidance "$GUIDANCE")
+
+# auf ein Vielfaches von 16 runden, mindestens 16 (FLUX.2/Qwen brauchen 16er-Kanten)
+runde16() {
+  local v=$1
+  v=$(( (v + 8) / 16 * 16 ))
+  [[ $v -lt 16 ]] && v=16
+  echo "$v"
+}
+
+# Zielmaße aus dem Quellbild: Seitenverhältnis behalten, längste Kante <= MAXKANTE.
+# Linux: Maße via ffprobe (ffmpeg ist Pflicht-Dep) statt macOS `sips`.
+masse_aus_quelle() {
+  local src="$1" sw sh longest
+  sw=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$src" 2>/dev/null || true)
+  sh=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$src" 2>/dev/null || true)
+  if [[ -z "$sw" || -z "$sh" || "$sw" -le 0 || "$sh" -le 0 ]]; then
+    echo "Warnung: Maße von $src nicht lesbar — nutze ${WIDTH}x${HEIGHT}." >&2
+    return 0
+  fi
+  longest=$sw
+  [[ $sh -gt $longest ]] && longest=$sh
+  if [[ $longest -gt $MAXKANTE ]]; then
+    sw=$(( sw * MAXKANTE / longest ))
+    sh=$(( sh * MAXKANTE / longest ))
+  fi
+  if [[ $WIDTH_SET -eq 0 ]]; then WIDTH=$(runde16 "$sw"); fi
+  if [[ $HEIGHT_SET -eq 0 ]]; then HEIGHT=$(runde16 "$sh"); fi
+  return 0
+}
+
+case "$MODE" in
+  fast)
+    echo "Schnell-Modus (FLUX.2-klein-4B, 4-bit) ..."
+    "$PY" "$GEN" --engine flux2 --model "$MODELL_KLEIN4B" --quant nf4 \
+      --steps "${STEPS:-8}" --offload model "${COMMON[@]}"
+    ;;
+  text)
+    echo "Text-Modus (Qwen-Image GGUF Q4_K_S, ~12 GB — nichts Großes parallel) ..."
+    "$PY" "$GEN" --engine qwen --model "$MODELL_QWEN" --gguf "$QWEN_GGUF" \
+      --steps "${STEPS:-30}" --offload sequential "${COMMON[@]}"
+    ;;
+  quality)
+    echo "Qualitäts-Modus (FLUX.2-klein-9B, 4-bit + CPU-Offload) ..."
+    "$PY" "$GEN" --engine flux2 --model "$MODELL_KLEIN9B" --quant nf4 \
+      --steps "${STEPS:-28}" --offload model "${COMMON[@]}"
+    ;;
+  frei)
+    echo "UNZENSIERT-Modus (FLUX.2-klein-9B + NSFW-LoRA, 4-bit + Offload) ..."
+    "$PY" "$GEN" --engine flux2 --model "$MODELL_KLEIN9B" --quant nf4 \
+      --lora "$LORA_NSFW" --steps "${STEPS:-28}" --offload model "${COMMON[@]}"
+    ;;
+  frei-gross)
+    echo "UNZENSIERT-Modus groß (Qwen-Image GGUF + NSFW-LoRA) ..."
+    "$PY" "$GEN" --engine qwen --model "$MODELL_QWEN" --gguf "$QWEN_GGUF" \
+      --lora "$LORA_NSFW_QWEN" --steps "${STEPS:-30}" --offload sequential "${COMMON[@]}"
+    ;;
+  edit)
+    for img in "${EDIT_IMAGES[@]}"; do
+      if [[ ! -f "$img" ]]; then
+        echo "Fehler: Quellbild nicht gefunden: $img" >&2
+        exit 1
+      fi
+    done
+    masse_aus_quelle "${EDIT_IMAGES[0]}"
+    # WIDTH/HEIGHT können sich geändert haben -> COMMON neu aufbauen
+    COMMON=(--prompt "$PROMPT" --width "$WIDTH" --height "$HEIGHT" --output "$OUT")
+    [[ ${#SEEDS[@]} -gt 0 ]] && COMMON+=(--seed "${SEEDS[@]}")
+    [[ -n "$GUIDANCE" ]] && COMMON+=(--guidance "$GUIDANCE")
+    if [[ -n "$EDIT_PFAD" ]]; then
+      EDIT_MODELL="$EDIT_PFAD"; EDIT_LORA="$EDIT_LORA_ARG"
+      EDIT_QUANT="nf4"; EDIT_STEPS=28
+      VARIANTE="pipeline"
+    else
+      VARIANTE="$EDIT_VARIANTE"
+      [[ $FREI -eq 1 ]] && VARIANTE="$EDIT_VARIANTE-frei"
+      ZEILE="$(edit_modell "$VARIANTE")"
+      if [[ -z "$ZEILE" ]]; then
+        echo "Fehler: unbekanntes Edit-Modell: $VARIANTE" >&2
+        exit 1
+      fi
+      IFS='|' read -r EDIT_MODELL EDIT_LORA EDIT_QUANT EDIT_STEPS <<< "$ZEILE"
+    fi
+    echo "Bearbeiten-Modus ($VARIANTE) ..."
+    echo "Quelle: ${EDIT_IMAGES[*]} — Ausgabe ${WIDTH}x${HEIGHT}"
+    EDIT_ARGS=(--engine flux2-edit --model "$EDIT_MODELL" --quant "${EDIT_QUANT:-nf4}" \
+      --steps "${STEPS:-$EDIT_STEPS}" --offload model)
+    [[ -n "$EDIT_LORA" ]] && EDIT_ARGS+=(--lora "$EDIT_LORA")
+    for img in "${EDIT_IMAGES[@]}"; do EDIT_ARGS+=(--image "$img"); done
+    "$PY" "$GEN" "${EDIT_ARGS[@]}" "${COMMON[@]}"
+    ;;
+esac
+
+echo "Fertig: $OUT"
+if [[ $OPEN -eq 1 ]]; then xdg-open "$OUT" >/dev/null 2>&1 || true; fi

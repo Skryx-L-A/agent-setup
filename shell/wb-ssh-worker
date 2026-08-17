@@ -1,0 +1,194 @@
+#!/bin/bash
+# wb-ssh-worker — spawn a worker on the OTHER machine and mirror it into the local grid.
+#
+#   wb-ssh-worker <mac|peer> <claude|pi> <name> <model>[:effort] <workdir> <task...>
+#
+# Called by `claude-worker --on <machine> …` and `pi-worker --on <machine> …`;
+# not meant to be typed directly. Two halves:
+#
+#   REMOTE  the target machine spawns the worker with ITS OWN claude-worker/pi-worker
+#           (nothing is installed or changed over there) into its visible orchestrator
+#           session — `wb-orch` on peer, the attached wb-* session on the Mac — in an
+#           OWN window named `ssh-<name>`. TMUX_PANE is set explicitly, exactly like
+#           peer's `orch-launch` does, because a machine with several wb-* sessions
+#           cannot guess the target.
+#   LOCAL   `wb-remote-view <machine>` — EIN Spiegel-Pane je Zielmaschine, der die
+#           ganze Worker-Session des Ziels zeigt (nicht mehr einer je Worker, siehe
+#           Kopf von wb-remote-view). Ein Spiegel je entfernter SESSION, markiert als
+#           `@wb_worker REMOTE-<machine>-<session>`, von wb-grid wie jeder Worker
+#           eingeordnet; er verschwindet wieder, sobald in seiner Session drueben kein
+#           Worker mehr laeuft.
+#
+# Name contract: the worker is called `SSH-<name>` EVERYWHERE — @wb_worker on both
+# machines, pane title, result directory ~/.pi-workers/results/SSH-<name>/ on the
+# TARGET machine, and the entry in the workbench state file (with `machine`).
+# Result: `wb-result SSH-<name>` (it finds the machine itself).
+set -u
+
+MACHINE="${1:?machine (mac|peer)}"; KIND="${2:?claude|pi}"
+NAME="${3:?name}"; MODEL="${4:?model}"; WORKDIR="${5:?workdir}"; shift 5
+TASK="$*"
+
+case "$MACHINE" in mac|peer) ;; *) echo "wb-ssh-worker: unbekannte Maschine '$MACHINE' (mac|peer)" >&2; exit 1 ;; esac
+case "$KIND" in claude|pi) ;; *) echo "wb-ssh-worker: unbekannte Worker-Art '$KIND' (claude|pi)" >&2; exit 1 ;; esac
+
+# `SSH-` is added once, never twice — callers may already carry the prefix.
+BASE="${NAME#SSH-}"
+SSHNAME="SSH-$BASE"
+WIN="ssh-$BASE"
+# Eine eigene View-Session je Worker gibt es seit 2026-08-13 NICHT mehr (`view-SSH-<name>`).
+# Der Spiegel haengt an der Orchestrator-Session des Ziels; `wb-remote-view` legt die eine
+# gruppierte Sicht dort an. Begruendung im Kopf jener Datei.
+
+# POSIX-safe single-quoting for everything that crosses the ssh command line.
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# The target's orchestrator session: fixed on peer, auto-detected on the Mac.
+[ "$MACHINE" = peer ] && RSESS="wb-orch" || RSESS=""
+
+TASK_B64=$(printf '%s' "$TASK" | base64 | tr -d '\n')
+
+# ---------------------------------------------------------------- remote half
+# The script runs on the TARGET with the target's own scripts — nothing of ours is
+# installed over there. It is kept in a variable because it may have to run twice
+# (see the delivery check below).
+REMOTE_SCRIPT=$(cat <<'REMOTE'
+set -u
+SESS="$1"; WIN="$2"; NAME="$3"; MODEL="$4"; WORKDIR="$5"; KIND="$6"; TASK_B64="$7"
+TASK=$(printf '%s' "$TASK_B64" | base64 -d 2>/dev/null || printf '%s' "$TASK_B64" | base64 -D)
+
+if [ -z "$SESS" ]; then
+  SESS=$(tmux list-sessions -F '#{session_attached} #{session_name}' 2>/dev/null | awk '$1>=1 && $2 ~ /^wb-/{print $2; exit}')
+  if [ -z "$SESS" ]; then
+    n=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -c '^wb-')
+    [ "$n" = "1" ] && SESS=$(tmux list-sessions -F '#{session_name}' | grep '^wb-')
+  fi
+  [ -z "$SESS" ] && { echo "FEHLER: Ziel-Workbench auf der Zielmaschine nicht eindeutig (keine/mehrere wb-* Sessions)." >&2; exit 1; }
+fi
+tmux has-session -t "=$SESS" 2>/dev/null || tmux new-session -d -s "$SESS" -n orch
+
+# Own window per ssh worker — only that makes a mirror of exactly ONE worker possible.
+wid=$(tmux list-windows -t "=$SESS" -F '#{window_id} #{window_name}' | awk -v n="$WIN" '$2==n{print $1; exit}')
+fresh=0
+if [ -z "$wid" ]; then
+  wid=$(tmux new-window -d -t "=$SESS:" -n "$WIN" -P -F '#{window_id}' 'exec sleep 604800')
+  tmux set-option -w -t "$wid" automatic-rename off    # global automatic-rename would eat the contract name
+  fresh=1
+fi
+ph=$(tmux list-panes -t "$wid" -F '#{pane_id} #{pane_active}' | awk '$2==1{print $1; exit}')
+
+# The target spawns with ITS OWN scripts; TMUX_PANE names the pane to split.
+if [ "$KIND" = claude ]; then
+  env TMUX_PANE="$ph" "$HOME/.local/bin/claude-worker" "$NAME" "$MODEL" "$WORKDIR" "$TASK"; rc=$?
+else
+  env TMUX_PANE="$ph" "$HOME/.local/bin/pi-worker" "$NAME" "$MODEL" "$WORKDIR" "$TASK"; rc=$?
+fi
+
+# Where did the worker really end up? An existing pane of the same name is reused
+# (same name = same pane = same context), possibly in a different window.
+wp=$(tmux list-panes -a -F '#{pane_id} #{@wb_worker} #{window_id} #{window_name}' | awk -v n="$NAME" '$2==n{print $1"|"$3"|"$4; exit}')
+if [ -n "$wp" ]; then
+  wpane=${wp%%|*}; rest=${wp#*|}; wwid=${rest%%|*}; wname=${rest#*|}
+  if [ "$wwid" = "$wid" ] && [ "$wpane" != "$ph" ]; then
+    tmux kill-pane -t "$ph" 2>/dev/null      # placeholder did its job
+  elif [ "$wwid" != "$wid" ] && [ "$fresh" = 1 ]; then
+    tmux kill-window -t "$wid" 2>/dev/null   # worker was reused elsewhere: drop the empty window
+  fi
+  # Report the ORCHESTRATOR session. A grouped view session shares the same windows,
+  # so `display -p '#{session_name}'` on the pane may name the view instead.
+  ws=$(tmux list-panes -a -F '#{session_name} #{pane_id}' | awk -v p="$wpane" -v s="$SESS" '$2==p && $1==s{print $1; exit}')
+  [ -z "$ws" ] && ws=$(tmux display -p -t "$wpane" '#{session_name}')
+  echo "WBSESS=$ws"
+  echo "WBWIN=$wname"
+  echo "WBPANE=$wpane"
+fi
+exit $rc
+REMOTE
+)
+
+remote_spawn() {
+  printf '%s\n' "$REMOTE_SCRIPT" | ssh -o BatchMode=yes -o ConnectTimeout=10 "$MACHINE" \
+    "bash -s -- $(q "$RSESS") $(q "$WIN") $(q "$SSHNAME") $(q "$MODEL") $(q "$WORKDIR") $(q "$KIND") $(q "$TASK_B64")"
+}
+
+REMOTE_OUT=$(remote_spawn) \
+  || { echo "$REMOTE_OUT" >&2; echo "wb-ssh-worker: Spawn auf '$MACHINE' fehlgeschlagen." >&2; exit 1; }
+
+parse_remote() {
+  RSESS_REAL=$(printf '%s\n' "$REMOTE_OUT" | sed -n 's/^WBSESS=//p' | tail -1)
+  RWIN=$(printf '%s\n' "$REMOTE_OUT" | sed -n 's/^WBWIN=//p' | tail -1)
+  RPANE=$(printf '%s\n' "$REMOTE_OUT" | sed -n 's/^WBPANE=//p' | tail -1)
+  # The result file lives on the TARGET machine; pi-worker printed the timestamped
+  # path, the latest.md symlink is the stable one.
+  RRES=$(printf '%s\n' "$REMOTE_OUT" | sed -n 's/^Ergebnis-Datei: \([^ ]*\).*/\1/p' | tail -1)
+}
+parse_remote
+[ -n "$RSESS_REAL" ] || { printf '%s\n' "$REMOTE_OUT" >&2; echo "wb-ssh-worker: Zielmaschine hat keinen Worker-Pane gemeldet — Abbruch." >&2; exit 1; }
+[ -n "$RWIN" ] || RWIN="$WIN"
+
+# DELIVERY CHECK. A task pasted into a still-booting TUI is swallowed silently, and
+# the sender cannot tell: its "input box empty" check also passes when nothing ever
+# arrived. peer's readiness pattern matches Claude Code's welcome-box border, which
+# renders before the input is live — the first task of a fresh worker is lost there.
+# We cannot patch the other machine, so we verify from here: does the pane show our
+# task? If not, send it once more — the second call reuses the existing pane and
+# pastes immediately (no readiness wait).
+if [ -n "$TASK" ] && [ -n "$RPANE" ]; then
+  PROBE=$(printf '%s' "$TASK" | head -c 40)
+  delivered() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$MACHINE" \
+      "tmux capture-pane -p -S -2000 -t $(q "$RPANE") | grep -qF $(q "$PROBE")" 2>/dev/null; }
+  if ! delivered; then
+    sleep 4
+    if ! delivered; then
+      echo "Hinweis: Task kam im frisch gestarteten Pane nicht an (TUI war noch nicht bereit) — sende erneut." >&2
+      REMOTE_OUT=$(remote_spawn) || true
+      parse_remote
+      [ -n "$RWIN" ] || RWIN="$WIN"
+      sleep 2
+      delivered || echo "WARNUNG: Task in '$SSHNAME' auf $MACHINE auch nach dem zweiten Versuch nicht sichtbar — Pane pruefen." >&2
+    fi
+  fi
+fi
+
+printf '%s\n' "$REMOTE_OUT" | grep -v '^WB\(SESS\|WIN\|PANE\)='
+
+# ---------------------------------------------------------------- local half
+#
+# UMBAU 2026-08-13: der Spiegel haengt jetzt an der ORCHESTRATOR-Session des Ziels
+# (`wb-orch` auf peer), nicht mehr an einer eigenen View-Session je Worker. Diese Datei
+# baut die lokale Sicht deshalb nicht mehr selbst — sie ruft `wb-remote-view`, das genau
+# dasselbe Verfahren fuer ALLE Remote-Worker macht, gleich wer sie gestartet hat.
+# Der Grund steht ausfuehrlich im Kopf von `wb-remote-view`; kurz: ein per `orch-launch`
+# auf peer gestarteter Worker kommt hier nie vorbei und blieb deshalb unsichtbar, und
+# eine View-Session je Worker hat dreimal Streu-Sessions erzeugt.
+find_local_pane() {
+  tmux list-panes -a -F '#{session_name}|#{pane_id}|#{@wb_worker}|#{pane_dead}' 2>/dev/null \
+    | awk -F'|' -v p="REMOTE-$MACHINE-" '$1 ~ /^wb-/ && index($3, p)==1 {print $2" "$4; exit}'
+}
+if [ -x "$HOME/.local/bin/wb-remote-view" ]; then
+  "$HOME/.local/bin/wb-remote-view" "$MACHINE" || true
+else
+  echo "WARNUNG: wb-remote-view fehlt — der Worker laeuft auf $MACHINE, aber ohne Spiegel im Worker-Tab." >&2
+fi
+info=$(find_local_pane); pane=${info%% *}; dead=${info##* }
+
+# Register in the workbench state file — with the machine, so the sidebar and
+# wb-result know where this worker lives. Old entries have no `machine`. Die
+# Session wird vom SPIEGEL genommen, wenn es einen gibt; ohne Spiegel bleibt sie
+# leer, statt eine Sitzung zu behaupten, in der dieser Worker gar nicht laeuft.
+WBSESS=""
+[ -n "$pane" ] && WBSESS=$(tmux display -p -t "$pane" '#{session_name}' 2>/dev/null || true)
+[ "$KIND" = claude ] && WBMODEL="claude-$MODEL" || WBMODEL="$MODEL"
+$HOME/.local/bin/wb-state add-worker "$SSHNAME" "$KIND" "$WBMODEL" "$WORKDIR" "$WBSESS" --machine "$MACHINE" \
+  || echo "WARNUNG: wb-state add-worker fehlgeschlagen — '$SSHNAME' fehlt in der Workbench-Sidebar." >&2
+
+echo "Remote-Worker '$SSHNAME' laeuft auf $MACHINE (Session $RSESS_REAL, Fenster $RWIN)."
+if [ -n "$pane" ]; then
+  echo "Lokaler Spiegel-Pane: $pane — zeigt die Worker-Session '$RSESS_REAL' von $MACHINE."
+else
+  echo "WARNUNG: kein lokaler Spiegel-Pane — der Worker laeuft, ist hier aber NICHT sichtbar." >&2
+  echo "         Selbst herstellen: wb-remote-view $MACHINE    (sagt, woran es liegt)" >&2
+  echo "         Direkt ansehen:    ssh -t $MACHINE 'tmux attach -t =$RSESS_REAL'" >&2
+fi
+[ -n "$RRES" ] && echo "Ergebnis-Datei auf $MACHINE: $RRES"
+echo "Ergebnis holen (Deadline-tauglich, 0 = da / 1 = noch nicht): wb-result $SSHNAME"

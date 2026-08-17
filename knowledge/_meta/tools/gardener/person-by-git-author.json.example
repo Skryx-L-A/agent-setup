@@ -1,0 +1,35 @@
+{
+  "_warum": [
+    "Diese Datei ordnet git-Identitaeten den Personen in 40-people/ zu. Der",
+    "Gardener liest sie, um den `owner:` eines Projekt-MOC zu bestimmen",
+    "(gardener/owner.py).",
+    "",
+    "Sie gehoert nach ~/.config/gardener/person-by-git-author.json und damit",
+    "AUSSERHALB jedes Repos - so wie secret-patterns.local.json. Der Grund ist",
+    "derselbe: eine Tabelle aus echten Namen, Mailadressen und Konto-Kennungen",
+    "ist ein Personenbezug, und Personenbezug gehoert nicht in eine Datei, die",
+    "veroeffentlicht wird.",
+    "",
+    "Der Anlass war der 17.08.2026. Aus diesem Baum entstand ein oeffentliches",
+    "Repo. Der Ersetzer, der darueber lief, tauschte die Nachnamen aus und liess",
+    "eine numerische GitHub-Kennung stehen - `<zahl>+<konto>@users.noreply.",
+    "github.com`. Sie loest ueber die oeffentliche API auf genau das Konto auf,",
+    "das die Zeile verbergen sollte. Den Ersetzer nachzuschaerfen haette diese",
+    "eine Zeile geheilt; die Tabelle auszulagern heilt die ganze Gattung.",
+    "",
+    "FEHLT die Datei, ist das KEIN Fehler und wird nicht gemeldet: die Zuordnung",
+    "ist dann leer, jeder Autor bleibt unbekannt, und ein Projekt ohne erkennbaren",
+    "Eigentuemer behaelt ein leeres `owner:`. Genau das ist das gewollte Ergebnis",
+    "und keine Panne.",
+    "",
+    "Der Schluessel ist IMMER die vollstaendige Identitaet `Name <mail>`, nie die",
+    "Mail allein: ein geteiltes Konto-Postfach ist kein Identitaetsbeweis.",
+    "",
+    "Die Werte unten sind erfunden."
+  ],
+  "authors": {
+    "Alex Beispiel <alex@example.com>": "alex",
+    "Alex Beispiel <alex@users.noreply.github.com>": "alex",
+    "Robin Muster <robin@example.org>": "robin"
+  }
+}

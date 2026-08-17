@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Dieselbe Strenge wie in den anderen Fenstern: nur das eigene Buendel, nichts aus dem
+         Netz, kein Rahmen. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:"
+    />
+    <title>Agent Workbench — First Steps</title>
+    <style>
+      /* Farben der drei anderen Fenster (app/src/verbrauch/index.html), damit vier Fenster
+         desselben Programms wie vier Fenster desselben Programms aussehen. */
+      :root {
+        color-scheme: dark;
+        --grund: #101216;
+        --leiste: #171a20;
+        --linie: #262b34;
+        --schrift: #d8dee9;
+        --gedaempft: #8b93a1;
+        --fern: #6a7fd0;
+        --wahl: #222833;
+        --gut: #46a758;
+        --schlecht: #d24c4c;
+      }
+      /* HELL UND DUNKEL (Farben durchreichen, 11.08.), dieselbe Mechanik wie in
+         den anderen Fenstern: `data-thema` traegt den von main/thema.ts
+         AUFGELOESTEN Wert ('hell'/'dunkel'), gesetzt in erststart.ts. */
+      :root[data-thema='hell'] {
+        color-scheme: light;
+        --grund: #ffffff;
+        --leiste: #f4f5f7;
+        --linie: #d8dbe1;
+        --schrift: #1b1f27;
+        --gedaempft: #5c6472;
+        --fern: #3355c4;
+        --wahl: #e4e8f4;
+        --gut: #22803c;
+        --schlecht: #b3261e;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--grund);
+        color: var(--schrift);
+      }
+      body {
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      #kopf {
+        flex: 0 0 auto;
+        padding: 16px 26px 10px;
+        border-bottom: 1px solid var(--linie);
+        background: var(--leiste);
+      }
+      #kopf h1 {
+        font-size: 17px;
+        font-weight: 600;
+        margin: 0 0 3px;
+      }
+      #kopf .unterzeile {
+        color: var(--gedaempft);
+        margin: 0;
+      }
+      #fortschritt {
+        margin-top: 8px;
+        color: var(--gedaempft);
+      }
+      #inhalt {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 18px 26px 24px;
+      }
+      #inhalt h2 {
+        font-size: 14px;
+        font-weight: 600;
+        margin: 0 0 4px;
+      }
+      #inhalt .unterzeile {
+        color: var(--gedaempft);
+        margin: 0 0 14px;
+      }
+      .hinweis {
+        color: var(--gedaempft);
+        margin: 8px 0;
+      }
+      .chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 10px 0;
+      }
+      .chip {
+        font: inherit;
+        text-align: left;
+        background: transparent;
+        color: var(--schrift);
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 6px 12px;
+        cursor: pointer;
+      }
+      .chip:hover {
+        background: #1e232b;
+      }
+      .chip.gewaehlt {
+        border-color: var(--fern);
+        color: var(--fern);
+        background: var(--wahl);
+      }
+      .chip .zeichen {
+        margin-right: 6px;
+      }
+      .chip .zeichen.ja {
+        color: var(--gut);
+      }
+      .chip .zeichen.nein {
+        color: var(--schlecht);
+      }
+      .grund {
+        color: var(--gedaempft);
+        margin: -4px 0 10px;
+      }
+      #fuss {
+        flex: 0 0 auto;
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 12px 26px;
+        border-top: 1px solid var(--linie);
+        background: var(--leiste);
+      }
+      .knopf {
+        font: inherit;
+        background: transparent;
+        color: var(--schrift);
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 6px 16px;
+        cursor: pointer;
+      }
+      .knopf:hover {
+        background: #1e232b;
+      }
+      .knopf.hervor {
+        border-color: var(--fern);
+        color: var(--fern);
+      }
+      .zusammenfassung {
+        margin: 6px 0 14px;
+      }
+      .zusammenfassung li {
+        margin: 2px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <header id="kopf">
+      <h1 id="titel"></h1>
+      <p class="unterzeile" id="kopf-unterzeile"></p>
+      <p id="fortschritt"></p>
+    </header>
+    <main id="inhalt"></main>
+    <div id="fuss">
+      <button class="knopf" id="knopf-ueberspringen"></button>
+      <button class="knopf hervor" id="knopf-weiter"></button>
+    </div>
+    <script src="erststart.js"></script>
+  </body>
+</html>

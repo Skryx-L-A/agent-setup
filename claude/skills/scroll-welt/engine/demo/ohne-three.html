@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>scroll-welt — dieselbe Kette, aber ohne three.js</title>
+  <meta name="description" content="Belegt den Ausfallweg: fehlt three, faellt das 3D-Segment auf sein Standbild zurueck und die Seite laeuft weiter." />
+  <!-- Bewusst KEINE importmap und kein vendor/three. Der Treiber findet nichts,
+       muss das sagen und darf die Seite nicht mitreissen. -->
+  <style>
+    :root, .sw-root {
+      --sw-bg: #F5EDE0;
+      --sw-ink: #241d2b;
+      --sw-ink-soft: #6a6072;
+      --sw-accent: #6D9668;
+    }
+  </style>
+</head>
+<body>
+  <div id="top"></div>
+  <div id="welt"></div>
+
+  <script src="../scrub-welt.js"></script>
+  <script src="../treiber-parallax.js"></script>
+  <script src="../treiber-three.js"></script>
+  <script src="scenes.js"></script>
+  <script src="szene-halle.js"></script>
+  <script>
+    const segments = window.DEMO_SEGMENTS.slice();
+    // Dasselbe 3D-Segment wie auf index.html, nur bekommt es hier ein Standbild
+    // mit: genau dann soll der Treiber still ausfallen und das Poster stehen
+    // lassen, statt einen Hinweis auf ein leeres Segment zu malen.
+    segments.splice(3, 0, Object.assign({}, window.HALLE_SEGMENT, {
+      still: 'assets/seams/werkstatt-t1.png',
+    }));
+
+    window.welt = mountScrollWelt(document.getElementById('welt'), {
+      brand: { name: 'Pearl & Co.', href: '#top' },
+      hint: 'scrollen',
+      debug: true,
+      segments: segments,
+    });
+  </script>
+</body>
+</html>

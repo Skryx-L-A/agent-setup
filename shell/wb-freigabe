@@ -1,0 +1,414 @@
+#!/bin/bash
+# wb-freigabe — die EINE Stelle, die eine Rueckfrage freigibt.
+#
+#   wb-freigabe liste                     Was gerade auf eine Entscheidung wartet.
+#   wb-freigabe erteilen [--ttl <sek>] [--schluessel <sha256>] [--index <n>|--alle]
+#                        <pane> <grund>   Die wartende Frage dieses Panes freigeben.
+#   wb-freigabe beleg                     Wie dieser Aufruf gemessen wird (Diagnose).
+#
+# `--schluessel` bindet die Freigabe an DEN Eintrag, den der Erteilende gelesen hat:
+# stimmt der Schluessel des wartenden Markers nicht damit ueberein, wird nichts
+# erteilt. Das Programmfenster benutzt das, weil zwischen Anzeigen und Klicken ein
+# anderer Befehl angeschlagen haben koennte -- eine Zustimmung zu etwas Ungelesenem
+# ist der eine Fehler, den ein Freigabeweg nicht haben darf.
+#
+# MEHRDEUTIGKEIT (2026-08-10): versucht dieselbe Pane waehrend einer offenen Frage
+# einen ANDEREN Wortlaut, bleibt die AELTERE Frage die einzige STEHENDE (siehe
+# hooks/bash-guard.py) -- der neue Versuch landet nur im Verlauf. `erteilen` liest
+# beides zusammen: liegt mehr als EIN Wortlaut vor, zaehlt das Werkzeug sie
+# nummeriert auf und erteilt NICHTS, bis `--index <n>` sagt, welcher gemeint ist,
+# oder `--alle` ausdruecklich ALLE freigibt. Der einfache Fall (nur ein Wortlaut)
+# laeuft unveraendert.
+#
+# WARUM ES DIESES WERKZEUG GIBT (Durchsicht 2026-08-07, gemessen)
+# Die Rueckfrage-Stufe haelt an, was weder harmlos noch verboten ist — `sudo`,
+# `chmod -R`, `git push --force`, `npm publish` — und wartet auf einen Menschen.
+# Eingeloest wurde ueber eine JSON-Datei in ~/.pi-workers/guard-grants/. Nur schrieb
+# die niemand ausser der Freigabe-Ansicht — UND jedem Agenten, der die Regel gelesen
+# hat: gemessen wurde, dass ein selbst geschriebener Freigabe-Zettel denselben
+# angehaltenen Befehl durchlaufen laesst. Der Satz "eine Freigabe erteilt ein Mensch"
+# war eine Erwartung, keine Pruefung.
+#
+# DIE HERKUNFT WIRD GEMESSEN, NICHT GEGLAUBT — dasselbe Prinzip wie in `wb-mensch`
+# und `wb-pane-write`: Es gibt hier KEINEN Schalter, mit dem sich jemand zum Menschen
+# erklaert. Gefragt wird `wb-mensch`, und dessen Positivpruefung haengt an Merkmalen,
+# die ein Agent sich nicht anschreiben kann (steuerndes Terminal M1, oder das
+# Programmfenster als nachgewiesener Ahne M2). Fehlt `wb-mensch`, gilt: kein Mensch.
+# Die erteilte Freigabe traegt den Beleg mit und eine Signatur (HMAC) ueber genau die
+# Werte, an die sie gebunden ist; `hooks/lib/ask_muster.py` prueft beides, bevor eine
+# Freigabe zaehlt.
+#
+# DER SCHLUESSEL liegt neben den Freigaben (Modus 0600) und entsteht beim ersten
+# Erteilen durch einen gemessenen Menschen. Ein Agent kommt an ihn nicht heran, ohne
+# einen Befehl auszufuehren, den die Hook-Kette ablehnt (Guard `freigabe-pfad`).
+#
+# GRENZE, offen benannt (wie in wb-mensch): Als derselbe Benutzer gibt es kein
+# Versteck, das gegen einen Agenten haelt, der seine Spuren aktiv verwischt. Was hier
+# faellt, ist der gemessene Fall — der Zettel, den sich ein Agent selbst hinlegt.
+set -uo pipefail
+
+ABGELEHNT=77
+PY=/usr/bin/python3
+
+GRANTS="${AWB_GUARD_GRANTS_DIR:-$HOME/.pi-workers/guard-grants}"
+BLOCKS="${AWB_GUARD_BLOCKS_DIR:-$HOME/.pi-workers/guard-blocks}"
+# Derselbe Verlauf, den Hook und Programm schreiben (AWB_GUARD_LOG). Die Zeile
+# entsteht dort, wo die Freigabe entsteht -- damit gibt es genau eine Stelle, an
+# der eine gueltige Freigabe erscheint, und genau eine, die es aufschreibt.
+VERLAUF="${AWB_GUARD_LOG:-$HOME/.pi-workers/guard-blocks.log}"
+
+CMD="${1:-liste}"
+
+MENSCH_ART=""
+MENSCH_GRUND=""
+messen() {
+    local beleg
+    if [ -x "$HOME/.local/bin/wb-mensch" ]; then
+        beleg=$("$HOME/.local/bin/wb-mensch" beleg 2>/dev/null)
+    elif command -v wb-mensch >/dev/null 2>&1; then
+        beleg=$(wb-mensch beleg 2>/dev/null)
+    else
+        MENSCH_ART=agent
+        MENSCH_GRUND="wb-mensch nicht gefunden — ohne Messung gilt: kein Mensch."
+        return 1
+    fi
+    MENSCH_GRUND="${beleg#*$'\t'}"
+    MENSCH_ART="${beleg%%$'\t'*}"
+    [ "$MENSCH_ART" = mensch ]
+}
+
+# Die Herkunftsart, die in der Freigabe steht: das Programmfenster nennt sich so,
+# ein Mensch am Terminal 'mensch'. Beides sind Messungen aus wb-mensch (M2/M1) --
+# unterschieden wird an dessen Begruendung, nicht an einer Behauptung des Aufrufers.
+herkunft_art() {
+    case "$MENSCH_GRUND" in
+        *Oberflaeche*|*M2*) printf 'oberflaeche' ;;
+        *) printf 'mensch' ;;
+    esac
+}
+
+ablehnen() {
+    {
+        printf 'wb-freigabe: ABGELEHNT — %s\n' "$1"
+        printf '  Gemessen: %s (%s)\n' "$MENSCH_ART" "$MENSCH_GRUND"
+        printf '  Eine Freigabe erteilt ein Mensch: am Terminal oder im Programmfenster.\n'
+        printf '  Ein angehaltener Befehl wird wiederholt, nicht umgangen.\n'
+    } >&2
+    exit "$ABGELEHNT"
+}
+
+case "$CMD" in
+    liste)
+        "$PY" - "$BLOCKS" "$VERLAUF" <<'PY'
+import json, os, sys
+
+def kuerzen(text, max_len=700, rand=300):
+    # Voller Text bis max_len; darueber Anfang UND Ende, Mitte weg -- und die
+    # Kuerzung als solche erkennbar (Vorfall 2026-08-10: ein bei 300 Zeichen
+    # hart abgeschnittener Befehl endete mitten in `ls ~`, unbemerkbar).
+    text = text or ''
+    if len(text) <= max_len:
+        return text
+    fehlt = len(text) - 2 * rand
+    return '%s\n      ...[%d Zeichen gekuerzt]...\n      %s' % (text[:rand], fehlt, text[-rand:])
+
+def andere_wortlaute(verlauf_pfad, pane, primaer_ts, primaer_command):
+    # Wortlaute, die dieselbe Pane waehrend dieser offenen Frage ebenfalls
+    # versucht hat -- bash-guard.py protokolliert sie als
+    # 'muster-anderer-wortlaut-wartend', OHNE einen eigenen Merker anzulegen.
+    treffer, gesehen = [], {primaer_command}
+    try:
+        with open(verlauf_pfad, 'r', encoding='utf-8') as fh:
+            for zeile in fh:
+                zeile = zeile.strip()
+                if not zeile:
+                    continue
+                try:
+                    e = json.loads(zeile)
+                except ValueError:
+                    continue
+                if not isinstance(e, dict) or e.get('guard') != 'muster-anderer-wortlaut-wartend':
+                    continue
+                if str(e.get('pane', '')) != pane or str(e.get('ts', '')) < primaer_ts:
+                    continue
+                cmd = e.get('command', '') or ''
+                if cmd in gesehen:
+                    continue
+                gesehen.add(cmd)
+                treffer.append(cmd)
+    except OSError:
+        pass
+    return treffer
+
+d, verlauf = sys.argv[1], sys.argv[2]
+try:
+    namen = sorted(os.listdir(d))
+except OSError:
+    print('Keine wartenden Rueckfragen (%s gibt es nicht).' % d)
+    raise SystemExit(0)
+gefunden = 0
+for name in namen:
+    if not name.endswith('.json') or name.startswith('.'):
+        continue
+    try:
+        with open(os.path.join(d, name), 'r', encoding='utf-8') as fh:
+            e = json.load(fh)
+    except (OSError, ValueError):
+        continue
+    if not isinstance(e, dict) or e.get('wartet') is not True:
+        continue
+    gefunden += 1
+    pane = str(e.get('pane', '') or '')
+    command = e.get('command', '') or ''
+    print('Pane %s  (%s)' % (pane or '?', e.get('muster', 'ohne Muster')))
+    print('  Befehl: %s' % kuerzen(command))
+    print('  Verzeichnis: %s' % (e.get('cwd', '') or ''))
+    print('  Wartet seit: %s, laeuft ab: %s' % (e.get('ts', '?'), e.get('expires_ts', '?')))
+    alt = andere_wortlaute(verlauf, pane, str(e.get('ts', '') or ''), command)
+    if alt:
+        print('  MEHRDEUTIG -- %d weitere(r) Wortlaut(e) derselben Pane wurden ebenfalls '
+              'angehalten:' % len(alt))
+        for i, cmd in enumerate(alt, start=2):
+            print('    [%d] %s' % (i, kuerzen(cmd)))
+        print('  Freigeben: wb-freigabe erteilen %s "<grund>" --index <1..%d>  (oder --alle '
+              'fuer ALLE auf einmal)' % (pane, len(alt) + 1))
+    else:
+        print('  Freigeben: wb-freigabe erteilen %s "<grund>"' % pane)
+if not gefunden:
+    print('Keine wartende Rueckfrage.')
+PY
+        exit 0 ;;
+    beleg)
+        messen || true
+        printf 'art\t%s\ngrund\t%s\nherkunft\t%s\nfreigaben\t%s\n' \
+            "$MENSCH_ART" "$MENSCH_GRUND" "$(herkunft_art)" "$GRANTS"
+        exit 0 ;;
+    erteilen) : ;;
+    ''|-h|--help) sed -n '2,7p' "$0" >&2; exit 2 ;;
+    *) echo "wb-freigabe: unbekanntes Kommando '$CMD' (liste|erteilen|beleg)" >&2; exit 2 ;;
+esac
+
+shift
+TTL=300
+ERWARTETER_SCHLUESSEL=""
+INDEX=""
+ALLE=0
+while true; do
+    case "${1:-}" in
+        --ttl) TTL="${2:?Sekunden fehlen nach --ttl}"; shift 2 ;;
+        --schluessel) ERWARTETER_SCHLUESSEL="${2:?Schluessel fehlt nach --schluessel}"; shift 2 ;;
+        --index) INDEX="${2:?Zahl fehlt nach --index}"; shift 2 ;;
+        --alle) ALLE=1; shift ;;
+        *) break ;;
+    esac
+done
+case "$TTL" in ''|*[!0-9]*) echo "wb-freigabe: --ttl braucht eine Zahl in Sekunden." >&2; exit 2 ;; esac
+if [ -n "$INDEX" ]; then
+    case "$INDEX" in *[!0-9]*) echo "wb-freigabe: --index braucht eine Zahl >= 1." >&2; exit 2 ;; esac
+fi
+if [ -n "$INDEX" ] && [ "$ALLE" = 1 ]; then
+    echo "wb-freigabe: --index und --alle schliessen sich aus." >&2; exit 2
+fi
+
+PANE="${1:-}"
+GRUND="${2:-}"
+[ -n "$PANE" ] || { echo "wb-freigabe: Pane fehlt — 'wb-freigabe erteilen <pane> <grund>'" >&2; exit 2; }
+[ -n "$GRUND" ] || { echo "wb-freigabe: Begruendung fehlt — ein Satz genuegt." >&2; exit 2; }
+
+messen || ablehnen "hier ruft kein gemessener Mensch."
+
+ART="$(herkunft_art)"
+"$PY" - "$BLOCKS" "$GRANTS" "$PANE" "$GRUND" "$ART" "$MENSCH_GRUND" "$TTL" "$ERWARTETER_SCHLUESSEL" \
+      "$VERLAUF" "$INDEX" "$ALLE" <<'PY'
+# Der Zettel wird aus dem MARKER gebaut, den der Hook selbst geschrieben hat --
+# nicht aus dem, was auf der Kommandozeile steht. Damit gilt die Freigabe genau
+# dem Befehl, der wirklich angehalten wurde, und nicht einem aehnlich
+# aussehenden: dieselbe Eigenschaft, die die Freigabe-Ansicht hat.
+import hashlib, hmac, json, os, re, stat, sys, time
+
+(blocks, grants, pane, grund, art, beleg, ttl_roh, erwartet, verlauf,
+ index_roh, alle_roh) = sys.argv[1:12]
+sicher = re.sub(r'[^A-Za-z0-9_.-]', '_', pane)
+pfad = os.path.join(blocks, sicher + '.json')
+try:
+    with open(pfad, 'r', encoding='utf-8') as fh:
+        merker = json.load(fh)
+except (OSError, ValueError):
+    sys.stderr.write('wb-freigabe: fuer Pane %s wartet keine Rueckfrage (%s).\n' % (pane, pfad))
+    raise SystemExit(1)
+if not isinstance(merker, dict) or merker.get('wartet') is not True:
+    sys.stderr.write('wb-freigabe: der Eintrag fuer %s wartet nicht auf eine Freigabe.\n' % pane)
+    raise SystemExit(1)
+
+
+def kuerzen(text, max_len=700, rand=300):
+    # Voller Text bis max_len; darueber Anfang UND Ende, Mitte weg -- und die
+    # Kuerzung als solche erkennbar (Vorfall 2026-08-10: ein bei 300 Zeichen
+    # hart abgeschnittener Befehl endete mitten in `ls ~`, unbemerkbar).
+    text = text or ''
+    if len(text) <= max_len:
+        return text
+    fehlt = len(text) - 2 * rand
+    return '%s\n    ...[%d Zeichen gekuerzt]...\n    %s' % (text[:rand], fehlt, text[-rand:])
+
+
+primaer_command = str(merker.get('command', ''))
+primaer_cwd = str(merker.get('cwd', ''))
+primaer_ts = str(merker.get('ts', '') or '')
+
+# Weitere Wortlaute, die dieselbe Pane WAEHREND dieser offenen Frage ebenfalls
+# versucht hat. bash-guard.py legt dafuer KEINEN eigenen Merker an (die
+# aeltere Frage bleibt die einzige STEHENDE, siehe dort) -- protokolliert wird
+# nur der Versuch, als 'muster-anderer-wortlaut-wartend'. Erst hier werden sie
+# sichtbar und waehlbar (Auftrag 2026-08-10, Punkt 1).
+alternativen = []
+gesehen = {primaer_command}
+try:
+    with open(verlauf, 'r', encoding='utf-8') as fh:
+        for zeile in fh:
+            zeile = zeile.strip()
+            if not zeile:
+                continue
+            try:
+                e = json.loads(zeile)
+            except ValueError:
+                continue
+            if not isinstance(e, dict) or e.get('guard') != 'muster-anderer-wortlaut-wartend':
+                continue
+            if str(e.get('pane', '')) != pane or str(e.get('ts', '')) < primaer_ts:
+                continue
+            cmd = e.get('command', '') or ''
+            if cmd in gesehen:
+                continue
+            gesehen.add(cmd)
+            alternativen.append({'command': cmd, 'cwd': e.get('cwd', '') or primaer_cwd})
+except OSError:
+    pass
+
+eintraege = [{'command': primaer_command, 'cwd': primaer_cwd, 'ist_primaer': True}]
+eintraege += [{'command': a['command'], 'cwd': a['cwd'], 'ist_primaer': False} for a in alternativen]
+
+alle = alle_roh == '1'
+index = int(index_roh) if index_roh else None
+if index is not None and (index < 1 or index > len(eintraege)):
+    sys.stderr.write('wb-freigabe: --index %d gibt es nicht (1..%d).\n' % (index, len(eintraege)))
+    raise SystemExit(1)
+if erwartet and alle:
+    sys.stderr.write(
+        'wb-freigabe: --schluessel und --alle schliessen sich aus -- --schluessel bindet an '
+        'GENAU einen Eintrag, --alle meint sie alle.\n')
+    raise SystemExit(2)
+
+if len(eintraege) > 1 and index is None and not alle:
+    # Mehrdeutig: nichts wird still genommen, der Mensch waehlt (Auftrag
+    # 2026-08-10, Punkt 1). Voller Wortlaut je Eintrag, nicht gekappt.
+    sys.stderr.write(
+        'wb-freigabe: MEHRDEUTIG -- fuer Pane %s liegen %d offene Wortlaute vor. Waehle '
+        'einen:\n' % (pane, len(eintraege)))
+    for i, e in enumerate(eintraege, start=1):
+        sys.stderr.write('  [%d] %s\n' % (i, kuerzen(e['command'])))
+    sys.stderr.write(
+        'Freigeben: wb-freigabe erteilen %s "<grund>" --index <1..%d>\n'
+        'ALLE auf einmal, wenn ausdruecklich gewollt: wb-freigabe erteilen %s "<grund>" '
+        '--alle\n' % (pane, len(eintraege), pane))
+    raise SystemExit(1)
+
+zu_erteilen = eintraege if alle else [eintraege[(index or 1) - 1]]
+
+# Obergrenze wie im Hook (ask_muster.MAX_TTL_SEKUNDEN): eine Freigabe mit langer
+# Frist waere der Freibrief, den diese Stufe nicht sein darf.
+try:
+    TTL = max(1, min(int(ttl_roh), 900))
+except ValueError:
+    TTL = 300
+
+# Der Signaturschluessel: einmal angelegt, danach nur gelesen. 0600 und mit
+# umask geschrieben, damit er nie kurz offen liegt.
+key_datei = os.path.join(os.path.dirname(os.path.normpath(grants)), '.freigabe-schluessel')
+geheim = None
+try:
+    with open(key_datei, 'r', encoding='utf-8') as fh:
+        geheim = fh.read().strip() or None
+except OSError:
+    geheim = None
+if geheim is None:
+    os.makedirs(os.path.dirname(key_datei), exist_ok=True)
+    geheim = os.urandom(32).hex()
+    alt_umask = os.umask(0o077)
+    try:
+        with open(key_datei, 'w', encoding='utf-8') as fh:
+            fh.write(geheim + '\n')
+        os.chmod(key_datei, stat.S_IRUSR | stat.S_IWUSR)
+    finally:
+        os.umask(alt_umask)
+    sys.stderr.write('wb-freigabe: Signaturschluessel angelegt (%s, nur fuer dich lesbar).\n' % key_datei)
+
+os.makedirs(grants, exist_ok=True)
+jetzt = time.time()
+stempel = lambda t: time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t))
+
+for e in zu_erteilen:
+    command, cwd = e['command'], e['cwd']
+    schluessel = hashlib.sha256('\x00'.join([pane, cwd, command]).encode('utf-8')).hexdigest()
+
+    # Zugestimmt wird dem, was gelesen wurde -- nicht dem, was inzwischen
+    # dasteht. Bei mehreren Wortlauten gilt das je GEWAEHLTEM Eintrag.
+    if erwartet and erwartet != schluessel:
+        sys.stderr.write(
+            'wb-freigabe: der Eintrag, der freigegeben werden sollte, ist nicht mehr der, '
+            'der jetzt vorliegt (Schluessel %s statt %s). Nichts erteilt.\n'
+            % (schluessel[:16], erwartet[:16]))
+        raise SystemExit(1)
+
+    eintrag = {
+        'schluessel': schluessel, 'pane': pane, 'cwd': cwd, 'command': command,
+        'muster': merker.get('muster', ''), 'reason': grund,
+        'granted_ts': stempel(jetzt), 'expires_ts': stempel(jetzt + TTL),
+        'herkunft': {'art': art, 'beleg': beleg},
+    }
+    roh = '\x00'.join([eintrag['schluessel'], pane, cwd, command,
+                       eintrag['granted_ts'], eintrag['expires_ts'], art, beleg])
+    eintrag['herkunft']['sig'] = hmac.new(geheim.encode('utf-8'), roh.encode('utf-8'),
+                                          hashlib.sha256).hexdigest()
+
+    ziel = os.path.join(grants, schluessel + '.json')
+    alt_umask = os.umask(0o077)
+    try:
+        with open(ziel, 'w', encoding='utf-8') as fh:
+            fh.write(json.dumps(eintrag, ensure_ascii=False, indent=2) + '\n')
+    finally:
+        os.umask(alt_umask)
+
+    # Der Verlaufseintrag entsteht hier und nicht beim Aufrufer: sonst haette
+    # jeder Weg, der eine Freigabe erteilt, seine eigene Fassung davon -- und
+    # ein Weg, der es vergisst, waere unsichtbar.
+    try:
+        os.makedirs(os.path.dirname(verlauf) or '.', exist_ok=True)
+        with open(verlauf, 'a', encoding='utf-8') as fh:
+            fh.write(json.dumps({
+                'ts': stempel(jetzt), 'guard': 'muster-freigabe',
+                'reason': 'Einmal freigegeben (%s): %s' % (merker.get('muster', ''), grund),
+                'command': command[:2000], 'cwd': cwd,
+                'session_id': str(merker.get('session_id', '')), 'pane': pane,
+            }, ensure_ascii=False) + '\n')
+    except OSError:
+        # Ein nicht schreibbarer Verlauf haelt die Entscheidung nicht auf; die
+        # Freigabedatei selbst ist der wirksame Teil.
+        pass
+
+    print('Freigegeben fuer EINEN Durchlauf, gueltig %d Minuten:' % max(1, TTL // 60))
+    print('  %s' % kuerzen(command))
+    print('  Herkunft: %s (%s)' % (art, kuerzen(beleg, max_len=200, rand=80)))
+
+# Der Merker wird geloescht, sobald der PRIMAERE Eintrag mit dabei war -- er
+# ist die einzige STEHENDE Frage, die die Ansicht als "offen" fuehrt. Wurde
+# nur eine Alternative gewaehlt, bleibt er stehen: die urspruengliche Frage
+# ist noch unbeantwortet, bis der Agent den WIRKLICH freigegebenen Wortlaut
+# sendet -- dann raeumt bash-guard.py ihn selbst ab (beim Einloesen).
+if any(e['ist_primaer'] for e in zu_erteilen):
+    try:
+        os.remove(pfad)
+    except OSError:
+        pass
+PY
+exit $?

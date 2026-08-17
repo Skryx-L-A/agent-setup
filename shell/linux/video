@@ -1,0 +1,77 @@
+#!/bin/bash
+# video — lokale Videogenerierung (LTX-2) mit einem Befehl, komplett offline-fähig.
+# LINUX/CUDA-Port (RTX 4070 SUPER, 12 GB VRAM). IDENTISCHE CLI wie der Mac.
+# Backend: offizielle LTX-2 CUDA-Pipeline via diffusers (LTX2Pipeline) + fp8 + Offload.
+# Der Mac nutzt ltx-2-mlx (MLX-Port) — hier zurueck auf die Upstream-CUDA-Pipeline.
+# ACHTUNG: 12 GB ist das LTX-2-Minimum -> nur kurze Clips, niedrige Aufloesung, langsam.
+#
+#   video "Wellen brechen am Strand bei Sonnenuntergang"        Schnell (distilled)
+#   video --hq "eine Drohnenaufnahme über einem Wald"           Qualität (dauert deutlich länger)
+#   video --bild foto.png "Kamera zoomt langsam heraus"         Standbild animieren (beste Route:
+#                                                               erst 'bild', dann hier animieren)
+# Optionen:
+#   --sekunden N   Länge in Sekunden (Default 3, bei 24 fps)
+#   --seed N       reproduzierbar
+#   -o name.mp4    Ausgabedatei (Default ~/Movies/video-<datum>.mp4)
+#   --kein-open    nicht automatisch öffnen
+#
+# WICHTIG: braucht viel VRAM+RAM. Vorher große Ollama-Modelle stoppen:
+#   ollama ps        (zeigt geladene Modelle)
+#   ollama stop <modell>
+set -euo pipefail
+
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+VENV="$HOME/AI/media-linux/venvs/ltx"
+GEN="$HOME/.local/bin/_video_gen.py"
+MODELL="$HOME/AI/models-linux/LTX-2"          # enthält fp8-Variante (ltx-2-19b-dev-fp8)
+
+MODE="fast"; IMAGE=""; SECONDS_LEN=3; SEED=""; OUT=""; OPEN=1
+PROMPT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --hq)       MODE="hq"; shift ;;
+    --bild)     IMAGE="$2"; shift 2 ;;
+    --sekunden) SECONDS_LEN="$2"; shift 2 ;;
+    --seed)     SEED="$2"; shift 2 ;;
+    -o)         OUT="$2"; shift 2 ;;
+    --kein-open) OPEN=0; shift ;;
+    -h|--help)  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)          PROMPT="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$PROMPT" ]]; then
+  echo "Fehler: kein Prompt. Aufruf: video \"beschreibung der szene\"" >&2
+  exit 1
+fi
+
+if ollama ps 2>/dev/null | grep -qE ':(7b|8b|9b|13b|30b|35b|70b)'; then
+  echo "WARNUNG: großes Ollama-Modell geladen (VRAM-Konflikt). Erst 'ollama stop <modell>'." >&2
+  exit 1
+fi
+
+[[ -z "$OUT" ]] && OUT="$HOME/Movies/video-$(date +%Y%m%d-%H%M%S).mp4"
+mkdir -p "$(dirname "$OUT")"
+
+PY="$VENV/bin/python"
+[[ -x "$PY" ]] || { echo "Fehler: venv fehlt ($VENV). Erst linux/media-install.sh laufen lassen." >&2; exit 1; }
+
+# LTX-2: num_frames muss (8*n + 1) sein. 24 ist durch 8 teilbar -> sekunden*24+1 passt immer.
+FRAMES=$(( SECONDS_LEN * 24 + 1 ))
+ARGS=(--model "$MODELL" --prompt "$PROMPT" --frames "$FRAMES" --fps 24 --output "$OUT")
+[[ -n "$SEED" ]]  && ARGS+=(--seed "$SEED")
+[[ -n "$IMAGE" ]] && ARGS+=(--image "$IMAGE")
+if [[ "$MODE" == "hq" ]]; then
+  ARGS+=(--mode hq)
+  echo "Qualitäts-Modus (LTX-2 full) — das dauert eine Weile ..."
+else
+  ARGS+=(--mode fast)
+  echo "Schnell-Modus (LTX-2 distilled/fp8) ..."
+fi
+
+"$PY" "$GEN" "${ARGS[@]}"
+echo "Fertig: $OUT"
+if [[ $OPEN -eq 1 ]]; then xdg-open "$OUT" >/dev/null 2>&1 || true; fi

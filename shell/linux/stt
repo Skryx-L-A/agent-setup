@@ -1,0 +1,70 @@
+#!/bin/bash
+# stt — local speech-to-text for agents. LINUX/CUDA port (RTX 4070 SUPER).
+#
+# NOBARA-VERIFY 2026-07-19 (the user's Peer-Rechner): the original faster-whisper /
+# CTranslate2 path links CUDA 12 (libcublas.so.12) and FAILS on this CUDA-13
+# box. This machine already runs another service's whisper.cpp — a CUDA-13-native
+# build (whisper-cli, links libcublas.so.13) with the ggml models already on
+# disk in ~/.local/share/whisper-models. So the default engine here REUSES
+# that: no extra download, GPU works out of the box.
+#
+# Engines:
+#   whispercpp -> whisper.cpp (whisper-cli, CUDA-13 native, reuses another service's
+#                 ggml models)                                    [default]
+#   whisper    -> faster-whisper (CTranslate2; CPU works, GPU needs CUDA-12
+#                 libs — see --whisper note)                      [--whisper]
+#   parakeet   -> NVIDIA NeMo parakeet-tdt (needs the NeMo venv)  [--parakeet]
+# Transcript text is printed on stdout.
+#
+# Usage:
+#   stt file.wav                 fast GPU default (whisper.cpp, large-v3-turbo)
+#   stt --timestamps file.wav    SRT-style timestamps (whisper.cpp)
+#   stt --model PATH file.wav    override the ggml model file
+#   stt --whisper file.wav       faster-whisper fallback (CT2 venv; CPU by default)
+#   stt --parakeet file.wav      NVIDIA NeMo parakeet (needs the NeMo venv)
+set -euo pipefail
+
+WHISPER_MODELS="${WHISPER_MODELS:-$HOME/.local/share/whisper-models}"
+WHISPER_CLI="${WHISPER_CLI:-$HOME/.local/bin/whisper-cli}"
+# Prefer turbo (fast + accurate), then full large-v3, then base, then tiny.
+pick_model() {
+  for m in ggml-large-v3-turbo.bin ggml-large-v3.bin ggml-base.bin ggml-tiny.bin; do
+    [ -f "$WHISPER_MODELS/$m" ] && { echo "$WHISPER_MODELS/$m"; return; }
+  done
+  return 1
+}
+
+ENGINE="whispercpp"; TS=0; AUDIO=""; MODEL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --whispercpp) ENGINE="whispercpp"; shift ;;
+    --whisper)    ENGINE="whisper"; shift ;;
+    --parakeet)   ENGINE="parakeet"; shift ;;
+    --timestamps) TS=1; shift ;;
+    --model)      MODEL="$2"; shift 2 ;;
+    *)            AUDIO="$1"; shift ;;
+  esac
+done
+[ -f "${AUDIO:-}" ] || { echo "usage: stt [--timestamps] [--model PATH] [--whisper|--parakeet] file.wav" >&2; exit 2; }
+
+if [ "$ENGINE" = whispercpp ]; then
+  [ -x "$WHISPER_CLI" ] || { echo "Fehler: whisper-cli fehlt ($WHISPER_CLI). another service/whisper.cpp installieren oder --whisper nutzen." >&2; exit 1; }
+  [ -n "$MODEL" ] || MODEL="$(pick_model)" || { echo "Fehler: kein ggml-Modell in $WHISPER_MODELS." >&2; exit 1; }
+  if [ "$TS" = 1 ]; then
+    # SRT-style timestamps to stdout.
+    "$WHISPER_CLI" -m "$MODEL" -f "$AUDIO" -osrt -of /dev/stdout 2>/dev/null
+  else
+    "$WHISPER_CLI" -m "$MODEL" -f "$AUDIO" -nt 2>/dev/null | sed 's/^ *//' | sed '/^$/d'
+  fi
+  exit 0
+fi
+
+# --- venv engines (faster-whisper / parakeet) ---
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+VENV="$HOME/AI/media-linux/venvs/stt"
+GEN="$HOME/.local/bin/_stt_gen.py"
+PY="$VENV/bin/python"
+[ -x "$PY" ] || { echo "Fehler: venv fehlt ($VENV). Erst linux/media-install.sh laufen lassen (oder Default whisper.cpp nutzen)." >&2; exit 1; }
+ARGS=(--engine "$ENGINE" --audio "$AUDIO")
+[ "$TS" = 1 ] && ARGS+=(--timestamps)
+"$PY" "$GEN" "${ARGS[@]}"

@@ -1,0 +1,398 @@
+{
+  "_comment": "External config for wb-consistency. {BASE} is substituted with --base (default $HOME). This file holds every exception/pairing list the tool needs so the checker never hardcodes a self-exemption in code (2026-08-03 rule).",
+  "check1_model_caps": {
+    "registry_path": "{BASE}/.claude/workbench/models.json",
+    "scan_globs": [
+      "{BASE}/.claude/CLAUDE.md",
+      "{BASE}/.claude/roles/*.md",
+      "{BASE}/.claude/regeln/*.md",
+      "{BASE}/.pi/agent/*.md",
+      "{BASE}/.local/bin/*",
+      "{BASE}/Knowledge/**/*.md"
+    ],
+    "exclude_substrings": [
+      "/90-secrets/"
+    ],
+    "extra_model_name_variants": {
+      "fable5": [
+        "fable 5",
+        "fable"
+      ],
+      "opus5": [
+        "opus 5"
+      ],
+      "opus48": [
+        "opus 4.8",
+        "opus 4-8",
+        "opus"
+      ],
+      "sonnet5": [
+        "sonnet 5",
+        "sonnet"
+      ],
+      "haiku45": [
+        "haiku 4.5",
+        "haiku"
+      ],
+      "ornith": [
+        "ornith-35b",
+        "ornith 35b"
+      ],
+      "ornith9": [
+        "ornith-9b",
+        "ornith 9b"
+      ]
+    }
+  },
+  "check2_generated_blocks": {
+    "scan_globs": [
+      "{BASE}/.claude/CLAUDE.md",
+      "{BASE}/.claude/roles/*.md",
+      "{BASE}/.claude/regeln/*.md",
+      "{BASE}/.pi/agent/*.md",
+      "{BASE}/Knowledge/**/*.md"
+    ],
+    "exclude_substrings": [
+      "/90-secrets/"
+    ],
+    "session_load_groups": [
+      {
+        "name": "claude-session (CLAUDE.md + aktive roles/*.md werden in jeder Claude-Session zusammen geladen)",
+        "files": [
+          "{BASE}/.claude/CLAUDE.md",
+          "{BASE}/.claude/roles/*.md"
+        ]
+      },
+      {
+        "name": "pi-session (~/.pi/agent/*.md werden in jeder pi-Session zusammen geladen)",
+        "files": [
+          "{BASE}/.pi/agent/ORCHESTRATOR.md",
+          "{BASE}/.pi/agent/RULES.md",
+          "{BASE}/.pi/agent/WORKER.md"
+        ]
+      }
+    ]
+  },
+  "check3_dangling_refs": {
+    "scan_globs": [
+      "{BASE}/.claude/CLAUDE.md",
+      "{BASE}/.claude/roles/*.md",
+      "{BASE}/.claude/regeln/*.md"
+    ],
+    "tool_dirs": [
+      "{BASE}/.local/bin",
+      "{BASE}/.claude/hooks"
+    ],
+    "skill_dirs": [
+      "{BASE}/.claude/skills"
+    ],
+    "_comment_extra_path_dirs": "Befund 2026-08-10: der woechentliche launchd-Job (wb-hygiene, siehe hooks/sessionstart-hygiene-status.sh) startet ohne Login-Shell -- sein PATH ist das nackte /usr/bin:/bin:/usr/sbin:/sbin, ohne /opt/homebrew/bin. tmux, ollama, npm, uv, llama-server, llama-bench, rsvg-convert und pi liegen dort (Apple-Silicon-Homebrew); ohne diese Zeile meldet der Check sie als VERWEIS-INS-LEERE, obwohl sie installiert sind -- 30 von 31 Befunden desselben Tages waren dieser eine fehlende Ordner. Diese Verzeichnisse werden VOR das echte Prozess-PATH gehaengt, das echte PATH bleibt zusaetzlich erhalten (build_search_path im Code). Deckt Apple-Silicon- und Intel-Homebrew sowie generisches /usr/local ab; ein fehlendes Verzeichnis ist harmlos, es traegt einfach nichts zur Suche bei.",
+    "extra_path_dirs": [
+      "/opt/homebrew/bin",
+      "/opt/homebrew/sbin",
+      "/usr/local/bin",
+      "/usr/local/sbin"
+    ],
+    "registry_path": "{BASE}/.claude/workbench/models.json",
+    "cross_machine_marker": "peer",
+    "_comment_machine_map": "Befund 2026-08-04: Regeldateien sind zwischen Mac und peer geteilt (wortgleich), die Werkzeuge unter ~/.local/bin sind es NICHT. machine_ids_by_os erkennt die laufende Maschine rein lokal (kein SSH, kein Netz) -- Darwin/Linux ist bereits die Unterscheidung, die shell/wb-sync-setup selbst benutzt (SELF=mac bei Darwin, sonst peer). machine_tool_map ordnet Werkzeuge einer der beiden IDs zu: fehlt eines auf der ihm zugeordneten Maschine, bleibt das ein harter Fehler (VERWEIS-INS-LEERE); fehlt es auf der jeweils ANDEREN, ist das erwartet (severity=expected, eigene Meldung VERWEIS-ANDERE-MASCHINE, zaehlt nirgends als Fehler). Das alte cross_machine_marker-Raten oben bleibt als Fallback fuer jedes Werkzeug, das hier noch nicht gelistet ist -- es wird durch die Karte ERGAENZT, nicht ersetzt.",
+    "machine_ids_by_os": {
+      "Darwin": "mac",
+      "Linux": "peer"
+    },
+    "machine_tool_map": {
+      "mac": [
+        "wb-shot",
+        "wb-shot-remote",
+        "mcp-shared",
+        "basic-memory",
+        "bild",
+        "video",
+        "llama-server",
+        "llama-bench",
+        "screencapture",
+        "open",
+        "grug-server",
+        "wb-modell-proxy",
+        "cliclick"
+      ],
+      "peer": [
+        "peer-shot",
+        "orch-launch",
+        "orch-bare",
+        "msync-handoff",
+        "msync-arrive",
+        "nvidia-smi"
+      ]
+    },
+    "_comment_non_tool_identifiers": "Befund 2026-08-04: diese Backtick-Bezeichner sehen wie Werkzeugnamen aus, sind aber keine aufzurufenden Programme -- Tippfehler beim 'Reparieren' drohen (fast passiert). name wird lowercased mit dem Backtick-Inhalt verglichen, exakt wie known_non_commands oben; kind ist reine Dokumentation fuer den naechsten Leser.",
+    "known_non_tool_identifiers": [
+      {
+        "name": "wb-orch",
+        "kind": "tmux-Sessionname auf peer (regeln/maschinen.md), kein Programm"
+      },
+      {
+        "name": "secrets-sync",
+        "kind": "Syncthing-Ordnername (regeln/maschinen.md), kein Programm"
+      },
+      {
+        "name": "vault-secrets",
+        "kind": "Syncthing-Ordnername (regeln/maschinen.md), kein Programm"
+      }
+    ],
+    "label_prefixes_exclude": [
+      "service",
+      "dienst",
+      "named",
+      "called",
+      "keychain"
+    ],
+    "known_non_commands": [
+      "unset",
+      "set",
+      "export",
+      "source",
+      "eval",
+      "wait",
+      "trap",
+      "read",
+      "type",
+      "alias",
+      "cd",
+      "echo",
+      "exit",
+      "break",
+      "continue",
+      "return",
+      "do",
+      "done",
+      "then",
+      "fi",
+      "elif",
+      "else",
+      "case",
+      "esac",
+      "function",
+      "in",
+      "select",
+      "time",
+      "until",
+      "esc",
+      "send-keys",
+      "respawn-pane",
+      "capture-pane",
+      "new-window",
+      "new-session",
+      "list-clients",
+      "list-windows",
+      "has-session",
+      "set-option",
+      "join-pane",
+      "wb-",
+      "findet",
+      "machte",
+      "wb-ai",
+      "wb-ai-view",
+      "t1-view"
+    ]
+  },
+  "check4_skill_vs_rules": {
+    "skills_glob": "{BASE}/.claude/skills/*/SKILL.md",
+    "rule_text_globs": [
+      "{BASE}/.claude/CLAUDE.md",
+      "{BASE}/.claude/roles/*.md"
+    ],
+    "rule_pairs": [
+      {
+        "id": "no-emojis",
+        "description_pattern": "(?i)\\b(use|uses|using|add|adds|adding|include|includes|including|insert|inserts)\\b[^.]{0,40}\\bemojis?\\b",
+        "rule_pattern": "(?i)no\\s+emojis|keine\\s+emojis",
+        "explanation": "Standing rule 'No emojis in app UIs/notifications' vs. a skill description that instructs adding/using emoji."
+      },
+      {
+        "id": "push-authority",
+        "description_pattern": "(?i)\\b(automatically|ungefragt|selbstst\\u00e4ndig)\\b[^.]{0,40}\\b(git\\s+push|pushes?\\b|publish(es)?\\b|ver\\u00f6ffentlicht)",
+        "rule_pattern": "(?i)nur der Orchestrator entscheidet und f\\u00fchrt.{0,20}push",
+        "explanation": "Standing rule 'only the orchestrator pushes/publishes' vs. a skill description that has the skill push or publish on its own."
+      },
+      {
+        "id": "worker-spawns-worker",
+        "description_pattern": "(?i)\\bspawns?\\b[^.]{0,40}\\b(sub-?worker|sub-?agent|weitere[nr]?\\s+worker)\\b",
+        "rule_pattern": "(?i)du spawnst weiter\\s*NICHT|is a leaf, not an orchestrator",
+        "explanation": "Standing rule 'workers are leaves, they do not spawn workers' vs. a skill description that has the skill itself spawn further workers."
+      }
+    ]
+  },
+  "check5_config_claims": {
+    "_comment": "Regeltext behauptet einen Konfigurationswert. truth_file/truth_pattern liefern den WAHREN Wert; claim_files/claim_pattern finden die Behauptung; must_not_exceed_* findet Werte, die groesser sind als der servierte. Ein must_not_exceed_files-Eintrag kann statt eines blossen Pfads ein Objekt {file, provider_aware} sein (2026-08-15): dann prueft Check 5 je Provider/Modell-Tag statt pauschal gegen truth -- siehe provider_aware unten und _check_must_not_exceed_provider_aware im Code.",
+    "claims": [
+      {
+        "id": "OLLAMA_CONTEXT_LENGTH",
+        "truth_file": "{BASE}/Library/LaunchAgents/homebrew.mxcl.ollama.plist",
+        "truth_pattern": "OLLAMA_CONTEXT_LENGTH</key>\\s*\\n\\s*<string>(\\d+)</string>",
+        "claim_files": [
+          "{BASE}/.claude/regeln/lokale-modelle.md",
+          "{BASE}/.claude/CLAUDE.md"
+        ],
+        "claim_pattern": "OLLAMA_CONTEXT_LENGTH=(\\d+)",
+        "must_not_exceed_files": [
+          {
+            "file": "{BASE}/.pi/agent/models.json",
+            "provider_aware": {
+              "_comment": "baseurl_pattern/id_pattern lesen den jeweils zuletzt gesehenen Provider- bzw. Modell-Kontext vor einer contextWindow-Zeile mit; ollama_baseurl_marker unterscheidet Ollama-Provider (Port 11434) von anderen (z.B. mlx-lokal auf 8080) -- Nicht-Ollama-Provider bekommen einen Hinweis statt eine Pruefung gegen die plist. num_ctx_pattern liest 'ollama show <tag> --modelfile': traegt das Tag ein eigenes PARAMETER num_ctx, gilt DAS als Wahrheit statt der plist.",
+              "baseurl_pattern": "\"baseUrl\"\\s*:\\s*\"([^\"]*)\"",
+              "ollama_baseurl_marker": ":11434",
+              "id_pattern": "\"id\"\\s*:\\s*\"([^\"]*)\"",
+              "num_ctx_pattern": "PARAMETER\\s+num_ctx\\s+(\\d+)",
+              "show_timeout_sec": 10
+            }
+          }
+        ],
+        "must_not_exceed_pattern": "\"contextWindow\"\\s*:\\s*(\\d+)"
+      }
+    ]
+  },
+  "check6_settings_switches": {
+    "_comment": "Tote und unsichtbare Einstellungs-Schalter. store_file haelt die Deklaration (DEFAULTS + Pruef-Tabellen); menu_globs sind die Dateien, die SCHREIBEN und ANZEIGEN -- ein Treffer dort ist nie ein Leser, sonst waere jeder tote Schalter automatisch lebendig. Alles uebrige im Scan zaehlt als Leser.",
+    "store_file": "{REPO}/shell/wb-state",
+    "repo_dir": "{REPO}",
+    "scan_globs": [
+      "{REPO}/shell/*",
+      "{REPO}/hooks/*",
+      "{REPO}/hooks/lib/*",
+      "{REPO}/app/src/**/*.ts",
+      "{REPO}/extension/src/**/*.ts"
+    ],
+    "exclude_substrings": [
+      "/tests/",
+      ".test.ts",
+      "/node_modules/",
+      "/dist/",
+      "/out/"
+    ],
+    "menu_globs": [
+      "app/src/einstellungen/*",
+      "extension/src/settings.ts",
+      "extension/src/settingsHtml.ts",
+      "extension/src/settingsView.ts"
+    ],
+    "write_patterns": [
+      "\\bsetze\\(\\s*'([A-Za-z][A-Za-z0-9_]*)'",
+      "\\bset\\(\\s*'([A-Za-z][A-Za-z0-9_]*)'",
+      "settings\\s+set\\s+([A-Za-z][A-Za-z0-9_]*)"
+    ],
+    "read_patterns": [
+      "settings\\s+get\\s+([A-Za-z][A-Za-z0-9_]*)",
+      "read_setting(?:_bool)?\\(\\s*[\"']([A-Za-z][A-Za-z0-9_]*)[\"']"
+    ]
+  },
+  "check7_kopien": {
+    "_comment": "Auseinandergelaufene Kopien. install_map leitet den Zielort aus dem VERZEICHNIS ab, nicht aus einer Paarliste -- verglichen wird, was dort schon liegt. Eine Datei, die nur im Repo lebt, traegt ihre Begruendung selbst ('NICHT INSTALLIERT: <warum>' in den ersten 40 Zeilen), nicht eine Liste hier. marker_patterns/identifier_pattern sind das Vokabular der Sorte C: sie stehen in dieser DATEI und nicht im Quelltext, weil ein Erkenner sonst auf seine eigene Beschreibung passt und sich selbst meldet -- derselbe Weg wie bei den Secret-Mustern.",
+    "repo_dir": "{REPO}",
+    "install_map": [
+      [
+        "shell/",
+        "{BASE}/Library/LaunchAgents",
+        "*.plist"
+      ],
+      [
+        "shell/",
+        "{BASE}/.local/bin"
+      ],
+      [
+        "hooks/lib/",
+        "{BASE}/.claude/hooks/lib"
+      ],
+      [
+        "hooks/tests/",
+        "{BASE}/.claude/hooks/tests"
+      ],
+      [
+        "hooks/",
+        "{BASE}/.claude/hooks"
+      ]
+    ],
+    "exclude_substrings": [
+      "__pycache__",
+      "/.git/",
+      ".pyc"
+    ],
+    "harness_sources": [
+      [
+        "code",
+        "{REPO}/shell/wb-state"
+      ],
+      [
+        "vorlage",
+        "{REPO}/shell/models.default.json"
+      ],
+      [
+        "echt",
+        "{BASE}/.claude/workbench/models.json"
+      ]
+    ],
+    "tool_fact_fields": [
+      "effort",
+      "readyPattern",
+      "promptPattern",
+      "promptIgnore",
+      "contextPattern",
+      "session",
+      "resume"
+    ],
+    "marker_globs": [
+      "{REPO}/shell/*",
+      "{REPO}/hooks/*",
+      "{REPO}/hooks/lib/*",
+      "{REPO}/app/src/main/*.ts",
+      "{REPO}/app/src/einstellungen/*.ts"
+    ],
+    "test_globs": [
+      "{REPO}/shell/tests/*",
+      "{REPO}/hooks/tests/*",
+      "{REPO}/app/tests/**/*"
+    ],
+    "marker_patterns": [
+      "ZWEITE STELLE",
+      "[Zz]weite Stelle",
+      "[Bb]eide Stellen"
+    ],
+    "identifier_pattern": "\\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\\b",
+    "fremd_pruefung": {
+      "_comment": "Sorte D, die Umkehrung von Sorte A: ein installiertes Werkzeug ohne Gegenstueck im Repo. paketmanager_verzeichnisse ist eine Liste von ORTEN, keine Liste von NAMEN -- Paketmanager kommen selten hinzu, eigene Werkzeuge fast woechentlich. Was hier NICHT steht, wird per Shebang-Merkmal erkannt (siehe _ist_skript im Quelltext), nicht ueber eine gepflegte Registrierung einzelner Programme.",
+      "ziel": "{BASE}/.local/bin",
+      "paketmanager_verzeichnisse": [
+        "{BASE}/.local/share/uv/tools",
+        "{BASE}/.local/pipx/venvs",
+        "{BASE}/.local/share/pipx",
+        "{BASE}/.npm-global",
+        "{BASE}/.cargo/bin",
+        "{BASE}/go/bin",
+        "{BASE}/.rbenv",
+        "{BASE}/.nvm",
+        "{BASE}/.local/share/claude",
+        "{BASE}/Library/Python",
+        "{BASE}/.gem",
+        "/opt/homebrew",
+        "/usr/local",
+        "/Applications",
+        "/System",
+        "/usr/bin",
+        "/usr/sbin",
+        "/bin"
+      ]
+    }
+  },
+  "check8_test_socket": {
+    "test_globs": [
+      "{REPO}/shell/tests/*",
+      "{REPO}/hooks/tests/*"
+    ],
+    "exclude_substrings": [
+      "/__pycache__/",
+      ".png",
+      ".json"
+    ],
+    "live_session_prefix": "wb-"
+  }
+}

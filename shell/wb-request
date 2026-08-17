@@ -1,0 +1,377 @@
+#!/bin/bash
+# wb-request — a worker APPLIES for a cheaper sub-worker; it never spawns one.
+#
+#   wb-request <name> <model>[:effort] <dir> --files <pfad[,pfad...]> \
+#              --done <fertig-kriterium> --why <warum abtrennbar> --est <umfang> \
+#              [--from <eigenes-modell>] <task...>
+#   wb-request harvest [--dry-run]
+#
+# The request is filed as JSON in ~/.pi-workers/requests/<parent>-<ts>.json plus ONE
+# line in ~/.pi-workers/requests/log.tsv. The orchestrator decides with `wb-decide`.
+# NOTHING here calls a model: the whole runtime path is shell + python arithmetic, so
+# measuring the experiment never costs tokens.
+#
+# log.tsv columns (tab separated, no header, fixed order):
+#   1 ts  2 parent  3 parent_model  4 child_name  5 child_model  6 est
+#   7 decision  8 child_session_id  9 actual_in  10 actual_out
+# Columns 8-10 stay empty until `wb-request harvest` fills them from the child's
+# transcript. child_effort lives in the JSON, not in the log.
+#
+# Rules enforced here (rejection = clear German message + exit 2):
+#   • downward only — the requested model must be CHEAPER than the applicant's
+#     (pi < haiku45 < sonnet5 < opus5/opus48); fable5 can never be requested.
+#   • --files, --done and --why are mandatory.
+#   • at most 2 open requests/children per applicant (open = no .decision yet, or an
+#     approved child whose pane is still alive).
+set -u
+
+REQDIR="$HOME/.pi-workers/requests"
+LOG="$REQDIR/log.tsv"
+LOCKDIR="$HOME/.claude/workbench/locks"
+mkdir -p "$REQDIR" "$LOCKDIR"
+
+# Cost ladder. Everything that is not a Claude model is a local pi model (free).
+# fable5 sits at the opus level so a fable applicant can still request downwards,
+# but it is never allowed as a TARGET (checked separately).
+rank() {
+  case "${1%%:*}" in
+    fable*|claude-fable*)   echo 3 ;;
+    opus*|claude-opus*)     echo 3 ;;
+    sonnet*|claude-sonnet*) echo 2 ;;
+    haiku*|claude-haiku*)   echo 1 ;;
+    *)                      echo 0 ;;
+  esac
+}
+is_claude() { case "${1%%:*}" in claude*|opus*|sonnet*|haiku*|fable*) return 0 ;; *) return 1 ;; esac; }
+
+# ------------------------------------------------------------------- harvest
+if [ "${1:-}" = "harvest" ]; then
+  shift
+  DRY=""; [ "${1:-}" = "--dry-run" ] && DRY=1
+  exec /usr/bin/python3 - "$LOG" "$REQDIR" "$HOME/.claude/projects" "${DRY:-}" <<'PY'
+import json, os, re, sys, tempfile, fcntl, glob, datetime
+
+log, reqdir, projects, dry = sys.argv[1:5]
+if not os.path.exists(log):
+    print("wb-request harvest: keine log.tsv — nichts zu tun.")
+    sys.exit(0)
+
+def token_sums(path):
+    """Add up the usage fields of a Claude transcript. Pure arithmetic."""
+    tin = tout = 0
+    seen = False
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            usage = (rec.get("message") or {}).get("usage") or rec.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            seen = True
+            tin += (usage.get("input_tokens") or 0)
+            tin += (usage.get("cache_creation_input_tokens") or 0)
+            tin += (usage.get("cache_read_input_tokens") or 0)
+            tout += (usage.get("output_tokens") or 0)
+    return (tin, tout) if seen else (None, None)
+
+def parse_ts(ts):
+    """The log's ts ('20260725T091457Z', possibly '…Z-2' on a collision)."""
+    base = (ts or "").split("-")[0]
+    try:
+        return datetime.datetime.strptime(base, "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+    except Exception:
+        return None
+
+def first_ts(path):
+    """Earliest record timestamp of a transcript = when that session started."""
+    best = None
+    try:
+        with open(path, errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i > 200:
+                    break
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                t = rec.get("timestamp")
+                if not isinstance(t, str):
+                    continue
+                try:
+                    dt = datetime.datetime.fromisoformat(t.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if best is None or dt < best:
+                    best = dt
+    except Exception:
+        return None
+    return best
+
+def has_probe(path, probe):
+    try:
+        with open(path, errors="replace") as fh:
+            return probe in fh.read(200000)
+    except Exception:
+        return False
+
+def find_transcript(req, ts):
+    """The CHILD's transcript, or (None, reason).
+
+    The task text alone does NOT identify it: the PARENT typed the wb-request call
+    with exactly that text, so its own transcript contains it too — and the old
+    newest-mtime fallback was usually the parent's still-running transcript, which
+    would have charged the parent's tokens to the child. These figures are the
+    entire point of the experiment (evaluation mail 2026-08-08), so attribution is
+    now anchored on the ts: the child's pane is created AFTER the request was
+    filed, hence its FIRST record cannot predate it. Only a UNIQUE candidate is
+    accepted; anything else leaves the numbers empty with a reason in column 8 —
+    no value beats a wrong value.
+    """
+    d = (req or {}).get("dir") or ""
+    # JEDES Zeichen ausser [A-Za-z0-9-] wird zu einem Bindestrich, nicht nur der
+    # Schraegstrich (gemessen 2026-08-08 an allen 140 Ordnern unter ~/.claude/projects).
+    # Sonst faellt jeder Pfad mit einem versteckten Ordner darin heraus -- und seit dem
+    # 04.08. liegt in jedem Worker-Pfad einer (~/.pi-workers/worktrees/<name>).
+    slug = re.sub(r"[^A-Za-z0-9-]", "-", d)
+    started = parse_ts(ts)
+    if started is None:
+        return None, "TS?"
+    cands = [p for p in glob.glob(os.path.join(projects, slug, "*.jsonl"))
+             if (first_ts(p) or datetime.datetime.min.replace(
+                     tzinfo=datetime.timezone.utc)) >= started]
+    probe = ((req or {}).get("task") or "")[:60]
+    if probe and len(cands) > 1:
+        narrowed = [p for p in cands if has_probe(p, probe)]
+        if narrowed:
+            cands = narrowed
+    if not cands:
+        return None, "MISSING"
+    if len(cands) > 1:
+        return None, "AMBIG:%d" % len(cands)
+    return cands[0], ""
+
+lock = open(log + ".lock", "w")
+fcntl.flock(lock, fcntl.LOCK_EX)
+try:
+    rows = [l.rstrip("\n").split("\t") for l in open(log) if l.strip()]
+    filled = skipped = missing = 0
+    for r in rows:
+        while len(r) < 10:
+            r.append("")
+        if r[6] != "approved":
+            continue
+        if r[8].strip():          # actual_in already filled: never count twice
+            skipped += 1
+            continue
+        ts, parent = r[0], r[1]
+        reqfile = os.path.join(reqdir, "%s-%s.json" % (parent, ts))
+        try:
+            req = json.load(open(reqfile))
+        except Exception:
+            req = None
+        path, reason = find_transcript(req, ts)
+        if not path:
+            # reason in column 8: MISSING (no transcript started after the request),
+            # AMBIG:n (several — attribution would be a guess), TS? (unparsable ts).
+            r[7] = reason or "MISSING"
+            missing += 1
+            continue
+        tin, tout = token_sums(path)
+        if tin is None:
+            r[7] = "MISSING"
+            missing += 1
+            continue
+        r[7] = os.path.basename(path)[:-6]
+        r[8] = str(tin)
+        r[9] = str(tout)
+        filled += 1
+    if not dry:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(log))
+        with os.fdopen(fd, "w") as fh:
+            for r in rows:
+                fh.write("\t".join(r) + "\n")
+        # mkstemp() erzeugt IMMER 0600 -- ohne dies wird log.tsv bei jedem harvest ein
+        # Stueck enger (2026-08-16, bugjagd shell/niedrig, wie in wb-decide). Bestehenden
+        # Modus erhalten statt ihn stillschweigend zu verschaerfen.
+        try:
+            os.chmod(tmp, os.stat(log).st_mode & 0o777)
+        except OSError:
+            pass
+        os.replace(tmp, log)
+    print("wb-request harvest: %d Zeile(n) gefuellt, %d ohne Transcript (markiert MISSING), %d bereits gezaehlt.%s"
+          % (filled, missing, skipped, " [dry-run, nichts geschrieben]" if dry else ""))
+finally:
+    fcntl.flock(lock, fcntl.LOCK_UN)
+PY
+fi
+
+# ------------------------------------------------------------------- request
+CHILD=""; CMODEL_RAW=""; DIR=""; FILES=""; DONE=""; WHY=""; EST=""; FROM=""; POSN=0
+TASK=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --files) FILES="${2:?Dateiliste}"; shift 2 ;;
+    --done)  DONE="${2:?Fertig-Kriterium}"; shift 2 ;;
+    --why)   WHY="${2:?Begruendung der Abtrennbarkeit}"; shift 2 ;;
+    --est)   EST="${2:?geschaetzter Umfang}"; shift 2 ;;
+    --from)  FROM="${2:?eigenes Modell}"; shift 2 ;;
+    -*) echo "wb-request: unbekannte Option '$1'" >&2; exit 2 ;;
+    *)
+      POSN=$((POSN+1))
+      case "$POSN" in
+        1) CHILD="$1" ;;
+        2) CMODEL_RAW="$1" ;;
+        3) DIR="$1" ;;
+        *) [ -n "$TASK" ] && TASK="$TASK $1" || TASK="$1" ;;
+      esac
+      shift ;;
+  esac
+done
+
+usage() {
+  echo "usage: wb-request <name> <model>[:effort] <dir> --files <p[,p...]> --done <kriterium> --why <warum> --est <umfang> [--from <modell>] <task...>" >&2
+}
+[ -n "$CHILD" ] && [ -n "$CMODEL_RAW" ] && [ -n "$DIR" ] && [ -n "$TASK" ] || { usage; exit 2; }
+
+CMODEL="${CMODEL_RAW%%:*}"
+CEFFORT=""; [ "$CMODEL_RAW" != "$CMODEL" ] && CEFFORT="${CMODEL_RAW#*:}"
+
+# --- mandatory fields -------------------------------------------------------
+miss=""
+[ -n "$FILES" ] || miss="$miss --files"
+[ -n "$DONE" ]  || miss="$miss --done"
+[ -n "$WHY" ]   || miss="$miss --why"
+if [ -n "$miss" ]; then
+  echo "wb-request: ABGELEHNT — Pflichtangabe fehlt:$miss." >&2
+  echo "  --files = die Dateien, die das Kind anfassen darf; --done = woran Fertigsein messbar ist;" >&2
+  echo "  --why  = warum die Arbeit ueberhaupt abtrennbar ist. Ohne das ist der Antrag nicht pruefbar." >&2
+  exit 2
+fi
+
+# --- who is applying? -------------------------------------------------------
+PARENT=""; PARENT_MODEL="$FROM"
+if [ -n "${TMUX_PANE:-}" ]; then
+  PARENT=$(tmux display -p -t "$TMUX_PANE" '#{@wb_worker}' 2>/dev/null || true)
+  if [ -z "$PARENT" ]; then
+    # fall back to the pane title 'claude:<name>' / 'pi:<name>'
+    t=$(tmux display -p -t "$TMUX_PANE" '#{pane_title}' 2>/dev/null || true)
+    case "$t" in claude:*|pi:*) PARENT="${t#*:}" ;; esac
+  fi
+fi
+[ -n "$PARENT" ] || PARENT="unbekannt"
+if [ -z "$PARENT_MODEL" ] && [ "$PARENT" != "unbekannt" ]; then
+  PARENT_MODEL=$($HOME/.local/bin/wb-state worker-model "$PARENT" 2>/dev/null || true)
+fi
+if [ -z "$PARENT_MODEL" ]; then
+  echo "wb-request: ABGELEHNT — eigenes Modell nicht ermittelbar (Pane-Kontext und wb-state liefern nichts)." >&2
+  echo "  Bitte mit --from <modell> erneut stellen, z. B. --from opus5:xhigh." >&2
+  exit 2
+fi
+
+# --- downward only ----------------------------------------------------------
+case "${CMODEL}" in
+  fable*|claude-fable*)
+    echo "wb-request: ABGELEHNT — fable5 ist nie beantragbar." >&2
+    exit 2 ;;
+esac
+PR=$(rank "$PARENT_MODEL"); CR=$(rank "$CMODEL")
+if [ "$CR" -ge "$PR" ]; then
+  echo "wb-request: ABGELEHNT — nur abwaerts: '$CMODEL' ist nicht guenstiger als Dein eigenes Modell '$PARENT_MODEL'." >&2
+  echo "  Rangfolge: pi < haiku45 < sonnet5 < opus5/opus48. Waehle ein billigeres Modell oder mach es selbst." >&2
+  exit 2
+fi
+
+# --- at most two open requests/children -------------------------------------
+open=0; openlist=""
+for f in "$REQDIR/$PARENT"-*.json; do
+  [ -e "$f" ] || continue
+  if [ ! -e "$f.decision" ]; then
+    open=$((open+1)); openlist="$openlist
+  offen (noch nicht entschieden): $f"
+    continue
+  fi
+  grep -q '^decision: approved' "$f.decision" 2>/dev/null || continue
+  cn=$(/usr/bin/python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("child_name") or "")
+except Exception: pass' "$f")
+  [ -n "$cn" ] || continue
+  alive=$(tmux list-panes -a -F '#{@wb_worker} #{pane_dead}' 2>/dev/null | awk -v n="$cn" '$1==n && $2=="0"{print "1"; exit}')
+  if [ -n "$alive" ]; then
+    open=$((open+1)); openlist="$openlist
+  laeuft noch: Kind '$cn' aus $f"
+  fi
+done
+if [ "$open" -ge 2 ]; then
+  echo "wb-request: ABGELEHNT — Du hast schon $open offene Antraege/Kinder (Maximum 2):$openlist" >&2
+  echo "  Erst abschliessen (oder entscheiden lassen), dann neu beantragen." >&2
+  exit 2
+fi
+
+# --- file it ----------------------------------------------------------------
+# ts is the unique key (file name AND log row). Two requests in the same second must
+# not collide — the second one would silently overwrite the first.
+# Der Name wird ATOMAR belegt, nicht bloss geprueft. Zwischen `[ -e ]` und dem
+# Schreiben lag ein ganzer Prozessstart, und zwei Antraege derselben Sekunde fielen in
+# dieses Fenster: gemessen 2026-08-15 mit vier parallelen Antraegen — vier Zeilen in
+# log.tsv, aber nur EINE Antragsdatei, die drei anderen still ueberschrieben.
+# `set -C` (noclobber) laesst `>` eine bestehende Datei nicht anfassen; das ist das
+# O_EXCL, das der Kopfkommentar oben schon versprochen hat.
+TSBASE=$(date -u +%Y%m%dT%H%M%SZ); TS="$TSBASE"; n=1
+while :; do
+  REQFILE="$REQDIR/$PARENT-$TS.json"
+  if (set -C; : > "$REQFILE") 2>/dev/null; then break; fi
+  n=$((n+1)); TS="$TSBASE-$n"
+  if [ "$n" -gt 100 ]; then
+    echo "wb-request: kein freier Antragsname unter $REQDIR (100 Versuche fuer $TSBASE)." >&2
+    exit 2
+  fi
+done
+/usr/bin/python3 - "$REQFILE" "$TS" "$PARENT" "$PARENT_MODEL" "$CHILD" "$CMODEL" "$CEFFORT" "$DIR" "$FILES" "$TASK" "$DONE" "$WHY" "$EST" <<'PY'
+import json, os, sys, tempfile
+(f, ts, parent, pmodel, child, cmodel, ceffort, d, files, task, done, why, est) = sys.argv[1:14]
+req = {
+    "ts": ts,
+    "parent": parent,
+    "parent_model": pmodel,
+    "child_name": child,
+    "child_model": cmodel,
+    "child_effort": ceffort,
+    "dir": d,
+    "files": [x for x in files.split(",") if x],
+    "task": task,
+    "done_criterion": done,
+    "why_separable": why,
+    "est": est,
+}
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(f))
+with os.fdopen(fd, "w") as fh:
+    json.dump(req, fh, indent=2, ensure_ascii=False)
+os.replace(tmp, f)
+PY
+
+# One line, appended — no analysis, no model, nothing that could cost tokens.
+# Under the SAME lock the readers take: `harvest` and `wb-decide` rewrite log.tsv
+# completely under flock on log.tsv.lock, so a plain '>>' during a harvest run was
+# lost in the os.replace. python does the append because macOS has no flock(1).
+/usr/bin/python3 - "$LOG" "$TS" "$PARENT" "$PARENT_MODEL" "$CHILD" "$CMODEL" "$EST" "pending" "" "" "" <<'PY'
+import fcntl, sys
+log = sys.argv[1]
+row = "\t".join(sys.argv[2:12]) + "\n"
+lock = open(log + ".lock", "w")
+fcntl.flock(lock, fcntl.LOCK_EX)
+try:
+    with open(log, "a") as fh:
+        fh.write(row)
+finally:
+    fcntl.flock(lock, fcntl.LOCK_UN)
+PY
+
+echo "Antrag gestellt: $REQFILE"
+echo "Kind '$CHILD' ($CMODEL_RAW) in $DIR — Entscheidung trifft der Orchestrator (wb-decide)."
+echo "Du bist NICHT blockiert: arbeite weiter. Wird der Antrag genehmigt, startet der Orchestrator das Kind."

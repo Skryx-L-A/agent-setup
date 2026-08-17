@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2560" height="1440" viewBox="0 0 2560 1440">
+  <defs>
+    <radialGradient id="hg" cx="0.5" cy="0.42" r="0.72">
+      <stop offset="0"   stop-color="#F7EEDF"/>
+      <stop offset="0.6" stop-color="#EADCC4"/>
+      <stop offset="1"   stop-color="#D6C3A6"/>
+    </radialGradient>
+    <linearGradient id="flasche" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0"    stop-color="#6E8C77"/>
+      <stop offset="0.28" stop-color="#A8C4AC"/>
+      <stop offset="0.55" stop-color="#8AAA92"/>
+      <stop offset="1"    stop-color="#5F7C68"/>
+    </linearGradient>
+  </defs>
+  <rect width="2560" height="1440" fill="url(#hg)"/>
+  <ellipse cx="1280" cy="1188" rx="520" ry="72" fill="#B49B78" opacity="0.35"/>
+
+  <g transform="translate(1082 348)">
+    <rect x="0" y="240" width="396" height="700" rx="52" fill="url(#flasche)"/>
+    <rect x="132" y="86" width="132" height="176" rx="30" fill="url(#flasche)"/>
+    <rect x="112" y="34" width="172" height="72" rx="20" fill="#7E5D40"/>
+    <rect x="40" y="440" width="316" height="290" rx="14" fill="#F4EADA"/>
+    <rect x="40" y="440" width="316" height="290" rx="14" fill="none" stroke="#C9B694" stroke-width="6"/>
+    <g fill="#3C6440">
+      <rect x="86" y="512" width="224" height="20" rx="10"/>
+      <rect x="120" y="562" width="156" height="14" rx="7"/>
+      <circle cx="198" cy="646" r="44" fill="none" stroke="#3C6440" stroke-width="10"/>
+      <path d="M198 622 L212 646 L198 670 L184 646 Z"/>
+    </g>
+    <rect x="58" y="286" width="46" height="560" rx="23" fill="#FFFFFF" opacity="0.34"/>
+  </g>
+</svg>

@@ -1,0 +1,127 @@
+#!/bin/bash
+# brain-maintain — der wiederkehrende Vault-Pflegelauf, an EINEM Ort.
+#
+# Anlass (2026-08-03): Zwei Werkzeuge hingen an gar keinem Aufrufer.
+#   - `brain gardener run` lief zuletzt am 2026-07-29, weil sein alter launchd-Job auf
+#     einen Pfad zeigte, den die Brain-4.0-Migration weggezogen hatte (tools/ -> _meta/tools/).
+#   - `brain-extra-embed` embeddet die Projekt-MOCs in einen eigenen Such-Layer und lief
+#     zuletzt am 2026-07-28. Es hatte NIE einen Job: kein launchd, kein Hook, kein Aufruf
+#     aus dem Gardener. Zwei seither angelegte Projekt-MOCs fehlten dadurch still in der
+#     semantischen Suche - ein Fehler, der niemandem auffaellt, weil die Suche ja
+#     Ergebnisse liefert, nur die falschen.
+# Deshalb hier zusammengefasst: ein Job, ein Log, ein Ort zum Nachsehen.
+#
+# Widerspruchs-Warteschlange (2026-08-04): Session-Ende haengte den vollen
+# `brain contradict`-Scan (~100s je geaenderter Notiz, lokales Modell) frueher
+# direkt in den kritischen Pfad und blockierte damit jedes Sessionende.
+# Session-Ende haengt seither nur noch Pfade an `_meta/state/contradiction-queue.txt`
+# an (Millisekunden, siehe braincli/cli.py --queue-add); das Abarbeiten passiert
+# hier, bei den anderen wiederkehrenden Laeufen.
+#
+#   brain-maintain                 alle drei Schritte, Ausgabe ins Log
+#   brain-maintain --status        was lief wann, ohne etwas zu tun
+#   brain-maintain --contradict-only   NUR die Widerspruchs-Warteschlange abarbeiten
+#                                   (kein gardener run, kein extra-embed) - der Weg
+#                                   von Hand, und der isoliert testbare Pfad;
+#                                   Vault ueberschreibbar via BRAIN_MAINTAIN_VAULT
+#                                   (Default: $HOME/Knowledge), fuer Tests ohne
+#                                   Beruehrung des echten Vaults.
+#
+# PATH (2026-08-10): launchd startet Jobs mit /usr/bin:/bin:/usr/sbin:/sbin und
+# sonst nichts. `brain` ist ein Zweizeiler um `uv`, und `uv` liegt unter
+# /opt/homebrew/bin - deshalb standen im Log am 06.08. und am 10.08. je drei
+# Zeilen "exec: uv: not found", und der Gardener lief seit dem 04.08. nicht mehr.
+# Ein Job, der scheitert, ohne dass jemand es sieht, ist kein Job.
+set -uo pipefail
+
+case ":$PATH:" in
+  *:/opt/homebrew/bin:*) ;;
+  *) PATH="/opt/homebrew/bin:$PATH"; export PATH ;;
+esac
+
+# Das Log ist ueberschreibbar, damit ein Test nicht in den Live-Zustand unter
+# ~/.local/state schreibt (Regel: ein Test fasst die Live-Umgebung nicht an).
+LOG="${BRAIN_MAINTAIN_LOG:-$HOME/.local/state/brain-maintain.log}"
+mkdir -p "$(dirname "$LOG")"
+VAULT="${BRAIN_MAINTAIN_VAULT:-$HOME/Knowledge}"
+# Ebenfalls nur fuer Tests: gegen welche Fassung von `brain` gelaufen wird.
+BRAIN="${BRAIN_BIN:-$HOME/.local/bin/brain}"
+
+run_contradict_queue() {
+  # Eigene Funktion statt Inline-Code, damit --contradict-only exakt denselben
+  # Pfad testet, der auch im vollen Lauf unten steht - kein zweiter, driftender
+  # Ort fuer dieselbe Logik.
+  "$BRAIN" --vault "$VAULT" contradict --queue --write
+}
+
+if [ "${1:-}" = "--status" ]; then
+  echo "== gardener =="
+  "$BRAIN" gardener status 2>&1 | head -4
+  echo
+  echo "== extra-embed (Projekt-MOCs im semantischen Layer) =="
+  db="$HOME/Knowledge/_meta/tools/braincli/state/extra-embeddings.db"
+  [ -f "$db" ] && stat -f '  DB zuletzt geschrieben: %Sm' -t '%Y-%m-%d %H:%M' "$db" \
+               || echo "  DB nicht gefunden: $db"
+  echo
+  echo "== Widerspruchs-Warteschlange =="
+  qfile="$VAULT/_meta/state/contradiction-queue.txt"
+  if [ -s "$qfile" ]; then
+    echo "  $(wc -l < "$qfile" | tr -d ' ') Eintrag/Eintraege wartet/warten: $qfile"
+  else
+    echo "  leer"
+  fi
+  echo
+  echo "== letzter Wartungslauf =="
+  [ -f "$LOG" ] && tail -3 "$LOG" || echo "  noch keiner"
+  exit 0
+fi
+
+if [ "${1:-}" = "--contradict-only" ]; then
+  run_contradict_queue
+  exit $?
+fi
+
+{
+  echo "===== brain-maintain $(date '+%Y-%m-%d %H:%M:%S') ====="
+  echo "--- gardener ---"
+  "$BRAIN" gardener run 2>&1 | tail -20
+  echo "--- extra-embed ---"
+  # Eigener Entrypoint des braincli-Projekts; ohne ihn veralten die MOC-Embeddings still.
+  BC="$HOME/Knowledge/_meta/tools/braincli"
+  if command -v uv >/dev/null 2>&1 && [ -d "$BC" ]; then
+    uv run --project "$BC" brain-extra-embed 2>&1 | tail -10
+  else
+    echo "uv oder $BC fehlt - extra-embed uebersprungen"
+  fi
+  echo "--- contradict-queue ---"
+  run_contradict_queue 2>&1 | tail -20
+  echo "--- messstrecke ---"
+  # Warum HIER und nicht im pre-push-Hook des Vaults (2026-08-10, beide Kandidaten
+  # abgewogen): Die Messstrecke braucht ein laufendes Ollama und einen FERTIGEN
+  # Index. Beides ist genau hier gegeben, drei Zeilen weiter oben wurde der Index
+  # gerade gebaut - im pre-push-Hook ist keins von beidem sicher, und ein Lauf
+  # ohne Ollama faellt auf BM25 zurueck und meldet einen Einbruch, den es nicht
+  # gibt. Dazu: ein Push ist eine Handlung des Menschen, die nicht warten will;
+  # 12 Sekunden Messung und ein moeglicher Fehlalarm gehoeren nicht in seinen Weg.
+  # Der Preis dieser Wahl ist ehrlich zu nennen: der Job laeuft Mo und Do, also
+  # bleibt ein Einbruch bis zu dreieinhalb Tage unentdeckt. Gegenueber den sechs
+  # Tagen vom 04.08. ist das der Fortschritt, den es hier zu holen gibt.
+  EV="$HOME/Knowledge/_meta/tools/eval"
+  EVAL_BIN="${BRAIN_EVAL_BIN:-$EV/.venv/bin/retrieval-eval}"
+  if [ ! -x "$EVAL_BIN" ]; then
+    echo "Messstrecke nicht gebaut ($EVAL_BIN fehlt) - uebersprungen"
+  elif ! "$EVAL_BIN" --help 2>&1 | grep -q -- "--vault"; then
+    # Versionsversatz statt Messwert: eine aeltere Fassung kennt weder --vault
+    # noch den Kopfteil und wuerde eine Zahl ohne ihre Bedingungen liefern.
+    # Lieber gar nicht messen als unbeschriftet messen.
+    echo "Messstrecke ist aelter als dieser Aufrufer (kein --vault) - uebersprungen;"
+    echo "  nach dem naechsten Vault-Merge: cd $EV && uv sync"
+  else
+    "$EVAL_BIN" --quiet --vault "$VAULT" 2>&1 | tail -25
+    rc=${PIPESTATUS[0]}
+    [ "$rc" = "3" ] && echo "ACHTUNG: Suchguete unter der Schwelle - siehe $EV/results/report.md"
+  fi
+  echo "===== fertig $(date '+%H:%M:%S') ====="
+} >> "$LOG" 2>&1
+
+tail -6 "$LOG"

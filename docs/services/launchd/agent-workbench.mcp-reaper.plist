@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE. Replace __HOME__ before loading; see docs/SERVICES.md for the one-line sed.
+
+  Every half hour, ends the MCP helper processes whose agent session is no longer
+  alive. A session that closes cleanly tidies up its own stdio servers; a crash, a
+  memory kill or a hard-closed pane does not, and each orphan holds 100 to 200 MB.
+
+  `mcp-shared reap` ends only processes with no living owner, and always by their
+  concrete PID. It ships in shell/.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>agent-workbench.mcp-reaper</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/mcp-shared</string>
+    <string>reap</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>1800</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/mcp-shared/reaper.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/mcp-shared/reaper.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

@@ -1,0 +1,191 @@
+#!/bin/bash
+# mcp-shared — eine geteilte MCP-Instanz je Server statt einer pro Claude-Session,
+# plus Aufräumen verwaister Helferprozesse.
+#
+# Warum es das gibt (gemessen 2026-07-28): MCP-Server mit stdio-Transport werden vom
+# Client gestartet — jede Claude-Session bekommt also ihre eigenen. Bei 23 laufenden
+# Sessions waren das 21 basic-memory-Prozesse (3.7 GB) und 51 npm/node-Prozesse für
+# playwright (3.0 GB), zusammen 6.6 GB, obwohl fast keine davon benutzt wurden.
+# Mit HTTP-Transport gibt es je Server genau EINEN Prozess (LaunchAgent, KeepAlive),
+# an den sich alle Sessions hängen.
+#
+#   mcp-shared status     was läuft, welche Ports, wie viele Alt-Prozesse
+#   mcp-shared start|stop|restart
+#   mcp-shared apply      Client-Konfiguration auf die geteilten Server zeigen lassen
+#                         (auch nach einem Plugin-Update nötig — das überschreibt sie)
+#   mcp-shared reap       Helferprozesse ohne lebende Claude-Session beenden
+#   mcp-shared reap --dry-run
+#
+# `reap` beendet NUR Prozesse, deren Elternkette keinen lebenden Claude-Prozess mehr
+# enthält, und immer über die konkrete PID — nie über ein Muster (Standing Rule nach
+# dem Vorfall, bei dem ein pkill-Muster Live-Client des Nutzers beendet hat).
+set -uo pipefail
+
+BM_PORT=8766
+PW_PORT=8767
+BM_URL="http://127.0.0.1:${BM_PORT}/mcp"
+PW_URL="http://localhost:${PW_PORT}/mcp"   # playwright-mcp prüft den Host-Header (DNS-Rebind-Schutz)
+BM_LABEL=agent-workbench.mcp-basic-memory
+PW_LABEL=agent-workbench.mcp-playwright
+STATE="$HOME/.local/state/mcp-shared"
+mkdir -p "$STATE"
+
+port_alive() { /usr/bin/nc -z 127.0.0.1 "$1" >/dev/null 2>&1; }
+
+cmd_status() {
+  printf '%-22s %-7s %s\n' SERVER PORT ZUSTAND
+  for pair in "$BM_LABEL:$BM_PORT" "$PW_LABEL:$PW_PORT"; do
+    l="${pair%%:*}"; p="${pair##*:}"
+    if port_alive "$p"; then st="läuft"; else st="NICHT erreichbar"; fi
+    launchctl list 2>/dev/null | grep -q "$l" || st="$st (LaunchAgent nicht geladen)"
+    printf '%-22s %-7s %s\n' "${l##*.}" "$p" "$st"
+  done
+  echo
+  helpers_report
+}
+
+# Alle lokalen MCP-Helferprozesse mit ihrem Besitzer (= nächster Claude-Vorfahr).
+helpers_python() {
+  /usr/bin/python3 - "$@" <<'PY'
+import subprocess, sys
+ps = subprocess.run(['ps','-axo','pid=,ppid=,etime=,rss=,command='],
+                    capture_output=True, text=True).stdout
+procs = {}
+for line in ps.splitlines():
+    parts = line.split(None, 4)
+    if len(parts) < 5:
+        continue
+    pid, ppid, et, rss, cmd = int(parts[0]), int(parts[1]), parts[2], int(parts[3]), parts[4]
+    procs[pid] = (ppid, et, rss, cmd)
+
+def is_claude(cmd):
+    return ('claude.app/Contents/MacOS/claude' in cmd
+            or cmd.startswith('/Users/')  and '/bin/claude ' in cmd
+            or cmd.endswith('/bin/claude'))
+
+def owner(pid):
+    seen = set()
+    while pid in procs and pid not in seen:
+        seen.add(pid)
+        ppid, _, _, cmd = procs[pid]
+        if is_claude(cmd):
+            return pid
+        pid = ppid
+    return None
+
+def is_helper(cmd):
+    if 'Helpers/disclaimer' in cmd:      # Claude.app-Helfer, kein MCP-Prozess
+        return False
+    return ('basic-memory' in cmd and 'mcp' in cmd) \
+        or '@playwright/mcp' in cmd or 'playwright-mcp' in cmd
+
+rows = []
+for pid, (ppid, et, rss, cmd) in procs.items():
+    if not is_helper(cmd):
+        continue
+    # der geteilte Server selbst gehoert launchd und wird NIE angefasst
+    if '--transport streamable-http' in cmd or '--port 8767' in cmd or '--port 8766' in cmd:
+        rows.append((pid, 'shared', et, rss, cmd))
+        continue
+    o = owner(ppid)
+    rows.append((pid, 'owned' if o else 'orphan', et, rss, cmd))
+
+mode = sys.argv[1] if len(sys.argv) > 1 else 'report'
+if mode == 'orphan-pids':
+    print('\n'.join(str(r[0]) for r in rows if r[1] == 'orphan'))
+else:
+    from collections import Counter
+    c = Counter(r[1] for r in rows)
+    mb = lambda k: sum(r[3] for r in rows if r[1] == k) // 1024
+    print(f"Helferprozesse: {c.get('shared',0)} geteilt · "
+          f"{c.get('owned',0)} an lebende Sessions gebunden ({mb('owned')} MB) · "
+          f"{c.get('orphan',0)} verwaist ({mb('orphan')} MB)")
+    for pid, kind, et, rss, cmd in sorted(rows, key=lambda r: -r[3]):
+        if kind == 'orphan':
+            print(f"  verwaist  PID {pid:>6}  seit {et:>12}  {rss//1024:>4} MB  {cmd[:70]}")
+PY
+}
+
+helpers_report() { helpers_python report; }
+
+cmd_reap() {
+  local dry=""; [ "${1:-}" = "--dry-run" ] && dry=1
+  local pids; pids="$(helpers_python orphan-pids)"
+  if [ -z "$pids" ]; then echo "Keine verwaisten MCP-Helferprozesse."; return 0; fi
+  for pid in $pids; do
+    # Gegenprobe unmittelbar vor dem Kill: existiert die PID noch, und ist es
+    # wirklich ein Helferprozess? (Eine PID kann zwischen Analyse und Kill neu
+    # vergeben worden sein.)
+    local cmd; cmd="$(ps -p "$pid" -o command= 2>/dev/null)" || continue
+    case "$cmd" in
+      *basic-memory*|*playwright/mcp*|*playwright-mcp*) ;;
+      *) echo "übersprungen: PID $pid ist kein MCP-Helfer mehr"; continue ;;
+    esac
+    if [ -n "$dry" ]; then echo "würde beenden: PID $pid ($(echo "$cmd" | cut -c1-60))"; continue; fi
+    kill "$pid" 2>/dev/null
+    sleep 1
+    if ps -p "$pid" >/dev/null 2>&1; then kill -9 "$pid" 2>/dev/null; sleep 1; fi
+    if ps -p "$pid" >/dev/null 2>&1; then
+      echo "FEHLER: PID $pid läuft trotz SIGKILL weiter" >&2
+    else
+      echo "beendet: PID $pid"
+      printf '%s\tPID %s\t%s\n' "$(date -u +%FT%TZ)" "$pid" "$(echo "$cmd" | cut -c1-80)" >> "$STATE/reaped.log"
+    fi
+  done
+}
+
+cmd_start()   { launchctl load  -w "$HOME/Library/LaunchAgents/$BM_LABEL.plist" 2>/dev/null
+                launchctl load  -w "$HOME/Library/LaunchAgents/$PW_LABEL.plist" 2>/dev/null; sleep 3; cmd_status; }
+cmd_stop()    { launchctl unload  "$HOME/Library/LaunchAgents/$BM_LABEL.plist" 2>/dev/null
+                launchctl unload  "$HOME/Library/LaunchAgents/$PW_LABEL.plist" 2>/dev/null; echo "beide LaunchAgents entladen."; }
+cmd_restart() { cmd_stop; sleep 2; cmd_start; }
+
+# Client-Konfiguration auf die geteilten Server zeigen lassen. Wird auch nach einem
+# Plugin-Update gebraucht: das Update schreibt die Plugin-eigene .mcp.json zurueck
+# auf `npx @playwright/mcp` und damit auf einen Prozess pro Session.
+cmd_apply() {
+  /usr/bin/python3 - "$BM_URL" "$PW_URL" <<'PY'
+import json, pathlib, shutil, sys, datetime
+bm_url, pw_url = sys.argv[1], sys.argv[2]
+stamp = datetime.date.today().strftime('%Y%m%d')
+snap = pathlib.Path.home() / '.local/trash-snapshots' / f'{stamp}-mcp-shared'
+snap.mkdir(parents=True, exist_ok=True)
+changed = []
+
+cfg = pathlib.Path.home() / '.claude.json'
+if cfg.exists():
+    shutil.copy2(cfg, snap / 'claude.json')
+    d = json.loads(cfg.read_text())
+    servers = d.setdefault('mcpServers', {})
+    want = {'type': 'http', 'url': bm_url}
+    if servers.get('basic-memory') != want:
+        servers['basic-memory'] = want
+        cfg.write_text(json.dumps(d, indent=2) + '\n')
+        changed.append(str(cfg))
+
+for p in sorted(pathlib.Path.home().glob('.claude/plugins/cache/*/playwright/*/.mcp.json')):
+    d = json.loads(p.read_text())
+    want = {'type': 'http', 'url': pw_url}
+    if d.get('playwright') != want:
+        shutil.copy2(p, snap / f'playwright-{p.parent.name}.mcp.json')
+        d['playwright'] = want
+        p.write_text(json.dumps(d, indent=2) + '\n')
+        changed.append(str(p))
+
+print('angepasst: ' + (', '.join(changed) if changed else 'nichts, war schon korrekt'))
+print(f'Sicherung: {snap}')
+PY
+  echo "Neue Sessions benutzen ab sofort die geteilten Server. Laufende Sessions behalten"
+  echo "ihre eigenen Prozesse, bis sie beendet werden — das ist Absicht, ein Kill wuerde"
+  echo "ihnen mitten in der Arbeit die Werkzeuge wegnehmen."
+}
+
+case "${1:-status}" in
+  status)  cmd_status ;;
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  apply)   cmd_apply ;;
+  reap)    shift; cmd_reap "${1:-}" ;;
+  *) echo "mcp-shared: unbekanntes Kommando '$1' (status|start|stop|restart|apply|reap)" >&2; exit 1 ;;
+esac

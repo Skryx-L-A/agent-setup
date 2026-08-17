@@ -1,0 +1,39 @@
+{
+  "_comment": "NICHT INSTALLIERT: gehoert nicht nach ~/.local/bin, sondern nach ~/.config/wb-modell-proxy/backends.json (gelesen von wb-modell-proxy, gestartet ueber agent-workbench.modell-proxy.plist). Auslieferungsstand fuer die Bedarfsschaltung lokaler Modellserver, 2026-08-13. Schluessel unter 'backends' ist der LAUSCHPORT; 'socketName' ist der passende Schluessel im Sockets-Dict der plist. Ein weiteres Backend (llama.cpp, vllm) braucht hier einen weiteren Eintrag und in der plist einen weiteren Socket — sonst nichts.",
+  "_felder": {
+    "launchdLabel": "Das eigene launchd-Label. Der Proxy reicht es als WB_EIGENTUEMER_LAUNCHD an ensureCmd/stopCmd weiter, damit wb-nohup einen nachpruefbaren Eigentuemer eintragen kann — unter launchd gibt es keinen tmux-Pane. Leer lassen, wer den Proxy von Hand mit --selbst-binden faehrt.",
+    "tickSeconds": "Takt der Leerlaufwache in Sekunden.",
+    "exitIdleSeconds": "So lange bleibt der Proxy noch stehen, wenn kein Backend laeuft und keine Verbindung offen ist; danach beendet er sich und launchd re-armiert den Socket.",
+    "name": "Anzeigename im Protokoll.",
+    "socketName": "Schluessel im Sockets-Dict der plist; ohne Angabe der Lauschport.",
+    "backendPort": "Port, auf dem der echte Modellserver lauscht.",
+    "backendHost": "Vorgabe 127.0.0.1.",
+    "ensureCmd": "Kommandozeile (keine Shell), die das Backend bereitstellt und erst mit Exit 0 endet, wenn es antwortet.",
+    "stopCmd": "Kommandozeile, die das Backend beendet. Der Proxy prueft danach selbst, ob der Port frei ist.",
+    "idleMinutes": "Ohne Verkehr und ohne offene Verbindung so lange, dann stopCmd.",
+    "hardIdleMinutes": "Notbremse fuer Clients, die eine Keep-Alive-Verbindung offen HALTEN, ohne sie zu benutzen. Ohne Angabe das Dreifache von idleMinutes.",
+    "healthPath": "Pfad fuer die Bereitschaftspruefung. Der Proxy verlangt eine gueltige HTTP-Statuszeile, bevor ein Backend als laufend gilt — ein blosser TCP-Verbindungsaufbau reicht nicht. Vorgabe /health.",
+    "healthTimeoutSeconds": "Frist dieser HTTP-Probe. Vorgabe 3. Hoeher setzen, wenn das Backend unter Last laenger als drei Sekunden fuer /health braucht.",
+    "portProbeTimeoutSeconds": "Frist des REINEN TCP-Verbindungsversuchs. Vorgabe 2. Er beantwortet die andere Frage: haelt ueberhaupt noch jemand den Port. Danach entscheidet sich, ob ein Backend fremd ist (vor dem ensureCmd) und ob ein Stopp wirklich gewirkt hat.",
+    "stopForeign": "Ob ein Backend, das der Proxy NICHT selbst gestartet hat, von ihm gestoppt wird. Vorgabe false: er klinkt sich dann nur aus und laesst es laufen, weil es einem anderen Starter gehoert (etwa einem Pane, das grug-server selbst faehrt). Fremd heisst: der Backendport war unmittelbar vor dem ensureCmd schon belegt.",
+    "ensureTimeoutSeconds": "Frist fuer ensureCmd (grug-server braucht bis zu ~150 s: Modell laden, /health, Probeanfrage).",
+    "stopTimeoutSeconds": "Frist fuer stopCmd.",
+    "connectTimeoutSeconds": "Frist fuer die Verbindung zum Backend."
+  },
+  "launchdLabel": "agent-workbench.modell-proxy",
+  "tickSeconds": 5,
+  "exitIdleSeconds": 30,
+  "backends": {
+    "8080": {
+      "name": "grug",
+      "socketName": "grug",
+      "backendHost": "127.0.0.1",
+      "backendPort": 8081,
+      "ensureCmd": "grug-server ensure",
+      "stopCmd": "grug-server stop",
+      "idleMinutes": 20,
+      "ensureTimeoutSeconds": 300,
+      "stopTimeoutSeconds": 120
+    }
+  }
+}

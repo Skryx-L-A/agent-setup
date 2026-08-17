@@ -1,0 +1,26 @@
+#!/bin/sh
+# Atomare Ein-Platz-Sperre fuer grosse Modelle auf der GPU.
+#   gpu-slot nimm  <wer>   -> Exit 0 = Platz gehoert Dir, 1 = belegt (mit Anzeige wem)
+#   gpu-slot gib   <wer>   -> gibt frei, nur der Besitzer darf
+#   gpu-slot wer           -> zeigt den Besitzer oder "frei"
+#   gpu-slot warte <wer> [sekunden]  -> wartet mit Deadline, nimmt dann
+L="$HOME/.pi-workers/gpu-slot.lock"
+case "$1" in
+  nimm)
+    if mkdir "$L" 2>/dev/null; then echo "$2" > "$L/wer"; date +%s > "$L/seit"; echo "Platz genommen von $2"; exit 0
+    else echo "BELEGT von $(cat "$L/wer" 2>/dev/null) seit $(( ($(date +%s) - $(cat "$L/seit" 2>/dev/null || echo 0)) / 60 )) min"; exit 1; fi ;;
+  gib)
+    [ -d "$L" ] || { echo "war frei"; exit 0; }
+    o=$(cat "$L/wer" 2>/dev/null)
+    [ "$o" = "$2" ] || { echo "FEHLER: Platz gehoert $o, nicht $2"; exit 1; }
+    rm -rf "$L"; echo "Platz freigegeben von $2"; exit 0 ;;
+  wer) [ -d "$L" ] && cat "$L/wer" || echo "frei" ;;
+  warte)
+    d=${3:-3600}; e=$(( $(date +%s) + d ))
+    while [ $(date +%s) -lt $e ]; do
+      if mkdir "$L" 2>/dev/null; then echo "$2" > "$L/wer"; date +%s > "$L/seit"; echo "Platz genommen von $2"; exit 0; fi
+      sleep 20
+    done
+    echo "Deadline: Platz blieb belegt von $(cat "$L/wer" 2>/dev/null)"; exit 1 ;;
+  *) echo "gpu-slot nimm|gib|wer|warte <wer> [sekunden]"; exit 2 ;;
+esac

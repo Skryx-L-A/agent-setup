@@ -1,0 +1,39 @@
+# pi (lokaler Harness) — Regeln, Rollen und Skills
+
+> **Vorlage.** Diese Datei wird nicht von Hand geschrieben, sondern erzeugt. `wb-instructions sync`
+> liest `~/.claude/CLAUDE.md`, `~/.claude/roles/orchestrator.md` und `~/.claude/roles/agent.md` und
+> legt daraus eine einzige Datei unter `~/.pi/agent/RULES.md` ab. Fuelle also erst Deine `CLAUDE.md`
+> aus, dann lass sie erzeugen. Bis dahin liegt hier nur diese Beschreibung.
+>
+> *This is a placeholder. The real `~/.pi/agent/RULES.md` is generated from your `CLAUDE.md` and the
+> two role prompts — fill those in, then run `wb-instructions sync`.*
+
+## Warum diese eine Datei
+
+pi liest genau eine Anweisungsdatei automatisch ein. Es gibt dort kein Skill-System und keine
+getrennte System-Prompt-Datei, wie Claude Code sie kennt. Alles, was ein pi-Agent vor der ersten
+Handlung wissen muss, gehoert deshalb in `RULES.md`: die globalen Regeln, die Orchestrator-Rolle und
+die Worker-Rolle, hintereinander in einer Datei.
+
+`wb-instructions sync` setzt genau das zusammen. Der Kopf der erzeugten Datei traegt die
+Quellpfade, den Zeitpunkt und je eine Pruefsumme der Quellen und des eigenen Textes. Daran erkennt
+ein zweiter Lauf, dass sich nichts geaendert hat, und daran erkennt er auch eine von Hand
+geaenderte Zieldatei — die wird gemeldet und nicht ueberschrieben.
+
+## Erzeugen
+
+```bash
+wb-instructions sync                  # alle Harnesse, die dieses Setup kennt
+wb-instructions sync --harness pi     # nur diese Datei
+wb-instructions sync --dry-run        # zeigt, was sich aendern wuerde
+```
+
+## Was daneben liegt und bleibt
+
+`WORKER.md` und `ORCHESTRATOR.md` im selben Verzeichnis sind von Hand gepflegt und werden von
+`sync` nicht angefasst. Sie sind die kurze Fassung fuer den taeglichen Betrieb; `RULES.md` ist die
+vollstaendige, mechanisch uebersetzte. Ein pi-Setup, das die beiden Rollendateien gar nicht laedt,
+hat mit `RULES.md` trotzdem alles beisammen.
+
+Aendere die Regeln also in `~/.claude/CLAUDE.md` und in den Rollen unter `~/.claude/roles/`, nie
+hier. Was unterhalb der Marker-Zeilen steht, ist beim naechsten `sync` weg.

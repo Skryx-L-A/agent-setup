@@ -1,0 +1,100 @@
+/* V20: die Freigabe-Ansicht. Eine Schublade von rechts, ueber der Buehne,
+   nicht daneben -- die Panes sollen ihre Flaeche behalten, solange niemand
+   hinsieht. Dieselbe Sprache wie der Rest: dunkel, monospace, ruhige Farben,
+   Gelb ist fuer "etwas will etwas" reserviert. */
+/* Die Schublade steht IN der Reihe zwischen Sessionleiste und Buehne, nicht
+   darueber -- Vorgabe des Nutzers vom 05.08.: "so wie es auch rechts aussieht".
+   Als schwebende Flaeche lag sie ueber der Buehne und liess die linke Seite
+   wie zwei uebereinandergeschobene Leisten wirken. Jetzt endet die Buehne an
+   ihr, genau wie sie rechts an der Workerleiste endet. Zugeklappt ist sie
+   `display: none` und nimmt keine Breite -- das ersetzt die alte Schiebe-
+   Animation, die in der Reihe die Buehne bei jedem Bild neu vermessen haette. */
+.fg-panel {
+  flex: 0 0 auto; width: min(480px, 45vw); height: 100%; box-sizing: border-box;
+  background: #14171c; border-right: 1px solid #262b34; color: #d8dee9;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  display: none; flex-direction: column;
+  /* Ein Pfad oder ein anderes unbrechbares langes Wort (kein Leerzeichen)
+     lief sonst ueber den rechten Rand der Schublade hinaus, statt umzubrechen
+     -- gefunden am Belegbild vom 05.08., beim Verzeichnis eines Antrags. Gilt
+     fuer die ganze Schublade, damit keine neue Stelle denselben Fehler wieder
+     einfuehrt. */
+  overflow-wrap: anywhere;
+}
+.fg-panel.offen { display: flex; }
+
+.fg-kopf {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px; border-bottom: 1px solid #262b34; flex: 0 0 auto;
+}
+.fg-titel { font-weight: 700; font-size: 13px; }
+.fg-schliessen {
+  background: none; border: 0; color: #8b93a1; font-size: 18px; line-height: 1;
+  cursor: pointer; padding: 2px 6px;
+}
+.fg-schliessen:hover { color: #d8dee9; }
+
+.fg-inhalt { flex: 1 1 auto; overflow-y: auto; padding: 4px 0 16px; }
+.fg-abschnitt-titel {
+  margin: 14px 12px 6px; color: #8b93a1; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.fg-liste { display: flex; flex-direction: column; gap: 8px; padding: 0 12px; }
+.fg-leer { color: #8b93a1; padding: 4px 0 8px; }
+
+.fg-eintrag {
+  background: #1a1e25; border: 1px solid #262b34; border-radius: 6px; padding: 8px 10px;
+}
+.fg-block { border-left: 3px solid #e0a020; }
+/* Die mittlere Stufe: ein Befehl, der auf eine Antwort wartet, statt
+   endgueltig abgelehnt zu sein. Kraeftiger als eine harte Ablehnung, weil hier
+   etwas ZU TUN ist -- dieselbe Rubrik, deutlich unterscheidbar. */
+.fg-block-wartet { border-left-width: 5px; border-left-color: #e8b23a; background: #1e2028; }
+.fg-muster { margin-top: 6px; color: #e8b23a; font-size: 11px; }
+.fg-verzeichnis { margin-top: 4px; color: #8b93a1; font-size: 11px; }
+.fg-antrag { border-left: 3px solid #6a7fd0; }
+/* Verlauf (V17): gedaempft statt gefaerbt -- eine Gruppe ist Geschichte, kein
+   aktiver Wunsch wie ein Block (gelb) oder ein Antrag (blau). */
+.fg-verlauf { border-left: 3px solid #545c6b; }
+
+.fg-eintrag-kopf { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.fg-wer { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fg-wann { color: #8b93a1; font-size: 11px; white-space: nowrap; }
+.fg-zusatz { color: #8b93a1; font-size: 11px; margin-top: 2px; }
+
+.fg-grund { margin-top: 6px; white-space: pre-wrap; }
+.fg-befehl {
+  margin-top: 6px; padding: 4px 6px; background: #0e1014; border-radius: 4px;
+  color: #b9c0cc; white-space: pre-wrap; word-break: break-all;
+}
+
+.fg-feld { margin-top: 4px; }
+.fg-feld b { color: #8b93a1; font-weight: 600; }
+.fg-hinweis { margin-top: 8px; margin-bottom: 8px; color: #8b93a1; font-size: 11px; }
+
+.fg-grundfeld { display: block; margin-top: 8px; color: #8b93a1; font-size: 11px; }
+.fg-grund-eingabe {
+  display: block; width: 100%; margin-top: 3px; box-sizing: border-box;
+  background: #0e1014; border: 1px solid #262b34; border-radius: 4px; color: #d8dee9;
+  font: inherit; padding: 4px 6px;
+}
+
+.fg-aktionen { display: flex; gap: 8px; margin-top: 8px; }
+.fg-btn {
+  font: inherit; color: #d8dee9; background: #21262f; border: 1px solid #262b34;
+  border-radius: 4px; padding: 3px 10px; cursor: pointer;
+}
+.fg-btn:hover { background: #2a3140; }
+.fg-btn-an { border-color: #46a758; }
+.fg-btn-ab { border-color: #d24c4c; }
+.fg-ergebnis { margin-top: 6px; color: #8b93a1; }
+.fg-ergebnis.fg-fehler { color: #d24c4c; }
+
+/* Der Knopf links traegt einen kleinen Punkt, solange etwas wartet -- dieselbe
+   Farbe wie das Gelb der Tab-Marken: "etwas will etwas". */
+.knopf[data-tot="freigaben"] { position: relative; }
+.knopf[data-tot="freigaben"].fg-hat-wartende::after {
+  content: ''; position: absolute; top: 4px; right: 6px; width: 7px; height: 7px;
+  border-radius: 50%; background: #e0a020;
+}
+.schmal .knopf[data-tot="freigaben"].fg-hat-wartende::after { right: 10px; }

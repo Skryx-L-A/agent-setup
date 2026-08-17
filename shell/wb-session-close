@@ -1,0 +1,423 @@
+#!/bin/bash
+# wb-session-close <session> [...] — eine ganze Workbench-Session bewusst schliessen.
+#
+# Warum es das gibt: `bash-guard-kill-pattern` blockt rohe `tmux kill-session`-Aufrufe,
+# weil ein zu breites Kill-Muster schon zweimal LIVE-Client des Nutzers beendet hat
+# ([[incident-2026-07-25-killmuster-beendete-live-client]]). Der dort genannte Umweg
+# („eigener Test-Socket") gilt fuer TESTS — er hilft nicht, wenn eine echte, alte
+# Session absichtlich weg soll. Genau dafuer ist dieses Werkzeug: die Sicherheit
+# steckt in den Pruefungen, nicht in einem Flag, das jeder setzen kann.
+#
+# Es verweigert den Dienst, wenn
+#   * ein CLIENT an der Session ODER an einer Session ihrer Gruppe haengt
+#     (dann schaut gerade jemand hin),
+#   * ein WORKER-Pane laeuft (dann ist Arbeit in Flug),
+#   * es die eigene Session ist — inklusive ihrer gruppierten '-view'-Schwester
+#     (man saegt nicht den Ast, auf dem man sitzt).
+#
+# Die Eigen-Erkennung laeuft ueber die Prozesskette, nicht ueber den Sessionnamen,
+# den tmux zurueckmeldet: siehe die Begruendung bei own_sessions() weiter unten.
+# Am 2026-08-03 hat sich eine Session ueber genau diese Luecke selbst geschlossen.
+# `--force` hebt NUR die Client-Pruefung auf und verlangt eine zusaetzliche Bestaetigung
+# ueber WB_SESSION_CLOSE_CONFIRM=<sessionname>.
+# `--with-workers` hebt NUR die Worker-Pruefung auf. Es galt bis 2026-08-06 allein fuer
+# --self; seither auch fuer eine benannte Session, weil das Fenster der Workbench eine
+# Sitzung auf Verlangen schliesst und loescht ("sessions sollen auch sofort endgültig
+# löschbar sein ohne sie vorher zu schließen", der Nutzer). Die Bremse davor ist die
+# Rueckfrage im Fenster, nicht ein grauer Menuepunkt. Ohne den Schalter bleibt es bei
+# der Verweigerung -- ein Skript raeumt keine laufende Arbeit ab.
+# Die EIGEN-Pruefung hebt keiner der beiden auf; dafuer gibt es allein --self.
+#
+# Vor dem Schliessen wird immer notiert, wie die Session wiederherzustellen ist
+# (Verzeichnis + Startkommando) — Ziel ein aufgeraeumter Rechner, kein Datenverlust.
+#
+# Wird eine BASIS-Session benannt (nicht ihre Sicht selbst), schliesst der normale
+# Weg ihre gruppierte '-view'-Schwester automatisch mit — erst die Sicht, dann die
+# Basis, wie bei --self. Ohne das blieb eine Sicht ohne Basis zurueck (Befund
+# 2026-08-04: `wb-session-close wb-a project` liess `wb-a project-view` als Waise
+# stehen, wb-doctor meldete sie prompt als Strukturfehler). Wird die Sicht selbst
+# ausdruecklich als Argument genannt, schliesst sie weiterhin allein — das bleibt
+# die Rettung fuer eine bereits verwaiste Sicht.
+#
+# --self [--with-workers] — Knopf fuer einen tmux-Tastendruck: schliesst die EIGENE
+# Session samt gruppierter '-view'-Schwester. Das ist der einzige Fall, in dem die
+# "ist es die eigene Session"-Pruefung nicht verweigert, sondern absichtlich der Zweck
+# des Aufrufs ist. Deshalb zusaetzliche Bedingungen statt weniger:
+#   * WB_SESSION_CLOSE_CONFIRM muss exakt der eigenen BASIS-Session entsprechen
+#     (nicht der '-view'-Schwester — die Bestaetigung soll den echten Namen treffen,
+#     den der Nutzer auch aus wb-grid kennt),
+#   * ein lebender Worker-Pane verweigert wie ueberall sonst, ausser --with-workers,
+#   * erst die '-view'-Schwester schliessen, dann die Basis (die Schwester haengt an
+#     der Basis, nicht umgekehrt).
+# --self nimmt KEINE Sessionnamen als Argument entgegen — es schliesst ausschliesslich,
+# was die Prozesskette als eigen erkennt UND was tmux derselben Sessiongruppe zuordnet.
+# Auch WB_SESSION aus der Umgebung kommt hier nicht hinein (siehe OWN_LIST unten). Das
+# ist bewusst kein Freibrief: es bleibt unmoeglich, ueber --self eine FREMDE Session zu
+# treffen.
+set -uo pipefail
+
+FORCE=""
+SELF=""
+WITH_WORKERS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force)        FORCE=1; shift ;;
+    --self)         SELF=1; shift ;;
+    --with-workers) WITH_WORKERS=1; shift ;;
+    --)             shift; break ;;
+    *)              break ;;
+  esac
+done
+
+if [ -n "$SELF" ]; then
+  [ $# -eq 0 ] || { echo "usage: wb-session-close --self [--with-workers]  (keine Sessionnamen erlaubt)" >&2; exit 1; }
+else
+  [ $# -gt 0 ] || { echo "usage: wb-session-close [--force] [--with-workers] <session> [<session>...]  |  wb-session-close --self [--with-workers]" >&2; exit 1; }
+fi
+
+SNAPDIR="$HOME/.local/trash-snapshots/$(date +%Y%m%d)-geschlossene-sessions"
+mkdir -p "$SNAPDIR"
+REC="$SNAPDIR/sessions.md"
+
+# --- Welche Sessions sind die EIGENEN? --------------------------------------
+# NICHT ueber `tmux display -p '#{session_name}'` bestimmen. Haengt das eigene
+# Fenster in einer Sessiongruppe (die Workbench legt zu jeder Session eine
+# gruppierte '<name>-view' fuer das VS-Code-Fenster an), nennt tmux die
+# SCHWESTER-Session statt der eigenen. Auf eigenem Socket gemessen (2026-08-03):
+#     Pane laeuft in 't1', `display -p '#{session_name}'` antwortet "t1-view".
+# Genau daran hat sich am 2026-08-03 um 22:12 eine laufende Orchestrator-Session
+# selbst geschlossen: die Eigen-Pruefung verglich gegen den falschen Namen, und
+# die Client-Pruefung griff auch nicht, weil der Client am '-view' haengt und die
+# Basis-Session deshalb `session_attached=0` meldet.
+#
+# Verlaesslich ist nur die Prozesskette: dieser Prozess laeuft unterhalb des
+# `pane_pid` genau eines Panes. Jede Session, die dieses Pane zeigt — und jede
+# Session ihrer Gruppe — ist die eigene.
+own_pid_chain() {
+  local p=$$ chain=""
+  while [ "${p:-0}" -gt 1 ]; do
+    chain="$chain $p"
+    p="$(ps -p "$p" -o ppid= 2>/dev/null | tr -d ' ')"
+    [ -n "$p" ] || break
+  done
+  printf '%s ' "$chain"
+}
+
+# Zweiter Weg, wenn tmux den Prozess SELBST gestartet hat: bei `run-shell` (so laeuft
+# der Tastendruck Prefix + S) haengt der Prozess unter dem tmux-SERVER, nicht unter
+# einem Pane — die Prozesskette findet dann nichts. Gemessen 2026-08-04:
+#     TMUX=[/private/tmp/tmux-501/<socket>,<serverpid>,<session-id>]  TMUX_PANE=[]
+# Das dritte Feld ist die Session-ID des aufrufenden Clients; sie stammt von tmux und
+# nicht vom Aufrufer, taugt also als Beleg. Ohne diesen Weg verweigerte `--self` beim
+# echten Tastendruck den Dienst (mit einem angehaengten Client nachgestellt).
+session_from_tmux_env() {
+  local sid
+  [ -n "${TMUX:-}" ] || return 0
+  sid="${TMUX##*,}"
+  case "$sid" in ''|*[!0-9]*) return 0 ;; esac
+  tmux list-sessions -F '#{session_id} #{session_name}' 2>/dev/null \
+    | awk -v want="\$$sid" '$1==want{print $2; exit}'
+}
+
+own_sessions() {
+  local chain
+  chain=" $(own_pid_chain) "
+  tmux list-panes -a -F '#{pane_pid} #{session_name} #{session_group}' 2>/dev/null \
+  | awk -v c="$chain" '
+      { pid=$1; sess=$2; grp=$3
+        sn[NR]=sess; sg[NR]=grp
+        if (index(c, " " pid " ")) { own[sess]=1; if (grp != "") owngrp[grp]=1 }
+      }
+      END { for (i=1; i<=NR; i++)
+              if (sn[i] in own || (sg[i] != "" && sg[i] in owngrp)) out[sn[i]]=1
+            for (s in out) print s }'
+}
+
+# Welche der eigenen Sessions ist die BASIS (nicht die '-view'-Schwester)?
+# Gemessen (2026-08-03, eigener Socket): eine Sessiongruppe traegt als
+# '#{session_group}' den Namen der Basis-Session, fuer BEIDE Mitglieder —
+# `eigen` zeigt `session_group=eigen`, `eigen-view` zeigt ebenfalls
+# `session_group=eigen`. Die Basis ist also die Session, deren eigener Name
+# gleich ihrer Gruppe ist (oder die ganz ohne Gruppe laeuft, dann ist sie
+# trivial ihre eigene Basis).
+own_base_session() {
+  # Bewusst reines Bash statt awk -v mit der mehrzeiligen Liste: awk (BSD/onetrueawk
+  # auf macOS) bricht bei eingebetteten Newlines im -v-Wert mit "newline in string"
+  # ab. Der Lookup je Session ist einzeilig und daher unproblematisch.
+  local own="$1" s grp
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    grp="$(tmux list-sessions -F '#{session_name} #{session_group}' 2>/dev/null | awk -v n="$s" '$1==n{print $2; exit}')"
+    if [ -z "$grp" ] || [ "$grp" = "$s" ]; then
+      printf '%s\n' "$s"
+      return 0
+    fi
+  done <<EOF
+$own
+EOF
+  return 1
+}
+
+OWN_MEASURED="$(own_sessions || true)"
+# Findet die Prozesskette nichts, aber tmux hat uns selbst gestartet: die Session aus
+# $TMUX nehmen und ihre ganze Gruppe dazu (Basis und Sicht teilen ihre Fenster).
+if [ -z "$(printf '%s' "$OWN_MEASURED" | tr -d '[:space:]')" ]; then
+  ENVSESS="$(session_from_tmux_env)"
+  if [ -n "$ENVSESS" ]; then
+    OWN_MEASURED="$(tmux list-sessions -F '#{session_name} #{session_group}' 2>/dev/null \
+      | awk -v s="$ENVSESS" '
+          { n[NR]=$1; g[NR]=$2; if ($1==s) { wg=$2; found=1 } }
+          END { if (!found) exit
+                for (i=1; i<=NR; i++)
+                  if (n[i]==s || (wg != "" && g[i]==wg)) print n[i] }')"
+  fi
+fi
+# WB_SESSION ist die ausdrueckliche Angabe fuer Aufrufer ohne tmux-Kontext
+# (launchd, ssh). Sie zaehlt NUR als SCHUTZ — "diese Session bitte nicht anfassen" —
+# und niemals als Beleg fuer Eigenheit.
+#
+# Warum (Befund 2026-08-15, nachgestellt in test-session-close.sh): frueher wanderte
+# WB_SESSION in dieselbe Liste, aus der `--self` seine Kill-Ziele nimmt. Ein geerbtes
+# WB_SESSION=<fremde-session> — im Worker-Pane, unter launchd, ueber ssh — liess `--self`
+# eine FREMDE Session samt laufendem Worker schliessen, ohne Client- und ohne
+# Worker-Pruefung. Es ist derselbe Fehlertyp wie der Selbstabschuss vom 2026-08-03:
+# Eigenheit wird ueber die PROZESSKETTE bewiesen, nie ueber einen Namen aus der
+# Umgebung. Ein Name aus der Umgebung darf deshalb nur verschaerfen, nie oeffnen.
+OWN_LIST="$OWN_MEASURED"
+[ -n "${WB_SESSION:-}" ] && OWN_LIST="$OWN_LIST
+$WB_SESSION"
+
+# Fail-closed: laeuft dieser Aufruf INNERHALB von tmux, muss die MESSUNG eine
+# eigene Session finden. Tut sie es nicht, ist die Erkennung kaputt — dann wird
+# nichts geschlossen, statt blind weiterzumachen (der alte Code uebersprang die
+# Pruefung stillschweigend, wenn der Name leer blieb; und mit WB_SESSION in der
+# Liste haette ein gesetzter Umgebungsname sie ebenfalls stillschweigend erfuellt).
+if [ -n "${TMUX:-}" ] && [ -z "$(printf '%s' "$OWN_MEASURED" | tr -d '[:space:]')" ]; then
+  echo "wb-session-close: laeuft in tmux, konnte die EIGENE Session aber nicht bestimmen — verweigert." >&2
+  echo "  (Ohne diese Messung koennte der Aufruf die eigene Session schliessen.)" >&2
+  exit 1
+fi
+
+is_own() {
+  local s="$1" o
+  while IFS= read -r o; do
+    [ -n "$o" ] || continue
+    [ "$s" = "$o" ] && return 0
+  done <<EOF
+$OWN_LIST
+EOF
+  return 1
+}
+
+# Ein Client an IRGENDEINER Session der Gruppe heisst: jemand schaut hin. Die
+# Basis-Session zaehlt 0, wenn das Fenster am '-view' haengt — deshalb ueber die
+# ganze Gruppe summieren statt nur die genannte Session zu fragen.
+group_attached() {
+  local s="$1"
+  tmux list-sessions -F '#{session_name} #{session_group} #{session_attached}' 2>/dev/null \
+  | awk -v want="$s" '
+      { n[NR]=$1; g[NR]=$2; a[NR]=$3; if ($1==want) { wg=$2; found=1 } }
+      END { if (!found) { print 0; exit }
+            t=0
+            for (i=1; i<=NR; i++)
+              if (n[i]==want || (wg != "" && g[i]==wg)) t+=a[i]
+            print t }'
+}
+
+# --- --self: der Knopf ------------------------------------------------------
+if [ -n "$SELF" ]; then
+  # Ausschliesslich die GEMESSENE Liste — siehe die Begruendung bei OWN_LIST oben.
+  BASE="$(own_base_session "$OWN_MEASURED")"
+  if [ -z "$BASE" ]; then
+    echo "wb-session-close --self: konnte die eigene Basis-Session nicht bestimmen — verweigert." >&2
+    exit 1
+  fi
+
+  if [ "${WB_SESSION_CLOSE_CONFIRM:-}" != "$BASE" ]; then
+    echo "wb-session-close --self: verlangt WB_SESSION_CLOSE_CONFIRM=$BASE (die eigene Basis-Session) — verweigert." >&2
+    exit 1
+  fi
+
+  # Gruppierte Sessions teilen sich ihre Fenster (gemessen, 2026-08-03): ein
+  # Pane der '-view'-Schwester ist dasselbe Pane wie in der Basis. Die
+  # Worker-Pruefung auf der Basis allein deckt deshalb die ganze Gruppe ab.
+  workers="$(tmux list-panes -s -t "=$BASE" -F '#{@wb_role}:#{pane_dead}' 2>/dev/null | awk -F: '$1=="worker" && $2=="0"' | wc -l | tr -d ' ')"
+  if [ "${workers:-0}" -gt 0 ] && [ -z "$WITH_WORKERS" ]; then
+    echo "wb-session-close --self: '$BASE' hat $workers laufende Worker — verweigert. Mit --with-workers erzwingen." >&2
+    exit 1
+  fi
+
+  {
+    echo "## --self: $BASE (geschlossen $(date '+%F %T'))"
+    tmux list-panes -s -t "=$BASE" -F '  pane=#{pane_id} rolle=#{@wb_role} pfad=#{pane_current_path}' 2>/dev/null
+    d="$(tmux display -p -t "=$BASE" '#{pane_current_path}' 2>/dev/null)"
+    [ -n "$d" ] && echo "  wiederherstellen: wb-code $d"
+    echo
+  } >> "$REC"
+
+  # Die Kill-Liste: gemessene eigene Sessions, und davon nur die, die tmux
+  # DERSELBEN Gruppe wie $BASE zuordnet. Beides zusammen — Messung und
+  # Gruppenzugehoerigkeit — laesst nur das durch, was die Doku verspricht: die
+  # eigene Basis samt ihrer gruppierten '-view'-Schwester. Alles andere, egal wie
+  # es in die Liste gekommen ist, bleibt stehen.
+  BASEGRP="$(tmux list-sessions -F '#{session_name} #{session_group}' 2>/dev/null \
+             | awk -v n="$BASE" '$1==n{print $2; exit}')"
+  SELF_KILL="$(while IFS= read -r s; do
+      [ -n "$s" ] || continue
+      [ "$s" = "$BASE" ] && continue
+      [ -n "$BASEGRP" ] || continue
+      g="$(tmux list-sessions -F '#{session_name} #{session_group}' 2>/dev/null \
+           | awk -v n="$s" '$1==n{print $2; exit}')"
+      [ "$g" = "$BASEGRP" ] && printf '%s\n' "$s"
+    done <<EOF
+$OWN_MEASURED
+EOF
+)"
+
+  rc=0
+  # Erst die '-view'-Schwester(n), dann die Basis — die Schwester haengt an der
+  # Basis, nicht umgekehrt.
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    if tmux kill-session -t "=$s" 2>/dev/null; then
+      echo "geschlossen (Sicht): $s"
+    else
+      echo "wb-session-close --self: Sicht-Session '$s' liess sich nicht schliessen." >&2
+      rc=1
+    fi
+  done <<EOF
+$SELF_KILL
+EOF
+
+  if tmux kill-session -t "=$BASE" 2>/dev/null; then
+    echo "geschlossen (eigene Basis): $BASE"
+  else
+    echo "wb-session-close --self: eigene Basis-Session '$BASE' liess sich nicht schliessen." >&2
+    rc=1
+  fi
+
+  echo "Notiert in: $REC"
+  exit $rc
+fi
+
+# --- normaler Weg: benannte (fremde) Sessions -------------------------------
+rc=0
+# Wurde eine Session als Sicht-Kaskade ihrer Basis bereits mitgeschlossen (siehe
+# unten), taucht sie u.U. auch noch als eigenes Argument auf ($@ kann Basis UND
+# Sicht enthalten). Ohne diese Liste wuerde der zweite Durchlauf "gibt es nicht"
+# melden, obwohl das Schliessen bereits erfolgreich war.
+CLOSED_LIST=""
+for S in "$@"; do
+  case " $CLOSED_LIST " in
+    *" $S "*) echo "wb-session-close: '$S' wurde bereits als Sicht ihrer Basis mitgeschlossen — uebersprungen." >&2; continue ;;
+  esac
+  # '=' verankert den Namen: wb-foo-1a2b ist ein PRAEFIX von wb-foo-1a2b-9f2a.
+  if ! tmux has-session -t "=$S" 2>/dev/null; then
+    echo "wb-session-close: '$S' gibt es nicht." >&2; rc=1; continue
+  fi
+  if is_own "$S"; then
+    echo "wb-session-close: '$S' ist die EIGENE Session (oder ihre gruppierte Sicht) — verweigert." >&2; rc=1; continue
+  fi
+  # Gruppierte Sessions TEILEN ihre Fenster. Wer eine reine Sicht schliesst, beendet
+  # deshalb keinen einzigen Pane — die Fenster leben in der Basis weiter. Die
+  # Worker-Pruefung darf dort nicht greifen, sonst laesst sich eine ueberzaehlige
+  # Sicht nie aufraeumen, solange in der Basis ein Worker laeuft (gemessen
+  # 2026-08-04 an drei aufeinander gestapelten 'wb-a project-view-view…'-Sessions).
+  # `display -p -t <session> '#{session_group}'` liefert LEER (gemessen 2026-08-04);
+  # die Gruppe steht nur in `list-sessions`.
+  grp="$(tmux list-sessions -F '#{session_name} #{session_group}' 2>/dev/null \
+         | awk -v n="$S" '$1==n{print $2; exit}')"
+  nur_sicht=""
+  if [ -n "$grp" ] && [ "$grp" != "$S" ] && tmux has-session -t "=$grp" 2>/dev/null; then
+    nur_sicht=1
+  fi
+
+  workers="$(tmux list-panes -s -t "=$S" -F '#{@wb_role}:#{pane_dead}' 2>/dev/null | awk -F: '$1=="worker" && $2=="0"' | wc -l | tr -d ' ')"
+  if [ "${workers:-0}" -gt 0 ] && [ -z "$nur_sicht" ] && [ -z "$WITH_WORKERS" ]; then
+    echo "wb-session-close: '$S' hat $workers laufende Worker — verweigert. Erst 'wb-close <name>', oder bewusst mit --with-workers." >&2; rc=1; continue
+  fi
+  if [ "${workers:-0}" -gt 0 ] && [ -z "$nur_sicht" ] && [ -n "$WITH_WORKERS" ]; then
+    echo "wb-session-close: '$S' hat $workers laufende Worker — sie gehen mit (--with-workers)." >&2
+  fi
+  if [ "${workers:-0}" -gt 0 ] && [ -n "$nur_sicht" ]; then
+    echo "wb-session-close: '$S' ist nur eine Sicht auf '$grp' — die $workers Worker laufen dort weiter." >&2
+  fi
+  # Bei einer ueberzaehligen Sicht zaehlt nur, ob jemand GENAU DIESE Sicht ansieht:
+  # ihre Fenster leben in der Basis weiter, ein Client auf einer Schwester verliert
+  # nichts. Bei der Basis dagegen gilt weiter die ganze Gruppe (dort verschwinden
+  # die Panes wirklich).
+  if [ -n "$nur_sicht" ]; then
+    attached="$(tmux list-sessions -F '#{session_name} #{session_attached}' 2>/dev/null \
+                | awk -v n="$S" '$1==n{print $2; exit}')"
+  else
+    attached="$(group_attached "$S")"
+  fi
+  if [ "${attached:-0}" -gt 0 ] && [ -z "$FORCE" ]; then
+    echo "wb-session-close: an '$S' (oder ihrer Gruppe) haengt ein Client — verweigert (jemand sieht gerade hin)." >&2
+    echo "  Bewusst trotzdem: WB_SESSION_CLOSE_CONFIRM=$S wb-session-close --force $S" >&2
+    rc=1; continue
+  fi
+  if [ "${attached:-0}" -gt 0 ] && [ "${WB_SESSION_CLOSE_CONFIRM:-}" != "$S" ]; then
+    echo "wb-session-close: '$S' ist angehaengt; --force verlangt zusaetzlich WB_SESSION_CLOSE_CONFIRM=$S." >&2
+    rc=1; continue
+  fi
+
+  # Ist $S selbst eine Basis (kein reiner Sicht-Aufruf), gehoert ihre gruppierte
+  # '-view'-Schwester mit zum Schliessen dazu — sonst bleibt eine Sicht ohne Basis
+  # zurueck, die ausschliesslich als Anhaengsel fuer das VS-Code-Fenster existiert
+  # und die wb-doctor sofort als Strukturfehler meldet (Befund 2026-08-04 an
+  # 'wb-a project' / 'wb-a project-view'). Die Sicherheitspruefungen oben (Client
+  # summiert ueber die Gruppe via group_attached, Worker-Pruefung, Eigen-Erkennung)
+  # sind dafuer bereits ausreichend: eine Sicht teilt sich ihre Panes mit der Basis,
+  # sie braucht keine eigene Pruefung.
+  views=""
+  if [ -z "$nur_sicht" ]; then
+    views="$(tmux list-sessions -F '#{session_name} #{session_group}' 2>/dev/null \
+             | awk -v n="$S" '$1!=n && $2==n{print $1}')"
+  fi
+
+  {
+    echo "## $S   (geschlossen $(date '+%F %T'))"
+    tmux list-panes -s -t "=$S" -F '  pane=#{pane_id} rolle=#{@wb_role} pfad=#{pane_current_path}' 2>/dev/null
+    d="$(tmux display -p -t "=$S" '#{pane_current_path}' 2>/dev/null)"
+    [ -n "$d" ] && echo "  wiederherstellen: wb-code $d"
+    if [ -n "$views" ]; then
+      echo "  mitgeschlossene Sicht(en):"
+      printf '%s\n' "$views" | sed 's/^/    /'
+    fi
+    echo
+  } >> "$REC"
+
+  # Erst die Sicht(en) schliessen, dann die Basis — wie bei --self: die Sicht
+  # haengt an der Basis, nicht umgekehrt.
+  #
+  # Zeilenweise statt `for v in $views`: ungequotet zerlegt die Shell einen
+  # Sessionnamen mit Leerzeichen in zwei Namen und expandiert '*' gegen das
+  # Arbeitsverzeichnis — das Werkzeug meldete dann "geschlossen" fuer Ziele, die es
+  # nie getroffen hat (Befund 2026-08-15). tmux laesst solche Namen zu.
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    if ! tmux has-session -t "=$v" 2>/dev/null; then
+      continue
+    fi
+    if tmux kill-session -t "=$v" 2>/dev/null; then
+      echo "geschlossen (Sicht): $v"
+      CLOSED_LIST="$CLOSED_LIST $v"
+    else
+      echo "wb-session-close: gruppierte Sicht '$v' von '$S' liess sich nicht schliessen." >&2
+      rc=1
+    fi
+  done <<EOF
+$views
+EOF
+
+  if tmux kill-session -t "=$S" 2>/dev/null; then
+    echo "geschlossen: $S"
+    CLOSED_LIST="$CLOSED_LIST $S"
+  else
+    echo "wb-session-close: '$S' liess sich nicht schliessen." >&2; rc=1
+  fi
+done
+
+echo "Notiert in: $REC"
+exit $rc

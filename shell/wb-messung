@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+# HERKUNFT (2026-08-10): dieses Werkzeug entstand am 09.08. direkt in ~/.local/bin und lag
+# damit in KEINEM Repo -- es war weder versioniert noch von wb-sync-setup erfasst, und auf
+# peer fehlte es, waehrend regeln/messungen.md es dort als Werkzeug nannte. Seit heute liegt
+# die Quelle hier, wird von wb-sync-setup ausgerollt und von wb-consistency geprueft.
+"""wb-messung -- Eintragen und Pruefen von Modellmessungen in der
+projektuebergreifenden Sammelstelle ~/Knowledge/_meta/messungen/modelle/daten.json.
+
+WARUM: eine Messung, die nur in einer Session-Notiz steht, ist fuer die naechste
+Session verloren. Dieses Werkzeug macht "eintragen" zu einem validierten,
+wiederholbaren Schritt statt einer Handbearbeitung der JSON-Datei.
+
+Unterbefehle:
+  wb-messung pfad                  -- zeigt den Pfad zur daten.json
+  wb-messung modelle                -- listet alle Modell-IDs
+  wb-messung reihen                 -- listet Messreihen und Kurven (Projekt, Datum)
+  wb-messung render                 -- rendert MODELLVERGLEICH.html neu
+  wb-messung pruefen [DATEI]        -- validiert die JSON gegen das Schema
+  wb-messung add --datei X.json     -- haengt eine Messreihe oder Kurve an
+
+Ort ueberschreiben (z.B. fuer Tests): Umgebungsvariable WB_MESSUNG_DATEN auf den
+vollen Pfad einer daten.json setzen. Ohne das zeigt das Werkzeug auf
+~/Knowledge/_meta/messungen/modelle/daten.json -- die geteilte Vault-Kopie.
+
+Ausgabe deutsch, keine Emojis. Vor jedem Schreiben wird die alte daten.json nach
+~/.local/trash-snapshots/DATUM-daten-json/ kopiert.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from datetime import date
+from pathlib import Path
+
+DIAGRAMM_TYPEN = {"balken", "gestapelt", "keins"}
+
+
+def resolve_daten_pfad() -> Path:
+    import os
+
+    override = os.environ.get("WB_MESSUNG_DATEN")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / "Knowledge" / "_meta" / "messungen" / "modelle" / "daten.json"
+
+
+def load(pfad: Path) -> dict:
+    return json.loads(pfad.read_text(encoding="utf-8"))
+
+
+def save(pfad: Path, data: dict) -> None:
+    pfad.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
+def snapshot(pfad: Path) -> Path:
+    ziel_dir = Path.home() / ".local" / "trash-snapshots" / f"{date.today().isoformat()}-daten-json"
+    ziel_dir.mkdir(parents=True, exist_ok=True)
+    ziel = ziel_dir / pfad.name
+    if pfad.exists():
+        shutil.copy2(pfad, ziel)
+    return ziel
+
+
+# ---------------------------------------------------------------------------
+# Validierung
+# ---------------------------------------------------------------------------
+
+def pruefen_daten(data) -> tuple[list[str], list[str]]:
+    fehler: list[str] = []
+    warnungen: list[str] = []
+
+    if not isinstance(data, dict):
+        return (["Wurzel der JSON ist kein Objekt."], [])
+
+    for schluessel in ("modelle", "messreihen", "kurven", "kosten", "befunde", "offen"):
+        if schluessel not in data:
+            fehler.append(f"Pflichtfeld '{schluessel}' fehlt auf oberster Ebene.")
+        elif not isinstance(data[schluessel], list):
+            fehler.append(f"'{schluessel}' muss eine Liste sein.")
+
+    modelle = data.get("modelle") or []
+    modell_ids: set[str] = set()
+    for i, m in enumerate(modelle):
+        if not isinstance(m, dict):
+            fehler.append(f"modelle[{i}] ist kein Objekt.")
+            continue
+        mid = m.get("id")
+        if not mid:
+            fehler.append(f"modelle[{i}] hat keine 'id'.")
+            continue
+        if mid in modell_ids:
+            fehler.append(f"Modell-ID doppelt vergeben: '{mid}'.")
+        modell_ids.add(mid)
+        if not m.get("name"):
+            fehler.append(f"modelle[{i}] ('{mid}') hat keinen 'name'.")
+
+    messreihen = data.get("messreihen") or []
+    messreihen_ids: set[str] = set()
+    for i, mr in enumerate(messreihen):
+        if not isinstance(mr, dict):
+            fehler.append(f"messreihen[{i}] ist kein Objekt.")
+            continue
+        mrid = mr.get("id")
+        if not mrid:
+            fehler.append(f"messreihen[{i}] hat keine 'id'.")
+            mrid = f"[{i}]"
+        if mrid in messreihen_ids:
+            fehler.append(f"Messreihen-ID doppelt vergeben: '{mrid}'.")
+        messreihen_ids.add(mrid)
+
+        diagramm = mr.get("diagramm")
+        if diagramm not in DIAGRAMM_TYPEN:
+            fehler.append(
+                f"messreihe '{mrid}': 'diagramm' muss eine von {sorted(DIAGRAMM_TYPEN)} sein, "
+                f"nicht {diagramm!r}."
+            )
+
+        kennzahlen = mr.get("kennzahlen")
+        if not isinstance(kennzahlen, list) or not kennzahlen:
+            fehler.append(f"messreihe '{mrid}': 'kennzahlen' fehlt oder ist leer.")
+            kennzahlen = []
+        felder = []
+        for k in kennzahlen:
+            feld = k.get("feld") if isinstance(k, dict) else None
+            if not feld:
+                fehler.append(f"messreihe '{mrid}': eine Kennzahl hat kein 'feld'.")
+                continue
+            if feld in felder:
+                fehler.append(f"messreihe '{mrid}': Kennzahl-Feld doppelt: '{feld}'.")
+            felder.append(feld)
+
+        zeilen = mr.get("zeilen")
+        if not isinstance(zeilen, list) or not zeilen:
+            fehler.append(f"messreihe '{mrid}': 'zeilen' fehlt oder ist leer.")
+            zeilen = []
+        for j, z in enumerate(zeilen):
+            if not isinstance(z, dict):
+                fehler.append(f"messreihe '{mrid}' zeile[{j}] ist kein Objekt.")
+                continue
+            modell = z.get("modell")
+            if not modell:
+                fehler.append(f"messreihe '{mrid}' zeile[{j}] hat kein 'modell'.")
+            elif modell not in modell_ids:
+                fehler.append(
+                    f"messreihe '{mrid}' zeile[{j}]: unbekanntes Modell '{modell}'."
+                )
+            werte = z.get("werte")
+            if not isinstance(werte, dict):
+                fehler.append(f"messreihe '{mrid}' zeile[{j}] hat kein 'werte'-Objekt.")
+                continue
+            for feld in felder:
+                if feld not in werte:
+                    fehler.append(
+                        f"messreihe '{mrid}' zeile[{j}]: 'werte' fehlt der Schluessel "
+                        f"'{feld}' aus den Kennzahlen."
+                    )
+            for feld in werte:
+                if feld not in felder:
+                    warnungen.append(
+                        f"messreihe '{mrid}' zeile[{j}]: 'werte' hat unbekannten "
+                        f"Schluessel '{feld}', der in keiner Kennzahl definiert ist."
+                    )
+
+    kurven = data.get("kurven") or []
+    kurven_ids: set[str] = set()
+    for i, kv in enumerate(kurven):
+        if not isinstance(kv, dict):
+            fehler.append(f"kurven[{i}] ist kein Objekt.")
+            continue
+        kvid = kv.get("id")
+        if not kvid:
+            fehler.append(f"kurven[{i}] hat keine 'id'.")
+            kvid = f"[{i}]"
+        if kvid in kurven_ids:
+            fehler.append(f"Kurven-ID doppelt vergeben: '{kvid}'.")
+        kurven_ids.add(kvid)
+
+        reihen = kv.get("reihen")
+        if not isinstance(reihen, list) or not reihen:
+            fehler.append(f"kurve '{kvid}': 'reihen' fehlt oder ist leer.")
+            reihen = []
+        reihen_ids: set[str] = set()
+        for j, r in enumerate(reihen):
+            if not isinstance(r, dict):
+                fehler.append(f"kurve '{kvid}' reihe[{j}] ist kein Objekt.")
+                continue
+            rid = r.get("id")
+            if not rid:
+                fehler.append(f"kurve '{kvid}' reihe[{j}] hat keine 'id'.")
+                rid = f"[{j}]"
+            if rid in reihen_ids:
+                fehler.append(f"kurve '{kvid}': Reihen-ID doppelt vergeben: '{rid}'.")
+            reihen_ids.add(rid)
+            modell = r.get("modell")
+            if modell and modell not in modell_ids:
+                fehler.append(f"kurve '{kvid}' reihe '{rid}': unbekanntes Modell '{modell}'.")
+            punkte = r.get("punkte")
+            if not isinstance(punkte, list) or not punkte:
+                fehler.append(f"kurve '{kvid}' reihe '{rid}': 'punkte' fehlt oder ist leer.")
+                continue
+            for p in punkte:
+                if not isinstance(p, dict) or "x" not in p:
+                    fehler.append(f"kurve '{kvid}' reihe '{rid}': ein Punkt hat kein 'x'.")
+
+    for i, k in enumerate(data.get("kosten") or []):
+        if not isinstance(k, dict):
+            fehler.append(f"kosten[{i}] ist kein Objekt.")
+            continue
+        modell = k.get("modell")
+        if modell and modell not in modell_ids:
+            fehler.append(f"kosten[{i}]: unbekanntes Modell '{modell}'.")
+
+    return fehler, warnungen
+
+
+# ---------------------------------------------------------------------------
+# Unterbefehle
+# ---------------------------------------------------------------------------
+
+def cmd_pfad(args) -> int:
+    pfad = resolve_daten_pfad()
+    print(pfad)
+    if not pfad.exists():
+        print("(Datei existiert an diesem Pfad noch nicht.)", file=sys.stderr)
+    return 0
+
+
+def cmd_modelle(args) -> int:
+    pfad = resolve_daten_pfad()
+    data = load(pfad)
+    for m in data.get("modelle", []):
+        print(f"{m.get('id')}\t{m.get('name')}\t{m.get('rolle') or ''}")
+    return 0
+
+
+def cmd_reihen(args) -> int:
+    pfad = resolve_daten_pfad()
+    data = load(pfad)
+    for mr in data.get("messreihen", []):
+        print(f"messreihe\t{mr.get('id')}\t{mr.get('projekt') or ''}\t{mr.get('datum') or ''}\t{mr.get('titel') or ''}")
+    for kv in data.get("kurven", []):
+        print(f"kurve\t{kv.get('id')}\t{kv.get('projekt') or ''}\t{kv.get('datum') or ''}\t{kv.get('titel') or ''}")
+    return 0
+
+
+def cmd_render(args) -> int:
+    pfad = resolve_daten_pfad()
+    render_py = pfad.parent / "render.py"
+    if not render_py.exists():
+        print(f"wb-messung: render.py nicht gefunden unter {render_py}", file=sys.stderr)
+        return 1
+    out = pfad.parent / "MODELLVERGLEICH.html"
+    result = subprocess.run([sys.executable, str(render_py), str(pfad), str(out)])
+    if result.returncode == 0:
+        print(f"Gerendert: {out}")
+    return result.returncode
+
+
+def cmd_pruefen(args) -> int:
+    pfad = Path(args.datei).expanduser() if args.datei else resolve_daten_pfad()
+    if not pfad.exists():
+        print(f"wb-messung: Datei nicht gefunden: {pfad}", file=sys.stderr)
+        return 1
+    try:
+        data = load(pfad)
+    except json.JSONDecodeError as e:
+        print(f"wb-messung: kein gueltiges JSON in {pfad}: {e}", file=sys.stderr)
+        return 1
+    fehler, warnungen = pruefen_daten(data)
+    for w in warnungen:
+        print(f"Warnung: {w}")
+    for f in fehler:
+        print(f"Fehler: {f}")
+    if fehler:
+        print(f"\n{len(fehler)} Fehler, {len(warnungen)} Warnung(en). Nicht gueltig.")
+        return 1
+    print(f"Gueltig. {len(warnungen)} Warnung(en).")
+    return 0
+
+
+def cmd_add(args) -> int:
+    pfad = resolve_daten_pfad()
+    if not pfad.exists():
+        print(f"wb-messung: daten.json nicht gefunden unter {pfad}", file=sys.stderr)
+        return 1
+    zusatz_pfad = Path(args.datei).expanduser()
+    if not zusatz_pfad.exists():
+        print(f"wb-messung: Datei nicht gefunden: {zusatz_pfad}", file=sys.stderr)
+        return 1
+
+    data = load(pfad)
+    zusatz = load(zusatz_pfad)
+
+    arten = [a for a in ("messreihe", "kurve") if a in zusatz]
+    if len(arten) != 1:
+        print(
+            "wb-messung: Datei muss genau einen Schluessel 'messreihe' oder 'kurve' haben.",
+            file=sys.stderr,
+        )
+        return 1
+    art = arten[0]
+    eintrag = zusatz[art]
+    neue_id = eintrag.get("id") if isinstance(eintrag, dict) else None
+    if not neue_id:
+        print(f"wb-messung: '{art}' in {zusatz_pfad} hat keine 'id'.", file=sys.stderr)
+        return 1
+
+    ziel_liste_name = "messreihen" if art == "messreihe" else "kurven"
+    ziel_liste = data.setdefault(ziel_liste_name, [])
+    bestehende_ids = {e.get("id") for e in ziel_liste}
+    if neue_id in bestehende_ids:
+        print(
+            f"wb-messung: '{ziel_liste_name}' hat bereits die ID '{neue_id}' -- "
+            "aeltere Reihen werden nie ueberschrieben, nur als 'veraltet' markiert. "
+            "Neue ID waehlen oder die alte Reihe von Hand als veraltet kennzeichnen.",
+            file=sys.stderr,
+        )
+        return 1
+
+    kandidat = dict(data)
+    kandidat[ziel_liste_name] = ziel_liste + [eintrag]
+    fehler, warnungen = pruefen_daten(kandidat)
+    if fehler:
+        print(f"wb-messung: neue Daten sind nicht gueltig, nichts geschrieben:", file=sys.stderr)
+        for f in fehler:
+            print(f"  Fehler: {f}", file=sys.stderr)
+        return 1
+    for w in warnungen:
+        print(f"Warnung: {w}")
+
+    snap = snapshot(pfad)
+    print(f"Snapshot der alten daten.json: {snap}")
+    save(pfad, kandidat)
+    print(f"'{art}' '{neue_id}' angehaengt an {ziel_liste_name}.")
+
+    return cmd_render(args)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="wb-messung",
+        description="Eintragen und Pruefen von Modellmessungen (~/Knowledge/_meta/messungen/modelle/daten.json).",
+    )
+    sub = parser.add_subparsers(dest="befehl", required=True)
+
+    sub.add_parser("pfad", help="zeigt den Pfad zur daten.json").set_defaults(func=cmd_pfad)
+    sub.add_parser("modelle", help="listet alle Modell-IDs").set_defaults(func=cmd_modelle)
+    sub.add_parser("reihen", help="listet Messreihen und Kurven").set_defaults(func=cmd_reihen)
+    sub.add_parser("render", help="rendert MODELLVERGLEICH.html neu").set_defaults(func=cmd_render)
+
+    p_pruefen = sub.add_parser("pruefen", help="validiert eine daten.json gegen das Schema")
+    p_pruefen.add_argument("datei", nargs="?", help="Pfad; Default: die aktive daten.json")
+    p_pruefen.set_defaults(func=cmd_pruefen)
+
+    p_add = sub.add_parser("add", help="haengt eine Messreihe oder Kurve an")
+    p_add.add_argument("--datei", required=True, help="kleine JSON-Datei mit {'messreihe': {...}} oder {'kurve': {...}}")
+    p_add.set_defaults(func=cmd_add)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

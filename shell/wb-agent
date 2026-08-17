@@ -1,0 +1,23 @@
+#!/bin/bash
+# wb-agent — add one Claude agent pane; wb-grid arranges everything afterwards.
+set -u
+# $HOME instead of a hardcoded $HOME: the same script has to run on peer
+# ($HOME) once both machines share one script set. Same target, same behaviour.
+# Remote Control stays OFF here (Vorgabe des Nutzers 2026-08-05: nur der
+# Orchestrator bekommt sie) -- an agent pane is never the orchestrator, and the
+# flag is opt-in on the claude CLI, so simply not adding it is enough.
+CLAUDE="${WB_CLAUDE:-$HOME/.local/bin/claude --append-system-prompt \"\$(cat $HOME/.claude/roles/agent.md)\"}"
+
+panes=$(tmux list-panes -F '#{pane_id} #{@wb_role}')
+n_agents=$(echo "$panes" | awk '$2=="agent"{c++} END{print c+0}')
+target=$(echo "$panes" | awk '$2=="orchestrator"{print $1; exit}')
+[ -z "${target:-}" ] && target=$(echo "$panes" | awk '$2!="sidebar"{print $1; exit}')
+
+new=$(tmux split-window -v -t "${target:-}" -P -F '#{pane_id}' -c "#{pane_current_path}" "$CLAUDE")
+tmux set -p -t "$new" @wb_role agent
+tmux set -p -t "$new" @wb_worker "claude-$((n_agents + 2))"
+# Clean, re-executable command for wb-revive / wb-autorevive (pane-died hook).
+tmux set -p -t "$new" @wb_cmd "$CLAUDE"
+tmux set -p -t "$new" remain-on-exit on
+tmux select-pane -t "$new" -T "claude-$((n_agents + 2))"
+"$HOME/.local/bin/wb-grid"

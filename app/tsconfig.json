@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "types": ["node"],
+    /* Die uebernommenen Seiten (Schritt 7) liegen weiter in extension/src und schreiben
+       ihre Importe mit ".ts" -- die Schreibweise ihres eigenen tsconfigs. Sie hier ebenfalls
+       zuzulassen ist der Preis dafuer, dass es EINE Fassung der Seiten gibt statt einer Kopie,
+       die auseinanderlaeuft. Erlaubt ist es nur zusammen mit noEmit -- so laeuft die
+       Typpruefung hier ohnehin. */
+    "allowImportingTsExtensions": true
+  },
+  "include": ["src/**/*.ts"]
+}

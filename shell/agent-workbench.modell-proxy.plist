@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-workbench.modell-proxy — launchd haelt den Lausch-Socket, der Prozess
+  startet erst bei der ersten Verbindung.
+
+  Wichtig ist, was hier NICHT steht: kein RunAtLoad, kein KeepAlive. Genau
+  dadurch laeuft im Leerlauf null Prozess — launchd haelt nur den Socket
+  127.0.0.1:8080 offen und startet wb-modell-proxy erst, wenn sich jemand
+  verbindet. Beendet sich der Proxy nach der Leerlaufzeit selbst, re-armiert
+  launchd den Socket, und der naechste Aufruf startet alles von vorn.
+
+  Ein weiteres Backend (llama.cpp, vllm) braucht hier NUR einen weiteren
+  Eintrag im Sockets-Dict und daneben einen Eintrag in
+  ~/.config/wb-modell-proxy/backends.json — ein Prozess bedient alle Ports.
+  Der Schluessel im Sockets-Dict ist der Name, unter dem das Programm den
+  Deskriptor abholt (launch_activate_socket); er muss mit 'socketName' im
+  Backend-Eintrag uebereinstimmen (Vorgabe dort: der Lauschport).
+
+  Installation (der Nutzer selbst, nicht automatisch eingerichtet): diese Datei
+  nach ~/Library/LaunchAgents/agent-workbench.modell-proxy.plist kopieren, dann
+  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/agent-workbench.modell-proxy.plist`.
+  Voraussetzung: shell/wb-modell-proxy und shell/grug-server liegen bereits
+  ausfuehrbar in ~/.local/bin/, und
+  shell/wb-modell-proxy-backends.default.json liegt als
+  ~/.config/wb-modell-proxy/backends.json — ProgramArguments zeigt auf den
+  installierten Pfad, nicht auf das Repo.
+  Abschalten: `launchctl bootout gui/$(id -u)/agent-workbench.modell-proxy`.
+
+  ThrottleInterval bleibt bei der Vorgabe (10 s): launchd startet den Job
+  nicht oefter als alle 10 Sekunden neu. Das ist der Schutz gegen eine
+  Startschleife und in der Praxis unsichtbar, weil ein Lauf Minuten dauert.
+  Nur direkt nach einem Selbstende kann die naechste Verbindung bis zu 10 s
+  auf den Prozessstart warten.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>agent-workbench.modell-proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/.local/bin/wb-modell-proxy</string>
+  </array>
+  <key>Sockets</key>
+  <dict>
+    <key>grug</key>
+    <dict>
+      <key>SockNodeName</key><string>127.0.0.1</string>
+      <key>SockServiceName</key><string>8080</string>
+      <key>SockType</key><string>stream</string>
+      <key>SockFamily</key><string>IPv4</string>
+    </dict>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <!--
+    ExitTimeOut: launchd gibt einem Job nach SIGTERM sonst nur 5 Sekunden bis
+    zum SIGKILL. Der Proxy beendet in dieser Zeit noch das Backend
+    (grug-server stop wartet bis zu 15 s auf SIGTERM, dann SIGKILL, dann
+    prueft es den Port) — mit der Vorgabe waere er mitten darin erschlagen
+    worden und haette 15 GB verwaist zurueckgelassen.
+  -->
+  <key>ExitTimeOut</key><integer>90</integer>
+  <key>StandardOutPath</key><string>$HOME/.local/state/wb-modell-proxy/launchd.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.local/state/wb-modell-proxy/launchd.log</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>

@@ -1,0 +1,4 @@
+#!/bin/sh
+# docrender — Dokument rendern, Seiten als Bild pruefen, Befund als JSON/Text.
+# Quelle: ~/AI/design-tools/doc-render-review
+exec "$HOME/AI/design-tools/doc-render-review/.venv/bin/docrender" "$@"

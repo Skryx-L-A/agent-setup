@@ -1,0 +1,695 @@
+#!/bin/bash
+# wb-ereignisse — der Ereignisstrom der Werkbank. Eine Zeile je Ereignis auf stdout,
+# ohne dass irgendjemand in einen Pane tippt und ohne dass ein Modell mitwirkt.
+#
+#   wb-ereignisse [--session <tmux-session>] [--intervall <sekunden>] [--einmal]
+#
+# Warum es das gibt (2026-08-07): In den Orchestrator-Pane darf nur noch der
+# Kontext-Guard schreiben, und der nur bei vollem Kontextfenster. Damit faellt der
+# bisherige Weg weg, auf dem eine Fertigmeldung beim Orchestrator ankam. Der Weg,
+# der bleibt, ist der Ereignisstrom des Harness: ein Dauerbeobachter, dessen
+# stdout-ZEILEN beim Orchestrator als Benachrichtigung ankommen. Dieses Werkzeug
+# ist die Quelle dieser Zeilen. Es haengt an Dateien und an tmux-Eigenschaften,
+# nicht daran, dass sich ein Modell richtig verhaelt.
+#
+# Vier Ereignisarten, je Worker und Anlass GENAU EINMAL:
+#
+#   fertig       Eine neue, nicht leere Ergebnisdatei unter
+#                ~/.pi-workers/results/<name>/. Erkannt an PFAD UND MTIME der
+#                echten Datei, nie an latest.md: der Symlink bleibt derselbe,
+#                wenn ein Worker sein Ergebnis nachbessert, und zwei Ergebnisse
+#                koennen dieselbe Sekunde tragen. Zusammen sind sie eindeutig.
+#   freigabe     Ein neuer Antrag unter ~/.pi-workers/requests/ (JSON ohne
+#                .decision daneben) oder ein Marker unter
+#                ~/.pi-workers/guard-blocks/ (ein von bash-guard.py angehaltener
+#                Bash-Befehl).
+#   steht still  Der Pane lebt, aber seit `stallMinutes` (geteilte
+#                Einstellungsdatei, nicht aus dem Code) bewegt sich nichts.
+#   weg          Der Pane eines registrierten Workers ist fort oder tot, und es
+#                kam nie ein Ergebnis. Genau der Fall, den heute niemand bemerkt.
+#
+# WORAN Stillstand gemessen wird, und woran NICHT: nicht an der CPU-Zeit des
+# Panes. `regeln/worker-panes.md` haelt den gemessenen Fall fest, in dem ein Scan
+# in 82 Minuten 1,3 Sekunden CPU verbrauchte, waehrend er durchgehend arbeitete --
+# ein Client, der auf eine Antwort wartet, rechnet nicht. Gemessen wird deshalb,
+# in dieser Reihenfolge:
+#   1. das WACHSTUM des Transcripts (mtime), Pfad aus `wb-state worker-transcript`.
+#      Es waechst mit jeder Nachricht und jedem Werkzeugergebnis.
+#   2. faellt das aus (pi-Worker ohne Transcript, Pfad noch unbekannt): die
+#      AUSGABE des Panes -- eine Pruefsumme von `capture-pane`, deren Wechsel den
+#      Zeitpunkt der letzten Bewegung setzt.
+# Und in beiden Faellen die zweite Bedingung, die den haengenden vom arbeitenden
+# Worker trennt: ist ein Prozess unter dem Pane JUENGER als die Stille, laeuft
+# gerade ein langes Werkzeug -- das ist Arbeit, kein Stillstand. Die blosse
+# Existenz von Kindprozessen taugt dafuer nicht, MCP-Server laufen durchgehend
+# mit. Dieselbe Regel wendet die Oberflaeche an (app/src/main/workerstate.ts,
+# `stillstand()`), dort mit ihrer Messung begruendet.
+#
+# ROBUSTHEIT: Das Programm hoert nie von selbst auf. Kein `set -e`; jede Pruefung
+# laeuft fuer sich, ein tmux-Aussetzer, ein fehlendes Verzeichnis oder eine Datei,
+# die zwischen zwei Pruefungen verschwindet, beendet es nicht. Jede Zeile geht
+# sofort raus (bash schreibt jedes `printf` einzeln).
+#
+# MERKER: neben dem Zustand, nicht im Projektverzeichnis --
+# ~/.local/state/wb-ereignisse/<slug>/, Slug aus Socketpfad UND Basis-Sessionname
+# (wie beim Kontext-Guard). Sie ueberleben einen Neustart des Beobachters, also
+# meldet ein Neustart die Vergangenheit nicht nach. Ein neues Ergebnis desselben
+# Workers ist ein neuer Anlass und wird gemeldet.
+set -u
+
+RESROOT="$HOME/.pi-workers/results"
+REQDIR="$HOME/.pi-workers/requests"
+BLOCKDIR="$HOME/.pi-workers/guard-blocks"
+STATE_BASE="$HOME/.local/state/wb-ereignisse"
+WBSTATE="$HOME/.local/bin/wb-state"
+[ -x "$WBSTATE" ] || WBSTATE="$(dirname "$0")/wb-state"
+
+# Karenz beim ERSTEN Start fuer diese Session (Sekunden). Was laenger her ist,
+# wird still vorgemerkt statt gemeldet -- sonst wuerde der erste Lauf jedes alte
+# Ergebnis der Session als frisch melden. Was juenger ist, wird gemeldet: lieber
+# eine Meldung zuviel als ein Worker, der drei Sekunden vor dem Start fertig war
+# und dessen Ergebnis niemand je sieht. Dieselbe Abwaegung wie im Kontext-Guard.
+KARENZ="${WB_EREIGNISSE_KARENZ:-300}"
+
+usage() {
+    cat <<'EOF'
+wb-ereignisse — Ereignisstrom der Worker dieser Session, eine Zeile je Ereignis.
+
+  wb-ereignisse [--session <tmux-session>] [--intervall <sekunden>] [--einmal]
+
+  --session    Basis-Sessionname. Ohne Angabe: die eigene Session (aus $WB_SESSION
+               oder aus dem eigenen Pane).
+  --intervall  Takt in Sekunden. Ohne Angabe: 'workerPollSeconds' aus den
+               Einstellungen, sonst 2.
+  --einmal     Einen Durchgang, dann Ende (fuer Tests und Skripte).
+
+Gedacht als HINTERGRUNDBEFEHL: seine stdout-Zeilen kommen beim Orchestrator als
+Benachrichtigung an, ohne dass jemand in seinen Pane schreibt.
+EOF
+}
+
+SESS=""; INTERVALL=""; EINMAL=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --session)   SESS="${2:?--session erwartet einen tmux-Sessionnamen}"; shift 2 ;;
+        --intervall) INTERVALL="${2:?--intervall erwartet Sekunden}"; shift 2 ;;
+        --einmal)    EINMAL=1; shift ;;
+        -h|--help|--hilfe) usage; exit 0 ;;
+        *) echo "wb-ereignisse: unbekannte Option '$1'" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+# ---------------------------------------------------------------- Grundlagen
+
+# Basis-Sessionname: der GRUPPENNAME, wenn die Session in einer Gruppe haengt.
+# Jede Workbench-Session tut das (wb-foo plus die gruppierte wb-foo-view fuer das
+# VS-Code-Fenster), und aus einem Pane heraus antwortet tmux mit der SCHWESTER.
+# Wer die Buchfuehrung an dem Namen aufhaengt, den er gerade zurueckbekommt, hat
+# je nach Augenblick zwei Dateisaetze. Siehe regeln/worker-panes.md.
+base_session_name() {   # <pane-id> -> Basis-Sessionname
+    local pane="$1" sess grp
+    sess=$(tmux display -p -t "$pane" '#{session_name}' 2>/dev/null)
+    grp=$(tmux display -p -t "$pane" '#{session_group}' 2>/dev/null)
+    printf '%s' "${grp:-$sess}"
+}
+
+if [ -z "$SESS" ]; then
+    SESS="${WB_SESSION:-}"
+fi
+# Selbst herausfinden nur, wenn wir WIRKLICH in einem Pane stehen ($TMUX). Ohne
+# das antwortet `tmux display` mit der zuletzt benutzten Session des Standard-
+# Servers -- also mit einer FREMDEN Werkbank, und der Beobachter haengt sich
+# still an sie. Dieselbe Falle hat pi-worker beim Zielsuchen schon einmal in eine
+# fremde Werkbank spawnen lassen; dort wie hier gilt: lieber laut fehlschlagen
+# als raten.
+if [ -z "$SESS" ] && [ -n "${TMUX:-}" ]; then
+    eigen=$(tmux display -p '#{pane_id}' 2>/dev/null || true)
+    [ -n "$eigen" ] && SESS="$(base_session_name "$eigen")"
+fi
+if [ -z "$SESS" ]; then
+    echo "wb-ereignisse: keine tmux-Session bestimmbar." >&2
+    echo "  Aus einem Pane heraus starten, oder --session <name> angeben." >&2
+    echo "  Vorhandene Werkbank-Sessions: $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^wb-' | tr '\n' ' ')" >&2
+    exit 2
+fi
+
+# Der Slug traegt den SOCKETPFAD mit. Ein Test auf eigenem Socket bekommt damit
+# von selbst eigene Merker, auch wenn die Session zufaellig gleich heisst -- eine
+# Testklausel im Code braucht es dafuer nicht.
+sockpfad=$(tmux display -p '#{socket_path}' 2>/dev/null || true)
+SLUG="$(printf '%s|%s' "${sockpfad:-kein-socket}" "$SESS" | tr -c 'a-zA-Z0-9' '-')"
+STATE="$STATE_BASE/$SLUG"
+mkdir -p "$STATE/fertig" "$STATE/freigabe" "$STATE/still" "$STATE/weg" "$STATE/bewegung" 2>/dev/null
+
+BEKANNT_DATEI="$STATE/bekannt"
+ERSTSTART_DATEI="$STATE/gestartet"
+PID_DATEI="$STATE/pid"
+[ -f "$BEKANNT_DATEI" ] || : >"$BEKANNT_DATEI" 2>/dev/null
+
+if [ -z "$INTERVALL" ]; then
+    INTERVALL=$("$WBSTATE" settings get workerPollSeconds 2>/dev/null || true)
+fi
+case "$INTERVALL" in
+    ''|*[!0-9]*) INTERVALL=2 ;;
+    *) [ "$INTERVALL" -ge 1 ] 2>/dev/null || INTERVALL=2
+       [ "$INTERVALL" -le 60 ] 2>/dev/null || INTERVALL=60 ;;
+esac
+
+# Der Stillstandstakt haengt NICHT am Poll-Takt: Stillstand ist ein Vorgang von
+# Minuten, ihn alle zwei Sekunden zu pruefen kostet capture-pane- und ps-Aufrufe
+# und bringt nichts. Der schnelle Takt gehoert den Dateiereignissen, auf die es
+# fuer die Latenz ankommt.
+STILL_TAKT=15
+still_faellig=0
+
+# ---------------------------------------------------------------- Werkzeugkasten
+
+# Welches `stat` hier liegt, wird EINMAL beim Start gemessen statt bei jedem
+# Aufruf durchprobiert -- das spart im Dauerlauf einen Prozess je Datei und
+# raeumt zugleich die GNU/BSD-Falle ab: bei GNU ist `-f` kein Formatschalter,
+# sondern "Dateisystem statt Datei", und ein `stat -L -f %m <datei>` schreibt
+# dort einen Dateisystemblock nach stdout, mit dem kein Zahlenvergleich mehr
+# stimmt.
+if stat -L -c %Y "$0" >/dev/null 2>&1; then STATART=gnu; else STATART=bsd; fi
+mtime() {   # <pfad> -> mtime in Sekunden, 0 wenn nicht lesbar
+    if [ "$STATART" = gnu ]; then
+        stat -L -c %Y "$1" 2>/dev/null || echo 0
+    else
+        stat -L -f %m "$1" 2>/dev/null || echo 0
+    fi
+}
+
+sicher_name() { printf '%s' "$1" | tr -c 'a-zA-Z0-9_.-' '_'; }
+
+# Eine Zeile raus. Genau hier und nirgends sonst -- eine Stelle, ein Format.
+melde() { printf '%s\n' "$*"; }
+
+# Merker lesen/schreiben. Ein unlesbarer Merker ist "noch nichts gemeldet"; das
+# faellt in Richtung "lieber einmal zuviel melden" aus, nie in Richtung Schweigen.
+merker_lesen()    { cat "$1" 2>/dev/null; }
+merker_schreiben() { printf '%s\n' "$2" >"$1" 2>/dev/null || true; }
+
+# Ein Name aus einer mehrzeiligen Liste? Reine bash-Mustererkennung, kein Subshell.
+enthaelt() {   # <liste> <name>
+    case $'\n'"$1"$'\n' in *$'\n'"$2"$'\n'*) return 0 ;; esac
+    return 1
+}
+
+# Das Feld hinter einem Namen in einer Tabelle "name<TAB>rest". Ergebnis in $FELD.
+FELD=""
+feld() {   # <tabelle> <name>
+    local t=$'\n'"$1"$'\n' rest
+    FELD=""
+    case "$t" in
+        *$'\n'"$2"$'\t'*) rest="${t#*$'\n'"$2"$'\t'}"; FELD="${rest%%$'\n'*}" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- Ergebnisdatei
+
+# Die neueste ECHTE Ergebnisdatei eines Workers: "<pfad> <mtime>", sonst leer.
+#
+# Warum nicht latest.md: der Symlink zeigt nach einer Nachbesserung auf dieselbe
+# Datei, und sein Name unterscheidet vier Ergebnisse desselben Workers nicht.
+# Warum nur *.md: neben dem Ergebnis liegen `<zeitstempel>.auftrag.txt` (der
+# AUFTRAG, geschrieben beim Spawn) und `auftraege.tsv`. Wer jede Datei zaehlt,
+# meldet jeden Spawn als "fertig".
+# `ls -t` sortiert absteigend nach mtime, die erste ECHTE Datei gewinnt: so
+# kostet ein Worker EINEN stat-Aufruf statt einen je Datei. Ein Ergebnisordner
+# waechst mit jeder Aufgabe, und im Zwei-Sekunden-Takt macht das den Unterschied.
+ergebnis_von() {   # <name> -> "<pfad> <mtime>" oder leer
+    local d="$RESROOT/$1" f m
+    [ -d "$d" ] || return 0
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        [ -L "$f" ] && continue           # latest.md und jeder andere Symlink
+        [ -f "$f" ] || continue
+        [ -s "$f" ] || continue           # leer zaehlt nicht als Ergebnis
+        m=$(mtime "$f")
+        case "$m" in ''|*[!0-9]*) continue ;; esac
+        printf '%s %s' "$f" "$m"
+        return 0
+    done <<EOF
+$(ls -t "$d"/*.md 2>/dev/null)
+EOF
+    return 0
+}
+
+# ---------------------------------------------------------------- Panes lesen
+
+# Einmal je Durchgang. Ergebnis in drei mehrzeiligen Variablen, damit der Rest
+# ohne weitere tmux-Aufrufe auskommt (ein Aussetzer trifft dann genau einen
+# Durchgang, nicht acht verstreute Stellen).
+#
+# Rueckgabe 1 heisst: tmux hat NICHT geantwortet. Das ist etwas voellig anderes
+# als "keine Worker-Panes" und muss es bleiben -- wer beides gleich behandelt,
+# meldet bei jedem tmux-Aussetzer jeden laufenden Worker als "weg".
+LEBT=""      # name<TAB>pane<TAB>pid
+TOT=""       # name<TAB>pane
+LEBT_NAMEN=""
+panes_lesen() {
+    local name pane dead pid roh rc
+    LEBT=""; TOT=""; LEBT_NAMEN=""
+    # Der awk-Filter wirft Panes OHNE @wb_worker heraus, und er tut es VOR dem
+    # `read`: bei `IFS=$'\t'` ist der Tabulator IFS-Weissraum, fuehrende leere
+    # Felder fallen also weg, und die Zeile eines Orchestrator-Panes rueckt um
+    # eins auf. Der "Worker" hiesse dann %10 und wuerde beim naechsten
+    # Fensterschluss als verschwundener Worker gemeldet -- genau so gemessen am
+    # 2026-08-07. awk (FS='\t') zaehlt leere Felder korrekt mit.
+    # Erst tmux, dann filtern, in zwei Schritten: so ist der Exit-Code wirklich
+    # der von tmux und nicht der von awk am Ende einer Pipe.
+    roh=$(tmux list-panes -s -t "=$SESS" \
+            -F '#{@wb_worker}	#{pane_id}	#{pane_dead}	#{pane_pid}' 2>/dev/null)
+    rc=$?
+    [ "$rc" = 0 ] || return 1
+    roh=$(printf '%s\n' "$roh" | awk -F'\t' '$1 != ""')
+    while IFS=$'\t' read -r name pane dead pid; do
+        [ -n "$name" ] || continue
+        if [ "$dead" = "0" ]; then
+            LEBT="$LEBT$name	$pane	$pid"$'\n'
+            LEBT_NAMEN="$LEBT_NAMEN$name"$'\n'
+        else
+            TOT="$TOT$name	$pane"$'\n'
+        fi
+    done <<EOF
+$roh
+EOF
+    return 0
+}
+
+# Ein Name kommt in die Liste der bekannten Worker, sobald ein Pane mit diesem
+# `@wb_worker` in DIESER Session gesehen wurde -- lebend ODER tot. Ein toter Pane
+# gehoert dazu: `remain-on-exit on` laesst ihn stehen, wenn der Prozess endet, und
+# ein Worker, der stirbt, bevor der Beobachter zum ersten Mal hinsieht, ist genau
+# der Fall, den niemand bemerkt. Die Liste haengt bewusst am PANE und nicht an der
+# Zustandsdatei: die kennt auch Namen aus fremden und alten Sessions, und die
+# gehen diesen Orchestrator nichts an.
+bekannte_pflegen() {
+    local name bekannt
+    bekannt=$(cat "$BEKANNT_DATEI" 2>/dev/null)
+    while IFS=$'\t' read -r name _; do
+        [ -n "$name" ] || continue
+        enthaelt "$bekannt" "$name" && continue
+        printf '%s\n' "$name" >>"$BEKANNT_DATEI" 2>/dev/null || true
+        bekannt="$bekannt"$'\n'"$name"
+    done <<EOF
+$LEBT
+$TOT
+EOF
+}
+
+# ---------------------------------------------------------------- fertig
+
+# Die Ergebnisse aller bekannten Worker, EINMAL je Durchgang eingesammelt:
+# "name<TAB>pfad<TAB>mtime". `pruefe_weg` braucht dieselbe Auskunft und soll die
+# Verzeichnisse nicht ein zweites Mal durchgehen.
+ERG=""
+pruefe_fertig() {
+    local name erg pfad mzeit kennung alt
+    ERG=""
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        erg=$(ergebnis_von "$name")
+        [ -n "$erg" ] || continue
+        pfad="${erg% *}"; mzeit="${erg##* }"
+        ERG="$ERG$name	$pfad	$mzeit"$'\n'
+        kennung="$pfad@$mzeit"
+        alt=$(merker_lesen "$STATE/fertig/$(sicher_name "$name")")
+        [ "$alt" = "$kennung" ] && continue
+        merker_schreiben "$STATE/fertig/$(sicher_name "$name")" "$kennung"
+        melde "fertig  $name  $pfad"
+    done <"$BEKANNT_DATEI"
+}
+
+# ---------------------------------------------------------------- freigabe
+
+# Antraege: eine JSON-Datei ohne `.decision` daneben ist offen. Gemeldet wird nur,
+# was von einem Worker DIESER Session stammt -- ein Antrag aus einer fremden
+# Session ist nicht die Entscheidung dieses Orchestrators.
+pruefe_antraege() {
+    local f base marker felder parent kindname kindmodell bekannt
+    [ -d "$REQDIR" ] || return 0
+    bekannt=$(cat "$BEKANNT_DATEI" 2>/dev/null)
+    for f in "$REQDIR"/*.json; do
+        [ -f "$f" ] || continue
+        [ -e "$f.decision" ] && continue
+        base=$(basename "$f")
+        marker="$STATE/freigabe/antrag-$(sicher_name "$base")"
+        [ -f "$marker" ] && continue
+        # Nur hier laeuft python, und nur wenn wirklich ein neuer Antrag daliegt.
+        felder=$(/usr/bin/python3 -c 'import json,sys
+try:
+    r = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+print("%s\t%s\t%s" % (r.get("parent",""), r.get("child_name",""), r.get("child_model","")))' "$f" 2>/dev/null)
+        # Der Merker faellt IMMER, auch wenn die Datei unlesbar ist oder von einer
+        # fremden Session stammt. Sonst kaeme jeder Durchgang wieder an derselben
+        # Datei vorbei und startete python -- und daran aendert sich nie etwas,
+        # weil ein fremder Antrag nie zu unserem wird. Antraege werden atomar
+        # geschrieben (wb-request), einen halb geschriebenen gibt es also nicht.
+        : >"$marker" 2>/dev/null || true
+        [ -n "$felder" ] || continue
+        parent="${felder%%	*}";     felder="${felder#*	}"
+        kindname="${felder%%	*}";   kindmodell="${felder#*	}"
+        [ -n "$parent" ] || continue
+        enthaelt "$bekannt" "$parent" || continue
+        melde "freigabe  $parent  beantragt Worker '$kindname' ($kindmodell) — entscheiden: wb-decide $f"
+    done
+}
+
+# Angehaltene Bash-Befehle: bash-guard.py legt je Pane einen Marker ab. Die
+# Zuordnung Pane -> Worker kommt aus den Panes DIESER Session und wird nirgends
+# geraten; ein Marker fuer einen fremden oder fuer den Orchestrator-Pane wird
+# uebergangen.
+#
+# Anlass ist DATEI PLUS MTIME, nicht der Zeitstempel im JSON. Der Marker wird bei
+# jedem neuen Block derselben Pane atomar ueberschrieben, seine mtime wandert
+# also mit; steht dieselbe wartende Frage schon da, laesst bash-guard die Datei
+# ausdruecklich unveraendert, und dann bleibt es derselbe Anlass. Und der Merker
+# faellt VOR dem Lesen: eine unlesbare Datei soll nicht bei jedem Durchgang
+# erneut python starten.
+pruefe_bloecke() {
+    local f base pane name marker felder wartet grund n p
+    [ -d "$BLOCKDIR" ] || return 0
+    for f in "$BLOCKDIR"/*.json; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f")
+        case "$base" in .*) continue ;; esac
+        marker="$STATE/freigabe/block-$(sicher_name "$base")-$(mtime "$f")"
+        [ -f "$marker" ] && continue
+        : >"$marker" 2>/dev/null || true
+        felder=$(/usr/bin/python3 -c 'import json,sys
+try:
+    r = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+g = (r.get("reason") or "").splitlines()
+print("%s\t%s\t%s" % (r.get("pane",""),
+                      "wartet" if r.get("wartet") is True else "abgelehnt",
+                      g[0][:120] if g else ""))' "$f" 2>/dev/null)
+        [ -n "$felder" ] || continue
+        pane="${felder%%	*}";  felder="${felder#*	}"
+        wartet="${felder%%	*}"; grund="${felder#*	}"
+        [ -n "$pane" ] || continue
+        name=""
+        while IFS=$'\t' read -r n p _; do
+            [ "$p" = "$pane" ] && { name="$n"; break; }
+        done <<EOF
+$LEBT
+EOF
+        [ -n "$name" ] || continue
+        if [ "$wartet" = wartet ]; then
+            melde "freigabe  $name  $pane  wartet auf Freigabe: $grund"
+        else
+            melde "freigabe  $name  $pane  Befehl abgelehnt: $grund"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------- steht still
+
+# Der Transcript-Pfad aendert sich nicht mehr, sobald er einmal bekannt ist --
+# also einmal holen und merken. Ein noch unbekannter Pfad (der Worker hat seine
+# Sitzung noch nicht angelegt) wird spaeter erneut versucht, aber nicht bei jedem
+# Durchgang: `wb-state worker-transcript` startet python.
+transcript_von() {   # <name> -> Pfad oder leer
+    local name="$1" cache fehl p jetzt
+    cache="$STATE/bewegung/$(sicher_name "$name").transcript"
+    p=$(cat "$cache" 2>/dev/null)
+    if [ -n "$p" ]; then printf '%s' "$p"; return 0; fi
+    # Auch das AUSBLEIBEN wird gemerkt, sonst startet ein pi-Worker (der nie ein
+    # Claude-Transcript bekommt) bei jeder Stillstandspruefung erneut python.
+    # Eine Minute Karenz, damit ein Worker, dessen Sitzung noch nicht angelegt
+    # war, trotzdem bald gefunden wird.
+    fehl="$cache.fehlt"
+    jetzt=$(date +%s)
+    if [ -f "$fehl" ] && [ "$(( jetzt - $(mtime "$fehl") ))" -lt 60 ]; then return 0; fi
+    p=$("$WBSTATE" worker-transcript "$name" 2>/dev/null)
+    if [ -n "$p" ] && [ -f "$p" ]; then
+        printf '%s\n' "$p" >"$cache" 2>/dev/null || true
+        rm -f "$fehl" 2>/dev/null
+        printf '%s' "$p"
+    else
+        : >"$fehl" 2>/dev/null || true
+    fi
+}
+
+# Rueckfall ohne Transcript: die AUSGABE des Panes. Nicht ihr Inhalt wird
+# bewertet, nur ob sie sich geaendert hat -- der Zustand eines Workers wird
+# NIE am Pane-Text abgelesen (regeln/worker-panes.md), ein Pruefsummenwechsel
+# ist aber schlicht "es ist etwas passiert".
+bewegung_pane() {   # <name> <pane> -> Zeitpunkt der letzten Bewegung
+    local name="$1" pane="$2" datei alt altsumme altzeit neu jetzt
+    datei="$STATE/bewegung/$(sicher_name "$name").pane"
+    jetzt=$(date +%s)
+    neu=$(tmux capture-pane -p -t "$pane" 2>/dev/null | cksum 2>/dev/null | awk '{print $1"-"$2}')
+    [ -n "$neu" ] || { printf '%s' "$jetzt"; return 0; }
+    alt=$(cat "$datei" 2>/dev/null)
+    altsumme="${alt%% *}"; altzeit="${alt##* }"
+    case "$altzeit" in ''|*[!0-9]*) altzeit="" ;; esac
+    if [ "$altsumme" = "$neu" ] && [ -n "$altzeit" ]; then
+        printf '%s' "$altzeit"
+    else
+        printf '%s %s\n' "$neu" "$jetzt" >"$datei" 2>/dev/null || true
+        printf '%s' "$jetzt"
+    fi
+}
+
+# Das Alter des JUENGSTEN Prozesses unter einem Pane, ohne den Pane-Prozess
+# selbst; -1, wenn es keinen gibt. `ps` laeuft hoechstens EINMAL je Durchgang und
+# nur, wenn ueberhaupt ein Kandidat ueber der Schwelle liegt.
+PSTAB=""
+ps_lesen() {
+    PSTAB=$(ps -eo pid=,ppid=,etime= 2>/dev/null | awk '
+        {
+            e = $3; s = 0; t = 0
+            n = split(e, a, "-")
+            if (n == 2) { t = a[1]; e = a[2] } else { e = a[1] }
+            m = split(e, b, ":")
+            if (m == 3)      s = b[1]*3600 + b[2]*60 + b[3]
+            else if (m == 2) s = b[1]*60 + b[2]
+            else             s = -1
+            if (s >= 0) s += t * 86400
+            print $1"\t"$2"\t"s
+        }')
+}
+
+juengstes_kind() {   # <pane-pid> -> Sekunden oder -1
+    [ -n "$PSTAB" ] || { echo -1; return; }
+    printf '%s\n' "$PSTAB" | awk -F'\t' -v wurzel="$1" '
+        { ppid[$1] = $2; alter[$1] = $3; alle[NR] = $1 }
+        END {
+            jung = -1
+            for (i = 1; i <= NR; i++) {
+                p = alle[i]
+                if (p == wurzel) continue
+                # Ahnenreihe bis zur Wurzel, hoechstens 40 Stufen (Zyklusschutz).
+                q = p
+                for (k = 0; k < 40 && q != "" && q != "0"; k++) {
+                    if (q == wurzel) {
+                        if (alter[p] >= 0 && (jung < 0 || alter[p] < jung)) jung = alter[p]
+                        break
+                    }
+                    q = ppid[q]
+                }
+            }
+            print jung
+        }'
+}
+
+pruefe_stillstand() {
+    local schwelle min name pane pid letzte jetzt stille kandidaten kind alt t
+    min=$("$WBSTATE" settings get stallMinutes 2>/dev/null || true)
+    case "$min" in ''|*[!0-9]*) min=10 ;; esac
+    [ "$min" -ge 1 ] 2>/dev/null || min=10
+    schwelle=$(( min * 60 ))
+    jetzt=$(date +%s)
+
+    # Erster Durchgang: wer liegt ueberhaupt ueber der Schwelle? Nur fuer die
+    # laeuft danach ps.
+    kandidaten=""
+    while IFS=$'\t' read -r name pane pid; do
+        [ -n "$name" ] || continue
+        letzte=""
+        t=$(transcript_von "$name")
+        if [ -n "$t" ] && [ -f "$t" ]; then
+            letzte=$(mtime "$t")
+        else
+            letzte=$(bewegung_pane "$name" "$pane")
+        fi
+        case "$letzte" in ''|*[!0-9]*) continue ;; esac
+        stille=$(( jetzt - letzte ))
+        [ "$stille" -gt "$schwelle" ] || continue
+        kandidaten="$kandidaten$name	$pane	$pid	$letzte	$stille"$'\n'
+    done <<EOF
+$LEBT
+EOF
+    [ -n "$kandidaten" ] || return 0
+
+    ps_lesen
+    while IFS=$'\t' read -r name pane pid letzte stille; do
+        [ -n "$name" ] || continue
+        kind=$(juengstes_kind "$pid")
+        case "$kind" in ''|*[!0-9-]*) kind=-1 ;; esac
+        # Ein Kindprozess, der NACH der letzten Bewegung entstanden ist, ist
+        # Arbeit -- ein langlaufendes Werkzeug schreibt nichts und rechnet doch.
+        if [ "$kind" -ge 0 ] && [ "$kind" -lt "$stille" ]; then continue; fi
+        # Anlass ist der Zeitpunkt der letzten Bewegung: bewegt sich der Worker
+        # wieder und steht danach erneut, ist das ein anderer Anlass.
+        alt=$(merker_lesen "$STATE/still/$(sicher_name "$name")")
+        [ "$alt" = "$letzte" ] && continue
+        merker_schreiben "$STATE/still/$(sicher_name "$name")" "$letzte"
+        melde "steht still  $name  $pane  seit $(( stille / 60 )) min ohne Bewegung"
+    done <<EOF
+$kandidaten
+EOF
+}
+
+# ---------------------------------------------------------------- weg
+
+# Ein registrierter Worker, dessen Pane fort oder tot ist, ohne dass je eine
+# Ergebnisdatei kam. Ein TOTER Pane zaehlt mit: `remain-on-exit on` laesst den
+# Pane stehen, wenn der Prozess endet -- fuer den Orchestrator ist das derselbe
+# Fall (der Worker arbeitet nicht mehr und hat nichts abgeliefert), und ohne ihn
+# bliebe genau der abgestuerzte Worker unbemerkt.
+pruefe_weg() {
+    local name pane alt wie
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        enthaelt "$LEBT_NAMEN" "$name" && continue
+        # Ergebnis? Dann ist er nicht spurlos weg. Die Auskunft steht schon in
+        # $ERG, eingesammelt von pruefe_fertig im selben Durchgang.
+        feld "$ERG" "$name"
+        [ -n "$FELD" ] && continue
+        feld "$TOT" "$name"
+        # Der Hinweis richtet sich danach, was ueberhaupt noch da ist: einen
+        # TOTEN Pane holt `wb-revive` samt Gespraech zurueck, ein FORTER Pane ist
+        # nicht wiederzubeleben, dort bleibt nur ein neuer Start.
+        if [ -n "$FELD" ]; then
+            pane="$FELD"; wie="Pane tot, kein Ergebnis — zurueckholen: wb-revive $name"
+        else
+            pane="-";     wie="Pane fort, kein Ergebnis — neu beauftragen: wb-do $name <auftrag>"
+        fi
+        alt=$(merker_lesen "$STATE/weg/$(sicher_name "$name")")
+        [ "$alt" = "$pane" ] && continue
+        merker_schreiben "$STATE/weg/$(sicher_name "$name")" "$pane"
+        melde "weg  $name  $pane  $wie"
+    done <"$BEKANNT_DATEI"
+}
+
+# ---------------------------------------------------------------- Erststart
+
+# Beim ALLERERSTEN Start fuer diese Session still vormerken, was schon dalag.
+# Genau einmal: bei jedem weiteren Start regeln die Merker, was gemeldet wird --
+# so meldet ein Neustart die Vergangenheit nicht nach, und `--einmal` in einer
+# Schleife tut es auch nicht.
+erststart_vormerken() {
+    local name erg pfad mzeit f base m jetzt
+    [ -f "$ERSTSTART_DATEI" ] && return 0
+    jetzt=$(date +%s)
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        erg=$(ergebnis_von "$name"); [ -n "$erg" ] || continue
+        pfad="${erg% *}"; mzeit="${erg##* }"
+        [ "$(( jetzt - mzeit ))" -gt "$KARENZ" ] || continue
+        merker_schreiben "$STATE/fertig/$(sicher_name "$name")" "$pfad@$mzeit"
+    done <"$BEKANNT_DATEI"
+    # Antraege und Bloecke, die schon vor dem Start dalagen, gelten als gesehen --
+    # sie stehen ohnehin in der Freigabe-Ansicht.
+    if [ -d "$REQDIR" ]; then
+        for f in "$REQDIR"/*.json; do
+            [ -f "$f" ] || continue
+            [ -e "$f.decision" ] && continue
+            [ "$(( jetzt - $(mtime "$f") ))" -gt "$KARENZ" ] || continue
+            : >"$STATE/freigabe/antrag-$(sicher_name "$(basename "$f")")" 2>/dev/null || true
+        done
+    fi
+    if [ -d "$BLOCKDIR" ]; then
+        for f in "$BLOCKDIR"/*.json; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f"); case "$base" in .*) continue ;; esac
+            m=$(mtime "$f")
+            [ "$(( jetzt - m ))" -gt "$KARENZ" ] || continue
+            : >"$STATE/freigabe/block-$(sicher_name "$base")-$m" 2>/dev/null || true
+        done
+    fi
+    : >"$ERSTSTART_DATEI" 2>/dev/null || true
+}
+
+# Namen, die weder einen lebenden Pane haben noch noch etwas zu melden haetten,
+# fallen einmal beim Start heraus -- fertig UND abgeholt, oder als weg gemeldet.
+# Nur eins von beiden reicht nicht: ein Name ohne Pane, dessen Ergebnis noch
+# niemand gemeldet hat, muss in der Liste bleiben.
+bekannte_aufraeumen() {
+    local name tmp
+    tmp="$BEKANNT_DATEI.$$"
+    : >"$tmp" 2>/dev/null || return 0
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        if enthaelt "$LEBT_NAMEN" "$name"; then printf '%s\n' "$name" >>"$tmp"; continue; fi
+        [ -f "$STATE/fertig/$(sicher_name "$name")" ] && continue
+        [ -f "$STATE/weg/$(sicher_name "$name")" ] && continue
+        printf '%s\n' "$name" >>"$tmp"
+    done <"$BEKANNT_DATEI"
+    mv -f "$tmp" "$BEKANNT_DATEI" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- Lauf
+
+aufraeumen() {
+    [ "$(cat "$PID_DATEI" 2>/dev/null)" = "$$" ] && rm -f "$PID_DATEI" 2>/dev/null
+    exit 0
+}
+trap aufraeumen TERM INT HUP
+
+printf '%s\n' "$$" >"$PID_DATEI" 2>/dev/null || true
+
+erststart_erledigt=0
+durchgang() {
+    local panes_da=1
+    panes_lesen || panes_da=0
+    if [ "$panes_da" = 1 ]; then
+        bekannte_pflegen
+        # Vormerken und Aufraeumen brauchen eine gefuellte Bekanntenliste, also
+        # den ERSTEN Durchgang, in dem tmux wirklich geantwortet hat. Antwortet
+        # es beim Start nicht, wird nichts vorgemerkt und nichts verworfen --
+        # sonst hiesse ein Aussetzer im falschen Augenblick, dass die
+        # Vergangenheit gleich beim naechsten Mal komplett gemeldet wird.
+        if [ "$erststart_erledigt" = 0 ]; then
+            erststart_vormerken
+            bekannte_aufraeumen
+            erststart_erledigt=1
+        fi
+    fi
+    # Was aus DATEIEN kommt, laeuft auch ohne tmux weiter -- eine Fertigmeldung
+    # soll ein tmux-Aussetzer nicht verschlucken.
+    pruefe_fertig
+    pruefe_antraege
+    # Alles Weitere haengt an den Panes. Ohne Antwort von tmux wird hier NICHTS
+    # geschlossen: "keine Panes gesehen" heisst dann "nichts gesehen", nicht
+    # "alle Worker sind weg".
+    if [ "$panes_da" = 1 ]; then
+        pruefe_bloecke
+        pruefe_weg
+        if [ "$still_faellig" -le 0 ]; then
+            pruefe_stillstand
+            still_faellig=$(( STILL_TAKT / INTERVALL ))
+            [ "$still_faellig" -ge 1 ] || still_faellig=1
+        fi
+        still_faellig=$(( still_faellig - 1 ))
+    fi
+}
+
+if [ "$EINMAL" = 1 ]; then
+    durchgang
+    rm -f "$PID_DATEI" 2>/dev/null
+    exit 0
+fi
+
+echo "wb-ereignisse: beobachte Session $SESS (Takt ${INTERVALL}s, Merker $STATE)" >&2
+
+while :; do
+    durchgang
+    sleep "$INTERVALL"
+done

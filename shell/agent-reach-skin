@@ -1,0 +1,116 @@
+#!/bin/bash
+# agent-reach-skin — haelt die Haus-Fassung des agent-reach-Skills (englisch, entschaerfter
+# Trigger, umformulierte Update-Regel) gegen jede Neuinstallation durch.
+#
+# Warum: `agent-reach skill --install` kopiert SKILL.md und references/ aus dem installierten
+# Python-Paket nach ~/.claude/skills/agent-reach und ueberschreibt dabei die Haus-Fassung mit
+# dem chinesischen Original samt aggressivem Trigger. Ein Agent, der das Werkzeug aktualisiert,
+# faellt sonst still auf die Fremdfassung zurueck.
+#
+# capture  Aktuellen Stand aus ~/.claude/skills/agent-reach als Haus-Fassung einfrieren.
+# apply    Haus-Fassung in ALLE Ziele zurueckschreiben (Skill-Verzeichnis, installiertes Paket,
+#          lokaler Klon) — damit auch ein spaeteres `skill --install` wieder die Haus-Fassung legt.
+# verify   Abweichung melden; Exit 1, wenn ein Ziel abweicht. Fuer Hooks und Pruefungen.
+set -uo pipefail
+
+HOUSE="${AGENT_REACH_HOUSE_SKIN:-$HOME/.agent-reach/house-skin}"
+SKILL_DIR="$HOME/.claude/skills/agent-reach"
+SRC_CLONE="$HOME/.agent-reach/src/agent-reach"
+QUIET=0
+
+log() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+
+# Alle Orte, an denen eine Kopie des Skills liegt: das Skill-Verzeichnis selbst, die Kopie im
+# installierten uv-Tool-Paket (Quelle fuer `skill --install`) und der lokale Klon, aus dem
+# neu installiert wird.
+targets() {
+  printf '%s\n' "$SKILL_DIR"
+  local d
+  for d in "$HOME"/.local/share/uv/tools/agent-reach/lib/python*/site-packages/agent_reach/skill; do
+    [ -d "$d" ] && printf '%s\n' "$d"
+  done
+  [ -d "$SRC_CLONE/agent_reach/skill" ] && printf '%s\n' "$SRC_CLONE/agent_reach/skill"
+  return 0
+}
+
+copy_skin_into() {
+  local dest="$1" f name
+  mkdir -p "$dest/references"
+  cp "$HOUSE/SKILL.md" "$dest/SKILL.md"
+  cp "$HOUSE"/references/*.md "$dest/references/"
+  # Was die Haus-Fassung NICHT kennt, gehoert dort nicht hin: sonst ueberlebt eine vom
+  # Upstream mitgebrachte Referenz (etwa ein wieder aufgetauchtes finance.md) jede
+  # Wiederherstellung. Gemessen am 2026-08-13, als genau das passiert ist.
+  for f in "$dest"/references/*.md; do
+    [ -e "$f" ] || continue
+    name=$(basename "$f")
+    [ -e "$HOUSE/references/$name" ] || rm -f "$f"
+  done
+}
+
+files_differ() {
+  local dest="$1" f
+  [ -f "$dest/SKILL.md" ] || return 0
+  cmp -s "$HOUSE/SKILL.md" "$dest/SKILL.md" || return 0
+  for f in "$HOUSE"/references/*.md; do
+    cmp -s "$f" "$dest/references/$(basename "$f")" || return 0
+  done
+  return 1
+}
+
+cmd_capture() {
+  [ -f "$SKILL_DIR/SKILL.md" ] || { echo "agent-reach-skin: $SKILL_DIR/SKILL.md fehlt" >&2; exit 1; }
+  mkdir -p "$HOUSE/references"
+  cp "$SKILL_DIR/SKILL.md" "$HOUSE/SKILL.md"
+  # Erst leeren: sonst bleibt eine geloeschte Referenz in der Haus-Fassung stehen und
+  # wird bei der naechsten Wiederherstellung zurueckgeschrieben.
+  rm -f "$HOUSE"/references/*.md
+  cp "$SKILL_DIR"/references/*.md "$HOUSE/references/"
+  ( cd "$HOUSE" && find . -name '*.md' -type f | sort | xargs shasum -a 256 > MANIFEST.sha256 )
+  log "Haus-Fassung eingefroren in $HOUSE ($(ls "$HOUSE"/references/*.md | wc -l | tr -d ' ') references)"
+}
+
+cmd_apply() {
+  [ -f "$HOUSE/SKILL.md" ] || { echo "agent-reach-skin: keine Haus-Fassung unter $HOUSE — erst 'capture'" >&2; exit 1; }
+  local t changed=0
+  while IFS= read -r t; do
+    if files_differ "$t"; then
+      copy_skin_into "$t"
+      log "wiederhergestellt: $t"
+      changed=1
+    fi
+  done < <(targets)
+  [ "$changed" -eq 0 ] && log "nichts zu tun — alle Ziele tragen die Haus-Fassung"
+  return 0
+}
+
+cmd_verify() {
+  [ -f "$HOUSE/SKILL.md" ] || { echo "agent-reach-skin: keine Haus-Fassung unter $HOUSE" >&2; exit 2; }
+  local t rc=0
+  while IFS= read -r t; do
+    if files_differ "$t"; then
+      log "ABWEICHUNG: $t traegt nicht die Haus-Fassung"
+      rc=1
+    fi
+  done < <(targets)
+  [ "$rc" -eq 0 ] && log "alle Ziele tragen die Haus-Fassung"
+  return "$rc"
+}
+
+CMD="${1:-}"
+shift || true
+for a in "$@"; do [ "$a" = "--quiet" ] && QUIET=1; done
+
+case "$CMD" in
+  capture) cmd_capture ;;
+  apply)   cmd_apply ;;
+  verify)  cmd_verify ;;
+  *) cat >&2 <<'USAGE'
+Aufruf: agent-reach-skin {capture|apply|verify} [--quiet]
+
+  capture  aktuellen Skill-Stand als Haus-Fassung einfrieren
+  apply    Haus-Fassung in Skill-Verzeichnis, installiertes Paket und lokalen Klon zurueckschreiben
+  verify   Abweichungen melden (Exit 1), ohne etwas zu aendern
+USAGE
+     exit 64 ;;
+esac

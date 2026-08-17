@@ -1,0 +1,61 @@
+/* V12/V13: dieselbe Zeilenform wie .knopf (siehe index.html), nur mit einem
+   Punkt statt eines Liniensymbols -- Farbe und Groesse kommen aus den
+   globalen Zustandsklassen (laeuft-bg/will-bg/aus-bg/ruhig-bg, .punkt), hier
+   steht nur das Zeilenlayout. */
+#statuszeile {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  padding: 2px 0 4px;
+  border-top: 1px solid var(--linie);
+  margin-top: 2px;
+}
+#statuszeile:empty { display: none; }
+
+.sz-zeile {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 26px;
+  padding: 0 8px;
+  cursor: pointer;
+  color: var(--gedaempft);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.sz-zeile:hover { color: var(--schrift); }
+
+/* Die Marke traegt zwei Zeichen, nicht bloss eine Farbe -- dieselbe Kachel
+   wie in der Workerleiste (#rechts .punkt), aus demselben Grund: eingeklappt
+   ist sie die ganze Auskunft, und drei gleiche Punkte untereinander sagten
+   nicht, wovon sie handeln. Der Streifen an der linken Kante traegt den
+   Zustand, die Zeichen sagen wen. Breite 22px, damit sie auf derselben
+   Mittelachse steht wie die 20px-Symbole der Knoepfe darueber. */
+.sz-marke {
+  position: relative; flex: 0 0 22px; height: 15px; margin: 0 4px;
+  border-radius: 3px; background: #21262f; padding-left: 3px;
+  box-sizing: border-box;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 9px; letter-spacing: 0.3px; line-height: 1;
+  /* Die Zeichen bleiben hell, unabhaengig vom Zustand: zwei Buchstaben in
+     Rot auf Dunkelgrau sind bei 9px nicht mehr zu lesen -- derselbe Befund
+     wie beim Kuerzel der Sessionzeile. Der Zustand sitzt im Streifen. */
+  color: var(--schrift);
+  --streifen: var(--gedaempft);
+}
+.sz-marke::before {
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  border-radius: 3px 0 0 3px; background: var(--streifen);
+}
+.sz-marke.laeuft { --streifen: var(--laeuft); }
+.sz-marke.will { --streifen: var(--will); }
+.sz-marke.aus { --streifen: var(--aus); }
+.sz-marke.ruhig { --streifen: var(--gedaempft); }
+/* Die Budgetzeile meint keine Maschine, sondern eine Summe -- gedaempfte
+   Zeichen, damit die beiden Pruefstaende darueber die Aufmerksamkeit behalten. */
+.sz-budget .sz-marke { color: var(--gedaempft); font-size: 11px; }
+
+.sz-beschriftung { overflow: hidden; text-overflow: ellipsis; }
+.schmal .sz-zeile { justify-content: center; padding: 0; }
+.schmal .sz-beschriftung { display: none; }

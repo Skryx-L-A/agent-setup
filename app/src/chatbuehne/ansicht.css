@@ -1,0 +1,545 @@
+/* DIE OBERFLAECHE DER CHAT-SITZUNG -- gebaut nach dem Foto vom 12.08.
+   (VS-Code-Claude-Panel): Punktspalte links, Werkzeugaufrufe mit Titelzeile,
+   gedimmte Denk-Zeile, unten ein umrandetes Eingabefeld mit Modus-Marke.
+
+   BIS ZUM 12.08. STAND DIESE DATEI ALS <style> IM KOPF EINES EIGENEN FENSTERS
+   (app/src/chatfenster/index.html). Seit dem 13.08. liegt die Chat-Sitzung auf
+   der Buehne des HAUPTFENSTERS -- damit gibt es kein Dokument mehr, dem ein
+   eigener Kopf gehoert, und die Regeln ziehen in eine Datei, die das Buendel
+   des Renderers mitnimmt (renderer.ts importiert sie, esbuild schreibt sie in
+   dist/renderer/renderer.css).
+
+   Zwei Dinge sind beim Umzug WEGGEFALLEN und stehen bewusst nicht mehr hier:
+   die `html, body, #wurzel`-Regeln (es gibt kein eigenes Dokument mehr) und
+   der `:root`-Farbblock (das Hauptfenster fuehrt dieselben Namen und zieht sie
+   ueber `data-thema` in hell und dunkel nach -- eine zweite Fassung hier waere
+   eine zweite Wahrheit).
+
+   Die Flaeche selbst -- der Kasten `#chatbuehne` ueber dem Kachelgitter --
+   gehoert zur Buehne und steht deshalb in app/src/renderer/index.html. */
+.chatsdk {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  /* Die Schrift stand vorher am `body` des eigenen Fensters. Auf der Buehne
+     erbt der Kasten sonst die des Hauptfensters, und die Ansicht saehe je nach
+     Nachbarschaft anders aus. */
+  font: 13px/1.55 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: var(--schrift);
+  background: var(--grund);
+}
+
+/* --- Kopfleiste ------------------------------------------------------ */
+.csdk-kopf {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--linie);
+  background: var(--leiste);
+}
+.csdk-marke {
+  font-size: 11px;
+  color: var(--gedaempft);
+  border: 1px solid var(--linie);
+  border-radius: 10px;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+.csdk-marke.zustand.arbeitet {
+  color: var(--zustand-laeuft);
+  border-color: var(--zustand-laeuft);
+}
+.csdk-marke.zustand.freigabe {
+  color: var(--will);
+  border-color: var(--will);
+}
+.csdk-marke.zustand.beendet {
+  color: var(--aus);
+  border-color: var(--aus);
+}
+/* --- Worker-Leiste (Punkt 1) ----------------------------------------- */
+/* Die Worker DIESER Chat-Sitzung, gleich unter dem Kopf: sie sind das, wozu
+   gewechselt wird, und sie sollen im Blick sein, ohne den Verlauf zu druecken. */
+.csdk-worker {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--linie);
+  background: var(--leiste);
+}
+.csdk-workermarke {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--gedaempft);
+  margin-right: 4px;
+}
+.csdk-workerkachel {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font: inherit;
+  font-size: 11px;
+  color: var(--schrift);
+  background: var(--wahl);
+  border: 1px solid var(--linie);
+  border-radius: 6px;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+.csdk-workerkachel:hover {
+  border-color: var(--zustand-laeuft);
+}
+.csdk-workerkachel:not(.laeuft) .csdk-workername {
+  color: var(--gedaempft);
+}
+.csdk-workerpunkt {
+  flex: 0 0 7px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+/* --- Verlauf --------------------------------------------------------- */
+.csdk-verlauf {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 16px 8px;
+}
+.csdk-leer {
+  color: var(--gedaempft);
+  text-align: center;
+  margin-top: 22vh;
+}
+.csdk-leer-titel {
+  font-size: 15px;
+  margin-bottom: 4px;
+  color: var(--schrift);
+}
+
+/* Die Nachricht des Menschen: umrandeter Kasten (Foto). */
+.csdk-mensch {
+  border: 1px solid var(--linie);
+  border-radius: 7px;
+  padding: 8px 12px;
+  margin: 12px 0;
+  background: var(--leiste);
+}
+.csdk-mensch p:first-child {
+  margin-top: 0;
+}
+.csdk-mensch p:last-child {
+  margin-bottom: 0;
+}
+
+/* Alles vom Programm haengt an der Punktspalte links (Foto). */
+.csdk-zeile {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin: 9px 0;
+}
+.csdk-punkt {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: var(--gedaempft);
+}
+.csdk-zeile.agent .csdk-punkt {
+  background: var(--gedaempft);
+}
+.csdk-zeile.werkzeug .csdk-punkt {
+  background: var(--laeuft);
+}
+.csdk-zeile.werkzeug.laeuft .csdk-punkt {
+  background: var(--zustand-laeuft);
+}
+.csdk-zeile.werkzeug.fehler .csdk-punkt {
+  background: var(--aus);
+}
+.csdk-zeile.system .csdk-punkt {
+  background: var(--aus);
+}
+.csdk-koerper {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.csdk-agenttext p:first-child {
+  margin-top: 0;
+}
+.csdk-agenttext p:last-child {
+  margin-bottom: 0;
+}
+/* Inline-Code als Chip (Foto). */
+.csdk-agenttext code,
+.csdk-mensch code {
+  background: var(--wahl);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+.csdk-agenttext pre,
+.csdk-mensch pre {
+  background: var(--leiste);
+  border: 1px solid var(--linie);
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+}
+.csdk-agenttext pre code,
+.csdk-mensch pre code {
+  background: none;
+  padding: 0;
+}
+.csdk-systemtext {
+  color: var(--aus);
+}
+
+/* Denken: gedimmt und aufklappbar (Foto). */
+.csdk-zeile.denken .csdk-punkt {
+  background: var(--linie);
+}
+.csdk-klapp {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  color: var(--gedaempft);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.csdk-klapp:hover {
+  color: var(--schrift);
+}
+.csdk-denkentext,
+.csdk-voll {
+  display: none;
+}
+.csdk-denkentext.auf,
+.csdk-voll.auf {
+  display: block;
+}
+.csdk-denkentext {
+  color: var(--gedaempft);
+  white-space: pre-wrap;
+  border-left: 2px solid var(--linie);
+  padding-left: 10px;
+  margin-top: 5px;
+}
+
+/* Werkzeug: Titelzeile plus je eine Zeile EIN/AUS (Foto). */
+.csdk-werkzeugname {
+  color: var(--schrift);
+  font-weight: 600;
+}
+.csdk-werkzeugsatz {
+  color: var(--gedaempft);
+}
+.csdk-lauf {
+  color: var(--zustand-laeuft);
+  font-size: 11px;
+}
+.csdk-kurz {
+  margin-top: 4px;
+  border: 1px solid var(--linie);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.csdk-paar {
+  display: flex;
+  gap: 10px;
+  padding: 3px 9px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+.csdk-paar + .csdk-paar {
+  border-top: 1px solid var(--linie);
+}
+.csdk-paar.fehler .csdk-wert {
+  color: var(--aus);
+}
+.csdk-marke-klein {
+  flex: 0 0 auto;
+  width: 26px;
+  color: var(--gedaempft);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.csdk-wert {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.csdk-vollfeld {
+  margin-top: 6px;
+}
+.csdk-pre {
+  margin: 3px 0 0;
+  background: var(--leiste);
+  border: 1px solid var(--linie);
+  border-radius: 6px;
+  padding: 7px 9px;
+  overflow-x: auto;
+  max-height: 320px;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Freigabe: der Kasten, den man nicht uebersehen soll. */
+.csdk-freigabe {
+  border: 1px solid var(--will);
+  border-radius: 7px;
+  padding: 10px 12px;
+  margin: 12px 0;
+  background: var(--leiste);
+}
+.csdk-freigabe.entschieden {
+  border-color: var(--linie);
+  opacity: 0.75;
+}
+.csdk-freigabe-titel {
+  font-weight: 600;
+}
+.csdk-freigabe-satz {
+  color: var(--gedaempft);
+  margin-top: 2px;
+}
+.csdk-freigabe-knoepfe {
+  display: flex;
+  gap: 8px;
+  margin-top: 9px;
+}
+.csdk-ja,
+.csdk-nein {
+  font: inherit;
+  padding: 4px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid var(--linie);
+  background: var(--wahl);
+  color: var(--schrift);
+}
+.csdk-ja {
+  border-color: var(--laeuft);
+  color: var(--laeuft);
+}
+.csdk-nein {
+  border-color: var(--aus);
+  color: var(--aus);
+}
+.csdk-freigabe-stand {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--gedaempft);
+}
+.csdk-freigabe-stand.erlaubt {
+  color: var(--laeuft);
+}
+.csdk-freigabe-stand.abgelehnt {
+  color: var(--aus);
+}
+
+/* --- Eingabe --------------------------------------------------------- */
+.csdk-fuss {
+  flex: 0 0 auto;
+  padding: 8px 16px 12px;
+}
+.csdk-eingabekasten {
+  border: 1px solid var(--linie);
+  border-radius: 9px;
+  background: var(--leiste);
+  padding: 8px 10px 6px;
+}
+.csdk-eingabekasten:focus-within {
+  border-color: var(--zustand-laeuft);
+}
+.csdk-feld {
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  border: none;
+  outline: none;
+  background: none;
+  color: var(--schrift);
+  font: inherit;
+  max-height: 220px;
+}
+.csdk-feld::placeholder {
+  color: var(--gedaempft);
+}
+.csdk-eingabeleiste {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+/* Die Modus-Marke ist seit dem 12.08. ein KNOPF (Luecke 5c) -- sie soll
+   trotzdem aussehen wie eine Marke und nicht wie eine Schaltflaeche: der
+   Rahmen kommt erst beim Zeigen. */
+.csdk-modus {
+  font: inherit;
+  font-size: 11px;
+  color: var(--gedaempft);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 1px 8px;
+  cursor: pointer;
+  margin-right: auto;
+}
+.csdk-modus:hover:enabled {
+  color: var(--schrift);
+  border-color: var(--linie);
+}
+.csdk-modus:disabled {
+  cursor: default;
+}
+.csdk-modus.fehler {
+  color: var(--aus);
+  border-color: var(--aus);
+}
+/* Der Stop-Knopf steht nur, solange etwas laeuft. */
+.csdk-halt {
+  border: 1px solid var(--aus);
+  background: none;
+  color: var(--aus);
+  border-radius: 6px;
+  width: 26px;
+  height: 22px;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+}
+.csdk-halt:hover {
+  background: var(--wahl);
+}
+
+/* --- Vervollstaendigung (Punkt 3) ------------------------------------ */
+/* Sie liegt UEBER dem Feld, im selben Kasten: unter dem Feld kommt der Rand
+   des Fensters, und ein Kasten, der dort aufklappt, waere abgeschnitten. */
+.csdk-vervoll {
+  max-height: 220px;
+  overflow-y: auto;
+  margin: -2px -4px 6px;
+  border: 1px solid var(--linie);
+  border-radius: 7px;
+  background: var(--grund);
+}
+.csdk-vervoll-kopf {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--gedaempft);
+  padding: 4px 9px 2px;
+}
+.csdk-vervoll-zeile {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+.csdk-vervoll-zeile.gewaehlt {
+  background: var(--wahl);
+}
+.csdk-vervoll-wert {
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--schrift);
+}
+.csdk-vervoll-satz {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--gedaempft);
+}
+
+/* --- Statusleiste (Punkt 2) ------------------------------------------ */
+/* Dieselben Groessen wie die Zeile unter einer Terminal-Sitzung, deshalb auch
+   dieselbe Anmutung: eine schmale, gedimmte Zeile ganz unten, die im
+   Vorbeigehen gelesen wird und nichts wegnimmt. */
+.csdk-status {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 4px 16px 6px;
+  border-top: 1px solid var(--linie);
+  background: var(--leiste);
+  font-size: 11px;
+  color: var(--gedaempft);
+}
+.csdk-statusfeld {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  white-space: nowrap;
+  min-width: 0;
+}
+.csdk-statusfeld.ordner {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.csdk-statusfeld.modell .csdk-statuswert {
+  color: var(--zustand-laeuft);
+}
+.csdk-statusfeld.kontext .csdk-statuswert,
+.csdk-statusfeld.limit .csdk-statuswert {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.csdk-statusfeld.will .csdk-statuswert {
+  color: var(--will);
+}
+.csdk-statusfeld.aus .csdk-statuswert {
+  color: var(--aus);
+}
+.csdk-zweig {
+  color: var(--gedaempft);
+  opacity: 0.8;
+}
+.csdk-senden {
+  border: 1px solid var(--linie);
+  background: var(--wahl);
+  color: var(--schrift);
+  border-radius: 6px;
+  width: 26px;
+  height: 22px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+.csdk-senden:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.csdk-hinweis {
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--gedaempft);
+}

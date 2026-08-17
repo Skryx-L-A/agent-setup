@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+"""wb-kontingent -- Plan, nutzbare Modelle und Restkontingent je Harness.
+
+  wb-kontingent auffrischen [--harness <id>] [--wenn-aelter-als <stunden>] [--json]
+  wb-kontingent zeigen [<harness>] [--json]
+  wb-kontingent pruefen <harness> [<modell>]
+  wb-kontingent pfad
+
+Vertrag: scratchpad/kontingent-vertrag.md. Geschrieben wird
+~/.claude/workbench/kontingent.json, gelesen von `wb-state models table` (die
+Routing-Tabelle des Orchestrators) und von pi-worker/claude-worker VOR jedem Start.
+
+GRUNDREGEL: das Messen kostet nichts. Gelesen werden ausschliesslich lokale
+Zustands- und Konfigurationsdateien, ein lokaler Katalog (`ollama list`) und eine
+lokale Datenbank (~/.copilot/session-store.db, nur lesend geoeffnet). KEIN
+Modellaufruf, kein Login, kein Token-Refresh, kein Netzzugriff. Was sich nur so
+bestimmen liesse, bleibt leer und traegt als Quelle 'nicht-kostenlos-ermittelbar'
+-- das ist ein Ergebnis, kein Loch.
+
+ZWEI GRENZEN, an denen sich alles hier ausrichtet:
+
+  1. Nur ein NACHWEIS sperrt. 'Unbekannt' sperrt NIE. Ein Messloch darf die
+     Werkbank nicht lahmlegen -- jede Fehlerbehandlung faellt deshalb in Richtung
+     "startet trotzdem" aus, nie in Richtung "sicherheitshalber blockiert".
+  2. Die Pruefung darf den Spawn nicht spuerbar verzoegern. `pruefen` liest die
+     Zustandsdatei und frischt sie nur auf, wenn sie aelter als eine Stunde ist.
+
+Rueckgabewerte von `pruefen`:
+  0  spawnbar (auch: nichts bekannt -- siehe Grenze 1)
+  3  Kontingent nachweislich erschoepft
+  4  lokales Modell nicht in Ollama vorhanden
+  5  nachweislich nicht angemeldet (Abo-Spur ohne gueltiges Zeugnis)
+  2  Aufruffehler (falsche Argumente)
+"""
+import argparse
+import base64
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+HOME = os.environ.get("HOME") or os.path.expanduser("~")
+
+
+def hp(p):
+    """~/ gegen $HOME aufloesen, nicht gegen das echte Heimatverzeichnis des
+    Prozesses -- damit ein Test mit HOME=$(mktemp -d) niemals echte des Nutzers
+    Ablagen anfasst."""
+    if p.startswith("~/"):
+        return os.path.join(HOME, p[2:])
+    return os.path.expanduser(p)
+
+
+STATE_FILE = os.environ.get("WB_KONTINGENT_FILE") or hp("~/.claude/workbench/kontingent.json")
+REGISTRY_FILE = os.environ.get("WB_MODELS_FILE") or hp("~/.claude/workbench/models.json")
+MAXALTER_STUNDEN = 1.0
+
+ISO = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def jetzt():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def jetzt_iso():
+    return jetzt().strftime(ISO)
+
+
+def lies_json(pfad):
+    try:
+        with open(pfad, "r", encoding="utf-8", errors="replace") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# ── Der leere Eintrag: JEDES Feld des Vertrags, in der Reihenfolge des Vertrags ──
+# Ein Sammler fuellt, was er belegen kann, und laesst den Rest stehen. So kann ein
+# neuer Sammler kein Feld vergessen und keines dazuerfinden.
+def leerer_eintrag(art="unbekannt"):
+    return {
+        "art": art,
+        "plan": "",
+        "plan_quelle": "",
+        "angemeldet": None,
+        "modelle_nutzbar": [],
+        "modelle_gesperrt": [],
+        "modelle_quelle": "",
+        "kontingent": {
+            "art": "unbekannt",
+            "verbraucht": None,
+            "grenze": None,
+            "rest": None,
+            "einheit": "",
+            "faellt_zurueck_am": "",
+            "quelle": "",
+        },
+        "erschoepft": None,
+        "gemessen_am": jetzt_iso(),
+        "hinweis": "",
+    }
+
+
+# ── Registry ────────────────────────────────────────────────────────────────────
+def registry():
+    cfg = lies_json(REGISTRY_FILE) or {}
+    return (cfg.get("harnesses") or [], cfg.get("models") or [], cfg.get("providers") or [])
+
+
+def kblock(h):
+    """Der `kontingent`-Block eines Harness-Eintrags. Er sagt, WO man nachsieht --
+    die Werte selbst stehen nie dort, die veralten."""
+    b = h.get("kontingent")
+    return b if isinstance(b, dict) else {}
+
+
+def modelle_von(harness_id, modelle):
+    return [m for m in modelle if m.get("harness") == harness_id and m.get("enabled") is not False]
+
+
+def provider_kind(pid, providers):
+    for p in providers:
+        if p.get("id") == pid:
+            return p.get("kind") or "cloud"
+    return ""
+
+
+# ── Ollama-Katalog (kostenlos, laedt nichts) ────────────────────────────────────
+_OLLAMA_CACHE = None
+
+
+def ollama_katalog():
+    """(namen, fehler). `namen` enthaelt jeden Eintrag doppelt: mit Tag
+    ('ornith:9b') und ohne ('ornith'), weil beide Schreibweisen in modelRefs
+    vorkommen. Ein Fehler (Dienst tot, Binary weg) ist KEIN leerer Katalog,
+    sondern 'nicht messbar' -- sonst waere jedes Modell auf einmal 'fehlt'."""
+    global _OLLAMA_CACHE
+    if _OLLAMA_CACHE is not None:
+        return _OLLAMA_CACHE
+    exe = shutil.which("ollama")
+    if not exe:
+        _OLLAMA_CACHE = (set(), "ollama nicht im PATH")
+        return _OLLAMA_CACHE
+    try:
+        r = subprocess.run([exe, "list"], capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        _OLLAMA_CACHE = (set(), "ollama list fehlgeschlagen: %s" % e)
+        return _OLLAMA_CACHE
+    if r.returncode != 0:
+        _OLLAMA_CACHE = (set(), "ollama list exit %d: %s" % (r.returncode, (r.stderr or "").strip()[:120]))
+        return _OLLAMA_CACHE
+    namen = set()
+    for zeile in r.stdout.splitlines()[1:]:
+        teile = zeile.split()
+        if not teile:
+            continue
+        namen.add(teile[0])
+        namen.add(teile[0].split(":")[0])
+    _OLLAMA_CACHE = (namen, None)
+    return _OLLAMA_CACHE
+
+
+def ollama_kandidaten(modelref):
+    """Die Schreibweisen, unter denen dieser modelRef in 'ollama list' stehen
+    koennte -- oder eine leere Liste, wenn er gar kein Ollama-Name ist.
+
+    Der modelRef kommt in drei Formen vor, und alle drei muessen treffen:
+      * roh: 'ornith:9b'
+      * mit Harness-Praefix: 'ollama/ornith:9b', 'local/qwen3:1.7b'
+      * mit Ollama-EIGENEM Namensraum: 'huihui_ai/qwen3-abliterated:4b' -- hier
+        gehoert der Teil vor dem Schraegstrich ZUM Namen. Blindes Abschneiden
+        des ersten Segments meldete diese Modelle als fehlend, obwohl sie
+        installiert sind (gemessen beim ersten Lauf) -- deshalb steht die
+        ungekuerzte Form zuerst und das Kuerzen nur als zweite Chance.
+
+    Ohne Doppelpunkt wird gar nicht geurteilt: kimi traegt als modelRef einen
+    selbstgewaehlten Konfigurationsschluessel ('ollama-ornith-9b'), der erst in
+    ~/.kimi/config.toml auf 'ornith:9b' zeigt. Ihn gegen den Katalog zu halten
+    hiesse, ein vorhandenes Modell als fehlend zu melden -- und ein falscher
+    Nachweis sperrt genauso hart wie ein echter."""
+    if not modelref or ":" not in modelref:
+        return []
+    kand = [modelref]
+    if "/" in modelref:
+        kand.append(modelref.split("/", 1)[1])
+    return kand
+
+
+# ── codex: Plan und Gueltigkeit stehen im JWT, LOKAL dekodiert ──────────────────
+# `codex login status` meldet auch bei totem Token "Logged in using ChatGPT"
+# (gemessen 07.08. und 10.08.) -- diese Auskunft ist als Beleg NACHWEISLICH
+# untauglich und wird hier bewusst nicht aufgerufen. Wer sie wieder einbaut,
+# baut den Fehler wieder ein, wegen dem dieses Werkzeug existiert.
+def jwt_payload(token):
+    try:
+        teil = token.split(".")[1]
+        teil += "=" * (-len(teil) % 4)
+        return json.loads(base64.urlsafe_b64decode(teil))
+    except Exception:
+        return {}
+
+
+MONATE = {m: i + 1 for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])}
+RUECKFALL_RE = re.compile(
+    r"try again at ([A-Z][a-z]{2})[a-z]* (\d{1,2})\w{0,2},? (\d{4})[, ]+(\d{1,2}):(\d{2})\s*(AM|PM)")
+
+# Die Meldung nennt KEINE Zeitzone ("try again at Aug 27th, 2026 11:59 PM").
+# Gelesen wird sie als Pacific Time (UTC-7 im Sommer, OpenAI-Konvention) -- das
+# ist die SPAETESTE der in Frage kommenden Lesarten. Die Richtung ist Absicht:
+# liegt sie daneben, sperrt die Werkbank hoechstens ein paar Stunden zu lange,
+# statt einen Worker in ein noch erschoepftes Kontingent zu schicken. Genau
+# dieser Fehler ist der Anlass des ganzen Werkzeugs.
+RUECKFALL_TZ = datetime.timezone(datetime.timedelta(hours=-7))
+
+
+def codex_rueckfall(meldung):
+    m = RUECKFALL_RE.search(meldung or "")
+    if not m:
+        return None
+    mon, tag, jahr, std, minute, ampm = m.groups()
+    if mon not in MONATE:
+        return None
+    std = int(std) % 12
+    if ampm == "PM":
+        std += 12
+    try:
+        return datetime.datetime(int(jahr), MONATE[mon], int(tag), std, int(minute),
+                                 tzinfo=RUECKFALL_TZ)
+    except ValueError:
+        return None
+
+
+def codex_sitzungen(grenze=40):
+    """Die juengsten Sitzungsprotokolle, die codex ohnehin selbst geschrieben hat.
+    Nur lesen -- kein Aufruf, keine neue Datei."""
+    pfade = glob.glob(hp("~/.codex/sessions/*/*/*/rollout-*.jsonl"))
+    try:
+        pfade.sort(key=os.path.getmtime, reverse=True)
+    except OSError:
+        pfade.sort(reverse=True)
+    return pfade[:grenze]
+
+
+def sammle_codex(h, ctx):
+    e = leerer_eintrag("abo")
+    kb = kblock(h)
+    auth = lies_json(hp("~/.codex/auth.json"))
+    if not auth:
+        e["hinweis"] = "~/.codex/auth.json nicht lesbar -- nichts ermittelbar, deshalb kein Urteil."
+        return e
+    if auth.get("OPENAI_API_KEY"):
+        e["art"] = "api-schluessel"
+
+    tokens = auth.get("tokens") or {}
+    idp = jwt_payload(tokens.get("id_token") or "")
+    plan = ((idp.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or "")
+    if plan:
+        e["plan"] = plan
+        e["plan_quelle"] = kb.get("planQuelle") or "datei:~/.codex/auth.json (tokens.id_token, lokal dekodiert)"
+
+    ap = jwt_payload(tokens.get("access_token") or "")
+    exp = ap.get("exp")
+    if isinstance(exp, (int, float)):
+        gueltig_bis = datetime.datetime.fromtimestamp(exp, datetime.timezone.utc)
+        e["angemeldet"] = gueltig_bis > jetzt()
+        e["hinweis"] = "Access-Token gueltig bis %s (lokal aus dem JWT, kein Netzaufruf)." % \
+            gueltig_bis.strftime(ISO)
+
+    cache = lies_json(hp("~/.codex/models_cache.json")) or {}
+    gelistet = [m.get("slug") or m.get("id") for m in (cache.get("models") or [])
+                if m.get("visibility") == "list"]
+    e["modelle_nutzbar"] = [g for g in gelistet if g]
+    e["modelle_quelle"] = kb.get("modellQuelle") or "datei:~/.codex/models_cache.json"
+
+    # Erschoepft: das maschinenlesbare Signal aus den Sitzungsdateien, nicht der
+    # Fliesstext -- eine geaenderte Sprachfassung darf die Erkennung nicht kippen.
+    letzte_sperre = None   # (timestamp, meldung)
+    letzter_erfolg = None  # timestamp
+    for p in codex_sitzungen():
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                for zeile in f:
+                    if '"task_complete"' not in zeile:
+                        continue
+                    try:
+                        d = json.loads(zeile)
+                    except Exception:
+                        continue
+                    pl = d.get("payload") or {}
+                    if pl.get("type") != "task_complete":
+                        continue
+                    ts = d.get("timestamp") or ""
+                    err = pl.get("error") or {}
+                    if err.get("codex_error_info") == "usage_limit_exceeded":
+                        if letzte_sperre is None or ts > letzte_sperre[0]:
+                            letzte_sperre = (ts, err.get("message") or "")
+                    elif not err:
+                        if letzter_erfolg is None or ts > letzter_erfolg:
+                            letzter_erfolg = ts
+        except OSError:
+            continue
+
+    k = e["kontingent"]
+    k["art"] = "zeitfenster"
+    k["einheit"] = "Monatskontingent"
+    k["quelle"] = kb.get("nutzungQuelle") or \
+        "datei:~/.codex/sessions/*/rollout-*.jsonl (payload.error.codex_error_info)"
+    if letzte_sperre is None:
+        e["erschoepft"] = False if e["angemeldet"] else None
+        if e["angemeldet"]:
+            e["hinweis"] += " Kein Erschoepft-Signal in den juengsten Sitzungsdateien."
+    else:
+        ts, meldung = letzte_sperre
+        ende = codex_rueckfall(meldung)
+        if ende:
+            k["faellt_zurueck_am"] = ende.astimezone(datetime.timezone.utc).strftime(ISO)
+        if letzter_erfolg and letzter_erfolg > ts:
+            # Nach der Sperre ist wieder ein Zug durchgelaufen -- der beste
+            # denkbare Gegenbeweis, und er kostet nichts.
+            e["erschoepft"] = False
+            e["hinweis"] += " Nach dem letzten Erschoepft-Signal (%s) lief %s wieder ein Zug durch." % (ts, letzter_erfolg)
+        elif ende is None:
+            e["erschoepft"] = True
+            e["hinweis"] += " Erschoepft-Signal vom %s ohne lesbares Rueckfalldatum." % ts
+        else:
+            e["erschoepft"] = jetzt() < ende
+            k["rest"] = 0 if e["erschoepft"] else None
+            e["hinweis"] += " Erschoepft-Signal vom %s, Rueckfall laut Meldung '%s' (Zeitzone nicht benannt, als Pacific gelesen)." % (
+                ts, meldung.split("try again at ")[-1].rstrip("."))
+    return e
+
+
+# ── claude: die Statusleiste schreibt die Zahlen laengst ────────────────────────
+def sammle_claude(h, ctx):
+    e = leerer_eintrag("abo")
+    kb = kblock(h)
+    quelle = kb.get("nutzungQuelle") or "datei:~/.claude/workbench/limits-latest.json"
+    d = lies_json(hp("~/.claude/workbench/limits-latest.json"))
+    e["modelle_nutzbar"] = [m.get("modelRef") or m.get("id") for m in ctx["eigene_modelle"]]
+    e["modelle_quelle"] = kb.get("modellQuelle") or "registry:models[harness=claude]"
+    if not d:
+        e["hinweis"] = "limits-latest.json fehlt -- die Statusleiste hat in dieser Werkbank noch nie geschrieben."
+        return e
+    e["angemeldet"] = True
+    e["plan_quelle"] = kb.get("planQuelle") or ""
+    fuenf = d.get("five_hour_pct")
+    sieben = d.get("seven_day_pct")
+    k = e["kontingent"]
+    k["art"] = "zeitfenster"
+    k["einheit"] = "Prozent des 5-Stunden-Fensters"
+    k["quelle"] = quelle
+    if isinstance(fuenf, (int, float)):
+        k["verbraucht"] = fuenf
+        k["grenze"] = 100
+        k["rest"] = max(0, 100 - fuenf)
+    def zurueck(feld):
+        try:
+            return datetime.datetime.fromtimestamp(int(d.get(feld)), datetime.timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+    fuenf_zurueck, sieben_zurueck = zurueck("five_hour_resets_at"), zurueck("seven_day_resets_at")
+    if fuenf_zurueck:
+        k["faellt_zurueck_am"] = fuenf_zurueck.strftime(ISO)
+
+    # Ein volles Fenster zaehlt NUR, solange sein eigener Rueckfallzeitpunkt noch
+    # aussteht. Die Datei wird von der Statusleiste einer LAUFENDEN Sitzung
+    # geschrieben und altert danach still vor sich hin: eine Sitzung, die abends
+    # bei 100 % endete, haette sonst am naechsten Morgen jeden claude-Worker
+    # gesperrt, obwohl das Fenster laengst zurueckgesetzt ist. Ein abgelaufenes
+    # Fenster ist deshalb 'unbekannt', nicht 'frei' -- der Prozentwert daneben
+    # sagt ueber den jetzigen Stand nichts mehr.
+    voll, veraltet = False, False
+    for wert, rueck in ((fuenf, fuenf_zurueck), (sieben, sieben_zurueck)):
+        if not isinstance(wert, (int, float)) or wert < 100:
+            continue
+        if rueck is None or rueck > jetzt():
+            voll = True
+        else:
+            veraltet = True
+    if voll:
+        e["erschoepft"] = True
+    elif veraltet:
+        e["erschoepft"] = None
+    elif isinstance(fuenf, (int, float)) or isinstance(sieben, (int, float)):
+        e["erschoepft"] = False
+    e["hinweis"] = "5-Stunden-Fenster %s%%, 7-Tage-Fenster %s%% (Stand der Datei: %s)%s." % (
+        fuenf, sieben, d.get("ts") or "?",
+        "; das volle Fenster ist laut eigenem Rueckfallzeitpunkt schon zurueckgesetzt, "
+        "die Zahl daneben ist damit veraltet" if veraltet and not voll else "")
+    return e
+
+
+# ── copilot-cloud: Verbrauch in der eigenen Datenbank, Plan nur als Bildschirmtext ─
+def sammle_copilot_cloud(h, ctx):
+    e = leerer_eintrag("abo")
+    kb = kblock(h)
+    # Der Plan steht ausschliesslich im Modellwaehler der Oberflaeche und ist
+    # deshalb NICHT kostenlos wiederholbar automatisierbar. Einmal gemessen,
+    # datiert im Registry-Block hinterlegt (planFest/planFestStand) -- hier nur
+    # uebernommen, nie geraten.
+    e["plan"] = kb.get("planFest") or ""
+    if e["plan"]:
+        e["plan_quelle"] = kb.get("planQuelle") or ""
+    nutzbar = [m.get("modelRef") or m.get("id") for m in ctx["eigene_modelle"]]
+    e["modelle_nutzbar"] = nutzbar
+    e["modelle_gesperrt"] = [x for x in (kb.get("modelleGesperrt") or []) if isinstance(x, str)]
+    e["modelle_quelle"] = kb.get("modellQuelle") or ""
+
+    db = hp("~/.copilot/session-store.db")
+    k = e["kontingent"]
+    k["art"] = "credits"
+    k["einheit"] = "AIC"
+    k["quelle"] = kb.get("nutzungQuelle") or "datei:~/.copilot/session-store.db (assistant_usage_events)"
+    if os.path.exists(db):
+        e["angemeldet"] = True
+        try:
+            # Nur lesend geoeffnet (mode=ro): eine fremde, laufende Copilot-Sitzung
+            # darf dieser Aufruf unter keinen Umstaenden stoeren.
+            con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=5)
+            try:
+                (nano,) = con.execute(
+                    "select coalesce(sum(total_nano_aiu),0) from assistant_usage_events").fetchone()
+            finally:
+                con.close()
+            k["verbraucht"] = round((nano or 0) / 1e9, 4)
+        except Exception as ex:
+            k["quelle"] = "%s -- nicht lesbar: %s" % (k["quelle"], ex)
+    else:
+        e["hinweis"] = "~/.copilot/session-store.db fehlt -- kein Verbrauch messbar, kein Urteil."
+    # Die GRENZE des Free-Plans nennt keine lokale Datei; sie stuende nur auf der
+    # Abrechnungsseite im Netz. Deshalb bleibt sie leer statt geraten -- und ohne
+    # Grenze gibt es kein belegbares 'erschoepft'.
+    e["hinweis"] = (e["hinweis"] + " Grenze des Plans nicht-kostenlos-ermittelbar; "
+                    "'erschoepft' bleibt deshalb unbekannt und sperrt nie.").strip()
+    return e
+
+
+# ── agy: kein Statusbefehl, aber ein Log, das die Auth-Aufloesung nennt ─────────
+def sammle_agy(h, ctx):
+    e = leerer_eintrag("abo")
+    kb = kblock(h)
+    e["modelle_nutzbar"] = [m.get("modelRef") or m.get("id") for m in ctx["eigene_modelle"]]
+    e["modelle_quelle"] = kb.get("modellQuelle") or ""
+    logs = sorted(glob.glob(hp("~/.gemini/antigravity-cli/log/cli-*.log")))
+    treffer = ""
+    for p in reversed(logs[-8:]):
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                for zeile in f:
+                    if "applyAuthResult:" in zeile:
+                        treffer = zeile.strip()
+        except OSError:
+            continue
+        if treffer:
+            break
+    if treffer:
+        e["angemeldet"] = "email=" in treffer and "authMethod=" in treffer
+        m = re.search(r"authMethod=(\w+)", treffer)
+        e["hinweis"] = "Auth-Aufloesung im eigenen Log: authMethod=%s (kein Produktname, deshalb kein Plan)." % (
+            m.group(1) if m else "?")
+    else:
+        e["hinweis"] = "Keine applyAuthResult-Zeile in den juengsten Logs -- Anmeldung unbekannt."
+    k = e["kontingent"]
+    k["art"] = "unbekannt"
+    k["quelle"] = kb.get("nutzungQuelle") or "nicht-kostenlos-ermittelbar"
+    return e
+
+
+# ── Alles Lokale: kein Kontingent, sondern Katalog und Speicher ─────────────────
+def sammle_lokal(h, ctx):
+    e = leerer_eintrag("lokal")
+    kb = kblock(h)
+    namen, fehler = ollama_katalog()
+    nutzbar, gesperrt, ungeprueft = [], [], []
+    for m in ctx["eigene_modelle"]:
+        ref = m.get("modelRef") or m.get("id")
+        if provider_kind(m.get("provider") or "", ctx["providers"]) != "local":
+            ungeprueft.append(ref)
+            continue
+        kand = ollama_kandidaten(ref)
+        if not kand or fehler:
+            ungeprueft.append(ref)
+        elif any(k in namen for k in kand):
+            nutzbar.append(ref)
+        else:
+            gesperrt.append(ref)
+    e["modelle_nutzbar"] = nutzbar + ungeprueft
+    e["modelle_gesperrt"] = gesperrt
+    e["modelle_quelle"] = kb.get("modellQuelle") or "befehl:ollama list"
+    if fehler:
+        e["modelle_quelle"] += " -- nicht messbar: %s" % fehler
+    k = e["kontingent"]
+    k["art"] = "keins"
+    k["quelle"] = "keins"
+    e["hinweis"] = ("Kein Credit-Kontingent. Vor einem Spawn zaehlt, ob das Modell in Ollama "
+                    "liegt und ob der Speicher reicht -- nicht dieser Eintrag.")
+    if ungeprueft:
+        e["hinweis"] += " Nicht gegen den Katalog geprueft (kein Ollama-Name): %s." % ", ".join(
+            sorted(set(ungeprueft))[:4])
+    return e
+
+
+SAMMLER = {
+    "codex": sammle_codex,
+    "claude": sammle_claude,
+    "copilot-cloud": sammle_copilot_cloud,
+    "agy": sammle_agy,
+}
+
+
+def sammle(h, modelle, providers):
+    ctx = {"eigene_modelle": modelle_von(h["id"], modelle), "providers": providers}
+    fn = SAMMLER.get(h["id"])
+    if fn is None:
+        art = (kblock(h).get("art") or "").strip()
+        # Ohne Registry-Angabe wird nichts behauptet: ein Harness, ueber den
+        # niemand etwas hinterlegt hat, bleibt 'unbekannt' und sperrt nie.
+        if art == "lokal":
+            fn = sammle_lokal
+        else:
+            e = leerer_eintrag(art or "unbekannt")
+            e["hinweis"] = "Kein Sammler und kein 'kontingent.art' in der Registry -- nichts ermittelt."
+            return e
+    return fn(h, ctx)
+
+
+# ── Zustandsdatei ───────────────────────────────────────────────────────────────
+def lies_zustand():
+    d = lies_json(STATE_FILE)
+    if not isinstance(d, dict) or not isinstance(d.get("harnesses"), dict):
+        return None
+    return d
+
+
+def alter_sekunden(zustand):
+    try:
+        stand = datetime.datetime.strptime(zustand["stand"], ISO).replace(
+            tzinfo=datetime.timezone.utc)
+    except Exception:
+        return None
+    return (jetzt() - stand).total_seconds()
+
+
+def schreibe_zustand(daten):
+    """Atomar: erst daneben schreiben, dann umbenennen. Ein abgebrochener Lauf
+    hinterlaesst nie eine halbe Datei, die alle anderen dann als Wahrheit lesen."""
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE_FILE), prefix=".kontingent-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(daten, f, ensure_ascii=False, indent=2, sort_keys=False)
+            f.write("\n")
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def auffrischen(nur_harness=None):
+    harnesses, modelle, providers = registry()
+    alt = lies_zustand() or {}
+    eintraege = dict(alt.get("harnesses") or {}) if nur_harness else {}
+    for h in harnesses:
+        if not isinstance(h, dict) or not h.get("id"):
+            continue
+        if nur_harness and h["id"] != nur_harness:
+            continue
+        eintraege[h["id"]] = sammle(h, modelle, providers)
+    daten = {"stand": jetzt_iso(), "harnesses": eintraege}
+    schreibe_zustand(daten)
+    return daten
+
+
+def zustand_frisch(max_stunden=MAXALTER_STUNDEN):
+    """Die Zustandsdatei, notfalls neu erhoben. Faellt das Auffrischen aus, gilt
+    der alte Stand weiter -- und wenn es auch den nicht gibt, ein leerer, der
+    nichts behauptet und nichts sperrt."""
+    z = lies_zustand()
+    a = alter_sekunden(z) if z else None
+    if z is not None and a is not None and a <= max_stunden * 3600:
+        return z, False
+    try:
+        return auffrischen(), True
+    except Exception as e:
+        if z is not None:
+            print("wb-kontingent: Auffrischen fehlgeschlagen (%s) -- alter Stand gilt weiter." % e,
+                  file=sys.stderr)
+            return z, False
+        return {"stand": jetzt_iso(), "harnesses": {}}, False
+
+
+# ── Unterbefehle ────────────────────────────────────────────────────────────────
+def cmd_auffrischen(args):
+    start = datetime.datetime.now()
+    if args.wenn_aelter_als is not None:
+        z = lies_zustand()
+        a = alter_sekunden(z) if z else None
+        if z is not None and a is not None and a <= args.wenn_aelter_als * 3600:
+            if not args.json:
+                print("wb-kontingent: Stand ist %d Minuten alt -- nichts zu tun." % (a / 60))
+            else:
+                print(json.dumps(z, ensure_ascii=False, indent=2))
+            return 0
+    daten = auffrischen(args.harness)
+    dauer = (datetime.datetime.now() - start).total_seconds()
+    if args.json:
+        print(json.dumps(daten, ensure_ascii=False, indent=2))
+    else:
+        print("wb-kontingent: %d Harness(es) erhoben in %.2fs -> %s"
+              % (len(daten["harnesses"]), dauer, STATE_FILE))
+    return 0
+
+
+def _zeile(hid, e):
+    k = e.get("kontingent") or {}
+    if e.get("erschoepft") is True:
+        zustand = "ERSCHOEPFT"
+        if k.get("faellt_zurueck_am"):
+            zustand += " bis " + k["faellt_zurueck_am"][:16].replace("T", " ")
+    elif e.get("angemeldet") is False and e.get("art") == "abo":
+        zustand = "NICHT ANGEMELDET"
+    elif e.get("erschoepft") is False:
+        zustand = "frei"
+    elif e.get("art") == "lokal":
+        # 'unbekannt' waere hier irrefuehrend: erschoepfen kann sich eine lokale
+        # Spur nicht, die einzige Frage ist der Katalog -- und die ist beantwortet.
+        fehlen = len(e.get("modelle_gesperrt") or [])
+        zustand = "%d Modell(e) fehlen" % fehlen if fehlen else "Katalog vollstaendig"
+    else:
+        zustand = "unbekannt"
+    rest = ""
+    if k.get("rest") is not None:
+        rest = "%s %s" % (k["rest"], k.get("einheit") or "")
+    elif k.get("verbraucht") is not None:
+        rest = "%s %s verbraucht" % (k["verbraucht"], k.get("einheit") or "")
+    elif k.get("art") == "keins":
+        rest = "kein Kontingent"
+    return "%-15s %-9s %-14s %-27s %s" % (
+        hid, e.get("art") or "?", e.get("plan") or "-", zustand, rest)
+
+
+def cmd_zeigen(args):
+    z = lies_zustand()
+    if z is None:
+        print("wb-kontingent: noch kein Stand erhoben -- 'wb-kontingent auffrischen' laeuft kostenlos.",
+              file=sys.stderr)
+        return 1
+    if args.json:
+        if args.harness:
+            print(json.dumps((z["harnesses"].get(args.harness) or {}), ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps(z, ensure_ascii=False, indent=2))
+        return 0
+    a = alter_sekunden(z)
+    print("Stand: %s%s" % (z.get("stand"), ("  (%d Minuten alt)" % (a / 60)) if a is not None else ""))
+    if args.harness:
+        e = z["harnesses"].get(args.harness)
+        if e is None:
+            print("wb-kontingent: '%s' steht nicht im Stand." % args.harness, file=sys.stderr)
+            return 1
+        print(_zeile(args.harness, e))
+        print("  Modelle nutzbar:  %s" % (", ".join(e.get("modelle_nutzbar") or []) or "-"))
+        if e.get("modelle_gesperrt"):
+            print("  Modelle gesperrt: %s" % ", ".join(e["modelle_gesperrt"]))
+        for feld, wert in (("Plan", e.get("plan_quelle")), ("Modelle", e.get("modelle_quelle")),
+                           ("Nutzung", (e.get("kontingent") or {}).get("quelle"))):
+            if wert:
+                print("  Quelle %-8s %s" % (feld + ":", wert))
+        if e.get("hinweis"):
+            print("  Hinweis: %s" % e["hinweis"])
+        return 0
+    print("%-15s %-9s %-14s %-27s %s" % ("HARNESS", "ART", "PLAN", "ZUSTAND", "KONTINGENT"))
+    for hid in sorted(z["harnesses"]):
+        print(_zeile(hid, z["harnesses"][hid]))
+    return 0
+
+
+def _finde_modell(kennung, harness_id):
+    """Ein Modell-Argument darf eine Registry-id ODER ein roher modelRef sein --
+    pi-worker kennt an dieser Stelle beides."""
+    _, modelle, _ = registry()
+    for m in modelle:
+        if m.get("id") == kennung:
+            return m.get("modelRef") or m.get("id")
+    for m in modelle:
+        if m.get("harness") == harness_id and (m.get("modelRef") or "") == kennung:
+            return kennung
+    return kennung
+
+
+def cmd_pruefen(args):
+    z, _ = zustand_frisch()
+    e = (z.get("harnesses") or {}).get(args.harness)
+    if e is None:
+        # Grenze 1: unbekannt sperrt nie.
+        return 0
+
+    if e.get("erschoepft") is True:
+        k = e.get("kontingent") or {}
+        wieder = k.get("faellt_zurueck_am") or "unbekannt"
+        print("wb-kontingent: Harness '%s' ist nachweislich erschoepft -- kein Start. "
+              "Wieder frei ab: %s. Beleg: %s"
+              % (args.harness, wieder, k.get("quelle") or "?"), file=sys.stderr)
+        return 3
+
+    if e.get("art") == "abo" and e.get("angemeldet") is False:
+        print("wb-kontingent: Harness '%s' ist nachweislich nicht angemeldet -- kein Start. %s"
+              % (args.harness, e.get("hinweis") or ""), file=sys.stderr)
+        return 5
+
+    if args.modell:
+        ref = _finde_modell(args.modell, args.harness)
+        if ref in (e.get("modelle_gesperrt") or []):
+            kand = ollama_kandidaten(ref)
+            print("wb-kontingent: Modell '%s' ist auf dieser Maschine nicht vorhanden "
+                  "(nicht in 'ollama list') -- kein Start. Holen: ollama pull %s"
+                  % (ref, kand[-1] if kand else ref), file=sys.stderr)
+            return 4
+        # Speicher ist eine WARNUNG, kein Riegel: Ollama entlaedt bei Druck selbst,
+        # und ein Riegel an dieser Stelle wuerde raten, wo er messen muesste.
+        if e.get("art") == "lokal" and ref in (e.get("modelle_nutzbar") or []):
+            frei = freier_speicher_mib()
+            if frei is not None and frei < 4096:
+                print("wb-kontingent: WARNUNG -- nur %d MiB frei; ein grosses lokales Modell "
+                      "verdraengt hier moeglicherweise ein anderes." % frei, file=sys.stderr)
+    return 0
+
+
+def freier_speicher_mib():
+    exe = shutil.which("check-resources")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe], capture_output=True, text=True, timeout=10)
+        d = json.loads(r.stdout)
+        return (d.get("ram") or {}).get("free_mib")
+    except Exception:
+        return None
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="wb-kontingent", add_help=True,
+                                 description="Plan, nutzbare Modelle und Restkontingent je Harness.")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("auffrischen", help="alle Quellen lesen und die Zustandsdatei schreiben")
+    p.add_argument("--harness")
+    p.add_argument("--wenn-aelter-als", dest="wenn_aelter_als", type=float, metavar="STUNDEN")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_auffrischen)
+
+    p = sub.add_parser("zeigen", help="lesbare Uebersicht")
+    p.add_argument("harness", nargs="?")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_zeigen)
+
+    p = sub.add_parser("pruefen", help="0 = spawnbar, sonst Grund auf stderr")
+    p.add_argument("harness")
+    p.add_argument("modell", nargs="?")
+    p.set_defaults(fn=cmd_pruefen)
+
+    p = sub.add_parser("pfad", help="Pfad der Zustandsdatei")
+    p.set_defaults(fn=lambda a: (print(STATE_FILE), 0)[1])
+
+    args = ap.parse_args()
+    if not getattr(args, "fn", None):
+        ap.print_help()
+        return 2
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

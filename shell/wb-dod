@@ -1,0 +1,211 @@
+#!/bin/bash
+# wb-dod <worker-name> ["<fertig-kriterium>"]
+#   Prueft, ob das Ergebnis eines Workers (pi-worker/claude-worker) sein
+#   Fertig-Kriterium erfuellt. Kriterium optional: wenn `pi-worker --dod "..."`
+#   es schon in ~/.pi-workers/results/<name>/.dod hinterlegt hat, reicht der Name.
+#
+# Ablauf: Result-Datei lesen (~/.pi-workers/results/<name>/latest.md), zusammen
+# mit dem Kriterium an ein BILLIGES Modell geben -- erst ein lokales Ollama-Modell
+# (token-frei), nur wenn keins erreichbar/startbar ist Fallback auf
+# claude-haiku-4-5. Das Modell liefert ERFUELLT/NICHT-ERFUELLT plus einen Satz
+# Begruendung.
+#
+# Exit 0 = ERFUELLT, 1 = NICHT-ERFUELLT, 2 = nicht pruefbar (keine Result-Datei,
+# kein Kriterium, kein Modell erreichbar, Antwort nicht eindeutig).
+#
+# Test-Ersatz fuer den Modellaufruf: WB_DOD_JUDGE_CMD (Pflicht bei Tests -- das
+# Urteil darf nicht davon abhaengen, was auf dieser Maschine gerade laeuft).
+# Gesetzt, ersetzt es den kompletten Modellaufruf: der Befehl bekommt den vollen
+# Judge-Prompt auf STDIN und muss auf STDOUT als ERSTE Zeile exakt ERFUELLT oder
+# NICHT-ERFUELLT liefern, als ZWEITE Zeile eine Begruendung. WB_DOD_JUDGE_NAME
+# setzt den in der Ausgabe genannten Modellnamen (Default "fake").
+set -u
+
+NAME="${1:?Aufruf: wb-dod <worker-name> [\"<fertig-kriterium>\"]}"
+CRIT="${2:-}"
+
+case "$NAME" in
+  ''|-*|*[!A-Za-z0-9_-]*)
+    echo "FEHLER: unzulaessiger Worker-Name '$NAME' (Buchstaben/Ziffern/-/_ , kein '/')." >&2
+    exit 2 ;;
+esac
+
+RESDIR="$HOME/.pi-workers/results/$NAME"
+RESFILE="$RESDIR/latest.md"
+DODFILE="$RESDIR/.dod"
+
+if [ -z "$CRIT" ] && [ -s "$DODFILE" ]; then
+  CRIT="$(cat "$DODFILE")"
+fi
+if [ -z "$CRIT" ]; then
+  echo "NICHT PRUEFBAR: kein Fertig-Kriterium -- weder als Argument noch in $DODFILE (pi-worker --dod)." >&2
+  exit 2
+fi
+
+if [ ! -s "$RESFILE" ]; then
+  echo "NICHT PRUEFBAR: keine (oder leere) Result-Datei fuer Worker '$NAME' ($RESFILE)." >&2
+  exit 2
+fi
+
+RESULT_CONTENT="$(cat "$RESFILE")"
+
+# Der Judge-Prompt ist NICHT beliebig formuliert, sondern auserprobt: neun Fassungen
+# (A bis I), gemessen an 253 Faellen mit bekannter Wahrheit. Die erste, naheliegende
+# Fassung ("pruefe streng") kam auf 85 %, weil sie das Modell in die Strenge kippte und
+# es echte Belege ablehnte. Was den Ausschlag gab, war die Umkehr der Beweislast in
+# Schritt 4: NICHT-ERFUELLT nur, wenn sich die fehlende Forderung BENENNEN laesst.
+# Herleitung und Messreihe: ~/AI/claude-workbench/dod-judge/.
+PROMPT="Du entscheidest, ob ein Arbeitsergebnis sein Fertig-Kriterium erfuellt.
+
+Vorgehen:
+1. Lies das Kriterium und zaehle seine Forderungen auf - nur die, die woertlich dort stehen.
+2. Suche fuer jede Forderung die konkrete Angabe im Ergebnis.
+3. Pruefe, ob die Angabe die Forderung BESTAETIGT oder ihr WIDERSPRICHT. Eine konkrete
+Angabe, die das Gegenteil zeigt, widerlegt die Forderung: Kriterium verlangt unter
+100 KB, Angabe lautet 412.880 Byte; Kriterium verlangt einen laufenden Dienst, Ausgabe
+lautet failed; Kriterium verlangt Exit 0, es steht Exit 1 da. Dann NICHT-ERFUELLT.
+4. Antworte NICHT-ERFUELLT nur, wenn Du eine Forderung BENENNEN kannst, zu der nichts
+Konkretes dasteht oder zu der die Angabe das Gegenteil zeigt. Sonst ERFUELLT.
+
+Was als konkrete Angabe zaehlt - grosszuegig lesen:
+- Zahl, Pfad, Dateiname, Befehl, Ausgabe, Testname, Version, Zeitpunkt, Hash.
+- Auch ein NEGATIVER Nachweis: 'pgrep liefert nichts mehr', 'zeigt nur noch X',
+'0 Abweichungen', 'git status: leer'. Dass etwas WEG ist, laesst sich nur so belegen -
+das ist ein vollwertiger Beleg, kein fehlender.
+- Auch ein Grund im Satz: ein 'weil ...' IST die verlangte Begruendung, wenn das
+Kriterium nach dem Grund fragt.
+- Auch eine Moeglichkeit, die durch eine konkrete Angabe belegt ist: ein genannter
+Snapshot-Pfad belegt, dass etwas rueckgaengig zu machen ist.
+- Ein Beleg darf sehr kurz sein. 'diff sagt: identisch' belegt eine Pruefung,
+'Exit 0, 228 s' einen dokumentierten Lauf. Kuerze ist kein Mangel.
+
+Kein Beleg ist eine blosse Zusicherung ohne jede konkrete Angabe: 'funktioniert',
+'ist getestet', 'sauber erledigt', 'deutlich besser', 'wie ueblich'.
+Kein Beleg ist auch eine VAGE Angabe, die den verlangten Namen oder Wert umschreibt
+statt ihn zu nennen. Fragt das Kriterium nach einer Fundstelle, ist 'steht in der
+Worker-Rolle' zu vage - verlangt ist Datei und Stelle. Fragt es, WELCHES Modell
+geurteilt hat, ist 'ein lokales Modell' zu vage - verlangt ist der Name. Pruefe deshalb
+nicht nur, OB etwas dasteht, sondern ob es das benennt, wonach gefragt wurde.
+Verlange nichts, was im Kriterium nicht steht.
+
+Antworte in GENAU zwei Zeilen.
+Zeile 1: ERFUELLT oder NICHT-ERFUELLT
+Zeile 2: bei NICHT-ERFUELLT die fehlende oder widerlegte Forderung, sonst der gefundene Beleg.
+
+FERTIG-KRITERIUM:
+$CRIT
+
+ERGEBNIS (Result-Datei des Workers):
+---
+$RESULT_CONTENT
+---"
+
+VERDICT_RAW=""
+MODEL_USED=""
+
+if [ -n "${WB_DOD_JUDGE_CMD:-}" ]; then
+  VERDICT_RAW="$(printf '%s' "$PROMPT" | eval "$WB_DOD_JUDGE_CMD" 2>/dev/null)"
+  MODEL_USED="${WB_DOD_JUDGE_NAME:-fake}"
+else
+  # 1) Lokal ueber Ollama -- token-frei, erste Wahl fuer ein Ja/Nein-Urteil.
+  #
+  # 2026-08-11: die Adresse kommt aus den Einstellungen (ollamaEndpoint), nicht mehr
+  # fest aus dem Quelltext -- dieselbe Form-Pruefung wie bei jedem anderen Leser
+  # dieses Schluessels: eine leere oder unsinnige Form faellt auf die Auslieferung
+  # zurueck, statt lokale Modelle still abzuschalten.
+  OLLAMA_URL="$(wb-state settings get ollamaEndpoint 2>/dev/null)"
+  case "$OLLAMA_URL" in
+    http://*|https://*) ;;
+    *) OLLAMA_URL="http://127.0.0.1:11434" ;;
+  esac
+  if curl -s -m 3 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+    LOCAL_MODEL=""
+    # JUDGE_RANKING: nach gemessener Trefferquote sortiert, bestes zuerst.
+    # Wer hier etwas einfuegt, misst vorher mit judge-bench2.py -- Groesse sagt nichts.
+    # Gemessen an 253 Faellen mit bekannter Wahrheit (Messreihe:
+    # ~/AI/claude-workbench/dod-judge/). Reihenfolge nach Trefferquote, bestes zuerst.
+    # gemma4:12b liegt am frischen, nie zum Tunen benutzten Pruefsatz bei 96 %.
+    JUDGE_RANKING="gemma4:12b gemma4:26b qwen3.6:27b-coding-nvfp4 gemma4:e4b huihui_ai/qwen3-abliterated:4b qwen3:1.7b ornith:9b"
+    # Ein bereits geladenes Modell wird nur dann benutzt, wenn es SELBST auf der
+    # Bestenliste steht. Bis 2026-08-03 nahm dieser Zweig einfach, was gerade geladen
+    # war -- gemessen fiel er dadurch auf ornith:9b (75 % Trefferquote) zurueck und
+    # urteilte im Test prompt falsch, obwohl ein besseres Modell installiert war.
+    # Ein zusaetzliches 4b-Modell kostet rund 2,5 GB und 0,7 s; ein falsches Urteil
+    # ueber ein Arbeitsergebnis kostet mehr. Embedding-Modelle taugen nie als Judge.
+    LOADED="$(ollama ps 2>/dev/null | awk 'NR>1{print $1}' | grep -vi embed)"
+    for cand in $JUDGE_RANKING; do
+      printf '%s\n' "$LOADED" | grep -qx "$cand" && { LOCAL_MODEL="$cand"; break; }
+    done
+    if [ -z "$LOCAL_MODEL" ]; then
+      # Nichts geladen: vor dem Start check-resources befragen (nie blind starten),
+      # dann das Modell nehmen, das als JUDGE gemessen am besten war -- nicht das
+      # kleinste und erst recht nicht das groesste.
+      #
+      # Gemessen 2026-08-03 (judge-bench2.py): 20 Faelle mit bekannter Wahrheit,
+      # davon 9 knifflig -- ein Ergebnis, das selbstbewusst "fertig" meldet, ohne den
+      # Beleg zu liefern, den das Kriterium verlangt. 3 Durchlaeufe, temperature 0,
+      # 60 Urteile je Modell. "durchgewunken" = faelschlich ERFUELLT, der teure Fehler:
+      #
+      #   gemma4:e4b                      51/60 (85 %)  knifflig 18/27   0 durchgewunken  1,08 s
+      #   huihui_ai/qwen3-abliterated:4b  36/60 (60 %)  knifflig 18/27   0 durchgewunken  0,86 s
+      #   granite4:3b                     36/60 (60 %)  knifflig  6/27  21 durchgewunken  0,64 s
+      #   phi4-mini:3.8b                  27/60 (45 %)  knifflig 15/27   3 durchgewunken  0,68 s
+      #   lfm2.5:8b                        0/60         60 Antworten unlesbar            3,81 s
+      #   ornith:9b (35B-Familie, 9B)     nur im leichten Vorlauf: 18/24 (75 %)
+      #
+      # Drei Lehren, die in der Reihenfolge stecken: (1) Groesse sagt nichts -- das
+      # groesste getestete Modell war das schlechteste. (2) Trefferquote allein taeuscht:
+      # granite4:3b liegt gleichauf mit qwen4b, winkt aber 21-mal unfertige Arbeit durch.
+      # (3) Ein leichter Testsatz taeuscht: qwen4b hatte im ersten, einfacheren Benchmark
+      # 24/24 und faellt hier auf 60 %. Wer die Reihenfolge aendert, misst vorher neu --
+      # mit den kniffligen Faellen, nicht nur den offensichtlichen.
+      FREE_MIB="$(check-resources 2>/dev/null | jq -r '.ram.free_mib // 0' 2>/dev/null)"
+      case "$FREE_MIB" in ''|*[!0-9]*) FREE_MIB=0 ;; esac
+      if [ "$FREE_MIB" -ge 3000 ]; then
+        INSTALLED="$(ollama list 2>/dev/null | awk 'NR>1{print $1}')"
+        for cand in $JUDGE_RANKING; do
+          printf '%s\n' "$INSTALLED" | grep -qx "$cand" && { LOCAL_MODEL="$cand"; break; }
+        done
+      fi
+    fi
+    if [ -n "$LOCAL_MODEL" ]; then
+      RESP_JSON="$(jq -n --arg m "$LOCAL_MODEL" --arg p "$PROMPT" \
+        '{model:$m, prompt:$p, stream:false, think:false}' \
+        | curl -s -m 60 -d @- "$OLLAMA_URL/api/generate" 2>/dev/null)"
+      VERDICT_RAW="$(printf '%s' "$RESP_JSON" | jq -r '.response // empty' 2>/dev/null)"
+      [ -n "$VERDICT_RAW" ] && MODEL_USED="$LOCAL_MODEL (ollama, lokal)"
+    fi
+  fi
+
+  # 2) Fallback: kein lokales Modell erreichbar/geladen/startbar -> claude-haiku-4-5.
+  if [ -z "$VERDICT_RAW" ] && command -v claude >/dev/null 2>&1; then
+    VERDICT_RAW="$(printf '%s' "$PROMPT" | claude -p --model claude-haiku-4-5 2>/dev/null)"
+    [ -n "$VERDICT_RAW" ] && MODEL_USED="claude-haiku-4-5 (Fallback, kein lokales Modell erreichbar)"
+  fi
+fi
+
+if [ -z "$VERDICT_RAW" ]; then
+  echo "NICHT PRUEFBAR: kein Modell erreichbar (weder lokal via Ollama noch claude-haiku-4-5)." >&2
+  exit 2
+fi
+
+FIRSTLINE="$(printf '%s\n' "$VERDICT_RAW" | head -1)"
+REASON="$(printf '%s\n' "$VERDICT_RAW" | tail -n +2 | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+
+# Umlaut-Varianten tolerieren. Der Prompt verlangt ERFUELLT, aber Modelle schreiben
+# je nach Laune ERFUELLT, ERFULLT oder ERFÜLLT -- gemessen bei gemma4:e4b im echten
+# Lauf am 2026-08-03, wo ein korrektes Urteil als "nicht pruefbar" (Exit 2) verfiel,
+# weil der Parser nur die eine Schreibweise kannte. Das NICHT-Praefix wird zuerst
+# geprueft, weil ERFUELLT sein Teilstring ist.
+VERDICT_PAT='ERF(UE|U|Ü)LLT'
+if printf '%s' "$FIRSTLINE" | grep -qiE "NICHT[- ]?$VERDICT_PAT"; then
+  echo "NICHT-ERFUELLT (Modell: $MODEL_USED): ${REASON:-<keine Begruendung>}"
+  exit 1
+elif printf '%s' "$FIRSTLINE" | grep -qiE "$VERDICT_PAT"; then
+  echo "ERFUELLT (Modell: $MODEL_USED): ${REASON:-<keine Begruendung>}"
+  exit 0
+else
+  echo "NICHT PRUEFBAR: Modellantwort nicht eindeutig (Modell: $MODEL_USED):" >&2
+  printf '%s\n' "$VERDICT_RAW" >&2
+  exit 2
+fi

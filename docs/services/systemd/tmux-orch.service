@@ -1,0 +1,34 @@
+# TEMPLATE. Replace __USER__ in the install commands below; the unit itself needs no
+# substitution, because a systemd user unit already runs as you.
+#
+# Keeps a tmux session named 'wb-orch' alive across reboots and logouts on a Linux
+# machine, so that a lead session and its workers can be reached from the other machine
+# at any time. Without it, `ssh peer tmux attach` finds nothing after a reboot and every
+# worker pane that was running is gone with no trace.
+#
+# Install, as the normal user on the Linux machine:
+#   mkdir -p ~/.config/systemd/user
+#   cp tmux-orch.service ~/.config/systemd/user/
+#   loginctl enable-linger __USER__        # survive logout, start at boot
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now tmux-orch.service
+#
+# From the other machine you then reach it with
+#   ssh -t peer tmux new -A -s wb-orch
+# which attaches the running session and only creates one if it is genuinely gone.
+
+[Unit]
+Description=Persistent tmux session 'wb-orch' for agent orchestrator sessions
+After=default.target
+
+[Service]
+Type=forking
+# -A: attach if it exists, create otherwise. That is what keeps the session alive across
+# reconnects instead of stacking a second one next to it.
+ExecStart=/usr/bin/tmux new-session -d -s wb-orch -n orch
+ExecStop=/usr/bin/tmux kill-session -t wb-orch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

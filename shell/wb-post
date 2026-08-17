@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+# wb-post — das Postfach zwischen Orchestratoren. Eine Datei je Nachricht, ein
+# Postfach je Sitzung, und nichts davon haengt am Harness.
+#
+#   wb-post schreiben <ziel-sitzung> <text...>   Nachricht ablegen und zustellen lassen
+#   wb-post lesen [--sitzung <s>] [--alle]       das eigene Postfach lesen
+#   wb-post gelesen <kennung>… | --alle          als gelesen markieren
+#   wb-post postfaecher                          welche Sitzung hat wieviel Ungelesenes
+#
+# WARUM ES DAS GIBT (11.08.): Auf dieser Maschine laufen mehrere Werkbank-Sitzungen
+# nebeneinander, jede mit eigenem Orchestrator und eigenen Workern, und jede laedt
+# Modelle, ohne dass die andere davon weiss. In der Nacht zum 11.08. sind sich zwei
+# Sitzungen nur deshalb nicht ins Gehege gekommen, weil ihre Orchestratoren einander
+# zufaellig Nachrichten geschickt haben. Das soll die Werkbank koennen, statt es dem
+# Zufall zu ueberlassen.
+#
+# Der Weg, den es bisher gab, ist die Nachrichtenfunktion von Claude Code, und die
+# hat zwei Loecher: sie kennt nur Claude-Sitzungen, und ihre Adresse wird ungueltig,
+# sobald der andere Prozess neu startet — in derselben Nacht lief eine Antwort genau
+# so in einen toten Socket. Ein Postfach im Dateisystem hat beide Loecher nicht: die
+# Adresse ist der Sitzungsname, und die Nachricht ueberlebt jeden Neustart des
+# Empfaengers, weil sie liegen bleibt, bis er sie liest.
+#
+# AUSGEROLLT am 11.08. nach ~/.local/bin, nachdem der Orchestrator die Suiten selbst
+#   gefahren hat (31/0 hier, 59/0 beim Belegungsbuch) — gebaut hat es ein Worker, ueber
+#   das Ausrollen entscheidet der Orchestrator. Auf peer liegt es ebenfalls; es steht
+#   dafuer in der Liste von `wb-sync-setup`.
+#
+# DIE ZUSTELLUNG IN DEN PANE MACHT DIESES WERKZEUG NICHT SELBST, und das ist Absicht:
+# `wb-pane-write` ist die EINE Stelle, die entscheidet, wer in einen Pane schreiben
+# darf, und die einzige, die es tut; `pi-worker` geht denselben Weg und prueft dort
+# auch die Absendung. Ein zweiter Weg daneben waere ein Loch in genau der Sicherung,
+# die den Orchestrator-Chat schuetzt — Regel des Nutzers vom 06.08. lautet woertlich
+# „ich will das niemand ausser mir und dem kontext guard in den orchestrator chat
+# promptet". Dieses Werkzeug legt die Nachricht ab (das ist der haltbare Teil) und
+# bittet danach `wb-pane-write` um einen kurzen Hinweis in den Pane des Empfaengers.
+# Was daraus wurde, steht in der Antwort und in der Nachricht selbst.
+#
+# In aller Regel wird dieser Hinweis ABGELEHNT, weil der Empfaenger ein
+# Orchestrator-Pane ist. Das ist kein Fehlschlag: die Nachricht liegt im Postfach,
+# und der Empfaenger holt sie sich mit `wb-post lesen`. Zugestellt wird nie mit
+# Enter — es wird nichts abgeschickt, was in einem fremden Chat als Eingabe gilt.
+#
+# Der Text geht als stdin an `wb-pane-write`, nie ueber eine Shell-Zeile. Backticks
+# in einem Text, den man durch eine Shell-Ebene schickt, werden dort ausgefuehrt und
+# der Text kommt leer an, waehrend der Schreibvorgang Erfolg meldet (Standing Rule
+# vom 30.07.).
+#
+# ZUSTAND, atomar geschrieben (tempfile + os.replace, nie halb lesbar):
+#   ~/.local/state/wb-post/<sitzung>/<zeit>-<kennung>.json
+# Gelesene Nachrichten bleiben liegen und werden beim naechsten Schreiben in dasselbe
+# Postfach entfernt, sobald sie aelter als 14 Tage sind. Ungelesene werden nie
+# entfernt: eine Nachricht, die verschwindet, weil niemand hinsah, waere genau der
+# Fehler, gegen den dieses Werkzeug gebaut ist.
+#
+# NIEMAND WIRD HIER BEENDET, und nichts haengt: jeder Aufruf nach aussen hat ein
+# Zeitlimit.
+#
+# EXIT-CODES: 0 = erledigt (bei `lesen`: es lag etwas da), 1 = nichts da / nichts
+#             getroffen, 2 = Benutzungsfehler, 3 = Ablegen fehlgeschlagen.
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".local", "state", "wb-post")
+AUFBEWAHRUNG_TAGE = 14
+ERLAUBT = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+
+
+def fehler(text, code=2):
+    print("wb-post: " + text, file=sys.stderr)
+    sys.exit(code)
+
+
+def jetzt():
+    return time.time()
+
+
+def iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def kennung():
+    return os.urandom(3).hex()
+
+
+def slug(name):
+    """Ein Sitzungsname wird zum Verzeichnisnamen. '/' und alles Ungewohnte wird
+    ersetzt, und ein Name, der nur aus Punkten besteht, wird abgefangen: ein Pane
+    namens '../evil' hat am 28.07. schon einmal einen Testfall aus seinem
+    Verzeichnis heraus in laufende des Nutzers Sitzung geschrieben."""
+    s = "".join(c if c in ERLAUBT else "_" for c in (name or ""))
+    return s if s.strip(".") else "_"
+
+
+def atomar_schreiben(pfad, objekt):
+    os.makedirs(os.path.dirname(pfad), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(pfad), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(objekt, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, pfad)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ------------------------------------------------------------------- tmux
+
+def tmux_pfad():
+    """Dieselbe Vorsicht wie in shell/wb-belegung und im SessionStart-Haken: ein
+    Prozess ohne Login-Shell — ein launchd-Job etwa — hat /opt/homebrew/bin nicht
+    im PATH. Fehlt tmux ganz, faellt nur die Zustellung aus; abgelegt wird die
+    Nachricht trotzdem, und das ist der Teil, auf den es ankommt."""
+    p = shutil.which("tmux")
+    if p:
+        return p
+    for p in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
+        if os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def socket_wahl():
+    """Welcher tmux-Server ist gemeint? Der umgebende, wenn wir in einem Pane
+    sitzen ($TMUX traegt seinen Socketpfad im ersten Feld) — sonst der ueber
+    WB_TMUX_SOCKET benannte, denselben Namen liest `wb-pane-write` selbst aus der
+    Umgebung, beide Seiten schauen also auf denselben Server. Ohne beides der
+    Vorgabeserver.
+
+    Das ist nicht nur Kosmetik: ohne diese Wahl redet ein Aufruf ausserhalb von
+    tmux mit dem LAUFENDEN Server des Menschen. Beim ersten Rauchtest dieses
+    Werkzeugs ist genau das passiert — der Hinweis lief in lebenden des Nutzers
+    Orchestrator-Pane und wurde dort von `wb-pane-write` abgelehnt."""
+    tmux_env = os.environ.get("TMUX", "")
+    if tmux_env:
+        return ["-S", tmux_env.split(",")[0]]
+    name = os.environ.get("WB_TMUX_SOCKET", "")
+    return ["-L", name] if name else []
+
+
+def tmux_ruf(argumente, frist=3.0):
+    binaer = tmux_pfad()
+    if not binaer:
+        return 127, ""
+    befehl = [binaer] + socket_wahl()
+    befehl += argumente
+    try:
+        p = subprocess.run(befehl, capture_output=True, text=True, timeout=frist)
+        return p.returncode, p.stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return 126, ""
+
+
+def eigene_sitzung():
+    """Der BASIS-Sessionname, nicht `#{session_name}`: sobald der Worker-Tab offen
+    ist, haengt die Sitzung in einer Gruppe, und derselbe Pane meldet je nach
+    Augenblick mal 'wb-AI', mal 'wb-AI-view'. Dieselbe Messung und dieselbe
+    Begruendung wie in shell/pi-worker, shell/context-guard und shell/wb-belegung."""
+    wb = os.environ.get("WB_SESSION", "")
+    if wb:
+        return wb
+    pane = os.environ.get("TMUX_PANE", "")
+    if not pane:
+        return ""
+    rc, aus = tmux_ruf(["display", "-p", "-t", pane, "#{session_group}\t#{session_name}"])
+    if rc != 0 or not aus.strip():
+        return ""
+    teile = (aus.strip("\n").split("\t") + ["", ""])[:2]
+    return teile[0] or teile[1]
+
+
+def eigener_absender():
+    absender = {"sitzung": eigene_sitzung(),
+                "pane": os.environ.get("TMUX_PANE", ""),
+                "worker": "",
+                "host": os.uname().nodename.split(".")[0]}
+    if absender["pane"]:
+        rc, aus = tmux_ruf(["display", "-p", "-t", absender["pane"], "#{@wb_worker}"])
+        if rc == 0:
+            absender["worker"] = aus.strip()
+    return absender
+
+
+def wb_rolle_pfad():
+    """Dieselbe Reihenfolge wie bei `wb-pane-write`: ausdrueckliche Umlenkung,
+    installierte Fassung, Schwesterdatei im Arbeitsbaum."""
+    p = os.environ.get("WB_ROLLE", "")
+    if p:
+        if not os.access(p, os.X_OK):
+            fehler("WB_ROLLE zeigt auf '%s' — dort ist nichts Ausfuehrbares." % p)
+        return p
+    installiert = os.path.join(HOME, ".local", "bin", "wb-rolle")
+    if os.access(installiert, os.X_OK):
+        return installiert
+    nachbar = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wb-rolle")
+    return nachbar if os.access(nachbar, os.X_OK) else ""
+
+
+def rolle_aus_register(pane):
+    """Die wirksame Rolle laut Register, oder ''.
+
+    Die Pane-Option ist nur EINE der beiden Quellen. `wb-pane-write` fragt ueber
+    `wb-rolle lesen` beide und gibt dem Register sogar den Vorrang; wer hier nur auf
+    `#{@wb_role}` filtert, haelt einen laufenden Orchestrator, dessen Rolle nur im
+    Register steht, fuer eine tote Sitzung (Befund 16 des Pruefdurchgangs vom
+    11.08.). Die Nachricht laege dann richtig, aber der Hinweis unterbliebe."""
+    werkzeug = wb_rolle_pfad()
+    if not werkzeug:
+        return ""
+    befehl = [werkzeug]
+    sock = socket_wahl()
+    if sock[:1] == ["-L"]:
+        befehl += sock          # wb-rolle kennt -L, nicht -S; ohne beides folgt es $TMUX
+    befehl += ["lesen", pane]
+    try:
+        p = subprocess.run(befehl, capture_output=True, text=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    if p.returncode != 0:
+        return ""
+    for zeile in p.stdout.splitlines():
+        teile = zeile.split("\t")
+        if len(teile) >= 2 and teile[0] == "effektiv":
+            return teile[1].strip()
+    return ""
+
+
+def orchestrator_pane(ziel):
+    """Der lebende Orchestrator-Pane der Zielsitzung, oder ''. Gesucht wird ueber
+    die BASIS-Sitzung, damit die '-view'-Schwester eines gruppierten Fensters
+    denselben Treffer liefert.
+
+    Zwei Durchgaenge: erst die Pane-Option (eine einzige tmux-Abfrage), dann das
+    Register (ein Aufruf je lebendem Pane dieser Sitzung, deshalb nur, wenn der
+    erste Durchgang leer bleibt)."""
+    rc, aus = tmux_ruf(["list-panes", "-a", "-F",
+                        "#{session_group}\t#{session_name}\t#{@wb_role}\t#{pane_id}\t#{pane_dead}"])
+    if rc != 0:
+        return ""
+    kandidaten = []
+    for zeile in aus.splitlines():
+        teile = zeile.split("\t")
+        if len(teile) < 5:
+            continue
+        gruppe, name, rolle, pane, tot = teile[:5]
+        if (gruppe or name) != ziel or tot.strip() == "1":
+            continue
+        if rolle == "orchestrator":
+            return pane
+        kandidaten.append(pane)
+    for pane in kandidaten:
+        if rolle_aus_register(pane) == "orchestrator":
+            return pane
+    return ""
+
+
+def pane_write_pfad():
+    """Reihenfolge, absichtlich in dieser: eine ausdrueckliche Umlenkung, dann die
+    installierte Fassung, dann die Schwesterdatei neben diesem Werkzeug (solange es
+    nur im Repo lebt). Einen Rueckfall auf `tmux send-keys` gibt es NICHT — der
+    waere ein Loch, das offensteht, sobald jemand halb installiert, und genau das
+    haelt `pi-worker` mit derselben Begruendung so."""
+    p = os.environ.get("WB_PANE_WRITE", "")
+    if p:
+        if not os.access(p, os.X_OK):
+            fehler("WB_PANE_WRITE zeigt auf '%s' — dort ist nichts Ausfuehrbares." % p)
+        return p
+    installiert = os.path.join(HOME, ".local", "bin", "wb-pane-write")
+    if os.access(installiert, os.X_OK):
+        return installiert
+    nachbar = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wb-pane-write")
+    return nachbar if os.access(nachbar, os.X_OK) else ""
+
+
+def zustellen(ziel, nachricht):
+    """Best effort, ehrlich berichtet. Ein Hinweis, kein Text — und nie mit Enter."""
+    pane = orchestrator_pane(ziel)
+    if not pane:
+        return "kein lebender Orchestrator-Pane fuer '%s' gefunden — die Nachricht liegt im Postfach" % ziel
+    werkzeug = pane_write_pfad()
+    if not werkzeug:
+        return "wb-pane-write nicht gefunden — es wurde NICHTS in einen Pane geschrieben"
+    erste = (nachricht.get("betreff") or nachricht.get("text", "").strip().splitlines() or [""])[0]
+    hinweis = "[wb-post] Neue Nachricht von %s (%s): %s — lesen mit: wb-post lesen" % (
+        nachricht["von"].get("sitzung") or nachricht["von"].get("host", "?"),
+        nachricht["id"], erste[:120])
+    try:
+        p = subprocess.run([werkzeug, "einfuegen", pane], input=hinweis,
+                           capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return "wb-pane-write antwortete nicht (%s) — die Nachricht liegt im Postfach" % e
+    if p.returncode == 0:
+        return "Hinweis in Pane %s eingefuegt (ohne Enter)" % pane
+    if p.returncode == 77:
+        return ("Hinweis in Pane %s abgelehnt (Orchestrator-Schutz, wb-pane-write) — "
+                "so gedacht; die Nachricht liegt im Postfach" % pane)
+    return "wb-pane-write scheiterte (Exit %d: %s)" % (p.returncode,
+                                                       (p.stderr or "").strip()[:200])
+
+
+# ---------------------------------------------------------------- Postfach
+
+def postfach(ziel):
+    return os.path.join(STATE_DIR, slug(ziel))
+
+
+def nachrichten_lesen(ziel):
+    ordner = postfach(ziel)
+    liste = []
+    try:
+        namen = sorted(os.listdir(ordner))
+    except OSError:
+        return liste
+    for name in namen:
+        if not name.endswith(".json") or name.startswith("."):
+            continue
+        pfad = os.path.join(ordner, name)
+        try:
+            with open(pfad) as f:
+                n = json.load(f)
+        except (OSError, ValueError) as e:
+            # Eine unlesbare Datei wird uebergangen und nicht geloescht — sie ist
+            # der einzige Hinweis darauf, dass hier etwas schieflief. Und sie wird
+            # GEMELDET: bis zum 11.08. wurde sie nur uebergangen, und damit war die
+            # beschaedigte Nachricht fuer den Empfaenger unsichtbar. Das stand gegen
+            # den eigenen Anspruch dieses Werkzeugs, dass keine Nachricht
+            # verschwindet, weil niemand hinsah.
+            print("wb-post: WARNUNG: %s ist nicht lesbar (%s) — hier lag eine "
+                  "Nachricht, die niemand mehr zustellen kann." % (pfad, e),
+                  file=sys.stderr)
+            continue
+        if isinstance(n, dict):
+            n["_pfad"] = pfad
+            liste.append(n)
+    liste.sort(key=lambda n: n.get("zeit", 0))
+    return liste
+
+
+def alte_gelesene_entfernen(ziel):
+    grenze = jetzt() - AUFBEWAHRUNG_TAGE * 86400
+    for n in nachrichten_lesen(ziel):
+        if n.get("gelesen") and float(n.get("gelesen", 0)) < grenze:
+            try:
+                os.unlink(n["_pfad"])
+            except OSError:
+                pass
+
+
+def bekannte_ziele():
+    """(postfaecher, lebende_sitzungen). Beides Basisnamen, beides ohne Netz."""
+    try:
+        faecher = sorted(n for n in os.listdir(STATE_DIR)
+                         if os.path.isdir(os.path.join(STATE_DIR, n)))
+    except OSError:
+        faecher = []
+    sitzungen = []
+    rc, aus = tmux_ruf(["list-sessions", "-F", "#{session_group}\t#{session_name}"])
+    if rc == 0:
+        for zeile in aus.splitlines():
+            teile = (zeile.split("\t") + ["", ""])[:2]
+            name = teile[0] or teile[1]
+            if name and name not in sitzungen:
+                sitzungen.append(name)
+    return faecher, sorted(sitzungen)
+
+
+def ziel_pruefen(ziel):
+    """Ein Zielname, den weder ein Postfach noch eine laufende Sitzung kennt, ist
+    wahrscheinlich ein Tippfehler — und ein Tippfehler verschluckt die Nachricht
+    lautlos, weil die Zustellzeile Wort fuer Wort dieselbe ist wie bei einem
+    Empfaenger, der gerade nicht laeuft. Gemessen im Pruefdurchgang vom 11.08. mit
+    'wb-Al' statt 'wb-AI': Exit 0, ein neues Postfach, und niemand haette es gemerkt.
+
+    Gemeldet wird auf stderr und die Nachricht wird trotzdem abgelegt: sie koennte
+    fuer eine Sitzung gedacht sein, die es erst noch geben wird, und das ist ein
+    ausdruecklich vorgesehener Fall."""
+    faecher, sitzungen = bekannte_ziele()
+    if ziel in faecher or ziel in sitzungen:
+        return ""
+    bekannt = sorted(set(faecher) | set(sitzungen))
+    hinweis = ("WARNUNG: '%s' hat kein Postfach und es laeuft keine Sitzung dieses "
+               "Namens — moeglicherweise ein Tippfehler." % ziel)
+    if bekannt:
+        hinweis += "\n         Bekannt sind: %s" % ", ".join(bekannt)
+    hinweis += ("\n         Die Nachricht wurde trotzdem abgelegt; ist der Name falsch, "
+                "liest sie niemand.")
+    return hinweis
+
+
+def cmd_schreiben(a):
+    text = " ".join(a.text).strip() if a.text else ""
+    if not text or text == "-":
+        # Von stdin lesen, aber nie an einem Terminal darauf warten: ein Werkzeug,
+        # das im Leeren blockiert, ist genau das, was hier nie passieren darf.
+        if sys.stdin.isatty():
+            fehler("kein Text. `wb-post schreiben <sitzung> <text…>` oder den Text "
+                   "auf stdin.")
+        text = sys.stdin.read().strip()
+    if not text:
+        fehler("kein Text. `wb-post schreiben <sitzung> <text…>` oder den Text auf stdin.")
+    # VOR dem Ablegen: danach gibt es das Postfach, und die Pruefung liefe ins Leere.
+    tippfehler = ziel_pruefen(a.ziel)
+    absender = eigener_absender()
+    nachricht = {
+        "id": kennung(),
+        "an": a.ziel,
+        "von": absender,
+        "betreff": a.betreff,
+        "text": text,
+        "zeit": jetzt(),
+        "zeit_iso": iso(jetzt()),
+        "gelesen": None,
+        "zustellung": "",
+    }
+    pfad = os.path.join(postfach(a.ziel),
+                        "%d-%s.json" % (int(nachricht["zeit"]), nachricht["id"]))
+    try:
+        alte_gelesene_entfernen(a.ziel)
+        atomar_schreiben(pfad, nachricht)
+    except OSError as e:
+        fehler("die Nachricht liess sich nicht ablegen (%s)" % e, code=3)
+
+    if a.nur_ablegen:
+        nachricht["zustellung"] = "nur abgelegt (--nur-ablegen)"
+    else:
+        nachricht["zustellung"] = zustellen(a.ziel, nachricht)
+    try:
+        atomar_schreiben(pfad, nachricht)
+    except OSError:
+        pass   # Abgelegt ist sie; nur die Notiz ueber die Zustellung fehlt dann.
+
+    if tippfehler:
+        print("wb-post: " + tippfehler, file=sys.stderr)
+    if a.json:
+        nachricht["warnung"] = tippfehler
+        print(json.dumps({k: v for k, v in nachricht.items() if not k.startswith("_")},
+                         indent=2, ensure_ascii=False))
+        return 0
+    print("Abgelegt: %s -> Postfach '%s' (%s)" % (nachricht["id"], a.ziel, pfad))
+    print("Zustellung: %s" % nachricht["zustellung"])
+    return 0
+
+
+def cmd_lesen(a):
+    ziel = a.sitzung or eigene_sitzung()
+    if not ziel:
+        fehler("welches Postfach? Ausserhalb einer tmux-Sitzung braucht es "
+               "--sitzung <name>.")
+    alle = nachrichten_lesen(ziel)
+    zeigen = alle if a.alle else [n for n in alle if not n.get("gelesen")]
+    if a.json:
+        print(json.dumps({"sitzung": ziel,
+                          "nachrichten": [{k: v for k, v in n.items() if k != "_pfad"}
+                                          for n in zeigen],
+                          "ungelesen": len([n for n in alle if not n.get("gelesen")])},
+                         indent=2, ensure_ascii=False))
+    else:
+        if not zeigen:
+            print("Postfach '%s': nichts %s." % (ziel, "darin" if a.alle else "Ungelesenes"))
+        for n in zeigen:
+            von = n.get("von") or {}
+            alter = int((jetzt() - float(n.get("zeit", 0))) / 60)
+            print("--- %s  von %s%s  vor %d min%s"
+                  % (n.get("id"), von.get("sitzung") or von.get("host", "?"),
+                     (" (Worker '%s')" % von["worker"]) if von.get("worker") else "",
+                     alter, "  GELESEN" if n.get("gelesen") else ""))
+            if n.get("betreff"):
+                print("    Betreff: %s" % n["betreff"])
+            for zeile in (n.get("text") or "").splitlines():
+                print("    %s" % zeile)
+        if zeigen and not a.und_gelesen:
+            print()
+            print("Als gelesen markieren: wb-post gelesen %s"
+                  % " ".join(n.get("id", "") for n in zeigen))
+    if a.und_gelesen:
+        for n in zeigen:
+            markieren(n)
+    return 0 if zeigen else 1
+
+
+def markieren(n):
+    n = dict(n)
+    pfad = n.pop("_pfad")
+    n["gelesen"] = jetzt()
+    n["gelesen_iso"] = iso(n["gelesen"])
+    try:
+        atomar_schreiben(pfad, n)
+        return True
+    except OSError:
+        return False
+
+
+def cmd_gelesen(a):
+    ziel = a.sitzung or eigene_sitzung()
+    if not ziel:
+        fehler("welches Postfach? Ausserhalb einer tmux-Sitzung braucht es "
+               "--sitzung <name>.")
+    alle = nachrichten_lesen(ziel)
+    getroffen = [n for n in alle
+                 if (a.alle and not n.get("gelesen")) or n.get("id") in a.kennungen]
+    if not getroffen:
+        print("wb-post: nichts zu markieren.", file=sys.stderr)
+        return 1
+    erledigt = [n.get("id") for n in getroffen if markieren(n)]
+    if a.json:
+        print(json.dumps({"gelesen": erledigt}, indent=2, ensure_ascii=False))
+    else:
+        print("Als gelesen markiert: %s" % ", ".join(erledigt))
+    return 0 if erledigt else 1
+
+
+def cmd_postfaecher(a):
+    faecher = []
+    try:
+        namen = sorted(os.listdir(STATE_DIR))
+    except OSError:
+        namen = []
+    for name in namen:
+        if not os.path.isdir(os.path.join(STATE_DIR, name)):
+            continue
+        alle = nachrichten_lesen(name)
+        offen = [n for n in alle if not n.get("gelesen")]
+        faecher.append({"sitzung": name, "gesamt": len(alle), "ungelesen": len(offen),
+                        "juengste": max([n.get("zeit", 0) for n in alle] or [0])})
+    if a.json:
+        print(json.dumps({"postfaecher": faecher}, indent=2, ensure_ascii=False))
+        return 0
+    if not faecher:
+        print("Kein Postfach angelegt.")
+        return 0
+    for f in faecher:
+        alter = int((jetzt() - f["juengste"]) / 60) if f["juengste"] else 0
+        print("  %-28s %d ungelesen von %d  (juengste vor %d min)"
+              % (f["sitzung"], f["ungelesen"], f["gesamt"], alter))
+    return 0
+
+
+def argumente_schreiben(argv):
+    """`schreiben` wird von Hand zerlegt, nicht von argparse.
+
+    Der Grund ist gemessen: mit `nargs='*'` fuer den freien Text bricht argparse mit
+    'unrecognized arguments' ab, sobald eine Option NEBEN dem Text steht — die
+    Nachricht ginge dann gar nicht erst raus, und das ist der teuerste Fehlerfall,
+    den dieses Werkzeug haben kann. Hier ist der Text das Wichtigste und darf
+    ueberall stehen; '--' beendet die Optionen, falls der Text selbst mit zwei
+    Strichen beginnt."""
+    a = argparse.Namespace(befehl="schreiben", ziel="", text=[], betreff="",
+                           nur_ablegen=False, json=False, hilfe=False)
+    rest, nur_text = [], False
+    i = 0
+    while i < len(argv):
+        t = argv[i]
+        if nur_text:
+            rest.append(t)
+        elif t == "--":
+            nur_text = True
+        elif t == "--betreff":
+            i += 1
+            if i >= len(argv):
+                fehler("--betreff erwartet einen Text.")
+            a.betreff = argv[i]
+        elif t.startswith("--betreff="):
+            a.betreff = t.split("=", 1)[1]
+        elif t == "--nur-ablegen":
+            a.nur_ablegen = True
+        elif t == "--json":
+            a.json = True
+        elif t in ("-h", "--help", "--hilfe"):
+            a.hilfe = True
+        elif t.startswith("--"):
+            fehler("unbekannte Option '%s' (nach '--' gilt alles als Text)." % t)
+        else:
+            rest.append(t)
+        i += 1
+    if not a.hilfe:
+        if not rest:
+            fehler("wb-post schreiben <ziel-sitzung> <text…>")
+        a.ziel, a.text = rest[0], rest[1:]
+    return a
+
+
+def main(argv):
+    p = argparse.ArgumentParser(
+        prog="wb-post",
+        description="Postfach zwischen Orchestratoren: schreiben, lesen, als gelesen "
+                    "markieren. Haengt nicht am Harness.")
+    sub = p.add_subparsers(dest="befehl")
+
+    p_s = sub.add_parser("schreiben", help="Nachricht in ein fremdes Postfach legen")
+    p_s.add_argument("ziel", help="Sitzungsname des Empfaengers (Basisname, z. B. wb-AI)")
+    p_s.add_argument("text", nargs="*", help="der Text; '-' oder leer liest von stdin")
+    p_s.add_argument("--betreff", default="")
+    p_s.add_argument("--nur-ablegen", action="store_true",
+                     help="keinen Hinweis in den Pane des Empfaengers versuchen")
+    p_s.add_argument("--json", action="store_true")
+
+    p_l = sub.add_parser("lesen", help="das eigene Postfach lesen")
+    p_l.add_argument("--sitzung", default="")
+    p_l.add_argument("--alle", action="store_true", help="auch schon Gelesenes")
+    p_l.add_argument("--und-gelesen", action="store_true",
+                     help="das Gezeigte gleich als gelesen markieren")
+    p_l.add_argument("--json", action="store_true")
+
+    p_g = sub.add_parser("gelesen", help="Nachrichten als gelesen markieren")
+    p_g.add_argument("kennungen", nargs="*")
+    p_g.add_argument("--sitzung", default="")
+    p_g.add_argument("--alle", action="store_true")
+    p_g.add_argument("--json", action="store_true")
+
+    p_p = sub.add_parser("postfaecher", help="welche Sitzung hat wieviel Ungelesenes")
+    p_p.add_argument("--json", action="store_true")
+
+    if argv[:1] == ["schreiben"]:
+        a = argumente_schreiben(argv[1:])
+        if a.hilfe:
+            p_s.print_help()
+            return 0
+        os.makedirs(STATE_DIR, exist_ok=True)
+        return cmd_schreiben(a)
+
+    a = p.parse_args(argv)
+    if not a.befehl:
+        p.print_help()
+        return 2
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if a.befehl == "lesen":
+        return cmd_lesen(a)
+    if a.befehl == "gelesen":
+        if not a.kennungen and not a.alle:
+            fehler("wb-post gelesen <kennung>… — oder --alle.")
+        return cmd_gelesen(a)
+    if a.befehl == "postfaecher":
+        return cmd_postfaecher(a)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

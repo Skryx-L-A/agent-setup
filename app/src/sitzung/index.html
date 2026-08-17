@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Dieselbe Strenge wie in den beiden anderen Fenstern: nur das eigene
+         Buendel, nichts aus dem Netz, kein Rahmen. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:"
+    />
+    <title>Agent Workbench — Sessions</title>
+    <style>
+      /* EINE Seite (Umbau 06.08.). Die Zwei-Seiten-Form mit Seitenliste links
+         ist weg: das Fenster beantwortet eine einzige Frage -- welche Sitzung --,
+         und dafuer ist eine Liste mit einem Knopf darunter genug. Die Farben
+         bleiben die des Einstellungsfensters
+         (app/src/einstellungen/index.html), damit zwei Fenster desselben
+         Programms wie zwei Fenster desselben Programms aussehen. */
+      :root {
+        color-scheme: dark;
+        --grund: #101216;
+        --leiste: #171a20;
+        --linie: #262b34;
+        --schrift: #d8dee9;
+        --gedaempft: #8b93a1;
+        --laeuft: #46a758;
+        --will: #e0a020;
+        --aus: #d24c4c;
+        --fern: #6a7fd0;
+        --wahl: #222833;
+        /* Die zwei Sitzungszustaende, die dieses Fenster als eigene Marke
+           zeigt (Farben durchreichen, 11.08.) -- vom Menschen gewaehlt
+           (Einstellungen, Seite "Aussehen") und von main/thema.ts je Thema
+           kontrastangepasst nachgezogen (siehe das Skript am Ende der Datei).
+           Die Werte hier sind nur die Vorgabe fuer den einen Wimpernschlag vor
+           dem ersten `awb:thema-neu`. */
+        --zustand-laeuft: #4ea1ff;
+        --zustand-wartet: #e0a33e;
+      }
+      /* HELL UND DUNKEL, dieselbe Mechanik wie im Einstellungsfenster
+         (app/src/einstellungen/index.html): `data-thema` traegt den von
+         main/thema.ts AUFGELOESTEN Wert ('hell'/'dunkel'), nie 'system'.
+         sitzung.ts fasst diese Datei nicht an (Sprachschicht) -- die
+         Anwendung steht deshalb als eigenes Skript unten, nicht dort. */
+      :root[data-thema='hell'] {
+        color-scheme: light;
+        --grund: #ffffff;
+        --leiste: #f4f5f7;
+        --linie: #d8dbe1;
+        --schrift: #1b1f27;
+        --gedaempft: #5c6472;
+        --laeuft: #22803c;
+        --will: #9a6600;
+        --aus: #b3261e;
+        --fern: #3355c4;
+        --wahl: #e4e8f4;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--grund);
+        color: var(--schrift);
+        overflow: hidden;
+      }
+      body {
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        display: flex;
+        flex-direction: column;
+      }
+
+      /* Kopfzeile: links die Ueberschrift, RECHTS der neue Start.
+         Feld und Knopf stehen in EINER Zeile nebeneinander (Wahl des Nutzers
+         „oben rechts", 06.08.). Nebeneinander statt untereinander, weil ein
+         eigener Block darunter eine dritte Kopfzeile gekostet haette -- und
+         weil beide zusammengehoeren: der Name gilt genau dem Start, den der
+         Knopf ausloest. Die Liste darunter bleibt dabei so breit wie vorher;
+         die Kopfzeile liegt UEBER ihr, nicht daneben. */
+      #kopf {
+        flex: 0 0 auto;
+        padding: 16px 22px 10px;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-start;
+        gap: 10px 16px;
+      }
+      #kopf .titel {
+        flex: 1 1 260px;
+        min-width: 0;
+      }
+      #kopf h1 {
+        font-size: 16px;
+        font-weight: 600;
+        margin: 0 0 2px;
+      }
+      #kopf .unterzeile {
+        color: var(--gedaempft);
+        margin: 0;
+      }
+      #kopf .start {
+        flex: 0 1 auto;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      #kopf .start input[type='text'] {
+        flex: 0 1 240px;
+        min-width: 120px;
+      }
+      /* Die Maschinenwahl vor „Neue Sitzung …" -- nur da, wenn
+         settings.remoteMachines wenigstens einen Eintrag traegt (sitzung.ts).
+         Sonst gibt es hier gar kein Element, kein leerer Waehler fuer einen
+         Ein-Rechner-Nutzer. */
+      #kopf .start select {
+        font: inherit;
+        background: var(--grund);
+        color: var(--schrift);
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 5px 6px;
+        flex: 0 0 auto;
+      }
+
+      /* Der Pfad auf einer FERNEN Maschine: kein nativer Dialog kann dort
+         waehlen, also ein Textfeld mit einem eigenen Pruefen-Knopf. Nur
+         gezeichnet, solange die Maschinenwahl NICHT auf der eigenen Maschine
+         steht (sitzung.ts, `zeichneFernZeile`). */
+      #neu-fern {
+        flex: 0 0 auto;
+        padding: 0 22px 10px;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+      }
+      #neu-fern input[type='text'] {
+        flex: 1 1 320px;
+        min-width: 160px;
+      }
+      #neu-fern .fernstatus {
+        color: var(--gedaempft);
+        flex: 1 1 160px;
+        min-width: 0;
+      }
+
+      /* --- Suche, Zustand und Maschine ----------------------------------- */
+      #filter {
+        flex: 0 0 auto;
+        padding: 0 22px 10px;
+      }
+      .filterzeile {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-bottom: 6px;
+      }
+      .filterzeile button {
+        font: inherit;
+        background: transparent;
+        color: var(--gedaempft);
+        border: 1px solid var(--linie);
+        border-radius: 10px;
+        padding: 3px 10px;
+        cursor: pointer;
+      }
+      .filterzeile button.gewaehlt {
+        background: var(--wahl);
+        border-color: var(--fern);
+        color: var(--schrift);
+      }
+      #such-feld {
+        width: 100%;
+        box-sizing: border-box;
+      }
+
+      /* Der eine Knopf, fuer den es dieses Fenster gibt: gefuellt statt
+         umrandet. Ruhig -- eine Flaeche, kein Leuchten, keine Bewegung. */
+      .knopf.haupt {
+        background: var(--fern);
+        border-color: var(--fern);
+        color: #0b0e13;
+        font-weight: 600;
+      }
+      .knopf.haupt:hover:not(:disabled) {
+        background: #7d90da;
+        border-color: #7d90da;
+      }
+      .knopf.haupt:disabled {
+        background: #39415c;
+        border-color: #39415c;
+        color: #8b93a1;
+      }
+
+      /* --- die Liste der Gruppen --------------------------------------- */
+      #gruppen {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        margin: 0 22px;
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        background: var(--grund);
+      }
+      .gruppe {
+        border-bottom: 1px solid var(--linie);
+      }
+      .gruppe:last-child {
+        border-bottom: 0;
+      }
+      /* Der Ordner steht EINMAL, ueber seinen Sitzungen. In den Zeilen darunter
+         stuende er nur noch einmal dasselbe. */
+      .gruppenkopf {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        padding: 6px 10px 2px;
+        background: var(--leiste);
+      }
+      .gruppenkopf .ordner {
+        font-weight: 600;
+        flex: 0 0 auto;
+      }
+      .gruppenkopf .pfad {
+        color: var(--gedaempft);
+        flex: 1 1 auto;
+        min-width: 0;
+        word-break: break-all;
+      }
+      /* Wieviele Sitzungen dieser Ordner traegt -- eine Auskunft, kein Knopf.
+         Der Ausklapp-Knopf, der hier stand, ist am 11.08. weggefallen: es ist
+         nichts mehr aufzuklappen (siehe den Kopf von sitzung.ts). */
+      .gruppenkopf .anzahl {
+        flex: 0 0 auto;
+        color: var(--gedaempft);
+        white-space: nowrap;
+      }
+
+      .listenzeile {
+        display: block;
+        width: 100%;
+        box-sizing: border-box;
+        text-align: left;
+        font: inherit;
+        background: transparent;
+        color: var(--schrift);
+        border: 0;
+        border-top: 1px solid transparent;
+        padding: 5px 10px 7px;
+        cursor: pointer;
+      }
+      .listenzeile:hover {
+        background: #1e232b;
+      }
+      .listenzeile.gewaehlt {
+        background: var(--wahl);
+      }
+      .listenzeile.gewaehlt .zeile1 {
+        font-weight: 600;
+      }
+      /* Alle Zeilen einer Gruppe sehen gleich aus. Die zweite war bis zum
+         11.08. eingerueckt, weil sie „unter" der juengsten hing; seit alle
+         gleichrangig dastehen, waere die Einrueckung eine Rangfolge, die es
+         nicht gibt. Getrennt werden sie durch die Linie. */
+      .listenzeile + .listenzeile {
+        border-top-color: var(--linie);
+      }
+      /* Eine Sitzung, die nicht zurueckkommen kann, bleibt SICHTBAR und
+         anklickbar -- ihr Grund steht unten. Ausgegraut und stumm hiesse:
+         raten, warum sie fehlt. */
+      .listenzeile.tot .zeile1 {
+        color: var(--gedaempft);
+      }
+      .listenzeile .zeile1 {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .listenzeile .zeile2 {
+        color: var(--gedaempft);
+        margin-top: 1px;
+      }
+      .marke {
+        flex: 0 0 auto;
+        color: var(--gedaempft);
+        border: 1px solid var(--linie);
+        border-radius: 3px;
+        padding: 0 6px;
+        white-space: nowrap;
+      }
+      .marke.laeuft {
+        border-color: var(--zustand-laeuft);
+        color: var(--zustand-laeuft);
+      }
+      .marke.wartet {
+        border-color: var(--zustand-wartet);
+        color: var(--zustand-wartet);
+      }
+      .marke.fern {
+        border-color: var(--aus);
+        color: var(--aus);
+      }
+      .leerhinweis {
+        color: var(--gedaempft);
+        padding: 10px;
+      }
+
+      /* --- die Fusszeile: was mit der Wahl geschieht, und der neue Start */
+      #fuss {
+        flex: 0 0 auto;
+        padding: 10px 22px 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      #fuss .reihe {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px;
+      }
+      #fort-grund {
+        flex: 1 1 240px;
+        min-width: 0;
+        color: var(--gedaempft);
+      }
+      input[type='text'] {
+        font: inherit;
+        background: var(--grund);
+        color: var(--schrift);
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 5px 8px;
+        flex: 1 1 200px;
+        min-width: 140px;
+      }
+      input:focus {
+        outline: 1px solid var(--fern);
+        outline-offset: -1px;
+      }
+      .knopf {
+        font: inherit;
+        background: transparent;
+        color: var(--schrift);
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        padding: 5px 12px;
+        cursor: pointer;
+        flex: 0 0 auto;
+      }
+      .knopf:hover:not(:disabled) {
+        background: #1e232b;
+      }
+      .knopf.tun {
+        border-color: var(--laeuft);
+        color: var(--laeuft);
+      }
+      /* Beenden -- Warnfarbe wie die Marke "fern", denn anders als beim
+         Loeschen ist hier nichts unwiderruflich (die Zustandsdatei bleibt),
+         aber es ist trotzdem ein Eingriff in eine laufende Sitzung, keine
+         beilaeufige Handlung. */
+      .knopf.stop {
+        border-color: var(--aus);
+        color: var(--aus);
+      }
+      .knopf:disabled {
+        color: #5d6675;
+        border-color: #333a45;
+        cursor: not-allowed;
+      }
+
+      /* --- Fusszeile des Fensters: was zuletzt geschah ------------------ */
+      #statuszeile {
+        flex: 0 0 auto;
+        border-top: 1px solid var(--linie);
+        background: var(--leiste);
+        padding: 5px 14px;
+        color: var(--gedaempft);
+        min-height: 17px;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      #statuszeile.fehler {
+        color: var(--aus);
+      }
+      #statuszeile.gut {
+        color: var(--laeuft);
+      }
+    </style>
+  </head>
+  <body>
+    <header id="kopf">
+      <div class="titel">
+        <h1 id="kopf-titel"></h1>
+        <p class="unterzeile" id="kopf-unterzeile"></p>
+      </div>
+      <div class="start" id="kopf-start">
+        <input type="text" id="neu-name" spellcheck="false" />
+        <button type="button" class="knopf haupt" id="neu-start"></button>
+        <!-- Der zweite Weg (12.08.): eine Chat-Sitzung. Kein tmux, kein Pane --
+             sie laeuft als Prozess dieser App in einem eigenen Fenster. Steht
+             neben dem ersten Knopf, weil beides „neue Sitzung" heisst und die
+             Wahl zwischen ihnen die einzige ist, die der Mensch hier trifft. -->
+        <button type="button" class="knopf" id="neu-chat"></button>
+      </div>
+    </header>
+    <div id="neu-fern" style="display: none">
+      <input type="text" id="neu-fern-pfad" list="neu-fern-ordner" spellcheck="false" />
+      <!-- Vorschlaege aus den SCHON BEKANNTEN Sitzungen dieser Maschine (sitzung.ts,
+           `zeichneFernZeile`) -- nichts geraten, nur was schon einmal getippt wurde. -->
+      <datalist id="neu-fern-ordner"></datalist>
+      <button type="button" class="knopf" id="neu-fern-pruefen"></button>
+      <span class="fernstatus" id="neu-fern-status"></span>
+    </div>
+    <div id="filter">
+      <div id="maschine-chips" class="filterzeile"></div>
+      <div id="zustand-chips" class="filterzeile"></div>
+      <input type="text" id="such-feld" spellcheck="false" />
+    </div>
+    <main id="gruppen"></main>
+    <div id="fuss">
+      <div class="reihe">
+        <div id="fort-grund"></div>
+        <button type="button" class="knopf stop" id="beenden-start"></button>
+        <button type="button" class="knopf tun" id="fort-start"></button>
+      </div>
+    </div>
+    <div id="statuszeile"></div>
+    <!-- Testsonde fuer Thema und Zustandsfarben (thema-anwenden.ts). Kein
+         eigener Testkanal noetig: der bestehende Testhaken in sitzung.ts,
+         `window.__awbSitzung.zustand(auswahl)`, liest das `.value` jeder
+         Auswahl bereits. -->
+    <input type="hidden" id="thema-testsonde" value="" />
+    <script src="sitzung.js"></script>
+    <script src="thema-anwenden.js"></script>
+  </body>
+</html>

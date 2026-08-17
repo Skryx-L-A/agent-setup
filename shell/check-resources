@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# check-resources — machine-aware compute/resource snapshot for cross-machine orchestration.
+#
+# Modes:
+#   check-resources            JSON (machine-readable, default)
+#   check-resources --human    human-readable summary
+#   check-resources --guard    KEY=VALUE lines for run-on (shell-parseable, no jq needed)
+#
+# Machine-detecting (Darwin vs Linux). Reports free VRAM, free RAM, running GPU
+# processes, loaded ollama models, and a PROTECTED list of services/processes that
+# must NEVER be stopped (peer: a protected service — RoBERTa Polarschern veto).
+#
+# Test hook: CR_ASSUME_NEWS_CLF_ACTIVE=1 forces a protected service into the protected list
+# (for reproducibly exercising run-on's refusal path outside market hours).
+#
+# NACHTRAG 16.08.2026 (siehe shell/wb-belegung, Konstante OLLAMA_STABIL_SCHWELLE_S):
+# das Buch von wb-belegung sah Ollama-Ladungen nicht, weil diese Datei zwar schon
+# `ollama_loaded` mit ECHTER Groesse aus `/api/ps` lieferte, aber wb-belegung diese
+# Antwort nie las. Beim Nachziehen dort fiel eine zweite Luecke auf, HIER: `ollama
+# ps` (die Namensliste) und der Aufruf gegen `/api/ps` (die Groessen) sind zwei
+# getrennte Befehle gegen denselben Daemon. Scheitert nur der zweite -- der Server
+# antwortet auf `ollama ps`, aber `/api/ps` nicht -- blieb OLLAMA_LOADED_JSON
+# stillschweigend leer, ununterscheidbar von "wirklich nichts geladen". Genau das
+# ist der Fehler, vor dem die Kontextwache warnt: unbekannt wird zu frei. Deshalb
+# jetzt OLLAMA_LOADED_NOTE, nur in diesem einen Fall gesetzt -- nicht, wenn der
+# Server schlicht nicht laeuft (dann ist "nichts geladen" keine Vermutung, sondern
+# so sicher wie ein Server ohne Prozess).
+#
+# STAND DIESER DATEI: bislang nur nach ~/.local/bin ausgerollt, nie im Repo verfolgt
+# (im Unterschied zu wb-belegung, das seit dem 11.08. hier UND dort liegt). Diese
+# Fassung liegt jetzt zusaetzlich hier, mit dem Nachtrag; das Ausrollen der neuen
+# Fassung nach ~/.local/bin bleibt Entscheidung des Orchestrators (dieselbe Trennung
+# wie im Kopf von wb-belegung: bauen tut ein Worker, ausrollen der Orchestrator).
+set -euo pipefail
+
+MODE=json
+case "${1:-}" in
+  --human|-h) MODE=human ;;
+  --guard)    MODE=guard ;;
+  --json|"")  MODE=json ;;
+  *) echo "check-resources: unknown arg '$1' (use --human|--guard)" >&2; exit 2 ;;
+esac
+
+OS="$(uname -s)"
+HOST="$(hostname -s 2>/dev/null || hostname)"
+
+MACHINE=""
+GPU_KIND=""
+# GPU_UTIL leer = nicht gemessen. Wird als JSON-null ausgegeben, nie als 0 —
+# eine 0 waere von "GPU ist im Leerlauf" nicht zu unterscheiden (2026-08-07).
+VRAM_FREE=0; VRAM_TOTAL=0; GPU_UTIL=""; VRAM_NOTE=""
+RAM_FREE=0;  RAM_TOTAL=0
+GPU_PROCS_JSON="[]"
+OLLAMA_JSON="[]"; OLLAMA_LOADED_JSON="[]"; OLLAMA_NOTE=""; OLLAMA_LOADED_NOTE=""
+OLLAMA_LOCAL=null
+PROTECTED_JSON="[]"; PROTECTED_ACTIVE=0; PROTECTED_NAMES=""
+
+# ---- ollama (both platforms) ----
+# Wer bedient Port 11434 auf DIESER Maschine? Antwort: der Befehlsname des
+# lauschenden Prozesses, oder leer, wenn er sich nicht ermitteln laesst.
+#
+# Anlass (16.08.2026, gemessen): auf peer lauscht dort ein `ssh` -- ein
+# Portforward zum Mac, aufgebaut, damit die Scout-Agenten das Embedding-Modell
+# erreichen. `ollama ps` und /api/ps antworten also, aber sie beschreiben die
+# GPU einer ANDEREN Maschine. Ohne diese Pruefung haette wb-belegung auf peer
+# die Ladungen des Macs als lokale Belegung verrechnet und Auftraege abgelehnt,
+# die dort problemlos gepasst haetten -- und eine echte peer-Ladung waere
+# unsichtbar geblieben, weil der Port schon belegt ist. Es ist derselbe
+# Fehlertyp wie "unbekannt wird zu frei", nur andersherum: fremd wird zu eigen.
+ollama_listener() {
+  local out=""
+  if [ "$OS" = "Linux" ]; then
+    # -H unterdrueckt die Kopfzeile; das Prozessfeld sieht aus wie
+    # users:(("ssh",pid=123,fd=4)) -- daraus der Name in den Anfuehrungen.
+    out="$(ss -lntpH 'sport = :11434' 2>/dev/null \
+      | sed -n 's/.*users:((\"\([^\"]*\)\".*/\1/p' | head -1)"
+  else
+    # -F c gibt je Prozess eine Zeile "c<befehlsname>".
+    out="$(lsof -nP -iTCP:11434 -sTCP:LISTEN -F c 2>/dev/null \
+      | sed -n 's/^c//p' | head -1)"
+  fi
+  printf '%s' "$out"
+}
+
+# Hinweise sammeln statt ueberschreiben: die Herkunft des Ports und ein
+# Lesefehler auf /api/ps sind zwei verschiedene Aussagen, und die zweite darf
+# die erste nicht verschlucken.
+note_add() {
+  if [ -z "$OLLAMA_LOADED_NOTE" ]; then OLLAMA_LOADED_NOTE="$1"
+  else OLLAMA_LOADED_NOTE="$OLLAMA_LOADED_NOTE; $1"; fi
+}
+
+collect_ollama() {
+  if ! command -v ollama >/dev/null 2>&1; then OLLAMA_NOTE="ollama not installed"; return; fi
+  local ops
+  if ! ops="$(ollama ps 2>/dev/null)" || printf '%s' "$ops" | grep -qi "could not connect"; then
+    # Der Server ist bestaetigt NICHT erreichbar -- dann ist "nichts geladen"
+    # keine Vermutung, sondern so sicher wie ein Prozess, der nicht laeuft. Kein
+    # Versuch gegen :11434, der nur eine zweite Art desselben Nein waere.
+    OLLAMA_NOTE="ollama server not running"
+    return
+  fi
+  OLLAMA_JSON="$(printf '%s\n' "$ops" | awk 'NR>1 && NF>0{print $1}' \
+    | jq -R -s 'split("\n")|map(select(length>0))' 2>/dev/null || echo "[]")"
+  [ -n "$OLLAMA_JSON" ] || OLLAMA_JSON="[]"
+  # Namen allein reichen nicht: wer entscheiden will, ob ein geladenes Modell
+  # die GPU wirklich belegt, braucht seine Groesse. Ohne sie bleibt nur eine
+  # gepflegte Ausnahmeliste, und eine Sauberkeitspruefung mit Ausnahmeliste ist
+  # die falsche Konstruktion (Standing Rule 2026-07-29). q8_0-Embedder wiegen
+  # unter 1 GiB, ein 35B-Coder ueber 20 -- ein Schwellwert trennt das sauber
+  # und braucht keine Pflege (2026-08-08). expires_at (Nachtrag 16.08.) ist die
+  # maschinenlesbare UNTIL-Spalte: wb-belegung braucht sie, um eine Ladung, die
+  # gleich von selbst ablaeuft, nicht wie einen Dauerhalter zu behandeln.
+  # Bedient ein lokaler ollama den Port, oder zeigt er woandershin? Die Antwort
+  # entscheidet nicht ueber die SICHTBARKEIT der Ladungen (die bleibt, sie ist
+  # nuetzlich), sondern darueber, ob sie fuer die Vergabe auf DIESER Maschine
+  # zaehlen duerfen. Drei Faelle, wie ueberall in dieser Datei: bestaetigt
+  # lokal, bestaetigt fremd, nicht ermittelbar -- und der dritte wird nie
+  # stillschweigend zum ersten.
+  local listener
+  listener="$(ollama_listener)"
+  case "$listener" in
+    ollama)      OLLAMA_LOCAL=true ;;
+    "")          OLLAMA_LOCAL=null
+                 OLLAMA_LOADED_NOTE="wer Port 11434 bedient, war nicht zu ermitteln — die Ladungen zaehlen nicht als lokal" ;;
+    *)           OLLAMA_LOCAL=false
+                 OLLAMA_LOADED_NOTE="Port 11434 wird von '$listener' bedient, nicht von ollama — die Ladungen liegen auf einer ANDEREN Maschine" ;;
+  esac
+  local roh
+  if roh="$(curl -sf --max-time 2 http://localhost:11434/api/ps 2>/dev/null)"; then
+    OLLAMA_LOADED_JSON="$(printf '%s' "$roh" \
+      | jq -c '[.models[]? | {name: .name, size_mib: ((.size // 0) / 1048576 | floor), expires_at: (.expires_at // null)}]' \
+      2>/dev/null || echo "")"
+    if [ -z "$OLLAMA_LOADED_JSON" ] || [ "$OLLAMA_LOADED_JSON" = "null" ]; then
+      OLLAMA_LOADED_JSON="[]"
+      note_add "/api/ps antwortete, aber nicht als lesbares JSON"
+    fi
+  else
+    # Der Server hat gerade noch auf 'ollama ps' geantwortet -- hier koennte
+    # also etwas geladen sein, das diese Antwort nicht zeigt. UNBEKANNT, nicht
+    # "nichts geladen": genau die Unterscheidung, die dieser Nachtrag bringt.
+    OLLAMA_LOADED_JSON="[]"
+    note_add "der Server antwortet auf 'ollama ps', /api/ps aber nicht (in 2s)"
+  fi
+}
+
+if [ "$OS" = "Linux" ]; then
+  MACHINE="peer"; [ "$HOST" = "Peer-Rechner" ] || MACHINE="$(printf '%s' "$HOST" | tr 'A-Z' 'a-z')"
+  GPU_KIND="cuda"
+
+  RAM_TOTAL=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024 ))
+  RAM_FREE=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1024 ))
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    read -r VRAM_FREE VRAM_TOTAL GPU_UTIL < <(
+      nvidia-smi --query-gpu=memory.free,memory.total,utilization.gpu \
+        --format=csv,noheader,nounits 2>/dev/null | head -1 | awk -F', ' '{print $1, $2, $3}')
+    : "${VRAM_FREE:=0}" "${VRAM_TOTAL:=0}" "${GPU_UTIL:=0}"
+    GPU_PROCS_JSON="$(nvidia-smi --query-compute-apps=pid,process_name,used_memory \
+        --format=csv,noheader,nounits 2>/dev/null \
+      | jq -R -s 'split("\n")|map(select(length>0))
+                  |map(split(", ")|{pid:(.[0]|tonumber?),name:.[1],used_mib:(.[2]|tonumber?)})' 2>/dev/null || echo "[]")"
+    [ -n "$GPU_PROCS_JSON" ] || GPU_PROCS_JSON="[]"
+  fi
+
+  # PROTECTED: a protected service (RoBERTa Polarschern veto for a machine-bound project)
+  news_act=""
+  if command -v systemctl >/dev/null 2>&1; then
+    news_act="$(systemctl --user is-active a protected service 2>/dev/null || true)"
+  fi
+  [ "${CR_ASSUME_NEWS_CLF_ACTIVE:-0}" = "1" ] && news_act="active"
+  if [ "$news_act" = "active" ]; then
+    PROTECTED_ACTIVE=1; PROTECTED_NAMES="a protected service"
+    news_pids="$(nvidia-smi --query-compute-apps=pid,process_name,used_memory \
+        --format=csv,noheader,nounits 2>/dev/null | awk -F', ' '/news-llm/{print $1}' | paste -sd, - 2>/dev/null || true)"
+    PROTECTED_JSON="$(jq -n --arg n a protected service --arg pids "${news_pids:-}" \
+      --arg d "systemd user service a protected service — RoBERTa Polarschern veto for a machine-bound project; ~5.6 GB VRAM resident at market-open; NEVER stop it" \
+      '[{name:$n, active:true, detail:$d, pids:($pids|split(",")|map(select(length>0)|tonumber?))}]')"
+  fi
+
+  collect_ollama
+
+elif [ "$OS" = "Darwin" ]; then
+  MACHINE="mac"
+  GPU_KIND="unified"
+  VRAM_NOTE="unified memory — MLX/Metal share system RAM; free RAM is the VRAM proxy"
+
+  PAGE="$(sysctl -n hw.pagesize)"; MEMSIZE="$(sysctl -n hw.memsize)"
+  vms="$(vm_stat)"
+  getp() { printf '%s\n' "$vms" | awk -v k="$1" '$0 ~ k {gsub("[^0-9]","",$NF); print $NF; exit}'; }
+  FREEP="$(getp 'Pages free')";        : "${FREEP:=0}"
+  INACT="$(getp 'Pages inactive')";    : "${INACT:=0}"
+  SPEC="$(getp 'Pages speculative')";  : "${SPEC:=0}"
+  PURGE="$(getp 'Pages purgeable')";   : "${PURGE:=0}"
+  AVAIL_PAGES=$(( FREEP + INACT + SPEC + PURGE ))
+  RAM_TOTAL=$(( MEMSIZE / 1048576 ))
+  RAM_FREE=$(( AVAIL_PAGES * PAGE / 1048576 ))
+  VRAM_TOTAL="$RAM_TOTAL"; VRAM_FREE="$RAM_FREE"
+
+  # Echte GPU-Auslastung, rund 18 ms. Bis 2026-08-07 stand hier nichts und das
+  # Feld meldete konstant 0 — ein Sweep, der darauf abbricht, bricht immer ab.
+  # `|| true` ist Pflicht: unter `set -euo pipefail` reisst ein fehlendes ioreg
+  # (oder das SIGPIPE von `head -1`) sonst den ganzen Befehl mit.
+  GPU_UTIL="$(ioreg -r -d 1 -w 0 -c AGXAccelerator 2>/dev/null \
+    | sed -n 's/.*"Device Utilization %"=\([0-9][0-9]*\).*/\1/p' | head -1 || true)"
+
+  # Test hook works cross-platform even though a protected service lives on peer.
+  if [ "${CR_ASSUME_NEWS_CLF_ACTIVE:-0}" = "1" ]; then
+    PROTECTED_ACTIVE=1; PROTECTED_NAMES="a protected service"
+    PROTECTED_JSON='[{"name":"a protected service","active":true,"detail":"forced active via CR_ASSUME_NEWS_CLF_ACTIVE (test hook)","pids":[]}]'
+  fi
+
+  collect_ollama
+else
+  MACHINE="$(printf '%s' "$HOST" | tr 'A-Z' 'a-z')"
+  GPU_KIND="unknown"
+fi
+
+emit_json() {
+  jq -n \
+    --arg machine "$MACHINE" --arg os "$(printf '%s' "$OS" | tr 'A-Z' 'a-z')" \
+    --arg host "$HOST" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg gpukind "$GPU_KIND" --arg vnote "$VRAM_NOTE" --arg ollnote "$OLLAMA_NOTE" \
+    --arg ollloadednote "$OLLAMA_LOADED_NOTE" --argjson olllocal "${OLLAMA_LOCAL:-null}" \
+    --argjson vfree "${VRAM_FREE:-0}" --argjson vtotal "${VRAM_TOTAL:-0}" --argjson gutil "${GPU_UTIL:-null}" \
+    --argjson rfree "${RAM_FREE:-0}" --argjson rtotal "${RAM_TOTAL:-0}" \
+    --argjson gpuprocs "$GPU_PROCS_JSON" --argjson ollama "$OLLAMA_JSON" --argjson ollamaloaded "${OLLAMA_LOADED_JSON:-[]}" \
+    --argjson protected "$PROTECTED_JSON" \
+    '{machine:$machine, os:$os, hostname:$host, timestamp:$ts,
+      vram:{kind:$gpukind, free_mib:$vfree, total_mib:$vtotal, gpu_util_pct:$gutil, note:$vnote},
+      ram:{free_mib:$rfree, total_mib:$rtotal},
+      gpu_procs:$gpuprocs,
+      ollama_models:$ollama, ollama_loaded:$ollamaloaded, ollama_note:$ollnote,
+      ollama_loaded_note:$ollloadednote, ollama_local:$olllocal,
+      protected:$protected}'
+}
+
+case "$MODE" in
+  json) emit_json ;;
+  guard)
+    printf 'MACHINE=%s\n' "$MACHINE"
+    printf 'GPU_KIND=%s\n' "$GPU_KIND"
+    printf 'VRAM_FREE_MIB=%s\n' "${VRAM_FREE:-0}"
+    printf 'VRAM_TOTAL_MIB=%s\n' "${VRAM_TOTAL:-0}"
+    printf 'RAM_FREE_MIB=%s\n' "${RAM_FREE:-0}"
+    printf 'RAM_TOTAL_MIB=%s\n' "${RAM_TOTAL:-0}"
+    printf 'PROTECTED_ACTIVE=%s\n' "$PROTECTED_ACTIVE"
+    printf 'PROTECTED_NAMES=%s\n' "$PROTECTED_NAMES"
+    ;;
+  human)
+    echo "machine : $MACHINE ($HOST, $(printf '%s' "$OS" | tr 'A-Z' 'a-z'))"
+    if [ -n "$GPU_UTIL" ]; then UTIL_TXT="util ${GPU_UTIL}%"; else UTIL_TXT="util nicht gemessen"; fi
+    if [ "$GPU_KIND" = "unified" ]; then
+      echo "GPU     : unified memory (MLX/Metal share RAM), $UTIL_TXT"
+      echo "  free  : ${VRAM_FREE} MiB / ${VRAM_TOTAL} MiB total"
+    else
+      echo "GPU     : $GPU_KIND, $UTIL_TXT"
+      echo "  VRAM  : ${VRAM_FREE} MiB free / ${VRAM_TOTAL} MiB total"
+    fi
+    echo "RAM     : ${RAM_FREE} MiB free / ${RAM_TOTAL} MiB total"
+    echo "ollama  : $(printf '%s' "$OLLAMA_JSON" | jq -r 'if length>0 then join(", ") else "-" end') ${OLLAMA_NOTE:+($OLLAMA_NOTE)}"
+    if [ -n "$OLLAMA_LOADED_NOTE" ]; then
+      echo "  Groessen nicht lesbar: $OLLAMA_LOADED_NOTE"
+    fi
+    echo "gpuproc : $(printf '%s' "$GPU_PROCS_JSON" | jq -r 'if length>0 then map("\(.name|split("/")|last) pid=\(.pid) \(.used_mib)MiB")|join(", ") else "-" end')"
+    if [ "$PROTECTED_ACTIVE" = 1 ]; then
+      echo "PROTECT : $PROTECTED_NAMES ACTIVE — never stop (ask the user before any displacement)"
+    else
+      echo "PROTECT : none active"
+    fi
+    ;;
+esac

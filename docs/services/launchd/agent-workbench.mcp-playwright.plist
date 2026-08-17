@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE. Replace __HOME__ before loading; see docs/SERVICES.md for the one-line sed.
+
+  ONE shared playwright MCP server for every agent session. Without it each session
+  starts its own `npx @playwright/mcp` (npm wrapper plus node): measured on a working
+  machine, 51 processes holding 3.0 GB.
+
+  --headless and --isolated are deliberate. A shared server must never tear open a
+  visible browser window in front of whoever is working, and it must not mix one
+  session's profile into the next. It binds 127.0.0.1 only.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>agent-workbench.mcp-playwright</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/npx</string>
+    <string>@playwright/mcp@latest</string>
+    <string>--port</string>
+    <string>8767</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--headless</string>
+    <string>--isolated</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:__HOME__/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/mcp-shared/playwright.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/mcp-shared/playwright.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

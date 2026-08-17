@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>scroll-welt — gemischte Kette: szene, video, still</title>
+  <meta name="description" content="Demo der Treiber-Architektur: eine Code-Szene, ein Videoclip mit gelockten Naehten, ein Standbild." />
+  <!-- Lets the bare specifier "three" resolve without a bundler. treiber-three.js
+       looks for { three } and window.THREE first and only then reaches for
+       import('three') — this map is what makes that last branch work here. -->
+  <script type="importmap">
+  { "imports": { "three": "./vendor/three/three.module.min.js" } }
+  </script>
+  <style>
+    :root, .sw-root {
+      --sw-bg: #F5EDE0;
+      --sw-ink: #241d2b;
+      --sw-ink-soft: #6a6072;
+      --sw-accent: #6D9668;
+    }
+  </style>
+</head>
+<body>
+  <div id="top"></div>
+  <div id="welt"></div>
+
+  <script src="../scrub-welt.js"></script>
+  <script src="../treiber-parallax.js"></script>
+  <script src="../treiber-three.js"></script>
+  <script src="scenes.js"></script>
+  <script src="szene-halle.js"></script>
+  <script>
+    // The 3D segment goes in front of the closing still: szene -> video ->
+    // szene -> szene(3D) -> still. Between the two code scenes there is no seam
+    // to build at all, which is the point the contract makes about code drivers.
+    const segments = window.DEMO_SEGMENTS.slice();
+    segments.splice(3, 0, window.HALLE_SEGMENT);
+
+    window.welt = mountScrollWelt(document.getElementById('welt'), {
+      brand: { name: 'Pearl & Co.', href: '#top' },
+      cta: { label: 'Bestellen', href: '#' },
+      hint: 'scrollen',
+      debug: true,
+      segments: segments,
+    });
+  </script>
+</body>
+</html>

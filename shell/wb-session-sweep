@@ -1,0 +1,293 @@
+#!/bin/bash
+# wb-session-sweep [--dry-run] [--days N] [--quiet] — verwaiste wb-*-Sessions raeumen.
+#
+# Anlass (2026-08-03): ein geschlossenes VS-Code-Fenster beendet die zugehoerige
+# tmux-Session NICHT — sie laeuft unsichtbar weiter. An diesem Tag hingen 27
+# verwaiste Sessions mit 22 Claude-Prozessen und 7,5 GB im Speicher; zusammen mit
+# geladenen Modellen fuehrte das zu Speicherdruck und jetsam-Kills ohne
+# Absturzbericht. Dieses Werkzeug ist die Automatik dazu — der Knopf fuer die
+# eigene Session ist `wb-session-close --self`.
+#
+# Eine Session gilt als verwaist und wird geschlossen, wenn ALLE Bedingungen
+# zutreffen:
+#   (a) an keiner Session ihrer Gruppe haengt ein Client,
+#   (b) kein lebender Worker-Pane (@wb_role=worker, pane_dead=0) in der Gruppe,
+#   (c) letzte Aktivitaet (#{session_activity}) aelter als --days Tage (Default 3)
+#       ODER die Session ist als verwaist markiert und die Marke ist aelter als
+#       --orphan-minutes (Default 10). Die Marke legt die Extension beim
+#       Schliessen des Fensters ab (2026-08-04); sie beweist, dass hinter der
+#       Session kein Fenster mehr steht, und macht die Drei-Tage-Frist ueberfluessig,
+#   (d) der Sessionname beginnt mit 'wb-',
+#   (e) es ist nicht die eigene Session/Gruppe.
+#
+# Gruppen statt einzelner Sessionnamen: `wb-foo` + gruppierte Sicht `wb-foo-view`
+# teilen sich ihre Fenster (gemessen, 2026-08-03 — beide Sessionnamen zeigen
+# dieselben #{pane_id}). Wird nur die Basis `wb-foo` geschlossen, bleibt
+# `wb-foo-view` als eigenstaendige Session mit denselben Fenstern zurueck
+# (ebenfalls gemessen) — deshalb werden IMMER alle Mitglieder einer Gruppe in
+# einem Aufruf an wb-session-close uebergeben.
+#
+# Geschlossen wird AUSSCHLIESSLICH ueber `wb-session-close` — dieses Skript ruft
+# nie selbst `tmux kill-session`. Die Sicherheitspruefungen (Client, Worker,
+# eigene Session) leben dort exakt einmal; eine zweite, abweichende Kopie hier
+# waere genau die Art Luecke, an der sich am 2026-08-03 eine Session selbst
+# geschlossen hat.
+#
+# Jede Entscheidung — geschlossen UND uebersprungen, je mit Begruendung —
+# landet in $HOME/.local/state/wb-session-sweep.log.
+set -uo pipefail
+
+DAYS=3
+ORPHAN_MINUTES=10
+DRY=""
+QUIET=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1; shift ;;
+    --orphan-minutes)
+      [ $# -ge 2 ] || { echo "wb-session-sweep: --orphan-minutes braucht eine Zahl" >&2; exit 1; }
+      ORPHAN_MINUTES="$2"; shift 2 ;;
+    --orphan-minutes=*) ORPHAN_MINUTES="${1#--orphan-minutes=}"; shift ;;
+    --days)
+      [ $# -ge 2 ] || { echo "wb-session-sweep: --days braucht eine Zahl" >&2; exit 1; }
+      DAYS="$2"; shift 2 ;;
+    --days=*)  DAYS="${1#--days=}"; shift ;;
+    --quiet)   QUIET=1; shift ;;
+    -h|--help)
+      echo "usage: wb-session-sweep [--dry-run] [--days N] [--orphan-minutes N] [--quiet]"
+      exit 0 ;;
+    *) echo "wb-session-sweep: unbekannte Option '$1'" >&2; exit 1 ;;
+  esac
+done
+
+case "$DAYS" in
+  ''|*[!0-9]*) echo "wb-session-sweep: --days braucht eine nicht-negative ganze Zahl, bekam '$DAYS'" >&2; exit 1 ;;
+esac
+case "$ORPHAN_MINUTES" in
+  ''|*[!0-9]*) echo "wb-session-sweep: --orphan-minutes braucht eine nicht-negative ganze Zahl, bekam '$ORPHAN_MINUTES'" >&2; exit 1 ;;
+esac
+
+CLOSE_TOOL="${WB_SESSION_CLOSE:-wb-session-close}"
+LOG="${WB_SESSION_SWEEP_LOG:-$HOME/.local/state/wb-session-sweep.log}"
+ORPHAN_DIR="${WB_ORPHAN_DIR:-$HOME/.claude/workbench/orphans}"
+mkdir -p "$(dirname "$LOG")"
+
+NOW=$(date +%s)
+THRESHOLD=$((DAYS * 86400))
+ORPHAN_THRESHOLD=$((ORPHAN_MINUTES * 60))
+
+# Sessions, deren Fenster sich beim Schliessen abgemeldet hat (2026-08-04). Die
+# Extension legt beim Fensterschluss eine Marke ab, und wb-session-orphan
+# schliesst die Session normalerweise selbst. Bleibt eine Marke trotzdem liegen —
+# der Wachposten wurde erschlagen, die Maschine schlief, ein Worker lief noch —,
+# dann ist bewiesen, dass hinter dieser Session kein Fenster mehr steht. Auf drei
+# Tage Untaetigkeit zu warten, waere fuer diesen Fall die falsche Frist: die
+# Marke sagt bereits, was der Zeitstempel sonst nur vermuten laesst.
+# Ausgabe je Zeile: <sessionname> <marken-alter-in-sekunden>
+marked_orphans() {
+  [ -d "$ORPHAN_DIR" ] || return 0
+  /usr/bin/python3 - "$ORPHAN_DIR" "$NOW" <<'PY' 2>/dev/null
+import json, os, sys
+d, now = sys.argv[1], int(sys.argv[2])
+for name in sorted(os.listdir(d)):
+    if not name.endswith(".json"):
+        continue
+    try:
+        with open(os.path.join(d, name)) as f:
+            m = json.load(f)
+        session = m.get("session")
+        at = int(m.get("at", 0)) // 1000
+    except Exception:
+        continue
+    if session:
+        print("%s %d" % (session, max(0, now - at)))
+PY
+}
+
+ORPHAN_MARKS="$(marked_orphans)"
+
+# Ist irgendein Mitglied der Gruppe als verwaist markiert, und ist die Marke alt
+# genug? Setzt MARK_AGE auf das Alter der aeltesten passenden Marke.
+group_marked() {
+  local members="$1" m line s age
+  MARK_AGE=""
+  for m in $members; do
+    while IFS=' ' read -r s age; do
+      [ -n "$s" ] || continue
+      if [ "$s" = "$m" ] && [ "${age:-0}" -ge "$ORPHAN_THRESHOLD" ]; then
+        MARK_AGE="$age"
+        return 0
+      fi
+    done <<EOF
+$ORPHAN_MARKS
+EOF
+  done
+  return 1
+}
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$1" >> "$LOG"; }
+say() { [ -n "$QUIET" ] || printf '%s\n' "$1"; }
+
+# --- eigene Session(s) bestimmen — dieselbe Messung wie in wb-session-close,
+#     absichtlich hier dupliziert statt geteilt (jedes wb-*-Werkzeug in diesem
+#     Projekt ist eigenstaendig), aber wortgleich, damit sie nie auseinanderlaufen.
+own_pid_chain() {
+  local p=$$ chain=""
+  while [ "${p:-0}" -gt 1 ]; do
+    chain="$chain $p"
+    p="$(ps -p "$p" -o ppid= 2>/dev/null | tr -d ' ')"
+    [ -n "$p" ] || break
+  done
+  printf '%s ' "$chain"
+}
+
+own_sessions() {
+  local chain
+  chain=" $(own_pid_chain) "
+  tmux list-panes -a -F '#{pane_pid} #{session_name} #{session_group}' 2>/dev/null \
+  | awk -v c="$chain" '
+      { pid=$1; sess=$2; grp=$3
+        sn[NR]=sess; sg[NR]=grp
+        if (index(c, " " pid " ")) { own[sess]=1; if (grp != "") owngrp[grp]=1 }
+      }
+      END { for (i=1; i<=NR; i++)
+              if (sn[i] in own || (sg[i] != "" && sg[i] in owngrp)) out[sn[i]]=1
+            for (s in out) print s }'
+}
+
+OWN_LIST="$(own_sessions || true)"
+[ -n "${WB_SESSION:-}" ] && OWN_LIST="$OWN_LIST
+$WB_SESSION"
+
+is_own() {
+  local s="$1" o
+  while IFS= read -r o; do
+    [ -n "$o" ] || continue
+    [ "$s" = "$o" ] && return 0
+  done <<EOF
+$OWN_LIST
+EOF
+  return 1
+}
+
+if ! tmux list-sessions >/dev/null 2>&1; then
+  log "kein tmux-Server erreichbar - nichts zu tun."
+  say "wb-session-sweep: kein tmux-Server erreichbar, nichts zu tun."
+  exit 0
+fi
+
+# --- Sessions zu Gruppen buendeln (reines awk statt Bash-4-Arrays: /bin/bash
+#     auf macOS ist 3.2 und kennt kein 'declare -A'). Eine Zeile pro Gruppe:
+#     schluessel|kommagetrennte-mitglieder|angehaengte-clients-summe|juengste-aktivitaet
+#
+# Bewusst NICHT '$GROUPS' genannt: das ist bei bash ein RESERVIERTER Name (die
+# eingebaute Array-Variable mit den Gruppen-IDs des Users). Eine Zuweisung
+# darauf schlaegt in einer nicht-interaktiven Skript-Ausfuehrung fehl bzw.
+# liefert beim Auslesen bashs eigenen dynamischen Wert zurueck statt der
+# zugewiesenen Session-Liste -- gemessen (2026-08-03): der Sweep schloss
+# dadurch nie eine Session, weil die komplette Gruppen-Liste durch die GID des
+# Users (bei diesem User zufaellig "20") ersetzt wurde. Kein awk- oder
+# bash-3.2-Bug, sondern ein Namenskonflikt mit einer bash-Sondervariablen.
+SESS_GROUPS="$(tmux list-sessions -F '#{session_name}|#{session_group}|#{session_attached}|#{session_activity}' 2>/dev/null \
+  | awk -F'|' '
+      { name=$1; grp=$2; att=$3; act=$4
+        key = (grp != "") ? grp : name
+        if (!(key in seen)) { order[++n] = key; seen[key] = 1 }
+        members[key] = (members[key] == "") ? name : members[key] "," name
+        attsum[key] += att
+        if (!(key in maxact) || act > maxact[key]) maxact[key] = act
+      }
+      END { for (i = 1; i <= n; i++) { k = order[i]; print k "|" members[k] "|" attsum[k] "|" maxact[k] } }
+  ')"
+
+closed=0
+kept=0
+errors=0
+
+while IFS='|' read -r key memberscsv attached activity; do
+  [ -n "$key" ] || continue
+  members="${memberscsv//,/ }"
+  age=$(( NOW - activity ))
+  age_days=$(( age / 86400 ))
+
+  case "$key" in
+    wb-*) ;;
+    *)
+      log "UEBERSPRUNGEN gruppe=$key mitglieder=[$members] grund=kein-wb-praefix"
+      kept=$((kept + 1))
+      continue ;;
+  esac
+
+  eigen=""
+  is_own "$key" && eigen=1
+  for m in $members; do
+    is_own "$m" && eigen=1
+  done
+  if [ -n "$eigen" ]; then
+    log "UEBERSPRUNGEN gruppe=$key mitglieder=[$members] grund=eigene-session"
+    kept=$((kept + 1))
+    continue
+  fi
+
+  if [ "${attached:-0}" -gt 0 ]; then
+    log "UEBERSPRUNGEN gruppe=$key mitglieder=[$members] grund=client-haengt-an angehaengt=$attached"
+    kept=$((kept + 1))
+    continue
+  fi
+
+  # NICHT nur "=$key" fragen (2026-08-16, bugjagd shell/mittel, wb-session-sweep:238):
+  # $key ist der GRUPPEN-Name, nicht notwendig der Name einer noch lebenden Session
+  # -- reproduziert per Umbenennung der Basis-Session (session_group bleibt bei
+  # BEIDEN Mitgliedern der ORIGINALE Basis-Name, `list-panes -t "=<alter Name>"`
+  # findet danach nichts mehr: "can't find window", die Abfrage liefert leer,
+  # `${workers:-0}` wird 0, ein lebender Worker im ueberlebenden Mitglied bleibt
+  # unsichtbar). Derselbe Fehlertyp wie bei "eigen" zwei Bloecke oben, und dort
+  # schon so geloest: ueber $members iterieren statt nur ueber $key. Ein Pane
+  # erscheint bei einer gruppierten Session je Mitglied einmal (gemessen,
+  # wb-close's list_workers()) -- `!seen[$1]++` dedupliziert nach Pane-Id.
+  workers="$(
+    for m in $members; do
+      tmux list-panes -s -t "=$m" -F '#{pane_id}|#{@wb_role}|#{pane_dead}' 2>/dev/null
+    done | awk -F'|' '$2=="worker" && $3=="0" && !seen[$1]++' | wc -l | tr -d ' '
+  )"
+  if [ "${workers:-0}" -gt 0 ]; then
+    log "UEBERSPRUNGEN gruppe=$key mitglieder=[$members] grund=laufender-worker anzahl=$workers"
+    kept=$((kept + 1))
+    continue
+  fi
+
+  if [ "$age" -lt "$THRESHOLD" ] && ! group_marked "$members"; then
+    log "UEBERSPRUNGEN gruppe=$key mitglieder=[$members] grund=zu-jung alter_tage=$age_days schwelle_tage=$DAYS"
+    kept=$((kept + 1))
+    continue
+  fi
+  if [ "$age" -lt "$THRESHOLD" ]; then
+    log "VERWAIST-MARKIERT gruppe=$key mitglieder=[$members] marke_alter_s=$MARK_AGE schwelle_s=$ORPHAN_THRESHOLD"
+  fi
+
+  if [ -n "$DRY" ]; then
+    log "WUERDE-SCHLIESSEN gruppe=$key mitglieder=[$members] alter_tage=$age_days (--dry-run)"
+    say "wuerde schliessen: $key ($members) - $age_days Tage inaktiv"
+    kept=$((kept + 1))
+    continue
+  fi
+
+  out="$("$CLOSE_TOOL" $members 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    for m in $members; do rm -f "$ORPHAN_DIR/$m.json"; done
+    log "GESCHLOSSEN gruppe=$key mitglieder=[$members] alter_tage=$age_days"
+    say "geschlossen: $key ($members) - $age_days Tage inaktiv"
+    closed=$((closed + 1))
+  else
+    log "FEHLER gruppe=$key mitglieder=[$members] wb-session-close_rc=$rc ausgabe=[$out]"
+    say "FEHLER beim Schliessen von $key (rc=$rc): $out"
+    errors=$((errors + 1))
+  fi
+done <<EOF
+$SESS_GROUPS
+EOF
+
+say "wb-session-sweep: $closed geschlossen, $kept nicht (Grund je im Log), $errors Fehler."
+log "ZUSAMMENFASSUNG geschlossen=$closed nicht_geschlossen=$kept fehler=$errors schwelle_tage=$DAYS dry_run=${DRY:-0}"
+exit 0

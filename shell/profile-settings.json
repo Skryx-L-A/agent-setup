@@ -1,0 +1,20 @@
+{
+  "_comment": "NICHT INSTALLIERT: gehoert nicht nach ~/.local/bin. Derzeit von nichts im Repo gelesen (setup-vscode-profile.sh traegt seine eigene, leicht abweichende Kopie dieser Einstellungen inline als Heredoc) -- Divergenz siehe Ergebnisbericht.",
+  "workbench.startupEditor": "none",
+  "workbench.tips.enabled": false,
+  "workbench.welcomePage.walkthroughs.openOnInstall": false,
+  "workbench.editor.empty.hint": "hidden",
+  "workbench.panel.defaultLocation": "bottom",
+  "terminal.integrated.defaultLocation": "view",
+  "telemetry.telemetryLevel": "off",
+  "update.showReleaseNotes": false,
+  "window.title": "Claude Workbench \u2014 ${rootName}",
+  "explorer.compactFolders": false,
+  "security.workspace.trust.enabled": false,
+  "chat.commandCenter.enabled": false,
+  "workbench.secondarySideBar.defaultVisibility": "hidden",
+  "chat.agent.enabled": false,
+  "chat.disableAIFeatures": true,
+  "workbench.panel.opensMaximized": "always",
+  "terminal.integrated.enablePersistentSessions": false
+}

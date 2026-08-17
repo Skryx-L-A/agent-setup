@@ -1,0 +1,252 @@
+#!$HOME/.local/bin/peer-shot-py3
+# NICHT INSTALLIERT auf mac: nur fuer peer (KDE Plasma/Wayland, siehe Shebang-Pfad
+# oben). Auf peer gehoert diese Datei sehr wohl nach ~/.local/bin und wird dort
+# ausgerollt -- der Satz oben gilt maschinenabhaengig, nicht allgemein.
+"""Fenstergenaue Bildschirmaufnahme fuer KDE Plasma 6 / Wayland.
+
+Nutzt ausschliesslich org.kde.KWin.ScreenShot2.CaptureWindow ueber DBus.
+Es gibt in diesem Programm bewusst keinen Vollbild- oder Arbeitsflaechen-Pfad
+und keinen Aufruf, der das Zielfenster aktiviert oder in den Vordergrund holt.
+"""
+import sys
+import os
+import uuid
+import json
+import threading
+
+# dbus/gi/PIL/numpy are imported lazily inside the functions that need them
+# (connect_session_bus, list_windows, capture_window), on purpose: argument
+# validation and the "keine grafische Sitzung erreichbar" path must stay
+# testable on a machine that has none of these libraries installed (they are
+# Linux/KDE-only) — see shell/tests/test-peer-shot.sh.
+
+KWIN_SERVICE = "org.kde.KWin"
+SCRIPTING_PATH = "/Scripting"
+SCRIPTING_IFACE = "org.kde.kwin.Scripting"
+SCREENSHOT_PATH = "/org/kde/KWin/ScreenShot2"
+SCREENSHOT_IFACE = "org.kde.KWin.ScreenShot2"
+
+HELPER_IFACE = "org.peershot.Helper"
+HELPER_PATH = "/Helper"
+
+LIST_SCRIPT_JS = """
+var out = [];
+var wins = workspace.windowList();
+for (var i = 0; i < wins.length; i++) {
+    var w = wins[i];
+    if (!w.normalWindow) continue;
+    out[out.length] = {
+        internalId: w.internalId.toString(),
+        caption: w.caption,
+        resourceClass: w.resourceClass ? w.resourceClass.toString() : "",
+        resourceName: w.resourceName ? w.resourceName.toString() : "",
+        width: w.width,
+        height: w.height
+    };
+}
+callDBus("%(service)s", "%(path)s", "%(iface)s", "ReportWindows", JSON.stringify(out));
+"""
+
+# QImage::Format -> (Pillow rawmode to decode a "RGBA" image, needs_unpremultiply)
+FORMAT_MAP = {
+    4: ("BGRX", False),   # Format_RGB32
+    5: ("BGRA", False),   # Format_ARGB32
+    6: ("BGRA", True),    # Format_ARGB32_Premultiplied
+    16: ("RGBX", False),  # Format_RGBX8888
+    17: ("RGBA", False),  # Format_RGBA8888
+    18: ("RGBA", True),   # Format_RGBA8888_Premultiplied
+}
+
+
+def fail(msg, code):
+    sys.stderr.write(msg.rstrip("\n") + "\n")
+    sys.exit(code)
+
+
+def connect_session_bus():
+    try:
+        import dbus
+        import dbus.mainloop.glib
+
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+        bus = dbus.SessionBus()
+        bus.call_blocking(KWIN_SERVICE, "/KWin", "org.freedesktop.DBus.Peer", "Ping", "", [])
+        return bus
+    except Exception as exc:
+        fail(
+            "Keine grafische KDE-Sitzung erreichbar (KWin nicht ueber DBus ansprechbar): %s" % exc,
+            4,
+        )
+
+
+def list_windows(bus):
+    import dbus
+    import dbus.service
+    from gi.repository import GLib
+
+    name = "peershot-" + uuid.uuid4().hex[:8]
+    script_path = "/tmp/%s.js" % name
+    helper_service = "org.peershot.Helper.p%d" % os.getpid()
+
+    result = {}
+    loop = GLib.MainLoop()
+
+    class Helper(dbus.service.Object):
+        @dbus.service.method(HELPER_IFACE, in_signature="s", out_signature="")
+        def ReportWindows(self, json_str):
+            result["data"] = str(json_str)
+            loop.quit()
+
+    bus_name = dbus.service.BusName(helper_service, bus)
+    helper = Helper(bus, HELPER_PATH)
+
+    script_js = LIST_SCRIPT_JS % {
+        "service": helper_service,
+        "path": HELPER_PATH,
+        "iface": HELPER_IFACE,
+    }
+    with open(script_path, "w") as f:
+        f.write(script_js)
+
+    try:
+        bus.call_blocking(
+            KWIN_SERVICE, SCRIPTING_PATH, SCRIPTING_IFACE,
+            "loadScript", "ss", [script_path, name],
+        )
+        bus.call_blocking(KWIN_SERVICE, SCRIPTING_PATH, SCRIPTING_IFACE, "start", "", [])
+
+        GLib.timeout_add_seconds(5, loop.quit)
+        loop.run()
+
+        bus.call_blocking(
+            KWIN_SERVICE, SCRIPTING_PATH, SCRIPTING_IFACE,
+            "unloadScript", "s", [name],
+        )
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+        helper.remove_from_connection()
+        del bus_name
+
+    if "data" not in result:
+        fail("KWin hat die Fensterliste nicht rechtzeitig geliefert (Timeout).", 1)
+
+    return json.loads(result["data"])
+
+
+def capture_window(bus, handle):
+    import dbus
+    from PIL import Image
+    import numpy as np
+
+    screenshot = bus.get_object(KWIN_SERVICE, SCREENSHOT_PATH)
+    iface = dbus.Interface(screenshot, dbus_interface=SCREENSHOT_IFACE)
+
+    r, w = os.pipe()
+    buf = bytearray()
+
+    def reader():
+        while True:
+            chunk = os.read(r, 1 << 20)
+            if not chunk:
+                break
+            buf.extend(chunk)
+
+    t = threading.Thread(target=reader)
+    t.start()
+
+    options = dbus.Dictionary({"native-resolution": dbus.Boolean(True)}, signature="sv")
+    try:
+        results = iface.CaptureWindow(handle, options, dbus.types.UnixFd(w))
+    finally:
+        os.close(w)
+    t.join(timeout=10)
+    os.close(r)
+
+    results = {str(k): v for k, v in results.items()}
+    if str(results.get("type")) != "raw":
+        fail("Unerwartete Antwort von ScreenShot2.CaptureWindow: %r" % results, 1)
+
+    width = int(results["width"])
+    height = int(results["height"])
+    stride = int(results["stride"])
+    fmt = int(results["format"])
+
+    if fmt not in FORMAT_MAP:
+        fail(
+            "Von KWin geliefertes Pixelformat %d wird nicht unterstuetzt "
+            "(erwartet einer der bekannten QImage::Format-Werte)." % fmt,
+            1,
+        )
+    rawmode, premultiplied = FORMAT_MAP[fmt]
+
+    img = Image.frombuffer("RGBA", (width, height), bytes(buf), "raw", rawmode, stride, 1)
+
+    if premultiplied:
+        arr = np.array(img).astype(np.float32)
+        alpha = arr[..., 3]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            scale = np.where(alpha > 0, 255.0 / alpha, 0.0)
+        for c in range(3):
+            arr[..., c] = np.clip(arr[..., c] * scale, 0, 255)
+        img = Image.fromarray(arr.astype(np.uint8))
+
+    return img
+
+
+def match_windows(windows, pattern):
+    pattern_lc = pattern.lower()
+    return [w for w in windows if pattern_lc in (w.get("caption") or "").lower()]
+
+
+def print_window_table(windows, stream=sys.stdout):
+    stream.write("%-40s %-22s %s\n" % ("TITEL", "KLASSE", "GROESSE"))
+    for w in windows:
+        size = "%dx%d" % (w["width"], w["height"])
+        stream.write("%-40s %-22s %s\n" % (w["caption"][:40], w["resourceClass"][:22], size))
+
+
+def cmd_list():
+    bus = connect_session_bus()
+    windows = list_windows(bus)
+    print_window_table(windows)
+
+
+def cmd_capture(pattern, dest):
+    bus = connect_session_bus()
+    windows = list_windows(bus)
+    matches = match_windows(windows, pattern)
+
+    if len(matches) > 1:
+        sys.stderr.write("Mehrdeutiges Muster %r, %d Treffer:\n" % (pattern, len(matches)))
+        print_window_table(matches, stream=sys.stderr)
+        sys.exit(2)
+
+    if len(matches) == 0:
+        fail("Kein Fenster gefunden, das zu Muster %r passt." % pattern, 3)
+
+    target = matches[0]
+    img = capture_window(bus, target["internalId"])
+    img.save(dest, "PNG")
+
+
+def main(argv):
+    if len(argv) == 2 and argv[1] == "--list":
+        cmd_list()
+        return
+
+    if len(argv) != 3:
+        fail(
+            "Verwendung:\n"
+            "  peer-shot <titel-muster> <ziel.png>\n"
+            "  peer-shot --list",
+            1,
+        )
+
+    cmd_capture(argv[1], argv[2])
+
+
+if __name__ == "__main__":
+    main(sys.argv)

@@ -1,0 +1,2039 @@
+#!/usr/bin/env bash
+# Watches the context load of the orchestrator and every worker, and acts BEFORE anything is lost.
+#
+#   context-guard <orchestrator-pane> <worker-pane:name> [worker-pane:name ...]
+#   context-guard --auto <orchestrator-pane>     (workers taken from the pane's own tmux
+#                                                 session at every poll, so panes spawned
+#                                                 later are watched without a restart)
+#   context-guard --ensure [<pane>]              starts exactly ONE guard for the workbench
+#                                                 session of that pane (default $TMUX_PANE),
+#                                                 with --auto --exit-when-session-gone, and
+#                                                 does nothing if one is already running.
+#                                                 pi-worker calls this after every spawn.
+#   context-guard --auto --exit-when-no-workers <orchestrator-pane>
+#                                                 as --auto, but the guard ENDS ITSELF once
+#                                                 the last worker pane of its session is gone
+#                                                 (an ORCHESTRATOR working alone stays unwatched
+#                                                 -- kept for existing callers, see 2026-08-04
+#                                                 below for why --ensure no longer uses this)
+#   context-guard --auto --exit-when-session-gone <orchestrator-pane>
+#                                                 as --auto, but the guard ENDS ITSELF once the
+#                                                 tmux SESSION of the orchestrator pane is gone --
+#                                                 unlike --exit-when-no-workers it keeps watching
+#                                                 while the orchestrator works alone (2026-08-04:
+#                                                 an unwatched orchestrator carries the context
+#                                                 that is most expensive to lose -- its own
+#                                                 session history cannot be rebuilt from a result
+#                                                 file the way a worker's can)
+#   Auf JEDEM dieser Startwege gilt seit 2026-08-08: laeuft fuer dieselbe Workbench-Instanz
+#   bereits ein nachweislich lebender Guard, startet der neue NICHT, sondern meldet das und
+#   endet mit 0 -- der Schutz haengt nicht mehr daran, dass der Aufrufer `--ensure` benutzt.
+#   Begruendung und Abwaegung stehen bei der Pruefung selbst, weiter unten.
+#
+#   Ohne jedes Flag endet ein Guard ausserdem IMMER, sobald der bewachte PANE selbst
+#   verschwunden ist (2026-08-07) -- unabhaengig davon, ob seine Session noch lebt. Ein Guard
+#   ohne seinen Pane kann nichts lesen und nirgends hin tippen; er wuerde sonst als Waise
+#   weiterlaufen, bis ihn jemand von Hand findet. Siehe orch_pane_gone() weiter unten.
+#
+#   context-guard --stop [<pane-id|session-name>]   stops the guard of that WORKBENCH
+#                                                    (current session if no target given)
+#   context-guard --stop --all                      stops every wb-* guard on this tmux server
+#
+# Why this exists: a full context window does not fail loudly. The agent just gets quietly worse --
+# it forgets invariants, re-derives solved bugs, contradicts its own measurements. der Nutzer had to
+# point it out three times, which is three times too many. So nobody is asked to remember: this does.
+#
+# What it does, per poll:
+#   * WORKER >= WARN_PCT  -> tells it to write a full handoff into a project file, then /compact.
+#     Only once per worker per compaction cycle (it re-arms after the load drops).
+#   * ORCHESTRATOR >= ORCH_PCT -> tells IT to update SESSION-STATE.md and the vault note NOW,
+#     before the harness compacts it. The brain is the backstop a summary cannot shrink.
+#   * ORCHESTRATOR + sentinel file -> compacts IMMEDIATELY, whatever the load. The orchestrator
+#     signals "my knowledge is saved" by running `touch $PROJECT/.wb-knowledge-saved` (the warning
+#     text tells it to). The guard polls for that file, types /compact as soon as the pane is idle,
+#     then the resume prompt, then deletes the sentinel so the cycle re-arms. This is the whole
+#     point: waiting for a higher load after the knowledge is already saved wastes context.
+#   * ORCHESTRATOR >= ORCH_COMPACT_PCT -> the same compaction WITHOUT a sentinel: the emergency
+#     brake for an orchestrator that never signals. The orchestrator has no tool to compact itself;
+#     the guard is its hands.
+#     Only ever while the pane is IDLE -- a keystroke mid-turn or mid-compaction would wreck it.
+#   * Never types into a pane that is mid-compaction, and never into one that is mid-turn.
+#   * WORKER shows a waiting confirmation dialog (a question + a numbered choice list with a
+#     selection pointer, e.g. the CLI's own "Dangerous rm operation ... Do you want to proceed?
+#     1. Yes / 2. Yes, and don't ask again / 3. No") for DIALOG_CONFIRM_POLLS polls in a row ->
+#     tells the orchestrator once, with the worker's name, pane id and the question. Resets as
+#     soon as the dialog is gone, so a later dialog is reported again (2026-08-04, N5).
+#
+# Reading the load, MEASURED on the real panes (2026-07-25), three sources in this order:
+#   1. EXACT figures from the status line: "▓▓▓▓░░░░░░ 485k/1.0M" -> 48%. Primary source, and the
+#      reason a 75% threshold is meaningful at all.
+#   2. The ten-block bar alone (▓ = filled) -> 10% steps, for panes too narrow for the figures.
+#      On this source 75 is NOT representable, so the threshold rounds DOWN to 70: the warning
+#      comes one step EARLIER, never later -- more lead time is the intent.
+#   3. The pane's transcript (~/.claude/projects/<slug>/<session>.jsonl), for panes so narrow that
+#      the status line is cut before the bar. Measured: at 51 columns with a long project path the
+#      line ended at "… claude-workbench m…" -- no bar, no figures, and a bar-only guard then
+#      NEVER warns. Silent blindness is the failure this whole tool exists to prevent.
+#   4. contextPattern des Harness aus der Registry (2026-08-06), fuer fremde CLIs, die ihre
+#      Auslastung in einer eigenen Schreibweise anzeigen (opencode: "8.3K (4%)").
+#   5. Der session-Block des Harness aus der Registry (2026-08-08, seit 2026-08-11 heisst er so
+#      und nicht mehr contextSession): die Sitzungs- oder Verlaufsdatei, die der Harness selbst
+#      schreibt -- fuer CLIs, die die Auslastung NIRGENDS anzeigen und deshalb auch kein Muster
+#      haben koennen. Gemessen: codex schreibt sie exakt (Verbrauch UND Fenster), aider schreibt
+#      den Verbrauch (Nenner aus der Registry), agy schreibt sie nicht. Geschaetzt wird dabei nie
+#      -- Details am Vertrag von session_load(). Der Block gehoert seit dem 11.08. NICHT mehr
+#      allein der Kontextwache: aus demselben Block liest auch die Chat-Ansicht (SPEC-V4 6.3).
+#      Die Wache zieht ihn nur heran, wenn via 'sessionFile' ist UND sie den Formatnamen kennt.
+#   Nothing readable at all: the pane is announced as BLIND once, on stdout, and skipped -- never
+#   silently ignored.
+set -uo pipefail
+
+# STOP_FILE/lock live per INSTANCE (round-4 point A, refined round 5 point 1). An
+# instance is ONE WORKBENCH -- one orchestrator tmux SESSION -- not one tmux SERVER
+# (Reviewer-Befund 1, round 5): the server-only slug from round 4 fixed the isolated-
+# test-socket case, but two REAL `wb-code` sessions on the SAME default socket still
+# had the identical slug and could stop/block each other, exactly the case the SPEC
+# line names. The slug therefore folds in BOTH the socket path (`#{socket_path}`,
+# still needed so an isolated test socket never collides with a real one) AND the
+# orchestrator's SESSION NAME, stored under $HOME.
+STATE_BASE="$HOME/.local/state/wb-context-guard"
+mkdir -p "$STATE_BASE" 2>/dev/null || true
+
+# Die eigene Session wird NIE ueber ihren zurueckgemeldeten NAMEN erkannt, nur ueber
+# ihre BASIS (2026-08-04, "Punkt 0" -- derselbe Aufruf, derselbe Fehler wie beim
+# Selbstabschluss vom 2026-08-03: siehe regeln/worker-panes.md "Die eigene Session
+# wird nie ueber ihren NAMEN erkannt" und
+# 10-global/incident-2026-08-03-session-hat-sich-selbst-geschlossen.md; Loesung
+# 1:1 aus wb-session-close's own_base_session() uebernommen statt neu erfunden).
+# Eine Sessiongruppe traegt `#{session_group}` als Namen der BASIS fuer BEIDE
+# Mitglieder -- 'eigen' UND 'eigen-view' liefern beide session_group=eigen.
+# `#{session_name}` dagegen ist INSTABIL: derselbe Pane kann je nach
+# Aufrufzeitpunkt mal 'eigen' und mal 'eigen-view' zurueckgeben (gemessen
+# 2026-08-04 in Produktion: %0 der wb-AI-Session erscheint in EINEM einzigen
+# `tmux list-panes -a`-Aufruf sowohl unter 'wb-AI' als auch unter 'wb-AI-view').
+# Jede Stelle, die den Namen als STABILEN SCHLUESSEL ueber mehrere Aufrufe hinweg
+# benutzt (Slug, Log-Pfad, "existiert die Session noch"), muss die Basis nehmen --
+# sonst zerfaellt die Buchfuehrung (known-workers/done-notified/dialog-notified) in
+# zwei Dateisaetze, je nachdem, ob im Moment des jeweiligen Aufrufs eine '-view'
+# existiert. `#{session_group}` ist LEER fuer eine Session ohne Gruppe (noch nie
+# eine '-view' erzeugt) -- dann ist sie trivial ihre eigene Basis.
+base_session_name() {   # <pane-id> -> Basis-Sessionname (Gruppenname, oder der eigene ohne Gruppe)
+    local pane="$1" sess grp
+    sess=$(tmux display -p -t "$pane" '#{session_name}' 2>/dev/null)
+    grp=$(tmux display -p -t "$pane" '#{session_group}' 2>/dev/null)
+    printf '%s' "${grp:-$sess}"
+}
+
+# Accepts a pane id (%N), a bare session name, or nothing (ambient current
+# session/socket). `display -p -t "=<session>"` is measured EMPTY on some tmux
+# versions (same gotcha pi-worker/wb-ssh-worker already work around), so a session
+# name is never used directly as a display target -- normalised to its active pane
+# via list-panes first.
+socket_slug() {   # [pane-id|session-name] -> combined slug, or "unknown-$$" if unreachable
+    local t="${1:-}" pane sp sess
+    if [ -z "$t" ]; then
+        pane=$(tmux display -p '#{pane_id}' 2>/dev/null)
+    else
+        case "$t" in
+            %*) pane="$t" ;;
+            *)  pane=$(tmux list-panes -t "=$t" -F '#{pane_id} #{pane_active}' 2>/dev/null | awk '$2==1{print $1; exit}') ;;
+        esac
+    fi
+    [ -n "$pane" ] || { echo "unknown-$$"; return; }
+    sp=$(tmux display -p -t "$pane" '#{socket_path}' 2>/dev/null)
+    [ -n "$sp" ] || { echo "unknown-$$"; return; }
+    sess=$(base_session_name "$pane")
+    printf '%s|%s' "$sp" "$sess" | tr -c 'a-zA-Z0-9' '-'
+}
+
+if [[ "${1:-}" == "--stop" ]]; then
+    shift
+    if [[ "${1:-}" == "--all" ]]; then
+        # Every wb-* session reachable on the AMBIENT tmux server -- there is no
+        # registry of "guards that exist" (the stop mechanism is purely passive:
+        # each guard polls its own file), so this is the closest thing to "all" that
+        # does not require guessing. A guard on a DIFFERENT socket is unreachable
+        # from here by construction, same as a single-target --stop.
+        # Eine Basis UND ihre '-view'-Schwester zaehlen hier als ZWEI Zeilen (anders
+        # als list-panes: list-sessions listet Sessionnamen, nicht Panes) -- harmlos,
+        # da socket_slug() jede von beiden ueber ihren Pane auf dieselbe Basis
+        # normalisiert (geprueft 2026-08-04, Punkt-0-Nachschau): beide Aufrufe
+        # touchen dieselbe Stop-Datei, `n` zaehlt hoechstens kosmetisch zu hoch.
+        sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^wb-')
+        if [ -z "$sessions" ]; then
+            echo "context-guard: kein tmux erreichbar oder keine wb-* Session — nichts zu stoppen." >&2
+            exit 1
+        fi
+        n=0
+        while IFS= read -r sess; do
+            [ -n "$sess" ] || continue
+            slug=$(socket_slug "$sess")
+            case "$slug" in unknown-*) continue ;; esac
+            touch "$STATE_BASE/$slug.stop"
+            n=$((n+1))
+        done <<<"$sessions"
+        echo "context-guard: stop requested fuer $n Workbench-Session(en)"
+        exit 0
+    fi
+    TARGETARG="${1:-}"
+    slug="$(socket_slug "$TARGETARG")"
+    case "$slug" in
+        unknown-*)
+            echo "context-guard: kein tmux erreichbar${TARGETARG:+ oder Ziel '$TARGETARG' nicht gefunden} — Ziel-Instanz nicht bestimmbar, kein --stop moeglich." >&2
+            exit 1 ;;
+    esac
+    STOP_FILE="$STATE_BASE/$slug.stop"
+    touch "$STOP_FILE"
+    echo "context-guard: stop requested ($STOP_FILE)"
+    exit 0
+fi
+
+# --- Guard-Lebenszyklus = Session-Lebenszyklus (Entscheidung des Nutzers 2026-08-03, korrigiert
+# 2026-08-04) --------------------------------------------------------------------------------
+# Beim Sessionstart laeuft absichtlich KEIN Guard (contextGuardAutostart bleibt false): niemand
+# haelt dafuer einen Prozess ueber Wochen, ohne dass je ein Worker gelaufen ist. Ausgeloest wird
+# der erste Guard vom ERSTEN Worker -- pi-worker ruft `--ensure` nach jedem Pane-Start auf.
+#
+# Bis 2026-08-04 endete der so gestartete Guard mit `--exit-when-no-workers`, sobald der letzte
+# Worker verschwand -- das war fuer WORKER richtig (sie sind der Grund, warum es den Guard gibt),
+# liess aber den ORCHESTRATOR selbst unbewacht, sobald er wieder allein arbeitete. Gemessen
+# 2026-08-04: eine Session bei 60% Kontext ohne einen einzigen laufenden Guard. Der Orchestrator
+# traegt genau das Wissen, dessen Verlust am teuersten ist -- seine Sitzungsgeschichte laesst
+# sich nicht aus einer Ergebnisdatei wiederherstellen, anders als die eines Workers.
+#
+# `--ensure` startet den Guard deshalb jetzt mit `--exit-when-session-gone`: er bewacht den
+# Orchestrator weiter, auch wenn gerade kein Worker laeuft, und wird dabei trotzdem keine Waise
+# -- er endet mit dem Ende der SESSION statt mit dem Ende der Worker-Liste. `--exit-when-no-workers`
+# bleibt unveraendert fuer Aufrufer, die genau das alte Verhalten brauchen.
+
+# Der eigene Pfad, damit --ensure GENAU DIESE Fassung startet -- im Test die Testkopie, nicht
+# die installierte. $0 ist der Skriptpfad, auch bei `bash /pfad/context-guard`.
+SELF_PATH="$0"
+case "$SELF_PATH" in
+    /*) ;;
+    *)  SELF_PATH="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" ;;
+esac
+# Der Leser der fuenften Quelle (session_load() weiter unten) liegt seit dem
+# 11.08. daneben statt eingebettet -- derselbe Grund wie bei SELF_PATH: die
+# Testkopie soll IHREN Leser finden, nicht einen installierten.
+SESSION_LOAD_PY="$(dirname "$SELF_PATH")/wb-session-load"
+
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }  # Linux || macOS
+
+# Ist DIESE Kommandozeile ein laufender Guard fuer genau diesen Pane? Entscheidend ist das ERSTE
+# Argument der Kommandozeile (der Programmpfad), NICHT ein Vorkommen des Wortes irgendwo in der
+# Zeile: in dieser Umgebung tragen die Claude-Prozesse ihren Rollen-Prompt im argv, und darin steht
+# der Text "context-guard --auto". `pgrep -f "context-guard --auto"` meldet deshalb den
+# ORCHESTRATOR selbst als laufenden Guard (gemessen 2026-08-03: PID 2807, wb-myproject) -- mit
+# diesem Kriterium wuerde nie wieder einer gestartet. Ausgewertet wird darum: Programmname ist
+# `context-guard` (auch als `bash /pfad/context-guard`, so starten wb-code und Hand-Starts es),
+# es ist kein `--ensure`/`--stop`-Aufruf, und das erste Nicht-Options-Argument ist der gesuchte
+# Pane.
+guard_args_match() {   # <args-zeile> <pane> -> 0, wenn die Zeile ein Guard fuer genau diesen Pane ist
+    [ -n "${1:-}" ] || return 1   # leere Eingabe: awk laeuft nie durch den Hauptblock und meldete sonst 0
+    awk -v want="$2" '
+        {
+            i = 1
+            n = split($i, a, "/"); prog = a[n]
+            if (prog != "context-guard") {
+                if (prog !~ /^(bash|sh|zsh|dash|ksh)$/) exit 1
+                i++
+                n = split($i, a, "/"); if (a[n] != "context-guard") exit 1
+            }
+            for (i++; i <= NF; i++) {
+                if ($i == "--ensure" || $i == "--stop") exit 1
+                if ($i ~ /^-/) continue
+                if ($i == want) exit 0
+                exit 1
+            }
+            exit 1
+        }' <<<"$1"
+}
+
+# Merkdatei je INSTANZ (2026-08-07). Bis heute wurde ein laufender Guard allein am Pane-NAMEN
+# in `ps` erkannt -- ueber ALLE Prozesse der Maschine hinweg. Pane-Namen sind aber nur pro
+# tmux-SERVER eindeutig: jeder frische Socket faengt wieder bei %0 an, und jede Testsuite bringt
+# ihren eigenen Socket mit. Beide Richtungen waren damit kaputt, und die gefaehrlichere ist die
+# erste: ein Guard auf einem FREMDEN Socket liess `--ensure` "laeuft bereits" melden, sodass auf
+# dem Live-Server KEINER startete -- der Orchestrator stand ohne Kontextwache da und die Meldung
+# sagte ihm, alles sei in Ordnung. (Die Testsuite hat das schon beschrieben, siehe Punkt 3b in
+# shell/tests/test-guard-sessionende.sh, und den Befund berichtet statt daran zu scheitern.)
+#
+# Der Schluessel ist deshalb derselbe wie fuer Stopdatei und Buchfuehrung: der Slug aus
+# socket_path + Basis-Session. Ein Guard traegt beim Start seine PID dort ein, ein `--ensure`
+# derselben Instanz findet sie. Eine PID allein ist KEIN Beleg (sie wird nach einem Neustart neu
+# vergeben), also wird gegengeprueft, dass der Prozess lebt UND wirklich ein `context-guard` fuer
+# genau diesen Pane ist. Jeder Zweifel -- keine Merkdatei, tote PID, fremdes Programm, anderer
+# Pane -- faellt auf "kein Guard da" und damit auf STARTEN: ein zweiter Guard tippt schlimmstenfalls
+# doppelt `/compact`, ein fehlender laesst einen Kontext volllaufen.
+# Nur die Programm-Identitaet, ohne Pane (2026-08-13, fuer --jeder-pane): ist diese
+# Kommandozeile ein LAUFENDER context-guard und kein `--ensure`/`--stop`-Aufruf?
+guard_ist_guard() {   # <args-zeile> -> 0, wenn es ein laufender Guard ist
+    [ -n "${1:-}" ] || return 1
+    awk '
+        {
+            i = 1
+            n = split($i, a, "/"); prog = a[n]
+            if (prog != "context-guard") {
+                if (prog !~ /^(bash|sh|zsh|dash|ksh)$/) exit 1
+                i++
+                n = split($i, a, "/"); if (a[n] != "context-guard") exit 1
+            }
+            for (i++; i <= NF; i++) if ($i == "--ensure" || $i == "--stop") exit 1
+            exit 0
+        }' <<<"$1"
+}
+
+guard_pidfile() { printf '%s/%s.pid' "$STATE_BASE" "$1"; }
+
+running_guard_pid() {   # <slug> <orch-pane> [--jeder-pane] -> PID des laufenden Guards dieser Instanz
+    local pf pid args
+    pf="$(guard_pidfile "$1")"
+    [ -f "$pf" ] || return 0
+    pid="$(head -1 "$pf" 2>/dev/null | tr -dc '0-9')"
+    [ -n "$pid" ] && [ "$pid" != "$$" ] || { rm -f "$pf"; return 0; }
+    kill -0 "$pid" 2>/dev/null || { rm -f "$pf"; return 0; }
+    args="$(ps -p "$pid" -o args= 2>/dev/null)"
+    # `--jeder-pane` (2026-08-13): ein Guard im Worker-Modus ZIEHT seinen Anker nach, wenn
+    # der alte Worker fertig ist (siehe die Nachzieh-Stelle im Poll). Seine Kommandozeile
+    # nennt dann weiter den URSPRUENGLICHEN Pane, waehrend er laengst einen anderen
+    # bewacht. Ein Vergleich auf genau diesen Pane wuerde ihn deshalb uebersehen und einen
+    # ZWEITEN Guard fuer dieselbe Session starten — zwei Wachen tippen jedes /compact
+    # doppelt. Die Merkdatei haengt am Slug aus Socket + Basis-Session; ein Treffer darin
+    # gehoert also bereits derselben Session. Geprueft wird deshalb nur noch, dass der
+    # Prozess wirklich ein context-guard ist und kein `--ensure`/`--stop`-Aufruf — mit dem
+    # Pane, den seine eigene Kommandozeile nennt.
+    if [ "${3:-}" = --jeder-pane ]; then
+        # Kein Pane-Vergleich: welcher Pane in der Zeile steht, ist im Worker-Modus
+        # veraltet, sobald der Anker einmal nachgezogen wurde. Geprueft wird die
+        # Programm-Identitaet — Programmname `context-guard` und kein
+        # `--ensure`/`--stop`-Aufruf. Ein Ableiten des Panes AUS der Zeile waere ein
+        # zweiter Weg, denselben Fehler zu machen: findet das Muster nichts, faellt der
+        # Vergleich still auf "kein Guard da" zurueck und startet einen zweiten
+        # (gemessen 2026-08-13, genau dieser Fehlschlag).
+        guard_ist_guard "$args" || { rm -f "$pf"; return 0; }
+    else
+        guard_args_match "$args" "$2" || { rm -f "$pf"; return 0; }
+    fi
+    printf '%s' "$pid"
+}
+
+if [[ "${1:-}" == "--ensure" ]]; then
+    shift
+    REF="${1:-${TMUX_PANE:-}}"
+    if [ -z "$REF" ]; then
+        echo "context-guard --ensure: kein Pane genannt und \$TMUX_PANE leer — Session nicht bestimmbar, kein Guard gestartet." >&2
+        exit 1
+    fi
+    # Basis statt zurueckgemeldeter Name (siehe base_session_name() oben, Punkt 0
+    # vom 2026-08-04): sonst haengt der GLOG-Pfad unten von einer Zufaelligkeit ab,
+    # die sich beim naechsten --ensure-Aufruf desselben Panes wieder aendern kann.
+    SESS=$(base_session_name "$REF" 2>/dev/null || true)
+    if [ -z "$SESS" ]; then
+        echo "context-guard --ensure: Pane '$REF' auf diesem tmux-Server nicht gefunden — kein Guard gestartet." >&2
+        exit 1
+    fi
+    # Bewacht wird der ORCHESTRATOR, nicht der Worker, der den Start ausgeloest hat.
+    ORCH_P=$(tmux list-panes -s -t "=$SESS" -F '#{pane_id} #{@wb_role} #{pane_dead}' 2>/dev/null \
+             | awk '$2=="orchestrator" && $3=="0"{print $1; exit}')
+    # REINE WORKER-SESSION (2026-08-13). Auf peer ist `wb-orch` genau das: `orch-launch`
+    # startet dort Worker, und sobald der Orchestrator-Pane fehlt oder tot ist, stand hier
+    # bisher "kein Guard gestartet" — die Worker auf der Zweitmaschine liefen also ohne
+    # Kontextwache, und genau die brauchen sie: ein voller Worker scheitert nicht, er wird
+    # still schlechter, und seine Sitzungsgeschichte ist genauso weg wie die eines
+    # Orchestrators.
+    #
+    # Der alte Satz "ein Guard, der in einen unbekannten Pane tippt, ist schlimmer als
+    # keiner" bleibt richtig und wird hier nicht aufgeweicht, sondern erfuellt: im
+    # Worker-Modus dient der Anker-Pane NUR als Adresse fuer Socket, Session und
+    # "Session weg?" — es wird NICHTS hineingetippt (--workers-only schaltet die
+    # Orchestrator-Wache und jede an den Orchestrator gerichtete Meldung ab). Getippt
+    # wird ausschliesslich in die WORKER selbst, und zwar dasselbe wie in jeder anderen
+    # Session auch.
+    ENSURE_MODE=orchestrator
+    if [ -z "$ORCH_P" ]; then
+        ORCH_P=$(tmux list-panes -s -t "=$SESS" -F '#{pane_id} #{@wb_role} #{pane_dead}' 2>/dev/null \
+                 | awk '$2=="worker" && $3=="0"{print $1; exit}')
+        ENSURE_MODE=workers-only
+    fi
+    if [ -z "$ORCH_P" ]; then
+        echo "context-guard --ensure: Session $SESS hat weder einen lebenden @wb_role=orchestrator- noch einen lebenden @wb_role=worker-Pane — kein Guard gestartet. (Ein Guard ohne einen einzigen zu bewachenden Pane haette nichts zu tun.)" >&2
+        exit 1
+    fi
+    ENSURE_SLUG="$(socket_slug "$ORCH_P")"
+    case "$ENSURE_SLUG" in
+        unknown-*)
+            echo "context-guard --ensure: Socket/Session von $ORCH_P nicht bestimmbar — kein Guard gestartet." >&2
+            exit 1 ;;
+    esac
+    # Genau EINER pro Workbench-Session: zwei Guards tippen /compact doppelt. Die Sperre deckt
+    # den Fall ab, dass zwei Spawns gleichzeitig pruefen und beide "keiner da" sehen; `mkdir`
+    # ist dafuer der atomare Teil. Eine Sperre aelter als 60s stammt aus einem abgebrochenen
+    # Lauf und wird entfernt, sonst blockiert sie den Start fuer immer.
+    LOCK="$STATE_BASE/$ENSURE_SLUG.ensure.lock"
+    locked=0
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if mkdir "$LOCK" 2>/dev/null; then locked=1; break; fi
+        [ $(( $(date +%s) - $(mtime "$LOCK") )) -gt 60 ] && rmdir "$LOCK" 2>/dev/null
+        sleep 1
+    done
+    if [ "$ENSURE_MODE" = workers-only ]; then
+        GPID="$(running_guard_pid "$ENSURE_SLUG" "$ORCH_P" --jeder-pane)"
+    else
+        GPID="$(running_guard_pid "$ENSURE_SLUG" "$ORCH_P")"
+    fi
+    if [ -n "$GPID" ]; then
+        [ "$locked" = 1 ] && rmdir "$LOCK" 2>/dev/null
+        echo "context-guard: laeuft bereits fuer $ORCH_P (PID $GPID, Session $SESS) — kein zweiter gestartet."
+        exit 0
+    fi
+    GLOG="$HOME/.local/state/context-guard-$SESS.log"
+    mkdir -p "$HOME/.local/state" 2>/dev/null || true
+    # PROJECT (Sentinel + HANDOFF-Dateien) aus der Umgebung, sonst das Arbeitsverzeichnis des
+    # Orchestrator-Panes -- das ist das Projekt, in dem die Session laeuft. Bleibt es leer,
+    # faellt der Guard wie bisher auf sein eigenes $PWD zurueck.
+    GPROJECT="${PROJECT:-$(tmux display -p -t "$ORCH_P" '#{pane_current_path}' 2>/dev/null || true)}"
+    ENSURE_FLAGS=""
+    [ "$ENSURE_MODE" = workers-only ] && ENSURE_FLAGS="--workers-only"
+    PROJECT="$GPROJECT" nohup "$SELF_PATH" --auto $ENSURE_FLAGS --exit-when-session-gone "$ORCH_P" >>"$GLOG" 2>&1 &
+    NEWPID=$!
+    [ "$locked" = 1 ] && rmdir "$LOCK" 2>/dev/null
+    if [ "$ENSURE_MODE" = workers-only ]; then
+        echo "context-guard: gestartet fuer die reine Worker-Session $SESS (PID $NEWPID, Anker-Pane $ORCH_P, PROJECT=${GPROJECT:-\$PWD}, Log $GLOG) — bewacht die Worker, tippt NICHTS in den Anker-Pane, endet mit der Session."
+    else
+        echo "context-guard: gestartet fuer $ORCH_P (PID $NEWPID, Session $SESS, PROJECT=${GPROJECT:-\$PWD}, Log $GLOG) — endet automatisch mit der Session (bewacht den Orchestrator weiter, auch ohne Worker)."
+    fi
+    exit 0
+fi
+
+AUTO=0
+EXIT_WHEN_EMPTY=0
+EXIT_WHEN_SESSION_GONE=0
+# --workers-only (2026-08-13): der genannte Pane ist KEIN Orchestrator, sondern nur der
+# Anker einer reinen Worker-Session (peer `wb-orch`). Er liefert Socket, Session und die
+# Antwort auf "Session weg?"; hinein getippt wird nichts. Alles, was diesem Guard sonst
+# an den Orchestrator gerichtet ist -- Kontextwarnung, /compact, WEITERARBEITEN,
+# Fertig- und Haengt-Meldungen, Postfach -- entfaellt. Die WORKER werden unveraendert
+# bewacht; sie sind der Grund, warum es diesen Modus gibt.
+WORKERS_ONLY=0
+# Flags in beliebiger Reihenfolge vor dem Pane. `--exit-when-no-workers` ist bewusst OPT-IN:
+# ein per contextGuardAutostart oder von Hand gestarteter Guard soll weiterhin auch ohne
+# Worker den Orchestrator bewachen und wuerde sich sonst sofort selbst beenden.
+# `--exit-when-session-gone` ist die zweite, unabhaengige Abbruchbedingung (2026-08-04): anders
+# als `--exit-when-no-workers` bewacht sie den Orchestrator WEITER, solange er allein arbeitet,
+# und beendet den Guard erst mit der Session selbst. Eigene Option statt das Verhalten von
+# `--exit-when-no-workers` zu aendern, damit bestehende Aufrufer dieses Flags unveraendert bleiben.
+while true; do
+    case "${1:-}" in
+        --auto)                    AUTO=1; shift ;;
+        --exit-when-no-workers)    EXIT_WHEN_EMPTY=1; shift ;;
+        --exit-when-session-gone)  EXIT_WHEN_SESSION_GONE=1; shift ;;
+        --workers-only)            WORKERS_ONLY=1; shift ;;
+        *) break ;;
+    esac
+done
+ORCH="${1:?usage: context-guard [--auto] [--exit-when-no-workers] [--exit-when-session-gone] [--workers-only] <orch-pane> <pane:name>...}"; shift
+# Refuses to start rather than silently falling back to "unknown-$$" (Reviewer-Befund
+# 6): a guard started that way is per-process-unique and can NEVER be reached by a
+# later --stop again -- and without a reachable tmux there is nothing to watch anyway.
+GUARD_SLUG="$(socket_slug "$ORCH")"
+case "$GUARD_SLUG" in
+    unknown-*)
+        echo "context-guard: tmux-Socket/Session von Pane '$ORCH' nicht bestimmbar — ohne erreichbares tmux gibt es nichts zu bewachen, Start abgebrochen." >&2
+        exit 1 ;;
+esac
+# Fuer --exit-when-session-gone EINMAL beim Start gemerkt (2026-08-04), nicht bei jedem Poll neu
+# aus $ORCH abgeleitet: genau DIESES Ableiten schlaegt fehl, sobald die Session weg ist -- der
+# gemerkte Name ist der einzige Ankerpunkt, an dem sich "verschwunden" ueberhaupt noch feststellen
+# laesst. `tmux has-session -t "=<name>"` bleibt auch nach dem Ende der Session eindeutig
+# beantwortbar (anders als ein erneutes `display -p -t "$ORCH"`, das dann selbst leer laeuft).
+#
+# MUSS die Basis sein, nicht der zurueckgemeldete Name (2026-08-04, Folgefehler
+# desselben Tages behoben, ehe er auslieferte): session_gone() unten prueft
+# `has-session -t "=$GUARD_SESSION"`. Waere hier zufaellig die '-view'-Schwester
+# gelandet (siehe base_session_name()), wuerde der Guard sich selbst beenden,
+# sobald NUR der Worker-Tab (die Sicht) schliesst -- genau in dem Moment, in dem
+# die Basis-Session mit allen Workern weiterlaeuft und ihn am meisten braucht.
+GUARD_SESSION="$(base_session_name "$ORCH" 2>/dev/null || true)"
+STOP_FILE="$STATE_BASE/$GUARD_SLUG.stop"
+# Der Schutz gegen zwei Wachen sitzt HIER, im Startweg selbst -- nicht nur in `--ensure`
+# (2026-08-08, gemessen). Bis heute trug sich jeder startende Guard bedingungslos ein und
+# ueberschrieb dabei den Eintrag eines LEBENDEN Vorgaengers. Fuer `--ensure` fiel das nicht auf,
+# weil es vorher selbst prueft; jeder ANDERE Startweg ging daran vorbei. Genau so ist es
+# passiert: `wb-code` startete `--auto <pane>` direkt, und in Gardener-Sitzung des Nutzers liefen
+# zwei Wachen fuer denselben Pane %10 (PIDs 14604 und 81969, die Merkdatei trug am Ende nur noch
+# die juengere). Ein zweiter Guard tippt jedes `/compact` doppelt -- das zweite trifft eine
+# Sitzung, die gerade erst wieder anlaeuft.
+#
+# Abwaegung, denn gestern galt hier die Gegenrichtung ("jeder Zweifel faellt auf STARTEN, weil
+# ein fehlender Guard schlimmer ist als ein doppelter"): Dieser Satz gilt fuer den ZWEIFEL, und
+# er gilt unveraendert weiter -- running_guard_pid() setzt ihn um und liefert bei jeder
+# Unsicherheit (keine Merkdatei, tote PID, fremdes Programm, anderer Pane) leer, also STARTEN.
+# Was hier abgefangen wird, ist kein Zweifel, sondern das Gegenteil: ein Prozess, der lebt UND
+# dessen Kommandozeile in `ps` ihn als context-guard fuer GENAU DIESEN Pane ausweist. Wo es
+# nichts zu bezweifeln gibt, traegt das Zweifelsargument nichts, und dann bleibt nur der Schaden
+# des doppelten `/compact`. Der Guard beendet sich deshalb, statt nur laut zu melden: eine
+# Meldung aus einem `nohup`-Kindprozess landet im besten Fall in einem Log, das niemand liest,
+# und der zweite Guard tippt trotzdem weiter mit. Bewusst NICHT eingebaut ist ein Lebenszeichen
+# je Poll ("Vorgaenger haengt, ich uebernehme"): das Kriterium muesste das Poll-Intervall des
+# Vorgaengers raten, und ein zu kurz geratenes Intervall stellt genau die zwei Wachen wieder her,
+# die hier verhindert werden. Ein haengender, aber lebender Guard bleibt damit unerkannt -- so
+# wie er es in `--ensure` seit gestern auch ist; beide Startwege haben jetzt dieselbe Garantie.
+RUNNING_PID="$(running_guard_pid "$GUARD_SLUG" "$ORCH")"
+if [ -n "$RUNNING_PID" ]; then
+    # Hier wird die Merkdatei bewusst NICHT angefasst: sie gehoert dem Vorgaenger. Deshalb steht
+    # dieser Block auch VOR der GUARD_PIDFILE-Zuweisung -- so kann kein spaeterer Handler den
+    # fremden Eintrag fuer den eigenen halten.
+    # Zweiter, von stdout unabhaengiger Schreibpfad, aus demselben Grund wie ORCH_NOTIFY_LOG
+    # weiter unten: der gemessene Doppelstart kam ueber `nohup ... >>log 2>&1 &` -- eine Absage,
+    # die nur auf stderr steht, faellt in so einem Aufruf mit dem Log unter den Tisch.
+    printf '%s abgelehnt: Guard %s bewacht %s bereits\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$RUNNING_PID" "$ORCH" \
+        >>"$STATE_BASE/$GUARD_SLUG.doppelstart.log" 2>/dev/null || true
+    echo "context-guard: fuer $ORCH laeuft bereits ein Guard (PID $RUNNING_PID) — dieser startet NICHT. Zwei Wachen tippen jedes /compact doppelt. Der laufende bleibt zustaendig; wirklich neu starten: 'context-guard --stop $ORCH', dann erneut." >&2
+    exit 0
+fi
+# Eintragen, damit `--ensure` DIESER Instanz diesen Prozess findet (siehe running_guard_pid()
+# oben). So frueh wie moeglich: zwischen dem Start durch pi-worker und dem naechsten `--ensure`
+# koennen Millisekunden liegen. Beim Ende wird der Eintrag wieder entfernt -- aber nur, wenn er
+# noch die EIGENE PID traegt: hat ein neuerer Guard derselben Instanz inzwischen ueberschrieben,
+# gehoert der Eintrag ihm. Bleibt eine Merkdatei doch einmal stehen (SIGKILL laesst keine Falle
+# zu), erkennt `--ensure` sie als tot und startet trotzdem.
+GUARD_PIDFILE="$(guard_pidfile "$GUARD_SLUG")"
+printf '%s\n' "$$" > "$GUARD_PIDFILE" 2>/dev/null || true
+guard_unregister() {
+    [ -n "${GUARD_PIDFILE:-}" ] || return 0
+    [ "$(head -1 "$GUARD_PIDFILE" 2>/dev/null | tr -dc '0-9')" = "$$" ] && rm -f "$GUARD_PIDFILE"
+    return 0
+}
+# Nur EXIT, KEIN Fangen von TERM/INT/HUP (gemessen 2026-08-07): mit einer Signalfalle fuehrt bash
+# den Handler erst aus, wenn der laufende Vordergrundprozess fertig ist -- der Guard steckt aber
+# fast immer in `sleep "$POLL"` (60s im Betrieb). Ein `kill` haette dann bis zu ein Poll-Intervall
+# gebraucht, statt sofort zu wirken; das Aufraeumen einer Merkdatei ist diesen Preis nicht wert.
+# Bleibt sie nach einem Kill stehen, erkennt `--ensure` sie an der toten PID und startet trotzdem.
+trap guard_unregister EXIT
+# Fertigmeldung fuer Worker-Ergebnisse (2026-08-04): DONE_DIR haelt EINE Datei pro
+# bereits gemeldetem Worker (Name sanitisiert wie GUARD_SLUG), KNOWN_WORKERS_FILE die
+# Namen aller je in dieser Session gesehenen Worker -- beide ueberleben einen Neustart
+# des Guards, weil sie ueber GUARD_SLUG (Socket+Session, nicht PID) verankert sind,
+# genau wie STOP_FILE oben. Grund: ein Worker, dessen Pane VOR der Meldung schon
+# geschlossen wurde, verschwindet sonst spurlos aus jeder tmux-Abfrage -- die
+# Ergebnisdatei bleibt die einzige Spur, die er hinterlaesst.
+DONE_DIR="$STATE_BASE/$GUARD_SLUG.done-notified"
+KNOWN_WORKERS_FILE="$STATE_BASE/$GUARD_SLUG.known-workers"
+mkdir -p "$DONE_DIR" 2>/dev/null || true
+touch "$KNOWN_WORKERS_FILE" 2>/dev/null || true
+# Blockierte Worker (2026-08-04, N5 der Masterliste): `fensterzu` stand rund
+# eine Stunde vor der CLI-eigenen Rueckfrage "Dangerous rm operation on
+# statically-unresolvable target ... Do you want to proceed? 1. Yes / 2. Yes,
+# and don't ask again / 3. No" -- der Spinner-Text war laengst weg, die
+# Kontextzahl bewegte sich nicht mehr, aber NICHTS meldete das aktiv. Dieser
+# Zustand ist pro Worker ueber DIALOG_STATE_DIR verankert (gleiches Muster wie
+# DONE_DIR: Name sanitisiert, ueberlebt einen Guard-Neustart), damit ein
+# Dialog, der ueber mehrere Poll-Zyklen hinweg unveraendert steht, gezaehlt
+# und genau einmal gemeldet werden kann.
+DIALOG_STATE_DIR="$STATE_BASE/$GUARD_SLUG.dialog-notified"
+mkdir -p "$DIALOG_STATE_DIR" 2>/dev/null || true
+# Postfach-Ankuendigungen (2026-08-11): eine leere Datei je bereits angekuendigter
+# NACHRICHT, benannt nach ihrer Kennung. Wie DONE_DIR ueber GUARD_SLUG verankert, also
+# ueber Socket und Session statt ueber die PID -- ein Neustart des Guards kuendigt
+# dieselbe Nachricht deshalb nicht erneut an. Siehe check_post_mail() weiter unten.
+POST_DIR="$STATE_BASE/$GUARD_SLUG.post-notified"
+mkdir -p "$POST_DIR" 2>/dev/null || true
+
+# Jede Meldung AN DEN ORCHESTRATOR hinterlaesst IMMER eine Log-Zeile -- unabhaengig
+# davon, wie dieser Guard-PROZESS gestartet wurde (2026-08-04, gemessen): PID 91894
+# lief mit stdout+stderr auf /dev/null (`lsof -p` zeigte beide fds als /dev/null --
+# vermutlich von Hand oder ueber einen Aufrufer ausserhalb von `--ensure` gestartet,
+# das seinerseits IMMER nach $GLOG umleitet). Eine echte Fertigmeldung um 08:00:02
+# hinterliess dadurch NIRGENDS eine Spur -- nur die done-notified-Markierung selbst
+# war noch da. Diese Datei ist ein ZWEITER, von stdout unabhaengiger Schreibpfad: die
+# bestehenden `echo`-Zeilen bleiben unveraendert (Tests und der `--ensure`-Redirect
+# nach $GLOG verlassen sich darauf), aber jede Stelle, die tatsaechlich in den
+# Orchestrator-Pane tippt, schreibt zusaetzlich HIERHIN -- direkt per Dateizugriff,
+# nie ueber stdout/2>&1, also unverwundbar gegen eine falsch verdrahtete Umleitung.
+ORCH_NOTIFY_LOG="$STATE_BASE/$GUARD_SLUG.orchestrator-notified.log"
+log_orch_notify() {   # message -> haengt IMMER an, unabhaengig von stdout dieses Prozesses
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"$ORCH_NOTIFY_LOG" 2>/dev/null || true
+}
+
+# Beim START still vormarkieren, was LANGE vor diesem Guard fertig war (2026-08-04,
+# nach echtem Laerm): Wird die Fertigmeldung in eine laufende Session hinein
+# installiert oder der Guard neu gestartet, hat DONE_DIR fuer die frueheren Worker
+# noch keine Markierung — der erste Poll meldet dann der Reihe nach Ergebnisse, die
+# der Orchestrator laengst gelesen und deren Panes er laengst geschlossen hat. Genau
+# das ist heute Nacht dreimal passiert und macht die Meldung unglaubwuerdig.
+# Die Grenze ist bewusst grosszuegig: nur was mehr als GRACE_SECONDS vor dem
+# Guard-Start geschrieben wurde, gilt als "hat er schon gesehen". Ein Worker, der
+# kurz vor einem Neustart fertig wurde, wird weiterhin gemeldet — lieber eine
+# Meldung zuviel als ein verlorenes Ergebnis.
+DONE_BACKFILL_GRACE="${DONE_BACKFILL_GRACE:-600}"
+backfill_done_markers() {
+    local name resfile cutoff
+    cutoff=$(( $(date +%s) - DONE_BACKFILL_GRACE ))
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        [ -f "$DONE_DIR/$(sanitize_name "$name")" ] && continue
+        resfile="$HOME/.pi-workers/results/$name/latest.md"
+        [ -s "$resfile" ] || continue
+        # -L: stat der ZIELDATEI, nicht des Symlinks — latest.md zeigt auf die
+        # Ergebnisdatei, und deren Zeitstempel ist der, der zaehlt.
+        # Reihenfolge GNU vor BSD, wie in mtime() weiter oben: bei GNU ist `-f`
+        # kein Formatschalter, sondern "Dateisystem statt Datei" — `stat -L -f %m
+        # <datei>` liest '%m' als zweiten Dateinamen, schreibt trotzdem einen
+        # Dateisystem-Block nach stdout und endet mit 1. In der alten Reihenfolge
+        # stand dieser Block dann vor dem Zeitstempel, der Zahlenvergleich brach ab
+        # und `|| continue` uebersprang die Vormarkierung: auf Linux hat der Guard
+        # damit bei jedem Start jedes alte Ergebnis erneut als frisch gemeldet.
+        [ "$(stat -L -c %Y "$resfile" 2>/dev/null || stat -L -f %m "$resfile" 2>/dev/null || echo 0)" \
+          -lt "$cutoff" ] || continue
+        touch "$DONE_DIR/$(sanitize_name "$name")" 2>/dev/null || true
+        echo "$(date +%H:%M) worker $name war schon vor dem Guard-Start fertig — still vorgemerkt, keine Meldung"
+    done <"$KNOWN_WORKERS_FILE"
+}
+# KNOWN_WORKERS_FILE waechst nur -- sie ueberlebt Guard-Neustarts absichtlich (siehe
+# oben), aber niemand hat je etwas herausgenommen. Gemessen 2026-08-04: 26 Namen in
+# einer einzigen Session, davon 25 ohne lebenden Pane. Jeder Start (backfill_done_markers)
+# und jeder Poll (check_worker_results) geht die GESAMTE Liste durch -- Aufwand und
+# Fehlerflaeche wachsen mit jeder Session, ohne dass je etwas herausfaellt.
+#
+# Ein Name faellt NUR heraus, wenn BEIDES zutrifft: (a) kein lebender Pane mit
+# @wb_worker=<name> mehr vorhanden UND (b) schon eine done-Markierung in DONE_DIR --
+# also fertig UND abgeholt. Nur eins von beiden reicht nicht: ein Name ohne Pane,
+# dessen Ergebnis noch NIEMAND markiert hat (weder backfill_done_markers noch eine
+# echte Meldung), muss weiter in der Liste stehen, sonst verschwindet ein Worker
+# spurlos, dessen Fertigmeldung noch aussteht -- exakt der a project-Bug, den diese
+# Liste ueberhaupt erst behoben hat. Einmal beim START, nicht bei jedem Poll: die
+# Liste wird waehrend eines Laufs von mehreren Stellen gelesen und geschrieben
+# (record_known_worker haengt an), eine laufende Bereinigung waere unnoetige
+# Komplexitaet fuer einen Effekt, der auch einmal pro Start reicht.
+prune_known_workers() {
+    local live_names name tmpfile removed=0 kept=0
+    live_names=$'\n'"$(tmux list-panes -a -F '#{@wb_worker}:#{pane_dead}' 2>/dev/null \
+                        | awk -F: '$1!="" && $2=="0"{print $1}')"$'\n'
+    tmpfile="$KNOWN_WORKERS_FILE.prune.$$"
+    : >"$tmpfile" 2>/dev/null || return
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        if [[ "$live_names" == *$'\n'"$name"$'\n'* ]]; then
+            printf '%s\n' "$name" >>"$tmpfile"; kept=$((kept+1)); continue
+        fi
+        if [ -f "$DONE_DIR/$(sanitize_name "$name")" ]; then
+            removed=$((removed+1)); continue
+        fi
+        printf '%s\n' "$name" >>"$tmpfile"; kept=$((kept+1))
+    done <"$KNOWN_WORKERS_FILE"
+    if (( removed > 0 )); then
+        mv "$tmpfile" "$KNOWN_WORKERS_FILE"
+        echo "$(date +%H:%M) known-workers bereinigt: $removed Name(n) ohne Pane und mit done-Markierung entfernt, $kept verbleiben"
+    else
+        rm -f "$tmpfile"
+    fi
+}
+# So viele Polls IN FOLGE im selben Dialog, bevor gemeldet wird. Ein einzelner
+# Poll reicht nicht -- der Nutzer beantwortet Rueckfragen oft selbst, binnen
+# eines Poll-Intervalls (Default 60s), und eine sofortige Meldung waere dann
+# reiner Laerm. Ueberschreibbar wie POLL/COMPACT_SETTLE, fuer Tests in Minuten
+# statt Stunden.
+DIALOG_CONFIRM_POLLS="${DIALOG_CONFIRM_POLLS:-2}"
+# Thresholds are exact when the status line shows the figures. Only in bar-fallback mode does the
+# ten-block resolution apply -- there a threshold is rounded DOWN to the next reachable step
+# (see ORCH_WARN_EFF below), so it fires earlier rather than never.
+#
+# guardWorkerWarnPct/guardOrchWarnPct (SPEC-V2 A) replace the old hardcoded WARN_PCT/ORCH_PCT.
+# Precedence: an ENV var set by the caller wins, but ONLY when it validates -- otherwise it
+# falls through to the settings file, then the built-in default; same numbers the constants
+# used to carry, so an unconfigured workbench behaves exactly as before. Nothing here ever
+# aborts the guard: a garbage settings value OR a garbage ENV value both fall back rather
+# than being trusted blindly (Reviewer-Befund 5 -- `WARN_PCT=abc` used to hit `(( ))` under
+# `set -u` and kill the poll loop mid-run).
+#
+# validate_pct forces base 10 explicitly: bash's `(( ))` treats a leading zero as octal, so
+# a literal "08" would abort with "value too great for base" before ever reaching the range
+# check (Reviewer-Befund 8) -- `10#$val` reads it as decimal every time, valid or not.
+validate_pct() {   # value -> prints it (normalised, no leading zeros) if 1..99, else fails
+    local val="$1" n
+    [[ "$val" =~ ^[0-9]+$ ]] || return 1
+    n=$((10#$val))
+    (( n >= 1 && n <= 99 )) || return 1
+    echo "$n"
+}
+pct_setting() {   # key default -> validated 1..99 integer from settings, or the default
+    local key="$1" def="$2" val
+    val=$("$HOME/.local/bin/wb-state" settings get "$key" 2>/dev/null)
+    validate_pct "$val" 2>/dev/null || echo "$def"
+}
+# `"${WARN_PCT:-}"` reads an inherited ENV var without tripping `set -u`, and treats an
+# UNSET or EMPTY var identically -- `WARN_PCT=` (the exact form the old SPEC line implied
+# would win) is not a real value and correctly falls through to the settings file, same as
+# not setting it at all.
+resolve_pct() {   # env-value settings-key default -> validated 1..99 integer
+    local envval="$1" v
+    v=$(validate_pct "$envval" 2>/dev/null) && { echo "$v"; return; }
+    pct_setting "$2" "$3"
+}
+# ── Die Wache getrennt je Rolle (2026-08-06, Anforderung des Nutzers) ────────────
+# "Ich will fuer den Orchestrator zum Beispiel die Kontextwache ausschalten
+# koennen, aber fuer die Worker, die sie noch anhaben." Drei Dinge sind seither je
+# Rolle einstellbar: ob die Wache diese Rolle ueberhaupt beobachtet (`an`), ab
+# welcher Auslastung sie mahnt (`mahnenAb`), und ob sie selbst eingreift
+# (`eingreifen`) oder nur meldet. Die Notbremse des Orchestrators steht in
+# derselben Aufstellung (`notbremseAb`) -- bis hierher stand sie fest auf 80 im
+# Code und war nirgends sichtbar, obwohl sie `/compact` in eine fremde Sitzung
+# tippt.
+#
+# ACHTUNG bei der Vorrangfolge: gelesen wird NUR, was wirklich gesetzt ist
+# (`--gesetzt`), nie die Vorgaben darunter. Sonst haette diese neue Aufstellung
+# die aelteren Schluessel guardOrchWarnPct/guardWorkerWarnPct stillschweigend
+# verdraengt, obwohl beide weiter gelten sollen. Reihenfolge unveraendert:
+# ENV gewinnt, dann kontextwache, dann der alte Schluessel, dann die Vorgabe.
+WACHE=$("$HOME/.local/bin/wb-state" wache get --gesetzt --json 2>/dev/null)
+[ -n "$WACHE" ] || WACHE='{}'
+wache_feld() {   # rolle feld -> der GESETZTE Wert oder leer
+    printf '%s' "$WACHE" | /usr/bin/python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+e = d.get(sys.argv[1])
+if isinstance(e, dict) and sys.argv[2] in e:
+    v = e[sys.argv[2]]
+    print("true" if v is True else "false" if v is False else v)
+' "$1" "$2" 2>/dev/null
+}
+wache_an() {     # rolle -> 0 wenn beobachtet wird (Vorgabe: ja)
+    [ "$(wache_feld "$1" an)" != "false" ]
+}
+wache_greift_ein() {   # rolle -> 0 wenn sie selbst kompaktieren darf (Vorgabe: ja)
+    [ "$(wache_feld "$1" eingreifen)" != "false" ]
+}
+
+# Die ENV-Vorgabe wird VORHER festgehalten: gleich darunter ueberschreibt
+# resolve_pct dieselbe Variable, und danach waere nicht mehr zu unterscheiden, ob
+# der Wert vom Aufrufer kam oder aus einer Datei. Genau diese Unterscheidung
+# entscheidet, ob die Einstellung darunter noch zum Zug kommt.
+ENV_WARN=$(validate_pct "${WARN_PCT:-}" 2>/dev/null || true)
+ENV_ORCH=$(validate_pct "${ORCH_PCT:-}" 2>/dev/null || true)
+WARN_PCT=$(resolve_pct "${WARN_PCT:-}" guardWorkerWarnPct 80)   # a worker gets told to hand off + compact at this load
+ORCH_PCT=$(resolve_pct "${ORCH_PCT:-}" guardOrchWarnPct 75)     # the orchestrator gets told to write brain + state at this load
+# kontextwache.<rolle>.mahnenAb steht ZWISCHEN ENV und dem alten Schluessel: eine
+# ENV-Vorgabe des Aufrufers gewinnt weiterhin (Tests setzen sie), der aeltere
+# Schluessel tritt hinter die ausdrueckliche neue Einstellung zurueck.
+if [ -z "$ENV_WARN" ]; then
+    _w=$(wache_feld worker mahnenAb) && _w=$(validate_pct "$_w" 2>/dev/null) && WARN_PCT=$_w
+fi
+if [ -z "$ENV_ORCH" ]; then
+    _o=$(wache_feld orchestrator mahnenAb) && _o=$(validate_pct "$_o" 2>/dev/null) && ORCH_PCT=$_o
+fi
+
+WACHE_WORKER_AN=1;      wache_an worker       || WACHE_WORKER_AN=0
+WACHE_ORCH_AN=1;        wache_an orchestrator || WACHE_ORCH_AN=0
+WACHE_WORKER_EINGRIFF=1; wache_greift_ein worker       || WACHE_WORKER_EINGRIFF=0
+WACHE_ORCH_EINGRIFF=1;   wache_greift_ein orchestrator || WACHE_ORCH_EINGRIFF=0
+
+# ... and at this load the guard compacts the orchestrator ITSELF even without a sentinel.
+# Floor is guardOrchWarnPct (Reviewer-Befund 1, hoch): the old hardcoded 80 meant a
+# guardOrchWarnPct above 80 (valid up to 99) hit the emergency brake BEFORE the warning
+# ever fired -- the orchestrator got compacted having never been asked to save its
+# knowledge, exactly the loss this tool exists to prevent. Self-compaction must never
+# happen before the warning; ORCH_PCT is therefore a hard lower bound, never the other
+# way round (80 still wins whenever ORCH_PCT is at or below it, unaffected).
+ORCH_COMPACT_PCT=80
+_n=$(wache_feld orchestrator notbremseAb); _n=$(validate_pct "$_n" 2>/dev/null) && ORCH_COMPACT_PCT=$_n
+(( ORCH_PCT > ORCH_COMPACT_PCT )) && ORCH_COMPACT_PCT=$ORCH_PCT
+# minWorkerPaneWidth (SPEC-V2 A): only READ here, to name it in the BLIND announcement --
+# wb-grid is the one that enforces it. Same validate-or-default pattern as the percentages,
+# same explicit base-10 fix (Befund 8).
+MINW=$("$HOME/.local/bin/wb-state" settings get minWorkerPaneWidth 2>/dev/null)
+if [[ "$MINW" =~ ^[0-9]+$ ]] && (( 10#$MINW >= 20 )); then
+    MINW=$((10#$MINW))
+else
+    MINW=60
+fi
+# guardMeldetWorkerStatus (2026-08-06, Praezisierung des Nutzers): tippt der Guard von
+# sich aus etwas ueber den STATUS eines Workers in den Orchestrator-Pane -- die
+# Fertigmeldung (check_worker_results) UND die Haengt-Meldung (check_dialog_block)?
+# Vorgabe AUS -- alles ausser dem woertlichen "true" gilt als aus, unset/leer/Fehler
+# eingeschlossen. Das trifft genau die gewuenschte Vorgabe, ohne einen eigenen
+# Vorgabe-Zweig zu brauchen. Die "schon gemeldet"-Merker (DONE_DIR bzw.
+# DIALOG_STATE_DIR) laufen UNABHAENGIG von diesem Schalter weiter -- sie halten
+# fest, was der Guard GESEHEN hat, nicht, was er GEMELDET hat, sonst wuerde ein
+# spaeteres Einschalten die gesamte Vergangenheit auf einen Schlag nachmelden.
+# AUSDRUECKLICH UNBERUEHRT: die Kontext-Warnung des Orchestrators (Zeile ~1345),
+# das getippte /compact (~1127) und der WEITERARBEITEN-Prompt danach (~1136) --
+# die einzige Schutzfunktion, die nie verstummen darf -- sowie jede Meldung an
+# einen WORKER-Pane (Zeile ~1277/1285): Stoerungs-Einwand des Nutzers gilt dem
+# Orchestrator-Chat, nicht den Workern. Kein Menue-Haken dafuer (Auftrag beschraenkt
+# auf shell/, app/ bleibt unberuehrt) -- Einschalten von Hand:
+# `wb-state settings set guardMeldetWorkerStatus true` (aus wieder mit `false`).
+GUARD_MELDET_STATUS=0
+[ "$("$HOME/.local/bin/wb-state" settings get guardMeldetWorkerStatus 2>/dev/null)" = "true" ] && GUARD_MELDET_STATUS=1
+# --workers-only schlaegt JEDE dieser Einstellungen (2026-08-13). Der Anker-Pane einer
+# reinen Worker-Session ist selbst ein Worker; eine an den Orchestrator gerichtete
+# Meldung wuerde dort als fremder Auftrag landen und den Worker von seiner Arbeit
+# abbringen. Deshalb wird hier hart abgeschaltet statt nur per Vorgabe -- eine
+# Einstellung, die jemand anschaltet, darf diesen Modus nicht aufweichen.
+if (( WORKERS_ONLY )); then
+    WACHE_ORCH_AN=0
+    WACHE_ORCH_EINGRIFF=0
+    GUARD_MELDET_STATUS=0
+fi
+# Re-arm gap (Reviewer-Befund 9, niedrig): a pane counts as "recovered" once its load
+# drops this many points below the warn threshold. Flat -20 is today's number and MUST
+# NOT change for it -- both real defaults (75, 80) keep it exactly, unaffected. Only a
+# threshold <= 20 (valid down to 1) made "pct < threshold - 20" permanently false, since a
+# percentage can never be negative -- once warned/compacted, that pane could never be
+# re-armed again in the same guard run. Below that point the gap switches to a proportion
+# of the threshold instead of a flat count, so a reachable re-arm point exists again.
+rearm_gap() {   # threshold -> points below it that count as "recovered"
+    local t="$1" g
+    (( t - 20 >= 1 )) && { echo 20; return; }
+    g=$(( t / 4 )); (( g < 1 )) && g=1
+    echo "$g"
+}
+WORKER_REARM_GAP=$(rearm_gap "$WARN_PCT")
+ORCH_REARM_GAP=$(rearm_gap "$ORCH_PCT")
+POLL="${POLL:-60}"
+COMPACT_SETTLE="${COMPACT_SETTLE:-120}"   # hands off this long right after typing /compact
+# BUSY detection decides whether it is safe to type at all, so it errs towards "busy".
+# 'esc to interrupt' alone was NOT enough: on 2026-07-25 the guard typed /compact into a
+# pane that was mid-turn and only showed its spinner line ("✽ Flibbertigibbeting… (18m ·
+# ↓ 67.5k tokens)") plus "Running 3 shell commands…". Every one of those is a turn in
+# progress. A false BUSY only postpones an action by one poll; a false IDLE corrupts a turn.
+BUSY_RE='esc to interrupt|Compacting|Summariz|tokens\)|↓ [0-9]|Running [0-9]+ (shell|tool)|^[[:space:]]*[✢✳✶✻✽·][[:space:]]+[A-Za-z].*…'
+PROJECT="${PROJECT:-$PWD}"   # HANDOFF-<name>.md and .wb-knowledge-saved live here
+SENTINEL="$PROJECT/.wb-knowledge-saved"   # orchestrator writes it when its knowledge is safe
+GUARD_START=$(date +%s)                   # only a sentinel written after this counts (see below)
+# (mtime() is defined further up, next to the --ensure block that needs it.)
+# (POLL and COMPACT_SETTLE are overridable so the guard can be verified in minutes instead of
+# hours; the defaults are the production values.)
+
+# Karenz gegen Flattern, nur mit --exit-when-no-workers. Der Guard darf sich NICHT beenden,
+# waehrend gerade ein Worker entsteht. Zwei Bedingungen, beide muessen gelten:
+#   * EXIT_GRACE Sekunden Mindestlaufzeit (Default 120 = zwei Poll-Intervalle). pi-worker
+#     markiert den Pane mit @wb_role=worker, BEVOR es --ensure aufruft, der ausloesende
+#     Worker ist also schon sichtbar; die Mindestlaufzeit deckt den umgekehrten Fall ab --
+#     einen Guard, der startet, waehrend tmux einen Pane gerade respawnt/umbaut.
+#   * EXIT_EMPTY_POLLS Polls HINTEREINANDER ohne einen lebenden Worker-Pane (Default 2, also
+#     >= 60s durchgehend leer). Zwischen `split-window` und `set -p @wb_role worker` liegen
+#     Millisekunden -- ein volles Poll-Intervall ist um Groessenordnungen mehr als das
+#     Rennen breit ist, und ein EINZELNER leerer Poll koennte auch ein tmux-Aussetzer sein.
+EXIT_GRACE="${EXIT_GRACE:-120}"
+EXIT_EMPTY_POLLS="${EXIT_EMPTY_POLLS:-2}"
+empty_polls=0
+
+live_worker_count() {   # lebende @wb_role=worker-Panes in der Session des Orchestrators
+    # DEAD ausgenommen (remain-on-exit laesst den Pane eines abgestuerzten Workers stehen --
+    # da ist nur noch sein letzter Bildschirm, kein Kontext, den man bewachen koennte); genau
+    # wie pi-workers maxWorkers-Zaehlung. Ist die Session weg, ist die Antwort 0 und der Guard
+    # laeuft ueber die Karenz hinaus in seinen Feierabend.
+    local sess
+    # Braucht die Basis NICHT (geprueft 2026-08-04, Punkt-0-Nachschau): eine
+    # Sessiongruppe teilt sich ALLE Fenster/Panes, `list-panes -s` liefert also ueber
+    # Basis- oder '-view'-Namen dieselbe Pane-Menge -- nur das ZAEHLERGEBNIS zaehlt
+    # hier, kein Name wird spaeter als Schluessel wiederverwendet.
+    sess=$(tmux display -p -t "$ORCH" '#{session_name}' 2>/dev/null || true)
+    [ -n "$sess" ] || { echo 0; return; }
+    tmux list-panes -s -t "=$sess" -F '#{@wb_role}:#{pane_dead}' 2>/dev/null \
+        | awk -F: '$1=="worker" && $2=="0"' | wc -l | tr -d ' '
+}
+
+session_gone() {   # -> wahr (Exit 0), wenn die beim Start gemerkte Session nicht mehr existiert
+    # Kein Karenz-Zaehler wie bei EXIT_WHEN_EMPTY noetig: "keine Worker gerade" kann ein
+    # fluechtiger Zustand mitten in einem Spawn-Rennen sein und sich von selbst korrigieren --
+    # "die Session existiert nicht mehr" ist es nicht, dafuer gibt es keinen Zwischenzustand.
+    # Der erste Treffer genuegt.
+    [ -n "$GUARD_SESSION" ] || return 1   # kein Name gemerkt -- kein Urteil moeglich, lieber weiterlaufen
+    tmux has-session -t "=$GUARD_SESSION" 2>/dev/null && return 1
+    return 0
+}
+
+# Der bewachte PANE, nicht die Session (2026-08-07). Gemessen an zwei Waisen von heute frueh
+# (%0 und %17, von Hand beendet): eine Waise entsteht auf ZWEI Wegen, und `--exit-when-session-gone`
+# deckt keinen davon ab.
+#   * Der haeufigere: gestartet wird von Hand bzw. ueber wb-code als schlichtes `--auto <pane>`
+#     -- die Startzeile, die auch regeln/kontext-guard.md nennt. Dieser Guard hat GAR KEINE
+#     Abbruchbedingung und laeuft, bis ihn jemand beendet. Beide heute frueh laufenden Guards
+#     trugen genau diese Kommandozeile, und in keinem ihrer Logs steht die Zeile
+#     "endet selbst, sobald die Session ... nicht mehr existiert".
+#   * Der zweite: die Session ueberlebt den Pane. Gemessen im Log der Session wb-AI -- 00:47
+#     "orchestrator=%0", 07:41 "orchestrator=%26", dieselbe Session. Ein neuer Orchestrator-Pane
+#     loest den alten ab, waehrend `has-session` weiter mit Ja antwortet; ein
+#     `--exit-when-session-gone`-Guard waere hier genauso haengengeblieben.
+# Ein Guard ohne seinen Pane kann nichts mehr: nichts lesen, nirgends hin tippen. Er endet
+# deshalb IMMER, unabhaengig von den Flags.
+#
+# Zwei Vorsichtsmassnahmen, beide gegen ein falsches "weg":
+#   * Nur eine ERFOLGREICHE, nicht leere Auflistung zaehlt. Faellt tmux kurz aus, ist die Antwort
+#     "kein Urteil" und nicht "verschwunden" -- die Richtung, in der ein Fehler nur Zeit kostet.
+#   * DEAD-Panes zaehlen als DA. `wb-revive`/`wb-autorevive` beleben einen abgestuerzten Pane mit
+#     `respawn-pane -k` unter DERSELBEN Pane-ID wieder; ein Guard, der beim ersten Absturz geht,
+#     laesst den wiederbelebten Orchestrator unbewacht zurueck.
+ORCH_PANE_GONE_POLLS="${ORCH_PANE_GONE_POLLS:-2}"
+orch_pane_missing=0
+
+orch_pane_gone() {   # -> wahr (Exit 0), wenn der bewachte Pane in einer erfolgreichen Auflistung fehlt
+    # Nur fuer eine echte Pane-ID. `$ORCH` darf laut socket_slug() auch ein Sessionname sein --
+    # dafuer ist diese Frage nicht gestellt und wird nicht beantwortet.
+    case "$ORCH" in %[0-9]*) ;; *) return 1 ;; esac
+    local panes
+    panes="$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null)" || return 1
+    [ -n "$panes" ] || return 1
+    grep -qxF -- "$ORCH" <<<"$panes" && return 1
+    return 0
+}
+
+rm -f "$STOP_FILE"
+
+tonum() {     # "109k" -> 109000 | "1.0M" -> 1000000 | "654" -> 654
+    local v="$1" n u
+    n="${v%[kKmM]}"; u="${v#"$n"}"
+    case "$u" in
+        k|K) awk -v n="$n" 'BEGIN{printf "%d", n*1000}' ;;
+        m|M) awk -v n="$n" 'BEGIN{printf "%d", n*1000000}' ;;
+        *)   awk -v n="$n" 'BEGIN{printf "%d", n}' ;;
+    esac
+}
+
+# LAST-RESORT source: the pane's own transcript, for panes whose status line is truncated before
+# both the figures and the bar (measured at 51 columns with a long project path). It does not care
+# about pane width -- but it is only used when the pane can be mapped to ONE session file without
+# guessing (see below), because a wrong number here is worse than none.
+transcript_load() {   # pane -> "<percent> transcript" or nothing
+    local pid cwd
+    pid=$(tmux display -p -t "$1" '#{pane_pid}' 2>/dev/null) || return
+    cwd=$(tmux display -p -t "$1" '#{pane_current_path}' 2>/dev/null) || return
+    [[ -n "$pid" && -n "$cwd" ]] || return
+    /usr/bin/python3 - "$pid" "$cwd" "$HOME/.claude/projects" <<'PY'
+import json, os, glob, re, subprocess, sys
+pane_pid, cwd, projects = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def cmdline(pid):
+    try:
+        return subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+
+def children(pid):
+    try:
+        out = subprocess.run(["pgrep", "-P", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout.split()
+        return [int(x) for x in out]
+    except Exception:
+        return []
+
+# the claude process of this pane: usually the pane process itself (exec), else a child
+cl, queue, seen = "", [int(pane_pid)], set()
+while queue:
+    p = queue.pop(0)
+    if p in seen:
+        continue
+    seen.add(p)
+    c = cmdline(p)
+    if "claude" in c and "--model" in c:
+        cl = c
+        break
+    queue.extend(children(p))
+if not cl:
+    sys.exit(0)
+
+args = cl.split()
+def opt(name):
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else ""
+model, sid = opt("--model"), opt("--resume")
+
+# Der Ordnername unter ~/.claude/projects ersetzt JEDES Zeichen ausser [A-Za-z0-9-]
+# durch einen Bindestrich, nicht nur den Schraegstrich (gemessen 2026-08-08 an allen
+# 140 vorhandenen Ordnern; in keinem steht ein anderes Zeichen). Der Punkt war der
+# Fall, der auffiel: seit die Worker am 04.08. in ~/.pi-workers/worktrees/<name>
+# umgezogen sind, liegt in JEDEM Worker-Pfad ein versteckter Ordner, "/"-Ersetzung
+# allein ergab "-Users-<user>-.pi-workers-..." statt "-Users-<user>--pi-workers-...",
+# und damit war diese letzte Rueckfallquelle fuer jeden Worker tot. Aufgefallen ist
+# es erst, als zwei Panes ausserdem zu niedrig fuer die Statuszeile waren und der
+# Guard sie als BLIND meldete -- vier Tage lang war die Wache bei jedem Worker eine
+# Quelle aermer, ohne dass es jemand sah.
+proj = os.path.join(projects, re.sub(r"[^A-Za-z0-9-]", "-", cwd))
+path = ""
+if sid and os.path.exists(os.path.join(proj, sid + ".jsonl")):
+    path = os.path.join(proj, sid + ".jsonl")           # --resume names the file exactly
+else:
+    # No --resume: only safe when the folder holds exactly ONE session. Measured 2026-07-25:
+    # four live workers shared one project folder, all files had the same mtime, and
+    # "newest mtime" picked the ORCHESTRATOR's transcript (12% instead of the pane's 26%).
+    # A wrong LOW number is worse than no number -- it silently suppresses the warning. So
+    # when the mapping is ambiguous we report nothing and the caller announces blindness.
+    cands = glob.glob(os.path.join(proj, "*.jsonl"))
+    if len(cands) == 1:
+        path = cands[0]
+if not path:
+    sys.exit(0)
+
+# read from the END -- these files reach tens of megabytes
+try:
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        fh.seek(max(0, size - 400000))
+        chunk = fh.read().decode("utf-8", "replace")
+except Exception:
+    sys.exit(0)
+lines = chunk.split("\n")[1:] if size > 400000 else chunk.split("\n")
+
+used = None
+for line in reversed(lines):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        rec = json.loads(line)
+    except Exception:
+        continue
+    u = (rec.get("message") or {}).get("usage") or rec.get("usage")
+    if isinstance(u, dict) and (u.get("input_tokens") or u.get("cache_read_input_tokens")):
+        used = ((u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0)
+                + (u.get("cache_creation_input_tokens") or 0))
+        break
+if used is None:
+    sys.exit(0)
+
+ctx = 200000 if "haiku" in model else 1000000
+print("%d transcript" % (used * 100 // ctx))
+PY
+}
+
+# Welcher Harness laeuft in diesem Pane? Abgeleitet aus dem Startbefehl, weil kein
+# Spawner eine @wb_harness-Option setzt (nachgesehen 2026-08-06: wb-code, pi-worker,
+# wb-ssh-worker und wb-agent setzen nur @wb_role, @wb_worker und @wb_cmd). Zwei Formen,
+# mehr gibt es heute nicht:
+#   1. Registry-Weg — "... wb-harness-run --model <id> ...": der Harness steht am Modell.
+#   2. Eingebauter Weg — das Programm selbst in der Zeile: ".../claude " oder "exec pi ".
+# Leer heisst UNBEKANNT, nicht "kaputt": dann verhaelt sich alles wie vor der Registry.
+#
+# ZWEITE STELLE: dieselbe Funktion steht in shell/wb-revive. Sie ist bewusst doppelt und
+# nicht in einer gemeinsamen Datei — ein drittes Skript waere ein weiteres Ausrollteil,
+# und faellt es aus, ist der Guard still blind. Wer eine der beiden aendert, aendert
+# beide; shell/tests/test-harness-wege.sh vergleicht sie Zeichen fuer Zeichen.
+pane_harness() {   # <startbefehl> -> harness-id oder leer
+  local c="$1" mid=""
+  case "$c" in
+    *wb-harness-run*)
+      # Nur dieser Zweig braucht die Registry: der Harness haengt am Modell.
+      [ -x "$HOME/.local/bin/wb-state" ] || { printf ''; return; }
+      mid=$(printf '%s\n' "$c" | sed -nE 's/.*--model[= ]+([^ ]+).*/\1/p' | head -1)
+      [ -n "$mid" ] && "$HOME/.local/bin/wb-state" models get "$mid" --field harness 2>/dev/null
+      return ;;
+  esac
+  # Wortgrenze statt Teilzeichenkette: "--model claude-opus-5" ist KEIN claude-Aufruf,
+  # "/Users/x/.local/bin/claude --model …" und "exec pi --provider …" sind welche.
+  [[ "$c" =~ (^|[[:space:]/])claude([[:space:]]|$) ]] && { printf 'claude\n'; return; }
+  [[ "$c" =~ (^|[[:space:]/])pi([[:space:]]|$) ]]     && { printf 'pi\n';     return; }
+  printf ''
+}
+
+# Registry-Angaben je Pane, einmal geholt und dann gemerkt: ein `wb-state`-Aufruf je Pane
+# und Poll waere sonst der teuerste Teil einer Schleife, die sonst nur capture-pane macht.
+# Ein Pane behaelt seinen Harness ueber einen Respawn hinweg (wb-revive startet dieselbe
+# Zeile neu), deshalb ist der Zwischenspeicher gefahrlos.
+# TRENNZEICHEN \002, NICHT Tabulator (gemessen 2026-08-08): ein Tabulator ist fuer `read`
+# ein IFS-WHITESPACE-Zeichen, und dabei fallen aufeinanderfolgende Trenner zu EINEM zusammen
+# und fuehrende verschwinden ganz. `IFS=$'\t' read -r HCTX HCOMPACT <<<$'\t/compact'` setzt
+# also HCTX=/compact und HCOMPACT='' — genau der Fall jedes Harness ohne contextPattern, und
+# damit seit dem 06.08. der Fall von 'claude' selbst: der Guard hielt '/compact' fuer ein
+# Kontextmuster und meldete fuer jeden Claude-Worker "kennt kein Kompaktieren", statt zu
+# kompaktieren. Ein Nicht-Whitespace-Trenner behaelt leere Felder; \002 kommt in keinem der
+# Werte vor (Regex, Slash-Befehl, einzeiliges JSON).
+HSEP=$'\002'
+HCACHE=""     # je Zeile: "<pane>\002<harness>\002<contextPattern>\002<compactCommand>\002<session>\002<contextWindow>"
+
+# Die Formatnamen, fuer die diese Wache einen Leser HAT. Der session-Block der Registry
+# beschreibt seit dem 11.08. auch Quellen, die nur die Chat-Ansicht liest (claude-transcript,
+# qwen-chat-jsonl, opencode-http …); ein Name ohne Leser darf hier nicht als fuenfte Quelle
+# gelten, sonst meldet der Guard einen Pane als bewacht, den er nicht lesen kann.
+# ZWEITE STELLE: dieselben Namen stehen im Verteiler von session_load() weiter unten; beide
+# Stellen gehoeren gleichgehalten, und test-context-guard-sessionblock.sh vergleicht sie.
+SESS_FORMATE="codex-rollout aider-chat-history crush-sqlite gptme-jsonl copilot-sqlite cline-sessions openhands-state"
+HID=""; HCTX=""; HCOMPACT=""; HSESS=""; HWIN=""
+harness_info() {   # <pane> -> fuellt HID, HCTX, HCOMPACT, HSESS, HWIN
+    local pane="$1" line cmd hjson mid
+    line=$(printf '%s\n' "$HCACHE" | awk -F"$HSEP" -v p="$pane" '$1==p{print; exit}')
+    if [[ -n "$line" ]]; then
+        IFS="$HSEP" read -r _ HID HCTX HCOMPACT HSESS HWIN <<<"$line"
+        return
+    fi
+    HID=""; HCTX=""; HCOMPACT=""; HSESS=""; HWIN=""
+    cmd=$(tmux show-options -pqv -t "$pane" @wb_cmd 2>/dev/null || true)
+    [[ -n "$cmd" ]] || cmd=$(tmux display-message -p -t "$pane" '#{pane_start_command}' 2>/dev/null || true)
+    HID="$(pane_harness "$cmd")"
+    if [[ -n "$HID" ]]; then
+        hjson="$("$HOME/.local/bin/wb-state" harness get "$HID" 2>/dev/null || true)"
+        if [[ -n "$hjson" && "$hjson" == \{* ]]; then
+            # Der session-Block kommt als EINZEILIGES JSON zurueck (separators ohne
+            # Leerzeichen): er faehrt als ein Feld in derselben Zeile mit, und \002 kann darin
+            # nicht vorkommen — json.dumps schreibt Steuerzeichen als \uXXXX. Weitergereicht
+            # wird er NUR, wenn er eine Sitzungsdatei in einem Format nennt, fuer das diese
+            # Wache einen Leser hat; sonst bleibt HSESS leer und der Pane gilt als unbewacht.
+            IFS="$HSEP" read -r HCTX HCOMPACT HSESS <<<"$(printf '%s' "$hjson" | /usr/bin/python3 -c '
+import json, sys
+h = json.load(sys.stdin)
+kann = set(sys.argv[1].split())
+s = h.get("session")
+lesbar = (isinstance(s, dict) and s.get("via") == "sessionFile"
+          and s.get("format") in kann and s.get("ort"))
+print("\002".join([h.get("contextPattern") or "", h.get("compactCommand") or "",
+                   json.dumps(s, separators=(",", ":")) if lesbar else ""]))
+' "$SESS_FORMATE" 2>/dev/null)"
+        fi
+        # Das Kontextfenster des MODELLS, nur fuer die fuenfte Quelle und nur einmal je Pane:
+        # aiders Sitzungsdatei nennt die verbrauchten Token, aber keinen Nenner (gemessen
+        # 2026-08-08). Fehlt das Feld in der Registry, bleibt HWIN leer und session_load()
+        # liefert nichts — geraten wird der Nenner nicht.
+        if [[ -n "$HSESS" ]]; then
+            mid=$(printf '%s\n' "$cmd" | sed -nE 's/.*--model[= ]+([^ ]+).*/\1/p' | head -1)
+            [[ -n "$mid" ]] && HWIN=$("$HOME/.local/bin/wb-state" models get "$mid" --field contextWindow 2>/dev/null | tr -dc '0-9')
+        fi
+    else
+        # Unbekannter Harness: exakt das Verhalten von vor der Registry, also /compact.
+        # Ein bekannter Harness OHNE compactCommand ist etwas anderes — dort wird bewusst
+        # nichts getippt (pi, aider und agy kompaktieren nicht auf Kommando).
+        HCOMPACT="/compact"
+    fi
+    HCACHE="$(printf '%s\n%s%s%s%s%s%s%s%s%s%s%s' "$HCACHE" \
+              "$pane" "$HSEP" "$HID" "$HSEP" "$HCTX" "$HSEP" "$HCOMPACT" "$HSEP" "$HSESS" "$HSEP" "$HWIN")"
+}
+
+# FUENFTE Quelle (2026-08-08): die Sitzungsdatei, die der Harness SELBST schreibt.
+#
+# Warum es sie braucht: fuer codex, agy und aider greift keine der vier Quellen davor —
+# keiner der drei zeigt eine Kontextauslastung auf dem Bildschirm, also gibt es auch kein
+# contextPattern, das man eintragen koennte (codex und aider am 2026-08-08 nachgemessen,
+# agy am 07.08.). Ein Worker auf einem dieser Harnesses lief damit unbewacht.
+#
+# Der Vertrag ist BEWUSST eng: gelesen wird nur, was das Werkzeug selbst als TOKENZAHL
+# aufgeschrieben hat. Aus einer Dateigroesse oder einer Zeichenzahl wird NICHTS geschaetzt —
+# eine Schaetzung, die als Prozentzahl auftritt, laesst sich von einer Messung nicht mehr
+# unterscheiden, und der Guard tippt auf diese Zahl hin in fremde Panes.
+#
+# Gelesen wird der session-Block der Registry (bis 2026-08-11 hiess er contextSession):
+# session.ort ist der Pfad, session.format der Name des Lesers, session.maxAgeSec das
+# Hoechstalter. Ein Formatname, den dieser Verteiler nicht kennt, liefert nichts (statt so zu
+# tun, als genuege es, einen Namen in die Registry zu schreiben) — und er kommt hier gar nicht
+# erst an, weil harness_info nur die Namen aus SESS_FORMATE durchlaesst.
+#   codex-rollout        ~/.codex/sessions/<jahr>/<monat>/<tag>/rollout-*.jsonl. Traegt in
+#                        event_msg/token_count sowohl den Verbrauch des letzten Zuges
+#                        (info.last_token_usage.total_tokens) ALS AUCH das Fenster
+#                        (info.model_context_window) — der Nenner kommt also aus derselben
+#                        Datei, nichts ist zu pflegen. Der Pane wird ueber session_meta.cwd
+#                        zugeordnet (aufgeloest verglichen: codex schreibt /private/var/...).
+#   aider-chat-history   .aider.chat.history.md IM Arbeitsverzeichnis des Panes. Traegt je
+#                        Zug "> Tokens: 760 sent, 388 received." — der Zaehler, aber KEINEN
+#                        Nenner; der kommt aus contextWindow des Modells in der Registry.
+#                        Gelesen wird nur der Abschnitt nach dem letzten "# aider chat
+#                        started at": die Datei wird ueber Sitzungen hinweg ANGEHAENGT, und
+#                        die 90 % der Vorsitzung waeren fuer die neue eine Falschmeldung.
+#   crush-sqlite         .crush/crush.db IM Arbeitsverzeichnis des Panes (2026-08-08).
+#                        crush ZEIGT seine Auslastung zwar an, aber in der rechten
+#                        Seitenleiste weit oben — ausserhalb der fuenf Zeilen, die
+#                        read_load liest. Die Datenbank traegt dieselbe Zahl: Tabelle
+#                        sessions, prompt_tokens + completion_tokens ist genau der Wert
+#                        neben dem Prozentsatz in der Leiste (gemessen: 11949+268 zu
+#                        angezeigten 12.2K). Nenner wie bei aider aus contextWindow des
+#                        Modells. GELESEN WIRD NUR, NIE GESCHRIEBEN, und ausdruecklich
+#                        schreibgeschuetzt geoeffnet: die Datei gehoert einem laufenden
+#                        crush, das im WAL-Modus darauf schreibt.
+#   gptme-jsonl          <logs>/<unterhaltung>/conversation.jsonl (2026-08-08). gptme zeigt
+#                        seine Auslastung NIRGENDS im Bild — die Zahl gibt es nur auf den
+#                        Befehl /tokens hin, und einen Befehl kann die Wache nicht tippen.
+#                        Aufgeschrieben wird sie trotzdem: jede Assistenten-Nachricht traegt
+#                        metadata.usage mit input_tokens und output_tokens, und deren Summe
+#                        ist der Stand des Kontexts (dieselbe Rechnung wie bei crush).
+#                        Nenner wie bei aider und crush aus contextWindow des Modells.
+#                        Der Pfad ist ein GLOB ueber den Unterhaltungs-Ordnern, nicht ein
+#                        Verzeichnis des Panes: gptme legt seine Unterhaltungen nach Namen ab
+#                        und nicht nach Arbeitsverzeichnis. Zugeordnet wird deshalb wie bei
+#                        codex ueber den Ort, den das Werkzeug selbst notiert — hier der
+#                        Symlink 'workspace' im Ordner der Unterhaltung, aufgeloest mit dem
+#                        Arbeitsverzeichnis des Panes verglichen. Damit der Glob ueberhaupt
+#                        treffen kann, setzt der Harness-Eintrag GPTME_LOGS_HOME auf denselben
+#                        Ort; ohne diese Variable waehlt gptme zwischen zwei Plattform-Pfaden.
+#   copilot-sqlite       ~/.copilot/session-store.db (2026-08-08). Auch die Copilot CLI zeigt
+#                        ihre Auslastung nicht in der Fusszeile — nur der Befehl /context
+#                        nennt sie, und einen Befehl kann die Wache nicht tippen. Die
+#                        Datenbank fuehrt sie mit: Tabelle assistant_usage_events mit
+#                        input_tokens und output_tokens je Zug, verbunden ueber session_id
+#                        mit der Tabelle sessions, die das Arbeitsverzeichnis traegt (Spalte
+#                        cwd, in aufgeloester Schreibweise). Zugeordnet wird also ueber cwd
+#                        wie bei codex, gerechnet input + output wie bei gptme und crush,
+#                        Nenner aus contextWindow des Modells. Die Datei ist GETEILT (alle
+#                        Copilot-Panes schreiben hinein) und gehoert einem laufenden Prozess:
+#                        geoeffnet wird ausdruecklich schreibgeschuetzt, und zwei gleichzeitig
+#                        lebende Sitzungen im selben Verzeichnis liefern lieber nichts.
+#   openhands-state      ~/.openhands/conversations/*/base_state.json (2026-08-10). Die
+#                        OpenHands CLI zeigt in ihrer Fusszeile nur eine ABSOLUTE Zahl
+#                        ('ctx 11.88K'), also keine Auslastung, die ein contextPattern
+#                        faengt. Dieselbe Zahl steht in der Datei, und zwar je Zug:
+#                        stats.usage_to_metrics.agent.token_usages[-1] mit prompt_tokens
+#                        und completion_tokens. Gerechnet wird ihre Summe (wie crush,
+#                        gptme und copilot); die Fusszeile zeigt nur den ersten der
+#                        beiden (gemessen: 11.88K zu prompt_tokens 11878). Geschrieben
+#                        wird WAEHREND des Laufs, nicht erst beim Beenden — nachgemessen
+#                        an zwei Zuegen mit lebendem Prozess. Der Pane wird ueber
+#                        workspace.working_dir zugeordnet (aufgeloest verglichen, die
+#                        CLI notiert /private/tmp/...), Nenner aus contextWindow des
+#                        Modells. context_window steht zwar in der Datei, ist bei einem
+#                        Ollama-Modell hinter dem OpenAI-Endpunkt aber 0.
+#   cline-sessions       ~/.cline-wb/sessions/<id>/<id>.json + <id>.messages.json
+#                        (2026-08-10). Die Cline CLI zeigt in ihrer Fusszeile ebenfalls
+#                        nur eine absolute Zahl ('qwen3:1.7b (3,673) $0.0000'). Die
+#                        Sitzung nennt das Arbeitsverzeichnis (cwd, aufgeloest), die
+#                        Nachrichtendatei daneben traegt je Antwort metrics.inputTokens
+#                        und metrics.outputTokens; gerechnet wird die Summe, angezeigt
+#                        wird nur der erste (gemessen: 3673). Auch hier je Zug und bei
+#                        lebendem Prozess geschrieben. Der contextProbe vom 08.08. hielt
+#                        das Gegenteil fest ('waehrend des Laufs keine Datei mit
+#                        Tokenzahlen'); die Suche lief damals unter dem falschen Ordner.
+#                        Nenner aus contextWindow des Modells.
+session_load() {   # <pane> -> "<percent> session" oder nichts  (setzt harness_info voraus)
+    local pane="$1" cwd out tok pct fenster
+    [[ -n "$HSESS" ]] || return
+    cwd=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null) || return
+    [[ -n "$cwd" ]] || return
+    # Der eigentliche Leser ist ausgelagert (2026-08-11, shell/wb-session-load):
+    # EIN Leser fuer die sieben Formate, gerufen von der Wache HIER und vom
+    # Worker-Modell der Oberflaeche (workerstate.ts) -- statt ihn ein zweites
+    # Mal in TypeScript nachzubauen. Liegt neben diesem Skript (SELF_PATH), so
+    # wie der Testlauf und die Installation es auch fuer wb-state & Co. halten.
+    [[ -x "$SESSION_LOAD_PY" ]] || return
+    out=$("$SESSION_LOAD_PY" "$HSESS" "$cwd" "${HWIN:-0}" 2>/dev/null) || return
+    [[ -n "$out" ]] || return
+    read -r tok pct fenster <<<"$out"
+    # tok und fenster bleiben hier ungenutzt -- die Wache braucht fuer ihre
+    # Entscheidungen nur den Prozentsatz, das Worker-Modell nimmt alle drei
+    # Zahlen selbst ab.
+    [[ "$pct" =~ ^[0-9]+$ ]] || return
+    echo "$pct session"
+}
+
+read_load() { # pane -> "<percent> <exact|bar|transcript|registry|session|none>"; -1 when nothing is readable
+    local cap tail5 pair num den bar filled t sedx
+    cap=$(tmux capture-pane -p -t "$1" 2>/dev/null) || cap=""
+    # BOTH readings come from the status line, so both search the SAME bottom window. Searching
+    # the whole pane for a bar finds STALE ones that scrolled up (measured: an old bar from
+    # further up read 80% while the live status line said 76%, and that triggered a compaction
+    # that should not have happened). A stale value is worse than no value.
+    tail5=$(printf '%s\n' "$cap" | tail -5)
+    # 1) exact figures, e.g. "109k/1.0M". Only the last lines are searched: that is where the
+    #    status line lives, and arbitrary output above must not be mistaken for it.
+    pair=$(printf '%s\n' "$tail5" \
+           | grep -oE '[0-9]+(\.[0-9]+)?[kKmM]?/[0-9]+(\.[0-9]+)?[kKmM]' | tail -1)
+    if [[ -n "$pair" ]]; then
+        num=$(tonum "${pair%%/*}"); den=$(tonum "${pair##*/}")
+        if [[ -n "$den" ]] && (( den > 0 )); then echo "$(( num * 100 / den )) exact"; return; fi
+    fi
+    # 2) ten-block bar, 10% resolution (pane too narrow for the figures)
+    bar=$(printf '%s\n' "$tail5" | grep -oE '[▓░]{6,12}' | tail -1)
+    if [[ -n "$bar" ]]; then
+        filled=${bar//░/}
+        echo "$(( ${#filled} * 10 )) bar"
+        return
+    fi
+    # 3) last resort: the transcript (pane so narrow that the status line is cut before the bar)
+    t=$(transcript_load "$1")
+    [[ -n "$t" ]] && { echo "$t"; return; }
+    # 4) das contextPattern des Harness aus der Registry (2026-08-06). Bewusst NACH den drei
+    #    gewachsenen Quellen: Claude und pi haengen daran, und pi wird ueberhaupt nur deshalb
+    #    ueberwacht, weil seine Statuszeile zufaellig die Schreibweise der ersten Quelle trifft
+    #    (gemessen 2026-08-06: "░░░░░░░░░░ 3k/66k"). Die Registry kommt dazu, sie ersetzt nichts.
+    #    Vertrag: die ERSTE Gruppe des Musters faengt die Auslastung in Prozent.
+    #    Das Trennzeichen fuer sed ist ein Steuerzeichen (\001) und nicht '/' oder '%': beide
+    #    kommen in echten Mustern vor — codex sucht nach einem Prozentzeichen, opencode nach
+    #    Klammern um eines.
+    harness_info "$1"
+    if [[ -n "$HCTX" ]]; then
+        sedx=$(printf 's\001.*%s.*\001\\1\001p' "$HCTX")
+        t=$(printf '%s\n' "$tail5" | sed -nE "$sedx" 2>/dev/null | tail -1)
+        if [[ "$t" =~ ^[0-9]{1,3}$ ]] && (( t <= 100 )); then echo "$t registry"; return; fi
+    fi
+    # 5) die Sitzungsdatei des Harness (2026-08-08). Als LETZTE, weil sie als einzige Quelle
+    #    den Bildschirm verlaesst: sie liest Dateien und kostet mehr als ein capture-pane.
+    #    Bezahlt wird das nur fuer Panes, die ohne sie ohnehin blind waeren.
+    t=$(session_load "$1")
+    [[ -n "$t" ]] && { echo "$t"; return; }
+    echo "-1 none"
+}
+
+announce_blind() {   # say it ONCE per pane instead of silently never warning
+    local pane="$1" label="$2" is_worker="${3:-0}" msg tpath
+    [[ "$blind" == *" $pane"* ]] && return
+    msg="$(date +%H:%M) $label ($pane): BLIND — weder Transcript noch Statuszeile lesbar; dieser Pane wird NICHT ueberwacht. Vermutlich schmaler als minWorkerPaneWidth=${MINW} Spalten — mit wb-grid gegenpruefen."
+    # SPEC-V2 B: for a worker (never the orchestrator, whose own transcript_load() above
+    # already tried this pane's OWN process/cwd mapping and failed for a different
+    # reason) name the RECORDED transcript file. pi-worker's background watcher stores
+    # the worker's claudeSessionId once its conversation starts, which sidesteps exactly
+    # the ambiguity that defeats transcript_load()'s own guess (several live sessions in
+    # one folder) — the state file already knows which one is this worker's. This is a
+    # POINTER only: no token count, no load percentage is computed from it here — that
+    # would be its own feature, not this one.
+    if [ "$is_worker" = "1" ]; then
+        tpath=$("$HOME/.local/bin/wb-state" worker-transcript "$label" 2>/dev/null)
+        [ -n "$tpath" ] && msg="$msg Transkript: $tpath"
+    fi
+    # Warum blind, wenn der Pane breit genug ist (2026-08-06): Ein fremder Harness hat weder
+    # Claudes Statuszeile noch sein Transcript. Dann ist die Ursache nicht die Breite, sondern
+    # ein fehlendes Muster — und das gehoert gesagt, sonst sucht man an der falschen Stelle.
+    harness_info "$pane"
+    if [ -n "$HID" ] && [ -z "$HCTX" ] && [ -z "$HSESS" ]; then
+        msg="$msg Harness '$HID' hat weder contextPattern noch eine lesbare Sitzungsquelle in der Registry — fuer ihn gibt es weder eine vierte noch eine fuenfte Quelle. Zeigt er eine Auslastung an, Muster messen und eintragen (wb-state models set --kind harness $HID contextPattern ...); zeigt er keine, aber schreibt eine Sitzungsdatei mit Tokenzahlen, gehoert sie in den session-Block (via 'sessionFile', ort, format — und das Format braucht einen Leser in dieser Wache). Sonst bleibt dieser Harness dauerhaft unbewacht."
+    fi
+    # Die fuenfte Quelle IST eingetragen und hat trotzdem nichts geliefert. Der haeufigste
+    # Grund ist ein fehlender Nenner: aiders Sitzungsdatei nennt nur die verbrauchten Token.
+    # Das gehoert benannt, sonst sucht man am Harness statt am Modell (2026-08-08).
+    if [ -n "$HSESS" ] && [ -z "$HWIN" ]; then
+        msg="$msg Harness '$HID' hat eine lesbare Sitzungsquelle (session), aber das Modell dieses Panes kein contextWindow in der Registry — ohne Nenner wird aus der Tokenzahl KEINE Prozentzahl geraten. contextWindow am Modell nachtragen."
+    fi
+    echo "$msg"
+    blind="$blind $pane"
+}
+
+# JEDER Tastendruck dieses Guards geht durch wb-pane-write (2026-08-06). Der Guard
+# gehoert zu den zwei Erlaubten und kommt dort durch — genau deshalb ist er der
+# richtige Beweis, dass die Engstelle die erlaubten Wege nicht zumauert. Fehlt das
+# Werkzeug, wird NICHT auf `tmux send-keys` zurueckgefallen: ein Rueckfall waere ein
+# Loch, das offen steht, sobald jemand die Installation halb ausliefert.
+PANE_WRITE="$HOME/.local/bin/wb-pane-write"
+
+schreib_text() {   # <pane> <text> -> wortwoertlich tippen, ohne Enter
+    [ -x "$PANE_WRITE" ] || { echo "context-guard: $PANE_WRITE fehlt — es wird NICHTS in einen Pane getippt." >&2; return 1; }
+    printf '%s' "$2" | "$PANE_WRITE" tippen "$1"
+}
+
+schreib_taste() {  # <pane> <tastenname>
+    [ -x "$PANE_WRITE" ] || return 1
+    "$PANE_WRITE" taste "$1" "$2"
+}
+
+# --- Absende-Pruefung ---------------------------------------------------------------
+# Text und Enter gehen schon immer als ZWEI getrennte wb-pane-write-Aufrufe raus (mit
+# einer Sekunde Pause dazwischen), nie in einem. Getippt ist trotzdem nicht angekommen:
+# tmux send-keys schreibt in den Pane und kehrt sofort zurueck, ohne zu warten, bis die
+# Gegenseite die Tasten verarbeitet hat. Gemessen 2026-08-12 (Pane %86, Worker chatsdk,
+# Log wb-AI): "at 80% -> handoff requested" stand im Protokoll, das Enter war also
+# geschickt -- der lange Handoff-Text stand danach trotzdem fertig getippt in der
+# Eingabezeile, nichts wurde abgeschickt, und der Kontext blieb bei 812k, weil die
+# Kompaktierung (Schritt 2) auf die -- nie geschriebene -- HANDOFF-Datei wartete. Weder
+# nudge() noch nudge_queue() pruefte je, was aus dem getippten Enter wurde; beide
+# meldeten unbedingt Erfolg. Verifiziert wird wie in pi-worker (dort gemessen und
+# getestet, shell/tests/test-absende-pruefung.sh): die Eingabezeile traegt danach
+# keinen Text mehr. Steht dort noch welcher, wird EINMAL ein zweites Enter nachgeschoben
+# und erneut geprueft -- nie oefter, und nie in einen sichtbaren Auswahldialog hinein:
+# dessen Optionszeilen beginnen mit demselben Zeiger '❯' wie die Eingabezeile, und ein
+# blindes zweites Enter dort waere keine Nachhilfe beim Absenden, sondern eine
+# Bestaetigung der markierten Option.
+GUARD_PROMPT_RE='^❯'
+GUARD_PROMPT_IGNORE='^❯ Press up to edit queued messages'
+absenden_verifizieren() {   # <pane> -> 0: Eingabezeile frei (oder Queue-Platzhalter), 1: Text haengt noch
+    local pane="$1" versuch inbox
+    for versuch in 1 2; do
+        sleep 1
+        [[ -n "$(pane_dialog_question "$pane")" ]] && return 1
+        inbox=$(tmux capture-pane -p -t "$pane" 2>/dev/null | grep -E "$GUARD_PROMPT_RE" | tail -1)
+        printf '%s' "$inbox" | grep -qE "$GUARD_PROMPT_IGNORE" && return 0
+        printf '%s' "$inbox" | grep -qE "${GUARD_PROMPT_RE}[[:space:]]+[^[:space:]]" || return 0
+        (( versuch == 1 )) && schreib_taste "$pane" Enter
+    done
+    return 1
+}
+
+nudge() {     # never interrupt a turn or a compaction (for /compact + orchestrator actions)
+    local pane="$1" msg="$2"
+    tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && return 1
+    schreib_text "$pane" "$msg" || return 1
+    sleep 1
+    schreib_taste "$pane" Enter
+    return 0
+}
+
+# Dieselbe Grundlage wie nudge(), zusaetzlich mit absenden_verifizieren() oben --
+# bewusst NICHT die Vorgabe fuer JEDEN nudge()-Aufruf, sondern nur fuer die Kette
+# handoff -> $HCOMPACT -> WEITERARBEITEN, wo diese Wache selbst weitertippt (siehe
+# deren Aufrufstellen). Eine Fertig- oder Postfach-Meldung ist eine einmalige
+# Randnotiz mit einer eigenen "nie zweimal"-Zusage (siehe deren Tests) und einem
+# Merker, der erst NACH einem erfolgreichen nudge() geschrieben wird: haengt die
+# Absende-Pruefung noch, waehrend der Guard just in dieser Sekunde beendet oder neu
+# gestartet wird, bleibt der Merker aus, obwohl der Text laengst sichtbar im Pane
+# stand -- die Meldung kommt beim Neustart ein zweites Mal. Gemessen, nicht vermutet:
+# genau das riss test-context-guard-postfach.sh (e) ein, als absenden_verifizieren()
+# probeweise in jedem nudge() lag (Restart mitten in dessen Wartesekunden). Fuer
+# Kompaktierung und Wiederaufnahme-Prompt gilt die Sorge nicht in derselben Schaerfe:
+# ein wiederholtes Tippen dort ist eine harmlose Redundanz, ein unentdeckt
+# verschlucktes ist der Bug, den dieser Auftrag beheben soll -- deshalb hier, und nur
+# hier, verifiziert.
+nudge_verifiziert() {
+    local pane="$1" msg="$2"
+    tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && return 1
+    schreib_text "$pane" "$msg" || return 1
+    sleep 1
+    schreib_taste "$pane" Enter
+    absenden_verifizieren "$pane" && return 0
+    echo "$(date +%H:%M) context-guard: Absenden an $pane NICHT verifiziert -- Text stand nach Enter (und einer Nachhilfe) noch in der Eingabezeile. Selbst pruefen: tmux capture-pane -p -t $pane" >&2
+    return 1
+}
+
+# Queue a message even when the pane is BUSY. Claude Code queues keystrokes typed mid-turn and
+# processes them after the current step ("Press up to edit queued messages"), so a handoff REQUEST
+# lands even for a worker that is continuously working. This closes the blind spot that let a worker
+# run to 99% context: the idle-only nudge() never fired because the worker was never idle. Safe only
+# for a plain message (it queues); NEVER for /compact (a queued "/compact" runs as a chat message,
+# not the command).
+nudge_queue() {
+    local pane="$1" msg="$2"
+    schreib_text "$pane" "$msg" || return 1
+    sleep 1
+    schreib_taste "$pane" Enter
+    absenden_verifizieren "$pane" && return 0
+    echo "$(date +%H:%M) context-guard: Absenden (queue) an $pane NICHT verifiziert -- Text stand nach Enter (und einer Nachhilfe) noch in der Eingabezeile. Selbst pruefen: tmux capture-pane -p -t $pane" >&2
+    return 1
+}
+
+sanitize_name() { printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-'; }
+
+record_known_worker() {   # name -> appends to KNOWN_WORKERS_FILE once, deduped
+    local name="$1"
+    [ -n "$name" ] || return
+    grep -qxF "$name" "$KNOWN_WORKERS_FILE" 2>/dev/null || echo "$name" >>"$KNOWN_WORKERS_FILE"
+}
+
+# Ein wartender Auswahldialog erkannt an seiner FORM, nicht an einem Wortlaut:
+# mindestens zwei Zeilen im Muster "<Auswahlzeiger?> <Ziffer>. <Text>" (eine
+# echte Auswahl hat immer >= 2 Optionen), davon MINDESTENS eine mit dem
+# Auswahlzeiger "❯" direkt vor der Ziffer -- Claude Codes normale Antwort-
+# Textausgabe rendert nie diesen Zeiger vor einer nummerierten Liste, nur der
+# interaktive Auswahl-Widget tut das. Das unterscheidet den Dialog auch von
+# der laufenden INPUT-Zeile, die ebenfalls mit "❯" beginnt (siehe
+# regeln/worker-panes.md) -- die traegt keine Ziffer+Punkt direkt danach.
+# Dazu, als drittes Merkmal, eine FRAGE: die letzte Zeile VOR der ersten
+# Optionszeile, die auf '?' oder ':' endet. Fehlt sie, wird NICHT gemeldet --
+# lieber ein Dialog seltener erkannt als ein falsches Muster in normalem Text.
+# Absichtlich kein einzelnes deutsches/englisches Wort im Muster (Frage-Text,
+# "proceed"/"fortfahren", Optionsbeschriftung): das aendert sich mit der
+# naechsten CLI-Version, die Form (Frage + nummerierte Auswahl + Zeiger) ist
+# stabiler.
+DIALOG_OPTION_RE='^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.[[:space:]]'
+
+pane_dialog_question() {   # pane -> Frage-Zeile, wenn ein wartender Auswahldialog sichtbar ist, sonst leer
+    local pane="$1" cap tail n_opts first_opt_line q
+    cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null) || { echo ""; return; }
+    tail=$(printf '%s\n' "$cap" | grep -v '^[[:space:]]*$' | tail -20)
+    [ -n "$tail" ] || { echo ""; return; }
+    n_opts=$(printf '%s\n' "$tail" | grep -cE "$DIALOG_OPTION_RE")
+    (( n_opts >= 2 )) || { echo ""; return; }
+    printf '%s\n' "$tail" | grep -E "$DIALOG_OPTION_RE" | grep -q '❯' || { echo ""; return; }
+    first_opt_line=$(printf '%s\n' "$tail" | grep -nE "$DIALOG_OPTION_RE" | head -1 | cut -d: -f1)
+    q=$(printf '%s\n' "$tail" | head -n $(( first_opt_line - 1 )) | grep -E '[?:][[:space:]]*$' | tail -1 \
+        | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    echo "$q"
+}
+
+# Zustand pro Worker: DIALOG_CONFIRM_POLLS aufeinanderfolgende Polls im
+# selben Dialog, bevor genau EINMAL an den Orchestrator gemeldet wird (Datei
+# ".reported" sperrt Wiederholungen fuer dieses Vorkommnis). Sobald kein
+# Dialog mehr sichtbar ist, werden Zaehler UND Sperre geloescht -- ein
+# spaeterer, neuer Dialog wird dadurch wieder von vorn gezaehlt und erneut
+# gemeldet (Vorgabe: "loest sich der Dialog auf, wird der Zustand
+# zurueckgesetzt").
+check_dialog_block() {   # pane name -> meldet dem Orchestrator, wenn noetig
+    local pane="$1" name="$2" key countfile flagfile q count
+    key="$(sanitize_name "$name")"
+    countfile="$DIALOG_STATE_DIR/$key.count"
+    flagfile="$DIALOG_STATE_DIR/$key.reported"
+    q="$(pane_dialog_question "$pane")"
+    if [[ -z "$q" ]]; then
+        rm -f "$countfile" "$flagfile"
+        return
+    fi
+    count=$(( $(cat "$countfile" 2>/dev/null || echo 0) + 1 ))
+    echo "$count" >"$countfile"
+    (( count >= DIALOG_CONFIRM_POLLS )) || return   # noch nicht genug Polls in Folge
+    [[ -f "$flagfile" ]] && return                  # dieses Vorkommnis schon gemeldet
+    # guardMeldetWorkerStatus AUS (Vorgabe): der ".reported"-Merker wird trotzdem
+    # gesetzt, als haette der Tap stattgefunden -- sonst wuerde dasselbe haengende
+    # Vorkommnis bei jedem Poll erneut geprueft. Kein nudge(), also kein
+    # log_orch_notify (die haelt nur fest, was tatsaechlich im Pane getippt wurde).
+    if (( ! GUARD_MELDET_STATUS )); then
+        touch "$flagfile"
+        echo "$(date +%H:%M) $name ($pane) haengt in Rueckfrage (${count} Polls) -> Meldung unterdrueckt (guardMeldetWorkerStatus aus), Merker gesetzt: $q"
+        return
+    fi
+    if nudge "$ORCH" "WORKER HAENGT (automatisch): $name ($pane) steht seit ${count} Polls in Folge vor einer Rueckfrage, die nur der Nutzer beantworten kann -- Frage: $q. Pane pruefen (tmux capture-pane -p -t $pane) und beantworten, oder der Nutzer Bescheid geben."; then
+        touch "$flagfile"
+        echo "$(date +%H:%M) $name ($pane) haengt in Rueckfrage (${count} Polls) -> orchestrator benachrichtigt: $q"
+        log_orch_notify "WORKER HAENGT: $name ($pane), ${count} Polls, Frage: $q"
+    fi
+}
+
+# Fertigmeldung: jeder Poll geht jeden je gesehenen Worker-Namen dieser Session durch --
+# nicht nur die gerade lebenden Panes, sonst verschluckt ein geschlossener Pane das
+# Ergebnis. "-s" prueft Existenz+Groesse>0 UND folgt dem Symlink latest.md ->
+# <zeitstempel>.md; ein haengender Symlink ohne Ziel liefert false, also keine Meldung.
+# Genau EINMAL pro Worker: die DONE_DIR-Markierung wird erst nach ERFOLGREICHEM nudge()
+# gesetzt (Pane also nicht BUSY) -- bei BUSY bleibt der Worker unmarkiert und wird beim
+# naechsten Poll automatisch erneut versucht, bis es durchkommt.
+check_worker_results() {
+    tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$ORCH" || return
+    local name resfile donefile machine self msg
+    case "$(uname -s)" in Darwin) self=mac ;; *) self=peer ;; esac
+    local ident prev ziel
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        donefile="$DONE_DIR/$(sanitize_name "$name")"
+        machine=$("$HOME/.local/bin/wb-state" worker-machine "$name" 2>/dev/null)
+        if [ -z "$machine" ] || [ "$machine" = "$self" ]; then
+            resfile="$HOME/.pi-workers/results/$name/latest.md"
+            [ -s "$resfile" ] || continue
+            # KENNUNG DES ERGEBNISSES, nicht des Workers (korrigiert 2026-08-04).
+            # Der Merker war bis dahin eine LEERE Datei mit dem Worker-Namen: einmal
+            # gemeldet, nie wieder. Das traf ausgerechnet die richtige Arbeitsweise --
+            # gleicher Name = gleicher Pane = weiterverwendeter Kontext --, sodass ab
+            # der zweiten Runde JEDE Fertigmeldung unterdrueckt wurde. Gemessen am
+            # 04.08.: drei Meldungen bis 20:15, danach keine mehr, waehrend derselbe
+            # Worker viermal fertig wurde. Jetzt steht im Merker, WELCHES Ergebnis
+            # gemeldet wurde; ein neues Ergebnis meldet erneut.
+            # PFAD UND ZEITSTEMPEL, beides (2026-08-06). Der Pfad allein reichte nicht:
+            # schreibt ein Worker SEIN Ergebnis nach, bleibt der Symlink derselbe und die
+            # Nachbesserung wird verschluckt. Der Zeitstempel allein reichte auch nicht:
+            # zwei Ergebnisse koennen dieselbe Sekunde tragen. Zusammen sind sie eindeutig,
+            # und die Richtung des Zweifels stimmt — aendert sich irgendetwas an der Datei,
+            # wird lieber einmal zuviel gemeldet als ein Ergebnis verschluckt.
+            ziel="$(readlink "$resfile" 2>/dev/null)"
+            [ -n "$ziel" ] || ziel="$resfile"
+            case "$ziel" in /*) ;; *) ziel="$(dirname "$resfile")/$ziel" ;; esac
+            ident="$ziel@$(stat -L -c %Y "$resfile" 2>/dev/null || stat -L -f %m "$resfile" 2>/dev/null || echo 0)"
+            # KEINE Handlungsanweisung (2026-08-05). Hier stand bis heute
+            # "... lies es und schliesse den Pane mit `wb-close <name>`, wenn er
+            # nicht mehr gebraucht wird". Der Guard sieht den Pane nicht an, und
+            # seine Meldung kommt spaeter als das Ergebnis: hat der Orchestrator
+            # es inzwischen gelesen und demselben Worker die naechste Aufgabe
+            # gegeben, ist die Meldung sachlich richtig ("Auftrag 1 ist fertig")
+            # und die Aufforderung trotzdem falsch. Am 05.08. haette sie um ein
+            # Haar einen arbeitenden Worker mitten im Zug beendet. Eine Meldung
+            # traegt keine Aufforderung, deren Voraussetzung sie nicht selbst
+            # geprueft hat -- sie sagt, was sie weiss: es liegt ein Ergebnis, hier.
+            # Die Meldung nennt die AUFGELOESTE Datei, nicht den Symlink (2026-08-06).
+            # Solange hier "latest.md" stand, sahen vier Meldungen zu vier verschiedenen
+            # Ergebnissen desselben Workers wortgleich aus — am 06.08. las sich das wie
+            # dieselbe Meldung viermal, obwohl jedes Mal ein anderes Ergebnis gemeint war.
+            # Der volle Pfad macht den Unterschied sichtbar und zeigt weiter auf das
+            # gemeldete Ergebnis, auch wenn latest.md inzwischen weitergezogen ist.
+            msg="Worker $name ist fertig, Ergebnis unter $ziel"
+        else
+            # SSH-Worker: die Ergebnisdatei liegt auf $machine, nicht hier -- ein lokaler Blick
+            # nach ~/.pi-workers/results/ findet sie NIE (gemessen 2026-08-04: SSH-acmess lief
+            # auf peer, das Verzeichnis fuer diesen Namen gab es auf dem Mac gar nicht). Serverseitig
+            # pruefen wie wb-result es tut (gleiches $RFILE-Escaping), statt die Datei herzuholen --
+            # wb-result kennt schon den richtigen Weg, sie zu LESEN.
+            RFILE="\"\$HOME/.pi-workers/results/$name/latest.md\""
+            # Dieselbe Verbindung liefert Vorhandensein UND Kennung -- ein Aufruf, nicht zwei.
+            # Dieselbe Kennung wie lokal — Pfad UND Zeitstempel, in einem Aufruf geholt.
+            ident="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$machine" \
+                "test -s $RFILE && printf '%s@%s' \"\$(readlink $RFILE 2>/dev/null || echo $RFILE)\" \"\$(stat -L -c %Y $RFILE 2>/dev/null || stat -L -f %m $RFILE 2>/dev/null || echo 0)\"" 2>/dev/null)"
+            [ -n "$ident" ] || continue
+            ziel="${ident%@*}"   # fuer die Altbestands-Pruefung unten, siehe dort
+            # Ebenfalls ohne Aufforderung zum Schliessen. Der Lese-Hinweis bleibt:
+            # bei einem fernen Worker liegt die Datei auf der anderen Maschine und
+            # ist ohne wb-result gar nicht erreichbar -- und dass sie da ist, hat
+            # diese Meldung selbst nachgesehen.
+            msg="Worker $name (auf $machine) ist fertig, Ergebnis mit \`wb-result $name\` zu lesen."
+        fi
+        # Altbestand: ein LEERER Merker stammt aus der alten Fassung. Er wird einmalig
+        # nachgetragen und NICHT gemeldet -- sonst haette die Umstellung fuer jeden je
+        # gelaufenen Worker eine Meldung in den Orchestrator-Pane getippt.
+        if [ -f "$donefile" ]; then
+            prev="$(cat "$donefile" 2>/dev/null)"
+            if [ -z "$prev" ]; then
+                printf '%s\n' "$ident" >"$donefile" 2>/dev/null || true
+                continue
+            fi
+            # Altbestand zweiter Art (2026-08-06): ein Merker OHNE '@' stammt aus der
+            # Fassung, die nur den Pfad festhielt. Er wird still auf die neue Kennung
+            # gehoben, wenn er denselben Pfad meint — sonst haette die Umstellung jedem
+            # je gelaufenen Worker EINE Meldung in den Orchestrator-Pane getippt, also
+            # genau den Laerm erzeugt, gegen den sie gebaut ist.
+            case "$prev" in
+                *@*) ;;
+                "$ziel"|"$(basename "$ziel")")
+                    printf '%s\n' "$ident" >"$donefile" 2>/dev/null || true
+                    continue ;;
+            esac
+            [ "$prev" = "$ident" ] && continue
+        fi
+        # guardMeldetWorkerStatus AUS (Vorgabe): der Merker wandert trotzdem weiter,
+        # als haette der Tap stattgefunden -- ohne nudge() also OHNE log_orch_notify
+        # (die haelt fest, was tatsaechlich im Pane getippt wurde, hier nichts). Wird
+        # der Schalter spaeter eingeschaltet, ist dieses Ergebnis schon "gesehen" und
+        # meldet nicht nach; nur ein WEITERES Ergebnis nach dem Einschalten meldet.
+        if (( ! GUARD_MELDET_STATUS )); then
+            printf '%s\n' "$ident" >"$donefile" 2>/dev/null || true
+            echo "$(date +%H:%M) worker $name fertig -> Meldung unterdrueckt (guardMeldetWorkerStatus aus), Merker gesetzt (${machine:-lokal})"
+            continue
+        fi
+        if nudge "$ORCH" "$msg"; then
+            printf '%s\n' "$ident" >"$donefile" 2>/dev/null || true
+            echo "$(date +%H:%M) worker $name fertig -> orchestrator benachrichtigt (${machine:-lokal})"
+            log_orch_notify "worker $name fertig (${machine:-lokal}): $msg"
+        fi
+    done <"$KNOWN_WORKERS_FILE"
+}
+
+# --- Postfach: sagen, DASS etwas da ist, nie WAS ------------------------------------
+# Anlass (11.08.): `wb-post` legt eine Nachricht ins Postfach der Zielsitzung und laesst
+# `wb-pane-write` einen Hinweis in deren Orchestrator-Pane versuchen. Der wird dort
+# regelmaessig abgelehnt, und zwar richtigerweise -- in einen Orchestrator-Pane duerfen
+# nur ein gemessener Mensch und DIESER Guard schreiben. Der Empfaenger holt sich die
+# Nachricht also mit `wb-post lesen`, nur weiss er nicht, dass etwas da ist. Ein
+# Postfach, in das niemand schaut, ist ein Papierkorb mit Deckel.
+#
+# Der Guard ist die vorhandene Loesung, nicht eine neue: er darf ohnehin in diesen Pane
+# schreiben, er laeuft ohnehin je Sitzung, und er weiss ohnehin, wann der Pane gerade
+# arbeitet. Deshalb geht die Ankuendigung durch dasselbe `nudge()` wie jede andere
+# Meldung -- kein zweiter Weg, keine zweite Busy-Erkennung.
+#
+# DIE ZEILE IST EIN HINWEIS, KEIN AUFTRAG, und sie gibt den INHALT der fremden
+# Nachricht NICHT wieder. Fremder Text, der ungefiltert in einen Chat gelangt, ist ein
+# Einfallstor; die Nachricht liest der Empfaenger selbst aus dem Postfach, wo sie als
+# Daten steht und nicht als Anweisung. Auch der Absendername wird nicht roh
+# uebernommen: er kommt aus der Umgebung des Absenders, wird deshalb auf
+# [A-Za-z0-9._-] beschnitten, auf 40 Zeichen gekuerzt, und es werden hoechstens drei
+# genannt.
+#
+# GENAU EINMAL je Nachricht: der Merker traegt die Kennung der Nachricht und liegt
+# unter GUARD_SLUG, ueberlebt also einen Neustart des Guards -- dasselbe Muster wie
+# DONE_DIR. Eine Vormarkierung wie bei den Worker-Ergebnissen gibt es hier bewusst
+# NICHT: eine ungelesene Nachricht hat der Empfaenger per Definition noch nicht
+# gesehen, egal wie alt sie ist, und ein Guard-Neustart ist kein Grund, sie zu
+# verschlucken.
+#
+# ER DARF DARAN NICHT SCHEITERN. Faellt `wb-post` aus, fehlt es, oder ist das Postfach
+# unlesbar, endet diese Pruefung still und der Guard macht weiter -- seine Aufgabe ist
+# die Kontextwache.
+post_werkzeug() {
+    local p="${WB_POST:-}"
+    if [ -n "$p" ]; then [ -x "$p" ] && printf '%s' "$p"; return; fi
+    if [ -x "$HOME/.local/bin/wb-post" ]; then printf '%s' "$HOME/.local/bin/wb-post"; return; fi
+    p="$(dirname "$0")/wb-post"
+    [ -x "$p" ] && printf '%s' "$p"
+}
+
+# --- Spiegel der anderen Maschine (2026-08-13) -------------------------------------
+# Die Ansage beim Spawn (pi-worker) und beim Schliessen (wb-close) deckt den Normalfall
+# ab. Sie deckt NICHT ab, was danach passiert: ein Spiegel-Pane, der spaeter stirbt,
+# behauptet weiter eine Sicht, die es nicht gibt (Vault
+# [[remote-worker-spiegel-stirbt]]) -- und ein Worker, der drueben von selbst endet,
+# ohne dass jemand `wb-close` tippt, laesst einen leeren Spiegel stehen. Beides faellt
+# nur auf, wenn jemand nachsieht. Das ist diese Stelle.
+#
+# Sie laeuft ABGEKOPPELT: `wb-remote-view` macht einen ssh-Aufruf, und der Poll dieses
+# Guards darf darauf niemals warten -- eine schlafende Zweitmaschine wuerde ihn sonst
+# bei jedem Durchlauf um die volle Zeitsperre bremsen. Abschalten:
+# `wb-state settings set guardRemoteView false`.
+REMOTE_VIEW_EVERY="${REMOTE_VIEW_EVERY:-180}"
+REMOTE_VIEW_LAST=0
+REMOTE_VIEW_AN=1
+[ "$("$HOME/.local/bin/wb-state" settings get guardRemoteView 2>/dev/null)" = "false" ] && REMOTE_VIEW_AN=0
+
+check_remote_view() {
+    (( REMOTE_VIEW_AN )) || return 0
+    local rv now
+    rv="${WB_REMOTE_VIEW:-$HOME/.local/bin/wb-remote-view}"
+    [ -x "$rv" ] || return 0
+    now=$(date +%s)
+    (( now - REMOTE_VIEW_LAST < REMOTE_VIEW_EVERY )) && return 0
+    REMOTE_VIEW_LAST=$now
+    # Ohne Argument nimmt wb-remote-view die jeweils ANDERE Maschine. Der Aufruf legt
+    # den Spiegel an, belebt ihn wieder oder raeumt ihn ab -- je nachdem, was drueben
+    # laeuft. Seine Ausgabe gehoert ins Guard-Log, nicht in den Chat.
+    ( "$rv" --quiet >/dev/null 2>&1 || true ) &
+}
+
+check_post_mail() {
+    # `an: false` fuer den Orchestrator heisst wirklich STILL (siehe die Begruendung
+    # weiter unten im Poll): der Kontext-Guard ist der einzige Guard, der ueberhaupt in
+    # den Chat spricht. Wer ihn abschaltet, will von ihm nichts hoeren, auch keine Post.
+    (( WACHE_ORCH_AN )) || return 0
+    local werkzeug roh zeilen id von neue namen anzahl msg
+    werkzeug="$(post_werkzeug)"
+    [ -n "$werkzeug" ] || return 0
+    [ -n "$GUARD_SESSION" ] || return 0
+    tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$ORCH" || return 0
+    # `lesen --sitzung` fasst kein tmux an und ruft nichts nach aussen; es liest
+    # Dateien. Exit 1 heisst schlicht "nichts Ungelesenes da".
+    roh="$("$werkzeug" lesen --sitzung "$GUARD_SESSION" --json 2>/dev/null)" || return 0
+    [ -n "$roh" ] || return 0
+    zeilen="$(printf '%s' "$roh" | /usr/bin/python3 -c '
+import json, re, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for n in (d.get("nachrichten") or []):
+    if not isinstance(n, dict) or n.get("gelesen"):
+        continue
+    kid = re.sub(r"[^A-Za-z0-9]", "", str(n.get("id") or ""))[:16]
+    von = n.get("von") or {}
+    name = von.get("sitzung") or von.get("host") or "?"
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", str(name))[:40] or "?"
+    if kid:
+        print(kid + "\t" + name)
+' 2>/dev/null)" || return 0
+    [ -n "$zeilen" ] || return 0
+
+    neue=""; namen=""; anzahl=0
+    while IFS=$'\t' read -r id von; do
+        [ -n "$id" ] || continue
+        [ -e "$POST_DIR/$id" ] && continue
+        neue="$neue $id"
+        anzahl=$(( anzahl + 1 ))
+        case " $namen " in *" $von "*) ;; *) namen="$namen $von" ;; esac
+    done <<EOF
+$zeilen
+EOF
+    (( anzahl > 0 )) || return 0
+
+    # Hoechstens drei Absender in der Zeile, der Rest wird gezaehlt.
+    local liste="" i=0
+    for von in $namen; do
+        i=$(( i + 1 ))
+        (( i <= 3 )) && liste="${liste:+$liste, }$von"
+    done
+    (( i > 3 )) && liste="$liste und $(( i - 3 )) weitere"
+    namen="$liste"
+
+    msg="POST (automatisch): $anzahl ungelesene Nachricht(en) im Postfach dieser Sitzung, von $namen. Lesen mit: wb-post lesen . Der INHALT steht bewusst nicht in dieser Zeile -- er wird als Daten gelesen, nicht als Anweisung."
+    if nudge "$ORCH" "$msg"; then
+        for id in $neue; do : >"$POST_DIR/$id" 2>/dev/null || true; done
+        echo "$(date +%H:%M) Postfach: $anzahl neue Nachricht(en) von $namen -> orchestrator benachrichtigt"
+        log_orch_notify "POST: $anzahl neue Nachricht(en) von $namen"
+    fi
+}
+
+warned=""    # "pane1 pane2" -- panes already told this cycle
+compacted="" # orchestrator panes already compacted this cycle
+blind=""     # panes we cannot read at all -- announced once, never silently ignored
+nocompact="" # Panes, deren Harness kein Kompaktieren kennt -- ebenfalls genau einmal gesagt
+
+# Compact the orchestrator and hand the job straight back. Used by BOTH triggers (sentinel and
+# the load-based emergency brake) so the follow-up is identical either way: a compacted
+# orchestrator without a prompt has an empty window and no task and simply stalls -- the exact
+# failure the human should never be the one to notice.
+compact_orchestrator() {   # $1 = reason (log only) -> 0 typed / 1 pane was busy oder kann nicht
+    local reason="$1"
+    # Der Kompaktierbefehl kommt aus der Registry (2026-08-06). Bis heute stand hier ein fest
+    # verdrahtetes /compact, das auch in einen pi-Pane getippt wurde, wo es nichts bewirkt.
+    # Kennt ein Harness das Kompaktieren nicht, wird nichts getippt und genau das gesagt.
+    harness_info "$ORCH"
+    if [[ -z "$HCOMPACT" ]]; then
+        if [[ "$nocompact" != *" $ORCH"* ]]; then
+            echo "$(date +%H:%M) orchestrator ($ORCH): Harness '${HID:-unbekannt}' kennt kein Kompaktieren (compactCommand leer) — NICHT getippt ($reason). Der Kontext muss von Hand entlastet werden."
+            log_orch_notify "Harness '${HID:-unbekannt}' kann nicht kompaktieren ($reason)"
+            nocompact="$nocompact $ORCH"
+        fi
+        return 1
+    fi
+    nudge_verifiziert "$ORCH" "$HCOMPACT Behalte: SESSION-STATE.md im Projekt ist der Live-Zustand (Ziele, gemessener Stand, geloeste Kernbugs, Prozessregeln, laufende Worker mit Pane-IDs, naechste Schritte) — sie ueberlebt die Kompaktierung und wird danach ZUERST gelesen. Ebenso GOALS.md (verbindliche Ziele), QUALITY.md (Pruefkatalog, Abnahme am Auge), PERF-STATE.md (alle gemessenen Sackgassen — nicht wiederholen). Worker-Status NIE am Pane-Text ablesen, sondern auf die Ergebnisdatei warten." || return 1
+    echo "$(date +%H:%M) orchestrator ($ORCH) -> $HCOMPACT typed ($reason)"
+    log_orch_notify "orchestrator /compact getippt ($reason)"
+    compacted="$compacted $ORCH"
+    sleep "$COMPACT_SETTLE"                # hands off while it compacts
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        tmux capture-pane -p -t "$ORCH" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" || break
+        sleep 30
+    done
+    rm -f "$SENTINEL"                      # cycle is armed again for the next rise
+    warned="${warned/ $ORCH/}"
+    # Die Kette Handoff-Aufforderung -> $HCOMPACT -> WEITERARBEITEN laeuft in dieser
+    # Reihenfolge und jede Stufe loggt ihr eigenes Ergebnis (2026-08-12): die
+    # WEITERARBEITEN-Zeile "-> resumed" stand hier bis heute UNBEDINGT im Protokoll,
+    # egal ob nudge() den Prompt wirklich abgesendet bekam. Ein Kompaktieren ohne
+    # verifizierten Folgeauftrag ist genau der Fall, den diese Wache verhindern soll --
+    # ein leeres Fenster, das schweigend stehenbleibt.
+    if nudge_verifiziert "$ORCH" "WEITERARBEITEN (automatisch nach der Kompaktierung, kein Nutzer-Input noetig). Lies ZUERST SESSION-STATE.md im Projekt — dort steht der Live-Zustand und der naechste Schritt. Dazu, falls vorhanden: GOALS.md (verbindliche Ziele), QUALITY.md (Pruefkatalog), PERF-STATE.md (gemessene Sackgassen — nicht wiederholen) und die Vault-Notiz im Projekt-Branch. Pruefe dann die Worker-Ergebnisse (~/.pi-workers/results/<name>/latest.md), verifiziere sie SELBST und arbeite autonom weiter — warte NICHT auf den Nutzer."; then
+        log_orch_notify "orchestrator WEITERARBEITEN nach /compact getippt ($reason)"
+        echo "$(date +%H:%M) orchestrator ($ORCH) -> resumed (Sentinel entfernt)"
+    else
+        echo "$(date +%H:%M) orchestrator ($ORCH): WEITERARBEITEN NICHT verifiziert nach /compact ($reason) -- Pane steht moeglicherweise leer und ohne Auftrag. Selbst pruefen: tmux capture-pane -p -t $ORCH"
+    fi
+    return 0
+}
+
+if (( AUTO )); then
+    if (( WORKERS_ONLY )); then
+        echo "context-guard: anker=$ORCH (Worker-Modus, KEIN Orchestrator) workers=auto (session of $ORCH, re-read every poll)"
+    else
+        echo "context-guard: orchestrator=$ORCH workers=auto (session of $ORCH, re-read every poll)"
+    fi
+else
+    if (( WORKERS_ONLY )); then
+        echo "context-guard: anker=$ORCH (Worker-Modus, KEIN Orchestrator) workers=$* (worker warn ${WARN_PCT}%)"
+    else
+        echo "context-guard: orchestrator=$ORCH workers=$* (worker warn ${WARN_PCT}%, orch ${ORCH_PCT}%, Notbremse ${ORCH_COMPACT_PCT}%)"
+    fi
+    # Eine abgeschaltete Rolle wird beim Start BENANNT. Eine Wache, die schweigend
+    # nichts tut, ist von einer kaputten nicht zu unterscheiden.
+    (( WACHE_ORCH_AN ))   || echo "context-guard: Kontextwache fuer den ORCHESTRATOR ist AUS — keine Mahnung, keine Notbremse, kein /compact. (wb-state wache get)"
+    (( WACHE_WORKER_AN )) || echo "context-guard: Kontextwache fuer WORKER ist AUS — keine Mahnung, keine Kompaktierung. Fertigmeldungen laufen weiter. (wb-state wache get)"
+    (( !WACHE_ORCH_AN   || WACHE_ORCH_EINGRIFF ))   || echo "context-guard: ORCHESTRATOR — Wache MELDET nur, sie greift nicht ein (kein /compact)."
+    (( !WACHE_WORKER_AN || WACHE_WORKER_EINGRIFF )) || echo "context-guard: WORKER — Wache MELDET nur, sie greift nicht ein (kein /compact)."
+fi
+(( GUARD_MELDET_STATUS )) || echo "context-guard: guardMeldetWorkerStatus ist AUS — weder Fertig- noch Haengt-Meldung im Orchestrator-Pane, die Merker laufen still weiter. (wb-state settings get guardMeldetWorkerStatus)"
+(( EXIT_WHEN_EMPTY )) && echo "context-guard: endet selbst, sobald ${EXIT_EMPTY_POLLS} Polls in Folge kein lebender Worker-Pane da ist (fruehestens ${EXIT_GRACE}s nach dem Start)"
+(( EXIT_WHEN_SESSION_GONE )) && echo "context-guard: endet selbst, sobald die Session '${GUARD_SESSION:-?}' nicht mehr existiert (spaetestens ${POLL}s nach dem Verschwinden, siehe unten)"
+case "$ORCH" in
+    %[0-9]*) echo "context-guard: endet selbst, sobald der bewachte Pane $ORCH verschwunden ist (${ORCH_PANE_GONE_POLLS} Polls in Folge, unabhaengig von den Flags)" ;;
+esac
+
+# Erst HIER, nicht bei der Definition: die Funktion braucht sanitize_name, das weiter
+# unten steht. Ein Aufruf oben waere unter `set -u` still gescheitert.
+backfill_done_markers
+# NACH dem Backfill: ein Name, der in DIESEM Start gerade erst als alt-und-fertig
+# markiert wurde, ist damit sofort auch ein Kandidat fuer die Bereinigung.
+prune_known_workers
+
+while true; do
+    [[ -f "$STOP_FILE" ]] && { echo "context-guard: stopped"; exit 0; }
+
+    # --exit-when-session-gone (2026-08-04): unbedingt geprueft, VOR der
+    # --exit-when-no-workers-Karenz unten und vor jeder Kompaktierung in diesem Zyklus -- ein
+    # Orchestrator ohne Session braucht keine weitere Runde durch die Schleife, um das
+    # festzustellen. Maximale Zeit bis zum Ende: siehe Kommentar bei session_gone() und die
+    # Begruendung im Ergebnis dieses Auftrags -- im Regelfall (Guard steckt im `sleep "$POLL"`
+    # unten) hoechstens ein Poll-Intervall (Default ${POLL}s), weil dieser Check der ALLERERSTE
+    # Schritt jeder neuen Runde ist.
+    if (( EXIT_WHEN_SESSION_GONE )) && session_gone; then
+        echo "$(date +%H:%M) Session '$GUARD_SESSION' von $ORCH existiert nicht mehr — Guard beendet sich."
+        exit 0
+    fi
+
+    # Der bewachte Pane selbst (2026-08-07, siehe orch_pane_gone() oben): ohne Flag, weil ein
+    # Guard ohne seinen Pane in JEDER Betriebsart nutzlos ist. Das Ende steht im Protokoll --
+    # eine Wache, die still verschwindet, ist von einer haengenden nicht zu unterscheiden.
+    if orch_pane_gone; then
+        orch_pane_missing=$(( orch_pane_missing + 1 ))
+        if (( orch_pane_missing >= ORCH_PANE_GONE_POLLS )); then
+            # WORKER-MODUS: den Anker NACHZIEHEN statt zu enden (2026-08-13, Reviewer-Befund).
+            # Der Anker ist hier selbst ein Worker, also typischerweise der aelteste der
+            # Session und damit der, der zuerst fertig wird. Auf peers `wb-orch`, wo Worker
+            # kommen und gehen, waere sein Verschwinden der Normalfall — und die uebrigen
+            # Worker derselben Session liefen ab da ohne Kontextwache weiter, bis irgendwann
+            # ein Spawn `--ensure` aufruft. Fuer einen ORCHESTRATOR-Anker bleibt die Regel
+            # richtig (er ueberlebt die Session), fuer einen Worker-Anker ist sie es nicht.
+            # Der Slug haengt an Socket + Basis-Session und aendert sich dabei NICHT, die
+            # Buchfuehrung (Merkdatei, Stopdatei) bleibt also gueltig.
+            NEUER_ANKER=""
+            if (( WORKERS_ONLY )) && [ -n "$GUARD_SESSION" ]; then
+                NEUER_ANKER=$(tmux list-panes -s -t "=$GUARD_SESSION" -F '#{pane_id} #{@wb_role} #{pane_dead}' 2>/dev/null \
+                              | awk '$2=="worker" && $3=="0"{print $1; exit}')
+            fi
+            if [ -n "$NEUER_ANKER" ]; then
+                echo "$(date +%H:%M) Anker-Pane $ORCH ist weg, aber in '$GUARD_SESSION' laeuft noch ein Worker — Anker wird $NEUER_ANKER (Guard laeuft weiter)."
+                ORCH="$NEUER_ANKER"
+                orch_pane_missing=0
+            else
+                echo "$(date +%H:%M) bewachter Pane $ORCH existiert nicht mehr (${orch_pane_missing} Polls in Folge, Session '${GUARD_SESSION:-?}') — Guard beendet sich."
+                exit 0
+            fi
+        fi
+    else
+        orch_pane_missing=0
+    fi
+
+    # Ende des Worker-Lebenszyklus = Ende des Guards. Der Zaehler sitzt HIER und nicht in
+    # wb-close, weil er so auch Worker erfasst, die abgestuerzt oder von Hand gekillt wurden --
+    # wb-close sieht nur, was durch wb-close geht. Ausserdem kann ein Stopp-Signal von aussen
+    # mit einem gleichzeitigen Spawn kollidieren; der Guard selbst zaehlt stattdessen den
+    # tatsaechlichen Zustand und liegt damit nie falsch herum.
+    if (( EXIT_WHEN_EMPTY )); then
+        if [ "$(live_worker_count)" = "0" ]; then
+            empty_polls=$(( empty_polls + 1 ))
+            if (( $(date +%s) - GUARD_START >= EXIT_GRACE )) && (( empty_polls >= EXIT_EMPTY_POLLS )); then
+                echo "$(date +%H:%M) kein lebender Worker-Pane mehr in der Session von $ORCH (${empty_polls} Polls in Folge) — Guard beendet sich."
+                exit 0
+            fi
+        else
+            empty_polls=0
+        fi
+    fi
+
+    # --auto: take the worker list from the orchestrator's own session at every poll, tagged by
+    # @wb_worker (pi-worker/wb-ssh-worker set it). A guard started at session start has no workers
+    # yet, and one started by hand goes stale the moment a worker is added or closed -- that stale
+    # list is how a worker ends up unwatched, which is the exact failure this tool exists for.
+    #
+    # Braucht die Basis NICHT (geprueft 2026-08-04, Punkt-0-Nachschau, gleicher Grund
+    # wie in live_worker_count() oben): eine Sessiongruppe teilt sich alle Panes,
+    # `list-panes -s` liefert ueber Basis- oder '-view'-Namen dieselbe Menge.
+    if (( AUTO )); then
+        sess="$(tmux display -p -t "$ORCH" '#{session_name}' 2>/dev/null || true)"
+        if [[ -n "$sess" ]]; then
+            set -- $(tmux list-panes -s -t "=$sess" -F '#{pane_id}:#{@wb_worker}' 2>/dev/null \
+                       | awk -F: '$2!=""{print}')
+        else
+            set --
+        fi
+    fi
+
+    # --- workers
+    # `an: false` fuer die Worker heisst: keine Mahnung, keine Kompaktierung, kein
+    # BLIND-Hinweis. Das Buchfuehren (record_known_worker, Ergebnis- und
+    # Dialogerkennung weiter unten) laeuft WEITER -- abgeschaltet ist die
+    # Kontextwache, nicht die Beobachtung der Worker ueberhaupt. Wer die Meldung
+    # "Worker fertig" verlieren wollte, haette etwas anderes abgeschaltet.
+    for entry in "$@"; do
+        pane="${entry%%:*}"; name="${entry##*:}"
+        record_known_worker "$name"
+        (( WACHE_WORKER_AN )) || continue
+        tmux list-panes -a -F '#{pane_id}' | grep -qx "$pane" || continue
+
+        # Blockiert-Erkennung LAEUFT UNABHAENGIG von der Kontextmessung unten
+        # (auch wenn read_load() gleich BLIND meldet -- der Dialog kann genau
+        # die Statuszeile ueberdecken, die read_load() sonst liest).
+        check_dialog_block "$pane" "$name"
+
+        read -r pct src <<<"$(read_load "$pane")"
+        if (( pct < 0 )); then announce_blind "$pane" "$name" 1; continue; fi
+        blind="${blind/ $pane/}"
+
+        if (( pct < WARN_PCT - WORKER_REARM_GAP )); then
+            warned="${warned/ $pane/}"          # load dropped: re-arm for the next cycle
+            compacted="${compacted/ $pane/}"
+            continue
+        fi
+
+        # Step 1 -- ask for the handoff. A worker CANNOT compact itself: /compact is a slash command
+        # typed into the input box, and the agent inside the pane has no hands for that. It will
+        # cheerfully announce "Jetzt /compact" and then sit there forever. So we only ask for the
+        # handoff here, and do the compaction ourselves in step 2.
+        if (( pct >= WARN_PCT )) && [[ "$warned" != *" $pane"* ]]; then
+            if nudge_queue "$pane" "KONTEXT-WARNUNG (automatisch): Du stehst bei ~${pct}% Kontext. Ein voller Worker scheitert nicht — er wird STILL SCHLECHTER (vergisst Invarianten, wiederholt geloeste Fehler, widerspricht seinen eigenen Messungen). Schreibe JETZT eine VOLLSTAENDIGE UEBERGABE nach HANDOFF-${name}.md im Projektverzeichnis: Auftrag, Architektur, Vertraege/Invarianten, alle Fallstricke und NULL-RESULTATE (die sind das wertvollste Wissen — sie verhindern, dass jemand deine Sackgassen erneut durchmisst), offene Punkte, naechster konkreter Schritt. Danach NUR kurz melden, was du persistiert hast, und STEHENBLEIBEN. Tippe KEINEN Kompaktierbefehl — das kannst du nicht selbst, ich mache es fuer dich, sobald deine Uebergabe steht."; then
+                echo "$(date +%H:%M) $name ($pane) at ${pct}% -> handoff requested"
+                warned="$warned $pane"
+            fi
+            continue
+        fi
+
+        # Step 2 -- handoff written and the pane has gone quiet: compact it, then hand the task back.
+        # Without the resume prompt a compacted worker has a fresh window and no job, and stalls in
+        # silence -- which is exactly the failure the human should never be the one to notice.
+        # `eingreifen: false` haelt genau HIER an: gemahnt wurde schon (Schritt 1),
+        # kompaktiert wird nicht. Der Worker bekommt seine Warnung und entscheidet
+        # selbst -- gewollt fuer den, der nicht will, dass ihm eine fremde Hand
+        # etwas in die Eingabezeile tippt.
+        if [[ "$warned" == *" $pane"* ]] && [[ "$compacted" != *" $pane"* ]]; then
+            (( WACHE_WORKER_EINGRIFF )) || continue
+            tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && continue
+            [[ -f "$PROJECT/HANDOFF-${name}.md" ]] || continue   # no handoff yet -- let it finish
+            # Kompaktierbefehl aus der Registry (2026-08-06), gleiche Begruendung wie beim
+            # Orchestrator. Die Uebergabe aus Schritt 1 ist damit nicht umsonst: sie steht in
+            # der Datei, auch wenn dieser Harness nicht kompaktieren kann.
+            harness_info "$pane"
+            if [[ -z "$HCOMPACT" ]]; then
+                if [[ "$nocompact" != *" $pane"* ]]; then
+                    echo "$(date +%H:%M) $name ($pane): Harness '${HID:-unbekannt}' kennt kein Kompaktieren — Uebergabe steht in HANDOFF-${name}.md, kompaktiert wird NICHT."
+                    nocompact="$nocompact $pane"
+                fi
+                continue
+            fi
+            if nudge_verifiziert "$pane" "$HCOMPACT"; then
+                echo "$(date +%H:%M) $name ($pane) -> $HCOMPACT typed (handoff persisted)"
+                compacted="$compacted $pane"
+                sleep 90
+                for _ in 1 2 3 4 5 6 7 8 9 10; do
+                    tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" || break
+                    sleep 30
+                done
+                # Gleiche Begruendung wie bei compact_orchestrator: der Erfolg des
+                # WEITERARBEITEN-Prompts wird geprueft, nicht unterstellt (2026-08-12).
+                if nudge_verifiziert "$pane" "WEITERARBEITEN (automatisch nach deiner Kompaktierung, kein Nutzer-Input noetig). Lies ZUERST HANDOFF-${name}.md — das ist deine eigene Uebergabe, dort steht dein Auftrag und der naechste Schritt. Dazu GOALS.md (verbindliche Ziele), SESSION-STATE.md (Live-Zustand), QUALITY.md (Pruefkatalog, Abnahme am AUGE) und PERF-STATE.md (gemessene Sackgassen — nicht wiederholen). Dann arbeite selbstaendig weiter und melde wie gewohnt ins Result-File."; then
+                    echo "$(date +%H:%M) $name ($pane) -> resumed"
+                else
+                    echo "$(date +%H:%M) $name ($pane): WEITERARBEITEN NICHT verifiziert nach $HCOMPACT -- Pane steht moeglicherweise leer und ohne Auftrag. Selbst pruefen: tmux capture-pane -p -t $pane"
+                fi
+            fi
+        fi
+    done
+
+    # --- Fertigmeldung (unabhaengig von der Panegruppe oben: laeuft auch fuer Worker,
+    # deren Pane schon geschlossen wurde -- deren Namen stehen trotzdem in KNOWN_WORKERS_FILE)
+    check_worker_results
+
+    # --- Postfach dieser Sitzung: eine Zeile, wenn Ungelesenes daliegt
+    check_post_mail
+
+    # --- Spiegel der anderen Maschine nachziehen
+    check_remote_view
+
+    # --- orchestrator
+    # `an: false` fuer den Orchestrator heisst wirklich STILL: keine Mahnung, kein
+    # BLIND-Hinweis, keine Notbremse, auch kein Sentinel-Aufgriff. Der Kontext-Guard
+    # ist der einzige Guard, der ueberhaupt in den Chat spricht -- bei ihm heisst
+    # abschalten deshalb auch, dass niemand mehr angesprochen wird. Wer das setzt,
+    # bekommt vor dem Ueberlauf keine Warnung mehr; genau so steht es im
+    # Beschreibungstext des Menues.
+    if (( WACHE_ORCH_AN )) && tmux list-panes -a -F '#{pane_id}' | grep -qx "$ORCH"; then
+        read -r pct src <<<"$(read_load "$ORCH")"
+        # On the bar fallback a 75 threshold is unreachable (ten blocks = 10% steps), so it rounds
+        # DOWN to 70: earlier, never later. With the transcript or the exact figures 75 IS 75.
+        if [[ "$src" == "bar" ]]; then ORCH_WARN_EFF=$(( ORCH_PCT / 10 * 10 )); else ORCH_WARN_EFF=$ORCH_PCT; fi
+
+        # The sentinel outranks everything, INCLUDING an unreadable load: once the orchestrator
+        # says "my knowledge is saved", waiting for a higher load only wastes context.
+        # The sentinel is a signal for THIS guard's cycle, never a standing order. A file
+        # left over from an earlier session (or from a crashed one) used to compact a
+        # brand-new orchestrator at 26% load within one poll — measured on 2026-07-25,
+        # der Nutzer caught the typed /compact himself. So only a sentinel written AFTER this
+        # guard started counts; an older one is removed with a visible line.
+        if [[ -f "$SENTINEL" ]] && (( $(mtime "$SENTINEL") < GUARD_START )); then
+            echo "$(date +%H:%M) orchestrator ($ORCH): ALTER Sentinel ($(date -r "$SENTINEL" +%H:%M) < Guard-Start) — ignoriert und entfernt, KEINE Kompaktierung."
+            rm -f "$SENTINEL"
+        fi
+        # `eingreifen: false` nimmt der Wache die HAND, nicht die Stimme: gemahnt
+        # wird weiter (der Zweig unten), aber weder ein Sentinel noch die Notbremse
+        # tippen dann noch `/compact` in die Sitzung. Der Sentinel bleibt liegen und
+        # wird beim naechsten Einschalten wieder aufgegriffen.
+        if [[ -f "$SENTINEL" ]] && [[ "$compacted" != *" $ORCH"* ]] && (( WACHE_ORCH_EINGRIFF )); then
+            compact_orchestrator "Sentinel $SENTINEL"
+        elif (( pct < 0 )); then
+            announce_blind "$ORCH" "orchestrator"
+        else
+            blind="${blind/ $ORCH/}"
+            if (( pct < ORCH_PCT - ORCH_REARM_GAP )); then
+                warned="${warned/ $ORCH/}"
+                compacted="${compacted/ $ORCH/}"
+            # Warn-before-compact is an ORDER invariant, not just a threshold floor
+            # (Reviewer-Befund 1, round 2): ORCH_COMPACT_PCT >= ORCH_PCT only keeps the
+            # brake from firing BELOW the warn threshold -- at guardOrchWarnPct > 80 both
+            # thresholds land on the SAME number, and the brake used to sit in the elif
+            # chain BEFORE the warn check, so it fired first at that shared value and the
+            # orchestrator got compacted having never been asked to save its knowledge.
+            # The warn branch is therefore checked FIRST, unconditionally, as long as this
+            # pane has not been warned yet this cycle; the brake below can only ever fire
+            # once "warned" already holds $ORCH. the user's call over the reviewer's
+            # ORCH_PCT+1 floor: a floor makes the brake unreachable at guardOrchWarnPct=99,
+            # an order swap does not, and pushing compaction one extra poll later (at most
+            # one POLL interval) is an accepted cost, not a bug.
+            elif (( pct >= ORCH_WARN_EFF )) && [[ "$warned" != *" $ORCH"* ]]; then
+                if nudge "$ORCH" "KONTEXT-WARNUNG (automatisch): Dein eigener Kontext liegt bei ~${pct}%. BEVOR der Harness dich komprimiert, sichere das Wissen — eine Zusammenfassung verliert genau die Details, die niemand als wichtig markiert hat: (1) SESSION-STATE.md im Projekt aktualisieren (Ziele, gemessener Stand, geloeste Kernbugs, Prozessregeln, laufende Worker mit Pane-IDs, naechste Schritte). (2) Vault-Notiz im Projekt-Branch aktualisieren und committen (~/Knowledge). (3) Kontext ALLER Worker pruefen und die ueber 80% zu einer Uebergabe und danach zur Kompaktierung schicken (welcher Befehl das ist, haengt am Harness des Workers). (4) WENN das erledigt ist, sofort 'touch ${SENTINEL}' ausfuehren — daran erkenne ich, dass Dein Wissen gesichert ist, und kompaktiere Dich SOFORT (statt auf 80% zu warten); danach bekommst Du automatisch einen Weiterarbeiten-Prompt. Bis dahin normal weiterarbeiten."; then
+                    echo "$(date +%H:%M) orchestrator ($ORCH) at ${pct}% (${src}) -> brain+state update requested, warte auf $SENTINEL"
+                    log_orch_notify "KONTEXT-WARNUNG bei ${pct}% (${src})"
+                    warned="$warned $ORCH"
+                fi
+            elif (( pct >= ORCH_COMPACT_PCT )) && [[ "$compacted" != *" $ORCH"* ]] \
+                 && (( WACHE_ORCH_EINGRIFF )); then
+                # Emergency brake: only reachable once this pane is already in "warned"
+                # (the warn branch above re-checks and skips once that's true), so the
+                # knowledge-save request always went out first, this cycle or an earlier one.
+                compact_orchestrator "Notbremse ${pct}%"
+            fi
+        fi
+    fi
+
+    sleep "$POLL"
+done

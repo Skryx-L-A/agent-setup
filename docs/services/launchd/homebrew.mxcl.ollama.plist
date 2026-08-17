@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE, and a replacement rather than an addition: Homebrew installs a file of this
+  name when you run `brew services start ollama`. This one differs from it in exactly one
+  respect, the environment block.
+
+  OLLAMA_CONTEXT_LENGTH is why it exists. Without it every local model silently serves a
+  fraction of the context it was built with, and nothing anywhere reports that — the model
+  simply forgets the beginning of long work. The other three values are the ones that made
+  a measurable difference on a 48 GB machine: flash attention on, a quantised KV cache so
+  a long context fits, and one request at a time so a second caller does not halve the
+  context of the first.
+
+  This template needs no substitution. Raise or lower the context length to fit your
+  memory; 131072 is a reasonable starting point on 32 GB and above.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>homebrew.mxcl.ollama</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OLLAMA_CONTEXT_LENGTH</key>
+    <string>131072</string>
+    <key>OLLAMA_FLASH_ATTENTION</key>
+    <string>1</string>
+    <key>OLLAMA_KV_CACHE_TYPE</key>
+    <string>q8_0</string>
+    <key>OLLAMA_KEEP_ALIVE</key>
+    <string>2h</string>
+    <key>OLLAMA_NUM_PARALLEL</key>
+    <string>1</string>
+  </dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/opt/ollama/bin/ollama</string>
+    <string>serve</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/opt/homebrew/var/log/ollama.log</string>
+  <key>StandardErrorPath</key>
+  <string>/opt/homebrew/var/log/ollama.log</string>
+  <key>WorkingDirectory</key>
+  <string>/opt/homebrew/var</string>
+</dict>
+</plist>

@@ -1,0 +1,280 @@
+#!/bin/bash
+# wb-mensch — beantwortet EINE Frage: ruft hier ein MENSCH oder ein AGENT?
+#
+#   wb-mensch pruefen         Exit 0 = Mensch, 1 = Agent. Ohne Ausgabe.
+#   wb-mensch beleg           <mensch|agent> TAB <Begruendung>   (immer Exit 0)
+#   wb-mensch ahnen           Die geprueften Ahnen, eine Zeile je Prozess (Diagnose)
+#
+# WARUM ES DIESES WERKZEUG GIBT
+# Drei Sicherungen in dieser Werkbank duerfen nur von einem Menschen gelockert
+# werden: der Effort-Deckel (pi-worker), die einzelnen Guards (bash-guard.py) und
+# die Kontextwache je Rolle (context-guard). Das ist dreimal dieselbe Frage, also
+# steht die Antwort einmal hier und wird dreimal benutzt.
+#
+# DAS MERKMAL WIRD GEMESSEN, NICHT BEHAUPTET
+# Das Vorbild ist `isTrusted` im Browser: ein Klick traegt die Echtheit, WEIL die
+# vertrauenswuerdige Schicht sie aufgepraegt hat -- kein Skript kann sie an ein
+# selbstgebautes Ereignis anhaengen. Genauso hier: der Aufrufer sagt zwar
+# `--mensch`, aber ob das gilt, entscheidet NICHT er, sondern was dieses Werkzeug
+# an seinem Prozess ablesen kann. Ein Agent, der `--mensch` errät und mitschickt,
+# kommt damit nicht durch, weil er sich seine eigene Herkunft nicht wegschreiben
+# kann.
+#
+# NEGATIVPRUEFUNG (irgendeine trifft zu -> Agent):
+#   A1  Agenten-Umgebungsvariablen (CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, …).
+#       Gemessen 2026-08-06 im Bash-Werkzeug eines laufenden Claude-Workers:
+#       CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SESSION_ID und
+#       CLAUDE_PID sind gesetzt.
+#   A2  Ein HARNESS-BINARY in der Ahnenreihe. Gemessen in derselben Messung:
+#       die Elternkette der Bash-Werkzeug-Shell lautet
+#       /bin/zsh -> ~/.local/bin/claude -> tmux. Das Harness ist also ein
+#       direkter Ahne, und ein Agent kann seinen eigenen Elternprozess nicht
+#       austauschen.
+#   A3  Ein Ahnen-PID ist die pane_pid eines tmux-Panes mit
+#       @wb_role=worker|orchestrator.
+#   A4  Eine SSH-Sitzung, deren Gegenstelle DIESE MASCHINE SELBST ist. Gemessen
+#       2026-08-06 vom Nutzer, und es war ein Loch: ein Agent verbindet sich per
+#       `ssh -tt $(tailscale ip -4)` mit dem eigenen Rechner, sshd gibt ihm einen
+#       frischen Prozessbaum mit Pseudoterminal, und damit sind A1 bis A3 alle
+#       wirkungslos -- keine Agenten-Variablen mehr, kein Harness in der Ahnenreihe,
+#       kein Pane darueber. M1 sah daraufhin einen Menschen und sagte es woertlich:
+#       "mensch  Steuerndes Terminal vorhanden, kein Agent in der Ahnenreihe (M1)".
+#       Eine Schleife ueber die eigene Maschine ist aber nie ein Mensch, sondern nur
+#       ein Umweg. Die Gegenstelle steht in SSH_CONNECTION (erste Adresse) und wird
+#       gegen die GEMESSENEN eigenen Adressen gehalten -- ifconfig/ip, dazu
+#       `tailscale ip` und ausdruecklich die Rueckschleife. Nichts davon ist fest
+#       verdrahtet: eine Adressliste im Quelltext waere an dem Tag falsch, an dem
+#       sich eine Adresse aendert, und zwar still und in die gefaehrliche Richtung.
+#
+#       Eine SSH-Sitzung von einer ANDEREN Maschine bleibt vorerst wie bisher. Das
+#       ist eine Vertrauensfrage, die der Nutzer noch entscheidet; sie steht als
+#       offener Punkt 2 in IPHONE-FERNBEDIENUNG-PLAN.md.
+#
+# POSITIVPRUEFUNG (eine muss zutreffen -> Mensch):
+#   M1  Ein steuerndes Terminal. Gemessen: die Shell des Bash-Werkzeugs hat
+#       KEINES (`tty` sagt "not a tty", `ps -o tty=` zeigt "??"). Ein Mensch am
+#       Terminal hat immer eines.
+#   M2  Die Oberflaeche: WB_MENSCH_QUELLE=oberflaeche zusammen mit WB_APP_PID.
+#       Die Variablen allein zaehlen NICHT -- die PID muss ein echter Ahne
+#       dieses Prozesses sein UND wie das Werkbank-Programm aussehen. Ein Agent
+#       kann beide Variablen setzen; er kann sich nicht unter den
+#       Electron-Hauptprozess haengen.
+#
+# GRENZE, offen benannt: gegen einen Agenten, der seine Herkunft AKTIV verwischt
+# (Umgebung leeren, `setsid`, ein eigenes Pseudoterminal aufmachen), schuetzt das
+# nicht -- als derselbe Benutzer gibt es dagegen in einer Shell kein Mittel.
+# Abgewehrt wird der reale Fall: ein Agent, der das Merkmal in der Dokumentation
+# oder im Code liest und es einfach mitschickt.
+#
+# Fuer A4 ist eine Ecke dieser Grenze allerdings geschlossen: SSH_CONNECTION selbst
+# zu loeschen nuetzt nichts, weil dann A4b greift -- steht sshd in der Ahnenreihe und
+# laesst sich die Gegenstelle NICHT bestimmen, ist die Antwort Nein. Ein Agent kann
+# seine Umgebung leeren, aber nicht den sshd aus seiner Elternkette entfernen.
+set -uo pipefail
+
+CMD="${1:-pruefen}"
+
+# Kommandonamen der bekannten Harnesses. Die eingebaute Liste ist die Untergrenze;
+# die Registry darf ERGAENZEN, nie wegnehmen -- eine kaputte oder fehlende
+# models.json darf die Erkennung nicht schwaechen.
+harness_kommandos() {
+    printf '%s\n' claude pi codex aider opencode agy
+    /usr/bin/python3 - "$HOME/.claude/workbench/models.json" <<'PY' 2>/dev/null || true
+import json, os, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for h in (d.get("harnesses") or []):
+    c = h.get("command")
+    if isinstance(c, str) and c:
+        print(os.path.basename(c.rstrip("/")))
+PY
+}
+
+# Ahnenreihe, innerster Prozess zuerst: "<pid> <kommando-basename>".
+ahnen() {
+    local pid=${1:-$$} zeile ppid comm
+    # `read` statt Parameter-Expansion: `ps -o ppid=` polstert die Spalte LINKS
+    # mit Leerzeichen, wodurch `${zeile%% *}` leer wird und die Kette nach zwei
+    # Prozessen abbrach (gemessen 2026-08-06 -- die Harness-Pruefung A2 fiel
+    # dadurch still aus und nur die Rueckfallzeile griff noch). `read` frisst
+    # fuehrende Trenner und laesst den REST der Zeile im zweiten Feld, also
+    # bleiben Kommandonamen mit Leerzeichen ganz.
+    while [ "$pid" -gt 1 ] 2>/dev/null; do
+        zeile=$(ps -o ppid=,comm= -p "$pid" 2>/dev/null) || return 0
+        [ -n "$zeile" ] || return 0
+        read -r ppid comm <<<"$zeile"
+        printf '%s %s\n' "$pid" "${comm##*/}"
+        case "${ppid:-}" in ''|*[!0-9]*) return 0 ;; esac
+        pid=$ppid
+    done
+}
+
+# Startet dieser Prozess unter einem Pane, der als Agent markiert ist? Geprueft
+# wird ueber die pane_pid, nicht ueber $TMUX_PANE: die Variable ist eine
+# Behauptung, die Prozesstabelle ist es nicht.
+agenten_pane() {
+    command -v tmux >/dev/null 2>&1 || return 1
+    local karte
+    karte=$(tmux list-panes -a -F '#{pane_pid} #{@wb_role}' 2>/dev/null) || return 1
+    [ -n "$karte" ] || return 1
+    local pid
+    while read -r pid _; do
+        printf '%s\n' "$karte" | awk -v p="$pid" '$1==p && ($2=="worker" || $2=="orchestrator"){f=1} END{exit !f}' \
+            && return 0
+    done < <(ahnen)
+    return 1
+}
+
+# Alle Adressen, unter denen DIESE Maschine erreichbar ist -- gemessen, nie verdrahtet.
+# Drei Quellen, weil keine allein reicht: `ifconfig` deckt macOS und BSD ab, `ip -o addr`
+# Linux (Peer-Rechner), und `tailscale ip` fragt den Dienst selbst. Die Rueckschleife steht
+# ausserdem ausdruecklich drin und nicht nur, weil sie zufaellig in jeder Schnittstellen-
+# liste auftaucht: sie ist der Fall, den man zuerst probiert.
+eigene_adressen() {
+    printf '%s\n%s\n' 127.0.0.1 ::1
+    ifconfig 2>/dev/null | awk '$1=="inet" || $1=="inet6" { print $2 }'
+    ip -o addr show 2>/dev/null | awk '{ for (i=1;i<=NF;i++) if ($i=="inet" || $i=="inet6") print $(i+1) }'
+    command -v tailscale >/dev/null 2>&1 && tailscale ip 2>/dev/null
+    return 0
+}
+
+# Adressen vergleichbar machen: Linux haengt die Praefixlaenge an (10.0.0.5/24), IPv6
+# traegt oft einen Gueltigkeitsbereich (fe80::1%en0), und ein IPv4-Ziel erscheint ueber
+# eine IPv6-Fassung als ::ffff:127.0.0.1. Ohne diese drei Schnitte verglichen man
+# Zeichenketten, die dieselbe Maschine meinen und trotzdem verschieden aussehen.
+adresse_normal() {
+    local a="${1%%/*}"
+    a="${a%%\%*}"
+    # Nur die PUNKT-Schreibweise wird zurueckgeschnitten (::ffff:127.0.0.1 -> 127.0.0.1),
+    # und der Schnitt geht bis zum LETZTEN Doppelpunkt. `${a#*:*:}` waere hier falsch:
+    # bei '::ffff:127.0.0.1' passt '*:*:' schon auf die beiden fuehrenden Doppelpunkte,
+    # uebrig blieb 'ffff:127.0.0.1' und der Vergleich ging ins Leere (gemessen
+    # 2026-08-06, der Fall fiel in der eigenen Suite durch).
+    # Die seltene Hex-Fassung (::ffff:7f00:1) bleibt absichtlich unangetastet: sie
+    # sauber zurueckzurechnen waere mehr Code als Nutzen, und sshd meldet sie nicht.
+    case "$a" in
+        ::ffff:*.*.*.*|::FFFF:*.*.*.*) a="${a##*:}" ;;
+    esac
+    printf '%s' "$a" | tr 'A-F' 'a-f'
+}
+
+# Steht sshd in der Ahnenreihe? Auf macOS heisst der Sitzungsprozess seit einiger Zeit
+# `sshd-session`, frueher und auf Linux `sshd` -- beides zaehlt. Gematcht wird mit
+# Praefix und nicht auf den nackten Namen: `ps -o comm=` liefert hier nicht "sshd",
+# sondern den vollen Prozesstitel. Gemessen 2026-08-06 in einer echten Sitzung:
+#   19442 sshd-session: <user>@ttys004
+#   19422 sshd-session: <user> [priv]
+# Ein exakter Vergleich griff deshalb nie, und A4b lief still ins Leere -- die Probe
+# mit geloeschtem SSH_CONNECTION meldete weiterhin "mensch".
+sshd_ist_ahne() {
+    local pid name
+    while read -r pid name; do
+        case "$name" in sshd|sshd:*|sshd\ *|sshd-session*|sshd-auth*) return 0 ;; esac
+    done < <(ahnen)
+    return 1
+}
+
+# A4: die Gegenstelle dieser SSH-Sitzung ist diese Maschine selbst.
+# GRUND_SSH traegt die Begruendung, damit die Meldung sagt, WELCHE Adresse es war.
+GRUND_SSH=""
+ssh_auf_sich_selbst() {
+    local peer eigen
+    if [ -z "${SSH_CONNECTION:-}" ]; then
+        # Kein SSH im Spiel -> A4 sagt nichts. Aber: sitzt ein sshd in der Ahnenreihe
+        # und ist die Variable trotzdem weg, laesst sich die Gegenstelle nicht messen --
+        # und ein Zweifelsfall ist hier ein Nein (A4b). Genau ueber diese Luecke ginge
+        # sonst derselbe Weg noch einmal, nur mit einem `unset` davor.
+        if sshd_ist_ahne; then
+            GRUND_SSH="SSH-Sitzung (sshd in der Ahnenreihe), aber SSH_CONNECTION fehlt -- die Gegenstelle ist nicht messbar (A4b)."
+            return 0
+        fi
+        return 1
+    fi
+    peer=$(adresse_normal "${SSH_CONNECTION%% *}")
+    if [ -z "$peer" ]; then
+        GRUND_SSH="SSH_CONNECTION ist gesetzt, enthaelt aber keine lesbare Gegenstelle (A4b)."
+        return 0
+    fi
+    while read -r eigen; do
+        [ -n "$eigen" ] || continue
+        if [ "$(adresse_normal "$eigen")" = "$peer" ]; then
+            GRUND_SSH="SSH-Sitzung auf DIESE Maschine selbst -- die Gegenstelle $peer ist eine eigene Adresse (A4)."
+            return 0
+        fi
+    done < <(eigene_adressen)
+    return 1
+}
+
+hat_terminal() {
+    if [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; then
+        return 0
+    fi
+    # Auch ohne offenen Terminal-Deskriptor kann ein steuerndes Terminal da sein
+    # (Umleitung aller drei Deskriptoren). `ps -o tty=` zeigt "??" fuer keines.
+    local t
+    t=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')
+    [ -n "$t" ] && [ "$t" != "??" ] && [ "$t" != "?" ]
+}
+
+# Die Oberflaeche als Ahne. WB_APP_PID ist eine BEHAUPTUNG und wird geprueft:
+# die PID muss in der eigenen Ahnenreihe stehen und wie das Werkbank-Programm
+# heissen. Ohne beides zaehlt sie nicht.
+oberflaeche_ist_ahne() {
+    [ "${WB_MENSCH_QUELLE:-}" = oberflaeche ] || return 1
+    local app="${WB_APP_PID:-}"
+    case "$app" in ''|*[!0-9]*) return 1 ;; esac
+    ahnen | awk -v p="$app" '$1==p{print $2; f=1} END{exit !f}' \
+        | grep -qiE 'electron|agent-workbench|Agent Workbench|Claude Workbench'
+}
+
+klassifizieren() {   # setzt ART und GRUND
+    local kom
+    for v in CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID PI_AGENT WB_AGENT; do
+        if [ -n "${!v:-}" ]; then
+            ART=agent; GRUND="Agenten-Umgebungsvariable $v ist gesetzt (A1)."; return
+        fi
+    done
+    kom=$(harness_kommandos | sort -u)
+    local pid name
+    while read -r pid name; do
+        [ -n "$name" ] || continue
+        if printf '%s\n' "$kom" | grep -qxF "$name"; then
+            ART=agent; GRUND="Harness '$name' (PID $pid) steht in der Ahnenreihe (A2)."; return
+        fi
+    done < <(ahnen)
+    if agenten_pane; then
+        ART=agent; GRUND="Ein Ahne dieses Prozesses ist der Prozess eines tmux-Panes mit @wb_role=worker|orchestrator (A3)."; return
+    fi
+    # VOR M1, und genau deshalb wirksam: die Schleife ueber die eigene Maschine liefert
+    # ja gerade das steuernde Terminal, an dem M1 sonst einen Menschen erkennt.
+    if ssh_auf_sich_selbst; then
+        ART=agent; GRUND="$GRUND_SSH"; return
+    fi
+    if hat_terminal; then
+        ART=mensch; GRUND="Steuerndes Terminal vorhanden, kein Agent in der Ahnenreihe (M1)."; return
+    fi
+    if oberflaeche_ist_ahne; then
+        ART=mensch; GRUND="Oberflaeche als geprueften Ahnen nachgewiesen (WB_APP_PID=$WB_APP_PID, M2)."; return
+    fi
+    ART=agent
+    GRUND="Kein Nachweis fuer einen Menschen: weder ein steuerndes Terminal (M1) noch die Oberflaeche als Ahne (M2)."
+}
+
+case "$CMD" in
+    pruefen)
+        klassifizieren
+        [ "$ART" = mensch ] && exit 0
+        exit 1 ;;
+    beleg)
+        klassifizieren
+        printf '%s\t%s\n' "$ART" "$GRUND"
+        exit 0 ;;
+    ahnen)
+        ahnen
+        exit 0 ;;
+    *)
+        echo "wb-mensch: unbekanntes Kommando '$CMD' (pruefen|beleg|ahnen)" >&2
+        exit 2 ;;
+esac

@@ -1,0 +1,118 @@
+#!/bin/bash
+# wb-session-orphan --session <name> --token <t> [--grace <sekunden>] — der Wachposten,
+# der entscheidet, ob ein geschlossenes VS-Code-Fenster seine tmux-Session mitnimmt.
+#
+# Anlass (2026-08-04): der Nutzer schloss drei Fenster, die Sessions liefen unveraendert
+# weiter, und die Claude-Prozesse dahinter hielten 6,0 GB. Seine Worte: „Die Session
+# sollte, wenn ich sie schliesse, auch richtig geschlossen sein und keinen
+# Arbeitsspeicher mehr verbrauchen."
+#
+# WARUM EIN WACHPOSTEN UND KEIN SOFORTIGES SCHLIESSEN. VS Code ruft `deactivate()`
+# sowohl beim Schliessen als auch beim NEULADEN eines Fensters auf; ein
+# `onWillCloseWindow` gibt es nicht. Gemessen (isolierte VS-Code-Instanz 1.131,
+# eigener --user-data-dir/--extensions-dir, 2026-08-04): nach einem Reload meldet
+# sich ein neuer Extension-Host nach 547 bis 592 ms zurueck (vier Durchlaeufe),
+# nach einem Schliessen nie. Die Extension toetet deshalb nichts, sondern legt eine
+# Marke „verwaist seit <zeit>" ab und startet diesen Wachposten losgeloest. Er
+# wartet die Karenzzeit ab und sieht dann nach, ob die Marke noch da ist: ein
+# Reload hat sie laengst entfernt.
+#
+# Geschlossen wird AUSSCHLIESSLICH ueber `wb-session-close` — nie mit rohem
+# `tmux kill-session`. Dessen Pruefungen (haengt ein Client, laeuft ein Worker,
+# ist es die eigene Session) gelten hier unveraendert. Laeuft noch ein Worker,
+# verweigert wb-session-close, die Marke BLEIBT liegen, und `wb-session-sweep`
+# nimmt sich der Session spaeter an.
+#
+# Jede Entscheidung landet in $HOME/.local/state/wb-session-orphan.log.
+set -uo pipefail
+
+SESSION=""
+TOKEN=""
+GRACE=90
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session) [ $# -ge 2 ] || { echo "wb-session-orphan: --session braucht einen Namen" >&2; exit 1; }
+               SESSION="$2"; shift 2 ;;
+    --token)   [ $# -ge 2 ] || { echo "wb-session-orphan: --token braucht einen Wert" >&2; exit 1; }
+               TOKEN="$2"; shift 2 ;;
+    --grace)   [ $# -ge 2 ] || { echo "wb-session-orphan: --grace braucht eine Zahl" >&2; exit 1; }
+               GRACE="$2"; shift 2 ;;
+    -h|--help) echo "usage: wb-session-orphan --session <name> --token <t> [--grace <sekunden>]"; exit 0 ;;
+    *) echo "wb-session-orphan: unbekannte Option '$1'" >&2; exit 1 ;;
+  esac
+done
+
+[ -n "$SESSION" ] || { echo "wb-session-orphan: --session fehlt" >&2; exit 1; }
+case "$GRACE" in
+  ''|*[!0-9]*) echo "wb-session-orphan: --grace braucht eine nicht-negative ganze Zahl, bekam '$GRACE'" >&2; exit 1 ;;
+esac
+
+CLOSE_TOOL="${WB_SESSION_CLOSE:-wb-session-close}"
+ORPHAN_DIR="${WB_ORPHAN_DIR:-$HOME/.claude/workbench/orphans}"
+LOG="${WB_SESSION_ORPHAN_LOG:-$HOME/.local/state/wb-session-orphan.log}"
+MARKER="$ORPHAN_DIR/$SESSION.json"
+mkdir -p "$(dirname "$LOG")"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$1" >> "$LOG"; }
+
+# Warten, bevor irgendetwas geprueft wird. Genau in dieser Spanne raeumt ein
+# Reload seine eigene Marke ab.
+[ "$GRACE" -gt 0 ] && sleep "$GRACE"
+
+if [ ! -f "$MARKER" ]; then
+  log "STEHENGELASSEN session=$SESSION grund=marke-weg (Fenster ist zurueckgekommen)"
+  exit 0
+fi
+
+# Die Marke traegt ein Kennzeichen. Wurde das Fenster in der Karenzzeit geschlossen,
+# neu geoeffnet und wieder geschlossen, liegt dort das Kennzeichen des JUENGEREN
+# Wachpostens — dann ist dieser hier ueberholt und haelt sich heraus.
+MARKER_TOKEN="$(/usr/bin/python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        print(json.load(f).get("token", ""))
+except Exception:
+    pass
+' "$MARKER" 2>/dev/null)"
+if [ -n "$TOKEN" ] && [ "$MARKER_TOKEN" != "$TOKEN" ]; then
+  log "STEHENGELASSEN session=$SESSION grund=juengere-marke marke=$MARKER_TOKEN eigen=$TOKEN"
+  exit 0
+fi
+
+if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
+  rm -f "$MARKER"
+  log "AUFGERAEUMT session=$SESSION grund=session-existiert-nicht-mehr"
+  exit 0
+fi
+
+# Gruppierte Sessions TEILEN ihre Fenster: wird nur die Basis geschlossen, bleibt
+# die '-view'-Schwester mit denselben Fenstern als eigenstaendige Session zurueck
+# (gemessen 2026-08-03, siehe wb-session-sweep). Genau so standen am 2026-08-04
+# drei der vier verwaisten Sessions da. Deshalb gehen IMMER alle Mitglieder der
+# Gruppe in EINEN Aufruf.
+GROUP="$(tmux list-sessions -F '#{session_name} #{session_group}' 2>/dev/null \
+         | awk -v n="$SESSION" '$1==n{print $2; exit}')"
+if [ -n "$GROUP" ]; then
+  MEMBERS="$(tmux list-sessions -F '#{session_name} #{session_group}' 2>/dev/null \
+             | awk -v g="$GROUP" '$2==g{print $1}' | tr '\n' ' ')"
+else
+  MEMBERS="$SESSION"
+fi
+# Die Basis zuletzt: die Sicht haengt an der Basis, nicht umgekehrt.
+ORDERED="$(printf '%s\n' $MEMBERS | awk -v b="$SESSION" '$0!=b{print} END{print b}' | tr '\n' ' ')"
+
+OUT="$("$CLOSE_TOOL" $ORDERED 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  rm -f "$MARKER"
+  log "GESCHLOSSEN session=$SESSION mitglieder=[$ORDERED] karenz_s=$GRACE"
+  exit 0
+fi
+
+# Verweigert — fast immer, weil noch ein Worker laeuft. Die Marke bleibt liegen:
+# sie ist der Beleg, den wb-session-sweep spaeter auswertet, und sie ist die
+# einzige Spur, die von einem Fenster uebrig ist, das es nicht mehr gibt.
+log "NICHT-GESCHLOSSEN session=$SESSION mitglieder=[$ORDERED] rc=$rc ausgabe=[$OUT]"
+printf 'wb-session-orphan: %s wurde NICHT geschlossen: %s\n' "$SESSION" "$OUT" >&2
+exit "$rc"

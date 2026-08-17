@@ -1,0 +1,53 @@
+#!/bin/bash
+# ai-scout — monthly research agent: scans ALL relevant areas for new tools,
+# models, techniques and improvements to the user's agent setup; writes a
+# ranked action report into the Knowledge inbox and notifies him.
+export PATH=$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin
+LOG="$HOME/.ai-scout.log"
+REPORT="$HOME/Knowledge/00-sources/ai-scout-$(date +%Y-%m).md"
+
+{
+echo "=== ai-scout run $(date) ==="
+
+# cheap deterministic check first (no tokens)
+bash "$HOME/.local/bin/check-ollama-kv-ssd"
+
+# snapshot current versions so the agent compares against reality
+SNAP=$(mktemp)
+{
+  echo "claude: $(claude --version 2>/dev/null)"
+  echo "pi: $(pi --version 2>/dev/null)"
+  echo "ollama: $(ollama --version 2>/dev/null)"
+  echo "ollama models:"; ollama list 2>/dev/null
+  echo "brew: $(brew list --versions tmux node python@3.13 uv 2>/dev/null | tr '\n' ' ')"
+  echo "mflux: $(mflux-generate --version 2>/dev/null | head -1)"
+  echo "basic-memory: $(basic-memory --version 2>/dev/null | tail -1)"
+} > "$SNAP" 2>&1
+
+gtimeout 2400 claude -p "You are the monthly AI-scout for the user's Mac agent setup (M5 Pro, 48 GB).
+Current setup: read ~/Knowledge/10-global/local-ai-orchestrator-architecture.md and the version
+snapshot at $SNAP. Research (web search) what is NEW and genuinely useful since the last report
+(check for a previous ~/Knowledge/00-sources/ai-scout-*.md or 20-projects notes) in ALL of these areas:
+1. Claude Code: new features, agent-teams improvements, hooks, statusline, memory.
+2. Multi-agent orchestration & prompt engineering: better techniques for how an orchestrator
+   should prompt, monitor and quality-gate worker agents.
+3. New community skills/plugins for Claude Code worth adopting.
+4. New MCP servers/tools that fit his projects (coding, knowledge base, DSGVO-safe automation).
+5. New local models runnable on 48 GB Apple Silicon: coding, embeddings, image, video, speech.
+6. Updates to installed stack: Ollama (esp. KV-cache/context-to-SSD offload), pi, mflux,
+   LTX/video-MLX, Basic Memory, tmux.
+7. Agent security: prompt-injection defenses, sandboxing news.
+8. Apple/macOS AI tooling (MLX ecosystem, Foundation Models APIs).
+9. Anything else clearly valuable for a solo builder running Myproject (DSGVO phone-AI agency),
+   another service (voice typing), a machine-bound project, and school-website projects.
+Then write a CONCISE ranked report to $REPORT (markdown, frontmatter: title, type: reference,
+tags [ai-scout, action], created: today). Only include findings that are genuinely new and
+actionable for THIS setup; for each: what it is, why it helps, concrete install/adopt step.
+If an item is safe and trivially reversible (e.g. 'ollama pull better-model', a settings flag),
+mark it AUTO-OK; everything else NEEDS-DECISION. Do NOT modify the system yourself.
+Finally run: osascript -e 'display notification \"AI-Scout-Report liegt im Knowledge-Inbox.\" with title \"Agent-Setup\"'" \
+  >> "$LOG" 2>&1
+
+rm -f "$SNAP"
+echo "=== done $(date), report: $REPORT ==="
+} >> "$LOG" 2>&1

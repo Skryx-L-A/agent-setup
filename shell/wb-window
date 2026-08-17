@@ -1,0 +1,121 @@
+#!/bin/bash
+# wb-window <worker-tab|reload> — schickt einen der zwei fest verdrahteten
+# claude-workbench-URI-Aufrufe an ein laufendes VS-Code-Fenster, ohne dass
+# sich ein Aufrufer die vscode://-URI selbst merken oder zusammenbauen muss.
+#
+# Anlass (2026-08-04): der Selbstheil-Fix fuer den Worker-Tab (siehe
+# extension/src/workerTab.ts) greift erst, sobald die Extension einmal frisch
+# geladen wurde — und ein VS-Code-Fenster auf einem anderen macOS-Space ist
+# weder per wb-shot noch per System Events erreichbar. Blindes Cmd+R tippen
+# ist ausgeschlossen: in derselben Nacht sind so zweimal Tastendruecke im
+# falschen Fenster gelandet und haben eine Streu-Session erzeugt. Eine
+# vscode://-URI ist der einzige Kanal, der ein Fenster erreicht, das man
+# weder sieht noch anklicken kann.
+#
+# WARNUNG, GEMESSEN AM 2026-08-04 (09:36 bis 09:52): dieser Kanal hat auf
+# dieser Maschine noch NIE nachweislich funktioniert. Zwei Wege ausprobiert,
+# je gegen das laufende Fenster von 07:54, das den Handler nachweislich
+# geladen hatte (Commit 9120df3 um 07:09, Aktivierung um 07:54:30 im
+# exthost.log):
+#   * `code --profile 'Claude Workbench' --open-url <uri>` — kein Reload, kein
+#     Eintrag irgendwo. Grund gefunden: es existiert KEIN vscode-ipc-*.sock
+#     (weder in $TMPDIR noch sonst unter /var/folders), und ohne diesen Socket
+#     kann die CLI eine laufende Instanz nicht erreichen; sie startet
+#     stattdessen eine eigene, kurzlebige, die mit der URI nichts anfaengt.
+#     Sichtbar nur daran, dass unter Code/logs/ ein neues Verzeichnis mit
+#     ausschliesslich cli.log entsteht.
+#   * `open -g "vscode://…"` (LaunchServices, der macOS-uebliche Weg) — Exit 0,
+#     aber ebenfalls kein Reload und kein Eintrag in main.log.
+# Nach beiden Versuchen trugen die tmux-Clients unveraendert dieselben ttys
+# (ttys020/ttys027); ein Reload haette neue vergeben. Deshalb gibt es die
+# Quittung unten: sie beantwortet diese Frage kuenftig in einem Befehl statt
+# in einer halben Stunde Log-Suche. Bis eine Quittung erscheint, gilt dieses
+# Werkzeug als UNBEWIESEN — der Selbstheil-Fix wird dann eben beim naechsten
+# ohnehin faelligen Fensterstart wirksam, und niemand baut eine Automatik auf
+# einen Kanal, der vielleicht gar nicht traegt.
+#
+# worker-tab -- ruft claude-workbench.openWorkerTab (holt den Worker-Tab
+#               zurueck, falls die Selbstheilung selbst nicht greift)
+# reload     -- workbench.action.reloadWindow (laedt die Extension frisch,
+#               das macht die Selbstheilung erst wirksam)
+#
+# Beide Pfade sind in extension/src/uriHandler.ts fest verdrahtet — dieses
+# Werkzeug kapselt nur den Aufruf, es reicht KEINEN Text an den Handler durch.
+# Siehe dort fuer die Begruendung dieser Enge (ein URI-Handler ist von jeder
+# Webseite ausloesbar, ein Parameter dort waere eine Fernsteuerung).
+#
+# QUITTUNG (2026-08-04): der Handler schreibt fuer jede behandelte URI eine
+# Zeile nach ~/.local/state/wb-window-uri.log (extension/src/uriReceiptLog.ts)
+# — Zeitstempel, Aktion, Workspace-Ordner des Fensters, das sie behandelt hat.
+# Dieses Skript merkt sich die Zeilenzahl der Datei vor dem Senden und wartet
+# danach mit Deadline auf eine neue Zeile, statt blind zu hoffen. Der
+# Workspace-Ordner in der Quittung beantwortet dabei die Frage, die von
+# aussen sonst unbeantwortbar ist: bei mehreren Fenstern desselben Profils
+# ist unbestimmt, welches die URI bekommt.
+set -uo pipefail
+
+PUBLISHER="<user>"
+EXT_NAME="claude-workbench"
+PROFILE="Claude Workbench"
+DEFAULT_TIMEOUT=10
+TIMEOUT="${WB_WINDOW_TIMEOUT:-$DEFAULT_TIMEOUT}"
+LOG="${WB_WINDOW_RECEIPT_LOG:-$HOME/.local/state/wb-window-uri.log}"
+POLL_INTERVAL=0.2
+
+usage() {
+  echo "usage: wb-window <worker-tab|reload>" >&2
+  echo "  worker-tab  -- Worker-Tab oeffnen/zurueckholen" >&2
+  echo "  reload      -- VS-Code-Fenster neu laden" >&2
+  echo "  WB_WINDOW_TIMEOUT=<Sekunden>  -- wie lange auf die Quittung gewartet wird (Default $DEFAULT_TIMEOUT)" >&2
+}
+
+ACTION="${1:-}"
+case "$ACTION" in
+  worker-tab|reload) ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage; exit 1 ;;
+esac
+
+command -v code >/dev/null 2>&1 || {
+  echo "wb-window: 'code' nicht im PATH — die VS-Code-CLI fehlt." >&2
+  echo "  Installieren: VS Code -> Cmd+Shift+P -> 'Shell Command: Install \"code\" command in PATH'." >&2
+  exit 1
+}
+
+before_lines=0
+if [ -f "$LOG" ]; then
+  before_lines="$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')"
+  before_lines="${before_lines:-0}"
+fi
+
+URI="vscode://${PUBLISHER}.${EXT_NAME}/${ACTION}"
+echo "wb-window: sende '$URI' (Profil '$PROFILE')."
+if ! code --profile "$PROFILE" --open-url "$URI"; then
+  echo "wb-window: 'code --open-url' ist fehlgeschlagen — nichts verschickt." >&2
+  exit 1
+fi
+
+deadline=$(( $(date +%s) + TIMEOUT ))
+new_line=""
+while [ "$(date +%s)" -le "$deadline" ]; do
+  if [ -f "$LOG" ]; then
+    now_lines="$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')"
+    now_lines="${now_lines:-0}"
+    if [ "$now_lines" -gt "$before_lines" ]; then
+      new_line="$(sed -n "$((before_lines + 1))p" "$LOG")"
+      break
+    fi
+  fi
+  sleep "$POLL_INTERVAL"
+done
+
+if [ -z "$new_line" ]; then
+  echo "wb-window: keine Quittung nach ${TIMEOUT} s — Fenster tot, Extension nicht geladen, oder falsches Profil." >&2
+  exit 4
+fi
+
+RECV_ACTION="$(printf '%s' "$new_line" | cut -f2)"
+RECV_FOLDER="$(printf '%s' "$new_line" | cut -f3)"
+[ -n "$RECV_FOLDER" ] || RECV_FOLDER="(kein Ordner offen)"
+echo "wb-window: angekommen — Fenster '$RECV_FOLDER', Aktion '$RECV_ACTION'."
+exit 0

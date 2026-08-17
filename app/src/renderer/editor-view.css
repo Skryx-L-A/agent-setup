@@ -1,0 +1,94 @@
+/* Editor (Schritt 6, A3/4c): Tab-Zeile ueber der Buehne, der Monaco-Host
+   darunter. Beide legt editor-view.ts selbst an -- index.html bleibt
+   unveraendert, genau wie bei der Freigabe-Ansicht. Die Tab-Zeile ist LEER,
+   solange keine Datei offen ist, und dann auch nicht zu sehen (4c: "Wer nie
+   eine Datei oeffnet, sieht die Tab-Zeile nie"). */
+.ed-tabs {
+  display: flex; flex: 0 0 auto; overflow-x: auto; background: var(--leiste);
+  border-bottom: 1px solid var(--linie);
+}
+.ed-tabs:empty { display: none; }
+
+.ed-tab {
+  display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
+  font: inherit; color: var(--gedaempft); background: none; border: 0;
+  border-right: 1px solid var(--linie); padding: 5px 10px; cursor: pointer;
+  max-width: 220px; white-space: nowrap;
+}
+.ed-tab span:first-child { overflow: hidden; text-overflow: ellipsis; }
+.ed-tab:hover { color: var(--schrift); background: #1e232b; }
+.ed-tab.gewaehlt { color: var(--schrift); background: #222833; box-shadow: inset 0 -2px 0 var(--laeuft); }
+.ed-tab-x {
+  flex: 0 0 auto; opacity: 0.6; border-radius: 3px; padding: 0 3px;
+}
+.ed-tab-x:hover { opacity: 1; background: #333b48; }
+
+.ed-host { position: relative; flex: 1 1 auto; min-height: 0; min-width: 0; background: var(--grund); }
+/* Der eigentliche Monaco-Mount fuellt den Host; die Notiz liegt daneben, statt
+   dass Monaco ihre Kindknoten mitverwaltet. */
+.ed-monaco-mount { position: absolute; inset: 0; }
+
+/* V18: Auftrag und Ergebnis nebeneinander -- schlichter Text statt Monaco,
+   die beiden sind keine Fassungen derselben Datei (kein Diff, nur zwei
+   Spalten). Dieselbe Flaeche wie ed-host, damit sie sich mit ihr abwechselt. */
+/* KEIN display hier: die Sichtbarkeit steuert editor-view.ts ausschliesslich
+   ueber style.display (nicht die 'hidden'-Eigenschaft) -- ein author-Regel
+   mit 'display' auf demselben Selektor wie [hidden] schlaegt das Attribut
+   IMMER, unabhaengig von der Spezifitaet (Autor- vor Useragent-Herkunft in
+   der Kaskade). Genau das hat hier einmal dafuer gesorgt, dass die Kachel
+   staendig Platz in der Mitte beanspruchte, auch waehrend sie unsichtbar sein
+   sollte -- gefunden an einer fehlgeschlagenen Kontrastmessung eines ganz
+   anderen Tests, dessen Pane dadurch kleiner ausfiel als angefordert. */
+.ed-auftrag-host {
+  flex: 1 1 auto; min-height: 0; min-width: 0;
+  background: var(--grund);
+}
+.ed-auftrag-spalte {
+  flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.ed-auftrag-spalte + .ed-auftrag-spalte { border-left: 1px solid var(--linie); }
+.ed-auftrag-kopf {
+  flex: 0 0 auto; padding: 6px 12px; color: var(--gedaempft); font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 1px solid var(--linie);
+}
+.ed-auftrag-text {
+  flex: 1 1 auto; margin: 0; padding: 12px; overflow: auto; white-space: pre-wrap;
+  word-break: break-word; font: inherit; color: var(--schrift);
+}
+
+/* Der Schnelloeffner (4c: "eine Datei ueber ihren Namen findet, ohne dass
+   der Baum aufgeklappt werden muss"). Eigenes Overlay, wie die
+   Freigabe-Ansicht ein eigenes Panel ist. */
+.ed-qo {
+  position: fixed; inset: 0; z-index: 20; display: none;
+  background: rgba(6, 8, 11, 0.55);
+  align-items: flex-start; justify-content: center;
+}
+.ed-qo.offen { display: flex; }
+.ed-qo-box {
+  margin-top: 96px; width: min(640px, 86vw); max-height: 70vh;
+  background: var(--leiste); border: 1px solid var(--linie); border-radius: 8px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5); display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.ed-qo-input {
+  font: inherit; font-size: 14px; padding: 12px 14px; border: 0;
+  border-bottom: 1px solid var(--linie); background: none; color: var(--schrift);
+  outline: none;
+}
+.ed-qo-list { overflow-y: auto; }
+.ed-qo-item { padding: 6px 14px; color: var(--gedaempft); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ed-qo-item.gewaehlt { background: #222833; color: var(--schrift); }
+.ed-qo-leer { padding: 10px 14px; color: var(--gedaempft); }
+
+/* Kurze Rueckmeldung ueber dem Editor -- dieselbe Bildsprache wie #notiz in
+   index.html, aber eine eigene Instanz: editor-view.ts fasst dessen
+   Zustand nicht an. */
+.ed-notiz {
+  position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
+  z-index: 5; display: none; width: max-content; max-width: 80%;
+  padding: 5px 12px; border-radius: 6px; background: #222833;
+  border: 1px solid var(--linie); color: var(--schrift); font-size: 12px;
+}
+.ed-notiz.sichtbar { display: block; }

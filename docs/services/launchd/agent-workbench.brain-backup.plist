@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE. Replace __HOME__ before loading; see docs/SERVICES.md for the one-line sed.
+
+  Bundles the knowledge base once a week, so a bad git day is not a lost brain.
+  `backup-bundle.sh` ships with the knowledge skeleton; it writes a single git bundle
+  and keeps the last few.
+
+  Sunday, 04:00. If the machine is asleep at that time launchd runs the job at the next
+  wake-up, not never.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>agent-workbench.brain-backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/Knowledge/_meta/tools/backup-bundle.sh</string>
+  </array>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/knowledge-backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/knowledge-backup.log</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>4</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+</dict>
+</plist>

@@ -1,0 +1,490 @@
+#!/bin/bash
+# wb-doctor — findet und repariert die Strukturfehler der Workbench-Sessions.
+#
+# Warum es das gibt (2026-08-04): An einem Abend traten sechs verschiedene
+# Strukturfehler auf, jeder einzeln harmlos, zusammen ein unbenutzbares Layout —
+# gestapelte Sicht-Sessions ('wb-a project-view-view-view'), Sicht-Sessions ohne
+# Basis (Gruppenname war die Zeichenkette '=wb-…', weil `tmux new-session -t
+# <fehlt>` nicht scheitert, sondern etwas Neues erzeugt), fehlende
+# `workers`-Fenster, Sichten, die auf das Orchestrator-Fenster zeigten,
+# Worker-Panes im falschen Fenster und Panes ohne `@wb_role`.
+#
+# Der Umweg ueber die Augen ("sieht komisch aus") kostet jedes Mal eine
+# Diagnose von vorn. Dieses Werkzeug macht die Diagnose maschinell und die
+# Reparatur wiederholbar.
+#
+#   wb-doctor            Bericht, aendert nichts
+#   wb-doctor --fix      repariert, was sicher reparierbar ist
+#   wb-doctor --fix --closed-views   schliesst zusaetzlich ueberzaehlige Sichten
+#
+# Acht Pruefungen. Die achte vergleicht die Zustandsdateien der Startseite mit den
+# laufenden tmux-Sessions und nennt fuer jede fortsetzbare, aber nicht mehr
+# laufende Session den fertigen `wb-session-delete`-Aufruf — Loeschen bleibt
+# Handarbeit, --fix fasst dort nichts an.
+#
+# Dazu kamen spaeter Punkt 9 (dieselbe Unterhaltung in mehreren Zustandsdateien)
+# und, VOR dem tmux-Gate, Punkt 0: die Konfigurationsdateien, ohne die ein Harness
+# gar nicht startet (2026-08-08, `configFiles`). Der steht vorn, weil er auf einer
+# frisch aufgesetzten Maschine greifen muss, auf der noch keine Session laeuft.
+#
+# Punkt 10 (2026-08-11, verschaerft am selben Tag) ruft `wb-waisen` auf:
+# Hintergrundprozesse, die ein Agent selbst gestartet hat (Modellserver,
+# Playwright/Chromium headless, Entwicklungsserver, Tunnel) und deren
+# Eigentuemer nachweislich weg ist. Der Anlass war eine Kernel-Panik — ein per
+# `nohup ... & disown` gestarteter Modellserver lief nach dem Schliessen
+# seines Panes mit 21,9 GB weiter, unbemerkt von diesem Werkzeug UND von
+# `wb-close`. Die ERSTE Fassung erkannte einen Waisen allein an PPID=1/keinem
+# Terminal — und stufte damit einen echten, gerade benutzten Modellserver
+# (PID 82087, siehe wb-waisens Kopfkommentar) faelschlich als Waise ein.
+# Seither zwei Klassen: "waise" (Eigentuemer-Eintrag vorhanden, dessen Pane
+# bestaetigt tot ist — der einzige Fall mit kill-Vorschlag) und
+# "unregistriert" (kein Eintrag, nur Verdachtsmomente, NIE ein
+# Beenden-Vorschlag). Nur ein Hinweis, keine Reparatur: was `wb-waisen`
+# selbst nicht beendet (Absicht, siehe dessen Kopfkommentar), beendet
+# `--fix` hier erst recht nicht.
+#
+# Was es NIE tut: einen Pane mit laufender Arbeit toeten, eine Basis-Session
+# schliessen, oder eine Session anfassen, an der ein Client haengt. Geschlossen
+# wird ausschliesslich ueber `wb-session-close`, das seine eigenen Pruefungen
+# mitbringt.
+set -uo pipefail
+
+FIX=""; CLOSE_VIEWS=""
+for a in "$@"; do
+  case "$a" in
+    --fix) FIX=1 ;;
+    --closed-views|--close-views) CLOSE_VIEWS=1 ;;
+    -h|--help) sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "wb-doctor: unbekannte Option '$a'" >&2; exit 1 ;;
+  esac
+done
+
+BIN="$HOME/.local/bin"
+befunde=0; repariert=0
+
+melde()  { befunde=$((befunde+1)); printf '  %-8s %s\n' "BEFUND" "$1"; }
+tat()    { repariert=$((repariert+1)); printf '  %-8s %s\n' "REPARIERT" "$1"; }
+hinweis(){ printf '  %-8s %s\n' "hinweis" "$1"; }
+
+# EIN Filter fuer alle Pruefungen, die tmux-Sessions oder deren Panes anfassen
+# (Betriebslauf 2026-08-04, B4): --fix darf NIE eine fremde tmux-Session umbauen,
+# die der Nutzer nebenher offen hat. Im Testlauf bekam eine gewoehnliche Shell-
+# Session ein 'workers'-Fenster und eine gruppierte Sicht verpasst, weil die
+# Punkte 4, 5 und 7 jede Session pruefen statt nur Workbench-Sessions. Punkt 8
+# filterte schon vorher auf 'wb-*'; jetzt an EINER Stelle, damit kein Punkt es
+# vergessen kann.
+ist_wb_session() { case "$1" in wb-*) return 0 ;; *) return 1 ;; esac; }
+
+# EIN Filter fuer gueltige Worker-Fensternamen (Betriebslauf 2026-08-04, B6/B8):
+# 'workers' ist nur das ERSTE von moeglicherweise mehreren Fenstern -- wb-grid
+# legt 'workers-2', 'workers-3', ... an, sobald maxWorkerPanesPerTab
+# ueberschritten wird (siehe shell/wb-grid, shell/wb-workers-window). Ein
+# Vergleich nur gegen die Zeichenkette 'workers' haelt jedes Ueberlauf-Fenster
+# faelschlich fuer falsch platziert.
+ist_workers_fenster() { case "$1" in workers|workers-[0-9]*) return 0 ;; *) return 1 ;; esac; }
+
+# == 0. Harness-Konfigurationsdateien ==========================================
+# Steht VOR dem tmux-Gate, und zwar mit Absicht: das ist die einzige Pruefung hier,
+# die nichts mit laufenden Sessions zu tun hat, und sie muss gerade dann greifen,
+# wenn noch gar nichts laeuft — auf einer frisch aufgesetzten Maschine, BEVOR
+# jemand den ersten Worker startet. Haenge sie hinter das Gate, und sie schwiege
+# genau in dem Moment, fuer den sie gebaut ist (2026-08-08).
+#
+# Reparatur bleibt ein eigener Aufruf: `wb-doctor --fix` raeumt tmux-Struktur auf,
+# und eine Datei nach ~/.config zu schreiben ist keine Struktur-Reparatur. Wer sie
+# will, tippt den genannten Befehl — er sichert vorher und laesst eine angepasste
+# Datei stehen.
+echo "== 0. Harness-Konfigurationsdateien (Startbedingung) =="
+if [ -x "$BIN/wb-harness-config" ]; then
+  konfig="$("$BIN/wb-harness-config" check 2>&1)"; krc=$?
+  if [ "$krc" -eq 0 ]; then
+    case "$konfig" in
+      *abgewichen*|*veraltet*|*"QUELLE FEHLT"*)
+        printf '%s\n' "$konfig" | sed 's/^/  /'
+        hinweis "keine PFLICHT-Datei fehlt; die Abweichungen oben halten keinen Spawn auf" ;;
+      *) echo "  ok       alle Pflichtdateien liegen an ihrem Platz" ;;
+    esac
+  else
+    melde "einem Harness fehlt eine Konfigurationsdatei — sein Worker startet nicht:"
+    printf '%s\n' "$konfig" | sed 's/^/           /'
+    hinweis "Ausrollen: wb-harness-config apply   (sichert vorher, laesst Angepasstes stehen)"
+  fi
+else
+  hinweis "wb-harness-config ist nicht installiert — Konfigurationsdateien ungeprueft"
+fi
+
+echo
+tmux has-session 2>/dev/null || { echo "wb-doctor: kein tmux-Server erreichbar — die Sessionpruefungen entfallen."; exit 0; }
+
+# Sessionname -> Gruppe. `display -p -t <session> '#{session_group}'` liefert LEER
+# (gemessen 2026-08-04); die Gruppe steht nur in list-sessions.
+sessions="$(tmux list-sessions -F '#{session_name}|#{session_group}|#{session_attached}|#{session_windows}' 2>/dev/null)"
+
+# Einmal berechnet, von den Punkten 4, 6 und 7 gemeinsam benutzt. Frueher stand
+# das nur am Kopf von Punkt 6 und war fuer Punkt 4 nicht sichtbar -- Betriebslauf
+# 2026-08-04, B5: unter 'split' verlangte Punkt 4 trotzdem die Sicht, die die
+# Extension in genau diesem Layout bewusst schliesst (killViewSession).
+layout="$("$BIN/wb-state" settings get workerLayout 2>/dev/null || echo window)"
+
+echo "== Sessions =="
+printf '%s\n' "$sessions" | while IFS='|' read -r name grp att wins; do
+  printf '  %-34s Gruppe=%-22s Clients=%s Fenster=%s\n' "$name" "${grp:-—}" "$att" "$wins"
+done
+
+echo
+echo "== 1. Sicht-Sessions ohne Basis (Gruppenname beginnt mit '=') =="
+while IFS='|' read -r name grp att wins; do
+  case "${grp:-}" in
+    =*) melde "'$name' haengt an der Zeichenkette '$grp' — die Basis existiert nicht."
+        if [ -n "$FIX" ] && [ "${att:-0}" -eq 0 ]; then
+          "$BIN/wb-session-close" "$name" >/dev/null 2>&1 && tat "'$name' geschlossen"
+        elif [ "${att:-0}" -gt 0 ]; then
+          hinweis "an '$name' haengt ein Client — erst das zugehoerige Fenster schliessen oder neu laden"
+        fi ;;
+  esac
+done <<EOF
+$sessions
+EOF
+
+echo
+echo "== 2. Gestapelte Sichten ('…-view-view') =="
+while IFS='|' read -r name grp att wins; do
+  case "$name" in
+    *-view-view*)
+      melde "'$name' ist eine Sicht auf eine Sicht — dieselben Fenster ein drittes Mal."
+      if [ -n "$FIX" ] || [ -n "$CLOSE_VIEWS" ]; then
+        "$BIN/wb-session-close" "$name" >/dev/null 2>&1 && tat "'$name' geschlossen (Panes leben in '$grp' weiter)"
+      fi ;;
+  esac
+done <<EOF
+$sessions
+EOF
+
+echo
+echo "== 3. Verwaiste Sichten (Basis gibt es nicht mehr) =="
+while IFS='|' read -r name grp att wins; do
+  case "$name" in
+    *-view)
+      base="${name%-view}"
+      if ! tmux has-session -t "=$base" 2>/dev/null && [ "${grp#=}" = "$grp" ]; then
+        melde "'$name' hat keine Basis '$base' mehr."
+        if [ -n "$FIX" ] && [ "${att:-0}" -eq 0 ]; then
+          "$BIN/wb-session-close" "$name" >/dev/null 2>&1 && tat "'$name' geschlossen"
+        fi
+      fi ;;
+  esac
+done <<EOF
+$sessions
+EOF
+
+echo
+echo "== 4. Basis-Sessions: workers-Fenster und Sicht =="
+while IFS='|' read -r name grp att wins; do
+  case "$name" in *-view) continue ;; esac
+  case "${grp:-}" in =*) continue ;; esac
+  ist_wb_session "$name" || continue
+  hat_workers="$(tmux list-windows -t "=$name" -F '#{window_name}' 2>/dev/null | grep -cx workers)"
+  if [ "${hat_workers:-0}" -eq 0 ]; then
+    melde "'$name' hat kein 'workers'-Fenster — der Worker-Tab zeigt sonst den Orchestrator."
+    if [ -n "$FIX" ]; then
+      "$BIN/wb-workers-window" "$name" >/dev/null 2>&1 && tat "'$name': workers-Fenster angelegt"
+    fi
+  fi
+  # Unter workerLayout=split gibt es bewusst KEINE Sicht -- applyWorkerLayout in
+  # der Extension ruft killViewSession genau dafuer auf, sobald der Tab
+  # geschlossen wird. Punkt 7 haelt es schon so; Betriebslauf 2026-08-04 (B5)
+  # zeigte, dass Punkt 4 die Sicht trotzdem verlangte und sie mit --fix neu
+  # anlegte -- und damit den Layoutwechsel teilweise rueckgaengig machte.
+  if [ "$layout" = split ]; then
+    :
+  elif ! tmux has-session -t "=$name-view" 2>/dev/null; then
+    melde "'$name' hat keine Sicht '$name-view' — an ihr haengt der Worker-Tab."
+    if [ -n "$FIX" ]; then
+      "$BIN/wb-workers-window" "$name" >/dev/null 2>&1 && tat "'$name': Sicht angelegt"
+    fi
+  else
+    aktiv="$(tmux list-windows -t "=$name-view" -F '#{window_name} #{window_active}' 2>/dev/null | awk '$2==1{print $1}')"
+    # 'workers-2', 'workers-3', ... sind gueltige Ueberlauf-Fenster (siehe
+    # ist_workers_fenster oben) -- Betriebslauf 2026-08-04 (B8): der geoeffnete
+    # Ueberlauf-Tab wurde bisher als Fehler gemeldet und mit --fix auf 'workers'
+    # zurueckgestellt, der Tab sprang dem Benutzer unter der Hand weg.
+    if [ -n "$aktiv" ] && ! ist_workers_fenster "$aktiv" && [ "${hat_workers:-0}" -gt 0 ]; then
+      melde "'$name-view' steht auf '$aktiv' statt auf einem workers-Fenster."
+      if [ -n "$FIX" ]; then
+        tmux select-window -t "=$name-view:workers" 2>/dev/null && tat "'$name-view' auf workers gestellt"
+      fi
+    fi
+  fi
+done <<EOF
+$sessions
+EOF
+
+echo
+echo "== 5. Panes ohne Rolle =="
+# < <(...) statt | while (Betriebslauf 2026-08-04, B9): eine Pipe fuehrt die
+# rechte Seite in einer SUBSHELL aus -- befunde/repariert, die melde()/tat()
+# darin hochzaehlen, gingen beim Verlassen der Schleife wieder verloren. Ein
+# Lauf, der NUR hier oder in Punkt 6 etwas findet, endete deshalb mit
+# "wb-doctor: keine Befunde." trotz gedruckter BEFUND-Zeilen. Prozess-
+# substitution laesst die Schleife selbst im Hauptprozess laufen.
+while IFS='|' read -r sname wname pid role cmd; do
+  case "$sname" in *-view) continue ;; esac
+  ist_wb_session "$sname" || continue
+  [ -n "$role" ] && continue
+  melde "$sname:$wname $pid hat keine @wb_role (Kommando '$cmd') — Grid und wb-close uebersehen ihn."
+  if [ -n "$FIX" ]; then
+    if [ "$wname" = workers ]; then
+      tmux set -p -t "$pid" @wb_role worker 2>/dev/null && tat "$pid als worker markiert"
+    else
+      tmux set -p -t "$pid" @wb_role orchestrator 2>/dev/null && tat "$pid als orchestrator markiert"
+    fi
+  fi
+done < <(tmux list-panes -a -F '#{session_name}|#{window_name}|#{pane_id}|#{@wb_role}|#{pane_current_command}' 2>/dev/null)
+
+echo
+echo "== 6. Worker im falschen Fenster (workerLayout) =="
+echo "  Einstellung: workerLayout=$layout"
+# < <(...) aus demselben Grund wie Punkt 5 (B9): sonst zaehlt diese Pruefung
+# ihre eigenen Befunde nicht mit.
+while IFS='|' read -r sname wname pid role; do
+  case "$sname" in *-view) continue ;; esac
+  [ "$role" = worker ] || continue
+  # ist_workers_fenster statt Vergleich gegen die Zeichenkette 'workers'
+  # (Betriebslauf 2026-08-04, B6): 'workers-2', 'workers-3', ... sind
+  # gueltige Ueberlauf-Fenster, kein Fehlstand.
+  if [ "$layout" = window ] && ! ist_workers_fenster "$wname"; then
+    melde "$pid ($sname) ist ein Worker im Fenster '$wname', obwohl workerLayout=window gilt."
+    if [ -n "$FIX" ]; then
+      "$BIN/wb-grid" "$pid" >/dev/null 2>&1
+      # Nachmessen statt dem Rueckgabewert glauben (Betriebslauf 2026-08-04,
+      # B3): wb-grid endet mit 0, auch wenn es einen Pane nicht bewegen konnte
+      # (Ursache in wb-grid selbst, dort arbeitet ein anderer Worker dran).
+      # REPARIERT gibt es hier nur, wenn der Pane danach WIRKLICH in einem
+      # gueltigen workers-Fenster liegt.
+      neues_fenster="$(tmux display -p -t "$pid" '#{window_name}' 2>/dev/null)"
+      ist_workers_fenster "${neues_fenster:-}" && tat "$sname neu geordnet"
+    fi
+  fi
+  if [ "$layout" = split ] && ist_workers_fenster "$wname"; then
+    melde "$pid ($sname) liegt im Fenster '$wname', obwohl workerLayout=split gilt."
+    if [ -n "$FIX" ]; then
+      "$BIN/wb-grid" "$pid" >/dev/null 2>&1
+      neues_fenster="$(tmux display -p -t "$pid" '#{window_name}' 2>/dev/null)"
+      ist_workers_fenster "${neues_fenster:-}" || tat "$sname neu geordnet"
+    fi
+  fi
+done < <(tmux list-panes -a -F '#{session_name}|#{window_name}|#{pane_id}|#{@wb_role}' 2>/dev/null)
+
+echo
+echo "== 7. Sichtbarkeit =="
+while IFS='|' read -r name grp att wins; do
+  case "$name" in *-view) continue ;; esac
+  case "${grp:-}" in =*) continue ;; esac
+  ist_wb_session "$name" || continue
+  # Aus dem eingangs eingelesenen $sessions berechnet, nicht aus einer neuen,
+  # leerzeichengetrennten Abfrage: bei einer ungruppierten Session (keine Sicht
+  # vorhanden) ist '#{session_group}' LEER, und awks Standard-Feldtrennung
+  # schluckt das leere Feld -- session_attached rutscht dann eine Spalte nach
+  # links und wird faelschlich als Gruppenname gelesen. Mit '|' als Trenner
+  # (wie $sessions es schon durchgehend benutzt) bleiben leere Felder erhalten.
+  gruppe_att="$(printf '%s\n' "$sessions" | awk -F'|' -v b="$name" '$2==b || $1==b {s+=$3} END{print s+0}')"
+  if [ "${gruppe_att:-0}" -eq 0 ]; then
+    melde "'$name' laeuft, aber KEIN Client sieht sie — weder Orchestrator- noch Worker-Tab."
+    hinweis "das kann kein Werkzeug nachholen: Fenster oeffnen (wb-code '<ordner>') oder in VS Code den Tab"
+    continue
+  fi
+  # Mindestens ein Client haengt irgendwo in der Gruppe — das reicht nicht,
+  # um beide Tabs fuer sichtbar zu erklaeren. Orchestrator- und Worker-Tab
+  # sind ZWEI verschiedene Sessions (Basis vs. '<name>-view'), und genau das
+  # hat die alte Pruefung uebersehen: sie summierte session_attached ueber
+  # die ganze Gruppe, ein einziger Client an der Basis reichte fuer "sichtbar".
+  # Gemessen 2026-08-04: 'wb-AI' clients=1, 'wb-AI-view' clients=0 — der
+  # Worker-Tab war ohne Client, wb-doctor meldete trotzdem nichts.
+  if [ "${att:-0}" -eq 0 ]; then
+    melde "'$name': kein Client am Orchestrator-Tab — nur der Worker-Tab (falls offen) haengt."
+    hinweis "Fenster oeffnen (wb-code '<ordner>') oder in VS Code den Orchestrator-Tab neu laden"
+  fi
+  # Der Worker-Tab existiert nur als eigene Sichtbarkeit, wenn workerLayout=window
+  # gilt — bei 'split' liegen die Worker-Panes im selben Fenster wie der
+  # Orchestrator, es gibt keinen zweiten Tab, und eine fehlende oder unbesuchte
+  # '-view'-Sicht ist dort der korrekte Zustand, kein Befund.
+  if [ "$layout" = window ]; then
+    view_att="$(printf '%s\n' "$sessions" | awk -F'|' -v v="$name-view" '$1==v{print $3+0}')"
+    if [ -z "$view_att" ]; then
+      melde "'$name' hat keine Sicht '$name-view' — der Worker-Tab kann an nichts haengen."
+      if [ -n "$FIX" ]; then
+        "$BIN/wb-workers-window" "$name" >/dev/null 2>&1 && tat "'$name': Sicht angelegt"
+      fi
+    elif [ "$view_att" -eq 0 ]; then
+      melde "'$name': kein Client am Worker-Tab ('$name-view') — der Orchestrator-Tab haengt, der Worker-Tab nicht."
+      # Nicht per --fix reparierbar: die '-view'-Session existiert, es fehlt
+      # nur ein VS-Code-Tab, der sich an sie haengt. Kein Werkzeug hier kann
+      # in einem fremden VS-Code-Fenster einen Tab oeffnen (anders als die
+      # fehlende Sicht oben, die wb-workers-window anlegen kann).
+      # Seit dem URI-Handler (2026-08-04) gibt es dafuer doch einen Weg ohne Tastatur --
+      # aber nur, wenn im Fenster bereits eine Fassung MIT Handler laeuft. Beim ersten Mal
+      # nach einer Installation trifft das nicht zu, deshalb steht der Handgriff zuerst.
+      hinweis "in VS Code den Worker-Tab oeffnen; laeuft dort schon eine Fassung mit URI-Handler: wb-window worker-tab"
+    fi
+  fi
+done <<EOF
+$sessions
+EOF
+
+echo
+echo "== 8. Zustandsdateien und tmux-Sessions =="
+# Die Startseite liest die Zustandsdateien, tmux kennt die laufenden Sessions.
+# Laufen die auseinander, zeigt die Startseite Sessions, hinter denen nichts mehr
+# steht — oder es laeuft eine Session, die auf der Startseite fehlt. Beides ist
+# nur ein Hinweis: eine Zustandsdatei ohne laufende Session ist voellig normal
+# (genau die will man fortsetzen), sie wird hier nur benannt, damit man die alten
+# gezielt entfernen kann statt sie zu suchen.
+STATEDIR="$HOME/.claude/workbench/sessions"
+if [ -d "$STATEDIR" ]; then
+  /usr/bin/python3 - "$STATEDIR" <<'PY' | while IFS='|' read -r dir key sess; do
+import json, os, sys
+d = sys.argv[1]
+for fn in sorted(os.listdir(d)):
+    if not fn.endswith(".json"):
+        continue
+    try:
+        st = json.load(open(os.path.join(d, fn)))
+    except Exception:
+        continue
+    if not st.get("dir"):
+        continue
+    print("%s|%s|%s" % (st["dir"], st.get("sessionKey") or "", st.get("tmuxSession") or ""))
+PY
+    [ -n "$sess" ] || continue
+    tmux has-session -t "=$sess" 2>/dev/null && continue
+    # Kein Befund, nur eine Zeile: eine fortsetzbare Session, die gerade nicht
+    # laeuft, ist der Normalfall — genau die will man ja fortsetzen. Gemeldet
+    # wird sie, damit die alten gezielt entfernbar sind statt gesucht.
+    printf '  %-8s %s\n' "ruht" "$sess   ($dir${key:+, Schluessel $key})"
+  done
+  echo "  Zum Entfernen einer davon: wb-session-delete --dir '<ordner>' [--key <schluessel>] --yes"
+  echo "  (zeigt zuerst nur an, was ginge; erst mit --yes wird geloescht und vorher gesichert)"
+  # Der umgekehrte Fall ist ein echter Befund: eine laufende Workbench-Session,
+  # die auf der Startseite gar nicht auftaucht, findet man sonst nie wieder.
+  while IFS='|' read -r name grp att wins; do
+    case "$name" in *-view) continue ;; esac
+    ist_wb_session "$name" || continue
+    case "${grp:-}" in =*) continue ;; esac
+    if ! grep -rlq "\"tmuxSession\": \"$name\"" "$STATEDIR" 2>/dev/null; then
+      melde "'$name' laeuft, steht aber in keiner Zustandsdatei — die Startseite kennt sie nicht."
+      hinweis "das kann kein Werkzeug erraten: die Session gehoert zu einem Ordner, den nur sie kennt"
+    fi
+  done <<EOF
+$sessions
+EOF
+else
+  hinweis "kein Zustandsverzeichnis $STATEDIR — noch keine Session gestartet?"
+fi
+
+echo
+echo "== 9. Dieselbe Unterhaltung in mehreren Zustandsdateien =="
+# Seit dem 05.08. nimmt `wb-revive` die `claudeSessionId` DIESER Session, statt
+# mit `--continue` die neueste im Ordner zu raten. Das setzt voraus, dass eine
+# Unterhaltung zu genau einer Session gehoert. Heute steht sie manchmal in
+# zweien: wer eine Unterhaltung mit `wb-code --resume` in eine NEUE Session
+# holt, hinterlaesst die Kennung auch im alten Eintrag. Werden dann beide
+# wiederbelebt, haengen zwei Prozesse an derselben Unterhaltung -- genau der
+# Fall, den die Aenderung verhindern sollte.
+#
+# Nur ein Hinweis, keine Reparatur: welcher der beiden Eintraege der gemeinte
+# ist, weiss nur der Mensch, und ein Werkzeug, das hier raet, loescht die
+# falsche Haelfte einer Arbeitswoche.
+if [ -d "$STATEDIR" ]; then
+  # Erst einsammeln, dann durchgehen: eine Schleife HINTER einer Pipe laeuft in
+  # einer Unterschale, und `melde` zaehlte dort in eine Kopie von `befunde` --
+  # die Schlusszeile haette "keine Befunde" gemeldet. Punkt 8 daneben loest es
+  # aus demselben Grund genauso.
+  doppelte="$(/usr/bin/python3 - "$STATEDIR" <<'PY'
+import json, os, sys, collections
+d = sys.argv[1]
+nach_id = collections.defaultdict(list)
+for fn in sorted(os.listdir(d)):
+    if not fn.endswith(".json"):
+        continue
+    try:
+        st = json.load(open(os.path.join(d, fn)))
+    except Exception:
+        continue
+    cid = st.get("claudeSessionId")
+    if cid:
+        nach_id[cid].append(f'{fn} (tmux {st.get("tmuxSession", "?")})')
+for cid, eintraege in nach_id.items():
+    if len(eintraege) > 1:
+        print(f'{cid}|' + ", ".join(eintraege))
+PY
+)"
+  if [ -n "$doppelte" ]; then
+    while IFS='|' read -r cid rest; do
+      [ -z "$cid" ] && continue
+      melde "Unterhaltung $cid steht in mehreren Zustandsdateien: $rest"
+      hinweis "wird eine davon wiederbelebt, laeuft sie auf derselben Unterhaltung wie die andere"
+    done <<EOF
+$doppelte
+EOF
+  fi
+fi
+
+echo
+echo "== 10. Hintergrundprozesse ohne bestaetigten lebenden Besitzer (wb-waisen) =="
+# Nur ein Hinweis, keine Reparatur (siehe Kopfkommentar): wb-waisen selbst
+# beendet nichts. Seit 2026-08-11 unterscheidet es zwei Klassen -- nur
+# "waise" (Eigentuemer-Eintrag vorhanden, dessen Pane bestaetigt tot ist)
+# bekommt hier einen kill-Vorschlag; "unregistriert" (kein Eigentuemer-
+# Eintrag) ist ein eigener Befund -- der Prozess wurde am vorgeschriebenen
+# Startweg (wb-nohup) vorbeigebaut --, aber NIE mit einem Beenden-Vorschlag,
+# denn genau ein solcher Vorschlag aus reiner Verdachtsmessung hat sich als
+# falsch erwiesen (siehe Kopfkommentar von wb-waisen, "Fund 2").
+if [ -x "$BIN/wb-waisen" ]; then
+  waisen_out="$("$BIN/wb-waisen" --lines 2>/dev/null)"; waisen_rc=$?
+  case "$waisen_rc" in
+    3) hinweis "wb-waisen ist auf diesem System (nicht macOS) nicht geprueft, siehe dessen Kopfkommentar" ;;
+    1|2)
+      while IFS='|' read -r pid rss etime ports kategorie klasse detail cmd; do
+        [ -n "$pid" ] || continue
+        if [ "$klasse" = "waise" ]; then
+          melde "PID $pid ($kategorie) ist ein bestaetigter Waise${ports:+, Port(e) $ports} — $detail"
+          hinweis "Befehl war: $cmd"
+          # "kein automatischer kill-Vorschlag" in $detail heisst: der
+          # Eigentuemer ist tot, aber wb-waisen hat den Prozess selbst gerade
+          # in Benutzung gemessen (Befund 1, unabhaengiger Pruefdurchgang
+          # 2026-08-11) -- dann keinen kill vorschlagen.
+          case "$detail" in
+            *"kein automatischer kill-Vorschlag"*) ;;
+            *) hinweis "pruefen und bei Bedarf beenden: kill $pid" ;;
+          esac
+        else
+          # Ein "benutzt"-Grund (unabhaengiger Pruefdurchgang 2026-08-11,
+          # Befund 7) heisst: wb-waisen hat den Prozess selbst als aktiv
+          # gemessen, es ist also kein offener Verdacht mehr, nur eine
+          # Buchhaltungs-Abweichung (am wb-nohup vorbeigebaut) -- dafuer
+          # reicht ein hinweis, kein Befund-Zaehler.
+          case "$detail" in
+            benutzt*)
+              hinweis "PID $pid ($kategorie) laeuft ohne Eigentuemer-Eintrag, wird aber gerade benutzt${ports:+, Port(e) $ports} — $detail" ;;
+            *)
+              melde "PID $pid ($kategorie) laeuft ohne Eigentuemer-Eintrag (unregistriert)${ports:+, Port(e) $ports} — $detail" ;;
+          esac
+          hinweis "Befehl: $cmd — kuenftig ueber wb-nohup starten, dann ist die Auskunft sicher statt nur vermutet"
+        fi
+      done < <(printf '%s\n' "$waisen_out") ;;
+    0) echo "  ok       keine Hintergrundprozesse ohne bestaetigten Besitzer gefunden" ;;
+    *) hinweis "wb-waisen konnte nicht laufen (Exit $waisen_rc)" ;;
+  esac
+else
+  hinweis "wb-waisen ist nicht installiert — Hintergrundprozesse ungeprueft"
+fi
+
+echo
+if [ "$befunde" -eq 0 ]; then
+  echo "wb-doctor: keine Befunde."
+elif [ -n "$FIX" ]; then
+  echo "wb-doctor: $befunde Befunde, $repariert repariert. Nochmal laufen lassen zeigt den Rest."
+else
+  echo "wb-doctor: $befunde Befunde. Reparieren: wb-doctor --fix"
+fi
+exit 0

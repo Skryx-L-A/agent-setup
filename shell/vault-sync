@@ -1,0 +1,187 @@
+#!/bin/bash
+# vault-sync — Wrapper um Commit+Push im Wissens-Vault (~/Knowledge), fuer den Mehrpersonen-
+#   Betrieb (der Nutzer + ein Mitnutzer, siehe shared-brain).
+#
+# WARUM: "IMMER git pull --rebase vor dem Schreiben/Push, nie force-push" ist bisher nur
+#   eine Erinnerungsregel (CRITICAL-FACTS.md), keine Durchsetzung. Dieser Wrapper erzwingt sie
+#   technisch: pull --rebase VOR dem Commit, Abbruch statt Ueberschreiben bei Rebase-Konflikt,
+#   kategorische Weigerung bei force-push, Hard-Abbruch wenn 90-secrets/ im Commit landen wuerde.
+#
+# BENUTZUNG:
+#   vault-sync -m "Nachricht"            committet (nach pull --rebase), pusht NICHT
+#   vault-sync -m "Nachricht" --push     committet UND pusht
+#   vault-sync --vault <pfad> ...        gegen ein anderes Vault-Verzeichnis (z.B. Testkopie)
+#
+# Push ist IMMER eine bewusste Handlung (--push-Flag) — Default ist nur committen.
+# Es gibt KEINEN --force/-f-Pfad in diesem Skript, auch nicht durchgereicht: force-push wird
+# kategorisch verweigert, ohne Ausnahme.
+
+set -u
+
+VAULT="$HOME/Knowledge"
+MESSAGE=""
+DO_PUSH=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --vault) VAULT="$2"; shift 2 ;;
+    -m|--message) MESSAGE="$2"; shift 2 ;;
+    --push) DO_PUSH=1; shift ;;
+    --force|-f)
+      echo "vault-sync: force-push wird kategorisch verweigert. Kein Ausnahmepfad." >&2
+      exit 1
+      ;;
+    *) echo "vault-sync: unbekannte Option: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [ ! -d "$VAULT/.git" ]; then
+  echo "vault-sync: $VAULT ist kein Git-Repo." >&2
+  exit 1
+fi
+
+g() { git -C "$VAULT" "$@"; }
+
+# --- 1) Secrets-Wächter: 90-secrets/ darf NIE Teil eines Commits werden. ---
+# Greift bereits vor dem Staging (verhindert versehentliches "git add -A -f") UND danach
+# nochmal auf dem tatsächlichen Stage-Inhalt — doppelt, weil ein einzelner Check bei einer
+# .gitignore-Lücke stillschweigend versagen könnte.
+if g status --porcelain --ignored 2>/dev/null | awk '{print $2}' | grep -q '^90-secrets/'; then
+  # Nur relevant, falls 90-secrets/ NICHT ignoriert ist (Ignored-Dateien tauchen mit "!!" auf,
+  # das wird hier absichtlich mitgeprüft statt gefiltert).
+  if g status --porcelain --ignored 2>/dev/null | grep -v '^!! ' | awk '{print $2}' | grep -q '^90-secrets/'; then
+    echo "vault-sync: ABBRUCH — 90-secrets/ enthaelt nicht-ignorierte Aenderungen. Kein Commit." >&2
+    exit 1
+  fi
+fi
+
+CHANGED=$(g status --porcelain | wc -l | tr -d ' ')
+
+# --- 2) pull --rebase VOR dem Commit, mit Autostash (Vorgabe: vor dem Schreiben pullen). ---
+# Stash-Zustand VOR dem Pull merken: nur der Hash von refs/stash zeigt zuverlaessig, ob DIESER
+# Lauf einen neuen Stash-Eintrag erzeugt hat. Ein Text-Vergleich auf "stash@{0}: autostash"
+# reicht NICHT — genau dieser Eintrag ueberlebt einen fehlgeschlagenen Pop und wuerde bei jedem
+# spaeteren Lauf erneut als "das ist meiner" gelesen (K2, echter Befund aus dem Review).
+STASH_BEFORE=$(git -C "$VAULT" rev-parse --quiet --verify refs/stash 2>/dev/null || echo "")
+
+echo "vault-sync: git pull --rebase --autostash ..."
+PULL_OK=1
+g pull --rebase --autostash || PULL_OK=0
+
+STASH_AFTER=$(git -C "$VAULT" rev-parse --quiet --verify refs/stash 2>/dev/null || echo "")
+
+# Fall A: echter Rebase-Konflikt (divergierende LOKALE COMMITS) — Rebase haengt noch mittendrin.
+if [ -d "$VAULT/.git/rebase-merge" ] || [ -d "$VAULT/.git/rebase-apply" ]; then
+  echo "vault-sync: ABBRUCH — Rebase-Konflikt. Kein Commit, kein Push, nichts ueberschrieben." >&2
+  echo "vault-sync: Repo-Zustand wird per 'git rebase --abort' zurueckgesetzt." >&2
+  g rebase --abort 2>/dev/null
+  exit 1
+fi
+
+# Fall B: der Pull/Rebase selbst lief durch, aber das automatische Wiedereinspielen der
+# uncommitteten Aenderungen (autostash) kollidiert mit dem neuen Remote-Stand. git meldet das
+# NICHT als Fehlschlag von "pull" (Exit-Code bleibt 0) — es hinterlaesst Konfliktmarker direkt
+# in den Dateien. Nur ein NEUER Stash-Eintrag aus DIESEM Lauf zaehlt (STASH_AFTER != STASH_BEFORE
+# UND STASH_AFTER existiert UND traegt "autostash" als Nachricht) — ein stehengebliebener alter
+# Eintrag von einem frueheren, nie aufgeloesten Lauf loest diesen Zweig NICHT mehr aus.
+if [ -n "$STASH_AFTER" ] && [ "$STASH_AFTER" != "$STASH_BEFORE" ] \
+   && g stash list 2>/dev/null | head -1 | grep -q '^stash@{0}: autostash'; then
+  CONFLICTED=$(g diff --name-only --diff-filter=U)
+  echo "vault-sync: ABBRUCH — deine uncommitteten Aenderungen kollidieren mit neu gepullten" >&2
+  echo "vault-sync: Remote-Aenderungen. Der Pull selbst ist uebernommen. Kein Commit." >&2
+  if [ -n "$CONFLICTED" ]; then
+    echo "vault-sync: Konfliktmarker in folgenden Dateien (UNVERAENDERT gelassen, nichts verworfen):" >&2
+    echo "$CONFLICTED" >&2
+  else
+    echo "vault-sync: keine einzelne Datei eindeutig als Konflikt markiert — 'git status' pruefen." >&2
+  fi
+  echo "vault-sync: dein Arbeitsstand liegt zusaetzlich unter '$STASH_AFTER' im Stash." >&2
+  echo "vault-sync: manuell aufloesen: Konfliktmarker in den genannten Dateien bearbeiten und" >&2
+  echo "vault-sync: 'git add', danach optional 'git stash drop'. Nichts wurde automatisch verworfen." >&2
+  exit 1
+fi
+
+if [ "$PULL_OK" -eq 0 ]; then
+  echo "vault-sync: ABBRUCH — git pull --rebase fehlgeschlagen (siehe Ausgabe oben)." >&2
+  exit 1
+fi
+
+if [ "$CHANGED" -eq 0 ]; then
+  echo "vault-sync: keine lokalen Aenderungen — nichts zu committen."
+  AHEAD=$(g rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
+  echo "vault-sync: $AHEAD Commit(s) dem Remote voraus."
+  if [ "${AHEAD:-0}" != "0" ] && [ "$DO_PUSH" -eq 1 ]; then
+    echo "vault-sync: git push ..."
+    g push
+  fi
+  exit 0
+fi
+
+# --- 3) Staging. ---
+# Getrackte Aenderungen sind unkritisch (bestehende Pfade, keine Ueberraschung).
+g add -u
+
+# Neue (untracked) Pfade einzeln pruefen: was nach generiertem Werkzeug-Artefakt aussieht (Tool-
+# State, Lockfiles, Caches), wird NICHT automatisch mitgenommen, sondern vorgeschlagen — sonst
+# landen fremde `results/`/`state/`/Lockfile-Verzeichnisse beim naechsten Lauf im geteilten Vault
+# und kollidieren dort mit der anderen Person (M5, echter Befund: ~/Knowledge/tools/eval/results/
+# und tools/braincli/state/ sind untracked und nicht in der jeweiligen .gitignore erfasst).
+SUSPECT_RE='(^|/)(results|state|__pycache__|\.venv|node_modules|dist|build)(/|$)|uv\.lock$|package-lock\.json$|\.pyc$|(^|/)\.DS_Store$'
+SKIPPED=()
+while IFS= read -r path; do
+  [ -n "$path" ] || continue
+  if echo "$path" | grep -Eq "$SUSPECT_RE"; then
+    SKIPPED+=("$path")
+  else
+    g add -- "$path"
+  fi
+done < <(g status --porcelain --untracked-files=all | grep '^?? ' | cut -c4-)
+
+if [ "${#SKIPPED[@]}" -gt 0 ]; then
+  echo "vault-sync: folgende neue Pfade sehen nach generiertem Werkzeug-Artefakt aus und wurden" >&2
+  echo "NICHT automatisch mitgenommen (falls gewollt: manuell 'git add <pfad>' + erneut committen):" >&2
+  printf '  %s\n' "${SKIPPED[@]}" >&2
+fi
+
+SECRET_HITS=$(g diff --cached --name-only | grep -E '(^|/)90-secrets/' || true)
+if [ -n "$SECRET_HITS" ]; then
+  echo "vault-sync: ABBRUCH — folgende Dateien aus 90-secrets/ waeren mitcommittet worden:" >&2
+  echo "$SECRET_HITS" >&2
+  echo "vault-sync: nichts committet, Stage wird zurueckgesetzt. .gitignore pruefen." >&2
+  g reset >/dev/null 2>&1
+  exit 1
+fi
+
+if [ -z "$MESSAGE" ]; then
+  echo "vault-sync: ABBRUCH — keine Commit-Nachricht (-m \"...\") angegeben." >&2
+  g reset >/dev/null 2>&1
+  exit 1
+fi
+
+# --- 4) Commit. ---
+if ! g commit -m "$MESSAGE"; then
+  echo "vault-sync: ABBRUCH — Commit fehlgeschlagen." >&2
+  exit 1
+fi
+
+# --- 5) Zeigen, was gepusht wuerde — IMMER, auch ohne --push. ---
+echo
+echo "vault-sync: folgende Commit(s) stehen zum Push bereit:"
+g log --oneline '@{u}..HEAD' 2>/dev/null || g log --oneline -1
+echo
+echo "vault-sync: Diffstat gegenueber Remote:"
+g diff --stat '@{u}..HEAD' 2>/dev/null
+
+if [ "$DO_PUSH" -eq 1 ]; then
+  echo
+  echo "vault-sync: git push ..."
+  if g push; then
+    echo "vault-sync: gepusht."
+  else
+    echo "vault-sync: Push fehlgeschlagen (siehe Ausgabe oben). Kein force-push-Versuch." >&2
+    exit 1
+  fi
+else
+  echo
+  echo "vault-sync: NICHT gepusht (kein --push). Commit liegt lokal bereit."
+fi

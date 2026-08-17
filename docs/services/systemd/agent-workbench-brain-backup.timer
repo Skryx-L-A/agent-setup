@@ -1,0 +1,15 @@
+# TEMPLATE. Needs no substitution; the service unit next to it does.
+#
+# Sunday, 04:00. Persistent=true is the part that matters on a machine that is not always
+# on: a run missed while the machine was off happens at the next start instead of being
+# skipped silently until the following week.
+
+[Unit]
+Description=Weekly bundle of the knowledge base
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
