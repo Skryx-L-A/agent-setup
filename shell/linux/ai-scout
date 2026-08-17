@@ -1,0 +1,49 @@
+#!/bin/bash
+# ai-scout — monthly research agent: scans relevant areas for new tools, models,
+# techniques and improvements to the agent setup; writes a ranked action report
+# into the Knowledge inbox and notifies.
+export PATH="$HOME/.local/bin:/usr/bin:/bin:$PATH"
+LOG="$HOME/.ai-scout.log"
+REPORT="$HOME/Knowledge/00-inbox/ai-scout-$(date +%Y-%m).md"
+TIMEOUT=timeout; command -v timeout >/dev/null 2>&1 || TIMEOUT=gtimeout
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then notify-send "Agent-Setup" "$1"
+  elif command -v osascript  >/dev/null 2>&1; then osascript -e "display notification \"$1\" with title \"Agent-Setup\""
+  fi
+}
+
+{
+echo "=== ai-scout run $(date) ==="
+bash "$HOME/.local/bin/check-ollama-kv-ssd" 2>/dev/null || true
+
+SNAP=$(mktemp)
+{
+  echo "claude: $(claude --version 2>/dev/null)"
+  echo "pi: $(pi --version 2>/dev/null)"
+  echo "ollama: $(ollama --version 2>/dev/null)"
+  echo "ollama models:"; ollama list 2>/dev/null
+  echo "basic-memory: $(basic-memory --version 2>/dev/null | tail -1)"
+} > "$SNAP" 2>&1
+
+"$TIMEOUT" 2400 claude -p "You are the monthly AI-scout for this machine's agent setup.
+Current setup: read ~/Knowledge/10-global/ (orchestrator/local-ai architecture notes) and the
+version snapshot at $SNAP. Research (web search) what is NEW and genuinely useful since the last
+report (check for a previous ~/Knowledge/00-inbox/ai-scout-*.md) in ALL of these areas:
+1. Claude Code: new features, agent-teams improvements, hooks, statusline, memory.
+2. Multi-agent orchestration & prompt engineering.
+3. New community skills/plugins for Claude Code worth adopting.
+4. New MCP servers/tools that fit the projects (coding, knowledge base, DSGVO-safe automation).
+5. New local models runnable on THIS hardware (check the snapshot / GPU): coding, embeddings, image, video, speech.
+6. Updates to the installed stack: Ollama (esp. KV-cache/context-to-SSD offload), pi, Basic Memory, tmux.
+7. Agent security: prompt-injection defenses, sandboxing news.
+8. Local AI tooling for this platform (MLX on Apple, CUDA on NVIDIA/Linux).
+Then write a CONCISE ranked report to $REPORT (markdown, frontmatter: title, type: reference,
+tags [ai-scout, action], created: today). Only genuinely new and actionable items; for each:
+what it is, why it helps, concrete install/adopt step. Mark safe/trivially-reversible items
+AUTO-OK, everything else NEEDS-DECISION. Do NOT modify the system yourself." \
+  >> "$LOG" 2>&1
+
+rm -f "$SNAP"
+notify "AI-Scout-Report liegt im Knowledge-Inbox."
+echo "=== done $(date), report: $REPORT ==="
+} >> "$LOG" 2>&1

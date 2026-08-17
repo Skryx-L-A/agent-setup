@@ -43,13 +43,22 @@ fi
 
 # Obergrenzen aus session-end Schritt 2b. Werden sie ueberschritten, wird in der
 # laufenden Session ausgelagert — nicht vertagt.
-# 16000 statt der ursprünglich gesetzten 14000: drei Bloecke bleiben nach dem
+# 16000 statt der ursprünglich gesetzten 14000: drei Bloecke blieben nach dem
 # Router-Umbau vom 03.08. bewusst in CLAUDE.md, weil sie keinen Ausloeser haben, an dem
 # man sie noch rechtzeitig nachschlagen koennte — der Vault-Abschnitt (gilt vor jeder
 # nicht-trivialen Aufgabe), die Prompt-Injection-Abwehr (der Schaden entsteht, sobald
 # fremder Text im Kontext liegt) und die Backtick-Regel (feuert bei jedem Bash-Aufruf).
 # Zusammen 4.100 Bytes. Eine Grenze, die diese drei nicht einrechnet, waere von Anfang
 # an unerreichbar und damit wertlos.
+#
+# NACHTRAG 17.08.: der Vault-Abschnitt ist doch gewandert, nach
+# `regeln/wissensspeicher.md` (2.234 Bytes). Der Grund, ihn zu halten, war schwaecher
+# als gedacht: sein Merksatz steht ohnehin in jeder Session im Kontext, weil der
+# SessionStart-Hook die Note CRITICAL-FACTS ausgibt, und die neue Verweisbaum-Zeile
+# nennt den Ausloeser „vor jeder nicht-trivialen Aufgabe" selbst. Die Grenze bleibt
+# trotzdem bei 16000 und sinkt NICHT um die freigewordenen Bytes: eine Grenze, die
+# jedem Aufraeumen nachgezogen wird, bestraft genau das Aufraeumen, das sie erreichen
+# will. Die beiden anderen Bloecke bleiben aus den oben genannten Gruenden.
 # Die Grenze gilt fuer den ALLGEMEINEN Anteil, nicht fuer den maschinenspezifischen
 # (2026-08-04, nach Messung). Auf peer schlug sie an, ohne dass dort etwas aufzuraeumen
 # gewesen waere: die Aufteilung vom 03.08. ist dort laengst durchgefuehrt, und ein

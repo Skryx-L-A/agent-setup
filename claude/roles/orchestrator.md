@@ -13,7 +13,7 @@ Statusbericht als Wartepunkt, keine Freigabe für Selbstentscheidbares, Bericht 
 geschlossenen Arbeitsblocks; „nächster Schritt bei mir: X" schreiben und anhalten ist der Fehler,
 dann tu X.
 
-`~/.claude/CLAUDE.md` gilt für jede Session und hält weiterhin: Vault-Verfahren, Secrets,
+`~/.claude/CLAUDE.md` gilt für jede Session und hält weiterhin: Secrets,
 E-Mail-Freigabe, Snapshot vor destruktiven Operationen, Umgangston, session-end,
 Third-party-content, den Merksatz der Prozess-Hygiene — und den Verweisbaum auf
 `~/.claude/regeln/`. Diese Datei hält die Mechanik: Begründungen, exakte Befehle,
@@ -196,14 +196,14 @@ Regeldatei; lies sie VOR der Handlung, nicht danach:
   erinnert. Wie der Guard gestartet, geprüft, beendet und aktualisiert wird und wie
   eine Auslastung überhaupt korrekt abgelesen wird: `regeln/kontext-guard.md`.
 
-## Media, Session end, Quality, Budgets (Regeln: Medien `regeln/medien.md`; session-end, Vault-Filing und E-Mail `~/.claude/CLAUDE.md`; Qualität und Verifikation `regeln/arbeitsweise.md`)
+## Media, Session end, Quality, Budgets (Regeln: Medien `regeln/medien.md`; session-end und E-Mail `~/.claude/CLAUDE.md`; Vault-Filing `regeln/wissensspeicher.md`; Qualität und Verifikation `regeln/arbeitsweise.md`)
 - Media LOCAL-FIRST gilt auch für jede delegierte Aufgabe: die Regel INS Worker-/Teammate-Prompt
   schreiben, wenn der Task Medien berühren kann.
 - Session end: `session-end`-Skill ungefragt; dabei ALLE Worker-Ergebnisse einsammeln und
   wrapping-up Workers anstoßen, ihre Learnings ins Result-File zu schreiben, BEVOR du ihre Panes
   schließt. **Das Vault-Filing machst DU selbst (2026-07-27)** — nie an einen billigen Worker
   delegieren, auch nicht bei knappem Kontingent: das Harvest-Manifest ist deine Checkliste, nicht
-  ein Auftrag an jemand anderen (Begründung: CLAUDE.md).
+  ein Auftrag an jemand anderen (Begründung: `regeln/wissensspeicher.md`).
 - Quality gates: Plan-Approval vor Edits bei riskanter/komplexer Teammate-Arbeit; unabhängiger
   Reviewer-Pass als DEFAULT nach jedem delegierten Multi-Step-Task (stärkster Zuverlässigkeitshebel
   im Supervisor/Worker-Setup, keine gelegentliche Zugabe); Ergebnisse SELBST verifizieren (Tests
