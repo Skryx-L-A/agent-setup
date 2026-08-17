@@ -1,12 +1,19 @@
 # Linux-Fassungen der Medien-Kette
 
-Die vier Werkzeuge in diesem Ordner sind eigenständige Linux/CUDA-Ports der
+Die Werkzeuge in diesem Ordner sind eigenständige Linux-Ports der
 gleichnamigen Mac-Werkzeuge in `shell/`. Sie wurden mit `diff` gegen die
-jeweilige Mac-Fassung verglichen: in allen vier Fällen unterscheidet sich der
+jeweilige Mac-Fassung verglichen: in jedem Fall unterscheidet sich der
 Inhalt so stark, dass beide Fassungen aufgenommen wurden, nicht nur eine.
 Die CLI (Optionen, Reihenfolge der Argumente, Ausgabepfade) ist bewusst
 identisch zur Mac-Fassung gehalten; ausgetauscht ist ausschließlich das
 Backend darunter.
+
+Seit 2026-08-17 vergleicht `wb-consistency` auf der Linux-Maschine Sorte A
+(installierte Kopie gegen Repo) für ein Werkzeug bevorzugt gegen seine Fassung
+hier, wenn es eine gibt — siehe `_linux_gegenstueck` in `shell/wb-consistency`
+und `linux_variante` in `shell/wb-consistency.config.json`. Eine Datei, die
+hier aufgenommen wird, braucht deshalb keinen weiteren Eintrag, um nicht mehr
+als KOPIE-EIGENMAECHTIG gemeldet zu werden — ihre bloße Existenz reicht.
 
 ## bild
 
@@ -53,6 +60,32 @@ stattdessen die offizielle CUDA-Pipeline des Modells über `diffusers`
 Apple-Silicon-Maschine ausnutzt. Auch die Warnung vor gleichzeitig
 geladenen Ollama-Modellen ist angepasst: die Linux-Fassung prüft auf mehr
 Modellgrößen, weil hier ein VRAM- statt ein RAM-Konflikt droht.
+
+## ai-scout, check-ollama-kv-ssd und rerank
+
+Diese drei kamen am 17.08.2026 dazu, als `wb-consistency` sie auf Peer-Rechner als
+KOPIE-EIGENMAECHTIG meldete: Repo und installierte Fassung waren wirklich
+verschieden, aber nicht wegen einer unversionierten Handänderung, sondern
+weil beide eine eigene, absichtliche Linux-Fassung sind, wie `stt`/`tts`
+oben.
+
+`ai-scout` und `check-ollama-kv-ssd` ersetzen macOS-spezifische Aufrufe durch
+plattformneutrale: `osascript`-Benachrichtigungen werden durch eine
+`notify()`-Hilfsfunktion ersetzt, die zuerst `notify-send` (Linux) und sonst
+`osascript` (macOS) versucht; feste Homebrew-Pfade (`/opt/homebrew/bin`)
+weichen einem generischen `$HOME/.local/bin`-PATH; der Bericht landet unter
+dem inzwischen umbenannten `00-inbox/`-Zweig des Vaults statt `00-sources/`.
+Die Recherche-Auftragstexte selbst sind zusätzlich anonymisiert (kein
+Personen- oder Projektname mehr, „this machine's agent setup" statt eines
+konkreten Namens) und nennen CUDA statt MLX als lokale Backend-Option.
+
+`rerank` tauscht die Shebang-Zeile aus: Die Mac-Fassung ruft den Python der
+`audio-tools`-venv über einen fest einprogrammierten, benutzerspezifischen
+Pfad auf (`/Users/…/AI/audio-tools/.venv/bin/python`) — das schlägt auf Peer-Rechner
+sofort mit „no such file" fehl. Die Linux-Fassung ist ein Bash-Wrapper, der
+zur Laufzeit prüft, ob diese venv unter `$HOME` existiert, und sonst auf das
+PATH-`python3` zurückfällt, bevor er denselben Python-Code über ein Heredoc
+ausführt.
 
 ## peer-code und orch-launch
 
@@ -121,7 +154,12 @@ Die zweite Prüfrunde fand weitere Werkzeuge auf Peer-Rechner, die zunächst wie
 eigene Werkbank-Werkzeuge aussahen, sich bei genauerem Hinsehen aber als
 Teil eines ANDEREN, eigenen Repositorys herausstellten. Sie wurden deshalb
 nicht in dieses Verzeichnis aufgenommen, nur ihre Zugehörigkeit ist hier
-festgehalten:
+festgehalten. Seit 2026-08-17 prüft `wb-consistency` diese Zuordnung auch
+selbst, gemessen statt behauptet: `nachbar_repos` in
+`shell/wb-consistency.config.json` nennt die vier Repositorys, und
+`_nachbar_bekannt` im Code fragt bei jedem Lauf per `git -C <repo> ls-files`
+nach, ob eine Datei dort wirklich versioniert ist. Ein Treffer erscheint
+dann als eigene, ungezählte Kategorie EIGEN-ANDERES-REPO statt als Fund.
 
 - `msync-arrive`, `msync-handoff`, `msync-link-env` sind Symlinks auf
   `~/AI/machine-sync/bin/…` und gehören zum Repository
@@ -129,7 +167,13 @@ festgehalten:
 - `project-kit` ist ein Symlink auf `~/AI/project-kit/bin/project-kit` und
   gehört zum Repository `<your-github-user>/project-kit`.
 - `unreal-editor` startet den Unreal Editor für ein Projekt namens
-  „a project"; das zugehörige Repository ist `<your-github-user>/a project`.
+  „a project"; inhaltlich gehört es zu `<your-github-user>/a project`, aber
+  `git -C ~/AI/a project ls-files` führt die Datei nicht — sie ist dort
+  NICHT versioniert (Stand 17.08.2026), nur ein lokaler Launcher. Die
+  wb-consistency-Prüfung erkennt das an genau diesem fehlenden Nachweis und
+  meldet die Datei deshalb weiterhin als EIGEN-NICHT-IM-REPO, nicht als
+  EIGEN-ANDERES-REPO — zu Recht: eine Zuordnung, die sich nicht misst,
+  bleibt ein Fund und keine Ausnahme.
 - `another service-ctl`, `another service-pill`, `another service-type` und `another serviced` gehören zum
   Sprach- und Hotkey-Werkzeug „another service". Der lokale Ordner heißt
   `~/AI/a project`, sein Git-Fernverweis zeigt aber auf das Repository
@@ -180,3 +224,9 @@ byteweise gegen den aktuellen Stand auf Peer-Rechner verglichen, beide unveränd
 `bm`, `orch-bare`, `pi`, `voice-toggle` und `work` neu aufgenommen (siehe
 oben); ihr Inhalt wurde vor der Aufnahme auf Personenbezug geprüft (siehe
 Ergebnisdatei der Prüfung).
+
+Dritte Prüfrunde, ebenfalls am 2026-08-17: `ai-scout`, `check-ollama-kv-ssd`
+und `rerank` per `scp` von Peer-Rechner geholt und aufgenommen, weil `wb-consistency`
+sie sonst weiterhin als KOPIE-EIGENMAECHTIG gemeldet hätte, obwohl beide
+Fassungen absichtlich sind (siehe oben). Ihr Inhalt wurde vor der Aufnahme
+ebenfalls auf Personenbezug geprüft — keiner gefunden.

@@ -358,6 +358,16 @@
       "[Bb]eide Stellen"
     ],
     "identifier_pattern": "\\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\\b",
+    "linux_variante": {
+      "_comment": "Sorte A vergleicht Installiertes gegen Repo. Auf peer ist die installierte Fassung mancher Werkzeuge ein bewusster Linux-Port (CUDA statt MLX, notify-send statt osascript) -- gegen shell/<name> (die Mac-Fassung) verglichen, meldete das zu Recht existierende Unterschiede als KOPIE-EIGENMAECHTIG. Auf der Linux-Maschine wird deshalb bevorzugt gegen shell/linux/<name> verglichen, WENN es diese Datei gibt -- Existenz ist das Merkmal, siehe _linux_gegenstueck im Code (2026-08-17).",
+      "prefix": "shell/",
+      "variant_dir": "shell/linux/",
+      "machine_ids_by_os": {
+        "Darwin": "mac",
+        "Linux": "peer"
+      },
+      "linux_machine_id": "peer"
+    },
     "fremd_pruefung": {
       "_comment": "Sorte D, die Umkehrung von Sorte A: ein installiertes Werkzeug ohne Gegenstueck im Repo. paketmanager_verzeichnisse ist eine Liste von ORTEN, keine Liste von NAMEN -- Paketmanager kommen selten hinzu, eigene Werkzeuge fast woechentlich. Was hier NICHT ueber einen Ort erkannt wird, prueft installationsnachweis_globs ueber das RECORD der installierenden Distribution (noetig auf Linux: `pip install --user` legt Skripte ohne Symlink und ohne unterscheidbaren Ort direkt in ~/.local/bin -- gemessen 2026-08-17 auf peer, 40 von 48 Funden waren so ein Fall). Was danach noch uebrig ist, wird per Shebang-Merkmal erkannt (siehe _ist_skript im Quelltext), nicht ueber eine gepflegte Registrierung einzelner Programme. bekannt_zusatz_praefixe nennt zusaetzliche Repo-Verzeichnisse, deren Dateinamen ebenfalls als 'schon versioniert' zaehlen, auch wenn sie nicht direkt unter dem install_map-Ziel-Praefix liegen -- shell/linux/ ist auf der zweiten Maschine so ein Fall: eine Datei, die dort versioniert ist, aber nicht auch in shell/, ist trotzdem versioniert.",
       "ziel": "{BASE}/.local/bin",
@@ -388,6 +398,40 @@
       ],
       "bekannt_zusatz_praefixe": [
         "shell/linux/"
+      ],
+      "nachbar_repos": [
+        {
+          "_comment": "Namen, die es hier in .local/bin gibt, aber die per `git ls-files` (Code, nicht diese Liste) in einem ANDEREN eigenen Repo versioniert sind, sind kein Befund -- eigene Kategorie EIGEN-ANDERES-REPO statt EIGEN-NICHT-IM-REPO. Ein Eintrag hier ist nur ein Kandidat: zaehlt nur, was `git -C repo ls-files` bei diesem Lauf wirklich liefert (siehe _nachbar_bekannt im Code, 2026-08-17).",
+          "repo": "{BASE}/AI/machine-sync",
+          "github": "<your-github-user>/machine-sync",
+          "install_subdirs": [
+            "bin/"
+          ]
+        },
+        {
+          "repo": "{BASE}/AI/project-kit",
+          "github": "<your-github-user>/project-kit",
+          "install_subdirs": [
+            "bin/"
+          ]
+        },
+        {
+          "repo": "{BASE}/AI/a project",
+          "github": "<your-github-user>/a project",
+          "install_subdirs": [
+            "bin/",
+            "scripts/",
+            "tools/"
+          ]
+        },
+        {
+          "_comment": "lokaler Ordnername ist a project, das Repo dahinter heisst another service -- deshalb repo != github hier.",
+          "repo": "{BASE}/AI/a project",
+          "github": "<your-github-user>/another service",
+          "install_subdirs": [
+            "bin/"
+          ]
+        }
       ]
     }
   },

@@ -1,0 +1,38 @@
+#!/bin/bash
+# Monthly check: has Ollama gained native KV-cache/context offload to SSD?
+# On a hit: notify + drop an action note into the Knowledge inbox, so the next
+# Claude session implements it.
+export PATH="$HOME/.local/bin:$PATH"
+notify() { # portable desktop notification
+  if command -v notify-send >/dev/null 2>&1; then notify-send "Agent-Setup" "$1"
+  elif command -v osascript  >/dev/null 2>&1; then osascript -e "display notification \"$1\" with title \"Agent-Setup\""
+  fi
+}
+MARKER="$HOME/Knowledge/00-inbox/ollama-kv-ssd-available.md"
+[ -f "$MARKER" ] && exit 0
+command -v ollama >/dev/null 2>&1 || exit 0
+
+hit=$( { ollama serve --help; ollama --help; } 2>&1 | grep -iE 'kv[-_ ]?cache.*(disk|ssd|offload|swap|spill)|offload.*kv|context.*(disk|ssd)' | head -3 )
+[ -z "$hit" ] && exit 0
+
+cat > "$MARKER" <<EOF
+---
+title: "ACTION: Ollama supports KV/context offload to SSD now"
+type: note
+branch: 00-inbox
+tags: [action, local-ai]
+created: $(date +%F)
+---
+
+Automated monthly check found new Ollama flags:
+
+\`\`\`
+$hit
+\`\`\`
+
+TODO for the next Claude session: evaluate + enable it in the local Ollama config
+(launchd plist on macOS / systemd unit or OLLAMA_* env on Linux) if it benefits the
+setup (bigger context without RAM/VRAM pressure), then update the local-model vault
+note and delete this note.
+EOF
+notify "Ollama kann jetzt Kontext auf die SSD auslagern - Auftrag liegt im Knowledge-Inbox."

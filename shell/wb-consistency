@@ -582,9 +582,12 @@ def label_precedes(line, span_start):
     return m
 
 
-def current_machine_id(c3):
+def current_machine_id(machine_ids_by_os):
     """Which machine is THIS process running on, as one of the ids used in
-    machine_tool_map (config, not code -- 2026-08-03 self-exemption rule).
+    machine_tool_map / check7's linux_variante (config, not code -- 2026-08-03
+    self-exemption rule). Takes the id map directly (not a whole check-config
+    block) so check3 and check7 can share one function without either owning
+    the other's config shape (2026-08-17).
     WB_CONSISTENCY_MACHINE_ID overrides for tests, so the test fixture can
     exercise both directions (this-machine / other-machine) from a single
     real machine without SSH, without touching peer, and without faking
@@ -595,7 +598,6 @@ def current_machine_id(c3):
     override = os.environ.get("WB_CONSISTENCY_MACHINE_ID")
     if override:
         return override
-    machine_ids_by_os = c3.get("machine_ids_by_os", {})
     return machine_ids_by_os.get(platform.system(), "unknown")
 
 
@@ -634,7 +636,7 @@ def check3_dangling_refs(cfg, base):
     for machine_id, tools in machine_tool_map.items():
         for t in tools:
             tool_machine[t.lower()] = machine_id
-    current_machine = current_machine_id(c3)
+    current_machine = current_machine_id(c3.get("machine_ids_by_os", {}))
 
     for path in files:
         lines = read_lines(path)
@@ -1462,6 +1464,36 @@ def _ziel_fuer(rel, name, c7):
     return None
 
 
+def _linux_gegenstueck(rel, name, c7):
+    """Auf peer hat manches Werkzeug eine eigene Fassung unter shell/linux/<name>,
+    weil die Repo-Fassung shell/<name> fuer den Mac gebaut ist (MLX statt CUDA,
+    osascript statt notify-send, Homebrew- statt Distro-Pfade). Ohne diese
+    Funktion verglich Sorte A auf peer IMMER gegen shell/<name> und meldete den
+    dadurch zwangslaeufigen Unterschied als KOPIE-EIGENMAECHTIG -- fuenf Funde am
+    2026-08-17 (ai-scout, check-ollama-kv-ssd, rerank, stt, tts), obwohl auf der
+    Maschine selbst nichts falsch lief.
+
+    Gibt (Datei, rel) der Linux-Fassung zurueck, wenn (a) diese Maschine laut
+    Konfiguration die Linux-Maschine ist UND (b) es unter variant_dir wirklich
+    eine Datei dieses Namens gibt -- sonst None, dann bleibt shell/<name> die
+    Vergleichsgrundlage wie bisher. Die EXISTENZ der Datei ist das Merkmal,
+    keine Namensliste: eine neue Linux-Portierung wird automatisch bevorzugt,
+    sobald sie unter shell/linux/ liegt, ohne dass hier ein Eintrag noetig
+    waere. Fehlt eine Linux-Fassung fuer ein Werkzeug (noch nicht geholt, oder
+    bewusst nie eine gebraucht), bleibt der alte Vergleich -- und ein echter
+    KOPIE-EIGENMAECHTIG-Fund bleibt ein Fund."""
+    lv = c7.get("linux_variante")
+    if not lv or not rel.startswith(lv["prefix"]):
+        return None
+    aktuelle_maschine = current_machine_id(lv.get("machine_ids_by_os", {}))
+    if aktuelle_maschine != lv.get("linux_machine_id", "peer"):
+        return None
+    kandidat = os.path.join(c7["repo_dir"], lv["variant_dir"], name)
+    if not os.path.isfile(kandidat):
+        return None
+    return kandidat, os.path.join(lv["variant_dir"], name)
+
+
 def _sorte_a(c7, findings):
     repo_dir = c7["repo_dir"]
     gesehen = set()
@@ -1495,26 +1527,30 @@ def _sorte_a(c7, findings):
                     "ihrem Kopf selbst warum nicht: 'NICHT INSTALLIERT: <Begruendung>'."
                     % ziel, severity="hint"))
                 continue
-            if open(repo_datei, "rb").read() == open(inst_datei, "rb").read():
+            vergleich_datei, vergleich_rel = repo_datei, rel
+            gegenstueck = _linux_gegenstueck(rel, name, c7)
+            if gegenstueck:
+                vergleich_datei, vergleich_rel = gegenstueck
+            if open(vergleich_datei, "rb").read() == open(inst_datei, "rb").read():
                 continue
-            richtung, warum = _installiert_richtung(repo_datei, inst_datei, repo_dir)
+            richtung, warum = _installiert_richtung(vergleich_datei, inst_datei, repo_dir)
             if richtung == "veraltet":
                 findings.append(Finding(
-                    "KOPIE-VERALTET", rel, 1,
+                    "KOPIE-VERALTET", vergleich_rel, 1,
                     "Repo und %s sind verschieden" % inst_datei,
                     "die INSTALLIERTE Fassung ist ein alter Stand (%s) -- Ausrollen "
                     "vergessen. Die Suiten fahren teils die installierte Fassung, also "
                     "faellt das erst im Gesamtlauf auf." % warum))
             elif richtung == "eigenmaechtig":
                 findings.append(Finding(
-                    "KOPIE-EIGENMAECHTIG", rel, 1,
+                    "KOPIE-EIGENMAECHTIG", vergleich_rel, 1,
                     "Repo und %s sind verschieden" % inst_datei,
                     "die INSTALLIERTE Fassung traegt Inhalt, den das Repo nicht kennt "
                     "(%s) -- jemand hat an der installierten Kopie gearbeitet. Beim "
                     "naechsten Ausrollen ist diese Arbeit weg." % warum))
             else:
                 findings.append(Finding(
-                    "KOPIE-VERSCHIEDEN", rel, 1,
+                    "KOPIE-VERSCHIEDEN", vergleich_rel, 1,
                     "Repo und %s sind verschieden" % inst_datei,
                     "Richtung nicht bestimmbar (%s)." % warum))
 
@@ -1655,6 +1691,21 @@ def _sorte_c(c7, findings):
 # Wie bei Sorte A traegt eine bewusste Ausnahme ihre Begruendung an der
 # DATEI selbst ('NICHT VERSIONIERT: <warum>' in den ersten 40 Zeilen), nicht
 # in einer Ausnahmeliste hier.
+#
+# Nachbar-Repos (2026-08-17): elf der 16 Funde auf peer waren gar keine Luecke
+# in DIESEM Repo, sondern Werkzeuge aus ANDEREN eigenen Repositories
+# (machine-sync, project-kit, a project, another service/a project) -- installiert per
+# Symlink oder Kopie, genau wie ein Werkzeug aus diesem Repo. nachbar_repos
+# (Konfiguration) nennt diese Repos; _nachbar_bekannt() fragt bei jedem Lauf
+# per `git -C <repo> ls-files`, ob eine Datei dort WIRKLICH versioniert ist --
+# eine blosse Namensliste haette geglaubt statt geprueft, und waere verrottet,
+# sobald ein Repo umzieht oder eine Datei dort verschwindet. Gemessen genau
+# das: `unreal-editor` (in der urspruenglichen Zuordnung "gehoert zu
+# a project") steht in a project nicht in `git ls-files` -- bleibt deshalb zu
+# Recht ein normaler Befund, keine Ausnahme. Ein Nachbar-Repo, dessen Pfad
+# fehlt oder das die Datei nicht (mehr) fuehrt, traegt nichts zu `bekannt` bei
+# und die Datei faellt automatisch zurueck in den normalen EIGEN-NICHT-IM-REPO-
+# Fund -- keine gepflegte Ausnahme, die veralten kann.
 
 
 def _ist_paketverwaltet(pfad, fremd_verzeichnisse):
@@ -1721,6 +1772,33 @@ def _installationsnachweis(record_globs):
     return pfade
 
 
+def _nachbar_bekannt(nachbar_repos):
+    """name -> Repo-Bezeichner, aber nur fuer Namen, die per `git ls-files`
+    WIRKLICH in einem der konfigurierten Nachbar-Repos versioniert sind (siehe
+    Kommentarblock oben). Ein Repo, dessen Pfad nicht existiert oder dessen
+    `git ls-files` scheitert, traegt zu `bekannt` nichts bei -- keine
+    Ausnahme wird geraten, jede muss sich bei jedem Lauf neu beweisen."""
+    bekannt = {}
+    for eintrag in nachbar_repos:
+        repo = eintrag.get("repo")
+        if not repo or not os.path.isdir(repo):
+            continue
+        try:
+            r = subprocess.run(["git", "-C", repo, "ls-files"],
+                                capture_output=True, text=True, timeout=20)
+        except Exception:
+            continue
+        if r.returncode != 0:
+            continue
+        subdirs = eintrag.get("install_subdirs", [""])
+        bez = eintrag.get("github", repo)
+        for pfad in r.stdout.splitlines():
+            if not any(pfad.startswith(s) for s in subdirs):
+                continue
+            bekannt.setdefault(os.path.basename(pfad), bez)
+    return bekannt
+
+
 def _sorte_d(c7, findings, base):
     d = c7.get("fremd_pruefung")
     if not d:
@@ -1737,6 +1815,7 @@ def _sorte_d(c7, findings, base):
         wurzel = os.path.join(c7["repo_dir"], prefix)
         if os.path.isdir(wurzel):
             bekannt.update(os.listdir(wurzel))
+    nachbar_bekannt = _nachbar_bekannt(d.get("nachbar_repos", []))
     for name in sorted(os.listdir(ziel)):
         pfad = os.path.join(ziel, name)
         if name in bekannt or not os.path.isfile(pfad):
@@ -1753,6 +1832,15 @@ def _sorte_d(c7, findings, base):
             continue
         kopf = "\n".join(read_lines(pfad)[:40])
         if NICHT_VERSIONIERT_RE.search(kopf):
+            continue
+        nachbar = nachbar_bekannt.get(name)
+        if nachbar:
+            findings.append(Finding(
+                "EIGEN-ANDERES-REPO", os.path.relpath(pfad, base), 1,
+                "liegt unter %s, aber nicht in DIESEM Repo" % ziel,
+                "versioniert in %s (per `git ls-files` bestaetigt) -- kein Befund, "
+                "sondern ein Werkzeug aus einem anderen eigenen Repository." % nachbar,
+                severity="hint"))
             continue
         findings.append(Finding(
             "EIGEN-NICHT-IM-REPO", os.path.relpath(pfad, base), 1,
