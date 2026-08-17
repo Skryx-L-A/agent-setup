@@ -1,0 +1,6 @@
+#!/bin/bash
+# pi CLI Wrapper (peer) — nvm-/PATH-unabhaengig. Inferenz auf dem Mac (ollama)
+# via systemd-SSH-Tunnel mac-ollama-tunnel.service (peer 127.0.0.1:11434 -> Mac 127.0.0.1:11434).
+# Mac-ollama bleibt Default (127.0.0.1), keine LAN-Exposition, Mac-lokal unberuehrt.
+export OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+exec "$HOME/.nvm/versions/node/v24.17.0/bin/node" "$HOME/.nvm/versions/node/v24.17.0/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" "$@"

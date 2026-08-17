@@ -17,6 +17,7 @@ current_machine_id().
 """
 import argparse
 import ast
+import csv
 import fnmatch
 import glob as globmod
 import hashlib
@@ -1607,7 +1608,7 @@ def _sorte_c(c7, findings):
 # (uv, pipx, npm, cargo, Homebrew, der Claude-Code-Eigeninstaller, ...), und
 # die duerfen nicht als vermisste eigene Werkzeuge gemeldet werden.
 #
-# Die Trennung haengt an ZWEI messbaren Merkmalen, keiner Namensliste:
+# Die Trennung haengt an VIER messbaren Merkmalen, keiner Namensliste:
 #   1. _ist_paketverwaltet -- der REALE Pfad (nach Symlinks aufgeloest) liegt
 #      unter einem der konfigurierten Paketmanager-Verzeichnisse. uv/pipx/npm
 #      legen Symlinks dorthin, Homebrew verlinkt in den Cellar, der
@@ -1615,16 +1616,41 @@ def _sorte_c(c7, findings):
 #      ~/.local/share/claude. Eine Handvoll ORTE altert nicht wie eine Liste
 #      von NAMEN -- neue Paketmanager kommen selten hinzu, neue eigene
 #      Werkzeuge fast woechentlich.
-#   2. _ist_skript -- traegt eine Shebang-Zeile. Jedes der bisher geborgenen
+#   2. _installationsnachweis -- eine RECORD-Datei (Python-Wheel-Standard)
+#      fuehrt die Datei als von IHR installiert. Auf Linux legt
+#      `pip install --user` Skripte OHNE Symlink und OHNE unterscheidbares
+#      Verzeichnis direkt in ~/.local/bin -- Merkmal (1) trifft dort auf
+#      nichts, gemessen an 40 von 48 Funden auf peer (2026-08-17), die alle
+#      Fremdprogramme waren. Das RECORD der jeweiligen Distribution zaehlt
+#      trotzdem jede von ihr installierte Datei einzeln auf; das ist der
+#      Nachweis selbst, keine Ableitung aus einem Ort oder Namen.
+#   3. _ist_venv_datei -- der REALE Pfad der Datei selbst liegt in bin/ einer
+#      Python-virtuellen-Umgebung (pyvenv.cfg daneben, der Standard-Marker
+#      von venv/virtualenv). Trifft ein Fremdprogramm aus einem eigenen
+#      Studio-/Installer-Venv, per Symlink aus ~/.local/bin herausgezeigt
+#      (gemessen: `unsloth`), ohne den Produktnamen zu kennen -- und ohne ein
+#      eigenes Werkzeug zu treffen, das lediglich das Python EINES Venvs als
+#      Interpreter benutzt (etwa `rerank`s Shebang): dort liegt die Datei
+#      SELBST nicht im Venv, nur ihr Interpreter kommt von dort.
+#   4. _ist_skript -- traegt eine Shebang-Zeile. Jedes der bisher geborgenen
 #      eigenen Werkzeuge ist ein von Hand geschriebenes Bash/Python/sh-Skript;
 #      ein kompiliertes Binary OHNE erkennbaren Paketmanager-Pfad (etwa ein
 #      `go install` direkt nach ~/.local/bin, gemessen an `agy`) faellt damit
 #      bewusst NICHT unter 'eigen' -- ohne Shebang ist die Herkunft nicht
 #      entscheidbar, und ein falscher Fund waere schlimmer als ein
 #      ausgelassener.
-# Beides zusammen ist notwendig: ohne (1) meldet die Pruefung jedes per uv/
-# pipx als Skript-Shim installierte Fremdprogramm; ohne (2) auch jedes
-# fremde Binary, das direkt (ohne Symlink) in ~/.local/bin landet.
+# Jedes Merkmal trifft eine andere Installationsform: uv/pipx/npm/Homebrew
+# ueber den Ort (1), `pip install --user` ueber den Nachweis (2), ein
+# projekteigenes Venv ueber seinen eigenen Standard-Marker (3). (4) bleibt
+# unabhaengig davon noetig: ohne sie meldete die Pruefung auch jedes fremde
+# Binary, das ohne Symlink, RECORD oder Venv-Marker in ~/.local/bin landet.
+#
+# Was als 'schon versioniert' gilt, ist nicht nur, was direkt unter dem
+# install_map-Ziel-Praefix liegt: bekannt_zusatz_praefixe (Konfiguration)
+# nennt weitere Repo-Verzeichnisse, deren Dateinamen ebenfalls zaehlen --
+# shell/linux/ auf der zweiten Maschine ist so ein Fall, sonst meldete die
+# Pruefung dort jedes Werkzeug, das bewusst NUR in shell/linux/ liegt, weil
+# es sich vom Mac-Gegenstueck unterscheidet.
 #
 # Wie bei Sorte A traegt eine bewusste Ausnahme ihre Begruendung an der
 # DATEI selbst ('NICHT VERSIONIERT: <warum>' in den ersten 40 Zeilen), nicht
@@ -1654,6 +1680,47 @@ def _ist_skript(pfad):
     return b"\x00" not in kopf and kopf[:2] == b"#!"
 
 
+def _ist_venv_datei(pfad):
+    """Der REALE Pfad der Datei selbst (nicht der ihrer Shebang-Zeile) liegt in
+    bin/ einer Python-virtuellen-Umgebung -- pyvenv.cfg im Elternverzeichnis
+    von bin/ ist der Standard-Marker von venv/virtualenv, unabhaengig vom
+    Produktnamen. Trifft ein per Symlink aus ~/.local/bin herausgezeigtes
+    Fremdprogramm aus einem eigenen Studio-/Installer-Venv (gemessen:
+    `unsloth`, Symlink auf .../unsloth_studio/bin/unsloth, mit pyvenv.cfg
+    daneben). Geprueft wird NUR die Datei selbst: ein von Hand geschriebenes
+    Skript, das lediglich das Python eines fremden Venvs als Interpreter
+    benutzt (etwa `rerank`s Shebang), liegt selbst nicht IN diesem Venv und
+    faellt hier nicht hinein -- sonst waere jedes eigene Werkzeug mit einem
+    projektgebundenen venv-Interpreter faelschlich fremd."""
+    real = os.path.realpath(pfad)
+    eltern = os.path.dirname(os.path.dirname(real))
+    return os.path.isfile(os.path.join(eltern, "pyvenv.cfg"))
+
+
+def _installationsnachweis(record_globs):
+    """Menge realer Pfade, die im RECORD einer per pip installierten
+    Distribution als deren eigene Datei aufgefuehrt sind. Ein RECORD-Eintrag
+    ist relativ zum site-packages-Verzeichnis (dem Elternverzeichnis des
+    *.dist-info-Ordners) zu lesen -- ein Skript in bin/ steht dort typisch als
+    '../../../bin/<name>'. Absichtlich nur die Nutzer-Installationsorte
+    (record_globs, aus der Konfiguration): Orte, die bereits ueber
+    _ist_paketverwaltet erkannt werden (uv-/pipx-Venvs), muessen hier nicht
+    noch einmal durchsucht werden -- das waeren auf dem Mac ueber tausend
+    RECORD-Dateien fuer eine Frage, die (1) schon beantwortet."""
+    pfade = set()
+    for record in expand_globs(record_globs):
+        site_packages = os.path.dirname(os.path.dirname(record))
+        try:
+            with open(record, "r", newline="", errors="replace") as f:
+                for zeile in csv.reader(f):
+                    if not zeile or not zeile[0]:
+                        continue
+                    pfade.add(os.path.realpath(os.path.join(site_packages, zeile[0])))
+        except (OSError, csv.Error):
+            continue
+    return pfade
+
+
 def _sorte_d(c7, findings, base):
     d = c7.get("fremd_pruefung")
     if not d:
@@ -1662,7 +1729,9 @@ def _sorte_d(c7, findings, base):
     if not ziel or not os.path.isdir(ziel):
         return
     fremd_verzeichnisse = d.get("paketmanager_verzeichnisse", [])
+    nachweis = _installationsnachweis(d.get("installationsnachweis_globs", []))
     repo_praefixe = [p for p, z in ((e[0], e[1]) for e in c7["install_map"]) if z == ziel]
+    repo_praefixe += d.get("bekannt_zusatz_praefixe", [])
     bekannt = set()
     for prefix in repo_praefixe:
         wurzel = os.path.join(c7["repo_dir"], prefix)
@@ -1675,6 +1744,10 @@ def _sorte_d(c7, findings, base):
         if any(ex in pfad for ex in c7.get("exclude_substrings", ())):
             continue
         if _ist_paketverwaltet(pfad, fremd_verzeichnisse):
+            continue
+        if os.path.realpath(pfad) in nachweis:
+            continue
+        if _ist_venv_datei(pfad):
             continue
         if not _ist_skript(pfad):
             continue

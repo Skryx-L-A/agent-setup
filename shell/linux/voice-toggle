@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+PID_FILE="$RUN_DIR/voice-toggle.pid"
+WAV_FILE="$RUN_DIR/voice-toggle.wav"
+SERVER_URL="http://127.0.0.1:8080/inference"
+
+notify() { notify-send -a "voice-toggle" -t "${2:-3000}" "$1" "${3:-}" 2>/dev/null || true; }
+
+if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    REC_PID="$(cat "$PID_FILE")"
+    kill "$REC_PID" 2>/dev/null || true
+    wait "$REC_PID" 2>/dev/null || true
+    rm -f "$PID_FILE"
+
+    if [[ ! -s "$WAV_FILE" ]]; then
+        notify "voice-toggle" 2000 "Empty recording, aborted."
+        exit 1
+    fi
+
+    notify "Transkribiere…" 1500
+
+    RESPONSE="$(curl -sS --max-time 60 \
+        -F "file=@${WAV_FILE}" \
+        -F "response_format=json" \
+        -F "language=auto" \
+        "$SERVER_URL")" || {
+        notify "voice-toggle: Fehler" 5000 "Server nicht erreichbar (systemctl --user status whisper)"
+        exit 1
+    }
+
+    TEXT="$(printf '%s' "$RESPONSE" | jq -r '.text // empty' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    if [[ -z "$TEXT" ]]; then
+        notify "voice-toggle: nichts erkannt" 3000
+        exit 1
+    fi
+
+    printf '%s' "$TEXT" | wl-copy
+    notify "In Zwischenablage" 2500 "$TEXT"
+else
+    rm -f "$PID_FILE" "$WAV_FILE"
+    parecord \
+        --rate=16000 \
+        --channels=1 \
+        --format=s16le \
+        --file-format=wav \
+        "$WAV_FILE" &
+    echo $! > "$PID_FILE"
+    notify "Aufnahme läuft…" 60000 "Skript erneut aufrufen zum Stoppen."
+fi

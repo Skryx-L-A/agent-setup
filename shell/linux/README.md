@@ -79,6 +79,77 @@ Skript bis zum 13.08.2026 ausschließlich auf Peer-Rechner lag und in keinem Rep
 stand, weshalb keine Änderung daran nachvollziehbar oder wiederherstellbar
 war.
 
+## bm, orch-bare, pi, voice-toggle und work
+
+Diese fünf Werkzeuge kamen am 17.08.2026 aus der zweiten Prüfrunde der neuen
+Sorte-D-Erkennung dazu: Sie lagen ebenfalls nur auf Peer-Rechner, standen aber nicht
+in der ersten, von Hand zusammengestellten Liste.
+
+`bm` ruft die per `uv tool install basic-memory` installierte
+Basic-Memory-CLI über den Vault `~/Knowledge` auf. Der Kopf der Datei hält
+fest, warum sie überhaupt als eigenes Skript existiert: Die Mac-Fassung
+verweist fest auf den Python-Pfad der uv-Werkzeug-Umgebung, und dieser Pfad
+ist maschinenspezifisch — auf Peer-Rechner übernimmt der Wrapper stattdessen, was
+gerade auf dem `PATH` steht.
+
+`orch-bare` startet, ähnlich wie `orch-launch`, einen Claude-Orchestrator in
+einer eigenen tmux-Sitzung, aber ohne einen Auftrag mitzuschicken: Der
+Startaufruf bleibt in der Eingabezeile stehen, bis ein Mensch ihn selbst
+abschickt. Gedacht ist das Werkzeug für ein VSCode-Remote-SSH-Fenster, in dem
+jemand von Hand zusieht.
+
+`pi` ist ein Wrapper um die CLI des Programmier-Agenten „pi", unabhängig von
+`nvm` und dem aktuellen `PATH`. Er leitet Inferenz-Anfragen über einen
+SSH-Tunnel an eine Ollama-Instanz auf dem Mac weiter, damit auf Peer-Rechner kein
+eigenes Modell dafür laufen muss.
+
+`voice-toggle` schaltet eine Sprachaufnahme per Tastendruck an und aus:
+Beim ersten Aufruf startet die Aufnahme, beim zweiten stoppt sie, schickt
+die Aufnahme an einen lokalen Transkriptionsserver und legt den erkannten
+Text in die Zwischenablage. Kein Projekt beansprucht dieses Werkzeug als
+sein eigenes; es scheint ein eigenständiges, nirgends sonst verwaltetes
+Hilfsmittel zu sein.
+
+`work` hängt eine tmux-Sitzung ein oder legt sie neu an, damit eine
+Terminal-Sitzung eine SSH-Trennung übersteht. Das Werkzeug ist vollständig
+plattformneutral (kein Linux-spezifischer Pfad oder Aufruf); es liegt trotzdem
+hier, weil bislang nur eine Fassung auf Peer-Rechner bekannt ist.
+
+## Was zu anderen Projekten gehört, nicht hierher
+
+Die zweite Prüfrunde fand weitere Werkzeuge auf Peer-Rechner, die zunächst wie
+eigene Werkbank-Werkzeuge aussahen, sich bei genauerem Hinsehen aber als
+Teil eines ANDEREN, eigenen Repositorys herausstellten. Sie wurden deshalb
+nicht in dieses Verzeichnis aufgenommen, nur ihre Zugehörigkeit ist hier
+festgehalten:
+
+- `msync-arrive`, `msync-handoff`, `msync-link-env` sind Symlinks auf
+  `~/AI/machine-sync/bin/…` und gehören zum Repository
+  `<your-github-user>/machine-sync`.
+- `project-kit` ist ein Symlink auf `~/AI/project-kit/bin/project-kit` und
+  gehört zum Repository `<your-github-user>/project-kit`.
+- `unreal-editor` startet den Unreal Editor für ein Projekt namens
+  „a project"; das zugehörige Repository ist `<your-github-user>/a project`.
+- `another service-ctl`, `another service-pill`, `another service-type` und `another serviced` gehören zum
+  Sprach- und Hotkey-Werkzeug „another service". Der lokale Ordner heißt
+  `~/AI/a project`, sein Git-Fernverweis zeigt aber auf das Repository
+  `<your-github-user>/another service`.
+- `launch-odysseus.sh` startet ein Projekt namens „Odysseus", das im
+  Wissens-Tresor unter `20-projects/odysseus` dokumentiert ist. Das
+  Anwendungsverzeichnis, auf das das Skript fest verweist
+  (`~/AI/odysseus`), existiert auf Peer-Rechner zum Zeitpunkt dieser Prüfung
+  nicht mehr — ob das Projekt umgezogen oder das Skript veraltet ist,
+  wurde nicht weiter verfolgt.
+
+## Ein gemeldeter Kandidat, der sich als Fremdprogramm herausstellte
+
+`ecal` stand in der ersten, von Hand zusammengestellten Liste als
+vermutlich eigenes Werkzeug. Der Inhalt der Datei zeigt aber, dass sie der
+Einstiegspunkt des PyPI-Pakets `exchange_calendars` ist (`from
+exchange_calendars.ecal import main`), bestätigt durch dessen eigene
+RECORD-Datei, die genau diese Datei als von ihr installiert aufführt. `ecal`
+wurde deshalb nicht aufgenommen.
+
 ## Was bewusst nicht geholt wurde
 
 `workbench`, ebenfalls auf Peer-Rechner unter `~/.local/bin`, wurde absichtlich
@@ -103,3 +174,9 @@ Aufgenommen am 2026-08-17, verglichen gegen den Stand von
 Dateien sind ein Abzug von dort, keine gepflegte Kopie mit eigenem
 Änderungsverlauf — bei künftigen Änderungen an der Quelle bitte erneut
 abgleichen.
+
+Zweite Prüfrunde, ebenfalls am 2026-08-17: `peer-code` und `orch-launch`
+byteweise gegen den aktuellen Stand auf Peer-Rechner verglichen, beide unverändert.
+`bm`, `orch-bare`, `pi`, `voice-toggle` und `work` neu aufgenommen (siehe
+oben); ihr Inhalt wurde vor der Aufnahme auf Personenbezug geprüft (siehe
+Ergebnisdatei der Prüfung).

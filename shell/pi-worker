@@ -1013,6 +1013,14 @@ MSG="${VORSPANN}$TASK
 # name) -- it doubles as the marker record_worker_conversation greps new transcripts
 # for. Triggered here, not earlier, because this is the first point both the marker
 # AND the spawn/reuse decision are both known.
+#
+# Dieselbe Eindeutigkeit traegt auch die Zustellpruefung weiter unten (2026-08-17,
+# nach einem Auftrag, der als "Submission verifiziert" galt, im Pane aber nur eine
+# Terminal-Escape-Folge stand): nur der DATEINAME, nicht der ganze Pfad, weil eine
+# lange Zeile im Pane umbrechen oder gekuerzt werden kann -- der volle Pfad steht
+# mitten in einem langen Satz und ist dafuer untauglich, der kurze, garantiert
+# eindeutige Zeitstempel-Dateiname (19 Zeichen) uebersteht das.
+MARKER_INHALT="$(basename "$RES")"
 if [ -n "$CTRACK" ] && [ "$SPAWNED" = "1" ] && [ -n "$CS_BEFORE" ]; then
   record_worker_conversation "$CS_BEFORE" "$RES"
   # Uebergeben an den abgekoppelten Hintergrundprozess (raeumt die Datei am Ende
@@ -1158,6 +1166,43 @@ if [ -n "$PROMPT_RE" ]; then
     echo "FEHLER: Prompt haengt noch in der Inputbox von Pane $pane — der Bildschirm hat sich seit dem Absenden nicht mehr bewegt (${nachgetippt} zusaetzliche '${ABSENDE_TASTE}' ohne Wirkung). Manuell pruefen (tmux send-keys -t $pane $ABSENDE_TASTE)." >&2
     exit 1
   fi
+
+  # INHALTSPRUEFUNG (2026-08-17). Bis hierher hat die Schleife nur belegt, dass die
+  # EINGABEZEILE abgeschickt wurde -- nicht, dass der abgeschickte Text der
+  # Auftragstext war. Ein Paste, in den sich eine Terminalantwort mischt (gemessen:
+  # eine Device-Attributes-Antwort landete statt des Auftrags im Pane), leert die
+  # Eingabezeile genauso wie ein echtes Absenden und bestand die Pruefung oben
+  # unveraendert -- mit der Meldung "Submission verifiziert", auf die sich
+  # Orchestrator und Kontextwache verlassen. Deshalb erst HIER, NACHDEM die Zeile
+  # leer aussieht, der eigentliche Beleg: taucht $MARKER_INHALT (siehe oben, derselbe
+  # Marker, den record_worker_conversation schon fuer die Transkript-Zuordnung
+  # benutzt) irgendwo im Pane wieder auf? Nur wenn ja, hat WIRKLICH unser Auftrag
+  # das Terminal erreicht, nicht irgendein anderer Text, der die Zeile ebenso leert.
+  if [ -n "$submitted" ]; then
+    INHALT_FRIST=10   # Sekunden Gnadenfrist. Eingabezeile und Verlauf zeichnen im
+                       # selben Bildschirm-Neuzeichnen (siehe oben: "Neuzeichnen nach
+                       # einem Paste ist in unter einer Sekunde durch") -- 10s ist das
+                       # Zehnfache davon und bricht die Wartezeit ab, sobald der Beleg
+                       # da ist, kostet also im Regelfall nichts.
+    inhalt_ende=$(( $(date +%s) + INHALT_FRIST ))
+    beleg=""
+    while :; do
+      # -J: umgebrochene Zeilen werden vor der Suche wieder zusammengesetzt, sonst
+      # zerreisst ein Terminal-Umbruch mitten im Marker die Zeichenkette in zwei
+      # Fundstellen, die keine von beiden trifft. -S -2000: der Marker kann laengst
+      # aus dem sichtbaren Fenster gescrollt sein, bis der Harness zu antworten
+      # beginnt (Vorbild: derselbe Aufruf in wb-ssh-worker fuer dieselbe Frage).
+      if tmux capture-pane -p -J -S -2000 -t "$pane" 2>/dev/null | grep -qF -- "$MARKER_INHALT"; then
+        beleg=1; break
+      fi
+      [ "$(date +%s)" -ge "$inhalt_ende" ] && break
+      sleep 1
+    done
+    if [ -z "$beleg" ]; then
+      submitted=""
+      inhalt_fehlt=1
+    fi
+  fi
 fi
 
 # Ohne gemessenes promptPattern wird NICHT behauptet, was nicht geprueft wurde: der
@@ -1166,6 +1211,11 @@ fi
 # mit einer Erfolgsmeldung darueber waere sie unauffindbar.
 if [ -n "$submitted" ]; then
   echo "Task an Chat-Agent '$NAME' ($MODEL, Pane $pane) gesendet (Submission verifiziert)."
+elif [ -n "${inhalt_fehlt:-}" ]; then
+  echo "FEHLER: Eingabezeile in Pane $pane ist leer, aber der Auftragstext ist dort nicht wiederzufinden (gesucht: '$MARKER_INHALT', ${INHALT_FRIST}s gewartet)." >&2
+  echo "  Die Zeile allein zu leeren belegt kein Absenden -- irgendein anderer Text kann sie ebenso geleert haben." >&2
+  echo "  Selbst ansehen und, falls noetig, den Auftrag erneut schicken: tmux capture-pane -p -t $pane" >&2
+  exit 1
 elif [ -n "$PROMPT_RE" ]; then
   # Der dritte Ausgang, neu am 2026-08-08: die Frist ist um, die Eingabezeile traegt den
   # Text noch, aber der Pane BEWEGT sich. "Haengt" ist das nicht -- ein eingefrorener Pane

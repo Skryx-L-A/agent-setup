@@ -236,7 +236,13 @@ export class TmuxControl extends EventEmitter {
    * bleibender Eingriff, und genau den verbietet F2.
    */
   private vorZustand: { windowId: string; layout: string; cols: number; rows: number }[] = [];
-  private windowSizeVorher: string | null = null;
+  /**
+   * Der vorherige Wert von `window-size` -- JE FENSTER. `window-size` ist eine
+   * FENSTER-Option: ueber ein Session-Ziel gesetzt oder gelesen trifft sie das
+   * gerade aktuelle Fenster, und das ist in einer Werkbank-Sitzung regelmaessig
+   * ein anderes als das gezeichnete (gemessen am 17.08.).
+   */
+  private windowSizeVorher = new Map<string, string>();
   /**
    * Nur eine FREMDE Session bekommt ihren Zustand zurueck. Eine selbst
    * angelegte behaelt die Groesse, die wir ihr gegeben haben -- das ist die
@@ -427,13 +433,19 @@ export class TmuxControl extends EventEmitter {
     this.ownSession = owned;
     await this.ignoreOwnSize();
 
-    const { cols, rows, policy } = await this.applySizePolicy(owned, desired);
     const windows = await this.listWindows();
     const panes = await this.listPanes();
     // NUR der aktive Pane. Jede weitere Momentaufnahme kostet einen Umlauf,
     // in dem laufende Ausgabe anfaellt, und gezeichnet wird ohnehin nur einer;
     // die uebrigen holt paneZeigen() beim Wechsel.
     const active = panes.find((p) => p.active) ?? panes[0];
+    // ERST DEN PANE, DANN DIE GROESSENREGEL (17.08.). Sie galt vorher der
+    // SESSION -- und das ist bei tmux das gerade aktuelle Fenster, nicht das,
+    // das wir zeichnen. In einer Werkbank-Sitzung sind das zwei verschiedene:
+    // `wb-worker-tab` waehlt zuletzt das Worker-Fenster, gezeichnet wird der
+    // Orchestrator. Gemessen ging so bei jedem Anhaengen das Worker-Fenster auf
+    // 120x34 und blieb dort, ohne je gezeichnet worden zu sein.
+    const { cols, rows, policy } = await this.applySizePolicy(owned, active?.windowId ?? '', desired);
     const initialContent: Record<string, string> = {};
     if (active) initialContent[active.paneId] = await this.capturePane(active.paneId);
 
@@ -489,18 +501,42 @@ export class TmuxControl extends EventEmitter {
    * Session bekommt (D), damit die Panebreite eine Entscheidung ist und nicht
    * die Nebenwirkung der Fensterbreite; daran haengt spaeter die
    * 80-Spalten-Schwelle.
+   *
+   * WAS SICH AM 17.08. GEAENDERT HAT, und warum. Der eigene Zweig brach das
+   * Fenster beim Anhaengen zuerst auf `ownedCols x ownedRows` und die Buehne
+   * einen Wimpernschlag spaeter auf ihre eigene Zahl. Gemessen an den
+   * %layout-change-Meldungen fuehrte EIN Anhaengen das gezeichnete Fenster
+   * dadurch in 40 ms ueber drei Groessen (120x34 -> 147x42 -> 143x42), und drei
+   * schnelle Umbrueche sind genau die Schwelle, ab der eine Oberflaeche, die
+   * ihre untersten Zeilen staendig neu zeichnet, ueber ihre eigene alte
+   * Zeichnung schreibt: zwei Wechsel im Abstand von 0,3 s blieben sauber, drei
+   * im Abstand von 50 ms erzeugten den Salat (test-app-fenster-umbruch-naht.sh).
+   *
+   * Die Vorgabe aus der Konfiguration ist deshalb nur noch das, was sie immer
+   * war: die Zahl fuer eine Sitzung, die NOCH KEINE Groesse hat. Eine laufende
+   * behaelt ihre, bis die Buehne ihre eigene meldet -- ein Umbruch statt dreien.
+   * `window-size manual` bleibt: es ist der Schutz, nicht der Umbruch.
    */
-  private async applySizePolicy(owned: boolean, desired: { cols: number; rows: number }): Promise<{ cols: number; rows: number; policy: 'adopted' | 'owned' }> {
-    if (owned) {
-      await this.command(`set-option -t ${this.target()} window-size manual`);
-      await this.command(`resize-window -t ${this.target()} -x ${desired.cols} -y ${desired.rows}`);
-      await this.command(`refresh-client -C ${desired.cols}x${desired.rows}`);
-      return { cols: desired.cols, rows: desired.rows, policy: 'owned' };
-    }
+  private async applySizePolicy(owned: boolean, windowId: string, desired: { cols: number; rows: number }): Promise<{ cols: number; rows: number; policy: 'adopted' | 'owned' }> {
+    // Das Ziel ist das gezeichnete FENSTER. `window-size` ist eine
+    // Fenster-Option und `resize-window -t <session>:` meint das aktuelle
+    // Fenster -- ueber das Session-Ziel landen beide am falschen (gemessen:
+    // das Worker-Fenster stand danach auf der Vorgabegroesse).
+    const ziel = /^@\d+$/.test(windowId) ? windowId : this.target();
     const size = this.maschine
-      ? await this.auskunft(`display -p -t ${this.target()} '#{window_width}x#{window_height}'`)
-      : this.query(['display', '-p', '-t', this.target(), '#{window_width}x#{window_height}']);
-    const [w, h] = size.split('x').map((n) => parseInt(n, 10));
+      ? await this.auskunft(`display -p -t ${ziel} '#{window_width}x#{window_height}'`)
+      : this.query(['display', '-p', '-t', ziel, '#{window_width}x#{window_height}']);
+    let [w, h] = size.split('x').map((n) => parseInt(n, 10));
+    if (owned) {
+      await this.command(`set-option -w -t ${ziel} window-size manual`);
+      // Nur wenn tmux keine brauchbare Groesse nennt, wird eine gesetzt.
+      if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
+        await this.command(`resize-window -t ${ziel} -x ${desired.cols} -y ${desired.rows}`);
+        [w, h] = [desired.cols, desired.rows];
+      }
+      await this.command(`refresh-client -C ${w}x${h}`);
+      return { cols: w, rows: h, policy: 'owned' };
+    }
     if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
       throw new Error(`tmux nannte keine Fenstergroesse fuer ${this.session}: "${size}"`);
     }
@@ -708,10 +744,10 @@ export class TmuxControl extends EventEmitter {
     if (!this.vorZustand.some((v) => v.windowId === windowId)) {
       this.vorZustand.push({ windowId, layout, cols: parseInt(wBreite, 10), rows: parseInt(wHoehe, 10) });
     }
-    if (this.windowSizeVorher === null) {
-      const [wert] = await this.command(`show-options -t ${this.target()} -qv window-size`);
-      this.windowSizeVorher = wert ?? '';
-      await this.command(`set-option -t ${this.target()} window-size manual`);
+    if (!this.windowSizeVorher.has(windowId)) {
+      const [wert] = await this.command(`show-options -w -t ${windowId} -qv window-size`);
+      this.windowSizeVorher.set(windowId, wert ?? '');
+      await this.command(`set-option -w -t ${windowId} window-size manual`);
     }
 
     const messen = async (): Promise<{ cols: number; rows: number }> => {
@@ -738,7 +774,7 @@ export class TmuxControl extends EventEmitter {
     await this.entzoomen();
     if (this.ownSession) {
       this.vorZustand = [];
-      this.windowSizeVorher = null;
+      this.windowSizeVorher.clear();
       return;
     }
     for (const v of this.vorZustand) {
@@ -761,15 +797,15 @@ export class TmuxControl extends EventEmitter {
       }
     }
     this.vorZustand = [];
-    if (this.windowSizeVorher !== null) {
+    for (const [windowId, wert] of this.windowSizeVorher) {
       try {
-        if (this.windowSizeVorher) await this.command(`set-option -t ${this.target()} window-size ${this.windowSizeVorher}`);
-        else await this.command(`set-option -t ${this.target()} -u window-size`);
+        if (wert) await this.command(`set-option -w -t ${windowId} window-size ${wert}`);
+        else await this.command(`set-option -w -t ${windowId} -u window-size`);
       } catch {
         // dito
       }
-      this.windowSizeVorher = null;
     }
+    this.windowSizeVorher.clear();
   }
 
   /**
@@ -796,7 +832,7 @@ export class TmuxControl extends EventEmitter {
     }
     if (this.ownSession) {
       this.vorZustand = [];
-      this.windowSizeVorher = null;
+      this.windowSizeVorher.clear();
       return;
     }
     const gruppen: string[][] = [];
@@ -805,12 +841,12 @@ export class TmuxControl extends EventEmitter {
       if (v.layout) gruppen.push(['select-layout', '-t', v.windowId, v.layout]);
     }
     this.vorZustand = [];
-    if (this.windowSizeVorher !== null) {
-      gruppen.push(this.windowSizeVorher
-        ? ['set-option', '-t', this.target(), 'window-size', this.windowSizeVorher]
-        : ['set-option', '-t', this.target(), '-u', 'window-size']);
-      this.windowSizeVorher = null;
+    for (const [windowId, wert] of this.windowSizeVorher) {
+      gruppen.push(wert
+        ? ['set-option', '-w', '-t', windowId, 'window-size', wert]
+        : ['set-option', '-w', '-t', windowId, '-u', 'window-size']);
     }
+    this.windowSizeVorher.clear();
     if (!gruppen.length) return;
     if (this.maschine) {
       // FERN ALS EIN EINZIGER AUFRUF. Jeder dieser Befehle waere sonst eine
@@ -896,10 +932,13 @@ export class TmuxControl extends EventEmitter {
       this.vorZustand.push({ windowId, layout: rest.join(';'), cols: parseInt(b, 10), rows: parseInt(h, 10) });
     }
     // Der ALTE Wert wird genau einmal festgehalten -- er ist das, was beim
-    // Abloesen wieder hergestellt wird.
-    if (this.windowSizeVorher === null) {
-      const [wert] = await this.command(`show-options -t ${this.target()} -qv window-size`);
-      this.windowSizeVorher = wert ?? '';
+    // Abloesen wieder hergestellt wird. JE FENSTER (17.08.): `window-size` ist
+    // eine Fenster-Option, und ueber das Session-Ziel gesetzt oder gelesen
+    // erwischt sie das gerade aktuelle Fenster. In einer Sitzung mit einem
+    // Orchestrator- und einem Worker-Fenster ist das regelmaessig das falsche.
+    if (!this.windowSizeVorher.has(windowId)) {
+      const [wert] = await this.command(`show-options -w -t ${windowId} -qv window-size`);
+      this.windowSizeVorher.set(windowId, wert ?? '');
     }
     // Dass 'manual' GILT, wird dagegen jedes Mal nachgesehen, nicht nur beim
     // ersten Fenster: die Option kann von aussen zurueckgestellt werden (ein
@@ -1245,7 +1284,7 @@ export class TmuxControl extends EventEmitter {
     // gegangen. Die Buchfuehrung wird geleert, damit auch der Ausstieg nichts
     // mehr an einer Session versucht, die es nicht gibt.
     this.vorZustand = [];
-    this.windowSizeVorher = null;
+    this.windowSizeVorher.clear();
     this.gezoomt = '';
     try {
       p?.kill('SIGTERM');

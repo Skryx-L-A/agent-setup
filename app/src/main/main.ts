@@ -1534,7 +1534,32 @@ function verbindungVerloren(maschine: string, grund: string): void {
  *                 Maschine, der sie gehoert; der Steuerkanal geht dann ueber
  *                 `fernAufruf` dorthin (tmux.ts).
  */
-async function attachTmux(sessionName: string, maschine = ''): Promise<void> {
+/**
+ * ZWEI ANHAENGEN GLEICHZEITIG GIBT ES NICHT (17.08.).
+ *
+ * `attachTmux` loest den vorigen Steuerclient ab, BEVOR es einen neuen
+ * aufmacht -- aber es setzt `tmux` erst, wenn das Anhaengen geglueckt ist.
+ * Zwei Aufrufe, die sich ueberholen (zwei Klicks in der Sitzungsleiste, ein
+ * Klick waehrend eines Wechsels in die Chat-Werkstatt), sehen deshalb beide
+ * ein leeres `tmux`, loesen beide nichts ab und lassen zwei Steuerclients an
+ * derselben Session stehen. GEMESSEN an Sitzung des Nutzers: zwei
+ * Steuerkanal-Clients auf `wb-AI`, angelegt um 21:19:58 und um 22:03:52, beide
+ * am Leben. Und jedes Anhaengen ist ein Groessenereignis fuer die Sitzung.
+ *
+ * Die Reihe hier laesst immer nur eines laufen; das naechste beginnt, wenn das
+ * vorige fertig ist -- und findet dann ein gesetztes `tmux` vor, das es
+ * ordentlich abloest.
+ */
+let anhaengenLaeuft: Promise<void> = Promise.resolve();
+function attachTmux(sessionName: string, maschine = ''): Promise<void> {
+  const dran = anhaengenLaeuft.then(() => attachTmuxJetzt(sessionName, maschine));
+  // Die Reihe darf an einem Fehlschlag nicht abreissen: der Aufrufer bekommt
+  // ihn, die Reihe laeuft weiter.
+  anhaengenLaeuft = dran.catch(() => undefined);
+  return dran;
+}
+
+async function attachTmuxJetzt(sessionName: string, maschine = ''): Promise<void> {
   if (tmux) {
     // Erst die Zuhoerer weg, dann abloesen: das Abloesen feuert 'closed', und
     // der Zuhoerer aus dem vorigen Durchlauf haette sonst gerade den Fehler
@@ -1645,7 +1670,18 @@ async function attachTmux(sessionName: string, maschine = ''): Promise<void> {
     // blossen Anhaengen hat niemand eine Ansicht gewaehlt -- der aktive Pane
     // gehoert dem Menschen davor. Die Groesse wird trotzdem gesetzt; genau
     // dafuer gibt es den zweiten Weg (tmux.ts, fensterNachziehen).
-    if (flaeche && streamPane) await paneZeigen(streamPane, false);
+    // OHNE die Groesse zu setzen (17.08.). `flaeche` ist hier die Zahl der
+    // VORIGEN Ansicht: der Renderer legt sein Terminal fuer diesen Pane erst
+    // beim Zeichnen an und kennt seine Zellbreite bis dahin nicht (siehe
+    // renderer.ts, nachfordernSpaeter). Wer sie trotzdem an tmux weitergibt,
+    // bricht das Fenster auf eine Zahl um, die er 250 ms spaeter selbst
+    // korrigiert -- gemessen 147x42, dann 143x42. Zwei Umbrueche statt einem,
+    // und zusammen mit der Vorgabegroesse waren es drei: die gemessene
+    // Schwelle, ab der eine laufende Oberflaeche ueber ihre eigene alte
+    // Zeichnung schreibt (test-app-fenster-umbruch-naht.sh). Gezeichnet wird
+    // deshalb in der Groesse, die tmux gerade hat; die eine richtige Zahl
+    // kommt gleich darauf vom Renderer.
+    if (flaeche && streamPane) await paneZeigen(streamPane, false, false);
     if (maschine) {
       // DER UNTERSCHIED WIRD GESAGT, nicht versteckt. Er ist echt: jede Taste
       // und jedes Zeichen Ausgabe laeuft ueber die Leitung, und die kann enden.
@@ -1679,7 +1715,7 @@ async function attachTmux(sessionName: string, maschine = ''): Promise<void> {
  * Der Pane bekommt dabei die Groesse der Zeichenflaeche -- beim Wechsel zwischen
  * Orchestrator und Worker aendert sie sich, also wird jedes Mal neu gesetzt.
  */
-async function paneZeigen(paneId: string, zoomen = true): Promise<void> {
+async function paneZeigen(paneId: string, zoomen = true, groesseSetzen = true): Promise<void> {
   if (!tmux) throw new Error('nicht angehaengt');
   streamPane = paneId;
   ansicht = { art: 'pane', pane: paneId };
@@ -1694,7 +1730,7 @@ async function paneZeigen(paneId: string, zoomen = true): Promise<void> {
   // wieder der alte Pane aktiv war. Dann wird eben so gross gezeichnet, wie
   // tmux es hergibt; das ist ehrlicher als eine Zahl, die nur wir glauben.
   let groesse = await paneGroesse(paneId);
-  if (flaeche) {
+  if (flaeche && groesseSetzen) {
     // DIE BUEHNE GIBT DIE ZAHLEN VOR -- auch dann, wenn das Programm bloss eine
     // Aenderung von aussen nachzieht. Vorher stand hier nur der Zoom, und der
     // faellt beim Nachziehen weg; die Groesse fiel damit mit weg, und die
