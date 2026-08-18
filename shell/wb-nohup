@@ -93,6 +93,16 @@ if [[ $# -eq 0 || "$1" == "-h" || "$1" == "--help" ]]; then
   exit 1
 fi
 
+# Ein vergessener Name sah bisher aus wie eine unbekannte Option: der erste
+# Platz wird ungeprueft als Name genommen, und die Optionsschleife stolperte
+# dann ueber dessen Wert ("unbekannte Option '/pfad/zur/log'"). Die Meldung
+# schickte den Leser zu '--', wo nichts fehlte. Gemessen am 18.08., als der
+# Orchestrator selbst darauf hereinfiel.
+case "$1" in
+  --*) echo "wb-nohup: erstes Argument ist der kurze Bezeichner, keine Option (bekommen: '$1')." >&2
+       echo "          Aufruf: wb-nohup <name> [--worker <name>] [--log <pfad>] -- <befehl>" >&2
+       exit 2 ;;
+esac
 NAME="$1"; shift
 WORKER=""
 LOG=""

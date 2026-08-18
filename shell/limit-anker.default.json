@@ -1,4 +1,5 @@
 {
+  "_hinweis": "NICHT INSTALLIERT: Vorlage fuer ~/.claude/workbench/limit-anker.json, wird bei Bedarf dorthin kopiert statt nach ~/.local/bin.",
   "_comment": [
     "Vorlage fuer ~/.claude/workbench/limit-anker.json.",
     "Von Hand nachgerechnete Verbrauchsabschnitte, die wb-budget --limit-gewichte NICHT",

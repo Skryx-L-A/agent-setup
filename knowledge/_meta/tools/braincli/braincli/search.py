@@ -231,7 +231,8 @@ def semantic_search(vault: Path, query: str, k: int) -> list[SearchHit]:
     if not entries:
         return []
     client = OllamaClient()
-    qvec = client.embed(query)  # raises OllamaError if Ollama is down
+    # keep_alive="0s": die Einzelabfrage laesst nichts auf der Karte zurueck.
+    qvec = client.embed(query, keep_alive="0s")  # raises OllamaError if Ollama is down
     hits = rank(qvec, entries, k)
     for h in hits:
         h.match = "semantic"

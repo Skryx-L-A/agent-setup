@@ -106,6 +106,18 @@ ist_mensch() {
     [ "${beleg%%$'\t'*}" = mensch ]
 }
 
+# Haengt an der Sitzung des Ziel-Panes kein Client, sitzt dort auch kein Mensch.
+# Faellt die Messung aus (kein tmux erreichbar), gilt der vorsichtige Ausgang:
+# behandeln, als haenge keiner -- eine Hochstufung, die nicht belegt werden kann,
+# findet nicht statt.
+sitzung_ohne_client() {
+    local sitzung anzahl
+    sitzung=$(tm display -p -t "$PANE" '#{session_name}' 2>/dev/null) || return 0
+    [ -n "$sitzung" ] || return 0
+    anzahl=$(tm list-clients -t "=$sitzung" 2>/dev/null | grep -c . || true)
+    [ "${anzahl:-0}" -eq 0 ]
+}
+
 # Ist der Ziel-Pane der eigene? Gemessen an der pane_pid, nicht an $TMUX_PANE.
 ist_eigener_pane() {
     local ziel_pid pid
@@ -139,7 +151,25 @@ entscheiden() {
                 GRUND="eigener Pane, aber '$ROLLE' schraenkt nur ein."
                 return 0 ;;
             *)
-                if ist_mensch; then
+                # ZWEITE Bedingung fuer die Hochstufung des EIGENEN Panes, ergaenzt
+                # am 18.08. nach einem reproduzierten Angriff: an der Sitzung des
+                # Panes muss ein Client haengen.
+                #
+                # Warum das noetig ist: `wb-mensch` faellt, wenn alle vier
+                # Agenten-Merkmale fehlen, auf M1 zurueck — "hat ein steuerndes
+                # Terminal". Ein frisch erzeugter tmux-Pane hat aber IMMER ein pty;
+                # tmux vergibt es beim Erzeugen, nicht beim Anhaengen. Ein Prozess
+                # ohne Claude-Kennzeichen (`env -i`, so laeuft der woechentliche
+                # launchd-Job) konnte sich damit selbst zum Orchestrator erklaeren —
+                # genau der Weg, den der Kopf dieser Datei ausschliesst.
+                #
+                # Warum HIER und nicht in `wb-mensch`: dessen Semantik "ein nackter
+                # Pane ist ein Mensch" ist die dokumentierte Grundlage von 18 Zusagen
+                # in `test-mensch-und-schalter.sh`; sie zu aendern haette eine
+                # Sicherheitsfrage mit einem Umbau an gemeinsam genutztem Code
+                # beantwortet. Der angehaengte Client ist die POSITIVE Spur eines
+                # Menschen und wird nur dort verlangt, wo es um die Hochstufung geht.
+                if ist_mensch && ! sitzung_ohne_client; then
                     ENTSCHEIDUNG=erlaubt
                     GRUND="eigener Pane, '$ROLLE' von einem gemessenen Menschen — $MENSCH_GRUND"
                     return 0
