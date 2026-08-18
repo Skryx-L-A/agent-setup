@@ -1,4 +1,5 @@
 {
+  "_hinweis": "NICHT INSTALLIERT: Vorlage fuer ~/.claude/workbench/plan-historie.json, wird bei Bedarf dorthin kopiert statt nach ~/.local/bin.",
   "zweck": "Welches Anthropic-Abo wann galt. Eine Limit-Kalibrierung darf NIE ueber eine Plangrenze hinweg rechnen: ein Prozentpunkt bedeutet vorher und nachher eine andere Tokenmenge. Gepflegt von Hand, Quelle ist immer der Kontoinhaber.",
   "wochenfenster": "Das Wochenlimit setzt montags um 14:00 Ortszeit zurueck (Europe/Berlin).",
   "plaene": [

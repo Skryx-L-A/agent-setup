@@ -28,6 +28,7 @@ ZWEI GRENZEN, an denen sich alles hier ausrichtet:
 Rueckgabewerte von `pruefen`:
   0  spawnbar (auch: nichts bekannt -- siehe Grenze 1)
   3  Kontingent nachweislich erschoepft
+  6  Harness auf dieser Maschine nicht installiert
   4  lokales Modell nicht in Ollama vorhanden
   5  nachweislich nicht angemeldet (Abo-Spur ohne gueltiges Zeugnis)
   2  Aufruffehler (falsche Argumente)
@@ -700,10 +701,36 @@ def _finde_modell(kennung, harness_id):
 
 
 def cmd_pruefen(args):
+    # Grenze 0 (18.08.): das Programm des Harness fehlt auf DIESER Maschine.
+    # Bis dahin meldete `pruefen` fuer einen Harness ohne Binary eine 0, und der
+    # Fehler zeigte sich erst im Pane -- gemessen an `cline`, das auf dem Mac nicht
+    # installiert ist, waehrend die Routing-Tabelle fuenf cline-Eintraege fuehrt.
+    # Der Aufrufname steht in der Registry; fehlt er dort, wird der Harness-Name
+    # selbst versucht. Das ist eine reine PATH-Frage und kostet keine Messung.
+    aufruf = _harness_befehl(args.harness)
+    # Ein Eintrag darf einen PFAD statt eines Namens tragen (`claude` steht in der
+    # Registry als `~/.local/bin/claude`). `shutil.which` findet einen Pfad mit
+    # Tilde nicht -- ohne diese Zeile haette der neue Riegel JEDEN Claude-Spawn
+    # gesperrt. Gemessen und beinahe ausgeliefert, 18.08.
+    if aufruf:
+        aufruf = os.path.expanduser(aufruf)
+        vorhanden = (os.access(aufruf, os.X_OK) and os.path.isfile(aufruf)) \
+            if os.sep in aufruf else (shutil.which(aufruf) is not None)
+    else:
+        vorhanden = True
+    if not vorhanden:
+        print("wb-kontingent: Harness '%s' ist auf dieser Maschine nicht installiert "
+              "('%s' liegt in keinem PATH-Verzeichnis) -- kein Start."
+              % (args.harness, aufruf), file=sys.stderr)
+        return 6
+
+
     z, _ = zustand_frisch()
     e = (z.get("harnesses") or {}).get(args.harness)
     if e is None:
-        # Grenze 1: unbekannt sperrt nie.
+        # Grenze 1: unbekannt sperrt nie. Das gilt fuer den KONTINGENT-Stand --
+        # ein fehlendes Programm ist damit schon oben abgefangen, sonst kaeme ein
+        # Harness, den die Zustandsdatei nicht kennt, nie an der Pruefung vorbei.
         return 0
 
     if e.get("erschoepft") is True:
@@ -736,6 +763,28 @@ def cmd_pruefen(args):
                       "verdraengt hier moeglicherweise ein anderes." % frei, file=sys.stderr)
     return 0
 
+
+
+def _harness_befehl(harness):
+    """Der AUFRUFNAME eines Harness, aus der Registry -- nicht sein Name.
+
+    Beides faellt regelmaessig auseinander: `copilot-cloud` faehrt ueber das
+    Programm `copilot`, und `cline` heisst als Programm `clite`. Wer den
+    Harness-Namen fuer den Aufruf haelt, sperrt einen funktionierenden Harness
+    und laesst einen fehlenden durch (beides gemessen am 18.08.). Faellt die
+    Registry aus, wird nicht geraten: dann gibt es keinen Riegel.
+    """
+    pfad = os.environ.get("WB_MODELS_FILE") or os.path.expanduser(
+        "~/.claude/workbench/models.json")
+    try:
+        with open(pfad, encoding="utf-8") as fh:
+            daten = json.load(fh)
+    except Exception:
+        return None
+    for h in (daten.get("harnesses") or []):
+        if h.get("id") == harness:
+            return h.get("command")
+    return None
 
 def freier_speicher_mib():
     exe = shutil.which("check-resources")

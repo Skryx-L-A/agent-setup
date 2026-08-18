@@ -1516,6 +1516,15 @@ def _sorte_a(c7, findings):
                 continue
             inst_datei = os.path.join(ziel, name)
             if not os.path.exists(inst_datei):
+                # Eine Datei auf `.default.json` ist per NAMEN eine Vorlage: sie wird
+                # beim Einrichten an ihren Zielort kopiert und gehoert nie nach
+                # ~/.local/bin. Das ist ein strukturelles Merkmal, keine Ausnahmeliste
+                # -- eine Liste haette gepflegt werden muessen, der Namensteil pflegt
+                # sich selbst. Aufgenommen 18.08., nachdem drei solche Vorlagen als
+                # Befund erschienen und JSON keine Kommentarzeile fuer die Begruendung
+                # traegt.
+                if rel.endswith(".default.json"):
+                    continue
                 # Traegt die Datei ihre Begruendung selbst? Dann ist sie kein Befund.
                 kopf = "\n".join(read_lines(repo_datei)[:40])
                 if NICHT_INSTALLIERT_RE.search(kopf):

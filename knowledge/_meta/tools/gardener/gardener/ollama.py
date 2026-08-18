@@ -124,11 +124,21 @@ class OllamaClient:
         })
         return ((data.get("message") or {}).get("content") or "").strip()
 
-    def embed(self, text: str) -> list[float]:
-        data = self._post_retrying("/api/embed", {
+    def embed(self, text: str, keep_alive: str | None = None) -> list[float]:
+        """`keep_alive` steuert, wie lange Ollama das Modell nach der Antwort
+        haelt. Vorgabe bleibt Ollamas eigene (rund 20 Minuten), weil ein
+        Gaertnerlauf hunderte Bloecke hintereinander einbettet und jedes
+        Entladen dazwischen ihn um ein Vielfaches verlangsamen wuerde. Eine
+        EINZELNE Abfrage -- `brain search` -- gibt "0s" mit: sie braucht das
+        Modell fuer einen Augenblick, und ein 673-MB-Rueckstand auf der Karte
+        hat am 17.08. zweimal eine Belegungspruefung in die Irre gefuehrt."""
+        nutzlast = {
             "model": self.embed_model,
             "input": text[:config.EMBED_MAX_CHARS],
-        }, "embed")
+        }
+        if keep_alive is not None:
+            nutzlast["keep_alive"] = keep_alive
+        data = self._post_retrying("/api/embed", nutzlast, "embed")
         if data is None:
             raise OllamaError("embedding failed (transient)")
         embs = data.get("embeddings") or []

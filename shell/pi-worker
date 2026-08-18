@@ -675,14 +675,20 @@ finalize_latest_when_done() {
 # `chat-foo` denselben Anfang -- eine echte Terminal-Sitzung waere damit
 # unsichtbar geworden. Die Option setzt nur, wer die Werkstatt anlegt.
 wb_kandidaten() {   # <nur angehaengte: 1|0>
-  tmux list-sessions -F '#{session_attached}	#{session_name}	#{@wb_chat}' 2>/dev/null \
-    | awk -F'\t' -v nur="$1" '$2 ~ /^wb-/ && $3 != "1" && (nur == 0 || $1 >= 1) { print $2 }'
+  # Trennzeichen '|' statt Tab (gemessen 2026-08-18): tmux ersetzt einen
+  # literalen Tab im -F-Format durch '_', sobald keine UTF-8-Locale gesetzt
+  # ist (LANG/LC_ALL leer -- so laeuft z.B. der woechentliche launchd-Job).
+  # Damit verschmelzen alle drei Felder zu einem, und die Suche findet nie
+  # ein Ziel. '|' ist ASCII-druckbar und bleibt unter jeder Locale erhalten;
+  # kein Sitzungsname und kein @wb_chat-Wert enthaelt es.
+  tmux list-sessions -F '#{session_attached}|#{session_name}|#{@wb_chat}' 2>/dev/null \
+    | awk -F'|' -v nur="$1" '$2 ~ /^wb-/ && $3 != "1" && (nur == 0 || $1 >= 1) { print $2 }'
 }
 
 # Die uebergangenen Werkstaetten -- nur fuer die Fehlermeldung.
 chat_werkstaetten() {
-  tmux list-sessions -F '#{session_name}	#{@wb_chat}' 2>/dev/null \
-    | awk -F'\t' '$2 == "1" { print $1 }'
+  tmux list-sessions -F '#{session_name}|#{@wb_chat}' 2>/dev/null \
+    | awk -F'|' '$2 == "1" { print $1 }'
 }
 
 find_caller_session() {

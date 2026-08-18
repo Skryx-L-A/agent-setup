@@ -1,5 +1,5 @@
 #!$HOME/.local/bin/peer-shot-py3
-# NICHT INSTALLIERT auf mac: nur fuer peer (KDE Plasma/Wayland, siehe Shebang-Pfad
+# NICHT INSTALLIERT: nur fuer peer, auf mac ohne Zweck (KDE Plasma/Wayland, siehe Shebang-Pfad
 # oben). Auf peer gehoert diese Datei sehr wohl nach ~/.local/bin und wird dort
 # ausgerollt -- der Satz oben gilt maschinenabhaengig, nicht allgemein.
 """Fenstergenaue Bildschirmaufnahme fuer KDE Plasma 6 / Wayland.
