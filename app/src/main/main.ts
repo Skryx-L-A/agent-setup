@@ -184,6 +184,28 @@ for (const werkzeug of ['tmux', 'wb-code']) {
 
 const started = Date.now();
 const config: Config = loadConfig(process.argv.slice(1));
+// KOPFLOS UNTER LINUX: DER BILDTAKT MUSS ERST GELOEST WERDEN.
+//
+// Das Fenster entsteht immer mit show:false. Unter Linux nimmt Chromium ein
+// nie gezeigtes Fenster von der Bildquelle des Bildschirms und faellt auf einen
+// Nottakt zurueck; GEMESSEN auf peer am 21.08. ueber `window.__awb.scroll-
+// leistung`: 1016,6 ms zwischen zwei requestAnimationFrame-Zeitstempeln, also
+// EIN Bild je Sekunde, in jedem Anlauf auf die Zehntelmillisekunde gleich.
+// macOS zeigt an derselben Stelle 8,9 ms.
+//
+// Das trifft nicht nur das Zeichnen. Chromium reicht Rad-Ereignisse aus
+// `sendInputEvent` im Takt der Bilder an den Renderer weiter; bei einem Bild je
+// Sekunde kam von 30 Ereignissen eines an, der Rest verfiel. Genau daran starb
+// test-app-scroll-wisch.sh auf peer mit „0 Zeilen bewegt", ohne dass an der
+// Rechnung etwas falsch war. Mit dem Schalter: 4,9 ms je Bild und 30 von 30
+// Ereignissen angekommen.
+//
+// Nur kopflos, nur unter Linux: ein sichtbares Fenster hat seinen Takt vom
+// Bildschirm, und auf macOS wuerde der Schalter die Bildgrenze auch dort
+// aufheben, wo sie richtig ist (gemessen 8,9 ms auf 2,9 ms).
+if (config.headless && process.platform === 'linux') {
+  app.commandLine.appendSwitch('disable-frame-rate-limit');
+}
 const ui = new UiStore(config.stateDir);
 // Was beim letzten Blick dieses Programms noch lief (11.08.) -- die eine
 // Quelle dafuer, dass eine nach einem Absturz weggebrochene Sitzung nicht
@@ -721,7 +743,7 @@ async function planSofort(plan: Plan): Promise<void> {
  * not a terminal', Exitcode 1) -- die Session steht zu dem Zeitpunkt schon,
  * das ist kein Fehlschlag dieser Funktion.
  */
-function sessionWiederherstellen(id: string): { command: string; conversation: string; conversationReason: string } {
+function sessionWiederherstellen(id: string, mensch = false): { command: string; conversation: string; conversationReason: string } {
   const s = sessions.find((x) => x.id === id);
   if (!s) throw new Error(`unbekannte Session: ${id}`);
   if (!darfWiederherstellen(s)) throw new Error(`Session '${s.name}' ist nicht (mehr) im Zustand 'stopped' -- keine Wiederherstellung.`);
@@ -750,17 +772,43 @@ function sessionWiederherstellen(id: string): { command: string; conversation: s
   gescheiterteStarts.delete(startKey);
   const protokollPfad = join(config.stateDir, 'sitzungsstart',
     `${Date.now()}-fortsetzen-${basename(s.dir).replace(/[^A-Za-z0-9._-]/g, '_')}.log`);
-  const startUmgebung = { ...process.env, WB_EIGENTUEMER_WERKBANK: String(process.pid) };
+  // DERSELBE MENSCHEN-NACHWEIS WIE BEIM PLUS-MENUE (21.08.2026, zweite des Nutzers
+  // Ansage: "der user wird im menu gewarnt, das reicht, die app sollte es dann nicht
+  // mehr verhindern"). Der Wiederholen-Pfeil ist der Knopf, den er drueckt, NACHDEM
+  // ihm die Oberflaeche eine Stufe als nicht passend gezeigt hat -- gerade hier darf
+  // eine abgelehnte Speicherbuchung ihn nicht ein zweites Mal aufhalten. `wb-code`
+  // macht daraus mit `--mensch` eine laute Warnung statt eines Abbruchs.
+  //
+  // Die Ahnenreihe traegt hier aus demselben Grund wie in `sessionAnlegen`: `wb-code`
+  // laeuft als Kind DIESES Prozesses. Und wie dort wird das Flag geprobt statt blind
+  // angehaengt -- ein abgelehntes `--mensch` beendet `wb-code` mit Exit 1, und ein
+  // Wiederholen, das daran scheitert, waere schlimmer als der Deckel.
+  const menschUmgebungR: Record<string, string> = {};
+  const cmdArgs = [...cmd.args];
+  if (mensch && s.machine === config.machine) {
+    const probeUmgebung = {
+      ...process.env,
+      WB_MENSCH_QUELLE: 'oberflaeche',
+      WB_APP_PID: String(process.pid),
+    };
+    const probe = spawnSync(config.wbMenschBin, ['pruefen'], { env: probeUmgebung, timeout: 5000 });
+    if (probe.status === 0) {
+      cmdArgs.push('--mensch');
+      menschUmgebungR.WB_MENSCH_QUELLE = 'oberflaeche';
+      menschUmgebungR.WB_APP_PID = String(process.pid);
+    }
+  }
+  const startUmgebung = { ...process.env, WB_EIGENTUEMER_WERKBANK: String(process.pid), ...menschUmgebungR };
   let kind: ReturnType<typeof spawn>;
   try {
     mkdirSync(dirname(protokollPfad), { recursive: true });
     const fd = openSync(protokollPfad, 'a');
-    kind = spawn(cmd.bin, cmd.args, { stdio: ['ignore', fd, fd], detached: true, env: startUmgebung });
+    kind = spawn(cmd.bin, cmdArgs, { stdio: ['ignore', fd, fd], detached: true, env: startUmgebung });
     closeSync(fd);
     startGrundBeobachten(kind, protokollPfad, s.dir, startKey, s.sessionKey);
   } catch (e) {
     process.stderr.write(`Fortsetzen: kein Protokoll moeglich (${(e as Error).message}) -- Start ohne Mitschrift.\n`);
-    kind = spawn(cmd.bin, cmd.args, { stdio: 'ignore', detached: true, env: startUmgebung });
+    kind = spawn(cmd.bin, cmdArgs, { stdio: 'ignore', detached: true, env: startUmgebung });
     kind.once('exit', () => { laufendeStarts.delete(startKey); });
   }
   kind.unref();
@@ -768,7 +816,8 @@ function sessionWiederherstellen(id: string): { command: string; conversation: s
   // Oberflaeche, nicht die neue Session -- und ob seine Unterhaltung
   // zurueckkommt, darf er nicht erst am Pane merken.
   process.stderr.write(`revive '${s.name}' (Harness ${s.harness}): ${cmd.conversationReason}\n`);
-  return { command: `${cmd.bin} ${cmd.args.join(' ')}`, conversation: cmd.conversation, conversationReason: cmd.conversationReason };
+  // cmdArgs statt cmd.args: was gemeldet wird, muss das sein, was wirklich lief -- mit --mensch, wenn es mitging.
+  return { command: `${cmd.bin} ${cmdArgs.join(' ')}`, conversation: cmd.conversation, conversationReason: cmd.conversationReason };
 }
 
 /**
@@ -2944,6 +2993,24 @@ ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) =
         await tabZeigen((Array.isArray(wert) ? wert : []).map(String));
         break;
       case 'flaeche': {
+        // EINE VORGABE HAELT, BIS EINE NEUE KOMMT.
+        //
+        // `flaecheVorgegeben` sagt seit jeher: gibt ein Skript die Flaeche ueber
+        // den Steuerkanal vor, „gilt genau diese Zahl und die Buehne haelt
+        // still". Gehalten hat sie nur die Nachforderung im Renderer, und die
+        // entscheidet anhand der Lage, mit der sie 250 ms vorher losgeschickt
+        // wurde -- kommt die Vorgabe in diesen 250 ms, prueft sie gegen einen
+        // Stand, den es nicht mehr gibt, und ueberschreibt die Vorgabe mit der
+        // selbst gemessenen Zahl. GEMESSEN auf peer am 21.08.: nach
+        // `awb-ctl flaeche 132x40` rechnete die Kapazitaet mit 137x35, und die
+        // Zusage A13 in test-app-oberflaeche.sh fiel. Die Sperre gehoert
+        // deshalb hierher, wo der Stand WIRKLICH steht, statt in eine
+        // Momentaufnahme davon.
+        //
+        // Zurueckgenommen wird eine Vorgabe durch die naechste Vorgabe (der Weg
+        // ueber 'flaeche' im Steuerkanal, der `vorgegeben` selbst setzt) -- kein
+        // Produktivpfad setzt sie je.
+        if (flaecheVorgegeben) break;
         const f = wert as { cols: number; rows: number };
         await flaecheSetzen(Number(f?.cols), Number(f?.rows));
         break;
@@ -4476,14 +4543,14 @@ async function chatAufBuehne(id: string): Promise<BrowserWindow> {
 ipcMain.handle('awb:sitz-fern-pruefen', (_e, machine: string, pfad: string) =>
   fernOrdnerPruefen(String(machine ?? ''), String(pfad ?? '')));
 
-ipcMain.handle('awb:sitz-fortsetzen', (_e, id: string) => {
+ipcMain.handle('awb:sitz-fortsetzen', (_e, id: string, echt: boolean) => {
   try {
     // Gegen den JETZIGEN Stand, nicht gegen den, aus dem die Zeile gezeichnet
     // wurde: zwischen Zeichnen und Klick koennen Sekunden liegen, und in denen
     // kann dieselbe Sitzung wieder laufen. Die Ablehnung dafuer steht in
     // `sessionWiederherstellen`; sie taugt nur, wenn die Liste frisch ist.
     sessions = modellLesen();
-    const r = sessionWiederherstellen(String(id ?? ''));
+    const r = sessionWiederherstellen(String(id ?? ''), echt === true);
     nachStartNachlesen();
     return { ok: true, meldung: r.conversationReason, command: r.command };
   } catch (e) {

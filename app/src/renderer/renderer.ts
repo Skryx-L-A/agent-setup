@@ -2231,6 +2231,8 @@ let rollenUhr: number | undefined;
 let rollenZuletzt = 0;
 /** Zaehlt die abgegebenen Buendel -- das Nachsehen unten gilt nur fuer seines. */
 let rollenZug = 0;
+/** Wann zuletzt wirklich gerollt wurde -- die Auskunft, ab wann Nachmessen Sinn hat. */
+let rollenAngewandt = 0;
 
 /**
  * KEIN BILDLAUF OHNE FRAME-GARANTIE -- zwei Stellen, an denen ein ausbleibendes
@@ -2288,6 +2290,35 @@ function rollenAnwenden(ohneBild = false): void {
     } catch {
       // Dieses Terminal nimmt nichts mehr an -- die uebrigen schon.
     }
+  }
+  if (stapel.length) rollenAngewandt = Date.now();
+}
+
+/**
+ * WARTEN, BIS DER BILDLAUF WIRKLICH STEHT -- statt eine Zeit zu raten.
+ *
+ * Nur fuer den Messhaken `rad()` weiter unten. Wer nach einem Rad-Ereignis den
+ * Ausschnitt abliest, muss zwei Schritte abwarten: die Abgabe in
+ * `rollenAnwenden` und das `rollenNachsehen`, das ROLLEN_RUECKFALL_MS spaeter
+ * den Rest ohne Animation nachzieht. Dafuer stand hier ein festes
+ * `setTimeout(50)` -- achtzehn Millisekunden Luft ueber dem Nachsehen. Unter der
+ * Last des vollen Testlaufs reichten die nicht: GEMESSEN auf peer am 21.08.
+ * fiel in test-app-rueckblick.sh eine von neunzehn Zusagen mit „das Rad bewegt
+ * nichts (viewportY bleibt 382)", waehrend dieselbe Suite einzeln gefahren
+ * neunzehn von neunzehn hielt.
+ *
+ * Gewartet wird deshalb auf den Zustand statt auf die Uhr: solange ein Buendel
+ * offen ist oder das Nachsehen noch aussteht, wird weiter nachgesehen. Bewegt
+ * sich gar nichts -- der Fall, den die Zusage FINDEN soll --, laeuft der Deckel
+ * ab und der Ausschnitt wird unveraendert gemeldet, wie vorher.
+ */
+async function rollenBeruhigt(deckelMs = 500): Promise<void> {
+  const ende = Date.now() + deckelMs;
+  for (;;) {
+    const offen = rollenOffen.size > 0 || rollenBild !== undefined || rollenUhr !== undefined;
+    if (!offen && Date.now() - rollenAngewandt > ROLLEN_RUECKFALL_MS + 16) return;
+    if (Date.now() >= ende) return;
+    await new Promise((r) => setTimeout(r, 8));
   }
 }
 
@@ -2765,9 +2796,10 @@ window.__awb = {
     // demselben Durchlauf wie das Rad-Ereignis. Ohne diese Wartezeit laese
     // dieser Haken den Stand VOR der Bewegung -- gemessen in
     // test-app-flaeche.sh: "das Rad bewegt nichts", obwohl es das sehr wohl
-    // tat, nur noch nicht in derselben Millisekunde. 50ms sind das Fuenffache
-    // der eingestellten Animationsdauer, reichlich Luft zum Einschwingen.
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // tat, nur noch nicht in derselben Millisekunde. Hier stand dafuer ein
+    // festes `setTimeout(50)`; warum daraus ein Warten auf den Zustand wurde,
+    // steht bei rollenBeruhigt().
+    await rollenBeruhigt();
     const buf = eintrag.term.buffer.active;
     return {
       pane: gemeint,
