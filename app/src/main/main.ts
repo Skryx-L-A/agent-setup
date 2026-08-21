@@ -1147,6 +1147,7 @@ function sessionAnlegen(
   name: string,
   machine: string = config.machine,
   wahl?: SitzungsWahl,
+  mensch = false,
 ): { gestartet: boolean; meldung: string; command: string } {
   const pfad = (dir || '').trim();
   if (!pfad) throw new Error('Feld dir fehlt');
@@ -1270,6 +1271,54 @@ function sessionAnlegen(
     if (wbCodeKenntKontext(probe)) args.push('--kontext', String(kontext));
     else kontextWeggelassen = String(kontext);
   }
+  // DER MENSCHEN-NACHWEIS FUER DIESEN EINEN START (21.08.2026, Entscheidung des Nutzers).
+  //
+  // Der Effort-Deckel bindet den AGENTEN, nicht den Menschen -- er sagt, was ein Orchestrator
+  // seinen Workern zugesteht. `wb-code` prueft ihn trotzdem beim Sitzungsstart, und zwar aus
+  // einem guten Grund: die HERKUNFT, nicht die Rolle. Ein Aufruf ohne belegten Menschen
+  // koennte von einem Agenten kommen, und der soll sich keine teure eigene Sitzung aufmachen.
+  // Die Folge war, dass eigener des Nutzers Klick im Plus-Menue wie ein Agentenaufruf behandelt
+  // wurde: bei einem Modell, dessen Deckel unter seiner Wahl liegt, brach der Start ab mit
+  // "Als MENSCH darueber hinaus starten: --mensch" -- ein Verweis auf einen Weg, den die
+  // Oberflaeche selbst nicht ging.
+  //
+  // WARUM ES HIER TRAEGT UND IM FORTSETZEN-WEG NICHT. `wb-mensch` glaubt die Variablen nicht,
+  // es misst: die genannte PID muss ein echter VORFAHRE des Aufrufs sein und wie dieses
+  // Programm heissen. Genau hier laeuft `wb-code` als Kind dieses Prozesses, auch abgeloest --
+  // dieselbe Ahnenreihe, auf die sich WB_EIGENTUEMER_WERKBANK ein paar Zeilen weiter stuetzt.
+  // Der Fortsetzen-Weg in befehle.ts geht ueber eine tmux-Hilfssession, dort ist der
+  // tmux-SERVER der Elternprozess und die Huerde traegt nicht. Sie dafuer aufzuweichen hiesse,
+  // jedem Agenten den Menschen-Nachweis zu schenken; also bleibt dieser Weg dort aus.
+  //
+  // ERST PROBIEREN, DANN MITGEBEN. `wb-code` verzeiht einen abgelehnten `--mensch` nicht,
+  // sondern bricht mit Exit 1 ab. Ein blind angehaengtes Flag koennte also den ganzen Start
+  // verhindern, sobald die Ahnenreihe aus irgendeinem Grund nicht durchgeht. Die Probe laeuft
+  // aus DIESEM Prozess und hat damit dieselbe Ahnenreihe wie das Kind gleich darauf.
+  //
+  // `mensch` kommt aus `isTrusted` im Fenster und wird hier NICHT nachgebessert: ein
+  // `el.click()` aus dem Steuerkanal traegt false, und der Steuerkanal-Weg ruft diese
+  // Funktion ohnehin ohne das Merkmal. Fern gilt es nie -- dort laeuft `wb-code` auf der
+  // anderen Maschine, und dieses Programm ist dort kein Vorfahre von irgendwas.
+  const menschUmgebung: Record<string, string> = {};
+  let menschBeleg = '';
+  if (mensch && !fern) {
+    const probeUmgebung = {
+      ...process.env,
+      WB_MENSCH_QUELLE: 'oberflaeche',
+      WB_APP_PID: String(process.pid),
+    };
+    const probe = spawnSync(config.wbMenschBin, ['pruefen'], { env: probeUmgebung, timeout: 5000 });
+    if (probe.status === 0) {
+      args.push('--mensch');
+      menschUmgebung.WB_MENSCH_QUELLE = 'oberflaeche';
+      menschUmgebung.WB_APP_PID = String(process.pid);
+      menschBeleg = 'mensch';
+    } else {
+      // Kein Abbruch: ohne das Flag startet derselbe Aufruf normal, dann greift der Deckel.
+      // Gesagt wird es trotzdem, sonst bekaeme er still weniger, als er gewaehlt hat.
+      menschBeleg = 'kein-mensch';
+    }
+  }
   let bin: string; let kindArgs: string[];
   if (fern) {
     const [b, ...rest] = fernAufruf(machine, ['wb-code', ...args]);
@@ -1308,7 +1357,7 @@ function sessionAnlegen(
   // traegt genau hier: `wb-code` laeuft als Kind dieses Prozesses, auch
   // abgeloest. Ein Agent, der die Variable selbst setzt, kann sich nicht unter
   // den Electron-Hauptprozess haengen.
-  const startUmgebung = { ...process.env, WB_EIGENTUEMER_WERKBANK: String(process.pid) };
+  const startUmgebung = { ...process.env, WB_EIGENTUEMER_WERKBANK: String(process.pid), ...menschUmgebung };
   let kind: ReturnType<typeof spawn>;
   try {
     mkdirSync(dirname(protokollPfad), { recursive: true });
@@ -1335,6 +1384,12 @@ function sessionAnlegen(
     // die Sitzung mit einem anderen Fenster, als im Fenster stand.
     + (kontextWeggelassen
       ? ` Das Kontextfenster ${kontextWeggelassen} ging NICHT mit: dieses wb-code kennt --kontext noch nicht.`
+      : '')
+    // Auch das wird gesagt und nicht verschwiegen: sonst liefe die Sitzung mit einer
+    // niedrigeren Denkstufe, als im Fenster stand, und niemand wuesste warum.
+    + (menschBeleg === 'kein-mensch'
+      ? ' Der Klick zaehlte NICHT als Mensch (wb-mensch hat die Probe abgelehnt) --'
+        + ' fuer diesen Start gilt deshalb der Effort-Deckel. Diagnose: wb-mensch beleg.'
       : '');
   return { gestartet: true, meldung, command: `${bin} ${kindArgs.join(' ')}` };
 }
@@ -4192,7 +4247,7 @@ ipcMain.handle('awb:sitz-neu', async (_e, name: string, machine: string, fernPfa
     pfad = wahl.pfad;
   }
   try {
-    const r = sessionAnlegen(pfad, String(name ?? ''), ziel);
+    const r = sessionAnlegen(pfad, String(name ?? ''), ziel, undefined, echt === true);
     process.stderr.write(`Sitzungsfenster: neu in '${pfad}' (${ziel}) -- gestartet=${r.gestartet} ${r.meldung}\n`);
     if (r.gestartet) nachStartNachlesen();
     return { ok: r.gestartet, meldung: r.meldung, command: r.command };
@@ -4237,7 +4292,7 @@ ipcMain.handle(
       kontext: Number(wahl?.kontext ?? 0),
     };
     try {
-      const r = sessionAnlegen(pfad, String(name ?? ''), ziel, gewaehlt);
+      const r = sessionAnlegen(pfad, String(name ?? ''), ziel, gewaehlt, echt === true);
       process.stderr.write(
         `Sitzungsfenster: neu MIT WAHL in '${pfad}' (${ziel}) -- gestartet=${r.gestartet} ${r.command}\n`,
       );
