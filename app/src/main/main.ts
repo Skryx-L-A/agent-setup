@@ -5530,7 +5530,13 @@ async function handle(req: ControlRequest): Promise<unknown> {
           deltaY: d,
           wheelTicksX: 0,
           wheelTicksY: d / 120,
-          hasPreciseScrollingDeltas: true,
+          // Steuerbar, weil dieses Feld die Bauart des GERAETS beschreibt und nicht die
+          // Geste: `hasPreciseScrollingDeltas` ist das Kennzeichen eines Trackpads. Ob
+          // Chromium daraus auf einer Plattform ohne Trackpad ueberhaupt ein
+          // DOM-Ereignis macht, ist eine Frage, die sich nur messen laesst -- und dafuer
+          // muss man es auch einmal weglassen koennen. Vorgabe bleibt true, also das
+          // bisherige Verhalten.
+          hasPreciseScrollingDeltas: req.praezise === undefined ? true : Boolean(req.praezise),
           canScroll: true,
         } as Parameters<typeof win.webContents.sendInputEvent>[0]);
         if (abstand) await new Promise((r) => setTimeout(r, abstand));

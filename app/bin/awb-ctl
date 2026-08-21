@@ -438,6 +438,10 @@ async function main() {
     if (args[3] !== undefined) payload.abstand = Number(args[3]);
     if (args[4] !== undefined) payload.block = Number(args[4]);
     if (args[5] !== undefined) payload.pause = Number(args[5]);
+    // Sechstes Argument: das Trackpad-Kennzeichen. 'nein' schaltet
+    // hasPreciseScrollingDeltas ab -- gebraucht, um zu MESSEN, ob Chromium auf einer
+    // Plattform ohne Trackpad daraus ueberhaupt ein DOM-Ereignis macht.
+    if (args[6] !== undefined) payload.praezise = !/^(nein|no|false|0)$/i.test(String(args[6]));
   } else if (cmd === 'treffer') {
     if (!args[1] || !args[2]) throw new Error('treffer braucht <x> <y> in CSS-Pixeln');
     payload = { cmd: 'treffer', x: Number(args[1]), y: Number(args[2]) };
