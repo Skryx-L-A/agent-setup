@@ -22,6 +22,15 @@ nachzuschlagen.
   abzuwägen; stattdessen den Prüfling sich selbst messen lassen. Hergang:
   [[Übersetzer 2026-08-02 — Sitzplatz-Sprache, DMA-Aufnahme, und wie ein Hörtest die halbe Diagnose kippte]].
 
+## Standing rules — bevor etwas als unmöglich gilt
+
+- **Vor jedem Ausschluss nachsehen, ob es jemand schon geschafft hat (2026-08-19):** GitHub
+  (Repos, Zusammenführungen, Fehlerberichte), Hugging Face und Foren durchsuchen, BEVOR ein Weg
+  als unmöglich gilt — fremde Vorarbeit ist die billigste Quelle, und ein ungeprüftes „geht
+  nicht" war schon falsch. Im Bericht steht, wo gesucht wurde.
+  (Ausgelagert aus CLAUDE.md am 2026-08-20, weil die Datei über der Größengrenze lag. Die
+  Regel gilt unverändert; der Auslöser steht im Verweisbaum.)
+
 ## Working principles (Karpathy-derived)
 
 - **Think before coding:** state assumptions explicitly; surface competing interpretations instead of

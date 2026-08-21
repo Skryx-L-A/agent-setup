@@ -28,6 +28,37 @@ export const DE: Record<string, string> = {
   // Der zweite Weg (12.08.): eine Chat-Sitzung als Prozess dieser App, ohne tmux.
   'knopf.neuChat': 'Neue Chat-Sitzung …',
 
+  // Der dritte Weg (19.08.): eine Wahl, die nur für diese eine Sitzung gilt.
+  'knopf.neuWahl': 'Modell für diese Sitzung wählen …',
+  'knopf.neuWahlZu': 'Wahl schließen',
+  'knopf.neuWahlStart': 'Mit dieser Wahl starten …',
+  'wahl.titel': 'Nur für diese Sitzung',
+  'wahl.unterzeile':
+    'Vorbelegt ist überall, was in den Einstellungen steht — wer nur eine Sache anders will, '
+    + 'ändert eine Sache. Die Einstellungsdatei bleibt dabei unberührt; die Wahl endet mit dieser Sitzung.',
+  'wahl.harness': 'Programm',
+  'wahl.modell': 'Modell',
+  'wahl.effort': 'Wie tief die Sitzung denkt',
+  'wahl.kontext': 'Kontextfenster',
+  'wahl.platzhalterSuche': 'Nach Name oder Kennung filtern …',
+  'wahl.keinModell': 'Für dieses Programm ist kein Modell mit der Rolle „Orchestrator" bekannt.',
+  'wahl.keinTreffer': 'Kein Modell passt zu dieser Suche.',
+  'wahl.keineStufen': 'Dieses Programm kennt keine Denkstufen — es wird keine mitgegeben.',
+  'wahl.kontextNurLokal':
+    'Nur bei einem Modell, das hier auf der Maschine läuft — bei einem Modell aus der Cloud '
+    + 'gehört diese Zahl dem Anbieter.',
+  'wahl.kontextWirdErmittelt': 'Die Stufen werden ermittelt …',
+  'wahl.kontextNichtErmittelt':
+    'Die Stufen ließen sich nicht ermitteln: {grund}. Es geht dann kein Kontextfenster mit, '
+    + 'und es gilt, was für dieses Modell eingetragen ist.',
+  'wahl.kontextEmpfohlen': 'empfohlen',
+  'wahl.kontextToken': '{tokens} Token',
+  'wahl.kontextBedarf': 'Braucht {bedarf} GiB.',
+  'wahl.nichtStartbar': 'Programm fehlt auf dieser Maschine',
+  'wahl.flaggenLeer': 'Ohne eigene Angabe — es gilt, was in den Einstellungen steht.',
+  'wahl.laedt': 'Hole, was zur Wahl steht …',
+  'wahl.ladefehler': 'Was zur Wahl steht, ließ sich nicht holen: {grund}',
+
   'platzhalter.fernpfadVorgabe': 'Absoluter Pfad auf der gewählten Maschine …',
   'platzhalter.fernpfad': "Absoluter Pfad auf '{maschine}' …",
   'knopf.pruefen': 'Prüfen',
@@ -38,6 +69,8 @@ export const DE: Record<string, string> = {
   'zustand.wartet': 'wartet',
   'zustand.fern': 'fern',
   'zustand.beendet': 'beendet',
+  'zustand.startet': 'startet…',
+  'zustand.startFehler': 'Start gescheitert',
 
   'satz.ohneOrdner': '(ohne Ordner)',
   'zeit.nieAktiv': 'nie aktiv',
@@ -71,6 +104,36 @@ export const EN: Record<string, string> = {
   'knopf.neu': 'New Session …',
   'knopf.neuChat': 'New Chat Session …',
 
+  'knopf.neuWahl': 'Pick a model for this session …',
+  'knopf.neuWahlZu': 'Close the picker',
+  'knopf.neuWahlStart': 'Start with this choice …',
+  'wahl.titel': 'For this session only',
+  'wahl.unterzeile':
+    'Everything is prefilled from Settings — change one thing if only one thing should differ. '
+    + 'The settings file stays untouched; the choice ends with this session.',
+  'wahl.harness': 'Program',
+  'wahl.modell': 'Model',
+  'wahl.effort': 'How deep the session thinks',
+  'wahl.kontext': 'Context window',
+  'wahl.platzhalterSuche': 'Filter by name or id …',
+  'wahl.keinModell': 'No model with the role "orchestrator" is known for this program.',
+  'wahl.keinTreffer': 'No model matches this search.',
+  'wahl.keineStufen': 'This program knows no thinking levels — none will be passed.',
+  'wahl.kontextNurLokal':
+    'Only for a model that runs here on this machine — for a model in the cloud that number '
+    + 'belongs to the provider.',
+  'wahl.kontextWirdErmittelt': 'Determining the levels …',
+  'wahl.kontextNichtErmittelt':
+    'The levels could not be determined: {grund}. No context window will be passed, and '
+    + 'whatever is registered for this model applies.',
+  'wahl.kontextEmpfohlen': 'recommended',
+  'wahl.kontextToken': '{tokens} tokens',
+  'wahl.kontextBedarf': 'Needs {bedarf} GiB.',
+  'wahl.nichtStartbar': 'Program missing on this machine',
+  'wahl.flaggenLeer': 'Nothing of its own — whatever is in Settings applies.',
+  'wahl.laedt': 'Fetching what there is to choose from …',
+  'wahl.ladefehler': 'What there is to choose from could not be fetched: {grund}',
+
   'platzhalter.fernpfadVorgabe': 'Absolute path on the chosen machine …',
   'platzhalter.fernpfad': "Absolute path on '{maschine}' …",
   'knopf.pruefen': 'Check',
@@ -81,6 +144,8 @@ export const EN: Record<string, string> = {
   'zustand.wartet': 'waiting',
   'zustand.fern': 'remote',
   'zustand.beendet': 'stopped',
+  'zustand.startet': 'starting…',
+  'zustand.startFehler': 'start failed',
 
   'satz.ohneOrdner': '(no folder)',
   'zeit.nieAktiv': 'never active',

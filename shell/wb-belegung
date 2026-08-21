@@ -10,8 +10,17 @@
 #                                   ein Ja bekommen.
 #   wb-belegung geladen <kennung>   Das Modell steht jetzt IM Speicher.
 #   wb-belegung verlaengern <kennung> --frist <minuten>
+#   wb-belegung uebernehmen <kennung>   Haengt die Belegung an den EIGENEN,
+#                                   gerade aufrufenden Pane -- danach verfaellt
+#                                   sie erst, wenn DIESER Pane stirbt, nicht
+#                                   mehr nach einer Frist (Befund N5, zweiter
+#                                   Pruefpass: Lebendigkeit statt Versprechen).
 #   wb-belegung aufraeumen          Verfallenes entfernen (laeuft bei jedem Aufruf mit).
 #   wb-belegung kv liste|setzen …   Der KV-Bedarf je Token, je Modell, mit HERKUNFT.
+#   wb-belegung ollama-freigeben    Ollama-Speicher verlaesslich freibekommen, jeder
+#                                   Schritt frisch verifiziert statt angenommen
+#                                   (Befund 20.08.: 'ollama stop' meldet Erfolg und wirkt
+#                                   nicht, siehe cmd_ollama_freigeben()).
 #
 # WOZU ES DA IST, ehrlich gesagt: Am 10./11.08. ist die Maschine zweimal in zwei
 # Stunden mit derselben Signatur stehengeblieben — `completeMemory() prepare count
@@ -37,10 +46,41 @@
 # haette jede einzelne der toedlichen Stufen durchgewinkt. Gerechnet wird deshalb
 #
 #     Spitze = Gewichte + Anfragen x Kontext-Token x KV-Bedarf je Token + Zuschlag
+#              + Prompt-Cache-Plaetze x PROMPT_CACHE_GB_JE_PLATZ
 #
-# mit einem festen Zuschlag von 4 GiB fuer Prompt-Cache und Spitzen. Der Zuschlag
-# ist keine Kleinigkeit: bei sieben gleichzeitigen Sequenzen hat ein Server 1,46 GB
-# allein fuer den Prompt-Cache gemeldet, unmittelbar vor der Panik.
+# mit einem Zuschlag fuer Prompt-Cache und Spitzen -- seit Betriebsfehler 1 (zweiter
+# Pruefpass, 19.08.2026) an die tatsaechliche Nebenlaeufigkeit gebunden
+# (`--parallel` x `ZUSCHLAG_JE_SEQUENZ_GIB`, siehe `zuschlag_herleiten()` unten),
+# nicht mehr ein fuer alle Aufrufe fester Wert. Der Zuschlag ist keine Kleinigkeit:
+# bei sieben gleichzeitigen Sequenzen hat ein Server 1,46 GB allein fuer den
+# Prompt-Cache gemeldet, unmittelbar vor der Panik -- der Ursprung der heutigen
+# Pro-Sequenz-Rate, siehe die Herleitung dort.
+#
+# PROMPT-CACHE-PLAETZE ist ein ZWEITER, eigener Posten (Nachtrag "MTPLX im Betrieb",
+# 2026-08-20) -- NICHT dasselbe wie der Zuschlag oben. mlx_lm.server haelt eine
+# eigene LRUPromptCache mit einer FESTEN Vorgabe von 10 Plaetzen (Praefixbaum ueber
+# system/user/assistant getrennt, KEINE Byte-Grenze eingebaut) -- dieser Speicher
+# stand bisher in KEINER Buchung, obwohl er real ist: Worker "nebenlauf" hat ihn am
+# 20.08.2026 an einem echten Server gemessen (Log-Zeile "Prompt Cache: 10 sequences,
+# 2.24-2.25 GB" bei ~1100 gecachten Prompt-Token je Sequenz, `--log-level INFO`
+# schreibt das mit) und auf die tatsaechlich betriebene Kontextlaenge hochgerechnet:
+# 0,47 GiB je Platz. Zehn volle Plaetze sind 4,7 GiB, die vorher niemand gebucht hat
+# -- derselbe stille Speicherverbrauch, der zur Kernel-Panik vom 11.08. gefuehrt hat
+# (siehe oben). `--prompt-cache-plaetze <n>` (Vorgabe 0 -- wer ihn nicht angibt,
+# bucht wie bisher nichts dafuer) traegt ihn getrennt aus, mit derselben Begruendung
+# wie beim Entwerfer oben: eine Belegung, die nur die Summe zeigt, laesst nicht
+# erkennen, wieviel vom Cache kommt.
+#
+# EIN MOTOR, DER SICH SEIN BUDGET SELBST ZUTEILT, WIRD ANDERS GEBUCHT (Nachtrag
+# "vllm-metal als zweiter Motor", 2026-08-21). Die Formel oben gilt fuer Server, die
+# ihren Speicher nach Bedarf nehmen -- mlx_lm.server, mlx-dspark, mtplx. vllm-metal tut
+# das nicht: es rechnet beim Start ein festes Budget aus (`VLLM_METAL_MEMORY_FRACTION`
+# mal Metals `max_recommended_working_set_size`, auf diesem Geraet 42,0 GiB), verteilt
+# Gewichte, Overhead und KV-Cache darin und haelt es fuer die ganze Laufzeit. Fuer ihn
+# waere Gewichte + Stroeme x Kontext x KV-Bedarf eine zweite Spitze neben der, die er
+# sich selbst gesetzt hat. `--metal-fraktion <f>` bucht deshalb genau sein Budget und
+# schliesst --gb und --gewichte-gb aus; Herleitung, Messbeleg und die wired_limit-Warnung
+# stehen bei METAL_ARBEITSSATZ_GIB im Quelltext.
 #
 # DIE ZAHL, AUF DIE ES ANKOMMT, IST DER KV-BEDARF JE TOKEN, und der ist
 # modellabhaengig. Die geerbte Konstante von 0,11 MiB je Token ist eine Falle: an
@@ -175,10 +215,205 @@ FRIST_MIN = 45          # Nachtrag 11.08.: eine Stufe laeuft bis 900 s, eine vol
 KARENZ_MIN = 60         # nur fuer Belegungen OHNE messbaren Pane, siehe Kopf.
 RESERVE_GIB = 6.0       # 6144 MiB. NICHT frei waehlbar — siehe „Die Reserve ist
                         # gekoppelt" unten, bevor jemand sie senkt.
-ZUSCHLAG_GIB = 4.0      # Prompt-Cache und Spitzen, gemessen 1,46 GB bei sieben Sequenzen.
+ZUSCHLAG_JE_SEQUENZ_GIB = 2.3  # Prompt-Cache und Spitzen, PRO Sequenz -- Herleitung
+# unten bei zuschlag_herleiten(). URSPRUENGLICH 0.6 (der Nutzer, 2026-08-19, Betriebsfehler 1, zweite
+# Runde Prueferbefunde): der alte ZUSCHLAG_GIB=4.0 war ein FESTER Wert, unabhaengig
+# von --parallel -- richtig fuer die Betriebsart, in der EIN Aufruf mehrere
+# gleichzeitige Sequenzen buchte (grug-server, bis 2026-08-19, bis zu acht). Seit dem
+# Umbau (BELEGUNG_PARALLEL=1, jeder Worker bucht seine EIGENE Sequenz einzeln) wird
+# derselbe feste Zuschlag bei JEDEM einzelnen Aufruf faellig -- beim Serverstart UND
+# bei jedem Worker obendrauf, obwohl er den Spitzenbedarf FUER ALLE gleichzeitigen
+# Sequenzen EINES Servers beschreibt, nicht je Buchung. Gemessen: 'wb-mlx-server
+# ensure qwen38 --kontext 32768' lehnte bei ~20-22 GiB frei ab (Spitze 22,2 GiB =
+# Gewichte 16,1 + KV 2,2 + Zuschlag 4,0) -- der alte Zuschlag allein war groesser als
+# der gesamte KV-Bedarf der angeforderten Stufe.
+#
+# NACHTRAG (Worker "mlxsrv", 2026-08-20) -- 0,6 GiB/Sequenz WAR ZU NIEDRIG, ECHT
+# GEMESSEN nachgewiesen, nicht nur vermutet: Auftrag war, den Zuschlag bei acht und
+# sechzehn Stroemen echt nachzumessen statt die alte Zahl (aus EINEM Punkt bei sieben
+# Sequenzen, elf Jahre vor diesem qwen38-Aufbau, an grug-27b) fortzuschreiben. Drei
+# echte Laeufe gegen einen echten qwen38-27b-Server (mlx_lm.server, --decode-concurrency
+# 8, --kontext 4096, acht VERSCHIEDENE Prompts a rund 700-900 Token, macOS
+# check-resources vor/waehrend/nach jedem Lauf abgetastet, N=8 zweimal unabhaengig
+# wiederholt):
+#   1 Strom   Spitze 8,7 GiB ueber der eingeschwungenen Grundlast (Messung nicht sauber
+#             isoliert -- nur 15 s Ruhe davor, MLX gibt Speicher verzoegert frei, siehe
+#             "DER FREIE SPEICHER WIRD NIE AUS EINER EINZIGEN ABTASTUNG GENOMMEN" oben --
+#             deshalb nur als Anhaltspunkt gewertet, nicht als harter Messpunkt)
+#   4 Stroeme Spitze 16,3 GiB (40 s Ruhe davor)
+#   8 Stroeme Spitze 20,3 GiB und, unabhaengig wiederholt nach 60 s voller Ruhe, 21,0 GiB
+#             (deckungsgleich, beide Male kam der Lauf auf 6,6-8,0 GiB frei herunter --
+#             GEFAEHRLICH NAH an der eigenen Sicherheitsschwelle MIN_FREE_MIB=20480
+#             dieses Werkzeugs, siehe wb-mlx-server, mit blosser Erfahrungsglueck ohne
+#             Absturz)
+# Nach Abzug von KV (parallel x 4096 x 0,07 MiB/Token) und dem festen
+# Prompt-Cache-Posten (4,7 GiB) bleibt als benoetigter Zuschlag: 3,8 / 10,5 / 13,8 GiB
+# bei 1 / 4 / 8 Stroemen -- klar NICHT proportional durch den Ursprung (das alte,
+# ausdruecklich vereinfachte Modell aus Betriebsfehler 1): der Sprung von 1 auf 4
+# Stroeme (+6,7 GiB) ist steiler als von 4 auf 8 (+3,3 GiB), ein Fixkosten-Anteil
+# unabhaengig von der Stromzahl liegt nahe (Metal-Scratch-Speicher/Kompilierpuffer, die
+# nicht mit der Sequenzzahl wachsen -- reine Spekulation, NICHT unabhaengig geprueft).
+# ZUSCHLAG_FIXED_GIB + ZUSCHLAG_JE_SEQUENZ_GIB x Sequenzen ist deshalb ab jetzt die
+# Formel (siehe zuschlag_herleiten()), mit der Steigung zwischen 1 und 4 Stroemen (der
+# steilste gemessene Abschnitt, 2,25 GiB/Sequenz) durchgezogen statt der flacheren
+# zwischen 4 und 8 -- das ueberzeichnet die Buchung bei acht absichtlich (rechnerisch
+# 20,4 GiB Zuschlag statt der gemessenen 13,8 benoetigten), weil die Richtung des
+# Irrtums bei SECHZEHN Stroemen die harmlose sein soll: SECHZEHN SELBST WURDE NICHT
+# GEMESSEN. Eine Hochrechnung mit dieser Steigung ergibt dort rund 38,8 GiB Zuschlag
+# allein, macht die Spitze weit groesser als die 48 GiB dieser Maschine und lehnt den
+# Start folgerichtig ab -- das deckt sich mit einer groben Abschaetzung aus den drei
+# echten Messpunkten (Spitze bei sechzehn irgendwo zwischen 45 und 68 GiB, je nach
+# Modell), nicht mit einer eigenen Messung. EHRLICH BENANNTE LUECKE statt erfundener
+# Herleitung: SECHZEHN gleichzeitige echte Stroeme liessen sich auf dieser 48-GiB-
+# Maschine nicht gefahrlos treiben, ohne genau die Kernel-Panik-Bedingungen vom 11.08.
+# nachzustellen (siehe Kopfkommentar) -- ein Versuch haette das Risiko getragen, das
+# dieses Werkzeug verhindern soll. Wer eine belastbare Zahl fuer sechzehn will: auf
+# einer Maschine mit deutlich mehr als 48 GiB freiem Speicher wiederholen, oder mit
+# einem kuerzeren Kontext/kleineren Modell, wo eine Spitze von absehbar unter 40 GiB
+# bleibt. Volle Rohdaten und Einzelwerte: Ergebnis 20260820-075413.md.
+ZUSCHLAG_FIXED_GIB = 2.0  # Sockel, unabhaengig von der Stromzahl -- siehe Nachtrag oben.
 ABTASTUNGEN = 3
 ABSTAND_S = 1.5
-SICHERHEITSFAKTOR = 1.5  # auf jede ANGENOMMENE KV-Zahl, bis sie gemessen ist.
+METAL_ARBEITSSATZ_GIB = 42.0  # Der Bezugswert von VLLM_METAL_MEMORY_FRACTION.
+# Nachtrag "vllm-metal als zweiter Motor" (2026-08-21). Diese Zahl ist NICHT der
+# Gesamtspeicher der Maschine (48 GiB) und auch nicht das, was gerade frei ist. Sie ist
+# `max_recommended_working_set_size` von Metal -- 42,0 GiB auf diesem Geraet -- und der
+# Motor vllm-metal rechnet SEIN Speicherbudget ausschliesslich daraus. Sein eigener
+# Speicherplan im Protokoll macht das nachrechenbar (Worker "nebenlauf", 20.08.2026):
+#
+#   metal_limit=45.10GB, fraction=0.5, usable_metal=22.55GB, model_memory=15.13GB,
+#   overhead=2.20GB, kv_budget_before_hybrid=5.22GB
+#
+# 45,10 dezimale GB sind genau 42,0 GiB, 22,55 GB genau 21,0 GiB -- also
+# Fraktion x METAL_ARBEITSSATZ_GIB, ohne Rest. Wer die Fraktion mit den 48 GiB der
+# Maschine verrechnet, bucht rund 14 % zu viel und bekommt zu frueh ein Nein.
+#
+# WARUM DIESER MOTOR EINE EIGENE BUCHUNGSART BRAUCHT und nicht die Formel oben durchlaeuft:
+# vllm-metal teilt sich sein Budget VORAB selbst zu (Gewichte, Overhead, KV-Budget in
+# einem Zug) und haelt es fuer die ganze Laufzeit, unabhaengig davon, wie viele Stroeme
+# tatsaechlich anliegen und wie lang der Kontext ist. Gewichte + Stroeme x Kontext x
+# KV-Bedarf zu rechnen waere fuer ihn eine zweite, konkurrierende Spitze neben der, die
+# er sich selbst gesetzt hat. Gebucht wird deshalb genau sein eigenes Budget:
+# `--metal-fraktion <f>` (siehe rechen_argumente) statt `--gewichte-gb`/`--kontext`.
+#
+# BELEGT IST DAS FUER FRAKTION 0,5: der ganze Prozess blieb dabei gemessen unter 21 GiB,
+# und 0,5 x 42,0 = 21,0. Fuer jede ANDERE Fraktion ist dieselbe Rechnung eine
+# Fortschreibung derselben Linie, keine eigene Messung -- die Richtung des moeglichen
+# Irrtums ist dabei die harmlose, weil das Budget die Obergrenze ist, die sich der Motor
+# selbst setzt, nicht ein Mittelwert.
+#
+# WARNUNG, die jeder kennen muss, der an der Fraktion dreht: vllm-metal setzt beim Start
+# `Set Metal wired_limit to 42.0 GB` -- AUCH bei kleiner Fraktion. Diese Zeile hebt die
+# Obergrenze fuer festverdrahteten Speicher auf das Maximum an, und genau dieser Hebel
+# steht in der Kernel-Panik-Geschichte vom 11.08. (siehe Kopfkommentar und
+# ~/Knowledge/10-global/incident-2026-08-11-kernel-panik-durch-gpu-speichermangel.md).
+# In der Messung ist nichts passiert, aber der Deckel steht darunter weit offen: die
+# Buchung hier ist die einzige Bremse, die dann noch greift. Wer die Fraktion erhoeht,
+# erhoeht damit auch, wieviel der Motor sich im Fehlerfall nehmen KANN, nicht nur, was er
+# sich vornimmt.
+PROMPT_CACHE_GB_JE_PLATZ = 0.47  # mlx_lm.servers eigener LRUPromptCache, PRO Platz.
+# DER DECKEL WIRD UEBERSCHRITTEN, UND ZWAR UM RUND DAS DOPPELTE (gemessen
+# 2026-08-21, Worker "eigenegefahr", zwei echte Laeufe gegen qwen38-27b unter
+# mlx_lm.server mit --log-level INFO, je acht verschiedene Anfragen zu 6353
+# Prompt-Token):
+#
+#   --prompt-cache-bytes = 1 GiB  ->  "Prompt Cache: 4 sequences, 2.28 GB"
+#   --prompt-cache-bytes = 2 GiB  ->  "Prompt Cache: 6 sequences, 3.42 GB",
+#                                     Spitze 3.74 GB
+#
+# Der Deckel WIRKT -- ohne ihn waechst der Cache weiter, mit ihm verdraengt er
+# (6 Sequenzen fielen auf 4 zurueck) und bleibt dann stehen. Er ist aber keine
+# harte Obergrenze: geprueft wird offenbar erst NACH dem Eintragen, und die
+# gemeldete Groesse liegt bei beiden Messpunkten rund beim Doppelten des
+# gesetzten Werts.
+#
+# Den Deckel eins zu eins zu buchen waere deshalb genau der gefaehrliche Fehler:
+# eine Buchung, die die Haelfte des wirklichen Bedarfs nennt. Gebucht wird
+# stattdessen Deckel x diesem Faktor. 2,2 statt 2,0, weil der ungueenstigere der
+# beiden Messpunkte bei 2,12 liegt (1 GiB Deckel, 2,28 GB = 2,12 GiB) -- der
+# Faktor muss ueber dem SCHLECHTESTEN gemessenen Verhaeltnis liegen, nicht ueber
+# dem Mittel.
+PROMPT_CACHE_DECKEL_FAKTOR = 2.2
+# Worker "nebenlauf", 20.08.2026: `mlx_lm.server --log-level INFO` meldete an einem
+# echten qwen38-27b-Server "Prompt Cache: 10 sequences, 2.24-2.25 GB" (voll besetzt,
+# ~1100 gecachte Prompt-Token je Sequenz -- roh 0,224 GiB/Platz bei DIESER Laenge).
+# Hochgerechnet auf die tatsaechlich betriebene, laengere Kontextstufe: 0,47 GiB je
+# Platz. Vorgabe der Bibliothek selbst ist 10 Plaetze, KEINE Byte-Grenze eingebaut --
+# siehe Kopfkommentar "PROMPT-CACHE-PLAETZE" oben fuer die volle Herleitung und wieso
+# das ein EIGENER Posten ist, kein Teil von ZUSCHLAG_JE_SEQUENZ_GIB.
+SICHERHEITSFAKTOR = 1.1  # auf jede ANGENOMMENE KV-Zahl, bis sie gemessen ist.
+# der Nutzer, 2026-08-19, Pruefer-Nachtrag: vorher 1,5. Ehrlichkeitspruefung gegen die
+# Paniknacht vom 11.08. (siehe ~/Knowledge/10-global/incident-2026-08-11-kernel-panik-
+# durch-gpu-speichermangel.md): dort war die angenommene KV-Konstante 0,11 MiB/Token,
+# gemessen waren es 1,05 MiB/Token — Faktor 9,5 daneben. Weder 1,5 noch 1,1 haetten das
+# aufgefangen; kein im Zehnerbereich vertretbarer Sicherheitsfaktor haette das je gekonnt.
+# Die Rettung dort war eine ECHTE Messung plus Notbremse/Sperrliste/Vorabreserve, nicht
+# dieser Faktor — der griff in jenem Vorfall ueberhaupt nicht (die eigene Messstrecke
+# `sweep.py` lief ausserhalb von wb-belegung, mit eigener Reserve).
+#
+# RICHTIGGESTELLT (zweiter Pruefer-Pass, Befund N3, 19.08.2026): hier stand bis zu
+# diesem Nachtrag, fuer alle heute aktiv genutzten Modelle sei die Aenderung wirkungslos,
+# weil deren KV-Werte "gemessen" seien und den Faktor gar nicht durchlaufen -- FALSCH,
+# zurecht bemaengelt. Nachgesehen in kv-bedarf.json: von den fuenf MLX-Eintraegen (grug,
+# die drei qwen38-Varianten) ist KEINER "gemessen" -- alle stehen auf "angenommen" (aus
+# der config.json hergeleitet, nicht unabhaengig gemessen) und durchlaufen den Faktor
+# sehr wohl, in kv_fuer() Fall 2, nicht Fall 1. Konkreter Effekt fuer qwen38-27b (das
+# heutige Standardmodell), bei 32768 Token und einer Sequenz: vorher (x 1,5) 0,09375
+# MiB/Token = 3,00 GiB Buchungsanteil; jetzt (x 1,1) 0,06875 MiB/Token = 2,20 GiB --
+# eine reale Senkung um 27% fuer genau das Modell, das gerade laeuft, nicht nur fuer ein
+# hypothetisches unbekanntes. "Gemessen" (Fall 1, faehrt den Faktor NICHT) trifft heute
+# nur auf den neuen Ollama-Messpunkt (qwen3:1.7b) zu und auf das eine GGUF-Modell, das
+# als "gemessen" eingetragen ist -- nicht auf die beiden MLX-Modelle, die dieser Server
+# tatsaechlich startet. Wer diese Konstante als naechstes anfasst: die Wirkungslos-
+# Behauptung gilt je nach Modell und muss an der HERKUNFT im konkreten kv-bedarf.json-
+# Eintrag geprueft werden, nicht pauschal unterstellt werden.
+#
+# WOGEGEN DIESER FAKTOR ABSICHERT, UND OB 1,1 DAFUER REICHT (Auftrag des Nutzers,
+# 19.08.2026, "ein Faktor, den niemand begruenden kann, ist beim naechsten Zweifel
+# genauso schnell wieder falsch gesetzt"): eine "angenommene" KV-Zahl ist reine
+# Architektur-Arithmetik aus der config.json (Lagenzahl, volle-Attention-Intervall,
+# KV-Koepfe, Kopfdimension, Datentyp) -- KEINE Messung am laufenden Server. Der
+# Faktor deckt die Luecke zwischen dieser Rechnung und dem, was mlx_lm.server zur
+# Laufzeit WIRKLICH allokiert: einen falsch angenommenen Datentyp (bf16 statt eines
+# anderen internen Formats), Ausrichtungs-/Auffuell-Bytes des Allokators, oder eine
+# interne Pufferung, die die reine K+V-Formel nicht erfasst. NICHT abgedeckt werden
+# muss hier der rekurrente/SSM-Zustand (qwen3_5-Hybridarchitektur) -- der ist ein
+# EIGENER, fester Posten und wird vom Zuschlag getragen (siehe wb-mlx-server), nicht
+# von diesem Faktor.
+#
+# GEMESSENE MLX-DATEN FUER GENAU DIESEN VERGLEICH GIBT ES NICHT -- ehrlich gesagt,
+# statt erfunden: kein qwen38-27b-Lauf unter mlx_lm.server wurde bisher unabhaengig
+# auf seinen realen KV-Speicherbedarf hin gemessen (deshalb "angenommen", nicht
+# "gemessen" -- siehe kv_fuer() oben). Was es gibt, ist eine INDIREKTE Gegenprobe der
+# reinen Arithmetik, kein Beleg fuer die Groesse einer etwaigen Laufzeit-Zusatzlast:
+# derselbe Architekturwert (16 volle Attention-Lagen, 4 KV-Koepfe, Kopfdimension 256)
+# wurde zweimal unabhaengig hergeleitet -- einmal aus mlx-lms config.json-Feldern
+# (0,0625 MiB/Token, bf16), einmal aus einem ECHTEN llama-server-Log an einem
+# kleineren Modell derselben Bauform, hochgerechnet auf 27B (0,0332 MiB/Token,
+# q8_0-Quantisierung: 1,0625 Byte statt 2 Byte je Element). Auf dieselbe Bitbreite
+# normiert (0,0332 x 2/1,0625 = 0,0625) stimmen beide EXAKT ueberein. Das bestaetigt,
+# dass die Architektur-Formel richtig gerechnet ist und in zwei unabhaengigen
+# Werkzeugen (mlx-lm, llama.cpp) zum selben Ergebnis fuehrt -- es bestaetigt NICHT,
+# dass mlx_lm.server zur Laufzeit keine zusaetzliche Reserve ueber die reine
+# K+V-Groesse hinaus braucht, weil beide Herleitungen dieselbe reine Formel ohne
+# Laufzeit-Zuschlag rechnen.
+#
+# EHRLICHES FAZIT: 1,1 ist NICHT messtechnisch als ausreichend belegt -- die Zahl ist
+# Lilleboars Abwaegung, keine Rechnung (seine eigenen Worte im vorigen Nachtrag oben:
+# "ob die Marge trotzdem reicht, ist eine Entscheidung, keine Rechnung"). Was diese
+# Entscheidung traegt, ohne sie zu einer Messung zu erklaeren: die vorige 1,5 war auf
+# eine falsche Analogie (KAT, ein voellig anderes, GQA-loses 8-Bit-Modell) aufgebaut
+# und haette selbst bei 1,5 den damaligen 9,5-fachen Fehler nicht aufgefangen -- die
+# Hoehe der alten Zahl war also selbst kein belegter Schutz. Die neuen Werte kommen
+# dagegen aus einer Architektur-Formel, deren reine Arithmetik oben gegengeprueft
+# ist; das verbleibende Risiko ist schmaler (Datentyp-/Allokator-Unschaerfe, nicht
+# eine falsche Architektur-Annahme) als das, wofuer 1,5 einmal gedacht war. Ob 10 %
+# Marge diese schmalere Unschaerfe deckt, ist NICHT gemessen. Wer das schliessen
+# will: qwen38-27b unter mlx_lm.server einmal mit einer echten Speichermessung vor
+# und nach dem Laden bei bekanntem Kontext fahren (dieselbe Median-Methode wie
+# check-resources selbst), den realen KV-Anteil eintragen als "gemessen" -- dann
+# durchlaeuft dieser Eintrag den Faktor gar nicht mehr, und die Frage erledigt sich
+# fuer dieses Modell von selbst.
 
 # OLLAMA (Nachtrag 16.08.): das Buch sah nur, was sich freiwillig eintraegt.
 # Zeitgleich zu einer einzigen eingetragenen Belegung (25,5 GiB MLX) fuehrte
@@ -234,7 +469,38 @@ SICHERHEITSFAKTOR = 1.5  # auf jede ANGENOMMENE KV-Zahl, bis sie gemessen ist.
 # Zustand, in dem Ollama ueberhaupt nicht gefragt wird -- auch mit 0,0 GiB in
 # die Summe; sichtbar bleibt es trotzdem, als `unbekannt` markiert, nicht als
 # `leer`.
+#
+# NACHTRAG vom 20.08.2026, zwei Befunde aus einem Echttest, der viermal
+# hintereinander scheiterte, bevor ueberhaupt ein Worker startete:
+#
+# ERSTENS, die GEGENPROBE (siehe ollama_widerspruch_pruefen() unten): Grenze B
+# zog eine STABILE Ollama-Ladung ab, deren Prozess laengst tot war, und
+# rechnete so 21,6 GiB verfuegbar -- waehrend `check-resources` zeitgleich 30
+# GiB frei mass. Die Fremdanzeige gewann, obwohl die eigene Messung daneben
+# lag, und der Widerspruch war messbar: ohne Phantom-Ladung ist Grenze A
+# rechnerisch IMMER <= Grenze B (die Grundlast, die nur Grenze A automatisch
+# sieht, zieht sie zusaetzlich nach unten -- siehe Herleitung dort). Grenze A
+# > Grenze B laesst sich also nur aus einer ueberhoehten Ollama-Meldung
+# erklaeren und wird jetzt LAUT gemeldet statt stillschweigend zugunsten der
+# Fremdanzeige aufgeloest -- eine so widerlegte Ladung zaehlt fuer Grenze B
+# nicht mehr mit.
+#
+# ZWEITENS, unabhaengig vom Buch: `ollama stop <modell>` meldete an derselben
+# Maschine Erfolg (Exit 0) und liess die Ladung UNVERAENDERT in `ollama ps`
+# stehen, auch das Beenden des zugehoerigen `llama-server`-Prozesses half
+# nicht. Erst `launchctl stop homebrew.mxcl.ollama` gab den Speicher wirklich
+# frei. Ob dahinter Ollama selbst oder ein Waechter davor steckt, ist
+# UNGEKLAERT und liegt vermutlich ausserhalb dieser Werkbank -- siehe
+# cmd_ollama_freigeben() weiter unten: der neue Unterbefehl `ollama-
+# freigeben` verlaesst sich deshalb nie auf den Erfolgs-Exit von `ollama
+# stop`, sondern MISST nach jedem Schritt neu nach.
 OLLAMA_STABIL_SCHWELLE_S = 300.0
+# Toleranz fuer die Gegenprobe oben: kleine Differenzen zwischen Grenze A und
+# Grenze B sind normales Messrauschen (Median ueber wenige Abtastungen), kein
+# Widerspruch. 1,0 GiB liegt deutlich unter jeder bisher beobachteten
+# Phantom-Ladung (6,4 GB im Befund vom 20.08.) und deutlich ueber der
+# Schwankung einer Median-Messung.
+OLLAMA_GEGENPROBE_TOLERANZ_GIB = 1.0
 
 # Der hoechste je gemessene KV-Bedarf, eingebaut, damit die Zahl mit dem Werkzeug
 # reist und nicht erst ausgerollt werden muss. Ein unbekanntes Modell wird an dieser
@@ -496,9 +762,26 @@ def check_resources_pfad():
         if not os.access(p, os.X_OK):
             fehler("WB_BELEGUNG_CHECK zeigt auf '%s' — dort ist nichts Ausfuehrbares." % p)
         return p
+    # NACHBARN STEHEN UNTER $HOME, NICHT DARUEBER (korrigiert 2026-08-21, nachdem
+    # genau das acht Zusagen in test-mlx-motorwahl.sh und test-entwerfer.sh
+    # umgeworfen hat). Der Gedanke war richtig -- ein Arbeitsbaum soll mit SEINEN
+    # Werkzeugen messen --, die Reihenfolge war falsch: In diesem Haus isoliert sich
+    # ein Test ueber ein eigenes HOME und legt seine Stellvertreter nach
+    # $HOME/.local/bin. Eine Suche, die den Nachbarn DAVOR stellt, hebelt jeden
+    # dieser Stellvertreter aus, ohne dass es jemand sieht -- die Tests riefen
+    # daraufhin das echte Werkzeug, massen den echten Speicher der Maschine, bekamen
+    # eine Absage und fingen eine leere Startzeile ab.
+    #
+    # Der Nachbar bleibt als RUECKFALL, fuer den Fall, dass gar nichts installiert
+    # ist. Wer aus einem Arbeitsbaum ausdruecklich gegen dessen eigenen Stand messen
+    # will, setzt die dafuer vorgesehene Variable -- eine Behauptung im Aufruf, nicht
+    # eine stille Vorfahrt im Pfad.
     eigen = os.path.join(HOME, ".local", "bin", "check-resources")
     if os.access(eigen, os.X_OK):
         return eigen
+    nebenan = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-resources")
+    if os.access(nebenan, os.X_OK):
+        return nebenan
     return shutil.which("check-resources") or ""
 
 
@@ -622,7 +905,20 @@ def ollama_aus_antwort(d):
     if lokal is False:
         eintraege = ollama_eintraege_lesen(ladungen)
         return "fremd", eintraege, grund or "der Port wird nicht von einem lokalen ollama bedient"
-    if grund:
+    # NACHTRAG 21.08.2026: 'lokal is not True' hier ist Absicht, nicht Zufall.
+    # Bis heute trug ausschliesslich ein UNSICHERER Befund einen Vermerk --
+    # 'grund' und "bestaetigt lokal" schlossen sich also gegenseitig aus, und
+    # "wenn ein Vermerk da ist, ist es unbekannt" traf zu, ohne dass diese
+    # Funktion 'lokal' dafuer je ansehen musste. Seit check-resources bei einem
+    # fremden Portnamen zusaetzlich prueft, ob hier ein echter Ollama-Laeufer
+    # laeuft (Bedarfsschaltung, z. B. wb-modell-proxy als Vordertuer), traegt
+    # auch der BESTAETIGT LOKALE Fall einen erklaerenden Vermerk -- der ist rein
+    # informativ (er steht in 'wer' als Klammertext neben der Ladung), keine
+    # Unsicherheit. Ohne dieses 'lokal is not True' wuerde jede Bedarfsschaltungs-
+    # Ladung hier faelschlich als UNBEKANNT gefuehrt und mit 0,0 GiB gezaehlt,
+    # obwohl sie bestaetigt lokal ist -- derselbe Fehlertyp wie der Anlass dieses
+    # ganzen Umbaus (unbekannt wird zu frei), nur einen Schritt weiter hinten.
+    if grund and lokal is not True:
         return "unbekannt", [], grund
     if not isinstance(ladungen, list):
         return "unbekannt", [], "ollama_loaded ist keine Liste"
@@ -768,6 +1064,227 @@ def frei_messen(abtastungen, abstand, beruhigen):
             "ollama": ollama}
 
 
+# -------------------------------------------------- Ollama frei bekommen
+#
+# Befund vom 20.08.2026 (siehe der lange Nachtrag bei OLLAMA_STABIL_SCHWELLE_S):
+# `ollama stop <modell>` meldete Erfolg (Exit 0) und liess die Ladung in `ollama
+# ps` unveraendert stehen, mit derselben Restlaufzeit wie davor -- auch das
+# Beenden des zugehoerigen `llama-server`-Prozesses half nicht, kurz danach war
+# die Ladung wieder da. Erst `launchctl stop homebrew.mxcl.ollama` gab den
+# Speicher wirklich frei (34,6 statt 27,2 GiB). Ob dahinter Ollama selbst oder
+# ein Waechter davor steckt, ist UNGEKLAERT -- diese Funktionen erfinden keine
+# Erklaerung dafuer. Was sie stattdessen tun: nach JEDEM Schritt neu messen,
+# nie dem Erfolgs-Exit eines Befehls glauben.
+
+OLLAMA_LAUNCHD_LABEL = "homebrew.mxcl.ollama"
+
+
+def ollama_binaer():
+    p = os.environ.get("WB_BELEGUNG_OLLAMA_BIN", "")
+    if p:
+        if not os.access(p, os.X_OK):
+            fehler("WB_BELEGUNG_OLLAMA_BIN zeigt auf '%s' — dort ist nichts Ausfuehrbares." % p)
+        return p
+    gefunden = shutil.which("ollama")
+    if gefunden:
+        return gefunden
+    for kandidat in ("/opt/homebrew/bin/ollama", "/usr/local/bin/ollama"):
+        if os.access(kandidat, os.X_OK):
+            return kandidat
+    return ""
+
+
+def launchctl_binaer():
+    p = os.environ.get("WB_BELEGUNG_LAUNCHCTL_BIN", "")
+    if p:
+        if not os.access(p, os.X_OK):
+            fehler("WB_BELEGUNG_LAUNCHCTL_BIN zeigt auf '%s' — dort ist nichts Ausfuehrbares." % p)
+        return p
+    return shutil.which("launchctl") or "/bin/launchctl"
+
+
+def ollama_jetzt():
+    """Eine EINZIGE, frische Abtastung der Ollama-Ladungen -- anders als
+    frei_messen() kein Median: hier zaehlt der Zustand JETZT, unmittelbar nach
+    einem Schritt, nicht ueber ein Zeitfenster geglaettet. (status, eintraege,
+    grund), siehe ollama_aus_antwort()."""
+    w = eine_abtastung(check_resources_pfad())
+    if not w:
+        return "unbekannt", [], "check-resources war nicht messbar"
+    return w[2]
+
+
+def ollama_ist_leer(status, eintraege):
+    """'leer' (nichts geladen) oder 'fremd' (auf dieser Maschine ohnehin nichts
+    zu holen) oder eine leere Liste zaehlen als frei -- 'unbekannt' NIE, siehe
+    UNBEKANNT IST NICHT FREI weiter oben: dort koennte etwas geladen sein, das
+    gerade nicht sichtbar ist, und genau das darf dieser Befehl nicht als
+    Erfolg verbuchen."""
+    return status in ("leer", "fremd") or (status == "ladungen" and not eintraege)
+
+
+def _fremdbefehl(binaer, argumente, frist=10.0):
+    """(rc, ausgabe) eines externen Befehls, nie laenger als frist Sekunden. rc
+    -1 heisst: er lief gar nicht erst an (Zeitueberschreitung oder fehlendes
+    Binaer) -- wird wie jeder andere Fehlschlag behandelt, nie wie ein Erfolg."""
+    try:
+        p = subprocess.run([binaer] + list(argumente), capture_output=True,
+                           text=True, timeout=frist)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return -1, str(exc)
+
+
+def cmd_ollama_freigeben(a):
+    """Ollama-Speicher verlaesslich freibekommen -- siehe der Nachtrag oben.
+
+    Ablauf, jeder Schritt mit einer FRISCHEN Messung verifiziert, nie mit dem
+    Exit-Code des vorigen Schritts zufrieden:
+      1. Nichts geladen -> nichts zu tun, sofortiger Erfolg.
+      2. 'ollama stop <modell>' fuer jede gemeldete Ladung, dann neu messen.
+      3. Steht danach noch etwas geladen (der Befund vom 20.08.), eskaliert auf
+         'launchctl stop homebrew.mxcl.ollama' und wartet bis zur Frist auf die
+         Bestaetigung, dass nichts mehr geladen ist.
+      4. Nach einer Eskalation zusaetzlich verifizieren, dass der DIENST wieder
+         antwortet -- launchd startet ihn wegen KeepAlive=true im Plist
+         (publish/vorlagen/services/launchd/homebrew.mxcl.ollama.plist) von
+         selbst neu; kommt er innerhalb der Frist nicht von selbst zurueck,
+         wird 'launchctl start' ausdruecklich nachgeholt. Ollama ist ein
+         Dienst, den der Nutzer auch anderweitig nutzt (Rahmen dieses Auftrags)
+         -- 'kurz anhalten' ja, 'abschalten lassen' nie.
+    Ist der Ollama-Zustand selbst nicht messbar (status 'unbekannt'), wird
+    NICHTS angefasst: ohne eine verlaessliche Vorher-Messung liesse sich ein
+    Nachher nicht von einem Zufall unterscheiden."""
+    schritte = []
+
+    def schritt(text):
+        schritte.append(text)
+        gib_aus("  " + text)
+
+    status, eintraege, grund = ollama_jetzt()
+    if status == "unbekannt":
+        gib_aus("Ollama-Zustand NICHT MESSBAR (%s) -- nichts wird angefasst, ohne "
+                "verifizieren zu koennen, ob es wirkte." % grund)
+        if a.json:
+            print(json.dumps({"ok": False, "grund": "unbekannt: %s" % grund,
+                              "schritte": schritte}, indent=2, ensure_ascii=False))
+        return 1
+    if ollama_ist_leer(status, eintraege):
+        gib_aus("Nichts geladen (%s) -- nichts zu tun." % status)
+        if a.json:
+            print(json.dumps({"ok": True, "schritte": ["nichts geladen (%s)" % status]},
+                             indent=2, ensure_ascii=False))
+        return 0
+
+    namen = sorted({e["name"] for e in eintraege if e.get("name")})
+    gib_aus("Ollama haelt %d Ladung(en): %s" % (len(namen), ", ".join(namen)))
+
+    ollama_bin = ollama_binaer()
+    if not ollama_bin:
+        schritt("kein 'ollama'-Binaer gefunden -- 'ollama stop' uebersprungen")
+    for name in namen:
+        if not ollama_bin:
+            break
+        rc, _aus = _fremdbefehl(ollama_bin, ["stop", name], frist=10.0)
+        schritt("ollama stop %s -> Exit %s" % (name, rc))
+
+    status, eintraege, _grund = ollama_jetzt()
+    if ollama_ist_leer(status, eintraege):
+        schritt("verifiziert: nichts mehr geladen nach 'ollama stop'")
+        if a.json:
+            print(json.dumps({"ok": True, "schritte": schritte, "eskaliert": False},
+                             indent=2, ensure_ascii=False))
+        return 0
+
+    gib_aus("  'ollama stop' meldete Erfolg, aber die Ladung steht noch -- der Befund "
+            "vom 20.08. Eskaliere auf launchctl.")
+    schritte.append("'ollama stop' wirkte nicht -- Ladung steht noch")
+
+    if os.uname().sysname != "Darwin":
+        gib_aus("Diese Maschine ist kein macOS -- die launchctl-Eskalation gibt es nur dort.")
+        schritte.append("keine launchctl-Eskalation ausserhalb macOS")
+        if a.json:
+            print(json.dumps({"ok": False, "schritte": schritte}, indent=2, ensure_ascii=False))
+        return 1
+
+    lc = launchctl_binaer()
+    rc, _aus = _fremdbefehl(lc, ["stop", OLLAMA_LAUNCHD_LABEL], frist=10.0)
+    schritt("launchctl stop %s -> Exit %s" % (OLLAMA_LAUNCHD_LABEL, rc))
+
+    frist_s = max(1.0, float(a.frist))
+    ende = time.monotonic() + frist_s
+    frei_verifiziert = False
+    while True:
+        status, eintraege, _grund = ollama_jetzt()
+        if ollama_ist_leer(status, eintraege):
+            frei_verifiziert = True
+            break
+        if time.monotonic() >= ende:
+            break
+        time.sleep(1.0)
+    if not frei_verifiziert:
+        gib_aus("NEIN: auch nach 'launchctl stop' steht innerhalb von %s s noch eine "
+                "Ladung -- 'frei' wird nicht gemeldet, ohne es verifiziert zu haben."
+                % zahl(frist_s))
+        schritte.append("innerhalb von %s s nach launchctl stop weiterhin geladen" % zahl(frist_s))
+        if a.json:
+            print(json.dumps({"ok": False, "schritte": schritte}, indent=2, ensure_ascii=False))
+        return 1
+    schritt("verifiziert: nichts mehr geladen nach 'launchctl stop'")
+
+    # KeepAlive=true im Plist soll den Dienst von selbst neu starten -- hier nur
+    # verifizieren, nicht blind annehmen. WICHTIG: 'leer' (status ueber
+    # check-resources) reicht dafuer NICHT -- check-resources meldet einen
+    # bestaetigt TOTEN Server ebenfalls als 'leer' (siehe UNBEKANNT IST NICHT
+    # FREI weiter oben: "ein toter Server haelt keinen Grafikspeicher"). 'leer'
+    # unterscheidet also nicht zwischen 'Dienst laeuft, nichts geladen' und
+    # 'Dienst ist tot' -- genau die Unterscheidung, die hier gebraucht wird.
+    # Verifiziert wird deshalb direkt am Binaer, mit demselben Befehl, den
+    # check-resources selbst zur Erreichbarkeitspruefung nutzt ('ollama ps').
+    if not ollama_bin:
+        schritt("kein 'ollama'-Binaer gefunden -- kann die Rueckkehr des Dienstes "
+                "nicht verifizieren")
+        dienst_zurueck = False
+    else:
+        def dienst_antwortet():
+            rc, _aus = _fremdbefehl(ollama_bin, ["ps"], frist=5.0)
+            return rc == 0
+
+        ende = time.monotonic() + frist_s
+        dienst_zurueck = False
+        while True:
+            if dienst_antwortet():
+                dienst_zurueck = True
+                break
+            if time.monotonic() >= ende:
+                break
+            time.sleep(1.0)
+        if not dienst_zurueck:
+            gib_aus("  Dienst kam nicht von selbst zurueck -- 'launchctl start %s'."
+                    % OLLAMA_LAUNCHD_LABEL)
+            _fremdbefehl(lc, ["start", OLLAMA_LAUNCHD_LABEL], frist=10.0)
+            ende = time.monotonic() + frist_s
+            while True:
+                if dienst_antwortet():
+                    dienst_zurueck = True
+                    break
+                if time.monotonic() >= ende:
+                    break
+                time.sleep(1.0)
+    schritte.append("Dienst wieder erreichbar" if dienst_zurueck
+                    else "Dienst innerhalb der Frist NICHT wieder erreichbar")
+    if dienst_zurueck:
+        gib_aus("Verifiziert: der Dienst antwortet wieder.")
+    else:
+        gib_aus("WARNUNG: der Speicher ist frei, aber der Dienst antwortet innerhalb von "
+                "%s s nicht wieder -- von Hand nachsehen (launchctl list | grep ollama)."
+                % zahl(frist_s))
+    if a.json:
+        print(json.dumps({"ok": dienst_zurueck, "schritte": schritte, "eskaliert": True,
+                          "dienst_zurueck": dienst_zurueck}, indent=2, ensure_ascii=False))
+    return 0 if dienst_zurueck else 1
+
+
 # ------------------------------------------------------------ KV-Bedarf
 
 def kv_registry():
@@ -823,6 +1340,18 @@ def kv_kandidaten(schluessel):
     return aus
 
 
+KV_QUANT_WERTE = ("off", "q8", "q4")
+
+
+def kv_quant_von(eintrag):
+    """Die Cache-Quantisierung eines Registereintrags, normalisiert. Ein Eintrag
+    ohne Vermerk gibt den leeren String zurueck -- 'nicht vermerkt' ist NICHT
+    dasselbe wie 'off', und die Antwort soll die beiden nicht verwechseln."""
+    w = (eintrag or {}).get("kv_quant") or ""
+    w = str(w).strip().lower()
+    return w if w in KV_QUANT_WERTE else ""
+
+
 def kv_fuer(modell):
     """(mib_je_token_effektiv, herkunft_klartext, roh, gemessen?).
 
@@ -845,7 +1374,31 @@ def kv_fuer(modell):
 
     Die Grenze, offen benannt: der Modellname ist eine BEHAUPTUNG des Aufrufers. Wer
     ein grosses Modell laedt und ein kleines nennt, kommt durch — dagegen hilft kein
-    Abgleich von Zeichenketten, sondern nur eine Messung nach dem Laden."""
+    Abgleich von Zeichenketten, sondern nur eine Messung nach dem Laden.
+
+    FUENFTER RUECKGABEWERT: die Cache-Quantisierung, UNTER DER dieser Wert gilt
+    (Nachtrag "quantisierter KV-Cache", 2026-08-21). Ein KV-Wert ohne sie ist eine
+    halbe Angabe: derselbe Kontext kostet in bf16 doppelt so viel wie in q8, und die
+    Hausregel schreibt seit dem 19.08. q8 vor (regeln/lokale-modelle.md). Ein
+    Aufrufer, der weiss, womit sein Motor gleich faehrt, gibt es mit --kv-quant an;
+    weicht es vom Eintrag ab, sagt die Antwort das LAUT, statt die Zahl still
+    zurechtzubiegen. Umgerechnet wird hier NICHTS: ein Faktor auf einen gemessenen
+    Wert waere wieder eine Annahme, und genau die soll die Messung ersetzen.
+    Leerer String heisst "nicht vermerkt" (jeder Eintrag vor diesem Nachtrag).
+
+    SECHSTER RUECKGABEWERT: True nur im ALLERLETZTEN Fall unten -- kein Eintrag
+    trifft exakt, keine lose Zuordnung (kv_kandidaten()) trifft irgendetwas, es
+    bleibt nur der Ersatzwert des hungrigsten gemessenen Modells (Nachtrag
+    "Namensverwechslung qwen38-27b/MTPLX", 2026-08-21, Befund: eine Buchung, die
+    einen Schluessel nicht findet, fiel bisher STILL auf diesen deutlich
+    groesseren Wert zurueck und lehnte danach ab, ohne zu sagen, dass sie raet --
+    ein Fehler, der wie eine Sicherheitsentscheidung aussieht. Die drei Faelle
+    DAVOR (exakter Treffer, auch unvermessen; lose Zuordnung) sind KEIN Raten ins
+    Blaue -- sie haengen an einem konkreten Eintrag, auch wenn seine Herkunft
+    'angenommen' ist, deshalb bleibt dieser Wert dort False. Die
+    Sicherheitsrichtung bleibt unveraendert: raten heisst weiterhin grosszuegig
+    raten, nicht knapp -- dieses Feld macht das Raten nur SICHTBAR, es senkt es
+    nicht."""
     modelle = kv_registry()
     hoechster = max([float(e["mib_je_token"]) for e in modelle.values()
                      if e.get("herkunft") == "gemessen"] + [KV_NOTFALL])
@@ -857,13 +1410,13 @@ def kv_fuer(modell):
         return (float(eintrag["mib_je_token"]),
                 "GEMESSEN an '%s'%s" % (schluessel,
                                         (", " + eintrag["wann"]) if eintrag.get("wann") else ""),
-                float(eintrag["mib_je_token"]), True)
+                float(eintrag["mib_je_token"]), True, kv_quant_von(eintrag), False)
     if eintrag:
         roh = float(eintrag["mib_je_token"])
         return (roh * SICHERHEITSFAKTOR,
                 "ANGENOMMEN fuer '%s' (%s MiB/Token x Sicherheitsfaktor %s)"
                 % (schluessel, zahl(roh, 2), zahl(SICHERHEITSFAKTOR, 1)),
-                roh, False)
+                roh, False, kv_quant_von(eintrag), False)
 
     for kandidat, wie in kv_kandidaten(schluessel):
         e = modelle.get(kandidat)
@@ -877,13 +1430,15 @@ def kv_fuer(modell):
                 "x Sicherheitsfaktor %s; eine lose Zuordnung darf nur erhoehen%s)"
                 % (wie, kandidat, zahl(roh, 2), e.get("herkunft", "?"),
                    zahl(SICHERHEITSFAKTOR, 1), gehoben),
-                roh, False)
+                roh, False, kv_quant_von(e), False)
 
     quelle = "unbekanntes Modell" if not schluessel else "Modell '%s' nicht eingetragen" % schluessel
     return (grundwert,
-            "ANGENOMMEN (%s: gerechnet mit dem hoechsten gemessenen Wert %s MiB/Token "
-            "x Sicherheitsfaktor %s)" % (quelle, zahl(hoechster, 2), zahl(SICHERHEITSFAKTOR, 1)),
-            hoechster, False)
+            "ANGENOMMEN — ERSATZWERT, KEIN TREFFER (%s: weder eine exakte Angabe noch eine lose "
+            "Zuordnung fanden einen Eintrag; gerechnet mit dem hoechsten gemessenen Wert %s "
+            "MiB/Token x Sicherheitsfaktor %s -- ein Ratewert, kein gemessener oder auch nur "
+            "zugeordneter)" % (quelle, zahl(hoechster, 2), zahl(SICHERHEITSFAKTOR, 1)),
+            hoechster, False, "", True)
 
 
 # --------------------------------------------------------------- das Buch
@@ -898,13 +1453,82 @@ def buch_schreiben(belegungen):
     atomar_schreiben(BUCH, {"version": 1, "belegungen": belegungen})
 
 
+def prozess_lstart(pid):
+    """Der exakte `ps -o lstart=`-Wert einer PID, oder leer, wenn sie nicht
+    (mehr) existiert. LC_ALL=C (nicht die Login-Locale) ist Absicht, nicht
+    Zufall: derselbe Wert muss bei 'geladen' (Registrierung) und bei jeder
+    spaeteren Pruefung dieselbe Zeichenkette liefern, egal unter welcher
+    LC_TIME gerade gelaufen wird -- exakt dieselbe Festlegung wie shell/
+    wb-nohup und shell/wb-waisen fuer denselben Zweck (siehe dort, 'PID-
+    WIEDERVERWENDUNG')."""
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    try:
+        p = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))],
+                            capture_output=True, text=True, timeout=3, env=env)
+    except (subprocess.TimeoutExpired, OSError, ValueError, TypeError):
+        return ""
+    return p.stdout.strip()
+
+
+def prozess_lebt(pid, lstart_pruefwert):
+    """True/False/None. None heisst 'nicht pruefbar' (keine PID oder kein
+    gespeicherter Pruefwert) -- das ist ausdruecklich KEIN Urteil, ein
+    Aufrufer darf None nie als 'tot' lesen. Der eigentliche Vergleich ist
+    derselbe wie in shell/wb-waisen: eine PID allein beweist nichts, sie
+    kann laengst zu einem ganz anderen Prozess gehoeren (PID-Wiederverwendung,
+    'lade_eigentuemer' dort) -- erst der exakte Startzeitpunkt bestaetigt,
+    dass es wirklich noch derselbe Prozess ist."""
+    if not pid or not lstart_pruefwert:
+        return None
+    jetzt = prozess_lstart(pid)
+    return bool(jetzt) and jetzt == lstart_pruefwert
+
+
+def prozess_tot(eintrag):
+    """True nur fuer eine REALISIERTE Belegung mit einer eingetragenen PID,
+    deren Prozess nachweislich nicht mehr derselbe ist (siehe prozess_lebt).
+
+    'laedt noch' (realisiert=False) bleibt IMMER unangetastet -- waehrend ein
+    Server gerade startet, laeuft er zu Recht noch nicht und hat trotzdem eine
+    gueltige Buchung (Auftrag 2026-08-21 abends, Punkt 3: genau dieser Zustand
+    trat bei jedem Fehlversuch der Kernel-Panik-Nacht auf; ihn als 'tot'
+    einzustufen wuerde einem startenden Server die Buchung unter den Fuessen
+    wegraeumen). Eine Belegung ohne PID (die meisten -- z. B. pi-workers
+    'eigene Sequenz', gebunden an einen tmux-Pane, nicht an eine Server-PID)
+    bleibt ebenso unangetastet: fuer sie gilt weiterhin ausschliesslich die
+    Pane-Lebendigkeit (zustand_bestimmen unten), die eigentliche Frage dieser
+    Funktion stellt sich fuer sie gar nicht."""
+    if not eintrag.get("realisiert"):
+        return False
+    pid = eintrag.get("prozess_pid")
+    if not pid:
+        return False
+    return prozess_lebt(pid, eintrag.get("prozess_lstart") or "") is False
+
+
 def zustand_bestimmen(eintrag, panes_je_socket):
-    """'offen' | 'ueberfaellig' | 'verfallen', plus ein Satz zur Begruendung.
+    """'offen' | 'ueberfaellig' | 'tot' | 'verfallen', plus ein Satz zur Begruendung.
 
     Das HARTE Kriterium ist der Pane. Die Frist ist die Warnung davor: sie macht
     eine Belegung ueberfaellig, sie raeumt sie nie ab. Nur ohne messbaren Pane
     entscheidet Frist + Karenz, sonst koennte eine vergessene Belegung die Maschine
-    dauerhaft sperren."""
+    dauerhaft sperren.
+
+    'tot' ist ein VIERTER, eigener Zustand (Nachtrag "Karteileiche", 2026-08-21
+    abends): eine Belegung mit eingetragener PID, deren Prozess nachweislich
+    nicht mehr laeuft (siehe prozess_tot) -- gemessen an einem MLX-Server, der
+    ohne Abschiedszeile starb, waehrend seine Buchung drei Stunden lang
+    unbeirrt als 'geladen' weiterlief und jede Vergabe (wb-belegung darf/nimm)
+    um ihre volle Groesse belastete. Bewusst NICHT wie 'verfallen' behandelt:
+    eine Anzeige, die Dinge von selbst verschwinden laesst, ist schwerer zu
+    verstehen als eine, die sagt, was sie sieht (Vorgabe des Nutzers) -- 'tot'
+    bleibt deshalb in der gueltigen Liste sichtbar (buch_pruefen raeumt es
+    NICHT weg, nur 'wb-belegung aufraeumen' tut das explizit), zaehlt aber
+    nirgends mehr in die Vergabe (siehe entscheiden()). PANE-Verfallenheit
+    wird weiterhin ZUERST geprueft und gewinnt, wenn beides zutrifft -- sie
+    entfernt ohnehin vollstaendig, ein zusaetzliches 'tot'-Etikett auf einem
+    bereits verschwindenden Eintrag waere ueberfluessig."""
     alter = jetzt() - float(eintrag.get("seit", 0))
     frist = float(eintrag.get("frist_s", FRIST_MIN * 60))
     karenz = float(eintrag.get("karenz_s", KARENZ_MIN * 60))
@@ -927,6 +1551,11 @@ def zustand_bestimmen(eintrag, panes_je_socket):
         if alter > frist + karenz:
             return "verfallen", ("kein Pane als Halter, und Frist samt Karenz sind "
                                  "seit %d min um" % minuten(alter - frist - karenz))
+    if prozess_tot(eintrag):
+        return "tot", ("Prozess (PID %s) laeuft nicht mehr -- die Belegung meldete "
+                       "'geladen', ihr Prozess ist aber nachweislich nicht mehr derselbe "
+                       "(neu gestartet, abgestuerzt, oder die PID laengst wiederverwendet)"
+                       % eintrag.get("prozess_pid"))
     if alter > frist:
         return "ueberfaellig", "die Frist ist seit %d min um" % minuten(alter - frist)
     return "offen", ""
@@ -934,7 +1563,12 @@ def zustand_bestimmen(eintrag, panes_je_socket):
 
 def buch_pruefen(belegungen):
     """(gueltige, entfernte). Bewertet jede Belegung genau einmal und haengt ihren
-    Zustand an — der Rest des Programms misst danach nicht noch einmal nach."""
+    Zustand an — der Rest des Programms misst danach nicht noch einmal nach.
+
+    'tot' bleibt bewusst in 'gueltige' (nicht 'entfernte') -- siehe
+    zustand_bestimmen(): sichtbar in wb-belegung wer, aber ausgeschlossen von
+    der Vergabe (entscheiden()); entfernt wird ein toter Eintrag ausschliesslich
+    durch 'wb-belegung aufraeumen'."""
     panes_je_socket = {}
     gueltig, entfernt = [], []
     for eintrag in belegungen:
@@ -974,11 +1608,36 @@ def belegungen_zeigen(gueltige):
         alter = minuten(jetzt() - float(e.get("seit", 0)))
         frist = float(e.get("frist_s", FRIST_MIN * 60))
         rest = minuten(float(e.get("seit", 0)) + frist - jetzt())
+        status = "geladen" if e.get("realisiert") else "laedt noch"
+        if e.get("_zustand") == "tot":
+            status = "TOT"
         gib_aus("  %-8s %8s GiB  %-12s %s"
-                % (e.get("id", "?"), zahl(e.get("gb", 0.0)),
-                   "geladen" if e.get("realisiert") else "laedt noch", halter_text(e)))
+                % (e.get("id", "?"), zahl(e.get("gb", 0.0)), status, halter_text(e)))
         gib_aus("           Zweck: %s" % (e.get("zweck") or "(nicht genannt)"))
-        if e.get("_zustand") == "ueberfaellig":
+        # Nachtrag 2026-08-21, zweiter Pruefpass: kv_ersatzwert stand bisher NUR in
+        # 'rechnung' (JSON) -- der eigene Kommentar bei cmd_nimm behauptete, das mache
+        # es "sichtbar auch im Buch", aber diese Funktion, die das Buch im Klartext
+        # zeigt, las das Feld nie. Wer 'wb-belegung wer' ohne --json liest, sah also
+        # nichts vom geratenen KV-Wert. Kurz gehalten (der volle Klartext steht nur in
+        # der Direktantwort von darf/nimm) -- Modellname und der eine Handgriff, der
+        # es behebt, reichen, um die Zeile ohne Nachschlagen zu verstehen.
+        if (e.get("rechnung") or {}).get("kv_ersatzwert"):
+            gib_aus("           KV-WERT GERATEN: kein Eintrag fuer '%s' in kv-bedarf.json "
+                    "getroffen -- gerechnet mit dem Ersatzwert des hungrigsten gemessenen "
+                    "Modells. Messen und eintragen: wb-belegung kv setzen %s <mib-je-token> "
+                    "--herkunft gemessen"
+                    % (e.get("modell") or "?", e.get("modell") or "<modell>"))
+        if e.get("auf_eigene_gefahr"):
+            gib_aus("           AUF EIGENE GEFAHR eingetragen — diese Belegung ist NICHT durch")
+            gib_aus("           die Pruefung gekommen, ein Mensch hat sie ausdruecklich gewollt.")
+        if e.get("_zustand") == "tot":
+            # TOT zaehlt nicht mehr in die Vergabe (entscheiden()), bleibt aber
+            # sichtbar stehen, bis 'wb-belegung aufraeumen' sie wirklich entfernt --
+            # eine Anzeige, die von selbst Dinge verschwinden laesst, ist schwerer
+            # zu verstehen als eine, die sagt, was sie sieht.
+            gib_aus("           %s -- zaehlt NICHT mehr in die Vergabe, aufraeumen um sie zu entfernen"
+                    % e.get("_grund", ""))
+        elif e.get("_zustand") == "ueberfaellig":
             h = e.get("halter") or {}
             gib_aus("           seit %d min, UEBERFAELLIG (%s)" % (alter, e.get("_grund", "")))
             if h.get("sitzung"):
@@ -990,31 +1649,164 @@ def belegungen_zeigen(gueltige):
 
 # ----------------------------------------------------------- die Rechnung
 
+def zuschlag_herleiten(parallel, ohne_sockel=False):
+    """Der Zuschlag fuer Prompt-Cache und Spitzen, GEBUNDEN an die tatsaechliche
+    Nebenlaeufigkeit DIESER Buchung -- nicht mehr ein fester Wert aus einer anderen
+    Betriebsart geliehen (Betriebsfehler 1, zweite Runde Prueferbefunde, 2026-08-19).
+
+    FIXKOSTEN-SOCKEL PLUS PRO-SEQUENZ-RATE (Worker "mlxsrv", 2026-08-20, siehe der
+    lange Nachtrag bei ZUSCHLAG_JE_SEQUENZ_GIB oben fuer die vollen Messwerte): die
+    fruehere Annahme reiner Proportionalitaet durch den Ursprung war ein bewusst
+    einfaches Modell aus EINEM historischen Messpunkt (sieben Sequenzen,
+    11.08.2026) und ist an drei ECHTEN Laeufen gegen einen echten qwen38-27b-Server
+    (1/4/8 gleichzeitige, verschiedene Anfragen) widerlegt: der benoetigte Zuschlag
+    waechst NICHT linear durch den Ursprung -- schon bei EINER Sequenz liegt er bei
+    rund 3,8 GiB, ein Sockel, der bei einem reinen Proportionalmodell fehlen wuerde
+    und die Buchung gerade beim haeufigsten Fall (ein einzelner Aufrufer, parallel=1)
+    unterschaetzt haette. Die Formel ist deshalb ZUSCHLAG_FIXED_GIB + parallel x
+    ZUSCHLAG_JE_SEQUENZ_GIB, mit der Steigung aus dem steilsten gemessenen Abschnitt
+    (eins auf vier Stroeme), damit die Buchung bei groesseren, NICHT gemessenen
+    Stromzahlen absichtlich zu grosszuegig statt zu knapp rechnet -- siehe die
+    Begruendung fuer sechzehn Stroeme im Nachtrag oben.
+
+    OHNE_SOCKEL (Nachtrag, Auftrag "der feste Sockel wird je Worker erneut
+    gebucht", 2026-08-20): ZUSCHLAG_FIXED_GIB ist Server-Fixkosten -- Metal-
+    Scratch-/Kompilierpuffer, die EINMAL je Server anfallen, nicht je Sequenz
+    und nicht je Aufrufer. In der Betriebsart, in der jeder Worker seine EIGENE
+    Sequenz einzeln bucht (BELEGUNG_PARALLEL=1, siehe pi-worker), zaehlte der
+    Sockel bisher bei JEDEM einzelnen `nimm`-Aufruf erneut -- beim Serverstart
+    UND bei jedem Worker obendrauf, real gemessen im Echttest vom 20.08.2026:
+    zwei durchgelaufene Worker plus Server standen mit 3x4,3 GiB Zuschlag statt
+    einmal im Buch, ein dritter und vierter Worker wurden deshalb bei ~40 GiB
+    abgelehnt, obwohl der wirkliche Bedarf bei rund 33 GiB lag. Wer den Sockel
+    TRAEGT, muss aus dem Aufruf hervorgehen: der Server bucht ihn beim Start
+    (ohne_sockel=False, die Vorgabe -- unveraendert fuer wb-mlx-server und
+    wb-llama-server), ein Worker, der sich an einen bereits laufenden Server
+    haengt (`--ohne-sockel`, siehe pi-worker), bucht nur seinen eigenen Anteil
+    an der Pro-Sequenz-Rate."""
+    n = max(1, int(parallel))
+    sockel = 0.0 if ohne_sockel else ZUSCHLAG_FIXED_GIB
+    return round(sockel + n * ZUSCHLAG_JE_SEQUENZ_GIB, 4)
+
+
 def spitze_rechnen(a):
-    """Die Spitze, nicht das Gewicht. Rueckgabe: (gb, zeilen, kv_herkunft)."""
+    """Die Spitze, nicht das Gewicht. Rueckgabe: (gb, zeilen, kv_herkunft, kv_ersatzwert)."""
     if a.gb is not None:
+        # Nachtrag "vllm-metal als zweiter Motor" (2026-08-21): dieselbe selbst genannte
+        # Spitze, aber mit ihrer Herkunft davor -- eine Zeile "selbst genannt, hier nicht
+        # nachgerechnet" waere fuer diesen Weg unwahr, die Zahl IST hier gerechnet.
+        # kv_ersatzwert bleibt hier IMMER False: dieser Weg rechnet gar kein KV (die Spitze
+        # kommt vom Aufrufer selbst), es gibt also nichts, wobei ein Schluessel raten koennte.
+        metal_fraktion = getattr(a, "metal_fraktion", None)
+        if metal_fraktion is not None:
+            return float(a.gb), [
+                "  Spitze     %s GiB = Metal-Arbeitssatz %s GiB x Fraktion %s "
+                "(VLLM_METAL_MEMORY_FRACTION)"
+                % (zahl(a.gb), zahl(METAL_ARBEITSSATZ_GIB), zahl(metal_fraktion, 2)),
+                "             vllm-metal teilt sich dieses Budget beim Start vorab selbst zu "
+                "und haelt es",
+                "             unabhaengig von Stroemen und Kontext -- deshalb KEINE "
+                "Gewichte-plus-KV-Rechnung.",
+                # Wortlaut der Protokollzeile, unveraendert zitiert (Punkt statt Komma):
+                # wer danach im Protokoll sucht, soll sie finden.
+                "             ACHTUNG: der Motor setzt beim Start 'Set Metal wired_limit to "
+                "42.0 GB', auch",
+                "             bei kleiner Fraktion. Diese Buchung ist dann die einzige "
+                "Bremse (11.08.).",
+            ], "keine (Budget des Motors, nicht KV-gerechnet)", False
         return float(a.gb), ["  Spitze     %s GiB (selbst genannt, hier nicht nachgerechnet)"
-                             % zahl(a.gb)], "keine (Spitze selbst genannt)"
+                             % zahl(a.gb)], "keine (Spitze selbst genannt)", False
     # Ohne max(0, …): die Werte sind in pruefe_rechnung() geprueft, und ein Klemmen
     # wuerde eine unsinnige Angabe wieder in eine stille Null verwandeln.
     gewichte = float(a.gewichte_gb)
+    # Entwerfer-Gewichte (Nachtrag 2026-08-20, "Vorhersage im Betrieb"):
+    # eigenes Feld statt vorab in --gewichte-gb hineingerechnet, damit die
+    # Zeile unten SICHTBAR macht, wieviel vom Ziel und wieviel vom Entwerfer
+    # kommt -- eine Belegung, die "20 GiB Gewichte" nur summiert zeigt, laesst
+    # nicht erkennen, ob das ein groesseres Ziel oder ein Ziel-plus-Entwerfer
+    # ist. Ein Entwerfer traegt seine eigene, sehr kleine KV-Last nicht extra
+    # in dieser Formel -- sein Fenster ist auf wenige Draft-Token begrenzt,
+    # winzig gegen das Ziel-Fenster, und wird vom Zuschlag mitgedeckt (siehe
+    # zuschlag_herleiten()), genau wie der rekurrente SSM-Zustand.
+    gewichte_entwerfer = float(getattr(a, "gewichte_entwerfer_gb", 0.0) or 0.0)
     parallel = int(a.parallel)
     kontext = int(a.kontext)
     zuschlag = float(a.zuschlag_gb)
-    kv_mib, herkunft, _roh, _gemessen = kv_fuer(a.modell)
+    # Prompt-Cache-Plaetze (Nachtrag "MTPLX im Betrieb", 2026-08-20): eigener
+    # Posten, siehe PROMPT_CACHE_GB_JE_PLATZ und den Kopfkommentar dort --
+    # NICHT Teil von zuschlag, sonst wuerde eine Belegung mit Cache-Buchung
+    # den Zuschlag-Wert unerklaert groesser zeigen, als zuschlag_herleiten()
+    # fuer dasselbe --parallel liefert.
+    # Ein DECKEL (--prompt-cache-gb) ist eine Tatsache ueber den Server, der
+    # gleich startet; eine Platzzahl mal angenommener Platzgroesse ist eine
+    # Schaetzung darueber, wie gross die Plaetze im Betrieb werden. Wo es einen
+    # Deckel gibt, gewinnt er (Nachtrag 2026-08-21).
+    cache_plaetze = int(getattr(a, "prompt_cache_plaetze", 0) or 0)
+    cache_deckel = getattr(a, "prompt_cache_gb", None)
+    if cache_deckel is not None:
+        cache_gib = float(cache_deckel) * PROMPT_CACHE_DECKEL_FAKTOR
+    else:
+        cache_gib = cache_plaetze * PROMPT_CACHE_GB_JE_PLATZ
+    kv_mib, herkunft, _roh, _gemessen, kv_quant_eintrag, kv_ersatzwert = kv_fuer(a.modell)
     kv_gib = parallel * kontext * kv_mib / MIB_JE_GIB
-    spitze = gewichte + kv_gib + zuschlag
-    zeilen = [
-        "  Spitze     %s GiB = Gewichte %s + KV-Cache %s + Zuschlag %s"
-        % (zahl(spitze), zahl(gewichte), zahl(kv_gib), zahl(zuschlag)),
+    spitze = gewichte + gewichte_entwerfer + kv_gib + zuschlag + cache_gib
+    if gewichte_entwerfer > 0:
+        zeilen = [
+            "  Spitze     %s GiB = Gewichte %s (Ziel) + %s (Entwerfer) + KV-Cache %s + Zuschlag %s"
+            % (zahl(spitze), zahl(gewichte), zahl(gewichte_entwerfer), zahl(kv_gib), zahl(zuschlag)),
+        ]
+    else:
+        zeilen = [
+            "  Spitze     %s GiB = Gewichte %s + KV-Cache %s + Zuschlag %s"
+            % (zahl(spitze), zahl(gewichte), zahl(kv_gib), zahl(zuschlag)),
+        ]
+    if cache_gib > 0:
+        zeilen[-1] += " + Prompt-Cache %s" % zahl(cache_gib)
+        if cache_deckel is not None:
+            zeilen.append("  Prompt-Cache %s GiB Deckel (mlx_lm.server --prompt-cache-bytes) "
+                          "x %s = %s GiB gebucht."
+                          % (zahl(float(cache_deckel)), zahl(PROMPT_CACHE_DECKEL_FAKTOR, 1),
+                             zahl(cache_gib)))
+            zeilen.append("             Der Faktor ist gemessen: der Deckel wirkt (der Cache "
+                          "verdraengt und bleibt stehen),")
+            zeilen.append("             haelt aber rund das Doppelte -- siehe "
+                          "PROMPT_CACHE_DECKEL_FAKTOR im Quelltext.")
+        else:
+            zeilen.append("  Prompt-Cache %d Plaetze x %s GiB/Platz (mlx_lm.servers eigene LRUPromptCache)"
+                          % (cache_plaetze, zahl(PROMPT_CACHE_GB_JE_PLATZ)))
+    zeilen += [
         "  KV-Cache   %d Anfragen x %d Token x %s MiB/Token"
         % (parallel, kontext, zahl(kv_mib, 2)),
         "             %s" % herkunft,
     ]
     if "ANGENOMMEN" in herkunft:
         zeilen.append("             einmal messen und eintragen: wb-belegung kv setzen "
-                      "%s <mib-je-token> --herkunft gemessen" % (a.modell or "<modell>"))
-    return spitze, zeilen, herkunft
+                      "%s <mib-je-token> --herkunft gemessen --kv-quant q8"
+                      % (a.modell or "<modell>"))
+    # Die Cache-Quantisierung (Nachtrag 2026-08-21). Sie wird NIE eingerechnet, nur
+    # verglichen und benannt: derselbe Kontext kostet in bf16 doppelt so viel wie in
+    # q8, und wer beides verwechselt, bucht entweder die Haelfte zu viel (harmlos,
+    # aber es sperrt Stufen, die passen wuerden -- genau der Fall vom 21.08.) oder
+    # die Haelfte zu wenig (der teure Fall). Ein Umrechnungsfaktor waere wieder eine
+    # Annahme; hier gilt der gemessene Wert fuer die Einstellung, unter der er
+    # gemessen wurde, und alles andere ist ein sichtbarer Widerspruch.
+    kv_quant_lauf = (getattr(a, "kv_quant", "") or "").strip().lower()
+    if kv_quant_eintrag:
+        zeilen.append("             KV-Cache-Quantisierung des Eintrags: %s" % kv_quant_eintrag)
+    if kv_quant_lauf:
+        if not kv_quant_eintrag:
+            zeilen.append("             ACHTUNG: der Motor faehrt den KV-Cache mit '%s', der "
+                          "Eintrag sagt nicht," % kv_quant_lauf)
+            zeilen.append("             wofuer seine Zahl gilt. Sie wird UNVERAENDERT gerechnet "
+                          "-- einmal unter '%s' messen" % kv_quant_lauf)
+            zeilen.append("             und mit --kv-quant %s eintragen." % kv_quant_lauf)
+        elif kv_quant_lauf != kv_quant_eintrag:
+            zeilen.append("             ACHTUNG: der Motor faehrt '%s', der Eintrag gilt fuer "
+                          "'%s'. Die Zahl wird" % (kv_quant_lauf, kv_quant_eintrag))
+            zeilen.append("             UNVERAENDERT gerechnet (kein stiller Umrechnungsfaktor) "
+                          "-- unter '%s' messen und" % kv_quant_lauf)
+            zeilen.append("             eintragen, sonst bucht diese Rechnung dauerhaft daneben.")
+    return spitze, zeilen, herkunft, kv_ersatzwert
 
 
 def nicht_geladen(gueltige):
@@ -1060,31 +1852,73 @@ def entscheiden(spitze_gb, gueltige, messung, reserve_gib, ohne_messung=False):
     Ollama-Zustand zaehlen mit 0,0 GiB -- sonst waere die Vergabe haerter als vor
     diesem Umbau, und genau das soll sie nicht sein.
 
-    Rueckgabe: (ja, verfuegbar, offen, grenze_a, grenze_b, grund)."""
-    offen = sum(float(e.get("gb", 0.0)) for e in gueltige) + ollama_stabile_summe(messung)
+    GEGENPROBE (Nachtrag 20.08., siehe der lange Kommentar bei OLLAMA_STABIL_
+    SCHWELLE_S): eine stabile Ollama-Ladung, deren Prozess in Wahrheit tot ist,
+    zieht Grenze B nach unten, ohne dass Grenze A das jemals bestaetigt --
+    Grenze A ist rechnerisch IMMER <= Grenze B, solange die Ollama-Meldung
+    stimmt (die unbekannte Grundlast des Systems, die nur Grenze A sieht, zieht
+    sie zusaetzlich nach unten; eine korrekt gemeldete Ollama-Last hebt diese
+    Ungleichung nicht auf). Grenze A > Grenze B laesst sich also nur aus einer
+    ueberhoehten Ollama-Meldung erklaeren. Tritt das ein, zaehlt die stabile
+    Ollama-Summe fuer DIESE Entscheidung nicht mehr mit -- die Fremdanzeige
+    gewinnt nie mehr stillschweigend gegen die eigene Messung -- und der
+    Widerspruch wird im vierten Rueckgabewert als Text mitgegeben, damit er
+    sichtbar wird statt nur intern zu korrigieren.
+
+    Rueckgabe: (ja, verfuegbar, offen, grenze_a, grenze_b, grund, widerspruch).
+
+    Zustand 'tot' zaehlt hier NICHT mit (Nachtrag "Karteileiche", 2026-08-21
+    abends): eine Belegung, deren Prozess nachweislich nicht mehr laeuft, ist
+    kein Speicherverbrauch mehr, den die Vergabe schuetzen muesste -- der
+    reale, gemessene freie Speicher (Grenze A) hat den Unterschied laengst
+    gesehen, nur das Buch (Grenze B) wusste es bisher nicht. buch_pruefen()
+    entfernt 'tot' bewusst NICHT aus 'gueltige' (sichtbar in wb-belegung wer,
+    siehe zustand_bestimmen), deshalb der Filter genau hier fuer Grenze B.
+    Grenze A (nicht_geladen(), unten in dieser Rechnung ueber 'gueltige'
+    aufgerufen) braucht KEINEN eigenen Filter: eine tote Belegung ist immer
+    'realisiert' (siehe prozess_tot()), nicht_geladen() zaehlt also ohnehin
+    nur unrealisierte Belegungen -- ein toter Eintrag war dort nie drin,
+    nicht weil hier gefiltert wird, sondern aus einem eigenen, unabhaengigen
+    Grund."""
+    offen = (sum(float(e.get("gb", 0.0)) for e in gueltige if e.get("_zustand") != "tot")
+             + ollama_stabile_summe(messung))
     if not messung["messbar"]:
         if not ohne_messung:
             return (False, None, offen, None, None,
                     "der freie Speicher ist NICHT MESSBAR (%s). Ein Ja waere geraten, "
-                    "und geraten wird hier nicht." % messung["quelle"])
+                    "und geraten wird hier nicht." % messung["quelle"], "")
         if not messung.get("gesamt_bekannt"):
             return (False, None, offen, None, None,
                     "weder der freie noch der Gesamtspeicher sind messbar — auch "
-                    "--ohne-messung hat dann nichts, worauf es sich stuetzen koennte.")
+                    "--ohne-messung hat dann nichts, worauf es sich stuetzen koennte.", "")
         grenze_b = messung["gesamt_gib"] - reserve_gib - offen
         return (spitze_gb <= grenze_b, grenze_b, offen, None, grenze_b,
-                "" if spitze_gb <= grenze_b else "")
+                "" if spitze_gb <= grenze_b else "", "")
     grenze_b = messung["gesamt_gib"] - reserve_gib - offen
     # Grenze A minus dem, was belegt, aber noch nicht im Speicher ist. Der gemessene
     # freie Speicher sieht ein ladendes Modell noch nicht — wer nur gegen ihn prueft,
     # vergibt denselben Speicher zweimal, solange das Ladefenster offen ist.
     grenze_a = messung["frei_gib"] - reserve_gib - nicht_geladen(gueltige)
+
+    widerspruch = ""
+    ollama_sum = ollama_stabile_summe(messung)
+    if ollama_sum > 0 and grenze_a > grenze_b + OLLAMA_GEGENPROBE_TOLERANZ_GIB:
+        widerspruch = (
+            "Ollama meldet %s GiB stabile Ladung, aber der wirklich gemessene freie "
+            "Speicher (Grenze A, %s GiB) ist HOEHER als die Buchrechnung MIT dieser "
+            "Ladung (Grenze B, %s GiB) -- sie taucht im echten freien Speicher nicht auf. "
+            "Ein Abzug fuer eine Ladung, die dort nicht auftaucht, ist falsch: sie zaehlt "
+            "hier NICHT."
+            % (zahl(ollama_sum), zahl(grenze_a), zahl(grenze_b)))
+        offen = offen - ollama_sum
+        grenze_b = messung["gesamt_gib"] - reserve_gib - offen
+
     verfuegbar = min(grenze_a, grenze_b)
-    return spitze_gb <= verfuegbar, verfuegbar, offen, grenze_a, grenze_b, ""
+    return spitze_gb <= verfuegbar, verfuegbar, offen, grenze_a, grenze_b, "", widerspruch
 
 
 def entscheidung_zeigen(spitze_gb, zeilen, gueltige, messung, reserve_gib,
-                        ja, verfuegbar, offen, grenze_a, grenze_b, grund=""):
+                        ja, verfuegbar, offen, grenze_a, grenze_b, grund="", widerspruch=""):
     for z in zeilen:
         gib_aus(z)
     if messung["messbar"]:
@@ -1095,6 +1929,8 @@ def entscheidung_zeigen(spitze_gb, zeilen, gueltige, messung, reserve_gib,
         gib_aus("  Grenze B   %s GiB = %s gesamt - %s Reserve - %s offen belegt "
                 "(Buch + stabile Ollama-Ladungen)"
                 % (zahl(grenze_b), zahl(messung["gesamt_gib"]), zahl(reserve_gib), zahl(offen)))
+        if widerspruch:
+            gib_aus("  WIDERSPRUCH  %s" % widerspruch)
         gib_aus("  Verfuegbar %s GiB (die kleinere der beiden)" % zahl(verfuegbar))
     else:
         gib_aus("  Frei       NICHT MESSBAR (%s)" % messung["quelle"])
@@ -1119,6 +1955,9 @@ def entscheidung_zeigen(spitze_gb, zeilen, gueltige, messung, reserve_gib,
     gib_aus()
     for z in ollama_zeigen(messung):
         gib_aus(z)
+    if widerspruch:
+        gib_aus("  (GEZAEHLT oben beschreibt nur die Frist-Stabilitaet -- fuer DIESE")
+        gib_aus("  Entscheidung zaehlt die Ladung wegen des Widerspruchs oben NICHT.)")
 
 
 def absage_erklaeren(ja, gueltige, messung, grund=""):
@@ -1174,6 +2013,87 @@ def antwort_json(ja, spitze_gb, verfuegbar, offen, messung, gueltige, extra=None
     print(json.dumps(d, indent=2, ensure_ascii=False))
 
 
+# ------------------------------------------- der Weg auf eigene Gefahr
+
+def wb_mensch_pfad():
+    p = os.path.join(HOME, ".local", "bin", "wb-mensch")
+    return p if os.access(p, os.X_OK) else (shutil.which("wb-mensch") or "")
+
+
+def mensch_oder_ende():
+    """`--auf-eigene-gefahr` ist eine BEHAUPTUNG und wird nie geglaubt -- gemessen
+    wird sie von `wb-mensch` an der Herkunft des Aufrufs, genau wie beim
+    Effort-Deckel und bei den Guards (siehe dort). Ein Agent, der den Schalter im
+    Quelltext liest und mitschickt, kommt damit nicht durch: er kann seine eigene
+    Elternkette nicht wegschreiben.
+
+    IM ZWEIFEL KEIN MENSCH. Ist `wb-mensch` nicht aufrufbar, gilt Nein -- die
+    andere Richtung waere ein Loch, das sich durch das blosse Loeschen einer Datei
+    aufmachen liesse."""
+    pfad = wb_mensch_pfad()
+    if not pfad:
+        fehler("'--auf-eigene-gefahr' braucht wb-mensch, und das ist hier nicht "
+               "aufrufbar (~/.local/bin/wb-mensch). Im Zweifel gilt: kein Mensch, "
+               "also kein Weg an der Buchung vorbei.")
+    try:
+        rc = subprocess.run([pfad, "pruefen"], timeout=15).returncode
+    except (OSError, subprocess.SubprocessError) as e:
+        fehler("'--auf-eigene-gefahr' braucht wb-mensch, und der Aufruf ist "
+               "gescheitert (%s). Im Zweifel gilt: kein Mensch." % e)
+    if rc == 0:
+        return
+    beleg = ""
+    try:
+        p = subprocess.run([pfad, "beleg"], capture_output=True, text=True, timeout=15)
+        beleg = (p.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    fehler("'--auf-eigene-gefahr' ist NUR fuer den Menschen — dieser Aufruf kommt "
+           "nicht von einem.\n"
+           "  Erkannt wurde: %s\n"
+           "  Der Weg gehoert an die Hand am Terminal und an die Auswahl in der "
+           "Oberflaeche, nicht in\n"
+           "  pi-worker, claude-worker oder wb-harness-run — und es gibt ihn "
+           "bewusst nicht als\n"
+           "  Umgebungsvariable, die sich beilaeufig setzen laesst.\n"
+           "  Diagnose: wb-mensch beleg ; wb-mensch ahnen"
+           % (beleg or "kein Beleg"))
+
+
+def gefahr_zeilen(spitze_gb, verfuegbar, grund=""):
+    """Was ein Mensch gesagt bekommt, bevor er trotzdem startet. Ausfuehrlich und
+    in ganzen Saetzen, absichtlich: hier ist Verkuerzung gefaehrlich."""
+    zeilen = [
+        "",
+        "  ======================================================================",
+        "  AUF EIGENE GEFAHR — diese Belegung waere ABGELEHNT worden.",
+        "",
+    ]
+    if grund:
+        zeilen.append("  Grund der Ablehnung: %s" % grund)
+    else:
+        zeilen.append("  Angefragt sind %s GiB Spitze, verfuegbar waeren %s GiB."
+                      % (zahl(spitze_gb),
+                         "nicht bestimmbar" if verfuegbar is None else zahl(verfuegbar)))
+    zeilen += [
+        "",
+        "  WAS PASSIEREN KANN: Am 10. und 11.08.2026 ist diese Maschine zweimal in",
+        "  zwei Stunden hart stehengeblieben — Kernel-Panik mit der Signatur",
+        "  'completeMemory() prepare count underflow @IOGPUMemory.cpp:550', ausgeloest",
+        "  aus einem MLX-Prozess. Beide Male standen zwei grosse GPU-Nutzer gleichzeitig.",
+        "  Genau diesen Zustand verhindert die Buchung, die hier gerade uebergangen wird.",
+        "  Stuerzt die Maschine ab, ist jede laufende Arbeit weg: offene Sitzungen,",
+        "  ungespeicherte Dateien, laufende Worker.",
+        "",
+        "  Die Zahl wird NICHT zurechtgebogen: gebucht wird %s GiB, also genau das,"
+        % zahl(spitze_gb),
+        "  was angefragt wurde.",
+        "  ======================================================================",
+        "",
+    ]
+    return zeilen
+
+
 # ------------------------------------------------------------ Unterbefehle
 
 def messung_holen(a):
@@ -1181,7 +2101,7 @@ def messung_holen(a):
 
 
 def cmd_darf(a):
-    spitze, zeilen, _ = spitze_rechnen(a)
+    spitze, zeilen, _kv_herkunft, kv_ersatzwert = spitze_rechnen(a)
     with Sperre():
         gueltige, entfernt = buch_pruefen(buch_lesen())
         pruefe_buch(gueltige)
@@ -1189,19 +2109,43 @@ def cmd_darf(a):
             buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
                             for e in gueltige])
         messung = messung_holen(a)
-        ja, verfuegbar, offen, ga, gb, grund = entscheiden(
+        ja, verfuegbar, offen, ga, gb, grund, widerspruch = entscheiden(
             spitze, gueltige, messung, a.reserve_gb, a.ohne_messung)
+    # Der Mensch darf die Buchung uebergehen, ein Agent nicht (der Nutzer, 2026-08-21).
+    # Die Ablehnung wird NICHT weggerechnet: sie steht weiter vollstaendig in der
+    # Ausgabe, sie hoert nur auf, ein Nein zu sein.
+    gefahr = bool(getattr(a, "auf_eigene_gefahr", False)) and not ja
+    warnzeilen = gefahr_zeilen(spitze, verfuegbar, grund) if gefahr else []
+    if gefahr:
+        ja = True
     if a.json:
         antwort_json(ja, spitze, verfuegbar, offen, messung, gueltige,
-                     {"verfallen": [e.get("id") for e in entfernt], "grund": grund})
+                     {"verfallen": [e.get("id") for e in entfernt], "grund": grund,
+                      "ollama_widerspruch": widerspruch or None,
+                      "auf_eigene_gefahr": gefahr or None,
+                      "warnung_eigene_gefahr": "\n".join(z.strip() for z in warnzeilen if z.strip()) or None,
+                      # Ein Schluessel, der keinen Treffer fand, faellt auf den grossen
+                      # Ersatzwert zurueck und lehnt dann ab, OHNE zu sagen, dass er raet --
+                      # gefaehrlich, weil das wie eine Sicherheitsentscheidung aussieht
+                      # (Nachtrag "Namensverwechslung qwen38-27b/MTPLX", 2026-08-21). Feld
+                      # UND Klartext, kein Feld allein: wer nur "true" sieht, muss noch immer
+                      # in den Quelltext schauen, um zu verstehen, wovor er warnt.
+                      "kv_ersatzwert": True if kv_ersatzwert else None,
+                      "kv_ersatzwert_hinweis": ("kein Eintrag fuer diesen Modell-Schluessel "
+                          "getroffen (weder exakt noch lose zugeordnet) -- gerechnet mit dem "
+                          "Ersatzwert des hungrigsten gemessenen Modells, absichtlich "
+                          "grosszuegig. Richtiger Schluessel gesucht? Siehe 'wb-belegung kv "
+                          "liste'.") if kv_ersatzwert else None})
         return 0 if ja else 1
     gib_aus("%s — %s GiB Spitze angefragt%s"
             % ("JA" if ja else "NEIN",
                zahl(spitze),
                "" if verfuegbar is None else (", %s GiB verfuegbar" % zahl(verfuegbar))))
+    for z in warnzeilen:
+        gib_aus(z)
     gib_aus()
     entscheidung_zeigen(spitze, zeilen, gueltige, messung, a.reserve_gb,
-                        ja, verfuegbar, offen, ga, gb, grund)
+                        ja, verfuegbar, offen, ga, gb, grund, widerspruch)
     if entfernt:
         gib_aus()
         for e in entfernt:
@@ -1215,7 +2159,7 @@ def cmd_nimm(a):
         fehler("--zweck fehlt. Eine Belegung ohne Zweck kann niemand beurteilen.")
     pruefe_zahl(a.frist, "--frist", 0)
     pruefe_zahl(a.karenz, "--karenz", 0)
-    spitze, zeilen, kv_herkunft = spitze_rechnen(a)
+    spitze, zeilen, kv_herkunft, kv_ersatzwert = spitze_rechnen(a)
     halter = eigener_halter()
     if a.halter:
         halter["etikett"] = a.halter
@@ -1223,8 +2167,15 @@ def cmd_nimm(a):
         gueltige, entfernt = buch_pruefen(buch_lesen())
         pruefe_buch(gueltige)
         messung = messung_holen(a)
-        ja, verfuegbar, offen, ga, gb, grund = entscheiden(
+        ja, verfuegbar, offen, ga, gb, grund, widerspruch = entscheiden(
             spitze, gueltige, messung, a.reserve_gb, a.ohne_messung)
+        # Siehe cmd_darf: der Mensch darf uebergehen, ein Agent nicht. Die Belegung
+        # traegt danach ein eigenes Merkmal, damit `wer` und jeder spaetere Leser
+        # sehen, dass diese eine Zahl NICHT durch die Pruefung gekommen ist.
+        gefahr = bool(getattr(a, "auf_eigene_gefahr", False)) and not ja
+        warnzeilen = gefahr_zeilen(spitze, verfuegbar, grund) if gefahr else []
+        if gefahr:
+            ja = True
         neu = None
         if ja:
             neu = {
@@ -1232,9 +2183,27 @@ def cmd_nimm(a):
                 "gb": round(spitze, 3),
                 "zweck": a.zweck,
                 "modell": a.modell or "",
-                "rechnung": {"gewichte_gb": a.gewichte_gb, "parallel": a.parallel,
+                # metal_fraktion (Nachtrag "vllm-metal als zweiter Motor",
+                # 2026-08-21): bei dieser Buchungsart ist sie die EINZIGE Zahl,
+                # aus der sich die Spitze nachrechnen laesst -- gewichte_gb ist
+                # dann leer, und kontext/parallel stehen zwar im Buch (der
+                # Aufrufer nennt sie, weil `status` sie anzeigt), gehen aber
+                # nicht in die Spitze ein. Ohne diesen Eintrag waere die
+                # Herkunft der Zahl nach dem Aufruf nicht mehr auffindbar.
+                "rechnung": {"gewichte_gb": a.gewichte_gb,
+                             "gewichte_entwerfer_gb": a.gewichte_entwerfer_gb,
+                             "parallel": a.parallel,
                              "kontext": a.kontext, "zuschlag_gb": a.zuschlag_gb,
-                             "kv_herkunft": kv_herkunft},
+                             "prompt_cache_plaetze": a.prompt_cache_plaetze,
+                             "prompt_cache_gb": getattr(a, "prompt_cache_gb", None),
+                             "metal_fraktion": getattr(a, "metal_fraktion", None),
+                             "kv_herkunft": kv_herkunft,
+                             # Sichtbar auch im Buch, nicht nur in der Direktantwort
+                             # (Nachtrag "Namensverwechslung qwen38-27b/MTPLX",
+                             # 2026-08-21): wer spaeter 'wb-belegung wer' liest, soll
+                             # sehen, dass eine bestehende Buchung auf dem Ersatzwert
+                             # steht, ohne den Klartext in kv_herkunft parsen zu muessen.
+                             "kv_ersatzwert": bool(kv_ersatzwert)},
                 "seit": jetzt(),
                 "seit_iso": iso(jetzt()),
                 # Solange das Modell laedt, sieht die Messung seinen Speicher noch
@@ -1245,23 +2214,69 @@ def cmd_nimm(a):
                 "frist_s": int(a.frist) * 60,
                 "karenz_s": int(a.karenz) * 60,
                 "halter": halter,
+                # Nicht kosmetisch: eine Belegung, die die Pruefung uebergangen hat,
+                # muss als solche im Buch stehen. Wer spaeter fragt, warum die
+                # Maschine voll ist, soll es hier sehen und nicht rekonstruieren
+                # muessen.
+                "auf_eigene_gefahr": bool(gefahr),
             }
             gueltige = gueltige + [neu]
         buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
                         for e in gueltige])
     if a.json:
+        # Befund N5, zweiter Pruefer-Pass, 19.08.2026: die ACHTUNG-Warnung
+        # unten lief bisher NUR im Text-Zweig -- ein Aufrufer mit --json
+        # (z.B. pi-worker fuer jede Worker-Sequenz) hat sie NIE gesehen,
+        # obwohl er derselbe Fall ist: ohne messbaren Pane ist die Frist das
+        # einzige Kriterium, und ohne Gegenmassnahme verfaellt die Buchung,
+        # waehrend die Sequenz weiterlaeuft -- der dokumentierte Weg in den
+        # Speichermangel. Jetzt auch im JSON sichtbar. Empfohlene
+        # Gegenmassnahme seit demselben Nachtrag: 'wb-belegung uebernehmen
+        # <kennung>' EINMAL aus dem tatsaechlich lang lebenden Pane des
+        # Workers aufgerufen, sobald der existiert -- haengt die Belegung an
+        # dessen Lebendigkeit (Tatsache), nicht an eine periodische
+        # Erneuerung (Versprechen, das eine tote/verzoegerte Schleife
+        # brechen kann). 'verlaengern' bleibt der Rueckfall fuer Faelle ganz
+        # ohne einen solchen Pane.
+        warnung = None
+        if ja and not halter.get("pane"):
+            warnung = ("kein tmux-Pane als Halter messbar — Frist %d min + Karenz %d min sind "
+                       "das einzige Kriterium. Empfohlen: 'wb-belegung uebernehmen %s' EINMAL "
+                       "aus dem tatsaechlichen Worker-Pane aufrufen, sobald er existiert -- "
+                       "haengt die Belegung an dessen Lebendigkeit statt an ein Frist-"
+                       "Versprechen. Ohne das verfaellt diese Belegung von selbst, auch wenn "
+                       "die Sequenz noch laeuft.") % (int(a.frist), int(a.karenz), neu["id"])
         antwort_json(ja, spitze, verfuegbar, offen, messung, gueltige,
-                     {"kennung": neu["id"] if neu else None, "grund": grund})
+                     {"kennung": neu["id"] if neu else None, "grund": grund,
+                      "warnung": warnung, "ollama_widerspruch": widerspruch or None,
+                      "auf_eigene_gefahr": gefahr or None,
+                      "warnung_eigene_gefahr": "\n".join(z.strip() for z in warnzeilen if z.strip()) or None,
+                      # Siehe cmd_darf fuer die Begruendung: Feld UND Klartext, sichtbar
+                      # auch dann, wenn diese Anfrage abgelehnt wird (kv_ersatzwert haengt
+                      # nur am Modell-Schluessel, nicht am ja/nein der Buchung).
+                      "kv_ersatzwert": True if kv_ersatzwert else None,
+                      "kv_ersatzwert_hinweis": ("kein Eintrag fuer diesen Modell-Schluessel "
+                          "getroffen (weder exakt noch lose zugeordnet) -- gerechnet mit dem "
+                          "Ersatzwert des hungrigsten gemessenen Modells, absichtlich "
+                          "grosszuegig. Richtiger Schluessel gesucht? Siehe 'wb-belegung kv "
+                          "liste'.") if kv_ersatzwert else None})
         return 0 if ja else 1
+    for z in warnzeilen:
+        gib_aus(z)
     if ja:
-        gib_aus("BELEGT: %s GiB unter der Kennung %s, Frist %d min."
-                % (zahl(spitze), neu["id"], int(a.frist)))
+        gib_aus("BELEGT%s: %s GiB unter der Kennung %s, Frist %d min."
+                % (" AUF EIGENE GEFAHR" if gefahr else "",
+                   zahl(spitze), neu["id"], int(a.frist)))
         gib_aus("  Sobald das Modell IM Speicher steht: wb-belegung geladen %s" % neu["id"])
         gib_aus("  Freigeben, sobald es wieder heraus ist:  wb-belegung gib %s" % neu["id"])
         if not halter.get("pane"):
             gib_aus("  ACHTUNG: kein tmux-Pane als Halter messbar. Hier ist die Frist das")
             gib_aus("  harte Kriterium — nach Frist + Karenz (%d min) verfaellt die Belegung"
                     % int(a.karenz))
+            gib_aus("  Empfohlen: 'wb-belegung uebernehmen %s' EINMAL aus dem tatsaechlichen"
+                    % neu["id"])
+            gib_aus("  Arbeits-Pane aufrufen, sobald er existiert -- haengt die Belegung an")
+            gib_aus("  dessen Lebendigkeit statt an ein Frist-Versprechen.")
             gib_aus("  von selbst, auch wenn Dein Lauf noch laeuft.")
         gib_aus()
     else:
@@ -1270,7 +2285,7 @@ def cmd_nimm(a):
                    "" if verfuegbar is None else (", nur %s GiB verfuegbar" % zahl(verfuegbar))))
         gib_aus()
     entscheidung_zeigen(spitze, zeilen, gueltige, messung, a.reserve_gb,
-                        ja, verfuegbar, offen, ga, gb, grund)
+                        ja, verfuegbar, offen, ga, gb, grund, widerspruch)
     absage_erklaeren(ja, gueltige, messung, grund)
     return 0 if ja else 1
 
@@ -1295,19 +2310,31 @@ def cmd_wer(a):
                        if ollama_status in ("ladungen", "fremd") else [])
     ollama_gezaehlt = (sum(e["gb"] for e in ollama_bewertet if e["stabil"])
                        if ollama_status == "ladungen" else 0.0)
+    # 'summe_gib' zaehlt 'tot' NICHT mit (Nachtrag "Karteileiche", 2026-08-21
+    # abends) -- dieselbe Zahl, die entscheiden() der Vergabe zugrunde legt.
+    # Eine Karteileiche bleibt in 'belegungen'/gueltige sichtbar (jeder Eintrag
+    # traegt sein eigenes _zustand), zaehlt aber nicht mehr mit in die eine
+    # Zahl, die jeder Leser zuerst sieht -- sonst behauptet genau diese Zeile
+    # weiterhin, was den Anlass fuer diesen Nachtrag gab (drei Stunden lang
+    # 23,4 GiB "belegt", waehrend nichts lief).
+    tot_gib = sum(float(e.get("gb", 0.0)) for e in gueltige if e.get("_zustand") == "tot")
+    summe = sum(float(e.get("gb", 0.0)) for e in gueltige if e.get("_zustand") != "tot")
     if a.json:
         print(json.dumps({"belegungen": gueltige,
                           "verfallen": [{"id": e.get("id"), "grund": e.get("_grund")}
                                         for e in entfernt],
-                          "summe_gib": round(sum(float(e.get("gb", 0.0)) for e in gueltige), 3),
+                          "summe_gib": round(summe, 3),
+                          "tot_gib": round(tot_gib, 3),
                           "ollama_status": ollama_status,
                           "ollama_grund": ollama_grund,
                           "ollama_ladungen": ollama_bewertet,
                           "ollama_gezaehlt_gib": round(ollama_gezaehlt, 3)},
                          indent=2, ensure_ascii=False))
         return 0
-    summe = sum(float(e.get("gb", 0.0)) for e in gueltige)
-    gib_aus("Offene Belegungen: %d, zusammen %s GiB (Buch)" % (len(gueltige), zahl(summe)))
+    gib_aus("Offene Belegungen: %d, zusammen %s GiB (Buch)%s"
+            % (len(gueltige), zahl(summe),
+               "" if tot_gib <= 0 else (" -- davon %s GiB TOT, zaehlt nicht mehr mit, "
+                                        "'wb-belegung aufraeumen' entfernt sie" % zahl(tot_gib))))
     belegungen_zeigen(gueltige)
     for e in entfernt:
         gib_aus("  verfallen: %s (%s)" % (e.get("id"), e.get("_grund")))
@@ -1326,7 +2353,7 @@ def cmd_gib(a):
         fehler("--eigene braucht einen eigenen tmux-Pane, sonst waere 'eigene' nicht von "
                "'alle ohne Pane' zu unterscheiden. Gib die Kennung an.")
     with Sperre():
-        gueltige, _ = buch_pruefen(buch_lesen())
+        gueltige, entfernt = buch_pruefen(buch_lesen())
         bleiben, weg = [], []
         for e in gueltige:
             fremder_pane = (e.get("halter") or {}).get("pane", "")
@@ -1343,11 +2370,27 @@ def cmd_gib(a):
                 fehler("die Belegung %s gehoert %s, nicht Dir. Wenn Du sicher bist, dass "
                        "sie tot ist: --fremd." % (e.get("id"), halter_text(e)), code=1)
             weg.append(e)
+        # Verfallenes IMMER schreiben, auch wenn dieser Aufruf selbst nichts trifft
+        # (Fehler 2/3, Auftrag 2026-08-20): bisher endete die Funktion bei leerem
+        # 'weg' VOR buch_schreiben() -- eine Belegung, deren Pane laengst tot war
+        # (buch_pruefen() oben stuft sie deshalb schon als 'verfallen' ein und
+        # nimmt sie aus 'gueltige' heraus), blieb dadurch trotzdem auf der Platte
+        # stehen, solange 'gib' sie nicht selbst per Kennung/--eigene fand. Genau
+        # das hat wb-mlx-servers 'gib <kennung>' dann als 'beide Versuche
+        # gescheitert' gemeldet: der erste Versuch traf 'nichts freizugeben' (die
+        # Belegung war schon aus 'gueltige' raus), der zweite (--fremd) ebenso --
+        # keiner der beiden schrieb je das bereinigte Buch.
+        if entfernt or weg:
+            buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
+                            for e in bleiben])
         if not weg:
+            bereits_verfallen = next((e for e in entfernt if a.kennung and e.get("id") == a.kennung), None)
+            if bereits_verfallen:
+                gib_aus("Bereits verfallen: %s (%s) -- Buch bereinigt, nichts mehr freizugeben."
+                        % (a.kennung, bereits_verfallen.get("_grund", "")))
+                return 0
             print("wb-belegung: nichts freizugeben.", file=sys.stderr)
             return 1
-        buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
-                        for e in bleiben])
     for e in weg:
         gib_aus("Freigegeben: %s (%s GiB, %s)" % (e.get("id"), zahl(e.get("gb", 0.0)),
                                                   e.get("zweck") or ""))
@@ -1357,13 +2400,28 @@ def cmd_gib(a):
 def cmd_geladen(a):
     """Der Halter meldet, dass sein Modell jetzt wirklich im Speicher steht. Ab da
     sieht die Messung den Speicher selbst, und die Belegung wird nicht mehr zusaetzlich
-    von Grenze A abgezogen."""
+    von Grenze A abgezogen.
+
+    --pid (Nachtrag "Karteileiche", 2026-08-21 abends): genau HIER, im Moment, in
+    dem der Aufrufer die Lebendigkeit gerade selbst bestaetigt hat (Health-Probe
+    o.ae. bereits gelaufen), laesst sich der Startzeitpunkt der PID einfangen --
+    derselbe Pruefwert, den shell/wb-nohup bei seiner eigenen Registrierung
+    einfaengt (siehe dort, 'PID-WIEDERVERWENDUNG'). Ohne --pid bleibt die Belegung
+    wie bisher: ihre einzige Lebendigkeits-Pruefung ist der Pane des Halters."""
     halter = eigener_halter()
     if a.eigene and not halter.get("pane"):
         fehler("--eigene braucht einen eigenen tmux-Pane, sonst ist 'eigene' nicht von "
                "'alle ohne Pane' zu unterscheiden. Gib die Kennung an.")
+    pid = int(getattr(a, "pid", 0) or 0)
+    lstart = prozess_lstart(pid) if pid else ""
+    if pid and not lstart:
+        err_txt = ("WARNUNG: --pid %d liess sich nicht bestaetigen (Prozess nicht mehr da) -- "
+                   "die Belegung wird trotzdem als geladen markiert, aber ohne PID-Merkmal "
+                   "eingetragen.") % pid
+        print(err_txt, file=sys.stderr)
+        pid = 0
     with Sperre():
-        gueltige, _ = buch_pruefen(buch_lesen())
+        gueltige, entfernt = buch_pruefen(buch_lesen())
         getroffen = []
         for e in gueltige:
             eigen = (halter.get("pane") and
@@ -1373,8 +2431,17 @@ def cmd_geladen(a):
                     continue
                 e["realisiert"] = True
                 e["realisiert_iso"] = iso(jetzt())
+                if pid:
+                    e["prozess_pid"] = pid
+                    e["prozess_lstart"] = lstart
                 getroffen.append(e)
         if not getroffen:
+            # Verfallenes trotzdem schreiben (dieselbe Luecke wie in cmd_gib,
+            # Fehler 2/3, Auftrag 2026-08-20): sonst bleibt eine Belegung mit
+            # totem Pane im Buch, nur weil dieser Aufruf sie nicht selbst traf.
+            if entfernt:
+                buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
+                                for e in gueltige])
             print("wb-belegung: keine ladende Belegung getroffen.", file=sys.stderr)
             return 1
         buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
@@ -1388,7 +2455,7 @@ def cmd_geladen(a):
 def cmd_verlaengern(a):
     pruefe_zahl(a.frist, "--frist", 0)
     with Sperre():
-        gueltige, _ = buch_pruefen(buch_lesen())
+        gueltige, entfernt = buch_pruefen(buch_lesen())
         getroffen = None
         for e in gueltige:
             if e.get("id") == a.kennung:
@@ -1399,6 +2466,11 @@ def cmd_verlaengern(a):
                 e["frist_s"] = int(a.frist) * 60
                 getroffen = e
         if not getroffen:
+            # Verfallenes trotzdem schreiben, dieselbe Luecke wie in cmd_gib
+            # (Fehler 2/3, Auftrag 2026-08-20).
+            if entfernt:
+                buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
+                                for e in gueltige])
             print("wb-belegung: keine Belegung mit der Kennung '%s'." % a.kennung, file=sys.stderr)
             return 1
         buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
@@ -1407,20 +2479,96 @@ def cmd_verlaengern(a):
     return 0
 
 
-def cmd_aufraeumen(a):
+def cmd_uebernehmen(a):
+    """Haengt eine bestehende Belegung an den GERADE AUFRUFENDEN Pane, statt an
+    ihren urspruenglichen Halter (Befund N5, zweiter Pruefpass, 2026-08-19:
+    "die Verlaengerung soll am Leben des Workers haengen, nicht an einem
+    Versprechen").
+
+    DER FALL, DEN DAS LOEST: `nimm` liest den Halter-Pane aus der Umgebung DES
+    AUFRUFERS ZUM ZEITPUNKT DER BUCHUNG (eigener_halter(), oben) -- wer VOR dem
+    eigentlichen Arbeits-Pane bucht (etwa ein Orchestrator, der erst prueft, ob
+    ueberhaupt Platz ist, und den Worker-Pane erst danach aufmacht), bucht unter
+    dem FALSCHEN, kurzlebigen Pane. Die Buchung verfaellt dann, sobald DIESER
+    kurze Aufrufer-Pane verschwindet (oder gar nie einen Pane hatte) -- nicht,
+    wenn der eigentliche Worker stirbt. Genau das war die Ursache hinter Befund
+    N5: die Buchung des Worker-Prozesses war an ein FRIST-VERSPRECHEN gebunden
+    (die 240-Minuten-Frist ohne periodische Erneuerung), weil sie NIE einen
+    lebendigen Pane als Halter hatte, der sie automatisch am Leben haelt.
+
+    DIE LOESUNG: ruft der WORKER selbst (aus SEINEM eigenen, lang lebenden
+    Pane heraus, sobald der existiert) `wb-belegung uebernehmen <kennung>` auf,
+    haengt die Belegung ab diesem Moment an GENAU DIESEN Pane -- dieselbe
+    Lebendigkeits-Pruefung wie bei jeder anderen Belegung mit Pane
+    (zustand_bestimmen() oben: laeuft der Pane, bleibt die Belegung offen bzw.
+    ueberfaellig, NIE verfallen; stirbt er, verfaellt sie sofort). Das ist eine
+    TATSACHE (tmux weiss, ob ein Pane lebt), kein Versprechen (eine periodische
+    `verlaengern`-Schleife, die vergessen, verzoegert oder abgebrochen werden
+    kann). Danach ist die Frist fuer diese Belegung praktisch bedeutungslos --
+    sie kann beliebig lange ueberfaellig bleiben, ohne je automatisch zu
+    verfallen, solange der Pane lebt.
+
+    Ohne messbaren Pane beim Aufruf (kein TMUX_PANE in der Umgebung) wird
+    NICHTS uebernommen und ein Fehler gemeldet -- ein Uebernehmen INS LEERE
+    waere schlimmer als der Ausgangszustand: es wuerde einen vielleicht noch
+    gueltigen alten Halter durch gar keinen ersetzen."""
+    neuer_halter = eigener_halter()
+    if not neuer_halter.get("pane"):
+        print("wb-belegung: kein TMUX_PANE in der Umgebung dieses Aufrufs -- "
+              "nichts uebernommen. 'uebernehmen' ohne eigenen Pane wuerde den "
+              "bisherigen Halter durch GAR KEINEN ersetzen, das waere schlimmer "
+              "als der jetzige Zustand.", file=sys.stderr)
+        return 2
     with Sperre():
         gueltige, entfernt = buch_pruefen(buch_lesen())
+        getroffen = None
+        for e in gueltige:
+            if e.get("id") == a.kennung:
+                e["halter"] = neuer_halter
+                getroffen = e
+        if not getroffen:
+            # Verfallenes trotzdem schreiben, dieselbe Luecke wie in cmd_gib
+            # (Fehler 2/3, Auftrag 2026-08-20).
+            if entfernt:
+                buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
+                                for e in gueltige])
+            print("wb-belegung: keine Belegung mit der Kennung '%s'." % a.kennung, file=sys.stderr)
+            return 1
         buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
                         for e in gueltige])
+    gib_aus("Uebernommen: %s haengt jetzt an Pane %s (Sitzung %s) -- verfaellt "
+            "erst, wenn dieser Pane stirbt, nicht mehr nach einer Frist."
+            % (a.kennung, neuer_halter["pane"], neuer_halter.get("sitzung") or "?"))
+    return 0
+
+
+def cmd_aufraeumen(a):
+    # 'tot' (Nachtrag "Karteileiche", 2026-08-21 abends): buch_pruefen() haelt eine
+    # tote Belegung ABSICHTLICH in 'gueltige' (sichtbar in 'wer', ausgeschlossen von
+    # der Vergabe in entscheiden()) -- ERST hier, beim ausdruecklichen Aufraeumen,
+    # wird sie wirklich aus dem Buch entfernt. Getrennt von 'verfallen' berichtet:
+    # unterschiedliche Kriterien (Pane- gegen Prozess-Lebendigkeit), derselbe Leser
+    # soll den Unterschied sehen koennen, nicht nur "irgendwas ist weg".
+    with Sperre():
+        gueltige, entfernt = buch_pruefen(buch_lesen())
+        tot = [e for e in gueltige if e.get("_zustand") == "tot"]
+        bleibt = [e for e in gueltige if e.get("_zustand") != "tot"]
+        buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
+                        for e in bleibt])
     if a.json:
         print(json.dumps({"verfallen": [{"id": e.get("id"), "grund": e.get("_grund")}
                                         for e in entfernt],
-                          "offen": len(gueltige)}, indent=2, ensure_ascii=False))
+                          "tot": [{"id": e.get("id"), "grund": e.get("_grund")}
+                                  for e in tot],
+                          "offen": len(bleibt)}, indent=2, ensure_ascii=False))
         return 0
-    if not entfernt:
-        gib_aus("Nichts verfallen; %d Belegung(en) offen." % len(gueltige))
+    if not entfernt and not tot:
+        gib_aus("Nichts verfallen, nichts tot; %d Belegung(en) offen." % len(bleibt))
     for e in entfernt:
         gib_aus("verfallen: %s (%s GiB, %s) — %s"
+                % (e.get("id"), zahl(e.get("gb", 0.0)), halter_text(e), e.get("_grund")))
+    for e in tot:
+        gib_aus("tot: %s (%s GiB, %s) — %s"
                 % (e.get("id"), zahl(e.get("gb", 0.0)), halter_text(e), e.get("_grund")))
     return 0
 
@@ -1435,8 +2583,9 @@ def cmd_kv(a):
                 "Sicherheitsfaktor %s):" % zahl(SICHERHEITSFAKTOR))
         for name in sorted(modelle):
             e = modelle[name]
-            gib_aus("  %-24s %6s MiB/Token  %-11s %s"
-                    % (name, zahl(e["mib_je_token"], 2), e.get("herkunft", "?"),
+            gib_aus("  %-24s %6s MiB/Token  %-11s %-9s %s"
+                    % (name, zahl(e["mib_je_token"], 4), e.get("herkunft", "?"),
+                       "KV " + kv_quant_von(e) if kv_quant_von(e) else "KV ?",
                        e.get("wann", "")))
             if e.get("notiz"):
                 gib_aus("  %-24s %s" % ("", e["notiz"]))
@@ -1459,9 +2608,14 @@ def cmd_kv(a):
             "herkunft": a.herkunft,
             "wann": time.strftime("%Y-%m-%d"),
             "notiz": a.notiz or "",
+            # Leerer String heisst "nicht vermerkt" und ist NICHT dasselbe wie "off"
+            # -- siehe kv_quant_von() oben.
+            "kv_quant": (a.kv_quant or "").strip().lower(),
         }
         atomar_schreiben(KV_DATEI, daten)
-    gib_aus("Eingetragen: %s = %s MiB/Token (%s)." % (a.modell, zahl(a.mib, 2), a.herkunft))
+    gib_aus("Eingetragen: %s = %s MiB/Token (%s%s)."
+            % (a.modell, zahl(a.mib, 4), a.herkunft,
+               ", KV-Cache %s" % a.kv_quant if a.kv_quant else ", Cache-Quantisierung nicht vermerkt"))
     return 0
 
 
@@ -1472,14 +2626,52 @@ def rechen_argumente(p):
                    help="die Spitze in GiB, selbst gerechnet (statt --gewichte-gb)")
     p.add_argument("--gewichte-gb", type=float, default=None,
                    help="Groesse der Modellgewichte in GiB")
+    p.add_argument("--metal-fraktion", type=float, default=None,
+                   help="der dritte Weg zur Spitze, fuer den Motor vllm-metal: dessen "
+                        "VLLM_METAL_MEMORY_FRACTION. Die Spitze ist dann Fraktion x %s GiB "
+                        "(METAL_ARBEITSSATZ_GIB, Metals max_recommended_working_set_size auf "
+                        "diesem Geraet), NICHT Gewichte + KV + Zuschlag -- vllm-metal teilt "
+                        "sich sein Budget vorab selbst zu und haelt es unabhaengig von "
+                        "Stroemen und Kontext. Schliesst --gb und --gewichte-gb aus. "
+                        "Herleitung und die wired_limit-Warnung: METAL_ARBEITSSATZ_GIB "
+                        "im Quelltext" % METAL_ARBEITSSATZ_GIB)
+    p.add_argument("--gewichte-entwerfer-gb", type=float, default=0.0,
+                   help="zusaetzliche Gewichte eines Entwerfers (spekulatives Decoding), "
+                        "getrennt vom Ziel ausgewiesen (Vorgabe 0 -- kein Entwerfer)")
+    p.add_argument("--prompt-cache-plaetze", type=int, default=0,
+                   help="Plaetze in mlx_lm.servers eigener LRUPromptCache, mit "
+                        "%s GiB je Platz gebucht (Vorgabe 0 -- ungebucht wie bisher, "
+                        "siehe PROMPT_CACHE_GB_JE_PLATZ im Kopfkommentar)" % PROMPT_CACHE_GB_JE_PLATZ)
+    p.add_argument("--prompt-cache-gb", type=float, default=None,
+                   help="der GESETZTE Deckel des Prompt-Cache in GiB (mlx_lm.server "
+                        "--prompt-cache-bytes). Gebucht wird Deckel x %s -- gemessen "
+                        "haelt der Cache rund das Doppelte seines Deckels, siehe "
+                        "PROMPT_CACHE_DECKEL_FAKTOR im Quelltext. Vorzuziehen gegenueber "
+                        "--prompt-cache-plaetze: der Deckel begrenzt das Wachstum "
+                        "wirklich, eine Platzzahl tut das nicht. Schliesst "
+                        "--prompt-cache-plaetze aus." % PROMPT_CACHE_DECKEL_FAKTOR)
     p.add_argument("--parallel", type=int, default=1,
                    help="gleichzeitige Anfragen (Vorgabe 1)")
     p.add_argument("--kontext", type=int, default=None,
                    help="Kontext-Token je Anfrage")
     p.add_argument("--modell", default="",
                    help="Modellname fuer den KV-Bedarf je Token")
-    p.add_argument("--zuschlag-gb", type=float, default=ZUSCHLAG_GIB,
-                   help="Zuschlag fuer Prompt-Cache und Spitzen (Vorgabe %s)" % ZUSCHLAG_GIB)
+    p.add_argument("--kv-quant", default="", choices=("", "off", "q8", "q4"),
+                   help="womit der Motor den KV-Cache gleich faehrt. Wird NIE "
+                        "eingerechnet, nur mit dem Registereintrag verglichen und "
+                        "benannt -- ein Umrechnungsfaktor waere wieder eine Annahme "
+                        "(Hausregel: q8, regeln/lokale-modelle.md)")
+    p.add_argument("--zuschlag-gb", type=float, default=None,
+                   help="Zuschlag fuer Prompt-Cache und Spitzen. Ohne Angabe: "
+                        "%s GiB Sockel + --parallel x %s GiB je Sequenz (Herleitung: "
+                        "zuschlag_herleiten() im Quelltext, Messung Worker \"mlxsrv\", "
+                        "2026-08-20)" % (ZUSCHLAG_FIXED_GIB, ZUSCHLAG_JE_SEQUENZ_GIB))
+    p.add_argument("--ohne-sockel", action="store_true",
+                   help="den %s GiB Fixkosten-Sockel NICHT mitbuchen -- fuer einen "
+                        "Worker, der sich an einen bereits laufenden Server haengt "
+                        "(der Server hat den Sockel schon bei seinem eigenen Start "
+                        "gebucht). Ohne Wirkung, wenn --zuschlag-gb ausdruecklich "
+                        "gesetzt ist." % ZUSCHLAG_FIXED_GIB)
     p.add_argument("--reserve-gb", type=float, default=RESERVE_GIB,
                    help="was dem System bleibt (Vorgabe %s)" % RESERVE_GIB)
     p.add_argument("--abtastungen", type=int, default=ABTASTUNGEN,
@@ -1491,12 +2683,48 @@ def rechen_argumente(p):
     p.add_argument("--ohne-messung", action="store_true",
                    help="entscheidet ALLEIN nach den offenen Belegungen, wenn der freie "
                         "Speicher nicht messbar ist (sonst: Nein)")
+    p.add_argument("--auf-eigene-gefahr", action="store_true",
+                   help="NUR FUER DEN MENSCHEN (gemessen von wb-mensch, nicht "
+                        "behauptet): eine Ablehnung wird zur lauten WARNUNG, und es "
+                        "wird trotzdem gebucht und gestartet. Der Weg fuer eine "
+                        "Entscheidung, die der Nutzer selbst trifft -- nie fuer einen "
+                        "Agenten, nie ueber eine Umgebungsvariable. Die Warnung nennt "
+                        "die Kernel-Panik vom 11.08. beim Namen: die Maschine kann "
+                        "hart abstuerzen, laufende Arbeit ist dann weg.")
     p.add_argument("--json", action="store_true")
 
 
 def pruefe_rechnung(a):
+    # ZUERST die Herkunft, vor jeder Rechnung: wer 'auf eigene Gefahr' sagt, muss
+    # ein Mensch sein, und das wird gemessen, nicht geglaubt (siehe
+    # mensch_oder_ende()). Ein Aufruf, der daran scheitert, soll gar nicht erst
+    # rechnen -- sonst stuende in der Ausgabe eine Spitze neben einer Absage, und
+    # der Leser muesste raten, welche der beiden gilt.
+    if getattr(a, "auf_eigene_gefahr", False):
+        mensch_oder_ende()
+    # --metal-fraktion ist der dritte Weg zur Spitze (Nachtrag "vllm-metal als zweiter
+    # Motor", 2026-08-21, siehe METAL_ARBEITSSATZ_GIB). Er wird HIER, vor allen anderen
+    # Pruefungen, in eine gewoehnliche --gb-Spitze umgerechnet -- alles darunter sieht
+    # danach eine selbst genannte Spitze wie bisher, und nur die Ausgabezeile in
+    # spitze_rechnen() erklaert zusaetzlich, wo die Zahl herkommt.
+    metal_fraktion = getattr(a, "metal_fraktion", None)
+    if metal_fraktion is not None:
+        if a.gb is not None or a.gewichte_gb is not None:
+            fehler("--metal-fraktion nennt die Spitze bereits (Fraktion x %s GiB); "
+                   "zusammen mit --gb oder --gewichte-gb waeren es zwei. Eine davon."
+                   % zahl(METAL_ARBEITSSATZ_GIB))
+        # Eine Fraktion ueber 1 waere kein Tippfehler mit harmloser Richtung: sie wuerde
+        # dem Motor mehr zusagen, als Metal ueberhaupt als Arbeitssatz empfiehlt.
+        metal_fraktion = pruefe_zahl(metal_fraktion, "--metal-fraktion", 0, strikt=True)
+        if metal_fraktion > 1:
+            fehler("--metal-fraktion %s ist groesser als 1 -- die Fraktion ist ein Anteil "
+                   "an Metals Arbeitssatz (%s GiB), kein Vielfaches davon."
+                   % (zahl(metal_fraktion, 2), zahl(METAL_ARBEITSSATZ_GIB)))
+        a.metal_fraktion = metal_fraktion
+        a.gb = round(metal_fraktion * METAL_ARBEITSSATZ_GIB, 4)
     if a.gb is None and a.gewichte_gb is None:
-        fehler("entweder --gb (Spitze selbst gerechnet) oder --gewichte-gb. "
+        fehler("entweder --gb (Spitze selbst gerechnet), --gewichte-gb oder "
+               "--metal-fraktion (Motor vllm-metal). "
                "Belegt wird die SPITZE, nicht das Gewicht.")
     if a.gb is not None and a.gewichte_gb is not None:
         fehler("--gb und --gewichte-gb zugleich ergeben zwei Spitzen. Eine davon.")
@@ -1505,6 +2733,18 @@ def pruefe_rechnung(a):
                "KV-Bedarf je Token + Zuschlag; ohne Kontext waere sie geraten.")
     a.gb = pruefe_zahl(a.gb, "--gb", 0, strikt=True)
     a.gewichte_gb = pruefe_zahl(a.gewichte_gb, "--gewichte-gb", 0, strikt=True)
+    # Entwerfer-Gewichte duerfen null sein (kein Entwerfer, der Regelfall),
+    # negativ nicht: er wuerde die Spitze verkleinern, wie beim Zuschlag.
+    a.gewichte_entwerfer_gb = pruefe_zahl(a.gewichte_entwerfer_gb, "--gewichte-entwerfer-gb", 0)
+    # Plaetze duerfen null sein (ungebucht, der bisherige Zustand), negativ nicht --
+    # dieselbe Regel wie bei den Entwerfer-Gewichten oben.
+    a.prompt_cache_plaetze = int(pruefe_zahl(a.prompt_cache_plaetze, "--prompt-cache-plaetze", 0))
+    if getattr(a, "prompt_cache_gb", None) is not None:
+        if a.prompt_cache_plaetze:
+            fehler("--prompt-cache-gb und --prompt-cache-plaetze zusammen ergaeben zwei "
+                   "Betraege fuer denselben Cache. Eine davon -- und wo es einen Deckel "
+                   "gibt, ist es der Deckel.")
+        a.prompt_cache_gb = pruefe_zahl(a.prompt_cache_gb, "--prompt-cache-gb", 0)
     # Der Zuschlag darf null sein (wer ihn ausdruecklich abwaehlt, weiss was er tut),
     # negativ nicht: er wuerde die Spitze verkleinern.
     a.zuschlag_gb = pruefe_zahl(a.zuschlag_gb, "--zuschlag-gb", 0)
@@ -1517,6 +2757,11 @@ def pruefe_rechnung(a):
         # KV-Anteil zu null, und dann steht wieder nur das Gewicht in der Belegung.
         pruefe_zahl(a.parallel, "--parallel", 1)
         pruefe_zahl(a.kontext, "--kontext", 1)
+        # Ohne --zuschlag-gb: an die tatsaechliche Nebenlaeufigkeit DIESER Buchung
+        # gebunden herleiten, statt eines von Hand gesetzten festen Werts (Betriebsfehler
+        # 1, zweite Runde Prueferbefunde, 2026-08-19) -- siehe zuschlag_herleiten().
+        if a.zuschlag_gb is None:
+            a.zuschlag_gb = zuschlag_herleiten(a.parallel, ohne_sockel=a.ohne_sockel)
     if a.kontext is None:
         a.kontext = 0
 
@@ -1550,10 +2795,21 @@ def main(argv):
     p_gel = sub.add_parser("geladen", help="melden, dass das Modell jetzt im Speicher steht")
     p_gel.add_argument("kennung", nargs="?", default="")
     p_gel.add_argument("--eigene", action="store_true", help="alle Belegungen dieses Panes")
+    p_gel.add_argument("--pid", type=int, default=0,
+                        help="PID des jetzt wirklich laufenden Prozesses (z. B. der geladene "
+                             "MLX-Server) -- ohne sie kann diese Belegung spaeter nicht als "
+                             "'tot' erkannt werden, wenn ihr Prozess ohne Abschiedszeile "
+                             "verschwindet (Nachtrag 'Karteileiche', 2026-08-21 abends). Optional: "
+                             "eine Belegung ohne Pane als Halter (z. B. ein detached Server) hat "
+                             "sonst KEIN Kriterium, an dem sie je als tot erkannt wuerde.")
 
     p_verl = sub.add_parser("verlaengern", help="die Frist einer Belegung neu setzen")
     p_verl.add_argument("kennung")
     p_verl.add_argument("--frist", type=int, default=FRIST_MIN)
+
+    p_ueb = sub.add_parser("uebernehmen", help="die Belegung an den EIGENEN, "
+                            "aktuellen Pane haengen (Lebendigkeit statt Frist-Versprechen, Befund N5)")
+    p_ueb.add_argument("kennung")
 
     p_auf = sub.add_parser("aufraeumen", help="Verfallenes entfernen")
     p_auf.add_argument("--json", action="store_true")
@@ -1566,8 +2822,21 @@ def main(argv):
     p_kvs.add_argument("modell")
     p_kvs.add_argument("mib", type=float)
     p_kvs.add_argument("--herkunft", required=True, choices=("gemessen", "angenommen"))
+    p_kvs.add_argument("--kv-quant", default="", choices=("", "off", "q8", "q4"),
+                       help="unter WELCHER Cache-Quantisierung dieser Wert gilt. Ohne "
+                            "Angabe bleibt der Eintrag darueber stumm -- und ein KV-Wert "
+                            "ohne sie ist eine halbe Angabe (bf16 kostet das Doppelte "
+                            "von q8).")
     p_kvs.add_argument("--notiz", default="")
     p_kvs.add_argument("--json", action="store_true")
+
+    p_of = sub.add_parser("ollama-freigeben", help="Ollama-Speicher verlaesslich "
+                          "freibekommen, jeder Schritt verifiziert statt angenommen "
+                          "(Befund 20.08.: 'ollama stop' meldet Erfolg und wirkt nicht)")
+    p_of.add_argument("--frist", type=float, default=30.0,
+                      help="Sekunden, die je Eskalationsstufe auf Wirkung/Rueckkehr "
+                           "gewartet wird (Vorgabe 30)")
+    p_of.add_argument("--json", action="store_true")
 
     a = p.parse_args(argv)
     if not a.befehl:
@@ -1594,6 +2863,8 @@ def main(argv):
         return cmd_geladen(a)
     if a.befehl == "verlaengern":
         return cmd_verlaengern(a)
+    if a.befehl == "uebernehmen":
+        return cmd_uebernehmen(a)
     if a.befehl == "aufraeumen":
         return cmd_aufraeumen(a)
     if a.befehl == "kv":
@@ -1603,6 +2874,8 @@ def main(argv):
         if not hasattr(a, "json"):
             a.json = False
         return cmd_kv(a)
+    if a.befehl == "ollama-freigeben":
+        return cmd_ollama_freigeben(a)
     return 2
 
 

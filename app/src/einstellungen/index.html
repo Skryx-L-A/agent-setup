@@ -468,6 +468,73 @@
       .marke.deckel {
         background: var(--will);
       }
+      /* Der Rang der empfohlenen Stufe -- ein Wort, kein Symbol, kein Emoji. */
+      .marke.empfohlen {
+        background: var(--laeuft);
+      }
+
+      /* --- Das Kontextfenster (nur bei lokalen Modellen) -----------------
+         Bewusst dieselbe Bauform wie die Modellliste: derselbe Rahmen,
+         dieselbe zweizeilige Zeile. Wer die eine bedienen kann, kann auch
+         die andere. NICHTS ist hier gesperrt oder ausgegraut -- eine Stufe,
+         fuer die der Speicher nicht reicht, sieht genauso waehlbar aus, wie
+         sie es ist, und traegt ihren Hinweis in der zweiten Zeile. */
+      .kontextliste {
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        max-height: 260px;
+        overflow-y: auto;
+        background: var(--grund);
+      }
+      .kontexteintrag {
+        display: block;
+        width: 100%;
+        text-align: left;
+        font: inherit;
+        background: transparent;
+        color: var(--schrift);
+        border: 0;
+        border-bottom: 1px solid var(--linie);
+        padding: 6px 10px;
+        cursor: pointer;
+      }
+      .kontexteintrag:last-child {
+        border-bottom: 0;
+      }
+      .kontexteintrag:hover {
+        background: var(--erhoben);
+      }
+      .kontexteintrag.gewaehlt {
+        background: var(--wahl);
+      }
+      .kontexteintrag .zeile1 {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+      }
+      .kontexteintrag .kennung {
+        color: var(--gedaempft);
+        margin-left: auto;
+      }
+      .kontexteintrag .zeile2 {
+        color: var(--gedaempft);
+        margin-top: 1px;
+      }
+      .kontexteintrag.gewaehlt .zeile1 {
+        font-weight: 600;
+      }
+      /* Der Hinweis auf knappen Speicher. Er faerbt, er sperrt nicht. */
+      .kontexteintrag .zeile2.kontexthinweis {
+        color: var(--will);
+        white-space: normal;
+      }
+      .kontextfuss {
+        color: var(--gedaempft);
+        margin-top: 6px;
+      }
+      .kontextfuss.warnt {
+        color: var(--will);
+      }
       .leerhinweis {
         color: var(--gedaempft);
         padding: 10px 0;

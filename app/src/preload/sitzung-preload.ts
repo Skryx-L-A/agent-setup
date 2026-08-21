@@ -24,6 +24,21 @@
 //                 (dieselbe Funktion wie beim Loeschen im Kontextmenue).
 //   bereit()      das erste Zeichnen melden, fuer den Steuerkanal
 //
+// DREI WEGE MEHR (19.08.), fuer den zweiten Weg im Plus-Menue: eine Sitzung mit
+// einer Wahl starten, die NUR fuer sie gilt. Sie schreiben zusammen KEINEN
+// einzigen Einstellungsschluessel -- die Wahl reist als Befehlszeile mit und
+// endet mit der Sitzung.
+//   wahlDaten()   was zur Wahl steht (Programme, Modelle, Denkstufen) und was
+//                 heute in den Einstellungen steht. Auf Abruf, nicht im
+//                 Datenstand -- siehe main.ts bei 'awb:sitz-wahl-daten'.
+//   kontextStufen(modellId)
+//                 die waehlbaren Kontextfenster eines LOKALEN Modells --
+//                 derselbe Kanal, den auch Einstellungen und Erststart
+//                 benutzen (main/kontext.ts). Nur Lesen.
+//   neuMitWahl(name,machine,fernPfad,wahl,echt)
+//                 wie `neu()`, nur mit der Wahl im Gepaeck. Dieselbe Auflage
+//                 fuer den Ordnerdialog: ohne echten Klick kein Dialog.
+//
 // Ein Weg zum ZEIGEN des Fensters gibt es hier NICHT. Sichtbar wird es
 // ausschliesslich ueber den echten Klick auf das Plus im HAUPTfenster (siehe
 // main/sitzungsfenster.ts, Klassendoc).
@@ -40,10 +55,24 @@ contextBridge.exposeInMainWorld('awbSitzung', {
   // laeuft. Die Echtheit des Klicks reist mit, wie beim ersten Weg: ohne sie
   // gibt es keinen Ordnerdialog.
   neuChat: (name: string, echt: boolean) => ipcRenderer.invoke('awb:sitz-neu-chat', String(name), echt === true),
+  wahlDaten: () => ipcRenderer.invoke('awb:sitz-wahl-daten'),
+  kontextStufen: (modellId: string) => ipcRenderer.invoke('awb:kontext-stufen', modellId),
+  neuMitWahl: (
+    name: string,
+    machine: string,
+    fernPfad: string,
+    wahl: Record<string, unknown>,
+    echt: boolean,
+  ) => ipcRenderer.invoke('awb:sitz-neu-wahl', name, machine, fernPfad, wahl, echt === true),
   fernPruefen: (machine: string, pfad: string) => ipcRenderer.invoke('awb:sitz-fern-pruefen', machine, pfad),
   fortsetzen: (id: string) => ipcRenderer.invoke('awb:sitz-fortsetzen', id),
   beenden: (id: string, echt: boolean) => ipcRenderer.invoke('awb:sitz-beenden', id, echt === true),
   onDaten: (fn: (d: unknown) => void) => ipcRenderer.on('awb:sitz-daten-neu', (_e, d) => fn(d)),
+  // Ein Start, der SPAETER scheitert (21.08.2026): `neu`/`neuMitWahl` antworten,
+  // sobald `wb-code` abgeschickt ist -- der Grund fuer einen Fehlschlag entsteht
+  // erst Sekunden danach und braucht deshalb einen eigenen Weg zurueck. Ohne ihn
+  // bleibt im Fenster "wird gestartet" stehen, waehrend nichts mehr kommt.
+  onStartfehler: (fn: (p: unknown) => void) => ipcRenderer.on('awb:sitz-startfehler', (_e, p) => fn(p)),
   bereit: () => ipcRenderer.send('awb:sitz-bereit'),
   // Farben durchreichen (11.08.): derselbe Kanal wie in den drei anderen
   // Fenstern (main/thema.ts) -- sitzung.ts fasst diese Bruecke nicht an, die

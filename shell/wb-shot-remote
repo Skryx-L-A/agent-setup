@@ -21,20 +21,47 @@ PATTERN=$1
 DEST=$2
 REMOTE_TMP="/tmp/wb-shot-remote-$$-$RANDOM.png"
 
+# FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden der App am
+# selben Tag): keiner der drei ssh-Aufrufe hier trug bis heute eine Grenze --
+# eine unerreichbare peer, oder ein Wayland/DBus-Aufruf in peer-shot selbst,
+# der nie zurueckkommt, liess dieses Skript unbegrenzt haengen, mit ihm jeden
+# Aufrufer (die App wartet synchron auf sein Ergebnis). ConnectTimeout deckt
+# die Verbindung, `timeout` die gesamte Ausfuehrung -- eine echte Aufnahme
+# braucht Sekunden, nicht Minuten, die Fristen unten sind grosszuegig genug.
+#
+# `timeout` fehlt auf manchen Mac-PATHs (kein coreutils, siehe run-all.sh fuer
+# dieselbe Vorsicht) -- fehlt es, laeuft `ssh_mit_frist` ungebremst statt mit
+# einem "command not found" abzubrechen; ConnectTimeout/BatchMode wirken so
+# oder so.
+TIMEOUT_BIN=""
+command -v timeout >/dev/null 2>&1 && TIMEOUT_BIN="timeout"
+ssh_mit_frist() {   # ssh_mit_frist <sekunden> <ssh-argumente...>
+  local frist="$1"; shift
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" "$frist" ssh -o ConnectTimeout=8 -o BatchMode=yes "$@"
+  else
+    ssh -o ConnectTimeout=8 -o BatchMode=yes "$@"
+  fi
+}
+
 CMD=$(printf '%q %q %q' "$REMOTE_TOOL" "$PATTERN" "$REMOTE_TMP")
-ssh "$REMOTE" "$CMD"
+ssh_mit_frist 30 "$REMOTE" "$CMD"
 rc=$?
 
+if [ $rc -eq 124 ]; then
+  echo "wb-shot-remote: nach 30s abgebrochen -- peer oder peer-shot antwortet nicht." >&2
+  exit $rc
+fi
 if [ $rc -ne 0 ]; then
   exit $rc
 fi
 
-if ! scp -q "$REMOTE:$REMOTE_TMP" "$DEST"; then
+if ! scp -o ConnectTimeout=8 -o BatchMode=yes -q "$REMOTE:$REMOTE_TMP" "$DEST"; then
   echo "wb-shot-remote: scp fehlgeschlagen (Datei nicht entstanden oder Verbindung weg)." >&2
-  ssh "$REMOTE" "rm -f '$REMOTE_TMP'" >/dev/null 2>&1
+  ssh_mit_frist 10 "$REMOTE" "rm -f '$REMOTE_TMP'" >/dev/null 2>&1
   exit 1
 fi
 
-ssh "$REMOTE" "rm -f '$REMOTE_TMP'"
+ssh_mit_frist 10 "$REMOTE" "rm -f '$REMOTE_TMP'"
 
 echo "wb-shot-remote: aufgenommen -> $DEST ($(wc -c < "$DEST" | tr -d ' ') Bytes)"

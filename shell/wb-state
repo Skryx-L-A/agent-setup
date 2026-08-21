@@ -3,10 +3,10 @@
 #
 #   wb-state touch <dir> [tmux-session]        create/update the session state
 #            [--name <name>] [--key <sessionKey>]
-#            [--harness claude|pi] [--model <model>]
+#            [--harness claude|pi] [--model <model>] [--kontext <stufe>]
 #            [--claude-session <id>]           remember the Claude conversation
 #   wb-state add-worker <name> <kind> <model> <dir> [tmux-session] [--machine <m>]
-#            [--claude-session <id>]           remember the worker's Claude conversation
+#            [--kontext <stufe>] [--claude-session <id>]  remember the worker's Claude conversation
 #   wb-state remove-worker <name> <dir> [tmux-session]
 #                                               forget a worker (wb-close calls this
 #                                               after the pane is really gone, 2026-08-16)
@@ -203,9 +203,10 @@ except Exception: pass' "$f" 2>/dev/null || true)
   own_file "$dir"
 }
 
-# --name/--key/--harness/--model/--machine/--claude-session may appear anywhere;
-# everything else stays positional so that all V1 call forms keep working unchanged.
-OPT_NAME=""; OPT_KEY=""; OPT_HARNESS=""; OPT_MODEL=""; OPT_MACHINE=""; OPT_CSESS=""; POS=()
+# --name/--key/--harness/--model/--machine/--claude-session/--kontext may appear
+# anywhere; everything else stays positional so that all V1 call forms keep
+# working unchanged.
+OPT_NAME=""; OPT_KEY=""; OPT_HARNESS=""; OPT_MODEL=""; OPT_MACHINE=""; OPT_CSESS=""; OPT_KONTEXT=""; POS=()
 parse_opts() {
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -215,6 +216,9 @@ parse_opts() {
       --model)   OPT_MODEL="${2:?model}"; shift 2 ;;
       --machine) OPT_MACHINE="${2:?machine}"; shift 2 ;;
       --claude-session) OPT_CSESS="${2:?claude session id}"; shift 2 ;;
+      # Die Kontextstufe, mit der eine lokale Sitzung laeuft (wb-kontext, Auftrag
+      # B 2026-08-19) -- rein informativ fuer die Oberflaeche, wie --model/--harness.
+      --kontext) OPT_KONTEXT="${2:?kontext}"; shift 2 ;;
       *)         POS[${#POS[@]}]="$1"; shift ;;
     esac
   done
@@ -339,9 +343,9 @@ PY
     [ -n "$DIR" ] || { echo "wb-state touch: dir fehlt" >&2; exit 1; }
     [ -n "$SESS" ] || { echo "wb-state touch: tmux session fehlt" >&2; exit 1; }
     FILE="$(own_file "$DIR" "$OPT_KEY")"
-    /usr/bin/python3 - "$FILE" "$DIR" "$SESS" "$LOCKDIR" "$OPT_NAME" "$OPT_KEY" "$OPT_HARNESS" "$OPT_MODEL" "$OPT_CSESS" <<'PY'
+    /usr/bin/python3 - "$FILE" "$DIR" "$SESS" "$LOCKDIR" "$OPT_NAME" "$OPT_KEY" "$OPT_HARNESS" "$OPT_MODEL" "$OPT_CSESS" "$OPT_KONTEXT" <<'PY'
 import json, os, sys, tempfile, datetime, fcntl
-file, dir_, sess, lockdir, name, key, harness, model, csess = sys.argv[1:10]
+file, dir_, sess, lockdir, name, key, harness, model, csess, kontext = sys.argv[1:11]
 lock = open(os.path.join(lockdir, os.path.basename(file) + ".lock"), "w")
 fcntl.flock(lock, fcntl.LOCK_EX)
 try:
@@ -373,6 +377,10 @@ try:
         st["harness"] = harness
     if model:
         st["model"] = model
+    # Die gewaehlte Kontextstufe (wb-kontext, Auftrag B 2026-08-19) -- rein
+    # informativ fuer die Oberflaeche, nur fuer ein lokales Modell gesetzt.
+    if kontext:
+        st["kontext"] = kontext
     # Crash recovery (2026-07-25): the Claude conversation running in this
     # session. Only ever written when given — a plain touch must not wipe it,
     # because it is the only thing that survives a lost tmux server.
@@ -406,9 +414,9 @@ PY
       echo "WARNUNG: wb-state add-worker: kein Zustandsdokument fuer Worker '$NAME' (dir='$DIR', session='${SESS:-unbekannt}') gefunden — Worker fehlt in der Workbench-Sidebar." >&2
       exit 0
     fi
-    /usr/bin/python3 - "$FILE" "$NAME" "$KIND" "$MODEL" "$DIR" "$LOCKDIR" "$OPT_MACHINE" "$OPT_CSESS" <<'PY'
+    /usr/bin/python3 - "$FILE" "$NAME" "$KIND" "$MODEL" "$DIR" "$LOCKDIR" "$OPT_MACHINE" "$OPT_CSESS" "$OPT_KONTEXT" <<'PY'
 import json, os, sys, tempfile, datetime, fcntl
-file, name, kind, model, dir_, lockdir, machine, csess = sys.argv[1:9]
+file, name, kind, model, dir_, lockdir, machine, csess, kontext = sys.argv[1:10]
 lock = open(os.path.join(lockdir, os.path.basename(file) + ".lock"), "w")
 fcntl.flock(lock, fcntl.LOCK_EX)
 try:
@@ -430,10 +438,16 @@ try:
     # place preservation happens now: pi-worker no longer reads either back itself.
     machine_val = machine or (old.get("machine") if old else None)
     csess_val = csess or (old.get("claudeSessionId") if old else None)
+    # Wie machine/claudeSessionId (wb-kontext, Auftrag B 2026-08-19): nur fuer ein
+    # lokales Modell gesetzt, und ein erneutes Prompten OHNE --kontext darf die
+    # zuletzt gewaehlte Stufe nicht loeschen.
+    kontext_val = kontext or (old.get("kontext") if old else None)
     if machine_val:
         entry["machine"] = machine_val
     if csess_val:
         entry["claudeSessionId"] = csess_val
+    if kontext_val:
+        entry["kontext"] = kontext_val
     workers.append(entry)
     st["workers"] = workers
     st["lastActive"] = now
@@ -621,6 +635,16 @@ DEFAULTS = {
     # `wb-state settings set workerEffort <stufe>`.
     "workerModel": "claude-sonnet-5",
     "workerEffort": "high",
+    # Multi-Token-Vorhersage (2026-08-20, Vorgaben des Nutzers): AN/AUS getrennt
+    # je Rolle, WELCHES Modell dabei benutzt wird, steht in der Registry
+    # (Feld 'vorhersage' je Modell) und ist hier nicht einstellbar. Vorgabe
+    # AUS: spekulatives Decoding und die gemeinsame MLX-Server-
+    # Nebenlaeufigkeit schliessen sich aus (`is_batchable = draft_model is
+    # None` in mlx_lm.server, siehe shell/wb-mlx-server) -- ein
+    # stillschweigend eingeschalteter Schalter wuerde unbemerkt Durchsatz
+    # kosten. Zweite Stelle: VORGABEN in app/src/main/einstellungen.ts.
+    "orchestratorVorhersage": False,
+    "workerVorhersage": False,
     "newSessionDefaultDir": "~/AI",
     # 2026-08-11 GESTRICHEN, mit Begruendung, damit niemand sie nachtraegt:
     #   workerPollSeconds       war nie eine Worker-Einstellung, sondern der
@@ -778,6 +802,20 @@ DEFAULTS = {
     # (shell/pi-worker, --dangerously-skip-permissions). Die acht Guards und
     # die Rueckfrage-Stufe bleiben davon unberuehrt.
     "workerSkipPermissions": True,
+    # Auf welchem WEG ein Auftrag beim Worker ankommt (2026-08-20).
+    #   auto    Wo es eine Sitzungs-Inbox gibt (heute: Claude Code), wird sie
+    #           benutzt; sonst wird getippt. Vorgabe.
+    #   socket  Die Inbox wird VERLANGT. Gibt es sie nicht, scheitert die
+    #           Zustellung hoerbar, statt ersatzweise zu tippen -- fuer Tests
+    #           und fuer den Fall, dass niemand mehr in eine Eingabezeile
+    #           schreiben soll.
+    #   paste   Nur der bisherige Tippweg. Der Rueckweg, falls der Inbox-Weg
+    #           an einer kuenftigen Harness-Version scheitert.
+    # Anlass: in der Nacht auf den 20.08. hat der Tippweg fuenf Panes eingefroren
+    # und Auftraege stumm verschluckt. Gelesen von shell/pi-worker; der
+    # Umgebungsschalter WB_ZUSTELLUNG schlaegt diesen Wert fuer einen einzelnen
+    # Aufruf (Tests).
+    "workerZustellung": "auto",
     # Der Berechtigungsmodus, mit dem der ORCHESTRATOR selbst startet (2026-08-16,
     # Anweisung des Nutzers: "sessions ab jetzt immer so starten"). Gemessen: 'claude
     # --help' kennt --permission-mode mit genau den sechs Werten unten, und erst
@@ -1044,6 +1082,10 @@ try:
            "maxWorkers": (1, 64), "maxWorkerPanesPerTab": (0, 64),
            "stallMinutes": (1, 120), "terminalFontSize": (8, 32)}
     ENUM = {"workerLayout": ["split", "window"],
+            # 2026-08-20: die drei Zustellwege. Ein Tippfehler hier waere teuer --
+            # 'sockett' wuerde als unbekannter Wert auf 'auto' fallen und der
+            # Mensch saehe im Menue einen Wert, der etwas anderes tut als er sagt.
+            "workerZustellung": ["auto", "socket", "paste"],
             # 2026-08-06: die Maschinenliste ist offen (der Nutzer: "mehr als
             # zwei sind moeglich"), also kann das Ziel nicht mehr aus drei
             # festen Namen bestehen. Geprueft wird nur noch die FORM eines
@@ -1069,7 +1111,7 @@ try:
             "orchestratorHarness": None}          # free, but must be a string
     BOOL = ("terminalStartMaximized", "contextGuardAutostart", "modelDiscoveryAuto",
             "closeSessionOnWindowClose", "workerWorktrees", "workerSkipPermissions",
-            "guardMeldetWorkerStatus")
+            "guardMeldetWorkerStatus", "orchestratorVorhersage", "workerVorhersage")
     LIST = ("secretExcludeDirs", "secretExcludePatterns", "remoteMachines")
     NAME = ("defaultWorkerMachine",)
     # 2026-08-06: die drei Objekt-Schluessel. Geprueft wird die FORM, nicht der
@@ -2482,6 +2524,24 @@ def cmd_resolve():
     if h["id"] == "claude" and role == "orchestrator":
         parts.append(("q", "--remote-control"))
         parts.append(("q", ctx["name"]))
+    # Die Gegenseite (Nachtrag 2026-08-19, gemessen: 'claude
+    # --dangerously-skip-permissions' allein zeigt ein aktives Remote Control in
+    # der Fusszeile, obwohl kein '--remote-control' auf der Befehlszeile steht --
+    # Auto-Verbinden greift ausserhalb der Einstellungsdateien, App-/IDE-Schalter.
+    # Ein WORKER darf nicht in Remote-Control-Liste des Nutzers auftauchen; einzig
+    # zuverlaessiger Weg ist '--settings' mit 'remoteControlAtStartup: false'
+    # explizit auf der Befehlszeile. pi-worker traegt dieselbe Regel fuer seinen
+    # eigenen, hiervon nicht erreichten claude-Schnellpfad -- zwei Stellen, eine
+    # Regel, keine dritte Kopie.
+    # crossSessionInbound (2026-08-20): derselbe Grund wie oben, zweite Zusage im
+    # selben Wert. Ohne ihn haelt ein Worker eine Nachricht an, die ueber seine
+    # Socket-Inbox statt ueber die Eingabezeile kommt, und wartet auf einen
+    # Auswahldialog, den niemand beantwortet (gemessen, dreimal). Auch das steht
+    # ZWEIMAL -- hier und in pi-workers eigenem claude-Schnellpfad --, weil beide
+    # Wege einen Startbefehl bauen; der Wortlaut wird zusammen gepflegt.
+    elif h["id"] == "claude" and role == "worker":
+        parts.append(("q", "--settings"))
+        parts.append(("q", '{"remoteControlAtStartup": false, "crossSessionInbound": "accept"}'))
     res = h.get("resume") or {}
     if res.get("args"):
         probe = res.get("probe") or "always"

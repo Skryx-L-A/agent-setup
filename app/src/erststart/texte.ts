@@ -41,6 +41,16 @@ export const DE: Record<string, string> = {
   'modell.unterzeile': 'Welches Modell soll der Orchestrator verwenden?',
   'modell.keine': 'Für das gewählte Programm ist noch kein Modell bekannt. Dieser Schritt lässt sich später über die Seite „Programme und Modelle" nachholen.',
 
+  // --- Schritt 3, zweite Frage: das Kontextfenster ---------------------------
+  // Sie steht nur da, wenn das gewählte Modell auf dieser Maschine läuft.
+  'kontext.titel': 'Kontextfenster',
+  'kontext.unterzeile': 'Wie viel Text dieses Modell gleichzeitig im Kopf behält. Ein größeres Fenster hält mehr Zusammenhang und belegt dauerhaft mehr Grafikspeicher. Wählbar ist jede Stufe — auch eine, für die der Speicher gerade nicht reicht; sie sagt es dann dazu.',
+  'kontext.empfohlen': 'empfohlen',
+  'kontext.token': '{0} Token',
+  'kontext.bedarf': 'Braucht {0} GiB.',
+  'kontext.wirdErmittelt': 'Die Stufen werden ermittelt …',
+  'kontext.nichtErmittelt': 'Die Stufen ließen sich nicht ermitteln: {0}. Das Fenster bleibt dann bei dem, was für dieses Modell eingetragen ist; ändern lässt es sich später in den Einstellungen.',
+
   // --- Schritt 4: Fertig -----------------------------------------------------
   'fertig.titel': 'Fertig',
   'fertig.unterzeile': 'Das war’s — alles andere bleibt auf Vorgabe.',
@@ -50,6 +60,7 @@ export const DE: Record<string, string> = {
   'fertig.eintrag.maschine': 'Maschine „{0}"',
   'fertig.eintrag.harness': 'Programm „{0}"',
   'fertig.eintrag.modell': 'Modell „{0}"',
+  'fertig.eintrag.kontext': 'Kontextfenster {0} Token',
 
   // --- Zustandszeichen (keine Emojis) --------------------------------------
   'zeichen.gewaehlt': '●',
@@ -95,6 +106,15 @@ export const EN: Record<string, string> = {
   'modell.unterzeile': 'Which model should the orchestrator use?',
   'modell.keine': 'No model is known yet for the chosen program. This step can be caught up later on the "Programs and models" page.',
 
+  // --- Step 3, second question: the context window ---------------------------
+  'kontext.titel': 'Context window',
+  'kontext.unterzeile': 'How much text this model keeps in mind at once. A larger window holds more context and permanently occupies more GPU memory. Every level is selectable — including one the memory does not cover right now; it says so.',
+  'kontext.empfohlen': 'recommended',
+  'kontext.token': '{0} tokens',
+  'kontext.bedarf': 'Needs {0} GiB.',
+  'kontext.wirdErmittelt': 'Determining the levels …',
+  'kontext.nichtErmittelt': 'The levels could not be determined: {0}. The window then stays at whatever is registered for this model; it can be changed later in Settings.',
+
   // --- Step 4: Done -----------------------------------------------------
   'fertig.titel': 'Done',
   'fertig.unterzeile': "That's it — everything else stays at its default.",
@@ -104,6 +124,7 @@ export const EN: Record<string, string> = {
   'fertig.eintrag.maschine': 'Machine "{0}"',
   'fertig.eintrag.harness': 'Program "{0}"',
   'fertig.eintrag.modell': 'Model "{0}"',
+  'fertig.eintrag.kontext': 'Context window {0} tokens',
 
   // --- State marks (no emoji) --------------------------------
   'zeichen.gewaehlt': '●',

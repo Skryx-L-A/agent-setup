@@ -144,6 +144,12 @@ export interface WorkerInfo {
    * Pane haengt (chat/zuordnung.ts, Stufe 'vermerk').
    */
   claudeSessionId: string;
+  /**
+   * Die Beschriftung, wenn sie nicht der Name ist -- gesetzt nur bei einem
+   * Worker, der aus einem PANE stammt statt aus der Zustandsdatei (siehe
+   * `fremdePanes`). Dort ist der Pane-Titel das einzige, was ihn beschreibt.
+   */
+  titel?: string;
 }
 
 export interface SessionInfo {
@@ -191,6 +197,47 @@ export interface SessionInfo {
    * vergisst, sperrt still den Knopf, den es hier gerade zu retten gilt.
    */
   verloren: boolean;
+  /**
+   * FUER DIESEN ORDNER LAEUFT GERADE EIN START (21.08.). Gilt wie `verloren`
+   * nur zusammen mit `state === 'stopped'` und aus demselben Grund als
+   * MERKMAL statt als fuenfter Zustand: die Frage „laeuft sie?" ist auch hier
+   * mit 'stopped' richtig beantwortet -- es gibt noch keinen Pane. Beantwortet
+   * wird eine zweite Frage: „kommt da noch etwas?"
+   *
+   * WARUM ES DEN FALL UEBERHAUPT GIBT: `wb-code` schreibt die Zustandsdatei in
+   * seiner Zeile 316, seine tmux-Sitzung entsteht erst in Zeile 822 -- dazwischen
+   * liegen `wb-mlx-server ensure` und `wb-kontext ensure`, und bei einem lokalen
+   * Modell laedt dort ein Modellkoerper von rund 20 GiB. In dieser Zeit steht die
+   * Sitzung in der Liste, ohne dass es sie gibt. Ohne dieses Merkmal las sich das
+   * als „beendet", und das ist eine falsche Auskunft: beendet ist etwas anderes
+   * als noch nicht da.
+   *
+   * Gemessen wird es NICHT hier: der Hauptprozess weiss, welche seiner
+   * `wb-code`-Kinder noch laufen, und reicht das mit.
+   */
+  startet: boolean;
+  /**
+   * DER LETZTE START FUER DIESEN ORDNER IST GESCHEITERT (21.08.). Wieder ein
+   * Merkmal neben 'stopped', wieder eine zweite Frage: „hat der Start
+   * aufgegeben?"
+   *
+   * Ohne ihn fiel genau dieser Fall aus der Liste. `sichtbare()` blendet
+   * beendete Sitzungen aus, solange sie nicht `verloren` sind -- und `verloren`
+   * heisst „lief noch, als dieses Programm zuletzt hinsah". Eine Sitzung, die
+   * NIE lief, erfuellt das nicht. Ein gescheiterter Start war damit unsichtbar,
+   * obwohl er das Gegenteil von wegraeumbar ist.
+   */
+  startFehler: boolean;
+  /**
+   * DIE KONTEXTSTUFE, MIT DER SIE LAEUFT -- in Token, 0 wenn keine gewaehlt ist
+   * (`wb-state touch --kontext`, geschrieben von `wb-code`, seit 19.08.).
+   *
+   * Gelesen wird sie seit dem 21.08., und zwar aus einem handfesten Grund: der
+   * Fortsetzen-Weg baute seine Zeile ohne `--kontext`, obwohl die Zustandsdatei
+   * die Stufe fuehrt. Wer einmal 131072 gewaehlt hatte, bekam die Sitzung nach
+   * einem Neustart mit der Vorgabestufe zurueck -- ohne dass es irgendwo stand.
+   */
+  kontext: number;
   /** Nur bei einer NICHT-Standardsession des Ordners gesetzt (SPEC-V2 B). */
   sessionKey: string;
   /**
@@ -264,13 +311,27 @@ export interface PaneRow {
   worker: string;
   pid: number;
   command: string;
+  /** `pane_title` -- die Beschriftung, die tmux fuer diesen Pane fuehrt. */
+  title: string;
+  /**
+   * `pane_dead`: der Pane steht noch da, sein Prozess ist beendet.
+   *
+   * `pi-worker` setzt auf jedem Worker-Pane `remain-on-exit on` -- ein
+   * abgestuerzter Worker hinterlaesst also einen Pane, den tmux weiterhin
+   * auflistet. Ohne diese Spalte sah er hier lebendig aus (`alive: !!pane`,
+   * Zustand 'running'), bekam im Worker-Tab eine Kachel und stand in der
+   * Kapazitaetsrechnung. Der Rest des Hauses fragt die Zahl laengst ab
+   * (context-guard, wb-close, wb-session-sweep, pi-worker, chatwerkstatt.ts);
+   * diese Formatzeile war die letzte, die es nicht tat.
+   */
+  dead: boolean;
 }
 
 /** `tmux list-sessions -F '#{session_name}\t#{@awb_owner}'`, roh -- lokal wie ueber SSH gleich. */
 export const SESSION_LIST_FORMAT = '#{session_name}\t#{@awb_owner}';
 /** Dieselbe Formatzeile wie `readPanes`, exportiert, damit ein Fernabruf (V10) genau dasselbe fragt. */
 export const PANE_LIST_FORMAT =
-  '#{session_name}\t#{window_id}\t#{window_index}\t#{pane_id}\t#{pane_index}\t#{@wb_role}\t#{@wb_worker}\t#{pane_pid}\t#{pane_current_command}';
+  '#{session_name}\t#{window_id}\t#{window_index}\t#{pane_id}\t#{pane_index}\t#{@wb_role}\t#{@wb_worker}\t#{pane_pid}\t#{pane_current_command}\t#{pane_title}\t#{pane_dead}';
 
 /**
  * Was ein tmux-Aufruf ergeben hat -- und zwar in ZWEI Fragen, die bis zum
@@ -319,7 +380,13 @@ function tmuxAntwort(socket: string, args: string[]): TmuxAntwort {
   // zerfaellt still -- deshalb bekommt genau dieser Aufruf seine Kodierung mit,
   // unabhaengig davon, welche Locale der Mensch fuer sich gesetzt hat. Die
   // Messung dazu steht im Kopf von pfad.ts.
-  const r = spawnSync('tmux', [...base, ...args], { encoding: 'utf8', env: mitMaschinenLocale() });
+  // FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden): dieser
+  // Aufruf liest die Sitzungsliste bei jedem Takt -- ohne Grenze haette ein
+  // haengendes oertliches tmux nicht nur diese eine Anzeige, sondern den
+  // GANZEN Hauptprozess angehalten. 2s wie jeder andere oertliche
+  // bare-tmux-Aufruf dieses Hauses (eine Fernmaschine geht nicht hier durch,
+  // siehe den RemotePoller-Verweis im Kopf dieser Datei).
+  const r = spawnSync('tmux', [...base, ...args], { encoding: 'utf8', env: mitMaschinenLocale(), timeout: 2000 });
   if (r.error) {
     return {
       ausfuehrbar: false,
@@ -418,7 +485,8 @@ export function parseProcTable(raw: string): Map<number, ProcRow> {
 /** `tmux list-panes -a -F PANE_LIST_FORMAT` roh -> Zeilen. Reine Funktion (siehe oben). */
 export function parsePaneRows(raw: string): PaneRow[] {
   return raw.split('\n').filter(Boolean).map((z) => {
-    const [session, windowId, windowIndex, paneId, paneIndex, role, worker, pid, command] = z.split('\t');
+    const [session, windowId, windowIndex, paneId, paneIndex, role, worker, pid, command, title, dead] =
+      z.split('\t');
     return {
       session,
       windowId,
@@ -429,8 +497,76 @@ export function parsePaneRows(raw: string): PaneRow[] {
       worker: worker ?? '',
       pid: Number(pid) || 0,
       command: command ?? '',
+      // Neu am 19.08.: der Titel steht am ENDE der Zeile, damit eine
+      // Fernmaschine mit einer aelteren Fassung dieses Programms weiterhin
+      // lesbar antwortet -- fehlt das Feld, bleibt der Titel leer und alles
+      // davor stimmt. Gebraucht wird er fuer die Beschriftung eines
+      // Worker-Panes, zu dem die Zustandsdatei nichts sagt (`fremdePanes`).
+      title: title ?? '',
+      // Eine ALTE Formatzeile (eine Fernmaschine mit aelterem Stand) hat die
+      // Spalte nicht. Dann ist der Pane nicht 'tot', sondern unbekannt -- und
+      // unbekannt wird hier wie lebendig behandelt, damit ein fehlendes Feld
+      // niemanden faelschlich fuer beendet erklaert.
+      dead: (dead ?? '').trim() === '1',
     };
   });
+}
+
+/**
+ * WORKER-PANES, VON DENEN DIE ZUSTANDSDATEI NICHTS WEISS (19.08.).
+ *
+ * DER BEFUND (alice, 19.08.): „bei 3 workern ist die aufteilung des platzes
+ * noch nicht richtig, das untere rechte viertel ist frei." Im tmux-Fenster war
+ * nichts leer -- es hatte VIER Panes, alle gefuellt. Einer davon war der
+ * SPIEGEL einer Sitzung auf der anderen Maschine: `@wb_role worker`,
+ * `@wb_worker REMOTE-peer-…`, Titel `spiegel:peer:…`. Die Zustandsdatei dieser
+ * Sitzung kennt ihn nicht, denn er gehoert einer anderen; die Oberflaeche
+ * baute ihre Worker ausschliesslich aus der Datei und liess ihn damit weg.
+ *
+ * Die Folge war kein Anzeigefehler, sondern ein Auseinanderlaufen zweier
+ * Zaehlungen: tmux teilte das Fenster unter VIER Panes auf, die Buehne legte
+ * DREI Kacheln. Die dritte bekam die volle Breite, ihr Pane war halb so
+ * breit -- und die rechte Haelfte der unteren Reihe blieb schwarz. Gemessen:
+ * Kachel 1002 Punkte breit, Schirm darin 495.
+ *
+ * DIE ENTSCHEIDUNG, und warum sie so und nicht andersherum faellt: ein solcher
+ * Pane wird als VOLLWERTIGE Kachel gezeigt und mitgezaehlt.
+ *
+ *   * Er traegt `@wb_role worker` -- genau das Merkmal, an dem dieses Programm
+ *     ueberall sonst erkennt, dass ein Pane zu einem Worker gehoert. Ihn
+ *     wegzulassen hiesse, dieses Merkmal an einer Stelle anders zu lesen als
+ *     an allen anderen.
+ *   * Er belegt ein Viertel des tmux-Fensters. Ihn nicht mitzuzaehlen macht
+ *     seinen Platz nicht frei -- und in einer Sitzung, die dieses Programm
+ *     nicht angelegt hat, darf es das Fenster nicht umraeumen (F14). „Nicht
+ *     mitzaehlen" waere also nur dann eine Antwort, wenn die Oberflaeche tmux
+ *     zwingen duerfte, und das darf sie hier gerade nicht.
+ *   * Damit geben Anzeige und Aufteilung dieselbe Antwort: was eine Kachel
+ *     bekommt, steht auch in der Liste rechts, und umgekehrt.
+ *
+ * WAS NICHT GERATEN WIRD: Modell, Ordner und Kontextzahl stehen in der
+ * Zustandsdatei, die es fuer ihn nicht gibt. Sie bleiben leer bzw. -1 -- eine
+ * erfundene Zahl waere schlimmer als eine fehlende. Der Name kommt aus
+ * `@wb_worker`, die Beschriftung aus dem Pane-Titel.
+ */
+export function fremdePanes(
+  sessionPanes: PaneRow[],
+  bekannteNamen: string[],
+): { paneId: string; name: string; titel: string }[] {
+  const bekannt = new Set(bekannteNamen.filter(Boolean));
+  const raus: { paneId: string; name: string; titel: string }[] = [];
+  const gesehen = new Set<string>();
+  for (const p of sessionPanes) {
+    if (p.role !== 'worker') continue;
+    // Ein Pane OHNE `@wb_worker` ist kein zweiter Fall, sondern derselbe: er
+    // sagt „hier arbeitet ein Worker" und nennt keinen Namen. Er bekommt den
+    // Pane als Namen -- eindeutig, und man findet ihn im Terminal wieder.
+    const name = p.worker || p.paneId;
+    if (bekannt.has(name) || gesehen.has(name)) continue;
+    gesehen.add(name);
+    raus.push({ paneId: p.paneId, name, titel: p.title || name });
+  }
+  return raus;
 }
 
 /**
@@ -700,7 +836,9 @@ export function leseSessions(opt: SessionsOptions): SessionsBefund {
       const wname = String(w.name ?? '');
       const wmodel = String(w.model ?? '');
       const wdir = String(w.dir ?? '');
-      const pane = sessionPanes.find((p) => p.role === 'worker' && p.worker === wname);
+      // `!p.dead`: ein Pane, dessen Prozess beendet ist, ist kein Worker mehr.
+      // Er bleibt nur stehen, weil `remain-on-exit` das so will.
+      const pane = sessionPanes.find((p) => p.role === 'worker' && p.worker === wname && !p.dead);
       const cpu = pane ? subtree(pane.pid, ps).reduce((sum, r) => sum + r.cpu, 0) : 0;
 
       // Die Kontextzahl kommt aus dem Transcript, und WELCHES Transcript es ist,
@@ -793,6 +931,36 @@ export function leseSessions(opt: SessionsOptions): SessionsBefund {
       };
     });
 
+    // Worker-Panes, von denen die Zustandsdatei nichts weiss -- der Spiegel
+    // einer anderen Maschine ist der Fall, fuer den es das gibt. Siehe
+    // `fremdePanes` fuer die Entscheidung und den Befund vom 19.08.
+    for (const f of fremdePanes(sessionPanes, workerNamen)) {
+      workers.push({
+        name: f.name,
+        // Kein Harness geraten: er steht in keiner Datei, die hier gelesen wird.
+        kind: '',
+        model: '',
+        dir: '',
+        paneId: f.paneId,
+        alive: true,
+        cpu: 0,
+        state: einsehbar ? 'running' : 'unknown',
+        contextPercent: -1,
+        contextTokens: 0,
+        contextWindow: 0,
+        transcriptPath: '',
+        idleSeconds: -1,
+        resultPath: '',
+        resultAt: 0,
+        subagents: subagenten.get(f.name) ?? [],
+        requestedBy: '',
+        pendingRequest: false,
+        blockedReason: '',
+        claudeSessionId: '',
+        titel: f.titel,
+      });
+    }
+
     // Subagenten ohne zuordenbaren Worker gehen nicht verloren: sie haengen
     // dann am Orchestrator, sichtbar wie alle anderen.
     const heimatlos = subagenten.get('') ?? [];
@@ -840,6 +1008,11 @@ export function leseSessions(opt: SessionsOptions): SessionsBefund {
       // „niemand hat ihr Ende gesehen" keine Aussage ueber sie, sondern
       // ueber uns.
       verloren: state === 'stopped' && verlorene.has(basename(datei, '.json')),
+      // Der Hauptprozess setzt beides nach dem Lesen: nur er weiss, welche
+      // seiner eigenen Startvorgaenge noch laufen (main.ts, `startzustand`).
+      startet: false,
+      startFehler: false,
+      kontext: Number(roh.kontext ?? 0) || 0,
       sessionKey: String(roh.sessionKey ?? ''),
       harness: String(roh.harness ?? '') || 'claude',
       model: String(roh.model ?? ''),
@@ -894,7 +1067,7 @@ function remoteSessions(snapshots: RemoteSnapshot[], verlorene: Set<string>): Se
       }
 
       const workers: WorkerInfo[] = rec.workers.map((w) => {
-        const pane = sessionPanes.find((p) => p.role === 'worker' && p.worker === w.name);
+        const pane = sessionPanes.find((p) => p.role === 'worker' && p.worker === w.name && !p.dead);
         const cpu = pane ? subtree(pane.pid, snap.procTable).reduce((sum, r) => sum + r.cpu, 0) : 0;
         return {
           name: w.name,
@@ -919,6 +1092,36 @@ function remoteSessions(snapshots: RemoteSnapshot[], verlorene: Set<string>): Se
           blockedReason: '',
         };
       });
+
+      // Dieselbe Ergaenzung wie im oertlichen Weg -- ein Worker-Pane ohne
+      // Eintrag in der Zustandsdatei zaehlt mit und bekommt eine Kachel.
+      // Stuende sie nur oben, saehe eine Fernsitzung anders aus als eine
+      // hiesige, und das Loch waere druebem geblieben.
+      for (const f of fremdePanes(sessionPanes, workerNamen)) {
+        workers.push({
+          name: f.name,
+          kind: '',
+          claudeSessionId: '',
+          model: '',
+          dir: '',
+          paneId: f.paneId,
+          alive: true,
+          cpu: 0,
+          state: snap.reachable ? 'running' : 'unknown',
+          contextPercent: -1,
+          contextTokens: 0,
+          contextWindow: 0,
+          transcriptPath: '',
+          idleSeconds: -1,
+          resultPath: '',
+          resultAt: 0,
+          subagents: subagenten.get(f.name) ?? [],
+          requestedBy: '',
+          pendingRequest: false,
+          blockedReason: '',
+          titel: f.titel,
+        });
+      }
 
       const heimatlos = subagenten.get('') ?? [];
       const wartend = workers.filter((w) => w.state !== 'running').length;
@@ -949,6 +1152,13 @@ function remoteSessions(snapshots: RemoteSnapshot[], verlorene: Set<string>): Se
         claudeSessionId: rec.claudeSessionId,
         // Dieselbe Bedingung wie hiesig, aus demselben Grund (siehe dort).
         verloren: state === 'stopped' && verlorene.has(id),
+        // Eine ferne Sitzung startet nicht von hier aus -- der Startvorgang
+        // laeuft auf ihrer Maschine, und dieser Prozess sieht ihn nicht.
+        startet: false,
+        startFehler: false,
+        // Eine ferne Sitzung meldet ihre Stufe (noch) nicht mit; 0 heisst hier
+        // "nicht bekannt", und der Fortsetzen-Weg laesst den Schalter dann weg.
+        kontext: 0,
         sessionKey: rec.sessionKey,
         harness: rec.harness || 'claude',
         model: rec.model,

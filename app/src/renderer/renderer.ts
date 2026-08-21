@@ -63,6 +63,13 @@ interface LayoutPayload {
    * `kachelAusRaster` und main.ts, `tabZeigen`.
    */
   raster?: { cols: number; rows: number };
+  /**
+   * Wie `raster`, aber der Tab zeigt nur einen TEIL der Panes dieses Fensters
+   * (Layout 'split': der Orchestrator sitzt mit im Fenster). Die Lage der
+   * gezeigten Panes ist dann immer noch die von tmux -- es fehlen nur Zellen
+   * dazwischen, und die werden zusammengeschoben.
+   */
+  rasterTeil?: { cols: number; rows: number };
   /** Angeforderte Panes, die es nicht (mehr) gibt -- mit dem Grund. */
   fehlend?: { pane: string; grund: string }[];
 }
@@ -87,6 +94,8 @@ interface Worker {
   /** Die Ergebnisdatei, sobald es eine gibt (V2). */
   resultPath: string;
   resultAt: number;
+  /** Beschriftung eines Workers, der aus einem PANE stammt (sessions.ts, `fremdePanes`). */
+  titel?: string;
 }
 interface Session {
   id: string; name: string; dir: string; machine: string; tmuxSession: string;
@@ -101,6 +110,14 @@ interface Session {
    * deshalb, obwohl beendete Sitzungen sonst ausgeblendet sind.
    */
   verloren?: boolean;
+  /**
+   * Fuer diesen Ordner laeuft gerade ein Start (21.08.): die Zustandsdatei ist
+   * da, die tmux-Sitzung noch nicht. Bei einem lokalen Modell dauert das
+   * Minuten. Gilt wie `verloren` nur zusammen mit `state === 'stopped'`.
+   */
+  startet?: boolean;
+  /** Der letzte Start fuer diesen Ordner ist gescheitert (21.08.). */
+  startFehler?: boolean;
   sessionKey: string;
   /** Harness und Modell, mit denen sie lief -- aus ihrer Zustandsdatei. */
   harness?: string;
@@ -313,6 +330,32 @@ const TERMOPT = {
 const rendererJePane = new Map<string, 'webgl' | 'canvas' | 'dom'>();
 /** Schluessel des Mass-Terminals in `rendererJePane` -- kein echter Pane hat je diese Kennung. */
 const MASS_TERMINAL_ID = '__mass__';
+/**
+ * Das GELADENE WebGL-Stueck je Terminal, damit es sich auch wieder abwerfen
+ * laesst. Gebraucht wird das an genau einer Stelle: `__awb.webglSperren()`
+ * (nur fuer Tests) stellt damit auch schon bestehende Terminals auf Canvas um
+ * -- siehe die Begruendung dort. Eingetragen wird ausschliesslich in
+ * `ladeRenderer()`, der einzigen Stelle, die WebglAddon ueberhaupt laedt.
+ */
+const webglJeTerminal = new Map<string, { addon: WebglAddon; term: Terminal }>();
+
+/**
+ * Canvas laden und festhalten, was jetzt wirklich zeichnet. Steht hier oben und
+ * nicht mehr nur in `ladeRenderer()`, weil `webglSperren()` denselben Weg
+ * braucht -- zwei Kopien davon liefen genau in dem Moment auseinander, in dem
+ * es darauf ankaeme.
+ */
+function canvasLaden(paneId: string, t: Terminal): void {
+  try {
+    t.loadAddon(new CanvasAddon());
+    rendererJePane.set(paneId, 'canvas');
+  } catch {
+    // Weder WebGL noch Canvas verfuegbar -- der eingebaute DOM-Renderer
+    // zeichnet weiter, nur ohne Beschleunigung. Kein Fehlerfall: xterm
+    // selbst braucht keinen der beiden Zusaetze, um etwas zu zeigen.
+    rendererJePane.set(paneId, 'dom');
+  }
+}
 
 /**
  * WebGL zuerst, mit Rueckfall auf Canvas und zuletzt den blossen DOM-Renderer
@@ -340,39 +383,49 @@ const MASS_TERMINAL_ID = '__mass__';
  * einen neuen Weg. Beide Terminals brauchen denselben Renderer.
  */
 function ladeRenderer(paneId: string, t: Terminal): void {
-  const aufCanvas = (): void => {
-    try {
-      t.loadAddon(new CanvasAddon());
-      rendererJePane.set(paneId, 'canvas');
-    } catch {
-      // Weder WebGL noch Canvas verfuegbar -- der eingebaute DOM-Renderer
-      // zeichnet weiter, nur ohne Beschleunigung. Kein Fehlerfall: xterm
-      // selbst braucht keinen der beiden Zusaetze, um etwas zu zeigen.
-      rendererJePane.set(paneId, 'dom');
-    }
-  };
-  // SOFORTMASSNAHME 2026-08-16: WebGL bleibt aus, gezeichnet wird auf Canvas.
-  // alice konnte nicht mehr arbeiten -- Text wurde ueber alten Inhalt
-  // geschrieben, ohne dass die Zeile geloescht wurde, zwei Bildschirmzustaende
-  // verschmolzen (Belege: ~/Downloads/Fehlerhaft*.png, 18:24-18:28). Der
-  // beschleunigte Renderer kam am 12.08. mit 21219e6 dazu, und genau diese
-  // Fehlerbilder sind bei xterm.js unter WebGL bekannt, vor allem nach
-  // Groessenaenderungen. Ob WebGL wirklich die Ursache ist, ist NICHT belegt --
-  // deshalb steht hier eine Massnahme und keine Diagnose: Canvas ist der
-  // naechstschnellste Weg und faellt als Fehlerquelle aus. Ein Worker misst
-  // parallel weiter (Ergebnis: ~/.pi-workers/results/termdarstellung/).
-  // Zurueckgenommen wird das erst, wenn die Ursache belegt und behoben ist;
-  // wer es frueher aufhebt, nimmt alice die Arbeitsfaehigkeit weg.
-  const WEBGL_AUS = true;
+  const aufCanvas = (): void => canvasLaden(paneId, t);
+  // SOFORTMASSNAHME 2026-08-16, AUFGEHOBEN 2026-08-19 auf Wort des Nutzers. Die
+  // Geschichte bleibt hier stehen, weil sie erklaert, wofuer diese Konstante
+  // ueberhaupt da ist -- und weil der Weg zurueck eine Zeile ist.
+  //
+  // Damals: alice konnte nicht mehr arbeiten -- Text wurde ueber alten
+  // Inhalt geschrieben, ohne dass die Zeile geloescht wurde, zwei
+  // Bildschirmzustaende verschmolzen (Belege: ~/Downloads/Fehlerhaft*.png,
+  // 18:24-18:28). Der beschleunigte Renderer kam am 12.08. mit 21219e6 dazu,
+  // und genau diese Fehlerbilder sind bei xterm.js unter WebGL bekannt, vor
+  // allem nach Groessenaenderungen. Ob WebGL wirklich die Ursache ist, war
+  // NICHT belegt -- deshalb stand hier eine Massnahme und keine Diagnose:
+  // Canvas ist der naechstschnellste Weg und faellt als Fehlerquelle aus.
+  //
+  // Inzwischen ist es gemessen, und WebGL war es NICHT: Bildpunktvergleich,
+  // zehn Proben, null Unterschied (Ergebnis: ~/.pi-workers/results/
+  // termdarstellung/). Die Ursache waren zwei Naehte in
+  // app/src/main/tmux.ts, beide behoben in f050ee5 -- eine mitten in einer
+  // Steuerfolge zerschnittene Ausgabe, deren erste Haelfte verworfen wurde
+  // (Fingerabdruck im Foto von 18:24: `machen8;5;153mcontext`, Rest von
+  // ESC[38;5;153m), und Bildschirminhalt plus Cursor aus zwei getrennten
+  // tmux-Befehlen mit einem Lesevorgang dazwischen (bei 10 von 129 Aufnahmen
+  // gemessen). Damit traegt die Sperre nichts mehr; sie kostete nur
+  // Zeichengeschwindigkeit.
+  //
+  // Wieder aufziehen heisst: `false` auf `true`. Die Zusage in
+  // shell/tests/test-app-scroll-renderer.sh liest den Wert hier und dreht
+  // sich von selbst mit, in beide Richtungen -- niemand muss daran denken.
+  // Offen und ausdruecklich unerklaert bleiben die grauen Balken auf dem
+  // Bildschirmfoto vom 16.08., 21:52; kommen sie unter WebGL wieder, ist das
+  // das Zeichen, hier wieder zuzumachen.
+  const WEBGL_AUS = false;
   if (WEBGL_AUS) { aufCanvas(); return; }
   try {
     const webgl = new WebglAddon();
     webgl.onContextLoss(() => {
       webgl.dispose();
+      webglJeTerminal.delete(paneId);
       aufCanvas();
     });
     t.loadAddon(webgl);
     rendererJePane.set(paneId, 'webgl');
+    webglJeTerminal.set(paneId, { addon: webgl, term: t });
   } catch {
     aufCanvas();
   }
@@ -522,6 +575,16 @@ function farbklasse(zustand: string): string {
   return 'aus';
 }
 
+/**
+ * Die Farbe einer Sitzung, die gerade STARTET, ist nicht die einer beendeten.
+ * Rot heisst hier im Haus „laeuft nicht mehr"; ein Start, der laeuft, ist das
+ * Gegenteil davon und bekommt deshalb dieselbe Farbe wie „wartet". Ein
+ * gescheiterter Start bleibt rot -- er ist wirklich nicht gelaufen.
+ */
+function startfarbe(s: Session): string {
+  return s.startet ? 'will' : farbklasse(s.state);
+}
+
 /** Schmal, mittel oder breit -- was ein Eintrag zeigt, haengt an der Breite. */
 function breitenmodus(w: number): 'schmal' | 'mittel' | 'breit' {
   if (w <= 64) return 'schmal';
@@ -612,13 +675,20 @@ function terminalZeile(
 ): HTMLDivElement {
   {
     const zeile = document.createElement('div');
-    zeile.className = `eintrag zustand-${s.state}`;
+    // `startet` und `startfehler` kommen als eigene Klassen dazu, nicht statt
+    // `zustand-stopped`: der Zustand ist weiter 'stopped' (es gibt keinen
+    // Pane), die Klasse sagt nur, warum er hier trotzdem steht.
+    const startKlasse = s.startet ? ' startet' : (s.startFehler ? ' startfehler' : '');
+    zeile.className = `eintrag zustand-${s.state}${startKlasse}`;
     zeile.dataset.id = s.id;
     // Eine verlorene Sitzung steht hier, obwohl beendete ausgeblendet sind --
     // dann gehoert auch der Grund dran, sonst sieht sie aus wie eine Leiche,
-    // die der Filter vergessen hat.
+    // die der Filter vergessen hat. Dasselbe gilt fuer die beiden Start-Faelle.
     const verlorenSatz = s.verloren ? '\nlief noch, als dieses Fenster zuletzt hinsah' : '';
-    zeile.title = `${s.name} — ${s.machine} — ${s.tmuxSession || 'keine tmux-Session'}${verlorenSatz}`;
+    const startSatz = s.startet
+      ? '\nstartet gerade — bei einem lokalen Modell dauert das Minuten'
+      : (s.startFehler ? '\nder Start ist gescheitert; der Grund stand in der Meldung' : '');
+    zeile.title = `${s.name} — ${s.machine} — ${s.tmuxSession || 'keine tmux-Session'}${verlorenSatz}${startSatz}`;
     // Gewaehlt ist die Sitzung, die man SIEHT. Liegt eine Chat-Sitzung auf der
     // Buehne, ist das keine Terminal-Sitzung -- zwei hervorgehobene Zeilen
     // waeren die Frage, welche von beiden gilt.
@@ -629,13 +699,13 @@ function terminalZeile(
     if (modus === 'schmal') {
       // Schmal gibt es nur die zwei Buchstaben, also faerben sie sich selbst.
       const kuerzel = document.createElement('div');
-      kuerzel.className = `kuerzel ${farbklasse(s.state)}`;
+      kuerzel.className = `kuerzel ${startfarbe(s)}`;
       kuerzel.textContent = s.initials;
       zeile.appendChild(kuerzel);
     } else {
       // Aufgezogen wandert die Farbe auf einen Punkt, die Schrift wird neutral.
       const punkt = document.createElement('div');
-      punkt.className = `punkt ${farbklasse(s.state)}-bg`;
+      punkt.className = `punkt ${startfarbe(s)}-bg`;
       zeile.appendChild(punkt);
 
       const texte = document.createElement('div');
@@ -653,7 +723,12 @@ function terminalZeile(
         // (sie liest sich wie "da ist nichts mehr"). Solange die Panes
         // abzufragen sind, ist es dieselbe Zahl wie vorher.
         const anzahl = s.workers.filter((w) => w.state !== 'done').length;
-        zusatz.textContent = `${s.machine} · ${anzahl} Worker`;
+        // Waehrend eines Starts ist die Zahl der Worker die uninteressanteste
+        // Auskunft, die hier stehen kann -- und „0 Worker" liest sich wie
+        // „da ist nichts". Solange etwas laeuft oder gescheitert ist, steht das.
+        zusatz.textContent = s.startet
+          ? `${s.machine} · startet…`
+          : (s.startFehler ? `${s.machine} · Start gescheitert` : `${s.machine} · ${anzahl} Worker`);
         texte.appendChild(zusatz);
       }
       zeile.appendChild(texte);
@@ -662,7 +737,11 @@ function terminalZeile(
       // mehr, ihre Maschine antwortet aber (main.ts prueft das beim Klick
       // ein zweites Mal gegen den dann aktuellen Stand). Zeigt vorher, was
       // passieren wird: Ordner und welche Unterhaltung fortgesetzt wird.
-      if (s.state === 'stopped') {
+      // NICHT waehrend eines laufenden Starts (21.08.): der Knopf wuerde einen
+      // zweiten Start neben den ersten setzen, und der Zustand 'stopped' ist
+      // hier nur die Vorstufe zur Sitzung, nicht ihr Ende. Nach einem
+      // GESCHEITERTEN Start steht er wieder da -- da ist er genau richtig.
+      if (s.state === 'stopped' && !s.startet) {
         const wiederherstellen = document.createElement('button');
         wiederherstellen.type = 'button';
         wiederherstellen.className = 'wiederherstellen';
@@ -1030,7 +1109,12 @@ function zeichneRechts(m: Model): void {
       zusatz: anhang ? `+${anhang}` : '',
       // Die Herkunft haengt am Worker, nicht an seiner Einrueckung: liegt er
       // in einem anderen Tab als sein Antragsteller, steht sie trotzdem da.
-      unten: herkunft(w) || zustandText(w),
+      //
+      // EIN WORKER AUS EINEM PANE (19.08., `fremdePanes` in sessions.ts) hat
+      // keine Zustandsdatei und damit weder Modell noch Kontextzahl. Was ihn
+      // beschreibt, ist der Pane-Titel -- er steht hier statt einer Zustands-
+      // zeile, die aus lauter Unbekannten bestuende.
+      unten: herkunft(w) || (w.titel || zustandText(w)),
       pane: w.paneId,
       marke: kuerzel(w.name),
     });
@@ -1531,7 +1615,83 @@ function kachelAusRaster(
   };
 }
 
-function kachelLage(anzahl: number, spalten: number): { x: number; y: number; b: number; h: number }[] {
+/**
+ * `breiten` ist die Spaltenzahl JE PANE, in der Reihenfolge der Kacheln, und
+ * `flaecheCols` die Spaltenzahl der ganzen Buehne. Damit teilt eine Reihe ihre
+ * Breite nach dem, was die Panes wirklich brauchen, statt zu gleichen Teilen.
+ *
+ * DER GRUND: tmux teilt eine Reihe nicht gleichmaessig, sondern verteilt den
+ * Rest -- bei drei Spalten auf 133 Zellen werden daraus 44, 44 und 45. Bei
+ * gleich breiten Kacheln (je ein Drittel) ist der Pane mit 45 Spalten dann
+ * breiter als seine Kachel, und das letzte Zeichen jeder Zeile wird
+ * abgeschnitten. GEMESSEN am 19.08. kopflos mit sieben und acht Workern im
+ * Layout 'split': Schirm 338 Bildpunkte in einer Kachel von 334.
+ *
+ * Verteilt wird nur, wenn die Reihe zusammen NICHT breiter ist als die Buehne
+ * -- sonst waere die Rechnung ein Verschieben des Abschnitts von einem Pane auf
+ * den naechsten. Fehlt eine Zahl (ein angeforderter Pane, den es nicht gibt),
+ * bleibt es bei gleichen Teilen.
+ */
+/**
+ * DIE KACHELN, WENN DER TAB NUR EINEN TEIL EINES FENSTERS ZEIGT.
+ *
+ * Die Lage der gezeigten Panes ist die von tmux -- zwischen ihnen fehlen aber
+ * Zellen (im Layout 'split' die des Orchestrators). Zwei Zusagen zugleich:
+ *
+ *   - KEINE LUECKE. Jede Reihe wird auf die volle Breite verteilt, die Reihen
+ *     zusammen auf die volle Hoehe. Was fehlt, hinterlaesst kein leeres Viertel.
+ *   - NICHTS ABGESCHNITTEN. Verteilt wird nach der Spalten- und Zeilenzahl der
+ *     Panes selbst. Weil die gezeigten Panes einer Reihe zusammen nie mehr
+ *     Spalten haben als das Fenster, ist jede Kachel mindestens so breit wie
+ *     ihr Inhalt; fuer die Hoehe gilt dasselbe.
+ *
+ * Bis dahin fiel dieser Fall auf das gleichmaessige Gitter zurueck, das die
+ * wirkliche Groesse der Panes nicht kennt. GEMESSEN am 19.08. kopflos mit vier
+ * Workern im Layout 'split': tmux hatte dem letzten Pane 133 Spalten gegeben
+ * (998 Bildpunkte), seine Kachel war 501 breit -- die halbe Ausgabe stand
+ * ausserhalb.
+ */
+function kachelnAusTeilraster(
+  boxen: PaneBox[],
+  buehneZellen: { cols: number; rows: number },
+): { x: number; y: number; b: number; h: number }[] {
+  const { b: flaecheB, h: flaecheH } = gitterFlaeche();
+  // Die Reihen des Fensters, in der Reihenfolge von oben nach unten; leere
+  // Reihen (nur ungezeigte Panes) fallen dabei ganz weg.
+  const reihen = [...new Set(boxen.map((b) => b.y))].sort((a, b) => a - b);
+  const hoeheJeReihe = reihen.map((y) => Math.max(...boxen.filter((b) => b.y === y).map((b) => b.rows)));
+  const summeHoehe = hoeheJeReihe.reduce((a, b) => a + b, 0) || 1;
+  // Der Riegel gegen eine Aufteilung, die den Inhalt doch beschneiden wuerde:
+  // gemessen wird gegen die BUEHNE in Zellen, nicht gegen das Fenster. Das
+  // Fenster ist in diesem Fall absichtlich groesser (main.ts, zweiter
+  // Durchgang); massgeblich ist, ob die gezeigten Panes zusammen auf die Buehne
+  // passen. Tun sie es nicht, gleiche Teile -- dann ist ohnehin nichts zu
+  // retten.
+  const hoehePasst = summeHoehe <= buehneZellen.rows;
+  const lagen = new Map<string, { x: number; y: number; b: number; h: number }>();
+  let oben = 0;
+  for (const [n, y] of reihen.entries()) {
+    const inReihe = boxen.filter((b) => b.y === y).sort((a, b) => a.x - b.x);
+    const summeBreite = inReihe.reduce((a, b) => a + b.cols, 0) || 1;
+    const breitePasst = summeBreite <= buehneZellen.cols;
+    const h = hoehePasst ? (hoeheJeReihe[n] / summeHoehe) * flaecheH : flaecheH / reihen.length;
+    let links = 0;
+    for (const box of inReihe) {
+      const b = breitePasst ? (box.cols / summeBreite) * flaecheB : flaecheB / inReihe.length;
+      lagen.set(box.paneId, { x: links, y: oben, b, h });
+      links += b;
+    }
+    oben += h;
+  }
+  return boxen.map((box) => lagen.get(box.paneId) ?? { x: 0, y: 0, b: flaecheB, h: flaecheH });
+}
+
+function kachelLage(
+  anzahl: number,
+  spalten: number,
+  breiten?: number[],
+  flaecheCols?: number,
+): { x: number; y: number; b: number; h: number }[] {
   const { b: flaecheB, h: flaecheH } = gitterFlaeche();
   const zeilen = Math.max(1, Math.ceil(anzahl / spalten));
   const hoehe = flaecheH / zeilen;
@@ -1539,8 +1699,16 @@ function kachelLage(anzahl: number, spalten: number): { x: number; y: number; b:
   for (let z = 0; z < zeilen; z++) {
     const inZeile = Math.min(spalten, anzahl - z * spalten);
     if (inZeile <= 0) break;
-    const breite = flaecheB / inZeile;
-    for (let i = 0; i < inZeile; i++) lagen.push({ x: i * breite, y: z * hoehe, b: breite, h: hoehe });
+    const cols = breiten?.slice(z * spalten, z * spalten + inZeile) ?? [];
+    const summe = cols.reduce((a, b) => a + b, 0);
+    const nachMass =
+      cols.length === inZeile && cols.every((c) => c > 0) && !!flaecheCols && summe <= flaecheCols;
+    let x = 0;
+    for (let i = 0; i < inZeile; i++) {
+      const breite = nachMass ? (cols[i] / summe) * flaecheB : flaecheB / inZeile;
+      lagen.push({ x, y: z * hoehe, b: breite, h: hoehe });
+      x += breite;
+    }
   }
   return lagen;
 }
@@ -1593,6 +1761,8 @@ function zeichneLage(p: LayoutPayload): void {
   // Faelle, in denen es kein gemeinsames Raster GIBT: Panes aus mehreren
   // Fenstern, oder ein Fenster, von dem nur ein Teil gezeigt wird.
   const raster = p.art === 'tab' ? p.raster : undefined;
+  const teilraster = p.art === 'tab' && !raster ? p.rasterTeil : undefined;
+  const teilKacheln = teilraster ? kachelnAusTeilraster(p.panes, { cols: p.cols, rows: p.rows }) : null;
   // Ein EINZELN gezeigter Pane bekommt die ganze Buehne als Kachel -- dieselbe
   // Regel wie im Tab: die Kachel bestimmt den Kasten, nicht der Inhalt. Bis
   // zum 06.08. bekam er die Groesse seines Inhalts, und damit wanderte jede
@@ -1603,7 +1773,14 @@ function zeichneLage(p: LayoutPayload): void {
   // Frage -- die beantwortet die Groesse, die tmux bekommt.
   const kacheln =
     p.art === 'tab'
-      ? (raster ? null : kachelLage(p.panes.length + (p.fehlend?.length ?? 0), Math.max(1, p.spalten ?? 1)))
+      ? (raster || teilKacheln
+          ? null
+          : kachelLage(
+              p.panes.length + (p.fehlend?.length ?? 0),
+              Math.max(1, p.spalten ?? 1),
+              [...p.panes.map((b) => b.cols), ...(p.fehlend ?? []).map(() => 0)],
+              p.cols,
+            ))
       : [{ x: 0, y: 0, ...gitterFlaeche() }];
 
   for (const [i, box] of p.panes.entries()) {
@@ -1707,7 +1884,7 @@ function zeichneLage(p: LayoutPayload): void {
     if (eintrag.term.cols !== box.cols || eintrag.term.rows !== box.rows) {
       eintrag.term.resize(box.cols, box.rows);
     }
-    const kachel = raster ? kachelAusRaster(box, raster) : kacheln?.[i];
+    const kachel = raster ? kachelAusRaster(box, raster) : (teilKacheln?.[i] ?? kacheln?.[i]);
     const kx = kachel ? kachel.x : (box.x - x0) * zelle.breite;
     const ky = kachel ? kachel.y : (box.y - y0) * zelle.hoehe;
     // Die Kachel bestimmt den Kasten, nicht der Inhalt.
@@ -1796,6 +1973,9 @@ function zeichneLage(p: LayoutPayload): void {
     e.el.remove();
     paneTerms.delete(id);
     rendererJePane.delete(id);
+    // Sonst hielte die Sammelstelle ein weggeworfenes Terminal fest, und
+    // `webglSperren()` liefe spaeter darauf zu.
+    webglJeTerminal.delete(id);
     chatAnbindungen.get(id)?.weg();
     chatAnbindungen.delete(id);
   }
@@ -2360,6 +2540,18 @@ window.awbBridge.onModel((m) => {
   auskunft.layout = m.mayArrange ? 'eigene Session, darf geordnet werden' : 'fremde Session, nur gezeichnet';
   zeichneSessions(m);
   zeichneRechts(m);
+  // DIE NAMENSSCHILDER HAENGEN AM MODELL, nicht nur an der Lage.
+  //
+  // `zeigeNamen()` lief bisher allein beim Zeichnen einer Lage und beim Wechsel
+  // des aktiven Panes. Der NAME eines Panes kommt aber aus dem Modell, und das
+  // trifft eigenen Takt: ein Pane, der beim letzten Zeichnen noch keinen Worker
+  // hatte, behielt sein Schild -- und das ist dann die rohe Kennung. GEMESSEN am
+  // 19.08. kopflos: bei zwei Workern stand auf dem zweiten Pane dauerhaft "%2"
+  // statt "mlxsrv", waehrend das Modell im Hauptprozess den Namen laengst
+  // fuehrte (`awb-ctl sessions`: paneId %2, name mlxsrv); acht Sekunden spaeter
+  // stand dort immer noch "%2". Bei drei Workern stimmte es, weil dort zufaellig
+  // nach dem Modell noch einmal gezeichnet wurde.
+  zeigeNamen();
   if (statuszeileEl) zeichneStatuszeile(statuszeileEl, m.ampel, m.budget);
   // Jede stehende Ergebnismeldung gegen den laufenden Auftrag halten: `resultPath`
   // ist die Datei des Auftrags, an dem der Worker JETZT haengt (leer, solange er
@@ -2600,12 +2792,38 @@ window.__awb = {
   },
 
   /**
-   * NUR FUER TESTS: macht `getContext('webgl2')` unbrauchbar, BEVOR ein Pane
-   * angelegt wird -- damit sich der Rueckfall auf Canvas ueberhaupt ausloesen
-   * laesst, ohne auf einen Chromium-Schalter angewiesen zu sein, der je nach
-   * Treiber und Software-Rasterisierer (SwiftShader) trotzdem noch einen
-   * Kontext liefert. Wirkt nur auf DIESEN Fensterprozess, nur bis zum
-   * naechsten Neuladen.
+   * NUR FUER TESTS: WebGL fuer dieses Fenster unbrauchbar machen -- damit sich
+   * der Rueckfall auf Canvas ueberhaupt ausloesen laesst, ohne auf einen
+   * Chromium-Schalter angewiesen zu sein, der je nach Treiber und
+   * Software-Rasterisierer (SwiftShader) trotzdem noch einen Kontext liefert.
+   * Wirkt nur auf DIESEN Fensterprozess, nur bis zum naechsten Neuladen.
+   *
+   * ZWEI HAELFTEN, und die zweite kam am 19.08. dazu:
+   *
+   *   1. `getContext('webgl2')` gibt nichts mehr her. Das gilt fuer jedes
+   *      Terminal, das DANACH entsteht -- der Rueckfall in `ladeRenderer()`
+   *      greift dort von selbst.
+   *   2. Jedes Terminal, das SEIN WebGL SCHON GELADEN hat, wird hier
+   *      umgestellt: Zusatz abwerfen, Canvas laden, Buchfuehrung nachziehen.
+   *
+   * Warum die zweite Haelfte fehlte und warum das niemandem auffiel: Bis zum
+   * 19.08. stand `WEBGL_AUS = true` in `ladeRenderer()`, und die Konstante
+   * sorgte fuer Canvas, ganz gleich ob diese Sperre etwas taugte. Der Riegel
+   * hier war also nie gemessen, sondern vom anderen verdeckt. Mit dem Fall der
+   * Konstante kam es heraus: `test-app-zweitblick-verschmelzung.sh` sperrt
+   * WebGL, NACHDEM das Terminal seines Messpanes laengst steht, und bekam
+   * weiterhin 'webgl' zurueck -- die Zusage, an der die ganze Suite haengt,
+   * war damit wertlos.
+   *
+   * Der Name ist die Begruendung: was `webglSperren` heisst, muss WebGL
+   * sperren, nicht nur den naechsten Kontextwunsch. Eine Sperre, die einen
+   * schon laufenden Fall auslaesst, ist eine Zusage mit einer Ausnahme, die
+   * nirgends steht.
+   *
+   * Was das fuer `test-app-scroll-renderer.sh` bedeutet, die denselben Helfer
+   * benutzt: nichts. Dort wird 'im Normallauf ist WebGL aktiv' an P1 gemessen,
+   * BEVOR diese Sperre faellt; danach misst die Suite nur noch P2, und der
+   * kommt so oder so auf Canvas.
    */
   webglSperren(): boolean {
     const original = HTMLCanvasElement.prototype.getContext;
@@ -2613,6 +2831,20 @@ window.__awb = {
       if (art === 'webgl2' || art === 'webgl') return null;
       return (original as (...a: unknown[]) => unknown).apply(this, [art, ...rest]);
     } as typeof HTMLCanvasElement.prototype.getContext;
+    // Ueber eine Kopie laufen: `canvasLaden()` schreibt in `rendererJePane`,
+    // und `delete` waehrend des Durchlaufs waere ein Griff in die Sammelstelle,
+    // aus der gerade gelesen wird.
+    for (const [id, { addon, term }] of [...webglJeTerminal]) {
+      webglJeTerminal.delete(id);
+      try {
+        addon.dispose();
+      } catch {
+        // Schon abgeworfen oder nie richtig oben -- der naechste Schritt
+        // (Canvas laden) ist trotzdem der richtige, und er ist der einzige,
+        // an dem die Messung danach haengt.
+      }
+      canvasLaden(id, term);
+    }
     return true;
   },
 
@@ -2946,9 +3178,22 @@ window.__awb = {
         // Die Spalte, die xterm fuer die Bildlaufleiste freihaelt. Sie gehoert
         // zum Terminal und ist kein ungenutzter Rand.
         bildlaufleiste: Math.round(buehneRect.width - (gitter?.width ?? buehneRect.width)),
+        // DIE GEMESSENE ZELLE EINES GEZEICHNETEN PANES -- nicht mehr die Flaeche
+        // geteilt durch das Mass-Terminal.
+        //
+        // Das Mass-Terminal (`term`) steht in der Tab-Ansicht unberuehrt auf
+        // seinen Anfangswerten 80x24. Die Flaeche dadurch zu teilen ergab eine
+        // Zahl, die mit dem Gezeichneten nichts zu tun hat: bei einer Buehne von
+        // 1384x876 meldete sie 17,3 x 36,5, waehrend die Zellen in Wirklichkeit
+        // 7,5 x 15,4 gross waren (184 Spalten, 57 Zeilen). Aus dem Verhaeltnis
+        // der beiden Zahlen (2,3) liess sich ein Fehler bei der Umrechnung
+        // zwischen Geraetepixeln und CSS-Punkten lesen, den es nicht gibt --
+        // 184 x 7,5 = 1380 und 57 x 15,4 = 878 gehen sauber auf. `zellmass()`
+        // misst am gezeichneten Pane und ist dieselbe Zahl, mit der auch
+        // gerechnet wird.
         zelle: {
-          breite: Number((((gitter?.width ?? 0) / (term.cols || 1))).toFixed(2)),
-          hoehe: Number((((gitter?.height ?? 0) / (term.rows || 1))).toFixed(2)),
+          breite: Number(zellmass().breite.toFixed(2)),
+          hoehe: Number(zellmass().hoehe.toFixed(2)),
         },
         // Lage im FENSTER, nicht in der Buehne: damit laesst sich auf einem
         // Selbstfoto genau der Bereich nachmessen, in dem der Pane steht.

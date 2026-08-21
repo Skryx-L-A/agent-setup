@@ -39,6 +39,12 @@
 //                       Bruecke, die mehr anbietet als das Fenster benutzt, ist
 //                       eine Angriffsflaeche ohne Gegenwert" gilt auch hier.
 //
+// NEUNTER WEG: kontextStufen(modellId) -- die waehlbaren Kontextfenster eines
+// LOKALEN Modells, gemessen von `wb-kontext`. Er fuehrt nicht in `daten()` mit,
+// weil die Antwort am gewaehlten Modell haengt und den FREIEN Speicher misst:
+// eine Liste fuer alle Modelle waere teuer und morgen falsch. Nur Lesen; der
+// Kanal schreibt nichts, die Wahl selbst geht wie jede andere ueber `setzen()`.
+//
 // ACHTER WEG (12.08.): meldungTesten() -- der Knopf 'Test senden' auf der
 // Seite Aufsicht und Meldungen. Er sendet eine ECHTE Probe (siehe
 // main/melden.ts, meldenTesten()) und bekommt je Weg zurueck, was passiert
@@ -61,6 +67,7 @@ contextBridge.exposeInMainWorld('awbEinstellungen', {
   schluesselSetzen: (providerId: string, wert: string) =>
     ipcRenderer.invoke('awb:ein-schluessel-setzen', providerId, wert),
   meldungTesten: () => ipcRenderer.invoke('awb:ein-meldung-testen'),
+  kontextStufen: (modellId: string) => ipcRenderer.invoke('awb:kontext-stufen', modellId),
   erststartZeigen: (echt: boolean) =>
     ipcRenderer.send('awb:bedienung', { aktion: echt ? 'erststart-zeigen' : 'erststart-bauen', wert: null }),
 });

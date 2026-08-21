@@ -1,7 +1,7 @@
 #!/bin/bash
 # wb-decide — the ORCHESTRATOR decides a worker's request for a sub-worker.
 #
-#   wb-decide <antrags-datei> approve|reject <ein-satz-begruendung>
+#   wb-decide <antrags-datei> approve|reject [begruendung]
 #
 # Writes <antrag>.decision, updates the decision column of
 # ~/.pi-workers/requests/log.tsv and, on approve, prints the ready-to-run spawn
@@ -15,7 +15,11 @@ LOG="$HOME/.pi-workers/requests/log.tsv"
 
 [ -f "$REQ" ] || { echo "wb-decide: Antrag nicht gefunden: $REQ" >&2; exit 2; }
 case "$ACTION" in approve|reject) ;; *) echo "wb-decide: '$ACTION' ist weder approve noch reject." >&2; exit 2 ;; esac
-[ -n "$REASON" ] || { echo "wb-decide: Begruendung fehlt (ein Satz genuegt, sie steht spaeter in der Auswertung)." >&2; exit 2; }
+# Die Begruendung ist FREIWILLIG (19.08., auf Ansage des Nutzers): steht sie da,
+# landet sie unveraendert in der .decision-Datei und damit in der Auswertung;
+# steht sie nicht da, wird trotzdem entschieden. Ein leeres $* ist hier
+# ungefaehrlich, weil REASON alles NACH Antrag und Aktion einsammelt -- es kann
+# nichts an eine andere Stelle rutschen.
 if [ -e "$REQ.decision" ]; then
   echo "wb-decide: bereits entschieden — $REQ.decision:" >&2
   cat "$REQ.decision" >&2
@@ -92,9 +96,13 @@ finally:
 PY
 fi
 
+# Eine Zeile, die auch ohne Begruendung etwas sagt -- "Begruendung: " mit nichts
+# dahinter liest sich wie ein Fehler, und genau das ist es hier nicht mehr.
+grundzeile() { [ -n "$REASON" ] && echo "Begruendung: $REASON" || echo "Begruendung: keine angegeben"; }
+
 if [ "$ACTION" = reject ]; then
   echo "Abgelehnt: $REQ"
-  echo "Begruendung: $REASON"
+  grundzeile
   exit 0
 fi
 
@@ -106,7 +114,7 @@ case "$R_CHILD_MODEL" in
 esac
 
 echo "Genehmigt: $REQ"
-echo "Begruendung: $REASON"
+grundzeile
 [ -n "$R_FILES" ] && echo "Dateien laut Antrag: $R_FILES"
 echo
 echo "Starten (der Orchestrator fuehrt das aus, nichts passiert automatisch):"

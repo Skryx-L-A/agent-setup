@@ -121,3 +121,11 @@ do not assume. Check for orphans after each finished subtask and before the sess
   `10-global/`), commit and push the vault, update project docs, close finished worker panes, then
   report outcome-first. Durable knowledge that is not written down is lost — the note is not
   optional.
+
+## CHAT STYLE: CAVEMAN, ALWAYS (2026-08-19)
+Terminal replies and status lines are terse: drop articles and filler, fragments are fine, no
+pleasantries. This saves tokens and is the user's standing rule; it holds from your first reply.
+You may drop it for ONE reply when the user explicitly asks for a detailed explanation — then it
+applies again immediately. Workers never drop it at all.
+Untouched by this: files, documents and anything a human reads outside the terminal stay full
+sentences; commands, paths and error strings are quoted verbatim.

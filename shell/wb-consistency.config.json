@@ -433,7 +433,27 @@
           ]
         }
       ]
-    }
+    },
+    "registry_paare": [
+      {
+        "_comment": "Sorte E (2026-08-20): inhaltlicher Vergleich statt Byte-Diff -- Anlass: shell/models.default.json trug 'bleibt als zweite, waehlbare Moeglichkeit', die lebende Registry noch das GEGENTEIL ('faellt aus der Wahl'), unbemerkt bis von Hand nachgezogen. id_felder bestimmt, woran ein Listeneintrag WIEDERERKANNT wird (id > name > class, der erste vorhandene UND eindeutige gewinnt); ein Feld, das nur auf einer Seite steht, ist erlaubt (unbekannte Schluessel duerfen ueberleben) und kein Fund. KEINE veraltet/eigenmaechtig-Unterscheidung wie bei Sorte A -- die Registry wird nachweislich in BEIDEN Richtungen gepflegt (contextWindow-Werte gemessen: die lebende Fassung war mehrfach die NEUERE, nicht die Vorlage), eine erzwungene Richtung haette dort die falsche Seite beschuldigt.",
+        "name": "models.json",
+        "vorlage": "{REPO}/shell/models.default.json",
+        "echt": "{BASE}/.claude/workbench/models.json",
+        "listen_felder": [
+          "models",
+          "providers",
+          "harnesses"
+        ],
+        "id_felder": [
+          "id",
+          "name",
+          "class"
+        ]
+      }
+    ],
+    "registry_ausnahmen": [],
+    "_comment_registry_ausnahmen": "Felder, die je Maschine verschieden sein DUERFEN -- heute leer, und das ist gemessen: bei allen 16 Abweichungen vom 2026-08-20 war jede echte Drift und keine einzige ein 'so soll es bleiben'. Drei Schreibweisen, von grob nach fein: 'contextPattern' (dieses Blatt ueberall), 'harnesses.contextPattern' (in dieser Liste), 'harnesses[claude].contextPattern' (nur in diesem Eintrag). Datenfeld statt Codewechsel: eine Ausnahme wird hier eingetragen, nicht in wb-consistency."
   },
   "check8_test_socket": {
     "test_globs": [
@@ -446,5 +466,37 @@
       ".json"
     ],
     "live_session_prefix": "wb-"
+  },
+  "check9_harness_konfig": {
+    "_comment": "Konfigurations-Vorlagen fuer fremde Harnesses (crush, kimi, nanocoder, cline, forge -- die *.default.*-Dateien direkt unter shell/, deren Ziel NICHT ~/.local/bin ist). Ihr Vorlage-Ziel-Paar steht bereits maschinenlesbar in der Registry (configFiles je Harness-Eintrag, SPEC-V3-MODELS A.2) und wird bereits von shell/wb-harness-config verglichen -- EIGENER Merkposten (~/.local/state/wb-harness-config.json, Pruefsumme statt Git-Historie), weil das Ziel oft gar nicht in einem Repo liegt. Dieser Check erfindet die Unterscheidung nicht neu: er ruft wb-harness-config als EIGENEN Prozess mit umgelenktem HOME/WB_HARNESS_CONFIG_SRC auf (nie ein Import in denselben Interpreter -- ein Testlauf mit --base darf nie das echte HOME des aufrufenden Prozesses sehen) und uebersetzt dessen Befunde in Findings. wb-ausrollen ruft aus demselben Grund 'wb-harness-config apply' auf, statt die Kopierlogik ein zweites Mal zu schreiben.",
+    "skript": "{REPO}/shell/wb-harness-config",
+    "quelle_verzeichnis": "{REPO}/shell"
+  },
+  "check10_pane_quellen": {
+    "_comment": "Check 10 (2026-08-20): woraus ein Werkzeug seine Auskunft ueber einen Pane zieht. PANE-OHNE-SERVER -- spricht einen Pane an, kann aber den tmux-Server nicht waehlen; '%0' gibt es auf jedem Server, und genau so ist eine Testnachricht in eine laufende Sitzung geraten. PANE-VERLAUF-OHNE-ALTSCREEN -- liest capture-pane -S -<n>, ohne zu wissen, dass der Alternate Screen keinen Verlauf hat (alternate_on=1 heisst history_size=0). Beides HINWEIS, nicht Fehler: es gibt legitime Faelle.",
+    "globs": [
+      "shell/wb-*",
+      "shell/pi-worker",
+      "shell/claude-worker",
+      "hooks/*.py"
+    ],
+    "exclude_substrings": [
+      ".default.json",
+      ".config.json",
+      "/tests/"
+    ]
+  },
+  "check11_pipefail_erstglied": {
+    "_comment": "Check 11 (2026-08-20): eine Pipe unter 'set -o pipefail', deren erstes Glied ein bekanntes Werkzeug ist, das mehrere unabhaengige Bedingungen zu EINEM Rueckgabewert aggregiert ('models check' in wb-state, sys.exit(0 if ok else 1)) -- unter pipefail liefert die Pipe DESSEN Rueckgabewert statt den des grep, auch wenn die gesuchte Zeile in der Ausgabe steht (Fall B1, test-harness-baukasten.sh, behoben in c2e2752). Absichtlich auf die bekannte Liste RISIKO_UNTERKOMMANDOS beschraenkt (im Skript, nicht hier): eine allgemeine 'jede Pipe vor grep ist verdaechtig'-Regel hat gegen den ganzen Testbaum ~55 falsche Alarme erzeugt (tmux capture-pane, awb-ctl, awk -- alle mit korrekt gekoppeltem Fehlschlag). Anders als Check 10: 'shell/tests/' ist hier bewusst NICHT ausgeschlossen, denn B1 lebte in einer Testdatei.",
+    "globs": [
+      "shell/wb-*",
+      "shell/pi-worker",
+      "shell/claude-worker",
+      "shell/tests/*.sh"
+    ],
+    "exclude_substrings": [
+      ".default.json",
+      ".config.json"
+    ]
   }
 }

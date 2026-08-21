@@ -176,9 +176,11 @@ export function sendSelectionToOrchestrator(tmuxSocket: string, paneId: string, 
         reject(new Error(`tmux load-buffer schlug fehl: ${stderr.trim() || `Exitcode ${code}`}`));
         return;
       }
-      const paste = spawnSync('tmux', [...baseArgs, 'paste-buffer', '-p', '-b', bufName, '-d', '-t', paneId], { encoding: 'utf8' });
+      // FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden): oertlich,
+      // 2s wie die anderen bare-tmux-Aufrufe dieses Hauses.
+      const paste = spawnSync('tmux', [...baseArgs, 'paste-buffer', '-p', '-b', bufName, '-d', '-t', paneId], { encoding: 'utf8', timeout: 2000 });
       if (paste.status !== 0) {
-        reject(new Error(`tmux paste-buffer schlug fehl: ${(paste.stderr || '').trim()}`));
+        reject(new Error(`tmux paste-buffer schlug fehl: ${paste.signal ? 'nach 2000ms abgebrochen' : (paste.stderr || '').trim()}`));
         return;
       }
       resolvePromise();

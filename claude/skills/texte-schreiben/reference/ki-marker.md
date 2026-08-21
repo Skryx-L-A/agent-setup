@@ -241,7 +241,7 @@ aufzuzählen, liest sich wie ein zweiter Bewerbungsversuch und verschiebt den Zw
 - **Vorher:** „Am Interesse hat sich nichts geändert. Der Stack, den ihr fahrt, ist der, in
   dem ich täglich arbeite: n8n läuft bei mir selbst gehostet mit vier ausgerollten Workflows,
   Claude Code ist meine Arbeitsumgebung, und was ich an Agenten-Orchestrierung gebaut habe,
-  liegt offen unter github.com/Skryx-L-A/agent-workbench."
+  liegt offen unter github.com/<your-github-user>/agent-workbench."
 - **Nachher:** „Mein Interesse ist unverändert – ich würde wirklich gern bei euch anfangen.
   Falls euch für die Entscheidung noch etwas von mir fehlt, sagt einfach Bescheid, ich
   schicke es sofort."

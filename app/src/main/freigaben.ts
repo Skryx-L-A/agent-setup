@@ -105,10 +105,19 @@ export function decideRequest(
   wbDecideBin: string,
 ): DecideResult {
   const home = dirname(dirname(requestsDir));
+  // FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden): ein externes
+  // Werkzeug ohne `timeout` kann den Hauptprozess unbegrenzt anhalten, wenn es
+  // haengt -- auch wenn `wb-decide` heute schnell ist, ist das keine Zusage
+  // fuer morgen. 10s wie bei den anderen lokalen Werkzeug-Aufrufen dieses
+  // Hauses (schluesselbund.ts).
   const r = spawnSync(wbDecideBin, [reqPath, action, reason], {
     encoding: 'utf8',
     env: { ...process.env, HOME: home },
+    timeout: 10_000,
   });
+  if (r.error || r.signal) {
+    process.stderr.write(`decideRequest(${wbDecideBin}): ${r.signal ? 'nach 10000ms abgebrochen' : r.error?.message}\n`);
+  }
   const output = `${r.stdout ?? ''}${r.stderr ?? ''}`;
   return { ok: r.status === 0, output };
 }
@@ -209,12 +218,17 @@ function alleTmuxPanes(tmuxSocket: string): Set<string> | null {
   // Kodierung mitgeben -- dieselbe Regel wie in sessions.ts und tmux.ts, siehe
   // den Kopf von pfad.ts. Ein einzelnes Feld je Zeile ist von der fehlenden
   // Zeichenklasse nicht betroffen; die Regel gilt trotzdem einheitlich.
+  // FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden): oertlich, 2s
+  // wie die anderen bare-tmux-Aufrufe dieses Hauses.
   const r = spawnSync('tmux', [...basis, 'list-panes', '-a', '-F', '#{pane_id}'], {
     encoding: 'utf8',
     env: mitMaschinenLocale(),
+    timeout: 2000,
   });
-  // `r.error` faengt den Fall, in dem tmux gar nicht erst startet; `status`
-  // ungleich 0 den, in dem es abbricht. Beides ist keine Auskunft ueber Panes.
+  // `r.error` faengt den Fall, in dem tmux gar nicht erst startet (oder die
+  // Frist ablief, `r.signal` gesetzt); `status` ungleich 0 den, in dem es
+  // abbricht. Beides ist keine Auskunft ueber Panes.
+  if (r.signal) process.stderr.write('alleTmuxPanes: tmux nach 2000ms abgebrochen -- gilt als unbekannt.\n');
   if (r.error || r.status !== 0) return null;
   return new Set((r.stdout || '').split('\n').filter(Boolean));
 }
@@ -460,7 +474,10 @@ export function freigabeErteilen(
   mensch: boolean,
 ): FreigabeErgebnis {
   if (!eintrag.wartet) return { ok: false, output: 'Dieser Eintrag wartet nicht auf eine Freigabe.' };
-  if (!reason.trim()) return { ok: false, output: 'Begruendung fehlt -- ein Satz genuegt.' };
+  // Die Begruendung ist FREIWILLIG (19.08.): sie stand hier als Pflicht, obwohl
+  // sie nie das war, was eine Freigabe traegt -- das ist die gemessene Herkunft
+  // drei Zeilen weiter. Ein Satz Text hat nie jemanden aufgehalten, der ihn
+  // hinschreiben wollte.
   if (!mensch) {
     return {
       ok: false,
@@ -474,7 +491,13 @@ export function freigabeErteilen(
   const schluessel = freigabeSchluessel(eintrag.pane, eintrag.cwd, eintrag.command);
   const r = spawnSync(
     umgebung.bin,
-    ['erteilen', '--ttl', String(ttl), '--schluessel', schluessel, eintrag.pane, reason],
+    // Die Begruendung geht als SCHALTER hinaus, nicht als Stellungsargument
+    // (19.08.). Sie darf jetzt leer sein, und ein leeres Stellungsargument ist
+    // die Art Argument, die beim naechsten Umbau still an die falsche Stelle
+    // rutscht -- dann laese `wb-freigabe` den Pane als Grund oder umgekehrt.
+    // `--grund` benennt, was es traegt; der Pane bleibt das einzige, was
+    // hinten steht.
+    ['erteilen', '--ttl', String(ttl), '--schluessel', schluessel, '--grund', reason, eintrag.pane],
     {
       encoding: 'utf8',
       env: {
@@ -485,6 +508,11 @@ export function freigabeErteilen(
         WB_MENSCH_QUELLE: 'oberflaeche',
         WB_APP_PID: String(umgebung.appPid),
       },
+      // FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden): ein
+      // haengendes `wb-freigabe erteilen` haette sonst den Hauptprozess
+      // unbegrenzt angehalten. Ein Zeitablauf landet ganz von selbst im
+      // bestehenden Fehlerzweig unten (`r.error`) und damit im Verlauf.
+      timeout: 10_000,
     },
   );
   const ausgabe = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim();
@@ -515,8 +543,18 @@ export function freigabeVerweigern(
   reason: string,
 ): FreigabeErgebnis {
   if (!eintrag.wartet) return { ok: false, output: 'Dieser Eintrag wartet nicht auf eine Freigabe.' };
-  if (!reason.trim()) return { ok: false, output: 'Begruendung fehlt -- ein Satz genuegt.' };
-  verlaufAnhaengen(logFile, 'muster-abgelehnt', `Freigabe verweigert (${eintrag.muster}): ${reason}`, eintrag);
+  // Freiwillig wie beim Erteilen (19.08.). Fehlt sie, sagt die Verlaufszeile das
+  // ausdruecklich -- sonst endete sie mit einem Doppelpunkt ins Leere, und
+  // niemand saehe spaeter, ob der Grund fehlte oder verlorenging.
+  const grund = reason.trim();
+  verlaufAnhaengen(
+    logFile,
+    'muster-abgelehnt',
+    grund
+      ? `Freigabe verweigert (${eintrag.muster}): ${grund}`
+      : `Freigabe verweigert (${eintrag.muster}), ohne Begruendung.`,
+    eintrag,
+  );
   try {
     unlinkSync(eintrag.path);
   } catch {

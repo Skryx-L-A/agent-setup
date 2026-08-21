@@ -201,6 +201,16 @@ def sag(*zeilen):
 # NIE ein Muster — sie stehen beim Booten schon da (aider 0.86.2, 2026-07-28).
 PROMPTZEICHEN = "❯>›»▶$#%◆●"
 RAHMEN = lambda c: 0x2500 <= ord(c) <= 0x257F
+# Dieselben Zeichen, aber als AUFZAEHLUNG statt als '[X-Y]'-Bereich: ein
+# Bereich ueber mehrbytige Unicode-Zeichen verlangt von GNU grep eine
+# Kollationsordnung, die die Locale 'C.UTF-8' (Vorgabe auf peer) nicht kennt --
+# 'grep -E "[─-╿]"' bricht dort mit 'Invalid collation character' ab, obwohl
+# Pythons eigenes re-Modul denselben Bereich anstandslos akzeptiert (Befund
+# 2026-08-21: der Entwurf hier bestand die eigene Pruefung, verspottete aber
+# das externe grep, das jeder Aufrufer -- allen voran pi-worker beim Warten
+# auf READY -- tatsaechlich benutzt). Eine Aufzaehlung einzelner Zeichen
+# braucht keine Kollation und ist unter jeder Locale gleich lauffaehig.
+RAHMEN_KLASSE = "[" + "".join(chr(c) for c in range(0x2500, 0x2580)) + "]"
 
 
 def kandidaten(text):
@@ -233,7 +243,7 @@ def kandidaten(text):
     for z in zeilen:
         m = re.match(r"^([─-╿]{2,})\s*([A-Za-z][A-Za-z0-9 _-]{0,14}?)\s*[─-╿]", z)
         if m:
-            k = "^" + re.escape(m.group(1) + " " + m.group(2) + " ") + "[─-╿]"
+            k = "^" + re.escape(m.group(1) + " " + m.group(2) + " ") + RAHMEN_KLASSE
             if not any(x["muster"] == k for x in aus):
                 aus.append({"muster": k, "art": "beschriftete Kastenkante der Eingabebox"})
 

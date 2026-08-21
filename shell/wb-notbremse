@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+# wb-notbremse — die letzte Sicherung vor dem Stillstand: faellt der freie
+# Speicher unter eine Schwelle, werden die LOKALEN MODELLE beendet, sonst nichts.
+#
+#   wb-notbremse wache [--schwelle-mib 1024] [--takt 1] [--anlauf 120]
+#                                Die Schleife selbst. Laeuft im Vordergrund und
+#                                endet von selbst, sobald kein Modell mehr laeuft.
+#   wb-notbremse start [...]     Dieselbe Schleife abgeloest im Hintergrund,
+#                                genau einmal (Pid-Datei). Der Weg fuer wb-mlx-server.
+#   wb-notbremse stopp           Die laufende Wache beenden.
+#   wb-notbremse status          Laeuft eine? Was sieht sie gerade?
+#   wb-notbremse pruefen         EIN Durchgang, ohne irgendetwas zu beenden.
+#   wb-notbremse jetzt           EIN Durchgang, der wirklich beendet (Notgriff von Hand).
+#
+# WOZU (Auftrag des Nutzers, 2026-08-21, woertlich): "baue ein sicherheitsmechanismus
+# ein das bei solchen tests die lokalen modelle automatisch beendet werden wenn
+# unter 1gb freier speicher insgesammt verfuegbar ist." Anlass war ein Worker, der
+# einen MLX-Server OHNE `wb-belegung` gestartet und dabei versehentlich ein ZWEITES
+# Modell nachgeladen hat; der Speicher stieg auf 47 von 48 GiB, und niemand ausser
+# der Nutzer selbst konnte das noch anhalten.
+#
+# WARUM SIE NICHT INS BUCH SCHAUT. `wb-belegung` ist die Planung: es entscheidet
+# VORHER, ob etwas passen wird. Dieses Werkzeug ist die Wirklichkeit: es sieht, was
+# TATSAECHLICH laeuft. Genau der Fall, gegen den es gebaut ist, war ein Start am
+# Buch VORBEI — eine Bremse, die das Buch liest, haette dort nichts gesehen und
+# nichts getan. Gesucht wird deshalb in der Prozessliste, nach den Startzeilen der
+# Modellserver selbst.
+#
+# WEISSE LISTE, KEINE SCHWARZE. Beendet wird ausschliesslich, was auf MUSTER unten
+# passt — Modellserver, die wir selbst starten. Alles andere bleibt unangetastet,
+# auch wenn es viel Speicher haelt: die Werkbank, Sitzungen des Nutzers, der Browser,
+# der Diktierdienst. Eine schwarze Liste waere hier der falsche Weg: sie muesste
+# jeden neuen fremden Prozess kennen, um ihn NICHT zu toeten, und ein Vergessen
+# haette die teure Richtung.
+#
+# AUSDRUECKLICH NICHT BEENDET (auch wenn ein Muster zufaellig passte, siehe TABU):
+#   ollama serve        der Dienst selbst -- beendet wird nur sein 'runner', der die
+#                       Gewichte haelt; der Dienst nimmt danach sofort wieder Anfragen.
+#   whisper-server      das Diktat-Werkzeug. Es haengt an der Tastatur des
+#                       Menschen, nicht an einem Modelllauf, und es ist mit
+#                       gemessenen 0,6 GiB nie der Grund fuer einen Engpass.
+#   a protected service            geschuetzter Dienst auf peer (globale Regel).
+#
+# DIE SCHWELLE IST EIN NOTAUS, KEINE VERWALTUNG. 1 GiB frei heisst: die Maschine
+# steht kurz vor dem Anhalten, und ein sauberes Beenden ist ab hier besser als jeder
+# weitere Versuch, richtig zu rechnen. Wer den Speicher VERTEILEN will, ist bei
+# `wb-belegung` richtig; hier wird nur noch abgeraeumt.
+#
+# SIE LAEUFT NUR, SOLANGE SIE GEBRAUCHT WIRD (stehende des Nutzers Regel vom 20.08.:
+# kein Prozess laeuft auf Vorrat). Die Schleife endet von selbst, sobald kein
+# Modellprozess mehr da ist — nach einer Anlauffrist, damit sie einen gerade
+# startenden Server nicht fuer "nichts mehr da" haelt. `wb-mlx-server` startet sie
+# bei jedem Serverstart neu; ein zweiter Start ist wirkungslos (Pid-Datei).
+#
+# SIE BEENDET AUCH DIE BUCHUNG, NICHT NUR DEN PROZESS (Nachtrag nach dem echten
+# Lauf, 2026-08-21). Nach dem ersten Verifikationslauf standen 25,2 GiB weiter im
+# Belegungsbuch, obwohl der Server tot war: der Speicher war frei, das Buch sagte
+# das Gegenteil, und die naechste Anfrage waere an einer Belegung gescheitert, die
+# niemand mehr haelt. Siehe belegung_zurueckgeben() -- freigegeben wird nur, wenn
+# danach gar kein Modellprozess mehr laeuft.
+#
+# SIE SAGT LAUT, WAS SIE GETAN HAT. Ein Modell, das stillschweigend verschwindet,
+# ist schlimmer als eines, das abstuerzt: drei Wege gleichzeitig — die Protokolldatei,
+# eine Merkdatei mit dem letzten Eingriff, und `tmux display-message` in jede Sitzung
+# des Werkbank-Servers. Keiner davon tippt in einen Chat (wb-pane-write bleibt die
+# einzige Stelle, die das duerfte).
+#
+# DER FREIE SPEICHER HAT GENAU EINE WAHRHEIT, UND SIE STEHT IN `check-resources`
+# (Umbau 21.08.2026, Entscheidung des Nutzers nach Befund 2 aus dem Pruefpass
+# ~/.pi-workers/results/hafenmeister/20260821-045339.md). Bis zu diesem Umbau
+# rechnete diese Datei dieselbe Formel EIGENSTAENDIG nach ("dieselbe Formel wie
+# check-resources, siehe dort") -- und genau das war der Fehler: als
+# check-resources am 21.08. auf eine grosszuegigere, genauere Formel umstellte
+# (Commit b89093e), blieb diese Datei bei der alten stehen, ohne dass es
+# irgendjemand merkte, weil beide plausible Zahlen lieferten. Zwei Waechter mit
+# zwei Meinungen, und lautlos gewonnen hat der grosszuegigere: bei geladenem
+# Modell zeigte die alte, hier nachgerechnete Formel 20707 MiB, wo
+# check-resources zur selben Zeit schon 18404 MiB sah -- die naehere Zahl,
+# weil das Modell anonymen, nicht wiederbeschaffbaren Speicher haelt, den die
+# alte Formel faelschlich als "inaktiv" (also frei) mitzaehlte.
+#
+# Diese Datei FRAGT check-resources jetzt, statt selbst zu rechnen (siehe
+# frei_mib_quelle() unten, "ERSTE WAHL"). Nur wenn dieser Aufruf ausfaellt --
+# Werkzeug fehlt, Frist ueberschritten, kaputte oder unsinnige Antwort --
+# rechnet sie noch selbst nach, und zwar NICHT mehr mit der grosszuegigen
+# Formel, sondern mit der STRENGEN (`frei_mib_streng()`, vormals `frei_mib()`):
+# lieber einmal zu frueh gebremst als einmal zu spaet. check-resources fuehrt
+# genau diese Zahl selbst als `ram.free_strict_mib` -- dieselbe
+# Bedeutung, hier lokal nachgerechnet fuer den Fall, dass check-resources
+# selbst nicht mehr da ist, um sie zu liefern. Jede Meldung sagt dazu, welche
+# der beiden Quellen gerade galt -- eine Sicherung, die still auf den
+# Rueckfall wechselt, waere nur eine halbe Sicherung.
+#
+# Zustand:  ~/.local/state/wb-notbremse/protokoll.log     jede Messung mit Eingriff
+#           ~/.local/state/wb-notbremse/wache.pid         die laufende Wache
+#           ~/.local/state/wb-notbremse/letzter-eingriff.json
+#
+# EXIT-CODES: 0 = in Ordnung / nichts zu tun, 1 = es wurde eingegriffen (bei
+#             'jetzt'/'pruefen': es waere eingegriffen worden), 2 = Benutzungsfehler.
+import argparse
+import errno
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".local", "state", "wb-notbremse")
+PROTOKOLL = os.path.join(STATE_DIR, "protokoll.log")
+PIDDATEI = os.path.join(STATE_DIR, "wache.pid")
+EINGRIFF = os.path.join(STATE_DIR, "letzter-eingriff.json")
+
+SCHWELLE_MIB = 1024      # Zahl des Nutzers: "unter 1gb freier speicher insgesammt".
+TAKT_S = 1.0
+ANLAUF_S = 120.0         # solange gilt "noch kein Modell da" NICHT als "fertig".
+TERM_FRIST_S = 5.0       # zwischen SIGTERM und SIGKILL.
+# ZWEI ABTASTUNGEN, NICHT EINE (Nachtrag nach dem echten Lauf, 2026-08-21).
+# Im Verifikationslauf gegen einen wirklich geladenen mtplx-Server standen zwei
+# Messungen DERSELBEN Sekunde 7 GiB auseinander: der Mitschreiber las 21808 MiB
+# frei, die Wache 14477 MiB, und die Wache hatte recht (nach dem Beenden waren
+# 36554 MiB frei, der Server hielt 21029 MiB davon). Dass hier die EINZELMESSUNG
+# des Mitschreibers der Ausreisser war und nicht die der Wache, ist Glueck und
+# kein Verlass: dieselbe Schwankung kann in die andere Richtung zeigen, und dann
+# beendet eine einzelne Abtastung ein gesundes Modell. wb-belegung nimmt aus
+# genau diesem Grund den Median aus drei Abtastungen (siehe der Abschnitt "DER
+# FREIE SPEICHER WIRD NIE AUS EINER EINZIGEN ABTASTUNG GENOMMEN" dort; dort
+# wurde eine Messung mit 735 MiB frei abgelehnt, waehrend eine Minute spaeter
+# 14,2 GiB frei waren).
+#
+# Ein Median waere hier falsch -- er kostet drei Takte, bevor ueberhaupt eine
+# Entscheidung faellt. Verlangt wird stattdessen, dass die Schwelle in ZWEI
+# aufeinanderfolgenden Abtastungen unterschritten ist. Bei einem Takt von 0,5 s
+# kostet das eine halbe Sekunde und faengt den einzelnen Ausreisser. Die
+# Zwischenmessung steht im Protokoll, damit ein knapper Fall nachlesbar bleibt.
+BESTAETIGUNGEN = 2
+
+# Die weisse Liste. Jedes Muster wird gegen die GANZE Startzeile gehalten.
+# Bewusst an den Startzeilen der Server festgemacht, nicht an Verbrauchszahlen:
+# ein MLX-Prozess haelt seinen Speicher als Metal-Puffer und zeigt dabei eine
+# winzige RSS (gemessen 2026-08-21: 170 MiB RSS bei 14,1 GiB gehaltenen Gewichten).
+# Eine Schwelle auf RSS haette genau die groessten Halter uebersehen.
+MUSTER = [
+    (re.compile(r"\bmlx_lm\.(server|generate|chat|benchmark|evaluate)\b"), "mlx-lm"),
+    (re.compile(r"\bmlx[-_]dspark\b"), "mlx-dspark"),
+    (re.compile(r"\bmtplx\b"), "mtplx"),
+    (re.compile(r"\bvllm\b.*\b(serve|entrypoints)\b"), "vllm"),
+    (re.compile(r"\bllama-(server|cli)\b"), "llama.cpp"),
+    (re.compile(r"\bollama\s+runner\b"), "ollama-runner"),
+]
+
+# TABU: trifft eines davon, wird der Prozess NIE angefasst, auch wenn ein Muster
+# oben passte. Die Reihenfolge ist Absicht -- das Tabu wird zuerst geprueft.
+TABU = [
+    re.compile(r"\bollama\s+serve\b"),
+    re.compile(r"\bwhisper-server\b"),
+    re.compile(r"\bnews-clf\b"),
+]
+
+# DER ZAUN (Nachtrag 21.08.2026). Diese Bremse ist maschinenweit -- im Betrieb ist
+# das genau ihr Zweck, im Testlauf war es ihr Fehler. test-notbremse.sh isoliert
+# sich ueber ein eigenes HOME und einen eigenen tmux-Socket, aber ihr eigentlicher
+# Handgriff, das Beenden, ging an beidem vorbei: sie beendet, was in der
+# Prozessliste der ganzen Maschine auf MUSTER passt. Im parallelen Testlauf war
+# das der Motor-Stellvertreter der Nachbarsuite -- gemessen an diesem Tag:
+# test-mlx-wechsel-speicher.sh fiel mit "wb-nohup konnte den Server nicht starten"
+# aus, weil test-notbremse.sh ihm den Prozess unter den Haenden weggenommen hatte,
+# und test-notbremse.sh fiel umgekehrt aus, weil der fremde Stellvertreter seine
+# Wache nicht von selbst enden liess. Beide Suiten bestanden allein und fielen
+# gemeinsam.
+#
+# WB_NOTBREMSE_NUR_MUSTER ist deshalb ein ZUSAETZLICHER Filter, kein Ersatz: die
+# weisse Liste sucht weiter wie im Ernstfall, aber betrachtet wird nur, wessen
+# Startzeile auch auf dieses Muster passt. Gesetzt wird es ausschliesslich von der
+# eigenen Testsuite (dieselbe Bauart wie WB_NOTBREMSE_CHECK darunter), nie im
+# Betrieb -- ist es leer, aendert sich nichts. Und der Zaun wird in jeder Meldung
+# genannt: eine Bremse, die still nur die Haelfte der Maschine sieht, waere nur
+# eine halbe Bremse.
+_ZAUN = os.environ.get("WB_NOTBREMSE_NUR_MUSTER", "")
+try:
+    ZAUN = re.compile(_ZAUN) if _ZAUN else None
+except re.error:
+    # Ein kaputtes Muster darf nie zu "dann eben alles" werden -- die teure
+    # Richtung waere hier, den Zaun fallen zu lassen. Er bleibt stehen und laesst
+    # nichts durch.
+    ZAUN = re.compile(r"(?!)")
+
+
+def zaun_zusatz():
+    """Ein Satz ueber den Zaun, oder nichts. Er gehoert in JEDE Meldung: wer
+    diese Ausgabe liest, muss sehen, dass gerade nicht die ganze Maschine
+    betrachtet wird (siehe ZAUN oben)."""
+    return "" if ZAUN is None else " [Zaun: nur Startzeilen auf '%s']" % _ZAUN
+
+
+def gib_aus(text=""):
+    sys.stdout.write(text + "\n")
+
+
+def jetzt_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+
+def protokollieren(zeile):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(PROTOKOLL, "a", encoding="utf-8") as f:
+            f.write("%s  %s\n" % (jetzt_iso(), zeile))
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------- freier Speicher
+
+def frei_mib_streng():
+    """Die STRENGE, konservative Formel -- der Rueckfall, wenn check-resources
+    nicht erreichbar ist, siehe frei_mib_quelle() unten. Auf macOS: frei +
+    inaktiv + spekulativ + freigebbar (dieselbe Formel, die check-resources
+    selbst als `ram.free_strict_mib` fuehrt). Auf Linux gibt es keine zweite,
+    grosszuegigere Fassung -- check-resources rechnet dort schon immer
+    MemAvailable, direkt aus dem Kernel, und das ist zugleich die strengste
+    verfuegbare Zahl; dieselbe Quelle wird hier nur ein zweites Mal gelesen.
+    Gibt None zurueck, wenn nicht messbar -- und NICHT MESSBAR IST KEIN
+    EINGRIFF: eine Bremse, die bei fehlender Messung zieht, wuerde beim ersten
+    kaputten PATH alle Modelle beenden."""
+    if sys.platform == "darwin":
+        try:
+            seite = int(subprocess.run(["/usr/sbin/sysctl", "-n", "hw.pagesize"],
+                                       capture_output=True, text=True, timeout=5).stdout.strip())
+            vms = subprocess.run(["/usr/bin/vm_stat"], capture_output=True,
+                                 text=True, timeout=5).stdout
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        seiten = 0
+        gefunden = 0
+        for name in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+            m = re.search(re.escape(name) + r":\s*(\d+)", vms)
+            if m:
+                seiten += int(m.group(1))
+                gefunden += 1
+        if not gefunden:
+            return None
+        return seiten * seite / 1048576.0
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for zeile in f:
+                if zeile.startswith("MemAvailable:"):
+                    return float(zeile.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return None
+
+
+# GEMESSEN 2026-08-21 auf dieser Maschine: drei Aufrufe von 'check-resources'
+# hintereinander, 0,14 / 0,15 / 0,15 s -- der uebliche Fall bleibt weit unter
+# einer Zehntelsekunde Streuung. Die Frist unten ist grosszuegiger als dieser
+# Normalfall (gut das Dreifache), aber bewusst kuerzer als TAKT_S: schlaegt
+# der Aufruf fehl (haengender 'ollama ps' o.ae. -- check-resources selbst hat
+# dafuer keine harte Frist), soll EIN Takt der Wache trotzdem nicht laenger
+# als etwa TAKT_S + CHECK_RESOURCES_FRIST_S dauern, nicht das Doppelte davon.
+# Ueberschreibbar fuer Tests (WB_NOTBREMSE_CHECK_FRIST_S), damit eine
+# Attrappe, die absichtlich zu langsam antwortet, keine Suite ausbremst.
+CHECK_RESOURCES_FRIST_S = float(os.environ.get("WB_NOTBREMSE_CHECK_FRIST_S", "0.5"))
+
+
+def check_resources_pfad():
+    """Woher 'check-resources' kommt -- dieselbe Reihenfolge wie in
+    wb-belegungs eigenem check_resources_pfad(), aus demselben Grund
+    (Nachbarn NIE vor $HOME/.local/bin, siehe dort): eigenes $HOME/.local/bin
+    zuerst, dann der Nachbar neben dieser Datei (ein Arbeitsbaum misst gegen
+    seinen eigenen Stand), dann PATH. WB_NOTBREMSE_CHECK ist der ausdrueckliche
+    Test-Umweg -- anders als wb-belegungs WB_BELEGUNG_CHECK loest ein
+    ungueltiger Pfad hier aber KEINEN Fehler aus, sondern zaehlt einfach als
+    'check-resources nicht verfuegbar' und damit als Fall fuer den strengen
+    Rueckfall: diese Datei darf nie hart abbrechen, das ist ihr ganzer Zweck."""
+    p = os.environ.get("WB_NOTBREMSE_CHECK", "")
+    if p:
+        return p if os.access(p, os.X_OK) else None
+    eigen = os.path.join(HOME, ".local", "bin", "check-resources")
+    if os.access(eigen, os.X_OK):
+        return eigen
+    nebenan = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-resources")
+    if os.access(nebenan, os.X_OK):
+        return nebenan
+    return shutil.which("check-resources") or None
+
+
+def frei_mib_quelle():
+    """(frei_mib oder None, quelle) -- die EINE Zahl fuer freien Speicher, samt
+    Angabe, woher sie kommt. ERSTE WAHL ist immer check-resources: es ist seit
+    dem Umbau vom 21.08.2026 die einzige Stelle, die die Formel fuehrt (siehe
+    Kopfkommentar). Nur wenn der Aufruf ausfaellt -- Werkzeug fehlt, Frist
+    ueberschritten (CHECK_RESOURCES_FRIST_S), kein gueltiges JSON, das Feld
+    fehlt oder ist keine sinnvolle Zahl (negativ, Text, 'null') -- rechnet
+    diese Funktion selbst nach, streng (frei_mib_streng()). Beide Zweige
+    koennen None liefern (nicht messbar); der Aufrufer behandelt das wie
+    bisher als 'kein Eingriff', nie als 'unbegrenzt frei'."""
+    pfad = check_resources_pfad()
+    if pfad:
+        try:
+            p = subprocess.run([pfad, "--json"], capture_output=True, text=True,
+                               timeout=CHECK_RESOURCES_FRIST_S)
+            if p.returncode == 0:
+                d = json.loads(p.stdout)
+                wert = d.get("ram", {}).get("free_mib")
+                # bool ist in Python eine int-Unterklasse -- ein JSON 'true'/
+                # 'false' waere sonst eine (unsinnige) gueltige Zahl.
+                if (isinstance(wert, (int, float)) and not isinstance(wert, bool)
+                        and wert >= 0):
+                    return float(wert), "check-resources"
+        except (subprocess.TimeoutExpired, OSError, ValueError,
+                json.JSONDecodeError, AttributeError, TypeError):
+            pass
+    return frei_mib_streng(), "streng (lokal, Rueckfall -- check-resources war nicht nutzbar)"
+
+
+# ------------------------------------------------------------- Modellsuche
+
+def prozessliste():
+    try:
+        p = subprocess.run(["/bin/ps", "-Ao", "pid=,rss=,command="],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    zeilen = []
+    for z in p.stdout.splitlines():
+        teile = z.strip().split(None, 2)
+        if len(teile) < 3:
+            continue
+        try:
+            zeilen.append((int(teile[0]), int(teile[1]), teile[2]))
+        except ValueError:
+            continue
+    return zeilen
+
+
+def modelle(eigene_pid=None):
+    """Die lokalen Modellprozesse, weisse Liste. Der eigene Prozess und die
+    eigene Prozesskette bleiben aussen vor -- eine Bremse, die sich selbst
+    beendet, waere zwar folgerichtig, aber unbrauchbar."""
+    aus = []
+    selbst = {os.getpid(), os.getppid()}
+    if eigene_pid:
+        selbst.add(eigene_pid)
+    for pid, rss, cmd in prozessliste():
+        if pid in selbst:
+            continue
+        # Der Zaun zuerst: was ausserhalb liegt, wird gar nicht erst betrachtet
+        # (siehe ZAUN oben). Im Betrieb ist er nicht gesetzt und diese Zeile
+        # folgenlos.
+        if ZAUN is not None and not ZAUN.search(cmd):
+            continue
+        if any(t.search(cmd) for t in TABU):
+            continue
+        for muster, art in MUSTER:
+            if muster.search(cmd):
+                aus.append({"pid": pid, "rss_mib": round(rss / 1024.0, 1),
+                            "art": art, "kommando": cmd})
+                break
+    return aus
+
+
+def lebt(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        return e.errno != errno.ESRCH
+    return True
+
+
+def beenden(procs):
+    """SIGTERM, Frist, SIGKILL — und danach NACHSEHEN, nicht annehmen.
+    Rueckgabe: Liste von (eintrag, weg_ja_nein, wie)."""
+    ergebnis = []
+    for e in procs:
+        try:
+            os.kill(e["pid"], signal.SIGTERM)
+        except OSError:
+            ergebnis.append((e, not lebt(e["pid"]), "war schon weg"))
+            continue
+        ende = time.time() + TERM_FRIST_S
+        while time.time() < ende and lebt(e["pid"]):
+            time.sleep(0.2)
+        if not lebt(e["pid"]):
+            ergebnis.append((e, True, "SIGTERM"))
+            continue
+        try:
+            os.kill(e["pid"], signal.SIGKILL)
+        except OSError:
+            pass
+        ende = time.time() + TERM_FRIST_S
+        while time.time() < ende and lebt(e["pid"]):
+            time.sleep(0.2)
+        ergebnis.append((e, not lebt(e["pid"]), "SIGKILL" if not lebt(e["pid"]) else "UEBERLEBT"))
+    return ergebnis
+
+
+# ------------------------------------------------------------- laut werden
+
+def tmux_pfad():
+    for p in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
+        if os.access(p, os.X_OK):
+            return p
+    return ""
+
+
+def in_die_sitzungen(text):
+    """`display-message` in jede Sitzung des Werkbank-Servers. Das ist die
+    Statuszeile, nicht der Chat -- in einen Pane TIPPEN darf hier niemand
+    (wb-pane-write ist die einzige Stelle dafuer)."""
+    tm = tmux_pfad()
+    if not tm:
+        return 0
+    socket = os.environ.get("WB_TMUX_SOCKET", "")
+    vorn = [tm] + (["-L", socket] if socket else [])
+    try:
+        p = subprocess.run(vorn + ["list-sessions", "-F", "#{session_name}"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if p.returncode != 0:
+        return 0
+    n = 0
+    for name in p.stdout.split():
+        try:
+            subprocess.run(vorn + ["display-message", "-t", "=" + name, "-d", "20000", text],
+                           capture_output=True, timeout=5)
+            n += 1
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return n
+
+
+def eingriff_merken(daten):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = EINGRIFF + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(daten, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, EINGRIFF)
+    except OSError:
+        pass
+
+
+MLX_KENNUNG_DATEI = os.path.join(HOME, ".local", "state", "wb-mlx-server", "belegung-kennung")
+
+
+def belegung_zurueckgeben():
+    """Die Belegung des Servers, den dieses Werkzeug gerade beendet hat, aus dem
+    Buch nehmen (Nachtrag nach dem echten Lauf, 2026-08-21).
+
+    Im Verifikationslauf blieben 25,2 GiB im Buch stehen, nachdem die Bremse den
+    mtplx-Server beendet hatte -- der Speicher war frei, das Buch sagte das
+    Gegenteil, und die naechste Anfrage waere an einer Belegung gescheitert, die
+    niemand mehr haelt. `wb-belegung aufraeumen` hilft dort nicht: es entfernt
+    eine Belegung erst, wenn ihr HALTER-Pane stirbt, und der lebt weiter.
+
+    NUR WENN GAR KEIN MODELLPROZESS MEHR LAEUFT. Die Kennungsdatei gehoert dem
+    Server auf Port 8081; solange noch irgendein Modell laeuft, koennte es
+    dieses eine sein, und dann waere die Freigabe eine Luege ueber laufenden
+    Speicher. Ist keines mehr da, kann die Belegung niemandem mehr gehoeren.
+
+    Fehlt die Datei oder scheitert die Freigabe, wird das gesagt und nicht
+    stillschweigend uebergangen -- eine Belegung zu viel im Buch kostet einen
+    Start, eine zu wenig kostet die Maschine."""
+    if modelle():
+        protokollieren("  Belegung NICHT freigegeben: es laeuft noch ein Modellprozess, die "
+                       "Buchung koennte ihm gehoeren. Von Hand pruefen: wb-belegung wer")
+        return
+    try:
+        kennung = open(MLX_KENNUNG_DATEI, encoding="utf-8").read().strip()
+    except OSError:
+        return
+    if not kennung:
+        return
+    wbb = os.path.join(HOME, ".local", "bin", "wb-belegung")
+    if not os.access(wbb, os.X_OK):
+        wbb = shutil.which("wb-belegung") or ""
+    if not wbb:
+        protokollieren("  Belegung %s steht weiter im Buch: wb-belegung ist nicht aufrufbar. "
+                       "Von Hand: wb-belegung gib %s --fremd" % (kennung, kennung))
+        return
+    try:
+        p = subprocess.run([wbb, "gib", kennung, "--fremd"],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        protokollieren("  Belegung %s liess sich nicht freigeben (%s) -- von Hand: "
+                       "wb-belegung gib %s --fremd" % (kennung, e, kennung))
+        return
+    if p.returncode == 0:
+        protokollieren("  Belegung %s freigegeben -- das Buch stimmt wieder mit der Maschine "
+                       "ueberein." % kennung)
+        try:
+            os.unlink(MLX_KENNUNG_DATEI)
+        except OSError:
+            pass
+    else:
+        protokollieren("  Belegung %s liess sich nicht freigeben (Exit %d: %s) -- von Hand: "
+                       "wb-belegung gib %s --fremd"
+                       % (kennung, p.returncode, (p.stderr or p.stdout or "").strip()[:200], kennung))
+
+
+def zuschlagen(frei, schwelle, procs, quelle):
+    """Der Eingriff selbst: beenden, verifizieren, dreifach laut werden."""
+    protokollieren("NOTBREMSE — frei %.0f MiB (Quelle: %s) unter Schwelle %.0f MiB, "
+                   "%d Modellprozess(e)%s"
+                   % (frei, quelle, schwelle, len(procs), zaun_zusatz()))
+    for e in procs:
+        protokollieren("  beende %s pid %d (%s)" % (e["art"], e["pid"], e["kommando"][:160]))
+    ergebnis = beenden(procs)
+    frei_danach, quelle_danach = frei_mib_quelle()
+    beendet = [e for e, weg, _ in ergebnis if weg]
+    ueberlebt = [e for e, weg, _ in ergebnis if not weg]
+    for e, weg, wie in ergebnis:
+        protokollieren("  %s pid %d: %s" % (e["art"], e["pid"], wie if weg else "UEBERLEBT — von Hand nachsehen"))
+    protokollieren("  frei danach: %s (Quelle: %s)"
+                   % ("nicht messbar" if frei_danach is None else "%.0f MiB" % frei_danach, quelle_danach))
+    text = ("wb-notbremse: %d lokale Modelle beendet — nur noch %.0f MiB frei (Schwelle %.0f, "
+            "Quelle: %s)%s. Protokoll: %s"
+            % (len(beendet), frei, schwelle, quelle, zaun_zusatz(), PROTOKOLL))
+    if ueberlebt:
+        text += " ACHTUNG: %d Prozess(e) haben UEBERLEBT." % len(ueberlebt)
+    erreicht = in_die_sitzungen(text)
+    eingriff_merken({
+        "zeit": jetzt_iso(),
+        "frei_mib_vorher": round(frei, 1),
+        "quelle_vorher": quelle,
+        "frei_mib_nachher": None if frei_danach is None else round(frei_danach, 1),
+        "quelle_nachher": quelle_danach,
+        "schwelle_mib": schwelle,
+        "beendet": [{"pid": e["pid"], "art": e["art"], "kommando": e["kommando"][:400]} for e in beendet],
+        "ueberlebt": [{"pid": e["pid"], "art": e["art"], "kommando": e["kommando"][:400]} for e in ueberlebt],
+        "sitzungen_benachrichtigt": erreicht,
+    })
+    sys.stderr.write(text + "\n")
+    belegung_zurueckgeben()
+    return ergebnis
+
+
+# ------------------------------------------------------------- Unterbefehle
+
+def zeige_lage(frei, procs, schwelle, quelle):
+    gib_aus("frei        %s MiB (Schwelle %s MiB, Quelle: %s)"
+            % ("NICHT MESSBAR" if frei is None else "%.0f" % frei, "%.0f" % schwelle, quelle))
+    if ZAUN is not None:
+        gib_aus("Zaun        nur Prozesse, deren Startzeile auf '%s' passt "
+                "(WB_NOTBREMSE_NUR_MUSTER) -- Testbetrieb, nicht der Ernstfall." % _ZAUN)
+    if not procs:
+        gib_aus("Modelle     keine gefunden.")
+        return
+    gib_aus("Modelle     %d gefunden:" % len(procs))
+    for e in procs:
+        gib_aus("  %-14s pid %-7d rss %7.1f MiB  %s" % (e["art"], e["pid"], e["rss_mib"], e["kommando"][:100]))
+
+
+def cmd_pruefen(a, wirklich=False):
+    frei, quelle = frei_mib_quelle()
+    procs = modelle()
+    zeige_lage(frei, procs, a.schwelle_mib, quelle)
+    if frei is None:
+        gib_aus()
+        gib_aus("Kein Eingriff: der freie Speicher ist nicht messbar. Eine Bremse, die")
+        gib_aus("ohne Messung zieht, wuerde beim ersten kaputten PATH alles beenden.")
+        return 0
+    if frei >= a.schwelle_mib:
+        gib_aus()
+        gib_aus("Kein Eingriff noetig.")
+        return 0
+    if not procs:
+        gib_aus()
+        gib_aus("Unter der Schwelle, aber KEIN lokales Modell laeuft — hier ist nichts")
+        gib_aus("zu beenden, was dieses Werkzeug beenden duerfte. Der Speicher gehoert")
+        gib_aus("jemand anderem; siehe 'wb-belegung wer'.")
+        return 1
+    if not wirklich:
+        gib_aus()
+        gib_aus("WUERDE ZUSCHLAGEN: %d Modellprozess(e) beenden." % len(procs))
+        return 1
+    zuschlagen(frei, a.schwelle_mib, procs, quelle)
+    return 1
+
+
+def cmd_wache(a):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    start = time.time()
+    protokollieren("Wache an (pid %d, Schwelle %.0f MiB, Takt %.1f s, Anlauf %.0f s, "
+                   "%d Abtastungen zur Bestaetigung)%s"
+                   % (os.getpid(), a.schwelle_mib, a.takt, a.anlauf, a.bestaetigungen,
+                      zaun_zusatz()))
+    eingegriffen = False
+    unter = 0
+    try:
+        while True:
+            procs = modelle()
+            if not procs:
+                if time.time() - start > a.anlauf:
+                    protokollieren("Wache aus: kein lokales Modell mehr — sie wird nicht auf Vorrat gehalten.")
+                    return 1 if eingegriffen else 0
+            else:
+                frei, quelle = frei_mib_quelle()
+                if frei is not None and frei < a.schwelle_mib:
+                    unter += 1
+                    if unter < a.bestaetigungen:
+                        protokollieren("unter der Schwelle (%d von %d): frei %.0f MiB "
+                                       "(Quelle: %s), Schwelle %.0f MiB"
+                                       % (unter, a.bestaetigungen, frei, quelle, a.schwelle_mib))
+                    else:
+                        zuschlagen(frei, a.schwelle_mib, procs, quelle)
+                        eingegriffen = True
+                        unter = 0
+                else:
+                    # Eine einzelne Unterschreitung, der eine normale Messung folgt,
+                    # war ein Ausreisser und keine Lage -- der Zaehler faengt neu an.
+                    if unter:
+                        protokollieren("wieder ueber der Schwelle (frei %s, Quelle: %s) -- die "
+                                       "Unterschreitung war ein Ausreisser, nichts beendet."
+                                       % ("nicht messbar" if frei is None else "%.0f MiB" % frei,
+                                          quelle))
+                    unter = 0
+            time.sleep(a.takt)
+    except KeyboardInterrupt:
+        protokollieren("Wache aus (Abbruch von Hand).")
+        return 1 if eingegriffen else 0
+    finally:
+        try:
+            if os.path.exists(PIDDATEI) and int(open(PIDDATEI).read().strip() or 0) == os.getpid():
+                os.unlink(PIDDATEI)
+        except (OSError, ValueError):
+            pass
+
+
+def wache_pid():
+    try:
+        pid = int(open(PIDDATEI, encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        return 0
+    return pid if lebt(pid) else 0
+
+
+def cmd_start(a):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    alt = wache_pid()
+    if alt:
+        gib_aus("wb-notbremse: laeuft bereits (pid %d)." % alt)
+        return 0
+    log = os.path.join(STATE_DIR, "wache.log")
+    argumente = [sys.executable, os.path.abspath(__file__), "wache",
+                 "--schwelle-mib", str(int(a.schwelle_mib)),
+                 "--takt", str(a.takt), "--anlauf", str(a.anlauf),
+                 "--bestaetigungen", str(int(a.bestaetigungen))]
+    with open(log, "a", encoding="utf-8") as f:
+        kind = subprocess.Popen(argumente, stdout=f, stderr=f,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    with open(PIDDATEI, "w", encoding="utf-8") as f:
+        f.write(str(kind.pid))
+    gib_aus("wb-notbremse: Wache an (pid %d, Schwelle %d MiB)%s. Protokoll: %s"
+            % (kind.pid, int(a.schwelle_mib), zaun_zusatz(), PROTOKOLL))
+    return 0
+
+
+def cmd_stopp(_a):
+    pid = wache_pid()
+    if not pid:
+        gib_aus("wb-notbremse: keine Wache aktiv.")
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    ende = time.time() + 5.0
+    while time.time() < ende and lebt(pid):
+        time.sleep(0.2)
+    if lebt(pid):
+        gib_aus("wb-notbremse: Wache %d liess sich nicht beenden." % pid)
+        return 1
+    try:
+        os.unlink(PIDDATEI)
+    except OSError:
+        pass
+    gib_aus("wb-notbremse: Wache %d beendet." % pid)
+    return 0
+
+
+def cmd_status(a):
+    pid = wache_pid()
+    gib_aus("Wache       %s" % ("laeuft (pid %d)" % pid if pid else "aus"))
+    frei, quelle = frei_mib_quelle()
+    zeige_lage(frei, modelle(), a.schwelle_mib, quelle)
+    if os.path.exists(EINGRIFF):
+        try:
+            d = json.load(open(EINGRIFF, encoding="utf-8"))
+            gib_aus("Letzter Eingriff  %s — %d beendet, %d ueberlebt, frei %s -> %s MiB (Quelle: %s -> %s)"
+                    % (d.get("zeit"), len(d.get("beendet") or []), len(d.get("ueberlebt") or []),
+                       d.get("frei_mib_vorher"), d.get("frei_mib_nachher"),
+                       d.get("quelle_vorher", "?"), d.get("quelle_nachher", "?")))
+        except (OSError, ValueError):
+            pass
+    return 0
+
+
+def main(argv):
+    p = argparse.ArgumentParser(
+        prog="wb-notbremse",
+        description="Notaus fuer lokale Modelle, wenn der freie Speicher unter die Schwelle faellt.")
+    sub = p.add_subparsers(dest="befehl")
+
+    def gemeinsam(sp):
+        sp.add_argument("--schwelle-mib", type=float, default=SCHWELLE_MIB,
+                        help="freier Speicher in MiB, unter dem beendet wird (Vorgabe %d)" % SCHWELLE_MIB)
+        sp.add_argument("--takt", type=float, default=TAKT_S,
+                        help="Sekunden zwischen zwei Messungen (Vorgabe %s)" % TAKT_S)
+        sp.add_argument("--bestaetigungen", type=int, default=BESTAETIGUNGEN,
+                        help="wie viele aufeinanderfolgende Abtastungen unter der Schwelle "
+                             "liegen muessen, bevor beendet wird (Vorgabe %d -- eine einzelne "
+                             "Abtastung ist gemessen bis zu 7 GiB danebengelegen, siehe "
+                             "BESTAETIGUNGEN im Quelltext)" % BESTAETIGUNGEN)
+        sp.add_argument("--anlauf", type=float, default=ANLAUF_S,
+                        help="Sekunden, in denen 'noch kein Modell da' die Wache NICHT beendet "
+                             "(Vorgabe %d -- ein Server braucht zum Laden laenger als einen Takt)" % ANLAUF_S)
+
+    for name in ("wache", "start", "stopp", "status", "pruefen", "jetzt"):
+        sp = sub.add_parser(name)
+        gemeinsam(sp)
+
+    a = p.parse_args(argv)
+    if not a.befehl:
+        p.print_help()
+        return 2
+    if a.schwelle_mib <= 0 or a.takt <= 0:
+        sys.stderr.write("wb-notbremse: --schwelle-mib und --takt muessen groesser als null sein.\n")
+        return 2
+    if a.bestaetigungen < 1:
+        sys.stderr.write("wb-notbremse: --bestaetigungen muss mindestens 1 sein.\n")
+        return 2
+    if a.befehl == "wache":
+        return cmd_wache(a)
+    if a.befehl == "start":
+        return cmd_start(a)
+    if a.befehl == "stopp":
+        return cmd_stopp(a)
+    if a.befehl == "status":
+        return cmd_status(a)
+    if a.befehl == "pruefen":
+        return cmd_pruefen(a, wirklich=False)
+    if a.befehl == "jetzt":
+        return cmd_pruefen(a, wirklich=True)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

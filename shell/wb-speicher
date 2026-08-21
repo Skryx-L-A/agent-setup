@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+# wb-speicher — was die Werkbank an Arbeitsspeicher wirklich haelt, nach Posten
+# getrennt, mit einer Grenze, ab der es zu viel ist.
+#
+#   wb-speicher              Bericht fuer Menschen
+#   wb-speicher --json       derselbe Bericht maschinenlesbar
+#   wb-speicher --pruefen    nur die Ampel; Exit 1 ab gelb, Exit 2 ab rot
+#   wb-speicher --reste      nur die Liste dessen, was liegengeblieben ist
+#   wb-speicher --reste --aufraeumen   beendet davon, was nachweislich tot ist
+#
+# WOZU (2026-08-20). der Nutzer sah "fast 20 GB" belegt, waehrend nur die Werkbank
+# lief. Die Zahl kam aus `ps rss` — und die ist auf macOS die falsche Zahl. Der
+# tmux-Server stand dort mit 4,07 GiB; sein tatsaechlicher Fussabdruck waren
+# 371 MB, die uebrigen 3,8 GiB waren Seiten, die malloc laengst freigegeben hat
+# und die das System sich unter Druck sofort zurueckholt (`footprint -p` nennt
+# sie "Reclaimable" und laesst sie aus phys_footprint heraus).
+#
+# Deshalb misst dieses Werkzeug phys_footprint und nicht RSS. Die Quelle ist
+# `top -l 1 -stats pid,mem`: dieselbe Zahl wie `footprint -p` (an tmux, claude
+# und der Werkbank-App gegengeprueft, jeweils auf das MB genau), aber fuer alle
+# 2000 Prozesse der Maschine in 0,26 s statt in einer Sekunde je Prozess.
+#
+# WAS ALS "WERKBANK" ZAEHLT: der tmux-Server, der die wb-Sessions haelt, alles,
+# was in seinen Panes laeuft (Agenten, deren MCP-Server, deren Kindprozesse),
+# die Werkbank-App samt ihrer Electron-Helfer, die Waechter, die geteilten
+# Dienste (basic-memory, ollama) — und die Reste, die niemand mehr braucht.
+# Der uebrige Schreibtisch (Browser, Editor, Teams) wird nur als eine Zeile
+# "Rest der Maschine" gezeigt, damit die Verhaeltnisse stimmen.
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+
+MIB = 1.0  # alle Zahlen in MiB, erst die Ausgabe rechnet in GiB um
+
+# Die Ampel, hergeleitet und nicht geraten (Messung vom 2026-08-20):
+#   * Die Maschine hat 48 GiB. `wb-belegung` haelt davon 6,0 GiB als Reserve
+#     fuer das System frei (RESERVE_GIB dort), ein grosses lokales Modell nimmt
+#     rund 33 GiB. Fuer allen uebrigen Userland-Speicher bleiben also 9 GiB.
+#   * Eine Werkbank aus Orchestrator und vier Workern kostet gemessen: tmux
+#     0,36 GiB, App samt Helfern 0,25 GiB, Orchestrator 0,62 GiB, je Worker
+#     0,50 GiB ohne und 0,25 GiB mit knapper MCP-Ausstattung, geteilte Dienste
+#     0,42 GiB. Das sind 3,7 GiB im heutigen Zustand und 2,7 GiB, wenn die
+#     Worker ihre ungenutzten MCP-Server nicht mehr mitstarten.
+#   * GRUEN ist deshalb das Erreichbare, nicht das Bequeme: 2,5 GiB. GELB ab
+#     2,5 GiB heisst "sieh nach, was liegengeblieben ist". ROT ab 4,0 GiB
+#     heisst, dass die Werkbank allein knapp die Haelfte der neun GiB haelt,
+#     die der ganzen Maschine neben einem Modell bleiben.
+GRENZE_GELB_MIB = 2560
+GRENZE_ROT_MIB = 4096
+
+# Die Reste-Muster. Jeder Eintrag: (Kennung, Erklaerung, Erkennung, "tot?"-Test).
+# Beendet wird von --aufraeumen nur, was der tot()-Test bejaht — ein Prozess,
+# der noch zu einer laufenden Sitzung gehoeren KOENNTE, bleibt stehen.
+
+
+def sh(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def fussabdruecke():
+    """phys_footprint je PID in MiB, aus einem einzigen top-Lauf."""
+    aus = {}
+    for zeile in sh("top", "-l", "1", "-stats", "pid,mem").splitlines():
+        f = zeile.split()
+        if len(f) != 2 or not f[0].isdigit():
+            continue
+        wert = f[1]
+        einheit = wert[-1]
+        faktor = {"K": 1 / 1024, "M": 1, "G": 1024, "B": 1 / 1048576}.get(einheit)
+        if faktor is None:
+            continue
+        try:
+            aus[int(f[0])] = float(wert[:-1]) * faktor
+        except ValueError:
+            pass
+    return aus
+
+
+def prozessbaum():
+    """(kinder, args, ppid, laufzeit_sekunden) fuer jeden Prozess."""
+    kinder, args, eltern, alter = {}, {}, {}, {}
+    for zeile in sh("ps", "-Ao", "pid=,ppid=,etime=,args=").splitlines():
+        f = zeile.split(None, 3)
+        if len(f) < 4:
+            continue
+        pid, ppid = int(f[0]), int(f[1])
+        kinder.setdefault(ppid, []).append(pid)
+        args[pid] = f[3]
+        eltern[pid] = ppid
+        alter[pid] = etime_sekunden(f[2])
+    return kinder, args, eltern, alter
+
+
+def etime_sekunden(s):
+    # [[dd-]hh:]mm:ss
+    tage = 0
+    if "-" in s:
+        t, s = s.split("-", 1)
+        tage = int(t)
+    teile = [int(x) for x in s.split(":")]
+    while len(teile) < 3:
+        teile.insert(0, 0)
+    return tage * 86400 + teile[0] * 3600 + teile[1] * 60 + teile[2]
+
+
+def kopf(a):
+    """Die ersten drei Woerter einer Befehlszeile, klein geschrieben.
+
+    Es waere bequem, die GANZE Befehlszeile nach 'mcp' oder 'wb-' abzusuchen —
+    und es ist falsch. Ein Claude-Pane traegt seine Rollendatei per
+    `--append-system-prompt` als Argument mit; dort steht das Wort MCP mehrfach
+    im Fliesstext, und die Sitzung landete damit in der Spalte ihrer eigenen
+    MCP-Server (gemessen am 20.08.: 2,10 GiB statt 0,64 GiB). Der Befehl steht
+    immer vorn, der Prosatext immer weiter hinten.
+    """
+    return " ".join(a.split()[:3]).lower()
+
+
+def nachkommen(pid, kinder, gesehen=None):
+    gesehen = gesehen if gesehen is not None else set()
+    if pid in gesehen:
+        return gesehen
+    gesehen.add(pid)
+    for k in kinder.get(pid, []):
+        nachkommen(k, kinder, gesehen)
+    return gesehen
+
+
+def wb_tmux():
+    """(Server-PIDs, Pane-PIDs) der tmux-Server, die Werkbank-Sessions halten."""
+    server, panes = set(), set()
+    for zeile in sh("tmux", "list-sessions", "-F", "#{pid}\t#{session_name}").splitlines():
+        f = zeile.split("\t")
+        if len(f) == 2 and f[1].startswith("wb-"):
+            server.add(int(f[0]))
+    for zeile in sh("tmux", "list-panes", "-a", "-F", "#{pane_pid}").splitlines():
+        if zeile.strip().isdigit():
+            panes.add(int(zeile.strip()))
+    return server, panes
+
+
+# --- Reste -----------------------------------------------------------------
+
+def reste_finden(args, eltern, alter):
+    """Was liegengeblieben ist. 'tot' heisst: es kann seinen Zweck nicht mehr
+    erfuellen, weil sein Ziel verschwunden ist — nicht bloss 'sieht alt aus'."""
+    funde = []
+
+    for pid, a in args.items():
+        if eltern.get(pid) != 1:
+            continue
+
+        # 1. Der Platzhalter-Beobachter aus pi-worker: eine Schleife, die bis zu
+        #    sechs Stunden alle 15 s nachsieht, ob eine Ergebnisdatei da ist.
+        #    Verschwindet das Ergebnisverzeichnis (Testlauf raeumt sein Tempdir
+        #    ab), laeuft er trotzdem weiter — er kann nichts mehr finden und
+        #    nichts mehr umbiegen.
+        if "seq 1 1440" in a and "latest.md" in a:
+            ziel = re.search(r"(\S+/\.pi-workers/results/\S+?)(?:/|\s|$)", a)
+            verzeichnis = ziel.group(1) if ziel else None
+            tot = bool(verzeichnis) and not os.path.isdir(verzeichnis)
+            funde.append({
+                "pid": pid, "art": "platzhalter-beobachter",
+                "was": "pi-worker-Beobachter fuer ein Ergebnis",
+                "ziel": verzeichnis or "?", "alter_s": alter.get(pid, 0), "tot": tot,
+                "grund": "Ergebnisverzeichnis existiert nicht mehr" if tot
+                         else "Ergebnisverzeichnis existiert noch",
+            })
+            continue
+
+        # 2. tmux-Server von Testlaeufen. Ein Test raeumt seinen Socket ab; was
+        #    hier steht, hat es nicht getan. Tot ist er, wenn keine Session mehr
+        #    daran haengt oder er laenger als eine Stunde ohne Client steht.
+        m = re.search(r"tmux\s+-L\s+(\S*(?:wbtest|wbmem|wbctl|wbdyn|wbsw|wbsit)\S*)", a)
+        if m:
+            sock = m.group(1)
+            clients = sh("tmux", "-L", sock, "list-clients").strip()
+            sessions = sh("tmux", "-L", sock, "list-sessions").strip()
+            tot = (not sessions) or (not clients and alter.get(pid, 0) > 3600)
+            funde.append({
+                "pid": pid, "art": "test-tmux",
+                "was": f"tmux-Server eines Testlaufs (-L {sock})",
+                "ziel": sock, "alter_s": alter.get(pid, 0), "tot": tot,
+                "grund": "keine Session mehr daran" if not sessions
+                         else ("seit ueber einer Stunde ohne Client" if tot
+                               else "haengt noch an einer Session"),
+            })
+            continue
+
+        # 3. Ein MCP-Server ohne Sitzung darueber. Startet ihn eine Sitzung,
+        #    ist sein Elternprozess diese Sitzung; steht er unter PID 1, ist
+        #    die Sitzung weg und er nicht.
+        k = kopf(a)
+        if "@playwright/mcp" in k or "modelcontextprotocol" in k or "-mcp" in k:
+            funde.append({
+                "pid": pid, "art": "verwaister-mcp",
+                "was": "MCP-Server ohne die Sitzung, die ihn gestartet hat",
+                "ziel": "-", "alter_s": alter.get(pid, 0), "tot": True,
+                "grund": "Elternprozess ist PID 1, also ist seine Sitzung beendet",
+            })
+
+    return funde
+
+
+def reste_beenden(funde):
+    """Beendet nur die toten. Erst SIGTERM, dann nachsehen, dann SIGKILL."""
+    beendet, geblieben = [], []
+    tote = [f for f in funde if f["tot"]]
+    for f in tote:
+        try:
+            os.kill(f["pid"], signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    # Kurz warten, ohne zu schlafen wenn nichts zu tun ist.
+    if tote:
+        subprocess.run(["sleep", "2"])
+    for f in tote:
+        try:
+            os.kill(f["pid"], 0)
+        except ProcessLookupError:
+            beendet.append(f["pid"])
+            continue
+        except PermissionError:
+            geblieben.append(f["pid"])
+            continue
+        try:
+            os.kill(f["pid"], signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if tote:
+        subprocess.run(["sleep", "1"])
+    for f in tote:
+        if f["pid"] in beendet or f["pid"] in geblieben:
+            continue
+        try:
+            os.kill(f["pid"], 0)
+            geblieben.append(f["pid"])
+        except (ProcessLookupError, PermissionError):
+            beendet.append(f["pid"])
+    return beendet, geblieben
+
+
+# --- Hinweise ---------------------------------------------------------------
+
+# So viel Verlauf reicht allen, die ihn lesen (gemessen 2026-08-20 auf eigenem
+# Socket): die Kontextwache nimmt nur den sichtbaren Schirm, der Rueckblick der
+# App holt 2000 Zeilen, pi-worker und wb-ssh-worker belegen mit -S -2000, und
+# der weiteste Griff im ganzen Repo ist -S -3000. Bei 20000 bleiben in einem
+# 57 Zeilen hohen Pane trotzdem 350 Bildschirme zum Zurueckscrollen — der
+# Puffer ist auch Bedienoberflaeche des Nutzers, nicht nur Futter fuer Werkzeuge.
+VERLAUF_EMPFOHLEN = 20000
+# Kosten, gemessen mit sieben randvollen Panes: 294 MiB Gitter bei 100000,
+# 59 MiB bei 20000.
+VERLAUF_MIB_JE_10K_UND_PANE = 4.2
+
+
+def hinweise(posten, panes, args):
+    h = []
+
+    limit = sh("tmux", "show-options", "-gv", "history-limit").strip()
+    if limit.isdigit() and int(limit) > VERLAUF_EMPFOHLEN:
+        n = max(1, len(panes))
+        jetzt = int(limit) / 10000 * VERLAUF_MIB_JE_10K_UND_PANE * n
+        dann = VERLAUF_EMPFOHLEN / 10000 * VERLAUF_MIB_JE_10K_UND_PANE * n
+        h.append(
+            f"history-limit steht auf {limit}. Randvoll kostet das bei {n} Panes "
+            f"{jetzt:.0f} MiB statt {dann:.0f} MiB bei {VERLAUF_EMPFOHLEN}, und "
+            f"{VERLAUF_EMPFOHLEN} reicht allen Lesern (siehe Kommentar). "
+            f"Aendern in ~/.tmux.conf; sofort wirksam mit "
+            f"'tmux set -g history-limit {VERLAUF_EMPFOHLEN}'."
+        )
+
+    sitzungen = len(posten["sitzungen"]["pids"])
+    mcp_mib = posten["mcp"]["mib"]
+    if sitzungen and mcp_mib > 200:
+        h.append(
+            f"Die MCP-Server kosten {mcp_mib:.0f} MiB bei {sitzungen} Sitzungen "
+            f"({mcp_mib / sitzungen:.0f} MiB je Sitzung). Gemessen startet eine "
+            "frische Claude-Sitzung mit 516 MiB und mit "
+            "'--strict-mcp-config --mcp-config <nur was gebraucht wird>' mit "
+            "252 MiB — der Browser-MCP macht die Haelfte aus und wird von den "
+            "wenigsten Workern benutzt."
+        )
+
+    if any("ollama serve" in kopf(a) for a in args.values()):
+        # Ein Daemon ohne geladenes Modell ist der Fall, den stehende des Nutzers
+        # Regel meint: er laeuft nicht, solange er gebraucht wird, sondern immer.
+        geladen = sh("curl", "-s", "--max-time", "3", "http://127.0.0.1:11434/api/ps")
+        if '"models":[]' in geladen.replace(" ", ""):
+            h.append(
+                "ollama serve laeuft, hat aber nichts geladen. Seit 2026-08-20 "
+                "ist das normalerweise kein Dauerzustand mehr: der Dienst haengt "
+                "hinter wb-modell-proxy (launchd haelt 11434, der echte Server "
+                "lauscht auf 11444) und beendet sich 20 Minuten nach der letzten "
+                "Anfrage von selbst. Steht er hier trotzdem laenger, ist entweder "
+                "die Leerlaufwache aus oder ihn haelt jemand mit Anfragen wach — "
+                "nachsehen mit 'wb-dienst status agent-workbench.ollama 11444'. Von "
+                "Hand anhalten: 'wb-dienst halt agent-workbench.ollama 11444'. NICHT "
+                "'brew services stop ollama' — das schaltet den falschen Dienst "
+                "(Homebrews Dauerfassung ist bewusst abgeschaltet)."
+            )
+
+    return h
+
+
+# --- Erhebung ---------------------------------------------------------------
+
+def erheben():
+    mem = fussabdruecke()
+    kinder, args, eltern, alter = prozessbaum()
+    server, panes = wb_tmux()
+
+    posten = {k: {"mib": 0.0, "pids": []} for k in
+              ("tmux", "sitzungen", "mcp", "arbeit", "app", "waechter", "dienste", "reste")}
+    zugeordnet = set()
+
+    def eintragen(schluessel, pid):
+        if pid in zugeordnet or pid not in mem:
+            return
+        zugeordnet.add(pid)
+        posten[schluessel]["mib"] += mem[pid]
+        posten[schluessel]["pids"].append(pid)
+
+    funde = reste_finden(args, eltern, alter)
+    for f in funde:
+        eintragen("reste", f["pid"])
+
+    for pid in server:
+        eintragen("tmux", pid)
+
+    # Alles unter den Panes: die Sitzung selbst, ihre MCP-Server, und alles
+    # andere, was in einem Pane arbeitet (Testlaeufe, Skripte, Hilfsprozesse).
+    for wurzel in panes:
+        for pid in nachkommen(wurzel, kinder):
+            k = kopf(args.get(pid, ""))
+            if "mcp" in k or "@playwright" in k:
+                eintragen("mcp", pid)
+            elif re.search(r"(^|/)(claude|pi|codex|opencode|crush|nanocoder|kimi)\b", k):
+                eintragen("sitzungen", pid)
+            else:
+                eintragen("arbeit", pid)
+
+    for pid, a in args.items():
+        k = kopf(a)
+        if "agent workbench.app" in k or "agent-workbench-bin" in k:
+            eintragen("app", pid)
+        elif "context-guard" in k or re.search(r"/wb-[a-z-]+\b", k):
+            eintragen("waechter", pid)
+        elif "ollama serve" in k or "basic_memory" in k or "basic-memory" in k:
+            eintragen("dienste", pid)
+
+    gesamt = sum(p["mib"] for p in posten.values())
+    maschine = sum(mem.values())
+    return {
+        "posten": posten,
+        "hinweise": hinweise(posten, panes, args),
+        "gesamt_mib": gesamt,
+        "maschine_mib": maschine,
+        "rest_mib": maschine - gesamt,
+        "reste": funde,
+        "ampel": "rot" if gesamt > GRENZE_ROT_MIB else ("gelb" if gesamt > GRENZE_GELB_MIB else "gruen"),
+        "grenzen_mib": {"gelb": GRENZE_GELB_MIB, "rot": GRENZE_ROT_MIB},
+    }
+
+
+# --- Ausgabe ----------------------------------------------------------------
+
+TITEL = {
+    "tmux": "tmux-Server (haelt die Panes und ihren Verlauf)",
+    "sitzungen": "Agenten-Sitzungen in den Panes",
+    "mcp": "MCP-Server dieser Sitzungen",
+    "arbeit": "Arbeit in den Panes (Tests, Skripte, Hilfsprozesse)",
+    "app": "Werkbank-App samt Electron-Helfern",
+    "waechter": "Waechter und wb-Werkzeuge",
+    "dienste": "geteilte Dienste (basic-memory, ollama)",
+    "reste": "Reste, die niemand mehr braucht",
+}
+
+
+def gib(mib):
+    return f"{mib / 1024:.2f} GiB" if mib >= 1024 else f"{mib:.0f} MiB"
+
+
+def bericht(d):
+    z = []
+    z.append("Speicher der Werkbank — gemessen als phys_footprint, nicht als RSS.")
+    z.append("")
+    for k in ("tmux", "sitzungen", "mcp", "arbeit", "app", "waechter", "dienste", "reste"):
+        p = d["posten"][k]
+        if not p["pids"]:
+            continue
+        z.append(f"  {TITEL[k]:<48} {gib(p['mib']):>10}   ({len(p['pids'])} Prozesse)")
+    z.append("  " + "-" * 48 + " " + "-" * 10)
+    z.append(f"  {'Werkbank gesamt':<48} {gib(d['gesamt_mib']):>10}")
+    z.append(f"  {'Rest der Maschine (Browser, Editor, System)':<48} {gib(d['rest_mib']):>10}")
+    z.append("")
+    ampel = {"gruen": "GRUEN", "gelb": "GELB", "rot": "ROT"}[d["ampel"]]
+    z.append(f"  Ampel: {ampel}   (gelb ab {gib(GRENZE_GELB_MIB)}, rot ab {gib(GRENZE_ROT_MIB)})")
+    if d["ampel"] == "gruen":
+        z.append("  Die Werkbank passt neben ein grosses lokales Modell.")
+    else:
+        z.append("  Neben einem Modell von 33 GiB wird es eng. Erst die Reste ansehen:")
+        z.append("  wb-speicher --reste")
+    tot = [r for r in d["reste"] if r["tot"]]
+    if tot:
+        z.append("")
+        z.append(f"  {len(tot)} von {len(d['reste'])} Resten sind nachweislich tot — "
+                 "'wb-speicher --reste --aufraeumen' beendet genau diese.")
+    if d["hinweise"]:
+        z.append("")
+        z.append("  Hebel, die gemessen sind:")
+        for hinweis in d["hinweise"]:
+            zeilen = umbrechen(hinweis, 72)
+            z.append(f"   * {zeilen[0]}")
+            for w in zeilen[1:]:
+                z.append(f"     {w}")
+    return "\n".join(z)
+
+
+def umbrechen(text, breite):
+    zeilen, aktuell = [], ""
+    for wort in text.split():
+        if aktuell and len(aktuell) + 1 + len(wort) > breite:
+            zeilen.append(aktuell)
+            aktuell = wort
+        else:
+            aktuell = f"{aktuell} {wort}".strip()
+    if aktuell:
+        zeilen.append(aktuell)
+    return zeilen
+
+
+def reste_bericht(funde):
+    if not funde:
+        return "Keine Reste gefunden."
+    z = []
+    nach_art = {}
+    for f in funde:
+        nach_art.setdefault(f["art"], []).append(f)
+    for art, liste in nach_art.items():
+        tote = [f for f in liste if f["tot"]]
+        z.append(f"{art}: {len(liste)} Prozesse, davon {len(tote)} tot")
+        z.append(f"   {liste[0]['was']}")
+        gruende = {}
+        for f in liste:
+            gruende.setdefault(f["grund"], 0)
+            gruende[f["grund"]] += 1
+        for grund, n in gruende.items():
+            z.append(f"   {n}x  {grund}")
+        aeltester = max(liste, key=lambda f: f["alter_s"])
+        z.append(f"   aeltester laeuft seit {aeltester['alter_s'] // 3600} h "
+                 f"{(aeltester['alter_s'] % 3600) // 60} min")
+        z.append("")
+    return "\n".join(z).rstrip()
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=True, description="Speicherverbrauch der Werkbank")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--pruefen", action="store_true")
+    p.add_argument("--reste", action="store_true")
+    p.add_argument("--aufraeumen", action="store_true")
+    a = p.parse_args()
+
+    d = erheben()
+
+    if a.reste:
+        if a.aufraeumen:
+            beendet, geblieben = reste_beenden(d["reste"])
+            print(f"Beendet: {len(beendet)} Prozesse.")
+            if geblieben:
+                print(f"Geblieben trotz Aufforderung: {len(geblieben)} — {geblieben}")
+            nach = erheben()
+            print(f"Werkbank vorher {gib(d['gesamt_mib'])}, nachher {gib(nach['gesamt_mib'])}.")
+            return 0
+        if a.json:
+            print(json.dumps(d["reste"], indent=1))
+        else:
+            print(reste_bericht(d["reste"]))
+        return 0
+
+    if a.json:
+        print(json.dumps(d, indent=1))
+    elif a.pruefen:
+        print(f"{d['ampel'].upper()} {gib(d['gesamt_mib'])}")
+    else:
+        print(bericht(d))
+
+    if a.pruefen:
+        return {"gruen": 0, "gelb": 1, "rot": 2}[d["ampel"]]
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

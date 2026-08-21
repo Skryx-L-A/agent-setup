@@ -1,0 +1,776 @@
+#!/bin/bash
+# wb-llama-server — startet und beendet den llama.cpp-Server fuer lokale GGUF-
+# Modelle (Port 8082). Schwesterwerkzeug zu wb-mlx-server, mit denselben
+# Sicherungen und bewusst OHNE jeden Eingriff in dieses: eigener Port, eigener
+# Zustandsordner, eigene Belegungskennung. Beide koennen nebeneinander
+# existieren; ob gleichzeitig, entscheidet allein der freie Speicher und damit
+# wb-belegung, nicht dieses Skript.
+#
+# WARUM ES DIESES WERKZEUG UEBERHAUPT GIBT (Auftrag G, 2026-08-19, Plan
+# angenommen): mlx_lm.server 0.31.3 kann Stapelverarbeitung ODER ein
+# Entwurfsmodell, nie beides — `is_batchable = draft_model is None`
+# (server.py:371). Schlimmer noch: fuer unsere qwen3_5-Hybridmodelle kann es
+# das Entwurfsmodell UEBERHAUPT NICHT, weil spekulatives Dekodieren einen
+# zurueckrollbaren Cache verlangt (generate.py:528) und die rekurrenten Lagen
+# einen ArraysCache ohne `trim` benutzen (models/qwen3_5.py:305). Der Beleg
+# liegt seit dem 11.08. auf der Platte: in
+# ~/AI/mlx-models/spek-draft08-n2-server.log steht bei JEDER der 50 Anfragen
+# "ValueError: Speculative decoding requires a trimmable prompt cache (got
+# {'ArraysCache'})", und spek-out-draft08-n2.json meldet 50 unlesbare Faelle
+# und null erzeugte Token.
+#
+# llama.cpp kann beides ZUSAMMEN, in einem Prozess, und zwar auch fuer
+# hybride und rekurrente Modelle — nachgelesen im Quelltext, nicht geglaubt:
+# tools/server/server-context.cpp legt den spekulativen Zustand mit der
+# Slot-Zahl an (`common_speculative_init(params_base.speculative,
+# params_base.n_parallel)`), jeder Slot haelt seinen eigenen Entwurf
+# (slot.spec_draft) und seinen eigenen Kontrollpunkt (slot.spec_ckpt), und
+# common/speculative.cpp unterscheidet ausdruecklich
+# `llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)`
+# und arbeitet dort mit Zustands-Kontrollpunkten statt mit Beschneiden. Genau
+# an dieser Stelle steigt mlx-lm aus.
+#
+# PORT 8082 (nicht 8080, nicht 8081): 8080 ist der Proxy, 8081 gehoert
+# wb-mlx-server. Wer den llama.cpp-Weg in ~/.pi/agent/models.json eintraegt,
+# legt dafuer einen EIGENEN Provider mit baseUrl http://127.0.0.1:8082/v1 an
+# — dieses Skript fasst models.json nicht an, aus demselben Grund, aus dem
+# wb-mlx-server es seit 2026-08-19 nicht mehr tut: zwei unabhaengige
+# Schreiber auf denselben Eintrag sind ein Wettlauf.
+#
+# KV-CACHE IMMER 8 BIT (Anweisung des Nutzers, gilt fuer jedes lokale Modell und
+# jeden Weg): -ctk q8_0 -ctv q8_0 fuer das Zielmodell und
+# --spec-draft-type-k/-v q8_0 fuer das Entwurfsmodell. Quantisierter KV
+# verlangt in llama.cpp Flash Attention, deshalb steht -fa on fest daneben und
+# nicht auf 'auto'. Ueberschreibbar ueber WB_LLAMA_SERVER_KV_TYP, aber die
+# Vorgabe ist die Regel.
+#
+# NEBENLAEUFIGKEIT: -np <N> gibt die Zahl der Server-Slots, -cb (kontinuierliche
+# Buendelung) ist in llama.cpp die Vorgabe und wird hier nicht abgeschaltet.
+# Vorgabe 4, wie auf der MLX-Seite — dort ist 4 der gemessene Suesspunkt
+# (40,3 s je Einheit gegen 97,0 s seriell, 8 war wieder langsamer). Ob 4 auch
+# hier der Suesspunkt ist, entscheidet die Messstrecke aus Paket 5 des Plans;
+# bis dahin ist es die begruendete Uebernahme, nicht eine Messung.
+#
+# SPEKULATION: --spekulation waehlt das Verfahren.
+#   aus      keine Spekulation (reine Buendelung)
+#   mtp      --spec-type draft-mtp mit dem trainierten MTP-Kopf des Modells
+#            als -md; die Qwen3.5/3.6/3.8-Familie bringt ihn mit
+#            (common/speculative.cpp:1296 nennt qwen35/qwen35moe ausdruecklich)
+#   entwurf  --spec-type draft-simple mit einem kleinen Modell derselben
+#            Familie als -md (gleiche Tokenisierung ist Pflicht)
+#   ngram    --spec-type ngram-mod, ohne zweites Modell und ohne GPU-Speicher;
+#            der Hash-Vorrat wird ueber ALLE Slots geteilt, gleichzeitige
+#            Anfragen helfen einander also
+# Welches Verfahren zu welchem Modell gehoert, steht in der Registry
+# (entwurfsmodelle.json, siehe unten) und wird NICHT hier hartkodiert. Ohne
+# --spekulation nimmt `ensure` den Registry-Eintrag; --spekulation aus
+# ueberstimmt ihn.
+#
+# DENKSTUFE (uebernommen von der MLX-Seite, gleiche Falle): Qwen3.8s eigene
+# Chat-Vorlage geht OHNE gesetzten reasoning_effort auf xhigh, und eine Anfrage
+# braucht dann statt rund einer Minute ueber 28 Minuten (gemessen, siehe
+# Kopfkommentar von wb-mlx-server und gardener/dream/config.py). Auf der
+# MLX-Seite loest das die Registry-Vorgabe chatTemplateArgs
+# {"reasoning_effort":"low"}; llama-server hat dafuer einen eigenen Schalter,
+# --reasoning-effort. Der Wert kommt aus dem Registry-Feld reasoningEffort und
+# gehoert damit zum MODELL, nicht zum Aufruf. Ohne Feld wird nichts gesetzt und
+# es gilt die Vorgabe des Servers.
+#
+# ANTWORT UND DENKSPUR: llama-server laeuft mit --jinja (Vorgabe) und legt die
+# Denkspur eines Qwen3.5-Modells in message.reasoning_content, waehrend
+# message.content leer bleibt, solange das Modell noch denkt. Ein Client, der
+# nur content liest, sieht bei zu kleinem max_tokens also eine leere Antwort -
+# das ist kein Fehler des Servers. Gemessen am 2026-08-19 mit 300 Token: 300
+# completion_tokens, content leer, reasoning_content gefuellt.
+#
+# BELEGUNG: gleiche Regel wie bei wb-mlx-server, gleiche Begruendung (die zwei
+# Kernel-Paniken vom 11.08., siehe
+# ~/Knowledge/10-global/incident-2026-08-11-kernel-panik-durch-gpu-speichermangel.md).
+# `ensure` nimmt VOR dem Start eine Belegung, meldet sie nach der Probeanfrage
+# als `geladen`, `stop` gibt sie nach dem verifizierten Ende zurueck. Die
+# Gewichte des ENTWURFSMODELLS werden mitgebucht, und sein KV-Bedarf geht als
+# Aufschlag in --zuschlag-gb — llama.cpp legt fuer den Entwurf einen zweiten,
+# eigenen KV-Cache an, und ein nicht gebuchter zweiter Cache ist genau die
+# Luecke, aus der die Paniken entstanden sind.
+#
+# REGISTRY: ~/.local/state/wb-belegung/entwurfsmodelle.json, angelegt von
+# diesem Werkzeug (`wb-llama-server liste` zeigt sie). Sie gehoert NICHT zur
+# Modell-Registry der Werkbank (~/.claude/workbench/models.json) — die gehoert
+# einer anderen Spur und wird hier weder gelesen noch geschrieben.
+#
+# WB_LLAMA_SERVER_OHNE_BELEGUNG=1 ist die einzige Umgehung und bewusst laut,
+# wortgleich zur MLX-Seite: ein klares NEIN von wb-belegung wird davon NICHT
+# uebersteuert.
+
+set -uo pipefail
+
+PORT="${WB_LLAMA_SERVER_PORT:-8082}"
+BASEURL="http://127.0.0.1:$PORT"
+NAME="wb-llama-server"
+LOG="$HOME/.local/state/wb-nohup/logs/$NAME.log"
+STATEDIR="$HOME/.local/state/wb-llama-server"
+KENNUNG_DATEI="$STATEDIR/belegung-kennung"
+AKTUELL_DATEI="$STATEDIR/aktuell.json"
+REGISTRY="$HOME/.local/state/wb-belegung/entwurfsmodelle.json"
+
+NP="${WB_LLAMA_SERVER_PARALLEL:-4}"
+KV_TYP="${WB_LLAMA_SERVER_KV_TYP:-q8_0}"
+BELEGUNG_FRIST_MIN_VORGABE="${WB_LLAMA_SERVER_FRIST_MIN:-180}"
+
+# Mindestfreier Speicher vor dem Start, in MiB (20 GB) — dieselbe Schwelle wie
+# wb-mlx-server, gleiche Begruendung.
+MIN_FREE_MIB=20480
+
+# Letzter Rueckfall fuer den Kontext, wenn wb-kontext nichts Brauchbares
+# liefert. Derselbe Wert, den grug-server und wb-mlx-server benutzen.
+VORGABE_KONTEXT_ALT=18432
+
+# Grundzuschlag von wb-belegung (dessen Vorgabe ist 4,0 GiB). Wird hier nur
+# angefasst, um den zweiten KV-Cache des Entwurfsmodells daraufzulegen.
+ZUSCHLAG_GRUND=4.0
+
+err() { printf 'wb-llama-server: %s\n' "$*" >&2; }
+
+belegung_bin() {
+  local p="$HOME/.local/bin/wb-belegung"
+  if [ -x "$p" ]; then printf '%s' "$p"; return 0; fi
+  command -v wb-belegung 2>/dev/null
+}
+
+find_pid() {
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1
+}
+
+is_ours() {
+  local pid="$1"
+  [ -n "$pid" ] && ps -o command= -p "$pid" 2>/dev/null | grep -q "llama-server"
+}
+
+# Das Modell, das GERADE unter dieser PID laeuft — aus dem lebenden
+# -m-Argument gelesen, nicht aus einer Merkdatei (dieselbe Regel wie bei
+# wb-mlx-server: nachsehen statt annehmen).
+laufendes_modell() {
+  local pid="$1"
+  ps -o command= -p "$pid" 2>/dev/null | sed -n 's/.* -m \([^ ]*\).*/\1/p'
+}
+
+wait_health() {
+  local deadline_s="$1" waited=0
+  while [ "$waited" -lt "$deadline_s" ]; do
+    curl -fsS --max-time 2 "$BASEURL/health" >/dev/null 2>&1 && return 0
+    sleep 2; waited=$((waited + 2))
+  done
+  return 1
+}
+
+probe_request() {
+  local body
+  body=$(printf '{"model":"%s","messages":[{"role":"user","content":"Antworte nur mit OK."}],"max_tokens":8}' "$1")
+  curl -fsS --max-time 120 "$BASEURL/v1/chat/completions" -H 'Content-Type: application/json' -d "$body"
+}
+
+# ── Registry ────────────────────────────────────────────────────────────────
+# Legt die Datei an, wenn sie fehlt. Der Inhalt ist Wissen ueber Modelle, kein
+# Schalter: welcher Entwurf zu welchem Ziel gehoert, mit Herkunft und Datum
+# wie in kv-bedarf.json. Der Mensch waehlt hier nichts aus.
+registry_anlegen() {
+  [ -f "$REGISTRY" ] && return 0
+  mkdir -p "$(dirname "$REGISTRY")" 2>/dev/null
+  cat > "$REGISTRY" <<'JSON'
+{
+  "version": 1,
+  "modelle": {}
+}
+JSON
+}
+
+# Setzt bei Erfolg RES_KEY, RES_GGUF, RES_ENTWURF, RES_VERFAHREN,
+# RES_GEWICHTE_GB, RES_ENTWURF_GEWICHTE_GB, RES_KV_NAME, RES_ENTWURF_KV_MIB,
+# RES_ALIAS, RES_DENKSTUFE.
+RES_KEY=""; RES_GGUF=""; RES_ENTWURF=""; RES_VERFAHREN=""
+RES_GEWICHTE_GB=""; RES_ENTWURF_GEWICHTE_GB=""; RES_KV_NAME=""
+RES_ENTWURF_KV_MIB=""; RES_ALIAS=""; RES_DENKSTUFE=""
+RES_GGUF_BYTE=""; RES_ENTWURF_BYTE=""
+
+resolve_modell() {
+  local eingabe="$1"
+  registry_anlegen
+  local out
+  out="$(python3 - "$REGISTRY" "$eingabe" <<'PY'
+import json, os, sys
+reg_pfad, eingabe = sys.argv[1], sys.argv[2]
+try:
+    reg = json.load(open(reg_pfad, encoding="utf-8"))
+except Exception:
+    reg = {"modelle": {}}
+modelle = reg.get("modelle") or {}
+
+key, eintrag = "", None
+if eingabe in modelle:
+    key, eintrag = eingabe, modelle[eingabe]
+else:
+    # Ein Pfad darf auch ohne Registry-Eintrag benutzt werden; wird er dort
+    # wiedererkannt, gibt es Entwurf und Gewichte gratis dazu.
+    for k, v in modelle.items():
+        if os.path.abspath(v.get("gguf", "")) == os.path.abspath(eingabe):
+            key, eintrag = k, v
+            break
+if eintrag is None:
+    if not eingabe.endswith(".gguf"):
+        sys.exit(3)
+    eintrag = {"gguf": eingabe}
+    key = os.path.basename(eingabe)[:-5]
+
+felder = [
+    key,
+    eintrag.get("gguf", ""),
+    eintrag.get("entwurf") or "",
+    eintrag.get("verfahren") or "aus",
+    str(eintrag.get("gewichteGb") or ""),
+    str(eintrag.get("entwurfGewichteGb") or ""),
+    eintrag.get("kvName") or os.path.basename(eintrag.get("gguf", ""))[:-5],
+    str(eintrag.get("entwurfKvMibJeToken") or ""),
+    eintrag.get("alias") or key,
+    eintrag.get("reasoningEffort") or "",
+    str(eintrag.get("ggufByte") or ""),
+    str(eintrag.get("entwurfByte") or ""),
+]
+print("\t".join(felder))
+PY
+)"
+  local rc=$?
+  if [ "$rc" -eq 3 ]; then
+    err "'$eingabe' ist weder ein Registry-Schluessel noch ein Pfad auf eine .gguf-Datei."
+    err "Bekannte Schluessel: $(registry_schluessel)"
+    return 1
+  fi
+  [ "$rc" -eq 0 ] || { err "Registry '$REGISTRY' nicht lesbar."; return 1; }
+  RES_KEY="$(printf '%s' "$out" | cut -f1)"
+  RES_GGUF="$(printf '%s' "$out" | cut -f2)"
+  RES_ENTWURF="$(printf '%s' "$out" | cut -f3)"
+  RES_VERFAHREN="$(printf '%s' "$out" | cut -f4)"
+  RES_GEWICHTE_GB="$(printf '%s' "$out" | cut -f5)"
+  RES_ENTWURF_GEWICHTE_GB="$(printf '%s' "$out" | cut -f6)"
+  RES_KV_NAME="$(printf '%s' "$out" | cut -f7)"
+  RES_ENTWURF_KV_MIB="$(printf '%s' "$out" | cut -f8)"
+  RES_ALIAS="$(printf '%s' "$out" | cut -f9)"
+  RES_DENKSTUFE="$(printf '%s' "$out" | cut -f10)"
+  RES_GGUF_BYTE="$(printf '%s' "$out" | cut -f11)"
+  RES_ENTWURF_BYTE="$(printf '%s' "$out" | cut -f12)"
+  return 0
+}
+
+registry_schluessel() {
+  registry_anlegen
+  python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+print(", ".join(sorted((d.get("modelle") or {}).keys())) or "(keine)")
+' "$REGISTRY" 2>/dev/null
+}
+
+# Gewichte in GiB: Registry-Wert, sonst aus der Dateigroesse. Anders als bei
+# einem MLX-Verzeichnis ist das hier exakt, weil eine GGUF-Datei genau die
+# Gewichte enthaelt.
+gewichte_gb_ermitteln() {
+  local pfad="$1" registry_wert="$2"
+  if [ -n "$registry_wert" ]; then printf '%s' "$registry_wert"; return 0; fi
+  local bytes
+  bytes="$(stat -c %s "$pfad" 2>/dev/null || stat -f %z "$pfad" 2>/dev/null)"
+  if [ -z "$bytes" ]; then
+    err "Groesse von '$pfad' nicht messbar — kein Start ohne eine Gewichtsangabe."
+    return 1
+  fi
+  awk -v b="$bytes" 'BEGIN { printf "%.2f", b/1073741824 }'
+}
+
+# Prueft eine Datei gegen ihre Sollgroesse aus der Registry. Ohne Sollgroesse
+# wird nichts geprueft und nichts behauptet.
+vollstaendig_pruefen() {
+  local pfad="$1" soll="$2" was="$3"
+  [ -n "$soll" ] || return 0
+  local ist; ist="$(stat -c %s "$pfad" 2>/dev/null || stat -f %z "$pfad" 2>/dev/null)"
+  if [ -z "$ist" ]; then
+    err "$was '$pfad' ist nicht lesbar."
+    return 1
+  fi
+  if [ "$ist" != "$soll" ]; then
+    err "$was '$pfad' ist unvollstaendig: $ist von $soll Byte. Kein Start mit einer halben Datei."
+    return 1
+  fi
+  return 0
+}
+
+kontext_vorgabe_ermitteln() {
+  local kennung="$1"
+  if command -v wb-kontext >/dev/null 2>&1; then
+    local wert rc
+    wert="$(wb-kontext empfehlung "$kennung" --parallel "$NP")"
+    rc=$?
+    case "$wert" in ''|*[!0-9]*) wert="" ;; esac
+    if [ "$rc" -eq 0 ] && [ -n "$wert" ]; then
+      err "Kontext: $wert Token (wb-kontext empfehlung $kennung --parallel $NP)."
+      printf '%s' "$wert"
+      return 0
+    fi
+    err "wb-kontext lieferte keinen brauchbaren Wert (Exit $rc) fuer '$kennung' — falle auf den Festwert $VORGABE_KONTEXT_ALT zurueck."
+  else
+    err "wb-kontext nicht installiert — falle auf den Festwert $VORGABE_KONTEXT_ALT zurueck."
+  fi
+  err "Kontext: $VORGABE_KONTEXT_ALT Token (Vorgabe)."
+  printf '%s' "$VORGABE_KONTEXT_ALT"
+}
+
+# ── aktuell.json: Gedaechtnis, keine Live-Anzeige (wie bei wb-mlx-server) ────
+aktuell_schreiben() {
+  local key="$1" gguf="$2" kontext="$3" kennung="$4" verfahren="$5" entwurf="$6"
+  mkdir -p "$STATEDIR" 2>/dev/null
+  python3 - "$AKTUELL_DATEI" "$key" "$gguf" "$kontext" "$kennung" "$verfahren" "$entwurf" "$NP" <<'PY'
+import json, sys, time
+pfad_out, key, gguf, kontext, kennung, verfahren, entwurf, np = sys.argv[1:9]
+daten = {
+    "schluessel": key,
+    "modell": gguf,
+    "kontext": int(kontext) if kontext.isdigit() else None,
+    "parallel": int(np) if np.isdigit() else None,
+    "spekulation": verfahren,
+    "entwurf": entwurf or None,
+    "belegungKennung": kennung or None,
+    "startzeit": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+}
+with open(pfad_out, "w", encoding="utf-8") as f:
+    json.dump(daten, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+}
+
+aktuell_modell_lesen() {
+  [ -f "$AKTUELL_DATEI" ] || return 0
+  python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+print(d.get("schluessel") or d.get("modell") or "")
+' "$AKTUELL_DATEI" 2>/dev/null
+}
+
+# ── Belegung ────────────────────────────────────────────────────────────────
+BELEGUNG_KENNUNG=""
+belegung_nehmen() {
+  local kv_name="$1" gewichte_gb="$2" kontext="$3" frist_min="$4" zweck="$5" zuschlag_gb="$6"
+  BELEGUNG_KENNUNG=""
+  local wbb; wbb="$(belegung_bin)"
+  if [ -z "$wbb" ]; then
+    if [ "${WB_LLAMA_SERVER_OHNE_BELEGUNG:-0}" = "1" ]; then
+      err "WARNUNG: wb-belegung nicht gefunden — WB_LLAMA_SERVER_OHNE_BELEGUNG=1 gesetzt, starte OHNE Cross-Sitzungs-Sperre."
+      return 0
+    fi
+    err "wb-belegung nicht gefunden — kein Start ohne die Cross-Sitzungs-Sperre."
+    return 1
+  fi
+
+  local nimm_out nimm_rc
+  nimm_out="$("$wbb" nimm \
+    --gewichte-gb "$gewichte_gb" --modell "$kv_name" \
+    --parallel "$NP" --kontext "$kontext" \
+    --zuschlag-gb "$zuschlag_gb" \
+    --zweck "$zweck" \
+    --frist "$frist_min" 2>&1)"
+  nimm_rc=$?
+  printf '%s\n' "$nimm_out" >&2
+
+  if [ "$nimm_rc" -eq 0 ]; then
+    BELEGUNG_KENNUNG="$(printf '%s\n' "$nimm_out" | sed -n 's/.*unter der Kennung \([0-9a-f]\{1,\}\).*/\1/p' | head -1)"
+    if [ -z "$BELEGUNG_KENNUNG" ]; then
+      err "wb-belegung nimm meldete Erfolg, aber keine lesbare Kennung — kein Start."
+      return 1
+    fi
+    return 0
+  fi
+  if [ "$nimm_rc" -eq 1 ]; then
+    err "wb-belegung lehnt die Belegung ab (siehe oben, mit Halter) — kein Start."
+    return 1
+  fi
+  if [ "${WB_LLAMA_SERVER_OHNE_BELEGUNG:-0}" = "1" ]; then
+    err "WARNUNG: wb-belegung scheiterte (Exit $nimm_rc) — WB_LLAMA_SERVER_OHNE_BELEGUNG=1 gesetzt, starte OHNE Cross-Sitzungs-Sperre."
+    return 0
+  fi
+  err "wb-belegung scheiterte unerwartet (Exit $nimm_rc) — kein Start ohne die Cross-Sitzungs-Sperre."
+  return 1
+}
+
+belegung_freigeben() {
+  local wbb; wbb="$(belegung_bin)"
+  [ -n "$wbb" ] || return 0
+  local kennung=""
+  if [ -f "$KENNUNG_DATEI" ]; then
+    kennung="$(tr -d '[:space:]' < "$KENNUNG_DATEI" 2>/dev/null)"
+  fi
+  if [ -n "$kennung" ]; then
+    if ! "$wbb" gib "$kennung" 2>&1; then
+      "$wbb" gib "$kennung" --fremd 2>&1
+    fi
+    rm -f "$KENNUNG_DATEI"
+  fi
+  return 0
+}
+
+belegung_abbrechen() {
+  local wbb; wbb="$(belegung_bin)"
+  if [ -n "$wbb" ] && [ -n "$BELEGUNG_KENNUNG" ]; then
+    "$wbb" gib "$BELEGUNG_KENNUNG" 2>&1
+    rm -f "$KENNUNG_DATEI"
+  fi
+  return 1
+}
+
+# Abbruch NACH dem Start: erst den Prozess beenden, dann die Belegung
+# zurueckgeben — nie umgekehrt. Ein geladenes Modell ohne Belegung ist genau
+# der Zustand, aus dem die naechste Sitzung den freien Speicher zu gross
+# schaetzt, und das ist der dokumentierte Weg in die Kernel-Panik vom 11.08.
+abbruch_nach_start() {
+  local pid="$1"
+  if [ -n "$pid" ] && ps -o pid= -p "$pid" >/dev/null 2>&1; then
+    err "raeume den gestarteten Server ab (PID $pid), bevor die Belegung zurueckgeht."
+    kill "$pid" 2>/dev/null
+    local waited=0
+    while ps -o pid= -p "$pid" >/dev/null 2>&1 && [ "$waited" -lt 20 ]; do
+      sleep 0.5; waited=$((waited + 1))
+    done
+    ps -o pid= -p "$pid" >/dev/null 2>&1 && kill -9 "$pid" 2>/dev/null
+    sleep 1
+  else
+    err "der Serverprozess ist bereits von selbst beendet (Absturz) — siehe $LOG."
+  fi
+  local stillpid; stillpid="$(find_pid)"
+  if [ -n "$stillpid" ]; then
+    err "Port $PORT ist weiterhin belegt (PID $stillpid) — von Hand pruefen."
+  fi
+  belegung_abbrechen
+}
+
+# ── status/liste ────────────────────────────────────────────────────────────
+cmd_status() {
+  local pid; pid="$(find_pid)"
+  if [ -z "$pid" ]; then
+    echo "wb-llama-server: laeuft nicht (Port $PORT frei)."
+    [ -f "$KENNUNG_DATEI" ] && echo "  WARNUNG: Kennungsdatei $KENNUNG_DATEI existiert trotzdem — 'wb-llama-server stop' raeumt sie ab."
+    return 1
+  fi
+  if ! is_ours "$pid"; then
+    echo "wb-llama-server: Port $PORT ist belegt, aber nicht von llama-server (PID $pid)."
+    return 1
+  fi
+  echo "wb-llama-server: laeuft (PID $pid, Port $PORT)."
+  echo "  Modell:      $(laufendes_modell "$pid")"
+  if [ -f "$AKTUELL_DATEI" ]; then
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print("  Schluessel:  %s" % (d.get("schluessel") or "-"))
+print("  Kontext:     %s Token, %s Slots" % (d.get("kontext") or "-", d.get("parallel") or "-"))
+print("  Spekulation: %s%s" % (d.get("spekulation") or "aus",
+      (" (%s)" % d["entwurf"]) if d.get("entwurf") else ""))
+print("  Belegung:    %s" % (d.get("belegungKennung") or "-"))
+print("  gestartet:   %s" % (d.get("startzeit") or "-"))
+' "$AKTUELL_DATEI" 2>/dev/null
+  fi
+  return 0
+}
+
+cmd_liste() {
+  registry_anlegen
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+m = d.get("modelle") or {}
+if not m:
+    print("Registry ist leer: %s" % sys.argv[1]); raise SystemExit(0)
+print("Entwurfsmodell-Zuordnung (%s):" % sys.argv[1])
+for k in sorted(m):
+    v = m[k]
+    print("  %-22s %s" % (k, v.get("gguf", "-")))
+    print("  %-22s Verfahren %s, Entwurf %s" % ("", v.get("verfahren", "aus"), v.get("entwurf") or "-"))
+    if v.get("notiz"):
+        print("  %-22s %s" % ("", v["notiz"]))
+' "$REGISTRY"
+}
+
+# ── stop ────────────────────────────────────────────────────────────────────
+_stop_pruefen_und_beenden() {
+  # Beendet, was auf $PORT laeuft, und PRUEFT das Ende (Prozess weg, Port
+  # frei) statt es anzunehmen — dieselbe Pruefung wie bei wb-mlx-server.
+  local pid="$1"
+  kill "$pid" 2>/dev/null
+  local waited=0
+  while ps -o pid= -p "$pid" >/dev/null 2>&1 && [ "$waited" -lt 30 ]; do
+    sleep 0.5; waited=$((waited + 1))
+  done
+  if ps -o pid= -p "$pid" >/dev/null 2>&1; then
+    err "PID $pid reagiert nach 15s nicht auf SIGTERM — sende SIGKILL."
+    kill -9 "$pid" 2>/dev/null
+    sleep 1
+  fi
+  if ps -o pid= -p "$pid" >/dev/null 2>&1; then
+    err "PID $pid laeuft immer noch — Beenden fehlgeschlagen."
+    return 1
+  fi
+  local stillpid; stillpid="$(find_pid)"
+  if [ -n "$stillpid" ]; then
+    err "Prozess $pid ist weg, aber Port $PORT ist weiterhin belegt (PID $stillpid) — pruefen."
+    return 1
+  fi
+  echo "wb-llama-server: beendet — Prozess $pid weg, Port $PORT frei." >&2
+  belegung_freigeben
+  return 0
+}
+
+cmd_stop() {
+  local pid; pid="$(find_pid)"
+  if [ -z "$pid" ]; then
+    # Kein Prozess heisst NICHT "nichts zu tun": eine offene Belegung ohne
+    # Prozess ist genau der Zustand, aus dem die naechste Sitzung den Speicher
+    # falsch einschaetzt.
+    echo "wb-llama-server: laeuft nicht (Port $PORT frei)." >&2
+    if [ -f "$KENNUNG_DATEI" ]; then
+      err "es lag noch eine Belegungskennung herum — gebe sie zurueck."
+      belegung_freigeben
+    fi
+    return 0
+  fi
+  if ! is_ours "$pid"; then
+    err "Port $PORT ist belegt, aber nicht von llama-server (PID $pid) — nichts beendet."
+    return 1
+  fi
+  _stop_pruefen_und_beenden "$pid"
+}
+
+# ── ensure ──────────────────────────────────────────────────────────────────
+cmd_ensure() {
+  local eingabe="" kontext_arg="" frist_min="$BELEGUNG_FRIST_MIN_VORGABE" spek_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --kontext)
+        case "${2:-}" in ''|*[!0-9]*) err "--kontext braucht Token als Zahl"; exit 2 ;; esac
+        kontext_arg="$2"; shift 2 ;;
+      --frist)
+        case "${2:-}" in ''|*[!0-9]*) err "--frist braucht Minuten als Zahl"; exit 2 ;; esac
+        frist_min="$2"; shift 2 ;;
+      --parallel)
+        case "${2:-}" in ''|*[!0-9]*) err "--parallel braucht eine Zahl"; exit 2 ;; esac
+        NP="$2"; shift 2 ;;
+      --spekulation)
+        case "${2:-}" in
+          aus|mtp|entwurf|ngram) spek_arg="$2" ;;
+          *) err "--spekulation kennt nur aus|mtp|entwurf|ngram"; exit 2 ;;
+        esac
+        shift 2 ;;
+      --*) err "unbekannte Option '$1'"; exit 2 ;;
+      *)
+        if [ -n "$eingabe" ]; then err "nur ein Modell je Aufruf"; exit 2; fi
+        eingabe="$1"; shift ;;
+    esac
+  done
+
+  if [ -z "$eingabe" ]; then
+    eingabe="$(aktuell_modell_lesen)"
+    if [ -z "$eingabe" ]; then
+      err "kein Modell angegeben und keine vorherige Wahl gemerkt."
+      err "Bekannte Schluessel: $(registry_schluessel)"
+      return 2
+    fi
+    err "kein Modell angegeben — verwende das zuletzt gewaehlte ($eingabe)."
+  fi
+
+  resolve_modell "$eingabe" || return 1
+  local gguf="$RES_GGUF"
+  if [ ! -f "$gguf" ]; then
+    err "GGUF-Datei fehlt: $gguf"
+    return 1
+  fi
+  # Eine halb geladene Datei EXISTIERT, und `-f` allein wuerde sie durchlassen —
+  # llama-server startet dann mit einem abgeschnittenen Modell oder scheitert
+  # mit einer schwer lesbaren Meldung. Steht in der Registry eine Sollgroesse,
+  # wird sie geprueft (Auftrag G, 2026-08-19: genau dieser Fall lag beim Bau vor,
+  # weil der 16-GB-Download noch lief).
+  vollstaendig_pruefen "$gguf" "$RES_GGUF_BYTE" "Zielmodell" || return 1
+
+  # Verfahren: ausdrueckliches --spekulation schlaegt die Registry.
+  local verfahren="${spek_arg:-$RES_VERFAHREN}"
+  [ -n "$verfahren" ] || verfahren="aus"
+  local entwurf=""
+  if [ "$verfahren" = "mtp" ] || [ "$verfahren" = "entwurf" ]; then
+    entwurf="$RES_ENTWURF"
+    if [ -n "$entwurf" ] && [ -f "$entwurf" ] && [ -n "$RES_ENTWURF_BYTE" ]; then
+      vollstaendig_pruefen "$entwurf" "$RES_ENTWURF_BYTE" "Entwurfsmodell" || entwurf=""
+    fi
+    if [ -z "$entwurf" ] || [ ! -f "$entwurf" ]; then
+      err "Verfahren '$verfahren' verlangt ein Entwurfsmodell, aber '${entwurf:-nichts}' ist nicht da — schalte auf ngram um."
+      verfahren="ngram"; entwurf=""
+    fi
+  fi
+
+  local kontext kontext_automatisch=0
+  if [ -n "$kontext_arg" ]; then
+    kontext="$kontext_arg"
+  else
+    kontext="$(kontext_vorgabe_ermitteln "$RES_KEY")"
+    kontext_automatisch=1
+  fi
+
+  # Laeuft schon etwas auf dem Port?
+  local pid; pid="$(find_pid)"
+  if [ -n "$pid" ] && is_ours "$pid"; then
+    local laufend; laufend="$(laufendes_modell "$pid")"
+    if [ "$laufend" = "$gguf" ]; then
+      echo "wb-llama-server: '$RES_KEY' laeuft bereits (PID $pid, Port $PORT)." >&2
+      # Frist der BESTEHENDEN Belegung nachziehen — ein langer Lauf faehrt
+      # sonst ab Stunde drei mit verfallener Belegung weiter, und genau das
+      # ist der dokumentierte Weg in die Kernel-Panik (Befund B2 vom 16.08.).
+      if [ -f "$KENNUNG_DATEI" ]; then
+        local wbb kennung; wbb="$(belegung_bin)"
+        kennung="$(tr -d '[:space:]' < "$KENNUNG_DATEI" 2>/dev/null)"
+        if [ -n "$wbb" ] && [ -n "$kennung" ]; then
+          "$wbb" verlaengern "$kennung" --frist "$frist_min" 2>&1 >/dev/null || \
+            err "Frist der bestehenden Belegung $kennung konnte nicht nachgezogen werden."
+        fi
+      fi
+      return 0
+    fi
+    echo "wb-llama-server: es laeuft '$laufend', angefordert ist '$gguf' — beende das laufende Modell zuerst." >&2
+    _stop_pruefen_und_beenden "$pid" || return 1
+  elif [ -n "$pid" ]; then
+    err "Port $PORT ist belegt, aber nicht von llama-server (PID $pid). Kein Start."
+    return 1
+  fi
+
+  if ! command -v check-resources >/dev/null 2>&1; then
+    err "check-resources nicht gefunden — kein Start ohne Speicherpruefung."
+    return 1
+  fi
+  local free_mib
+  free_mib="$(check-resources 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["ram"]["free_mib"])' 2>/dev/null)"
+  if [ -z "$free_mib" ]; then
+    err "check-resources lieferte keinen lesbaren Wert — kein Start ohne Speicherpruefung."
+    return 1
+  fi
+  if [ "$free_mib" -lt "$MIN_FREE_MIB" ]; then
+    err "nur ${free_mib} MiB frei, mindestens ${MIN_FREE_MIB} MiB (20 GB) noetig — Start abgebrochen."
+    err "Grund: ~/Knowledge/10-global/incident-2026-08-11-kernel-panik-durch-gpu-speichermangel.md"
+    return 1
+  fi
+
+  if ! command -v llama-server >/dev/null 2>&1; then
+    err "llama-server nicht im PATH gefunden."
+    return 1
+  fi
+
+  # Gewichte: Ziel plus, falls benutzt, Entwurf. Der zweite KV-Cache des
+  # Entwurfsmodells geht als Aufschlag in den Zuschlag.
+  local gewichte_ziel gewichte_gesamt zuschlag
+  gewichte_ziel="$(gewichte_gb_ermitteln "$gguf" "$RES_GEWICHTE_GB")" || return 1
+  gewichte_gesamt="$gewichte_ziel"
+  zuschlag="$ZUSCHLAG_GRUND"
+  if [ -n "$entwurf" ]; then
+    local gewichte_entwurf
+    gewichte_entwurf="$(gewichte_gb_ermitteln "$entwurf" "$RES_ENTWURF_GEWICHTE_GB")" || return 1
+    gewichte_gesamt="$(awk -v a="$gewichte_ziel" -v b="$gewichte_entwurf" 'BEGIN { printf "%.2f", a+b }')"
+    local kv_mib="${RES_ENTWURF_KV_MIB:-0}"
+    zuschlag="$(awk -v z="$ZUSCHLAG_GRUND" -v k="$kv_mib" -v n="$NP" -v c="$kontext" \
+      'BEGIN { printf "%.2f", z + (k*n*c)/1024 }')"
+    err "Entwurfsmodell mitgebucht: $gewichte_entwurf GiB Gewichte, Zuschlag auf $zuschlag GiB erhoeht (zweiter KV-Cache)."
+  fi
+
+  local zweck="wb-llama-server: llama.cpp-Server fuer $RES_KEY, Port $PORT, $NP Slots, Spekulation $verfahren"
+  if ! belegung_nehmen "$RES_KV_NAME" "$gewichte_gesamt" "$kontext" "$frist_min" "$zweck" "$zuschlag"; then
+    if [ "$kontext_automatisch" -eq 1 ] && [ "$kontext" -ne "$VORGABE_KONTEXT_ALT" ]; then
+      err "automatische Kontextempfehlung ($kontext Token) abgelehnt — letzter Rueckfall: $VORGABE_KONTEXT_ALT."
+      kontext="$VORGABE_KONTEXT_ALT"
+      belegung_nehmen "$RES_KV_NAME" "$gewichte_gesamt" "$kontext" "$frist_min" "$zweck" "$zuschlag" || return 1
+    else
+      return 1
+    fi
+  fi
+  mkdir -p "$(dirname "$KENNUNG_DATEI")" 2>/dev/null
+  if [ -n "$BELEGUNG_KENNUNG" ]; then
+    printf '%s\n' "$BELEGUNG_KENNUNG" > "$KENNUNG_DATEI"
+  else
+    rm -f "$KENNUNG_DATEI"
+  fi
+  # Ab hier haelt dieser Lauf ggf. eine Belegung — jeder Abbruchpfad darunter
+  # muss sie wieder freigeben (belegung_abbrechen).
+
+  # "$@" statt eines Arrays, weil /bin/bash hier 3.2 ist: ein LEERES Array
+  # unter "${arr[@]}" wirft dort mit `set -u` "unbound variable".
+  set -- -m "$gguf" --host 127.0.0.1 --port "$PORT" \
+    --alias "$RES_ALIAS" \
+    -np "$NP" -c "$((kontext * NP))" \
+    -ngl 999 -fa on \
+    -ctk "$KV_TYP" -ctv "$KV_TYP" \
+    --no-webui
+  if [ -n "$RES_DENKSTUFE" ]; then
+    set -- "$@" --reasoning-effort "$RES_DENKSTUFE"
+  fi
+  case "$verfahren" in
+    mtp)     set -- "$@" -md "$entwurf" --spec-type draft-mtp \
+                        --spec-draft-type-k "$KV_TYP" --spec-draft-type-v "$KV_TYP" ;;
+    entwurf) set -- "$@" -md "$entwurf" --spec-type draft-simple \
+                        --spec-draft-type-k "$KV_TYP" --spec-draft-type-v "$KV_TYP" ;;
+    ngram)   set -- "$@" --spec-type ngram-mod ;;
+    aus)     : ;;
+  esac
+
+  local newpid
+  newpid="$("$HOME/.local/bin/wb-nohup" "$NAME" -- llama-server "$@")" || {
+    err "wb-nohup konnte den Server nicht starten — siehe $LOG"
+    belegung_abbrechen; return 1
+  }
+  echo "wb-llama-server: gestartet (PID $newpid, Modell $RES_KEY, Spekulation $verfahren), warte auf Antwortbereitschaft..." >&2
+
+  # 16 GB von der Platte laden dauert laenger als bei MLX, deshalb 300s statt
+  # 90s. Unbegrenzt wird hier nie gewartet.
+  if ! wait_health 300; then
+    err "Server antwortet nach 300s nicht auf /health — siehe $LOG"
+    abbruch_nach_start "$newpid"; return 1
+  fi
+
+  echo "wb-llama-server: /health antwortet, sende Probeanfrage..." >&2
+  local resp
+  if ! resp="$(probe_request "$RES_ALIAS")"; then
+    err "Probeanfrage fehlgeschlagen — Server erreichbar, liefert aber keine gueltige Antwort. Siehe $LOG"
+    abbruch_nach_start "$newpid"; return 1
+  fi
+  if ! printf '%s' "$resp" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+sys.exit(0 if d.get("choices") else 1)' 2>/dev/null; then
+    err "Probeanfrage lieferte kein gueltiges Ergebnis: $resp"
+    abbruch_nach_start "$newpid"; return 1
+  fi
+
+  if [ -n "$BELEGUNG_KENNUNG" ]; then
+    local wbb; wbb="$(belegung_bin)"
+    [ -n "$wbb" ] && "$wbb" geladen "$BELEGUNG_KENNUNG" 2>&1
+  fi
+
+  aktuell_schreiben "$RES_KEY" "$gguf" "$kontext" "$BELEGUNG_KENNUNG" "$verfahren" "$entwurf"
+
+  echo "wb-llama-server: bereit (PID $newpid, Port $PORT, Modell $RES_KEY, $NP Slots, Kontext $kontext je Slot, KV $KV_TYP, Spekulation $verfahren), Probeanfrage erfolgreich." >&2
+  return 0
+}
+
+unterbefehl="${1:-}"; shift 2>/dev/null || true
+case "$unterbefehl" in
+  ensure) cmd_ensure "$@" ;;
+  stop)   cmd_stop "$@" ;;
+  status) cmd_status ;;
+  liste)  cmd_liste ;;
+  *)
+    echo "Usage: wb-llama-server ensure [<schluessel|pfad.gguf>] [--kontext <token>] [--parallel <n>] [--spekulation aus|mtp|entwurf|ngram] [--frist <minuten>]" >&2
+    echo "       wb-llama-server stop | status | liste" >&2
+    exit 2 ;;
+esac

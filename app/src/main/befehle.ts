@@ -23,10 +23,12 @@
 // und spawnt, nichts anderes -- keiner der Befehle der Seiten tut es, und es
 // kommt hier auch keiner dazu.
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fernAufruf, mitMaschinenLocale } from './pfad';
+import { wbCodeKenntKontext as kenntKontext, KONTEXT_PROBE_ARGS } from './kontext';
+import { startBefund, kurzfassung } from './startprotokoll';
 
 export interface BefehlsUmgebung {
   sessionsDir: string;
@@ -34,6 +36,38 @@ export interface BefehlsUmgebung {
   tmuxSocket: string;
   /** Aufrufe, ueberschreibbar fuer Tests -- im Betrieb die Namen aus dem PATH. */
   wbCodeBin: string;
+  /**
+   * Ein Satz an den Menschen, waehrend etwas laeuft. Optional: der Steuerkanal
+   * und die Tests haben kein Fenster, in das sie melden koennten.
+   */
+  fortschritt?: (text: string) => void;
+  /**
+   * Wohin die Ausgabe von `wb-code` geschrieben wird -- derselbe Ordner, den
+   * `sessionAnlegen` benutzt (`stateDir/sitzungsstart`). Ohne ihn gibt es auf
+   * diesem Weg keinen Grund zu zeigen: die Hilfssession nimmt ihre Ausgabe mit
+   * ins Grab, sobald tmux sie abraeumt.
+   */
+  startProtokollDir?: string;
+  /**
+   * WIE EIN START AUF DIESEM WEG AUSGEHT -- damit die Liste dasselbe zeigt wie
+   * beim Plus-Menue (21.08.). Dort haelt `sessionAnlegen` seinen eigenen
+   * Kindprozess und weiss es selbst; hier laeuft `wb-code` in einer
+   * tmux-Hilfssession, und nur diese Funktion sieht, wie es ausgeht.
+   *
+   * 'beginnt'     ab jetzt startet etwas fuer diesen Ordner
+   * 'steht'       die Zielsitzung ist da
+   * 'gescheitert' der Befehl ist zu Ende, ohne dass eine Sitzung entstand
+   *
+   * Optional aus demselben Grund wie `fortschritt`: Steuerkanal und Tests
+   * haben kein Fenster.
+   */
+  startVerlauf?: (
+    phase: 'beginnt' | 'steht' | 'gescheitert',
+    info: {
+      dir: string; key: string; ort: string;
+      kurz?: string; grund?: string; protokoll?: string;
+    },
+  ) => void;
   wbSessionDeleteBin: string;
   /**
    * `wb-session-close`. Eine tmux-Session wird NIE mit `tmux kill-session`
@@ -85,6 +119,12 @@ export interface Plan {
   daten?: Record<string, unknown>;
 }
 
+// FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden derselben Woche):
+// ein `spawnSync('tmux', …)` ohne `timeout` blockiert den GESAMTEN
+// Hauptprozess ohne Ende, sobald das echte tmux-Binary nicht antwortet --
+// nicht nur diesen einen Aufruf. Rein oertlich (dieser Helfer nimmt keine
+// Maschine entgegen, siehe seine Aufrufer), darum dieselbe 2s-Grenze wie bei
+// den anderen oertlichen bare-tmux-Aufrufen in diesem Haus.
 function tmux(socket: string, args: string[]): { ok: boolean; out: string } {
   const basis = socket ? ['-L', socket] : [];
   // Kodierung mitgeben, aus demselben Grund wie in sessions.ts und tmux.ts
@@ -92,7 +132,10 @@ function tmux(socket: string, args: string[]): { ok: boolean; out: string } {
   // Leerzeichen und waeren von der fehlenden Zeichenklasse nicht betroffen --
   // die Regel steht trotzdem an jedem Aufruf, dessen Ausgabe zerlegt wird,
   // damit sie nicht bei der naechsten Formataenderung neu erwogen werden muss.
-  const r = spawnSync('tmux', [...basis, ...args], { encoding: 'utf8', env: mitMaschinenLocale() });
+  const r = spawnSync('tmux', [...basis, ...args], { encoding: 'utf8', env: mitMaschinenLocale(), timeout: 2000 });
+  if (r.error || r.signal) {
+    process.stderr.write(`befehle.ts tmux(${args.join(' ')}): ${r.signal ? 'nach 2000ms abgebrochen' : r.error?.message} -- gilt als fehlgeschlagen.\n`);
+  }
   return { ok: r.status === 0, out: (r.stdout || '').trim() };
 }
 
@@ -142,6 +185,12 @@ export interface SessionAkte {
   tmuxSession: string;
   sessionKey: string;
   claudeSessionId: string;
+  /** Der Harness, mit dem sie lief -- leer, wenn die Datei ihn nicht fuehrt. */
+  harness: string;
+  /** Das Modell, mit dem sie lief. */
+  model: string;
+  /** Die gewaehlte Kontextstufe in Token, 0 wenn keine. */
+  kontext: number;
 }
 
 /**
@@ -189,6 +238,9 @@ export function findeSessionAkte(sessionsDir: string, dir: string, sessionKey?: 
       tmuxSession: String(roh.tmuxSession ?? ''),
       sessionKey: key,
       claudeSessionId: String(roh.claudeSessionId ?? ''),
+      harness: String(roh.harness ?? ''),
+      model: String(roh.model ?? ''),
+      kontext: Number(roh.kontext ?? 0) || 0,
     };
   }
   return null;
@@ -397,6 +449,19 @@ export function plane(nachricht: Record<string, unknown>, u: BefehlsUmgebung): P
       if (akte.sessionKey) args.push('--key', akte.sessionKey);
       if (akte.name) args.push('--name', akte.name);
       if (akte.claudeSessionId) args.push('--resume', akte.claudeSessionId);
+      // WOMIT SIE LIEF, GEHT MIT (21.08.). Ohne diese drei Angaben baute dieser
+      // Weg die Zeile nur aus Ordner, Name und Kennung -- und `wb-code` faellt
+      // fuer alles Uebrige auf die EINSTELLUNGEN zurueck, nicht auf die
+      // Zustandsdatei. Eine pi-Sitzung mit 131072 Token kam so als das zurueck,
+      // was gerade in den Einstellungen stand. Der Knopf in der Leiste macht es
+      // laengst richtig (revive.ts, `reviveCommand`); dieser Weg zog nach.
+      if (akte.harness) {
+        args.push('--harness', akte.harness);
+        if (akte.model) args.push('--model', akte.model);
+      }
+      if (akte.kontext > 0 && kenntKontext([u.wbCodeBin, ...KONTEXT_PROBE_ARGS])) {
+        args.push('--kontext', String(akte.kontext));
+      }
       return {
         art: 'bestaetigen',
         command,
@@ -642,6 +707,65 @@ export interface Ausgang {
   ausgabe: string;
 }
 
+// WIE LANGE AUF EINE NEUE SITZUNG GEWARTET WIRD, und warum es nicht mehr zwanzig
+// Sekunden sind (korrigiert 2026-08-21).
+//
+// `wb-code` legt seine tmux-Session erst an, NACHDEM `wb-mlx-server ensure` und
+// `wb-kontext ensure` durch sind. Bei einem lokalen Modell heisst das: erst laedt
+// ein Modellkoerper von rund 20 GiB, dann erst entsteht die Sitzung. Zwanzig
+// Sekunden konnten dabei nie reichen.
+//
+// DIE OBERGRENZE IST HERGELEITET, NICHT GERATEN. `wb-mlx-server` setzt seine
+// eigene harte Frist, bis zu der ein Server antworten muss: 90 Sekunden fuer die
+// drei MLX-Motoren, 300 Sekunden fuer vllm-metal (dort gemessen: 77 Sekunden bis
+// zur ersten beantworteten Anfrage). Laenger als diese Frist kann der Schritt
+// gar nicht dauern -- danach bricht das Werkzeug selbst ab. Dazu kommen die
+// gemessenen Zeiten drumherum: die Buchung samt Start und Probeanfrage brauchte
+// bei einem winzigen Modell 6,4 Sekunden kalt und 0,5 Sekunden warm, ein
+// zweiter, kleinerer Buchungsversuch kann dazukommen, und `wb-kontext ensure`
+// lag bei 0,1 Sekunden. Sechs Minuten decken den schlechtesten dieser Faelle mit
+// Reserve ab.
+//
+// DIE SCHNELLE SPUR WIRD DADURCH NICHT LANGSAMER. Eine Claude-Sitzung ohne
+// Modellstart bricht die Schleife ab, sobald ihre Sitzung auftaucht -- das war
+// vorher so und bleibt so. Die Obergrenze ist nur die Stelle, an der aufgegeben
+// wird, nicht die Zeit, die gewartet wird.
+const HELFER_OBERGRENZE_MS = 360_000;
+// Ab wann und wie oft der Mensch hoert, dass es noch laeuft. Zwanzig Sekunden
+// sind die alte Frist: bis dahin ist jede schnelle Sitzung laengst da, und wer
+// laenger wartet, wartet auf ein Modell.
+const HELFER_MELDUNG_AB_S = 20;
+const HELFER_MELDUNG_TAKT_S = 15;
+// So heissen die Hilfssessions. Der Praefix ist die einzige Klammer, an der ein
+// spaeterer Aufruf eine liegengebliebene wiedererkennt.
+const HELFER_PREFIX = 'awb-neu-';
+
+/**
+ * Liegengebliebene Hilfssessions einsammeln -- die, deren Befehl WIRKLICH haengt.
+ *
+ * tmux raeumt eine Session ab, sobald ihr Befehl endet, auch wenn er scheitert.
+ * Eine Hilfssession, die deutlich aelter ist als die Obergrenze, ist deshalb
+ * keine, die noch arbeitet, sondern eine, deren Befehl nicht mehr zurueckkommt.
+ * Nur die wird beendet.
+ *
+ * Es laeuft dafuer KEIN Waechter im Hintergrund (stehende Regel: kein Prozess auf
+ * Vorrat). Aufgeraeumt wird beim naechsten Start -- also genau dann, wenn es
+ * jemanden interessiert, und nie ohne Anlass.
+ */
+function helferAufraeumen(socket: string): void {
+  const zeilen = tmux(socket, ['list-sessions', '-F', '#{session_name} #{session_created}']).out
+    .split('\n').filter(Boolean);
+  const jetzt = Math.floor(Date.now() / 1000);
+  for (const zeile of zeilen) {
+    const [name, erzeugt] = zeile.split(' ');
+    if (!name?.startsWith(HELFER_PREFIX)) continue;
+    const alter = jetzt - Number(erzeugt || 0);
+    if (!Number.isFinite(alter) || alter * 1000 <= HELFER_OBERGRENZE_MS) continue;
+    process.stderr.write(`Hilfssession '${name}' haengt seit ${alter}s -- eingesammelt.\n`);
+    tmux(socket, ['kill-session', '-t', `=${name}`]);
+  }
+}
+
 /**
  * Einen Plan ausfuehren -- und NUR einen, der ausgefuehrt werden darf. Die
  * Beschreibung wird dabei nicht neu erzeugt: Was der Mensch bestaetigt hat, ist
@@ -661,20 +785,56 @@ export interface Ausgang {
  * Weg, der nichts sagt (Steuerkanal, Plan-Bestaetigung im Hauptfenster, ein
  * Skript), gilt als Agent.
  */
-export function fuehreAus(plan: Plan, u: BefehlsUmgebung, mensch = false): Ausgang {
+export async function fuehreAus(plan: Plan, u: BefehlsUmgebung, mensch = false): Promise<Ausgang> {
   if (plan.art !== 'bestaetigen' || !plan.aufruf?.length) {
     return { ok: false, ausgabe: `Nichts auszufuehren (${plan.art}).` };
   }
   const [bin, ...args] = plan.aufruf;
 
   if (bin === u.wbCodeBin) {
-    const helfer = `awb-neu-${process.pid}-${Date.now()}`;
+    // Zuerst einsammeln, was von frueher haengengeblieben ist -- siehe
+    // helferAufraeumen(). Vor dem eigenen Start, damit die Liste sauber ist,
+    // gegen die gleich verglichen wird.
+    helferAufraeumen(u.tmuxSocket);
+    const helfer = `${HELFER_PREFIX}${process.pid}-${Date.now()}`;
     const zeile = [bin, ...args].map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ');
+    // DIE AUSGABE GEHT IN EINE DATEI, sonst gibt es auf diesem Weg keinen Grund
+    // zu zeigen (21.08.). Die Hilfssession nimmt ihre Ausgabe mit, sobald tmux
+    // sie abraeumt -- und `wb-code` schreibt genau dorthin, warum er aufgibt.
+    const protokoll = u.startProtokollDir
+      ? join(u.startProtokollDir, `${Date.now()}-fortsetzen.log`)
+      : '';
+    if (protokoll) {
+      try {
+        mkdirSync(dirname(protokoll), { recursive: true });
+      } catch { /* ein Protokoll ist eine Verbesserung, keine Bedingung */ }
+    }
     // `unset TMUX`: sonst haelt tmux den Aufruf fuer eine verschachtelte
     // Sitzung und `attach` verweigert -- die Zielsession entstuende zwar, aber
     // der Weg dorthin waere ein Fehlschlag, auf den man sich nicht stuetzt.
+    //
+    // DER PANE WIRD DABEI GERETTET, NICHT WEGGEWORFEN (21.08.). Dieses `unset`
+    // nimmt dem, was danach kommt, seinen Bezugspunkt: `wb-nohup` startet
+    // keinen abgeloesten Modellserver ohne nachweisbaren Eigentuemer, und ohne
+    // $TMUX findet es keinen. Gemessen an genau diesem Weg -- der Start brach
+    // ab mit "wb-nohup: braucht einen tmux-Pane als Bezugspunkt", danach
+    // "wb-code: 'wb-mlx-server ensure' fehlgeschlagen -- kein Start", und
+    // uebrig blieb eine Zustandsdatei ohne Sitzung.
+    //
+    // WARUM NICHT WB_EIGENTUEMER_WERKBANK wie beim Plus-Menue: dort laeuft
+    // `wb-code` als Kind dieses Prozesses, und `wb-nohup` verlangt (zu Recht),
+    // dass die genannte PID ein echter VORFAHRE des Aufrufs ist. Hier laeuft
+    // `wb-code` als Kind des tmux-SERVERS, und der gehoert nicht diesem
+    // Programm -- die Huerde traegt also nicht, und sie aufzuweichen hiesse,
+    // jedem Agenten die Werkbank als Eigentuemer zu schenken. Der Pane der
+    // Hilfssession ist statt dessen ein echter, nachpruefbarer Eigentuemer;
+    // `wb-code` schreibt ihn spaeter auf den Pane der Zielsitzung um, sobald es
+    // die gibt (wb-nohup umschreiben).
+    const rettung = 'WB_EIGENTUEMER_TMUX="$TMUX"; WB_EIGENTUEMER_TMUX_PANE="$TMUX_PANE"; '
+      + 'export WB_EIGENTUEMER_TMUX WB_EIGENTUEMER_TMUX_PANE; unset TMUX; ';
+    const umleitung = protokoll ? ` > '${protokoll.replace(/'/g, `'\\''`)}' 2>&1` : '';
     const start = tmux(u.tmuxSocket, [
-      'new-session', '-d', '-s', helfer, `unset TMUX; ${zeile}`,
+      'new-session', '-d', '-s', helfer, `${rettung}${zeile}${umleitung}`,
     ]);
     if (!start.ok) return { ok: false, ausgabe: `Hilfssession liess sich nicht anlegen: ${helfer}` };
 
@@ -688,24 +848,124 @@ export function fuehreAus(plan: Plan, u: BefehlsUmgebung, mensch = false): Ausga
     // eine wb-Session, die es VORHER nicht gab, oder die Hilfssession von
     // selbst endet (dann ist ihr Befehl durch).
     const ziel = String(plan.daten?.tmuxSession ?? '');
+    // Wofuer der Start gilt -- dieselben zwei Angaben, ueber die auch
+    // `sessionAnlegen` seine Merkmale zuordnet: Ordner und Sitzungsschluessel.
+    const zielInfo = {
+      dir: String(plan.daten?.dir ?? ''),
+      key: String(plan.daten?.sessionKey ?? ''),
+      ort: ziel || String(plan.daten?.dir ?? 'die Sitzung'),
+    };
+    u.startVerlauf?.('beginnt', zielInfo);
     const namen = (): string[] => tmux(u.tmuxSocket, ['list-sessions', '-F', '#{session_name}']).out
       .split('\n').filter(Boolean);
     const vorher = new Set(namen().filter((n) => n !== helfer));
-    const frist = Date.now() + 20_000;
+    const begonnen = Date.now();
     let da = false;
-    while (Date.now() < frist) {
-      spawnSync('sleep', ['0.3']);
+    /** Der Befehl ist zu Ende gekommen -- unabhaengig davon, wie er ausging. */
+    let durch = false;
+    let gemeldet = 0;
+    while (Date.now() - begonnen < HELFER_OBERGRENZE_MS) {
+      // `await` statt `spawnSync('sleep', ...)`: der Hauptprozess bedient
+      // waehrenddessen weiter IPC und Fenster, ein blockierender Systemaufruf
+      // wuerde die ganze Oberflaeche einfrieren.
+      await new Promise((resolve) => { setTimeout(resolve, 300); });
       const jetzt = namen();
       if (ziel && jetzt.includes(ziel)) { da = true; break; }
       if (jetzt.some((n) => n.startsWith('wb-') && n !== helfer && !vorher.has(n))) { da = true; break; }
-      if (!jetzt.includes(helfer)) { da = true; break; }   // Befehl ist durch
+      // DER BEFEHL IST DURCH -- ABER NICHT UNBEDINGT GUT AUSGEGANGEN (21.08.).
+      // Hier stand `da = true`, und das war der Grund, warum dieser Weg "ok"
+      // meldete, ohne dass eine Sitzung entstand: `wb-code` bricht ab, tmux
+      // raeumt die Hilfssession ab, und ihr Verschwinden galt als Erfolg. Ein
+      // Weg, der "ok" sagt und nichts tut, ist schlimmer als einer, der
+      // scheitert. Jetzt entscheidet, ob die Zielsitzung wirklich da ist.
+      //
+      // DIESER ZWEIG STELLT DIESELBE FRAGE WIE DIE ZWEI ZEILEN DARUEBER, und
+      // zwar beide Teile davon. Am VERHALTEN aendert das nichts, und das sei
+      // ausdruecklich gesagt, damit es niemand fuer eine Reparatur haelt: wenn
+      // eine neue `wb-`Sitzung da ist, hat die Schleife eine Zeile vorher
+      // laengst abgebrochen. Der Zweig hier wird nur erreicht, wenn beide
+      // Fragen gerade mit Nein beantwortet wurden. Er fragt sie trotzdem noch
+      // einmal vollstaendig, weil er sonst fuer sich gelesen enger aussieht,
+      // als er ist -- wer ihn spaeter aus der Schleife loest, uebernaehme
+      // sonst eine Verengung, die hier keine ist.
+      if (!jetzt.includes(helfer)) {
+        durch = true;
+        da = (!!ziel && jetzt.includes(ziel))
+          || jetzt.some((n) => n.startsWith('wb-') && n !== helfer && !vorher.has(n));
+        break;
+      }
+      // FUENF MINUTEN OHNE EIN WORT SIND KEIN GUTER ZUSTAND. Ab der Sekunde, in
+      // der ein Start laenger dauert als die schnelle Spur, sagt das Programm
+      // regelmaessig, dass es noch laeuft und woran es vermutlich liegt.
+      const her = Math.round((Date.now() - begonnen) / 1000);
+      if (her >= HELFER_MELDUNG_AB_S && her - gemeldet >= HELFER_MELDUNG_TAKT_S) {
+        gemeldet = her;
+        u.fortschritt?.(`Die Sitzung startet noch (${her} s). Bei einem lokalen Modell wird `
+          + 'jetzt der Modellkoerper geladen; das dauert Minuten, nicht Sekunden.');
+      }
     }
-    // Die Hilfssession geht in jedem Fall wieder weg: sie hat ihren Zweck
-    // erfuellt oder ist gescheitert, und stehen bleiben darf sie nie.
-    tmux(u.tmuxSocket, ['kill-session', '-t', `=${helfer}`]);
-    return da
-      ? { ok: true, ausgabe: `Session steht${ziel ? `: ${ziel}` : ''}.` }
-      : { ok: false, ausgabe: 'Die Session ist innerhalb von 20 Sekunden nicht erschienen.' };
+    if (!da && durch) {
+      // Der Grund steht im Protokoll, in denselben Zeilen, die auch das
+      // Plus-Menue auswertet -- und ausgewertet wird er mit derselben Funktion,
+      // damit nicht zwei Vorstellungen davon entstehen, was ein gescheiterter
+      // Start ist.
+      let inhalt = '';
+      try {
+        inhalt = protokoll ? readFileSync(protokoll, 'utf8') : '';
+      } catch { inhalt = ''; }
+      const befund = startBefund(inhalt);
+      const kurz = kurzfassung(befund.grund);
+      u.startVerlauf?.('gescheitert', { ...zielInfo, kurz, grund: befund.grund, protokoll });
+      tmux(u.tmuxSocket, ['kill-session', '-t', `=${helfer}`]);
+      return {
+        ok: false,
+        ausgabe: befund.grund
+          ? `Die Sitzung ist NICHT gestartet:\n${befund.grund}`
+            + (protokoll ? `\n\nVollstaendig: ${protokoll}` : '')
+          : 'Die Sitzung ist NICHT gestartet, und wb-code hat keinen Grund hinterlassen.'
+            + (protokoll ? ` Protokoll: ${protokoll}` : ''),
+      };
+    }
+    if (da) {
+      u.startVerlauf?.('steht', zielInfo);
+      // Der Befehl ist durch: die Hilfssession ist entweder schon von selbst weg
+      // (tmux raeumt eine Session ab, sobald ihr Befehl endet) oder gleich. Der
+      // kill-session hier trifft nur den Fall, dass die Zielsession steht,
+      // waehrend die Hilfssession ihre letzten Zeilen schreibt.
+      tmux(u.tmuxSocket, ['kill-session', '-t', `=${helfer}`]);
+      return { ok: true, ausgabe: `Session steht${ziel ? `: ${ziel}` : ''}.` };
+    }
+    // KEIN kill-session BEI FRISTABLAUF (korrigiert 2026-08-21). Die alte
+    // Fassung beendete die Hilfssession in JEDEM Fall -- auch dann, wenn ihre
+    // Arbeit noch lief. Bei einem lokalen Modell laeuft sie nach der Frist
+    // fast immer noch: `wb-code` legt seine tmux-Session erst NACH
+    // `wb-mlx-server ensure` und `wb-kontext ensure` an, und der Serverstart
+    // laedt vorher einen Modellkoerper von rund 20 GiB. Der kill riss also
+    // genau das ab, worauf gewartet wurde. Was blieb, war die Zustandsdatei,
+    // die `wb-state touch` laengst geschrieben hatte -- ein Eintrag ohne
+    // Sitzung, und genau so sieht "Stopped" aus.
+    //
+    // Stehen bleiben darf sie trotzdem nicht. Sie muss auch nicht: tmux raeumt
+    // eine Session ab, sobald ihr Befehl endet, und der Befehl endet auch dann,
+    // wenn er scheitert. Eine Hilfssession, die spaeter noch lebt, ist deshalb
+    // eine, deren Befehl WIRKLICH haengt -- und die sammelt der naechste Aufruf
+    // ein (helfer_aufraeumen weiter oben), nach derselben Obergrenze. Kein
+    // Waechter im Hintergrund: es laeuft kein Prozess auf Vorrat.
+    // Die Obergrenze ist erreicht: der Start gilt als gescheitert, auch wenn die
+    // Hilfssession weiterlaeuft. Sonst stuende die Zeile fuer immer auf
+    // "startet" -- und niemand koennte es zurueckstellen.
+    u.startVerlauf?.('gescheitert', {
+      ...zielInfo,
+      kurz: 'die Sitzung ist in der Obergrenze nicht erschienen',
+      grund: '', protokoll,
+    });
+    return {
+      ok: false,
+      ausgabe: `Die Session ist in ${Math.round(HELFER_OBERGRENZE_MS / 1000)} Sekunden nicht `
+        + `erschienen. Die Hilfssession '${helfer}' laeuft WEITER und wird nicht abgebrochen -- `
+        + 'sie raeumt sich selbst ab, sobald ihr Befehl durch ist. Was sie gerade tut, steht im '
+        + 'Protokoll von wb-code.',
+    };
   }
 
   // DER MENSCHEN-NACHWEIS, und warum er hier steht und nicht im Fenster.

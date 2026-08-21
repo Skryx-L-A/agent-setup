@@ -1,5 +1,5 @@
 {
-  "_comment": "NICHT INSTALLIERT: gehoert nicht nach ~/.local/bin, sondern nach ~/.config/wb-modell-proxy/backends.json (gelesen von wb-modell-proxy, gestartet ueber agent-workbench.modell-proxy.plist). Auslieferungsstand fuer die Bedarfsschaltung lokaler Modellserver, 2026-08-13. Schluessel unter 'backends' ist der LAUSCHPORT; 'socketName' ist der passende Schluessel im Sockets-Dict der plist. Ein weiteres Backend (llama.cpp, vllm) braucht hier einen weiteren Eintrag und in der plist einen weiteren Socket — sonst nichts.",
+  "_comment": "NICHT INSTALLIERT: gehoert nicht nach ~/.local/bin, sondern nach ~/.config/wb-modell-proxy/backends.json (gelesen von wb-modell-proxy, gestartet ueber agent-workbench.modell-proxy.plist). Auslieferungsstand fuer die Bedarfsschaltung lokaler Modellserver, 2026-08-13. Schluessel unter 'backends' ist der LAUSCHPORT; 'socketName' ist der passende Schluessel im Sockets-Dict der plist. Ein weiteres Backend (llama.cpp, vllm) braucht hier einen weiteren Eintrag und in der plist einen weiteren Socket — sonst nichts. SEIT 2026-08-19: ensureCmd/stopCmd zeigen auf wb-mlx-server (nicht mehr grug-server direkt) -- der haelt jetzt mehrere MLX-Modelle (grug, qwen3.8) hinter demselben Port 8081 und beendet das jeweils falsche selbst, bevor er das gewuenschte startet. ensureCmd bekommt bewusst KEIN Modell mit (kein Shell-Aufruf moeglich, siehe wb-mlx-server-Kopfkommentar 'OHNE ANGABE') -- wb-mlx-server ensure OHNE Argument nimmt das zuletzt gewaehlte Modell aus ~/.local/state/wb-mlx-server/aktuell.json, ersatzweise die Werkbank-Vorgabe. 'socketName' bleibt 'grug', weil das der Schluessel im Sockets-Dict der PLIST ist (eine Aenderung dort braucht einen manuellen launchd-Reload) -- 'name' ist nur die Log-Anzeige und heisst deshalb jetzt 'mlx'.",
   "_felder": {
     "launchdLabel": "Das eigene launchd-Label. Der Proxy reicht es als WB_EIGENTUEMER_LAUNCHD an ensureCmd/stopCmd weiter, damit wb-nohup einen nachpruefbaren Eigentuemer eintragen kann — unter launchd gibt es keinen tmux-Pane. Leer lassen, wer den Proxy von Hand mit --selbst-binden faehrt.",
     "tickSeconds": "Takt der Leerlaufwache in Sekunden.",
@@ -25,15 +25,51 @@
   "exitIdleSeconds": 30,
   "backends": {
     "8080": {
-      "name": "grug",
+      "name": "mlx",
       "socketName": "grug",
       "backendHost": "127.0.0.1",
       "backendPort": 8081,
-      "ensureCmd": "grug-server ensure",
-      "stopCmd": "grug-server stop",
+      "ensureCmd": "wb-mlx-server ensure",
+      "stopCmd": "wb-mlx-server stop",
       "idleMinutes": 20,
       "ensureTimeoutSeconds": 300,
       "stopTimeoutSeconds": 120
+    },
+    "8767": {
+      "name": "mcp-playwright",
+      "socketName": "8767",
+      "backendHost": "127.0.0.1",
+      "backendPort": 8777,
+      "ensureCmd": "mcp-shared ensure playwright",
+      "stopCmd": "mcp-shared halt playwright",
+      "idleMinutes": 15,
+      "healthPath": "/mcp",
+      "ensureTimeoutSeconds": 90,
+      "stopTimeoutSeconds": 30
+    },
+    "8766": {
+      "name": "mcp-basic-memory",
+      "socketName": "8766",
+      "backendHost": "127.0.0.1",
+      "backendPort": 8776,
+      "ensureCmd": "mcp-shared ensure basic-memory",
+      "stopCmd": "mcp-shared halt basic-memory",
+      "idleMinutes": 15,
+      "healthPath": "/mcp",
+      "ensureTimeoutSeconds": 90,
+      "stopTimeoutSeconds": 30
+    },
+    "11434": {
+      "name": "ollama",
+      "socketName": "11434",
+      "backendHost": "127.0.0.1",
+      "backendPort": 11444,
+      "ensureCmd": "wb-dienst ensure agent-workbench.ollama 11444 /api/tags",
+      "stopCmd": "wb-dienst halt agent-workbench.ollama 11444",
+      "idleMinutes": 20,
+      "healthPath": "/api/tags",
+      "ensureTimeoutSeconds": 90,
+      "stopTimeoutSeconds": 30
     }
   }
 }

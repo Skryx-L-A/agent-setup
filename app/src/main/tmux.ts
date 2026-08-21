@@ -320,8 +320,11 @@ export class TmuxControl extends EventEmitter {
    */
   private query(args: string[]): string {
     if (this.maschine) throw new Error(`query() ist der oertliche Weg -- fuer ${this.maschine} gilt der Steuerkanal`);
-    const r = spawnSync('tmux', [...this.baseArgs(), ...args], { encoding: 'utf8', env: mitMaschinenLocale() });
-    if (r.status !== 0) throw new Error(`tmux ${args.join(' ')}: ${(r.stderr || '').trim()}`);
+    // FRIST (2026-08-20, dieselbe Fehlerklasse wie zustandZurueckSync() unten):
+    // laeuft VOR dem Anhaengen, blockiert also den Fensteraufbau selbst, wenn
+    // sie haengt. 2s wie jeder andere oertliche bare-tmux-Aufruf dieses Hauses.
+    const r = spawnSync('tmux', [...this.baseArgs(), ...args], { encoding: 'utf8', env: mitMaschinenLocale(), timeout: 2000 });
+    if (r.status !== 0) throw new Error(`tmux ${args.join(' ')}: ${r.signal ? 'nach 2000ms abgebrochen' : (r.stderr || '').trim()}`);
     return (r.stdout || '').replace(/\n$/, '');
   }
 
@@ -353,7 +356,9 @@ export class TmuxControl extends EventEmitter {
   }
 
   isOwned(): boolean {
-    const r = spawnSync('tmux', [...this.baseArgs(), 'show-options', '-t', this.target(), '-qv', OWNER_OPTION], { encoding: 'utf8', env: mitMaschinenLocale() });
+    // FRIST wie bei query() direkt darueber -- derselbe Grund, derselbe Weg.
+    const r = spawnSync('tmux', [...this.baseArgs(), 'show-options', '-t', this.target(), '-qv', OWNER_OPTION], { encoding: 'utf8', env: mitMaschinenLocale(), timeout: 2000 });
+    if (r.signal) process.stderr.write('isOwned: tmux nach 2000ms abgebrochen -- gilt als nicht eigen.\n');
     return (r.stdout || '').trim().length > 0;
   }
 
@@ -446,6 +451,7 @@ export class TmuxControl extends EventEmitter {
     // Orchestrator. Gemessen ging so bei jedem Anhaengen das Worker-Fenster auf
     // 120x34 und blieb dort, ohne je gezeichnet worden zu sein.
     const { cols, rows, policy } = await this.applySizePolicy(owned, active?.windowId ?? '', desired);
+    await this.andereFensterFesthalten(active?.windowId ?? '');
     const initialContent: Record<string, string> = {};
     if (active) initialContent[active.paneId] = await this.capturePane(active.paneId);
 
@@ -815,14 +821,34 @@ export class TmuxControl extends EventEmitter {
    * nicht mehr durch -- gemessen blieb die Session dann auf der Fuellgroesse
    * stehen, mit `window-size manual`. Ein synchroner Aufruf blockiert den
    * Faden, bis tmux geantwortet hat, und laeuft deshalb auch dann noch zu Ende.
+   *
+   * MIT FRIST (Betriebsbefund 2026-08-20): "bis tmux geantwortet hat" nahm
+   * bis heute an, tmux antworte IMMER -- `spawnSync` hier hatte keine
+   * `timeout`-Angabe. Antwortet das echte tmux-Binary nicht (Systemlast, ein
+   * haengender Server, irgendein anderer Grund), blockiert `spawnSync` den
+   * GESAMTEN Hauptprozess ohne Ende: kein Ereignisloop, keine Ausgabe, 0%
+   * CPU -- gemessen genau dieses Bild beim Beenden ueber `before-quit`/
+   * `will-quit` (`zurueckstellen()` unten), waehrend Electrons eigene,
+   * native Fenster-Aufraeumung schon lief (die Fensterliste war laengst leer,
+   * der Prozess aber noch da). Dieselbe Sicherung wie beim asynchronen
+   * Gegenstueck `detach()` weiter unten ("2 Sekunden reichen einem lebenden
+   * tmux um Groessenordnungen; einem toten reichen auch zwei Stunden nicht"),
+   * hier nur synchron: `timeout` laesst `spawnSync` nach Ablauf zurueckkehren
+   * (mit `r.signal` gesetzt) statt zu haengen, und ein Fehlschlag wird
+   * geloggt statt schweigend verworfen -- "der Schritt wird uebersprungen,
+   * der Grund protokolliert", nicht nur uebersprungen.
    */
   zustandZurueckSync(): void {
+    const frist = this.maschine ? 4000 : 2000;
     const ruf = (args: string[]): void => {
       try {
         const argv = this.argv(args);
-        spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', env: mitMaschinenLocale() });
-      } catch {
-        // Beim Beenden ist ein fehlgeschlagener Aufruf kein Grund anzuhalten.
+        const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', env: mitMaschinenLocale(), timeout: frist });
+        if (r.error || r.signal) {
+          process.stderr.write(`zustandZurueckSync: '${argv.join(' ')}' ${r.signal ? `nach ${frist}ms abgebrochen (${r.signal})` : `fehlgeschlagen (${r.error?.message})`} -- Schritt uebersprungen.\n`);
+        }
+      } catch (e) {
+        process.stderr.write(`zustandZurueckSync: '${args.join(' ')}' fehlgeschlagen (${(e as Error).message}) -- Schritt uebersprungen.\n`);
       }
     };
     // Auch der Zoom muss weg, wenn das Programm haesslich endet.
@@ -924,6 +950,66 @@ export class TmuxControl extends EventEmitter {
     return parseLayout(layout ?? '');
   }
 
+  /**
+   * DIE FENSTER, DIE WIR NICHT ZEICHNEN, BLEIBEN STEHEN (20.08.).
+   *
+   * Unser Steuerclient hat eine Groesse, und `refresh-client -C` gibt ihm die
+   * des GEZEICHNETEN Fensters. Fuer sein eigenes Fenster ist das richtig -- fuer
+   * jedes andere Fenster derselben Sitzung ist es ein Umbruch ohne Zweck: unter
+   * `window-size latest` folgt es dem zuletzt angehaengten Client, und das sind
+   * wir. Der Client haengt zwar mit `ignore-size` an, doch tmux laesst ihn nur
+   * aus der Rechnung, solange noch ein Client OHNE dieses Merkmal an derselben
+   * Sitzungsgruppe haengt; ist er der einzige, zaehlt er doch.
+   *
+   * GEMESSEN am 20.08. mit test-app-fenster-umbruch-naht.sh: Sitzung 188x58,
+   * das Worker-Fenster wird nicht gezeichnet -- beim zweiten Anhaengen stand
+   * `refresh-client -C` auf den inzwischen 143x42 des Orchestrator-Fensters,
+   * und das Worker-Fenster ging auf 143x42 mit. Sein Inhalt bricht dabei neu um,
+   * ohne dass irgendjemand es ansieht.
+   *
+   * Bis heute fiel das nicht auf, weil `merkeFenster` seinen Riegel versehentlich
+   * am AKTUELLEN Fenster der Sitzung setzte statt am gezeichneten -- und das
+   * aktuelle war in dieser Bauart gerade das Worker-Fenster. Der Schutz war also
+   * da, nur an einer Stelle, die ihn nicht meinte und ihn in einer FREMDEN
+   * Sitzung auch nie wieder zurueckstellte.
+   *
+   * Deshalb hier ausdruecklich: jedes andere Fenster der Sitzung wird auf der
+   * Groesse festgehalten, die es JETZT hat. Ein Fenster, das schon `manual`
+   * traegt, bleibt unberuehrt.
+   *
+   * MIT `resize-window`, NICHT MIT `set-option` (gemessen 20.08.). Ein blosses
+   * `set-option -w window-size manual` HAELT die Groesse nicht -- es bringt das
+   * Fenster auf die `default-size` der Sitzung: ein Fenster, das unter einem
+   * kleinen Client bei 80x23 stand, sprang damit auf 200x50. `resize-window`
+   * dagegen setzt Groesse und Option in EINEM Befehl, und die Groesse ist die,
+   * die schon dastand -- ein Umbruch weniger, und der Wortlaut der Zusage
+   * stimmt wieder mit dem ueberein, was passiert.
+   *
+   * Zurueckgestellt wird beim Abloesen nur die OPTION (`windowSizeVorher`);
+   * eine Groesse steht nicht in `vorZustand`, weil wir keine geaendert haben.
+   */
+  private async andereFensterFesthalten(gezeichnet: string): Promise<void> {
+    let fenster: WindowInfo[] = [];
+    try {
+      fenster = await this.listWindows();
+    } catch {
+      return; // ohne Fensterliste gibt es nichts festzuhalten
+    }
+    for (const w of fenster) {
+      if (!w.windowId || w.windowId === gezeichnet) continue;
+      if (this.windowSizeVorher.has(w.windowId)) continue;
+      if (!(w.width > 0) || !(w.height > 0)) continue;
+      try {
+        const [wert] = await this.command(`show-options -w -t ${w.windowId} -qv window-size`);
+        if ((wert ?? '') === 'manual') continue;
+        this.windowSizeVorher.set(w.windowId, wert ?? '');
+        await this.command(`resize-window -t ${w.windowId} -x ${w.width} -y ${w.height}`);
+      } catch {
+        // Ein Fenster kann inzwischen weg sein -- die uebrigen bleiben trotzdem dran.
+      }
+    }
+  }
+
   /** Merkt sich Groesse und Aufteilung eines Fensters, einmal je Fenster. */
   private async merkeFenster(windowId: string): Promise<void> {
     if (!this.vorZustand.some((v) => v.windowId === windowId)) {
@@ -947,9 +1033,21 @@ export class TmuxControl extends EventEmitter {
     // Clients. Die Buehne verliert ihre Flaeche dann an das schmalste Terminal
     // und bekommt sie NIE zurueck -- gemessen am 06.08.: 208 Spalten gestellt,
     // 144 vom angehaengten Terminal durchgesetzt, 515 Bildpunkte dauerhaft leer.
-    const [jetzt] = await this.command(`show-options -t ${this.target()} -qv window-size`).catch(() => ['']);
+    //
+    // AM FENSTER, NICHT AN DER SESSION (20.08.). Die beiden Zeilen darueber
+    // sind am 17.08. auf das Fenster umgestellt worden, diese beiden nicht --
+    // sie fragten und setzten weiter ueber `target()`, und ein Session-Ziel
+    // meint bei tmux das gerade AKTUELLE Fenster. Gemessen mit einer Sitzung,
+    // deren aktuelles Fenster 'workers' ist (so laesst `wb-worker-tab` sie
+    // stehen), waehrend %0 im Orchestrator-Fenster gezeichnet wird: 'manual'
+    // landete auf 'workers'. Zweimal falsch auf einmal -- das gezeichnete
+    // Fenster blieb ungeschuetzt, und 'workers' behielt den Riegel auch nach
+    // dem Abloesen, weil `windowSizeVorher` nur Fenster zuruecksetzt, die
+    // dieser Weg auch angefasst hat (gemessen: @0 zurueck auf 'latest',
+    // @1 dauerhaft 'manual' in einer fremden Sitzung).
+    const [jetzt] = await this.command(`show-options -w -t ${windowId} -qv window-size`).catch(() => ['']);
     if ((jetzt ?? '') !== 'manual') {
-      await this.command(`set-option -t ${this.target()} window-size manual`);
+      await this.command(`set-option -w -t ${windowId} window-size manual`);
     }
   }
 

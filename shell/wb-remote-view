@@ -58,6 +58,28 @@ done
 [ -n "$MACHINE" ] || MACHINE="$OTHER"
 case "$MACHINE" in mac|peer) ;; *) echo "wb-remote-view: unbekannte Maschine '$MACHINE' (mac|peer)" >&2; exit 1 ;; esac
 
+# ------------------------------------------------- Riegel DIESER Maschine (2026-08-20)
+# `guardRemoteView` schaltet nur den Kontext-Guard DIESER Maschine ab. Es hindert
+# niemanden sonst: `--announce` von drueben laesst per ssh genau dieses Werkzeug hier
+# laufen, und `wb-ssh-worker` ruft es ebenfalls direkt. der Nutzer sah deshalb am
+# 2026-08-20 zweimal hintereinander einen fremden Spiegel-Pane in seinem Worker-Fenster,
+# obwohl der lokale Guard-Schalter bereits aus stand -- der zweite kam 12 Minuten nach
+# dem Schliessen des ersten.
+#
+# `spiegelPanes` ist deshalb der Riegel, der fuer JEDEN Aufrufer gilt: steht er auf
+# `false`, legt diese Maschine keinen Spiegel-Pane an, egal wer fragt. Was schon steht,
+# wird weiterhin abgeraeumt (der Abbau-Weg bleibt offen -- ein Riegel, der einen
+# vorhandenen Spiegel einfriert, waere schlimmer als keiner). `--check` bleibt ebenfalls
+# erlaubt, es ist reines Nachsehen.
+if [ "$ANNOUNCE" = 1 ] || [ "$CHECK" = 0 ]; then
+  if [ "$("$HOME/.local/bin/wb-state" settings get spiegelPanes 2>/dev/null)" = "false" ]; then
+    # Kein `say` — das ist erst weiter unten definiert, und dieser Riegel muss VOR
+    # dem `--announce`-Block greifen.
+    [ "$QUIET" = 1 ] || printf '%s\n' "wb-remote-view: 'spiegelPanes' steht auf false — diese Maschine legt keine Spiegel-Panes an (Aufruf fuer '$MACHINE' beendet)."
+    exit 0
+  fi
+fi
+
 say() { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
@@ -162,6 +184,101 @@ ALL=$(tmux list-panes -a -F '#{session_name}|#{pane_id}|#{@wb_role}|#{pane_dead}
 [ -n "$WANT" ] && ALL=$(printf '%s\n' "$ALL" | awk -F'|' -v s="$WANT" '$1==s')
 
 SESSIONS=$(printf '%s\n' "$ALL" | awk -F'|' 'NF>1{print $1}' | sort -u)
+
+# ------------------------------------------------------------- Groessen-Riegel
+# EIN SPIEGEL DARF DIE FENSTERGROESSE SEINER BASIS NICHT BESTIMMEN (20.08.).
+#
+# `attach -f ignore-size` reicht dafuer NICHT, und zwar aus einem Grund, der in
+# der Handbuchseite nicht steht: tmux laesst einen so angehaengten Client nur
+# dann aus der Rechnung, solange in derselben Sitzungsgruppe noch ein Client
+# OHNE dieses Merkmal haengt. Ist der Spiegel der einzige, zaehlt er doch.
+# Gemessen auf einem eigenen Testsocket, tmux 3.7b, Basis 200x50:
+#
+#   nur der Spiegel (80x24, ignore-size, an der Sicht)   -> Fenster 80x23
+#   dazu ein gewoehnlicher Client 200x50                 -> Fenster 200x49
+#   dieser Client wieder weg                             -> Fenster 80x23
+#   window-size manual, dann resize-window 188x57        -> bleibt 188x57,
+#                                                           auch wenn der
+#                                                           Spiegel sich ab-
+#                                                           und wieder anhaengt
+#
+# Genau der erste Fall stand am 20.08. in Sitzung des Nutzers: `wb-AI:@0` auf
+# 80x22, einziger Client der Spiegel von peer mit 80x23. Der Steuerclient der
+# Werkbank haengt selbst mit `ignore-size` an (er ueberlaesst die Groesse
+# absichtlich dem Menschen davor) und rettet deshalb nichts.
+#
+# Der einzige Riegel, der haelt, ist also `window-size manual`. Gesetzt wird er
+# VOR dem Anlegen der Sicht, solange die Groesse noch die des Eigentuemers ist,
+# und nur auf Fenster, die ihn nicht schon tragen -- wo die Werkbank oder
+# `wb-workers-window` bereits `manual` gesetzt hat, bestimmt die, und zwei
+# Riegel auf derselben Option waeren zwei Wahrheiten.
+#
+# NIE KLEINER, HOECHSTENS GROESSER. Laeuft dieser Lauf erst, wenn ein Spiegel
+# die Fenster schon zusammengedrueckt hat (der Riegel geht verloren, sobald die
+# Werkbank die Sitzung abloest und ihren Vorzustand wiederherstellt), wuerde ein
+# blosses `manual` die gedrueckte Zahl festschreiben. Deshalb waechst ein
+# verriegeltes Fenster auf die groesste Groesse, die in seiner Sitzung ueberhaupt
+# steht -- in Fall des Nutzers traegt das Worker-Fenster die 188x58 der Buehne,
+# waehrend @0 auf 80x22 lag.
+#
+# WAS DAS KOSTET: an einer verriegelten Sitzung folgt das Fenster einem
+# angehaengten Terminal nicht mehr, wenn ein Mensch es groesser zieht. Deshalb
+# traegt jedes von UNS verriegelte Fenster `@wb_view_pin`, und der Riegel faellt
+# wieder, sobald in der Sitzung kein Worker mehr lebt (Freigabe unten).
+#
+# GESETZT WIRD MIT `resize-window`, NICHT MIT `set-option` (gemessen 20.08.).
+# `set-option -w window-size manual` HAELT die Groesse nicht -- es bringt das
+# Fenster auf die `default-size` der Sitzung: ein Fenster, das unter dem Spiegel
+# bei 80x23 stand, sprang damit auf 200x50, und ein grosses koennte ebenso
+# herunterspringen. `resize-window` setzt Groesse UND Option in einem Befehl.
+riegel() {
+  s="$1"; n=0; gc=0; gr=0; zc=0; zr=0; ic=0; ir=0
+  read gc gr <<EOF
+$(tmux list-windows -t "=$s" -F '#{window_width} #{window_height}' 2>/dev/null \
+  | awk '{if($1+0>c)c=$1+0; if($2+0>r)r=$2+0} END{print c+0, r+0}')
+EOF
+  for w in $(tmux list-windows -t "=$s" -F '#{window_id}' 2>/dev/null); do
+    [ "$(tmux show-options -w -t "$w" -qv window-size 2>/dev/null)" = manual ] && continue
+    read ic ir <<EOF
+$(tmux display -p -t "$w" '#{window_width} #{window_height}' 2>/dev/null)
+EOF
+    zc="${ic:-0}"; zr="${ir:-0}"
+    [ "${gc:-0}" -gt "$zc" ] && zc="$gc"
+    [ "${gr:-0}" -gt "$zr" ] && zr="$gr"
+    [ "$zc" -gt 0 ] && [ "$zr" -gt 0 ] || continue
+    tmux resize-window -t "$w" -x "$zc" -y "$zr" 2>/dev/null || continue
+    tmux set-option -w -t "$w" @wb_view_pin 1 2>/dev/null
+    n=$(( n + 1 ))
+  done
+  [ "$n" -gt 0 ] && echo "RIEGEL=$s|$n|${zc}x${zr}"
+  return 0
+}
+
+# Freigabe: wo kein Worker mehr lebt, wird auch kein Spiegel mehr gesetzt (der
+# Abbau-Weg auf der anderen Seite raeumt seinen Pane weg), also darf der Riegel
+# fallen. Angefasst wird nur, was `@wb_view_pin` traegt -- ein `manual`, das die
+# Werkbank oder ein Mensch gesetzt hat, bleibt stehen. Bei einer ausdruecklich
+# genannten Sitzung (`--remote-session`) unterbleibt die Freigabe: dieser Lauf
+# kennt dann nur EINE Sitzung und duerfte aus dem Schweigen ueber alle anderen
+# nicht schliessen, dass dort niemand mehr arbeitet.
+if [ -z "$WANT" ]; then
+  for v in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -- '-view$'); do
+    b="${v%-view}"
+    tmux has-session -t "=$b" 2>/dev/null || continue
+    case "
+$SESSIONS
+" in *"
+$b
+"*) continue ;; esac
+    for w in $(tmux list-windows -t "=$b" -F '#{window_id}' 2>/dev/null); do
+      [ "$(tmux show-options -w -t "$w" -qv @wb_view_pin 2>/dev/null)" = 1 ] || continue
+      tmux set-option -w -t "$w" -u window-size 2>/dev/null
+      tmux set-option -w -t "$w" -u @wb_view_pin 2>/dev/null
+      echo "FREI=$b|$w"
+    done
+  done
+fi
+
 if [ -z "$SESSIONS" ]; then
   echo "GRUND=kein lebender Worker-Pane auf dieser Maschine"
   exit 0
@@ -172,6 +289,10 @@ for s in $SESSIONS; do
   N=$(printf '%s\n' "$ALL" | awk -F'|' -v s="$s" 'NF>1 && $1==s' | grep -c .)
   [ "$N" -gt 0 ] || continue
   VIEW="$s-view"
+  # ERST DER RIEGEL, DANN DIE SICHT: solange die Sicht nicht steht, kann sich
+  # auch kein Spiegel an sie haengen, und die Groesse, die wir festhalten, ist
+  # noch die des Eigentuemers.
+  riegel "$s"
   if ! tmux has-session -t "=$VIEW" 2>/dev/null; then
     # `new-session -t <fehlende Basis>` scheitert NICHT, es legt eine Streu-Session an,
     # deren Gruppe die Zeichenkette '=<name>' ist. Deshalb erst pruefen, danach nachsehen.
@@ -213,6 +334,21 @@ RAW=$("$SSHBIN" "${SSHOPT[@]}" "$MACHINE" "bash -s -- $(q "$RSESS_IN")" < "$PREP
 }
 GRUND=$(printf '%s\n' "$RAW" | sed -n 's/^GRUND=//p' | tail -1)
 SESSIONS=$(printf '%s\n' "$RAW" | sed -n 's/^SESSION=//p')
+
+# Was der Riegel drueben getan hat, wird GESAGT und nicht verschwiegen: er
+# aendert eine Option an einer fremden Sitzung, und wer sich spaeter wundert,
+# warum sein Fenster einem groesser gezogenen Terminal nicht mehr folgt, soll
+# es hier nachlesen koennen.
+while IFS='|' read -r rs n groesse; do
+  [ -n "$rs" ] && say "wb-remote-view: $n Fenster in $MACHINE:$rs auf 'window-size manual' verriegelt (${groesse}) — ein Spiegel bestimmt die Groesse der Basis nicht."
+done <<EOF
+$(printf '%s\n' "$RAW" | sed -n 's/^RIEGEL=//p')
+EOF
+while IFS='|' read -r rs w; do
+  [ -n "$rs" ] && say "wb-remote-view: Riegel an $MACHINE:$rs ($w) wieder gelöst — dort lebt kein Worker mehr."
+done <<EOF
+$(printf '%s\n' "$RAW" | sed -n 's/^FREI=//p')
+EOF
 
 # --------------------------------------------------------------- lokale Seite
 PREFIX="REMOTE-$MACHINE-"

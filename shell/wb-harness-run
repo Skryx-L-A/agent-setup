@@ -639,6 +639,37 @@ PY
   fi
 fi
 
+# KNAPPE MCP-AUSSTATTUNG FUER CLAUDE-WORKER (2026-08-20).
+#
+# `pi-worker` setzt `--strict-mcp-config --mcp-config <datei>` fuer Claude-Worker, weil
+# eine frische Sitzung sonst 516 MiB kostet statt 252 — der Unterschied ist fast
+# vollstaendig der Playwright-MCP, den kaum ein Worker benutzt (gemessen vom Worker
+# "speicher"). Das griff aber NUR auf dem Alias-Pfad von pi-worker; ein Modell, das
+# ueber die Registry aufgeloest wird, laeuft hier durch und bekam die Flags nicht.
+#
+# GEMESSEN 2026-08-20 an drei gleichzeitig gestarteten Workern: `claude-opus5:xhigh`
+# (Alias-Pfad) hatte die Flags, `claude-sonnet-5:high` (Registry-Pfad, zweimal) nicht
+# — und startete je einen Playwright-Helfer mit rund 200 MB. Genau die Verzweigung,
+# vor der die Ergebnisnotiz von "stress" gewarnt hatte.
+#
+# WARUM HIER UND NICHT IN DER REGISTRY: `autonomy.args` gilt fuer JEDE Rolle, auch
+# fuer den Orchestrator — und der behaelt die volle Ausstattung, weil Web-Design-
+# Arbeit den Browser-MCP wirklich benutzt. Diese Stelle kennt die Rolle.
+# `WB_MCP_VOLL=1` gibt die volle Ausstattung zurueck, gleiche Stellschraube wie dort.
+if [ "$ROLE" = worker ] && [ "$HARNESS" = claude ] && [ -z "${WB_MCP_VOLL:-}" ]; then
+  MCP_WORKER="$HOME/.claude/workbench/mcp-worker.json"
+  if [ ! -s "$MCP_WORKER" ]; then
+    mkdir -p "$(dirname "$MCP_WORKER")" 2>/dev/null
+    printf '%s\n' '{"mcpServers":{"basic-memory":{"type":"http","url":"http://127.0.0.1:8766/mcp"}}}' \
+      > "$MCP_WORKER" 2>/dev/null || true
+  fi
+  if [ -s "$MCP_WORKER" ] && [ "${CMD#*--strict-mcp-config}" = "$CMD" ]; then
+    # Hinter den Programmnamen, vor alles andere: die Flags muessen VOR dem
+    # --append-system-prompt stehen, dessen Wert eine Kommandosubstitution ist.
+    CMD="${CMD/ --model / --strict-mcp-config --mcp-config $(printf %q "$MCP_WORKER") --model }"
+  fi
+fi
+
 # Every workbench pane needs the workbench tools on PATH, otherwise the agent in it
 # cannot call wb-*/claude-worker/pi-worker — same reason wb-code does it for pi.
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"

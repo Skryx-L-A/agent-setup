@@ -74,6 +74,10 @@ interface SitzungsZeile {
   fortsetzbar: boolean;
   grund: string;
   unterhaltung: string;
+  /** Fuer diesen Ordner laeuft gerade ein Start (21.08.). */
+  startet?: boolean;
+  /** Der letzte Start fuer diesen Ordner ist gescheitert (21.08.). */
+  startFehler?: boolean;
 }
 
 interface Daten {
@@ -92,16 +96,56 @@ interface Antwort {
   command: string;
 }
 
+// --- Der dritte Weg (19.08.): eine Wahl nur fuer diese Sitzung -------------
+
+interface WahlHarness { id: string; label: string; binaer: boolean }
+interface WahlModell {
+  id: string;
+  label: string;
+  harness: string;
+  harnessLabel: string;
+  /** Laeuft hier auf der Maschine -- nur dann gibt es ein Kontextfenster zu waehlen. */
+  lokal: boolean;
+  startbar: boolean;
+}
+interface WahlDaten {
+  harnesses: WahlHarness[];
+  modelle: WahlModell[];
+  harnessStufen: Record<string, string[]>;
+  einstellung: { harness: string; model: string; effort: string; kontext: number };
+}
+
+/** Eine waehlbare Kontextstufe -- dieselbe Form wie in main/kontext.ts. */
+interface KontextStufe {
+  tokens: number;
+  label: string;
+  bedarfGib: number;
+  passt: boolean;
+  hinweis: string | null;
+}
+interface KontextSicht { vorgabe: number; empfehlung: number; stufen: KontextStufe[] }
+type KontextAntwort = { ok: true; sicht: KontextSicht } | { ok: false; fehler: string };
+
+/** Die Wahl, so wie sie an `wb-code` geht. Ein leeres Feld erzeugt keinen Schalter. */
+interface Wahl { harness: string; model: string; effort: string; kontext: number }
+
 declare global {
   interface Window {
     awbSitzung: {
       daten(): Promise<Daten>;
       neu(name: string, machine: string, fernPfad: string, echt: boolean): Promise<Antwort>;
       neuChat(name: string, echt: boolean): Promise<Antwort>;
+      /** Was zur Wahl steht -- auf Abruf, siehe main.ts bei 'awb:sitz-wahl-daten'. */
+      wahlDaten(): Promise<WahlDaten>;
+      /** Die waehlbaren Kontextfenster EINES lokalen Modells. Nur Lesen. */
+      kontextStufen(modellId: string): Promise<KontextAntwort>;
+      /** Wie `neu()`, nur mit der Wahl im Gepaeck. Schreibt keine Einstellung. */
+      neuMitWahl(name: string, machine: string, fernPfad: string, wahl: Wahl, echt: boolean): Promise<Antwort>;
       fernPruefen(machine: string, pfad: string): Promise<{ ok: boolean; meldung: string }>;
       fortsetzen(id: string): Promise<Antwort>;
       beenden(id: string, echt: boolean): Promise<Antwort>;
       onDaten(fn: (d: Daten) => void): void;
+      onStartfehler(fn: (p: { ort: string; kurz: string; grund: string; protokoll: string }) => void): void;
       bereit(): void;
     };
     /** Testhaken: was steht gerade da, und was ist gewaehlt. Nur Lesen und Klicken. */
@@ -174,6 +218,33 @@ let maschineFilter = 'alle';
 /** Gewaehlter Zustands-Chip ('alle' = kein Filter). */
 let zustandFilter = 'alle';
 
+// --- Zustand des dritten Weges (19.08.) ------------------------------------
+//
+// Er lebt neben dem uebrigen Zustand und nicht darin: die Wahl gilt einem
+// STARTVORGANG, nicht der Liste, und sie verschwindet mit dem Zuklappen.
+/** Steht die Wahl offen? Zu heisst: der schnelle Weg ist der einzige sichtbare. */
+let wahlOffen = false;
+/** Was zur Wahl steht -- null, solange es noch nicht geholt ist. */
+let wahlDaten: WahlDaten | null = null;
+/** Warum das Holen scheiterte -- leer, solange nichts scheiterte. */
+let wahlFehler = '';
+/** Laeuft das Holen gerade? Verhindert einen zweiten Aufruf beim Neuzeichnen. */
+let wahlLaedt = false;
+/**
+ * Wurde schon einmal geholt? Ein GESCHEITERTER Versuch wird genauso gemerkt wie
+ * ein gelungener -- sonst versuchte es jedes Neuzeichnen erneut, und ein
+ * dauerhaft scheiternder Aufruf haenge sich in eine Endlosschleife aus Holen
+ * und Zeichnen. Dieselbe Sicherung wie im Einstellungsfenster.
+ */
+let wahlVersucht = false;
+/** Die getroffene Wahl. Vorbelegt aus den Einstellungen, sobald `wahlDaten` da ist. */
+const wahl: Wahl = { harness: '', model: '', effort: '', kontext: 0 };
+/** Der Suchtext der Modellliste, aus demselben Grund gemerkt wie `nameWert`. */
+let wahlSuche = '';
+/** Die Kontextstufen je Modell-Kennung, geholt auf Abruf. */
+const kontextStand: Record<string, KontextAntwort> = {};
+const kontextLaeuft = new Set<string>();
+
 const gruppenEl = document.getElementById('gruppen') as HTMLElement;
 const statusEl = document.getElementById('statuszeile') as HTMLElement;
 const grundEl = document.getElementById('fort-grund') as HTMLElement;
@@ -181,6 +252,8 @@ const fortKnopf = document.getElementById('fort-start') as HTMLButtonElement;
 const beendenKnopf = document.getElementById('beenden-start') as HTMLButtonElement;
 const neuKnopf = document.getElementById('neu-start') as HTMLButtonElement;
 const neuChatKnopf = document.getElementById('neu-chat') as HTMLButtonElement;
+const neuWahlKnopf = document.getElementById('neu-wahl') as HTMLButtonElement;
+const wahlBlockEl = document.getElementById('neu-wahl-block') as HTMLElement;
 const nameFeld = document.getElementById('neu-name') as HTMLInputElement;
 const kopfStartEl = document.getElementById('kopf-start') as HTMLElement;
 const fernEl = document.getElementById('neu-fern') as HTMLElement;
@@ -244,8 +317,19 @@ function wann(iso: string): string {
   return `${p(d.getDate())}.${p(d.getMonth() + 1)}. ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** Der Zustand als kurzes Wort samt Farbe -- dieselben vier wie in der Leiste. */
-function zustandMarke(state: string): { text: string; klasse: string } {
+/**
+ * Der Zustand als kurzes Wort samt Farbe -- dieselben vier wie in der Leiste,
+ * und seit dem 21.08. zwei Faelle davor.
+ *
+ * WARUM DIE BEIDEN VORNE STEHEN: Ihr `state` ist 'stopped', und das Wort dazu
+ * hiess bis heute "beendet". Genau dieses Wort hat alice gelesen, waehrend
+ * sein Modell noch geladen wurde -- eine Sitzung, die gerade entsteht, sah aus
+ * wie eine, die vorbei ist. Beendet, noch-nicht-da und gescheitert sind drei
+ * verschiedene Auskuenfte, und nur die erste darf "beendet" heissen.
+ */
+function zustandMarke(state: string, startet = false, startFehler = false): { text: string; klasse: string } {
+  if (startet) return { text: t('zustand.startet'), klasse: 'marke wartet' };
+  if (startFehler) return { text: t('zustand.startFehler'), klasse: 'marke' };
   if (state === 'running') return { text: t('zustand.laeuft'), klasse: 'marke laeuft' };
   if (state === 'attention') return { text: t('zustand.wartet'), klasse: 'marke wartet' };
   if (state === 'unreachable') return { text: t('zustand.fern'), klasse: 'marke fern' };
@@ -289,7 +373,7 @@ function zeileBauen(z: SitzungsZeile): HTMLButtonElement {
 
   const z1 = el('div', 'zeile1');
   z1.appendChild(el('span', undefined, z.name));
-  const marke = zustandMarke(z.state);
+  const marke = zustandMarke(z.state, z.startet, z.startFehler);
   z1.appendChild(el('span', marke.klasse, marke.text));
   zeile.appendChild(z1);
 
@@ -404,10 +488,281 @@ function zeichneChipZeile(
   }
 }
 
+// --- Die Wahl fuer genau diese Sitzung (19.08.) ----------------------------
+//
+// VIER FRAGEN UNTEREINANDER, und jede ist vorbelegt mit dem, was in den
+// Einstellungen steht. Wer nur eine Sache anders will, aendert eine Sache --
+// das ist der ganze Zweck dieses Weges (Wort des Nutzers: „damit man … nicht
+// erst in die Einstellungen muss und sie danach wieder zurueckstellt").
+//
+// GESCHRIEBEN WIRD HIER NICHTS. Es gibt in diesem ganzen Block keinen Aufruf,
+// der eine Einstellung setzt; die Wahl reist als Befehlszeile mit und endet mit
+// der Sitzung. Nachgewiesen wird das an der Datei selbst, nicht an dieser
+// Zusage.
+//
+// DIE KONTEXTSTUFEN kommen ueber denselben Kanal wie im Einstellungsfenster
+// und tragen dieselbe Regel: alle Stufen sichtbar, auch die, fuer die der
+// Speicher nicht reicht -- mit Hinweis, nie mit Sperre.
+
+function wahlHolen(): void {
+  if (wahlLaedt || wahlVersucht) return;
+  wahlLaedt = true;
+  wahlVersucht = true;
+  wahlFehler = '';
+  void window.awbSitzung.wahlDaten()
+    .then((d) => {
+      wahlDaten = d;
+      // Vorbelegen -- aber nur, was noch nicht von Hand gesetzt wurde.
+      if (!wahl.harness) wahl.harness = d.einstellung.harness;
+      if (!wahl.model) wahl.model = d.einstellung.model;
+      if (!wahl.effort) wahl.effort = d.einstellung.effort;
+      if (!wahl.kontext) wahl.kontext = d.einstellung.kontext;
+    })
+    .catch((e: unknown) => { wahlFehler = String((e as Error)?.message ?? e); })
+    .then(() => { wahlLaedt = false; zeichne(); });
+}
+
+function kontextHolen(modellId: string): void {
+  if (!modellId || kontextLaeuft.has(modellId) || kontextStand[modellId]) return;
+  kontextLaeuft.add(modellId);
+  void window.awbSitzung.kontextStufen(modellId)
+    .then((a) => { kontextStand[modellId] = a; })
+    .catch((e: unknown) => { kontextStand[modellId] = { ok: false, fehler: String(e) }; })
+    .then(() => { kontextLaeuft.delete(modellId); zeichne(); });
+}
+
+/** Eine Zeile des Wahlblocks: Name, Steuerelement, optional ein Hinweis darunter. */
+function wahlZeile(name: string, steuer: HTMLElement, hinweis?: string): HTMLElement {
+  const z = el('div', 'wahlzeile');
+  z.dataset.wahl = name;
+  z.appendChild(el('div', 'wahlname', name));
+  z.appendChild(steuer);
+  if (hinweis) z.appendChild(el('div', 'wahlhinweis', hinweis));
+  return z;
+}
+
+/** Ein zweizeiliger Listeneintrag -- dieselbe Bauform wie die Modellliste der Einstellungen. */
+function wahlEintrag(
+  zeile1: HTMLElement,
+  zeile2: HTMLElement | undefined,
+  gewaehlt: boolean,
+  auf: () => void,
+): HTMLButtonElement {
+  const b = el('button', gewaehlt ? 'wahleintrag gewaehlt' : 'wahleintrag') as HTMLButtonElement;
+  b.type = 'button';
+  b.appendChild(zeile1);
+  if (zeile2) b.appendChild(zeile2);
+  b.addEventListener('click', auf);
+  return b;
+}
+
+/** Die Flaggen, die beim Start wirklich mitgehen -- wortwoertlich, VOR dem Klick. */
+function wahlFlaggen(modell: WahlModell | undefined, stufen: string[]): string[] {
+  const f: string[] = [];
+  if (wahl.harness) f.push('--harness', wahl.harness);
+  if (wahl.model) f.push('--model', wahl.model);
+  if (wahl.effort && stufen.includes(wahl.effort)) f.push('--effort', wahl.effort);
+  if (modell?.lokal && wahl.kontext > 0) f.push('--kontext', String(wahl.kontext));
+  return f;
+}
+
+function zeichneWahlblock(): void {
+  neuWahlKnopf.textContent = wahlOffen ? t('knopf.neuWahlZu') : t('knopf.neuWahl');
+  neuWahlKnopf.disabled = beschaeftigt;
+  wahlBlockEl.style.display = wahlOffen ? 'block' : 'none';
+  // Die Gewichtung des Platzes haengt an dieser einen Klasse (index.html):
+  // solange die Wahl offen ist, gehoert ihr der Raum, die Sitzungsliste
+  // behaelt einen Rest.
+  document.body.classList.toggle('wahl-offen', wahlOffen);
+  if (!wahlOffen) return;
+  wahlBlockEl.textContent = '';
+
+  if (!wahlDaten) {
+    wahlHolen();
+    wahlBlockEl.appendChild(el('div', 'wahlhinweis',
+      wahlFehler ? t('wahl.ladefehler', { grund: wahlFehler }) : t('wahl.laedt')));
+    return;
+  }
+  const d = wahlDaten;
+  wahlBlockEl.appendChild(el('div', 'wahlname', t('wahl.titel')));
+  wahlBlockEl.appendChild(el('div', 'wahlhinweis', t('wahl.unterzeile')));
+
+  // --- Programm ------------------------------------------------------------
+  const harnessReihe = el('div', 'filterzeile');
+  for (const h of d.harnesses) {
+    const b = el('button') as HTMLButtonElement;
+    b.type = 'button';
+    b.textContent = h.binaer ? h.label : `${h.label} · ${t('wahl.nichtStartbar')}`;
+    b.dataset.wahlHarness = h.id;
+    if (h.id === wahl.harness) b.classList.add('gewaehlt');
+    b.addEventListener('click', () => {
+      if (wahl.harness === h.id) return;
+      wahl.harness = h.id;
+      // Ein Modell eines anderen Programms waere nach dem Wechsel nicht mehr
+      // waehlbar -- also faellt es weg, und die erste Wahl des neuen Programms
+      // tritt an seine Stelle. Ein Modell stehen zu lassen, das zum gewaehlten
+      // Programm nicht gehoert, ergaebe eine Startzeile, die nicht laeuft.
+      const passend = d.modelle.filter((m) => m.harness === h.id);
+      wahl.model = passend.some((m) => m.id === wahl.model) ? wahl.model : (passend[0]?.id ?? '');
+      const stufen = d.harnessStufen[h.id] ?? [];
+      if (!stufen.includes(wahl.effort)) wahl.effort = stufen[stufen.length - 1] ?? '';
+      wahl.kontext = 0;
+      wahlSuche = '';
+      zeichne();
+    });
+    harnessReihe.appendChild(b);
+  }
+  wahlBlockEl.appendChild(wahlZeile(t('wahl.harness'), harnessReihe));
+
+  // --- Modell --------------------------------------------------------------
+  const eigene = d.modelle.filter((m) => m.harness === wahl.harness);
+  const modellKasten = el('div');
+  if (eigene.length === 0) {
+    modellKasten.appendChild(el('div', 'wahlhinweis', t('wahl.keinModell')));
+  } else {
+    const suchfeld = el('input', 'modellsuche') as HTMLInputElement;
+    suchfeld.type = 'text';
+    suchfeld.placeholder = t('wahl.platzhalterSuche');
+    suchfeld.value = wahlSuche;
+    suchfeld.dataset.wahlSuche = '1';
+    suchfeld.spellcheck = false;
+    suchfeld.addEventListener('input', () => {
+      wahlSuche = suchfeld.value;
+      zeichne();
+      // Nach dem Neuzeichnen steht ein neues Feld da -- der Fokus muss mit,
+      // sonst reisst das Tippen nach dem ersten Zeichen ab (derselbe Befund
+      // wie im Einstellungsfenster).
+      const neu = wahlBlockEl.querySelector<HTMLInputElement>('input[data-wahl-suche="1"]');
+      if (neu) {
+        neu.focus();
+        neu.setSelectionRange(neu.value.length, neu.value.length);
+      }
+    });
+    modellKasten.appendChild(suchfeld);
+
+    const suche = wahlSuche.trim().toLowerCase();
+    const passt = (m: WahlModell): boolean => !suche
+      || m.label.toLowerCase().includes(suche) || m.id.toLowerCase().includes(suche);
+    // Das Gewaehlte steht immer oben, auch wenn die Suche es sonst wegnaehme --
+    // sonst sieht man nicht mehr, was gerade gilt.
+    const dasGewaehlte = eigene.find((m) => m.id === wahl.model);
+    const zeigen = [
+      ...(dasGewaehlte ? [dasGewaehlte] : []),
+      ...eigene.filter((m) => m.id !== wahl.model && passt(m)),
+    ];
+    const liste = el('div', 'wahlliste');
+    if (zeigen.length === 0) liste.appendChild(el('div', 'wahlhinweis', t('wahl.keinTreffer')));
+    for (const m of zeigen) {
+      const z1 = el('div', 'zeile1');
+      z1.appendChild(el('span', undefined, `${m.id === wahl.model ? '● ' : '○ '}${m.label}`));
+      z1.appendChild(el('span', 'kennung', m.id));
+      const z2 = el('div', 'zeile2', m.startbar
+        ? m.harnessLabel
+        : `${m.harnessLabel} · ${t('wahl.nichtStartbar')}`);
+      const b = wahlEintrag(z1, z2, m.id === wahl.model, () => {
+        if (wahl.model === m.id) return;
+        wahl.model = m.id;
+        // Das Kontextfenster gehoert dem Modell -- ein Wechsel nimmt die alte
+        // Tokenzahl mit, sonst ginge eine Stufe mit, die dieses Modell gar
+        // nicht anbietet.
+        wahl.kontext = 0;
+        zeichne();
+      });
+      b.dataset.wahlModell = m.id;
+      liste.appendChild(b);
+    }
+    modellKasten.appendChild(liste);
+  }
+  wahlBlockEl.appendChild(wahlZeile(t('wahl.modell'), modellKasten));
+
+  // --- Denkstufe -----------------------------------------------------------
+  const stufen = d.harnessStufen[wahl.harness] ?? [];
+  if (stufen.length === 0) {
+    wahlBlockEl.appendChild(wahlZeile(t('wahl.effort'), el('div', 'wahlhinweis', t('wahl.keineStufen'))));
+  } else {
+    const stufenReihe = el('div', 'filterzeile');
+    for (const s of stufen) {
+      const b = el('button') as HTMLButtonElement;
+      b.type = 'button';
+      b.textContent = s;
+      b.dataset.wahlEffort = s;
+      if (s === wahl.effort) b.classList.add('gewaehlt');
+      b.addEventListener('click', () => {
+        wahl.effort = s;
+        zeichne();
+      });
+      stufenReihe.appendChild(b);
+    }
+    wahlBlockEl.appendChild(wahlZeile(t('wahl.effort'), stufenReihe));
+  }
+
+  // --- Kontextfenster, nur bei einem lokalen Modell ------------------------
+  const modell = d.modelle.find((m) => m.id === wahl.model);
+  if (modell?.lokal) {
+    const antwort = kontextStand[modell.id];
+    if (!antwort) {
+      kontextHolen(modell.id);
+      wahlBlockEl.appendChild(wahlZeile(
+        t('wahl.kontext'), el('div', 'wahlhinweis', t('wahl.kontextWirdErmittelt')),
+      ));
+    } else if (!antwort.ok) {
+      wahlBlockEl.appendChild(wahlZeile(
+        t('wahl.kontext'),
+        el('div', 'wahlhinweis', t('wahl.kontextNichtErmittelt', { grund: antwort.fehler })),
+      ));
+    } else {
+      const s = antwort.sicht;
+      if (!wahl.kontext) wahl.kontext = s.vorgabe;
+      const liste = el('div', 'wahlliste');
+      for (const stufe of s.stufen) {
+        const z1 = el('div', 'zeile1');
+        z1.appendChild(el('span', undefined,
+          `${stufe.tokens === wahl.kontext ? '● ' : '○ '}${stufe.label}`));
+        if (stufe.tokens === s.empfehlung) {
+          z1.appendChild(el('span', 'marke', t('wahl.kontextEmpfohlen')));
+        }
+        z1.appendChild(el('span', 'kennung', t('wahl.kontextToken', { tokens: stufe.tokens })));
+        // Wo der Speicher nicht reicht, steht der HINWEIS statt der knappen
+        // Bedarfszeile: er nennt den Bedarf bereits samt dem, was frei ist.
+        const eng = !stufe.passt && !!stufe.hinweis;
+        const z2 = el('div', eng ? 'zeile2 knapp' : 'zeile2',
+          eng ? String(stufe.hinweis) : t('wahl.kontextBedarf', { bedarf: stufe.bedarfGib.toFixed(1) }));
+        const b = wahlEintrag(z1, z2, stufe.tokens === wahl.kontext, () => {
+          wahl.kontext = stufe.tokens;
+          zeichne();
+        });
+        b.dataset.wahlKontext = String(stufe.tokens);
+        b.dataset.passt = stufe.passt ? 'ja' : 'nein';
+        liste.appendChild(b);
+      }
+      wahlBlockEl.appendChild(wahlZeile(t('wahl.kontext'), liste));
+    }
+  } else {
+    wahlBlockEl.appendChild(wahlZeile(
+      t('wahl.kontext'), el('div', 'wahlhinweis', t('wahl.kontextNurLokal')),
+    ));
+  }
+
+  // --- Die Startzeile, wortwoertlich ---------------------------------------
+  const flaggen = wahlFlaggen(modell, stufen);
+  const startzeile = el('div', 'startzeile');
+  const flaggenEl = el('div', 'flaggen', flaggen.length ? flaggen.join(' ') : t('wahl.flaggenLeer'));
+  flaggenEl.id = 'neu-wahl-flaggen';
+  startzeile.appendChild(flaggenEl);
+  const startKnopf = el('button', 'knopf haupt', t('knopf.neuWahlStart')) as HTMLButtonElement;
+  startKnopf.type = 'button';
+  startKnopf.id = 'neu-wahl-start';
+  startKnopf.disabled = beschaeftigt || !wahl.model;
+  startKnopf.addEventListener('click', (ereignis) => void neueSitzungMitWahl(ereignis.isTrusted));
+  startzeile.appendChild(startKnopf);
+  wahlBlockEl.appendChild(startzeile);
+}
+
 function zeichne(): void {
   if (!daten) return;
   zeichneMaschinenwahl();
   zeichneFernZeile();
+  zeichneWahlblock();
 
   // Chips ERZEUGT aus den tatsaechlich vorkommenden Werten -- vor der
   // Filterung berechnet, sonst wuerde jeder gewaehlte Filter die uebrigen
@@ -483,6 +838,12 @@ function zeichne(): void {
   const laeuftGerade = !!gewaehlt && (gewaehlt.state === 'running' || gewaehlt.state === 'attention');
   beendenKnopf.disabled = beschaeftigt || !laeuftGerade;
   neuKnopf.disabled = beschaeftigt;
+  // BEFUND 19.08.: Der Chat-Knopf blieb waehrend eines laufenden Starts
+  // anklickbar, obwohl `neueChatSitzung()` ihn mit `if (beschaeftigt) return`
+  // gleich wieder abweist -- ein Knopf, der sichtbar nichts tun KANN, soll das
+  // auch zeigen, statt es erst nach dem Klick zu verschweigen. Dieselbe Regel,
+  // nach der drei Zeilen weiter oben der Beenden-Knopf gesperrt wird.
+  neuChatKnopf.disabled = beschaeftigt;
   if (nameFeld.value !== nameWert) nameFeld.value = nameWert;
 }
 
@@ -512,6 +873,65 @@ async function neueSitzung(echt: boolean): Promise<void> {
     if (a.ok) {
       nameWert = '';
       fernPfadWert = '';
+    }
+  } catch (e) {
+    melde(String((e as Error).message ?? e), 'fehler');
+  } finally {
+    beschaeftigt = false;
+    zeichne();
+  }
+}
+
+/**
+ * DER DRITTE WEG (19.08.): dieselbe neue Sitzung, aber mit einer Wahl, die nur
+ * fuer sie gilt.
+ *
+ * Bis auf die Wahl im Gepaeck ist er Zeile fuer Zeile `neueSitzung()` -- und
+ * das mit Absicht: derselbe Ordnerdialog, dieselbe Fernpruefung, dieselbe
+ * Echtheit des Klicks. Was er NICHT tut, ist eine Einstellung schreiben.
+ */
+async function neueSitzungMitWahl(echt: boolean): Promise<void> {
+  if (beschaeftigt) return;
+  if (daten && maschineWert !== daten.machine && !fernPfadWert.trim()) {
+    melde(t('satz.erstOrdnerEintragen', { maschine: maschineWert }), 'fehler');
+    return;
+  }
+  const modell = wahlDaten?.modelle.find((m) => m.id === wahl.model);
+  const stufen = wahlDaten?.harnessStufen[wahl.harness] ?? [];
+  // Genau die Flaggen, die im Fenster standen -- nicht mehr und nicht weniger.
+  // Ein Feld, das leer bleibt, erzeugt keinen Schalter; dann gilt dafuer
+  // weiter, was in den Einstellungen steht.
+  const mit: Wahl = {
+    harness: wahl.harness,
+    model: wahl.model,
+    effort: stufen.includes(wahl.effort) ? wahl.effort : '',
+    kontext: modell?.lokal ? wahl.kontext : 0,
+  };
+  beschaeftigt = true;
+  zeichne();
+  try {
+    const a = await window.awbSitzung.neuMitWahl(nameWert, maschineWert, fernPfadWert, mit, echt);
+    melde(a.command ? `${a.meldung}\n${a.command}` : a.meldung, a.ok ? 'gut' : 'fehler');
+    if (a.ok) {
+      nameWert = '';
+      fernPfadWert = '';
+      // Die Wahl gilt EINER Sitzung. Sie bleibt danach nicht stehen -- sonst
+      // startete der naechste Klick unbemerkt wieder mit ihr.
+      //
+      // `wahlDaten` und `wahlVersucht` gehen MIT zurueck, und das ist kein
+      // Beiwerk: die Vorbelegung geschieht nur beim Holen (`wahlHolen`). Blieben
+      // die Daten stehen, faende das naechste Aufklappen leere Felder statt der
+      // Einstellungen -- kein gewaehltes Programm, keine Modellliste, ein
+      // gesperrter Startknopf. Nebenbei ist es das Richtige: die Einstellungen
+      // koennen sich zwischen zwei Starts geaendert haben.
+      wahlOffen = false;
+      wahlDaten = null;
+      wahlVersucht = false;
+      wahl.harness = '';
+      wahl.model = '';
+      wahl.effort = '';
+      wahl.kontext = 0;
+      wahlSuche = '';
     }
   } catch (e) {
     melde(String((e as Error).message ?? e), 'fehler');
@@ -636,6 +1056,13 @@ suchFeld.addEventListener('input', () => {
 });
 neuKnopf.addEventListener('click', (ereignis) => void neueSitzung(ereignis.isTrusted));
 neuChatKnopf.addEventListener('click', (ereignis) => void neueChatSitzung(ereignis.isTrusted));
+// Auf- und zuklappen ist eine Sache der Ansicht -- die Echtheit des Klicks
+// entscheidet hier nichts, sie entscheidet erst am Startknopf darin.
+neuWahlKnopf.addEventListener('click', () => {
+  if (beschaeftigt) return;
+  wahlOffen = !wahlOffen;
+  zeichne();
+});
 fernPruefenKnopf.addEventListener('click', () => void fernPruefen());
 fortKnopf.addEventListener('click', () => void setzeFort(gewaehlteSitzung));
 beendenKnopf.addEventListener('click', (ereignis) => void sitzungBeenden(gewaehlteSitzung, ereignis.isTrusted));
@@ -699,6 +1126,14 @@ window.__awbSitzung = {
     fortsetzbar: b.dataset.fortsetzbar === '1',
   })),
 };
+
+// Der Grund, wenn ein Start spaeter scheitert. Er steht in der Statuszeile, wo
+// auch die Startmeldung stand -- die Zeile "Session wird gestartet" wird damit
+// von der Wahrheit abgeloest, statt stehenzubleiben.
+window.awbSitzung.onStartfehler((p) => {
+  const zeilen = [p.kurz || 'Die Sitzung ist nicht gestartet.', p.grund, `Protokoll: ${p.protokoll}`];
+  melde(zeilen.filter(Boolean).join('\n'), 'fehler');
+});
 
 window.awbSitzung.onDaten((d) => {
   daten = d;

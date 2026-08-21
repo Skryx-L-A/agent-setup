@@ -33,10 +33,15 @@ is_heavy=0
 printf '%s' "$CMD" | grep -Eq "$HEAVY_RE" && is_heavy=1
 
 # --- read the target's guard snapshot ---
+# FRIST (2026-08-20, same error class as the app-quit hang the same day):
+# this ssh call had no ConnectTimeout/BatchMode -- an unreachable target left
+# it hanging on the TCP handshake (or a password prompt nothing answers) far
+# longer than the `|| true` fallback below ever gets a chance to matter, since
+# that only catches a non-zero exit, never a hang.
 if [ "$TARGET" = "$SELF" ]; then
   GUARD="$("$HOME/.local/bin/check-resources" --guard 2>/dev/null || true)"
 else
-  GUARD="$(ssh "$TARGET" '$HOME/.local/bin/check-resources --guard' 2>/dev/null || true)"
+  GUARD="$(ssh -o ConnectTimeout=8 -o BatchMode=yes "$TARGET" '$HOME/.local/bin/check-resources --guard' 2>/dev/null || true)"
 fi
 
 if [ -z "$GUARD" ]; then

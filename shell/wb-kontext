@@ -1,0 +1,1215 @@
+#!/usr/bin/env python3
+# wb-kontext — die Kontextfenster-Wahl fuer ein lokales Modell: welche Stufen
+# gibt es, welche passt gerade in den freien Speicher, und wie wird eine Stufe
+# wirklich lieferbar (Ollama-Variante brennen / MLX-Provider in
+# ~/.pi/agent/models.json eintragen).
+#
+#   wb-kontext stufen <modell> [--parallel <n>] [--denken <stufe>] [--json]
+#   wb-kontext empfehlung <modell> [--parallel <n>] [--denken <stufe>]
+#   wb-kontext ensure <modell> <stufe>
+#
+# --parallel beantwortet "ich will N lokale Worker gleichzeitig, wie gross
+# darf das Fenster je Worker sein" (Vorgabe: 1, ein sachkundiger Aufrufer wie
+# pi-worker zaehlt die bereits laufenden Worker und gibt N explizit mit).
+# JEDE Stufe traegt zusaetzlich "plaetze": die Umkehrfrage, "bei DIESER Stufe,
+# wie viele Worker passen insgesamt in den gerade freien Speicher".
+#
+# --denken (off, minimal, low, medium, high, xhigh, max — pis eigene
+# Stufenleiter) wird geprueft und im JSON als "denken"/"denkFaktor"
+# gemeldet, geht aber NICHT in die Bedarfsrechnung ein (Korrektur
+# 19.08.2026 abends -- siehe DENK_FAKTOR unten fuer die Begruendung: der
+# Faktor sagt etwas ueber die Geschwindigkeit, mit der ein Gespraech ein
+# Fenster fester Groesse fuellt, nicht ueber den Byte-Bedarf je Token-Feld
+# im KV-Cache, der einzigen Groesse, die hier gerechnet wird). Ohne Angabe
+# waehlt denken_vorgabe() den Wert, der im Betrieb wirklich gilt (ein
+# serverseitig erzwungenes Denken aus der Registry, sonst der
+# Denken-immer-an-Boden 'low' jedes Workers) -- NICHT pauschal 'off'.
+#
+# JEDE Stufe bleibt waehlbar, auch wenn der Speicher gerade nicht reicht — sie
+# bekommt "passt": false und einen Hinweis im Klartext, wird aber nie
+# ausgelassen oder gesperrt (ausdrueckliche des Nutzers Vorgabe, 2026-08-19).
+#
+# WAS "passt" NICHT IST (Korrektur 2026-08-19, nach einer ersten falschen
+# Fassung, die hier faelschlich 20480 MiB Nach-dem-Laden-Reserve verlangte):
+# grug-server's MIN_FREE_MIB (20 GB) ist eine VORBEDINGUNG vor einem MLX-Start
+# -- so viel muss frei sein, BEVOR ueberhaupt geladen wird -- kein Reservat,
+# das danach stehen bleiben muss. Dieser Boden gehoert dorthin (bzw. zu
+# wb-mlx-server) und wird hier NICHT nachgebaut. "passt" rechnet stattdessen
+# mit einer kleinen, immer gleichen Reserve (RESERVE_MIB unten).
+import argparse
+import contextlib
+import copy
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, ".local", "bin")
+PI_MODELS = os.path.join(HOME, ".pi", "agent", "models.json")
+PI_MODELS_LOCK = PI_MODELS + ".lock"
+KV_DATEI = os.path.join(HOME, ".local", "state", "wb-belegung", "kv-bedarf.json")
+
+MIB_JE_GIB = 1024.0
+STUFE_START = 32768
+# 2048 MiB -- eine kleine Stoergroessen-Reserve fuer den laufenden
+# Host-Grundverbrauch zwischen Messung und Start (Vorgabe des Nutzers 2026-08-19:
+# "nimm 2 GiB"). Kein Ersatz fuer wb-belegung's eigene Buchfuehrung (6 GiB
+# System-Reserve, 4 GiB Zuschlag fuer Prompt-Cache/Spitzen -- die zaehlt beim
+# echten Belegen, nicht hier) und keine Kopie von grug-server's MIN_FREE_MIB
+# (20480 MiB, Vorbedingung VOR einem MLX-Start). Beide bleiben, wo sie sind.
+RESERVE_MIB = 2048
+# 1,1, nicht 1,5 (Anweisung des Nutzers 2026-08-19) -- NUR die eigene Konstante
+# hier. wb-belegung fuehrt seinen EIGENEN Sicherheitsfaktor unabhaengig (eine
+# andere Spur aendert ihn, nicht dieser Auftrag) -- KEINE Zahl dafuer hier
+# nennen: ein Wert aus einer fremden Datei veraltet zuverlaessig, sobald die
+# andere Spur ihn erneut aendert, ohne dass hier jemand es merkt (Pruefer-
+# Befund N6, 19.08.2026 abends, genau diese Stelle: die 1,5 stand hier noch,
+# als die andere Datei laengst auf 1,1 stand). Wer den aktuellen Wert
+# braucht: `grep SICHERHEITSFAKTOR shell/wb-belegung`. Die beiden Faktoren
+# muessen ohnehin nicht gleich sein.
+SICHERHEITSFAKTOR = 1.1
+# KORRIGIERT 19.08.2026 abends, nach einem echten Betriebsfehler: die vorige
+# Fassung dieser Konstante (KV_DICHTE_BODEN = 1,05 MiB/Token, geliehen von
+# "kat", dem einzigen in dieser Werkbank gemessenen dichten Modell) galt
+# PAUSCHAL fuer JEDES unbekannte dichte Modell, unabhaengig von dessen echter
+# Groesse -- eine Analogie statt einer Herleitung. Fuer ornith-9b ergab das
+# einen KV-Bedarf von 82,5 GiB bei 32k, obwohl ornith:9b-256k auf dieser
+# Maschine nachweislich mit 262144 Token bei 100% GPU, kein Spill lief
+# (gemessen 2026-08-15, regeln/lokale-modelle.md) -- eine Zahl, die eine echte
+# Messung widerlegt, waere unbemerkt in den Betrieb gegangen.
+#
+# Der Boden kommt jetzt PRO MODELL aus der Architektur (kv_architektur_mlx /
+# kv_architektur_ollama unten) -- Lagen, KV-Koepfe, Kopfdimension, 8-Bit-Cache
+# (Standing Rule, siehe regeln/lokale-modelle.md) -- genau wie es fuer das
+# native Maximum bei MLX schon laenger passiert (natives_maximum_mlx liest
+# config.json). Nur wenn selbst DAS scheitert (kein config.json, kein
+# lesbares 'ollama show -v'), greift die folgende Familien-Annahme -- keine
+# blanke Zahl, sondern dieselbe Formel mit angenommenen statt gemessenen
+# Groessen: 32 Lagen (mittlere Tiefe heutiger 7-35B-Modelle), 8 KV-Koepfe
+# (uebliche GQA-Gruppierung bei 32-64 Query-Koepfen), Kopfdimension 128
+# (Standardwert bei hidden_size/num_heads fuer diese Groessenklasse), 8-Bit-
+# Cache. Keine Hybrid-Ersparnis angenommen (unbekannt, ob rekurrent) -- das
+# haelt die Annahme auf der teureren, ehrlicheren Seite.
+ANNAHME_LAGEN = 32
+ANNAHME_KV_KOEPFE = 8
+ANNAHME_KOPFDIM = 128
+KV_ANNAHME_BODEN = 2 * ANNAHME_LAGEN * ANNAHME_KV_KOEPFE * ANNAHME_KOPFDIM * 1 / (1024.0 ** 2)
+
+# Denken UND Nebenlaeufigkeit sind NICHT dieselbe Rechnung (Korrektur
+# 19.08.2026 abends, nach demselben Befund wie oben): eine hoehere Denkstufe
+# erzeugt bei GLEICHER Aufgabe mehr AUSGABE-Token (gemessen,
+# session-2026-08-15-16-qwen38-nebenlaeufigkeit-volllauf: 34233 gegen 16376,
+# Faktor 2,090) -- das sagt aber nur, wie SCHNELL ein Gespraech ein Fenster
+# fester Groesse fuellt, nicht wie viele BYTE ein einzelnes Token-Feld im
+# KV-Cache kostet. Bytes je Token-Feld sind eine Architektur-Konstante (Lagen
+# x KV-Koepfe x Kopfdimension x Cache-Breite), fest fuer eine gegebene Stufe
+# tok -- die vorige Fassung multiplizierte DENK_FAKTOR trotzdem in bedarf_gib
+# hinein, obendrauf auf ein tok, das schon die volle Fenstergroesse war: bei
+# 32k kamen so aus den ohnehin schon zu hohen 32768*1,05 GiB nochmal 82,5 GiB
+# statt der eigentlichen 39,5 -- doppelt gezaehlt. DENK_FAKTOR bleibt als Wert
+# erhalten (fuer die --denken-Validierung und als Auskunftsfeld in der
+# JSON-Ausgabe), geht aber NICHT MEHR in bedarf_gib oder plaetze ein.
+DENK_AKTIV = {"minimal", "low", "medium", "high", "xhigh", "max"}
+DENK_FAKTOR = 34233.0 / 16376.0
+
+# Nebenlaeufigkeit UND Denken gehoeren zur selben Rechnung (des Nutzers
+# Korrektur, 19.08.2026, nach einem ersten -- falschen -- Versuch dieses
+# Befunds): decode-concurrency 4 ist eine KAPAZITAET des MLX-Servers, keine
+# automatische Buchung fuer vier gleichzeitige Sequenzen. `--parallel`
+# beantwortet stattdessen die Frage, die ein sachkundiger Aufrufer wirklich
+# stellt: "wie gross darf das Fenster sein, wenn N Worker gleichzeitig
+# laufen sollen" -- siehe parallel_vorgabe() und das Feld "plaetze" je Stufe
+# (die Umkehrfrage: "bei dieser Stufe, wie viele Worker passen noch").
+
+
+def fail(msg):
+    print("FEHLER: %s" % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError as e:
+        class R:
+            returncode = 127
+            stdout = ""
+            stderr = str(e)
+        return R()
+
+
+def zahl(x, n=2):
+    return ("%.*f" % (n, x))
+
+
+def label(tokens):
+    if tokens % 1048576 == 0:
+        return "%dM" % (tokens // 1048576)
+    if tokens % 1024 == 0:
+        return "%dk" % (tokens // 1024)
+    return str(tokens)
+
+
+def parse_stufe(s):
+    s = s.strip()
+    if s.isdigit():
+        return int(s)
+    m = re.match(r"^(\d+)([kKmM])$", s)
+    if m:
+        n, einheit = int(m.group(1)), m.group(2).lower()
+        return n * (1048576 if einheit == "m" else 1024)
+    fail("Stufe '%s' nicht verstanden — eine Tokenzahl (131072) oder ein Kurzform (128k, 1M)." % s)
+
+
+def stufen_liste(native_max):
+    werte = []
+    v = STUFE_START
+    while v <= native_max:
+        werte.append(v)
+        v *= 2
+    if native_max not in werte:
+        werte.append(native_max)
+    return werte
+
+
+# --------------------------------------------------------------- Modell aufloesen
+
+def registry_get(modell):
+    p = run([os.path.join(BIN, "wb-state"), "models", "get", modell])
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(p.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def einstellung_ist_an(name):
+    # Denselben Weg lesen wie wb-code/pi-worker (Nachtrag 2026-08-21,
+    # Befund vom echten Doppelstart): beide lesen
+    # "wb-state settings get orchestratorVorhersage" bzw. "...workerVorhersage"
+    # VOR jeder Vorhersage-Entscheidung -- kein zweiter, eigener Lesepfad hier.
+    p = run([os.path.join(BIN, "wb-state"), "settings", "get", name])
+    if p.returncode != 0:
+        return False
+    return p.stdout.strip() == "true"
+
+
+def ollama_namen():
+    p = run(["ollama", "list"])
+    if p.returncode != 0:
+        return []
+    zeilen = p.stdout.splitlines()[1:]
+    return [ln.split()[0] for ln in zeilen if ln.strip()]
+
+
+def resolve(modell):
+    reg = registry_get(modell)
+    if reg:
+        return {
+            "id": reg.get("id", modell),
+            "alias": reg.get("alias") or reg.get("id", modell),
+            "harness": reg.get("harness") or "pi",
+            "provider": reg.get("provider") or "",
+            "modelRef": reg.get("modelRef") or reg.get("id"),
+            "registryContextWindow": reg.get("contextWindow"),
+            # Ein serverseitig ERZWUNGENES Denken (Pruefer-Befund B2, 19.08.2026):
+            # wb-mlx-server reicht chatTemplateArgs unveraendert an den Server
+            # weiter, der Aufrufer kann es NICHT abschalten. Fuer die
+            # Denken-Vorgabe unten (siehe denken_vorgabe()) wichtiger als
+            # defaultEffort, das nur pis EIGENES --thinking steuert.
+            "chatTemplateArgs": reg.get("chatTemplateArgs") or {},
+            "supportsEffort": bool(reg.get("supportsEffort")),
+            # Das Registry-Feld 'vorhersage' (Schema von Worker "ktxwerk",
+            # extension/src/models.ts) -- EINE Quelle fuer diesen Nachschlag,
+            # dieselbe, aus der wb-mlx-server denselben Wert liest (dort ueber
+            # 'wb-state models get <id> --field vorhersage', hier ueber
+            # denselben registry_get()-Aufruf, der ohnehin schon lief). Siehe
+            # berechne() fuer die Auswertung bei bauart == "eingebaut".
+            "vorhersage": reg.get("vorhersage") or None,
+        }
+    if modell.startswith("/") or os.path.isdir(modell):
+        return {"id": modell, "alias": modell, "harness": "pi", "provider": "mlx-lokal",
+                "modelRef": modell, "registryContextWindow": None,
+                "chatTemplateArgs": {}, "supportsEffort": False, "vorhersage": None}
+    namen = ollama_namen()
+    if modell in namen:
+        return {"id": modell, "alias": modell, "harness": "pi", "provider": "ollama",
+                "modelRef": modell, "registryContextWindow": None,
+                "chatTemplateArgs": {}, "supportsEffort": False, "vorhersage": None}
+    fail("Modell '%s' ist weder in der Werkbank-Registry noch als installiertes Ollama-Modell "
+         "bekannt, und kein Verzeichnis. Registriert pruefen: wb-state models list" % modell)
+
+
+# --------------------------------------------------------------- natives Maximum
+
+def natives_maximum_ollama(modelref):
+    p = run(["ollama", "show", modelref])
+    if p.returncode != 0:
+        return None, "'ollama show %s' fehlgeschlagen: %s" % (modelref, p.stderr.strip())
+    m = re.search(r"context length\s+(\d+)", p.stdout)
+    if not m:
+        return None, "'ollama show %s' nennt keine 'context length'" % modelref
+    return int(m.group(1)), "ollama show"
+
+
+def natives_maximum_mlx(modelref):
+    cfgp = os.path.join(modelref, "config.json")
+    if not os.path.isfile(cfgp):
+        return None, "%s fehlt" % cfgp
+    try:
+        cfg = json.load(open(cfgp))
+    except (json.JSONDecodeError, OSError) as e:
+        return None, "%s nicht lesbar: %s" % (cfgp, e)
+    tc = cfg.get("text_config") or {}
+    v = tc.get("max_position_embeddings") or cfg.get("max_position_embeddings")
+    if not v:
+        return None, "%s nennt kein max_position_embeddings" % cfgp
+    return int(v), "config.json (text_config.max_position_embeddings)"
+
+
+def natives_maximum(res):
+    if res["provider"] == "ollama":
+        nmax, quelle_oder_grund = natives_maximum_ollama(res["modelRef"])
+    elif res["provider"] == "mlx-lokal":
+        nmax, quelle_oder_grund = natives_maximum_mlx(res["modelRef"])
+    else:
+        nmax, quelle_oder_grund = None, "unbekannter Provider '%s'" % res["provider"]
+    if nmax is not None:
+        return nmax, quelle_oder_grund
+    if res.get("registryContextWindow"):
+        return res["registryContextWindow"], \
+            "Werkbank-Registry (Ersatz — direkte Quelle scheiterte: %s)" % quelle_oder_grund
+    fail("natives Maximum fuer '%s' nicht zu ermitteln: %s" % (res["id"], quelle_oder_grund))
+
+
+# --------------------------------------------------------------- Gewichte
+
+def gewichte_gb(res):
+    # GiB (/1024**3), nicht dezimales GB (/1e9) -- Pruefer-Befund B13a,
+    # 19.08.2026: die fruehere Fassung holte die Groesse dezimal und addierte
+    # sie unveraendert zum binaeren KV-Anteil (bedarf_gib in berechne() rechnet
+    # ueberall mit MIB_JE_GIB=1024) -- 7,4 % zu viel, in die harmlose Richtung,
+    # aber die angezeigte Zahl war nicht die gerechnete. Der Feldname
+    # "gewichteGb" bleibt (Auftrag C baut die Oberflaeche gegen genau dieses
+    # Feld), der WERT ist ab jetzt echtes GiB wie der Rest der Rechnung.
+    if res["provider"] == "mlx-lokal" or os.path.isdir(res["modelRef"]):
+        d = res["modelRef"]
+        if not os.path.isdir(d):
+            return 0.0, "Modellverzeichnis '%s' nicht gefunden" % d
+        tot = sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d)
+                  if f.endswith(".safetensors"))
+        return tot / MIB_JE_GIB ** 3, "safetensors auf der Platte"
+    p = run(["ollama", "list"])
+    for ln in p.stdout.splitlines()[1:]:
+        teile = ln.split()
+        if not teile or teile[0] != res["modelRef"]:
+            continue
+        for i, tok in enumerate(teile):
+            if tok in ("GB", "MB", "KB") and i > 0:
+                # ollama list gibt dezimale Einheiten aus (dieselbe Herkunft
+                # wie oben, /1e9 fuer GB) -- erst in Byte, dann einheitlich in GiB.
+                faktor = {"GB": 1e9, "MB": 1e6, "KB": 1e3}[tok]
+                try:
+                    return float(teile[i - 1]) * faktor / MIB_JE_GIB ** 3, "ollama list SIZE-Spalte"
+                except ValueError:
+                    break
+    return 0.0, "Groesse nicht ermittelbar ('%s' steht nicht in 'ollama list')" % res["modelRef"]
+
+
+# --------------------------------------------------------------- KV-Bedarf je Token
+
+def kv_registry():
+    try:
+        with open(KV_DATEI) as f:
+            daten = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    modelle = daten.get("modelle")
+    return modelle if isinstance(modelle, dict) else {}
+
+
+def kv_obergrenze_mib(lagen_gesamt, koepfe_gesamt, kopfdim):
+    # Physikalische Obergrenze fuer EIN Modell mit dieser Architektur: ALLE
+    # Lagen mit voller Attention (keine Hybrid-/SSM-Ersparnis angenommen),
+    # ALLE Koepfe (keine GQA-Reduktion auf wenige KV-Koepfe angenommen), 2
+    # Byte je Element (kein Quantisierungsgewinn angenommen). Hybrid-Bauart,
+    # GQA und 8-Bit-Cache koennen den echten Bedarf nur SENKEN, nie darueber
+    # steigen -- ein Wert je Token, der diese Zahl uebersteigt, ist fuer diese
+    # Architektur unmoeglich, egal woher er kommt (gemessen, hergeleitet oder
+    # angenommen).
+    return 2 * lagen_gesamt * koepfe_gesamt * kopfdim * 2 / (1024.0 ** 2)
+
+
+def kv_architektur_mlx(modelref):
+    # Liest dieselbe config.json wie natives_maximum_mlx, nur die
+    # Attention-Felder statt max_position_embeddings.
+    cfgp = os.path.join(modelref, "config.json")
+    if not os.path.isfile(cfgp):
+        return None
+    try:
+        cfg = json.load(open(cfgp))
+    except (json.JSONDecodeError, OSError):
+        return None
+    tc = cfg.get("text_config") or cfg
+    lagen = tc.get("num_hidden_layers")
+    alle_koepfe = tc.get("num_attention_heads")
+    kv_koepfe = tc.get("num_key_value_heads") or alle_koepfe
+    kopfdim = tc.get("head_dim")
+    if not kopfdim and alle_koepfe:
+        hidden = tc.get("hidden_size")
+        if hidden:
+            kopfdim = hidden / alle_koepfe
+    if not (lagen and kv_koepfe and kopfdim and alle_koepfe):
+        return None
+    layer_types = tc.get("layer_types")
+    if layer_types:
+        # Die tatsaechliche Liste schlaegt jede Annahme ueber den Abstand --
+        # so wurde grugs "16 von 64" (siehe kv-bedarf.json) ueberhaupt zuerst
+        # gemessen.
+        wachsende = sum(1 for t in layer_types if t == "full_attention")
+    else:
+        intervall = tc.get("full_attention_interval")
+        wachsende = -(-lagen // int(intervall)) if intervall else lagen  # Aufrunden
+    mib = 2 * wachsende * kv_koepfe * kopfdim * 1 / (1024.0 ** 2)  # 1 Byte: 8-Bit-Cache, Standing Rule
+    quelle = ("config.json: %d/%d Lagen volle Attention, %d KV-Koepfe, Kopfdim %s, 8-Bit-Cache"
+              % (wachsende, lagen, kv_koepfe, kopfdim))
+    obergrenze = kv_obergrenze_mib(lagen, alle_koepfe, kopfdim)
+    return mib, quelle, obergrenze
+
+
+def kv_architektur_ollama(modelref):
+    # 'ollama show -v' liefert dieselben GGUF-Metadatenfelder, die grug/
+    # qwen3.8 schon per config.json hergeleitet wurden (general.architecture
+    # als Praefix, dann <arch>.block_count, <arch>.attention.head_count_kv,
+    # <arch>.attention.key_length, optional <arch>.full_attention_interval).
+    p = run(["ollama", "show", modelref, "--verbose"])
+    if p.returncode != 0:
+        return None
+    out = p.stdout
+    m = re.search(r"general\.architecture\s+(\S+)", out)
+    if not m:
+        return None
+    arch = re.escape(m.group(1))
+
+    def feld(name):
+        mm = re.search(r"%s\.%s\s+(\S+)" % (arch, re.escape(name)), out)
+        return mm.group(1) if mm else None
+
+    lagen_s = feld("block_count")
+    kv_koepfe_s = feld("attention.head_count_kv") or feld("attention.head_count")
+    alle_koepfe_s = feld("attention.head_count")
+    kopfdim_s = feld("attention.key_length") or feld("attention.value_length")
+    embed_s = feld("embedding_length")
+    if not kopfdim_s and alle_koepfe_s and embed_s:
+        try:
+            kopfdim_s = str(float(embed_s) / float(alle_koepfe_s))
+        except (ValueError, ZeroDivisionError):
+            kopfdim_s = None
+    if not (lagen_s and kv_koepfe_s and kopfdim_s):
+        return None
+    try:
+        lagen = int(float(lagen_s))
+        kv_koepfe = int(float(kv_koepfe_s))
+        kopfdim = int(float(kopfdim_s))
+        alle_koepfe = int(float(alle_koepfe_s)) if alle_koepfe_s else kv_koepfe
+    except ValueError:
+        return None
+    intervall_s = feld("full_attention_interval")
+    if intervall_s:
+        try:
+            wachsende = -(-lagen // int(float(intervall_s)))  # Aufrunden
+        except (ValueError, ZeroDivisionError):
+            wachsende = lagen
+    else:
+        wachsende = lagen
+    mib = 2 * wachsende * kv_koepfe * kopfdim * 1 / (1024.0 ** 2)  # 1 Byte: 8-Bit-Cache, Standing Rule
+    quelle = ("ollama show -v: %d/%d Lagen volle Attention, %d KV-Koepfe, Kopfdim %d, 8-Bit-Cache"
+              % (wachsende, lagen, kv_koepfe, kopfdim))
+    obergrenze = kv_obergrenze_mib(lagen, alle_koepfe, kopfdim)
+    return mib, quelle, obergrenze
+
+
+def kv_architektur(res):
+    if res["provider"] == "mlx-lokal":
+        return kv_architektur_mlx(res["modelRef"])
+    if res["provider"] == "ollama":
+        return kv_architektur_ollama(res["modelRef"])
+    return None
+
+
+def kv_ollama_kunstname(reg, modelref):
+    # Pruefer-Befund N2 (19.08.2026 abends): die Messstrecke traegt Ollama-KV-
+    # Werte unter von Hand gebildeten Namen ein, die Herkunft, Laufzeit und
+    # Quantisierung in EINEM String zusammenfassen (Beispiel aus
+    # kv-bedarf.json: "qwen3-1.7b-ollama-q4km" fuer den echten modelRef
+    # 'qwen3:1.7b') -- kein Aufrufer nennt das Modell je unter diesem
+    # Kunstnamen, nur unter seinem echten modelRef mit Doppelpunkt-Tag. Ohne
+    # diese Funktion trifft der exakte Schluesselvergleich oben nie, und die
+    # frisch gemessene Zahl bleibt fuer immer unerreichbar -- "die Arbeit ist
+    # da, sie ist nur nicht angeschlossen" (Pruefer, woertlich). Der feste
+    # Namensteil "-ollama-" ist die einzige stabile Klammer der Konvention
+    # (Modellname roh davor, Quantisierungskuerzel dahinter, das je nach
+    # Laufzeit variiert); ':' wird auf '-' normalisiert, weil der Ollama-Tag
+    # ihn traegt, der Dateiname aber keinen Doppelpunkt kennt. Bei mehreren
+    # Treffern (z.B. verschiedene Quantisierungen desselben Modells) wird
+    # deterministisch der alphabetisch erste genommen -- besser ein plausibler
+    # Treffer als der alte, weit teurere Ersatzwert, aber ohne Anspruch,
+    # zwischen mehreren Quantisierungen richtig zu raten.
+    basis = modelref.replace(":", "-").lower()
+    marker = basis + "-ollama-"
+    treffer = sorted(k for k in reg if k.lower().startswith(marker))
+    return treffer[0] if treffer else None
+
+
+def kv_mib_pro_token(res):
+    reg = kv_registry()
+    kandidaten = []
+    if res["provider"] == "mlx-lokal":
+        basis = os.path.basename(res["modelRef"].rstrip("/"))
+        kandidaten.append(basis)
+        # Kleingeschrieben ZUSAETZLICH (2026-08-21): die Messstrecke traegt
+        # jeden Schluessel klein (siehe kv_ollama_kunstname() daneben,
+        # "':' wird auf '-' normalisiert" -- dieselbe Konvention), waehrend
+        # ein MLX-Ordnername selbst Grossbuchstaben tragen kann (Beispiel:
+        # 'Qwen3.8-27B-MTPLX-Optimized-Speed'). Ein reiner Exakt-Vergleich
+        # verfehlt den gemessenen Eintrag dann selbst bei identischem Namen --
+        # gefunden bei der Vorhersage-Ersetzung unten, wo genau dieser
+        # gemischtschreibige Koerperpfad jetzt ankommt.
+        if basis.lower() != basis:
+            kandidaten.append(basis.lower())
+    if res["provider"] == "ollama":
+        kunstname = kv_ollama_kunstname(reg, res["modelRef"])
+        if kunstname:
+            kandidaten.append(kunstname)
+    kandidaten += [res.get("alias"), res.get("id"), res["modelRef"]]
+    gesehen = set()
+    wert = quelle = None
+    for k in kandidaten:
+        if not k or k in gesehen:
+            continue
+        gesehen.add(k)
+        eintrag = reg.get(k)
+        if eintrag:
+            wert = float(eintrag["mib_je_token"])
+            quelle = "%s (wb-belegung kv, Schluessel '%s')" % (eintrag.get("herkunft", "?"), k)
+            break
+
+    # Architektur wird IMMER berechnet, wenn lesbar -- einmal, fuer die
+    # Vorgabe (falls kein Registry-Treffer) UND fuer die Plausibilitaetsschranke
+    # weiter unten (falls doch ein Treffer da war, siehe dort).
+    arch = kv_architektur(res)
+
+    if wert is None:
+        if arch:
+            arch_mib, arch_quelle, _ = arch
+            wert = arch_mib * SICHERHEITSFAKTOR
+            quelle = ("aus der Architektur hergeleitet (%s) x Sicherheitsfaktor %s"
+                      % (arch_quelle, zahl(SICHERHEITSFAKTOR, 1)))
+        else:
+            wert = KV_ANNAHME_BODEN * SICHERHEITSFAKTOR
+            quelle = ("Architektur nicht lesbar — Familien-Annahme (%d Lagen, %d KV-Koepfe, Kopfdim %d, "
+                      "8-Bit-Cache = %s MiB/Token) x Sicherheitsfaktor %s"
+                      % (ANNAHME_LAGEN, ANNAHME_KV_KOEPFE, ANNAHME_KOPFDIM,
+                         zahl(KV_ANNAHME_BODEN, 4), zahl(SICHERHEITSFAKTOR, 1)))
+
+    # Plausibilitaetsschranke (Anweisung des Nutzers 19.08.2026 abends): ein
+    # Wert -- gemessen, hergeleitet oder angenommen --, der fuer DIESE
+    # Architektur unmoeglich ist, wird nicht stillschweigend weitergerechnet.
+    # Braucht selbst lesbare Architekturdaten; sind die nicht lesbar, bleibt
+    # auch die Familien-Annahme oben ungeprueft (es gibt nichts, wogegen).
+    if arch:
+        obergrenze = arch[2]
+        if wert > obergrenze:
+            fail("KV-Bedarf %s MiB/Token fuer '%s' ist architektonisch unmoeglich (Obergrenze %s "
+                 "MiB/Token: alle Lagen, alle Koepfe, kein Quantisierungsgewinn angenommen) — "
+                 "verworfen statt stillschweigend benutzt. Herkunft des verworfenen Werts: %s"
+                 % (zahl(wert, 4), res["id"], zahl(obergrenze, 4), quelle))
+    return wert, quelle
+
+
+# --------------------------------------------------------------- freier Speicher
+
+def frei_mib():
+    p = run([os.path.join(BIN, "check-resources")])
+    if p.returncode != 0:
+        fail("check-resources lieferte keinen Speicherstand (Exit %s) — kein Ergebnis moeglich." % p.returncode)
+    try:
+        d = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        fail("check-resources lieferte kein lesbares JSON.")
+    return int(d["ram"]["free_mib"])
+
+
+# --------------------------------------------------------------- stufen/empfehlung
+
+def pruefe_denken(denken):
+    if denken not in DENK_AKTIV and denken != "off":
+        fail("--denken '%s' nicht verstanden — off, minimal, low, medium, high, xhigh oder max."
+             % denken)
+    return DENK_FAKTOR if denken in DENK_AKTIV else 1.0
+
+
+def parallel_vorgabe(res):
+    # KORRIGIERT (der Nutzer, 19.08.2026, nach dem ersten -- falschen -- Versuch
+    # dieses Befunds): decode-concurrency 4 ist eine KAPAZITAET des MLX-Servers,
+    # keine automatische Belegung. Ein einzelner Worker bucht seine EIGENE
+    # Sequenz (1x); vier Sequenzen entstehen nur, wenn wirklich vier Anfragen
+    # gleichzeitig laufen. Ohne Angabe bleibt 'parallel' deshalb IMMER 1, fuer
+    # jeden Provider -- 'parallel' ist die Antwort auf "wie viele Worker WILL
+    # ich gleichzeitig", die ein sachkundiger Aufrufer (pi-worker, das die
+    # laufenden Worker zaehlt) explizit mitgibt, kein Vorgabewert, der hier
+    # geraten wird.
+    return 1
+
+
+def denken_vorgabe(res):
+    # Ohne Angabe darf 'denken' nicht pauschal 'off' sein, aus demselben Grund
+    # (Pruefer-Befund B2): die Oberflaeche fragt ohne --denken und bekam
+    # dadurch eine Zahl, die im Betrieb nie eintrifft.
+    #
+    # Ein serverseitig ERZWUNGENES Denken (chatTemplateArgs.reasoning_effort,
+    # von wb-mlx-server unveraendert an den Server weitergereicht) gewinnt
+    # immer -- der Aufrufer kann es nicht abschalten, egal was er waehlt.
+    erzwungen = (res.get("chatTemplateArgs") or {}).get("reasoning_effort")
+    if erzwungen:
+        return erzwungen
+    # Sonst der reale Boden fuer jeden WORKER: derselbe Riegel wie in
+    # pi-worker ("fuer Worker muss Denken immer an sein, mindestens auf low").
+    # Ein lokales Modell, das hier ankommt, laeuft frueher oder spaeter als
+    # Worker -- nie als 'off'. 'off' als Vorgabe waere eine Zahl, die in der
+    # Praxis nie eintritt.
+    return "low"
+
+
+def plaetze_wirklich(res, tok, gewichte):
+    # Pruefer-Befund N7 (19.08.2026 abends): die alte 'plaetze'-Rechnung zog
+    # RESERVE_MIB (2 GiB, diese Datei -- ein kleiner Stoergroessen-Puffer, kein
+    # Ersatz fuer wb-belegungs eigene Buchfuehrung, siehe der Kommentar dort
+    # oben) von der Reserve ab, die der WIRKLICHE Waechter benutzt (6 GiB
+    # System-Reserve + 4 GiB Zuschlag, dazu das Buch der schon offenen
+    # Belegungen anderer Worker, das diese Datei gar nicht kennt) --
+    # "wb-kontext meldet plaetze 1, wb-belegung darf antwortet NEIN fuer
+    # dieselbe eine Sequenz". Fuer mlx-lokal (der einzige Provider, bei dem
+    # pi-worker ueberhaupt bei wb-belegung bucht -- Ollama-Worker bucht
+    # niemand dort) fragt diese Funktion deshalb den echten Waechter direkt,
+    # statt seine Zahlen nachzubilden: EINE Quelle, nicht zwei. Zwei kurze,
+    # ungebuchte `darf`-Anfragen (--abtastungen 1, keine Wartezeit -- schnell,
+    # aber eine einzelne Messung statt wb-belegungs sonst uebliche
+    # Mehrfachmessung; fuer eine reine Auskunftszahl wie 'plaetze' vertretbar)
+    # liefern: "verfuegbar_gib" (dieselbe Zahl, unabhaengig von der
+    # angefragten Groesse -- min(Grenze A, Grenze B), siehe entscheiden() in
+    # wb-belegung) und die Differenz von parallel=2 zu parallel=1 (der reine
+    # KV-Aufpreis EINER weiteren Sequenz bei dieser Stufe, nach wb-belegungs
+    # EIGENEM KV-Wert, der von wb-kontexts eigenem abweichen kann). Gibt None
+    # zurueck, wenn wb-belegung nicht antwortet -- der Aufrufer faellt dann auf
+    # die lokale Naeherung zurueck, statt ganz ohne Zahl dazustehen.
+    basis = os.path.basename(res["modelRef"].rstrip("/"))
+
+    def frage(parallel):
+        p = run([os.path.join(BIN, "wb-belegung"), "darf",
+                 "--gewichte-gb", str(gewichte), "--modell", basis,
+                 "--parallel", str(parallel), "--kontext", str(tok),
+                 "--abtastungen", "1", "--abstand", "0", "--json"])
+        try:
+            return json.loads(p.stdout)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    a1, a2 = frage(1), frage(2)
+    if not a1 or not a2 or a1.get("verfuegbar_gib") is None or a2.get("spitze_gib") is None:
+        return None
+    verfuegbar = a1["verfuegbar_gib"]
+    delta = a2["spitze_gib"] - a1["spitze_gib"]
+    if delta <= 0:
+        return None
+    return max(0, int((verfuegbar - a1["spitze_gib"]) // delta) + 1)
+
+
+def bedarf_wirklich(res, tok, gewichte, parallel):
+    # Zwei Formeln fuer dieselbe Zahl laufen auseinander (Nachtrag 21.08.2026,
+    # gemessen: wb-kontext sagte fuer 131072 Token "bedarfGib 24.08, passt:
+    # ja", wb-belegung verlangte beim echten Start 29,4 GiB und lehnte ab --
+    # der Unterschied ist genau der Zuschlag (Prompt-Cache/Spitzen-Puffer,
+    # zuschlag_herleiten() in wb-belegung), den diese Datei nie gefuehrt hat.
+    # "Die Oberflaeche sagt passt, der Start sagt nein" ist schlimmer als eine
+    # Zahl, die durchgehend zu gross waere -- eine freundlichere Auskunft als
+    # die Wirklichkeit fuehrt jeden in die Irre, der sich darauf verlaesst.
+    # Also NICHT die Formel nachbauen (dieselbe "eine Quelle, nicht zwei"-
+    # Linie wie bei plaetze_wirklich() oben, KV weiter oben und dem modelRef-
+    # Umbiegen in berechne()): wb-belegung ENTSCHEIDET ueber den Start, also
+    # kennt es die Zahl, nach der der Start wirklich geht. Anders als
+    # plaetze_wirklich() (zwei ungebuchte Anfragen bei festem parallel=1/2,
+    # um eine reine DELTA-Zahl zu gewinnen) reicht hier EINE Anfrage beim
+    # tatsaechlich angefragten 'parallel' -- "spitze_gib" und "ja" sind schon
+    # die fertige Antwort, keine Ableitung noetig. Gibt None zurueck, wenn
+    # wb-belegung nicht antwortet; der Aufrufer faellt dann auf die lokale
+    # Naeherung zurueck (siehe Kommentar dort), mit ihrer Herkunft klar
+    # benannt, statt so zu tun, als waere sie dieselbe Zahl.
+    basis = os.path.basename(res["modelRef"].rstrip("/"))
+    p = run([os.path.join(BIN, "wb-belegung"), "darf",
+             "--gewichte-gb", str(gewichte), "--modell", basis,
+             "--parallel", str(parallel), "--kontext", str(tok),
+             "--abtastungen", "1", "--abstand", "0", "--json"])
+    try:
+        antwort = json.loads(p.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if antwort.get("spitze_gib") is None or antwort.get("ja") is None:
+        return None
+    return antwort["spitze_gib"], bool(antwort["ja"]), antwort.get("grund")
+
+
+def berechne(modell, parallel=None, denken=None, entwerfer_gewichte_gb=0.0,
+             vorhersage_einstellung=None):
+    res = resolve(modell)
+    # BAUART "eingebaut" ERSETZT den Modellkoerper (Nachtrag 2026-08-21,
+    # Pruefer-Befund zu qwen38-27b/MTPLX): der Kommentar bei
+    # entwerfer_gewichte_gb weiter unten sagt das schon lange, aber bis heute
+    # RECHNETE diese Funktion trotzdem mit res["modelRef"] des ersetzten
+    # Ziel-Eintrags weiter -- Gewichte und KV-Schluessel eines Koerpers, der
+    # gar nicht laeuft. Die Quelle ist dieselbe, aus der wb-mlx-server sein
+    # MODEL_PATH-Umbiegen speist (siehe dort, cmd_ensure, "MODEL_PATH wird
+    # dabei auf vorh_modell umgebogen"): das Registry-Feld
+    # vorhersage.modell, hier schon in resolve() mitgelesen -- eine Quelle,
+    # nicht zwei. modelRef wird deshalb HIER, VOR jeder weiteren Rechnung,
+    # auf den wirklich laufenden Koerper umgebogen; natives_maximum(),
+    # gewichte_gb() und kv_mib_pro_token() sehen danach nur noch ihn, genau
+    # wie beim echten Start.
+    #
+    # ZWEI BEDINGUNGEN ENTSCHEIDEN ZUSAMMEN, NICHT EINE (Nachtrag 21.08.2026,
+    # Befund vom echten Doppelstart, direkt im Anschluss an den Fix oben):
+    # das Registry-Feld allein reicht nicht. Ob wb-code/pi-worker den
+    # Ersatzkoerper WIRKLICH anfordern, haengt zusaetzlich an einer Sitzungs-
+    # Einstellung (orchestratorVorhersage / workerVorhersage) -- gemessen
+    # stand die auf 'false' (Absicht, kein Versehen), waehrend diese Funktion
+    # trotzdem mit dem MTPLX-Koerper (19,83 GiB, q8-KV) rechnete, obwohl
+    # wirklich der schlichte Koerper lief (14,95 GiB, bf16-KV) -- vor diesem
+    # zweiten Fix war die Zahl zu niedrig, jetzt (nur Registry, ohne
+    # Einstellung) zu hoch; richtig ist sie erst, wenn BEIDE Bedingungen
+    # geprueft werden. `vorhersage_einstellung` ist der Name dieser Einstellung
+    # (vom Aufrufer mitgegeben -- wb-code kennt "orchestratorVorhersage",
+    # pi-worker "workerVorhersage"; wb-kontext selbst weiss nicht, in welcher
+    # Rolle es gerufen wird, deshalb nennt der Aufrufer den Namen). Gelesen
+    # wird sie ueber `einstellung_ist_an()`, DENSELBEN Weg, den wb-code/
+    # pi-worker fuer denselben Wert benutzen ("wb-state settings get
+    # <name>") -- keinen zweiten, eigenen Lesepfad fuer dieselbe Zahl.
+    # OHNE angegebenen Namen bleibt es beim sicheren Ausgangswert (KEIN
+    # Umbiegen): die Einstellung steht im Regelfall auf 'false', und ein
+    # Aufrufer, der den Namen nicht mitgibt (z.B. ein Mensch am Terminal),
+    # bekommt die Zahl fuer den Koerper, der ohne weitere Angabe wirklich
+    # startet -- kein Raten in die teurere Richtung.
+    #
+    # OFFEN, ERNEUT GEPRUEFT UND BEWUSST OFFEN GELASSEN (Nachtrag 21.08.2026,
+    # zweiter Pruefpass des Auftrags zu shell/wb-mlx-server -- derselbe
+    # Wechsel-Riegel-Auftrag stellt ausdruecklich frei, das hier zu schliessen
+    # ODER begruendet offen zu lassen; nur STILL offen lassen waere nicht
+    # erlaubt): wb-mlx-server waehlt ab einer Stromzahl (Registry-Feld
+    # buendelung.umschlagpunktStroeme -- 2 fuer qwen38-27b, Vorgabe sonst 3
+    # ueber MTPLX_UMSCHLAGPUNKT_STROEME -- UND davon abhaengig, ob der
+    # vllm-metal-Motor auf DIESER Maschine ueberhaupt ausfuehrbar ist: venv/
+    # bin/vllm oder ein vllm im PATH) den Buendelungsmotor STATT der
+    # Vorhersage und laesst MODEL_PATH dann beim urspruenglichen Ziel. Diese
+    # Funktion biegt unabhaengig von 'parallel' immer um, sobald Registry-Feld
+    # UND Einstellung beide an sind.
+    #
+    # WARUM NICHT GESCHLOSSEN: die Schwelle haengt nicht nur an einer
+    # Registry-Zahl, sondern zusaetzlich daran, ob ein externes Werkzeug
+    # (vllm) auf DIESER Maschine gerade ausfuehrbar ist -- eine Pruefung, die
+    # diese Datei bisher fuer nichts sonst macht (sie kennt Registry, KV-Buch,
+    # check-resources, wb-belegung, wb-state; keine Datei- oder PATH-Sonde
+    # auf ein Drittwerkzeug). Eine zweite Kopie der Schwelle OHNE diese Sonde
+    # waere selbst wieder eine Annahme und haette dasselbe Schicksal wie die
+    # 1,5 bei SICHERHEITSFAKTOR oben (veraltet lautlos, sobald die andere
+    # Datei sie verschiebt, siehe der Kommentar dort und Pruefer-Befund N6).
+    #
+    # AUSWIRKUNG, damit sie nicht verschwiegen bleibt: bei einem Aufruf mit
+    # 'parallel' AB dem Umschlagpunkt (typisch 2, ein zweiter gleichzeitiger
+    # qwen38-Worker) nimmt diese Funktion weiterhin den groesseren
+    # MTPLX-Koerper an, waehrend der echte Start dort auf die Buendelung mit
+    # dem KLEINEREN Ziel-Koerper umschaltet -- eine UEBERSCHAETZUNG (die
+    # sichere Richtung: eine Stufe kann dadurch faelschlich als "passt nicht"
+    # erscheinen, nie umgekehrt faelschlich als "passt"). Der Regelfall
+    # (paralell 1, der CLI-Vorgabewert und der von pi-worker fuer den ersten
+    # Worker berechnete Wert) ist davon nicht betroffen.
+    #
+    # WEG FUER EINE SPAETERE SPUR: wb-mlx-server bekaeme eine eigene, kleine
+    # Abfrage seiner wirksamen Motorwahl (z.B. `wb-mlx-server motor-fuer
+    # <modell> --parallel <n>`), die diese Funktion aufruft, statt die
+    # Verzweigung ein zweites Mal nachzubauen -- EINE Quelle bleibt dann auch
+    # hier die Linie, nicht zwei.
+    vorhersage = res.get("vorhersage") or {}
+    vorhersage_ersetzt_ziel = None
+    vorhersage_aktiv = bool(vorhersage_einstellung) and einstellung_ist_an(vorhersage_einstellung)
+    if (res["provider"] == "mlx-lokal" and vorhersage.get("bauart") == "eingebaut"
+            and vorhersage.get("modell") and vorhersage_aktiv):
+        vorhersage_ersetzt_ziel = res["modelRef"]
+        res = dict(res)
+        res["modelRef"] = vorhersage["modell"]
+    if parallel is None:
+        parallel = parallel_vorgabe(res)
+    if denken is None:
+        denken = denken_vorgabe(res)
+    denk_faktor = pruefe_denken(denken)
+    nmax, nmax_quelle = natives_maximum(res)
+    gewichte, gw_quelle = gewichte_gb(res)
+    # Multi-Token-Vorhersage (2026-08-20): laeuft ein EXTERNER Entwerfer neben
+    # dem Zielmodell (Registry-Feld vorhersage.bauart == 'entwerfer'), laedt
+    # der Server ihn ZUSAETZLICH -- diese Datei kennt davon nichts von sich
+    # aus (gewichte_gb() liest nur das Zielmodell), der Aufrufer (wb-code/
+    # pi-worker, die die Registry ohnehin schon lesen) gibt das Zusatzgewicht
+    # deshalb explizit mit. Ohne das wuerde 'passt'/'plaetze' zu grosszuegig
+    # rechnen, sobald Vorhersage an ist -- dieselbe "eine Quelle, nicht
+    # zwei"-Linie wie beim KV-Boden weiter oben. Bei 'bauart: eingebaut'
+    # bleibt dieser Wert 0: dort ERSETZT der groessere Modellkoerper das Ziel
+    # (eigener modelRef, kein Zusatzgewicht), keine Addition hier -- siehe
+    # das modelRef-Umbiegen ganz oben in dieser Funktion, das genau das jetzt
+    # wirklich tut.
+    if entwerfer_gewichte_gb:
+        gewichte += entwerfer_gewichte_gb
+        gw_quelle += " + %s GiB Entwerfer (Multi-Token-Vorhersage)" % zahl(entwerfer_gewichte_gb, 2)
+    kv, kv_quelle = kv_mib_pro_token(res)
+    frei = frei_mib()
+    stufen = []
+    for tok in stufen_liste(nmax):
+        # KEIN denk_faktor hier (Korrektur 19.08.2026 abends): tok ist schon
+        # die volle Fenstergroesse, kv schon der Byte-Bedarf JE Token-Feld --
+        # beide zusammen ergeben bereits den vollen Speicher fuer diese Stufe.
+        # denk_faktor auf diese Summe zu multiplizieren zaehlte "mehr Token
+        # wegen Denken" ein zweites Mal, obwohl tok das Fenster schon in
+        # voller Groesse einpreist -- siehe die Begruendung bei DENK_FAKTOR
+        # oben. Der Wert bleibt im Rueckgabe-/JSON-Feld "denkFaktor" sichtbar,
+        # zaehlt aber nicht mehr in die Bedarfsrechnung.
+        bedarf_gib = gewichte + parallel * tok * kv / MIB_JE_GIB
+        bedarf_quelle = "wb-kontext eigene Naeherung (ohne wb-belegungs Zuschlag/Prompt-Cache)"
+        bedarf_mib = bedarf_gib * MIB_JE_GIB
+        passt = bedarf_mib + RESERVE_MIB <= frei
+        wb_belegung_grund = None
+        # Die lokale Naeherung oben zaehlt keinen Zuschlag und keinen Prompt-
+        # Cache-Puffer (siehe bedarf_wirklich() fuer die Herleitung des
+        # Befunds) -- fuer mlx-lokal deshalb, wie schon bei 'plaetze', den
+        # echten Waechter fragen und dessen Zahl nehmen, wenn er antwortet.
+        if res["provider"] == "mlx-lokal":
+            echter_bedarf = bedarf_wirklich(res, tok, gewichte, parallel)
+            if echter_bedarf is not None:
+                bedarf_gib, passt, wb_belegung_grund = echter_bedarf
+                bedarf_quelle = "wb-belegung darf (spitze_gib, dieselbe Zahl wie beim echten Start)"
+        hinweis = None
+        if not passt:
+            # wb-belegungs EIGENE Erklaerung, wenn sie da ist (dieselbe, die
+            # der echte Start sehen wuerde) -- sonst die lokale Naeherung.
+            hinweis = wb_belegung_grund or (
+                "Braucht %s GiB (+ %s MiB Reserve), frei sind %s GiB — waehlbar, aber der "
+                "Start kann am Speicher scheitern."
+                % (zahl(bedarf_gib, 1), RESERVE_MIB, zahl(frei / MIB_JE_GIB, 1)))
+        # "plaetze": die Umkehrfrage zu 'parallel' (der Nutzer, 19.08.2026): bei
+        # DIESER Stufe, wie viele Worker passen insgesamt gleichzeitig in den
+        # gerade freien Speicher -- unabhaengig vom angefragten 'parallel'
+        # oben. Fuer mlx-lokal fragt plaetze_wirklich() den echten Waechter
+        # (wb-belegung) direkt (N7-Fix, siehe dort) -- nur wenn der nicht
+        # antwortet, oder fuer Ollama (wo pi-worker gar nicht bei wb-belegung
+        # bucht, siehe dort), gilt die lokale Naeherung: Gewichte zaehlen
+        # EINMAL (der Server laedt sie einmal), jeder Worker zusaetzlich nur
+        # seine eigene Sequenz -- dieselbe Rechnung wie bedarf_gib, nur nach n
+        # statt nach bedarf aufgeloest. Auch hier ohne denk_faktor, aus
+        # demselben Grund wie oben.
+        kv_je_worker_gib = tok * kv / MIB_JE_GIB
+        frei_gib_nutzbar = (frei - RESERVE_MIB) / MIB_JE_GIB
+        uebrig = frei_gib_nutzbar - gewichte
+        plaetze_naeherung = max(0, int(uebrig // kv_je_worker_gib)) if kv_je_worker_gib > 0 else 0
+        plaetze = plaetze_naeherung
+        if res["provider"] == "mlx-lokal":
+            echte_plaetze = plaetze_wirklich(res, tok, gewichte)
+            if echte_plaetze is not None:
+                plaetze = echte_plaetze
+        stufen.append({"tokens": tok, "label": label(tok), "bedarfGib": round(bedarf_gib, 2),
+                        "bedarfQuelle": bedarf_quelle,
+                        "passt": passt, "hinweis": hinweis, "plaetze": plaetze})
+    return {
+        "res": res, "nmax": nmax, "nmax_quelle": nmax_quelle,
+        "denken": denken, "denk_faktor": denk_faktor,
+        "gewichte": gewichte, "gw_quelle": gw_quelle,
+        "entwerfer_gewichte_gb": entwerfer_gewichte_gb,
+        "kv": kv, "kv_quelle": kv_quelle,
+        "frei": frei, "stufen": stufen, "parallel": parallel,
+        # Fuer die Anzeige (drucke_stufen): res["modelRef"] ist ab hier
+        # schon der ersetzte Koerper, falls vorhersage.bauart == "eingebaut"
+        # zugeschlagen hat -- diese beiden Felder sagen dem Leser, OB und
+        # WOFUER umgebogen wurde, ohne dass er das selbst nachschlagen muss.
+        "vorhersage_bauart": vorhersage.get("bauart"),
+        "vorhersage_ersetzt_ziel": vorhersage_ersetzt_ziel,
+    }
+
+
+def empfehlen(daten):
+    stufen, frei = daten["stufen"], daten["frei"]
+    passend = [s for s in stufen if s["passt"]]
+    if passend:
+        return max(passend, key=lambda s: s["tokens"]), None
+    kleinste = min(stufen, key=lambda s: s["tokens"])
+    grund = ("keine Stufe passt (Bedarf + %s MiB Reserve) in die %s MiB frei — kleinste Stufe %s "
+             "trotzdem gewaehlt." % (RESERVE_MIB, frei, kleinste["label"]))
+    return kleinste, grund
+
+
+# --------------------------------------------------------------- ensure
+
+@contextlib.contextmanager
+def pi_models_sperre():
+    # ECHTE Sperre ums ganze Lesen-Aendern-Schreiben (Pruefer-Befund B3,
+    # 19.08.2026): das erneute Einlesen unmittelbar vor dem Schreiben schuetzt
+    # NICHT vor einem Wettlauf -- es verkuerzt nur das Fenster, in dem zwei
+    # gleichzeitige Aufrufe sich gegenseitig ueberschreiben koennen (gemessen:
+    # 25 von 25 Laeufen verloren einen Schreiber). Eine echte Sperre schliesst
+    # das Fenster vollstaendig: ein zweiter Aufrufer wartet auf `flock`, statt
+    # gleichzeitig zu lesen. Verzeichnis-Sperre (eine eigene .lock-Datei,
+    # unabhaengig vom eigentlichen Inhalt) statt eine Sperre auf PI_MODELS
+    # selbst, damit ein Absturz zwischen Lesen und Schreiben die Sperrdatei nie
+    # mit halb geschriebenem JSON verwechselt.
+    d = os.path.dirname(PI_MODELS_LOCK)
+    os.makedirs(d, exist_ok=True)
+    fd = open(PI_MODELS_LOCK, "a+")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+
+
+def pi_models_lesen():
+    if not os.path.isfile(PI_MODELS):
+        return {"providers": {}}
+    with open(PI_MODELS) as f:
+        return json.load(f)
+
+
+def pi_models_schreiben(daten):
+    d = os.path.dirname(PI_MODELS)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".models.json.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(daten, f, indent=4, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, PI_MODELS)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    # Eine kaputte Datei nimmt pi kommentarlos uebel -- sofort neu einlesen und pruefen.
+    with open(PI_MODELS) as f:
+        json.load(f)
+
+
+def eintrag_setzen(provs, pname, basis_vorlage, modelref, stufe, name):
+    """Traegt <modelref> mit contextWindow=<stufe> im Provider <pname> ein (legt
+    ihn aus basis_vorlage an, falls er fehlt). Gemeinsam fuer ensure_ollama und
+    ensure_mlx, damit es nur EINE Stelle gibt, die in providers[...].models
+    schreibt."""
+    prov = provs.get(pname)
+    if not prov:
+        prov = {"baseUrl": basis_vorlage["baseUrl"], "api": basis_vorlage["api"],
+                 "apiKey": basis_vorlage["apiKey"],
+                 "compat": dict(basis_vorlage.get("compat", {})), "models": []}
+        provs[pname] = prov
+    prov.setdefault("models", [])
+    eintrag = next((m for m in prov["models"] if m.get("id") == modelref), None)
+    if eintrag:
+        eintrag["contextWindow"] = stufe
+    else:
+        prov["models"].append({"id": modelref, "name": name, "contextWindow": stufe})
+
+
+def ensure_ollama(modelref, stufe, lbl):
+    varname = "%s-%s" % (modelref, lbl)
+    if varname not in ollama_namen():
+        inhalt = "FROM %s\nPARAMETER num_ctx %d\n" % (modelref, stufe)
+        fd, pfad = tempfile.mkstemp(suffix=".Modelfile")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(inhalt)
+            cp = run(["ollama", "create", varname, "-f", pfad])
+            if cp.returncode != 0:
+                fail("'ollama create %s' fehlgeschlagen: %s"
+                     % (varname, (cp.stderr or cp.stdout).strip()))
+        finally:
+            try:
+                os.unlink(pfad)
+            except OSError:
+                pass
+    # ~/.pi/agent/models.json ist ausschliesslich wb-kontexts Sache (Nachtrag
+    # 2026-08-19, es der MLX-Spur abgenommen). Eine frisch gebrannte Variante
+    # braucht hier ihren eigenen Eintrag, sonst rechnet pi mit der falschen
+    # Fenstergroesse und die Kontextwache sieht eine falsche Auslastung -- das
+    # ist der Grund, warum diese Zahl gepflegt wird. Das ganze
+    # Lesen-Aendern-Schreiben steht unter EINER echten Sperre (pi_models_sperre,
+    # Pruefer-Befund B3) -- ein erneutes Einlesen allein schuetzt nicht vor
+    # zwei gleichzeitigen Aufrufen, siehe die Begruendung dort.
+    with pi_models_sperre():
+        daten = pi_models_lesen()
+        provs = daten.setdefault("providers", {})
+        ollama_basis = provs.get("ollama") or {
+            "baseUrl": "http://localhost:11434/v1", "api": "openai-completions",
+            "apiKey": "ollama", "compat": {"supportsDeveloperRole": False},
+        }
+        eintrag_setzen(provs, "ollama", ollama_basis, varname, stufe,
+                       "%s (%s ctx, wb-kontext)" % (varname, lbl))
+        pi_models_schreiben(daten)
+    print(varname)
+
+
+def ensure_mlx(modelref, stufe, lbl, bedient_als=""):
+    """`bedient_als` ist der Name, unter dem der laufende Server WIRKLICH antwortet
+    (Nachtrag 2026-08-21). Gebraucht wird er, seit der Betriebsmotor fuer
+    qwen38-27b mtplx ist: der Server meldet unter /v1/models ausschliesslich
+    "mtplx-qwen38-27b-optimized-speed" und weist jeden anderen Namen ab, waehrend
+    hier bisher der Registry-Pfad in pis Modell-Eintrag geschrieben wurde. Ein
+    fehlerfrei gestarteter Server, den sein einziger Aufrufer nicht ansprechen
+    kann -- gemessen am 21.08.
+
+    Der SCHLUESSEL bleibt der modelref: danach wird der Basis-Eintrag gesucht,
+    und danach findet ein spaeterer Aufruf denselben Eintrag wieder. Nur die
+    `id`, die pi als Modellnamen sendet, und die gedruckte erste Zeile tragen
+    den bedienten Namen. Leer heisst wie bisher: der modelref ist der Name."""
+    # Das ganze Lesen-Aendern-Schreiben steht unter EINER echten Sperre
+    # (pi_models_sperre, Pruefer-Befund B3, 19.08.2026) -- ein erneutes
+    # Einlesen unmittelbar vor dem Schreiben (die fruehere Fassung dieser
+    # Funktion) schuetzt NICHT vor einem Wettlauf, es verkuerzt nur das
+    # Fenster; gemessen verlor das 25 von 25 gleichzeitigen Laeufen einen
+    # Schreiber. Wichtig: die SPERRE muss auch den fruehen Kurzschluss
+    # ("passt schon", kein Schreiben) umschliessen, sonst liest dieser Zweig
+    # einen Zwischenstand, waehrend ein anderer Aufruf gerade schreibt.
+    with pi_models_sperre():
+        daten = pi_models_lesen()
+        provs = daten.setdefault("providers", {})
+        basis = provs.get("mlx-lokal")
+        # GESUCHT WIRD UNTER BEIDEN NAMEN (Nachtrag 2026-08-21), aus demselben
+        # Grund wie unten beim Stufen-Provider: seit die `id` der Name ist, den
+        # der Server wirklich bedient, kann derselbe Eintrag je nach Alter den
+        # modelRef ODER den bedienten Namen tragen. Wer nur nach dem modelRef
+        # sucht, findet einen umbenannten Eintrag nicht mehr wieder -- und legt
+        # dann still einen zweiten daneben, statt den vorhandenen zu erkennen.
+        gewuenschte_id = bedient_als or modelref
+        basis_eintrag = None
+        if basis:
+            for m in basis.get("models", []):
+                if m.get("id") in (modelref, gewuenschte_id):
+                    basis_eintrag = m
+                    break
+        # DER KURZSCHLUSS PRUEFT BEIDES, UND ER NENNT SEINEN PROVIDER
+        # (korrigiert 2026-08-21). Er sagt "es ist schon alles so, wie es sein
+        # soll, hier ist nichts zu schreiben". Damit dieser Satz stimmt, muessen
+        # ZWEI Dinge stimmen, nicht eines:
+        #
+        #   contextWindow == stufe   das Fenster, das die Sitzung gleich fahren will
+        #   id == der Name, den der Server WIRKLICH bedient
+        #
+        # Bis heute stand hier nur das erste. In ~/.pi/agent/models.json trug der
+        # Provider mlx-lokal einen Eintrag mit der id
+        # $HOME/AI/mlx-models/qwen38-27b-mlx-4bit und contextWindow 262144,
+        # waehrend der laufende Server ausschliesslich
+        # mtplx-qwen38-27b-optimized-speed bedient. Der Kurzschluss feuerte, gab
+        # den bedienten Namen als erste Zeile zurueck und liess den Eintrag mit
+        # der Pfad-id stehen: pi fragte danach den Provider mlx-lokal nach einem
+        # Modell, das dieser Provider gar nicht fuehrt.
+        #
+        # UND ER DRUCKT SEIN provider=. wb-code liest die Zeile
+        # (sed -n 's/^provider=//p') und laesst PIPROVIDER sonst auf dem
+        # Vorgabewert stehen -- auf diesem Pfad blieb der Provider also
+        # ungesetzt, waehrend das Modell schon den neuen Namen trug. Fuer den
+        # Basisprovider ist der gedruckte Wert derselbe wie die Vorgabe; gedruckt
+        # wird er trotzdem, weil eine Auskunft, die manchmal fehlt, schlimmer ist
+        # als eine, die manchmal ueberfluessig ist.
+        #
+        # WARUM NUR IM BASISPROVIDER GESUCHT WIRD und nicht auch in den
+        # mlx-lokal-<label>-Providern, in die diese Funktion ihre Eintraege
+        # schreibt: der Schreibweg unten gleicht bei JEDEM Aufruf ALLE Felder des
+        # Basis-Eintrags neu ab (siehe der lange Kommentar dort). Das ist kein
+        # Beiwerk -- die MLX-Spur traegt reasoning/thinkingLevelMap/
+        # compat.thinkingFormat in den Basis-Eintrag ein, und eine Kopie, die
+        # davon abgeschnitten ist, schaltet das Denken still ab. Ein Kurzschluss
+        # auf die Kopie wuerde genau diesen Abgleich ueberspringen und die Kopie
+        # lautlos veralten lassen. Der zweite Schreibvorgang ist billig, eine
+        # veraltete Kopie ist es nicht.
+        if (basis_eintrag
+                and basis_eintrag.get("contextWindow") == stufe
+                and basis_eintrag.get("id") == gewuenschte_id):
+            print(gewuenschte_id)
+            print("provider=mlx-lokal")
+            return
+        pname = "mlx-lokal-%s" % lbl
+        name_basis = os.path.basename(modelref.rstrip("/"))
+        if pname not in provs:
+            quelle = basis or {"baseUrl": "http://127.0.0.1:8080/v1", "api": "openai-completions",
+                                "apiKey": "mlx", "compat": {"supportsDeveloperRole": False}}
+            # Alle Felder des Basis-Providers uebernehmen, nicht nur baseUrl/api/
+            # apiKey/compat -- derselbe Grundsatz wie beim Modell-Eintrag unten,
+            # "models" wird neu aufgebaut.
+            provs[pname] = {k: copy.deepcopy(v) for k, v in quelle.items() if k != "models"}
+            provs[pname].setdefault("models", [])
+        prov = provs[pname]
+        prov.setdefault("models", [])
+        # Gesucht wird unter BEIDEN Namen: ein Eintrag aus der Zeit vor diesem
+        # Nachtrag traegt den modelref als id, ein neuer den bedienten Namen.
+        # Ohne das entstuende bei der Umstellung ein zweiter Eintrag daneben.
+        _namen = {modelref, gewuenschte_id}
+        idx = next((i for i, m in enumerate(prov["models"]) if m.get("id") in _namen), None)
+    # ALLE Felder des Original-Eintrags uebernehmen, nicht nur id/name/
+    # contextWindow (Nachtrag 2026-08-19, ausdrueckliche des Nutzers Vorgabe): die
+    # MLX-Spur traegt reasoning/thinkingLevelMap/compat.thinkingFormat/
+    # compat.chatTemplateKwargs in den Basis-Eintrag ein, damit --thinking bei
+    # einem lokalen Modell ueberhaupt wirkt. Eine Kopie, die nur die drei
+    # bekannten Felder mitnimmt, schaltet das Denken jedes Workers auf dieser
+    # Kopie STILL ab, ohne Fehlermeldung. Generisch fuer JEDES Feld, nicht als
+    # Aufzaehlung der heutigen Namen -- die naechste pi-Fassung bringt
+    # womoeglich weitere. Bei JEDEM Aufruf neu abgeglichen (nicht nur bei der
+    # ersten Anlage), sonst veraltet eine bestehende Kopie lautlos, sobald die
+    # MLX-Spur der Basis neue Felder hinzufuegt.
+        eintrag = copy.deepcopy(basis_eintrag) if basis_eintrag else {"id": modelref}
+        # Die id ist das, was pi als Modellnamen an den Server schickt -- also der
+        # Name, den der Server auch annimmt. Siehe der Docstring oben.
+        eintrag["id"] = gewuenschte_id
+        eintrag["name"] = "%s (%s ctx, wb-kontext)" % (name_basis, lbl)
+        eintrag["contextWindow"] = stufe
+        if idx is None:
+            prov["models"].append(eintrag)
+        else:
+            prov["models"][idx] = eintrag
+        pi_models_schreiben(daten)
+    print(gewuenschte_id)
+    print("provider=%s" % pname)
+
+
+# --------------------------------------------------------------- Ausgabe
+
+def drucke_stufen(daten, als_json):
+    res, empf, empf_grund = daten["res"], *empfehlen(daten)
+    if empf_grund:
+        print("HINWEIS: %s" % empf_grund, file=sys.stderr)
+    if als_json:
+        out = {
+            "modell": res["id"], "harness": res["harness"], "provider": res["provider"],
+            "modelRef": res["modelRef"], "nativesMaximum": daten["nmax"],
+            "freiMib": daten["frei"], "gewichteGb": round(daten["gewichte"], 2),
+            "entwerferGewichteGb": daten["entwerfer_gewichte_gb"],
+            "kvMibProToken": daten["kv"], "parallel": daten["parallel"],
+            "denken": daten["denken"], "denkFaktor": round(daten["denk_faktor"], 3),
+            "vorgabe": res.get("registryContextWindow"), "empfehlung": empf["tokens"],
+            "stufen": daten["stufen"],
+            # None/None ausser bei vorhersage.bauart == "eingebaut": dann steht
+            # hier die Bauart und der urspruenglich angefragte modelRef, den
+            # "modelRef" oben ersetzt hat (siehe berechne()).
+            "vorhersageBauart": daten["vorhersage_bauart"],
+            "vorhersageErsetztFuer": daten["vorhersage_ersetzt_ziel"],
+        }
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return
+    print("modell        : %s (harness %s, provider %s)" % (res["id"], res["harness"], res["provider"]))
+    print("modelRef      : %s" % res["modelRef"])
+    if daten["vorhersage_ersetzt_ziel"]:
+        print("vorhersage    : eingebaut -- Koerper ersetzt '%s' (siehe modelRef oben, das ist der wirklich "
+              "laufende Koerper)" % daten["vorhersage_ersetzt_ziel"])
+    print("natives Max.  : %s (Quelle: %s)" % (daten["nmax"], daten["nmax_quelle"]))
+    print("frei          : %s MiB" % daten["frei"])
+    print("Gewichte      : %s GiB (Quelle: %s)" % (zahl(daten["gewichte"], 2), daten["gw_quelle"]))
+    print("KV je Token   : %s MiB (Quelle: %s)" % (zahl(daten["kv"], 4), daten["kv_quelle"]))
+    print("Denken        : %s (Faktor %s)" % (daten["denken"], zahl(daten["denk_faktor"], 2)))
+    print("parallel      : %s   vorgabe: %s   empfehlung: %s"
+          % (daten["parallel"], res.get("registryContextWindow"), empf["tokens"]))
+    print("")
+    print("%-10s %-6s %-10s %-5s %-8s %s" % ("tokens", "label", "bedarfGib", "passt", "plaetze", "hinweis"))
+    for s in daten["stufen"]:
+        print("%-10s %-6s %-10s %-5s %-8s %s" % (
+            s["tokens"], s["label"], zahl(s["bedarfGib"], 2), "ja" if s["passt"] else "nein",
+            s["plaetze"], s["hinweis"] or ""))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="wb-kontext", add_help=True)
+    sub = p.add_subparsers(dest="befehl")
+
+    VORHERSAGE_HILFE = ("Name der Sitzungs-Einstellung, die entscheidet, ob "
+                         "vorhersage.bauart=eingebaut wirklich zuschlaegt "
+                         "(wb-code: orchestratorVorhersage, pi-worker: "
+                         "workerVorhersage) -- gelesen ueber 'wb-state settings "
+                         "get <name>', denselben Weg wie der Aufrufer. Ohne "
+                         "Angabe bleibt es beim schlichten Ziel-Koerper.")
+
+    p_s = sub.add_parser("stufen")
+    p_s.add_argument("modell")
+    p_s.add_argument("--parallel", type=int, default=None)
+    p_s.add_argument("--denken", default=None)
+    p_s.add_argument("--entwerfer-gewichte-gb", type=float, default=0.0)
+    p_s.add_argument("--vorhersage-einstellung", default=None, help=VORHERSAGE_HILFE)
+    p_s.add_argument("--json", action="store_true")
+
+    p_e = sub.add_parser("empfehlung")
+    p_e.add_argument("modell")
+    p_e.add_argument("--parallel", type=int, default=None)
+    p_e.add_argument("--denken", default=None)
+    p_e.add_argument("--entwerfer-gewichte-gb", type=float, default=0.0)
+    p_e.add_argument("--vorhersage-einstellung", default=None, help=VORHERSAGE_HILFE)
+
+    p_n = sub.add_parser("ensure")
+    p_n.add_argument("modell")
+    p_n.add_argument("stufe")
+    p_n.add_argument("--bedient-als", default="",
+                     help="der Name, unter dem der laufende Server WIRKLICH antwortet "
+                          "(wb-mlx-server ensure gibt ihn als 'modell=' auf stdout aus). "
+                          "Er wird die id in pis Modell-Eintrag und die erste gedruckte "
+                          "Zeile; gesucht wird weiterhin ueber den modelRef. Ohne Angabe "
+                          "bleibt es wie bisher beim modelRef.")
+
+    a = p.parse_args()
+    if not a.befehl:
+        p.print_help()
+        return 2
+
+    if a.befehl == "stufen":
+        if a.parallel is not None and a.parallel < 1:
+            fail("--parallel muss mindestens 1 sein.")
+        daten = berechne(a.modell, a.parallel, a.denken, a.entwerfer_gewichte_gb,
+                          a.vorhersage_einstellung)
+        drucke_stufen(daten, a.json)
+        return 0
+
+    if a.befehl == "empfehlung":
+        if a.parallel is not None and a.parallel < 1:
+            fail("--parallel muss mindestens 1 sein.")
+        daten = berechne(a.modell, a.parallel, a.denken, a.entwerfer_gewichte_gb,
+                          a.vorhersage_einstellung)
+        empf, grund = empfehlen(daten)
+        if grund:
+            print("HINWEIS: %s" % grund, file=sys.stderr)
+        print(empf["tokens"])
+        return 0
+
+    if a.befehl == "ensure":
+        res = resolve(a.modell)
+        nmax, _ = natives_maximum(res)
+        stufe = parse_stufe(a.stufe)
+        gueltig = stufen_liste(nmax)
+        if stufe not in gueltig:
+            fail("Stufe %d ist fuer '%s' keine gueltige Stufe (natives Maximum %d). Gueltig: %s"
+                 % (stufe, a.modell, nmax, ", ".join(label(t) for t in gueltig)))
+        lbl = label(stufe)
+        if res["provider"] == "ollama":
+            ensure_ollama(res["modelRef"], stufe, lbl)
+        elif res["provider"] == "mlx-lokal":
+            ensure_mlx(res["modelRef"], stufe, lbl, a.bedient_als)
+        else:
+            fail("ensure kennt Provider '%s' nicht (nur ollama, mlx-lokal)." % res["provider"])
+        return 0
+
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

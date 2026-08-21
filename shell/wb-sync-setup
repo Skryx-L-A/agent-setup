@@ -192,8 +192,17 @@ if [ -z "${WB_REPO:-}" ]; then
   fi
 fi
 
+# FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden der App am selben
+# Tag): keiner der ssh-Aufrufe dieser Datei trug bis heute `ConnectTimeout`
+# oder `BatchMode` -- eine unerreichbare Gegenmaschine liess `wb-sync-setup`
+# unbegrenzt an der TCP-Verbindung haengen, eine, die (anders als hier
+# vorgesehen) doch nach einem Passwort fragt, unbegrenzt an stdin. Dieselben
+# zwei Optionen wie in context-guard/wb-result/wb-ssh-worker, hier einmal
+# gebuendelt statt an sieben Aufrufstellen einzeln vergessen zu koennen.
+ssh_other() { ssh -o ConnectTimeout=8 -o BatchMode=yes "$OTHER" "$@"; }
+
 hash_local()  { [ -f "$HOME/$1" ] && shasum -a 256 "$HOME/$1" 2>/dev/null | cut -d' ' -f1 || echo MISSING; }
-hash_remote() { ssh "$OTHER" "test -f \$HOME/$1 && sha256sum \$HOME/$1 2>/dev/null | cut -d' ' -f1 || echo MISSING" 2>/dev/null; }
+hash_remote() { ssh_other "test -f \$HOME/$1 && sha256sum \$HOME/$1 2>/dev/null | cut -d' ' -f1 || echo MISSING" 2>/dev/null; }
 
 echo "Abgleich $SELF -> $OTHER"
 echo
@@ -223,7 +232,7 @@ manifest_local()  { # $1 = relativer Pfad
     | awk '{h=$1; sub(/^\.\//,"",$2); print $2"  "h}' | LC_ALL=C sort
 }
 manifest_remote() { # $1 = relativer Pfad
-  ssh "$OTHER" "cd \$HOME/$1 2>/dev/null && find . -type f ! -path './__pycache__/*' ! -name '*.pyc' -exec sha256sum {} + 2>/dev/null" 2>/dev/null \
+  ssh_other "cd \$HOME/$1 2>/dev/null && find . -type f ! -path './__pycache__/*' ! -name '*.pyc' -exec sha256sum {} + 2>/dev/null" 2>/dev/null \
     | awk '{h=$1; sub(/^\.\//,"",$2); print $2"  "h}' | LC_ALL=C sort
 }
 
@@ -293,21 +302,21 @@ echo "Uebertrage $n Posten nach $OTHER ..."
 # bricht ab — deshalb die +-Ersetzung, die bei leerem Array gar nichts einsetzt.
 for p in ${missing[@]+"${missing[@]}"} ${diffs[@]+"${diffs[@]}"}; do
   if [ -d "$HOME/$p" ]; then
-    ssh "$OTHER" "mkdir -p \$HOME/$p" 2>/dev/null
+    ssh_other "mkdir -p \$HOME/$p" 2>/dev/null
     scp -q -r "$HOME/$p/." "$OTHER:~/$p/" && echo "  ok  $p/"
   else
-    ssh "$OTHER" "mkdir -p \$(dirname \$HOME/$p)" 2>/dev/null
+    ssh_other "mkdir -p \$(dirname \$HOME/$p)" 2>/dev/null
     scp -q "$HOME/$p" "$OTHER:~/$p" && echo "  ok  $p"
-    case "$p" in .local/bin/*|*.sh) ssh "$OTHER" "chmod +x \$HOME/$p" 2>/dev/null ;; esac
+    case "$p" in .local/bin/*|*.sh) ssh_other "chmod +x \$HOME/$p" 2>/dev/null ;; esac
   fi
 done
 for e in ${remote_only_todo[@]+"${remote_only_todo[@]}"}; do
   rest="${e#*|}"; quelle="${rest%%|*}"; zielpfad="${rest#*|}"
-  ssh "$OTHER" "mkdir -p \$(dirname \$HOME/$zielpfad)" 2>/dev/null
+  ssh_other "mkdir -p \$(dirname \$HOME/$zielpfad)" 2>/dev/null
   scp -q "$WB_REPO/$quelle" "$OTHER:~/$zielpfad" || { echo "  FEHLER  $zielpfad"; continue; }
   # Ausfuehrungsrecht ausdruecklich setzen: scp uebertraegt den Modus nicht zuverlassig,
   # und eine Datei in ~/.local/bin ohne +x ist ein stiller Ausfall.
-  ssh "$OTHER" "chmod 755 \$HOME/$zielpfad" 2>/dev/null
+  ssh_other "chmod 755 \$HOME/$zielpfad" 2>/dev/null
   echo "  ok  $zielpfad  (nur dorthin, aus $quelle)"
 done
 echo

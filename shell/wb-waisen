@@ -343,8 +343,64 @@ launchd_job_laeuft() {
   printf '%s\n' "$aus" | grep -qE '^[[:space:]]*(pid = [0-9]+|state = running)'
 }
 
+# Dritte Eigentuemer-Art (2026-08-21, siehe wb-nohup --werkbank): der Starter
+# ist das Werkbank-Programm. Die Tatsachenfrage ist dieselbe wie beim Pane und
+# beim launchd-Job, nur an einen Prozess gestellt: LAEUFT er noch, und ist es
+# noch derselbe? Der zweite Teil ist kein Beiwerk -- eine PID wird
+# wiederverwendet, und ohne den `lstart`-Vergleich haette ein beliebiger neuer
+# Prozess mit derselben Nummer den Server unbefristet von dieser Pruefung
+# ausgenommen. Zusaetzlich muss er heissen wie die Oberflaeche; dieselbe
+# Schranke steht schon in `wb-nohup`, hier noch einmal, weil eine von Hand
+# geschriebene Registrierung diesen Weg sonst umginge.
+werkbank_laeuft() {
+  local pid="$1" erwartet="$2" cmd jetzt
+  [ -n "$pid" ] && [ "$pid" != "0" ] || return 1
+  cmd="$(ps -o command= -p "$pid" 2>/dev/null)"
+  [ -n "$cmd" ] || return 1
+  printf '%s\n' "$cmd" | grep -qiE 'electron|agent-workbench|Agent Workbench|Claude Workbench' || return 1
+  # LC_ALL=C aus demselben Grund wie ueberall sonst hier: `ps -o lstart=`
+  # formatiert nach LC_TIME, und ein Vergleich ueber zwei Umgebungen hinweg
+  # faellt sonst still aus.
+  jetzt="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)"
+  [ -n "$erwartet" ] || return 0
+  [ "$jetzt" = "$erwartet" ]
+}
+
+# Lebt noch EINER der eingetragenen Benutzer? (2026-08-21, nachmittags.)
+#
+# WARUM DIE FRAGE JETZT IM PLURAL STEHT, gemessen am selben Tag: Vier Sitzungen
+# benutzten EINEN Modellserver. Eingetragen war der Pane der zuletzt
+# gestarteten; genau die wurde zuerst geschlossen. Ergebnis: "Eigentuemer: Pane
+# %95 (tot)" -- eine Waisenmeldung fuer einen Server, an dem eine lebende
+# Sitzung hing. Wer danach handelt, beendet einen benutzten Server.
+#
+# Die Liste wird nicht gepflegt, sie wird BEFRAGT: ein toter Pane faellt hier
+# von selbst heraus, ohne dass ihn jemand austragen muesste. Genau deshalb
+# braucht es auch kein Austragen beim harten Sterben einer Sitzung.
+#
+# `$1` ist eine Liste "socket<TAB>pane" je Zeile (aus lade_eigentuemer). Gibt 0
+# zurueck, sobald einer lebt, und setzt LEBENDER_PANE auf ihn.
+LEBENDER_PANE=""
+ein_benutzer_lebt() {
+  local zeilen="$1" sock pane
+  LEBENDER_PANE=""
+  [ -n "$zeilen" ] || return 1
+  while IFS=$'\t' read -r sock pane; do
+    [ -n "$sock" ] && [ -n "$pane" ] || continue
+    if pane_ist_lebendig "$sock" "$pane"; then
+      LEBENDER_PANE="$pane"
+      return 0
+    fi
+  done <<EOF
+$zeilen
+EOF
+  return 1
+}
+
 # lade_eigentuemer <pid> -> setzt EIG_WORKER/EIG_PANE/EIG_SOCKET/
-# EIG_GESTARTET/EIG_NAME/EIG_LAUNCHD/EIG_BEFEHL, Rueckgabe 0 nur bei einem GUELTIGEN,
+# EIG_GESTARTET/EIG_NAME/EIG_LAUNCHD/EIG_WERKBANK/EIG_WERKBANK_LSTART/
+# EIG_BENUTZER/EIG_BEFEHL,
+# Rueckgabe 0 nur bei einem GUELTIGEN,
 # zu genau dieser PID passenden Eintrag (siehe „PID-Wiederverwendung" oben).
 lade_eigentuemer() {
   local pid="$1" f="$REGDIR/$1.json" jetzt ausgabe
@@ -368,19 +424,45 @@ if d.get("lstart_pruefwert") != lstart_jetzt:
     sys.exit(1)
 pane, socket_path = d.get("pane") or "", d.get("socket_path") or ""
 label = d.get("launchd_label") or ""
+werkbank = str(d.get("werkbank_pid") or "")
+if werkbank in ("0", "None"):
+    werkbank = ""
+werkbank_lstart = d.get("werkbank_lstart") or ""
 # Gueltig ist ein Eintrag mit Pane UND Socket -- oder einer mit launchd-Label
-# (zweite Eigentuemer-Art, siehe launchd_job_laeuft weiter oben).
-if not label and (not pane or not socket_path):
+# (zweite Eigentuemer-Art, siehe launchd_job_laeuft weiter oben) -- oder einer
+# mit einer Werkbank-PID (dritte Art, siehe werkbank_laeuft weiter oben).
+if not label and not werkbank and (not pane or not socket_path) and not d.get("benutzer"):
     sys.exit(1)
+# Die Benutzerliste (wb-nohup benutzer). Sie geht als eine Zeichenkette mit
+# Zeilen "socket<TAB>pane" mit; der Haupt-Pane steht vorn, damit die Meldung
+# ihn zuerst nennt, wenn er lebt.
+benutzer = d.get("benutzer")
+zeilen = []
+if pane and socket_path:
+    zeilen.append("%s\t%s" % (socket_path, pane))
+if isinstance(benutzer, list):
+    for b in benutzer:
+        if not isinstance(b, dict):
+            continue
+        bp, bs = b.get("pane") or "", b.get("socket_path") or ""
+        if bp and bs and "%s\t%s" % (bs, bp) not in zeilen:
+            zeilen.append("%s\t%s" % (bs, bp))
+# Newline geht nicht durch die '|'-Zeile -- deshalb mit ';' verbunden und
+# drueben zurueckuebersetzt.
+benutzerfeld = ";".join(zeilen)
 befehl = " ".join(d.get("befehl") or [])
 # befehl bleibt das LETZTE Feld -- er ist das einzige, das selbst ein '|'
 # enthalten kann, und `read` schiebt Ueberzaehliges in die letzte Variable.
-print("%s|%s|%s|%s|%s|%s|%s" % (d.get("worker") or "unbekannt", pane, socket_path,
-                                 d.get("gestartet") or "", d.get("name") or "", label, befehl))
+print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (d.get("worker") or "unbekannt", pane, socket_path,
+                                          d.get("gestartet") or "", d.get("name") or "", label,
+                                          werkbank, werkbank_lstart, benutzerfeld, befehl))
 PY
 )"
   [ -n "$ausgabe" ] || return 1
-  IFS='|' read -r EIG_WORKER EIG_PANE EIG_SOCKET EIG_GESTARTET EIG_NAME EIG_LAUNCHD EIG_BEFEHL <<< "$ausgabe"
+  IFS='|' read -r EIG_WORKER EIG_PANE EIG_SOCKET EIG_GESTARTET EIG_NAME EIG_LAUNCHD \
+      EIG_WERKBANK EIG_WERKBANK_LSTART EIG_BENUTZER EIG_BEFEHL <<< "$ausgabe"
+  # Aus ';' wird wieder eine Zeile je Benutzer.
+  EIG_BENUTZER="$(printf '%s' "$EIG_BENUTZER" | tr ';' '\n')"
   return 0
 }
 
@@ -440,24 +522,42 @@ WAISE_TOT_META=""
 UNREG_META=""
 while IFS='|' read -r pid rss etime kategorie cmd; do
   [ -n "$pid" ] || continue
-  # Ein Eintrag mit launchd-Label braucht kein tmux -- deshalb wird Weg A
-  # nur dann wegen fehlendem tmux uebersprungen, wenn der Eintrag wirklich
-  # einen Pane als Eigentuemer nennt (Pruefung unten, nach dem Laden).
+  # Ein Eintrag mit launchd-Label oder mit einer Werkbank-PID braucht kein
+  # tmux -- deshalb wird Weg A nur dann wegen fehlendem tmux uebersprungen,
+  # wenn der Eintrag wirklich einen Pane als Eigentuemer nennt (Pruefung
+  # unten, nach dem Laden; die beiden anderen Arten stehen davor).
   if lade_eigentuemer "$pid"; then
     if [ -n "$EIG_LAUNCHD" ]; then
       if launchd_job_laeuft "$EIG_LAUNCHD"; then
         continue   # Eigentuemer lebt -- kein Fund
       fi
       detail="Eigentuemer: launchd-Job '$EIG_LAUNCHD' (laeuft nicht) — gestartet $EIG_GESTARTET als '$EIG_NAME'"
+    elif [ -n "$EIG_WERKBANK" ]; then
+      if werkbank_laeuft "$EIG_WERKBANK" "$EIG_WERKBANK_LSTART"; then
+        continue   # Eigentuemer lebt -- kein Fund
+      fi
+      detail="Eigentuemer: Werkbank-Programm PID $EIG_WERKBANK (laeuft nicht mehr) — gestartet $EIG_GESTARTET als '$EIG_NAME'"
     elif [ -n "$TMUX_FEHLT" ]; then
       # tmux fehlt: der Pane ist nicht nachpruefbar, also wird hier NICHTS
       # behauptet -- der Kandidat faellt wie bisher auf Weg B zurueck.
       [ -n "$NUR_WAISEN" ] || UNREG_META="${UNREG_META}${pid}|${rss}|${etime}|${kategorie}|${cmd}"$'\n'
       continue
-    elif pane_ist_lebendig "$EIG_SOCKET" "$EIG_PANE"; then
-      continue   # Eigentuemer lebt -- kein Fund
+    elif ein_benutzer_lebt "$EIG_BENUTZER"; then
+      continue   # Mindestens einer der eingetragenen Benutzer lebt -- kein Fund
     else
-      detail="Eigentuemer: Worker '$EIG_WORKER', Pane $EIG_PANE (tot) — gestartet $EIG_GESTARTET als '$EIG_NAME'"
+      # KEIN EINGETRAGENER BENUTZER LEBT MEHR -> Fund.
+      #
+      # HIER WIRD NICHT NOCH EINE OFFENE VERBINDUNG GEGENGERECHNET, und das ist
+      # eine Entscheidung, keine Auslassung. Sie wird weiter unten gemessen und
+      # nimmt dem Fund seinen kill-Vorschlag ("benutzt — N offene
+      # ESTABLISHED-Verbindung(en)"), aber sie hebt ihn nicht auf. Zwei Gruende:
+      # eine solche Verbindung kann auch von etwas kommen, das selbst herrenlos
+      # ist (der Proxy etwa), und sie ist punktuell -- zwischen zwei Anfragen
+      # steht keine. Aus ihr "kein Fund" zu machen hiesse, den STILLEN Fehler zu
+      # bauen: kein Wort, waehrend 20 GiB herrenlos stehen. Die Liste der
+      # Benutzer hat einen Bezug zu einer Sitzung, eine Verbindung hat ihn nicht.
+      anzahl="$(printf '%s\n' "$EIG_BENUTZER" | grep -c . || true)"
+      detail="Eigentuemer: Worker '$EIG_WORKER', ${anzahl:-0} eingetragene(r) Benutzer, keiner lebt (zuletzt $EIG_PANE) — gestartet $EIG_GESTARTET als '$EIG_NAME'"
     fi
     WAISE_TOT_META="${WAISE_TOT_META}${pid}|${rss}|${etime}|${kategorie}|${cmd}|${detail}"$'\n'
   elif [ -z "$NUR_WAISEN" ]; then

@@ -26,11 +26,21 @@
 #   --log <pfad>       eigener Logpfad statt der Vorgabe
 #   --launchd <label>  Eigentuemer ist ein launchd-Job statt eines Panes
 #                      (auch ueber WB_EIGENTUEMER_LAUNCHD, siehe unten)
+#   --werkbank <pid>   Eigentuemer ist das Werkbank-Programm (auch ueber
+#                      WB_EIGENTUEMER_WERKBANK, siehe unten)
+#
+#   wb-nohup benutzer <pid> --pane <pane> --socket <pfad>
+#                      einen LEBENDEN Pane als Benutzer eines bereits
+#                      registrierten Prozesses eintragen (siehe unten).
+#                      `umschreiben` ist der aeltere Name desselben Befehls.
 #   --                 trennt wb-nohups eigene Optionen vom Befehl selbst
 #
-# Braucht einen tmux-Pane als Bezugspunkt ($TMUX gesetzt) -- ausserhalb eines
-# Workbench-Panes gibt es keinen Eigentuemer, den dieses Werkzeug festhalten
-# koennte, und ohne Pane waere die ganze Eintragung nur ein Attrappen-Eintrag.
+# Braucht einen nachpruefbaren Eigentuemer. Drei Arten kommen dafuer in Frage,
+# in dieser Reihenfolge: ein tmux-Pane ($TMUX/$TMUX_PANE, oder der von wb-code
+# gerettete unter WB_EIGENTUEMER_TMUX*), ein eigener launchd-Job (--launchd),
+# das Werkbank-Programm (--werkbank). Ohne eine davon gibt es keinen
+# Eigentuemer, den dieses Werkzeug festhalten koennte, und die ganze
+# Eintragung waere nur ein Attrappen-Eintrag.
 #
 # ZWEI HUERDEN FUER DIESEN WEG (Review 2026-08-13, S6, Entscheidung des
 # Orchestrators). Zuerst genuegte es, dass launchd das Label KENNT — damit
@@ -42,6 +52,18 @@
 # `agent-workbench.`; (2) der Job muss GERADE LAUFEN und seine PID muss ein
 # VORFAHRE dieses Aufrufs sein. Damit kann nur der Job selbst — ueber seine
 # eigene Prozesskette — sich als Eigentuemer eintragen lassen.
+#
+# DER PANE UEBERLEBT EIN `unset TMUX` NICHT VON SELBST (2026-08-21). `wb-code`
+# entfernt $TMUX und $TMUX_PANE gleich in seiner Zeile 52, damit es einen
+# frischen Client anhaengen kann. Alles, was danach kommt -- und dazu gehoert
+# `wb-mlx-server ensure` --, sieht deshalb keinen Pane mehr, auch wenn wb-code
+# selbst mitten in einem Workbench-Pane laeuft. Gemessen am 21.08. an des Nutzers
+# eigenem Fall: JEDER Start einer Sitzung mit lokalem Modell brach hier ab,
+# egal von wo. Deshalb liest dieses Werkzeug zusaetzlich
+# WB_EIGENTUEMER_TMUX/WB_EIGENTUEMER_TMUX_PANE -- dieselbe Eigentuemer-ART,
+# nur eine zweite Quelle, weil wb-code die beiden Werte vor seinem `unset`
+# dorthin rettet. Geglaubt wird auch das nicht: der genannte Pane muss LEBEN
+# (`#{pane_dead}` = 0), sonst zaehlt er nicht. Der reguläre $TMUX-Weg geht vor.
 #
 # ZWEITE EIGENTUEMER-ART: EIN LAUNCHD-JOB (2026-08-13). Mit dem
 # bedarfsweisen Modellserver-Proxy (wb-modell-proxy, gehalten von
@@ -55,6 +77,79 @@
 # (hat er eine PID)? Nein -> der Prozess dahinter ist eine Waise. Das ist
 # keine Aufweichung der Regel, sondern ihre zweite Auspraegung: ohne Pane
 # UND ohne Label bleibt es beim harten Nein darunter.
+#
+# DRITTE EIGENTUEMER-ART: DAS WERKBANK-PROGRAMM (2026-08-21). Startet die
+# Oberflaeche eine Sitzung ueber ihr Plus-Menue, laeuft `wb-code` als
+# abgeloestes KIND des Electron-Hauptprozesses -- ohne Pane, ohne launchd-Job,
+# und mit dem `unset` oben auch ohne geretteten Pane, denn die App hat keinen.
+# Ein Eigentuemer ist trotzdem da, und zwar ein besserer als beide: das
+# Programm selbst ist langlebig, eindeutig zu erkennen und am Leben pruefbar.
+# Es nennt sich ueber --werkbank <pid> oder WB_EIGENTUEMER_WERKBANK.
+#
+# GEPRUEFT WIRD WIE BEI LAUNCHD, UND AUS DEMSELBEN GRUND: eine mitgeschickte
+# PID ist eine Behauptung. Drei Huerden, alle gemessen statt geglaubt. (1) Der
+# Prozess muss LAUFEN -- ein Eigentuemer, den es nicht gibt, ist keiner. (2) Er
+# muss wie das Werkbank-Programm heissen; geprueft wird gegen dieselben Muster,
+# an denen `wb-mensch` die Oberflaeche als Ahnen erkennt (electron,
+# agent-workbench, Agent Workbench, Claude Workbench) -- ohne das liesse sich
+# jeder beliebige Dauerlaeufer als Eigentuemer eintragen, genau der Fall, der
+# beim launchd-Label mit com.apple.Finder schon einmal offenstand. (3) Er muss
+# ein VORFAHRE dieses Aufrufs sein. Damit kann nur die App selbst -- ueber ihre
+# eigene Prozesskette -- sich als Eigentuemer eintragen lassen; ein Agent, der
+# die PID in der Dokumentation liest und mitschickt, kann sich nicht unter den
+# Electron-Hauptprozess haengen.
+#
+# WAS PASSIERT, WENN DIE APP BEENDET WIRD: dasselbe wie bei einem toten Pane.
+# `wb-waisen` stellt dieselbe eine Tatsachenfrage -- laeuft dieser Prozess noch
+# und ist er noch derselbe (`lstart`-Pruefwert) -- und meldet den Server sonst
+# als Waise. Ein Eigentuemer, dessen Ende niemanden interessiert, waere keiner.
+#
+# EIN SERVER HAT MEHRERE BENUTZER (2026-08-21, nachmittags): `wb-nohup
+# benutzer <pid> --pane <pane> --socket <pfad>` (frueher `umschreiben`, der
+# Name gilt weiter).
+#
+# WARUM AUS DEM WECHSEL EIN DAZU WURDE, gemessen am selben Tag: Vier Sitzungen
+# benutzten EINEN Modellserver. Eingetragen war der Pane der zuletzt
+# gestarteten. Genau die wurde zuerst geschlossen -- und `wb-waisen` meldete
+# den Server als Waise, waehrend eine lebende Sitzung ihn benutzte. Wer nach
+# dieser Meldung handelt, beendet einen Server, an dem jemand haengt.
+#
+# Die Frage ist also nicht "wem gehoert er", sondern "benutzt ihn noch jemand".
+# Ein einzelner Eigentuemer kann sie nicht beantworten, sobald mehrere
+# Sitzungen sich einen Server teilen -- und das ist der Normalfall geworden.
+# Deshalb fuehrt die Registrierung jetzt eine LISTE von Benutzern: wer
+# dazukommt, traegt sich ein.
+#
+# AUSGETRAGEN WIRD NICHT, UND DAS IST ABSICHT. Ein Austragen muesste auch dann
+# passieren, wenn eine Sitzung hart stirbt -- und genau dann passiert es nicht.
+# Stattdessen zaehlt bei jeder Pruefung nur, was LEBT: ein toter Pane faellt von
+# selbst heraus, ohne dass ihn jemand entfernen muss. Dieselbe Tatsachenfrage
+# wie bisher, nur an mehrere gestellt.
+#
+# `pane`/`socket_path` bleiben zusaetzlich stehen und nennen den zuletzt
+# eingetragenen lebenden Benutzer. Sie sind der Ruecksprung fuer alles, was die
+# Liste noch nicht kennt.
+#
+# DER ALTE ABSATZ, weiterhin gueltig, weil er den ersten Eintrag erklaert:
+#
+# Warum es das braucht: ein Modellserver wird gestartet, BEVOR es die Sitzung
+# gibt, die ihn benutzt. `wb-code` legt seine tmux-Sitzung erst an, nachdem
+# `wb-mlx-server ensure` durch ist -- beim Start ist also nur ein vorlaeufiger
+# Eigentuemer da (die Hilfssession der Oberflaeche, oder die Oberflaeche
+# selbst). Der vorlaeufige ist nicht falsch, aber er ist der falsche auf Dauer:
+# die Hilfssession wird abgeraeumt, sobald die Zielsitzung steht, und danach
+# zeigt die Registrierung auf einen toten Pane. `wb-waisen` meldete den Server
+# dann als Waise, obwohl ihn eine laufende Sitzung gerade benutzt.
+#
+# Der richtige Eigentuemer ist der Pane der ZIELSITZUNG: er lebt genau so
+# lange wie das, was den Server braucht -- laenger als die Hilfssession, kuerzer
+# als die Oberflaeche. Deshalb schreibt `wb-code` die Registrierung um, sobald
+# seine Sitzung steht.
+#
+# GEPRUEFT WIRD AUCH HIER, NICHT GEGLAUBT: der neue Pane muss leben, die
+# Registrierung muss es geben, und ihr `lstart_pruefwert` muss noch zur PID
+# passen -- sonst beschriebe sie einen anderen, laengst ersetzten Prozess.
+# Geschrieben wird atomar (os.replace) wie ueberall sonst im Haus.
 #
 # Registrierung unter ~/.local/state/wb-nohup/eigentuemer/<pid>.json, EINE
 # Datei je PID: {pid, name, befehl, worker, pane, socket_path, log,
@@ -93,6 +188,97 @@ if [[ $# -eq 0 || "$1" == "-h" || "$1" == "--help" ]]; then
   exit 1
 fi
 
+# == Der Eigentuemer-Wechsel (siehe Kopfkommentar) =========================
+# Steht VOR der Namenspruefung, weil `umschreiben` kein Bezeichner ist, sondern
+# ein eigener Unterbefehl -- er startet nichts und schreibt nur die vorhandene
+# Registrierung um.
+if [ "$1" = "benutzer" ] || [ "$1" = "umschreiben" ]; then
+  shift
+  UPID="${1:-}"
+  [ $# -gt 0 ] && shift
+  UPANE=""; USOCK=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pane)   [ $# -ge 2 ] || { echo "wb-nohup umschreiben: --pane braucht einen Pane" >&2; exit 2; }
+                UPANE="$2"; shift 2 ;;
+      --socket) [ $# -ge 2 ] || { echo "wb-nohup umschreiben: --socket braucht einen Pfad" >&2; exit 2; }
+                USOCK="$2"; shift 2 ;;
+      *) echo "wb-nohup umschreiben: unbekannte Option '$1'" >&2; exit 2 ;;
+    esac
+  done
+  case "$UPID" in
+    ''|*[!0-9]*) echo "wb-nohup benutzer: erstes Argument ist die PID des Prozesses (bekommen: '${UPID:-nichts}')." >&2
+                 exit 2 ;;
+  esac
+  if [ -z "$UPANE" ] || [ -z "$USOCK" ]; then
+    echo "wb-nohup benutzer: --pane und --socket werden beide gebraucht." >&2
+    exit 2
+  fi
+  UREG="$HOME/.local/state/wb-nohup/eigentuemer/$UPID.json"
+  if [ ! -f "$UREG" ]; then
+    echo "wb-nohup benutzer: fuer PID $UPID gibt es keine Registrierung — nichts einzutragen." >&2
+    exit 1
+  fi
+  if [ "$(tmux -S "$USOCK" display -p -t "$UPANE" '#{pane_dead}' 2>/dev/null)" != "0" ]; then
+    echo "wb-nohup benutzer: Pane '$UPANE' auf '$USOCK' lebt nicht — ein toter Benutzer waere keiner." >&2
+    exit 2
+  fi
+  ULSTART="$(LC_ALL=C ps -o lstart= -p "$UPID" 2>/dev/null)"
+  if [ -z "$ULSTART" ]; then
+    echo "wb-nohup benutzer: PID $UPID laeuft nicht mehr — die Registrierung beschreibt eine Leiche." >&2
+    exit 1
+  fi
+  /usr/bin/python3 - "$UREG" "$UPANE" "$USOCK" "$ULSTART" <<'PY'
+import datetime, json, os, sys, tempfile
+reg, pane, sock, lstart = sys.argv[1:5]
+try:
+    d = json.load(open(reg))
+except Exception as e:
+    sys.stderr.write("wb-nohup benutzer: Registrierung nicht lesbar (%s)\n" % e)
+    sys.exit(1)
+# Der Pruefwert muss noch zur PID passen -- sonst beschreibt die Datei einen
+# anderen, laengst ersetzten Prozess, und wir wuerden einem Fremden einen
+# Eigentuemer verpassen.
+if d.get("lstart_pruefwert") != lstart:
+    sys.stderr.write("wb-nohup benutzer: die Registrierung gehoert zu einem anderen Prozess derselben PID.\n")
+    sys.exit(1)
+# DAZU, NICHT STATT (siehe Kopfkommentar). Derselbe Pane zweimal waere nur
+# Rauschen in der Liste; sonst bleibt jeder Eintrag stehen, auch der eines
+# laengst geschlossenen Panes -- er zaehlt bei der Pruefung ohnehin nicht mehr,
+# weil dort gefragt wird, ob er LEBT.
+benutzer = d.get("benutzer")
+if not isinstance(benutzer, list):
+    benutzer = []
+if not any(b.get("pane") == pane and b.get("socket_path") == sock
+           for b in benutzer if isinstance(b, dict)):
+    benutzer.append({
+        "pane": pane,
+        "socket_path": sock,
+        "seit": datetime.datetime.now().isoformat(timespec="seconds"),
+    })
+d["benutzer"] = benutzer
+# `pane`/`socket_path` nennen weiterhin den zuletzt eingetragenen Benutzer --
+# fuer alles, was die Liste noch nicht kennt.
+d["pane"] = pane
+d["socket_path"] = sock
+# Die vorlaeufigen Eigentuemer treten ab: ab jetzt zaehlen die Panes.
+d["launchd_label"] = ""
+d["werkbank_pid"] = 0
+d["werkbank_lstart"] = ""
+d["eigentuemer_gewechselt"] = True
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(reg))
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=2)
+os.replace(tmp, reg)
+PY
+  if [ $? -eq 0 ]; then
+    echo "wb-nohup: Pane $UPANE ist als Benutzer von PID $UPID eingetragen." >&2
+    exit 0
+  fi
+  echo "wb-nohup benutzer: der Eintrag hat nicht geklappt — die Registrierung bleibt, wie sie war." >&2
+  exit 1
+fi
+
 # Ein vergessener Name sah bisher aus wie eine unbekannte Option: der erste
 # Platz wird ungeprueft als Name genommen, und die Optionsschleife stolperte
 # dann ueber dessen Wert ("unbekannte Option '/pfad/zur/log'"). Die Meldung
@@ -107,6 +293,7 @@ NAME="$1"; shift
 WORKER=""
 LOG=""
 LAUNCHD_LABEL="${WB_EIGENTUEMER_LAUNCHD:-}"
+WERKBANK_PID="${WB_EIGENTUEMER_WERKBANK:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --worker) [ $# -ge 2 ] || { echo "wb-nohup: --worker braucht einen Namen" >&2; exit 2; }
@@ -115,6 +302,8 @@ while [ $# -gt 0 ]; do
               LOG="$2"; shift 2 ;;
     --launchd) [ $# -ge 2 ] || { echo "wb-nohup: --launchd braucht ein Label" >&2; exit 2; }
               LAUNCHD_LABEL="$2"; shift 2 ;;
+    --werkbank) [ $# -ge 2 ] || { echo "wb-nohup: --werkbank braucht eine PID" >&2; exit 2; }
+              WERKBANK_PID="$2"; shift 2 ;;
     --)       shift; break ;;
     *) echo "wb-nohup: unbekannte Option '$1' (Befehl braucht ein '--' davor)" >&2; exit 2 ;;
   esac
@@ -128,6 +317,16 @@ fi
 # Ist <pid> ein Vorfahre DIESES Aufrufs? Die Kette wird ueber ps -o ppid=
 # hochgelaufen; 64 Schritte sind mehr als jede reale Prozesstiefe und
 # schuetzen zugleich gegen einen Zyklus aus wiederverwendeten PIDs.
+# Lebt dieser Pane? Genau die Frage, die `wb-waisen` spaeter erneut stellt --
+# hier schon beim Eintragen, damit eine gerettete Pane-Angabe aus der Umgebung
+# nicht bloss behauptet, sondern nachgesehen ist.
+pane_lebt() {
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  [ "$(tmux -S "$1" display -p -t "$2" '#{pane_dead}' 2>/dev/null)" = "0" ]
+}
+
+WERKBANK_LSTART=""
+
 ist_vorfahre() {
   local ziel="$1" p="$$" schritte=0
   while [ -n "$p" ] && [ "$p" != "0" ] && [ "$schritte" -lt 64 ]; do
@@ -162,18 +361,62 @@ if [ -n "$LAUNCHD_LABEL" ]; then
   fi
   SOCKET_PATH=""
   PANE=""
+  WERKBANK_PID=""
   [ -n "$WORKER" ] || WORKER="launchd:$LAUNCHD_LABEL"
-elif [ -z "${TMUX:-}" ] || [ -z "${TMUX_PANE:-}" ]; then
-  echo "wb-nohup: braucht einen tmux-Pane als Bezugspunkt (kein \$TMUX/\$TMUX_PANE gesetzt) — ausserhalb eines Workbench-Panes gibt es keinen Eigentuemer, den es festhalten koennte." >&2
-  echo "wb-nohup: laeuft der Starter unter launchd, nennt er seinen Job: --launchd <label> (oder WB_EIGENTUEMER_LAUNCHD)." >&2
-  exit 2
-else
+elif [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+  # Ein echter Pane geht vor: er ist der genauere Eigentuemer, und eine geerbte
+  # Werkbank-PID darf ihn nicht verdraengen.
+  WERKBANK_PID=""
   SOCKET_PATH="${TMUX%%,*}"
   PANE="$TMUX_PANE"
   if [ -z "$WORKER" ]; then
     WORKER="$(tmux -S "$SOCKET_PATH" display -p -t "$PANE" '#{@wb_worker}' 2>/dev/null)"
     [ -n "$WORKER" ] || WORKER="unbekannt"
   fi
+elif [ -n "${WB_EIGENTUEMER_TMUX:-}" ] && [ -n "${WB_EIGENTUEMER_TMUX_PANE:-}" ] \
+     && pane_lebt "${WB_EIGENTUEMER_TMUX%%,*}" "$WB_EIGENTUEMER_TMUX_PANE"; then
+  # DER GERETTETE PANE (siehe Kopfkommentar). Dieselbe Eigentuemer-Art wie
+  # oben, nur aus einer zweiten Quelle: `wb-code` legt die beiden Werte hier
+  # ab, bevor es $TMUX und $TMUX_PANE entfernt. Der Pane muss LEBEN -- ein
+  # toter Pane ist genau das, was diese Pruefung sonst als Waise meldet, und
+  # er darf sich nicht ueber eine Umgebungsvariable am Leben behaupten.
+  WERKBANK_PID=""
+  SOCKET_PATH="${WB_EIGENTUEMER_TMUX%%,*}"
+  PANE="$WB_EIGENTUEMER_TMUX_PANE"
+  if [ -z "$WORKER" ]; then
+    WORKER="$(tmux -S "$SOCKET_PATH" display -p -t "$PANE" '#{@wb_worker}' 2>/dev/null)"
+    [ -n "$WORKER" ] || WORKER="unbekannt"
+  fi
+elif [ -n "$WERKBANK_PID" ]; then
+  # Eigentuemer ist das Werkbank-Programm (siehe Kopfkommentar). Drei Huerden,
+  # alle nachgesehen statt geglaubt.
+  case "$WERKBANK_PID" in
+    ''|*[!0-9]*) echo "wb-nohup: '$WERKBANK_PID' ist keine PID — als Werkbank-Eigentuemer wird eine Zahl gebraucht." >&2
+                 exit 2 ;;
+  esac
+  WERKBANK_CMD="$(ps -o command= -p "$WERKBANK_PID" 2>/dev/null)"
+  if [ -z "$WERKBANK_CMD" ]; then
+    echo "wb-nohup: der Werkbank-Prozess $WERKBANK_PID laeuft gerade nicht — ein Eigentuemer, den es nicht gibt, ist keiner." >&2
+    exit 2
+  fi
+  # Dieselben Muster, an denen `wb-mensch` die Oberflaeche als Ahnen erkennt.
+  if ! printf '%s\n' "$WERKBANK_CMD" | grep -qiE 'electron|agent-workbench|Agent Workbench|Claude Workbench'; then
+    echo "wb-nohup: PID $WERKBANK_PID sieht nicht wie das Werkbank-Programm aus — als Eigentuemer zaehlt nur die Oberflaeche selbst, sonst liesse sich jeder Dauerlaeufer eintragen." >&2
+    exit 2
+  fi
+  if ! ist_vorfahre "$WERKBANK_PID"; then
+    echo "wb-nohup: PID $WERKBANK_PID laeuft, dieser Aufruf stammt aber nicht aus ihrer Prozesskette — nur das Programm selbst darf sich als Eigentuemer eintragen." >&2
+    exit 2
+  fi
+  WERKBANK_LSTART="$(LC_ALL=C ps -o lstart= -p "$WERKBANK_PID" 2>/dev/null)"
+  SOCKET_PATH=""
+  PANE=""
+  [ -n "$WORKER" ] || WORKER="werkbank:$WERKBANK_PID"
+else
+  echo "wb-nohup: braucht einen tmux-Pane als Bezugspunkt (kein \$TMUX/\$TMUX_PANE gesetzt) — ausserhalb eines Workbench-Panes gibt es keinen Eigentuemer, den es festhalten koennte." >&2
+  echo "wb-nohup: laeuft der Starter unter launchd, nennt er seinen Job: --launchd <label> (oder WB_EIGENTUEMER_LAUNCHD)." >&2
+  echo "wb-nohup: ist der Starter das Werkbank-Programm, nennt es seine PID: --werkbank <pid> (oder WB_EIGENTUEMER_WERKBANK)." >&2
+  exit 2
 fi
 
 REGDIR="$HOME/.local/state/wb-nohup/eigentuemer"
@@ -199,10 +442,11 @@ LSTART="$(LC_ALL=C ps -o lstart= -p "$PID" 2>/dev/null)"
 REGFILE="$REGDIR/$PID.json"
 TMPFILE="$(mktemp "$REGDIR/.$PID.XXXXXX")" || { echo "wb-nohup: konnte keine temporaere Registrierungsdatei anlegen" >&2; TMPFILE=""; }
 if [ -n "$TMPFILE" ]; then
-  /usr/bin/python3 - "$TMPFILE" "$PID" "$NAME" "$WORKER" "$PANE" "$SOCKET_PATH" "$LOG" "$LSTART" "$LAUNCHD_LABEL" "$@" <<'PY'
+  /usr/bin/python3 - "$TMPFILE" "$PID" "$NAME" "$WORKER" "$PANE" "$SOCKET_PATH" "$LOG" "$LSTART" "$LAUNCHD_LABEL" "$WERKBANK_PID" "$WERKBANK_LSTART" "$@" <<'PY'
 import datetime, json, sys
-tmpfile, pid, name, worker, pane, socket_path, log, lstart, launchd_label = sys.argv[1:10]
-befehl = sys.argv[10:]
+(tmpfile, pid, name, worker, pane, socket_path, log, lstart, launchd_label,
+ werkbank_pid, werkbank_lstart) = sys.argv[1:12]
+befehl = sys.argv[12:]
 data = {
     "pid": int(pid),
     "name": name,
@@ -211,6 +455,17 @@ data = {
     "pane": pane,
     "socket_path": socket_path,
     "launchd_label": launchd_label,
+    # Dritte Eigentuemer-Art: die PID des Werkbank-Programms und ihr
+    # lstart-Pruefwert. Ohne den zweiten Wert wuerde eine wiederverwendete PID
+    # spaeter als lebender Eigentuemer durchgehen -- dieselbe Falle, gegen die
+    # `lstart_pruefwert` fuer den eigenen Prozess schuetzt.
+    "werkbank_pid": int(werkbank_pid) if werkbank_pid else 0,
+    "werkbank_lstart": werkbank_lstart,
+    # Die Benutzerliste (siehe Kopfkommentar). Der Pane, der beim Start da war,
+    # ist der erste Eintrag -- ohne ihn muesste `wb-waisen` zwei Formen kennen.
+    "benutzer": ([{"pane": pane, "socket_path": socket_path,
+                   "seit": datetime.datetime.now().isoformat(timespec="seconds")}]
+                 if pane and socket_path else []),
     "log": log,
     "gestartet": datetime.datetime.now().isoformat(timespec="seconds"),
     "lstart_pruefwert": lstart,
@@ -240,6 +495,8 @@ fi
 
 if [ -n "$LAUNCHD_LABEL" ]; then
   echo "wb-nohup: PID $PID gestartet (name=$NAME worker=$WORKER launchd=$LAUNCHD_LABEL), Protokoll: $LOG" >&2
+elif [ -n "$WERKBANK_PID" ] && [ -z "$PANE" ]; then
+  echo "wb-nohup: PID $PID gestartet (name=$NAME worker=$WORKER werkbank=$WERKBANK_PID), Protokoll: $LOG" >&2
 else
   echo "wb-nohup: PID $PID gestartet (name=$NAME worker=$WORKER pane=$PANE), Protokoll: $LOG" >&2
 fi

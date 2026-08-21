@@ -35,9 +35,31 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Der Vault selbst ist das Repo fuer "knowledge-vault" — darum als eigener Kandidat,
+# Der Vault selbst ist das Repo fuer den Wissensspeicher — darum als eigener Kandidat,
 # nicht nur ~/AI/*. Reihenfolge wird erst hier gesetzt, damit --vault sie mitbestimmt.
-SEARCH_ROOTS=("$HOME/AI" "$HOME/AI/Minecraft/Shader" "$VAULT")
+SEARCH_ROOTS=("$HOME/AI" "$VAULT")
+
+# Zusaetzliche Suchwurzeln kommen von AUSSEN, nie aus dem Repo. Welche Projekte auf dieser
+# einen Maschine liegen und wo, ist personenbezogen: ein hart geschriebener Pfad wandert mit
+# jeder Veroeffentlichung nach draussen und verraet ein Projekt, das niemanden angeht.
+# Gemessen am 2026-08-21: genau so stand hier ein privater Projektpfad und kam durch alle
+# sieben Tore des Veroeffentlichungswegs, weil keine Namenstabelle ihn kannte.
+# Quelle ist WB_STATUS_SUCHWURZELN (Doppelpunkt-getrennt) oder eine Datei mit einer Wurzel
+# je Zeile; Leerzeilen und Zeilen, die mit # beginnen, werden uebergangen.
+SUCHWURZELN_DATEI="${WB_STATUS_SUCHWURZELN_DATEI:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-workbench/status-suchwurzeln}"
+zusatzwurzeln_lesen() {
+  if [ -n "${WB_STATUS_SUCHWURZELN:-}" ]; then
+    printf '%s\n' "$WB_STATUS_SUCHWURZELN" | tr ':' '\n'
+  elif [ -f "$SUCHWURZELN_DATEI" ]; then
+    cat "$SUCHWURZELN_DATEI"
+  fi
+}
+while IFS= read -r wurzel; do
+  case "$wurzel" in ''|'#'*) continue ;; esac
+  # fuehrende Tilde ausschreiben, damit die Datei sie benutzen darf
+  case "$wurzel" in '~/'*) wurzel="$HOME/${wurzel#\~/}" ;; esac
+  SEARCH_ROOTS+=("$wurzel")
+done < <(zusatzwurzeln_lesen)
 
 SHARED_MD="$VAULT/10-global/shared-projects.md"
 if [ ! -f "$SHARED_MD" ]; then

@@ -1,7 +1,12 @@
 #!/bin/bash
 # pi-worker — prompt a PERMANENT local pi chat agent (always-visible pane).
 #
-#   pi-worker [--mensch] <name> <qwen|ornith|ornith9|grug|model-id> <workdir> <task...>
+#   pi-worker [--mensch] [--kontext <stufe|auto>] <name> <qwen|qwen38|ornith|ornith9|grug|model-id> <workdir> <task...>
+#
+# WB_MCP_VOLL=1 gibt einem Claude-Worker die volle MCP-Ausstattung. Ohne die
+# Variable bekommt er die knappe (nur basic-memory ueber HTTP) -- gemessen
+# 264 MiB weniger je Sitzung, weil der Browser-MCP wegfaellt, den ein Worker
+# fast nie benutzt.
 #
 # `--mensch` hebt den Effort-Deckel fuer DIESEN Start auf (2026-08-06). Es gilt
 # nur, wenn der Aufruf wirklich von einem Menschen kommt — geprueft von
@@ -22,6 +27,20 @@
 # mirrors it into the local grid — see wb-ssh-worker. Without --on nothing changes.
 set -u
 
+# Mindesthoehe eines Worker-Fensters/-Panes (Betriebsbefund 19.08.2026 abends,
+# der Nutzer, gemessen: alle vier Worker-Panes der Sitzung wb-AI standen auf
+# 184x1). Dieselbe Zahl wie shell/wb-workers-window:MIN_ZEILEN und
+# app/src/main/config.ts:184 (minPaneRows, Default 12) -- eine Entscheidung,
+# an drei Stellen wiederverwendet, nicht dreimal neu erfunden. Genug fuer
+# Status- und Eingabezeile plus ein paar Zeilen sichtbaren Verlauf, das
+# Mindeste, das die Absendepruefung braucht, um den Panebildschirm ueberhaupt
+# lesen zu koennen. Wird an ZWEI Stellen in dieser Datei gebraucht: vor dem
+# Split in ein bestehendes 'workers'-Fenster (das sonst mit "no space for a
+# new pane" scheitert, siehe dort) und unmittelbar vor dem Tippen eines
+# Auftrags (Riegel gegen eine falsche Fehlschlag-Meldung der
+# Absendepruefung).
+PI_WORKER_MIN_ZEILEN=12
+
 if [ "${1:-}" = "--on" ]; then
   ONMACHINE="${2:?Maschine (mac|peer)}"; shift 2
   case "$(uname -s)" in Darwin) SELF=mac ;; *) SELF=peer ;; esac
@@ -34,6 +53,16 @@ fi
 DOD=""
 if [ "${1:-}" = "--dod" ]; then
   DOD="${2:?--dod erwartet ein Fertig-Kriterium}"; shift 2
+fi
+
+# Kontextfenster fuer ein LOKALES Modell (wb-kontext, Auftrag B 2026-08-19,
+# 'auto' vereinheitlicht im Nachtrag 2 vom selben Tag). Sowohl OHNE Angabe als
+# auch mit 'auto' waehlt der Orchestrator automatisch, gemessen am freien
+# Speicher -- derselbe Wortsinn wie in wb-code, nur ohne dessen zusaetzlichen
+# Settings-Schritt (siehe unten am Punkt der Wahl selbst).
+KONTEXT_ARG=""
+if [ "${1:-}" = "--kontext" ]; then
+  KONTEXT_ARG="${2:?--kontext erwartet eine Stufe oder 'auto'}"; shift 2
 fi
 
 # ── Wer ruft hier? (2026-08-06) ───────────────────────────────────────────────
@@ -294,22 +323,58 @@ ALTSUBMIT_KEY=""
 # claude models accept an optional effort suffix: claude-haiku:low, claude-fable:medium …
 EFFORT="${MODEL#*:}"; [ "$EFFORT" = "$MODEL" ] && EFFORT=""
 MODEL="${MODEL%%:*}"
+# EFFORT_ID haelt die REGISTRY-Identitaet des Modells fest (Nachtrag 3,
+# 2026-08-19), fuer den Denkstufen-Deckel weiter unten -- getrennt von $MODEL,
+# weil $MODEL in diesem case gleich auf die rohe Ollama-ID/den MLX-Pfad
+# umgeschrieben wird und spaeter durch `wb-kontext ensure` noch einmal (auf die
+# gebrannte Variante). 'ornith-35b' etwa ist niemals gleich dem $MODEL-Wert
+# 'ornith:35b', den die Registry unter genau dieser ID fuehrt.
+EFFORT_ID=""
 case "$MODEL" in
-  qwen)    MODEL="qwen3.6:35b-a3b-coding-nvfp4" ;;
-  ornith)  MODEL="ornith:35b" ;;
-  ornith9) MODEL="ornith:9b" ;;
+  qwen)    EFFORT_ID="qwen3.6:35b-a3b-coding-nvfp4"; MODEL="qwen3.6:35b-a3b-coding-nvfp4" ;;
+  ornith)  EFFORT_ID="ornith-35b"; MODEL="ornith:35b" ;;
+  ornith9) EFFORT_ID="ornith-9b"; MODEL="ornith:9b" ;;
   grug)
     # Token-freier Default-Coder seit 2026-08-11 (Messung: MLX 4bit schlaegt
     # Ollama und llama.cpp auf beiden Achsen, siehe regeln/lokale-modelle.md).
     # Der Server wird bei Bedarf gestartet, nie dauerhaft gehalten (kein
     # LaunchAgent) — ein Worker gegen einen toten Server ist schlimmer als
-    # einer, der gar nicht startet, deshalb blockiert das hier synchron.
-    "$HOME/.local/bin/grug-server" ensure || {
-      echo "FEHLER: grug-server nicht bereit — pi-worker bricht ab, statt gegen einen toten Server zu starten." >&2
-      exit 1
-    }
+    # einer, der gar nicht startet.
+    #
+    # `grug-server ensure` steht NICHT mehr hier (Korrektur, Pruefer-Befund B7,
+    # 19.08.2026): mitten in der Modell-Fallunterscheidung gerufen, lange bevor
+    # der Kontextblock weiter unten die Stufe waehlt, bucht grug-server sein
+    # eigenes, davon unabhaengiges Kontextmass -- pi bekommt danach eine ANDERE
+    # Stufe gesagt, als tatsaechlich gebucht wurde. Der Aufruf wandert in den
+    # gemeinsamen Kontext-Block, genau wie beim qwen38-Zweig, ueber
+    # GRUG_VIA_SERVER (dasselbe Muster wie MLX_VIA_SERVER dort).
     PIPROVIDER=mlx-lokal
+    GRUG_VIA_SERVER=1
+    EFFORT_ID="grug-27b"
     MODEL="$HOME/AI/mlx-models/grug-27b-mlx-q4"
+    ;;
+  qwen38)
+    # Neuer Standard-Worker fuer lokale Arbeit seit 2026-08-19 (des Nutzers
+    # Entscheidung, GEMEINSAME-FAKTEN Nachtrag Punkt 6) — grug bleibt vollstaendig
+    # erhalten und waehlbar, verliert nur den Vorgabe-Rang. qwen3.8 teilt sich mit
+    # grug EINEN umschaltbaren MLX-Server (GEMEINSAME-FAKTEN Punkt 2); den
+    # verwaltet `wb-mlx-server` (wird in Auftrag A gebaut, nicht in diesem
+    # Arbeitsauftrag). Ein fehlendes Werkzeug ist ein klarer Fehler — nie ein
+    # stiller Rueckfall auf grug-server, das waere das FALSCHE Modell.
+    #
+    # Der eigentliche `ensure`-Aufruf steht NICHT hier, sondern erst im
+    # gemeinsamen Kontext-Block weiter unten, NACHDEM die Stufe feststeht:
+    # `wb-mlx-server ensure` OHNE --kontext nimmt das Modell-Maximum, und das
+    # lehnt wb-belegung fast immer ab (262144 Token x 4 parallel = 112 GiB
+    # Spitze) — Hinweis aus der MLX-Spur, 2026-08-19.
+    if [ ! -x "$HOME/.local/bin/wb-mlx-server" ]; then
+      echo "FEHLER: wb-mlx-server fehlt — qwen3.8 laeuft ueber den umschaltbaren MLX-Server, den dieses Werkzeug verwaltet (Auftrag A). Kein Rueckfall auf grug-server (falsches Modell)." >&2
+      exit 1
+    fi
+    PIPROVIDER=mlx-lokal
+    MLX_VIA_SERVER=1
+    EFFORT_ID="qwen38-27b"
+    MODEL="$HOME/AI/mlx-models/qwen38-27b-mlx-4bit"
     ;;
   claude|claude-sonnet|claude-sonnet5) ENGINE=claude; CMODEL="claude-sonnet-5" ;;
   claude-haiku|claude-haiku45)         ENGINE=claude; CMODEL="claude-haiku-4-5" ;;
@@ -355,21 +420,407 @@ case "$MODEL" in
     # Registry first, THEN the raw-Ollama-id passthrough: a model somebody took the
     # trouble to register must win over the same string happening to be installed in
     # Ollama — otherwise its harness, effort caps and role filter would be skipped.
-    if [ -n "$($HOME/.local/bin/wb-state models get "$MODEL" --field id 2>/dev/null || true)" ]; then
+    #
+    # EXCEPT harness=pi (Betriebsbefund 19.08.2026 abends, der Nutzer): ein
+    # LOKALES Modell unter seiner REGISTRY-KENNUNG statt seines Kurzalias
+    # ('qwen38-27b' statt 'qwen38' -- genau das, was die Oberflaeche in ihrer
+    # Modellliste zeigt und weiterreicht) landete bisher trotzdem bei
+    # ENGINE=registry -> wb-harness-run -> 'wb-state models resolve', und DAS
+    # kennt wb-kontext/wb-mlx-server nicht -- gemessen: die Zeile kam mit
+    # '--provider ollama --model <MLX-Verzeichnispfad>' heraus, derselbe
+    # Fehlerausgang wie in wb-code (400 "invalid model name"), nur ueber einen
+    # anderen Weg. Ein registriertes Modell MIT harness=pi gehoert stattdessen
+    # in denselben schnellen Pfad wie die Kurzaliase oben (ENGINE bleibt
+    # "pi") -- der kennt beides bereits richtig.
+    RHARNESS_PI="$($HOME/.local/bin/wb-state models get "$MODEL" --field harness 2>/dev/null || true)"
+    if [ "$RHARNESS_PI" = pi ]; then
+      RPROVIDER_PI="$($HOME/.local/bin/wb-state models get "$MODEL" --field provider 2>/dev/null || true)"
+      RMODELREF_PI="$($HOME/.local/bin/wb-state models get "$MODEL" --field modelRef 2>/dev/null || true)"
+      if [ -z "$RPROVIDER_PI" ] || [ -z "$RMODELREF_PI" ]; then
+        echo "FEHLER: Registry-Eintrag '$MODEL' hat harness=pi, aber kein provider/modelRef — kein Spawn." >&2
+        exit 1
+      fi
+      EFFORT_ID="$MODEL"
+      PIPROVIDER="$RPROVIDER_PI"
+      MODEL="$RMODELREF_PI"
+      # mlx-lokal laeuft ueber den umschaltbaren MLX-Server, wie der 'qwen38'-
+      # Kurzalias oben (grugs eigener grug-server-Weg ist eine benannte
+      # Ausnahme fuer GENAU dieses Modell, keine Vorgabe fuer jedes weitere
+      # mlx-lokal-Modell aus der Registry).
+      [ "$RPROVIDER_PI" = mlx-lokal ] && MLX_VIA_SERVER=1
+    elif [ -n "$($HOME/.local/bin/wb-state models get "$MODEL" --field id 2>/dev/null || true)" ]; then
       ENGINE=registry
     # A raw Ollama model id stays allowed (documented above), but only if it really
     # exists here — otherwise it is a typo and must not start anything.
     elif command -v ollama >/dev/null 2>&1 \
        && ollama list 2>/dev/null | awk 'NR>1{print $1; sub(/:.*/,"",$1); print $1}' | grep -qx "$MODEL"; then
-      : # installed locally, pass it through
+      EFFORT_ID="$MODEL"   # roh, unregistriert -- der Harness-Deckel greift trotzdem (siehe unten)
     else
       echo "FEHLER: unbekanntes Modell '$MODEL'." >&2
-      echo "  Lokal: qwen ornith ornith9 grug — oder eine installierte Ollama-ID ('ollama list')." >&2
+      echo "  Lokal: qwen qwen38 ornith ornith9 grug — oder eine installierte Ollama-ID ('ollama list')." >&2
       echo "  Claude: haiku45 sonnet5 opus5 opus48 fable5 (ueber claude-worker)." >&2
       echo "  Registriert: $($HOME/.local/bin/wb-state models list 2>/dev/null | tr '\n' ' ')" >&2
       exit 1
     fi ;;
 esac
+
+# ── Denkstufe fuer den SCHNELLEN pi-Pfad (Nachtrag 3, 2026-08-19) ─────────────
+# Bug, gemeldet vom Orchestrator: dieser Pfad gab bisher UEBERHAUPT kein
+# --thinking mit. $EFFORT wurde oben aus 'modell:stufe' geparst, aber danach
+# fallengelassen -- jeder lokale Worker lief mit dem, was Modell/pi von sich
+# aus waehlen. Bei qwen3.8 ist das die teure Falle: seine Chat-Vorlage setzt
+# reasoning_effort selbst auf xhigh, gemessen ueber 28 Minuten statt 62
+# Sekunden je Einheit (Faktor 27).
+#
+# Herkunft der Stufe: das ':stufe'-Suffix am Aufruf ($EFFORT, falls gesetzt),
+# sonst das defaultEffort des Modells aus der Registry. Entschieden wird das an
+# DERSELBEN Stelle wie fuer claude (`wb-state models effort` -- der Kommentar
+# "Welche Stufe wirklich gestartet wird, entscheidet EINE Stelle" im
+# claude-Zweig weiter unten erklaert, warum es nur diese eine Stelle gibt):
+# keine zweite Kopie der Deckel-Regel hier in bash. `${EFFORT_ID:-$MODEL}`
+# faellt auf den rohen Modellnamen zurueck, wenn keine Registry-Identitaet
+# bekannt ist (roher Ollama-Passthrough) -- `models effort` behandelt ein
+# unregistriertes Modell mit `--harness` bereits richtig (Harness-Stufenliste
+# minus 'max' als Deckel, siehe cmd_effort in wb-state).
+#
+# pis eigene Stufenleiter (`pi --help`): off, minimal, low, medium, high,
+# xhigh, max. Die Werkbank-Stufenleiter (BUILTIN_HARNESSES['pi']['effort'] in
+# wb-state) bildet genau die FUENF gemeinsamen Worte per Identitaet ab
+# (low->low, medium->medium, high->high, xhigh->xhigh, max->max) und laesst
+# 'off'/'minimal' bewusst aus -- "die Werkbank kennt keine Stufe unter low".
+# $THINKING kommt aus `models effort` deshalb schon im pi-Wortschatz zurueck,
+# keine weitere Umschreibung noetig.
+
+# ── Nebenlaeufigkeit gegen den GETEILTEN MLX-Server (Nachtrag 3, 2026-08-19,
+# Rechnung korrigiert vom Nutzer am selben Tag) ─────────────────────────────
+# grug und qwen38 laufen ueber EINEN gemeinsamen MLX-Server. decode-concurrency
+# 4 ist eine KAPAZITAET des Servers, keine automatische Buchung -- ein
+# einzelner Worker bucht seine eigene Sequenz, mehrere Worker addieren sich zu
+# der Zahl, die wirklich gleichzeitig laeuft. mlx_worker_anzahl() steht deshalb
+# HIER, vor der Kontextwahl: die automatische Stufenwahl unten zaehlt die
+# BEREITS laufenden lokalen Worker mit, statt so zu tun, als waere sie die
+# einzige (derselbe Zaehler traegt weiter unten auch die reine
+# Geschwindigkeits-Warnung ab decode-concurrency). Panes werden beim Spawn mit
+# @wb_lokal_provider markiert (siehe weiter unten) und hier MASCHINENWEIT
+# gezaehlt -- ueber alle wb-*-Sessions, nicht nur die eigene, weil der Server
+# sich nicht um Session-Grenzen schert.
+MLX_NEBENLAEUFIGKEIT_SUESSPUNKT=4
+mlx_worker_anzahl() {
+  tmux list-panes -a -F '#{@wb_lokal_provider} #{pane_dead}' 2>/dev/null \
+    | awk '$1=="mlx-lokal" && $2=="0"' | wc -l | tr -d ' '
+}
+# Prefix, nicht Gleichheit (Betriebsbefund 19.08.2026 abends): wb-kontext
+# ensure_mlx (Auftrag B) traegt einen MLX-Provider NIE als blankes "mlx-lokal"
+# in ~/.pi/agent/models.json ein, sondern IMMER mit Kontextstufen-Suffix
+# ("mlx-lokal-64k", "mlx-lokal-256k", ...) -- ein '=' gegen "mlx-lokal" trifft
+# das nie, sobald $PIPROVIDER (weiter unten, nach 'wb-kontext ensure') den
+# gebrannten Wert traegt. Vor 'wb-kontext ensure' ist der Wert dagegen noch
+# das blanke "mlx-lokal" (siehe die case-Aeste oben). Beide Formen muessen als
+# "das hier ist ein MLX-Modell" zaehlen -- der getaggte Pane-Wert selbst
+# bleibt bewusst das blanke "mlx-lokal" (mlx_worker_anzahl() zaehlt danach),
+# nur die Frage "ist es eins" wird hier auf den Praefix geprueft.
+ist_mlx_lokal() { case "$1" in mlx-lokal*) return 0 ;; *) return 1 ;; esac; }
+
+if [ "$ENGINE" = pi ]; then
+  # ── Denken-immer-an-Riegel fuer WORKER (Anweisung des Nutzers, 2026-08-19,
+  # woertlich: "fuer worker muss denken immer an sein, also mindestens auf
+  # low") ─────────────────────────────────────────────────────────────────
+  # Gemessen: der Arm OHNE Denken war der schnellste von allen, fiel bei der
+  # Zitat-Ablehnungsquote aber sofort auf das Niveau des schwaecheren Modells
+  # zurueck -- Denken ist bei diesen Modellen der WIRKSTOFF, nicht der
+  # Aufschlag. Ein WORKER (alles, was ueber pi-worker startet) bekommt deshalb
+  # nie 'off' oder 'minimal' -- die einzig realistische Quelle dafuer ist das
+  # ':stufe'-Suffix am Aufruf, denn die Registry-Vorgabe kennt beide Worte gar
+  # nicht (siehe die Denkstufen-Abbildung direkt oberhalb dieses Blocks). `wb-state models
+  # effort` LEHNT 'off'/'minimal' ohnehin als Eingabe ab ("unbekannter effort"
+  # -- gemessen), deshalb muss die Anhebung VOR diesem Aufruf stehen, nicht
+  # danach. Der Riegel steht bewusst HIER, an der Stelle, die einen WORKER
+  # startet -- nicht in wb-kontext und nicht in einer allgemeinen
+  # Abbildungstabelle: Messstrecken, Rauchtests und Probelaeufe laufen nicht
+  # ueber pi-worker und duerfen weiterhin ohne Denken fahren.
+  case "$EFFORT" in
+    off|minimal)
+      echo "pi-worker: Denkstufe '$EFFORT' auf 'low' angehoben — ein Worker startet nie ohne Denken (Denken ist bei diesen Modellen der Wirkstoff, nicht der Aufschlag)." >&2
+      EFFORT=low
+      ;;
+  esac
+  EFF_OUT="$($HOME/.local/bin/wb-state models effort "${EFFORT_ID:-$MODEL}" --harness pi \
+              ${EFFORT:+--effort "$EFFORT"} ${MENSCH:+--mensch} 2>&1)" || {
+    printf '%s\n' "$EFF_OUT" >&2
+    exit 1
+  }
+  THINKING="$(printf '%s\n' "$EFF_OUT" | tail -1)"
+  VOR="$(printf '%s\n' "$EFF_OUT" | sed '$d')"
+  [ -n "$VOR" ] && printf '%s\n' "$VOR" >&2
+  # Gegenprobe (billig, deckt jeden kuenftigen Weg ab, der doch einmal
+  # off/minimal zurueckgibt): derselbe Riegel, diesmal auf das ERGEBNIS.
+  case "$THINKING" in
+    off|minimal)
+      echo "pi-worker: Denkstufe '$THINKING' auf 'low' angehoben — ein Worker startet nie ohne Denken." >&2
+      THINKING=low
+      ;;
+  esac
+
+  # ── Multi-Token-Vorhersage (2026-08-20, Vorgaben des Nutzers) ────────────────
+  # Getrennter Schalter fuer WORKER ('workerVorhersage', nicht
+  # 'orchestratorVorhersage' -- siehe shell/wb-code fuer den Orchestrator-
+  # Zweig derselben Sache). WELCHES Modell dabei benutzt wird, steht in der
+  # Registry und ist hier nicht waehlbar. EFFORT_ID traegt an dieser Stelle
+  # schon die Registry-Kennung (oben im case-Block gesetzt, derselbe Wert,
+  # den die Denkstufen-Deckelung weiter oben schon benutzt) -- kein zweiter
+  # Alias-Uebersetzer noetig.
+  VORH_BAUART=""; VORH_MODELL=""; VORH_GEWICHTE_GB=""
+  VORH_AN="$($HOME/.local/bin/wb-state settings get workerVorhersage 2>/dev/null || true)"
+  if [ "$VORH_AN" = "true" ] && ist_mlx_lokal "$PIPROVIDER"; then
+    VORH_JSON="$($HOME/.local/bin/wb-state models get "${EFFORT_ID:-$MODEL}" --field vorhersage 2>/dev/null || true)"
+    if [ -n "$VORH_JSON" ]; then
+      VORH_BAUART="$(printf '%s' "$VORH_JSON" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("bauart") or "")
+except Exception:
+    print("")' 2>/dev/null)"
+      VORH_MODELL="$(printf '%s' "$VORH_JSON" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("modell") or "")
+except Exception:
+    print("")' 2>/dev/null)"
+      VORH_GEWICHTE_GB="$(printf '%s' "$VORH_JSON" | python3 -c 'import json,sys
+try:
+    v = json.load(sys.stdin).get("gewichteGb")
+    print(v if v is not None else "")
+except Exception:
+    print("")' 2>/dev/null)"
+    fi
+    if [ -n "$VORH_BAUART" ]; then
+      echo "pi-worker: Multi-Token-Vorhersage an ($VORH_BAUART: $VORH_MODELL)." >&2
+    else
+      echo "pi-worker: Multi-Token-Vorhersage an, aber fuer '${EFFORT_ID:-$MODEL}' nichts in der Registry hinterlegt." >&2
+    fi
+  fi
+  ENTWERFER_ARGS=()
+  if [ "$VORH_BAUART" = entwerfer ] && [ -n "$VORH_GEWICHTE_GB" ]; then
+    ENTWERFER_ARGS=(--entwerfer-gewichte-gb "$VORH_GEWICHTE_GB")
+  fi
+
+  # ── Kontextfenster (wb-kontext, Auftrag B 2026-08-19) ─────────────────────────
+  # Gilt nur fuer ein LOKALES Modell (ENGINE bleibt hier "pi" -- claude und ein
+  # registrierter Adapter haben kein waehlbares Kontextfenster in diesem Sinn).
+  # EIN Aufruf von `wb-kontext stufen --json` liefert Empfehlung UND deren
+  # Passt-Status zusammen -- keine zweite Messung noetig. `--denken "$THINKING"`
+  # (Nachtrag 3): eine hoehere Denkstufe braucht bei GLEICHER Aufgabe spuerbar
+  # mehr Ausgabe-Token, und die belegen KV genauso wie Prompt-Token -- Herleitung
+  # steht als Kommentar in wb-kontext bei DENK_FAKTOR.
+  # 'parallel' zaehlt hier die bereits laufenden MLX-Worker mit + diesen einen
+  # (Korrektur, 19.08.2026): "ich will N Worker gleichzeitig -- wie gross darf
+  # das Fenster je Worker sein" ist die Frage, die wb-kontext beantwortet, und
+  # pi-worker ist der sachkundige Aufrufer, der N wirklich kennt. Fuer Ollama
+  # bleibt es bei 1 -- kein geteilter Server, jeder Ollama-Worker ist fuer sich.
+  KPARALLEL=1
+  ist_mlx_lokal "$PIPROVIDER" && KPARALLEL=$(( $(mlx_worker_anzahl) + 1 ))
+  KWARN="$(mktemp "${TMPDIR:-/tmp}/pi-worker-kontext.XXXXXX")"
+  # "${ENTWERFER_ARGS[@]+"${ENTWERFER_ARGS[@]}"}", nicht "${ENTWERFER_ARGS[@]}":
+  # auf macOS' Bash 3.2 wirft ein LEERES Array unter 'set -u' sonst "unbound
+  # variable" (gemessen, 20.08.2026) -- das Array selbst IST deklariert, nur
+  # ohne Elemente. Der naheliegende Ausweg "${ARR[@]:-}" ist selbst falsch:
+  # er ersetzt ein leeres Array durch EIN leeres Wort statt durch NULL
+  # Woerter, und wb-kontexts argparse lehnt das dann als "unrecognized
+  # arguments" ab (ebenfalls gemessen) -- dieser Weg mit '+' liefert bei
+  # einem leeren Array wirklich null Woerter.
+  # --vorhersage-einstellung workerVorhersage (Nachtrag 21.08.2026, Befund vom
+  # echten Doppelstart in wb-code): 'eingebaut' liest die Registry SELBST
+  # (wb-kontext resolve()), anders als 'entwerfer' oben also NICHT ueber
+  # VORH_BAUART/ENTWERFER_ARGS gegen $VORH_AN abgesichert. Ohne diese Zeile
+  # rechnete wb-kontext den MTPLX-Koerper, selbst wenn $VORH_AN hier oben
+  # "false" war und der schlichte Koerper startet -- wb-kontext liest
+  # dieselbe Einstellung selbst nach, denselben Weg wie oben ("wb-state
+  # settings get workerVorhersage").
+  KJSON="$("$HOME/.local/bin/wb-kontext" stufen "$MODEL" --parallel "$KPARALLEL" --denken "$THINKING" --vorhersage-einstellung workerVorhersage "${ENTWERFER_ARGS[@]+"${ENTWERFER_ARGS[@]}"}" --json 2>"$KWARN")"
+  KRC=$?
+  KHINWEIS="$(cat "$KWARN" 2>/dev/null)"; rm -f "$KWARN"
+  if [ "$KRC" -ne 0 ] || [ -z "$KJSON" ]; then
+    [ -n "$KHINWEIS" ] && echo "$KHINWEIS" >&2
+    echo "FEHLER: Kontextstufen fuer '$MODEL' nicht zu ermitteln — kein Spawn." >&2
+    exit 1
+  fi
+  case "$KONTEXT_ARG" in
+    ""|auto)
+      # 'auto' heisst ueberall dasselbe wie kein Schalter (Vereinheitlichung,
+      # Nachtrag 2 vom 2026-08-19 -- zuvor bedeutete 'auto' hier faelschlich die
+      # Registry-Vorgabe/das Modell-Maximum, in wb-code aber schon die Automatik;
+      # ein Wort mit zwei Bedeutungen in zwei Werkzeugen war ein Fehler, kein
+      # Geschmack). Anders als in wb-code gibt es hier KEINEN Settings-Schritt:
+      # ueber das Fenster eines WORKERS entscheidet der Orchestrator, nicht die
+      # Einstellungsdatei eines Menschen, die es fuer einen Worker gar nicht gibt.
+      STUFE="$(printf '%s' "$KJSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["empfehlung"])')"
+      PASST="$(printf '%s' "$KJSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+s = next((x for x in d["stufen"] if x["tokens"] == d["empfehlung"]), None)
+sys.stdout.write("ja" if (s and s["passt"]) else "nein")')"
+      if [ "$PASST" != ja ]; then
+        # Reicht es fuer KEINE Stufe mehr, bricht der Spawn ab, statt die
+        # Maschine an den Rand zu fahren (Kernel-Panik-Historie 11.08.2026).
+        echo "FEHLER: fuer '$MODEL' passt nach dem freien Speicher nicht einmal die kleinste Kontextstufe — kein Spawn." >&2
+        [ -n "$KHINWEIS" ] && echo "  $KHINWEIS" >&2
+        echo "  Speicherstand: wb-kontext stufen $MODEL" >&2
+        exit 1
+      fi
+      echo "pi-worker: Kontext automatisch gewaehlt (freier Speicher) — $STUFE Token." >&2
+      ;;
+    *)
+      STUFE="$KONTEXT_ARG"
+      ;;
+  esac
+  # Der wirklich laufende KOERPER, fuer den KV-Schluessel weiter unten (Auftrag
+  # 2026-08-21 abends, Befund "Namensverwechslung"): $MODEL wird gleich durch
+  # 'wb-kontext ensure' auf den Namen umgeschrieben, den PI ALS MODELL BEKOMMT
+  # (siehe unten, --bedient-als) -- das kann seit heute Abend der BEDIENTE
+  # Servername sein ("mtplx-qwen38-27b-optimized-speed"), nicht mehr zwingend
+  # ein Pfad. Der KV-Schluessel braucht etwas anderes: den Verzeichnisnamen
+  # des Koerpers, der WIRKLICH geladen ist. Bei bauart "eingebaut" ersetzt
+  # vorhersage.modell (VORH_MODELL, oben schon gelesen) den Registry-Koerper --
+  # dieselbe Ersetzung wie in wb-kontexts eigenem berechne() (siehe dort,
+  # Nachtrag 2026-08-21): EINE Quelle, nicht zwei. Vor 'wb-kontext ensure'
+  # erfasst, weil der Aufruf $MODEL gleich ueberschreibt.
+  KOERPER_PFAD="$MODEL"
+  if [ "$VORH_BAUART" = eingebaut ] && [ -n "$VORH_MODELL" ]; then
+    KOERPER_PFAD="$VORH_MODELL"
+  fi
+  # qwen38 laeuft ueber den umschaltbaren MLX-Server, NIE ohne --kontext (sonst
+  # nimmt es das Modell-Maximum, und das lehnt wb-belegung fast immer ab: 262144
+  # Token x 4 parallel = 112 GiB Spitze). wb-mlx-server gibt dafuer aber KEINE
+  # provider-Zeile aus -- ~/.pi/agent/models.json bleibt ausschliesslich Sache
+  # von wb-kontext (Nachtrag 2026-08-19), dessen ensure deshalb IMMER laeuft,
+  # zusaetzlich zu wb-mlx-server bei qwen38.
+  MLXBEDIENT=""
+  if [ -n "${MLX_VIA_SERVER:-}" ]; then
+    # Durchreichung an den Server (Auftrag 2026-08-20, Punkt 3): shell/wb-mlx-
+    # server ist nicht meine Datei und kennt heute noch kein eigenes CLI-Flag
+    # dafuer -- Uebergabe ueber Umgebungsvariablen, nach demselben Muster wie
+    # WB_MLX_SERVER_DECODE_PARALLEL/_VORGABE/_OHNE_BELEGUNG (siehe wb-code fuer
+    # denselben Vorschlag auf der Orchestrator-Seite). Nur per Praefix
+    # gesetzt, kein Leck in den pi-Prozess.
+    #
+    # DIE AUSGABE WIRD JETZT GELESEN, NICHT WEGGEWORFEN (Auftrag 2026-08-21
+    # abends): 'wb-mlx-server ensure' gibt seit heute Abend auf stdout eine
+    # Zeile 'modell=<name>' aus -- den Namen, unter dem der Server WIRKLICH
+    # antwortet. wb-code (Orchestrator-Seite) liest sie schon so, seit
+    # demselben Nachtrag; hier fehlte die Gegenstelle, und genau das war die
+    # Ursache: der mtplx-Server prueft den Modellnamen und weist jeden
+    # anderen ab, waehrend pi-worker weiterhin den Registry-Pfad schickte --
+    # ein fehlerfrei gestarteter Server, den sein Aufrufer nicht ansprechen
+    # konnte. Stderr des Werkzeugs bleibt unveraendert sichtbar, nur stdout
+    # wird eingefangen.
+    MLXAUS="$(WB_MLX_SERVER_VORHERSAGE_BAUART="$VORH_BAUART" \
+      WB_MLX_SERVER_VORHERSAGE_MODELL="$VORH_MODELL" \
+      WB_MLX_SERVER_VORHERSAGE_GEWICHTE_GB="$VORH_GEWICHTE_GB" \
+      "$HOME/.local/bin/wb-mlx-server" ensure "$MODEL" --kontext "$STUFE")" || {
+      echo "FEHLER: 'wb-mlx-server ensure' fuer Kontext $STUFE fehlgeschlagen — kein Spawn." >&2
+      exit 1
+    }
+    MLXBEDIENT="$(printf '%s\n' "$MLXAUS" | sed -n 's/^modell=//p' | head -1)"
+    if [ -n "$MLXBEDIENT" ] && [ "$MLXBEDIENT" != "$MODEL" ]; then
+      echo "pi-worker: der Server bedient '$MLXBEDIENT' (nicht '$MODEL') — pi bekommt diesen Namen." >&2
+    fi
+  fi
+  # grug-server ensure steht ERST hier, NACH der Kontextwahl (Pruefer-Befund
+  # B7): `grug-server` kennt keinen --kontext-Schalter (nicht mein Bereich,
+  # nicht anfassen), aber der Aufruf steht jetzt wenigstens an derselben
+  # Stelle wie beim qwen38-Zweig -- er bucht, NACHDEM feststeht, welche Stufe
+  # pi tatsaechlich gleich gesagt bekommt, nicht lange vorher mitten in der
+  # Modell-Fallunterscheidung.
+  if [ -n "${GRUG_VIA_SERVER:-}" ]; then
+    "$HOME/.local/bin/grug-server" ensure || {
+      echo "FEHLER: grug-server nicht bereit — pi-worker bricht ab, statt gegen einen toten Server zu starten." >&2
+      exit 1
+    }
+  fi
+  # --bedient-als (Auftrag 2026-08-21 abends): schreibt den bedienten Namen als
+  # `id` in pis Modell-Eintrag und gibt ihn als erste Zeile zurueck -- $MODEL
+  # wird gleich darauf das, was pi als --model bekommt (siehe wb-code fuer
+  # denselben Weg auf der Orchestrator-Seite). Leer (Ollama, grug, oder ein
+  # MLX-Motor ohne eigenen Servernamen) heisst wie bisher: der Pfad ist der
+  # Name.
+  BEDIENT_ARGS=()
+  [ -n "${MLXBEDIENT:-}" ] && BEDIENT_ARGS=(--bedient-als "$MLXBEDIENT")
+  ENSURED="$("$HOME/.local/bin/wb-kontext" ensure "$MODEL" "$STUFE" "${BEDIENT_ARGS[@]+"${BEDIENT_ARGS[@]}"}")" || {
+    echo "FEHLER: Kontextstufe $STUFE fuer '$MODEL' nicht lieferbar — kein Spawn." >&2
+    exit 1
+  }
+  MODEL="$(printf '%s\n' "$ENSURED" | head -1)"
+  KPROV="$(printf '%s\n' "$ENSURED" | sed -n 's/^provider=//p')"
+  [ -n "$KPROV" ] && PIPROVIDER="$KPROV"
+  KONTEXT_STUFE="$STUFE"
+
+  # ── Eigene Sequenz buchen (Korrektur, 19.08.2026) ──────────────────────────
+  # "Der Server bucht Gewichte plus EINE Sequenz. JEDER weitere lokale Worker
+  # bucht VOR seinem Start seine EIGENE Sequenz dazu (1 x seine Kontextstufe x
+  # KV je Token) und gibt sie beim Schliessen zurueck." -- KEINE Gewichte hier
+  # (0,001 GiB statt 0 GiB, weil wb-belegung --gewichte-gb > 0 verlangt; die
+  # Gewichte sind schon geladen und werden vom SERVERSTART gebucht, nicht von
+  # jedem einzelnen Worker erneut). Nur bei einem ECHTEN Neuspawn -- ein
+  # wiederverwendeter Pane fuegt keine neue gleichzeitige Sequenz hinzu, dafuer
+  # der fruehe find_pane-Blick hier (ein zweites Mal, billig, reine
+  # tmux-Abfrage -- die eigentliche Spawn/Reuse-Entscheidung faellt unveraendert
+  # weiter unten). Wird die Buchung abgelehnt, startet der Worker NICHT -- das
+  # ist der Schutz gegen die Kernel-Panik-Historie, genauer als eine pauschale
+  # Vier, weil er misst, was wirklich frei ist.
+  BELEGUNG_KENNUNG=""
+  if ist_mlx_lokal "$PIPROVIDER"; then
+    VORAB_INFO=$(find_pane); VORAB_PANE=${VORAB_INFO%% *}
+    if [ -z "$VORAB_PANE" ]; then
+      # Der Dateiname des KOERPERS (KOERPER_PFAD, oben gesetzt -- VOR der
+      # 'wb-kontext ensure'-Zeile, die $MODEL ueberschreibt), NICHT $MODEL
+      # selbst und nicht der volle Pfad (Korrektur 2026-08-21 abends,
+      # Namensverwechslung, Ergebnis 20260821-050834.md): $MODEL traegt ab der
+      # ensure-Zeile den Namen, den PI ALS MODELL BEKOMMT -- seit
+      # --bedient-als kann das der bediente Servername sein
+      # ("mtplx-qwen38-27b-optimized-speed"), eine ganz andere Aufgabe als der
+      # KV-Schluessel. wb-belegungs eigener KV-Schluessel ist der
+      # Verzeichnisname des Modellkoerpers ("qwen38-27b-mlx-4bit" bzw., bei
+      # bauart "eingebaut", der Ersatzkoerper aus vorhersage.modell --
+      # "Qwen3.8-27B-MTPLX-Optimized-Speed"), derselbe wie in wb-kontexts
+      # eigenem kv_mib_pro_token(). Weder der bediente Name noch der volle
+      # Pfad trifft dort einen Eintrag; beides faellt auf wb-belegungs
+      # eigenen, deutlich groesseren "unbekannt"-Ersatzwert zurueck -- kein
+      # Fehler in wb-belegung, nur die falsche Schluesselform von hier aus
+      # (gemessen: rund das Vierzehnfache bei 32768 Token). Absichtlich OHNE
+      # die beiden Zahlen selbst: sie haengen an wb-belegungs eigenem
+      # Sicherheitsfaktor, den eine andere Spur pflegt und der sich seitdem
+      # schon einmal geaendert hat (Pruefer-Befund N6, 19.08.2026 abends, traf
+      # genau diese Zeile mit einer laengst veralteten Zahl) -- wer die
+      # aktuelle Differenz sehen will: `wb-belegung darf --modell
+      # <voller-pfad>` gegen `wb-belegung darf --modell <basename>`.
+      BMODELL="$(basename "$KOERPER_PFAD")"
+      # --ohne-sockel (Auftrag "der feste Sockel wird je Worker erneut
+      # gebucht", 2026-08-20): der Fixkosten-Sockel ist Server-Fixkosten,
+      # vom SERVERSTART schon einmal gebucht (siehe wb-mlx-server) -- ein
+      # Worker, der sich hier an den laufenden Server haengt, bucht nur
+      # seinen eigenen Anteil an der Pro-Sequenz-Rate, sonst zaehlt der
+      # Sockel bei jedem Worker erneut mit.
+      BJSON="$("$HOME/.local/bin/wb-belegung" nimm --gewichte-gb 0.001 --modell "$BMODELL" \
+                --parallel 1 --kontext "$STUFE" --zweck "pi-worker:$NAME" --frist 240 \
+                --ohne-sockel --json 2>&1)"
+      BRC=$?
+      BJA="$(printf '%s' "$BJSON" | python3 -c 'import json,sys
+try:
+    print("ja" if json.load(sys.stdin).get("ja") else "nein")
+except Exception:
+    print("nein")' 2>/dev/null)"
+      if [ "$BRC" -ne 0 ] || [ "$BJA" != ja ]; then
+        echo "FEHLER: eigene Speicherbuchung fuer '$NAME' abgelehnt — kein Spawn." >&2
+        printf '%s\n' "$BJSON" | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); print("  Grund:", d.get("grund") or d)
+except Exception as e:
+    print("  (Antwort nicht lesbar:", e, ")")' >&2 2>/dev/null || printf '%s\n' "$BJSON" >&2
+        exit 1
+      fi
+      BELEGUNG_KENNUNG="$(printf '%s' "$BJSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("kennung") or "")' 2>/dev/null)"
+      echo "pi-worker: eigene Sequenz gebucht ($STUFE Token, Kennung ${BELEGUNG_KENNUNG:-?})." >&2
+    fi
+  fi
+fi
 
 if [ "$ENGINE" = claude ]; then
   TITLE="claude:$NAME"
@@ -412,16 +863,80 @@ if [ "$ENGINE" = claude ]; then
   # stands until morning. Guards and the ask stage are untouched by this -- they
   # hang off the hook, not off the CLI.
   #
-  # Remote Control stays OFF here (Vorgabe 2026-08-05: Worker starten
-  # standardmaessig ohne). '--remote-control' is opt-in on the claude CLI --
-  # absent = off, no settings.json key and no env var can switch it on (checked
-  # 2026-08-05) -- so this is the inherited default, not a flag added below.
+  # Remote Control MUSS hier aktiv abgeschaltet werden (Korrektur 2026-08-19 --
+  # die Annahme unten war FALSCH und ist mit A/B auf einem eigenen tmux-Socket
+  # widerlegt: 'claude --dangerously-skip-permissions' allein zeigt in der
+  # Fusszeile ein /rc mit Sitzungs-Link, obwohl kein '--remote-control' auf der
+  # Befehlszeile steht -- Auto-Verbinden greift ausserhalb der Einstellungsdateien
+  # (App-/IDE-Schalter), 'kein Flag = aus' galt nicht mehr. Damit tauchten
+  # WORKER-Sitzungen auf Handy des Nutzers in der Remote-Control-Liste auf. Der
+  # einzige Weg, der es zuverlaessig abschaltet: '--settings' mit
+  # 'remoteControlAtStartup: false' explizit auf der Befehlszeile. Zweite Stelle
+  # derselben Regel: wb-state's `models resolve` fuer den Registry-Pfad (Rolle
+  # worker) -- keine dritte Kopie.
   SKIPFLAG=" --dangerously-skip-permissions"
   if [ "$("$HOME/.local/bin/wb-state" settings get workerSkipPermissions 2>/dev/null)" = "false" ]; then
     SKIPFLAG=""
     echo "pi-worker: workerSkipPermissions=false — dieser Worker haelt bei jedem Schreibzugriff an." >&2
   fi
-  CFLAGS="--model $CMODEL --effort ${EFFORT:-medium}$SKIPFLAG"
+  # printf %q hier, NICHT nur beim finalen Zusammenbau der CHAT-Zeile: der JSON-
+  # Text traegt ein Leerzeichen und Anfuehrungszeichen und muss als EIN Argument
+  # durch printf %q (fuer die spaetere bash -lc-Huelle) UND die eigene
+  # Wort-Trennung von bash -lc hindurch ankommen -- gemessen (siehe Ergebnis-
+  # Beleg), nicht angenommen.
+  #
+  # crossSessionInbound (2026-08-20): ohne diesen Wert wird ein Auftrag, der ueber
+  # die Socket-Inbox statt ueber die Eingabezeile kommt, ANGEHALTEN -- der Worker
+  # zeigt einen Auswahldialog und arbeitet nicht, bis jemand ihn beantwortet.
+  # Gemessen auf eigenem tmux-Socket, dreimal: ohne die Einstellung angehalten,
+  # mit ihr zugestellt und ausgefuehrt. Der Grund, den Claude Code selbst nennt:
+  # ein Absender, der eine Shell ist, kann seine Berechtigungsstufe nicht
+  # bezeugen, waehrend der Worker mit uebersprungenen Rueckfragen laeuft. Der
+  # Wert steht deshalb HIER, auf der Befehlszeile genau dieses Workers, und nicht
+  # in einer Einstellungsdatei: er gilt fuer die Sitzungen, die die Werkbank
+  # selbst startet, und fuer keine andere. Wer die Inbox nicht will, stellt
+  # `workerZustellung` auf `paste` -- dann wird sie nie benutzt, und der Wert
+  # aendert nichts.
+  RC_SETTINGS=" --settings $(printf %q '{"remoteControlAtStartup": false, "crossSessionInbound": "accept"}')"
+
+  # KNAPPE MCP-AUSSTATTUNG FUER WORKER (2026-08-20, Messung des Workers
+  # "speicher"). Eine frische Sitzung kostet 516 MiB, mit
+  # `--strict-mcp-config --mcp-config <datei>` und nur basic-memory darin
+  # 252 MiB -- 264 MiB je Sitzung, 51 Prozent. Der ganze Unterschied ist der
+  # Playwright-MCP: 163 MiB fuer den npm-exec-Wrapper und 97 MiB fuer den
+  # Server. Ein Worker benutzt ihn fast nie, der ORCHESTRATOR schon (Web-Design
+  # braucht den Browser) -- und der laeuft hier nicht durch, dieser Zweig
+  # startet ausschliesslich Worker.
+  #
+  # basic-memory bleibt erreichbar, weil es ueber HTTP an einen geteilten
+  # Daemon geht und je Sitzung keinen eigenen Prozess braucht; der Vault-Zugriff
+  # eines Workers aendert sich also nicht.
+  #
+  # WARUM HIER UND NICHT IN DER REGISTRY: dieser Zweig ist der schnelle Pfad fuer
+  # die Aliase haiku45|sonnet5|opus5|opus48|fable5 und baut seine Startzeile
+  # selbst -- `harnesses[claude].args` kommt hier nie an.
+  #
+  # Die Datei wird angelegt, wenn sie fehlt, statt auf einen Ausrollschritt zu
+  # warten: ein Worker, der wegen einer fehlenden Konfigurationsdatei ohne
+  # Werkzeuge startet, waere teurer als die 264 MiB.
+  MCPFLAGS=""
+  if [ -z "${WB_MCP_VOLL:-}" ]; then
+    MCP_WORKER="$HOME/.claude/workbench/mcp-worker.json"
+    if [ ! -s "$MCP_WORKER" ]; then
+      mkdir -p "$(dirname "$MCP_WORKER")" 2>/dev/null
+      printf '%s\n' '{"mcpServers":{"basic-memory":{"type":"http","url":"http://127.0.0.1:8766/mcp"}}}' \
+        > "$MCP_WORKER" 2>/dev/null || true
+    fi
+    if [ -s "$MCP_WORKER" ]; then
+      MCPFLAGS=" --strict-mcp-config --mcp-config $(printf %q "$MCP_WORKER")"
+    else
+      echo "pi-worker: $MCP_WORKER liess sich nicht anlegen — Worker startet mit voller MCP-Ausstattung." >&2
+    fi
+  else
+    echo "pi-worker: WB_MCP_VOLL gesetzt — dieser Worker bekommt die volle MCP-Ausstattung (Browser-MCP kostet gemessen 264 MiB)." >&2
+  fi
+
+  CFLAGS="--model $CMODEL --effort ${EFFORT:-medium}$SKIPFLAG$RC_SETTINGS$MCPFLAGS"
   # Die Chat-Zuordnung (SPEC-V4 6.3 Punkt 4) installiert sich sonst NIE fuer
   # diesen Zweig: er baut seine Startzeile selbst und laeuft nie durch
   # wb-harness-run, dem einzigen anderen Ort, der den Hook eintraegt. 'claude'
@@ -480,7 +995,7 @@ else
     http://*|https://*) ;;
     *) OLLAMA_ENDPOINT="http://127.0.0.1:11434" ;;
   esac
-  CHAT="cd $(printf %q "$WORKDIR") && export PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH && export OLLAMA_HOST=$(printf %q "$OLLAMA_ENDPOINT") && exec pi --provider $(printf %q "$PIPROVIDER") --model $(printf %q "$MODEL") --session-dir $(printf %q "$SESSDIR") \$( ls $(printf %q "$SESSDIR")/*.json* >/dev/null 2>&1 && echo --continue ) --append-system-prompt \$HOME/.pi/agent/WORKER.md"
+  CHAT="cd $(printf %q "$WORKDIR") && export PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH && export OLLAMA_HOST=$(printf %q "$OLLAMA_ENDPOINT") && exec pi --provider $(printf %q "$PIPROVIDER") --model $(printf %q "$MODEL") --thinking $(printf %q "$THINKING") --session-dir $(printf %q "$SESSDIR") \$( ls $(printf %q "$SESSDIR")/*.json* >/dev/null 2>&1 && echo --continue ) --append-system-prompt \$HOME/.pi/agent/WORKER.md"
 fi
 
 # What the state file / sidebar records as this worker's kind: the harness that
@@ -641,9 +1156,26 @@ finalize_latest_when_done() {
     stamp() { date "+%F %T"; }
     for i in $(seq 1 1440); do
       sleep 15
+      # Der Beobachter stirbt mit seinem Ziel (2026-08-20, Messung des Workers
+      # "speicher": 632 von 635 abgeraeumten Waisenprozessen waren solche
+      # Schleifen, der aelteste lief 5 Stunden 48 Minuten, zusammen 878 MiB).
+      # Verschwindet das Ergebnisverzeichnis -- ein Testlauf raeumt sein
+      # Wegwerf-HOME ab, ein Worker wird geloescht --, kann hier nie mehr etwas
+      # entstehen, worauf zu warten waere. Die Pruefung steht VOR der auf $res,
+      # damit ein geloeschtes Verzeichnis nicht noch sechs Stunden lang alle 15
+      # Sekunden abgefragt wird.
+      [ -d "$resdir" ] || exit 0
       if [ -s "$res" ]; then
         ln -sf "$res" "$resdir/latest.md"
-        echo "$(stamp) pi-worker: latest.md auf das Ergebnis umgebogen ($res)."
+        # Nicht nur den Symlink umbiegen, auch den Platzhalter SELBST entfernen
+        # (2026-08-20, Nachtrag zum Zustellungs-Auftrag: testschnell fand
+        # .laufend.md noch liegen, obwohl das Ergebnis laengst fertig war -- ein
+        # fertiger Worker sah damit weiterhin wie ein laufender aus, fuer jeden,
+        # der die blosse Anwesenheit der Datei statt dem Ziel von latest.md prueft).
+        # Sein einziger Zweck war "noch kein Ergebnis"; sobald $res steht, ist
+        # dieser Zweck erfuellt und die Datei ueberfluessig.
+        rm -f "$resdir/.laufend.md"
+        echo "$(stamp) pi-worker: latest.md auf das Ergebnis umgebogen ($res), Platzhalter entfernt."
         exit 0
       fi
     done
@@ -723,6 +1255,14 @@ markiere_rolle() {   # <pane> <rolle>
   fi
 }
 
+if [ -z "$pane" ] && ist_mlx_lokal "${PIPROVIDER:-}"; then
+  MLXN=$(mlx_worker_anzahl)
+  if [ "${MLXN:-0}" -ge "$MLX_NEBENLAEUFIGKEIT_SUESSPUNKT" ]; then
+    echo "WARNUNG: bereits $MLXN MLX-Worker aktiv (Suesspunkt decode-concurrency $MLX_NEBENLAEUFIGKEIT_SUESSPUNKT) — dieser hier wartet hinter den anderen, statt schneller zu werden." >&2
+    echo "  Vorschlag: mit einem bestehenden lokalen Worker weiterarbeiten, auf ein Ollama-Modell ausweichen (eigener Server, keine gemeinsame Warteschlange), oder abwarten, bis einer schliesst." >&2
+  fi
+fi
+
 if [ -z "$pane" ]; then
   # spawn a fresh permanent chat pane in the RIGHT workbench:
   # 0) $WB_SESSION if set   1) our own pane if inside tmux
@@ -790,7 +1330,19 @@ if [ -z "$pane" ]; then
     MAXW_LOCK="$MAXW_LOCKDIR/$(printf '%s' "$SESS_T" | tr -c 'a-zA-Z0-9' '-').lock"
     MAXW_WAITED=0
     while ! mkdir "$MAXW_LOCK" 2>/dev/null; do
-      MAXW_AGE=$(( $(date +%s) - $(stat -f %m "$MAXW_LOCK" 2>/dev/null || stat -c %Y "$MAXW_LOCK" 2>/dev/null || echo 0) ))
+      # Zwei getrennte Aufrufe statt eines '||': GNU 'stat -f' (Linux) ist NICHT das BSD
+      # 'stat -f' (macOS) -- es bedeutet "Dateisystem-Status", nicht "eigenes Format", und
+      # %m ist dort kein gueltiges Feld. Es scheitert zwar (Exit 1), schreibt dabei aber
+      # trotzdem einen mehrzeiligen Bericht ("  File: ...") nach STDOUT -- der durch das
+      # '||' NICHT verschluckt wird, weil `2>/dev/null` nur STDERR unterdrueckt. Verkettet in
+      # einer einzigen $(( )), wertete die Arithmetik das Wort 'File' als Variablennamen und
+      # brach unter 'set -u' mit 'File: unbound variable' ab (Befund 2026-08-21, nur unter
+      # Last reproduzierbar: der Zweig laeuft ausschliesslich bei Sperr-Konkurrenz). Deshalb
+      # hier: jeder stat-Aufruf in eine EIGENE Variable, erst dann auf reine Ziffern geprueft.
+      MAXW_MTIME="$(stat -f %m "$MAXW_LOCK" 2>/dev/null)"
+      case "$MAXW_MTIME" in ''|*[!0-9]*) MAXW_MTIME="$(stat -c %Y "$MAXW_LOCK" 2>/dev/null)" ;; esac
+      case "$MAXW_MTIME" in ''|*[!0-9]*) MAXW_MTIME=0 ;; esac
+      MAXW_AGE=$(( $(date +%s) - MAXW_MTIME ))
       if [ "$MAXW_AGE" -ge 10 ]; then rm -rf "$MAXW_LOCK"; continue; fi
       MAXW_WAITED=$((MAXW_WAITED + 1))
       if [ "$MAXW_WAITED" -ge 100 ]; then
@@ -850,6 +1402,26 @@ if [ -z "$pane" ]; then
       # landet in einer anderen Session). Derselbe Fehlertyp wie beim leeren $TARGET
       # weiter oben: lieber laut abbrechen als still am falschen Ort spawnen.
       [ -n "$wtgt" ] || { echo "FEHLER: 'workers'-Fenster von '$WBSESS_T' hat kein aktives Pane mehr (Fenster verschwunden?). Kein Spawn." >&2; exit 1; }
+      # Mindesthoehe VOR dem Split (Betriebsbefund 19.08.2026 abends): ein auf
+      # eine Zeile gedruecktes 'workers'-Fenster (siehe wb-workers-window fuer
+      # die gemessene Ursache) hat schlicht keinen Platz fuer einen weiteren
+      # Pane -- 'split-window' scheitert dann mit "size or position no space
+      # for a new pane", BEVOR wb-grid (Zeile ~1206, danach) je die Chance
+      # bekommt, die Groesse zu reparieren: das laeuft erst NACH einem
+      # erfolgreichen Split. Dieselbe Pruefung wie in wb-workers-window
+      # (MIN_ZEILEN dort), hier noch einmal, weil pi-worker diesen Zweig
+      # (schon bestehendes 'workers'-Fenster) selbst aufloest, ohne
+      # wb-workers-window dafuer aufzurufen.
+      whoehe="$(tmux display -p -t "$wwin" '#{window_height}' 2>/dev/null || true)"
+      case "$whoehe" in
+        ''|*[!0-9]*) ;;
+        *)
+          if [ "$whoehe" -lt "$PI_WORKER_MIN_ZEILEN" ]; then
+            tmux set-option -w -t "$wwin" window-size manual 2>/dev/null || true
+            tmux resize-window -t "$wwin" -y "$PI_WORKER_MIN_ZEILEN" 2>/dev/null || true
+          fi
+          ;;
+      esac
       pane=$(tmux split-window -d -t "$wtgt" -P -F '#{pane_id}' "bash -lc $(printf %q "$CHAT")")
     else
       pane=$(tmux new-window -d -t "=$WBSESS_T:" -n workers -P -F '#{pane_id}' "bash -lc $(printf %q "$CHAT")")
@@ -866,6 +1438,10 @@ if [ -z "$pane" ]; then
   [ -n "$pane" ] || { echo "FEHLER: Worker-Pane konnte nicht angelegt werden (Ziel '$TARGET') — nichts markiert, kein Spawn." >&2; exit 1; }
   markiere_rolle "$pane" worker
   tmux set -p -t "$pane" @wb_worker "$NAME"
+  # Markiert fuer die Nebenlaeufigkeits-Warnung oben ("mlx_worker_anzahl") --
+  # nur bei einem ECHTEN Neuspawn, damit ein wiederverwendeter Pane nicht
+  # doppelt zaehlt.
+  ist_mlx_lokal "${PIPROVIDER:-}" && tmux set -p -t "$pane" @wb_lokal_provider mlx-lokal
   tmux set -p -t "$pane" remain-on-exit on
   tmux select-pane -t "$pane" -T "$TITLE"
   $HOME/.local/bin/wb-grid "$pane"
@@ -887,6 +1463,42 @@ else
   SPAWNED=0
 fi
 
+# Die eigene Sequenz automatisch zurueckgeben, sobald der Pane verschwindet
+# (Korrektur, 19.08.2026) -- unabhaengig davon, WIE er geschlossen wurde
+# (wb-close, von Hand, Absturz mit spaeterem `wb-close`). Nur wenn oben
+# wirklich gebucht wurde ($BELEGUNG_KENNUNG gesetzt -- das ist NUR beim echten
+# Neuspawn-Zweig der Fall, ein wiederverwendeter Pane bucht nichts Neues und
+# hat hier nichts zurueckzugeben). Abgekoppelt, endliche Frist (6 h im
+# 15-s-Takt, dasselbe Muster wie finalize_latest_when_done oben).
+if [ -n "${BELEGUNG_KENNUNG:-}" ]; then
+  nohup bash -c '
+    pane="$1"; kennung="$2"
+    for i in $(seq 1 1440); do
+      sleep 15
+      # "tmux display -p -t <toter-pane>" meldet auf dieser Maschine RC=0 mit
+      # leerer Ausgabe statt eines Fehlers, sobald der Pane weg ist (gemessen,
+      # 2026-08-20 -- dieselbe Quirke, die wb-belegungs eigenes
+      # panes_des_servers() deshalb NICHT so prueft). Diese Schleife lief mit
+      # der zerbrechlicheren Pruefung deshalb NIE aus, auch lange nachdem
+      # wb-close den Pane laengst gekillt hatte -- die Buchung blieb bis zur
+      # Frist (240 min) im Buch stehen. Stattdessen dieselbe robuste Quelle
+      # wie wb-belegung selbst: eine Momentaufnahme ALLER Panes, Mitglied-
+      # schaft und pane_dead darin pruefen, nicht das Exit-Verhalten von
+      # "display -t" auf eine moeglicherweise verschwundene Kennung.
+      zeile="$(tmux list-panes -a -F "#{pane_id} #{pane_dead}" 2>/dev/null | grep "^$pane ")"
+      { [ -z "$zeile" ] || [ "${zeile##* }" = "1" ]; } && break
+    done
+    # Erst der normale Weg (eigener Pane als Halter), dann --fremd als
+    # Rueckfall -- derselbe zweistufige Nachweis wie in wb-mlx-servers
+    # belegung_freigeben(), aus demselben Grund: der Pane, unter dem diese
+    # Buchung eingetragen wurde (der AUFRUFER-Pane zum Zeitpunkt von "nimm",
+    # siehe cmd_uebernehmen in wb-belegung), muss nicht derselbe sein wie der
+    # hier ueberwachte Worker-Pane.
+    "$HOME/.local/bin/wb-belegung" gib "$kennung" >/dev/null 2>&1 || \
+      "$HOME/.local/bin/wb-belegung" gib "$kennung" --fremd >/dev/null 2>&1
+  ' _ "$pane" "$BELEGUNG_KENNUNG" >>"$HOME/.local/state/wb-code.log" 2>&1 &
+fi
+
 # register the worker in the workbench state file (VSCode sidebar reads it).
 # A failing wb-state must never kill the spawn, but it must not stay silent
 # either — otherwise workers never show up in the sidebar and nobody notices.
@@ -899,7 +1511,9 @@ WBSESS=$(base_session_name "$pane")
 if [ "$ENGINE" = claude ]; then WBMODEL="$CMODEL:${EFFORT:-medium}"
 elif [ "$ENGINE" = registry ]; then WBMODEL="$MODEL:${REFFORT:-medium}"
 else WBMODEL="$MODEL"; fi
-$HOME/.local/bin/wb-state add-worker "$NAME" "$KIND" "$WBMODEL" "$WORKDIR" "$WBSESS" \
+AWARGS=("$NAME" "$KIND" "$WBMODEL" "$WORKDIR" "$WBSESS")
+[ -n "${KONTEXT_STUFE:-}" ] && AWARGS+=(--kontext "$KONTEXT_STUFE")
+$HOME/.local/bin/wb-state add-worker "${AWARGS[@]}" \
   || echo "WARNUNG: wb-state add-worker fehlgeschlagen — '$NAME' fehlt in der Workbench-Sidebar." >&2
 
 # No watcher trigger here any more (Reviewer-Befund 2, round 5): it needs the marker
@@ -952,11 +1566,44 @@ fi
 
 if [ -z "$TASK" ]; then
   [ -n "$CS_BEFORE" ] && rm -f "$CS_BEFORE"   # no message will ever carry a marker
-  echo "Chat-Agent '$NAME' ($MODEL) bereit in Pane $pane — keine Task übergeben."
+  KTXT=""; [ -n "${KONTEXT_STUFE:-}" ] && KTXT=", Kontext $KONTEXT_STUFE Token"
+  echo "Chat-Agent '$NAME' ($MODEL$KTXT) bereit in Pane $pane — keine Task übergeben."
   exit 0
 fi
 
 TS="$(date +%Y%m%d-%H%M%S)"
+# EINDEUTIG, auch zweimal in derselben Sekunde (2026-08-20, Stresstest der
+# Zustellung, reproduziert mit angehaltener Uhr). Der Zeitstempel hat nur
+# Sekundenaufloesung, und ZWEI Auftraege an denselben Worker innerhalb einer
+# Sekunde sind kein Sonderfall: ein zweiter Auftrag in einen bestehenden Pane
+# braucht ueber die Sitzungs-Inbox rund eine Sekunde, und in einem Lauf mit
+# zwoelf Auftraegen hintereinander teilten sich gemessen je zwei denselben
+# Zeitstempel.
+#
+# Was daran teuer ist, ist NICHT die Namensgleichheit, sondern der Beleg. $TS
+# ist zugleich der MARKER, an dem die Inhaltspruefung unten die Ankunft
+# nachweist ($MARKER_INHALT ist sein Dateiname). Traegt der zweite Auftrag
+# denselben Marker wie der erste, findet die Pruefung den Marker des ERSTEN im
+# Pane und meldet den zweiten als angekommen -- gemessen genau so: der zweite
+# Auftrag wurde von der Sitzung verschluckt (im Pane nicht ein einziges Mal zu
+# finden), pi-worker meldete trotzdem "zugestellt (Ankunft belegt: Pane)" und
+# endete mit 0. Das ist der Fehlalarm in der gefaehrlichen Richtung. Dazu
+# ueberschreibt der zweite Auftrag die Auftragsdatei des ersten, und beide
+# zeigen auf dieselbe Ergebnisdatei.
+#
+# Der Ausweg ist ein Namenszusatz, kein feineres Zeitformat: das Format
+# <zeitstempel>.md steht in Werkzeugen, Tests und Dokumentation, und
+# aktivitaet.ts leitet die Begleitdatei daraus ab (.md -> .auftrag.txt). Der
+# Zusatz haengt deshalb an $TS SELBST, damit Ergebnis-, Auftrags- und
+# Fehlschlagdatei denselben Namen weitertragen. Sortiert wird nirgends nach
+# dem Namen -- wb-ereignisse nimmt die mtime, alles andere latest.md.
+TS_BASIS="$TS"
+TS_LAUF=1
+while [ -e "$RESDIR/$TS.md" ] || [ -e "$RESDIR/$TS.auftrag.txt" ] \
+   || [ -e "$RESDIR/$TS.zustellung-fehlgeschlagen.md" ]; do
+  TS_LAUF=$(( TS_LAUF + 1 ))
+  TS="$TS_BASIS-$TS_LAUF"
+done
 RES="$RESDIR/$TS.md"
 # latest.md zeigt WAEHREND der Laufzeit auf einen echten, lesbaren Platzhalter,
 # nicht direkt auf $RES (siehe finalize_latest_when_done oben fuer die volle
@@ -967,6 +1614,7 @@ PLATZHALTER="$RESDIR/.laufend.md"
 {
   printf '# Worker "%s" laeuft\n\n' "$NAME"
   printf -- '- Modell: %s (%s)\n' "$MODEL" "$KIND"
+  [ -n "${KONTEXT_STUFE:-}" ] && printf -- '- Kontext: %s Token\n' "$KONTEXT_STUFE"
   printf -- '- Gestartet: %s\n' "$(date '+%F %T')"
   printf -- '- Ziel-Ergebnisdatei (sobald fertig): %s\n\n' "$RES"
   printf 'Noch kein Ergebnis -- diese Datei ist ein Platzhalter. `wb-result %s` meldet\n' "$NAME"
@@ -975,6 +1623,82 @@ PLATZHALTER="$RESDIR/.laufend.md"
 ln -sf "$PLATZHALTER" "$RESDIR/latest.md"
 finalize_latest_when_done "$RESDIR" "$RES"
 
+# Ein FEHLGESCHLAGENER Zustellversuch darf keinen Platzhalter zuruecklassen, der
+# spaeter wie ein arbeitender Worker aussieht (2026-08-20, Auftrag: die Zustellung
+# selbst muss sich melden, wenn sie es nicht weiss). Bis hierher zeigen
+# $PLATZHALTER/latest.md "laeuft" -- das widerruft niemand, wenn der Auftrag nie
+# ankam: der Sechs-Stunden-Beobachter aus finalize_latest_when_done() wartet auf
+# $RES, das dann NIE geschrieben wird, und eine Deadline-Warteschleife beim
+# Aufrufer ("until [ -s $RES ]; do sleep 5; done", siehe die Zeile am Ende dieses
+# Skripts) haengt bis zu IHRER eigenen Frist an einem Auftrag, der nie gestartet
+# ist. Der Ausweg braucht kein neues Geruest: eine ECHTE, sofort sichtbare Datei
+# statt eines Platzhalters, und latest.md sofort darauf umgebogen (nicht erst
+# nach den bis zu 15s des Beobachters).
+#
+# WOHIN diese Datei geht, ist am 2026-08-20 KORRIGIERT worden. Sie lag zuerst
+# unter $RES -- also genau dort, wo spaeter das ECHTE Ergebnis erwartet wird.
+# Gemessen am selben Tag beim Worker 'dsharness': die Zustellpruefung schlug
+# Alarm, obwohl der Auftrag angekommen war; pi-worker schrieb daraufhin
+# "Zustellung fehlgeschlagen" nach $RES, und der Ereignisstrom meldete den gerade
+# erst anfangenden Worker als FERTIG. Danach ist "Zustellung gescheitert" von
+# "Arbeit fertig" nicht mehr zu unterscheiden -- und beim naechsten Fehlalarm
+# waere es wieder so. Deshalb steht der Fehlschlag jetzt in einer eigenen Datei
+# mit sprechendem Namen; $RES bleibt dem Ergebnis vorbehalten, und wenn der
+# Worker doch arbeitet (Fehlalarm), biegt finalize_latest_when_done() latest.md
+# von selbst auf das echte Ergebnis um, sobald es da ist. Der Ereignisstrom
+# uebergeht die Datei ausdruecklich (siehe ergebnis_von() in wb-ereignisse).
+zustellung_fehlgeschlagen() {
+  local grund="$1" fehldatei
+  fehldatei="$RESDIR/$TS.zustellung-fehlgeschlagen.md"
+  echo "FEHLER: $grund" >&2
+  {
+    printf '# Zustellung an "%s" fehlgeschlagen\n\n' "$NAME"
+    printf -- '- Modell: %s (%s)\n' "$MODEL" "$KIND"
+    printf -- '- Pane: %s\n' "${pane:-?}"
+    printf -- '- Zeitpunkt: %s\n' "$(date '+%F %T')"
+    printf -- '- Erwartete Ergebnisdatei: %s (bewusst NICHT diese Datei hier)\n\n' "$RES"
+    printf 'WHAT: kein Auftrag wurde uebergeben — die Zustellung ist gescheitert, BEVOR ein Worker angefangen hat zu arbeiten.\n\n'
+    printf 'HOW-verified: %s\n\n' "$grund"
+    printf 'OPEN: Auftrag manuell pruefen und, falls noetig, erneut senden: tmux capture-pane -p -t %s\n' "${pane:-?}"
+    printf '\nSollte der Worker doch arbeiten (Fehlalarm der Zustellpruefung), erscheint sein\n'
+    printf 'echtes Ergebnis unter dem Pfad oben, und latest.md zeigt dann wieder dorthin.\n'
+  } > "$fehldatei" 2>/dev/null
+  ln -sf "$fehldatei" "$RESDIR/latest.md" 2>/dev/null
+  # Wie im Erfolgspfad (finalize_latest_when_done): den Platzhalter SELBST
+  # entfernen, nicht nur den Symlink umbiegen -- sonst sieht ein gescheiterter
+  # Zustellversuch fuer jeden, der die blosse Anwesenheit von .laufend.md statt
+  # latest.md's Ziel prueft, weiterhin wie ein laufender Worker aus.
+  rm -f "$PLATZHALTER" 2>/dev/null
+  exit 1
+}
+
+# UNENTSCHIEDEN IST EIN EIGENES URTEIL, UND ES SIEHT NICHT WIE EIN FEHLSCHLAG AUS
+# (2026-08-20, zweite Runde, nach zwei Fehlalarmen im Betrieb).
+#
+# Es gibt drei Antworten auf "ist der Auftrag angekommen", nicht zwei: ja, nein,
+# und "das laesst sich hier nicht entscheiden". Die dritte fehlte, und ihr
+# Fehlen hat den teureren Fehlalarm erzeugt: Zwei von fuenf Workern bekamen eine
+# Fehlschlagdatei, BEIDE haben trotzdem gearbeitet. Der Schaden war nicht die
+# Datei, sondern der Zeiger: latest.md zeigte danach auf den Fehlschlag statt auf
+# das kommende Ergebnis, und wer latest.md liest -- Wachen, die Oberflaeche, der
+# Orchestrator -- sah stundenlang "gescheitert", waehrend der Worker arbeitete.
+#
+# Unentschieden heisst deshalb: Rueckgabewert 0, Platzhalter BLEIBT stehen,
+# latest.md zeigt weiter auf ihn, KEINE Fehlschlagdatei -- und die Meldung sagt
+# in Worten, was nicht entschieden werden konnte und wo man nachsieht. Ein
+# spaeter eintreffendes echtes Ergebnis holt den Zeiger von selbst ein, dafuer
+# laeuft der Beobachter aus finalize_latest_when_done() ohnehin schon.
+# Dasselbe Urteil gab es fuer den busy-Fall bereits; hier bekommt es seinen
+# eigenen Namen und gilt fuer jeden Grund, aus dem kein Beleg moeglich war.
+zustellung_unentschieden() {
+  local grund="$1"
+  echo "Task an Chat-Agent '$NAME' ($MODEL, Pane $pane) in die Sitzungs-Inbox gelegt —"
+  echo "  UNENTSCHIEDEN: $grund"
+  echo "  Weder Erfolg noch Fehlschlag behauptet. Der Platzhalter bleibt stehen, damit ein"
+  echo "  Ergebnis, das noch kommt, den Zeiger von selbst einholt ($RESDIR/latest.md)."
+  echo "  Selbst nachsehen: tmux capture-pane -p -t $pane   (gesucht: '$MARKER_INHALT')"
+}
+
 # DER AUFTRAGSTEXT (2026-08-05, Schritt 9/V18). Das Auftragsbuch unten haelt
 # nur Zeitpunkt, Ergebnisdatei, Pane, Harness und Modell fest -- der Text
 # selbst geht in den Pane und ist danach vergessen. Ohne ihn laesst sich beim
@@ -982,6 +1706,29 @@ finalize_latest_when_done "$RESDIR" "$RES"
 # additiv, neben der Ergebnisdatei, unter demselben Zeitstempel -- keine
 # bestehende Spalte des Auftragsbuchs aendert sich dadurch.
 printf '%s' "$TASK" > "$RESDIR/$TS.auftrag.txt" 2>/dev/null || true
+
+# Datei-Zeiger statt Inline-Text ab einer Schwelle (2026-08-20, Auftrag: Zustellung
+# muss zuverlaessig ankommen). Die Laenge allein erklaert die drei Haenger heute
+# Nacht NICHT -- gemessen: auch ein kurzer Zeigertext blieb beim ersten Versuch
+# stehen, C-u vor dem Tippen (siehe unten) war der eigentliche Fix. Trotzdem bleibt
+# ein LANGER Inline-Text ein zweites, unabhaengiges Risiko: er kommt als ein
+# einziger, oft ueber mehrere OS-Leseaufrufe verteilter Bracketed-Paste-Block an,
+# und je mehr Bytes darin stecken, desto mehr Gelegenheit fuer eine TUI, eine
+# Klammer des Paste-Modus mitten im Datenstrom zu verpassen. Die 1200-Zeichen-
+# Schwelle liegt bewusst UNTER den ~2000 Zeichen des heute gemessenen Ausfalls
+# (Worker 'nebenlauf') und deutlich UEBER dem ueblichen kurzen Auftragssatz (ein bis
+# zwei Zeilen, Vorspann+Protokoll allein sind schon ~540 Zeichen) -- ein normaler
+# kurzer Auftrag bleibt inline, ein laengerer Fliesstext wandert in genau die Datei,
+# die ohnehin schon fuer jeden Auftrag mitgeschrieben wird ($RESDIR/$TS.auftrag.txt,
+# siehe die Zeile darueber), keine zweite Kopie noetig. Der Zeigertext selbst bleibt
+# WORTGLEICH ankommender Auftragsinhalt: die Datei traegt $TASK unveraendert, der
+# Pane bekommt nur einen kurzen, festen Satz, der auf sie zeigt.
+AUFTRAG_SCHWELLE=1200
+TASK_FUER_MSG="$TASK"
+if [ "${#TASK}" -gt "$AUFTRAG_SCHWELLE" ]; then
+  TASK_FUER_MSG="Lies $RESDIR/$TS.auftrag.txt und arbeite ihn ab."
+  echo "pi-worker: Auftragstext ist ${#TASK} Zeichen lang (> $AUFTRAG_SCHWELLE) -- in eine Datei geschrieben, im Pane steht nur ein kurzer Zeiger darauf ($RESDIR/$TS.auftrag.txt)." >&2
+fi
 
 # DAS AUFTRAGSBUCH (2026-08-05). Ein neuer Ergebnispfad entsteht je AUFTRAG, nicht
 # je Spawn -- diese Zeilen laufen auch, wenn ein bestehender Pane wiederverwendet
@@ -1011,7 +1758,11 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
 # findet.
 [ -n "$DOD" ] && printf '%s\n' "$DOD" > "$RESDIR/.dod"
 
-MSG="${VORSPANN}$TASK
+# Kontextstufe merken (wb-kontext, Auftrag B 2026-08-19), neben .dod -- damit
+# nachvollziehbar bleibt, womit dieser Worker lief, auch ohne die Sidebar.
+[ -n "${KONTEXT_STUFE:-}" ] && printf '%s\n' "$KONTEXT_STUFE" > "$RESDIR/.kontext"
+
+MSG="${VORSPANN}$TASK_FUER_MSG
 
 [Protokoll — immer befolgen] Schreibe dein vollständiges Endergebnis als Markdown in die Datei $RES (WHAT/HOW-verified/OPEN). Antworte danach im Chat, letzte Zeile exakt: DONE"
 
@@ -1035,19 +1786,227 @@ if [ -n "$CTRACK" ] && [ "$SPAWNED" = "1" ] && [ -n "$CS_BEFORE" ]; then
   CS_BEFORE=""
 fi
 
-# Wie die Eingabezeile aussieht, BEVOR etwas eingefuegt wird (2026-08-06). Manche TUIs
-# zeigen in der leeren Zeile einen Vorschlag, und codex waehlt ihn beim Start aus einer
-# Liste — gemessen sind fuenf verschiedene. Eine feste Zeichenkette (promptIgnore) kann
-# das nicht fangen: sie trifft einen von fuenf, und in den uebrigen Faellen haelt die
-# Pruefung unten den Vorschlag fuer haengenden Text, tippt zweimal Enter nach und meldet
-# einen Fehlschlag, obwohl der Auftrag angekommen ist.
-# Der Vergleich mit DIESER Zeile loest das ohne Wortlaut: sieht die Eingabezeile hinterher
-# wieder so aus wie vorher, ist unser Text weg. Gemessen am selben Tag, dass der Vorschlag
-# INNERHALB einer Sitzung stabil bleibt: getippt, geloescht, derselbe Vorschlag zurueck.
+# ---------------------------------------------------------------------------
+# WELCHER WEG (2026-08-20). Bis heute gab es genau einen: den Auftrag in die
+# Eingabezeile des Panes tippen. In der Nacht auf den 20.08. hat dieser Weg fuenf
+# Panes eingefroren und Auftraege stumm verschluckt; die Verifikation dahinter ist
+# viermal nachgeschaerft worden. Fuer Claude-Code-Worker gibt es einen zweiten Weg,
+# der nicht durch die Eingabezeile geht: die Socket-Inbox der Sitzung (siehe
+# wb-inbox fuer die Messungen). Er kann nichts ueberschreiben, an nichts anhaengen
+# und keine Eingabezeile blockieren -- die drei Schadensbilder von heute Nacht sind
+# dort per Bauart nicht moeglich.
+#
+# WAS SICH DADURCH NICHT AENDERT: der BELEG. Weder ein Paste noch ein Socket-Schreiben
+# beweist, dass der Auftrag angekommen ist; beweisen tut das nur, dass der Marker
+# ($MARKER_INHALT) hinterher im Pane wieder auftaucht. Diese Pruefung lief bisher
+# nur fuer Harnesses mit gemessenem promptPattern -- ab jetzt fuer JEDEN Weg und
+# JEDEN Harness (siehe INHALTSPRUEFUNG weiter unten). Das ist der Kern: ein Weg,
+# dessen Erfolg man nicht messen kann, ist kein Weg.
+#
+# Der Schalter `workerZustellung` (auto|socket|paste, Vorgabe auto) haelt den
+# Rueckweg offen: 'paste' benutzt die Inbox nie, 'socket' verlangt sie und faellt
+# NICHT zurueck (fuer Tests), 'auto' nimmt sie, wo es sie gibt, und tippt sonst.
+ZUSTELLWEG=paste
+submitted=""
+inhalt_beleg=""
+# Vorbelegt, damit die Meldungen ganz unten auch auf einem Weg definiert sind, der
+# nie tippt (`set -u`). Der Paste-Weg setzt beide unten selbst.
+ABSENDE_TASTE=Enter
+ABSENDE_FRIST=45
+ZUSTELL_WAHL="$("$HOME/.local/bin/wb-state" settings get workerZustellung 2>/dev/null || true)"
+ZUSTELL_QUELLE="der Einstellung workerZustellung"
+if [ -n "${WB_ZUSTELLUNG:-}" ]; then
+  ZUSTELL_WAHL="$WB_ZUSTELLUNG"
+  ZUSTELL_QUELLE="der Umgebungsvariablen WB_ZUSTELLUNG"
+fi
+# EIN UNBEKANNTER WERT IST EIN FEHLER, KEIN 'auto' (2026-08-20, Stresstest der
+# Zustellung, gemessen). Bis hierher fiel jeder nicht erkannte Wert still auf
+# 'auto' -- und das kehrte die Wahl um, statt sie zu ignorieren: mit
+# workerZustellung=paste in den Einstellungen und einem vertippten
+# WB_ZUSTELLUNG=sockett lief die Zustellung ueber die Inbox, also genau ueber
+# den Weg, den die Einstellung ausgeschlossen hatte. Umgekehrt genauso teuer:
+# ein vertipptes 'socket' verliert die Zusage "faellt NICHT aufs Tippen
+# zurueck", die der einzige Grund fuer diese Stellung ist -- und niemand
+# erfaehrt es, weil 'auto' im Erfolgsfall gleich aussieht.
+#
+# Die gespeicherte Einstellung prueft `wb-state settings set` bereits beim
+# Schreiben (ENUM dort). Diese Stelle deckt die zwei Wege ab, die daran
+# vorbeigehen: die Umgebungsvariable fuer den Einzelfall, die niemand prueft,
+# und eine von Hand veraenderte Einstellungsdatei. Leer bleibt leer und heisst
+# weiterhin 'auto' -- eine nicht gesetzte Variable ist keine falsche Angabe.
+case "$ZUSTELL_WAHL" in
+  paste|socket|auto) : ;;
+  "")                ZUSTELL_WAHL=auto ;;
+  *) zustellung_fehlgeschlagen "Zustellweg '$ZUSTELL_WAHL' aus $ZUSTELL_QUELLE ist keiner der drei bekannten (auto|socket|paste). Es wurde NICHTS zugestellt -- ein unbekannter Wert wird nicht als 'auto' geraten, weil das die getroffene Wahl umkehren statt uebergehen wuerde." ;;
+esac
+WB_INBOX=""
+if [ "$ZUSTELL_WAHL" != paste ] && [ "$KIND" = claude ]; then
+  for kandidat in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/wb-inbox" \
+                  "$HOME/.local/bin/wb-inbox"; do
+    [ -x "$kandidat" ] && { WB_INBOX="$kandidat"; break; }
+  done
+  if [ -n "$WB_INBOX" ] && "$WB_INBOX" finde "$pane" >/dev/null 2>&1; then
+    ZUSTELLWEG=socket
+  elif [ "$ZUSTELL_WAHL" = socket ]; then
+    zustellung_fehlgeschlagen "workerZustellung=socket verlangt die Sitzungs-Inbox, aber unter Pane $pane ist keine lebende Claude-Sitzung eingetragen (~/.claude/sessions). Es wurde NICHT ersatzweise getippt."
+  fi
+fi
+
+if [ "$ZUSTELLWEG" = socket ]; then
+  # Beschaeftigt oder untaetig? Das entscheidet, WIE LANGE ein fehlender Beleg
+  # etwas bedeutet. Eine Inbox-Nachricht wird an der TURN-GRENZE zugestellt: eine
+  # untaetige Sitzung nimmt sie sofort (gemessen: 1 s), eine mitten im Zug
+  # arbeitende erst danach -- und "der Worker rechnet noch" ist kein Fehlschlag
+  # der Zustellung. Der Zustand kommt aus dem Sitzungsregister, nicht aus dem
+  # Pane-Text (regeln/worker-panes.md).
+  INBOX_ZUSTAND="$("$WB_INBOX" status "$pane" 2>/dev/null | cut -f1)"
+  # Der Auftrag kommt beim Worker als Nachricht EINER ANDEREN SITZUNG an, nicht
+  # als etwas, das der Mensch getippt hat -- Claude Code stellt ihn auch genau so
+  # dar. Gemessen am 2026-08-20: eine Sitzung OHNE Worker-Rolle hat einen so
+  # zugestellten Auftrag ausdruecklich verweigert ("Anfrage von externem Agent
+  # blockiert"). Deshalb sagen die ersten Zeilen, wer schreibt und warum das der
+  # normale Weg ist. Der Auftragstext selbst bleibt Wort fuer Wort derselbe.
+  INBOX_DATEI="$RESDIR/.$TS.inbox.txt"
+  {
+    printf 'Auftrag deines Orchestrators (Werkbank), zugestellt ueber die Sitzungs-Inbox\n'
+    printf 'statt ueber die Eingabezeile deines Panes. Das ist der vorgesehene Weg und\n'
+    printf 'keine fremde Anfrage: derselbe Absender, der diesen Worker gestartet hat.\n\n'
+    printf '%s' "$MSG"
+  } > "$INBOX_DATEI" 2>/dev/null
+  if "$WB_INBOX" sende "$pane" "$INBOX_DATEI"; then
+    submitted=inbox
+    # Aufraeumen auch im ERFOLGSFALL (2026-08-20, Stresstest der Zustellung:
+    # nach drei Auftraegen lagen drei versteckte '.<ts>.inbox.txt' im
+    # Ergebnisordner). `wb-inbox sende` hat die Datei zu diesem Zeitpunkt
+    # vollstaendig gelesen und weggeschrieben; sie wird nicht mehr gebraucht.
+    # Der Auftragstext selbst geht dabei nicht verloren -- er steht wortgleich
+    # in $RESDIR/$TS.auftrag.txt, die ohnehin fuer jeden Auftrag mitlaeuft.
+    rm -f "$INBOX_DATEI" 2>/dev/null
+  else
+    rm -f "$INBOX_DATEI" 2>/dev/null
+    if [ "$ZUSTELL_WAHL" = socket ]; then
+      zustellung_fehlgeschlagen "Zustellung ueber die Sitzungs-Inbox von Pane $pane fehlgeschlagen, und workerZustellung=socket verbietet den Rueckfall auf das Tippen."
+    fi
+    echo "pi-worker: Zustellung ueber die Sitzungs-Inbox fehlgeschlagen — es wird getippt." >&2
+    ZUSTELLWEG=paste
+  fi
+fi
+
+if [ "$ZUSTELLWEG" = paste ]; then
+
+# Zusaetzliche Sicherung, VOR dem Tippen (Betriebsbefund 19.08.2026 abends,
+# der Nutzer, gemessen: alle vier Worker-Panes der Sitzung wb-AI standen auf
+# 184x1). wb-workers-window haelt die Mindesthoehe des FENSTERS jetzt selbst
+# durch (siehe dort, MIN_ZEILEN, dieselbe Zahl wie hier), aber dieser Pane
+# hier kann trotzdem zu klein sein -- ein alter Pane von vor dem Fix, ein Weg
+# ohne wb-grid/wb-workers-window dazwischen, oder ein Wettlauf mit einem
+# Client, der GENAU JETZT klein anhaengt. Die Absendepruefung gleich unten
+# LIEST den Pane-Inhalt (Eingabezeile, Fusszeile) -- bei einer Zeile Hoehe
+# sieht sie nichts davon und meldet einen Fehlschlag, der keiner ist (genau
+# der gemeldete Betriebsfehler). Deshalb: erst pruefen und noetigenfalls
+# korrigieren, danach erst tippen -- nie umgekehrt. PI_WORKER_MIN_ZEILEN ist
+# oben am Dateianfang definiert (dieselbe Zahl, die auch der Split-Schutz vor
+# dem 'workers'-Fenster weiter oben benutzt).
+#
+# ZWEITER ANLASS (2026-08-20, drei Suiten wurden durch den Zusammenfuehren-Merge
+# rot: test-worker-rueckfragen.sh Fall 5, test-pi-worker-worktreehinweis.sh Fall C,
+# beide beim DRITTEN Worker in derselben Session): diese Absicherung prueft die
+# Hoehe des EINEN Panes, korrigiert aber die Hoehe des GANZEN Fensters -- und ein
+# Pane ist auch dann kurz, wenn er sich ein bereits ausreichend hohes Fenster nur
+# mit mehreren ANDEREN Workern teilt (normaler Zustand im 'split'-Layout: jeder
+# weitere Worker halbiert die Hoehe des naechsten Panes). Traf das zu, klemmte
+# `resize-window -y 12` das Fenster auf 12 Zeilen -- und SCHRUMPFTE damit ein
+# Fenster, das vorher genug Platz fuer weitere Panes hatte, dazu noch mit
+# `window-size manual` GESPERRT. Der naechste Worker, der in dasselbe Fenster
+# splitten wollte, fand keinen Platz mehr ("size or position no space for a new
+# pane") und wurde gar nicht erst angelegt -- gemessen, reproduziert mit genau
+# drei Workern in derselben Session, drittes Pane 9 Zeilen hoch, danach kein
+# vierter Split mehr moeglich.
+#
+# Der Fix: gewachsen wird nur, wenn das FENSTER selbst (nicht nur dieser eine
+# Pane) unter der Mindesthoehe liegt -- exakt der Fall aus dem ERSTEN Anlass
+# (Fenster 184x1, nicht nur ein einzelner kurzer Pane darin). Ein Fenster, das
+# schon hoch genug ist, wird nie angefasst, egal wie kurz einer seiner Panes
+# durch Teilen mit anderen geworden ist -- lieber ein Pane, den die
+# Absendepruefung im seltenen Fall knapp liest, als ein Fenster, das keinen
+# weiteren Worker mehr aufnimmt.
+PANE_HOEHE_VOR_TIPPEN="$(tmux display -p -t "$pane" '#{pane_height}' 2>/dev/null || true)"
+case "$PANE_HOEHE_VOR_TIPPEN" in
+  ''|*[!0-9]*) ;;   # Pane gerade nicht ansprechbar -- kein Rateversuch, weiter wie bisher
+  *)
+    if [ "$PANE_HOEHE_VOR_TIPPEN" -lt "$PI_WORKER_MIN_ZEILEN" ]; then
+      PANE_FENSTER="$(tmux display -p -t "$pane" '#{window_id}' 2>/dev/null || true)"
+      if [ -n "$PANE_FENSTER" ]; then
+        FENSTER_HOEHE_VOR_TIPPEN="$(tmux display -p -t "$PANE_FENSTER" '#{window_height}' 2>/dev/null || true)"
+        case "$FENSTER_HOEHE_VOR_TIPPEN" in
+          ''|*[!0-9]*) ;;
+          *)
+            if [ "$FENSTER_HOEHE_VOR_TIPPEN" -lt "$PI_WORKER_MIN_ZEILEN" ]; then
+              echo "pi-worker: Pane $pane ist nur $PANE_HOEHE_VOR_TIPPEN Zeile(n) hoch, das ganze Fenster nur $FENSTER_HOEHE_VOR_TIPPEN — hebe auf $PI_WORKER_MIN_ZEILEN an, bevor getippt wird (sonst ist die Absendepruefung blind)." >&2
+              tmux set-option -w -t "$PANE_FENSTER" window-size manual 2>/dev/null || true
+              tmux resize-window -t "$PANE_FENSTER" -y "$PI_WORKER_MIN_ZEILEN" 2>/dev/null || true
+            fi
+            ;;
+        esac
+      fi
+    fi
+    ;;
+esac
+
+# Wie die Eingabezeile aussieht, BEVOR wir sie ueberhaupt anfassen (2026-08-06,
+# erweitert 2026-08-20, KORRIGIERT 2026-08-20 nach test-rollen-generator.sh Fall G).
+# Diese Aufnahme ist die Referenz fuer den Vergleich "ohne Wortlaut" weiter unten:
+# sieht die Eingabezeile nach dem Absenden wieder so aus wie HIER, ist unser Text weg.
+# Sie muss VOR dem eigenen C-u entstehen, nicht danach: C-u ist selbst ein
+# Tastendruck, und ob er die Zeile wirklich LEERT statt nur ein Zeichen
+# hineinzuschreiben, haengt vom Harness ab. Gemessen an der Attrappe 'projektcli'
+# aus test-rollen-generator.sh Fall G (ein Harness, der C-u nicht als Zeile-loeschen
+# bindet, sondern roh als Zeichen liest, wie ein rohes tty.setraw() es tut): die
+# Referenz war bis heute die Aufnahme NACH C-u und trug damit das Steuerzeichen
+# selbst als Verfaelschung in sich -- die spaetere Ruhelage (der echte Platzhalter
+# nach dem Absenden) traf sie danach nie wieder, jeder Auftrag ueber diesen Harness
+# galt als haengend, obwohl er angekommen war. Manche TUIs zeigen in der leeren
+# Zeile ausserdem einen Vorschlag, und codex waehlt ihn beim Start aus einer Liste —
+# gemessen sind fuenf verschiedene. Eine feste Zeichenkette (promptIgnore) kann das
+# nicht fangen: sie trifft einen von fuenf, und in den uebrigen Faellen haelt die
+# Pruefung unten den Vorschlag fuer haengenden Text, tippt zweimal Enter nach und
+# meldet einen Fehlschlag, obwohl der Auftrag angekommen ist. Gemessen am selben Tag,
+# dass der Vorschlag INNERHALB einer Sitzung stabil bleibt: getippt, geloescht,
+# derselbe Vorschlag zurueck.
 INBOX_VORHER=""
 [ -n "$PROMPT_RE" ] && INBOX_VORHER=$(tmux capture-pane -p -t "$pane" 2>/dev/null | grep -E "$PROMPT_RE" | tail -1)
 
-printf '%s' "$MSG" | pane_einfuegen "$pane" || exit 1
+# Eingabezeile leeren, BEVOR ueberhaupt etwas eingefuegt wird (2026-08-20, Auftrag:
+# Zustellung kommt heute Nacht dreimal nicht an). Gemessener Befund: ein Auftrag
+# blieb ungesendet in der Box stehen, Enter wirkte nicht, nur Escape loeste ein
+# Neuzeichnen aus -- und das traf auch einen KURZEN Zeigertext, die Laenge
+# erklaert es also nicht. Was live half: C-u (Eingabezeile loeschen), DANACH
+# tippen. Das deutet auf liegengebliebenen Text VOR dem eigentlichen Einfuegen,
+# an den der neue Text angehaengt statt in eine leere Zeile getippt wurde --
+# C-u geht deshalb jetzt UNBEDINGT vor jedem Absenden raus, nicht erst als
+# Reparatur danach.
+pane_taste "$pane" C-u || zustellung_fehlgeschlagen "C-u an Pane $pane fehlgeschlagen (wb-pane-write taste) -- Eingabezeile konnte nicht geleert werden."
+sleep 1
+
+# Ob die Zeile hinterher wirklich leer ist, wird GEMESSEN, nicht angenommen
+# (dasselbe Prinzip wie ueberall in diesem Werkzeug): ohne PROMPT_RE kann das
+# niemand pruefen (Registry-Harness ohne gemessenes Muster) -- C-u geht trotzdem
+# unbedingt raus, das schadet einer leeren Zeile nicht. Mit PROMPT_RE wird
+# nachgesehen: bleibt die Zeile auch NACH C-u belegt (und ist es nicht bloss der
+# harmlose Platzhalter aus PROMPT_IGNORE, siehe oben), ist der Pane eingefroren
+# oder wirklich beschaeftigt -- dann wird JETZT NICHT hineingetippt. Ein
+# Fehlschlag hier ist ehrlicher als ein Paste in einen unbekannten Zustand.
+# EIGENE, FRISCHE Aufnahme (INBOX_NACH_CU, nicht INBOX_VORHER): dieser Schnappschuss
+# dient nur dieser einen Sofort-Pruefung und darf die Referenz von oben nicht
+# ueberschreiben, selbst wenn C-u hier sichtbar etwas hinterlassen hat.
+INBOX_NACH_CU=""
+[ -n "$PROMPT_RE" ] && INBOX_NACH_CU=$(tmux capture-pane -p -t "$pane" 2>/dev/null | grep -E "$PROMPT_RE" | tail -1)
+if [ -n "$PROMPT_RE" ] && printf '%s' "$INBOX_NACH_CU" | grep -qE "${PROMPT_RE}[[:space:]]+[^[:space:]]" \
+   && ! { [ -n "$PROMPT_IGNORE" ] && printf '%s' "$INBOX_NACH_CU" | grep -qE "$PROMPT_IGNORE"; }; then
+  zustellung_fehlgeschlagen "Eingabezeile in Pane $pane traegt nach C-u immer noch Text -- Pane vermutlich eingefroren oder beschaeftigt, kein Paste in einen unbekannten Zustand. Selbst ansehen: tmux capture-pane -p -t $pane"
+fi
+
+printf '%s' "$MSG" | pane_einfuegen "$pane" || zustellung_fehlgeschlagen "Einfuegen des Auftrags in Pane $pane fehlgeschlagen (wb-pane-write einfuegen)."
 # Hat das Einfuegen die Eingabezeile ueberhaupt VERAENDERT? Diese Frage entscheidet, ob
 # der Vergleich unten benutzt werden darf (2026-08-06, Befund aus test-registry.sh):
 # Ein Pane, dessen Zeile sich NIE aendert -- eine eingefrorene TUI mit altem Text im
@@ -1075,7 +2034,7 @@ if [ -n "$ALTSUBMIT_TRIGGER" ] && [ -n "$ALTSUBMIT_KEY" ] \
   ABSENDE_TASTE="$ALTSUBMIT_KEY"
   echo "pi-worker: Fusszeile zeigt den zweiten Absende-Weg dieses Harness an — sende '$ABSENDE_TASTE' statt Enter." >&2
 fi
-pane_taste "$pane" "$ABSENDE_TASTE" || exit 1
+pane_taste "$pane" "$ABSENDE_TASTE" || zustellung_fehlgeschlagen "'$ABSENDE_TASTE' an Pane $pane fehlgeschlagen (wb-pane-write taste)."
 
 # WIE LANGE GEWARTET WIRD, UND WORAN DAS HAENGT (2026-08-08).
 # Bis heute prüfte diese Stelle dreimal im Abstand von zwei Sekunden und tippte bei
@@ -1169,59 +2128,173 @@ if [ -n "$PROMPT_RE" ]; then
     [ "$(date +%s)" -ge "$absende_ende" ] && break
   done
   if [ -z "$submitted" ] && [ -n "$eingefroren" ]; then
-    echo "FEHLER: Prompt haengt noch in der Inputbox von Pane $pane — der Bildschirm hat sich seit dem Absenden nicht mehr bewegt (${nachgetippt} zusaetzliche '${ABSENDE_TASTE}' ohne Wirkung). Manuell pruefen (tmux send-keys -t $pane $ABSENDE_TASTE)." >&2
-    exit 1
+    zustellung_fehlgeschlagen "Prompt haengt noch in der Inputbox von Pane $pane — der Bildschirm hat sich seit dem Absenden nicht mehr bewegt (${nachgetippt} zusaetzliche '${ABSENDE_TASTE}' ohne Wirkung). Manuell pruefen (tmux send-keys -t $pane $ABSENDE_TASTE)."
   fi
+fi
 
-  # INHALTSPRUEFUNG (2026-08-17). Bis hierher hat die Schleife nur belegt, dass die
-  # EINGABEZEILE abgeschickt wurde -- nicht, dass der abgeschickte Text der
-  # Auftragstext war. Ein Paste, in den sich eine Terminalantwort mischt (gemessen:
-  # eine Device-Attributes-Antwort landete statt des Auftrags im Pane), leert die
-  # Eingabezeile genauso wie ein echtes Absenden und bestand die Pruefung oben
-  # unveraendert -- mit der Meldung "Submission verifiziert", auf die sich
-  # Orchestrator und Kontextwache verlassen. Deshalb erst HIER, NACHDEM die Zeile
-  # leer aussieht, der eigentliche Beleg: taucht $MARKER_INHALT (siehe oben, derselbe
-  # Marker, den record_worker_conversation schon fuer die Transkript-Zuordnung
-  # benutzt) irgendwo im Pane wieder auf? Nur wenn ja, hat WIRKLICH unser Auftrag
-  # das Terminal erreicht, nicht irgendein anderer Text, der die Zeile ebenso leert.
-  if [ -n "$submitted" ]; then
-    INHALT_FRIST=10   # Sekunden Gnadenfrist. Eingabezeile und Verlauf zeichnen im
-                       # selben Bildschirm-Neuzeichnen (siehe oben: "Neuzeichnen nach
-                       # einem Paste ist in unter einer Sekunde durch") -- 10s ist das
-                       # Zehnfache davon und bricht die Wartezeit ab, sobald der Beleg
-                       # da ist, kostet also im Regelfall nichts.
-    inhalt_ende=$(( $(date +%s) + INHALT_FRIST ))
-    beleg=""
-    while :; do
-      # -J: umgebrochene Zeilen werden vor der Suche wieder zusammengesetzt, sonst
-      # zerreisst ein Terminal-Umbruch mitten im Marker die Zeichenkette in zwei
-      # Fundstellen, die keine von beiden trifft. -S -2000: der Marker kann laengst
-      # aus dem sichtbaren Fenster gescrollt sein, bis der Harness zu antworten
-      # beginnt (Vorbild: derselbe Aufruf in wb-ssh-worker fuer dieselbe Frage).
-      if tmux capture-pane -p -J -S -2000 -t "$pane" 2>/dev/null | grep -qF -- "$MARKER_INHALT"; then
-        beleg=1; break
-      fi
-      [ "$(date +%s)" -ge "$inhalt_ende" ] && break
-      sleep 1
-    done
-    if [ -z "$beleg" ]; then
-      submitted=""
-      inhalt_fehlt=1
+fi   # Ende des Paste-Wegs
+
+# INHALTSPRUEFUNG (2026-08-17, seit 2026-08-20 fuer JEDEN Weg und JEDEN Harness).
+# Bis hierher hat die Schleife oben nur belegt, dass die EINGABEZEILE abgeschickt
+# wurde -- nicht, dass der abgeschickte Text der Auftragstext war. Ein Paste, in
+# den sich eine Terminalantwort mischt (gemessen: eine Device-Attributes-Antwort
+# landete statt des Auftrags im Pane), leert die Eingabezeile genauso wie ein
+# echtes Absenden und bestand die Pruefung oben unveraendert -- mit der Meldung
+# "Submission verifiziert", auf die sich Orchestrator und Kontextwache verlassen.
+# Der eigentliche Beleg ist deshalb dieser: taucht $MARKER_INHALT (derselbe
+# Marker, den record_worker_conversation fuer die Transkript-Zuordnung benutzt)
+# irgendwo im Pane wieder auf?
+#
+# ZWEI ERWEITERUNGEN am 2026-08-20:
+#   * Sie laeuft jetzt auch OHNE gemessenes promptPattern. Diese Pruefung braucht
+#     keines: sie liest den Bildschirm, nicht die Eingabezeile. Fuer kimi und
+#     opencode -- die beiden Harnesses, bei denen Zustellung bisher grundsaetzlich
+#     unbelegbar war -- ist damit wenigstens belegt, ob der Auftragstext ueberhaupt
+#     im Terminal ANGEKOMMEN ist. Genau diese Luecke hat zweimal einen Auftrag
+#     still verschluckt. Was sie dort NICHT belegt, bleibt beim Namen genannt: ob
+#     er auch abgeschickt wurde.
+#   * Sie belegt auch den Inbox-Weg. Gemessen am 2026-08-20: eine ueber die
+#     Socket-Inbox zugestellte Nachricht steht nach einer Sekunde im Pane -- also
+#     derselbe Beleg, dieselbe Stelle, kein zweiter Mechanismus.
+INHALT_FRIST=10   # Sekunden Gnadenfrist. Eingabezeile und Verlauf zeichnen im
+                  # selben Bildschirm-Neuzeichnen (siehe oben: "Neuzeichnen nach
+                  # einem Paste ist in unter einer Sekunde durch") -- 10s ist das
+                  # Zehnfache davon und bricht die Wartezeit ab, sobald der Beleg
+                  # da ist, kostet also im Regelfall nichts.
+# Der Inbox-Weg bekommt mehr Zeit: die Nachricht wird an der TURN-GRENZE
+# zugestellt. Ein frisch gestarteter Worker ist untaetig und nimmt sie sofort
+# (gemessen: 1 s), ein beschaeftigter erst nach seinem laufenden Zug -- und darauf
+# zu warten ist richtig, nicht ein Fehler.
+[ "$ZUSTELLWEG" = socket ] && INHALT_FRIST=60
+
+# ZWEI QUELLEN STATT EINER (2026-08-20, nach einem Fehlalarm im Betrieb).
+# Der Beleg hing bisher allein daran, dass die Oberflaeche den Auftrag auch
+# ANZEIGT. Das ist eine Menge Voraussetzungen fuer eine Ja/Nein-Frage: Pane-
+# Breite, Zeilenumbruch, Abkuerzung langer Pfade, Einklappen eingefuegter
+# Bloecke, Scrollback-Tiefe. Beim Worker 'dsharness' schlug die Pruefung Alarm,
+# obwohl der Auftrag angekommen war und der Worker schon arbeitete; nachstellen
+# liess sich der Fall danach in keiner der gemessenen Lagen (Nachricht 645 bis
+# 4884 Zeichen, Pane 50 bis 200 Spalten, Inline- und Dateizeiger-Weg, 60 s lang
+# jede Sekunde nachgesehen -- der Marker war immer da und blieb es). Wo eine
+# Ursache nicht feststeht, wird die Pruefung breiter statt schaerfer:
+#
+#   1. Der Pane, wie bisher, aber mit ZWEI Nadeln: dem Dateinamen und dem
+#      blossen Zeitstempel. Der Zeitstempel ist kuerzer und uebersteht eine
+#      Abkuerzung oder einen Umbruch, an dem der volle Name zerbricht; eindeutig
+#      ist er trotzdem, denn gesucht wird nur in DIESEM Pane und der vorige
+#      Auftrag desselben Panes trug einen anderen.
+#   2. Die GESPRAECHSDATEI der Sitzung (nur Claude Code, ueber `wb-inbox
+#      transcript`). Sie haengt an keiner Anzeige: dort steht der Auftragstext
+#      so, wie die Sitzung ihn bekommen hat. Gemessen am 2026-08-20: der Marker
+#      steht dort, kurz nachdem er im Pane erscheint.
+#
+# Beides zusammen belegt dieselbe Sache; ein Treffer genuegt. Die Datei wird nur
+# gelesen, nie geschrieben.
+# KANN DER PANE UEBERHAUPT ETWAS BELEGEN? (2026-08-20, zweite Runde, gemessen.)
+# Diese Frage stand bisher nirgends, und ihre Antwort ist bei Claude Code NEIN.
+# Der Harness laeuft im ALTERNATE SCREEN, und fuer den fuehrt tmux keinen
+# Verlauf: gemessen auf eigenem Socket ergibt alternate_on=1 ein
+# history_size=0, `capture-pane -S -2000` liefert dann nur das sichtbare Bild.
+# Das `-S -2000` unten ist dort also wirkungslos, und sobald die Sitzung nach
+# dem Empfang zu arbeiten anfaengt, ist der Marker aus den sichtbaren Zeilen
+# heraus und nie wieder zu finden. Gegengeprueft am Betrieb: alle 13 Panes der
+# drei laufenden Sessions standen auf alternate_on=1 und history_size=0.
+#
+# GEMESSEN, NICHT GEGLAUBT, mit der Registry als Rueckfall: gefragt wird zuerst
+# der Pane selbst (`alternate_on`), denn das ist die Tatsache, um die es geht --
+# fuehrt DIESER Pane einen Verlauf? Laesst sich das nicht ablesen (Pane
+# verschwunden, fremdes tmux), entscheidet das Feld `altScreen` des Harness aus
+# der Registry. Der Harness-NAME steht hier bewusst nirgends: die Eigenschaft
+# gehoert dem Harness, und die Registry fuehrt sie fuer jeden.
+PANE_FUEHRT_VERLAUF=1
+PANE_ALT="$(tmux display -p -t "$pane" '#{alternate_on}' 2>/dev/null)"
+case "$PANE_ALT" in
+  1) PANE_FUEHRT_VERLAUF=0 ;;
+  0) PANE_FUEHRT_VERLAUF=1 ;;
+  *) # Nicht ablesbar (Pane weg, fremdes tmux) -- dann sagt die Registry, was
+     # dieser Harness tut. `models harness-get` gibt den ganzen Eintrag aus,
+     # das eine Feld wird hier herausgelesen.
+     if "$HOME/.local/bin/wb-state" models harness-get "${RHARNESS:-$KIND}" 2>/dev/null \
+        | /usr/bin/python3 -c 'import json,sys
+try: sys.exit(0 if json.load(sys.stdin).get("altScreen") is True else 1)
+except Exception: sys.exit(1)'; then
+       PANE_FUEHRT_VERLAUF=0
+     fi ;;
+esac
+
+# Die Gespraechsdatei wird IN der Schleife gesucht, nicht einmal davor
+# (2026-08-20, zweite Runde: das war der zweite Teil des Fehlalarms). Ein
+# frisch gestarteter Worker hat seine Datei noch nicht, wenn hier zum ersten
+# Mal gefragt wird -- gemessen am eigenen Fall: Sitzung um 14:41:38 gestartet,
+# Datei um 14:41:40 angelegt, gefragt wurde um 14:41:38/39. Einmal gefragt und
+# nichts gefunden hiess bisher: diese Quelle bleibt fuer alle 60 Sekunden tot,
+# obwohl der Marker ab Sekunde 1 darin stand. Deshalb wird jede Runde neu
+# gefragt, solange noch kein Pfad steht.
+TRANSCRIPT_BELEG=""
+TRANSCRIPT_DA=""     # war die Gespraechsdatei je verfuegbar? Das entscheidet unten,
+                     # ob ein fehlender Marker ueberhaupt etwas bedeutet.
+inhalt_beleg=""
+inhalt_quelle=""
+inhalt_ende=$(( $(date +%s) + INHALT_FRIST ))
+while :; do
+  # -J: umgebrochene Zeilen werden vor der Suche wieder zusammengesetzt, sonst
+  # zerreisst ein Terminal-Umbruch mitten im Marker die Zeichenkette in zwei
+  # Fundstellen, die keine von beiden trifft. -S -2000: der Marker kann laengst
+  # aus dem sichtbaren Fenster gescrollt sein, bis der Harness zu antworten
+  # beginnt (Vorbild: derselbe Aufruf in wb-ssh-worker fuer dieselbe Frage).
+  BILD_BELEG="$(tmux capture-pane -p -J -S -2000 -t "$pane" 2>/dev/null)"
+  if printf '%s' "$BILD_BELEG" | grep -qF -- "$MARKER_INHALT"; then
+    inhalt_beleg=1; inhalt_quelle="Pane"; break
+  fi
+  if printf '%s' "$BILD_BELEG" | grep -qF -- "$TS"; then
+    inhalt_beleg=1; inhalt_quelle="Pane (Zeitstempel)"; break
+  fi
+  if [ "$KIND" = claude ] && [ -n "$WB_INBOX" ] && [ -z "$TRANSCRIPT_BELEG" ]; then
+    TRANSCRIPT_BELEG="$("$WB_INBOX" transcript "$pane" 2>/dev/null)"
+  fi
+  if [ -n "$TRANSCRIPT_BELEG" ] && [ -f "$TRANSCRIPT_BELEG" ]; then
+    TRANSCRIPT_DA=1
+    if grep -qF -- "$MARKER_INHALT" "$TRANSCRIPT_BELEG" 2>/dev/null; then
+      inhalt_beleg=1; inhalt_quelle="Gespraechsdatei"; break
     fi
   fi
+  [ "$(date +%s)" -ge "$inhalt_ende" ] && break
+  sleep 1
+done
+if [ -n "$submitted" ] && [ -z "$inhalt_beleg" ]; then
+  submitted=""
+  inhalt_fehlt=1
 fi
 
 # Ohne gemessenes promptPattern wird NICHT behauptet, was nicht geprueft wurde: der
 # Task ist eingefuegt und Enter ist gesendet, aber ob die Inputbox leer ist, weiss
 # hier niemand. Genau diese Luecke hat schon zweimal einen Task still verschluckt —
 # mit einer Erfolgsmeldung darueber waere sie unauffindbar.
-if [ -n "$submitted" ]; then
+if [ "$submitted" = inbox ]; then
+  echo "Task an Chat-Agent '$NAME' ($MODEL, Pane $pane) ueber die Sitzungs-Inbox zugestellt (Ankunft belegt: $inhalt_quelle) — nichts getippt."
+elif [ -n "$submitted" ]; then
   echo "Task an Chat-Agent '$NAME' ($MODEL, Pane $pane) gesendet (Submission verifiziert)."
+elif [ -n "${inhalt_fehlt:-}" ] && [ "$ZUSTELLWEG" = socket ] && [ "${INBOX_ZUSTAND:-}" = busy ]; then
+  # Der eine Fall, in dem ein fehlender Beleg KEIN Fehlschlag ist: die Sitzung war
+  # beim Absenden mitten in einem Zug, und die Inbox stellt erst an dessen Grenze
+  # zu. Behauptet wird deshalb weder Erfolg noch Misserfolg -- und der Platzhalter
+  # bleibt zu Recht stehen, denn dieser Worker ARBEITET nachweislich.
+  echo "Task an Chat-Agent '$NAME' ($MODEL, Pane $pane) in die Sitzungs-Inbox gelegt —"
+  echo "  Zustellung steht noch aus: die Sitzung war beschaeftigt, die Nachricht kommt"
+  echo "  an der naechsten Turn-Grenze an. Beleg nach ${INHALT_FRIST}s noch nicht da."
+  echo "  Nachsehen: tmux capture-pane -p -t $pane   (gesucht: '$MARKER_INHALT')"
+elif [ -n "${inhalt_fehlt:-}" ] && [ "$PANE_FUEHRT_VERLAUF" = 0 ] && [ -z "$TRANSCRIPT_DA" ]; then
+  # BEIDE Quellen waren blind, also sagt ihr Schweigen nichts (2026-08-20,
+  # reproduziert): der Pane fuehrt keinen Verlauf (Alternate Screen), und eine
+  # Gespraechsdatei gab es in der ganzen Frist nicht -- der Normalfall bei einem
+  # frisch gestarteten Worker, dessen Datei erst zwei Sekunden nach dem Start
+  # entsteht. Genau diese Lage hat heute zwei arbeitende Worker als gescheitert
+  # gemeldet. Ein fehlender Beleg ist hier kein Gegenbeleg.
+  zustellung_unentschieden "der Auftragstext ist nicht wiederzufinden (gesucht: '$MARKER_INHALT' und '$TS', ${INHALT_FRIST}s), aber beide Belegquellen waren blind — der Pane fuehrt keinen Verlauf (Alternate Screen, history_size 0) und eine Gespraechsdatei gab es in dieser Zeit noch nicht. Ob der Auftrag ankam, ist damit offen, NICHT widerlegt."
+elif [ -n "${inhalt_fehlt:-}" ] && [ "$ZUSTELLWEG" = socket ]; then
+  zustellung_fehlgeschlagen "In die Sitzungs-Inbox von Pane $pane wurde geschrieben, aber der Auftragstext ist weder im Pane noch in der Gespraechsdatei wiederzufinden (gesucht: '$MARKER_INHALT' und '$TS', ${INHALT_FRIST}s gewartet), obwohl die Sitzung beim Absenden untaetig war ('${INBOX_ZUSTAND:-unbekannt}'). Geschrieben heisst nicht angekommen. Selbst ansehen: tmux capture-pane -p -t $pane"
 elif [ -n "${inhalt_fehlt:-}" ]; then
-  echo "FEHLER: Eingabezeile in Pane $pane ist leer, aber der Auftragstext ist dort nicht wiederzufinden (gesucht: '$MARKER_INHALT', ${INHALT_FRIST}s gewartet)." >&2
-  echo "  Die Zeile allein zu leeren belegt kein Absenden -- irgendein anderer Text kann sie ebenso geleert haben." >&2
-  echo "  Selbst ansehen und, falls noetig, den Auftrag erneut schicken: tmux capture-pane -p -t $pane" >&2
-  exit 1
+  zustellung_fehlgeschlagen "Eingabezeile in Pane $pane ist leer, aber der Auftragstext ist nicht wiederzufinden (gesucht: '$MARKER_INHALT' und '$TS', ${INHALT_FRIST}s gewartet, Pane und -- soweit vorhanden -- Gespraechsdatei). Die Zeile allein zu leeren belegt kein Absenden -- irgendein anderer Text kann sie ebenso geleert haben. Selbst ansehen und, falls noetig, den Auftrag erneut schicken: tmux capture-pane -p -t $pane"
 elif [ -n "$PROMPT_RE" ]; then
   # Der dritte Ausgang, neu am 2026-08-08: die Frist ist um, die Eingabezeile traegt den
   # Text noch, aber der Pane BEWEGT sich. "Haengt" ist das nicht -- ein eingefrorener Pane
@@ -1232,12 +2305,19 @@ elif [ -n "$PROMPT_RE" ]; then
   echo "  Submission NICHT verifiziert: die Eingabezeile traegt den Text nach ${ABSENDE_FRIST}s"
   echo "  noch, der Pane arbeitet aber (Bildschirm bewegt sich). Keine weitere '$ABSENDE_TASTE' getippt."
   echo "  Selbst ansehen: tmux capture-pane -p -t $pane"
-else
+elif [ -n "$inhalt_beleg" ]; then
+  # Kein gemessenes promptPattern -- die Eingabezeile ist hier nicht lesbar. Was
+  # sich TROTZDEM messen laesst, ist seit 2026-08-20 gemessen: der Auftragstext
+  # steht im Pane, er ist also wirklich dort angekommen. Genau der Fall, der
+  # zweimal still verschluckt wurde, faellt damit ab jetzt auf. Was weiterhin
+  # offen bleibt, steht daneben und wird nicht schoengeredet.
   echo "Task an Chat-Agent '$NAME' ($MODEL, Pane $pane) eingefuegt und '$ABSENDE_TASTE' gesendet —"
-  echo "  Submission NICHT verifizierbar: Harness '${RHARNESS:-?}' hat kein gemessenes"
-  echo "  promptPattern. Messen: wb-harness-probe ${RHARNESS:-<harness>} ; danach"
+  echo "  ANGEKOMMEN ist er: der Auftragstext ('$MARKER_INHALT') ist wiederzufinden — Quelle: $inhalt_quelle."
+  echo "  Ob er auch ABGESCHICKT wurde, ist bei Harness '${RHARNESS:-?}' nicht pruefbar"
+  echo "  (kein gemessenes promptPattern). Messen: wb-harness-probe ${RHARNESS:-<harness>} ; danach"
   echo "  wb-state models set --kind harness ${RHARNESS:-<harness>} promptPattern '\"<muster>\"'"
-  echo "  Bis dahin: Pane selbst ansehen, ob der Task wirklich abgeschickt wurde."
+else
+  zustellung_fehlgeschlagen "Der Auftragstext ist in Pane $pane nicht wiederzufinden (gesucht: '$MARKER_INHALT' und '$TS', ${INHALT_FRIST}s gewartet), und Harness '${RHARNESS:-?}' hat kein gemessenes promptPattern, an dem sich das Absenden ablesen liesse. Es ist also weder belegt, dass der Auftrag angekommen ist, noch dass er abgeschickt wurde. Selbst ansehen: tmux capture-pane -p -t $pane"
 fi
 echo "Ergebnis-Datei: $RES (latest.md zeigt bis dahin auf einen Platzhalter, danach auf diese Datei: $RESDIR/latest.md)"
 echo "Auftrag Nr. $(grep -cv '^#' "$AUFTRAEGE" 2>/dev/null || echo 1) fuer '$NAME' — Buch: $AUFTRAEGE"

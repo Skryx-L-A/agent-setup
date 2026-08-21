@@ -1,7 +1,7 @@
 // Bauskript. esbuild statt tsc, weil der Renderer xterm.js mitbuendeln muss und
 // tsc dafuer einen zweiten Buendler braeuchte. Typen prueft `npm run typecheck`.
 import { build } from 'esbuild';
-import { cpSync, mkdirSync } from 'node:fs';
+import { cpSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -10,14 +10,53 @@ const out = join(root, 'dist');
 
 const common = { bundle: true, platform: 'node', target: 'node20', sourcemap: false, logLevel: 'info' };
 
-await build({
+// ATOMARER SCHREIBWEG (Auftrag 2026-08-19, Betriebsfehler: viele native
+// JS-Fehlerfenster waehrend eines parallelen Testlaufs, ausgeloest durch
+// einen Bau von Hand mitten im Lauf). esbuild schreibt sein `outfile`
+// in-place -- gemessen: die Inode-Nummer von dist/main/main.js aendert sich
+// ueber einen Bau NICHT, es ist truncate+write auf DIESELBE Datei, kein
+// Tempfile-plus-Umbenennen. Ein Electron-Hauptprozess, der GENAU in diesem
+// Fenster `require()`t (ein frisch gestarteter Testlauf, waehrend jemand von
+// Hand baut), kann die Datei abgeschnitten lesen -- Node wirft dabei eine
+// SyntaxError beim Laden, UNCAUGHT, weit bevor irgendein eigener
+// Fehler-Handler dieses Programms ueberhaupt existiert (der Handler steht ja
+// selbst in der Datei, die gerade nicht vollstaendig geladen werden konnte).
+// Electron zeigt fuer genau diesen Fall standardmaessig eine native
+// Fehlerbox -- das ist die Box, die alice gesehen hat.
+//
+// GEMESSEN, nicht vermutet: ein Leser, der waehrend eines echten Baus mit
+// realistischer Gegenlast (mehrere gleichzeitige Bauten UND mehrere
+// gleichzeitige Leser, wie bei bis zu acht parallelen Testinstanzen) einige
+// zehntausend Mal pro Sekunde liest und parst, traf die abgeschnittene Datei
+// mehrfach -- jedesmal mit exakt diesem Fehlerbild (SyntaxError). Ein
+// einzelner Bau ohne Gegenlast traf das Fenster in derselben Messung kein
+// einziges Mal unter rund 30000 Versuchen: schmal, aber nicht Null, und
+// genau unter Gegenlast (der Alltag eines parallelen Laufs) am wahrscheinlichsten.
+//
+// Der Fix: esbuild schreibt NICHT mehr selbst (`write:false`), dieses Skript
+// schreibt stattdessen in eine Tempdatei im SELBEN Ordner (also demselben
+// Dateisystem) und benennt sie um. `rename()` innerhalb eines Dateisystems
+// ist auf macOS wie Linux atomar -- ein gleichzeitiger Leser sieht IMMER
+// entweder die alte oder die neue Datei vollstaendig, nie etwas dazwischen.
+async function buildAtomic(opts) {
+  const ergebnis = await build({ ...opts, write: false });
+  for (const datei of ergebnis.outputFiles) {
+    mkdirSync(dirname(datei.path), { recursive: true });
+    const tmp = `${datei.path}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    writeFileSync(tmp, datei.contents);
+    renameSync(tmp, datei.path);
+  }
+  return ergebnis;
+}
+
+await buildAtomic({
   ...common,
   entryPoints: [join(root, 'src/main/main.ts')],
   outfile: join(out, 'main/main.js'),
   external: ['electron'],
 });
 
-await build({
+await buildAtomic({
   ...common,
   entryPoints: [join(root, 'src/preload/preload.ts')],
   outfile: join(out, 'preload/preload.js'),
@@ -26,7 +65,7 @@ await build({
 
 // A9: die Bruecke des Einstellungsfensters. Eigene Datei, weil dieses Fenster
 // nichts von dem braucht, was das Hauptfenster bekommt.
-await build({
+await buildAtomic({
   ...common,
   entryPoints: [join(root, 'src/preload/einstellungen-preload.ts')],
   outfile: join(out, 'preload/einstellungen-preload.js'),
@@ -35,7 +74,7 @@ await build({
 
 // A9: die Oberflaeche des Einstellungsfensters. Ohne minify -- sie zieht kein
 // Monaco mit und soll im Fehlerfall lesbar sein.
-await build({
+await buildAtomic({
   ...common,
   platform: 'browser',
   target: 'chrome120',
@@ -47,14 +86,14 @@ await build({
 // aus denselben zwei Gruenden wie beim Einstellungsfenster. Die Bruecke reicht
 // nur die vier Wege durch, die dieses Fenster braucht; die Oberflaeche bleibt
 // ohne minify, weil sie kein Monaco mitzieht und im Fehlerfall lesbar sein soll.
-await build({
+await buildAtomic({
   ...common,
   entryPoints: [join(root, 'src/preload/sitzung-preload.ts')],
   outfile: join(out, 'preload/sitzung-preload.js'),
   external: ['electron'],
 });
 
-await build({
+await buildAtomic({
   ...common,
   platform: 'browser',
   target: 'chrome120',
@@ -66,7 +105,7 @@ await build({
 // sitzung.ts -- an sitzung.ts arbeitet parallel die Sprachschicht, und die CSP
 // dieses Fensters ('script-src self', kein 'unsafe-inline') laesst ohnehin nur
 // ein zweites <script src> zu, kein Inline-Skript in index.html.
-await build({
+await buildAtomic({
   ...common,
   platform: 'browser',
   target: 'chrome120',
@@ -86,14 +125,14 @@ await build({
 // denselben zwei Gruenden wie beim Einstellungs- und beim Sitzungsfenster. Die Bruecke reicht
 // nur zwei Wege durch (Daten holen, Bereitschaft melden), die Oberflaeche bleibt ohne minify:
 // sie zieht kein Monaco mit und soll im Fehlerfall lesbar sein.
-await build({
+await buildAtomic({
   ...common,
   entryPoints: [join(root, 'src/preload/verbrauch-preload.ts')],
   outfile: join(out, 'preload/verbrauch-preload.js'),
   external: ['electron'],
 });
 
-await build({
+await buildAtomic({
   ...common,
   platform: 'browser',
   target: 'chrome120',
@@ -104,14 +143,14 @@ await build({
 // Der geführte erste Start (SPEC-V4 3.8): eigene Bruecke, eigene Oberflaeche -- aus denselben
 // zwei Gruenden wie bei den drei Geschwistern. Die Bruecke reicht nur drei Wege durch (Daten
 // holen, einen Schluessel schreiben, Bereitschaft melden); die Oberflaeche bleibt ohne minify.
-await build({
+await buildAtomic({
   ...common,
   entryPoints: [join(root, 'src/preload/erststart-preload.ts')],
   outfile: join(out, 'preload/erststart-preload.js'),
   external: ['electron'],
 });
 
-await build({
+await buildAtomic({
   ...common,
   platform: 'browser',
   target: 'chrome120',
@@ -140,7 +179,7 @@ const monacoDraussen = {
   },
 };
 
-await build({
+await buildAtomic({
   ...common,
   platform: 'browser',
   target: 'chrome120',
@@ -162,7 +201,7 @@ await build({
 // <link rel="stylesheet" href="monaco-bootstrap.css"> ins Dokument; ein Name
 // mehr oder weniger an einer der beiden Stellen laesst den Editor schmucklos
 // erscheinen, ohne dass irgendetwas abbricht.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   platform: 'browser',
@@ -178,7 +217,7 @@ await build({
 // sie durch Fenster und Bildlaufpuffer hindurch zu erraten -- der Puffer im
 // Renderer haelt 5000 Zeilen, eine flutende Sitzung schiebt die Naht in
 // Sekundenbruchteilen darueber hinaus.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/tmux.ts')],
@@ -191,11 +230,24 @@ await build({
 // streuen dafuer um Hunderte von Millisekunden; zwei node-Prozesse an einem
 // gemeinsamen Startsignal treffen ihn zuverlaessig -- mit demselben Quelltext,
 // nicht mit einer Nachstellung.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/control.ts')],
   outfile: join(out, 'test/control.mjs'),
+});
+
+// `fuehreAus()` einzeln, aus demselben Grund wie tmux.ts/control.ts: kein
+// Electron noetig (nur node:child_process/fs/os/path), und genau hier wurde
+// das Warten auf die neue tmux-Session bis zu 20s lang blockierend im
+// Hauptfaden verbracht (`spawnSync('sleep', ...)`, behoben 20.08.). Ob die
+// Ereignisschleife waehrenddessen wirklich weiterlaeuft, laesst sich nur an
+// diesem eigenstaendigen Modul messen, nicht durch das ganze Fenster hindurch.
+await buildAtomic({
+  ...common,
+  format: 'esm',
+  entryPoints: [join(root, 'src/main/befehle.ts')],
+  outfile: join(out, 'test/befehle.mjs'),
 });
 
 // Das Sessionmodell einzeln, aus demselben Grund wie die beiden davor: Der
@@ -204,25 +256,36 @@ await build({
 // auch pruefbar sein: gegen ein eigenes HOME und einen eigenen tmux-Socket,
 // ohne dass ein Fenster entsteht. Ueber dist/main/main.js ginge das nicht, das
 // zieht Electron mit hinein.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/sessions.ts')],
   outfile: join(out, 'test/sessions.mjs'),
 });
 
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/results.ts')],
   outfile: join(out, 'test/results.mjs'),
 });
 
+// Die Auswertung des Startprotokolls einzeln (21.08.): sie entscheidet, ob eine
+// Sitzung gestartet ist und was der Mensch als Grund zu sehen bekommt, wenn
+// nicht. Reine Textarbeit ohne Fenster und ohne Electron -- und genau so
+// pruefbar, gegen echte wb-code-Ausgaben.
+await buildAtomic({
+  ...common,
+  format: 'esm',
+  entryPoints: [join(root, 'src/main/startprotokoll.ts')],
+  outfile: join(out, 'test/startprotokoll.mjs'),
+});
+
 // Der Oberflaechen-Zustand einzeln (16.08.): `ui.set()` schreibt ui.json bei
 // JEDEM Aufruf (writeFileSync + renameSync). Was ein einzelner Aufruf kostet,
 // gehoert gemessen und nicht geschaetzt -- daran haengt, warum das Ziehen der
 // Seitenleiste nicht mehr je Mausbewegung speichert.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/uistate.ts')],
@@ -233,7 +296,7 @@ await build({
 // -- die Reihenfolge je Pane und das Abgeben vor jeder Momentaufnahme --, und
 // beide muessen an ECHTEN Stuecken messbar sein, ohne dass dafuer ein Fenster
 // entsteht. Ueber dist/main/main.js ginge das nicht, das zieht Electron mit.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/ausgabe.ts')],
@@ -243,7 +306,7 @@ await build({
 // Der Editor einzeln, aus demselben Grund: Seine Ausschlussliste kommt seit
 // Schritt 7 aus den Einstellungen, und genau das muss gegen ein eigenes HOME
 // pruefbar sein -- ohne Fenster und ohne Electron.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/editor.ts')],
@@ -254,7 +317,7 @@ await build({
 // Funktion (Text -> RemoteSnapshot) und `RemotePoller` treibt echte
 // Kindprozesse -- beides soll pruefbar sein, ohne dass main.js mit Electron
 // mitkommt.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/remote.ts')],
@@ -263,7 +326,7 @@ await build({
 
 // V13, aus demselben Grund: `parseBudget` ist rein, `BudgetPoller` treibt
 // einen echten Kindprozess.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/budget.ts')],
@@ -272,7 +335,7 @@ await build({
 
 // V12: `ampel.ts` bewertet reine Textdateien, ohne jedes I/O -- trotzdem
 // einzeln gebuendelt, damit eine Suite sie ohne main.js pruefen kann.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/ampel.ts')],
@@ -281,7 +344,7 @@ await build({
 
 // V14: `reviveCommand`/`darfWiederherstellen` sind reine Funktionen -- kein
 // Kindprozess in dieser Datei selbst, der entsteht erst in main.ts.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/revive.ts')],
@@ -292,7 +355,7 @@ await build({
 // sitzung.ts herausgezogen, weil dessen Modul beim Laden sofort das DOM
 // anfasst und sich darum nicht nackt in node laden laesst -- siehe den
 // Kopfkommentar von src/sitzung/filter.ts.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/sitzung/filter.ts')],
@@ -303,7 +366,7 @@ await build({
 // Zustand -- welcher Schritt als nächstes kommt, was ein Überspringen bedeutet, dass
 // `erststartErledigt` beim Abschluss GENAU EINMAL geschrieben wird -- kein DOM, kein Electron.
 // Genau so muss sich das prüfen lassen.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/erststart/ablauf.ts')],
@@ -315,7 +378,7 @@ await build({
 // nur `LebensSpur` fasst dafuer eine Datei an. Die Regel muss ohne Electron
 // und ohne Dateisystem messbar sein, sonst laesst sich der Absturzfall nur
 // nachstellen, indem man einen Rechner abstuerzen laesst.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/lebensspur.ts')],
@@ -328,11 +391,31 @@ await build({
 // dass ein Aufruf OHNE Klick gar nichts startet, und dass der Aufruf MIT Klick
 // genau die Argumente und die Umgebung mitgibt, an denen die Herkunft gemessen
 // wird. Ueber dist/main/main.js ginge das nicht, das zieht Electron mit herein.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/freigaben.ts')],
   outfile: join(out, 'test/freigaben.mjs'),
+});
+
+// Die Freigabe-ANSICHT einzeln (19.08.), als IIFE fuer ein kopfloses Fenster.
+// Geprueft werden muss hier etwas, das nur ein echtes Dokument hat: dass der
+// getippte Satz im Begruendungsfeld, der Fokus und die Schreibmarke ein
+// Neuzeichnen ueberleben. Ueber dist/renderer/renderer.js ginge das nicht --
+// das Buendel zieht xterm und die ganze Buehne mit und sucht beim Laden sofort
+// eine Bruecke zum Hauptprozess. IIFE statt ESM, weil Chromium ein Modul von
+// file:// nicht laedt (Herkunft 'null'); shell/tests/test-app-freigabe-eingabe.sh
+// laedt das Buendel als gewoehnliches <script> und greift ueber den globalen
+// Namen darauf zu.
+await buildAtomic({
+  ...common,
+  format: 'iife',
+  globalName: 'AwbFreigabenAnsicht',
+  platform: 'browser',
+  target: 'chrome120',
+  entryPoints: [join(root, 'src/renderer/freigaben-view.ts')],
+  outfile: join(out, 'test/freigaben-view.js'),
+  loader: { '.css': 'css' },
 });
 
 // Die Konfiguration einzeln: Die Musterliste der Rueckfrage-Stufe steht als
@@ -340,7 +423,7 @@ await build({
 // einzeln lauffaehig bleiben. Zwei Kopien laufen auseinander, wenn niemand
 // hinsieht, also sieht shell/tests/test-app-muster.sh hin und vergleicht sie
 // gegeneinander. Dafuer muss die Vorgabe ohne Electron lesbar sein.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/config.ts')],
@@ -352,7 +435,7 @@ await build({
 // gestartet wurde. Genau dieser Fall muss messbar sein -- in einer Umgebung
 // wie der von launchd (`env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin`), und ohne
 // dass dafuer ein Fenster oder Electron entsteht.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/pfad.ts')],
@@ -365,7 +448,7 @@ await build({
 // aendert, aendert BEIDE Stellen" -- ein Satz, der ohne Pruefung nur ein Wunsch
 // ist. shell/tests/test-vorgaben-paritaet.sh vergleicht beide, und dafuer muss
 // die Tabelle ohne Electron lesbar sein.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/einstellungen.ts')],
@@ -377,7 +460,7 @@ await build({
 // ohne jedes Electron-I/O und soll es bleiben -- ein eigenes Buendel haelt sie
 // mit blossem `node` pruefbar, dieselbe Bauform wie bei `einstellungen.ts`
 // direkt darueber, von dem diese Datei ihrerseits liest.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/thema.ts')],
@@ -392,7 +475,7 @@ await build({
 // und die Zahlen es auch sein muessen. shell/tests/test-vorgaben-paritaet.sh
 // rechnet sie gegeneinander, und dafuer muss die Konstante ohne Electron
 // lesbar sein.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/workerstate.ts')],
@@ -410,7 +493,7 @@ await build({
 // Grund: seiten.ts sucht den Symbolordner ueber `__dirname` (medienOrdner()).
 // Den gibt es in einem ESM-Buendel nicht, der Aufruf wuerde mit einem
 // ReferenceError abbrechen, bevor die erste Karte entsteht.
-await build({
+await buildAtomic({
   ...common,
   format: 'cjs',
   entryPoints: [join(root, 'src/main/seiten.ts')],
@@ -422,7 +505,7 @@ await build({
 // eigene Achse braucht, sind REINE Funktionen -- kein DOM, kein Electron, keine Datei. Genau so
 // muessen sie pruefbar sein. Ueber dist/verbrauch/verbrauch.js ginge das nicht: das ist ein
 // Browser-Buendel, das beim Laden sofort ein Fenster sucht.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/verbrauch/rechnen.ts')],
@@ -432,7 +515,7 @@ await build({
 // Die Beschriftungstabelle ebenfalls einzeln: dass jeder Schluessel, den die Oberflaeche
 // abfragt, auch einen Text hat, ist eine Zusage, die nur ein Test halten kann -- ein
 // Typpruefer sieht eine Zeichenkette, keinen fehlenden Tabelleneintrag.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/verbrauch/texte.ts')],
@@ -443,7 +526,7 @@ await build({
 // und `SchwellenMelder` sind die Entscheidung, wer ueberhaupt meldet -- ohne
 // Electron pruefbar, mit einer Attrappe statt osascript/notify-send/afplay/
 // paplay/HTTP-POST fuer die Sendewege selbst.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/melden.ts')],
@@ -457,14 +540,14 @@ await build({
 // einem lokalen Server. Beides muss ohne Electron pruefbar sein: der erste Teil
 // ist reine Umformung, der zweite fasst nur Dateien und Kindprozesse an, und
 // ueber dist/main/main.js ginge keins von beiden, das zieht Electron mit.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/chat/rein.ts')],
   outfile: join(out, 'test/chat-rein.mjs'),
 });
 
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/chatquelle.ts')],
@@ -474,7 +557,7 @@ await build({
 // Der enge Registry-Leser hinter dem Chat-Schalter im Einstellungsfenster
 // (`chatQuellen`, SPEC-V4 6.3), aus einstellungsfenster.ts herausgeloest und
 // einzeln gebuendelt: die Datei fasst nur die Registry an, kein Fenster.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/chatschalter.ts')],
@@ -486,7 +569,7 @@ await build({
 // `Sendewege` in melden.ts) -- ein Test ersetzt ihn durch eine Attrappe und ruehrt
 // nie den echten Schluesselbund an. Ohne Electron pruefbar: die Datei fasst nur
 // `security` ueber `child_process.spawnSync` an, sonst nichts.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/schluesselbund.ts')],
@@ -499,21 +582,21 @@ await build({
 // Electron gegen die echten Mitschnitte pruefbar sein. Dazu die Befehlszeile
 // aus main/chatsitzung.ts -- das eine Stueck der Prozess-Steuerung, dessen
 // Fehler still bliebe (ein vergessenes Flag macht die Anzeige nur aermer).
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/chat/sdkstrom.ts')],
   outfile: join(out, 'test/chat-sdkstrom.mjs'),
 });
 
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/chatregistry.ts')],
   outfile: join(out, 'test/chatregistry.mjs'),
 });
 
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/chatsitzung.ts')],
@@ -527,7 +610,7 @@ await build({
 // stdout-Stuecken GESAMMELT hinausgeht statt je Stueck einmal, und dass
 // Schloss und Werkstatt erst fallen, wenn der Kindprozess wirklich weg ist.
 // Ueber dist/main/main.js ginge beides nicht, das zieht Electron mit herein.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/chatbuehne.ts')],
@@ -540,14 +623,14 @@ await build({
 // Listen), `main/chatdateien.ts` besorgt die Dateiliste ueber `git ls-files`.
 // Der Klassenteil der ersten Datei fasst DOM an, wird hier aber nur gebuendelt,
 // nicht ausgefuehrt -- die Tests rufen ausschliesslich die reinen Funktionen.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/chatbuehne/vervollstaendigung.ts')],
   outfile: join(out, 'test/vervollstaendigung.mjs'),
 });
 
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/chatdateien.ts')],
@@ -557,7 +640,7 @@ await build({
 // Die Werkstatt einer Chat-Sitzung (Punkt 1, 12.08.): sie fasst NUR tmux an,
 // ueber `spawnSync`, und laesst sich damit gegen einen eigenen Testsocket
 // pruefen -- ohne Electron und ohne die laufende Sitzung eines Menschen.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/chatwerkstatt.ts')],
@@ -570,14 +653,14 @@ await build({
 // gegen eine gestellte Uhr vollstaendig durchspielen; `main/chatwache.ts`
 // fasst nur Dateien an und bekommt Sitzung, Uhr und Schwellen von aussen. Eine
 // Wache, die man nicht ohne echte Sitzung pruefen kann, wird nie geprueft.
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/chat/wache.ts')],
   outfile: join(out, 'test/chat-wache.mjs'),
 });
 
-await build({
+await buildAtomic({
   ...common,
   format: 'esm',
   entryPoints: [join(root, 'src/main/chatwache.ts')],

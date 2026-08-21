@@ -5,14 +5,26 @@
 // der Hauptprozess bereits mit `show:false` gebaut hat (erststartfenster.ts) -- ob es sichtbar
 // wird, entscheidet ausschließlich der Hauptprozess.
 import {
-  anfang, schrittName, ueberspringen, weiter, SCHRITTE,
+  anfang, mitKontext, schrittName, ueberspringen, weiter, SCHRITTE,
   type ErststartZustand, type SettingsSchreibung,
 } from './ablauf';
 import { setzeSprache, sprache, t } from './texte';
 
 interface HarnessZeile { id: string; label: string; startbar: boolean }
-interface ModellZeile { id: string; label: string; harness: string }
+/** `lokal`: läuft das Modell auf dieser Maschine? Nur dann gibt es ein Kontextfenster zu wählen. */
+interface ModellZeile { id: string; label: string; harness: string; lokal: boolean }
 interface AnmeldeZeile { stand: 'ja' | 'nein' | 'unbekannt'; grund: string }
+
+/** Eine wählbare Kontextstufe -- dieselbe Form wie in main/kontext.ts. */
+interface KontextStufe {
+  tokens: number;
+  label: string;
+  bedarfGib: number;
+  passt: boolean;
+  hinweis: string | null;
+}
+interface KontextSicht { vorgabe: number; empfehlung: number; stufen: KontextStufe[] }
+type KontextAntwort = { ok: true; sicht: KontextSicht } | { ok: false; fehler: string };
 
 interface ErststartDaten {
   machine: string;
@@ -41,6 +53,8 @@ declare global {
       daten(): Promise<ErststartDaten>;
       setzen(key: string, value: unknown): Promise<{ ok: boolean; ausgabe: string }>;
       bereit(): void;
+      /** Die wählbaren Kontextfenster EINES lokalen Modells. Nur Lesen. */
+      kontextStufen(modellId: string): Promise<KontextAntwort>;
       /** Farben durchreichen (11.08.): einmal alles, aus main/thema.ts. */
       thema(): Promise<ThemaPayload>;
       onThema(fn: (p: ThemaPayload) => void): void;
@@ -177,25 +191,130 @@ function schrittHarness(d: ErststartDaten): HTMLElement {
   return frag;
 }
 
+/**
+ * DAS KONTEXTFENSTER IM DRITTEN SCHRITT -- die zweite Frage derselben Seite.
+ *
+ * Sie erscheint nur, wenn das gerade gewählte Modell auf DIESER Maschine läuft:
+ * bei einem Modell aus der Cloud gehört die Zahl dem Anbieter, und ein Feld
+ * dafür wäre ein Schalter ohne Wirkung. Wer das Modell wechselt, sieht den
+ * Block deshalb kommen und gehen.
+ *
+ * JEDE STUFE BLEIBT WÄHLBAR, auch die, für die der Speicher gerade nicht
+ * reicht -- sie trägt ihren Hinweis und sonst nichts. Das ist des Nutzers
+ * ausdrückliche Vorgabe und dieselbe Regel wie im Einstellungsfenster.
+ */
+const kontextStand: Record<string, KontextAntwort> = {};
+const kontextLaeuft = new Set<string>();
+/** Der Kasten unter den Modell-Chips. Er wird neu gefüllt, wenn die Wahl umspringt. */
+let kontextKasten: HTMLElement | null = null;
+
+function kontextFuellen(modellId: string, modelle: ModellZeile[]): void {
+  const kasten = kontextKasten;
+  if (!kasten) return;
+  kasten.textContent = '';
+  const modell = modelle.find((m) => m.id === modellId);
+  if (!modell?.lokal) {
+    // Kein lokales Modell: kein Feld, und eine etwaige frühere Antwort geht
+    // wieder weg -- sonst schriebe der Abschluss eine Tokenzahl für ein Modell,
+    // das gar kein wählbares Fenster hat.
+    zustand = mitKontext(zustand, 0);
+    return;
+  }
+  const antwort = kontextStand[modellId];
+  if (!antwort) {
+    kasten.appendChild(el('p', 'hinweis', t('kontext.wirdErmittelt')));
+    if (!kontextLaeuft.has(modellId)) {
+      kontextLaeuft.add(modellId);
+      void window.awbErststart.kontextStufen(modellId)
+        .then((a) => { kontextStand[modellId] = a; })
+        .catch((e: unknown) => { kontextStand[modellId] = { ok: false, fehler: String(e) }; })
+        .then(() => {
+          kontextLaeuft.delete(modellId);
+          // Nur nachziehen, wenn die Wahl inzwischen nicht weitergesprungen ist.
+          if (laufendeWahl === modellId) kontextFuellen(modellId, modelle);
+        });
+    }
+    return;
+  }
+  if (!antwort.ok) {
+    kasten.appendChild(el('p', 'hinweis', t('kontext.nichtErmittelt', antwort.fehler)));
+    zustand = mitKontext(zustand, 0);
+    return;
+  }
+  const s = antwort.sicht;
+  const bisher = zustand.antworten.kontext;
+  const wert = typeof bisher === 'number' && s.stufen.some((x) => x.tokens === bisher)
+    ? bisher
+    : s.vorgabe;
+  zustand = mitKontext(zustand, wert);
+
+  kasten.appendChild(el('h3', undefined, t('kontext.titel')));
+  kasten.appendChild(el('p', 'unterzeile', t('kontext.unterzeile')));
+  const liste = el('div', 'kontextliste');
+  for (const stufe of s.stufen) {
+    const b = el('button', 'kontexteintrag') as HTMLButtonElement;
+    b.type = 'button';
+    b.dataset.kontext = String(stufe.tokens);
+    b.dataset.passt = stufe.passt ? 'ja' : 'nein';
+    if (stufe.tokens === (zustand.antworten.kontext ?? s.vorgabe)) b.classList.add('gewaehlt');
+    const z1 = el('div', 'zeile1');
+    z1.appendChild(el('span', undefined, stufe.label));
+    if (stufe.tokens === s.empfehlung) {
+      b.dataset.empfohlen = 'ja';
+      // Ein knappes Kennwort statt eines Symbols -- die stehende Regel dieses
+      // Hauses: keine Emojis, und der Rang ist ein Wort wert.
+      z1.appendChild(el('span', 'marke', t('kontext.empfohlen')));
+    }
+    z1.appendChild(el('span', 'kennung', t('kontext.token', stufe.tokens)));
+    b.appendChild(z1);
+    // Wo der Speicher nicht reicht, steht der HINWEIS statt der knappen
+    // Bedarfszeile: er nennt den Bedarf bereits samt dem, was frei ist.
+    const eng = !stufe.passt && !!stufe.hinweis;
+    const z2 = el('div', eng ? 'zeile2 kontexthinweis' : 'zeile2');
+    z2.textContent = eng ? String(stufe.hinweis) : t('kontext.bedarf', stufe.bedarfGib.toFixed(1));
+    b.appendChild(z2);
+    b.addEventListener('click', () => {
+      zustand = mitKontext(zustand, stufe.tokens);
+      kontextFuellen(modellId, modelle);
+    });
+    liste.appendChild(b);
+  }
+  kasten.appendChild(liste);
+}
+
 function schrittModell(d: ErststartDaten): HTMLElement {
   const frag = document.createDocumentFragment() as unknown as HTMLElement;
   frag.appendChild(el('h2', undefined, t('modell.titel')));
   frag.appendChild(el('p', 'unterzeile', t('modell.unterzeile')));
-  const harness = zustand.antworten.harness || d.settings.orchestratorHarness || d.vorgaben.orchestratorHarness;
+  const harness = String(
+    zustand.antworten.harness || d.settings.orchestratorHarness || d.vorgaben.orchestratorHarness,
+  );
   const modelle = d.orchestratorModelle.filter((m) => m.harness === harness);
+  kontextKasten = null;
   if (modelle.length === 0) {
     frag.appendChild(el('p', 'hinweis', t('modell.keine')));
     return frag;
   }
   const eintraege = modelle.map((m) => ({ wert: m.id, label: m.label }));
-  frag.appendChild(chipReihe(eintraege, d.settings.orchestratorModel || d.vorgaben.orchestratorModel));
+  frag.appendChild(chipReihe(
+    eintraege,
+    d.settings.orchestratorModel || d.vorgaben.orchestratorModel,
+    (wert) => kontextFuellen(wert, modelle),
+  ));
+  const kasten = el('div', 'kontextblock');
+  frag.appendChild(kasten);
+  kontextKasten = kasten;
+  // Auch die VORBELEGUNG ist eine Wahl -- der Block muss stehen, bevor jemand
+  // etwas angeklickt hat.
+  kontextFuellen(laufendeWahl, modelle);
   return frag;
 }
 
-const FERTIG_LABEL: Record<'maschine' | 'harness' | 'modell', string> = {
+const FERTIG_LABEL: Record<'maschine' | 'harness' | 'modell' | 'kontext', string> = {
   maschine: 'fertig.eintrag.maschine',
   harness: 'fertig.eintrag.harness',
   modell: 'fertig.eintrag.modell',
+  kontext: 'fertig.eintrag.kontext',
 };
 
 function schrittFertig(): HTMLElement {

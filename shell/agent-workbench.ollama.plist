@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Ollama als BEDARFSDIENST (2026-08-20).
+
+  WARUM EIGENE plist STATT DER VON HOMEBREW: Homebrews Datei liegt unter
+  /opt/homebrew/opt/ollama/homebrew.mxcl.ollama.plist und wird bei jedem
+  `brew upgrade` ueberschrieben — jede Aenderung daran waere fluechtig. Diese
+  hier gehoert uns und ueberlebt Updates.
+
+  WIE ES ZUSAMMENSPIELT: der Dienst lauscht auf 11444, NICHT auf 11434. Auf 11434
+  haelt launchd den Socket fuer wb-modell-proxy; der startet diesen Job beim ersten
+  Zugriff (wb-dienst ensure) und beendet ihn nach Leerlauf (wb-dienst halt). Jede
+  bestehende Konfiguration, die auf 127.0.0.1:11434 zeigt, bleibt damit gueltig.
+
+  RunAtLoad und KeepAlive stehen bewusst auf false: der Job ist geladen, aber er
+  laeuft erst, wenn ihn jemand braucht. Das ist globale des Nutzers Regel, dass kein
+  Prozess dauerhaft laeuft — ausdruecklich auch fuer Dienste der Werkbank.
+
+  OLLAMA_FLASH_ATTENTION und OLLAMA_KV_CACHE_TYPE sind aus Homebrews Fassung
+  uebernommen, damit der 8-Bit-KV-Cache erhalten bleibt (stehende Vorgabe fuer
+  Ollama-Modelle).
+
+  Installation: nach ~/Library/LaunchAgents/agent-workbench.ollama.plist kopieren, dann
+  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/agent-workbench.ollama.plist`.
+  Vorher `brew services stop ollama`, sonst halten zwei Dienste denselben Port.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>agent-workbench.ollama</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/ollama</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OLLAMA_HOST</key><string>127.0.0.1:11444</string>
+    <key>OLLAMA_FLASH_ATTENTION</key><string>1</string>
+    <key>OLLAMA_KV_CACHE_TYPE</key><string>q8_0</string>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$HOME/.local/state/ollama/launchd.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.local/state/ollama/launchd.log</string>
+</dict>
+</plist>

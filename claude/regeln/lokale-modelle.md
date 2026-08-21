@@ -149,3 +149,52 @@ Auslöser: bevor ein lokales Modell gestartet, gewechselt oder eingeplant wird.
   on conflict the Konfliktregel applies (der Nutzer fragen, nie eigenmächtig killen; full ladder in the
   `regeln/maschinen.md`, Abschnitt Cross-Machine Compute). Before local video generation stop Ollama models (`ollama stop <model>`); image
   gen (~15 GB) coexists with the 9B but not with a 35B under load. Check with `ollama ps`.
+
+## Immer nur EIN Modell gleichzeitig (2026-08-18, Anweisung des Nutzers)
+
+Seine Worte: „lokale modelle wieder ohne einschraenkung erlaubt, aber achte darauf das nur ein
+modell gleichzeitig arbeitet, du kannst mit concurrency aber auch mehrere anfragen gleichzeitig
+senden."
+
+Also: vor jedem Modellstart nachsehen, ob die Karte frei ist (`ollama ps`, `check-resources`,
+`wb-belegung`), und nach der Arbeit entladen. Nebenlaeufigkeit findet INNERHALB eines Modells
+statt — mehrere gleichzeitige Anfragen an dasselbe geladene Modell sind ausdruecklich erwuenscht
+und der richtige Weg, einen Stapellauf zu beschleunigen (gemessen am Einbettungslauf des Vaults:
+109 ms je Block seriell, 39 ms bei vier gleichzeitigen Anfragen, darueber kein Gewinn mehr).
+
+Zwei Dinge, die dabei am selben Tag aufgefallen sind:
+
+- **Ein kleines Einbettungsmodell zaehlt nicht als Belegung.** Der Suchclient des Vaults laedt
+  `embeddinggemma` (0,6 GB) bei jeder Abfrage; wer jede Ollama-Ladung als „belegt" zaehlt,
+  verschiebt einen Wartelauf fuer immer. Die Schwelle des Suite-Waechters liegt deshalb bei
+  2 GiB — zwischen jedem gemessenen Embedder und jedem gemessenen Coder.
+- **Die Einzelabfrage gibt die Karte selbst wieder frei** (`keep_alive: 0s` seit 18.08.); ein
+  Stapellauf behaelt die Vorgabe, weil er das Modell sonst hunderte Male neu laedt.
+
+## Speicher, Kontext und Denken bei MLX-Modellen (2026-08-19, Vorgaben des Nutzers)
+
+- **Der Speicher ist ein gemeinsamer Topf, und der Orchestrator handelt damit.** Ein MLX-Server
+  bucht Gewichte plus die eine Sequenz, für die er gestartet wurde; jeder weitere lokale Worker
+  bucht seine eigene Sequenz dazu und gibt sie beim Schließen zurück. eine Dekodier-Nebenläufigkeit von 4
+  bleibt eingeschaltet — es ist die Kapazität des Servers, keine Aussage darüber, wie viele
+  Sequenzen leben. Wer vier Worker will, gibt ihnen kleinere Fenster; wer ein großes Fenster
+  will, nimmt weniger Worker. Diese Wahl trifft der Orchestrator an den Zahlen, nicht das
+  Werkzeug im Voraus. Eine Buchung, die die Kapazität vorwegnimmt, sperrt die Maschine für
+  nichts — genau daran startete am 2026-08-19 kein einziger lokaler Lauf mehr.
+- **Der KV-Cache läuft IMMER auf 8 Bit** — bei jedem lokalen Modell, für Worker wie für den
+  Orchestrator, gleich welcher Weg (MLX oder Ollama), mit der besten auf dem Mac verfügbaren
+  Quantisierung (Anweisung des Nutzers 2026-08-19: „immer 8-Bit KV-Cache-Quantisierung"). Das
+  halbiert den Bedarf je Token gegenüber bf16, plus Aufschlag für Skalen und Nullpunkte. Der
+  geltende Wert je Token steht in `~/.local/state/wb-belegung/kv-bedarf.json` und wird von dort
+  gelesen, nie hartkodiert.
+- **Der Sicherheitsfaktor auf angenommene KV-Werte ist 1,1**, nicht 1,5 (Anweisung des Nutzers).
+  Ein Faktor ersetzt keine Messung: wo der zugrunde liegende Wert von einer fremden Architektur
+  stammt, wird der Wert korrigiert, nicht der Faktor erhöht.
+
+- **MLX vor GGUF, MLX vor llama.cpp (2026-08-19, Vorgabe des Nutzers):** Auf Apple Silicon läuft
+  MLX gemessen schneller als die Alternativen (17,7 gegen 15,3 bei Ollama und 14,1 bei
+  llama.cpp für dieselbe Architektur, 2026-08-11). Deshalb wird für jedes lokale Modell die
+  MLX-Fassung geladen, wenn es sie gibt, und notfalls selbst nach MLX quantisiert. GGUF und
+  llama.cpp sind der Rückfall für den Fall, dass auf der MLX-Spur nachweislich nichts geht —
+  nicht die erste Wahl, und nie ungemessen. Wo beide Formate verfügbar sind und beide Wege in
+  Frage kommen, wird gegeneinander gemessen statt entschieden.

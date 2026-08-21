@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""wb-verzeichniswache — meldet, wenn sich in einem Verzeichnis etwas tut.
+
+  wb-verzeichniswache [--einmal] [--frist <sekunden>] <verzeichnis>...
+
+Je Ereignisstoss EINE Zeile auf stdout: `wach <verzeichnis>`. Der Inhalt der
+Zeile ist absichtlich belanglos -- wer hier zuhoert, will nur geweckt werden und
+sieht danach selbst nach. Ein Aufrufer, der die Zeile nicht bekommt, verpasst
+deshalb nichts Unwiederbringliches: er sieht beim naechsten eigenen Takt nach.
+
+WOZU (2026-08-20): `wb-ereignisse` fragte alle zwei Sekunden alle Ergebnis- und
+Antragsverzeichnisse ab. Das kostet dauerhaft Prozesse und liefert eine
+Fertigmeldung trotzdem erst bis zu zwei Sekunden spaet. Diese Wache dreht das
+um: der Takt wird lang, das Wecken kommt vom Dateisystem.
+
+WELCHE QUELLE, UND WARUM IN DIESER REIHENFOLGE:
+  1. `fswatch`      -- falls installiert. Kann rekursiv und ist auf beiden
+                       Maschinen dasselbe Werkzeug.
+  2. `inotifywait`  -- der Linux-Weg (Peer-Rechner), wenn fswatch dort fehlt.
+  3. kqueue         -- eingebaut in Pythons Standardbibliothek und auf macOS
+                       immer da. GEMESSEN am 2026-08-20: `fswatch` ist auf
+                       diesem Mac NICHT installiert, der Plan hatte es
+                       angenommen. Ohne diesen dritten Weg haette der ganze
+                       Umbau an einem Homebrew-Paket gehangen.
+Faellt alles aus, endet das Programm mit 3 und sagt es -- der Aufrufer faellt
+dann auf seinen eigenen Takt zurueck, statt blind zu warten.
+
+WAS KQUEUE SIEHT UND WAS NICHT: ein Verzeichnis-Deskriptor meldet, wenn darin
+etwas ENTSTEHT, VERSCHWINDET oder UMBENANNT wird. Er meldet NICHT, wenn eine
+schon vorhandene Datei ihren Inhalt aendert -- ein nachgebessertes Ergebnis mit
+demselben Namen bleibt also stumm. Genau deshalb ist diese Wache ein
+Beschleuniger und kein Ersatz: `wb-ereignisse` behaelt seinen (langen) Takt als
+Netz darunter. Rekursiv wird von Hand nachgezogen: die Unterverzeichnisse der
+Wurzeln werden mitgeoeffnet und nach jedem Ereignis neu eingelesen, damit ein
+frisch angelegter Worker-Ordner nicht unbeobachtet bleibt.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+# Mehr als so viele Verzeichnisse werden nicht offengehalten. Ein Deskriptor je
+# Verzeichnis ist billig, aber nicht umsonst, und die Ergebniswurzel waechst mit
+# jedem Worker, den es je gab. Wird die Grenze erreicht, bleibt der Rest dem Takt
+# des Aufrufers ueberlassen -- gemeldet wird das einmal nach stderr.
+MAX_DIRS = 256
+
+
+def melde(pfad):
+    sys.stdout.write("wach %s\n" % pfad)
+    sys.stdout.flush()
+
+
+def unterverzeichnisse(wurzeln):
+    """Die Wurzeln selbst plus ihre direkten Unterverzeichnisse."""
+    raus = []
+    for w in wurzeln:
+        if not os.path.isdir(w):
+            continue
+        raus.append(w)
+        try:
+            with os.scandir(w) as eintraege:
+                for e in eintraege:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            raus.append(e.path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+        if len(raus) >= MAX_DIRS:
+            break
+    return raus[:MAX_DIRS]
+
+
+def lauf_fswatch(wurzeln, einmal):
+    # -o buendelt einen Stoss zu EINER Zeile (einer Zahl), genau die Semantik,
+    # die hier gebraucht wird. --latency dampft ein Schreibgewitter.
+    cmd = [shutil.which("fswatch"), "-o", "--latency", "0.3", "-r"] + wurzeln
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        for _ in p.stdout:
+            melde(wurzeln[0])
+            if einmal:
+                return 0
+    finally:
+        p.terminate()
+        try:
+            p.wait(timeout=3)
+        except Exception:
+            p.kill()
+    return 0
+
+
+def lauf_inotify(wurzeln, einmal):
+    cmd = [shutil.which("inotifywait"), "-q", "-m", "-r",
+           "-e", "create", "-e", "moved_to", "-e", "close_write", "-e", "delete"] + wurzeln
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        for _ in p.stdout:
+            melde(wurzeln[0])
+            if einmal:
+                return 0
+    finally:
+        p.terminate()
+        try:
+            p.wait(timeout=3)
+        except Exception:
+            p.kill()
+    return 0
+
+
+def lauf_kqueue(wurzeln, einmal, frist):
+    import select
+
+    kq = select.kqueue()
+    flags = (select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND
+             | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME)
+    offen = {}          # pfad -> fd
+    gewarnt = [False]
+
+    def anmelden(pfade):
+        for p in pfade:
+            if p in offen:
+                continue
+            if len(offen) >= MAX_DIRS:
+                if not gewarnt[0]:
+                    sys.stderr.write(
+                        "wb-verzeichniswache: mehr als %d Verzeichnisse — der Rest "
+                        "bleibt dem Takt des Aufrufers ueberlassen.\n" % MAX_DIRS)
+                    gewarnt[0] = True
+                return
+            try:
+                fd = os.open(p, os.O_RDONLY | getattr(os, "O_EVTONLY", 0))
+            except OSError:
+                continue
+            kq.control([select.kevent(fd, select.KQ_FILTER_VNODE,
+                                      select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                                      flags)], 0, 0)
+            offen[p] = fd
+
+    def abmelden_verschwundene():
+        for p in list(offen):
+            if not os.path.isdir(p):
+                try:
+                    os.close(offen.pop(p))
+                except OSError:
+                    offen.pop(p, None)
+
+    anmelden(unterverzeichnisse(wurzeln))
+    if not offen:
+        sys.stderr.write("wb-verzeichniswache: keines der Verzeichnisse ist da.\n")
+        return 4
+
+    try:
+        while True:
+            ereignisse = kq.control(None, 8, frist)
+            if not ereignisse:
+                continue
+            # Ein Stoss wird zu EINER Meldung zusammengefasst: was hier lauscht,
+            # sieht danach ohnehin alles auf einmal nach.
+            time.sleep(0.15)
+            kq.control(None, 32, 0)
+            abmelden_verschwundene()
+            anmelden(unterverzeichnisse(wurzeln))
+            melde(wurzeln[0])
+            if einmal:
+                return 0
+    finally:
+        for fd in offen.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        kq.close()
+
+
+def main(argv):
+    einmal = False
+    frist = 60.0
+    wurzeln = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--einmal":
+            einmal = True
+        elif a == "--frist":
+            i += 1
+            frist = float(argv[i])
+        elif a in ("-h", "--help", "--hilfe"):
+            sys.stdout.write(__doc__)
+            return 0
+        elif a.startswith("-"):
+            sys.stderr.write("wb-verzeichniswache: unbekannte Option '%s'\n" % a)
+            return 2
+        else:
+            wurzeln.append(os.path.expanduser(a))
+        i += 1
+
+    if not wurzeln:
+        sys.stderr.write("wb-verzeichniswache: mindestens ein Verzeichnis angeben.\n")
+        return 2
+
+    da = [w for w in wurzeln if os.path.isdir(w)]
+    if not da:
+        sys.stderr.write("wb-verzeichniswache: keines der Verzeichnisse ist da.\n")
+        return 4
+
+    if os.environ.get("WB_WACHE_QUELLE"):
+        quelle = os.environ["WB_WACHE_QUELLE"]
+    elif shutil.which("fswatch"):
+        quelle = "fswatch"
+    elif shutil.which("inotifywait"):
+        quelle = "inotify"
+    elif hasattr(__import__("select"), "kqueue"):
+        quelle = "kqueue"
+    else:
+        sys.stderr.write(
+            "wb-verzeichniswache: keine Ereignisquelle (weder fswatch noch "
+            "inotifywait noch kqueue).\n")
+        return 3
+
+    sys.stderr.write("wb-verzeichniswache: Quelle %s, %d Wurzel(n)\n" % (quelle, len(da)))
+    sys.stderr.flush()
+    if quelle == "fswatch":
+        return lauf_fswatch(da, einmal)
+    if quelle == "inotify":
+        return lauf_inotify(da, einmal)
+    return lauf_kqueue(da, einmal, frist)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except BrokenPipeError:
+        sys.exit(0)

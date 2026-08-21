@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# wb-echttest — wiederholbarer Echttest: ein bis vier lokale Worker an kleinen,
+# echten, NACHRECHENBAREN Aufgaben, mit Buchung und wirklich freiem Speicher
+# vor und nach jedem Spawn nebeneinander im Protokoll, Antwortzeit je Worker,
+# und garantiertem Aufraeumen — auch bei einem Abbruch mitten im Lauf.
+#
+# Usage:
+#   wb-echttest [arbeitsverzeichnis] [modell] [anzahl] [--deadline-s N] [--kontext <stufe>]
+#
+# arbeitsverzeichnis: Vorgabe ~/.local/state/wb-echttest/<zeitstempel>.
+# modell: Vorgabe qwen38. anzahl: 1..4, Vorgabe 4.
+# --deadline-s N: hoechstens N Sekunden je Worker auf das Ergebnis warten
+#   (Vorgabe 180) — nie unbegrenzt warten.
+# --kontext <stufe>: an jeden pi-worker durchgereicht (Vorgabe: pi-worker
+#   entscheidet selbst, 'auto'). Nachtrag 2026-08-20: pi-workers eigene
+#   Auto-Wahl stuetzt sich auf wb-kontexts 'passt'-Feld, das den Zuschlag aus
+#   wb-belegungs eigener, staerker gesicherter Formel NICHT nachbildet (siehe
+#   Kopfkommentar dort) -- bei einem Modell mit sehr grossem nativen Maximum
+#   kann das eine Stufe als 'passt' melden, die wb-belegung dann trotzdem
+#   ablehnt, noch bevor irgendeine Buchung stattfindet. Fuer einen
+#   reproduzierbaren Echttest, der die BUCHUNG pruefen soll (nicht wb-kontexts
+#   Empfehlung), eine feste, bekannt passende Stufe erzwingen.
+#
+# JEDE Aufgabe erzeugt eine Datei mit einem Inhalt, den dieses Werkzeug SELBST
+# nachrechnet (Summe zweier Vielfachen von n, Anzahl Dateien in einem festen
+# Eingabeverzeichnis) — ein Worker, der nur "fertig" meldet, ohne die Datei
+# richtig zu schreiben, faellt damit auf, statt als Erfolg durchzugehen.
+#
+# 'gebucht' ist wb-belegungs eigenes 'summe_gib' aus 'wer --json' — nicht die
+# Posten einzeln nachaddiert, sonst laufen zwei Rechnungen auseinander. 'frei'
+# ist der wirklich freie Speicher aus check-resources (ram.free_mib), demselben
+# Werkzeug, auf das sich wb-belegung selbst fuer Grenze A stuetzt.
+#
+# Vorbild (Idee, nicht Code — siehe Kopfkommentar dort):
+#   scratchpad/echttest-worker.sh
+set -uo pipefail
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+# ── Argumente: positional in Reihenfolge, --deadline-s/--kontext an
+#    beliebiger Stelle ─────────────────────────────────────────────────────
+DEADLINE_S=180
+KONTEXT_ARG=""
+POSARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --deadline-s)
+      DEADLINE_S="${2:?--deadline-s erwartet Sekunden}"; shift 2 ;;
+    --kontext)
+      KONTEXT_ARG="${2:?--kontext erwartet eine Stufe oder 'auto'}"; shift 2 ;;
+    --)
+      shift
+      while [ $# -gt 0 ]; do POSARGS+=("$1"); shift; done ;;
+    -*)
+      echo "wb-echttest: unbekannte Option '$1'" >&2; exit 2 ;;
+    *)
+      POSARGS+=("$1"); shift ;;
+  esac
+done
+
+ARBEIT="${POSARGS[0]:-}"
+[ -n "$ARBEIT" ] || ARBEIT="$HOME/.local/state/wb-echttest/$(date +%Y%m%d-%H%M%S)"
+MODELL="${POSARGS[1]:-qwen38}"
+ANZAHL="${POSARGS[2]:-4}"
+
+case "$ANZAHL" in
+  ''|*[!0-9]*)
+    echo "FEHLER: Anzahl '$ANZAHL' ist keine Zahl." >&2; exit 2 ;;
+esac
+if [ "$ANZAHL" -lt 1 ] || [ "$ANZAHL" -gt 4 ]; then
+  echo "FEHLER: Anzahl muss zwischen 1 und 4 liegen (bekommen: $ANZAHL)." >&2
+  exit 2
+fi
+case "$DEADLINE_S" in
+  ''|*[!0-9]*)
+    echo "FEHLER: --deadline-s '$DEADLINE_S' ist keine Zahl." >&2; exit 2 ;;
+esac
+
+# ── Werkzeuge ueber ~/.local/bin aufloesen (Testkonvention: eigenes HOME mit
+# Attrappen dort, echter Betrieb findet die echten Werkzeuge) ────────────────
+BIN="$HOME/.local/bin"
+werkzeug() {
+  local n="$1"
+  if [ -x "$BIN/$n" ]; then printf '%s' "$BIN/$n"; else command -v "$n" 2>/dev/null; fi
+}
+PIWORKER="$(werkzeug pi-worker)"
+WBBELEGUNG="$(werkzeug wb-belegung)"
+WBCLOSE="$(werkzeug wb-close)"
+WBRESULT="$(werkzeug wb-result)"
+CHECKRES="$(werkzeug check-resources)"
+for paar in "pi-worker:$PIWORKER" "wb-belegung:$WBBELEGUNG" "wb-close:$WBCLOSE" \
+            "wb-result:$WBRESULT" "check-resources:$CHECKRES"; do
+  n="${paar%%:*}"; p="${paar#*:}"
+  [ -n "$p" ] || { echo "FEHLER: Werkzeug '$n' fehlt (weder $BIN/$n noch im PATH)." >&2; exit 2; }
+done
+
+mkdir -p "$ARBEIT" || { echo "FEHLER: Arbeitsverzeichnis '$ARBEIT' nicht anlegbar." >&2; exit 2; }
+PROTOKOLL="$ARBEIT/echttest-protokoll.tsv"
+printf 'zeitpunkt\tschritt\tworker\tgebucht_vor_gib\tfrei_vor_gib\tgebucht_nach_gib\tfrei_nach_gib\tdauer_s\tergebnis\n' > "$PROTOKOLL"
+
+EINGABE_N=7
+mkdir -p "$ARBEIT/eingabe"
+for i in $(seq 1 "$EINGABE_N"); do : > "$ARBEIT/eingabe/datei-$i.txt"; done
+
+gebucht_gib() {
+  "$WBBELEGUNG" wer --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print("%.3f" % float(json.load(sys.stdin).get("summe_gib") or 0))
+except Exception:
+    print("0.000")
+' 2>/dev/null || echo "0.000"
+}
+
+frei_gib() {
+  "$CHECKRES" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print("%.3f" % (float(d["ram"]["free_mib"]) / 1024.0))
+except Exception:
+    print("n/a")
+' 2>/dev/null || echo "n/a"
+}
+
+notiere() {   # schritt worker gebucht_vor frei_vor gebucht_nach frei_nach dauer ergebnis
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%H:%M:%S)" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" >> "$PROTOKOLL"
+}
+
+aufgabe_fuer() {
+  local n="$1"
+  cat <<AUFGABE
+Kleine Pruefaufgabe Nr. $n. Schreibe die Datei $ARBEIT/ergebnis-$n.txt mit GENAU zwei Zeilen:
+Zeile 1: das Ergebnis von $((n * 7)) plus $((n * 13)), nur die Zahl.
+Zeile 2: die Anzahl der Dateien, die im Verzeichnis $ARBEIT/eingabe liegen, nur die Zahl.
+Sonst nichts. Keine Erklaerung, keine Ueberschrift, keine leere Zeile am Ende.
+AUFGABE
+}
+
+pruefe_ergebnis() {   # n -> "ok" oder "FEHLGESCHLAGEN: grund"
+  local n="$1" datei="$ARBEIT/ergebnis-$n.txt" erwartet z1 z2 nichtleer
+  erwartet=$((n * 7 + n * 13))
+  if [ ! -s "$datei" ]; then echo "FEHLGESCHLAGEN: $datei fehlt oder ist leer"; return; fi
+  nichtleer=$(grep -c . "$datei" 2>/dev/null || echo 0)
+  if [ "$nichtleer" -gt 2 ]; then echo "FEHLGESCHLAGEN: mehr als zwei Zeilen"; return; fi
+  z1=$(sed -n '1p' "$datei" | tr -d '[:space:]')
+  z2=$(sed -n '2p' "$datei" | tr -d '[:space:]')
+  if [ "$z1" != "$erwartet" ]; then
+    echo "FEHLGESCHLAGEN: Zeile 1 ist '$z1', erwartet '$erwartet'"; return
+  fi
+  if [ "$z2" != "$EINGABE_N" ]; then
+    echo "FEHLGESCHLAGEN: Zeile 2 ist '$z2', erwartet '$EINGABE_N'"; return
+  fi
+  echo "ok"
+}
+
+# ── Aufraeumen — auch bei Abbruch, das ist der Zweck dieses Traps ───────────
+NAMEN=()
+ERGEBNISSE=()
+FEHLSCHLAEGE=0
+ABGEBROCHEN=0
+CLEANED=0
+BASELINE_GEBUCHT="0.000"
+
+cleanup() {
+  [ "$CLEANED" = 1 ] && return
+  CLEANED=1
+  if [ "${#NAMEN[@]}" -eq 0 ]; then return; fi
+  echo "Raeume auf: schliesse ${#NAMEN[@]} Worker (${NAMEN[*]})." >&2
+  for name in "${NAMEN[@]}"; do
+    "$WBCLOSE" "$name" >/dev/null 2>&1 || true
+  done
+  # pi-worker gibt seine Buchung selbst zurueck, sobald der Pane weg ist —
+  # ein Hintergrund-Watcher prueft das alle 15s. Hier wird das VERIFIZIERT,
+  # nicht angenommen: bis zu 30s auf die Rueckkehr unter die Baseline warten,
+  # dann laut melden, falls sie ausbleibt.
+  local deadline=$((SECONDS + 30)) jetzt
+  while [ $SECONDS -lt $deadline ]; do
+    jetzt=$(gebucht_gib)
+    if awk -v a="$jetzt" -v b="$BASELINE_GEBUCHT" 'BEGIN{exit !(a<=b+0.01)}'; then
+      break
+    fi
+    sleep 2
+  done
+  jetzt=$(gebucht_gib)
+  local frei_jetzt; frei_jetzt=$(frei_gib)
+  local zustand="ja"
+  awk -v a="$jetzt" -v b="$BASELINE_GEBUCHT" 'BEGIN{exit !(a<=b+0.01)}' || zustand="NEIN — noch $jetzt GiB gebucht, Baseline war $BASELINE_GEBUCHT"
+  notiere "ende" "-" "$BASELINE_GEBUCHT" "-" "$jetzt" "$frei_jetzt" "-" "Buchung auf Baseline zurueck: $zustand"
+  echo "Endzustand: gebucht=${jetzt} GiB (Baseline ${BASELINE_GEBUCHT} GiB), frei=${frei_jetzt} GiB." >&2
+}
+trap cleanup EXIT
+trap 'ABGEBROCHEN=1; echo "Abbruch empfangen — schliesse bereits gespawnte Worker und gebe Buchungen zurueck." >&2' INT TERM
+
+# ── Hauptlauf ────────────────────────────────────────────────────────────────
+BASELINE_GEBUCHT="$(gebucht_gib)"
+notiere start "-" "$BASELINE_GEBUCHT" "$(frei_gib)" "-" "-" "-" "-"
+echo "Baseline: gebucht=${BASELINE_GEBUCHT} GiB, frei=$(frei_gib) GiB." >&2
+
+for n in $(seq 1 "$ANZAHL"); do
+  [ "$ABGEBROCHEN" = 1 ] && break
+  name="echttest-$$-$n"
+  NAMEN+=("$name")
+
+  vor_geb="$(gebucht_gib)"; vor_frei="$(frei_gib)"
+  start_ts=$(date +%s)
+  PIWORKER_ARGS=()
+  [ -n "$KONTEXT_ARG" ] && PIWORKER_ARGS+=(--kontext "$KONTEXT_ARG")
+  # "${ARR[@]+"${ARR[@]}"}", nicht "${ARR[@]}": auf macOS' Bash 3.2 wirft ein
+  # LEERES Array unter 'set -u' sonst "unbound variable" (dieselbe Falle wie
+  # in pi-worker bei ENTWERFER_ARGS, siehe dort).
+  "$PIWORKER" "${PIWORKER_ARGS[@]+"${PIWORKER_ARGS[@]}"}" \
+    "$name" "$MODELL" "$ARBEIT" "$(aufgabe_fuer "$n")" >"$ARBEIT/spawn-$n.log" 2>&1
+  spawn_rc=$?
+
+  if [ "$spawn_rc" -ne 0 ]; then
+    nach_geb="$(gebucht_gib)"; nach_frei="$(frei_gib)"
+    dauer=$(( $(date +%s) - start_ts ))
+    ergebnis="FEHLGESCHLAGEN: pi-worker rc=$spawn_rc, siehe $ARBEIT/spawn-$n.log"
+    notiere "spawn" "$name" "$vor_geb" "$vor_frei" "$nach_geb" "$nach_frei" "$dauer" "$ergebnis"
+    ERGEBNISSE+=("$name: $ergebnis")
+    FEHLSCHLAEGE=$((FEHLSCHLAEGE + 1))
+    continue
+  fi
+
+  fertig=0
+  ergebnis_deadline=$((SECONDS + DEADLINE_S))
+  while [ $SECONDS -lt $ergebnis_deadline ]; do
+    [ "$ABGEBROCHEN" = 1 ] && break
+    if "$WBRESULT" "$name" >/dev/null 2>&1; then fertig=1; break; fi
+    sleep 2
+  done
+  ende_ts=$(date +%s)
+  dauer=$((ende_ts - start_ts))
+  nach_geb="$(gebucht_gib)"; nach_frei="$(frei_gib)"
+
+  if [ "$fertig" = 1 ]; then
+    pruefung="$(pruefe_ergebnis "$n")"
+  elif [ "$ABGEBROCHEN" = 1 ]; then
+    pruefung="ABBRUCH: Lauf unterbrochen, bevor das Ergebnis da war"
+  else
+    pruefung="FEHLGESCHLAGEN: kein Ergebnis nach ${DEADLINE_S}s"
+  fi
+  notiere "spawn" "$name" "$vor_geb" "$vor_frei" "$nach_geb" "$nach_frei" "$dauer" "$pruefung"
+  ERGEBNISSE+=("$name: $pruefung (${dauer}s Antwortzeit)")
+  case "$pruefung" in ok) ;; *) FEHLSCHLAEGE=$((FEHLSCHLAEGE + 1)) ;; esac
+done
+
+echo >&2
+echo "=== Zusammenfassung ===" >&2
+for e in "${ERGEBNISSE[@]}"; do echo "  $e" >&2; done
+echo "Protokoll: $PROTOKOLL" >&2
+
+if [ "$ABGEBROCHEN" = 1 ]; then
+  exit 130
+fi
+[ "$FEHLSCHLAEGE" -eq 0 ]

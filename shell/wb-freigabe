@@ -3,7 +3,7 @@
 #
 #   wb-freigabe liste                     Was gerade auf eine Entscheidung wartet.
 #   wb-freigabe erteilen [--ttl <sek>] [--schluessel <sha256>] [--index <n>|--alle]
-#                        <pane> <grund>   Die wartende Frage dieses Panes freigeben.
+#                        [--grund <text>] <pane> [grund]  Die wartende Frage freigeben.
 #   wb-freigabe beleg                     Wie dieser Aufruf gemessen wird (Diagnose).
 #
 # `--schluessel` bindet die Freigabe an DEN Eintrag, den der Erteilende gelesen hat:
@@ -193,11 +193,28 @@ TTL=300
 ERWARTETER_SCHLUESSEL=""
 INDEX=""
 ALLE=0
+GRUND=""
+# Die Begruendung kommt entweder als STELLUNGSARGUMENT (am Terminal, wie bisher)
+# oder ueber `--grund` -- und dieser Schalter ist seit dem 19.08. der Weg, den
+# das Programmfenster geht. Grund: die Begruendung ist jetzt FREIWILLIG, und ein
+# leeres Stellungsargument ist genau die Sorte Argument, die man beim naechsten
+# Umbau uebersieht. Heute steht hinter dem Pane keins mehr, morgen vielleicht
+# doch -- dann rutscht ein leerer Grund still an die falsche Stelle, und
+# freigegeben wuerde etwas anderes als gemeint. Der Schalter kann das nicht:
+# er benennt, was er traegt. GRUND_GESETZT unterscheidet dabei "ausdruecklich
+# leer" von "gar nicht gesagt"; ohne das wuerde die Zeile weiter unten den
+# Schalterwert mit dem leeren $2 ueberschreiben.
+GRUND_GESETZT=0
 while true; do
     case "${1:-}" in
         --ttl) TTL="${2:?Sekunden fehlen nach --ttl}"; shift 2 ;;
         --schluessel) ERWARTETER_SCHLUESSEL="${2:?Schluessel fehlt nach --schluessel}"; shift 2 ;;
         --index) INDEX="${2:?Zahl fehlt nach --index}"; shift 2 ;;
+        --grund)
+            # Nicht ${2:?...}: eine LEERE Begruendung ist erlaubt, ein fehlendes
+            # Argument nicht -- und `shift 2` ohne zweites Argument liefe endlos.
+            [ $# -ge 2 ] || { echo "wb-freigabe: nach --grund fehlt der Text (leer ist erlaubt: --grund '')." >&2; exit 2; }
+            GRUND="$2"; GRUND_GESETZT=1; shift 2 ;;
         --alle) ALLE=1; shift ;;
         *) break ;;
     esac
@@ -211,9 +228,13 @@ if [ -n "$INDEX" ] && [ "$ALLE" = 1 ]; then
 fi
 
 PANE="${1:-}"
-GRUND="${2:-}"
-[ -n "$PANE" ] || { echo "wb-freigabe: Pane fehlt — 'wb-freigabe erteilen <pane> <grund>'" >&2; exit 2; }
-[ -n "$GRUND" ] || { echo "wb-freigabe: Begruendung fehlt — ein Satz genuegt." >&2; exit 2; }
+[ "$GRUND_GESETZT" = 1 ] || GRUND="${2:-}"
+[ -n "$PANE" ] || { echo "wb-freigabe: Pane fehlt — 'wb-freigabe erteilen <pane> [grund]'" >&2; exit 2; }
+# Die Begruendung wird NICHT mehr verlangt (19.08., auf Ansage des Nutzers): sie
+# ist eine Moeglichkeit, kein Zwang. Steht sie da, wandert sie unveraendert in
+# die Freigabedatei und in den Verlauf; steht sie nicht da, bleibt das Feld leer
+# und der Verlauf sagt es ausdruecklich. Was die Freigabe TRAEGT, ist die
+# gemessene Herkunft ein paar Zeilen weiter -- nie ein Satz Text.
 
 messen || ablehnen "hier ruft kein gemessener Mensch."
 
@@ -387,7 +408,13 @@ for e in zu_erteilen:
         with open(verlauf, 'a', encoding='utf-8') as fh:
             fh.write(json.dumps({
                 'ts': stempel(jetzt), 'guard': 'muster-freigabe',
-                'reason': 'Einmal freigegeben (%s): %s' % (merker.get('muster', ''), grund),
+                # Die Begruendung ist freiwillig (19.08.). Fehlt sie, sagt die
+                # Zeile das ausdruecklich, statt mit einem Doppelpunkt ins Leere
+                # zu enden -- im Verlauf soll man den Unterschied zwischen "kein
+                # Grund genannt" und "Grund verlorengegangen" noch sehen.
+                'reason': ('Einmal freigegeben (%s): %s' % (merker.get('muster', ''), grund)
+                           if grund else
+                           'Einmal freigegeben (%s), ohne Begruendung.' % merker.get('muster', '')),
                 'command': command[:2000], 'cwd': cwd,
                 'session_id': str(merker.get('session_id', '')), 'pane': pane,
             }, ensure_ascii=False) + '\n')

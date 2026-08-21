@@ -18,7 +18,7 @@ local worker lane runs entirely on your own hardware.
 The program plus everything that grew around it: the agent rules, the skills, the hooks, the
 knowledge base, the configuration for local workers. If you only want the window and the worker
 machinery and intend to bring your own agent configuration, take
-**[agent-workbench](https://github.com/Skryx-L-A/agent-workbench)** instead. Both
+**[agent-workbench](https://github.com/<your-github-user>/agent-workbench)** instead. Both
 repositories are built from the same private source tree by the same script, so they never drift
 apart.
 
@@ -33,12 +33,12 @@ app/         the workbench itself — Electron main process, preload bridges, re
 extension/   16 modules the app imports rather than duplicates. They started life in a
              VS Code extension and still carry its directory name; there is exactly one copy
              of each, and this is it
-shell/       100 command-line tools and the default configuration files they read:
+shell/       111 command-line tools and the default configuration files they read:
              worker spawners, context guard, model registry, session management, budget and
              quota, cross-machine helpers, local media generation, knowledge-base maintenance.
              shell/linux/ holds the variants that need CUDA instead of Apple Silicon
 claude/      what an agent reads before it starts — two role prompts, 13 rule files,
-             16 skills, 18 hooks, and templates for CLAUDE.md and settings.json
+             17 skills, 18 hooks, and templates for CLAUDE.md and settings.json
 pi/          the configuration for local workers: the two role files the local harness reads,
              its model list, and a template for the instruction file it generates
 knowledge/   an empty knowledge-base skeleton: branch layout, note templates, and the tooling

@@ -1,14 +1,14 @@
 {
- "lastChangelogVersion": "0.83.0",
- "theme": "dark",
- "defaultProvider": "ollama",
- "defaultModel": "ornith:35b-256k",
- "enabledModels": [
-  "mlx-lokal/$HOME/AI/mlx-models/grug-27b-mlx-q4",
-  "ollama/ornith:35b-256k",
-  "ollama/ornith:9b-256k",
-  "ollama/qwen3.6-abliterated:35b-128k",
-  "ollama/qwen3.6:35b-a3b-coding-nvfp4-256k",
-  "ollama/qwen3.6:27b-coding-nvfp4-256k"
- ]
+  "lastChangelogVersion": "0.83.0",
+  "theme": "dark",
+  "defaultProvider": "mlx-lokal",
+  "defaultModel": "$HOME/AI/mlx-models/qwen38-27b-mlx-4bit",
+  "enabledModels": [
+    "mlx-lokal/$HOME/AI/mlx-models/grug-27b-mlx-q4",
+    "ollama/ornith:35b-256k",
+    "ollama/ornith:9b-256k",
+    "ollama/qwen3.6-abliterated:35b-128k",
+    "ollama/qwen3.6:35b-a3b-coding-nvfp4-256k",
+    "ollama/qwen3.6:27b-coding-nvfp4-256k"
+  ]
 }
