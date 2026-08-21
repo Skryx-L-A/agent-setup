@@ -165,6 +165,18 @@ export const VORGABEN: Readonly<Record<string, unknown>> = {
   // `wb-state settings set workerEffort <stufe>`.
   workerModel: 'claude-sonnet-5',
   workerEffort: 'high',
+  // Multi-Token-Vorhersage (2026-08-20, Vorgaben des Nutzers): AN/AUS getrennt
+  // je Rolle, WELCHES Modell dabei benutzt wird, steht in der Registry
+  // (Feld 'vorhersage' je Modell, siehe extension/src/models.ts) und ist
+  // hier nicht einstellbar -- "die Zuordnung gehoert zur Auslieferung, nicht
+  // in die Oberflaeche". Vorgabe AUS: spekulatives Decoding und die
+  // gemeinsame MLX-Server-Nebenlaeufigkeit sind ein Entweder-oder
+  // (`is_batchable = draft_model is None` in mlx_lm.server, siehe
+  // shell/wb-mlx-server), ein stillschweigend eingeschalteter Schalter
+  // wuerde also unbemerkt Durchsatz kosten. Zweite Stelle: DEFAULTS in
+  // shell/wb-state.
+  orchestratorVorhersage: false,
+  workerVorhersage: false,
   maxWorkers: 8,
   workerWorktrees: true,
   defaultWorkerMachine: 'local',
@@ -211,6 +223,9 @@ export const VORGABEN: Readonly<Record<string, unknown>> = {
   // in shell/wb-state.
   guardMeldetWorkerStatus: false,
   workerSkipPermissions: true,
+  // Der Zustellweg zum Worker (2026-08-20). Zweite Stelle: DEFAULTS in
+  // shell/wb-state, dort steht auch, was die drei Werte bedeuten.
+  workerZustellung: 'auto',
   // Die vierte Sicherung, die ein MENSCH lockert (2026-08-16). SENKEN -- jeder
   // Wechsel weg von 'bypassPermissions' -- geht immer und ohne Grund; nur das
   // ANHEBEN zurueck auf die staerkste Stufe verlangt einen Grund und einen

@@ -151,17 +151,20 @@ is_registered_worktree() { # is_registered_worktree <repo> <pfad>
 # Symlink, und weil ein Symlink fuer Dateioperationen transparent ist, hat
 # npm beim Leeren vor der Neuinstallation den Ordner im HAUPTBAUM getroffen,
 # nicht eine eigene Kopie — Hauptbaum brauchte danach selbst wieder `npm ci`.
-# Jetzt wird per `cp -c -R` geklont (APFS clonefile(2), copy-on-write):
-# gemessen am echten Bestand (427 MB / 3096 Dateien) 0,47 s, praktisch kein
-# zusaetzlicher Plattenverbrauch, aber Schreibzugriffe im Worktree treffen ab
-# da an nur noch dessen eigene Kopie. `cp -c` faellt auf nicht-APFS-Zielen von
-# sich aus auf eine gewoehnliche (nicht Copy-on-Write) Kopie zurueck statt zu
-# scheitern — genau das wollen wir hier NICHT (voller Plattenverbrauch pro
-# Worker), darum laeuft vorab eine Vorprobe mit einer winzigen Testdatei im Zielvolumen:
-# schlaegt schon die Vorprobe fehl (Exit-Code, oder `cp` selbst fehlt/kennt
-# `-c` nicht wie GNU cp auf Linux), gilt Klonen als nicht verfuegbar, und die
-# Funktion faellt auf den Symlink von 2026-08-11 zurueck — MIT Warnung nach
-# stderr, dass darin kein npm ci/install laufen darf.
+# Jetzt wird per Copy-on-Write geklont: `cp -c -R` (APFS clonefile(2)) auf
+# macOS, `cp --reflink=always -R` (btrfs/xfs) auf Linux — gemessen am echten
+# Bestand (427 MB / 3096 Dateien) 0,47 s, praktisch kein zusaetzlicher
+# Plattenverbrauch, aber Schreibzugriffe im Worktree treffen ab da an nur noch
+# dessen eigene Kopie. `cp -c` faellt auf nicht-APFS-Zielen von sich aus auf
+# eine gewoehnliche (nicht Copy-on-Write) Kopie zurueck statt zu scheitern —
+# genau das wollen wir hier NICHT (voller Plattenverbrauch pro Worker), darum
+# laeuft vorab eine Vorprobe mit einer winzigen Testdatei im Zielvolumen, die
+# beide Flags der Reihe nach versucht (siehe clone_flag_available()). Schlagen
+# beide Vorproben fehl (GNU cp kennt `-c` gar nicht — sofortiger Fehler, kein
+# stiller Rueckfall — und das Volume traegt kein CoW-Dateisystem, z.B. tmpfs),
+# gilt Klonen als nicht verfuegbar, und die Funktion faellt auf den Symlink
+# von 2026-08-11 zurueck — MIT Warnung nach stderr, dass darin kein npm
+# ci/install laufen darf.
 #
 # Bedingungen, unter denen NICHTS passiert (keine der drei wird ueberschrieben):
 #   - der Hauptbaum hat selbst kein app/node_modules -> nichts zu klonen.
@@ -170,19 +173,33 @@ is_registered_worktree() { # is_registered_worktree <repo> <pfad>
 #     Verzeichnis oder bereits ein Verweis, beides bleibt unangetastet.
 # Ziel ist IMMER $repo (der Hauptbaum, siehe main_worktree_of oben) — nie ein
 # anderer Worktree, und $repo ist an dieser Stelle bereits genau das.
-clonefile_available() {
+# Welches Copy-on-Write-Verfahren traegt dieses Volume? Druckt das passende
+# `cp`-Flag ('-c' fuer APFS clonefile(2) auf macOS, '--reflink=always' fuer
+# btrfs/xfs auf Linux) und liefert Exit 0, oder liefert Exit 1 ohne Ausgabe,
+# wenn keins der beiden geht. Nachtrag 2026-08-21: bis dahin kannte diese
+# Funktion nur '-c' -- auf peer (btrfs, `mount | grep ' / '` zeigt es) ist
+# das Volume selbst durchaus CoW-faehig, GNU cp versteht nur `-c` nicht (sofort
+# "invalid option"), also griff hier IMMER der Symlink-Rueckfall, obwohl ein
+# echter Klon technisch moeglich gewesen waere.
+clone_flag_available() {
   # Vorprobe: legt eine winzige Testdatei im $dst-Elternverzeichnis an (also
-  # auf demselben Volume wie das eigentliche Ziel) und versucht, sie per
-  # `cp -c` zu klonen. Erst danach wissen wir, ob das Zielvolume Cloning
-  # unterstuetzt, ohne die grosse Kopie im Fehlerfall wieder wegwerfen zu
-  # muessen.
-  local parent="$1" probe_src probe_dst rc
+  # auf demselben Volume wie das eigentliche Ziel) und versucht, sie zu
+  # klonen. Erst danach wissen wir, ob das Zielvolume Cloning unterstuetzt,
+  # ohne die grosse Kopie im Fehlerfall wieder wegwerfen zu muessen.
+  local parent="$1" probe_src probe_dst flag
   probe_src="$(mktemp "$parent/.wb-clone-probe.XXXXXX" 2>/dev/null)" || return 1
   probe_dst="${probe_src}.dst"
   printf 'x' > "$probe_src" 2>/dev/null
-  cp -c "$probe_src" "$probe_dst" 2>/dev/null; rc=$?
+  for flag in -c --reflink=always; do
+    rm -f "$probe_dst" 2>/dev/null
+    if cp "$flag" "$probe_src" "$probe_dst" 2>/dev/null; then
+      rm -f "$probe_src" "$probe_dst" 2>/dev/null
+      printf '%s' "$flag"
+      return 0
+    fi
+  done
   rm -f "$probe_src" "$probe_dst" 2>/dev/null
-  return "$rc"
+  return 1
 }
 link_app_node_modules() {
   local repo="$1" wt="$2" src dst
@@ -196,13 +213,15 @@ link_app_node_modules() {
   if [ -e "$dst" ] || [ -L "$dst" ]; then
     return 0
   fi
-  if clonefile_available "$wt/app" && cp -c -R "$src" "$dst" 2>/dev/null; then
+  local clone_flag
+  clone_flag="$(clone_flag_available "$wt/app")"
+  if [ -n "$clone_flag" ] && cp "$clone_flag" -R "$src" "$dst" 2>/dev/null; then
     say "app/node_modules vom Hauptbaum geklont ($src, copy-on-write) — kein npm install noetig."
     return 0
   fi
   rm -rf "$dst" 2>/dev/null
   if ln -s "$src" "$dst" 2>/dev/null; then
-    say "Hinweis: app/node_modules liess sich nicht klonen (kein APFS o. ae.) — stattdessen auf den Hauptbaum verlinkt ($src). ACHTUNG: kein npm ci/install in diesem Verweis, das raeumt beim Neuinstallieren durch den Symlink hindurch im HAUPTBAUM auf."
+    say "Hinweis: app/node_modules liess sich nicht klonen (kein APFS/btrfs-Klon auf diesem Volume) — stattdessen auf den Hauptbaum verlinkt ($src). ACHTUNG: kein npm ci/install in diesem Verweis, das raeumt beim Neuinstallieren durch den Symlink hindurch im HAUPTBAUM auf."
   else
     say "Hinweis: app/node_modules liess sich weder klonen noch verlinken — 'npm install' bleibt noetig."
   fi

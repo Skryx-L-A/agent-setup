@@ -55,6 +55,7 @@ import {
   parseModelsRegistry,
   type ModelsRegistry,
   type RegistryModel,
+  type RegistryVorhersage,
 } from '../../../extension/src/models.ts';
 import { type Effort } from '../../../extension/src/settings.ts';
 import { claudeSettingsFile, parseHooks } from '../../../extension/src/hooksInfo.ts';
@@ -111,6 +112,17 @@ export interface ModellSicht {
   effortFaehig: boolean;
   /** Groesse des Kontextfensters in Token, 0 wenn unbekannt. */
   kontext: number;
+  /**
+   * Laeuft dieses Modell auf DIESER Maschine, statt bei einem Anbieter?
+   *
+   * Gemessen an der ART DES ANBIETERS (`provider.kind === 'local'`), nicht am
+   * Harness: `kontingent.art` steht am Harness und sagt etwas ueber sein
+   * KONTINGENT, nicht ueber den Ort des Modells -- aider etwa traegt dort
+   * 'lokal' und fuehrt trotzdem zwanzig Modelle ueber openrouter. Am Anbieter
+   * gemessen stimmt es je Modell, und genau darauf kommt es an: nur bei einem
+   * lokalen Modell ist die Groesse des Kontextfensters ueberhaupt eine Wahl.
+   */
+  lokal: boolean;
   /** V11: laeuft der Harness dieses Modells auf DIESER Maschine an? */
   startbar: boolean;
   /**
@@ -119,6 +131,14 @@ export interface ModellSicht {
    * zeigen, was ein Mensch entschieden hat und was mitgeliefert wurde.
    */
   deckelRegistry: string;
+  /**
+   * Multi-Token-Vorhersage (2026-08-20): die AUSLIEFERUNG legt fest, welcher
+   * Entwerfer/eingebaute Kopf zu diesem Modell gehoert -- ein Mensch liest es
+   * hier nur, er stellt es nicht um (Vorgabe des Nutzers: "die Zuordnung
+   * gehoert zur Auslieferung, nicht in die Oberflaeche"). Fehlt, wenn die
+   * Registry-Zeile kein `vorhersage`-Feld traegt.
+   */
+  vorhersage?: RegistryVorhersage;
 }
 
 export interface EinstellungsDaten {
@@ -241,7 +261,8 @@ function modellSicht(
   binaer: Record<string, boolean>,
 ): ModellSicht {
   const h = findHarness(registry, m.harness);
-  const faehig = modelSupportsEffort(m, h, findProvider(registry, m.provider));
+  const anbieter = findProvider(registry, m.provider);
+  const faehig = modelSupportsEffort(m, h, anbieter);
   return {
     id: m.id,
     label: m.label,
@@ -251,8 +272,10 @@ function modellSicht(
     efforts: faehig ? allowedEfforts(m) : [],
     effortFaehig: faehig,
     kontext: m.contextWindow ?? 0,
+    lokal: anbieter?.kind === 'local',
     startbar: binaer[m.harness] !== false,
     deckelRegistry: m.maxEffort ?? '',
+    vorhersage: m.vorhersage,
   };
 }
 

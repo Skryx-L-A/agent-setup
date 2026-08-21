@@ -32,6 +32,44 @@ set -euo pipefail
 S="${1:?usage: wb-workers-window <tmux-session> [window-name]}"
 WNAME="${2:-workers}"
 
+# Mindesthoehe des Worker-Fensters (Betriebsbefund 19.08.2026 abends, der Nutzer,
+# gemessen: alle vier Worker-Panes der Sitzung wb-AI standen auf 184x1). Ursache
+# gemessen, nicht angenommen (isolierter Testsocket, Gruppensitzung mit einer
+# '-view'-Schwester, ein Steuerclient haengt sich MIT WINZIGER GROESSE an --
+# egal an welche der beiden Sitzungen der Gruppe, da sie dasselbe Fenster
+# teilen -- und loest sich wieder): das Fenster faellt SOFORT auf die Groesse
+# dieses Clients (200x50 -> 20x2 im Test) und bleibt DAUERHAFT dort stehen,
+# auch wenn danach ueberhaupt kein Client mehr angehaengt ist. `window-size
+# latest` (die tmux-Vorgabe, siehe show-options -g) verfolgt den zuletzt
+# gesehenen Client, nicht den GROESSTEN -- ein Fenster ohne eigene Vorgabe hat
+# also keinen Boden nach unten. 12 Zeilen, dieselbe Zahl wie
+# app/src/main/config.ts:184 (minPaneRows, Default 12) -- dieselbe
+# Entscheidung, wiederverwendet statt neu erfunden: genug fuer piIs Status-
+# und Eingabezeile plus ein paar Zeilen sichtbaren Verlauf, die
+# Absendepruefung braucht genau das.
+MIN_ZEILEN=12
+
+# Wird auf JEDEM Aufruf durchgesetzt, nicht nur beim Anlegen (des Nutzers
+# Auftrag: "unabhaengig davon, ob ein Client es gerade anzeigt") -- ein
+# bereits bestehendes Fenster, das zwischenzeitlich durch genau den oben
+# gemessenen Mechanismus geschrumpft ist, wird hier wieder hochgesetzt.
+# `window-size manual` MUSS vor `resize-window` stehen, sonst ueberschreibt
+# der naechste "latest"-Client die gesetzte Groesse sofort wieder (gemessen,
+# siehe app/src/main/tmux.ts applySizePolicy fuer dasselbe Muster). Eine
+# gruppierte '-view'-Schwester braucht KEINEN eigenen Aufruf: sie teilt
+# dasselbe Fenster-Objekt, eine Fenster-Option gilt fuer beide Sitzungen der
+# Gruppe gleichermassen.
+sichere_mindesthoehe() {   # <session> <fenstername>
+  local ziel="=$1:$2"
+  tmux set-option -w -t "$ziel" window-size manual 2>/dev/null || return 0
+  local hoehe
+  hoehe="$(tmux display -p -t "$ziel" '#{window_height}' 2>/dev/null || true)"
+  case "$hoehe" in
+    ''|*[!0-9]*) return 0 ;;   # Fenster gerade nicht ansprechbar -- kein Rateversuch
+  esac
+  [ "$hoehe" -lt "$MIN_ZEILEN" ] && tmux resize-window -t "$ziel" -y "$MIN_ZEILEN" 2>/dev/null || true
+}
+
 # Eine SICHT-Session bekommt niemals eine eigene Sicht. Wird dieses Werkzeug mit
 # '<name>-view' aufgerufen, arbeitet es auf der BASIS weiter — sonst entstehen
 # Ketten wie 'wb-a project-view-view-view' (gemessen 2026-08-04: drei Glieder, alle
@@ -105,6 +143,7 @@ point_view_at_workers() {
 }
 
 if tmux list-windows -t "=$S" -F '#{window_name}' 2>/dev/null | grep -qx "$WNAME"; then
+  sichere_mindesthoehe "$S" "$WNAME"
   point_view_at_workers
   exit 0
 fi
@@ -127,4 +166,5 @@ tmux set -p -t "$pane" @wb_role placeholder
 tmux select-pane -t "$pane" -T 'noch keine Worker'
 # global automatic-rename is on; the window must keep the contract name.
 tmux set-option -w -t "=$S:$WNAME" automatic-rename off 2>/dev/null || true
+sichere_mindesthoehe "$S" "$WNAME"
 point_view_at_workers

@@ -160,6 +160,31 @@ export interface RegistryCost {
   outPerMTok?: number;
 }
 
+/**
+ * Multi-Token-Vorhersage (Auftrag 2026-08-20): welche BAUART fuer dieses
+ * lokale Modell gewinnt, und mit welchem zusaetzlichen Modell.
+ *
+ *   'entwerfer'  ein KLEINES externes Modell schlaegt Token vor, das
+ *                Zielmodell prueft sie nur noch (`modell` ist der Pfad des
+ *                Entwerfers, wird ZUSAETZLICH zum Ziel geladen).
+ *   'eingebaut'  das Zielmodell traegt den Vorhersage-Kopf schon selbst
+ *                (`modell` ist der Pfad des GROESSEREN Modellkoerpers, der
+ *                die eigentliche Auslieferung ERSETZT, kein Zusatz).
+ *
+ * Der Sieger unter mehreren Kandidaten (bei qwen3.8-27B: zwei Entwerfer, zwei
+ * eingebaute Koepfe) ist bewusst NUR diese eine Struktur -- ein neuer Sieger
+ * aendert `bauart`/`modell`, sonst nichts an der Registry-Zeile des
+ * Zielmodells selbst.
+ */
+export interface RegistryVorhersage {
+  bauart: 'entwerfer' | 'eingebaut';
+  modell: string;
+  /** Gewichte des Entwerfers/eingebauten Koerpers in GiB, fuer die Speicherrechnung. */
+  gewichteGb?: number;
+  /** Woher der aktuelle Sieger stammt (Messung, Datum) -- Klartext, keine Struktur. */
+  herkunft?: string;
+}
+
 export interface RegistryModel {
   id: string;
   label: string;
@@ -191,6 +216,8 @@ export interface RegistryModel {
   source?: 'auto' | 'manual';
   /** ISO timestamp of the last successful discovery run that touched this entry. */
   discoveredAt?: string;
+  /** Multi-Token-Vorhersage: siehe RegistryVorhersage. Fehlt, wenn keine Vorhersage hinterlegt ist. */
+  vorhersage?: RegistryVorhersage;
 }
 
 export interface ModelsRegistry {
@@ -528,6 +555,24 @@ function validateCost(raw: unknown): RegistryCost | undefined {
   return inPerMTok !== undefined || outPerMTok !== undefined ? { inPerMTok, outPerMTok } : undefined;
 }
 
+function validateVorhersage(raw: unknown): RegistryVorhersage | undefined {
+  if (typeof raw !== 'object' || raw === null) {
+    return undefined;
+  }
+  const r = raw as Record<string, unknown>;
+  const bauart = r.bauart === 'entwerfer' || r.bauart === 'eingebaut' ? r.bauart : undefined;
+  const modell = asString(r.modell);
+  // Ohne beide Felder ist der Eintrag nicht auswertbar -- lieber "keine
+  // Vorhersage hinterlegt" (undefined) als eine halbe Angabe, die spaeter
+  // (wb-code/pi-worker) an einer fehlenden Haelfte scheitert.
+  if (!bauart || !modell) {
+    return undefined;
+  }
+  const gewichteGb = asPositiveNumber(r.gewichteGb);
+  const herkunft = asString(r.herkunft);
+  return { bauart, modell, gewichteGb, herkunft };
+}
+
 /**
  * A single model entry. `maxEffort` deckelt jeden Spawn (SPEC-V3 A.3, Policy-Caps
  * bleiben scharf): `efforts` wird auf alles <= `maxEffort` beschnitten, und ein
@@ -604,6 +649,7 @@ function validateModel(raw: unknown): RegistryModel | undefined {
     dataStaysLocal: typeof r.dataStaysLocal === 'boolean' ? r.dataStaysLocal : undefined,
     source: r.source === 'auto' || r.source === 'manual' ? r.source : undefined,
     discoveredAt: asString(r.discoveredAt),
+    vorhersage: validateVorhersage(r.vorhersage),
   };
 }
 

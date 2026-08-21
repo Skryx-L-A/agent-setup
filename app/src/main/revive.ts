@@ -197,10 +197,18 @@ export function fortsetzenHinweis(alterMinuten: number, tokens: number): string 
  * ohnehin schon ueber SSH abgerufen wird.
  */
 export function reviveCommand(
-  s: Pick<SessionInfo, 'dir' | 'machine' | 'claudeSessionId' | 'sessionKey' | 'name' | 'harness' | 'model'>,
+  s: Pick<SessionInfo, 'dir' | 'machine' | 'claudeSessionId' | 'sessionKey' | 'name' | 'harness' | 'model'>
+    & { kontext?: number },
   localMachine: string,
   wbCodeBin: string,
   harness?: HarnessResume,
+  /**
+   * Ob das `wb-code`, das gleich laeuft, `--kontext` ueberhaupt kennt. Gefragt
+   * wird es vom Aufrufer, nicht hier: diese Funktion baut nur eine Zeile und
+   * ruft keine Prozesse. Ohne Angabe bleibt der Schalter weg -- die vorsichtige
+   * Richtung, denn ein unbekanntes Flag beendet `wb-code` mit exit 1.
+   */
+  kenntKontext = false,
 ): ReviveCommand {
   const args = [s.dir];
 
@@ -282,6 +290,11 @@ export function reviveCommand(
 
   if (s.name) args.push('--name', s.name);
   if (s.sessionKey) args.push('--key', s.sessionKey);
+  // DIE STUFE, DIE DER MENSCH EINMAL GEWAEHLT HAT (21.08.). Sie steht in der
+  // Zustandsdatei, und ohne sie kam die Sitzung nach jedem Neustart mit der
+  // Vorgabestufe zurueck. Nur wenn das Ziel-`wb-code` den Schalter kennt --
+  // sonst waere aus einer fehlenden Stufe ein gescheiterter Start geworden.
+  if (kenntKontext && s.kontext && s.kontext > 0) args.push('--kontext', String(s.kontext));
   if (s.machine === localMachine) return { bin: wbCodeBin, args, conversation, conversationReason };
   // EIN Weg auf die andere Maschine, fuer alle vier Griffe (09.08.). Die Zeile
   // stand bis heute hier von Hand zusammengesetzt, ohne Kodierung und ohne

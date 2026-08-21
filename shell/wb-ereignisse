@@ -3,6 +3,7 @@
 # ohne dass irgendjemand in einen Pane tippt und ohne dass ein Modell mitwirkt.
 #
 #   wb-ereignisse [--session <tmux-session>] [--intervall <sekunden>] [--einmal]
+#                 [--modus auto|ereignis|poll]
 #
 # Warum es das gibt (2026-08-07): In den Orchestrator-Pane darf nur noch der
 # Kontext-Guard schreiben, und der nur bei vollem Kontextfenster. Damit faellt der
@@ -45,10 +46,31 @@
 # mit. Dieselbe Regel wendet die Oberflaeche an (app/src/main/workerstate.ts,
 # `stillstand()`), dort mit ihrer Messung begruendet.
 #
+# WIE OFT NACHGESEHEN WIRD (2026-08-20, Schritt 1 des Kommunikationsplans):
+# Bis heute lief ein fester Takt von zwei Sekunden -- eine Fertigmeldung kam also
+# bis zu zwei Sekunden zu spaet, und die Schleife lief Tag und Nacht durch, auch
+# wenn stundenlang nichts passierte. Jetzt gibt es zwei Modi im selben Skript:
+#
+#   ereignis  Das Dateisystem WECKT. `wb-verzeichniswache` (kqueue auf macOS,
+#             fswatch/inotifywait wo vorhanden) beobachtet results/, requests/
+#             und guard-blocks/; jede ihrer Zeilen loest sofort einen Durchgang
+#             aus. Darunter laeuft weiter ein LANGSAMER Takt als Netz
+#             (WB_EREIGNISSE_NETZ, Vorgabe 15 s) -- er faengt alles, was ein
+#             Verzeichnis-Ereignis nicht sieht: den geaenderten Inhalt einer
+#             schon vorhandenen Datei, einen toten Pane, einen Stillstand.
+#   poll      Der bisherige feste Takt, unveraendert.
+#   auto      ereignis, wenn die Wache laeuft; sonst poll. Vorgabe.
+#
+# Was NICHT anders wird: das Ausgabeformat, die vier Ereignisarten, die Merker,
+# die Karenz beim Erststart und jede Pruefung selbst. Der Modus entscheidet nur,
+# WANN `durchgang` laeuft, nie WAS es meldet -- deshalb ist der Rueckweg ein
+# Schalter und kein Rueckbau.
+#
 # ROBUSTHEIT: Das Programm hoert nie von selbst auf. Kein `set -e`; jede Pruefung
 # laeuft fuer sich, ein tmux-Aussetzer, ein fehlendes Verzeichnis oder eine Datei,
 # die zwischen zwei Pruefungen verschwindet, beendet es nicht. Jede Zeile geht
-# sofort raus (bash schreibt jedes `printf` einzeln).
+# sofort raus (bash schreibt jedes `printf` einzeln). Stirbt die Wache mitten im
+# Lauf, faellt der Beobachter still auf den Takt zurueck statt stehenzubleiben.
 #
 # MERKER: neben dem Zustand, nicht im Projektverzeichnis --
 # ~/.local/state/wb-ereignisse/<slug>/, Slug aus Socketpfad UND Basis-Sessionname
@@ -63,6 +85,11 @@ BLOCKDIR="$HOME/.pi-workers/guard-blocks"
 STATE_BASE="$HOME/.local/state/wb-ereignisse"
 WBSTATE="$HOME/.local/bin/wb-state"
 [ -x "$WBSTATE" ] || WBSTATE="$(dirname "$0")/wb-state"
+# Die Wache aus DEMSELBEN Verzeichnis zuerst: wer die Repo-Fassung dieses Skripts
+# startet (Test, Worktree), soll auch deren Wache bekommen und nicht die
+# installierte von gestern.
+WACHE="$(dirname "$0")/wb-verzeichniswache"
+[ -x "$WACHE" ] || WACHE="$HOME/.local/bin/wb-verzeichniswache"
 
 # Karenz beim ERSTEN Start fuer diese Session (Sekunden). Was laenger her ist,
 # wird still vorgemerkt statt gemeldet -- sonst wuerde der erste Lauf jedes alte
@@ -71,16 +98,30 @@ WBSTATE="$HOME/.local/bin/wb-state"
 # und dessen Ergebnis niemand je sieht. Dieselbe Abwaegung wie im Kontext-Guard.
 KARENZ="${WB_EREIGNISSE_KARENZ:-300}"
 
+# Der langsame Takt UNTER dem Ereignis-Modus. Er faengt, was ein
+# Verzeichnis-Ereignis nicht sieht (siehe Kopfkommentar). 15 s ist die
+# Groessenordnung, in der ein stehengebliebener oder toter Worker bemerkt werden
+# soll -- fuer das, worauf es bei der Latenz ankommt (eine neue Ergebnisdatei),
+# ist ohnehin die Wache zustaendig.
+NETZ_TAKT="${WB_EREIGNISSE_NETZ:-15}"
+case "$NETZ_TAKT" in ''|*[!0-9]*) NETZ_TAKT=15 ;; esac
+[ "$NETZ_TAKT" -ge 1 ] 2>/dev/null || NETZ_TAKT=15
+
 usage() {
     cat <<'EOF'
 wb-ereignisse — Ereignisstrom der Worker dieser Session, eine Zeile je Ereignis.
 
   wb-ereignisse [--session <tmux-session>] [--intervall <sekunden>] [--einmal]
+                [--modus auto|ereignis|poll]
 
   --session    Basis-Sessionname. Ohne Angabe: die eigene Session (aus $WB_SESSION
                oder aus dem eigenen Pane).
-  --intervall  Takt in Sekunden. Ohne Angabe: 'workerPollSeconds' aus den
+  --intervall  Takt in Sekunden (Modus 'poll', und das Netz unter 'ereignis' als
+               Untergrenze). Ohne Angabe: 'workerPollSeconds' aus den
                Einstellungen, sonst 2.
+  --modus      'ereignis' laesst das Dateisystem wecken (wb-verzeichniswache) und
+               nimmt den Takt nur noch als Netz; 'poll' ist der alte feste Takt;
+               'auto' (Vorgabe) nimmt 'ereignis', wenn die Wache laeuft.
   --einmal     Einen Durchgang, dann Ende (fuer Tests und Skripte).
 
 Gedacht als HINTERGRUNDBEFEHL: seine stdout-Zeilen kommen beim Orchestrator als
@@ -88,16 +129,21 @@ Benachrichtigung an, ohne dass jemand in seinen Pane schreibt.
 EOF
 }
 
-SESS=""; INTERVALL=""; EINMAL=0
+SESS=""; INTERVALL=""; EINMAL=0; MODUS="${WB_EREIGNISSE_MODUS:-auto}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --session)   SESS="${2:?--session erwartet einen tmux-Sessionnamen}"; shift 2 ;;
         --intervall) INTERVALL="${2:?--intervall erwartet Sekunden}"; shift 2 ;;
+        --modus)     MODUS="${2:?--modus erwartet auto|ereignis|poll}"; shift 2 ;;
         --einmal)    EINMAL=1; shift ;;
         -h|--help|--hilfe) usage; exit 0 ;;
         *) echo "wb-ereignisse: unbekannte Option '$1'" >&2; usage >&2; exit 2 ;;
     esac
 done
+case "$MODUS" in
+    auto|ereignis|poll) ;;
+    *) echo "wb-ereignisse: --modus kennt nur auto, ereignis, poll (nicht '$MODUS')." >&2; exit 2 ;;
+esac
 
 # ---------------------------------------------------------------- Grundlagen
 
@@ -159,8 +205,15 @@ esac
 # Minuten, ihn alle zwei Sekunden zu pruefen kostet capture-pane- und ps-Aufrufe
 # und bringt nichts. Der schnelle Takt gehoert den Dateiereignissen, auf die es
 # fuer die Latenz ankommt.
+#
+# Gemessen wird er an der UHR, nicht an einer Zahl von Durchgaengen (geaendert
+# 2026-08-20): im Ereignis-Modus kommen die Durchgaenge unregelmaessig -- ein
+# Schreibgewitter loest zwanzig in einer Sekunde aus, danach passiert eine
+# Stunde nichts. Ein Zaehler ueber Durchgaenge haette den Stillstand dann genau
+# dort haeufig geprueft, wo es am wenigsten noetig ist, und dort gar nicht, wo es
+# darauf ankommt.
 STILL_TAKT=15
-still_faellig=0
+still_zuletzt=0
 
 # ---------------------------------------------------------------- Werkzeugkasten
 
@@ -225,6 +278,14 @@ ergebnis_von() {   # <name> -> "<pfad> <mtime>" oder leer
         [ -L "$f" ] && continue           # latest.md und jeder andere Symlink
         [ -f "$f" ] || continue
         [ -s "$f" ] || continue           # leer zaehlt nicht als Ergebnis
+        # Ein gescheiterter ZUSTELLVERSUCH ist kein Ergebnis (2026-08-20).
+        # pi-worker legt ihn als eigene Datei ab, damit er nicht die Stelle
+        # besetzt, an der spaeter das echte Ergebnis erwartet wird -- gemessen
+        # beim Worker 'dsharness', wo ein Fehlalarm der Zustellpruefung als
+        # "fertig" gemeldet wurde, waehrend der Worker gerade erst anfing.
+        # Wer davon erfahren muss, erfaehrt es sofort und laut: pi-worker
+        # endet mit einem Fehler und schreibt den Grund nach stderr.
+        case "$f" in *.zustellung-fehlgeschlagen.md) continue ;; esac
         m=$(mtime "$f")
         case "$m" in ''|*[!0-9]*) continue ;; esac
         printf '%s %s' "$f" "$m"
@@ -637,17 +698,30 @@ bekannte_aufraeumen() {
 
 # ---------------------------------------------------------------- Lauf
 
+WACHE_PID=""
+WACHE_FIFO="$STATE/wache.fifo"
+# Was dieses Programm gestartet hat, beendet es auch -- eine Wache, die den
+# Beobachter ueberlebt, beobachtet fuer niemanden mehr. Beendet wird sie ueber
+# die gemerkte PID (nie ueber ein Namensmuster), und der Weg haengt an EXIT,
+# damit auch ein Abbruch mitten im Lauf sie mitnimmt.
+wache_beenden() {
+    [ -n "$WACHE_PID" ] && kill "$WACHE_PID" 2>/dev/null
+    WACHE_PID=""
+    rm -f "$WACHE_FIFO" 2>/dev/null
+}
 aufraeumen() {
+    wache_beenden
     [ "$(cat "$PID_DATEI" 2>/dev/null)" = "$$" ] && rm -f "$PID_DATEI" 2>/dev/null
     exit 0
 }
 trap aufraeumen TERM INT HUP
+trap wache_beenden EXIT EXIT
 
 printf '%s\n' "$$" >"$PID_DATEI" 2>/dev/null || true
 
 erststart_erledigt=0
 durchgang() {
-    local panes_da=1
+    local panes_da=1 jetzt_s
     panes_lesen || panes_da=0
     if [ "$panes_da" = 1 ]; then
         bekannte_pflegen
@@ -672,12 +746,11 @@ durchgang() {
     if [ "$panes_da" = 1 ]; then
         pruefe_bloecke
         pruefe_weg
-        if [ "$still_faellig" -le 0 ]; then
+        jetzt_s=$(date +%s)
+        if [ "$(( jetzt_s - still_zuletzt ))" -ge "$STILL_TAKT" ]; then
             pruefe_stillstand
-            still_faellig=$(( STILL_TAKT / INTERVALL ))
-            [ "$still_faellig" -ge 1 ] || still_faellig=1
+            still_zuletzt="$jetzt_s"
         fi
-        still_faellig=$(( still_faellig - 1 ))
     fi
 }
 
@@ -685,6 +758,63 @@ if [ "$EINMAL" = 1 ]; then
     durchgang
     rm -f "$PID_DATEI" 2>/dev/null
     exit 0
+fi
+
+# Die Wache anwerfen, wenn der Modus sie zulaesst. Sie schreibt eine Zeile je
+# Ereignisstoss in eine FIFO; ihr stderr faellt weg, die gewaehlte Quelle steht
+# ohnehin in der eigenen Startzeile. Scheitert irgendetwas daran -- Skript fehlt,
+# keine Ereignisquelle, FIFO nicht anzulegen --, bleibt es beim Takt, und zwar
+# still: der Beobachter darf daran nie haengenbleiben.
+#
+# Warum eine FIFO und keine Prozess-Substitution: dieses Skript laeuft auf
+# bash 3.2 (macOS-Bordfassung). Dort gibt es weder `{fd}<` noch ein `$!` fuer
+# `<(...)` -- ohne die PID koennte die Wache am Ende nicht beendet werden, und
+# genau das waere der Fehler, den die Prozess-Hygiene verbietet. Geoeffnet wird
+# die FIFO LESEND UND SCHREIBEND (`<>`): so blockiert das Oeffnen nicht, und ein
+# EOF (Wache gestorben) macht aus der Warteschleife keine Schleife ohne Pause.
+# Ob die Wache noch lebt, wird stattdessen an ihrer PID geprueft.
+WACHE_AN=0
+if [ "$MODUS" != poll ] && [ -x "$WACHE" ]; then
+    mkdir -p "$RESROOT" "$REQDIR" 2>/dev/null
+    rm -f "$WACHE_FIFO" 2>/dev/null
+    if mkfifo "$WACHE_FIFO" 2>/dev/null; then
+        "$WACHE" --frist "$NETZ_TAKT" "$RESROOT" "$REQDIR" "$BLOCKDIR" \
+            >"$WACHE_FIFO" 2>/dev/null &
+        WACHE_PID=$!
+        # KEIN `2>/dev/null` an dieses `exec`: ein `exec` OHNE Kommando wendet
+        # seine Umlenkungen auf die SCHLEIFE SELBST an -- die Zeile haette also
+        # nicht den Oeffnungsfehler unterdrueckt, sondern von hier an jede
+        # stderr-Ausgabe dieses Programms, samt seiner Startzeile. Genau so
+        # gemessen (2026-08-20): der Ereignis-Modus lief, sagte es aber
+        # nirgends mehr. Die FIFO ist eine Zeile darueber gerade erst angelegt
+        # worden; scheitert das Oeffnen trotzdem, soll man es sehen.
+        if exec 3<>"$WACHE_FIFO"; then
+            sleep 0.5
+            kill -0 "$WACHE_PID" 2>/dev/null && WACHE_AN=1
+        fi
+        [ "$WACHE_AN" = 1 ] || wache_beenden
+    fi
+fi
+if [ "$WACHE_AN" = 0 ] && [ "$MODUS" = ereignis ]; then
+    echo "wb-ereignisse: --modus ereignis verlangt, aber die Wache laeuft nicht ($WACHE) — es bleibt beim Takt." >&2
+fi
+
+if [ "$WACHE_AN" = 1 ]; then
+    # Das Netz ist nie SCHNELLER als der eingestellte Takt: wer workerPollSeconds
+    # hochdreht, will weniger Betrieb, nicht mehr.
+    [ "$NETZ_TAKT" -ge "$INTERVALL" ] || NETZ_TAKT="$INTERVALL"
+    echo "wb-ereignisse: beobachte Session $SESS (Ereignisse + Netz ${NETZ_TAKT}s, Merker $STATE)" >&2
+    while :; do
+        durchgang
+        # Warten, bis die Wache weckt ODER das Netz faellig ist.
+        read -r -t "$NETZ_TAKT" -u 3 _zeile
+        if ! kill -0 "$WACHE_PID" 2>/dev/null; then
+            echo "wb-ereignisse: Wache beendet — weiter im Takt (${INTERVALL}s)." >&2
+            exec 3<&-
+            WACHE_PID=""; rm -f "$WACHE_FIFO" 2>/dev/null
+            break
+        fi
+    done
 fi
 
 echo "wb-ereignisse: beobachte Session $SESS (Takt ${INTERVALL}s, Merker $STATE)" >&2

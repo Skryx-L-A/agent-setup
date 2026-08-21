@@ -1,0 +1,258 @@
+#!/bin/bash
+# wb-lokal-server — der Waehler zwischen den beiden lokalen Motoren.
+#
+# Es gibt zwei Wege, ein lokales Modell zu bedienen, und sie koennen
+# verschiedene Dinge:
+#
+#   wb-mlx-server    (Port 8081)  mlx_lm.server. Im Einzelstrom der schnellste
+#                                 Weg auf dieser Maschine (17,7 gegen 14,1
+#                                 Tok/s, gemessen 2026-08-11) und mit
+#                                 --decode-concurrency 4 der erprobte Weg fuer
+#                                 Buendelung (40,3 s je Einheit gegen 97,0 s
+#                                 seriell, gemessen 15./16.08.). Spekulatives
+#                                 Dekodieren kann er fuer unsere
+#                                 qwen3_5-Hybridmodelle NICHT — nicht
+#                                 "langsamer", sondern gar nicht: er bricht
+#                                 jede Anfrage mit "Speculative decoding
+#                                 requires a trimmable prompt cache (got
+#                                 {'ArraysCache'})" ab (am 2026-08-19 selbst
+#                                 reproduziert, mlx-lm 0.31.3).
+#
+#   wb-llama-server  (Port 8082)  llama.cpp. Kann kontinuierliche Buendelung
+#                                 UND spekulatives Dekodieren gleichzeitig, in
+#                                 einem Prozess und auch fuer hybride Modelle
+#                                 (common_speculative_init bekommt n_parallel,
+#                                 jeder Slot haelt seinen eigenen Entwurf und
+#                                 seinen eigenen Kontrollpunkt).
+#
+# Dieses Werkzeug entscheidet, welcher von beiden startet, und NUR dieses
+# Werkzeug liest dafuer die beiden Einstellungsschluessel. Die Aufrufer
+# (pi-worker, wb-kontext, wb-code, wb-modell-proxy) geben ihre ROLLE mit und
+# fragen nicht selbst in settings.json nach — sonst steht die Regel an vier
+# Stellen und weicht an dreien ab.
+#
+# EINSTELLUNGEN (~/.claude/workbench/settings.json):
+#   speculativeDecoding         Vorgabe true.  Hauptschalter. Ist er false,
+#                               laeuft nirgends Spekulation und der Waehler
+#                               nimmt immer den MLX-Weg.
+#   speculativeDecodingWorkers  Vorgabe true.  Gilt zusaetzlich und NUR fuer
+#                               Aufrufe mit --rolle worker. Ohne den
+#                               Hauptschalter wirkungslos.
+# Fehlt ein Schluessel, gilt true — die Vorgabe ist "an", weil Spekulation bei
+# gierigem Dekodieren verlustfrei ist und die meisten Anfragen beschleunigt.
+#
+# ENTSCHEIDUNGSREGEL (bis die Messstrecke aus Paket 5 des Plans sie mit Zahlen
+# ersetzt — sie ist begruendet, nicht gemessen, und das steht hier bewusst):
+#   Spekulation nicht erlaubt          -> MLX, Buendelung
+#   kein GGUF fuer dieses Modell       -> MLX, Buendelung   (llama.cpp braucht GGUF)
+#   erlaubt und --parallel 1           -> llama.cpp mit dem Verfahren aus der
+#                                         Registry (mtp oder entwurf)
+#   erlaubt und --parallel >= 2        -> llama.cpp mit ngram-mod: kostet keinen
+#                                         zweiten KV-Cache, und der Hash-Vorrat
+#                                         wird ueber alle Slots geteilt, gleich-
+#                                         zeitige Anfragen helfen einander
+#
+# AUSGABE: auf stdout genau eine JSON-Zeile mit dem, was ein Aufrufer braucht
+# (Motor, baseUrl, Port, Modell, Verfahren, Begruendung). Alles Menschliche
+# geht auf stderr. Damit kann ein Aufrufer `eval`-frei mit einer Zeile
+# weiterarbeiten und trotzdem mitlesen, warum so entschieden wurde.
+#
+# NICHTS AN DEN ANDEREN WERKZEUGEN: dieses Skript ruft wb-mlx-server und
+# wb-llama-server auf und aendert an keinem von beiden etwas. Es fasst
+# ~/.claude/workbench/models.json nicht an und ~/.pi/agent/models.json auch
+# nicht.
+
+set -uo pipefail
+
+SETTINGS="${WB_SETTINGS_FILE:-$HOME/.claude/workbench/settings.json}"
+REGISTRY="$HOME/.local/state/wb-belegung/entwurfsmodelle.json"
+MLX_PORT="${WB_MLX_SERVER_PORT:-8081}"
+LLAMA_PORT="${WB_LLAMA_SERVER_PORT:-8082}"
+
+err() { printf 'wb-lokal-server: %s\n' "$*" >&2; }
+
+schalter_lesen() {
+  # Gibt "haupt worker" als zwei Woerter true/false. Fehlende Datei, fehlender
+  # Schluessel und kaputtes JSON ergeben alle die Vorgabe true — ein Waehler,
+  # der wegen einer unlesbaren Einstellungsdatei stehen bleibt, waere schlimmer
+  # als einer, der die Vorgabe nimmt und es sagt.
+  python3 - "$SETTINGS" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    d = {}
+def b(k):
+    v = d.get(k, True)
+    return "true" if v is not False else "false"
+print(b("speculativeDecoding"), b("speculativeDecodingWorkers"))
+PY
+}
+
+registry_feld() {
+  local key="$1" feld="$2"
+  python3 - "$REGISTRY" "$key" "$feld" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+e = (d.get("modelle") or {}).get(sys.argv[2])
+if e is None:
+    sys.exit(2)
+v = e.get(sys.argv[3])
+print("" if v is None else v)
+PY
+}
+
+cmd_entscheiden() {
+  local modell="" rolle="orchestrator" parallel=1 kontext="" frist="" nur_zeigen=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --rolle)
+        case "${2:-}" in
+          worker|orchestrator) rolle="$2" ;;
+          *) err "--rolle kennt nur worker|orchestrator"; exit 2 ;;
+        esac
+        shift 2 ;;
+      --parallel)
+        case "${2:-}" in ''|*[!0-9]*) err "--parallel braucht eine Zahl"; exit 2 ;; esac
+        parallel="$2"; shift 2 ;;
+      --kontext)
+        case "${2:-}" in ''|*[!0-9]*) err "--kontext braucht eine Zahl"; exit 2 ;; esac
+        kontext="$2"; shift 2 ;;
+      --frist)
+        case "${2:-}" in ''|*[!0-9]*) err "--frist braucht Minuten als Zahl"; exit 2 ;; esac
+        frist="$2"; shift 2 ;;
+      --nur-entscheiden) nur_zeigen=1; shift ;;
+      --*) err "unbekannte Option '$1'"; exit 2 ;;
+      *)
+        if [ -n "$modell" ]; then err "nur ein Modell je Aufruf"; exit 2; fi
+        modell="$1"; shift ;;
+    esac
+  done
+  if [ -z "$modell" ]; then
+    err "kein Modell angegeben. Usage siehe 'wb-lokal-server' ohne Argumente."
+    exit 2
+  fi
+
+  local schalter haupt fuer_worker
+  schalter="$(schalter_lesen)"
+  haupt="$(printf '%s' "$schalter" | awk '{print $1}')"
+  fuer_worker="$(printf '%s' "$schalter" | awk '{print $2}')"
+
+  local spek_erlaubt="ja" grund=""
+  if [ "$haupt" != "true" ]; then
+    spek_erlaubt="nein"
+    grund="speculativeDecoding steht auf false"
+  elif [ "$rolle" = "worker" ] && [ "$fuer_worker" != "true" ]; then
+    spek_erlaubt="nein"
+    grund="speculativeDecodingWorkers steht auf false und der Aufrufer ist ein Worker"
+  fi
+
+  local gguf="" verfahren_registry=""
+  gguf="$(registry_feld "$modell" gguf 2>/dev/null)"
+  local reg_rc=$?
+  if [ "$reg_rc" -eq 2 ]; then
+    err "'$modell' steht nicht in $REGISTRY — behandle es als reines MLX-Modell."
+  fi
+  verfahren_registry="$(registry_feld "$modell" verfahren 2>/dev/null)"
+  [ -n "$verfahren_registry" ] || verfahren_registry="aus"
+
+  local motor verfahren
+  if [ "$spek_erlaubt" = "nein" ]; then
+    motor="mlx"; verfahren="aus"
+  elif [ -z "$gguf" ] || [ "$gguf" = "None" ] || [ ! -f "$gguf" ]; then
+    motor="mlx"; verfahren="aus"
+    grund="kein GGUF fuer '$modell' vorhanden, und llama.cpp braucht eines"
+  elif [ "$verfahren_registry" = "aus" ]; then
+    motor="mlx"; verfahren="aus"
+    grund="die Registry setzt fuer '$modell' das Verfahren 'aus'"
+  elif [ "$parallel" -ge 2 ]; then
+    motor="llama"; verfahren="ngram"
+    grund="ab zwei gleichzeitigen Anfragen buendelt llama.cpp und spekuliert per n-Gramm, ohne zweiten KV-Cache"
+  else
+    motor="llama"; verfahren="$verfahren_registry"
+    grund="ein einzelner Strom, also das Entwurfsverfahren aus der Registry"
+  fi
+  [ -n "$grund" ] || grund="Vorgabe"
+
+  local port baseurl
+  if [ "$motor" = "mlx" ]; then port="$MLX_PORT"; else port="$LLAMA_PORT"; fi
+  baseurl="http://127.0.0.1:$port/v1"
+
+  err "Entscheidung: Motor $motor, Spekulation $verfahren ($grund)."
+  err "  Schalter: speculativeDecoding=$haupt, speculativeDecodingWorkers=$fuer_worker, Rolle=$rolle, parallel=$parallel."
+
+  if [ "$nur_zeigen" -eq 0 ]; then
+    local rc=0
+    if [ "$motor" = "mlx" ]; then
+      command -v wb-mlx-server >/dev/null 2>&1 || { err "wb-mlx-server nicht im PATH."; exit 1; }
+      # Der Registry-Eintrag darf einen anderen Namen fuer den MLX-Weg tragen
+      # (Feld "mlx"). Fehlt er oder ist er leer, gilt der Modellname selbst —
+      # ein leerer Name wuerde wb-mlx-server sonst in seinen eigenen Rueckfall
+      # schicken und ein ganz anderes Modell starten.
+      local mlx_name; mlx_name="$(registry_feld "$modell" mlx 2>/dev/null)"
+      case "$mlx_name" in ''|None) mlx_name="$modell" ;; esac
+      set -- ensure "$mlx_name"
+      [ -n "$kontext" ] && set -- "$@" --kontext "$kontext"
+      [ -n "$frist" ] && set -- "$@" --frist "$frist"
+      wb-mlx-server "$@" || rc=$?
+    else
+      command -v wb-llama-server >/dev/null 2>&1 || { err "wb-llama-server nicht im PATH."; exit 1; }
+      set -- ensure "$modell" --parallel "$parallel" --spekulation "$verfahren"
+      [ -n "$kontext" ] && set -- "$@" --kontext "$kontext"
+      [ -n "$frist" ] && set -- "$@" --frist "$frist"
+      wb-llama-server "$@" || rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+      err "der gewaehlte Motor konnte nicht starten (Exit $rc) — KEIN stiller Wechsel auf den anderen."
+      err "Ein stiller Wechsel wuerde die Belegungslage verschleiern; wer den anderen Weg will, ruft ihn ausdruecklich auf."
+      exit "$rc"
+    fi
+  fi
+
+  python3 - "$motor" "$baseurl" "$port" "$modell" "$verfahren" "$grund" "$rolle" "$parallel" <<'PY'
+import json, sys
+motor, baseurl, port, modell, verfahren, grund, rolle, parallel = sys.argv[1:9]
+print(json.dumps({
+    "motor": motor,
+    "baseUrl": baseurl,
+    "port": int(port),
+    "modell": modell,
+    "spekulation": verfahren,
+    "rolle": rolle,
+    "parallel": int(parallel),
+    "grund": grund,
+}, ensure_ascii=False))
+PY
+}
+
+cmd_status() {
+  echo "MLX-Weg (Port $MLX_PORT):"
+  if command -v wb-mlx-server >/dev/null 2>&1; then wb-mlx-server status 2>&1 | sed 's/^/  /'; else echo "  wb-mlx-server nicht im PATH."; fi
+  echo "llama.cpp-Weg (Port $LLAMA_PORT):"
+  if command -v wb-llama-server >/dev/null 2>&1; then wb-llama-server status 2>&1 | sed 's/^/  /'; else echo "  wb-llama-server nicht im PATH."; fi
+  echo "Schalter ($SETTINGS): $(schalter_lesen | awk '{print "speculativeDecoding="$1", speculativeDecodingWorkers="$2}')"
+}
+
+cmd_stop() {
+  # Beendet BEIDE Wege und prueft beide — wer aufraeumt, raeumt ganz auf.
+  local rc=0
+  command -v wb-mlx-server >/dev/null 2>&1 && { wb-mlx-server stop || rc=$?; }
+  command -v wb-llama-server >/dev/null 2>&1 && { wb-llama-server stop || rc=$?; }
+  return "$rc"
+}
+
+unterbefehl="${1:-}"; shift 2>/dev/null || true
+case "$unterbefehl" in
+  ensure) cmd_entscheiden "$@" ;;
+  status) cmd_status ;;
+  stop)   cmd_stop ;;
+  *)
+    echo "Usage: wb-lokal-server ensure <modell> [--rolle worker|orchestrator] [--parallel <n>] [--kontext <token>] [--frist <minuten>] [--nur-entscheiden]" >&2
+    echo "       wb-lokal-server status | stop" >&2
+    echo "" >&2
+    echo "Gibt auf stdout eine JSON-Zeile: motor, baseUrl, port, modell, spekulation, rolle, parallel, grund." >&2
+    exit 2 ;;
+esac

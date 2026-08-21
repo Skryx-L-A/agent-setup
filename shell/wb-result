@@ -47,6 +47,16 @@ if [ "$MACHINE" = "$SELF" ]; then
   tgt="$(readlink "$f" 2>/dev/null || true)"
   case "$tgt" in
     *.laufend.md) : ;;
+    # Ein gescheiterter ZUSTELLVERSUCH ist kein Ergebnis (2026-08-20). Er wird
+    # GEZEIGT -- wer hier fragt, will genau das wissen --, zaehlt aber nicht als
+    # "fertig": Exit 1 wie beim Platzhalter. Erkannt am Dateinamen, nicht am
+    # Inhalt, dieselbe Regel wie eine Zeile darueber. Anlass: beim Worker
+    # 'dsharness' stand ein Fehlschlag unter dem ERGEBNISPFAD, und danach war
+    # "Zustellung gescheitert" von "Arbeit fertig" nicht mehr zu unterscheiden.
+    *.zustellung-fehlgeschlagen.md)
+      [ -s "$f" ] && cat "$f"
+      echo "wb-result: '$NAME' hat KEIN Ergebnis — die Zustellung ist gescheitert (siehe oben)." >&2
+      exit 1 ;;
     *) if [ -s "$f" ]; then cat "$f"; exit 0; fi ;;
   esac
   echo "wb-result: '$NAME' ist noch nicht fertig ($f fehlt oder ist leer)." >&2
@@ -55,7 +65,11 @@ fi
 
 # $HOME is expanded by the REMOTE shell; the double quotes survive spaces in a name.
 RFILE="\"\$HOME/.pi-workers/results/$NAME/latest.md\""
-RCMD="t=\$(readlink $RFILE 2>/dev/null); case \"\$t\" in *.laufend.md) exit 1 ;; esac; test -s $RFILE && cat $RFILE"
+# Dieselben zwei Ausnahmen wie im lokalen Zweig darueber, sonst haette ein Worker
+# auf der anderen Maschine eine andere Wahrheit als einer hier. Der Fehlschlag
+# wird auch dort GEZEIGT und zaehlt trotzdem nicht als fertig -- der Text geht
+# nach stderr, damit stdout dem echten Ergebnis vorbehalten bleibt.
+RCMD="t=\$(readlink $RFILE 2>/dev/null); case \"\$t\" in *.laufend.md) exit 1 ;; *.zustellung-fehlgeschlagen.md) cat $RFILE >&2; exit 1 ;; esac; test -s $RFILE && cat $RFILE"
 out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$MACHINE" "$RCMD" 2>/dev/null)
 rc=$?
 if [ "$rc" = 0 ]; then printf '%s\n' "$out"; exit 0; fi

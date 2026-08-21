@@ -59,6 +59,14 @@ function ergebnisEintraege(resultsDir: string, worker: string, sessionId: string
   const raus: AktivitaetEintrag[] = [];
   for (const name of namen) {
     if (name === 'latest.md' || !name.endsWith('.md')) continue;
+    // Eine gescheiterte Zustellung ist KEIN Ergebnis (2026-08-20). Die Datei
+    // endet auf '.md' und lag deshalb bisher als Ergebniseintrag in der
+    // Aktivitaet -- also genau die Verwechslung von "Zustellung gescheitert" und
+    // "Arbeit fertig", gegen die pi-worker sie ueberhaupt erst unter eigenem
+    // Namen ablegt. `wb-ereignisse` uebergeht sie schon (ergebnis_von() dort);
+    // hier fehlte es. Der Fall ist heute zweimal im Betrieb aufgetreten, und
+    // beide Male hat der Worker trotzdem gearbeitet.
+    if (name.endsWith('.zustellung-fehlgeschlagen.md')) continue;
     const pfad = join(ordner, name);
     try {
       const st = statSync(pfad);

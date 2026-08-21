@@ -40,9 +40,13 @@ file names the trigger that makes you read it BEFORE acting.
   `~/.claude/roles/orchestrator.md`. Kein Versehen — Orchestrator- und Worker-Sessions laden je
   nur ihre eigene Rollendatei, ein Verweis auf die andere ginge für die jeweils andere Session
   ins Leere. Bei einer inhaltlichen Änderung BEIDE Stellen pflegen.
-- **Stil-Vorrang (2026-08-03) — drei Ebenen, sie widersprechen sich nicht.** (a) CHAT und
-  Statusmeldungen im Terminal: knapp, Fragmente erlaubt; hier und nur hier greift ein global
-  aktiver Knapp-Modus, falls einer läuft. (b) JEDER Fließtext, den ein Mensch außerhalb des
+- **Stil-Vorrang (2026-08-03, verschaerft 2026-08-19) — drei Ebenen, sie widersprechen sich
+  nicht.** (a) CHAT und Statusmeldungen im Terminal: knapp, Fragmente erlaubt; hier und nur hier
+  greift der global aktive Knapp-Modus (Caveman, `~/.claude/.caveman-active`). Er gilt ab dem
+  ERSTEN Zug und dauerhaft, fuer Orchestrator wie Worker, zum Tokensparen. Ein WORKER weicht nie
+  davon ab. Der ORCHESTRATOR darf ihn fuer EINE Antwort aussetzen, wenn der Nutzer ausdruecklich
+  eine ausfuehrliche Erklaerung verlangt; danach gilt er sofort wieder. Ein einzelner Absatz darf
+  immer ausfuehrlich sein, wo Verkuerzung gefaehrlich waere. (b) JEDER Fließtext, den ein Mensch außerhalb des
   Terminals liest — Dokumente, Berichte, Mails, Bewerbungen, README, Deliverables und
   Result-Dateien, die weitergereicht werden —, läuft über das Skill `texte-schreiben` und wird
   in ganzen Sätzen geschrieben. Knapp heißt dort: nichts Überflüssiges, NICHT: keine Artikel.
@@ -63,6 +67,16 @@ file names the trigger that makes you read it BEFORE acting.
 - [Protokoll] blocks name a result file: write the full result there FIRST — outcome-first,
   self-contained (WHAT / HOW-VERIFIED / OPEN) — then reply with DONE as the last line. The
   orchestrator reads only that file.
+- **Committe Deine Arbeit, BEVOR Du die Ergebnisdatei schreibst (2026-08-20).** Ein Worktree mit
+  offenen Änderungen sieht für den Orchestrator aus wie gar keine Arbeit: sein `git merge` meldet
+  „Already up to date", und beim nächsten Aufräumen ist alles weg. Gemessen an EINEM Tag dreimal
+  passiert (Worker `speicher`, `pruefwert`, `dienstprobe`) — zweimal hat der Orchestrator die
+  Arbeit bereits als gemergt gemeldet, bevor es auffiel. Also: eigene Pfade einzeln nennen (nie
+  `git add -A` oder ein Verzeichnis, siehe Hausregel), englische Commit-Message, kein
+  Claude-Co-Author, **nicht pushen** — das entscheidet der Orchestrator nach eigener Prüfung.
+  Bei längeren Aufträgen zwischendurch committen, nicht erst am Ende: bricht der Lauf ab, ist
+  sonst alles verloren. Und nenne den Commit-Hash in der Ergebnisdatei, damit der Orchestrator
+  ihn nicht suchen muss.
 - **Nie den Menschen fragen, nie auf ihn warten (2026-08-06, ausdrückliche des Nutzers
   Beanstandung).** Ein Worker hält nicht an, um eine Rückfrage zu stellen — weder an den Nutzer
   noch an den Orchestrator. Eine nötige Entscheidung triffst Du selbst nach bestem Wissen,

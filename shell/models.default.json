@@ -102,7 +102,7 @@
       "label": "MLX (mlx_lm.server, lokal)",
       "kind": "local",
       "baseUrl": "http://127.0.0.1:8080/v1",
-      "notes": "Lokal, kein Key. Bedarfsweise gestartet ueber grug-server (kein LaunchAgent fuer den Modellserver selbst, siehe regeln/lokale-modelle.md) — teilt sich den Port mit llamacpp, nie beide gleichzeitig laufen lassen. Seit 2026-08-13 liegt hinter 127.0.0.1:8080 nicht mehr mlx_lm.server selbst, sondern wb-modell-proxy: launchd haelt den Socket, der Proxy startet grug-server bei der ersten Anfrage (Backend 8081) und stoppt ihn nach 20 Minuten Leerlauf. Die Adresse hier bleibt deshalb richtig."
+      "notes": "Lokal, kein Key. Bedarfsweise gestartet ueber wb-mlx-server (grug-server ist seit 2026-08-19 nur noch ein duenner Vorspann darauf) (kein LaunchAgent fuer den Modellserver selbst, siehe regeln/lokale-modelle.md) — teilt sich den Port mit llamacpp, nie beide gleichzeitig laufen lassen. Seit 2026-08-13 liegt hinter 127.0.0.1:8080 nicht mehr mlx_lm.server selbst, sondern wb-modell-proxy: launchd haelt den Socket, der Proxy startet grug-server bei der ersten Anfrage (Backend 8081) und stoppt ihn nach 20 Minuten Leerlauf. Die Adresse hier bleibt deshalb richtig."
     },
     {
       "id": "openai",
@@ -1706,7 +1706,11 @@
           "source": "cline-providers.default.json",
           "target": "~/.cline-wb/settings/providers.json",
           "required": true,
-          "why": "ohne sie bleibt clite im Anmeldebildschirm stehen; der Spawn scheitert nach 60 s."
+          "why": "ohne sie bleibt clite im Anmeldebildschirm stehen; der Spawn scheitert nach 60 s.",
+          "compareIgnoreKeys": [
+            "_comment",
+            "updatedAt"
+          ]
         }
       ],
       "kontingent": {
@@ -2112,8 +2116,8 @@
         "peer"
       ],
       "workerClass": [],
-      "goodFor": "Kundengerichtete VISUELLE Deliverables (Landing-Page, Kundenpraesentation).",
-      "notFor": "Standard-Coding, Internes, Visuelles fuer den Nutzer selbst (Fable-Sperre 2026-07-12/25).",
+      "goodFor": "Nur auf ausdrueckliche des Nutzers Anweisung (Fable-Sperre 2026-07-12; Ausnahme fuer kundengerichtet-visuell am 2026-07-29 aufgehoben).",
+      "notFor": "Standard-Coding, Internes, Visuelles fuer den Nutzer selbst — UND seit 2026-07-29 auch kundengerichtete visuelle Deliverables (dafuer jetzt opus5:xhigh).",
       "enabled": true,
       "contextWindow": 1000000
     },
@@ -2130,7 +2134,7 @@
       ],
       "maxEffort": "xhigh",
       "defaultEffort": "medium",
-      "contextWindow": 131072,
+      "contextWindow": 262144,
       "machines": [
         "mac",
         "peer"
@@ -2139,10 +2143,10 @@
         {
           "class": "bulk",
           "effort": "medium",
-          "goodFor": "Token-freier lokaler Coder; Bulk, Inventur, DSGVO, Overnight. Nicht mehr Default (siehe grug)."
+          "goodFor": "Token-freier lokaler Coder; Bulk, Inventur, DSGVO, Overnight. Nicht mehr Default (siehe qwen3.8)."
         }
       ],
-      "goodFor": "Token-freier lokaler Coder, 128K Kontext: Bulk, Inventur, DSGVO-kritische Arbeit und Overnight-Laeufe. Daten verlassen die Maschine nie. Seit 2026-08-11 nicht mehr Default-Coder — diese Rolle traegt jetzt 'grug' (gemessen schneller im Einzelstrom und in der Nebenlaeufigkeit, siehe regeln/lokale-modelle.md und [[messung-2026-08-11-lokale-coder-grug-kat-ornith]]). ornith bleibt bestehen und waehlbar.",
+      "goodFor": "Token-freier lokaler Coder, 256K Kontext NUR ueber pi (gemessen 2026-08-15: ollama-Variante 'ornith:35b-256k' mit eingebranntem num_ctx=262144, 100% GPU, kein Spill; die globale Ollama-Vorgabe bleibt 65536 fuer alle anderen Programme, siehe regeln/lokale-modelle.md): Bulk, Inventur, DSGVO-kritische Arbeit und Overnight-Laeufe. Daten verlassen die Maschine nie. Seit 2026-08-11 nicht mehr Default-Coder — den Rang hielt zwischenzeitlich 'grug' (gemessen schneller im Einzelstrom und in der Nebenlaeufigkeit, siehe regeln/lokale-modelle.md und [[messung-2026-08-11-lokale-coder-grug-kat-ornith]]), seit 2026-08-19 traegt ihn qwen3.8 (Entscheidung des Nutzers, eigene Messung steht noch aus). ornith bleibt bestehen und waehlbar.",
       "notFor": "Latenzkritisches — laeuft langsamer als jede Cloud-Spur.",
       "enabled": true,
       "supportsEffort": true,
@@ -2161,7 +2165,7 @@
       ],
       "maxEffort": "xhigh",
       "defaultEffort": "medium",
-      "contextWindow": 65536,
+      "contextWindow": 131072,
       "machines": [
         "mac"
       ],
@@ -2169,14 +2173,62 @@
         {
           "class": "bulk",
           "effort": "medium",
-          "goodFor": "Token-freier Default-Coder (MLX 4bit); Bulk, Inventur, DSGVO, Overnight."
+          "goodFor": "Token-freier lokaler Coder (MLX 4bit); Bulk, Inventur, DSGVO, Overnight. Nicht mehr Default (siehe qwen3.8)."
         }
       ],
-      "goodFor": "Token-freier Default-Coder seit 2026-08-11, dicht, hybride Attention (qwen3_5), 65K Kontext, winziger KV-Bedarf (0,0625 MiB/Token, drei von vier Lagen rekurrent). Gemessen (dod-judge/pruef3, 50 Faelle): 17,7 Tok/s im Einzelstrom, Nebenlaeufigkeitskurve 14,8/21,1/28,1/28,1/23,9 Tok/s bei 1/2/4/8/16 gleichzeitigen Anfragen, Trefferquote 49/50. Schlaegt Ollama (15,3 Tok/s, serialisiert: 7,5/7,0/6,8 bei steigender Last) und llama.cpp (14,1 Tok/s, 45/50 Trefferquote) auf beiden Achsen. Details: [[messung-2026-08-11-lokale-coder-grug-kat-ornith]].",
+      "goodFor": "Token-freier lokaler Coder (MLX 4bit), weiterhin waehlbar -- Default-Rang seit 2026-08-19 bei qwen3.8 (Entscheidung des Nutzers; dieselbe Bauform, eigene Durchsatzmessung steht dort noch aus). Bis 2026-08-19 Default-Coder, dicht, hybride Attention (qwen3_5), 128K Kontext seit 2026-08-15 (errechnet aus KV-Bedarf, NICHT lastgetestet -- Kernel-Panik-Historie bei GPU-Speichermangel, siehe regeln/lokale-modelle.md), winziger KV-Bedarf (0,0625 MiB/Token, drei von vier Lagen rekurrent). Gemessen (dod-judge/pruef3, 50 Faelle): 17,7 Tok/s im Einzelstrom, Nebenlaeufigkeitskurve 14,8/21,1/28,1/28,1/23,9 Tok/s bei 1/2/4/8/16 gleichzeitigen Anfragen, Trefferquote 49/50. Schlaegt Ollama (15,3 Tok/s, serialisiert: 7,5/7,0/6,8 bei steigender Last) und llama.cpp (14,1 Tok/s, 45/50 Trefferquote) auf beiden Achsen. Details: [[messung-2026-08-11-lokale-coder-grug-kat-ornith]].",
       "notFor": "Latenzkritisches — laeuft langsamer als jede Cloud-Spur. Braucht vor dem Start 20 GB freien Speicher (grug-server ensure prueft das) und laeuft nicht dauerhaft — bewusst kein LaunchAgent, damit Bild-/Videoerzeugung denselben Speicher weiter bekommt.",
       "enabled": true,
       "supportsEffort": true,
-      "notes": "Server bedarfsweise ueber shell/grug-server (ensure|stop|status), gestartet via wb-nohup auf Port 8081 (mlx_lm.server); davor sitzt seit 2026-08-13 wb-modell-proxy auf 8080, der ihn bei der ersten Anfrage selbst hochfaehrt und nach 20 Minuten Leerlauf wieder stoppt. pi-worker ruft grug-server ensure automatisch auf, wenn 'grug' gewaehlt wird, und bricht ab, wenn der Server nicht bereit wird. pi reicht --thinking weiter, deshalb supportsEffort=true trotz lokalem Provider. Nur auf dem Mac installiert (MLX/Metal, unified memory) — nicht auf peer (CUDA)."
+      "notes": "Server bedarfsweise ueber grug-server, seit 2026-08-19 ein duenner Vorspann auf wb-mlx-server ensure grug (shell/wb-mlx-server -- ein Server fuer mehrere MLX-Modelle, grug und qwen3.8 teilen sich Port 8081, immer nur eines geladen), gestartet via wb-nohup auf Port 8081; davor sitzt seit 2026-08-13 wb-modell-proxy auf 8080, der bei der ersten Anfrage selbst hochfaehrt und nach 20 Minuten Leerlauf das tatsaechlich laufende Modell wieder stoppt. pi-worker ruft grug-server ensure automatisch auf, wenn 'grug' gewaehlt wird, und bricht ab, wenn der Server nicht bereit wird. supportsEffort=true, weil pi --thinking als eigenen CLI-Schalter annimmt -- GEMESSEN 2026-08-19 (an qwen38-27b, selber Provider mlx-lokal): pi gibt --thinking NICHT als chat_template_kwargs/reasoning_effort an den Server weiter, der Anfragekoerper im DEBUG-Log von mlx_lm.server enthaelt dieses Feld nicht. Ob grugs eigene Chat-Vorlage ohne gesetzten Wert ebenfalls eine teure Vorgabe waehlt wie bei qwen3.8 (dort xhigh, siehe qwen38-27b), ist fuer grug NICHT gemessen. Nur auf dem Mac installiert (MLX/Metal, unified memory) — nicht auf peer (CUDA).",
+      "gewichteGb": 14.09
+    },
+    {
+      "id": "qwen38-27b",
+      "label": "qwen3.8-27b (lokal, MLX 4bit)",
+      "alias": "qwen38",
+      "harness": "pi",
+      "provider": "mlx-lokal",
+      "modelRef": "$HOME/AI/mlx-models/qwen38-27b-mlx-4bit",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "medium",
+      "contextWindow": 262144,
+      "machines": [
+        "mac"
+      ],
+      "gewichteGb": 14.95,
+      "chatTemplateArgs": {
+        "reasoning_effort": "low"
+      },
+      "vorhersage": {
+        "bauart": "eingebaut",
+        "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-MTPLX-Optimized-Speed",
+        "gewichteGb": 19.83,
+        "herkunft": "Endgueltiger Sieger, gemessen 2026-08-20 (Worker 'nebenlauf', alle vier Kandidaten fertig gemessen, ruhige Maschine, temperature 0): MTPLX Speed 4bit ueber den eigenstaendigen mtplx-Motor (--scheduler-mode serial) liefert 31,5 Tok/s kurz / 35,8 Tok/s warm bei 4737 Prompt-Token und haelt dabei den Hausgrundwert bei der Guete (48/50 auf pruef3, in 392 statt 718 Sekunden) -- schneller UND gleich gut. Schlaegt DSpark-DimInfer (15,3 kalt/30,3 warm), DFlash2 (12,5/29,5) und den Betrieb ganz ohne Vorhersage (11,1/17,2). Die 8-Bit-Guetefassung (Qwen3.8-27B-MTPLX-Optimized-Quality, $HOME/AI/mlx-models/Qwen3.8-27B-MTPLX-Optimized-Quality) bringt KEINE messbare Guete gegenueber der 4-Bit-Fassung (dieselben 48/50), dafuer 8,6 GiB mehr Speicher (30,2 statt 21,6 GiB) und deutlich weniger Tempo (23,0 statt 31,5 Tok/s kurz, 24,9 statt 35,8 Tok/s warm). Entscheidung des Nutzers (2026-08-20): sie bleibt trotzdem als zweite, ausdruecklich waehlbare Moeglichkeit erhalten -- Vorgabe/Standardwahl bleibt MTPLX Speed 4bit, wer stattdessen die Quality-Fassung will, setzt 'vorhersage.modell' auf den Optimized-Quality-Pfad und kennt dann den Preis. Buendelung UND Vorhersage gibt es fuer dieses Modell architekturbedingt nicht (mtp_batch scheitert nach sieben erfuellten Bedingungen an QwenRowOwnedRouterConfigError) -- wb-mlx-server klemmt --parallel deshalb fest auf 1 fuer diesen Motor, bei beiden Koerpern."
+      },
+      "workerClass": [
+        {
+          "class": "bulk",
+          "effort": "medium",
+          "goodFor": "Token-freier Default-Coder (MLX 4bit); Bulk, Inventur, DSGVO, Overnight."
+        }
+      ],
+      "goodFor": "Token-freier Default-Coder seit 2026-08-19 (Entscheidung des Nutzers, siehe GEMEINSAME-FAKTEN.md / Auftrag A-C 'lokales Modell als Orchestrator + waehlbares Kontextfenster'), Nachfolger von grug (grug bleibt vollstaendig erhalten und waehlbar). Dieselbe Bauform wie grug-27b-mlx-q4 (config.json: model_type qwen3_5, Qwen3_5ForConditionalGeneration, 4bit/group_size 64, 64 Lagen, full_attention_interval 4 -- 16 volle Attention-Lagen, num_key_value_heads 4, head_dim 256) -- also derselbe KV-Bedarf je Token (0,0625 MiB, angenommen aus der Architektur, nicht lastgetestet, siehe wb-belegung kv liste 'qwen38-27b-mlx-4bit'). 262144 Kontext-Token nativ (max_position_embeddings). Gewichte rund 16,05 GB (drei safetensors-Dateien). GEMESSEN am echten Gardener-Extraktionspfad (dieselben 15 Einheiten, vier gleichzeitige Buendel, 2026-08-15/16, Laeufe unter ~/Knowledge/_meta/messungen/strecken/modellvergleich/laeufe/2026-08-15-*.json, siehe gardener/dream/config.py Zeilen 388-414): mit Denkstufe 'low' (Gardeners gewaehlte Einstellung) 129 gefundene Aussagen bei 62,2 s/Einheit, 36,7 Tok/s, Ablehnungsquote des Zitattors nur 19,4 % (gegen 31,1 % bei grug); mit Denken aus 99 Aussagen bei 29,5 s/Einheit, 37,0 Tok/s, Ablehnungsquote 31,7 %. Rechengeschwindigkeit praktisch gleich wie grug (37 Tok/s) -- qwen3.8 findet WENIGER Aussagen, ist aber je gefundener Aussage deutlich belastbarer, und langsamer je Einheit, weil es mit Denkstufe 'low' mehr schreibt. Gardener wechselte deshalb am 16.08.2026 von grug auf qwen3.8 (mit reasoning_effort='low') als Extraktionsmodell.",
+      "notFor": "Latenzkritisches -- laeuft langsamer als jede Cloud-Spur (Erwartung, nicht eigens gemessen). Braucht vor dem Start 20 GB freien Speicher (wb-mlx-server ensure prueft das) und laeuft nicht dauerhaft -- bewusst kein LaunchAgent, damit Bild-/Videoerzeugung denselben Speicher weiter bekommt. DENKSTUFEN-FALLE (GEMESSEN 2026-08-19, siehe gardener/dream/config.py Zeilen 415-420): ohne gesetzten reasoning_effort waehlt Qwen3.8s eigene Chat-Vorlage xhigh, und eine einzelne Anfrage kann dann ueber 28 Minuten statt rund einer Minute brauchen. pi gibt --thinking NICHT an den Server weiter (gemessen: der Anfragekoerper im DEBUG-Log von mlx_lm.server enthaelt kein chat_template_kwargs/reasoning_effort-Feld) -- wb-mlx-server setzt deshalb serverseitig chatTemplateArgs={\"reasoning_effort\":\"low\"} aus diesem Registry-Eintrag (--chat-template-args beim Start von mlx_lm.server), unabhaengig davon, was der Aufrufer schickt.",
+      "enabled": true,
+      "supportsEffort": true,
+      "notes": "Server bedarfsweise ueber wb-mlx-server ensure qwen38 (shell/wb-mlx-server, Nachfolger von grug-server -- ein Server fuer mehrere MLX-Modelle, grug und qwen3.8 teilen sich Port 8081, immer nur eines geladen), gestartet via wb-nohup; davor sitzt wb-modell-proxy auf 8080, der bei der ersten Anfrage selbst hochfaehrt und nach 20 Minuten Leerlauf wieder stoppt. supportsEffort=true, weil pi --thinking als eigenen CLI-Schalter annimmt -- GEMESSEN 2026-08-19: pi gibt --thinking NICHT als chat_template_kwargs/reasoning_effort an den mlx-lokal-Provider weiter (Anfragekoerper im DEBUG-Log von mlx_lm.server ohne dieses Feld). Die Denkintensitaet dieses Modells wird deshalb ausschliesslich ueber den Server-Start gesteuert, siehe chatTemplateArgs und die Denkstufen-Falle in notFor. Nur auf dem Mac installiert (MLX/Metal, unified memory) -- nicht auf peer (CUDA).",
+      "buendelung": {
+        "motor": "vllm-metal",
+        "venv": "$HOME/.venv-vllm-metal",
+        "metalFraktion": 0.5,
+        "umschlagpunktStroeme": 2,
+        "herkunft": "Zweiter Motor neben MTPLX, Entscheidung des Nutzers vom 20.08.2026: MTPLX bleibt der Standard fuer den einzelnen Strom, vllm-metal uebernimmt, sobald mehrere lokale Worker gleichzeitig laufen. GEMESSEN (Worker 'nebenlauf', 2026-08-20, qwen38-27b-mlx-4bit, 200 Token je Anfrage, temperature 0, Denkstufe low, --max-model-len 2048, VLLM_METAL_MEMORY_FRACTION=0.5; Gesamtdurchsatz Tok/s): 17,22 / 32,63 / 53,81 / 59,44 / 66,68 bei 1 / 2 / 4 / 8 / 16 Stroemen, gegen 16,44 / 30,49 / 51,99 / 54,56 / 63,52 bei mlx_lm.server -- auf JEDER Stufe vorn, auch im Einzelstrom. MTPLX bleibt intern seriell (31,5 / 31,3 / 30,2 bei 1 / 2 / 4) und ist unter zwei Stroemen mit Abstand schneller; der Umschlagpunkt liegt rechnerisch bei 1,89 Stroemen und damit ganzzahlig bei zwei, wo vllm-metal mit 32,63 gegen 31,3 Tok/s gesamt und 16,32 gegen 15,65 je Worker auf beiden Achsen vorn liegt (Herleitung im Quelltext bei VLLM_UMSCHLAGPUNKT_STROEME in shell/wb-mlx-server). FALLE, die in derselben Tabelle steht: bei ZWOELF Stroemen faellt der Durchsatz auf 52,89 zurueck, unter die 59,44 bei acht, bevor er bei sechzehn auf 66,68 springt -- derselbe Knick wie bei mlx_lm.server (50,51 bei zwoelf). Der Deckel (--max-num-seqs) rastet deshalb auf acht bzw. sechzehn ein und liegt nie dazwischen. KEINE VORHERSAGE ueber diesen Motor: MTP ist dort nur fuer Gemma4 gebaut, ein Entwurfsmodell wird bei gemischten Lagentypen abgewiesen (draft_model_proposer.py:585-614, und die ganze Qwen3.5/3.6/3.8-Familie ist hybrid), und n-Gramm stirbt beim ersten Dekodierschritt mit 'NotImplementedError: Speculative decode verification is not supported for hybrid GDN models on Metal yet.' -- deshalb ein eigenes Feld neben 'vorhersage' und nicht darin. GUETE ist fuer diesen Wechsel ausdruecklich NICHT gemessen und das ist keine Luecke: es sind dieselben Gewichte ueber denselben MLX-Kern, gierig dekodiert; nur die Schicht darueber und damit die Geschwindigkeit aendert sich. SPEICHER: VLLM_METAL_MEMORY_FRACTION bezieht sich auf Metals max_recommended_working_set_size (42,0 GiB), NICHT auf die 48 GiB der Maschine -- mit 0,5 blieb der ganze Prozess gemessen unter 21 GiB. wb-belegung bucht genau dieses Budget (--metal-fraktion). WARNUNG: der Motor setzt beim Start 'Set Metal wired_limit to 42.0 GB', auch bei kleiner Fraktion -- genau der Hebel aus der Kernel-Panik vom 11.08.; wer die Fraktion erhoeht, muss das wissen. NACHGEMESSEN am 21.08.2026 (Worker 'motor', beide Motoren selbst gefahren, je ein frisch gestarteter Server ueber wb-mlx-server ensure, --kontext 2048, 200 Token je Anfrage, temperature 0): MTPLX 28,63 / 30,57 / 29,65 gegen vllm-metal 17,25 / 32,59 / 54,47 Tok/s bei 1 / 2 / 4 Stroemen -- derselbe Schnittpunkt (1,87 statt 1,89), dieselbe Schwelle bei zwei, und bei vier Stroemen fast das Doppelte."
+      }
     },
     {
       "id": "ornith-9b",
@@ -2190,7 +2242,7 @@
       ],
       "maxEffort": "high",
       "defaultEffort": "low",
-      "contextWindow": 131072,
+      "contextWindow": 262144,
       "machines": [
         "mac",
         "peer"
@@ -2202,7 +2254,7 @@
           "goodFor": "Mechanischer Bulk, token-frei, laeuft neben einem grossen Modell."
         }
       ],
-      "goodFor": "Mechanischer Bulk, token-frei, laeuft neben einem grossen Modell im Speicher.",
+      "goodFor": "Mechanischer Bulk, token-frei, laeuft neben einem grossen Modell im Speicher. 256K Kontext NUR ueber pi (gemessen 2026-08-15: ollama-Variante 'ornith:9b-256k', 100% GPU, kein Spill).",
       "notFor": "Mehrstufige Aufgaben mit Ambiguitaet.",
       "enabled": true,
       "supportsEffort": true,
@@ -2367,7 +2419,7 @@
         "recherche"
       ],
       "goodFor": "Recherche und lange Analysen: bringt search_web und read_url_content von Haus aus mit, dazu eigene Subagenten. Erste Wahl, wenn im Web gesucht oder eine Seite ausgelesen werden soll, und fuer lange Ketten mit grossem Kontext.",
-      "enabled": true,
+      "enabled": false,
       "notFor": "Alles, was den Rechner nicht verlassen darf — laeuft ueber Googles Cloud. Kein Rollen-Prompt-Flag, die Regeln kommen nur ueber die Instruktionsdatei."
     },
     {
@@ -2584,7 +2636,8 @@
       "supportsEffort": false,
       "defaultEffort": "medium",
       "machines": [
-        "mac"
+        "mac",
+        "peer"
       ],
       "workerClass": [
         "mechanisch",
@@ -2609,7 +2662,8 @@
       "supportsEffort": false,
       "defaultEffort": "low",
       "machines": [
-        "mac"
+        "mac",
+        "peer"
       ],
       "workerClass": [
         "mechanisch"

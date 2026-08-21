@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""wb-ausrollen — Repo nach ~/.local/bin (und die uebrigen Installationsziele
+von wb-consistency) ausrollen, ohne eigenmaechtige Aenderungen zu ueberschreiben.
+
+Anlass (20.08.2026, der Nutzer, woertlich): "Ich muss gleich ausrollen und will
+dabei nichts ueberschreiben, das jemand von Hand gesetzt hat." Zwei Worker
+hatten unabhaengig voneinander context-guard und wb-testsuite-run als
+KOPIE-EIGENMAECHTIG bzw. unklar liegen lassen -- beide Male war die
+installierte Fassung tatsaechlich nur AELTER, aber das war "genau die
+Pruefung, die ich von Hand machen musste, weil die Meldung sie nicht macht."
+
+Dieses Werkzeug macht die Pruefung UND handelt danach, in einem Schritt, ueber
+DIESELBE Berechnung wie `wb-consistency` (kopie_vergleiche() dort, per
+importlib importiert, nicht neu geschrieben -- zwei Kopien derselben
+Richtungs-Logik waeren genau die Fehlerklasse, um die es hier geht):
+
+  veraltet     -> Schnappschuss der installierten Datei nach
+                  ~/.local/trash-snapshots/, dann ersetzen.
+  fehlt        -> noch nie ausgerollt, nichts zu verlieren: kopieren.
+  eigenmaechtig/unklar -> NICHT angefasst, nur gemeldet.
+
+Usage:
+  wb-ausrollen [--dry-run] [--base DIR] [--repo DIR] [--config FILE]
+
+--dry-run zeigt, was passieren wuerde, schreibt nichts (auch keinen
+Schnappschuss). --base/--repo/--config wie bei wb-consistency, aus demselben
+Grund: ein Test zeigt auf ein eigenes, kleines Verzeichnis statt auf die
+echte Maschine.
+
+Exit 0: nichts zu tun oder alles ausgerollt, keine eigenmaechtige Kopie im Weg.
+Exit 1: mindestens eine eigenmaechtige/unklare Kopie wurde NICHT angefasst --
+        das ist kein Fehler dieses Werkzeugs, sondern der Grund, von Hand
+        nachzusehen (dieselbe Bedeutung wie wb-consistencys Exit 1).
+"""
+import argparse
+import atomar_schreiben
+import datetime
+import importlib.util
+import importlib.machinery
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+
+def _lade_wb_consistency():
+    # wb-consistency traegt keine .py-Endung (es ist selbst ein ausfuehrbares
+    # Skript, kein Modul) -- `spec_from_file_location` findet dafuer OHNE
+    # expliziten Loader keinen passenden und liefert None zurueck (gemessen:
+    # "AttributeError: 'NoneType' object has no attribute 'loader'"). Ein
+    # SourceFileLoader von Hand umgeht die Endungserkennung.
+    pfad = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wb-consistency")
+    loader = importlib.machinery.SourceFileLoader("wb_consistency", pfad)
+    spec = importlib.util.spec_from_loader("wb_consistency", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _schnappschuss(inst_datei, base, lauf_id, trocken):
+    """Kopie nach <base>/.local/trash-snapshots/<lauf-id>-wb-ausrollen/<relativer
+    Pfad zu base>, VOR dem Ueberschreiben (Hausregel: Schnappschuss vor jedem
+    Ueberschreiben). <base>, NICHT ein hartes '~': --base existiert genau
+    dafuer, dass ein Test seine eigene, kleine Kopie prueft und NIE die echte
+    Maschine beruehrt (siehe Kopf von wb-consistency) -- ein hartes '~' haette
+    diese Abschirmung ausgerechnet an der schreibenden Stelle unterlaufen. Ein
+    Pfad je LAUF, nicht je Tag -- ein zweiter Lauf am selben Tag darf den
+    ersten Schnappschuss nicht stillschweigend ueberschreiben."""
+    try:
+        rel = os.path.relpath(inst_datei, base)
+    except ValueError:
+        rel = os.path.basename(inst_datei)
+    ziel = os.path.join(base, ".local", "trash-snapshots",
+                        "%s-wb-ausrollen" % lauf_id, rel)
+    if trocken:
+        return ziel
+    os.makedirs(os.path.dirname(ziel), exist_ok=True)
+    shutil.copy2(inst_datei, ziel)
+    return ziel
+
+
+# ATOMAR (Anlass 21.08.2026): `shutil.copy2` direkt auf `ziel` geschrieben
+# liess ein Werkzeug, das GENAU in diesem Moment gestartet wurde, eine halb
+# geschriebene Datei lesen -- ein `pi-worker`-Start bekam einen Syntaxfehler
+# in einer Zeile, an der nichts falsch war, weil die Datei schlicht noch
+# nicht fertig geschrieben war. Die unteilbare Fassung (Nebendatei im selben
+# Verzeichnis, Rechte dort setzen, dann `os.replace`) steht seit Auftrag 5
+# nicht mehr hier, sondern in `atomar_schreiben.kopieren()` -- an DEMSELBEN
+# Abend fanden sich drei weitere Stellen mit derselben Bauart
+# (`wb-harness-config`, `wb-instructions`, `mcp-shared`), und eine vierte
+# eigene Fassung hier waere genau die Verdopplung gewesen, die schon bei der
+# Speicherformel dieser Nacht (vier unabhaengige Fassungen an einem einzigen
+# Werkzeug) den eigentlichen Fehler ausgemacht hat. Siehe dort fuer die volle
+# Begruendung (Nebendatei nie in /tmp, Ausfuehrbit vor dem Umbenennen,
+# erkennbarer Name, Mindestalter-Aufraeumung).
+def _kopieren(quelle, ziel, trocken):
+    if trocken:
+        return
+    atomar_schreiben.kopieren(quelle, ziel)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true",
+                    help="zeigen, was passieren wuerde, nichts schreiben")
+    ap.add_argument("--base", default=os.path.expanduser("~"))
+    # Kein fest verdrahteter Vorgabewert mehr (Befund 21.08.2026, gemessen auf
+    # peer: ein Lauf ohne --repo verglich gegen ~/AI/claude-workbench, waehrend
+    # die Arbeit tatsaechlich in einem 34 Commits entfernten Worktree lief --
+    # neun Werkzeuge wurden faelschlich als eigenmaechtig veraendert gemeldet.
+    # Nicht nur eine falsche Zahl, eine falsche Beschuldigung. Siehe
+    # wc.repo_wurzel_ermitteln() fuer die Herleitung; dieselbe Vorgabe stand
+    # unveraendert auch in wb-consistency und ist dort genauso behandelt).
+    ap.add_argument("--repo", default=None,
+                    help="Arbeitsbaum der Werkbank -- ohne Angabe: der Baum, aus dem dieses "
+                         "Werkzeug selbst laeuft, wenn ermittelbar, sonst ein genannter "
+                         "Ratewert.")
+    ap.add_argument("--config", default=os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "wb-consistency.config.json"))
+    a = ap.parse_args()
+
+    wc = _lade_wb_consistency()
+    if a.repo:
+        repo, repo_quelle = a.repo, "--repo (ausdruecklich genannt)"
+    else:
+        repo, gemessen, repo_quelle = wc.repo_wurzel_ermitteln()
+        if not gemessen:
+            # Laut, nicht still -- gerade WEIL dieses Werkzeug schreibt (siehe
+            # Kopfkommentar dort): ein falsch geratener Baum wuerde sonst
+            # unbemerkt aus der falschen Quelle ausrollen.
+            print("wb-ausrollen: ACHTUNG -- Arbeitsbaum %s" % repo_quelle, file=sys.stderr)
+    print("wb-ausrollen: Arbeitsbaum -- %s" % repo_quelle)
+    cfg = wc.load_config(a.config, a.base, repo)
+    c7 = cfg.get("check7_kopien")
+    c9 = cfg.get("check9_harness_konfig")
+    if not c7 and not c9:
+        print("wb-ausrollen: weder 'check7_kopien' noch 'check9_harness_konfig' in der "
+              "Konfiguration -- nichts zu tun.")
+        return 0
+
+    ausgerollt, uebersprungen = [], []
+    lauf_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    if c7:
+        if not os.path.isdir(c7["repo_dir"]):
+            print("wb-ausrollen: Arbeitsbaum %s gibt es nicht -- abgebrochen." % c7["repo_dir"],
+                  file=sys.stderr)
+            return 1
+
+        c3 = cfg.get("check3_dangling_refs") or {}
+        machine_tool_map = c3.get("machine_tool_map", {})
+        current_machine = wc.current_machine_id(c3.get("machine_ids_by_os", {}))
+
+        for fall in wc.kopie_vergleiche(c7, machine_tool_map, current_machine):
+            status = fall["status"]
+            if status in ("gleich", "andere_maschine"):
+                continue
+            if status == "fehlt":
+                _kopieren(fall["repo_datei"], fall["inst_datei"], a.dry_run)
+                ausgerollt.append((fall["rel"], "neu installiert (lag noch nicht vor)"))
+                print("  %s NEU installiert nach %s" % (fall["rel"], fall["inst_datei"]))
+                continue
+            # status == "verschieden"
+            richtung, warum = fall["richtung"], fall["warum"]
+            if richtung == "veraltet":
+                schnappschuss = _schnappschuss(fall["inst_datei"], a.base, lauf_id, a.dry_run)
+                _kopieren(fall["repo_datei"], fall["inst_datei"], a.dry_run)
+                ausgerollt.append((fall["rel"], warum))
+                print("  %s ausgerollt (%s) — Schnappschuss: %s"
+                      % (fall["rel"], warum, schnappschuss))
+            else:
+                grund = ("traegt eigene, im Repo unbekannte Aenderungen" if richtung == "eigenmaechtig"
+                         else "Richtung nicht bestimmbar")
+                uebersprungen.append((fall["rel"], richtung, warum))
+                print("  %s UEBERSPRUNGEN (%s: %s) — von Hand pruefen." % (fall["rel"], grund, warum))
+
+    # Konfigurations-Vorlagen fuer fremde Harnesses (crush/kimi/nanocoder/cline/
+    # forge, siehe check9_harness_konfig in wb-consistency.config.json): dieselbe
+    # FEHLT/VERALTET/ABGEWICHEN-Unterscheidung, aber ein ANDERES Werkzeug traegt
+    # sie schon (shell/wb-harness-config, eigener Merkposten statt Git-Historie,
+    # weil das Ziel oft gar nicht in einem Repo liegt). Aufgerufen wird 'apply'
+    # selbst -- nicht seine Kopierlogik hier nachgebaut -- und sein Ergebnis
+    # zaehlt in DIESELBE ausgerollt/uebersprungen-Summe, damit ein einziger
+    # Bericht entsteht statt zwei getrennter.
+    c9 = cfg.get("check9_harness_konfig")
+    if c9 and os.path.isfile(c9.get("skript", "")):
+        vorher = wc.harness_konfig_befunde(c9, a.base) or []
+        offene = [r for r in vorher if r.get("status") != "GLEICH"]
+        if offene:
+            print()
+            print("  -- Konfigurations-Vorlagen fuer fremde Harnesses (wb-harness-config) --")
+        if a.dry_run:
+            for r in offene:
+                status = r.get("status")
+                if status in ("FEHLT", "VERALTET"):
+                    ausgerollt.append((r.get("target", "?"), r.get("detail", "")))
+                    print("  WUERDE %s: %s" % (r.get("target", "?"), r.get("detail", "")))
+                else:
+                    uebersprungen.append((r.get("target", "?"), status.lower(), r.get("detail", "")))
+                    print("  WUERDE UEBERSPRINGEN %s (%s)" % (r.get("target", "?"), r.get("detail", "")))
+        elif offene:
+            env = dict(os.environ)
+            env["HOME"] = a.base
+            env["WB_HARNESS_CONFIG_SRC"] = c9.get("quelle_verzeichnis", "")
+            try:
+                p = subprocess.run([sys.executable, c9["skript"], "apply"],
+                                   capture_output=True, text=True, timeout=30, env=env)
+                for zeile in p.stdout.splitlines():
+                    print("  [wb-harness-config] %s" % zeile)
+                if p.stderr.strip():
+                    print("  [wb-harness-config] %s" % p.stderr.strip())
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                print("  wb-harness-config nicht aufrufbar: %s" % exc)
+            for r in offene:
+                status = r.get("status")
+                if status in ("FEHLT", "VERALTET"):
+                    ausgerollt.append((r.get("target", "?"), r.get("detail", "")))
+                else:
+                    uebersprungen.append((r.get("target", "?"), status.lower(), r.get("detail", "")))
+
+    # Registry-Abweichungen (registry_vergleiche(), dieselbe Berechnung wie
+    # wb-consistencys REGISTRY-ABWEICHUNG-Meldung -- siehe deren Docstring:
+    # Sorte E hat KEINE veraltet/eigenmaechtig-Richtung, weil die lebende
+    # Registry nachweislich oefter die neuere Seite ist als die Vorlage, nicht
+    # umgekehrt. wb-ausrollen kopiert hier deshalb nichts -- jeder Fund landet
+    # als Handentscheidung in derselben uebersprungen-Sammlung wie eine
+    # eigenmaechtige Kopie oben.
+    if c7:
+        registry_funde = wc.registry_vergleiche(c7)
+        if registry_funde:
+            print()
+            print("  -- Registry-Abweichungen (Vorlage vs. lebende Registry, von Hand entscheiden) --")
+        for fall in registry_funde:
+            pfad_text = "%s.%s[%s=%s].%s" % (
+                fall["name"], fall["liste"], fall["schluessel"], fall["eintrag_id"], fall["feld"])
+            warum = "Vorlage: %s -- lebend: %s" % (
+                json.dumps(fall["vorlage_wert"], ensure_ascii=False),
+                json.dumps(fall["lebend_wert"], ensure_ascii=False))
+            uebersprungen.append((pfad_text, "registry-abweichung", warum))
+            print("  %s UEBERSPRUNGEN (registry-abweichung: %s) — von Hand pruefen."
+                  % (pfad_text, warum))
+
+    vorsatz = "WUERDE " if a.dry_run else ""
+    print()
+    print("wb-ausrollen: %s%d ausgerollt, %d uebersprungen (eigenmaechtig/unklar)."
+          % (vorsatz, len(ausgerollt), len(uebersprungen)))
+    if uebersprungen:
+        print("  Von Hand pruefen, dann entweder die installierte Fassung ins Repo "
+              "uebernehmen oder die Aenderung dort verwerfen:")
+        for rel, richtung, warum in uebersprungen:
+            print("    %-40s %-13s %s" % (rel, richtung, warum))
+    return 1 if uebersprungen else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

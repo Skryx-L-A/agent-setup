@@ -21,8 +21,24 @@
 # dem Vorfall, bei dem ein pkill-Muster Live-Client des Nutzers beendet hat).
 set -uo pipefail
 
+# Fuer den Python-Teil von cmd_apply(): der laeuft ueber 'python3 -' (Code von
+# stdin, kein Skript mit __file__), deshalb kennt er sein eigenes Verzeichnis
+# nicht von selbst -- anders als ein Python-SKRIPT, dessen Verzeichnis Python
+# automatisch vorn in sys.path eintraegt. SKRIPT_VERZ liefert diesen Pfad von
+# aussen, damit der eingebettete Code atomar_schreiben.py findet (siehe dort).
+SKRIPT_VERZ="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 BM_PORT=8766
 PW_PORT=8767
+# Bedarfsschaltung (2026-08-20): auf BM_PORT/PW_PORT lauscht seither nicht mehr der
+# Server selbst, sondern wb-modell-proxy (launchd haelt den Socket). Er startet den
+# echten Server auf dem BACKEND-Port beim ersten Zugriff und beendet ihn nach
+# Leerlauf. Die Client-Konfiguration bleibt deshalb unveraendert auf 8766/8767 --
+# nur diese beiden Ports hier sind neu. Anlass ist globale des Nutzers Regel: kein
+# Prozess laeuft dauerhaft, nur solange er gebraucht wird; das gilt ausdruecklich
+# auch fuer die Dienste der Werkbank selbst.
+BM_BACKEND_PORT=8776
+PW_BACKEND_PORT=8777
 BM_URL="http://127.0.0.1:${BM_PORT}/mcp"
 PW_URL="http://localhost:${PW_PORT}/mcp"   # playwright-mcp prüft den Host-Header (DNS-Rebind-Schutz)
 BM_LABEL=agent-workbench.mcp-basic-memory
@@ -140,13 +156,77 @@ cmd_stop()    { launchctl unload  "$HOME/Library/LaunchAgents/$BM_LABEL.plist" 2
                 launchctl unload  "$HOME/Library/LaunchAgents/$PW_LABEL.plist" 2>/dev/null; echo "beide LaunchAgents entladen."; }
 cmd_restart() { cmd_stop; sleep 2; cmd_start; }
 
+# --- Bedarfsschaltung: was wb-modell-proxy als ensureCmd/stopCmd ruft ---------
+# ensure kehrt ERST zurueck, wenn der Backendport eine gueltige HTTP-Statuszeile
+# liefert -- der Proxy verlangt das ausdruecklich, ein blosser Prozessstart
+# reicht ihm nicht. halt beendet nur den PROZESS; der launchd-Job bleibt geladen,
+# damit der naechste Zugriff ihn wieder anwerfen kann (KeepAlive steht auf false).
+_label_fuer() {
+  case "$1" in
+    bm|basic-memory) echo "$BM_LABEL" ;;
+    pw|playwright)   echo "$PW_LABEL" ;;
+    *) echo "mcp-shared: unbekannter Server '$1' (basic-memory|playwright)" >&2; return 1 ;;
+  esac
+}
+_backendport_fuer() {
+  case "$1" in
+    bm|basic-memory) echo "$BM_BACKEND_PORT" ;;
+    pw|playwright)   echo "$PW_BACKEND_PORT" ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_ensure() {
+  local label port frist=0
+  label="$(_label_fuer "${1:-}")" || return 1
+  port="$(_backendport_fuer "${1:-}")" || return 1
+  # Schon da? Dann nichts tun -- ensure muss mehrfach aufrufbar sein.
+  if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$port/mcp" 2>/dev/null; then
+    echo "mcp-shared: $label antwortet bereits auf $port."
+    return 0
+  fi
+  launchctl kickstart "gui/$(id -u)/$label" >/dev/null 2>&1
+  while [ "$frist" -lt 60 ]; do
+    if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$port/mcp" 2>/dev/null; then
+      echo "mcp-shared: $label bereit auf $port (nach ${frist}s)."
+      return 0
+    fi
+    sleep 1; frist=$((frist + 1))
+  done
+  echo "mcp-shared: $label antwortet nach ${frist}s nicht auf $port." >&2
+  return 1
+}
+
+cmd_halt() {
+  local label frist=0 port
+  label="$(_label_fuer "${1:-}")" || return 1
+  port="$(_backendport_fuer "${1:-}")" || return 1
+  launchctl kill TERM "gui/$(id -u)/$label" >/dev/null 2>&1
+  while [ "$frist" -lt 20 ]; do
+    curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$port/mcp" 2>/dev/null || {
+      echo "mcp-shared: $label beendet, Port $port frei (nach ${frist}s)."
+      return 0
+    }
+    sleep 1; frist=$((frist + 1))
+  done
+  echo "mcp-shared: $label haelt Port $port nach ${frist}s noch." >&2
+  return 1
+}
+
 # Client-Konfiguration auf die geteilten Server zeigen lassen. Wird auch nach einem
 # Plugin-Update gebraucht: das Update schreibt die Plugin-eigene .mcp.json zurueck
 # auf `npx @playwright/mcp` und damit auf einen Prozess pro Session.
 cmd_apply() {
-  /usr/bin/python3 - "$BM_URL" "$PW_URL" <<'PY'
+  # Unteilbar (Auftrag 5, siehe shell/atomar_schreiben.py): dieser Code laeuft
+  # ueber 'python3 -' (von stdin), nicht als Datei -- Python traegt darum
+  # KEIN Skriptverzeichnis automatisch in sys.path ein, wie es das bei einem
+  # echten .py-Skript taete. $SKRIPT_VERZ (oben im Kopf dieser Datei ermittelt)
+  # reicht den Pfad von aussen herein, damit 'import atomar_schreiben' greift.
+  /usr/bin/python3 - "$BM_URL" "$PW_URL" "$SKRIPT_VERZ" <<'PY'
 import json, pathlib, shutil, sys, datetime
-bm_url, pw_url = sys.argv[1], sys.argv[2]
+bm_url, pw_url, skript_verz = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, skript_verz)
+import atomar_schreiben
 stamp = datetime.date.today().strftime('%Y%m%d')
 snap = pathlib.Path.home() / '.local/trash-snapshots' / f'{stamp}-mcp-shared'
 snap.mkdir(parents=True, exist_ok=True)
@@ -160,7 +240,7 @@ if cfg.exists():
     want = {'type': 'http', 'url': bm_url}
     if servers.get('basic-memory') != want:
         servers['basic-memory'] = want
-        cfg.write_text(json.dumps(d, indent=2) + '\n')
+        atomar_schreiben.schreiben(cfg, json.dumps(d, indent=2) + '\n', modus=0o644)
         changed.append(str(cfg))
 
 for p in sorted(pathlib.Path.home().glob('.claude/plugins/cache/*/playwright/*/.mcp.json')):
@@ -169,7 +249,7 @@ for p in sorted(pathlib.Path.home().glob('.claude/plugins/cache/*/playwright/*/.
     if d.get('playwright') != want:
         shutil.copy2(p, snap / f'playwright-{p.parent.name}.mcp.json')
         d['playwright'] = want
-        p.write_text(json.dumps(d, indent=2) + '\n')
+        atomar_schreiben.schreiben(p, json.dumps(d, indent=2) + '\n', modus=0o644)
         changed.append(str(p))
 
 print('angepasst: ' + (', '.join(changed) if changed else 'nichts, war schon korrekt'))
@@ -186,6 +266,8 @@ case "${1:-status}" in
   stop)    cmd_stop ;;
   restart) cmd_restart ;;
   apply)   cmd_apply ;;
+  ensure)  shift; cmd_ensure "${1:-}" ;;
+  halt)    shift; cmd_halt "${1:-}" ;;
   reap)    shift; cmd_reap "${1:-}" ;;
-  *) echo "mcp-shared: unbekanntes Kommando '$1' (status|start|stop|restart|apply|reap)" >&2; exit 1 ;;
+  *) echo "mcp-shared: unbekanntes Kommando '$1' (status|start|stop|restart|apply|reap|ensure|halt)" >&2; exit 1 ;;
 esac

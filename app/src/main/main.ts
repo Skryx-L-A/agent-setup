@@ -7,9 +7,9 @@
 // tippt -- kein Ereignis, kein Steuerbefehl und kein Test erreicht ihn.
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, shell, protocol } from 'electron';
 import { execFile, spawn, spawnSync } from 'node:child_process';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, statSync, mkdirSync, openSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, relative } from 'node:path';
+import { join, relative, dirname, basename } from 'node:path';
 import { loadConfig, Config } from './config';
 import { fernAufruf, findetWerkzeug, pfadHerrichten } from './pfad';
 import { Ergebnis, ErgebnisWaechter } from './results';
@@ -24,7 +24,7 @@ import { AusgabeBuendel } from './ausgabe';
 import { darfWiederherstellen, fortsetzenHinweis, reviveCommand } from './revive';
 import { kontextFenster, transcriptPfad, transcriptStand } from './workerstate';
 import type { HarnessResume, ReviveCommand } from './revive';
-import { capacity, tabsFor, mayArrange } from './capacity';
+import { capacity, tabsFor, mayArrange, gitterFuer, tiledRaster } from './capacity';
 import { UiStore, sortSessions, UiState } from './uistate';
 import { LebensSpur } from './lebensspur';
 import { readRequests, readGuardBlocks, decideRequest, RequestEntry, GuardBlockEntry } from './freigaben';
@@ -36,6 +36,8 @@ import { renderSeite, SEITEN_SCHEMA, type SeitenName } from './seiten';
 import {
   Einstellungsfenster, einstellungsDaten, wacheLesen, type EinstellungsDaten,
 } from './einstellungsfenster';
+import { kontextStufen, wbCodeKenntKontext, KONTEXT_PROBE_ARGS } from './kontext';
+import { startBefund, kurzfassung } from './startprotokoll';
 import { Sitzungsfenster, sitzungsZeilen, type SitzungsDaten } from './sitzungsfenster';
 import { Chatbuehne } from './chatbuehne';
 import { Chatwache } from './chatwache';
@@ -75,6 +77,54 @@ import {
 import { themaPayload } from './thema';
 import { schluesselSetzenFuerAnbieter, schluesselStatusAlle } from './schluesselbund';
 import type { FSWatcher } from 'node:fs';
+
+// KEIN FENSTER FUER EINEN FEHLER, DEN NIEMAND ERWARTET HAT (Auftrag 2026-08-19).
+//
+// Anlass: waehrend eines parallelen Testlaufs poppten mehrere native
+// "A JavaScript error occurred in the main process"-Fenster auf des Nutzers
+// Bildschirm auf -- Electrons EIGENE Standardreaktion auf eine unbehandelte
+// Ausnahme im Hauptprozess, wenn nichts anderes sie abfaengt. Bis heute stand
+// hier kein einziger `process.on('uncaughtException'|'unhandledRejection')`
+// -- jede der 68 App-Suiten startet denselben Hauptprozess, also war JEDE von
+// ihnen demselben Risiko ausgesetzt, nicht nur die, bei denen es zufaellig
+// zuschlug.
+//
+// Diese Zeilen stehen bewusst VOR JEDEM anderen Code dieser Datei (vor
+// app.dock?.hide(), vor pfadHerrichten(), vor loadConfig()) -- ein Fehler in
+// irgendeinem dieser fruehen Schritte soll denselben Weg nehmen wie einer,
+// der Minuten spaeter passiert.
+//
+// Die Regel gilt UNBEDINGT, nicht nur unter --headless: ein rohes natives
+// Fehlerfenster ist auch im echten, sichtbaren Betrieb keine brauchbare
+// Fehlermeldung fuer einen Menschen -- die Zeile im Protokoll ist es. Ein
+// Test macht daraus ausserdem eine ROTE Suite (die Meldung steht in
+// $LOG, das jede test-app-*.sh-Suite selbst ausliest), statt dass der Fehler
+// unbemerkt in einem Fenster liegt, das niemand sieht, weil --headless kein
+// Fenster zeigt -- nur eben die eine native Fehlerbox, die --headless NICHT
+// verhindert.
+//
+// `app.exit()` statt `process.exit()`: beendet sofort, ohne den normalen
+// 'before-quit'/'will-quit'-Weg (der selbst wieder Code ist, der bei einem
+// bereits kaputten Zustand seinerseits werfen koennte) -- angemessen fuer
+// einen Zustand, den dieses Programm nicht mehr fuer vertrauenswuerdig haelt.
+function unbehandelterFehler(art: string, fehler: unknown): void {
+  const text = fehler instanceof Error ? (fehler.stack || fehler.message) : String(fehler);
+  process.stderr.write(`UNBEHANDELTER FEHLER (${art}) im Hauptprozess -- kein Fenster, nur diese Zeile:\n${text}\n`);
+  app.exit(1);
+}
+process.on('uncaughtException', (e) => unbehandelterFehler('uncaughtException', e));
+process.on('unhandledRejection', (e) => unbehandelterFehler('unhandledRejection', e));
+
+// NUR FUER DEN REGRESSIONSTEST (test-app-kein-fehlerfenster.sh): wirft absichtlich,
+// bevor irgendein Fenster entsteht, damit der Test beweisen kann, dass daraus
+// eine Protokollzeile wird und NIE ein sichtbares Fenster. Ohne AWB_TEST_UNCAUGHT
+// aendert sich nichts -- dieselbe Bauform wie AWB_RUECKFRAGE/AWB_ORDNER_DIALOG.
+if (process.env.AWB_TEST_UNCAUGHT === 'throw') {
+  throw new Error('AWB_TEST_UNCAUGHT: absichtlicher Fehler fuer den Regressionstest');
+}
+if (process.env.AWB_TEST_UNCAUGHT === 'reject') {
+  Promise.reject(new Error('AWB_TEST_UNCAUGHT: absichtliche Ablehnung fuer den Regressionstest'));
+}
 
 // Auf macOS aktiviert Electron beim Start die App und legt ein Dock-Symbol an.
 // Beides wuerde dem Menschen an dieser Maschine den Fokus nehmen. Das Verstecken
@@ -476,6 +526,9 @@ function modellLesen(): SessionInfo[] {
     verlorene: lebensspur.verlorene(),
   });
   tmuxBefundMelden({ ausfuehrbar: befund.tmuxAusfuehrbar, fehler: befund.tmuxFehler });
+  // Was dieser Prozess ueber laufende und gescheiterte Starts weiss, gehoert an
+  // die Liste, bevor irgendjemand sie filtert oder zeichnet.
+  startzustand(befund.sessions);
   // Erst lesen, dann fortschreiben: was dieser Durchgang gesehen hat, ist der
   // Stand, gegen den der NAECHSTE Start misst. Ob eine Beobachtung ueberhaupt
   // etwas wert ist, wird JE MASCHINE beantwortet (11.08.): hier haengt es am
@@ -547,7 +600,90 @@ function befehlsUmgebung(): BefehlsUmgebung {
     wbStateBin: process.env.AWB_WB_STATE ?? 'wb-state',
     // Woran `plane` erkennt, ob ein Griff hier laeuft oder drueben (09.08.).
     machine: config.machine,
+    // Der Weg fuer Zwischenmeldungen waehrend eines langen Starts (21.08.):
+    // dieselbe Buehne, ueber die auch sonst ein Satz ins Fenster geht. Ohne sie
+    // saesse der Mensch bei einem lokalen Modell minutenlang vor einem Fenster,
+    // das nichts sagt -- `wb-code` legt seine tmux-Session erst nach dem
+    // Modellstart an.
+    fortschritt: (text: string) => melde(text),
+    // Wohin `wb-code` auf dem Fortsetzen-Weg schreibt -- derselbe Ordner wie
+    // beim Plus-Menue, damit beide Wege ihre Gruende am selben Platz ablegen.
+    startProtokollDir: join(config.stateDir, 'sitzungsstart'),
+    // Und der Fehlschlag wird gemeldet wie dort: derselbe Satz ins Fenster,
+    // dieselbe Nachricht ans Sitzungsfenster, dieselbe Auffrischung der Liste.
+    // Bis zum 21.08. meldete dieser Weg gar nichts -- er gab sogar `ok` zurueck,
+    // wenn `wb-code` abbrach.
+    startVerlauf: (phase, info) => startVerlaufEintragen(phase, info),
   };
+}
+
+/**
+ * Ein gescheiterter Start, auf beiden Wegen gleich behandelt.
+ *
+ * Die Merkmale `startet`/`startFehler` an der Sitzung haengen an
+ * `sessionAnlegen` -- der Fortsetzen-Weg hat keinen eigenen Kindprozess, den
+ * dieses Programm halten koennte, also traegt er den Fehlschlag hier ein. Ein
+ * `dir` gibt es dabei nicht immer; ohne eines bleibt es bei der Meldung, und
+ * die ist ohnehin das, was der Mensch zuerst sieht.
+ */
+function startVerlaufEintragen(
+  phase: 'beginnt' | 'steht' | 'gescheitert',
+  info: { dir: string; key: string; ort: string; kurz?: string; grund?: string; protokoll?: string },
+): void {
+  // Der Fortsetzen-Weg laeuft immer auf dieser Maschine: eine ferne Sitzung
+  // geht ueber `ssh`, und dann ist der Aufruf gar kein `wb-code` mehr, den
+  // dieser Zweig behandelt.
+  const schluessel = info.dir ? startSchluessel(config.machine, info.dir) : '';
+  if (phase === 'beginnt') {
+    if (!schluessel) return;
+    laufendeStarts.set(schluessel, { seit: Date.now(), key: info.key });
+    gescheiterteStarts.delete(schluessel);
+    sessions = modellLesen();
+    modellSenden();
+    return;
+  }
+  if (schluessel) laufendeStarts.delete(schluessel);
+  if (phase === 'steht') {
+    if (schluessel) gescheiterteStarts.delete(schluessel);
+    sessions = modellLesen();
+    modellSenden();
+    return;
+  }
+  startFehlschlagMelden(
+    {
+      ort: info.ort,
+      kurz: info.kurz ?? '',
+      grund: info.grund ?? '',
+      protokoll: info.protokoll ?? '',
+    },
+    schluessel ? { machine: config.machine, dir: info.dir, key: info.key } : undefined,
+  );
+}
+
+function startFehlschlagMelden(
+  befund: { ort: string; kurz: string; grund: string; protokoll: string },
+  ziel?: { machine: string; dir: string; key: string },
+): void {
+  process.stderr.write(
+    `Sitzungsstart in ${befund.ort} GESCHEITERT -- ${befund.kurz || 'kein Grund im Protokoll'}`
+    + `${befund.protokoll ? ` (${befund.protokoll})` : ''}\n`,
+  );
+  melde(befund.grund
+    ? `Die Sitzung in ${befund.ort} ist NICHT gestartet:\n${befund.grund}`
+      + (befund.protokoll ? `\n\nVollstaendig: ${befund.protokoll}` : '')
+    : `Die Sitzung in ${befund.ort} ist NICHT gestartet, und wb-code hat keinen Grund hinterlassen.`
+      + (befund.protokoll ? ` Protokoll: ${befund.protokoll}` : ''));
+  sitzungsfenster.aktuell()?.webContents.send('awb:sitz-startfehler', {
+    ort: befund.ort, kurz: befund.kurz, grund: befund.grund, protokoll: befund.protokoll,
+  });
+  if (ziel) {
+    gescheiterteStarts.set(startSchluessel(ziel.machine, ziel.dir), {
+      key: ziel.key, kurz: befund.kurz, protokoll: befund.protokoll, zeit: Date.now(),
+    });
+  }
+  sessions = modellLesen();
+  modellSenden();
+  sitzungsfensterAuffrischen();
 }
 
 /**
@@ -589,8 +725,44 @@ function sessionWiederherstellen(id: string): { command: string; conversation: s
   const s = sessions.find((x) => x.id === id);
   if (!s) throw new Error(`unbekannte Session: ${id}`);
   if (!darfWiederherstellen(s)) throw new Error(`Session '${s.name}' ist nicht (mehr) im Zustand 'stopped' -- keine Wiederherstellung.`);
-  const cmd = reviveCommand(s, config.machine, config.wbCodeBin, harnessResume(s.harness));
-  const kind = spawn(cmd.bin, cmd.args, { stdio: 'ignore', detached: true });
+  // Ob das `wb-code`, das gleich laeuft, `--kontext` kennt -- oertlich das
+  // eigene, fern das der Zielmaschine, ueber denselben ssh-Weg wie beim
+  // Plus-Menue. Ohne diese Frage bliebe die einmal gewaehlte Stufe liegen.
+  //
+  // GEFRAGT WIRD NUR, WENN ES ETWAS ZU FRAGEN GIBT: die Probe startet einen
+  // echten Prozess, und eine Sitzung ohne gewaehlte Stufe hat davon nichts.
+  // (Ohne diese Bedingung lief sie bei JEDEM Fortsetzen mit -- aufgefallen an
+  // einer fremden Suite, deren Attrappe den Probeaufruf mitprotokollierte.)
+  const fern = s.machine !== config.machine;
+  const kenntKontext = s.kontext > 0 && wbCodeKenntKontext(fern
+    ? fernAufruf(s.machine, ['wb-code', ...KONTEXT_PROBE_ARGS])
+    : [config.wbCodeBin, ...KONTEXT_PROBE_ARGS]);
+  const cmd = reviveCommand(
+    s, config.machine, config.wbCodeBin, harnessResume(s.harness), kenntKontext,
+  );
+  // DERSELBE UMGANG WIE BEIM PLUS-MENUE (21.08.), und zwar in allen drei
+  // Punkten. Bis heute stand hier `stdio: 'ignore'` und sonst nichts: der Grund
+  // eines Fehlschlags wurde weggeworfen, es gab keinen Eigentuemer fuer einen
+  // Modellserver, und in der Liste stand danach eine Sitzung, die nie kam.
+  // Genau die Kette, die `sessionAnlegen` seit Auftrag 1 hinter sich hat.
+  const startKey = startSchluessel(s.machine, s.dir);
+  laufendeStarts.set(startKey, { seit: Date.now(), key: s.sessionKey });
+  gescheiterteStarts.delete(startKey);
+  const protokollPfad = join(config.stateDir, 'sitzungsstart',
+    `${Date.now()}-fortsetzen-${basename(s.dir).replace(/[^A-Za-z0-9._-]/g, '_')}.log`);
+  const startUmgebung = { ...process.env, WB_EIGENTUEMER_WERKBANK: String(process.pid) };
+  let kind: ReturnType<typeof spawn>;
+  try {
+    mkdirSync(dirname(protokollPfad), { recursive: true });
+    const fd = openSync(protokollPfad, 'a');
+    kind = spawn(cmd.bin, cmd.args, { stdio: ['ignore', fd, fd], detached: true, env: startUmgebung });
+    closeSync(fd);
+    startGrundBeobachten(kind, protokollPfad, s.dir, startKey, s.sessionKey);
+  } catch (e) {
+    process.stderr.write(`Fortsetzen: kein Protokoll moeglich (${(e as Error).message}) -- Start ohne Mitschrift.\n`);
+    kind = spawn(cmd.bin, cmd.args, { stdio: 'ignore', detached: true, env: startUmgebung });
+    kind.once('exit', () => { laufendeStarts.delete(startKey); });
+  }
   kind.unref();
   // Der Satz geht mit ins Protokoll: nach dem Klick sieht der Mensch die
   // Oberflaeche, nicht die neue Session -- und ob seine Unterhaltung
@@ -802,6 +974,34 @@ function fernOrdnerPruefen(machine: string, pfad: string): { ok: boolean; meldun
 }
 
 /**
+ * DIE WAHL FUER GENAU DIESE EINE SITZUNG (19.08.), Wort des Nutzers: „damit man,
+ * wenn man nur diese eine Sitzung anders fahren will, nicht erst in die
+ * Einstellungen muss und sie danach wieder zurueckstellt."
+ *
+ * Sie geht ausschliesslich als BEFEHLSZEILE mit -- `wb-code` kennt die vier
+ * Schalter laengst und laesst sie den Einstellungen vorgehen (shell/wb-code,
+ * Zeilen 166-168: die Datei wird nur gelesen, wenn nichts auf der Zeile steht).
+ * DIE EINSTELLUNGSDATEI WIRD DABEI NICHT ANGEFASST, und zwar nirgends auf
+ * diesem Weg: es gibt hier keinen `wb-state settings set`-Aufruf, weder vor
+ * noch nach dem Start. Genau das ist der Sinn dieses zweiten Weges.
+ *
+ * Ein Feld, das leer bleibt, erzeugt KEINEN Schalter -- dann gilt fuer diesen
+ * Punkt weiter, was in den Einstellungen steht.
+ */
+export interface SitzungsWahl {
+  harness?: string;
+  model?: string;
+  effort?: string;
+  /** Kontextfenster in Token. Nur bei einem lokalen Modell sinnvoll -- 0 heisst „nichts sagen". */
+  kontext?: number;
+}
+
+/** Ein Wert, der ohne Anfuehrungszeichen auf eine Befehlszeile darf. */
+function harmlosesArgument(wert: string): boolean {
+  return /^[A-Za-z0-9._:/-]{1,120}$/.test(wert);
+}
+
+/**
  * `machine` ist NEU (11.08., Bauteil 1): ohne Angabe wie bisher die eigene
  * Maschine, mit einer aus `config.remoteMachines` startet die Sitzung DORT --
  * ueber dieselbe `fernAufruf`-Zeile, mit der auch Fortsetzen, Schliessen und
@@ -810,10 +1010,143 @@ function fernOrdnerPruefen(machine: string, pfad: string): { ok: boolean; meldun
  * dem Fenster und wird HIER gegen die Fernmaschine geprueft, nicht nur gegen
  * eine Zeichenkette.
  */
+/**
+ * Warten, bis `wb-code` durch ist, und den Grund zeigen, wenn keine Sitzung
+ * entstanden ist.
+ *
+ * GEWARTET WIRD AUF 'exit', NICHT AUF 'close': `wb-code` laesst Hintergrund-
+ * prozesse zurueck, die die Ausgabedatei geerbt haben (record_conversation,
+ * bis zu 40 s). 'close' kaeme erst, wenn auch die fertig sind -- der Mensch
+ * saehe seinen Fehlschlag also eine halbe Minute zu spaet.
+ *
+ * Der Exit-Code sagt hier NICHTS: `wb-code` endet mit `exec tmux attach`, und
+ * das scheitert ohne Terminal immer. Entschieden wird an der Marke im
+ * Protokoll, siehe startprotokoll.ts.
+ */
+function startGrundBeobachten(
+  kind: ReturnType<typeof spawn>,
+  protokollPfad: string,
+  ort: string,
+  schluessel: string,
+  sitzungsSchluessel: string,
+): void {
+  kind.once('exit', () => {
+    // Der Startvorgang ist beendet, wie auch immer er ausging: die Zeile in der
+    // Liste soll ab jetzt nicht mehr „startet" sagen.
+    laufendeStarts.delete(schluessel);
+    // Ein kurzer Nachlauf: die letzte stderr-Zeile kann die Datei nach dem
+    // Prozessende noch erreichen (der Puffer des Kernels), und gerade die
+    // letzte Zeile traegt oft den Abbruchgrund.
+    setTimeout(() => {
+      let inhalt = '';
+      try {
+        inhalt = readFileSync(protokollPfad, 'utf8');
+      } catch {
+        return;
+      }
+      const befund = startBefund(inhalt);
+      if (befund.gestartet) {
+        gescheiterteStarts.delete(schluessel);
+        return;
+      }
+      const kurz = kurzfassung(befund.grund);
+      // GESCHEITERT IST NICHT BEENDET (21.08.). Ohne diese Zeile stuende die
+      // Sitzung gleich wieder als gewoehnliche beendete da und fiele bei
+      // `showStopped: false` aus der Liste -- genau der Fall, in dem alice
+      // seine Sitzung nicht mehr fand.
+      gescheiterteStarts.set(schluessel, {
+        key: sitzungsSchluessel, kurz, protokoll: protokollPfad, zeit: Date.now(),
+      });
+      process.stderr.write(`Sitzungsstart in ${ort} GESCHEITERT -- ${kurz || 'kein Grund im Protokoll'} (${protokollPfad})\n`);
+      const text = befund.grund
+        ? `Die Sitzung in ${ort} ist NICHT gestartet:\n${befund.grund}\n\nVollstaendig: ${protokollPfad}`
+        : `Die Sitzung in ${ort} ist NICHT gestartet, und wb-code hat keinen Grund hinterlassen. Protokoll: ${protokollPfad}`;
+      melde(text);
+      sitzungsfenster.aktuell()?.webContents.send('awb:sitz-startfehler', {
+        ort, kurz, grund: befund.grund, protokoll: protokollPfad,
+      });
+      // Damit die Zeile in der Leiste nachzieht: der Ordner steht jetzt als
+      // gescheiterter Start da (nicht als beendete Sitzung), und das Fenster
+      // soll das zeigen, statt auf einen Start zu warten, der nicht mehr kommt.
+      sessions = modellLesen();
+      modellSenden();
+      sitzungsfensterAuffrischen();
+    }, 400);
+  });
+}
+
+/**
+ * WAS ZWISCHEN KLICK UND LAUFENDER SITZUNG PASSIERT -- und warum es hier steht
+ * und nicht in `sessions.ts` (21.08.).
+ *
+ * `wb-code` schreibt die Zustandsdatei frueh und legt seine tmux-Sitzung spaet
+ * an; dazwischen liegt bei einem lokalen Modell das Laden von rund 20 GiB.
+ * Aus dem Dateisystem allein ist dieser Zwischenzustand nicht zu erkennen: die
+ * Datei sieht genauso aus wie die einer beendeten Sitzung. Wer es weiss, ist
+ * dieser Prozess -- er hat den Start ausgeloest und haelt das Kind.
+ *
+ * DIE ZUORDNUNG GEHT UEBER MASCHINE, ORDNER UND SCHLUESSEL, nicht ueber die
+ * Kennung: die entsteht erst mit der Zustandsdatei, also nach dem Start. Ein
+ * Start ohne eigenen Schluessel meint die Standardsitzung des Ordners (die mit
+ * leerem `sessionKey`) -- genau die, die `wb-code` ohne `--key` bedient.
+ */
+interface Startvorgang { seit: number; key: string; }
+const laufendeStarts = new Map<string, Startvorgang>();
+const gescheiterteStarts = new Map<string, { key: string; kurz: string; protokoll: string; zeit: number }>();
+/**
+ * Wie lange ein gescheiterter Start in der Liste stehen bleibt, wenn ihn
+ * niemand mehr anfasst. Er verschwindet ausserdem sofort, sobald die Sitzung
+ * doch laeuft oder ein neuer Versuch beginnt -- diese Frist ist nur die
+ * Obergrenze fuer den Fall, dass beides nie eintritt. Zwoelf Stunden: lang
+ * genug, um am naechsten Morgen noch dazustehen, kurz genug, um nicht ewig zu
+ * bleiben.
+ */
+const START_FEHLER_VERFALL_MS = 12 * 60 * 60 * 1000;
+
+/** Maschine und Ordner -- der Schluessel beider Karten. */
+function startSchluessel(machine: string, dir: string): string {
+  return `${machine}\t${dir}`;
+}
+
+/**
+ * Gehoert diese Sitzung zu jenem Startvorgang? Mit Schluessel: nur die Sitzung
+ * mit genau diesem `sessionKey`. Ohne: nur die Standardsitzung des Ordners.
+ */
+function startBetrifft(s: SessionInfo, key: string): boolean {
+  return key ? s.sessionKey === key : !s.sessionKey;
+}
+
+/**
+ * Die beiden Merkmale an die frisch gelesene Liste heften -- und dabei
+ * aufraeumen, was sich erledigt hat.
+ */
+function startzustand(liste: SessionInfo[]): void {
+  const jetzt = Date.now();
+  for (const [k, v] of gescheiterteStarts) {
+    if (jetzt - v.zeit > START_FEHLER_VERFALL_MS) gescheiterteStarts.delete(k);
+  }
+  for (const s of liste) {
+    const k = startSchluessel(s.machine, s.dir);
+    const laeuft = laufendeStarts.get(k);
+    if (laeuft && startBetrifft(s, laeuft.key)) {
+      // Steht die Sitzung schon, ist der Startvorgang beantwortet -- auch wenn
+      // `wb-code` noch ein paar Zeilen schreibt.
+      if (s.state === 'stopped') { s.startet = true; continue; }
+      laufendeStarts.delete(k);
+    }
+    const fehler = gescheiterteStarts.get(k);
+    if (!fehler || !startBetrifft(s, fehler.key)) continue;
+    // Laeuft sie wieder, ist der alte Fehlschlag Geschichte.
+    if (s.state !== 'stopped') { gescheiterteStarts.delete(k); continue; }
+    s.startFehler = true;
+  }
+}
+
 function sessionAnlegen(
   dir: string,
   name: string,
   machine: string = config.machine,
+  wahl?: SitzungsWahl,
 ): { gestartet: boolean; meldung: string; command: string } {
   const pfad = (dir || '').trim();
   if (!pfad) throw new Error('Feld dir fehlt');
@@ -897,6 +1230,46 @@ function sessionAnlegen(
   // Gemerkt wird der Stand VOR dem Start: an ihm erkennt der naechste Versuch,
   // ob dieser hier inzwischen angekommen ist.
   gestarteteOrdner.set(schutzSchluessel, { zeit: Date.now(), sitzungenVorher: bekannteSitzungen });
+  // Ab hier laeuft ein Start fuer diesen Ordner, und die Liste soll das sagen
+  // statt „beendet". Ein neuer Versuch loescht den alten Fehlschlag: was gerade
+  // laeuft, ist die aktuellere Auskunft.
+  const startKey = startSchluessel(machine, pfad);
+  laufendeStarts.set(startKey, { seit: Date.now(), key });
+  gescheiterteStarts.delete(startKey);
+
+  const ort = fern ? `${pfad} auf '${machine}'` : pfad;
+  const ort0 = ort;
+
+  // --- Die Wahl fuer diese eine Sitzung (19.08.) ---------------------------
+  //
+  // Sie steht ZWISCHEN Ordner und Aufrufbau, weil `--kontext` davon abhaengt,
+  // WELCHES `wb-code` gleich laeuft: bei einer Fernmaschine ist das ihres, und
+  // ob es den Schalter kennt, weiss nur sie selbst.
+  let kontextWeggelassen = '';
+  for (const [flagge, wert] of [['--harness', wahl?.harness], ['--model', wahl?.model], ['--effort', wahl?.effort]] as const) {
+    const w = (wert ?? '').trim();
+    if (!w) continue;
+    if (!harmlosesArgument(w)) throw new Error(`Wert fuer ${flagge} enthaelt Zeichen, die hier nicht vorgesehen sind: ${w}`);
+    args.push(flagge, w);
+  }
+  const kontext = Math.trunc(Number(wahl?.kontext ?? 0));
+  if (kontext > 0) {
+    // GEFRAGT WIRD DAS `wb-code`, DAS GLEICH LAEUFT -- oertlich das eigene,
+    // fern das der Zielmaschine ueber denselben ssh-Weg. Kennt es den Schalter
+    // nicht, bleibt er weg und die Sitzung startet trotzdem; was fehlt, steht
+    // danach in der Meldung.
+    //
+    // DIE PROBE WIRD GANZ GEBAUT, nicht an einen fertigen Aufruf angehaengt:
+    // `fernAufruf` faltet den fernen Befehl zu EINER gequoteten Zeichenkette
+    // zusammen, an die sich nichts mehr anhaengen laesst (siehe kontext.ts).
+    // Aus demselben Grund steht dieser Block VOR dem Bau von bin/kindArgs --
+    // `--kontext` gehoert in `args`, nicht dahinter.
+    const probe = fern
+      ? fernAufruf(machine, ['wb-code', ...KONTEXT_PROBE_ARGS])
+      : [config.wbCodeBin, ...KONTEXT_PROBE_ARGS];
+    if (wbCodeKenntKontext(probe)) args.push('--kontext', String(kontext));
+    else kontextWeggelassen = String(kontext);
+  }
   let bin: string; let kindArgs: string[];
   if (fern) {
     const [b, ...rest] = fernAufruf(machine, ['wb-code', ...args]);
@@ -904,13 +1277,65 @@ function sessionAnlegen(
   } else {
     bin = config.wbCodeBin; kindArgs = args;
   }
-  const kind = spawn(bin, kindArgs, { stdio: 'ignore', detached: true });
+  // NICHT MEHR `stdio: 'ignore'` (21.08.2026). Genau daran ist des Nutzers
+  // 256k-Sitzung unsichtbar gescheitert: `wb-code` schrieb den vollstaendigen
+  // Grund auf stderr -- die abgelehnte Speicherbuchung mit Spitze, Verfuegbarem
+  // und Halter --, und dieser Prozess warf ihn weg. Im Fenster stand nur
+  // "Stopped", also ein Zustand statt eines Fehlschlags, und die Suche lief
+  // stundenlang an der falschen Stelle.
+  //
+  // Die Ausgabe geht in eine DATEI, nicht in eine Pipe: `wb-code` startet
+  // Hintergrundprozesse, die stderr erben (record_conversation laeuft bis zu
+  // 40 s weiter), und eine Pipe bliebe dann offen, waehrend das Kind laengst
+  // beendet ist. Eine Datei hat dieses Problem nicht und bleibt ausserdem
+  // liegen -- wer spaeter nachsehen will, findet sie unter dem Pfad, den die
+  // Meldung nennt.
+  const protokollPfad = join(config.stateDir, 'sitzungsstart',
+    `${Date.now()}-${basename(pfad).replace(/[^A-Za-z0-9._-]/g, '_')}.log`);
+  // DIESES PROGRAMM ALS EIGENTUEMER (21.08.2026). `wb-nohup` startet keinen
+  // abgeloesten Prozess ohne nachweisbaren Eigentuemer -- ohne einen wuerde ein
+  // Modellserver von 20 GiB spaeter niemandem gehoeren und niemand koennte
+  // sagen, ob ihn noch jemand braucht. Bis heute kannte es zwei Arten, einen
+  // tmux-Pane und einen launchd-Job; die Oberflaeche hat weder das eine noch
+  // das andere, und deshalb brach jeder Start einer Sitzung mit lokalem Modell
+  // ueber das Plus-Menue ab (gemessen 21.08.: "wb-nohup: braucht einen
+  // tmux-Pane als Bezugspunkt", danach "wb-code: 'wb-mlx-server ensure' ...
+  // fehlgeschlagen -- kein Start").
+  //
+  // Die dritte Art ist dieses Programm selbst. Weitergereicht wird nur die
+  // PID; alles andere misst `wb-nohup` nach -- laeuft der Prozess, heisst er
+  // wie die Werkbank, und ist er ein echter VORFAHRE des Aufrufs. Das Letzte
+  // traegt genau hier: `wb-code` laeuft als Kind dieses Prozesses, auch
+  // abgeloest. Ein Agent, der die Variable selbst setzt, kann sich nicht unter
+  // den Electron-Hauptprozess haengen.
+  const startUmgebung = { ...process.env, WB_EIGENTUEMER_WERKBANK: String(process.pid) };
+  let kind: ReturnType<typeof spawn>;
+  try {
+    mkdirSync(dirname(protokollPfad), { recursive: true });
+    const fd = openSync(protokollPfad, 'a');
+    kind = spawn(bin, kindArgs, { stdio: ['ignore', fd, fd], detached: true, env: startUmgebung });
+    closeSync(fd);
+    startGrundBeobachten(kind, protokollPfad, ort0, startKey, key);
+  } catch (e) {
+    // Ein Protokoll ist eine Verbesserung, keine Bedingung: laesst es sich nicht
+    // anlegen, startet die Sitzung wie bisher -- nur eben wieder stumm.
+    process.stderr.write(`Sitzungsstart: kein Protokoll moeglich (${(e as Error).message}) -- Start ohne Mitschrift.\n`);
+    kind = spawn(bin, kindArgs, { stdio: 'ignore', detached: true, env: startUmgebung });
+    // Ohne Protokoll gibt es keinen Grund zu zeigen -- dass der Start VORBEI
+    // ist, laesst sich trotzdem sagen, und die Zeile darf nicht ewig „startet"
+    // behaupten.
+    kind.once('exit', () => { laufendeStarts.delete(startKey); });
+  }
   kind.unref();
-  const ort = fern ? `${pfad} auf '${machine}'` : pfad;
-  const meldung = key
+  const meldung = (key
     ? `Weitere Session in ${ort} wird gestartet (Schluessel ${key}) -- `
       + `die ${bekannte.length === 1 ? 'bisherige bleibt' : 'bisherigen bleiben'}, wie sie ${bekannte.length === 1 ? 'ist' : 'sind'}.`
-    : `Session in ${ort} wird gestartet.`;
+    : `Session in ${ort} wird gestartet.`)
+    // Was weggelassen wurde, wird gesagt und nicht verschwiegen -- sonst liefe
+    // die Sitzung mit einem anderen Fenster, als im Fenster stand.
+    + (kontextWeggelassen
+      ? ` Das Kontextfenster ${kontextWeggelassen} ging NICHT mit: dieses wb-code kennt --kontext noch nicht.`
+      : '');
   return { gestartet: true, meldung, command: `${bin} ${kindArgs.join(' ')}` };
 }
 
@@ -1135,7 +1560,18 @@ function sichtbare(alle: SessionInfo[]): SessionInfo[] {
   // dahin gleich behandelt hat: geschlossen (zugesehen, soll weg) und
   // weggebrochen (niemand hat das Ende gesehen, gehoert gezeigt). Die
   // Herleitung steht in lebensspur.ts.
-  const gefiltert = z.showStopped ? alle : alle.filter((s) => s.state !== 'stopped' || s.verloren);
+  //
+  // UND EIN START AUCH NICHT (21.08.). Zwei weitere Faelle, die 'stopped'
+  // heissen und trotzdem nichts mit „erledigt" zu tun haben: eine Sitzung, die
+  // GERADE STARTET (die Zustandsdatei ist da, die tmux-Sitzung noch nicht --
+  // bei einem lokalen Modell dauert das Minuten), und eine, deren Start
+  // GESCHEITERT ist. Der zweite Fall ist der, an dem des Nutzers 256k-Sitzung
+  // unsichtbar wurde: `showStopped` steht in seiner ui.json auf false, und
+  // `verloren` griff nicht, weil die Sitzung nie lief. Uebrig blieb ein
+  // Fehlschlag, den niemand sehen konnte.
+  const gefiltert = z.showStopped
+    ? alle
+    : alle.filter((s) => s.state !== 'stopped' || s.verloren || s.startet || s.startFehler);
   return sortSessions(gefiltert, z.sort, z.order);
 }
 
@@ -1869,15 +2305,15 @@ async function tabZeigen(paneIds: string[]): Promise<void> {
   // zwei Wahrheiten: die Leiste rechts verspraeche vier Panes je Tab, und die
   // Buehne legte sie anders hin.
   const kap = kapazitaet();
-  const spalten = Math.max(1, Math.min(kap.perRow, paneIds.length));
-  const zeilen = Math.max(1, Math.ceil(paneIds.length / spalten));
+  // Das Raster ist jetzt das, das tmux zu dieser Zahl von Panes auch BAUT
+  // (gitterFuer/tiledRaster). Vorher stand hier `min(perRow, anzahl)` Spalten
+  // und `ceil(anzahl / spalten)` Reihen -- eine zweite Form neben der von tmux,
+  // und bei sieben Panes wich sie ab: die Buehne verlangte zwei Spalten, tmux
+  // legte drei.
+  const gitter = gitterFuer(paneIds.length, kap.perRow, kap.perColumn);
+  const spalten = gitter.spalten;
+  const zeilen = gitter.zeilen;
   const flaecheJetzt = flaeche ?? { cols: config.ownedCols, rows: config.ownedRows };
-  const zellRows = Math.max(1, Math.floor(flaecheJetzt.rows / zeilen));
-  // Die Kachelbreite OHNE die aufgezogene letzte Reihe: dass die letzte Reihe
-  // sich aufzieht, macht tmux in seiner Aufteilung selbst, und der Renderer
-  // macht es in kachelLage. Hier steht die Groesse einer gewoehnlichen Kachel,
-  // aus der die Fenstergroesse folgt.
-  const zellCols = Math.max(1, Math.floor(flaecheJetzt.cols / spalten));
 
   // Die Panes eines Tabs stammen aus VERSCHIEDENEN tmux-Fenstern: ein Worker
   // liegt im Fenster seines Orchestrators, der naechste im Fenster 'workers'.
@@ -1899,7 +2335,19 @@ async function tabZeigen(paneIds: string[]): Promise<void> {
     const fenster = fensterVon.get(id);
     if (!fenster || erledigt.has(fenster)) continue;
     erledigt.add(fenster);
-    const lage = await fensterAufKachel(id, zellCols, zellRows, spalten, zeilen);
+    // WIEVIELE PANES DIESES FENSTER TRAEGT -- nicht, wieviele der Tab zeigt.
+    //
+    // Im Layout 'split' (die Vorgabe) sitzen die Worker als Panes UNTER dem
+    // Orchestrator, also in EINEM Fenster mit ihm. Der Tab zeigt dann vier
+    // Panes, das Fenster hat aber fuenf, und tmux teilt seine Flaeche unter
+    // allen fuenf auf. Bisher bekam es trotzdem die Groesse fuer vier --
+    // gemessen am 19.08. kopflos mit vier Workern: drei Panes standen auf
+    // 495x195 Bildpunkten in einer Kachel von 501x319 (unten blieb ein
+    // schwarzer Streifen), der vierte auf 998x225 in derselben Kachel und war
+    // damit auf halber Breite abgeschnitten.
+    const imFenster = alle.filter((p) => p.windowId === fenster).length;
+    const ausDiesemFenster = new Set(paneIds.filter((x) => fensterVon.get(x) === fenster));
+    const lage = await fensterAufKachel(id, spalten, zeilen, imFenster, flaecheJetzt, ausDiesemFenster);
     fensterLage.set(fenster, { cols: lage.cols, rows: lage.rows, panes: lage.panes.length });
     for (const b of lage.panes) kaesten.set(b.paneId, b);
   }
@@ -1947,10 +2395,18 @@ async function tabZeigen(paneIds: string[]): Promise<void> {
    */
   const fensterDerGezeigten = new Set(gezeigt.map((p) => fensterVon.get(p.paneId) ?? ''));
   let raster: { cols: number; rows: number } | undefined;
+  // DER TEILFALL, und er ist seit dem 19.08. nicht mehr der Rueckfall auf ein
+  // gleichmaessiges Gitter: liegen alle gezeigten Panes in EINEM Fenster, das
+  // aber MEHR Panes hat (Layout 'split' -- die Vorgabe --, wo der Orchestrator
+  // im selben Fenster sitzt), dann ist die Aufteilung von tmux immer noch die
+  // Wahrheit; es fehlen nur Zellen dazwischen. Die Buehne schiebt sie zusammen
+  // (kachelnAusTeilraster) statt die Groessen zu erfinden.
+  let rasterTeil: { cols: number; rows: number } | undefined;
   if (fensterDerGezeigten.size === 1 && fehlend.length === 0) {
     const lage = fensterLage.get([...fensterDerGezeigten][0]);
-    if (lage && lage.panes === gezeigt.length && lage.cols > 0 && lage.rows > 0) {
-      raster = { cols: lage.cols, rows: lage.rows };
+    if (lage && lage.cols > 0 && lage.rows > 0) {
+      if (lage.panes === gezeigt.length) raster = { cols: lage.cols, rows: lage.rows };
+      else rasterTeil = { cols: lage.cols, rows: lage.rows };
     }
   }
 
@@ -1983,6 +2439,7 @@ async function tabZeigen(paneIds: string[]): Promise<void> {
       maus,
       spalten,
       raster,
+      rasterTeil,
       fehlend,
     });
   } finally {
@@ -2019,17 +2476,39 @@ async function tabZeigen(paneIds: string[]): Promise<void> {
  */
 async function fensterAufKachel(
   paneId: string,
-  zellCols: number,
-  zellRows: number,
   gitterSpalten: number,
   gitterZeilen: number,
+  panesImFenster: number,
+  flaecheJetzt: { cols: number; rows: number },
+  gezeigteIds: Set<string>,
 ): Promise<{ cols: number; rows: number; panes: { paneId: string; x: number; y: number; cols: number; rows: number }[] }> {
   const leer = { cols: 0, rows: 0, panes: [] };
   if (!tmux) return leer;
   // 'owned' ist die Zusage aus F14 selbst. `sizeIgnored` waere die falsche
   // Frage: es sagt nur, ob `refresh-client -f ignore-size` gegriffen hat, und
   // auf einem aelteren tmux ist es auch bei einer fremden Session falsch.
-  if (!darfUmraeumen()) {
+  //
+  // GROESSE UND AUFTEILUNG SIND ZWEI FRAGEN (20.08.). Bis heute hingen sie an
+  // derselben Erlaubnis, und das war der Fehler hinter „das leere untere
+  // Viertel": F14 schuetzt die AUFTEILUNG einer fremden Session -- ein
+  // `select-layout` schoebe dem Menschen davor die Panes unter den Haenden
+  // herum. Die GROESSE des Fensters setzt dieses Programm dagegen auch bei
+  // einer fremden Session schon lange, im Pane-Weg (`fensterNachziehen`), und
+  // stellt sie beim Abloesen zurueck. Nur der Tab-Weg liess sie mit der
+  // Aufteilung zusammen weg -- und weil eine Werkbank-Sitzung KEIN
+  // `@awb_owner` traegt (das setzt nur die Chat-Werkstatt) und an des Nutzers
+  // Sitzung immer sein Terminal haengt, war das der Normalfall und nicht die
+  // Ausnahme. GEMESSEN am 20.08. auf eigenem Socket, drei Worker im Tab,
+  // Buehne 1002x638: das Fenster blieb bei 80x24 und die Panes bei 40x24,
+  // 39x12 und 39x11 -- genau Bild des Nutzers.
+  //
+  // Also wird die Groesse jetzt in BEIDEN Faellen gesetzt und nur das
+  // Umraeumen bleibt an der Erlaubnis. Ohne eine Flaeche VON DER BUEHNE bleibt
+  // es beim blossen Lesen: `flaecheJetzt` faellt sonst auf ownedCols/ownedRows
+  // zurueck, und die Vorgabe aus der Konfiguration in ein fremdes Fenster zu
+  // schreiben ist genau der Umbruch ohne Zweck, den der 17.08. entfernt hat.
+  const umraeumen = darfUmraeumen();
+  if (!umraeumen && !flaeche) {
     const nur = await tmux.leseFensterLage(paneId).catch(() => null);
     return nur ?? leer;
   }
@@ -2037,11 +2516,88 @@ async function fensterAufKachel(
   // derselben Form auf, die die Buehne legt: eine Spalte untereinander, eine
   // Zeile nebeneinander, sonst gekachelt. Beides muss zusammenpassen, sonst
   // ist der Inhalt breiter als seine Kachel und wird abgeschnitten.
-  const aufteilung = gitterSpalten === 1 ? 'even-vertical' : gitterZeilen === 1 ? 'even-horizontal' : 'tiled';
-  const cols = gitterSpalten * zellCols + (gitterSpalten - 1);
-  const rows = gitterZeilen * zellRows + (gitterZeilen - 1);
-  const gitter = await tmux.fitWindow(paneId, cols, rows, aufteilung, true).catch(() => null);
-  return gitter ?? leer;
+  // Das Fenster bekommt Platz fuer SEINE Panes, in derselben Kachelgroesse, die
+  // der Tab legt. Zeigt der Tab alle Panes des Fensters, ist das genau das
+  // Raster des Tabs; traegt das Fenster mehr (Layout 'split': der Orchestrator
+  // sitzt mit darin), wird es entsprechend groesser -- und jeder einzelne Pane
+  // behaelt trotzdem die Groesse einer Kachel.
+  // Die Form richtet sich nach den Panes, die DIESES Fenster traegt: eine
+  // Spalte untereinander, eine Reihe nebeneinander, sonst gekachelt. Alles
+  // andere waehlt `tiled` selbst -- erzwingen laesst sich nur der erste und der
+  // zweite Fall.
+  const eigen =
+    gitterSpalten === 1
+      ? { spalten: 1, zeilen: Math.max(1, panesImFenster) }
+      : gitterZeilen === 1
+        ? { spalten: Math.max(1, panesImFenster), zeilen: 1 }
+        : tiledRaster(panesImFenster);
+  const aufteilung = eigen.spalten === 1 ? 'even-vertical' : eigen.zeilen === 1 ? 'even-horizontal' : 'tiled';
+  // DAS FENSTER BEKOMMT DIE FLAECHE DER BUEHNE. Nicht mehr, nicht weniger.
+  //
+  // Vorher wurde eine Kachelgroesse ausgerechnet und mit der Zahl der Spalten
+  // und Reihen wieder multipliziert, samt Trennlinien obendrauf. Das ist
+  // zweimal gerundet und lag beides Male daneben: mal war das Fenster groesser
+  // als die Buehne (gemessen am 19.08. kopflos: 43 Zeilen fuer eine Buehne von
+  // 42, die unterste Zeile der unteren Panes war ab), mal um den weggeworfenen
+  // Rest kleiner (ein schwarzer Streifen am Rand).
+  //
+  // Die Flaeche unmittelbar zu nehmen ist genauer und zugleich sicher: tmux
+  // verteilt den Rest selbst (66|67 statt 66|66), und weil die Buehne ihre
+  // Zellenzahl aus derselben Flaeche ABRUNDET, ist eine Kachel nie schmaler als
+  // ihr Inhalt. Traegt das Fenster mehr Panes, als der Tab zeigt (Layout
+  // 'split'), werden sie eben kleiner -- die Buehne schiebt sie dann zusammen
+  // (kachelnAusTeilraster), und lieber ein schwarzer Rand als abgeschnittener
+  // Text.
+  const cols = flaecheJetzt.cols;
+  const rows = flaecheJetzt.rows;
+  const gitter = await tmux.fitWindow(paneId, cols, rows, aufteilung, umraeumen).catch(() => null);
+  if (!gitter) return leer;
+
+  /**
+   * ZEIGT DER TAB NUR EINEN TEIL DES FENSTERS, WIRD DAS FENSTER GROESSER.
+   *
+   * DER BEFUND (alice, 19.08., Bildschirmfoto Fehler8.png): Der zweite
+   * Worker-Tab mit EINEM Worker darin zeichnete oben vier Zeilen und darunter
+   * zwei Drittel Schwarz -- keine Fusszeile, kein Kontextbalken. Der Grund war
+   * nicht die Kachel, sondern der Pane: sein Fenster trug Orchestrator und
+   * sieben Worker, es bekam die Groesse der Buehne (57 Zeilen), und
+   * `even-vertical` teilte die unter allen acht auf. Der gezeigte Worker stand
+   * damit auf SECHS Zeilen und wurde in eine Kachel von 57 gezeichnet. Der
+   * erste Tab hatte denselben Fehler in kleinerer Form: sechs von acht Panes,
+   * jeder ein Drittel schmaler als seine Kachel.
+   *
+   * Also wird das Fenster so gross gestellt, dass die GEZEIGTEN Panes zusammen
+   * die Buehne fuellen. `R`/`C` ist das Raster des Fensters, `Kr`/`Kc` sind die
+   * Reihen und die dichteste Reihe unter den gezeigten Panes -- der Rest ist
+   * ein Dreisatz. Genommen wird die DICHTESTE Reihe, nie die duennste: sonst
+   * liefe die dichteste ueber ihre Kacheln hinaus, und abgeschnittener Text ist
+   * schlimmer als ein schwarzer Rand.
+   *
+   * Ein zweiter Durchgang, kein Kreis: das Ziel folgt allein aus dem Raster und
+   * der Buehne, nicht aus einer Messung des eingestellten Zustands -- steht das
+   * Fenster schon richtig, wird nichts geschrieben.
+   */
+  const gezeigteBoxen = gitter.panes.filter((p) => gezeigteIds.has(p.paneId));
+  if (gezeigteBoxen.length && gezeigteBoxen.length < gitter.panes.length) {
+    const R = new Set(gitter.panes.map((p) => p.y)).size;
+    const C = new Set(gitter.panes.map((p) => p.x)).size;
+    const reihen = new Set(gezeigteBoxen.map((p) => p.y));
+    const Kr = reihen.size;
+    const Kc = Math.max(...[...reihen].map((y) => gezeigteBoxen.filter((p) => p.y === y).length));
+    // Ist die dichteste gezeigte Reihe schon so dicht wie das Raster, bleibt es
+    // bei der Flaeche der Buehne -- die Trennlinien dazuzurechnen machte das
+    // Fenster dann um genau sie zu gross, und ein Pane, den tmux ueber die
+    // ganze Reihe zieht, liefe um diese Zellen ueber seine Kachel hinaus
+    // (gemessen: 1005 gegen 1002 Bildpunkte bei vier Workern, 675 gegen 501 bei
+    // sieben).
+    const neuCols = Kc >= C ? flaecheJetzt.cols : Math.floor((C * flaecheJetzt.cols) / Kc) + (C - 1);
+    const neuRows = Kr >= R ? flaecheJetzt.rows : Math.floor((R * flaecheJetzt.rows) / Kr) + (R - 1);
+    if (neuCols !== gitter.cols || neuRows !== gitter.rows) {
+      const zweiter = await tmux.fitWindow(paneId, neuCols, neuRows, aufteilung, umraeumen).catch(() => null);
+      if (zweiter) return zweiter;
+    }
+  }
+  return gitter;
 }
 
 /**
@@ -2066,6 +2622,25 @@ async function fensterAufKachel(
 const ABKLINGZEIT_MS = 750;
 let zuletztGezeichnet = 0;
 let gleichtAb = false;
+
+/**
+ * Worker-Panes der gezeigten Sitzung, die in der laufenden Tab-Ansicht (noch)
+ * nicht vorkommen -- der Fall „ein Worker kommt dazu, waehrend man zusieht".
+ *
+ * Leer, sobald die Sitzung mehr als EINEN Tab hat: welcher Worker in welchen
+ * Tab faellt, entscheidet die Leiste rechts, und diese Regel gehoert genau
+ * einmal ins Programm.
+ */
+function neueWorkerPanes(): string[] {
+  if (ansicht.art !== 'tab') return [];
+  if (kapazitaet().tabs > 1) return [];
+  const s = gewaehlte();
+  if (!s) return [];
+  const drin = new Set(ansicht.panes);
+  return s.workers
+    .filter((w) => w.alive && w.paneId && !drin.has(w.paneId))
+    .map((w) => w.paneId);
+}
 async function lageAbgleichen(): Promise<void> {
   if (!tmux || !gezeichneteLage.length || gleichtAb) return;
   if (Date.now() - zuletztGezeichnet < ABKLINGZEIT_MS) {
@@ -2080,7 +2655,43 @@ async function lageAbgleichen(): Promise<void> {
       const s = stand.get(p.paneId);
       return !!s && s !== `${p.cols}x${p.rows}`;
     });
-    if (!anders) return;
+    // ZWEITER ANLASS (19.08.): die ANZAHL hat sich geaendert. Bis heute stand
+    // hier nur die Frage nach der GROESSE, und `!!s &&` liess einen Pane, den
+    // es nicht mehr gibt, ausdruecklich durchgehen. Die Folge war am Bild
+    // gemessen: schliesst man einen von fuenf Workern, behielt der tote Pane
+    // seine Kachel ueber die volle Breite, und die uebrigen vier blieben im
+    // alten Zwei-mal-Zwei darueber stehen -- bis jemand den Tab neu oeffnete.
+    //
+    // Die Kachel MIT GRUND bleibt, wofuer sie gedacht ist: der Pane fehlte
+    // schon, als der Tab geoeffnet wurde ("ein Worker, der ohne ein Wort
+    // verschwindet, ist schlimmer als einer, der schlecht sitzt"). Verschwindet
+    // er, WAEHREND man zusieht, folgt die Ansicht -- dass er weg ist, sagt die
+    // Leiste rechts, die ihn dann unter "Fertig" fuehrt.
+    const verschwunden = ansicht.art === 'tab'
+      ? ansicht.panes.filter((id) => !stand.has(id))
+      : [];
+    if (verschwunden.length && ansicht.art === 'tab') {
+      const bleibt = ansicht.panes.filter((id) => stand.has(id));
+      // Bleibt keiner uebrig, wird nichts umgeschrieben: dann ist die Ansicht
+      // als Ganzes gegenstandslos, und die Kacheln mit Grund sind das einzige,
+      // was ueberhaupt noch etwas sagt.
+      if (bleibt.length) ansicht = { art: 'tab', panes: bleibt };
+    }
+    // DIE GEGENRICHTUNG: ein Worker kommt DAZU. tmux teilt sein Fenster dann
+    // neu auf, `anders` schlaegt also an -- aber die Ansicht kennt den neuen
+    // Pane nicht, und die Buehne legte N Kacheln fuer N+1 Panes. Genau das ist
+    // dieselbe Luecke wie beim Spiegel, nur zeitlich statt raeumlich.
+    //
+    // ERGAENZT WIRD NUR BEI EINEM EINZIGEN TAB. Wie die Worker auf mehrere
+    // Tabs fallen, entscheidet die Leiste rechts (renderer.ts, `imTab`); diese
+    // Regel hier ein zweites Mal zu schreiben hiesse, zwei Wahrheiten zu
+    // fuehren, von denen eine irgendwann die falsche ist. Bei einem Tab gibt es
+    // nichts zu entscheiden: er zeigt alle.
+    const dazu = neueWorkerPanes();
+    if (dazu.length && ansicht.art === 'tab') {
+      ansicht = { art: 'tab', panes: [...ansicht.panes, ...dazu] };
+    }
+    if (!anders && !verschwunden.length && !dazu.length) return;
     await ansichtZeichnen();
   } catch (e) {
     process.stderr.write(`Aufteilung nicht nachgezogen: ${(e as Error).message}\n`);
@@ -2430,7 +3041,7 @@ ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) =
           process.stderr.write('plan-ausfuehren ohne offenen Plan — abgelehnt\n');
           break;
         }
-        const ergebnis = fuehreAus(letzterPlan, befehlsUmgebung());
+        const ergebnis = await fuehreAus(letzterPlan, befehlsUmgebung());
         letzterAusgang = { plan: letzterPlan, ...ergebnis };
         process.stderr.write(`Plan '${letzterPlan.command}' ausgefuehrt: ok=${ergebnis.ok} ${ergebnis.ausgabe}\n`);
         win?.webContents.send('awb:plan-ergebnis', letzterAusgang);
@@ -2652,6 +3263,24 @@ function maschinePruefen(name: string): Promise<{ ok: boolean; ausgabe: string }
 ipcMain.handle('awb:ein-daten', () => einstellungenDatenJetzt());
 
 /**
+ * DIE KONTEXTSTUFEN EINES LOKALEN MODELLS -- ein Kanal fuer ZWEI Fenster
+ * (Einstellungen und Erststart), weil beide dieselbe Frage stellen.
+ *
+ * WARUM NICHT IN `einstellungenDatenJetzt()`. Die Frage haengt am GEWAEHLTEN
+ * Modell, und lokal sind heute 220 der 266 Orchestrator-Modelle -- sie alle
+ * vorab zu messen waeren 220 Aufrufe fuer eine Zahl, die nur eine einzige
+ * Zeile braucht. Im Erststart kommt dazu, dass die Wahl im Fenster selbst
+ * umspringt: dort gibt es die Antwort erst, wenn jemand geklickt hat.
+ *
+ * Der Aufruf misst den FREIEN Speicher und ist deshalb nicht auf Vorrat
+ * haltbar -- wer ihn stellt, will den Stand von jetzt. Er wird darum bei jedem
+ * neuen Datenstand des Fensters wiederholt und sonst nicht.
+ */
+const wbKontextBin = process.env.AWB_WB_KONTEXT ?? 'wb-kontext';
+ipcMain.handle('awb:kontext-stufen', (_e, modellId: string) =>
+  kontextStufen(wbKontextBin, String(modellId ?? '')));
+
+/**
  * DER SCHREIBWEG DES FENSTERS -- und es ist derselbe wie ueberall sonst:
  * `plane()` erzeugt den Aufruf, `fuehreAus()` fuehrt ihn aus, also
  * `wb-state settings set`. Der Umweg ueber die Rueckfrage entfaellt hier
@@ -2661,13 +3290,13 @@ ipcMain.handle('awb:ein-daten', () => einstellungenDatenJetzt());
  * in der Fusszeile, samt Aufruf. Der eine Schalter, der trotzdem fragt
  * (contextGuardAutostart), fragt im Fenster selbst, vor dem Absenden.
  */
-ipcMain.handle('awb:ein-setzen', (_e, key: string, value: unknown) => {
+ipcMain.handle('awb:ein-setzen', async (_e, key: string, value: unknown) => {
   const plan = plane({ command: 'set', key, value }, befehlsUmgebung());
   const aufruf = (plan.aufruf ?? []).join(' ');
   if (plan.art !== 'bestaetigen') {
     return { ok: false, ausgabe: plan.grund ?? `abgelehnt (${plan.art})`, aufruf };
   }
-  const ergebnis = fuehreAus(plan, befehlsUmgebung());
+  const ergebnis = await fuehreAus(plan, befehlsUmgebung());
   process.stderr.write(`Einstellung '${key}': ok=${ergebnis.ok} ${ergebnis.ausgabe}\n`);
   // Die offene Seite im Hauptfenster zieht nach, falls sie dieselbe Datei zeigt.
   if (seiteOffen) win?.webContents.send('awb:seite', { name: seiteOffen });
@@ -2689,7 +3318,7 @@ ipcMain.handle('awb:ein-setzen', (_e, key: string, value: unknown) => {
  * lockert, muss ein Mensch sein. Beides prueft `wb-state`, nicht dieses
  * Fenster; hier wird nur der Aufruf gebaut und ausgefuehrt.
  */
-ipcMain.handle('awb:ein-werkzeug', (_e, nachricht: Record<string, unknown>, echt: boolean) => {
+ipcMain.handle('awb:ein-werkzeug', async (_e, nachricht: Record<string, unknown>, echt: boolean) => {
   const plan = plane(nachricht, befehlsUmgebung());
   const aufruf = (plan.aufruf ?? []).join(' ');
   if (plan.art !== 'bestaetigen') {
@@ -2698,7 +3327,7 @@ ipcMain.handle('awb:ein-werkzeug', (_e, nachricht: Record<string, unknown>, echt
   // `echt` kommt aus `isTrusted` im Fenster und wird hier NICHT nachgebessert:
   // was ohne echten Klick hereinkommt, laeuft ohne Menschen-Merkmal, und
   // `wb-state` weist es mit seiner eigenen Meldung ab.
-  const ergebnis = fuehreAus(plan, befehlsUmgebung(), echt === true);
+  const ergebnis = await fuehreAus(plan, befehlsUmgebung(), echt === true);
   process.stderr.write(
     `Werkzeug '${String(nachricht.command ?? '')}' (echter Klick: ${echt === true}): `
     + `ok=${ergebnis.ok} ${ergebnis.ausgabe}\n`,
@@ -2885,7 +3514,12 @@ ipcMain.handle('awb:erststart-daten', () => {
     maschinen: d.maschinen,
     sprache: d.sprache,
     harnesses: d.harnesses.map((h) => ({ id: h.id, label: h.label, startbar: h.binaer })),
-    orchestratorModelle: d.orchestratorModelle.map((m) => ({ id: m.id, label: m.label, harness: m.harness })),
+    // `lokal` faehrt mit, weil der dritte Schritt danach entscheidet, ob unter
+    // der Modellwahl das Feld "Kontextfenster" erscheint. Die Stufen selbst
+    // kommen erst auf Klick ueber `awb:kontext-stufen` -- siehe dort.
+    orchestratorModelle: d.orchestratorModelle.map((m) => ({
+      id: m.id, label: m.label, harness: m.harness, lokal: m.lokal,
+    })),
     anmeldung: d.anmeldung,
     settings: {
       defaultWorkerMachine: String(d.settings.defaultWorkerMachine ?? ''),
@@ -2900,10 +3534,10 @@ ipcMain.handle('awb:erststart-daten', () => {
   };
 });
 
-ipcMain.handle('awb:erststart-setzen', (_e, key: string, value: unknown) => {
+ipcMain.handle('awb:erststart-setzen', async (_e, key: string, value: unknown) => {
   const plan = plane({ command: 'set', key, value }, befehlsUmgebung());
   if (plan.art !== 'bestaetigen') return { ok: false, ausgabe: plan.grund ?? `abgelehnt (${plan.art})` };
-  const ergebnis = fuehreAus(plan, befehlsUmgebung());
+  const ergebnis = await fuehreAus(plan, befehlsUmgebung());
   process.stderr.write(`Erststart '${key}': ok=${ergebnis.ok} ${ergebnis.ausgabe}\n`);
   return ergebnis;
 });
@@ -3323,7 +3957,7 @@ async function menuePunktAusfuehren(
   // dastehen. Gemerkt VOR dem Aufruf; danach ist die Session weg und die Frage
   // nicht mehr zu beantworten.
   const gezeichnet = !!s.tmuxSession && attachState?.session === s.tmuxSession;
-  const ergebnis = fuehreAus(plan, befehlsUmgebung());
+  const ergebnis = await fuehreAus(plan, befehlsUmgebung());
   process.stderr.write(`Menue '${punkt}' auf '${s.name}': ok=${ergebnis.ok} ${ergebnis.ausgabe}\n`);
   // Die Lage hat sich geaendert: Leiste und Sitzungsfenster ziehen nach.
   sessions = modellLesen();
@@ -3443,7 +4077,7 @@ ipcMain.on('awb:sitzung-menue', (_e, n: { id: string; echt: boolean }) => {
  * Steuerkanal. EINE Fassung fuer beide Wege, damit ein Test denselben Weg
  * prueft, den ein Mensch geht.
  */
-function sitzungUmbenennen(id: string, name: string): { ok: boolean; meldung: string; aufruf: string } {
+async function sitzungUmbenennen(id: string, name: string): Promise<{ ok: boolean; meldung: string; aufruf: string }> {
   // EINE CHAT-SITZUNG WIRD IN IHRER EIGENEN BUCHFUEHRUNG UMBENANNT (Luecke 5b).
   // `wb-state` kennt sie nicht -- sie hat weder tmux-Namen noch Zustandsdatei
   // --, und ein Aufruf dorthin liefe ins Leere und meldete trotzdem Erfolg.
@@ -3475,7 +4109,7 @@ function sitzungUmbenennen(id: string, name: string): { ok: boolean; meldung: st
     process.stderr.write(`Umbenennen abgelehnt: ${plan.grund ?? plan.art}\n`);
     return { ok: false, meldung: plan.grund ?? `abgelehnt (${plan.art})`, aufruf };
   }
-  const ergebnis = fuehreAus(plan, befehlsUmgebung());
+  const ergebnis = await fuehreAus(plan, befehlsUmgebung());
   process.stderr.write(`Umbenennen '${s.name}' -> '${name}': ok=${ergebnis.ok} ${ergebnis.ausgabe}\n`);
   sessions = modellLesen();
   modellSenden();
@@ -3567,6 +4201,90 @@ ipcMain.handle('awb:sitz-neu', async (_e, name: string, machine: string, fernPfa
     process.stderr.write(`Sitzungsfenster: neu in '${pfad}' (${ziel}) abgelehnt -- ${meldung}\n`);
     return { ok: false, meldung, command: '' };
   }
+});
+
+/**
+ * DER DRITTE KNOPF: „Modell für diese Sitzung wählen …" (19.08.).
+ *
+ * Er tut GENAU DASSELBE wie `awb:sitz-neu` -- derselbe Ordnerdialog, dieselbe
+ * Maschinenwahl, dieselbe `sessionAnlegen` -- und reicht nur eine Wahl mit
+ * durch. Kein zweiter Startweg: zwei Wege, die eine Sitzung anlegen, wären
+ * zwei Stellen, an denen die Ausschlussliste, der Doppelklick-Schutz und die
+ * Schlüsselvergabe auseinanderlaufen können.
+ */
+ipcMain.handle(
+  'awb:sitz-neu-wahl',
+  async (_e, name: string, machine: string, fernPfad: string, wahl: SitzungsWahl, echt: boolean) => {
+    const ziel = String(machine ?? '').trim() || config.machine;
+    let pfad: string;
+    if (ziel !== config.machine) {
+      pfad = String(fernPfad ?? '').trim();
+      if (!pfad) {
+        return { ok: false, meldung: `Erst einen Ordner auf '${ziel}' eintragen.`, command: '' };
+      }
+    } else {
+      const w = await ordnerDialog(echt === true);
+      if (!w.pfad) {
+        process.stderr.write(`Sitzungsfenster: Ordnerwahl ohne Ergebnis -- ${w.grund}\n`);
+        return { ok: false, meldung: w.grund, command: '' };
+      }
+      pfad = w.pfad;
+    }
+    const gewaehlt: SitzungsWahl = {
+      harness: String(wahl?.harness ?? ''),
+      model: String(wahl?.model ?? ''),
+      effort: String(wahl?.effort ?? ''),
+      kontext: Number(wahl?.kontext ?? 0),
+    };
+    try {
+      const r = sessionAnlegen(pfad, String(name ?? ''), ziel, gewaehlt);
+      process.stderr.write(
+        `Sitzungsfenster: neu MIT WAHL in '${pfad}' (${ziel}) -- gestartet=${r.gestartet} ${r.command}\n`,
+      );
+      if (r.gestartet) nachStartNachlesen();
+      return { ok: r.gestartet, meldung: r.meldung, command: r.command };
+    } catch (e) {
+      const meldung = (e as Error).message;
+      process.stderr.write(`Sitzungsfenster: neu MIT WAHL in '${pfad}' (${ziel}) abgelehnt -- ${meldung}\n`);
+      return { ok: false, meldung, command: '' };
+    }
+  },
+);
+
+/**
+ * WAS ZUR WAHL STEHT -- Programme, Modelle und Denkstufen, und was heute in den
+ * Einstellungen steht.
+ *
+ * AUF ABRUF UND NICHT IM DATENSTAND: `sitzungsDatenJetzt()` läuft bei jeder
+ * Änderung an den Sitzungen; `einstellungenDatenJetzt()` dagegen ruft mehrfach
+ * `wb-state` auf. Beides zusammenzulegen hieße, diese Aufrufe an den Takt der
+ * Sitzungsliste zu hängen. Dieser Kanal wird genau einmal befragt: wenn ein
+ * Mensch die Wahl aufklappt.
+ *
+ * Es ist eine reine Projektion von `einstellungenDatenJetzt()` -- dieselbe
+ * Quelle wie im Einstellungsfenster und im Erststart, damit es über Modelle,
+ * Programme und Stufen genau EINE Auskunft gibt.
+ */
+ipcMain.handle('awb:sitz-wahl-daten', () => {
+  const d = einstellungenDatenJetzt() as EinstellungsDaten;
+  return {
+    harnesses: d.harnesses.map((h) => ({ id: h.id, label: h.label, binaer: h.binaer })),
+    modelle: d.orchestratorModelle.map((m) => ({
+      id: m.id,
+      label: m.label,
+      harness: m.harness,
+      harnessLabel: m.harnessLabel,
+      lokal: m.lokal,
+      startbar: m.startbar,
+    })),
+    harnessStufen: d.harnessStufen,
+    einstellung: {
+      harness: String(d.settings.orchestratorHarness ?? d.vorgaben.orchestratorHarness ?? ''),
+      model: String(d.settings.orchestratorModel ?? d.vorgaben.orchestratorModel ?? ''),
+      effort: String(d.settings.orchestratorEffort ?? d.vorgaben.orchestratorEffort ?? ''),
+      kontext: Number(d.settings.orchestratorKontext ?? 0),
+    },
+  };
 });
 
 /**
@@ -3932,7 +4650,13 @@ function steuerkanalDarfSchreiben(paneId: string, was: string): void {
   const seit = darfGedaechtnis.get(schluessel);
   if (seit !== undefined && Date.now() - seit < DARF_GEDAECHTNIS_MS) return;
   if (seit !== undefined) darfGedaechtnis.delete(schluessel);
-  const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8' });
+  // FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden): dieser Aufruf
+  // steht vor JEDEM Tippen in einen Pane -- ohne Grenze haette ein haengendes
+  // wb-pane-write (oertlich) oder eine tote Fernmaschine (ssh) den gesamten
+  // Hauptprozess angehalten, nicht nur diesen einen Tastendruck. Dieselbe
+  // Grenze wie bei den anderen machinenabhaengigen Aufrufen dieser Datei
+  // (config.remoteTimeoutMs + 2000 fuer eine Fernmaschine, sonst 2s oertlich).
+  const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', timeout: attachMaschine ? config.remoteTimeoutMs + 2000 : 2000 });
   if (r.status === 0) {
     darfGedaechtnis.set(schluessel, Date.now());
     return;
@@ -4400,12 +5124,12 @@ async function handle(req: ControlRequest): Promise<unknown> {
       sessions = modellLesen();
       const kennung = String(req.session ?? '');
       if (istChat(kennung)) {
-        const r = sitzungUmbenennen(kennung, String(req.name ?? ''));
+        const r = await sitzungUmbenennen(kennung, String(req.name ?? ''));
         return { session: kennung, gelungen: r.ok, meldung: r.meldung, aufruf: r.aufruf };
       }
       const s = sessions.find((x) => x.id === kennung || x.name === kennung || x.tmuxSession === kennung);
       if (!s) throw new Error(`keine Session '${kennung}'`);
-      const r = sitzungUmbenennen(s.id, String(req.name ?? ''));
+      const r = await sitzungUmbenennen(s.id, String(req.name ?? ''));
       // `gelungen` statt `ok` -- siehe 'sitzung-menue-punkt'.
       return { session: s.id, gelungen: r.ok, meldung: r.meldung, aufruf: r.aufruf };
     }
@@ -4633,7 +5357,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
       if (!letzterPlan || letzterPlan.art !== 'bestaetigen') {
         throw new Error('kein Plan steht zur Bestaetigung');
       }
-      const ergebnis = fuehreAus(letzterPlan, befehlsUmgebung());
+      const ergebnis = await fuehreAus(letzterPlan, befehlsUmgebung());
       letzterAusgang = { plan: letzterPlan, ...ergebnis };
       win?.webContents.send('awb:plan-ergebnis', letzterAusgang);
       sessions = modellLesen();
@@ -4753,8 +5477,13 @@ async function handle(req: ControlRequest): Promise<unknown> {
       if (!deltas.length) throw new Error('Feld deltas fehlt');
       const modus = Number(req.modus ?? 0);
       const zeilen = Number(req.zeilen ?? 40);
+      // zellhoehe darf vorgegeben werden (awb-ctl radmass <weg> [modus] [zeilen]
+      // [zellhoehe]), damit die Rechenprobe nicht an der Schrift haengt, mit der
+      // das Fenster gerade zeichnet -- sonst fiel sie hier auf dem Weg zur Bruecke
+      // still weg und der Renderer massass gegen die ECHTE Zellhoehe.
+      const zellhoehe = req.zellhoehe !== undefined ? Number(req.zellhoehe) : undefined;
       const mass = await win.webContents.executeJavaScript(
-        `window.__awb.radmass(${JSON.stringify({ deltas, modus, zeilen })})`,
+        `window.__awb.radmass(${JSON.stringify({ deltas, modus, zeilen, zellhoehe })})`,
       );
       return { deltas, modus, mass };
     }
@@ -5152,7 +5881,9 @@ async function handle(req: ControlRequest): Promise<unknown> {
       const grund = String(req.reason ?? '');
       if (!pfad) throw new Error('Feld path fehlt');
       if (aktion !== 'approve' && aktion !== 'reject') throw new Error("Feld action muss 'approve' oder 'reject' sein");
-      if (!grund) throw new Error('Feld reason fehlt (ein Satz Begruendung)');
+      // `reason` ist FREIWILLIG (19.08.) -- derselbe Schritt wie im Fenster und
+      // in `wb-decide`. Ein fehlendes Feld ist hier kein Fehler mehr, sondern
+      // eine leere Begruendung.
       const ergebnis = decideRequest(config.requestsDir, pfad, aktion, grund, config.wbDecideBin);
       freigabenAktualisieren();
       return ergebnis;
@@ -5164,7 +5895,8 @@ async function handle(req: ControlRequest): Promise<unknown> {
       const grund = String(req.reason ?? '');
       if (!s) throw new Error('Feld schluessel fehlt');
       if (aktion !== 'approve' && aktion !== 'reject') throw new Error("Feld action muss 'approve' oder 'reject' sein");
-      if (!grund) throw new Error('Feld reason fehlt (ein Satz Begruendung)');
+      // `reason` ist auch hier freiwillig (19.08.). An der Herkunft aendert das
+      // nichts -- die naechsten Zeilen sind unberuehrt.
       // Ueber den Steuerkanal kommt KEIN gemessener Mensch: `musterEntscheiden`
       // bekommt deshalb kein `mensch`, und ein Annehmen endet hier mit einer
       // Absage. Sie wird geworfen statt zurueckgegeben, damit der Aufrufer den
@@ -5338,9 +6070,106 @@ function sitzungBeenden(sitzung: string): void {
     return;
   }
   const args = config.tmuxSocket ? ['-L', config.tmuxSocket] : [];
-  const r = spawnSync('tmux', [...args, 'kill-session', '-t', `=${sitzung}`], { encoding: 'utf8' });
+  // FRIST (2026-08-20): derselbe Fehler wie der, der am selben Tag das
+  // Beenden ueber before-quit/will-quit haengen liess (zustandZurueckSync()
+  // in tmux.ts) -- dieser Aufruf sitzt auf demselben Beenden-Weg
+  // (shutdown() -> schlussUrteil() -> sitzungBeenden()), nur oertlich, ohne
+  // Maschine. 2s wie zustandZurueckSync()s oertlicher Zweig.
+  const r = spawnSync('tmux', [...args, 'kill-session', '-t', `=${sitzung}`], { encoding: 'utf8', timeout: 2000 });
   if (r.status === 0) process.stderr.write(`Sitzung '${sitzung}' mit dem Fenster beendet.\n`);
-  else process.stderr.write(`Sitzung '${sitzung}' nicht beendet: ${(r.stderr || '').trim()}\n`);
+  else process.stderr.write(`Sitzung '${sitzung}' nicht beendet: ${r.signal ? 'nach 2000ms abgebrochen' : (r.stderr || '').trim()}\n`);
+}
+
+/**
+ * Ein Schritt beim Beenden bekommt eine Frist (Betriebsbefund 2026-08-20): laeuft
+ * er nicht in `ms` durch, wird er uebersprungen, der Grund geht ins Protokoll, und
+ * das Beenden macht mit dem naechsten Schritt weiter -- kein Schritt haelt den
+ * ganzen Ausstieg unbegrenzt auf. Loest `versprechen` ab, bevor die Frist um ist,
+ * verhaelt sich diese Funktion wie ein blosses `await` (ein Fehlschlag geht
+ * unveraendert an den Aufrufer durch, dessen eigenes try/catch bleibt zustaendig).
+ * Eine SPAETE Ablehnung, die erst nach dem Ueberspringen eintrifft, bekommt hier
+ * einen No-op-Faenger -- sonst waere sie eine unbehandelte Ausnahme mitten im
+ * Beenden und loeste den eigenen uncaughtException-Riegel aus.
+ */
+async function mitFrist(versprechen: Promise<void>, ms: number, name: string): Promise<void> {
+  let zeitAbgelaufen = false;
+  const uhr = new Promise<void>((resolve) => {
+    setTimeout(() => { zeitAbgelaufen = true; resolve(); }, ms);
+  });
+  await Promise.race([versprechen, uhr]);
+  if (zeitAbgelaufen) {
+    process.stderr.write(`Beenden: Schritt '${name}' antwortete nicht in ${ms}ms -- uebersprungen, weiter mit dem naechsten Schritt.\n`);
+    versprechen.catch(() => {});
+  }
+}
+
+/**
+ * DER NOTAUSGANG (2026-08-21, Befund von peer).
+ *
+ * WAS GEMESSEN WURDE: Auf kopflosem Linux bleibt das Beenden nach dem
+ * Abloesen stehen. `detach()` und `zustandZurueck()` laufen bis zur letzten
+ * Zeile durch und melden „fertig" -- belegt mit Zeitstempeln aus dem echten,
+ * unveraenderten Lauf. Uebrig bleiben genau die letzten fuenf Zeilen dieser
+ * Funktion: vier `destroy()` und `app.exit()`. Ein frueherer /proc-Befund passt
+ * dazu: der Hauptthread stand in einem `write()` auf eine anonyme Pipe mit
+ * beiden Enden im selben Prozess -- Chromiums interne IPC, also genau dort, wo
+ * ein `destroy()` ansetzt.
+ *
+ * WARUM KEINE FRIST DAFUER TAUGT, und das ist der Kern: alle fuenf sind
+ * SYNCHRONE native Aufrufe. Eine blockierende native Operation laeuft
+ * ausserhalb des Ereignisloops, und kein `setTimeout` erreicht sie -- der
+ * Zeitgeber wuerde erst zuenden, wenn der Aufruf zurueckkommt, also genau dann,
+ * wenn man ihn nicht mehr braucht. `mitFrist()` weiter oben hilft hier nicht.
+ *
+ * Was einen blockierten Hauptthread noch erreicht, ist ein SIGNAL von aussen.
+ * Deshalb ein losgeloester Wachhund: er wartet, sieht nach, ob es diesen
+ * Prozess noch gibt, und beendet ihn hart. Er beendet sich danach selbst; es
+ * bleibt kein Prozess auf Vorrat stehen.
+ *
+ * ER PRUEFT, OB ER NOCH DENSELBEN TRIFFT. Eine PID wird wiederverwendet, und
+ * ein `kill -9` auf eine fremde, gleichnamige Nummer waere ein sehr teurer
+ * Fehler. Verglichen wird deshalb der `ps -o lstart=`-Wert, den er sich beim
+ * Start selbst merkt -- dieselbe Absicherung wie in `wb-nohup`. Passt er nicht
+ * mehr oder ist die PID weg, tut er nichts.
+ *
+ * DASS ER GEFEUERT HAT, DARF NICHT VERLORENGEHEN: stderr dieses Prozesses ist
+ * dann tot. Er hinterlaesst deshalb eine Zeile in `stateDir/notausgang.log` --
+ * daran ist nachher zu sehen, ob der geordnete Weg durchkam oder nicht.
+ *
+ * WAS DABEI KAPUTTGEHEN KANN: nichts. Nachgesehen statt angenommen. Die drei
+ * Kindfenster haengen nur einen `closed`-Empfaenger an, der ihre eigene
+ * Referenz auf null setzt; das Hauptfenster hat gar keinen Empfaenger. Was
+ * wirklich gespeichert wird, ist zu diesem Zeitpunkt laengst geschrieben:
+ * `UiStore.set()` schreibt bei JEDER Aenderung synchron (uistate.ts), die
+ * Zustandsdateien gehoeren `wb-state`, und die Lebensspur ist weiter oben in
+ * dieser Funktion abgeraeumt. Zwischen dem letzten Speichern und `app.exit()`
+ * steht nichts, was jemand vermissen wuerde. `destroy()` loest ausserdem gar
+ * kein `close`-Ereignis aus -- wer es benutzt, hat den geordneten Abbau
+ * bereits uebersprungen.
+ */
+function notausgangScharfstellen(ms: number): void {
+  const protokoll = join(config.stateDir, 'notausgang.log');
+  const pid = process.pid;
+  // Alles in EINEM Skript, ohne Werte von aussen: der Wachhund merkt sich den
+  // Startwert selbst, in dem Moment, in dem der Prozess sicher noch lebt.
+  const skript = [
+    `L0=$(ps -o lstart= -p ${pid} 2>/dev/null)`,
+    `sleep ${Math.max(1, Math.round(ms / 1000))}`,
+    `L1=$(ps -o lstart= -p ${pid} 2>/dev/null)`,
+    `[ -n "$L1" ] && [ "$L0" = "$L1" ] || exit 0`,
+    `echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) Notausgang: PID ${pid} hing nach dem Abbau der Fenster `
+      + `laenger als ${ms}ms -- hart beendet." >> '${protokoll.replace(/'/g, `'\\''`)}'`,
+    `kill -9 ${pid} 2>/dev/null`,
+  ].join('\n');
+  try {
+    mkdirSync(dirname(protokoll), { recursive: true });
+    const wache = spawn('/bin/sh', ['-c', skript], { detached: true, stdio: 'ignore' });
+    wache.unref();
+  } catch (e) {
+    // Ohne Wachhund bleibt es beim bisherigen Verhalten -- das ist auf dieser
+    // Maschine seit jeher in Ordnung; er ist eine Absicherung, keine Bedingung.
+    process.stderr.write(`Beenden: kein Notausgang moeglich (${(e as Error).message}).\n`);
+  }
 }
 
 let shuttingDown = false;
@@ -5354,8 +6183,10 @@ async function shutdown(code: number): Promise<void> {
   // es wirklich weg ist (Befund B5, 12.08.). Ohne das `await` lief
   // `app.exit()` in aller Regel frueher als das Nachfassen nach zwei
   // Sekunden, und ein Kind, das auf SIGTERM nicht reagiert, ueberlebte die
-  // App ohne Fenster.
-  await chatbuehne.alleBeenden();
+  // App ohne Fenster. MIT FRIST (2026-08-20): das Nachfassen selbst ist
+  // eine eigene Zusage der Chat-Sitzung, keine dieser Funktion hier -- eine
+  // Sitzung, die sie bricht, darf trotzdem nicht das GANZE Beenden aufhalten.
+  await mitFrist(chatbuehne.alleBeenden(), 5000, 'Chat-Sitzungen beenden');
   chatRegistry.alleFreigeben();
   for (const w of dateiWaechter) w.close();
   dateiWaechter = [];
@@ -5386,12 +6217,32 @@ async function shutdown(code: number): Promise<void> {
   }
   if (urteil.sitzung) sitzungBeenden(urteil.sitzung);
   try {
-    await channel?.close();
+    // MIT FRIST (2026-08-20): `server.close()` wartet auf ALLE offenen
+    // Verbindungen, nicht nur auf sich selbst -- ein Client, der seinen Socket
+    // nicht schliesst, liesse dieses `await` ohne Ende stehen.
+    if (channel) await mitFrist(channel.close(), 2000, 'Steuerkanal schliessen');
   } catch {
     // dito fuer den Steuerkanal
   }
+  // AB HIER KANN NICHTS MEHR SCHIEFGEHEN, OHNE DASS ES AUFFAELLT (21.08.).
+  // Alles, was Zeit brauchen darf, ist durch und hatte seine eigene Frist. Was
+  // jetzt kommt, sind fuenf synchrone native Aufrufe, und genau dort bleibt das
+  // Beenden auf kopflosem Linux stehen. Der Wachhund steht deshalb GENAU hier
+  // und nicht frueher: davor gibt es legitime Wartezeiten, danach keine mehr.
+  // Die Frist ist ueberschreibbar, damit eine MESSUNG den Wachhund einmal aus dem Weg
+  // nehmen kann: solange er bei 5 s zuschlaegt, misst man seine eigene Frist und nicht,
+  // wie lange der geordnete Weg wirklich braucht. Im Betrieb setzt das niemand.
+  notausgangScharfstellen(Number(process.env.AWB_NOTAUSGANG_MS) || 5000);
   // Was dieses Programm geoeffnet hat, macht es auch wieder zu -- ein
   // Kindfenster, das den Beenden-Weg ueberlebt, haelt den Prozess am Leben.
+  //
+  // Diese vier Zeilen sind vor `app.exit()` streng genommen entbehrlich: `exit`
+  // beendet den Prozess sofort und nimmt jedes Fenster mit, ohne zu fragen (die
+  // Sorge im Satz darueber gilt `app.quit()`, nicht `exit`). Sie bleiben
+  // trotzdem stehen -- welcher der fuenf Aufrufe drueben blockiert, ist NICHT
+  // gemessen, und etwas zu entfernen, dessen Wirkung man nicht kennt, waere
+  // geraten. Gefaehrlich sind sie nicht mehr: der Wachhund oben deckt sie ab,
+  // gleich ob sie selbst haengen oder `app.exit()` danach.
   einstellungsfenster.aktuell()?.destroy();
   sitzungsfenster.aktuell()?.destroy();
   erststartfenster.aktuell()?.destroy();
@@ -5742,6 +6593,19 @@ function zurueckstellen(): void {
   } catch {
     // Ein Fehler beim Beenden der Kinder darf den Ausstieg nicht aufhalten.
   }
+  // UND WIRKLICH BEENDEN (Betriebsbefund 2026-08-20): bis heute endete diese
+  // Funktion hier, in der Annahme, Electrons eigene Weiterfuehrung des
+  // Ausstiegs erledige den Rest zuverlaessig. Gemessen war das falsch --
+  // `osascript` zeigte schon eine LEERE Fensterliste (Electrons native
+  // Aufraeumung lief also), waehrend der Prozess selbst noch 45+ Sekunden bei
+  // 0,0% CPU weiterlief, bis nur noch SIGKILL half. Jeder Schritt oben ist
+  // jetzt selbst mit einer Frist versehen (siehe zustandZurueckSync() in
+  // tmux.ts), also kommt diese Stelle garantiert an -- und beendet den
+  // Prozess jetzt SELBST, statt auf Electrons Fortsetzung zu hoffen. Zweimal
+  // aufgerufen (before-quit UND will-quit feuern beide hierher) schadet
+  // nicht: der erste Aufruf beendet den Prozess, der zweite findet keinen
+  // mehr vor.
+  app.exit(0);
 }
 app.on('before-quit', zurueckstellen);
 app.on('will-quit', zurueckstellen);

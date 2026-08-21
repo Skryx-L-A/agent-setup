@@ -46,7 +46,7 @@ Regeldatei; lies sie VOR der Handlung, nicht danach:
   des Nutzers `effortCaps` in `settings.json` überschreiben sie, und der Deckel bindet DICH,
   nicht ihn) — Begründungen und Zusätze:
   <!-- wb:routing-table:start -->
-  <!-- wb-instructions:generated SHA-256=c717238b3ea08aa955188f5d68b8829c38ca6ccc44788d7afe420865adcb9142 -->
+  <!-- wb-instructions:generated SHA-256=893928648df5c1122505e7b89121df614cd220516afb489638b8022235b4d2ab -->
   | Aufgabe | So spawnen | Harness | Eignung |
   |---|---|---|---|
   | Bulk / Overnight | `agy-flash:medium` | agy | Schnelle, billige Spur ueber das Antigravity-Abo: viele kleine Abfragen, Web-Recherche in Breite, Seiten auslesen, Vorsortieren von Material. |
@@ -54,9 +54,10 @@ Regeldatei; lies sie VOR der Handlung, nicht danach:
   | Bulk / Inventur / DSGVO / Overnight | `aider-ornith-9b` | aider | Kleine mechanische Edits, laedt in Sekunden statt Minuten und passt neben ein grosses Modell in den Speicher. Token-frei, Daten bleiben auf der Maschine. |
   | Bulk / Inventur / DSGVO / Overnight | `goose-ornith-9b` | goose | Kleine mechanische Aufgaben, token-frei ueber Ollama, Daten bleiben auf der Maschine. Der einzige der lokalen Harnesses, der seine Kontextauslastung SELBST anzeigt ('3% 4k/128k' ueber der Eingabezeile) — ein goose-Worker ist damit von der Kontextwache lueckenlos beobachtet, ohne dass eine Sitzungsdatei gelesen werden muss. |
   | Bulk / Inventur / DSGVO / Overnight | `gptme-ornith-9b` | gptme | Kleine mechanische Aufgaben, token-frei ueber Ollama, Daten bleiben auf der Maschine. Von den lokalen Harnesses der mit der reichsten Werkzeugliste (Shell, Patch, Dateien, Subagenten) und mit einem Rollen-Weg, der ohne Zutun greift: gptme liest AGENTS.md aus dem Arbeitsverzeichnis. |
-  | Bulk / Inventur / DSGVO / Overnight | `grug` | pi | Token-freier Default-Coder (MLX 4bit); Bulk, Inventur, DSGVO, Overnight. |
-  | Bulk / Inventur / DSGVO / Overnight | `ornith` | pi | Token-freier lokaler Coder; Bulk, Inventur, DSGVO, Overnight. Nicht mehr Default (siehe grug). |
+  | Bulk / Inventur / DSGVO / Overnight | `grug` | pi | Token-freier lokaler Coder (MLX 4bit); Bulk, Inventur, DSGVO, Overnight. Nicht mehr Default (siehe qwen3.8). |
+  | Bulk / Inventur / DSGVO / Overnight | `ornith` | pi | Token-freier lokaler Coder; Bulk, Inventur, DSGVO, Overnight. Nicht mehr Default (siehe qwen3.8). |
   | Bulk / Inventur / DSGVO / Overnight | `ornith9` | pi | Mechanischer Bulk, token-frei, laeuft neben einem grossen Modell. |
+  | Bulk / Inventur / DSGVO / Overnight | `qwen38` | pi | Token-freier Default-Coder (MLX 4bit); Bulk, Inventur, DSGVO, Overnight. |
   | mechanisch | `aider-ornith-35b` | aider | Mechanische Mehrdatei-Edits mit Git-Integration, token-frei ueber Ollama: Umbenennungen, Formatierung, wiederkehrende Muster ueber viele Dateien. Zeilen-REPL statt Vollbild-TUI, deshalb die robusteste Pane-Erkennung. |
   | mechanisch | `aider-ornith-9b` | aider | Kleine mechanische Edits, laedt in Sekunden statt Minuten und passt neben ein grosses Modell in den Speicher. Token-frei, Daten bleiben auf der Maschine. |
   | mechanisch | `haiku45:low` | claude | Rename, Config-Tweak, Format, ein offensichtlicher Fix (nur 200K Kontext). |
@@ -158,14 +159,9 @@ Regeldatei; lies sie VOR der Handlung, nicht danach:
   Datei MIT Deadline warten (`until [ -s file ]` + timeout, nie unbegrenzt); hängender Worker →
   `pi-worker <name> --interrupt`, einmal nachstoßen, dann neu vergeben. Idle Teammate: ein
   SendMessage-Nudge, dann neu vergeben.
-- **Nie unbegrenzt warten.** Jedes Warten auf Prozess, Worker, Download oder Service braucht (a) eine
-  Deadline und (b) Liveness+Progress-Checks — lebt genau dieser Prozess (präzise matchen; ein
-  `pgrep -f`-Muster darf nicht den eigenen Watcher treffen) UND wächst seine Ausgabe/Größe/Log noch?
-  Nach Deadline stehengeblieben = gescheitert: killen, loggen, ein- bis zweimal mit Backoff neu
-  versuchen, dann den Fehler melden statt zu warten. pi-Worker laufen per `gtimeout` aus (Default
-  30 min, `PI_WORKER_TIMEOUT` überschreibt; Exit 124 = hängt/Timeout). Womit Fortschritt
-  überhaupt gemessen wird, steht in `regeln/worker-panes.md` — die CPU-Zeit eines
-  wartenden Clients ist kein Fortschrittsmaß.
+- **Nie unbegrenzt warten** (Wortlaut, Deadline-Regel und Fortschrittsmaß:
+  `regeln/prozess-hygiene.md`). Kurz: jedes Warten braucht eine Deadline plus
+  Liveness- und Fortschrittsprüfung; nach Deadline stehengeblieben heißt gescheitert.
 
 - **Worker-Anträge entscheiden (2026-07-25; die fünf Regeln: `regeln/orchestrierung.md`):** Anträge liegen in
   `~/.pi-workers/requests/` (der Worker schreibt sie per `wb-request`), gespawnt wird ausschließlich
@@ -235,9 +231,13 @@ Regeldatei; lies sie VOR der Handlung, nicht danach:
 ihre eigene Rollendatei, ein Verweis auf die andere ginge für die jeweils andere Session ins
 Leere. Bei einer inhaltlichen Änderung BEIDE Stellen pflegen.
 
-- **Stil-Vorrang (2026-08-03) — drei Ebenen, sie widersprechen sich nicht.** (a) CHAT und
-  Statusmeldungen im Terminal: knapp, Fragmente erlaubt; hier und nur hier greift ein global
-  aktiver Knapp-Modus, falls einer läuft. (b) JEDER Fließtext, den ein Mensch außerhalb des
+- **Stil-Vorrang (2026-08-03, verschaerft 2026-08-19) — drei Ebenen, sie widersprechen sich
+  nicht.** (a) CHAT und Statusmeldungen im Terminal: knapp, Fragmente erlaubt; hier und nur hier
+  greift der global aktive Knapp-Modus (Caveman, `~/.claude/.caveman-active`). Er gilt ab dem
+  ERSTEN Zug und dauerhaft, fuer Orchestrator wie Worker, zum Tokensparen. Ein WORKER weicht nie
+  davon ab. Der ORCHESTRATOR darf ihn fuer EINE Antwort aussetzen, wenn der Nutzer ausdruecklich
+  eine ausfuehrliche Erklaerung verlangt; danach gilt er sofort wieder. Ein einzelner Absatz darf
+  immer ausfuehrlich sein, wo Verkuerzung gefaehrlich waere. (b) JEDER Fließtext, den ein Mensch außerhalb des
   Terminals liest — Dokumente, Berichte, Mails, Bewerbungen, README, Deliverables und
   Result-Dateien, die weitergereicht werden —, läuft über das Skill `texte-schreiben` und wird
   in ganzen Sätzen geschrieben. Knapp heißt dort: nichts Überflüssiges, NICHT: keine Artikel.

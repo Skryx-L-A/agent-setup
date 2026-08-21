@@ -82,6 +82,44 @@ ollama_listener() {
   printf '%s' "$out"
 }
 
+# Laufen auf DIESER Maschine echte Ollama-Modell-Laeufer? Gibt 'ja', 'nein'
+# oder 'unbekannt' aus (Messung selbst gescheitert). Dieselbe Frage, mit
+# denselben Mustern, die wb-notbremse schon fuer die Notbremse beantwortet
+# (siehe dort, MUSTER) -- gebraucht hier, wenn der Portname allein nicht mehr
+# reicht (siehe NACHTRAG 21.08.2026 unten bei OLLAMA_LOCAL). Erst der ganze
+# `ps`-Schnappschuss in eine Variable, dann grep DARAUF: ein direktes
+# `ps | grep <Muster>` faende unter Umstaenden sein eigenes Kommando, weil
+# `ps` den schon gestarteten `grep`-Prozess samt Suchtext im Aufruf mit
+# einfaengt. Die eckigen Klammern um je einen Buchstaben sind derselbe
+# Trick nochmal, zur Sicherheit -- ein woertlich passendes Suchmuster im
+# eigenen Aufruf (etwa durch einen umschliessenden Wrapper) matcht dann
+# trotzdem nicht sich selbst.
+#
+# Zweistufig, nicht ein einzelnes Muster: 'llama-server'/'llama-cli' allein
+# heisst nur "irgendein llama.cpp-Prozess", nicht "Ollamas eigener". Gemessen
+# beim Bau dieser Funktion, live auf dieser Maschine: mehrere FREMDE, voellig
+# ollama-lose Test-Stubs namens 'llama-server' liefen gerade gleichzeitig aus
+# fremden Test-HOMEs (/var/folders/.../tmp.*/home?/bin/llama-server, aus
+# einem anderen, parallel laufenden Testlauf). Ein einstufiges Muster haette
+# die als "lokaler Ollama-Laeufer" durchgehen lassen. Deshalb: erst die
+# Kandidaten sammeln (Laeufer-Namensmuster), dann verlangen, dass MINDESTENS
+# EINER davon tatsaechlich 'ollama' im eigenen Kommando traegt (Installations-
+# pfad oder das explizite 'ollama runner' aelterer Fassungen) -- ein fremder
+# Stub ohne das Wort 'ollama' irgendwo im Kommando besteht das nicht.
+ollama_lokale_laeufer_lage() {
+  local ps_out kandidaten
+  if ! ps_out="$(ps -Ao command= 2>/dev/null)"; then
+    printf 'unbekannt'
+    return
+  fi
+  kandidaten="$(printf '%s\n' "$ps_out" | grep -E '\bollama runne[r]\b|\bllama[-_](serve[r]|cl[i])\b')"
+  if printf '%s\n' "$kandidaten" | grep -qi 'ollama'; then
+    printf 'ja'
+  else
+    printf 'nein'
+  fi
+}
+
 # Hinweise sammeln statt ueberschreiben: die Herkunft des Ports und ein
 # Lesefehler auf /api/ps sind zwei verschiedene Aussagen, und die zweite darf
 # die erste nicht verschlucken.
@@ -123,8 +161,40 @@ collect_ollama() {
     ollama)      OLLAMA_LOCAL=true ;;
     "")          OLLAMA_LOCAL=null
                  OLLAMA_LOADED_NOTE="wer Port 11434 bedient, war nicht zu ermitteln — die Ladungen zaehlen nicht als lokal" ;;
-    *)           OLLAMA_LOCAL=false
-                 OLLAMA_LOADED_NOTE="Port 11434 wird von '$listener' bedient, nicht von ollama — die Ladungen liegen auf einer ANDEREN Maschine" ;;
+    *)
+      # NACHTRAG 21.08.2026 (Auftrag, gemessen auf dieser Maschine): der Name
+      # allein traegt die Entscheidung seit der Bedarfsschaltung nicht mehr.
+      # `wb-modell-proxy` (Python) ist dort die VORGESEHENE Vordertuer auf
+      # :11434 und heisst nie 'ollama' -- damit fiel jede Bedarfsschaltungs-
+      # Ladung in denselben Zweig wie der ssh-Portforward vom 16.08., obwohl
+      # die Modelle sehr wohl HIER liegen. Befund: 'ollama ps' meldete
+      # ornith:9b (6,1 GiB) und embeddinggemma, `ps` zeigte gleichzeitig zwei
+      # echte llama-server-Prozesse aus dem ollama-Verzeichnis (einer mit
+      # 6321 MiB RSS) -- und OLLAMA_LOCAL wurde trotzdem false, macht rund
+      # 7 GiB wirklich belegten Speicher unsichtbar fuer die Vergabe.
+      #
+      # Der Portname beantwortet nur noch "wer nimmt Anfragen entgegen",
+      # nicht "wo liegen die Gewichte". Letzteres beantwortet wb-notbremse
+      # schon fuer die Notbremse (siehe dort, MUSTER): Ollamas Modell-Laeufer
+      # heissen 'ollama runner' (aeltere Fassungen) oder 'llama-server' /
+      # 'llama-cli' (llama.cpp-Unterbau neuerer Fassungen). Dieselbe Frage,
+      # dieselbe Suche hier -- misst, ob so ein Laeufer auf DIESER Maschine
+      # lebt, statt am Namen des Port-Lauschers zu raten. Findet sich einer,
+      # gehoert die Ladung dieser Maschine (Bedarfsschaltung). Findet sich
+      # keiner, bleibt es beim Fremd-Urteil von oben (ssh-Portforward, 16.08.).
+      # Scheitert die Messung selbst (ps nicht aufrufbar), bleibt es beim
+      # dritten Fall -- UNBEKANNT, nie stillschweigend LOKAL oder FREMD.
+      local laeufer
+      laeufer="$(ollama_lokale_laeufer_lage)"
+      case "$laeufer" in
+        ja)    OLLAMA_LOCAL=true
+               OLLAMA_LOADED_NOTE="Port 11434 wird von '$listener' bedient, nicht von ollama selbst — aber auf dieser Maschine laufen echte Ollama-Modell-Laeufer (Bedarfsschaltung, z. B. wb-modell-proxy als Vordertuer) — die Ladungen zaehlen als lokal" ;;
+        nein)  OLLAMA_LOCAL=false
+               OLLAMA_LOADED_NOTE="Port 11434 wird von '$listener' bedient, nicht von ollama, und auf dieser Maschine laeuft kein Ollama-Modell-Laeufer — die Ladungen liegen auf einer ANDEREN Maschine" ;;
+        *)     OLLAMA_LOCAL=null
+               OLLAMA_LOADED_NOTE="Port 11434 wird von '$listener' bedient, nicht von ollama, und ob hier ein lokaler Modell-Laeufer laeuft, war nicht zu ermitteln — die Ladungen zaehlen nicht als lokal" ;;
+      esac
+      ;;
   esac
   local roh
   if roh="$(curl -sf --max-time 2 http://localhost:11434/api/ps 2>/dev/null)"; then
@@ -185,6 +255,40 @@ elif [ "$OS" = "Darwin" ]; then
   GPU_KIND="unified"
   VRAM_NOTE="unified memory — MLX/Metal share system RAM; free RAM is the VRAM proxy"
 
+  # WAS "FREI" AUF EINEM MAC HEISST (korrigiert 2026-08-21).
+  #
+  # Bis heute stand hier frei + inaktiv + spekulativ + freigebbar. Diese Summe
+  # laesst einen ganzen Posten aus: DATEI-GESTUETZTE SEITEN, die gerade AKTIV
+  # sind. Das sind Kopien von Dateien -- Programmcode, gelesene Modelldateien,
+  # Caches --, und macOS wirft sie unter Druck weg, ohne dass irgendjemand etwas
+  # verliert; ihr Inhalt steht auf der Platte. Sie als belegt zu zaehlen, macht
+  # die Maschine auf dem Papier voller, als sie ist.
+  #
+  # Befund des Nutzers, der das ausgeloest hat: "der verfuegbare speicher ist immer
+  # zu niedrig angesetzt ... da sind die ganze zeit fast 40gb frei wenn gerade
+  # kein modell geladen ist". Gemessen im Ruhezustand am 21.08., ohne geladenes
+  # Modell, auf dieser Maschine mit 48 GiB:
+  #
+  #   alte Formel  38279 MiB      frei 30420 + inaktiv 5101 + spekulativ 2642
+  #   neue Formel  40819 MiB      gesamt - anonym 4166 - wired 3781 - Kompressor 386
+  #   memory_pressure sagte gleichzeitig "System-wide memory free percentage: 90"
+  #   iogpu.wired_limit_mb = 43008, davon 39227 MiB noch nicht gewired
+  #
+  # Drei unabhaengige Quellen nennen also rund 39 bis 43 GiB, die alte Formel
+  # 37,4 GiB. Die neue trifft zusaetzlich des Nutzers "fast 40 GB" auf den Punkt.
+  #
+  # DAS IST KEINE NEUE ERFINDUNG, SONDERN DIE ANGLEICHUNG AN DEN LINUX-ZWEIG
+  # DIESER DATEI. Dort steht seit jeher MemAvailable, und genau das rechnet der
+  # Kernel so: verfuegbar ist, was ohne Verlust wiederbeschafft werden kann.
+  # macOS war der Sonderfall, nicht Linux.
+  #
+  # UNVERZICHTBAR sind nur drei Posten: anonymer Speicher (Heap, Stack,
+  # Metal-Puffer -- steht nirgends sonst), Gewired und der Kompressor. Alles
+  # andere ist Kopie.
+  #
+  # Die alte Zahl geht nicht verloren: sie steht weiter im JSON, als
+  # `ram.free_strict_mib`, zusammen mit den Bestandteilen. Wer die vorsichtigere
+  # Rechnung braucht, findet sie dort -- niemand muss sie nachbauen.
   PAGE="$(sysctl -n hw.pagesize)"; MEMSIZE="$(sysctl -n hw.memsize)"
   vms="$(vm_stat)"
   getp() { printf '%s\n' "$vms" | awk -v k="$1" '$0 ~ k {gsub("[^0-9]","",$NF); print $NF; exit}'; }
@@ -192,9 +296,32 @@ elif [ "$OS" = "Darwin" ]; then
   INACT="$(getp 'Pages inactive')";    : "${INACT:=0}"
   SPEC="$(getp 'Pages speculative')";  : "${SPEC:=0}"
   PURGE="$(getp 'Pages purgeable')";   : "${PURGE:=0}"
-  AVAIL_PAGES=$(( FREEP + INACT + SPEC + PURGE ))
+  ANON="$(getp 'Anonymous pages')";    : "${ANON:=0}"
+  FILEP="$(getp 'File-backed pages')"; : "${FILEP:=0}"
+  WIRED="$(getp 'Pages wired down')";  : "${WIRED:=0}"
+  COMPR="$(getp 'Pages occupied by compressor')"; : "${COMPR:=0}"
   RAM_TOTAL=$(( MEMSIZE / 1048576 ))
-  RAM_FREE=$(( AVAIL_PAGES * PAGE / 1048576 ))
+  STRICT_PAGES=$(( FREEP + INACT + SPEC + PURGE ))
+  RAM_FREE_STRICT=$(( STRICT_PAGES * PAGE / 1048576 ))
+  RAM_FREE=$(( RAM_TOTAL - (ANON + WIRED + COMPR) * PAGE / 1048576 ))
+  # Faellt eines der neuen Felder aus (eine kuenftige macOS-Fassung koennte eine
+  # Zeile umbenennen), waere RAM_FREE ploetzlich fast der ganze Speicher -- die
+  # gefaehrliche Richtung. Dann gilt wieder die alte, vorsichtige Zahl.
+  if [ "$ANON" -eq 0 ] || [ "$WIRED" -eq 0 ] || [ "$RAM_FREE" -gt "$RAM_TOTAL" ]; then
+    RAM_FREE="$RAM_FREE_STRICT"
+    RAM_NOTE_FREI="vm_stat lieferte keine brauchbaren Anonymous/Wired-Zeilen — zurueck auf die vorsichtige Formel"
+  fi
+  [ "$RAM_FREE" -lt 0 ] && RAM_FREE=0
+  RAM_FILEBACKED=$(( FILEP * PAGE / 1048576 ))
+  RAM_ANON=$(( ANON * PAGE / 1048576 ))
+  RAM_WIRED=$(( WIRED * PAGE / 1048576 ))
+  RAM_COMPRESSOR=$(( COMPR * PAGE / 1048576 ))
+  # Der Deckel, den der Treiber selbst fuer gewired GPU-Speicher nennt. Auf
+  # diesem Geraet 43008 MiB = 42,0 GiB, dieselbe Zahl, die vllm-metal als
+  # max_recommended_working_set_size meldet. 0 heisst "kein eigener Deckel
+  # gesetzt"; dann bleibt das Feld leer statt eine Null zu behaupten.
+  GPU_WIRED_LIMIT="$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || true)"
+  case "$GPU_WIRED_LIMIT" in ''|0|*[!0-9]*) GPU_WIRED_LIMIT="" ;; esac
   VRAM_TOTAL="$RAM_TOTAL"; VRAM_FREE="$RAM_FREE"
 
   # Echte GPU-Auslastung, rund 18 ms. Bis 2026-08-07 stand hier nichts und das
@@ -224,11 +351,18 @@ emit_json() {
     --arg ollloadednote "$OLLAMA_LOADED_NOTE" --argjson olllocal "${OLLAMA_LOCAL:-null}" \
     --argjson vfree "${VRAM_FREE:-0}" --argjson vtotal "${VRAM_TOTAL:-0}" --argjson gutil "${GPU_UTIL:-null}" \
     --argjson rfree "${RAM_FREE:-0}" --argjson rtotal "${RAM_TOTAL:-0}" \
+    --argjson rstrict "${RAM_FREE_STRICT:-null}" --argjson rfile "${RAM_FILEBACKED:-null}" \
+    --argjson ranon "${RAM_ANON:-null}" --argjson rwired "${RAM_WIRED:-null}" \
+    --argjson rcompr "${RAM_COMPRESSOR:-null}" \
+    --argjson gpulimit "${GPU_WIRED_LIMIT:-null}" --arg rfreenote "${RAM_NOTE_FREI:-}" \
     --argjson gpuprocs "$GPU_PROCS_JSON" --argjson ollama "$OLLAMA_JSON" --argjson ollamaloaded "${OLLAMA_LOADED_JSON:-[]}" \
     --argjson protected "$PROTECTED_JSON" \
     '{machine:$machine, os:$os, hostname:$host, timestamp:$ts,
       vram:{kind:$gpukind, free_mib:$vfree, total_mib:$vtotal, gpu_util_pct:$gutil, note:$vnote},
-      ram:{free_mib:$rfree, total_mib:$rtotal},
+      ram:{free_mib:$rfree, total_mib:$rtotal,
+           free_strict_mib:$rstrict, filebacked_mib:$rfile, anon_mib:$ranon,
+           wired_mib:$rwired, compressor_mib:$rcompr,
+           gpu_wired_limit_mib:$gpulimit, free_note:$rfreenote},
       gpu_procs:$gpuprocs,
       ollama_models:$ollama, ollama_loaded:$ollamaloaded, ollama_note:$ollnote,
       ollama_loaded_note:$ollloadednote, ollama_local:$olllocal,
@@ -258,6 +392,11 @@ case "$MODE" in
       echo "  VRAM  : ${VRAM_FREE} MiB free / ${VRAM_TOTAL} MiB total"
     fi
     echo "RAM     : ${RAM_FREE} MiB free / ${RAM_TOTAL} MiB total"
+    if [ -n "${RAM_FREE_STRICT:-}" ]; then
+      echo "  streng: ${RAM_FREE_STRICT} MiB (frei+inaktiv+spekulativ+freigebbar) — die Differenz sind"
+      echo "          datei-gestuetzte Seiten, die macOS jederzeit verwirft"
+    fi
+    [ -n "${GPU_WIRED_LIMIT:-}" ] && echo "  GPU     : Deckel ${GPU_WIRED_LIMIT} MiB (iogpu.wired_limit_mb), davon ${RAM_WIRED:-0} MiB gewired"
     echo "ollama  : $(printf '%s' "$OLLAMA_JSON" | jq -r 'if length>0 then join(", ") else "-" end') ${OLLAMA_NOTE:+($OLLAMA_NOTE)}"
     if [ -n "$OLLAMA_LOADED_NOTE" ]; then
       echo "  Groessen nicht lesbar: $OLLAMA_LOADED_NOTE"

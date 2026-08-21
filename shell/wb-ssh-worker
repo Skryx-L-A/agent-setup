@@ -135,17 +135,54 @@ parse_remote
 # pastes immediately (no readiness wait).
 if [ -n "$TASK" ] && [ -n "$RPANE" ]; then
   PROBE=$(printf '%s' "$TASK" | head -c 40)
+
+  # PANE FUEHRT VERLAUF? (2026-08-20, derselbe Fund wie in pi-worker heute, hier
+  # noch offen.) `capture-pane -S -2000` verspricht 2000 Zeilen Rueckblick, aber
+  # im ALTERNATE SCREEN fuehrt tmux GAR KEINEN Verlauf (in pi-worker gemessen:
+  # alternate_on=1 ergibt history_size=0) — die Option liefert dort nur das
+  # gerade sichtbare Bild, und das ist bei einem frisch startenden TUI schmal
+  # und vergaenglich. "Marker nicht gefunden" auf so einem Pane beweist also
+  # NICHT, dass der Auftrag fehlt; er kann so gut aus dem sichtbaren Rahmen
+  # herausgeschoben worden sein. Erst den Pane selbst fragen (misst die
+  # Tatsache direkt), bei fehlender Antwort (Pane weg, ssh-Fehler) auf die
+  # Registry zurueckfallen (Feld altScreen des Harness) — dieselbe Kaskade wie
+  # pi-worker.
+  RHARNESS="$KIND"
+  [ "$KIND" = pi ] && RHARNESS="$("$HOME/.local/bin/wb-state" models get "$MODEL" --field harness 2>/dev/null || true)"
+  PANE_ALT=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$MACHINE" \
+      "tmux display -p -t $(q "$RPANE") '#{alternate_on}'" 2>/dev/null)
+  PANE_FUEHRT_VERLAUF=1
+  case "$PANE_ALT" in
+    1) PANE_FUEHRT_VERLAUF=0 ;;
+    0) PANE_FUEHRT_VERLAUF=1 ;;
+    *) if "$HOME/.local/bin/wb-state" models harness-get "${RHARNESS:-$KIND}" 2>/dev/null \
+         | /usr/bin/python3 -c 'import json,sys
+try: sys.exit(0 if json.load(sys.stdin).get("altScreen") is True else 1)
+except Exception: sys.exit(1)'; then
+         PANE_FUEHRT_VERLAUF=0
+       fi ;;
+  esac
+
   delivered() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$MACHINE" \
       "tmux capture-pane -p -S -2000 -t $(q "$RPANE") | grep -qF $(q "$PROBE")" 2>/dev/null; }
   if ! delivered; then
     sleep 4
     if ! delivered; then
-      echo "Hinweis: Task kam im frisch gestarteten Pane nicht an (TUI war noch nicht bereit) — sende erneut." >&2
-      REMOTE_OUT=$(remote_spawn) || true
-      parse_remote
-      [ -n "$RWIN" ] || RWIN="$WIN"
-      sleep 2
-      delivered || echo "WARNUNG: Task in '$SSHNAME' auf $MACHINE auch nach dem zweiten Versuch nicht sichtbar — Pane pruefen." >&2
+      if [ "$PANE_FUEHRT_VERLAUF" = 0 ]; then
+        # Kein Gegenbeleg aus einem leeren Verlauf (2026-08-20): dieser Pane hat
+        # gar keine Scrollback, "nicht gefunden" heisst hier "war vielleicht
+        # schon aus dem sichtbaren Bild raus", nicht "kam nie an". Ein
+        # automatischer Zweitversand wuerde bei echter Zustellung den Auftrag
+        # verdoppeln — deshalb hier nur melden, nicht erneut senden.
+        echo "Hinweis: Task im Pane von '$SSHNAME' auf $MACHINE nicht gefunden — Pane ist Alternate Screen (kein Verlauf, siehe pi-worker), das ist KEIN Gegenbeleg. Von Hand pruefen statt automatisch erneut senden." >&2
+      else
+        echo "Hinweis: Task kam im frisch gestarteten Pane nicht an (TUI war noch nicht bereit) — sende erneut." >&2
+        REMOTE_OUT=$(remote_spawn) || true
+        parse_remote
+        [ -n "$RWIN" ] || RWIN="$WIN"
+        sleep 2
+        delivered || echo "WARNUNG: Task in '$SSHNAME' auf $MACHINE auch nach dem zweiten Versuch nicht sichtbar — Pane pruefen." >&2
+      fi
     fi
   fi
 fi

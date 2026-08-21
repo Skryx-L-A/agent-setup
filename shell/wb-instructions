@@ -24,6 +24,7 @@ existing worker-routing table in ~/.claude/CLAUDE.md and around the matching ref
 `wb-state models table` fill-in can keep that table current without hand edits.
 """
 import argparse
+import atomar_schreiben
 import datetime
 import hashlib
 import os
@@ -346,14 +347,21 @@ def now_generated_at_for(target_path, new_body_hash):
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+# Unteilbar (Auftrag 5, siehe atomar_schreiben.py): das ist die unangenehmste
+# der drei Fundstellen, weil ein halb geschriebener Rollen-Prompt syntaktisch
+# gueltiger Text bleibt -- eine Sitzung, die ihn in genau diesem Moment liest,
+# faellt nicht mit einem Fehler auf, sie verhaelt sich nur schlechter, ohne
+# dass irgendjemand den Grund sieht. modus=0o644: derselbe Wert, den ein
+# gewoehnliches open(path,'w') unter dem hier ueblichen umask 022 ohnehin
+# ergeben haette -- ohne ihn wuerden diese Dateien nach dem Umbau ploetzlich
+# mit den engeren 0600 von tempfile.mkstemp dastehen, eine stille
+# Rechte-Verschaerfung, die niemand gebeten hat.
 def write_generated(target_path, full_content, body_hash, dry_run, day_tag, force):
     status, disk_body = check_target(target_path)
     if status == "new":
         if dry_run:
             return "new"
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        with open(target_path, "w", encoding="utf-8") as f:
-            f.write(full_content)
+        atomar_schreiben.schreiben(target_path, full_content, modus=0o644)
         return "new"
     if status == "conflict":
         if not force:
@@ -361,8 +369,7 @@ def write_generated(target_path, full_content, body_hash, dry_run, day_tag, forc
         if dry_run:
             return "conflict-would-force"
         snapshot_before_overwrite(target_path, day_tag)
-        with open(target_path, "w", encoding="utf-8") as f:
-            f.write(full_content)
+        atomar_schreiben.schreiben(target_path, full_content, modus=0o644)
         return "conflict-forced"
     # status == 'clean'
     if disk_body == full_content[len(MARKER_RE.match(full_content).group(0)):]:
@@ -370,8 +377,7 @@ def write_generated(target_path, full_content, body_hash, dry_run, day_tag, forc
     if dry_run:
         return "would-update"
     snapshot_before_overwrite(target_path, day_tag)
-    with open(target_path, "w", encoding="utf-8") as f:
-        f.write(full_content)
+    atomar_schreiben.schreiben(target_path, full_content, modus=0o644)
     return "updated"
 
 
@@ -582,8 +588,11 @@ def sync_routing_block(path, label, anchor_fn, table_md, table_err, dry_run, day
             return
         snapshot_before_overwrite(path, day_tag)
         new_text = text[:insert_at] + insertion + text[insert_at:]
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(new_text)
+        # Unteilbar (Auftrag 5): 'path' ist hier CLAUDE.md oder
+        # orchestrator.md -- gelesen bei jedem Sitzungsstart, dieselbe
+        # Fundstelle wie write_generated() oben, nur im selben Atemzug
+        # mitgefunden statt eigens gemeldet.
+        atomar_schreiben.schreiben(path, new_text, modus=0o644)
         if not table_md:
             # nothing to fill yet -- report once, don't fall through to a no-op Phase B
             report.append(("routing-table:%s" % label,
@@ -614,8 +623,7 @@ def sync_routing_block(path, label, anchor_fn, table_md, table_err, dry_run, day
     snapshot_before_overwrite(path, day_tag)
     new_region = "%s%s\n%s%s%s\n" % (indent, ROUTING_START, desired, indent, ROUTING_END)
     new_text = text[:m.start()] + new_region + text[m.end():]
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_text)
+    atomar_schreiben.schreiben(path, new_text, modus=0o644)
     verb = "conflict-forced" if status == "foreign" else ("filled" if desired else "left-empty")
     report.append(("routing-table:%s" % label,
                     verb if not table_err else "%s (%s)" % (verb, table_err), path))

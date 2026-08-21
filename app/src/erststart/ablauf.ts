@@ -22,19 +22,33 @@ export type SchrittName = 'maschine' | 'harness' | 'modell' | 'fertig';
 
 export const SCHRITTE: readonly SchrittName[] = ['maschine', 'harness', 'modell', 'fertig'];
 
-/** Die drei Schritte, die eine Antwort abliefern können, und der Einstellungs-Schlüssel dahinter. */
-export const SCHLUESSEL: Readonly<Record<'maschine' | 'harness' | 'modell', string>> = {
+/**
+ * Welche Antwort auf welchen Einstellungs-Schlüssel geht.
+ *
+ * VIER Schlüssel bei drei Schritten, und das ist kein Versehen: der dritte
+ * Schritt kann ZWEI Antworten abliefern. Wer dort ein Modell wählt, das auf
+ * dieser Maschine läuft, wählt darunter auch sein Kontextfenster -- eine Frage,
+ * die es bei einem Modell aus der Cloud gar nicht gibt und die deshalb keinen
+ * eigenen Schritt bekommt: sie wäre bei den meisten Wahlen eine leere Seite.
+ * `kontext` ist damit der einzige Eintrag ohne gleichnamigen Schritt; er wird
+ * über `mitKontext()` gesetzt und wie die anderen genau einmal geschrieben.
+ */
+export const SCHLUESSEL: Readonly<Record<'maschine' | 'harness' | 'modell' | 'kontext', string>> = {
   maschine: 'defaultWorkerMachine',
   harness: 'orchestratorHarness',
   modell: 'orchestratorModel',
+  kontext: 'orchestratorKontext',
 };
 
 /** Der Schlüssel, der den Weg als erledigt markiert -- geschrieben genau einmal, beim Abschluss. */
 export const ERLEDIGT_SCHLUESSEL = 'erststartErledigt';
 
+/** Die Antworten. `kontext` ist eine Tokenzahl, die drei anderen sind Kennungen. */
+export type AntwortName = 'maschine' | 'harness' | 'modell' | 'kontext';
+
 export interface ErststartZustand {
   readonly index: number;
-  readonly antworten: Readonly<Partial<Record<'maschine' | 'harness' | 'modell', string>>>;
+  readonly antworten: Readonly<Partial<Record<AntwortName, string | number>>>;
   readonly abgeschlossen: boolean;
 }
 
@@ -80,7 +94,7 @@ function fortschritt(z: ErststartZustand, antwort: string | undefined): Ergebnis
   const name = schrittName(z);
   if (name === 'fertig') {
     const schreibungen: SettingsSchreibung[] = [];
-    for (const schritt of Object.keys(SCHLUESSEL) as (keyof typeof SCHLUESSEL)[]) {
+    for (const schritt of Object.keys(SCHLUESSEL) as AntwortName[]) {
       const wert = z.antworten[schritt];
       if (wert !== undefined) schreibungen.push({ key: SCHLUESSEL[schritt], value: wert });
     }
@@ -100,6 +114,24 @@ export function weiter(z: ErststartZustand, antwort: string): Ergebnis {
 /** Den aktuellen Schritt OHNE Antwort überspringen. Auf 'fertig': ebenfalls abschließen. */
 export function ueberspringen(z: ErststartZustand): Ergebnis {
   return fortschritt(z, undefined);
+}
+
+/**
+ * Das gewählte Kontextfenster festhalten -- die zweite Antwort des dritten
+ * Schritts. Sie hat keinen eigenen Schritt (siehe SCHLUESSEL), deshalb einen
+ * eigenen Setzer statt `weiter()`.
+ *
+ * `0` LÖSCHT die Antwort wieder. Das ist der Fall "erst ein lokales Modell
+ * gewählt, dann doch eines aus der Cloud": ohne dieses Zurücknehmen bliebe eine
+ * Tokenzahl in der Liste stehen und würde am Ende geschrieben, obwohl das
+ * gewählte Modell gar kein Fenster zur Wahl stellt.
+ */
+export function mitKontext(z: ErststartZustand, tokens: number): ErststartZustand {
+  if (z.abgeschlossen) return z;
+  const antworten = { ...z.antworten };
+  if (tokens > 0) antworten.kontext = tokens;
+  else delete antworten.kontext;
+  return { ...z, antworten };
 }
 
 /**

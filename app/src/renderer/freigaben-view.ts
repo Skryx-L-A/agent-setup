@@ -109,7 +109,93 @@ export function initFreigabenView(): void {
   const listeRequests = panel.querySelector<HTMLDivElement>('[data-liste="requests"]')!;
 
   let letzte: FreigabenPayload = { requests: [], guardBlocks: [], guardLog: [] };
+  /** Die zuletzt GEZEICHNETE Nutzlast als Zeichenkette -- siehe `onFreigaben` unten. */
+  let letzteSignatur = '';
   let offen = false;
+
+  /**
+   * Was im Begruendungsfeld steht, ueberlebt hier ein Neuzeichnen: je Eintrag
+   * unter seiner STABILEN Kennung (wartender Block: `b.schluessel`, Antrag:
+   * `r.path`). Beides benennt dieselbe Sache auch dann noch, wenn die Liste
+   * dazwischen neu gebaut wurde.
+   *
+   * Der Anlass (19.08.): `zeichnen()` baut die drei Listen mit
+   * `replaceChildren()` komplett neu, und der Hauptprozess schickt die Nutzlast
+   * in jedem Zwei-Sekunden-Takt. Wer tippte, verlor seinen Satz, den Fokus und
+   * die Schreibmarke, bevor er ihn zu Ende hatte. Der Takt zeichnet inzwischen
+   * nur noch bei einer echten Aenderung (`onFreigaben`) -- DAS hier ist die
+   * zweite Haelfte: es haelt den Satz auch dann, wenn wirklich etwas passiert,
+   * waehrend jemand schreibt. Ohne diese Haelfte waere derselbe Fehler nur
+   * seltener ausgeloest, nicht behoben.
+   */
+  const entwuerfe = new Map<string, string>();
+  /** Dieselbe Sache fuer die Ergebniszeile -- sie gehoert zur selben Fehlerklasse. */
+  const ergebnisse = new Map<string, { text: string; fehler: boolean }>();
+
+  /**
+   * Feld und Ergebniszeile eines Eintrags an seine Kennung binden: was von
+   * vorhin da ist, wieder einsetzen, und jede Eingabe merken. `data-entwurf`
+   * traegt die Kennung am Element selbst -- daran findet `zeichnen()` das Feld
+   * nach dem Neubau wieder.
+   */
+  function feldBinden(eingabe: HTMLInputElement, ergebnis: HTMLDivElement, kennung: string): void {
+    eingabe.dataset.entwurf = kennung;
+    eingabe.value = entwuerfe.get(kennung) ?? '';
+    eingabe.addEventListener('input', () => entwuerfe.set(kennung, eingabe.value));
+    const vorher = ergebnisse.get(kennung);
+    if (vorher) {
+      ergebnis.textContent = vorher.text;
+      ergebnis.classList.toggle('fg-fehler', vorher.fehler);
+    }
+  }
+
+  /** Ergebniszeile setzen UND merken -- sonst waere sie nach dem naechsten Neubau weg. */
+  function ergebnisSetzen(ergebnis: HTMLDivElement, kennung: string, text: string, fehler = false): void {
+    ergebnis.textContent = text;
+    ergebnis.classList.toggle('fg-fehler', fehler);
+    ergebnisse.set(kennung, { text, fehler });
+  }
+
+  /** Wo die Schreibmarke gerade steht, bevor die Liste neu gebaut wird. */
+  function fokusMerken(): { kennung: string; von: number; bis: number } | null {
+    const aktiv = document.activeElement;
+    if (!(aktiv instanceof HTMLInputElement) || !aktiv.classList.contains('fg-grund-eingabe')) return null;
+    const kennung = aktiv.dataset.entwurf ?? '';
+    if (!kennung) return null;
+    return {
+      kennung,
+      von: aktiv.selectionStart ?? aktiv.value.length,
+      bis: aktiv.selectionEnd ?? aktiv.value.length,
+    };
+  }
+
+  /** Und wieder dorthin, nachdem sie neu gebaut wurde. Ist der Eintrag weg, bleibt es dabei. */
+  function fokusZurueck(merk: { kennung: string; von: number; bis: number } | null): void {
+    if (!merk) return;
+    const feld = panel.querySelector<HTMLInputElement>(
+      `.fg-grund-eingabe[data-entwurf="${CSS.escape(merk.kennung)}"]`,
+    );
+    if (!feld) return;
+    feld.focus();
+    feld.setSelectionRange(merk.von, merk.bis);
+  }
+
+  /**
+   * Die Zeitangabe eines Eintrags haengt an der UHR, nicht an den Daten. Sie
+   * traegt deshalb ihren Zeitpunkt am Element mit: bleibt die Nutzlast gleich,
+   * wird nur sie aufgefrischt, statt die Liste neu zu bauen.
+   */
+  function wannBinden(el: HTMLElement, ms: number, praefix = ''): void {
+    if (!Number.isFinite(ms) || !ms) return;
+    el.dataset.wann = String(ms);
+    if (praefix) el.dataset.wannPraefix = praefix;
+  }
+
+  function zeitenAuffrischen(): void {
+    for (const el of panel.querySelectorAll<HTMLElement>('.fg-wann[data-wann]')) {
+      el.textContent = `${el.dataset.wannPraefix ?? ''}${seitHerMs(Number(el.dataset.wann))}`;
+    }
+  }
 
   function schliessen(): void {
     offen = false;
@@ -155,6 +241,7 @@ export function initFreigabenView(): void {
       <div class="fg-verzeichnis"></div>
       <div class="fg-aktionen"></div>
       <div class="fg-ergebnis"></div>`;
+    wannBinden(el.querySelector<HTMLSpanElement>('.fg-wann')!, Date.parse(b.ts));
     const musterZeile = el.querySelector<HTMLDivElement>('.fg-muster')!;
     const grundZeile = el.querySelector<HTMLDivElement>('.fg-grund')!;
     if (b.wartet) {
@@ -187,14 +274,22 @@ export function initFreigabenView(): void {
       aktionen.appendChild(btn);
     }
     if (b.wartet) {
+      // Die Kennung dieses Eintrags: der Schluessel ist derselbe Wert, ueber den
+      // auch entschieden wird. Der Pfad ist nur der Rueckfall, falls einmal
+      // keiner mitkommt -- ein Feld ohne Kennung behielte seinen Text nicht.
+      const kennung = b.schluessel || b.path;
       const label = document.createElement('label');
       label.className = 'fg-grundfeld';
-      label.textContent = 'Begruendung (ein Satz)';
+      // FREIWILLIG seit dem 19.08.: das Feld bleibt, der Zwang faellt. Steht
+      // etwas darin, landet es im Verlauf; steht nichts darin, wird trotzdem
+      // entschieden.
+      label.textContent = 'Begruendung (freiwillig)';
       const eingabe = document.createElement('input');
       eingabe.type = 'text';
       eingabe.className = 'fg-grund-eingabe';
-      eingabe.placeholder = 'ein Satz Begruendung';
+      eingabe.placeholder = 'optional -- ein Satz genuegt';
       label.appendChild(eingabe);
+      feldBinden(eingabe, ergebnis, kennung);
       el.insertBefore(label, aktionen);
 
       const hinweis = document.createElement('div');
@@ -209,22 +304,16 @@ export function initFreigabenView(): void {
       // angehaltene Rueckfrage beantwortet nur ein Mensch.
       const entscheiden = (aktion: 'approve' | 'reject', echt: boolean): void => {
         const grund = eingabe.value.trim();
-        if (!grund) {
-          ergebnis.textContent = 'Begruendung fehlt -- ein Satz genuegt.';
-          ergebnis.classList.add('fg-fehler');
-          return;
-        }
         window.awbBridge.bedienung('muster-entscheiden', {
           schluessel: b.schluessel, action: aktion, reason: grund, echt,
         });
-        ergebnis.classList.remove('fg-fehler');
         // Beim Annehmen wird nichts versprochen, was hier niemand weiss: die
         // Freigabe entsteht erst im Werkzeug, das die Herkunft misst. Bleibt
         // der Eintrag nach der Auffrischung stehen, hat es nicht geklappt --
         // der Grund steht dann im Verlauf darunter.
-        ergebnis.textContent = aktion === 'approve'
+        ergebnisSetzen(ergebnis, kennung, aktion === 'approve'
           ? 'Freigabe erteilt -- der Eintrag verschwindet, sobald sie gilt; der Worker wiederholt den Befehl selbst.'
-          : 'Abgelehnt -- der Befehl bleibt angehalten.';
+          : 'Abgelehnt -- der Befehl bleibt angehalten.');
       };
       const an = document.createElement('button');
       an.type = 'button';
@@ -255,6 +344,7 @@ export function initFreigabenView(): void {
       </div>
       <div class="fg-grund"></div>
       <div class="fg-befehl"></div>`;
+    wannBinden(el.querySelector<HTMLSpanElement>('.fg-wann')!, g.letzteMs, `${g.anzahl}× · zuletzt `);
     el.querySelector('.fg-grund')!.textContent = g.reason;
     el.querySelector('.fg-befehl')!.textContent = g.letzterBefehl;
     return el;
@@ -276,14 +366,15 @@ export function initFreigabenView(): void {
       <div class="fg-feld"><b>Dateien:</b> <span></span></div>
       <div class="fg-feld"><b>Umfang:</b> <span></span></div>
       <div class="fg-hinweis">Annehmen heisst: der Orchestrator startet diesen Worker von Hand. Es spawnt hier nichts von selbst.</div>
-      <label class="fg-grundfeld">Begruendung (ein Satz)
-        <input type="text" class="fg-grund-eingabe" placeholder="ein Satz Begruendung" />
+      <label class="fg-grundfeld">Begruendung (freiwillig)
+        <input type="text" class="fg-grund-eingabe" placeholder="optional -- ein Satz genuegt" />
       </label>
       <div class="fg-aktionen">
         <button type="button" class="fg-btn fg-btn-an">Annehmen</button>
         <button type="button" class="fg-btn fg-btn-ab">Ablehnen</button>
       </div>
       <div class="fg-ergebnis"></div>`;
+    wannBinden(el.querySelector<HTMLSpanElement>('.fg-wann')!, Date.parse(r.ts));
     const felder = el.querySelectorAll('.fg-feld span');
     felder[0].textContent = r.task;
     felder[1].textContent = r.whySeparable;
@@ -292,16 +383,14 @@ export function initFreigabenView(): void {
     felder[4].textContent = r.est;
     const eingabe = el.querySelector<HTMLInputElement>('.fg-grund-eingabe')!;
     const ergebnis = el.querySelector<HTMLDivElement>('.fg-ergebnis')!;
+    // Der Pfad des Antrags ist hier die stabile Kennung -- ueber ihn wird auch
+    // entschieden. Die Begruendung ist freiwillig (19.08.), wie beim Block.
+    feldBinden(eingabe, ergebnis, r.path);
     const entscheiden = (aktion: 'approve' | 'reject'): void => {
       const grund = eingabe.value.trim();
-      if (!grund) {
-        ergebnis.textContent = 'Begruendung fehlt -- ein Satz genuegt.';
-        ergebnis.classList.add('fg-fehler');
-        return;
-      }
       window.awbBridge.bedienung('freigaben-entscheiden', { path: r.path, action: aktion, reason: grund });
-      ergebnis.classList.remove('fg-fehler');
-      ergebnis.textContent = aktion === 'approve' ? 'Angenommen -- wird neu geladen …' : 'Abgelehnt -- wird neu geladen …';
+      ergebnisSetzen(ergebnis, r.path,
+        aktion === 'approve' ? 'Angenommen -- wird neu geladen …' : 'Abgelehnt -- wird neu geladen …');
     };
     el.querySelector('.fg-btn-an')!.addEventListener('click', () => entscheiden('approve'));
     el.querySelector('.fg-btn-ab')!.addEventListener('click', () => entscheiden('reject'));
@@ -310,6 +399,11 @@ export function initFreigabenView(): void {
 
   function zeichnen(): void {
     if (!offen) return;
+    // Bevor die Listen fallen: wo stand die Schreibmarke? Der Text selbst
+    // liegt schon in `entwuerfe` (jede Eingabe wird dort mitgeschrieben),
+    // Fokus und Markierung dagegen haengen am Knoten und muessen hier ueber
+    // den Neubau getragen werden.
+    const merk = fokusMerken();
     listeBlocks.replaceChildren();
     if (!letzte.guardBlocks.length) {
       const leer = document.createElement('div');
@@ -341,10 +435,38 @@ export function initFreigabenView(): void {
     }
 
     knopfEl.classList.toggle('fg-hat-wartende', letzte.guardBlocks.length > 0 || letzte.requests.length > 0);
+
+    // Was nicht mehr in der Liste steht, braucht auch keinen Entwurf mehr --
+    // sonst waechst die Karte ueber die Laufzeit des Fensters immer weiter.
+    const lebende = new Set<string>([
+      ...letzte.guardBlocks.map((b) => b.schluessel || b.path),
+      ...letzte.requests.map((r) => r.path),
+    ]);
+    for (const k of [...entwuerfe.keys()]) if (!lebende.has(k)) entwuerfe.delete(k);
+    for (const k of [...ergebnisse.keys()]) if (!lebende.has(k)) ergebnisse.delete(k);
+
+    fokusZurueck(merk);
   }
 
   window.awbBridge.onFreigaben((p) => {
-    letzte = p as FreigabenPayload;
+    const neu = p as FreigabenPayload;
+    // DER TAKT (19.08.): der Hauptprozess schickt diese Nutzlast alle zwei
+    // Sekunden -- auch dann, wenn sich nichts geaendert hat. Bis heute zeichnete
+    // jede davon die Listen neu und riss dabei das Begruendungsfeld samt
+    // getipptem Satz, Fokus und Schreibmarke aus dem Dokument; wer schrieb,
+    // verlor seinen Satz nach spaetestens zwei Sekunden. Verglichen wird
+    // deshalb die Nutzlast SELBST, und nur eine echte Aenderung zeichnet neu.
+    //
+    // Die Zeitangaben ("seit 3 Min.") haengen an der Uhr und nicht an den
+    // Daten. Sie werden auch im ruhigen Fall aufgefrischt -- ohne Neubau, denn
+    // sonst stuende die Anzeige still, solange sich nichts anderes bewegt.
+    const signatur = JSON.stringify(neu);
+    letzte = neu;
+    if (signatur === letzteSignatur) {
+      zeitenAuffrischen();
+      return;
+    }
+    letzteSignatur = signatur;
     zeichnen();
   });
 }

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# wb-dienst — einen launchd-Dienst bedarfsweise starten und wieder anhalten.
+#
+#   wb-dienst ensure <label> <port> [pfad]   startet ihn und wartet, bis er antwortet
+#   wb-dienst halt   <label> <port>          beendet den Prozess, laesst den Job geladen
+#   wb-dienst status <label> <port>
+#
+# WOZU (2026-08-20): globale des Nutzers Regel lautet, dass kein Prozess dauerhaft
+# laeuft, sondern nur solange er gebraucht wird — ausdruecklich auch die Dienste der
+# Werkbank selbst, und ausdruecklich schon BEIM BAU zu befolgen, nicht erst beim
+# spaeteren Aufraeumen. Dieses Werkzeug ist der Baustein dafuer: es ist genau das,
+# was `wb-modell-proxy` als ensureCmd und stopCmd aufruft, wenn eine Anfrage auf dem
+# vorgelagerten Port eintrifft beziehungsweise die Leerlauffrist ablaeuft.
+#
+# WARUM 'kickstart' UND NICHT 'load': der launchd-Job bleibt dauerhaft GELADEN, aber
+# mit RunAtLoad=false und KeepAlive=false. Geladen heisst hier nicht laufend — er ist
+# nur bekannt. Damit kann 'kickstart' ihn anwerfen und 'kill TERM' ihn beenden, ohne
+# dass jemand die plist ein- und aushaengen muss (das braeuchte eine Freigabe und
+# haette bei jedem Zyklus ein Zeitfenster, in dem der Socket nicht armiert ist).
+#
+# WORAN BEREITSCHAFT GEMESSEN WIRD: an einer TCP-Verbindung auf dem Backendport, die
+# eine Antwort liefert — nicht daran, dass ein Prozess existiert. Ein gestarteter,
+# aber noch nicht lauschender Dienst ist fuer den Aufrufer dasselbe wie keiner.
+set -uo pipefail
+
+BEREIT_FRIST="${WB_DIENST_BEREIT_FRIST:-60}"
+STOPP_FRIST="${WB_DIENST_STOPP_FRIST:-20}"
+
+fehler() { printf 'wb-dienst: %s\n' "$1" >&2; exit "${2:-1}"; }
+
+antwortet() {
+  # -o /dev/null, kein -f: ein 403 oder 406 ist eine Antwort und damit ein Beleg,
+  # dass der Dienst lauscht. Nur ein gescheiterter Verbindungsaufbau zaehlt als tot.
+  curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$1${2:-/}" 2>/dev/null
+}
+
+cmd_ensure() {
+  local label="$1" port="$2" pfad="${3:-/}" i=0
+  if antwortet "$port" "$pfad"; then
+    echo "wb-dienst: $label antwortet bereits auf $port."
+    return 0
+  fi
+  launchctl kickstart "gui/$(id -u)/$label" >/dev/null 2>&1 \
+    || fehler "'launchctl kickstart $label' fehlgeschlagen — ist der Job geladen? (launchctl list | grep $label)"
+  while [ "$i" -lt "$BEREIT_FRIST" ]; do
+    antwortet "$port" "$pfad" && { echo "wb-dienst: $label bereit auf $port (nach ${i}s)."; return 0; }
+    sleep 1; i=$((i + 1))
+  done
+  fehler "$label antwortet nach ${i}s nicht auf $port."
+}
+
+cmd_halt() {
+  local label="$1" port="$2" i=0
+  launchctl kill TERM "gui/$(id -u)/$label" >/dev/null 2>&1
+  while [ "$i" -lt "$STOPP_FRIST" ]; do
+    antwortet "$port" || { echo "wb-dienst: $label beendet, Port $port frei (nach ${i}s)."; return 0; }
+    sleep 1; i=$((i + 1))
+  done
+  fehler "$label haelt Port $port nach ${i}s noch."
+}
+
+cmd_status() {
+  local label="$1" port="$2"
+  local geladen; geladen="$(launchctl list 2>/dev/null | grep -c "$label")"
+  printf '%-34s Job %s   Port %s %s\n' "$label" \
+    "$([ "$geladen" -gt 0 ] && echo geladen || echo 'NICHT geladen')" \
+    "$port" "$(antwortet_text "$port")"
+}
+antwortet_text() { antwortet "$1" && echo "antwortet (laeuft)" || echo "still (angehalten)"; }
+
+[ $# -ge 3 ] || fehler "Aufruf: wb-dienst ensure|halt|status <label> <port> [pfad]" 2
+case "$1" in
+  ensure) shift; cmd_ensure "$@" ;;
+  halt)   shift; cmd_halt "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  *) fehler "unbekanntes Kommando '$1' (ensure|halt|status)" 2 ;;
+esac

@@ -53,6 +53,15 @@ export interface SitzungsZeile {
   grund: string;
   /** 'resumed' oder 'fresh' bei einer fortsetzbaren Zeile, sonst leer. */
   unterhaltung: string;
+  /**
+   * Fuer diesen Ordner laeuft gerade ein Start (21.08.). In diesem Fenster
+   * stand bisher nur "Stopped" -- und genau das hat alice gesehen, waehrend
+   * sein Modell noch geladen wurde. Beendet und noch-nicht-da sind zwei
+   * verschiedene Auskuenfte.
+   */
+  startet: boolean;
+  /** Der letzte Start fuer diesen Ordner ist gescheitert (21.08.). */
+  startFehler: boolean;
 }
 
 export interface SitzungsDaten {
@@ -126,6 +135,10 @@ export function sitzungsZeilen(
       grund = `Die Maschine '${s.machine}' antwortet gerade nicht.`;
     } else if (s.state !== 'stopped') {
       grund = 'Läuft noch — sie steht schon in der Sessionleiste.';
+    } else if (s.startet) {
+      grund = 'Startet gerade. Bei einem lokalen Modell wird jetzt der Modellkörper geladen; das dauert Minuten.';
+    } else if (s.startFehler) {
+      grund = 'Der letzte Start ist gescheitert. Der Grund stand in der Meldung und im Startprotokoll.';
     } else {
       grund = 'Zu dieser Sitzung ist kein Projektordner gemerkt.';
     }
@@ -137,6 +150,8 @@ export function sitzungsZeilen(
       harness: s.harness,
       model: s.model,
       state: s.state,
+      startet: s.startet,
+      startFehler: s.startFehler,
       lastActive: s.lastActive,
       fortsetzbar: kann,
       grund,

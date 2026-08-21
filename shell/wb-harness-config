@@ -56,12 +56,14 @@ Reihenfolge: $WB_HARNESS_CONFIG_SRC (fuer Tests), das Verzeichnis dieses Skripts
 ~/.local/bin, ~/AI/claude-workbench/shell. Der erste Ort, an dem die Quelle liegt, gewinnt.
 """
 
+import atomar_schreiben
 import datetime
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import sys
 
 HOME = os.path.expanduser("~")
@@ -218,6 +220,48 @@ def snapshot(target):
     return dest
 
 
+def _ohne_ignorierte_felder(obj, keys):
+    """Entfernt die genannten Schluesselnamen rekursiv aus jeder Ebene eines
+    JSON-Baums (dict/list), unabhaengig von der Verschachtelungstiefe."""
+    if isinstance(obj, dict):
+        return {k: _ohne_ignorierte_felder(v, keys) for k, v in obj.items() if k not in keys}
+    if isinstance(obj, list):
+        return [_ohne_ignorierte_felder(v, keys) for v in obj]
+    return obj
+
+
+def _inhaltlich_gleich(target_text, resolved_text, ignore_keys):
+    """Vergleicht Ziel und aufgeloeste Vorlage als JSON statt als Byte-Kette,
+    und ignoriert dabei die konfigurierten ignore_keys (2026-08-20).
+
+    ANLASS: der erste Lauf gegen die echte Maschine meldete
+    ~/.cline-wb/settings/providers.json als ABGEWICHEN, obwohl das Ausrollen
+    korrekt war -- clite selbst liest die Datei beim Start, serialisiert sie
+    neu und schreibt sie zurueck, dabei fallen unbekannte Felder wie
+    '_comment' weg, 'updatedAt' traegt den echten Zeitstempel des Laufs statt
+    des Vorlagenwerts, und die Feldreihenfolge aendert sich. Das ist keine
+    Handaenderung, sondern das erwartete Verhalten der Anwendung selbst -- ein
+    reiner Byte-Vergleich kann das nicht von einer echten Abweichung
+    unterscheiden.
+
+    Nur ein Rueckfall fuer den Fall, dass der Byte-Vergleich in befund() schon
+    gescheitert ist, und nur, wenn der configFiles-Eintrag 'compareIgnoreKeys'
+    ausdruecklich setzt (config-getrieben statt hartkodiert, wie jede andere
+    Ausnahme in diesem Werkzeug) -- ohne diese Angabe bleibt jede Datei beim
+    alten, strengeren Byte-Vergleich. Gibt True/False zurueck, oder None, wenn
+    eine der beiden Seiten kein gueltiges JSON ist (dann entscheidet weiter
+    der Byte-Vergleich in befund(), dieser Rueckfall haelt sich raus)."""
+    if not ignore_keys:
+        return None
+    try:
+        t = json.loads(target_text)
+        v = json.loads(resolved_text)
+    except (ValueError, TypeError):
+        return None
+    keys = set(ignore_keys)
+    return _ohne_ignorierte_felder(t, keys) == _ohne_ignorierte_felder(v, keys)
+
+
 # ── Befund je Datei ────────────────────────────────────────────────────────────────
 def befund(hid, spec, state):
     """Ein Eintrag aus configFiles, gegen die Wirklichkeit gehalten. Aendert nichts."""
@@ -250,13 +294,24 @@ def befund(hid, spec, state):
         r["detail"] = "am Ziel liegt nichts"
         return r
     tgt_hash = sha256(target)
+    aufgeloest = resolve_template(src)
     # Verglichen wird gegen die AUFGELOESTE Vorlage, nicht gegen die rohe Datei im Repo:
     # nach einer Ersetzung sind Ziel und rohe Vorlage zu Recht verschieden, und ein
     # Vergleich gegen die rohe Fassung wuerde ein frisch ausgerolltes Ziel faelschlich
     # als ABGEWICHEN melden.
-    if tgt_hash == hashlib.sha256(resolve_template(src).encode("utf-8")).hexdigest():
+    if tgt_hash == hashlib.sha256(aufgeloest.encode("utf-8")).hexdigest():
         r["status"] = "GLEICH"
         r["detail"] = "Ziel entspricht der Vorlage"
+        return r
+    ignore_keys = spec.get("compareIgnoreKeys")
+    with open(target, "r", encoding="utf-8", errors="replace") as fh:
+        tgt_text = fh.read()
+    gleich = _inhaltlich_gleich(tgt_text, aufgeloest, ignore_keys)
+    if gleich:
+        r["status"] = "GLEICH"
+        r["detail"] = ("Ziel entspricht der Vorlage inhaltlich (ignoriert: %s -- "
+                       "diese Felder schreibt der Harness selbst beim Start um)"
+                       % ", ".join(sorted(ignore_keys)))
         return r
     letzte = (state.get(target) or {}).get("sha256")
     if letzte and letzte == tgt_hash:
@@ -304,11 +359,13 @@ def apply_one(r, state, force):
     gesichert = ""
     if os.path.exists(target):
         gesichert = snapshot(target)
-    os.makedirs(os.path.dirname(target), exist_ok=True)
     aufgeloest = resolve_template(src)
-    with open(target, "w", encoding="utf-8", newline="") as fh:
-        fh.write(aufgeloest)
-    shutil.copymode(src, target)
+    # Unteilbar (Auftrag 5, siehe atomar_schreiben.py): der Inhalt ist erzeugt
+    # (Platzhalter aus 'src' aufgeloest), die Rechte sollen aber trotzdem von
+    # der Vorlagendatei kommen -- deshalb 'modus' statt shutil.copymode() im
+    # Nachhinein, das ein Fenster mit falschen Rechten offen liesse.
+    atomar_schreiben.schreiben(target, aufgeloest,
+                               modus=stat.S_IMODE(os.stat(src).st_mode), newline="")
     state[target] = {"sha256": hashlib.sha256(aufgeloest.encode("utf-8")).hexdigest(), "source": r["source"],
                      "harness": r["harness"], "at": datetime.datetime.now().isoformat(timespec="seconds")}
     wort = {"FEHLT": "angelegt", "VERALTET": "erneuert", "ABGEWICHEN": "ersetzt (--force)"}[status]

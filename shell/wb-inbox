@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""wb-inbox — einen Auftrag in die Socket-Inbox einer Claude-Code-Sitzung legen,
+statt ihn in ihren Pane zu tippen.
+
+  wb-inbox [-L <socket>] [--pid <n>] finde <pane-id>       Sitzung zu diesem Pane
+  wb-inbox [-L <socket>] [--pid <n>] sende <pane-id> <datei> Text zustellen
+  wb-inbox [-L <socket>] [--pid <n>] status <pane-id>        Zustand laut Register
+  wb-inbox [-L <socket>] [--pid <n>] transcript <pane-id>    Pfad der Gespraechsdatei
+
+WELCHER TMUX-SERVER (2026-08-20, nach einem Vorfall). Ohne `-L`/`--socket` und
+ohne `WB_TMUX_SOCKET` gilt der umgebende Server, wie bisher. Bis heute gab es
+diese Wahl NICHT: die Pane-Kennung wurde immer auf dem umgebenden Server
+aufgeloest. Ein Testlauf auf eigenem tmux-Socket, dessen Pane dort `%0` heisst,
+liess damit `%0` auf dem LAUFENDEN Server aufloesen -- und hat seine Testnachricht
+in zwei laufende Sitzungen des Menschen zugestellt. Die Ahnenreihen-Pruefung
+unten hat nicht geschuetzt, weil sie gegen den falschen Server geprueft hat: auf
+DEM Server war die gefundene Sitzung wirklich ein Kind von `%0`. Eine
+Pane-Kennung ist ohne ihren Server keine Adresse.
+
+DER PID-RIEGEL (`--pid`). Das Sitzungsregister fuehrt JEDE lebende Sitzung der
+Maschine, unabhaengig vom tmux-Socket -- ein umgelenktes HOME trennt es, ein
+eigener tmux-Socket nicht. Wer auf Nummer sicher gehen will (ein Testlauf mit
+echtem HOME), nennt die PID, die er selbst gestartet hat: passt der gefundene
+Eintrag nicht dazu, wird nichts gesendet und der Unterschied gemeldet.
+
+WOZU (2026-08-20). Ein Auftrag geht heute als Tastendruck-Folge in einen Pane.
+In der Nacht auf den 20.08. hat dieser Weg fuenf Panes eingefroren und Auftraege
+stumm verschluckt; die Verifikation dahinter ist viermal nachgeschaerft worden
+und heisst im Plan zu Recht "Narbengewebe". Claude Code bringt fuer genau dieses
+Problem einen eigenen Weg mit: jede Sitzung bindet einen Unix-Socket und nimmt
+darueber Nachrichten von anderen Sitzungen entgegen. Der Weg geht nicht durch
+die Eingabezeile, er kann also nichts ueberschreiben und nichts anhaengen, und
+ein Schreibfehler ist ein Fehler statt eines Schweigens.
+
+WAS AM 2026-08-20 GEMESSEN WURDE (eigener tmux-Socket, eigenes
+Arbeitsverzeichnis, Modell haiku-4.5, drei Laeufe):
+  * `claude --messaging-socket-path <pfad>` bindet den GEWUENSCHTEN Pfad. Wer
+    die Sitzung startet, muss ihre Adresse also nicht suchen -- er bestimmt sie.
+    Gebraucht wird das hier trotzdem nicht: das Register unten fuehrt jede
+    Sitzung ohnehin.
+  * `~/.claude/sessions/<pid>.json` fuehrt jede lebende Sitzung mit
+    Socketpfad, tmux-Adresse, Namen, Arbeitsverzeichnis und busy/idle.
+    Daneben liegt `<pid>.<hash>.key` mit dem `peerToken`, mit dem sich ein
+    fremder Absender anmeldet. Beides ist 0600 und gehoert dem Benutzer.
+  * Eine Zeile `{"type":"auth","token":...}`, dann eine Zeile
+    `{"type":"user","message":{"role":"user","content":...}}` -- die Sitzung
+    fuehrt den Auftrag aus. Der Weg selbst ist von Anthropic dokumentiert (die
+    CLI druckt ihn im Debug-Modus als socat-Einzeiler).
+  * OHNE `crossSessionInbound: "accept"` beim EMPFAENGER wird die Nachricht
+    ANGEHALTEN: der Worker zeigt einen Auswahldialog "Deny / Deliver" und tut
+    bis zu einer Antwort nichts. Grund laut Claude Code: der Absender ist eine
+    Shell und kann seine Berechtigungsstufe nicht bezeugen, waehrend der Worker
+    mit uebersprungenen Rueckfragen laeuft. Gemessen ohne die Einstellung:
+    angehalten. Mit ihr: zugestellt und ausgefuehrt. Deshalb setzt `pi-worker`
+    sie beim Start eines Claude-Workers -- nicht dieses Werkzeug, und nirgends
+    global.
+  * NACHTRAG 2026-08-20, gemessen an einer echten Sitzung: `accept` allein
+    reicht NICHT in jedem Fall. Eine Sitzung mit gesetztem Schalter hat eine
+    Nachricht trotzdem angehalten, mit der Begruendung "from an unidentified
+    session -- The sender did not attest its permission mode, and this session
+    bypasses permission prompts". Der auth-Token weist den Absender aus, bezeugt
+    aber keine Berechtigungsstufe. Solange kein Feld dafuer bekannt ist, ist
+    dieser Zustand fuer den Absender nicht von aussen zu erkennen -- und genau
+    deshalb behandelt `pi-worker` einen fehlenden Beleg, den keine Quelle liefern
+    KANN, als "unentschieden" statt als Fehlschlag.
+
+WAS DIESES WERKZEUG NICHT TUT: Es BEWEIST die Zustellung nicht. Der Socket
+antwortet nicht, und "geschrieben" heisst nie "gelesen". Der Beleg bleibt, wo er
+schon war -- der Auftragsmarker taucht im Pane wieder auf (das prueft `pi-worker`
+fuer JEDEN Harness gleich), und die Ergebnisdatei ist das Signal, das nicht
+luegen kann. Dieses Werkzeug meldet ehrlich nur, was es weiss: an welchen Prozess
+geschrieben wurde, und ob das Schreiben gelang.
+"""
+
+import glob
+import json
+import os
+import socket
+import subprocess
+import sys
+
+SESSIONS = os.path.expanduser("~/.claude/sessions")
+
+# Der tmux-Server, auf dem eine Pane-Kennung ueberhaupt etwas bedeutet. Leer =
+# der umgebende, also das bisherige Verhalten.
+TMUX_SOCKET = os.environ.get("WB_TMUX_SOCKET", "") or ""
+
+# Nur diese PID gilt als gueltiger Empfaenger (0 = kein Riegel).
+NUR_PID = 0
+
+# Nach dem Verbinden ablesen, WELCHER Prozess am anderen Ende haengt -- die
+# Frage, die eine Socketadresse mit einer PID darin sonst nur behauptet.
+# macOS: SOL_LOCAL/LOCAL_PEERPID. Linux: SO_PEERCRED auf SOL_SOCKET, liefert
+# ein struct ucred (pid, uid, gid) als drei native ints (Befund 2026-08-21:
+# der Kommentar hier nannte SO_PEERCRED schon lange, nur implementiert war er
+# nie -- auf Linux griff deshalb IMMER der stille Ausweichpfad unten, die
+# Verwechslungspruefung lief nie).
+SOL_LOCAL = 0
+LOCAL_PEERPID = 0x002
+
+
+def peer_pid(s):
+    """Die PID am anderen Ende von `s`, oder None wenn nicht ablesbar."""
+    if sys.platform == "darwin":
+        try:
+            return int.from_bytes(s.getsockopt(SOL_LOCAL, LOCAL_PEERPID, 4), sys.byteorder)
+        except OSError:
+            return None
+    try:
+        import struct
+        ucred = s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, _uid, _gid = struct.unpack("3i", ucred)
+        return pid
+    except (OSError, AttributeError):
+        return None
+
+
+def fehler(text):
+    sys.stderr.write("wb-inbox: %s\n" % text)
+
+
+def tmux_feld(pane, feld):
+    befehl = ["tmux"]
+    if TMUX_SOCKET:
+        befehl += ["-L", TMUX_SOCKET]
+    befehl += ["display", "-p", "-t", pane, feld]
+    try:
+        r = subprocess.run(befehl, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def ahnenreihe(pid, wurzel, tiefe=40):
+    """Steht `wurzel` in der Ahnenreihe von `pid`? Wurzel selbst zaehlt mit."""
+    if pid == wurzel:
+        return True
+    q = pid
+    for _ in range(tiefe):
+        if q in (0, 1):
+            return False
+        try:
+            r = subprocess.run(["ps", "-o", "ppid=", "-p", str(q)],
+                               capture_output=True, text=True, timeout=5)
+            q = int(r.stdout.strip())
+        except Exception:
+            return False
+        if q == wurzel:
+            return True
+    return False
+
+
+def lebt(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def peer_token(pid):
+    treffer = glob.glob(os.path.join(SESSIONS, "%d.*.key" % pid))
+    for k in treffer:
+        try:
+            d = json.load(open(k))
+        except Exception:
+            continue
+        t = d.get("peerToken")
+        if isinstance(t, str) and t:
+            return t
+    return None
+
+
+def sitzung_zu_pane(pane):
+    """Der Registereintrag der Claude-Sitzung in diesem Pane, oder None.
+
+    Zwei Stufen, und die zweite ist die entscheidende. Erst wird nach der
+    tmux-Adresse im Register vorsortiert -- das ist billig. Dann wird die
+    AHNENREIHE geprueft: der Prozess muss wirklich unter diesem Pane haengen.
+    Ohne diese zweite Stufe waere eine Pane-Kennung wie '%0' das Kriterium, und
+    '%0' gibt es auf JEDEM tmux-Server, auch auf dem Testserver nebenan und in
+    einer fremden Werkbank. Genau diese Verwechslung hat pi-worker schon einmal
+    in eine fremde Session spawnen lassen.
+    """
+    pane_pid = tmux_feld(pane, "#{pane_pid}")
+    if not pane_pid.isdigit():
+        return None
+    pane_pid = int(pane_pid)
+
+    kandidaten = []
+    for f in glob.glob(os.path.join(SESSIONS, "*.json")):
+        try:
+            d = json.load(open(f))
+        except Exception:
+            continue
+        pid = d.get("pid")
+        if not isinstance(pid, int) or not lebt(pid):
+            continue
+        sock = d.get("messagingSocketPath") or ""
+        if not sock or not os.path.exists(sock):
+            continue
+        kandidaten.append(d)
+
+    # Vorsortieren nach der tmux-Adresse, wenn eine dasteht -- sonst muesste die
+    # Ahnenreihe fuer jede lebende Sitzung der Maschine gelaufen werden.
+    kurz = "." + pane
+    vorn = [d for d in kandidaten if str(d.get("tmux") or "").endswith(kurz)]
+    for d in vorn + [d for d in kandidaten if d not in vorn]:
+        if NUR_PID and d["pid"] != NUR_PID:
+            continue
+        if ahnenreihe(d["pid"], pane_pid):
+            return d
+    return None
+
+
+def cmd_finde(pane):
+    d = sitzung_zu_pane(pane)
+    if not d:
+        return 1
+    sys.stdout.write("%d\t%s\t%s\t%s\t%s\n" % (
+        d["pid"], d.get("messagingSocketPath", ""), d.get("name", ""),
+        d.get("status", ""), d.get("sessionId", "")))
+    return 0
+
+
+def cmd_transcript(pane):
+    """Die Gespraechsdatei der Sitzung in diesem Pane.
+
+    Wozu (2026-08-20): Der Beleg, dass ein Auftrag angekommen ist, haengt sonst
+    allein daran, dass die Oberflaeche ihn auch ANZEIGT -- an Zeilenumbruch,
+    Pane-Breite, Abkuerzung langer Pfade und daran, ob sie einen eingefuegten
+    Block einklappt. Die Gespraechsdatei haengt an nichts davon: dort steht der
+    Auftragstext so, wie die Sitzung ihn bekommen hat. Sie ist deshalb die
+    zweite, unabhaengige Quelle fuer dieselbe Frage.
+
+    Bewusst NICHT ueber `wb-state worker-transcript`: das braucht einen Eintrag
+    im Zustandsdokument der Werkbank, den ein Worker in einem fremden
+    Verzeichnis nicht immer hat (gemessen). Hier reicht der Pane.
+    """
+    d = sitzung_zu_pane(pane)
+    if not d:
+        return 1
+    sid = d.get("sessionId")
+    if not sid:
+        return 1
+    treffer = glob.glob(os.path.expanduser("~/.claude/projects/*/%s.jsonl" % sid))
+    if not treffer:
+        return 1
+    sys.stdout.write("%s\n" % treffer[0])
+    return 0
+
+
+def cmd_status(pane):
+    d = sitzung_zu_pane(pane)
+    if not d:
+        return 1
+    sys.stdout.write("%s\t%s\n" % (d.get("status", ""), d.get("statusUpdatedAt", "")))
+    return 0
+
+
+def cmd_sende(pane, datei):
+    d = sitzung_zu_pane(pane)
+    if not d:
+        fehler("keine lebende Claude-Sitzung unter Pane %s (Register %s%s%s)."
+               % (pane, SESSIONS,
+                  ", tmux-Socket %s" % TMUX_SOCKET if TMUX_SOCKET else "",
+                  ", nur PID %d" % NUR_PID if NUR_PID else ""))
+        return 1
+    pid = d["pid"]
+    sock = d["messagingSocketPath"]
+    token = peer_token(pid)
+    if not token:
+        fehler("Sitzung %d hat keine lesbare Schluesseldatei — ohne sie wuerde die "
+               "Nachricht als unbekannter Absender ankommen und angehalten." % pid)
+        return 1
+    try:
+        text = open(datei, encoding="utf-8").read()
+    except Exception as e:
+        fehler("Auftragsdatei nicht lesbar (%s): %s" % (datei, e))
+        return 1
+    if not text.strip():
+        fehler("Auftragsdatei ist leer — nichts gesendet.")
+        return 1
+
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        s.connect(sock)
+    except OSError as e:
+        fehler("Socket %s nicht erreichbar (%s) — die Sitzung ist vermutlich neu "
+               "gestartet und die Adresse tot." % (sock, e))
+        return 1
+
+    # Wer haengt wirklich am anderen Ende? Die PID steckt zwar im Socketnamen,
+    # aber ein Name ist keine Messung: ein neu gestarteter Prozess kann eine
+    # alte Adresse geerbt haben. Laesst sich das nicht ablesen (fremdes System),
+    # wird trotzdem gesendet -- aber es wird gesagt.
+    gegen = peer_pid(s)
+    if gegen is not None and gegen != pid:
+        s.close()
+        fehler("am Socket %s haengt Prozess %d, erwartet war %d — nichts gesendet."
+               % (sock, gegen, pid))
+        return 1
+
+    zeilen = [
+        json.dumps({"type": "auth", "token": token}),
+        json.dumps({"type": "user", "message": {"role": "user", "content": text}}),
+    ]
+    try:
+        s.sendall(("\n".join(zeilen) + "\n").encode("utf-8"))
+    except OSError as e:
+        s.close()
+        fehler("Schreiben in %s fehlgeschlagen: %s" % (sock, e))
+        return 1
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+    sys.stdout.write("in die Inbox von '%s' (pid %d%s) geschrieben: %s\n" % (
+        d.get("name", "?"), pid,
+        "" if gegen is not None else ", Gegenstelle nicht pruefbar", sock))
+    return 0
+
+
+def main(argv):
+    global TMUX_SOCKET, NUR_PID
+    while argv and argv[0] in ("-L", "--socket", "--pid"):
+        if len(argv) < 2:
+            fehler("nach %s fehlt der Wert." % argv[0])
+            return 2
+        if argv[0] == "--pid":
+            if not argv[1].isdigit():
+                fehler("--pid erwartet eine Zahl, nicht '%s'." % argv[1])
+                return 2
+            NUR_PID = int(argv[1])
+        else:
+            TMUX_SOCKET = argv[1]
+        argv = argv[2:]
+    if not argv or argv[0] in ("-h", "--help", "--hilfe"):
+        sys.stdout.write(__doc__)
+        return 0
+    befehl = argv[0]
+    if befehl == "finde" and len(argv) == 2:
+        return cmd_finde(argv[1])
+    if befehl == "status" and len(argv) == 2:
+        return cmd_status(argv[1])
+    if befehl == "transcript" and len(argv) == 2:
+        return cmd_transcript(argv[1])
+    if befehl == "sende" and len(argv) == 3:
+        return cmd_sende(argv[1], argv[2])
+    fehler("Aufruf: wb-inbox finde|status|transcript <pane> "
+           "| wb-inbox sende <pane> <textdatei>")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

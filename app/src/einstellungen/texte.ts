@@ -153,6 +153,31 @@ export const DE: Record<string, string> = {
     + 'abgeschrieben. Höhere Stufen kosten mehr Zeit und mehr Kontingent.',
   'feld.orchestratorEffort.etikett': 'gilt für die nächste Sitzung',
 
+  'feld.orchestratorKontext.name': 'Kontextfenster',
+  'feld.orchestratorKontext.wirkung':
+    'Wie viel Text „{modell}" gleichzeitig im Kopf behält. Nur bei einem Modell, das hier auf der '
+    + 'Maschine läuft — bei einem Modell aus der Cloud gehört diese Zahl dem Anbieter.',
+  'feld.orchestratorKontext.info':
+    'Ein größeres Fenster hält mehr Zusammenhang, belegt aber dauerhaft mehr Grafikspeicher: der Bedarf '
+    + 'steigt mit jedem Token, und was nicht mehr hineinpasst, lässt den Start scheitern. Deshalb steht '
+    + 'an jeder Stufe, was sie braucht und was gerade frei ist. Gesperrt ist nichts: Stufen, für die der '
+    + 'Speicher heute nicht reicht, bleiben wählbar und tragen einen Hinweis — die Entscheidung liegt bei '
+    + 'dir, nicht beim Programm. Gemessen wird sie von wb-kontext, zusammen mit dem freien Speicher '
+    + 'dieses Augenblicks. Die Wahl gilt für den Orchestrator; über die Fenster der Worker entscheidet '
+    + 'der Orchestrator selbst.',
+  'feld.orchestratorKontext.etikett': 'gilt für die nächste Sitzung',
+  'wort.kontextToken': '{tokens} Token',
+  'wort.kontextEmpfohlen': 'empfohlen',
+  'satz.kontextBedarf': 'Braucht {bedarf} GiB.',
+  'satz.kontextSpeicher': 'Frei sind {frei} GiB, die Gewichte des Modells belegen davon {gewichte} GB.',
+  'satz.kontextFremderWert':
+    'Gespeichert sind {tokens} Token — diese Stufe bietet das gewählte Modell nicht an. '
+    + 'Solange keine der Stufen gewählt ist, startet die Sitzung mit dem gespeicherten Wert.',
+  'satz.kontextWirdErmittelt': 'Die Stufen werden ermittelt …',
+  'satz.kontextNichtErmittelt':
+    'Die Stufen ließen sich nicht ermitteln: {grund}. Solange das so ist, startet die Sitzung mit dem '
+    + 'Fenster, das für dieses Modell eingetragen ist.',
+
   'feld.newSessionDefaultDir.name': 'Ordner, in dem eine neue Sitzung anfängt',
   'feld.newSessionDefaultDir.wirkung':
     'Diesen Ordner schlägt der Plus-Knopf vor, solange du keinen anderen wählst.',
@@ -422,6 +447,29 @@ export const DE: Record<string, string> = {
     + 'wb-state sie längst liest.',
   'feld.modelDiscoveryAuto.etikett': 'sofort',
 
+  'feld.orchestratorVorhersage.name': 'Multi-Token-Vorhersage für den Orchestrator',
+  'feld.orchestratorVorhersage.wirkung':
+    'An: der Orchestrator lädt, falls für sein Modell hinterlegt, zusätzlich einen Entwerfer oder eine '
+    + 'Fassung mit eingebautem Vorhersage-Kopf — schneller je Antwort, aber ohne gemeinsame Nebenläufigkeit '
+    + 'am MLX-Server.',
+  'feld.orchestratorVorhersage.info':
+    'Welches Modell dabei benutzt wird, steht in der Registry und ist hier nicht wählbar — nur diese '
+    + 'Anzeige zeigt es an. Spekulatives Decoding und die geteilte Nebenläufigkeit des MLX-Servers '
+    + 'schließen sich gegenseitig aus (mlx_lm.server schaltet die Stapelverarbeitung ab, sobald ein '
+    + 'Entwerfer gesetzt ist) — deshalb steht dieser Schalter standardmäßig aus.',
+  'feld.workerVorhersage.name': 'Multi-Token-Vorhersage für Worker',
+  'feld.workerVorhersage.wirkung':
+    'An: ein Worker mit einem lokalen Modell lädt, falls dafür hinterlegt, denselben Entwerfer oder '
+    + 'eingebauten Kopf — getrennt vom Schalter des Orchestrators.',
+  'feld.workerVorhersage.info':
+    'Welches Modell dabei benutzt wird, steht in der Registry und ist hier nicht wählbar — nur diese '
+    + 'Anzeige zeigt es an. Gilt unabhängig vom Orchestrator-Schalter: der eine kann an sein, der andere '
+    + 'aus.',
+  'wort.vorhersageEntwerfer': 'externer Entwerfer',
+  'wort.vorhersageEingebaut': 'eingebauter Kopf',
+  'satz.vorhersageModell': 'Modell: {modell} ({bauart})',
+  'satz.vorhersageKeine': 'Für das aktuell gewählte Modell ist keine Vorhersage hinterlegt.',
+
   'feld.anbieter.name': 'Zugang zu den Anbietern',
   'feld.anbieter.wirkung':
     'Für jeden Anbieter: woher sein Zugang kommt und ob er auf dieser Maschine vorliegt.',
@@ -510,6 +558,28 @@ export const DE: Record<string, string> = {
     + 'antwortet, lässt den Start scheitern statt ihn umzuleiten — deshalb der Prüfknopf daneben.',
   'feld.defaultWorkerMachine.etikett': 'gilt für den nächsten Worker',
   'wort.dieseMaschine': 'Diese Maschine ({name})',
+
+  'feld.workerZustellung.name': 'Wie ein Auftrag beim Worker ankommt',
+  'feld.workerZustellung.wirkung':
+    'Über das Postfach der Sitzung, oder in die Eingabezeile des Panes getippt.',
+  'feld.workerZustellung.info':
+    'Getippt wird der Auftrag Zeichen für Zeichen in das Terminal des Workers – sichtbar, aber '
+    + 'anfällig: in der Nacht auf den 20.08. sind fünf Panes dabei eingefroren und Aufträge stumm '
+    + 'verschwunden. Claude Code bringt für denselben Zweck ein Postfach mit, das nicht durch die '
+    + 'Eingabezeile geht und deshalb nichts überschreiben und nichts blockieren kann. '
+    + '„Von selbst" nimmt das Postfach, wo es eines gibt, und tippt sonst; das ist die Vorgabe, '
+    + 'weil ein Postfach heute nur Claude Code mitbringt – die übrigen Programme der Registry tippen '
+    + 'so oder so, und eine Vorgabe, die für sie nicht gilt, dürfte für sie nichts kaputt machen. '
+    + '„Nur Postfach" verlangt es und lässt die Zustellung hörbar scheitern, statt ersatzweise zu '
+    + 'tippen: gedacht für Prüfläufe und für den Fall, dass in gar keine Eingabezeile mehr '
+    + 'geschrieben werden soll. Für einen Worker auf einem anderen Programm heißt diese Wahl '
+    + 'deshalb, dass er gar keinen Auftrag bekommt. „Nur tippen" ist der Rückweg, falls das '
+    + 'Postfach an einer künftigen Fassung der CLI scheitert. Ob ein Auftrag angekommen ist, wird '
+    + 'auf jedem der drei Wege gleich geprüft und im Klartext gemeldet.',
+  'feld.workerZustellung.etikett': 'gilt für den nächsten Auftrag',
+  'wort.workerZustellung.auto': 'von selbst',
+  'wort.workerZustellung.socket': 'nur Postfach',
+  'wort.workerZustellung.paste': 'nur tippen',
 
   // --- Seite 5: Aufsicht und Meldungen -------------------------------------
   'feld.contextGuardAutostart.name': 'Kontextwache läuft mit',
@@ -981,7 +1051,7 @@ export const DE: Record<string, string> = {
   'frage.einsetzen.tun': 'Einsetzen',
 
   // --- Die Namen in „was bei dir anders ist" --------------------------------
-  // 28 der 35 Namen hier sind wortgleich mit dem `name` des zugehoerigen
+  // 30 der 37 Namen hier sind wortgleich mit dem `name` des zugehoerigen
   // Feldes (`feld.<schluessel>.name`) -- test-app-bezeichnung-paritaet.sh
   // haelt das zusammen, nicht bloss dieser Kommentar. Zwei weichen ABSICHTLICH
   // ab, weil die Abweichungsliste einen ZUSTAND meldet und die Seite ein
@@ -994,6 +1064,12 @@ export const DE: Record<string, string> = {
   // Menü"), logPaths und meldungen zerfallen auf der Seite in mehrere
   // Einzelfelder statt eines, kontextwache zeigt sich nicht als Feld, sondern
   // ueber `wb-state guard|wache`.
+  // Zwei Zaehlerstaende sind hier nachgetragen, nicht neu erfunden: der
+  // Kommentar stand bis zum 20.08. auf 28 von 35 und hatte
+  // orchestratorPermissionMode (16.08.) nie mitgezaehlt; die Suite fuehrte
+  // laengst 29 von 36. Dazu kommt jetzt workerZustellung (20.08.) -- macht
+  // 30 von 37. Die zwei angemeldeten Abweichungen und die fuenf Schluessel
+  // ohne Gegenstueck sind unveraendert.
   'bezeichnung.closeSessionOnWindowClose': 'Terminal mit dem Fenster beenden',
   'bezeichnung.orchestratorHarness': 'Programm im Hauptfenster',
   'bezeichnung.orchestratorModel': 'Modell der Sitzung',
@@ -1006,6 +1082,7 @@ export const DE: Record<string, string> = {
   'bezeichnung.maxWorkers': 'Worker gleichzeitig auf dieser Maschine',
   'bezeichnung.workerWorktrees': 'Jeder Worker bekommt einen eigenen Arbeitsbaum',
   'bezeichnung.defaultWorkerMachine': 'Wo ein Worker läuft, wenn nichts gesagt wird',
+  'bezeichnung.workerZustellung': 'Wie ein Auftrag beim Worker ankommt',
   'bezeichnung.maxWorkerPanesPerTab': 'Worker je Tab',
   'bezeichnung.minWorkerPaneWidth': 'Schmalster Worker-Pane',
   'bezeichnung.contextGuardAutostart': 'Kontextwache läuft mit',
@@ -1151,6 +1228,30 @@ export const EN: Record<string, string> = {
     + 'itself, measured against its own help text, not copied from a list. Higher levels cost more time '
     + 'and more of the quota.',
   'feld.orchestratorEffort.etikett': 'takes effect on the next session',
+
+  'feld.orchestratorKontext.name': 'Context window',
+  'feld.orchestratorKontext.wirkung':
+    'How much text "{modell}" keeps in mind at once. Only for a model that runs here on this machine -- '
+    + 'for a model in the cloud that number belongs to the provider.',
+  'feld.orchestratorKontext.info':
+    'A larger window holds more context but permanently occupies more GPU memory: the demand grows with '
+    + 'every token, and what no longer fits makes the start fail. That is why every level states what it '
+    + 'needs and what is free right now. Nothing is locked: levels the memory does not cover today stay '
+    + 'selectable and carry a note -- the decision is yours, not the program\'s. It is measured by '
+    + 'wb-kontext, together with the free memory of this very moment. The choice applies to the '
+    + 'orchestrator; the windows of its workers are the orchestrator\'s own call.',
+  'feld.orchestratorKontext.etikett': 'takes effect on the next session',
+  'wort.kontextToken': '{tokens} tokens',
+  'wort.kontextEmpfohlen': 'recommended',
+  'satz.kontextBedarf': 'Needs {bedarf} GiB.',
+  'satz.kontextSpeicher': 'Free: {frei} GiB, of which the model weights take {gewichte} GB.',
+  'satz.kontextFremderWert':
+    'Stored: {tokens} tokens — the chosen model does not offer that level. '
+    + 'As long as no level is selected, the session starts with the stored value.',
+  'satz.kontextWirdErmittelt': 'Determining the levels …',
+  'satz.kontextNichtErmittelt':
+    'The levels could not be determined: {grund}. Until that changes, the session starts with the window '
+    + 'registered for this model.',
 
   'feld.newSessionDefaultDir.name': 'Folder a new session starts in',
   'feld.newSessionDefaultDir.wirkung':
@@ -1419,6 +1520,27 @@ export const EN: Record<string, string> = {
     + 'even though wb-state has long read it.',
   'feld.modelDiscoveryAuto.etikett': 'immediately',
 
+  'feld.orchestratorVorhersage.name': 'Multi-token prediction for the orchestrator',
+  'feld.orchestratorVorhersage.wirkung':
+    'On: if one is registered for its model, the orchestrator additionally loads a drafter or a build with '
+    + 'a built-in prediction head -- faster per reply, but without shared concurrency on the MLX server.',
+  'feld.orchestratorVorhersage.info':
+    'Which model gets used is set in the registry and is not selectable here -- this is a read-only '
+    + 'display only. Speculative decoding and the MLX server\'s shared concurrency are mutually exclusive '
+    + '(mlx_lm.server turns off batching the moment a drafter is set) -- that is why this switch defaults '
+    + 'to off.',
+  'feld.workerVorhersage.name': 'Multi-token prediction for workers',
+  'feld.workerVorhersage.wirkung':
+    'On: a worker on a local model loads, if one is registered for it, the same drafter or built-in head '
+    + '-- separate from the orchestrator\'s switch.',
+  'feld.workerVorhersage.info':
+    'Which model gets used is set in the registry and is not selectable here -- this is a read-only '
+    + 'display only. Independent of the orchestrator switch: one can be on while the other is off.',
+  'wort.vorhersageEntwerfer': 'external drafter',
+  'wort.vorhersageEingebaut': 'built-in head',
+  'satz.vorhersageModell': 'Model: {modell} ({bauart})',
+  'satz.vorhersageKeine': 'No prediction is registered for the currently selected model.',
+
   'feld.anbieter.name': 'Access to the providers',
   'feld.anbieter.wirkung':
     'For every provider: where its access comes from, and whether it is present on this machine.',
@@ -1508,6 +1630,26 @@ export const EN: Record<string, string> = {
     + 'answer fails the start instead of redirecting it -- hence the check button next to it.',
   'feld.defaultWorkerMachine.etikett': 'takes effect on the next worker',
   'wort.dieseMaschine': 'This machine ({name})',
+
+  'feld.workerZustellung.name': 'How a task reaches the worker',
+  'feld.workerZustellung.wirkung':
+    'Through the session inbox, or typed into the pane input line.',
+  'feld.workerZustellung.info':
+    'Typing puts the task into the worker terminal character by character -- visible, but fragile: on '
+    + 'the night of 20.08. five panes froze that way and tasks vanished silently. Claude Code ships an '
+    + 'inbox for the same purpose that does not go through the input line and therefore cannot overwrite '
+    + 'or block anything. "Automatic" uses the inbox where there is one and types otherwise; it is the '
+    + 'default because only Claude Code ships an inbox today -- the other programs in the registry type either '
+    + 'way, and a default that does not apply to them must not break anything for them. "Inbox only" '
+    + 'requires it and lets delivery fail audibly instead of typing as a substitute: meant for test runs '
+    + 'and for the case that nothing should be written into an input line at all. For a worker on any '
+    + 'other program that choice therefore means it gets no task. "Typing only" is the way back, should '
+    + 'the inbox break on a future version of the CLI. Whether a task arrived is checked the same way on '
+    + 'all three routes and reported in plain words.',
+  'feld.workerZustellung.etikett': 'takes effect on the next task',
+  'wort.workerZustellung.auto': 'automatic',
+  'wort.workerZustellung.socket': 'inbox only',
+  'wort.workerZustellung.paste': 'typing only',
 
   // --- Page 5: Oversight and notifications -------------------------
   'feld.contextGuardAutostart.name': 'Context guard starts along',
@@ -1984,6 +2126,7 @@ export const EN: Record<string, string> = {
   'bezeichnung.maxWorkers': 'Workers at once on this machine',
   'bezeichnung.workerWorktrees': 'Every worker gets its own worktree',
   'bezeichnung.defaultWorkerMachine': 'Where a worker runs when nothing is said',
+  'bezeichnung.workerZustellung': 'How a task reaches the worker',
   'bezeichnung.maxWorkerPanesPerTab': 'Workers per tab',
   'bezeichnung.minWorkerPaneWidth': 'Narrowest worker pane',
   'bezeichnung.contextGuardAutostart': 'Context guard starts along',

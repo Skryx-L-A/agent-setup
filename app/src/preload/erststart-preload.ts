@@ -10,6 +10,11 @@
 //                  (`plane()`/`fuehreAus()`, also `wb-state settings set`), nur ueber einen
 //                  eigenen Kanal
 //   bereit()       das erste Zeichnen melden, fuer den Steuerkanal
+//   kontextStufen(modellId)  die waehlbaren Kontextfenster eines LOKALEN Modells,
+//                  gemessen von `wb-kontext` -- derselbe Kanal, den auch das
+//                  Einstellungsfenster benutzt. Er kann NICHT in `daten()`
+//                  mitfahren: welches Modell gemeint ist, entscheidet sich erst
+//                  im Fenster, wenn jemand im dritten Schritt geklickt hat.
 //
 // Es gibt hier KEINEN Weg, das Fenster zu ZEIGEN: sichtbar wird es entweder automatisch beim
 // ersten echten Start oder ueber einen echten Klick im HAUPTfenster (siehe
@@ -20,6 +25,7 @@ contextBridge.exposeInMainWorld('awbErststart', {
   daten: () => ipcRenderer.invoke('awb:erststart-daten'),
   setzen: (key: string, value: unknown) => ipcRenderer.invoke('awb:erststart-setzen', key, value),
   bereit: () => ipcRenderer.send('awb:erststart-bereit'),
+  kontextStufen: (modellId: string) => ipcRenderer.invoke('awb:kontext-stufen', modellId),
   // Farben durchreichen (11.08.): derselbe Kanal wie in den anderen Fenstern
   // (main/thema.ts).
   thema: () => ipcRenderer.invoke('awb:thema-daten'),

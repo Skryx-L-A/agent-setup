@@ -1,66 +1,74 @@
 #!/bin/bash
-# grug-server — bedarfsweiser MLX-Server fuer grug-27b (mlx_lm.server, Port 8081).
+# grug-server — duenner Vorspann fuer grug-27b auf wb-mlx-server (mlx_lm.server,
+# Port 8081 ueber den Server, 8080 ueber wb-modell-proxy davor).
 #
-# PORT 8081 STATT 8080 (2026-08-13): Vor 8080 sitzt jetzt wb-modell-proxy,
-# gehalten von launchd (agent-workbench.modell-proxy.plist). Der Proxy nimmt die
-# erste Verbindung an, ruft `grug-server ensure` auf, reicht danach roh nach
-# 8081 durch und ruft nach 20 Minuten Leerlauf `grug-server stop`. pi's
-# ~/.pi/agent/models.json zeigt unveraendert auf 127.0.0.1:8080 und merkt vom
-# Umbau nichts — die Adresse stimmt weiterhin, nur haelt sie jetzt der Proxy.
-# Von Hand aufgerufen tut dieses Werkzeug genau dasselbe wie vorher, nur eben
-# auf 8081.
-#
-# Usage:
-#   grug-server ensure   startet den Server falls noetig, wartet mit Frist auf
-#                         Antwortbereitschaft, meldet Erfolg erst nach einer
-#                         echten Probeanfrage. Laeuft er schon, tut es nichts.
-#   grug-server stop      beendet den Server und PRUEFT das Ende (Prozess weg,
-#                         Port frei), statt es anzunehmen.
-#   grug-server status     sagt, ob er laeuft, seit wann, mit wie viel Speicher.
-#
-#   --frist <minuten>      wie lange die Belegung bei `wb-belegung` gelten soll
-#                          (Vorgabe 180, auch ueber GRUG_SERVER_FRIST_MIN). Wer
-#                          einen langen Lauf faehrt, setzt sie auf dessen
-#                          Laenge — siehe die Begruendung bei
-#                          BELEGUNG_FRIST_MIN weiter unten.
-#
-# BEWUSST KEIN LaunchAgent (2026-08-11, Anweisung des Nutzers): 15 GB dauerhaft
-# im Speicher zu halten wuerde Bild- und Videoerzeugung blockieren, die auf
-# dieser Maschine denselben Speicher braucht. Der Server startet bei Bedarf
-# (`ensure`) und gibt den Speicher mit `stop` wieder frei.
+# UMGEBAUT 2026-08-19 (Auftrag A, Entscheidung des Nutzers: grug und qwen3.8
+# teilen sich EINEN umschaltbaren MLX-Server, weil nur eines der beiden in den
+# Speicher passt). Was VORHER hier direkt implementiert war -- Belegungsbuch,
+# Speicherwaechter (Boden 20480 MiB), Nebenlaeufigkeit (decode/prompt-
+# concurrency, samt der Verklemmungsgeschichte von mlx-lm 0.31.3), das
+# generische Ensure/Stop/Status mit Probeanfrage -- lebt jetzt in
+# shell/wb-mlx-server, UNVERAENDERT scharf, nur nicht mehr grug-spezifisch
+# hartkodiert (Gewichte/Kontext kommen dort aus der Registry). Diese Datei
+# tut nur noch zwei Dinge: (1) den Pfad zu grug-27b GENAUSO aufloesen wie
+# bisher (siehe MODEL_PATH unten -- das bleibt unveraendert, weil
+# gardener/grug_client.py GRUG_MODEL_PATH UNABHAENGIG liest und Server,
+# Client und Belegung sonst auseinanderlaufen koennten, siehe die Begruendung
+# dort), und (2) das Ergebnis unveraendert (als absoluter PFAD, nicht als
+# Alias "grug") an `wb-mlx-server ensure|stop|status` weiterreichen. pi-worker
+# (Zeile ~307), der Modell-Proxy und lauf-fenster.sh rufen weiterhin
+# `grug-server ensure|stop|status` auf und merken vom Umbau nichts; jeder
+# bisherige Schalter (--frist, GRUG_SERVER_DECODE_PARALLEL,
+# GRUG_SERVER_PROMPT_PARALLEL, GRUG_SERVER_OHNE_BELEGUNG) wirkt unveraendert,
+# nur uebersetzt auf die Namen, die wb-mlx-server versteht.
 #
 # Modellwahl (2026-08-11, Messung des Nutzers, siehe regeln/lokale-modelle.md
 # Abschnitt "Das Kleinere darf gewinnen"): MLX 4bit schlug Ollama und
-# llama.cpp auf beiden Achsen — Einzeldurchsatz (17,7 Tok/s) UND
+# llama.cpp auf beiden Achsen -- Einzeldurchsatz (17,7 Tok/s) UND
 # Nebenlaeufigkeit (14,8/21,1/28,1/28,1/23,9 Tok/s bei 1/2/4/8/16 Anfragen,
 # Trefferquote 49/50). Ollama serialisiert fuer diese Architektur komplett,
-# llama.cpp liegt unter MLX und trifft nur 45/50.
+# llama.cpp liegt unter MLX und trifft nur 45/50. grug ist seit 2026-08-19
+# nicht mehr die Vorgabe fuer lokale Arbeit (das ist jetzt qwen3.8, dieselbe
+# Bauform, eigene Messung steht aus) -- grug bleibt vollstaendig erhalten und
+# waehlbar, diese Messung bleibt seine Grundlage.
 #
-# BELEGUNGSBUCH (2026-08-11): `check-resources` sieht nur den freien Speicher
-# IN DIESEM AUGENBLICK, nicht, was eine ANDERE Sitzung gerade zu laden
-# vorhat — genau die Luecke, aus der beide Kernel-Paniken der Nacht zum
-# 11.08. entstanden. `ensure` nimmt deshalb VOR dem Start eine Belegung bei
-# `wb-belegung`, meldet sie nach der Probeanfrage als `geladen`, und `stop`
-# gibt sie nach dem verifizierten Ende zurueck. --parallel/--kontext
-# spiegeln nicht die theoretischen Maximalwerte von `mlx_lm.server`
-# (decode-concurrency=32 in der Vorgabe), sondern die empirisch belegte
-# Betriebsgrenze aus der Vorfallsnotiz: 8 gleichzeitige Anfragen liefen
-# sauber, bei 16 brach das Modell zusammen. Der KV-Bedarf je Token ist fuer
-# die MLX-Fassung selbst nicht gemessen; eingetragen ist er als ANGENOMMEN,
-# uebernommen von der llama.cpp-Messung derselben Architektur (Schluessel
-# "grug27b-llamacpp-qat-q4" in wb-belegungs KV-Register, `wb-belegung kv
-# liste`) — beide sind Quantisierungen desselben qwen3_5-Hybrid-Checkpoints
-# mit demselben Rekurrent/Attention-Verhaeltnis, aber nicht derselbe
-# Server-Prozess, deshalb "angenommen" statt "gemessen". check-resources
-# bleibt zusaetzlich bestehen: das eine misst die Wirklichkeit, das andere
-# die Absicht der anderen Sitzungen.
+# Usage (unveraendert):
+#   grug-server ensure    startet grug falls noetig, wartet mit Frist auf
+#                         Antwortbereitschaft, meldet Erfolg erst nach einer
+#                         echten Probeanfrage. Laeuft es schon, tut es nichts
+#                         (Frist wird nachgezogen). Laeuft STATTDESSEN ein
+#                         anderes MLX-Modell (z.B. qwen3.8), wird es zuerst
+#                         sauber beendet -- das ist jetzt Aufgabe von
+#                         wb-mlx-server, siehe dort.
+#   grug-server stop      beendet den Server, aber NUR wenn es grug ist, das
+#                         gerade laeuft (sonst Fehler statt eines falschen
+#                         Beendens -- siehe wb-mlx-server stop [<modell>]).
+#   grug-server status    sagt, ob (irgendein MLX-Modell ueber diesen Server)
+#                         laeuft, seit wann, mit wie viel Speicher.
 #
-# GRUG_SERVER_OHNE_BELEGUNG=1 ist die einzige Umgehung, und sie ist
-# bewusst laut: fehlt `wb-belegung` oder scheitert es an etwas anderem als
-# einem klaren Nein (Kommando nicht gefunden, Sperre haengt, Buch
-# beschaedigt), bricht `ensure` sonst ab, statt still ohne die
-# Cross-Sitzungs-Sperre zu starten. Ein klares NEIN von `wb-belegung`
-# selbst (kein Platz) wird von dieser Variable NICHT uebersteuert.
+#   --frist <minuten>      wie lange die Belegung bei `wb-belegung` gelten soll
+#                          (Vorgabe 180, auch ueber GRUG_SERVER_FRIST_MIN).
+#   --parallel <n>         NACHGEZOGEN 2026-08-20 (offener Punkt aus dem
+#                          Handoff dieses Worktrees): reines Durchreichen an
+#                          `wb-mlx-server ensure --parallel <n>` (siehe dort
+#                          fuer die volle Bedeutung -- Nebenlaeufigkeit als
+#                          Aufrufer-Entscheidung, Vorgabe 1). Bisher ging das
+#                          nur ueber die zwei getrennten Umgebungsvariablen
+#                          GRUG_SERVER_DECODE_PARALLEL/_PROMPT_PARALLEL; die
+#                          bleiben unveraendert bestehen (tieferliegende
+#                          Vorgabe), ein gesetztes --parallel hat aber
+#                          Vorrang, weil es die ausdrueckliche Zahl DIESES
+#                          Aufrufs ist.
+#
+# BEWUSST KEIN LaunchAgent (2026-08-11, Anweisung des Nutzers): 15 GB dauerhaft
+# im Speicher zu halten wuerde Bild- und Videoerzeugung blockieren, die auf
+# dieser Maschine denselben Speicher braucht. Gilt unveraendert fuer
+# wb-mlx-server darunter.
+#
+# GRUG_SERVER_OHNE_BELEGUNG=1 ist die einzige Umgehung der Cross-Sitzungs-
+# Sperre, und sie ist bewusst laut (siehe wb-mlx-server fuer die volle
+# Begruendung). Ein klares NEIN von `wb-belegung` selbst wird davon NICHT
+# uebersteuert.
 set -uo pipefail
 
 # Ueber die Umgebung setzbar, damit ein Modellwechsel EINE Stelle ist. Server,
@@ -71,7 +79,9 @@ set -uo pipefail
 # des Traums. Zwei hartkodierte Pfade waeren zwei Wahrheiten, und
 # `mlx_lm.server` 0.31.3 laedt bei Abweichung still das Modell des Clients
 # nach - die Divergenz faellt dann nicht auf, sie kostet nur je Anfrage 15 GB
-# Umladen (Befund B3, 16.08.2026).
+# Umladen (Befund B3, 16.08.2026). DIESE KETTE BLEIBT UNVERAENDERT (siehe
+# Kopfkommentar) -- wb-mlx-server bekommt unten den FERTIGEN Pfad, nicht den
+# Alias "grug".
 _konfig_modell() {
   uv run --project "$HOME/Knowledge/_meta/tools/gardener" python -c \
     'from gardener.dream import config as c; print(c.DREAM_LOCAL_MODEL_PATH)' \
@@ -79,399 +89,19 @@ _konfig_modell() {
 }
 MODEL_PATH="${GRUG_MODEL_PATH:-$(_konfig_modell)}"
 MODEL_PATH="${MODEL_PATH:-$HOME/AI/mlx-models/grug-27b-mlx-q4}"
-PORT=8081
-BASEURL="http://127.0.0.1:$PORT"
-NAME="grug-server"
-LOG="$HOME/.local/state/wb-nohup/logs/$NAME.log"
 
-BELEGUNG_MODELL="$(basename "$MODEL_PATH")"
-BELEGUNG_GEWICHTE_GB=15
-# Die Belegung bucht GENAU so viele gleichzeitige Anfragen, wie der Server
-# auch faehrt. Bis zum 16.08.2026 stand hier 8, waehrend --decode-concurrency
-# 4 fuhr - zwei Zahlen fuer dieselbe Sache, und die eine wusste nichts von der
-# anderen. Ein Deckel, der etwas anderes buchte als das, was laeuft, ist keine
-# Sicherung, sondern eine Zahl mit gutem Gewissen.
-BELEGUNG_PARALLEL=${GRUG_SERVER_DECODE_PARALLEL:-4}
-# Kontext-Token je Anfrage fuer die Belegungsrechnung.
-#
-# Angehoben am 16.08.2026 von 2048 auf 18432 (Befund B1 des Prueferlaufs
-# `pruefer-lokal`). Die alte Zahl deckte den Worst Case nicht: Eine Anfrage der
-# Extraktion traegt rund 1.700 Prompt-Token und darf bis zu
-# DREAM_LOCAL_MAX_TOKENS = 16.384 zurueckschreiben. Vier gleichzeitige
-# Anfragen, die alle ans Token-Limit laufen (finish_reason=length, bei lokalen
-# Modellen kein exotischer Fall), belegen also rund 70.000 Token KV-Cache -
-# gebucht waren 8 x 2048 = 16.384, also ein Viertel davon.
-#
-# Der Kommentar von f7aa829 hatte es schon gesagt, ohne die Folgerung zu
-# ziehen: die Buchung "war korrekt und trotzdem zu klein". Genau in diese
-# Luecke ist der Rechner am 15.08. um 23:04 gefallen.
-BELEGUNG_KONTEXT=18432
-# Stapelverarbeitung. Ohne diese beiden Schalter arbeitet mlx_lm.server
-# gleichzeitige Anfragen NACHEINANDER ab; Nebenlaeufigkeit bringt dann fast
-# nichts (11.08.2026: 16 gleichzeitige Anfragen fuer 35 % mehr Durchsatz).
-# Mit ihnen teilen sich mehrere Sequenzen EINEN Gewichtsdurchlauf - der teure
-# Teil eines Tokens ist das Lesen der 15 GB Gewichte, nicht das Rechnen.
-# Am 15.08.2026 am echten Extraktionspfad gemessen, dieselben 15 Einheiten:
-#   seriell   97,0 s/Einheit   15,9 Tok/s
-#   vier      40,3 s/Einheit   37,4 Tok/s   2,40x
-#   acht      42,2 s/Einheit   34,8 Tok/s   2,30x
-# Vier ist der Suesspunkt, acht ist bereits wieder langsamer - ab dort
-# konkurrieren die Anfragen um dieselbe Bandbreite, statt sie zu teilen.
-# Der Wert bleibt UNTER der Belegung (8): die Belegung deckt die Spitze ab,
-# gefahren wird die gemessene Bestleistung.
-DECODE_PARALLEL=${GRUG_SERVER_DECODE_PARALLEL:-4}
-# Die VORVERARBEITUNG bleibt bei eins, auch wenn vier erzeugt wird. Das sind
-# zwei verschiedene Dinge, und sie am 15.08.2026 gekoppelt zu haben, hat den
-# Rechner um 23:04 umgebracht (watchdog timeout, 92 s ohne Lebenszeichen):
-#
-#   Erzeugung  ist lang und gleichmaessig - dort kommt der Faktor 2,4 her.
-#   Vorverarbeitung ist kurz und SPITZ: vier Prompts zugleich vorzuverarbeiten
-#   erzeugt die groessten Zwischenergebnisse des ganzen Laufs, und zwar alle
-#   im selben Moment.
-#
-# Der Vorfallsbericht vom 11.08. beschreibt genau diesen Augenblick: die Panik
-# kam, "als acht gleichzeitige Anfragen ihre Prompt-Verarbeitung beendeten und
-# zugleich in die Erzeugung gingen". Bei der Extraktion mit 1.739
-# Prompt-Tokens ging es gut; bei der Urteilsstufe mit bis zu 12.390 nicht.
-# Kosten: fast nichts. Vorverarbeitung laeuft mit hunderten Tokens je Sekunde,
-# Erzeugung mit sechzehn - sie serialisiert zu haben faellt kaum ins Gewicht.
-#
-# ZURUECKGENOMMEN am 16.08.2026, wenige Stunden nach der Einfuehrung: Die
-# Kombination decode=4 mit prompt=1 VERKLEMMT sich in mlx-lm 0.31.3. Gemessen
-# an einem haengenden Lauf - vier offene Verbindungen, GPU bei null, und in
-# `sample` warten ALLE Faeden auf Bedingungsvariablen, auch der Hauptfaden.
-# Kein Fortschritt, nur Zeitueberschreitungen im Client.
-#
-# Der Gedanke war richtig, der Weg falsch. Die Spitze bei der Vorverarbeitung
-# wird jetzt anders begrenzt, naemlich am Prompt selbst: Die Urteilsstufe
-# zeigt Hunks als Differenz (REVIEW_HUNK_AS_DIFF), das drueckt den groessten
-# Prompt von 43.376 auf 14.140 Zeichen. Vier davon gleichzeitig sind rund
-# 16.000 Token Vorverarbeitung - gegen 7.000 bei der Extraktion, die bei 4/4
-# nie Probleme machte, und gegen 49.560 in der Nacht des Absturzes.
-#
-# Dazu die Speicherwache in der Messstrecke, die den Server beendet, wenn der
-# freie Speicher zweimal hintereinander unter den Boden faellt.
-PROMPT_PARALLEL=${GRUG_SERVER_PROMPT_PARALLEL:-$DECODE_PARALLEL}
-# Frist der Belegung in Minuten. Drei Stunden reichen fuer eine interaktive
-# Sitzung, aber nicht fuer einen langen Lauf: am 12.08.2026 lief ein
-# Kaltstart-Fenster bis 12:00, waehrend seine Belegung um 06:55 verfallen
-# waere. Eine verfallene Belegung ist kein harmloser Karteileichnam — sie wird
-# von `wb-belegung aufraeumen` entfernt, und danach haelt die naechste Sitzung
-# die 20,5 GiB fuer frei und laedt ihr eigenes Modell daneben. Das ist genau
-# der Weg in den Speichermangel, an dem die Maschine in der Nacht zum 11.08.
-# zweimal gestorben ist. Wer laenger braucht, sagt es beim Start:
-#   grug-server ensure --frist 460
+# GRUG_SERVER_*-Namen bleiben fuer Aufrufer bestehen (lauf-fenster.sh,
+# pi-worker), werden hier auf die generischen WB_MLX_SERVER_*-Namen
+# uebersetzt, die wb-mlx-server liest. Reines Durchreichen -- kein neuer
+# Vorgabewert, keine neue Bedeutung.
+[ -n "${GRUG_SERVER_DECODE_PARALLEL:-}" ] && export WB_MLX_SERVER_DECODE_PARALLEL="$GRUG_SERVER_DECODE_PARALLEL"
+[ -n "${GRUG_SERVER_PROMPT_PARALLEL:-}" ] && export WB_MLX_SERVER_PROMPT_PARALLEL="$GRUG_SERVER_PROMPT_PARALLEL"
+[ -n "${GRUG_SERVER_OHNE_BELEGUNG:-}" ] && export WB_MLX_SERVER_OHNE_BELEGUNG="$GRUG_SERVER_OHNE_BELEGUNG"
+
 BELEGUNG_FRIST_MIN=${GRUG_SERVER_FRIST_MIN:-180}
-KENNUNG_DATEI="$HOME/.local/state/grug-server/belegung-kennung"
-
-# Mindestfreier Speicher vor dem Start, in MiB (20 GB). Das Modell braucht rund
-# 15 GB Gewichte; darunter fuehrt ein Start dieselbe Kette wie in der Nacht
-# zum 11.08.2026: MLX fordert mehr Grafikspeicher an als frei ist, der Metal-
-# Befehlspuffer scheitert mit "Insufficient Memory"
-# (kIOGPUCommandBufferCallbackErrorOutOfMemory), und im Aufraeumpfad danach
-# zaehlt der Treiber (IOGPUFamily) einen Referenzzaehler unter null — Kernel-
-# Panik, zweimal in derselben Nacht gemessen, beide Male aus mlx_lm.server.
-# Siehe ~/Knowledge/10-global/incident-2026-08-11-kernel-panik-durch-gpu-speichermangel.md.
-# Eine abgelehnte Stufe wird NIE von Hand nachgefordert — die Ablehnung IST
-# das Ergebnis, kein Anlass fuer einen zweiten Versuch.
-MIN_FREE_MIB=20480
+PARALLEL=""
 
 err() { printf 'grug-server: %s\n' "$*" >&2; }
-
-belegung_bin() {
-  local p="$HOME/.local/bin/wb-belegung"
-  if [ -x "$p" ]; then printf '%s' "$p"; return 0; fi
-  command -v wb-belegung 2>/dev/null
-}
-
-find_pid() {
-  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1
-}
-
-is_ours() {
-  local pid="$1"
-  [ -n "$pid" ] && ps -o command= -p "$pid" 2>/dev/null | grep -q "mlx_lm"
-}
-
-wait_health() {
-  local deadline_s="$1" waited=0
-  while [ "$waited" -lt "$deadline_s" ]; do
-    curl -fsS --max-time 2 "$BASEURL/health" >/dev/null 2>&1 && return 0
-    sleep 2; waited=$((waited + 2))
-  done
-  return 1
-}
-
-probe_request() {
-  local body
-  body=$(printf '{"model":"%s","messages":[{"role":"user","content":"Antworte nur mit OK."}],"max_tokens":8}' "$MODEL_PATH")
-  curl -fsS --max-time 60 "$BASEURL/v1/chat/completions" -H 'Content-Type: application/json' -d "$body"
-}
-
-# Nimmt VOR dem Start eine Belegung bei wb-belegung, die die SPITZE beschreibt
-# (Gewichte + Nebenlaeufigkeit x Kontext x KV-Bedarf + Zuschlag), nicht nur das
-# Gewicht -- siehe Kopfkommentar. Setzt bei Erfolg BELEGUNG_KENNUNG (leer, wenn
-# ohne Belegung weitergemacht wird, siehe GRUG_SERVER_OHNE_BELEGUNG oben).
-# Rueckgabe: 0 = weiter (mit oder ohne Kennung), 1 = abbrechen.
-BELEGUNG_KENNUNG=""
-belegung_nehmen() {
-  BELEGUNG_KENNUNG=""
-  local wbb; wbb="$(belegung_bin)"
-  if [ -z "$wbb" ]; then
-    if [ "${GRUG_SERVER_OHNE_BELEGUNG:-0}" = "1" ]; then
-      err "WARNUNG: wb-belegung nicht gefunden — GRUG_SERVER_OHNE_BELEGUNG=1 gesetzt, starte OHNE Cross-Sitzungs-Sperre."
-      return 0
-    fi
-    err "wb-belegung nicht gefunden — kein Start ohne die Cross-Sitzungs-Sperre."
-    err "Wer sicher ist, dass das in Ordnung geht: GRUG_SERVER_OHNE_BELEGUNG=1 grug-server ensure"
-    return 1
-  fi
-
-  local nimm_out nimm_rc
-  nimm_out="$("$wbb" nimm \
-    --gewichte-gb "$BELEGUNG_GEWICHTE_GB" --modell "$BELEGUNG_MODELL" \
-    --parallel "$BELEGUNG_PARALLEL" --kontext "$BELEGUNG_KONTEXT" \
-    --zweck "grug-server: MLX-Server fuer grug-27b, Port $PORT" \
-    --frist "$BELEGUNG_FRIST_MIN" 2>&1)"
-  nimm_rc=$?
-  printf '%s\n' "$nimm_out" >&2
-
-  if [ "$nimm_rc" -eq 0 ]; then
-    BELEGUNG_KENNUNG="$(printf '%s\n' "$nimm_out" | sed -n 's/.*unter der Kennung \([0-9a-f]\{1,\}\).*/\1/p' | head -1)"
-    if [ -z "$BELEGUNG_KENNUNG" ]; then
-      err "wb-belegung nimm meldete Erfolg, aber keine lesbare Kennung in der Ausgabe — kein Start."
-      return 1
-    fi
-    return 0
-  fi
-  if [ "$nimm_rc" -eq 1 ]; then
-    err "wb-belegung lehnt die Belegung ab (siehe oben, mit Halter) — kein Start."
-    return 1
-  fi
-  # Exit 2/3 oder etwas anderes Unerwartetes: wb-belegung selbst ist
-  # gescheitert (Sperre haengt, Buch beschaedigt, Aufrufsfehler), kein
-  # ordentliches Nein. "NICHT stumm durchstarten" heisst: Standard ist
-  # Abbruch; die Umgehung ist ein Mensch, der es bewusst setzt.
-  if [ "${GRUG_SERVER_OHNE_BELEGUNG:-0}" = "1" ]; then
-    err "WARNUNG: wb-belegung scheiterte (Exit $nimm_rc, siehe oben) — GRUG_SERVER_OHNE_BELEGUNG=1 gesetzt, starte OHNE Cross-Sitzungs-Sperre."
-    return 0
-  fi
-  err "wb-belegung scheiterte unerwartet (Exit $nimm_rc) — kein Start ohne die Cross-Sitzungs-Sperre."
-  err "Wer sicher ist, dass das in Ordnung geht: GRUG_SERVER_OHNE_BELEGUNG=1 grug-server ensure"
-  return 1
-}
-
-# Gibt eine gehaltene Belegung zurueck -- ueber die persistierte Kennung, sonst
-# ersatzweise alle Belegungen dieses Panes (siehe Randfall im Kopfkommentar:
-# eine vergessene Belegung darf die Maschine nie sperren).
-belegung_freigeben() {
-  local wbb; wbb="$(belegung_bin)"
-  [ -n "$wbb" ] || return 0
-  local kennung=""
-  if [ -f "$KENNUNG_DATEI" ]; then
-    kennung="$(tr -d '[:space:]' < "$KENNUNG_DATEI" 2>/dev/null)"
-  fi
-  if [ -n "$kennung" ]; then
-    if ! "$wbb" gib "$kennung" 2>&1; then
-      # Ownership-Mismatch (stop laeuft in einem anderen Pane als ensure) --
-      # der Prozess ist an dieser Stelle bereits nachweislich tot, die
-      # Belegung darf trotzdem weg.
-      "$wbb" gib "$kennung" --fremd 2>&1
-    fi
-    rm -f "$KENNUNG_DATEI"
-  else
-    "$wbb" gib --eigene 2>&1
-  fi
-  return 0
-}
-
-belegung_abbrechen() {
-  local wbb; wbb="$(belegung_bin)"
-  if [ -n "$wbb" ] && [ -n "$BELEGUNG_KENNUNG" ]; then
-    "$wbb" gib "$BELEGUNG_KENNUNG" 2>&1
-    rm -f "$KENNUNG_DATEI"
-  fi
-  return 1
-}
-
-cmd_status() {
-  local kennung=""
-  [ -f "$KENNUNG_DATEI" ] && kennung="$(tr -d '[:space:]' < "$KENNUNG_DATEI" 2>/dev/null)"
-
-  local pid; pid="$(find_pid)"
-  if [ -n "$pid" ] && is_ours "$pid"; then
-    local since rss_kib rss_mib
-    since="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//')"
-    rss_kib="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
-    rss_mib=$(( ${rss_kib:-0} / 1024 ))
-    echo "grug-server: laeuft (PID $pid, Port $PORT), seit: $since, Speicher: ${rss_mib} MiB"
-    echo "  Modell: $MODEL_PATH"
-    if [ -n "$kennung" ]; then
-      echo "  Belegung: $kennung (Details: wb-belegung wer)"
-    else
-      echo "  Belegung: keine gehalten"
-    fi
-    return 0
-  fi
-  echo "grug-server: nicht aktiv (Port $PORT frei)"
-  if [ -n "$kennung" ]; then
-    echo "  ACHTUNG: Belegung $kennung ist noch eingetragen, obwohl der Server nicht laeuft (wb-belegung wer / wb-belegung gib $kennung)."
-  fi
-  return 1
-}
-
-cmd_ensure() {
-  local pid; pid="$(find_pid)"
-  if [ -n "$pid" ] && is_ours "$pid"; then
-    echo "grug-server: laeuft bereits (PID $pid) — kein Start noetig." >&2
-    # Die FRIST der bestehenden Belegung trotzdem nachziehen. Ohne das hier
-    # schliesst `lauf-fenster.sh` sein Loch nur halb: Es setzt
-    # GRUG_SERVER_FRIST_MIN auf die Fensterlaenge, aber die Variable wirkt
-    # allein beim START. Laeuft der Server schon — vom Modell-Proxy mit der
-    # Vorgabe von 180 Minuten hochgezogen, oder aus einer frueheren Sitzung —,
-    # kehrt `ensure` an dieser Stelle zurueck und die alte, kuerzere Frist
-    # bleibt stehen. Ein Acht-Stunden-Lauf faehrt dann ab Stunde drei mit
-    # VERFALLENER Belegung; `wb-belegung aufraeumen` entfernt sie, die
-    # naechste Sitzung haelt die 20,5 GiB fuer frei und laedt ihr Modell
-    # daneben. Das ist der dokumentierte Weg in den Speichermangel, und der
-    # ist der Weg in die Panik (gefunden am 16.08.2026 vom Prueferlauf
-    # `pruefer-lokal`, Befund B2).
-    local wbb kennung
-    wbb="$(belegung_bin)"
-    if [ -n "$wbb" ] && [ -f "$KENNUNG_DATEI" ]; then
-      kennung="$(tr -d '[:space:]' < "$KENNUNG_DATEI" 2>/dev/null)"
-      if [ -n "$kennung" ]; then
-        if "$wbb" verlaengern "$kennung" --frist "$BELEGUNG_FRIST_MIN" >/dev/null 2>&1; then
-          err "Belegung $kennung auf $BELEGUNG_FRIST_MIN Minuten verlaengert."
-        else
-          err "WARNUNG: Belegung $kennung liess sich nicht verlaengern — bei einem langen Lauf kann sie verfallen."
-        fi
-      fi
-    fi
-    return 0
-  fi
-  if [ -n "$pid" ]; then
-    err "Port $PORT ist belegt, aber nicht von mlx_lm.server (PID $pid). Kein Start."
-    return 1
-  fi
-
-  if ! command -v check-resources >/dev/null 2>&1; then
-    err "check-resources nicht gefunden — kein Start ohne Speicherpruefung."
-    return 1
-  fi
-  local free_mib
-  free_mib="$(check-resources 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["ram"]["free_mib"])' 2>/dev/null)"
-  if [ -z "$free_mib" ]; then
-    err "check-resources lieferte keinen lesbaren Wert — kein Start ohne Speicherpruefung."
-    return 1
-  fi
-  if [ "$free_mib" -lt "$MIN_FREE_MIB" ]; then
-    err "nur ${free_mib} MiB frei, mindestens ${MIN_FREE_MIB} MiB (20 GB) noetig — Start abgebrochen."
-    err "Grund: siehe Kopfkommentar dieser Datei und ~/Knowledge/10-global/incident-2026-08-11-kernel-panik-durch-gpu-speichermangel.md"
-    return 1
-  fi
-
-  if ! command -v mlx_lm.server >/dev/null 2>&1; then
-    err "mlx_lm.server nicht im PATH gefunden."
-    return 1
-  fi
-  if [ ! -d "$MODEL_PATH" ]; then
-    err "Modellverzeichnis fehlt: $MODEL_PATH"
-    return 1
-  fi
-
-  belegung_nehmen || return 1
-  mkdir -p "$(dirname "$KENNUNG_DATEI")" 2>/dev/null
-  if [ -n "$BELEGUNG_KENNUNG" ]; then
-    printf '%s\n' "$BELEGUNG_KENNUNG" > "$KENNUNG_DATEI"
-  else
-    rm -f "$KENNUNG_DATEI"
-  fi
-  # Ab hier haelt dieser Lauf ggf. eine Belegung -- jeder Abbruchpfad
-  # darunter muss sie wieder freigeben (belegung_abbrechen), sonst bleibt
-  # eine Spitze im Buch stehen, die nie geladen wurde.
-  local newpid
-  newpid="$("$HOME/.local/bin/wb-nohup" "$NAME" -- mlx_lm.server --model "$MODEL_PATH" --port "$PORT" \
-    --decode-concurrency "$DECODE_PARALLEL" \
-    --prompt-concurrency "$PROMPT_PARALLEL")" || {
-    err "wb-nohup konnte den Server nicht starten — siehe $LOG"
-    belegung_abbrechen; return 1
-  }
-  echo "grug-server: gestartet (PID $newpid), warte auf Antwortbereitschaft..." >&2
-
-  if ! wait_health 90; then
-    err "Server antwortet nach 90s nicht auf /health — siehe $LOG"
-    belegung_abbrechen; return 1
-  fi
-
-  echo "grug-server: /health antwortet, sende Probeanfrage..." >&2
-  local resp
-  if ! resp="$(probe_request)"; then
-    err "Probeanfrage fehlgeschlagen — Server ist erreichbar, liefert aber keine gueltige Antwort. Siehe $LOG"
-    belegung_abbrechen; return 1
-  fi
-  if ! printf '%s' "$resp" | python3 -c 'import json,sys
-d=json.load(sys.stdin)
-sys.exit(0 if d.get("choices") else 1)' 2>/dev/null; then
-    err "Probeanfrage lieferte kein gueltiges Ergebnis: $resp"
-    belegung_abbrechen; return 1
-  fi
-
-  if [ -n "$BELEGUNG_KENNUNG" ]; then
-    local wbb; wbb="$(belegung_bin)"
-    [ -n "$wbb" ] && "$wbb" geladen "$BELEGUNG_KENNUNG" 2>&1
-  fi
-  echo "grug-server: bereit (PID $newpid, Port $PORT), Probeanfrage erfolgreich." >&2
-  return 0
-}
-
-cmd_stop() {
-  local pid; pid="$(find_pid)"
-  if [ -z "$pid" ]; then
-    # Kein Prozess heisst NICHT "nichts zu tun". Bis zum 16.08.2026 kehrte
-    # stop hier zurueck, ohne die Belegung freizugeben, und genau dann ist sie
-    # tot: gebuchter Speicher ohne Server dahinter. Jeder weitere `ensure`
-    # wird daraufhin abgelehnt ("Grenze B ... - 25,5 offen belegt"), und was
-    # den Server braucht, faellt still auf einen Ersatzweg zurueck. Beim
-    # Traum-Lauf hiess dieser Ersatzweg: jedes Aussagenpaar bleibt
-    # unbeurteilt "distinct", ueber Stunden, ohne Fehlermeldung.
-    if [ -f "$KENNUNG_DATEI" ]; then
-      echo "grug-server: kein Prozess, aber eine offene Belegung — gebe sie frei." >&2
-      belegung_freigeben
-    else
-      echo "grug-server: nicht aktiv — nichts zu beenden." >&2
-    fi
-    return 0
-  fi
-  if ! is_ours "$pid"; then
-    err "Port $PORT ist belegt von PID $pid, aber nicht von mlx_lm.server — nichts beendet."
-    return 1
-  fi
-
-  kill "$pid" 2>/dev/null
-  local waited=0
-  while ps -o pid= -p "$pid" >/dev/null 2>&1 && [ "$waited" -lt 30 ]; do
-    sleep 0.5; waited=$((waited + 1))
-  done
-  if ps -o pid= -p "$pid" >/dev/null 2>&1; then
-    err "PID $pid reagiert nach 15s nicht auf SIGTERM — sende SIGKILL."
-    kill -9 "$pid" 2>/dev/null
-    sleep 1
-  fi
-
-  if ps -o pid= -p "$pid" >/dev/null 2>&1; then
-    err "PID $pid laeuft immer noch — Beenden fehlgeschlagen."
-    return 1
-  fi
-  local stillpid; stillpid="$(find_pid)"
-  if [ -n "$stillpid" ]; then
-    err "Prozess $pid ist weg, aber Port $PORT ist weiterhin belegt (PID $stillpid) — pruefen."
-    return 1
-  fi
-  echo "grug-server: beendet — Prozess $pid weg, Port $PORT frei." >&2
-  belegung_freigeben
-  return 0
-}
 
 unterbefehl="${1:-}"
 shift 2>/dev/null || true
@@ -482,13 +112,21 @@ while [ $# -gt 0 ]; do
         ''|*[!0-9]*) echo "grug-server: --frist braucht Minuten als Zahl" >&2; exit 2 ;;
       esac
       BELEGUNG_FRIST_MIN="$2"; shift 2 ;;
+    --parallel)
+      case "${2:-}" in
+        ''|*[!0-9]*|0) echo "grug-server: --parallel braucht eine Zahl ab 1" >&2; exit 2 ;;
+      esac
+      PARALLEL="$2"; shift 2 ;;
     *) echo "grug-server: unbekannte Option '$1'" >&2; exit 2 ;;
   esac
 done
 
 case "$unterbefehl" in
-  ensure) cmd_ensure ;;
-  stop)   cmd_stop ;;
-  status) cmd_status ;;
-  *) echo "Usage: grug-server ensure|stop|status [--frist <minuten>]" >&2; exit 2 ;;
+  ensure)
+    set -- ensure "$MODEL_PATH" --frist "$BELEGUNG_FRIST_MIN"
+    [ -n "$PARALLEL" ] && set -- "$@" --parallel "$PARALLEL"
+    exec "$HOME/.local/bin/wb-mlx-server" "$@" ;;
+  stop)   exec "$HOME/.local/bin/wb-mlx-server" stop "$MODEL_PATH" ;;
+  status) exec "$HOME/.local/bin/wb-mlx-server" status ;;
+  *) echo "Usage: grug-server ensure|stop|status [--frist <minuten>] [--parallel <n>]" >&2; exit 2 ;;
 esac

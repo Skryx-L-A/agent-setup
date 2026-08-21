@@ -20,8 +20,9 @@
   Installation (der Nutzer selbst, nicht automatisch eingerichtet): diese Datei
   nach ~/Library/LaunchAgents/agent-workbench.modell-proxy.plist kopieren, dann
   `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/agent-workbench.modell-proxy.plist`.
-  Voraussetzung: shell/wb-modell-proxy und shell/grug-server liegen bereits
-  ausfuehrbar in ~/.local/bin/, und
+  Voraussetzung: shell/wb-modell-proxy, shell/wb-mlx-server und
+  shell/grug-server (duenner Vorspann auf wb-mlx-server, seit 2026-08-19)
+  liegen bereits ausfuehrbar in ~/.local/bin/, und
   shell/wb-modell-proxy-backends.default.json liegt als
   ~/.config/wb-modell-proxy/backends.json — ProgramArguments zeigt auf den
   installierten Pfad, nicht auf das Repo.
@@ -49,6 +50,32 @@
       <key>SockType</key><string>stream</string>
       <key>SockFamily</key><string>IPv4</string>
     </dict>
+    <!-- Bedarfsschaltung der geteilten MCP-Server (2026-08-20). Der Schluessel ist
+         zugleich 'socketName' im passenden Eintrag von backends.json. Der Server
+         selbst lauscht dahinter auf 8777 und wird erst beim ersten Zugriff
+         gestartet -- global geltende Regel: kein Prozess laeuft dauerhaft, nur
+         solange er gebraucht wird. -->
+    <key>8767</key>
+    <dict>
+      <key>SockNodeName</key><string>127.0.0.1</string>
+      <key>SockServiceName</key><string>8767</string>
+      <key>SockType</key><string>stream</string>
+      <key>SockFamily</key><string>IPv4</string>
+    </dict>
+    <key>8766</key>
+    <dict>
+      <key>SockNodeName</key><string>127.0.0.1</string>
+      <key>SockServiceName</key><string>8766</string>
+      <key>SockType</key><string>stream</string>
+      <key>SockFamily</key><string>IPv4</string>
+    </dict>
+    <key>11434</key>
+    <dict>
+      <key>SockNodeName</key><string>127.0.0.1</string>
+      <key>SockServiceName</key><string>11434</string>
+      <key>SockType</key><string>stream</string>
+      <key>SockFamily</key><string>IPv4</string>
+    </dict>
   </dict>
   <key>EnvironmentVariables</key>
   <dict>
@@ -58,9 +85,10 @@
   <!--
     ExitTimeOut: launchd gibt einem Job nach SIGTERM sonst nur 5 Sekunden bis
     zum SIGKILL. Der Proxy beendet in dieser Zeit noch das Backend
-    (grug-server stop wartet bis zu 15 s auf SIGTERM, dann SIGKILL, dann
+    (wb-mlx-server stop, seit 2026-08-19 -- vorher grug-server stop direkt,
+    dieselbe Wartelogik: wartet bis zu 15 s auf SIGTERM, dann SIGKILL, dann
     prueft es den Port) — mit der Vorgabe waere er mitten darin erschlagen
-    worden und haette 15 GB verwaist zurueckgelassen.
+    worden und haette 15-16 GB verwaist zurueckgelassen.
   -->
   <key>ExitTimeOut</key><integer>90</integer>
   <key>StandardOutPath</key><string>$HOME/.local/state/wb-modell-proxy/launchd.log</string>

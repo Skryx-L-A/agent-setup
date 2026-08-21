@@ -51,6 +51,14 @@ interface HarnessSicht {
   binaer: boolean;
 }
 
+/** Multi-Token-Vorhersage (2026-08-20) -- Spiegel von RegistryVorhersage in extension/src/models.ts. */
+interface VorhersageSicht {
+  bauart: 'entwerfer' | 'eingebaut';
+  modell: string;
+  gewichteGb?: number;
+  herkunft?: string;
+}
+
 interface ModellSicht {
   id: string;
   label: string;
@@ -60,9 +68,36 @@ interface ModellSicht {
   efforts: string[];
   effortFaehig: boolean;
   kontext: number;
+  /** Laeuft dieses Modell hier statt bei einem Anbieter? Nur dann ist das Fenster eine Wahl. */
+  lokal: boolean;
   startbar: boolean;
   deckelRegistry: string;
+  /** Aus der Registry, nicht einstellbar -- siehe VorhersageSicht. */
+  vorhersage?: VorhersageSicht;
 }
+
+/** Eine waehlbare Kontextstufe -- siehe main/kontext.ts fuer die Herkunft der Zahlen. */
+interface KontextStufe {
+  tokens: number;
+  label: string;
+  bedarfGib: number;
+  passt: boolean;
+  hinweis: string | null;
+}
+
+interface KontextSicht {
+  modell: string;
+  nativesMaximum: number;
+  freiMib: number;
+  gewichteGb: number;
+  kvMibProToken: number;
+  parallel: number;
+  vorgabe: number;
+  empfehlung: number;
+  stufen: KontextStufe[];
+}
+
+type KontextAntwort = { ok: true; sicht: KontextSicht } | { ok: false; fehler: string };
 
 interface WacheRolle {
   an: boolean;
@@ -200,6 +235,8 @@ declare global {
       schluesselSetzen(providerId: string, wert: string): Promise<{ ok: boolean }>;
       /** ECHTER Versand -- eine Probe ueber die gewaehlten Wege, Rueckmeldung je Weg. */
       meldungTesten(): Promise<MeldeTestErgebnis>;
+      /** Die waehlbaren Kontextfenster EINES lokalen Modells. Nur Lesen. */
+      kontextStufen(modellId: string): Promise<KontextAntwort>;
       /** Denselben Weg wie das Zahnrad im Hauptfenster: isTrusted entscheidet. */
       erststartZeigen(echt: boolean): void;
     };
@@ -241,6 +278,35 @@ let sicherungsText = '';
  * dieser Funktion sich selbst neu.
  */
 let schluesselStand: Record<string, boolean> = {};
+
+/**
+ * Die Kontextstufen je Modell-Kennung, so wie `wb-kontext` sie zuletzt gemeldet
+ * hat. Sie fahren NICHT im Datenstand mit (Grund: main.ts beim Kanal
+ * `awb:kontext-stufen`), sondern werden geholt, sobald ein lokales Modell
+ * gewaehlt ist und nichts dazu vorliegt.
+ *
+ * DREI SACHEN HALTEN DAS RUHIG. Erstens merkt sich `kontextLaeuft`, welche
+ * Abfrage unterwegs ist -- ohne das setzte jedes Neuzeichnen einen weiteren
+ * Prozess an. Zweitens wird ein GESCHEITERTER Versuch genauso gemerkt wie ein
+ * gelungener: sonst versuchte es die Oberflaeche endlos weiter, solange das
+ * Werkzeug fehlt. Drittens wird der Vorrat geleert, wenn ein neuer Datenstand
+ * ankommt -- der freie Speicher ist eine Momentaufnahme, und eine alte Zahl
+ * unter einer frischen Seite waere eine Behauptung ueber jetzt.
+ */
+let kontextStand: Record<string, KontextAntwort> = {};
+const kontextLaeuft = new Set<string>();
+
+function kontextHolen(modellId: string): void {
+  if (!modellId || kontextLaeuft.has(modellId) || kontextStand[modellId]) return;
+  kontextLaeuft.add(modellId);
+  void window.awbEinstellungen.kontextStufen(modellId)
+    .then((a) => { kontextStand[modellId] = a; })
+    .catch((e: unknown) => { kontextStand[modellId] = { ok: false, fehler: String(e) }; })
+    .then(() => {
+      kontextLaeuft.delete(modellId);
+      zeichne();
+    });
+}
 
 async function schluesselStatusLaden(): Promise<void> {
   try {
@@ -405,6 +471,23 @@ function klartext(g: HTMLElement, text: string): HTMLElement {
   const p = el('div', 'klartext', text);
   g.appendChild(p);
   return p;
+}
+
+/**
+ * Multi-Token-Vorhersage (2026-08-20): welches Modell der Schalter benutzen
+ * WUERDE, reine Anzeige aus der Registry -- kein Steuerelement, des Nutzers
+ * Vorgabe ("die Zuordnung gehoert zur Auslieferung, nicht in die
+ * Oberflaeche"). `modelle` ist die Liste der jeweiligen Rolle
+ * (orchestrator/worker), `modellId` das gerade fuer diese Rolle gesetzte
+ * Modell.
+ */
+function vorhersageAnzeige(modelle: ModellSicht[], modellId: string): string {
+  const m = modelle.find((x) => x.id === modellId);
+  if (!m?.vorhersage) return t('satz.vorhersageKeine');
+  const { bauart, modell, herkunft } = m.vorhersage;
+  const kurz = modell.split('/').pop() ?? modell;
+  const bauartText = bauart === 'entwerfer' ? t('wort.vorhersageEntwerfer') : t('wort.vorhersageEingebaut');
+  return t('satz.vorhersageModell', { modell: kurz, bauart: bauartText }) + (herkunft ? ` (${herkunft})` : '');
 }
 
 function feld(g: HTMLElement, o: FeldOpt): HTMLElement {
@@ -862,6 +945,118 @@ function stufenwahl(
   feld(g, { ...o, schluessel, breit: true, steuer: box });
 }
 
+/**
+ * DAS KONTEXTFENSTER -- und die eine Regel, die diese Wahl traegt.
+ *
+ * JEDE STUFE BLEIBT WAEHLBAR. Eine Stufe, fuer die der Speicher gerade nicht
+ * reicht (`passt: false`), wird nicht ausgegraut, nicht gesperrt und nicht
+ * weggelassen: sie steht in derselben Liste, an derselben Stelle, und traegt
+ * ihren Hinweis sichtbar mit. Das ist ausdrueckliche des Nutzers Vorgabe -- er
+ * will sehen, was der Speicher sagt, und trotzdem selbst entscheiden. Wer
+ * daraus einen Riegel macht, hat die Aufgabe missverstanden.
+ *
+ * DAS FELD ERSCHEINT NUR BEI EINEM LOKALEN MODELL. Bei einem Cloud-Modell
+ * gehoert das Fenster dem Anbieter; ein Schalter dafuer waere ein Versprechen
+ * ohne Deckung. Es bleibt dann ganz weg -- keine graue Zeile, keine Luecke im
+ * Aufbau der Seite, denn eine leere Zeile laesst jemanden nach dem Fehler
+ * suchen, den es nicht gibt.
+ *
+ * WAS NICHT ERMITTELT WERDEN KONNTE, WIRD GESAGT. Fehlt `wb-kontext` oder
+ * lehnt es ab, steht der Wortlaut des Werkzeugs da -- nie eine erfundene
+ * Liste. Dieselbe Regel wie bei den Effort-Stufen je Harness.
+ */
+function kontextwahl(
+  g: HTMLElement,
+  modell: ModellSicht | undefined,
+  gewaehlt: unknown,
+): void {
+  if (!modell?.lokal) return;
+  const o = texte('orchestratorKontext', { modell: modell.label });
+  const antwort = kontextStand[modell.id];
+  if (!antwort) {
+    kontextHolen(modell.id);
+    feld(g, {
+      ...o,
+      schluessel: 'orchestratorKontext',
+      breit: true,
+      steuer: el('div', 'leerhinweis', t('satz.kontextWirdErmittelt')),
+    });
+    return;
+  }
+  if (!antwort.ok) {
+    feld(g, {
+      ...o,
+      schluessel: 'orchestratorKontext',
+      breit: true,
+      steuer: el('div', 'leerhinweis', t('satz.kontextNichtErmittelt', { grund: antwort.fehler })),
+    });
+    return;
+  }
+  const s = antwort.sicht;
+  // Vorausgewaehlt ist `vorgabe`, solange niemand etwas anderes gesetzt hat.
+  const wert = typeof gewaehlt === 'number' && gewaehlt > 0 ? gewaehlt : s.vorgabe;
+  const box = el('div');
+  const liste = el('div', 'kontextliste');
+  for (const stufe of s.stufen) {
+    const b = el('button', 'kontexteintrag') as HTMLButtonElement;
+    b.type = 'button';
+    b.dataset.kontext = String(stufe.tokens);
+    b.dataset.passt = stufe.passt ? 'ja' : 'nein';
+    if (stufe.tokens === wert) b.classList.add('gewaehlt');
+    if (stufe.tokens === s.empfehlung) b.dataset.empfohlen = 'ja';
+
+    const z1 = el('div', 'zeile1');
+    z1.appendChild(el('span', undefined,
+      `${stufe.tokens === wert ? '● ' : '○ '}${stufe.label}`));
+    // Die Marke steht NEBEN dem Namen, nicht am rechten Rand hinter der
+    // Tokenzahl: sie gehoert zur Stufe, nicht zur Zahl.
+    if (stufe.tokens === s.empfehlung) {
+      z1.appendChild(el('span', 'marke empfohlen', t('wort.kontextEmpfohlen')));
+    }
+    z1.appendChild(el('span', 'kennung', t('wort.kontextToken', { tokens: stufe.tokens })));
+    b.appendChild(z1);
+
+    // Zweite Zeile: wo der Speicher nicht reicht, der HINWEIS -- und nur er.
+    // Er nennt den Bedarf bereits mitsamt dem, was frei ist; die knappe Zeile
+    // daneben stuende sonst zweimal fast wortgleich untereinander (am Bild
+    // gesehen). Wo der Speicher reicht, steht der Bedarf.
+    const z2 = el('div', !stufe.passt && stufe.hinweis ? 'zeile2 kontexthinweis' : 'zeile2');
+    z2.textContent = !stufe.passt && stufe.hinweis
+      ? stufe.hinweis
+      : t('satz.kontextBedarf', { bedarf: stufe.bedarfGib.toFixed(1) });
+    b.appendChild(z2);
+
+    b.addEventListener('click', () => void setze('orchestratorKontext', stufe.tokens));
+    liste.appendChild(b);
+  }
+  box.appendChild(liste);
+
+  // Der Hinweis der GEWAEHLTEN Stufe noch einmal unter der Liste: nach dem
+  // Klick steht die Wahl oben, und der Satz, der zu ihr gehoert, soll nicht
+  // erst wieder gesucht werden muessen.
+  const gewaehlteStufe = s.stufen.find((x) => x.tokens === wert);
+  const fuss = el('div', 'kontextfuss');
+  if (!gewaehlteStufe) {
+    // Der gespeicherte Wert kommt in dieser Liste nicht vor -- der Fall nach
+    // einem Modellwechsel, bei dem das neue Modell ein kleineres Maximum hat.
+    // Es wird nichts stillschweigend auf die Vorgabe zurechtgebogen: dann
+    // stuende in der Datei etwas anderes als im Fenster.
+    fuss.classList.add('warnt');
+    fuss.textContent = t('satz.kontextFremderWert', { tokens: wert });
+  } else if (!gewaehlteStufe.passt && gewaehlteStufe.hinweis) {
+    fuss.classList.add('warnt');
+    fuss.textContent = gewaehlteStufe.hinweis;
+  } else {
+    fuss.textContent = t('satz.kontextSpeicher', {
+      frei: (s.freiMib / 1024).toFixed(1),
+      gewichte: s.gewichteGb.toFixed(1),
+    });
+  }
+  box.appendChild(fuss);
+
+  feld(g, { ...o, schluessel: 'orchestratorKontext', breit: true, steuer: box });
+}
+
 // --- Seite 1: Sitzung -------------------------------------------------------
 
 function seiteSitzung(d: Daten): HTMLElement {
@@ -909,6 +1104,8 @@ function seiteSitzung(d: Daten): HTMLElement {
     d.deckel[gewaehlt],
     d.deckel[gewaehlt]?.efforts ?? d.harnessStufen[orchModell?.harness ?? ''] ?? [],
     String(d.settings.orchestratorEffort ?? 'xhigh'));
+  // Unter der Modellwahl, und nur bei einem lokalen Modell -- siehe kontextwahl().
+  kontextwahl(g1, orchModell, d.settings.orchestratorKontext);
 
   feld(g1, {
     ...texte('newSessionDefaultDir'),
@@ -1335,6 +1532,33 @@ function seiteHarnesses(d: Daten): HTMLElement {
       (an) => void setze('modelDiscoveryAuto', an)),
   });
 
+  // Multi-Token-Vorhersage (2026-08-20): AN/AUS je Rolle, das Modell dahinter
+  // ist eine reine Anzeige aus der Registry -- kein Steuerelement dafuer, wie
+  // alice es vorgegeben hat ("die Zuordnung gehoert zur Auslieferung,
+  // nicht in die Oberflaeche").
+  const orchVorhersage = el('div');
+  orchVorhersage.appendChild(haken('orchestratorVorhersage', d.settings.orchestratorVorhersage === true,
+    (an) => void setze('orchestratorVorhersage', an)));
+  orchVorhersage.appendChild(el('div', 'klartext',
+    vorhersageAnzeige(d.orchestratorModelle, String(d.settings.orchestratorModel ?? ''))));
+  feld(g2, {
+    ...texte('orchestratorVorhersage'),
+    schluessel: 'orchestratorVorhersage',
+    breit: true,
+    steuer: orchVorhersage,
+  });
+  const workerVorhersage = el('div');
+  workerVorhersage.appendChild(haken('workerVorhersage', d.settings.workerVorhersage === true,
+    (an) => void setze('workerVorhersage', an)));
+  workerVorhersage.appendChild(el('div', 'klartext',
+    vorhersageAnzeige(d.workerModelle, String(d.settings.workerModel ?? ''))));
+  feld(g2, {
+    ...texte('workerVorhersage'),
+    schluessel: 'workerVorhersage',
+    breit: true,
+    steuer: workerVorhersage,
+  });
+
   const g3 = gruppe(s, t('gruppe.harnesses.schluessel'));
   const at = el('table');
   at.id = 'anbieterTabelle';
@@ -1606,6 +1830,25 @@ function seiteMaschinen(d: Daten): HTMLElement {
       String(d.settings.defaultWorkerMachine ?? 'local'),
       maschinenwahl,
       (w) => void setze('defaultWorkerMachine', w),
+    ),
+  });
+  // Auf welchem Weg ein Auftrag beim Worker ankommt (2026-08-20). Steht hier und
+  // nicht auf der Erlaubnisse-Seite: das ist keine Sicherung, die jemand
+  // wegnimmt, sondern die Frage, wie ein Auftrag den Worker erreicht -- dieselbe
+  // Familie wie 'auf welcher Maschine' direkt darueber.
+  feld(g2, {
+    ...texte('workerZustellung'),
+    wartet: true,
+    schluessel: 'workerZustellung',
+    steuer: segmente(
+      'workerZustellung',
+      String(d.settings.workerZustellung ?? 'auto'),
+      [
+        { wert: 'auto', label: t('wort.workerZustellung.auto') },
+        { wert: 'socket', label: t('wort.workerZustellung.socket') },
+        { wert: 'paste', label: t('wort.workerZustellung.paste') },
+      ],
+      (w) => void setze('workerZustellung', w),
     ),
   });
   return s;
@@ -2325,6 +2568,10 @@ window.awbEinstellungen.onDaten((d) => {
   if (stand === gezeichneterStand) return;
   gezeichneterStand = stand;
   daten = d;
+  // Ein neuer Datenstand heisst: irgendetwas hat sich geaendert, vielleicht das
+  // Modell selbst. Der freie Speicher ist ohnehin eine Momentaufnahme -- der
+  // Vorrat wird geleert, und was gebraucht wird, holt `kontextwahl()` neu.
+  kontextStand = {};
   zeichne();
 });
 

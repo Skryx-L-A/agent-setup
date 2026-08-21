@@ -32,6 +32,52 @@ import subprocess
 RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
 
 
+def repo_wurzel_ermitteln():
+    """Der Baum, aus dem DIESES Werkzeug wirklich gerufen wird -- eine
+    Tatsache, keine Annahme (Befund 21.08.2026, gemessen auf peer: ein Lauf
+    ohne --repo verglich gegen den fest verdrahteten Vorgabewert
+    ~/AI/claude-workbench, waehrend die Arbeit tatsaechlich in einem 34
+    Commits entfernten Worktree lief -- neun Werkzeuge wurden faelschlich als
+    KOPIE-EIGENMAECHTIG gemeldet, eine Registry-Abweichung dazu. Nicht nur
+    eine falsche Zahl: eine falsche Beschuldigung, "hier hat jemand von Hand
+    herumgepfuscht", waehrend in Wirklichkeit nur der Vergleichsbaum falsch
+    war).
+
+    Diese Datei liegt selbst unter shell/wb-consistency -- ob sie direkt
+    laeuft oder von wb-ausrollen importiert wird (_lade_wb_consistency() dort
+    haengt sie aus DEMSELBEN Verzeichnis wie wb-ausrollen selbst ein, beide
+    liegen immer nebeneinander), __file__ zeigt so oder so auf DIESEN
+    Aufrufort. Der Elternordner von shell/ ist der Arbeitsbaum, WENN von dort
+    aus gelaufen wird -- Hauptbaum und jeder Worktree haben dieselbe Form,
+    beide werden hier gleich behandelt. Nur die ausgerollte Kopie unter
+    ~/.local/bin hat KEINEN Baum ueber sich: shell/ existiert dort nicht, das
+    Skript liegt flach neben den anderen ausgerollten Werkzeugen.
+
+    Fuer DIESEN Fall bleibt ein Rueckfall noetig -- aber er MUSS sagen, dass
+    er raet, statt still einen Pfad anzunehmen (dieselbe Linie wie die
+    ANGENOMMEN/GEMESSEN-Kennzeichnung beim KV-Bedarf in wb-belegung: raten
+    ist erlaubt, stilles Raten nicht). --repo <pfad> bleibt in jedem Fall die
+    letzte, staerkste Quelle -- diese Funktion wird nur befragt, wenn er
+    fehlt.
+
+    Rueckgabe: (pfad, gemessen: bool, erklaerung-fuer-den-menschen: str)."""
+    eigen = os.path.dirname(os.path.abspath(__file__))
+    if os.path.basename(eigen) == "shell":
+        kandidat = os.path.dirname(eigen)
+        # .git bestaetigt: kein zufaellig "shell" benannter Ordner, sondern
+        # wirklich ein Klon oder Worktree (bei einem Worktree ist .git eine
+        # Datei, kein Verzeichnis -- os.path.exists deckt beides ab).
+        if os.path.exists(os.path.join(kandidat, ".git")):
+            return kandidat, True, (
+                "gemessen: %s (Elternordner von shell/, wo dieses Werkzeug "
+                "tatsaechlich liegt)" % kandidat)
+    geraten = os.path.expanduser("~/AI/claude-workbench")
+    return geraten, False, (
+        "GERATEN, nicht gemessen: dieses Werkzeug laeuft als ausgerollte "
+        "Kopie ohne eigenen Baum ueber sich -- %s angenommen. --repo <pfad> "
+        "nennt den echten Baum." % geraten)
+
+
 def load_config(path, base, repo=None):
     """{BASE} ist das Heimatverzeichnis, {REPO} der Arbeitsbaum der Werkbank.
 
@@ -40,11 +86,19 @@ def load_config(path, base, repo=None):
     Oberflaeche und der Skripte liegt im Repo. Check 6 braucht den Quelltext --
     ein Schalter ist tot oder lebendig im Code, nicht in der Installation.
     Beide sind ueber die Kommandozeile umlenkbar, damit ein Test seine eigene
-    Kopie pruefen kann und nie den echten Baum."""
+    Kopie pruefen kann und nie den echten Baum.
+
+    Fehlt 'repo' (None oder leer), entscheidet repo_wurzel_ermitteln() --
+    gemessen, wenn moeglich, sonst ein genannter Ratewert (siehe dort). Ein
+    Aufrufer, der die Herkunft dem Menschen zeigen will (main() in diesem
+    Werkzeug und in wb-ausrollen tun das), ruft repo_wurzel_ermitteln() vorher
+    selbst auf und uebergibt das Ergebnis ausdruecklich -- diese Zeile hier
+    ist der Rueckfall fuer jeden anderen, kuenftigen Aufrufer, der das
+    vergisst."""
     with open(path, "r") as f:
         raw = f.read()
     raw = raw.replace("{BASE}", base)
-    raw = raw.replace("{REPO}", repo or os.path.expanduser("~/AI/claude-workbench"))
+    raw = raw.replace("{REPO}", repo or repo_wurzel_ermitteln()[0])
     return json.loads(raw)
 
 
@@ -1403,15 +1457,60 @@ def _installationsziel(rel, c7):
     return None
 
 
+def _historische_zeilen(repo_datei, repo_dir):
+    """Jede Zeile, die diese Datei jemals getragen hat, ueber ihre GANZE
+    Commit-Geschichte -- fuer die feinere Frage 'stand DIESE Zeile je im
+    Repo', nicht nur 'ist die installierte Datei byteidentisch mit EINEM
+    einzelnen frueheren Ganzdatei-Stand' (siehe _installiert_richtung).
+
+    Ein Commit `git log -p --follow` reicht: jede Zeile, die in irgendeiner
+    Fassung der Datei je stand, erscheint dort mindestens einmal als '+'-Zeile
+    (in ihrem eigenen Einfuegungs-Commit, oder im allerersten Commit, den git
+    ebenfalls als vollstaendigen '+'-Diff gegen /dev/null zeigt) -- ein
+    einziger Aufruf statt einem `git show` je Commit. Gibt None zurueck, wenn
+    git nicht antwortet (kein Repo, kein Log) -- der Aufrufer faellt dann auf
+    den strengeren, aelteren Weg zurueck, statt eine Nicht-Antwort als leere
+    Menge (und damit als 'nichts stand je im Repo') misszuverstehen."""
+    rel = os.path.relpath(repo_datei, repo_dir)
+    try:
+        p = subprocess.run(["git", "-C", repo_dir, "log", "-p", "--follow", "--", rel],
+                           capture_output=True, timeout=30)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    zeilen = set()
+    for line in p.stdout.decode("utf-8", "replace").splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            zeilen.add(line[1:])
+    return zeilen
+
+
 def _installiert_richtung(repo_datei, inst_datei, repo_dir):
     """'veraltet' (Ausrollen vergessen) oder 'eigenmaechtig' (jemand hat an der
     installierten Kopie gearbeitet) -- und woher wir das wissen.
 
-    Der belastbare Weg fuehrt ueber git: entspricht der installierte Inhalt IRGEND
-    EINEM frueheren Stand der Repo-Datei, dann ist er ein alter Stand, Punkt. Passt
-    er zu keinem, hat diesen Inhalt nie ein Commit getragen -- dann wurde an der
-    installierten Kopie gearbeitet, und das ist die gefaehrlichere Richtung, weil
-    die Arbeit beim naechsten Ausrollen verschwindet.
+    ERSTER WEG, GENAU: entspricht der installierte Inhalt IRGEND EINEM
+    frueheren GANZDATEI-Stand der Repo-Datei (Byte fuer Byte), dann ist er ein
+    alter Stand, Punkt.
+
+    ZWEITER WEG, gemessener Nachtrag (der Nutzer, 20.08.2026 -- zwei Worker
+    hatten unabhaengig voneinander context-guard/wb-testsuite-run als
+    KOPIE-EIGENMAECHTIG bzw. unklar stehen lassen, obwohl beide installierten
+    Fassungen nachweislich NUR aelter waren: "alle Zeilen, die nur in der
+    installierten Kopie stehen, sind Code, den ein Worker im Hauptbaum
+    inzwischen ersetzt hat, und es gibt keine einzige Zeile, die nur dort
+    existiert und im Hauptbaum fehlt"). Der erste Weg verlangt einen EINZIGEN
+    Commit, der die GANZE Datei exakt so trug -- eine installierte Kopie, die
+    ueber mehrere Ausroll-Zeitpunkte hinweg entstanden ist (jedes Mal ein
+    Teilstueck des damaligen Repo-Stands), trifft nie eine einzelne
+    Ganzdatei-Momentaufnahme, obwohl JEDE ihrer Zeilen echter, ueberholter
+    Repo-Inhalt ist -- ein Flickenteppich aus echten Vergangenheiten, keine
+    neue Naht. Deshalb, wenn der erste Weg keinen Treffer findet: pruefen, ob
+    JEDE Zeile, die NUR in der installierten Fassung steht (nicht auch im
+    aktuellen Repo-Stand), irgendwann in der Geschichte dieser Datei stand
+    (_historische_zeilen). Steht auch nur eine einzige nirgends in der
+    Geschichte, ist sie echt neu -- eigenmaechtig, wie zuvor.
 
     Ohne git bleibt die Aenderungszeit, und die ist nur ein Hinweis: sie wird
     entsprechend gekennzeichnet."""
@@ -1434,8 +1533,24 @@ def _installiert_richtung(repo_datei, inst_datei, repo_dir):
         if alt.returncode == 0 and alt.stdout == inhalt:
             return "veraltet", "der installierte Inhalt ist der Repo-Stand von %s" % sha[:9]
     if shas:
+        try:
+            aktuell = open(repo_datei, "rb").read()
+        except OSError:
+            aktuell = b""
+        installiert_zeilen = set(inhalt.decode("utf-8", "replace").splitlines())
+        aktuell_zeilen = set(aktuell.decode("utf-8", "replace").splitlines())
+        nur_installiert = installiert_zeilen - aktuell_zeilen
+        if nur_installiert:
+            historie = _historische_zeilen(repo_datei, repo_dir)
+            if historie is not None and nur_installiert <= historie:
+                return "veraltet", (
+                    "kein einzelner Commit traegt die ganze Datei byteidentisch, aber "
+                    "alle %d Zeile(n), die nur die installierte Fassung traegt, standen "
+                    "irgendwann im Repo-Verlauf -- ein Flickenteppich aus alten Staenden, "
+                    "kein eigener Inhalt" % len(nur_installiert))
         return "eigenmaechtig", ("dieser Inhalt stand in keinem der letzten %d Commits "
-                                 "dieser Datei" % len(shas))
+                                 "dieser Datei, und mindestens eine Zeile darin stand nie "
+                                 "im Repo-Verlauf" % len(shas))
     try:
         neuer = os.path.getmtime(inst_datei) > os.path.getmtime(repo_datei)
     except OSError:
@@ -1494,9 +1609,33 @@ def _linux_gegenstueck(rel, name, c7):
     return kandidat, os.path.join(lv["variant_dir"], name)
 
 
-def _sorte_a(c7, findings):
+def kopie_vergleiche(c7, machine_tool_map=None, current_machine=None):
+    """Ein Fall je Repo-Datei mit Installationsziel: 'fehlt' (nur im Repo,
+    noch nie ausgerollt), 'andere_maschine' (laut machine_tool_map nur auf
+    einer ANDEREN Maschine erwartet -- fehlt hier zu Recht), 'gleich' (nichts
+    zu tun) oder ein Verschiedenheits-Fall mit 'richtung'
+    (veraltet/eigenmaechtig/unklar).
+
+    EIN Durchlauf, ZWEI Abnehmer: `_sorte_a` macht daraus die Meldungen, die
+    `wb-consistency` ausgibt; `wb-ausrollen` (shell/wb-ausrollen) handelt
+    danach -- veraltet wird ersetzt, eigenmaechtig/unklar/andere_maschine wird
+    nur gemeldet bzw. gar nicht erst als Luecke gezaehlt. Beide lesen
+    DIESELBE Berechnung, nicht zwei, die auseinanderlaufen koennten -- genau
+    die Fehlerklasse, um die es in diesem Auftrag geht, soll nicht ein
+    zweites Mal zwischen Melder und Handler entstehen.
+
+    machine_tool_map/current_machine sind ABSICHTLICH dieselben Werte wie in
+    check3_dangling_refs (Konfiguration, nicht hier neu gepflegt -- eine
+    zweite mac/peer-Werkzeugliste waere selbst wieder das Auseinanderlaufen,
+    das dieser Auftrag beheben soll). None/{} heisst: keine Maschinenkenntnis,
+    Verhalten wie vor diesem Umbau (2026-08-20)."""
     repo_dir = c7["repo_dir"]
+    tool_machine = {}
+    for mid, tools in (machine_tool_map or {}).items():
+        for t in tools:
+            tool_machine[t.lower()] = mid
     gesehen = set()
+    faelle = []
     for prefix, ziel_unbenutzt in [(e[0], e[1]) for e in c7["install_map"]]:
         wurzel = os.path.join(repo_dir, prefix)
         if not os.path.isdir(wurzel):
@@ -1529,39 +1668,78 @@ def _sorte_a(c7, findings):
                 kopf = "\n".join(read_lines(repo_datei)[:40])
                 if NICHT_INSTALLIERT_RE.search(kopf):
                     continue
-                findings.append(Finding(
-                    "KOPIE-NUR-REPO", rel, 1,
-                    "liegt nur im Repo",
-                    "unter %s liegt nichts. Entweder ausrollen, oder die Datei sagt in "
-                    "ihrem Kopf selbst warum nicht: 'NICHT INSTALLIERT: <Begruendung>'."
-                    % ziel, severity="hint"))
+                zugewiesen = tool_machine.get(name.lower())
+                if zugewiesen is not None and current_machine is not None \
+                        and zugewiesen != current_machine:
+                    faelle.append({"status": "andere_maschine", "rel": rel,
+                                   "zugewiesen": zugewiesen, "hier": current_machine})
+                    continue
+                faelle.append({"status": "fehlt", "rel": rel, "repo_datei": repo_datei,
+                               "inst_datei": inst_datei, "ziel": ziel})
                 continue
             vergleich_datei, vergleich_rel = repo_datei, rel
             gegenstueck = _linux_gegenstueck(rel, name, c7)
             if gegenstueck:
                 vergleich_datei, vergleich_rel = gegenstueck
             if open(vergleich_datei, "rb").read() == open(inst_datei, "rb").read():
+                faelle.append({"status": "gleich", "rel": vergleich_rel})
                 continue
             richtung, warum = _installiert_richtung(vergleich_datei, inst_datei, repo_dir)
-            if richtung == "veraltet":
+            faelle.append({"status": "verschieden", "rel": vergleich_rel,
+                           "repo_datei": vergleich_datei, "inst_datei": inst_datei,
+                           "richtung": richtung, "warum": warum})
+    return faelle
+
+
+def _sorte_a(c7, findings, machine_tool_map=None, current_machine=None):
+    for fall in kopie_vergleiche(c7, machine_tool_map, current_machine):
+        if fall["status"] == "andere_maschine":
+            findings.append(Finding(
+                "KOPIE-ANDERE-MASCHINE", fall["rel"], 1,
+                "liegt nur im Repo, hier nicht installiert",
+                "laut machine_tool_map nur auf Maschine '%s' erwartet -- diese Maschine "
+                "ist '%s', erwartetes Fehlen, kein Fehler." % (fall["zugewiesen"], fall["hier"]),
+                severity="expected"))
+            continue
+        if fall["status"] in ("fehlt", "gleich"):
+            if fall["status"] == "fehlt":
                 findings.append(Finding(
-                    "KOPIE-VERALTET", vergleich_rel, 1,
-                    "Repo und %s sind verschieden" % inst_datei,
-                    "die INSTALLIERTE Fassung ist ein alter Stand (%s) -- Ausrollen "
-                    "vergessen. Die Suiten fahren teils die installierte Fassung, also "
-                    "faellt das erst im Gesamtlauf auf." % warum))
-            elif richtung == "eigenmaechtig":
-                findings.append(Finding(
-                    "KOPIE-EIGENMAECHTIG", vergleich_rel, 1,
-                    "Repo und %s sind verschieden" % inst_datei,
-                    "die INSTALLIERTE Fassung traegt Inhalt, den das Repo nicht kennt "
-                    "(%s) -- jemand hat an der installierten Kopie gearbeitet. Beim "
-                    "naechsten Ausrollen ist diese Arbeit weg." % warum))
-            else:
-                findings.append(Finding(
-                    "KOPIE-VERSCHIEDEN", vergleich_rel, 1,
-                    "Repo und %s sind verschieden" % inst_datei,
-                    "Richtung nicht bestimmbar (%s)." % warum))
+                    "KOPIE-NUR-REPO", fall["rel"], 1,
+                    "liegt nur im Repo",
+                    "unter %s liegt nichts. Entweder ausrollen, oder die Datei sagt in "
+                    "ihrem Kopf selbst warum nicht: 'NICHT INSTALLIERT: <Begruendung>'."
+                    % fall["ziel"], severity="hint"))
+            continue
+        richtung, warum = fall["richtung"], fall["warum"]
+        vergleich_rel, inst_datei = fall["rel"], fall["inst_datei"]
+        if richtung == "veraltet":
+            # severity="hint", nicht "error" (der Nutzer, 20.08.2026: "der
+            # erste [Fall] ist eine Aufforderung zum Ausrollen und darf
+            # als solche gemeldet werden"). Eine Kopie, die NUR aelter
+            # ist, ist der Normalzustand zwischen zwei Ausroll-
+            # Zeitpunkten, kein Fehler -- als "error" gemeldet, verwaesserte
+            # sie genau die Pruefung, die eine ECHTE eigenmaechtige
+            # Aenderung auffangen soll: "eine Pruefung, die dauerhaft rot
+            # steht, ist keine Pruefung mehr, sie wird ueberlesen".
+            findings.append(Finding(
+                "KOPIE-VERALTET", vergleich_rel, 1,
+                "Repo und %s sind verschieden" % inst_datei,
+                "die INSTALLIERTE Fassung ist ein alter Stand (%s) -- Ausrollen "
+                "vergessen, gefahrlos nachholbar (`wb-ausrollen`). Die Suiten fahren "
+                "teils die installierte Fassung, also faellt das erst im Gesamtlauf "
+                "auf." % warum, severity="hint"))
+        elif richtung == "eigenmaechtig":
+            findings.append(Finding(
+                "KOPIE-EIGENMAECHTIG", vergleich_rel, 1,
+                "Repo und %s sind verschieden" % inst_datei,
+                "die INSTALLIERTE Fassung traegt Inhalt, den das Repo nicht kennt "
+                "(%s) -- jemand hat an der installierten Kopie gearbeitet. Beim "
+                "naechsten Ausrollen ist diese Arbeit weg." % warum))
+        else:
+            findings.append(Finding(
+                "KOPIE-VERSCHIEDEN", vergleich_rel, 1,
+                "Repo und %s sind verschieden" % inst_datei,
+                "Richtung nicht bestimmbar (%s)." % warum))
 
 
 def _harness_liste(quelle):
@@ -1860,6 +2038,191 @@ def _sorte_d(c7, findings, base):
             "vermerken: 'NICHT VERSIONIERT: <Begruendung>'.", severity="error"))
 
 
+# --------------------------------------------------------------------------
+# Sorte E -- Registry-Paare, inhaltlich verglichen (2026-08-20)
+# --------------------------------------------------------------------------
+# Anlass: shell/models.default.json trug bei einem Modelleintrag "bleibt als
+# zweite, waehlbare Moeglichkeit", die lebende Registry
+# (~/.claude/workbench/models.json) noch das GEGENTEIL ("faellt aus der
+# Wahl") -- unbemerkt, bis von Hand nachgezogen. Ein Byte-fuer-Byte-Vergleich
+# wie bei Sorte A waere hier wertlos: die Registry wird lesend-aendernd-
+# schreibend gepflegt, Schluesselreihenfolge und Formatierung wandern, und
+# unbekannte Schluessel (Felder, die nur die lebende Fassung kennt) sollen
+# absichtlich ueberleben. Verglichen wird deshalb je EINTRAG (per id/name/
+# class wiedererkannt) und je FELD, rekursiv durch verschachtelte Objekte.
+#
+# KEINE veraltet/eigenmaechtig-Unterscheidung wie bei Sorte A, absichtlich:
+# ein Werkzeug fuehrt IMMER vom Repo zur Installation, eine einzige Richtung.
+# Die Registry nicht -- contextWindow-Werte gemessen: die lebende Fassung war
+# in mehreren Faellen die NEUERE (ein Nachtrag, der zuerst live eingetragen
+# und noch nicht in die Vorlage zurueckgespielt wurde), nicht die Vorlage. Eine
+# erzwungene Richtungsbestimmung nach Sorte-A-Vorbild haette in diesen Faellen
+# die falsche Seite beschuldigt. Gemeldet wird deshalb die Abweichung SELBST,
+# severity=hint -- sichtbar statt uebersehen, ohne eine Seite zu verurteilen,
+# die vielleicht zu Recht vorausgeeilt ist. Das ist weniger als Sorte A leistet,
+# aber ehrlich: eine geratene Richtung waere hier oefter falsch als richtig.
+
+REGISTRY_ID_VORGABE = ("id", "name", "class")
+
+
+def _registry_id_feld(liste, id_felder):
+    """Welches Feld identifiziert einen Eintrag dieser Liste eindeutig? Das
+    ERSTE Feld aus id_felder, das JEDER Eintrag traegt UND das unter allen
+    Eintraegen eindeutig ist -- eine Liste ohne ein solches Feld (z.B.
+    reine Zeichenketten, oder Objekte ohne gemeinsamen Schluessel) hat keine
+    Identitaet und wird als GANZES verglichen (siehe _registry_blaetter)."""
+    for feld in id_felder:
+        if not all(isinstance(e, dict) and feld in e for e in liste):
+            continue
+        werte = [str(e.get(feld)) for e in liste]
+        if len(set(werte)) == len(werte):
+            return feld
+    return None
+
+
+def _registry_blaetter(wert, id_felder, pfad=()):
+    """(pfad, wert) fuer jedes SKALARE Blatt, rekursiv durch dicts und durch
+    Listen von Objekten mit einer erkennbaren Identitaet (siehe oben). Eine
+    Liste OHNE erkennbare Identitaet (auch eine Liste von Zeichenketten) ist
+    selbst ein Blatt -- als sortiertes JSON verglichen, damit eine blosse
+    Umsortierung keinen Fund erzeugt."""
+    if isinstance(wert, dict):
+        for k, v in wert.items():
+            yield from _registry_blaetter(v, id_felder, pfad + (k,))
+        return
+    if isinstance(wert, list) and wert and all(isinstance(e, dict) for e in wert):
+        feld = _registry_id_feld(wert, id_felder)
+        if feld:
+            for e in wert:
+                marke = "[%s=%s]" % (feld, e[feld])
+                yield from _registry_blaetter(e, id_felder, pfad + (marke,))
+            return
+    if isinstance(wert, list):
+        try:
+            yield pfad, json.dumps(sorted(wert, key=lambda x: json.dumps(x, sort_keys=True)),
+                                   ensure_ascii=False)
+        except TypeError:
+            yield pfad, json.dumps(wert, ensure_ascii=False)
+        return
+    yield pfad, wert
+
+
+def registry_ausnahme(c7, liste, eintrag_id, feld):
+    """Darf dieses Feld je Maschine verschieden sein?
+
+    Positivliste in wb-consistency.config.json unter 'registry_ausnahmen',
+    heute leer -- und das ist ein Messergebnis, kein Versaeumnis: bei allen 16
+    Abweichungen, die am 2026-08-20 einzeln entschieden wurden, war jede echte
+    Drift und keine einzige ein "so soll es bleiben". Ein Feld, das wirklich je
+    Maschine abweichen darf, gehoert deshalb als DATENFELD hier hinein und
+    nicht als Sonderfall in den Code.
+
+    Drei Schreibweisen, von grob nach fein:
+        "contextPattern"                    -- dieses Blatt ueberall
+        "harnesses.contextPattern"          -- dieses Blatt in dieser Liste
+        "harnesses[claude].contextPattern"  -- nur in genau diesem Eintrag
+    """
+    for muster in (c7.get("registry_ausnahmen") or []):
+        if muster == feld:
+            return True
+        if muster == "%s.%s" % (liste, feld):
+            return True
+        if muster == "%s[%s].%s" % (liste, eintrag_id, feld):
+            return True
+    return False
+
+
+def registry_vergleiche(c7):
+    """Jede Abweichung zwischen Registry-VORLAGE und lebender Registry, als
+    Liste von dicts -- OHNE gerenderten Text.
+
+    EIN Durchlauf, ZWEI Abnehmer, dasselbe Prinzip wie bei kopie_vergleiche()
+    weiter oben: `_sorte_e` macht daraus die Meldungen von `wb-consistency`,
+    und `wb-ausrollen` handelt danach. Zwei getrennte Berechnungen waeren
+    genau die Fehlerklasse, die dieser Umbau vermeiden soll -- Melder und
+    Handler duerfen nicht auseinanderlaufen.
+
+    Je Fund:
+        name          Name des Registry-Paares aus der Konfiguration
+        liste         Listenfeld darin ("harnesses", "models", ...)
+        schluessel    Feld, das einen Eintrag identifiziert ("id", ...)
+        eintrag_id    Wert dieses Feldes beim betroffenen Eintrag
+        feld          Blattpfad INNERHALB des Eintrags, mit Punkten
+        vorlage_wert  Wert in der Vorlage
+        lebend_wert   Wert in der lebenden Registry
+        vorlage_datei / lebend_datei   die beiden Pfade
+
+    Was ABSICHTLICH kein Fund ist: ein Eintrag, den die lebende Registry noch
+    gar nicht kennt (noch nicht uebernommen), ein Feld, das es nur in der
+    Vorlage gibt, und alles, was in der Positivliste steht.
+    """
+    faelle = []
+    for paar in c7.get("registry_paare", []):
+        vorlage_datei = paar.get("vorlage", "")
+        echt_datei = paar.get("echt", "")
+        if not (os.path.isfile(vorlage_datei) and os.path.isfile(echt_datei)):
+            continue
+        try:
+            vorlage = json.load(open(vorlage_datei))
+            echt = json.load(open(echt_datei))
+        except (OSError, ValueError):
+            continue
+        id_felder = paar.get("id_felder") or list(REGISTRY_ID_VORGABE)
+        name = paar.get("name", os.path.basename(echt_datei))
+        for feld in paar.get("listen_felder", []):
+            v_liste, e_liste = vorlage.get(feld), echt.get(feld)
+            if not isinstance(v_liste, list) or not isinstance(e_liste, list) or not v_liste:
+                continue
+            schluessel = _registry_id_feld(v_liste, id_felder)
+            if not schluessel:
+                continue
+            e_nach_id = {str(e.get(schluessel)): e for e in e_liste if isinstance(e, dict)}
+            for v_eintrag in v_liste:
+                if not isinstance(v_eintrag, dict):
+                    continue
+                eid = str(v_eintrag.get(schluessel))
+                e_eintrag = e_nach_id.get(eid)
+                if e_eintrag is None:
+                    continue  # noch nicht in die lebende Registry uebernommen -- kein Fund
+                e_blaetter = dict(_registry_blaetter(e_eintrag, id_felder))
+                for pfad, v_wert in _registry_blaetter(v_eintrag, id_felder):
+                    if pfad not in e_blaetter:
+                        continue  # Feld nur in der Vorlage -- kein Fund, siehe Kopf oben
+                    e_wert = e_blaetter[pfad]
+                    if e_wert == v_wert:
+                        continue
+                    blattpfad = ".".join(pfad)
+                    if registry_ausnahme(c7, feld, eid, blattpfad):
+                        continue
+                    faelle.append({
+                        "name": name,
+                        "liste": feld,
+                        "schluessel": schluessel,
+                        "eintrag_id": eid,
+                        "feld": blattpfad,
+                        "vorlage_wert": v_wert,
+                        "lebend_wert": e_wert,
+                        "vorlage_datei": vorlage_datei,
+                        "lebend_datei": echt_datei,
+                    })
+    return faelle
+
+
+def _sorte_e(c7, findings):
+    for fall in registry_vergleiche(c7):
+        pfad_text = "%s.%s[%s=%s].%s" % (
+            fall["name"], fall["liste"], fall["schluessel"], fall["eintrag_id"], fall["feld"])
+        findings.append(Finding(
+            "REGISTRY-ABWEICHUNG", pfad_text, 1,
+            "Vorlage (%s) und lebende Registry (%s) sind an dieser Stelle "
+            "verschieden" % (os.path.basename(fall["vorlage_datei"]), fall["lebend_datei"]),
+            "Vorlage: %s -- lebend: %s. `wb-ausrollen` zeigt diesen Fund unter "
+            "'Registry-Abweichungen' -- von Hand pruefen, welche Seite gilt, und "
+            "die andere nachziehen." % (json.dumps(fall["vorlage_wert"], ensure_ascii=False),
+                                        json.dumps(fall["lebend_wert"], ensure_ascii=False)),
+            severity="hint"))
+
+
 def check7_kopien(cfg, base):
     c7 = cfg.get("check7_kopien")
     if not c7:
@@ -1869,10 +2232,17 @@ def check7_kopien(cfg, base):
         return [Finding("KOPIE-VERSCHIEDEN", c7["repo_dir"], 0, "Arbeitsbaum vorhanden",
                         "Verzeichnis %s gibt es nicht -- nichts zu vergleichen."
                         % c7["repo_dir"], severity="hint")]
-    _sorte_a(c7, findings)
+    # machine_tool_map lebt in check3_dangling_refs, EINE Quelle fuer beide
+    # Checks (siehe kopie_vergleiche()-Docstring) -- current_machine_id()
+    # braucht die machine_ids_by_os-Karte, die dort ebenfalls schon steht.
+    c3 = cfg.get("check3_dangling_refs") or {}
+    machine_tool_map = c3.get("machine_tool_map", {})
+    current_machine = current_machine_id(c3.get("machine_ids_by_os", {}))
+    _sorte_a(c7, findings, machine_tool_map, current_machine)
     _sorte_b(c7, findings)
     _sorte_c(c7, findings)
     _sorte_d(c7, findings, base)
+    _sorte_e(c7, findings)
     return findings
 
 
@@ -2212,6 +2582,40 @@ def check8_test_socket(cfg, base):
         lines = read_lines(path)
         if not lines:
             continue
+        # DIE SITZUNGS-INBOX IST DURCH EINEN EIGENEN TMUX-SOCKET NICHT ISOLIERT
+        # (2026-08-20, Vorfall). Ein Testlauf auf eigenem Socket hat seine
+        # Nachricht in zwei LAUFENDE Sitzungen des Menschen zugestellt: das
+        # Register ~/.claude/sessions/*.json fuehrt JEDE lebende Sitzung der
+        # Maschine, unabhaengig davon, auf welchem tmux-Server ihr Pane haengt.
+        # Was hier trennt, ist ein umgelenktes HOME -- und nur das. Eine Suite,
+        # die die Inbox anfasst, ohne HOME zu setzen, kann den Menschen treffen.
+        ganz = "\n".join(lines)
+        if re.search(r"\bwb-inbox\b", ganz) or ".claude/sessions" in ganz:
+            # Die gesourcten Helfer zaehlen mit: eine Suite, die ihren Aufbau aus
+            # lib-zustellbett.sh holt, setzt HOME dort und nicht bei sich selbst.
+            # Ohne diesen Schritt meldet die Pruefung genau die Suiten, die es
+            # richtig machen -- gemessen beim ersten Lauf, zwei Fehlalarme.
+            gesamt = [ganz]
+            # Gesucht wird der NAME der Helferdatei irgendwo im Text, nicht das
+            # Argument von `source` -- das steht hier regelmaessig in einer
+            # Kommandosubstitution (`. "$(cd "$(dirname ...)")/lib-x.sh"`), an der
+            # sich kein Pfad ablesen laesst.
+            for name in set(re.findall(r"\b(lib-[A-Za-z0-9._-]+\.sh)\b", ganz)):
+                helfer = os.path.join(os.path.dirname(path), name)
+                if os.path.isfile(helfer):
+                    gesamt.append("\n".join(read_lines(helfer)))
+            if not any(re.search(r"\bHOME\s*=", t) for t in gesamt):
+                findings.append(Finding(
+                    "TEST-INBOX-OHNE-HOME", path, 1,
+                    "benutzt die Sitzungs-Inbox (wb-inbox / ~/.claude/sessions), "
+                    "setzt aber nirgends HOME",
+                    "ein eigener tmux-Socket isoliert die Inbox NICHT -- das "
+                    "Sitzungsregister fuehrt jede lebende Sitzung der Maschine. "
+                    "Ohne umgelenktes HOME kann dieser Test eine laufende Sitzung "
+                    "adressieren; am 20.08. ist genau das passiert. Eigenes HOME "
+                    "setzen (mktemp -d) oder den Empfaenger mit `wb-inbox --pid` "
+                    "auf die selbst gestartete Sitzung festnageln.",
+                    severity="error"))
         # Eine Datei, die TMUX_TMPDIR setzt, hat ihren Server ohnehin umgelenkt.
         if any(re.search(r"\bTMUX_TMPDIR\s*=", _ohne_kommentar(l)) for l in lines):
             continue
@@ -2259,17 +2663,261 @@ def check8_test_socket(cfg, base):
 
 
 # --------------------------------------------------------------------------
+# Check 9 -- Konfigurations-Vorlagen fuer fremde Harnesses (2026-08-20)
+# --------------------------------------------------------------------------
+# crush/kimi/nanocoder/cline/forge brauchen je eine Datei AUSSERHALB von
+# ~/.local/bin, sonst startet ihr Worker nicht (~/.config/crush/crushrc,
+# ~/.kimi/config.toml, ...). Das Vorlage-Ziel-Paar dafuer steht bereits in der
+# Registry (configFiles je Harness-Eintrag) und wird bereits von
+# shell/wb-harness-config verglichen, mit einem EIGENEN Merkposten statt
+# Git-Historie (das Ziel liegt oft gar nicht in einem Repo). Dieser Check
+# schreibt die Unterscheidung nicht neu: er ruft wb-harness-config als
+# EIGENEN Prozess auf -- nie ein Import in denselben Interpreter, ein Testlauf
+# mit --base darf nie das echte HOME des aufrufenden Prozesses sehen -- und
+# uebersetzt dessen Befunde in Findings.
+
+HARNESS_KONFIG_ZUORDNUNG = {
+    "FEHLT": ("HARNESS-KONFIG-FEHLT", "hint", "'wb-harness-config apply' legt sie an."),
+    "VERALTET": ("HARNESS-KONFIG-VERALTET", "hint",
+                 "'wb-harness-config apply' rollt sie gefahrlos aus."),
+    "ABGEWICHEN": ("HARNESS-KONFIG-EIGENMAECHTIG", "error",
+                   "von Hand nachsehen, dann 'wb-harness-config apply --force <harness>' "
+                   "(sichert vorher) oder die Aenderung in die Vorlage uebernehmen."),
+    "QUELLE-FEHLT": ("HARNESS-KONFIG-QUELLE-FEHLT", "error",
+                     "die Vorlage selbst ist an keinem der gesuchten Orte auffindbar."),
+    "UNVOLLSTAENDIG": ("HARNESS-KONFIG-UNVOLLSTAENDIG", "error",
+                       "der configFiles-Eintrag in der Registry hat kein 'source' oder "
+                       "kein 'target'."),
+}
+
+
+def harness_konfig_befunde(c9, base):
+    """Ruft `wb-harness-config status --json` mit umgelenktem HOME/Vorlagen-
+    Quelle auf und gibt dessen rohe Befundliste zurueck (oder [] bei jedem
+    Fehlschlag -- ein nicht aufrufbares Werkzeug ist ein Hinweis, kein
+    Absturzgrund fuer den gesamten Lauf). EIN Durchlauf, ZWEI Abnehmer:
+    check9_harness_konfig() macht daraus Findings, wb-ausrollen ruft
+    stattdessen 'apply' -- beide gegen DASSELBE Werkzeug, nicht zwei
+    Nachbauten seiner Logik."""
+    skript = c9.get("skript", "")
+    if not skript or not os.path.isfile(skript):
+        return None
+    env = dict(os.environ)
+    env["HOME"] = base
+    env["WB_HARNESS_CONFIG_SRC"] = c9.get("quelle_verzeichnis", "")
+    try:
+        p = subprocess.run([sys.executable, skript, "status", "--json"],
+                           capture_output=True, text=True, timeout=20, env=env)
+        return json.loads(p.stdout)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# Check 10 -- woraus ein Werkzeug seine Auskunft ueber einen Pane zieht (2026-08-20)
+# --------------------------------------------------------------------------
+# Zwei Fehlerklassen desselben Tages, beide teuer, beide unsichtbar:
+#
+#   1. Ein Werkzeug bekommt eine Pane-Kennung und ruft damit tmux -- ohne je
+#      sagen zu koennen, auf WELCHEM Server. '%0' gibt es auf jedem Server;
+#      wb-inbox hat deshalb eine Testnachricht in eine laufende Sitzung
+#      zugestellt.
+#   2. Ein Pruefpfad liest den tmux-VERLAUF (`capture-pane -S -<n>`), ohne zu
+#      beruecksichtigen, dass es fuer den Alternate Screen keinen Verlauf gibt
+#      (gemessen: alternate_on=1 ergibt history_size=0). Bei Claude Code ist
+#      das der Normalfall -- der Verlauf, auf den sich die Pruefung stuetzt,
+#      existiert dort nicht, und ihr Schweigen bedeutet nichts.
+#
+# Beide werden als HINWEIS gemeldet, nicht als Fehler: es gibt legitime Faelle
+# (ein Werkzeug, das ausdruecklich nur den umgebenden Server meint; ein
+# Verlaufsleser, der nur mit Harnesses ohne Alternate Screen zu tun hat). Der
+# Hinweis sagt, wo nachzusehen ist, und behauptet nicht, dass es falsch ist.
+
+def check10_pane_quellen(cfg, base):
+    c10 = cfg.get("check10_pane_quellen")
+    if not c10:
+        return []
+    findings = []
+    for path in expand_globs(c10["globs"], c10.get("exclude_substrings", ())):
+        lines = read_lines(path)
+        if not lines:
+            continue
+        ganz = "\n".join(lines)
+        # Nimmt dieses Werkzeug ueberhaupt eine Pane-Kennung entgegen und ruft
+        # damit tmux? Erst dann ist die Serverfrage seine Frage.
+        # NUR die gefaehrliche Kombination, nicht jeder tmux-Aufruf. Fast jedes
+        # Werkzeug hier spricht Panes auf dem UMGEBENDEN Server an, und das ist
+        # richtig so -- die erste Fassung dieser Pruefung meldete 16 Dateien und
+        # war damit Rauschen statt Befund. Teuer wird es erst, wenn die
+        # Pane-Kennung in einen MASCHINENWEITEN Namensraum uebersetzt wird: das
+        # Sitzungsregister ~/.claude/sessions fuehrt jede Sitzung der Maschine,
+        # unabhaengig vom tmux-Server. Wer '%0' auf dem falschen Server aufloest
+        # und dann dessen Sitzung anschreibt, trifft einen Fremden -- genau der
+        # Vorfall vom 20.08.
+        # Beide Schreibweisen. Die erste Fassung suchte nur die Shell-Form
+        # (`tmux ... -t $pane`) und hat damit ausgerechnet den Fall nicht
+        # gefunden, fuer den diese Pruefung geschrieben wurde: wb-inbox ist
+        # Python und baut ["tmux", "display", "-p", "-t", pane, feld]. Eine
+        # Pruefung, die ihren eigenen Anlass nicht trifft, ist keine.
+        nutzt_pane = "tmux" in ganz and re.search(r"[\"']?-t[\"']?[\s,]", ganz) is not None
+        # BEIDES, nicht eines von beiden: der blosse Pfad ~/.claude/sessions steht
+        # auch in Fehlermeldungen ("unter Pane X ist keine Sitzung eingetragen"),
+        # und eine Meldung liest kein Register. Wer wirklich hineingreift, kennt
+        # auch das Feld darin -- gemessen als Unterscheidung, die pi-worker
+        # (nennt nur den Pfad) von wb-inbox (liest das Register) trennt.
+        greift_register = ".claude/sessions" in ganz and "messagingSocketPath" in ganz
+        kennt_server = ("WB_TMUX_SOCKET" in ganz or "--socket" in ganz
+                        or re.search(r"tmux\s+-L\b", ganz) is not None
+                        or re.search(r"[\"'-]L[\"']", ganz) is not None)
+        if nutzt_pane and greift_register and not kennt_server:
+            findings.append(Finding(
+                "PANE-OHNE-SERVER", path, 1,
+                "loest eine Pane-Kennung auf und schlaegt damit im Sitzungsregister "
+                "nach, kann den tmux-Server aber nicht waehlen (kein -L, kein "
+                "--socket, kein WB_TMUX_SOCKET)",
+                "eine Pane-Kennung ist ohne ihren Server keine Adresse: '%0' gibt "
+                "es auf jedem tmux-Server, das Sitzungsregister dagegen fuehrt jede "
+                "Sitzung der ganzen Maschine. Am 20.08. hat ein Werkzeug in genau "
+                "dieser Lage eine Testnachricht in zwei laufende Sitzungen "
+                "zugestellt. Vorbild: shell/wb-inbox (-L/--socket, --pid).",
+                severity="error"))
+        # Liest die Datei den Verlauf, ohne den Alternate Screen zu kennen?
+        liest_verlauf = re.search(r"capture-pane[^\n]{0,80}-S\s+-\d", ganz) is not None
+        kennt_altscreen = "alternate_on" in ganz or "altScreen" in ganz
+        if liest_verlauf and not kennt_altscreen:
+            findings.append(Finding(
+                "PANE-VERLAUF-OHNE-ALTSCREEN", path, 1,
+                "liest den tmux-Verlauf (capture-pane -S -<n>), beruecksichtigt "
+                "aber den Alternate Screen nicht",
+                "fuer den Alternate Screen fuehrt tmux KEINEN Verlauf -- gemessen "
+                "ergibt alternate_on=1 ein history_size=0, `-S -2000` liefert dann "
+                "nur das sichtbare Bild. Bei Claude Code ist das der Normalfall. "
+                "Wer sich auf den Verlauf stuetzt, sollte vorher `#{alternate_on}` "
+                "abfragen (oder das Feld altScreen des Harness lesen) und aus "
+                "einem leeren Ergebnis keinen Gegenbeleg machen.",
+                severity="hint"))
+    return findings
+
+
+# --------------------------------------------------------------------------
+# Check 11 -- Pipe unter pipefail, deren Erstglied legitim scheitern darf (2026-08-20)
+# --------------------------------------------------------------------------
+# Anlass: `"$WBS" models check "$MID" 2>/dev/null | grep -q "^Konfig:.*vorhanden"`
+# in test-harness-baukasten.sh, Fall B1. Unter `set -o pipefail` liefert eine
+# Pipe den Rueckgabewert des ERSTEN fehlgeschlagenen Glieds, nicht den des
+# grep. `models check` (cmd_check in wb-state) endet bewusst mit
+# `sys.exit(0 if ok else 1)`, wobei `ok` mehrere unabhaengige Bedingungen
+# zusammenfasst (Binary, Ready-Muster, Konfigdatei, Provider-Key, ...) -- die
+# Zusage fiel, WAEHREND die gesuchte Zeile in der Ausgabe stand. Behoben in
+# Commit c2e2752 (Ausgabe erst einsammeln, dann pruefen).
+#
+# ABSICHTLICH SCHMAL. Am selben Tag wurden von Hand rund 60 weitere Treffer
+# derselben rohen Suche ("cmd | grep -q ...") gegen den ganzen Testbaum
+# geprueft -- fast alle waren falscher Alarm: `tmux capture-pane` liefert bei
+# totem/fremdem Pane KEINE Ausgabe, `grep -q` scheitert dann so oder so;
+# `awb-ctl` (node) ersetzt die Ausgabe im Fehlerfall komplett durch
+# "Fehler: ...", die gesuchte Zeile kann darin nicht stehen; `awk` endet ohne
+# Syntaxfehler immer mit 0. Der einzige tatsaechlich gefaehrliche Fall war ein
+# Werkzeug, das MEHRERE unabhaengige Bedingungen zu EINEM Rueckgabewert
+# aggregiert. Eine allgemeine "jede Pipe vor grep ist verdaechtig"-Regel haette
+# diese ~55 gesunden Stellen mitgemeldet -- ein Hinweis, den niemand aufloest,
+# ist schlimmer als keiner. Die Erkennung bleibt deshalb auf die bekannte Form
+# beschraenkt (Liste unten) statt auf jede Pipe zu raten.
+RISIKO_UNTERKOMMANDOS = (
+    # bekannt: sys.exit(0 if ok else 1) in wb-state, `ok` fasst mehrere
+    # unabhaengige Bedingungen zu einem Rueckgabewert zusammen (cmd_check).
+    "models check",
+)
+
+
+def check11_pipefail_erstglied(cfg, base):
+    c11 = cfg.get("check11_pipefail_erstglied")
+    if not c11:
+        return []
+    findings = []
+    for path in expand_globs(c11["globs"], c11.get("exclude_substrings", ())):
+        lines = read_lines(path)
+        if not lines or "pipefail" not in "\n".join(lines):
+            continue
+        for i, line in enumerate(lines, start=1):
+            stripped = line.lstrip()
+            # Ausgabe schon vorher eingesammelt (printf/echo einer Variable)
+            # oder ein Kommentar -- beides ausserhalb der Gefahr.
+            if stripped.startswith(("printf", "echo", "#")):
+                continue
+            if "| grep" not in line and not re.search(r"\|\s*grep\b", line):
+                continue
+            for cmd in RISIKO_UNTERKOMMANDOS:
+                if cmd in line:
+                    findings.append(Finding(
+                        "PIPE-UNTER-PIPEFAIL-MIT-SCHEITERNDEM-ERSTGLIED", path, i,
+                        "prueft die Ausgabe von '%s' direkt in der Pipe (... | grep ...)" % cmd,
+                        "'%s' endet mit sys.exit(0 if ok else 1) in wb-state (cmd_check), "
+                        "wobei 'ok' mehrere unabhaengige Bedingungen zusammenfasst -- unter "
+                        "pipefail liefert die Pipe DESSEN Rueckgabewert, nicht den des grep, "
+                        "selbst wenn die gesuchte Zeile in der Ausgabe steht (Fall B1, "
+                        "test-harness-baukasten.sh, behoben in c2e2752). Ausgabe erst "
+                        "einsammeln (VAR=\"$(... 2>&1)\"), dann printf '%%s' \"$VAR\" | grep ..."
+                        % cmd,
+                        severity="hint"))
+                    break
+    return findings
+
+
+def check9_harness_konfig(cfg, base):
+    c9 = cfg.get("check9_harness_konfig")
+    if not c9:
+        return []
+    rs = harness_konfig_befunde(c9, base)
+    if rs is None:
+        return [Finding("HARNESS-KONFIG-FEHLER", c9.get("skript", "?"), 0,
+                        "wb-harness-config status --json ist aufrufbar",
+                        "Aufruf ist gescheitert oder lieferte kein lesbares JSON.",
+                        severity="hint")]
+    findings = []
+    for r in rs:
+        status = r.get("status")
+        if status == "GLEICH" or status not in HARNESS_KONFIG_ZUORDNUNG:
+            continue
+        check_name, severity, hinweis = HARNESS_KONFIG_ZUORDNUNG[status]
+        findings.append(Finding(
+            check_name, r.get("target") or r.get("source") or "?", 1,
+            "%s-Konfiguration (Vorlage: %s)" % (r.get("harness", "?"), r.get("source", "?")),
+            "%s -- %s" % (r.get("detail", ""), hinweis), severity=severity))
+    return findings
+
+
+# --------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--base", default=os.path.expanduser("~"))
-    ap.add_argument("--repo", default=os.path.expanduser("~/AI/claude-workbench"),
-                    help="Arbeitsbaum der Werkbank ({REPO} in der Konfiguration)")
+    # Kein fest verdrahteter Vorgabewert mehr (Befund 21.08.2026, siehe
+    # repo_wurzel_ermitteln()): None heisst "nicht genannt", und erst DANN
+    # entscheidet die Messung -- --repo bleibt die staerkste Quelle und
+    # schlaegt sie, wenn gegeben.
+    ap.add_argument("--repo", default=None,
+                    help="Arbeitsbaum der Werkbank ({REPO} in der Konfiguration) -- ohne "
+                         "Angabe: der Baum, aus dem dieses Werkzeug selbst laeuft, wenn "
+                         "ermittelbar (siehe repo_wurzel_ermitteln()), sonst ein genannter "
+                         "Ratewert.")
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "wb-consistency.config.json"))
     args = ap.parse_args()
 
-    cfg = load_config(args.config, args.base, args.repo)
+    if args.repo:
+        repo, repo_quelle = args.repo, "--repo (ausdruecklich genannt)"
+    else:
+        repo, gemessen, repo_quelle = repo_wurzel_ermitteln()
+        # Geraten wird laut gemeldet, auch unter --quiet -- eine Bremse, die
+        # geraetene Ergebnisse verschweigt, waere selbst wieder ein stilles
+        # Raten (Auftrag: "raten ist erlaubt, stilles Raten nicht").
+        if not gemessen:
+            print("wb-consistency: Arbeitsbaum %s" % repo_quelle, file=sys.stderr)
+    if not args.quiet:
+        print("wb-consistency: Arbeitsbaum -- %s" % repo_quelle)
+
+    cfg = load_config(args.config, args.base, repo)
 
     all_findings = []
     all_findings += check1_model_caps(cfg, args.base)
@@ -2280,6 +2928,9 @@ def main():
     all_findings += check6_settings_switches(cfg, args.base)
     all_findings += check7_kopien(cfg, args.base)
     all_findings += check8_test_socket(cfg, args.base)
+    all_findings += check9_harness_konfig(cfg, args.base)
+    all_findings += check10_pane_quellen(cfg, args.base)
+    all_findings += check11_pipefail_erstglied(cfg, args.base)
 
     if not args.quiet:
         for f in all_findings:

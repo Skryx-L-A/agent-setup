@@ -52,7 +52,7 @@ Node is often older; use [nodesource](https://github.com/nodesource/distribution
 ## 1. Get the repository
 
 ```bash
-git clone https://github.com/Skryx-L-A/agent-setup.git ~/agent-setup
+git clone https://github.com/<your-github-user>/agent-setup.git ~/agent-setup
 cd ~/agent-setup
 ```
 

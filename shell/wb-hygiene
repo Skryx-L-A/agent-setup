@@ -111,6 +111,18 @@ if [ -x "$BIN/status-freshness" ]; then
   FRESH_OUT="$("$BIN/status-freshness" 2>&1)"
 fi
 
+# Anlass (2026-08-20): der Speicherverbrauch der Werkbank ist niemandem
+# aufgefallen, bis der Nutzer ihn selbst in der Aktivitaetsanzeige sah. Was
+# niemand misst, waechst — und auf einer 48-GiB-Maschine, auf der ein lokales
+# Modell 33 GiB braucht, ist jedes liegengebliebene GiB eines, das dem Modell
+# fehlt. Derselbe eine Lauf liefert Bericht und Ampel, aus demselben Grund wie
+# bei CONS_OUT oben.
+SPEICHER_DA=0; SPEICHER_OUT=""
+if [ -x "$BIN/wb-speicher" ]; then
+  SPEICHER_DA=1
+  SPEICHER_OUT="$("$BIN/wb-speicher" 2>&1)"
+fi
+
 out=$(
   echo "# Hygiene-Bericht — $(date '+%Y-%m-%d %H:%M')"
   echo
@@ -206,6 +218,14 @@ out=$(
       echo "  ok            keine liegengebliebenen Test-Sockets ($lebendig lebendig)"
     fi
   fi
+  echo
+
+  echo "## Speicher der Werkbank (wb-speicher)"
+  if [ "$SPEICHER_DA" = 1 ]; then
+    printf '%s\n' "$SPEICHER_OUT" | sed 's/^/  /'
+  else
+    echo "  wb-speicher nicht gefunden"
+  fi
 )
 
 echo "$out"
@@ -215,6 +235,10 @@ echo "$out"
 # dauerhaft rot faerben und damit unlesbar machen.
 echo "$out" | grep -q 'UEBER GRENZE' && findings=1
 [ "$CONS_DA" = 1 ] && [ "$CONS_RC" -ne 0 ] && findings=1
+# ROT ist ein hartes Kriterium, GELB ein Hinweis: gelb heisst "sieh nach, was
+# liegengeblieben ist", rot heisst, dass die Werkbank allein knapp die Haelfte
+# dessen haelt, was der Maschine neben einem grossen Modell ueberhaupt bleibt.
+printf '%s\n' "$SPEICHER_OUT" | grep -q 'Ampel: ROT' && findings=1
 
 # Statusdatei fuer den SessionStart-Hook (2026-08-04, selber Anlass wie oben):
 # Bericht und Job-Exit-Code gab es schon, aber ohne maschinenlesbare Ablage
@@ -271,14 +295,31 @@ else
   freshness_ok=0
 fi
 
+speicher_ok=1
+if [ "$SPEICHER_DA" != 1 ]; then
+  speicher_ampel=""; speicher_gib=""
+else
+  speicher_line=$(printf '%s\n' "$SPEICHER_OUT" | grep -E 'Ampel: (GRUEN|GELB|ROT)' | head -1)
+  gesamt_line=$(printf '%s\n' "$SPEICHER_OUT" | grep -E 'Werkbank gesamt' | head -1)
+  if [ -n "$speicher_line" ] && [ -n "$gesamt_line" ]; then
+    speicher_ampel=$(printf '%s' "$speicher_line" | grep -oE 'GRUEN|GELB|ROT' | head -1)
+    speicher_gib=$(printf '%s' "$gesamt_line" | grep -oE '[0-9]+\.[0-9]+ GiB|[0-9]+ MiB' | head -1)
+  else
+    speicher_ampel=""; speicher_gib=""; speicher_ok=0
+  fi
+fi
+
 status_parse_ok=1
 [ "$consistency_ok" = 0 ] && status_parse_ok=0
 [ "$lint_ok" = 0 ] && status_parse_ok=0
 [ "$freshness_ok" = 0 ] && status_parse_ok=0
+[ "$speicher_ok" = 0 ] && status_parse_ok=0
 if [ "$status_parse_ok" = 0 ]; then
   consistency_count=""
   lint_undated_count=""
   freshness_stale_count=""
+  speicher_ampel=""
+  speicher_gib=""
 fi
 
 if [ "$WRITE" = 1 ]; then
@@ -297,6 +338,8 @@ if [ "$WRITE" = 1 ]; then
     echo "consistency_count=$consistency_count"
     echo "lint_undated_count=$lint_undated_count"
     echo "freshness_stale_count=$freshness_stale_count"
+    echo "speicher_ampel=$speicher_ampel"
+    echo "speicher_gesamt=$speicher_gib"
   } > "$STATUS.tmp" && mv "$STATUS.tmp" "$STATUS"
   echo "Status: $STATUS"
 fi

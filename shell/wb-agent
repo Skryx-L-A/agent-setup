@@ -4,9 +4,24 @@ set -u
 # $HOME instead of a hardcoded $HOME: the same script has to run on peer
 # ($HOME) once both machines share one script set. Same target, same behaviour.
 # Remote Control stays OFF here (Vorgabe des Nutzers 2026-08-05: nur der
-# Orchestrator bekommt sie) -- an agent pane is never the orchestrator, and the
-# flag is opt-in on the claude CLI, so simply not adding it is enough.
-CLAUDE="${WB_CLAUDE:-$HOME/.local/bin/claude --append-system-prompt \"\$(cat $HOME/.claude/roles/agent.md)\"}"
+# Orchestrator bekommt sie) -- an agent pane is never the orchestrator.
+#
+# WIDERLEGT 2026-08-19 (Pruefer-Befund B9, siehe auch pi-worker und
+# wb-state's models resolve): "die Flagge ist opt-in, sie wegzulassen reicht"
+# stimmt NICHT. Gemessen an einem echten, eingeloggten claude-Prozess auf
+# einem isolierten Testsocket: 'claude --dangerously-skip-permissions' allein
+# zeigt in der Fusszeile ein /rc mit Sitzungs-Link, obwohl kein
+# '--remote-control' auf der Befehlszeile steht -- Auto-Verbinden greift
+# ausserhalb der Einstellungsdateien (App-/IDE-Schalter). Der einzige Weg, der
+# es zuverlaessig abschaltet, ist '--settings' mit 'remoteControlAtStartup:
+# false' explizit auf der Befehlszeile -- dieselbe Regel wie bei pi-worker
+# (dort CFLAGS/RC_SETTINGS) und wb-state's models resolve fuer role=worker,
+# jetzt auch hier fuer den Agent-Pane, keine vierte Kopie der Ausnahme.
+# printf %q, nicht nur Anfuehrungszeichen von Hand: der JSON-Text traegt ein
+# Leerzeichen und Anfuehrungszeichen und muss als EIN Argument durch die
+# Shell-Huelle ankommen, mit der tmux $CLAUDE ausfuehrt.
+RC_SETTINGS=" --settings $(printf %q '{"remoteControlAtStartup": false}')"
+CLAUDE="${WB_CLAUDE:-$HOME/.local/bin/claude --append-system-prompt \"\$(cat $HOME/.claude/roles/agent.md)\"$RC_SETTINGS}"
 
 panes=$(tmux list-panes -F '#{pane_id} #{@wb_role}')
 n_agents=$(echo "$panes" | awk '$2=="agent"{c++} END{print c+0}')

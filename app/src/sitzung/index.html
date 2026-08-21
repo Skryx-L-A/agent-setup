@@ -143,6 +143,150 @@
         min-width: 0;
       }
 
+      /* --- Die Wahl fuer genau diese Sitzung (19.08.) --------------------
+         Vier Fragen untereinander -- Programm, Modell, Denkstufe und, wenn
+         das Modell hier auf der Maschine laeuft, das Kontextfenster. Die
+         Bauformen sind die des Einstellungsfensters (Chips, Suchfeld,
+         zweizeilige Listeneintraege): wer das eine bedienen kann, kann auch
+         das andere. NICHTS ist gesperrt -- eine Kontextstufe, fuer die der
+         Speicher nicht reicht, sieht genauso waehlbar aus, wie sie es ist. */
+      /* Der Block bekommt Platz, solange er offen ist, und rollt in sich
+         selbst -- die Sitzungsliste darunter behaelt ihren eigenen Anteil.
+         `flex: 1 1 auto` statt einer festen Hoehe, weil das Fenster in der
+         Hoehe veraenderlich ist und eine feste Zahl auf einem kleinen Schirm
+         die Startzeile abschnitte. */
+      #neu-wahl-block {
+        flex: 1 1 auto;
+        min-height: 0;
+        margin: 0 22px 10px;
+        padding: 10px 12px;
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        background: var(--leiste);
+        overflow-y: auto;
+      }
+      /* Solange die Wahl offen ist, gehoert ihr der Platz -- die Sitzungsliste
+         behaelt einen Rest, damit man sie noch sieht, aber wer gerade ein
+         Modell aussucht, sucht kein Projekt.
+         GEDECKELT WIRD DIE LISTE, nicht der Block gewichtet. Zwei Anlaeufe
+         davor gingen daneben und beide am Bild gesehen (19.08.): `flex-grow`
+         wirkt nicht, wenn das Fenster zu VOLL ist statt zu leer, und ein
+         blosser Schrumpf-Faktor am Block liess Fusszeile und Filter aus dem
+         Fenster laufen. Eine Obergrenze fuer die Liste ist die einzige der
+         drei Formen, bei der alles andere stehen bleibt. */
+      body.wahl-offen #gruppen {
+        flex: 0 1 auto;
+        max-height: 90px;
+      }
+      /* Suche und Filter gehoeren der Sitzungsliste. Solange die Wahl offen
+         ist, ist die Liste auf einen Rest gedeckelt -- eine Suche darueber
+         waere ein Bedienelement fuer neunzig Pixel Inhalt, und sie kostet die
+         Hoehe, die der Wahl fehlt. */
+      body.wahl-offen #filter {
+        display: none;
+      }
+      #neu-wahl-block .wahlzeile {
+        margin-bottom: 10px;
+      }
+      #neu-wahl-block .wahlzeile:last-child {
+        margin-bottom: 0;
+      }
+      #neu-wahl-block .wahlname {
+        font-weight: 600;
+        margin-bottom: 4px;
+      }
+      #neu-wahl-block .wahlhinweis {
+        color: var(--gedaempft);
+        margin-top: 4px;
+      }
+      #neu-wahl-block .modellsuche {
+        width: 100%;
+        box-sizing: border-box;
+        margin-bottom: 6px;
+      }
+      #neu-wahl-block .wahlliste {
+        border: 1px solid var(--linie);
+        border-radius: 4px;
+        /* 110 statt 150: bei 150 passten die vier Fragen zusammen nicht mehr in
+           ein Fenster von 620 Punkten, und die letzten beiden lagen unter dem
+           Rollrand (am Bild gesehen, 19.08.). */
+        max-height: 110px;
+        overflow-y: auto;
+        background: var(--grund);
+      }
+      #neu-wahl-block .wahleintrag {
+        display: block;
+        width: 100%;
+        box-sizing: border-box;
+        text-align: left;
+        font: inherit;
+        background: transparent;
+        color: var(--schrift);
+        border: 0;
+        border-bottom: 1px solid var(--linie);
+        padding: 5px 10px;
+        cursor: pointer;
+      }
+      #neu-wahl-block .wahleintrag:last-child {
+        border-bottom: 0;
+      }
+      #neu-wahl-block .wahleintrag:hover {
+        background: #1e232b;
+      }
+      #neu-wahl-block .wahleintrag.gewaehlt {
+        background: var(--wahl);
+      }
+      #neu-wahl-block .wahleintrag.gewaehlt .zeile1 {
+        font-weight: 600;
+      }
+      #neu-wahl-block .wahleintrag .zeile1 {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+      }
+      #neu-wahl-block .wahleintrag .kennung {
+        color: var(--gedaempft);
+        margin-left: auto;
+      }
+      #neu-wahl-block .wahleintrag .zeile2 {
+        color: var(--gedaempft);
+      }
+      /* Der Hinweis auf knappen Speicher. Er faerbt, er sperrt nicht. */
+      #neu-wahl-block .wahleintrag .zeile2.knapp {
+        color: var(--will);
+      }
+      /* Ein Wort, kein Symbol und kein Emoji -- die stehende Regel des Hauses. */
+      #neu-wahl-block .marke {
+        border-radius: 3px;
+        padding: 0 5px;
+        background: var(--laeuft);
+        color: var(--grund);
+        font-weight: 600;
+      }
+      /* Die Startzeile, wortwoertlich. Sie steht VOR dem Klick da: wer startet,
+         soll gesehen haben, was mitgeht.
+         KLEBEND AM UNTEREN RAND des Blocks: sonst liegt der Knopf, fuer den es
+         diesen Block gibt, unterhalb des Rollbereichs und ist erst nach einer
+         Rollbewegung zu sehen (am Bild gesehen, 19.08.). */
+      #neu-wahl-block .startzeile {
+        position: sticky;
+        bottom: -10px;
+        margin-top: 10px;
+        padding: 8px 0 10px;
+        border-top: 1px solid var(--linie);
+        background: var(--leiste);
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+      }
+      #neu-wahl-block .flaggen {
+        flex: 1 1 240px;
+        min-width: 0;
+        color: var(--gedaempft);
+        word-break: break-all;
+      }
+
       /* --- Suche, Zustand und Maschine ----------------------------------- */
       #filter {
         flex: 0 0 auto;
@@ -401,8 +545,19 @@
              neben dem ersten Knopf, weil beides „neue Sitzung" heisst und die
              Wahl zwischen ihnen die einzige ist, die der Mensch hier trifft. -->
         <button type="button" class="knopf" id="neu-chat"></button>
+        <!-- Der dritte Weg (19.08.): dieselbe neue Sitzung, aber mit einer
+             Wahl, die NUR fuer sie gilt. Er steht als letzter, weil der erste
+             Knopf der schnelle bleiben soll -- ein Klick, keine Rueckfrage.
+             Wort des Nutzers: „damit man, wenn man nur diese eine Sitzung anders
+             fahren will, nicht erst in die Einstellungen muss und sie danach
+             wieder zurueckstellt." -->
+        <button type="button" class="knopf" id="neu-wahl"></button>
       </div>
     </header>
+    <!-- Die Wahl fuer genau diese Sitzung. Steht erst da, wenn jemand sie
+         aufklappt (sitzung.ts, `zeichneWahlblock`) -- ein Fenster, das die
+         Modellliste immer zeigte, waere fuer den schnellen Weg im Weg. -->
+    <div id="neu-wahl-block" style="display: none"></div>
     <div id="neu-fern" style="display: none">
       <input type="text" id="neu-fern-pfad" list="neu-fern-ordner" spellcheck="false" />
       <!-- Vorschlaege aus den SCHON BEKANNTEN Sitzungen dieser Maschine (sitzung.ts,

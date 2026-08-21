@@ -3,7 +3,7 @@
 #
 #   wb-code [project-dir] [--resume <session-id>] [--name <name>] [--key <sessionKey>]
 #          [--harness claude|pi] [--model <model>] [--effort <effort>] [--mensch]
-#          [--fresh]
+#          [--kontext <stufe|auto>] [--fresh]
 #
 # ZWEI DINGE, DIE NICHT DASSELBE SIND (2026-08-06). Sie tragen beide das Wort
 # "Effort" und werden deshalb leicht verwechselt:
@@ -49,10 +49,24 @@ set -euo pipefail
 
 # The VSCode integrated terminal may inherit $TMUX when VSCode itself was
 # launched from inside a tmux pane; we always attach a fresh client here.
+#
+# DER PANE WIRD DABEI GERETTET, NICHT WEGGEWORFEN (2026-08-21). Dieses `unset`
+# hat einen zweiten, lange unbemerkten Nebeneffekt: alles, was dieses Skript
+# danach aufruft, sieht keinen tmux-Pane mehr -- und `wb-nohup` verweigert
+# ohne Pane den Dienst, weil ein abgeloester Prozess einen nachweisbaren
+# Eigentuemer braucht. Seit `wb-mlx-server ensure` hier laeuft, brach deshalb
+# JEDER Start einer Sitzung mit lokalem Modell ab, auch mitten aus einem
+# Workbench-Pane heraus ("wb-nohup: braucht einen tmux-Pane als Bezugspunkt",
+# gemessen am 21.08.). Die beiden Werte wandern darum in eigene Variablen; das
+# Programm erkennt sie als dieselbe Eigentuemer-Art wieder, prueft aber nach,
+# ob der genannte Pane wirklich lebt. Ein bereits gesetzter Wert (die App
+# reicht ihre eigene Herkunft durch) hat Vorrang und wird nicht ueberschrieben.
+export WB_EIGENTUEMER_TMUX="${WB_EIGENTUEMER_TMUX:-${TMUX:-}}"
+export WB_EIGENTUEMER_TMUX_PANE="${WB_EIGENTUEMER_TMUX_PANE:-${TMUX_PANE:-}}"
 unset TMUX TMUX_PANE
 
 DIR="$PWD"; RESUME=""; NAME=""; KEY=""; HARNESS=""; MODEL=""; EFFORT=""; FRESH=""
-HARNESS_FLAG=""; MODEL_FLAG=""; MENSCH=""
+HARNESS_FLAG=""; MODEL_FLAG=""; MENSCH=""; KONTEXT_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     # `--mensch` ist eine BEHAUPTUNG und wird nie geglaubt: `wb-mensch` misst die
@@ -80,6 +94,12 @@ while [ $# -gt 0 ]; do
     --harness) HARNESS="${2:?claude|pi|registrierter Adapter}"; HARNESS_FLAG=1; shift 2 ;;
     --model) MODEL="${2:?model}"; MODEL_FLAG=1; shift 2 ;;
     --effort) EFFORT="${2:?effort}"; shift 2 ;;
+    # Kontextfenster fuer einen lokalen Orchestrator (wb-kontext, Auftrag B
+    # 2026-08-19, Rangfolge korrigiert im Nachtrag vom selben Tag). Gilt nur,
+    # wenn HARNESS am Ende 'pi' ist -- 'auto' bzw. kein Schalter heisst: nach
+    # freiem Speicher automatisch waehlen (settings.json 'orchestratorKontext'
+    # zuerst, siehe die volle Rangfolge weiter unten am Punkt der Wahl selbst).
+    --kontext) KONTEXT_ARG="${2:?stufe|auto}"; shift 2 ;;
     -*) echo "wb-code: unbekannte Option '$1'" >&2; exit 1 ;;
     *) DIR="$1"; shift ;;
   esac
@@ -409,6 +429,18 @@ maybe_start_guard() {
 }
 
 attach() {
+  # DIE MARKE, an der ein Aufrufer OHNE Terminal erkennt, dass es geklappt hat
+  # (2026-08-21). `attach` ist der gemeinsame Ausgang JEDES gelungenen Weges --
+  # frischer Start wie Anhaengen an eine schon laufende Sitzung --, und an dieser
+  # Stelle steht die tmux-Sitzung mit Sicherheit.
+  #
+  # Warum es die Marke braucht: die Zeile darunter endet mit `exec tmux attach`,
+  # und das scheitert ohne Terminal IMMER. Die Oberflaeche startet dieses Skript
+  # abgeloest, also ohne Terminal -- ein GELUNGENER Start liefert ihr damit
+  # denselben Exit-Code wie ein misslungener, und am 21.08. hat sie deshalb eine
+  # abgelehnte Speicherbuchung als "Stopped" gezeigt statt als Fehlschlag mit
+  # Grund. Der Exit-Code kann diese Frage nicht beantworten, diese Zeile schon.
+  echo "wb-code: SITZUNG-STEHT $SESSION" >&2
   # Sessions created by the terminal `workbench` still carry a yazi sidebar
   # pane; inside VSCode the explorer takes that job, so drop it — the whole
   # terminal area belongs to the orchestrator and its workers.
@@ -436,14 +468,242 @@ fi
 # NB: dropped `--teammate-mode tmux` — deprecated in Claude Code 2.x and it suppresses the
 # custom statusline at the bottom of the orchestrator pane. Delegation runs through
 # claude-worker/pi-worker panes, which don't need it.
+# Prefix, nicht Gleichheit (Befund aus dem Betrieb, 19.08.2026 abends): wb-kontext
+# ensure_mlx (Auftrag B) traegt einen MLX-Provider NIE als blankes "mlx-lokal" in
+# ~/.pi/agent/models.json ein, sondern IMMER mit Kontextstufen-Suffix
+# ("mlx-lokal-64k", "mlx-lokal-256k", ...) -- ein '=' gegen "mlx-lokal" trifft das
+# nie. Vor 'wb-kontext ensure' ist der Wert dagegen noch das blanke "mlx-lokal"
+# (siehe unten). Beide Formen muessen als "das hier ist ein MLX-Modell" zaehlen.
+ist_mlx_lokal() { case "$1" in mlx-lokal*) return 0 ;; *) return 1 ;; esac; }
+
 if [ "$HARNESS" = "pi" ]; then
   # Local orchestrator (SPEC-V2 section F): same pane contract, other harness.
+  # PIPROVIDER faellt auf ollama zurueck (der bisherige, einzige Weg); grug/qwen38
+  # sind MLX-Modelle und laufen BEIDE ueber den umschaltbaren MLX-Server (Auftrag
+  # A, GEMEINSAME-FAKTEN Punkt 2: "grug und qwen3.8 teilen sich einen
+  # umschaltbaren MLX-Server"). Das Ensure dafuer steht EINMAL weiter unten, im
+  # gemeinsamen Kontext-Block -- hier nur PIPROVIDER/PIMODEL setzen, kein
+  # zweiter, widerspruechlicher Ensure-Aufruf gegen grug-server.
+  PIPROVIDER=ollama
   case "$MODEL" in
     ornith)  PIMODEL="ornith:35b" ;;
     qwen)    PIMODEL="qwen3.6:35b-a3b-coding-nvfp4" ;;
     ornith9) PIMODEL="ornith:9b" ;;
-    *)       PIMODEL="$MODEL" ;;
+    grug)
+      PIPROVIDER=mlx-lokal
+      PIMODEL="$HOME/AI/mlx-models/grug-27b-mlx-q4"
+      ;;
+    qwen38)
+      PIPROVIDER=mlx-lokal
+      PIMODEL="$HOME/AI/mlx-models/qwen38-27b-mlx-4bit"
+      ;;
+    *)
+      # Befund aus dem Betrieb, 19.08.2026 abends (der Nutzer, 400er "invalid model
+      # name" beim Start mit 'qwen38-27b"): die fuenf Kurzaliase oben sind
+      # eine Abkuerzung, keine zweite Wahrheit neben der Registry. Wer die
+      # REGISTRY-KENNUNG angibt -- genau das, was die Oberflaeche in ihrer
+      # Modellliste zeigt und weiterreicht -- landete hier bisher unveraendert
+      # in PIMODEL, PIPROVIDER blieb auf dem Vorgabewert "ollama" stehen, egal
+      # was die Registry wirklich fuehrt. Jetzt zuerst die Registry fragen; nur
+      # wenn sie den Namen nicht kennt, gilt er als roher Ollama-Modellname wie
+      # bisher.
+      RPROVIDER="$($HOME/.local/bin/wb-state models get "$MODEL" --field provider 2>/dev/null || true)"
+      RMODELREF="$($HOME/.local/bin/wb-state models get "$MODEL" --field modelRef 2>/dev/null || true)"
+      if [ -n "$RPROVIDER" ] && [ -n "$RMODELREF" ]; then
+        PIPROVIDER="$RPROVIDER"
+        PIMODEL="$RMODELREF"
+      else
+        PIMODEL="$MODEL"
+      fi
+      ;;
   esac
+  # ── Multi-Token-Vorhersage (2026-08-20, Vorgaben des Nutzers) ────────────────
+  # Der Schalter (an/aus) steht in den Settings ('orchestratorVorhersage');
+  # WELCHES Modell dabei benutzt wird, steht in der REGISTRY (Feld
+  # 'vorhersage' je Modell) und ist hier nicht waehlbar -- "die Zuordnung
+  # gehoert zur Auslieferung, nicht in die Oberflaeche". Nur fuer ein
+  # mlx-lokal-Modell wirksam: fuer die eingebauten Ollama-Aliase (ornith,
+  # qwen, ornith9) existiert heute kein Registry-Eintrag mit diesem Feld,
+  # der Nachschlag liefert dann einfach nichts -- kein Fehler, nur "fuer
+  # dieses Modell nichts hinterlegt".
+  #
+  # $MODEL traegt an dieser Stelle noch den ROHEN Aufrufwert (Alias oder
+  # Registry-Kennung) -- der case-Block oben schreibt nur PIMODEL/
+  # PIPROVIDER um, $MODEL selbst nicht. Fuer die beiden Kurzaliase, die
+  # nicht schon selbst die Registry-Kennung sind (qwen38 -> qwen38-27b,
+  # grug -> grug-27b), wird die Kennung hier nachgetragen -- derselbe
+  # Kunstgriff wie EFFORT_ID in shell/pi-worker fuer denselben Zweck.
+  case "$MODEL" in
+    qwen38) VORH_ID="qwen38-27b" ;;
+    grug)   VORH_ID="grug-27b" ;;
+    *)      VORH_ID="$MODEL" ;;
+  esac
+  VORH_BAUART=""; VORH_MODELL=""; VORH_GEWICHTE_GB=""
+  VORH_AN="$($HOME/.local/bin/wb-state settings get orchestratorVorhersage 2>/dev/null || true)"
+  if [ "$VORH_AN" = "true" ] && ist_mlx_lokal "$PIPROVIDER"; then
+    VORH_JSON="$($HOME/.local/bin/wb-state models get "$VORH_ID" --field vorhersage 2>/dev/null || true)"
+    if [ -n "$VORH_JSON" ]; then
+      VORH_BAUART="$(printf '%s' "$VORH_JSON" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("bauart") or "")
+except Exception:
+    print("")' 2>/dev/null)"
+      VORH_MODELL="$(printf '%s' "$VORH_JSON" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("modell") or "")
+except Exception:
+    print("")' 2>/dev/null)"
+      VORH_GEWICHTE_GB="$(printf '%s' "$VORH_JSON" | python3 -c 'import json,sys
+try:
+    v = json.load(sys.stdin).get("gewichteGb")
+    print(v if v is not None else "")
+except Exception:
+    print("")' 2>/dev/null)"
+    fi
+    if [ -n "$VORH_BAUART" ]; then
+      echo "wb-code: Multi-Token-Vorhersage an ($VORH_BAUART: $VORH_MODELL)." >&2
+    else
+      echo "wb-code: Multi-Token-Vorhersage an, aber fuer '$VORH_ID' nichts in der Registry hinterlegt." >&2
+    fi
+  fi
+
+  # ── Kontextfenster (wb-kontext, Auftrag B 2026-08-19, Rangfolge korrigiert
+  # im Nachtrag vom selben Tag) ──────────────────────────────────────────────
+  # Die App startet 'wb-code <ordner>' OHNE Flags -- Harness/Modell/Effort liest
+  # wb-code selbst aus den Settings, und das Einstellungsfenster schreibt den
+  # Kontext genauso nach 'orchestratorKontext'. Rangfolge:
+  #   1) --kontext auf der Befehlszeile (eine konkrete Stufe).
+  #   2) sonst settings.json 'orchestratorKontext'.
+  #   3) sonst 'wb-kontext empfehlung' -- die nach freiem Speicher gewaehlte
+  #      Stufe, NICHT die Registry-Vorgabe/das Modell-Maximum: das waere bei
+  #      einem MLX-Modell ohnehin fast immer zu gross fuer wb-belegung, und
+  #      es waere die spuerbare Verhaltensaenderung, vor der der erste Durchlauf
+  #      dieses Auftrags warnte.
+  # '--kontext auto' zaehlt wie kein Schalter -- durchlaeuft Stufe 2, dann 3.
+  # Es gibt hier keine Registry-Vorgabe mehr, auf die 'auto' eigens zeigen
+  # koennte; ein Mensch, der "auto" tippt, meint "entscheide selbst", nicht
+  # "ignoriere die Settings".
+  # Ein UNBEKANNTER Wert fuehrt nie zu einem stillen Abbruch: 'wb-kontext
+  # ensure'/'wb-mlx-server ensure' pruefen ihn selbst und nennen den Grund auf
+  # stderr, bevor der Aufruf hier mit einer eigenen Zeile scheitert.
+  if [ -n "$KONTEXT_ARG" ] && [ "$KONTEXT_ARG" != auto ]; then
+    KSTUFE="$KONTEXT_ARG"
+  else
+    KONTEXT_SETTING="$($HOME/.local/bin/wb-state settings get orchestratorKontext 2>/dev/null || true)"
+    if [ -n "$KONTEXT_SETTING" ]; then
+      KSTUFE="$KONTEXT_SETTING"
+      echo "wb-code: Kontext aus den Settings (orchestratorKontext) — $KSTUFE." >&2
+    else
+      # --denken "$EFFORT" (Pruefer-Befund B12, 19.08.2026): $EFFORT steht an
+      # dieser Stelle schon fest (oben, "Welche Stufe wirklich gestartet
+      # wird") und wird weiter unten ohnehin als --thinking an pi gereicht --
+      # dieselbe Stufe muss dann auch in die Kontextrechnung, sonst zeigt
+      # wb-kontext eine Zahl, die kleiner ist als das, was pi gleich wirklich
+      # denkt.
+      # Das Entwerfer-Gewicht zaehlt in wb-kontexts eigene Speicherrechnung
+      # mit hinein (nur bei 'entwerfer' -- bei 'eingebaut' ERSETZT der
+      # groessere Modellkoerper das Ziel, kein Zusatzgewicht, siehe
+      # wb-kontext berechne()).
+      ENTWERFER_ARGS=()
+      if [ "$VORH_BAUART" = entwerfer ] && [ -n "$VORH_GEWICHTE_GB" ]; then
+        ENTWERFER_ARGS=(--entwerfer-gewichte-gb "$VORH_GEWICHTE_GB")
+      fi
+      # --vorhersage-einstellung orchestratorVorhersage (Nachtrag 21.08.2026,
+      # Befund vom echten Doppelstart): 'eingebaut' liest die Registry SELBST
+      # (wb-kontext resolve()), im Unterschied zu 'entwerfer' oben also NICHT
+      # ueber VORH_BAUART/ENTWERFER_ARGS gegen $VORH_AN abgesichert. Ohne diese
+      # Zeile rechnete wb-kontext den MTPLX-Koerper (19,83 GiB, q8) selbst dann,
+      # wenn $VORH_AN hier oben "false" war und wirklich der schlichte Koerper
+      # startet (14,95 GiB, bf16) -- eine Zahl, die niemand angefordert hat.
+      # wb-kontext liest dieselbe Einstellung selbst nach, denselben Weg wie
+      # hier oben ("wb-state settings get orchestratorVorhersage").
+      # "${ENTWERFER_ARGS[@]+"${ENTWERFER_ARGS[@]}"}", nicht
+      # "${ENTWERFER_ARGS[@]}": auf macOS' Bash 3.2 wirft ein LEERES Array
+      # unter 'set -u' sonst "unbound variable" (gemessen) -- das Array
+      # selbst IST deklariert, nur ohne Elemente. "${ARR[@]:-}" waere selbst
+      # falsch: es ersetzt ein leeres Array durch EIN leeres Wort statt durch
+      # NULL Woerter, wb-kontexts argparse lehnt das als "unrecognized
+      # arguments" ab (ebenfalls gemessen) -- dieser Weg mit '+' liefert bei
+      # einem leeren Array wirklich null Woerter.
+      KSTUFE="$("$HOME/.local/bin/wb-kontext" empfehlung "$PIMODEL" --parallel 1 --denken "$EFFORT" --vorhersage-einstellung orchestratorVorhersage "${ENTWERFER_ARGS[@]+"${ENTWERFER_ARGS[@]}"}")" || {
+        echo "wb-code: Kontext-Empfehlung fuer '$PIMODEL' nicht zu ermitteln — kein Start." >&2
+        exit 1
+      }
+    fi
+  fi
+  # ~/.pi/agent/models.json bleibt bei JEDEM lokalen Modell (Ollama UND MLX)
+  # ausschliesslich in der Hand von wb-kontext (Nachtrag 2026-08-19) --
+  # wb-mlx-server gibt dafuer KEINE provider-Zeile aus; PIPROVIDER kommt
+  # ausschliesslich aus 'wb-kontext ensure'. Bei einem MLX-Modell kommt VORHER
+  # noch 'wb-mlx-server ensure' dazu, fuer Speicherbuchung und Serverstart/-swap
+  # -- IMMER mit --kontext, sonst nimmt es das Modell-Maximum und wb-belegung
+  # lehnt das fast immer ab (262144 Token x 4 parallel = 112 GiB Spitze).
+  MLXBEDIENT=""
+  MLXPID=""
+  if ist_mlx_lokal "$PIPROVIDER"; then
+    if [ ! -x "$HOME/.local/bin/wb-mlx-server" ]; then
+      echo "wb-code: wb-mlx-server fehlt — Kontextwahl fuer ein MLX-Modell braucht dieses Werkzeug (Auftrag A). Kein stiller Sprung auf den alten Pfad." >&2
+      exit 1
+    fi
+    # Durchreichung an den Server (Auftrag 2026-08-20, Punkt 3: "kein
+    # stiller Pfad, auf dem die Wahl verlorengeht"). shell/wb-mlx-server ist
+    # NICHT meine Datei (Auftrag A/parallele Spur) und kennt heute noch kein
+    # eigenes CLI-Flag dafuer -- die Uebergabe laeuft ueber Umgebungs-
+    # variablen, nach demselben, dort schon etablierten Muster wie
+    # WB_MLX_SERVER_DECODE_PARALLEL/_VORGABE/_OHNE_BELEGUNG. Das ist ein
+    # VORSCHLAG an die Server-Seite, keine abgestimmte Vereinbarung -- siehe
+    # Ergebnisbericht. Nur per Praefix gesetzt (nicht 'export'): wirkt
+    # ausschliesslich fuer DIESEN einen Aufruf, kein Leck in den spaeter
+    # gestarteten pi-Prozess.
+    # DIE AUSGABE WIRD GELESEN, NICHT WEGGEWORFEN (2026-08-21). `wb-mlx-server
+    # ensure` gibt auf stdout eine Zeile `modell=<name>` aus: den Namen, unter
+    # dem der gestartete Server WIRKLICH antwortet. Gebraucht wird er, seit der
+    # Betriebsmotor fuer qwen38-27b mtplx ist -- der Server meldet unter
+    # /v1/models ausschliesslich "mtplx-qwen38-27b-optimized-speed" und weist
+    # jeden anderen Namen ab, waehrend hier bisher der Registry-Pfad
+    # weitergereicht wurde. Ergebnis war ein fehlerfrei gestarteter Server, den
+    # sein einziger Aufrufer nicht ansprechen konnte (gemessen 21.08.).
+    #
+    # Die Meldungen des Werkzeugs laufen weiter ueber stderr und bleiben
+    # sichtbar; nur stdout wird eingefangen.
+    MLXAUS="$(WB_MLX_SERVER_VORHERSAGE_BAUART="$VORH_BAUART" \
+      WB_MLX_SERVER_VORHERSAGE_MODELL="$VORH_MODELL" \
+      WB_MLX_SERVER_VORHERSAGE_GEWICHTE_GB="$VORH_GEWICHTE_GB" \
+      "$HOME/.local/bin/wb-mlx-server" ensure "$PIMODEL" --kontext "$KSTUFE")" || {
+      echo "wb-code: 'wb-mlx-server ensure' fuer Kontext $KSTUFE fehlgeschlagen — kein Start." >&2
+      exit 1
+    }
+    MLXBEDIENT="$(printf '%s\n' "$MLXAUS" | sed -n 's/^modell=//p' | head -1)"
+    # Die PID des Modellservers -- gebraucht wird sie weiter unten, sobald die
+    # tmux-Sitzung steht: dann bekommt der abgeloeste Server seinen richtigen
+    # Eigentuemer (siehe dort). Fehlt sie (aelteres wb-mlx-server), bleibt es
+    # beim vorlaeufigen Eigentuemer; der Start haengt nicht daran.
+    MLXPID="$(printf '%s\n' "$MLXAUS" | sed -n 's/^pid=//p' | head -1)"
+    if [ -n "$MLXBEDIENT" ] && [ "$MLXBEDIENT" != "$PIMODEL" ]; then
+      echo "wb-code: der Server bedient '$MLXBEDIENT' (nicht '$PIMODEL') — pi bekommt diesen Namen." >&2
+    fi
+  fi
+  # --bedient-als schreibt genau diesen Namen als `id` in pis Modell-Eintrag und
+  # gibt ihn als erste Zeile zurueck; gesucht wird der Eintrag weiterhin ueber
+  # den modelRef. Leer (Ollama, oder ein Motor ohne eigenen Namen) heisst wie
+  # bisher: der Pfad ist der Name.
+  BEDIENT_ARGS=()
+  [ -n "${MLXBEDIENT:-}" ] && BEDIENT_ARGS=(--bedient-als "$MLXBEDIENT")
+  ENSURED="$("$HOME/.local/bin/wb-kontext" ensure "$PIMODEL" "$KSTUFE" "${BEDIENT_ARGS[@]+"${BEDIENT_ARGS[@]}"}")" || {
+    echo "wb-code: 'wb-kontext ensure' fuer Kontext $KSTUFE fehlgeschlagen — kein Start." >&2
+    exit 1
+  }
+  PIMODEL="$(printf '%s\n' "$ENSURED" | head -1)"
+  KPROV="$(printf '%s\n' "$ENSURED" | sed -n 's/^provider=//p')"
+  [ -n "$KPROV" ] && PIPROVIDER="$KPROV"
+  echo "wb-code: Kontext $KSTUFE Token (Provider $PIPROVIDER)." >&2
+  # In die Sitzungs-Zustandsdatei schreiben, damit die Oberflaeche die gewaehlte
+  # Stufe anzeigen kann (Auftrag B 2026-08-19) -- eigener Aufruf, weil KSTUFE
+  # erst hier feststeht, lange nach dem 'touch' oben.
+  KTOUCH=("$DIR" "$SESSION"); [ -n "$KEY" ] && KTOUCH+=(--key "$KEY")
+  KTOUCH+=(--kontext "$KSTUFE")
+  $HOME/.local/bin/wb-state touch "${KTOUCH[@]}" \
+    || echo "wb-code: WARNUNG — Kontextstufe nicht in die Zustandsdatei geschrieben." >&2
   PISESSDIR="$HOME/.pi-workers/sessions/orch-${KEY:-$(printf '%s' "$DIR" | tr '/' '-')}"
   mkdir -p "$PISESSDIR"
   ROLE="$HOME/.pi/agent/ORCHESTRATOR.md"
@@ -454,7 +714,7 @@ if [ "$HARNESS" = "pi" ]; then
   # orchestrator cannot spawn workers (claude-worker, pi-worker, wb-*).
   # Run through `bash -lc` like pi-worker does: the user's login shell is zsh,
   # which aborts loudly on the non-matching session glob below.
-  PI_CMD="export PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH && exec pi --provider ollama --model $(printf %q "$PIMODEL") --thinking $(printf %q "$EFFORT") --session-dir $(printf %q "$PISESSDIR") \$( ls $(printf %q "$PISESSDIR")/*.json* >/dev/null 2>&1 && echo --continue )"
+  PI_CMD="export PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH && exec pi --provider $(printf %q "$PIPROVIDER") --model $(printf %q "$PIMODEL") --thinking $(printf %q "$EFFORT") --session-dir $(printf %q "$PISESSDIR") \$( ls $(printf %q "$PISESSDIR")/*.json* >/dev/null 2>&1 && echo --continue )"
   [ -n "$NAME" ] && PI_CMD="$PI_CMD --name $(printf %q "$NAME")"
   [ -f "$ROLE" ] && PI_CMD="$PI_CMD --append-system-prompt $(printf %q "$ROLE")"
   CLAUDE_CMD="bash -lc $(printf %q "$PI_CMD")"
@@ -590,6 +850,33 @@ fi
 
 tmux new-session -d -s "$SESSION" -c "$DIR" "$CLAUDE_CMD"
 orch=$(tmux list-panes -t "=$SESSION" -F '#{pane_id}' | head -1)
+
+# ── Diese Sitzung traegt sich als Benutzer des Modellservers ein (2026-08-21) ─
+# Beim Start gab es diese Sitzung noch nicht: `wb-mlx-server ensure` laeuft
+# weiter oben, `tmux new-session` erst hier. Der Server wurde deshalb auf einen
+# VORLAEUFIGEN Eigentuemer registriert -- die Hilfssession der Oberflaeche, oder
+# die Oberflaeche selbst. Beide sind falsch auf Dauer: die Hilfssession wird
+# abgeraeumt, sobald diese Sitzung steht, und die Oberflaeche ueberlebt die
+# Sitzung, die den Server wirklich braucht.
+#
+# EINGETRAGEN WIRD DAZU, NICHT STATT (nachmittags korrigiert). Ein Server wird
+# von MEHREREN Sitzungen benutzt; wer ihn nur auf die zuletzt gestartete
+# umschreibt, meldet ihn als Waise, sobald genau die zuerst geschlossen wird --
+# waehrend die anderen weiterlaufen. Gemessen an vier Sitzungen auf einem
+# Server. Deshalb: jede traegt ihren Pane in die Liste ein, und eine Waise ist
+# es erst, wenn KEINER dieser Panes mehr lebt.
+#
+# Der Eintrag ist bewusst NICHT Bedingung fuer den Start: schlaegt er fehl,
+# laeuft die Sitzung mit dem bisherigen Stand weiter, und das Werkzeug sagt es.
+if [ -n "${MLXPID:-}" ] && [ -n "$orch" ]; then
+  # GEFRAGT WIRD DER SERVER SELBST, nicht der Vorgabepfad: welchen Socket
+  # dieses Skript benutzt, entscheidet die Umgebung (die Oberflaeche setzt einen
+  # eigenen), und ein geratener Pfad zeigte dann auf einen fremden Server.
+  msock="$(tmux display -p -t "=$SESSION" '#{socket_path}' 2>/dev/null)"
+  [ -n "$msock" ] || msock="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/default"
+  "$HOME/.local/bin/wb-nohup" benutzer "$MLXPID" --pane "$orch" --socket "$msock" \
+    || echo "wb-code: diese Sitzung steht nicht als Benutzer des Modellservers (PID $MLXPID) — sie laeuft trotzdem." >&2
+fi
 # Ueber wb-rolle (2026-08-07), damit die Rolle nicht nur in der Pane-Option steht,
 # sondern von der ersten Sekunde an auch im Register, das die Guards als zweite
 # Quelle lesen. Ohne das gaebe es ein Fenster: ein frischer Orchestrator-Pane, der

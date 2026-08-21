@@ -802,7 +802,8 @@ COMPACT_SETTLE="${COMPACT_SETTLE:-120}"   # hands off this long right after typi
 # ↓ 67.5k tokens)") plus "Running 3 shell commands…". Every one of those is a turn in
 # progress. A false BUSY only postpones an action by one poll; a false IDLE corrupts a turn.
 BUSY_RE='esc to interrupt|Compacting|Summariz|tokens\)|↓ [0-9]|Running [0-9]+ (shell|tool)|^[[:space:]]*[✢✳✶✻✽·][[:space:]]+[A-Za-z].*…'
-PROJECT="${PROJECT:-$PWD}"   # HANDOFF-<name>.md and .wb-knowledge-saved live here
+PROJECT="${PROJECT:-$PWD}"   # .wb-knowledge-saved lives here; HANDOFF-<name>.md is only the
+                              # fallback candidate for a worker's handoff -- see handoff_candidates()
 SENTINEL="$PROJECT/.wb-knowledge-saved"   # orchestrator writes it when its knowledge is safe
 GUARD_START=$(date +%s)                   # only a sentinel written after this counts (see below)
 # (mtime() is defined further up, next to the --ensure block that needs it.)
@@ -900,14 +901,24 @@ tonum() {     # "109k" -> 109000 | "1.0M" -> 1000000 | "654" -> 654
 # both the figures and the bar (measured at 51 columns with a long project path). It does not care
 # about pane width -- but it is only used when the pane can be mapped to ONE session file without
 # guessing (see below), because a wrong number here is worse than none.
-transcript_load() {   # pane -> "<percent> transcript" or nothing
-    local pid cwd
+transcript_load() {   # pane [name] -> "<percent> transcript" or nothing
+    local pid cwd name="${2:-}" wbpath=""
     pid=$(tmux display -p -t "$1" '#{pane_pid}' 2>/dev/null) || return
     cwd=$(tmux display -p -t "$1" '#{pane_current_path}' 2>/dev/null) || return
     [[ -n "$pid" && -n "$cwd" ]] || return
-    /usr/bin/python3 - "$pid" "$cwd" "$HOME/.claude/projects" <<'PY'
+    # DER SICHERE PFAD ZUERST (2026-08-19, Befund des Nutzers): pi-worker traegt
+    # claudeSessionId + dir schon ein, sobald das Gespraech beginnt, und wb-state
+    # loest daraus denselben Pfad auf, den announce_blind() unten laengst NENNT --
+    # aber bis heute nur als Hinweistext, nie als echte Quelle. Er umgeht genau die
+    # Mehrdeutigkeit, an der die eigene PID/CWD-Vermutung weiter unten scheitert
+    # (mehrere .jsonl im selben Projektordner, z. B. nach einem Compact-Resume).
+    # Gemessen: die Worker 'komm' und 'wache' galten deshalb als BLIND, obwohl die
+    # Wache den Transkriptpfad in derselben Zeile schon nannte.
+    [[ -n "$name" ]] && wbpath=$("$HOME/.local/bin/wb-state" worker-transcript "$name" 2>/dev/null)
+    /usr/bin/python3 - "$pid" "$cwd" "$HOME/.claude/projects" "$wbpath" <<'PY'
 import json, os, glob, re, subprocess, sys
 pane_pid, cwd, projects = sys.argv[1], sys.argv[2], sys.argv[3]
+explicit_path = sys.argv[4] if len(sys.argv) > 4 else ""
 
 def cmdline(pid):
     try:
@@ -924,7 +935,10 @@ def children(pid):
     except Exception:
         return []
 
-# the claude process of this pane: usually the pane process itself (exec), else a child
+# the claude process of this pane: usually the pane process itself (exec), else a child.
+# Best-effort only now (2026-08-19): it still supplies model+sid for the GUESS branch
+# below, but a working explicit_path must not depend on finding it -- pi-worker's own
+# bookkeeping is unambiguous by construction, unlike a pid/cwd guess.
 cl, queue, seen = "", [int(pane_pid)], set()
 while queue:
     p = queue.pop(0)
@@ -936,37 +950,40 @@ while queue:
         cl = c
         break
     queue.extend(children(p))
-if not cl:
-    sys.exit(0)
 
-args = cl.split()
-def opt(name):
-    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else ""
-model, sid = opt("--model"), opt("--resume")
+model, sid = "", ""
+if cl:
+    args = cl.split()
+    def opt(name):
+        return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else ""
+    model, sid = opt("--model"), opt("--resume")
 
-# Der Ordnername unter ~/.claude/projects ersetzt JEDES Zeichen ausser [A-Za-z0-9-]
-# durch einen Bindestrich, nicht nur den Schraegstrich (gemessen 2026-08-08 an allen
-# 140 vorhandenen Ordnern; in keinem steht ein anderes Zeichen). Der Punkt war der
-# Fall, der auffiel: seit die Worker am 04.08. in ~/.pi-workers/worktrees/<name>
-# umgezogen sind, liegt in JEDEM Worker-Pfad ein versteckter Ordner, "/"-Ersetzung
-# allein ergab "-Users-<user>-.pi-workers-..." statt "-Users-<user>--pi-workers-...",
-# und damit war diese letzte Rueckfallquelle fuer jeden Worker tot. Aufgefallen ist
-# es erst, als zwei Panes ausserdem zu niedrig fuer die Statuszeile waren und der
-# Guard sie als BLIND meldete -- vier Tage lang war die Wache bei jedem Worker eine
-# Quelle aermer, ohne dass es jemand sah.
-proj = os.path.join(projects, re.sub(r"[^A-Za-z0-9-]", "-", cwd))
 path = ""
-if sid and os.path.exists(os.path.join(proj, sid + ".jsonl")):
-    path = os.path.join(proj, sid + ".jsonl")           # --resume names the file exactly
-else:
-    # No --resume: only safe when the folder holds exactly ONE session. Measured 2026-07-25:
-    # four live workers shared one project folder, all files had the same mtime, and
-    # "newest mtime" picked the ORCHESTRATOR's transcript (12% instead of the pane's 26%).
-    # A wrong LOW number is worse than no number -- it silently suppresses the warning. So
-    # when the mapping is ambiguous we report nothing and the caller announces blindness.
-    cands = glob.glob(os.path.join(proj, "*.jsonl"))
-    if len(cands) == 1:
-        path = cands[0]
+if explicit_path and os.path.exists(explicit_path):
+    path = explicit_path
+elif sid or cl:
+    # Der Ordnername unter ~/.claude/projects ersetzt JEDES Zeichen ausser [A-Za-z0-9-]
+    # durch einen Bindestrich, nicht nur den Schraegstrich (gemessen 2026-08-08 an allen
+    # 140 vorhandenen Ordnern; in keinem steht ein anderes Zeichen). Der Punkt war der
+    # Fall, der auffiel: seit die Worker am 04.08. in ~/.pi-workers/worktrees/<name>
+    # umgezogen sind, liegt in JEDEM Worker-Pfad ein versteckter Ordner, "/"-Ersetzung
+    # allein ergab "-Users-<user>-.pi-workers-..." statt "-Users-<user>--pi-workers-...",
+    # und damit war diese letzte Rueckfallquelle fuer jeden Worker tot. Aufgefallen ist
+    # es erst, als zwei Panes ausserdem zu niedrig fuer die Statuszeile waren und der
+    # Guard sie als BLIND meldete -- vier Tage lang war die Wache bei jedem Worker eine
+    # Quelle aermer, ohne dass es jemand sah.
+    proj = os.path.join(projects, re.sub(r"[^A-Za-z0-9-]", "-", cwd))
+    if sid and os.path.exists(os.path.join(proj, sid + ".jsonl")):
+        path = os.path.join(proj, sid + ".jsonl")           # --resume names the file exactly
+    else:
+        # No --resume: only safe when the folder holds exactly ONE session. Measured 2026-07-25:
+        # four live workers shared one project folder, all files had the same mtime, and
+        # "newest mtime" picked the ORCHESTRATOR's transcript (12% instead of the pane's 26%).
+        # A wrong LOW number is worse than no number -- it silently suppresses the warning. So
+        # when the mapping is ambiguous we report nothing and the caller announces blindness.
+        cands = glob.glob(os.path.join(proj, "*.jsonl"))
+        if len(cands) == 1:
+            path = cands[0]
 if not path:
     sys.exit(0)
 
@@ -1214,8 +1231,8 @@ session_load() {   # <pane> -> "<percent> session" oder nichts  (setzt harness_i
     echo "$pct session"
 }
 
-read_load() { # pane -> "<percent> <exact|bar|transcript|registry|session|none>"; -1 when nothing is readable
-    local cap tail5 pair num den bar filled t sedx
+read_load() { # pane [name] -> "<percent> <exact|bar|transcript|registry|session|none>"; -1 when nothing is readable
+    local cap tail5 pair num den bar filled t sedx wname="${2:-}"
     cap=$(tmux capture-pane -p -t "$1" 2>/dev/null) || cap=""
     # BOTH readings come from the status line, so both search the SAME bottom window. Searching
     # the whole pane for a bar finds STALE ones that scrolled up (measured: an old bar from
@@ -1238,7 +1255,7 @@ read_load() { # pane -> "<percent> <exact|bar|transcript|registry|session|none>"
         return
     fi
     # 3) last resort: the transcript (pane so narrow that the status line is cut before the bar)
-    t=$(transcript_load "$1")
+    t=$(transcript_load "$1" "$wname")
     [[ -n "$t" ]] && { echo "$t"; return; }
     # 4) das contextPattern des Harness aus der Registry (2026-08-06). Bewusst NACH den drei
     #    gewachsenen Quellen: Claude und pi haengen daran, und pi wird ueberhaupt nur deshalb
@@ -1329,17 +1346,51 @@ schreib_taste() {  # <pane> <tastenname>
 # dessen Optionszeilen beginnen mit demselben Zeiger '❯' wie die Eingabezeile, und ein
 # blindes zweites Enter dort waere keine Nachhilfe beim Absenden, sondern eine
 # Bestaetigung der markierten Option.
+# GEMESSEN (2026-08-19, Auftrag zu den drei Kompaktierungen in wb-AI, Log-Beleg
+# 22:55-23:00): der Verdacht, eine Vervollstaendigungsliste beim Tippen des
+# Slash-Befehls male Zeilen mit demselben Zeiger '❯' wie die Eingabezeile, ist
+# WIDERLEGT -- eine echte Claude-Code-TUI (isolierter tmux-Socket, eigenes
+# Scratch-Verzeichnis) zeigt Vorschlagszeilen ohne '❯', nur mit zwei
+# Leerzeichen eingerueckt ("  /compact ... Free up context ..."). Auch ein
+# ueber mehrere Zeilen umgebrochener, langer Kompaktierbefehl (der reale Text
+# aus compact_orchestrator() unten, gemessen mit demselben Wortlaut) traegt
+# das '❯' nur auf der ERSTEN Zeile, Folgezeilen sind ohne Zeiger eingerueckt --
+# `grep '^❯' | tail -1` trifft zuverlaessig die aktuelle Eingabezeile, nie eine
+# Vorschlags- oder Verlaufszeile.
+#
+# Die tatsaechliche Ursache der drei Kompaktierungen lag nicht in dieser
+# Pruefung selbst, sondern EINE Ebene hoeher: compact_orchestrator() markierte
+# `compacted` nur auf dem ERFOLGSPFAD. Eine einzelne unverifizierte Absendung
+# (siehe Kopfkommentar oben: langer Text, `tmux send-keys` kehrt sofort zurueck,
+# eine Sekunde reicht nicht immer) liess `compacted` leer UND $SENTINEL stehen
+# -- der naechste Poll (Default 60s) sah dieselbe Ausloese-Bedingung wieder und
+# tippte den KOMPLETTEN Kompaktierbefehl ein zweites Mal, unabhaengig davon, ob
+# der erste Versuch tatsaechlich schon eine echte Kompaktierung angestossen
+# hatte (gemessen: eine bereits laufende Kompaktierung ist nach 60s regelmaessig
+# laengst fertig und faellt nicht mehr unter BUSY_RE). Der Log-Beleg passt exakt
+# dazu: zwei "NICHT verifiziert"-Zeilen im Abstand von genau 60s (POLL-Default),
+# dann eine dritte, erfolgreiche Absendung. Fuer die meisten Nachrichten
+# (Handoff, WEITERARBEITEN) ist ein wiederholtes Tippen echte, harmlose
+# Redundanz -- fuer den Kompaktierbefehl ist es das Gegenteil: eine zweite
+# Kompaktierung wirft Kontext weg, den die erste gerade erst gerettet hat.
+# Deshalb gilt fuer ihn ab jetzt "lieber einmal ungesendet und laut gemeldet
+# als zweimal gesendet" (Auftrag): kein internes zweites Enter mehr (siehe
+# `nachhilfe` unten) und der Aufrufer (compact_orchestrator) markiert den Pane
+# als "diesen Zyklus schon versucht", SOBALD etwas getippt wurde -- auch wenn
+# die Verifikation scheitert.
 GUARD_PROMPT_RE='^❯'
 GUARD_PROMPT_IGNORE='^❯ Press up to edit queued messages'
-absenden_verifizieren() {   # <pane> -> 0: Eingabezeile frei (oder Queue-Platzhalter), 1: Text haengt noch
-    local pane="$1" versuch inbox
+absenden_verifizieren() {   # <pane> [nachhilfe=1] -> 0: Eingabezeile frei (oder Queue-Platzhalter), 1: Text haengt noch
+    local pane="$1" nachhilfe="${2:-1}" versuch inbox
     for versuch in 1 2; do
         sleep 1
         [[ -n "$(pane_dialog_question "$pane")" ]] && return 1
         inbox=$(tmux capture-pane -p -t "$pane" 2>/dev/null | grep -E "$GUARD_PROMPT_RE" | tail -1)
         printf '%s' "$inbox" | grep -qE "$GUARD_PROMPT_IGNORE" && return 0
         printf '%s' "$inbox" | grep -qE "${GUARD_PROMPT_RE}[[:space:]]+[^[:space:]]" || return 0
-        (( versuch == 1 )) && schreib_taste "$pane" Enter
+        (( versuch == 2 )) && break
+        (( nachhilfe )) || break            # nachhilfe=0: EIN Check reicht, keine zweite Sekunde warten
+        schreib_taste "$pane" Enter
     done
     return 1
 }
@@ -1363,11 +1414,19 @@ nudge() {     # never interrupt a turn or a compaction (for /compact + orchestra
 # gestartet wird, bleibt der Merker aus, obwohl der Text laengst sichtbar im Pane
 # stand -- die Meldung kommt beim Neustart ein zweites Mal. Gemessen, nicht vermutet:
 # genau das riss test-context-guard-postfach.sh (e) ein, als absenden_verifizieren()
-# probeweise in jedem nudge() lag (Restart mitten in dessen Wartesekunden). Fuer
-# Kompaktierung und Wiederaufnahme-Prompt gilt die Sorge nicht in derselben Schaerfe:
-# ein wiederholtes Tippen dort ist eine harmlose Redundanz, ein unentdeckt
-# verschlucktes ist der Bug, den dieser Auftrag beheben soll -- deshalb hier, und nur
-# hier, verifiziert.
+# probeweise in jedem nudge() lag (Restart mitten in dessen Wartesekunden).
+#
+# FUER DEN KOMPAKTIERBEFEHL SELBST GILT DIESE FUNKTION NICHT MEHR (Befund
+# 2026-08-19, siehe Kopfkommentar bei absenden_verifizieren): hier stand bis
+# heute, wiederholtes Tippen sei bei Kompaktierung/Wiederaufnahme-Prompt eine
+# harmlose Redundanz. Fuer den Wiederaufnahme-Prompt (WEITERARBEITEN, reiner
+# Text) stimmt das weiterhin -- er bleibt bei nudge_verifiziert(). Fuer den
+# Kompaktierbefehl ist die Behauptung WIDERLEGT: eine zweite Kompaktierung wirft
+# echten Kontext weg, den die erste gerade erst gerettet hat (drei Kompaktierungen
+# aus einer einzigen Notbremse in wb-AI, 22:55-23:00, zwei davon ueberzaehlig,
+# eine davon nicht mehr abgefangen). compact_orchestrator() unten ruft dafuer
+# nudge_kompakt_einmalig() auf: kein internes zweites Enter, und der Aufrufer
+# markiert den Pane als versucht, SOBALD getippt wurde -- auch ohne Verifikation.
 nudge_verifiziert() {
     local pane="$1" msg="$2"
     tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && return 1
@@ -1376,6 +1435,26 @@ nudge_verifiziert() {
     schreib_taste "$pane" Enter
     absenden_verifizieren "$pane" && return 0
     echo "$(date +%H:%M) context-guard: Absenden an $pane NICHT verifiziert -- Text stand nach Enter (und einer Nachhilfe) noch in der Eingabezeile. Selbst pruefen: tmux capture-pane -p -t $pane" >&2
+    return 1
+}
+
+# Fuer den Kompaktierbefehl allein (siehe Kopfkommentar oben): kein internes
+# zweites Enter (absenden_verifizieren mit nachhilfe=0), und drei statt zwei
+# Ergebnisse, damit der Aufrufer "gar nicht versucht" (Pane war busy, nichts
+# getippt) von "getippt, aber nicht verifiziert" unterscheiden kann -- nur beim
+# zweiten Fall darf in diesem Zyklus NICHT erneut getippt werden.
+# Rueckgabe: 0 verifiziert gesendet · 1 GETIPPT, aber nicht verifiziert (Aufrufer
+# markiert den Zyklus als versucht und tippt NICHT erneut) · 2 gar nicht
+# versucht (Pane busy oder schreib_text schlug fehl -- naechster Poll darf es
+# erneut versuchen, es steht ja nichts Halbes im Pane).
+nudge_kompakt_einmalig() {
+    local pane="$1" msg="$2"
+    tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && return 2
+    schreib_text "$pane" "$msg" || return 2
+    sleep 1
+    schreib_taste "$pane" Enter
+    absenden_verifizieren "$pane" 0 && return 0
+    echo "$(date +%H:%M) context-guard: Kompaktierbefehl an $pane NICHT verifiziert -- Text stand nach Enter noch in der Eingabezeile. Lieber einmal ungesendet gemeldet als zweimal gesendet: KEIN erneuter Versuch in diesem Zyklus. Selbst pruefen: tmux capture-pane -p -t $pane" >&2
     return 1
 }
 
@@ -1396,6 +1475,23 @@ nudge_queue() {
 }
 
 sanitize_name() { printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-'; }
+
+# Wo HANDOFF-<name>.md fuer EINEN Worker liegt (2026-08-19). Seit dem 04.08. arbeitet
+# jeder Worker in seinem eigenen Git-Worktree (~/.pi-workers/worktrees/<name>) statt in
+# PROJECT -- und schreibt seine Uebergabe dorthin, wo er tatsaechlich sitzt. Der alte
+# Code pruefte NUR "$PROJECT/HANDOFF-${name}.md" und wartete damit auf eine Datei, die
+# an dieser Stelle nie erscheint: 19:30 "handoff requested", danach nie kompaktiert
+# (Befund des Nutzers am mlxsrv-Worker, Uebergabe stand mit 28723 Byte im Worktree).
+# Kandidat 1 ist das PANE-eigene pane_current_path (der Worktree, der Normalfall seit
+# 04.08.); Kandidat 2 bleibt PROJECT als Rueckfallebene -- fuer den Moment, in dem tmux
+# den Pfad nicht liefert, und fuer Worker, die noch direkt im Hauptbaum sitzen. Eine der
+# beiden Stellen reicht.
+handoff_candidates() {   # pane name -> ein oder zwei Kandidatpfade, cwd zuerst
+    local pane="$1" name="$2" cwd
+    cwd=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
+    [[ -n "$cwd" ]] && printf '%s/HANDOFF-%s.md\n' "$cwd" "$name"
+    [[ "$cwd" != "$PROJECT" ]] && printf '%s/HANDOFF-%s.md\n' "$PROJECT" "$name"
+}
 
 record_known_worker() {   # name -> appends to KNOWN_WORKERS_FILE once, deduped
     local name="$1"
@@ -1724,7 +1820,7 @@ nocompact="" # Panes, deren Harness kein Kompaktieren kennt -- ebenfalls genau e
 # the load-based emergency brake) so the follow-up is identical either way: a compacted
 # orchestrator without a prompt has an empty window and no task and simply stalls -- the exact
 # failure the human should never be the one to notice.
-compact_orchestrator() {   # $1 = reason (log only) -> 0 typed / 1 pane was busy oder kann nicht
+compact_orchestrator() {   # $1 = reason (log only) -> 0 verifiziert getippt / 1 nichts getippt (busy/Harness) ODER getippt-aber-unverifiziert (dann `compacted` trotzdem gesetzt, siehe unten -- kein zweiter Versuch in diesem Zyklus)
     local reason="$1"
     # Der Kompaktierbefehl kommt aus der Registry (2026-08-06). Bis heute stand hier ein fest
     # verdrahtetes /compact, das auch in einen pi-Pane getippt wurde, wo es nichts bewirkt.
@@ -1738,10 +1834,24 @@ compact_orchestrator() {   # $1 = reason (log only) -> 0 typed / 1 pane was busy
         fi
         return 1
     fi
-    nudge_verifiziert "$ORCH" "$HCOMPACT Behalte: SESSION-STATE.md im Projekt ist der Live-Zustand (Ziele, gemessener Stand, geloeste Kernbugs, Prozessregeln, laufende Worker mit Pane-IDs, naechste Schritte) — sie ueberlebt die Kompaktierung und wird danach ZUERST gelesen. Ebenso GOALS.md (verbindliche Ziele), QUALITY.md (Pruefkatalog, Abnahme am Auge), PERF-STATE.md (alle gemessenen Sackgassen — nicht wiederholen). Worker-Status NIE am Pane-Text ablesen, sondern auf die Ergebnisdatei warten." || return 1
+    nudge_kompakt_einmalig "$ORCH" "$HCOMPACT Behalte: SESSION-STATE.md im Projekt ist der Live-Zustand (Ziele, gemessener Stand, geloeste Kernbugs, Prozessregeln, laufende Worker mit Pane-IDs, naechste Schritte) — sie ueberlebt die Kompaktierung und wird danach ZUERST gelesen. Ebenso GOALS.md (verbindliche Ziele), QUALITY.md (Pruefkatalog, Abnahme am Auge), PERF-STATE.md (alle gemessenen Sackgassen — nicht wiederholen). Worker-Status NIE am Pane-Text ablesen, sondern auf die Ergebnisdatei warten."
+    local sendestatus=$?
+    if (( sendestatus == 2 )); then
+        return 1                           # Pane war busy, nichts getippt -- naechster Poll darf es erneut versuchen
+    fi
+    # GETIPPT, unabhaengig davon, ob verifiziert (Befund 2026-08-19, siehe
+    # nudge_kompakt_einmalig): $ORCH gilt ab hier als "diesen Zyklus versucht",
+    # egal wie dieser Aufruf endet. Sentinel und Notbremse pruefen beide nur
+    # noch `compacted` -- eine unverifizierte Absendung darf den Befehl darum
+    # NIE ein zweites Mal in DIESEM Zyklus abschicken, sonst wirft die zweite
+    # Kompaktierung genau den Kontext weg, den die erste (falls sie doch
+    # ankam) gerade erst gerettet hat.
+    compacted="$compacted $ORCH"
+    if (( sendestatus != 0 )); then
+        return 1                           # geloggt hat nudge_kompakt_einmalig schon
+    fi
     echo "$(date +%H:%M) orchestrator ($ORCH) -> $HCOMPACT typed ($reason)"
     log_orch_notify "orchestrator /compact getippt ($reason)"
-    compacted="$compacted $ORCH"
     sleep "$COMPACT_SETTLE"                # hands off while it compacts
     for _ in 1 2 3 4 5 6 7 8 9 10; do
         tmux capture-pane -p -t "$ORCH" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" || break
@@ -1897,7 +2007,7 @@ while true; do
         # die Statuszeile ueberdecken, die read_load() sonst liest).
         check_dialog_block "$pane" "$name"
 
-        read -r pct src <<<"$(read_load "$pane")"
+        read -r pct src <<<"$(read_load "$pane" "$name")"
         if (( pct < 0 )); then announce_blind "$pane" "$name" 1; continue; fi
         blind="${blind/ $pane/}"
 
@@ -1912,8 +2022,14 @@ while true; do
         # cheerfully announce "Jetzt /compact" and then sit there forever. So we only ask for the
         # handoff here, and do the compaction ourselves in step 2.
         if (( pct >= WARN_PCT )) && [[ "$warned" != *" $pane"* ]]; then
-            if nudge_queue "$pane" "KONTEXT-WARNUNG (automatisch): Du stehst bei ~${pct}% Kontext. Ein voller Worker scheitert nicht — er wird STILL SCHLECHTER (vergisst Invarianten, wiederholt geloeste Fehler, widerspricht seinen eigenen Messungen). Schreibe JETZT eine VOLLSTAENDIGE UEBERGABE nach HANDOFF-${name}.md im Projektverzeichnis: Auftrag, Architektur, Vertraege/Invarianten, alle Fallstricke und NULL-RESULTATE (die sind das wertvollste Wissen — sie verhindern, dass jemand deine Sackgassen erneut durchmisst), offene Punkte, naechster konkreter Schritt. Danach NUR kurz melden, was du persistiert hast, und STEHENBLEIBEN. Tippe KEINEN Kompaktierbefehl — das kannst du nicht selbst, ich mache es fuer dich, sobald deine Uebergabe steht."; then
-                echo "$(date +%H:%M) $name ($pane) at ${pct}% -> handoff requested"
+            # Vollstaendiger Pfad statt "im Projektverzeichnis" (2026-08-19): das stimmte
+            # seit dem Umzug in eigene Worktrees nicht mehr und liess die Uebergabe an
+            # einer Stelle suchen, an der sie nie erschien. Erster Kandidat = der Ort, den
+            # handoff_candidates() (und damit der Schritt-2-Check unten) auch prueft.
+            handoff_target="$(handoff_candidates "$pane" "$name" | head -1)"
+            [[ -n "$handoff_target" ]] || handoff_target="$PROJECT/HANDOFF-${name}.md"
+            if nudge_queue "$pane" "KONTEXT-WARNUNG (automatisch): Du stehst bei ~${pct}% Kontext. Ein voller Worker scheitert nicht — er wird STILL SCHLECHTER (vergisst Invarianten, wiederholt geloeste Fehler, widerspricht seinen eigenen Messungen). Schreibe JETZT eine VOLLSTAENDIGE UEBERGABE nach ${handoff_target}: Auftrag, Architektur, Vertraege/Invarianten, alle Fallstricke und NULL-RESULTATE (die sind das wertvollste Wissen — sie verhindern, dass jemand deine Sackgassen erneut durchmisst), offene Punkte, naechster konkreter Schritt. Danach NUR kurz melden, was du persistiert hast, und STEHENBLEIBEN. Tippe KEINEN Kompaktierbefehl — das kannst du nicht selbst, ich mache es fuer dich, sobald deine Uebergabe steht."; then
+                echo "$(date +%H:%M) $name ($pane) at ${pct}% -> handoff requested ($handoff_target)"
                 warned="$warned $pane"
             fi
             continue
@@ -1929,21 +2045,35 @@ while true; do
         if [[ "$warned" == *" $pane"* ]] && [[ "$compacted" != *" $pane"* ]]; then
             (( WACHE_WORKER_EINGRIFF )) || continue
             tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && continue
-            [[ -f "$PROJECT/HANDOFF-${name}.md" ]] || continue   # no handoff yet -- let it finish
+            # Beide Kandidaten pruefen, nicht nur PROJECT (2026-08-19, siehe handoff_candidates
+            # oben): der Worker schreibt seit dem Worktree-Umzug fast immer in sein eigenes
+            # pane_current_path, nicht in PROJECT.
+            found_handoff=""
+            while IFS= read -r cand; do
+                [[ -f "$cand" ]] && { found_handoff="$cand"; break; }
+            done < <(handoff_candidates "$pane" "$name")
+            [[ -n "$found_handoff" ]] || continue   # no handoff yet -- let it finish
             # Kompaktierbefehl aus der Registry (2026-08-06), gleiche Begruendung wie beim
             # Orchestrator. Die Uebergabe aus Schritt 1 ist damit nicht umsonst: sie steht in
             # der Datei, auch wenn dieser Harness nicht kompaktieren kann.
             harness_info "$pane"
             if [[ -z "$HCOMPACT" ]]; then
                 if [[ "$nocompact" != *" $pane"* ]]; then
-                    echo "$(date +%H:%M) $name ($pane): Harness '${HID:-unbekannt}' kennt kein Kompaktieren — Uebergabe steht in HANDOFF-${name}.md, kompaktiert wird NICHT."
+                    echo "$(date +%H:%M) $name ($pane): Harness '${HID:-unbekannt}' kennt kein Kompaktieren — Uebergabe steht in $found_handoff, kompaktiert wird NICHT."
                     nocompact="$nocompact $pane"
                 fi
                 continue
             fi
-            if nudge_verifiziert "$pane" "$HCOMPACT"; then
+            # Derselbe Fund wie bei compact_orchestrator (2026-08-19): eine unverifizierte
+            # Absendung darf `compacted` nicht leer lassen, sonst tippt der naechste Poll
+            # denselben Kompaktierbefehl noch einmal in denselben Worker.
+            nudge_kompakt_einmalig "$pane" "$HCOMPACT"
+            kompaktstatus=$?
+            if (( kompaktstatus != 2 )); then
+                compacted="$compacted $pane"          # getippt, unabhaengig von der Verifikation -- kein zweiter Versuch
+            fi
+            if (( kompaktstatus == 0 )); then
                 echo "$(date +%H:%M) $name ($pane) -> $HCOMPACT typed (handoff persisted)"
-                compacted="$compacted $pane"
                 sleep 90
                 for _ in 1 2 3 4 5 6 7 8 9 10; do
                     tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" || break
@@ -1951,7 +2081,7 @@ while true; do
                 done
                 # Gleiche Begruendung wie bei compact_orchestrator: der Erfolg des
                 # WEITERARBEITEN-Prompts wird geprueft, nicht unterstellt (2026-08-12).
-                if nudge_verifiziert "$pane" "WEITERARBEITEN (automatisch nach deiner Kompaktierung, kein Nutzer-Input noetig). Lies ZUERST HANDOFF-${name}.md — das ist deine eigene Uebergabe, dort steht dein Auftrag und der naechste Schritt. Dazu GOALS.md (verbindliche Ziele), SESSION-STATE.md (Live-Zustand), QUALITY.md (Pruefkatalog, Abnahme am AUGE) und PERF-STATE.md (gemessene Sackgassen — nicht wiederholen). Dann arbeite selbstaendig weiter und melde wie gewohnt ins Result-File."; then
+                if nudge_verifiziert "$pane" "WEITERARBEITEN (automatisch nach deiner Kompaktierung, kein Nutzer-Input noetig). Lies ZUERST $found_handoff — das ist deine eigene Uebergabe, dort steht dein Auftrag und der naechste Schritt. Dazu GOALS.md (verbindliche Ziele), SESSION-STATE.md (Live-Zustand), QUALITY.md (Pruefkatalog, Abnahme am AUGE) und PERF-STATE.md (gemessene Sackgassen — nicht wiederholen). Dann arbeite selbstaendig weiter und melde wie gewohnt ins Result-File."; then
                     echo "$(date +%H:%M) $name ($pane) -> resumed"
                 else
                     echo "$(date +%H:%M) $name ($pane): WEITERARBEITEN NICHT verifiziert nach $HCOMPACT -- Pane steht moeglicherweise leer und ohne Auftrag. Selbst pruefen: tmux capture-pane -p -t $pane"

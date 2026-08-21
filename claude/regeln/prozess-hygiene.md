@@ -59,3 +59,17 @@ vollständige Aufzählung samt NIE-beenden-Liste.
   ein Wächter, der nach dem Ende seines Schützlings weiterläuft, ist selbst eine Waise.
   Unberührt bleiben die geteilten Dienste, die es aus Sparsamkeit GIBT (`mcp-shared`,
   LaunchAgents) — sie ersetzen viele Einzelprozesse und sind der Grund, nicht der Verstoß.
+
+## Nie unbegrenzt warten (ausgelagert aus roles/orchestrator.md, 2026-08-20)
+
+Die Regel gilt unverändert; sie steht hier, weil die Rollendatei über der Größengrenze lag.
+
+Jedes Warten auf Prozess, Worker, Download oder Service braucht (a) eine Deadline und (b)
+Liveness- und Fortschrittsprüfung: Lebt genau dieser Prozess (präzise matchen; ein
+`pgrep -f`-Muster darf nicht den eigenen Watcher treffen) UND wächst seine Ausgabe, Größe oder
+sein Log noch? Nach Deadline stehengeblieben heißt gescheitert: killen, loggen, ein- bis zweimal
+mit Backoff neu versuchen, dann den Fehler melden statt weiter zu warten.
+
+pi-Worker laufen per `gtimeout` aus (Default 30 min, `PI_WORKER_TIMEOUT` überschreibt; Exit 124
+heißt hängt oder Timeout). Womit Fortschritt überhaupt gemessen wird, steht in
+`regeln/worker-panes.md` — die CPU-Zeit eines wartenden Clients ist kein Fortschrittsmaß.
