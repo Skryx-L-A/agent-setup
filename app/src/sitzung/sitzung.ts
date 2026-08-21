@@ -142,7 +142,7 @@ declare global {
       /** Wie `neu()`, nur mit der Wahl im Gepaeck. Schreibt keine Einstellung. */
       neuMitWahl(name: string, machine: string, fernPfad: string, wahl: Wahl, echt: boolean): Promise<Antwort>;
       fernPruefen(machine: string, pfad: string): Promise<{ ok: boolean; meldung: string }>;
-      fortsetzen(id: string): Promise<Antwort>;
+      fortsetzen(id: string, echt: boolean): Promise<Antwort>;
       beenden(id: string, echt: boolean): Promise<Antwort>;
       onDaten(fn: (d: Daten) => void): void;
       onStartfehler(fn: (p: { ort: string; kurz: string; grund: string; protokoll: string }) => void): void;
@@ -990,13 +990,16 @@ async function fernPruefen(): Promise<void> {
   }
 }
 
-async function setzeFort(id: string): Promise<void> {
+// `echt` ist die Echtheit des Klicks (`isTrusted`) und reist bis zu `wb-code` durch:
+// nur ein wirklicher Klick zaehlt als Mensch, und nur ein Mensch darf an einer
+// abgelehnten Speicherbuchung vorbei starten. Ein Skript-Klick traegt false.
+async function setzeFort(id: string, echt: boolean): Promise<void> {
   if (beschaeftigt || !id) return;
   beschaeftigt = true;
   zeichne();
   melde(t('satz.holeZurueck'));
   try {
-    const a = await window.awbSitzung.fortsetzen(id);
+    const a = await window.awbSitzung.fortsetzen(id, echt);
     melde(a.command ? `${a.meldung}\n${a.command}` : a.meldung, a.ok ? 'gut' : 'fehler');
   } catch (e) {
     melde(String((e as Error).message ?? e), 'fehler');
@@ -1064,7 +1067,7 @@ neuWahlKnopf.addEventListener('click', () => {
   zeichne();
 });
 fernPruefenKnopf.addEventListener('click', () => void fernPruefen());
-fortKnopf.addEventListener('click', () => void setzeFort(gewaehlteSitzung));
+fortKnopf.addEventListener('click', (ereignis) => void setzeFort(gewaehlteSitzung, ereignis.isTrusted));
 beendenKnopf.addEventListener('click', (ereignis) => void sitzungBeenden(gewaehlteSitzung, ereignis.isTrusted));
 
 // --- Anlauf -----------------------------------------------------------------

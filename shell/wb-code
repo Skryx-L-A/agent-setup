@@ -248,8 +248,19 @@ EFF_OUT="$($HOME/.local/bin/wb-state models effort "$MODEL" --harness "$HARNESS"
 EFF_VOR="$(printf '%s\n' "$EFF_OUT" | sed '$d')"
 EFFORT="$(printf '%s\n' "$EFF_OUT" | tail -1)"
 [ -n "$EFF_VOR" ] && printf '%s\n' "$EFF_VOR" >&2
+GEFAHR_ARGS=()
 if [ -n "$MENSCH" ]; then
   echo "wb-code: als MENSCH gestartet — der Effort-Deckel gilt fuer diesen Start nicht (effort $EFFORT)." >&2
+  # EIN MENSCH WIRD GEWARNT, NICHT AUFGEHALTEN (21.08.2026, zweite des Nutzers Ansage:
+  # "der user wird im menu gewarnt, das reicht, die app sollte es dann nicht mehr
+  # verhindern"). Eine abgelehnte Speicherbuchung war bis heute das Ende des Starts --
+  # auch fuer ihn, an seiner eigenen Maschine, nachdem die Oberflaeche die Stufe
+  # laengst als nicht passend gezeigt hatte. `--auf-eigene-gefahr` macht aus der
+  # Ablehnung eine laute Warnung und startet trotzdem; `wb-belegung` misst dahinter
+  # mit `wb-mensch` selbst nach, wer ruft, und weist einen AGENTEN weiterhin ab. Die
+  # Sicherung bleibt also, sie gilt nur nicht mehr gegen ihn.
+  GEFAHR_ARGS=(--auf-eigene-gefahr)
+  echo "wb-code: als MENSCH gestartet — eine abgelehnte Speicherbuchung wird zur WARNUNG, der Start laeuft trotzdem." >&2
 fi
 
 # ── Crash recovery (2026-07-25) ──────────────────────────────────────────────
@@ -638,6 +649,25 @@ except Exception:
   # noch 'wb-mlx-server ensure' dazu, fuer Speicherbuchung und Serverstart/-swap
   # -- IMMER mit --kontext, sonst nimmt es das Modell-Maximum und wb-belegung
   # lehnt das fast immer ab (262144 Token x 4 parallel = 112 GiB Spitze).
+  # DIE GEWOLLTE STUFE WIRD JETZT SCHON FESTGEHALTEN, nicht erst nach dem Start
+  # (21.08.2026). Bis heute stand sie erst weiter unten in der Zustandsdatei -- NACH
+  # 'wb-mlx-server ensure' und 'wb-kontext ensure'. Scheiterte einer der beiden, stand
+  # sie also nirgends, und der Wiederholen-Pfeil in der Leiste, der seinen Kontext aus
+  # genau dieser Datei nimmt (revive.ts, `s.kontext`), setzte danach mit einer ANDEREN
+  # Stufe fort als der, die der Mensch gewaehlt hatte. Gemessen an Lauf des Nutzers vom
+  # 21.08.: 262144 gewaehlt, Buchung abgelehnt, Pfeil gedrueckt -- gestartet mit 131072,
+  # ohne dass irgendwo stand, dass die Wahl verlorengegangen war.
+  #
+  # Der Wert ist derselbe, den der Aufruf gleich verlangt. Glueckt der Start, schreibt
+  # ihn der Aufruf weiter unten noch einmal (gleicher Wert, kein Unterschied);
+  # scheitert er, bleibt die GEWOLLTE Stufe stehen, und der Pfeil versucht wieder das,
+  # was gewollt war. Fehlschlaege dieses Aufrufs sind stumm bis auf eine Warnung: eine
+  # Zustandsdatei ist eine Verbesserung, keine Bedingung fuer den Start.
+  KGEWOLLT=("$DIR" "$SESSION"); [ -n "$KEY" ] && KGEWOLLT+=(--key "$KEY")
+  KGEWOLLT+=(--kontext "$KSTUFE")
+  $HOME/.local/bin/wb-state touch "${KGEWOLLT[@]}" 2>/dev/null \
+    || echo "wb-code: WARNUNG — die gewaehlte Kontextstufe ($KSTUFE) liess sich nicht vormerken; ein Wiederholen koennte eine andere nehmen." >&2
+
   MLXBEDIENT=""
   MLXPID=""
   if ist_mlx_lokal "$PIPROVIDER"; then
@@ -669,7 +699,8 @@ except Exception:
     MLXAUS="$(WB_MLX_SERVER_VORHERSAGE_BAUART="$VORH_BAUART" \
       WB_MLX_SERVER_VORHERSAGE_MODELL="$VORH_MODELL" \
       WB_MLX_SERVER_VORHERSAGE_GEWICHTE_GB="$VORH_GEWICHTE_GB" \
-      "$HOME/.local/bin/wb-mlx-server" ensure "$PIMODEL" --kontext "$KSTUFE")" || {
+      "$HOME/.local/bin/wb-mlx-server" ensure "$PIMODEL" --kontext "$KSTUFE" \
+        "${GEFAHR_ARGS[@]+"${GEFAHR_ARGS[@]}"}")" || {
       echo "wb-code: 'wb-mlx-server ensure' fuer Kontext $KSTUFE fehlgeschlagen — kein Start." >&2
       exit 1
     }

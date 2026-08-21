@@ -245,6 +245,29 @@
                             }
                         }
                     }
+                },
+                {
+                    "id": "$HOME/AI/mlx-models/Qwen3.8-27B-MTPLX-Optimized-Speed",
+                    "name": "qwen38-27b-mlx-4bit (256k ctx, wb-kontext)",
+                    "contextWindow": 262144,
+                    "reasoning": true,
+                    "thinkingLevelMap": {
+                        "off": null,
+                        "minimal": "low",
+                        "low": "low",
+                        "medium": "medium",
+                        "high": "xhigh",
+                        "xhigh": "xhigh",
+                        "max": null
+                    },
+                    "compat": {
+                        "thinkingFormat": "chat-template",
+                        "chatTemplateKwargs": {
+                            "reasoning_effort": {
+                                "$var": "thinking.effort"
+                            }
+                        }
+                    }
                 }
             ]
         },
@@ -257,7 +280,7 @@
             },
             "models": [
                 {
-                    "id": "$HOME/AI/mlx-models/qwen38-27b-mlx-4bit",
+                    "id": "mtplx-qwen38-27b-optimized-speed",
                     "name": "qwen38-27b-mlx-4bit (128k ctx, wb-kontext)",
                     "contextWindow": 131072,
                     "reasoning": true,

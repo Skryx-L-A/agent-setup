@@ -65,7 +65,7 @@ contextBridge.exposeInMainWorld('awbSitzung', {
     echt: boolean,
   ) => ipcRenderer.invoke('awb:sitz-neu-wahl', name, machine, fernPfad, wahl, echt === true),
   fernPruefen: (machine: string, pfad: string) => ipcRenderer.invoke('awb:sitz-fern-pruefen', machine, pfad),
-  fortsetzen: (id: string) => ipcRenderer.invoke('awb:sitz-fortsetzen', id),
+  fortsetzen: (id: string, echt: boolean) => ipcRenderer.invoke('awb:sitz-fortsetzen', id, echt === true),
   beenden: (id: string, echt: boolean) => ipcRenderer.invoke('awb:sitz-beenden', id, echt === true),
   onDaten: (fn: (d: unknown) => void) => ipcRenderer.on('awb:sitz-daten-neu', (_e, d) => fn(d)),
   // Ein Start, der SPAETER scheitert (21.08.2026): `neu`/`neuMitWahl` antworten,

@@ -1525,6 +1525,25 @@ with open(pfad_out, "w", encoding="utf-8") as f:
 PY
 }
 
+# DIE REGISTRY-KENNUNG HAT VORRANG VOR DEM KOERPERPFAD (Nachtrag 2026-08-21).
+#
+# Beides steht in der Datei: "modellId" ist die Kennung, unter der die Registry das
+# Modell fuehrt (etwa qwen38-27b), "modell" der Pfad des Koerpers, der zuletzt wirklich
+# geladen war. Bei einem Modell MIT Vorhersage sind das zwei verschiedene Dinge -- der
+# geladene Koerper ist dann die MTPLX-Fassung, und unter DIESEM Pfad kennt die Registry
+# nichts. Wer beim Wiederanlauf den Pfad nimmt, verliert damit die Registry-Zuordnung
+# und mit ihr die Vorhersage: der Server kommt als gewoehnlicher mlx_lm.server hoch.
+#
+# GEMESSEN AM 21.08.2026, und es war Fehler des Nutzers im Betrieb: die Notbremse beendete
+# unter Speicherdruck den laufenden mtplx-Server. Der Modell-Proxy startete bedarfsweise
+# nach -- ohne Modellargument, also ueber genau diesen Weg --, bekam den Koerperpfad,
+# fand dazu keinen Registry-Eintrag und startete mlx_lm.server. Der meldet unter
+# /v1/models nicht "mtplx-qwen38-27b-optimized-speed", haelt den Namen fuer eine
+# HuggingFace-Kennung und schlaegt ihn online nach. Die laufende pi-Sitzung bekam
+# daraufhin auf jede Anfrage 404 -- zweimal an einem Nachmittag.
+#
+# Der Pfad bleibt der Rueckfall: eine aeltere Datei ohne "modellId" funktioniert weiter
+# wie bisher, und ein Modell ohne Registry-Eintrag hat gar keine Kennung.
 aktuell_modell_lesen() {
   [ -f "$AKTUELL_DATEI" ] || return 0
   python3 -c '
@@ -1533,7 +1552,7 @@ try:
     d = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(0)
-print(d.get("modell") or "")
+print(d.get("modellId") or d.get("modell") or "")
 ' "$AKTUELL_DATEI" 2>/dev/null
 }
 
