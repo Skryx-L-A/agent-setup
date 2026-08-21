@@ -60,6 +60,14 @@ export interface Config {
   /** V14: Aufruf fuer `wb-code` -- derselbe Grund wie bei wbDecideBin (PATH statt fester Pfad). */
   wbCodeBin: string;
   /**
+   * Aufruf fuer `wb-mensch` (21.08.2026). Gebraucht wird er an genau einer Stelle: bevor
+   * dieses Programm einem Sitzungsstart `--mensch` mitgibt, fragt es VORHER, ob der Nachweis
+   * ueberhaupt traegt. Der Grund ist, dass `wb-code` einen abgelehnten `--mensch` nicht
+   * verzeiht, sondern mit Exit 1 abbricht -- ohne diese Probe haette ein Klick, dessen
+   * Ahnenreihe aus irgendeinem Grund nicht durchgeht, den ganzen Start verhindert.
+   */
+  wbMenschBin: string;
+  /**
    * Aufruf fuer `wb-pane-write` (2026-08-06) -- die eine Stelle, die entscheidet, wer in
    * einen Pane tippen darf. Das Programm bringt KEINE eigene Fassung dieser Regel mit; es
    * fragt dieses Werkzeug (`wb-pane-write darf <pane>`), damit es die Regel nur einmal gibt.
@@ -255,6 +263,7 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
     guardLogFile: env.AWB_GUARD_LOG ?? file.guardLogFile ?? join(homedir(), '.pi-workers', 'guard-blocks.log'),
     wbDecideBin: env.AWB_WB_DECIDE ?? file.wbDecideBin ?? 'wb-decide',
     wbCodeBin: env.AWB_WB_CODE ?? file.wbCodeBin ?? 'wb-code',
+    wbMenschBin: env.AWB_WB_MENSCH ?? file.wbMenschBin ?? 'wb-mensch',
     wbPaneWriteBin: env.AWB_WB_PANE_WRITE ?? file.wbPaneWriteBin ?? 'wb-pane-write',
     wbFreigabeBin: env.AWB_WB_FREIGABE ?? file.wbFreigabeBin ?? 'wb-freigabe',
     // Nur ueber die Umgebung, NICHT ueber die Konfigurationsdatei: eine
