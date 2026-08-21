@@ -143,6 +143,7 @@ function usage() {
       '                       Terminal-Kontextmenue direkt ausloesen (clipmenu)',
       '  ordner [pfad]        Ordneransicht listen (leer = aktuelle Wurzel, 4c.2)',
       '  ordner-oeffnen <pfad>  Datei im Programm des Menschen oeffnen',
+      '  ordner-auf <pfad>    NUR FUER TESTS: einen Ordner im Baum aufklappen',
       '  aktivitaet           Aktivitaetsliste lesen (4c.1)',
       '  aktivitaet-oeffnen <pfad>  Inhalt eines Eintrags lesen (V15/V18, erster Klick)',
       '  aktivitaet-diff <pfad>  Diff eines Aenderung-Eintrags (V15, zweiter Klick)',
@@ -450,6 +451,9 @@ async function main() {
   } else if (cmd === 'ordner-oeffnen') {
     if (!args[1]) throw new Error('ordner-oeffnen braucht einen Pfad');
     payload = { cmd: 'ordner-oeffnen', pfad: args[1] };
+  } else if (cmd === 'ordner-auf') {
+    if (!args[1]) throw new Error('ordner-auf braucht einen Pfad');
+    payload = { cmd: 'ordner-auf', pfad: args[1] };
   } else if (cmd === 'aktivitaet-oeffnen') {
     if (!args[1]) throw new Error('aktivitaet-oeffnen braucht einen Pfad');
     payload = { cmd: 'aktivitaet-oeffnen', pfad: args[1] };

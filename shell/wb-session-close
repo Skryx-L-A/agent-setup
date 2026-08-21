@@ -31,6 +31,11 @@
 # Vor dem Schliessen wird immer notiert, wie die Session wiederherzustellen ist
 # (Verzeichnis + Startkommando) — Ziel ein aufgeraeumter Rechner, kein Datenverlust.
 #
+# Eine geschlossene Sitzung gibt ihren MODELLSERVER frei, sofern ihn sonst
+# niemand mehr benutzt (2026-08-21, siehe den Abschnitt weiter unten). Das
+# Modell wird beim Fortsetzen neu geladen; der Mensch erfaehrt das in der
+# Meldung.
+#
 # Wird eine BASIS-Session benannt (nicht ihre Sicht selbst), schliesst der normale
 # Weg ihre gruppierte '-view'-Schwester automatisch mit — erst die Sicht, dann die
 # Basis, wie bei --self. Ohne das blieb eine Sicht ohne Basis zurueck (Befund
@@ -224,6 +229,224 @@ group_attached() {
             print t }'
 }
 
+# --- Der Modellserver einer geschlossenen Sitzung ----------------------------
+#
+# BEFUND 2026-08-21 (der Nutzer, woertlich): „Ich habe die Sitzung mit Pi und
+# Qwen 3.8 geschlossen ... aber das Modell belegt noch den Speicherplatz, also
+# es wird nicht entladen, wenn ich die Sitzung schliesse." Er musste den Server
+# von Hand beenden. Die andere Haelfte funktionierte bereits: die Belegung
+# erkannte den Prozess von selbst als tot und nahm ihn aus der Vergabe. Was
+# fehlte, war das Beenden. Solange es fehlt, haelt jede geschlossene lokale
+# Sitzung ihre rund 28 GiB, bis jemand nachsieht.
+#
+# BLIND BEENDEN WAERE DER SCHLIMMERE FEHLER. Ein Modellserver wird von MEHREREN
+# Sitzungen benutzt -- am 21.08. gemessen an vier Sitzungen auf einem Server.
+# Wer beim Schliessen einfach stoppt, nimmt einer laufenden Sitzung ihr Modell
+# weg. Die Frage lautet deshalb nicht „wem gehoert er", sondern „benutzt ihn
+# noch jemand", und sie ist schon beantwortet: `wb-nohup` fuehrt in seiner
+# Registrierung eine LISTE der eingetragenen Benutzer (`wb-nohup benutzer
+# <pid> --pane <pane> --socket <pfad>`, eingetragen von `wb-code`), und
+# `wb-waisen` entscheidet nach genau derselben Frage. Hier wird derselbe Weg
+# benutzt, kein zweiter erfunden: ein Server geht erst weg, wenn KEINER seiner
+# eingetragenen Benutzer mehr lebt.
+#
+# WAS DAS KOSTET, UND WARUM ES TROTZDEM RICHTIG IST: eine geschlossene Sitzung
+# ist per `wb-code` fortsetzbar, und beim Fortsetzen muss das Modell neu
+# geladen werden. Der Preis ist eine Ladezeit; die Alternative waeren 28 GiB
+# auf Verdacht. Der Mensch erfaehrt beides in der Meldung.
+REGDIR="$HOME/.local/state/wb-nohup/eigentuemer"
+
+# Beendet wird NUR durch das Werkzeug, das den Server auch gestartet hat --
+# es gibt die Speicherbuchung im selben Handgriff frei (siehe `belegung_freigeben`
+# in wb-mlx-server; eine offene Buchung ohne laufenden Server ist genau der
+# Zustand, aus dem die Kernel-Panik-Nacht entstand). Der Name kommt aus der
+# Registrierung und ist zugleich der Name des Werkzeugs. Alles, was hier nicht
+# steht, wird BENANNT und nicht angefasst: ein `kill` auf irgendeinen
+# abgeloesten Hintergrundprozess ist nicht die Aufgabe dieses Werkzeugs.
+modellserver_werkzeug() {
+  case "$1" in
+    wb-mlx-server|wb-llama-server) printf '%s\n' "$HOME/.local/bin/$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Alle Registrierungen als Zeilen "pid|lstart_pruefwert|name|benutzer".
+# `benutzer` ist eine mit ';' verbundene Liste von "socket<TAB>pane" -- der
+# beim Start eingetragene Pane steht vorn, danach die spaeter dazugekommenen.
+# Dieselbe Lesart wie in wb-waisens lade_eigentuemer(), nur ueber das ganze
+# Verzeichnis statt ueber eine einzelne PID.
+registrierungen() {
+  [ -d "$REGDIR" ] || return 0
+  /usr/bin/python3 - "$REGDIR" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+for datei in sorted(os.listdir(d)):
+    if not datei.endswith(".json"):
+        continue
+    try:
+        e = json.load(open(os.path.join(d, datei)))
+    except Exception:
+        continue
+    pid = str(e.get("pid") or "")
+    if not pid.isdigit():
+        continue
+    zeilen = []
+    pane, sock = e.get("pane") or "", e.get("socket_path") or ""
+    if pane and sock:
+        zeilen.append("%s\t%s" % (sock, pane))
+    liste = e.get("benutzer")
+    if isinstance(liste, list):
+        for b in liste:
+            if not isinstance(b, dict):
+                continue
+            bp, bs = b.get("pane") or "", b.get("socket_path") or ""
+            if bp and bs and "%s\t%s" % (bs, bp) not in zeilen:
+                zeilen.append("%s\t%s" % (bs, bp))
+    if not zeilen:
+        continue
+    print("%s|%s|%s|%s" % (pid, e.get("lstart_pruefwert") or "",
+                           e.get("name") or "", ";".join(zeilen)))
+PY
+}
+
+# Die Panes einer Session als "socket<TAB>pane" — genau die Form, in der die
+# Registrierung ihre Benutzer fuehrt. Gruppierte Sessions TEILEN ihre Fenster,
+# die Panes der Basis decken ihre '-view'-Schwester also mit ab.
+#
+# GEFRAGT WIRD TMUX NACH DEM SOCKET, nicht der Vorgabepfad geraten: welchen
+# Socket dieser Lauf benutzt, entscheidet die Umgebung (die Oberflaeche setzt
+# einen eigenen), und ein geratener Pfad zeigte dann auf einen fremden Server.
+# Dieselbe Ueberlegung wie in wb-code an der Stelle, die den Benutzer eintraegt.
+panes_von_session() {
+  local s="$1" sock p
+  sock="$(tmux display -p -t "=$s" '#{socket_path}' 2>/dev/null)"
+  [ -n "$sock" ] || sock="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/default"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    printf '%s\t%s\n' "$sock" "$p"
+  done <<EOF
+$(tmux list-panes -s -t "=$s" -F '#{pane_id}' 2>/dev/null)
+EOF
+}
+
+# Welche Registrierungen nennen einen dieser Panes als Benutzer? Muss VOR dem
+# Schliessen laufen: danach gibt es die Panes nicht mehr, und die Frage „war
+# das ein Server DIESER Sitzung" ist nicht mehr zu beantworten.
+modellserver_kandidaten() {
+  local meine="$1" pid lstart name users u
+  [ -n "$meine" ] || return 0
+  while IFS='|' read -r pid lstart name users; do
+    [ -n "$pid" ] || continue
+    while IFS= read -r u; do
+      [ -n "$u" ] || continue
+      case "
+$meine
+" in
+        *"
+$u
+"*) printf '%s|%s|%s|%s\n' "$pid" "$lstart" "$name" "$users"; break ;;
+      esac
+    done <<EOF
+$(printf '%s' "$users" | tr ';' '\n')
+EOF
+  done <<EOF
+$(registrierungen)
+EOF
+}
+
+# Lebt dieser Pane? Der Socket kommt aus der Registrierung und ist nicht
+# zwingend der eigene, deshalb ueber -S. Existiert der Pane nicht mehr,
+# antwortet tmux gar nicht — das ist keine 0 und zaehlt als tot.
+pane_lebt() {
+  [ "$(tmux -S "$1" display -p -t "$2" '#{pane_dead}' 2>/dev/null)" = "0" ]
+}
+
+# Die Entscheidung. `$1` sind die Kandidatenzeilen aus modellserver_kandidaten,
+# `$2` die Panes, die als weg gelten (fuer --self, das VOR dem Schliessen
+# entscheiden muss — auf dem normalen Weg sind die Panes bereits tot und die
+# Liste ist leer).
+modellserver_freigeben() {
+  local kandidaten="$1" verschwunden="$2" pid lstart name users u sock pane
+  local jetzt werkzeug rss groesse lebender ausgabe
+  [ -n "$kandidaten" ] || return 0
+  while IFS='|' read -r pid lstart name users; do
+    [ -n "$pid" ] || continue
+    # PID-Wiederverwendung: derselbe `lstart`-Vergleich wie in wb-nohup und
+    # wb-waisen. Ohne ihn beendete ein alter Eintrag irgendeinen neuen Prozess,
+    # der zufaellig dieselbe Nummer bekommen hat.
+    jetzt="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)"
+    [ -n "$jetzt" ] || continue
+    [ "$jetzt" = "$lstart" ] || continue
+
+    lebender=""
+    while IFS=$'\t' read -r sock pane; do
+      [ -n "$sock" ] && [ -n "$pane" ] || continue
+      case "
+$verschwunden
+" in
+        *"
+$sock	$pane
+"*) continue ;;
+      esac
+      if pane_lebt "$sock" "$pane"; then lebender="$pane"; break; fi
+    done <<EOF
+$(printf '%s' "$users" | tr ';' '\n')
+EOF
+    if [ -n "$lebender" ]; then
+      echo "Der Modellserver '$name' (PID $pid) bleibt: Pane $lebender einer anderen Sitzung benutzt ihn noch."
+      continue
+    fi
+
+    if ! werkzeug="$(modellserver_werkzeug "$name")"; then
+      echo "wb-session-close: '$name' (PID $pid) hat keinen lebenden Benutzer mehr, ist aber kein bekannter Modellserver — nichts beendet." >&2
+      continue
+    fi
+    if [ ! -x "$werkzeug" ]; then
+      echo "wb-session-close: '$name' (PID $pid) haelt weiter Speicher — $werkzeug ist hier nicht ausfuehrbar, nichts beendet." >&2
+      continue
+    fi
+    # `<werkzeug> stop` sucht seinen Prozess ueber seinen PORT, nicht ueber
+    # diese PID. Beides muss derselbe Prozess sein, sonst beendete der Aufruf
+    # einen fremden Server, der den Port inzwischen uebernommen hat. Also erst
+    # nachsehen, ob genau diese PID ueberhaupt lauscht.
+    if ! lsof -nP -iTCP -sTCP:LISTEN -a -p "$pid" -t >/dev/null 2>&1; then
+      echo "wb-session-close: '$name' (PID $pid) lauscht auf keinem Port — nichts beendet, bitte von Hand nachsehen." >&2
+      continue
+    fi
+
+    # DIESER AUFRUF WARTET, und das ist Absicht: erst wenn der Prozess
+    # nachweislich weg ist, darf hier "beendet" stehen (Prozess-Hygiene: das
+    # Ende wird geprueft, nicht angenommen). Er ist von der Gegenseite
+    # gedeckelt -- `wb-mlx-server` wartet hoechstens 15s auf SIGTERM und legt
+    # dann SIGKILL nach, ein Aufruf endet also spaetestens nach rund 16
+    # Sekunden. Die Oberflaeche fuehrt `wb-session-close` synchron aus; im
+    # Regelfall ist das eine Sekunde, im schlechtesten diese 16.
+    rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
+    ausgabe="$("$werkzeug" stop 2>&1)"
+    if ps -o pid= -p "$pid" >/dev/null 2>&1; then
+      echo "wb-session-close: '$name stop' lief, aber PID $pid laeuft weiter und haelt ihren Speicher — bitte von Hand nachsehen." >&2
+      [ -n "$ausgabe" ] && printf '%s\n' "$ausgabe" >&2
+      rc=1
+      continue
+    fi
+    if [ -n "$rss" ] && [ "$rss" -gt 0 ] 2>/dev/null; then
+      # `ps -o rss=` zaehlt in KiB. Dieselbe Schwelle wie wb-waisens
+      # rss_lesbar(): ab einem GiB in GiB, darunter in MiB — „0.0 GiB frei"
+      # waere fuer den Menschen keine Auskunft.
+      if [ "$rss" -ge 1048576 ]; then
+        groesse="$(awk -v k="$rss" 'BEGIN{printf "%.1f GiB", k/1048576}')"
+      else
+        groesse="$(awk -v k="$rss" 'BEGIN{printf "%.0f MiB", k/1024}')"
+      fi
+      echo "Modellserver '$name' beendet (PID $pid, $groesse frei): keine offene Sitzung benutzt ihn mehr. Beim Fortsetzen wird das Modell neu geladen."
+    else
+      echo "Modellserver '$name' beendet (PID $pid): keine offene Sitzung benutzt ihn mehr. Beim Fortsetzen wird das Modell neu geladen."
+    fi
+  done <<EOF
+$kandidaten
+EOF
+}
+
 # --- --self: der Knopf ------------------------------------------------------
 if [ -n "$SELF" ]; then
   # Ausschliesslich die GEMESSENE Liste — siehe die Begruendung bei OWN_LIST oben.
@@ -289,10 +512,26 @@ EOF
 $SELF_KILL
 EOF
 
+  # DER MODELLSERVER, UND WARUM ER HIER VOR DEM SCHLIESSEN GEHT.
+  #
+  # Auf dem normalen Weg wird nach dem Schliessen entschieden — dann sind die
+  # Panes tot und beantworten die Frage „benutzt ihn noch jemand" von selbst.
+  # `--self` kann das nicht: der naechste Befehl beendet den Pane, in dem
+  # DIESES Skript laeuft, und was danach steht, laeuft nicht mehr. Also wird
+  # hier vorher entschieden, und die Panes dieser Sitzung gelten dabei
+  # ausdruecklich als weg (zweites Argument) — sie sind es gleich.
+  #
+  # Der Preis, falls das Schliessen danach doch scheitert: die Sitzung laeuft
+  # ohne ihr Modell weiter. Das wird dann gesagt, statt es zu verschweigen.
+  modellserver_freigeben \
+    "$(modellserver_kandidaten "$(panes_von_session "$BASE")")" \
+    "$(panes_von_session "$BASE")"
+
   if tmux kill-session -t "=$BASE" 2>/dev/null; then
     echo "geschlossen (eigene Basis): $BASE"
   else
     echo "wb-session-close --self: eigene Basis-Session '$BASE' liess sich nicht schliessen." >&2
+    echo "  (Ein Modellserver dieser Sitzung ist oben moeglicherweise schon beendet worden — sie laeuft dann ohne ihn weiter.)" >&2
     rc=1
   fi
 
@@ -388,6 +627,13 @@ for S in "$@"; do
     echo
   } >> "$REC"
 
+  # WESSEN MODELLSERVER HAENGT AN DIESER SITZUNG? Gefragt wird JETZT, solange
+  # ihre Panes noch da sind — nach dem Schliessen ist die Zuordnung nicht mehr
+  # zu treffen. Entschieden wird erst danach (siehe unten): dann sind genau
+  # diese Panes tot, und die Frage „benutzt ihn noch jemand" beantwortet sich
+  # von selbst, ohne dass hier eine Liste gepflegt werden muesste.
+  MSRV_KANDIDATEN="$(modellserver_kandidaten "$(panes_von_session "$S")")"
+
   # Erst die Sicht(en) schliessen, dann die Basis — wie bei --self: die Sicht
   # haengt an der Basis, nicht umgekehrt.
   #
@@ -414,6 +660,9 @@ EOF
   if tmux kill-session -t "=$S" 2>/dev/null; then
     echo "geschlossen: $S"
     CLOSED_LIST="$CLOSED_LIST $S"
+    # Jetzt sind die Panes dieser Sitzung tot. Ein Modellserver, den sonst
+    # niemand mehr benutzt, gibt hier seinen Speicher frei.
+    modellserver_freigeben "$MSRV_KANDIDATEN" ""
   else
     echo "wb-session-close: '$S' liess sich nicht schliessen." >&2; rc=1
   fi

@@ -7,7 +7,7 @@
 // tippt -- kein Ereignis, kein Steuerbefehl und kein Test erreicht ihn.
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, shell, protocol } from 'electron';
 import { execFile, spawn, spawnSync } from 'node:child_process';
-import { readFileSync, statSync, mkdirSync, openSync, closeSync } from 'node:fs';
+import { readFileSync, statSync, mkdirSync, openSync, closeSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, relative, dirname, basename } from 'node:path';
 import { loadConfig, Config } from './config';
@@ -18,7 +18,7 @@ import { ControlChannel, ControlRequest } from './control';
 import { captureWindow } from './shot';
 import { leseSessions, SessionInfo } from './sessions';
 import { RemotePoller } from './remote';
-import { ampelFuerMaschine, AmpelStand } from './ampel';
+import { ampelFuerMaschine, parseRepoStand, repoStandLokal, AmpelStand, RepoStand } from './ampel';
 import { BudgetPoller } from './budget';
 import { AusgabeBuendel } from './ausgabe';
 import { darfWiederherstellen, fortsetzenHinweis, reviveCommand } from './revive';
@@ -232,16 +232,65 @@ function leseStatusdatei(pfad: string): string {
   }
 }
 
+/**
+ * Der Stand des EIGENEN Repos (21.08.) -- die zweite Zahl, die ampel.ts
+ * braucht, um einen ueberholten Befund von einem frischen zu unterscheiden.
+ * Wo der Baum liegt, sagt die Statusdatei selbst (`repo_dir`, von
+ * wb-testsuite-run geschrieben); geraten wird nichts, und eine aeltere Datei
+ * ohne das Feld laesst die Ampel unveraendert.
+ *
+ * GEMERKT, NICHT BEI JEDEM TAKT GEMESSEN: `ampelStandJetzt()` haengt am
+ * 2-Sekunden-Takt des Hauptprozesses, und `spawnSync('git', ...)` darin waere
+ * derselbe Fehler, den remote.ts fuer SSH ausdruecklich vermeidet -- ein
+ * blockierender Aufruf im Takt friert das Fenster ein. Ein HEAD-Wechsel ist
+ * eine Sache von Minuten, nicht von Sekunden; eine Minute Nachlauf aendert an
+ * der Auskunft nichts.
+ */
+const REPO_STAND_FRIST_MS = 60_000;
+// Der gepruefte Commit gehoert in den Schluessel: laeuft die Suite neu, waehrend
+// der gemerkte Stand noch gilt, waere `head_ahead` sonst bis zu eine Minute lang
+// gegen den VORIGEN Lauf gezaehlt -- eine Zahl, die zu keiner der beiden
+// Messungen passt.
+let repoStandCache: { wann: number; geprueft: string; stand: RepoStand | null } | null = null;
+
+function gitAus(dir: string, args: string[]): string {
+  const r = spawnSync('git', ['--no-optional-locks', '-C', dir, ...args], { encoding: 'utf8', timeout: 3000 });
+  if (r.status !== 0 || r.error) return '';
+  return (r.stdout ?? '').trim();
+}
+
+function eigenerRepoStand(testsuiteRaw: string): RepoStand | null {
+  const jetzt = Date.now();
+  const dir = /^repo_dir=(.+)$/m.exec(testsuiteRaw)?.[1]?.trim() ?? '';
+  const geprueft = /^repo_commit=(.+)$/m.exec(testsuiteRaw)?.[1]?.trim() ?? '';
+  if (repoStandCache && repoStandCache.geprueft === geprueft && jetzt - repoStandCache.wann < REPO_STAND_FRIST_MS) {
+    return repoStandCache.stand;
+  }
+  // Die Regel selbst sitzt in ampel.ts (`repoStandLokal`), damit sie dieselbe
+  // ist wie die des Fernwegs und einzeln geprueft werden kann; hier steht nur,
+  // WIE git auf dieser Maschine gerufen wird.
+  const stand = dir && existsSync(dir) ? repoStandLokal(testsuiteRaw, gitAus) : null;
+  repoStandCache = { wann: jetzt, geprueft, stand };
+  return stand;
+}
+
 /** V12: eigene Maschine aus den lokalen Dateien, jede Fernmaschine aus ihrem letzten Poll-Stand. */
 function ampelStandJetzt(): AmpelStand[] {
   const jetztSek = Math.floor(Date.now() / 1000);
+  const eigenTestsuite = leseStatusdatei(config.testsuiteStatusFile);
   const eigene = ampelFuerMaschine(
     config.machine,
-    leseStatusdatei(config.testsuiteStatusFile),
+    eigenTestsuite,
     leseStatusdatei(config.hygieneStatusFile),
     jetztSek,
+    eigenerRepoStand(eigenTestsuite),
   );
-  const fern = remotePoller.snapshots().map((s) => ampelFuerMaschine(s.machine, s.testsuiteRaw, s.hygieneRaw, jetztSek));
+  // JEDE MASCHINE MIT IHREN EIGENEN ZAHLEN: der Fernstand kommt aus dem
+  // REPO-Abschnitt DIESER Maschine, nie aus dem des Macs -- ein Lauf von peer
+  // gegen den Baum des Macs zu halten waere schlimmer als gar kein Vergleich.
+  const fern = remotePoller
+    .snapshots()
+    .map((s) => ampelFuerMaschine(s.machine, s.testsuiteRaw, s.hygieneRaw, jetztSek, parseRepoStand(s.repoRaw)));
   return [eigene, ...fern];
 }
 
@@ -6058,6 +6107,24 @@ async function handle(req: ControlRequest): Promise<unknown> {
       const pfad = String(req.pfad ?? '');
       if (!pfad) throw new Error('Feld pfad fehlt');
       await ordnerOeffnen(pfad);
+      return { pfad };
+    }
+
+    // NUR FUER TESTS: einen Ordner IM Baum aufklappen. Dieselbe Bauart wie
+    // 'editor' -- der Steuerkanal ruft einen Haken der Ansicht auf, statt einen
+    // Klick an Bildschirmkoordinaten zu raten (die haengen an der
+    // Schriftgroesse). Geklickt wird die echte Zeile, also laeuft der Test
+    // durch denselben Behandler wie die Maus. Gebraucht fuer die Zusage, dass
+    // sich auch ein aufgeklappter UNTERORDNER auffrischt und nicht nur die
+    // Wurzel (test-app-ordner-auffrischung.sh).
+    case 'ordner-auf': {
+      const pfad = String(req.pfad ?? '');
+      if (!pfad) throw new Error('Feld pfad fehlt');
+      if (!win) throw new Error('kein Fenster');
+      const getroffen = (await win.webContents.executeJavaScript(
+        `(() => { const h = window.__awbOrdner; return !!(h && h.auf(${JSON.stringify(pfad)})); })()`,
+      )) as boolean;
+      if (!getroffen) throw new Error(`keine Baumzeile fuer '${pfad}' -- steht sie ueberhaupt auf dem Schirm?`);
       return { pfad };
     }
 

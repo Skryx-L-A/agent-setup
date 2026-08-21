@@ -177,6 +177,13 @@ export const VORGABEN: Readonly<Record<string, unknown>> = {
   // shell/wb-state.
   orchestratorVorhersage: false,
   workerVorhersage: false,
+  // WELCHER der hinterlegten Wege (2026-08-21, alice: "ich will mich
+  // entscheiden koennen"). Der Wert ist die `id` eines Eintrags aus
+  // vorhersage.wege des gewaehlten Orchestrator-Modells -- kein Pfad: waehlbar
+  // bleibt, was die Auslieferung gemessen hat. Leer heisst "der Vorgabeweg der
+  // Registry"; der Schalter darueber bleibt das An/Aus und schlaegt jede
+  // Wegwahl. Zweite Stelle: DEFAULTS in shell/wb-state.
+  orchestratorVorhersageWeg: '',
   maxWorkers: 8,
   workerWorktrees: true,
   defaultWorkerMachine: 'local',

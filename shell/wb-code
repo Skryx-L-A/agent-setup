@@ -530,13 +530,22 @@ if [ "$HARNESS" = "pi" ]; then
   esac
   # ── Multi-Token-Vorhersage (2026-08-20, Vorgaben des Nutzers) ────────────────
   # Der Schalter (an/aus) steht in den Settings ('orchestratorVorhersage');
-  # WELCHES Modell dabei benutzt wird, steht in der REGISTRY (Feld
-  # 'vorhersage' je Modell) und ist hier nicht waehlbar -- "die Zuordnung
-  # gehoert zur Auslieferung, nicht in die Oberflaeche". Nur fuer ein
-  # mlx-lokal-Modell wirksam: fuer die eingebauten Ollama-Aliase (ornith,
-  # qwen, ornith9) existiert heute kein Registry-Eintrag mit diesem Feld,
-  # der Nachschlag liefert dann einfach nichts -- kein Fehler, nur "fuer
-  # dieses Modell nichts hinterlegt".
+  # WELCHE Modelle dafuer ueberhaupt in Frage kommen, steht in der REGISTRY
+  # (Feld 'vorhersage' je Modell) -- "die Zuordnung gehoert zur Auslieferung,
+  # nicht in die Oberflaeche". Nur fuer ein mlx-lokal-Modell wirksam: fuer die
+  # eingebauten Ollama-Aliase (ornith, qwen, ornith9) existiert heute kein
+  # Registry-Eintrag mit diesem Feld, der Nachschlag liefert dann einfach
+  # nichts -- kein Fehler, nur "fuer dieses Modell nichts hinterlegt".
+  #
+  # SEIT DEM 21.08.2026 IST ES EINE WAHL UNTER MEHREREN WEGEN (der Nutzer: "ich
+  # will das ich als zweite option qwen3.8 als orchestrator auch mit einem
+  # multitokenprediction model starten kann anstatt mtplx, ich will mich
+  # entscheiden koennen"). Die WEGE stehen weiterhin ausschliesslich in der
+  # Registry (vorhersage.wege); die Einstellung 'orchestratorVorhersageWeg'
+  # traegt nur die `id` eines davon. Damit bleibt die Zuordnung in der
+  # Auslieferung -- waehlbar ist, was gemessen wurde, kein freier Pfad.
+  # Leer oder unbekannt heisst: der Vorgabeweg (vorhersage.wegVorgabe, sonst
+  # der erste der Liste, sonst die Felder auf oberster Ebene).
   #
   # $MODEL traegt an dieser Stelle noch den ROHEN Aufrufwert (Alias oder
   # Registry-Kennung) -- der case-Block oben schreibt nur PIMODEL/
@@ -549,30 +558,64 @@ if [ "$HARNESS" = "pi" ]; then
     grug)   VORH_ID="grug-27b" ;;
     *)      VORH_ID="$MODEL" ;;
   esac
-  VORH_BAUART=""; VORH_MODELL=""; VORH_GEWICHTE_GB=""
+  VORH_BAUART=""; VORH_MODELL=""; VORH_GEWICHTE_GB=""; VORH_WEG_LABEL=""; VORH_WEG_WARNUNG=""
   VORH_AN="$($HOME/.local/bin/wb-state settings get orchestratorVorhersage 2>/dev/null || true)"
+  VORH_WEG="$($HOME/.local/bin/wb-state settings get orchestratorVorhersageWeg 2>/dev/null || true)"
   if [ "$VORH_AN" = "true" ] && ist_mlx_lokal "$PIPROVIDER"; then
     VORH_JSON="$($HOME/.local/bin/wb-state models get "$VORH_ID" --field vorhersage 2>/dev/null || true)"
     if [ -n "$VORH_JSON" ]; then
-      VORH_BAUART="$(printf '%s' "$VORH_JSON" | python3 -c 'import json,sys
+      # EIN python3-Aufruf fuer alle vier Werte statt vier Aufrufe wie bis zum
+      # 21.08.2026: die Auswahl des Weges ist eine Entscheidung, und sie darf
+      # nicht in vier getrennten Prozessen getroffen werden, die jeder fuer
+      # sich haetten anders ausgehen koennen. Getrennt werden die Felder erst
+      # danach, an einem Zeichen, das in keinem Pfad und in keinem Etikett
+      # vorkommt (Tabulator).
+      VORH_FELDER="$(printf '%s' "$VORH_JSON" | python3 -c '
+import json, sys
+gewaehlt = sys.argv[1] if len(sys.argv) > 1 else ""
 try:
-    print(json.load(sys.stdin).get("bauart") or "")
+    d = json.load(sys.stdin)
 except Exception:
-    print("")' 2>/dev/null)"
-      VORH_MODELL="$(printf '%s' "$VORH_JSON" | python3 -c 'import json,sys
-try:
-    print(json.load(sys.stdin).get("modell") or "")
-except Exception:
-    print("")' 2>/dev/null)"
-      VORH_GEWICHTE_GB="$(printf '%s' "$VORH_JSON" | python3 -c 'import json,sys
-try:
-    v = json.load(sys.stdin).get("gewichteGb")
-    print(v if v is not None else "")
-except Exception:
-    print("")' 2>/dev/null)"
+    sys.exit(0)
+wege = [w for w in (d.get("wege") or []) if isinstance(w, dict) and w.get("id")]
+# Der Vorgabeweg: wegVorgabe, sonst der erste der Liste, sonst die Felder auf
+# oberster Ebene (der Stand vor dem 21.08.2026, unveraendert gueltig).
+vorgabe = None
+for w in wege:
+    if w.get("id") == (d.get("wegVorgabe") or ""):
+        vorgabe = w
+        break
+if vorgabe is None and wege:
+    vorgabe = wege[0]
+if vorgabe is None:
+    vorgabe = {"id": "", "label": "", "bauart": d.get("bauart"),
+               "modell": d.get("modell"), "gewichteGb": d.get("gewichteGb")}
+weg, warnung = vorgabe, ""
+if gewaehlt:
+    treffer = [w for w in wege if w.get("id") == gewaehlt]
+    if treffer:
+        weg = treffer[0]
+    else:
+        warnung = ("Weg %r ist fuer dieses Modell nicht hinterlegt (bekannt: %s) -- "
+                   "es gilt der Vorgabeweg." % (gewaehlt, ", ".join(w["id"] for w in wege) or "keiner"))
+gb = weg.get("gewichteGb")
+print("\t".join([
+    weg.get("bauart") or "",
+    weg.get("modell") or "",
+    "" if gb is None else str(gb),
+    weg.get("label") or weg.get("id") or "",
+    warnung,
+]))
+' "$VORH_WEG" 2>/dev/null)"
+      VORH_BAUART="$(printf '%s' "$VORH_FELDER" | cut -f1)"
+      VORH_MODELL="$(printf '%s' "$VORH_FELDER" | cut -f2)"
+      VORH_GEWICHTE_GB="$(printf '%s' "$VORH_FELDER" | cut -f3)"
+      VORH_WEG_LABEL="$(printf '%s' "$VORH_FELDER" | cut -f4)"
+      VORH_WEG_WARNUNG="$(printf '%s' "$VORH_FELDER" | cut -f5)"
     fi
+    [ -n "$VORH_WEG_WARNUNG" ] && echo "wb-code: $VORH_WEG_WARNUNG" >&2
     if [ -n "$VORH_BAUART" ]; then
-      echo "wb-code: Multi-Token-Vorhersage an ($VORH_BAUART: $VORH_MODELL)." >&2
+      echo "wb-code: Multi-Token-Vorhersage an${VORH_WEG_LABEL:+ — Weg '$VORH_WEG_LABEL'} ($VORH_BAUART: $VORH_MODELL)." >&2
     else
       echo "wb-code: Multi-Token-Vorhersage an, aber fuer '$VORH_ID' nichts in der Registry hinterlegt." >&2
     fi
@@ -618,6 +661,31 @@ except Exception:
       ENTWERFER_ARGS=()
       if [ "$VORH_BAUART" = entwerfer ] && [ -n "$VORH_GEWICHTE_GB" ]; then
         ENTWERFER_ARGS=(--entwerfer-gewichte-gb "$VORH_GEWICHTE_GB")
+      fi
+      # --vorhersage-koerper: der eingebaute Weg, AUSGESPROCHEN statt
+      # nachgeschlagen (Nachtrag 21.08.2026, beim Bau der Wegwahl gemessen).
+      # wb-kontext sucht seinen eigenen Registry-Eintrag ueber den Namen, den
+      # es bekommt -- und das ist hier seit jeher $PIMODEL, also ein PFAD.
+      # 'wb-state models get <pfad>' findet nichts (nachgemessen am
+      # 21.08.2026: "Modell '/Users/.../qwen38-27b-mlx-4bit' ist nicht
+      # registriert"), wb-kontext fiel damit in seinen Verzeichniszweig, sah
+      # gar keine 'vorhersage' und rechnete den SCHLICHTEN Koerper (14,95 GiB)
+      # -- obwohl gleich der MTPLX-Koerper mit 19,83 GiB startet. Die
+      # Kontextempfehlung war also fast 5 GiB zu grosszuegig, immer wenn der
+      # Schalter an war. Ueber die Registry-Kennung statt des Pfades zu gehen
+      # waere der groessere Eingriff (contextWindow, KV-Name und Denk-Vorgabe
+      # kaemen dann aus einer anderen Quelle als bisher); wb-code WEISS den
+      # Koerper an dieser Stelle laengst und sagt ihn deshalb einfach.
+      #
+      # NUR WENN DER KOERPER WIRKLICH DA IST. Fehlt das Verzeichnis, koennte
+      # wb-kontext ohnehin nichts Besseres rechnen -- es braeche mit
+      # "<pfad>/config.json fehlt" ab, und dieser Start scheitert dann an einer
+      # Meldung ueber die Kontextrechnung statt an der, die die Sache benennt.
+      # Gemeldet wird das Fehlen ein paar Zeilen weiter unten von
+      # 'wb-mlx-server ensure' ("Modellverzeichnis fehlt: <pfad>"), das ohnehin
+      # nicht startet -- die richtige Stelle fuer diesen Satz.
+      if [ "$VORH_BAUART" = eingebaut ] && [ -n "$VORH_MODELL" ] && [ -d "$VORH_MODELL" ]; then
+        ENTWERFER_ARGS+=(--vorhersage-koerper "$VORH_MODELL")
       fi
       # --vorhersage-einstellung orchestratorVorhersage (Nachtrag 21.08.2026,
       # Befund vom echten Doppelstart): 'eingebaut' liest die Registry SELBST

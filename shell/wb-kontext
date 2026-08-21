@@ -8,6 +8,11 @@
 #   wb-kontext empfehlung <modell> [--parallel <n>] [--denken <stufe>]
 #   wb-kontext ensure <modell> <stufe>
 #
+# Beide Rechenbefehle nehmen zusaetzlich --entwerfer-gewichte-gb,
+# --vorhersage-einstellung und --vorhersage-koerper: die drei Angaben zur
+# Multi-Token-Vorhersage, siehe berechne() und die Hilfetexte im
+# Argument-Parser.
+#
 # --parallel beantwortet "ich will N lokale Worker gleichzeitig, wie gross
 # darf das Fenster je Worker sein" (Vorgabe: 1, ein sachkundiger Aufrufer wie
 # pi-worker zaehlt die bereits laufenden Worker und gibt N explizit mit).
@@ -665,7 +670,7 @@ def bedarf_wirklich(res, tok, gewichte, parallel):
 
 
 def berechne(modell, parallel=None, denken=None, entwerfer_gewichte_gb=0.0,
-             vorhersage_einstellung=None):
+             vorhersage_einstellung=None, vorhersage_koerper=None):
     res = resolve(modell)
     # BAUART "eingebaut" ERSETZT den Modellkoerper (Nachtrag 2026-08-21,
     # Pruefer-Befund zu qwen38-27b/MTPLX): der Kommentar bei
@@ -742,10 +747,27 @@ def berechne(modell, parallel=None, denken=None, entwerfer_gewichte_gb=0.0,
     # <modell> --parallel <n>`), die diese Funktion aufruft, statt die
     # Verzweigung ein zweites Mal nachzubauen -- EINE Quelle bleibt dann auch
     # hier die Linie, nicht zwei.
+    #
+    # DER AUFRUFER DARF DEN KOERPER AUCH AUSSPRECHEN (--vorhersage-koerper,
+    # Nachtrag 21.08.2026, beim Bau der Vorhersage-Wegwahl gemessen). Der
+    # Nachschlag darueber setzt voraus, dass resolve() den Registry-Eintrag
+    # ueberhaupt findet -- und das gelingt nur, wenn der Aufrufer eine
+    # Registry-KENNUNG uebergibt. wb-code uebergibt seit jeher einen PFAD
+    # ($PIMODEL), 'wb-state models get <pfad>' findet dazu nichts, und der
+    # Verzeichniszweig von resolve() liefert vorhersage=None: fuer den
+    # Orchestrator ist der Nachschlag oben also wirkungslos, und gerechnet
+    # wurde der schlichte Koerper, obwohl der groessere startete. Wer den
+    # Koerper WEISS, sagt ihn deshalb, statt sich auf die Aufloesung zu
+    # verlassen; die Einstellung braucht dieser Weg nicht mehr zu pruefen,
+    # denn ein Aufrufer, der den Koerper nennt, hat sie selbst schon gelesen.
     vorhersage = res.get("vorhersage") or {}
     vorhersage_ersetzt_ziel = None
     vorhersage_aktiv = bool(vorhersage_einstellung) and einstellung_ist_an(vorhersage_einstellung)
-    if (res["provider"] == "mlx-lokal" and vorhersage.get("bauart") == "eingebaut"
+    if vorhersage_koerper:
+        vorhersage_ersetzt_ziel = res["modelRef"]
+        res = dict(res)
+        res["modelRef"] = vorhersage_koerper
+    elif (res["provider"] == "mlx-lokal" and vorhersage.get("bauart") == "eingebaut"
             and vorhersage.get("modell") and vorhersage_aktiv):
         vorhersage_ersetzt_ziel = res["modelRef"]
         res = dict(res)
@@ -840,7 +862,10 @@ def berechne(modell, parallel=None, denken=None, entwerfer_gewichte_gb=0.0,
         # schon der ersetzte Koerper, falls vorhersage.bauart == "eingebaut"
         # zugeschlagen hat -- diese beiden Felder sagen dem Leser, OB und
         # WOFUER umgebogen wurde, ohne dass er das selbst nachschlagen muss.
-        "vorhersage_bauart": vorhersage.get("bauart"),
+        # Beim ausgesprochenen Koerper (--vorhersage-koerper) traegt die
+        # Registry-Zeile womoeglich einen ANDEREN Vorgabeweg -- gerechnet
+        # wurde aber der genannte, und nur der darf hier stehen.
+        "vorhersage_bauart": "eingebaut" if vorhersage_koerper else vorhersage.get("bauart"),
         "vorhersage_ersetzt_ziel": vorhersage_ersetzt_ziel,
     }
 
@@ -1142,12 +1167,22 @@ def main():
                          "get <name>', denselben Weg wie der Aufrufer. Ohne "
                          "Angabe bleibt es beim schlichten Ziel-Koerper.")
 
+    KOERPER_HILFE = ("Pfad des Modellkoerpers, der beim eingebauten Vorhersage-Weg "
+                     "WIRKLICH startet und das Ziel ERSETZT. Fuer Aufrufer, die den "
+                     "Weg schon gewaehlt haben (wb-code liest dafuer die Einstellung "
+                     "'orchestratorVorhersageWeg') und das Modell als PFAD statt als "
+                     "Registry-Kennung uebergeben -- dann findet der Nachschlag ueber "
+                     "--vorhersage-einstellung den Eintrag naemlich gar nicht. Ist der "
+                     "Pfad gegeben, schlaegt er den Nachschlag; ohne ihn aendert sich "
+                     "nichts.")
+
     p_s = sub.add_parser("stufen")
     p_s.add_argument("modell")
     p_s.add_argument("--parallel", type=int, default=None)
     p_s.add_argument("--denken", default=None)
     p_s.add_argument("--entwerfer-gewichte-gb", type=float, default=0.0)
     p_s.add_argument("--vorhersage-einstellung", default=None, help=VORHERSAGE_HILFE)
+    p_s.add_argument("--vorhersage-koerper", default=None, help=KOERPER_HILFE)
     p_s.add_argument("--json", action="store_true")
 
     p_e = sub.add_parser("empfehlung")
@@ -1156,6 +1191,7 @@ def main():
     p_e.add_argument("--denken", default=None)
     p_e.add_argument("--entwerfer-gewichte-gb", type=float, default=0.0)
     p_e.add_argument("--vorhersage-einstellung", default=None, help=VORHERSAGE_HILFE)
+    p_e.add_argument("--vorhersage-koerper", default=None, help=KOERPER_HILFE)
 
     p_n = sub.add_parser("ensure")
     p_n.add_argument("modell")
@@ -1176,7 +1212,7 @@ def main():
         if a.parallel is not None and a.parallel < 1:
             fail("--parallel muss mindestens 1 sein.")
         daten = berechne(a.modell, a.parallel, a.denken, a.entwerfer_gewichte_gb,
-                          a.vorhersage_einstellung)
+                          a.vorhersage_einstellung, a.vorhersage_koerper)
         drucke_stufen(daten, a.json)
         return 0
 
@@ -1184,7 +1220,7 @@ def main():
         if a.parallel is not None and a.parallel < 1:
             fail("--parallel muss mindestens 1 sein.")
         daten = berechne(a.modell, a.parallel, a.denken, a.entwerfer_gewichte_gb,
-                          a.vorhersage_einstellung)
+                          a.vorhersage_einstellung, a.vorhersage_koerper)
         empf, grund = empfehlen(daten)
         if grund:
             print("HINWEIS: %s" % grund, file=sys.stderr)

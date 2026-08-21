@@ -172,9 +172,18 @@ export interface RegistryCost {
  *                die eigentliche Auslieferung ERSETZT, kein Zusatz).
  *
  * Der Sieger unter mehreren Kandidaten (bei qwen3.8-27B: zwei Entwerfer, zwei
- * eingebaute Koepfe) ist bewusst NUR diese eine Struktur -- ein neuer Sieger
- * aendert `bauart`/`modell`, sonst nichts an der Registry-Zeile des
- * Zielmodells selbst.
+ * eingebaute Koepfe) stand bis zum 21.08.2026 bewusst NUR als diese eine
+ * Struktur hier -- ein neuer Sieger aenderte `bauart`/`modell`, sonst nichts.
+ *
+ * SEIT DEM 21.08.2026 SIND ES MEHRERE WEGE ZUR WAHL (alice: "ich will das
+ * ich als zweite option qwen3.8 als orchestrator auch mit einem
+ * multitokenprediction model starten kann anstatt mtplx, ich will mich
+ * entscheiden koennen"). `wege` fuehrt sie, `wegVorgabe` nennt den Vorgabeweg,
+ * und die Sitzungs-Einstellung `orchestratorVorhersageWeg` waehlt einen davon
+ * aus. `bauart`/`modell`/`gewichteGb` auf oberster Ebene bleiben und tragen
+ * WEITER den Vorgabeweg: jeder Leser, der `wege` nicht kennt, verhaelt sich
+ * damit genau wie vorher -- was in der Oberflaeche waehlbar wird, bleibt eine
+ * Aussage der Auslieferung ueber DIESES Modell, keine freie Pfadeingabe.
  */
 export interface RegistryVorhersage {
   bauart: 'entwerfer' | 'eingebaut';
@@ -182,6 +191,23 @@ export interface RegistryVorhersage {
   /** Gewichte des Entwerfers/eingebauten Koerpers in GiB, fuer die Speicherrechnung. */
   gewichteGb?: number;
   /** Woher der aktuelle Sieger stammt (Messung, Datum) -- Klartext, keine Struktur. */
+  herkunft?: string;
+  /** Die `id` des Weges, der ohne eigene Wahl gilt. Fehlt sie, gilt der erste aus `wege`. */
+  wegVorgabe?: string;
+  /** Die waehlbaren Wege. Fehlt die Liste, gibt es genau den einen Weg oben. */
+  wege?: RegistryVorhersageWeg[];
+}
+
+/**
+ * EIN waehlbarer Vorhersage-Weg. Dieselben Felder wie oben, plus `id` (der Wert,
+ * den `orchestratorVorhersageWeg` traegt) und `label` fuer die Oberflaeche.
+ */
+export interface RegistryVorhersageWeg {
+  id: string;
+  label: string;
+  bauart: 'entwerfer' | 'eingebaut';
+  modell: string;
+  gewichteGb?: number;
   herkunft?: string;
 }
 
@@ -570,7 +596,45 @@ function validateVorhersage(raw: unknown): RegistryVorhersage | undefined {
   }
   const gewichteGb = asPositiveNumber(r.gewichteGb);
   const herkunft = asString(r.herkunft);
-  return { bauart, modell, gewichteGb, herkunft };
+  // Die Wege-Liste ist optional und faellt bei Unsinn ganz weg -- dann bleibt
+  // genau der eine Weg oben, also das Verhalten vor dem 21.08.2026. Ein
+  // einzelner kaputter Eintrag nimmt nur sich selbst mit (dieselbe
+  // Fehlertoleranz wie bei den Modellen selbst).
+  const wege = Array.isArray(r.wege)
+    ? r.wege.map(validateVorhersageWeg).filter(isDefined)
+    : undefined;
+  const wegVorgabe = asString(r.wegVorgabe);
+  return {
+    bauart,
+    modell,
+    gewichteGb,
+    herkunft,
+    wegVorgabe,
+    wege: wege && wege.length > 0 ? wege : undefined,
+  };
+}
+
+function validateVorhersageWeg(raw: unknown): RegistryVorhersageWeg | undefined {
+  if (typeof raw !== 'object' || raw === null) {
+    return undefined;
+  }
+  const r = raw as Record<string, unknown>;
+  const id = asString(r.id);
+  const bauart = r.bauart === 'entwerfer' || r.bauart === 'eingebaut' ? r.bauart : undefined;
+  const modell = asString(r.modell);
+  // Ohne id/bauart/modell ist der Weg nicht waehlbar -- ein Eintrag, den die
+  // Einstellung nie treffen kann, waere in der Liste nur eine Falle.
+  if (!id || !bauart || !modell) {
+    return undefined;
+  }
+  return {
+    id,
+    label: asString(r.label) ?? id,
+    bauart,
+    modell,
+    gewichteGb: asPositiveNumber(r.gewichteGb),
+    herkunft: asString(r.herkunft),
+  };
 }
 
 /**

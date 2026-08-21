@@ -70,6 +70,13 @@ export interface RemoteSnapshot {
   /** Roh-Inhalt der beiden Statusdateien (V12) -- leer, wenn sie dort fehlen. */
   testsuiteRaw: string;
   hygieneRaw: string;
+  /**
+   * Der Stand des Repos DIESER Maschine, wie das Fernskript ihn eben gemessen
+   * hat (21.08.) -- `head_commit`/`head_commit_ts`/`head_ahead` als key=value.
+   * Leer, wenn drueben kein Baum steht oder die Statusdatei noch nicht sagt,
+   * wo er liegt; ampel.ts faellt dann auf ihr bisheriges Verhalten zurueck.
+   */
+  repoRaw: string;
 }
 
 const SECTION_MARK = 'SECTION:';
@@ -91,6 +98,7 @@ function leererStand(machine: string, error: string, vorheriger?: RemoteSnapshot
     procTable: vorheriger?.procTable ?? new Map(),
     testsuiteRaw: vorheriger?.testsuiteRaw ?? '',
     hygieneRaw: vorheriger?.hygieneRaw ?? '',
+    repoRaw: vorheriger?.repoRaw ?? '',
   };
 }
 
@@ -123,6 +131,34 @@ export function fernSkript(relSessionsDir: string, relTestsuiteStatus: string, r
     '    cat "$f"',
     "    printf '\\n'",
     '  done',
+    'fi',
+    // V12+ (21.08.): DER STAND DER ANDEREN MASCHINE. Ohne ihn laesst sich der
+    // Vergleich "ist dieser Befund aelter als der Code, den er geprueft hat?"
+    // fuer eine Fernmaschine gar nicht fuehren -- und ihn mit dem Stand des
+    // MACS zu fuehren waere schlimmer als die alte Anzeige: zwei Zahlen von
+    // zwei verschiedenen Baeumen ergeben eine Aussage ueber keinen von beiden.
+    //
+    // Wo der Baum liegt, sagt die Statusdatei drueben SELBST (`repo_dir`, von
+    // wb-testsuite-run geschrieben) -- kein geratener Pfad, und auf peer ein
+    // anderer als hier. Fehlt das Feld (aeltere Statusdatei), fehlt der Baum
+    // oder fehlt git, bleibt der Abschnitt LEER und die Ampel faellt auf ihr
+    // bisheriges Verhalten zurueck. `head_ahead` zaehlt gegen den geprueften
+    // Commit und bleibt leer, wenn der drueben nicht mehr aufloesbar ist.
+    //
+    // DIESER ABSCHNITT STEHT VOR DEN BEIDEN `cat`-ZEILEN, nicht hinter ihnen --
+    // aus dem Grund, der gleich darunter steht: die letzte Zeile bestimmt den
+    // Rueckgabewert des ganzen ssh-Aufrufs, und ein `git`, das mit 1 endet,
+    // haette an letzter Stelle dieselbe Wirkung gehabt wie das fehlende
+    // `|| true` am 10.08. -- die ganze Maschine als unerreichbar gefuehrt.
+    `printf '${SECTION_MARK}REPO\\1\\n'`,
+    `R="$(sed -n 's/^repo_dir=//p' "$HOME/${relTestsuiteStatus}" 2>/dev/null | tail -1)"`,
+    `GEPRUEFT="$(sed -n 's/^repo_commit=//p' "$HOME/${relTestsuiteStatus}" 2>/dev/null | tail -1)"`,
+    'if [ -n "$R" ] && [ -d "$R" ] && command -v git >/dev/null 2>&1; then',
+    `  printf 'head_commit=%s\\n' "$(git --no-optional-locks -C "$R" rev-parse HEAD 2>/dev/null)"`,
+    `  printf 'head_commit_ts=%s\\n' "$(git --no-optional-locks -C "$R" log -1 --format=%ct 2>/dev/null)"`,
+    '  if [ -n "$GEPRUEFT" ]; then',
+    `    printf 'head_ahead=%s\\n' "$(git --no-optional-locks -C "$R" rev-list --count "$GEPRUEFT..HEAD" 2>/dev/null)"`,
+    '  fi',
     'fi',
     // V12: dieselben zwei Statusdateien, die die SessionStart-Hooks auf der
     // Fernmaschine schon lesen -- hier nur mitgebracht, nicht neu bewertet
@@ -243,6 +279,7 @@ export function parseFernAusgabe(machine: string, raw: string): RemoteSnapshot {
     procTable,
     testsuiteRaw: sec.TESTSUITE ?? '',
     hygieneRaw: sec.HYGIENE ?? '',
+    repoRaw: sec.REPO ?? '',
   };
 }
 

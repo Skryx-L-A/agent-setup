@@ -645,6 +645,15 @@ DEFAULTS = {
     # kosten. Zweite Stelle: VORGABEN in app/src/main/einstellungen.ts.
     "orchestratorVorhersage": False,
     "workerVorhersage": False,
+    # WELCHER der hinterlegten Wege es sein soll (2026-08-21, der Nutzer: "ich
+    # will mich entscheiden koennen"). Der Wert ist die `id` eines Eintrags aus
+    # vorhersage.wege des gewaehlten Orchestrator-Modells -- kein Pfad: waehlbar
+    # bleibt, was die Auslieferung gemessen hat. Leer heisst "der Vorgabeweg der
+    # Registry" (vorhersage.wegVorgabe), und ein Weg, den das gerade gewaehlte
+    # Modell nicht kennt, faellt ebenfalls darauf zurueck, laut gemeldet. Der
+    # Schalter darueber bleibt das An/Aus und schlaegt jede Wegwahl. Zweite
+    # Stelle: VORGABEN in app/src/main/einstellungen.ts.
+    "orchestratorVorhersageWeg": "",
     "newSessionDefaultDir": "~/AI",
     # 2026-08-11 GESTRICHEN, mit Begruendung, damit niemand sie nachtraegt:
     #   workerPollSeconds       war nie eine Worker-Einstellung, sondern der
