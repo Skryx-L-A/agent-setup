@@ -55,6 +55,16 @@
 #                         "NACHTRAG 7" bis "NACHTRAG 10" fuer die volle Form,
 #                         das Null-Resultat und die Messungen, die diese
 #                         Weichen begruenden.
+#                        [--vorhersage-weg <id>]
+#                         WELCHEN der in der Registry hinterlegten
+#                         Vorhersage-Wege dieser Start nehmen soll
+#                         (`vorhersage.wege`, Nachtrag 19, 2026-08-21 --
+#                         fuer qwen38-27b: mtplx, dflash2, dspark-diminfer).
+#                         Wirkt nur, wenn der Aufrufer die Umgebungsvariablen
+#                         oben NICHT gesetzt hat, denn dann hat er den Weg
+#                         schon gewaehlt. Ohne die Option gilt der Vorgabeweg
+#                         (`vorhersage.wegVorgabe`), ein unbekannter Weg faellt
+#                         laut gemeldet ebenfalls darauf zurueck.
 #   wb-mlx-server stop [<modell>]
 #                         beendet den laufenden Server und PRUEFT das Ende
 #                         (Prozess weg, Port frei), statt es anzunehmen. Mit
@@ -859,15 +869,24 @@ PROMPT_CACHE_GIB=${WB_MLX_SERVER_PROMPT_CACHE_GIB:-1}
 #                        diesem Weg NICHT erfuellt, und die Buchung muss das wissen
 #                        (deshalb geht KV_QUANT als --kv-quant an wb-belegung, siehe
 #                        belegung_nehmen).
-#   mlx-dspark      JA   `--kv-bits {0,4,8}` (nachgesehen in `mlx-dspark serve --help`,
-#                        2026-08-21). Wird hier gesetzt. ABER: dass der Motor ihn fuer
-#                        DIESE Hybridarchitektur auch annimmt, ist NICHT gemessen -- es
-#                        gibt die Angabe, er lehne ihn ab, weil nur 16 der 64 Lagen
-#                        ueberhaupt KV halten. Wenn das stimmt, scheitert der Start
-#                        sichtbar, und das ist die richtige Richtung: lieber ein lautes
-#                        Nein als eine stille Verletzung der Hausregel. Dieser Zweig
-#                        laeuft heute ohnehin nicht (qwen38-27b hat
-#                        vorhersage.bauart=eingebaut, also mtplx).
+#   mlx-dspark      JA, ABER NICHT FUER DIESEN KOERPER. Der Schalter existiert
+#                        (`--kv-bits {0,4,8}`, nachgesehen in `mlx-dspark serve --help`,
+#                        2026-08-21) -- fuer die Hybridarchitektur von qwen3.8 lehnt der
+#                        Motor ihn jedoch ab. AB DEM 21.08.2026 IST DAS GEMESSEN, nicht
+#                        mehr eine Vermutung: der erste echte Start ueber diesen Motor
+#                        brach ab mit "--kv-bits is unsupported for hybrid
+#                        linear-attention targets (their recurrent-state caches are not
+#                        KV caches; only 16 of 64 layers even hold KV). Run without
+#                        --kv-bits." Bis dahin stand hier, ein lautes Nein sei die
+#                        richtige Richtung -- das galt, solange der Zweig gar nicht lief.
+#                        Seit die drei Vorhersage-Wege waehlbar sind, laeuft er, und ein
+#                        lautes Nein hiesse: der gewaehlte Weg startet nie. Der Schalter
+#                        wird fuer solche Koerper deshalb weggelassen (siehe
+#                        dspark_ziel_ist_hybrid), der Cache laeuft dort unquantisiert,
+#                        und die BUCHUNG bekommt genau diesen Wert (kv_quant_buchung
+#                        "off") -- die Hausregel ist auf diesem Weg nicht erfuellt, aber
+#                        nichts wird kleiner gebucht als gefahren, und gesagt wird es
+#                        bei jedem Start.
 #   vllm-metal      ENTFAELLT Der Motor teilt sich sein Speicherbudget vorab selbst
 #                        zu (--metal-fraktion, siehe NACHTRAG 10); der KV-Cache liegt
 #                        INNERHALB dieses Budgets. Eine KV-Quantisierung aendert dort
@@ -1021,27 +1040,112 @@ except Exception:
 ' "$konfig"
 }
 
+# HAELT DER ZIELKOERPER IN EINEM TEIL SEINER LAGEN GAR KEINEN KV-CACHE?
+# (Nachtrag 19, 2026-08-21, GEMESSEN beim ersten echten Start ueber diesen
+# Motor.) mlx-dspark lehnt `--kv-bits` fuer solche Koerper rundheraus ab:
+#
+#   mlx-dspark serve: error: --kv-bits is unsupported for hybrid linear-attention
+#   targets (their recurrent-state caches are not KV caches; only 16 of 64 layers
+#   even hold KV). Run without --kv-bits.
+#
+# Der Kommentar bei KV_QUANT oben hatte genau das als Moeglichkeit notiert und
+# ein lautes Nein fuer die richtige Richtung gehalten -- solange dieser Zweig
+# gar nicht lief. Seit die drei Vorhersage-Wege waehlbar sind, laeuft er, und
+# ein lautes Nein heisst dann: der gewaehlte Weg startet nie. Also wird der
+# Schalter fuer genau diese Koerper weggelassen und die BUCHUNG erfaehrt es
+# (kv_quant_buchung="off"), damit kein KV-Cache kleiner gebucht als gefahren
+# wird.
+#
+# Erkannt wird es an derselben Stelle, an der mlx-dspark selbst nachsieht, nur
+# vor dem Laden: `layer_types` in der config.json des Ziels. Bei qwen38-27b
+# stehen dort 64 Eintraege, abwechselnd 'linear_attention' und
+# 'full_attention' (nachgesehen 2026-08-21) -- die Datei sagt es also selbst,
+# nichts daran ist geraten. NICHT ABGEDECKT ist mlx-dsparks zweite Bauform
+# (Nemotron-H/Mamba-2, dort `block_type == "M"`): hier liegt kein solches
+# Modell, an dem sich nachsehen liesse, welches config.json-Feld das traegt --
+# eine Behauptung darueber waere geraten. Kommt eines dazu, meldet mlx-dspark
+# denselben Satz wie oben, und diese Funktion bekommt seine zweite Bedingung.
+dspark_ziel_ist_hybrid() {
+  local konfig="$1/config.json"
+  [ -f "$konfig" ] || return 1
+  python3 -c '
+import json, sys
+
+def lagentypen(o):
+    if isinstance(o, dict):
+        werte = o.get("layer_types")
+        if isinstance(werte, list):
+            for w in werte:
+                if isinstance(w, str):
+                    yield w
+        for v in o.values():
+            for w in lagentypen(v):
+                yield w
+
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if any(t == "linear_attention" for t in lagentypen(d)) else 1)
+' "$konfig"
+}
+
 # Ein einzelnes Feld aus dem Registry-Objekt `buendelung` (siehe
 # resolve_modell, RES_BUENDELUNG, global gesetzt, bevor diese Funktion
 # aufgerufen wird). Leer, wenn die Registry das Feld nicht traegt -- kein
 # Ersatzwert, kein Raten: fehlt die Angabe, faellt die Motorwahl eben auf den
 # bisherigen Weg zurueck.
-# Ein einzelnes Feld aus dem Registry-Objekt `vorhersage` -- dasselbe Muster wie
-# buendelung_feld() darunter (`wb-state models get --field` kann keine
-# Punktpfade, geprueft: 'vorhersage.bauart' liefert nichts).
-vorhersage_feld() {
-  local schluessel="$1"
+# EINEN Vorhersage-Weg aus dem Registry-Objekt `vorhersage` waehlen (Nachtrag
+# 19, 2026-08-21; ersetzt vorhersage_feld(), das bis dahin die drei Felder auf
+# oberster Ebene einzeln holte -- gelesen wird weiter aus RES_VORHERSAGE, das
+# resolve_modell setzt, weil `wb-state models get --field` keine Punktpfade
+# kann: 'vorhersage.bauart' liefert nichts, geprueft). Gibt eine Zeile aus,
+# tabulatorgetrennt:
+#   bauart <TAB> modell <TAB> gewichteGb <TAB> label <TAB> warnung
+# Der Tabulator kommt in keinem Pfad und keinem Etikett vor. EIN python3-Aufruf
+# fuer alle Felder, nicht fuenf: die Wahl ist eine Entscheidung und darf nicht
+# in fuenf getrennten Prozessen fallen, die jeder fuer sich anders ausgehen
+# koennten -- dieselbe Ueberlegung wie in shell/wb-code an der gleichen Stelle.
+# Ohne `wege` in der Registry (oder ohne gewaehlte id) sind es genau die Felder
+# auf oberster Ebene, also der Stand vor dem 21.08.
+vorhersage_weg_waehlen() {
+  local gewaehlt="$1"
   [ -n "${RES_VORHERSAGE:-}" ] && [ "$RES_VORHERSAGE" != "null" ] || return 0
   printf '%s' "$RES_VORHERSAGE" | python3 -c '
 import json, sys
+gewaehlt = sys.argv[1] if len(sys.argv) > 1 else ""
 try:
     d = json.load(sys.stdin)
-    v = d.get(sys.argv[1])
-    if v is not None and v != "":
-        print(v)
 except Exception:
-    pass
-' "$schluessel" 2>/dev/null
+    sys.exit(0)
+wege = [w for w in (d.get("wege") or []) if isinstance(w, dict) and w.get("id")]
+vorgabe = None
+for w in wege:
+    if w.get("id") == (d.get("wegVorgabe") or ""):
+        vorgabe = w
+        break
+if vorgabe is None and wege:
+    vorgabe = wege[0]
+if vorgabe is None:
+    vorgabe = {"id": "", "label": "", "bauart": d.get("bauart"),
+               "modell": d.get("modell"), "gewichteGb": d.get("gewichteGb")}
+weg, warnung = vorgabe, ""
+if gewaehlt:
+    treffer = [w for w in wege if w.get("id") == gewaehlt]
+    if treffer:
+        weg = treffer[0]
+    else:
+        warnung = ("Vorhersage-Weg %r ist fuer dieses Modell nicht hinterlegt (bekannt: %s) -- "
+                   "es gilt der Vorgabeweg." % (gewaehlt, ", ".join(w["id"] for w in wege) or "keiner"))
+gb = weg.get("gewichteGb")
+print("\t".join([
+    weg.get("bauart") or "",
+    weg.get("modell") or "",
+    "" if gb is None else str(gb),
+    weg.get("label") or weg.get("id") or "",
+    warnung,
+]))
+' "$gewaehlt" 2>/dev/null
 }
 
 buendelung_feld() {
@@ -1992,9 +2096,20 @@ cmd_ensure() {
   # wirklich ruft, und lehnt einen Agenten ab. Weitergereicht wird sie unveraendert,
   # entschieden wird dort.
   local auf_eigene_gefahr=0
+  # --vorhersage-weg (Nachtrag 19, 2026-08-21): WELCHEN der in der Registry
+  # hinterlegten Vorhersage-Wege dieser Start nehmen soll. Wirkt nur dort, wo
+  # dieses Skript die Registry ohnehin selbst befragt -- also wenn der Aufrufer
+  # KEINE WB_MLX_SERVER_VORHERSAGE_BAUART gesetzt hat. Die Sitzungen gehen
+  # weiterhin ueber die Umgebungsvariablen (wb-code hat den Weg dort schon
+  # gewaehlt); diese Option ist der Weg fuer einen Menschen am Terminal und
+  # fuer ein Skript, das denselben Start nachstellen will.
+  local vorhersage_weg=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --auf-eigene-gefahr) auf_eigene_gefahr=1; shift ;;
+      --vorhersage-weg)
+        if [ -z "${2:-}" ]; then echo "wb-mlx-server: --vorhersage-weg braucht die id eines Weges" >&2; exit 2; fi
+        vorhersage_weg="$2"; shift 2 ;;
       --kontext)
         case "${2:-}" in
           ''|*[!0-9]*) echo "wb-mlx-server: --kontext braucht Token als Zahl" >&2; exit 2 ;;
@@ -2072,15 +2187,30 @@ cmd_ensure() {
   # Modells; OB er gewaehlt wird, bleibt Sache des Aufrufs. Die Umgebungsvariable
   # behaelt deshalb den Vorrang -- nachgeschlagen wird nur, wenn sie GAR NICHT
   # gesetzt ist.
+  #
+  # MEHRERE WEGE ZUR WAHL (Nachtrag 19, 2026-08-21): die Registry fuehrt seit
+  # heute unter `vorhersage.wege` mehrere gemessene Moeglichkeiten je Modell
+  # (fuer qwen38-27b: der eingebaute MTPLX-Kopf und zwei externe Entwerfer).
+  # Ohne --vorhersage-weg gilt weiter der Vorgabeweg, und der ist derselbe wie
+  # die Felder auf oberster Ebene -- der Aufruf ohne Option verhaelt sich also
+  # genau wie vor dem 21.08.
   if [ "$VORHERSAGE_GENANNT" -eq 0 ]; then
-    local reg_bauart reg_modell reg_gewichte
-    reg_bauart="$(vorhersage_feld bauart)"
-    reg_modell="$(vorhersage_feld modell)"
-    reg_gewichte="$(vorhersage_feld gewichteGb)"
+    local reg_bauart reg_modell reg_gewichte reg_label reg_warnung reg_felder
+    reg_felder="$(vorhersage_weg_waehlen "$vorhersage_weg")"
+    reg_bauart="$(printf '%s' "$reg_felder" | cut -f1)"
+    reg_modell="$(printf '%s' "$reg_felder" | cut -f2)"
+    reg_gewichte="$(printf '%s' "$reg_felder" | cut -f3)"
+    reg_label="$(printf '%s' "$reg_felder" | cut -f4)"
+    reg_warnung="$(printf '%s' "$reg_felder" | cut -f5)"
+    [ -n "$reg_warnung" ] && err "$reg_warnung"
     if [ -n "$reg_bauart" ] && [ -n "$reg_modell" ]; then
       vorh_bauart="$reg_bauart"; vorh_modell="$reg_modell"; vorh_gewichte_gb="$reg_gewichte"
-      err "Vorhersage aus der Registry uebernommen (bauart=$reg_bauart, Koerper '$reg_modell') -- der Aufrufer hat WB_MLX_SERVER_VORHERSAGE_BAUART nicht gesetzt. Wer sie ausdruecklich NICHT will, setzt die Variable leer."
+      err "Vorhersage aus der Registry uebernommen (bauart=$reg_bauart, Koerper '$reg_modell'${reg_label:+, Weg '$reg_label'}) -- der Aufrufer hat WB_MLX_SERVER_VORHERSAGE_BAUART nicht gesetzt. Wer sie ausdruecklich NICHT will, setzt die Variable leer."
+    elif [ -n "$vorhersage_weg" ]; then
+      err "--vorhersage-weg '$vorhersage_weg' laeuft ins Leere: fuer '${RES_ID:-$MODEL_PATH}' fuehrt die Registry ueberhaupt keine Vorhersage. Der Server startet ohne."
     fi
+  elif [ -n "$vorhersage_weg" ]; then
+    err "--vorhersage-weg '$vorhersage_weg' wird nicht beachtet: der Aufrufer hat WB_MLX_SERVER_VORHERSAGE_BAUART schon gesetzt und damit den Weg bereits gewaehlt."
   fi
   local motor="mlx-lm"
 
@@ -2517,9 +2647,20 @@ cmd_ensure() {
   # der config.json, waehrend die Hausregel seit zwei Tagen q8 vorschreibt.
   # 'off' ist hier kein Versaeumnis, sondern die gemessene Wahrheit fuer diese
   # Motoren (siehe KV_QUANT oben): sie haben den Schalter nicht.
+  #
+  # Beim Motor mlx-dspark haengt es am ZIELKOERPER: haelt ein Teil seiner Lagen
+  # einen rekurrenten Zustand statt eines KV-Caches, nimmt der Motor gar keinen
+  # --kv-bits an (siehe dspark_ziel_ist_hybrid oben, gemessen 2026-08-21) --
+  # dann laeuft der Cache unquantisiert, und genau das muss hier stehen.
+  local dspark_ziel_hybrid=0
+  if [ "$motor" = "mlx-dspark" ] && dspark_ziel_ist_hybrid "$MODEL_PATH"; then
+    dspark_ziel_hybrid=1
+  fi
   local kv_quant_buchung="off"
-  if [ "$motor" = "mtplx" ] || [ "$motor" = "mlx-dspark" ]; then
+  if [ "$motor" = "mtplx" ]; then
     kv_quant_buchung="$KV_QUANT"
+  elif [ "$motor" = "mlx-dspark" ]; then
+    [ "$dspark_ziel_hybrid" -eq 1 ] || kv_quant_buchung="$KV_QUANT"
   elif [ "$motor" = "vllm-metal" ]; then
     # Bei diesem Motor geht der KV-Cache gar nicht in die gebuchte Zahl ein
     # (--metal-fraktion bucht sein Gesamtbudget) -- eine Angabe waere hier eine
@@ -2593,12 +2734,29 @@ cmd_ensure() {
       set -- "$@" --prefix-cache-slots "$parallel"
     fi
     # 8-Bit-KV, dieselbe Hausregel wie bei mtplx (siehe KV_QUANT oben). Der Schalter
-    # heisst hier --kv-bits und nimmt Zahlen; 'off' waere 0.
-    case "$KV_QUANT" in
-      q8)  set -- "$@" --kv-bits 8 ;;
-      q4)  set -- "$@" --kv-bits 4 ;;
-      off) set -- "$@" --kv-bits 0 ;;
-    esac
+    # heisst hier --kv-bits und nimmt Zahlen; 'off' waere 0. FUER EINEN
+    # HYBRIDKOERPER GIBT ES IHN NICHT (gemessen 2026-08-21, siehe
+    # dspark_ziel_ist_hybrid): der Motor bricht dann schon beim Laden ab. Die
+    # Buchung weiss davon (kv_quant_buchung oben), es wird also nichts kleiner
+    # gebucht als gefahren -- gesagt wird es trotzdem, denn die Hausregel
+    # "immer 8 Bit" ist auf diesem Weg nicht erfuellt, und das darf niemand
+    # aus dem Schweigen dieses Skripts schliessen.
+    if [ "$dspark_ziel_hybrid" -eq 1 ]; then
+      err "KV-Quantisierung ist fuer diesen Koerper nicht zu haben: '$MODEL_PATH' haelt in einem Teil seiner Lagen einen rekurrenten Zustand statt eines KV-Caches (config.json, layer_types: linear_attention), und mlx-dspark lehnt --kv-bits dafuer ab ('their recurrent-state caches are not KV caches'). Der Cache laeuft unquantisiert; die Buchung rechnet mit genau diesem Wert, nicht mit dem quantisierten."
+    else
+      case "$KV_QUANT" in
+        q8)  set -- "$@" --kv-bits 8 ;;
+        q4)  set -- "$@" --kv-bits 4 ;;
+        off) set -- "$@" --kv-bits 0 ;;
+      esac
+    fi
+    # --context-window: derselbe Satz wie beim mtplx-Zweig darunter, und aus
+    # demselben Grund (Nachtrag 19, 2026-08-21). Der Schalter existiert
+    # (`mlx-dspark serve --help`), wurde hier aber nie gesetzt -- der Server
+    # lief also auf dem Modellmaximum weiter, waehrend das Buch $kontext
+    # eintrug. Eine Buchung, die ein kleineres Fenster nennt als das
+    # gefahrene, ist keine Bremse mehr. Was gebucht ist, laeuft.
+    set -- "$@" --context-window "$kontext"
     local denken; denken="$(chat_template_denken_wert)"
     if [ -n "$denken" ]; then
       set -- "$@" --reasoning-effort "$denken"
@@ -2851,5 +3009,5 @@ case "$unterbefehl" in
       echo "$DECODE_PARALLEL_VORGABE"
     fi
     ;;
-  *) echo "Usage: wb-mlx-server ensure [<modell>] [--kontext <token>] [--frist <minuten>] [--parallel <n>] [--auf-eigene-gefahr] | stop [<modell>] | status | liste | parallel" >&2; exit 2 ;;
+  *) echo "Usage: wb-mlx-server ensure [<modell>] [--kontext <token>] [--frist <minuten>] [--parallel <n>] [--vorhersage-weg <id>] [--auf-eigene-gefahr] | stop [<modell>] | status | liste | parallel" >&2; exit 2 ;;
 esac

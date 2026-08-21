@@ -128,7 +128,7 @@ interface Session {
    */
   revive?: { conversation: 'resumed' | 'fresh'; reason: string };
 }
-interface AmpelBefund { quelle: string; vorhanden: boolean; rot: boolean; ueberfaellig: boolean; ageDays: number; text: string }
+interface AmpelBefund { quelle: string; vorhanden: boolean; rot: boolean; ueberfaellig: boolean; ueberholt: boolean; ageDays: number; text: string }
 interface AmpelStand { machine: string; befunde: AmpelBefund[]; farbe: 'rot' | 'gelb' | 'gruen' | 'unbekannt' }
 /**
  * Farben durchreichen (11.08.): dieselbe Form wie `ThemaPayload` in

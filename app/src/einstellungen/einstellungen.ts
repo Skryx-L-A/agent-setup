@@ -57,6 +57,20 @@ interface VorhersageSicht {
   modell: string;
   gewichteGb?: number;
   herkunft?: string;
+  /** Der Weg, der ohne eigene Wahl gilt (2026-08-21). */
+  wegVorgabe?: string;
+  /** Die waehlbaren Wege. Fehlt die Liste, gibt es genau den einen Weg oben. */
+  wege?: VorhersageWegSicht[];
+}
+
+/** EIN waehlbarer Vorhersage-Weg (2026-08-21) -- Spiegel von RegistryVorhersageWeg. */
+interface VorhersageWegSicht {
+  id: string;
+  label: string;
+  bauart: 'entwerfer' | 'eingebaut';
+  modell: string;
+  gewichteGb?: number;
+  herkunft?: string;
 }
 
 interface ModellSicht {
@@ -488,6 +502,64 @@ function vorhersageAnzeige(modelle: ModellSicht[], modellId: string): string {
   const kurz = modell.split('/').pop() ?? modell;
   const bauartText = bauart === 'entwerfer' ? t('wort.vorhersageEntwerfer') : t('wort.vorhersageEingebaut');
   return t('satz.vorhersageModell', { modell: kurz, bauart: bauartText }) + (herkunft ? ` (${herkunft})` : '');
+}
+
+/**
+ * DIE WAHL UNTER MEHREREN VORHERSAGE-WEGEN (2026-08-21). alice: "ich will
+ * das ich als zweite option qwen3.8 als orchestrator auch mit einem
+ * multitokenprediction model starten kann anstatt mtplx, ich will mich
+ * entscheiden koennen."
+ *
+ * WAS DAMIT WAEHLBAR WIRD UND WAS NICHT: waehlbar sind genau die Wege, die die
+ * Registry fuer dieses Modell fuehrt -- kein Pfadfeld, keine freie Eingabe. Die
+ * Zuordnung bleibt damit in der Auslieferung, wie am 20.08. festgelegt; neu ist
+ * nur, dass die Auslieferung mehr als einen gemessenen Weg anbieten darf.
+ *
+ * DIE HERKUNFT STEHT DABEI, AUCH WENN SIE UNBEQUEM IST. Unter dem gewaehlten
+ * Weg steht der Klartext aus der Registry -- bei DSpark-DimInfer also auch der
+ * Satz, dass seine Guete NICHT gemessen ist. Wer zwischen drei Wegen waehlt,
+ * muss sehen, was gemessen wurde und was nicht.
+ *
+ * KEIN WEG WIRD GESPERRT, und die Liste erscheint nur, wenn es wirklich mehr
+ * als einen Weg gibt: bei genau einem waere ein Auswahlfeld eine Wahl ohne
+ * Alternative.
+ */
+function vorhersageWegWahl(
+  modelle: ModellSicht[],
+  modellId: string,
+  gewaehlt: string,
+  setzen: (weg: string) => void,
+): HTMLElement | null {
+  const m = modelle.find((x) => x.id === modellId);
+  const wege = m?.vorhersage?.wege;
+  if (!wege || wege.length < 2) return null;
+  const vorgabe = m?.vorhersage?.wegVorgabe ?? wege[0].id;
+  const wirksam = wege.some((w) => w.id === gewaehlt) ? gewaehlt : vorgabe;
+  const box = el('div', 'vorhersagewege');
+  box.appendChild(segmente(
+    'orchestratorVorhersageWeg',
+    wirksam,
+    wege.map((w) => ({
+      wert: w.id,
+      label: w.id === vorgabe ? t('satz.vorhersageWegVorgabe', { weg: w.label }) : w.label,
+    })),
+    // Der Vorgabeweg wird als LEER gespeichert, nicht unter seiner id: dann
+    // steht die Einstellung auf ihrem Vorgabewert, das Rueckstell-Zeichen der
+    // Zeile ist stumpf, und ein spaeter gewechselter Vorgabeweg in der Registry
+    // wirkt, ohne dass jemand hier nachstellen muss.
+    (w) => setzen(w === vorgabe ? '' : w),
+  ));
+  const weg = wege.find((w) => w.id === wirksam);
+  if (weg) {
+    const bauartText = weg.bauart === 'entwerfer'
+      ? t('wort.vorhersageEntwerfer')
+      : t('wort.vorhersageEingebaut');
+    const kurz = weg.modell.split('/').pop() ?? weg.modell;
+    box.appendChild(el('div', 'klartext',
+      t('satz.vorhersageModell', { modell: kurz, bauart: bauartText })));
+    if (weg.herkunft) box.appendChild(el('div', 'grund', weg.herkunft));
+  }
+  return box;
 }
 
 function feld(g: HTMLElement, o: FeldOpt): HTMLElement {
@@ -1536,11 +1608,27 @@ function seiteHarnesses(d: Daten): HTMLElement {
   // ist eine reine Anzeige aus der Registry -- kein Steuerelement dafuer, wie
   // alice es vorgegeben hat ("die Zuordnung gehoert zur Auslieferung,
   // nicht in die Oberflaeche").
+  //
+  // BEIM ORCHESTRATOR IST SEIT DEM 21.08.2026 EINE WAHL DAZUGEKOMMEN: fuehrt
+  // die Registry fuer sein Modell mehrere gemessene Wege, stehen sie unter dem
+  // Haken zur Wahl (siehe vorhersageWegWahl). Die Zuordnung bleibt trotzdem in
+  // der Auslieferung -- waehlbar ist nur, was dort steht. Der Worker-Schalter
+  // darunter bleibt unveraendert ein An/Aus: der Auftrag vom 21.08. gilt dem
+  // Orchestrator, und ein Auswahlfeld ohne den dazugehoerigen Weg durch
+  // pi-worker waere eine Wahl ohne Wirkung.
   const orchVorhersage = el('div');
   orchVorhersage.appendChild(haken('orchestratorVorhersage', d.settings.orchestratorVorhersage === true,
     (an) => void setze('orchestratorVorhersage', an)));
-  orchVorhersage.appendChild(el('div', 'klartext',
-    vorhersageAnzeige(d.orchestratorModelle, String(d.settings.orchestratorModel ?? ''))));
+  const orchModellId = String(d.settings.orchestratorModel ?? '');
+  const orchWege = vorhersageWegWahl(
+    d.orchestratorModelle,
+    orchModellId,
+    String(d.settings.orchestratorVorhersageWeg ?? ''),
+    (weg) => void setze('orchestratorVorhersageWeg', weg),
+  );
+  if (orchWege) orchVorhersage.appendChild(orchWege);
+  else orchVorhersage.appendChild(el('div', 'klartext',
+    vorhersageAnzeige(d.orchestratorModelle, orchModellId)));
   feld(g2, {
     ...texte('orchestratorVorhersage'),
     schluessel: 'orchestratorVorhersage',

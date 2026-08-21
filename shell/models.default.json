@@ -2208,7 +2208,34 @@
         "bauart": "eingebaut",
         "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-MTPLX-Optimized-Speed",
         "gewichteGb": 19.83,
-        "herkunft": "Endgueltiger Sieger, gemessen 2026-08-20 (Worker 'nebenlauf', alle vier Kandidaten fertig gemessen, ruhige Maschine, temperature 0): MTPLX Speed 4bit ueber den eigenstaendigen mtplx-Motor (--scheduler-mode serial) liefert 31,5 Tok/s kurz / 35,8 Tok/s warm bei 4737 Prompt-Token und haelt dabei den Hausgrundwert bei der Guete (48/50 auf pruef3, in 392 statt 718 Sekunden) -- schneller UND gleich gut. Schlaegt DSpark-DimInfer (15,3 kalt/30,3 warm), DFlash2 (12,5/29,5) und den Betrieb ganz ohne Vorhersage (11,1/17,2). Die 8-Bit-Guetefassung (Qwen3.8-27B-MTPLX-Optimized-Quality, $HOME/AI/mlx-models/Qwen3.8-27B-MTPLX-Optimized-Quality) bringt KEINE messbare Guete gegenueber der 4-Bit-Fassung (dieselben 48/50), dafuer 8,6 GiB mehr Speicher (30,2 statt 21,6 GiB) und deutlich weniger Tempo (23,0 statt 31,5 Tok/s kurz, 24,9 statt 35,8 Tok/s warm). Entscheidung des Nutzers (2026-08-20): sie bleibt trotzdem als zweite, ausdruecklich waehlbare Moeglichkeit erhalten -- Vorgabe/Standardwahl bleibt MTPLX Speed 4bit, wer stattdessen die Quality-Fassung will, setzt 'vorhersage.modell' auf den Optimized-Quality-Pfad und kennt dann den Preis. Buendelung UND Vorhersage gibt es fuer dieses Modell architekturbedingt nicht (mtp_batch scheitert nach sieben erfuellten Bedingungen an QwenRowOwnedRouterConfigError) -- wb-mlx-server klemmt --parallel deshalb fest auf 1 fuer diesen Motor, bei beiden Koerpern."
+        "herkunft": "Endgueltiger Sieger, gemessen 2026-08-20 (Worker 'nebenlauf', alle vier Kandidaten fertig gemessen, ruhige Maschine, temperature 0): MTPLX Speed 4bit ueber den eigenstaendigen mtplx-Motor (--scheduler-mode serial) liefert 31,5 Tok/s kurz / 35,8 Tok/s warm bei 4737 Prompt-Token und haelt dabei den Hausgrundwert bei der Guete (48/50 auf pruef3, in 392 statt 718 Sekunden) -- schneller UND gleich gut. Schlaegt DSpark-DimInfer (15,3 kalt/30,3 warm), DFlash2 (12,5/29,5) und den Betrieb ganz ohne Vorhersage (11,1/17,2). Die 8-Bit-Guetefassung (Qwen3.8-27B-MTPLX-Optimized-Quality, $HOME/AI/mlx-models/Qwen3.8-27B-MTPLX-Optimized-Quality) bringt KEINE messbare Guete gegenueber der 4-Bit-Fassung (dieselben 48/50), dafuer 8,6 GiB mehr Speicher (30,2 statt 21,6 GiB) und deutlich weniger Tempo (23,0 statt 31,5 Tok/s kurz, 24,9 statt 35,8 Tok/s warm). Entscheidung des Nutzers (2026-08-20): sie bleibt trotzdem als zweite, ausdruecklich waehlbare Moeglichkeit erhalten -- Vorgabe/Standardwahl bleibt MTPLX Speed 4bit, wer stattdessen die Quality-Fassung will, setzt 'vorhersage.modell' auf den Optimized-Quality-Pfad und kennt dann den Preis. Buendelung UND Vorhersage gibt es fuer dieses Modell architekturbedingt nicht (mtp_batch scheitert nach sieben erfuellten Bedingungen an QwenRowOwnedRouterConfigError) -- wb-mlx-server klemmt --parallel deshalb fest auf 1 fuer diesen Motor, bei beiden Koerpern.",
+        "wegVorgabe": "mtplx",
+        "wege": [
+          {
+            "id": "mtplx",
+            "label": "MTPLX Speed 4bit (eingebauter Kopf)",
+            "bauart": "eingebaut",
+            "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-MTPLX-Optimized-Speed",
+            "gewichteGb": 19.83,
+            "herkunft": "Vorgabeweg. GEMESSEN 2026-08-20 (Worker 'nebenlauf', ruhige Maschine, temperature 0, 4737 Prompt-Token): 31,5 Tok/s kalt / 35,8 warm, Guete 48/50 auf pruef3 -- der schnellste Weg UND einer der beiden mit gemessener Guete. Vergleichswert ohne jede Vorhersage, gemessen im selben Lauf: 11,1 Tok/s kalt / 17,2 warm. Der Koerper traegt den Vorhersage-Kopf selbst und ERSETZT den schlichten Koerper beim Start; Buendelung gibt es ueber den mtplx-Motor architekturbedingt nicht (--parallel bleibt fest 1)."
+          },
+          {
+            "id": "dflash2",
+            "label": "DFlash2 (externer Entwerfer)",
+            "bauart": "entwerfer",
+            "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-DFlash2",
+            "gewichteGb": 3.58,
+            "herkunft": "Zweiter Weg, Wahl des Nutzers vom 21.08.2026 ('ich will mich entscheiden koennen'). GEMESSEN 2026-08-20 (Worker 'nebenlauf'): 12,5 Tok/s kalt / 29,5 warm, Trefferquote 98 % auf pruef3 -- die BESTE Guete der vier Kandidaten, aber deutlich langsamer als MTPLX. Vergleichswert ohne jede Vorhersage, gemessen im selben Lauf: 11,1 Tok/s kalt / 17,2 warm. Der Entwerfer laeuft ueber mlx-dspark NEBEN dem Zielmodell, sein Gewicht kommt also zum Ziel hinzu (3,58 GiB, gemessen am safetensors dieses Ordners am 21.08.2026, Worker 'vorhersagewahl'). Die config.json traegt 'dflash_config' -- wb-mlx-server setzt deshalb '--mode dflash'."
+          },
+          {
+            "id": "dspark-diminfer",
+            "label": "DSpark-DimInfer (externer Entwerfer)",
+            "bauart": "entwerfer",
+            "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-DSpark-DimInfer",
+            "gewichteGb": 3.46,
+            "herkunft": "Dritter Weg, Wahl des Nutzers vom 21.08.2026. GEMESSEN 2026-08-20 (Worker 'nebenlauf'): 15,3 Tok/s kalt / 30,3 warm -- schneller als DFlash2, aber die GUETE IST FUER DIESEN KOERPER NICHT GEMESSEN, weder auf pruef3 noch sonstwo. Wer ihn waehlt, waehlt eine ungepruefte Trefferquote. Vergleichswert ohne jede Vorhersage, gemessen im selben Lauf: 11,1 Tok/s kalt / 17,2 warm. Der Entwerfer laeuft ueber mlx-dspark NEBEN dem Zielmodell, sein Gewicht kommt also zum Ziel hinzu (3,46 GiB, gemessen am safetensors dieses Ordners am 21.08.2026, Worker 'vorhersagewahl'). Die config.json traegt die DeepSpec-Felder oben -- mlx-dsparks eigene Erkennung greift, kein '--mode'."
+          }
+        ]
       },
       "workerClass": [
         {

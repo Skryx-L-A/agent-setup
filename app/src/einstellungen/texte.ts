@@ -453,10 +453,12 @@ export const DE: Record<string, string> = {
     + 'Fassung mit eingebautem Vorhersage-Kopf — schneller je Antwort, aber ohne gemeinsame Nebenläufigkeit '
     + 'am MLX-Server.',
   'feld.orchestratorVorhersage.info':
-    'Welches Modell dabei benutzt wird, steht in der Registry und ist hier nicht wählbar — nur diese '
-    + 'Anzeige zeigt es an. Spekulatives Decoding und die geteilte Nebenläufigkeit des MLX-Servers '
-    + 'schließen sich gegenseitig aus (mlx_lm.server schaltet die Stapelverarbeitung ab, sobald ein '
-    + 'Entwerfer gesetzt ist) — deshalb steht dieser Schalter standardmäßig aus.',
+    'Welche Wege es gibt, steht in der Registry: wählbar ist nur, was dort hinterlegt und gemessen ist, '
+    + 'kein freier Pfad. Führt die Registry für das Modell mehrere Wege, stehen sie unter dem Haken zur '
+    + 'Wahl, mit ihrer Herkunft darunter — samt der Stellen, an denen etwas NICHT gemessen wurde. '
+    + 'Spekulatives Decoding und die geteilte Nebenläufigkeit des MLX-Servers schließen sich gegenseitig '
+    + 'aus (mlx_lm.server schaltet die Stapelverarbeitung ab, sobald ein Entwerfer gesetzt ist) — deshalb '
+    + 'steht dieser Schalter standardmäßig aus.',
   'feld.workerVorhersage.name': 'Multi-Token-Vorhersage für Worker',
   'feld.workerVorhersage.wirkung':
     'An: ein Worker mit einem lokalen Modell lädt, falls dafür hinterlegt, denselben Entwerfer oder '
@@ -469,6 +471,7 @@ export const DE: Record<string, string> = {
   'wort.vorhersageEingebaut': 'eingebauter Kopf',
   'satz.vorhersageModell': 'Modell: {modell} ({bauart})',
   'satz.vorhersageKeine': 'Für das aktuell gewählte Modell ist keine Vorhersage hinterlegt.',
+  'satz.vorhersageWegVorgabe': '{weg} (Vorgabe)',
 
   'feld.anbieter.name': 'Zugang zu den Anbietern',
   'feld.anbieter.wirkung':
@@ -1525,10 +1528,11 @@ export const EN: Record<string, string> = {
     'On: if one is registered for its model, the orchestrator additionally loads a drafter or a build with '
     + 'a built-in prediction head -- faster per reply, but without shared concurrency on the MLX server.',
   'feld.orchestratorVorhersage.info':
-    'Which model gets used is set in the registry and is not selectable here -- this is a read-only '
-    + 'display only. Speculative decoding and the MLX server\'s shared concurrency are mutually exclusive '
-    + '(mlx_lm.server turns off batching the moment a drafter is set) -- that is why this switch defaults '
-    + 'to off.',
+    'Which paths exist is set in the registry: only what is registered and measured there can be picked, '
+    + 'never a free-form path. If the registry lists more than one path for the model, they appear below '
+    + 'the switch, each with its provenance -- including where something was NOT measured. Speculative '
+    + 'decoding and the MLX server\'s shared concurrency are mutually exclusive (mlx_lm.server turns off '
+    + 'batching the moment a drafter is set) -- that is why this switch defaults to off.',
   'feld.workerVorhersage.name': 'Multi-token prediction for workers',
   'feld.workerVorhersage.wirkung':
     'On: a worker on a local model loads, if one is registered for it, the same drafter or built-in head '
@@ -1540,6 +1544,7 @@ export const EN: Record<string, string> = {
   'wort.vorhersageEingebaut': 'built-in head',
   'satz.vorhersageModell': 'Model: {modell} ({bauart})',
   'satz.vorhersageKeine': 'No prediction is registered for the currently selected model.',
+  'satz.vorhersageWegVorgabe': '{weg} (default)',
 
   'feld.anbieter.name': 'Access to the providers',
   'feld.anbieter.wirkung':
