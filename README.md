@@ -182,4 +182,4 @@ the steps is a reasonable way to do it, and it is how the setup is meant to spre
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+AGPL-3.0-only. See [LICENSE](LICENSE).
