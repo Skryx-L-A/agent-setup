@@ -1,7 +1,15 @@
 /**
  * wb-footer — workbench footer for local pi agents:
- *   <model> · <cwd> (branch) · ↑in ↓out tokens · ctx-%
+ *   <model> · <cwd> (branch) · ↑in ↓out tokens · N tok/s (prefill Xs) · ctx-%
  * Set automatically at session start; `/footer` toggles back to the default.
+ *
+ * tok/s is the DECODE rate: output tokens of the last assistant message divided by
+ * the time between its first streamed token and its end. The previous footer divided
+ * output tokens by wall-clock time between renders, which includes prompt processing
+ * and tool execution -- a 27B model that decodes at 23 tok/s showed 3 to 8 tok/s
+ * during real work (measured 2026-09-09). Prefill (time to first token) is shown on
+ * its own so a slow prompt is visible as what it is. While a message streams, the
+ * rate is estimated from streamed characters (about 4 per token) since the first token.
  */
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -12,12 +20,45 @@ const fmt = (n: number) => (n < 1000 ? `${n}` : n < 1_000_000 ? `${Math.round(n 
 export default function (pi: ExtensionAPI) {
   let enabled = true;
 
+  // Decode-rate bookkeeping per assistant message (see header comment).
+  let msgStart = 0;      // message_start of the current assistant message
+  let firstTok = 0;      // first streamed text/thinking/toolcall delta
+  let streamedChars = 0; // characters streamed so far (live estimate only)
+  let streaming = false;
+  let last: { rate: number; prefillS: number } | undefined; // finalized last message
+  const rateInfo = (): { rate: number; prefillS: number; live: boolean } | undefined => {
+    if (streaming && firstTok) {
+      const dt = (Date.now() - firstTok) / 1000;
+      if (dt < 0.5) return last ? { ...last, live: false } : undefined;
+      return { rate: streamedChars / 4 / dt, prefillS: (firstTok - msgStart) / 1000, live: true };
+    }
+    return last ? { ...last, live: false } : undefined;
+  };
+  pi.on("message_start", async (ev: any) => {
+    if (ev.message?.role !== "assistant") return;
+    msgStart = Date.now(); firstTok = 0; streamedChars = 0; streaming = true;
+  });
+  pi.on("message_update", async (ev: any) => {
+    const e = ev.assistantMessageEvent;
+    if (!e) return;
+    if (e.type === "text_delta" || e.type === "thinking_delta" || e.type === "toolcall_delta") {
+      if (!firstTok) firstTok = Date.now();
+      streamedChars += (e.delta ?? "").length;
+    }
+  });
+  pi.on("message_end", async (ev: any) => {
+    if (ev.message?.role !== "assistant") return;
+    streaming = false;
+    const out = ev.message.usage?.output ?? 0;
+    const end = Date.now();
+    const decodeS = firstTok ? (end - firstTok) / 1000 : 0;
+    if (out > 0 && decodeS > 0.2) last = { rate: out / decodeS, prefillS: firstTok ? (firstTok - msgStart) / 1000 : 0 };
+  });
+
   const apply = (ctx: any) => {
     if (!enabled) { ctx.ui.setFooter(undefined); return; }
     ctx.ui.setFooter((tui: any, theme: any, footerData: any) => {
       const unsub = footerData.onBranchChange(() => tui.requestRender());
-      // tokens/sec sampling: compare output-token totals between renders
-      let lastT = 0, lastOut = 0, rate = 0;
       return {
         dispose: unsub,
         invalidate() {},
@@ -45,15 +86,13 @@ export default function (pi: ExtensionAPI) {
             theme.fg("dim", " · ") +
             `${dir}${branch ? " " + branch : ""}`;
 
-          const now = Date.now();
-          if (lastT && output > lastOut && now - lastT >= 300) {
-            const inst = ((output - lastOut) * 1000) / (now - lastT);
-            rate = rate ? rate * 0.6 + inst * 0.4 : inst; // smoothed
-          }
-          if (output !== lastOut || !lastT) { lastT = now; lastOut = output; }
-
           let right = theme.fg("dim", `↑${fmt(input)} ↓${fmt(output)}`);
-          if (rate >= 1) right += theme.fg("dim", " · ") + theme.fg("accent", `${Math.round(rate)} tok/s`);
+          const r = rateInfo();
+          if (r) {
+            right += theme.fg("dim", " · ") + theme.fg("accent", `${Math.round(r.rate)} tok/s`);
+            if (r.prefillS >= 1) right += theme.fg("dim", ` (prefill ${r.prefillS.toFixed(0)}s)`);
+            if (r.live) right += theme.fg("dim", " ~");
+          }
           if (ctxWin) {
             const pct = Math.min(100, Math.round((lastUsed / ctxWin) * 100));
             const color = pct >= 85 ? "error" : pct >= 60 ? "warning" : "success";
