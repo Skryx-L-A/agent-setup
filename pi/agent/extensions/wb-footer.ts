@@ -68,9 +68,13 @@ export default function (pi: ExtensionAPI) {
           for (const e of ctx.sessionManager.getBranch()) {
             if (e.type === "message" && e.message.role === "assistant") {
               const m = e.message as AssistantMessage;
-              input += m.usage.input;
+              // cacheRead counts too: with a prefix cache (APC on mlx_vlm.server) the
+              // provider reports only the uncached part as input, so a 37k conversation
+              // showed "1k/131k" in the context bar (seen 2026-09-10 on a real worker).
+              const cached = m.usage.cacheRead ?? 0;
+              input += m.usage.input + cached;
               output += m.usage.output;
-              lastUsed = m.usage.input + m.usage.output;
+              lastUsed = m.usage.input + cached + m.usage.output;
             }
           }
           const branch = footerData.getGitBranch();
