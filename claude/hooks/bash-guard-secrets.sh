@@ -2,6 +2,9 @@
 # Zweck: verhindert `git add`/`git commit`, die .env-Dateien oder gaengige
 #        Secret-Dateimuster ausserhalb ~/Knowledge/90-secrets/ einschliessen.
 # Event: PreToolUse, matcher Bash.
+# NICHT REGISTRIERT: Logik seit 2026-08-05 direkt in bash-guard.py neu geschrieben
+#        (dessen PreToolUse/Bash-Sammelpunkt) -- diese Datei traegt nur noch die
+#        Original-Begruendung, kein Eintrag in settings.json zeigt hierher.
 # Warum: CLAUDE.md sagt "Never commit a .env (or any secret) to GitHub" und
 #        "Secrets knowledge goes only into 90-secrets/" — bisher reine Prosa-
 #        Regel ohne technische Durchsetzung (siehe research-skills Luecke #1).

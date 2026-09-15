@@ -1,0 +1,1276 @@
+/* DIE OBERFLAECHE DES HAUPTFENSTERS -- neu entworfen am 03.09.2026.
+ *
+ * Sie ersetzt die Stilangaben, die bis dahin in index.html standen. Der
+ * Aufbau ist neu und nicht aus der alten Fassung uebernommen: Titelleiste mit
+ * Kontext und dem Ort der Arbeitsmodi, Freigabeleiste quer darunter, links der
+ * Baum aus Projekten und Orchestratoren, in der Mitte die Tab-Leiste ueber der
+ * Pane-Flaeche, rechts der Inspektor. Die Statusleiste stand bis zum
+ * 05.09.2026 unten quer; seitdem sind Maschinenkarten und Fusszeile Teil der
+ * linken Leiste (Wort des Nutzers: „Maschinen prominenter", „Statusleiste nicht
+ * unten"), und die Buehne reicht bis zum unteren Rand.
+ *
+ * KEINE FARBE STEHT HIER ALS HEXWERT. Die einzige Zeichenkette dieser Art im
+ * ganzen Blatt ist das `#000` im `mask-image` des Tab-Streifens -- eine MASKE
+ * und keine Farbe: die Werte darin sagen, wo der Streifen deckt und wo er
+ * ausblendet, sie faerben nichts. Alles kommt aus den
+ * Rollen von main/thema.ts (ueber die erzeugte tokens.css) und aus den
+ * Zustandsfarben, die main/thema.ts als `--zustand-*` durchreicht. Die eine
+ * Ausnahme, die es vor dem Neubau gab -- die drei festen Toene der
+ * Namensschilder auf den Panes --, ist mit dem Neubau gefallen, und die
+ * Schilder selbst sind es seit dem 03.09. auch: an ihrer Stelle steht eine
+ * Kopfzeile je Kachel (`.panekopf`).
+ *
+ * Kein Verlauf, kein Leuchten, kein Zierschatten. `box-shadow` steht an genau
+ * sieben Stellen, und keine davon ist Zierde:
+ *   - der Hof am wartenden Zustandspunkt (er traegt die Unterscheidung mit, wo
+ *     Farbe allein nicht reicht);
+ *   - die Zielmarke einer Zeile beim Ziehen;
+ *   - der Ring um die Kachel, die die Tastatur hat, und um die gewaehlte
+ *     Karte der Uebersicht -- beides Fokus, kein Schmuck;
+ *   - der eine weiche Schatten unter den beiden Blaettern, die ueber der
+ *     Flaeche schweben (Sitzungskarte, Maschinenfeld). Er sagt „das hier liegt
+ *     oben"; im hellen Thema traegt sonst nichts diese Aussage.
+ *
+ * SEIT DEM 04.09.2026 IST JEDER BEREICH EINE KARTE auf dem Fenstergrund
+ * (`--fenster`): vier Bildpunkte Fuge ringsum und zwischen den Karten, zehn
+ * Bildpunkte Eckenradius, keine Trennlinien mehr. Die Fuge ist die Trennung.
+ */
+
+/* --- Grundmasse -----------------------------------------------------------
+ * Sie stehen als Groessen, damit die schmalen Fassungen sie an EINER Stelle
+ * aendern und nicht an sechs. Die Breiten der beiden Leisten kommen dagegen
+ * aus dem Modell (ui.json) und werden von renderer.ts gesetzt: sie gehoeren
+ * dem Menschen, der sie gezogen hat.
+ */
+:root {
+  --titelhoehe: 40px;
+  --kopfhoehe: 52px;
+  --streifenhoehe: 34px;
+  /* Mindesthoehe der Fusszeile in der linken Leiste (bis 05.09.2026: die
+     Hoehe der Statusleiste unten). */
+  --statushoehe: 28px;
+  --r-klein: 6px;
+  --r-mittel: 8px;
+  --r-gross: 10px;
+  /* DIE FUGE UND DER KARTENRADIUS -- die zwei Zahlen, aus denen die Gestalt
+     entsteht (Entscheidung des Nutzers vom 04.09.2026: „eng, die Karten sitzen
+     fast aneinander"). Jeder Bereich ist eine Karte auf dem Fenstergrund, vier
+     Bildpunkte vom Fensterrand und vier voneinander entfernt; der Grund blitzt
+     dazwischen durch. Die beiden Ziehgriffe sind GENAU so breit wie die Fuge --
+     die Fuge ist der Griff, und es steht keine zusaetzliche Linie darin. */
+  --fuge: 4px;
+  --r-karte: 10px;
+  /* DIE SITZUNGSZEILE DER LINKEN LEISTE: 44 BILDPUNKTE (alice, 05.09.2026:
+     „44 px, wie gebaut"). Bis dahin stand hier 32 -- der Wert der einzeiligen
+     Fassung --, waehrend jede Sitzungszeile im Fenster mit ihrer Zusatzzeile
+     44 mass (gemessen ueber `awb-ctl ui`, gestalt.zeilenhoehe). Die Zahl steht
+     jetzt bei der Wahrheit, und die Zeile ist in jeder Leistenbreite gleich
+     hoch, ob mit oder ohne Zusatzzeile. Die Projektzeile behaelt ihre 32:
+     sie traegt eine Zeile Schrift, und 32 statt 24 war dort die Wahl vom
+     04.09. -- darunter wirkte die Leiste dicht statt ruhig. */
+  --zeilenhoehe: 44px;
+  --projektzeile: 32px;
+  /* Der Streifen, den die drei Fensterknoepfe auf dem Mac brauchen. Er wird in
+     der Titelleiste genommen, nicht ueber dem ganzen Fenster: so bleibt alles
+     darunter buendig. 28 Pixel stammen aus dem Fenster-Auftrag; die echte Lage
+     der Knoepfe laesst sich ohne sichtbares Fenster nicht nachmessen, und ein
+     geratener Ersatz waere nicht besser. */
+  --mac-knopfstreifen: 78px;
+}
+
+html, body {
+  margin: 0; height: 100%; overflow: hidden;
+  /* DER FENSTERGRUND, nicht der Kartengrund. Er liegt unter allem und ist in
+     beiden Themen dunkler als jede Karte darauf (main/thema.ts, Rolle
+     `fenster`). */
+  background: var(--fenster); color: var(--schrift);
+}
+/* Systemschrift fuer die ganze Oberflaeche, Grundtext 13 Punkt (HIG
+   Typography), Zeilenabstand 1,35. Monospace steht weiter unten und nur dort,
+   wo es hingehoert: Terminalinhalt, Pfade, Modellkennungen, Commit-Kuerzel.
+   DIE VIER STUFEN: 17 halbfett fuer den Sitzungsnamen im Inhaltskopf, 13 fuer
+   Zeilen und Fliesstext, 11,5 fuer Untertitel, Chips und Marken, 10,5 fuer die
+   festbreiten Nebenangaben. Eine fuenfte gibt es nicht. */
+body { font: 13px/1.35 -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui; }
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+svg { display: block; }
+
+/* DER RAHMEN IST DER FENSTERGRUND. Er traegt ringsum die Fuge als Polsterung
+   und zwischen seinen Kindern denselben Abstand -- daraus entsteht der schmale
+   Streifen Grund zwischen Titelleiste, Freigabeleiste und Spalten.
+   `border-box`, sonst waere das Fenster um acht Bildpunkte zu hoch und die
+   unterste Karte stuende unter dem Rand. */
+#rahmen {
+  display: flex; flex-direction: column; height: 100vh;
+  box-sizing: border-box; padding: var(--fuge); gap: var(--fuge);
+}
+
+/* --- Die Karte ------------------------------------------------------------
+ * Jeder Bereich -- linke Leiste, Inhaltsflaeche, Inspektor,
+ * Freigabeleiste, Kanalwarnung -- ist eine Karte: eigene Flaeche, zehn
+ * Bildpunkte Eckenradius, KEIN Rahmen und KEIN Zierschatten. Getrennt wird
+ * durch Flaeche gegen Flaeche; die Fuge dazwischen zeigt den Fenstergrund.
+ * Die TITELLEISTE ist ausdruecklich keine Karte: sie liegt auf dem Grund, weil
+ * die drei Fensterknoepfe des Systems dort stehen und eine Karte unter ihnen
+ * sie in einen Kasten sperren wuerde.
+ */
+.karte {
+  border-radius: var(--r-karte); overflow: hidden;
+  background: var(--leiste);
+}
+
+/* --- Der Zustandspunkt ----------------------------------------------------
+ * Farbe allein traegt die Unterscheidung nicht -- die FORM traegt mit:
+ * gefuellt heisst laeuft, ein Ring heisst laeuft fern, hohl und grau heisst
+ * aus, gefuellt mit weichem Hof heisst wartet auf Dich. Wer Farben schlecht
+ * unterscheidet, sieht den Unterschied trotzdem.
+ */
+/* `border-box`, damit ALLE Zustandspunkte gleich gross sind (04.09.2026). Die
+   Form unterscheidet sie -- gefuellt, Ring, hohl --, die Groesse nicht: mit
+   `content-box` war ein Ring mit zwei Bildpunkten Rand zwoelf statt acht
+   Bildpunkte breit, und in der eingeklappten Leiste standen die Punkte damit
+   auf verschiedenen senkrechten Achsen (gemessen: Mitte bei 14 gegen 16). */
+.punkt { width: 8px; height: 8px; box-sizing: border-box; border-radius: 50%; flex: 0 0 auto; }
+.punkt.laeuft { background: var(--zustand-laeuft); }
+.punkt.will { background: var(--zustand-wartet); box-shadow: 0 0 0 3px var(--wartet-matt); }
+.punkt.ruhig { background: transparent; border: 1.5px solid var(--gedaempft); }
+.punkt.aus { background: transparent; border: 1.5px solid var(--zustand-tot); }
+.punkt.fern { background: transparent; border: 2px solid var(--zustand-laeuft); }
+.punkt.fertig { background: var(--zustand-fertig); }
+
+/* Die matten Toene der Wartefarbe. Sie stehen als eigene Groessen, weil sie an
+   fuenf Stellen gebraucht werden (Abzeichen, Freigabeleiste, Panerand,
+   Panefuss, Punkthof) und `color-mix` sie aus derselben Rolle ableitet -- kein
+   zweiter Farbwert, der auseinanderlaufen kann. */
+:root {
+  --wartet-matt: color-mix(in srgb, var(--zustand-wartet) 14%, transparent);
+  --wartet-rand: color-mix(in srgb, var(--zustand-wartet) 38%, transparent);
+  --akzent-matt: color-mix(in srgb, var(--akzent) 15%, transparent);
+}
+
+/* --- Titelleiste ----------------------------------------------------------
+ * Sie wird BENUTZT. `titleBarStyle: 'hiddenInset'` ohne Inhalt darin war der
+ * Fehler des letzten Anlaufs -- oben klaffte ein leerer Streifen. Hier stehen
+ * Projekt, Orchestrator, Maschine und Zustand des Gewaehlten, mittig der Ort
+ * der Arbeitsmodi, rechts das Freigabe-Abzeichen und der Inspektorschalter.
+ * Die drei Fensterknoepfe bleiben frei: `#titelleiste` traegt links den
+ * Streifen als Polsterung, und ziehen laesst sich am ganzen freien Grund.
+ */
+/* SIE IST KEINE KARTE (04.09.2026). Sie liegt unmittelbar auf dem
+   Fenstergrund, ohne eigene Flaeche und ohne Trennstrich darunter: die drei
+   Fensterknoepfe des Systems stehen in ihr, und eine Karte unter ihnen sperrte
+   sie in einen Kasten, den es auf keinem Mac gibt. Getrennt wird sie von den
+   Karten darunter durch die Fuge -- so wie alles andere auch. */
+#titelleiste {
+  position: relative; flex: 0 0 auto; height: var(--titelhoehe);
+  display: flex; align-items: center; gap: 9px; padding: 0 6px 0 10px;
+  background: transparent;
+  -webkit-app-region: drag;
+}
+html[data-mac='ja'] #titelleiste { padding-left: var(--mac-knopfstreifen); }
+/* Jedes Bedienelement darin muss sich ausdruecklich vom Ziehen ausnehmen --
+   sonst zieht ein Klick darauf das Fenster statt zu klicken. */
+#titelleiste button, #titelleiste .modi { -webkit-app-region: no-drag; }
+
+/* DER KONTEXT ENDET VOR DEM MODUS-SCHALTER. Der Schalter liegt absolut in der
+   Mitte und nimmt in der Reihe keinen Platz weg; ohne diese Grenze laeuft der
+   Text der linken Seite unter ihn und wird von ihm ueberdeckt -- bei 1100
+   Bildpunkten stand vom Maschinennamen nur noch „w" da (gemessen 03.09.).
+   Die 100 sind die halbe Breite des Schalters plus Luft; was nicht mehr passt,
+   endet mit Auslassungspunkten. */
+#kontext {
+  display: flex; align-items: center; gap: 7px;
+  min-width: 0; max-width: calc(50% - 100px);
+}
+#k-projekt { font-size: 13px; font-weight: 600; letter-spacing: -0.1px; white-space: nowrap; }
+#kontext .teiler { color: var(--gedaempft); }
+#k-orch { font-size: 13px; white-space: nowrap; }
+/* SYSTEMSCHRIFT (03.09.2026, Prueferbefund 11). Hier stehen Maschinenname und
+   Zustand, und der Zustand ist ein uebersetztes Wort ("läuft", "wartet auf
+   Dich"). Festbreite ist im Haus fuer Terminalinhalt, Pfade, Code und
+   Modellkennungen reserviert; ein Wort aus der Sprachtabelle gehoert nicht
+   dazu. */
+#k-neben {
+  font-size: 11px; color: var(--gedaempft);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* DER ORT DER ARBEITSMODI. Heute gibt es genau einen -- Code, also
+   Orchestrator und Worker in Terminal-Panes. Der Rahmen ist trotzdem schon
+   da, und die zweite Stelle ist sichtbar angelegt und nicht bedienbar: kommt
+   ein zweiter Modus, wird aus dem gestrichelten Feld ein zweiter Knopf, und
+   sonst aendert sich nichts. Ein Schalter mit nur einem Eintrag waere kein
+   Schalter. */
+.modi {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  align-items: center;
+}
+/* DER UMSCHALTER TUT SEIT DEM 08.09.2026 ETWAS (Auftrag macagents). „Agents"
+   war bis dahin ein gedaempftes Segment mit einem Schildchen „kommt noch"
+   daneben; jetzt ist es ein Segment wie jedes andere im Fenster, und die
+   Gestalt kommt deshalb aus `.segment` -- eine Fassung fuer alle drei
+   Umschalter, statt einer eigenen fuer diesen einen. Die Wahl ist hier die
+   AKZENTFARBE, wie beim Umschalter Orchestrator | Worker: beide sagen, was
+   die Flaeche zeigt. */
+/* MIT DER KENNUNG, nicht mit der Klasse: `.segment button.gewaehlt` steht
+   weiter unten in dieser Datei und gewaenne sonst bei gleicher Spezifitaet --
+   gemessen am Belegbild vom 08.09., wo „Agents" weiss statt in der Akzentfarbe
+   stand. Die Akzentfarbe ist hier richtig: derselbe Umschalter-Sinn wie bei
+   Orchestrator | Worker (`.segment.wahl-akzent`) -- beide sagen, was die
+   Flaeche zeigt. */
+#modi button.gewaehlt { background: var(--akzent); color: var(--akzent-tinte); font-weight: 500; }
+
+#titel-rechts { margin-left: auto; display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+/* Das Abzeichen bleibt sichtbar, auch wenn die Leiste darunter einmal weg
+   sein sollte -- eine offene Freigabe darf an keinem Ort des Programms
+   verborgen sein. Ohne offene Freigabe ist es gar nicht da.
+   GEFUELLT, NICHT GETOENT (03.09.2026, Prueferbefund 1). Bis dahin stand die
+   Wartefarbe als SCHRIFT auf einem Hauch derselben Farbe; im hellen Thema trug
+   das 4,20:1 und lag damit unter der Hausschwelle. Jetzt traegt das Abzeichen
+   die Farbe als FLAECHE und darauf die Tinte, die main/thema.ts fuer genau
+   diese Flaeche rechnet (`tinteFuer`): gemessen 9,10:1 dunkel und 5,50:1 hell.
+   Es ist ausserdem das eine Element, das alice immer sehen will -- eine
+   gefuellte Marke unterscheidet sich auch auf einen Blick von der getoenten
+   Leiste darunter. */
+#freigabe-abzeichen {
+  display: inline-flex; align-items: center; gap: 6px; min-height: 0;
+  height: 24px; padding: 0 9px 0 8px; margin-right: 3px; border-radius: 12px;
+  background: var(--zustand-wartet); border: 1px solid var(--zustand-wartet);
+  color: var(--zustand-wartet-tinte); font-size: 11.5px; font-weight: 600;
+}
+#freigabe-abzeichen .zahl { font-variant-numeric: tabular-nums; }
+/* NICHTS OFFEN, ABER TROTZDEM DA (04.09.2026, Befund 2). Gedaempft und ohne
+   Zustandsfarbe: es meldet nichts, es ist nur der Weg zum Posteingang und zum
+   Verlauf. Die Warnmarke darin faellt weg -- ein Ausrufezeichen ohne Anlass
+   waere eine Falschmeldung. */
+#freigabe-abzeichen.leer {
+  background: var(--erhoben); border-color: var(--erhoben);
+  color: var(--gedaempft); font-weight: 500;
+}
+#freigabe-abzeichen.leer svg { display: none; }
+#freigabe-abzeichen[hidden] { display: none; }
+
+.knopf-schlicht {
+  width: 28px; height: 26px; display: grid; place-items: center;
+  border-radius: var(--r-klein); color: var(--gedaempft);
+}
+.knopf-schlicht:hover { background: var(--erhoben); color: var(--schrift); }
+.knopf-schlicht[aria-pressed='true'] { background: var(--akzent-matt); color: var(--akzent-text); }
+
+/* --- Freigabeleiste -------------------------------------------------------
+ * Quer ueber die volle Breite, und nur da, wenn wirklich etwas offen ist. Sie
+ * zeigt JEDE offene Freigabe im ganzen Programm, nicht nur die des gewaehlten
+ * Projekts: „Wartet etwas auf mich?" darf nicht davon abhaengen, welche
+ * Sitzung gerade gewaehlt ist.
+ */
+/* AUCH SIE IST EINE KARTE, mit der Wartefarbe als Flaeche statt eines
+   Trennstrichs darunter: der Strich war die letzte Linie, die quer durch das
+   Fenster lief. */
+#freigabeleiste {
+  flex: 0 0 auto; background: var(--wartet-matt);
+  border-radius: var(--r-karte); overflow: hidden;
+}
+#freigabeleiste:empty { display: none; }
+.fr-zeile { display: flex; align-items: center; gap: 10px; padding: 7px 12px 7px 14px; }
+/* Die Marke der Leiste bleibt eine gezeichnete Linie in der Wartefarbe -- sie
+   traegt keinen Text, und die Farbe steht auf dem getoenten Grund der Leiste.
+   Gemessen nach der Anhebung der Zustandsfarben (Prueferbefund 4): 6,74:1
+   dunkel und 4,55:1 hell, beide ueber der Hausschwelle und weit ueber den 3:1,
+   die WCAG fuer eine grafische Marke verlangt. */
+.fr-marke { color: var(--zustand-wartet); flex: 0 0 auto; }
+/* EINE ZEILE (05.09.2026, Regelbruch 8): Name, „wartet auf Dich", worum es
+   geht. Was nicht mehr passt, endet mit Auslassungspunkten, statt in eine
+   zweite Zeile zu brechen und das Fenster nach unten zu schieben. */
+.fr-text {
+  min-width: 0; flex: 1 1 auto; font-size: 12.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.fr-wer { font-weight: 600; }
+.fr-text .leise { font-weight: 400; color: var(--gedaempft); }
+.fr-knoepfe { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.knopf-voll {
+  padding: 4px 13px; border-radius: var(--r-klein);
+  background: var(--akzent); color: var(--akzent-tinte); font-size: 12px; font-weight: 500;
+}
+/* EINE KNOPFSPRACHE, ZWEI RAENGE (05.09.2026, Electron-Befund 10). Im Fenster
+   standen zwei Bauarten nebeneinander: gefuellte Pillen („Uebernehmen",
+   „Freigeben") und umrandete Kaesten („Ordner oeffnen", „Datei", „Ordnen",
+   „Ablehnen"). Der Rand ist die letzte Stelle, an der ein Kasten steht, wo
+   sonst Flaechen tragen. Jetzt ist jeder Knopf eine Pille: der erstrangige
+   gefuellt im Akzent (`knopf-voll`), der zweitrangige grau auf `--erhoben`.
+   Der Rang steht damit in der FLAECHE und nicht in einer Umrandung. */
+.knopf-rand {
+  padding: 4px 13px; border-radius: var(--r-klein);
+  background: var(--erhoben); color: var(--schrift); font-size: 12px; font-weight: 500;
+}
+.knopf-rand:hover { background: var(--linie); }
+.fr-blaettern { display: flex; align-items: center; gap: 2px; color: var(--gedaempft); font-size: 11px; flex: 0 0 auto; }
+.fr-blaettern button { width: 20px; height: 20px; display: grid; place-items: center; border-radius: 4px; }
+.fr-blaettern button:hover { background: var(--erhoben); color: var(--schrift); }
+.fr-zaehlung { font-variant-numeric: tabular-nums; padding: 0 3px; }
+.fr-mehr {
+  display: flex; align-items: center; gap: 4px; font-size: 11.5px;
+  color: var(--gedaempft); padding: 3px 6px; border-radius: var(--r-klein);
+}
+.fr-mehr:hover { background: var(--erhoben); }
+.fr-mehr .pfeil { transition: transform 0.12s ease; }
+.fr-mehr[aria-expanded='true'] .pfeil { transform: rotate(90deg); }
+/* Die Begruendung ist FREIWILLIG (Wort des Nutzers vom 03.09.: „ich will keinen
+   Grund angeben müssen"). Deshalb kein Feld, das dauerhaft danach aussieht,
+   als waere es Pflicht -- es klappt auf, wer eine hinterlassen will, und ein
+   Satz darunter sagt, dass die Entscheidung ohnehin sofort an den Worker
+   zurueckgeht. */
+.fr-begruendung { padding: 0 14px 10px 40px; }
+/* Auch dieses Feld ist eine Flaeche und kein Kasten (Electron-Befund 9). */
+.fr-begruendung input {
+  width: 100%; box-sizing: border-box; padding: 5px 8px; font: inherit; font-size: 12px;
+  background: var(--erhoben); border: 0; border-radius: var(--r-klein);
+  color: var(--schrift);
+}
+.fr-begruendung input:focus { outline: 2px solid var(--akzent); outline-offset: -2px; }
+.fr-hinweis { font-size: 11px; color: var(--gedaempft); margin-top: 4px; }
+
+/* --- Die drei Spalten -----------------------------------------------------
+ * Drei Karten nebeneinander, dazwischen die Fuge. Die beiden Ziehgriffe SIND
+ * die Fuge: sie sind genau so breit, zeigen den Fenstergrund und tragen keine
+ * Linie. Ein Griff, der eine Linie zeichnete, waere das Gitternetz an genau
+ * der Stelle, an der es abgeschafft wurde.
+ */
+#app { flex: 1 1 auto; display: flex; min-height: 0; }
+#griff, #griff-rechts { flex: 0 0 var(--fuge); cursor: col-resize; background: transparent; }
+/* Ueberfahren zeigt der Griff, dass er einer ist -- als aufgehellter Grund,
+   nicht als Strich. */
+#griff:hover, #griff-rechts:hover { background: var(--linie); }
+/* Ohne Inspektor faellt auch seine Fuge weg; sonst stuende rechts ein
+   doppelter Rand aus Fuge und Rahmenpolsterung. */
+#griff-rechts[hidden] { display: none; }
+
+/* --- Linke Leiste: Projekte, darunter NUR die Orchestrator ----------------
+ * Vorgabe des Nutzers vom 03.09.: „ich würde die Kinder, also die Worker, da
+ * nicht anzeigen, da das sonst viel zu voll werden würde." Ein Projekt kann
+ * mehrere Orchestrator haben, auf verschiedenen Maschinen; jede Zeile traegt
+ * ihren Zustand und ihre Maschine. Worker erscheinen hier nicht -- sie stehen
+ * in der Tab-Leiste, in den Kacheln und in der Uebersicht.
+ */
+#links {
+  flex: 0 0 auto; display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+  background: var(--leiste); border-radius: var(--r-karte);
+}
+/* DIESELBE OBERKANTE WIE DIE REITER DES INSPEKTORS. Die zwoelf Bildpunkte
+   stehen als AUSSENABSTAND und nicht als Polsterung: `obenLinks` und
+   `obenRechts` messen die Oberkante des ersten Elements je Leiste, und mit
+   Polsterung faengt die linke zwoelf Punkte hoeher an als die rechte. Die
+   Zusage „beide Leisten beginnen buendig" haengt an dieser einen Zeile
+   (test-app-oberflaeche.sh). */
+.leiste-kopf {
+  flex: 0 0 auto; display: flex; align-items: center; height: 26px;
+  margin: 12px 12px 6px; padding: 0; font-size: 11.5px; font-weight: 600; color: var(--gedaempft);
+}
+.leiste-kopf .titel { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#neue-session {
+  margin-left: auto; width: 24px; height: 24px; display: grid; place-items: center;
+  border-radius: var(--r-klein); color: var(--gedaempft); flex: 0 0 auto;
+}
+#neue-session:hover { background: var(--erhoben); color: var(--schrift); }
+#neue-session .beschriftung { display: none; }
+#sessions { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; padding: 0 0 12px; }
+/* Dieselbe Aussage wie auf der Buehne, nur fuer die Leiste: solange der Baum
+   keine Sitzung kennt, steht hier eine ruhige Zeile statt einer leeren Spalte.
+   In der eingeklappten Leiste faellt sie weg -- dort ist fuer einen Satz kein
+   Platz, und der Punkt allein waere keine Auskunft. */
+.baum-leer { padding: 12px; color: var(--gedaempft); font-size: 11.5px; line-height: 1.5; }
+#links.schmal .baum-leer { display: none; }
+
+/* EINE ZEILE IST EINE FLAECHE, KEIN EINTRAG IN EINER LISTE MIT LINIEN. 32
+   Bildpunkte hoch (Projekt) oder 44 (Sitzung), acht seitlich, acht Bildpunkte Eckenradius -- gewaehlt oder
+   ueberfahren wird sie gefuellt, nie umrandet. Die Karte gibt links und rechts
+   sechs Bildpunkte ab, damit die gefuellte Flaeche nicht an ihrer Kante klebt. */
+.projekt { margin: 0 6px 1px; }
+.projekt-zeile {
+  display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box;
+  height: var(--projektzeile); padding: 0 8px; border-radius: var(--r-mittel); text-align: left;
+}
+.projekt-zeile:hover { background: var(--erhoben); }
+/* Das Symbol der Zeile: ein gezeichneter Umriss, 16 Bildpunkte, gedaempft --
+   im aufgeklappten Projekt im Akzent, weil dort etwas offen steht. */
+.zeilensymbol { flex: 0 0 auto; color: var(--gedaempft); display: flex; }
+.projekt:not(.zu) .projekt-zeile .zeilensymbol { color: var(--akzent-text); }
+.projekt-zeile .name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.projekt-zeile .anzahl { margin-left: auto; font-size: 11.5px; color: var(--gedaempft); font-variant-numeric: tabular-nums; }
+/* Ein Projekt, in dem irgendwo etwas wartet, sagt es auch zugeklappt. */
+.projekt-zeile .merker { width: 7px; height: 7px; border-radius: 50%; background: var(--zustand-wartet); flex: 0 0 auto; }
+/* OFFEN ZEIGT NACH UNTEN (05.09.2026, Electron-Befund 4). Der gezeichnete
+   Winkel zeigt nach rechts, und das ist der Zustand ZU -- so macht es jede
+   Disclosure auf einem Mac. Offen wird er eine Vierteldrehung weitergedreht
+   und zeigt auf das, was er aufgeklappt hat. Vorher war es umgekehrt: offen
+   zeigte nach rechts, zu nach oben. */
+.pfeil { color: var(--gedaempft); transition: transform 0.12s ease; flex: 0 0 auto; }
+.projekt-zeile .pfeil { transform: rotate(90deg); }
+.projekt.zu .projekt-zeile .pfeil { transform: none; }
+.projekt.zu .orchestratoren { display: none; }
+
+/* Die Zeile eines Orchestrators. `.eintrag` und `data-id` bleiben: der
+   Steuerkanal liest die Leiste darueber (`awb-ctl ui`), und eine Umbenennung
+   dieser beiden Namen haette nur den Bericht gebrochen, nicht die Gestalt
+   verbessert. */
+.orch-zeile {
+  display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box;
+  height: var(--zeilenhoehe); padding: 0 8px 0 22px; border-radius: var(--r-mittel);
+  text-align: left; cursor: pointer;
+}
+.orch-zeile:hover { background: var(--erhoben); }
+/* DIE GEWAEHLTE ZEILE IST EINE GEFUELLTE FLAECHE ueber die volle Zeilenbreite,
+   kein Rahmen: ein Rahmen um eine Zeile ist die Bauart, an der die alte
+   Oberflaeche zu erkennen war. */
+.orch-zeile.gewaehlt { background: var(--akzent-matt); }
+.orch-zeile.gewaehlt .name { color: var(--akzent-text); font-weight: 600; }
+.orch-zeile.gewaehlt .zeilensymbol { color: var(--akzent-text); }
+.orch-zeile .name { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* NAME UND ZUSATZZEILE UNTEREINANDER (04.09.2026, Befund 8). 44 Bildpunkte
+   sind der Platz, den zwei Zeilen Schrift brauchen; seit dem 05.09.2026 ist
+   das die Hoehe JEDER Sitzungszeile (`--zeilenhoehe`), auch ohne Zusatz --
+   Entscheidung des Nutzers „44 px, wie gebaut". */
+.zeilenleib { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; justify-content: center; }
+.orch-zeile.zweizeilig { height: var(--zeilenhoehe); }
+.orch-zeile .zusatz {
+  font-size: 11.5px; color: var(--gedaempft);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* Ein gescheiterter Start ist eine AUFFORDERUNG und darf nicht aussehen wie
+   ein sauberes Ende (Befund 9): seine Zusatzzeile traegt die Fehlerfarbe, eine
+   verlorene Sitzung die Wartefarbe. Die Form der Zeile bleibt gleich -- was
+   sich unterscheidet, ist das, was sie sagt. */
+.orch-zeile.startfehler .zusatz { color: var(--zustand-tot); }
+.orch-zeile.verloren .zusatz { color: var(--zustand-wartet); }
+
+/* DAS KUERZEL (Befund 7). Zwei Buchstaben in der Zustandsfarbe, sichtbar NUR
+   in der eingeklappten Leiste: aufgezogen steht der Name da, und dann waeren
+   sie dieselbe Auskunft zweimal. Ohne sie blieb schmal von drei laufenden
+   Sitzungen dreimal derselbe Punkt. */
+.orch-zeile .kuerzel {
+  display: none; flex: 0 0 auto; font-size: 10.5px; font-weight: 600;
+  letter-spacing: 0.2px; font-variant-numeric: tabular-nums;
+}
+.orch-zeile .kuerzel.laeuft { color: var(--zustand-laeuft); }
+.orch-zeile .kuerzel.will { color: var(--zustand-wartet); }
+.orch-zeile .kuerzel.fern { color: var(--zustand-fern); }
+.orch-zeile .kuerzel.aus { color: var(--zustand-tot); }
+.orch-zeile .kuerzel.ruhig { color: var(--gedaempft); }
+/* Auch der Maschinenname steht in Systemschrift: ein Rechnername ist weder
+   Pfad noch Code noch Modellkennung. */
+.orch-zeile .maschine {
+  margin-left: auto; flex: 0 0 auto; font-size: 11.5px; color: var(--gedaempft);
+}
+.orch-zeile.zieht, .projekt-zeile.zieht { opacity: 0.4; }
+/* Die Rueckfrage vor dem Wiederbeleben steht unter GENAU der Zeile, zu der sie
+   gehoert, und geht mit ihrer Antwort wieder zu. Kein Systemdialog: der haelt
+   das ganze Fenster an und sieht in einer Oberflaeche, die sonst keinen
+   benutzt, fremd aus. */
+.orch-eintrag { display: block; }
+.wieder-frage {
+  margin: 2px 6px 6px 22px; padding: 10px 12px;
+  background: var(--erhoben); border-radius: var(--r-mittel);
+  font-size: 11.5px; line-height: 1.5;
+}
+.wieder-titel { font-weight: 600; margin-bottom: 4px; }
+.wieder-zeile { display: flex; gap: 8px; }
+.wieder-was { flex: 0 0 auto; color: var(--gedaempft); }
+.wieder-wert { min-width: 0; overflow-wrap: anywhere; }
+/* Pfad und Modellkennung bleiben in Festbreite -- fuer beides ist sie erlaubt. */
+.wieder-wert.fest { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+.wieder-satz { color: var(--gedaempft); margin-top: 4px; }
+.wieder-knoepfe { display: flex; gap: 6px; margin-top: 8px; }
+/* DIE ZIELMARKE. Sie erscheint nur dort, wo der laufende Zug wirklich
+   angenommen wird: eine Sitzung auf einem fremden Projekt bekommt sie gar
+   nicht zu sehen (renderer.ts, `ziehbarGrundform`). */
+.orch-zeile.ziel, .projekt-zeile.ziel { box-shadow: inset 0 2px 0 var(--akzent); }
+/* Eine Sitzung, die STARTET, ist nicht dasselbe wie eine beendete: ihr Punkt
+   traegt die Wartefarbe, und ein Klick auf die Zeile wartet mit ihr. */
+.orch-zeile .wieder {
+  flex: 0 0 auto; width: 20px; height: 18px; display: grid; place-items: center;
+  border-radius: 4px; color: var(--gedaempft);
+}
+.orch-zeile .wieder:hover { color: var(--schrift); background: var(--erhoben); }
+/* Eine Chat-Sitzung steht in DERSELBEN Liste (alice am 12.08.), sie traegt
+   nur ihr Kennzeichen -- seit dem 04.09. als dasselbe 16-Punkt-Symbol wie jede
+   andere Zeile, nur mit anderer Zeichnung. Laeuft sie, faerbt es sich. */
+.orch-zeile.chat.laeuft .zeilensymbol { color: var(--zustand-laeuft); }
+
+/* Eingeklappt bleibt von jeder Zeile ihr Punkt. Ein Baum ohne Namen ist keine
+   Auskunft mehr, aber die Farbe und die Form sagen weiter, ob etwas wartet --
+   und genau dafuer klappt man ihn ein. */
+#links.schmal { align-items: stretch; }
+#links.schmal .leiste-kopf { justify-content: center; margin: 12px 0 6px; }
+#links.schmal .leiste-kopf .titel { display: none; }
+#links.schmal #neue-session { margin: 0 auto; }
+#links.schmal .projekt-zeile .name,
+#links.schmal .projekt-zeile .anzahl,
+#links.schmal .orch-zeile .name,
+#links.schmal .orch-zeile .maschine { display: none; }
+/* DER NEUSTART-KNOPF FAELLT MIT DEN NAMEN WEG (05.09.2026, Regelbruch 3).
+   Er wurde bei Kuerzelbreite mitgezeichnet, und weil die Zeile ihre drei
+   Kinder mittig setzt, schob er Punkt und Kuerzel nach links aus der Karte
+   hinaus -- der Zustandspunkt einer gestoppten Sitzung lag ausserhalb, vom
+   Kuerzel stand nur die zweite Haelfte da. Eingeklappt bleiben Punkt und
+   Kuerzel; wer wiederbeleben will, klappt auf, und dort steht der Knopf
+   unveraendert. */
+#links.schmal .orch-zeile .wieder { display: none; }
+#links.schmal .projekt-zeile,
+#links.schmal .orch-zeile { justify-content: center; padding: 0; gap: 4px; height: 26px; }
+/* Eingeklappt bleiben PUNKT und KUERZEL. Das Symbol sagt dort dasselbe wie in
+   jeder anderen Zeile und faellt mit den Namen weg; die zwei Buchstaben sagen
+   als einzige, WELCHE Sitzung die Zeile ist (Befund 7). */
+#links.schmal .pfeil, #links.schmal .zeilensymbol { display: none; }
+#links.schmal .orch-zeile .kuerzel { display: block; }
+#links.schmal .orch-zeile.zweizeilig { height: 26px; }
+
+/* --- Mitte: Tab-Leiste ueber der Pane-Flaeche -----------------------------
+ * Der Ort der Worker-Tabs, und zugleich der Wechsel zwischen den drei
+ * Ansichten. Waagerecht ueber den Kacheln steht das Etikett dort, wo das
+ * Etikettierte liegt; ein Klick auf einen Tabkopf landet in „Gekachelt" auf
+ * diesem Tab.
+ */
+#mitte {
+  flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  background: var(--grund); border-radius: var(--r-karte); overflow: hidden;
+}
+
+/* --- Der Inhaltskopf ------------------------------------------------------
+ * Das Stueck, das bis zum 04.09.2026 fehlte. Oben in der Inhaltskarte, ueber
+ * dem Tab-Streifen: links steht, WORAN man arbeitet -- der Sitzungsname in 17
+ * Punkt halbfett, darunter in 11,5 Punkt gedaempft Harness, Modell und Ordner.
+ * Rechts steht, WAS gerade laeuft und WAS die Flaeche zeigt: die Statuspille
+ * mit der Zahl laufender Worker, der Umschalter zwischen Orchestrator und
+ * Worker, das Zahnrad dieser Sitzung.
+ *
+ * Die Hierarchie ist die des Vorbilds (Name gross, Herkunft klein darunter);
+ * die Angaben sind unsere. Zwoelf Bildpunkte Innenabstand wie in jeder Karte.
+ */
+/* DER NAME GEWINNT (05.09.2026, Kleinigkeit 3). Bei schmalem Fenster und
+   offenem Inspektor stand dort „claude-…", waehrend Pille, Umschalter und
+   Zahnrad daneben ihre volle Breite behielten -- die Auskunft wich den
+   Bedienelementen. Der Name bekommt jetzt eine Untergrenze von 180
+   Bildpunkten (gemessen: „claude-workbench" braucht bei 17 Punkt halbfett 152,
+   die Unterzeile darunter mehr), und was danach nicht mehr in die Zeile passt,
+   RUTSCHT in die naechste, statt den Namen zu stauchen. Kein Wort wird
+   abgeschnitten, keines faellt weg. */
+#inhaltskopf {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  min-height: var(--kopfhoehe); box-sizing: border-box; padding: 8px 12px;
+}
+#inhaltskopf.leer { display: none; }
+/* LIEGT EIN GESPRAECH AUF DER BUEHNE, gibt es weder einen Orchestrator-Pane
+   noch Worker-Tabs (Befund 6): der Umschalter und das Zahnrad haetten nichts
+   zu schalten und stehen deshalb nicht da. Name, Ordner und die Zahl ihrer
+   Worker bleiben -- das ist die Auskunft, die auch fuer sie gilt. */
+#inhaltskopf.gespraech #ik-modus,
+#inhaltskopf.gespraech #ik-zahnrad { display: none; }
+/* `flex-basis: 180px`, nicht `auto` -- sonst zaehlt beim Umbruch die INHALTS-
+   breite mit, und die ist die des Pfades in der Unterzeile: die Zeile braeche
+   dann in jedem Fenster um, auch im breitesten. Mit fester Grundbreite bricht
+   sie genau dann, wenn 180 plus die Bedienelemente wirklich nicht mehr
+   nebeneinander passen. */
+#ik-links { min-width: 180px; flex: 1 1 180px; display: flex; flex-direction: column; gap: 1px; }
+/* 17 Punkt halbfett -- die groesste Schrift des Fensters und die einzige
+   ueber 13. Sie beantwortet die Frage, an der jeder Blick anfaengt. */
+#ik-name {
+  font-size: 17px; font-weight: 600; letter-spacing: -0.2px; line-height: 1.2;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* Harness, Modellkennung und Ordner. Festbreite ist fuer alle drei erlaubt
+   und hier richtig: es sind Kennungen, keine Woerter. */
+#ik-herkunft {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px; color: var(--gedaempft); line-height: 1.3;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#ik-rechts { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; margin-left: auto; }
+
+/* DIE STATUSPILLE. Eine Pille, kein Kasten: Punkt links, 24 Bildpunkte hoch,
+   voller Rundungsradius, `--erhoben` als Flaeche, kein Rahmen. Bei null
+   laufenden Workern bleibt sie gedaempft, ab einem traegt ihr Punkt die
+   Zustandsfarbe -- genau das „0 working", das alice im Vorbild
+   unterstrichen hat. */
+.statuspille {
+  display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
+  height: 24px; padding: 0 10px; border-radius: 12px;
+  background: var(--erhoben); color: var(--gedaempft);
+  font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.statuspille.aktiv { color: var(--schrift); }
+/* Die Pille ist ein KNOPF (Befund 11): sie klappt die Worker-Liste auf. Sie
+   sieht deshalb anfassbar aus, ohne einen Rahmen zu bekommen. */
+button.statuspille { cursor: pointer; }
+button.statuspille:hover { color: var(--schrift); }
+button.statuspille[aria-expanded='true'] { background: var(--akzent-matt); color: var(--akzent-text); }
+
+/* DIE WORKER-LISTE hinter der Pille. Ein Blatt ueber der Flaeche, an derselben
+   Stelle wie die Sitzungskarte und mit derselben Gestalt -- sie kostet die
+   Buehne nichts, anders als die Uebersicht. */
+#workerliste {
+  position: absolute; right: 12px; top: 8px; z-index: 8;
+  display: none; width: min(380px, calc(100% - 24px)); max-height: calc(100% - 24px);
+  overflow-y: auto; padding: 6px 0;
+  background: var(--leiste); border-radius: var(--r-karte); color: var(--schrift);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--tinte) 22%, transparent);
+}
+#workerliste.sichtbar { display: block; }
+.wl-leer { color: var(--gedaempft); padding: 8px 12px; font-size: 12.5px; }
+
+/* Das Zahnrad dieser Sitzung. Dieselbe Groesse wie jedes andere Symbol im
+   Kopf; es oeffnet die Ueberlagerung darunter, nicht das Einstellungsfenster. */
+#ik-zahnrad {
+  width: 26px; height: 26px; display: grid; place-items: center; flex: 0 0 auto;
+  border-radius: var(--r-mittel); color: var(--gedaempft);
+}
+#ik-zahnrad:hover { background: var(--erhoben); color: var(--schrift); }
+#ik-zahnrad[aria-expanded='true'] { background: var(--akzent-matt); color: var(--akzent-text); }
+
+#tabstreifen {
+  flex: 0 0 auto; display: flex; align-items: stretch; gap: 6px;
+  height: var(--streifenhoehe); padding: 0 12px;
+  background: transparent;
+}
+/* Liegt kein Worker-Pane auf der Buehne, gibt es nichts zu kacheln: weder Tabs
+   noch Ansichtsschalter stehen dann da, und der Kopf ist eine Zeile hoch --
+   dieselbe Hoehe in jeder Sitzung (Vorgabe des Nutzers vom 04.09., nachgezogen
+   am 05.09.). */
+#tabstreifen[hidden] { display: none; }
+/* WAAGERECHTES ROLLEN MIT RANDVERLAUF, kein Ueberlaufmenue (Messung 03.09. bei
+   1100 Bildpunkten: sechs Tabs brauchen 470 Bildpunkte, der Streifen hat dort
+   nach Leiste, Inspektor und Schalter 300 -- es rollt also wirklich). Der
+   Verlauf an der rechten Kante ist die einzige im Programm und keine Zierde:
+   ohne ihn endet der Streifen mit einem hart abgeschnittenen Tab, und dass es
+   weitergeht, sieht man erst beim Rollen. Ein Ueberlaufmenue haette dieselbe
+   Auskunft hinter einem Klick versteckt und ausserdem eine zweite Stelle
+   gebraucht, an der Tabs stehen. */
+#tabs {
+  display: flex; align-items: stretch; gap: 2px; min-width: 0;
+  overflow-x: auto; scrollbar-width: none;
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 18px), transparent 100%);
+}
+#tabs.ganz { mask-image: none; }
+#tabs::-webkit-scrollbar { display: none; }
+/* Ein Tab ist eine Pille, kein Kasten. Der gewaehlte ist eine gefuellte
+   Flaeche; der Innenrand, der ihn bis zum 03.09. umgab, faellt weg -- er war
+   die letzte Linie in diesem Streifen. */
+.tab {
+  display: flex; align-items: center; gap: 6px;
+  padding: 0 10px; margin: 4px 0 4px; border-radius: var(--r-mittel);
+  font-size: 11.5px; color: var(--gedaempft); white-space: nowrap;
+}
+.tab:hover { background: var(--erhoben); }
+.tab.gewaehlt { background: var(--erhoben); color: var(--schrift); font-weight: 500; }
+.tab .anzahl {
+  font-size: 11.5px; color: var(--gedaempft); font-variant-numeric: tabular-nums;
+}
+.streifen-rechts { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+/* DIE SEGMENTGRUPPE: 26 Bildpunkte hoch, acht Bildpunkte Radius, das
+   gewaehlte Segment als gefuellte Flaeche. Kein Rahmen -- die vertiefte Bahn
+   (`--erhoben` auf der Karte) traegt die Form allein, so wie auf dem Mac.
+   Der ANSICHTS-Schalter fuellt neutral, der MODUS-Schalter im Inhaltskopf im
+   Akzent: es gibt genau eine Wahl im Fenster, die entscheidet, was die Flaeche
+   zeigt, und nur die traegt die Akzentfarbe (Regel 8: ein Akzent, sparsam). */
+.segment {
+  display: flex; gap: 2px; padding: 2px; box-sizing: border-box; height: 26px;
+  background: var(--erhoben); border-radius: var(--r-mittel);
+}
+.segment button {
+  display: flex; align-items: center; padding: 0 10px; border-radius: 6px;
+  font-size: 11.5px; color: var(--gedaempft); white-space: nowrap;
+}
+.segment button.gewaehlt { background: var(--grund); color: var(--schrift); font-weight: 500; }
+/* Der Umschalter, der bestimmt, was die Flaeche zeigt. */
+.segment.wahl-akzent button.gewaehlt { background: var(--akzent); color: var(--akzent-tinte); }
+/* OHNE SITZUNG SCHALTET ER NICHTS (03.09.2026). Er bleibt stehen -- er gehoert
+   zur Gestalt des Streifens --, sagt aber, dass er gerade nichts kann: matter
+   und ohne Zeigefinger am Mauszeiger. Keiner der drei traegt dann `gewaehlt`. */
+.segment.aus { opacity: 0.45; }
+.segment button:disabled { cursor: default; }
+#ordnen {
+  display: flex; align-items: center; height: 26px; padding: 0 10px;
+  border-radius: var(--r-mittel); background: var(--erhoben);
+  font-size: 11.5px; color: var(--gedaempft); white-space: nowrap;
+}
+#ordnen:hover { color: var(--schrift); }
+#ordnen[hidden] { display: none; }
+
+/* --- Die Pane-Flaeche ----------------------------------------------------
+ * Von hier bis zur Statusleiste steht GEMESSENES Verhalten: die Kacheln
+ * fuellen die Flaeche, tmux bekommt dieselben Zahlen, die Namensschilder
+ * bleiben oben rechts. Die Begruendungen sind unveraendert uebernommen -- wer
+ * eine dieser Zahlen aendert, aendert Verhalten und muss messen
+ * (test-app-tab-kachel.sh, test-app-groessensprung.sh).
+ */
+/* Die Buehne ist der Boden der Inhaltskarte. Sie traegt den FENSTERGRUND und
+   nicht den Kartengrund: auf ihr liegen die Kacheln als eigene Karten, und was
+   zwischen ihnen durchblitzt, ist dieselbe Fuge wie ueberall im Fenster. */
+#buehne { flex: 1 1 auto; position: relative; overflow: hidden; background: var(--fenster); }
+/* Das Mass-Terminal misst nur die Zellgroesse und wird nicht gezeigt. */
+#pane { position: absolute; inset: 0; visibility: hidden; pointer-events: none; }
+/* Das Gitter: ein Kasten je Pane, gesetzt nach der Aufteilung von tmux. */
+#gitter { position: absolute; inset: 0; }
+/* Die Chat-Sitzung liegt UEBER dem Gitter, nicht an seiner Stelle: sie hat
+   keinen Pane und keine tmux-Zellen, die Kachelrechnung darunter bleibt
+   unangetastet. z-index 7 -- ueber dem Gitter samt Pane-Namen (2), der
+   Lese-Ansicht eines Panes (5) und der Uebersicht (6), unter der
+   Namensabfrage (8). */
+#chatbuehne { position: absolute; inset: 0; z-index: 7; display: none; background: var(--grund); }
+#chatbuehne.an { display: block; }
+
+/* Die Kachel liegt eine Stufe UEBER der Flaeche, so wie jede andere Karte im
+   Fenster -- sonst ist nicht zu sehen, wo ein Pane aufhoert, und drei Panes
+   nebeneinander lesen sich als ein einziges dunkles Feld. Derselbe Ton geht an
+   das Terminal darin (paneflaeche.ts, `terminalFarben`), damit der Rand um den
+   gezeichneten Bereich nicht heraussticht. */
+.panekasten {
+  position: absolute; overflow: hidden;
+  /* Eine Spalte: oben die Kopfzeile, darunter das Terminal. Die Reihenfolge im
+     Baum ist die Reihenfolge auf dem Schirm (paneflaeche.ts baut die Zeile vor
+     `t.open`). */
+  display: flex; flex-direction: column;
+  background: var(--erhoben);
+  /* EINE KACHEL IST EINE KARTE (04.09.2026). Bis dahin stiessen die Kacheln
+     aneinander und wurden durch eine Haarlinie in `--gedaempft` getrennt --
+     das Gitternetz, gegen das der Auftrag steht. Jetzt liegen vier Bildpunkte
+     Fuge dazwischen (FUGE in paneflaeche.ts), die Kachel bekommt denselben
+     Eckenradius wie jede andere Karte, und der Fenstergrund der Buehne blitzt
+     dazwischen durch. Kein Rand, kein Schatten: die Flaeche traegt allein. */
+  border-radius: var(--r-karte);
+}
+/* KEINE Bildlaufleiste. Sie lag ueber der letzten Spalte statt neben ihr, und
+   das letzte Zeichen einer vollen Zeile stand danach halb unter dem Rand
+   (gemessen an 178 Zeichen auf 1393 Bildpunkten). Gerollt wird mit dem Rad.
+   `display: none` statt Breite 0: xterm rechnet seine Leistenbreite aus der
+   Differenz von Ansichts- und Rollflaeche und setzt bei 0 seine Vorgabe von
+   15 Bildpunkten ein. */
+.panekasten .xterm-viewport::-webkit-scrollbar { display: none; }
+/* Der Pane, der die Tastatur hat, traegt als einziger einen Ring -- in der
+   Akzentfarbe. Das ist kein Gitternetz, sondern der Fokus. */
+/* DER AKTIVE PANE OHNE RAHMEN (05.09.2026, Electron-Befund 11). Hier lag ein
+   ein Bildpunkt starker Ring in (0,112,235) rundherum, ZUSAETZLICH zur
+   getoenten Kopfzeile -- zwei Aussagen fuer dieselbe Sache, und die eine war
+   die einzige harte Linie auf der Buehne. Die Kopfzeile allein traegt den
+   Fokus jetzt nicht mehr nur als Hauch: sie steht im vollen Akzent-Matt, und
+   der ganze Kasten liegt auf einer helleren Flaeche als seine Nachbarn.
+   Gemessen wird der Unterschied in beiden Themen (siehe Ergebnisdatei). */
+.panekasten.aktiv { background: var(--erhoben); }
+/* DIE KOPFZEILE EINER KACHEL (03.09.2026, Prueferbefund 7). Sie ersetzt das
+   schwebende Namensschild, das bis dahin in der Ecke ueber dem Terminal lag und
+   Zellen zudeckte. Der Entwurf zeigt genau diese Zeile, und sie ist zugleich
+   die Antwort auf den Punkt, an dem alice das alte Token-Menue haesslich
+   fand: Modell und Tokenstand stehen dort, wo der Worker steht.
+   22 Bildpunkte hoch, fest -- die Begruendung fuer die Zahl steht bei
+   `KOPFHOEHE` in paneflaeche.ts, wo auch der Abzug in der Kachelrechnung
+   gerechnet wird. */
+.panekopf {
+  /* Die 22 Bildpunkte sind die GANZE Zeile, Trennlinie eingerechnet: dieselbe
+     Zahl zieht `KOPFHOEHE` in paneflaeche.ts von der Kachel ab. Ohne
+     `border-box` waere die gezeichnete Zeile 23 Bildpunkte hoch und naehme dem
+     Terminal einen, den die Rechnung ihm gelassen hat (gemessen 03.09.). */
+  box-sizing: border-box;
+  /* EIGENE STAPELEBENE, sonst fehlt die Zeile auf dem Selbstfoto. GEMESSEN am
+     03.09. in test-app-oberflaeche.sh: der Baum hatte die Zeile (berechnete
+     Angaben flex | visible | rgb(0,112,235) | 22px), das aufgenommene Bild
+     nicht -- die Kachelflaeche war zu 99,7 % einfarbig. Als gewoehnliches
+     Flex-Kind neben der Zeichenflaeche von xterm landete sie in deren Ebene
+     und fiel bei der Aufnahme heraus; die absolut liegenden Geschwister
+     (Chat-Griff, frueher das schwebende Namensschild) waren immer da. Mit
+     eigener Ebene wird sie zuverlaessig mit aufgenommen. */
+  position: relative; z-index: 2;
+  flex: 0 0 22px; display: flex; align-items: center; gap: 7px;
+  padding: 0 4px 0 10px; min-width: 0; overflow: hidden;
+  /* KEINE TRENNLINIE (05.09.2026). Unter der Zeile beginnt das Terminal mit
+     seinem eigenen, deutlich dunkleren Grund -- die Flaeche trennt schon, und
+     eine Linie darueber waere dieselbe Zierde, die im uebrigen Fenster gefallen
+     ist. Die 22 Bildpunkte bleiben unveraendert (`box-sizing: border-box`). */
+  background: var(--leiste);
+  font-size: 11.5px; color: var(--schrift);
+}
+.panekopf .pk-name { font-weight: 600; white-space: nowrap; }
+/* Modellkennung und Tokenstand in Festbreite -- fuer beides ist sie erlaubt. */
+.panekopf .pk-modell,
+.panekopf .pk-tokens {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px; color: var(--gedaempft); white-space: nowrap;
+}
+.panekopf .pk-tokens { margin-left: auto; font-variant-numeric: tabular-nums; }
+/* Wird es eng, weicht zuerst das Modell. Der Name weicht zuletzt und dann auf
+   sein Kuerzel -- abgeschnitten wird nie. */
+.panekopf.ohne-modell .pk-modell { display: none; }
+/* DIE ZWEI KNOEPFE DER KOPFZEILE -- Zoom und Gespraech. Der Gespraechs-Knopf
+   lag bis zum 04.09.2026 als beschrifteter Knopf „Gespräch zeigen" unten
+   rechts ueber dem Terminal; bei drei Kacheln standen drei davon gleichzeitig
+   im Bild. Er gehoert dorthin, wo schon alles steht, was diesem einen Pane
+   gehoert. Die Klasse `chat-griff` bleibt: der Steuerkanal spricht ihn ueber
+   genau diesen Waehler an. */
+.panekopf .pk-zoom, .panekopf .chat-griff {
+  flex: 0 0 auto; width: 20px; height: 18px; display: grid; place-items: center;
+  border: 0; background: none; padding: 0; cursor: pointer;
+  border-radius: 4px; color: var(--gedaempft);
+}
+.panekopf .pk-zoom:hover, .panekopf .chat-griff:hover { background: var(--erhoben); color: var(--schrift); }
+/* DER PANE MIT DER TASTATUR -- GETOENT, nicht gefuellt (04.09.2026). Bis dahin
+   faerbte sich die ganze Kopfzeile in der vollen Akzentfarbe; auf dem
+   Belegbild war das der lauteste Streifen im Fenster, und der Akzent soll
+   sparsam bleiben (Regel 8). Jetzt traegt sie denselben Hauch, den auch die
+   gewaehlte Zeile im Baum traegt -- eine Aussage, eine Farbe, an beiden Orten
+   dieselbe --, und der Name darauf steht im Akzent. */
+.panekopf.aktiv { background: var(--akzent-matt); }
+/* DER NAME DES AKTIVEN PANES STEHT AUF EINER GEFUELLTEN PILLE (05.09.2026,
+   Electron-Befund 11).
+ *
+ * Der harte Rahmen rundherum ist weg -- er war die einzige gezogene Linie auf
+ * der Buehne. Die getoente Kopfzeile allein traegt den Fokus aber NICHT: das
+ * ist gemessen und nicht geschaetzt. Getoent gegen ungetoent sind (26,47,72)
+ * gegen (23,26,32) im dunklen und (201,220,241) gegen (244,245,247) im hellen
+ * Thema, beide Male 1,28:1; und die beiden Namensfarben unterscheiden sich nur
+ * im Farbton, nicht in der Helligkeit (1,16:1 dunkel, 1,06:1 hell). Wer Farben
+ * schlecht unterscheidet, saehe bei vier offenen Kacheln viermal dasselbe.
+ * Eine kraeftigere Toenung half nicht: selbst eine Mischung aus 50 Prozent
+ * Akzent kommt nur auf 2,11:1 -- ueber 3 kaeme erst die volle Fuellung der
+ * ganzen Zeile, und die war am 04.09. als lautester Streifen des Fensters
+ * ausdruecklich verworfen.
+ *
+ * Gefuellt wird deshalb nur der NAME, als Pille -- dieselbe Sprache wie das
+ * gewaehlte Segment und das Freigabe-Abzeichen. Am gezeichneten Fenster
+ * gemessen: die Pille (0,112,235) gegen die Flaeche einer UNGEWAEHLTEN
+ * Kopfzeile traegt 3,75:1 im dunklen und 4,26:1 im hellen Thema, beide ueber
+ * den 3:1, die fuer eine bedeutungstragende Marke gelten. Sie ist dabei ein
+ * Wort breit und nicht zweiundzwanzig Bildpunkte hoch. */
+.panekopf.aktiv .pk-name {
+  background: var(--akzent); color: var(--akzent-tinte);
+  border-radius: 999px; padding: 1px 8px; margin-left: -2px;
+}
+/* Ein angeforderter Pane, den es nicht gibt. Er behaelt seinen Platz im
+   Gitter und sagt, warum er leer ist -- ein Worker, der ohne ein Wort
+   verschwindet, ist schlimmer als einer, der schlecht sitzt. */
+.panefehlt {
+  position: absolute; overflow: hidden; display: flex;
+  align-items: center; justify-content: center; text-align: center;
+  padding: 0 12px; font-size: 13px; color: var(--gedaempft);
+  background: var(--erhoben); border-radius: var(--r-karte);
+}
+
+/* --- Die Uebersicht ------------------------------------------------------
+ * Die Antwort auf „man will ja auch mal nur die Worker-Tabs sehen" (alice
+ * am 03.09.). Je Tab eine Karte mit den Workern darin: Zustand, Name, Modell,
+ * Tokenstand und woran der Worker gerade ist. Kein Terminalbild -- bei neun
+ * Panes sieht man dort neunmal denselben Text und muss trotzdem lesen.
+ */
+/* z-index 6: ueber dem Gitter samt Namensschildern (2), ueber dem Griff der
+   Pane-Chat-Ansicht (4) und ihrer Flaeche (5, chat/ansicht.css). Bei 3 blieben
+   die Griffe der Panes darunter sichtbar und standen mitten in der Uebersicht
+   -- gemessen am Belegbild vom 03.09. Unter der Chat-Buehne (7) und der
+   Namensabfrage (8) bleibt sie: was eine Rueckfrage verdeckt, verschluckt sie. */
+/* DIE LEERE BUEHNE SAGT, WAS ZU TUN IST (03.09.2026, dritter Durchgang). Ohne
+   Sitzung stand hier eine schwarze Flaeche ohne ein Wort; der erste Blick auf
+   ein frisches Programm gab keinen Anhalt. Eine Zeile, mittig, in der
+   gedaempften Schrift und ohne Kasten -- sie fuehrt den Blick und stellt sich
+   nicht als Meldung hin, die man wegklicken muesste. z-index 1: ueber dem
+   leeren Gitter, unter allem, was sich davorlegt (Uebersicht 6, Chat 7,
+   Namensabfrage 8). */
+#leer {
+  position: absolute; inset: 0; z-index: 1;
+  display: none; place-items: center; padding: 0 24px;
+  text-align: center; color: var(--gedaempft); font-size: 12.5px;
+}
+#leer.an { display: grid; }
+
+#uebersicht {
+  position: absolute; inset: 0; z-index: 6; overflow: auto;
+  display: none; padding: 12px; background: var(--grund);
+}
+#uebersicht.an { display: grid; gap: var(--fuge); grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); align-content: start; }
+/* Auch hier: Karte statt Kasten. Der Rahmen faellt weg, die Flaeche traegt.
+   DIE GEWAEHLTE KARTE IST DIE HELLERE (05.09.2026, Electron-Befund 8): sie
+   trug bis dahin einen ein Bildpunkt starken Ring in Blau, und die Karten
+   selbst hoben sich kaum vom Grund ab -- gemessen Karte (16,18,22) auf Grund
+   (11,13,16). Jetzt sagt es die Flaeche: die gewaehlte liegt auf `--erhoben`,
+   und ihr Name steht auf der Akzent-Pille darunter. Kein Ring, keine Linie. */
+.tabkarte { border-radius: var(--r-karte); background: var(--leiste); overflow: hidden; }
+.tabkarte.gewaehlt { background: var(--erhoben); }
+/* Und derselbe Griff wie an der Kopfzeile des aktiven Panes (Electron-Befund
+   11): der Name der gewaehlten Karte steht auf einer gefuellten Akzent-Pille.
+   Die hellere Flaeche allein traegt es nicht -- gemessen (30,35,43) gegen
+   (23,26,32), also 1,10:1; die Pille misst 3,75:1 dunkel und 4,26:1 hell
+   gegen die Flaeche einer ungewaehlten Karte. Eine Aussage, eine Form, an
+   beiden Orten dieselbe. */
+.tabkarte.gewaehlt > .tabkarte-kopf .name {
+  background: var(--akzent); color: var(--akzent-tinte);
+  border-radius: 999px; padding: 1px 9px;
+}
+.tabkarte-kopf {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  padding: 8px 12px;
+}
+.tabkarte-kopf:hover { background: var(--erhoben); }
+.tabkarte-kopf .name { font-size: 12.5px; font-weight: 600; }
+.tabkarte-kopf .anzahl { margin-left: auto; font-size: 11px; color: var(--gedaempft); }
+.worker-zeile {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  padding: 6px 12px;
+}
+.worker-zeile:hover:not(:disabled) { background: var(--erhoben); }
+/* Ohne Pane gibt es nichts zu zeigen -- die Zeile bleibt Auskunft und laedt
+   nicht zum Klicken ein. Der Text bleibt lesbar; abgeblendet waere er eine
+   zweite Aussage ueber den Zustand, den der Punkt schon traegt. */
+.worker-zeile:disabled { cursor: default; }
+/* Was unter einem Worker haengt, traegt eine Linie zu ihm: die Zugehoerigkeit
+   steht damit in der GEOMETRIE und nicht in einer Farbe -- die Farbe ist fuer
+   den Zustand reserviert. */
+.worker-zeile.kind { position: relative; padding-left: 26px; }
+.worker-zeile.kind::before {
+  content: ''; position: absolute; left: 15px; top: 0; bottom: 50%; width: 1px; background: var(--linie);
+}
+.worker-zeile.kind::after {
+  content: ''; position: absolute; left: 15px; top: 50%; width: 5px; height: 1px; background: var(--linie);
+}
+.worker-zeile.subagent { opacity: 0.85; }
+/* Eine Ueberschrift statt eines Tabs: „Fertig", „Nicht einsehbar". Sie ist kein
+   Knopf -- unter ihr steht nichts, wohin man springen koennte. */
+.tabkarte-kopf.rubrik { color: var(--gedaempft); }
+.tabkarte-kopf.rubrik:hover { background: none; }
+.worker-zeile .leib { min-width: 0; flex: 1 1 auto; }
+.worker-zeile .oben { display: flex; align-items: baseline; gap: 7px; }
+.worker-zeile .wname { font-size: 12px; font-weight: 500; }
+/* Modellkennung und Tokenstand in Festbreite -- fuer beides ist sie erlaubt.
+   Die Zeile darunter NICHT: dort steht, woran der Worker gerade ist, und das
+   ist ein uebersetzter Satz. */
+.worker-zeile .wmodell,
+.worker-zeile .wtokens {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px; color: var(--gedaempft);
+}
+.worker-zeile .letzte { font-size: 10.5px; color: var(--gedaempft); }
+.worker-zeile .letzte { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.worker-zeile .wtokens { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+/* `+n` am Antragsteller (Befund 10): so viele Worker sind auf seinen Antrag
+   entstanden. Eine Zahl, kein Wort -- daneben steht schon das Modell. */
+.worker-zeile .wkinder {
+  font-size: 10.5px; color: var(--gedaempft); font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+.uebersicht-leer { color: var(--gedaempft); padding: 12px 2px; }
+
+/* --- Rechter Inspektor ---------------------------------------------------
+ * Ordner, Aktivitaet und Protokolle. Die FREIGABEN liegen bewusst nicht hier:
+ * etwas, das immer sichtbar sein soll, kann nicht in einer Leiste stecken, die
+ * man zuklappen kann und die ohnehin nur eines von drei Blaettern zeigt. Sie
+ * stehen quer oben.
+ *
+ * Ueber dem Inhalt sagt eine schmale Zeile, WOZU das Blatt gehoert: der Ordner
+ * haengt am Projekt und bleibt stehen, wenn der Orchestrator wechselt;
+ * Aktivitaet und Protokolle wechseln mit.
+ */
+#rechts {
+  flex: 0 0 auto; display: flex; flex-direction: column; min-height: 0; min-width: 0;
+  overflow: hidden; background: var(--leiste); border-radius: var(--r-karte);
+}
+#rechts[hidden] { display: none; }
+/* Die drei Reiter als Segmentgruppe, mit ihren Symbolen. Kein Trennstrich
+   darunter: die Zeile darunter sagt selbst, wozu das Blatt gehoert. */
+.insp-reiter {
+  flex: 0 0 auto; display: flex; gap: 2px; padding: 2px; margin: 12px 12px 6px;
+  background: var(--erhoben); border-radius: var(--r-mittel);
+}
+.insp-reiter .knopf {
+  flex: 1 1 0; min-width: 0; min-height: 0;
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+  height: 22px; padding: 0 4px;
+  border-radius: 6px; font-size: 11.5px; color: var(--gedaempft);
+  white-space: nowrap; overflow: hidden;
+}
+.insp-reiter .knopf:hover { color: var(--schrift); }
+.insp-reiter .knopf.gewaehlt { background: var(--grund); color: var(--schrift); font-weight: 500; }
+/* Das Symbol jedes Reiters -- 16 Bildpunkte, gedaempft, im gewaehlten Reiter
+   in der Akzentfarbe. In einer schmal gezogenen Leiste bleibt es allein
+   stehen, und dort traegt es die Auskunft. */
+.insp-reiter .knopf svg { flex: 0 0 auto; }
+.insp-reiter .knopf.gewaehlt svg { color: var(--akzent-text); }
+.insp-reiter .knopf .beschriftung { overflow: hidden; text-overflow: ellipsis; }
+#insp-bereich {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
+  padding: 0 12px 8px; font-size: 11.5px; color: var(--gedaempft);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#insp-bereich:empty { display: none; }
+/* Der Schliessen-Knopf des offenen Blattes (Befund 12) -- am rechten Ende
+   derselben Zeile, die ohnehin sagt, wozu das Blatt gehoert. */
+.insp-zu {
+  margin-left: auto; flex: 0 0 auto; width: 20px; height: 20px;
+  display: grid; place-items: center; border-radius: var(--r-klein); color: var(--gedaempft);
+}
+.insp-zu:hover { background: var(--erhoben); color: var(--schrift); }
+/* Hier steht der Name eines Projekts oder eines Orchestrators -- ein Name, kein
+   Pfad. Systemschrift, nur etwas kraeftiger als das Wort davor. */
+#insp-bereich b { color: var(--schrift); font-weight: 600; font-size: 11.5px; }
+/* Der Platz der drei Blaetter. Sie bauen sich selbst hinein (ordner-view.ts
+   und die beiden Geschwister) und behalten ihre Logik -- nur ihre Gestalt ist
+   neu, und die steht in ihren eigenen Stilblaettern. */
+#schublade { flex: 1 1 auto; display: flex; min-height: 0; overflow: hidden; }
+#rechtsliste { flex: 0 0 auto; }
+/* Sie sitzt jetzt im Tab-Streifen (Kleinigkeit 4) und weicht dort als erstes:
+   Tabs und Ansichtsschalter sind Bedienelemente, sie ist eine Auskunft. */
+#hinweis {
+  display: flex; align-items: center; min-width: 0; flex: 0 1 auto;
+  padding: 0 4px; color: var(--gedaempft); font-size: 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#hinweis[hidden] { display: none; }
+/* KEIN WORT WIRD HALB ABGESCHNITTEN (04.09.2026, Befund des Nutzers am
+   Belegbild: „Aktivi…", „Proto…"). Passt eine der drei Aufschriften nicht
+   GANZ, faellt die ganze Reihe auf ihre Symbole zurueck -- gemessen an der
+   wirklichen Breite, nicht an einer festen Zahl (renderer.ts,
+   `reiterAufschriftPruefen`). Das Wort steht dann im Hilfeschildchen. */
+#rechts.nur-symbole .insp-reiter .knopf .beschriftung { display: none; }
+#rechts.nur-symbole .insp-reiter .knopf { justify-content: center; }
+
+/* --- Die Maschinenkarten und die Fusszeile der linken Leiste --------------
+ * Bis zum 05.09.2026 stand hier „Statusleiste unten": quer ueber die volle
+ * Breite, mit den Maschinen als Punkten und ihrer Auskunft hinter einem Klick.
+ * Wort des Nutzers am 05.09.: „Maschinen prominenter" und „Statusleiste nicht
+ * unten". Also: je Maschine eine KARTE in der linken Leiste, dauerhaft
+ * sichtbar, und die uebrige Leiste -- Verbrauch, Wochenstand, laufende Worker,
+ * Zahnrad -- als FUSSZEILE derselben Karte. Die Buehne reicht seitdem bis zum
+ * unteren Fensterrand.
+ */
+#statusleiste {
+  flex: 0 0 auto; box-sizing: border-box; min-height: var(--statushoehe);
+  display: flex; flex-direction: column; gap: 4px; padding: 6px 12px 10px;
+  font-size: 11.5px; color: var(--gedaempft);
+}
+#statusleiste .stueck { display: flex; align-items: center; gap: 6px; }
+#statusleiste .stueck b { color: var(--schrift); font-weight: 500; }
+#statusleiste .rechts { display: flex; align-items: center; gap: 10px; min-height: 22px; }
+#statusleiste .rechts .knopf { margin-left: auto; }
+#statusleiste .knopf {
+  min-height: 0; width: 24px; height: 22px; display: grid; place-items: center;
+  border-radius: var(--r-klein); padding: 0; color: var(--gedaempft);
+}
+#statusleiste .knopf:hover { background: var(--erhoben); color: var(--schrift); }
+#statusleiste .knopf .beschriftung { display: none; }
+/* Verbrauch und Wochenstand. Die Zeile darf UMBRECHEN: bei 232 Bildpunkten
+   Leistenbreite passen „104,8M heute" und der Wochenbalken mit seinen zwei
+   Zahlen nicht nebeneinander, und gekuerzt wird der Text, nicht der Inhalt. */
+/* `#fuss` ist ein Block, kein Flex: das Umbrechen macht `#statuszeile` darin
+   (fuss-status.css). Als Flex-Kind haette die Zeile ihre Inhaltsbreite
+   bekommen und waere rechts aus der Karte gelaufen -- gemessen am 05.09. */
+#fuss { min-width: 0; }
+/* Umgebrochen wird ZWISCHEN den Stuecken, nie mitten in einem: „106,3M heute"
+   bleibt ein Wort, der Wochenbalken bleibt bei seinen zwei Zahlen. */
+#fuss .sz-stueck, #fuss .sz-stueck span, #statusleiste .stueck { white-space: nowrap; }
+/* Der Wochenstand bekommt eine eigene Zeile: Wort, Balken und Grenze sind
+   zusammen breiter als die Leiste, und ein Balken, der aus der Karte laeuft,
+   sagt nichts mehr. */
+#fuss .sz-woche { flex: 1 1 100%; }
+
+/* EINE MASCHINE IST EINE KARTE (05.09.2026). Innenabstand 10, Abstand 4,
+   Radius 10 -- dieselben drei Zahlen wie an den Sitzungskarten der Uebersicht
+   (`.tabkarte`). Flaeche `--erhoben` auf der Leiste, kein Rahmen, keine neue
+   Farbe: die Zustandsfarben tragen der Punkt und die Pruefstandsmarke.
+   Kopfzeile: Punkt, Name, gegebenenfalls das Wort „pausiert", rechts die
+   Marke des Pruefstands. Darunter in Gedaempft, was die Bruecke wirklich
+   liefert -- Erreichbarkeit, Sitzungen, Worker. Was sie nicht liefert (eine
+   Auslastung in Prozent), steht auch nicht da; eine erfundene Zahl waere
+   schlimmer als eine fehlende. Ein Klick auf den Namen klappt in der Karte
+   die volle Auskunft samt Schalter auf, an Ort und Stelle statt als Blatt
+   darueber. */
+#maschinen { flex: 0 0 auto; display: flex; flex-direction: column; gap: 4px; padding: 4px 6px 0; }
+.masch {
+  display: flex; flex-direction: column; gap: 2px; box-sizing: border-box;
+  padding: 10px; border-radius: var(--r-karte); background: var(--erhoben);
+  font-size: 11.5px; color: var(--gedaempft); min-width: 0;
+}
+.masch-kopf { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.masch-name {
+  flex: 1 1 auto; min-width: 0; text-align: left; padding: 0; border-radius: 4px;
+  color: var(--schrift); font-size: 13px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.masch-name:hover { color: var(--akzent-text); }
+/* Die Kurzzeile darf umbrechen: „diese Maschine · 2 Sitzungen · 2 Worker"
+   passt bei 232 Bildpunkten nicht in eine Zeile, und abgeschnitten waere
+   gerade die Zahl weg, um die es geht. */
+.masch-kurz { line-height: 1.4; overflow-wrap: anywhere; }
+.masch-feld {
+  margin-top: 6px; padding-top: 6px; color: var(--schrift); line-height: 1.5;
+}
+.masch-feld[hidden] { display: none; }
+.masch-feld dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; }
+.masch-feld dt { color: var(--gedaempft); white-space: nowrap; }
+.masch-feld dd { margin: 0; overflow-wrap: anywhere; }
+/* Der Kopf des Feldes wiederholte den Namen, der jetzt direkt darueber
+   steht -- er bleibt fuer den Steuerkanal im Text, faellt aber aus dem Bild. */
+.masch-feld .kopf { display: none; }
+
+/* EINE PAUSIERTE MASCHINE (05.09.2026): gedaempft, aber da -- und mit ihrem
+   eigenen Wort. Sie darf nie aussehen wie „nicht erreichbar": das eine ist
+   gewollt, das andere ein Ausfall, und sie zu verwechseln versteckt den
+   Ausfall. Der Punkt traegt die Unterscheidung in der FORM (gefuellt, aber in
+   der gedaempften Schrift statt in einer Zustandsfarbe), das Wort daneben
+   noch einmal im Klartext. Keine neue Farbe: `--gedaempft` steht ueberall
+   dort, wo etwas da ist, aber nicht ruft. */
+.punkt.pausiert { background: var(--gedaempft); }
+.masch.pausiert .masch-name { color: var(--gedaempft); }
+.masch-wort { color: var(--gedaempft); flex: 0 0 auto; }
+
+/* Der Schalter im Aufklappfeld. Ein Kaestchen mit seiner Aufschrift, nicht
+   ohne -- ein blankes Kaestchen liest sich als „ausgewaehlt", nicht als
+   „Sitzungen laden". Darunter, was NICHT passiert. */
+.masch-schalter {
+  display: flex; align-items: center; gap: 6px; margin-top: 8px; cursor: pointer;
+}
+.masch-wirkung { color: var(--gedaempft); margin-top: 4px; }
+
+/* EINGEKLAPPT bleibt von jeder Karte ihr Punkt -- dieselbe Regel wie bei den
+   Sitzungszeilen: Farbe und Form sagen weiter, ob eine Maschine da ist. Die
+   Fusszeile behaelt das Zahnrad; Verbrauch und Workerzahl brauchen Worte, und
+   fuer Worte ist dort kein Platz. */
+#links.schmal #maschinen { padding: 4px 0 0; align-items: center; }
+#links.schmal .masch { padding: 0; height: 26px; justify-content: center; align-items: center; background: transparent; }
+#links.schmal .masch-kopf { gap: 0; }
+#links.schmal .masch-name, #links.schmal .masch-wort, #links.schmal .masch-kurz,
+#links.schmal .masch-feld, #links.schmal .sz-marke { display: none; }
+#links.schmal #statusleiste { padding: 6px 0 10px; align-items: center; }
+#links.schmal #fuss, #links.schmal #st-worker { display: none; }
+#links.schmal #statusleiste .rechts .knopf { margin: 0; }
+
+/* Der Verbrauch. Der Balken zeigt, wieviel von der Woche schon weg ist; die
+   Zahl daneben, wieviel bis heute Abend erlaubt waere. Beide kommen fertig
+   ausgewertet aus dem Hauptprozess (budget.ts) -- hier wird nichts gerechnet. */
+/* ALS BALKEN LESBAR, NICHT ALS STRICH (05.09.2026, Kleinigkeit 7). Er war
+   54 mal 3 Bildpunkte und las sich bei 60 Punkten Laenge wie eine Trennlinie
+   zwischen zwei Zahlen, nicht wie eine Fuellung. Doppelt so hoch (6 statt 3)
+   und rund abgeschlossen: damit hat die Fuellung eine sichtbare Hoehe, und die
+   leere Spur dahinter ist als Spur erkennbar. Die Breite bleibt -- die
+   Fusszeile ist der knappste Platz im Fenster. */
+.minibalken { width: 54px; height: 6px; border-radius: 3px; background: var(--linie); overflow: hidden; flex: 0 0 auto; }
+.minibalken i { display: block; height: 100%; border-radius: 3px; background: var(--akzent); }
+/* Ueber der Grenze faerbt der Balken um -- dieselbe Wartefarbe wie ueberall,
+   wo etwas Aufmerksamkeit will. */
+.minibalken i.drueber { background: var(--zustand-wartet); }
+.sz-woche[hidden] { display: none; }
+.sz-erlaubt { color: var(--gedaempft); }
+.sz-stueck { display: flex; align-items: center; gap: 6px; cursor: pointer; padding: 1px 4px; margin-left: -4px; border-radius: 4px; }
+.sz-stueck:hover { background: var(--erhoben); }
+/* Die Marke des Pruefstands: ein kleines VIERECK neben dem runden Punkt der
+   Maschine. Rund heisst „Maschine", eckig heisst „Pruefstand" -- zwei Aussagen
+   in derselben Form nebeneinander waeren eine. */
+.sz-marke { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 2px; background: var(--gedaempft); }
+.sz-marke.laeuft { color: var(--zustand-laeuft-tinte); background: var(--zustand-laeuft); }
+.sz-marke.will { color: var(--zustand-wartet-tinte); background: var(--zustand-wartet); }
+.sz-marke.aus { color: var(--zustand-tot-tinte); background: var(--zustand-tot); }
+.sz-marke.ruhig { color: var(--gedaempft); background: var(--leiste); }
+
+/* --- Ueberlagerungen ------------------------------------------------------ */
+/* Das Feld fuer den neuen Namen einer Sitzung. Ein Zeilenfeld ueber der
+   Flaeche statt eines eigenen Fensters: gefragt wird EIN Wort, und es geht mit
+   der Antwort wieder zu. */
+#umbenennen {
+  position: absolute; left: 50%; top: 40px; transform: translateX(-50%);
+  z-index: 8; display: none; width: min(460px, 84%);
+  background: var(--leiste); border-radius: var(--r-karte);
+  color: var(--schrift);
+}
+#umbenennen.sichtbar { display: block; }
+#umbenennen .kopf { padding: 9px 14px 0; font-weight: 600; }
+#umbenennen .alt {
+  padding: 2px 14px 0; font-size: 12px; color: var(--gedaempft); word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+#umbenennen .fuss { display: flex; gap: 8px; align-items: center; padding: 10px 14px 12px; }
+#umbenennen input {
+  flex: 1 1 auto; min-width: 0; padding: 6px 9px; border-radius: var(--r-klein);
+  background: var(--grund); border: 0; color: var(--schrift); font: inherit;
+}
+#umbenennen button {
+  padding: 6px 12px; border-radius: var(--r-klein);
+  background: var(--erhoben); color: var(--schrift);
+}
+#umbenennen button.start { background: var(--akzent); color: var(--akzent-tinte); }
+
+/* --- Die Sitzungskarte hinter dem Zahnrad ---------------------------------
+ * Was eine Sitzung ausmacht -- Name, Harness, Modell, Ordner, Maschine -- und
+ * die Griffe, die dazu gehoeren, an EINER Stelle und an Ort und Stelle: als
+ * Blatt unter dem Zahnrad, aus dem sie kommt. Bis zum 04.09.2026 steckte all
+ * das im Rechtsklickmenue der Zeile links, wo es niemand fand.
+ *
+ * Sie liegt bei z-index 8 -- ueber Uebersicht (6) und Chat-Buehne (7), auf
+ * derselben Ebene wie die Namensabfrage: eine Rueckfrage darf nichts
+ * verschlucken, was sie beantworten soll.
+ */
+#sitzungskarte {
+  position: absolute; right: 12px; top: 8px; z-index: 8;
+  display: none; width: min(320px, calc(100% - 24px));
+  padding: 12px; box-sizing: border-box;
+  background: var(--leiste); border-radius: var(--r-karte); color: var(--schrift);
+  /* DER EINE ERLAUBTE SCHATTEN. Ein Blatt, das ueber der Flaeche schwebt,
+     braucht im hellen Thema die Abhebung; im dunklen traegt der Kontrast der
+     Flaechen ohnehin. Weich und ohne Farbe -- keine Zierde, sondern die
+     Auskunft „das hier liegt oben". */
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--tinte) 22%, transparent);
+}
+#sitzungskarte.sichtbar { display: block; }
+.sk-kopf { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.sk-titel { font-size: 13px; font-weight: 600; }
+#sk-zu {
+  margin-left: auto; width: 22px; height: 22px; display: grid; place-items: center;
+  border-radius: var(--r-klein); color: var(--gedaempft);
+}
+#sk-zu:hover { background: var(--erhoben); color: var(--schrift); }
+.sk-was { display: block; font-size: 11.5px; color: var(--gedaempft); margin-bottom: 4px; }
+.sk-eingabe { display: flex; gap: 6px; }
+.sk-eingabe input {
+  flex: 1 1 auto; min-width: 0; padding: 5px 8px; border-radius: var(--r-klein);
+  background: var(--grund); border: 0; color: var(--schrift); font: inherit; font-size: 13px;
+}
+/* Die Angaben, die die Sitzung beschreiben. Was das Modell nicht kennt, steht
+   hier auch nicht -- eine erfundene Zeile waere schlimmer als eine fehlende. */
+.sk-liste {
+  margin: 12px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px;
+  font-size: 11.5px;
+}
+.sk-liste dt { color: var(--gedaempft); white-space: nowrap; }
+.sk-liste dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+/* Modellkennung, Harness-Name und Pfad in Festbreite -- fuer alle drei erlaubt. */
+.sk-liste dd.fest { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.sk-knoepfe { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.sk-knoepfe:empty { display: none; }
+
+/* Eine kurze Rueckmeldung ueber der Flaeche. Sie geht von selbst wieder. */
+#notiz {
+  position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 9;
+  display: none; width: max-content; max-width: 80%; padding: 6px 14px; border-radius: 14px;
+  background: var(--erhoben); color: var(--schrift);
+}
+#notiz.sichtbar { display: block; }
+
+/* Faellt der Steuerkanal aus, entsteht das Fenster trotzdem -- und dann muss
+   man ihm ansehen, dass es keinen hat. Kein Ausblenden nach ein paar
+   Sekunden: der Zustand bleibt, also bleibt die Anzeige. */
+/* Kein Ausblenden nach ein paar Sekunden: der Zustand bleibt, also bleibt die
+   Anzeige. Sie steht in der Reihe zwischen Titelleiste und Freigabeleiste --
+   beides Zustaende, die das ganze Programm betreffen und nicht die gewaehlte
+   Sitzung. */
+#kanalwarnung {
+  flex: 0 0 auto; display: none;
+  padding: 7px 12px; background: var(--vorsichtgrund); color: var(--aus);
+  border-radius: var(--r-karte); font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#kanalwarnung.sichtbar { display: block; }
+
+/* KEINE SICHTBAREN ROLLBALKEN (04.09.2026). Ein Rollbalken, der Platz
+   wegnimmt, laesst in jeder Karte einen Streifen stehen und ist auf dem Mac
+   ohnehin nur waehrend des Rollens da. Gerollt wird mit Rad und Trackpad --
+   derselbe Weg, auf dem auch die Terminals rollen (paneflaeche.ts). */
+::-webkit-scrollbar { width: 0; height: 0; }
+::-webkit-scrollbar-thumb, ::-webkit-scrollbar-track { background: transparent; }
+
+/* PFADE IM CHAT, ANKLICKBAR (chatdatei, 05.09.2026): ein Link der Werkbank --
+   Akzentfarbe als Schrift, Hand als Zeiger, Unterstrich erst beim Ueberfahren,
+   kein Symbol. Gilt in der Lese-Ansicht eines Panes UND auf der Chatbuehne,
+   deshalb hier und nicht in einer der beiden Ansichts-Dateien. */
+.chat-pfad { color: var(--akzent-text); cursor: pointer; text-decoration: none; }
+.chat-pfad:hover { text-decoration: underline; }

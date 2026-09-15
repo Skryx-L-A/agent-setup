@@ -18,6 +18,7 @@ current_machine_id().
 import argparse
 import ast
 import csv
+import difflib
 import fnmatch
 import glob as globmod
 import hashlib
@@ -76,6 +77,31 @@ def repo_wurzel_ermitteln():
         "GERATEN, nicht gemessen: dieses Werkzeug laeuft als ausgerollte "
         "Kopie ohne eigenen Baum ueber sich -- %s angenommen. --repo <pfad> "
         "nennt den echten Baum." % geraten)
+
+
+def ist_worktree(repo_dir):
+    """Ist repo_dir ein git-Worktree (nicht der Hauptbaum)? Dieselbe Ableitung
+    wie is_worktree() in shell/tests/betriebslauf.sh/betriebslauf2.sh, woertlich
+    uebertragen (Anlass, siehe Auftrag 2026-08-22: repo_wurzel_ermitteln() oben
+    behebt "gegen den FALSCHEN Baum verglichen" -- das hier ist ein zweiter,
+    eigener Fehler, der auch beim RICHTIGEN Baum bleibt, wenn dieser ein
+    Worktree ist. Ein Worktree hat seine eigene Branch-Historie; ein Werkzeug,
+    das der Hauptbaum inzwischen unabhaengig ausgerollt hat, ist in DIESER
+    Historie nicht auffindbar -- nicht weil jemand die installierte Kopie von
+    Hand geaendert haette, sondern weil der verglichene Baum schlicht nicht der
+    ist, von dem je ausgerollt wird. --git-dir und --git-common-dir sind fuer
+    einen Worktree verschiedene Pfade (das Worktree-eigene .git ist eine
+    Verweisdatei, kein Verzeichnis), fuer den Hauptbaum identisch."""
+    try:
+        gd = subprocess.run(["git", "-C", repo_dir, "rev-parse",
+                             "--path-format=absolute", "--git-dir"],
+                            capture_output=True, text=True, timeout=10).stdout.strip()
+        cd = subprocess.run(["git", "-C", repo_dir, "rev-parse",
+                             "--path-format=absolute", "--git-common-dir"],
+                            capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return False
+    return bool(gd) and bool(cd) and gd != cd
 
 
 def load_config(path, base, repo=None):
@@ -214,14 +240,40 @@ HISTORICAL_PREFIX = re.compile(r"(von|from)\s*$", re.I)
 
 
 def build_model_variants(registry_models, extra_variants):
-    """model_alias -> sorted list of (variant_text) longest first."""
+    """model_alias -> sorted list of (variant_text) longest first.
+
+    `extra_variants` ist von Menschenhand als {aktueller_alias: [Schreibweisen]}
+    gepflegt -- aber "aktuell" ist maschinenabhaengig, wenn ein Modell seinen
+    Alias wechselt (Befund 2026-09-05: Fable 5 -> Fable 5.1 am 02.09., Alias
+    `fable5` -> `fable51`; die Vorlage rollte den neuen Alias sofort aus, eine
+    Registry, die den Rollout noch nicht gesehen hat, traegt weiterhin
+    `fable5`). Ein reiner Schluesselvergleich (`extra_variants.get(alias)`)
+    liefert dann nichts: `fable5` ist in der Konfiguration nur noch als
+    Listeneintrag UNTER dem neuen Schluessel `fable51` vertreten, nicht mehr
+    selbst ein Schluessel. Damit fehlt der Registry-Alias `fable5` nicht nur
+    seine eigenen Zusatzschreibweisen (das nackte Wort `fable`) -- er verliert
+    auch, dass die Zeichenkette `fable51` ueberhaupt eine Modellerwaehnung
+    ist. Und GENAU dieser Verlust zerstoert die Blockbildung in
+    iter_bullet_blocks(): eine Kommentarzeile, die woertlich mit `fable51`
+    beginnt, oeffnet dann keinen neuen Block mehr, sondern haengt sich an den
+    VORIGEN, thematisch fremden Block -- und eine Cap-Behauptung, die zu
+    `fable51` gehoert, wird per Blocklabel-Rueckfall dem falschen Modell
+    zugeschlagen (siehe pair_claims_with_models). Die Aufloesung ist deshalb
+    symmetrisch: ein lebender Alias zieht die Zusatzliste, wenn er selbst der
+    Konfigurationsschluessel ist ODER wenn er irgendwo INNERHALB einer
+    Zusatzliste als Synonym auftaucht -- so bekommt `fable5` weiterhin genau
+    dieselbe Synonymgruppe wie `fable51`, ganz gleich, welche der beiden
+    Schreibweisen gerade lebt."""
     variants = {}
     for m in registry_models:
         alias = m.get("alias")
         if not alias:
             continue
         vs = {alias}
-        vs.update(extra_variants.get(alias, []))
+        for key, vlist in extra_variants.items():
+            if alias == key or alias in vlist:
+                vs.add(key)
+                vs.update(vlist)
         variants[alias] = sorted(vs, key=len, reverse=True)
     return variants
 
@@ -363,14 +415,46 @@ def trim_to_sentence_start(text, hard_start, pos):
     return last_end if last_end is not None else hard_start
 
 
+def trim_to_sentence_end(text, pos, hard_end):
+    """Move hard_end backward to the first sentence/clause boundary ('. ' or
+    '; ') inside [pos, hard_end), the mirror image of trim_to_sentence_start.
+
+    Ohne dieses Gegenstueck griff nur die RUECKWAERTS-Suche ueber Satzgrenzen
+    hinweg nicht -- die VORWAERTS-Suche (der 'after'-Rueckfall unten) durfte
+    bis zum naechsten Claim durchgreifen, auch wenn dazwischen ein '; ' oder
+    '. ' lag. Befund 2026-09-05: fehlt in der lebenden Registry der Alias, den
+    eine Konfigurationszeile fuer ein Modell erwartet (`fable5` in der
+    Registry, `extra_model_name_variants` traegt die Zusatzschreibweisen aber
+    nur unter dem SPAETEREN Alias `fable51`), erkennt find_model_mentions das
+    Wort `fable` im Text ueberhaupt nicht mehr. Ein Satz wie
+
+        `fable` max effort = high; `opus5`, `opus48` und `sonnet5` max effort
+        = xhigh.
+
+    verliert damit seine erste Modell-Erwaehnung. Die 'high'-Behauptung, die
+    eigentlich zu `fable` gehoert, fand vorher (im 'before'-Fenster) keinen
+    Treffer und griff ungebremst nach VORNE durch das Semikolon in den
+    zweiten Satzteil -- und paarte sich dort mit `opus5`, `opus48` und
+    `sonnet5`, obwohl deren eigene, richtige Behauptung ('xhigh') zwei Worte
+    weiter steht. Drei Fehlalarme aus einem einzigen fehlenden Alias. Die
+    Satzgrenze gilt in beide Richtungen: eine Behauptung darf nach vorn nur so
+    weit greifen, wie ihr eigener Satz reicht, genau wie sie es rueckwaerts
+    schon durfte."""
+    m = SENTENCE_BOUNDARY.search(text, pos, hard_end)
+    return m.start() if m else hard_end
+
+
 def pair_claims_with_models(claims, mentions, text, block_label=None):
     """For each cap claim, attribute it to the model mention(s) immediately
     before it (bounded by the previous claim and by the start of the current
     sentence/clause, so 'fable ... = high; opus5 ... = xhigh' doesn't leak
     fable into opus5's window, and an unrelated model named in the previous
     sentence doesn't leak into this one), falling back to mentions
-    immediately after if none precede. A claim with no nearby model mention
-    at all is dropped rather than guessed at."""
+    immediately after -- bounded the same way, by the end of the current
+    sentence/clause, so a claim whose own model mention went unrecognized
+    can't reach forward past a '. '/'; ' into an unrelated clause's models --
+    if none precede. A claim with no nearby model mention at all is dropped
+    rather than guessed at."""
     pairs = []  # (alias, cap_value)
     for i, (cstart, cend, cap) in enumerate(claims):
         window_start = max(cstart - PROXIMITY_WINDOW, claims[i - 1][1] if i > 0 else 0)
@@ -382,6 +466,7 @@ def pair_claims_with_models(claims, mentions, text, block_label=None):
             continue
         next_claim_start = claims[i + 1][0] if i + 1 < len(claims) else cend + PROXIMITY_WINDOW
         window_end = min(cend + PROXIMITY_WINDOW, next_claim_start)
+        window_end = trim_to_sentence_end(text, cend, window_end)
         after = [a for (s, e, a) in mentions if cend <= s and e <= window_end]
         if after:
             for a in after:
@@ -1446,6 +1531,7 @@ def check6_settings_switches(cfg, base):
 
 NICHT_INSTALLIERT_RE = re.compile(r"NICHT[ _-]INSTALLIERT\s*:\s*(\S.*)")
 NICHT_VERSIONIERT_RE = re.compile(r"NICHT[ _-]VERSIONIERT\s*:\s*(\S.*)")
+NICHT_REGISTRIERT_RE = re.compile(r"NICHT[ _-]REGISTRIERT\s*:\s*(\S.*)")
 
 
 def _installationsziel(rel, c7):
@@ -1486,6 +1572,51 @@ def _historische_zeilen(repo_datei, repo_dir):
     return zeilen
 
 
+TEILSTAND_WARUM = (
+    "die installierte Kopie ist ein Teilstand des Repo-Stands (nur fehlende "
+    "Zeilen), ersetzt")
+
+
+def _ist_teilstand(kopie_inhalt, repo_inhalt):
+    """True, wenn die installierte Kopie ein Teilstand des aktuellen Repo-Stands
+    ist (2026-09-10, gemessener Befund, siehe _installiert_richtung): eine
+    Datei wurde im Repo geaendert, aber noch nicht committet; `wb-ausrollen`
+    rief nach `~/.local/bin` (die Kopie bekam den uncommitteten Stand); erst
+    danach wurde committet. Auf dem naechsten Lauf war der Repo-Stand
+    seither zwar committet und neuer, die Kopie blieb aber als "eigenmaechtig"
+    stehen -- Grund: die Einordnung prueft, ob der installierte Inhalt in der
+    Geschichte der Datei vorkommt, und ein Zwischenstand, der nie committet
+    wurde, kommt dort nie vor, obwohl der committete Stand aus genau
+    derselben Arbeitslinie stammt.
+
+    Der Diff `difflib.unified_diff(kopie, repo)` macht den Teilstand sichtbar,
+    ohne eine Geschichte zu brauchen: er traegt nur `+`-Zeilen (das Repo hat
+    Zeilen mehr) und keine `-`-Zeilen (die Kopie hat nichts, was das Repo
+    nicht hat) -- die Kopie ist ein Zustand, aus dem der Repo-Stand durch
+    reines Hinzufügen entstand. Steht auch nur eine einzige `-`-Zeile vor,
+    hat die Kopie Inhalt, den der Repo-Stand nicht kennt, und bleibt es bei
+    der bisherigen Logik (eigenmaechtig oder unklar) -- ein Teilstand ist
+    kein Ersatz fuer diesen Schutz, er ergaenzt ihn nur im `+`-Fall.
+
+    Die Kopfzeilen des Diffs werden exakt gegen die eigenen, eindeutigen
+    Labels verglichen -- eine entfernte Zeile `-- ` waere sonst eine Zeile
+    `--- ...`, die wie eine Kopfzeile aussieht und still ueberlesen wurde.
+    """
+    kopie_zeilen = kopie_inhalt.decode("utf-8", "replace").splitlines()
+    repo_zeilen = repo_inhalt.decode("utf-8", "replace").splitlines()
+    kopie_label, repo_label = "<installierte-kopie>", "<repo-stand>"
+    hat_plus = False
+    for line in difflib.unified_diff(kopie_zeilen, repo_zeilen, kopie_label, repo_label):
+        if line == "--- %s\n" % kopie_label or line == "+++ %s\n" % repo_label \
+                or line.startswith("@@"):
+            continue
+        if line.startswith("-"):
+            return False
+        if line.startswith("+"):
+            hat_plus = True
+    return hat_plus
+
+
 def _installiert_richtung(repo_datei, inst_datei, repo_dir):
     """'veraltet' (Ausrollen vergessen) oder 'eigenmaechtig' (jemand hat an der
     installierten Kopie gearbeitet) -- und woher wir das wissen.
@@ -1512,8 +1643,17 @@ def _installiert_richtung(repo_datei, inst_datei, repo_dir):
     (_historische_zeilen). Steht auch nur eine einzige nirgends in der
     Geschichte, ist sie echt neu -- eigenmaechtig, wie zuvor.
 
-    Ohne git bleibt die Aenderungszeit, und die ist nur ein Hinweis: sie wird
-    entsprechend gekennzeichnet."""
+    DRITTER WEG, gemessener Nachtrag (2026-09-10, gemessener Befund, siehe
+    _ist_teilstand): die installierte Kopie war ein uncommitteter
+    Zwischenstand DIESER Datei -- sie stand in keinem Commit, und der erste
+    und zweite Weg schlagen beide fehl, obwohl der committete Stand die
+    Fortsetzung der Kopie ist. Der Teilstand-Check erkennt das an den zwei
+    Dateien selbst (siehe _ist_teilstand): der Diff traegt nur `+`-Zeilen.
+
+    Ohne git greift der DRITTE WEG trotzdem (er braucht keine Historie), nur
+    der ERSTE und ZWEITE nicht; bleibt danach noch immer nichts entschieden,
+    bleibt die Aenderungszeit als letzter Rueckgriff, und die ist nur ein
+    Hinweis: sie wird entsprechend gekennzeichnet."""
     try:
         inhalt = open(inst_datei, "rb").read()
     except OSError:
@@ -1548,9 +1688,27 @@ def _installiert_richtung(repo_datei, inst_datei, repo_dir):
                     "alle %d Zeile(n), die nur die installierte Fassung traegt, standen "
                     "irgendwann im Repo-Verlauf -- ein Flickenteppich aus alten Staenden, "
                     "kein eigener Inhalt" % len(nur_installiert))
+        if _ist_teilstand(inhalt, aktuell):
+            # Befund 2026-09-10 (gemessen): die installierte Kopie war ein
+            # uncommitteter Zwischenstand; der spaeter committete Stand ist
+            # ihre Fortsetzung -- nur reines Hinzufuegen im Repo, kein
+            # eigener Inhalt. Nicht eigenmaechtig, sondern veraltet (Schnappschuss,
+            # ersetzen), nicht von Hand pruefen.
+            return "veraltet", TEILSTAND_WARUM
         return "eigenmaechtig", ("dieser Inhalt stand in keinem der letzten %d Commits "
                                  "dieser Datei, und mindestens eine Zeile darin stand nie "
                                  "im Repo-Verlauf" % len(shas))
+    # DRITTER WEG greift auch ohne git (kein `shas`): _ist_teilstand vergleicht
+    # nur Dateiinhalte, braucht keine Historie. Ohne diese Zeile blieb der
+    # Zweig ohne Commits (frisches Repo, flaches Klon) bei reiner
+    # Zeitstempel-Ratung stehen, obwohl derselbe Teilstand-Fall hier genauso
+    # auftreten kann.
+    try:
+        aktuell = open(repo_datei, "rb").read()
+    except OSError:
+        aktuell = None
+    if aktuell is not None and _ist_teilstand(inhalt, aktuell):
+        return "veraltet", TEILSTAND_WARUM
     try:
         neuer = os.path.getmtime(inst_datei) > os.path.getmtime(repo_datei)
     except OSError:
@@ -1634,6 +1792,10 @@ def kopie_vergleiche(c7, machine_tool_map=None, current_machine=None):
     for mid, tools in (machine_tool_map or {}).items():
         for t in tools:
             tool_machine[t.lower()] = mid
+    # EINMAL pro Lauf, nicht je Datei -- derselbe Grund wie bei current_machine
+    # oben: eine Tatsache ueber den ganzen Vergleich, kein Merkmal einer
+    # einzelnen Datei (Auftrag 2026-08-22, siehe ist_worktree()).
+    worktree = ist_worktree(repo_dir)
     gesehen = set()
     faelle = []
     for prefix, ziel_unbenutzt in [(e[0], e[1]) for e in c7["install_map"]]:
@@ -1685,6 +1847,24 @@ def kopie_vergleiche(c7, machine_tool_map=None, current_machine=None):
                 faelle.append({"status": "gleich", "rel": vergleich_rel})
                 continue
             richtung, warum = _installiert_richtung(vergleich_datei, inst_datei, repo_dir)
+            # Ein Worktree deployt nach ~/.local_bin/~/.claude/hooks NIE (Konvention
+            # seit 04.08., siehe betriebslauf.sh/betriebslauf2.sh is_worktree()) --
+            # "eigenmaechtig"/"unklar" ist dort keine Aussage ueber die installierte
+            # Kopie, sondern nur darueber, dass DIESER Baum sie nicht kennt. Die
+            # richtige, in run-all.sh bereits laengst bewiesene Antwort ist nicht
+            # "still nichts sagen", sondern die Behauptung selbst umbenennen: nicht
+            # laenger "eigenmaechtig veraendert", sondern "aus diesem Baum nicht
+            # entscheidbar". Betrifft NUR richtung, nie status "fehlt"/"gleich"/
+            # "andere_maschine" -- die bleiben wahre Aussagen, unabhaengig davon,
+            # von wo aus verglichen wird.
+            if worktree and richtung in ("eigenmaechtig", "unklar"):
+                richtung = "worktree_unpruefbar"
+                warum = ("dieser Baum ist ein git-Worktree, kein Hauptbaum -- von hier "
+                         "wird nie nach ~/.local/bin/~/.claude/hooks ausgerollt, und "
+                         "seine eigene Branch-Historie kennt nicht jeden Stand, den der "
+                         "Hauptbaum inzwischen dorthin gebracht hat. Ob die installierte "
+                         "Kopie wirklich eigenmaechtig ist, laesst sich von hier aus "
+                         "nicht sagen -- das muss gegen den Hauptbaum laufen.")
             faelle.append({"status": "verschieden", "rel": vergleich_rel,
                            "repo_datei": vergleich_datei, "inst_datei": inst_datei,
                            "richtung": richtung, "warum": warum})
@@ -1735,6 +1915,17 @@ def _sorte_a(c7, findings, machine_tool_map=None, current_machine=None):
                 "die INSTALLIERTE Fassung traegt Inhalt, den das Repo nicht kennt "
                 "(%s) -- jemand hat an der installierten Kopie gearbeitet. Beim "
                 "naechsten Ausrollen ist diese Arbeit weg." % warum))
+        elif richtung == "worktree_unpruefbar":
+            # hint, nicht error (2026-08-22): derselbe Grund wie bei "veraltet"
+            # oben -- ein Lauf aus einem Worker-Worktree ist der Normalfall, kein
+            # Fehler, und JEDER volle Lauf aus einem Worktree endete bisher hier
+            # rot, unabhaengig von der Arbeit. Sichtbar bleibt es trotzdem (anders
+            # als ein stilles SKIP): wer nachsieht, soll den Unterschied weiterhin
+            # SEHEN koennen, nur nicht als Vorwurf gegen die installierte Kopie.
+            findings.append(Finding(
+                "KOPIE-WORKTREE-UNPRUEFBAR", vergleich_rel, 1,
+                "Repo und %s sind verschieden" % inst_datei,
+                warum, severity="hint"))
         else:
             findings.append(Finding(
                 "KOPIE-VERSCHIEDEN", vergleich_rel, 1,
@@ -1935,6 +2126,34 @@ def _ist_venv_datei(pfad):
     return os.path.isfile(os.path.join(eltern, "pyvenv.cfg"))
 
 
+MISE_SHIM_RE = re.compile(
+    r'^mise use -g "[^"\n]+" \|\| exit 1\n'
+    r'exec mise x "[^"\n]+" -- "[^"\n]+" "\$@"\s*$',
+    re.M)
+
+
+def _ist_mise_shim(pfad):
+    """Traegt die Datei selbst den `mise use -g`/`exec mise x`-Zweizeiler, den
+    `mise` beim Aktivieren eines global gewaehlten Werkzeugs (`mise use -g
+    <tool>`) direkt nach ~/.local/bin schreibt?
+
+    Befund 2026-09-05 (Auftrag peersauber): neun von 15 EIGEN-NICHT-IM-REPO-
+    Funden auf peer waren `codex`, `copilot`, `crush`, `gemini`, `ghui`,
+    `grok`, `hunk`, `omp` und `opencode` -- byteidentisch bis auf den
+    Werkzeugnamen, kein einziges davon von Hand geschrieben. `mise` legt
+    diese Shims direkt IN ~/.local/bin ab (keinen Symlink auf ein Paketmanager-
+    Verzeichnis wie bei uv/pipx/npm), deshalb greift `_ist_paketverwaltet`
+    (ortsbasiert) hier nicht -- dieselbe Luecke wie bei `_ist_venv_datei` oben,
+    nur mit einer anderen Werkzeug-Familie. Das Erkennungsmerkmal ist deshalb,
+    wie dort, der INHALT der Datei selbst: eine feste Vorlage, kein Register."""
+    try:
+        with open(pfad, "r", errors="replace") as f:
+            inhalt = f.read()
+    except OSError:
+        return False
+    return bool(MISE_SHIM_RE.search(inhalt))
+
+
 def _installationsnachweis(record_globs):
     """Menge realer Pfade, die im RECORD einer per pip installierten
     Distribution als deren eigene Datei aufgefuehrt sind. Ein RECORD-Eintrag
@@ -1987,9 +2206,30 @@ def _nachbar_bekannt(nachbar_repos):
 
 
 def _sorte_d(c7, findings, base):
-    d = c7.get("fremd_pruefung")
-    if not d:
-        return
+    """Ein Fund-Ort war bis 2026-08-22 fest auf EINEN Block angelegt
+    (`.local/bin`) -- `fremd_pruefung` ist deshalb jetzt eine LISTE von
+    Bloecken, nicht mehr ein einzelner. Anlass: `~/.claude/hooks` blieb dabei
+    aussen vor, und genau dort lagen zwei eigene Hooks monatelang nur
+    installiert (posttooluse-agent-reach-skin.sh seit 13.08.,
+    sessionstart-limit-budget.sh seit 22.08.), ohne dass irgendeine Pruefung
+    das je meldete -- Sorte A sieht nur Dateien, die im Repo schon stehen."""
+    bloecke = c7.get("fremd_pruefung") or []
+    for d in bloecke:
+        _sorte_d_block(c7, d, findings, base)
+
+
+def fremd_kopien_befunde(c7, base):
+    """Sorte D allein, wiederverwendbar ausserhalb von check7_kopien --
+    `wb-ausrollen` will genau diese Funde zusaetzlich zu seinem eigenen
+    Rollout-Bericht zeigen, ohne Sorte A/B/C/E ein zweites Mal mitlaufen zu
+    lassen (die laufen dort schon ueber `kopie_vergleiche()` fuer die
+    eigentliche Kopieraktion)."""
+    findings = []
+    _sorte_d(c7, findings, base)
+    return findings
+
+
+def _sorte_d_block(c7, d, findings, base):
     ziel = d.get("ziel")
     if not ziel or not os.path.isdir(ziel):
         return
@@ -2014,6 +2254,8 @@ def _sorte_d(c7, findings, base):
         if os.path.realpath(pfad) in nachweis:
             continue
         if _ist_venv_datei(pfad):
+            continue
+        if _ist_mise_shim(pfad):
             continue
         if not _ist_skript(pfad):
             continue
@@ -2864,6 +3106,72 @@ def check11_pipefail_erstglied(cfg, base):
     return findings
 
 
+# --------------------------------------------------------------------------
+# Check 12 -- installiert heisst nicht registriert (2026-08-22)
+# --------------------------------------------------------------------------
+# Anlass: `hooks/` bekam am selben Tag Sorte D (fremd_kopien_befunde oben) --
+# das beantwortet "steht die Datei im Repo UND liegt sie installiert genauso
+# da". Beides zusammen heisst noch nicht, dass Claude Code die Datei je
+# ausfuehrt: nur ein Eintrag unter "hooks" in settings.json macht sie zu
+# einem echten Hook. Ein Skript, das dort fehlt, ist toter Code, der wie ein
+# lebender aussieht -- niemand merkt es, weil ein fehlender Hook nicht
+# abstuerzt, er schweigt einfach (dieselbe Lehre wie bei Sorte D).
+#
+# Nur die OBERSTE Ebene von hooks_dir (kein os.walk): hooks/lib/ und
+# hooks/tests/ sind keine direkt registrierbaren Hooks, sondern Bibliothek
+# und Testsuiten -- ein rekursiver Scan haette sie faelschlich als
+# unregistriert gemeldet.
+#
+# Sechs Dateien traegt der Bestand vom 22.08. absichtlich NICHT registriert
+# (bash-guard.py fasst acht PreToolUse/Bash-Guards in einem Prozess
+# zusammen, siehe dessen Kopfkommentar seit 2026-08-05) -- sie tragen seither
+# den Marker unten in ihrem eigenen Kopf, derselbe Aufbau wie NICHT
+# VERSIONIERT/NICHT INSTALLIERT: eine Ausnahme traegt ihre Begruendung an
+# der Datei selbst, nicht in einer gepflegten Liste hier.
+def check12_hook_registrierung(cfg, base):
+    c12 = cfg.get("check12_hook_registrierung")
+    if not c12:
+        return []
+    hooks_dir = c12["hooks_dir"]
+    if not os.path.isdir(hooks_dir):
+        return []
+    settings_pfad = c12["settings_datei"]
+    try:
+        with open(settings_pfad, encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, ValueError) as exc:
+        return [Finding(
+            "HOOK-NICHT-REGISTRIERT", os.path.relpath(settings_pfad, base), 0,
+            "settings.json ist lesbar und gueltiges JSON",
+            "liess sich nicht lesen/parsen (%s) -- Registrierungspruefung uebersprungen, "
+            "damit ein kaputtes settings.json nicht jeden Hook faelschlich als fehlend "
+            "meldet." % exc, severity="hint")]
+    kommandos = []
+    for eintraege in (settings.get("hooks") or {}).values():
+        for eintrag in eintraege:
+            for h in (eintrag.get("hooks") or []):
+                kommandos.append(h.get("command") or "")
+    kommando_text = "\n".join(kommandos)
+    findings = []
+    for name in sorted(os.listdir(hooks_dir)):
+        pfad = os.path.join(hooks_dir, name)
+        if not os.path.isfile(pfad) or not _ist_skript(pfad):
+            continue
+        if name in kommando_text:
+            continue
+        kopf = "\n".join(read_lines(pfad)[:40])
+        if NICHT_REGISTRIERT_RE.search(kopf):
+            continue
+        findings.append(Finding(
+            "HOOK-NICHT-REGISTRIERT", os.path.relpath(pfad, base), 1,
+            "liegt unter %s, ausfuehrbares Skript" % hooks_dir,
+            "kommt in keinem 'command' unter settings.json -> hooks vor -- installiert, "
+            "aber nicht aktiv. Entweder in settings.json eintragen, oder falls die Logik "
+            "anderswo aufgegangen ist, in den ersten 40 Zeilen selbst vermerken: "
+            "'NICHT REGISTRIERT: <Begruendung>'.", severity="error"))
+    return findings
+
+
 def check9_harness_konfig(cfg, base):
     c9 = cfg.get("check9_harness_konfig")
     if not c9:
@@ -2931,6 +3239,7 @@ def main():
     all_findings += check9_harness_konfig(cfg, args.base)
     all_findings += check10_pane_quellen(cfg, args.base)
     all_findings += check11_pipefail_erstglied(cfg, args.base)
+    all_findings += check12_hook_registrierung(cfg, args.base)
 
     if not args.quiet:
         for f in all_findings:

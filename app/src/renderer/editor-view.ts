@@ -7,6 +7,8 @@
 // und haengt sie an vorhandene Elemente (#mitte, #buehne) -- index.html bleibt
 // unveraendert. renderer.ts bekommt nur den einen Aufruf `initEditorView()`.
 import './editor-view.css';
+// `tx`, nicht `t`: in dieser Datei heisst ein Tab schon `t`.
+import { t as tx } from './texte';
 // Monaco kommt seit dem 16.08. ERST BEIM ERSTEN EDITOR-TAB, nicht mehr beim
 // Fensterstart. Gemessen wurde der Unterschied kopflos, je fuenf Laeufe: das
 // Laden des Renderer-Dokuments bis zur Bereitschaftsmeldung dauerte mit
@@ -30,7 +32,12 @@ type EditorResult<T> = EditorBridgeResult<T> | EditorBridgeError;
 
 interface ModelLite {
   sessions: { id: string; dir: string; orchestratorPane: string }[];
+  /** Die Chat-Sitzungen und welche gerade auf der Buehne liegt (chatdatei, 05.09.2026). */
+  chats?: { id: string; ordner: string }[];
+  chatGezeigt?: string;
   selected: string;
+  /** Die Ansichtswahlen aus ui.json; hier zaehlt nur `editorEingeklappt`. */
+  ui?: { editorEingeklappt?: boolean };
 }
 
 export interface ProtokollEintrag { label: string; path: string; exists: boolean; size: number; mtimeMs: number }
@@ -67,6 +74,12 @@ interface EditorBridge {
   // Begriffe der Chat-Ansicht nicht ein zweites Mal fuehren muss; wer sie
   // braucht, holt sie aus app/src/chat/typen.ts.
   chatStand(paneId: string): Promise<EditorResult<unknown>>;
+  /** Setzt die Sitzungs-Uebersteuerung -- derselbe Schreibweg wie der Rechtsklick. */
+  chatAnsichtSetzen(paneId: string, an: boolean): Promise<EditorResult<{ gesetzt: boolean }>>;
+  // PFADE IM CHAT, ANKLICKBAR (chatdatei, 05.09.2026). Nutzlast lose wie bei
+  // `chatStand`, aus demselben Grund; gedeutet wird sie in renderer/chatdatei.ts.
+  chatPfade(paneId: string, kandidaten: string[]): Promise<EditorResult<unknown>>;
+  chatPfadOeffnen(abs: string): Promise<EditorResult<unknown>>;
   /** Die Sprache der Oberflaeche (SPEC-V4 Abschnitt 4) -- 'de' oder 'en'. */
   sprache(): Promise<string>;
 }
@@ -137,6 +150,23 @@ let activeIndex = -1;
 let viewSeq = 0;
 
 let tabRow: HTMLDivElement;
+/**
+ * EINGEKLAPPT (05.09.2026, Wort des Nutzers: „Editor auch einklappbar, soll nur
+ * Platz brauchen, wenn man ihn braucht"). Die Tabs bleiben offen, das Modell
+ * und die Cursorstelle bleiben, sichtbar ist nur eine schmale Leiste mit dem
+ * Namen der gewaehlten Datei und ihrem Aenderungspunkt; die Buehne hat ihren
+ * Platz zurueck. Ein Klick auf die Leiste klappt wieder auf. Geschlossen (alle
+ * Tabs zu) ist er wie bisher ganz weg. Gemerkt wird der Zustand in ui.json
+ * (`editorEingeklappt`), wie jede andere Ansichtswahl; der Hauptprozess
+ * schickt ihn mit jedem Modell zurueck.
+ */
+let eingeklappt = false;
+/**
+ * Was zuletzt an den Hauptprozess gemeldet wurde und noch nicht im Modell
+ * angekommen ist -- ein Modelltakt, der schon unterwegs war, traegt den alten
+ * Wert und darf die frische Wahl nicht zuruecknehmen.
+ */
+let eingeklapptGemeldet: boolean | null = null;
 let editorHost: HTMLDivElement;
 let monacoMount: HTMLDivElement;
 let diffHost: HTMLDivElement;
@@ -165,15 +195,52 @@ function basename(rel: string): string {
   return teile[teile.length - 1] || rel;
 }
 
+/** Ein Winkel als Knopf: nach unten heisst einklappen, nach oben aufklappen. */
+function klappKnopf(auf: boolean): HTMLButtonElement {
+  const knopf = document.createElement('button');
+  knopf.type = 'button';
+  knopf.className = 'ed-klapp';
+  knopf.id = auf ? 'ed-aufklappen' : 'ed-einklappen';
+  knopf.title = auf ? tx('editor.aufklappen') : tx('editor.einklappen');
+  knopf.setAttribute('aria-expanded', auf ? 'false' : 'true');
+  knopf.innerHTML = auf
+    ? '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 10l4.5-4.5 4.5 4.5"/></svg>'
+    : '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 6l4.5 4.5L12.5 6"/></svg>';
+  knopf.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (auf) aufklappen(); else einklappen();
+  });
+  return knopf;
+}
+
 function zeichneTabs(): void {
   tabRow.replaceChildren();
+  tabRow.classList.toggle('eingeklappt', eingeklappt && activeIndex >= 0);
   if (!tabs.length) return; // 4c: keine Datei offen -> keine Tab-Zeile.
+
+  // DIE EINGEKLAPPTE LEISTE: Winkel, Dateiname, Aenderungspunkt -- und sonst
+  // nichts. Ein Klick irgendwo darauf klappt auf. Sie steht nur, solange ein
+  // Dateitab gewaehlt ist; auf dem Terminal-Tab gibt es nichts einzuklappen.
+  if (eingeklappt && activeIndex >= 0) {
+    const t = tabs[activeIndex];
+    const leiste = document.createElement('button');
+    leiste.type = 'button';
+    leiste.className = 'ed-zu';
+    leiste.title = tx('editor.aufklappen');
+    const name = document.createElement('span');
+    name.className = 'ed-zu-name';
+    name.textContent = (t.dirty ? '● ' : '') + t.label;
+    leiste.append(klappKnopf(true), name);
+    leiste.addEventListener('click', () => aufklappen());
+    tabRow.appendChild(leiste);
+    return;
+  }
 
   const terminal = document.createElement('button');
   terminal.type = 'button';
   terminal.className = `ed-tab${activeIndex === -1 ? ' gewaehlt' : ''}`;
   const tLabel = document.createElement('span');
-  tLabel.textContent = 'Terminal';
+  tLabel.textContent = tx('editor.terminal');
   terminal.appendChild(tLabel);
   terminal.addEventListener('click', () => activateTab(-1));
   tabRow.appendChild(terminal);
@@ -197,6 +264,8 @@ function zeichneTabs(): void {
     btn.addEventListener('click', () => activateTab(i));
     tabRow.appendChild(btn);
   });
+  // Der Griff am rechten Rand, nur wenn gerade ein Editor die Mitte fuellt.
+  if (activeIndex >= 0) tabRow.appendChild(klappKnopf(false));
 }
 
 /**
@@ -259,7 +328,7 @@ function ensureEditor(): monaco.editor.IStandaloneCodeEditor {
   });
   editor.addAction({
     id: 'awb.sendSelectionToOrchestrator',
-    label: 'An Orchestrator senden',
+    label: tx('editor.senden'),
     contextMenuGroupId: 'awb',
     contextMenuOrder: 1,
     keybindings: [mo.KeyMod.CtrlCmd | mo.KeyMod.Shift | mo.KeyCode.Enter],
@@ -269,7 +338,7 @@ function ensureEditor(): monaco.editor.IStandaloneCodeEditor {
   });
   editor.addAction({
     id: 'awb.saveFile',
-    label: 'Datei speichern',
+    label: tx('editor.speichern'),
     keybindings: [mo.KeyMod.CtrlCmd | mo.KeyCode.KeyS],
     run: () => {
       void saveActive();
@@ -306,7 +375,26 @@ function activateTab(index: number): void {
     else if (vorher.kind === 'diff' && diffEditor) vorher.viewState = diffEditor.saveViewState();
   }
   activeIndex = index;
-  if (index === -1) {
+  zeigen();
+}
+
+/**
+ * Die Buehne zeigen (Reiter „Terminal"), ohne einen Tab zu schliessen. Die
+ * Ansicht Agents liegt IN der Buehne; ein gewaehlter Dateitab verdeckte sie
+ * sonst, obwohl oben „Agents" gewaehlt war (gemessen 10.09., ansicht4e).
+ */
+export function editorBuehneZeigen(): void {
+  if (activeIndex !== -1) activateTab(-1);
+}
+
+/**
+ * Die Mitte nach Tab und Klappzustand herrichten: Buehne oder eine der drei
+ * Editor-Kacheln. Eingeklappt zeigt sie die Buehne, auch wenn ein Dateitab
+ * gewaehlt ist -- das ist der ganze Sinn des Einklappens.
+ */
+function zeigen(): void {
+  const index = activeIndex;
+  if (index === -1 || eingeklappt) {
     editorHost.hidden = true;
     diffHost.hidden = true;
     auftragHost.style.display = 'none';
@@ -333,10 +421,40 @@ function activateTab(index: number): void {
     if (t.viewState) ed.restoreViewState(t.viewState as monaco.editor.IDiffEditorViewState);
     ed.layout();
   } else {
-    auftragAuftragEl.textContent = t.auftragText || '(kein aufgezeichneter Auftragstext)';
+    auftragAuftragEl.textContent = t.auftragText || tx('editor.ohneAuftragstext');
     auftragErgebnisEl.textContent = t.ergebnisText;
   }
   zeichneTabs();
+}
+
+/** Die Cursorstelle des sichtbaren Editors am Tab merken, bevor er verschwindet. */
+function stelleMerken(): void {
+  const t = tabs[activeIndex];
+  if (!t) return;
+  if ((t.kind === 'file' || t.kind === 'absolute') && editor) t.viewState = editor.saveViewState();
+  else if (t.kind === 'diff' && diffEditor) t.viewState = diffEditor.saveViewState();
+}
+
+function klappzustandMelden(wert: boolean): void {
+  eingeklapptGemeldet = wert;
+  (window as unknown as { awbBridge: { bedienung: (a: string, w: unknown) => void } })
+    .awbBridge.bedienung('editor-eingeklappt', wert);
+}
+
+function einklappen(): void {
+  if (eingeklappt || activeIndex < 0) return;
+  stelleMerken();
+  eingeklappt = true;
+  klappzustandMelden(true);
+  zeigen();
+}
+
+/** Aufklappen: derselbe Tab, dasselbe Modell, dieselbe Cursorstelle (`zeigen` stellt sie wieder her). */
+function aufklappen(): void {
+  if (!eingeklappt) return;
+  eingeklappt = false;
+  klappzustandMelden(false);
+  zeigen();
 }
 
 function closeTab(index: number): void {
@@ -358,9 +476,13 @@ function closeTab(index: number): void {
 
 async function openFile(rel: string): Promise<boolean> {
   if (!projectRoot) {
-    notiz('keine Session gewaehlt -- kein Projektordner');
+    notiz(tx('editor.ohneOrdner'));
     return false;
   }
+  // WER OEFFNET, WILL SEHEN: ein Oeffnen hebt das Einklappen auf, auch wenn
+  // der Tab schon da ist. Sonst stuende nach dem Klick im Ordner-Blatt weiter
+  // nur die schmale Leiste, und nichts saehe nach einer Antwort aus.
+  if (eingeklappt) { eingeklappt = false; klappzustandMelden(false); }
   const bestehend = tabs.findIndex((t) => t.kind === 'file' && t.key === rel);
   if (bestehend >= 0) {
     activateTab(bestehend);
@@ -369,7 +491,7 @@ async function openFile(rel: string): Promise<boolean> {
   // Sofortige Rueckmeldung, BEVOR die Antwort da ist (Befund 9, 15.08.): ohne
   // sie wirkt die App bei einer langsamen IPC-Antwort eingefroren -- kein
   // Unterschied zwischen "arbeitet" und "haengt".
-  notiz(`lädt: ${rel}`);
+  notiz(tx('editor.laedt', { name: rel }));
   const [res, mo] = await Promise.all([window.awbEditorBridge.readFile(projectRoot, rel), monacoLaden()]);
   if (!res.ok) {
     notiz(res.error);
@@ -383,7 +505,7 @@ async function openFile(rel: string): Promise<boolean> {
     viewState: null, dirty: false, readOnly: false,
   });
   activateTab(tabs.length - 1);
-  notiz(`geöffnet: ${rel}`);
+  notiz(tx('editor.geoeffnet', { name: rel }));
   return true;
 }
 
@@ -395,6 +517,7 @@ async function openFile(rel: string): Promise<boolean> {
  * einen zweiten anzulegen.
  */
 export async function openAbsoluteTab(key: string, label: string, abs: string, content: string): Promise<void> {
+  if (eingeklappt) { eingeklappt = false; klappzustandMelden(false); }
   const bestehend = tabs.findIndex((t) => t.kind === 'absolute' && t.key === key);
   if (bestehend >= 0) {
     activateTab(bestehend);
@@ -411,8 +534,40 @@ export async function openAbsoluteTab(key: string, label: string, abs: string, c
   activateTab(tabs.length - 1);
 }
 
+/**
+ * EIN PFAD AUS DEM CHAT (chatdatei, 05.09.2026). Liegt die Datei im
+ * Projektordner, geht sie denselben Weg wie ein Klick im Ordner-Blatt oder im
+ * Schnelloeffner (`openFile`, editierbar, mit Ausschlussliste); liegt sie
+ * ausserhalb (`~/.pi-workers/results/...`), wird der vom Hauptprozess schon
+ * gelesene Inhalt schreibgeschuetzt gezeigt -- derselbe Tab wie bei einem
+ * Ergebnis aus der Aktivitaet. Danach springt der Editor an die genannte
+ * Zeile. Gibt false zurueck, wenn nichts aufging (dann steht der Grund als Notiz).
+ */
+export async function oeffneChatDatei(abs: string, name: string, content: string, zeile: number, spalte: number): Promise<boolean> {
+  const wurzel = projectRoot.replace(/\/+$/, '');
+  let offen: boolean;
+  if (wurzel && abs.startsWith(`${wurzel}/`)) {
+    offen = await openFile(abs.slice(wurzel.length + 1));
+  } else {
+    await openAbsoluteTab(abs, name, abs, content);
+    offen = true;
+  }
+  if (offen && zeile > 0 && editor) {
+    editor.revealLineInCenter(zeile);
+    editor.setPosition({ lineNumber: zeile, column: Math.max(1, spalte) });
+    editor.focus();
+  }
+  return offen;
+}
+
+/** Eine Notiz im Editor zeigen -- fuer Aufrufer ausserhalb dieser Datei (renderer/chatdatei.ts). */
+export function editorNotiz(text: string): void {
+  if (notizEl) notiz(text);
+}
+
 /** Der zweite Klick auf eine Aenderung (V15): zwei Fassungen, Monacos eigener Diff-Editor stellt sie dar. */
 export async function openDiffTab(key: string, label: string, original: string, modified: string): Promise<void> {
+  if (eingeklappt) { eingeklappt = false; klappzustandMelden(false); }
   const bestehend = tabs.findIndex((t) => t.kind === 'diff' && t.key === key);
   if (bestehend >= 0) {
     activateTab(bestehend);
@@ -431,6 +586,7 @@ export async function openDiffTab(key: string, label: string, original: string, 
 
 /** Der zweite Klick auf ein Ergebnis (V18): Auftrag und Ergebnis nebeneinander, schlichter Text. */
 export function openAuftragTab(key: string, label: string, auftragText: string, ergebnisText: string): void {
+  if (eingeklappt) { eingeklappt = false; klappzustandMelden(false); }
   const bestehend = tabs.findIndex((t) => t.kind === 'auftrag' && t.key === key);
   if (bestehend >= 0) {
     activateTab(bestehend);
@@ -447,20 +603,20 @@ export function openAuftragTab(key: string, label: string, auftragText: string, 
 async function saveActive(): Promise<boolean> {
   const t = tabs[activeIndex];
   if (!t || t.kind !== 'file') {
-    notiz('kein Datei-Tab gewaehlt');
+    notiz(tx('editor.ohneDateiTab'));
     return false;
   }
   const content = t.model!.getValue();
   // Dieselbe sofortige Rueckmeldung wie in openFile() -- siehe dort (Befund 9).
-  notiz(`lädt: ${t.key}`);
+  notiz(tx('editor.laedt', { name: t.key }));
   const res = await window.awbEditorBridge.writeFile(projectRoot, t.key, content);
   if (!res.ok) {
-    notiz(`Speichern fehlgeschlagen: ${res.error}`);
+    notiz(tx('editor.speichernFehler', { grund: res.error }));
     return false;
   }
   t.dirty = false;
   zeichneTabs();
-  notiz(`gespeichert: ${t.key}`);
+  notiz(tx('editor.gespeichert', { name: t.key }));
   return true;
 }
 
@@ -474,16 +630,16 @@ async function saveActive(): Promise<boolean> {
 async function sendSelection(): Promise<boolean> {
   const t = tabs[activeIndex];
   if (!t || (t.kind !== 'file' && t.kind !== 'absolute') || !editor) {
-    notiz('kein Datei-Tab gewaehlt');
+    notiz(tx('editor.ohneDateiTab'));
     return false;
   }
   const sel = editor.getSelection();
   if (!sel || sel.isEmpty()) {
-    notiz('keine Auswahl markiert');
+    notiz(tx('editor.ohneAuswahl'));
     return false;
   }
   if (!orchestratorPane) {
-    notiz('kein Orchestrator-Pane fuer diese Session bekannt');
+    notiz(tx('editor.ohneOrchestrator'));
     return false;
   }
   const text = t.model!.getValueInRange(sel);
@@ -496,10 +652,10 @@ async function sendSelection(): Promise<boolean> {
   const nachricht = `${pfadAnzeige}:${zeilen}\n${text}`;
   const res = await window.awbEditorBridge.sendSelection(orchestratorPane, nachricht);
   if (!res.ok) {
-    notiz(`Senden fehlgeschlagen: ${res.error}`);
+    notiz(tx('editor.sendenFehler', { grund: res.error }));
     return false;
   }
-  notiz('Auswahl an den Orchestrator geschickt');
+  notiz(tx('editor.gesendet'));
   return true;
 }
 
@@ -606,7 +762,7 @@ function ensureQuickOpen(): void {
 
 async function openQuickOpen(): Promise<void> {
   if (!projectRoot) {
-    notiz('keine Session gewaehlt -- kein Projektordner');
+    notiz(tx('editor.ohneOrdner'));
     return;
   }
   ensureQuickOpen();
@@ -646,7 +802,7 @@ function renderQoList(): void {
   if (!qoMatches.length) {
     const leer = document.createElement('div');
     leer.className = 'ed-qo-leer';
-    leer.textContent = 'kein Treffer';
+    leer.textContent = tx('editor.keinTreffer');
     qoList.appendChild(leer);
     return;
   }
@@ -736,8 +892,28 @@ export function initEditorView(): void {
   modellBeobachten((p) => {
     const m = p as ModelLite;
     const s = m.sessions.find((x) => x.id === m.selected);
-    projectRoot = s?.dir ?? '';
+    // LIEGT EIN GESPRAECH AUF DER BUEHNE, IST SEIN ORDNER DIE WURZEL (chatdatei,
+    // 05.09.2026) -- dieselbe Regel, nach der das Ordner-Blatt seine Wurzel
+    // waehlt (main.ts, ordnerWurzel). Bis heute blieb die Wurzel bei einer
+    // Chat-Sitzung leer, und ein Pfad aus dem Gespraech ging nur
+    // schreibgeschuetzt auf, obwohl er im Projekt lag.
+    const chat = m.chatGezeigt ? (m.chats ?? []).find((c) => c.id === m.chatGezeigt) : undefined;
+    projectRoot = chat?.ordner || s?.dir || '';
     orchestratorPane = s?.orchestratorPane ?? '';
+    // Der gemerkte Klappzustand aus ui.json. Ein Takt, der noch den alten
+    // Wert traegt, waehrend die frische Meldung unterwegs ist, wird
+    // uebergangen; sobald das Modell die Meldung widerspiegelt, gilt es
+    // wieder als Quelle.
+    const gemerkt = m.ui?.editorEingeklappt === true;
+    if (eingeklapptGemeldet !== null) {
+      if (gemerkt !== eingeklapptGemeldet) return;
+      eingeklapptGemeldet = null;
+    }
+    if (gemerkt !== eingeklappt) {
+      if (gemerkt) stelleMerken();
+      eingeklappt = gemerkt;
+      zeigen();
+    }
   });
 
   window.addEventListener('resize', () => {
@@ -774,7 +950,30 @@ export function initEditorView(): void {
         auftragSichtbar: auftragHost.style.display !== 'none',
         buehneSichtbar: buehneEl?.style.display !== 'none',
         tabZeileSichtbar: tabRow.children.length > 0,
+        // Eingeklappt (05.09.): steht nur die schmale Leiste, und was zeigt sie?
+        eingeklappt,
+        zuLeiste: (tabRow.querySelector('.ed-zu-name')?.textContent ?? '').trim(),
+        zuLeisteHoehe: Math.round(tabRow.getBoundingClientRect().height),
+        einklappKnopf: !!tabRow.querySelector('#ed-einklappen'),
+        // Die Cursorstelle des sichtbaren Editors -- daran misst der Test,
+        // dass Aufklappen dieselbe Stelle zurueckbringt.
+        cursor: (() => {
+          const pos = editor?.getPosition();
+          return pos ? { zeile: pos.lineNumber, spalte: pos.column } : null;
+        })(),
+        // chatdatei (05.09.2026): welche Datei gerade offen ist -- der Beleg,
+        // dass ein Klick auf `datei:123` in der richtigen Datei landet.
+        aktiverPfad: tabs[activeIndex]?.abs ?? '',
       };
+    },
+    einklappen: (): boolean => { einklappen(); return eingeklappt; },
+    aufklappen: (): boolean => { aufklappen(); return !eingeklappt; },
+    // Den Cursor setzen, ohne eine Auswahl: dieselbe Stelle muss nach dem
+    // Auf- und Zuklappen wieder dastehen.
+    setzeCursor: (arg: { zeile: number; spalte: number }): boolean => {
+      if (!editor) return false;
+      editor.setPosition({ lineNumber: arg.zeile, column: arg.spalte });
+      return true;
     },
     openFile: (rel: string) => openFile(rel),
     // V15/V16/V18 (Schritt 9), fuer den Belegtest ohne einen echten

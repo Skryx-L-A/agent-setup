@@ -32,6 +32,9 @@ FLOSKELN = [
     "abschließend lässt sich sagen", "zusammenfassend", "interessant wird es",
     "spannend ist dabei", "über eine rückmeldung würde ich mich freuen",
     "nicht zuletzt", "darüber hinaus", "es lässt sich festhalten",
+    # 01.09.2026: Erfolgswunsch an die Gegenseite dreht die Rollen um, wenn der Nutzer
+    # selbst der Bewerber ist. Siehe reference/ki-marker.md.
+    "viel erfolg bei der suche", "viel erfolg bei der auswahl",
 ]
 
 UEBERNUTZT = [
@@ -96,6 +99,21 @@ def befunde(text: str) -> list[tuple[str, str]]:
     for x in s:
         if x.count(",") >= 3 and re.search(r",\s*und\s+\w+", x):
             aus.append(("hinweis", f"Moegliche Verbkette: {x[:90]}"))
+
+    # Pauschale Verfuegbarkeitszusagen: Aussage ueber Kalender des Nutzers, nie ungeprueft.
+    for m in re.finditer(r"(jederzeit|jeden tag|an jedem tag|zu jeder (uhr)?zeit|immer zeit|voellig flexibel|völlig flexibel|ganz flexibel)", klein):
+        anfang = max(0, m.start() - 40)
+        auszug = " ".join(text[anfang:m.end() + 30].split())
+        aus.append(("hoch", f"Verfuegbarkeit gegen den Kalender pruefen: ...{auszug}..."))
+        break
+
+    # Wir-Form in einem Text, der aus Sicht des Nutzers geschrieben ist: Er ist eine Person.
+    # Haeufigster Weg hinein ist das Spiegeln eines "uns" aus der eingehenden Nachricht.
+    for m in re.finditer(r"\b(wir|uns|unser[emsn]?)\b", klein):
+        anfang = max(0, m.start() - 45)
+        auszug = " ".join(text[anfang:m.end() + 25].split())
+        aus.append(("hinweis", f"Wir-Form pruefen (der Nutzer ist eine Person): ...{auszug}..."))
+        break
 
     for gruppe, name in ((FLOSKELN, "Floskel"), (UEBERNUTZT, "uebernutztes Wort"),
                          (WEICHSPUELER, "Weichspueler")):

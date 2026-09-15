@@ -8,7 +8,13 @@
 #   wb-belegung nimm   …            Beides zusammen: fragen UND eintragen, unter einer
 #                                   Sperre, damit zwei gleichzeitige Frager nicht beide
 #                                   ein Ja bekommen.
-#   wb-belegung geladen <kennung>   Das Modell steht jetzt IM Speicher.
+#   wb-belegung geladen <kennung>   Das Modell steht jetzt IM Speicher. --pid <n>
+#                                   --prozess-haelt haengt die Belegung ab jetzt an
+#                                   GENAU DIESEN Prozess statt an einen Pane (Nachtrag
+#                                   2026-09-08, Auftrag "buchung", Befund 1: fuer eine
+#                                   Server-Gewichtebuchung, die laenger lebt als der
+#                                   kurzlebige Pane, der den Start ausgeloest hat --
+#                                   siehe zustand_bestimmen()).
 #   wb-belegung verlaengern <kennung> --frist <minuten>
 #   wb-belegung uebernehmen <kennung>   Haengt die Belegung an den EIGENEN,
 #                                   gerade aufrufenden Pane -- danach verfaellt
@@ -130,11 +136,11 @@
 # hw.memsize` mit absolutem Pfad, auf Linux `os.sysconf`), und die Antwort sagt
 # dazu, dass ungebuchter Speicher in dieser Rechnung nicht vorkommt.
 #
-# DIE RESERVE IST GEKOPPELT, SIE IST KEINE HAUSNUMMER. Sie steht auf 6,0 GiB, also
-# auf 6144 MiB, und das ist genau die Zahl, die die Messstrecke der Nachbarsitzung an
-# zwei Stellen fuehrt: ihre Vorabpruefung laesst eine Stufe nur zu, wenn rechnerisch
-# mindestens diese Reserve frei bleibt, und ihre Notbremse feuert in dem Augenblick, in
-# dem die Wirklichkeit diese Rechnung widerlegt. Beide Zahlen sind dort mit Absicht
+# DIE RESERVE WAR GEKOPPELT, SIE WAR KEINE HAUSNUMMER. Sie stand auf 6,0 GiB, also
+# auf 6144 MiB, und das war genau die Zahl, die die Messstrecke der Nachbarsitzung an
+# zwei Stellen fuehrt: ihre Vorabpruefung liess eine Stufe nur zu, wenn rechnerisch
+# mindestens diese Reserve frei blieb, und ihre Notbremse feuerte in dem Augenblick, in
+# dem die Wirklichkeit diese Rechnung widerlegte. Beide Zahlen waren dort mit Absicht
 # dieselbe.
 #
 # WER SIE HIER SENKT, HEBELT DIE BREMSE AUS, und zwar lautlos: Von zwei Waechtern mit
@@ -145,6 +151,24 @@
 # gebaut werden. `--reserve-gb` bleibt fuer einen einzelnen Aufruf offen (etwa um zu
 # sehen, was mit mehr Luft ginge); die VORGABE gehoert nur zusammen mit der Schwelle
 # der Messstrecke veraendert, und nie unter sie.
+#
+# GENAU DAS IST AM 27.08.2026 TROTZDEM PASSIERT, AUF AUSDRUECKLICHE des Nutzers
+# ANWEISUNG: "aendere die Rechnung so, dass sie nicht mehr aufschlaegt, was das
+# Modell per Rechnung braucht, und baue stattdessen eine Not-Abschaltung, die
+# das Modell sofort killt, wenn weniger als 0,5 GB frei sind". RESERVE_GIB
+# UND der Zuschlag unten (ZUSCHLAG_FIXED_GIB, ZUSCHLAG_JE_SEQUENZ_GIB) gehen
+# auf 0 -- diese Zahl war eine ECHTE Messung, keine geratene Vorsicht, siehe
+# oben, und mit ihr faellt genau die Kopplung weg, vor der dieser Abschnitt
+# warnt. Der Ersatz ist NICHT eine andere Zahl hier, sondern `wb-notbremse`:
+# es haengt seit demselben Tag an jedem `wb-mlx-server`-Start, kennt die PID
+# des gestarteten Modells direkt (keine Muster-Suche) und beendet sie, wenn
+# der wirklich freie Speicher unter 512 MiB faellt -- eine Bremse NACH dem
+# Start statt einer Reserve VOR der Buchung. Was damit aufgegeben wird: diese
+# Buchung erlaubt jetzt Laeufe, deren Spitze rechnerisch bis auf den letzten
+# MiB an den Gesamtspeicher heranreicht, mit nichts mehr dazwischen ausser der
+# Notbremse -- und ob die schnell genug greift, ist nur gegen einen
+# harmlosen Testprozess erprobt, nie gegen einen echten Speicherengpass
+# (siehe deren Kopfkommentar und das Ergebnisprotokoll dieses Auftrags).
 #
 # DER FREIE SPEICHER WIRD NIE AUS EINER EINZIGEN ABTASTUNG GENOMMEN. MLX gibt seine
 # Puffer verzoegert zurueck; unmittelbar nach einer Stufe wurde dort eine Messung mit
@@ -168,6 +192,46 @@
 # Pane (ausserhalb tmux angelegt, oder tmux nicht auffindbar) verfaellt nach
 # Frist + Karenz von selbst — sonst koennte eine vergessene Belegung die Maschine
 # dauerhaft sperren, und das darf nie passieren.
+#
+# EIN PROZESS KANN AUCH DER HALTER SEIN, NICHT NUR EIN PANE (Nachtrag 2026-09-08,
+# Auftrag "buchung", Gegenleser-Befund 1). Ein wb-mlx-server-Serverstart lief bisher
+# als Belegung des PANES, der `ensure` aufgerufen hat -- und genau dieser Pane kann
+# lange vor dem Server selbst sterben (ein einzelner, kurzlebiger Worker-Durchlauf,
+# der `ensure` ausloest und danach schliesst), waehrend der Serverprozess ungestoert
+# weiterlaeuft. Die Belegung verfiel dann mit dem Pane, obwohl der reale
+# Speicherverbrauch unveraendert weiterbestand -- gemessen: Summe 0 bei N laufenden
+# Stroemen. `wb-belegung geladen <kennung> --pid <n> --prozess-haelt` haengt eine
+# Belegung ab dem Moment, in dem der Prozess NACHWEISLICH laeuft (Health/Probe schon
+# durch), an GENAU DIESEN Prozess statt an den startenden Pane -- Halter wird
+# `{"halter_art": "prozess", ...}`, kein Pane mehr. `zustand_bestimmen()` prueft
+# danach dieselbe PID/lstart-Lebendigkeit wie das bestehende 'tot'-Merkmal (siehe
+# prozess_lebt()), nur als PRIMAERES, nicht sekundaeres Kriterium: lebt der Prozess,
+# verfaellt die Belegung NIE ueber die Frist (nur 'ueberfaellig', zaehlt weiter genau
+# wie bei einem lebenden Pane); stirbt er, verfaellt sie SOFORT -- symmetrisch zum
+# Pane-Fall, keine dritte 'tot'-Zwischenstufe fuer diesen Halter-Typ.
+#
+# JEDER STROM WIRD VOM WORKER GEBUCHT, DER IHN FAEHRT -- AUCH DER ERSTE (dieselbe
+# Runde). Der Serverstart selbst bucht ab jetzt NUR NOCH Gewichte (+ Entwerfer +
+# Prompt-/APC-Cache-Pool), niemals eine Strom-KV-Zahl fuer einen Aufrufer stellvertretend
+# mit -- `--nur-gewichte` (siehe rechen_argumente) schaltet den KV-Anteil der Spitze
+# fuer genau diese eine Buchung auf 0, unabhaengig von --kontext/--parallel (die bleiben
+# rein informativ, fuer die Anzeige). Damit entfaellt der alte Sonderfall
+# "gestartet=frisch bucht der Serverstart schon eine Sequenz mit" vollstaendig, und mit
+# ihm die Notwendigkeit, bei einem Kapazitaets-Neustart fremde Geschwister-Buchungen
+# wieder freizugeben -- jede Strom-Buchung bleibt die ganze Zeit unangetastet beim
+# Worker, der sie haelt, ein Serverneustart aendert daran nichts.
+#
+# EIN CACHE KANN EXAKT ODER ALS DECKEL GEBUCHT WERDEN. `--prompt-cache-gb` bucht einen
+# GESETZTEN Deckel mal PROMPT_CACHE_DECKEL_FAKTOR (mlx_lm.servers LRUPromptCache
+# UEBERSCHREITET ihren Deckel gemessen um rund das Doppelte, siehe dort). mlx-vlms
+# APC-Blockpool ist dagegen eine EXAKTE, feste Zuteilung (Bloecke x Blockgroesse x
+# KV-Bedarf je Token) -- kein weiches Wachstum, das ueberschiessen koennte. Denselben
+# Faktor auf eine exakte Zahl anzuwenden wuerde rund das 2,2-fache dessen buchen, was
+# der Pool wirklich reserviert. `--prompt-cache-exakt-gb` bucht deshalb unveraendert,
+# ohne Faktor -- ein eigener Schalter statt eine dritte Bedeutung von
+# `--prompt-cache-gb`, aus demselben Grund wie bei --metal-fraktion: eine Zahl, deren
+# Herkunft sich nicht mehr am Namen des Schalters ablesen laesst, ist eine Falle fuer
+# den naechsten Leser.
 #
 # VERWANDT: `gpu-slot` (nur in ~/.local/bin) ist die Alles-oder-nichts-Fassung
 # desselben Gedankens — ein Platz, ein Halter. Es bleibt, wie es ist; wer nur einen
@@ -213,9 +277,12 @@ FRIST_MIN = 45          # Nachtrag 11.08.: eine Stufe laeuft bis 900 s, eine vol
                         # Leiter samt Serverstart und Kalibrierung 20-40 min, und das
                         # Laden eines grossen Modells allein mehrere Minuten.
 KARENZ_MIN = 60         # nur fuer Belegungen OHNE messbaren Pane, siehe Kopf.
-RESERVE_GIB = 6.0       # 6144 MiB. NICHT frei waehlbar — siehe „Die Reserve ist
-                        # gekoppelt" unten, bevor jemand sie senkt.
-ZUSCHLAG_JE_SEQUENZ_GIB = 2.3  # Prompt-Cache und Spitzen, PRO Sequenz -- Herleitung
+RESERVE_GIB = 0.0       # WAR 6.0 (6144 MiB), siehe „Die Reserve war gekoppelt" oben --
+                        # auf Null gesetzt 2026-08-27, ausdrueckliche des Nutzers
+                        # Anweisung, mit wb-notbremse (Schwelle 512 MiB, PID-Anbindung
+                        # an jeden wb-mlx-server-Start) als Ersatz danach statt einer
+                        # Reserve davor.
+ZUSCHLAG_JE_SEQUENZ_GIB = 0.0  # WAR 2.3, Prompt-Cache und Spitzen, PRO Sequenz -- Herleitung
 # unten bei zuschlag_herleiten(). URSPRUENGLICH 0.6 (der Nutzer, 2026-08-19, Betriebsfehler 1, zweite
 # Runde Prueferbefunde): der alte ZUSCHLAG_GIB=4.0 war ein FESTER Wert, unabhaengig
 # von --parallel -- richtig fuer die Betriebsart, in der EIN Aufruf mehrere
@@ -271,7 +338,19 @@ ZUSCHLAG_JE_SEQUENZ_GIB = 2.3  # Prompt-Cache und Spitzen, PRO Sequenz -- Herlei
 # einer Maschine mit deutlich mehr als 48 GiB freiem Speicher wiederholen, oder mit
 # einem kuerzeren Kontext/kleineren Modell, wo eine Spitze von absehbar unter 40 GiB
 # bleibt. Volle Rohdaten und Einzelwerte: Ergebnis 20260820-075413.md.
-ZUSCHLAG_FIXED_GIB = 2.0  # Sockel, unabhaengig von der Stromzahl -- siehe Nachtrag oben.
+ZUSCHLAG_FIXED_GIB = 0.0  # WAR 2.0, Sockel, unabhaengig von der Stromzahl -- siehe Nachtrag oben.
+# BEIDE ZUSCHLAG-KONSTANTEN AUF NULL (2026-08-27, ausdrueckliche des Nutzers
+# Anweisung, siehe die Anmerkung bei RESERVE_GIB oben und "GENAU DAS IST AM
+# 27.08.2026 TROTZDEM PASSIERT" im Kopfkommentar): das waren ECHTE, mehrfach
+# nachgemessene Werte (siehe der lange Nachtrag oben, drei echte Laeufe gegen
+# einen echten qwen38-27b-Server), keine geratene Vorsicht -- die Buchung
+# rechnet ab jetzt NUR NOCH Gewichte + KV-Cache, ohne Korrektur fuer
+# Prompt-Cache-internals und Metal-Spitzen, die dieselbe Messung
+# nachgewiesen, aber von der reinen Gewichte+KV-Formel nicht erfasst hat.
+# `zuschlag_herleiten()` bleibt unveraendert stehen (liefert jetzt ueberall
+# 0.0) -- so bleibt die Formel und ihre Herleitung lesbar, falls die Zuschlaege
+# je wieder gebraucht werden, ohne dass jemand sie aus der Versionsgeschichte
+# ausgraben muss.
 ABTASTUNGEN = 3
 ABSTAND_S = 1.5
 METAL_ARBEITSSATZ_GIB = 42.0  # Der Bezugswert von VLLM_METAL_MEMORY_FRACTION.
@@ -399,7 +478,7 @@ SICHERHEITSFAKTOR = 1.1  # auf jede ANGENOMMENE KV-Zahl, bis sie gemessen ist.
 # Laufzeit-Zuschlag rechnen.
 #
 # EHRLICHES FAZIT: 1,1 ist NICHT messtechnisch als ausreichend belegt -- die Zahl ist
-# Lilleboars Abwaegung, keine Rechnung (seine eigenen Worte im vorigen Nachtrag oben:
+# Abwaegung des Betreibers, keine Rechnung (seine eigenen Worte im vorigen Nachtrag oben:
 # "ob die Marge trotzdem reicht, ist eine Entscheidung, keine Rechnung"). Was diese
 # Entscheidung traegt, ohne sie zu einer Messung zu erklaeren: die vorige 1,5 war auf
 # eine falsche Analogie (KAT, ein voellig anderes, GQA-loses 8-Bit-Modell) aufgebaut
@@ -1534,6 +1613,31 @@ def zustand_bestimmen(eintrag, panes_je_socket):
     karenz = float(eintrag.get("karenz_s", KARENZ_MIN * 60))
     halter = eintrag.get("halter") or {}
     pane = halter.get("pane", "")
+    if halter.get("halter_art") == "prozess":
+        # PROZESS-HALTER (Nachtrag 2026-09-08, Auftrag "buchung", Befund 1, siehe
+        # Kopfkommentar): der PRIMAERE Halter ist hier der Prozess selbst, nicht ein
+        # Pane -- 'wb-belegung geladen ... --prozess-haelt' setzt diesen Halter-Typ.
+        # Lebendigkeit entscheidet SYMMETRISCH zum Pane-Fall: lebt der Prozess NIE
+        # ueber die Frist verfallen (nur 'ueberfaellig', zaehlt weiter); stirbt er,
+        # SOFORT verfallen. Das ist ein anderer Pfad als prozess_tot() unten -- jene
+        # Funktion ist fuer eine Pane-Belegung mit SEKUNDAERem PID-Merkmal gedacht
+        # ('tot', bleibt sichtbar bis 'aufraeumen'), nicht fuer den primaeren Halter
+        # hier (der verfaellt direkt, wie ein toter Pane -- keine dritte Zwischenstufe).
+        pid = eintrag.get("prozess_pid")
+        lstart = eintrag.get("prozess_lstart") or ""
+        lebt = prozess_lebt(pid, lstart)
+        if lebt is False:
+            return "verfallen", "der Prozess (PID %s) des Halters laeuft nicht mehr" % pid
+        if lebt is None and alter > frist + karenz:
+            # PID/Startzeitpunkt fehlt oder nicht pruefbar -- dieselbe Frist+Karenz-
+            # Sicherung wie beim 'kein Pane'-Fall unten, sonst haelt eine kaputt
+            # eingetragene Prozess-Belegung die Maschine fuer immer besetzt.
+            return "verfallen", ("Prozess-Halter nicht pruefbar (PID/Startzeitpunkt fehlt) "
+                                 "und Frist samt Karenz sind seit %d min um"
+                                 % minuten(alter - frist - karenz))
+        if alter > frist:
+            return "ueberfaellig", "die Frist ist seit %d min um" % minuten(alter - frist)
+        return "offen", ""
     if pane:
         socket = halter.get("socket", "")
         if socket not in panes_je_socket:
@@ -1587,6 +1691,18 @@ def buch_pruefen(belegungen):
 
 def halter_text(eintrag):
     h = eintrag.get("halter") or {}
+    if h.get("halter_art") == "prozess":
+        # Nachtrag 2026-09-08, Auftrag "buchung": kein Pane mehr -- der Prozess
+        # selbst ist der Halter, siehe zustand_bestimmen(). sitzung/worker/
+        # etikett sind, wenn vorhanden, vom urspruenglichen Pane-Halter
+        # uebernommen (ZWEITE RUNDE, Risiko 4) -- rein informativ, sie sagen
+        # WOHER der Prozess kam, ohne die Lebendigkeits-Entscheidung zu
+        # beeinflussen.
+        text = "Prozess PID %s, Host %s" % (eintrag.get("prozess_pid", "?"), h.get("host", "?"))
+        herkunft = [t for t in (h.get("sitzung", ""), h.get("worker", "")) if t]
+        if herkunft:
+            text += " (aus %s)" % ", ".join(herkunft)
+        return text
     teile = [t for t in (h.get("sitzung", ""), h.get("pane", "")) if t]
     if h.get("worker"):
         teile.append("Worker '%s'" % h["worker"])
@@ -1743,12 +1859,30 @@ def spitze_rechnen(a):
     # Deckel gibt, gewinnt er (Nachtrag 2026-08-21).
     cache_plaetze = int(getattr(a, "prompt_cache_plaetze", 0) or 0)
     cache_deckel = getattr(a, "prompt_cache_gb", None)
-    if cache_deckel is not None:
+    cache_exakt = getattr(a, "prompt_cache_exakt_gb", None)
+    if cache_exakt is not None:
+        # --prompt-cache-exakt-gb (Nachtrag 2026-09-08, Auftrag "buchung", siehe
+        # Kopfkommentar "EIN CACHE KANN EXAKT ODER ALS DECKEL GEBUCHT WERDEN"):
+        # schon EXAKT berechnet (z.B. mlx-vlms APC-Blockpool) -- UNVERAENDERT
+        # gebucht, ohne PROMPT_CACHE_DECKEL_FAKTOR.
+        cache_gib = float(cache_exakt)
+    elif cache_deckel is not None:
         cache_gib = float(cache_deckel) * PROMPT_CACHE_DECKEL_FAKTOR
     else:
         cache_gib = cache_plaetze * PROMPT_CACHE_GB_JE_PLATZ
-    kv_mib, herkunft, _roh, _gemessen, kv_quant_eintrag, kv_ersatzwert = kv_fuer(a.modell)
-    kv_gib = parallel * kontext * kv_mib / MIB_JE_GIB
+    nur_gewichte = bool(getattr(a, "nur_gewichte", False))
+    if nur_gewichte:
+        # --nur-gewichte (Nachtrag 2026-09-08, Auftrag "buchung", siehe Kopfkommentar
+        # "JEDER STROM WIRD VOM WORKER GEBUCHT"): kein KV-Anteil -- diese Buchung
+        # deckt nur Gewichte (+ Entwerfer + Cache), jeder Strom wird vom Worker, der
+        # ihn faehrt, einzeln gebucht.
+        kv_mib = 0.0
+        herkunft = "keine (nur Gewichte gebucht -- Stroeme werden einzeln von den Workern gebucht)"
+        kv_quant_eintrag, kv_ersatzwert = None, False
+        kv_gib = 0.0
+    else:
+        kv_mib, herkunft, _roh, _gemessen, kv_quant_eintrag, kv_ersatzwert = kv_fuer(a.modell)
+        kv_gib = parallel * kontext * kv_mib / MIB_JE_GIB
     spitze = gewichte + gewichte_entwerfer + kv_gib + zuschlag + cache_gib
     if gewichte_entwerfer > 0:
         zeilen = [
@@ -1762,7 +1896,11 @@ def spitze_rechnen(a):
         ]
     if cache_gib > 0:
         zeilen[-1] += " + Prompt-Cache %s" % zahl(cache_gib)
-        if cache_deckel is not None:
+        if cache_exakt is not None:
+            zeilen.append("  Prompt-Cache %s GiB EXAKT gebucht (kein Deckel, kein Faktor -- "
+                          "z.B. ein APC-Blockpool, siehe --prompt-cache-exakt-gb)."
+                          % zahl(cache_gib))
+        elif cache_deckel is not None:
             zeilen.append("  Prompt-Cache %s GiB Deckel (mlx_lm.server --prompt-cache-bytes) "
                           "x %s = %s GiB gebucht."
                           % (zahl(float(cache_deckel)), zahl(PROMPT_CACHE_DECKEL_FAKTOR, 1),
@@ -1774,6 +1912,12 @@ def spitze_rechnen(a):
         else:
             zeilen.append("  Prompt-Cache %d Plaetze x %s GiB/Platz (mlx_lm.servers eigene LRUPromptCache)"
                           % (cache_plaetze, zahl(PROMPT_CACHE_GB_JE_PLATZ)))
+    # --nur-gewichte (Nachtrag 2026-09-08, Auftrag "buchung"): kein KV-Anteil, also
+    # auch keine KV-Zeile und keinen Quantisierungsvergleich -- beides bezieht sich
+    # auf eine Zahl, die diese Buchung gar nicht rechnet.
+    if nur_gewichte:
+        zeilen.append("  KV-Cache   keine -- %s" % herkunft)
+        return spitze, zeilen, herkunft, kv_ersatzwert
     zeilen += [
         "  KV-Cache   %d Anfragen x %d Token x %s MiB/Token"
         % (parallel, kontext, zahl(kv_mib, 2)),
@@ -2196,6 +2340,8 @@ def cmd_nimm(a):
                              "kontext": a.kontext, "zuschlag_gb": a.zuschlag_gb,
                              "prompt_cache_plaetze": a.prompt_cache_plaetze,
                              "prompt_cache_gb": getattr(a, "prompt_cache_gb", None),
+                             "prompt_cache_exakt_gb": getattr(a, "prompt_cache_exakt_gb", None),
+                             "nur_gewichte": bool(getattr(a, "nur_gewichte", False)),
                              "metal_fraktion": getattr(a, "metal_fraktion", None),
                              "kv_herkunft": kv_herkunft,
                              # Sichtbar auch im Buch, nicht nur in der Direktantwort
@@ -2356,12 +2502,34 @@ def cmd_gib(a):
         gueltige, entfernt = buch_pruefen(buch_lesen())
         bleiben, weg = [], []
         for e in gueltige:
-            fremder_pane = (e.get("halter") or {}).get("pane", "")
-            # Eine Belegung OHNE Pane gehoert niemandem nachweisbar — an ihr laesst
-            # sich kein Eigentum messen, also verlangt ihre Freigabe auch keinen
-            # Nachweis. Sonst waere eine ausserhalb tmux angelegte Belegung von
-            # niemandem mehr regulaer freizugeben.
-            eigen = (not fremder_pane) or (halter.get("pane") and fremder_pane == halter["pane"])
+            e_halter = e.get("halter") or {}
+            if e_halter.get("halter_art") == "prozess":
+                # Nachtrag 2026-09-08, ZWEITE RUNDE, Auftrag "buchung", Befund 1:
+                # ein Prozess-Halter hat KEIN Pane -- die Regel darunter ("ohne
+                # Pane = niemandem nachweisbar, jeder darf freigeben") traf ihn
+                # bisher IMMER, fuer JEDEN Aufrufer, auch waehrend der Prozess
+                # quicklebendig ist. GEMESSEN: 'gib <kennung>' ohne --fremd und
+                # 'gib --eigene' aus einem voellig fremden Pane raeumten die
+                # Gewichtebuchung eines laufenden Servers ab. Eigentum ist bei
+                # diesem Halter-Typ ueber die Prozess-Lebendigkeit MESSBAR,
+                # genau wie bei einem Pane -- 'eigen' gilt deshalb nur, wenn der
+                # Prozess NACHWEISLICH tot ist. In der Praxis heisst das fast
+                # immer 'nie': ein wirklich toter Prozess-Halter ist schon
+                # 'verfallen' und laengst aus 'gueltige' entfernt
+                # (zustand_bestimmen() oben) -- was hier ankommt, ist entweder
+                # lebendig oder (selten) nicht pruefbar, aber innerhalb der
+                # Karenz. Beides verlangt --fremd, wie jede andere fremde
+                # Belegung. belegung_freigeben()/belegung_freigeben_gezielt() in
+                # wb-mlx-server versuchen ohnehin erst ohne, dann mit --fremd --
+                # sie funktionieren mit dieser Verschaerfung unveraendert.
+                eigen = prozess_lebt(e.get("prozess_pid"), e.get("prozess_lstart") or "") is False
+            else:
+                fremder_pane = e_halter.get("pane", "")
+                # Eine Belegung OHNE Pane gehoert niemandem nachweisbar — an ihr laesst
+                # sich kein Eigentum messen, also verlangt ihre Freigabe auch keinen
+                # Nachweis. Sonst waere eine ausserhalb tmux angelegte Belegung von
+                # niemandem mehr regulaer freizugeben.
+                eigen = (not fremder_pane) or (halter.get("pane") and fremder_pane == halter["pane"])
             treffer = (a.eigene and eigen) or (a.kennung and e.get("id") == a.kennung)
             if not treffer:
                 bleiben.append(e)
@@ -2420,6 +2588,17 @@ def cmd_geladen(a):
                    "eingetragen.") % pid
         print(err_txt, file=sys.stderr)
         pid = 0
+    # --prozess-haelt (Nachtrag 2026-09-08, Auftrag "buchung", Befund 1, siehe
+    # Kopfkommentar "EIN PROZESS KANN AUCH DER HALTER SEIN"): braucht eine
+    # BESTAETIGTE PID -- ohne sie liesse sich diese Belegung nie mehr als
+    # 'verfallen' erkennen, wenn ihr Prozess stirbt (zustand_bestimmen() faellt
+    # sonst auf die Frist+Karenz-Sicherung zurueck, aber das ist der Rueckfall
+    # fuer einen Fehler, kein normaler Betriebsmodus).
+    prozess_haelt = bool(getattr(a, "prozess_haelt", False))
+    if prozess_haelt and not pid:
+        fehler("--prozess-haelt braucht eine PID, die sich gerade wirklich bestaetigen liess "
+               "(--pid) -- ohne sie liesse sich diese Buchung nie mehr als 'verfallen' "
+               "erkennen, wenn ihr Prozess stirbt.")
     with Sperre():
         gueltige, entfernt = buch_pruefen(buch_lesen())
         getroffen = []
@@ -2434,6 +2613,29 @@ def cmd_geladen(a):
                 if pid:
                     e["prozess_pid"] = pid
                     e["prozess_lstart"] = lstart
+                if prozess_haelt:
+                    # Halter-Wechsel Pane -> Prozess: ab jetzt haelt NICHT mehr der
+                    # (moeglicherweise laengst wieder geschlossene) Pane, der den
+                    # Start ausgeloest hat, sondern der Prozess selbst.
+                    #
+                    # Herkunftsfelder mitnehmen (Nachtrag 2026-09-08, ZWEITE
+                    # RUNDE, Auftrag "buchung", Risiko 4): der ALTE Halter-Dict
+                    # wurde hier bisher KOMPLETT ersetzt -- sitzung/worker/
+                    # etikett gingen verloren, und mit ihnen die "Halter
+                    # fragen"-Zeile in belegungen_zeigen() fuer eine
+                    # ueberfaellige Belegung. Diese Felder sind rein
+                    # informativ (zustand_bestimmen() entscheidet fuer diesen
+                    # Halter-Typ ausschliesslich ueber prozess_pid/lstart, sie
+                    # aendern also keine Logik), aber ein Leser von 'wb-belegung
+                    # wer' soll weiterhin sehen koennen, WOHER dieser Prozess
+                    # kam, nicht nur, dass er jetzt ein Prozess ist.
+                    alter_halter = e.get("halter") or {}
+                    neuer_halter = {"halter_art": "prozess",
+                                   "host": os.uname().nodename.split(".")[0]}
+                    for feld in ("sitzung", "worker", "etikett"):
+                        if alter_halter.get(feld):
+                            neuer_halter[feld] = alter_halter[feld]
+                    e["halter"] = neuer_halter
                 getroffen.append(e)
         if not getroffen:
             # Verfallenes trotzdem schreiben (dieselbe Luecke wie in cmd_gib,
@@ -2511,7 +2713,62 @@ def cmd_uebernehmen(a):
     Ohne messbaren Pane beim Aufruf (kein TMUX_PANE in der Umgebung) wird
     NICHTS uebernommen und ein Fehler gemeldet -- ein Uebernehmen INS LEERE
     waere schlimmer als der Ausgangszustand: es wuerde einen vielleicht noch
-    gueltigen alten Halter durch gar keinen ersetzen."""
+    gueltigen alten Halter durch gar keinen ersetzen.
+
+    --pid (Nachtrag 2026-09-08, ZWEITE RUNDE, Auftrag "buchung", Befund 11):
+    haengt stattdessen an einen PROZESS -- fuer den Moment, in dem eine PID
+    schon bekannt ist (z.B. gleich nach wb-nohup), das Laden aber noch nicht
+    abgeschlossen ist. Anders als 'geladen --pid --prozess-haelt' (siehe dort)
+    ruehrt dieser Weg 'realisiert' NICHT an -- Grenze A zieht die Belegung
+    also weiterhin ab, solange sie laedt, genau wie vorgesehen. Damit ist das
+    GANZE Zeitfenster zwischen Buchung und bestaetigtem Laden prozessgebunden,
+    nicht mehr paneabhaengig: Befund 11 beschrieb genau die Luecke, die
+    entsteht, wenn dieses Fenster (oft mehrere Minuten, waehrend ein grosses
+    Modell laedt) noch am startenden Pane haengt und dieser Pane in der
+    Zwischenzeit stirbt -- die Buchung verfiel dann MITTEN im Laden.
+
+    --fremd (Nachtrag, Befund 5): eine PROZESS-gehaltene Belegung wird von der
+    PANE-Variante (kein --pid) NIE stillschweigend uebernommen -- das wuerde
+    exakt den Fehler wiederherstellen, den --prozess-haelt beheben soll (die
+    Buchung stuerbe dann wieder mit einem kurzlebigen Pane statt mit dem
+    tatsaechlichen Prozess). --fremd erlaubt es trotzdem, ausdruecklich."""
+    pid = int(getattr(a, "pid", 0) or 0)
+    if pid:
+        lstart = prozess_lstart(pid)
+        if not lstart:
+            print("wb-belegung: --pid %d liess sich nicht bestaetigen (Prozess nicht mehr "
+                  "da) -- nichts uebernommen." % pid, file=sys.stderr)
+            return 2
+        with Sperre():
+            gueltige, entfernt = buch_pruefen(buch_lesen())
+            getroffen = None
+            for e in gueltige:
+                if e.get("id") == a.kennung:
+                    alter_halter = e.get("halter") or {}
+                    neuer_halter = {"halter_art": "prozess",
+                                    "host": os.uname().nodename.split(".")[0]}
+                    # Herkunftsfelder mitnehmen (Nachtrag, Befund 4): sitzung/
+                    # worker/etikett bleiben informativ sichtbar in 'wer', auch
+                    # nachdem der Prozess der primaere Halter ist.
+                    for feld in ("sitzung", "worker", "etikett"):
+                        if alter_halter.get(feld):
+                            neuer_halter[feld] = alter_halter[feld]
+                    e["halter"] = neuer_halter
+                    e["prozess_pid"] = pid
+                    e["prozess_lstart"] = lstart
+                    getroffen = e
+            if not getroffen:
+                if entfernt:
+                    buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
+                                    for e in gueltige])
+                print("wb-belegung: keine Belegung mit der Kennung '%s'." % a.kennung, file=sys.stderr)
+                return 1
+            buch_schreiben([{k: v for k, v in e.items() if not k.startswith("_")}
+                            for e in gueltige])
+        gib_aus("Uebernommen: %s haengt jetzt an Prozess PID %d -- verfaellt sofort, wenn "
+                "dieser Prozess stirbt, nicht mehr nach Frist oder Pane."
+                % (a.kennung, pid))
+        return 0
     neuer_halter = eigener_halter()
     if not neuer_halter.get("pane"):
         print("wb-belegung: kein TMUX_PANE in der Umgebung dieses Aufrufs -- "
@@ -2524,6 +2781,14 @@ def cmd_uebernehmen(a):
         getroffen = None
         for e in gueltige:
             if e.get("id") == a.kennung:
+                if (e.get("halter") or {}).get("halter_art") == "prozess" and not getattr(a, "fremd", False):
+                    # Befund 5, siehe Docstring oben.
+                    print("wb-belegung: Belegung %s wird von einem PROZESS gehalten (siehe "
+                          "'wb-belegung wer'), nicht von einem Pane -- 'uebernehmen' wuerde sie "
+                          "wieder an einen Pane haengen und den Sinn von --prozess-haelt aufheben. "
+                          "Wirklich gewollt: 'wb-belegung uebernehmen %s --fremd'."
+                          % (a.kennung, a.kennung), file=sys.stderr)
+                    return 1
                 e["halter"] = neuer_halter
                 getroffen = e
         if not getroffen:
@@ -2650,6 +2915,21 @@ def rechen_argumente(p):
                         "--prompt-cache-plaetze: der Deckel begrenzt das Wachstum "
                         "wirklich, eine Platzzahl tut das nicht. Schliesst "
                         "--prompt-cache-plaetze aus." % PROMPT_CACHE_DECKEL_FAKTOR)
+    p.add_argument("--prompt-cache-exakt-gb", type=float, default=None,
+                   help="ein bereits EXAKT berechneter Cache-Betrag in GiB, KEIN Deckel -- "
+                        "z.B. mlx-vlms APC-Blockpool (Bloecke x Blockgroesse x KV-Bedarf je "
+                        "Token, eine feste Zuteilung, kein weiches Wachstum wie mlx_lm.servers "
+                        "LRUPromptCache). Wird UNVERAENDERT gebucht, OHNE "
+                        "PROMPT_CACHE_DECKEL_FAKTOR -- der gilt nur fuer einen Deckel, der "
+                        "gemessen ueberschritten wird. Schliesst --prompt-cache-gb/"
+                        "--prompt-cache-plaetze aus (Nachtrag 2026-09-08, Auftrag 'buchung').")
+    p.add_argument("--nur-gewichte", action="store_true",
+                   help="nur Gewichte (+ Entwerfer + Cache) buchen, KEIN KV-Cache fuer "
+                        "Stroeme -- fuer einen Server, dessen Stroeme jeder Worker EINZELN "
+                        "selbst bucht (siehe Kopfkommentar 'JEDER STROM WIRD VOM WORKER "
+                        "GEBUCHT'). --kontext bleibt informativ (Anzeige), geht aber nicht "
+                        "in die Spitze ein; --parallel wird auf 0 gesetzt (Nachtrag "
+                        "2026-09-08, Auftrag 'buchung').")
     p.add_argument("--parallel", type=int, default=1,
                    help="gleichzeitige Anfragen (Vorgabe 1)")
     p.add_argument("--kontext", type=int, default=None,
@@ -2728,7 +3008,15 @@ def pruefe_rechnung(a):
                "Belegt wird die SPITZE, nicht das Gewicht.")
     if a.gb is not None and a.gewichte_gb is not None:
         fehler("--gb und --gewichte-gb zugleich ergeben zwei Spitzen. Eine davon.")
-    if a.gewichte_gb is not None and a.kontext is None:
+    nur_gewichte = bool(getattr(a, "nur_gewichte", False))
+    # --nur-gewichte (Nachtrag 2026-09-08, Auftrag "buchung", siehe Kopfkommentar
+    # "JEDER STROM WIRD VOM WORKER GEBUCHT"): braucht --gewichte-gb (es gibt sonst
+    # nichts zu buchen), aber KEIN --kontext -- diese Buchungsart rechnet gar kein
+    # KV, --kontext bleibt rein informativ (Anzeige), also waere die Pflicht unten
+    # hier eine Forderung ohne Zweck.
+    if nur_gewichte and a.gewichte_gb is None:
+        fehler("--nur-gewichte braucht --gewichte-gb -- es gibt sonst nichts zu buchen.")
+    if a.gewichte_gb is not None and a.kontext is None and not nur_gewichte:
         fehler("--kontext fehlt. Die Spitze ist Gewichte + Anfragen x Kontext x "
                "KV-Bedarf je Token + Zuschlag; ohne Kontext waere sie geraten.")
     a.gb = pruefe_zahl(a.gb, "--gb", 0, strikt=True)
@@ -2745,6 +3033,16 @@ def pruefe_rechnung(a):
                    "Betraege fuer denselben Cache. Eine davon -- und wo es einen Deckel "
                    "gibt, ist es der Deckel.")
         a.prompt_cache_gb = pruefe_zahl(a.prompt_cache_gb, "--prompt-cache-gb", 0)
+    # --prompt-cache-exakt-gb (Nachtrag 2026-09-08, Auftrag "buchung", siehe
+    # Kopfkommentar "EIN CACHE KANN EXAKT ODER ALS DECKEL GEBUCHT WERDEN"): schliesst
+    # die beiden anderen Cache-Angaben aus, aus demselben Grund wie deren
+    # gegenseitiger Ausschluss oben -- ein Betrag fuer denselben Cache, nicht zwei.
+    if getattr(a, "prompt_cache_exakt_gb", None) is not None:
+        if a.prompt_cache_plaetze or getattr(a, "prompt_cache_gb", None) is not None:
+            fehler("--prompt-cache-exakt-gb zusammen mit --prompt-cache-gb oder "
+                   "--prompt-cache-plaetze ergaebe zwei Betraege fuer denselben Cache. "
+                   "Eine davon.")
+        a.prompt_cache_exakt_gb = pruefe_zahl(a.prompt_cache_exakt_gb, "--prompt-cache-exakt-gb", 0)
     # Der Zuschlag darf null sein (wer ihn ausdruecklich abwaehlt, weiss was er tut),
     # negativ nicht: er wuerde die Spitze verkleinern.
     a.zuschlag_gb = pruefe_zahl(a.zuschlag_gb, "--zuschlag-gb", 0)
@@ -2753,15 +3051,28 @@ def pruefe_rechnung(a):
     a.beruhigen = pruefe_zahl(a.beruhigen, "--beruhigen", 0)
     pruefe_zahl(a.abtastungen, "--abtastungen", 1)
     if a.gewichte_gb is not None:
-        # Mindestens eine Anfrage mit mindestens einem Token: alles darunter macht den
-        # KV-Anteil zu null, und dann steht wieder nur das Gewicht in der Belegung.
-        pruefe_zahl(a.parallel, "--parallel", 1)
-        pruefe_zahl(a.kontext, "--kontext", 1)
-        # Ohne --zuschlag-gb: an die tatsaechliche Nebenlaeufigkeit DIESER Buchung
-        # gebunden herleiten, statt eines von Hand gesetzten festen Werts (Betriebsfehler
-        # 1, zweite Runde Prueferbefunde, 2026-08-19) -- siehe zuschlag_herleiten().
-        if a.zuschlag_gb is None:
-            a.zuschlag_gb = zuschlag_herleiten(a.parallel, ohne_sockel=a.ohne_sockel)
+        if nur_gewichte:
+            # KEIN KV-Anteil -- jeder Strom wird vom Worker, der ihn faehrt, einzeln
+            # gebucht (Kopfkommentar). --kontext bleibt informativ (siehe
+            # spitze_rechnen()), --parallel wird auf 0 gesetzt: diese eine Buchung
+            # beansprucht ausdruecklich null gleichzeitige Stroeme.
+            a.parallel = 0
+            if a.kontext is None:
+                a.kontext = 0
+            else:
+                pruefe_zahl(a.kontext, "--kontext", 0)
+            if a.zuschlag_gb is None:
+                a.zuschlag_gb = zuschlag_herleiten(0, ohne_sockel=a.ohne_sockel)
+        else:
+            # Mindestens eine Anfrage mit mindestens einem Token: alles darunter macht den
+            # KV-Anteil zu null, und dann steht wieder nur das Gewicht in der Belegung.
+            pruefe_zahl(a.parallel, "--parallel", 1)
+            pruefe_zahl(a.kontext, "--kontext", 1)
+            # Ohne --zuschlag-gb: an die tatsaechliche Nebenlaeufigkeit DIESER Buchung
+            # gebunden herleiten, statt eines von Hand gesetzten festen Werts (Betriebsfehler
+            # 1, zweite Runde Prueferbefunde, 2026-08-19) -- siehe zuschlag_herleiten().
+            if a.zuschlag_gb is None:
+                a.zuschlag_gb = zuschlag_herleiten(a.parallel, ohne_sockel=a.ohne_sockel)
     if a.kontext is None:
         a.kontext = 0
 
@@ -2789,12 +3100,18 @@ def main(argv):
 
     p_gib = sub.add_parser("gib", help="eine Belegung freigeben")
     p_gib.add_argument("kennung", nargs="?", default="")
-    p_gib.add_argument("--eigene", action="store_true", help="alle Belegungen dieses Panes")
+    p_gib.add_argument("--eigene", action="store_true",
+                        help="alle Belegungen dieses Panes, plus jede ohne messbaren Pane -- trifft "
+                             "NIE eine PROZESS-gehaltene Belegung, ausser ihr Prozess ist nachweislich "
+                             "tot (Nachtrag 2026-09-08, Befund 1: sonst kein Eigentumsnachweis)")
     p_gib.add_argument("--fremd", action="store_true", help="eine fremde Belegung freigeben")
 
     p_gel = sub.add_parser("geladen", help="melden, dass das Modell jetzt im Speicher steht")
     p_gel.add_argument("kennung", nargs="?", default="")
-    p_gel.add_argument("--eigene", action="store_true", help="alle Belegungen dieses Panes")
+    p_gel.add_argument("--eigene", action="store_true",
+                        help="alle noch ladenden Belegungen dieses Panes -- trifft NIE eine bereits "
+                             "PROZESS-gehaltene Belegung (die hat kein Pane mehr, siehe --prozess-haelt); "
+                             "dafuer die Kennung direkt angeben (Nachtrag 2026-09-08)")
     p_gel.add_argument("--pid", type=int, default=0,
                         help="PID des jetzt wirklich laufenden Prozesses (z. B. der geladene "
                              "MLX-Server) -- ohne sie kann diese Belegung spaeter nicht als "
@@ -2802,6 +3119,11 @@ def main(argv):
                              "verschwindet (Nachtrag 'Karteileiche', 2026-08-21 abends). Optional: "
                              "eine Belegung ohne Pane als Halter (z. B. ein detached Server) hat "
                              "sonst KEIN Kriterium, an dem sie je als tot erkannt wuerde.")
+    p_gel.add_argument("--prozess-haelt", action="store_true",
+                        help="der Halter wird ab jetzt der Prozess selbst (braucht --pid), "
+                             "nicht mehr der aufrufende Pane -- fuer eine Buchung, die laenger "
+                             "lebt als der Pane, der sie ausgeloest hat (Nachtrag 2026-09-08, "
+                             "Auftrag 'buchung', Befund 1). Siehe zustand_bestimmen().")
 
     p_verl = sub.add_parser("verlaengern", help="die Frist einer Belegung neu setzen")
     p_verl.add_argument("kennung")
@@ -2810,6 +3132,16 @@ def main(argv):
     p_ueb = sub.add_parser("uebernehmen", help="die Belegung an den EIGENEN, "
                             "aktuellen Pane haengen (Lebendigkeit statt Frist-Versprechen, Befund N5)")
     p_ueb.add_argument("kennung")
+    p_ueb.add_argument("--pid", type=int, default=0,
+                        help="an einen PROZESS haengen statt an den eigenen Pane -- fuer eine PID, "
+                             "die schon bekannt ist, bevor das Laden abgeschlossen ist (Nachtrag "
+                             "2026-09-08, Befund 11). Anders als 'geladen --pid --prozess-haelt' "
+                             "bleibt 'realisiert' unangetastet.")
+    p_ueb.add_argument("--fremd", action="store_true",
+                        help="erlaubt es ausdruecklich, eine PROZESS-gehaltene Belegung zurueck an "
+                             "einen Pane zu haengen (Nachtrag 2026-09-08, Befund 5) -- ohne diesen "
+                             "Schalter lehnt 'uebernehmen' das ab, weil es sonst genau den Fehler "
+                             "wiederherstellt, den --prozess-haelt beheben soll.")
 
     p_auf = sub.add_parser("aufraeumen", help="Verfallenes entfernen")
     p_auf.add_argument("--json", action="store_true")

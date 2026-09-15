@@ -7,6 +7,7 @@
 // den Einstellungen (`logPaths`), das aendert dieses Modul nicht.
 import './protokolle-view.css';
 import { registriere, umschalten } from './flaeche';
+import { t } from './texte';
 import { openAbsoluteTab } from './editor-view';
 
 interface ProtokollEintrag { label: string; path: string; exists: boolean; size: number; mtimeMs: number }
@@ -27,8 +28,8 @@ export function initProtokolleView(): void {
   panel.className = 'pl-panel';
   panel.innerHTML = `
     <div class="pl-kopf">
-      <div class="pl-titel">Protokolle</div>
-      <button type="button" class="pl-schliessen" title="Schliessen">&times;</button>
+      <div class="pl-titel" data-text="panel.protokolle.titel"></div>
+      <button type="button" class="pl-schliessen" data-text-title="wort.schliessen">&times;</button>
     </div>
     <div class="pl-inhalt"><div class="pl-liste"></div><div class="pl-status"></div></div>`;
   // Die Schublade haengt in der Reihe zwischen Sessionleiste und Buehne,
@@ -53,7 +54,7 @@ export function initProtokolleView(): void {
 
   async function klick(e: ProtokollEintrag): Promise<void> {
     if (!e.exists) {
-      status(`Diese Datei gibt es noch nicht: ${e.path}`);
+      status(t('panel.protokolle.nochNicht', { pfad: e.path }));
       return;
     }
     const res = await window.awbEditorBridge.protokolleRead(e.path);
@@ -74,9 +75,11 @@ export function initProtokolleView(): void {
         </div>
         <div class="pl-pfad"></div>`;
       el.querySelector('.pl-label')!.textContent = e.label;
-      el.querySelector('.pl-groesse')!.textContent = e.exists ? `${e.size} B` : 'fehlt';
+      el.querySelector('.pl-groesse')!.textContent = e.exists ? `${e.size} B` : t('panel.protokolle.fehlt');
       el.querySelector('.pl-pfad')!.textContent = e.path;
-      el.title = e.exists ? `${e.path} oeffnen` : `${e.path} -- gibt es noch nicht`;
+      el.title = e.exists
+        ? t('panel.protokolle.oeffnen', { pfad: e.path })
+        : t('panel.protokolle.tippFehlt', { pfad: e.path });
       el.addEventListener('click', () => void klick(e));
       liste.appendChild(el);
     }

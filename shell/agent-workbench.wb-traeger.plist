@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  NICHT INSTALLIERT: Bau-Schritt 2 des Agents-Features (Auftrag traeger); ausgerollt
+  wird vom Orchestrator, nicht von diesem Repo aus.
+
+  Der Anmeldestart des Traegers. der Nutzer hat ihn am 10.09.2026 als Ausnahme von
+  seiner Ansage vom 22.08. ("Mac keine automatischen Laeufe, die sich wiederholen")
+  bestaetigt (docs/AGENTS-PLAN.md, Abschnitt 3 und Abschnitt 10, Punkt 6). Deshalb
+  RunAtLoad ohne StartInterval und ohne KeepAlive: der Job laeuft genau einmal je
+  Anmeldung. `wb-traeger nachsehen --vordergrund` macht einen Takt und endet sofort,
+  wenn der Vorrat nichts enthaelt, das ohne den Nutzer weiterkommt; sonst traegt dieser
+  Job den Traeger, bis die letzte Aufgabe fertig ist, und endet dann selbst.
+
+  AbandonProcessGroup: launchd beendet sonst beim Ende des Jobs alles in seiner
+  Prozessgruppe. Die Hauptagenten laufen in tmux, das sich ohnehin abloest; der
+  Schalter sichert, dass ein Neustart des Traegers nie eine laufende Aufgabe mitnimmt.
+
+  Installation (Orchestrator): nach ~/Library/LaunchAgents/agent-workbench.wb-traeger.plist
+  kopieren, dann `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/agent-workbench.wb-traeger.plist`.
+  Voraussetzung: shell/wb-traeger, shell/wb-aufgabe und shell/atomar_schreiben.py liegen
+  in ~/.local/bin, denn ProgramArguments zeigt auf den installierten Pfad.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>agent-workbench.wb-traeger</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/.local/bin/wb-traeger</string>
+    <string>nachsehen</string>
+    <string>--vordergrund</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>WB_EIGENTUEMER_LAUNCHD</key>
+    <string>agent-workbench.wb-traeger</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>AbandonProcessGroup</key><true/>
+  <key>StandardOutPath</key><string>$HOME/.local/state/wb-traeger.launchd.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.local/state/wb-traeger.launchd.log</string>
+</dict>
+</plist>

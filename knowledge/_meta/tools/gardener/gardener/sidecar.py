@@ -70,6 +70,11 @@ HOOK_LINES = {
 LEGACY_REQUIRED = ("sha256", "bytes", "mime", "created", "source",
                    "generated-by", "generated-at", "human-edited")
 
+# The kinds whose description in `describe()` reaches a model (a text summary
+# or the vision model). "audio"/"video" go through ffprobe - local metadata,
+# no model - and "unknown" calls nothing, so both still run in a dry run.
+MODEL_KINDS = {"pdf", "image", "doc", "text"}
+
 STOPWORDS = {
     "und", "der", "die", "das", "ist", "fuer", "für", "mit", "eine", "einen",
     "von", "the", "and", "for", "that", "this", "with", "dies", "diese",
@@ -268,7 +273,7 @@ def describe(client, path: Path, kind: str) -> tuple[str, str]:
         if not text:
             return "", ""
         desc = extract.summarize(client, text, hint=f"PDF: {path.name}")
-        return desc, (config.JUDGE_MODEL if desc else "")
+        return desc, (config.SMALL_MODEL if desc else "")
     if kind == "image":
         desc = extract.describe_image(client, path)
         return desc, (config.VISION_MODEL if desc else "")
@@ -277,7 +282,7 @@ def describe(client, path: Path, kind: str) -> tuple[str, str]:
         if not text:
             return "", ""
         desc = extract.summarize(client, text, hint=f"Dokument: {path.name}")
-        return desc, (config.JUDGE_MODEL if desc else "")
+        return desc, (config.SMALL_MODEL if desc else "")
     if kind == "text":
         try:
             text = read_text(path)[:config.SIDECAR_EXTRACT_MAX_CHARS]
@@ -286,7 +291,7 @@ def describe(client, path: Path, kind: str) -> tuple[str, str]:
         if not text.strip():
             return "", ""
         desc = extract.summarize(client, text, hint=f"Datei: {path.name}")
-        return desc, (config.JUDGE_MODEL if desc else "")
+        return desc, (config.SMALL_MODEL if desc else "")
     if kind in ("audio", "video"):
         desc = ffprobe_description(path)
         return desc, ("ffprobe" if desc else "")
@@ -478,6 +483,10 @@ class SidecarResult:
     skipped_human_edited: list[str] = field(default_factory=list)
     skipped_malformed: list[str] = field(default_factory=list)
     skipped_unreadable: list[str] = field(default_factory=list)
+    # Dry run only: assets a real run would additionally describe with a
+    # model here. Deliberately not folded into `metadata_only` - that list
+    # means "asked locally, got nothing back", this one means "never asked".
+    would_describe: list[str] = field(default_factory=list)
 
 
 def _filter_by_path(vault: Path, candidates: list[Path],
@@ -526,7 +535,12 @@ def scan(vault: Path, path: str | None = None,
 
 def generate(vault: Path, writer: VaultWriter, client, *, path: str | None = None,
             force: bool = False, notes: list[Note] | None = None,
-            today: dt.date | None = None, deadline=None) -> SidecarResult:
+            today: dt.date | None = None, deadline=None,
+            dry_run: bool = False) -> SidecarResult:
+    """`dry_run=True` calls no model. An asset whose description would need
+    one still gets its sidecar planned (the writer only records the path), so
+    the dry run keeps naming every file a real run would touch - just without
+    the description, and counted in `would_describe` instead."""
     vault = Path(vault)
     today = today or dt.date.today()
     notes = notes if notes is not None else load_notes(vault)
@@ -534,8 +548,9 @@ def generate(vault: Path, writer: VaultWriter, client, *, path: str | None = Non
     candidates = _filter_by_path(vault, iter_asset_candidates(vault), path)
     result = SidecarResult()
 
-    for asset_path in candidates:
-        if deadline is not None and deadline.expired():
+    for i, asset_path in enumerate(candidates):
+        if deadline is not None and deadline.expired(
+                "sidecar", done=i, total=len(candidates)):
             break
         rel = asset_path.relative_to(vault).as_posix()
         try:
@@ -572,9 +587,13 @@ def generate(vault: Path, writer: VaultWriter, client, *, path: str | None = Non
             else:
                 if existing_text is not None and not force and existing_fields.get("sha256") == digest:
                     continue   # up to date
-                description, generated_by = describe(client, asset_path, kind)
-                if not description:
-                    result.metadata_only.append(rel)
+                if dry_run and kind in MODEL_KINDS:
+                    result.would_describe.append(rel)
+                    description, generated_by = "", ""
+                else:
+                    description, generated_by = describe(client, asset_path, kind)
+                    if not description:
+                        result.metadata_only.append(rel)
 
             new_text = build_sidecar_text(
                 vault=vault, asset_path=asset_path, kind=kind, digest=digest,
@@ -597,10 +616,11 @@ def generate(vault: Path, writer: VaultWriter, client, *, path: str | None = Non
 
 def run_sidecar_phase(vault: Path, notes: list[Note], writer: VaultWriter, client,
                       queue: ReviewQueue, deadline=None,
-                      today: dt.date | None = None) -> SidecarResult:
+                      today: dt.date | None = None,
+                      dry_run: bool = False) -> SidecarResult:
     today = today or dt.date.today()
     result = generate(vault, writer, client, notes=notes, today=today,
-                      deadline=deadline)
+                      deadline=deadline, dry_run=dry_run)
     for rel in result.metadata_only:
         queue.add(f"Sidecar ohne Beschreibung: `{rel}` - lokal nicht "
                  "extrahierbar, Stub bei Bedarf von Hand ergaenzen",

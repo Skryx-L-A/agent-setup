@@ -86,6 +86,84 @@ export interface AttachResult {
 export const OWNER_OPTION = '@awb_owner';
 
 /**
+ * ZWEI WERKBAENKE AN EINEM FENSTER -- der Auslöser des Groessenflackerns
+ * (05.09.). Ein tmux-Fenster hat GENAU EINE Groesse, und beide Werkbaenke
+ * schrieben ihre eigene Buehnenzahl hinein: die hiesige ueber `fitWindow`/
+ * `fensterNachziehen`, die auf der anderen Maschine ueber denselben Weg an
+ * demselben Fenster. Jede Aenderung der einen kam bei der anderen als
+ * `%layout-change` an, loeste dort ein Neuzeichnen aus, und das schrieb die
+ * eigene Zahl zurueck. Gemessen am 05.09. auf eigenem Socket, zwei kopflose
+ * Fassungen an einer Sitzung (Buehnen 140x40 und 100x30): 75 Groessenwechsel
+ * in 30 Sekunden, im Mittel alle 0,4 s, ohne dass jemand etwas tat.
+ *
+ * Die Idempotenz, die den Kreis INNERHALB einer Werkbank bricht ("nicht
+ * schreiben, was schon dasteht"), hilft dagegen nicht: sie vergleicht mit dem
+ * eigenen Ziel, und das ist ein anderes als das der zweiten Werkbank.
+ *
+ * Deshalb wird die Groesse jetzt ABGESTIMMT statt durchgesetzt. Jeder Zeichner
+ * meldet seine Wunschgroesse an seinem Fenster unter dieser Option an -- der
+ * Name seines Steuerclients steht dahinter --, und gesetzt wird das
+ * spaltenweise KLEINSTE aller angemeldeten Wuensche. Das Kleinste, weil nur es
+ * bei jedem Zeichner ganz auf die Buehne passt: ein zu grosses Fenster wird
+ * abgeschnitten, ein zu kleines bekommt einen schwarzen Rand. Beide Seiten
+ * rechnen dieselbe Zahl aus, also schreibt die zweite nichts mehr -- der Kreis
+ * hat keinen Antrieb.
+ *
+ * Anmeldungen von Clients, die nicht mehr anhaengen, werden beim Lesen
+ * entfernt; beim Abloesen nimmt jeder seine eigene wieder weg.
+ */
+export const FLAECHE_OPTION = '@wb_flaeche_';
+
+/**
+ * DIE FASSUNGSMARKE NEBEN DER ANMELDUNG (08.09.2026, Gegenleser-Befund 2).
+ *
+ * Seit dem 08.09. rechnet diese Datei die Beschriftungszeile in die
+ * Fensterhoehe ein (`randZeilen`): fuer eine Buehne von 52 Zeilen steht das
+ * Fenster auf 53. Ein Kern auf dem Stand DAVOR schreibt fuer dieselbe Buehne
+ * 52. Beide melden ueber FLAECHE_OPTION dieselbe Panezahl an, beide halten ihr
+ * Ergebnis fuer richtig, und jedes `resize-window` des einen ist fuer den
+ * anderen ein `%layout-change` -- der Kreis vom 05.09., nur zwischen zwei
+ * FASSUNGEN statt zwei Maschinen. Waehrend eines Uebergangs (eine Maschine
+ * schon ausgerollt, die andere noch nicht, oder ein noch laufender alter Kern
+ * hier) waere das ein Dauerflackern.
+ *
+ * Deshalb meldet ein neuer Kern seine Anmeldung ZWEIMAL an: einmal unter
+ * FLAECHE_OPTION, wie bisher und damit fuer einen alten Kern lesbar, und
+ * einmal unter dieser Marke. Wer eine fremde Anmeldung ohne Marke findet, hat
+ * einen alten Zeichner vor sich und rechnet die Beschriftungszeile NICHT ein
+ * -- er schreibt dann dieselbe Zahl wie jener, und der Kreis hat wieder keinen
+ * Antrieb. Das kostet waehrend des Uebergangs die eine Zeile, um die es hier
+ * geht; sie kommt zurueck, sobald der alte Zeichner weg ist.
+ *
+ * Ein alter Kern sieht diese Option nicht: sein Muster in `groesseAbstimmen`
+ * verlangt `@wb_flaeche_` am Zeilenanfang, und `@wb_flaeche2_` faellt nicht
+ * darunter. Er braucht also keine Aenderung, um mit einem neuen zu koennen.
+ */
+export const FLAECHE2_OPTION = '@wb_flaeche2_';
+
+/**
+ * DIE MARKE AN JEDEM RIEGEL, DEN WIR SETZEN (05.09., Auftrag tmuxreste).
+ *
+ * `window-size manual` ist unser Riegel gegen fremde Clients, und beim
+ * Abloesen bekommt jedes Fenster seinen alten Wert zurueck -- solange das
+ * Zurueckstellen durchkommt. Es hat eine Frist von zwei Sekunden (gemessener
+ * Grund vom 06.08., siehe `detach()`), und es gibt Enden ohne jedes
+ * Zurueckstellen: ein Absturz, ein SIGKILL, eine Kernel-Panik. Danach steht
+ * 'manual' an Fenstern, die kein Client mehr vertritt, und bis heute war
+ * dieser Rest von einem fremden Riegel (wb-workers-window, ein Mensch) nicht
+ * zu unterscheiden: `andereFensterFesthalten` liess jedes 'manual' stehen,
+ * und ein solches Fenster blieb fuer immer festgehalten.
+ *
+ * Deshalb traegt jeder Riegel von uns den Namen unseres Steuerclients und
+ * den Wert, der vorher galt (`-` fuer "nicht gesetzt"). Beim Anhaengen prueft
+ * jeder Zeichner die Marken der Fenster gegen die lebenden Clients: eine Marke
+ * ohne Client stellt er zurueck und nimmt sie weg -- dieselbe Bauart wie bei
+ * FLAECHE_OPTION. Die Frist wird dadurch nicht laenger; der Rest wird nur
+ * nicht mehr ewig.
+ */
+export const FESTGEHALTEN_OPTION = '@wb_festgehalten_';
+
+/**
  * DIE WACHE UEBER DER FERNEN LEITUNG.
  *
  * Ein Steuerkanal ueber ssh ist eine Verbindung, die stundenlang steht und die
@@ -132,6 +210,15 @@ export interface PaneBox {
  * Lage in Zellen. Fuer das Zeichnen reicht deshalb die flache Liste, und die
  * Trennlinien stecken schon in den Abstaenden (ein Pane bei x=99 hinter einem
  * 98 Spalten breiten laesst genau eine Spalte frei).
+ *
+ * NICHT MEHR DIE QUELLE FUER DIE PANE-GROESSEN (08.09.2026). Der Text
+ * beschreibt die ZELLEN der Aufteilung, und eine Zelle ist um die
+ * Beschriftungszeile groesser als der Pane darin (`pane-border-status`); bei
+ * `off` und bei `top` kommt derselbe Text heraus, obwohl die Panes verschieden
+ * hoch sind. Wer die Groessen braucht, mit denen tmux die Programme wirklich
+ * laufen laesst, nimmt `fensterLage` (aus `list-panes`). Diese Funktion bleibt,
+ * weil sie den Aufbau des Textes festhaelt -- die Rechnung darauf ist es, die
+ * falsch war, nicht die Zerlegung.
  */
 export function parseLayout(layout: string): { cols: number; rows: number; panes: PaneBox[] } {
   const kopf = /^[0-9a-f]+,(\d+)x(\d+),\d+,\d+/.exec(layout);
@@ -252,6 +339,16 @@ export class TmuxControl extends EventEmitter {
   /** Von UNS gezoomter Pane -- nur der wird auch von uns wieder entzoomt. */
   private gezoomt = '';
   /**
+   * Der Name, unter dem tmux UNSEREN Steuerclient fuehrt (`client-1234`). Er
+   * ist die Kennung, unter der wir unsere Wunschgroesse anmelden, und zugleich
+   * das, woran ein anderer Zeichner erkennt, ob wir noch da sind
+   * (`groesseAbstimmen`). Leer, solange wir ihn nicht erfragen konnten -- dann
+   * wird nicht abgestimmt, sondern gesetzt wie vor dem 05.09.
+   */
+  private eigenerClient = '';
+  /** Fenster, an denen unsere Anmeldung steht -- beim Abloesen wieder weg. */
+  private flaechenAnmeldung = new Set<string>();
+  /**
    * Die letzte Zeile, die ssh oder tmux nach stderr geschrieben hat. Sie ist
    * die einzige Auskunft, die ein gescheitertes fernes Anhaengen mitbringt --
    * „kein %session-changed" allein sagt dem Menschen nicht, dass der Rechner
@@ -323,7 +420,13 @@ export class TmuxControl extends EventEmitter {
     // FRIST (2026-08-20, dieselbe Fehlerklasse wie zustandZurueckSync() unten):
     // laeuft VOR dem Anhaengen, blockiert also den Fensteraufbau selbst, wenn
     // sie haengt. 2s wie jeder andere oertliche bare-tmux-Aufruf dieses Hauses.
-    const r = spawnSync('tmux', [...this.baseArgs(), ...args], { encoding: 'utf8', env: mitMaschinenLocale(), timeout: 2000 });
+    // killSignal:SIGKILL (2026-08-22, gemessen an sessions.ts): die Node-Vorgabe
+    // SIGTERM laesst sich abfangen und liess spawnSync in der Messung ueber
+    // zwei Minuten haengen. SIGKILL kann kein Prozess im Nutzerraum ablehnen --
+    // so wie BudgetPoller/RemotePoller es an ihrer eigenen Frist schon machen.
+    const r = spawnSync('tmux', [...this.baseArgs(), ...args], {
+      encoding: 'utf8', env: mitMaschinenLocale(), timeout: 2000, killSignal: 'SIGKILL',
+    });
     if (r.status !== 0) throw new Error(`tmux ${args.join(' ')}: ${r.signal ? 'nach 2000ms abgebrochen' : (r.stderr || '').trim()}`);
     return (r.stdout || '').replace(/\n$/, '');
   }
@@ -356,8 +459,11 @@ export class TmuxControl extends EventEmitter {
   }
 
   isOwned(): boolean {
-    // FRIST wie bei query() direkt darueber -- derselbe Grund, derselbe Weg.
-    const r = spawnSync('tmux', [...this.baseArgs(), 'show-options', '-t', this.target(), '-qv', OWNER_OPTION], { encoding: 'utf8', env: mitMaschinenLocale(), timeout: 2000 });
+    // FRIST wie bei query() direkt darueber -- derselbe Grund, derselbe Weg,
+    // seit 2026-08-22 auch mit demselben killSignal:SIGKILL (siehe dort).
+    const r = spawnSync('tmux', [...this.baseArgs(), 'show-options', '-t', this.target(), '-qv', OWNER_OPTION], {
+      encoding: 'utf8', env: mitMaschinenLocale(), timeout: 2000, killSignal: 'SIGKILL',
+    });
     if (r.signal) process.stderr.write('isOwned: tmux nach 2000ms abgebrochen -- gilt als nicht eigen.\n');
     return (r.stdout || '').trim().length > 0;
   }
@@ -437,6 +543,14 @@ export class TmuxControl extends EventEmitter {
     const owned = this.maschine ? await this.istEigenUeberKanal() : ownedVorher;
     this.ownSession = owned;
     await this.ignoreOwnSize();
+    // UNSER EIGENER NAME BEI TMUX. `display -p` ohne Ziel beantwortet der
+    // Client, der den Befehl geschickt hat -- im Steuermodus also wir selbst
+    // (gemessen auf tmux 3.7c: `client-86892`). Er ist die Kennung fuer die
+    // Groessenabstimmung (FLAECHE_OPTION). Kommt etwas Unerwartetes zurueck,
+    // bleibt er leer und die Groesse wird gesetzt wie bisher -- ein Fenster,
+    // das flackert, ist immer noch besser als eines, das gar nicht mehr passt.
+    const [clientName] = await this.command(`display -p '#{client_name}'`).catch(() => ['']);
+    this.eigenerClient = /^[A-Za-z0-9_.-]{1,64}$/.test(clientName ?? '') ? (clientName as string) : '';
 
     const windows = await this.listWindows();
     const panes = await this.listPanes();
@@ -450,8 +564,24 @@ export class TmuxControl extends EventEmitter {
     // `wb-worker-tab` waehlt zuletzt das Worker-Fenster, gezeichnet wird der
     // Orchestrator. Gemessen ging so bei jedem Anhaengen das Worker-Fenster auf
     // 120x34 und blieb dort, ohne je gezeichnet worden zu sein.
-    const { cols, rows, policy } = await this.applySizePolicy(owned, active?.windowId ?? '', desired);
+    // UND DAS FESTHALTEN VOR DIE GROESSENREGEL (05.09.). `applySizePolicy`
+    // meldet unserem Steuerclient mit `refresh-client -C WxH` die Groesse des
+    // GEZEICHNETEN Fensters -- angezeigt bekommt der Client aber das aktuelle
+    // Fenster der Sitzung, und das ist in einer Werkbank-Sitzung regelmaessig
+    // ein anderes. Damit legt diese Meldung die Zahl des einen Fensters auf ein
+    // zweites, das niemand ansieht. Lief `andereFensterFesthalten` erst danach,
+    // las es die schon umgebrochene Zahl und schrieb GENAU SIE fest -- der
+    // Umbruch wurde damit nicht verhindert, sondern verewigt (gemessen auf
+    // tmux 3.7c: gezeichnetes Fenster 140x40, nicht gezeichnetes 80x23 ->
+    // 140x40 mit `window-size manual`, und es kam nie zurueck).
+    // Davor ist der Riegel schon gesetzt, und die Meldung geht ins Leere.
+    // UND VOR BEIDEM DIE RESTE DER TOTEN (05.09.): ein 'manual', das kein
+    // Client mehr vertritt, muss zurueckgestellt sein, BEVOR das Festhalten es
+    // als fremden Riegel ueberspringt und `merkeFenster` es als Vorzustand
+    // aufschreibt -- sonst kaeme es beim Abloesen als 'manual' zurueck.
+    await this.verwaisteRiegelAufraeumen(windows);
     await this.andereFensterFesthalten(active?.windowId ?? '');
+    const { cols, rows, policy } = await this.applySizePolicy(owned, active?.windowId ?? '', desired);
     const initialContent: Record<string, string> = {};
     if (active) initialContent[active.paneId] = await this.capturePane(active.paneId);
 
@@ -536,18 +666,23 @@ export class TmuxControl extends EventEmitter {
     if (owned) {
       await this.command(`set-option -w -t ${ziel} window-size manual`);
       // Nur wenn tmux keine brauchbare Groesse nennt, wird eine gesetzt.
+      // AUCH HIER IST `desired` EINE PANE-ZAHL (08.09.): sie kommt aus der
+      // Konfiguration und meint die Zellen fuer den Inhalt, nicht das Fenster
+      // darum. Der Rand kommt dazu, sonst faengt eine frische Sitzung schon
+      // eine Zeile zu klein an (siehe `randZeilen`).
       if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
-        await this.command(`resize-window -t ${ziel} -x ${desired.cols} -y ${desired.rows}`);
-        [w, h] = [desired.cols, desired.rows];
+        const rand = await this.randZeilen(ziel);
+        await this.command(`resize-window -t ${ziel} -x ${desired.cols} -y ${desired.rows + rand}`);
+        [w, h] = [desired.cols, desired.rows + rand];
       }
       await this.command(`refresh-client -C ${w}x${h}`);
-      return { cols: w, rows: h, policy: 'owned' };
+      return { cols: w, rows: h - (await this.randZeilen(ziel)), policy: 'owned' };
     }
     if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
       throw new Error(`tmux nannte keine Fenstergroesse fuer ${this.session}: "${size}"`);
     }
     await this.command(`refresh-client -C ${w}x${h}`);
-    return { cols: w, rows: h, policy: 'adopted' };
+    return { cols: w, rows: h - (await this.randZeilen(ziel)), policy: 'adopted' };
   }
 
   /**
@@ -694,7 +829,7 @@ export class TmuxControl extends EventEmitter {
       // koennen. Genau dieses Fenster war der Verlust aus B3.
       let marke = -1;
       const [[pos], lines] = await this.commandPaar(
-        `display -p -t ${paneId} '#{cursor_y};#{cursor_x}'`,
+        `display -p -t ${paneId} '#{cursor_y};#{cursor_x};#{scroll_region_upper};#{scroll_region_lower};#{pane_height}'`,
         `capture-pane -p -e -J -t ${paneId}`,
         () => {
           marke = this.outSeq;
@@ -704,12 +839,36 @@ export class TmuxControl extends EventEmitter {
       // ausgegeben hat. Alles danach -- auch die Ausgabe anderer Panes --
       // bleibt zum Nachspielen liegen.
       this.outQueue = this.outQueue.filter((o) => !(o.paneId === paneId && o.seq <= marke));
-      const [y, x] = (pos ?? '0;0').split(';').map((n) => parseInt(n, 10) || 0);
+      const [y, x, oben, unten, hoehe] = (pos ?? '0;0;0;0;0').split(';').map((n) => parseInt(n, 10) || 0);
       // Bildschirm loeschen, den Inhalt setzen und den Cursor dahin stellen, wo
       // tmux ihn hat. Ohne den letzten Schritt haengt die naechste Ausgabe unten
       // am Pufferende statt an der Eingabezeile, und der Anfang scrollt weg.
+      //
+      // UND DIE SCROLLREGION MUSS DAFUER WEG (08.09.2026, Auftrag geometrie).
+      // Die Zeilen werden mit `\r\n` gesetzt, und ein Zeilenvorschub am unteren
+      // Rand einer Scrollregion ROLLT -- er geht nicht in die naechste Zeile.
+      // Haelt die Anwendung im Pane eine Region (jede Oberflaeche mit
+      // Statuszeile tut das: pi, Claude Code, htop), landet die Aufnahme
+      // deshalb um so viele Zeilen verschoben, wie sie unter dem Regionsende
+      // hat -- die obersten rollen aus dem Bild, und in den untersten bleibt
+      // stehen, was die vorige Zeichnung dort hatte. GEMESSEN am 08.09. kopflos
+      // an einem Programm mit Region 1..z-2: der Schirm der Kachel begann bei
+      // `ZEILE-2`, waehrend `capture-pane -p` bei `ZEILE-1` begann, und rechts
+      // standen Reste der breiteren Zeichnung davor. Das ist Befund des Nutzers
+      // („rechts in der Trennlinie stand `Workbench --`, unten rechts `/rc`").
+      //
+      // Also: Region auf den vollen Schirm, malen, Region wieder hinstellen,
+      // dann der Cursor. Wiederhergestellt wird die Region, die tmux fuehrt --
+      // nicht irgendeine --, und nur dann, wenn es ueberhaupt eine gibt; sonst
+      // bliebe die Anwendung nach einer Neuzeichnung ohne ihre Region stehen,
+      // bis sie das naechste Mal von selbst eine setzt. Die Reihenfolge ist
+      // Absicht: `DECSTBM` setzt den Cursor auf den Anfang, deshalb steht die
+      // Cursormeldung dahinter.
       const esc = '\x1b';
-      return `${esc}[2J${esc}[H${lines.join('\r\n')}${esc}[${y + 1};${x + 1}H`;
+      const region = hoehe > 0 && (oben > 0 || unten < hoehe - 1)
+        ? `${esc}[${oben + 1};${unten + 1}r`
+        : '';
+      return `${esc}[r${esc}[2J${esc}[H${lines.join('\r\n')}${region}${esc}[${y + 1};${x + 1}H`;
     } catch (e) {
       // Nachspielen statt Wegwerfen: was waehrend des gescheiterten Versuchs
       // auflief, gehoert weiterhin diesem Pane.
@@ -718,66 +877,24 @@ export class TmuxControl extends EventEmitter {
     }
   }
 
-  /**
-   * Gibt dem angezeigten Pane GENAU die Groesse, die gezeichnet wird.
-   *
-   * Bisher lief es andersherum: tmux nannte die Fenstergroesse, der Renderer
-   * stellte sein Gitter darauf und passte es mit transform: scale() in die
-   * Flaeche. Daraus kamen drei Fehler auf einmal -- der leere Rand oben und
-   * unten (Seitenverhaeltnisse passen selten), ein falsch gezeichneter
-   * Worker-Pane (die Zahl kam vom FENSTER, der Inhalt vom PANE) und ein
-   * unscharfes Gitter. Jetzt bestimmt die Flaeche die Zahlen, und tmux bekommt
-   * dieselben.
-   *
-   * In einem geteilten Fenster reicht `resize-pane` allein nicht: gemessen
-   * bekommt der Pane in einem 91x42-Fenster nur 91x36, weil die uebrigen Panes
-   * und die Trennlinien Platz behalten. Deshalb wird das Fenster um den
-   * Fehlbetrag groesser gemacht und der Pane erneut gesetzt -- danach stimmt
-   * die Groesse auf die Zeile genau (gemessen: 91x42 in einem 91x48-Fenster).
-   */
-  async fitPane(paneId: string, cols: number, rows: number): Promise<{ cols: number; rows: number }> {
-    assertPaneId(paneId);
-    const c = Math.max(20, Math.min(999, Math.floor(cols)));
-    const r = Math.max(5, Math.min(999, Math.floor(rows)));
-
-    const [kopf] = await this.command(`display -p -t ${paneId} '#{window_id};#{window_width};#{window_height};#{window_layout}'`);
-    const [windowId, wBreite, wHoehe, ...rest] = (kopf ?? '').split(';');
-    if (!/^@\d+$/.test(windowId ?? '')) throw new Error(`kein Fenster zu Pane ${paneId}: ${kopf}`);
-    // Der Aufteilungs-Text enthaelt selbst Kommas, aber kein Semikolon.
-    const layout = rest.join(';');
-
-    // Einmal je Fenster merken, wie es vorher aussah.
-    if (!this.vorZustand.some((v) => v.windowId === windowId)) {
-      this.vorZustand.push({ windowId, layout, cols: parseInt(wBreite, 10), rows: parseInt(wHoehe, 10) });
-    }
-    if (!this.windowSizeVorher.has(windowId)) {
-      const [wert] = await this.command(`show-options -w -t ${windowId} -qv window-size`);
-      this.windowSizeVorher.set(windowId, wert ?? '');
-      await this.command(`set-option -w -t ${windowId} window-size manual`);
-    }
-
-    const messen = async (): Promise<{ cols: number; rows: number }> => {
-      const [z] = await this.command(`display -p -t ${paneId} '#{pane_width}x#{pane_height}'`);
-      const [a, b] = (z ?? '0x0').split('x').map((n) => parseInt(n, 10) || 0);
-      return { cols: a, rows: b };
-    };
-
-    await this.command(`resize-window -t ${windowId} -x ${c} -y ${r}`);
-    await this.command(`resize-pane -t ${paneId} -x ${c} -y ${r}`);
-    let ist = await messen();
-    if (ist.cols < c || ist.rows < r) {
-      await this.command(`resize-window -t ${windowId} -x ${c + (c - ist.cols)} -y ${r + (r - ist.rows)}`);
-      await this.command(`resize-pane -t ${paneId} -x ${c} -y ${r}`);
-      ist = await messen();
-    }
-    return ist;
-  }
-
   /** Stellt zurueck, was fuers Fuellen veraendert wurde. Reihenfolge zaehlt. */
   private async zustandZurueck(): Promise<void> {
     // Der Zoom geht IMMER weg, auch bei einer eigenen Session: er ist eine
     // Ansichtssache von uns und keine Eigenschaft der Session.
     await this.entzoomen();
+    // Die eigene Anmeldung geht IMMER weg, auch bei einer eigenen Session:
+    // sie gilt nur, solange wir zeichnen. Bliebe sie stehen, waere sie fuer
+    // den naechsten Zeichner eine Obergrenze, die niemand mehr vertritt --
+    // ihr Client haengt nicht mehr an, aber er ist auch nicht der einzige,
+    // der aufraeumen koennen muss.
+    for (const windowId of this.flaechenAnmeldung) {
+      await this.command(`set-option -w -t ${windowId} -u ${FLAECHE_OPTION}${this.eigenerClient}`)
+        .catch(() => undefined);
+      // Die Fassungsmarke geht mit der Anmeldung, die sie beschreibt.
+      await this.command(`set-option -w -t ${windowId} -u ${FLAECHE2_OPTION}${this.eigenerClient}`)
+        .catch(() => undefined);
+    }
+    this.flaechenAnmeldung.clear();
     if (this.ownSession) {
       this.vorZustand = [];
       this.windowSizeVorher.clear();
@@ -807,6 +924,11 @@ export class TmuxControl extends EventEmitter {
       try {
         if (wert) await this.command(`set-option -w -t ${windowId} window-size ${wert}`);
         else await this.command(`set-option -w -t ${windowId} -u window-size`);
+        // Die Marke geht mit dem Riegel: was zurueckgestellt ist, vertritt
+        // niemand mehr, und der naechste Zeichner soll es auch nicht suchen.
+        if (this.eigenerClient) {
+          await this.command(`set-option -w -t ${windowId} -u ${FESTGEHALTEN_OPTION}${this.eigenerClient}`);
+        }
       } catch {
         // dito
       }
@@ -856,6 +978,13 @@ export class TmuxControl extends EventEmitter {
       ruf(['resize-pane', '-Z', '-t', this.gezoomt]);
       this.gezoomt = '';
     }
+    // Wie im asynchronen Gegenstueck: die eigene Groessen-Anmeldung geht auch
+    // dann weg, wenn das Programm haesslich endet.
+    for (const windowId of this.flaechenAnmeldung) {
+      ruf(['set-option', '-w', '-t', windowId, '-u', `${FLAECHE_OPTION}${this.eigenerClient}`]);
+      ruf(['set-option', '-w', '-t', windowId, '-u', `${FLAECHE2_OPTION}${this.eigenerClient}`]);
+    }
+    this.flaechenAnmeldung.clear();
     if (this.ownSession) {
       this.vorZustand = [];
       this.windowSizeVorher.clear();
@@ -871,6 +1000,9 @@ export class TmuxControl extends EventEmitter {
       gruppen.push(wert
         ? ['set-option', '-w', '-t', windowId, 'window-size', wert]
         : ['set-option', '-w', '-t', windowId, '-u', 'window-size']);
+      if (this.eigenerClient) {
+        gruppen.push(['set-option', '-w', '-t', windowId, '-u', `${FESTGEHALTEN_OPTION}${this.eigenerClient}`]);
+      }
     }
     this.windowSizeVorher.clear();
     if (!gruppen.length) return;
@@ -914,8 +1046,274 @@ export class TmuxControl extends EventEmitter {
     assertPaneId(paneId);
     const [windowId] = await this.command(`display -p -t ${paneId} '#{window_id}'`);
     if (!/^@\d+$/.test(windowId ?? '')) throw new Error(`kein Fenster zu Pane ${paneId}: ${windowId}`);
-    const [layout] = await this.command(`display -p -t ${windowId} '#{window_layout}'`);
-    return parseLayout(layout ?? '');
+    return this.fensterLage(windowId);
+  }
+
+  /**
+   * DIE LAGE EINES FENSTERS, WIE SIE WIRKLICH DASTEHT (08.09.2026, Auftrag
+   * geometrie) -- aus `list-panes`, nicht mehr aus dem Aufteilungs-Text.
+   *
+   * WARUM DER UMZUG. Der Aufteilungs-Text (`#{window_layout}`) beschreibt die
+   * ZELLEN der Aufteilung, nicht die Panes darin, und beide gehen um die
+   * Beschriftungszeile auseinander (siehe `randZeilen`). Gemessen am 08.09.,
+   * zwei Panes even-vertical in einem Fenster von 160x52, `pane-border-status
+   * top`:
+   *
+   *   window_layout : 160x52,0,0[160x26,0,0,0  160x25,0,27,1]
+   *   list-panes    : %0 160x25 bei 0,1        %1 160x25 bei 0,27
+   *
+   * Der Text nennt fuer %0 also 26 Zeilen bei y=0, obwohl der Pane 25 Zeilen
+   * bei y=1 hat -- und derselbe Text kommt bei `pane-border-status off`
+   * ZEICHENGLEICH heraus, wo 26 dann stimmen. Die Buehne bekam damit fuer die
+   * obere Kachelreihe eine Zeile zuviel und zeichnete ein Terminal, das um eine
+   * Zeile groesser war als sein Pane -- derselbe Fehler wie beim Stellen, nur
+   * in der Gegenrichtung.
+   *
+   * `cols`/`rows` sind deshalb auch nicht die Fenstergroesse, sondern der Kasten,
+   * den die Panes zusammen einnehmen: das Raster, in dem die Kacheln der Buehne
+   * stehen (main.ts, `tabZeigen`, Abschnitt „DAS RASTER"). Die Lagen werden auf
+   * seine linke obere Ecke bezogen, damit eine Beschriftungszeile oben die
+   * Kacheln nicht um eine Zeile nach unten schiebt.
+   */
+  private async fensterLage(windowId: string): Promise<{ cols: number; rows: number; panes: PaneBox[] }> {
+    const zeilen = await this.command(
+      `list-panes -t ${windowId} -F '#{pane_id}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{window_zoomed_flag}'`,
+    );
+    // EIN GEZOOMTES FENSTER BEANTWORTET DIESE FRAGE NICHT (08.09.2026,
+    // Gegenleser-Befund 1). Unter Zoom gibt tmux dem gezoomten Pane die volle
+    // Fenstergroesse und laesst die Lage der uebrigen stehen, wie sie vor dem
+    // Zoom war -- die Buehne bekaeme uebereinanderliegende Kaesten. Der
+    // Aufteilungs-Text (`#{window_layout}`) traegt dagegen weiter die
+    // ENTZOOMTE Aufteilung, und genau die will die Buehne zeichnen; er war
+    // deshalb bis heute die Quelle und bleibt es fuer diesen einen Fall.
+    //
+    // Es ist kein theoretischer Fall: `entzoomen()` nimmt nur den Zoom
+    // zurueck, den WIR gesetzt haben. Ein Zoom, den der Mensch an seiner
+    // eigenen Sitzung gesetzt hat, bleibt stehen -- er gehoert ihm (F14).
+    //
+    // Die Beschriftungszeile ist im Aufteilungs-Text nicht abgezogen; unter
+    // fremdem Zoom ist die Kachel damit eine Zeile zu hoch, so wie vor dem
+    // 08.09. Das ist der kleinere Fehler: eine Zeile zu viel gegen Kaesten,
+    // die sich ueberdecken.
+    if (zeilen.some((l) => l.split('\t')[5] === '1')) {
+      const [layout] = await this.command(`display -p -t ${windowId} '#{window_layout}'`).catch(() => ['']);
+      const aus = parseLayout(layout ?? '');
+      if (aus.panes.length) return aus;
+    }
+    const roh = zeilen
+      .filter(Boolean)
+      .map((l) => {
+        const [paneId, x, y, w, h] = l.split('\t');
+        return {
+          paneId,
+          x: parseInt(x, 10),
+          y: parseInt(y, 10),
+          cols: parseInt(w, 10),
+          rows: parseInt(h, 10),
+        };
+      })
+      .filter((p) => /^%\d+$/.test(p.paneId) && p.cols > 0 && p.rows > 0
+        && Number.isFinite(p.x) && Number.isFinite(p.y));
+    if (!roh.length) return { cols: 0, rows: 0, panes: [] };
+    const links = Math.min(...roh.map((p) => p.x));
+    const oben = Math.min(...roh.map((p) => p.y));
+    const panes = roh.map((p) => ({ ...p, x: p.x - links, y: p.y - oben }));
+    return {
+      cols: Math.max(...panes.map((p) => p.x + p.cols)),
+      rows: Math.max(...panes.map((p) => p.y + p.rows)),
+      panes,
+    };
+  }
+
+  /**
+   * Die EINE Stelle, an der die Groesse eines gezeichneten Fensters geschrieben
+   * wird -- abgestimmt mit jedem anderen Zeichner desselben Fensters und nur
+   * dann, wenn dabei eine andere Zahl herauskommt als die, die schon dasteht.
+   *
+   * Beide Haelften sind noetig, und jede allein reicht nicht: ohne den
+   * Vergleich schreibt jede Neuzeichnung (22.08., siehe `fitWindow`), ohne die
+   * Abstimmung schreiben zwei Werkbaenke abwechselnd ihre eigene Zahl
+   * (05.09., siehe FLAECHE_OPTION).
+   *
+   * DIE ZAHL, DIE HEREINKOMMT, IST EINE PANE-ZAHL (08.09.). `c` und `r` sind
+   * die Zellen, die die Buehne fuer den INHALT hat -- das Fenster darum
+   * braucht die Zeilen dazu, die kein Pane bekommt (`randZeilen`). Ohne diese
+   * Umrechnung stand die Buehne auf 52 Zeilen und der Pane auf 51; was das
+   * kostet, steht in `randZeilen`.
+   */
+  private async fensterGroesseSetzen(windowId: string, c: number, r: number): Promise<void> {
+    const ziel = await this.groesseAbstimmen(windowId, c, r);
+    // ZEICHNET EIN KERN AUF ALTEM STAND MIT, WIRD GERECHNET WIE ER (08.09.2026,
+    // Gegenleser-Befund 2, Begruendung bei FLAECHE2_OPTION): sonst schreiben
+    // beide abwechselnd 52 und 53, und jedes Schreiben ist fuer den anderen
+    // ein `%layout-change`.
+    const rand = ziel.altfassung ? 0 : await this.randZeilen(windowId);
+    const zielHoehe = ziel.rows + rand;
+    const [istJetzt] = await this.command(`display -p -t ${windowId} '#{window_width};#{window_height}'`);
+    const [wJetzt, hJetzt] = (istJetzt ?? '').split(';').map((n) => parseInt(n, 10));
+    if (wJetzt !== ziel.cols || hJetzt !== zielHoehe) {
+      await this.command(`resize-window -t ${windowId} -x ${ziel.cols} -y ${zielHoehe}`);
+    }
+  }
+
+  /**
+   * ZEILEN, DIE DAS FENSTER HAT UND KEIN PANE BEKOMMT (08.09.2026, Auftrag
+   * geometrie).
+   *
+   * DER BEFUND (alice, 08.09., an der laufenden Werkbank): Die Buehne meldet
+   * 160x52, der Kern stellt das Fenster auf 160x52, und der Pane darin ist
+   * 160x51 -- `tmux display -p -t %1 '#{window_height} #{pane_height}'` sagt
+   * `52 51`. Im Strom-Modus fliessen damit die rohen Bytes eines 51-zeiligen
+   * Panes in ein 52-zeiliges Terminal: die Programme darin (pi, Claude Code)
+   * setzen ihre Scrollregion auf 51 Zeilen und bewegen den Cursor relativ,
+   * das Terminal rollt aber erst bei 52. Sichtbar als springende Eingabeleiste
+   * und als fehlende unterste Zeile direkt nach dem Oeffnen, bis eine absolute
+   * Neuzeichnung alles zurueckholt.
+   *
+   * WOHER DIE ZEILE KOMMT -- und es ist NICHT die Statuszeile. Gemessen am
+   * 08.09. auf eigenem Socket (tmux 3.7c, Fenster `window-size manual`, je
+   * Messung erst auf 40 und dann zurueck auf 52 gestellt, damit tmux wirklich
+   * neu aufteilt):
+   *
+   *   pane-border-status=off     status=off/on/2   ->  win 52, pane 52
+   *   pane-border-status=top     status=off/on/2   ->  win 52, pane 51 (oben 1)
+   *   pane-border-status=bottom  status=off/on/2   ->  win 52, pane 51 (oben 0)
+   *
+   * Die `status`-Option aendert an `window_height` also GAR NICHTS: die
+   * Fensterhoehe von tmux ist schon ohne Statuszeile gerechnet, sie gilt fuer
+   * die CLIENT-Hoehe. Was die Zeile kostet, ist `pane-border-status` -- und die
+   * steht in des Nutzers `~/.tmux.conf` (Zeile 22, `set -g pane-border-status
+   * top`), gilt damit fuer jede Sitzung dieser Maschine, eigene wie fremde.
+   *
+   * ES IST GENAU EINE ZEILE, unabhaengig davon, wieviele Pane-Reihen das
+   * Fenster hat: die Beschriftungszeile der zweiten und jeder weiteren Reihe
+   * liegt auf der Trennlinie, die es ohnehin gibt. Nur die erste Reihe (bei
+   * `top`) bzw. die letzte (bei `bottom`) braucht eine eigene. Gemessen mit
+   * einem, zwei, drei (even-vertical) und vier Panes (tiled), Fenster 52: die
+   * Panes spannen in jedem Fall zusammen 51 Zeilen.
+   *
+   * GELESEN WIRD ALS FORMAT, nicht mit `show-options -qv` (gemessen 08.09.):
+   * steht die Option nur global, gibt `show-options -w -t @0 -qv
+   * pane-border-status` eine LEERE Zeile zurueck, waehrend `display -p -t @0
+   * '#{pane-border-status}'` das geerbte `top` nennt. Mit `-qv` haetten wir den
+   * Rand genau dort verfehlt, wo er herkommt.
+   *
+   * ABGELEITET WIRD AUS DER OPTION, NICHT AUS EINER MESSUNG des eingestellten
+   * Zustands -- das ist dieselbe Regel wie in `fensterAufKachel`: ein Ziel, das
+   * aus dem Ergebnis des letzten Stellens folgt, ist der Motor des Kreises vom
+   * 05.08. Die Option haengt nicht an der Groesse, also bleibt das Stellen
+   * idempotent.
+   */
+  private async randZeilen(windowId: string): Promise<number> {
+    const [wert] = await this.command(`display -p -t ${windowId} '#{pane-border-status}'`).catch(() => ['']);
+    const w = (wert ?? '').trim();
+    if (w === 'top' || w === 'bottom') return 1;
+    if (w === 'off' || w === '') return 0;
+    // WAS TMUX SONST ANTWORTET, WIRD GEMELDET -- EINMAL (08.09.2026,
+    // Gegenleser-Befund 5). Loest eine aeltere Fassung das Format nicht auf,
+    // kommt der Literaltext `#{pane-border-status}` zurueck; die Zahl waere
+    // dann still 0, das Fenster eine Zeile zu klein, und niemand wuesste
+    // warum. Ein Fehlschlag ist das nicht -- ohne die Zeile ist die
+    // Darstellung dieselbe wie vor dem 08.09. --, aber er gehoert ins
+    // Protokoll und nicht ins Schweigen. Einmal je Sitzung: im Takt gerufen
+    // waere es sonst eine Zeile je Neuzeichnung.
+    if (!this.randGemeldet) {
+      this.randGemeldet = true;
+      this.emit('stderr', `tmux beantwortet '#{pane-border-status}' mit ${JSON.stringify(w)} -- `
+        + 'die Beschriftungszeile wird nicht eingerechnet, das Fenster bleibt eine Zeile kleiner.\n');
+    }
+    return 0;
+  }
+  /** Ob die Meldung aus `randZeilen` schon heraus ist -- sie geht einmal. */
+  private randGemeldet = false;
+
+  /**
+   * Unsere Wunschgroesse anmelden und die kleinste aller angemeldeten
+   * zurueckgeben -- die Zahl, auf die sich alle Zeichner dieses Fensters ohne
+   * ein Wort miteinander einigen (siehe FLAECHE_OPTION fuer das Warum).
+   *
+   * ANGEMELDET WIRD DAS ZIEL DIESES AUFRUFS, nicht die Buehne. Der Tab-Weg
+   * stellt ein Fenster ABSICHTLICH groesser als die Buehne, wenn er nur einen
+   * Teil seiner Panes zeigt (`fensterAufKachel`, Dreisatz vom 19.08.) -- eine
+   * Anmeldung der blossen Buehnenzahl wuerde genau diese Rechnung wieder
+   * einreissen.
+   *
+   * Eine Anmeldung eines Clients, der nicht mehr anhaengt, wird beim Lesen
+   * entfernt statt beruecksichtigt: sonst bliebe ein abgestuerztes Programm
+   * fuer immer die Obergrenze dieses Fensters.
+   *
+   * Ohne eigenen Clientnamen (`display -p` hat nicht geantwortet) wird nicht
+   * abgestimmt, sondern das eigene Ziel genommen -- das ist genau das
+   * Verhalten von vor dem 05.09.
+   */
+  private async groesseAbstimmen(windowId: string, c: number, r: number): Promise<{ cols: number; rows: number; altfassung: boolean }> {
+    if (!this.eigenerClient) return { cols: c, rows: r, altfassung: false };
+    const eigene = `${FLAECHE_OPTION}${this.eigenerClient}`;
+    const eigeneMarke = `${FLAECHE2_OPTION}${this.eigenerClient}`;
+    try {
+      await this.command(`set-option -w -t ${windowId} ${eigene} ${c}x${r}`);
+      // Die Marke steht neben der Anmeldung und sagt nur: dieser Zeichner
+      // rechnet die Beschriftungszeile ein (siehe FLAECHE2_OPTION).
+      await this.command(`set-option -w -t ${windowId} ${eigeneMarke} 1`).catch(() => undefined);
+      this.flaechenAnmeldung.add(windowId);
+      const zeilen = await this.command(`show-options -w -t ${windowId}`);
+      const fremd: { option: string; cols: number; rows: number }[] = [];
+      const markiert = new Set<string>();
+      for (const z of zeilen) {
+        const m = /^(@wb_flaeche_[A-Za-z0-9_.-]{1,64})\s+"?(\d+)x(\d+)"?$/.exec(z.trim());
+        if (m && m[1] !== eigene) fremd.push({ option: m[1], cols: Number(m[2]), rows: Number(m[3]) });
+        const m2 = /^@wb_flaeche2_([A-Za-z0-9_.-]{1,64})\s/.exec(z.trim());
+        if (m2) markiert.add(m2[1]);
+      }
+      if (!fremd.length) return { cols: c, rows: r, altfassung: false };
+      const lebend = new Set((await this.command(`list-clients -F '#{client_name}'`)).map((z) => z.trim()));
+      let cols = c;
+      let rows = r;
+      let altfassung = false;
+      for (const f of fremd) {
+        const wer = f.option.slice(FLAECHE_OPTION.length);
+        if (!lebend.has(wer)) {
+          await this.command(`set-option -w -t ${windowId} -u ${f.option}`).catch(() => undefined);
+          await this.command(`set-option -w -t ${windowId} -u ${FLAECHE2_OPTION}${wer}`).catch(() => undefined);
+          continue;
+        }
+        // Ein lebender Zeichner OHNE Marke ist einer auf altem Stand.
+        if (!markiert.has(wer)) altfassung = true;
+        cols = Math.min(cols, f.cols);
+        rows = Math.min(rows, f.rows);
+      }
+      // Dieselben Untergrenzen wie bei jedem anderen Weg in diese Datei: ein
+      // Fenster unter 20x5 ist keine Ansicht mehr, sondern ein Streifen.
+      return { cols: Math.max(20, cols), rows: Math.max(5, rows), altfassung };
+    } catch {
+      // Die Abstimmung ist eine Verbesserung, keine Bedingung: scheitert sie
+      // (altes tmux, Fenster inzwischen weg), wird gesetzt wie bisher.
+      return { cols: c, rows: r, altfassung: false };
+    }
+  }
+
+  /**
+   * NUR die Aufteilung eines Fensters stellen, ohne seine Groesse anzufassen
+   * (05.09., Auftrag tmuxreste). Der Tab-Weg braucht das Raster des Fensters
+   * (wie viele Reihen und Spalten die Aufteilung hat), BEVOR er die Groesse
+   * setzt: bis heute stellte er erst die Buehne, las das Raster aus dem
+   * Ergebnis und stellte dann den Dreisatz-Wert -- zwei Groessenwechsel je
+   * Neuzeichnung, gemessen mit test-fenster-tab-weg.sh (140x41, dann 140x57;
+   * mit zwei Zeichnern 100x30, 100x43, 100x41, 100x43). Das Raster haengt bei
+   * `even-vertical`, `even-horizontal` und `tiled` nicht von der Groesse ab
+   * (tiled nimmt die Wurzel aus der Panezahl), also laesst es sich vorher
+   * lesen, und die Groesse wird danach genau einmal geschrieben.
+   *
+   * Dieselben Vorkehrungen wie in `fitWindow`: erst merken, dann entzoomen,
+   * dann stellen.
+   */
+  async aufteilungSetzen(paneId: string, aufteilung: 'tiled' | 'even-vertical' | 'even-horizontal'): Promise<void> {
+    assertPaneId(paneId);
+    const [windowId] = await this.command(`display -p -t ${paneId} '#{window_id}'`);
+    if (!/^@\d+$/.test(windowId ?? '')) throw new Error(`kein Fenster zu Pane ${paneId}: ${windowId}`);
+    await this.merkeFenster(windowId);
+    await this.entzoomen();
+    await this.command(`select-layout -t ${windowId} ${aufteilung}`);
   }
 
   async fitWindow(
@@ -933,7 +1331,25 @@ export class TmuxControl extends EventEmitter {
 
     await this.merkeFenster(windowId);
     await this.entzoomen();
-    await this.command(`resize-window -t ${windowId} -x ${c} -y ${r}`);
+    // NICHT SCHREIBEN, WAS SCHON DASTEHT (22.08.). `fitWindow` lief bisher bei
+    // JEDER Neuzeichnung eines Tabs blind auf `resize-window` -- und
+    // `flaecheSetzen` meldet beim Zoomen/Maximieren der App laut eigenem
+    // Kommentar "Dutzende" neuer Zellenzahlen, macOS zeichnet die Animation
+    // Bild fuer Bild. Jedes dieser Bilder loeste einen weiteren
+    // `resize-window`-Aufruf auf das ECHTE tmux-Fenster aus -- bei einer
+    // fremden Session (F14/`darfUmraeumen`) genau das Fenster, an dem ein
+    // Mensch gerade selbst haengt. Der Aufruf bleibt (der Vorfall vom 05.08.,
+    // ein auf drei Zeilen gedruecktes fremdes Fenster, ist der Grund, warum es
+    // ihn ueberhaupt gibt), aber er wird nur noch ABGESETZT, wenn die
+    // Zielgroesse von der tatsaechlichen abweicht -- ein blosser Lesebefehl
+    // (`display -p`) statt eines Schreibbefehls, wenn ohnehin nichts zu tun
+    // ist. Eine Zeitschwelle waere hier die falsche Antwort: `fitWindow` hat
+    // andere Aufrufer als nur `flaecheSetzen`, und ein Timer koennte deren
+    // Ergebnis verzoegern oder eine echte, schnell aufeinanderfolgende
+    // Groessenaenderung verschlucken. Der Read-Vergleich trifft die Zusage
+    // exakt: keine Aenderung -> kein Schreibbefehl, eine echte Aenderung ->
+    // genau einer.
+    await this.fensterGroesseSetzen(windowId, c, r);
     // Die Aufteilung wird MITGEGEBEN, damit sie zu dem Gitter passt, das die
     // Buehne legt: eine Spalte ist `even-vertical`, eine Zeile
     // `even-horizontal`, alles andere `tiled`. Fest auf `tiled` gestellt teilte
@@ -946,8 +1362,61 @@ export class TmuxControl extends EventEmitter {
     // haengt (siehe fremdeClients). Zurueckgestellt wird sie beim Abloesen
     // trotzdem -- das haengt weiter an `ownSession`.
     if (umraeumen) await this.command(`select-layout -t ${windowId} ${aufteilung}`);
-    const [layout] = await this.command(`display -p -t ${windowId} '#{window_layout}'`);
-    return parseLayout(layout ?? '');
+    // Zurueck kommen die ECHTEN Panes, nicht die Zellen des Aufteilungs-Textes
+    // (08.09., siehe `fensterLage`): die Buehne stellt ihre Terminals auf genau
+    // diese Zahlen, und sie muessen dieselben sein, die tmux dem Pane gibt.
+    return this.fensterLage(windowId);
+  }
+
+  /**
+   * Unseren Riegel an einem Fenster mit Namen und Vorzustand kennzeichnen
+   * (FESTGEHALTEN_OPTION). Ohne eigenen Clientnamen gibt es keine Marke --
+   * dann ist der Riegel so anonym wie vor dem 05.09., mehr nicht.
+   */
+  private async riegelMarkieren(windowId: string, vorher: string): Promise<void> {
+    if (!this.eigenerClient) return;
+    const wert = /^[a-z]+$/.test(vorher) ? vorher : '-';
+    await this.command(`set-option -w -t ${windowId} ${FESTGEHALTEN_OPTION}${this.eigenerClient} ${wert}`)
+      .catch(() => undefined);
+  }
+
+  /**
+   * Riegel, die kein lebender Client mehr vertritt, zurueckstellen und ihre
+   * Marke wegnehmen (siehe FESTGEHALTEN_OPTION). Laeuft beim Anhaengen, VOR
+   * `andereFensterFesthalten` und vor dem ersten `merkeFenster`: beide lesen
+   * den Wert, der dann dasteht, und beide haetten ein stehengebliebenes
+   * 'manual' sonst fuer den Vorzustand gehalten.
+   *
+   * Zurueckgestellt wird nur, was noch 'manual' traegt. Hat inzwischen jemand
+   * anderes den Wert gesetzt, ist die Marke bloss alt -- sie geht weg, der
+   * Wert bleibt seiner.
+   */
+  private async verwaisteRiegelAufraeumen(fenster: WindowInfo[]): Promise<void> {
+    let lebend: Set<string>;
+    try {
+      lebend = new Set((await this.command(`list-clients -F '#{client_name}'`)).map((z) => z.trim()));
+    } catch {
+      return; // ohne Clientliste ist "tot" nicht zu entscheiden -- lieber stehen lassen
+    }
+    if (this.eigenerClient) lebend.add(this.eigenerClient);
+    for (const w of fenster) {
+      if (!w.windowId) continue;
+      try {
+        const zeilen = await this.command(`show-options -w -t ${w.windowId}`);
+        for (const z of zeilen) {
+          const m = /^@wb_festgehalten_([A-Za-z0-9_.-]{1,64})\s+"?([a-z-]+)"?$/.exec(z.trim());
+          if (!m || lebend.has(m[1])) continue;
+          const [jetzt] = await this.command(`show-options -w -t ${w.windowId} -qv window-size`);
+          if ((jetzt ?? '') === 'manual') {
+            if (m[2] !== '-') await this.command(`set-option -w -t ${w.windowId} window-size ${m[2]}`);
+            else await this.command(`set-option -w -t ${w.windowId} -u window-size`);
+          }
+          await this.command(`set-option -w -t ${w.windowId} -u ${FESTGEHALTEN_OPTION}${m[1]}`);
+        }
+      } catch {
+        // Ein Fenster kann inzwischen weg sein -- die uebrigen werden trotzdem geprueft.
+      }
+    }
   }
 
   /**
@@ -985,6 +1454,18 @@ export class TmuxControl extends EventEmitter {
    * die schon dastand -- ein Umbruch weniger, und der Wortlaut der Zusage
    * stimmt wieder mit dem ueberein, was passiert.
    *
+   * VOR `applySizePolicy` AUFRUFEN, nicht danach (05.09.). Gemessen auf tmux
+   * 3.7c: der Steuerclient zeigt das aktuelle Fenster der SITZUNG an, und
+   * `refresh-client -C WxH` legt die gemeldete Zahl auf genau dieses Fenster --
+   * auch wenn WxH die Groesse eines anderen, des gezeichneten, ist. Stehen
+   * beide gleich gross da, faellt das nicht auf; stehen sie verschieden (etwa
+   * weil ein vorheriges Zurueckstellen die Groesse des gezeichneten Fensters
+   * nicht mehr hergestellt hat), bricht das nicht gezeichnete um. Diese
+   * Schleife liest die Groessen selbst nach; lief sie danach, las sie die schon
+   * umgebrochene Zahl und hielt das Fenster DARAUF fest. Davor gesetzt, laeuft
+   * die Meldung gegen ein Fenster, das bereits `manual` traegt, und bewegt
+   * nichts mehr.
+   *
    * Zurueckgestellt wird beim Abloesen nur die OPTION (`windowSizeVorher`);
    * eine Groesse steht nicht in `vorZustand`, weil wir keine geaendert haben.
    */
@@ -1003,6 +1484,7 @@ export class TmuxControl extends EventEmitter {
         const [wert] = await this.command(`show-options -w -t ${w.windowId} -qv window-size`);
         if ((wert ?? '') === 'manual') continue;
         this.windowSizeVorher.set(w.windowId, wert ?? '');
+        await this.riegelMarkieren(w.windowId, wert ?? '');
         await this.command(`resize-window -t ${w.windowId} -x ${w.width} -y ${w.height}`);
       } catch {
         // Ein Fenster kann inzwischen weg sein -- die uebrigen bleiben trotzdem dran.
@@ -1025,6 +1507,7 @@ export class TmuxControl extends EventEmitter {
     if (!this.windowSizeVorher.has(windowId)) {
       const [wert] = await this.command(`show-options -w -t ${windowId} -qv window-size`);
       this.windowSizeVorher.set(windowId, wert ?? '');
+      await this.riegelMarkieren(windowId, wert ?? '');
     }
     // Dass 'manual' GILT, wird dagegen jedes Mal nachgesehen, nicht nur beim
     // ersten Fenster: die Option kann von aussen zurueckgestellt werden (ein
@@ -1072,7 +1555,7 @@ export class TmuxControl extends EventEmitter {
     const [windowId] = await this.command(`display -p -t ${paneId} '#{window_id}'`);
     if (!/^@\d+$/.test(windowId ?? '')) throw new Error(`kein Fenster zu Pane ${paneId}`);
     await this.merkeFenster(windowId);
-    await this.command(`resize-window -t ${windowId} -x ${c} -y ${r}`);
+    await this.fensterGroesseSetzen(windowId, c, r);
     const [z] = await this.command(`display -p -t ${paneId} '#{pane_width}x#{pane_height}'`);
     const [a, b] = (z ?? '0x0').split('x').map((n) => parseInt(n, 10) || 0);
     return { cols: a, rows: b };
@@ -1099,7 +1582,7 @@ export class TmuxControl extends EventEmitter {
       await this.command(`resize-pane -Z -t ${paneId}`);
       this.gezoomt = paneId;
     }
-    await this.command(`resize-window -t ${windowId} -x ${c} -y ${r}`);
+    await this.fensterGroesseSetzen(windowId, c, r);
     const [z] = await this.command(`display -p -t ${paneId} '#{pane_width}x#{pane_height}'`);
     const [a, b] = (z ?? '0x0').split('x').map((n) => parseInt(n, 10) || 0);
     return { cols: a, rows: b };
@@ -1147,6 +1630,30 @@ export class TmuxControl extends EventEmitter {
     const rest = this.outQueue;
     this.outQueue = [];
     for (const o of rest) this.emit('output', o.paneId, o.data);
+  }
+
+  /**
+   * Die Ausgabe eines Panes anhalten, BEVOR an seiner Groesse gedreht wird
+   * (08.09.2026, Auftrag geometrie).
+   *
+   * `capturePane` haelt selbst an, aber erst bei der Aufnahme -- und die kommt
+   * NACH dem `resize-window`. In der Luecke dazwischen bekommt die Anwendung im
+   * Pane ihr SIGWINCH und zeichnet sich neu, und diese Bytes gelten schon fuer
+   * die neue Groesse, waehrend das Terminal der Oberflaeche noch die alte hat:
+   * ein `\033[18;1H` landet dort auf Zeile 18 von vierundfuenfzig, und die
+   * Groessenmeldung, die gleich darauf kommt, schiebt beim Umbrechen die
+   * obersten Zeilen in den Rueckblick. GEMESSEN am 08.09. kopflos an einem
+   * Programm mit Statuszeile: der Schirm der Kachel begann bei `ZEILE-2`,
+   * `capture-pane -p` bei `ZEILE-1`, und es kam nicht von selbst zurueck.
+   *
+   * Wer eine Groesse stellt, haelt deshalb vorher an und ruft `fortsetzen`,
+   * NACHDEM die Lage hinaus ist -- dann trifft der Strom auf ein Terminal, das
+   * schon die richtige Groesse und das richtige Bild hat. Zweimal anhalten
+   * schadet nicht (es ist eine Menge), und `fortsetzen` auf einen Pane, der
+   * nicht angehalten war, tut nichts.
+   */
+  anhalten(paneId: string): void {
+    if (this.streaming) this.pausiert.add(paneId);
   }
 
   /**

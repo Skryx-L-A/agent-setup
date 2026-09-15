@@ -7,7 +7,7 @@
 export type Sprache = 'de' | 'en';
 
 export const DE: Record<string, string> = {
-  'fenster.titel': 'Agent-Workbench — Erste Schritte',
+  'fenster.titel': 'Agent-Workbench – Erste Schritte',
   'kopf.titel': 'Erste Schritte',
   'kopf.unterzeile': 'Vier kurze Fragen, jede überspringbar. Alles andere bleibt auf Vorgabe und lässt sich später in den Einstellungen ändern.',
 
@@ -22,7 +22,7 @@ export const DE: Record<string, string> = {
   // --- Schritt 1: Maschine -------------------------------------------------
   'maschine.titel': 'Maschine',
   'maschine.unterzeile': 'Auf welcher Maschine sollen Worker standardmäßig laufen?',
-  'maschine.nurEine': 'Auf diesem Rechner ist bisher keine weitere Maschine eingerichtet — es bleibt bei „diese Maschine". Weitere Maschinen lassen sich später über die Seite „Maschinen" hinzufügen.',
+  'maschine.nurEine': 'Auf diesem Rechner ist bisher keine weitere Maschine eingerichtet – es bleibt bei „diese Maschine“. Weitere Maschinen lassen sich später über die Seite „Maschinen“ hinzufügen.',
   'maschine.diese': 'diese Maschine ({0})',
 
   // --- Schritt 2: Harness ---------------------------------------------------
@@ -34,17 +34,17 @@ export const DE: Record<string, string> = {
   'harness.zeichen.ja': '●',
   'harness.zeichen.nein': '✕',
   'harness.zeichen.unbekannt': '–',
-  'harness.keine': 'Auf dieser Maschine ist kein startbares Programm gefunden. Dieser Schritt lässt sich später über die Seite „Programme und Modelle" nachholen.',
+  'harness.keine': 'Auf dieser Maschine ist kein startbares Programm gefunden. Dieser Schritt lässt sich später über die Seite „Programme und Modelle“ nachholen.',
 
   // --- Schritt 3: Modell -----------------------------------------------------
   'modell.titel': 'Modell',
   'modell.unterzeile': 'Welches Modell soll der Orchestrator verwenden?',
-  'modell.keine': 'Für das gewählte Programm ist noch kein Modell bekannt. Dieser Schritt lässt sich später über die Seite „Programme und Modelle" nachholen.',
+  'modell.keine': 'Für das gewählte Programm ist noch kein Modell bekannt. Dieser Schritt lässt sich später über die Seite „Programme und Modelle“ nachholen.',
 
   // --- Schritt 3, zweite Frage: das Kontextfenster ---------------------------
   // Sie steht nur da, wenn das gewählte Modell auf dieser Maschine läuft.
   'kontext.titel': 'Kontextfenster',
-  'kontext.unterzeile': 'Wie viel Text dieses Modell gleichzeitig im Kopf behält. Ein größeres Fenster hält mehr Zusammenhang und belegt dauerhaft mehr Grafikspeicher. Wählbar ist jede Stufe — auch eine, für die der Speicher gerade nicht reicht; sie sagt es dann dazu.',
+  'kontext.unterzeile': 'Wie viel Text dieses Modell gleichzeitig im Kopf behält. Ein größeres Fenster hält mehr Zusammenhang und belegt dauerhaft mehr Grafikspeicher. Wählbar ist jede Stufe – auch eine, für die der Speicher gerade nicht reicht; sie sagt es dann dazu.',
   'kontext.empfohlen': 'empfohlen',
   'kontext.token': '{0} Token',
   'kontext.bedarf': 'Braucht {0} GiB.',
@@ -53,13 +53,13 @@ export const DE: Record<string, string> = {
 
   // --- Schritt 4: Fertig -----------------------------------------------------
   'fertig.titel': 'Fertig',
-  'fertig.unterzeile': 'Das war’s — alles andere bleibt auf Vorgabe.',
+  'fertig.unterzeile': 'Das war’s – alles andere bleibt auf Vorgabe.',
   'fertig.satz.gesetzt': 'Gesetzt: {0}.',
-  'fertig.satz.nichtsGesetzt': 'Es wurde nichts geändert — alles bleibt auf Vorgabe.',
-  'fertig.satz.aendernWo': 'Ändern lässt sich das jederzeit über die Einstellungen, Seiten „Programme und Modelle" und „Maschinen".',
-  'fertig.eintrag.maschine': 'Maschine „{0}"',
-  'fertig.eintrag.harness': 'Programm „{0}"',
-  'fertig.eintrag.modell': 'Modell „{0}"',
+  'fertig.satz.nichtsGesetzt': 'Es wurde nichts geändert – alles bleibt auf Vorgabe.',
+  'fertig.satz.aendernWo': 'Ändern lässt sich das jederzeit über die Einstellungen, Seiten „Programme und Modelle“ und „Maschinen“.',
+  'fertig.eintrag.maschine': 'Maschine „{0}“',
+  'fertig.eintrag.harness': 'Programm „{0}“',
+  'fertig.eintrag.modell': 'Modell „{0}“',
   'fertig.eintrag.kontext': 'Kontextfenster {0} Token',
 
   // --- Zustandszeichen (keine Emojis) --------------------------------------

@@ -19,7 +19,7 @@ import { spawnSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, existsSync, unlinkSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
-import { mitMaschinenLocale } from './pfad';
+import { panesHinweisOderFrisch } from './sessions';
 import type { SessionInfo } from './sessions';
 
 // V17 (Schritt 9, Guard-Verlauf) haengt unten an: eine eigene Datei
@@ -212,25 +212,42 @@ export function blockiertePanes(dir: string): Set<string> {
  * hinein, null Eintraege heraus, Datei weg.
  *
  * Ein Fehlschlag heisst jetzt „unbekannt", und Unbekanntes loescht nichts.
+ *
+ * EIN FETCH STATT ZWEIER, WENN MOEGLICH (2026-09-03, Audit "gleiche
+ * Pane-Liste mehrfach im selben Takt"): bis heute fragte diese Funktion
+ * `#{pane_id}` in einem EIGENEN `tmux list-panes -a`-Aufruf ab -- im selben
+ * 2000-ms-Takt (main.ts), in dem `sessions.ts` (`readSessions`/
+ * `leseSessions`) dieselbe Vollserver-Auflistung bereits fuer sich selbst
+ * holt, nur in voller Breite (`PANE_LIST_FORMAT`, wovon `#{pane_id}` eine
+ * echte Teilmenge ist). `panesHinweisOderFrisch()` in sessions.ts gibt genau
+ * diesen schon geholten, noch unbenutzten Fetch heraus, WENN main.ts's Takt
+ * kurz zuvor ueber `modellLesen()` einen hinterlassen hat -- sonst fragt es
+ * selbst frisch nach, mit demselben `tmuxAntwort()`-Mechanismus wie fuer die
+ * Sitzungsliste. Warum kein blosses Zeitfenster/keine blosse Cache-Frische
+ * reicht (die Antwort auf zwei Testfaelle mit demselben Socket, aber
+ * ABSICHTLICH unterschiedlichem tmux-Verhalten, kurz hintereinander): siehe
+ * die ausfuehrliche Erklaerung dort.
+ *
+ * `tmuxDa`/`fehler` kommen aus `tmuxAntwort()`, DERSELBEN Stelle, die
+ * sessions.ts fuer die Sitzungsliste laengst benutzt: sie erkennt "kein
+ * Server laeuft" als GUELTIGE leere Antwort (keine Panes, sicher, nicht bloss
+ * vermutet) statt als Fehlschlag -- eine Nuance, die der fruehere eigene
+ * spawnSync-Aufruf hier nicht kannte und jeden nicht-Null-Exitcode
+ * gleichermassen als "unbekannt" behandelte. Das AENDERT NICHTS an der
+ * Kernzusage von oben (ein echter Fehlschlag -- haengendes oder nicht
+ * ausfuehrbares tmux -- bleibt `null`, und Unbekanntes loescht weiterhin
+ * nichts): es ordnet nur den einen Fall, in dem tmux mit Sicherheit "keine
+ * Sitzung, also keine Panes" sagt, korrekt als bekannt-leer statt als
+ * unbekannt ein -- exakt wie sessions.ts es fuer denselben Befund an der
+ * Sitzungsliste schon immer tut.
  */
 function alleTmuxPanes(tmuxSocket: string): Set<string> | null {
-  const basis = tmuxSocket ? ['-L', tmuxSocket] : [];
-  // Kodierung mitgeben -- dieselbe Regel wie in sessions.ts und tmux.ts, siehe
-  // den Kopf von pfad.ts. Ein einzelnes Feld je Zeile ist von der fehlenden
-  // Zeichenklasse nicht betroffen; die Regel gilt trotzdem einheitlich.
-  // FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden): oertlich, 2s
-  // wie die anderen bare-tmux-Aufrufe dieses Hauses.
-  const r = spawnSync('tmux', [...basis, 'list-panes', '-a', '-F', '#{pane_id}'], {
-    encoding: 'utf8',
-    env: mitMaschinenLocale(),
-    timeout: 2000,
-  });
-  // `r.error` faengt den Fall, in dem tmux gar nicht erst startet (oder die
-  // Frist ablief, `r.signal` gesetzt); `status` ungleich 0 den, in dem es
-  // abbricht. Beides ist keine Auskunft ueber Panes.
-  if (r.signal) process.stderr.write('alleTmuxPanes: tmux nach 2000ms abgebrochen -- gilt als unbekannt.\n');
-  if (r.error || r.status !== 0) return null;
-  return new Set((r.stdout || '').split('\n').filter(Boolean));
+  const { tmuxDa, panes, fehler } = panesHinweisOderFrisch(tmuxSocket);
+  if (!tmuxDa) {
+    process.stderr.write(`alleTmuxPanes: ${fehler || 'tmux hat nicht geantwortet'} -- gilt als unbekannt.\n`);
+    return null;
+  }
+  return new Set(panes.map((p) => p.paneId));
 }
 
 interface PaneZuordnung {

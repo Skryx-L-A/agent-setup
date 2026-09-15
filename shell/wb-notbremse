@@ -2,11 +2,16 @@
 # wb-notbremse — die letzte Sicherung vor dem Stillstand: faellt der freie
 # Speicher unter eine Schwelle, werden die LOKALEN MODELLE beendet, sonst nichts.
 #
-#   wb-notbremse wache [--schwelle-mib 1024] [--takt 1] [--anlauf 120]
+#   wb-notbremse wache [--schwelle-mib 512] [--takt 0.15] [--anlauf 120] [--pid <n>]
 #                                Die Schleife selbst. Laeuft im Vordergrund und
 #                                endet von selbst, sobald kein Modell mehr laeuft.
+#                                --pid: GENAU diese eine PID beobachten statt
+#                                der ganzen Prozesstabelle per Muster (siehe
+#                                Nachtrag 27.08.2026 unten).
 #   wb-notbremse start [...]     Dieselbe Schleife abgeloest im Hintergrund,
-#                                genau einmal (Pid-Datei). Der Weg fuer wb-mlx-server.
+#                                genau einmal je beobachteter PID (eigene
+#                                Pid-Datei je Ziel, siehe piddatei_fuer()).
+#                                Der Weg fuer wb-mlx-server.
 #   wb-notbremse stopp           Die laufende Wache beenden.
 #   wb-notbremse status          Laeuft eine? Was sieht sie gerade?
 #   wb-notbremse pruefen         EIN Durchgang, ohne irgendetwas zu beenden.
@@ -97,6 +102,70 @@
 #
 # EXIT-CODES: 0 = in Ordnung / nichts zu tun, 1 = es wurde eingegriffen (bei
 #             'jetzt'/'pruefen': es waere eingegriffen worden), 2 = Benutzungsfehler.
+#
+# NACHTRAG 27.08.2026 (Auftrag "Speicher-Reserven abbauen"): der Nutzer hat an
+# diesem Tag `wb-belegung`s RESERVE_GIB/Zuschlag, `wb-kontext`s RESERVE_MIB und
+# `wb-mlx-server`s MIN_FREE_MIB auf Null gesetzt -- die Werkbank rechnet jetzt
+# ohne Aufschlag, was das Modell wirklich braucht, und verlaesst sich fuer den
+# Ernstfall ganz auf DIESES Werkzeug. Drei Aenderungen dafuer:
+#
+#   1. --pid <n>: der neue, bevorzugte Weg fuer `wb-mlx-server`. Statt die
+#      MUSTER-Liste gegen die GANZE Prozesstabelle zu halten, bekommt die
+#      Wache die PID, die `wb-nohup` beim Start selbst zurueckgegeben hat, und
+#      beobachtet NUR diese eine PID -- keine Muster-Suche noetig, wenn der
+#      Aufrufer seinen eigenen Prozess schon kennt (Hausregel: `pgrep -f`
+#      trifft auch den Agenten-Prompt, in dem der Suchbegriff vorkommt). Das
+#      TABU bleibt als Gegenprobe bestehen (schuetzt gegen eine wiederverwendete
+#      PID nach einer Race), das MUSTER wird nur noch als Warnung gemeldet,
+#      nicht mehr als Bedingung. Ohne --pid bleibt das alte, musterbasierte
+#      Verhalten unveraendert (fuer 'jetzt'/'pruefen'/'status' von Hand und
+#      fuer den Fall eines Off-the-books-Starts, gegen den es urspruenglich
+#      gebaut wurde, siehe "WOZU" oben).
+#
+#   2. SCHWELLE_MIB 1024 -> 512 (neue des Nutzers Zahl, woertlich "unter 0,5 GB
+#      Speicher frei"), per Umgebungsvariable WB_NOTBREMSE_SCHWELLE_MIB
+#      ueberschreibbar -- das macht die Schwelle testbar (siehe die
+#      zugehoerige Testsuite), ohne echten Speicher wegnehmen zu muessen.
+#
+#   3. Schnellere, lokale Messung statt IMMER zuerst check-resources zu rufen
+#      (frei_mib_schnell() unten). Gemessen an diesem Auftrag: ein einzelner
+#      `vm_stat`+`sysctl`-Aufruf kostet rund 3 ms, derselbe Wert ueber
+#      `check-resources --json` rund 160 ms -- gut 50x langsamer, weil dort
+#      auch Ollama/GPU-Zustand mitgeprueft wird, was fuer diese Entscheidung
+#      irrelevant ist. Bei einer Schwelle von 512 MiB ist das entscheidend:
+#      ein eigener, kontrollierter Belastungstest auf dieser Maschine (12
+#      GiB durch einen einzelnen Python-Prozess belegt, danach sofort wieder
+#      freigegeben) zeigte einen Fall von rund 880 MiB/s unter anhaltender
+#      Last -- bei 160 ms Messtakt waeren das schon rund 140 MiB Blindflug
+#      JE Messung, mehr als ein Viertel der ganzen Schwelle. TAKT_S sinkt
+#      deshalb von 1,0 auf 0,15 s; bei rund 3-5 ms Messkosten je Takt bleibt
+#      davon fast alles Luft.
+#
+#      DERSELBE TEST ZEIGTE ETWAS WICHTIGERES: `frei_mib_streng()` (die
+#      Rueckfallformel frei+inaktiv+spekulativ+freigebbar) ist fuer GENAU
+#      DIE Gefahr, vor der dieses Werkzeug schuetzt, die FALSCHE Wahl als
+#      Hauptquelle. Waehrend der Testbelastung (reines Anfordern und
+#      Beschreiben von anonymem Speicher, wie ein ladendes MLX-Modell es
+#      tut) fiel die grosszuegige Formel (total - anonym - gewired -
+#      Kompressor, dieselbe wie check-resources' `ram.free_mib`) von 25803
+#      auf 11974 MiB (-13829 MiB in 15,7 s), waehrend die STRENGE Formel im
+#      selben Fenster nur von 24561 auf 20291 MiB fiel (-4270 MiB) -- sie
+#      haette an dieser Stelle rund 16 GiB frei gemeldet, die es in
+#      Wirklichkeit nicht mehr gab, weil neu belegter anonymer Speicher
+#      weder "frei" noch "inaktiv" noch "freigebbar" ist und in der strengen
+#      Formel schlicht nicht auftaucht. Die "strenge" Formel ist also nur
+#      dann die vorsichtigere, wenn Speicher durch Datei-Cache knapp wird --
+#      bei einem wachsenden Modellprozess ist es umgekehrt, und genau das
+#      ist der Fall, den diese Bremse abfangen muss. `frei_mib_schnell()`
+#      rechnet deshalb lokal dieselbe grosszuegige Formel wie check-resources
+#      (mit demselben eingebauten Rueckfall auf die strenge Formel, wenn die
+#      dafuer noetigen vm_stat-Zeilen fehlen -- siehe dort), nur ohne den
+#      Umweg ueber den externen Aufruf. check-resources bleibt der Weg, wenn
+#      die lokale Rechnung selbst ausfaellt (fehlendes vm_stat/sysctl); ganz
+#      am Ende bleibt frei_mib_streng() als letzter Rueckfall, nie "unbegrenzt
+#      frei". Volle Messwerte und die Begruendung fuer 0,5 GB als Schwelle
+#      selbst (Vorgabe des Nutzers, nicht neu hergeleitet) stehen im
+#      Ergebnisprotokoll dieses Auftrags.
 import argparse
 import errno
 import json
@@ -114,8 +183,20 @@ PROTOKOLL = os.path.join(STATE_DIR, "protokoll.log")
 PIDDATEI = os.path.join(STATE_DIR, "wache.pid")
 EINGRIFF = os.path.join(STATE_DIR, "letzter-eingriff.json")
 
-SCHWELLE_MIB = 1024      # Zahl des Nutzers: "unter 1gb freier speicher insgesammt".
-TAKT_S = 1.0
+# WAR 1024 ("unter 1gb freier speicher insgesammt", der Nutzer 2026-08-21).
+# 2026-08-27, neue Anweisung, woertlich "weniger als 0,5 GB Speicher frei
+# sind": 512. Per WB_NOTBREMSE_SCHWELLE_MIB ueberschreibbar -- das macht die
+# Schwelle fuer einen Test verstellbar, ohne echten Speicher wegnehmen zu
+# muessen (siehe Nachtrag 27.08.2026 im Kopfkommentar); --schwelle-mib
+# gewinnt, wenn es fuer einen einzelnen Aufruf ausdruecklich gesetzt wird.
+SCHWELLE_MIB = float(os.environ.get("WB_NOTBREMSE_SCHWELLE_MIB", "512"))
+# WAR 1.0. Gesenkt auf 0,15 s (Nachtrag 27.08.2026, siehe Kopfkommentar fuer
+# die Messung): bei rund 880 MiB/s gemessenem Fall unter Last waere ein
+# Sekundentakt bei einer 512-MiB-Schwelle schon fuer sich genommen zu grob.
+# Eine einzelne Messung (frei_mib_schnell(), siehe dort) kostet gemessen nur
+# rund 3-5 ms -- der neue Takt bleibt weit unter dem, was die Messung selbst
+# braucht.
+TAKT_S = 0.15
 ANLAUF_S = 120.0         # solange gilt "noch kein Modell da" NICHT als "fertig".
 TERM_FRIST_S = 5.0       # zwischen SIGTERM und SIGKILL.
 # ZWEI ABTASTUNGEN, NICHT EINE (Nachtrag nach dem echten Lauf, 2026-08-21).
@@ -145,6 +226,11 @@ BESTAETIGUNGEN = 2
 # Eine Schwelle auf RSS haette genau die groessten Halter uebersehen.
 MUSTER = [
     (re.compile(r"\bmlx_lm\.(server|generate|chat|benchmark|evaluate)\b"), "mlx-lm"),
+    # mlx_vlm.server (Nachtrag 2026-09-10, gemessen): der Vorgabemotor der Worker seit
+    # 2026-08-27 stand NICHT in dieser Liste. Am 10.09. wuchs er auf 43 GB (15 GB
+    # komprimiert, Swap 11 GB), die Wache protokollierte nur "passt auf KEIN bekanntes
+    # Modell-Muster" und griff nicht ein; der Worker fiel mit Metal-OOM.
+    (re.compile(r"\bmlx_vlm\.(server|generate|chat)\b"), "mlx-vlm"),
     (re.compile(r"\bmlx[-_]dspark\b"), "mlx-dspark"),
     (re.compile(r"\bmtplx\b"), "mtplx"),
     (re.compile(r"\bvllm\b.*\b(serve|entrypoints)\b"), "vllm"),
@@ -254,15 +340,78 @@ def frei_mib_streng():
     return None
 
 
+def frei_mib_schnell():
+    """(frei_mib oder None, quelle) -- dieselbe GROSSZUEGIGE Formel, die
+    check-resources als `ram.free_mib` fuehrt (total - anonym - gewired -
+    Kompressor), lokal nachgerechnet statt ueber den externen Aufruf.
+    NEUER Nachtrag 27.08.2026, siehe Kopfkommentar fuer die volle Messung:
+    diese Formel ist unter wachsendem anonymem Speicher (ein ladendes oder
+    rechnendes Modell) NICHT nur schneller zu berechnen als
+    frei_mib_streng(), sie liegt in genau diesem Fall auch NAEHER an der
+    Wirklichkeit -- die strenge Formel zaehlt frisch belegten anonymen
+    Speicher weder als frei noch als inaktiv und faellt deshalb sichtbar
+    langsamer, als der Speicher wirklich schwindet (gemessen: -13829 MiB vs.
+    -4270 MiB im selben 15,7-Sekunden-Fenster unter dem gleichen Test).
+
+    Auf Linux identisch mit frei_mib_streng() (dort gibt es nur MemAvailable,
+    keine zweite Formel) -- diese Funktion existiert dort nur, damit
+    frei_mib_quelle() plattformunabhaengig eine Quelle zurueckbekommt.
+
+    Scheitert die Messung selbst (vm_stat/sysctl fehlen, eine erwartete Zeile
+    fehlt, oder das Ergebnis ist unsinnig -- negativ oder groesser als der
+    Gesamtspeicher, ein Zeichen, dass macOS eine Zeile umbenannt hat), faellt
+    diese Funktion auf frei_mib_streng() zurueck und sagt das in der Quelle
+    dazu. None heisst 'nicht messbar', wie ueberall hier NIE 'unbegrenzt
+    frei'."""
+    if sys.platform != "darwin":
+        wert = frei_mib_streng()
+        return wert, ("streng (lokal, MemAvailable)" if wert is not None else None)
+    try:
+        seite = int(subprocess.run(["/usr/sbin/sysctl", "-n", "hw.pagesize"],
+                                   capture_output=True, text=True, timeout=5).stdout.strip())
+        gesamt = int(subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"],
+                                    capture_output=True, text=True, timeout=5).stdout.strip())
+        vms = subprocess.run(["/usr/bin/vm_stat"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return frei_mib_streng(), "streng (lokal, Rueckfall -- vm_stat/sysctl fuer die schnelle Formel nicht lesbar)"
+    anon = wired = kompr = 0
+    gefunden = {"anon": False, "wired": False}
+    for name, feld in (("Anonymous pages", "anon"), ("Pages wired down", "wired"),
+                       ("Pages occupied by compressor", "kompr")):
+        m = re.search(re.escape(name) + r":\s*(\d+)", vms)
+        if not m:
+            continue
+        wert_seiten = int(m.group(1))
+        if feld == "anon":
+            anon = wert_seiten; gefunden["anon"] = True
+        elif feld == "wired":
+            wired = wert_seiten; gefunden["wired"] = True
+        else:
+            kompr = wert_seiten
+    if not gefunden["anon"] or not gefunden["wired"]:
+        return frei_mib_streng(), "streng (lokal, Rueckfall -- vm_stat lieferte keine Anonymous/Wired-Zeile)"
+    gesamt_mib = gesamt / 1048576.0
+    frei = gesamt_mib - (anon + wired + kompr) * seite / 1048576.0
+    if frei < 0 or frei > gesamt_mib:
+        return frei_mib_streng(), "streng (lokal, Rueckfall -- die schnelle Formel ergab einen unsinnigen Wert)"
+    return frei, "schnell (lokal, grosszuegige Formel wie check-resources' ram.free_mib)"
+
+
 # GEMESSEN 2026-08-21 auf dieser Maschine: drei Aufrufe von 'check-resources'
 # hintereinander, 0,14 / 0,15 / 0,15 s -- der uebliche Fall bleibt weit unter
-# einer Zehntelsekunde Streuung. Die Frist unten ist grosszuegiger als dieser
-# Normalfall (gut das Dreifache), aber bewusst kuerzer als TAKT_S: schlaegt
-# der Aufruf fehl (haengender 'ollama ps' o.ae. -- check-resources selbst hat
-# dafuer keine harte Frist), soll EIN Takt der Wache trotzdem nicht laenger
-# als etwa TAKT_S + CHECK_RESOURCES_FRIST_S dauern, nicht das Doppelte davon.
-# Ueberschreibbar fuer Tests (WB_NOTBREMSE_CHECK_FRIST_S), damit eine
-# Attrappe, die absichtlich zu langsam antwortet, keine Suite ausbremst.
+# einer Zehntelsekunde Streuung.
+#
+# NACHTRAG 27.08.2026: check-resources ist seither NICHT mehr die erste
+# Quelle (siehe frei_mib_quelle()/frei_mib_schnell() oben) -- die lokale
+# Formel ist rund 50x schneller (~3 ms gegen ~160 ms) und liefert dieselbe
+# Zahl. Dieser Aufruf greift nur noch, wenn die lokale Rechnung selbst
+# scheitert (vm_stat/sysctl nicht lesbar), also selten. Die Frist bleibt
+# grosszuegiger als der gemessene Normalfall (gut das Dreifache); dass sie
+# heute laenger ist als TAKT_S (0,15 s), ist ohne Belang, weil dieser Pfad
+# im Normalbetrieb gar nicht mehr durchlaufen wird. Ueberschreibbar fuer
+# Tests (WB_NOTBREMSE_CHECK_FRIST_S), damit eine Attrappe, die absichtlich
+# zu langsam antwortet, keine Suite ausbremst.
 CHECK_RESOURCES_FRIST_S = float(os.environ.get("WB_NOTBREMSE_CHECK_FRIST_S", "0.5"))
 
 
@@ -297,7 +446,19 @@ def frei_mib_quelle():
     fehlt oder ist keine sinnvolle Zahl (negativ, Text, 'null') -- rechnet
     diese Funktion selbst nach, streng (frei_mib_streng()). Beide Zweige
     koennen None liefern (nicht messbar); der Aufrufer behandelt das wie
-    bisher als 'kein Eingriff', nie als 'unbegrenzt frei'."""
+    bisher als 'kein Eingriff', nie als 'unbegrenzt frei'.
+
+    UNVERAENDERT seit 21.08.2026 mit Absicht (Nachtrag 27.08.2026): diese
+    Funktion bleibt der Weg fuer 'jetzt'/'pruefen'/'status' von Hand und fuer
+    den musterbasierten Ernstfall ohne --pid -- Zusage 11 der Testsuite
+    (test-notbremse.sh) schreibt genau dieses Verhalten fest (check-resources
+    als EINE Quelle, mit striktem Rueckfall), und nichts an dieser Zusage hat
+    sich geaendert. Fuer den NEUEN --pid-Weg mit seiner viel engeren 512-MiB-
+    Schwelle gibt es stattdessen frei_mib_fuer() weiter unten, das VOR dieser
+    Funktion zuerst die viel schnellere lokale Formel probiert (siehe dort fuer
+    die Messung, die diese Aufteilung begruendet) -- eine zusaetzliche,
+    schnellere Quelle fuer einen neuen Anwendungsfall, keine Aenderung an
+    dieser hier."""
     pfad = check_resources_pfad()
     if pfad:
         try:
@@ -315,6 +476,30 @@ def frei_mib_quelle():
                 json.JSONDecodeError, AttributeError, TypeError):
             pass
     return frei_mib_streng(), "streng (lokal, Rueckfall -- check-resources war nicht nutzbar)"
+
+
+def frei_mib_fuer(ziel_pid):
+    """Welche Quelle fuer DIESEN Aufruf gilt -- die Weiche zwischen dem
+    bestehenden, getesteten Weg und dem neuen schnellen Weg (Nachtrag
+    27.08.2026).
+
+    MIT ziel_pid (der --pid-Weg, eng getaktet gegen eine 512-MiB-Schwelle):
+    erst frei_mib_schnell(), die lokale (~3-5 ms) Fassung derselben
+    grosszuegigen Formel, die check-resources als `ram.free_mib` fuehrt --
+    rund 50x schneller als der externe Aufruf (~160 ms, dominiert von
+    Ollama-/GPU-Pruefungen, die fuer diese Entscheidung irrelevant sind) und
+    bei einem gemessenen Fall von rund 880 MiB/s unter Last der Unterschied
+    zwischen genug und zu wenig Vorwarnzeit. Scheitert sie (vm_stat/sysctl
+    nicht lesbar), ist frei_mib_quelle() die zweite Chance.
+
+    OHNE ziel_pid (der bisherige, musterbasierte Betrieb): unveraendert
+    frei_mib_quelle() direkt -- damit bleibt Zusage 11 der Testsuite exakt
+    das, was sie war."""
+    if ziel_pid:
+        wert, quelle = frei_mib_schnell()
+        if wert is not None:
+            return wert, quelle
+    return frei_mib_quelle()
 
 
 # ------------------------------------------------------------- Modellsuche
@@ -337,10 +522,67 @@ def prozessliste():
     return zeilen
 
 
-def modelle(eigene_pid=None):
-    """Die lokalen Modellprozesse, weisse Liste. Der eigene Prozess und die
-    eigene Prozesskette bleiben aussen vor -- eine Bremse, die sich selbst
-    beendet, waere zwar folgerichtig, aber unbrauchbar."""
+def ps_fuer_pid(pid):
+    """RSS und Kommandozeile fuer GENAU eine PID, oder None, wenn sie nicht
+    (mehr) lebt oder nicht lesbar ist. Nachtrag 27.08.2026, fuer den
+    --pid-Weg unten: ein gezielter Aufruf statt eines Scans der ganzen
+    Prozesstabelle, O(1) statt O(alle Prozesse) -- gemessen rund 1,6 ms
+    gegen rund 25 ms fuer prozessliste() auf dieser Maschine."""
+    try:
+        p = subprocess.run(["/bin/ps", "-o", "rss=,command=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    zeile = p.stdout.strip("\n").strip()
+    if not zeile:
+        return None
+    teile = zeile.split(None, 1)
+    if len(teile) < 2:
+        return None
+    try:
+        return int(teile[0]), teile[1]
+    except ValueError:
+        return None
+
+
+def modelle(eigene_pid=None, ziel_pid=None):
+    """Die lokalen Modellprozesse.
+
+    MIT ziel_pid (Nachtrag 27.08.2026, der --pid-Weg): KEINE Musterjagd
+    ueber die Maschine. Der Aufrufer (wb-mlx-server) kennt seine PID aus der
+    eigenen Rueckgabe von `wb-nohup` und diese Funktion prueft nur, ob genau
+    sie noch lebt -- die Lehre aus dem Haus: `pgrep -f` trifft auch den
+    Agenten-Prompt, in dem der Suchbegriff zufaellig vorkommt; eine bekannte
+    PID braucht dieses Risiko gar nicht erst einzugehen. Das TABU bleibt als
+    Gegenprobe bestehen (schuetzt gegen eine PID, die seit dem Start durch
+    einen Prozess-Neuvergabe-Zufall zu etwas anderem wurde); das MUSTER wird
+    nur noch als Warnung protokolliert, wenn es NICHT passt -- ein Hinweis
+    auf eine falsche PID beim Aufrufer -- verhindert das Beenden aber nicht:
+    der Auftrag ist ausdruecklich, der PID zu vertrauen, nicht dem Muster.
+
+    OHNE ziel_pid (Vorgabe, unveraendert): die weisse Liste ueber die ganze
+    Prozesstabelle, fuer den musterbasierten Ernstfall (ein Modell, das am
+    Buch vorbei gestartet wurde, siehe 'WOZU' im Kopfkommentar) und fuer
+    'jetzt'/'pruefen'/'status' von Hand. Der eigene Prozess und die eigene
+    Prozesskette bleiben aussen vor -- eine Bremse, die sich selbst beendet,
+    waere zwar folgerichtig, aber unbrauchbar."""
+    if ziel_pid:
+        gefunden = ps_fuer_pid(ziel_pid)
+        if gefunden is None:
+            return []
+        rss, cmd = gefunden
+        if any(t.search(cmd) for t in TABU):
+            protokollieren("Ziel-PID %d ist per TABU geschuetzt (%s) -- KEIN Eingriff, "
+                           "auch nicht unter der Schwelle." % (ziel_pid, cmd[:160]))
+            return []
+        art = next((a for muster, a in MUSTER if muster.search(cmd)), None)
+        if art is None:
+            protokollieren("WARNUNG: Ziel-PID %d passt auf KEIN bekanntes Modell-Muster (%s) "
+                           "-- wird trotzdem als Ziel behandelt, die PID gewinnt vor dem Muster."
+                           % (ziel_pid, cmd[:160]))
+            art = "ziel-pid (unbekanntes Muster)"
+        return [{"pid": ziel_pid, "rss_mib": round(rss / 1024.0, 1),
+                 "art": art, "kommando": cmd}]
     aus = []
     selbst = {os.getpid(), os.getppid()}
     if eigene_pid:
@@ -448,9 +690,14 @@ def eingriff_merken(daten):
 MLX_KENNUNG_DATEI = os.path.join(HOME, ".local", "state", "wb-mlx-server", "belegung-kennung")
 
 
-def belegung_zurueckgeben():
+def belegung_zurueckgeben(ziel_pid=None):
     """Die Belegung des Servers, den dieses Werkzeug gerade beendet hat, aus dem
     Buch nehmen (Nachtrag nach dem echten Lauf, 2026-08-21).
+
+    MIT ziel_pid (Nachtrag 27.08.2026): die Nachpruefung fragt gezielt, ob
+    GENAU diese eine PID noch lebt (modelle(ziel_pid=...)), nicht mehr, ob
+    irgendein Muster-Treffer irgendwo auf der Maschine noch laeuft -- im
+    --pid-Betrieb ist von vornherein klar, wessen Buchung das war.
 
     Im Verifikationslauf blieben 25,2 GiB im Buch stehen, nachdem die Bremse den
     mtplx-Server beendet hatte -- der Speicher war frei, das Buch sagte das
@@ -466,7 +713,7 @@ def belegung_zurueckgeben():
     Fehlt die Datei oder scheitert die Freigabe, wird das gesagt und nicht
     stillschweigend uebergangen -- eine Belegung zu viel im Buch kostet einen
     Start, eine zu wenig kostet die Maschine."""
-    if modelle():
+    if modelle(ziel_pid=ziel_pid):
         protokollieren("  Belegung NICHT freigegeben: es laeuft noch ein Modellprozess, die "
                        "Buchung koennte ihm gehoeren. Von Hand pruefen: wb-belegung wer")
         return
@@ -503,7 +750,7 @@ def belegung_zurueckgeben():
                        % (kennung, p.returncode, (p.stderr or p.stdout or "").strip()[:200], kennung))
 
 
-def zuschlagen(frei, schwelle, procs, quelle):
+def zuschlagen(frei, schwelle, procs, quelle, ziel_pid=None):
     """Der Eingriff selbst: beenden, verifizieren, dreifach laut werden."""
     protokollieren("NOTBREMSE — frei %.0f MiB (Quelle: %s) unter Schwelle %.0f MiB, "
                    "%d Modellprozess(e)%s"
@@ -536,7 +783,7 @@ def zuschlagen(frei, schwelle, procs, quelle):
         "sitzungen_benachrichtigt": erreicht,
     })
     sys.stderr.write(text + "\n")
-    belegung_zurueckgeben()
+    belegung_zurueckgeben(ziel_pid=ziel_pid)
     return ergebnis
 
 
@@ -557,8 +804,8 @@ def zeige_lage(frei, procs, schwelle, quelle):
 
 
 def cmd_pruefen(a, wirklich=False):
-    frei, quelle = frei_mib_quelle()
-    procs = modelle()
+    frei, quelle = frei_mib_fuer(a.pid)
+    procs = modelle(ziel_pid=a.pid)
     zeige_lage(frei, procs, a.schwelle_mib, quelle)
     if frei is None:
         gib_aus()
@@ -579,28 +826,28 @@ def cmd_pruefen(a, wirklich=False):
         gib_aus()
         gib_aus("WUERDE ZUSCHLAGEN: %d Modellprozess(e) beenden." % len(procs))
         return 1
-    zuschlagen(frei, a.schwelle_mib, procs, quelle)
+    zuschlagen(frei, a.schwelle_mib, procs, quelle, ziel_pid=a.pid)
     return 1
 
 
 def cmd_wache(a):
     os.makedirs(STATE_DIR, exist_ok=True)
     start = time.time()
-    protokollieren("Wache an (pid %d, Schwelle %.0f MiB, Takt %.1f s, Anlauf %.0f s, "
+    protokollieren("Wache an (pid %d, Ziel-PID %s, Schwelle %.0f MiB, Takt %.2f s, Anlauf %.0f s, "
                    "%d Abtastungen zur Bestaetigung)%s"
-                   % (os.getpid(), a.schwelle_mib, a.takt, a.anlauf, a.bestaetigungen,
-                      zaun_zusatz()))
+                   % (os.getpid(), a.pid or "keine (musterbasiert)", a.schwelle_mib, a.takt,
+                      a.anlauf, a.bestaetigungen, zaun_zusatz()))
     eingegriffen = False
     unter = 0
     try:
         while True:
-            procs = modelle()
+            procs = modelle(ziel_pid=a.pid)
             if not procs:
                 if time.time() - start > a.anlauf:
                     protokollieren("Wache aus: kein lokales Modell mehr — sie wird nicht auf Vorrat gehalten.")
                     return 1 if eingegriffen else 0
             else:
-                frei, quelle = frei_mib_quelle()
+                frei, quelle = frei_mib_fuer(a.pid)
                 if frei is not None and frei < a.schwelle_mib:
                     unter += 1
                     if unter < a.bestaetigungen:
@@ -608,7 +855,7 @@ def cmd_wache(a):
                                        "(Quelle: %s), Schwelle %.0f MiB"
                                        % (unter, a.bestaetigungen, frei, quelle, a.schwelle_mib))
                     else:
-                        zuschlagen(frei, a.schwelle_mib, procs, quelle)
+                        zuschlagen(frei, a.schwelle_mib, procs, quelle, ziel_pid=a.pid)
                         eingegriffen = True
                         unter = 0
                 else:
@@ -625,16 +872,32 @@ def cmd_wache(a):
         protokollieren("Wache aus (Abbruch von Hand).")
         return 1 if eingegriffen else 0
     finally:
+        piddatei = piddatei_fuer(a.pid)
         try:
-            if os.path.exists(PIDDATEI) and int(open(PIDDATEI).read().strip() or 0) == os.getpid():
-                os.unlink(PIDDATEI)
+            if os.path.exists(piddatei) and int(open(piddatei).read().strip() or 0) == os.getpid():
+                os.unlink(piddatei)
         except (OSError, ValueError):
             pass
 
 
-def wache_pid():
+def piddatei_fuer(ziel_pid=None):
+    """Die PID-Datei DIESER Wache. Ohne ziel_pid: die eine maschinenweite
+    PIDDATEI wie bisher -- eine musterbasierte Wache deckt ohnehin alle
+    Modelle ab, ein zweiter Start waere wirkungslos. MIT ziel_pid (Nachtrag
+    27.08.2026, fuer den --pid-Weg): eine EIGENE Datei je beobachteter PID.
+    Ohne diese Trennung wuerde `wb-mlx-server` bei einem Modellwechsel den
+    Start einer neuen Wache fuer den NEUEN Prozess uebergehen, weil die ALTE
+    (noch in ihrer Anlauffrist nach dem Tod des alten Modells, siehe
+    ANLAUF_S) in der EINEN gemeinsamen PIDDATEI faelschlich als 'deckt das
+    schon ab' durchgehen wuerde, obwohl sie eine ganz andere PID beobachtet."""
+    if not ziel_pid:
+        return PIDDATEI
+    return os.path.join(STATE_DIR, "wache-pid-%d.pid" % int(ziel_pid))
+
+
+def wache_pid(ziel_pid=None):
     try:
-        pid = int(open(PIDDATEI, encoding="utf-8").read().strip())
+        pid = int(open(piddatei_fuer(ziel_pid), encoding="utf-8").read().strip())
     except (OSError, ValueError):
         return 0
     return pid if lebt(pid) else 0
@@ -642,7 +905,8 @@ def wache_pid():
 
 def cmd_start(a):
     os.makedirs(STATE_DIR, exist_ok=True)
-    alt = wache_pid()
+    piddatei = piddatei_fuer(a.pid)
+    alt = wache_pid(a.pid)
     if alt:
         gib_aus("wb-notbremse: laeuft bereits (pid %d)." % alt)
         return 0
@@ -651,18 +915,21 @@ def cmd_start(a):
                  "--schwelle-mib", str(int(a.schwelle_mib)),
                  "--takt", str(a.takt), "--anlauf", str(a.anlauf),
                  "--bestaetigungen", str(int(a.bestaetigungen))]
+    if a.pid:
+        argumente += ["--pid", str(int(a.pid))]
     with open(log, "a", encoding="utf-8") as f:
         kind = subprocess.Popen(argumente, stdout=f, stderr=f,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
-    with open(PIDDATEI, "w", encoding="utf-8") as f:
+    with open(piddatei, "w", encoding="utf-8") as f:
         f.write(str(kind.pid))
-    gib_aus("wb-notbremse: Wache an (pid %d, Schwelle %d MiB)%s. Protokoll: %s"
-            % (kind.pid, int(a.schwelle_mib), zaun_zusatz(), PROTOKOLL))
+    gib_aus("wb-notbremse: Wache an (pid %d, Ziel-PID %s, Schwelle %d MiB)%s. Protokoll: %s"
+            % (kind.pid, a.pid or "keine (musterbasiert)", int(a.schwelle_mib), zaun_zusatz(), PROTOKOLL))
     return 0
 
 
-def cmd_stopp(_a):
-    pid = wache_pid()
+def cmd_stopp(a):
+    piddatei = piddatei_fuer(a.pid)
+    pid = wache_pid(a.pid)
     if not pid:
         gib_aus("wb-notbremse: keine Wache aktiv.")
         return 0
@@ -677,7 +944,7 @@ def cmd_stopp(_a):
         gib_aus("wb-notbremse: Wache %d liess sich nicht beenden." % pid)
         return 1
     try:
-        os.unlink(PIDDATEI)
+        os.unlink(piddatei)
     except OSError:
         pass
     gib_aus("wb-notbremse: Wache %d beendet." % pid)
@@ -685,10 +952,10 @@ def cmd_stopp(_a):
 
 
 def cmd_status(a):
-    pid = wache_pid()
+    pid = wache_pid(a.pid)
     gib_aus("Wache       %s" % ("laeuft (pid %d)" % pid if pid else "aus"))
-    frei, quelle = frei_mib_quelle()
-    zeige_lage(frei, modelle(), a.schwelle_mib, quelle)
+    frei, quelle = frei_mib_fuer(a.pid)
+    zeige_lage(frei, modelle(ziel_pid=a.pid), a.schwelle_mib, quelle)
     if os.path.exists(EINGRIFF):
         try:
             d = json.load(open(EINGRIFF, encoding="utf-8"))
@@ -720,6 +987,12 @@ def main(argv):
         sp.add_argument("--anlauf", type=float, default=ANLAUF_S,
                         help="Sekunden, in denen 'noch kein Modell da' die Wache NICHT beendet "
                              "(Vorgabe %d -- ein Server braucht zum Laden laenger als einen Takt)" % ANLAUF_S)
+        sp.add_argument("--pid", type=int, default=None,
+                        help="Nachtrag 27.08.2026: statt der MUSTER-Liste ueber die ganze "
+                             "Prozesstabelle nur GENAU diese eine PID beobachten -- der Weg fuer "
+                             "einen Aufrufer, der seine PID vom eigenen Start schon kennt (z.B. "
+                             "wb-mlx-server). Ohne --pid unveraendert das alte, musterbasierte "
+                             "Verhalten.")
 
     for name in ("wache", "start", "stopp", "status", "pruefen", "jetzt"):
         sp = sub.add_parser(name)
@@ -734,6 +1007,9 @@ def main(argv):
         return 2
     if a.bestaetigungen < 1:
         sys.stderr.write("wb-notbremse: --bestaetigungen muss mindestens 1 sein.\n")
+        return 2
+    if a.pid is not None and a.pid <= 0:
+        sys.stderr.write("wb-notbremse: --pid muss eine positive Zahl sein.\n")
         return 2
     if a.befehl == "wache":
         return cmd_wache(a)

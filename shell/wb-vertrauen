@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""wb-vertrauen — traegt das Arbeitsverzeichnis eines Workers in ~/.claude.json
+als vertraut ein, damit der Start nicht am Workspace-Trust-Dialog haengenbleibt.
+
+ANLASS (01.09.2026): claude 2.1.252 (installiert 31.08.2026 21:58) zeigt fuer
+ein Verzeichnis, das noch nie eine Sitzung gesehen hat, den Dialog "Quick safety
+check: Is this a project you created or one you trust?" -- auch mit
+`--dangerously-skip-permissions`, denn der Schalter regelt Werkzeug-Erlaubnisse,
+nicht das Vertrauen in den Arbeitsordner. Seit dem 04.08.2026 arbeitet aber JEDER
+Worker in einem frisch angelegten Worktree unter ~/.pi-workers/worktrees/<name>,
+und der ist per Definition neu. Ergebnis am 01.09.2026: der Pane starb reihenweise
+mit Status 127; die Fehlermeldung im Pane ("zsh:1: no such file or directory:
+bash -lc cd\\ ...") sah aus wie ein Quoting-Fehler und ist keiner -- die
+Startzeile ist wortgleich lauffaehig, wenn man sie von Hand absetzt. Wer den
+Fehler das naechste Mal sieht, prueft ZUERST, ob im Pane vorher der Trust-Dialog
+stand.
+
+KEINE ANHEBUNG DER ERLAUBNISSTUFE, sondern eine UEBERTRAGUNG. Eingetragen wird
+ein Verzeichnis nur, wenn der Nutzer selbst schon einmal Vertrauen ausgesprochen
+hat -- fuer genau diesen Quelltext oder fuer den Ordner darueber:
+
+  (a) es ist ein git-Worktree, und sein HAUPTBAUM traegt in ~/.claude.json
+      hasTrustDialogAccepted=true. Dann gilt das Vertrauen bereits fuer
+      denselben Quelltext, nur unter einem anderen Pfad; oder
+  (b) ein VORFAHRE des Verzeichnisses (bei einem Worktree: ein Vorfahre des
+      Hauptbaums) traegt hasTrustDialogAccepted=true, und dieser Vorfahre liegt
+      unter $HOME. Der uebliche Fall: ~$HOME/AI ist vertraut, ein neues
+      Projekt darunter war noch nie geoeffnet.
+
+Die Vererbung aus (b) ist die bewusste Ausweitung gegenueber claudes eigenem
+Verhalten, das nur den exakten Pfad kennt. Sie ist auf eigene des Nutzers
+Verzeichnisse begrenzt: ein geklontes fremdes Repo ausserhalb eines vertrauten
+Elternordners faellt nicht darunter und bleibt beim Dialog.
+
+Alles andere wird NICHT eingetragen; das Werkzeug meldet den Grund nach stderr
+und endet mit 0, damit ein Spawn daran nie scheitert.
+
+AUFRUF:  wb-vertrauen <verzeichnis> [--pruefen]
+         --pruefen schreibt nichts und sagt nur, was passieren wuerde.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import atomar_schreiben
+except ImportError:  # pragma: no cover - nur wenn die Nachbardatei fehlt
+    atomar_schreiben = None
+
+CONFIG = Path.home() / ".claude.json"
+WORKTREE_WURZEL = Path.home() / ".pi-workers" / "worktrees"
+SPERRE = Path.home() / ".claude.json.wb-vertrauen.lock"
+
+
+def melde(text: str) -> None:
+    print(f"wb-vertrauen: {text}", file=sys.stderr)
+
+
+def hauptbaum(verzeichnis: Path) -> Path | None:
+    """Der Baum, aus dem dieser Worktree stammt -- oder None, wenn es keiner ist."""
+    try:
+        roh = subprocess.run(
+            ["git", "-C", str(verzeichnis), "rev-parse",
+             "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if roh.returncode != 0:
+        return None
+    gemeinsam = Path(roh.stdout.strip())
+    if not gemeinsam.name == ".git":
+        # Ein bare-Repo oder eine ungewoehnliche Ablage: dann ist der Elternordner
+        # nicht der Arbeitsbaum, und wir raten hier nicht.
+        return None
+    return gemeinsam.parent
+
+
+def vertraut(pfad: Path, projekte: dict) -> bool:
+    eintrag = projekte.get(str(pfad))
+    return isinstance(eintrag, dict) and eintrag.get("hasTrustDialogAccepted") is True
+
+
+def buergen(ziel: Path, projekte: dict) -> Path | None:
+    """Wer buergt fuer dieses Verzeichnis? Der Hauptbaum eines Worktrees, sonst
+    der naechste vertraute Elternordner -- und der muss unter $HOME liegen, damit
+    ein geklontes fremdes Repo anderswo nicht ueber /tmp oder / erbt."""
+    heim = Path.home().resolve()
+    kandidaten: list[Path] = []
+    quelle = hauptbaum(ziel)
+    if quelle is not None and quelle != ziel:
+        if vertraut(quelle, projekte):
+            return quelle
+        kandidaten.append(quelle)
+    kandidaten.append(ziel)
+    for start in kandidaten:
+        for vorfahre in start.parents:
+            if vorfahre == heim or heim not in vorfahre.parents:
+                # Bis einschliesslich $HOME selbst wird nicht geerbt: ein
+                # vertrautes $HOME wuerde jedes Verzeichnis der Maschine decken
+                # und die Sicherung damit ganz abschaffen.
+                break
+            if vertraut(vorfahre, projekte):
+                return vorfahre
+    return None
+
+
+def sperre_holen(frist: float = 5.0) -> bool:
+    """Eine einfache Verzeichnissperre. ~/.claude.json wird auch von laufenden
+    claude-Sitzungen geschrieben; die benutzen keine Sperre, deshalb schuetzt
+    diese hier nur gegen ZWEI gleichzeitige Spawns -- den Fall, den wir selbst
+    erzeugen. Das Restrisiko bleibt und ist der Grund, warum unten nur ein
+    einziges Feld gesetzt und die Datei sonst unveraendert zurueckgeschrieben
+    wird."""
+    ende = time.time() + frist
+    while time.time() < ende:
+        try:
+            os.mkdir(SPERRE)
+            return True
+        except FileExistsError:
+            time.sleep(0.1)
+        except OSError:
+            return False
+    return False
+
+
+def sperre_geben() -> None:
+    try:
+        os.rmdir(SPERRE)
+    except OSError:
+        pass
+
+
+def main() -> int:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    nur_pruefen = "--pruefen" in sys.argv[1:]
+    if not args:
+        melde("Aufruf: wb-vertrauen <verzeichnis> [--pruefen]")
+        return 0
+
+    ziel = Path(args[0]).expanduser()
+    try:
+        ziel = ziel.resolve()
+    except OSError:
+        melde(f"Verzeichnis nicht aufloesbar: {args[0]} — nichts eingetragen.")
+        return 0
+    if not ziel.is_dir():
+        melde(f"kein Verzeichnis: {ziel} — nichts eingetragen.")
+        return 0
+
+    if not CONFIG.exists():
+        melde("~/.claude.json fehlt — nichts eingetragen.")
+        return 0
+
+    try:
+        daten = json.loads(CONFIG.read_text())
+    except (OSError, json.JSONDecodeError) as fehler:
+        melde(f"~/.claude.json nicht lesbar ({fehler}) — nichts eingetragen.")
+        return 0
+
+    projekte = daten.get("projects")
+    if not isinstance(projekte, dict):
+        melde("~/.claude.json hat keinen 'projects'-Abschnitt — nichts eingetragen.")
+        return 0
+
+    schluessel = str(ziel)
+    vorhanden = projekte.get(schluessel)
+    if isinstance(vorhanden, dict) and vorhanden.get("hasTrustDialogAccepted") is True:
+        melde(f"schon vertraut: {schluessel}")
+        return 0
+
+    quelle = buergen(ziel, projekte)
+    if quelle is None:
+        melde(
+            f"kein vertrauter Buerge fuer {schluessel} (weder der Hauptbaum eines "
+            f"Worktrees noch ein Elternordner unter $HOME) — nicht eingetragen, "
+            f"der Dialog bleibt."
+        )
+        return 0
+
+    if nur_pruefen:
+        melde(f"wuerde eintragen: {schluessel} (Vertrauen uebertragen von {quelle})")
+        return 0
+
+    if not sperre_holen():
+        melde("Sperre nicht zu bekommen — nichts eingetragen, der Dialog bleibt.")
+        return 0
+    try:
+        # Frisch lesen: zwischen der Pruefung oben und hier kann eine laufende
+        # claude-Sitzung geschrieben haben.
+        try:
+            daten = json.loads(CONFIG.read_text())
+        except (OSError, json.JSONDecodeError) as fehler:
+            melde(f"~/.claude.json beim zweiten Lesen unbrauchbar ({fehler}) — nichts eingetragen.")
+            return 0
+        projekte = daten.setdefault("projects", {})
+        eintrag = projekte.get(schluessel)
+        if not isinstance(eintrag, dict):
+            eintrag = {}
+        eintrag["hasTrustDialogAccepted"] = True
+        projekte[schluessel] = eintrag
+        text = json.dumps(daten, indent=2, ensure_ascii=False) + "\n"
+        if atomar_schreiben is not None:
+            atomar_schreiben.schreiben(CONFIG, text)
+        else:  # pragma: no cover
+            zwischen = CONFIG.with_suffix(".wb-vertrauen.tmp")
+            zwischen.write_text(text)
+            os.replace(zwischen, CONFIG)
+    finally:
+        sperre_geben()
+
+    melde(f"eingetragen: {schluessel} (Vertrauen uebertragen von {quelle})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

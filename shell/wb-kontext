@@ -60,13 +60,24 @@ KV_DATEI = os.path.join(HOME, ".local", "state", "wb-belegung", "kv-bedarf.json"
 
 MIB_JE_GIB = 1024.0
 STUFE_START = 32768
-# 2048 MiB -- eine kleine Stoergroessen-Reserve fuer den laufenden
+# WAR 2048 MiB -- eine kleine Stoergroessen-Reserve fuer den laufenden
 # Host-Grundverbrauch zwischen Messung und Start (Vorgabe des Nutzers 2026-08-19:
 # "nimm 2 GiB"). Kein Ersatz fuer wb-belegung's eigene Buchfuehrung (6 GiB
 # System-Reserve, 4 GiB Zuschlag fuer Prompt-Cache/Spitzen -- die zaehlt beim
 # echten Belegen, nicht hier) und keine Kopie von grug-server's MIN_FREE_MIB
 # (20480 MiB, Vorbedingung VOR einem MLX-Start). Beide bleiben, wo sie sind.
-RESERVE_MIB = 2048
+#
+# AUF NULL GESETZT (2026-08-27, ausdrueckliche des Nutzers Anweisung): die
+# Rechnung soll nicht mehr auf das aufschlagen, was das Modell per Formel
+# braucht -- sie nennt jetzt den reinen Bedarf. Ersatz fuer die Vorsicht, die
+# hier wegfaellt, ist NICHT eine andere Zahl hier, sondern `wb-notbremse`, das
+# ab sofort an jedem `wb-mlx-server`-Start haengt und den Modellprozess per
+# PID beendet, sobald der wirklich freie Speicher unter eine harte Schwelle
+# faellt (siehe dort, SCHWELLE_MIB). Diese Datei traf noch nie die
+# Startentscheidung selbst -- sie zeigt nur "passt"/"passt nicht" an; die
+# reale Absicherung lag ohnehin bei wb-belegung und grug-server/wb-mlx-server,
+# die beide denselben Tag denselben Umbau bekommen haben.
+RESERVE_MIB = 0
 # 1,1, nicht 1,5 (Anweisung des Nutzers 2026-08-19) -- NUR die eigene Konstante
 # hier. wb-belegung fuehrt seinen EIGENEN Sicherheitsfaktor unabhaengig (eine
 # andere Spur aendert ihn, nicht dieser Auftrag) -- KEINE Zahl dafuer hier
@@ -136,14 +147,26 @@ def fail(msg):
     sys.exit(1)
 
 
-def run(cmd):
+def run(cmd, timeout=None):
+    # timeout (Nachtrag 2026-09-08, Gegenleser-Befund, ZWEITE RUNDE Punkt 1):
+    # ohne ihn haengt ein einzelner haengender Aufruf (z.B. `wb-mlx-server
+    # status` -> lsof/ps) diesen Prozess auf unbestimmte Zeit -- und 'wb-kontext
+    # stufen' liegt auf dem KRITISCHEN PFAD jedes pi-worker-Spawns. Vorgabe
+    # bleibt None (unveraendertes Verhalten fuer alle bestehenden Aufrufer
+    # dieser Funktion): nur wer ausdruecklich eine Frist braucht, gibt sie mit.
     try:
-        return subprocess.run(cmd, capture_output=True, text=True)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError as e:
         class R:
             returncode = 127
             stdout = ""
             stderr = str(e)
+        return R()
+    except subprocess.TimeoutExpired as e:
+        class R:
+            returncode = 124
+            stdout = ""
+            stderr = "Zeitlimit (%ss) ueberschritten: %s" % (timeout, e)
         return R()
 
 
@@ -324,6 +347,117 @@ def gewichte_gb(res):
                 except ValueError:
                     break
     return 0.0, "Groesse nicht ermittelbar ('%s' steht nicht in 'ollama list')" % res["modelRef"]
+
+
+# ---------------------------------------------- schon laufender MLX-Server
+#
+# Nachtrag 2026-09-08 (Auftrag "kontextgewichte", gemessener Betriebsfehler
+# 19:09 Uhr): der MLX-Server fuer qwen38-27b lief bereits (wb-mlx-server, PID
+# 98588, Port 8081, 14,95 GiB Gewichte geladen, Belegung "realisiert"), aber
+# 'pi-worker unterkante qwen38' rechnete in seinem 'wb-kontext stufen --json'
+# die Gewichte trotzdem ERNEUT ein (bedarfGib 16,95 fuer 32k, "passt: nein")
+# und brach ab -- waehrend die echte Buchung weiter unten in pi-worker
+# (Abschnitt "Eigene Sequenz buchen") fuer denselben Server korrekt nur
+# 0,001 GiB (--ohne-sockel) bucht, weil die Gewichte schon geladen sind und
+# vom SERVERSTART gebucht wurden. Zwei Rechnungen fuer dieselbe Frage: die
+# Stufenwahl kannte den laufenden Server nicht, die spaetere Buchung schon.
+# `wb-mlx-server status` ist die einzige Stelle, die PID und das WIRKLICH
+# laufende --model kennt (siehe cmd_status dort, laufendes_modell()) --
+# dieselbe Quelle, nicht eine zweite Vermutung ueber ps/lsof hier ("eine
+# Quelle, nicht zwei", siehe der Kopfkommentar dieser Datei).
+def laufender_mlx_server():
+    # timeout=5 (Nachtrag 2026-09-08, Gegenleser-Befund Punkt 1): dieser Aufruf
+    # haengt an lsof/ps in wb-mlx-server; ohne Frist wuerde ein haengender
+    # Unterprozess 'wb-kontext stufen' unbegrenzt haengen lassen, und das liegt
+    # auf dem kritischen Pfad JEDES pi-worker-Spawns. Bei Ablauf: None, wie bei
+    # jedem anderen Grund, warum der Status nicht lesbar ist -- der Aufrufer
+    # faellt dann auf "kein Server erkannt" zurueck (die volle Gewichte-
+    # Rechnung), niemals auf "schon geladen" -- konservativ in die sichere
+    # Richtung, nie umgekehrt.
+    p = run([os.path.join(BIN, "wb-mlx-server"), "status"], timeout=5)
+    if p.returncode != 0:
+        return None
+    pid_m = re.search(r"laeuft \(PID (\d+)", p.stdout)
+    modell_m = re.search(r"^\s*Modell:\s*(.+)$", p.stdout, re.MULTILINE)
+    if not pid_m or not modell_m:
+        return None
+    # Kontext gebucht (Gegenleser-Befund Punkt 2/4): OHNE ihn wuerde jede
+    # Stufe fuer dasselbe Modell faelschlich als "schon geladen" gelten, nicht
+    # nur die, die der Server WIRKLICH gerade faehrt -- ein Server bei 32k
+    # deckt keine Anfrage bei 65536 ab, der braucht einen echten Neustart mit
+    # vollen Gewichten. "unbekannt" (kein `wb-belegung wer`-Treffer fuer die
+    # gehaltene Kennung) bleibt None -- dann matcht KEINE Stufe, dieselbe
+    # sichere Richtung wie beim Timeout oben.
+    kontext_m = re.search(r"Kontext gebucht:\s*(\d+)", p.stdout)
+    # Entwerfer (Gegenleser-Befund Punkt 2/5): eine ECHTE externe Entwerfer-
+    # Zeile (mlx-dspark/mlx_vlm.server), NICHT "Entwerfer: keiner" und NICHT
+    # die "Vorhersage: eingebaut (mtplx, ...)"/"Motor: vllm-metal (...)"-Zeilen
+    # -- die eingebaute Bauart hat keinen SEPARATEN externen Entwerfer, ihr
+    # Koerper ist bereits der ersetzte modelRef (siehe berechne()), ueber den
+    # der Pfadvergleich unten laeuft.
+    entwerfer_m = re.search(r"^\s*Entwerfer:\s*(?!keiner\s*$)(\S+)", p.stdout, re.MULTILINE)
+    return {
+        "pid": pid_m.group(1),
+        "modell_pfad": modell_m.group(1).strip(),
+        "kontext": int(kontext_m.group(1)) if kontext_m else None,
+        "hat_entwerfer": bool(entwerfer_m),
+    }
+
+
+def bereits_geladener_server(res, erwuenschter_entwerfer=False):
+    """Info ueber den laufenden wb-mlx-server, wenn er GENAU dieses Modell
+    schon geladen hat (realisiert) -- sonst None. Nur fuer mlx-lokal:
+    wb-mlx-server verwaltet ausschliesslich diesen Provider, ein Ollama-Worker
+    haengt sich nie an einen geteilten Server (siehe parallel_vorgabe() oben).
+
+    Rueckgabe: {"pid": str, "kontext": int|None} oder None. WELCHE Stufe davon
+    profitiert (nur die mit tokens == kontext), entscheidet der Aufrufer in
+    berechne() -- diese Funktion sagt nur, OB und WOFUER der Server ueberhaupt
+    infrage kommt, nicht fuer welche Stufe (Gegenleser-Befund Punkt 4: eine
+    globale Entlastung ALLER Stufen war falsch).
+
+    NUR Pfad UND Entwerferzustand werden hier geprueft, NICHT Motor
+    (Gegenleser-Befund Punkt 2 nennt beide bewusst: "wb-mlx-server prueft vier
+    Dinge (Pfad, Entwerfer, Motor, Kontext)"). Der Kontext-Anteil dieses
+    Vierervergleichs sitzt beim AUFRUFER (berechne(), pro Stufe -- siehe
+    "kontext" oben). Motor bleibt ausdruecklich AUSSEN VOR: wb-kontext waehlt
+    selbst nie einen Motor (das ist wb-mlx-servers eigene, hier bewusst NICHT
+    nachgebaute Schwellenwert-Logik ueber vllm-metal/mtplx, siehe der lange
+    Kommentar "ZWEI BEDINGUNGEN ENTSCHEIDEN ZUSAMMEN" in berechne() weiter
+    unten) -- ein Aufrufer, der wirklich weiss, dass der Motor beim naechsten
+    Start wechseln wuerde (Buendelungs-Umschlagpunkt), bekommt hier trotzdem
+    "schon geladen" fuer die passende Kontextstufe; das ist derselbe,
+    ausdruecklich offen gelassene Rand wie dort (siehe Ergebnisdatei des
+    Auftrags fuer die Abwaegung).
+
+    TOCTOU, ausdruecklich benannt statt verschwiegen (Gegenleser-Befund Punkt
+    3): der Stand hier ist eine MOMENTAUFNAHME. Stoppt oder ersetzt ein
+    anderer 'ensure' den Server, WAEHREND diese Funktion oder der Rest von
+    'stufen' laeuft, kann die Antwort schon beim Zurueckgeben veraltet sein.
+    Das ist nicht gefaehrlich: diese Funktion entscheidet nur die ANZEIGE/
+    STUFENWAHL (bedarfGib, passt, plaetze) -- die tatsaechliche, sicherheits-
+    relevante Entscheidung faellt weiterhin ausschliesslich bei wb-belegungs
+    EIGENEM, live gemessenem `nimm` in pi-workers "Eigene Sequenz buchen"
+    (dort --ohne-sockel, siehe shell/pi-worker) -- NICHT gegen diese aeltere
+    Momentaufnahme. Verschwindet der Server in der Luecke, lehnt 'nimm' die
+    Buchung mangels Kontext einfach ab (kein Server, keine Vorbedingung fuer
+    --ohne-sockel erfuellt) oder bucht regulaer neu -- kein stiller
+    Fehlschluss, nur ein etwas spaeter bemerkter."""
+    if res["provider"] != "mlx-lokal":
+        return None
+    info = laufender_mlx_server()
+    if not info:
+        return None
+    if bool(info["hat_entwerfer"]) != bool(erwuenschter_entwerfer):
+        return None
+    # Basisname, klein geschrieben -- dieselbe Vergleichsform wie an den
+    # anderen Stellen dieser Datei (siehe kv_mib_pro_token(), "Kleingeschrieben
+    # ZUSAETZLICH"), weil ein MLX-Ordnername selbst Grossbuchstaben tragen kann.
+    laufend = os.path.basename(str(info["modell_pfad"]).rstrip("/")).lower()
+    ziel = os.path.basename(str(res["modelRef"]).rstrip("/")).lower()
+    if laufend != ziel:
+        return None
+    return {"pid": info["pid"], "kontext": info["kontext"]}
 
 
 # --------------------------------------------------------------- KV-Bedarf je Token
@@ -591,7 +725,18 @@ def denken_vorgabe(res):
     return "low"
 
 
-def plaetze_wirklich(res, tok, gewichte):
+def plaetze_wirklich(res, tok, gewichte, ohne_sockel=False):
+    # ohne_sockel (Nachtrag 2026-09-08, siehe bereits_geladener_server() oben):
+    # laeuft der Server fuer DIESES Modell schon, hat er den Fixkosten-Sockel
+    # (ZUSCHLAG_FIXED_GIB in wb-belegung) schon bei seinem eigenen Start
+    # bezahlt -- ohne die Weitergabe wuerde diese Funktion ihn hier ein
+    # zweites Mal in die verfuegbare Reserve einrechnen, dieselbe Verwechslung,
+    # die pi-workers "Eigene Sequenz buchen" seit dem 20.08.2026 mit
+    # --ohne-sockel vermeidet (siehe dort). Auf das DELTA selbst (a2-a1) hat es
+    # keine Wirkung -- der Sockel steht in beiden Anfragen gleich und kuerzt
+    # sich heraus -- wohl aber auf die absolute Spitze a1, gegen die
+    # 'verfuegbar' unten verrechnet wird.
+    #
     # Pruefer-Befund N7 (19.08.2026 abends): die alte 'plaetze'-Rechnung zog
     # RESERVE_MIB (2 GiB, diese Datei -- ein kleiner Stoergroessen-Puffer, kein
     # Ersatz fuer wb-belegungs eigene Buchfuehrung, siehe der Kommentar dort
@@ -616,10 +761,13 @@ def plaetze_wirklich(res, tok, gewichte):
     basis = os.path.basename(res["modelRef"].rstrip("/"))
 
     def frage(parallel):
-        p = run([os.path.join(BIN, "wb-belegung"), "darf",
-                 "--gewichte-gb", str(gewichte), "--modell", basis,
-                 "--parallel", str(parallel), "--kontext", str(tok),
-                 "--abtastungen", "1", "--abstand", "0", "--json"])
+        cmd = [os.path.join(BIN, "wb-belegung"), "darf",
+               "--gewichte-gb", str(gewichte), "--modell", basis,
+               "--parallel", str(parallel), "--kontext", str(tok),
+               "--abtastungen", "1", "--abstand", "0", "--json"]
+        if ohne_sockel:
+            cmd.append("--ohne-sockel")
+        p = run(cmd)
         try:
             return json.loads(p.stdout)
         except (json.JSONDecodeError, ValueError):
@@ -635,7 +783,11 @@ def plaetze_wirklich(res, tok, gewichte):
     return max(0, int((verfuegbar - a1["spitze_gib"]) // delta) + 1)
 
 
-def bedarf_wirklich(res, tok, gewichte, parallel):
+def bedarf_wirklich(res, tok, gewichte, parallel, ohne_sockel=False):
+    # ohne_sockel (Nachtrag 2026-09-08): siehe plaetze_wirklich() und
+    # bereits_geladener_server() oben -- derselbe Grund, hier auf die absolute
+    # Spitze statt auf ein Delta wirkend.
+    #
     # Zwei Formeln fuer dieselbe Zahl laufen auseinander (Nachtrag 21.08.2026,
     # gemessen: wb-kontext sagte fuer 131072 Token "bedarfGib 24.08, passt:
     # ja", wb-belegung verlangte beim echten Start 29,4 GiB und lehnte ab --
@@ -656,10 +808,13 @@ def bedarf_wirklich(res, tok, gewichte, parallel):
     # Naeherung zurueck (siehe Kommentar dort), mit ihrer Herkunft klar
     # benannt, statt so zu tun, als waere sie dieselbe Zahl.
     basis = os.path.basename(res["modelRef"].rstrip("/"))
-    p = run([os.path.join(BIN, "wb-belegung"), "darf",
-             "--gewichte-gb", str(gewichte), "--modell", basis,
-             "--parallel", str(parallel), "--kontext", str(tok),
-             "--abtastungen", "1", "--abstand", "0", "--json"])
+    cmd = [os.path.join(BIN, "wb-belegung"), "darf",
+           "--gewichte-gb", str(gewichte), "--modell", basis,
+           "--parallel", str(parallel), "--kontext", str(tok),
+           "--abtastungen", "1", "--abstand", "0", "--json"]
+    if ohne_sockel:
+        cmd.append("--ohne-sockel")
+    p = run(cmd)
     try:
         antwort = json.loads(p.stdout)
     except (json.JSONDecodeError, ValueError):
@@ -791,13 +946,60 @@ def berechne(modell, parallel=None, denken=None, entwerfer_gewichte_gb=0.0,
     # (eigener modelRef, kein Zusatzgewicht), keine Addition hier -- siehe
     # das modelRef-Umbiegen ganz oben in dieser Funktion, das genau das jetzt
     # wirklich tut.
+    #
+    # UNBEDINGT addiert (Nachtrag 2026-09-08, Gegenleser-Befund Punkt 5,
+    # KORRIGIERT gegenueber einer ersten Fassung dieses Nachtrags): ob ein
+    # bereits laufender Server diesen Entwerfer schon mittraegt, wird jetzt
+    # PRO STUFE weiter unten geprueft (bereits_geladener_server() bekommt den
+    # ERWUENSCHTEN Entwerferzustand mit und liefert nur dann etwas zurueck,
+    # wenn der laufende Server GENAU dazu passt) -- ein globales Weglassen
+    # HIER war falsch: der laufende Server kann genau OHNE Entwerfer laufen,
+    # waehrend diese Anfrage einen verlangt, und dann fehlte das
+    # Entwerfergewicht in der Rechnung komplett.
     if entwerfer_gewichte_gb:
         gewichte += entwerfer_gewichte_gb
         gw_quelle += " + %s GiB Entwerfer (Multi-Token-Vorhersage)" % zahl(entwerfer_gewichte_gb, 2)
     kv, kv_quelle = kv_mib_pro_token(res)
     frei = frei_mib()
+    # Schon geladen? (Nachtrag 2026-09-08, siehe bereits_geladener_server()
+    # oben fuer den gemessenen Betriebsfehler und die Entscheidungen aus dem
+    # Gegenleser-Durchgang, ZWEITE RUNDE.) Laeuft der wb-mlx-server bereits
+    # GENAU mit diesem Koerper UND demselben Entwerferzustand (realisiert),
+    # zaehlen die Gewichte fuer die STUFE, die er WIRKLICH faehrt, nicht
+    # erneut -- der Serverstart hat sie schon gebucht. EINMAL hier abgefragt,
+    # nicht pro Stufe (Pfad/Entwerfer aendern sich nicht zwischen den Stufen,
+    # nur der Kontext -- der Vergleich dafuer sitzt unten, pro 'tok').
+    # Erwartet die Anfrage einen EXTERNEN Entwerfer? Ja, wenn der Aufrufer
+    # Entwerfergewichte mitgibt UND die Bauart "entwerfer" ist -- oder UNBEKANNT
+    # (Nachtrag 2026-09-10, gemessen am Spawn-Abbruch "passt nach dem freien
+    # Speicher nicht einmal die kleinste Kontextstufe" bei laufendem Server):
+    # pi-worker uebergibt den Modell-PFAD, resolve() liefert dafuer vorhersage=None
+    # (siehe den Kommentar zu --vorhersage-koerper oben), und der Vergleich
+    # "Server hat Entwerfer, Anfrage erwartet keinen" schaltete die Entlastung
+    # aus -- obwohl der Aufrufer mit --entwerfer-gewichte-gb 0.25 den Entwerfer
+    # laengst ausgesprochen hatte. Ohne Entwerfergewichte bleibt es beim
+    # strengen Vergleich (Fall 3 in test-kontext-schon-geladen.sh).
+    bauart = vorhersage.get("bauart")
+    bereits_geladen_info = bereits_geladener_server(
+        res, erwuenschter_entwerfer=bool(entwerfer_gewichte_gb) and bauart in ("entwerfer", None))
     stufen = []
     for tok in stufen_liste(nmax):
+        # NUR DIE STUFE ENTLASTEN, DEREN TOKENZAHL DEM LAUFENDEN KONTEXT
+        # ENTSPRICHT (Nachtrag 2026-09-08, Gegenleser-Befund Punkt 4): ein
+        # Server bei 32768 Token deckt keine Anfrage bei 65536 ab -- eine
+        # andere Stufe braucht einen echten Neustart mit vollen Gewichten.
+        # Die erste Fassung dieses Fixes entlastete faelschlich ALLE Stufen.
+        stufe_bereits_geladen = bool(bereits_geladen_info) and bereits_geladen_info.get("kontext") == tok
+        stufe_gewichte = gewichte
+        stufe_gw_quelle = gw_quelle
+        if stufe_bereits_geladen:
+            # 0,001 statt 0, weil wb-belegung --gewichte-gb > 0 verlangt --
+            # derselbe Wert, aus demselben Grund wie pi-workers "Eigene
+            # Sequenz buchen" weiter unten in shell/pi-worker.
+            stufe_gewichte = 0.001
+            stufe_gw_quelle = ("schon geladen, PID %s (wb-mlx-server status), Kontext %s -- "
+                                "Gewichte zaehlen nicht erneut, der Server haelt sie schon"
+                                % (bereits_geladen_info["pid"], tok))
         # KEIN denk_faktor hier (Korrektur 19.08.2026 abends): tok ist schon
         # die volle Fenstergroesse, kv schon der Byte-Bedarf JE Token-Feld --
         # beide zusammen ergeben bereits den vollen Speicher fuer diese Stufe.
@@ -806,8 +1008,10 @@ def berechne(modell, parallel=None, denken=None, entwerfer_gewichte_gb=0.0,
         # voller Groesse einpreist -- siehe die Begruendung bei DENK_FAKTOR
         # oben. Der Wert bleibt im Rueckgabe-/JSON-Feld "denkFaktor" sichtbar,
         # zaehlt aber nicht mehr in die Bedarfsrechnung.
-        bedarf_gib = gewichte + parallel * tok * kv / MIB_JE_GIB
+        bedarf_gib = stufe_gewichte + parallel * tok * kv / MIB_JE_GIB
         bedarf_quelle = "wb-kontext eigene Naeherung (ohne wb-belegungs Zuschlag/Prompt-Cache)"
+        if stufe_bereits_geladen:
+            bedarf_quelle += " -- %s" % stufe_gw_quelle
         bedarf_mib = bedarf_gib * MIB_JE_GIB
         passt = bedarf_mib + RESERVE_MIB <= frei
         wb_belegung_grund = None
@@ -816,10 +1020,13 @@ def berechne(modell, parallel=None, denken=None, entwerfer_gewichte_gb=0.0,
         # Befunds) -- fuer mlx-lokal deshalb, wie schon bei 'plaetze', den
         # echten Waechter fragen und dessen Zahl nehmen, wenn er antwortet.
         if res["provider"] == "mlx-lokal":
-            echter_bedarf = bedarf_wirklich(res, tok, gewichte, parallel)
+            echter_bedarf = bedarf_wirklich(res, tok, stufe_gewichte, parallel,
+                                             ohne_sockel=stufe_bereits_geladen)
             if echter_bedarf is not None:
                 bedarf_gib, passt, wb_belegung_grund = echter_bedarf
                 bedarf_quelle = "wb-belegung darf (spitze_gib, dieselbe Zahl wie beim echten Start)"
+                if stufe_bereits_geladen:
+                    bedarf_quelle += " -- %s" % stufe_gw_quelle
         hinweis = None
         if not passt:
             # wb-belegungs EIGENE Erklaerung, wenn sie da ist (dieselbe, die
@@ -841,11 +1048,12 @@ def berechne(modell, parallel=None, denken=None, entwerfer_gewichte_gb=0.0,
         # demselben Grund wie oben.
         kv_je_worker_gib = tok * kv / MIB_JE_GIB
         frei_gib_nutzbar = (frei - RESERVE_MIB) / MIB_JE_GIB
-        uebrig = frei_gib_nutzbar - gewichte
+        uebrig = frei_gib_nutzbar - stufe_gewichte
         plaetze_naeherung = max(0, int(uebrig // kv_je_worker_gib)) if kv_je_worker_gib > 0 else 0
         plaetze = plaetze_naeherung
         if res["provider"] == "mlx-lokal":
-            echte_plaetze = plaetze_wirklich(res, tok, gewichte)
+            echte_plaetze = plaetze_wirklich(res, tok, stufe_gewichte,
+                                              ohne_sockel=stufe_bereits_geladen)
             if echte_plaetze is not None:
                 plaetze = echte_plaetze
         stufen.append({"tokens": tok, "label": label(tok), "bedarfGib": round(bedarf_gib, 2),
@@ -1123,6 +1331,12 @@ def drucke_stufen(daten, als_json):
             "modell": res["id"], "harness": res["harness"], "provider": res["provider"],
             "modelRef": res["modelRef"], "nativesMaximum": daten["nmax"],
             "freiMib": daten["frei"], "gewichteGb": round(daten["gewichte"], 2),
+            # gewichteQuelle (Nachtrag 2026-09-08): auch im JSON sichtbar, nicht nur
+            # in der Textausgabe -- pi-worker ruft ausschliesslich mit --json auf
+            # (siehe shell/pi-worker), und genau dort muss ein Aufrufer/Mensch sehen
+            # koennen, ob die Gewichte gerade real gezaehlt wurden oder ein schon
+            # laufender Server sie schon haelt (siehe bereits_geladener_server()).
+            "gewichteQuelle": daten["gw_quelle"],
             "entwerferGewichteGb": daten["entwerfer_gewichte_gb"],
             "kvMibProToken": daten["kv"], "parallel": daten["parallel"],
             "denken": daten["denken"], "denkFaktor": round(daten["denk_faktor"], 3),

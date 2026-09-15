@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/stop-aufgabe-zugende.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -20,6 +20,12 @@ MODE=mosh
 case "${1:-}" in
   --ssh)   MODE=ssh; TARGET="${2:-wb-orch}" ;;
   --check) MODE=check ;;
+  # Anlass (2026-08-22, dieselbe Bugfamilie wie wb-budget): ohne diesen Zweig lief ein
+  # getipptes '--chek' weder in --ssh noch in --check, sondern wortwoertlich in TARGET
+  # (Zeile oben) -- 'mosh'/'tmux new-session' haengte dann still an eine neue,
+  # sinnlos benannte tmux-Session '--chek' an, statt den Tippfehler zu melden. Ein
+  # echtes Ziel (z.B. 'main') beginnt in keinem dokumentierten Aufruf mit '-'.
+  -*)      echo "peer-connect: unbekannte Option '$1'" >&2; exit 1 ;;
 esac
 
 if [ "$MODE" = check ]; then

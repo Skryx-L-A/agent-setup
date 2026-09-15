@@ -96,17 +96,32 @@ fresh_file_exists() {
 ok=0
 if [ "$role" = "worker" ]; then
   # Irgendein HANDOFF-*.md im cwd, seit der letzten Stunde geaendert.
-  while IFS= read -r -d '' f; do
-    if fresh_file_exists "$f"; then
-      ok=1
-      break
-    fi
-  done < <(find "$cwd" -maxdepth 1 -name 'HANDOFF-*.md' -print0 2>/dev/null)
+  # Gesucht wird im cwd UND im Wurzelverzeichnis des Arbeitsbaums (Befund
+  # 01.09.2026): ein Worker, dessen Sitzung in einem Unterordner steht
+  # (core/voice-agent/agent/), musste sein HANDOFF an ZWEI Stellen pflegen, weil
+  # dieses Gate nur im cwd nachsah -- eine Doppelpflege, die beim ersten
+  # Vergessen zur unbegruendeten Blockade fuehrt. Eine Uebergabe im Wurzelbaum
+  # ist genauso gueltig; der Ort stand in keiner Regel.
+  wurzel=$(cd "$cwd" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)
+  for ort in "$cwd" "$wurzel"; do
+    [ -n "$ort" ] && [ -d "$ort" ] || continue
+    while IFS= read -r -d '' f; do
+      if fresh_file_exists "$f"; then
+        ok=1
+        break
+      fi
+    done < <(find "$ort" -maxdepth 1 -name 'HANDOFF-*.md' -print0 2>/dev/null)
+    [ "$ok" = "1" ] && break
+  done
 else
   # Orchestrator: SESSION-STATE.md frisch, ODER Sentinel .wb-knowledge-saved vorhanden.
   if fresh_file_exists "$cwd/SESSION-STATE.md"; then
     ok=1
   elif [ -f "$cwd/.wb-knowledge-saved" ]; then
+    ok=1
+  # 2026-09-10: der Sentinel ist je tmux-Session eindeutig (.wb-knowledge-saved-<session>),
+  # der alte Name bleibt als Rueckfall oben stehen.
+  elif ls "$cwd"/.wb-knowledge-saved-* >/dev/null 2>&1; then
     ok=1
   fi
 fi

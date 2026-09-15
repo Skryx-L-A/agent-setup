@@ -14,10 +14,19 @@ Usage:
                           # abgewertet und nie ausgeblendet; --no-validity oder
                           # BRAIN_VALIDITY=0 schaltet das ab, ohne den Index
                           # anzufassen
+    brain pipeline run [--dry-run] [--verbose] [--budget-minutes N]
+                          # die ganze Kette in einem Befehl: erst der Gaertner
+                          # (alle Phasen), dann der Traum (`dream run`).
+                          # --dry-run prueft nur (Speicher, Modelle lokal
+                          # vorhanden, Sperre, Vault-Sauberkeit, grobe
+                          # Dauer-Schaetzung) und startet nichts.
+                          # --budget-minutes ueberschreibt das Gaertner-
+                          # Zeitbudget nur fuer diesen Lauf (Voreinstellung
+                          # unveraendert, siehe `gardener run --help`).
     brain gardener run [--phase embed|linking|consolidate|maintain|synth|all] [--dry-run]
                        # --phase embed: nur den Einbettungs-Index neu bauen,
                        #   ohne Bericht, Commit oder Schreibzugriff auf Notizen
-                       [--audit] [--topic T] [--min-notes N]
+                       [--audit] [--topic T] [--min-notes N] [--budget-minutes N]
     brain gardener status [--json]
     brain dream run [--limit N] [--budget-points P] [--dry-run] [--no-cloud]
     brain dream status | harvest | extract | reconcile | shadow | review |
@@ -50,14 +59,17 @@ from pathlib import Path
 
 from gardener import config
 from gardener import contradict as contradict_mod
+from gardener import mlx_server
 from gardener import sidecar as sidecar_mod
+from gardener.grug_client import GrugJudgeClient
 from gardener.linking import embed_notes
 from gardener.ollama import OllamaClient, OllamaError, OllamaUnavailable
 from gardener.runtime import Deadline
 from gardener.store import Store
 from gardener.vault import VaultWriter, load_notes
 
-from . import gardener_wrap, ingest as ingest_mod, search as search_mod, stats as stats_mod
+from . import (gardener_wrap, ingest as ingest_mod, pipeline as pipeline_mod,
+               search as search_mod, stats as stats_mod)
 
 DEFAULT_VAULT = config.DEFAULT_VAULT
 
@@ -66,13 +78,22 @@ def cmd_search(args) -> int:
     vault = Path(args.vault)
     validity = False if getattr(args, "no_validity", False) else None
     hits, used_fallback = search_mod.search(vault, args.query, args.k, validity)
+    idx = stats_mod.index_health(vault)
     if args.json:
         print(json.dumps({
             "query": args.query,
             "fallback": used_fallback,
+            "index_stale": idx["stale"],
+            "index_stale_reasons": idx["reasons"],
             "hits": [h.__dict__ for h in hits],
         }, ensure_ascii=False, indent=2))
         return 0
+    if idx["stale"]:
+        print("[!] Such-Index veraltet auf dieser Maschine - semantischer Treffer "
+              "kann fehlen oder daneben liegen:")
+        for reason in idx["reasons"]:
+            print(f"    {reason}")
+        print("    -> `brain gardener run` nachziehen. `brain stats` fuer Details.\n")
     if used_fallback:
         print("Ollama nicht erreichbar - rg-Volltextsuche als Fallback:\n")
     if not hits:
@@ -162,6 +183,14 @@ def cmd_contradict(args) -> int:
                 print("Warteschlange leer - nichts zu tun.")
             return 0
 
+    # `client` bleibt bei Ollama - nur fuer die Embeddings (embeddinggemma)
+    # und die 48-GB-Vorpruefung. Das eigentliche Urteil (judge_pair) laeuft
+    # seit Auftrag "startklar" (03.09.2026) ueber `smart` (Qwen3.8-27B via
+    # MLX, siehe grug_client.GrugJudgeClient) - contradict.judge_pair's
+    # Aufgabe gehoert zur SMART-Klasse aus denselben Gruenden wie linking,
+    # siehe gardener/config.py bei CONTRADICT_TOP_K und contradict.py's
+    # Modul-Docstring ("die Judge ist ein 9B lokales Modell und erfindet
+    # froehlich ein plausibel klingendes Zitat").
     client = OllamaClient()
     try:
         big = client.big_model_loaded()
@@ -224,10 +253,43 @@ def cmd_contradict(args) -> int:
     finally:
         embed_store.close()
 
-    cstore = contradict_mod.ContradictionStore(vault / config.CONTRADICTIONS_FILE)
-    result = contradict_mod.run_contradict(
-        [n for n in to_check if n.rel in vectors], notes, vectors, client, cstore,
-        top_k=args.k, deadline=deadline)
+    checkable = [n for n in to_check if n.rel in vectors]
+
+    # Nur provisionieren, wenn tatsaechlich etwas zu urteilen ist - ein
+    # `--queue`-Lauf mit lauter unbekannten Notizen braucht den MLX-Server
+    # nie. Eigentuemerschaft wie beim Gaertner (gardener/mlx_server.py):
+    # `release()` beendet nur einen Server, den DIESER Aufruf selbst
+    # provisioniert hat, nie einen, den jemand anders gerade benutzt.
+    smart = GrugJudgeClient()
+    mlx_owned = False   # only set True by a successful ensure() - release()
+                       # below must stay a no-op otherwise, same rule as
+                       # gardener/cli.py's five smart phases
+    try:
+        if checkable:
+            try:
+                mlx_owned = mlx_server.ensure()
+            except mlx_server.MlxServerError as e:
+                # Sichtbar und mit Grund, nicht dasselbe stille Uebergehen
+                # wie ein Modell, das mitten im Lauf ausfaellt (Auftrag
+                # "startklar", 03.09.2026, Punkt 1b) - contradict hat keine
+                # modellfreie Teilarbeit, auf die es ausweichen koennte, also
+                # bricht der Befehl hier klar ab statt "0 Befunde"
+                # vorzutaeuschen.
+                print(f"MLX-Server konnte nicht bereitgestellt werden: {e}")
+                return 2
+        cstore = contradict_mod.ContradictionStore(vault / config.CONTRADICTIONS_FILE)
+        result = contradict_mod.run_contradict(
+            checkable, notes, vectors, smart, cstore,
+            top_k=args.k, deadline=deadline)
+    except OllamaUnavailable as e:
+        # Unterscheidet sich bewusst von der MlxServerError oben: der Server
+        # ist hier erfolgreich gestartet und erst WAEHREND des Laufs
+        # gestorben - "ist unterwegs gestorben" statt "konnte nicht starten"
+        # (Auftrag "startklar", Punkt 1b, sinngemaess auch fuer contradict).
+        print(f"MLX-Server ist waehrend des Laufs ausgefallen: {e}")
+        return 2
+    finally:
+        mlx_server.release(mlx_owned)
 
     writer = VaultWriter(vault, dry_run=not args.write)
     for finding in result.findings:
@@ -305,12 +367,19 @@ def cmd_ingest(args) -> int:
     return 0
 
 
+def cmd_pipeline_run(args) -> int:
+    vault = Path(args.vault)
+    return pipeline_mod.run(vault, dry_run=args.dry_run, verbose=args.verbose,
+                            budget_minutes=getattr(args, "budget_minutes", None))
+
+
 def cmd_gardener_run(args) -> int:
     vault = Path(args.vault)
     return gardener_wrap.run(vault, phase=args.phase, dry_run=args.dry_run,
                              audit=args.audit, verbose=args.verbose,
                              topic=getattr(args, "topic", None),
-                             min_notes=getattr(args, "min_notes", None))
+                             min_notes=getattr(args, "min_notes", None),
+                             budget_minutes=getattr(args, "budget_minutes", None))
 
 
 def cmd_gardener_status(args) -> int:
@@ -408,6 +477,12 @@ def cmd_stats(args) -> int:
         print(f"  {b}: {n}")
     print(f"  davon in Gardeners Link-Korpus: {result['link_corpus_notes_total']} "
           "(schliesst MOC.md/DECISIONS.md/review-queue.md aus, siehe stats.collect docstring)")
+    excluded = result.get("notes_excluded_by_reason") or {}
+    excluded_total = sum(excluded.values())
+    if excluded_total:
+        print(f"  auf der Platte, aber nicht mitgezaehlt: {excluded_total}")
+        for reason, n in sorted(excluded.items(), key=lambda kv: -kv[1]):
+            print(f"    {reason}: {n}")
     print(f"Wikilinks gesamt: {result['wikilinks_total']}")
     # Getrennt, weil nur die erste Zahl handlungsfaehig macht: Quellnotizen
     # (00-sources/, sessions/) werden ueber die Suche gefunden, nicht ueber Links.
@@ -419,6 +494,15 @@ def cmd_stats(args) -> int:
     mb = result["lfs_object_size_bytes"] / (1024 * 1024)
     print(f"LFS-Objekte lokal: {mb:.1f} MB")
     print(f"Letztes Backup-Bundle: {result['last_backup_bundle'] or 'keins'}")
+    idx = result["index_health"]
+    if idx["stale"]:
+        print("Such-Index: VERALTET")
+        for reason in idx["reasons"]:
+            print(f"  {reason}")
+        print("  -> `brain gardener run` auf dieser Maschine nachziehen.")
+    else:
+        print(f"Such-Index: aktuell ({idx['vectors_total']} Vektoren, "
+              f"{idx['stale_notes_total']}/{idx['embed_corpus_total']} veraltet)")
     return 0
 
 
@@ -524,6 +608,23 @@ def build_parser() -> argparse.ArgumentParser:
                                "bleibt unberuehrt")
     p_search.set_defaults(func=cmd_search)
 
+    p_pipeline = sub.add_parser(
+        "pipeline", help="the whole chain in one command: gardener, then dream")
+    pipesub = p_pipeline.add_subparsers(dest="pcmd", required=True)
+
+    p_prun = pipesub.add_parser(
+        "run", help="run the full chain, or --dry-run to only check readiness")
+    p_prun.add_argument("--dry-run", action="store_true",
+                        help="check readiness only (memory, models present, "
+                             "lock, vault cleanliness, duration estimate) - "
+                             "starts nothing")
+    p_prun.add_argument("--verbose", action="store_true")
+    p_prun.add_argument("--budget-minutes", type=float, default=None,
+                        help="override the gardener's time budget for this "
+                             "run only (default: unchanged, see "
+                             "`gardener run --help`)")
+    p_prun.set_defaults(func=cmd_pipeline_run)
+
     p_gardener = sub.add_parser("gardener", help="gardener control")
     gsub = p_gardener.add_subparsers(dest="gcmd", required=True)
 
@@ -537,6 +638,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="nur diese eine Themenseite (Phase synth)")
     p_grun.add_argument("--min-notes", type=int, default=None,
                         help="Mindestzahl Quellnotizen je Themenseite (Phase synth)")
+    p_grun.add_argument("--budget-minutes", type=float, default=None,
+                        help="Zeitbudget nur fuer diesen Lauf ueberschreiben "
+                             "(Vorgabe unveraendert, siehe `gardener run --help`) "
+                             "- der direktere Weg fuer einen langen Nachlauf, "
+                             "wenn der Traum nicht mitlaufen soll")
     p_grun.set_defaults(func=cmd_gardener_run)
 
     p_gstatus = gsub.add_parser("status", help="last gardener run / lock status")

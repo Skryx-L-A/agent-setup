@@ -5,10 +5,75 @@
   wb-kontingent zeigen [<harness>] [--json]
   wb-kontingent pruefen <harness> [<modell>]
   wb-kontingent pfad
+  wb-kontingent erschoepft <spur> [--reset <zeit>] [--quelle "<text>"]
+  wb-kontingent frei <spur> [--quelle "<text>"]
+  wb-kontingent zaehl <spur> [<anzahl>]
+  wb-kontingent aktionen
+  wb-kontingent --knapp
 
 Vertrag: scratchpad/kontingent-vertrag.md. Geschrieben wird
 ~/.claude/workbench/kontingent.json, gelesen von `wb-state models table` (die
 Routing-Tabelle des Orchestrators) und von pi-worker/claude-worker VOR jedem Start.
+
+BEOBACHTUNG UND ZAEHLER (2026-08-27): Zwei zusaetzliche Quellen neben den Sammlern.
+`erschoepft`/`frei` tragen eine BEOBACHTUNG ein -- einen Nachweis, den kein Sammler
+selbst messen kann (z.B. eine Meldung im Pane, die keine Datei hinterlaesst). Sie gilt
+je Spur (ein Harness wie 'agy' oder ein Provider-Limit wie 'openrouter-frei'), UEBER-
+STIMMT das Sammler-Ergebnis, solange ihr Rueckfallzeitpunkt in der Zukunft liegt, und
+verfaellt danach von selbst -- das ist ein NACHWEIS, kein 'unbekannt', Grundregel 1
+bleibt unberuehrt. `zaehl` bucht eigene Aufrufe gegen eine Spur, sessionuebergreifend
+und mit taeglichem Rueckfall (fuer das gemeinsame Tageslimit der kostenlosen
+OpenRouter-Modelle, siehe unten). `--knapp` ist der Ausgang fuer den SessionStart-
+Hook: eine Zeile je Spur, die erschoepft oder knapp ist, sonst schweigt es.
+
+PREISAKTIONEN UND GUTHABEN (2026-08-27, zweiter Nachtrag): `auffrischen` prueft
+zusaetzlich (nur die explizite Aktion, siehe unten) die Preisliste und den
+Kontostand bei OpenRouter. Eine AKTION ist ein Preis, der gegenueber dem zuletzt
+gesehenen Stand je Modell-ID gefallen ist -- auch bis auf 0; ein Modell, das
+schon beim ERSTEN Sehen 0 kostet, hat keine Vergleichsbasis und ist keine
+Aktion, sondern normaler Freibestand. `wb-kontingent aktionen` zeigt die volle
+Liste; `--knapp`/`zeigen` bleiben knapp (bei mehr als fuenf Treffern nur die
+Zahl plus Verweis). EIN RABATT HEISST NICHT, DASS DAS MODELL GUENSTIG IST --
+das entscheidet der Orchestrator, dieses Werkzeug waehlt nichts aus.
+
+CODEX-KONTINGENT UEBER DEN CHATGPT-ENDPUNKT (2026-09-10, Auftrag des Nutzers "das
+chatgpt limit soll auch getrackt werden wie das claude limit"): anders als
+Claude haelt Codex sein Kontingent NICHT lokal vor -- die eigenen
+Sitzungsdateien tragen `rate_limits` leer. Der Sammler faellt deshalb weiterhin
+auf den alten Weg zurueck (JWT lokal dekodiert, `usage_limit_exceeded` aus den
+Sitzungsdateien), aber `auffrischen` (die explizite Aktion, wie bei den drei
+OpenRouter-Aufrufen oben, NIE der implizite Auto-Refresh aus `pruefen`) fragt
+zusaetzlich einen AKTIVEN Endpunkt ab, den die Codex-CLI selbst benutzt:
+  GET https://chatgpt.com/backend-api/wham/usage
+  Authorization: Bearer <tokens.access_token aus ~/.codex/auth.json>
+  ChatGPT-Account-Id: <tokens.account_id aus ~/.codex/auth.json>
+Zeitgrenze 10s; jeder Fehler (kein Netz, 401, Token abgelaufen) faellt auf den
+alten Weg zurueck und setzt das im `hinweis`, nie einen Absturz. Die Antwort
+kennt ZWEI rollende Fenster statt Claudes Wochenanker -- `primary_window` (5h,
+18000s) und `secondary_window` (7 Tage, 604800s), je mit eigenem `reset_at`.
+Erlaubter Anteil je Fenster = verstrichener Fensteranteil = (limit_window_seconds
+- reset_after_seconds) / limit_window_seconds x 100 -- NICHT der Claude-
+Wochentag-Anker (`limit-anker.default.json`). `rate_limit.limit_reached`
+(bzw. `used_percent >= 100` im 7-Tage-Fenster) ist das Erschoepft-Signal, sicherer
+als der Fliesstext "try again at ..." und geht vor, wenn der Endpunkt antwortet.
+Testhaken: `WB_CODEX_USAGE_URL` (Endpunkt ueberschreiben), `WB_CODEX_USAGE_DATEI`
+(liest eine Fixture-Datei statt eines Netzaufrufs -- das ist der einzige Weg,
+mit dem ein Test diese Antwort ueberhaupt betreten darf). Verlauf wie bei
+Claude (limits.jsonl): bei jedem erfolgreichen Auffrischen eine Zeile nach
+~/.claude/workbench/codex-limits.jsonl (Feld ueberschreibbar mit
+`WB_CODEX_LIMITS_FILE`), nur bei einer Aenderung gegenueber der letzten Zeile,
+inkl. `limit_window_seconds`/`reset_after_seconds` beider Fenster (siehe
+Vertrag) -- `wb-budget` rechnet damit, statt die Fensterlaenge hart zu codieren.
+
+NACHTRAG 2026-09-10 (Reviewer-Befund zu Commit d321f3e): `codex_usage_anwenden()`
+steht seither komplett hinter einem Fehlerfang -- eine 200er-Antwort in
+unerwarteter Form (z.B. eine JSON-Liste statt eines Objekts) darf nicht
+abstuerzen (`(antwort or {}).get` warf sonst AttributeError), sondern zaehlt
+wie ein unerreichbarer Endpunkt: alter Weg bleibt stehen, `hinweis` sagt es,
+keine Verlaufszeile. Und `kontingent.einheit`/`kontingent.quelle` werden nur
+GEMEINSAM mit einem tatsaechlich gemessenen `secondary_window.used_percent`
+gesetzt (wie `plan`/`plan_quelle`) -- sonst haetten sie faelschlich einen
+Endpunkt-Beleg fuer eine in Wahrheit ungemessene Zahl getragen.
 
 GRUNDREGEL: das Messen kostet nichts. Gelesen werden ausschliesslich lokale
 Zustands- und Konfigurationsdateien, ein lokaler Katalog (`ollama list`) und eine
@@ -45,6 +110,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import urllib.request
 
 HOME = os.environ.get("HOME") or os.path.expanduser("~")
 
@@ -71,6 +137,35 @@ def jetzt():
 
 def jetzt_iso():
     return jetzt().strftime(ISO)
+
+
+DAUER_RE = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?")
+
+
+def parse_zeitpunkt(text, bezug=None):
+    """Eine Rueckfall-Angabe in einer der beiden Formen, die die CLIs tatsaechlich
+    melden -- Restdauer ('167h41m', wie Antigravity sie ausgibt) oder ein
+    Zeitpunkt ('2026-09-03T13:25'). Rueckgabe immer eine AWARE UTC-datetime,
+    oder None, wenn nichts davon passt.
+
+    Ein Zeitpunkt OHNE Zonenangabe wird als ORTSZEIT gelesen, nicht als naive
+    Zeit stehengelassen: datetime.fromisoformat liefert sonst ein naives
+    Objekt, das sich mit einer bewussten (aware) Zeit nicht vergleichen laesst
+    (TypeError) -- genau daran ist die vorige Fassung dieses Werkzeugs zuerst
+    gescheitert."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    m = DAUER_RE.fullmatch(text)
+    if m and any(m.groups()):
+        std, minu, sek = (int(g) if g else 0 for g in m.groups())
+        basis = bezug or jetzt()
+        return basis + datetime.timedelta(hours=std, minutes=minu, seconds=sek)
+    try:
+        dt = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return dt.astimezone(datetime.timezone.utc)
 
 
 def lies_json(pfad):
@@ -102,6 +197,12 @@ def leerer_eintrag(art="unbekannt"):
             "faellt_zurueck_am": "",
             "quelle": "",
         },
+        # fenster_kurz (Nachtrag 2026-09-10, codex-Sammler): das ROLLENDE
+        # 5-Stunden-Fenster, das Codex zusaetzlich zum 7-Tage-Fenster oben in
+        # `kontingent` fuehrt -- Claude kennt nur den einen Wochenanker, Codex
+        # zwei unabhaengige Fenster mit je eigenem Rueckfallzeitpunkt. Bleibt
+        # bei jedem anderen Harness auf null stehen.
+        "fenster_kurz": {"verbraucht": None, "rest": None, "faellt_zurueck_am": None},
         "erschoepft": None,
         "gemessen_am": jetzt_iso(),
         "hinweis": "",
@@ -338,6 +439,188 @@ def sammle_codex(h, ctx):
     return e
 
 
+# ── codex: der aktive Nutzungs-Endpunkt, nur aus 'auffrischen' ──────────────────
+# Anders als alles bisherige in dieser Datei ist das hier kein Sammler (die
+# steuern Grundregel "das Messen kostet nichts"): Codex haelt sein Kontingent
+# nicht lokal vor, ein AKTIVER Aufruf ist die einzige Quelle. Deshalb genauso
+# eng gefasst wie die drei OpenRouter-Netzausnahmen oben -- aufgerufen NUR aus
+# cmd_auffrischen (der expliziten Aktion), NIE aus sammle_codex selbst (das
+# liefe sonst auch beim impliziten Auto-Refresh aus zustand_frisch()/pruefen
+# vor jedem Spawn) und NIE aus einem Test (WB_CODEX_USAGE_DATEI liest eine
+# Fixture-Datei statt eines Netzaufrufs).
+CODEX_USAGE_URL_DEFAULT = "https://chatgpt.com/backend-api/wham/usage"
+
+
+def codex_usage_abrufen(access_token, account_id):
+    """Die Antwort des Endpunkts, oder None -- fuer JEDEN Fehler (kein Netz,
+    401, abgelaufenes Token, Zeitueberschreitung, kaputtes JSON): der
+    Aufrufer faellt dann auf den alten Weg zurueck (JWT/Sitzungsdateien),
+    nichts stuerzt ab."""
+    datei = os.environ.get("WB_CODEX_USAGE_DATEI")
+    if datei:
+        return lies_json(datei)
+    if not _netz_erlaubt() or not access_token:
+        return None
+    url = os.environ.get("WB_CODEX_USAGE_URL") or CODEX_USAGE_URL_DEFAULT
+    headers = {"Authorization": "Bearer %s" % access_token, "Accept": "application/json"}
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    try:
+        anfrage = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(anfrage, timeout=10) as antwort:
+            return json.loads(antwort.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def _zahl_oder_none(wert):
+    return wert if isinstance(wert, (int, float)) and not isinstance(wert, bool) else None
+
+
+def codex_usage_anwenden(e, antwort):
+    """Traegt die Endpunkt-Antwort in den (von sammle_codex schon gefuellten)
+    Eintrag ein -- ueberschreibt nur, was der Endpunkt sicherer beantwortet
+    (Plan, die beiden Fenster, das Erschoepft-Signal); JWT-Gueltigkeit und
+    Modellliste aus dem alten Weg bleiben unberuehrt.
+
+    Rueckgabe (erfolg, fenster_meta): erfolg=False bei JEDEM Fehler -- eine
+    Antwort mit Status 200, aber falscher Form (Liste, String, alles ohne
+    '.get') darf hier nicht abstuerzen, sondern zaehlt wie ein unerreichbarer
+    Endpunkt: der alte Weg bleibt unveraendert stehen. fenster_meta traegt
+    limit_window_seconds/reset_after_seconds beider Fenster (roh, zum
+    Zeitpunkt der Messung) fuer codex_verlauf_schreiben -- nicht Teil des
+    kontingent.json-Vertrags, nur der Verlaufszeile."""
+    try:
+        rl = (antwort or {}).get("rate_limit") or {}
+        primaer = rl.get("primary_window") or {}
+        sekundaer = rl.get("secondary_window") or {}
+        # 2026-09-14: Das Abo "prolite" meldet nur noch EIN Fenster, und zwar das
+        # 7-Tage-Fenster als primary_window (limit_window_seconds 604800). Die
+        # Zuordnung nach Position schrieb es als 5-Stunden-Wert und liess den
+        # alten Wochenwert stehen. Tragen die Fenster ihre Laenge, entscheidet sie.
+        fenster = [w for w in (primaer, sekundaer) if isinstance(w, dict) and w]
+
+        def fensterlaenge(w):
+            wert = w.get("limit_window_seconds")
+            return float(wert) if isinstance(wert, (int, float)) and not isinstance(wert, bool) else None
+
+        if fenster and all(fensterlaenge(w) is not None for w in fenster):
+            lang = [w for w in fenster if fensterlaenge(w) >= 86400]
+            kurz = [w for w in fenster if fensterlaenge(w) < 86400]
+            sekundaer = lang[0] if lang else {}
+            primaer = kurz[0] if kurz else {}
+        plan = (antwort or {}).get("plan_type")
+        quelle = os.environ.get("WB_CODEX_USAGE_URL") or CODEX_USAGE_URL_DEFAULT
+        if plan:
+            e["plan"] = plan
+            e["plan_quelle"] = "netz:%s (plan_type)" % quelle
+
+        def rueckfall_iso(fenster):
+            rueck = fenster.get("reset_at")
+            if not isinstance(rueck, (int, float)):
+                return ""
+            return datetime.datetime.fromtimestamp(rueck, datetime.timezone.utc).strftime(ISO)
+
+        k = e["kontingent"]
+        verbraucht = sekundaer.get("used_percent")
+        # einheit/quelle NUR zusammen mit einem tatsaechlich gemessenen Wert setzen
+        # (wie plan/plan_quelle oben) -- sonst tragen sie einen Endpunkt-Beleg fuer
+        # eine Zahl, die in Wahrheit noch vom alten Weg stammt.
+        if isinstance(verbraucht, (int, float)):
+            k["art"] = "zeitfenster"
+            k["verbraucht"] = verbraucht
+            k["grenze"] = 100
+            k["rest"] = max(0, 100 - verbraucht)
+            k["einheit"] = "Wochenfenster (rollend, 7 Tage)"
+            k["quelle"] = quelle
+        if sekundaer.get("reset_at") is not None:
+            k["faellt_zurueck_am"] = rueckfall_iso(sekundaer)
+
+        fk = e["fenster_kurz"]
+        kurz_verbraucht = primaer.get("used_percent")
+        if isinstance(kurz_verbraucht, (int, float)):
+            fk["verbraucht"] = kurz_verbraucht
+            fk["rest"] = max(0, 100 - kurz_verbraucht)
+        if primaer.get("reset_at") is not None:
+            fk["faellt_zurueck_am"] = rueckfall_iso(primaer)
+
+        limit_reached = rl.get("limit_reached")
+        if limit_reached is True or (isinstance(verbraucht, (int, float)) and verbraucht >= 100):
+            e["erschoepft"] = True
+        elif limit_reached is False:
+            e["erschoepft"] = False
+
+        e["hinweis"] = (e.get("hinweis") or "").rstrip() + \
+            " Kontingent-Endpunkt erreichbar: 7-Tage-Fenster %s%%, 5-Stunden-Fenster %s%% (Plan: %s)." % (
+                verbraucht if isinstance(verbraucht, (int, float)) else "?",
+                kurz_verbraucht if isinstance(kurz_verbraucht, (int, float)) else "?",
+                plan or "?")
+
+        fenster_meta = {
+            "seven_day_window_s": _zahl_oder_none(sekundaer.get("limit_window_seconds")),
+            "seven_day_reset_after_s": _zahl_oder_none(sekundaer.get("reset_after_seconds")),
+            "five_hour_window_s": _zahl_oder_none(primaer.get("limit_window_seconds")),
+            "five_hour_reset_after_s": _zahl_oder_none(primaer.get("reset_after_seconds")),
+        }
+        return True, fenster_meta
+    except Exception as ex:
+        e["hinweis"] = (e.get("hinweis") or "").rstrip() + \
+            " Kontingent-Endpunkt antwortete in unerwarteter Form (%s: %s) -- alter Weg gilt weiter." % (
+                type(ex).__name__, ex)
+        return False, None
+
+
+def codex_verlauf_schreiben(e, fenster_meta=None):
+    """Eine Zeile je Aenderung nach codex-limits.jsonl, wie statusline-command.sh
+    es fuer Claude (limits.jsonl) tut -- nur aufgerufen, wenn der Endpunkt gerade
+    erfolgreich geantwortet hat, und nur, wenn sich ein Wert gegenueber der
+    letzten Zeile geaendert hat. fenster_meta (aus codex_usage_anwenden) traegt
+    die rohe Fensterlaenge/Rest-Sekunden beider Fenster mit -- wb-budget braucht
+    sie, weil die Fensterlaenge NICHT immer 7 Tage/5 Stunden sein muss (Nachtrag
+    2026-09-10, Reviewer-Befund: hart codierte 7*86400 waere falsch, sobald
+    Codex die Fensterlaenge je Plan aendert)."""
+    fenster_meta = fenster_meta or {}
+    k = e.get("kontingent") or {}
+    fk = e.get("fenster_kurz") or {}
+    zeile = {
+        "plan": e.get("plan") or "",
+        "five_hour_pct": fk.get("verbraucht"),
+        "seven_day_pct": k.get("verbraucht"),
+        "five_hour_resets_at": fk.get("faellt_zurueck_am") or "",
+        "seven_day_resets_at": k.get("faellt_zurueck_am") or "",
+        "five_hour_window_s": fenster_meta.get("five_hour_window_s"),
+        "seven_day_window_s": fenster_meta.get("seven_day_window_s"),
+        "five_hour_reset_after_s": fenster_meta.get("five_hour_reset_after_s"),
+        "seven_day_reset_after_s": fenster_meta.get("seven_day_reset_after_s"),
+    }
+    pfad = os.environ.get("WB_CODEX_LIMITS_FILE") or hp("~/.claude/workbench/codex-limits.jsonl")
+    letzte_zeile = None
+    try:
+        with open(pfad, "r", encoding="utf-8") as f:
+            for zl in f:
+                zl = zl.strip()
+                if zl:
+                    letzte_zeile = zl
+    except OSError:
+        pass
+    if letzte_zeile is not None:
+        try:
+            alt = json.loads(letzte_zeile)
+            alt = {feld: alt.get(feld) for feld in zeile}
+        except Exception:
+            alt = None
+        if alt == zeile:
+            return False
+    zeile["ts"] = jetzt_iso()
+    try:
+        os.makedirs(os.path.dirname(pfad), exist_ok=True)
+        with open(pfad, "a", encoding="utf-8") as f:
+            f.write(json.dumps(zeile, ensure_ascii=False) + "\n")
+    except OSError:
+        return False
+    return True
+
+
 # ── claude: die Statusleiste schreibt die Zahlen laengst ────────────────────────
 def sammle_claude(h, ctx):
     e = leerer_eintrag("abo")
@@ -445,6 +728,15 @@ def sammle_copilot_cloud(h, ctx):
 
 
 # ── agy: kein Statusbefehl, aber ein Log, das die Auth-Aufloesung nennt ─────────
+# ERSCHOEPFUNG ist hier NICHT kostenlos messbar (nachgesehen 2026-08-27, Anlass:
+# vier laufende Worker fielen gemeinsam aus, "Individual quota reached. Resets in
+# 167h40m52s." stand nur im Pane): ~/.gemini/antigravity-cli/log/cli-*.log fuehrt
+# zu dieser Meldung KEINE Zeile -- nur 'quota_manager.go: doRefreshQuota' ohne
+# Zahlen -- und agy legt nirgends eine Kontingent-Datei ab. Die einzige Quelle
+# ist, dass jemand die Meldung im Pane liest und sie mit `wb-kontingent erschoepft
+# agy --reset ...` eintraegt (siehe beobachtung_wirksam weiter unten); ein
+# kuenftiger Sammler-Umbau sollte hier zuerst wieder in den Logs nachsehen, bevor
+# er dieselbe Suche nochmal von vorne beginnt.
 def sammle_agy(h, ctx):
     e = leerer_eintrag("abo")
     kb = kblock(h)
@@ -578,7 +870,14 @@ def auffrischen(nur_harness=None):
         if nur_harness and h["id"] != nur_harness:
             continue
         eintraege[h["id"]] = sammle(h, modelle, providers)
-    daten = {"stand": jetzt_iso(), "harnesses": eintraege}
+    # Beobachtungen und Zaehler sind keine Sammler-Ausgabe -- ein Refresh der
+    # Harnesses darf sie nie wegwerfen, sonst verliert `pruefen agy` seinen
+    # einzigen Nachweis beim naechsten Auffrischen wieder.
+    daten = {"stand": jetzt_iso(), "harnesses": eintraege,
+             "beobachtungen": alt.get("beobachtungen") or {},
+             "zaehler": alt.get("zaehler") or {},
+             "openrouter_preise": alt.get("openrouter_preise") or {},
+             "openrouter_guthaben": alt.get("openrouter_guthaben") or {}}
     schreibe_zustand(daten)
     return daten
 
@@ -601,6 +900,258 @@ def zustand_frisch(max_stunden=MAXALTER_STUNDEN):
         return {"stand": jetzt_iso(), "harnesses": {}}, False
 
 
+# ── Beobachtung: ein Nachweis, den kein Sammler messen kann ─────────────────────
+def beobachtung_wirksam(z, spur):
+    """Die eingetragene Beobachtung zu dieser Spur, wenn sie noch gilt -- sonst
+    None. 'frei' ueberstimmt nichts (der Sammler entscheidet dann wieder allein);
+    'erschoepft' ueberstimmt, SOLANGE ihr Rueckfallzeitpunkt in der Zukunft liegt
+    oder gar keiner bekannt ist -- danach ist sie verfallen, genau wie ein
+    abgelaufenes Sammler-Signal (sammle_codex, codex_rueckfall)."""
+    b = (z.get("beobachtungen") or {}).get(spur)
+    if not b or b.get("zustand") != "erschoepft":
+        return None
+    rueck = b.get("faellt_zurueck_am") or ""
+    if rueck:
+        try:
+            ende = datetime.datetime.strptime(rueck, ISO).replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            ende = None
+        if ende is not None and jetzt() >= ende:
+            return None
+    return b
+
+
+# ── OpenRouter, kostenlose Modelle: Tageslimit gilt am PROVIDER, nicht am Harness ─
+# Begruendung der Ablage: das Limit haengt an ':free'-Modellreferenzen, nicht an
+# aider/opencode/einem Skript einzeln -- ein Riegel je Harness wuerde denselben
+# Deckel mehrfach fuehren und auseinanderlaufen koennen. Deshalb EIN Zaehler unter
+# der Spur 'openrouter-frei' in der Zustandsdatei, den jeder Aufrufer selbst
+# bucht (`zaehl`) und den `pruefen` gegen JEDES Modell mit dem Suffix ':free'
+# haelt, unabhaengig vom Harness.
+# Die Grenze wird NIE geraten, nur gemessen (openrouter_rang_pruefen() unten) --
+# ein Konto ohne Guthaben hat 50 Anfragen/Tag, belegt am 2026-08-27 (34 aus
+# Rauchtests + 15 aus einem Sieblauf, danach 429), eins mit >= 10 Euro Guthaben
+# 1000. Ein hartcodierter Rueckfall auf 50 waere selbst ein Nachweis-Ersatz --
+# und ein falscher dazu, siehe der gemessene Rang am 2026-08-27 (das Konto
+# stand da schon auf 1000). Solange kein 'auffrischen' den Rang je gemessen
+# hat, ist er UNBEKANNT, und Grundregel 1 gilt auch hier: unbekannt sperrt nie.
+
+
+def _heutiger_tag_utc():
+    # OpenRouter setzt laut Dokumentation (openrouter.ai/docs/api-reference/limits,
+    # abgerufen 2026-08-27) um Mitternacht UTC zurueck -- eine fremde Angabe, nicht
+    # selbst nachgemessen. Der Zaehler bucht deshalb gegen den UTC-Kalendertag.
+    return jetzt().strftime("%Y-%m-%d")
+
+
+def _ist_openrouter_frei_ref(ref):
+    # ':free' ist OpenRouters eigene Kennzeichnung fuer kostenlose Modelle in der
+    # Modell-Referenz selbst (z.B. 'minimax/minimax-m3:free') -- das gilt fuer
+    # jeden Harness, der so eine Referenz fahren kann, ohne dass die Registry
+    # dafuer einen 'provider: openrouter'-Eintrag fuehren muesste.
+    return bool(ref) and str(ref).endswith(":free")
+
+
+def _openrouter_frei_sperre(z):
+    """None, wenn noch Luft ist oder nichts bekannt -- sonst die fertige
+    Fehlermeldung fuer stderr. Zwei Faelle fuer 'nichts bekannt', beide
+    Grundregel 1 (unbekannt sperrt nie): kein Zaehler-Eintrag fuer HEUTE (ein
+    neuer Tag faengt bei 0 an, nicht beim alten Stand), oder der Rang noch nie
+    gemessen (kein hartcodierter Rueckfall -- siehe Kommentar oben)."""
+    zz = (z.get("zaehler") or {}).get("openrouter-frei") or {}
+    if zz.get("tag") != _heutiger_tag_utc():
+        return None
+    grenze = zz.get("grenze")
+    if not grenze:
+        return None
+    verbraucht = zz.get("verbraucht") or 0
+    if verbraucht < grenze:
+        return None
+    return ("wb-kontingent: OpenRouter-Tageslimit fuer kostenlose Modelle (':free') ist "
+            "nachweislich erschoepft -- %d von %d Anfragen heute verbraucht (Grenze: %s). "
+            "Gilt fuers ganze Konto, nicht nur fuer diesen Harness -- kein Start. Reset "
+            "laut OpenRouter-Doku um Mitternacht UTC (nicht selbst nachgemessen). Bekannte "
+            "Grenze dieser Zahl: nur gebucht wird, was ueber `wb-kontingent zaehl` laeuft -- "
+            "Anfragen, die ein Worker direkt ueber aider/opencode stellt, ohne das zu buchen, "
+            "zaehlen hier nicht mit." % (verbraucht, grenze, zz.get("grenze_quelle") or "?"))
+
+
+def _netz_erlaubt():
+    """Die drei Netz-Ausnahmen (Rang, Preise, Guthaben) schaltet
+    WB_KONTINGENT_KEIN_NETZ zuverlaessig ab -- ein Schirm auf 'security'
+    allein reicht dafuer NICHT, weil /api/v1/models oeffentlich ist und auch
+    ohne Schluessel erreichbar bliebe (gemessen 2026-08-27: kein
+    Authorization-Header noetig). Tests setzen diese Variable, damit keiner
+    der drei Aufrufe je das echte Netz erreicht."""
+    return not os.environ.get("WB_KONTINGENT_KEIN_NETZ")
+
+
+def openrouter_schluessel():
+    """Wie shell/messungen/freie-modelle/messlauf.py: Schluesselbund zuerst, dann
+    die Datei -- dieselbe Reihenfolge, damit es nicht zwei Wahrheiten gibt, wo
+    der Schluessel herkommt. `security` gibt es nur auf macOS; auf peer (Linux)
+    wirft subprocess.run FileNotFoundError, das faengt der except ab und die
+    Datei bleibt der Rueckfallweg -- kein Mac-only-Pfad ohne Ausweg."""
+    try:
+        r = subprocess.run(["security", "find-generic-password", "-s", "wb-openrouter", "-w"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    try:
+        with open(hp("~/.secrets-sync/api-keys/openrouter"), encoding="utf-8") as f:
+            k = f.read().strip()
+            return k or None
+    except OSError:
+        return None
+
+
+def openrouter_rang_pruefen(zaehler_eintrag):
+    """Die EINZIGE Ausnahme von 'kein Netzzugriff' in diesem Werkzeug (siehe
+    Kopf-Grundregel), und deshalb absichtlich eng gefasst: ob ein Konto 50 oder
+    1000 kostenlose Anfragen am Tag hat, haengt am eingezahlten Guthaben und
+    steht nirgends lokal -- ein geratener Standardwert wuerde ein aufgeladenes
+    Konto zwanzigfach zu frueh sperren. Der Aufruf gegen /api/v1/key beantwortet
+    genau das (is_free_tier), braucht keinen Login (der API-Schluessel traegt
+    das schon) und bekommt eine kurze Zeitgrenze (5s). Aufgerufen wird er NUR
+    aus cmd_auffrischen (der expliziten Aktion), NIE aus dem impliziten
+    Auto-Refresh in zustand_frisch()/pruefen -- und selbst dort hoechstens
+    einmal pro Tag, sonst wuerde jeder Session-Start, der `auffrischen` zieht,
+    erneut ins Netz gehen. Rueckgabe None heisst: nichts zu tun, alter Rang gilt
+    weiter (oder es gibt noch keinen)."""
+    if not _netz_erlaubt():
+        return None
+    heute = _heutiger_tag_utc()
+    if (zaehler_eintrag or {}).get("grenze_geprueft_am_tag") == heute:
+        return None
+    schluessel = openrouter_schluessel()
+    if not schluessel:
+        return None
+    try:
+        anfrage = urllib.request.Request(
+            "https://openrouter.ai/api/v1/key",
+            headers={"Authorization": "Bearer %s" % schluessel})
+        with urllib.request.urlopen(anfrage, timeout=5) as antwort:
+            d = json.loads(antwort.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    frei = ((d or {}).get("data") or {}).get("is_free_tier")
+    if frei is None:
+        return None
+    grenze = 50 if frei else 1000
+    return {
+        "grenze": grenze,
+        "grenze_quelle": "netz:https://openrouter.ai/api/v1/key (is_free_tier=%s; Grenzen laut "
+                          "openrouter.ai/docs/api-reference/limits, abgerufen 2026-08-27; "
+                          "50er-Grenze zusaetzlich belegt durch den Tag selbst, siehe oben)" % frei,
+        "grenze_geprueft_am_tag": heute,
+        "grenze_geprueft_am": jetzt_iso(),
+    }
+
+
+def openrouter_preise_pruefen(alte_preise):
+    """Zweite Netz-Ausnahme, aus demselben Grund wie oben nur in
+    cmd_auffrischen: EIN GET gegen /api/v1/models -- oeffentlich, kein
+    Schluessel, kein Modellaufruf, nur die Preisliste. Anders als der
+    Rang-Check NICHT auf einmal-am-Tag gedrosselt: Preise koennen sich
+    mehrmals am Tag aendern, und der Aufruf laeuft ohnehin nur, wenn jemand
+    `auffrischen` von Hand oder aus einem eigenen Skript zieht -- nie am
+    Spawn-Pfad (pruefen/zustand_frisch ruehren diese Funktion nie an).
+
+    AKTION = Preis (prompt+completion, USD/Token) niedriger als beim
+    zuletzt GESEHENEN Stand derselben Modell-ID -- der Sonderfall 'Preis
+    faellt auf 0' zaehlt genauso, ohne Extra-Behandlung: 0 < irgendein
+    positiver alter Preis ist einfach eine weitere Preissenkung. Ein Modell,
+    das beim ALLERERSTEN Sehen schon 0 kostet, hat keinen alten Preis zum
+    Vergleich -- es wird nur als Basislinie eingetragen, nie als Aktion
+    gemeldet. Das ist der normale Freibestand, keine Aktion.
+
+    EIN RABATT HEISST NICHT GLEICHZEITIG, DASS DAS MODELL GUENSTIG IST --
+    das muss der Orchestrator dann entscheiden. Diese Funktion waehlt
+    nichts aus, sie macht die Aktion nur sichtbar (Vorgabe des Nutzers,
+    2026-08-27)."""
+    if not _netz_erlaubt():
+        return None
+    try:
+        with urllib.request.urlopen("https://openrouter.ai/api/v1/models", timeout=8) as antwort:
+            d = json.loads(antwort.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    modelle = (d or {}).get("data") or []
+    if not modelle:
+        return None
+    neu = dict(alte_preise or {})
+    jetzt_str = jetzt_iso()
+    for m in modelle:
+        mid = m.get("id")
+        if not mid:
+            continue
+        preisblock = m.get("pricing") or {}
+        try:
+            preis = float(preisblock.get("prompt") or 0) + float(preisblock.get("completion") or 0)
+        except (TypeError, ValueError):
+            continue
+        alt = neu.get(mid)
+        alter_preis = alt.get("preis") if alt else None
+        if not isinstance(alter_preis, (int, float)):
+            neu[mid] = {"preis": preis, "gesehen_am": jetzt_str}
+        elif preis < alter_preis:
+            neu[mid] = {"preis": preis, "gesehen_am": jetzt_str,
+                        "aktion": {"vorher": alter_preis, "seit": jetzt_str}}
+        elif preis > alter_preis:
+            neu[mid] = {"preis": preis, "gesehen_am": jetzt_str}  # zurueckgestiegen -- Aktion vorbei
+        else:
+            eintrag = dict(alt)
+            eintrag["gesehen_am"] = jetzt_str
+            neu[mid] = eintrag  # unveraendert -- eine laufende Aktion bleibt sichtbar
+    return neu
+
+
+# Warnschwelle fuers OpenRouter-Guthaben: absolut, nicht prozentual, weil ein
+# Prozentwert bei jedem neuen Aufladebetrag neu begruendet werden muesste, ohne
+# dass sich am eigentlichen Risiko etwas aendert. 1 (Konto-Waehrung, siehe
+# /api/v1/credits) liegt klar ueber dem, was eine gewoehnliche Session an
+# bezahlten Modellrufen verursacht (die Preise oben liegen im Bereich von
+# Bruchteilen eines Cents je 1000 Token), aber nah genug an 0, dass die Warnung
+# nicht bei jedem 'zeigen' anschlaegt. Der eigentliche Grund ist nicht das Geld
+# selbst: faellt das Guthaben auf 0, kann openrouter_rang_pruefen beim naechsten
+# Messen den Rang wieder auf die 50er-Tagesgrenze zurueckfallen lassen (belegt:
+# das Konto stand am 2026-08-27 mit 5 geladen und 0,05 verbraucht auf 1000) --
+# und genau das soll sichtbar sein, BEVOR es passiert, nicht erst danach.
+GUTHABEN_WARNSCHWELLE = 1.0
+
+
+def openrouter_guthaben_pruefen():
+    """Dritte Netz-Ausnahme, wieder nur in cmd_auffrischen: EIN GET gegen
+    /api/v1/credits, authentifiziert (der Kontostand ist kontospezifisch,
+    anders als die oeffentliche Modell-Preisliste oben)."""
+    if not _netz_erlaubt():
+        return None
+    schluessel = openrouter_schluessel()
+    if not schluessel:
+        return None
+    try:
+        anfrage = urllib.request.Request(
+            "https://openrouter.ai/api/v1/credits",
+            headers={"Authorization": "Bearer %s" % schluessel})
+        with urllib.request.urlopen(anfrage, timeout=5) as antwort:
+            d = json.loads(antwort.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    daten = (d or {}).get("data") or {}
+    total = daten.get("total_credits")
+    verbraucht = daten.get("total_usage")
+    if not isinstance(total, (int, float)) or not isinstance(verbraucht, (int, float)):
+        return None
+    return {
+        "total_credits": total,
+        "total_usage": verbraucht,
+        "rest": total - verbraucht,
+        "gemessen_am": jetzt_iso(),
+    }
+
+
 # ── Unterbefehle ────────────────────────────────────────────────────────────────
 def cmd_auffrischen(args):
     start = datetime.datetime.now()
@@ -614,6 +1165,50 @@ def cmd_auffrischen(args):
                 print(json.dumps(z, ensure_ascii=False, indent=2))
             return 0
     daten = auffrischen(args.harness)
+    # codex-Kontingent (2026-09-10): der AKTIVE Endpunkt-Aufruf, siehe Kopfkommentar
+    # "CODEX-KONTINGENT UEBER DEN CHATGPT-ENDPUNKT" -- bewusst hier und nicht in
+    # sammle_codex, aus demselben Grund wie die drei OpenRouter-Aufrufe unten: sonst
+    # zoege ihn auch der implizite Auto-Refresh aus zustand_frisch()/pruefen mit,
+    # und jeder Spawn zahlte einen Netzaufruf. Nur, wenn dieser Lauf den codex-
+    # Eintrag ueberhaupt neu erhoben hat (kein --harness-Filter auf einen anderen
+    # Harness).
+    codex_eintrag = daten.get("harnesses", {}).get("codex")
+    if codex_eintrag is not None:
+        auth = lies_json(hp("~/.codex/auth.json")) or {}
+        tokens = auth.get("tokens") or {}
+        codex_antwort = codex_usage_abrufen(tokens.get("access_token"), tokens.get("account_id"))
+        if codex_antwort is not None:
+            erfolg, fenster_meta = codex_usage_anwenden(codex_eintrag, codex_antwort)
+            if erfolg:
+                codex_verlauf_schreiben(codex_eintrag, fenster_meta)
+        else:
+            codex_eintrag["hinweis"] = (codex_eintrag.get("hinweis") or "").rstrip() + \
+                " Kontingent-Endpunkt (%s) nicht erreichbar -- alter Weg (JWT/Sitzungsdateien) gilt weiter." % (
+                    os.environ.get("WB_CODEX_USAGE_URL") or CODEX_USAGE_URL_DEFAULT)
+        schreibe_zustand(daten)
+    # Luecke 2d (2026-08-27): hoechstens einmal am Tag den Rang des OpenRouter-
+    # Schluessels pruefen (50 vs. 1000 kostenlose Anfragen) -- die einzige
+    # Ausnahme von 'kein Netzzugriff', siehe openrouter_rang_pruefen(). Bewusst
+    # NUR hier (der expliziten Aktion), nicht in auffrischen() selbst, sonst
+    # wuerde ihn auch der implizite Auto-Refresh aus pruefen() mitziehen.
+    aktualisierung = openrouter_rang_pruefen(
+        (daten.get("zaehler") or {}).get("openrouter-frei"))
+    if aktualisierung:
+        daten.setdefault("zaehler", {}).setdefault("openrouter-frei", {}).update(aktualisierung)
+        schreibe_zustand(daten)
+    # Zweiter Nachtrag (2026-08-27): Preis-Historie und Guthaben, dieselbe
+    # Ausnahme, aber OHNE Tages-Drossel -- siehe Begruendung bei
+    # openrouter_preise_pruefen(). Beide scheitern fuer sich allein (kein Netz,
+    # kein Schluessel, kaputte Antwort); ein Fehlschlag hier darf den Rest von
+    # 'auffrischen' nie anhalten.
+    neue_preise = openrouter_preise_pruefen(daten.get("openrouter_preise"))
+    if neue_preise is not None:
+        daten["openrouter_preise"] = neue_preise
+        schreibe_zustand(daten)
+    neues_guthaben = openrouter_guthaben_pruefen()
+    if neues_guthaben is not None:
+        daten["openrouter_guthaben"] = neues_guthaben
+        schreibe_zustand(daten)
     dauer = (datetime.datetime.now() - start).total_seconds()
     if args.json:
         print(json.dumps(daten, ensure_ascii=False, indent=2))
@@ -623,9 +1218,28 @@ def cmd_auffrischen(args):
     return 0
 
 
-def _zeile(hid, e):
+def _lesbar(iso_zeit):
+    return iso_zeit[:16].replace("T", " ") if iso_zeit else "unbekannt"
+
+
+def _aktive_aktionen(z):
+    """Modelle mit einer laufenden Preisaktion, juengste zuerst -- gemeinsame
+    Quelle fuer 'zeigen', '--knapp' und 'aktionen', damit die drei nicht
+    auseinanderlaufen koennen."""
+    preise = z.get("openrouter_preise") or {}
+    return sorted(
+        ((mid, e) for mid, e in preise.items() if e.get("aktion")),
+        key=lambda kv: kv[1]["aktion"].get("seit") or "", reverse=True)
+
+
+def _zeile(hid, e, beob=None):
     k = e.get("kontingent") or {}
-    if e.get("erschoepft") is True:
+    if beob is not None:
+        # Beobachtet, nicht gemessen -- ueberstimmt den Sammler sichtbar, statt
+        # neben ihm zu stehen (sonst zeigt die Zeile 'unbekannt', obwohl ein
+        # Nachweis vorliegt).
+        zustand = "BEOBACHTET ERSCHOEPFT bis " + _lesbar(beob.get("faellt_zurueck_am"))
+    elif e.get("erschoepft") is True:
         zustand = "ERSCHOEPFT"
         if k.get("faellt_zurueck_am"):
             zustand += " bis " + k["faellt_zurueck_am"][:16].replace("T", " ")
@@ -667,10 +1281,19 @@ def cmd_zeigen(args):
     print("Stand: %s%s" % (z.get("stand"), ("  (%d Minuten alt)" % (a / 60)) if a is not None else ""))
     if args.harness:
         e = z["harnesses"].get(args.harness)
-        if e is None:
+        beob = beobachtung_wirksam(z, args.harness)
+        if e is None and beob is None:
             print("wb-kontingent: '%s' steht nicht im Stand." % args.harness, file=sys.stderr)
             return 1
-        print(_zeile(args.harness, e))
+        if e is None:
+            # Kein Sammler-Eintrag (z.B. Harness nicht in der Registry), aber
+            # eine Beobachtung liegt trotzdem vor -- die zaehlt, siehe pruefen().
+            print("%-15s %-9s %-14s BEOBACHTET ERSCHOEPFT bis %s"
+                  % (args.harness, "?", "-", _lesbar(beob.get("faellt_zurueck_am"))))
+            print("  Beobachtung (nicht gemessen): erschoepft seit %s. Quelle: %s"
+                  % (_lesbar(beob.get("seit")), beob.get("quelle") or "?"))
+            return 0
+        print(_zeile(args.harness, e, beob))
         print("  Modelle nutzbar:  %s" % (", ".join(e.get("modelle_nutzbar") or []) or "-"))
         if e.get("modelle_gesperrt"):
             print("  Modelle gesperrt: %s" % ", ".join(e["modelle_gesperrt"]))
@@ -680,10 +1303,35 @@ def cmd_zeigen(args):
                 print("  Quelle %-8s %s" % (feld + ":", wert))
         if e.get("hinweis"):
             print("  Hinweis: %s" % e["hinweis"])
+        if beob is not None:
+            print("  Beobachtung (nicht gemessen): erschoepft seit %s, wieder frei ab %s. Quelle: %s"
+                  % (_lesbar(beob.get("seit")), _lesbar(beob.get("faellt_zurueck_am")),
+                     beob.get("quelle") or "?"))
         return 0
     print("%-15s %-9s %-14s %-27s %s" % ("HARNESS", "ART", "PLAN", "ZUSTAND", "KONTINGENT"))
     for hid in sorted(z["harnesses"]):
-        print(_zeile(hid, z["harnesses"][hid]))
+        print(_zeile(hid, z["harnesses"][hid], beobachtung_wirksam(z, hid)))
+    zz = (z.get("zaehler") or {}).get("openrouter-frei") or {}
+    if zz.get("tag") == _heutiger_tag_utc():
+        verbraucht = zz.get("verbraucht") or 0
+        grenze = zz.get("grenze")
+        grenze_text = "%d" % grenze if grenze else "Rang unbekannt, `auffrischen` misst ihn"
+        print("%-15s %-9s %-14s %-27s %d von %s heute verbraucht (Zaehler, kein Sammler)"
+              % ("openrouter-frei", "zaehler", "-", "-", verbraucht, grenze_text))
+    guthaben = z.get("openrouter_guthaben") or {}
+    if guthaben:
+        rest = guthaben.get("rest")
+        knapp = " -- KNAPP (< %s)" % GUTHABEN_WARNSCHWELLE \
+            if isinstance(rest, (int, float)) and rest < GUTHABEN_WARNSCHWELLE else ""
+        print("OpenRouter-Guthaben: %s verbraucht von %s geladen, Rest %s (Stand %s)%s"
+              % (guthaben.get("total_usage"), guthaben.get("total_credits"), rest,
+                 _lesbar(guthaben.get("gemessen_am")), knapp))
+    aktive = _aktive_aktionen(z)
+    if aktive:
+        # Bewusst NIE die einzelnen Modelle hier auflisten (das ist
+        # 'wb-kontingent aktionen'): diese Zeile landet im Kontext jedes
+        # Orchestrators, der 'zeigen' aufruft.
+        print("OpenRouter-Preisaktionen: %d aktiv -- Liste: wb-kontingent aktionen" % len(aktive))
     return 0
 
 
@@ -726,6 +1374,29 @@ def cmd_pruefen(args):
 
 
     z, _ = zustand_frisch()
+
+    # Beobachtung (Luecke 1, 2026-08-27): ueberstimmt den Sammler, solange sie
+    # gilt -- unabhaengig davon, ob der Harness ueberhaupt einen Sammler-Eintrag
+    # hat (agy z.B. hat nie ein 'erschoepft', der Sammler kann es nicht messen).
+    beob = beobachtung_wirksam(z, args.harness)
+    if beob is not None:
+        print("wb-kontingent: Harness '%s' ist laut Beobachtung erschoepft (nicht gemessen, "
+              "kein Sammler kann das hier belegen) -- kein Start. Wieder frei ab: %s. Quelle: %s"
+              % (args.harness, beob.get("faellt_zurueck_am") or "unbekannt",
+                 beob.get("quelle") or "?"), file=sys.stderr)
+        return 3
+
+    # OpenRouter-Tageslimit (Luecke 2, 2026-08-27): haengt am Modell, nicht am
+    # Harness -- deshalb hier vor der harness-spezifischen Pruefung und auch
+    # dann wirksam, wenn der Harness selbst keinen Sammler-Eintrag hat.
+    if args.modell:
+        ref_openrouter = _finde_modell(args.modell, args.harness)
+        if _ist_openrouter_frei_ref(ref_openrouter):
+            sperre = _openrouter_frei_sperre(z)
+            if sperre:
+                print(sperre, file=sys.stderr)
+                return 3
+
     e = (z.get("harnesses") or {}).get(args.harness)
     if e is None:
         # Grenze 1: unbekannt sperrt nie. Das gilt fuer den KONTINGENT-Stand --
@@ -764,6 +1435,124 @@ def cmd_pruefen(args):
     return 0
 
 
+def cmd_erschoepft(args):
+    z = lies_zustand() or {"stand": jetzt_iso(), "harnesses": {}}
+    z.setdefault("beobachtungen", {})
+    rueck = parse_zeitpunkt(args.reset) if args.reset else None
+    if args.reset and rueck is None:
+        print("wb-kontingent: '%s' ist weder eine Restdauer ('167h41m') noch ein Zeitpunkt "
+              "('2026-09-03T13:25') -- die Beobachtung wird trotzdem eingetragen, aber ohne "
+              "Rueckfallzeitpunkt (verfaellt dann nie von selbst)." % args.reset, file=sys.stderr)
+    z["beobachtungen"][args.spur] = {
+        "zustand": "erschoepft",
+        "seit": jetzt_iso(),
+        "faellt_zurueck_am": rueck.strftime(ISO) if rueck else "",
+        "quelle": args.quelle or "",
+    }
+    schreibe_zustand(z)
+    print("wb-kontingent: '%s' als erschoepft eingetragen%s."
+          % (args.spur, (" -- wieder frei ab %s" % rueck.strftime(ISO)) if rueck else
+             " -- ohne Rueckfallzeitpunkt, verfaellt nicht von selbst"))
+    return 0
+
+
+def cmd_frei(args):
+    z = lies_zustand() or {"stand": jetzt_iso(), "harnesses": {}}
+    z.setdefault("beobachtungen", {})
+    z["beobachtungen"][args.spur] = {
+        "zustand": "frei", "seit": jetzt_iso(), "faellt_zurueck_am": "",
+        "quelle": args.quelle or "",
+    }
+    schreibe_zustand(z)
+    print("wb-kontingent: '%s' als beobachtet-frei eingetragen -- eine fruehere "
+          "'erschoepft'-Beobachtung ist damit aufgehoben, der Sammler entscheidet wieder allein."
+          % args.spur)
+    return 0
+
+
+def cmd_zaehl(args):
+    z = lies_zustand() or {"stand": jetzt_iso(), "harnesses": {}}
+    z.setdefault("zaehler", {})
+    eintrag = z["zaehler"].setdefault(args.spur, {})
+    heute = _heutiger_tag_utc()
+    if eintrag.get("tag") != heute:
+        eintrag["verbraucht"] = 0
+        eintrag["tag"] = heute
+    eintrag["verbraucht"] = (eintrag.get("verbraucht") or 0) + args.anzahl
+    eintrag["aktualisiert_am"] = jetzt_iso()
+    schreibe_zustand(z)
+    print("wb-kontingent: '%s' heute %d verbraucht." % (args.spur, eintrag["verbraucht"]))
+    return 0
+
+
+def cmd_knapp(args):
+    z, _ = zustand_frisch()
+    for hid in sorted((z.get("beobachtungen") or {}).keys()):
+        beob = beobachtung_wirksam(z, hid)
+        if beob is not None:
+            print("%s: BEOBACHTET erschoepft, wieder frei ab %s (Quelle: %s)"
+                  % (hid, _lesbar(beob.get("faellt_zurueck_am")), beob.get("quelle") or "?"))
+    beobachtet_schon = set((z.get("beobachtungen") or {}).keys())
+    for hid, e in sorted((z.get("harnesses") or {}).items()):
+        if hid in beobachtet_schon or e.get("erschoepft") is not True:
+            continue
+        k = e.get("kontingent") or {}
+        print("%s: erschoepft, wieder ab %s" % (hid, _lesbar(k.get("faellt_zurueck_am"))))
+    zz = (z.get("zaehler") or {}).get("openrouter-frei") or {}
+    grenze = zz.get("grenze")
+    if zz.get("tag") == _heutiger_tag_utc() and grenze:
+        # Ohne gemessenen Rang gibt es hier nichts Ehrliches zu meckern -- ein
+        # Rueckfallwert waere geraten, und geraten sperrt nicht (Grundregel 1).
+        verbraucht = zz.get("verbraucht") or 0
+        rest = max(0, grenze - verbraucht)
+        # Schwelle 'knapp': 20 % der Grenze oder 10 Anfragen, je nachdem, was
+        # groesser ist -- bei 50 sind das 10 (die tatsaechlich gemessene
+        # Restluft am 2026-08-27, als der Rauchtest den Tag beendete), bei 1000
+        # eher 200, sonst waere 'knapp' bei einem aufgeladenen Konto nie zu sehen.
+        if rest <= max(10, grenze * 0.2):
+            print("openrouter-frei: %d von %d heute noch frei (%d verbraucht, %s, Reset laut "
+                  "OpenRouter-Doku Mitternacht UTC)"
+                  % (rest, grenze, verbraucht, "erschoepft" if rest <= 0 else "knapp"))
+    guthaben = z.get("openrouter_guthaben") or {}
+    rest_guthaben = guthaben.get("rest")
+    if isinstance(rest_guthaben, (int, float)) and rest_guthaben < GUTHABEN_WARNSCHWELLE:
+        print("openrouter-guthaben: nur noch %s uebrig (< %s) -- der Rang koennte beim naechsten "
+              "Messen auf die 50er-Tagesgrenze zurueckfallen" % (rest_guthaben, GUTHABEN_WARNSCHWELLE))
+    aktive = _aktive_aktionen(z)
+    if aktive:
+        # KNAPP bleibt knapp: bis zu fuenf Treffer ausgeschrieben, darueber nur
+        # die Zahl -- jede Zeile hier landet im Kontext jedes Orchestrators bei
+        # jedem Session-Start (Vorgabe des Nutzers, 2026-08-27).
+        if len(aktive) <= 5:
+            for mid, e in aktive:
+                a = e["aktion"]
+                print("openrouter-aktion: %s %.8g -> %.8g USD/Token" % (mid, a["vorher"], e["preis"]))
+        else:
+            print("openrouter-aktion: %d Modelle mit Preisaktion -- Liste: wb-kontingent aktionen"
+                  % len(aktive))
+    return 0
+
+
+def cmd_aktionen(args):
+    z = lies_zustand() or {}
+    aktive = _aktive_aktionen(z)
+    if not aktive:
+        print("wb-kontingent: keine laufende Preisaktion bei OpenRouter bekannt "
+              "(Stand: %s)." % (z.get("stand") or "noch nie erhoben"))
+        return 0
+    print("%d Modell(e) mit laufender Preisaktion bei OpenRouter (Stand: %s):"
+          % (len(aktive), z.get("stand")))
+    for mid, e in aktive:
+        a = e["aktion"]
+        print("  %-50s %.8g -> %.8g USD/Token (seit %s)"
+              % (mid, a["vorher"], e["preis"], _lesbar(a.get("seit"))))
+    # Vorgabe des Nutzers woertlich: ein Rabatt heisst nicht gleichzeitig, dass
+    # das Modell guenstig ist -- das muss der Orchestrator dann entscheiden.
+    # Diese Liste waehlt nichts aus, sie macht die Aktion nur sichtbar.
+    print("Ein Rabatt heisst nicht gleichzeitig, dass das Modell guenstig ist -- "
+          "das muss der Orchestrator dann entscheiden.")
+    return 0
+
 
 def _harness_befehl(harness):
     """Der AUFRUFNAME eines Harness, aus der Registry -- nicht sein Name.
@@ -801,6 +1590,10 @@ def freier_speicher_mib():
 def main():
     ap = argparse.ArgumentParser(prog="wb-kontingent", add_help=True,
                                  description="Plan, nutzbare Modelle und Restkontingent je Harness.")
+    # Top-level statt Unterbefehl, weil der SessionStart-Hook genau diesen einen
+    # Aufruf macht ('wb-kontingent --knapp') und keinen Unterbefehl parsen muss.
+    ap.add_argument("--knapp", action="store_true",
+                    help="eine Zeile je Spur, die erschoepft oder knapp ist -- sonst still")
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("auffrischen", help="alle Quellen lesen und die Zustandsdatei schreiben")
@@ -822,7 +1615,30 @@ def main():
     p = sub.add_parser("pfad", help="Pfad der Zustandsdatei")
     p.set_defaults(fn=lambda a: (print(STATE_FILE), 0)[1])
 
+    p = sub.add_parser("erschoepft", help="eine beobachtete Erschoepfung eintragen (Nachweis, kein Sammler-Messwert)")
+    p.add_argument("spur")
+    p.add_argument("--reset", metavar="ZEIT",
+                   help="Restdauer ('167h41m', wie die CLIs sie melden) oder Zeitpunkt "
+                        "('2026-09-03T13:25', Ortszeit)")
+    p.add_argument("--quelle", help="woher die Beobachtung stammt, z.B. 'Meldung im Pane 2026-08-27 11:44'")
+    p.set_defaults(fn=cmd_erschoepft)
+
+    p = sub.add_parser("frei", help="eine fruehere 'erschoepft'-Beobachtung aufheben")
+    p.add_argument("spur")
+    p.add_argument("--quelle")
+    p.set_defaults(fn=cmd_frei)
+
+    p = sub.add_parser("zaehl", help="einen eigenen Aufruf gegen eine Spur buchen (taeglicher Rueckfall)")
+    p.add_argument("spur")
+    p.add_argument("anzahl", nargs="?", type=int, default=1)
+    p.set_defaults(fn=cmd_zaehl)
+
+    p = sub.add_parser("aktionen", help="volle Liste der laufenden OpenRouter-Preisaktionen")
+    p.set_defaults(fn=cmd_aktionen)
+
     args = ap.parse_args()
+    if args.knapp:
+        return cmd_knapp(args)
     if not getattr(args, "fn", None):
         ap.print_help()
         return 2

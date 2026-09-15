@@ -86,9 +86,24 @@ export class Chatwerkstatt {
 
   private tmux(args: string[], frist = 5000): { ok: boolean; aus: string } {
     const basis = this.opt.socket ? ['-L', this.opt.socket] : [];
+    // killSignal:SIGKILL (2026-09-03, Audit "tmux-Aufrufe ohne Frist"): SIGTERM
+    // (die Node-Vorgabe) ist abfangbar -- siehe sessions.ts/befehle.ts, wo genau
+    // das spawnSync in der Messung ueber zwei Minuten haengen liess.
     const r = spawnSync(this.opt.bin ?? 'tmux', [...basis, ...args], {
-      encoding: 'utf8', timeout: frist,
+      encoding: 'utf8', timeout: frist, killSignal: 'SIGKILL',
     });
+    // SICHTBAR, ABER NICHT LAUTER (2026-09-03): bisher verschwand r.error hier
+    // spurlos -- jeder Aufrufer dieses gemeinsamen Helfers (has-session,
+    // sicherstellen, markiere, workerAuskunft, aufraeumen) sah nur ein leeres
+    // Ergebnis, ununterscheidbar von "tmux hat geantwortet, nichts zu sagen".
+    // Geloggt wird EINMAL hier statt an jeder Aufrufstelle einzeln -- derselbe
+    // Ort, an dem befehle.ts' eigener `tmux()`-Helfer es schon so macht. Am
+    // Rueckgabewert aendert sich nichts: kein Aufrufer faellt dadurch lauter hin.
+    if (r.error || r.signal) {
+      process.stderr.write(`chatwerkstatt.ts tmux(${args.join(' ')}): ${
+        r.signal ? `nach ${frist}ms abgebrochen` : r.error?.message
+      } -- gilt als fehlgeschlagen.\n`);
+    }
     if (r.error) return { ok: false, aus: '' };
     return { ok: r.status === 0, aus: (r.stdout ?? '').replace(/\n$/, '') };
   }

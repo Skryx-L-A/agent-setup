@@ -67,6 +67,11 @@
                     "id": "ornith:9b-32k",
                     "name": "ornith:9b-32k (32k ctx, wb-kontext)",
                     "contextWindow": 32768
+                },
+                {
+                    "id": "qwen3.6:27b-coding-nvfp4-128k",
+                    "name": "qwen3.6:27b-coding-nvfp4-128k (128k ctx, wb-kontext)",
+                    "contextWindow": 131072
                 }
             ]
         },
@@ -191,6 +196,29 @@
             },
             "models": [
                 {
+                    "id": "mtplx-qwen38-27b-optimized-speed",
+                    "name": "qwen38-27b-mlx-4bit (32k ctx, wb-kontext)",
+                    "contextWindow": 32768,
+                    "reasoning": true,
+                    "thinkingLevelMap": {
+                        "off": null,
+                        "minimal": "low",
+                        "low": "low",
+                        "medium": "medium",
+                        "high": "xhigh",
+                        "xhigh": "xhigh",
+                        "max": null
+                    },
+                    "compat": {
+                        "thinkingFormat": "chat-template",
+                        "chatTemplateKwargs": {
+                            "reasoning_effort": {
+                                "$var": "thinking.effort"
+                            }
+                        }
+                    }
+                },
+                {
                     "id": "$HOME/AI/mlx-models/qwen38-27b-mlx-4bit",
                     "name": "qwen38-27b-mlx-4bit (32k ctx, wb-kontext)",
                     "contextWindow": 32768,
@@ -283,6 +311,67 @@
                     "id": "mtplx-qwen38-27b-optimized-speed",
                     "name": "qwen38-27b-mlx-4bit (128k ctx, wb-kontext)",
                     "contextWindow": 131072,
+                    "reasoning": true,
+                    "thinkingLevelMap": {
+                        "off": null,
+                        "minimal": "low",
+                        "low": "low",
+                        "medium": "medium",
+                        "high": "xhigh",
+                        "xhigh": "xhigh",
+                        "max": null
+                    },
+                    "compat": {
+                        "thinkingFormat": "chat-template",
+                        "chatTemplateKwargs": {
+                            "reasoning_effort": {
+                                "$var": "thinking.effort"
+                            }
+                        }
+                    }
+                },
+                {
+                    "id": "$HOME/AI/mlx-models/qwen38-27b-mlx-4bit",
+                    "name": "qwen38-27b-mlx-4bit (128k ctx, wb-kontext)",
+                    "contextWindow": 131072,
+                    "reasoning": true,
+                    "thinkingLevelMap": {
+                        "off": null,
+                        "minimal": "low",
+                        "low": "low",
+                        "medium": "medium",
+                        "high": "xhigh",
+                        "xhigh": "xhigh",
+                        "max": null
+                    },
+                    "compat": {
+                        "thinkingFormat": "chat-template",
+                        "chatTemplateKwargs": {
+                            "reasoning_effort": {
+                                "$var": "thinking.effort"
+                            }
+                        }
+                    }
+                },
+                {
+                    "id": "$HOME/AI/mlx-models/Ornith-1.5-35B-A3B-MLX-4bit",
+                    "name": "Ornith-1.5-35B-A3B-MLX-4bit (128k ctx, wb-kontext)",
+                    "contextWindow": 131072
+                }
+            ]
+        },
+        "omlx-lokal": {
+            "baseUrl": "http://127.0.0.1:8079/v1",
+            "api": "openai-completions",
+            "apiKey": "omlx",
+            "compat": {
+                "supportsDeveloperRole": false
+            },
+            "models": [
+                {
+                    "id": "$HOME/.omlx/models/pyros-vault/Qwen3.8-27B-Uncensored-oQ4e-mtp",
+                    "name": "qwen3.8-27b UNCENSORED (lokal, oMLX oQ4e, MTP an)",
+                    "contextWindow": 262144,
                     "reasoning": true,
                     "thinkingLevelMap": {
                         "off": null,

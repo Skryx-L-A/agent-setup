@@ -341,3 +341,24 @@ if fmt == "cline-sessions":
             used = i + (o if isinstance(o, int) else 0)
             break
     sag(used, win)
+
+# Anlass (2026-08-22, dieselbe Bugfamilie wie wb-budget -- bewusst NICHT gleich behandelt
+# wie dessen legitime Stille). Jeder der sieben Bloecke oben endet ausnahmslos ueber
+# sag(), das bei echtem ZWEIFEL (Datei fehlt, veraltet, mehrdeutig, kein Nenner) still mit
+# Exit 0 endet -- GENAU der dokumentierte Vertrag, unveraendert. Hier unten wird nur der
+# einzige Fall abgefangen, den keiner der sieben Bloecke ueberhaupt betreten hat: ein
+# NICHT LEERES 'format' in der Registry, das zu keinem der sieben bekannten Namen passt --
+# kein Zweifel an den DATEN, sondern ein Tippfehler oder ein neu eingetragener Harness
+# ohne passenden Leser hier. Ein LEERES 'format' bleibt unangetastet still (Exit 0): das
+# ist der normale Fall fuer einen Harness, der diesen Lesekanal gar nicht benutzt.
+#
+# Beide echten Aufrufer (shell/context-guard, app/src/main/workerstate.ts) verwerfen
+# stderr und behandeln jeden Fehlschlag ohnehin gleich als "unbekannt" -- fuer sie
+# aendert sich sichtbar NICHTS. Der Nutzen ist die direkte Handbedienung beim Debuggen
+# einer Registry-Eintragung: statt lautloser Leere jetzt eine Zeile, die den Tippfehler
+# nennt, statt ihn mit einer echten Unsicherheit zu verwechseln.
+if fmt:
+    print("wb-session-load: unbekanntes format %r in der Registry -- keines der sieben "
+          "bekannten (codex-rollout, aider-chat-history, crush-sqlite, gptme-jsonl, "
+          "copilot-sqlite, openhands-state, cline-sessions)." % fmt, file=sys.stderr)
+    sys.exit(1)

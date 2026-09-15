@@ -1,0 +1,1139 @@
+#!/usr/bin/env python3
+"""Die Pruefschleife -- der zweite Laeufer, fuer alles ohne Messzahl.
+
+`wb-autoresearch` optimiert eine einzelne Zahl gegen einen Messbefehl. Fast
+alles, was im Haus gebaut wird, hat keine solche Zahl -- ein Skill, ein
+Werkzeug, eine Regeldatei, ein Bericht. Hier entscheidet stattdessen eine
+KETTE von Pruefungen, billig und hart zuerst, teuer und weich zuletzt
+(SPEC-PRUEFSCHLEIFE.md):
+
+    bauen -> [1] formal -> [2] ausfuehrbar -> [3] Eigenschaften -> [4] Urteil
+             billig, hart --------------------------------> teuer, weich
+
+Auftrag vom 01.09.2026: "Genau diese Bauart wird hier gebraucht -- dieselben
+Lehren, dieselben Fallen, ein anderer Zweck" (bezogen auf den Vertrags-Umbau
+von wb_autoresearch.py, ~/AI/autoresearch/wb_autoresearch.py). Was von dort
+sinngemaess uebernommen ist, steht mit Fundstelle an der jeweiligen Funktion
+-- eine gemeinsame Bibliothek der beiden Laeufer ist ein eigener Umbau und
+nicht dieser hier (Auftrag, woertlich).
+
+Dieser Durchgang baut das GERUEST, nicht die Intelligenz: Stufe 1 (formal)
+und Stufe 2 (ausfuehrbar) sind vollstaendige Befehlsstufen; Stufe 3
+(Eigenschaften) und Stufe 4 (Urteil) haben die Schnittstelle (Agent: Modell +
+Rolle + Maschine) und eine lauffaehige Minimalfassung -- die inhaltliche
+Ausbaustufe kommt spaeter. Welche Stufe ein Agent ist, entscheidet der
+Vertrag: die ausgelieferte Vorlage besetzt Stufe 4 mit einem Agenten und
+Stufe 3 mit Pruefcode (property-based, metamorphic, differential -- so steht
+es in der Spec), weil das Haus zwei Modelle fuer diesen Laeufer hat und jedes
+davon nur EINE Rolle besetzen darf (siehe modell_kollision unten).
+
+Das Modell einer Agenten-Rolle steht NICHT neben dem Befehl, es wird AUS ihm
+gelesen (Befund B3 der Gegenpruefung vom 01.09.2026): ein Etikett, das
+nirgends ankommt, kann nicht scheitern, wenn jemand es ernst meint, und hilft
+nicht, wenn er es nicht tut.
+
+    wb-pruefschleife vorlage               # eine ausfuellbare pruefschleife.json schreiben
+    wb-pruefschleife lauf                  # eine Runde (neu oder fortgesetzt)
+    wb-pruefschleife schleife              # Runden bis Obergrenze oder Stillstand
+    wb-pruefschleife fortsetzen            # eine abgebrochene Runde fortsetzen
+    wb-pruefschleife stand                 # was bisher lief
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+import atomar_schreiben
+
+SKRIPT_VERZEICHNIS = Path(__file__).resolve().parent
+
+VERTRAG_DATEI_NAME = "pruefschleife.json"
+ARBEITSVERZEICHNIS_NAME = ".pruefschleife"
+ZUSTAND_DATEI = f"{ARBEITSVERZEICHNIS_NAME}/stand.json"
+RUNDEN_TSV = f"{ARBEITSVERZEICHNIS_NAME}/runden.tsv"
+RUNDEN_JSONL = f"{ARBEITSVERZEICHNIS_NAME}/runden.jsonl"
+AUFTRAG_ORDNER_NAME = f"{ARBEITSVERZEICHNIS_NAME}/auftraege"
+
+
+# ──────────────────────────────────────────────────────────── Projekt-Vertrag
+
+def _in_projekt(pfad: Path, projekt: Path, was: str) -> Path:
+    """Sinngemaess uebernommen aus wb_autoresearch.py, _in_projekt() (Fundstelle:
+    ~/AI/autoresearch/wb_autoresearch.py) -- kein Pfad aus dem Vertrag darf
+    das Projekt verlassen."""
+    voll = pfad.resolve()
+    projekt_voll = projekt.resolve()
+    if voll != projekt_voll and projekt_voll not in voll.parents:
+        raise ValueError(f"{was} {pfad} liegt ausserhalb von {projekt}")
+    return voll
+
+
+def _unter_projekt(pfad_text: str, projekt: Path) -> bool:
+    """Sinngemaess uebernommen aus wb_autoresearch.py, _unter_projekt()."""
+    kandidat = Path(pfad_text)
+    if not kandidat.is_absolute():
+        kandidat = projekt / kandidat
+    try:
+        kandidat_voll = kandidat.resolve()
+    except OSError:
+        return False
+    projekt_voll = projekt.resolve()
+    return kandidat_voll == projekt_voll or projekt_voll in kandidat_voll.parents
+
+
+def projekt_bestimmen(projekt_arg: Path | None, konfiguration_arg: Path | None) -> Path:
+    """Sinngemaess uebernommen aus wb_autoresearch.py, projekt_bestimmen()
+    (Fundstelle: ~/AI/autoresearch/wb_autoresearch.py) -- dieselbe Faellkette,
+    VERTRAG_DATEI_NAME statt autoresearch.json. Genau diese Bauart war der
+    Auftrag vom 01.09.2026: autoresearch war fuer ein fremdes Projekt
+    unbenutzbar, weil ein fest verdrahtetes WURZEL nie mit einem fremden Pfad
+    aufgerufen wurde -- dieser Laeufer traegt darum GAR KEIN globales WURZEL,
+    jede Funktion bekommt das Projektverzeichnis als Parameter.
+
+    1. `--projekt`, wenn gesetzt.
+    2. das Verzeichnis von `--konfiguration`, wenn gesetzt.
+    3. das aktuelle Arbeitsverzeichnis, wenn dort eine pruefschleife.json liegt.
+    4. das Skriptverzeichnis (Vorgabefall -- ohne eigenen Vertrag meldet main()
+       dort in einer Zeile, was fehlt; siehe main()).
+    """
+    if projekt_arg is not None:
+        return projekt_arg.resolve()
+    if konfiguration_arg is not None:
+        return konfiguration_arg.resolve().parent
+    cwd = Path.cwd()
+    if (cwd / VERTRAG_DATEI_NAME).exists():
+        return cwd.resolve()
+    return SKRIPT_VERZEICHNIS
+
+
+# Dieselbe enge Liste wie MESS_BEFEHL_ERLAUBT in wb_autoresearch.py -- bewusst
+# kopiert, nicht importiert (Auftrag 01.09.2026: keine gemeinsame Bibliothek
+# der beiden Laeufer in diesem Umbau). Ein projekteigenes Skript geht immer,
+# siehe _unter_projekt -- diese Pruefung gilt nur fuer befehl[0] selbst, nie
+# fuer die folgenden Argumente (Skriptpfade), die frei liegen duerfen.
+BEFEHL_ERLAUBT = {"uv", "python3", "python"}
+
+
+def _befehl_pruefen(befehl, feldname: str, projekt: Path) -> list[str]:
+    """Sinngemaess uebernommen aus wb_autoresearch.py, vertrag_laden()'s
+    mess_befehl-Pruefung -- kein Shell-String (das waere eine Hintertuer,
+    siehe dortiger Befund vom 01.09.2026 mit echter Ausfuehrung belegt), und
+    befehl[0] muss ein bekanntes Programm sein oder unter dem
+    Projektverzeichnis liegen."""
+    if not isinstance(befehl, list) or not befehl or not all(isinstance(t, str) for t in befehl):
+        raise ValueError(f"{feldname} muss eine nicht-leere Liste von Zeichenketten sein "
+                          f"(kein Shell-String -- das waere eine Hintertuer)")
+    erstes = befehl[0]
+    if Path(erstes).name not in BEFEHL_ERLAUBT and not _unter_projekt(erstes, projekt):
+        raise ValueError(
+            f"{feldname}[0]={erstes!r} ist weder ein bekanntes Programm "
+            f"({', '.join(sorted(BEFEHL_ERLAUBT))}) noch liegt es unter dem Projektverzeichnis")
+    return befehl
+
+
+# ──────────────────────────────────────────── Modellverzeichnis (Befund B3)
+
+def modell_verzeichnis_pfad() -> Path:
+    """Wo die Modell-Registry der Werkbank liegt. `WB_MODELS_FILE` ist der
+    Schalter, den die uebrigen Werkzeuge des Hauses schon benutzen
+    (wb-harness-config:70, wb-harness-probe:894) -- kein zweiter, eigener
+    Umweg fuer denselben Zweck."""
+    aus_umgebung = os.environ.get("WB_MODELS_FILE")
+    if aus_umgebung:
+        return Path(aus_umgebung)
+    return Path.home() / ".claude/workbench/models.json"
+
+
+_VERZEICHNIS_ZWISCHENSPEICHER: dict[str, dict[str, str]] = {}
+
+
+def modell_verzeichnis(pfad: Path | None = None) -> dict[str, str]:
+    """Name oder Alias -> kanonische Modell-Kennung, aus der Registry gelesen.
+
+    Ohne dieses Verzeichnis kann der Laeufer zwei Pruefer nicht auseinander
+    halten: `opus` und `opus5` waeren zwei verschiedene Modelle, obwohl das
+    eine nur ein Tippfehler ist (Befund B3, dritter Teil). Ein Name, der sich
+    nicht aufloesen laesst, faellt darum auf, statt durchzugehen."""
+    if pfad is None:
+        pfad = modell_verzeichnis_pfad()
+    schluessel = str(pfad)
+    if schluessel in _VERZEICHNIS_ZWISCHENSPEICHER:
+        return _VERZEICHNIS_ZWISCHENSPEICHER[schluessel]
+    if not pfad.exists():
+        raise ValueError(
+            f"Modellverzeichnis {pfad} fehlt -- ohne die Registry kann der Laeufer zwei "
+            f"Pruefer nicht unterscheiden. Anlegen (shell/models.default.json nach "
+            f"~/.claude/workbench/models.json) oder WB_MODELS_FILE auf eine Registry zeigen "
+            f"lassen.")
+    try:
+        roh = json.loads(pfad.read_text(encoding="utf-8"))
+        eintraege = roh["models"]
+    except (json.JSONDecodeError, KeyError, TypeError, OSError) as fehler:
+        raise ValueError(f"Modellverzeichnis {pfad} laesst sich nicht lesen: {fehler}") from None
+    verzeichnis: dict[str, str] = {}
+    for eintrag in eintraege:
+        if not isinstance(eintrag, dict) or not eintrag.get("id"):
+            continue
+        kennung = str(eintrag["id"])
+        verzeichnis[kennung.lower()] = kennung
+        if eintrag.get("alias"):
+            verzeichnis[str(eintrag["alias"]).lower()] = kennung
+    if not verzeichnis:
+        raise ValueError(f"Modellverzeichnis {pfad} enthaelt kein einziges Modell")
+    _VERZEICHNIS_ZWISCHENSPEICHER[schluessel] = verzeichnis
+    return verzeichnis
+
+
+def modell_kurznamen(verzeichnis: dict[str, str]) -> list[str]:
+    """Die Kurznamen der Registry -- jeder Eintrag, dessen Schluessel nicht
+    seine eigene Kennung ist, ist ein Alias. Das sind die Namen, die ein
+    Mensch in einen Vertrag schreibt (`qwen38`, `ornith`), waehrend die
+    kanonischen Kennungen (`qwen38-27b`) in die Meldungen gehoeren."""
+    return sorted({k for k, v in verzeichnis.items() if k != v.lower()})
+
+
+def ausweg_text(verzeichnis: dict[str, str]) -> str:
+    """Der Weg nach vorn, den JEDE Ablehnung wegen Modell- oder Rollengleichheit
+    mittragen muss. Eine Sperre ohne Ausweg schickt den naechsten Agenten ins
+    Raten oder in die Umgehung -- und die Umgehung ist genau das, was Befund B3
+    abgestellt hat.
+
+    Der zweite Satz ist der wichtigere: eine Kette braucht nicht zwei Agenten.
+    Pruefcode besetzt weder ein Modell noch eine Rolle, also erfuellt ein
+    Erbauer plus Stufen vom typ 'befehl' die Bedingung auch dann, wenn die
+    Maschine nur ein einziges Modell anbietet."""
+    kurz = modell_kurznamen(verzeichnis)
+    kennungen = len(set(verzeichnis.values()))
+    angebot = (", ".join(kurz) if kurz else "keine Kurznamen vergeben")
+    return (f"Weg nach vorn: entweder eine andere Kennung waehlen -- auf dieser Maschine "
+            f"stehen {angebot} zur Wahl ({kennungen} Kennungen insgesamt, vollstaendig mit "
+            f"'wb-state models table') -- oder die Stufe als Pruefcode fuehren (typ='befehl'): "
+            f"Code besetzt kein Modell und keine Rolle, ein Erbauer plus Pruefcode erfuellt die "
+            f"Bedingung also auch mit einem einzigen Modell.")
+
+
+def modell_aufloesen(name: str, verzeichnis: dict[str, str], was: str) -> str:
+    """Einen geschriebenen Modellnamen auf seine kanonische Kennung bringen.
+    Unbekannt heisst abgelehnt -- ein Modell, das es nicht gibt, kann keine
+    zweite, unabhaengige Stimme sein."""
+    kanonisch = verzeichnis.get(str(name).strip().lower())
+    if kanonisch is None:
+        raise ValueError(
+            f"{was}: {name!r} steht in keinem Modellverzeichnis "
+            f"({modell_verzeichnis_pfad()}) -- ein Tippfehler wuerde sonst als zweiter, "
+            f"unabhaengiger Pruefer durchgehen. Kurznamen auf dieser Maschine: "
+            f"{', '.join(modell_kurznamen(verzeichnis)) or 'keine'}; vollstaendig mit "
+            f"'wb-state models table'")
+    return kanonisch
+
+
+def modell_aus_befehl(befehl: list[str], verzeichnis: dict[str, str], was: str) -> str:
+    """Das Modell einer Agenten-Rolle AUS dem Befehl lesen, statt es daneben
+    zu glauben -- der Kern von Befund B3 (Gegenpruefung 01.09.2026) und die
+    Auflage der Spec ('Der Laeufer muss das Modell selbst waehlen und den
+    Aufruf selbst bauen, statt eine Angabe im Vertrag zu glauben',
+    SPEC-PRUEFSCHLEIFE.md, 'Der Balken, der im Geruest fehlt').
+
+    Genau EIN Wort des Befehls muss ein bekanntes Modell benennen. Keines
+    heisst: der Aufruf sagt nicht, wer urteilt, und zwei Stufen mit demselben
+    Befehl waeren derselbe Pruefer unter zwei Namen. Mehrere heissen: der
+    Aufruf ist mehrdeutig.
+
+    WAS DIESE PRUEFUNG NICHT PRUEFT (Regel 1 der Spec, auch fuer die
+    Pruefungen des Laeufers selbst): ob das aufgerufene Programm das Modell,
+    das in seinem Aufruf steht, tatsaechlich benutzt. Weiter kommt der Laeufer
+    von aussen nicht -- die Gegenprobe dazu ist die Pflichtangabe `modell` in
+    der Antwort einer agent-Stufe, siehe stufe_pruefen_agent()."""
+    gefunden = []
+    for wort in befehl:
+        kanonisch = verzeichnis.get(str(wort).strip().lower())
+        if kanonisch is not None and kanonisch not in gefunden:
+            gefunden.append(kanonisch)
+    if not gefunden:
+        raise ValueError(
+            f"{was}: der Befehl {befehl!r} nennt kein bekanntes Modell. Das Modell gehoert IN "
+            f"den Aufruf (z. B. [..., '--modell', 'ornith']), nicht daneben -- sonst fuehren "
+            f"zwei Stufen mit verschiedenen Etiketten dieselbe Zeile aus (Befund B3)")
+    if len(gefunden) > 1:
+        raise ValueError(
+            f"{was}: der Befehl {befehl!r} nennt mehrere Modelle ({', '.join(gefunden)}) -- "
+            f"eindeutig machen, sonst weiss der Laeufer nicht, wer urteilt")
+    return gefunden[0]
+
+
+def rolle_modell_pruefen(befehl: list[str], etikett: str, verzeichnis: dict[str, str],
+                          was: str) -> str:
+    """Die kanonische Kennung einer Agenten-Rolle: aus dem Befehl gelesen, mit
+    dem Etikett im Vertrag abgeglichen. Das Etikett bleibt im Vertrag stehen,
+    weil ein Mensch ihn liest -- geglaubt wird es nicht mehr."""
+    # Erst das Etikett aufloesen, dann den Befehl: steht in beiden derselbe
+    # Tippfehler, ist "der Name gibt es nicht" die Diagnose, die weiterhilft --
+    # "der Befehl nennt kein Modell" waere richtig und nutzlos.
+    aus_etikett = modell_aufloesen(etikett, verzeichnis, f"{was}: modell")
+    aus_befehl = modell_aus_befehl(befehl, verzeichnis, was)
+    if aus_befehl != aus_etikett:
+        raise ValueError(
+            f"{was}: das Etikett modell={etikett!r} ({aus_etikett}) widerspricht dem Befehl, "
+            f"der {aus_befehl} aufruft -- der Befehl gilt, das Etikett muss zu ihm passen")
+    return aus_befehl
+
+
+@dataclass
+class Stufe:
+    """Eine Pruefstufe. `typ` entscheidet die Ausfuehrung:
+
+    'befehl' (Stufe 1 formal, Stufe 2 ausfuehrbar): `befehl` laeuft direkt im
+        Projektverzeichnis, mit Zeitgrenze, Ergebnis bestanden/gefallen aus
+        dem Exit-Code.
+    'agent' (Stufe 3 Eigenschaften, Stufe 4 Urteil -- die Schnittstelle aus
+        dem Auftrag, mit lauffaehiger Minimalfassung): `befehl` bekommt den
+        Pfad einer erzeugten Auftragsdatei als LETZTES Argument angehaengt
+        (nie als Kommandozeilenargument mit eigenem Inhalt -- Backticks durch
+        eine Shell-Ebene sind im Haus ein bekannter Fehler) und muss auf
+        stdout {"bestanden": bool, "befund": str} als JSON liefern.
+    """
+    name: str
+    typ: str
+    was_nicht_prueft: str
+    befehl: list[str]
+    frist_sekunden: int
+    modell: str | None = None
+    rolle: str | None = None
+    maschine: str = "mac"
+    # Aus dem Befehl gelesen, nicht aus `modell` uebernommen -- nur dieses Feld
+    # wird verglichen (Befund B3).
+    modell_kanonisch: str | None = None
+
+
+@dataclass
+class Erbauer:
+    modell: str
+    rolle: str
+    maschine: str
+    befehl: list[str]
+    frist_sekunden: int
+    modell_kanonisch: str | None = None
+
+
+@dataclass
+class Vertrag:
+    ziel: str
+    fertig_wenn: str
+    bauauftrag_datei: Path
+    bauauftrag_text: str
+    dateien: list[str]
+    runden_maximal: int
+    stillstand_abbruch: int
+    erbauer: Erbauer
+    stufen: list[Stufe]
+    # Das beim Laden benutzte Modellverzeichnis -- die Antwort einer agent-Stufe
+    # wird damit gegengeprueft (stufe_pruefen_agent).
+    verzeichnis: dict[str, str]
+
+
+def pruefer_kollision(stufen: list[Stufe], verzeichnis: dict[str, str] | None = None) -> str | None:
+    """Bedingung 1 aus dem Auftrag (01.09.2026): zwei Pruefstufen muessen sich
+    im Modell UND in der Rolle unterscheiden. Begruendung
+    (SPEC-PRUEFSCHLEIFE.md, Stufe 4): ein Panel gleichartiger Pruefer faellt 8
+    bis 22 Prozentpunkte hinter unabhaengige Stimmen zurueck, und der beste
+    Einzelpruefer schlaegt das ganze Panel -- korrelierte Fehler, am
+    staerksten bei den staerksten Modellen.
+
+    VERSCHAERFT am 01.09.2026 (Befund B3, erster Teil). Vorher galt die
+    Ablehnung nur, wenn Modell UND Rolle gleich waren; damit war jede
+    Modell-Doppelung erlaubt, solange die Rollennamen sich unterschieden. Die
+    Spec verlangt das Gegenteil: 'Anderes Modell UND andere Rolle. Reine
+    Modellvielfalt reicht nicht.' -- also muss BEIDES verschieden sein, und
+    schon EINE Gleichheit ist die Ablehnung. Verglichen wird die kanonische
+    Kennung aus dem Befehl, nicht das Etikett.
+
+    Folge fuer den Zuschnitt einer Kette: jedes Modell besetzt hoechstens eine
+    Rolle. Im Haus (qwen38, ornith) heisst das eine bauende und eine
+    urteilende Rolle; eine zweite Agenten-Stufe braucht ein drittes Modell
+    einer anderen Familie.
+
+    `verzeichnis` dient nur der Meldung: mit ihm traegt die Ablehnung den
+    Ausweg (ausweg_text), ohne es bleibt sie bei der Begruendung."""
+    ausweg = f" {ausweg_text(verzeichnis)}" if verzeichnis else ""
+    nach_modell: dict[str, str] = {}
+    nach_rolle: dict[str, str] = {}
+    for s in stufen:
+        if s.typ != "agent":
+            continue
+        if s.modell_kanonisch in nach_modell:
+            return (f"Stufen {nach_modell[s.modell_kanonisch]!r} und {s.name!r} laufen beide "
+                     f"auf dem Modell {s.modell_kanonisch!r} -- ein Panel gleichartiger Pruefer "
+                     f"ist schlechter als der beste einzelne (SPEC-PRUEFSCHLEIFE.md, Stufe 4)."
+                     f"{ausweg}")
+        if s.rolle in nach_rolle:
+            return (f"Stufen {nach_rolle[s.rolle]!r} und {s.name!r} haben beide die Rolle "
+                     f"{s.rolle!r} -- ein Panel gleichartiger Pruefer ist schlechter als der "
+                     f"beste einzelne; die Spec verlangt anderes Modell UND andere Rolle "
+                     f"(SPEC-PRUEFSCHLEIFE.md, Stufe 4).{ausweg}")
+        nach_modell[s.modell_kanonisch] = s.name
+        nach_rolle[s.rolle] = s.name
+    return None
+
+
+def erbauer_prueft_nicht_selbst(erbauer: Erbauer, stufen: list[Stufe],
+                                 verzeichnis: dict[str, str] | None = None) -> str | None:
+    """Bedingung 2 aus dem Auftrag (01.09.2026, Regel 4 der Spec): 'Wer
+    prueft, baut nicht.' Keine Pruefstufe darf das Modell oder die Rolle des
+    Erbauers tragen.
+
+    VERSCHAERFT am 01.09.2026 (Befund B3): vorher musste beides zugleich
+    gleich sein, und genau diese Luecke nutzte die ausgelieferte Vorlage
+    selbst -- Erbauer qwen38/erbauer, erste Pruefstufe
+    qwen38/pruefer-eigenschaften. Dasselbe Modell baute und beurteilte sich,
+    und der Laeufer nahm den Vertrag an. Die Spec sagt dazu 'ein Modell, das
+    seine eigene Arbeit bewertet, bewertet sich' -- das trifft das Modell,
+    nicht den Rollennamen daneben.
+
+    `verzeichnis` dient nur der Meldung, siehe pruefer_kollision."""
+    ausweg = f" {ausweg_text(verzeichnis)}" if verzeichnis else ""
+    for s in stufen:
+        if s.typ != "agent":
+            continue
+        if s.modell_kanonisch == erbauer.modell_kanonisch:
+            return (f"Stufe {s.name!r} laeuft auf demselben Modell wie der Erbauer "
+                     f"({erbauer.modell_kanonisch!r}) -- wer prueft, baut nicht "
+                     f"(SPEC-PRUEFSCHLEIFE.md, Regel 4).{ausweg}")
+        if s.rolle == erbauer.rolle:
+            return (f"Stufe {s.name!r} hat dieselbe Rolle wie der Erbauer "
+                     f"({erbauer.rolle!r}) -- wer prueft, baut nicht "
+                     f"(SPEC-PRUEFSCHLEIFE.md, Regel 4).{ausweg}")
+    return None
+
+
+def _stufe_aus_roh(roh: dict, index: int, projekt: Path, verzeichnis: dict[str, str]) -> Stufe:
+    for pflicht in ("name", "typ", "was_nicht_prueft", "befehl"):
+        if pflicht not in roh:
+            raise ValueError(f"stufen[{index}] fehlt das Feld {pflicht!r}")
+    name = str(roh["name"]).strip()
+    if not name:
+        raise ValueError(f"stufen[{index}]: name darf nicht leer sein")
+    typ = roh["typ"]
+    if typ not in ("befehl", "agent"):
+        raise ValueError(f"stufen[{index}] ({name}): typ muss 'befehl' oder 'agent' sein, nicht {typ!r}")
+    was_nicht_prueft = str(roh["was_nicht_prueft"]).strip()
+    if not was_nicht_prueft:
+        # Regel 1 der Spec: "Jede Stufe sagt, was sie NICHT prueft." -- ohne
+        # benannte Blindstelle wird eine Pruefung fuer allwissend gehalten.
+        raise ValueError(f"stufen[{index}] ({name}): was_nicht_prueft darf nicht leer sein "
+                          f"(Regel 1 der Spec)")
+    befehl = _befehl_pruefen(roh["befehl"], f"stufen[{index}].befehl", projekt)
+    frist = int(roh.get("frist_sekunden", 300))
+    maschine = roh.get("maschine", "mac")
+    if maschine not in ("mac", "peer"):
+        raise ValueError(f"stufen[{index}] ({name}): maschine muss 'mac' oder 'peer' sein, "
+                          f"nicht {maschine!r}")
+    modell = rolle = modell_kanonisch = None
+    if typ == "agent":
+        for pflicht in ("modell", "rolle"):
+            if not roh.get(pflicht):
+                raise ValueError(f"stufen[{index}] ({name}): agent-Stufe braucht {pflicht!r}")
+        modell, rolle = str(roh["modell"]), str(roh["rolle"])
+        modell_kanonisch = rolle_modell_pruefen(befehl, modell, verzeichnis,
+                                                 f"stufen[{index}] ({name})")
+    return Stufe(name=name, typ=typ, was_nicht_prueft=was_nicht_prueft, befehl=befehl,
+                 frist_sekunden=frist, modell=modell, rolle=rolle, maschine=maschine,
+                 modell_kanonisch=modell_kanonisch)
+
+
+def vertrag_laden(projekt: Path, pfad: Path | None = None) -> Vertrag:
+    """Den Projekt-Vertrag laden. Kein Traceback bei einem fehlenden oder
+    kaputten Vertrag -- der Aufrufer (main()) faengt ValueError/OSError ab und
+    sagt in einer Zeile, was fehlt (dieselbe Lehre wie bei autoresearch,
+    01.09.2026: 'Der Laeufer bricht nie mit einer Ausnahme ab.')."""
+    if pfad is None:
+        pfad = projekt / VERTRAG_DATEI_NAME
+    if not pfad.exists():
+        raise ValueError(f"{pfad} existiert nicht -- anlegen mit: "
+                          f"wb-pruefschleife --projekt {projekt} vorlage")
+    pfad = _in_projekt(pfad, projekt, "die Vertragsdatei")
+    roh = json.loads(pfad.read_text(encoding="utf-8"))
+
+    for pflicht in ("ziel", "fertig_wenn", "bauauftrag_datei", "dateien", "erbauer", "stufen"):
+        if pflicht not in roh:
+            raise ValueError(f"{pfad}: Pflichtfeld {pflicht!r} fehlt")
+
+    ziel = str(roh["ziel"]).strip()
+    fertig_wenn = str(roh["fertig_wenn"]).strip()
+    if not ziel or not fertig_wenn:
+        raise ValueError(f"{pfad}: ziel und fertig_wenn duerfen nicht leer sein")
+
+    bauauftrag_datei = _in_projekt(projekt / roh["bauauftrag_datei"], projekt, "bauauftrag_datei")
+    if not bauauftrag_datei.exists():
+        raise ValueError(f"bauauftrag_datei {bauauftrag_datei} existiert nicht")
+    bauauftrag_text = bauauftrag_datei.read_text(encoding="utf-8")
+
+    dateien = roh["dateien"]
+    if not isinstance(dateien, list) or not dateien or not all(isinstance(d, str) and d for d in dateien):
+        raise ValueError("dateien muss eine nicht-leere Liste nichtleerer Pfade sein")
+    for d in dateien:
+        if Path(d).is_absolute() or ".." in Path(d).parts:
+            raise ValueError(f"dateien: {d!r} muss ein relativer Pfad innerhalb des Projekts sein")
+
+    verzeichnis = modell_verzeichnis()
+
+    erb = roh["erbauer"]
+    for pflicht in ("modell", "rolle", "maschine", "befehl"):
+        if pflicht not in erb:
+            raise ValueError(f"erbauer: Pflichtfeld {pflicht!r} fehlt")
+    if erb["maschine"] not in ("mac", "peer"):
+        raise ValueError(f"erbauer.maschine muss 'mac' oder 'peer' sein, nicht {erb['maschine']!r}")
+    erbauer_befehl = _befehl_pruefen(erb["befehl"], "erbauer.befehl", projekt)
+    erbauer = Erbauer(modell=str(erb["modell"]), rolle=str(erb["rolle"]), maschine=erb["maschine"],
+                       befehl=erbauer_befehl,
+                       frist_sekunden=int(erb.get("frist_sekunden", 900)),
+                       modell_kanonisch=rolle_modell_pruefen(erbauer_befehl, str(erb["modell"]),
+                                                              verzeichnis, "erbauer"))
+
+    roh_stufen = roh["stufen"]
+    if not isinstance(roh_stufen, list) or not roh_stufen:
+        raise ValueError("stufen muss eine nicht-leere Liste sein")
+    stufen = [_stufe_aus_roh(s, i, projekt, verzeichnis) for i, s in enumerate(roh_stufen)]
+
+    kollision = pruefer_kollision(stufen, verzeichnis)
+    if kollision:
+        raise ValueError(kollision)
+    selbstpruefung = erbauer_prueft_nicht_selbst(erbauer, stufen, verzeichnis)
+    if selbstpruefung:
+        raise ValueError(selbstpruefung)
+
+    return Vertrag(ziel=ziel, fertig_wenn=fertig_wenn, bauauftrag_datei=bauauftrag_datei,
+                    bauauftrag_text=bauauftrag_text, dateien=dateien,
+                    runden_maximal=int(roh.get("runden_maximal", 20)),
+                    stillstand_abbruch=int(roh.get("stillstand_abbruch", 5)),
+                    erbauer=erbauer, stufen=stufen, verzeichnis=verzeichnis)
+
+
+# ──────────────────────────────────────────────────────────── Sechs-Teile-Auftrag
+
+def auftrag_text(vertrag: Vertrag, rolle: str, *, stufe: Stufe | None = None,
+                  befund_letzte_runde: str | None = None) -> str:
+    """Baut den Sechs-Teile-Auftrag (SPEC-PRUEFSCHLEIFE.md, 'Wie eine
+    Agenten-Anweisung aussehen muss') fuer den Erbauer (`rolle="erbauer"`)
+    oder eine Pruefstufe (`rolle="pruefer"`, `stufe` gesetzt).
+
+    Regel 3 der Spec ('Der Pruefer sieht nicht, wer gebaut hat') gilt hier
+    STRUKTURELL: das Modell/die Rolle des Erbauers taucht im Pruefer-Text an
+    keiner Stelle auf. Die zweite Haelfte derselben Regel ('der Erbauer sieht
+    die Pruefkriterien vorher') gilt ebenso: Teil 2 zeigt IMMER alle Stufen im
+    Wortlaut, fuer beide Rollen gleich.
+    """
+    ist_pruefer = rolle == "pruefer"
+    if ist_pruefer and stufe is None:
+        raise ValueError("rolle='pruefer' braucht eine stufe")
+    zeilen: list[str] = []
+
+    if ist_pruefer:
+        zeilen += [f"# Auftrag: Stufe „{stufe.name}“ pruefen", "",
+                   "## 1. Was zu tun ist",
+                   f"Deine Rolle in dieser Runde: {stufe.rolle}.",
+                   f"Pruefe, ob das folgende Ergebnis das Ziel erreicht: {vertrag.ziel}",
+                   "Suche gezielt nach Fehlern und widerlege -- bewerte nicht mit einer Note. "
+                   "Die Frage ist nicht „ist das gut“, sondern „was ist daran falsch, und woran "
+                   "zeige ich es“."]
+    else:
+        zeilen += ["# Bauauftrag", "", "## 1. Was zu tun ist", vertrag.ziel]
+
+    if vertrag.bauauftrag_text.strip():
+        zeilen += ["", "### Kontext", vertrag.bauauftrag_text.strip()]
+
+    zeilen += ["", "## 2. Woran gemessen wird"]
+    for i, s in enumerate(vertrag.stufen, 1):
+        zeilen.append(f"  [{i}] {s.name}: prueft NICHT: {s.was_nicht_prueft}")
+    if ist_pruefer:
+        zeilen.append(f"Dein Urteil hier gilt fuer GENAU EINE davon: „{stufe.name}“ -- "
+                       f"prueft NICHT: {stufe.was_nicht_prueft}")
+
+    zeilen += ["", "## 3. Wo gearbeitet werden darf",
+               "Nur unter: " + ", ".join(vertrag.dateien)]
+    if ist_pruefer:
+        zeilen.append("Als Pruefer aenderst du nichts -- nur lesen und urteilen.")
+
+    zeilen += ["", "## 4. Was verboten ist",
+               "Etwas ausserhalb der genannten Pfade aendern -- wird automatisch verworfen, "
+               "nicht ermahnt."]
+    if not ist_pruefer:
+        zeilen.append("Die eigene Pruefstufe umgehen, deaktivieren oder gegen sie schreiben, "
+                       "statt sie zu bestehen.")
+
+    zeilen += ["", "## 5. Wie das Ergebnis aussieht"]
+    if ist_pruefer:
+        zeilen += ['Antworte NUR mit JSON, ohne Text davor oder danach:',
+                    '{"bestanden": true|false, "befund": "<was genau, mit Beleg>", '
+                    '"modell": "<das Modell, mit dem du geurteilt hast>"}',
+                    f"Fuer diese Stufe ist {stufe.modell_kanonisch} vorgesehen. Melde, WOMIT du "
+                    f"wirklich geurteilt hast -- ein anderes Modell laesst die Stufe fallen, "
+                    f"statt unbemerkt als zweite Stimme zu zaehlen.",
+                    "Was nicht belegt ist, gehoert in einen eigenen Satz, nicht in die Bewertung."]
+    else:
+        zeilen.append(f"Ergebnis unter den genannten Pfaden ablegen. {vertrag.fertig_wenn}")
+
+    zeilen += ["", "## 6. Was bei Unklarheit gilt",
+               "Entscheiden und die Entscheidung kurz notieren -- nicht fragen, nicht warten."]
+
+    if not ist_pruefer and befund_letzte_runde:
+        zeilen += ["", "## Befund der letzten Runde", befund_letzte_runde]
+
+    return "\n".join(zeilen) + "\n"
+
+
+def json_aus(text: str) -> dict:
+    """Sinngemaess uebernommen aus wb_autoresearch.py, json_aus() -- das erste
+    JSON-Objekt im Text; Modelle schreiben gern etwas davor oder danach."""
+    tiefe = 0
+    beginn = None
+    for i, zeichen in enumerate(text):
+        if zeichen == "{":
+            if tiefe == 0:
+                beginn = i
+            tiefe += 1
+        elif zeichen == "}":
+            tiefe -= 1
+            if tiefe == 0 and beginn is not None:
+                try:
+                    return json.loads(text[beginn:i + 1])
+                except json.JSONDecodeError:
+                    beginn = None
+    raise ValueError("keine JSON-Antwort")
+
+
+# ──────────────────────────────────────────────────────────── Ausfuehrung
+
+def befehl_ausfuehren(befehl: list[str], cwd: Path, frist_sekunden: int):
+    """(returncode, stdout, stderr, dauer_sekunden, frist_gerissen)."""
+    beginn = time.time()
+    try:
+        fertig = subprocess.run(befehl, cwd=cwd, capture_output=True, text=True,
+                                 timeout=frist_sekunden)
+        return (fertig.returncode, fertig.stdout, fertig.stderr,
+                round(time.time() - beginn, 1), False)
+    except subprocess.TimeoutExpired as fehler:
+        return (None, fehler.stdout or "", fehler.stderr or "",
+                round(time.time() - beginn, 1), True)
+    except OSError as fehler:
+        return (None, "", str(fehler), round(time.time() - beginn, 1), False)
+
+
+def agent_befehl_ausfuehren(rolle_konfig, auftrag_pfad: Path, projekt: Path):
+    """Fuehrt einen Agenten-Befehl aus (Erbauer oder eine agent-Pruefstufe).
+    `rolle_konfig` ist ein Erbauer oder eine Stufe -- beide tragen befehl,
+    frist_sekunden, maschine.
+
+    MANTEL-STELLE (Auftrag 01.09.2026, Abschnitt 'Wie es auf beiden Maschinen
+    laeuft'): maschine=='peer' ist nur die SCHNITTSTELLE, kein Fernaufruf --
+    peer baut gerade an der Fernstart-Frage (Pacht statt Vertrauen, ein
+    Mantel mit Ablaufzeit), und deren Ergebnis wird der Weg, ueber den ein
+    echter Fernaufruf spaeter laeuft. Bis der Mantel steht, laeuft JEDER
+    Aufruf hier lokal -- ein Prozess, der auf der anderen Maschine haengen
+    bleibt, weil hier vorgegriffen wurde, ist teurer als eine Woche
+    Wartezeit. Sobald der Mantel existiert, ersetzt genau dieser Zweig den
+    lokalen Aufruf durch den echten Fernaufruf; der Rest des Laeufers bleibt
+    unveraendert.
+    """
+    if rolle_konfig.maschine == "peer":
+        print(f"    (fuer peer vorgesehen -- MANTEL-STELLE noch offen, laeuft lokal)")
+    befehl = list(rolle_konfig.befehl) + [str(auftrag_pfad)]
+    return befehl_ausfuehren(befehl, cwd=projekt, frist_sekunden=rolle_konfig.frist_sekunden)
+
+
+def stufe_pruefen_befehl(stufe: Stufe, projekt: Path) -> dict:
+    rc, out, err, dauer, timeout = befehl_ausfuehren(stufe.befehl, projekt, stufe.frist_sekunden)
+    ausgabe = (out + ("\n" + err if err else "")).strip()
+    if timeout:
+        ausgabe = f"Frist gerissen nach {stufe.frist_sekunden}s\n{ausgabe}"
+    return {"name": stufe.name, "typ": "befehl", "bestanden": (rc == 0) and not timeout,
+            "ausgabe": ausgabe[-4000:], "dauer_sekunden": dauer,
+            "was_nicht_prueft": stufe.was_nicht_prueft}
+
+
+def stufe_pruefen_agent(vertrag: Vertrag, stufe: Stufe, projekt: Path, runde_nummer: int,
+                         auftrag_ordner: Path) -> dict:
+    text = auftrag_text(vertrag, "pruefer", stufe=stufe)
+    pfad = auftrag_ordner / f"runde{runde_nummer}-pruefer-{stufe.name}.md"
+    atomar_schreiben.schreiben(str(pfad), text, modus=0o644)
+    rc, out, err, dauer, timeout = agent_befehl_ausfuehren(stufe, pfad, projekt)
+    basis = {"name": stufe.name, "typ": "agent", "dauer_sekunden": dauer,
+              "was_nicht_prueft": stufe.was_nicht_prueft, "auftrag": str(pfad)}
+    if timeout:
+        return {**basis, "bestanden": False, "ausgabe": f"Frist gerissen nach {stufe.frist_sekunden}s"}
+    if rc != 0:
+        return {**basis, "bestanden": False,
+                "ausgabe": f"Pruefbefehl endete mit {rc}\n{(out + err)[-2000:]}"}
+    try:
+        urteil = json_aus(out)
+        bestanden = bool(urteil["bestanden"])
+        befund = str(urteil.get("befund", ""))[:2000]
+    except (ValueError, KeyError, TypeError):
+        return {**basis, "bestanden": False,
+                "ausgabe": f"Pruefer-Antwort kein gueltiges Urteil-JSON: {out[:500]!r}"}
+    # Die Gegenprobe zu modell_aus_befehl(): dort steht, WELCHES Modell der
+    # Aufruf nennt, hier sagt der Pruefer, mit welchem er geurteilt hat. Ohne
+    # diese Angabe bleibt der Aufruf eine Behauptung -- ein Programm, das
+    # '--modell ornith' bekommt und qwen38 fragt, waere sonst nicht zu
+    # bemerken (Befund B3, zweiter Teil).
+    gemeldet = urteil.get("modell")
+    if not gemeldet:
+        return {**basis, "bestanden": False,
+                "ausgabe": f"Pruefer-Antwort nennt kein Modell -- fuer diese Stufe ist "
+                            f"{stufe.modell_kanonisch} vorgesehen, und wer urteilt, sagt womit "
+                            f"(SPEC-PRUEFSCHLEIFE.md, Regel 4)"}
+    try:
+        gemeldet_kanonisch = modell_aufloesen(gemeldet, vertrag.verzeichnis,
+                                               f"Stufe {stufe.name!r}: gemeldetes Modell")
+    except ValueError as fehler:
+        return {**basis, "bestanden": False, "ausgabe": str(fehler)}
+    if gemeldet_kanonisch != stufe.modell_kanonisch:
+        return {**basis, "bestanden": False,
+                "ausgabe": f"Pruefer hat mit {gemeldet_kanonisch} geurteilt, vorgesehen war "
+                            f"{stufe.modell_kanonisch} -- die Stufe zaehlt nicht als zweite, "
+                            f"unabhaengige Stimme (SPEC-PRUEFSCHLEIFE.md, Stufe 4)"}
+    return {**basis, "bestanden": bestanden, "ausgabe": befund}
+
+
+def erbauer_ausfuehren(vertrag: Vertrag, projekt: Path, runde_nummer: int,
+                        befund_letzte_runde: str | None, auftrag_ordner: Path):
+    text = auftrag_text(vertrag, "erbauer", befund_letzte_runde=befund_letzte_runde)
+    pfad = auftrag_ordner / f"runde{runde_nummer}-erbauer.md"
+    atomar_schreiben.schreiben(str(pfad), text, modus=0o644)
+    rc, out, err, dauer, timeout = agent_befehl_ausfuehren(vertrag.erbauer, pfad, projekt)
+    erfolg = (rc == 0) and not timeout
+    protokoll = {"auftrag": str(pfad), "rc": rc, "ausgabe": (out + err)[-4000:],
+                 "dauer_sekunden": dauer, "frist_gerissen": timeout}
+    return erfolg, protokoll
+
+
+# ──────────────────────────────────────────────────────────── git
+
+def git(projekt: Path, *args, pruefen: bool = True) -> str:
+    """`.rstrip("\\n")`, NICHT `.strip()`: bei `git status --porcelain` ist ein
+    fuehrendes Leerzeichen Teil des Statuscodes (' M datei' heisst etwas
+    anderes als 'M  datei') -- ein `.strip()` frisst genau dieses Zeichen von
+    der JEWEILS ERSTEN Zeile der Ausgabe und verschiebt sie um eins (Befund
+    beim eigenen Testbau, 01.09.2026, per echtem Lauf belegt: 'kern.py'
+    wurde als 'ern.py' gemeldet)."""
+    fertig = subprocess.run(["git", "-C", str(projekt), *args], capture_output=True, text=True)
+    if pruefen and fertig.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {fertig.stderr.strip()}")
+    return fertig.stdout.rstrip("\n")
+
+
+def _git_bereit(projekt: Path) -> str | None:
+    if not (projekt / ".git").exists():
+        return f"{projekt} ist kein git-Repo -- erst: git -C {projekt} init"
+    fertig = subprocess.run(["git", "-C", str(projekt), "rev-parse", "HEAD"],
+                             capture_output=True, text=True)
+    if fertig.returncode != 0:
+        return f"{projekt} hat noch keinen Commit -- erst einen Startzustand committen"
+    return None
+
+
+def zuruecknehmen(projekt: Path, vorher: str, dateien: list[str]) -> None:
+    """Alles unter den erlaubten Pfaden auf den Stand vor der Runde zurueck --
+    auch neu angelegte Dateien (git clean), nicht nur veraenderte. Dieselbe
+    Idee wie wb_autoresearch.py's zuruecknehmen(), hier ueber eine LISTE von
+    Pfaden statt einer einzelnen Zieldatei, weil ein Bauauftrag hier mehrere
+    Dateien anfassen darf."""
+    for pfad in dateien:
+        git(projekt, "checkout", vorher, "--", pfad, pruefen=False)
+        git(projekt, "reset", "-q", "--", pfad, pruefen=False)
+    git(projekt, "clean", "-fdq", "--", *dateien, pruefen=False)
+
+
+def pfad_verstoss(projekt: Path, dateien: list[str]) -> list[str]:
+    """Was der Erbauer ausserhalb der erlaubten Pfade veraendert hat --
+    'dateien exklusiv, alles ausserhalb ist tabu' wird hier GEPRUEFT, nicht
+    nur im Auftragstext behauptet."""
+    status = git(projekt, "status", "--porcelain=v1", "--untracked-files=all")
+    erlaubte = [Path(d) for d in dateien]
+    verletzt = []
+    for zeile in status.splitlines():
+        if not zeile.strip():
+            continue
+        rest = zeile[3:]
+        if " -> " in rest:
+            rest = rest.split(" -> ", 1)[1]
+        rest = rest.strip().strip('"')
+        if rest.startswith(f"{ARBEITSVERZEICHNIS_NAME}/"):
+            continue
+        kandidat = Path(rest)
+        if not any(kandidat == e or e in kandidat.parents for e in erlaubte):
+            verletzt.append(rest)
+    return verletzt
+
+
+# ──────────────────────────────────────────────────────────── Zustand
+
+def zustand_lesen(projekt: Path) -> dict:
+    pfad = projekt / ZUSTAND_DATEI
+    if not pfad.exists():
+        return {"laufend": False, "naechste_runde": 1, "letzter_befund": None,
+                "stillstand_folge": 0, "stufen_ergebnisse": []}
+    return json.loads(pfad.read_text(encoding="utf-8"))
+
+
+def zustand_schreiben(projekt: Path, zustand: dict) -> None:
+    pfad = projekt / ZUSTAND_DATEI
+    pfad.parent.mkdir(parents=True, exist_ok=True)
+    atomar_schreiben.schreiben(str(pfad), json.dumps(zustand, indent=2, ensure_ascii=False) + "\n",
+                                modus=0o644)
+
+
+def _tsv_anhaengen(projekt: Path, runde_nummer: int, erbauer_kurz: str, stufen_kompakt: str,
+                    entscheidung: str, dauer: float, kosten: float = 0.0) -> None:
+    pfad = projekt / RUNDEN_TSV
+    if not pfad.exists():
+        pfad.parent.mkdir(parents=True, exist_ok=True)
+        pfad.write_text("runde\terbauer\tstufen\tentscheidung\tdauer_sekunden\tkosten\n",
+                         encoding="utf-8")
+    with pfad.open("a", encoding="utf-8") as f:
+        f.write(f"{runde_nummer}\t{erbauer_kurz}\t{stufen_kompakt}\t{entscheidung}\t"
+                f"{dauer:.1f}\t{kosten:.2f}\n")
+
+
+def _jsonl_anhaengen(projekt: Path, zeile: dict) -> None:
+    pfad = projekt / RUNDEN_JSONL
+    pfad.parent.mkdir(parents=True, exist_ok=True)
+    with pfad.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(zeile, ensure_ascii=False) + "\n")
+
+
+def _runde_abschliessen(projekt: Path, vertrag: Vertrag, runde_nummer: int, entscheidung: str,
+                         stufen_ergebnisse: list[dict], befund: str,
+                         erbauer_protokoll: dict | None = None) -> None:
+    dauer = sum(s.get("dauer_sekunden", 0.0) for s in stufen_ergebnisse)
+    stufen_kompakt = " ".join(f"{s['name']}:{'ok' if s['bestanden'] else 'X'}"
+                               for s in stufen_ergebnisse)
+    erbauer_kurz = f"{vertrag.erbauer.modell}/{vertrag.erbauer.rolle}"
+
+    _jsonl_anhaengen(projekt, {
+        "uhr": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "runde": runde_nummer, "erbauer": erbauer_kurz, "entscheidung": entscheidung,
+        "befund": befund, "stufen": stufen_ergebnisse, "erbauer_protokoll": erbauer_protokoll})
+    _tsv_anhaengen(projekt, runde_nummer, erbauer_kurz, stufen_kompakt, entscheidung, dauer)
+
+    # Der Ruhezustand wird VOR dem Commit geschrieben, nicht danach -- sonst
+    # bleibt stand.json nach JEDER Runde uncommittet liegen (Befund beim
+    # eigenen Testbau, 01.09.2026, per echtem Lauf belegt: `git status`
+    # zeigte stand.json als veraendert, obwohl die Runde laengst committet war).
+    stillstand_vorher = zustand_lesen(projekt).get("stillstand_folge", 0)
+    stillstand = 0 if entscheidung == "behalten" else stillstand_vorher + 1
+    zustand_schreiben(projekt, {"laufend": False, "runde": runde_nummer,
+                                 "naechste_runde": runde_nummer + 1, "letzter_befund": befund,
+                                 "stillstand_folge": stillstand, "stufen_ergebnisse": []})
+
+    git(projekt, "add", ARBEITSVERZEICHNIS_NAME, pruefen=False)
+    if entscheidung == "behalten":
+        for pfad in vertrag.dateien:
+            git(projekt, "add", pfad, pruefen=False)
+        git(projekt, "commit", "-q", "-m", f"pruefschleife: Runde {runde_nummer} behalten",
+            pruefen=False)
+    else:
+        git(projekt, "commit", "-q", "-m",
+            f"pruefschleife: Runde {runde_nummer} verworfen ({befund[:120]})", pruefen=False)
+
+
+def runde_ablaufen(vertrag: Vertrag, projekt: Path) -> int:
+    """Eine Runde: Bauauftrag stellen (oder eine begonnene fortsetzen), die
+    Stufen der Reihe nach, bei der ersten gefallenen Stufe abbrechen und den
+    Befund festhalten, sonst behalten und committen. Nach JEDER Stufe wird
+    der Zustand geschrieben -- das ist die Auflage, die jeden Abbruch
+    uebersteht (Auftrag 01.09.2026, Punkt 4)."""
+    auftrag_ordner = projekt / AUFTRAG_ORDNER_NAME
+    auftrag_ordner.mkdir(parents=True, exist_ok=True)
+    zustand = zustand_lesen(projekt)
+
+    if zustand.get("laufend"):
+        runde_nummer = zustand["runde"]
+        vorher_commit = zustand["vorher_commit"]
+        stufen_ergebnisse = list(zustand.get("stufen_ergebnisse", []))
+        print(f"Runde {runde_nummer} wird fortgesetzt ({len(stufen_ergebnisse)} von "
+              f"{len(vertrag.stufen)} Stufen schon durch).")
+    else:
+        runde_nummer = zustand.get("naechste_runde", 1)
+        if runde_nummer > vertrag.runden_maximal:
+            print(f"Rundenobergrenze erreicht ({vertrag.runden_maximal}).")
+            return 0
+        vorher_commit = git(projekt, "rev-parse", "HEAD")
+        befund_letzte_runde = zustand.get("letzter_befund")
+        erfolg, protokoll = erbauer_ausfuehren(vertrag, projekt, runde_nummer,
+                                                befund_letzte_runde, auftrag_ordner)
+        if not erfolg:
+            zuruecknehmen(projekt, vorher_commit, vertrag.dateien)
+            stufe_erbauer = [{"name": "erbauer", "typ": "agent", "bestanden": False,
+                               "ausgabe": protokoll["ausgabe"], "dauer_sekunden": protokoll["dauer_sekunden"],
+                               "was_nicht_prueft": "alles Inhaltliche -- der Erbauer selbst ist gescheitert"}]
+            _runde_abschliessen(projekt, vertrag, runde_nummer, "abgebrochen", stufe_erbauer,
+                                 f"Erbauer gescheitert (rc={protokoll['rc']})", protokoll)
+            print(f"Runde {runde_nummer}: Erbauer gescheitert -- abgebrochen")
+            return 0
+
+        stufen_ergebnisse = []
+        zustand = {"laufend": True, "runde": runde_nummer, "vorher_commit": vorher_commit,
+                   "erbauer_protokoll": protokoll, "stufen_ergebnisse": stufen_ergebnisse,
+                   "naechste_runde": zustand.get("naechste_runde", 1)}
+        zustand_schreiben(projekt, zustand)
+
+        verstoss = pfad_verstoss(projekt, vertrag.dateien)
+        if verstoss:
+            zuruecknehmen(projekt, vorher_commit, vertrag.dateien)
+            stufe_pfade = [{"name": "pfade", "typ": "wache", "bestanden": False,
+                             "ausgabe": "ausserhalb der erlaubten Pfade veraendert: " + ", ".join(verstoss),
+                             "dauer_sekunden": 0.0, "was_nicht_prueft": "alles ausser den erlaubten Pfaden"}]
+            befund = "Pfadverstoss: " + ", ".join(verstoss)
+            _runde_abschliessen(projekt, vertrag, runde_nummer, "abgebrochen", stufe_pfade, befund)
+            print(f"Runde {runde_nummer}: ausserhalb der erlaubten Pfade veraendert -- "
+                  f"abgebrochen ({', '.join(verstoss)})")
+            return 0
+
+    for stufe in vertrag.stufen[len(stufen_ergebnisse):]:
+        if stufe.typ == "befehl":
+            ergebnis = stufe_pruefen_befehl(stufe, projekt)
+        else:
+            ergebnis = stufe_pruefen_agent(vertrag, stufe, projekt, runde_nummer, auftrag_ordner)
+        stufen_ergebnisse.append(ergebnis)
+        zustand["stufen_ergebnisse"] = stufen_ergebnisse
+        zustand_schreiben(projekt, zustand)
+        print(f"  Stufe {stufe.name}: {'bestanden' if ergebnis['bestanden'] else 'gefallen'}")
+        if not ergebnis["bestanden"]:
+            zuruecknehmen(projekt, vorher_commit, vertrag.dateien)
+            befund = f"Stufe {stufe.name} gefallen: {ergebnis['ausgabe']}"
+            _runde_abschliessen(projekt, vertrag, runde_nummer, "abgebrochen", stufen_ergebnisse,
+                                 befund, zustand.get("erbauer_protokoll"))
+            print(f"Runde {runde_nummer}: abgebrochen bei Stufe {stufe.name}")
+            return 0
+
+    _runde_abschliessen(projekt, vertrag, runde_nummer, "behalten", stufen_ergebnisse, "",
+                         zustand.get("erbauer_protokoll"))
+    print(f"Runde {runde_nummer}: behalten")
+    return 0
+
+
+# ──────────────────────────────────────────────────────────── Befehle
+
+def befehl_lauf(args, projekt: Path, vertrag: Vertrag) -> int:
+    fehlt = _git_bereit(projekt)
+    if fehlt:
+        print(fehlt)
+        return 1
+    return runde_ablaufen(vertrag, projekt)
+
+
+def befehl_schleife(args, projekt: Path, vertrag: Vertrag) -> int:
+    fehlt = _git_bereit(projekt)
+    if fehlt:
+        print(fehlt)
+        return 1
+    for _ in range(vertrag.runden_maximal + 1):
+        zustand = zustand_lesen(projekt)
+        if not zustand.get("laufend"):
+            if zustand.get("naechste_runde", 1) > vertrag.runden_maximal:
+                print(f"Rundenobergrenze erreicht ({vertrag.runden_maximal}).")
+                break
+            if zustand.get("stillstand_folge", 0) >= vertrag.stillstand_abbruch:
+                print(f"Abbruch bei Stillstand: {vertrag.stillstand_abbruch} Runden ohne "
+                      f"'behalten' hintereinander.")
+                break
+        runde_ablaufen(vertrag, projekt)
+    return 0
+
+
+def befehl_fortsetzen(args, projekt: Path, vertrag: Vertrag) -> int:
+    fehlt = _git_bereit(projekt)
+    if fehlt:
+        print(fehlt)
+        return 1
+    zustand = zustand_lesen(projekt)
+    if not zustand.get("laufend"):
+        print("Kein abgebrochener Lauf da -- fuer eine neue Runde: wb-pruefschleife lauf")
+        return 1
+    return runde_ablaufen(vertrag, projekt)
+
+
+def befehl_stand(args, projekt: Path, vertrag: Vertrag) -> int:
+    tsv = projekt / RUNDEN_TSV
+    if not tsv.exists():
+        print("Noch keine Runde gelaufen.")
+        return 0
+    zeilen = tsv.read_text(encoding="utf-8").splitlines()
+    for z in zeilen:
+        print(z)
+    rest = zeilen[1:]
+    behalten = sum(1 for z in rest if z.split("\t")[3] == "behalten")
+    zustand = zustand_lesen(projekt)
+    laufend = ""
+    if zustand.get("laufend"):
+        laufend = (f" (Runde {zustand['runde']} laeuft gerade, "
+                   f"{len(zustand.get('stufen_ergebnisse', []))} von {len(vertrag.stufen)} "
+                   f"Stufen durch)")
+    print(f"\n{len(rest)} Runden, {behalten} behalten.{laufend}")
+    return 0
+
+
+VORLAGE_HINWEISE = {
+    "ziel": "Ein Satz, was gebaut werden soll -- so wie man es einem Menschen sagen wuerde.",
+    "fertig_wenn": "Woran der Abschluss erkannt wird. Die duennste Stelle der Spec (01.09.2026): "
+                   "vorlaeufig Rundenobergrenze + Stillstandsabbruch + ein Mensch, der hinsieht.",
+    "bauauftrag_datei": "Pfad relativ zu diesem Projekt, mit der ausfuehrlichen Aufgabenbeschreibung.",
+    "dateien": "Liste relativer Pfade -- wo der Erbauer schreiben darf, exklusiv. Alles ausserhalb "
+               "wird automatisch verworfen (der Laeufer prueft das, nicht nur die Doku).",
+    "runden_maximal": "Obergrenze an Runden (Vorgabe 20).",
+    "stillstand_abbruch": "Nach so vielen Runden ohne 'behalten' hintereinander bricht die "
+                           "Schleife ab (Vorgabe 5).",
+    "erbauer": "modell, rolle, maschine ('mac'|'peer'), befehl (Argumentliste -- bekommt den "
+               "Auftragspfad als letztes Argument angehaengt), frist_sekunden. Das Modell muss "
+               "IM befehl stehen (z. B. '--modell', 'qwen38'); der Laeufer liest es von dort "
+               "und vergleicht es mit dem Etikett.",
+    "stufen": "Liste je Stufe: name, typ ('befehl'|'agent'), was_nicht_prueft (Pflicht, Regel 1 "
+              "der Spec), befehl, frist_sekunden; bei typ='agent' zusaetzlich modell, rolle, "
+              "maschine. Zwei Stufen mit derselben Modell+Rolle-Kombination werden abgelehnt, "
+              "ebenso eine Stufe mit derselben Kombination wie der Erbauer (Regel 4).",
+    "_modelle": "Verschaerft am 01.09.2026 (Befund B3): abgelehnt wird schon, wenn zwei "
+                "agent-Stufen dasselbe Modell ODER dieselbe Rolle tragen, und ebenso, wenn eine "
+                "Stufe das Modell oder die Rolle des Erbauers hat -- die Spec verlangt 'anderes "
+                "Modell UND andere Rolle', weil ein Panel gleichartiger Pruefer schlechter ist "
+                "als der beste einzelne. Jedes Modell besetzt also hoechstens EINE Rolle: mit "
+                "qwen38 und ornith hat eine Kette einen Erbauer und eine agent-Stufe: Stufe 3 "
+                "steht darum als Pruefcode in der Vorlage (property-based, metamorphic, "
+                "differential -- so meint es die Spec). Eine zweite agent-Stufe braucht ein "
+                "drittes Modell einer anderen Familie.",
+    "_modell_im_befehl": "Ein agent-Befehl muss GENAU EIN bekanntes Modell benennen (Name oder "
+                         "Alias aus ~/.claude/workbench/models.json, siehe 'wb-state models "
+                         "list'). Ein unbekannter Name wird abgelehnt statt als eigener Pruefer "
+                         "gezaehlt -- sonst reicht ein Tippfehler als Umgehung. Die Antwort "
+                         "einer agent-Stufe traegt ausserdem 'modell': womit wirklich geurteilt "
+                         "wurde; weicht es ab, faellt die Stufe.",
+}
+
+
+def befehl_vorlage(args, projekt: Path) -> int:
+    ziel_datei = projekt / VERTRAG_DATEI_NAME
+    if ziel_datei.exists():
+        print(f"{ziel_datei} gibt es schon -- nichts geschrieben.")
+        return 1
+    projekt.mkdir(parents=True, exist_ok=True)
+    bauauftrag_pfad = projekt / "bauauftrag.md"
+    if not bauauftrag_pfad.exists():
+        bauauftrag_pfad.write_text(
+            "# Bauauftrag\n\nHier die ausfuehrliche Aufgabenbeschreibung eintragen -- was gebaut "
+            "werden soll, mit Kontext, so wie man es einem Menschen sagen wuerde.\n",
+            encoding="utf-8")
+    vorlage = {
+        "ziel": "EIN SATZ: was gebaut werden soll",
+        "fertig_wenn": "Rundenobergrenze erreicht oder Stillstand -- dann sieht ein Mensch hin.",
+        "bauauftrag_datei": "bauauftrag.md",
+        "dateien": ["pfad/oder/verzeichnis"],
+        "runden_maximal": 20,
+        "stillstand_abbruch": 5,
+        "erbauer": {"modell": "qwen38", "rolle": "erbauer", "maschine": "mac",
+                    "befehl": ["python3", "erbauer_aufrufen.py", "--modell", "qwen38"],
+                    "frist_sekunden": 900},
+        "stufen": [
+            {"name": "formal", "typ": "befehl",
+             "was_nicht_prueft": "ob es tut, was verlangt war",
+             "befehl": ["python3", "-m", "py_compile", "DATEI.py"], "frist_sekunden": 60},
+            {"name": "ausfuehrbar", "typ": "befehl",
+             "was_nicht_prueft": "ob Eigenschaften ausserhalb der Testfaelle gelten",
+             "befehl": ["python3", "-m", "pytest", "-q"], "frist_sekunden": 300},
+            {"name": "eigenschaften", "typ": "befehl",
+             "was_nicht_prueft": "ob es verstaendlich ist und zum Haus passt",
+             "befehl": ["python3", "eigenschaften_pruefen.py"], "frist_sekunden": 300},
+            {"name": "urteil", "typ": "agent",
+             "was_nicht_prueft": "alles, was die Stufen davor schon geprueft haben",
+             "befehl": ["python3", "pruefer_aufrufen.py", "--modell", "ornith"],
+             "modell": "ornith", "rolle": "pruefer-urteil", "maschine": "peer",
+             "frist_sekunden": 600},
+        ],
+        "_hinweise": VORLAGE_HINWEISE,
+    }
+    atomar_schreiben.schreiben(str(ziel_datei),
+                                json.dumps(vorlage, indent=2, ensure_ascii=False) + "\n",
+                                modus=0o644)
+    print(f"{ziel_datei} geschrieben (und {bauauftrag_pfad.name}, falls es fehlte). Felder "
+          f"ausfuellen, dann:\n  wb-pruefschleife --projekt {projekt} lauf")
+    return 0
+
+
+def bauen_zerleger() -> argparse.ArgumentParser:
+    zerleger = argparse.ArgumentParser(
+        prog="wb-pruefschleife",
+        description="Die Pruefschleife -- mehrstufige Pruefung statt einer Messzahl.")
+    zerleger.add_argument(
+        "--projekt", type=Path, default=None,
+        help="Projektverzeichnis. Reihenfolge ohne diesen Schalter: das Verzeichnis von "
+             "--konfiguration; sonst das aktuelle Arbeitsverzeichnis, wenn dort eine "
+             "pruefschleife.json liegt; sonst das Verzeichnis dieses Skripts. Vor oder nach "
+             "dem Unterbefehl.")
+    zerleger.add_argument("--konfiguration", type=Path, default=None,
+                          help="Pfad zur Vertragsdatei (Vorgabe: pruefschleife.json im "
+                               "Projektverzeichnis)")
+    unter = zerleger.add_subparsers(dest="befehl", required=True)
+
+    def mit_unterbefehl(name, **kw):
+        """Sinngemaess uebernommen aus wb_autoresearch.py, mit_unterbefehl():
+        default=SUPPRESS statt default=None, sonst wirft ein Unterbefehl ohne
+        eigenes --projekt ein vor ihm gesetztes --projekt wieder auf None
+        zurueck (Befund dort 01.09.2026, per echtem CLI-Aufruf belegt)."""
+        p = unter.add_parser(name, **kw)
+        p.add_argument("--projekt", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+        return p
+
+    vorlage = mit_unterbefehl("vorlage", help="eine ausfuellbare pruefschleife.json schreiben")
+    vorlage.set_defaults(funktion=befehl_vorlage)
+
+    lauf = mit_unterbefehl("lauf", help="eine Runde (neu oder fortgesetzt)")
+    lauf.set_defaults(funktion=befehl_lauf)
+
+    schleife = mit_unterbefehl("schleife", help="Runden bis Obergrenze oder Stillstand")
+    schleife.set_defaults(funktion=befehl_schleife)
+
+    stand = mit_unterbefehl("stand", help="was bisher lief")
+    stand.set_defaults(funktion=befehl_stand)
+
+    fortsetzen = mit_unterbefehl("fortsetzen", help="eine abgebrochene Runde fortsetzen")
+    fortsetzen.set_defaults(funktion=befehl_fortsetzen)
+
+    return zerleger
+
+
+def unterbefehle() -> list[str]:
+    """Die Namen aller Unterbefehle, aus dem Parser gelesen -- nicht aus einer
+    Konstanten, die ein neuer Unterbefehl vergessen koennte."""
+    for aktion in bauen_zerleger()._actions:
+        if isinstance(aktion, argparse._SubParsersAction):
+            return list(aktion.choices.keys())
+    return []
+
+
+def main() -> int:
+    args = bauen_zerleger().parse_args()
+    projekt = projekt_bestimmen(args.projekt, args.konfiguration)
+
+    if args.befehl == "vorlage":
+        return befehl_vorlage(args, projekt)
+
+    vertrag_pfad = args.konfiguration if args.konfiguration else projekt / VERTRAG_DATEI_NAME
+    if not vertrag_pfad.exists():
+        print(f"Kein Vertrag in {projekt}. Erst: wb-pruefschleife --projekt {projekt} vorlage")
+        return 1
+    try:
+        vertrag = vertrag_laden(projekt, args.konfiguration)
+    except (ValueError, OSError, json.JSONDecodeError) as fehler:
+        print(f"Vertrag laesst sich nicht laden: {fehler}")
+        return 1
+
+    return args.funktion(args, projekt, vertrag)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

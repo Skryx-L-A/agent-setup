@@ -1,6 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
+  NICHT INSTALLIERT: Ansage des Nutzers vom 22.08.2026 -- "Mac keine automatischen
+  Laeufe, die sich wiederholen". Alle zehn LaunchAgents mit Zeitplan sind an dem
+  Tag abgeschaltet und aus ~/Library/LaunchAgents entfernt worden; das Aufraeumen alter Sitzungen faellt beim Arbeiten an, nicht nach Kalender.
+  Die Datei bleibt hier als Vorlage fuer den Rueckweg stehen. Die abgeschaltete
+  Fassung liegt unter ~/.local/state/wb-launchagents-deaktiviert/ -- solange sie
+  dort liegt, weigert sich wb-ausrollen, diese plist zu installieren (Schalter
+  --trotz-deaktivierung hebt das fuer einen Lauf auf).
+-->
+<!--
   Installation (der Nutzer selbst, nicht automatisch eingerichtet): diese Datei
   nach ~/Library/LaunchAgents/agent-workbench.wb-session-sweep.plist kopieren,
   dann `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/agent-workbench.wb-session-sweep.plist`

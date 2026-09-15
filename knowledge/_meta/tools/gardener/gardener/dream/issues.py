@@ -113,12 +113,77 @@ def safe_detail(detail: str) -> str:
     return HELD_BACK if text and _INSTRUCTION_RE.search(text) else text
 
 
+def escalation_detail_path(vault: Path, run_id: str) -> Path:
+    """Where a hunk's full proposal text lives for one run - vault-relative,
+    versioned, next to that run's `judgments.json`/`applied.json`."""
+    return Path(vault) / dcfg.DREAM_AUDIT_DIR / run_id / dcfg.ESCALATION_DETAIL_FILE
+
+
+def escalation_detail_ref(issue: dict) -> str | None:
+    """The pointer `queue_line` prints for a human-facing issue, or None if
+    the issue carries no `run_id`/`hunk_id` to build one from (old issues.json
+    entries from before this existed)."""
+    run_id, hunk_id = issue.get("run_id"), issue.get("hunk_id")
+    if not run_id or not hunk_id:
+        return None
+    return (f"{dcfg.DREAM_AUDIT_DIR}/{run_id}/{dcfg.ESCALATION_DETAIL_FILE}"
+            f"#{hunk_id}")
+
+
+def write_escalation_details(vault: Path, run_id: str, hunks: list[dict],
+                             new_issues: list[dict],
+                             dry_run: bool = False) -> Path | None:
+    """The full proposal - `before`, `after`, `claims` - of every hunk that
+    just became human-facing (state in `HUMAN_STATES`), keyed by hunk_id.
+
+    This is the one place that keeps a hunk's own text once `dream shadow`'s
+    `changeset.json` is gone: that file is deliberately gitignored and
+    machine-local (the first full run's changeset was 120 MB), so nothing
+    versioned survived it - found 02.09.2026 when the 87 escalations of
+    2026-08-16 turned out to have no recoverable wording anywhere: not in
+    `trace.jsonl`, not in `dream.db`, not in `reconcile.db`, not in the shadow.
+    Six of them had to be rejected unread as a result.
+
+    Merges into whatever this run already wrote (a review step and an apply
+    step over the SAME run_id both call this); nothing already stored here is
+    ever dropped."""
+    by_id = {str(h.get("hunk_id") or ""): h for h in hunks}
+    relevant = [i for i in new_issues if i.get("state") in HUMAN_STATES]
+    if not relevant:
+        return None
+    path = escalation_detail_path(vault, run_id)
+    existing: dict = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            log.warning("dream: %s unreadable (%s) - treated as empty", path, e)
+            existing = {}
+    for issue in relevant:
+        hid = str(issue.get("hunk_id") or "")
+        hunk = by_id.get(hid)
+        if hunk is None:
+            continue          # this run's own hunks did not carry this id
+        existing[hid] = {"hunk_id": hid, "target": hunk.get("target"),
+                         "op": hunk.get("op"), "before": hunk.get("before"),
+                         "after": hunk.get("after"), "claims": hunk.get("claims"),
+                         "state": issue.get("state"), "reason": issue.get("reason"),
+                         "detail": issue.get("detail")}
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(existing, ensure_ascii=False, indent=2,
+                                   sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def queue_line(issue: dict) -> str:
     detail = safe_detail(issue.get("detail"))
+    ref = escalation_detail_ref(issue)
     return (f"- {str(issue.get('last_seen') or '')[:10]}: "
             f"[{issue.get('state')}] {issue.get('target')} "
             f"({issue.get('op')}, hunk {issue.get('hunk_id')}): "
-            f"{issue.get('reason')}" + (f" - {detail}" if detail else ""))
+            f"{issue.get('reason')}" + (f" - {detail}" if detail else "") +
+            (f" (Vorschlag: {ref})" if ref else ""))
 
 
 def render_section(issues: dict[str, dict]) -> str:
@@ -146,9 +211,24 @@ def write_review_queue(vault: Path, issues: dict[str, dict],
 
 
 def record(vault: Path, new_issues: list[dict], dry_run: bool = False,
-           now: str | None = None) -> dict[str, dict]:
-    """Merge, then write both destinations. Returns the merged set."""
+           now: str | None = None, hunks: list[dict] | None = None,
+           run_id: str | None = None) -> dict[str, dict]:
+    """Merge, then write both destinations. Returns the merged set.
+
+    `hunks` is the full changeset a caller happens to hold (review and apply
+    both do) - when given, the full proposal text of every NEW human-facing
+    issue is kept next to that run's judgments/applied file, so a later
+    session can read it back through `queue_line`'s pointer. Optional and
+    keyed by `run_id` (falling back to the first new issue's own `run_id`,
+    which is what `review.issues_from`/`apply.issues_from` already set) so
+    every existing caller that does not pass it keeps working unchanged."""
     merged = merge(load_issues(vault), new_issues, now=now)
     write_issues(vault, merged, dry_run=dry_run)
     write_review_queue(vault, merged, dry_run=dry_run)
+    if hunks:
+        rid = run_id or next((str(i.get("run_id")) for i in new_issues
+                              if i.get("run_id")), None)
+        if rid:
+            write_escalation_details(vault, rid, hunks, new_issues,
+                                     dry_run=dry_run)
     return merged

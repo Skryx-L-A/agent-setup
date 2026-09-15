@@ -17,7 +17,7 @@
 #   wb-doctor --fix      repariert, was sicher reparierbar ist
 #   wb-doctor --fix --closed-views   schliesst zusaetzlich ueberzaehlige Sichten
 #
-# Acht Pruefungen. Die achte vergleicht die Zustandsdateien der Startseite mit den
+# Vierzehn Pruefungen, von 0 bis 13. Pruefung 8 vergleicht die Zustandsdateien der Startseite mit den
 # laufenden tmux-Sessions und nennt fuer jede fortsetzbare, aber nicht mehr
 # laufende Session den fertigen `wb-session-delete`-Aufruf — Loeschen bleibt
 # Handarbeit, --fix fasst dort nichts an.
@@ -43,6 +43,11 @@
 # selbst nicht beendet (Absicht, siehe dessen Kopfkommentar), beendet
 # `--fix` hier erst recht nicht.
 #
+# Punkt 13 (2026-09-05) sucht das Gegenstueck zu Punkt 5: nicht ein Pane OHNE
+# Rolle, sondern eines mit der FALSCHEN — 'placeholder' auf einem Pane, in dem ein
+# Agent laeuft. Genau dieser Zustand liess die Werkbank den Orchestrator einer
+# Sitzung nicht mehr finden, und Punkt 5 konnte ihn nicht sehen.
+#
 # Was es NIE tut: einen Pane mit laufender Arbeit toeten, eine Basis-Session
 # schliessen, oder eine Session anfassen, an der ein Client haengt. Geschlossen
 # wird ausschliesslich ueber `wb-session-close`, das seine eigenen Pruefungen
@@ -54,7 +59,7 @@ for a in "$@"; do
   case "$a" in
     --fix) FIX=1 ;;
     --closed-views|--close-views) CLOSE_VIEWS=1 ;;
-    -h|--help) sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,54p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "wb-doctor: unbekannte Option '$a'" >&2; exit 1 ;;
   esac
 done
@@ -77,11 +82,33 @@ ist_wb_session() { case "$1" in wb-*) return 0 ;; *) return 1 ;; esac; }
 
 # EIN Filter fuer gueltige Worker-Fensternamen (Betriebslauf 2026-08-04, B6/B8):
 # 'workers' ist nur das ERSTE von moeglicherweise mehreren Fenstern -- wb-grid
-# legt 'workers-2', 'workers-3', ... an, sobald maxWorkerPanesPerTab
-# ueberschritten wird (siehe shell/wb-grid, shell/wb-workers-window). Ein
-# Vergleich nur gegen die Zeichenkette 'workers' haelt jedes Ueberlauf-Fenster
-# faelschlich fuer falsch platziert.
+# legt 'workers-2', 'workers-3', ... an (siehe shell/wb-grid,
+# shell/wb-workers-window). Seit dem 03.09.2026 gilt das fuer JEDEN Worker: im
+# Layout 'window' bekommt jeder sein eigenes Fenster, die Reihe wird also so
+# lang wie die Zahl der Worker. Ein Vergleich nur gegen die Zeichenkette
+# 'workers' haelt jedes weitere Fenster faelschlich fuer falsch platziert.
 ist_workers_fenster() { case "$1" in workers|workers-[0-9]*) return 0 ;; *) return 1 ;; esac; }
+
+# Welcher Pane einer Session WAERE der Orchestrator? Das erste Pane des ersten
+# Fensters -- so und nicht anders legen wb-code, wb-revive und orch-launch eine
+# Sitzung an, und alle weiteren Fenster ('workers', 'workers-2', ...) entstehen
+# erst danach. Nur dieser eine Pane darf von einem --fix zum Orchestrator erklaert
+# werden; jeder andere waere ein ZWEITER, und der bekaeme das Schreibrecht in den
+# Orchestrator-Chat und die Ausnahme vom Push-Verbot (2026-09-05).
+orchestrator_kandidat() {   # <session> -> pane_id oder leer
+  local w
+  w="$(tmux list-windows -t "=$1" -F '#{window_index}' 2>/dev/null | sort -n | head -1)"
+  [ -n "$w" ] || return 0
+  tmux list-panes -t "=$1:$w" -F '#{pane_id}' 2>/dev/null | head -1
+}
+
+# Laeuft in diesem Pane ein Platzhalter oder eine Arbeit? Der Platzhalter aus
+# wb-workers-window ist eine Shell, die `sleep` in einer Schleife ruft -- mehr
+# nicht. Alles andere (claude, pi, node, python, eine Agenten-CLI) ist Arbeit.
+# Dieselbe Unterscheidung wie in Pruefung 11, dort fuer den Copy-Modus.
+ist_platzhalter_kommando() {
+  case "$1" in ''|sh|bash|zsh|fish|dash|ksh|sleep) return 0 ;; *) return 1 ;; esac
+}
 
 # == 0. Harness-Konfigurationsdateien ==========================================
 # Steht VOR dem tmux-Gate, und zwar mit Absicht: das ist die einzige Pruefung hier,
@@ -235,8 +262,16 @@ while IFS='|' read -r sname wname pid role cmd; do
   if [ -n "$FIX" ]; then
     if [ "$wname" = workers ]; then
       tmux set -p -t "$pid" @wb_role worker 2>/dev/null && tat "$pid als worker markiert"
-    else
+    elif [ "$pid" = "$(orchestrator_kandidat "$sname")" ]; then
       tmux set -p -t "$pid" @wb_role orchestrator 2>/dev/null && tat "$pid als orchestrator markiert"
+    else
+      # BIS ZUM 05.09. STAND HIER NUR DER else-ZWEIG OBEN: jedes rollenlose Pane
+      # ausserhalb eines Fensters namens 'workers' wurde zum Orchestrator erklaert.
+      # Am selben Tag lag genau so ein Pane herum -- der echte Platzhalter der
+      # Companion-Sitzung, gelandet in einem Fenster namens '--no-attach' (siehe
+      # den Kopf von wb-workers-window). Ein --fix haette der Sitzung damit einen
+      # zweiten Orchestrator gegeben, samt Schreibrecht und Push-Ausnahme.
+      hinweis "$pid ist nicht das erste Pane des ersten Fensters — welche Rolle er tragen soll, entscheidet kein Automat: von Hand mit 'wb-rolle setzen $pid <rolle>'"
     fi
   fi
 done < <(tmux list-panes -a -F '#{session_name}|#{window_name}|#{pane_id}|#{@wb_role}|#{pane_current_command}' 2>/dev/null)
@@ -478,6 +513,129 @@ if [ -x "$BIN/wb-waisen" ]; then
 else
   hinweis "wb-waisen ist nicht installiert — Hintergrundprozesse ungeprueft"
 fi
+
+echo
+echo "== 11. Panes, die im Copy-Modus haengen (Tippen kommt nicht an) =="
+# 2026-08-28, zweites Vorkommen: Mausrad ueber einem claude-Pane oeffnet
+# `copy-mode -e`; wer danach tippt, fuettert die vi-Tastentabelle statt claude
+# und sieht "ich kann nicht schreiben". Gemessen: pane_in_mode=1, pane_mode=
+# view-mode auf der ANGEHAENGTEN Session. `copy-mode -q` beendet den Modus, ohne
+# in den Pane zu tippen -- darum kein send-keys und kein wb-pane-write noetig.
+modus_panes="$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}|#{pane_in_mode}|#{pane_mode}|#{pane_current_command}' 2>/dev/null | awk -F'|' '$2==1 && $4!="bash" && $4!="zsh" && $4!="fish"')"
+if [ -z "$modus_panes" ]; then
+  echo "  ok       kein Agenten-Pane im Copy-Modus"
+else
+  while IFS='|' read -r pane inmode mode cmd; do
+    [ -n "$pane" ] || continue
+    melde "Pane $pane ($cmd) steckt im $mode — Tastendruecke gehen an tmux statt an $cmd"
+    if [ -n "$FIX" ]; then
+      if tmux copy-mode -q -t "$pane" 2>/dev/null; then
+        tat "Copy-Modus in $pane beendet (copy-mode -q)"
+      else
+        hinweis "copy-mode -q schlug fehl — von Hand: Taste q im Pane"
+      fi
+    else
+      hinweis "wb-doctor --fix beendet den Modus; von Hand: Taste q im Pane"
+    fi
+  done <<< "$modus_panes"
+fi
+
+# ── 12. tmux-Hooks: zeigt einer ins Leere, oder kann einer ein Pane einfrieren? ──
+# Anlass 2026-08-29: drei Hooks auf peer zeigten nach $HOME, einen
+# Benutzer, den es dort seit dem Umbau auf Omarchy nicht mehr gibt. Jeder Aufruf
+# endete mit exit 127 -- und tmux zeigt Ausgabe UND Fehlercode eines run-shell im
+# aktiven Pane an, das danach im view-mode steht, wo keine Eingabe mehr ankommt.
+# Weil die Hooks an after-split-window, pane-exited und pane-died haengen, traf es
+# bei JEDEM Worker-Start und -Ende. Pruefung 9 befreit ein Pane, das schon
+# feststeckt; diese hier sucht den Grund, bevor es dazu kommt.
+#
+# Zwei Befunde, beide fuer sich ausreichend:
+#   * toter Pfad -- der Hook laeuft nie, das Raster wird stillschweigend nicht
+#     mehr geordnet und ein abgestuerztes Pane nie wiederbelebt;
+#   * ungeschirmt -- der Aufruf endet nicht auf '>/dev/null 2>&1 || true', dann
+#     friert der naechste Fehlschlag wieder ein Fenster ein.
+#
+# WICHTIG fuer jeden, der das erweitert: 'show-hooks -g' zeigt NUR den
+# Session-Scope. pane-exited und pane-died liegen im Window-Scope und tauchen
+# erst bei 'show-hooks -gw' auf -- wer nur die erste Form abfragt, haelt zwei von
+# drei Hooks fuer nicht gesetzt. Genau das hat beim Suchen zuerst getaeuscht.
+echo "12. tmux-Hooks (Pfad erreichbar, Ausgabe abgeschirmt)"
+hook_zeilen="$( { tmux show-hooks -g 2>/dev/null; tmux show-hooks -gw 2>/dev/null; } \
+  | grep -E '^(after-split-window|pane-exited|pane-died)' )"
+if [ -z "$hook_zeilen" ]; then
+  echo "  ok       keine Fenster-Hooks gesetzt (nichts, was einfrieren koennte)"
+else
+  hook_befunde=0
+  while IFS= read -r zeile; do
+    [ -n "$zeile" ] || continue
+    hook_name="$(printf '%s' "$zeile" | awk '{print $1}' | sed 's/\[[0-9]*\]$//')"
+    # Der Befehl steht in den ersten doppelten Anfuehrungszeichen; sein erstes
+    # Wort ist das Programm.
+    hook_befehl="$(printf '%s' "$zeile" | sed -n 's/[^"]*"\([^"]*\)".*/\1/p')"
+    # Ein ABGESCHALTETER Hook bleibt als nackter Name ohne Befehl stehen --
+    # genau das hinterlaesst 'set-hook -gu', und die Testbibliothek kappt so die
+    # Leitungen zur lebenden Maschine. Ohne diese Zeile hielt die Pruefung jeden
+    # gekappten Hook fuer ungeschirmt und faerbte betriebslauf.sh mit 45
+    # Fehlschlaegen rot (gemessen 2026-08-29, gleich beim ersten vollen Lauf).
+    # Nichts zu tun ist hier richtig: was nicht laeuft, friert nichts ein.
+    [ -n "$hook_befehl" ] || continue
+    hook_prog="$(printf '%s' "$hook_befehl" | awk '{print $1}')"
+    hook_prog="${hook_prog/#\$HOME/$HOME}"
+    hook_prog="${hook_prog/#\~/$HOME}"
+    if [ -n "$hook_prog" ] && [ ! -x "$hook_prog" ]; then
+      melde "Hook $hook_name ruft '$hook_prog' -- gibt es nicht oder nicht ausfuehrbar"
+      hinweis "Der Aufruf endet mit exit 127; ohne Abschirmung friert das aktive Pane ein. Pfad in ~/.tmux.conf richtigstellen (\$HOME statt fest verdrahtet)."
+      hook_befunde=$((hook_befunde + 1))
+    fi
+    case "$hook_befehl" in
+      *">/dev/null"*"|| true"*) : ;;
+      *)
+        melde "Hook $hook_name ist nicht abgeschirmt (kein '>/dev/null 2>&1 || true')"
+        hinweis "Schlaegt das Skript einmal fehl, zeigt tmux die Meldung im aktiven Pane und das Pane steht im view-mode -- dort kommt keine Eingabe mehr an."
+        hook_befunde=$((hook_befunde + 1))
+        ;;
+    esac
+  done <<< "$hook_zeilen"
+  [ "$hook_befunde" -eq 0 ] && echo "  ok       alle Fenster-Hooks erreichbar und abgeschirmt"
+fi
+
+echo
+echo "== 13. Platzhalter-Rolle auf einem Pane, in dem gearbeitet wird =="
+# Anlass 2026-09-05, gemessen: der Nutzer konnte in der Companion-Sitzung nicht mehr
+# auf den Orchestrator umschalten. Das Pane %5, in dem sein Claude lief, trug
+# `@wb_role placeholder` -- ein `wb-workers-window` mit einem Fensternamen, der mit
+# '-' anfing, hatte die Rolle am Fenster vorbei auf das Orchestrator-Pane gesetzt
+# (die Kette steht im Kopf von shell/wb-workers-window, die Ursache ist dort
+# behoben). Pruefung 5 hat den Zustand NICHT gefunden: sie sucht Panes OHNE Rolle,
+# und dieses hatte eine -- nur die falsche.
+#
+# Die Rolle ist keine Beschriftung. An ihr haengen das Schreibrecht ins
+# Orchestrator-Pane, der Umschalter der Werkbank, `wb-close` und das Push-Verbot.
+# Ein Pane mit 'placeholder', in dem ein Agent laeuft, ist deshalb immer ein
+# Befund -- der Platzhalter aus wb-workers-window fuehrt nichts aus ausser einer
+# Shell mit `sleep`.
+while IFS='|' read -r sname wname pane role cmd; do
+  case "$sname" in *-view) continue ;; esac
+  ist_wb_session "$sname" || continue
+  [ "$role" = placeholder ] || continue
+  ist_platzhalter_kommando "$cmd" && continue
+  melde "$sname:$wname $pane traegt die Rolle 'placeholder', darin laeuft aber '$cmd' — die Werkbank findet so kein Orchestrator-Pane."
+  if [ -n "$FIX" ]; then
+    if [ "$pane" = "$(orchestrator_kandidat "$sname")" ]; then
+      # Ueber wb-rolle und nicht ueber `tmux set -p`: nur dort wird ausser der
+      # Pane-Option auch das Register geschrieben, das die Guards als zweite
+      # Quelle lesen. Lehnt es ab (ein Register-Eintrag, den nur ein gemessener
+      # Mensch aendern darf), bleibt der Befund stehen statt still zu verschwinden.
+      if "$BIN/wb-rolle" setzen "$pane" orchestrator >/dev/null 2>&1; then
+        tat "$pane ($sname): Rolle von 'placeholder' auf 'orchestrator' berichtigt"
+      else
+        hinweis "wb-rolle hat die Berichtigung abgelehnt — Grund zeigt: wb-rolle beleg $pane orchestrator"
+      fi
+    else
+      hinweis "$pane ist nicht das erste Pane des ersten Fensters — hier raet kein Automat: 'wb-rolle setzen $pane worker' oder den Pane schliessen"
+    fi
+  fi
+done < <(tmux list-panes -a -F '#{session_name}|#{window_name}|#{pane_id}|#{@wb_role}|#{pane_current_command}' 2>/dev/null)
 
 echo
 if [ "$befunde" -eq 0 ]; then

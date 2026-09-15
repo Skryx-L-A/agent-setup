@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# wb-resume-id — die Kennung der Unterhaltung EINES Panes/EINER Session finden.
+#
+# EINE Quelle fuer zwei Wege (2026-09-06). shell/wb-revive belebt einen toten Pane
+# wieder, der Wiederherstellungs-Knopf der Oberflaeche (app/src/main/revive.ts ueber
+# main.ts) legt eine gestoppte Session neu an — beide brauchen dieselbe Antwort:
+# welche Unterhaltung gehoert zu DIESEM Arbeitsverzeichnis? Bis heute stand die Logik
+# nur in wb-revive; die Oberflaeche sagte fuer Registry-Harnesses „faengt neu an".
+# Statt sie in TypeScript zu doppeln, ruft der Hauptprozess dieses Skript auf — dieselbe
+# gemessene Aufloesung, an einer Stelle gepflegt.
+#
+# Die Registry wird DIREKT gelesen (nicht ueber wb-state), damit die Oberflaeche ihre
+# eigene, per --models uebergebene Datei benutzen kann und der Test keinen wb-state
+# braucht. Vorrang: --models <pfad>, sonst $WB_MODELS_FILE, sonst
+# ~/.claude/workbench/models.json. Beide Registry-Formen (Liste und Objekt) werden gelesen.
+#
+# Der Weg je Harness steht in der Registry (`resume.kennung`, Feld `verfahren` + `ort`):
+#   cline-sessions   <ort>/<id>/<id>.json         -> cwd + started_at, id=session_id
+#   jcode-sessions   <ort>/session_*.json         -> working_dir + created_at, id=id
+#   forge-sqlite     <ort> (SQLite .forge.db)     -> context <current_working_directory>
+#                                                    + created_at, id=conversation_id
+#
+# Gesucht wird die Unterhaltung dieses Arbeitsverzeichnisses. Mit --started (und
+# optional --dead) wird auf das Zeitfenster des Panes eingegrenzt und die AELTESTE
+# Unterhaltung darin genommen — so verwechseln sich zwei Panes desselben Harness unter
+# einem HOME nicht (der eigene Harness legt seine Sitzung Sekunden nach dem Start an).
+# Ohne --started zaehlt nur ein EINDEUTIGER Treffer im Verzeichnis; bei zweien wird
+# NICHT geraten. Das ist der Fall des Knopfes: eine gestoppte Session hat keinen Pane
+# und keine Startzeit mehr, und ein Worktree je Worker traegt in aller Regel genau eine.
+#
+# Ausgabe auf stdout, zeilenweise getaggt (ein fuehrender Tab wuerde von `read` als
+# IFS-Whitespace geschluckt, deshalb Tags statt Positionen):
+#   id\t<kennung>       eine plausible Kennung gefunden
+#   quelle\t<verfahren> dazu, welches Verfahren sie lieferte
+#   why\t<grund>        keine Kennung; der Grund, fuer die Meldung an den Menschen
+# Exit 0, wenn eine id ausgegeben wurde; 2 sonst. So kann ein Aufrufer auch am
+# Rueckgabewert entscheiden, ohne die Tags zu lesen.
+#
+# Usage: wb-resume-id <harness-id> --dir <workdir> [--started <epoch>] [--dead <epoch>] [--models <pfad>]
+set -uo pipefail
+
+HID=""; DIR=""; STARTED=""; DEAD=""; MODELS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dir)     DIR="${2:?--dir <workdir>}"; shift 2 ;;
+    --started) STARTED="${2:?--started <epoch>}"; shift 2 ;;
+    --dead)    DEAD="${2:?--dead <epoch>}"; shift 2 ;;
+    --models)  MODELS="${2:?--models <pfad>}"; shift 2 ;;
+    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    -*)        echo "wb-resume-id: unbekannte Option '$1'" >&2; exit 2 ;;
+    *)         [ -z "$HID" ] && HID="$1"; shift ;;
+  esac
+done
+[ -n "$HID" ] || { echo "wb-resume-id: Harness-Kennung fehlt" >&2; exit 2; }
+[ -n "$DIR" ] || { echo "why	kein Arbeitsverzeichnis angegeben"; exit 2; }
+[ -n "$MODELS" ] || MODELS="${WB_MODELS_FILE:-$HOME/.claude/workbench/models.json}"
+
+kfund="$(/usr/bin/python3 - "$HID" "$MODELS" "$DIR" "$STARTED" "$DEAD" <<'PY'
+import datetime, glob, json, os, re, sqlite3, sys
+hid, models, workdir, p_started, p_dead = sys.argv[1:6]
+
+try:
+    with open(models, "rb") as fh:
+        reg = json.loads(fh.read().decode("utf-8", "replace"))
+except Exception:
+    print("why\tRegistry %s nicht lesbar" % models); sys.exit(2)
+
+hs = reg.get("harnesses")
+if isinstance(hs, dict):
+    eintraege = [dict(v, id=k) for k, v in hs.items()]
+elif isinstance(hs, list):
+    eintraege = hs
+else:
+    eintraege = []
+h = next((e for e in eintraege if str(e.get("id")) == hid), None)
+if h is None:
+    print("why\tHarness '%s' nicht in der Registry" % hid); sys.exit(2)
+
+k = (h.get("resume") or {}).get("kennung") or {}
+verfahren, ort = k.get("verfahren") or "", os.path.expanduser(k.get("ort") or "")
+if not verfahren or not ort:
+    print("why\tHarness '%s' hat keinen resume.kennung-Block" % hid); sys.exit(2)
+if not workdir:
+    print("why\tkein Arbeitsverzeichnis bekannt"); sys.exit(2)
+real = os.path.realpath(workdir)
+
+def epoch(s):
+    """ISO-8601 (mit Z oder Offset) oder 'YYYY-MM-DD HH:MM:SS[.ffffff]' (UTC) -> Sekunden."""
+    s = str(s or "").strip()
+    if not s:
+        return None
+    try:
+        if "T" in s:
+            d = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        else:
+            d = datetime.datetime.strptime(s[:26], "%Y-%m-%d %H:%M:%S.%f" if "." in s else "%Y-%m-%d %H:%M:%S")
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return d.timestamp()
+    except Exception:
+        return None
+
+def gleich(pfad):
+    try:
+        return bool(pfad) and os.path.realpath(pfad) == real
+    except Exception:
+        return False
+
+def json_datei(f):
+    try:
+        with open(f, "rb") as fh:
+            return json.loads(fh.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+kand = []   # (erstellt, kennung)
+if verfahren == "cline-sessions":
+    for f in glob.glob(ort):
+        if f.endswith(".messages.json"):
+            continue
+        d = json_datei(f)
+        if isinstance(d, dict) and gleich(d.get("cwd")) and d.get("session_id"):
+            kand.append((epoch(d.get("started_at")), str(d["session_id"])))
+elif verfahren == "jcode-sessions":
+    for f in glob.glob(ort):
+        d = json_datei(f)
+        if isinstance(d, dict) and gleich(d.get("working_dir")) and d.get("id"):
+            kand.append((epoch(d.get("created_at")), str(d["id"])))
+elif verfahren == "forge-sqlite":
+    if os.path.exists(ort):
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % ort, uri=True, timeout=5)
+            rows = con.execute("select conversation_id, created_at, context from conversations "
+                               "where context is not null").fetchall()
+            con.close()
+        except Exception:
+            rows = []
+        for cid, created, ctx in rows:
+            m = re.search(r"<current_working_directory>(.*?)</current_working_directory>", ctx or "")
+            if m and gleich(m.group(1)) and cid:
+                kand.append((epoch(created), str(cid)))
+else:
+    print("why\tunbekanntes Verfahren '%s'" % verfahren); sys.exit(2)
+
+im_dir = len(kand)
+SLACK = 5
+started = float(p_started) if re.match(r"^\d+$", p_started or "") else None
+dead = float(p_dead) if re.match(r"^\d+$", p_dead or "") and p_dead != "0" else None
+if started is not None:
+    kand = [c for c in kand if c[0] is not None and c[0] >= started - SLACK]
+if dead is not None:
+    kand = [c for c in kand if c[0] is not None and c[0] <= dead + SLACK]
+kand.sort(key=lambda c: (c[0] if c[0] is not None else 0, c[1]))
+if not kand:
+    print("why\t%s fand keine Unterhaltung fuer %s%s" % (
+        verfahren, workdir, " im Zeitfenster des Panes" if im_dir else ""))
+    sys.exit(2)
+if started is not None or len(kand) == 1:
+    print("id\t%s" % kand[0][1])
+    print("quelle\t%s" % verfahren)
+    sys.exit(0)
+print("why\t%d Unterhaltungen in %s und keine Startzeit (@wb_started) — nicht geraten" % (
+    len(kand), workdir))
+sys.exit(2)
+PY
+)"
+rc=$?
+printf '%s\n' "$kfund"
+exit "$rc"

@@ -1,0 +1,92 @@
+{
+  "source": "$HOME/.claude/skills/council/SKILL.md",
+  "sha256": "2541bce4b00b4713baaaa6cde6d95b5b6c1969067a872ecffc8ac78713f4645e",
+  "bytes": 7652,
+  "sections": [
+    {
+      "file": "00.md",
+      "heading": "Council",
+      "sha256": "20791366d7d0017554675233cc15efce3a6269c376b5b12cf037be36e89602aa"
+    },
+    {
+      "file": "01.md",
+      "heading": "When to Use",
+      "sha256": "96a81fd0445ba2ead180c0ea49dea76bad19b480ab7e8d3a46ed47c6e0d56755"
+    },
+    {
+      "file": "02.md",
+      "heading": "When NOT to Use",
+      "sha256": "534b64be96b9c1de19ca61168779042a6b897b19366aaa10705ef9d5dcfde380"
+    },
+    {
+      "file": "03.md",
+      "heading": "Roles",
+      "sha256": "0bebc467aecdea02579255ec41f28726c0d259f88f1e6f207a1d7b459d2ea3a6"
+    },
+    {
+      "file": "04.md",
+      "heading": "Workflow",
+      "sha256": "bb79fe10f425bbd2d8ac9db69a0c2570436d54f37cf314aa7477a520585310d2"
+    },
+    {
+      "file": "05.md",
+      "heading": "1. Extract the real question",
+      "sha256": "86f1c52c9b90fc2bf090ac871ed9e265829fa2f8e37dea4f61195d25559d7b65"
+    },
+    {
+      "file": "06.md",
+      "heading": "2. Gather only the necessary context",
+      "sha256": "ffdc518d8302cc749da88de68ee8ccb82bc45f39119ce9cee030c7d10c48698b"
+    },
+    {
+      "file": "07.md",
+      "heading": "3. Form the Architect position first",
+      "sha256": "57ab89b23ae949bbae2ae31533652515d56835a4da90f1ee61628e20c32c1d3d"
+    },
+    {
+      "file": "08.md",
+      "heading": "4. Launch three independent voices in parallel",
+      "sha256": "86dbde3439c347cba0a72fdfd9cb9b8acc2770bffa5a34cbb0b0a65232ace8ff"
+    },
+    {
+      "file": "09.md",
+      "heading": "4b. Optional: one anonymized cross-read",
+      "sha256": "b0135c88978a3adb9dfc80ad27cbd672b1c7a9a40ca3b2914639e227e0bbd67e"
+    },
+    {
+      "file": "10.md",
+      "heading": "5. Synthesize with bias guardrails",
+      "sha256": "04c9ac5154f2047d91a944edb77cad37ec23070d8e6b137960497a798e5c8cce"
+    },
+    {
+      "file": "11.md",
+      "heading": "6. Present a compact verdict",
+      "sha256": "1f5612221a3f25fa7b6fdda66e0450c6547fa1a65089ae59c0a7343cc70d2135"
+    },
+    {
+      "file": "12.md",
+      "heading": "Persistence Rule",
+      "sha256": "27bbc2063af59ba8ce42e6046850bf862c9c9870618030c7de644235a73f4d2e"
+    },
+    {
+      "file": "13.md",
+      "heading": "Multi-Round Follow-up",
+      "sha256": "12bce850e70a099efe07fb8bd8f93b8c9c4e5a81739478f4ef08b00f734b0fb6"
+    },
+    {
+      "file": "14.md",
+      "heading": "Anti-Patterns",
+      "sha256": "0382993da8932d6af915da68aa74d9a28cf951ac43f196f0a84e61b57aa1f01b"
+    },
+    {
+      "file": "15.md",
+      "heading": "Related",
+      "sha256": "49e20b7ea8478a58db66f5b5ab49efb71557b51d7fd89ce60955dbf684143d57"
+    },
+    {
+      "file": "16.md",
+      "heading": "Example",
+      "sha256": "5728a97a68258993e9ee8cc378b5a3ab2558a077b637807275f4a84ab6c0c668"
+    }
+  ]
+}

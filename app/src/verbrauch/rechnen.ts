@@ -381,6 +381,20 @@ export interface LimitVerlauf {
  * Datei schreiben und dabei zeitversetzte Staende sehen: ein Rueckfall zaehlt erst ab der
  * Haelfte des bisherigen Spitzenwerts als echt, genauso wie in wb-budget.
  */
+/**
+ * Ein Ruecksetzpunkt aus dem Limit-Log als Millisekunden -- oder null.
+ *
+ * Das Log fuehrt ihn mal als Epochensekunden ("1788782400"), mal als ISO-Zeit.
+ * `Date.parse()` allein reicht deshalb nicht: auf die Sekundenform antwortet es
+ * mit NaN, und die Auskunft, die daran haengt, fiele stillschweigend weg.
+ */
+export function ruecksetzZeit(roh: unknown): number | null {
+  if (roh === null || roh === undefined || roh === '') return null;
+  const zahl = Number(roh);
+  const ms = Number.isFinite(zahl) && zahl > 1e9 ? zahl * 1000 : Date.parse(String(roh));
+  return Number.isFinite(ms) ? ms : null;
+}
+
 export function limitVerlauf(punkte: LimitPunkt[], feld: 'five_hour_pct' | 'seven_day_pct'): LimitVerlauf {
   const resetFeld = feld === 'five_hour_pct' ? 'five_hour_resets_at' : 'seven_day_resets_at';
   const segmente: LimitPunktXY[][] = [];
@@ -409,13 +423,8 @@ export function limitVerlauf(punkte: LimitPunkt[], feld: 'five_hour_pct' | 'seve
     laufend.push({ t, pct: wert });
     spitze = Math.max(spitze, wert);
     zuletzt = wert;
-    const roh = p[resetFeld];
-    if (roh) {
-      // Das Log fuehrt den Ruecksetzpunkt mal als Epochensekunden, mal als ISO-Zeit.
-      const zahl = Number(roh);
-      const ms = Number.isFinite(zahl) && zahl > 1e9 ? zahl * 1000 : Date.parse(String(roh));
-      if (Number.isFinite(ms)) naechsterReset = ms;
-    }
+    const ms = ruecksetzZeit(p[resetFeld]);
+    if (ms !== null) naechsterReset = ms;
   }
   if (laufend.length > 0) segmente.push(laufend);
   return {
@@ -563,4 +572,97 @@ export function zeitpunkt(iso: string): string {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return iso;
   return new Date(t).toLocaleString('de-DE', { dateStyle: 'short', timeStyle: 'short' });
+}
+
+// --- Das Tagesbudget des Wochenfensters ------------------------------------------------------
+
+export interface Wochenbudget {
+  /** Der zuletzt gemessene Stand des 7-Tage-Fensters in Prozent. */
+  verbraucht: number;
+  /** Wieviel bis heute Abend verbraucht sein darf, wenn die Woche gleichmaessig aufgeht. */
+  erlaubt: number;
+  /** erlaubt minus verbraucht. Negativ heisst: darueber. */
+  luft: number;
+  /** Der wievielte der sieben Fenstertage heute ist, 1 bis 7. */
+  tag: number;
+  /** Anfang und Ende des Fensters als Zeitstempel in Millisekunden. */
+  von: number;
+  bis: number;
+}
+
+/**
+ * „Erlaubt bis heute Abend": der Anteil des Wochenkontingents, der an einem
+ * gleichmaessig aufgeteilten Fenster bis heute 24:00 verbraucht sein darf.
+ *
+ * BEIDE ZAHLEN KOMMEN AUS DER BRUECKE. `seven_day_pct` ist der gemessene Stand,
+ * `seven_day_resets_at` das Ende des Fensters -- `wb-budget --json` liefert
+ * beide je Limitpunkt, gelesen aus ~/.claude/workbench/limits-latest.json.
+ * Gerechnet wird hier nur die Aufteilung.
+ *
+ * KALENDERTAGE IN ORTSZEIT, nicht 24-Stunden-Bloecke: das Fenster beginnt
+ * Montag 14:00, Rechnung des Nutzers zaehlt aber Kalendertage. Der Unterschied
+ * ist keine Rundung -- am Samstagmorgen sind 4,5 der 7 Fenstertage verstrichen
+ * (64 %), waehrend das Tagesbudget bei 6/7 steht (86 %).
+ *
+ * DIESELBE RECHNUNG STEHT IN `shell/wb-budget` unter `--limit` (Tagesindex mal
+ * 100 durch 7, gedeckelt auf 1 bis 7). Sie steht hier ein zweites Mal, weil das
+ * Fenster nur den JSON-Weg hat und `--limit` einen zweiten Programmaufruf
+ * waere; aendert sich die Regel dort, gehoert sie hier nachgezogen.
+ */
+export function wochenbudget(punkte: LimitPunkt[], jetzt = Date.now()): Wochenbudget | null {
+  let letzter: LimitPunkt | null = null;
+  let bis = 0;
+  for (const p of punkte) {
+    if (p.seven_day_pct === null || p.seven_day_pct === undefined) continue;
+    const ms = ruecksetzZeit(p.seven_day_resets_at);
+    if (ms === null) continue;
+    letzter = p;
+    bis = ms;
+  }
+  if (!letzter || letzter.seven_day_pct === null || letzter.seven_day_pct === undefined) return null;
+  const von = bis - 7 * 86400 * 1000;
+  const tagAnfang = new Date(von);
+  const tagHeute = new Date(jetzt);
+  const tage = Math.round(
+    (Date.UTC(tagHeute.getFullYear(), tagHeute.getMonth(), tagHeute.getDate())
+      - Date.UTC(tagAnfang.getFullYear(), tagAnfang.getMonth(), tagAnfang.getDate())) / 86400000,
+  );
+  const tag = Math.max(1, Math.min(7, tage + 1));
+  const erlaubt = Math.min(100, (tag * 100) / 7);
+  const verbraucht = letzter.seven_day_pct;
+  return { verbraucht, erlaubt, luft: erlaubt - verbraucht, tag, von, bis };
+}
+
+// --- Umschrift zurueckholen -----------------------------------------------
+//
+// Das Woerterbuch steht seit dem 03.09.2026 in `gemeinsam/umlaute.ts`: das
+// Einstellungsfenster braucht dieselbe Wandlung fuer die Registrytexte, und
+// zwei Kopien waeren zwei Staende. Weitergereicht wird sie hier, weil das
+// Messbuendel dieser Datei (`dist/test/verbrauch-rechnen.mjs`) sie kennt und
+// weil das Verbrauchsfenster seine Rechenfunktionen aus einer Hand bezieht.
+export { umlaute } from '../gemeinsam/umlaute';
+
+/**
+ * Der Satz, mit dem JEDE Zeile einer Liste anfaengt. Er gehoert einmal ueber
+ * die Liste, nicht in jede Zeile: „Kein Credit-Kontingent. Vor einem Spawn
+ * zaehlt, ob das Modell in Ollama liegt …" stand vierzehnmal untereinander und
+ * verdeckte, was die Zeilen wirklich unterscheidet.
+ *
+ * Abgeschnitten wird nur an einem SATZENDE. Ein halber gemeinsamer Satz waere
+ * schlimmer als die Wiederholung, und ein sehr kurzer gemeinsamer Anfang sagt
+ * nichts -- unter dreissig Zeichen bleibt alles, wie es ist.
+ */
+export function gemeinsamerVorspann(zeilen: string[]): string {
+  if (zeilen.length < 2) return '';
+  let gemeinsam = zeilen[0];
+  for (const z of zeilen.slice(1)) {
+    let i = 0;
+    while (i < gemeinsam.length && i < z.length && gemeinsam[i] === z[i]) i += 1;
+    gemeinsam = gemeinsam.slice(0, i);
+    if (!gemeinsam) return '';
+  }
+  const m = /^[\s\S]*[.!?](?=\s|$)/.exec(gemeinsam);
+  if (!m) return '';
+  const satz = m[0].trim();
+  return satz.length >= 30 ? satz : '';
 }

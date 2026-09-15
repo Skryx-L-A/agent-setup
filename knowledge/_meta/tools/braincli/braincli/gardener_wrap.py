@@ -14,11 +14,15 @@ VALID_PHASES = config.PHASES   # linking|consolidate|maintain|ingest|mine|lint|a
 
 def run(vault: Path, phase: str = "all", dry_run: bool = False,
         audit: bool = False, verbose: bool = False,
-        topic: str | None = None, min_notes: int | None = None) -> int:
+        topic: str | None = None, min_notes: int | None = None,
+        budget_minutes: float | None = None) -> int:
     """Wraps gardener.cli.main(); passes its exit code straight through.
 
     Phases are handed to the gardener core, which runs exactly the requested one
     (ingest -> linking -> consolidation -> maintenance -> mining -> lint on 'all').
+
+    `budget_minutes` reaches through to `--budget-minutes` (Auftrag
+    "zeitgrenze" Punkt 6): unset, the gardener keeps its own default budget.
     """
     if phase not in VALID_PHASES:
         raise ValueError(f"unknown phase {phase!r}, expected one of {VALID_PHASES}")
@@ -34,6 +38,8 @@ def run(vault: Path, phase: str = "all", dry_run: bool = False,
         argv += ["--topic", topic]
     if min_notes is not None:
         argv += ["--min-notes", str(min_notes)]
+    if budget_minutes is not None:
+        argv += ["--budget-minutes", str(budget_minutes)]
     return gardener_main(argv)
 
 

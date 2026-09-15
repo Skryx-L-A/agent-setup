@@ -70,7 +70,7 @@ HOME = os.path.expanduser("~")
 MODELS_FILE = os.environ.get("WB_MODELS_FILE") or os.path.join(HOME, ".claude/workbench/models.json")
 STATE_FILE = os.path.join(HOME, ".local/state/wb-harness-config.json")
 SNAPSHOT_ROOT = os.path.join(HOME, ".local/trash-snapshots")
-SETTINGS_FILE = os.path.join(HOME, ".claude", "workbench", "settings.json")
+SETTINGS_FILE = os.environ.get("AWB_SETTINGS_FILE") or os.path.join(HOME, ".claude", "workbench", "settings.json")
 
 # Dieselbe Regel wie in shell/wb-state (ollama_baseurl) und app/src/main/einstellungen.ts
 # (ollamaEndpunkt): nur die FORM wird geprueft, ein leerer oder unsinniger Wert faellt

@@ -23,13 +23,25 @@ Handlung — hinterher nachschlagen hilft nicht mehr.
 | … ein Bild, Video, Tonstueck oder Transkript erzeugst | `regeln/medien.md` |
 | … ein lokales Modell startest, wechselst oder Speicher dafuer einplanst | `regeln/lokale-modelle.md` |
 | … etwas auf einer zweiten Maschine startest oder dorthin auslagerst | `regeln/maschinen.md` |
-| … einen Test schreibst, der ueber den eigenen Prozess hinauswirkt | `regeln/tests-und-eingriffe.md` |
+| … pruefst oder einen Nachweis bewertest | `regeln/verifikation.md` |
+| … einen erforderlichen Test schreibst, der ueber den eigenen Prozess hinauswirkt | `regeln/tests-und-eingriffe.md` |
 | … einen Screenshot oder eine Bildschirmaufnahme machst | `regeln/aufnahmen.md` |
 | … ein Dokument gestaltest oder Produktdaten und Preise recherchierst | `regeln/dokumente.md` |
 | … eine Messzahl erzeugst oder Verbrauch und Kosten eines Laufs angibst | `regeln/messungen.md` |
 | … das erste Mal in einer Session Code schreibst, oder vor einem Commit | `regeln/arbeitsweise.md` |
 | … einen laenger laufenden Prozess startest | `regeln/prozess-hygiene.md` |
 | … ohne Rollen-Prompt Worker startest oder orchestrierst | `regeln/orchestrierung.md` |
+
+## Harnessneutrale Skills und Adapter
+
+Quelle fuer Hausregeln und Adapter ist `~/.claude/`. Nutze einen nativen Skill nur, wenn der
+laufende Harness ihn tatsaechlich bereitstellt; moegliche native Verzeichnisse sind
+`~/.agents/skills/` und `~/.agent-skills/`. Fehlt beides, liefert
+`~/.agent-instructions/skills.md` eine portable Skill-Liste.
+
+Anbieter- oder Plugin-Skills stehen unter `~/.claude/skill-adapters/index.md`. Der Adapter nennt
+Fachabsicht, tatsächliche Toolvoraussetzung und offenen Fallback. Er ersetzt weder Harness noch
+Modell und schafft keine neue Freigabe.
 
 ## Wissensspeicher `~/Knowledge`
 
@@ -66,6 +78,9 @@ bewaehrt haben, stehen schon da; der Rest ist Deiner.
   ohne Rueckfrage durch.
 - **Was gestartet wird, wird auch beendet.** Server, Wächter, Hintergrundjobs: sofort nach der
   Teilaufgabe beenden, die Beendigung verifizieren statt annehmen. Fremde Prozesse nie.
+- **Nachweise nach Anlass.** `regeln/verifikation.md` entscheidet, wann ein Test, ein Review oder
+  eine Suite erforderlich ist. Ein passender bestehender Nachweis bleibt gueltig, bis sich der
+  geprüfte Stand oder seine Bedingungen relevant ändern.
 - \<Deine eigenen Regeln hierhin. Format: Regel, Datum, ein Satz Begruendung.\>
 
 ## Geheimnisse

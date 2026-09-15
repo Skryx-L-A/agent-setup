@@ -18,7 +18,7 @@ export type Sprache = 'de' | 'en';
 
 /** Sortiert wie das Fenster: Kopfzeile, Fernzeile, Filter, Liste, Fusszeile. */
 export const DE: Record<string, string> = {
-  'fenster.titel': 'Agent-Workbench — Sitzungen',
+  'fenster.titel': 'Agent-Workbench – Sitzungen',
   'kopf.titel': 'Sitzungen',
   'kopf.unterzeile':
     'Nach Projektordner gruppiert, die zuletzt benutzte oben. Jede bekannte Sitzung steht '
@@ -34,18 +34,18 @@ export const DE: Record<string, string> = {
   'knopf.neuWahlStart': 'Mit dieser Wahl starten …',
   'wahl.titel': 'Nur für diese Sitzung',
   'wahl.unterzeile':
-    'Vorbelegt ist überall, was in den Einstellungen steht — wer nur eine Sache anders will, '
+    'Vorbelegt ist überall, was in den Einstellungen steht – wer nur eine Sache anders will, '
     + 'ändert eine Sache. Die Einstellungsdatei bleibt dabei unberührt; die Wahl endet mit dieser Sitzung.',
   'wahl.harness': 'Programm',
   'wahl.modell': 'Modell',
   'wahl.effort': 'Wie tief die Sitzung denkt',
   'wahl.kontext': 'Kontextfenster',
   'wahl.platzhalterSuche': 'Nach Name oder Kennung filtern …',
-  'wahl.keinModell': 'Für dieses Programm ist kein Modell mit der Rolle „Orchestrator" bekannt.',
+  'wahl.keinModell': 'Für dieses Programm ist kein Modell mit der Rolle „Orchestrator“ bekannt.',
   'wahl.keinTreffer': 'Kein Modell passt zu dieser Suche.',
-  'wahl.keineStufen': 'Dieses Programm kennt keine Denkstufen — es wird keine mitgegeben.',
+  'wahl.keineStufen': 'Dieses Programm kennt keine Denkstufen – es wird keine mitgegeben.',
   'wahl.kontextNurLokal':
-    'Nur bei einem Modell, das hier auf der Maschine läuft — bei einem Modell aus der Cloud '
+    'Nur bei einem Modell, das hier auf der Maschine läuft – bei einem Modell aus der Cloud '
     + 'gehört diese Zahl dem Anbieter.',
   'wahl.kontextWirdErmittelt': 'Die Stufen werden ermittelt …',
   'wahl.kontextNichtErmittelt':
@@ -55,7 +55,7 @@ export const DE: Record<string, string> = {
   'wahl.kontextToken': '{tokens} Token',
   'wahl.kontextBedarf': 'Braucht {bedarf} GiB.',
   'wahl.nichtStartbar': 'Programm fehlt auf dieser Maschine',
-  'wahl.flaggenLeer': 'Ohne eigene Angabe — es gilt, was in den Einstellungen steht.',
+  'wahl.flaggenLeer': 'Ohne eigene Angabe – es gilt, was in den Einstellungen steht.',
   'wahl.laedt': 'Hole, was zur Wahl steht …',
   'wahl.ladefehler': 'Was zur Wahl steht, ließ sich nicht holen: {grund}',
 
@@ -78,7 +78,7 @@ export const DE: Record<string, string> = {
   'wort.alle': 'Alle {n}',
   'wort.sitzungenAnzahl': '{n} Sitzungen',
   'satz.keineSitzungBekannt': 'Es ist keine Sitzung bekannt.',
-  'satz.waehleSitzung': 'Eine Sitzung wählen — was mit ihrer Unterhaltung geschieht, steht dann hier.',
+  'satz.waehleSitzung': 'Eine Sitzung wählen – was mit ihrer Unterhaltung geschieht, steht dann hier.',
 
   'satz.erstOrdnerEintragen': "Erst einen Ordner auf '{maschine}' eintragen.",
   'satz.erstPfadEintragen': 'Erst einen Pfad eintragen.',
@@ -87,6 +87,30 @@ export const DE: Record<string, string> = {
 
   'knopf.beenden': 'Beenden',
   'knopf.fortsetzen': 'Fortsetzen',
+
+  // Der Mantel (Mac, Auftrag 2.7, 06.09.) zeichnet das Fenster als Formular
+  // mit Gruppen und einer Rollenwahl; die Woerter dafuer stehen HIER, damit
+  // es weiter nur eine Tabelle gibt (`awb:sitz-texte`).
+  'gruppe.ordner': 'Ordner',
+  'gruppe.maschine': 'Maschine',
+  'gruppe.harness': 'Programm',
+  'gruppe.modell': 'Modell',
+  'gruppe.effort': 'Denkstufe',
+  'gruppe.rolle': 'Rolle',
+  'gruppe.sitzungen': 'Bekannte Sitzungen',
+  'rolle.orchestrator': 'Orchestrator im Terminal',
+  'rolle.chat': 'Chat-Sitzung',
+  'rolle.chatHinweis': 'Eine Chat-Sitzung läuft als Prozess dieser App, mit dem Modell aus den Einstellungen – ohne tmux und ohne Fernmaschine.',
+  'satz.ordnerImDialog': 'Der Ordner wird beim Start im Dialog gewählt.',
+  'wahl.deckel': 'Deckel dieses Modells: {deckel} ({quelle})',
+  'wahl.deckelHinweis': 'Ein Deckel bindet den Orchestrator, nicht Dich. Die Stufen darüber bleiben wählbar.',
+  'wahl.keinDeckel': 'Kein Deckel bekannt für dieses Modell.',
+  'knopf.start': 'Sitzung starten …',
+  'satz.abgebrochenNichtsBeendet': 'Abgebrochen – nichts beendet.',
+  'frage.beenden': '„{name}“ beenden?',
+  'frage.beendenText': 'Der Pane schließt; die Zustandsdatei bleibt, die Sitzung lässt sich danach fortsetzen.',
+  'knopf.abbrechen': 'Abbrechen',
+  'satz.startetGerade': 'Die Sitzung wird gestartet …',
 };
 
 /**
@@ -162,6 +186,27 @@ export const EN: Record<string, string> = {
 
   'knopf.beenden': 'Stop',
   'knopf.fortsetzen': 'Resume',
+
+  'gruppe.ordner': 'Folder',
+  'gruppe.maschine': 'Machine',
+  'gruppe.harness': 'Program',
+  'gruppe.modell': 'Model',
+  'gruppe.effort': 'Thinking level',
+  'gruppe.rolle': 'Role',
+  'gruppe.sitzungen': 'Known sessions',
+  'rolle.orchestrator': 'Orchestrator in the terminal',
+  'rolle.chat': 'Chat session',
+  'rolle.chatHinweis': 'A chat session runs as a process of this app, with the model from Settings — no tmux, no remote machine.',
+  'satz.ordnerImDialog': 'The folder is chosen in the dialog when you start.',
+  'wahl.deckel': 'Cap of this model: {deckel} ({quelle})',
+  'wahl.deckelHinweis': 'A cap binds the orchestrator, not you. The levels above it stay selectable.',
+  'wahl.keinDeckel': 'No cap known for this model.',
+  'knopf.start': 'Start session …',
+  'satz.abgebrochenNichtsBeendet': 'Cancelled — nothing stopped.',
+  'frage.beenden': 'Stop “{name}”?',
+  'frage.beendenText': 'The pane closes; the state file stays, and the session can be resumed afterwards.',
+  'knopf.abbrechen': 'Cancel',
+  'satz.startetGerade': 'Starting the session …',
 };
 
 /** Die Tabellen je Sprache. */

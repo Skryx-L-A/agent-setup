@@ -3,9 +3,36 @@
 statt ihn in ihren Pane zu tippen.
 
   wb-inbox [-L <socket>] [--pid <n>] finde <pane-id>       Sitzung zu diesem Pane
-  wb-inbox [-L <socket>] [--pid <n>] sende <pane-id> <datei> Text zustellen
+  wb-inbox [-L <socket>] [--pid <n>] [--absender <klasse>] sende <pane-id> <datei>
+                                                             Text zustellen
   wb-inbox [-L <socket>] [--pid <n>] status <pane-id>        Zustand laut Register
   wb-inbox [-L <socket>] [--pid <n>] transcript <pane-id>    Pfad der Gespraechsdatei
+  wb-inbox pause an|aus|status [--base <dir>] [--vorrat <dir>] [--grund <text>] [--json]
+                                                             Pausenschalter fuer Agent-Verkehr
+
+PAUSENSCHALTER FUER AGENT-VERKEHR (Bau-Schritt 3 des Agents-Features,
+docs/AGENTS-PLAN.md, Abschnitt 4 „Kommunikation zwischen Agenten", Anhang
+„Bremsen"). `pause an [--grund <text>]` legt `<vorrat>/.agentverkehr-pause`
+an (Zeit und Grund als JSON, 0600); `pause aus` entfernt sie; `pause status`
+zeigt den Stand. `<vorrat>` folgt derselben Regel wie bei `wb-traeger`:
+`--vorrat`, sonst `WB_VORRAT`, sonst `<--base oder $HOME>/.claude/workbench/vorrat`
+— absichtlich dieselbe Datei, die `wb-traeger status` schon anzeigt
+(docstring dort, Abschnitt „ZUSTAND IN DATEIEN").
+
+Bei gesetztem Schalter lehnt `sende` eine Nachricht der Agent-Klassen
+`hauptagent` und `companion-agent` ab; `traeger` und `mensch` gehen durch.
+Die Klasse leitet `sende` aus messbarer Herkunft ab, und nur bei gesetztem
+Schalter, weil sie sonst nichts entscheidet: `traeger`, wenn die PID aus
+`<vorrat>/.traeger.pid` in der Elternkette des Aufrufers steht und dieser
+Prozess wie `wb-traeger` aussieht; sonst `mensch`, wenn `wb-mensch pruefen`
+es bestätigt; sonst `hauptagent`. `--absender hauptagent|companion-agent|
+traeger|mensch` (vor dem Unterbefehl) kann die Klasse nur auf eine geblockte
+herabsetzen, nie anheben: wer `traeger` oder `mensch` behauptet, ohne es zu
+sein, bleibt `hauptagent`. Eine abgelehnte Sendung meldet „zurückgehalten" nach
+stderr, sendet nichts und endet mit Exit 4; geprüft wird `WB_VORRAT` (sonst
+`$HOME/.claude/workbench/vorrat`) — `sende` kennt kein `--base` eigens, ein
+Aufrufer, der einen anderen Vorrat treffen will, setzt `WB_VORRAT` in seiner
+Umgebung (so macht es `wb-traeger`).
 
 WELCHER TMUX-SERVER (2026-08-20, nach einem Vorfall). Ohne `-L`/`--socket` und
 ohne `WB_TMUX_SOCKET` gilt der umgebende Server, wie bisher. Bis heute gab es
@@ -72,6 +99,7 @@ luegen kann. Dieses Werkzeug meldet ehrlich nur, was es weiss: an welchen Prozes
 geschrieben wurde, und ob das Schreiben gelang.
 """
 
+import datetime
 import glob
 import json
 import os
@@ -87,6 +115,72 @@ TMUX_SOCKET = os.environ.get("WB_TMUX_SOCKET", "") or ""
 
 # Nur diese PID gilt als gueltiger Empfaenger (0 = kein Riegel).
 NUR_PID = 0
+
+# Absender-Klassen des Pausenschalters (Bau-Schritt 3). Geblockt bei
+# geschlossenem Schalter sind nur die beiden Agent-Klassen. Die Klasse kommt
+# aus der Herkunft (absender_klasse); `--absender` setzt sie nur herab.
+ABSENDER_KLASSEN = ("hauptagent", "companion-agent", "traeger", "mensch")
+ABSENDER_GEBLOCKT = ("hauptagent", "companion-agent")
+ABSENDER = None
+
+
+def _prozess(pid):
+    """(ppid, Befehlszeile) eines Prozesses, oder None, wenn ps ihn nicht kennt."""
+    try:
+        r = subprocess.run(["ps", "-o", "ppid=", "-o", "command=", "-p", str(pid)],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    teile = r.stdout.strip().split(None, 1)
+    if r.returncode != 0 or not teile or not teile[0].isdigit():
+        return None
+    return int(teile[0]), (teile[1] if len(teile) > 1 else "")
+
+
+def aus_traeger(vorrat):
+    """Kommt dieser Aufruf vom laufenden Träger dieses Vorrats? Seine PID aus
+    `.traeger.pid` muss in der Elternkette stehen, und der Prozess muss nach
+    wb-traeger aussehen -- eine liegengebliebene PID-Datei, deren Nummer
+    inzwischen einer Shell gehört, ist kein Träger."""
+    try:
+        with open(os.path.join(vorrat, ".traeger.pid"), encoding="utf-8") as f:
+            traeger_pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    pid = os.getppid()
+    for _ in range(64):
+        if pid <= 1:
+            return False
+        info = _prozess(pid)
+        if info is None:
+            return False
+        if pid == traeger_pid:
+            return "wb-traeger" in info[1]
+        pid = info[0]
+    return False
+
+
+def ist_mensch():
+    """`wb-mensch pruefen` entscheidet; fehlt es oder scheitert es, ist es kein Mensch."""
+    try:
+        r = subprocess.run(["wb-mensch", "pruefen"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def absender_klasse(vorrat):
+    """Die wirksame Absender-Klasse: gemessen, durch `--absender` nur auf
+    eine geblockte Klasse herabgesetzt. Wer `traeger` oder `mensch`
+    behauptet, ohne es zu sein, ist `hauptagent`."""
+    if ABSENDER in ABSENDER_GEBLOCKT:
+        return ABSENDER
+    if aus_traeger(vorrat):
+        return "traeger"
+    if ist_mensch():
+        return "mensch"
+    return "hauptagent"
 
 # Nach dem Verbinden ablesen, WELCHER Prozess am anderen Ende haengt -- die
 # Frage, die eine Socketadresse mit einer PID darin sonst nur behauptet.
@@ -258,7 +352,136 @@ def cmd_status(pane):
     return 0
 
 
+def jetzt_iso():
+    roh = os.environ.get("WB_TRAEGER_JETZT", "").strip()
+    if roh:
+        d = datetime.datetime.fromisoformat(roh[:-1] + "+00:00" if roh.endswith("Z") else roh)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return d.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def vorrat_bestimmen(base=None, vorrat_override=None):
+    """--vorrat, sonst WB_VORRAT, sonst <base oder $HOME>/.claude/workbench/vorrat
+    -- dieselbe Regel wie in wb-traeger (kontext_bauen), damit beide denselben
+    Pausenschalter sehen."""
+    if vorrat_override:
+        return os.path.abspath(vorrat_override)
+    env = os.environ.get("WB_VORRAT")
+    if env:
+        return os.path.abspath(env)
+    wurzel = os.path.abspath(base) if base else os.path.expanduser("~")
+    return os.path.join(wurzel, ".claude", "workbench", "vorrat")
+
+
+def pause_datei(vorrat):
+    return os.path.join(vorrat, ".agentverkehr-pause")
+
+
+def pause_lesen(vorrat):
+    pfad = pause_datei(vorrat)
+    if not os.path.isfile(pfad):
+        return None
+    try:
+        with open(pfad, encoding="utf-8") as f:
+            daten = json.load(f)
+        if isinstance(daten, dict):
+            return {"seit": daten.get("seit"), "grund": daten.get("grund") or None}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"seit": None, "grund": None}
+
+
+def cmd_pause_an(vorrat, grund):
+    os.makedirs(vorrat, exist_ok=True)
+    pfad = pause_datei(vorrat)
+    inhalt = json.dumps({"seit": jetzt_iso(), "grund": grund or None}, ensure_ascii=False) + "\n"
+    with open(pfad, "w", encoding="utf-8") as f:
+        f.write(inhalt)
+    os.chmod(pfad, 0o600)
+    sys.stdout.write("Agent-Verkehr pausiert.\n")
+    return 0
+
+
+def cmd_pause_aus(vorrat):
+    try:
+        os.unlink(pause_datei(vorrat))
+    except FileNotFoundError:
+        pass
+    sys.stdout.write("Agent-Verkehr offen.\n")
+    return 0
+
+
+def cmd_pause_status(vorrat, als_json):
+    pause = pause_lesen(vorrat)
+    if als_json:
+        if pause is None:
+            sys.stdout.write(json.dumps({"aktiv": False}, ensure_ascii=False) + "\n")
+        else:
+            sys.stdout.write(json.dumps(
+                {"aktiv": True, "seit": pause.get("seit"), "grund": pause.get("grund")},
+                ensure_ascii=False) + "\n")
+        return 0
+    if pause is None:
+        sys.stdout.write("Agent-Verkehr: offen\n")
+        return 0
+    teile = ["pausiert"]
+    if pause.get("seit"):
+        teile.append("seit %s" % pause["seit"])
+    if pause.get("grund"):
+        teile.append("(%s)" % pause["grund"])
+    sys.stdout.write("Agent-Verkehr: %s\n" % " ".join(teile))
+    return 0
+
+
+def cmd_pause(rest):
+    if not rest:
+        fehler("Aufruf: wb-inbox pause an|aus|status [--base <dir>] [--vorrat <dir>] "
+               "[--grund <text>] [--json]")
+        return 2
+    aktion, rest = rest[0], rest[1:]
+    base = vorrat_override = grund = None
+    als_json = False
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--base" and i + 1 < len(rest):
+            base = rest[i + 1]; i += 2; continue
+        if a == "--vorrat" and i + 1 < len(rest):
+            vorrat_override = rest[i + 1]; i += 2; continue
+        if a == "--grund" and i + 1 < len(rest):
+            grund = rest[i + 1]; i += 2; continue
+        if a == "--json":
+            als_json = True; i += 1; continue
+        fehler("wb-inbox pause: unbekanntes Argument '%s'." % a)
+        return 2
+    vorrat = vorrat_bestimmen(base, vorrat_override)
+    if aktion == "an":
+        return cmd_pause_an(vorrat, grund)
+    if aktion == "aus":
+        return cmd_pause_aus(vorrat)
+    if aktion == "status":
+        return cmd_pause_status(vorrat, als_json)
+    fehler("wb-inbox pause: '%s' unbekannt (an|aus|status)." % aktion)
+    return 2
+
+
 def cmd_sende(pane, datei):
+    vorrat = vorrat_bestimmen()
+    pause = pause_lesen(vorrat)
+    # Die Herkunft wird nur gemessen, wenn sie etwas entscheidet: ps-Kette und
+    # wb-mensch kosten Zeit, und bei offenem Schalter geht jede Klasse durch.
+    if pause is not None:
+        klasse = absender_klasse(vorrat)
+        if klasse in ABSENDER_GEBLOCKT:
+            teile = ["zurückgehalten — Agent-Verkehr ist pausiert (Absender-Klasse '%s')" % klasse]
+            if pause.get("seit"):
+                teile.append("seit %s" % pause["seit"])
+            if pause.get("grund"):
+                teile.append("(%s)" % pause["grund"])
+            fehler(" ".join(teile) + ".")
+            return 4
     d = sitzung_zu_pane(pane)
     if not d:
         fehler("keine lebende Claude-Sitzung unter Pane %s (Register %s%s%s)."
@@ -325,8 +548,8 @@ def cmd_sende(pane, datei):
 
 
 def main(argv):
-    global TMUX_SOCKET, NUR_PID
-    while argv and argv[0] in ("-L", "--socket", "--pid"):
+    global TMUX_SOCKET, NUR_PID, ABSENDER
+    while argv and argv[0] in ("-L", "--socket", "--pid", "--absender"):
         if len(argv) < 2:
             fehler("nach %s fehlt der Wert." % argv[0])
             return 2
@@ -335,6 +558,11 @@ def main(argv):
                 fehler("--pid erwartet eine Zahl, nicht '%s'." % argv[1])
                 return 2
             NUR_PID = int(argv[1])
+        elif argv[0] == "--absender":
+            if argv[1] not in ABSENDER_KLASSEN:
+                fehler("--absender kennt '%s' nicht (erlaubt: %s)." % (argv[1], ", ".join(ABSENDER_KLASSEN)))
+                return 2
+            ABSENDER = argv[1]
         else:
             TMUX_SOCKET = argv[1]
         argv = argv[2:]
@@ -350,8 +578,11 @@ def main(argv):
         return cmd_transcript(argv[1])
     if befehl == "sende" and len(argv) == 3:
         return cmd_sende(argv[1], argv[2])
+    if befehl == "pause":
+        return cmd_pause(argv[1:])
     fehler("Aufruf: wb-inbox finde|status|transcript <pane> "
-           "| wb-inbox sende <pane> <textdatei>")
+           "| wb-inbox [--absender <klasse>] sende <pane> <textdatei> "
+           "| wb-inbox pause an|aus|status [--base <dir>] [--vorrat <dir>] [--grund <text>] [--json]")
     return 2
 
 

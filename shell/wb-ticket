@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Eine Welt <host>:/pfad liegt verbindlich auf einer anderen Maschine: der ganze Befehl laeuft dort.
+for arg in "$@"; do
+  case "$arg" in
+    [a-z]*:/*)
+      if python3 "$SCRIPT_DIR/agents_fernweg.py" pruefen ticket "$@"; then
+        exec python3 "$SCRIPT_DIR/agents_fernweg.py" ausfuehren ticket "$@"
+      fi
+      break ;;
+  esac
+done
+if [ "${1:-}" = "neu" ]; then
+  # Absender- und Inbox-Option (docs/AGENTS-PLAN.md Abschnitt 7): `--welt <ordner>` steht fuer den
+  # Ordner als erstes Argument; mit `--absender orchestrator` traegt `neu` die Sitzungs-Inbox der
+  # aufrufenden Claude-Code-Sitzung als Rueckweg ein (`--inbox auto|keine`, `--inbox-pid <pid>`).
+  # Nach erfolgreichem Schreiben den Traeger der Welt wecken, falls einer konfiguriert ist.
+  exec python3 - "$SCRIPT_DIR" "$@" <<'PY'
+import os, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+import agents_data as ad
+try:
+    argv, route, warning = ad.prepare_ticket_new(sys.argv[2:], start_pid=os.getppid())
+except ad.AgentsError as exc:
+    print("wb-ticket: FEHLER: %s" % exc, file=sys.stderr)
+    raise SystemExit(2)
+if warning:
+    print("wb-ticket: %s" % warning, file=sys.stderr)
+status = ad.run("ticket", argv)
+if status == 0:
+    subprocess.run([sys.executable, os.path.join(sys.argv[1], "agents_traeger_wecken.py"), "ticket"] + argv)
+raise SystemExit(status)
+PY
+fi
+exec python3 "$SCRIPT_DIR/agents_data.py" ticket "$@"

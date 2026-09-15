@@ -101,6 +101,24 @@ export function ansichtOffen(l: AnsichtsLage): boolean {
 }
 
 /**
+ * Ist die Chat-Ansicht fuer einen HARNESS erlaubt (Ebene 2, der Schalter aus
+ * "Programme und Modelle")? `explizit` ist der Wert aus der Einstellung
+ * `chatAnsicht[harness]` -- `undefined`, wenn dort nie etwas gesetzt wurde.
+ *
+ * OHNE EXPLIZITE WAHL GILT: an, wo der Harness es KANN (22.08., des Nutzers
+ * Wortlaut zum Griff an jedem Pane: "ich will, dass man das jederzeit
+ * wechseln kann"). Ein Schalter, der eine vorhandene Faehigkeit erst nach
+ * einem Besuch der Einstellungen freigibt, widerspricht genau diesem Satz --
+ * derselbe Grundsatz, der am 06.08. schon das Kontextmenue traf ("sie sollen
+ * immer verfuegbar sein"). Eine EXPLIZITE Wahl -- an oder aus -- bleibt aber
+ * immer die letzte Antwort, unabhaengig von der Faehigkeit: wer einen Harness
+ * bewusst abgeschaltet hat, meinte das so.
+ */
+export function harnessErlaubt(explizit: boolean | undefined, kann: boolean): boolean {
+  return typeof explizit === 'boolean' ? explizit : kann;
+}
+
+/**
  * Die Einstellung `chatAnsichtVorgabe`, aus dem gedeutet, was in der Datei
  * steht.
  *

@@ -9,6 +9,9 @@
       content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:"
     />
     <title>Agent Workbench — Sessions</title>
+    <!-- DAS TOKEN-SYSTEM, an einer Stelle: main/thema.ts (ROLLEN, rollenCss()),
+         identisch in allen fuenf Fenstern. -->
+    <link rel="stylesheet" href="tokens.css" />
     <style>
       /* EINE Seite (Umbau 06.08.). Die Zwei-Seiten-Form mit Seitenliste links
          ist weg: das Fenster beantwortet eine einzige Frage -- welche Sitzung --,
@@ -17,17 +20,6 @@
          (app/src/einstellungen/index.html), damit zwei Fenster desselben
          Programms wie zwei Fenster desselben Programms aussehen. */
       :root {
-        color-scheme: dark;
-        --grund: #101216;
-        --leiste: #171a20;
-        --linie: #262b34;
-        --schrift: #d8dee9;
-        --gedaempft: #8b93a1;
-        --laeuft: #46a758;
-        --will: #e0a020;
-        --aus: #d24c4c;
-        --fern: #6a7fd0;
-        --wahl: #222833;
         /* Die zwei Sitzungszustaende, die dieses Fenster als eigene Marke
            zeigt (Farben durchreichen, 11.08.) -- vom Menschen gewaehlt
            (Einstellungen, Seite "Aussehen") und von main/thema.ts je Thema
@@ -37,24 +29,10 @@
         --zustand-laeuft: #4ea1ff;
         --zustand-wartet: #e0a33e;
       }
-      /* HELL UND DUNKEL, dieselbe Mechanik wie im Einstellungsfenster
-         (app/src/einstellungen/index.html): `data-thema` traegt den von
-         main/thema.ts AUFGELOESTEN Wert ('hell'/'dunkel'), nie 'system'.
-         sitzung.ts fasst diese Datei nicht an (Sprachschicht) -- die
-         Anwendung steht deshalb als eigenes Skript unten, nicht dort. */
-      :root[data-thema='hell'] {
-        color-scheme: light;
-        --grund: #ffffff;
-        --leiste: #f4f5f7;
-        --linie: #d8dbe1;
-        --schrift: #1b1f27;
-        --gedaempft: #5c6472;
-        --laeuft: #22803c;
-        --will: #9a6600;
-        --aus: #b3261e;
-        --fern: #3355c4;
-        --wahl: #e4e8f4;
-      }
+      /* `data-thema` traegt den von main/thema.ts AUFGELOESTEN Wert
+         ('hell'/'dunkel'), nie 'system'. sitzung.ts fasst diese Datei nicht an
+         (Sprachschicht) -- die Anwendung steht deshalb als eigenes Skript unten,
+         nicht dort. */
       html,
       body {
         margin: 0;
@@ -63,8 +41,11 @@
         color: var(--schrift);
         overflow: hidden;
       }
+      /* Systemschrift (HIG Typography), 13pt -- Monospace bleibt gezielt fuer
+         Pfade und Modellkennungen (siehe die entsprechenden Klassen unten),
+         nicht fuer das ganze Fenster. */
       body {
-        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui;
         display: flex;
         flex-direction: column;
       }
@@ -97,9 +78,19 @@
         color: var(--gedaempft);
         margin: 0;
       }
+      /* WRAP, nicht nur am #kopf: der aeussere Kasten bricht schon um, diese
+         Reihe tat es nicht -- ihre vier Bedienelemente standen fest in einer
+         Zeile und der letzte Knopf lief bei der Vorgabebreite von 900 Pixeln
+         (main/sitzungsfenster.ts) rechts aus dem Fenster. Auf Englisch tragen
+         die drei Knoepfe zusammen deutlich mehr Text als auf Deutsch, deshalb
+         faellt es dort zuerst auf. Sie duerfen jetzt in eine zweite Zeile
+         rutschen und richten sich dabei nach rechts aus, damit die Reihe unter
+         dem Titel nicht ausfranst. */
       #kopf .start {
         flex: 0 1 auto;
         display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
         align-items: center;
         gap: 8px;
       }
@@ -231,7 +222,7 @@
         border-bottom: 0;
       }
       #neu-wahl-block .wahleintrag:hover {
-        background: #1e232b;
+        background: var(--erhoben);
       }
       #neu-wahl-block .wahleintrag.gewaehlt {
         background: var(--wahl);
@@ -309,7 +300,7 @@
       }
       .filterzeile button.gewaehlt {
         background: var(--wahl);
-        border-color: var(--fern);
+        border-color: var(--akzent);
         color: var(--schrift);
       }
       #such-feld {
@@ -318,21 +309,24 @@
       }
 
       /* Der eine Knopf, fuer den es dieses Fenster gibt: gefuellt statt
-         umrandet. Ruhig -- eine Flaeche, kein Leuchten, keine Bewegung. */
+         umrandet. Ruhig -- eine Flaeche, kein Leuchten, keine Bewegung. Die
+         Flaeche ist die SYSTEMAKZENTFARBE (--akzent, main/thema.ts) -- dieselbe
+         Farbe wie der Hauptknopf jedes anderen Fensters, nicht mehr eine eigene
+         (vorher: --fern, blau-violett, wo die Startseite gruen zeigte). */
       .knopf.haupt {
-        background: var(--fern);
-        border-color: var(--fern);
-        color: #0b0e13;
+        background: var(--akzent);
+        border-color: var(--akzent);
+        color: var(--akzent-tinte);
         font-weight: 600;
       }
+      /* Heller/dunkler statt einer zweiten fest verdrahteten Farbe: --akzent
+         kommt live vom System und kann jeder Farbton sein, `brightness()`
+         wirkt auf jeden gleich. */
       .knopf.haupt:hover:not(:disabled) {
-        background: #7d90da;
-        border-color: #7d90da;
+        filter: brightness(1.12);
       }
       .knopf.haupt:disabled {
-        background: #39415c;
-        border-color: #39415c;
-        color: #8b93a1;
+        opacity: 0.45;
       }
 
       /* --- die Liste der Gruppen --------------------------------------- */
@@ -369,6 +363,7 @@
         flex: 1 1 auto;
         min-width: 0;
         word-break: break-all;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       }
       /* Wieviele Sitzungen dieser Ordner traegt -- eine Auskunft, kein Knopf.
          Der Ausklapp-Knopf, der hier stand, ist am 11.08. weggefallen: es ist
@@ -393,7 +388,7 @@
         cursor: pointer;
       }
       .listenzeile:hover {
-        background: #1e232b;
+        background: var(--erhoben);
       }
       .listenzeile.gewaehlt {
         background: var(--wahl);
@@ -478,7 +473,7 @@
         min-width: 140px;
       }
       input:focus {
-        outline: 1px solid var(--fern);
+        outline: 1px solid var(--akzent);
         outline-offset: -1px;
       }
       .knopf {
@@ -492,7 +487,7 @@
         flex: 0 0 auto;
       }
       .knopf:hover:not(:disabled) {
-        background: #1e232b;
+        background: var(--erhoben);
       }
       .knopf.tun {
         border-color: var(--laeuft);
@@ -507,8 +502,8 @@
         color: var(--aus);
       }
       .knopf:disabled {
-        color: #5d6675;
-        border-color: #333a45;
+        color: var(--gedaempft);
+        border-color: var(--linie);
         cursor: not-allowed;
       }
 

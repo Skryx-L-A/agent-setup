@@ -1,0 +1,72 @@
+{
+  "source": "$HOME/.claude/skills/scroll-welt/SKILL.md",
+  "sha256": "e468f3e7db5f9c625acbba5a5f577fbf0192913431761e97c70e4285c6a4ce95",
+  "bytes": 35764,
+  "sections": [
+    {
+      "file": "00.md",
+      "heading": "scroll-welt",
+      "sha256": "a5f9dc136e82c8442afd05bd10031c2399fb2f965a570ca1bd0cfc86ed82100c"
+    },
+    {
+      "file": "01.md",
+      "heading": "Wegwahl",
+      "sha256": "5137dcbd61b4e7b3cde33a86b550c1768e77f52c6d282b59719ab15e598686c3"
+    },
+    {
+      "file": "02.md",
+      "heading": "Zwei Hürden auf dem lokalen Videoweg – ungeschönt",
+      "sha256": "9af43eba9e2e17919d8926c4432ae2b04a6f4d3a6d40ab7da92cd8337773ef12"
+    },
+    {
+      "file": "03.md",
+      "heading": "Interview",
+      "sha256": "82265fdab6a9af7016610b7a9a733dd34a6dfcd6783ec794fcdd149d2fbd8be0"
+    },
+    {
+      "file": "04.md",
+      "heading": "Vertrag für render(t, ctx)",
+      "sha256": "17c3f53ed5f1d9c7f60d33bfe475c3ea23367799876dd55dd969ef74f804bf4e"
+    },
+    {
+      "file": "05.md",
+      "heading": "Bauschritte je Weg",
+      "sha256": "242fc256f7fe7296fd03309d12051d9610b70ed1012033403e6c5107a0fe3270"
+    },
+    {
+      "file": "06.md",
+      "heading": "Das Nahtgesetz",
+      "sha256": "85fe0fd44beaef1278f95bce4f681045c3d65804239bd9e5a7241b125675fa1c"
+    },
+    {
+      "file": "07.md",
+      "heading": "Telefon",
+      "sha256": "55fd5b20a493775182f14e2e856490f415618705969e107e0ecb82ec1fc88258"
+    },
+    {
+      "file": "08.md",
+      "heading": "QA",
+      "sha256": "6421e9c863fad0448e059157764da87cbd61c7181e1870f812357905c10f5c53"
+    },
+    {
+      "file": "09.md",
+      "heading": "Gotchas",
+      "sha256": "1a240bda311da39b32d45443bb884d5f99136078710afeb730bdd3394592d798"
+    },
+    {
+      "file": "10.md",
+      "heading": "Damit nicht jede Seite dieselbe Seite wird",
+      "sha256": "0989590af52c2daa5d82ddbd19845542483a14cf145bc0d9f7a153b1081ab324"
+    },
+    {
+      "file": "11.md",
+      "heading": "Einhängen in design-bausteine",
+      "sha256": "c0add42f4bf855641b912dfdb5a5e7aee78673b5588cca476b80c02dfa19dbef"
+    },
+    {
+      "file": "12.md",
+      "heading": "Referenzen",
+      "sha256": "e49312bc58f095fd94c4c8c4787ee57f20d0ee6f5cbcb142fd60e839cb31f1f0"
+    }
+  ]
+}

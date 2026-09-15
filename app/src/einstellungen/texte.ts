@@ -45,7 +45,7 @@ export type Sprache = 'de' | 'en';
  * sucht seinen Einstellungs-Schluessel -- der ist zugleich die Kennung hier.
  */
 export const DE: Record<string, string> = {
-  'fenster.titel': 'Agent-Workbench — Einstellungen',
+  'fenster.titel': 'Agent-Workbench – Einstellungen',
   // --- Die sieben Seiten ---------------------------------------------------
   'seite.sitzung.titel': 'Sitzung',
   'seite.sitzung.wofuer': 'Womit eine neue Sitzung anfängt',
@@ -121,7 +121,7 @@ export const DE: Record<string, string> = {
   'feld.orchestratorHarness.wirkung':
     'Welche Agenten-CLI der Orchestrator-Pane startet. Die Zahl daneben nennt die Modelle, die dazu passen.',
   'feld.orchestratorHarness.info':
-    'Jeder registrierte Adapter steht zur Wahl, nicht nur Claude Code und pi. „fehlt hier" heißt: das '
+    'Jeder registrierte Adapter steht zur Wahl, nicht nur Claude Code und pi. „fehlt hier“ heißt: das '
     + 'Programm dieses Adapters gibt es auf {maschine} nicht, ein Start liefe ins Leere. Geprüft wird '
     + 'dasselbe, was auch wb-state vor einem Start prüft: das Binary im Pfad.',
   'feld.orchestratorHarness.etikett': 'gilt für die nächste Sitzung',
@@ -130,24 +130,24 @@ export const DE: Record<string, string> = {
   'feld.orchestratorModel.wirkung':
     'Womit der Orchestrator denkt, solange beim Start nichts anderes gesagt wird.',
   'feld.orchestratorModel.info':
-    '{anzahl} Modelle mit der Rolle „Orchestrator" für dieses Programm. Die Kennung rechts ist die, mit '
+    '{anzahl} Modelle mit der Rolle „Orchestrator“ für dieses Programm. Die Kennung rechts ist die, mit '
     + 'der auch die Werkzeuge starten. Ein Modell, dessen Programm hier fehlt, bleibt in der Liste stehen '
-    + 'und ist rot markiert — damit man sieht, warum es nicht anläuft, statt es zu suchen.',
+    + 'und ist rot markiert – damit man sieht, warum es nicht anläuft, statt es zu suchen.',
   'feld.orchestratorModel.etikett': 'gilt für die nächste Sitzung',
   'feld.orchestratorModel.leerName': 'Modell',
   'feld.orchestratorModel.leerWirkung':
-    'Für dieses Programm ist kein Modell mit der Rolle „Orchestrator" eingetragen.',
+    'Für dieses Programm ist kein Modell mit der Rolle „Orchestrator“ eingetragen.',
   'feld.orchestratorModel.leerInfo':
     'Ein Modell mit dieser Rolle anlegen: wb-state models add-model … --roles orchestrator. Solange '
     + 'keins da ist, startet die Sitzung mit dem, was die CLI selbst vorgibt.',
-  'satz.keinModellFuerProgramm': 'Kein Modell mit Programm „{harness}" und Rolle „Orchestrator".',
+  'satz.keinModellFuerProgramm': 'Kein Modell mit Programm „{harness}“ und Rolle „Orchestrator“.',
 
   'feld.orchestratorEffort.name': 'Wie tief die Sitzung denkt',
   'feld.orchestratorEffort.wirkung':
-    'Die Stufe, mit der der Orchestrator startet. Deine Wahl — jede Stufe, die das Programm annimmt.',
+    'Die Stufe, mit der der Orchestrator startet. Deine Wahl – jede Stufe, die das Programm annimmt.',
   'feld.orchestratorEffort.info':
     'Das ist die Wahl eines Menschen, und einen Menschen bindet kein Deckel: alle Stufen sind wählbar, '
-    + 'auch die über dem Deckel; sie tragen nur eine Markierung. Der Deckel ist etwas anderes — er ist die '
+    + 'auch die über dem Deckel; sie tragen nur eine Markierung. Der Deckel ist etwas anderes – er ist die '
     + 'Selbstbindung des Orchestrators für Worker, die er ohne Rückfrage startet. Welche Stufen es '
     + 'überhaupt gibt, sagt das Programm selbst: gemessen an seiner Hilfe, nicht aus einer Liste '
     + 'abgeschrieben. Höhere Stufen kosten mehr Zeit und mehr Kontingent.',
@@ -155,13 +155,13 @@ export const DE: Record<string, string> = {
 
   'feld.orchestratorKontext.name': 'Kontextfenster',
   'feld.orchestratorKontext.wirkung':
-    'Wie viel Text „{modell}" gleichzeitig im Kopf behält. Nur bei einem Modell, das hier auf der '
-    + 'Maschine läuft — bei einem Modell aus der Cloud gehört diese Zahl dem Anbieter.',
+    'Wie viel Text „{modell}“ gleichzeitig im Kopf behält. Nur bei einem Modell, das hier auf der '
+    + 'Maschine läuft – bei einem Modell aus der Cloud gehört diese Zahl dem Anbieter.',
   'feld.orchestratorKontext.info':
     'Ein größeres Fenster hält mehr Zusammenhang, belegt aber dauerhaft mehr Grafikspeicher: der Bedarf '
     + 'steigt mit jedem Token, und was nicht mehr hineinpasst, lässt den Start scheitern. Deshalb steht '
     + 'an jeder Stufe, was sie braucht und was gerade frei ist. Gesperrt ist nichts: Stufen, für die der '
-    + 'Speicher heute nicht reicht, bleiben wählbar und tragen einen Hinweis — die Entscheidung liegt bei '
+    + 'Speicher heute nicht reicht, bleiben wählbar und tragen einen Hinweis – die Entscheidung liegt bei '
     + 'dir, nicht beim Programm. Gemessen wird sie von wb-kontext, zusammen mit dem freien Speicher '
     + 'dieses Augenblicks. Die Wahl gilt für den Orchestrator; über die Fenster der Worker entscheidet '
     + 'der Orchestrator selbst.',
@@ -171,7 +171,7 @@ export const DE: Record<string, string> = {
   'satz.kontextBedarf': 'Braucht {bedarf} GiB.',
   'satz.kontextSpeicher': 'Frei sind {frei} GiB, die Gewichte des Modells belegen davon {gewichte} GB.',
   'satz.kontextFremderWert':
-    'Gespeichert sind {tokens} Token — diese Stufe bietet das gewählte Modell nicht an. '
+    'Gespeichert sind {tokens} Token – diese Stufe bietet das gewählte Modell nicht an. '
     + 'Solange keine der Stufen gewählt ist, startet die Sitzung mit dem gespeicherten Wert.',
   'satz.kontextWirdErmittelt': 'Die Stufen werden ermittelt …',
   'satz.kontextNichtErmittelt':
@@ -183,16 +183,16 @@ export const DE: Record<string, string> = {
     'Diesen Ordner schlägt der Plus-Knopf vor, solange du keinen anderen wählst.',
   'feld.newSessionDefaultDir.info':
     'Der Vorschlag, mehr nicht: gewählt wird im Ordner-Dialog, und wer dort etwas anderes nimmt, bekommt '
-    + 'das andere. „~" steht für dein Heimatverzeichnis. Diese Einstellung war bis zum 11.08. nur in der '
+    + 'das andere. „~“ steht für dein Heimatverzeichnis. Diese Einstellung war bis zum 11.08. nur in der '
     + 'VS-Code-Erweiterung erreichbar, obwohl dieses Programm sie längst liest; deshalb steht sie jetzt hier.',
   'feld.newSessionDefaultDir.etikett': 'gilt für die nächste Sitzung',
 
   'feld.showStopped.name': 'Beendete Sitzungen mitzeigen',
   'feld.showStopped.wirkung':
-    'An: die Leiste zeigt auch Sitzungen, deren Terminal nicht mehr läuft — rot markiert.',
+    'An: die Leiste zeigt auch Sitzungen, deren Terminal nicht mehr läuft – rot markiert.',
   'feld.showStopped.info':
     'Aus (Vorgabe) hält die Leiste kurz: nur, was gerade lebt. An ist nützlich, wenn man eine Sitzung von '
-    + 'gestern wiederaufnehmen will — sie steht dann mit ihrem Ordner da und lässt sich anklicken. Das ist '
+    + 'gestern wiederaufnehmen will – sie steht dann mit ihrem Ordner da und lässt sich anklicken. Das ist '
     + 'eine Einstellung und keine tägliche Handlung, deshalb steht sie hier und nicht als Knopf in der Leiste.',
   'feld.showStopped.etikett': 'sofort',
 
@@ -200,21 +200,31 @@ export const DE: Record<string, string> = {
   'feld.sort.wirkung':
     'Wonach die Sitzungen stehen, solange keine eigene Reihenfolge gezogen wurde.',
   'feld.sort.info':
-    'Von Hand gezogen schlägt diese Vorgabe immer — wer eine Sitzung an einen Platz zieht, will sie dort '
-    + 'haben. Die Vorgabe greift für alles, was danach dazukommt. „zuletzt benutzt" ordnet nach der letzten '
+    'Von Hand gezogen schlägt diese Vorgabe immer – wer eine Sitzung an einen Platz zieht, will sie dort '
+    + 'haben. Die Vorgabe greift für alles, was danach dazukommt. „zuletzt benutzt“ ordnet nach der letzten '
     + 'Bewegung im Terminal, nicht nach dem Anlegen.',
   'feld.sort.etikett': 'sofort',
   'wort.sort.recent': 'zuletzt benutzt',
   'wort.sort.folder': 'nach Ordner',
   'wort.sort.name': 'nach Name',
 
+  // Die Einheiten hinter den Zahlenfeldern und die Ueberschrift der Seitenliste. Sie
+  // standen bis 03.09.2026 als deutsche Literale im Code (einstellungen.ts) und im
+  // Geruest (index.html) und blieben deshalb auch in der englischen Fassung deutsch --
+  // das war die sichtbare Sprachmischung im Fenster, obwohl beide Tabellen hier
+  // vollstaendig sind (536 Schluessel, keine Luecke).
+  'wort.einheit.punkt': 'Punkt',
+  'wort.einheit.zeilen': 'Zeilen',
+  'wort.einheit.spalten': 'Spalten',
+  'wort.einstellungen': 'Einstellungen',
+
   'feld.closeSessionOnWindowClose.name': 'Terminal mit dem Fenster beenden',
   'feld.closeSessionOnWindowClose.wirkung':
-    'Aus (Vorgabe): das Fenster geht zu, die tmux-Sitzung dahinter läuft weiter — beendet wird sie über '
+    'Aus (Vorgabe): das Fenster geht zu, die tmux-Sitzung dahinter läuft weiter – beendet wird sie über '
     + 'den Rechtsklick auf die Sitzung. An: schließt man das Fenster, endet auch die Sitzung.',
   'feld.closeSessionOnWindowClose.info':
     'Gemessen am 04.08.: drei geschlossene Fenster hielten ihre tmux-Sitzungen am Leben und zusammen 6,0 GB '
-    + 'belegt. Ein Neuladen beendet nie etwas — die Sitzung gilt erst nach einer Karenzzeit als verwaist, und '
+    + 'belegt. Ein Neuladen beendet nie etwas – die Sitzung gilt erst nach einer Karenzzeit als verwaist, und '
     + 'ein zurückkehrendes Fenster nimmt die Marke wieder weg. Läuft noch ein Worker, bleibt sie ohnehin '
     + 'offen. Seit dem 07.08. steht die Vorgabe trotzdem auf aus: belegter Speicher lässt sich jederzeit '
     + 'zurückholen, eine versehentlich beendete Sitzung samt laufender Arbeit nicht.',
@@ -226,7 +236,7 @@ export const DE: Record<string, string> = {
     'An: ein Worker hält bei einem Schreibzugriff nicht an, sondern arbeitet durch.',
   'feld.workerSkipPermissions.info':
     'Das ist die folgenreichste stille Festlegung des ganzen Aufbaus, und sie stand bis zum 06.08. nur in '
-    + 'einer Zeile Shell-Code. Die Guards und die Rückfrage-Stufe greifen weiterhin — die '
+    + 'einer Zeile Shell-Code. Die Guards und die Rückfrage-Stufe greifen weiterhin – die '
     + 'Berechtigungsabfrage der CLI nicht. Aus heißt: jeder Worker hält bei jedem Schreibzugriff an und '
     + 'wartet auf einen Menschen; ein Nachtlauf steht dann bis zum Morgen.',
   'feld.workerSkipPermissions.etikett': 'gilt für den nächsten Worker',
@@ -247,7 +257,7 @@ export const DE: Record<string, string> = {
     'An: jeder Worker arbeitet in einem git-Repo in seinem eigenen Ordner und Zweig statt im gemeinsamen.',
   'feld.workerWorktrees.info':
     'Der Baum liegt unter ~/.pi-workers/worktrees/<name>, der Zweig heißt wb/<name>. Aus heißt: alle Worker '
-    + 'arbeiten im übergebenen Verzeichnis und begegnen sich dort — zwei, die dieselbe Datei anfassen, '
+    + 'arbeiten im übergebenen Verzeichnis und begegnen sich dort – zwei, die dieselbe Datei anfassen, '
     + 'überschreiben einander. Außerhalb eines git-Repos ändert der Schalter nichts. Er wirkt global, weil '
     + 'weder claude-worker noch pi-worker heute einen Schalter je Aufruf kennen.',
   'feld.workerWorktrees.etikett': 'gilt für den nächsten Worker',
@@ -268,18 +278,18 @@ export const DE: Record<string, string> = {
     'Diese Befehle werden angehalten, erscheinen in der Freigabe-Ansicht und laufen nach einer einmaligen '
     + 'Freigabe durch.',
   'feld.askPatterns.info':
-    'Weder harmlos noch verboten — das ist die Stufe dazwischen. Ein Muster trifft eine STELLE in der '
+    'Weder harmlos noch verboten – das ist die Stufe dazwischen. Ein Muster trifft eine Stelle in der '
     + 'zerlegten Befehlszeile, nicht eine Zeichenkette irgendwo im Text: sonst hielte schon ein Absatz, der '
-    + '„git clean -fd" nur erwähnt, den Guard an (so geschehen am 05.08.). Abgeschaltet statt gelöscht '
+    + '„git clean -fd“ nur erwähnt, den Guard an (so geschehen am 05.08.). Abgeschaltet statt gelöscht '
     + 'bleibt sichtbar, dass es das Muster gibt. Eine Freigabe gilt fünfzehn Minuten, hart gedeckelt im Modul.',
   'feld.askPatterns.etikett': 'sofort',
 
   'feld.secretExcludeDirs.name': 'Ordner, die keine Ansicht betritt',
   'feld.secretExcludeDirs.wirkung':
-    'Diese Ordner betritt keine Ansicht — sie werden übersprungen, nicht nur ausgeblendet.',
+    'Diese Ordner betritt keine Ansicht – sie werden übersprungen, nicht nur ausgeblendet.',
   'feld.secretExcludeDirs.info':
     'Dateibaum, Schnellöffner, Inhaltssuche und Editor fragen dieselbe Stelle; ein Filter, den eine Ansicht '
-    + 'umgehen kann, ist keiner. Geprüft wird JEDER Namensteil eines Pfades, nicht nur der letzte — sonst '
+    + 'umgehen kann, ist keiner. Geprüft wird jeder Namensteil eines Pfades, nicht nur der letzte – sonst '
     + 'käme projekt/.ssh/config durch. Die Liste steht hier und nicht im Quelltext, weil man sie sehen und '
     + 'prüfen können soll.',
   'feld.secretExcludeDirs.etikett': 'sofort',
@@ -288,14 +298,14 @@ export const DE: Record<string, string> = {
   'feld.secretExcludePatterns.wirkung':
     'Dateien, deren Name auf eines dieser Muster passt, tauchen in keiner Ansicht auf.',
   'feld.secretExcludePatterns.info':
-    'Ein Glob auf EINEN Namensteil, ohne Pfadtrenner: * steht für beliebig viele Zeichen, ? für eines. '
-    + 'Bewusst klein gehalten — ein voller Glob-Dialekt mit ** und {a,b} lädt zu Mustern ein, deren Wirkung '
+    'Ein Glob auf einen einzelnen Namensteil, ohne Pfadtrenner: * steht für beliebig viele Zeichen, ? für eines. '
+    + 'Bewusst klein gehalten – ein voller Glob-Dialekt mit ** und {a,b} lädt zu Mustern ein, deren Wirkung '
     + 'man nicht mehr sieht. Groß- und Kleinschreibung spielt keine Rolle.',
   'feld.secretExcludePatterns.etikett': 'sofort',
 
   'feld.werkzeuge.name': 'Werkzeuge und MCP-Server eines Agenten',
   'feld.werkzeuge.wirkung':
-    'Was ein Agent an Werkzeugen mitbekommt, steht heute in seiner eigenen Konfiguration — dieses Programm '
+    'Was ein Agent an Werkzeugen mitbekommt, steht heute in seiner eigenen Konfiguration – dieses Programm '
     + 'liest es, setzt es aber noch nicht.',
   'feld.werkzeuge.info':
     'Die Hooks unten kommen aus ~/.claude/settings.json und gelten für jede Claude-Sitzung dieser Maschine; '
@@ -310,14 +320,20 @@ export const DE: Record<string, string> = {
     'MCP-Server werden von mcp-shared als Hintergrunddienste gehalten und nicht von diesem Programm. '
     + 'Solange das so ist, steht hier kein Schalter dafür, sondern dieser Satz.',
 
-  // Die neun Guards -- Kennungen aus hooks/bash-guard.py, Text von hier.
+  // Die elf Guards -- Kennungen aus hooks/bash-guard.py, Text von hier.
   'guard.secrets.name': 'Geheimnisse',
   'guard.secrets.wirkung':
     'Hält jeden Befehl an, der einen Schlüssel, ein Zertifikat oder den Geheimnis-Ordner anfasst.',
   'guard.secrets.info':
-    'Deckt ~/Knowledge/90-secrets, ~/.ssh und die üblichen Zugangsdaten-Dateien ab — dieselbe Liste, die '
+    'Deckt ~/Knowledge/90-secrets, ~/.ssh und die üblichen Zugangsdaten-Dateien ab – dieselbe Liste, die '
     + 'auch die Ordneransicht auslässt. Aus heißt: ein Agent kann diese Dateien lesen, kopieren und in eine '
     + 'Ausgabe schreiben, ohne dass jemand gefragt wird.',
+  'guard.git-add.name': 'Alles auf einmal vormerken',
+  'guard.git-add.wirkung':
+    'Hält ein „git add“ an, das ein ganzes Verzeichnis oder den Arbeitsbaum einsammelt.',
+  'guard.git-add.info':
+    'Wer committet, nennt seine Pfade. Ein Verzeichnis-Add sieht harmlos aus und hat am 16.08. die halbfertige '
+    + 'Arbeit einer zweiten Sitzung in zwei fremde Commits gezogen. Aus heißt: „git add -A“ geht wieder durch.',
   'guard.kill-pattern.name': 'Fremde Prozesse beenden',
   'guard.kill-pattern.wirkung':
     'Hält Befehle an, die Prozesse abschießen, die dem Agenten nicht gehören.',
@@ -346,27 +362,33 @@ export const DE: Record<string, string> = {
   'guard.screencapture.wirkung':
     'Hält Befehle an, die den Bildschirm abfotografieren oder aufzeichnen.',
   'guard.screencapture.info':
-    'Ein Bildschirmfoto nimmt alles mit, was gerade offen ist — auch das, was niemanden etwas angeht. Für '
+    'Ein Bildschirmfoto nimmt alles mit, was gerade offen ist – auch das, was niemanden etwas angeht. Für '
     + 'Belegbilder gibt es den Weg über das Fenster selbst, der nur das eigene Fenster aufnimmt.',
   'guard.snapshot.name': 'Sicherung vor dem Löschen',
   'guard.snapshot.wirkung':
     'Hält Löschbefehle an, solange keine Kopie der Daten angelegt wurde.',
   'guard.snapshot.info':
     'Die Kopie landet unter ~/.local/trash-snapshots/<datum>-<name>/. Der Guard prüft, ob sie existiert, '
-    + 'bevor der Löschbefehl durchgeht — er ersetzt sie nicht.',
+    + 'bevor der Löschbefehl durchgeht – er ersetzt sie nicht.',
   'guard.commit-trailer.name': 'Absender eines Commits',
   'guard.commit-trailer.wirkung':
     'Hält einen Commit an, der einen fremden Mitautor untergeschoben bekommt.',
   'guard.commit-trailer.info':
     'In diesen Repos steht ein Autor und sonst niemand. Der Guard ist der einzige, der mit einem Fehlerkode '
-    + 'statt einer Antwort abbricht — er sitzt direkt vor dem Commit.',
+    + 'statt einer Antwort abbricht – er sitzt direkt vor dem Commit.',
   'guard.muster.name': 'Rückfrage-Stufe',
   'guard.muster.wirkung':
     'Die Musterliste weiter unten: Befehle, die weder harmlos noch verboten sind, werden angehalten.',
   'guard.muster.info':
     'Die letzte Stufe, und die einzige, die nicht ablehnt, sondern fragt. Sie sitzt hinter allen anderen: '
     + 'was ein Guard hart ablehnt, kommt hier nie an. Hier abgeschaltet heißt: kein Muster löst mehr eine '
-    + 'Rückfrage aus — auch die, die weiter unten angehakt sind.',
+    + 'Rückfrage aus – auch die, die weiter unten angehakt sind.',
+  'guard.pane-write.name': 'In fremde Panes tippen',
+  'guard.pane-write.wirkung':
+    'Hält Befehle an, die mit tmux direkt in einen Orchestrator-Pane schreiben.',
+  'guard.pane-write.info':
+    'Die zweite Schicht neben wb-pane-write: sie fängt den Weg an dem Werkzeug vorbei. Ein Test arbeitet auf '
+    + 'einem eigenen Socket und ist davon nicht betroffen.',
 
   // --- Seite 3: Programme und Modelle --------------------------------------
   'feld.harnessTabelle.name': 'Programme, Anmeldung und Chat-Ansicht',
@@ -375,12 +397,15 @@ export const DE: Record<string, string> = {
     + 'ob es eine Chat-Ansicht tragen kann.',
   'feld.harnessTabelle.info':
     'Die Stufen sind an der Hilfe des jeweiligen Programms gemessen, nicht abgeschrieben. Die Anmeldung ist '
-    + 'kein Ratespiel: geprüft wird, ob der Beleg vorliegt, den die Registry für diesen Anbieter nennt — '
-    + 'liegt keiner vor, steht „nicht prüfbar" da und nicht „nicht angemeldet". Die Chat-Ansicht hängt am '
+    + 'kein Ratespiel: geprüft wird, ob der Beleg vorliegt, den die Registry für diesen Anbieter nennt – '
+    + 'liegt keiner vor, steht „nicht prüfbar“ da und nicht „nicht angemeldet“. Die Chat-Ansicht hängt am '
     + 'Programm und nicht am Geschmack; was ein Programm nicht kann, bekommt hier kein graues Feld, sondern '
     + 'den Grund im Klartext.',
   'wort.startbar': 'startet hier',
   'wort.nichtStartbar': 'startet auf {maschine} nicht',
+  // Stand bis zum 03.09.2026 als deutscher Text mitten in `einstellungen.ts` --
+  // die Programmwahl zeigte ihn auch im englischen Fenster.
+  'wort.fehltHier': 'fehlt hier',
   'wort.angemeldet': 'angemeldet',
   'wort.nichtAngemeldet': 'nicht angemeldet',
   'wort.anmeldungUnbekannt': 'nicht prüfbar',
@@ -389,7 +414,7 @@ export const DE: Record<string, string> = {
   'spalte.programm': 'Programm',
   'spalte.stufen': 'Stufen',
   'spalte.modelle': 'Modelle',
-  'spalte.hier': 'Auf {maschine}',
+  'spalte.hier': 'Auf dieser Maschine',
   'spalte.anmeldung': 'Anmeldung',
   'spalte.chat': 'Chat-Ansicht',
   'spalte.modell': 'Modell',
@@ -405,8 +430,8 @@ export const DE: Record<string, string> = {
   'spalte.maschine': 'Maschine',
   'spalte.wert': 'Wert',
 
-  'satz.chatKannNicht': 'Kein Weg zum Gesprächsverlauf eingetragen — deshalb steht hier kein Schalter.',
-  'satz.chatOhneMessung': 'Eingetragen, aber ohne Messdatum — ohne die zählt der Eintrag nicht.',
+  'satz.chatKannNicht': 'Kein Weg zum Gesprächsverlauf eingetragen – deshalb steht hier kein Schalter.',
+  'satz.chatOhneMessung': 'Eingetragen, aber ohne Messdatum – ohne die zählt der Eintrag nicht.',
   'satz.chatKannLive': 'liest mit, während die Sitzung läuft',
   'satz.chatKannNichtLive': 'liest erst, wenn die Sitzung steht',
   'satz.chatZeigtNicht': 'Zeigt nicht: {liste}.',
@@ -416,33 +441,54 @@ export const DE: Record<string, string> = {
     'An: die Werkbank zeichnet für dieses Programm den Gesprächsverlauf statt des Terminalbilds.',
   'feld.chatAnsicht.info':
     'Der Schalter steht je Programm und nicht global, weil die Fähigkeit am Programm hängt und nicht am '
-    + 'Geschmack. Der Terminal-Pane läuft in beiden Fällen weiter und wird weiter ausgewertet — nur so weiß '
+    + 'Geschmack. Der Terminal-Pane läuft in beiden Fällen weiter und wird weiter ausgewertet – nur so weiß '
     + 'die Werkbank, ob das Programm gerade fragt, antwortet oder wartet; sichtbar ist bloß die andere '
     + 'Darstellung. Was in keinem Protokoll steht (Freigabedialoge, Kontextauslastung, Fortschritt), steht '
     + 'in der Zeile daneben.',
   'feld.chatAnsicht.etikett': 'gilt für die nächste Sitzung',
 
+  // Der Transportschalter steht auf DIESER Seite und nicht auf „Sitzung“: deren
+  // Unterzeile sagt ausdruecklich, dass die Worker hier nicht eingestellt
+  // werden. Er gehoert zur Frage, WORAUF ein Agenten-Programm laeuft -- damit
+  // in die Gruppe „Die Programme auf dieser Maschine“.
+  'feld.workerTransport.name': 'Woran ein Worker-Pane hängt',
+  'feld.workerTransport.wirkung':
+    'An tmux wie bisher, oder an einem Pseudo-Terminal, das die Werkbank selbst hält. „pty“ ist ein '
+    + 'Prototyp: ein Worker je Pseudo-Terminal, Kontextwache und Rückkanal laufen über den Steuerkanal, '
+    + 'und mehrere pty-Panes nebeneinander in einem Tab sind noch nicht gebaut.',
+  'feld.workerTransport.info':
+    'Der Weg seit V1 ist tmux: jeder Worker ist ein Pane in einer tmux-Sitzung, und die Werkzeuge des '
+    + 'Hauses sind darauf gebaut. „pty“ kommt aus der Probe vom 04.09.2026 (app/src/main/pty.ts): die '
+    + 'Werkbank startet den Worker selbst auf einem eigenen Pseudo-Terminal und spiegelt seinen '
+    + 'Bytestrom in ein kopfloses Terminalmodell. Der Bildschirm, den die Kontextwache daraus liest, war '
+    + 'in der Messung byteweise derselbe wie der von tmux, und nach einem Neustart der Werkbank stand '
+    + 'der Worker mit derselben Unterhaltung wieder da. Offen sind zwei Stellen: die Tab-Ansicht zeichnet '
+    + 'bisher nur einen einzelnen pty-Pane, und die Umgebung der Werkbank wird an den Worker vollständig '
+    + 'vererbt. Steht der Schalter auf „tmux“, wird der Prototyp nicht einmal geladen; ein unbekannter '
+    + 'Wert gilt als „tmux“ und nicht als Fehler.',
+  'feld.workerTransport.etikett': 'gilt für den nächsten Worker',
+
   'feld.ollamaEndpoint.name': 'Adresse des lokalen Modell-Servers',
   'feld.ollamaEndpoint.wirkung':
-    'Unter dieser Adresse werden die lokalen Modelle gesucht — Ollama, vLLM oder MLX, je nachdem, was dort '
+    'Unter dieser Adresse werden die lokalen Modelle gesucht – Ollama, vLLM oder MLX, je nachdem, was dort '
     + 'antwortet.',
   'feld.ollamaEndpoint.info':
     'Bis zum 11.08. stand http://127.0.0.1:11434 an sieben Stellen fest im Quelltext und ließ sich nirgends '
     + 'einstellen; wer Ollama auf einem anderen Rechner betreibt, musste sieben Dateien von Hand ändern. '
     + 'Dieses Feld ist die eine Stelle dafür. Erwartet wird eine vollständige Adresse mit http:// oder '
     + 'https:// und ohne Pfad am Ende. Ein Server im Netz statt auf dieser Maschine heißt: die Anfragen '
-    + 'verlassen den Rechner — das ist eine Entscheidung und keine Kleinigkeit.',
+    + 'verlassen den Rechner – das ist eine Entscheidung und keine Kleinigkeit.',
   'feld.ollamaEndpoint.etikett': 'gilt für den nächsten Abruf',
   'satz.ollamaNochNichtVerdrahtet':
     'Der Wert wird gespeichert und hier angezeigt. Die sieben Stellen im Quelltext, die die Adresse heute '
-    + 'noch fest enthalten, lesen ihn noch nicht — sie werden in einem eigenen Schritt nachgezogen.',
+    + 'noch fest enthalten, lesen ihn noch nicht – sie werden in einem eigenen Schritt nachgezogen.',
 
   'feld.modelDiscoveryAuto.name': 'Modell-Kataloge von selbst abrufen',
   'feld.modelDiscoveryAuto.wirkung':
     'An: die Kataloge der Anbieter werden von selbst aus dem Netz geholt. Aus: nur noch auf Knopfdruck.',
   'feld.modelDiscoveryAuto.info':
-    'Aus heißt NUR, dass nicht mehr von selbst ins Netz gegangen wird. Die lokalen Quellen — ollama, die '
-    + 'Modell-Listen der CLIs, Dateien — laufen weiter automatisch, und der Abruf von Hand bleibt immer '
+    'Aus heißt nur, dass nicht mehr von selbst ins Netz gegangen wird. Die lokalen Quellen – ollama, die '
+    + 'Modell-Listen der CLIs, Dateien – laufen weiter automatisch, und der Abruf von Hand bleibt immer '
     + 'bedienbar. Diese Einstellung war bis zum 11.08. nur in der VS-Code-Erweiterung erreichbar, obwohl '
     + 'wb-state sie längst liest.',
   'feld.modelDiscoveryAuto.etikett': 'sofort',
@@ -450,21 +496,21 @@ export const DE: Record<string, string> = {
   'feld.orchestratorVorhersage.name': 'Multi-Token-Vorhersage für den Orchestrator',
   'feld.orchestratorVorhersage.wirkung':
     'An: der Orchestrator lädt, falls für sein Modell hinterlegt, zusätzlich einen Entwerfer oder eine '
-    + 'Fassung mit eingebautem Vorhersage-Kopf — schneller je Antwort, aber ohne gemeinsame Nebenläufigkeit '
+    + 'Fassung mit eingebautem Vorhersage-Kopf – schneller je Antwort, aber ohne gemeinsame Nebenläufigkeit '
     + 'am MLX-Server.',
   'feld.orchestratorVorhersage.info':
     'Welche Wege es gibt, steht in der Registry: wählbar ist nur, was dort hinterlegt und gemessen ist, '
     + 'kein freier Pfad. Führt die Registry für das Modell mehrere Wege, stehen sie unter dem Haken zur '
-    + 'Wahl, mit ihrer Herkunft darunter — samt der Stellen, an denen etwas NICHT gemessen wurde. '
+    + 'Wahl, mit ihrer Herkunft darunter – samt der Stellen, an denen nichts gemessen wurde. '
     + 'Spekulatives Decoding und die geteilte Nebenläufigkeit des MLX-Servers schließen sich gegenseitig '
-    + 'aus (mlx_lm.server schaltet die Stapelverarbeitung ab, sobald ein Entwerfer gesetzt ist) — deshalb '
+    + 'aus (mlx_lm.server schaltet die Stapelverarbeitung ab, sobald ein Entwerfer gesetzt ist) – deshalb '
     + 'steht dieser Schalter standardmäßig aus.',
   'feld.workerVorhersage.name': 'Multi-Token-Vorhersage für Worker',
   'feld.workerVorhersage.wirkung':
     'An: ein Worker mit einem lokalen Modell lädt, falls dafür hinterlegt, denselben Entwerfer oder '
-    + 'eingebauten Kopf — getrennt vom Schalter des Orchestrators.',
+    + 'eingebauten Kopf – getrennt vom Schalter des Orchestrators.',
   'feld.workerVorhersage.info':
-    'Welches Modell dabei benutzt wird, steht in der Registry und ist hier nicht wählbar — nur diese '
+    'Welches Modell dabei benutzt wird, steht in der Registry und ist hier nicht wählbar – nur diese '
     + 'Anzeige zeigt es an. Gilt unabhängig vom Orchestrator-Schalter: der eine kann an sein, der andere '
     + 'aus.',
   'wort.vorhersageEntwerfer': 'externer Entwerfer',
@@ -477,10 +523,10 @@ export const DE: Record<string, string> = {
   'feld.anbieter.wirkung':
     'Für jeden Anbieter: woher sein Zugang kommt und ob er auf dieser Maschine vorliegt.',
   'feld.anbieter.info':
-    'Ein Schlüssel wird hier eingegeben, aber NICHT in die Einstellungsdatei geschrieben — die ist '
+    'Ein Schlüssel wird hier eingegeben, aber nicht in die Einstellungsdatei geschrieben – die ist '
     + 'geteilter Klartext, den auch Worker beschreiben, und ein Schlüssel darin wäre ein Schlüssel im '
     + 'Klartext. Der Wert geht stattdessen einen eigenen Weg und wird danach nie wieder ausgelesen, um ihn '
-    + 'anzuzeigen. Gezeigt wird deshalb weiterhin nur, ob der Zugang vorliegt — nie sein Wert und nie sein '
+    + 'anzuzeigen. Gezeigt wird deshalb weiterhin nur, ob der Zugang vorliegt – nie sein Wert und nie sein '
     + 'Ort. Ein Anbieter mit Abo statt Schlüssel meldet stattdessen, ob die Anmeldung stattgefunden hat.',
   'wort.zugangDa': 'liegt vor',
   'wort.zugangFehlt': 'fehlt',
@@ -492,8 +538,8 @@ export const DE: Record<string, string> = {
   'feld.effortCaps.wirkung':
     'Bis hierher darf der Orchestrator gehen, wenn er von sich aus einen Worker startet.',
   'feld.effortCaps.info':
-    '„Auslieferung" heißt: der Wert kommt aus der Registry, so wie das Modell geliefert wurde. Sobald du '
-    + 'einen Deckel setzt, steht dort „von dir" mit Datum und Grund — und der Grund ist Pflicht, weil eine '
+    '„Auslieferung“ heißt: der Wert kommt aus der Registry, so wie das Modell geliefert wurde. Sobald du '
+    + 'einen Deckel setzt, steht dort „von dir“ mit Datum und Grund – und der Grund ist Pflicht, weil eine '
     + 'Selbstbindung ohne Begründung nach einem halben Jahr wie eine technische Grenze aussieht. Senken darf '
     + 'jeder; anheben verlangt einen Menschen, gemessen an der Herkunft des Aufrufs. Zurück auf die '
     + 'Auslieferung geht über den ersten Eintrag der Auswahl.',
@@ -505,11 +551,11 @@ export const DE: Record<string, string> = {
     + 'Stufe geben.',
   'satz.deckelDieses': 'Deckel dieses Modells: ',
   'satz.deckelGilt':
-    '. Er gilt, wenn der Orchestrator von sich aus einen Worker startet — für deine Wahl hier gilt er nicht. ',
+    '. Er gilt, wenn der Orchestrator von sich aus einen Worker startet – für deine Wahl hier gilt er nicht. ',
   'satz.deckelDarueber': 'Gestrichelt umrandet: die Stufen darüber ({stufen}).',
   'satz.deckelGrund': 'Grund des Deckels: {grund}',
   'satz.deckelKeiner':
-    'Für dieses Modell ist kein Deckel eingetragen — der Orchestrator vergibt jede Stufe.',
+    'Für dieses Modell ist kein Deckel eingetragen – der Orchestrator vergibt jede Stufe.',
   'satz.deckelUeber':
     'Über dem Deckel ({deckel}). Wählbar: der Deckel bindet den Orchestrator, nicht dich.',
   'wort.vonDir': 'von dir gesetzt',
@@ -517,7 +563,7 @@ export const DE: Record<string, string> = {
   'wort.vonDirAm': 'von dir, {datum}',
   'satz.deckelAuslieferungWahl': 'Auslieferung ({deckel})',
   'wort.ohne': 'ohne',
-  'satz.stufenKeineWahl': '„{harness}" kennt keine Stufen — hier ist nichts zu wählen.',
+  'satz.stufenKeineWahl': '„{harness}“ kennt keine Stufen – hier ist nichts zu wählen.',
   'satz.stufenErstModell': 'Erst ein Modell wählen; die Stufen hängen an seinem Programm.',
 
   // --- Seite 4: Maschinen --------------------------------------------------
@@ -525,30 +571,42 @@ export const DE: Record<string, string> = {
   'feld.remoteMachines.wirkung':
     'Jede Maschine hier taucht in der Sitzungsleiste auf und steht als Ziel für einen Worker zur Wahl.',
   'feld.remoteMachines.info':
-    'Der Name ist der SSH-Alias, so wie „ssh peer" ihn kennt — es gibt keine zweite Adressliste daneben. '
+    'Der Name ist der SSH-Alias, so wie „ssh peer“ ihn kennt – es gibt keine zweite Adressliste daneben. '
     + 'Ein Tailscale-Name oder eine IP funktioniert genauso, sofern ssh damit umgehen kann; wer ein Gate '
     + 'davor hat, trägt den Alias ein, der durch das Gate führt. Mehr als zwei sind ausdrücklich vorgesehen. '
     + 'Die Liste bleibt leer, bis jemand etwas einträgt: ein SSH-Ziel ist ein echter Netzzugriff und darf nie '
     + 'von selbst anspringen. Der Prüfknopf fragt genau einmal nach (ssh <name> true).',
   'feld.remoteMachines.etikett': 'sofort',
+  // Der Pause-Schalter je Zeile (04.09.): kein eigenes `feld()`, aber dieselbe
+  // Textform wie jeder andere Schlüssel -- die Wirkungszeile steht unter der
+  // Liste, `name`/`info` halten die Abweichungstabelle und die Suchleiter
+  // vollständig, auch ohne eigenes Steuerelement in dieser Form.
+  'feld.remoteMachinesPausiert.name': 'Pausierte Maschinen',
+  'feld.remoteMachinesPausiert.wirkung':
+    'Die Sitzungen auf einer pausierten Maschine laufen dort ungestört weiter – pausiert ist nur der '
+    + 'Blick dieser Werkbank darauf: kein Abruf, keine Sitzungen in der Leiste, keine Spiegel-Panes.',
+  'feld.remoteMachinesPausiert.info':
+    'Der Name bleibt in „Rechner, die mitarbeiten“ eingetragen – der Schalter ist umkehrbar, ohne die '
+    + 'Adresse neu einzutippen. Eine pausierte Maschine gilt nicht als „nicht erreichbar“: das sind zwei '
+    + 'verschiedene Zustände.',
   'satz.eigeneMaschine':
-    'Diese Maschine — sie steht immer in der Liste und lässt sich nicht entfernen.',
-  'satz.fremdeMaschine': 'Erreicht über ssh {name} — der Name IST der SSH-Alias.',
+    'Diese Maschine – sie steht immer in der Liste und lässt sich nicht entfernen.',
+  'satz.fremdeMaschine': 'Erreicht über ssh {name} – der Name ist zugleich der SSH-Alias.',
   'satz.keineMaschine':
     'Keine weitere Maschine eingetragen. Ohne Eintrag geht das Programm nie von selbst ins Netz.',
-  'satz.maschineSchonDa': '„{name}" steht schon in der Liste.',
+  'satz.maschineSchonDa': '„{name}“ steht schon in der Liste.',
   'satz.fremdeLast':
-    'Wie viele Worker eine andere Maschine gleichzeitig trägt, steht in IHRER Einstellungsdatei und wird '
+    'Wie viele Worker eine andere Maschine gleichzeitig trägt, steht in deren eigener Einstellungsdatei und wird '
     + 'dort gesetzt: ssh {name} wb-state settings set maxWorkers <zahl>. Zwei Zahlen an zwei Orten für '
     + 'dieselbe Frage wären zwei Wahrheiten, von denen eine falsch ist.',
 
   'feld.maxWorkers.name': 'Worker gleichzeitig auf dieser Maschine',
   'feld.maxWorkers.wirkung':
-    'Mehr als so viele Worker nimmt eine Sitzung nicht an — der nächste Start wird abgelehnt.',
+    'Mehr als so viele Worker nimmt eine Sitzung nicht an – der nächste Start wird abgelehnt.',
   'feld.maxWorkers.info':
     'Abgelehnt, nicht gestapelt: ein Start, der das Fenster überfüllt, kostet mehr als ein Start, der sagt '
-    + '„zu viele". Bestehende Panes werden weiter wiederverwendet, ein fertiger Worker macht also sofort '
-    + 'wieder Platz. Gezählt werden Worker-Panes, keine Subagenten. Die Zahl gehört der MASCHINE und nicht '
+    + '„zu viele“. Bestehende Panes werden weiter wiederverwendet, ein fertiger Worker macht also sofort '
+    + 'wieder Platz. Gezählt werden Worker-Panes, keine Subagenten. Die Zahl gehört der Maschine und nicht '
     + 'der Sitzung: was ein 48-GB-Rechner trägt, trägt ein kleinerer nicht.',
   'feld.maxWorkers.etikett': 'sofort',
 
@@ -558,7 +616,7 @@ export const DE: Record<string, string> = {
   'feld.defaultWorkerMachine.info':
     'Die Auswahl kommt aus der Liste darüber: jede dort eingetragene Maschine steht hier zur Wahl. „Diese '
     + 'Maschine" heißt: der Worker läuft im selben Terminal-Server wie die Sitzung. Ein Ziel, das nicht '
-    + 'antwortet, lässt den Start scheitern statt ihn umzuleiten — deshalb der Prüfknopf daneben.',
+    + 'antwortet, lässt den Start scheitern statt ihn umzuleiten – deshalb der Prüfknopf daneben.',
   'feld.defaultWorkerMachine.etikett': 'gilt für den nächsten Worker',
   'wort.dieseMaschine': 'Diese Maschine ({name})',
 
@@ -570,13 +628,13 @@ export const DE: Record<string, string> = {
     + 'anfällig: in der Nacht auf den 20.08. sind fünf Panes dabei eingefroren und Aufträge stumm '
     + 'verschwunden. Claude Code bringt für denselben Zweck ein Postfach mit, das nicht durch die '
     + 'Eingabezeile geht und deshalb nichts überschreiben und nichts blockieren kann. '
-    + '„Von selbst" nimmt das Postfach, wo es eines gibt, und tippt sonst; das ist die Vorgabe, '
+    + '„Von selbst“ nimmt das Postfach, wo es eines gibt, und tippt sonst; das ist die Vorgabe, '
     + 'weil ein Postfach heute nur Claude Code mitbringt – die übrigen Programme der Registry tippen '
     + 'so oder so, und eine Vorgabe, die für sie nicht gilt, dürfte für sie nichts kaputt machen. '
-    + '„Nur Postfach" verlangt es und lässt die Zustellung hörbar scheitern, statt ersatzweise zu '
+    + '„Nur Postfach“ verlangt es und lässt die Zustellung hörbar scheitern, statt ersatzweise zu '
     + 'tippen: gedacht für Prüfläufe und für den Fall, dass in gar keine Eingabezeile mehr '
     + 'geschrieben werden soll. Für einen Worker auf einem anderen Programm heißt diese Wahl '
-    + 'deshalb, dass er gar keinen Auftrag bekommt. „Nur tippen" ist der Rückweg, falls das '
+    + 'deshalb, dass er gar keinen Auftrag bekommt. „Nur tippen“ ist der Rückweg, falls das '
     + 'Postfach an einer künftigen Fassung der CLI scheitert. Ob ein Auftrag angekommen ist, wird '
     + 'auf jedem der drei Wege gleich geprüft und im Klartext gemeldet.',
   'feld.workerZustellung.etikett': 'gilt für den nächsten Auftrag',
@@ -587,7 +645,7 @@ export const DE: Record<string, string> = {
   // --- Seite 5: Aufsicht und Meldungen -------------------------------------
   'feld.contextGuardAutostart.name': 'Kontextwache läuft mit',
   'feld.contextGuardAutostart.wirkung':
-    'An: das Programm startet die Wache selbst, sobald eine Sitzung steht — niemand muss daran denken.',
+    'An: das Programm startet die Wache selbst, sobald eine Sitzung steht – niemand muss daran denken.',
   'feld.contextGuardAutostart.info':
     'Bis zum 06.08. startete der Orchestrator seine Wache selbst. Entscheidung des Nutzers, sie dem Programm '
     + 'zu geben: „Wenn jemand ein schwächeres Modell als Orchestrator nimmt, das nicht so zuverlässig ist, '
@@ -602,13 +660,13 @@ export const DE: Record<string, string> = {
     'Getrennt schaltbar, weil beide Seiten verschieden teuer sind: ein Orchestrator, der mitten in einer '
     + 'Übergabe kompaktiert wird, verliert den Faden, ein Worker selten. Wer die Aufsicht über sich selbst '
     + 'nicht will, schaltet hier ab und lässt sie für die Worker weiterlaufen. Abschalten verlangt einen '
-    + 'Grund und einen Menschen — aus einem Worker-Pane heraus geht es nicht.',
+    + 'Grund und einen Menschen – aus einem Worker-Pane heraus geht es nicht.',
   'feld.wacheOrchAn.etikett': 'gilt für die nächste Wache',
 
   'feld.wacheWorkerAn.name': 'Die Worker überwachen',
   'feld.wacheWorkerAn.wirkung': 'An: jeder Worker-Pane wird mitgelesen und bei vollem Kontext gemahnt.',
   'feld.wacheWorkerAn.info':
-    'Ein Worker, der ohne Übergabe kompaktiert wird, liefert seinen Auftrag halb ab — die Mahnung sorgt '
+    'Ein Worker, der ohne Übergabe kompaktiert wird, liefert seinen Auftrag halb ab – die Mahnung sorgt '
     + 'dafür, dass er vorher schreibt, was er weiß. Ein Pane, der schmaler ist als die Mindestbreite, lässt '
     + 'sich nicht lesen; die Wache meldet ihn dann ausdrücklich als blind, statt ihn stillschweigend '
     + 'auszulassen. Fertigmeldungen laufen auch dann weiter, wenn die Wache hier aus ist.',
@@ -620,7 +678,7 @@ export const DE: Record<string, string> = {
   'feld.wacheWorkerMahnenAb.info':
     'Prozent des Kontextfensters seines Modells. Zu früh gemahnt kostet Arbeit, zu spät kostet das Ergebnis: '
     + 'was nach dem Kompaktieren nicht aufgeschrieben ist, ist weg. 80 lässt genug Platz für die Übergabe '
-    + 'selbst. Eine HÖHERE Zahl heißt später mahnen, also weniger Sicherung — dafür verlangt das Werkzeug '
+    + 'selbst. Eine höhere Zahl heißt später mahnen, also weniger Sicherung – dafür verlangt das Werkzeug '
     + 'einen Grund.',
   'feld.wacheWorkerMahnenAb.etikett': 'gilt für die nächste Wache',
 
@@ -634,35 +692,35 @@ export const DE: Record<string, string> = {
 
   'feld.wacheOrchEingreifen.name': 'Die Wache greift selbst ein',
   'feld.wacheOrchEingreifen.wirkung':
-    'Aus: sie mahnt weiter, tippt aber kein /compact mehr — sie behält die Stimme, nicht die Hand.',
+    'An: sie mahnt nicht nur, sie tippt notfalls selbst /compact – sie hat die Stimme und die Hand.',
   'feld.wacheOrchEingreifen.info':
     'Die Wache kompaktiert die Orchestrator-Sitzung notfalls selbst, indem sie /compact in ein fremdes '
     + 'Fenster tippt. Wer das nicht will, aber weiter gewarnt werden möchte, schaltet hier ab: die Mahnung '
-    + 'bleibt, der Eingriff fällt weg. Das ist die mildere Stufe zwischen „alles" und „Wache aus".',
+    + 'bleibt, der Eingriff fällt weg. Das ist die mildere Stufe zwischen „alles“ und „Wache aus“.',
   'feld.wacheOrchEingreifen.etikett': 'gilt für die nächste Wache',
 
   'feld.wacheOrchNotbremseAb.name': 'Notbremse ab',
   'feld.wacheOrchNotbremseAb.wirkung':
-    'Ab hier kompaktiert die Wache den Orchestrator selbst — auch ohne sein Zeichen.',
+    'Ab hier kompaktiert die Wache den Orchestrator selbst – auch ohne sein Zeichen.',
   'feld.wacheOrchNotbremseAb.info':
     'Sie tippt /compact in eine fremde Sitzung, nie mitten in einem Zug. Bis zum 06.08. stand diese Zahl '
     + 'fest im Quelltext und war nirgends zu sehen; wer das nicht wusste, hielt das plötzliche Kompaktieren '
-    + 'für einen Fehler. Sie greift nur, solange „Die Wache greift selbst ein" an ist.',
+    + 'für einen Fehler. Sie greift nur, solange „Die Wache greift selbst ein“ an ist.',
   'feld.wacheOrchNotbremseAb.etikett': 'gilt für die nächste Wache',
 
-  'feld.stallMinutes.name': 'Als „hängt" melden nach',
+  'feld.stallMinutes.name': 'Als „hängt“ melden nach',
   'feld.stallMinutes.wirkung':
     'So lange darf ein Worker still sein, bevor die Leiste ihn als hängend markiert.',
   'feld.stallMinutes.info':
     'Gemessen an 11.070 Pausen aus 17 Sitzungen, die durchgearbeitet und abgeliefert haben: bei 5 Minuten '
-    + 'hätten 8 dieser 17 fälschlich „hängt" getragen, bei 10 Minuten noch 4. Ein Kindprozess, der jünger '
-    + 'ist als die Stille, unterdrückt die Meldung ohnehin — ein langer Testlauf zählt also nicht als '
+    + 'hätten 8 dieser 17 fälschlich „hängt“ getragen, bei 10 Minuten noch 4. Ein Kindprozess, der jünger '
+    + 'ist als die Stille, unterdrückt die Meldung ohnehin – ein langer Testlauf zählt also nicht als '
     + 'Stillstand.',
   'feld.stallMinutes.etikett': 'sofort',
 
   'feld.guardMeldetWorkerStatus.name': 'Die Wache schreibt Worker-Meldungen ins Hauptfenster',
   'feld.guardMeldetWorkerStatus.wirkung':
-    'An: die Wache tippt „Worker fertig" und „Worker hängt" selbst in den Orchestrator-Pane.',
+    'An: die Wache tippt „Worker fertig“ und „Worker hängt“ selbst in den Orchestrator-Pane.',
   'feld.guardMeldetWorkerStatus.info':
     'Vorgabe aus, und das ist eigene des Nutzers Entscheidung: die Meldung sieht aus wie sein eigenes Wort, '
     + 'sie unterbricht ihn mitten im Satz, und dieselbe Information steht ohnehin in der rechten Leiste. '
@@ -672,7 +730,7 @@ export const DE: Record<string, string> = {
   'feld.guardMeldetWorkerStatus.etikett': 'gilt für die nächste Wache',
 
   'satz.guardsWohnenAnderswo':
-    'Die Sicherungen, die vor jedem Befehl laufen, stehen auf der Seite „Erlaubnisse" — dort, wo alles '
+    'Die Sicherungen, die vor jedem Befehl laufen, stehen auf der Seite „Erlaubnisse“ – dort, wo alles '
     + 'steht, was ein Agent darf. Sie ein zweites Mal hier anzubieten hieße, zwei Orte für dieselbe '
     + 'Entscheidung zu haben.',
 
@@ -680,7 +738,7 @@ export const DE: Record<string, string> = {
   'feld.meldungenAn.wirkung':
     'An: das Programm sagt Bescheid, auch wenn du gerade etwas anderes tust. Aus: es schweigt.',
   'feld.meldungenAn.info':
-    'Bis zum 11.08. meldete sich das Programm nie nach außen — kein Systemhinweis, kein Ton, nichts aufs '
+    'Bis zum 11.08. meldete sich das Programm nie nach außen – kein Systemhinweis, kein Ton, nichts aufs '
     + 'Handy. Wer nebenbei etwas anderes tat, merkte erst beim nächsten Hinsehen, dass ein Worker fertig war '
     + 'oder eine Freigabe wartete. Dieser Schalter ist die eine Frage, an der alles hängt; was und wie '
     + 'gemeldet wird, steht darunter. Vorgabe ist aus, weil ein Programm, das ungefragt anfängt zu klingeln, '
@@ -689,18 +747,18 @@ export const DE: Record<string, string> = {
 
   'feld.meldungenEreignisse.name': 'Worüber gemeldet wird',
   'feld.meldungenEreignisse.wirkung':
-    'Nur diese vier Ereignisse können eine Meldung auslösen — jedes einzeln abwählbar.',
+    'Nur diese vier Ereignisse können eine Meldung auslösen – jedes einzeln abwählbar.',
   'feld.meldungenEreignisse.info':
     'Vier Ereignisse, und jedes hat einen anderen Grund: ein fertiger Worker heißt, dass Arbeit auf dich '
     + 'wartet; eine wartende Freigabe heißt, dass eine Kette steht, bis du antwortest; eine gestorbene '
     + 'Sitzung heißt, dass etwas abgebrochen ist, das du für laufend hältst; ein fast volles Kontingent '
-    + 'heißt, dass die nächste Stunde teuer wird. Wer alles abwählt, bekommt nichts — dann ist der Schalter '
+    + 'heißt, dass die nächste Stunde teuer wird. Wer alles abwählt, bekommt nichts – dann ist der Schalter '
     + 'darüber der ehrlichere Weg.',
   'feld.meldungenEreignisse.etikett': 'sofort',
 
   'feld.meldungenWege.name': 'Auf welchem Weg',
   'feld.meldungenWege.wirkung':
-    'Systemhinweis, Ton, Handy — einzeln oder zusammen. Der Weg bestimmt, wie aufdringlich es ist.',
+    'Systemhinweis, Ton, Handy – einzeln oder zusammen. Der Weg bestimmt, wie aufdringlich es ist.',
   'feld.meldungenWege.info':
     'Ein Systemhinweis ist leise und bleibt in der Mitteilungszentrale liegen; ein Ton holt dich sofort, '
     + 'auch wenn der Bildschirm aus ist; das Handy erreicht dich außer Haus. E-Mail steht bewusst nicht zur '
@@ -713,7 +771,7 @@ export const DE: Record<string, string> = {
     'Der Webhook, an den eine Meldung geschickt wird. Leer heißt: kein Weg aufs Handy.',
   'feld.meldungenHandyUrl.info':
     'Ein Webhook ist eine Adresse, die ein Dienst dir gibt und die eine Nachricht auf dein Telefon bringt. '
-    + 'Welchen Dienst du nimmst, entscheidest du — das Programm kennt nur die Adresse und schickt einen Text '
+    + 'Welchen Dienst du nimmst, entscheidest du – das Programm kennt nur die Adresse und schickt einen Text '
     + 'dorthin. Diese Adresse verlässt den Rechner bei jeder Meldung, und was sie enthält, entscheidet der '
     + 'Dienst dahinter: trag hier nichts ein, dem du das nicht zutraust.',
   'feld.meldungenHandyUrl.etikett': 'sofort',
@@ -723,13 +781,13 @@ export const DE: Record<string, string> = {
     'Der Pfad zu einer Klangdatei. Leer heißt: der Ton des Betriebssystems.',
   'feld.meldungenTonDatei.info':
     'Ein eigener Ton ist mehr als Geschmack: wer mehrere Programme laufen hat, erkennt an einem eigenen '
-    + 'Klang, dass die Meldung von hier kommt, ohne hinzusehen. Leer ist die sichere Wahl — der Systemton '
+    + 'Klang, dass die Meldung von hier kommt, ohne hinzusehen. Leer ist die sichere Wahl – der Systemton '
     + 'existiert immer, eine Datei kann verschwinden.',
   'feld.meldungenTonDatei.etikett': 'sofort',
 
   'feld.meldungenLimitSchwelle.name': 'Ab wann das Kontingent als fast voll gilt',
   'feld.meldungenLimitSchwelle.wirkung':
-    'Ab diesem Anteil des Kontingents meldet sich das Programm — sofern das Ereignis oben angehakt ist.',
+    'Ab diesem Anteil des Kontingents meldet sich das Programm – sofern das Ereignis oben angehakt ist.',
   'feld.meldungenLimitSchwelle.info':
     'Prozent des Kontingents im laufenden Zeitfenster. Zu früh gewarnt heißt: man gewöhnt sich daran und '
     + 'übersieht die Meldung, die zählt. Zu spät heißt: die Warnung kommt, wenn nichts mehr zu retten ist. '
@@ -741,19 +799,19 @@ export const DE: Record<string, string> = {
     'Schickt eine Probemeldung über genau die Wege, die oben gewählt sind, und zeigt darunter, was je Weg '
     + 'passiert ist.',
   'feld.meldungTesten.info':
-    'Der Knopf sendet EINE echte Probemeldung — Systemhinweis, Ton, Webhook, je nachdem, was oben angehakt '
-    + 'ist — und meldet danach je Weg, ob es geklappt hat: beim Webhook den HTTP-Status, sonst den Grund, '
+    'Der Knopf sendet eine einzige echte Probemeldung – Systemhinweis, Ton, Webhook, je nachdem, was oben angehakt '
+    + 'ist – und meldet danach je Weg, ob es geklappt hat: beim Webhook den HTTP-Status, sonst den Grund, '
     + 'warum nicht. Steht der Hauptschalter aus, sagt der Knopf das und sendet nichts.',
   'knopf.meldungTesten': 'Test senden',
-  'meldungTesten.hauptschalterAus': 'Der Hauptschalter oben ist aus — es wurde nichts gesendet.',
-  'meldungTesten.keinWeg': 'Kein Weg ist ausgewählt — es wurde nichts gesendet.',
+  'meldungTesten.hauptschalterAus': 'Der Hauptschalter oben ist aus – es wurde nichts gesendet.',
+  'meldungTesten.keinWeg': 'Kein Weg ist ausgewählt – es wurde nichts gesendet.',
   'meldungTesten.laeuft': 'Probe wird gesendet …',
   'meldungTesten.system.ok': 'Systemhinweis: abgesetzt',
-  'meldungTesten.system.fehler': 'Systemhinweis: fehlgeschlagen — {grund}',
+  'meldungTesten.system.fehler': 'Systemhinweis: fehlgeschlagen – {grund}',
   'meldungTesten.ton.ok': 'Ton: abgespielt',
-  'meldungTesten.ton.fehler': 'Ton: fehlgeschlagen — {grund}',
+  'meldungTesten.ton.fehler': 'Ton: fehlgeschlagen – {grund}',
   'meldungTesten.handy.ok': 'Handy: Webhook antwortete mit HTTP {status}',
-  'meldungTesten.handy.fehler': 'Handy: fehlgeschlagen — {grund}',
+  'meldungTesten.handy.fehler': 'Handy: fehlgeschlagen – {grund}',
   'meldung.workerFertig': 'Ein Worker ist fertig',
   'meldung.freigabeWartet': 'Eine Freigabe wartet auf dich',
   'meldung.sitzungTot': 'Eine Sitzung ist gestorben',
@@ -769,7 +827,7 @@ export const DE: Record<string, string> = {
   'feld.thema.wirkung':
     'Ob das Programm hell, dunkel oder so aussieht, wie das Betriebssystem gerade eingestellt ist.',
   'feld.thema.info':
-    '„Wie das System" folgt der Umstellung des Betriebssystems, auch mitten in der Arbeit. Die '
+    '„Wie das System“ folgt der Umstellung des Betriebssystems, auch mitten in der Arbeit. Die '
     + 'Terminal-Panes selbst folgen nicht: ihre Farben kommen aus tmux und der jeweiligen CLI, und eine '
     + 'zweite Stelle dafür hätte zwei Wahrheiten. Heute richtet sich dieses Fenster danach; die übrigen '
     + 'Fenster ziehen nach, sobald ihre Farben aus derselben Quelle kommen.',
@@ -782,7 +840,7 @@ export const DE: Record<string, string> = {
   'feld.zustandsfarben.wirkung':
     'Woran du in der Leiste erkennst, ob eine Sitzung arbeitet, wartet, fertig ist oder nicht mehr läuft.',
   'feld.zustandsfarben.info':
-    'Vier Zustände, vier Farben, und sie müssen sich für dich unterscheiden — nicht für einen Katalog. Wer '
+    'Vier Zustände, vier Farben, und sie müssen sich für dich unterscheiden – nicht für einen Katalog. Wer '
     + 'Rot und Grün schlecht auseinanderhält, stellt hier zwei Farben ein, die er sieht. Zurück auf die '
     + 'Auslieferung geht über das Zeichen neben der Überschrift.',
   'feld.zustandsfarben.etikett': 'sofort',
@@ -797,19 +855,19 @@ export const DE: Record<string, string> = {
   'feld.terminalFontSize.info':
     'Sie entscheidet mit, wie viele Spalten und Zeilen in ein Pane passen: größere Schrift heißt weniger '
     + 'Spalten auf derselben Fläche. Unter 80 Spalten kann die Kontextwache die Statuszeile eines Workers '
-    + 'nicht mehr sicher lesen — wer die Schrift stark vergrößert, bekommt deshalb eher einen zweiten '
+    + 'nicht mehr sicher lesen – wer die Schrift stark vergrößert, bekommt deshalb eher einen zweiten '
     + 'Worker-Tab als schmalere Panes. Erlaubt sind 8 bis 32; ein Wert außerhalb wird abgelehnt und der '
     + 'alte bleibt stehen.',
   'feld.terminalFontSize.etikett': 'sofort',
 
   'feld.terminalScrollLines.name': 'Zeilen je Rad-Rasterung',
   'feld.terminalScrollLines.wirkung':
-    'Wie weit ein Rasterschritt des Mausrads rollt — im Rückblick des Fensters und in der Anwendung im '
+    'Wie weit ein Rasterschritt des Mausrads rollt – im Rückblick des Fensters und in der Anwendung im '
     + 'Pane gleich.',
   'feld.terminalScrollLines.info':
     'Bis zum 06.08. fiel diese Zahl aus der Zellhöhe: der zurückgelegte Weg eines Rad-Ereignisses wurde '
     + 'durch die Höhe einer Zeile geteilt. Das hing am Gerät (ein Trackpad schickt viele kleine Ereignisse, '
-    + 'eine Maus wenige große) und an der Schriftgröße und wurde deshalb als „viel zu schnell" gemeldet. '
+    + 'eine Maus wenige große) und an der Schriftgröße und wurde deshalb als „viel zu schnell“ gemeldet. '
     + 'Jetzt zählt nur diese Zahl: eine Rasterung bewegt so viele Zeilen. Ein Trackpad-Wisch sammelt seine '
     + 'Bruchteile auf, und ein einzelnes Ereignis bewegt nie mehr als sechs Zeilen. Erlaubt sind 1 bis 20.',
   'feld.terminalScrollLines.etikett': 'sofort',
@@ -821,7 +879,7 @@ export const DE: Record<string, string> = {
     'Gemessen am 04.08.: bei 60 Spalten fiel die Statuszeile einer echten Claude-CLI auf den bloßen Balken '
     + 'zurück oder schlechter; 80 ist die bestätigte Untergrenze, bei der sie mit einem realistischen Pfad '
     + 'noch genau zu lesen ist. Darunter meldet die Kontextwache den Pane als blind und überwacht ihn nicht '
-    + '— ein schmalerer Wert bringt also keine dichtere Ansicht, sondern blinde Wachen. Erlaubt sind 20 bis '
+    + '– ein schmalerer Wert bringt also keine dichtere Ansicht, sondern blinde Wachen. Erlaubt sind 20 bis '
     + '1000.',
   'feld.minWorkerPaneWidth.etikett': 'sofort',
 
@@ -830,7 +888,7 @@ export const DE: Record<string, string> = {
     'Ab dieser Zahl legt das Fenster einen weiteren Worker-Tab an, statt die Panes weiter zu verkleinern.',
   'feld.maxWorkerPanesPerTab.info':
     'Gemessen am 04.08.: auf dem Bezugsfenster (197 × 54) passen zwei Spalten à 80 Spalten neben drei '
-    + 'Reihen lesbarer Höhe — also 6. Unter 80 Spalten kann die Kontextwache die Statuszeile nicht mehr '
+    + 'Reihen lesbarer Höhe – also 6. Unter 80 Spalten kann die Kontextwache die Statuszeile nicht mehr '
     + 'sicher lesen und meldet den Pane als blind. 0 heißt: keine eigene Obergrenze; wie viele wirklich '
     + 'nebeneinander passen, rechnet das Fenster ohnehin aus seiner Größe und der Mindestbreite darüber.',
   'feld.maxWorkerPanesPerTab.etikett': 'beim nächsten Neuanordnen',
@@ -847,11 +905,22 @@ export const DE: Record<string, string> = {
   'wort.workerLayout.split': 'geteilt unter dem Hauptfenster',
   'wort.workerLayout.window': 'eigenes Fenster',
 
+  // Die sechs Werte von `claude --permission-mode`, uebersetzt und nicht
+  // ausgelegt: was jede Stufe im Einzelnen zulaesst, steht in der Info-Zeile
+  // des Feldes, nicht in der Beschriftung des Abteils. Der Rohwert haengt als
+  // Titel am Abteil.
+  'wort.permissionMode.acceptEdits': 'Änderungen annehmen',
+  'wort.permissionMode.auto': 'automatisch',
+  'wort.permissionMode.bypassPermissions': 'Erlaubnisse übergehen',
+  'wort.permissionMode.manual': 'von Hand',
+  'wort.permissionMode.dontAsk': 'nicht nachfragen',
+  'wort.permissionMode.plan': 'nur planen',
+
   'feld.sprache.name': 'Sprache der Oberfläche',
   'feld.sprache.wirkung': 'In welcher Sprache die Beschriftungen dieses Programms stehen.',
   'feld.sprache.info':
-    'Alle Beschriftungen dieses Fensters kommen seit dem 11.08. aus EINER Tabelle und nicht mehr aus dem '
-    + 'Quelltext — das ist die Voraussetzung dafür, dass eine zweite Sprache eine zweite Tabelle ist und '
+    'Alle Beschriftungen dieses Fensters kommen aus einer einzigen Tabelle und nicht mehr aus dem '
+    + 'Quelltext – das ist die Voraussetzung dafür, dass eine zweite Sprache eine zweite Tabelle ist und '
     + 'kein Durchgang durch zweitausend Zeilen. Englisch ist die Auslieferungssprache; Deutsch bleibt '
     + 'vollständig gepflegt daneben.',
   'feld.sprache.etikett': 'sofort',
@@ -859,15 +928,15 @@ export const DE: Record<string, string> = {
   'wort.sprache.en': 'English',
   'satz.spracheNochNichtDa':
     'Für diese Sprache liegt noch keine Tabelle vor. Solange die zweite Tabelle fehlt, bleibt die '
-    + 'Oberfläche englisch — halb übersetzt wäre schlechter als gar nicht.',
+    + 'Oberfläche englisch – halb übersetzt wäre schlechter als gar nicht.',
 
   'feld.chatAnsichtVorgabe.name': 'Neue Sitzungen zeigen das Gespräch',
   'feld.chatAnsichtVorgabe.wirkung':
-    'An: neue Panes starten in der Chat-Ansicht, wo ihr Programm das kann — getrennt für den '
+    'An: neue Panes starten in der Chat-Ansicht, wo ihr Programm das kann – getrennt für den '
     + 'Orchestrator und für seine Worker.',
   'feld.chatAnsichtVorgabe.info':
-    'Das ist die Vorgabe je Rolle und keine Aussage darüber, was ein Programm kann — das steht je '
-    + 'Programm auf der Seite „Programme und Modelle". Ein Programm ohne Weg zum Gesprächsverlauf bleibt '
+    'Das ist die Vorgabe je Rolle und keine Aussage darüber, was ein Programm kann – das steht je '
+    + 'Programm auf der Seite „Programme und Modelle“. Ein Programm ohne Weg zum Gesprächsverlauf bleibt '
     + 'beim Terminalbild, ganz gleich, was hier steht. Für eine einzelne Sitzung schlägt der Rechtsklick '
     + 'auf sie diese Vorgabe: er stellt ihren Orchestrator sofort um, und zwar nur ihn. Die Worker folgen '
     + 'weiter dem, was hier steht.',
@@ -880,8 +949,8 @@ export const DE: Record<string, string> = {
   'feld.pfade.wirkung':
     'Wo die beiden Konfigurationsdateien, die Registry und der Oberflächen-Zustand liegen.',
   'feld.pfade.info':
-    'Zwei Dateien, getrennt nach Zuständigkeit: was Programm und Werkzeuge GEMEINSAM meinen, steht in den '
-    + 'Einstellungen (~/.claude/workbench/settings.json) — dort sitzt die Sperre, und geschrieben wird nur '
+    'Zwei Dateien, getrennt nach Zuständigkeit: was Programm und Werkzeuge gemeinsam meinen, steht in den '
+    + 'Einstellungen (~/.claude/workbench/settings.json) – dort sitzt die Sperre, und geschrieben wird nur '
     + 'über wb-state, das jede Änderung mit Urheber protokolliert. Was nur dieses Programm zum Hochfahren '
     + 'braucht (Pfade, Socket, Maschinenkennung), steht in der Programm-Konfiguration. Kein Schlüssel steht '
     + 'in beiden. Die Pfade sind aus der Konfiguration dieses Laufs gelesen, nicht fest verdrahtet. Welche '
@@ -892,7 +961,7 @@ export const DE: Record<string, string> = {
   'feld.erststartZeigen.wirkung':
     'Öffnet dasselbe Fenster, das beim allerersten Start dieser Werkbank von selbst erscheint.',
   'feld.erststartZeigen.info':
-    'Derselbe Ablauf wie beim ersten Start, nur von Hand aufgerufen — zum Nachlesen, oder um ihn einem '
+    'Derselbe Ablauf wie beim ersten Start, nur von Hand aufgerufen – zum Nachlesen, oder um ihn einem '
     + 'zweiten Menschen an diesem Rechner zu zeigen. Der Knopf setzt nichts zurück: dass der erste Start '
     + 'schon einmal gelaufen ist, bleibt vermerkt, und beim nächsten eigentlichen Programmstart erscheint '
     + 'das Fenster deshalb weiterhin nicht von selbst.',
@@ -900,14 +969,14 @@ export const DE: Record<string, string> = {
 
   'feld.abweichungen.name': 'Abweichungen von der Auslieferung',
   'feld.abweichungen.wirkung':
-    'Alles, was du verstellt hast, in einer Liste — mit dem Weg zurück.',
+    'Alles, was du verstellt hast, in einer Liste – mit dem Weg zurück.',
   'feld.abweichungen.info':
     'Für ein Programm, das weitergegeben werden soll, ist das die einzige ehrliche Antwort auf die Frage, '
     + 'warum es bei zwei Leuten verschieden läuft. Verglichen wird gegen die mitgelieferte Vorgabe, nicht '
-    + 'gegen den Stand von gestern. Ein Wert, der nie angefasst wurde, steht hier nicht — auch dann nicht, '
+    + 'gegen den Stand von gestern. Ein Wert, der nie angefasst wurde, steht hier nicht – auch dann nicht, '
     + 'wenn er zufällig gleich aussieht.',
   'feld.abweichungen.etikett': 'sofort',
-  'satz.keineAbweichung': 'Nichts — alles steht so, wie es ausgeliefert wurde.',
+  'satz.keineAbweichung': 'Nichts – alles steht so, wie es ausgeliefert wurde.',
 
   'feld.sicherung.name': 'Sichern, zurücksetzen, übertragen',
   'feld.sicherung.wirkung':
@@ -916,7 +985,7 @@ export const DE: Record<string, string> = {
   'feld.sicherung.info':
     'Bis zum 11.08. ließ sich nur jeder Schlüssel einzeln zurückstellen; vor einem größeren Umbau gab es '
     + 'keinen Weg, den vorherigen Stand zu sichern. Der Text unten ist genau das, was von der Auslieferung '
-    + 'abweicht — nicht die ganze Datei, denn Vorgaben zu sichern hieße, sie beim Einsetzen auf einem '
+    + 'abweicht – nicht die ganze Datei, denn Vorgaben zu sichern hieße, sie beim Einsetzen auf einem '
     + 'anderen Rechner festzuschreiben. Eingesetzt wird Schlüssel für Schlüssel über denselben Schreibweg '
     + 'wie jeder Haken; was das Werkzeug ablehnt, wird nicht gespeichert und steht danach in der Fußzeile.',
   'feld.sicherung.etikett': 'sofort',
@@ -924,11 +993,11 @@ export const DE: Record<string, string> = {
   'wort.einsetzen': 'einsetzen',
   'wort.allesZurueck': 'alles auf Auslieferung',
   'satz.sicherungKopiert': 'Der Stand liegt in der Zwischenablage ({zeichen} Zeichen).',
-  'satz.sicherungKeinText': 'Es steht nichts im Feld — nichts einzusetzen.',
+  'satz.sicherungKeinText': 'Es steht nichts im Feld – nichts einzusetzen.',
   'satz.sicherungKeinJson':
     'Das ist kein JSON-Objekt. Erwartet wird genau das, was der Knopf darüber liefert.',
   'satz.sicherungEingesetzt': '{anzahl} Einstellungen eingesetzt.',
-  'satz.sicherungLeer': 'Nichts weicht ab — es gibt nichts zu sichern.',
+  'satz.sicherungLeer': 'Nichts weicht ab – es gibt nichts zu sichern.',
 
   // --- Bedienung, quer über alle Seiten ------------------------------------
   'wort.hinzufuegen': 'Hinzufügen',
@@ -945,9 +1014,15 @@ export const DE: Record<string, string> = {
   'wort.einEintrag': '1 Eintrag',
   'wort.mehrereEintraege': '{anzahl} Einträge',
   'wort.leereListe': 'leere Liste',
+  // Der Schalter je Maschinenzeile (04.09.). Der lange Satz bleibt als Titel
+  // des Hakens; die kurze Aufschrift daneben kam am 05.09. dazu, weil ein
+  // blankes Kaestchen sich als „ausgewaehlt“ liest und nicht als
+  // „Sitzungen laden“.
+  'wort.maschineLaden': 'Sitzungen dieser Maschine laden',
+  'wort.sitzungenLaden': 'Sitzungen laden',
   'wort.nichtsGesetzt': 'nichts gesetzt',
   'wort.alleModelle': 'Alle {anzahl}',
-  'wort.leerListe': 'leer — es wird nichts ausgelassen',
+  'wort.leerListe': 'leer – es wird nichts ausgelassen',
   'platzhalter.modellsuche': 'zusätzlich nach Name oder Kennung filtern …',
   'platzhalter.suche': 'nach Name oder Kennung filtern …',
   'platzhalter.maschine': 'SSH-Alias, z. B. peer',
@@ -960,30 +1035,30 @@ export const DE: Record<string, string> = {
   'platzhalter.ollama': 'http://127.0.0.1:11434',
   'platzhalter.sicherung': 'Hier einen gesicherten Stand einsetzen …',
   'platzhalter.schluesselEingabe': 'Wert einfügen …',
-  'satz.schluesselLeer': 'Kein Wert eingegeben — nichts gespeichert.',
+  'satz.schluesselLeer': 'Kein Wert eingegeben – nichts gespeichert.',
   'satz.schluesselGespeichert': 'Für {anbieter} abgelegt.',
   'satz.schluesselFehler': 'Fehler beim Ablegen.',
   'satz.keinTreffer': 'Kein Modell passt auf Filter und Suche.',
   'satz.keinTrefferSuche': 'Kein Modell passt auf die Suche.',
   'satz.zuVieleTreffer':
-    '{anzahl} Modelle passen — gezeigt werden die ersten 60. Such nach Name oder Kennung.',
-  'satz.keineMuster': 'Keine Muster — es wird bei keinem Befehl zurückgefragt.',
+    '{anzahl} Modelle passen – gezeigt werden die ersten 60. Such nach Name oder Kennung.',
+  'satz.keineMuster': 'Keine Muster – es wird bei keinem Befehl zurückgefragt.',
   'satz.keineGuards':
-    'Die Liste der Sicherungen ist nicht zu lesen — wb-state antwortet nicht. Solange gilt: alle laufen.',
+    'Die Liste der Sicherungen ist nicht zu lesen – wb-state antwortet nicht. Solange gilt: alle laufen.',
   'satz.abgeschaltet': 'Abgeschaltet',
   'satz.abgeschaltetFuer': 'Abgeschaltet für {rolle}',
   'satz.seit': ' seit {datum}',
   'satz.stehtAufVorgabe': 'Steht auf der Vorgabe aus der Auslieferung.',
   'satz.zurueckAufVorgabe': 'Zurück auf die Vorgabe: {wert}',
-  'satz.infoTitel': 'Was macht „{feld}"?',
+  'satz.infoTitel': 'Was macht „{feld}“?',
   'satz.musterOhneBefehl':
-    'Ein Muster ohne Befehlsnamen wäre eine Textsuche über die ganze Zeile — es wird nicht angelegt.',
+    'Ein Muster ohne Befehlsnamen wäre eine Textsuche über die ganze Zeile – es wird nicht angelegt.',
   'satz.musterVonHand': 'Von Hand eingetragen.',
   'satz.schreibe': 'schreibe {schluessel} …',
   'satz.oberflaeche': 'Oberfläche: {schluessel} = {wert}',
-  'satz.fehler': 'FEHLER: {aufruf} — {ausgabe}',
+  'satz.fehler': 'Fehler: {aufruf} – {ausgabe}',
   'satz.ohneGrundNichts':
-    'Ohne Grund wird nichts geändert — schreib in einem Satz, warum.',
+    'Ohne Grund wird nichts geändert – schreib in einem Satz, warum.',
 
   // --- Rückfragen ----------------------------------------------------------
   'frage.wacheAus.text':
@@ -993,7 +1068,7 @@ export const DE: Record<string, string> = {
   'frage.wacheAus.tun': 'Wache abschalten',
   'frage.wacheOrchAus.text':
     'Die Kontextwache lässt den Orchestrator danach in Ruhe: keine Mahnung, keine Notbremse, kein /compact '
-    + '— auch nicht kurz vor dem Überlauf. Für die Worker läuft sie weiter.',
+    + '– auch nicht kurz vor dem Überlauf. Für die Worker läuft sie weiter.',
   'frage.wacheOrchAus.tun': 'Für das Hauptfenster abschalten',
   'frage.wacheWorkerAus.text':
     'Kein Worker wird danach mehr gemahnt oder kompaktiert. Ein volllaufender Worker verliert dann still, '
@@ -1003,7 +1078,7 @@ export const DE: Record<string, string> = {
     'Später mahnen heißt weniger Vorlauf: ab {wert} % bleibt einem Worker weniger Platz, seine Übergabe '
     + 'noch zu schreiben, bevor kompaktiert wird.',
   'frage.mahnenHoch.orch':
-    'Ab {wert} % wird der Orchestrator erst später gemahnt — er hat dann weniger Platz, Zustand und Wissen '
+    'Ab {wert} % wird der Orchestrator erst später gemahnt – er hat dann weniger Platz, Zustand und Wissen '
     + 'zu sichern, bevor kompaktiert wird.',
   'frage.mahnenHoch.tun': 'Schwelle anheben',
   'frage.eingreifenAus.text':
@@ -1014,15 +1089,15 @@ export const DE: Record<string, string> = {
     'Die Notbremse greift erst ab {wert} %. Je höher sie steht, desto näher am Überlauf wird kompaktiert.',
   'frage.notbremseHoch.tun': 'Notbremse anheben',
   'frage.guardAus.text':
-    '„{name}" greift danach nicht mehr. {wirkung} Was diese Sicherung bisher angehalten hat, läuft ab '
-    + 'sofort ohne Frage durch — die übrigen bleiben davon unberührt.',
+    '„{name}“ greift danach nicht mehr. {wirkung} Was diese Sicherung bisher angehalten hat, läuft ab '
+    + 'sofort ohne Frage durch – die übrigen bleiben davon unberührt.',
   'frage.guardAus.tun': 'Sicherung abschalten',
   'frage.musterAus.text':
-    '„{name}" löst danach keine Rückfrage mehr aus. {grund} Der Befehl läuft ab sofort ohne Nachfrage '
+    '„{name}“ löst danach keine Rückfrage mehr aus. {grund} Der Befehl läuft ab sofort ohne Nachfrage '
     + 'durch, sofern kein Guard ihn ohnehin hart ablehnt.',
   'frage.musterAus.tun': 'Muster abschalten',
   'frage.musterWeg.text':
-    'Das Muster „{name}" wird aus der Liste gelöscht. Danach sieht man nicht mehr, dass es es gab — wer es '
+    'Das Muster „{name}“ wird aus der Liste gelöscht. Danach sieht man nicht mehr, dass es es gab – wer es '
     + 'nur vorübergehend loswerden will, schaltet es stattdessen ab.',
   'frage.musterWeg.tun': 'Muster löschen',
   'frage.skipAn.text':
@@ -1039,12 +1114,12 @@ export const DE: Record<string, string> = {
     + 'Inhaltssuche und Editor zeigen dann auch das, was hier bisher fehlte.',
   'frage.listeLeer.tun': 'Liste leeren',
   'frage.deckel.text':
-    'Der Deckel von „{modell}" steht danach auf {stufe}. Er gilt für Worker, die der Orchestrator ohne '
-    + 'Rückfrage startet — deine eigene Wahl bleibt frei. Ein Deckel ohne Grund liest sich in einem halben '
+    'Der Deckel von „{modell}“ steht danach auf {stufe}. Er gilt für Worker, die der Orchestrator ohne '
+    + 'Rückfrage startet – deine eigene Wahl bleibt frei. Ein Deckel ohne Grund liest sich in einem halben '
     + 'Jahr wie eine technische Grenze, deshalb gehört einer dazu.',
   'frage.deckel.tun': 'Deckel setzen',
   'frage.allesZurueck.text':
-    'Jede der {anzahl} Abweichungen wird auf die Auslieferung zurückgestellt — auch abgeschaltete '
+    'Jede der {anzahl} Abweichungen wird auf die Auslieferung zurückgestellt – auch abgeschaltete '
     + 'Sicherungen, gelockerte Wachen und gesetzte Deckel. Sicher den Stand vorher, wenn du ihn '
     + 'wiederhaben willst.',
   'frage.allesZurueck.tun': 'Alles zurücksetzen',
@@ -1053,14 +1128,14 @@ export const DE: Record<string, string> = {
     + 'Werkzeug ablehnt, bleibt stehen.',
   'frage.einsetzen.tun': 'Einsetzen',
 
-  // --- Die Namen in „was bei dir anders ist" --------------------------------
+  // --- Die Namen in „was bei dir anders ist“ --------------------------------
   // 30 der 37 Namen hier sind wortgleich mit dem `name` des zugehoerigen
   // Feldes (`feld.<schluessel>.name`) -- test-app-bezeichnung-paritaet.sh
   // haelt das zusammen, nicht bloss dieser Kommentar. Zwei weichen ABSICHTLICH
   // ab, weil die Abweichungsliste einen ZUSTAND meldet und die Seite ein
   // BEDIENELEMENT beschriftet:
-  //   effortCaps  Feld „Höchste Stufe ohne Rückfrage", hier „Gesetzte Effort-Deckel"
-  //   guards      Feld „Welche Sicherungen mitlaufen", hier „Abgeschaltete Sicherungen"
+  //   effortCaps  Feld „Höchste Stufe ohne Rückfrage“, hier „Gesetzte Effort-Deckel“
+  //   guards      Feld „Welche Sicherungen mitlaufen“, hier „Abgeschaltete Sicherungen“
   // Fuenf haben KEIN Gegenstueck (kein `feld.<schluessel>.name`), weil der
   // Einstellungsschluessel nicht auf genau ein Feld abbildet: workerEffort und
   // workerModel stehen nicht im Menü (siehe deren eigene Zeile, „nicht im
@@ -1070,9 +1145,15 @@ export const DE: Record<string, string> = {
   // Zwei Zaehlerstaende sind hier nachgetragen, nicht neu erfunden: der
   // Kommentar stand bis zum 20.08. auf 28 von 35 und hatte
   // orchestratorPermissionMode (16.08.) nie mitgezaehlt; die Suite fuehrte
-  // laengst 29 von 36. Dazu kommt jetzt workerZustellung (20.08.) -- macht
-  // 30 von 37. Die zwei angemeldeten Abweichungen und die fuenf Schluessel
-  // ohne Gegenstueck sind unveraendert.
+  // laengst 29 von 36. Dazu kommt workerZustellung (20.08.) -- machte
+  // 30 von 37. Am 03.09. kommen vier dazu, die als Einstellung laengst in der
+  // Abweichungstabelle standen und dort als "[fehlender Text: ...]" erschienen:
+  // orchestratorVorhersage und workerVorhersage (beide wortgleich mit ihrem
+  // Feldnamen) sowie orchestratorVorhersageWeg und erststartErledigt (beide
+  // ohne Feld auf einer Seite). Macht 32 von 41; die zwei angemeldeten
+  // Abweichungen sind unveraendert, die Schluessel ohne Gegenstueck sind
+  // jetzt sieben. Am 04.09. kommt workerTransport dazu, wortgleich mit seinem
+  // Feldnamen -- 33 von 42, die beiden anderen Listen unveraendert.
   'bezeichnung.closeSessionOnWindowClose': 'Terminal mit dem Fenster beenden',
   'bezeichnung.orchestratorHarness': 'Programm im Hauptfenster',
   'bezeichnung.orchestratorModel': 'Modell der Sitzung',
@@ -1080,17 +1161,22 @@ export const DE: Record<string, string> = {
   'bezeichnung.workerEffort': 'Denkstufe eines Workers ohne eigene Angabe (nicht im Menü)',
   'bezeichnung.workerModel': 'Modell eines Workers ohne eigene Angabe (nicht im Menü)',
   'bezeichnung.workerLayout': 'Wo die Worker-Panes sitzen',
+  'bezeichnung.orchestratorVorhersage': 'Multi-Token-Vorhersage für den Orchestrator',
+  'bezeichnung.orchestratorVorhersageWeg': 'Weg der Multi-Token-Vorhersage für den Orchestrator',
+  'bezeichnung.workerVorhersage': 'Multi-Token-Vorhersage für Worker',
+  'bezeichnung.erststartErledigt': 'Der geführte erste Start ist durchlaufen',
   'bezeichnung.newSessionDefaultDir': 'Ordner, in dem eine neue Sitzung anfängt',
   'bezeichnung.modelDiscoveryAuto': 'Modell-Kataloge von selbst abrufen',
   'bezeichnung.maxWorkers': 'Worker gleichzeitig auf dieser Maschine',
   'bezeichnung.workerWorktrees': 'Jeder Worker bekommt einen eigenen Arbeitsbaum',
   'bezeichnung.defaultWorkerMachine': 'Wo ein Worker läuft, wenn nichts gesagt wird',
   'bezeichnung.workerZustellung': 'Wie ein Auftrag beim Worker ankommt',
+  'bezeichnung.workerTransport': 'Woran ein Worker-Pane hängt',
   'bezeichnung.maxWorkerPanesPerTab': 'Worker je Tab',
   'bezeichnung.minWorkerPaneWidth': 'Schmalster Worker-Pane',
   'bezeichnung.contextGuardAutostart': 'Kontextwache läuft mit',
   'bezeichnung.guardMeldetWorkerStatus': 'Die Wache schreibt Worker-Meldungen ins Hauptfenster',
-  'bezeichnung.stallMinutes': 'Als „hängt" melden nach',
+  'bezeichnung.stallMinutes': 'Als „hängt“ melden nach',
   'bezeichnung.workerSkipPermissions': 'Worker arbeiten ohne Rückfrage ihrer CLI',
   'bezeichnung.orchestratorPermissionMode': 'Wie viel der Orchestrator ohne Rückfrage tun darf',
   'bezeichnung.askPatterns': 'Befehle, bei denen zurückgefragt wird',
@@ -1103,6 +1189,7 @@ export const DE: Record<string, string> = {
   'bezeichnung.guards': 'Abgeschaltete Sicherungen',
   'bezeichnung.kontextwache': 'Verstellte Kontextwache',
   'bezeichnung.remoteMachines': 'Rechner, die mitarbeiten',
+  'bezeichnung.remoteMachinesPausiert': 'Pausierte Maschinen',
   'bezeichnung.ollamaEndpoint': 'Adresse des lokalen Modell-Servers',
   'bezeichnung.meldungen': 'Worüber du außerhalb des Fensters Bescheid bekommst',
   'bezeichnung.sprache': 'Sprache der Oberfläche',
@@ -1286,6 +1373,11 @@ export const EN: Record<string, string> = {
   'wort.sort.folder': 'by folder',
   'wort.sort.name': 'by name',
 
+  'wort.einheit.punkt': 'pt',
+  'wort.einheit.zeilen': 'lines',
+  'wort.einheit.spalten': 'columns',
+  'wort.einstellungen': 'Settings',
+
   'feld.closeSessionOnWindowClose.name': 'Close the terminal with the window',
   'feld.closeSessionOnWindowClose.wirkung':
     'Off (default): the window closes, the tmux session behind it keeps running -- it gets closed via '
@@ -1346,7 +1438,7 @@ export const EN: Record<string, string> = {
   'feld.askPatterns.wirkung':
     'These commands are held, show up in the approval view, and go through after a one-time approval.',
   'feld.askPatterns.info':
-    'Neither harmless nor forbidden -- this is the tier in between. A pattern matches a SPOT in the '
+    'Neither harmless nor forbidden -- this is the tier in between. A pattern matches a spot in the '
     + 'parsed command line, not a string anywhere in the text -- otherwise a paragraph merely mentioning '
     + '"git clean -fd" would already trip the guard (as happened on 05.08.). Switched off instead of '
     + 'deleted keeps it visible that the pattern exists. One approval lasts fifteen minutes, hard-capped '
@@ -1358,7 +1450,7 @@ export const EN: Record<string, string> = {
     'No view enters these folders -- they are skipped, not just hidden.',
   'feld.secretExcludeDirs.info':
     'File tree, quick-open, content search and editor all ask the same spot; a filter a view can bypass '
-    + 'is no filter. EVERY path segment is checked, not just the last one -- otherwise project/.ssh/config '
+    + 'is no filter. Every path segment is checked, not just the last one -- otherwise project/.ssh/config '
     + 'would slip through. The list lives here and not in source, because it should be visible and checkable.',
   'feld.secretExcludeDirs.etikett': 'immediately',
 
@@ -1366,7 +1458,7 @@ export const EN: Record<string, string> = {
   'feld.secretExcludePatterns.wirkung':
     'Files whose name matches one of these patterns show up in no view.',
   'feld.secretExcludePatterns.info':
-    'A glob on ONE path segment, no path separator: * stands for any number of characters, ? for one. '
+    'A glob on a single path segment, no path separator: * stands for any number of characters, ? for one. '
     + 'Deliberately kept small -- a full glob dialect with ** and {a,b} invites patterns whose effect is '
     + 'no longer visible. Case does not matter.',
   'feld.secretExcludePatterns.etikett': 'immediately',
@@ -1386,7 +1478,7 @@ export const EN: Record<string, string> = {
     'MCP servers are kept as background services by mcp-shared, not by this program. As long as that '
     + 'holds, there is no switch for it here, just this sentence.',
 
-  // The nine guards -- ids from hooks/bash-guard.py, text from here.
+  // The eleven guards -- ids from hooks/bash-guard.py, text from here.
   'guard.secrets.name': 'Secrets',
   'guard.secrets.wirkung':
     'Holds any command that touches a key, a certificate, or the secrets folder.',
@@ -1394,6 +1486,13 @@ export const EN: Record<string, string> = {
     'Covers ~/Knowledge/90-secrets, ~/.ssh, and the usual credential files -- the same list the folder '
     + 'view also skips. Off means: an agent can read, copy, and write these files into an output without '
     + 'anyone being asked.',
+  'guard.git-add.name': 'Staging everything at once',
+  'guard.git-add.wirkung':
+    'Holds a "git add" that sweeps up a whole directory or the working tree.',
+  'guard.git-add.info':
+    'Whoever commits names their paths. A directory add looks harmless and on 16 Aug pulled a second '
+    + "session's half-finished work into two commits that were not its own. Off means: \"git add -A\" goes "
+    + 'through again.',
   'guard.kill-pattern.name': 'Killing other processes',
   'guard.kill-pattern.wirkung':
     'Holds commands that shoot down processes that do not belong to the agent.',
@@ -1444,6 +1543,12 @@ export const EN: Record<string, string> = {
     'The last tier, and the only one that does not refuse but asks. It sits behind all the others: '
     + 'whatever a guard flatly refuses never reaches here. Switched off here means: no pattern triggers '
     + 'an ask-first prompt anymore -- including the ones still checked further below.',
+  'guard.pane-write.name': 'Typing into other panes',
+  'guard.pane-write.wirkung':
+    'Holds commands that write into an orchestrator pane with tmux directly.',
+  'guard.pane-write.info':
+    'The second layer next to wb-pane-write: it catches the route around the tool. A test works on its own '
+    + 'socket and is not affected.',
 
   // --- Page 3: Programs and models --------------------------------
   'feld.harnessTabelle.name': 'Programs, sign-in and chat view',
@@ -1458,6 +1563,7 @@ export const EN: Record<string, string> = {
     + 'reason instead.',
   'wort.startbar': 'starts here',
   'wort.nichtStartbar': 'does not start on {maschine}',
+  'wort.fehltHier': 'not installed here',
   'wort.angemeldet': 'signed in',
   'wort.nichtAngemeldet': 'not signed in',
   'wort.anmeldungUnbekannt': 'not checkable',
@@ -1466,7 +1572,7 @@ export const EN: Record<string, string> = {
   'spalte.programm': 'Program',
   'spalte.stufen': 'Levels',
   'spalte.modelle': 'Models',
-  'spalte.hier': 'On {maschine}',
+  'spalte.hier': 'On this machine',
   'spalte.anmeldung': 'Sign-in',
   'spalte.chat': 'Chat view',
   'spalte.modell': 'Model',
@@ -1499,6 +1605,22 @@ export const EN: Record<string, string> = {
     + 'line next to it.',
   'feld.chatAnsicht.etikett': 'takes effect on the next session',
 
+  'feld.workerTransport.name': 'What a worker pane hangs on',
+  'feld.workerTransport.wirkung':
+    'On tmux as before, or on a pseudo-terminal the workbench holds itself. "pty" is a prototype: one '
+    + 'worker per pseudo-terminal, the context guard and the return channel run over the control '
+    + 'socket, and several pty panes side by side in one tab are not built yet.',
+  'feld.workerTransport.info':
+    'The way since V1 is tmux: every worker is a pane in a tmux session, and this house\'s tools are '
+    + 'built on that. "pty" comes out of the 2026-09-04 probe (app/src/main/pty.ts): the workbench '
+    + 'starts the worker itself on its own pseudo-terminal and mirrors its byte stream into a headless '
+    + 'terminal model. The screen the context guard reads from it was byte-for-byte the same as the tmux '
+    + 'one in the measurement, and after a restart of the workbench the worker was back with the same '
+    + 'conversation. Two spots stay open: the tab view still draws only a single pty pane, and the '
+    + 'workbench passes its whole environment down to the worker. With the switch on "tmux" the '
+    + 'prototype is not even loaded; an unknown value counts as "tmux" and not as an error.',
+  'feld.workerTransport.etikett': 'takes effect on the next worker',
+
   'feld.ollamaEndpoint.name': 'Address of the local model server',
   'feld.ollamaEndpoint.wirkung':
     'Local models are looked for at this address -- Ollama, vLLM, or MLX, whichever answers there.',
@@ -1517,7 +1639,7 @@ export const EN: Record<string, string> = {
   'feld.modelDiscoveryAuto.wirkung':
     'On: the providers\' catalogs are fetched from the network on their own. Off: only on demand.',
   'feld.modelDiscoveryAuto.info':
-    'Off means ONLY that the network is no longer reached on its own. The local sources -- ollama, the '
+    'Off means only that the network is no longer reached on its own. The local sources -- ollama, the '
     + 'CLIs\' own model lists, files -- keep discovering automatically regardless, and the manual fetch '
     + 'button always stays usable. Until 11.08. this setting was only reachable in the VS Code extension, '
     + 'even though wb-state has long read it.',
@@ -1530,7 +1652,7 @@ export const EN: Record<string, string> = {
   'feld.orchestratorVorhersage.info':
     'Which paths exist is set in the registry: only what is registered and measured there can be picked, '
     + 'never a free-form path. If the registry lists more than one path for the model, they appear below '
-    + 'the switch, each with its provenance -- including where something was NOT measured. Speculative '
+    + 'the switch, each with its provenance -- including where nothing was measured. Speculative '
     + 'decoding and the MLX server\'s shared concurrency are mutually exclusive (mlx_lm.server turns off '
     + 'batching the moment a drafter is set) -- that is why this switch defaults to off.',
   'feld.workerVorhersage.name': 'Multi-token prediction for workers',
@@ -1550,7 +1672,7 @@ export const EN: Record<string, string> = {
   'feld.anbieter.wirkung':
     'For every provider: where its access comes from, and whether it is present on this machine.',
   'feld.anbieter.info':
-    'A key is entered here, but NOT written into the settings file -- that file is shared plain text that '
+    'A key is entered here, but not written into the settings file -- that file is shared plain text that '
     + 'workers write to as well, and a key inside it would be a key in plain text. The value takes its own '
     + 'path instead and is never read back afterward to display it. So all that is shown remains whether '
     + 'access is present -- never its value, never its location. A provider with a subscription instead of '
@@ -1605,14 +1727,22 @@ export const EN: Record<string, string> = {
     + 'The list stays empty until someone adds an entry: an SSH target is real network access and must '
     + 'never fire on its own. The check button asks exactly once (ssh <name> true).',
   'feld.remoteMachines.etikett': 'immediately',
+  'feld.remoteMachinesPausiert.name': 'Paused machines',
+  'feld.remoteMachinesPausiert.wirkung':
+    'The sessions on a paused machine keep running there undisturbed -- pausing only affects this '
+    + "workbench's view of it: no polling, no sessions in the bar, no mirror panes.",
+  'feld.remoteMachinesPausiert.info':
+    'The name stays entered in "Machines that work along" -- the switch is reversible, without '
+    + 'retyping the address. A paused machine does not count as "not reachable": those are two '
+    + 'different states.',
   'satz.eigeneMaschine':
     'This machine -- it is always in the list and cannot be removed.',
-  'satz.fremdeMaschine': 'Reached via ssh {name} -- the name IS the SSH alias.',
+  'satz.fremdeMaschine': 'Reached via ssh {name} -- the name is also the SSH alias.',
   'satz.keineMaschine':
     'No further machine is registered. Without an entry the program never reaches the network on its own.',
   'satz.maschineSchonDa': '"{name}" is already in the list.',
   'satz.fremdeLast':
-    'How many workers another machine carries at once lives in ITS OWN settings file and is set there: '
+    'How many workers another machine carries at once lives in the settings file of that machine and is set there: '
     + 'ssh {name} wb-state settings set maxWorkers <number>. Two numbers in two places for the same '
     + 'question would be two truths, one of which is wrong.',
 
@@ -1622,7 +1752,7 @@ export const EN: Record<string, string> = {
   'feld.maxWorkers.info':
     'Refused, not queued: a start that overflows the window costs more than a start that says "too '
     + 'many". Existing panes keep getting reused, so a finished worker immediately frees up room again. '
-    + 'What is counted is worker panes, not subagents. This number belongs to the MACHINE, not the '
+    + 'What is counted is worker panes, not subagents. This number belongs to the machine, not the '
     + 'session: what a 48 GB machine carries, a smaller one does not.',
   'feld.maxWorkers.etikett': 'immediately',
 
@@ -1692,7 +1822,7 @@ export const EN: Record<string, string> = {
   'feld.wacheWorkerMahnenAb.info':
     'Percent of its model\'s context window. Nudged too early costs work, too late costs the result: '
     + 'whatever is not written down before compacting is gone. 80 leaves enough room for the handoff '
-    + 'itself. A HIGHER number means a later nudge, so less of a safety margin -- the tool requires a '
+    + 'itself. A higher number means a later nudge, so less of a safety margin -- the tool requires a '
     + 'reason for that.',
   'feld.wacheWorkerMahnenAb.etikett': 'takes effect on the next guard run',
 
@@ -1706,7 +1836,7 @@ export const EN: Record<string, string> = {
 
   'feld.wacheOrchEingreifen.name': 'The guard steps in itself',
   'feld.wacheOrchEingreifen.wirkung':
-    'Off: it keeps nudging but no longer types /compact -- it keeps the voice, not the hand.',
+    'On: it does not only nudge, it types /compact itself when it has to -- it has the voice and the hand.',
   'feld.wacheOrchEingreifen.info':
     'The guard compacts the orchestrator session itself if needed, by typing /compact into a foreign '
     + 'window. Anyone who does not want that but still wants to be warned switches this off: the nudge '
@@ -1810,7 +1940,7 @@ export const EN: Record<string, string> = {
     'Sends a test notification over exactly the channels selected above, and shows below what happened '
     + 'on each one.',
   'feld.meldungTesten.info':
-    'This button sends ONE real test notification -- system notice, sound, webhook, whichever is checked '
+    'This button sends a single real test notification -- system notice, sound, webhook, whichever is checked '
     + 'above -- and then reports per channel whether it worked: the HTTP status for the webhook, otherwise '
     + 'the reason it did not. If the main switch is off, the button says so and sends nothing.',
   'knopf.meldungTesten': 'Send a test',
@@ -1851,7 +1981,7 @@ export const EN: Record<string, string> = {
   'feld.zustandsfarben.wirkung':
     'How you tell in the bar whether a session is working, waiting, done, or no longer running.',
   'feld.zustandsfarben.info':
-    'Four states, four colors, and they need to be distinguishable for YOU -- not for a catalog. Anyone '
+    'Four states, four colors, and they need to be distinguishable for you, not for a catalog. Anyone '
     + 'who has trouble telling red from green sets two colors here they can actually see. Back to default '
     + 'goes through the mark next to the heading.',
   'feld.zustandsfarben.etikett': 'immediately',
@@ -1914,10 +2044,17 @@ export const EN: Record<string, string> = {
   'wort.workerLayout.split': 'split under the main window',
   'wort.workerLayout.window': 'own window',
 
+  'wort.permissionMode.acceptEdits': 'Accept edits',
+  'wort.permissionMode.auto': 'Automatic',
+  'wort.permissionMode.bypassPermissions': 'Bypass permissions',
+  'wort.permissionMode.manual': 'By hand',
+  'wort.permissionMode.dontAsk': 'Do not ask',
+  'wort.permissionMode.plan': 'Plan only',
+
   'feld.sprache.name': 'Interface language',
   'feld.sprache.wirkung': 'What language this program\'s labels are in.',
   'feld.sprache.info':
-    'Every label in this window has come from ONE table since 11.08., no longer from source -- that is '
+    'Every label in this window comes from a single table, no longer from source -- that is '
     + 'what makes a second language a second table instead of a pass through two thousand lines. English '
     + 'is the shipped default; German stays fully maintained alongside it.',
   'feld.sprache.etikett': 'immediately',
@@ -1946,7 +2083,7 @@ export const EN: Record<string, string> = {
   'feld.pfade.wirkung':
     'Where the two configuration files, the registry, and the interface state live.',
   'feld.pfade.info':
-    'Two files, split by responsibility: what the program and the tools mean TOGETHER lives in the '
+    'Two files, split by responsibility: what the program and the tools mean together lives in the '
     + 'settings (~/.claude/workbench/settings.json) -- the lock sits there, and writes only ever go '
     + 'through wb-state, which logs every change with its author. What only this program needs to boot '
     + '(paths, socket, machine id) lives in the program configuration. No key lives in both. The paths '
@@ -2009,6 +2146,8 @@ export const EN: Record<string, string> = {
   'wort.einEintrag': '1 entry',
   'wort.mehrereEintraege': '{anzahl} entries',
   'wort.leereListe': 'empty list',
+  'wort.maschineLaden': 'Load sessions from this machine',
+  'wort.sitzungenLaden': 'Load sessions',
   'wort.nichtsGesetzt': 'nothing set',
   'wort.alleModelle': 'All {anzahl}',
   'wort.leerListe': 'empty -- nothing gets skipped',
@@ -2045,7 +2184,7 @@ export const EN: Record<string, string> = {
   'satz.musterVonHand': 'Entered by hand.',
   'satz.schreibe': 'writing {schluessel} …',
   'satz.oberflaeche': 'Interface: {schluessel} = {wert}',
-  'satz.fehler': 'ERROR: {aufruf} — {ausgabe}',
+  'satz.fehler': 'Error: {aufruf} — {ausgabe}',
   'satz.ohneGrundNichts':
     'Nothing changes without a reason -- write in one sentence why.',
 
@@ -2126,12 +2265,17 @@ export const EN: Record<string, string> = {
   'bezeichnung.workerEffort': 'Effort level of a worker with none of its own (not in the menu)',
   'bezeichnung.workerModel': 'Model of a worker with none of its own (not in the menu)',
   'bezeichnung.workerLayout': 'Where the worker panes sit',
+  'bezeichnung.orchestratorVorhersage': 'Multi-token prediction for the orchestrator',
+  'bezeichnung.orchestratorVorhersageWeg': 'Route of multi-token prediction for the orchestrator',
+  'bezeichnung.workerVorhersage': 'Multi-token prediction for workers',
+  'bezeichnung.erststartErledigt': 'The guided first run has been completed',
   'bezeichnung.newSessionDefaultDir': 'Folder a new session starts in',
   'bezeichnung.modelDiscoveryAuto': 'Fetch model catalogs on their own',
   'bezeichnung.maxWorkers': 'Workers at once on this machine',
   'bezeichnung.workerWorktrees': 'Every worker gets its own worktree',
   'bezeichnung.defaultWorkerMachine': 'Where a worker runs when nothing is said',
   'bezeichnung.workerZustellung': 'How a task reaches the worker',
+  'bezeichnung.workerTransport': 'What a worker pane hangs on',
   'bezeichnung.maxWorkerPanesPerTab': 'Workers per tab',
   'bezeichnung.minWorkerPaneWidth': 'Narrowest worker pane',
   'bezeichnung.contextGuardAutostart': 'Context guard starts along',
@@ -2149,6 +2293,7 @@ export const EN: Record<string, string> = {
   'bezeichnung.guards': 'Switched-off safeguards',
   'bezeichnung.kontextwache': 'Adjusted context guard',
   'bezeichnung.remoteMachines': 'Machines that work along',
+  'bezeichnung.remoteMachinesPausiert': 'Paused machines',
   'bezeichnung.ollamaEndpoint': 'Address of the local model server',
   'bezeichnung.meldungen': 'What you get notified about outside the window',
   'bezeichnung.sprache': 'Interface language',

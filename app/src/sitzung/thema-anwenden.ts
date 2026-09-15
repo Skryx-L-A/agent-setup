@@ -24,6 +24,8 @@ interface ThemaPayload {
   zustandsfarben: Record<string, string>;
   zustandsfarbenLesbar: Record<string, string>;
   zustandsfarbenTinte: Record<string, string>;
+  /** Bereitgestellt fuer den Worker 'farbsystem' -- siehe main/thema.ts. Dieses Fenster liest sie nicht. */
+  systemAkzentfarbe: string;
 }
 
 interface ThemaBruecke {

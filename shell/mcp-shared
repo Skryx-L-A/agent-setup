@@ -15,6 +15,14 @@
 #                         (auch nach einem Plugin-Update nötig — das überschreibt sie)
 #   mcp-shared reap       Helferprozesse ohne lebende Claude-Session beenden
 #   mcp-shared reap --dry-run
+#   mcp-shared browser [lokal|browserbase]
+#                         Browserwahl fuer playwright: ohne Argument aktuellen
+#                         Zustand zeigen; mit Argument umschalten. `browserbase`
+#                         haengt den Server an eine gehostete Browserbase-Sitzung
+#                         (wb-browserbase, Free-Plan 60 Minuten/Monat), `lokal`
+#                         ist die Vorgabe. Nach jedem Halt faellt die Wahl
+#                         automatisch auf lokal zurueck, damit kein vergessener
+#                         Schalter Minuten verbrennt (2026-09-09).
 #
 # `reap` beendet NUR Prozesse, deren Elternkette keinen lebenden Claude-Prozess mehr
 # enthält, und immer über die konkrete PID — nie über ein Muster (Standing Rule nach
@@ -43,10 +51,62 @@ BM_URL="http://127.0.0.1:${BM_PORT}/mcp"
 PW_URL="http://localhost:${PW_PORT}/mcp"   # playwright-mcp prüft den Host-Header (DNS-Rebind-Schutz)
 BM_LABEL=agent-workbench.mcp-basic-memory
 PW_LABEL=agent-workbench.mcp-playwright
-STATE="$HOME/.local/state/mcp-shared"
+# MCP_SHARED_STATE ist eine Ueberschreibung fuer Tests: die Zustandsdateien
+# (playwright-browser, playwright-browserbase-session) liegen sonst fest hier.
+STATE="${MCP_SHARED_STATE:-$HOME/.local/state/mcp-shared}"
 mkdir -p "$STATE"
 
 port_alive() { /usr/bin/nc -z 127.0.0.1 "$1" >/dev/null 2>&1; }
+
+# Browserwahl fuer playwright (siehe Kopf, `mcp-shared browser`). Eine Zeile in
+# cmd_status, mit der Sitzungs-ID sobald eine Browserbase-Sitzung offen ist.
+browser_zeile() {
+  local wahl id
+  wahl="$(cat "$STATE/playwright-browser" 2>/dev/null || echo lokal)"
+  if [ "$wahl" = "browserbase" ]; then
+    id="$(cat "$STATE/playwright-browserbase-session" 2>/dev/null)"
+    echo "Browser: browserbase (Sitzung ${id:-?})"
+  else
+    echo "Browser: lokal"
+  fi
+}
+
+cmd_browser() {
+  local arg="${1:-}"
+  if [ -z "$arg" ]; then
+    browser_zeile
+    return 0
+  fi
+  case "$arg" in
+    lokal|browserbase) ;;
+    *) echo "mcp-shared: browser braucht lokal|browserbase" >&2; return 1 ;;
+  esac
+  mkdir -p "$STATE"
+  # Laeuft der geteilte playwright gerade (Backend-Port antwortet), neu
+  # anwerfen, damit die Wahl SOFORT gilt statt beim naechsten Bedarf. Der Halt
+  # kommt VOR dem Schreiben der Wahl: cmd_halt setzt sie ueber
+  # _browserbase_aufraeumen selbst auf lokal zurueck, und die neue Wahl muss das
+  # ueberleben (Fund im Review 2026-09-09: erst schreiben, dann halten, ergab
+  # immer lokal).
+  local lief=""
+  if port_alive "$PW_BACKEND_PORT"; then
+    lief=1
+    cmd_halt playwright >/dev/null 2>&1
+  fi
+  echo "$arg" > "$STATE/playwright-browser"
+  if [ -n "$lief" ]; then
+    cmd_ensure playwright >/dev/null 2>&1
+  fi
+  if [ "$arg" = "browserbase" ]; then
+    local id
+    id="$(cat "$STATE/playwright-browserbase-session" 2>/dev/null)"
+    if [ -n "$id" ]; then
+      echo "Live-Ansicht: wb-browserbase schau $id --oeffnen"
+    else
+      echo "Live-Ansicht: wb-browserbase schau <id> --oeffnen (ID folgt beim Start)"
+    fi
+  fi
+}
 
 cmd_status() {
   printf '%-22s %-7s %s\n' SERVER PORT ZUSTAND
@@ -56,12 +116,16 @@ cmd_status() {
     launchctl list 2>/dev/null | grep -q "$l" || st="$st (LaunchAgent nicht geladen)"
     printf '%-22s %-7s %s\n' "${l##*.}" "$p" "$st"
   done
+  browser_zeile
   echo
   helpers_report
 }
 
 # Alle lokalen MCP-Helferprozesse mit ihrem Besitzer (= nächster Claude-Vorfahr).
 helpers_python() {
+  # Die Portnummern stehen oben im Skript, der Python-Block ist aber ein
+  # QUOTIERTES Here-Dokument und sieht sie nicht -- deshalb ueber die Umgebung.
+  MCPS_PORTS="$BM_PORT $PW_PORT $BM_BACKEND_PORT $PW_BACKEND_PORT" \
   /usr/bin/python3 - "$@" <<'PY'
 import subprocess, sys
 ps = subprocess.run(['ps','-axo','pid=,ppid=,etime=,rss=,command='],
@@ -89,18 +153,29 @@ def owner(pid):
         pid = ppid
     return None
 
+import os
+SHARED_PORTS = os.environ.get('MCPS_PORTS', '8766 8767 8776 8777').split()
+
 def is_helper(cmd):
     if 'Helpers/disclaimer' in cmd:      # Claude.app-Helfer, kein MCP-Prozess
         return False
     return ('basic-memory' in cmd and 'mcp' in cmd) \
-        or '@playwright/mcp' in cmd or 'playwright-mcp' in cmd
+        or '@playwright/mcp' in cmd or 'playwright-mcp' in cmd \
+        or 'mcp-playwright-start' in cmd
 
 rows = []
 for pid, (ppid, et, rss, cmd) in procs.items():
     if not is_helper(cmd):
         continue
-    # der geteilte Server selbst gehoert launchd und wird NIE angefasst
-    if '--transport streamable-http' in cmd or '--port 8767' in cmd or '--port 8766' in cmd:
+    # Der geteilte Server selbst gehoert launchd und wird NIE angefasst.
+    # BIS ZUM 2026-09-04 standen hier nur 8766 und 8767 fest im Text, waehrend die
+    # Bedarfsschaltung vom 20.08. den echten Server auf die BACKEND-Ports 8776/8777
+    # gelegt hat. Der Backend-Prozess haengt an launchd, hat also nie einen
+    # Claude-Vorfahren -- er wurde damit als "verwaist" gefuehrt, und
+    # `mcp-shared kill-orphans` haette den geteilten Server erschlagen, den dieses
+    # Werkzeug gerade schuetzen soll. Die Liste kommt jetzt aus denselben
+    # Variablen wie die Konfiguration, damit sie nicht wieder auseinanderlaufen.
+    if '--transport streamable-http' in cmd or any(f'--port {p}' in cmd for p in SHARED_PORTS):
         rows.append((pid, 'shared', et, rss, cmd))
         continue
     o = owner(ppid)
@@ -203,14 +278,35 @@ cmd_halt() {
   port="$(_backendport_fuer "${1:-}")" || return 1
   launchctl kill TERM "gui/$(id -u)/$label" >/dev/null 2>&1
   while [ "$frist" -lt 20 ]; do
-    curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$port/mcp" 2>/dev/null || {
-      echo "mcp-shared: $label beendet, Port $port frei (nach ${frist}s)."
-      return 0
-    }
+    curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$port/mcp" 2>/dev/null || break
     sleep 1; frist=$((frist + 1))
   done
-  echo "mcp-shared: $label haelt Port $port nach ${frist}s noch." >&2
-  return 1
+  if [ "$frist" -lt 20 ]; then
+    echo "mcp-shared: $label beendet, Port $port frei (nach ${frist}s)."
+  else
+    echo "mcp-shared: $label haelt Port $port nach ${frist}s noch." >&2
+  fi
+  _browserbase_aufraeumen
+  [ "$frist" -lt 20 ] || return 1
+}
+
+# Auto-Rueckfall (2026-09-09, der Nutzer): nach jedem Halt des playwright-Servers
+# gehostete Sitzung beenden (falls eine offen ist) und die Wahl auf lokal
+# zuruecksetzen, damit kein vergessener Schalter Browserminuten verbrennt.
+_browserbase_aufraeumen() {
+  local session_datei="$STATE/playwright-browserbase-session" id
+  if [ -f "$session_datei" ]; then
+    id="$(cat "$session_datei")"
+    if ! wb-browserbase sitzung ende "$id" 2>/dev/null; then
+      echo "mcp-shared: Browserbase-Sitzung $id konnte nicht beendet werden" >&2
+    fi
+    rm -f "$session_datei"
+  fi
+  if [ -f "$STATE/playwright-browser" ] \
+     && [ "$(cat "$STATE/playwright-browser" 2>/dev/null)" = "browserbase" ]; then
+    echo lokal > "$STATE/playwright-browser"
+    echo "mcp-shared: Browserwahl auf lokal zurueckgesetzt."
+  fi
 }
 
 # Client-Konfiguration auf die geteilten Server zeigen lassen. Wird auch nach einem
@@ -268,6 +364,7 @@ case "${1:-status}" in
   apply)   cmd_apply ;;
   ensure)  shift; cmd_ensure "${1:-}" ;;
   halt)    shift; cmd_halt "${1:-}" ;;
+  browser) shift; cmd_browser "${1:-}" ;;
   reap)    shift; cmd_reap "${1:-}" ;;
-  *) echo "mcp-shared: unbekanntes Kommando '$1' (status|start|stop|restart|apply|reap|ensure|halt)" >&2; exit 1 ;;
+  *) echo "mcp-shared: unbekanntes Kommando '$1' (status|start|stop|restart|apply|reap|ensure|halt|browser)" >&2; exit 1 ;;
 esac

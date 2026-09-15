@@ -259,7 +259,6 @@ def _stufen_teile(stufe, varmap):
     """
     wrapper = []
     i, n = 0, len(stufe)
-    flaggen_ueberspringen = False
     while i < n:
         roh = stufe[i]
         if roh in cs.BLOCK_KEYWORDS or _NUR_KLAMMERN_RE.match(roh):
@@ -283,14 +282,13 @@ def _stufen_teile(stufe, varmap):
         if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', roh):
             i += 1
             continue
-        if flaggen_ueberspringen and roh.startswith('-'):
-            i += 1
+        if wrapper and roh.startswith('-'):
+            i += cs.wrapper_option_width(wrapper[-1], roh)
             continue
         wort = cs.resolve_vars(roh, varmap)
         name = wort.split('/')[-1]
         if name in cs.WRAPPER_CMDS:
             wrapper.append(name)
-            flaggen_ueberspringen = True
             i += 1
             continue
         return wrapper, name, [cs.resolve_vars(t, varmap) for t in stufe[i + 1:]]

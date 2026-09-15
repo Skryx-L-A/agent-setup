@@ -1,0 +1,49 @@
+{
+  "scope": "persistent harness-neutral adapter catalog; vendor caches unchanged",
+  "snapshot": "$HOME/.local/trash-snapshots/2026-09-12-skill-adapters-before-plugin-command-role-pass",
+  "files": [
+    {
+      "path": "~/.claude/skill-adapters/index.md",
+      "bytes": 5117,
+      "sha256": "75fdb8695225dc58436aa9b8f446074ed65a008bba89003efc8479c606a15128",
+      "action": "unchanged"
+    },
+    {
+      "path": "~/.claude/skill-adapters/core.md",
+      "bytes": 1396,
+      "sha256": "8396e1aa36baaadf87646621f7dcb2d196eb389a5ef6e5c0ca734bd2fadfacdc",
+      "action": "unchanged"
+    },
+    {
+      "path": "~/.claude/skill-adapters/caveman.md",
+      "bytes": 2616,
+      "sha256": "61a105a4bbe93779fb3fe072071d7a91f119da5f038800db4b2626ce2727a309",
+      "action": "updated"
+    },
+    {
+      "path": "~/.claude/skill-adapters/vendor-runtimes.md",
+      "bytes": 2686,
+      "sha256": "8ff12b959198fb5526173eedcece6dd8a479bf7c7088e8cfdb9855dd6df986d1",
+      "action": "updated"
+    },
+    {
+      "path": "~/.claude/skill-adapters/project-kit.md",
+      "bytes": 1212,
+      "sha256": "034e0882ec02a2f2ab488de81c7f036f4b934397c4c4ac0ab850a1da463b1add",
+      "action": "unchanged"
+    }
+  ],
+  "active_skill_payloads_catalogued": 74,
+  "active_native_commands_roles_catalogued": 10,
+  "active_payloads_catalogued": 84,
+  "active_command_role_subcatalog": "$HOME/.codex/tasks/instruction-review-20260912/plugins/commands-roles.md",
+  "nonsemantic_cache_paths_explained": 38,
+  "additional_plugin_instruction_records": 172,
+  "excluded_scratch_instruction_copies": {
+    "~/.codex/.tmp": 1075,
+    "~/.codex/tasks": 136
+  },
+  "verification_rule": "~/.claude/regeln/verifikation.md integrated by reference; code-review fan-out and duplicate reviewer gates are not adopted",
+  "vendor_cache_changes": 0,
+  "unique_active_gap_found": false
+}

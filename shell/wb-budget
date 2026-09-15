@@ -64,6 +64,20 @@
 #
 # BENUTZUNG:
 #   wb-budget                            Token-Report (5h/7d/Trend/Hochrechnung) + Plan-Limit-Stand
+#   wb-budget --limit [--knapp]          das Tagesbudget des Wochenfensters: erlaubt, verbraucht,
+#                                          Luft. Liest NUR limits.jsonl, laeuft in Millisekunden
+#                                          statt in neun Sekunden -- gedacht fuer den
+#                                          SessionStart-Hook und fuer jede Delegationsentscheidung.
+#                                          Nachtrag 2026-09-10 (der Nutzer: "das chatgpt limit soll
+#                                          auch getrackt werden wie das claude limit"): OHNE --knapp
+#                                          folgt nach dem Claude-Block ein zweiter Block "ChatGPT
+#                                          Plus (Codex)" aus codex-limits.jsonl (geschrieben von
+#                                          `wb-kontingent auffrischen`, siehe dort) -- eigene
+#                                          Fensterformel, weil Codex zwei ROLLENDE Fenster (5h/7d)
+#                                          statt Claudes Wochenanker fuehrt: erlaubter Anteil =
+#                                          (jetzt - Fensterstart) / Fensterlaenge x 100. --knapp
+#                                          bleibt zeichengleich Claude-only (der SessionStart-Hook
+#                                          zaehlt Zeilen).
 #   wb-budget --ingest                   liest EINE Statusline-JSON von stdin, loggt rate_limits
 #                                          falls vorhanden (Aufruf z.B.:
 #                                          <statusline-json erzeugen> | wb-budget --ingest)
@@ -75,10 +89,18 @@
 #                                         wie viele Limit-Punkte kostet ein Modell fuer sich
 #                                          genommen -- ein Gewicht je Modell statt eines
 #                                          Faktors fuer alle, gegen dieselben Abschnitte gelost.
+#   wb-budget --json [--alle-maschinen] [--base <dir>]
+#                                         der LIMITSTAND selbst als EIN JSON-Objekt -- Spawn-
+#                                          Werkzeuge und Traeger werten ihn aus (Exit 0/1/2/3,
+#                                          Felder und Formen: Abschnitt "LIMITSTAND ALS JSON"
+#                                          weiter unten). Nur OHNE Berichtsfilter; der reine
+#                                          Aufruf ohne Filter ist dieser Modus.
 #   wb-budget --json [--tage N | --von ISO --bis ISO] [--harness a,b] [--modell x,y] [--sitzung id]
 #                                         der maschinenlesbare Bericht ueber ALLE belegten Quellen,
 #                                          nicht nur Claude -- Grundlage der Verbrauchsseite.
-#                                          Siehe MEHR ALS CLAUDE weiter unten.
+#                                          Siehe MEHR ALS CLAUDE weiter unten. Mit mindestens
+#                                          einem dieser Filter gilt weiterhin dieser volle
+#                                          Verbrauchsbericht; der Filteraufruf aendert sich nicht.
 #
 # MEHR ALS CLAUDE (Stand 2026-08-11, Messung ~/.pi-workers/results/verbrauchdaten/):
 #   Der Standardbericht oben liest ausschliesslich ~/.claude/projects/**/*.jsonl und ist damit
@@ -116,6 +138,510 @@ WORKBENCH_DIR="$HOME/.claude/workbench"
 WORKBENCH_LIMITS="$WORKBENCH_DIR/limits.jsonl"              # Betriebslog, seit 28.07. von statusline-command.sh
 mkdir -p "$STATE_DIR"
 
+# --- --limit: das Tagesbudget des Wochenfensters, in Millisekunden statt in 9 Sekunden. ---
+# Anlass (2026-08-22, Korrektur des Nutzers, zweimal): der Orchestrator hatte die Zahl im Kopf
+# und hatte sie zweimal falsch -- erst als starre 40-Prozent-Marke, dann als bis JETZT
+# verstrichenen Fensteranteil. Beide Male sparte er Worker, wo Luft war. Der Maszstab ist,
+# was bis zum ENDE des laufenden Kalendertages verbraucht sein darf.
+#
+# Bewusst VOR dem jq-Test und ohne jede Transkriptlesung: der volle Report braucht rund
+# neun Sekunden, diese Zahl muss in einen SessionStart-Hook passen. Gelesen wird eine
+# einzige Datei.
+if [ "${1:-}" = "--limit" ]; then
+  case "${2:-}" in
+    ''|--knapp) ;;
+    *) echo "wb-budget --limit: unbekannte Option '$2' -- erlaubt ist nur --knapp." >&2; exit 1 ;;
+  esac
+  if [ "$#" -gt 2 ]; then
+    echo "wb-budget --limit: zu viele Argumente ('$3' und weitere)." >&2
+    exit 1
+  fi
+  python3 - "$WORKBENCH_LIMITS" "${2:-}" <<'PY'
+import json, sys, time, datetime
+
+pfad = sys.argv[1]
+knapp = sys.argv[2] == "--knapp" if len(sys.argv) > 2 else False
+
+letzter = None
+try:
+    with open(pfad) as f:
+        for zeile in f:
+            zeile = zeile.strip()
+            if not zeile:
+                continue
+            try:
+                d = json.loads(zeile)
+            except Exception:
+                continue
+            if d.get("seven_day_pct") is not None and d.get("seven_day_resets_at"):
+                letzter = d
+except FileNotFoundError:
+    print("wb-budget --limit: %s fehlt -- kein Limitstand messbar." % pfad, file=sys.stderr)
+    raise SystemExit(1)
+
+if letzter is None:
+    print("wb-budget --limit: kein Eintrag mit seven_day_pct UND seven_day_resets_at in %s."
+          % pfad, file=sys.stderr)
+    raise SystemExit(1)
+
+verbraucht = float(letzter["seven_day_pct"])
+reset = float(letzter["seven_day_resets_at"])
+start = reset - 7 * 86400
+
+# Kalendertage in LOKALER Zeit: das Fenster beginnt Montag 14:00, Rechnung des Nutzers zaehlt
+# aber Kalendertage (Montag = 1 ... Samstag = 6), nicht 24-Stunden-Bloecke ab 14 Uhr. Der
+# Unterschied ist keine Rundung: am Samstagmorgen sind 4,5 der 7 Fenstertage verstrichen
+# (64 %), waehrend das Tagesbudget bei 6/7 steht (86 %).
+lok = datetime.datetime.now().astimezone().tzinfo
+# WB_LIMIT_JETZT ist ein Testhaken und sonst nichts: die Tagesindex-Rechnung laesst sich
+# ohne steuerbares "jetzt" nur an dem einen Wochentag pruefen, an dem die Suite gerade
+# laeuft -- und der Fehler, den diese Rechnung behebt, war ein Wochentagsfehler. Im Betrieb
+# ist die Variable nie gesetzt und die Zeile faellt auf die echte Uhr zurueck.
+import os
+jetzt = float(os.environ.get("WB_LIMIT_JETZT") or time.time())
+tag_start = datetime.datetime.fromtimestamp(start, lok).date()
+tag_heute = datetime.datetime.fromtimestamp(jetzt, lok).date()
+tagesindex = (tag_heute - tag_start).days + 1
+tagesindex = max(1, min(7, tagesindex))
+erlaubt = min(100.0, tagesindex * 100.0 / 7.0)
+luft = erlaubt - verbraucht
+
+wochentag = ["Montag", "Dienstag", "Mittwoch", "Donnerstag",
+             "Freitag", "Samstag", "Sonntag"][tag_heute.weekday()]
+stand = datetime.datetime.fromtimestamp(float(letzter.get("ts_epoch", time.time())), lok) \
+    if letzter.get("ts_epoch") else None
+gemessen = letzter.get("ts", "")
+
+if knapp:
+    print("Wochenlimit: %.0f%% verbraucht, bis heute Abend erlaubt %.0f%% (%s, Tag %d von 7) -- "
+          "%s %.0f Punkte." % (verbraucht, erlaubt, wochentag, tagesindex,
+                               "Luft" if luft >= 0 else "DARUEBER um",
+                               abs(luft)))
+else:
+    print("== Wochenlimit: Tagesbudget ==")
+    print("  Fenster:      %s bis %s (Montag 14:00 bis Montag 14:00)"
+          % (datetime.datetime.fromtimestamp(start, lok).strftime("%a %d.%m. %H:%M"),
+             datetime.datetime.fromtimestamp(reset, lok).strftime("%a %d.%m. %H:%M")))
+    print("  Heute:        %s = Tag %d von 7" % (wochentag, tagesindex))
+    print("  erlaubt:      %.1f %%  (Tag %d x 100/7, gilt bis heute 24:00)" % (erlaubt, tagesindex))
+    print("  verbraucht:   %.1f %%  (seven_day_pct, gemessen %s)" % (verbraucht, gemessen))
+    if luft >= 0:
+        print("  Luft:         %.1f Punkte -- NICHT knapp. Nicht vorsorglich sparen." % luft)
+    else:
+        print("  DARUEBER um:  %.1f Punkte -- jetzt drosseln: Worker lokal oder Aufgabe wartet."
+              % abs(luft))
+
+    # ChatGPT Plus (Codex) -- Nachtrag 2026-09-10 (der Nutzer: "das chatgpt limit
+    # soll auch getrackt werden wie das claude limit, achte darauf das es
+    # vielleicht anders aufgebaut ist als das von claude"). Anders als Claudes
+    # Beide Abos werden am Wochenbudget nach Kalendertagen gemessen: der Tag,
+    # an dem das rollende 7-Tage-Fenster beginnt, zaehlt schon als Tag 1; bis
+    # heute Abend sind Tagindex * 100/7 erlaubt. Die rollende Restzeit ist
+    # dafuer kein Massstab. Das 5-Stunden-Fenster bleibt ein hartes Limit bei
+    # 100 %, ohne anteilige Tages-Sparlinie. Quelle: ~/.claude/workbench/
+    # codex-limits.jsonl, geschrieben von `wb-kontingent auffrischen` (nie von
+    # hier). Fehlt die Datei oder ist die Zeile unlesbar, eine Zeile ohne Fehler
+    # -- das gilt nur im vollen Bericht, NICHT unter --knapp (die eine Zeile
+    # fuer den SessionStart-Hook bleibt unveraendert Claude).
+    print()
+    codex_pfad = os.environ.get("WB_CODEX_LIMITS_FILE") or \
+        os.path.expanduser("~/.claude/workbench/codex-limits.jsonl")
+    codex_letzter = None
+    try:
+        with open(codex_pfad) as f:
+            for cz in f:
+                cz = cz.strip()
+                if not cz:
+                    continue
+                try:
+                    cd = json.loads(cz)
+                except Exception:
+                    continue
+                if cd.get("seven_day_pct") is not None and cd.get("seven_day_resets_at"):
+                    codex_letzter = cd
+    except FileNotFoundError:
+        codex_letzter = None
+
+    NICHT_GEMESSEN = "  ChatGPT Plus (Codex): noch nicht gemessen (wb-kontingent auffrischen)"
+
+    def codex_sieben_tage_fensterlaenge(wert):
+        # Alte Verlaufszeilen hatten das Feld noch nicht. Nur dafuer ist 7 Tage
+        # der Rueckfall; ein vorhandener, aber kaputter Endpunktwert darf nicht
+        # still als Wochenfenster umgedeutet werden.
+        if wert is None:
+            return 7 * 86400
+        try:
+            window_s = float(wert)
+            return window_s if window_s > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def codex_fenster_zeile(bezeichnung, verbraucht_wert, resets_at_wert, gemessen,
+                            wochenbudget=False, window_wert=None):
+        # Jeder Wert aus der Zeile kann fehlen oder kaputt sein (eine von Hand
+        # beschaedigte Datei, ein alter Log ohne die neuen Felder) -- kein
+        # einzelner davon darf den ganzen Bericht abschiessen (Reviewer-Befund
+        # 2026-09-10: 'float(seven_day_pct)' stand bisher ungeschuetzt da).
+        try:
+            verbraucht = float(verbraucht_wert)
+        except (TypeError, ValueError):
+            return None
+        try:
+            reset_epoch = datetime.datetime.fromisoformat(
+                str(resets_at_wert).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            if not wochenbudget:
+                return ("  %s: verbraucht %.1f %%, hartes Limit bei 100 %% -- "
+                        "reset unbekannt (gemessen %s)." % (bezeichnung, verbraucht, gemessen))
+            return ("  %s: verbraucht %.1f %%, resets_at unlesbar -- keine Rechnung "
+                     "moeglich (gemessen %s)." % (bezeichnung, verbraucht, gemessen))
+        if not wochenbudget:
+            return ("  %s: verbraucht %.1f %%, hartes Limit bei 100 %% -- "
+                    "reset %s  (gemessen %s)"
+                    % (bezeichnung, verbraucht, resets_at_wert, gemessen))
+        window_s = codex_sieben_tage_fensterlaenge(window_wert)
+        if window_s is None:
+            return ("  %s: verbraucht %.1f %%, Fensterlaenge unlesbar -- "
+                    "keine Tageslinie moeglich (gemessen %s)."
+                    % (bezeichnung, verbraucht, gemessen))
+        if window_s != 7 * 86400:
+            return ("  %s: verbraucht %.1f %%, Fensterlaenge %.0f s -- "
+                    "Tageslinie nur fuer 7-Tage-Fenster moeglich (gemessen %s)."
+                    % (bezeichnung, verbraucht, window_s, gemessen))
+        start = reset_epoch - window_s
+        # Ohne tzinfo waehlt fromtimestamp fuer JEDEN Zeitstempel die damals
+        # geltende Ortszeit. Ein heute festgestellter UTC-Offset verschiebt den
+        # Fensterbeginn sonst an einem DST-Wechsel auf den falschen Kalendertag.
+        tag_start = datetime.datetime.fromtimestamp(start).date()
+        tag_heute = datetime.datetime.fromtimestamp(jetzt).date()
+        tagesindex = (tag_heute - tag_start).days + 1
+        if jetzt < start:
+            return ("  %s: verbraucht %.1f %%, Fenster beginnt erst %s -- "
+                    "keine Tageslinie moeglich (gemessen %s)."
+                    % (bezeichnung, verbraucht, datetime.datetime.fromtimestamp(start).isoformat(), gemessen))
+        if jetzt >= reset_epoch:
+            return ("  %s: verbraucht %.1f %%, Fenster endete %s -- "
+                    "keine Tageslinie moeglich (gemessen %s)."
+                    % (bezeichnung, verbraucht, resets_at_wert, gemessen))
+        tagesindex = min(7, tagesindex)
+        erlaubt = min(100.0, tagesindex * 100.0 / 7.0)
+        luft = erlaubt - verbraucht
+        return ("  %s: verbraucht %.1f %%, erlaubt %.1f %% (Kalendertag %d von 7) -- "
+                "%s %.1f Punkte  (gemessen %s)"
+                % (bezeichnung, verbraucht, erlaubt, tagesindex,
+                   "Luft" if luft >= 0 else "DARUEBER um", abs(luft), gemessen))
+
+    print("== ChatGPT Plus (Codex) ==")
+    if codex_letzter is None:
+        print(NICHT_GEMESSEN)
+    else:
+        c_gemessen = codex_letzter.get("ts", "?")
+        zeile7 = codex_fenster_zeile(
+            "7-Tage-Fenster (rollend)", codex_letzter.get("seven_day_pct"),
+            codex_letzter.get("seven_day_resets_at"), c_gemessen, wochenbudget=True,
+            window_wert=codex_letzter.get("seven_day_window_s"))
+        if zeile7 is None:
+            # 'seven_day_pct' selbst ist unlesbar -- dieselbe Zeile wie ein
+            # fehlendes Log, nichts Erfundenes vortaeuschen.
+            print(NICHT_GEMESSEN)
+        else:
+            print(zeile7)
+            zeile5 = codex_fenster_zeile(
+                "5-Stunden-Fenster (rollend)", codex_letzter.get("five_hour_pct"),
+                codex_letzter.get("five_hour_resets_at"), c_gemessen)
+            if zeile5 is not None:
+                print(zeile5)
+PY
+  exit $?
+fi
+
+# --- LIMITSTAND ALS JSON: wb-budget --json [--alle-maschinen] [--base <dir>] -----------------
+#
+# Anlass (2026-09-10, docs/AGENTS-PLAN.md, Anhang "Traeger"): Spawn-Werkzeug und Traeger
+#   brauchen den Limitstand maschinenlesbar; --limit liefert nur Text mit Exit 0, und in
+#   einer nicht-interaktiven ssh-Sitzung fehlt ~/.local/bin im PATH (deshalb setzt der
+#   Fernaufruf unten den PATH selbst).
+#
+# Form: genau EIN JSON-Objekt auf stdout, sonst nichts. Quelle ist
+#   ~/.claude/workbench/limits-latest.json (Felder siehe DATENLAGE im Kopf). Der Modus
+#   greift beim REINEN --json-Aufruf und bei --json --alle-maschinen; mit einem der
+#   Berichtsfilter (--tage/--von/--bis/--harness/--modell/--sitzung) gilt unveraendert der
+#   volle Verbrauchsbericht weiter unten -- die bestehenden Aufrufer (App, Suiten) bleiben
+#   unberuehrt.
+#
+# Felder: ts (ISO, Zeitpunkt des juengsten Messwerts), alter_s (Sekunden seit ts),
+#   five_hour_pct und five_hour_resets_at (ISO und _epoch), seven_day_pct und
+#   seven_day_resets_at (ISO und _epoch), erlaubt_pct (die Tageslinie, dieselbe Rechnung
+#   wie --limit), luft (erlaubt minus verbraucht), tageslimit_erreicht (bool: verbraucht
+#   UEBER der Tageslinie), fuenf_stunden_erreicht (bool: five_hour_pct >= 100), quelle
+#   (Pfad der gelesenen Datei), maschine (Hostname). Ein Quellwert in Epochensekunden
+#   bekommt seine ISO-Form aus der UTC gebaut; eine ISO-Zeichenkette bleibt Wortlaut und
+#   bekommt ihr _epoch daneben.
+#
+# Exit: 0 unter der Tageslinie und unter dem Fuenf-Stunden-Fenster, 1 am Tageslimit
+#   (tageslimit_erreicht), 2 am Fuenf-Stunden-Fenster (Vorrang vor 1), 3 ohne brauchbare
+#   Quelle -- dann {"fehler": "...", "quelle": ...} statt eines Stands.
+#
+# --alle-maschinen: fragt zusaetzlich je Maschine aus agents.maschinen in
+#   ~/.claude/workbench/settings.json (Objekte mit mindestens name und ssh; fehlt die
+#   Liste, nur peer) ueber "ssh <maschine> 'PATH=$HOME/.local/bin:$PATH wb-budget --json'"
+#   ab -- mit BatchMode=yes und ConnectTimeout=5, insgesamt mit einer Frist von 20 s je
+#   Maschine. Der PATH wird im ssh-Befehl gesetzt, weil er in nicht-interaktiven
+#   Sitzungen fehlt. Zurueck kommt der JUENGSTE Messwert (groesztes ts; die Tageslinien-
+#   Rechnung laeuft auf ihm), dazu maschinen_gelesen (Namen der erfolgreichen
+#   Fernmaschinen) und maschinen_fehlgeschlagen (Objekte mit name und Grund; ein
+#   unlesbarer lokaler Stand steht ebenfalls dort, unter dem Hostnamen). Scheitern alle
+#   Quellen, kommen fehler/quelle samt der beiden Listen mit Exit 3.
+#
+# Zwei Testhaeken, im Betrieb nie gesetzt: WB_LIMIT_JETZT (dieselbe Steuerung des
+#   "jetzt" wie bei --limit, oben erklaert) und WB_BUDGET_SSH (ersetzt das ssh-Werkzeug
+#   durch einen Schirm). --base <dir> ersetzt $HOME -- fuer Tests mit eigenen
+#   workbench-Verzeichnissen.
+if [ "${1:-}" = "--json" ]; then
+  LIMIT_JSON=1
+  ALLE_MASCHINEN=0
+  BASIS_DIR=""
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --alle-maschinen) ALLE_MASCHINEN=1; shift ;;
+      --base)
+        if [ "$#" -lt 2 ]; then
+          echo "wb-budget --json: --base braucht ein Verzeichnis." >&2
+          exit 1
+        fi
+        BASIS_DIR="$2"; shift 2 ;;
+      *) LIMIT_JSON=0; break ;;   # Berichtsfilter: der volle Verbrauchsbericht unten.
+    esac
+  done
+  if [ "$LIMIT_JSON" = 0 ] && { [ "$ALLE_MASCHINEN" = 1 ] || [ -n "$BASIS_DIR" ]; }; then
+    echo "wb-budget --json: --alle-maschinen und --base gehoeren zum Limitstand-Modus und" >&2
+    echo "vertragen keine Berichtsfilter." >&2
+    exit 1
+  fi
+  if [ "$LIMIT_JSON" = 1 ]; then
+    WB_JSON_BASE="$BASIS_DIR" WB_JSON_ALLE="$ALLE_MASCHINEN" python3 - <<'PY'
+import datetime, json, os, socket, subprocess, time
+
+base = os.environ.get("WB_JSON_BASE") or os.path.expanduser("~")
+wb_verzeichnis = os.path.join(base, ".claude", "workbench")
+quelle = os.path.join(wb_verzeichnis, "limits-latest.json")
+settings_pfad = os.path.join(wb_verzeichnis, "settings.json")
+alle = os.environ.get("WB_JSON_ALLE") == "1"
+# WB_LIMIT_JETZT ist derselbe Testhaken wie bei --limit (dort erklaert): im Betrieb nie
+# gesetzt, in der Suite steuert er das "jetzt" von Tageslinie und Alter.
+jetzt = float(os.environ.get("WB_LIMIT_JETZT") or time.time())
+
+
+def epoch_aus_wert(wert):
+    # Zahl oder Zahlenkette gilt als Epochensekunde, eine ISO-Zeichenkette wird geparst;
+    # limits-latest.json kennt beide Formen (die Statusline schreibt Epochen, die
+    # Bericht-Fixtures teils ISO). Unlesbar bleibt unlesbar -- None, kein geratener Wert.
+    if wert is None or isinstance(wert, bool):
+        return None
+    if isinstance(wert, (int, float)):
+        return float(wert)
+    s = str(wert).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    t = s[:-1] + "+00:00" if s.endswith("Z") else s
+    try:
+        return datetime.datetime.fromisoformat(t).timestamp()
+    except ValueError:
+        return None
+
+
+def wert_normalisieren(wert):
+    # (epoch, ISO) als Paar: eine Zahl bekommt ihre ISO-Form aus der UTC gebaut, eine
+    # echte ISO-Zeichenkette bleibt Wortlaut. Beide Ausgabefelder stehen immer als Paar.
+    ep = epoch_aus_wert(wert)
+    if ep is None:
+        return None, None
+    if isinstance(wert, str):
+        try:
+            float(wert.strip())
+        except ValueError:
+            return ep, str(wert).strip()
+    iso = datetime.datetime.fromtimestamp(ep, datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    return ep, iso
+
+
+def stand_aus_objekt(d, quellenpfad, maschine):
+    # Ohne ts, seven_day_pct und seven_day_resets_at ist der Stand unbrauchbar;
+    # five_hour_* ist dagegen optional (None bleibt None im Ausgabeobjekt).
+    if not isinstance(d, dict):
+        return None
+    ts = d.get("ts")
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    ts_ep = epoch_aus_wert(ts)
+    if ts_ep is None:
+        return None
+    sd = d.get("seven_day_pct")
+    if isinstance(sd, bool) or not isinstance(sd, (int, float)):
+        return None
+    sd_ep, sd_iso = wert_normalisieren(d.get("seven_day_resets_at"))
+    if sd_ep is None:
+        return None
+    fh = d.get("five_hour_pct")
+    if isinstance(fh, bool) or not isinstance(fh, (int, float)):
+        fh = None
+    fh_ep, fh_iso = None, None
+    if fh is not None:
+        fh_ep, fh_iso = wert_normalisieren(d.get("five_hour_resets_at"))
+    return {
+        "ts": ts.strip(), "ts_epoch": ts_ep,
+        "five_hour_pct": fh, "five_hour_resets_at": fh_iso, "five_hour_resets_at_epoch": fh_ep,
+        "seven_day_pct": float(sd),
+        "seven_day_resets_at": sd_iso, "seven_day_resets_at_epoch": sd_ep,
+        "quelle": str(quellenpfad), "maschine": str(maschine),
+    }
+
+
+def lies_lokal(pfad):
+    try:
+        with open(pfad) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return None, "Datei fehlt"
+    except Exception:
+        return None, "unlesbar"
+    s = stand_aus_objekt(d, pfad, socket.gethostname())
+    if s is None:
+        return None, "kein brauchbarer Stand"
+    return s, None
+
+
+def tageslinie(reset_ep):
+    # Dieselbe Rechnung wie --limit: Kalendertage in LOKALER Zeit, Montag = 1, der
+    # Maszstab ist das Tagesende, nicht der Augenblick; Deckel bei 100.
+    start = reset_ep - 7 * 86400
+    lok = datetime.datetime.now().astimezone().tzinfo
+    tag_start = datetime.datetime.fromtimestamp(start, lok).date()
+    tag_heute = datetime.datetime.fromtimestamp(jetzt, lok).date()
+    tagesindex = max(1, min(7, (tag_heute - tag_start).days + 1))
+    return min(100.0, tagesindex * 100.0 / 7.0)
+
+
+def bericht(stamm):
+    erlaubt = tageslinie(stamm["seven_day_resets_at_epoch"])
+    verbraucht = stamm["seven_day_pct"]
+    fh = stamm["five_hour_pct"]
+    return {
+        "ts": stamm["ts"],
+        "alter_s": round(jetzt - stamm["ts_epoch"], 3),
+        "five_hour_pct": fh,
+        "five_hour_resets_at": stamm["five_hour_resets_at"],
+        "five_hour_resets_at_epoch": stamm["five_hour_resets_at_epoch"],
+        "seven_day_pct": verbraucht,
+        "seven_day_resets_at": stamm["seven_day_resets_at"],
+        "seven_day_resets_at_epoch": stamm["seven_day_resets_at_epoch"],
+        "erlaubt_pct": round(erlaubt, 4),
+        "luft": round(erlaubt - verbraucht, 4),
+        "tageslimit_erreicht": verbraucht > erlaubt,
+        "fuenf_stunden_erreicht": fh is not None and fh >= 100,
+        "quelle": stamm["quelle"],
+        "maschine": stamm["maschine"],
+    }
+
+
+def ende(obj):
+    print(json.dumps(obj))
+    if obj.get("fuenf_stunden_erreicht"):
+        raise SystemExit(2)
+    if obj.get("tageslimit_erreicht"):
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+
+stand, grund = lies_lokal(quelle)
+
+if not alle:
+    if stand is None:
+        print(json.dumps({"fehler": "kein brauchbarer Limitstand (%s)" % grund, "quelle": quelle}))
+        raise SystemExit(3)
+    ende(bericht(stand))
+
+# --- --alle-maschinen: der juengste Messwert von hier und allen Fernmaschinen. ---------------
+maschinen = []
+try:
+    with open(settings_pfad) as f:
+        cfg = json.load(f)
+    agents = cfg.get("agents")
+    liste = agents.get("maschinen") if isinstance(agents, dict) else None
+    for e in liste or []:
+        if isinstance(e, dict) and e.get("name"):
+            maschinen.append((str(e["name"]), str(e.get("ssh") or e["name"])))
+except Exception:
+    maschinen = []
+if not maschinen:
+    # Ohne Liste (und ohne lesbare settings.json) nur peer -- ein ssh-Ziel springt
+    # nie von selbst ueber diese Vorgabe hinaus an.
+    maschinen = [("peer", "peer")]
+
+fern_befehl = "PATH=$HOME/.local/bin:$PATH wb-budget --json"
+ssh_wegzeug = os.environ.get("WB_BUDGET_SSH") or "ssh"
+gelesen, fehl, kandidaten = [], [], []
+if stand is not None:
+    kandidaten.append(stand)
+else:
+    fehl.append({"name": socket.gethostname(), "grund": str(grund)})
+
+for name, ziel in maschinen:
+    try:
+        r = subprocess.run(
+            [ssh_wegzeug, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ziel, fern_befehl],
+            capture_output=True, text=True, timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        fehl.append({"name": name, "grund": "keine Antwort nach 20 s"})
+        continue
+    except OSError as e:
+        fehl.append({"name": name, "grund": "ssh nicht startbar (%s)" % e})
+        continue
+    try:
+        d = json.loads((r.stdout or "").strip())
+    except Exception:
+        fehl.append({"name": name, "grund": "kein JSON auf stdout (Exit %d)" % r.returncode})
+        continue
+    if not isinstance(d, dict):
+        fehl.append({"name": name, "grund": "kein Objekt auf stdout"})
+        continue
+    if "fehler" in d:
+        fehl.append({"name": name, "grund": str(d.get("fehler"))})
+        continue
+    s = stand_aus_objekt(d, str(d.get("quelle") or "?"), str(d.get("maschine") or name))
+    if s is None:
+        fehl.append({"name": name, "grund": "unbrauchbare Felder im JSON"})
+        continue
+    gelesen.append(name)
+    kandidaten.append(s)
+
+if not kandidaten:
+    print(json.dumps({
+        "fehler": "kein brauchbarer Limitstand, weder lokal (%s) noch auf einer Maschine" % grund,
+        "quelle": quelle,
+        "maschinen_gelesen": gelesen,
+        "maschinen_fehlgeschlagen": fehl,
+    }))
+    raise SystemExit(3)
+
+sieger = max(kandidaten, key=lambda k: k["ts_epoch"])
+obj = bericht(sieger)
+obj["maschinen_gelesen"] = gelesen
+obj["maschinen_fehlgeschlagen"] = fehl
+ende(obj)
+PY
+    exit $?
+  fi
+  set -- --json "$@"   # Berichtsfilter sind restauriert: der volle Verbrauchsbericht unten.
+fi
+
+
 if [ ! -x "$JQ" ] && ! command -v jq >/dev/null 2>&1; then
   # Exit 0 waere hier eine Erfolgsmeldung an jeden Aufrufer, der den Rueckgabewert
   # prueft -- ein Fehlschlag, der aus dieser Zeile herauskommt, ist keiner (bugjagd
@@ -127,6 +653,10 @@ fi
 
 # --- --ingest: eine Statusline-JSON von stdin entgegennehmen, rate_limits loggen. ---
 if [ "${1:-}" = "--ingest" ]; then
+  if [ "$#" -gt 1 ]; then
+    echo "wb-budget --ingest: nimmt keine Argumente entgegen, bekommen: '$2'." >&2
+    exit 1
+  fi
   input=$(cat)
   has_limits=$(echo "$input" | "$JQ" -r 'if .rate_limits then "yes" else "no" end' 2>/dev/null)
   if [ "$has_limits" != "yes" ]; then
@@ -1738,6 +2268,19 @@ json.dump(raus, sys.stdout, ensure_ascii=False)
 sys.stdout.write("\n")
 PY
   exit 0
+fi
+
+# --- Alles bis hier ist durch, ohne dass $1 zu einem bekannten Unterbefehl passte. -----------
+# Anlass (2026-08-22): 'wb-budget --limit' gegen eine aeltere Fassung, die '--limit' noch nicht
+# kannte, fiel bis hierher durch und gab den vollen Neun-Sekunden-Report aus, Exit 0 -- sieht
+# nach Erfolg aus, ist aber nicht die angeforderte Antwort. Der Standardbericht selbst nimmt
+# KEIN Argument entgegen (siehe BENUTZUNG oben); jedes uebrige $1 ist ein Tippfehler oder ein
+# Unterbefehl, den dieses Skript (noch) nicht kennt, und beides soll laut scheitern statt still
+# den Bericht auszugeben.
+if [ -n "${1:-}" ]; then
+  echo "wb-budget: unbekannte Option '$1'." >&2
+  echo "bekannt: (ohne Argument) | --limit [--knapp] | --ingest | --limit-kalibrierung [--tage N] | --limit-gewichte [--tage N] | --json [--tage N | --von ISO --bis ISO] [--harness a,b] [--modell x,y] [--sitzung id] [--ohne-kontingent]" >&2
+  exit 1
 fi
 
 echo "wb-budget — Token-Verbrauch aus lokalen Session-Transkripten"

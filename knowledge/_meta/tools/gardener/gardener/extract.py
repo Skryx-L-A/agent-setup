@@ -200,6 +200,21 @@ def read_text_snippet(path: Path, max_chars: int = PDF_MAX_CHARS) -> str:
         return ""
 
 
+TEXTISH_SUFFIXES = (".txt", ".csv", ".log", ".json", ".yaml", ".yml")
+
+
+def needs_model(path: Path) -> bool:
+    """True when `describe_file` would reach a model for this file.
+
+    Mirrors describe_file's own branches on purpose (same constants, same
+    order): every other suffix falls through to the "unknown" return, which
+    calls nothing. Callers that must not touch a model - a dry run - ask this
+    first instead of guessing from the suffix themselves.
+    """
+    suffix = path.suffix.lower()
+    return suffix == ".pdf" or is_image(path) or suffix in TEXTISH_SUFFIXES
+
+
 def describe_file(client, path: Path) -> tuple[str, str]:
     """(description, kind) for any dropped file. kind is one of
     pdf | image | text | unknown; an empty description means: needs a human."""
@@ -209,7 +224,7 @@ def describe_file(client, path: Path) -> tuple[str, str]:
         return summarize(client, text, hint=f"PDF: {path.name}"), "pdf"
     if is_image(path):
         return describe_image(client, path), "image"
-    if suffix in (".txt", ".csv", ".log", ".json", ".yaml", ".yml"):
+    if suffix in TEXTISH_SUFFIXES:
         text = read_text_snippet(path)
         if not text:
             return "", "text"

@@ -124,7 +124,7 @@ if (typeof window !== 'undefined') {
     kind: 'szene', id: 'halle', label: 'Das Lager',
     scroll: 1.6, linger: 0.35,
     render: halleSzene,
-    accent: '#8C6A4A',
+    accent: '#6B4A2C',
     eyebrow: 'Und dahinter',
     title: 'Im Lager.',
     body: 'Dieses Segment ist echtes 3D. Die Kamera folgt einer Spline, es gibt keine Naht zu bauen, und der Treiber kopiert den WebGL-Frame einmal je Bild in das Canvas der Engine.',

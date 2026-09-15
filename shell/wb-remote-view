@@ -3,6 +3,7 @@
 #
 #   wb-remote-view [<mac|peer>] [--check] [--local-session <name>] [--remote-session <name>] [--quiet]
 #   wb-remote-view --announce [<mac|peer>]
+#   wb-remote-view [<mac|peer>] --owned-only     (nur AUTOMATISCHE Aufrufer, siehe unten)
 #
 # Ersetzt das Handverfahren aus `regeln/maschinen.md`, Abschnitt „Worker der anderen
 # Maschine sichtbar machen" (View-Session auf dem Ziel, lokal ein Pane mit `ssh -t`,
@@ -31,6 +32,85 @@
 # ist schlechter als keiner (Vault [[remote-worker-spiegel-stirbt]]). Die View-Sessions
 # auf dem Ziel bleiben stehen — sie kosten nichts, teilen die Fenster ihrer Basis und
 # sind genau das, was das Handverfahren ebenfalls stehen laesst.
+#
+# EIGENTUEMER-MARKIERUNG @wb_owner (2026-08-27, Befund vom selben Tag). „JEDE entfernte
+# Session mit lebenden Workern bekommt einen Spiegel" (oben) hatte keine Vorstellung
+# davon, WESSEN Spiegel das ist: eine automatische Ansage/ein Kontext-Guard-Poll nahm
+# blind ALLE Sessions der Zielmaschine und baute sie in die zufaellig gerade angehaengte
+# lokale Session — auch wenn die beiden nichts miteinander zu tun hatten. Befund: des Nutzers
+# Mac-Session `wb-AI` bekam einen Spiegel von peers `wb-Polarschern-379b75` (fremd), und
+# umgekehrt zeigte `wb-Polarschern-379b75` auf peer ZWEI fremde Mac-Spiegel gleichzeitig.
+#
+# Wer eine entfernte Session per `wb-ssh-worker` erst entstehen laesst, setzt dort jetzt
+# eine tmux-SESSION-Option `@wb_owner` = "<eigene-maschine>:<eigene-lokale-session>". Beim
+# Spiegeln gilt je gefundener entfernter Session:
+#   - @wb_owner zeigt auf eine hier LEBENDE lokale Session dieser Maschine  -> genau dort
+#     hinein spiegeln, EGAL welche Session/welcher Poll den Lauf ausgeloest hat. Das macht
+#     die alte Ratelogik (angehaengte Session, TMUX_PANE) fuer markierte Sessions ueberfluessig
+#     und damit auch fehlerfrei gegenueber mehreren gleichzeitig angehaengten Sessions.
+#   - @wb_owner zeigt auf eine lokale Session, die es hier nicht (mehr) gibt (Mac-Session
+#     geschlossen, Umzug, o.ae.) -> NIE spiegeln. Eine verwaiste Markierung erzeugt keinen
+#     Spiegel; sie verfaellt so von selbst, sobald die passende Session weg ist.
+#   - keine Markierung (peer-natives `orch-launch`, ein von Hand getippter Remote-Befehl,
+#     oder jeder andere Weg an `wb-ssh-worker` vorbei — das ist der „schwierige Fall" aus
+#     dem Auftrag: SOLCHE Worker laufen nie durch ein Werkzeug, das eine lokale Session
+#     kennt) -> ENTSCHEIDUNG: nur bei einem AUSDRUECKLICHEN Aufruf spiegeln (die alte
+#     Ratelogik, unveraendert), NICHT bei einem automatischen. `--owned-only` markiert
+#     einen Aufruf als automatisch; wer es setzt, laesst unmarkierte Sessions aus. Gesetzt
+#     wird es an drei Stellen: der ssh-Befehl hinter `--announce`, `context-guard`s Poll
+#     und `wb-ssh-worker`s eigener Aufruf nach dem Spawn. Ein Mensch/Orchestrator, der
+#     `wb-remote-view <maschine>` von Hand tippt, laesst es weg und sieht weiterhin ALLES,
+#     genau wie vor diesem Umbau (siehe test-remote-view.sh, Faelle 6-9, unveraendert).
+#
+# DER PREIS: ein `orch-launch`- oder von-Hand-gestarteter Worker auf peer taucht im
+# Mac-Worker-Tab nicht mehr automatisch auf (der 13.08.-Fall, in abgeschwaechter Form
+# zurueck) — er ist aber weiterhin EINEN Handgriff entfernt (`wb-remote-view peer`,
+# genau das Verfahren, das schon vorher fuer den unbeaufsichtigten Fall galt). Das wiegt
+# leichter als das Risiko, mit dem naechsten automatischen Poll wieder eine fremde Session
+# in eine falsche Sitzung zu haengen — genau Satz des Nutzers: „Die Worker gehoeren
+# ausschliesslich in den Worker-Tab der Session, zu der sie gehoeren."
+#
+# SCHLEIFENSCHUTZ (2026-09-03, gemessener Vorfall). Bis heute kannte dieses Skript nur die
+# Eigentuemer-Frage (WEM gehoert ein Spiegel) und keine Frage nach der RICHTUNG: ob eine
+# entfernte Session, die gespiegelt werden soll, ihrerseits schon eine Sicht auf DIESE
+# Maschine enthaelt. Gemessen wurde folgende Rueckkopplung: der Mac-Pane `wb-AI:3.3` zeigte
+# per `ssh -t peer tmux attach` die peer-Sicht `wb-orch-view`, waehrend gleichzeitig ein
+# peer-Pane per `ssh -t mac tmux attach` die Mac-Sicht `wb-AI-view` zeigte — und `wb-AI-view`
+# teilt die Fenster von `wb-AI` und damit auch Pane 3.3. Jede Bildschirmaenderung lief also im
+# Kreis: peer -> Mac-Pane 3.3 -> Mac-Fenster 3 -> peer-Client -> peer-Fenster -> zurueck.
+# Gemessen wurden 14,2 MB/s Terminalverkehr an einen einzigen Client und 30 GB Gesamtausgabe
+# in 80 Minuten, tmux-Server-CPU dauerhaft bei 21 %, RSS 8,3 GB (Peak 12,2 GB). Die Gegenprobe
+# (einen der beiden Panes geschlossen) senkte CPU auf 1,2 % und den Footprint auf 71 MB — und
+# `wb-remote-view` legte den Spiegel danach VON SELBST wieder an, die Schleife war zurueck.
+#
+# Der Riegel: JEDE gefundene entfernte Session wird VOR dem Aufbau eines Spiegels darauf
+# geprueft, ob sie einen Pane enthaelt, dessen Titel mit `spiegel:$SELF:` beginnt — also
+# selbst schon eine Sicht auf DIESE Maschine ist (Titel gesetzt bei `tmux select-pane -T
+# "spiegel:$MACHINE:$rsess"`, siehe pane_cmd weiter unten). Eine `-view`-Sicht braucht dabei
+# keine eigene Pruefung: sie teilt die Fenster ihrer Basis, `tmux list-panes -a` fuehrt jeden
+# Pane also ohnehin schon unter dem Namen der Basis-Session. Trifft das zu, unterbleibt der
+# Spiegel fuer genau diese Session, mit Begruendung; alle anderen Sessions der Maschine sind
+# davon unberuehrt — und ein schon BESTEHENDER Spiegel auf so eine Session faellt beim naechsten
+# Lauf dem normalen Abbau zum Opfer, weil sie dann nicht mehr unter den erlaubten Sessions
+# auftaucht (kein Sonderfall noetig, siehe Abbau weiter unten). Das haelt in BEIDE Richtungen,
+# unabhaengig davon, welcher der beiden Spiegel zuerst entstand: wer als zweiter aufbauen will,
+# findet den ersten schon vor und bricht ab; der erste wird beim naechsten Lauf SEINER Seite
+# ebenso fuendig und baut sich selbst ab.
+#
+# ZWEITER VERSTAERKER, GEPRUEFT UND BEWUSST UNVERAENDERT GELASSEN: die Client-Groesse des
+# Spiegels (116x80) passte nicht zur Fenstergroesse (169x58), und ein Client, dessen Groesse
+# nicht zur Fenstergroesse passt, bekommt von tmux keine inkrementellen Aenderungen mehr,
+# sondern bei jeder Aenderung ein komplettes Neuzeichnen — das hat die 14,2 MB/s erst moeglich
+# gemacht. Ursache ist NICHT `-f ignore-size` an sich: das Merkmal verhindert seit dem 16.08.
+# genau das Gegenteil (ein kleiner Spiegel darf die Fenstergroesse der Basis nicht diktieren,
+# siehe riegel() weiter unten) und bleibt dafuer noetig. Die Fenstergroesse wird seither ohnehin
+# nicht mehr von angehaengten Clients bestimmt, sondern von riegel() auf einen Mindestwert
+# (200x50) verriegelt, UNABHAENGIG von jeder Client-Groesse — ein einzelner, nicht im Kreis
+# haengender Spiegel zahlt diesen Preis also so oder so, das ist die schon oben dokumentierte
+# Entscheidung ("WAS DAS KOSTET"). Ohne Schleife ist dieser Preis EINMALIG und bleibt beschraenkt;
+# die gemessenen 14,2 MB/s entstanden erst dadurch, dass der Kreis jede Aenderung endlos
+# zurueckspiegelte. Der Schleifenschutz oben ist deshalb der eigentliche Fix; an `-f ignore-size`
+# und an der Verriegelung wird hier nichts geaendert.
 set -uo pipefail
 
 # WB_BIN nur fuer die Testsuite: sie zeigt damit auf ihre eigene Fassung der Helfer,
@@ -42,15 +122,16 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
 case "$(uname -s)" in Darwin) SELF=mac ;; *) SELF=peer ;; esac
 OTHER=$([ "$SELF" = mac ] && echo peer || echo mac)
 
-MACHINE=""; CHECK=0; ANNOUNCE=0; QUIET=0; LSESS=""; RSESS_IN=""
+MACHINE=""; CHECK=0; ANNOUNCE=0; QUIET=0; LSESS=""; RSESS_IN=""; OWNED_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) CHECK=1; shift ;;
     --announce) ANNOUNCE=1; shift ;;
     --quiet|-q) QUIET=1; shift ;;
+    --owned-only) OWNED_ONLY=1; shift ;;
     --local-session) LSESS="${2:?--local-session braucht einen Namen}"; shift 2 ;;
     --remote-session) RSESS_IN="${2:?--remote-session braucht einen Namen}"; shift 2 ;;
-    -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,113p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "wb-remote-view: unbekannte Option '$1'" >&2; exit 1 ;;
     *) MACHINE="$1"; shift ;;
   esac
@@ -79,6 +160,35 @@ if [ "$ANNOUNCE" = 1 ] || [ "$CHECK" = 0 ]; then
     exit 0
   fi
 fi
+
+# ---------------------------------------------- Riegel je MASCHINE (2026-09-04)
+# Anders als `spiegelPanes` oben (global, jede Maschine) gilt dieser Riegel nur
+# fuer EINE pausierte Maschine — Auftrag des Nutzers: "nicht nur nicht mehr
+# gezeigt, sondern gar nicht mehr geladen". `remoteMachinesPausiert` ist die
+# EINE Wahrheit dafuer (app/src/main/einstellungen.ts, `maschinenPausiert()`),
+# und sie wird ueber `wb-state settings get` gelesen — derselbe Weg wie beim
+# globalen Riegel oben, nicht aus der Einstellungsdatei geparst.
+#
+# `remoteMachines`/`remoteMachinesPausiert` sind in der App offen fuer beliebig
+# viele Maschinen; dieses Werkzeug kennt bis heute nur die feste Unterscheidung
+# mac/peer (`case "$MACHINE" in mac|peer)` weiter oben) und bleibt dabei — eine
+# echte Mehr-Maschinen-Faehigkeit waere ein eigener, groesserer Umbau. Hier wird
+# nur gefragt, ob der bereits aufgeloeste `$MACHINE`-Name (immer "mac" oder
+# "peer") in der Pausenliste steht.
+#
+# JEDER Fehlschlag beim Nachsehen (kein wb-state, kaputtes JSON) heisst "nicht
+# pausiert": ein Riegel, der bei einer bloss nicht lesbaren Einstellung
+# dichtmacht, waere keine Verbesserung — er wuerde eine funktionierende
+# Maschine stumm schalten, statt nur eine wirklich pausierte.
+maschine_pausiert() {   # maschine_pausiert <name> -- wahr (0), wenn pausiert
+  "$HOME/.local/bin/wb-state" settings get remoteMachinesPausiert 2>/dev/null \
+    | /usr/bin/python3 -c 'import json, sys
+try:
+    liste = json.load(sys.stdin)
+    sys.exit(0 if isinstance(liste, list) and sys.argv[1] in liste else 1)
+except Exception:
+    sys.exit(1)' "$1"
+}
 
 say() { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
@@ -115,8 +225,10 @@ if [ "$ANNOUNCE" = 1 ]; then
   fi
   echo "$now" > "$STAMP"
   # `--quiet`, weil auf der anderen Maschine niemand zusieht; das Ergebnis steht dort im Log.
+  # `--owned-only`: diese Ansage ist automatisch, kein Mensch hat um genau DIESEN Blick
+  # gebeten — sie darf deshalb nur Sessions zeigen, deren @wb_owner hierher zeigt.
   nohup "$SSHBIN" "${SSHOPT[@]}" "$MACHINE" \
-    "\$HOME/.local/bin/wb-remote-view $SELF --quiet" \
+    "\$HOME/.local/bin/wb-remote-view $SELF --quiet --owned-only" \
     >>"$STATE_DIR/wb-remote-view.log" 2>&1 &
   say "wb-remote-view: $MACHINE gebeten, einen Spiegel auf $SELF zu setzen."
   exit 0
@@ -125,6 +237,15 @@ fi
 if [ "$MACHINE" = "$SELF" ]; then
   echo "wb-remote-view: '$MACHINE' ist diese Maschine — hier gibt es nichts zu spiegeln." >&2
   exit 1
+fi
+
+# `$MACHINE` ist ab hier die Zielmaschine, deren Sitzungen gespiegelt werden
+# sollen (nicht die Gegenrichtung von `--announce` oben). `--check` bleibt
+# ausgenommen, aus demselben Grund wie beim globalen Riegel: reines Nachsehen
+# aendert nichts und darf den wahren Zustand weiter zeigen.
+if [ "$CHECK" = 0 ] && maschine_pausiert "$MACHINE"; then
+  warn "wb-remote-view: '$MACHINE' ist pausiert (remoteMachinesPausiert) — kein Spiegel-Pane wird angelegt oder erneuert."
+  exit 0
 fi
 
 # ------------------------------------------------------------------- Sperre
@@ -175,15 +296,56 @@ PREP_FILE="$(mktemp "${TMPDIR:-/tmp}/wb-remote-view.XXXXXX")"
 cat > "$PREP_FILE" <<'REMOTE'
 set -u
 WANT="$1"
+SELF="$2"
+
+# Frist je tmux-Aufruf, DIESSEITS (2026-09-03, Audit "tmux-Aufrufe ohne Frist"):
+# dieses Fernskript laeuft auf der ANDEREN Maschine und kann die gleichnamige
+# Definition im Hauptskript nicht teilen -- siehe deren Kommentar dort fuer den
+# vollen Befund. Wortgleiche Uebernahme aus wb-pane-write.
+TIMEOUT_BIN=""
+for _tb in timeout gtimeout; do
+  command -v "$_tb" >/dev/null 2>&1 && { TIMEOUT_BIN="$_tb"; break; }
+done
+mit_frist() {
+  local sek="$1"; shift
+  local kind i=0 grenze
+  if [ -n "$TIMEOUT_BIN" ]; then
+    command "$TIMEOUT_BIN" -k 2 "$sek" "$@"
+    return $?
+  fi
+  grenze=$(( sek * 10 ))
+  "$@" &
+  kind=$!
+  while kill -0 "$kind" 2>/dev/null; do
+    if [ "$i" -ge "$grenze" ]; then
+      kill -TERM "$kind" 2>/dev/null
+      sleep 0.2
+      kill -KILL "$kind" 2>/dev/null
+      wait "$kind" 2>/dev/null
+      return 124
+    fi
+    i=$(( i + 1 ))
+    sleep 0.1
+  done
+  wait "$kind"
+}
+tmux() { mit_frist 5 command tmux "$@"; }
 
 # Sicht-Sessions ('<name>-view') fallen raus: sie teilen die Panes ihrer Basis, wuerden
 # also dieselben Worker ein zweites Mal melden und als eigene Basis eine Sicht auf eine
 # Sicht erzeugen.
-ALL=$(tmux list-panes -a -F '#{session_name}|#{pane_id}|#{@wb_role}|#{pane_dead}|#{window_name}|#{@wb_worker}' 2>/dev/null \
+ALL=$(tmux list-panes -a -F '#{session_name}|#{pane_id}|#{@wb_role}|#{pane_dead}|#{window_name}|#{@wb_worker}|#{@wb_owner}' 2>/dev/null \
       | awk -F'|' '$3=="worker" && $4=="0" && $1 !~ /-view$/')
 [ -n "$WANT" ] && ALL=$(printf '%s\n' "$ALL" | awk -F'|' -v s="$WANT" '$1==s')
 
 SESSIONS=$(printf '%s\n' "$ALL" | awk -F'|' 'NF>1{print $1}' | sort -u)
+
+# Pane-Titel ALLER Panes, fuer den Schleifenschutz weiter unten (siehe Kopf, 03.09.2026) —
+# EIN Aufruf statt einer je Session, dieselbe Ueberlegung wie bei $ALL oben. Titel statt
+# Rolle/Name: ein Spiegel-Pane traegt zwar auch @wb_role=worker, aber die Auskunft "zeigt
+# diese Session schon eine Sicht auf UNS" steckt einzig im Titel (`spiegel:<Maschine>:<Session>`,
+# gesetzt bei `tmux select-pane -T` in pane_cmd weiter unten).
+TITEL=$(tmux list-panes -a -F '#{session_name} #{pane_id} #{pane_title}' 2>/dev/null)
 
 # ------------------------------------------------------------- Groessen-Riegel
 # EIN SPIEGEL DARF DIE FENSTERGROESSE SEINER BASIS NICHT BESTIMMEN (20.08.).
@@ -245,6 +407,17 @@ EOF
     zc="${ic:-0}"; zr="${ir:-0}"
     [ "${gc:-0}" -gt "$zc" ] && zc="$gc"
     [ "${gr:-0}" -gt "$zr" ] && zr="$gr"
+    # UNTERGRENZE (Befund 01.09.2026, Meldung des Nutzers "der dialog worker bekommt
+    # die ganze Zeit Kontextwarnungen, wird aber nicht kompaktiert"): der Riegel
+    # nahm bis hier die groesste GERADE vorhandene Fenstergroesse. Stand die Sitzung
+    # in dem Moment bei 80x24 -- was sie tut, sobald nur die gruppierte -view-Sitzung
+    # einen Client hat --, dann fror er 80x24 dauerhaft ein. Fuenf Worker darin
+    # ergaben Panes von 39x6, und unter 60 Spalten bzw. 10 Zeilen liest der
+    # Kontext-Guard GAR NICHTS mehr (gemessen 2026-08-26, Schwellen im Guard-Log).
+    # Ein Pane, den die Wache nicht lesen kann, laeuft bis in die Kontextwand.
+    # Deshalb nie unter das bequeme Mass verriegeln: 200x50.
+    [ "$zc" -lt 200 ] && zc=200
+    [ "$zr" -lt 50 ] && zr=50
     [ "$zc" -gt 0 ] && [ "$zr" -gt 0 ] || continue
     tmux resize-window -t "$w" -x "$zc" -y "$zr" 2>/dev/null || continue
     tmux set-option -w -t "$w" @wb_view_pin 1 2>/dev/null
@@ -288,6 +461,18 @@ for s in $SESSIONS; do
   tmux has-session -t "=$s" 2>/dev/null || continue
   N=$(printf '%s\n' "$ALL" | awk -F'|' -v s="$s" 'NF>1 && $1==s' | grep -c .)
   [ "$N" -gt 0 ] || continue
+
+  # SCHLEIFENSCHUTZ (siehe Kopf, 03.09.2026): VOR dem Riegel/der Sicht, sonst veraendert
+  # dieser Lauf schon eine Session, die er gleich darauf doch nicht spiegeln darf. Enthaelt
+  # $s einen Pane, dessen Titel mit "spiegel:$SELF:" beginnt, ist $s selbst schon eine Sicht
+  # auf DIESE Maschine — ein weiterer Spiegel hier wuerde den Kreis schliessen.
+  LOOPZEILE=$(printf '%s\n' "$TITEL" | awk -v s="$s" -v want="spiegel:$SELF:" \
+    '$1==s { rest=$0; sub(/^[^ ]+ [^ ]+ /,"",rest); if (index(rest, want)==1) { print $2" "rest; exit } }')
+  if [ -n "$LOOPZEILE" ]; then
+    echo "SCHLEIFE=$s|${LOOPZEILE%% *}|${LOOPZEILE#* }"
+    continue
+  fi
+
   VIEW="$s-view"
   # ERST DER RIEGEL, DANN DIE SICHT: solange die Sicht nicht steht, kann sich
   # auch kein Spiegel an sie haengen, und die Groesse, die wir festhalten, ist
@@ -322,12 +507,15 @@ for s in $SESSIONS; do
   WWIN=$(printf '%s\n' "$ALL" | awk -F'|' -v s="$s" 'NF>1 && $1==s{n=$2; sub(/^%/,"",n); print n"|"$5}' \
          | sort -t'|' -k1,1n | tail -1 | cut -d'|' -f2)
   [ -n "$WWIN" ] && tmux select-window -t "=$VIEW:$WWIN" 2>/dev/null
-  echo "SESSION=$s|$VIEW|$N|${WWIN:-}"
+  # Eigentuemer der Session (@wb_owner, siehe Kopf) — je Pane derselben Session gleich,
+  # deshalb genuegt der erste Treffer.
+  OWNER=$(printf '%s\n' "$ALL" | awk -F'|' -v s="$s" '$1==s{print $7; exit}')
+  echo "SESSION=$s|$VIEW|$N|${WWIN:-}|${OWNER:-}"
 done
 REMOTE
 
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
-RAW=$("$SSHBIN" "${SSHOPT[@]}" "$MACHINE" "bash -s -- $(q "$RSESS_IN")" < "$PREP_FILE" 2>&1) || {
+RAW=$("$SSHBIN" "${SSHOPT[@]}" "$MACHINE" "bash -s -- $(q "$RSESS_IN") $(q "$SELF")" < "$PREP_FILE" 2>&1) || {
   warn "wb-remote-view: $MACHINE nicht erreichbar oder Vorbereitung fehlgeschlagen:"
   printf '%s\n' "$RAW" >&2
   exit 1
@@ -349,9 +537,72 @@ while IFS='|' read -r rs w; do
 done <<EOF
 $(printf '%s\n' "$RAW" | sed -n 's/^FREI=//p')
 EOF
+# SCHLEIFENSCHUTZ (siehe Kopf, 03.09.2026): eine so gemeldete Session fehlt in $SESSIONS
+# oben und wird darum unten wie jede andere nicht mehr gewuenschte Session behandelt — ein
+# schon bestehender Spiegel auf sie faellt dem normalen Abbau zum Opfer, kein Sonderfall
+# noetig. Hier wird nur GESAGT, warum.
+while IFS='|' read -r rs pid titel; do
+  [ -n "$rs" ] && warn "wb-remote-view: '$rs' auf $MACHINE NICHT gespiegelt — Schleifenschutz: Pane $pid dort zeigt bereits eine Sicht auf diese Maschine ('$titel'). Ein weiterer Spiegel hier wuerde den Kreis schliessen."
+done <<EOF
+$(printf '%s\n' "$RAW" | sed -n 's/^SCHLEIFE=//p')
+EOF
 
 # --------------------------------------------------------------- lokale Seite
 PREFIX="REMOTE-$MACHINE-"
+
+# ------------------------------------------------------- Frist je tmux-Aufruf
+# OERTLICHE tmux-AUFRUFE OHNE FRIST (2026-09-03, Audit "tmux-Aufrufe ohne
+# Frist"): bis hier hatte KEIN einzelner `tmux`-Aufruf dieses Werkzeugs eine
+# eigene Zeitschranke -- nur die ssh-Verbindung traegt `ConnectTimeout` (siehe
+# SSHOPT oben), und das bindet keinen haengenden GEGENPART: ein tmux-Server,
+# der antwortet, aber auf genau EINE Anfrage nie reagiert, liesse jeden Aufruf
+# hier unbegrenzt stehen, waehrend ssh selbst gesund bliebe. Ab hier laeuft
+# JEDER bare `tmux`-Aufruf des lokalen Skripts (alle Stellen aus dem Audit ab
+# hier abwaerts, keine einzige angefasst) durch `mit_frist` -- wortgleich
+# uebernommen aus `wb-pane-write` (dort seit 26.08., Befund: ein `send-keys`
+# haengte 3 h 42 min in der Kontextwache, weil der Server auf genau eine
+# Anfrage nie antwortete). Ein zweites, abweichendes Muster fuer dieselbe
+# Zusage waere schlimmer als das, was schon da ist. Das Fernskript weiter oben
+# (PREP_FILE) traegt dieselbe Definition ein zweites Mal, selbststaendig --
+# es laeuft auf einer ANDEREN Maschine und kann diese Funktion nicht teilen.
+TIMEOUT_BIN=""
+for _tb in timeout gtimeout; do
+  command -v "$_tb" >/dev/null 2>&1 && { TIMEOUT_BIN="$_tb"; break; }
+done
+
+mit_frist() {   # mit_frist <sekunden> <programm> [args...] -- Rueckgabe 124 bei Ablauf, wie timeout(1)
+  local sek="$1"; shift
+  local kind i=0 grenze
+  if [ -n "$TIMEOUT_BIN" ]; then
+    command "$TIMEOUT_BIN" -k 2 "$sek" "$@"
+    return $?
+  fi
+  # KEIN timeout(1)/gtimeout im PATH (macOS ohne Homebrew-coreutils): derselbe
+  # Eigenbau wie in wb-pane-write, dieselbe Zusage (nichts haengt unbegrenzt).
+  grenze=$(( sek * 10 ))
+  "$@" &
+  kind=$!
+  while kill -0 "$kind" 2>/dev/null; do
+    if [ "$i" -ge "$grenze" ]; then
+      kill -TERM "$kind" 2>/dev/null
+      sleep 0.2
+      kill -KILL "$kind" 2>/dev/null
+      wait "$kind" 2>/dev/null
+      return 124
+    fi
+    i=$(( i + 1 ))
+    sleep 0.1
+  done
+  wait "$kind"
+}
+
+# Schattiert den Namen `tmux` fuer den REST dieses Skripts: jeder bestehende
+# Aufruf `tmux <argumente>` laeuft ab hier durch die Frist, ohne dass eine
+# einzige Aufrufstelle angefasst werden musste. `command tmux` darin ist der
+# einzige Weg zum echten Binary und verhindert die Rekursion.
+tmux() {
+  mit_frist "${WB_REMOTE_VIEW_TMUX_TIMEOUT:-5}" command tmux "$@"
+}
 
 # Alle Spiegel dieser Maschine: "<pane> <name> <dead>". Panes einer Sessiongruppe stehen
 # in `list-panes -a` zweimal (Basis + Sicht), deshalb wird nach Pane-ID entdoppelt.
@@ -431,10 +682,35 @@ if [ -z "$SESSIONS" ]; then
   exit 0
 fi
 
+# ----- Eigentuemer-Filter (@wb_owner, siehe Kopf): WEM gehoert jede gefundene Session?
+# Bewusst NACH dem Abbau oben: ein frueherer, ausdruecklicher Aufruf darf seinen Spiegel
+# behalten, auch wenn DIESER Aufruf automatisch ist und die Session nicht sehen darf --
+# gefiltert wird nur, was ab hier NEU gebaut/geprueft/verifiziert wird.
+SESSIONS_BUILD=""
+while IFS='|' read -r rsess view n rwin owner; do
+  [ -n "$rsess" ] || continue
+  if [ -n "$owner" ]; then
+    ownermaschine="${owner%%:*}"; ownersession="${owner#*:}"
+    if [ "$ownermaschine" = "$SELF" ] && [ -n "$ownersession" ] && tmux has-session -t "=$ownersession" 2>/dev/null; then
+      SESSIONS_BUILD="$SESSIONS_BUILD$rsess|$view|$n|$rwin|$owner
+"
+    else
+      say "wb-remote-view: '$rsess' auf $MACHINE nicht gespiegelt — Eigentuemer '$owner' zeigt auf keine hier laufende Sitzung."
+    fi
+  elif [ "$OWNED_ONLY" = 1 ]; then
+    say "wb-remote-view: '$rsess' auf $MACHINE nicht gespiegelt — keine Eigentuemer-Markierung, und dieser Aufruf ist automatisch (--owned-only)."
+  else
+    SESSIONS_BUILD="$SESSIONS_BUILD$rsess|$view|$n|$rwin|$owner
+"
+  fi
+done <<EOF
+$SESSIONS
+EOF
+
 # ----- Aufbau je entfernter Session.
 fehler=0; unsichtbar=0; gebaut=0; gesamt=0
 LOCAL_TARGET=""
-while IFS='|' read -r rsess view n rwin; do
+while IFS='|' read -r rsess view n rwin owner; do
   [ -n "$rsess" ] || continue
   gesamt=$(( gesamt + 1 ))
   name="$PREFIX$rsess"
@@ -467,32 +743,58 @@ while IFS='|' read -r rsess view n rwin; do
       say "wb-remote-view: Spiegel-Pane $mpane fuer '$rsess' neu gestartet."
     fi
   elif [ -z "$mpane" ]; then
-    [ -n "$LOCAL_TARGET" ] || LOCAL_TARGET="$(find_local_session)"
-    if [ -z "$LOCAL_TARGET" ]; then
+    # Hat die Session einen Eigentuemer (@wb_owner, siehe Kopf), bestimmt SIE das Ziel --
+    # der Filter oben hat schon geprueft, dass diese lokale Session hier lebt. Ohne
+    # Eigentuemer bleibt es beim alten Raten (angehaengte Session/--local-session), NUR
+    # dann ueberhaupt erreicht, wenn dieser Aufruf nicht --owned-only war (sonst waere die
+    # Session schon oben herausgefiltert worden).
+    if [ -n "$owner" ]; then
+      THIS_TARGET="${owner#*:}"
+    else
+      [ -n "$LOCAL_TARGET" ] || LOCAL_TARGET="$(find_local_session)"
+      THIS_TARGET="$LOCAL_TARGET"
+    fi
+    if [ -z "$THIS_TARGET" ]; then
       warn "wb-remote-view: keine ANGEHAENGTE Workbench-Session hier — die Worker auf $MACHINE laufen ohne Spiegel."
       warn "  Ein Spiegel wird nur dort gesetzt, wo jemand hinsieht; in eine unbeaufsichtigte"
       warn "  Session wird nicht hineingebaut. Session oeffnen (wb-code <ordner>) und erneut"
       warn "  aufrufen, oder die Session ausdruecklich nennen: wb-remote-view $MACHINE --local-session <name>"
       exit 1
     fi
-    # Das `workers`-Fenster MUSS vor dem Pane da sein (sonst landet der Spiegel im
-    # Orchestrator-Fenster und wb-grid muss ihn erst umziehen); es legt zugleich die
+    # Das `workers`-Fenster MUSS vor dem Pane da sein: es legt zugleich die
     # gruppierte `-view`-Session an, an der der Worker-Tab haengt.
-    [ -x "$BIN/wb-workers-window" ] && "$BIN/wb-workers-window" "$LOCAL_TARGET" >/dev/null 2>&1
+    [ -x "$BIN/wb-workers-window" ] && "$BIN/wb-workers-window" "$THIS_TARGET" >/dev/null 2>&1
     # Geteilt wird ein PANE, und der wird ausdruecklich aufgeloest. `split-window -t
     # "=<session>"` scheitert mit „can't find pane" — die Ankerform '=' gilt fuer
     # Session- und Fensterziele, nicht fuer Pane-Ziele (gemessen 2026-08-13). Ohne den
     # Anker waere jeder Sessionname ein Praefix-Treffer auf eine fremde Session.
-    ltgt=$(tmux list-panes -t "=$LOCAL_TARGET" -F '#{pane_id} #{pane_active}' 2>/dev/null \
-           | awk '$2==1{print $1; exit}')
-    [ -n "$ltgt" ] || { warn "wb-remote-view: Session '$LOCAL_TARGET' hat keinen aktiven Pane — kein Spiegel angelegt."; fehler=$(( fehler + 1 )); continue; }
+    #
+    # NIE DER "AKTIVE" PANE (Pruefer-Befund 3, 03.09.2026, seit Stufe A). Vor Stufe A
+    # sass jeder Worker als einer von mehreren Panes im Fenster `workers` — ein
+    # zusaetzlicher Spiegel-Pane dort fiel unter den ohnehin schon mehreren nicht auf,
+    # und war der aktive Pane zufaellig ein Worker, landete der Spiegel bloss im
+    # falschen, aber schon vollen Fenster. Seit Stufe A traegt JEDES `workers*`-Fenster
+    # genau EINEN Pane: ist dieser der aktive der Sitzung, splittet direkt HINEIN, das
+    # Fenster traegt kurzzeitig zwei, und solange faellt die Buehne des GANZEN Tabs auf
+    # das gebundene Raster zurueck (main.ts, `frei` verlangt genau einen Pane je
+    # Fenster). Der Zustand haelt nicht lange an, weil wb-grid weiter unten den Pane in
+    # sein eigenes Fenster umzieht — aber ein Worker-Fenster soll erst gar nicht,
+    # auch nicht kurzzeitig, zwei Panes tragen. Gezielt wird deshalb das
+    # ORCHESTRATOR-Fenster: derselbe Weg, den wb-grid selbst geht (@wb_role
+    # orchestrator, sonst der erste Pane ausserhalb eines `workers*`-Fensters und
+    # ausserhalb der Leiste).
+    opanes=$(tmux list-panes -t "=$THIS_TARGET" -F '#{pane_id}|#{@wb_role}|#{window_name}' 2>/dev/null)
+    ltgt=$(printf '%s\n' "$opanes" | awk -F'|' '$2=="orchestrator"{print $1; exit}')
+    [ -n "$ltgt" ] || ltgt=$(printf '%s\n' "$opanes" \
+      | awk -F'|' '$2!="sidebar" && $3!="workers" && $3 !~ /^workers-[0-9]+$/{print $1; exit}')
+    [ -n "$ltgt" ] || { warn "wb-remote-view: Session '$THIS_TARGET' hat kein Orchestrator-Fenster — kein Spiegel angelegt."; fehler=$(( fehler + 1 )); continue; }
     splitfehler="$(mktemp "${TMPDIR:-/tmp}/wb-remote-view-split.XXXXXX")"
     mpane=$(tmux split-window -d -t "$ltgt" -P -F '#{pane_id}' "$cmd" 2>"$splitfehler")
     # Ein leeres $mpane heisst: der Split ist fehlgeschlagen. `tmux set -p -t ""` meldet
     # KEINEN Fehler, sondern trifft den gerade aktiven Pane — so wurde 2026-07-25 der
     # ORCHESTRATOR einer fremden Session als Worker markiert.
     if [ -z "$mpane" ]; then
-      warn "wb-remote-view: Spiegel-Pane fuer '$rsess' liess sich in '$LOCAL_TARGET' nicht anlegen — nichts markiert."
+      warn "wb-remote-view: Spiegel-Pane fuer '$rsess' liess sich in '$THIS_TARGET' nicht anlegen — nichts markiert."
       warn "  tmux sagt: $(tr '\n' ' ' < "$splitfehler" 2>/dev/null)"
       rm -f "$splitfehler"; fehler=$(( fehler + 1 )); continue
     fi
@@ -505,7 +807,7 @@ while IFS='|' read -r rsess view n rwin; do
     tmux select-pane -t "$mpane" -T "spiegel:$MACHINE:$rsess"
     [ -x "$BIN/wb-grid" ] && "$BIN/wb-grid" "$mpane" >/dev/null 2>&1
     gebaut=$(( gebaut + 1 ))
-    say "wb-remote-view: Spiegel-Pane $mpane fuer '$rsess' angelegt (Session $LOCAL_TARGET, $n Worker)."
+    say "wb-remote-view: Spiegel-Pane $mpane fuer '$rsess' angelegt (Session $THIS_TARGET, $n Worker)."
   fi
 
   # ----- Schritt 3 des Handverfahrens: das Fenster des Spiegels in der SICHT aktiv schalten.
@@ -540,7 +842,7 @@ while IFS='|' read -r rsess view n rwin; do
   fi
   say "wb-remote-view: $n Worker in $MACHINE:$rsess sichtbar in Pane $mpane (Sicht '$view')."
 done <<EOF
-$SESSIONS
+$SESSIONS_BUILD
 EOF
 
 if [ "$CHECK" = 1 ]; then
@@ -552,13 +854,13 @@ fi
 # ein Aufruf fuer alle, statt einer je Session.
 if [ "$fehler" -eq 0 ] && [ "$gesamt" -gt 0 ]; then
   RCLIENTS=$("$SSHBIN" "${SSHOPT[@]}" "$MACHINE" "tmux list-clients -F '#{client_session}' 2>/dev/null" 2>/dev/null || true)
-  while IFS='|' read -r rsess view n rwin; do
+  while IFS='|' read -r rsess view n rwin owner; do
     [ -n "$view" ] || continue
     grep -qx "$view" <<<"$RCLIENTS" && continue
     warn "wb-remote-view: auf $MACHINE haengt kein Client an '$view' — die Sicht ist noch nicht angekommen."
     fehler=$(( fehler + 1 ))
   done <<EOF
-$SESSIONS
+$SESSIONS_BUILD
 EOF
 fi
 

@@ -93,6 +93,18 @@ while [[ $# -gt 0 ]]; do
     -o)        OUT="$2"; shift 2 ;;
     --kein-open) OPEN=0; shift ;;
     -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Anlass (2026-08-22, dieselbe Bugfamilie wie wb-budget): vorher stand hier nur
+    # `*) PROMPT="$1"; shift ;;` -- eine getippte Option landete dort genauso wie der
+    # echte Prompt, und der naechste Schleifendurchlauf (der echte Prompt) ueberschrieb
+    # sie wieder. `bild --schnnell "ein roter Apfel"` liess das Tippfehler-Flag spurlos
+    # verschwinden und generierte still im QUALITAETS-Modus statt im schnellen -- kein
+    # Fehler, nur eine falsche Wartezeit und ein anderes Ergebnis, als verlangt war.
+    # Eine mit '-' beginnende Zeichenkette ist in keinem der Aufrufe (Hand, Agent, die
+    # Beispiele im Kopfkommentar) ein legitimer Prompt -- sie ist immer eine Option.
+    -*)
+      echo "bild: unbekannte Option '$1'" >&2
+      exit 1
+      ;;
     *)         PROMPT="$1"; shift ;;
   esac
 done

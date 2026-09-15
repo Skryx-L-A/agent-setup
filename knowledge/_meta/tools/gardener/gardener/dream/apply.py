@@ -70,7 +70,7 @@ WRITER_CONFLICT = "refused-by-writer: expect-conflict"
 
 # Rules whose refusal is a case for a human rather than pure machine memory.
 ESCALATING_REASONS = ("ownership", "ownership-foreign-generator", "ownership-scope",
-                      "escalate-terms", "instruction-shaped")
+                      "escalate-terms", "instruction-shaped", "negation-mismatch")
 
 # Regel 8: material that reads like an instruction is never applied. The
 # extraction prompt already frames every segment as material, but a prompt is
@@ -410,9 +410,16 @@ def gate_values(hunk: dict) -> str | None:
     claim itself, and the only thing that may vouch for it is its own quote.
     """
     for claim in (hunk.get("claims") or []):
-        missing = claims_mod.uncovered_values(
-            str(claim.get("text") or ""), str(claim.get("quote") or ""),
-            include_model_names=True)
+        text, quote = (str(claim.get("text") or ""),
+                      str(claim.get("quote") or ""))
+        # `claims.verify_quote` already refuses this shape at extraction time
+        # (02.09.2026), but a hunk can also be built from a claim that was
+        # extracted before this gate existed and has sat in the claim store
+        # since - the applier re-checks every rule in code, this one included.
+        if claims_mod.negation_mismatch(text, quote):
+            return "negation-mismatch"
+        missing = claims_mod.uncovered_values(text, quote,
+                                              include_model_names=True)
         if missing:
             return "value-not-in-quote (" + ",".join(missing[:5]) + ")"
     return None
@@ -970,7 +977,8 @@ def own_paths(vault: Path, result: ApplyResult, run_id: str,
     braucht dieselbe Liste fuer ihren eigenen Commit, deshalb steht sie hier
     und nicht mitten in `run_apply`.
     """
-    audit_rel = shadow_mod.audit_dir(Path(vault), run_id).relative_to(vault)
+    audit_dir = shadow_mod.audit_dir(Path(vault), run_id)
+    audit_rel = audit_dir.relative_to(vault)
     paths = list(result.written) + [
         f"{audit_rel}/{APPLIED_FILE}",
         dcfg.ISSUES_FILE,
@@ -978,6 +986,10 @@ def own_paths(vault: Path, result: ApplyResult, run_id: str,
     ]
     if report_path is not None:
         paths.append(str(Path(report_path).relative_to(vault)))
+    # Nur wenn es sie gibt: ohne einen code-verweigerten oder eskalierten
+    # Hunk in DIESEM Uebernahme-Schritt schreibt apply.py sie nicht.
+    if (audit_dir / dcfg.ESCALATION_DETAIL_FILE).exists():
+        paths.append(f"{audit_rel}/{dcfg.ESCALATION_DETAIL_FILE}")
     return sorted({p for p in paths if p})
 
 
@@ -1008,7 +1020,8 @@ def run_apply(vault: Path, changeset_path: Path, verdicts_path: Path, *,
             snapshot_root=snapshot_root if snapshot_root is not None
             else snapshot_root_default())
         write_applied(vault, result, dry_run=dry_run)
-        issues_mod.record(vault, issues_from(result), dry_run=dry_run)
+        issues_mod.record(vault, issues_from(result), dry_run=dry_run,
+                          hunks=hunks, run_id=run_id)
         report_path = None
         if write_own_report:
             # In der Kette schreibt `cli.run_chain` EINEN Bericht ueber alle

@@ -1,17 +1,16 @@
 /* Die Aktivitaetsliste (4c.1). Dieselbe Bildsprache wie die Freigabe-Ansicht
    (dunkle Schublade von rechts), aber blau statt gelb/blau gemischt: hier
    will nichts etwas, hier steht nur, was gerade ist. */
-/* Die Schublade steht IN der Reihe zwischen Sessionleiste und Buehne, nicht
-   darueber -- Vorgabe des Nutzers vom 05.08.: "so wie es auch rechts aussieht".
-   Als schwebende Flaeche lag sie ueber der Buehne und liess die linke Seite
-   wie zwei uebereinandergeschobene Leisten wirken. Jetzt endet die Buehne an
-   ihr, genau wie sie rechts an der Workerleiste endet. Zugeklappt ist sie
-   `display: none` und nimmt keine Breite -- das ersetzt die alte Schiebe-
-   Animation, die in der Reihe die Buehne bei jedem Bild neu vermessen haette. */
+/* NEUE GESTALT (03.09.2026), gleiche Logik. Das Blatt liegt jetzt im
+   Inspektor rechts und nicht mehr als Schublade zwischen Leiste und Flaeche:
+   es fuellt seine Spalte ganz, traegt den Ton der Leisten und braucht keine
+   eigene Kante mehr -- die Spalte hat schon eine. Seine Kopfzeile ist weg, weil
+   der Reiter darueber den Namen schon nennt; ein zweiter Titel unmittelbar
+   darunter waere dieselbe Auskunft zweimal. */
 .ak-panel {
-  flex: 0 0 auto; width: min(480px, 45vw); height: 100%; box-sizing: border-box;
-  background: #14171c; border-right: 1px solid #262b34; color: #d8dee9;
-  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  flex: 1 1 auto; width: 100%; min-width: 0; height: 100%; box-sizing: border-box;
+  background: var(--leiste); color: var(--schrift);
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui;
   display: none; flex-direction: column;
   overflow-wrap: anywhere;
 }
@@ -19,35 +18,56 @@
 
 .ak-kopf {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 10px 12px; border-bottom: 1px solid #262b34; flex: 0 0 auto;
+  padding: 10px 12px; flex: 0 0 auto;
 }
 .ak-titel { font-weight: 700; font-size: 13px; }
 .ak-schliessen {
-  background: none; border: 0; color: #8b93a1; font-size: 18px; line-height: 1;
+  background: none; border: 0; color: var(--gedaempft); font-size: 18px; line-height: 1;
   cursor: pointer; padding: 2px 6px;
 }
-.ak-schliessen:hover { color: #d8dee9; }
+.ak-schliessen:hover { color: var(--schrift); }
 
-.ak-inhalt { flex: 1 1 auto; overflow-y: auto; padding: 10px 12px 16px; }
-.ak-liste { display: flex; flex-direction: column; gap: 6px; }
-.ak-leer { color: #8b93a1; padding: 4px 0; }
+.ak-inhalt { flex: 1 1 auto; overflow-y: auto; padding: 6px 8px 14px; }
+.ak-liste { display: flex; flex-direction: column; gap: 0; }
+.ak-leer { color: var(--gedaempft); padding: 4px 0; }
 
+/* Base/elevated (HIG Dark Mode): die Karte ruht auf --leiste, ihr Hover tritt
+   auf --erhoben vor -- ohne den Unterschied waere der Hover unsichtbar. */
+/* EINE FLACHE LISTE, KEIN KARTENSTAPEL (03.09.2026). In der schmalen Spalte
+   des Inspektors trug jede Karte ihren eigenen Rahmen, ihren eigenen Grund und
+   einen drei Bildpunkte breiten Farbbalken -- bei zwoelf Eintraegen uebereinander
+   war mehr Rahmen zu sehen als Inhalt. Jetzt eine Zeile je Eintrag, die
+   Unterscheidung traegt ein kleiner Punkt vorn, und der Grund tritt erst beim
+   Ueberfahren hervor. */
 .ak-eintrag {
-  background: #1a1e25; border: 1px solid #262b34; border-radius: 6px; padding: 6px 10px;
-  cursor: pointer;
+  position: relative; background: none; border: 0; border-radius: 0;
+  padding: 5px 4px 5px 18px; cursor: pointer;
 }
-.ak-eintrag:hover { background: #1e232b; border-color: #333b48; }
+.ak-eintrag::before {
+  content: ''; position: absolute; left: 2px; top: 10px;
+  width: 6px; height: 6px; border-radius: 50%; background: var(--gedaempft);
+}
+.ak-eintrag:hover { background: var(--erhoben); }
 /* Der Eintrag, dessen Inhalt gerade "in der Mitte" offen ist -- ein zweiter
    Klick auf GENAU diesen zeigt den Diff bzw. Auftrag+Ergebnis (V15/V18). */
-.ak-eintrag.ak-offen { border-color: #6a7fd0; box-shadow: inset 0 0 0 1px #6a7fd0; }
-.ak-status { color: #8b93a1; padding: 4px 0 0; font-size: 11px; }
+.ak-eintrag.ak-offen { background: var(--akzent-matt); }
+.ak-status { color: var(--gedaempft); padding: 4px 0 0; font-size: 11px; }
 /* Ergebnisdateien (Worker) blau, Session-Aenderungen (git) gruenlich --
    dieselbe Unterscheidung wie 'Urheber ist ein Worker oder eine Session'. */
-.ak-ergebnis { border-left: 3px solid #6a7fd0; }
-.ak-aenderung { border-left: 3px solid #46a758; }
+/* Ergebnisdateien tragen die Fertig-Farbe, unversionierte Aenderungen die
+   Warte-Farbe: das eine liegt vor, das andere will noch etwas. */
+.ak-ergebnis::before { background: var(--zustand-fertig); }
+.ak-aenderung::before { background: var(--zustand-wartet); }
 
 .ak-eintrag-kopf { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .ak-wer { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ak-wann { color: #8b93a1; font-size: 11px; white-space: nowrap; }
-.ak-datei { margin-top: 2px; color: #b9c0cc; }
-.ak-zusatz { color: #8b93a1; font-size: 11px; margin-top: 1px; }
+.ak-wann { color: var(--gedaempft); font-size: 11px; white-space: nowrap; }
+/* Der Pfad der geaenderten Datei -- HIG-Ausnahme fuer Monospace. */
+.ak-datei { margin-top: 2px; color: var(--schrift); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.ak-zusatz { color: var(--gedaempft); font-size: 11px; margin-top: 1px; }
+
+/* Die eigene Kopfzeile des Blattes bleibt weg -- der Reiter darueber nennt den
+   Namen schon, und ein zweiter Titel unmittelbar darunter waere dieselbe
+   Auskunft zweimal. Sie steht weiter im Baum, damit der Schliessen-Knopf darin
+   erreichbar bleibt (die Blaetter binden ihn beim Aufbau). */
+.ak-kopf { display: none; }

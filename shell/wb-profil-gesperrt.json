@@ -1,0 +1,87 @@
+{
+  "_comment": "Hausliste gesperrter Werkzeuge und Bash-Muster fuer Rollenprofile (docs/AGENTS-PLAN.md, Anhang 'Rollenprofile'). Ein Profil darf keinen der Eintraege hier in 'tools' oder 'bash' nennen -- gelesen von shell/wb-profil, 'programme' und 'muster' wie dort beschrieben (Kopfkommentar von wb-profil, Abschnitt PRUEFUNG). Aenderungen hier gelten sofort fuer jede kuenftige Pruefung; sie sind kein Code, damit sie ohne Release im Repo aendern.",
+  "programme": [
+    {
+      "programm": "mail",
+      "grund": "Mail-Versand"
+    },
+    {
+      "programm": "sendmail",
+      "grund": "Mail-Versand"
+    },
+    {
+      "programm": "wb-belegung",
+      "erfordert": [
+        "--verdraengen"
+      ],
+      "grund": "Verdraengen (wb-belegung --verdraengen)"
+    },
+    {
+      "programm": "kill",
+      "grund": "Verdraengen"
+    },
+    {
+      "programm": "pkill",
+      "grund": "Verdraengen"
+    },
+    {
+      "programm": "killall",
+      "grund": "Verdraengen"
+    },
+    {
+      "programm": "msmtp",
+      "grund": "Mail-Versand (realer Sendeweg von <ein eigenes Mailwerkzeug>)"
+    },
+    {
+      "programm": "mailx",
+      "grund": "Mail-Versand"
+    },
+    {
+      "programm": "git",
+      "erfordert": [
+        "push"
+      ],
+      "grund": "Push-Weg"
+    },
+    {
+      "programm": "wb-state",
+      "erfordert": [
+        "models",
+        "cap"
+      ],
+      "grund": "Erlaubnisstufen (Effort-Deckel)"
+    },
+    {
+      "programm": "wb-state",
+      "erfordert": [
+        "settings",
+        "set"
+      ],
+      "grund": "Erlaubnisstufen (Settings)"
+    },
+    {
+      "programm": "rm",
+      "erfordert": [
+        "-rf"
+      ],
+      "grund": "rm -rf"
+    },
+    {
+      "programm": "wb-rolle",
+      "erfordert": [
+        "setzen"
+      ],
+      "grund": "Rollen setzen"
+    }
+  ],
+  "muster": [
+    {
+      "enthaelt": ".claude/settings",
+      "grund": "Erlaubnisstufen (Pfade unter ~/.claude/settings)"
+    },
+    {
+      "enthaelt": "--dangerously-skip-permissions",
+      "grund": "Erlaubnisstufen"
+    }
+  ]
+}

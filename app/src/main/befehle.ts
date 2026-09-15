@@ -132,7 +132,13 @@ function tmux(socket: string, args: string[]): { ok: boolean; out: string } {
   // Leerzeichen und waeren von der fehlenden Zeichenklasse nicht betroffen --
   // die Regel steht trotzdem an jedem Aufruf, dessen Ausgabe zerlegt wird,
   // damit sie nicht bei der naechsten Formataenderung neu erwogen werden muss.
-  const r = spawnSync('tmux', [...basis, ...args], { encoding: 'utf8', env: mitMaschinenLocale(), timeout: 2000 });
+  // killSignal:SIGKILL (2026-08-22, gemessen an sessions.ts): die Node-Vorgabe
+  // SIGTERM laesst sich abfangen und liess spawnSync in der Messung ueber
+  // zwei Minuten haengen. SIGKILL kann kein Prozess im Nutzerraum ablehnen --
+  // so wie BudgetPoller/RemotePoller es an ihrer eigenen Frist schon machen.
+  const r = spawnSync('tmux', [...basis, ...args], {
+    encoding: 'utf8', env: mitMaschinenLocale(), timeout: 2000, killSignal: 'SIGKILL',
+  });
   if (r.error || r.signal) {
     process.stderr.write(`befehle.ts tmux(${args.join(' ')}): ${r.signal ? 'nach 2000ms abgebrochen' : r.error?.message} -- gilt als fehlgeschlagen.\n`);
   }
@@ -441,7 +447,7 @@ export function plane(nachricht: Record<string, unknown>, u: BefehlsUmgebung): P
         return {
           art: 'sofort',
           command,
-          beschreibung: `Die Session '${akte.tmuxSession}' laeuft bereits — sie wird nur gezeigt, nicht neu gestartet.`,
+          beschreibung: `Die Session '${akte.tmuxSession}' laeuft bereits – sie wird nur gezeigt, nicht neu gestartet.`,
           daten: { tmuxSession: akte.tmuxSession, dir, bereitsAktiv: true },
         };
       }

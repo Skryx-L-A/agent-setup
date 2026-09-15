@@ -16,7 +16,7 @@ export const MODELS = [
   'claude-opus-4-8',
   'claude-sonnet-5',
   'claude-haiku-4-5',
-  'claude-fable-5',
+  'claude-fable-5-1',
 ] as const;
 
 export type Model = (typeof MODELS)[number];
@@ -26,7 +26,7 @@ export const MODEL_LABEL: Record<Model, string> = {
   'claude-opus-4-8': 'Opus 4.8',
   'claude-sonnet-5': 'Sonnet 5',
   'claude-haiku-4-5': 'Haiku 4.5',
-  'claude-fable-5': 'Fable 5',
+  'claude-fable-5-1': 'Fable 5.1',
 };
 
 /**
@@ -108,11 +108,8 @@ export function effortLabel(harness: Harness): string {
   return harness === 'pi' ? 'Thinking-Level' : 'Effort';
 }
 
-/**
- * 'max' exists in Claude Code but is above the policy ceiling (CLAUDE.md), so it
- * is never offered here; Fable is capped at 'medium' by the same rule.
- */
-export const EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
+/** All reasoning levels understood by at least one registered harness. */
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 
 export type Effort = (typeof EFFORTS)[number];
 
@@ -305,9 +302,11 @@ function isTabCapacity(value: unknown): value is number {
   return n !== undefined && n >= 0;
 }
 
-/** Efforts a model may be run at — Fable stops at medium (CLAUDE.md hard cap). */
+/** Efforts a model may be run at: `fable` max effort = high (registry maxEffort; raised from medium 2026-07-30, CLAUDE.md hard cap). */
 export function effortsForModel(model: string): Effort[] {
-  return model === 'claude-fable-5' ? ['low', 'medium'] : [...EFFORTS];
+  return model === 'claude-fable-5-1'
+    ? ['low', 'medium', 'high']
+    : ['low', 'medium', 'high', 'xhigh', 'max'];
 }
 
 /**

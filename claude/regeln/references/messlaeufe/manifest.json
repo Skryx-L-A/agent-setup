@@ -1,0 +1,37 @@
+{
+  "source": "$HOME/.claude/regeln/messlaeufe.md",
+  "sha256": "43dea06c4eb165981608b9920d6fa06ae87c16244c9d533ae6584d78866895e9",
+  "bytes": 10410,
+  "sections": [
+    {
+      "file": "00.md",
+      "heading": "Messläufe — was VOR dem ersten Rechenschritt feststeht",
+      "sha256": "7e2a223f4d27c976e3d442a098939d4a37498e9f0e621c663e079369234d874a"
+    },
+    {
+      "file": "01.md",
+      "heading": "Die vier Tore, in dieser Reihenfolge",
+      "sha256": "e3cbd09609316499f72dca586c84884d83e5e48b12c860e503019dbac428770b"
+    },
+    {
+      "file": "02.md",
+      "heading": "Beim Lesen der Ergebnisse",
+      "sha256": "543bf1afac454dd7666a0877d296d83fe1f2d20f706ff23f47e0a21baf7b7d1d"
+    },
+    {
+      "file": "03.md",
+      "heading": "Beim Weitergeben",
+      "sha256": "bbc7820172e72e98b7a4289d78e396e14332ed2bbf3ec99044f2c0b9c978b1de"
+    },
+    {
+      "file": "04.md",
+      "heading": "Handwerk, das dreimal in einer Nacht schiefging",
+      "sha256": "f7bd5886fc3003c02e23197abbfeb6ee1d24d8e3be11a08014e5ccd27de71f45"
+    },
+    {
+      "file": "05.md",
+      "heading": "Die zwei Läufer, wenn der Lauf sich selbst wiederholen soll",
+      "sha256": "494ac9cb103f6ba1fb72c36a65d808ebdc6ee6a92957a388888f73c1d29ab357"
+    }
+  ]
+}

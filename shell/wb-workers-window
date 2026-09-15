@@ -1,11 +1,13 @@
 #!/bin/bash
 # wb-workers-window <session> [window-name] — make sure a worker-tab window of
 # a workbench session exists, with a placeholder pane while no worker runs yet.
-# [window-name] defaults to `workers` (the primary/only tab, unchanged behaviour
-# for every existing caller that omits it). Pass `workers-2`, `workers-3`, ...
-# to ensure an OVERFLOW tab once wb-grid's maxWorkerPanesPerTab capacity is
-# exceeded (2026-08-04) -- same mechanism, same placeholder contract, a
-# different window name.
+# [window-name] defaults to `workers` (the first window, unchanged behaviour for
+# every existing caller that omits it). Pass `workers-2`, `workers-3`, ... for a
+# further one (2026-08-04) -- same mechanism, same placeholder contract, a
+# different window name. Seit dem 03.09.2026 ist das der Normalfall und nicht
+# mehr der Ueberlauf: im Layout 'window' bekommt JEDER Worker sein eigenes
+# Fenster, wb-grid ruft dieses Werkzeug also einmal je Worker (siehe den Kopf
+# von shell/wb-grid fuer den Grund).
 #
 # Why this exists (measured 2026-07-25, isolated socket): the worker tab attaches
 # to the GROUPED session `<sess>-view`, and sessions of a group share their
@@ -31,6 +33,36 @@ set -euo pipefail
 
 S="${1:?usage: wb-workers-window <tmux-session> [window-name]}"
 WNAME="${2:-workers}"
+
+# DER FENSTERNAME IST EIN VERTRAG, KEIN FREITEXT (2026-09-05, gemessener Vorfall).
+# Am 05.09. um 08:39 lief `wb-workers-window wb-companion-299862 --no-attach` --
+# eine Verwechslung mit `wb-worker-tab`, das diese Option kennt. Das Werkzeug hat
+# den Namen damals ungeprueft weitergereicht, und die Folgen trafen NICHT das neue
+# Fenster, sondern den Orchestrator:
+#
+#   1. `grep -qx "$WNAME"` las '--no-attach' als eigene Optionen und endete mit
+#      einem Usage-Fehler statt mit einer Antwort -- die Existenzpruefung sagte
+#      also "Fenster fehlt", ganz gleich, was da war.
+#   2. `new-window -n --no-attach` legte das Fenster an, richtig benannt.
+#   3. `list-panes -t "=$S:--no-attach"` fand es NICHT wieder. Ein Fenstername mit
+#      fuehrendem '-' ist in tmux' Zielsyntax ein VERSATZ zum aktuellen Fenster;
+#      der Rest laesst sich nicht als Zahl lesen, der Versatz wird 0, und 0
+#      Fenster vom aktuellen aus ist das aktuelle -- das Orchestrator-Fenster.
+#      Gemessen auf tmux 3.7c, eigener Socket: `list-panes -t '=probe:--no-attach'`
+#      liefert den Pane des Fensters 'orch'.
+#   4. Damit landeten `@wb_role placeholder`, der Pane-Titel 'noch keine Worker'
+#      und `automatic-rename off` auf dem Claude-Pane des Orchestrators. Die
+#      Werkbank fand danach kein Pane mit der Rolle 'orchestrator' mehr, ihr
+#      Umschalter zeigte ins Leere, und der echte Platzhalter blieb ohne Rolle.
+#
+# Deshalb hier dieselbe Pruefung wie in `wb-worker-tab`: 'workers' oder
+# 'workers-<N>', sonst gar nichts. Jeder echte Aufrufer (wb-grid, wb-doctor,
+# wb-worker-tab, wb-revive, wb-remote-view) haelt sich ohnehin daran.
+case "$WNAME" in
+  workers|workers-[0-9]*) ;;
+  *) echo "wb-workers-window: unerwarteter Fenstername '$WNAME' (erwartet 'workers' oder 'workers-<N>')." >&2
+     exit 2 ;;
+esac
 
 # Mindesthoehe des Worker-Fensters (Betriebsbefund 19.08.2026 abends, der Nutzer,
 # gemessen: alle vier Worker-Panes der Sitzung wb-AI standen auf 184x1). Ursache
@@ -59,8 +91,8 @@ MIN_ZEILEN=12
 # gruppierte '-view'-Schwester braucht KEINEN eigenen Aufruf: sie teilt
 # dasselbe Fenster-Objekt, eine Fenster-Option gilt fuer beide Sitzungen der
 # Gruppe gleichermassen.
-sichere_mindesthoehe() {   # <session> <fenstername>
-  local ziel="=$1:$2"
+sichere_mindesthoehe() {   # <fenster-ziel, am besten eine window_id>
+  local ziel="$1"
   tmux set-option -w -t "$ziel" window-size manual 2>/dev/null || return 0
   local hoehe
   hoehe="$(tmux display -p -t "$ziel" '#{window_height}' 2>/dev/null || true)"
@@ -142,8 +174,19 @@ point_view_at_workers() {
   tmux select-window -t "=$S-view:workers" 2>/dev/null || true
 }
 
-if tmux list-windows -t "=$S" -F '#{window_name}' 2>/dev/null | grep -qx "$WNAME"; then
-  sichere_mindesthoehe "$S" "$WNAME"
+# Ein Fenster wird ab hier ueber seine ID angesprochen, nie ueber '<session>:<name>'
+# (derselbe Vorfall wie oben): eine window_id ist in tmux' Zielsyntax eindeutig und
+# kann weder als Versatz noch als Muster gelesen werden. Der Name wird nur EINMAL
+# nachgeschlagen, und zwar mit einem exakten Vergleich in awk statt mit tmux'
+# Namensaufloesung.
+fenster_id() {   # <fenstername> -> window_id oder leer
+  tmux list-windows -t "=$S" -F '#{window_id}	#{window_name}' 2>/dev/null \
+    | awk -F'\t' -v n="$1" '$2==n{print $1; exit}'
+}
+
+WID="$(fenster_id "$WNAME")"
+if [ -n "$WID" ]; then
+  sichere_mindesthoehe "$WID"
   point_view_at_workers
   exit 0
 fi
@@ -157,14 +200,18 @@ fi
 HINT='\n  Noch kein Worker in dieser Session.\n\n'
 HINT="$HINT"'  Der Orchestrator startet sie mit claude-worker / pi-worker,\n'
 HINT="$HINT"'  sie erscheinen dann hier und dieser Hinweis verschwindet.\n\n'
-tmux new-window -d -t "=$S:" -n "$WNAME" \
-  "printf '$HINT'; while :; do sleep 3600; done"
-
-pane="$(tmux list-panes -t "=$S:$WNAME" -F '#{pane_id}' 2>/dev/null | head -1)"
+#
+# `-P -F '#{pane_id}'` gibt den Pane des NEUEN Fensters direkt zurueck. Ihn
+# hinterher ueber den Namen zu suchen war der zweite Teil des Vorfalls vom 05.09.
+# (siehe Kopf): die Suche kann auf ein anderes Fenster zeigen, und dann bekommt
+# ein fremder Pane die Platzhalter-Rolle.
+pane="$(tmux new-window -d -t "=$S:" -n "$WNAME" -P -F '#{pane_id}' \
+  "printf '$HINT'; while :; do sleep 3600; done" 2>/dev/null || true)"
 [ -n "$pane" ] || exit 0
+WID="$(tmux display -p -t "$pane" '#{window_id}' 2>/dev/null || true)"
 tmux set -p -t "$pane" @wb_role placeholder
 tmux select-pane -t "$pane" -T 'noch keine Worker'
 # global automatic-rename is on; the window must keep the contract name.
-tmux set-option -w -t "=$S:$WNAME" automatic-rename off 2>/dev/null || true
-sichere_mindesthoehe "$S" "$WNAME"
+[ -n "$WID" ] && tmux set-option -w -t "$WID" automatic-rename off 2>/dev/null || true
+[ -n "$WID" ] && sichere_mindesthoehe "$WID" || true
 point_view_at_workers

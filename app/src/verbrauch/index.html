@@ -10,51 +10,49 @@
       content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:"
     />
     <title>Agent Workbench — Usage</title>
+    <!-- DAS TOKEN-SYSTEM, an einer Stelle: main/thema.ts (ROLLEN, rollenCss()),
+         identisch in allen fuenf Fenstern. -->
+    <link rel="stylesheet" href="tokens.css" />
     <style>
-      /* Farben und Schrift der beiden anderen Fenster (app/src/sitzung/index.html), damit drei
-         Fenster desselben Programms wie drei Fenster desselben Programms aussehen. Dazu vier
-         Verbrauchsfarben -- eine je Tokenart --, die in Diagramm, Kachel und Legende
-         DIESELBEN sind: eine Farbe, die im Balken etwas anderes bedeutet als in der Tabelle,
-         waere schlimmer als gar keine. */
+      /* Die Gestalt dieses Fensters: ruhige Zahlen und flache Chips, kein
+         Rahmenwerk. Was zaehlt, steht gross und ungerahmt da; was es
+         einschraenkt, klein und gedaempft daneben. Abschnitte trennt eine
+         Linie von 1 pt, nicht ein Kasten.
+
+         KEIN HEXWERT IN DIESER DATEI. Bis zum 03.09. standen hier acht feste
+         Werte fuer die vier Tokenarten, je Thema vier. Drei davon waren
+         zeichengenau die Rollen `fern`, `laeuft` und `will` aus main/thema.ts
+         -- dieselbe Farbe an zwei Orten, die beim naechsten Farbwechsel
+         auseinandergelaufen waere. Sie zeigen jetzt auf die Rolle. Die vierte,
+         Cache-Lesen, hat keine eigene Rolle und wird aus zweien gemischt;
+         gemessen am 03.09. traegt sie 4,52 (dunkel) und 7,90 (hell) gegen den
+         Fenstergrund und liegt damit ueber der Schwelle von 4,5 aus
+         main/thema.ts. */
       :root {
-        color-scheme: dark;
-        --grund: #101216;
-        --leiste: #171a20;
-        --linie: #262b34;
-        --schrift: #d8dee9;
-        --gedaempft: #8b93a1;
-        --laeuft: #46a758;
-        --will: #e0a020;
-        --aus: #d24c4c;
-        --fern: #6a7fd0;
-        --wahl: #222833;
-        --ein: #6a7fd0;
-        --raus: #46a758;
-        --cw: #e0a020;
-        --cr: #9a7ad4;
+        --ein: var(--fern);
+        --raus: var(--laeuft);
+        --cw: var(--will);
+        --cr: color-mix(in srgb, var(--fern) 55%, var(--aus));
+
+        --rand-stark: color-mix(in srgb, var(--linie) 50%, var(--gedaempft));
+        /* `--leise` ist die Farbe des ABGESCHALTETEN, keine dritte Textstufe
+           fuer Beschriftungen -- sie traegt gegen den Fenstergrund nur 3,30
+           (dunkel) und 2,87 (hell). Dieselbe Regel wie im
+           Einstellungsfenster; dort steht sie ausfuehrlich. */
+        --leise: color-mix(in srgb, var(--gedaempft) 66%, var(--grund));
+        /* Eine Rolle auf Textstaerke: 20 Prozent `--schrift` dazu, damit sie
+           auch auf `--erhoben` -- der Flaeche einer Tabellenzeile unter der
+           Maus -- ueber 4,5 bleibt. Als reine Rolle tragen `--laeuft` und
+           `--will` dort im hellen Thema nur 4,28 und 4,23. */
+        --laeuft-text: color-mix(in srgb, var(--laeuft) 80%, var(--schrift));
+        --will-text: color-mix(in srgb, var(--will) 80%, var(--schrift));
+        --aus-text: color-mix(in srgb, var(--aus) 80%, var(--schrift));
+        --akzent-matt: color-mix(in srgb, var(--akzent) 13%, transparent);
+        --r-klein: 5px;
+        --r-mittel: 7px;
       }
-      /* HELL UND DUNKEL (Farben durchreichen, 11.08.), dieselbe Mechanik wie in
-         den anderen Fenstern: `data-thema` traegt den von main/thema.ts
-         AUFGELOESTEN Wert ('hell'/'dunkel'), gesetzt in verbrauch.ts. Diese
-         Seite hat keine Zustandsfarben (keine Sitzungsmarken), nur das Thema
-         -- Ein/Aus/CW/CR sind eigene, feste Diagrammfarben und je einzeln auf
-         Kontrast zu Weiss gebracht (WCAG 4,5, siehe main/thema.ts). */
-      :root[data-thema='hell'] {
-        color-scheme: light;
-        --grund: #ffffff;
-        --leiste: #f4f5f7;
-        --linie: #d8dbe1;
-        --schrift: #1b1f27;
-        --gedaempft: #5c6472;
-        --laeuft: #22803c;
-        --will: #9a6600;
-        --aus: #b3261e;
-        --fern: #3355c4;
-        --wahl: #e4e8f4;
-        --ein: #3355c4;
-        --raus: #22803c;
-        --cw: #9a6600;
-        --cr: #6b3fa0;
+      * {
+        box-sizing: border-box;
       }
       html,
       body {
@@ -63,64 +61,121 @@
         background: var(--grund);
         color: var(--schrift);
       }
+      /* Systemschrift (HIG Typography), 13 pt -- Monospace bleibt gezielt fuer
+         Modellkennungen und Zahlenspalten mit fester Breite. */
       body {
-        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        font: 13px/1.45 -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui;
+        -webkit-font-smoothing: antialiased;
         display: flex;
         flex-direction: column;
         overflow: hidden;
+      }
+      button {
+        font: inherit;
+        color: inherit;
+        background: none;
+        border: 0;
+        padding: 0;
+        cursor: pointer;
+      }
+      svg {
+        display: block;
       }
 
       /* --- Kopf und Steuerung ------------------------------------------- */
       #kopf {
         flex: 0 0 auto;
-        padding: 14px 22px 8px;
+        padding: 14px 24px 10px;
         border-bottom: 1px solid var(--linie);
         background: var(--leiste);
       }
-      #kopf h1 {
-        font-size: 16px;
-        font-weight: 600;
-        margin: 0 0 2px;
+      #kopf .kopfzeile {
+        display: flex;
+        align-items: flex-start;
+        gap: 18px;
+        flex-wrap: wrap;
       }
-      #kopf .unterzeile,
+      #kopf .kopftext {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      #kopf h1 {
+        font-size: 17px;
+        font-weight: 600;
+        letter-spacing: -0.1px;
+        margin: 0;
+      }
       #kopf .stand {
         color: var(--gedaempft);
-        margin: 0;
+        font-size: 11.5px;
+        margin: 1px 0 0;
+        font-variant-numeric: tabular-nums;
+      }
+      #kopf .unterzeile {
+        color: var(--gedaempft);
+        font-size: 12px;
+        margin: 8px 0 0;
+        max-width: 92ch;
       }
       .reihe {
         display: flex;
         flex-wrap: wrap;
         align-items: center;
-        gap: 8px;
-        margin-top: 8px;
+        gap: 6px;
+        margin-top: 9px;
+      }
+      #zeitraum {
+        margin-top: 0;
+        flex: 0 0 auto;
       }
       .reihe .marke {
         color: var(--gedaempft);
+        font-size: 11px;
         flex: 0 0 auto;
+        margin-right: 2px;
       }
 
+      /* Flache Chips statt umrandeter Knoepfe: die Filterzeile ist Beiwerk,
+         kein Formular. */
       .knopf {
-        font: inherit;
-        background: transparent;
-        color: var(--schrift);
-        border: 1px solid var(--linie);
-        border-radius: 4px;
-        padding: 3px 10px;
-        cursor: pointer;
+        color: var(--gedaempft);
+        background: var(--erhoben);
+        border-radius: 11px;
+        padding: 2px 10px;
         flex: 0 0 auto;
+        font-size: 12px;
       }
       .knopf:hover:not(:disabled) {
-        background: #1e232b;
+        color: var(--schrift);
       }
       .knopf.gewaehlt {
-        border-color: var(--fern);
-        color: var(--fern);
-        background: var(--wahl);
+        background: var(--akzent-matt);
+        color: var(--akzent-text);
       }
       .knopf:disabled {
-        color: #5d6675;
-        border-color: #333a45;
+        color: var(--leise);
         cursor: not-allowed;
+      }
+      /* Der Zeitraum ist eine Wahl unter mehreren -- eine Segmentleiste, wie
+         ein Mac-Nutzer sie kennt, nicht fuenf einzelne Chips. */
+      .segmente {
+        display: inline-flex;
+        gap: 1px;
+        padding: 1px;
+        background: var(--erhoben);
+        border: 1px solid var(--linie);
+        border-radius: var(--r-mittel);
+      }
+      .segmente .knopf {
+        background: none;
+        border-radius: var(--r-klein);
+        padding: 2px 11px;
+      }
+      .segmente .knopf.gewaehlt {
+        background: var(--grund);
+        color: var(--schrift);
+        font-weight: 500;
+        box-shadow: inset 0 0 0 1px var(--linie);
       }
 
       /* --- Inhalt --------------------------------------------------------- */
@@ -128,98 +183,212 @@
         flex: 1 1 auto;
         min-height: 0;
         overflow-y: auto;
-        padding: 4px 22px 24px;
+        padding: 0 24px 28px;
       }
       section {
+        padding-top: 18px;
         margin-top: 18px;
+        border-top: 1px solid var(--linie);
       }
-      section > h2 {
+      section:first-child {
+        border-top: 0;
+        margin-top: 0;
+      }
+      section > h2,
+      .untertitel {
         font-size: 12px;
         font-weight: 600;
-        margin: 0 0 6px;
-        padding-bottom: 3px;
-        border-bottom: 1px solid var(--linie);
+        color: var(--gedaempft);
+        margin: 0 0 10px;
+      }
+      .untertitel {
+        margin-top: 18px;
       }
       .hinweis {
         color: var(--gedaempft);
-        margin: 0 0 8px;
+        font-size: 12px;
+        margin: 0 0 10px;
+        max-width: 96ch;
       }
       /* Ein Satz, der eine Zahl einschraenkt, steht NEBEN der Zahl -- nie als Fussnote am Ende
          der Seite. Wer eine Fussnote lesen soll, hat die Zahl schon geglaubt. */
       .einschraenkung {
-        color: var(--will);
+        color: var(--will-text);
       }
 
-      /* --- Kacheln -------------------------------------------------------- */
-      .kacheln {
+      /* --- Die grossen Zahlen ---------------------------------------------
+         Kein Kasten, kein Rahmen: die Zahl traegt sich selbst, die
+         Beschriftung steht klein darueber, der Farbstrich darunter ist
+         dieselbe Farbe wie im Diagramm und in der Legende. */
+      .zahlenreihe {
         display: flex;
         flex-wrap: wrap;
+        gap: 8px 34px;
+      }
+      .zahlenfeld {
+        min-width: 116px;
+      }
+      .zahlenfeld .titel {
+        color: var(--gedaempft);
+        font-size: 11px;
+      }
+      .zahlenfeld .wert {
+        font-size: 26px;
+        font-weight: 300;
+        letter-spacing: -0.5px;
+        line-height: 1.2;
+        font-variant-numeric: tabular-nums;
+      }
+      .zahlenfeld .neben,
+      .zahlenfeld .einschraenkung {
+        font-size: 11px;
+        color: var(--gedaempft);
+        max-width: 34ch;
+      }
+      .zahlenfeld .einschraenkung {
+        color: var(--will-text);
+      }
+      .zahlenfeld .strich {
+        height: 2px;
+        width: 32px;
+        border-radius: 1px;
+        margin: 5px 0 4px;
+        background: var(--gedaempft);
+      }
+      .zahlenfeld.ein .strich { background: var(--ein); }
+      .zahlenfeld.raus .strich { background: var(--raus); }
+      .zahlenfeld.cw .strich { background: var(--cw); }
+      .zahlenfeld.cr .strich { background: var(--cr); }
+      .zahlenfeld.summe .strich { background: var(--schrift); }
+
+      /* --- Kontingentbalken -------------------------------------------------
+         Ein Balken je Kontingent: links die Zahl, rechts die Einordnung, und
+         auf dem Balken die Marke, bis wohin es heute reichen darf. */
+      .balkenliste {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      .balkenzeile .oben {
+        display: flex;
+        align-items: baseline;
         gap: 10px;
+        flex-wrap: wrap;
       }
-      .kachel {
-        flex: 1 1 150px;
-        min-width: 140px;
-        border: 1px solid var(--linie);
-        border-left-width: 3px;
-        border-radius: 4px;
-        padding: 7px 10px 8px;
-        background: var(--leiste);
+      .balkenzeile .name {
+        font-size: 11px;
+        color: var(--gedaempft);
+        flex: 1 1 auto;
       }
-      .kachel .titel {
+      .balkenzeile .rechts {
+        font-size: 11px;
+        color: var(--gedaempft);
+        flex: 0 0 auto;
+        font-variant-numeric: tabular-nums;
+      }
+      .balkenzeile .wert {
+        font-size: 22px;
+        font-weight: 300;
+        letter-spacing: -0.4px;
+        line-height: 1.25;
+        font-variant-numeric: tabular-nums;
+      }
+      .balkenzeile .bahn {
+        position: relative;
+        height: 6px;
+        border-radius: 3px;
+        background: var(--erhoben);
+        margin: 6px 0 5px;
+        overflow: hidden;
+      }
+      .balkenzeile .fuellung {
+        position: absolute;
+        inset: 0 auto 0 0;
+        border-radius: 3px;
+        background: var(--akzent);
+      }
+      .balkenzeile[data-lage='knapp'] .fuellung { background: var(--will); }
+      .balkenzeile[data-lage='voll'] .fuellung { background: var(--aus); }
+      /* Die Marke steht AUF der Bahn und ist keine Fuellung: sie sagt, wieviel
+         bis heute Abend verbraucht sein darf, nicht wieviel verbraucht ist. */
+      .balkenzeile .marke {
+        position: absolute;
+        top: -2px;
+        bottom: -2px;
+        width: 2px;
+        border-radius: 1px;
+        background: var(--schrift);
+      }
+      .balkenzeile .fuss {
+        font-size: 11px;
         color: var(--gedaempft);
       }
-      .kachel .wert {
-        font-size: 17px;
-        margin-top: 1px;
+      .balkenzeile .fuss b {
+        color: var(--schrift);
+        font-weight: 500;
+        font-variant-numeric: tabular-nums;
       }
-      .kachel .neben {
+      .balkenzeile[data-lage='knapp'] .fuss b,
+      .balkenzeile[data-lage='voll'] .fuss b {
+        color: var(--will-text);
+      }
+      /* Was kein Kontingent hat, verschwindet nicht: eine ruhige Zeile mit dem
+         Grund. Sonst bliebe offen, ob nichts gemessen wurde oder nichts zu
+         messen ist. */
+      .ohnekontingent {
+        display: flex;
+        gap: 10px;
+        padding: 4px 0;
+        border-top: 1px solid var(--linie);
+        font-size: 12px;
         color: var(--gedaempft);
       }
-      .kachel.ein { border-left-color: var(--ein); }
-      .kachel.raus { border-left-color: var(--raus); }
-      .kachel.cw { border-left-color: var(--cw); }
-      .kachel.cr { border-left-color: var(--cr); }
-      .kachel.summe { border-left-color: var(--schrift); }
+      .ohnekontingent:first-child {
+        border-top: 0;
+      }
+      .ohnekontingent .wer {
+        color: var(--schrift);
+        flex: 0 0 8ch;
+      }
 
       /* --- Diagramme ------------------------------------------------------ */
       .diagramme {
         display: flex;
         flex-wrap: wrap;
-        gap: 14px;
+        gap: 22px;
       }
       .diagramm {
         flex: 1 1 380px;
         min-width: 300px;
-        border: 1px solid var(--linie);
-        border-radius: 4px;
-        padding: 8px 10px 6px;
-        background: var(--leiste);
       }
       .diagramm .kopfzeile {
         display: flex;
         justify-content: space-between;
         gap: 10px;
         color: var(--gedaempft);
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        margin-bottom: 4px;
       }
       .diagramm svg {
-        display: block;
         width: 100%;
         height: auto;
       }
       .legende {
         display: flex;
         flex-wrap: wrap;
-        gap: 10px;
+        gap: 12px;
         color: var(--gedaempft);
-        margin-top: 4px;
+        font-size: 11px;
+        margin-top: 5px;
       }
       .legende .punkt {
         display: inline-block;
         width: 8px;
-        height: 8px;
+        height: 3px;
         border-radius: 2px;
-        margin-right: 4px;
-        vertical-align: baseline;
+        margin-right: 5px;
+        vertical-align: middle;
       }
 
       /* --- Tabellen ------------------------------------------------------- */
@@ -230,75 +399,101 @@
       th,
       td {
         text-align: left;
-        padding: 3px 8px 3px 0;
+        padding: 4px 10px 4px 0;
         border-bottom: 1px solid var(--linie);
         vertical-align: top;
       }
       th {
         color: var(--gedaempft);
         font-weight: 400;
+        font-size: 11px;
         white-space: nowrap;
       }
       td.zahl,
       th.zahl {
         text-align: right;
         white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
+      tbody tr:hover td {
+        background: var(--erhoben);
       }
       tr:last-child td {
         border-bottom: 0;
       }
       .fein {
         color: var(--gedaempft);
+        font-size: 11.5px;
       }
+      /* Die Marke sagt, WIE eine Zahl zustande kam. Sie traegt ihre Farbe als
+         Schrift, nicht als Flaeche: eine getoente Flaeche in derselben Farbe
+         wie ihr Text nimmt genau den Kontrast weg, den die Marke braucht
+         (gemessen 4,17 und Naeherung 4,14 im hellen Thema, 03.09.). */
       .marke-art {
-        border: 1px solid var(--linie);
-        border-radius: 3px;
-        padding: 0 5px;
+        display: inline-block;
         white-space: nowrap;
+        font-size: 11px;
         color: var(--gedaempft);
       }
       .marke-art.gemessen {
-        border-color: var(--laeuft);
-        color: var(--laeuft);
+        color: var(--laeuft-text);
       }
       .marke-art.naeherung {
-        border-color: var(--will);
-        color: var(--will);
+        color: var(--will-text);
       }
       .marke-art.fehlt {
-        border-color: var(--aus);
-        color: var(--aus);
+        color: var(--aus-text);
       }
-      .mehr { color: var(--will); }
-      .weniger { color: var(--laeuft); }
+      .mehr { color: var(--will-text); }
+      .weniger { color: var(--laeuft-text); }
       .gleich { color: var(--gedaempft); }
 
       #fehler {
         border: 1px solid var(--aus);
-        border-radius: 4px;
-        padding: 10px 12px;
-        margin-top: 14px;
-        color: var(--aus);
+        border-radius: var(--r-mittel);
+        padding: 12px 14px;
+        margin-top: 18px;
+        color: var(--aus-text);
         white-space: pre-wrap;
         word-break: break-all;
+        background: var(--vorsichtgrund);
       }
       #statuszeile {
         flex: 0 0 auto;
         border-top: 1px solid var(--linie);
         background: var(--leiste);
-        padding: 5px 14px;
+        padding: 5px 16px;
         color: var(--gedaempft);
-        min-height: 17px;
+        font-size: 11.5px;
+        min-height: 24px;
         white-space: pre-wrap;
+      }
+
+      ::-webkit-scrollbar {
+        width: 9px;
+        height: 9px;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: var(--rand-stark);
+        border-radius: 5px;
+        border: 2px solid transparent;
+        background-clip: content-box;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
       }
     </style>
   </head>
   <body>
     <header id="kopf">
-      <h1 id="titel"></h1>
+      <div class="kopfzeile">
+        <div class="kopftext">
+          <h1 id="titel"></h1>
+          <p class="stand" id="stand"></p>
+        </div>
+        <div class="reihe" id="zeitraum"></div>
+      </div>
       <p class="unterzeile" id="unterzeile"></p>
-      <p class="stand" id="stand"></p>
-      <div class="reihe" id="zeitraum"></div>
       <div class="reihe" id="filter-harness"></div>
       <div class="reihe" id="filter-modell"></div>
     </header>

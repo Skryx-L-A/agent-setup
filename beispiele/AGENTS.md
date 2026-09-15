@@ -1,21 +1,20 @@
 # Beispielprojekt — Anweisungen fuer Agenten
 
-Diese Datei sagt dasselbe wie `projekt-CLAUDE.md` daneben, nur unter dem Namen, den Codex, aider,
-opencode und die uebrigen Harnesses beim Start lesen. Wer beide Namen bedient, kommt an einer
-Kopie nicht vorbei — jedes dieser Programme liest genau eine Datei und keine zweite.
+Nutze diese Datei nur für einen Harness, der `AGENTS.md` tatsächlich liest. Braucht ein anderer
+Harness einen anderen Projektnamen, verweist oder generiert dessen Konfiguration nach eigener
+Dokumentation. Keine Kopie wird allein wegen eines vermuteten Harness-Verhaltens angelegt.
 
-Die GLOBALEN Anweisungen musst Du dafuer nicht abschreiben: `wb-instructions sync` legt aus
-`~/.claude/CLAUDE.md`, den beiden Rollendateien und dem Verzeichnis der Skills je Harness eine
-Datei unter dem Namen an, den dieser Harness erwartet. Ein zweiter Lauf ist wirkungslos, solange
-sich nichts geaendert hat, und eine von Hand bearbeitete Zieldatei wird gemeldet statt
-ueberschrieben. Nur die PROJEKT-Regeln — die hier — schreibst Du selbst.
+Globale Regeln und Rollen stammen aus `~/.claude/`. Anbieter-Skills laufen über
+`~/.claude/skill-adapters/index.md`; native Skills nur aus einem vorhandenen
+`~/.agents/skills/` oder `~/.agent-skills/`, sonst aus `~/.agent-instructions/skills.md`.
+Hier stehen nur Projektregeln.
 
 ## Was das hier ist
 
 Ein HTTP-Dienst, der Messreihen entgegennimmt und sie nach SQLite schreibt. Python 3.12, FastAPI,
 kein ORM. Ein einziger Prozess, kein Cluster.
 
-## Bauen und pruefen
+## Bauen und pruefen, wenn der Anlass es verlangt
 
 ```bash
 uv sync
@@ -24,7 +23,9 @@ uv run ruff check .
 uv run uvicorn app:api --reload
 ```
 
-Ein Commit ohne gruenen `pytest`-Lauf geht nicht raus.
+Die Befehle zeigen die passende Projektprüfung. `~/.claude/regeln/verifikation.md` entscheidet,
+wann sie nötig ist; ein gültiger bestehender Nachweis zählt weiter, solange Code und relevante
+Bedingungen unverändert sind.
 
 ## Regeln, die nur hier gelten
 

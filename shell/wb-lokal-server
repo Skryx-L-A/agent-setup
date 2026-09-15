@@ -64,7 +64,7 @@
 
 set -uo pipefail
 
-SETTINGS="${WB_SETTINGS_FILE:-$HOME/.claude/workbench/settings.json}"
+SETTINGS="${AWB_SETTINGS_FILE:-${WB_SETTINGS_FILE:-$HOME/.claude/workbench/settings.json}}"
 REGISTRY="$HOME/.local/state/wb-belegung/entwurfsmodelle.json"
 MLX_PORT="${WB_MLX_SERVER_PORT:-8081}"
 LLAMA_PORT="${WB_LLAMA_SERVER_PORT:-8082}"

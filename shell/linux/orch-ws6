@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Orchestrator-Test-Umgebung auf einem virtuellen Headless-Output ("orch-ws6").
+# Startet Apps und macht Screenshots komplett isoliert von den echten Monitoren:
+# kein Fokus-Wechsel, kein Anfassen des sichtbaren Bildschirms. Der Headless-Output
+# wird bei Bedarf erzeugt und mit 'cleanup' wieder entfernt (Prozess-Hygiene).
+# Laeuft ueber SSH: stellt die Hyprland-Session-Umgebung selbst her.
+set -uo pipefail
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export WAYLAND_DISPLAY="$(basename "$(ls "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\.lock$' | head -1)")"
+export HYPRLAND_INSTANCE_SIGNATURE="$(ls -1 "$XDG_RUNTIME_DIR"/hypr/ 2>/dev/null | head -1)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+HL="HEADLESS-orch"
+
+ensure() { hyprctl monitors -j 2>/dev/null | grep -q "\"$HL\"" || { hyprctl output create headless "$HL" >/dev/null 2>&1; sleep 1; }; }
+hl_id() { hyprctl monitors -j 2>/dev/null | python3 -c "import sys,json;print(next((m['id'] for m in json.load(sys.stdin) if m['name']=='$HL'),-1))"; }
+
+case "${1:-}" in
+  run)   shift; [ -z "$*" ] && { echo "orch-ws6 run <cmd>"; exit 1; }
+         ensure
+         hyprctl dispatch "hl.dsp.exec_cmd(\"[monitor $HL] $*\")" 2>&1 | head -1 ;;
+  shot)  ensure; sleep 0.3
+         out="${2:-/tmp/orch-ws6-shot.png}"
+         grim -o "$HL" "$out" 2>&1 && echo "$out" ;;
+  clear) mid="$(hl_id)"
+         for a in $(hyprctl clients -j 2>/dev/null | python3 -c "import sys,json;[print(c['address']) for c in json.load(sys.stdin) if c.get('monitor')==$mid]" 2>/dev/null); do
+           hyprctl dispatch "hl.dsp.window.close({ address = \"$a\" })" >/dev/null 2>&1; done
+         echo "Fenster auf $HL geschlossen" ;;
+  status) mid="$(hl_id)"
+         echo "headless: $([ "$mid" != "-1" ] && echo "da (id $mid)" || echo nein)"
+         [ "$mid" != "-1" ] && hyprctl clients -j 2>/dev/null | python3 -c "import sys,json;print('Fenster:', [c.get('class') for c in json.load(sys.stdin) if c.get('monitor')==$mid])" 2>/dev/null ;;
+  cleanup) mid="$(hl_id)"
+         for a in $(hyprctl clients -j 2>/dev/null | python3 -c "import sys,json;[print(c['address']) for c in json.load(sys.stdin) if c.get('monitor')==$mid]" 2>/dev/null); do
+           hyprctl dispatch "hl.dsp.window.close({ address = \"$a\" })" >/dev/null 2>&1; done
+         sleep 0.3; hyprctl output remove "$HL" >/dev/null 2>&1; echo "headless entfernt, Fenster geschlossen" ;;
+  *) echo "orch-ws6 run <cmd> | shot [datei] | clear | status | cleanup" ;;
+esac

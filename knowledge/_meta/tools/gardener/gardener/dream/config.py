@@ -558,6 +558,16 @@ APPLY_FORBIDDEN_FILES = ("review-queue.md", "HOT.md", "INDEX.md",
                          "CRITICAL-FACTS.md", "OPEN-QUESTIONS.md", "LOG.md")
 ISSUES_FILE = DREAM_AUDIT_DIR + "/issues.json"     # vault-relative, versioned
 REVIEW_QUEUE_FILE = "review-queue.md"              # vault root, shared
+# Full proposal text (before/after/claims) of every hunk that just became a
+# human-facing issue (escalated or refused-by-code) - inside the run's own
+# audit dir, next to judgments.json/applied.json, so it is versioned like
+# them and NOT machine-local like changeset.json. Ohne diese Datei bleibt eine
+# Eskalation nach dem Lauf unentscheidbar: `review-queue.md` nennt Kennung und
+# Begruendung, aber nie den Vorschlag selbst, und der Wortlaut stand bis
+# 02.09.2026 nur in `changeset.json` - vorsaetzlich gitignored, also weg,
+# sobald der lokale Lauf-Ordner geleert wird (gemessen: beide Ordner der
+# Laeufe vom 16.08.2026 hatten am 02.09.2026 kein changeset.json mehr).
+ESCALATION_DETAIL_FILE = "escalations.json"        # inside the audit dir
 
 # -- Reconcile (M4: reconcile.py) -------------------------------------------
 # Machine-local, like the ledger and the claim store: embedding cache plus the

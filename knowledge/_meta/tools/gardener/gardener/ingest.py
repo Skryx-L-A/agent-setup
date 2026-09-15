@@ -35,6 +35,10 @@ class IngestResult:
     enriched: list[str] = field(default_factory=list)
     queued: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    # Dry run only: what a real run would additionally send to a model here.
+    # Kept apart from `queued`/`skipped` because those two are statements
+    # about an attempt that happened - this one is about one that did not.
+    would_describe: list[str] = field(default_factory=list)
 
 
 def known_branches(vault: Path) -> list[str]:
@@ -172,7 +176,13 @@ def drop_files(vault: Path) -> list[Path]:
 
 
 def ingest_drop(vault: Path, writer: VaultWriter, client,
-                queue: ReviewQueue, today: dt.date | None = None) -> IngestResult:
+                queue: ReviewQueue, today: dt.date | None = None,
+                dry_run: bool = False) -> IngestResult:
+    """`dry_run=True` calls no model: a dropped file that would need one is
+    filed and stubbed as usual (the writer only plans, it writes nothing), but
+    with an empty description, and counted in `would_describe`. Everything
+    local - the branch guess, the PDF text extract behind it - still runs, so
+    the dry run keeps saying WHERE each file would land."""
     today = today or dt.date.today()
     result = IngestResult()
     taken: set[Path] = set()
@@ -186,10 +196,22 @@ def ingest_drop(vault: Path, writer: VaultWriter, client,
             result.ingested.append((src.name, dst.relative_to(vault).as_posix()))
             continue
 
-        description, kind = extract.describe_file(client, src)
+        deferred = dry_run and extract.needs_model(src)
+        if deferred:
+            result.would_describe.append(src.name)
+            description, kind = "", ""
+        else:
+            description, kind = extract.describe_file(client, src)
         text_hint = description
         if src.suffix.lower() == ".pdf" and not description:
             text_hint = extract.pdf_text(src, max_chars=2000)
+        elif deferred and src.suffix.lower() in extract.TEXTISH_SUFFIXES:
+            # Der Zweig-Rat haengt sonst am Modell: ohne Beschreibung bliebe
+            # als Anhalt nur der Dateiname, und der Trockenlauf meldete ein
+            # anderes Ziel als der echte Lauf spaeter nimmt. Der Rohtext ist
+            # lokal zu haben und genau der Text, den auch die Zusammenfassung
+            # gelesen haette.
+            text_hint = extract.read_text_snippet(src, max_chars=2000)
         branch, confident = guess_branch(vault, src.name, text_hint)
 
         asset_dst = free_path(vault / branch / config.ASSET_DIR / src.name, taken)
@@ -212,7 +234,11 @@ def ingest_drop(vault: Path, writer: VaultWriter, client,
                       key=f"Drop-Ingest: Zielbranch unklar fuer `{src.name}`",
                       today=today)
             result.queued.append(src.name)
-        if not description:
+        # `deferred` files are deliberately NOT queued: "lokal nicht
+        # extrahierbar" would be a claim about an extraction attempt that a
+        # dry run never made, and it would seed the review queue of the next
+        # real run with entries that are simply false.
+        if not description and not deferred:
             queue.add(f"Asset ohne Beschreibung: [[{src.stem}]] ({kind}) - "
                       "lokal nicht extrahierbar, bitte Stub von Hand fuellen",
                       key=f"Asset ohne Beschreibung: [[{src.stem}]]", today=today)
@@ -222,8 +248,13 @@ def ingest_drop(vault: Path, writer: VaultWriter, client,
 
 def enrich_stubs(vault: Path, notes: list[Note], writer: VaultWriter, client,
                  queue: ReviewQueue, result: IngestResult | None = None,
-                 today: dt.date | None = None) -> IngestResult:
-    """Fill in descriptions for existing asset stubs that still lack one."""
+                 today: dt.date | None = None,
+                 dry_run: bool = False) -> IngestResult:
+    """Fill in descriptions for existing asset stubs that still lack one.
+
+    `dry_run=True` calls no model: a stub whose description would need one is
+    counted in `would_describe` and left alone. There is nothing to plan here
+    - without a description there is no new text to write."""
     today = today or dt.date.today()
     result = result or IngestResult()
     for n in notes:
@@ -232,6 +263,9 @@ def enrich_stubs(vault: Path, notes: list[Note], writer: VaultWriter, client,
         target = asset_file(vault, n)
         if target is None or not target.exists():
             result.skipped.append(n.rel)
+            continue
+        if dry_run and extract.needs_model(target):
+            result.would_describe.append(n.rel)
             continue
         description, kind = extract.describe_file(client, target)
         if not description:
@@ -254,6 +288,8 @@ def enrich_stubs(vault: Path, notes: list[Note], writer: VaultWriter, client,
 
 
 def run_ingest(vault: Path, notes: list[Note], writer: VaultWriter, client,
-               queue: ReviewQueue, today: dt.date | None = None) -> IngestResult:
-    result = ingest_drop(vault, writer, client, queue, today)
-    return enrich_stubs(vault, notes, writer, client, queue, result, today)
+               queue: ReviewQueue, today: dt.date | None = None,
+               dry_run: bool = False) -> IngestResult:
+    result = ingest_drop(vault, writer, client, queue, today, dry_run=dry_run)
+    return enrich_stubs(vault, notes, writer, client, queue, result, today,
+                        dry_run=dry_run)

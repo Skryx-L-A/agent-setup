@@ -58,7 +58,28 @@ EMBED_CHUNK_OVERLAP = 200     # so a fact on a chunk border is not cut in half
 EMBED_MAX_CHUNKS = 8          # 8 x 4000 = 32k chars; beyond that a note is a book
 EMBED_VERSION = 2             # bump to invalidate cached (truncated) vectors
 EMBED_MODEL = "embeddinggemma:latest"
-JUDGE_MODEL = "ornith:9b"
+# Das kleine Modell: fuer Aufgaben, die eine Zusammenfassung von bereits
+# extrahiertem Text liefern statt ein Urteil ueber Struktur oder Wahrheit des
+# Vaults (Sidecar-Dateibeschreibung, Ingest-Asset-Beschreibung - siehe
+# sidecar.describe/extract.summarize). Alles, dessen Fehlurteil Unsinn in den
+# Vault schreibt oder eine Struktur behauptet, die nicht da ist (linking,
+# contradict, consolidate, HOT.md-Zusammenfassung, Transkript-Mining,
+# Themensynthese), laeuft seit dem Auftrag "modellwege" (02.09.2026)
+# stattdessen ueber `grug_client.GrugJudgeClient` (Qwen3.8-27B via MLX) -
+# Ollama kennt Qwen3.8 gar nicht (`{"error": "invalid model name"}` auf Port
+# 11434, geprueft 02.09.2026), sodass ein Umstieg dieser Stellen auf ein
+# schlaueres Modell zwangslaeufig vom Ollama-Client weggefuehrt haette.
+#
+# BEWUSSTE FESTLEGUNG, kein vergessener Platzhalter (Auftrag "startklar",
+# 03.09.2026, Entscheidung des Nutzers): ornith:9b bleibt der Wert. Welches der
+# heute installierten kleinen Modelle (ornith:9b 5,6 GB, qwen3-vl:8b 6,1 GB,
+# huihui_ai/qwen3-abliterated:4b 2,5 GB, qwen3:1.7b 1,4 GB) hier gewinnt, war
+# am 02.09.2026 noch eine offene, PARALLEL laufende Recherche - die entfaellt
+# jetzt, der Wert ist final. Gebraucht wird das kleine Modell nur noch fuer
+# Sidecar-Dateibeschreibungen und Ingest-Asset-Zusammenfassungen (siehe
+# Kommentar oben) - jede Urteils-/Schreib-Stelle ist seit "modellwege"
+# (02.09.2026) laengst auf `smart` (Qwen3.8-27B via MLX) umgezogen.
+SMALL_MODEL = "ornith:9b"
 VISION_MODEL = "qwen3-vl:8b"   # local image description; skipped when not pulled
 MAX_VISION_BYTES = 12 * 1024**2  # bigger images are left to a human
 
@@ -185,8 +206,21 @@ PERSON_BY_GIT_AUTHOR = _load_person_by_git_author()
 # Share of a branch's notes one person must have created to count as its owner.
 OWNER_MIN_SHARE = 2 / 3
 
-# Contradiction detection (`brain contradict`). Reuses JUDGE_MODEL, the 48-GB
-# rule and the gardener.db embedding cache - see gardener/contradict.py.
+# Contradiction detection (`brain contradict`). Reuses the 48-GB rule and the
+# gardener.db embedding cache - see gardener/contradict.py.
+#
+# MODELLWEGE (02.09.2026): contradict.judge_pair's task - deciding whether
+# two notes really contradict each other, from a 9B model that "happily
+# invents a plausible-sounding quote" (see contradict.py's module docstring)
+# - belongs in the SMART class, same reasoning as linking/consolidate.
+#
+# UMGESTELLT (Auftrag "startklar", 03.09.2026): der Client fuer `brain
+# contradict` wird in `_meta/tools/braincli/braincli/cli.py`s `cmd_contradict`
+# konstruiert - dort heisst er `smart` (`grug_client.GrugJudgeClient`,
+# Qwen3.8-27B via MLX), `client` (Ollama) bleibt dort nur fuer Embeddings und
+# die 48-GB-Vorpruefung. `cmd_contradict` provisioniert den MLX-Server dafuer
+# selbst (`gardener.mlx_server.ensure`/`.release`, dieselbe
+# Eigentuemerschafts-Buchfuehrung wie `gardener/cli.py`s fuenf schlaue Phasen).
 CONTRADICT_TOP_K = 5             # semantic neighbors checked per note, not O(n^2)
 CONTRADICT_MIN_CONFIDENCE = 0.75  # a missed contradiction is cheaper than a false alarm
 # Vault-relative. Distinct from the tool-local, gitignored `_meta/tools/*/state/`
@@ -196,7 +230,9 @@ CONTRADICTIONS_FILE = "_meta/state/contradictions.json"
 CONTRADICT_REVIEW_QUEUE = "review-queue.md"   # Wurzel, siehe queue.py
 # Sammelstelle fuer `brain contradict --queue-add` (Session-Ende haengt hier nur noch
 # Pfade an, Millisekunden statt ~100s/Notiz). Abgearbeitet durch `brain contradict
-# --queue --write`, aufgerufen von brain-maintain (Mo/Mi launchd) oder von Hand.
+# --queue --write`, von Hand angestossen (seit 2026-08-22 laeuft auf dem Mac kein
+# zeitgesteuerter LaunchAgent mehr, auch der Gaertner selbst nur noch manuell -
+# siehe gardener/cli.py).
 CONTRADICT_QUEUE_FILE = "_meta/state/contradiction-queue.txt"
 
 # Topic synthesis (Brain 4.x, `brain gardener run --phase synth`). Unlike

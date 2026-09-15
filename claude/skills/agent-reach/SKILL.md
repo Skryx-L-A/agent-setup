@@ -1,27 +1,6 @@
 ---
 name: agent-reach
-description: >
-  Fetches content from platforms that normal web fetching cannot reach, and reads
-  a page as full text instead of a search snippet. Use it when the task needs
-  content from a specific platform — Twitter/X, Reddit, YouTube (subtitles and
-  transcripts), GitHub code search, LinkedIn/jobs, Instagram, Facebook, RSS/Atom
-  feeds, V2EX, Bilibili — or when a URL
-  has to be read in full, or when a research task explicitly asks for a sweep
-  across several of these platforms.
-
-  Do NOT reach for it on an ordinary question: a quick factual lookup, current
-  documentation, a news check or anything the built-in WebSearch and WebFetch
-  already answer stays with those tools. This skill is the specialist for
-  platform-gated and login-gated content, not the default front door to the
-  internet.
-
-  Also skip it for write operations (posting, commenting, liking), for content
-  work on material already collected (writing, analysis, translation), and for
-  platforms that have a dedicated skill installed — that skill wins.
-
-  Twelve platforms, multi-backend routing (OpenCLI / per-platform CLIs / APIs).
-  Six channels work without configuration. `agent-reach doctor --json` shows
-  which backend currently serves which platform.
+description: "Read platform-specific or login-gated web content using available Agent Reach backends. Use for social platforms, video transcripts or a multi-platform sweep; ordinary web lookup and posting are outside this skill."
 metadata:
   homepage: https://github.com/Panniantong/Agent-Reach
 ---
@@ -33,8 +12,8 @@ platforms, route it through this skill — do not invent your own approach.**
 
 ## Standing rules (apply for the whole session)
 
-1. **Health-check before acting**: for multi-backend/login-backed platforms (Reddit /
-   Bilibili / Twitter / Facebook / Instagram), run `agent-reach doctor --json` first.
+1. **Backend when unknown or failing**: for multi-backend/login-backed platforms (Reddit /
+   Bilibili / Twitter / Facebook / Instagram), use an existing relevant backend result; run `agent-reach doctor --json` only when availability is unknown or a request fails.
    Use a populated `active_backend`; `active_backend: null` means Doctor deliberately skipped a
    live probe to avoid browser-cookie reads or remote writes, not that no backend exists. Only when
    the user's task requires that platform, run the reference's read-only command to verify it.
@@ -156,48 +135,6 @@ https://raw.githubusercontent.com/Panniantong/agent-reach/main/docs/install.md
 It is reference material and gets read, judged and applied step by step — its
 `--system` variants and any credential step need the user's approval first.
 
-## House notes (not upstream)
+## Installation und Aktualisierung
 
-- Installed 2026-08-13 from a reviewed clone of `Panniantong/Agent-Reach` at
-  commit `93ae1d1`, via `uv tool install`. CLI lives in the `uv` tool
-  environment; `agent-reach` is on PATH. The reviewed clone stays at
-  `~/.agent-reach/src/agent-reach`, branch `house`, so an update is a merge
-  against this fassung instead of an overwrite.
-- This SKILL.md and the references are the local English fassung. **`agent-reach
-  skill --install` overwrites both**, so the fassung is kept outside the skill
-  directory and restored automatically:
-  - `~/.agent-reach/house-skin/` holds the authoritative copy plus checksums.
-  - `agent-reach-skin apply|verify|capture` writes it back into all three places
-    a copy lives: the skill directory, the installed package inside the uv tool
-    environment, and the local clone.
-  - A `PostToolUse`/Bash hook (`~/.claude/hooks/posttooluse-agent-reach-skin.sh`)
-    runs `apply` after any command mentioning `agent-reach` or `skills add`.
-    Verified by overwriting SKILL.md with the Chinese original — it came back.
-  - After editing this file on purpose, run `agent-reach-skin capture`, otherwise
-    the hook restores the older fassung.
-  - The Chinese originals are kept in
-    `~/.local/trash-snapshots/2026-08-13-agent-reach-references-zh/`.
-
-### Channel status on this machine (measured 2026-08-13, not guessed)
-
-Working, each confirmed with a real query rather than a doctor verdict:
-
-| Channel | Path |
-|---|---|
-| Web full text | Jina Reader over `curl` |
-| Web search | Exa via `mcporter` (`mcporter call exa.web_search_exa`) |
-| GitHub | `gh search` |
-| YouTube | `yt-dlp` subtitles |
-| V2EX, RSS | public APIs |
-| Bilibili | `bili-cli` |
-| Reddit, Facebook, Twitter/X, Instagram | OpenCLI browser bridge |
-| LinkedIn | `mcporter call linkedin.*`, profile in `~/.linkedin-mcp/profile` |
-
-- The OpenCLI bridge is the Chrome extension on this Mac talking to a local
-  daemon; it uses the sessions already logged in there. Instagram runs on the
-  project account `<projekt-konto>`, not
-  on a private one.
-- **`agent-reach doctor` undercounts** — it reported 5/15 while eight channels
-  answered real queries. It deliberately skips live probes for login-backed
-  platforms, so its verdict is a floor, not the truth. Run the platform's own
-  read command before believing a channel is missing.
+Bei Änderungen am Skill `agent-reach-skin capture` ausführen, damit der Wiederherstellungshook die neue Fassung behält. Herkunft, frühere Backend-Proben und Installationswege: [house-history.md](references/house-history.md), nur bei Wartung laden.

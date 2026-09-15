@@ -36,7 +36,7 @@ class OllamaClient:
 
     def __init__(self, base_url: str = config.OLLAMA_URL,
                  embed_model: str = config.EMBED_MODEL,
-                 judge_model: str = config.JUDGE_MODEL,
+                 judge_model: str = config.SMALL_MODEL,
                  timeout: int = config.OLLAMA_TIMEOUT):
         self.base_url = base_url.rstrip("/")
         self.embed_model = embed_model

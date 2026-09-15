@@ -83,7 +83,17 @@ def main() -> int:
         resume_idx = int(args[i + 1])
         del args[i : i + 2]
     only_live = "--live" in args
-    args = [a for a in args if not a.startswith("--")]
+    args = [a for a in args if a != "--live"]
+    # Anlass (2026-08-22, dieselbe Bugfamilie wie wb-budget): 'not a.startswith("--")'
+    # entfernte JEDES '--'-Token stillschweigend, ob bekannt oder nicht -- 'wb-sessions
+    # --Live' (Grossschreibung vertippt) traf 'only_live' nicht, wurde aber trotzdem
+    # herausgefiltert, und das Werkzeug zeigte kommentarlos die ungefilterte Liste
+    # statt eines Fehlers.
+    unbekannt = [a for a in args if a.startswith("--")]
+    if unbekannt:
+        print(f"wb-sessions: unbekannte Option {unbekannt[0]!r} -- bekannt: --resume <n> | --live.",
+              file=sys.stderr)
+        return 1
     needle = args[0].lower() if args else None
 
     rows = []

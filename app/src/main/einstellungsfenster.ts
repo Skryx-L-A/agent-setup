@@ -46,7 +46,6 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  allowedEfforts,
   effectiveHarnesses,
   effectiveModels,
   findHarness,
@@ -57,7 +56,7 @@ import {
   type RegistryModel,
   type RegistryVorhersage,
 } from '../../../extension/src/models.ts';
-import { type Effort } from '../../../extension/src/settings.ts';
+import { EFFORTS, type Effort } from '../../../extension/src/settings.ts';
 import { claudeSettingsFile, parseHooks } from '../../../extension/src/hooksInfo.ts';
 import {
   alleEinstellungen,
@@ -67,6 +66,7 @@ import {
   chatAnsicht,
   chatAnsichtVorgabe,
   maschinenliste,
+  maschinenPausiert,
   MELDE_EREIGNISSE,
   MELDE_WEGE,
   meldungen,
@@ -78,9 +78,10 @@ import {
   type AskMuster,
   type MeldeEinstellung,
 } from './einstellungen';
-import type { ChatVorgabe } from '../chat/ansichtsregel';
+import { harnessErlaubt, type ChatVorgabe } from '../chat/ansichtsregel';
 import { protokollListe } from './protokolle';
 import { chatQuellen, type ChatQuelle } from './chatschalter';
+import { umlaute } from '../gemeinsam/umlaute';
 import type { UiState } from './uistate';
 
 export { chatQuellen, type ChatQuelle };
@@ -93,6 +94,8 @@ export interface HarnessSicht {
   modelle: number;
   /** V11: Hat sein Binary auf DIESER Maschine? */
   binaer: boolean;
+  /** Modell, das beim bewussten Wechsel auf diesen Harness vorausgewaehlt wird. */
+  orchestratorDefaultModel?: string;
 }
 
 /**
@@ -169,6 +172,8 @@ export interface EinstellungsDaten {
   workerModelle: ModellSicht[];
   /** Die Fernmaschinen (V10). Ihr Name IST der SSH-Alias. */
   maschinen: string[];
+  /** Welche davon pausiert sind (04.09.) -- eingetragen, aber ohne Abruf. */
+  maschinenPausiert: string[];
   /** Die Muster der Rueckfrage-Stufe, einzeln abschaltbar. */
   askMuster: AskMuster[];
   /** Die neun Guards mit Zustand, Rolle, Datum und Grund -- aus `wb-state guard list`. */
@@ -190,6 +195,7 @@ export interface EinstellungsDaten {
   anbieter: AnbieterSicht[];
   /** Je Harness der `session`-Block der Registry (SPEC-V4 6.3). */
   chatQuellen: Record<string, ChatQuelle>;
+  /** Aufgeloest (22.08.): "an" auch ohne explizite Wahl, wo die Registry es erlaubt. */
   chatAnsicht: Record<string, boolean>;
   /** Die Vorgabe JE ROLLE (12.08.) -- Orchestrator und Worker getrennt. */
   chatAnsichtVorgabe: ChatVorgabe;
@@ -255,6 +261,36 @@ function lies(pfad: string): string | undefined {
   }
 }
 
+/**
+ * DIE EINE STELLE, AN DER DIE REGISTRYTEXTE IHRE UMLAUTE ZURUECKBEKOMMEN
+ * (03.09.2026).
+ *
+ * `shell/models.default.json` ist durchgehend in ASCII-Umschrift geschrieben --
+ * das ist die Hauskonvention dieser Datei, und die wb-Werkzeuge lesen sie so.
+ * Im Fenster stand deshalb „Das Volltext-Protokoll laege …" neben Text, der
+ * korrekt „läge" schreibt. Gewandelt wird beim Anzeigen, mit demselben
+ * Woerterbuch, das auch das Verbrauchsfenster benutzt
+ * (`gemeinsam/umlaute.ts`).
+ *
+ * HIER UND NICHT IM RENDERER, weil jedes Feld der Registry genau einmal durch
+ * diese Datei kommt: elf verstreute Aufrufe in `einstellungen.ts` waeren elf
+ * Stellen, an denen die zwoelfte vergessen wird. Gewandelt wird nur, was
+ * FLIESSTEXT ist -- `id`, `modell` (ein Pfad) und `wegVorgabe` bleiben
+ * unangetastet.
+ */
+function vorhersageUmschrift(v: RegistryVorhersage | undefined): RegistryVorhersage | undefined {
+  if (!v) return v;
+  return {
+    ...v,
+    herkunft: v.herkunft ? umlaute(v.herkunft) : v.herkunft,
+    wege: v.wege?.map((w) => ({
+      ...w,
+      label: umlaute(w.label),
+      herkunft: w.herkunft ? umlaute(w.herkunft) : w.herkunft,
+    })),
+  };
+}
+
 function modellSicht(
   m: RegistryModel,
   registry: ModelsRegistry,
@@ -265,17 +301,19 @@ function modellSicht(
   const faehig = modelSupportsEffort(m, h, anbieter);
   return {
     id: m.id,
-    label: m.label,
+    label: umlaute(m.label),
     harness: m.harness,
-    harnessLabel: h?.label ?? m.harness,
+    harnessLabel: umlaute(h?.label ?? m.harness),
     rollen: [...(m.roles ?? [])],
-    efforts: faehig ? allowedEfforts(m) : [],
+    // Menschen sehen jede vom Modell angebotene Stufe. `maxEffort` bindet nur
+    // automatische Worker-Spawns und darf diese Liste nicht beschneiden.
+    efforts: faehig ? m.efforts.filter((e): e is Effort => EFFORTS.includes(e as Effort)) : [],
     effortFaehig: faehig,
     kontext: m.contextWindow ?? 0,
     lokal: anbieter?.kind === 'local',
     startbar: binaer[m.harness] !== false,
     deckelRegistry: m.maxEffort ?? '',
-    vorhersage: m.vorhersage,
+    vorhersage: vorhersageUmschrift(m.vorhersage),
   };
 }
 
@@ -563,11 +601,11 @@ export function anmeldungSicht(
       grund: anbieterIds.length === 0
         ? 'Für dieses Programm ist kein Anbieter eingetragen.'
         : lokal && stand === 'ja'
-          ? 'Läuft lokal — es gibt nichts, wobei man sich anmelden müsste.'
+          ? 'Läuft lokal – es gibt nichts, wobei man sich anmelden müsste.'
           : stand === 'ja'
             ? 'Der Beleg der Anmeldung liegt vor.'
             : stand === 'nein'
-              ? 'Es liegt kein Beleg vor — ein Start würde an der Anmeldung scheitern.'
+              ? 'Es liegt kein Beleg vor – ein Start würde an der Anmeldung scheitern.'
               : 'Für diesen Anbieter ist kein Beleg hinterlegt, an dem sich das prüfen ließe.',
     };
   }
@@ -600,10 +638,36 @@ export function einstellungsDaten(q: DatenQuellen, ui: UiState): EinstellungsDat
 
   const harnesses: HarnessSicht[] = harnessListe.map((h) => ({
     id: h.id,
-    label: h.label,
+    label: umlaute(h.label),
     modelle: proHarness.get(h.id) ?? 0,
     binaer: binaer[h.id] === true,
+    orchestratorDefaultModel: typeof h.orchestratorDefaultModel === 'string'
+      ? h.orchestratorDefaultModel
+      : undefined,
   }));
+
+  // Die Chat-Ansicht je Harness: das explizite Feld aus den Einstellungen,
+  // aufgeloest gegen die Faehigkeit aus der Registry (`quelle.via && quelle.probe`
+  // -- dieselbe Bedingung, unter der die Oberflaeche unten ueberhaupt einen
+  // Haken zeichnet). Siehe harnessErlaubt() (chat/ansichtsregel.ts).
+  // `chatQuellen()` selbst bleibt bei der Schreibweise der Registry -- es liest
+  // sie, und `test-app-chatschalter.sh` misst es gegen die ausgelieferte Datei.
+  // Erst die Sicht fuers Fenster bekommt die Umlaute zurueck.
+  const chatQuellenRoh = chatQuellen(registryRaw);
+  const chatQuellenGelesen: Record<string, ChatQuelle> = {};
+  for (const [id, quelle] of Object.entries(chatQuellenRoh)) {
+    chatQuellenGelesen[id] = {
+      ...quelle,
+      grund: umlaute(quelle.grund),
+      zeigtNicht: quelle.zeigtNicht.map(umlaute),
+    };
+  }
+  const chatAnsichtExplizit = chatAnsicht(q.settingsFile);
+  const chatAnsichtAufgeloest: Record<string, boolean> = {};
+  for (const id of Object.keys(chatQuellenGelesen)) {
+    const quelle = chatQuellenGelesen[id];
+    chatAnsichtAufgeloest[id] = harnessErlaubt(chatAnsichtExplizit[id], Boolean(quelle.via && quelle.probe));
+  }
 
   const sicht = (rolle: 'orchestrator' | 'worker'): ModellSicht[] => alle
     .filter((m) => (m.roles ?? []).includes(rolle))
@@ -647,6 +711,7 @@ export function einstellungsDaten(q: DatenQuellen, ui: UiState): EinstellungsDat
     orchestratorModelle: sicht('orchestrator'),
     workerModelle: sicht('worker'),
     maschinen: maschinenliste(q.settingsFile),
+    maschinenPausiert: maschinenPausiert(q.settingsFile),
     askMuster: askMuster(q.settingsFile),
     guards: guardsLesen(q.wbStateBin),
     wache: wacheLesen(q.wbStateBin),
@@ -656,8 +721,13 @@ export function einstellungsDaten(q: DatenQuellen, ui: UiState): EinstellungsDat
     ausschluss: { ordner: ausschlussOrdner(q.settingsFile), muster: ausschlussMuster(q.settingsFile) },
     anmeldung: anmeldungSicht(registry, alle),
     anbieter: anbieterSicht(registry),
-    chatQuellen: chatQuellen(registryRaw),
-    chatAnsicht: chatAnsicht(q.settingsFile),
+    chatQuellen: chatQuellenGelesen,
+    // AUFGELOEST, nicht die rohe Einstellung: ein Harness, den niemand je
+    // an- oder abgeschaltet hat, zeigt hier "an", sofern die Registry ihm
+    // einen Weg zum Gespraechsverlauf gibt -- derselbe Grundsatz wie in
+    // harnessErlaubt() (chat/ansichtsregel.ts). Sonst zeigte der Haken auf
+    // dieser Seite "aus", obwohl der Griff am Pane laengst "an" gilt.
+    chatAnsicht: chatAnsichtAufgeloest,
     chatAnsichtVorgabe: chatAnsichtVorgabe(q.settingsFile),
     meldungen: meldungen(q.settingsFile),
     meldeEreignisse: [...MELDE_EREIGNISSE],
@@ -742,7 +812,17 @@ export class Einstellungsfenster {
   private fenster: BrowserWindow | null = null;
   private bereit: Promise<void> | null = null;
 
-  constructor(private readonly eltern: () => BrowserWindow | null) {}
+  /**
+   * `sperre` sagt vor jedem `new BrowserWindow`, ob ein Fenster ueberhaupt
+   * entstehen darf, und nennt sonst den Grund (main.ts, `fenstersperre`): im
+   * Mantelbetrieb bringt die Mac-native Oberflaeche dieses Blatt selbst mit,
+   * und ein zweites, unsichtbares Electron-Fenster daneben waere eine Buehne
+   * ohne Publikum (Auftrag 4.1). Ohne die Funktion baut die Klasse wie bisher.
+   */
+  constructor(
+    private readonly eltern: () => BrowserWindow | null,
+    private readonly sperre?: () => string | null,
+  ) {}
 
   /** Das Fenster, wenn es existiert -- fuer Foto und Auskunft. */
   aktuell(): BrowserWindow | null {
@@ -755,6 +835,8 @@ export class Einstellungsfenster {
    * Fenster aufmacht.
    */
   async baue(): Promise<BrowserWindow> {
+    const gesperrt = this.sperre?.();
+    if (gesperrt) throw new Error(gesperrt);
     const da = this.aktuell();
     if (da && this.bereit) {
       await this.bereit;
@@ -762,8 +844,12 @@ export class Einstellungsfenster {
     }
     const eltern = this.eltern();
     const w = new BrowserWindow({
-      width: 1020,
-      height: 700,
+      // 03.09.: von 1020x700 auf 1120x760. Die Seitenliste der neuen Gestalt
+      // braucht 216 Punkte, und die Programm-Modell-Tabelle bekam damit bei
+      // 1020 keine Spaltenbreite mehr -- sie rollte waagerecht in ihrem
+      // eigenen Kasten, statt lesbar dazustehen (am Bild gemessen).
+      width: 1120,
+      height: 760,
       // Die Mindestgroesse stammt aus der Vorlage (another service-Kontrollzentrum:
       // 680x520) und ist hier groesser, weil die Modell-Liste eine zweite
       // Spalte neben der Seitenliste braucht.
@@ -778,7 +864,7 @@ export class Einstellungsfenster {
       // Einstellens nicht mehr auf das Terminal sehen, um das es geht.
       parent: eltern ?? undefined,
       modal: false,
-      title: 'Agent-Workbench — Einstellungen',
+      title: 'Agent-Workbench – Einstellungen',
       backgroundColor: '#101216',
       paintWhenInitiallyHidden: true,
       webPreferences: {
@@ -789,7 +875,7 @@ export class Einstellungsfenster {
         sandbox: false,
       },
     });
-    w.setContentSize(1020, 700);
+    w.setContentSize(1120, 760);
     // Zu ist zu: geschlossen wird es weggeraeumt, der naechste Klick baut neu.
     // Ein verstecktes Fenster stehen zu lassen hiesse, seinen Zustand zwischen
     // zwei Sitzungen mitzuschleppen, ohne dass jemand ihn sieht.

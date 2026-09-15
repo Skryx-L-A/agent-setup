@@ -9,11 +9,23 @@
 #   wb-shot <pattern> <outfile.png>   capture the single window matching <pattern>
 #   wb-shot --list                    list capturable windows (id | app | title)
 #
-# Rule (der Nutzer, 2026-07-25): agents never record or screenshot the whole screen,
-# and never move his focus. `screencapture -l <windowid>` grabs exactly one window
-# and does NOT raise it; there is deliberately NO full-screen fallback here — an
-# ambiguous or missing match fails instead of capturing something unintended.
+# Original rule (der Nutzer, 2026-07-25): agents never record or screenshot the
+# whole screen, and never move his focus. `screencapture -l <windowid>` grabs
+# exactly one window and does NOT raise it; there is deliberately NO
+# full-screen fallback here — an ambiguous or missing match fails instead of
+# capturing something unintended.
 # Launching an app for such a check: `open -g -na "<App>" --args …` (-g = no focus).
+#
+# CHANGED 2026-08-22 (the user's release, verbatim): "Die Maschine gehoert Dir,
+# Du kannst Bildschirmfotos machen, Bildschirmaufnahmen, auch vom ganzen
+# Bildschirm, vollkommen egal, alles Deins, mach wie es am besten
+# funktioniert." The system-wide full-screen ban above is lifted — see
+# regeln/aufnahmen.md and hooks/lib/screencapture_classify.py. This script's
+# OWN behavior is unchanged (still window-only, still no fallback below): the
+# point of the change is that a failure here is no longer a dead end — an
+# agent can now call `screencapture` directly for a full-screen shot instead
+# of reporting the failure and stopping. The focus rule (never raise/activate)
+# stands unaffected.
 #
 # Limitation, by design: the window list is on-screen windows of the CURRENT Space
 # only (CGWindowListOption.optionOnScreenOnly). A window on another Space or a

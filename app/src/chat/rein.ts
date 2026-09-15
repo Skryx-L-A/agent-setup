@@ -19,4 +19,5 @@ export * from './bruecke';
 export * from './pfadmuster';
 export * from './markdown';
 export * from './bildplatzhalter';
+export * from './pfadlinks';
 export { t, alleSchluessel, setzeSprache } from './texte';

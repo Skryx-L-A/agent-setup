@@ -1,0 +1,2054 @@
+#!/usr/bin/env python3
+"""wb-traeger — der Träger des Agents-Features: ein eigener schlanker Prozess
+je Maschine, der den Vorrat hält, Hauptagenten startet und überwacht, zu
+Weckzeiten weckt, die Sicherung ausführt und Limits verbucht (Bau-Schritt 2,
+docs/AGENTS-PLAN.md, Abschnitt 3 „Was hier gilt", Abschnitt 4 „Rund um die
+Uhr", „Lokale Modelle", „Die Maschine", Abschnitt 9 Punkt 2, Anhang „Träger").
+Seit Bau-Schritt 3 (Auftrag traeger3) meldet `melden()` jeden Standwechsel und
+je Lebenszeichen-Takt über `wb-companion status` an den Companion, zusätzlich
+`frage` bei „wartet auf den Nutzer" und `bericht` bei „zur Abnahme"; Anhang
+„Companion-Socket".
+
+Ausgerollt seit dem 10.09.2026 (Bau-Schritt 2 des Agents-Features, Auftrag traeger).
+Gestartet wird er abgelöst von `wb-aufgabe freigeben|antwort|stand|aufnehmen`; der
+Anmeldestart über shell/agent-workbench.wb-traeger.plist bzw. shell/systemd/wb-traeger.service
+wird erst nach einem echten Ende-zu-Ende-Lauf installiert (Entscheidung des Orchestrators
+am 10.09.), bis dahin tragen beide Dateien ihre NICHT-INSTALLIERT-Zeile selbst.
+
+ZUSTAND IN DATEIEN unter dem Vorrat (<base>/.claude/workbench/vorrat, oder
+--vorrat/WB_VORRAT):
+  .traeger.pid           der laufende Träger; angelegt und übernommen nur unter
+                         flock auf .traeger.lock
+  .traeger.takt.lock     Sperre je Takt (zwei gleichzeitige Takte starten nie doppelt)
+  .traeger.status.json   Stand des letzten Takts (für status und die Werkbank)
+  .traeger.zustand.json  Zustand über Prozessgrenzen: Lebenszeichen (auch der
+                         Merker, wann die nächste Probe fällig ist),
+                         Wiederbelebungszähler, Start bei veraltetem Messwert,
+                         laufende lokale Züge samt Speicherbuchung, Fehlversuche
+                         der Übergabe an eine andere Maschine
+  .traeger.log           jede Ausnahme, die der Takt je Aufgabe abgefangen hat
+  .wecker/<id>           Wecker des Stop-Hooks: eine Zeile „<ISO-Zeit> zugende|limit";
+                         je Takt gelesen und gelöscht
+  .agentverkehr-pause    Pausenschalter für Agent-Verkehr (Bau-Schritt 3:
+                         `wb-inbox pause an|aus` schreibt ihn, mit Grund und
+                         Zeit als JSON; `wb-traeger status` liest ihn nur)
+
+GEMEINSAME PRÜFUNGEN. Freigabe-Hash, Repo-Belegung, Pfadprüfung und
+Vergleichsform der Projektpfade lädt der Träger aus wb-aufgabe selbst
+(freigabe_gueltig, belegt_repo, repo_schluessel, pfad_gueltig), damit beide
+Werkzeuge nie verschieden urteilen. Jeder Start und jedes Wecken läuft durch
+modell_fuer_start: Fable-Sperre, „Daten lokal", Registry, lokale Messung,
+Kontingent und Fallback an einer Stelle.
+
+AUFRUFE:
+  wb-traeger start [--vordergrund]   Ohne --vordergrund löst er sich über
+                         `wb-nohup traeger …` ab; läuft schon einer, Exit 0 mit Hinweis.
+  wb-traeger status [--json] [--alle-maschinen]
+  wb-traeger stop        SIGTERM an den laufenden Träger, PID-Datei geräumt.
+  wb-traeger takt        genau ein Takt ohne Schleife (der Weg der Tests).
+  wb-traeger nachsehen [--vordergrund]   Anmeldestart: ein Takt, dann Ende, wenn
+                         nichts ohne den Nutzer weiterkommt, sonst start.
+
+TESTHAKEN. WB_TRAEGER_JETZT=<ISO> ersetzt die Uhr (Nacht, Weckzeiten,
+Mindestabstände); WB_TMUX_SOCKET=<name> lenkt jeden tmux-Aufruf auf `tmux -L
+<name>` (dieselbe Variable wie in wb-inbox); WB_TRAEGER_MASCHINE setzt den
+Namen der eigenen Maschine; WB_TRAEGER_SCP das Kopierprogramm für die Übergabe
+an eine andere Maschine (Vorgabe scp); WB_TRAEGER_WIEDERHOLUNG_S die Pause vor
+der wiederholten ersten Probe nach dem Anmeldestart (Vorgabe 10);
+WB_COMPANION_SOCKET lenkt jeden Aufruf von `wb-companion` (in `melden()`) auf
+einen Schirm-Daemon statt den echten Companion-Socket.
+
+Exit: 0 bei Erfolg, 1 wenn stop den Träger nicht beenden konnte, 2 bei
+Aufruffehlern.
+"""
+import argparse
+import datetime
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import traceback
+
+import atomar_schreiben
+
+SKRIPT = os.path.abspath(__file__)
+SKRIPT_DIR = os.path.dirname(SKRIPT)
+
+TAKT_VORGABE_S = 30
+NACHTFENSTER_VORGABE = "23:00-07:00"
+WIEDERBELEBUNG_ABSTAND_VORGABE_S = 300
+WIEDERBELEBUNG_HOECHSTENS = 2
+WECKER_MINDESTABSTAND_VORGABE_S = 900
+LOKALER_ZUG_FRIST_VORGABE_S = 1800
+LOKALER_KONTEXT_VORGABE = 131072
+LEBENSZEICHEN_ABSTAND_S = 3600
+GESEHEN_ABSTAND_S = 300
+KONTINGENT_ALTER_GRENZE_S = 43200
+AUFNAHME_HOECHSTENS = 3
+NAECHSTE_HOECHSTENS = 20
+
+AKTIVE_PAUSEN = ("pausiert (Kontingent)", "pausiert (Nacht)", "pausiert (Weckzeit)")
+ENTSCHIEDENE_STAENDE = ("zur Abnahme", "wartet auf den Nutzer", "aufgegeben",
+                        "aufgegeben (Modell)", "abgenommen", "verworfen")
+
+SICHERUNG_NACHRICHT = ("Sicherung: du hast nichts entschieden. Entscheide: "
+                       "weiterarbeiten, Weckzeit setzen (`wb-aufgabe weckzeit`), "
+                       "oder Aufgabe anhalten (`wb-aufgabe stand …`).")
+NACHTPAUSE_NACHRICHT = ("Nachtpause: das Nachtfenster hat begonnen. Vergib nichts "
+                        "Neues mehr und schließe dich, wenn der letzte Worker fertig ist.")
+WECKEN_NACHRICHT = ("Weckzeit erreicht ({weckzeit}, {grund}). Lies `wb-aufgabe zeigen {id}` "
+                    "und deinen Wiederaufnahme-Stand und arbeite weiter.")
+ERSTER_PROMPT_VORLAGE = ("Du bist der Hauptagent der Werkbank-Aufgabe {id}. Lies "
+                         "`wb-aufgabe zeigen {id}` und arbeite nach "
+                         "`docs/AGENTS-PLAN.md`, Abschnitt 4; schreibe jeden Schritt "
+                         "mit `wb-aufgabe verlauf`, führe deine Pfade mit `wb-aufgabe "
+                         "pfade`, halte `wiederaufnahme` laufend aktuell.")
+WEITER_NACHRICHT = ("Nächster Zug: lies `wb-aufgabe zeigen {id}` und deinen "
+                    "Wiederaufnahme-Stand und arbeite weiter.")
+
+# Nichtstart-Gründe wörtlich aus docs/AGENTS-PLAN.md, Abschnitt 2.
+GRUND_REPO_BELEGT = "Repo belegt durch Aufgabe {andere}"
+GRUND_MODELL_NICHT_FREI = "das gewählte Modell nicht frei"
+GRUND_KONTINGENT = "Kontingent"
+GRUND_MESSWERT_VERALTET = "Kontingent-Messwert veraltet"
+GRUND_NACHT = "Nacht"
+GRUND_TAGESLIMIT = "Tageslimit"
+GRUND_DATEN_LOKAL = "Daten lokal ohne lokalen Hauptagenten"
+GRUND_LOKAL_UNGEMESSEN = "Daten lokal, lokaler Hauptagent noch nicht gemessen"
+# Gründe, die der Plan nicht wörtlich nennt (Auftrag traeger Nr. 1 und Nr. 2):
+GRUND_LOKAL_UNGEMESSEN_ALLGEMEIN = "lokaler Hauptagent noch nicht gemessen"
+GRUND_FREIGABE_UNGUELTIG = "Freigabe ungültig"
+GRUND_MODELL_UNBEKANNT = "Modell nicht in der Registry: {model}"
+GRUND_NICHT_VERTRAUT = "Projekt nicht vertraut: {verzeichnis}"
+GRUND_ZUG_LAEUFT = "Zug läuft noch"
+
+
+# ------------------------------------------------------------------ Uhr --
+def iso_zu_punkt(text):
+    t = str(text).strip()
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    d = datetime.datetime.fromisoformat(t)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=datetime.timezone.utc)
+    return d
+
+
+def jetzt():
+    roh = os.environ.get("WB_TRAEGER_JETZT")
+    if roh:
+        return iso_zu_punkt(roh)
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def punkt_zu_iso(punkt):
+    return punkt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def jetzt_iso():
+    return punkt_zu_iso(jetzt())
+
+
+def epoch_von(text):
+    """Unlesbarer Zeitstempel zählt als 0: er löst nichts aus."""
+    try:
+        return iso_zu_punkt(text).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def sekunden_seit(text):
+    """Vergangene Sekunden; ein Zeitstempel in der Zukunft zählt als 0."""
+    e = epoch_von(text)
+    return None if e == 0 else max(0.0, jetzt().timestamp() - e)
+
+
+# -------------------------------------------------------- Einstellungen --
+def einstellung(base, schluessel, vorgabe):
+    """`wb-state settings get`, sonst <base>/.claude/workbench/settings.json
+    punktweise gelesen (wb-state kennt die agents.*-Schlüssel nicht; derselbe
+    Weg wie in wb-aufgabe)."""
+    try:
+        r = subprocess.run(["wb-state", "settings", "get", schluessel],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        with open(os.path.join(base, ".claude", "workbench", "settings.json"), encoding="utf-8") as f:
+            node = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return vorgabe
+    for teil in schluessel.split("."):
+        if not isinstance(node, dict) or teil not in node:
+            return vorgabe
+        node = node[teil]
+    return vorgabe if node is None else node
+
+
+def zahl_einstellung(base, schluessel, vorgabe):
+    try:
+        return float(einstellung(base, schluessel, vorgabe))
+    except (TypeError, ValueError):
+        return float(vorgabe)
+
+
+def eigene_maschine_name():
+    if os.environ.get("WB_TRAEGER_MASCHINE"):
+        return os.environ["WB_TRAEGER_MASCHINE"]
+    return "peer" if "peer" in socket.gethostname().lower() else "mac"
+
+
+def maschinen_liste(base, eigene):
+    roh = einstellung(base, "agents.maschinen", None)
+    if isinstance(roh, str):
+        try:
+            roh = json.loads(roh)
+        except json.JSONDecodeError:
+            roh = None
+    if not isinstance(roh, list) or not roh:
+        roh = [{"name": "mac", "standard": False},
+               {"name": "peer", "ssh": "peer", "standard": True}]
+    liste = []
+    for m in roh:
+        if isinstance(m, dict) and m.get("name"):
+            liste.append({"name": m["name"], "ssh": m.get("ssh") or m["name"],
+                          "traegerPfad": m.get("traegerPfad") or "",
+                          "modelle": m.get("modelle") or [],
+                          "standard": bool(m.get("standard"))})
+    if not any(m["name"] == eigene for m in liste):
+        liste.append({"name": eigene, "ssh": eigene, "traegerPfad": "",
+                      "modelle": [], "standard": False})
+    return liste
+
+
+# ---------------------------------------------------------------- Registry --
+def registry_eintrag(model_id, base):
+    """Kennung oder Alias zum Registry-Eintrag; die eine Stelle dafür steht in
+    wb-aufgabe, damit Anlegen und Träger nie verschieden urteilen."""
+    return wa().registry_eintrag(model_id, base)
+
+
+def modell_klasse(model_id, base):
+    """'cloud' | 'lokal' | 'unbekannt', aus derselben Stelle in wb-aufgabe."""
+    return wa().modell_klasse(model_id, base)
+
+
+def ist_fable(model_id):
+    return "fable" in (model_id or "").lower()
+
+
+# ------------------------------------------------------------ Hilfsmittel --
+def laufe(befehl, frist_s=60, env=None):
+    """(rc, stdout, stderr); Timeout zählt als rc 124, fehlendes Programm als 127."""
+    try:
+        r = subprocess.run(befehl, capture_output=True, text=True, timeout=frist_s, env=env)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "Frist %ss überschritten" % frist_s
+    except OSError as e:
+        return 127, "", str(e)
+
+
+def tmux(*argumente):
+    sock = os.environ.get("WB_TMUX_SOCKET")
+    return ["tmux"] + (["-L", sock] if sock else []) + list(argumente)
+
+
+def pid_lebt(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def pane_info(pane):
+    """{'pid', 'dead', 'tty'} des Panes oder None, wenn tmux ihn nicht kennt."""
+    if not pane:
+        return None
+    rc, aus, _ = laufe(tmux("list-panes", "-a", "-F", "#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_tty}"), 10)
+    if rc != 0:
+        return None
+    for zeile in aus.splitlines():
+        teile = zeile.strip().split("|")
+        if len(teile) == 4 and teile[0] == pane:
+            return {"pid": int(teile[1]) if teile[1].isdigit() else None,
+                    "dead": teile[2] != "0", "tty": teile[3]}
+    return None
+
+
+def pane_lebt(pane):
+    info = pane_info(pane)
+    return bool(info and not info["dead"] and info["pid"] and pid_lebt(info["pid"]))
+
+
+def wb_aufgabe_programm():
+    """Die Fassung neben diesem Skript zuerst, dann der PATH: beide werden
+    zusammen ausgerollt, und bis dahin liegt wb-aufgabe nirgends im PATH."""
+    nachbar = os.path.join(SKRIPT_DIR, "wb-aufgabe")
+    if os.access(nachbar, os.X_OK):
+        return nachbar
+    return shutil.which("wb-aufgabe") or "wb-aufgabe"
+
+
+_WA = {}
+
+
+def wa():
+    """wb-aufgabe als Modul: die gemeinsamen Prüfungen stehen nur dort."""
+    if "modul" not in _WA:
+        pfad = wb_aufgabe_programm()
+        if not os.path.isabs(pfad):
+            raise RuntimeError("wb-aufgabe nicht gefunden (weder neben wb-traeger noch im PATH)")
+        lader = importlib.machinery.SourceFileLoader("wb_aufgabe_modul", pfad)
+        spec = importlib.util.spec_from_loader(lader.name, lader)
+        modul = importlib.util.module_from_spec(spec)
+        lader.exec_module(modul)
+        _WA["modul"] = modul
+    return _WA["modul"]
+
+
+# Stand (deutsch, wie in wb-aufgabe.STAENDE) -> task_state (snake_case), das
+# neue additive Feld aus dem Companion-Auftrag (Anhang „Companion-Socket").
+COMPANION_TASK_STATE = {
+    "offen": "offen",
+    "läuft": "laeuft",
+    "steckt": "steckt",
+    "pausiert (Kontingent)": "pausiert_kontingent",
+    "pausiert (Nacht)": "pausiert_nacht",
+    "pausiert (Weckzeit)": "pausiert_weckzeit",
+    "wartet auf den Nutzer": "wartet_auf_nutzer",
+    "zur Abnahme": "zur_abnahme",
+    "aufgegeben": "aufgegeben",
+    "aufgegeben (Modell)": "aufgegeben_modell",
+    "abgenommen": "abgenommen",
+    "verworfen": "verworfen",
+}
+
+_MELDEN_CTX = None
+
+
+def melden_kontext_setzen(ctx):
+    """Wird einmal je Aufruf von kontext_bauen() gesetzt: melden() bekommt
+    von seinen Aufrufern nur (aufgabe_id, ereignis) und muss --base/--vorrat
+    also selbst kennen, um den frischen Stand über wb-aufgabe zu lesen."""
+    global _MELDEN_CTX
+    _MELDEN_CTX = ctx
+
+
+def _companion_frage_text(frage):
+    text = (frage or {}).get("text")
+    if not text:
+        return None
+    text = text.strip()
+    optionen = (frage or {}).get("optionen") or []
+    empfehlung = (frage or {}).get("empfehlung")
+    if optionen:
+        geordnet = ([empfehlung] if empfehlung in optionen else []) + \
+                   [o for o in optionen if o != empfehlung]
+        text += " Optionen: %s." % ", ".join(
+            ("%s (Empfehlung)" % o) if o == empfehlung else o for o in geordnet)
+    return text
+
+
+def _erster_satz(text, laenge=200):
+    text = (text or "").strip()
+    for zeichen in (".", "!", "?"):
+        i = text.find(zeichen)
+        if i != -1:
+            return text[:i + 1][:laenge].strip()
+    return text[:laenge]
+
+
+def melden(aufgabe_id, ereignis):
+    """Meldung an den Companion (Bau-Schritt 3, Anhang „Companion-Socket"):
+    liest den frischen Stand über `wb-aufgabe zeigen --json` selbst (melden()
+    bekommt nur die Kennung und einen freien Ereignistext) und schickt darüber
+    `wb-companion status` — bei „wartet auf den Nutzer" zusätzlich `frage`, bei
+    „zur Abnahme" zusätzlich `bericht`. Zustellung oder Nichtzustellung wird
+    im Verlauf mit einer Vorgangs-Kennung verbucht (idempotent wie die
+    übrigen Zustellungen in diesem Skript); jeder Fehlschlag bleibt lokal,
+    der Takt läuft immer weiter."""
+    ctx = _MELDEN_CTX
+    if not ctx:
+        return None
+    try:
+        rc, aus, _ = wb_aufgabe(ctx, ["zeigen", aufgabe_id, "--json"])
+        if rc != 0 or not aus.strip():
+            return None
+        z = json.loads(aus)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    verlauf = z.get("verlauf") or {}
+    auftrag = z.get("auftrag") or {}
+    stand = verlauf.get("stand")
+    task_state = COMPANION_TASK_STATE.get(stand)
+    if task_state is None:
+        return None
+
+    eintraege_bisher = verlauf.get("verlauf") or []
+    grund = verlauf.get("grund") or None
+    weckzeit = verlauf.get("weckzeit") or None
+    # Der Ereignistext gehört nicht zur Kennung: melden() an der Aufrufstelle
+    # und die Standwechsel-Phase am Ende desselben Takts sehen denselben Stand
+    # mit verschiedenen Ereignistexten. Nur Stand, Grund und Weckzeit
+    # entscheiden, und verglichen wird mit der LETZTEN Companion-Meldung, nicht
+    # mit allen: kehrt die Aufgabe zu einem früheren Stand zurück (läuft,
+    # steckt, läuft), ist das wieder eine Änderung.
+    kennung = "companion-%s-%s" % (
+        aufgabe_id, hashlib.sha1(("%s|%s|%s" % (task_state, grund or "", weckzeit or "")).encode("utf-8")).hexdigest()[:16])
+    letzte = next((e for e in reversed(eintraege_bisher)
+                   if e.get("art") in ("companion", "companion-fehlgeschlagen")), None)
+    if letzte and letzte.get("art") == "companion" and letzte.get("kennung") == kennung:
+        return None
+    # Höchstens ein Versuch je Lage und Takt: sonst versuchte die
+    # Standwechsel-Phase einen eben gescheiterten Versuch der Aufrufstelle
+    # sofort noch einmal, bei hängendem Daemon mit voller Frist.
+    versucht = ctx.setdefault("companion_versucht", set())
+    if kennung in versucht:
+        return None
+    versucht.add(kennung)
+    # Ein Fehlschlag quittiert nichts, der nächste Takt versucht es wieder;
+    # steht derselbe Fehlschlag schon zuletzt im Verlauf, wird er nicht bei
+    # jedem Takt erneut angehängt.
+    schon_fehlgeschlagen = bool(letzte and letzte.get("art") == "companion-fehlgeschlagen"
+                                and letzte.get("kennung") == kennung)
+
+    titel = _erster_satz(auftrag.get("goal"))
+    maschine = verlauf.get("maschine")
+
+    status_argumente = ["status", aufgabe_id, "--stand", task_state]
+    if grund:
+        status_argumente += ["--grund", grund]
+    if titel:
+        status_argumente += ["--titel", titel]
+    if weckzeit:
+        status_argumente += ["--weckzeit", weckzeit]
+    if maschine:
+        status_argumente += ["--maschine", maschine]
+    status_optionen = status_argumente[4:]
+    befehl = ["wb-companion"] + status_argumente
+    if stand == "wartet auf den Nutzer":
+        text = _companion_frage_text(verlauf.get("frage"))
+        if text:
+            befehl = ["wb-companion", "frage", aufgabe_id, "--text", text] + status_optionen
+    elif stand == "zur Abnahme":
+        pfad = (verlauf.get("ergebnis") or {}).get("pfad")
+        if pfad:
+            text = "%s — %s" % (titel or auftrag.get("goal") or aufgabe_id, grund or "zur Abnahme")
+            befehl = ["wb-companion", "bericht", aufgabe_id, "--pfad", pfad, "--text", text] + status_optionen
+    gesamt_rc, _, fehl = laufe(befehl, 30)
+
+    if gesamt_rc == 0:
+        verlauf_schreiben(ctx, aufgabe_id, "companion",
+                          "Companion gemeldet: %s (%s)" % (ereignis, task_state), kennung=kennung)
+    elif not schon_fehlgeschlagen:
+        verlauf_schreiben(ctx, aufgabe_id, "companion-fehlgeschlagen",
+                          "Companion %s: %s (%s) — %s" % (
+                              "abgelehnt" if gesamt_rc == 2 else "nicht erreichbar",
+                              ereignis, task_state, fehl.strip()[:200]),
+                          grund="nicht zugestellt", kennung=kennung)
+    return None
+
+
+# ------------------------------------------------------------- Kontext --
+def kontext_bauen(args):
+    base = os.path.abspath(args.base)
+    if getattr(args, "vorrat", None):
+        vorrat = os.path.abspath(args.vorrat)
+    elif os.environ.get("WB_VORRAT"):
+        vorrat = os.path.abspath(os.environ["WB_VORRAT"])
+    else:
+        vorrat = os.path.join(base, ".claude", "workbench", "vorrat")
+    eigene = eigene_maschine_name()
+    os.makedirs(os.path.join(vorrat, ".wecker"), exist_ok=True)
+    ctx = {
+        "base": base, "vorrat": vorrat, "eigene": eigene,
+        "maschinen": maschinen_liste(base, eigene),
+        "takt_s": max(1.0, zahl_einstellung(base, "agents.taktSekunden", TAKT_VORGABE_S)),
+        "pid_datei": os.path.join(vorrat, ".traeger.pid"),
+        "anmeldestart": False,
+        "erste_probe_wiederholt": False,
+        "protokoll": [],
+        "budget": None,
+        "zugende": [],
+        "start_zeit": None,
+        "takt_zaehler": 0,
+    }
+    melden_kontext_setzen(ctx)
+    return ctx
+
+
+def protokoll(ctx, text):
+    ctx["protokoll"].append("%s %s" % (jetzt_iso(), text))
+
+
+def wb_aufgabe(ctx, argumente):
+    """wb-aufgabe mit --base/--vorrat des Trägers. WB_TRAEGER_NACHSEHEN=0,
+    damit die Stände des Trägers kein weiteres Nachsehen anstoßen."""
+    umgebung = dict(os.environ, WB_TRAEGER_NACHSEHEN="0")
+    befehl = [wb_aufgabe_programm()] + list(argumente) + ["--base", ctx["base"], "--vorrat", ctx["vorrat"]]
+    rc, aus, fehl = laufe(befehl, 90, env=umgebung)
+    if rc not in (0, 1):
+        protokoll(ctx, "wb-aufgabe %s scheiterte (rc=%s): %s" % (argumente[0], rc, fehl.strip()[:200]))
+    return rc, aus, fehl
+
+
+def verlauf_schreiben(ctx, id_, art, text, grund=None, kennung=None):
+    argumente = ["verlauf", id_, art, text, "--von", "traeger"]
+    if grund:
+        argumente += ["--grund", grund]
+    if kennung:
+        argumente += ["--kennung", kennung]
+    return wb_aufgabe(ctx, argumente)[0] == 0
+
+
+def stand_setzen(ctx, id_, stand, grund=None, weckzeit=None):
+    argumente = ["stand", id_, stand, "--von", "traeger"]
+    if grund:
+        argumente += ["--grund", grund]
+    if weckzeit:
+        argumente += ["--weckzeit", weckzeit]
+    return wb_aufgabe(ctx, argumente)[0] == 0
+
+
+def aufgabe_fehler(ctx, a, fehler):
+    """Eine Ausnahme bei einer Aufgabe: in .traeger.log, nur diese Aufgabe auf
+    „steckt" mit dem Fehlertext als Grund; der Takt läuft für die übrigen weiter."""
+    text = "%s: %s" % (type(fehler).__name__, fehler)
+    try:
+        with open(os.path.join(ctx["vorrat"], ".traeger.log"), "a", encoding="utf-8") as f:
+            f.write("%s Aufgabe %s: %s\n%s\n" % (jetzt_iso(), a.get("id"), text, traceback.format_exc()))
+    except OSError:
+        pass
+    protokoll(ctx, "Aufgabe %s: %s" % (a.get("id"), text))
+    try:
+        stand_setzen(ctx, a["id"], "steckt", grund=("Umgebung: " + text)[:200])
+    except Exception:
+        pass
+
+
+def je_aufgabe(ctx, aufgaben, fn, *rest):
+    for a in aufgaben:
+        try:
+            fn(ctx, a, *rest)
+        except Exception as e:
+            aufgabe_fehler(ctx, a, e)
+
+
+# ------------------------------------------------------------ Vorrat --
+def alle_aufgaben(ctx):
+    """Je Vorratseintrag: Kennung, Einträge aus Auftrag und Verlauf, Klasse
+    des Hauptagenten; nach Rang sortiert. Ein Eintrag ohne Maschine gilt als
+    einer der eigenen."""
+    funde = []
+    for name in sorted(os.listdir(ctx["vorrat"])):
+        if not name.endswith(".json") or name.startswith("."):
+            continue
+        id_ = name[:-5]
+        try:
+            with open(os.path.join(ctx["vorrat"], name), encoding="utf-8") as f:
+                eintrag = json.load(f)
+            with open(eintrag["auftrag"], encoding="utf-8") as f:
+                auftrag = json.load(f)
+            verlauf_pfad = os.path.join(os.path.dirname(eintrag["auftrag"]), "%s.verlauf.json" % id_)
+            with open(verlauf_pfad, encoding="utf-8") as f:
+                verlauf = json.load(f)
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as e:
+            protokoll(ctx, "Aufgabe %s unlesbar (%s)" % (id_, e))
+            continue
+        hauptagent = auftrag.get("hauptagent") or {}
+        funde.append({
+            "id": id_, "eintrag": eintrag, "auftrag": auftrag, "verlauf": verlauf,
+            "verlauf_pfad": verlauf_pfad,
+            "stand": verlauf.get("stand"), "projekt": eintrag.get("projekt"),
+            "maschine": eintrag.get("maschine") or ctx["eigene"],
+            "klasse": modell_klasse(hauptagent.get("model", ""), ctx["base"]),
+        })
+    funde.sort(key=lambda a: (a["eintrag"].get("rang", 0), a["id"]))
+    return funde
+
+
+def aufgabe_frisch(ctx, id_):
+    for a in alle_aufgaben(ctx):
+        if a["id"] == id_:
+            return a
+    return None
+
+
+def eintraege(a):
+    return (a["verlauf"].get("verlauf") or []) if a else []
+
+
+def nachtmodus(a):
+    return (a["auftrag"].get("grenzen") or {}).get("nachtmodus") or "pausieren"
+
+
+def kein_worker_arbeitet(a):
+    return not any(w.get("zustand") == "arbeitet" for w in (a["verlauf"].get("worker") or []))
+
+
+def letzte_aktivierung(a):
+    zeit = None
+    for e in eintraege(a):
+        if e.get("art") in ("gestartet", "geweckt") and e.get("von") == "traeger":
+            zeit = e.get("zeit") or zeit
+    return zeit
+
+
+def umgebung_steckt(a):
+    return a["stand"] == "steckt" and a["verlauf"].get("grund") == "Umgebung"
+
+
+def hat_entschieden(a):
+    """Einer der drei Wege aus Abschnitt 3 steht, seit der Träger den
+    Hauptagenten zuletzt gestartet oder geweckt hat. Weg 1 schreibt der
+    Hauptagent als `wach --bis <iso>`; bis dahin gilt er als entschieden."""
+    verlauf = a["verlauf"]
+    stand = verlauf.get("stand")
+    if stand in ENTSCHIEDENE_STAENDE:
+        return True
+    if stand in AKTIVE_PAUSEN and verlauf.get("weckzeit"):
+        return True
+    jetzt_s = jetzt().timestamp()
+    if any(e.get("art") == "wach" and epoch_von(e.get("bis")) > jetzt_s for e in eintraege(a)):
+        return True
+    seit = epoch_von(letzte_aktivierung(a))
+    if verlauf.get("weckzeit"):
+        for e in eintraege(a):
+            if e.get("art") == "wiederaufnahme" and epoch_von(e.get("zeit")) >= seit:
+                return True
+    return False
+
+
+def arbeitet_gerade(ctx, a, seit_iso):
+    """Ein arbeitender Hauptagent wird nie geweckt: neuer Verlaufseintrag seit
+    dem Wecker (nicht vom Träger), oder die Gesprächsdatei der Sitzung hat sich
+    seitdem geändert. Ist die Gesprächsdatei nicht messbar, zählt nur der Verlauf."""
+    seit = epoch_von(seit_iso)
+    for e in eintraege(a):
+        if e.get("von") != "traeger" and e.get("art") != "zustellung" and epoch_von(e.get("zeit")) > seit:
+            return True
+    pane = (a["verlauf"].get("hauptagent_sitzung") or {}).get("pane")
+    if pane:
+        rc, aus, _ = laufe(["wb-inbox", "transcript", pane], 15)
+        pfad = aus.strip().splitlines()[-1].strip() if rc == 0 and aus.strip() else ""
+        if pfad and os.path.isfile(pfad) and seit and os.path.getmtime(pfad) > seit:
+            return True
+    return False
+
+
+# --------------------------------------------------------- Zustand --
+def zustand_lesen(ctx):
+    try:
+        with open(os.path.join(ctx["vorrat"], ".traeger.zustand.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def zustand_schreiben(ctx, zustand):
+    atomar_schreiben.schreiben(os.path.join(ctx["vorrat"], ".traeger.zustand.json"),
+                               json.dumps(zustand, ensure_ascii=False, indent=2) + "\n")
+
+
+# ------------------------------------------------------------ Nacht --
+def nachtfenster(base):
+    roh = einstellung(base, "agents.nachtfenster", NACHTFENSTER_VORGABE)
+    try:
+        anfang, ende = str(roh).split("-")
+        ha, ma = anfang.strip().split(":")
+        he, me = ende.strip().split(":")
+        return int(ha) * 60 + int(ma), int(he) * 60 + int(me)
+    except (ValueError, AttributeError):
+        return None
+
+
+def im_fenster(punkt, fenster):
+    """Das Fenster liegt in der Ortszeit des Menschen, nicht in UTC."""
+    if fenster is None:
+        return False
+    lokal = punkt.astimezone()
+    m = lokal.hour * 60 + lokal.minute
+    anfang, ende = fenster
+    return anfang <= m < ende if anfang <= ende else (m >= anfang or m < ende)
+
+
+def fenster_ende(punkt, fenster):
+    lokal = punkt.astimezone()
+    ziel = lokal.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(minutes=fenster[1])
+    if ziel <= lokal:
+        ziel += datetime.timedelta(days=1)
+    return ziel
+
+
+def wirksame_weckzeit(ctx, a, weckzeit_iso):
+    """Eine Reset-Zeit im Nachtfenster weckt eine Aufgabe mit „pausieren"
+    erst zur Weckzeit am Morgen."""
+    fenster = nachtfenster(ctx["base"])
+    try:
+        punkt = iso_zu_punkt(weckzeit_iso)
+    except ValueError:
+        return weckzeit_iso
+    if fenster and nachtmodus(a) == "pausieren" and im_fenster(punkt, fenster):
+        return punkt_zu_iso(fenster_ende(punkt, fenster))
+    return weckzeit_iso
+
+
+# -------------------------------------------------------- Kontingent --
+def kontingent(ctx):
+    """Einmal je Takt `wb-budget --json --alle-maschinen`. Rückgabe (urteil,
+    daten), urteil: frei | tageslimit | fenster | keine-quelle | veraltet."""
+    if ctx["budget"] is not None:
+        return ctx["budget"]
+    rc, aus, _ = laufe(["wb-budget", "--json", "--alle-maschinen"], 60)
+    try:
+        daten = json.loads(aus) if aus.strip() else None
+    except json.JSONDecodeError:
+        daten = None
+    if rc == 2:
+        reset = (daten or {}).get("five_hour_resets_at")
+        urteil = "fenster" if reset and epoch_von(reset) else "keine-quelle"
+    elif rc == 1:
+        urteil = "tageslimit"
+    elif rc == 0 and isinstance(daten, dict):
+        try:
+            alter = float(daten.get("alter_s"))
+        except (TypeError, ValueError):
+            alter = None
+        urteil = "veraltet" if alter is None or alter > KONTINGENT_ALTER_GRENZE_S else "frei"
+    else:
+        urteil = "keine-quelle"
+    ctx["budget"] = (urteil, daten)
+    return ctx["budget"]
+
+
+# ----------------------------------------------------------- Zustellung --
+def kennung_quittiert(a, kennung):
+    return any(e.get("art") == "zustellung" and e.get("kennung") == kennung for e in eintraege(a))
+
+
+def mindestabstand_haelt(ctx, a):
+    """Abstand zur letzten automatischen Zustellung; ein Eintrag mit einer
+    Zeit in der Zukunft zählt nicht, sonst hielte er den Abstand für immer."""
+    abstand = zahl_einstellung(ctx["base"], "agents.weckerMindestabstandSekunden",
+                               WECKER_MINDESTABSTAND_VORGABE_S)
+    jetzt_s = jetzt().timestamp()
+    letzte = None
+    for e in eintraege(a):
+        if e.get("art") == "zustellung" and str(e.get("kennung") or "").startswith("sicherung-"):
+            z = epoch_von(e.get("zeit"))
+            if z and z <= jetzt_s + 60:
+                letzte = z
+    return letzte is not None and jetzt_s - letzte < abstand
+
+
+def nachricht_datei(ctx, id_, text):
+    verz = os.path.join(ctx["vorrat"], ".traeger.nachrichten")
+    os.makedirs(verz, exist_ok=True)
+    pfad = os.path.join(verz, "%s.txt" % id_)
+    atomar_schreiben.schreiben(pfad, text, modus=0o600)
+    return pfad
+
+
+def inbox_senden(ctx, id_, pane, text):
+    """Zustellung per Socket über wb-inbox, nie getippt. `--absender traeger`
+    lässt die Zustellung auch bei geschlossenem Agent-Verkehr-Schalter durch
+    (Bau-Schritt 3, Anhang „Bremsen": „Was der Träger zustellt … laufen bei
+    geschlossenem Schalter weiter"); WB_VORRAT sorgt dafür, dass wb-inbox
+    denselben Schalter prüft wie `wb-traeger status` (unter demselben Vorrat,
+    nicht unter dem eigenen $HOME des wb-inbox-Prozesses)."""
+    pfad = nachricht_datei(ctx, id_, text)
+    umgebung = dict(os.environ, WB_VORRAT=ctx["vorrat"])
+    rc, _, fehl = laufe(["wb-inbox", "--absender", "traeger", "sende", pane, pfad], 30, env=umgebung)
+    try:
+        os.unlink(pfad)
+    except OSError:
+        pass
+    if rc != 0:
+        protokoll(ctx, "Aufgabe %s: wb-inbox sende %s scheiterte (rc=%s): %s" % (id_, pane, rc, fehl.strip()[:200]))
+    return rc == 0
+
+
+def lokal_nachricht_ablegen(ctx, id_, text):
+    verz = os.path.join(ctx["vorrat"], ".traeger.lokal")
+    os.makedirs(verz, exist_ok=True)
+    atomar_schreiben.schreiben(os.path.join(verz, "%s.nachricht" % id_), text, modus=0o600)
+
+
+def lokal_nachricht_holen(ctx, id_):
+    pfad = os.path.join(ctx["vorrat"], ".traeger.lokal", "%s.nachricht" % id_)
+    try:
+        with open(pfad, encoding="utf-8") as f:
+            text = f.read()
+        os.unlink(pfad)
+    except OSError:
+        return None
+    return text or None
+
+
+def zustellen(ctx, a, text, kennung, automatisch):
+    """Eine Zustellung des Trägers mit Vorgangs-Kennung. Rückgabe:
+    zugestellt | quittiert | abstand | fehlgeschlagen. Nur eine gelungene
+    Zustellung wird mit der Kennung quittiert; ein Fehlschlag steht ohne sie im
+    Verlauf, damit der nächste Versuch nicht als schon erledigt gilt."""
+    if kennung_quittiert(a, kennung):
+        return "quittiert"
+    if automatisch and mindestabstand_haelt(ctx, a):
+        protokoll(ctx, "Aufgabe %s: Mindestabstand hält, keine Zustellung (%s)" % (a["id"], kennung))
+        return "abstand"
+    if a["klasse"] == "lokal":
+        lokal_nachricht_ablegen(ctx, a["id"], text)
+        ok = True
+    else:
+        pane = (a["verlauf"].get("hauptagent_sitzung") or {}).get("pane")
+        ok = bool(pane) and pane_lebt(pane) and inbox_senden(ctx, a["id"], pane, text)
+    if ok:
+        verlauf_schreiben(ctx, a["id"], "zustellung", text, kennung=kennung)
+        melden(a["id"], "zustellung:%s" % kennung)
+        return "zugestellt"
+    verlauf_schreiben(ctx, a["id"], "zustellung", "Zustellung %s gescheitert" % kennung,
+                      grund="nicht zugestellt")
+    return "fehlgeschlagen"
+
+
+# ---------------------------------------------- 1. Lebenszeichen --
+def kategorie(ctx, a):
+    if a["maschine"] != ctx["eigene"]:
+        return "maschine:%s" % a["maschine"]
+    return a["klasse"] if a["klasse"] in ("cloud", "lokal") else None
+
+
+def betroffen_bei_umgebung(a):
+    stand = a["stand"]
+    return stand == "läuft" or stand in AKTIVE_PAUSEN or \
+        (stand == "offen" and bool(a["auftrag"].get("approval")))
+
+
+def _letzte_zeile(text):
+    """„: <letzte nicht leere Zeile>" (auf 160 Zeichen gekürzt) oder leer."""
+    zeilen = [z.strip() for z in (text or "").splitlines() if z.strip()]
+    return ": %s" % zeilen[-1][:160] if zeilen else ""
+
+
+def proben(ctx, kategorien):
+    """Nur die Proben, die die Aufgaben brauchen. Rückgabe {kategorie: Grund}
+    der gescheiterten."""
+    fehl = {}
+    if "cloud" in kategorien:
+        rc, aus, err = laufe(["claude", "-p", "ok", "--max-turns", "1"], 60)
+        if rc != 0:
+            # Die letzte Zeile der Ausgabe gehört in den Grund (11.09.2026, Ende-zu-Ende-Lauf 3:
+            # „rc=1" ohne Wortlaut war nicht zu deuten, weil die Probe nirgends protokolliert
+            # wurde; eine Wiederholung von Hand lief durch).
+            fehl["cloud"] = "claude -p antwortet nicht (rc=%s%s)" % (rc, _letzte_zeile(err or aus))
+    if "lokal" in kategorien:
+        rc, aus, err = laufe(["wb-mlx-server", "status"], 30)
+        if rc != 0:
+            fehl["lokal"] = "wb-mlx-server status scheitert (rc=%s%s)" % (rc, _letzte_zeile(err or aus))
+    for m in ctx["maschinen"]:
+        kat = "maschine:%s" % m["name"]
+        if kat not in kategorien:
+            continue
+        ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", m["ssh"]]
+        rc, _, _ = laufe(ssh + ["true"], 20)
+        if rc != 0:
+            fehl[kat] = "ssh %s nicht erreichbar (rc=%s)" % (m["name"], rc)
+            continue
+        rc, _, _ = laufe(ssh + ["PATH=$HOME/.local/bin:$PATH claude -p ok --max-turns 1"], 90)
+        if rc != 0:
+            fehl[kat] = "claude -p auf %s antwortet nicht (rc=%s)" % (m["name"], rc)
+            continue
+        traeger = m["traegerPfad"] or "wb-traeger"
+        rc, _, _ = laufe(ssh + ["PATH=$HOME/.local/bin:$PATH %s status --json" % traeger], 30)
+        if rc != 0:
+            fehl[kat] = "wb-traeger status auf %s scheitert (rc=%s)" % (m["name"], rc)
+    return fehl
+
+
+def lebenszeichen(ctx, zustand, aufgaben):
+    """Fällig, wenn noch keins vorliegt, das letzte eine Stunde alt ist, das
+    letzte scheiterte, oder eine Art Aufgabe dazukam, die noch nicht geprüft
+    wurde. Der Merker liegt in der Zustandsdatei, nicht im Prozess: ein
+    abgelöster Träger nach `nachsehen` prüft also nicht gleich noch einmal.
+    Fehlschlag: nur die betroffenen Aufgaben auf „steckt (Umgebung)"; gelingt
+    eine spätere Probe, kehren sie auf steckt_vorher zurück. Nach dem
+    Anmeldestart wird die erste Probe einmal wiederholt, bevor „steckt" kommt."""
+    kategorien = set()
+    for a in aufgaben:
+        kat = kategorie(ctx, a)
+        if kat and (betroffen_bei_umgebung(a) or umgebung_steckt(a)):
+            kategorien.add(kat)
+    letztes = zustand.get("lebenszeichen") or {}
+    seit = sekunden_seit(letztes.get("zeit")) if letztes.get("zeit") else None
+    if seit is not None and seit < LEBENSZEICHEN_ABSTAND_S and letztes.get("ergebnis") == "ok" \
+            and kategorien <= set(letztes.get("geprueft") or []):
+        return
+    fehl = proben(ctx, kategorien)
+    if fehl and ctx["anmeldestart"] and not ctx["erste_probe_wiederholt"]:
+        ctx["erste_probe_wiederholt"] = True
+        time.sleep(float(os.environ.get("WB_TRAEGER_WIEDERHOLUNG_S", 10)))
+        fehl = proben(ctx, kategorien)
+    zustand["lebenszeichen"] = {"zeit": jetzt_iso(), "ergebnis": "fehlgeschlagen" if fehl else "ok",
+                                "geprueft": sorted(kategorien), "fehler": fehl}
+    # Companion-Meldung „einmal je Lebenszeichen-Takt" (Anhang „Companion-Socket"):
+    # das Lebenszeichen ist der einzige Takt, den es schon gibt und dessen
+    # Fälligkeit nicht an einem Standwechsel hängt — hier reitet der periodische
+    # `status` mit, mit der frischen Lebenszeichen-Zeit als eigenem Ereignis,
+    # damit ein unverändertes Ereignis auf eine spätere Runde nicht als „schon
+    # gemeldet" gilt.
+    for a in aufgaben:
+        melden(a["id"], "lebenszeichen:%s" % zustand["lebenszeichen"]["zeit"])
+    for a in aufgaben:
+        kat = kategorie(ctx, a)
+        if kat in fehl and betroffen_bei_umgebung(a):
+            stand_setzen(ctx, a["id"], "steckt", grund="Umgebung")
+            verlauf_schreiben(ctx, a["id"], "steckt", "Lebenszeichen: %s" % fehl[kat], grund="Umgebung")
+            melden(a["id"], "steckt:Umgebung")
+        elif kat in kategorien and kat not in fehl and umgebung_steckt(a) and a["verlauf"].get("steckt_vorher"):
+            stand_setzen(ctx, a["id"], a["verlauf"]["steckt_vorher"], grund="Umgebung wieder da")
+            zustand.setdefault("aufnahme_fehler", {}).pop(a["id"], None)
+            melden(a["id"], "umgebung:ok")
+    if fehl:
+        protokoll(ctx, "Lebenszeichen fehlgeschlagen: %s" % "; ".join(sorted(fehl.values())))
+
+
+# ---------------------------------------------------- 2. Wecker --
+def wecker_lesen(ctx):
+    verz = os.path.join(ctx["vorrat"], ".wecker")
+    funde = []
+    for name in sorted(os.listdir(verz)):
+        pfad = os.path.join(verz, name)
+        if not os.path.isfile(pfad):
+            continue
+        try:
+            with open(pfad, encoding="utf-8") as f:
+                teile = f.read().split()
+        except OSError:
+            teile = []
+        os.unlink(pfad)
+        if len(teile) >= 2 and teile[-1] in ("zugende", "limit"):
+            funde.append({"id": name, "zeit": teile[0], "grund": teile[-1]})
+        else:
+            protokoll(ctx, "Wecker %s unlesbar (%r), gelöscht" % (name, " ".join(teile)))
+    return funde
+
+
+def kontingent_pause(ctx, a):
+    """Fünf-Stunden-Fenster: pausiert (Kontingent) mit der gemessenen
+    Reset-Zeit; ohne lesbare Zeit „steckt (Umgebung)" statt einer erfundenen."""
+    urteil, daten = kontingent(ctx)
+    if urteil == "fenster":
+        weckzeit = wirksame_weckzeit(ctx, a, daten["five_hour_resets_at"])
+        stand_setzen(ctx, a["id"], "pausiert (Kontingent)", grund=GRUND_KONTINGENT, weckzeit=weckzeit)
+        melden(a["id"], "pausiert:Kontingent")
+        return True
+    if urteil == "keine-quelle":
+        stand_setzen(ctx, a["id"], "steckt", grund="Umgebung")
+        verlauf_schreiben(ctx, a["id"], "steckt", "Kontingent ohne lesbare Reset-Zeit", grund="Umgebung")
+        melden(a["id"], "steckt:Umgebung")
+        return True
+    return False
+
+
+def wecker_eins(ctx, a, w):
+    if w["grund"] == "limit":
+        verlauf_schreiben(ctx, a["id"], "limit", "Rate-Limit gemeldet (Stop-Hook, %s)" % w["zeit"])
+        if a["stand"] == "läuft" and a["klasse"] == "cloud":
+            kontingent_pause(ctx, a)
+
+
+def wecker_bearbeiten(ctx, wecker):
+    for w in wecker:
+        a = aufgabe_frisch(ctx, w["id"])
+        if a is None:
+            protokoll(ctx, "Wecker für %s: nicht im Vorrat" % w["id"])
+            continue
+        try:
+            wecker_eins(ctx, a, w)
+        except Exception as e:
+            aufgabe_fehler(ctx, a, e)
+        ctx["zugende"].append(w)
+
+
+# ---------------------------------------------- 3. Lebendigkeit --
+def wiederbelebung(ctx, zustand, a):
+    """Tote Sitzung eines laufenden Cloud-Hauptagenten: höchstens zweimal mit
+    Abstand über wb-revive, danach „steckt (Hauptagent weg)". Hat er nichts
+    entschieden und arbeitet kein Worker, bekommt er nach gelungener
+    Wiederbelebung die Sicherungsnachricht über die Inbox."""
+    abstand = zahl_einstellung(ctx["base"], "agents.wiederbelebungAbstandSekunden",
+                               WIEDERBELEBUNG_ABSTAND_VORGABE_S)
+    merker = zustand.setdefault("wiederbelebung", {}).get(a["id"]) or {"versuche": 0}
+    seit = sekunden_seit(merker.get("letzte")) if merker.get("letzte") else None
+    if seit is not None and seit < abstand:
+        return
+    if merker["versuche"] >= WIEDERBELEBUNG_HOECHSTENS:
+        stand_setzen(ctx, a["id"], "steckt", grund="Hauptagent weg")
+        verlauf_schreiben(ctx, a["id"], "steckt",
+                          "Wiederbelebung %d-mal gescheitert" % merker["versuche"], grund="Hauptagent weg")
+        zustand["wiederbelebung"].pop(a["id"], None)
+        melden(a["id"], "steckt:Hauptagent weg")
+        return
+    # wb-revive startet claude im selben Projekt neu: dieselbe Vertrauensprüfung
+    # wie jeder neue Start, sonst hinge die Wiederbelebung im Trust-Dialog.
+    urteil = vertrauen_herstellen(ctx, a["projekt"])
+    if urteil:
+        tor_scheitert(ctx, a, urteil)
+        return
+    pane = (a["verlauf"].get("hauptagent_sitzung") or {}).get("pane") or ""
+    # Ohne Pane gäbe wb-revive den Pane des Aufrufers wieder, nie den der Aufgabe.
+    rc, aus, fehl = laufe(["wb-revive", pane], 60) if pane else (2, "", "keine Pane-Kennung bekannt")
+    merker = {"versuche": merker["versuche"] + 1, "letzte": jetzt_iso()}
+    zustand["wiederbelebung"][a["id"]] = merker
+    if rc == 0 and pane_lebt(pane):
+        wb_aufgabe(ctx, ["sitzung", a["id"], "setzen", "--pane", pane,
+                         "--pid", str((pane_info(pane) or {}).get("pid") or 0)])
+        verlauf_schreiben(ctx, a["id"], "geweckt", "Hauptagent wiederbelebt (Pane %s, Versuch %d)"
+                          % (pane, merker["versuche"]))
+        frisch = aufgabe_frisch(ctx, a["id"])
+        if frisch and kein_worker_arbeitet(frisch) and not hat_entschieden(frisch):
+            zustellen(ctx, frisch, SICHERUNG_NACHRICHT,
+                      "sicherung-%s-tot-%s" % (a["id"], merker["letzte"]), automatisch=True)
+    else:
+        protokoll(ctx, "Aufgabe %s: wb-revive %s gescheitert (rc=%s) %s"
+                  % (a["id"], pane, rc, (aus + fehl).strip()[:160]))
+
+
+def lebendigkeit_eine(ctx, a, zustand):
+    """`sitzung gesehen` höchstens einmal je fünf Minuten: jeder Stempel ist
+    ein Schreibvorgang auf die Verlaufsdatei, die der Hauptagent gleichzeitig führt."""
+    if a["stand"] != "läuft" or a["klasse"] != "cloud" or a["maschine"] != ctx["eigene"]:
+        return
+    sitzung = a["verlauf"].get("hauptagent_sitzung") or {}
+    if pane_lebt(sitzung.get("pane")):
+        seit = sekunden_seit(sitzung.get("zuletzt_gesehen")) if sitzung.get("zuletzt_gesehen") else None
+        if seit is None or seit >= GESEHEN_ABSTAND_S:
+            wb_aufgabe(ctx, ["sitzung", a["id"], "gesehen"])
+        zustand.setdefault("wiederbelebung", {}).pop(a["id"], None)
+    else:
+        wiederbelebung(ctx, zustand, a)
+
+
+# ---------------------------------------------- 5. Sicherung --
+def sicherung_eine(ctx, a, w):
+    if a["stand"] != "läuft" or a["klasse"] != "cloud":
+        return
+    if not kein_worker_arbeitet(a):
+        protokoll(ctx, "Aufgabe %s: Sicherung entfällt, ein Worker arbeitet" % a["id"])
+        return
+    if hat_entschieden(a):
+        return
+    if arbeitet_gerade(ctx, a, w["zeit"]):
+        protokoll(ctx, "Aufgabe %s: seit dem Wecker %s arbeitet der Hauptagent, keine Sicherung" % (a["id"], w["zeit"]))
+        return
+    zustellen(ctx, a, SICHERUNG_NACHRICHT, "sicherung-%s-%s" % (a["id"], w["zeit"]), automatisch=True)
+
+
+def sicherung_zugende(ctx):
+    for w in ctx["zugende"]:
+        if w["grund"] != "zugende":
+            continue
+        a = aufgabe_frisch(ctx, w["id"])
+        if a is None:
+            continue
+        try:
+            sicherung_eine(ctx, a, w)
+        except Exception as e:
+            aufgabe_fehler(ctx, a, e)
+
+
+def repo_belegt_durch(ctx, a):
+    schluessel = wa().repo_schluessel(a["projekt"])
+    if not schluessel:
+        return None
+    for b in alle_aufgaben(ctx):
+        if b["id"] != a["id"] and wa().repo_schluessel(b["projekt"]) == schluessel \
+                and wa().belegt_repo(b["verlauf"]):
+            return b["id"]
+    return None
+
+
+def freigabe_pruefen(ctx, a):
+    """Vor jedem Start und jedem Wecken: nur ein Hash, der zum Auftrag passt,
+    ist eine Freigabe. Sonst wartet die Aufgabe auf den Nutzer."""
+    if wa().freigabe_gueltig(a["auftrag"]):
+        return True
+    nicht_gestartet(ctx, a, GRUND_FREIGABE_UNGUELTIG)
+    stand_setzen(ctx, a["id"], "wartet auf den Nutzer", grund=GRUND_FREIGABE_UNGUELTIG)
+    melden(a["id"], "wartet:%s" % GRUND_FREIGABE_UNGUELTIG)
+    return False
+
+
+def weckzeit_eine(ctx, a, zustand, fenster):
+    """Verstrichene Weckzeit. Pausierte Aufgabe: wecken. Laufende Aufgabe, die
+    seit der Weckzeit nichts getan hat: Sicherung. Der Mindestabstand entfällt
+    für hinterlassene Weckzeiten und Reset-Zeiten."""
+    if a["maschine"] != ctx["eigene"]:
+        return
+    wz = a["verlauf"].get("weckzeit")
+    if not wz or not epoch_von(wz) or jetzt().timestamp() < epoch_von(wz):
+        return
+    if a["stand"] == "läuft":
+        if kein_worker_arbeitet(a) and not arbeitet_gerade(ctx, a, wz):
+            zustellen(ctx, a, SICHERUNG_NACHRICHT, "weckzeit-%s-%s" % (a["id"], wz), automatisch=False)
+        wb_aufgabe(ctx, ["weckzeit", a["id"], "keine"])
+        return
+    if a["stand"] not in AKTIVE_PAUSEN:
+        return
+    if fenster and im_fenster(jetzt(), fenster) and nachtmodus(a) == "pausieren":
+        return
+    andere = repo_belegt_durch(ctx, a)
+    if andere:
+        nicht_gestartet(ctx, a, GRUND_REPO_BELEGT.format(andere=andere))
+        return
+    wecken(ctx, zustand, a, wz)
+
+
+def weckzeiten(ctx, zustand, aufgaben):
+    je_aufgabe(ctx, aufgaben, weckzeit_eine, zustand, nachtfenster(ctx["base"]))
+
+
+def wecken(ctx, zustand, a, wz):
+    """Lebende Cloud-Sitzung: Nachricht über die Inbox, das Modell bleibt, wie
+    es läuft. Sonst ein neuer Start mit der Nachricht als erstem Prompt, durch
+    dasselbe Tor wie jeder Start (lokal: der nächste Zug samt Buchung)."""
+    if not freigabe_pruefen(ctx, a):
+        return
+    grund = a["verlauf"].get("grund") or a["stand"]
+    text = WECKEN_NACHRICHT.format(weckzeit=wz, grund=grund, id=a["id"])
+    kennung = "wecken-%s-%s" % (a["id"], wz)
+    pane = (a["verlauf"].get("hauptagent_sitzung") or {}).get("pane")
+    if a["klasse"] == "cloud" and pane and pane_lebt(pane):
+        urteil, _ = kontingent(ctx)
+        if urteil in ("fenster", "keine-quelle"):
+            kontingent_pause(ctx, a)
+            return
+        if zustellen(ctx, a, text, kennung, automatisch=False) in ("zugestellt", "quittiert"):
+            wb_aufgabe(ctx, ["stand", a["id"], "läuft", "--weckzeit", "keine", "--grund", "geweckt",
+                             "--von", "traeger"])
+            verlauf_schreiben(ctx, a["id"], "geweckt", "über die Inbox geweckt (%s)" % wz)
+            melden(a["id"], "geweckt")
+        return
+    m = modell_fuer_start(ctx, a)
+    if m.get("nicht") == GRUND_KONTINGENT:
+        kontingent_pause(ctx, a)
+        return
+    if tor_scheitert(ctx, a, m):
+        return
+    if m["klasse"] == "cloud":
+        cloud_starten(ctx, a, m["model"], m["effort"], text, art="geweckt",
+                      urteil=m.get("urteil"), fallback_grund=m["fallback_grund"])
+        return
+    if lokal_zug_mit_buchung(ctx, zustand, a, m["model"], m["effort"], text, art="geweckt"):
+        verlauf_schreiben(ctx, a["id"], "zustellung", text, kennung=kennung)
+
+
+# ---------------------------------------------- 6. Nacht --
+def nacht_eine(ctx, a, fenster):
+    if a["stand"] != "läuft" or nachtmodus(a) != "pausieren" or a["maschine"] != ctx["eigene"]:
+        return
+    ende = fenster_ende(jetzt(), fenster)
+    stand_setzen(ctx, a["id"], "pausiert (Nacht)", grund="Nachtfenster", weckzeit=punkt_zu_iso(ende))
+    frisch = aufgabe_frisch(ctx, a["id"])
+    zustellen(ctx, frisch, NACHTPAUSE_NACHRICHT,
+              "nachtpause-%s-%s" % (a["id"], ende.date().isoformat()), automatisch=False)
+    melden(a["id"], "nachtpause")
+
+
+def nacht(ctx, aufgaben):
+    """Im Nachtfenster: jede laufende Aufgabe mit „pausieren" auf „pausiert
+    (Nacht)" mit Weckzeit am Fensterende und der Nachtpause an den Hauptagenten.
+    Idempotent über den Stand."""
+    fenster = nachtfenster(ctx["base"])
+    if fenster and im_fenster(jetzt(), fenster):
+        je_aufgabe(ctx, aufgaben, nacht_eine, fenster)
+
+
+# ---------------------------------------------- 7. Starten --
+def nicht_gestartet(ctx, a, grund):
+    """Den Grund wörtlich in den Verlauf, aber nicht je Takt neu."""
+    frisch = aufgabe_frisch(ctx, a["id"]) or a
+    for e in reversed(eintraege(frisch)):
+        if e.get("art") == "nicht-gestartet":
+            if e.get("text") == grund:
+                return
+            break
+    verlauf_schreiben(ctx, a["id"], "nicht-gestartet", grund)
+    melden(a["id"], "nicht-gestartet:%s" % grund)
+
+
+def sessionname_fuer(projekt, id_):
+    """Die Namensform von wb-code mit --key: wb-<basisname>-<md5-6>-<key>."""
+    san = re.sub(r"[^a-zA-Z0-9-]", "-", os.path.basename(projekt.rstrip("/")) or "projekt")
+    return "wb-%s-%s-%s" % (san, hashlib.md5(projekt.encode("utf-8")).hexdigest()[:6], id_)
+
+
+def permmode_flags(ctx):
+    """Wie wb-code: nur bei gültiger Settings-Datei, nur die sechs bekannten Werte."""
+    if laufe(["wb-state", "settings", "valid"], 10)[0] != 0:
+        return []
+    wert = einstellung(ctx["base"], "orchestratorPermissionMode", "")
+    if wert in ("acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"):
+        return ["--permission-mode", wert] + \
+            (["--allow-dangerously-skip-permissions"] if wert == "bypassPermissions" else [])
+    return []
+
+
+def kontextwache_starten(ctx, id_, projekt, pane):
+    guard = shutil.which("context-guard")
+    if not guard:
+        protokoll(ctx, "Aufgabe %s: context-guard fehlt, keine Kontextwache" % id_)
+        return
+    log = os.path.join(os.path.expanduser("~"), ".local", "state", "wb-traeger-guard-%s.log" % id_)
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    with open(log, "ab") as logdatei:
+        subprocess.Popen([guard, "--auto", pane, "--exit-when-session-gone"],
+                         env=dict(os.environ, PROJECT=projekt), stdout=logdatei,
+                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def vertrauen_herstellen(ctx, projekt):
+    """Vor jedem neuen Claude-Hauptagenten: ein Projekt, das noch nie eine
+    Sitzung sah, bliebe sonst im Dialog „Quick safety check: Is this a project
+    you created or one you trust?" stehen, und die Aufgabe stünde für immer auf
+    „läuft" (gemessen im Ende-zu-Ende-Lauf am 11.09. um 01:19). `wb-vertrauen`
+    trägt ein, wenn der Nutzer den Hauptbaum oder einen Vorfahren unter $HOME
+    schon vertraut hat, und endet immer mit 0; entschieden wird deshalb an
+    seiner Meldung. None, wenn gestartet werden darf, sonst ein Tor-Urteil
+    wie aus modell_fuer_start()."""
+    if not shutil.which("wb-vertrauen"):
+        return {"steckt": "wb-vertrauen fehlt im PATH, ein neues Projekt hinge im Trust-Dialog"}
+    _, _, meldung = laufe(["wb-vertrauen", projekt, "--pruefen"], 30)
+    if "wb-vertrauen: schon vertraut:" in meldung:
+        return None
+    if "wb-vertrauen: wuerde eintragen:" not in meldung:
+        return {"warten": GRUND_NICHT_VERTRAUT.format(verzeichnis=projekt)}
+    rc, _, meldung = laufe(["wb-vertrauen", projekt], 30)
+    if "wb-vertrauen: eingetragen:" in meldung or "wb-vertrauen: schon vertraut:" in meldung:
+        return None
+    # Prüfung sagte ja, Eintragen gelang nicht (Sperre): im nächsten Takt wieder.
+    return {"nicht": "Projekt-Vertrauen nicht eingetragen: %s"
+                     % (meldung.strip()[:160] or "rc=%s" % rc)}
+
+
+def hauptagent_starten(ctx, a, model, effort, prompt):
+    """Cloud-Hauptagent als Orchestrator-Sitzung nach dem Muster von wb-code,
+    ohne Terminal. wb-code selbst legt die Sitzung ohne TTY zwar an, endet dann
+    aber mit rc 1 am `exec tmux attach` und kann weder WB_AUFGABE_* in die
+    Sitzung reichen (ein laufender tmux-Server gibt dem neuen Pane seine eigene
+    Umgebung) noch einen ersten Prompt (gemessen am 10.09., siehe Ergebnis des
+    Auftrags traeger). Die claude-Zeile folgt wb-code; `--remote-control` hängt
+    an, wenn der Pane ein Terminal hat — tmux gibt jedem Pane ein pty, der
+    Zweig ohne ist die Absicherung. Rückgabe (pane, fehler); fehler ist ein
+    Tor-Urteil (dict), wenn das Projekt nicht vertraut ist."""
+    id_, projekt = a["id"], a["projekt"]
+    if not re.match(r"^[A-Za-z0-9._-]+$", id_):
+        return None, "Kennung %r taugt nicht als Sitzungsname" % id_
+    session = sessionname_fuer(projekt, id_)
+    if laufe(tmux("has-session", "-t", "=" + session), 10)[0] == 0:
+        # Je Aufgabe höchstens eine Sitzung: eine lebende wird weiterbenutzt und
+        # bekommt den Prompt über die Inbox, nur eine tote wird ersetzt.
+        rc, aus, _ = laufe(tmux("list-panes", "-t", "=" + session, "-F", "#{pane_id}"), 10)
+        alt = aus.split()[0] if rc == 0 and aus.split() else None
+        if alt and pane_lebt(alt):
+            if not inbox_senden(ctx, id_, alt, prompt):
+                return None, "Sitzung %s lebt, Prompt nicht zustellbar" % session
+            wb_aufgabe(ctx, ["sitzung", id_, "setzen", "--tmux-session", session, "--pane", alt,
+                             "--pid", str((pane_info(alt) or {}).get("pid") or 0)])
+            return alt, None
+        laufe(tmux("kill-session", "-t", "=" + session), 10)
+    urteil = vertrauen_herstellen(ctx, projekt)
+    if urteil:
+        return None, urteil
+    eintrag = registry_eintrag(model, ctx["base"]) or {}
+    ref = eintrag.get("modelRef") or model
+    teile = ["export WB_AUFGABE_ID=%s WB_AUFGABE_PROJEKT=%s WB_AUFGABE_BASE=%s;"
+             % (shlex.quote(id_), shlex.quote(projekt), shlex.quote(ctx["base"])),
+             'FERN=""; [ -t 0 ] && FERN="--remote-control %s";' % id_,
+             "exec $HOME/.local/bin/claude --model %s --effort %s -n %s"
+             % (shlex.quote(ref), shlex.quote(effort), shlex.quote(id_))]
+    teile += [shlex.quote(f) for f in permmode_flags(ctx)]
+    teile += ['$FERN --append-system-prompt "$(cat $HOME/.claude/roles/orchestrator.md)"']
+    innen = " ".join(teile)
+    rc, _, fehl = laufe(tmux("new-session", "-d", "-s", session, "-c", projekt,
+                             "bash -lc %s" % shlex.quote(innen + " " + shlex.quote(prompt))), 30)
+    if rc != 0:
+        return None, "tmux new-session scheiterte (rc=%s): %s" % (rc, fehl.strip()[:200])
+    rc, aus, _ = laufe(tmux("list-panes", "-t", "=" + session, "-F", "#{pane_id}"), 10)
+    pane = aus.split()[0] if rc == 0 and aus.split() else None
+    if not pane:
+        return None, "Sitzung %s ohne Pane" % session
+    # @wb_cmd ohne den ersten Prompt: wb-revive hängt die Fortsetzung an und
+    # darf den Anfangsauftrag nicht ein zweites Mal schicken.
+    laufe(tmux("set-option", "-p", "-t", pane, "@wb_cmd", "bash -lc %s" % shlex.quote(innen)), 10)
+    laufe(tmux("set-option", "-p", "-t", pane, "remain-on-exit", "on"), 10)
+    laufe(tmux("select-pane", "-t", pane, "-T", "ORCHESTRATOR"), 10)
+    if shutil.which("wb-rolle"):
+        laufe(["wb-rolle", "setzen", pane, "orchestrator"], 10)
+    else:
+        laufe(tmux("set-option", "-p", "-t", pane, "@wb_role", "orchestrator"), 10)
+    if shutil.which("wb-state"):
+        laufe(["wb-state", "touch", projekt, session, "--key", id_, "--name", id_,
+               "--harness", "claude", "--model", model], 20)
+    kontextwache_starten(ctx, id_, projekt, pane)
+    info = pane_info(pane) or {}
+    wb_aufgabe(ctx, ["sitzung", id_, "setzen", "--tmux-session", session, "--pane", pane,
+                     "--pid", str(info.get("pid") or 0)])
+    if not info.get("tty"):
+        verlauf_schreiben(ctx, id_, "fernsteuerung", "Fernsteuerung fehlt: kein TTY")
+    return pane, None
+
+
+def lokal_gemessen(ctx):
+    return str(einstellung(ctx["base"], "agents.lokalerHauptagentGemessen", "false")).strip().lower() == "true"
+
+
+def fallback_waehlen(ctx, a, bedingung):
+    """Das Fallback des Hauptagenten, wenn es der Träger starten kann: nie
+    Fable, bei „Daten lokal" nur lokal. bedingung: 'lokal' oder 'cloud'."""
+    fb = (a["auftrag"].get("hauptagent") or {}).get("fallback")
+    if not isinstance(fb, dict) or not fb.get("model") or ist_fable(fb["model"]):
+        return None
+    klasse = modell_klasse(fb["model"], ctx["base"])
+    if (a["auftrag"].get("grenzen") or {}).get("daten-lokal") and klasse != "lokal":
+        return None
+    if klasse != bedingung or (klasse == "lokal" and not lokal_gemessen(ctx)):
+        return None
+    return fb
+
+
+def modell_fuer_start(ctx, a):
+    """Das eine Tor für jeden Start und jedes Wecken. Rückgabe entweder
+    {model, effort, klasse, fallback_grund, urteil} oder genau einer der
+    Schlüssel warten (nie startbar ohne den Nutzer), nicht (heute nicht) oder
+    steckt (Umgebung)."""
+    auftrag = a["auftrag"]
+    hauptagent = auftrag.get("hauptagent") or {}
+    grenzen = auftrag.get("grenzen") or {}
+    model = hauptagent.get("model") or ""
+    effort = hauptagent.get("effort")
+    fallback_grund = None
+    if ist_fable(model) and not (auftrag.get("freigaben") or {}).get("fable"):
+        verlauf_schreiben(ctx, a["id"], "fallback-gewechselt",
+                          "Fable ohne Freigabe: Start mit opus5 statt %s" % model, grund="Fable-Sperre")
+        model, fallback_grund = "opus5", "Fable-Sperre"
+    klasse = modell_klasse(model, ctx["base"])
+    if klasse == "unbekannt":
+        return {"warten": GRUND_MODELL_UNBEKANNT.format(model=model or "(leer)")}
+    if grenzen.get("daten-lokal") and klasse != "lokal":
+        return {"warten": GRUND_DATEN_LOKAL}
+    if klasse == "lokal":
+        if not lokal_gemessen(ctx):
+            return {"warten": GRUND_LOKAL_UNGEMESSEN if grenzen.get("daten-lokal")
+                    else GRUND_LOKAL_UNGEMESSEN_ALLGEMEIN}
+        return {"model": model, "effort": effort or "medium", "klasse": "lokal",
+                "fallback_grund": fallback_grund}
+    urteil, _ = kontingent(ctx)
+    if urteil == "fenster":
+        fb = fallback_waehlen(ctx, a, "lokal")
+        if fb:
+            verlauf_schreiben(ctx, a["id"], "fallback-gewechselt",
+                              "%s nicht frei (Fünf-Stunden-Fenster), Fallback %s" % (model, fb["model"]),
+                              grund=GRUND_KONTINGENT)
+            return {"model": fb["model"], "effort": fb.get("effort") or "medium", "klasse": "lokal",
+                    "fallback_grund": GRUND_KONTINGENT}
+        return {"nicht": GRUND_KONTINGENT}
+    if urteil == "keine-quelle":
+        return {"steckt": "Kontingent-Messwert unlesbar (wb-budget)"}
+    return {"model": model, "effort": effort or "high", "klasse": "cloud",
+            "fallback_grund": fallback_grund, "urteil": urteil}
+
+
+def tor_scheitert(ctx, a, m):
+    if "warten" in m:
+        nicht_gestartet(ctx, a, m["warten"])
+        stand_setzen(ctx, a["id"], "wartet auf den Nutzer", grund=m["warten"])
+        melden(a["id"], "wartet:%s" % m["warten"])
+        return True
+    if "nicht" in m:
+        nicht_gestartet(ctx, a, m["nicht"])
+        return True
+    if "steckt" in m:
+        stand_setzen(ctx, a["id"], "steckt", grund="Umgebung")
+        verlauf_schreiben(ctx, a["id"], "steckt", m["steckt"], grund="Umgebung")
+        melden(a["id"], "steckt:Umgebung")
+        return True
+    return False
+
+
+def cloud_starten(ctx, a, model, effort, prompt, art="gestartet", urteil=None, fallback_grund=None):
+    pane, fehler = hauptagent_starten(ctx, a, model, effort, prompt)
+    if isinstance(fehler, dict):
+        tor_scheitert(ctx, a, fehler)
+        return False
+    if fehler:
+        protokoll(ctx, "Aufgabe %s: Start scheiterte: %s" % (a["id"], fehler))
+        nicht_gestartet(ctx, a, GRUND_MODELL_NICHT_FREI)
+        return False
+    wb_aufgabe(ctx, ["stand", a["id"], "läuft", "--weckzeit", "keine", "--von", "traeger"])
+    verlauf_schreiben(ctx, a["id"], art, "Hauptagent %s: %s:%s (Pane %s)"
+                      % ("gestartet" if art == "gestartet" else "neu gestartet", model, effort, pane),
+                      grund=fallback_grund)
+    if urteil == "tageslimit":
+        verlauf_schreiben(ctx, a["id"], "tageslimit", GRUND_TAGESLIMIT,
+                          grund="läuft weiter, vergibt aber keine Claude-Agenten")
+    melden(a["id"], "%s:%s" % (art, model))
+    return True
+
+
+def start_versuchen(ctx, zustand, a):
+    """Prüft die Bedingungen einer Kandidatin. Rückgabe True, wenn gestartet;
+    sonst steht der Grund im Verlauf und die nächste Kandidatin ist dran."""
+    if not freigabe_pruefen(ctx, a):
+        return False
+    fenster = nachtfenster(ctx["base"])
+    if fenster and im_fenster(jetzt(), fenster) and nachtmodus(a) != "weiter-lokal":
+        nicht_gestartet(ctx, a, GRUND_NACHT)
+        return False
+    m = modell_fuer_start(ctx, a)
+    if tor_scheitert(ctx, a, m):
+        return False
+    if m["klasse"] == "lokal":
+        return lokal_zug_mit_buchung(ctx, zustand, a, m["model"], m["effort"],
+                                     ERSTER_PROMPT_VORLAGE.format(id=a["id"]))
+    if m["urteil"] == "veraltet":
+        erste = zustand.get("veraltet_start")
+        if erste and erste != a["id"]:
+            nicht_gestartet(ctx, a, GRUND_MESSWERT_VERALTET)
+            return False
+        zustand["veraltet_start"] = a["id"]
+    return cloud_starten(ctx, a, m["model"], m["effort"], ERSTER_PROMPT_VORLAGE.format(id=a["id"]),
+                         urteil=m["urteil"], fallback_grund=m["fallback_grund"])
+
+
+def starten(ctx, zustand):
+    """Die vorderste startbare Aufgabe dieser Maschine; je Takt höchstens ein
+    Start. Kandidatinnen, die nicht starten, tragen ihren Grund, und die nächste
+    kommt dran. Zurückgestellte (Repo belegt, Freigabe ungültig) meldet
+    wb-aufgabe naechste mit."""
+    if (zustand.get("veraltet_start") and
+            (kontingent(ctx)[0] != "veraltet" or
+             any(w["id"] == zustand["veraltet_start"] and w["grund"] == "zugende" for w in ctx["zugende"]))):
+        zustand.pop("veraltet_start", None)
+    ausser = []
+    for _ in range(NAECHSTE_HOECHSTENS):
+        argumente = ["naechste", "--maschine", ctx["eigene"], "--json"]
+        for x in ausser:
+            argumente += ["--ausser", x]
+        rc, aus, _ = wb_aufgabe(ctx, argumente)
+        try:
+            antwort = json.loads(aus) if aus.strip() else {}
+        except json.JSONDecodeError:
+            protokoll(ctx, "wb-aufgabe naechste: Ausgabe unlesbar: %r" % aus[:120])
+            return
+        for z in antwort.get("zurueckgestellt") or []:
+            a = aufgabe_frisch(ctx, z["id"])
+            if a and z["id"] not in ausser:
+                nicht_gestartet(ctx, a, z["grund"])
+                if z.get("warten"):
+                    stand_setzen(ctx, a["id"], "wartet auf den Nutzer", grund=z["grund"])
+                ausser.append(z["id"])
+        if rc != 0 or not antwort.get("id"):
+            return
+        a = aufgabe_frisch(ctx, antwort["id"])
+        if a is None:
+            return
+        try:
+            if start_versuchen(ctx, zustand, a):
+                return
+        except Exception as e:
+            aufgabe_fehler(ctx, a, e)
+        ausser.append(a["id"])
+
+
+# ---------------------------------------------- 8. Lokaler Hauptagent --
+def commit_pfade(ctx, a):
+    """Die Pfade aus `pfade` einzeln genannt committen, nie `git add -A`;
+    was die Prüfung von wb-aufgabe nicht besteht, bleibt draußen."""
+    projekt = a["projekt"]
+    pfade = [p for p in (a["verlauf"].get("pfade") or [])
+             if wa().pfad_gueltig(p) and os.path.exists(os.path.join(projekt, p))]
+    verworfen = [p for p in (a["verlauf"].get("pfade") or []) if not wa().pfad_gueltig(p)]
+    if verworfen:
+        protokoll(ctx, "Aufgabe %s: ungültige Pfade nicht committet: %r" % (a["id"], verworfen))
+    if not pfade or laufe(["git", "-C", projekt, "rev-parse", "--git-dir"], 30)[0] != 0:
+        return False
+    if laufe(["git", "-C", projekt, "add", "--"] + pfade, 60)[0] != 0:
+        return False
+    if not laufe(["git", "-C", projekt, "diff", "--cached", "--name-only", "--"] + pfade, 30)[1].strip():
+        return False
+    rc, _, fehl = laufe(["git", "-C", projekt, "commit", "-m",
+                         "Task %s: end of turn (local main agent)" % a["id"], "--"] + pfade, 60)
+    if rc != 0:
+        protokoll(ctx, "Aufgabe %s: Commit beim Zugende scheiterte: %s" % (a["id"], fehl.strip()[:200]))
+    return rc == 0
+
+
+def buchung_nehmen(ctx, a, model):
+    """wb-belegung nimm --json wie pi-worker; Rückgabe die Kennung ('' wenn
+    keine gemeldet wurde) oder None, wenn die Buchung abgelehnt ist."""
+    e = registry_eintrag(model, ctx["base"]) or {}
+    kontext = int(zahl_einstellung(ctx["base"], "agents.lokalerHauptagentKontext", LOKALER_KONTEXT_VORGABE))
+    rc, aus, _ = laufe(["wb-belegung", "nimm", "--gewichte-gb", str(float(e.get("gewichteGb") or 16.0)),
+                        "--modell", str(e.get("modelRef") or model), "--kontext", str(kontext),
+                        "--zweck", "Hauptagent %s" % a["id"], "--json"], 60)
+    try:
+        antwort = json.loads(aus) if aus.strip() else {}
+    except json.JSONDecodeError:
+        antwort = {}
+    if rc != 0 or not antwort.get("ja"):
+        return None
+    return antwort.get("kennung") or ""
+
+
+def buchung_geben(ctx, kennung):
+    """Erst der normale Weg, dann --fremd, wie pi-worker."""
+    if kennung and laufe(["wb-belegung", "gib", kennung], 30)[0] != 0:
+        laufe(["wb-belegung", "gib", kennung, "--fremd"], 30)
+
+
+def lokal_zug_mit_buchung(ctx, zustand, a, model, effort, nachricht, art="gestartet"):
+    """Jeder lokale Zug bucht vorher (ein großes Modell zur Zeit) und gibt
+    nachher frei; solange der alte pi-Prozess lebt, kommt kein neuer Zug.
+    Lehnt die Buchung ab, das lokale Fallback, sonst „das gewählte Modell nicht frei"."""
+    alt = (zustand.get("lokaler_zug") or {}).get(a["id"])
+    if alt and pid_lebt(alt.get("pid")):
+        nicht_gestartet(ctx, a, GRUND_ZUG_LAEUFT)
+        return False
+    kandidaten = [(model, effort, False)]
+    fb = fallback_waehlen(ctx, a, "lokal")
+    if fb and fb["model"] != model:
+        kandidaten.append((fb["model"], fb.get("effort") or "medium", True))
+    for kandidat, eff, ist_fb in kandidaten:
+        kennung = buchung_nehmen(ctx, a, kandidat)
+        if kennung is None:
+            continue
+        if ist_fb:
+            verlauf_schreiben(ctx, a["id"], "fallback-gewechselt",
+                              "%s nicht frei (Speicherbuchung), Fallback %s" % (model, kandidat),
+                              grund=GRUND_MODELL_NICHT_FREI)
+        return lokal_zug_starten(ctx, zustand, a, kandidat, eff, nachricht, art, kennung)
+    nicht_gestartet(ctx, a, GRUND_MODELL_NICHT_FREI)
+    return False
+
+
+def lokal_zug_starten(ctx, zustand, a, model, effort, nachricht, art, kennung):
+    """Je Zug ein eigener pi-Prozess über wb-nohup; ohne nachweisbaren
+    Eigentümer (wb-nohup lehnt ab) ein eigener abgelöster Prozess. Prozessende
+    ist Zugende."""
+    id_, projekt = a["id"], a["projekt"]
+    e = registry_eintrag(model, ctx["base"]) or {}
+    provider, ref = e.get("provider") or "ollama", e.get("modelRef") or model
+    sitzverz = os.path.join(projekt, ".companion", "auftraege", "%s.sitzung" % id_)
+    os.makedirs(sitzverz, exist_ok=True)
+    befehl = ["pi", "--provider", provider, "--model", ref, "--thinking", effort, "-p",
+              "--session-dir", sitzverz, "--session-id", id_]
+    if any(n.endswith((".json", ".jsonl")) for n in os.listdir(sitzverz)):
+        befehl.append("--continue")
+    rollenprompt = os.path.join(os.path.expanduser("~"), ".pi", "agent", "ORCHESTRATOR.md")
+    if os.path.isfile(rollenprompt):
+        befehl += ["--append-system-prompt", rollenprompt]
+    else:
+        protokoll(ctx, "Aufgabe %s: Rollenprompt %s fehlt" % (id_, rollenprompt))
+    befehl.append(nachricht)
+    umgebung = dict(os.environ, WB_AUFGABE_ID=id_, WB_AUFGABE_PROJEKT=projekt, WB_AUFGABE_BASE=ctx["base"])
+    log = os.path.join(os.path.expanduser("~"), ".local", "state", "wb-traeger-zug-%s.log" % id_)
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    pid = None
+    if shutil.which("wb-nohup"):
+        rc, aus, fehl = laufe(["wb-nohup", "traeger-%s" % id_, "--worker", "traeger:%s" % id_,
+                               "--log", log, "--"] + befehl, 30, env=umgebung)
+        letzte = aus.strip().splitlines()[-1] if aus.strip() else ""
+        if rc == 0 and letzte.isdigit():
+            pid = int(letzte)
+        else:
+            protokoll(ctx, "Aufgabe %s: wb-nohup lehnte ab (rc=%s): %s" % (id_, rc, fehl.strip()[:160]))
+    if pid is None:
+        with open(log, "ab") as logdatei:
+            pid = subprocess.Popen(befehl, cwd=projekt, env=umgebung, stdout=logdatei,
+                                   stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                   start_new_session=True).pid
+    frist = zahl_einstellung(ctx["base"], "agents.lokalerZugFristSekunden", LOKALER_ZUG_FRIST_VORGABE_S)
+    zustand.setdefault("lokaler_zug", {})[id_] = {"pid": pid, "gestartet": jetzt_iso(), "modell": model,
+                                                   "effort": effort, "frist_s": frist, "kennung": kennung}
+    wb_aufgabe(ctx, ["sitzung", id_, "setzen", "--pid", str(pid)])
+    wb_aufgabe(ctx, ["stand", id_, "läuft", "--weckzeit", "keine", "--von", "traeger"])
+    verlauf_schreiben(ctx, id_, art, "Zug des lokalen Hauptagenten: %s:%s (PID %s, Buchung %s)"
+                      % (model, effort, pid, kennung or "?"))
+    melden(id_, "lokal:%s" % art)
+    return True
+
+
+def lokaler_zug_eine(ctx, a, zustand):
+    """Lebt der Zug, nur die Frist überwachen. Endet er: Buchung freigeben,
+    Pfade committen, dann der nächste Zug — sofort bei „weiter"; ab dem
+    zweiten „weiter" ohne neuen Eintrag zu Worker oder Ergebnis erst nach dem
+    Mindestabstand; sonst, wenn nichts entschieden ist und kein Worker
+    arbeitet, mit der Sicherung."""
+    if a["stand"] != "läuft" or a["klasse"] != "lokal" or a["maschine"] != ctx["eigene"]:
+        return
+    id_ = a["id"]
+    zug = (zustand.get("lokaler_zug") or {}).get(id_)
+    if zug and pid_lebt(zug["pid"]):
+        alter = sekunden_seit(zug["gestartet"]) or 0
+        if alter > float(zug.get("frist_s") or LOKALER_ZUG_FRIST_VORGABE_S):
+            try:
+                os.killpg(int(zug["pid"]), signal.SIGTERM)
+            except OSError:
+                pass
+            verlauf_schreiben(ctx, id_, "zugende", "Zug an der Frist beendet (PID %s)" % zug["pid"],
+                              grund="Frist überschritten")
+        else:
+            seit = sekunden_seit((a["verlauf"].get("hauptagent_sitzung") or {}).get("zuletzt_gesehen"))
+            if seit is None or seit >= GESEHEN_ABSTAND_S:
+                wb_aufgabe(ctx, ["sitzung", id_, "gesehen"])
+        return
+    if not lokal_gemessen(ctx):
+        return
+    letzter_zug = zug["gestartet"] if zug else letzte_aktivierung(a)
+    if zug:
+        buchung_geben(ctx, zug.get("kennung"))
+        if commit_pfade(ctx, a):
+            verlauf_schreiben(ctx, id_, "zugende", "Pfade beim Zugende committet")
+        zustand["lokaler_zug"].pop(id_, None)
+    frisch = aufgabe_frisch(ctx, id_)
+    if frisch is None or frisch["stand"] != "läuft" or not kein_worker_arbeitet(frisch):
+        return
+    nachricht = lokal_nachricht_holen(ctx, id_)
+    neu = [e for e in eintraege(frisch) if epoch_von(e.get("zeit")) >= epoch_von(letzter_zug)]
+    weiter = [e for e in neu if e.get("art") == "weiter"]
+    if nachricht is None and weiter:
+        fortschritt = any(e.get("art") in ("worker-vergeben", "ergebnis") for e in neu)
+        weiter_bisher = zustand.setdefault("weiter_ohne_fortschritt", {})
+        zaehler = 0 if fortschritt else weiter_bisher.get(id_, 0) + 1
+        weiter_bisher[id_] = zaehler
+        if zaehler >= 2 and mindestabstand_haelt(ctx, frisch):
+            return
+        if zaehler >= 2:
+            verlauf_schreiben(ctx, id_, "zustellung", WEITER_NACHRICHT.format(id=id_),
+                              kennung="sicherung-%s-weiter-%s" % (id_, jetzt_iso()))
+        nachricht = WEITER_NACHRICHT.format(id=id_)
+    elif nachricht is None:
+        if hat_entschieden(frisch):
+            return
+        if zustellen(ctx, frisch, SICHERUNG_NACHRICHT, "sicherung-%s-%s" % (id_, letzter_zug),
+                     automatisch=True) != "zugestellt":
+            return
+        nachricht = lokal_nachricht_holen(ctx, id_)
+    hauptagent = frisch["auftrag"].get("hauptagent") or {}
+    lokal_zug_mit_buchung(ctx, zustand, frisch, (zug or {}).get("modell") or hauptagent.get("model", ""),
+                          (zug or {}).get("effort") or hauptagent.get("effort") or "medium", nachricht)
+
+
+def lokale_zuege(ctx, zustand, aufgaben):
+    je_aufgabe(ctx, aufgaben, lokaler_zug_eine, zustand)
+
+
+def lebendigkeit(ctx, zustand, aufgaben):
+    je_aufgabe(ctx, aufgaben, lebendigkeit_eine, zustand)
+
+
+# ---------------------------------------------- 9. Maschinen --
+def aufnahme_eine(ctx, a, zustand, ziele):
+    """Eine Aufgabe für eine andere Maschine: Auftrags- und Verlaufsdatei per
+    scp in dasselbe Projektverzeichnis dort, dann `wb-aufgabe aufnehmen
+    --maschine <ziel>`; git wird dafür nicht gebraucht. Scheitert das dreimal
+    hintereinander, steht die Aufgabe auf „steckt (Umgebung)" und wartet auf
+    ein gelungenes Lebenszeichen der Maschine."""
+    if a["maschine"] == ctx["eigene"] or umgebung_steckt(a):
+        return
+    m = ziele.get(a["maschine"])
+    if m is None:
+        protokoll(ctx, "Aufgabe %s: Maschine %s steht nicht in agents.maschinen" % (a["id"], a["maschine"]))
+        return
+    ordner = os.path.dirname(a["eintrag"]["auftrag"])
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", m["ssh"]]
+    scp = os.environ.get("WB_TRAEGER_SCP") or "scp"
+    schritte = [
+        ssh + ["mkdir -p %s" % shlex.quote(ordner)],
+        [scp, "-q", "-o", "BatchMode=yes", a["eintrag"]["auftrag"], a["verlauf_pfad"],
+         "%s:%s/" % (m["ssh"], ordner)],
+        ssh + ["PATH=$HOME/.local/bin:$PATH wb-aufgabe aufnehmen %s %s --maschine %s" % (
+            shlex.quote(a["projekt"]), shlex.quote(a["id"]), shlex.quote(m["name"]))],
+    ]
+    for befehl in schritte:
+        rc, aus, fehl = laufe(befehl, 60)
+        if rc != 0:
+            zaehler = zustand.setdefault("aufnahme_fehler", {}).get(a["id"], 0) + 1
+            zustand["aufnahme_fehler"][a["id"]] = zaehler
+            protokoll(ctx, "Aufgabe %s: Übergabe an %s scheiterte (%d. Mal, rc=%s): %s"
+                      % (a["id"], m["name"], zaehler, rc, (aus + fehl).strip()[:160]))
+            if zaehler >= AUFNAHME_HOECHSTENS:
+                stand_setzen(ctx, a["id"], "steckt", grund="Umgebung")
+                verlauf_schreiben(ctx, a["id"], "steckt", "Übergabe an %s %d-mal gescheitert"
+                                  % (m["name"], zaehler), grund="Umgebung")
+                melden(a["id"], "steckt:Umgebung")
+            return
+    zustand.setdefault("aufnahme_fehler", {}).pop(a["id"], None)
+    verlauf_schreiben(ctx, a["id"], "verschoben", "in den Vorrat von %s aufgenommen" % m["name"])
+    os.unlink(os.path.join(ctx["vorrat"], "%s.json" % a["id"]))
+    melden(a["id"], "verschoben:%s" % m["name"])
+
+
+def aufnahmen_versenden(ctx, zustand, aufgaben):
+    ziele = {m["name"]: m for m in ctx["maschinen"] if m["name"] != ctx["eigene"]}
+    je_aufgabe(ctx, aufgaben, aufnahme_eine, zustand, ziele)
+
+
+# ------------------------------------------------------------ Takt --
+def vorrat_lebendig(ctx, aufgaben):
+    """Ende, wenn nichts ohne Handlung des Nutzers weiterkommt. Nie startbare
+    Aufgaben stehen nach dem Takt schon auf „wartet auf den Nutzer"; eine
+    Aufgabe einer unerreichbaren anderen Maschine zählt erst nach einem
+    gelungenen Lebenszeichen wieder."""
+    for a in aufgaben:
+        if a["maschine"] != ctx["eigene"]:
+            if not umgebung_steckt(a):
+                return True
+            continue
+        if a["stand"] == "läuft":
+            return True
+        if a["stand"] in AKTIVE_PAUSEN and a["verlauf"].get("weckzeit"):
+            return True
+        if a["stand"] == "offen" and wa().freigabe_gueltig(a["auftrag"]):
+            return True
+        if umgebung_steckt(a):
+            return True
+    return False
+
+
+def companion_standwechsel(ctx, aufgaben):
+    """Letzte Takt-Phase: meldet den Stand jeder Aufgabe an den Companion.
+    melden()s Kennung (Stand, Grund, Weckzeit, verglichen mit der letzten
+    erfolgreichen Meldung) sorgt dafür, dass ein unveränderter Stand nur
+    einmal gemeldet wird, auch wenn eine Aufrufstelle ihn im selben Takt
+    schon gemeldet hat --
+    dieser Durchlauf erreicht deshalb auch einen Standwechsel, den nicht der
+    Träger selbst gesetzt hat (`wb-aufgabe frage`/`antwort`/`stand` durch den
+    Hauptagenten oder einen Menschen), statt nur die Stellen, an denen der
+    Träger den Stand selbst ändert."""
+    for a in aufgaben:
+        melden(a["id"], "stand:%s" % a["stand"])
+
+
+def phase(ctx, name, fn, *argumente):
+    try:
+        fn(*argumente)
+    except Exception as e:
+        try:
+            with open(os.path.join(ctx["vorrat"], ".traeger.log"), "a", encoding="utf-8") as f:
+                f.write("%s Phase %s: %s\n%s\n" % (jetzt_iso(), name, e, traceback.format_exc()))
+        except OSError:
+            pass
+        protokoll(ctx, "Phase %s: %s: %s" % (name, type(e).__name__, e))
+
+
+def takt_ausfuehren(ctx):
+    sperre = open(os.path.join(ctx["vorrat"], ".traeger.takt.lock"), "w")
+    try:
+        ende = time.time() + 120
+        while True:
+            try:
+                fcntl.flock(sperre, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() > ende:
+                    protokoll(ctx, "Taktsperre 120 s belegt, Takt ausgelassen")
+                    return
+                time.sleep(0.5)
+        ctx["budget"], ctx["zugende"], ctx["companion_versucht"] = None, [], set()
+        zustand = zustand_lesen(ctx)
+        phase(ctx, "lebenszeichen", lambda: lebenszeichen(ctx, zustand, alle_aufgaben(ctx)))
+        phase(ctx, "wecker", lambda: wecker_bearbeiten(ctx, wecker_lesen(ctx)))
+        phase(ctx, "lebendigkeit", lambda: lebendigkeit(ctx, zustand, alle_aufgaben(ctx)))
+        phase(ctx, "lokal", lambda: lokale_zuege(ctx, zustand, alle_aufgaben(ctx)))
+        phase(ctx, "sicherung", lambda: sicherung_zugende(ctx))
+        phase(ctx, "nacht", lambda: nacht(ctx, alle_aufgaben(ctx)))
+        phase(ctx, "weckzeiten", lambda: weckzeiten(ctx, zustand, alle_aufgaben(ctx)))
+        phase(ctx, "starten", lambda: starten(ctx, zustand))
+        phase(ctx, "maschinen", lambda: aufnahmen_versenden(ctx, zustand, alle_aufgaben(ctx)))
+        phase(ctx, "companion", lambda: companion_standwechsel(ctx, alle_aufgaben(ctx)))
+        zustand["letzter_takt"] = jetzt_iso()
+        zustand_schreiben(ctx, zustand)
+        ctx["takt_zaehler"] += 1
+        status_schreiben(ctx, zustand)
+    finally:
+        sperre.close()
+
+
+# ------------------------------------------------------------ Status --
+def status_schreiben(ctx, zustand):
+    je_stand = {}
+    for a in alle_aufgaben(ctx):
+        je_stand.setdefault(a["stand"] or "unbekannt", []).append(a["id"])
+    daten = {"gestartet": ctx["start_zeit"], "takt_sekunden": ctx["takt_s"],
+             "takt_zaehler": ctx["takt_zaehler"], "letzter_takt": jetzt_iso(),
+             "aufgaben": je_stand, "lebenszeichen": zustand.get("lebenszeichen") or {},
+             "protokoll": ctx["protokoll"][-20:]}
+    atomar_schreiben.schreiben(os.path.join(ctx["vorrat"], ".traeger.status.json"),
+                               json.dumps(daten, ensure_ascii=False, indent=2) + "\n")
+
+
+def pid_holen(ctx):
+    try:
+        with open(ctx["pid_datei"], encoding="utf-8") as f:
+            roh = f.read().strip()
+    except OSError:
+        return None
+    return int(roh) if roh.isdigit() else None
+
+
+def agentverkehr_pause_lesen(ctx):
+    """None, wenn der Schalter offen ist; sonst {"seit": …, "grund": …}
+    (beide können None sein, wenn die Merkerdatei älter oder leer ist)."""
+    pfad = os.path.join(ctx["vorrat"], ".agentverkehr-pause")
+    if not os.path.isfile(pfad):
+        return None
+    try:
+        with open(pfad, encoding="utf-8") as f:
+            daten = json.load(f)
+        if isinstance(daten, dict):
+            return {"seit": daten.get("seit"), "grund": daten.get("grund") or None}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"seit": None, "grund": None}
+
+
+def cmd_status(args):
+    ctx = kontext_bauen(args)
+    try:
+        with open(os.path.join(ctx["vorrat"], ".traeger.status.json"), encoding="utf-8") as f:
+            letzter = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        letzter = {}
+    pid = pid_holen(ctx)
+    laeuft = bool(pid and pid_lebt(pid))
+    je_stand = {}
+    for a in alle_aufgaben(ctx):
+        je_stand.setdefault(a["stand"] or "unbekannt", []).append(a["id"])
+    pause = agentverkehr_pause_lesen(ctx)
+    daten = {"maschine": ctx["eigene"], "laeuft": laeuft, "pid": pid if laeuft else None,
+             "gestartet": letzter.get("gestartet") if laeuft else None,
+             "takt_sekunden": ctx["takt_s"], "letzter_takt": letzter.get("letzter_takt"),
+             "aufgaben": je_stand,
+             "lebenszeichen": zustand_lesen(ctx).get("lebenszeichen") or {},
+             "pausenschalter": pause is not None,
+             "pausenschalter_seit": (pause or {}).get("seit"),
+             "pausenschalter_grund": (pause or {}).get("grund")}
+    if args.alle_maschinen:
+        daten["maschinen_status"] = {}
+        for m in ctx["maschinen"]:
+            if m["name"] == ctx["eigene"]:
+                continue
+            fern = "PATH=$HOME/.local/bin:$PATH %s status --json" % (m["traegerPfad"] or "wb-traeger")
+            rc, aus, fehl = laufe(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", m["ssh"], fern], 30)
+            try:
+                daten["maschinen_status"][m["name"]] = json.loads(aus) if rc == 0 else \
+                    {"fehler": (fehl.strip() or "nicht erreichbar (rc=%s)" % rc)[:200]}
+            except json.JSONDecodeError:
+                daten["maschinen_status"][m["name"]] = {"fehler": "Status nicht lesbar"}
+    if args.json:
+        print(json.dumps(daten, ensure_ascii=False))
+        return 0
+    kopf = ("läuft seit %s (PID %s)" % (daten["gestartet"], pid)) if laeuft else "läuft nicht"
+    print("wb-traeger %s: %s, Takt %gs, letzter Takt %s" % (ctx["eigene"], kopf, ctx["takt_s"],
+                                                           daten["letzter_takt"] or "keiner"))
+    for stand, ids in sorted(je_stand.items()):
+        print("  %-22s %d  %s" % (stand, len(ids), " ".join(ids)))
+    lz = daten["lebenszeichen"]
+    print("  Lebenszeichen: %s" % (("%s %s" % (lz.get("zeit"), lz.get("ergebnis"))) if lz else "noch keins"))
+    if daten["pausenschalter"]:
+        teile = ["pausiert"]
+        if daten.get("pausenschalter_seit"):
+            teile.append("seit %s" % daten["pausenschalter_seit"])
+        if daten.get("pausenschalter_grund"):
+            teile.append("(%s)" % daten["pausenschalter_grund"])
+        print("  Agent-Verkehr: %s" % " ".join(teile))
+    else:
+        print("  Agent-Verkehr: offen")
+    for name, st in (daten.get("maschinen_status") or {}).items():
+        print("  %s: %s" % (name, st.get("fehler") or ("läuft" if st.get("laeuft") else "läuft nicht")))
+    return 0
+
+
+# ------------------------------------------------ start / stop / nachsehen --
+_STOP = {"jetzt": False}
+
+
+def _beim_signal(_nr, _rahmen):
+    _STOP["jetzt"] = True
+
+
+def pid_sperre(ctx):
+    f = open(os.path.join(ctx["vorrat"], ".traeger.lock"), "a")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+def sperre_nehmen(ctx):
+    """PID-Datei anlegen oder eine verwaiste übernehmen, beides unter flock
+    auf .traeger.lock: zwei Starter, die gleichzeitig eine tote PID sehen,
+    können sich so nicht gegenseitig die frische Datei löschen."""
+    with pid_sperre(ctx):
+        alt = pid_holen(ctx)
+        if alt and alt != os.getpid() and pid_lebt(alt):
+            return False
+        atomar_schreiben.schreiben(ctx["pid_datei"], "%d\n" % os.getpid(), modus=0o644)
+        return True
+
+
+def sperre_abgeben(ctx):
+    with pid_sperre(ctx):
+        if pid_holen(ctx) == os.getpid():
+            os.unlink(ctx["pid_datei"])
+
+
+def schleife(ctx):
+    """Der laufende Träger. Endet, wenn nichts mehr ohne den Nutzer
+    weiterkommt, auf stop und auf SIGTERM; räumt PID-Datei und caffeinate.
+    Nach dem Abgeben der PID-Datei prüft er einmal neu: ein Anstoß, der in
+    dieser Lücke „läuft schon" hörte, geht so nicht verloren."""
+    if not sperre_nehmen(ctx):
+        print("wb-traeger: ein Träger läuft schon (PID %s), nichts getan." % pid_holen(ctx))
+        return 0
+    signal.signal(signal.SIGTERM, _beim_signal)
+    signal.signal(signal.SIGINT, _beim_signal)
+    ctx["start_zeit"] = jetzt_iso()
+    wach = None
+    if sys.platform == "darwin" and shutil.which("caffeinate"):
+        wach = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], stdin=subprocess.DEVNULL)
+    try:
+        while True:
+            while not _STOP["jetzt"]:
+                takt_ausfuehren(ctx)
+                if not vorrat_lebendig(ctx, alle_aufgaben(ctx)):
+                    protokoll(ctx, "Vorrat ohne Arbeit, die ohne den Nutzer weiterkommt: Ende")
+                    break
+                ende = time.time() + ctx["takt_s"]
+                while not _STOP["jetzt"] and time.time() < ende:
+                    time.sleep(0.2)
+            sperre_abgeben(ctx)
+            if _STOP["jetzt"] or not vorrat_lebendig(ctx, alle_aufgaben(ctx)) or not sperre_nehmen(ctx):
+                break
+    finally:
+        if wach is not None:
+            wach.terminate()
+            try:
+                wach.wait(5)
+            except subprocess.TimeoutExpired:
+                wach.kill()
+                wach.wait(5)
+        sperre_abgeben(ctx)
+    return 0
+
+
+def abloesen(ctx):
+    """start ohne --vordergrund: der Träger löst sich über wb-nohup ab, damit
+    er einen nachweisbaren Eigentümer hat; lehnt wb-nohup ab (kein Pane, kein
+    launchd-Job, keine Werkbank), ein eigener abgelöster Prozess."""
+    befehl = [sys.executable, SKRIPT, "start", "--vordergrund", "--base", ctx["base"], "--vorrat", ctx["vorrat"]]
+    log = os.path.join(os.path.expanduser("~"), ".local", "state", "wb-traeger.log")
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    if shutil.which("wb-nohup"):
+        rc, aus, fehl = laufe(["wb-nohup", "traeger", "--worker", "traeger", "--log", log, "--"] + befehl, 30)
+        if rc == 0:
+            print("wb-traeger: gestartet über wb-nohup (PID %s)." % (aus.strip().splitlines() or ["?"])[-1])
+            return 0
+        sys.stderr.write("wb-traeger: wb-nohup lehnte ab (rc=%s): %s — starte ohne Eintrag.\n"
+                         % (rc, fehl.strip()[:200]))
+    with open(log, "ab") as logdatei:
+        p = subprocess.Popen(befehl, stdout=logdatei, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+    print("wb-traeger: abgelöst gestartet (PID %s)." % p.pid)
+    return 0
+
+
+def cmd_start(args, ctx=None):
+    ctx = ctx or kontext_bauen(args)
+    laufend = pid_holen(ctx)
+    if laufend and laufend != os.getpid() and pid_lebt(laufend):
+        print("wb-traeger: ein Träger läuft schon (PID %s), nichts getan." % laufend)
+        return 0
+    return schleife(ctx) if args.vordergrund else abloesen(ctx)
+
+
+def cmd_stop(args):
+    ctx = kontext_bauen(args)
+    pid = pid_holen(ctx)
+    if pid is None:
+        print("wb-traeger: es läuft kein Träger (keine PID-Datei).")
+        return 0
+    if not pid_lebt(pid):
+        with pid_sperre(ctx):
+            if pid_holen(ctx) == pid:
+                os.unlink(ctx["pid_datei"])
+        print("wb-traeger: PID %s lebte nicht mehr, verwaiste PID-Datei geräumt." % pid)
+        return 0
+    os.kill(pid, signal.SIGTERM)
+    ende = time.time() + 15
+    while time.time() < ende and pid_lebt(pid):
+        time.sleep(0.2)
+    if pid_lebt(pid):
+        sys.stderr.write("wb-traeger: PID %s lebt 15 s nach SIGTERM noch; nichts weiter getan.\n" % pid)
+        return 1
+    with pid_sperre(ctx):
+        if pid_holen(ctx) == pid:
+            os.unlink(ctx["pid_datei"])
+    print("wb-traeger: Träger (PID %s) beendet, PID-Datei geräumt." % pid)
+    return 0
+
+
+def cmd_takt(args):
+    takt_ausfuehren(kontext_bauen(args))
+    return 0
+
+
+def cmd_nachsehen(args):
+    ctx = kontext_bauen(args)
+    ctx["anmeldestart"] = True
+    laufend = pid_holen(ctx)
+    if laufend and pid_lebt(laufend):
+        print("wb-traeger: ein Träger läuft schon (PID %s), nichts getan." % laufend)
+        return 0
+    takt_ausfuehren(ctx)
+    if not vorrat_lebendig(ctx, alle_aufgaben(ctx)):
+        print("wb-traeger: der Vorrat enthält nichts, das ohne den Nutzer weiterkommt. Ende.")
+        return 0
+    return cmd_start(args, ctx)
+
+
+def main():
+    gemeinsam = argparse.ArgumentParser(add_help=False)
+    gemeinsam.add_argument("--base", default=os.path.expanduser("~"))
+    gemeinsam.add_argument("--vorrat", default=None)
+    ap = argparse.ArgumentParser(prog="wb-traeger")
+    sub = ap.add_subparsers(dest="befehl", required=True)
+    for name, func in (("start", cmd_start), ("nachsehen", cmd_nachsehen)):
+        p = sub.add_parser(name, parents=[gemeinsam])
+        p.add_argument("--vordergrund", action="store_true")
+        p.set_defaults(func=func)
+    p = sub.add_parser("status", parents=[gemeinsam])
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--alle-maschinen", action="store_true")
+    p.set_defaults(func=cmd_status)
+    for name, func in (("stop", cmd_stop), ("takt", cmd_takt)):
+        sub.add_parser(name, parents=[gemeinsam]).set_defaults(func=func)
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

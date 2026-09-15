@@ -1,0 +1,299 @@
+#!/bin/bash
+# wb-omlx-server — bedarfsweiser oMLX-Server fuer Modelle im oMLX-Format
+# (oQ mixed-precision, eingebauter MTP-Kopf), Port 8079.
+#
+# WARUM EIGENES WERKZEUG, NICHT wb-mlx-server: das oMLX-Format (oQ4e/oQ6e,
+# Datei config.json mit per-Lage 4/5-bit affine) laedt NUR ueber `omlx serve`,
+# nicht ueber mlx_lm.server/mlx_vlm.server/mtplx/mlx-dspark/vllm -- die fuenf
+# Motoren, die wb-mlx-server kennt. Statt in das 3467-Zeilen-Sicherheitswerkzeug
+# einen sechsten Motor zu schneiden (der jede seiner ineinandergreifenden
+# Pruefungen -- Port-Signaturerkennung, Belegung, Notbremse, Stop-Verifikation --
+# anschneiden muesste und bei einem Fehler die GANZE lokale Flotte lahmlegt),
+# laeuft der oMLX-Weg hier getrennt. Dieselben Sicherungen (check-resources,
+# wb-belegung, Probeanfrage, Leerlauf-Stopp), eigener Port, eigener Zustand --
+# ein Fehler hier trifft qwen38/grug/ollama nicht.
+#
+# MTP: fuer oMLX-Modelle steht MTP (Lightning MTP, nativer Kopf) in
+# ~/.omlx/model_settings.json je Modell auf mtp_enabled=true -- immer an,
+# nicht abhaengig von einem Schalter hier. omlx serve liest das beim Laden.
+#
+# Usage:
+#   wb-omlx-server ensure <alias|id> [--frist <minuten>]
+#   wb-omlx-server stop
+#   wb-omlx-server status
+#
+# Aufgerufen von pi-worker (Provider omlx-lokal, wie mlx-lokal ueber
+# wb-mlx-server) und vom Menschen/Orchestrator direkt.
+set -uo pipefail
+
+# PORT 8078 = BACKEND (nicht der Port, auf den pi zeigt). Davor sitzt seit
+# 2026-09-01 wb-modell-proxy auf 8079 (Eintrag in ~/.config/wb-modell-proxy/
+# backends.json + Socket in agent-workbench.modell-proxy.plist), damit auch das
+# interaktiv geoeffnete pi das oMLX-Modell benutzen kann, ohne dass jemand
+# vorher `ensure` ruft -- dieselbe Bedarfsschaltung wie qwen38 auf 8080/8081.
+# pi's Provider omlx-lokal zeigt auf 8079 (Proxy), dieser Server lauscht auf
+# 8078 (Backend). Wer den Proxy nicht benutzt, spricht 8078 direkt an.
+PORT=8078
+HOSTB=127.0.0.1
+STATEDIR="$HOME/.local/state/wb-omlx-server"
+AKTUELL="$STATEDIR/aktuell.json"
+IDLE_MIN=20
+FRIST_VORGABE=150
+MODELSFILE="$HOME/.claude/workbench/models.json"
+WBB="$HOME/.local/bin/wb-belegung"
+WBN="$HOME/.local/bin/wb-nohup"
+OMLX="$(command -v omlx || echo /opt/homebrew/bin/omlx)"
+mkdir -p "$STATEDIR"
+
+err() { printf '%s\n' "$*" >&2; }
+
+# --- Registry-Aufloesung -----------------------------------------------------
+RES_ID=""; RES_REF=""; RES_DIR=""; RES_SERVED=""; RES_GEW=""; RES_CTX=""
+resolve() {
+  local eingabe="$1"
+  local id; id="$($HOME/.local/bin/wb-state models get "$eingabe" --field id 2>/dev/null)"
+  if [ -z "$id" ]; then
+    err "Modell '$eingabe' ist keine Registry-Kennung/kein Alias."
+    return 1
+  fi
+  local prov; prov="$($HOME/.local/bin/wb-state models get "$id" --field provider 2>/dev/null)"
+  if [ "$prov" != "omlx-lokal" ]; then
+    err "Modell '$id' hat Provider '${prov:-?}', nicht 'omlx-lokal' — wb-omlx-server startet nur oMLX-Modelle."
+    return 1
+  fi
+  RES_ID="$id"
+  RES_REF="$($HOME/.local/bin/wb-state models get "$id" --field modelRef 2>/dev/null)"
+  RES_GEW="$($HOME/.local/bin/wb-state models get "$id" --field gewichteGb 2>/dev/null)"
+  RES_CTX="$($HOME/.local/bin/wb-state models get "$id" --field contextWindow 2>/dev/null)"
+  if [ -z "$RES_REF" ] || [ ! -d "$RES_REF" ]; then
+    err "modelRef fehlt oder ist kein Verzeichnis: '${RES_REF:-<leer>}'."
+    return 1
+  fi
+  RES_DIR="$(dirname "$RES_REF")"       # --model-dir fuer omlx serve
+  RES_SERVED="$(basename "$RES_REF")"   # omlx nennt das Modell nach dem Verzeichnis
+  [ -n "$RES_CTX" ] || RES_CTX=32768
+  [ -n "$RES_GEW" ] || RES_GEW=16.0
+  return 0
+}
+
+laeuft_pid() {  # gibt PID des omlx-serve auf PORT aus, sonst leer
+  lsof -nP -iTCP:$PORT -sTCP:LISTEN -t 2>/dev/null | head -1
+}
+
+antwortet() {  # 0 wenn /v1/models antwortet
+  curl -s -m 4 "http://$HOSTB:$PORT/v1/models" >/dev/null 2>&1
+}
+
+served_ref() {  # welche Modell-ID bedient der laufende Server (omlx versteckt
+                # die Prozess-Args via setproctitle 'omlx-server', darum ueber
+                # /v1/models statt ps)
+  curl -s -m 4 "http://$HOSTB:$PORT/v1/models" 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); print((d.get("data") or [{}])[0].get("id",""))
+except Exception: print("")' 2>/dev/null
+}
+
+# --- ensure ------------------------------------------------------------------
+cmd_ensure() {
+  local eingabe="" frist="$FRIST_VORGABE" kontext=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --frist) frist="$2"; shift 2 ;;
+      --kontext) kontext="$2"; shift 2 ;;
+      *) [ -z "$eingabe" ] && eingabe="$1"; shift ;;
+    esac
+  done
+  [ -n "$eingabe" ] || { err "kein Modell angegeben."; return 1; }
+  resolve "$eingabe" || return 1
+
+  # GEBUCHTER Kontext (nicht der native Max): der KV-Cache waechst linear mit
+  # dem Kontext, die volle native Laenge (262144) zu buchen laesst wb-belegung
+  # ablehnen, obwohl ein Worker nie so viel braucht. Vorgabe 32768 (reicht fuer
+  # Werkzeugschleifen), ueberschreibbar per --kontext, gedeckelt auf den
+  # nativen Max des Modells. omlx serve teilt den KV ohnehin seitenweise je
+  # Anfrage zu -- die Buchung ist die Cross-Sitzungs-Reserve, nicht die
+  # Server-Grenze.
+  local KONTEXT_VORGABE=32768
+  [ -n "$kontext" ] || kontext="$KONTEXT_VORGABE"
+  if [ "$kontext" -gt "$RES_CTX" ] 2>/dev/null; then kontext="$RES_CTX"; fi
+
+  local pid; pid="$(laeuft_pid)"
+  if [ -n "$pid" ]; then
+    local laufref; laufref="$(served_ref)"
+    if [ "$laufref" = "$RES_REF" ]; then
+      err "wb-omlx-server: '$RES_SERVED' laeuft bereits (PID $pid), Server antwortet — nichts zu tun."
+      echo "$RES_REF"
+      return 0
+    fi
+    err "wb-omlx-server: auf Port $PORT laeuft ein anderer/nicht antwortender oMLX-Server (PID $pid, bedient '${laufref:-?}') — beende ihn zuerst."
+    cmd_stop || return 1
+  fi
+
+  # Speicherpruefung (dieselbe Wahrheit wie wb-mlx-server: gegen den JETZT
+  # freien Speicher, nachdem ein evtl. altes Modell weg ist).
+  if ! command -v check-resources >/dev/null 2>&1; then
+    err "check-resources nicht gefunden — kein Start ohne Speicherpruefung."; return 1
+  fi
+  local free_mib
+  free_mib="$(check-resources 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["ram"]["free_mib"])' 2>/dev/null)"
+  err "freier Speicher vor dem Start: ${free_mib:-?} MiB (informativ)."
+
+  # Belegung buchen (Cross-Sitzungs-Sperre). --parallel 1: der Looping-/
+  # Arbeitsbetrieb faehrt einen Strom; MTP bleibt damit an (siehe Kopf).
+  local nimm_out nimm_rc kennung=""
+  buchen() {
+    nimm_out="$("$WBB" nimm --gewichte-gb "$RES_GEW" --modell "$RES_SERVED" \
+      --parallel 1 --kontext "$kontext" --kv-quant off \
+      --zweck "omlx serve $RES_SERVED" --frist "$frist" 2>&1)"
+    nimm_rc=$?
+  }
+  buchen
+  # Cross-Stack-Raeumung (2026-09-01): 48 GB = EIN grosses lokales Modell. qwen38
+  # (wb-mlx-server, Port 8081) und qwen38u (hier, Port 8078) sind getrennte Stacks
+  # und entladen sich nicht von selbst gegenseitig. Lehnt wb-belegung wegen Platz
+  # ab (Exit 1) und haelt gerade ein wb-mlx-server-Modell den Speicher, wird es
+  # gestoppt und EINMAL neu gebucht -- so ist der Wechsel ZUM unzensierten Modell
+  # nahtlos. Der umgekehrte Weg (zurueck auf qwen38, waehrend qwen38u laeuft) wird
+  # von wb-mlx-server NICHT geraeumt; dort hilft der 20-min-Leerlauf-Stopp oder
+  # `wb-omlx-server stop`.
+  if [ "$nimm_rc" -eq 1 ] && printf '%s' "$nimm_out" | grep -qiE 'wb-mlx-server|qwen38-27b|Port 8081'; then
+    err "wb-omlx-server: kein Platz, aber ein wb-mlx-server-Modell haelt den Speicher — stoppe es und buche neu."
+    "$HOME/.local/bin/wb-mlx-server" stop >/dev/null 2>&1
+    sleep 2
+    buchen
+  fi
+  printf '%s\n' "$nimm_out" >&2
+  if [ "$nimm_rc" -ne 0 ]; then
+    if [ "${WB_OMLX_OHNE_BELEGUNG:-0}" = "1" ]; then
+      err "WARNUNG: wb-belegung scheiterte (Exit $nimm_rc) — WB_OMLX_OHNE_BELEGUNG=1, starte ohne Cross-Sitzungs-Sperre."
+    else
+      err "wb-belegung lehnt ab oder scheiterte (Exit $nimm_rc) — kein Start. Ueberschreiben: WB_OMLX_OHNE_BELEGUNG=1."
+      return 1
+    fi
+  else
+    kennung="$(printf '%s\n' "$nimm_out" | sed -n 's/.*unter der Kennung \([0-9a-f]\{1,\}\).*/\1/p' | head -1)"
+  fi
+
+  # Start ueber wb-nohup (abgekoppelt, Log unter ~/.local/state/wb-nohup/logs)
+  local NAME="omlx-$RES_SERVED"
+  local newpid
+  newpid="$("$WBN" "$NAME" -- "$OMLX" serve --model-dir "$RES_DIR" \
+    --host "$HOSTB" --port "$PORT" --log-level info)" || {
+    err "wb-nohup konnte omlx serve nicht starten — siehe ~/.local/state/wb-nohup/logs/$NAME.log"
+    [ -n "$kennung" ] && "$WBB" gib "$kennung" --fremd >/dev/null 2>&1
+    return 1
+  }
+
+  # Auf Antwortbereitschaft warten (Frist 120 s: 16-GB-Modell laedt).
+  local i ok=0
+  for i in $(seq 1 60); do
+    if antwortet; then ok=1; break; fi
+    sleep 2
+  done
+  if [ "$ok" -ne 1 ]; then
+    err "omlx serve antwortet nach 120 s nicht auf /v1/models — Start gescheitert."
+    kill "$newpid" 2>/dev/null
+    [ -n "$kennung" ] && "$WBB" gib "$kennung" --fremd >/dev/null 2>&1
+    return 1
+  fi
+
+  # Echte Probeanfrage (Erfolg erst nach einer beantworteten Anfrage).
+  local probe
+  probe="$(curl -s -m 60 "http://$HOSTB:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$RES_REF\",\"messages\":[{\"role\":\"user\",\"content\":\"Sag OK.\"}],\"max_tokens\":8,\"temperature\":0}" 2>/dev/null)"
+  if ! printf '%s' "$probe" | grep -q '"content"'; then
+    err "Probeanfrage an '$RES_REF' scheiterte — Antwort: $(printf '%s' "$probe" | head -c 200)"
+    kill "$newpid" 2>/dev/null
+    [ -n "$kennung" ] && "$WBB" gib "$kennung" --fremd >/dev/null 2>&1
+    return 1
+  fi
+
+  # Als geladen melden + Zustand schreiben
+  [ -n "$kennung" ] && "$WBB" geladen "$kennung" >/dev/null 2>&1
+  python3 - "$AKTUELL" "$RES_ID" "$RES_SERVED" "$RES_REF" "$newpid" "${kennung:-}" <<'PY'
+import json,sys,time
+p,i,s,ref,pid,k=sys.argv[1:7]
+json.dump({"id":i,"served":s,"ref":ref,"pid":int(pid),"kennung":k,
+           "port":8079,"started":time.strftime("%Y-%m-%dT%H:%M:%S")},open(p,"w"))
+PY
+
+  # Leerlauf-Waechter: stoppt den Server nach IDLE_MIN ohne neue Log-Zeile.
+  # Stirbt mit dem Server (prueft dessen PID). Kein Dauerprozess auf Vorrat.
+  ( idlewatch "$newpid" "$NAME" ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+
+  err "wb-omlx-server: '$RES_SERVED' laeuft (PID $newpid), MTP an, Probeanfrage ok."
+  echo "$RES_REF"
+  return 0
+}
+
+idlewatch() {
+  local pid="$1" name="$2"
+  local log="$HOME/.local/state/wb-nohup/logs/$name.log"
+  local idle_s=$(( IDLE_MIN * 60 ))
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 60
+    kill -0 "$pid" 2>/dev/null || break
+    local last now age
+    last="$(stat -f %m "$log" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    age=$(( now - last ))
+    if [ "$age" -ge "$idle_s" ]; then
+      err "wb-omlx-server: $IDLE_MIN min Leerlauf — stoppe '$name'."
+      cmd_stop
+      break
+    fi
+  done
+}
+
+# --- stop --------------------------------------------------------------------
+cmd_stop() {
+  local pid; pid="$(laeuft_pid)"
+  local kennung=""
+  [ -f "$AKTUELL" ] && kennung="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("kennung",""))' "$AKTUELL" 2>/dev/null)"
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null
+    local i
+    for i in $(seq 1 10); do laeuft_pid | grep -q . || break; sleep 1; done
+    if laeuft_pid | grep -q .; then
+      kill -9 "$(laeuft_pid)" 2>/dev/null; sleep 1
+    fi
+    if laeuft_pid | grep -q .; then
+      err "WARNUNG: omlx serve auf Port $PORT laeuft trotz kill weiter (PID $(laeuft_pid))."
+    else
+      err "wb-omlx-server: gestoppt (Port $PORT frei)."
+    fi
+  else
+    err "wb-omlx-server: es lief nichts auf Port $PORT."
+  fi
+  if [ -n "$kennung" ]; then
+    "$WBB" gib "$kennung" --fremd >/dev/null 2>&1 || \
+      err "WARNUNG: Belegung $kennung liess sich nicht freigeben — wb-belegung wer / gib $kennung --fremd."
+  fi
+  rm -f "$AKTUELL"
+  return 0
+}
+
+# --- status ------------------------------------------------------------------
+cmd_status() {
+  local pid; pid="$(laeuft_pid)"
+  if [ -n "$pid" ]; then
+    if antwortet; then
+      echo "laeuft: PID $pid, bedient '$(served_ref)', Port $PORT, /v1/models antwortet"
+    else
+      echo "laeuft: PID $pid, Port $PORT, aber /v1/models antwortet NICHT"
+    fi
+    [ -f "$AKTUELL" ] && cat "$AKTUELL" && echo
+  else
+    echo "nicht aktiv (Port $PORT frei)"
+  fi
+}
+
+case "${1:-}" in
+  ensure) shift; cmd_ensure "$@" ;;
+  stop)   cmd_stop ;;
+  status) cmd_status ;;
+  *) err "Usage: wb-omlx-server {ensure <alias|id> [--frist <min>]|stop|status}"; exit 2 ;;
+esac

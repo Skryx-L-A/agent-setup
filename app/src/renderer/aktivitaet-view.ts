@@ -9,6 +9,7 @@
 // fruehere Einzelvorschlaege durch eine Ansicht (SESSION-STATE, Zeile 892).
 import './aktivitaet-view.css';
 import { registriere, umschalten } from './flaeche';
+import { t } from './texte';
 import { openAbsoluteTab, openDiffTab, openAuftragTab } from './editor-view';
 
 interface AktivitaetEintrag {
@@ -24,11 +25,11 @@ interface AktivitaetPayload { entries: AktivitaetEintrag[] }
 
 function seitHer(wannMs: number): string {
   const min = Math.max(0, Math.round((Date.now() - wannMs) / 60000));
-  if (min < 1) return 'gerade eben';
-  if (min < 60) return `seit ${min} Min.`;
+  if (min < 1) return t('zeit.geradeEben');
+  if (min < 60) return t('zeit.minuten', { n: min });
   const std = Math.floor(min / 60);
-  if (std < 24) return `seit ${std} Std.`;
-  return `seit ${Math.floor(std / 24)} Tg.`;
+  if (std < 24) return t('zeit.stunden', { n: std });
+  return t('zeit.tage', { n: Math.floor(std / 24) });
 }
 
 function dateiname(pfad: string): string {
@@ -51,8 +52,8 @@ export function initAktivitaetView(): void {
   panel.className = 'ak-panel';
   panel.innerHTML = `
     <div class="ak-kopf">
-      <div class="ak-titel">Aktivität</div>
-      <button type="button" class="ak-schliessen" title="Schliessen">&times;</button>
+      <div class="ak-titel" data-text="panel.aktivitaet.titel"></div>
+      <button type="button" class="ak-schliessen" data-text-title="wort.schliessen">&times;</button>
     </div>
     <div class="ak-inhalt"><div class="ak-liste"></div><div class="ak-status"></div></div>`;
   // Die Schublade haengt in der Reihe zwischen Sessionleiste und Buehne,
@@ -89,11 +90,11 @@ export function initAktivitaetView(): void {
       if (e.typ === 'aenderung') {
         const res = await window.awbEditorBridge.aktivitaetDiff(e.pfad);
         if (!res.ok) { status(res.error); return; }
-        await openDiffTab(`diff:${e.pfad}`, `Diff: ${name}`, res.value.original, res.value.modified);
+        await openDiffTab(`diff:${e.pfad}`, t('panel.aktivitaet.diff', { name }), res.value.original, res.value.modified);
       } else {
         const res = await window.awbEditorBridge.aktivitaetAuftrag(e.pfad);
         if (!res.ok) { status(res.error); return; }
-        openAuftragTab(`auftrag:${e.pfad}`, `Auftrag: ${name}`, res.value.auftrag, res.value.ergebnis);
+        openAuftragTab(`auftrag:${e.pfad}`, t('panel.aktivitaet.auftrag', { name }), res.value.auftrag, res.value.ergebnis);
       }
       status('');
       return;
@@ -112,7 +113,7 @@ export function initAktivitaetView(): void {
     if (!p.entries.length) {
       const leer = document.createElement('div');
       leer.className = 'ak-leer';
-      leer.textContent = 'Noch nichts fuer die sichtbaren Sessions.';
+      leer.textContent = t('panel.aktivitaet.leer');
       liste.appendChild(leer);
       return;
     }
@@ -121,17 +122,23 @@ export function initAktivitaetView(): void {
       el.className = `ak-eintrag ak-${e.typ}${e.pfad === aktiverPfad ? ' ak-offen' : ''}`;
       const name = dateiname(e.pfad);
       const zusatz = e.typ === 'ergebnis' ? `${e.groesse} B` : e.kommentar;
+      // e.wer nennt Worker oder Sitzung aus dem Aktivitaets-Datensatz -- fremder
+      // Text, siehe die gleiche Begruendung in freigaben-view.ts.
       el.innerHTML = `
         <div class="ak-eintrag-kopf">
-          <span class="ak-wer">${e.wer}</span>
+          <span class="ak-wer"></span>
           <span class="ak-wann">${seitHer(e.wannMs)}</span>
         </div>
         <div class="ak-datei"></div>
         <div class="ak-zusatz"></div>`;
+      el.querySelector('.ak-wer')!.textContent = e.wer;
       el.querySelector('.ak-datei')!.textContent = name;
       el.querySelector('.ak-zusatz')!.textContent = zusatz;
       el.title = e.pfad === aktiverPfad
-        ? `${e.pfad} -- noch einmal klicken fuer ${e.typ === 'aenderung' ? 'den Diff' : 'Auftrag und Ergebnis'}`
+        ? t('panel.aktivitaet.nochmal', {
+        pfad: e.pfad,
+        was: t(e.typ === 'aenderung' ? 'panel.aktivitaet.nochmal.diff' : 'panel.aktivitaet.nochmal.auftrag'),
+      })
         : e.pfad;
       el.addEventListener('click', () => void klick(e));
       liste.appendChild(el);

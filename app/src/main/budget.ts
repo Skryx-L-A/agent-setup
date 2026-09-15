@@ -24,6 +24,16 @@
 // pi-Worker in derselben Zahl waere eine andere Auskunft unter demselben Namen.
 import { spawn } from 'node:child_process';
 
+/**
+ * DIE WOCHENRECHNUNG KOMMT AUS `verbrauch/rechnen.ts`, nicht aus einer dritten
+ * Kopie (03.09.2026, Prueferbefund 9). Dort steht sie schon fuer das
+ * Verbrauchsfenster, sie ist reine Logik ohne einen einzigen Import, und die
+ * Regel dahinter -- Kalendertage in Ortszeit, nicht 24-Stunden-Bloecke -- ist
+ * genau die, die auch `shell/wb-budget --limit` anwendet. Ein drittes Mal
+ * abgeschrieben waere sie die Stelle, an der die drei auseinanderlaufen.
+ */
+import { wochenbudget, type LimitPunkt } from '../verbrauch/rechnen';
+
 export interface BudgetStand {
   ok: boolean;
   fetchedAt: number;
@@ -49,12 +59,22 @@ export interface BudgetStand {
    * eines geratenen.
    */
   resetText: string;
+  /**
+   * Der Wochenstand fuer die Statusleiste: wieviel Prozent des
+   * Wochenkontingents verbraucht sind und wieviel an einem gleichmaessig
+   * aufgeteilten Fenster bis heute Abend verbraucht sein duerften. Beide -1,
+   * wenn `wb-budget` keinen Ruecksetzpunkt kennt -- dann steht in der Leiste
+   * keine Wochenzahl, statt einer geratenen.
+   */
+  wocheVerbraucht: number;
+  wocheErlaubt: number;
 }
 
 function leererStand(error: string): BudgetStand {
   return {
     ok: false, fetchedAt: Date.now(), error, heuteTokens: 0, heuteStunden: 0, hochrechnung24h: 0,
     text: 'Budget: nicht verfuegbar', fiveHourPct: -1, sevenDayPct: -1, resetText: '',
+    wocheVerbraucht: -1, wocheErlaubt: -1,
   };
 }
 
@@ -83,7 +103,17 @@ export function parseBudget(raw: string): BudgetStand {
   const rohReset = (limit?.[3] ?? '').trim();
   const resetText = rohReset && rohReset !== 'unbekannt' ? rohReset : '';
   const text = `Budget heute: ${heuteTokens.toLocaleString('de-DE')} Tokens in ${heuteStunden.toFixed(1)} h -- Hochrechnung auf 24h: ~${hochrechnung24h.toLocaleString('de-DE')}`;
-  return { ok: true, fetchedAt: Date.now(), error: '', heuteTokens, heuteStunden, hochrechnung24h, text, fiveHourPct, sevenDayPct, resetText };
+  return {
+    ok: true, fetchedAt: Date.now(), error: '', heuteTokens, heuteStunden, hochrechnung24h, text,
+    fiveHourPct, sevenDayPct, resetText,
+    // DER TEXTWEG KENNT KEINEN WOCHENSTAND. `wb-budget` schreibt in seinem
+    // Fliesstext nur den Prozentsatz, nicht den Ruecksetzpunkt des
+    // Wochenfensters -- und ohne den laesst sich nicht sagen, welcher Tag des
+    // Fensters heute ist. Der JSON-Weg unten liefert beides; dieser hier ist
+    // der Rueckfall fuer eine aeltere Ausgabe, und dort bleibt die Zahl leer
+    // statt geraten.
+    wocheVerbraucht: -1, wocheErlaubt: -1,
+  };
 }
 
 /** Die Argumente des JSON-Wegs, an EINER Stelle -- Poller und Test nehmen dieselben. */
@@ -168,11 +198,17 @@ export function parseBudgetJson(raw: string): BudgetStand {
   const fiveHourPct = Number.isFinite(fuenf) ? fuenf : -1;
   const sevenDayPct = Number.isFinite(sieben) ? sieben : -1;
   const resetText = resetKlartext(letzter?.five_hour_resets_at);
+  const woche = wochenbudget(limits as unknown as LimitPunkt[]);
 
   const text = hochrechnung24h > 0
     ? `Budget heute: ${heuteTokens.toLocaleString('de-DE')} Tokens in ${heuteStunden.toFixed(1)} h -- Hochrechnung auf 24h: ~${hochrechnung24h.toLocaleString('de-DE')}`
     : `Budget heute: ${heuteTokens.toLocaleString('de-DE')} Tokens in ${heuteStunden.toFixed(1)} h -- zu frueh am UTC-Tag fuer eine Hochrechnung`;
-  return { ok: true, fetchedAt: Date.now(), error: '', heuteTokens, heuteStunden, hochrechnung24h, text, fiveHourPct, sevenDayPct, resetText };
+  return {
+    ok: true, fetchedAt: Date.now(), error: '', heuteTokens, heuteStunden, hochrechnung24h, text,
+    fiveHourPct, sevenDayPct, resetText,
+    wocheVerbraucht: woche ? woche.verbraucht : -1,
+    wocheErlaubt: woche ? woche.erlaubt : -1,
+  };
 }
 
 export interface BudgetPollerOptions {

@@ -1,6 +1,6 @@
 ---
 name: release-changelog
-description: Generates a CHANGELOG entry, a suggested semantic-version bump, and a release draft (title + notes) from the commits since the last release tag. Works with Conventional Commits (feat/fix/BREAKING CHANGE drive the version bump) and falls back to a plain grouped commit list with a conservative patch-bump suggestion when they aren't used. Use before tagging a release on a repo that is NOT a project-kit oss-library package (that project type already has its own release-engineer for CHANGELOG/SemVer — this skill is for everything else: website, saas, api-backend, app, or any other repo). Triggers include "generate a changelog", "what changed since the last release", "bump the version", "draft a release", "CHANGELOG erstellen", "Versionssprung", "was hat sich seit dem letzten Release geaendert", "Release-Notizen schreiben".
+description: "Draft a changelog, semantic version suggestion and release notes from commits since the last release. Reuse an existing project release workflow; never tag or publish implicitly."
 ---
 
 # Release Changelog

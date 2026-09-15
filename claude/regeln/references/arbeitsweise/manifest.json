@@ -1,0 +1,47 @@
+{
+  "source": "$HOME/.claude/regeln/arbeitsweise.md",
+  "sha256": "883680fe9cc50bfb4b5469529b281a00c31339a9885bd2d933a9dd2cbf66325a",
+  "bytes": 13297,
+  "sections": [
+    {
+      "file": "00.md",
+      "heading": "regeln/arbeitsweise.md",
+      "sha256": "e3e975add706c7d84f290811b3ac2565ff1c6d4b5fd4bf5c75e8bf7edbec54e6"
+    },
+    {
+      "file": "01.md",
+      "heading": "Standing rules — fremde Skills und sporadische Fehler",
+      "sha256": "e515783e6bb8cbb3813e3e230ebd8b6f6496dd55459bf8be1341f020d1e3b43e"
+    },
+    {
+      "file": "02.md",
+      "heading": "Standing rules — bevor etwas als unmöglich gilt",
+      "sha256": "333b359bb86175efef923779462f53489c3cdc66bb7e4d45f9aa0730f6c35d17"
+    },
+    {
+      "file": "03.md",
+      "heading": "Working principles (Karpathy-derived)",
+      "sha256": "9cd3485fe74ac44a8334cca1fe501787070738c2f7cc00abdf060e4a8bd8af55"
+    },
+    {
+      "file": "04.md",
+      "heading": "Shell-Fallen, die Arbeit kosten",
+      "sha256": "1e35fa3f806ca8ed60ddec4595eb07ef2848d86402d94d796c2fd95e975d161d"
+    },
+    {
+      "file": "05.md",
+      "heading": "Code hygiene",
+      "sha256": "3e75862c8f89114e1cb8fd91e2ccd7b8d9eabdab72102f790a123a5a0ca4f24b"
+    },
+    {
+      "file": "06.md",
+      "heading": "Erst Liste, dann Umbau",
+      "sha256": "54634a68d27a7ec1d4c6aa2fe285509b728e2db13cb7a2631495cce89a488b18"
+    },
+    {
+      "file": "07.md",
+      "heading": "Skills auf Vorrat — das Verfahren (2026-08-23)",
+      "sha256": "6b3bf201284ace01859574d043db3d65cf8e95bb6181d18e1723d9c67f22b74e"
+    }
+  ]
+}

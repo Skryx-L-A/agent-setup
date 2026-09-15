@@ -284,6 +284,18 @@ export class Chatbuehne {
      * vorher: die Sitzung laeuft, und niemand achtet auf ihren Kontext.
      */
     private readonly wache: Chatwache | null = null,
+    /**
+     * WOHIN DER STAND GEHT (06.09.2026, Auftrag 3.1 von mac/PLAN.md). Bis
+     * heute schrieb `standJetzt` direkt an `fenster().webContents` -- der
+     * einzige Kanal, der den Mantel (mac/) NICHT erreichte, weil er an
+     * `anOberflaeche` in main.ts vorbeilief. Jetzt bekommt die Buehne den Weg
+     * hinaus von aussen: main.ts reicht `anOberflaeche('awb:chat-stand-neu', …)`
+     * herein, und damit bekommt jede Oberflaeche (Electron-Fenster UND Mantel)
+     * denselben Stand. Ohne diesen Rueckruf gilt der alte Weg ueber das
+     * Fenster, damit test-app-chatbuehne-takt.sh mit seiner Fensterattrappe
+     * weiter zaehlt, was hinausgeht.
+     */
+    private readonly standSenden: ((nachricht: ChatStandNachricht) => void) | null = null,
   ) {}
 
   /**
@@ -630,6 +642,10 @@ export class Chatbuehne {
   }
 
   private standJetzt(id: string, o: Offen): void {
+    if (this.standSenden) {
+      this.standSenden(this.nachricht(id, o, o.gesendeterTakt));
+      return;
+    }
     const w = this.fenster();
     if (!w || w.isDestroyed()) return;
     w.webContents.send('awb:chat-stand-neu', this.nachricht(id, o, o.gesendeterTakt));

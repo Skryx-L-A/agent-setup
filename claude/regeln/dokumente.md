@@ -19,4 +19,6 @@ gestaltet wird, und bevor Produktdaten oder Preise recherchiert werden.
   Suchsnippets zeigen bei Mehrvarianten-Angeboten den Ab-Preis der kleinsten Variante — gemessen
   Faktor 3 daneben, und technische Daten stehen oft nur im Beschreibungstext. Browser dabei SICHTBAR
   starten, wenn der Nutzer zusieht; der geteilte Playwright-MCP bleibt headless, stattdessen eigener
-  Chrome per CDP. Weg: [[produktdaten-im-browser-pruefen]].
+  Chrome per CDP. Weg: [[produktdaten-im-browser-pruefen]]. Seit 2026-09-09 gibt es dafür auch
+  die Live-Ansicht einer Browserbase-Sitzung (`mcp-shared browser browserbase`, dann
+  `wb-browserbase schau <id> --oeffnen`; Budget 60 Minuten im Monat, `regeln/werkzeuge.md`).

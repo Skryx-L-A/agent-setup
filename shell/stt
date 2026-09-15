@@ -17,6 +17,12 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --whisper) ENGINE="whisper"; shift ;;
     --timestamps) ENGINE="whisper"; TS=1; shift ;;
+    # Anlass (2026-08-22, dieselbe Bugfamilie wie wb-budget): ein getipptes '--whisper'
+    # landete vorher genauso im Catchall wie der echte Dateiname, und der naechste
+    # Durchlauf (die echte Datei) ueberschrieb AUDIO wieder -- die Datei stimmte am
+    # Ende, aber ENGINE blieb still bei der Vorgabe 'parakeet' statt 'whisper'. Kein
+    # Aufruf hier gibt je einen mit '-' beginnenden Dateinamen an.
+    -*) echo "stt: unbekannte Option '$1'" >&2; exit 2 ;;
     *) AUDIO="$1"; shift ;;
   esac
 done

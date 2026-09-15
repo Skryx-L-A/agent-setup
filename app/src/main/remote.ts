@@ -21,6 +21,7 @@ import {
   PANE_LIST_FORMAT, SESSION_LIST_FORMAT,
 } from './sessions';
 import { MASCHINEN_LOCALE_PREFIX } from './pfad';
+import { absturzFernHookZeile } from './absturz';
 
 export interface RemoteWorkerRaw {
   name: string;
@@ -77,6 +78,14 @@ export interface RemoteSnapshot {
    * wo er liegt; ampel.ts faellt dann auf ihr bisheriges Verhalten zurueck.
    */
   repoRaw: string;
+  /**
+   * Die letzten Zeilen der fernen Absturzdatei (05.09., absturz.ts, Kopf
+   * „FERNE MASCHINEN"): was der Hook `pane-died[92]` drueben mitgeschrieben
+   * hat. Roh, ungefiltert -- gelesen und dedupliziert wird in main.ts ueber
+   * `FernAbsturzSpur`. Leer, wenn drueben noch nichts starb oder die Datei
+   * fehlt.
+   */
+  absturzRaw: string;
 }
 
 const SECTION_MARK = 'SECTION:';
@@ -99,6 +108,7 @@ function leererStand(machine: string, error: string, vorheriger?: RemoteSnapshot
     testsuiteRaw: vorheriger?.testsuiteRaw ?? '',
     hygieneRaw: vorheriger?.hygieneRaw ?? '',
     repoRaw: vorheriger?.repoRaw ?? '',
+    absturzRaw: vorheriger?.absturzRaw ?? '',
   };
 }
 
@@ -108,7 +118,7 @@ function leererStand(machine: string, error: string, vorheriger?: RemoteSnapshot
  * zu quoten und nichts einzuschleusen. `$HOME` und `$D` loest die REMOTE
  * Shell auf, nicht dieser Prozess.
  */
-export function fernSkript(relSessionsDir: string, relTestsuiteStatus: string, relHygieneStatus: string): string {
+export function fernSkript(relSessionsDir: string, relTestsuiteStatus: string, relHygieneStatus: string, relAbsturzLog = ''): string {
   return [
     'set -u',
     `D="$HOME/${relSessionsDir}"`,
@@ -121,6 +131,17 @@ export function fernSkript(relSessionsDir: string, relTestsuiteStatus: string, r
     `${MASCHINEN_LOCALE_PREFIX} tmux list-sessions -F '${SESSION_LIST_FORMAT}' 2>/dev/null`,
     `printf '${SECTION_MARK}PANES\\1\\n'`,
     `${MASCHINEN_LOCALE_PREFIX} tmux list-panes -a -F '${PANE_LIST_FORMAT}' 2>/dev/null`,
+    // DER ABSTURZ-HOOK DRUEBEN (05.09., absturz.ts, Kopf „FERNE MASCHINEN"):
+    // bei jedem Abruf neu gesetzt (idempotent, ueberlebt so einen Neustart des
+    // fernen Servers) und die letzten Zeilen seiner Datei mitgebracht. Ohne
+    // Server drueben scheitert `set-hook` still (`|| true`), ohne Datei bleibt
+    // der Abschnitt leer -- beides ist kein Ausfall der Maschine. Der Pfad
+    // haengt an `$HOME` der FERNEN Shell wie alle anderen hier.
+    ...(relAbsturzLog ? [
+      absturzFernHookZeile(relAbsturzLog),
+      `printf '${SECTION_MARK}ABSTURZ\\1\\n'`,
+      `tail -n 200 "$HOME/${relAbsturzLog}" 2>/dev/null || true`,
+    ] : []),
     `printf '${SECTION_MARK}PS\\1\\n'`,
     'ps -axo pid=,ppid=,pcpu=,etime=,args= 2>/dev/null || ps -eo pid=,ppid=,pcpu=,etime=,args= 2>/dev/null',
     `printf '${SECTION_MARK}FILES\\1\\n'`,
@@ -280,6 +301,7 @@ export function parseFernAusgabe(machine: string, raw: string): RemoteSnapshot {
     testsuiteRaw: sec.TESTSUITE ?? '',
     hygieneRaw: sec.HYGIENE ?? '',
     repoRaw: sec.REPO ?? '',
+    absturzRaw: sec.ABSTURZ ?? '',
   };
 }
 
@@ -295,6 +317,8 @@ export interface RemotePollerOptions {
   /** V12: die zwei Statusdateien, relativ zu `$HOME` der Fernmaschine. */
   relTestsuiteStatus: string;
   relHygieneStatus: string;
+  /** Die ferne Absturzdatei, relativ zu `$HOME` der Fernmaschine (absturz.ts); leer = kein Fernhook. */
+  relAbsturzLog?: string;
   /** Testhaken: ein anderes Programm statt `ssh` anspringen. */
   sshBin?: string;
 }
@@ -461,7 +485,7 @@ export class RemotePoller {
       // Listener eine unbehandelte Ausnahme im Hauptprozess. Ein misslungener
       // Abruf ist ein Fehlversuch, kein Grund, das Fenster mitzunehmen.
       kind.stdin.on('error', (e: NodeJS.ErrnoException) => beenden(`Das Skript liess sich nicht schicken (${e.code ?? e.message})`));
-      kind.stdin.write(fernSkript(this.opt.relSessionsDir, this.opt.relTestsuiteStatus, this.opt.relHygieneStatus));
+      kind.stdin.write(fernSkript(this.opt.relSessionsDir, this.opt.relTestsuiteStatus, this.opt.relHygieneStatus, this.opt.relAbsturzLog ?? ''));
       kind.stdin.end();
     });
   }

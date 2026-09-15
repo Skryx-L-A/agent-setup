@@ -1,0 +1,117 @@
+{
+  "source": "$HOME/.claude/regeln/orchestrierung.md",
+  "sha256": "f14bb3dd6d9365aae399bab83395b44a620c88e2165ebb90ae6e8b7416665874",
+  "bytes": 65463,
+  "sections": [
+    {
+      "file": "00.md",
+      "heading": "regeln/orchestrierung.md",
+      "sha256": "ebc48822b5befcb3942b883bb3c4286522790352ea4ff2bff48e285e503da8ad"
+    },
+    {
+      "file": "01.md",
+      "heading": "Orchestrator mode – Essentials",
+      "sha256": "5169a2b86d2b2528304e6057a37092f64dd246df23778ac2e16c51c5720516c8"
+    },
+    {
+      "file": "02.md",
+      "heading": "Modellwahl",
+      "sha256": "71c13cba83bdc5bdca4079fa03941ec9dcce03ea5568e75930ee3f3b0f8dc943"
+    },
+    {
+      "file": "03.md",
+      "heading": "Recherche laeuft lokal, wo es geht (2026-08-28)",
+      "sha256": "e551292c0befbdf59b094699dac8191ad74c1fa8ef7e55909659a53c5902df83"
+    },
+    {
+      "file": "04.md",
+      "heading": "Denkstufe: nie aus (2026-08-19)",
+      "sha256": "7bfa83e87194c13ce8c4377678ff6b54e1c97b29f7a5ad0fe160192cb5ec6d54"
+    },
+    {
+      "file": "05.md",
+      "heading": "Sichtbares bekommt ein visuell starkes Modell (2026-09-03; erweitert 2026-09-12)",
+      "sha256": "2698b2a280ad7d782e9c768e1fa9150fd7e855f9d2bad6e473ab2b74b04855d2"
+    },
+    {
+      "file": "06.md",
+      "heading": "Claude-Kontingent schonen: andere Spuren zuerst (2026-09-10)",
+      "sha256": "8e3f85bafd8872ff7a8c368bea010c0bd8a2f06bea9ca495753a33a869844fcd"
+    },
+    {
+      "file": "07.md",
+      "heading": "Codex neben Claude, beide Abos schonen (2026-09-11)",
+      "sha256": "3cfc184a297d54384dbfa84ad5fbbac6b37ef33f5ee6eff90f83e9fadca1dd7f"
+    },
+    {
+      "file": "08.md",
+      "heading": "Die Reihenfolge bei jeder Vergabe",
+      "sha256": "6d8477d12229d7c5aee5f8af2e420ae592649384a4e39ccd74bbbe894fdf7631"
+    },
+    {
+      "file": "09.md",
+      "heading": "Spawn-Befehle",
+      "sha256": "88ebeed6f5babffbf35249d4a351ebafdc5fba5eca436a98cf2699e1ba0bb9ae"
+    },
+    {
+      "file": "10.md",
+      "heading": "GPT-Orchestrator und GPT-Worker (2026-09-12; ersetzt „nur Luna und Terra\")",
+      "sha256": "b28a1d5cc4f6f72694b33598a6e6cb0ef2c75c4f6e250daba0f8d022226e7255"
+    },
+    {
+      "file": "11.md",
+      "heading": "Nie wegen des Limits eine schwächere Stufe (2026-09-10)",
+      "sha256": "b65a6aab2f9feeea6126d1ad75913710070745a304a1287217b172e1e5d12b7c"
+    },
+    {
+      "file": "12.md",
+      "heading": "Ein gescheitertes Nachschlagen ist nie ein Grund, ein anderes Modell zu nehmen (2026-08-29)",
+      "sha256": "db1b3ee5ee70e976b3384fa165e6bd93de14888daa64bb657390849eb5f425ca"
+    },
+    {
+      "file": "13.md",
+      "heading": "Kurztabelle: welche Stufe für welche Arbeit",
+      "sha256": "23db99c5f20a827ab3eced8f68d4d59d9aeb9267ddd082b42653b454c607c3e6"
+    },
+    {
+      "file": "14.md",
+      "heading": "Effort: Stufe und Deckel",
+      "sha256": "10e20b6a122b6703e8700ee8640e22ac79018d3694ceabcdc5c6c39f730ab0f8"
+    },
+    {
+      "file": "15.md",
+      "heading": "FABLE-SPERRE (2026-07-12)",
+      "sha256": "7c95357e112357be1febdf406f5ce7334bd0f7e5dae00402d7c2118bb75d5b62"
+    },
+    {
+      "file": "16.md",
+      "heading": "Wochenlimit: der Maßstab ist das TAGESBUDGET, kein fester Prozentwert",
+      "sha256": "5b4051dc4b0672dbfdc01ad5d8c22cf2eef4c5b4e7040988bc6211a521fed59b"
+    },
+    {
+      "file": "17.md",
+      "heading": "Kostenlose Spuren und ihre Kontingente (2026-08-27)",
+      "sha256": "0b2c8aa51f196a97c1fc3afa46c69806ad0b1b592ec6284864e001e1ec0532e5"
+    },
+    {
+      "file": "18.md",
+      "heading": "Lokal zuerst: Qwen3.8-27B ist die Vorgabe (2026-08-27)",
+      "sha256": "87becfeb682988ed521790e6c2a8d32f840e424ac0163dccdd1596e54a336205"
+    },
+    {
+      "file": "19.md",
+      "heading": "Die Standardwahl bei OpenRouter: drei statt vierhundert (2026-08-27)",
+      "sha256": "6f267f1d66d63547edd056802f4f975da5f0f43a58330c3c2ae2bab4f739a092"
+    },
+    {
+      "file": "20.md",
+      "heading": "Erst die Fähigkeit, dann Intelligenz und Preis (2026-08-27)",
+      "sha256": "77306f132efc16f8ef0ad8213b37dd0d7430a7a6207eaa4c7905a0ede45906e1"
+    },
+    {
+      "file": "21.md",
+      "heading": "Werkbank-Aufgaben (Agents-Feature, seit 2026-09-10)",
+      "sha256": "9b65cb7ee12235f55446f78e9c20162b3c24d1d3bb05bbf12179614cb42355d9"
+    }
+  ]
+}

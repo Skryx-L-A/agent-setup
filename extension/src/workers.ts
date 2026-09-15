@@ -213,7 +213,7 @@ async function remoteResultsFor(
 export async function loadWorkers(dir: string, sessionKey?: string): Promise<WorkerView[]> {
   const state: SessionState | undefined = await readState(dir, sessionKey);
   const session = state?.tmuxSession ?? sessionName(dir, sessionKey);
-  const panes = await listWorkerPanes(session);
+  const { panes } = await listWorkerPanes(session);
   const workers = mergeWorkers(state?.workers ?? [], panes);
   const remote = workers.filter(isRemoteWorker);
   if (remote.length > 0) {

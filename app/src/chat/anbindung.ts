@@ -14,6 +14,7 @@
 import { ChatAnsicht } from './ansicht';
 import type { ChatStand } from './typen';
 import { t } from './texte';
+import type { PfadHaken } from './pfadlinks';
 
 /**
  * Nur das eine Stueck der Bruecke, das diese Datei braucht -- und die Nutzlast
@@ -25,6 +26,7 @@ import { t } from './texte';
  */
 interface ChatBruecke {
   chatStand(paneId: string): Promise<{ ok: boolean; value?: unknown; error?: string } | { ok: false; error: string }>;
+  chatAnsichtSetzen(paneId: string, an: boolean): Promise<{ ok: boolean; value?: unknown; error?: string }>;
 }
 
 /** Sieht die Antwort wie ein Stand aus? Sonst wird sie nicht gezeichnet. */
@@ -51,18 +53,31 @@ export class ChatAnbindung {
     private readonly paneId: string,
     private readonly bruecke: ChatBruecke,
     offen: boolean,
+    /** Pfade pruefen und oeffnen (chatdatei, 05.09.2026) -- kommt von aussen, wie die Bruecke. */
+    pfade: PfadHaken,
   ) {
-    this.ansicht = new ChatAnsicht({ aufTerminal: () => this.zeigen(false) });
+    this.ansicht = new ChatAnsicht({ aufTerminal: () => this.terminalWaehlen(), pfade });
     this.kasten.appendChild(this.ansicht.element());
-    // Der Griff steht am Pane, solange die Ansicht AUS ist: ohne ihn gaebe es
-    // keinen Weg zurueck ins Gespraech, sobald jemand einmal auf Terminal
-    // gestellt hat. Er ist klein und sitzt in der Ecke, weil er dem Terminal
-    // darunter nichts wegnehmen darf.
+    // DER GRIFF STEHT IN DER KOPFZEILE DES PANES (04.09.2026). Ohne ihn gaebe
+    // es keinen Weg zurueck ins Gespraech, sobald jemand einmal auf Terminal
+    // gestellt hat -- aber als beschrifteter Knopf ueber dem Terminal lag er
+    // bei drei Kacheln dreimal gleichzeitig im Bild. Die Kopfzeile traegt
+    // ohnehin alles, was diesem einen Pane gehoert (Name, Modell, Tokenstand,
+    // Zoom); dort ist er ein Symbol neben dem Zoom-Knopf und kostet nichts.
+    //
+    // Der Waehler `.chat-griff` bleibt: `awb-ctl pane-chat-klick` spricht ihn
+    // ueber genau diesen Namen an, und die Kopfzeile liegt im selben Kasten.
+    // Gibt es ausnahmsweise keine Kopfzeile, faellt er in den Kasten zurueck.
     this.griff = document.createElement('button');
     this.griff.className = 'chat-griff';
-    this.griff.textContent = t('kopf.gespraech');
-    this.griff.addEventListener('click', () => this.zeigen(true));
-    this.kasten.appendChild(this.griff);
+    this.griff.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"'
+      + ' stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">'
+      + '<path d="M2.6 4.2a1.6 1.6 0 011.6-1.6h7.6a1.6 1.6 0 011.6 1.6v4.6a1.6 1.6 0'
+      + ' 01-1.6 1.6H6.4L3.4 13V10.4h-.8z"/></svg>';
+    this.griff.title = t('kopf.gespraech');
+    this.griff.addEventListener('click', () => this.gespraechWaehlen());
+    const kopf = this.kasten.querySelector('.panekopf');
+    (kopf ?? this.kasten).appendChild(this.griff);
     this.zeigen(offen);
     // EINMAL nachsehen, auch wenn die Ansicht zu ist: welche Ansicht ein Pane
     // zeigt, entscheidet die Regel in chat/ansichtsregel.ts aus drei Ebenen --
@@ -73,6 +88,30 @@ export class ChatAnbindung {
     // hinsieht -- ein Umschalten waehrenddessen kommt als eigene Nachricht
     // (main.ts, 'awb:chat-ansicht').
     if (!offen) void this.hole(true);
+  }
+
+  /**
+   * EIN KLICK AUF DEN GRIFF ODER AUF "Terminal zeigen" IN DER ANSICHT (22.08.):
+   * beide schreiben die Sitzungs-Uebersteuerung, genau wie der Rechtsklick auf
+   * die Sitzung -- sonst kann eine dort schon gesetzte Uebersteuerung (aus dem
+   * Rechtsklick, oder aus einem frueheren Klick hier) den naechsten Klick
+   * stumm ausser Kraft setzen: die Ansicht ginge auf, `hole()` bekaeme aber
+   * `moeglich: false` zurueck und zeigte den Grund statt des Gespraechs.
+   *
+   * `zeigen()` selbst bleibt rein anzeigend -- sie laeuft auch aus dem
+   * Konstruktor und aus dem automatischen Oeffnen nach der Rollenvorgabe
+   * (`hole(true)`), und keiner der beiden Faelle ist ein Klick, der eine
+   * Uebersteuerung verdient.
+   */
+  private gespraechWaehlen(): void {
+    // ERST SCHREIBEN, DANN ZEIGEN: `zeigen(true)` liest ueber `hole()` sofort
+    // den Stand nach -- laeuft das VOR der geschriebenen Uebersteuerung, saehe
+    // dieser erste Blick noch die alte Sperre.
+    void this.bruecke.chatAnsichtSetzen(this.paneId, true).finally(() => this.zeigen(true));
+  }
+
+  private terminalWaehlen(): void {
+    void this.bruecke.chatAnsichtSetzen(this.paneId, false).finally(() => this.zeigen(false));
   }
 
   /** Ansicht an oder aus. Beim Anschalten wird sofort einmal gelesen. */
@@ -117,8 +156,9 @@ export class ChatAnbindung {
       if (stand) {
         this.ansicht.zeichne(stand);
         // Die Sprache steht erst nach dem ersten Stand fest (setzeSprache() lief gerade in
-        // zeichne()) -- der Griff wird deshalb hier nachgezogen, nicht schon beim Bauen.
-        this.griff.textContent = t('kopf.gespraech');
+        // zeichne()) -- das Schildchen des Griffs wird deshalb hier nachgezogen,
+        // nicht schon beim Bauen. Seine Zeichnung haengt nicht an der Sprache.
+        this.griff.title = t('kopf.gespraech');
         return;
       }
       this.ansicht.zeichne({

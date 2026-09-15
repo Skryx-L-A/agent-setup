@@ -24,9 +24,18 @@ class LockHeldError(Exception):
 class Deadline:
     def __init__(self, budget_seconds: float = config.RUN_BUDGET_SECONDS):
         self.end = time.monotonic() + budget_seconds
+        # Jeder Treffer, den ein Aufrufer per `phase` gemeldet hat - der Stoff,
+        # aus dem build_report() den "ANGEHALTEN"-Abschnitt baut. Ohne `phase`
+        # (Altaufrufer, oder ein Check, der nur wissen will ob Zeit uebrig ist)
+        # bleibt der Aufruf folgenlos fuer diese Liste.
+        self.stops: list[dict] = []
 
-    def expired(self) -> bool:
-        return time.monotonic() >= self.end
+    def expired(self, phase: str | None = None, done: int | None = None,
+               total: int | None = None) -> bool:
+        hit = time.monotonic() >= self.end
+        if hit and phase is not None:
+            self.stops.append({"phase": phase, "done": done, "total": total})
+        return hit
 
 
 class Lock:
@@ -191,7 +200,10 @@ def git_commit(vault: Path, message: str, paths, dry_run: bool = False
 
 def write_last_run(state_dir: Path, data: dict) -> Path | None:
     """Record the outcome of a real run so Brain.app can show it without
-    parsing logs. Never written by a dry-run (the caller decides)."""
+    parsing logs. Never written by a dry-run (the caller decides).
+
+    Full overwrite of the file - callers that also want the attempt merged
+    in (the success case) put a "last_attempt" key into `data` themselves."""
     path = Path(state_dir) / LAST_RUN_FILE
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,6 +219,38 @@ def read_last_run(state_dir: Path) -> dict | None:
     try:
         return json.loads(path.read_text())
     except (OSError, ValueError):
+        return None
+
+
+def record_attempt(state_dir: Path, attempt: dict) -> Path | None:
+    """Merge `attempt` into the "last_attempt" key of last-run.json, leaving
+    every other (top-level) key untouched.
+
+    ANLASS 02.09.2026: write_last_run() above is only ever called after a run
+    finished cleanly, so a run that fails or is killed mid-way leaves the old
+    successful run's record standing - a human reading last-run.json sees a
+    stale "ok" and has no reason to suspect anything went wrong since. This
+    function tracks the last ATTEMPT (started/finished/phase/status/detail)
+    separately from the last SUCCESS (the unchanged top-level fields), so a
+    fresh failure can no longer hide behind an old success. Call it once when
+    a real run starts (status "running", no "finished" yet) and once when it
+    ends, whatever the outcome. A run that is killed outright (process
+    killed, power loss) never reaches the second call, so the "running" entry
+    with no "finished" simply stays - itself the visible sign of an abort."""
+    path = Path(state_dir) / LAST_RUN_FILE
+    try:
+        existing = json.loads(path.read_text())
+        if not isinstance(existing, dict):
+            existing = {}
+    except (OSError, ValueError):
+        existing = {}
+    existing["last_attempt"] = attempt
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(existing, indent=2, ensure_ascii=False) + "\n")
+        return path
+    except OSError as e:
+        log.warning("could not write %s: %s", path, e)
         return None
 
 

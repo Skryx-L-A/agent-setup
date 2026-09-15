@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""wb-fremdmessung -- Modellbewertungen aus offenen Fremdquellen holen und ablegen.
+
+WOZU (Anweisung des Nutzers, 2026-08-27): "Fuer die Intelligenzkosten-Messung gibt es auch
+Online-Benchmarks von anderen. Schaue, welche du da findest, und ergaenze unsere Daten durch
+diese Benchmarks, wenn sie glaubwuerdig wirken, sodass wir mehr Daten haben und nicht so viel
+Limit oder Credits selber fuer die Messung verbrauchen muessen. Das kannst du auch bei anderen
+Benchmarks so machen, nicht nur bei dem, wenn online einer verfuegbar ist."
+
+DIE TRENNUNG, die dieses Werkzeug durchhaelt: eine fremde Zahl ist eine FREMDE Zahl. Sie wird
+hier nie mit einer eigenen Messung in einen Topf geworfen, sie traegt immer Quelle und
+Abrufdatum, und sie ersetzt eine eigene Messung nie -- sie fuellt die Luecken, wo wir (noch)
+nicht selbst gemessen haben. Der Grund steht in regeln/messungen.md und hat einen Anlass: beim
+Apple-Design-Skill waren zwoelf uebernommene Fremdzahlen falsch.
+
+Ablage: ~/Knowledge/_meta/messungen/modelle/fremdmessungen.json, bewusst NEBEN der eigenen
+daten.json statt darin. Wer beides sehen will, nimmt `wb-fremdmessung zeigen <modell>`.
+
+Unterbefehle:
+  wb-fremdmessung holen [--quelle <name>]   -- Quellen abrufen und ablegen
+  wb-fremdmessung zeigen [<suchbegriff>]    -- was wir ueber ein Modell wissen
+  wb-fremdmessung rangliste [--bis <$/MTok>] -- Intelligenz je Dollar, aus zwei Quellen
+  wb-fremdmessung kann <image|video|audio|file> [--bis <$/MTok>]
+                                            -- wer nimmt diese Eingabe ueberhaupt auf
+  wb-fremdmessung quellen                   -- welche Quellen es gibt und wie es um sie steht
+  wb-fremdmessung json                      -- alles als JSON
+
+QUELLENLAGE, gemessen am 2026-08-27 (jede Quelle wurde einzeln geprueft, nicht angenommen):
+
+  artificial-analysis  Intelligence Index v4.1.1 ueber mehrere Benchmarks (GDPval, GPQA
+                       Diamond, Terminal-Bench, SciCode, Humanity's Last Exam und weitere).
+                       Die offizielle API verlangt einen Schluessel ("API key is required"),
+                       die oeffentliche Modellseite traegt die Werte aber als eingebettetes
+                       JSON im ausgelieferten HTML. Genau das lesen wir -- kein Schluessel,
+                       keine Anmeldung, nur die Seite, die jeder Besucher bekommt.
+                       Glaubwuerdig: offengelegte Methodik, benannte Einzel-Benchmarks,
+                       versionierter Index.
+  aider-polyglot       Aiders Polyglot-Leaderboard als YAML im Quell-Repo. Praxisnah (echte
+                       Programmieraufgaben, gemessene Bestehensquote) und offen abrufbar.
+                       ACHTUNG: der Datenbestand endete beim Abruf am 2026-08-27 im Oktober
+                       2025 -- fuer neuere Modelle steht dort nichts. Das Werkzeug traegt das
+                       Datum je Eintrag mit, damit niemand eine alte Zahl fuer aktuell haelt.
+  openrouter-preise    Preise je Million Token aus der OpenRouter-Modellliste. Keine
+                       Bewertung, aber die zweite Haelfte jeder Kosten-zu-Leistung-Rechnung.
+
+NICHT AUFGENOMMEN und warum: LiveBench liefert ueber seine Web-Oberflaeche keine offene
+Ergebnisdatei (nur das README im Repo), und die Coupon- und Vergleichsseiten, die bei einer
+Suche oben stehen, schreiben voneinander ab, ohne selbst zu messen. Wer eine Quelle ergaenzt,
+traegt sie in QUELLEN ein und schreibt dazu, woran ihre Glaubwuerdigkeit haengt.
+"""
+from __future__ import annotations
+
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+from datetime import date, datetime
+from pathlib import Path
+
+ZIEL = Path.home() / "Knowledge/_meta/messungen/modelle/fremdmessungen.json"
+KOPF = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+
+
+def hole(url: str, zeitgrenze: int = 40) -> str:
+    anfrage = urllib.request.Request(url, headers=KOPF)
+    with urllib.request.urlopen(anfrage, timeout=zeitgrenze) as antwort:
+        return antwort.read().decode("utf-8", "replace")
+
+
+# --- Quelle 1: Artificial Analysis -------------------------------------------
+
+def quelle_artificial_analysis() -> list[dict]:
+    """Liest den Intelligence Index aus dem eingebetteten JSON der Modellseite.
+
+    Die Seite ist eine Next.js-Anwendung; ihre Daten stehen in self.__next_f-Bloecken im
+    ausgelieferten HTML. Wir suchen genau die Datensaetze mit Label und Index. Bricht das
+    Muster, faellt die Zahl AUS -- das Werkzeug erfindet dann nichts, sondern meldet null
+    Treffer, und das ist das Signal, das Muster nachzuziehen.
+    """
+    h = hole("https://artificialanalysis.ai/models")
+    roh = re.findall(
+        r'\{"label":"((?:[^"\\]|\\.)*)","intelligenceIndex":([\d.]+),"detailsUrl":"([^"]*)"\}', h)
+    gesehen, raus = set(), []
+    for label, wert, url in roh:
+        if label in gesehen:
+            continue
+        gesehen.add(label)
+        raus.append({
+            "modell": label,
+            "kennzahl": "intelligence_index",
+            "wert": round(float(wert), 1),
+            "einheit": "Punkte (v4.1.1, hoeher ist besser)",
+            "detail": f"https://artificialanalysis.ai{url}",
+        })
+    return raus
+
+
+# --- Quelle 2: Aider Polyglot ------------------------------------------------
+
+def quelle_aider_polyglot() -> list[dict]:
+    """Bestehensquote auf Aiders Polyglot-Aufgaben, aus dem YAML im Quell-Repo.
+
+    Das Datum je Eintrag wird MITGEFUEHRT: der Bestand endete beim Abruf im Oktober 2025,
+    eine Zahl von dort ist also kein Urteil ueber ein Modell von heute.
+    """
+    y = hole("https://raw.githubusercontent.com/Aider-AI/aider/main/aider/website/_data/"
+             "polyglot_leaderboard.yml")
+    treffer = re.findall(
+        r"- dirname: (\d{4}-\d{2}-\d{2})[^\n]*\n(?:.*?\n)*?  model: ([^\n]+)\n"
+        r"(?:.*?\n)*?  pass_rate_2: ([\d.]+)", y)
+    raus = []
+    for datum, modell, quote in treffer:
+        raus.append({
+            "modell": modell.strip(),
+            "kennzahl": "aider_polyglot_pass_rate",
+            "wert": float(quote),
+            "einheit": "Prozent bestandener Aufgaben (zweiter Versuch)",
+            "gemessen_am": datum,
+        })
+    return raus
+
+
+# --- Quelle 3: OpenRouter-Preise ---------------------------------------------
+
+def quelle_openrouter_preise() -> list[dict]:
+    """Preis je Million Token. Keine Bewertung, aber die Kostenseite der Rechnung."""
+    d = json.loads(hole("https://openrouter.ai/api/v1/models"))
+    raus = []
+    for m in d.get("data", []):
+        p = m.get("pricing") or {}
+        try:
+            ein, aus = float(p.get("prompt", -1)), float(p.get("completion", -1))
+        except (TypeError, ValueError):
+            continue
+        if ein < 0 or aus < 0:
+            continue
+        arch = m.get("architecture") or {}
+        raus.append({
+            "modell": m["id"],
+            "kennzahl": "preis_je_mtok",
+            "wert": round(aus * 1e6, 4),
+            "einheit": "US-Dollar je Million Ausgabe-Token",
+            "eingabe_je_mtok": round(ein * 1e6, 4),
+            "kontextfenster": m.get("context_length") or 0,
+            # Was das Modell ueberhaupt aufnehmen und ausgeben kann. der Nutzer am 2026-08-27:
+            # "Ein Modell, das an etwas Visuellem arbeitet, braucht zwingend Sicht oder native
+            # Bildverarbeitung." Das ist ein Ausschlusskriterium und keine Feinheit -- es geht
+            # der ganzen Kosten-zu-Intelligenz-Rechnung voraus. Kein noch so kluges Textmodell
+            # kann ein Bild ansehen.
+            "nimmt_auf": sorted(arch.get("input_modalities") or ["text"]),
+            "gibt_aus": sorted(arch.get("output_modalities") or ["text"]),
+        })
+    return raus
+
+
+QUELLEN = {
+    "artificial-analysis": {
+        "holen": quelle_artificial_analysis,
+        "url": "https://artificialanalysis.ai/models",
+        "art": "Bewertung",
+        "glaubwuerdig_weil": ("offengelegte Methodik, benannte Einzel-Benchmarks, versionierter "
+                              "Index (v4.1.1)"),
+        "vorbehalt": ("gelesen aus dem eingebetteten JSON der oeffentlichen Seite, nicht aus der "
+                      "API; aendert die Seite ihren Aufbau, liefert die Quelle null Treffer"),
+    },
+    "aider-polyglot": {
+        "holen": quelle_aider_polyglot,
+        "url": "https://github.com/Aider-AI/aider (polyglot_leaderboard.yml)",
+        "art": "Bewertung",
+        "glaubwuerdig_weil": "echte Programmieraufgaben, gemessene Bestehensquote, offene Rohdaten",
+        "vorbehalt": ("Bestand endete beim Abruf 2026-08-27 im Oktober 2025 -- neuere Modelle "
+                      "fehlen dort ganz"),
+    },
+    "openrouter-preise": {
+        "holen": quelle_openrouter_preise,
+        "url": "https://openrouter.ai/api/v1/models",
+        "art": "Preis",
+        "glaubwuerdig_weil": "Preisliste des Anbieters selbst, denselben Zahlen wird abgerechnet",
+        "vorbehalt": "sagt nichts ueber Leistung; Aktionspreise koennen taeglich wechseln",
+    },
+}
+
+
+# --- Ablage ------------------------------------------------------------------
+
+def lies() -> dict:
+    if ZIEL.is_file():
+        try:
+            return json.loads(ZIEL.read_text())
+        except json.JSONDecodeError:
+            print(f"WARNUNG: {ZIEL} ist unlesbar, wird neu angelegt.", file=sys.stderr)
+    return {"zweck": ("Bewertungen aus FREMDEN Quellen. Bewusst getrennt von daten.json, in der "
+                      "die selbst gemessenen Werte stehen. Eine Zahl von hier ersetzt keine "
+                      "eigene Messung, sie fuellt Luecken."),
+            "quellen": {}, "werte": []}
+
+
+def cmd_holen(nur: str | None) -> int:
+    stand = lies()
+    heute = date.today().isoformat()
+    alle = [n for n in QUELLEN if not nur or n == nur]
+    if nur and nur not in QUELLEN:
+        print(f"FEHLER: Quelle '{nur}' kenne ich nicht. Bekannt: {', '.join(QUELLEN)}",
+              file=sys.stderr)
+        return 2
+    behalten = [w for w in stand["werte"] if w.get("quelle") not in alle]
+    for name in alle:
+        q = QUELLEN[name]
+        try:
+            werte = q["holen"]()
+        except Exception as fehler:
+            print(f"  {name}: FEHLGESCHLAGEN ({type(fehler).__name__}: {fehler})")
+            stand["quellen"].setdefault(name, {})["letzter_fehler"] = f"{heute}: {fehler}"
+            continue
+        if not werte:
+            print(f"  {name}: 0 Treffer -- vermutlich hat sich der Aufbau der Quelle geaendert. "
+                  f"Muster nachziehen, nichts erfinden.")
+        for w in werte:
+            w["quelle"] = name
+            w["abgerufen_am"] = heute
+        behalten.extend(werte)
+        stand["quellen"][name] = {k: v for k, v in q.items() if k != "holen"}
+        stand["quellen"][name]["zuletzt_geholt"] = heute
+        stand["quellen"][name]["treffer"] = len(werte)
+        print(f"  {name}: {len(werte)} Werte")
+    stand["werte"] = behalten
+    stand["stand"] = heute
+    ZIEL.parent.mkdir(parents=True, exist_ok=True)
+    ZIEL.write_text(json.dumps(stand, indent=1, ensure_ascii=False) + "\n")
+    print(f"\nAbgelegt: {ZIEL} ({len(behalten)} Werte)")
+    return 0
+
+
+def passt(name: str, suche: str) -> bool:
+    """Fremdquellen schreiben Modellnamen unterschiedlich: 'GLM-5.3-Flash' bei der einen,
+    'z-ai/glm-5.3-flash' bei der anderen. Deshalb wird auf einen gemeinsamen Nenner
+    heruntergebrochen, statt auf Gleichheit zu prufen."""
+    schrumpf = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+    return schrumpf(suche) in schrumpf(name) or schrumpf(name) in schrumpf(suche)
+
+
+def cmd_zeigen(suche: str | None) -> int:
+    stand = lies()
+    if not stand["werte"]:
+        print("Nichts abgelegt. Erst: wb-fremdmessung holen")
+        return 1
+    treffer = [w for w in stand["werte"] if not suche or passt(w["modell"], suche)]
+    if not treffer:
+        print(f"Kein Fremdwert zu '{suche}'. Das ist ein Ergebnis: dort muessen wir selbst messen.")
+        return 1
+    nach_modell: dict[str, list] = {}
+    for w in treffer:
+        nach_modell.setdefault(w["modell"], []).append(w)
+    for modell in sorted(nach_modell):
+        print(f"\n{modell}")
+        for w in sorted(nach_modell[modell], key=lambda x: x["kennzahl"]):
+            alt = f", gemessen {w['gemessen_am']}" if w.get("gemessen_am") else ""
+            print(f"    {w['kennzahl']:28s} {w['wert']:>10}  {w['einheit']}")
+            print(f"    {'':28s} Quelle: {w['quelle']} (abgerufen {w['abgerufen_am']}{alt}) "
+                  f"-- FREMDE Messung, nicht von uns")
+    print(f"\n{len(nach_modell)} Modell(e). Eigene Messungen stehen woanders: wb-messung.")
+    return 0
+
+
+def cmd_quellen() -> int:
+    stand = lies()
+    for name, q in QUELLEN.items():
+        gespeichert = stand["quellen"].get(name, {})
+        print(f"{name}  [{q['art']}]")
+        print(f"    {q['url']}")
+        print(f"    glaubwuerdig weil: {q['glaubwuerdig_weil']}")
+        print(f"    Vorbehalt: {q['vorbehalt']}")
+        if gespeichert.get("zuletzt_geholt"):
+            print(f"    zuletzt geholt: {gespeichert['zuletzt_geholt']} "
+                  f"({gespeichert.get('treffer', '?')} Werte)")
+        if gespeichert.get("letzter_fehler"):
+            print(f"    letzter Fehler: {gespeichert['letzter_fehler']}")
+        print()
+    return 0
+
+
+def normal(name: str) -> str:
+    """Ein Modell heisst bei jeder Quelle anders: 'GLM-5.3-Flash' hier, 'z-ai/glm-5.3-flash'
+    dort. Fuer die Rangliste muessen beide zusammenfinden, sonst steht die Intelligenz in der
+    einen Zeile und der Preis in der naechsten."""
+    ohne_anbieter = name.split("/")[-1]
+    return re.sub(r"[^a-z0-9]", "", ohne_anbieter.lower())
+
+
+def cmd_rangliste(grenze: float) -> int:
+    """Intelligenz gegen Preis. Die Kernfrage: was bekomme ich je Dollar.
+
+    Bewusst KEINE einzelne Rangzahl als Urteil -- der Quotient sagt nur, wie viel Bewertung
+    ein Dollar kauft, und nicht, ob das Modell fuer eine bestimmte Aufgabe taugt. Ein billiges
+    Modell mit halber Intelligenz gewinnt hier jeden Quotienten und kann trotzdem die falsche
+    Wahl sein. Deshalb stehen beide Rohwerte danebst."""
+    stand = lies()
+    intelligenz, preis, kontext = {}, {}, {}
+    for w in stand["werte"]:
+        k = normal(w["modell"])
+        if w["kennzahl"] == "intelligence_index":
+            intelligenz[k] = (w["wert"], w["modell"])
+        elif w["kennzahl"] == "preis_je_mtok":
+            # bei mehreren Treffern den guenstigsten nehmen (Anbieter-Varianten, :batch etc.)
+            if k not in preis or w["wert"] < preis[k][0]:
+                preis[k] = (w["wert"], w["modell"])
+                kontext[k] = w.get("kontextfenster", 0)
+    zeilen = []
+    for k, (iq, name) in intelligenz.items():
+        if k not in preis:
+            zeilen.append((None, iq, None, name, kontext.get(k, 0)))
+            continue
+        pr, pname = preis[k]
+        verhaeltnis = (iq / pr) if pr > 0 else float("inf")
+        if grenze and pr > grenze:
+            continue
+        zeilen.append((verhaeltnis, iq, pr, pname, kontext.get(k, 0)))
+    mit = sorted([z for z in zeilen if z[0] is not None], key=lambda z: -z[0])
+    ohne = [z for z in zeilen if z[0] is None]
+    print("Intelligenz je Dollar -- FREMDE Zahlen, beide Spalten aus verschiedenen Quellen")
+    print("(Index: artificial-analysis v4.1.1 | Preis: OpenRouter, Ausgabe je Mio Token)\n")
+    print(f"{'Index/$':>10} {'Index':>6} {'$/MTok':>8} {'ctx':>7}  Modell")
+    for v, iq, pr, name, ctx in mit:
+        wert = "gratis" if v == float("inf") else f"{v:10.1f}"
+        print(f"{wert:>10} {iq:6.1f} {pr:8.3f} {ctx//1000:6d}k  {name}")
+    if ohne:
+        print(f"\nBewertet, aber bei OpenRouter nicht gefunden (kein Preis, kein Quotient):")
+        for _, iq, _, name, _ in ohne:
+            print(f"           {iq:6.1f}                     {name}")
+    print(f"\nWas hier FEHLT, muessen wir selbst messen: die Quelle bewertet nur {len(intelligenz)} "
+          f"Modelle, OpenRouter fuehrt {len(preis)}.")
+    return 0
+
+
+def cmd_kann(gesucht: list[str], hoechstpreis: float) -> int:
+    """Welche Modelle nehmen die geforderten Eingaben auf.
+
+    Zuerst gefragt, nicht zuletzt: eine Aufgabe an einem Bild, einem Video oder einem Ton
+    schliesst jedes reine Textmodell aus, egal wie klug oder billig es ist.
+    """
+    stand = lies()
+    gesucht = [g.lower() for g in gesucht] or ["image"]
+    treffer = []
+    for w in stand["werte"]:
+        if w.get("kennzahl") != "preis_je_mtok":
+            continue
+        kann = [k.lower() for k in w.get("nimmt_auf", [])]
+        if not all(g in kann for g in gesucht):
+            continue
+        if hoechstpreis and w["wert"] > hoechstpreis:
+            continue
+        treffer.append(w)
+    treffer.sort(key=lambda w: (w["wert"], -(w.get("kontextfenster") or 0)))
+    print(f"Modelle, die {' und '.join(gesucht)} aufnehmen"
+          + (f", bis {hoechstpreis} $/MTok" if hoechstpreis else "") + ":\n")
+    print(f"{'$/MTok':>9} {'ctx':>7}  {'nimmt auf':32s} Modell")
+    for w in treffer:
+        preis = "gratis" if w["wert"] == 0 else f"{w['wert']:9.3f}"
+        print(f"{preis:>9} {(w.get('kontextfenster') or 0)//1000:6d}k  "
+              f"{','.join(w['nimmt_auf']):32s} {w['modell']}")
+    print(f"\n{len(treffer)} Treffer. LOKAL kann qwen38-27b Bild UND Video (config.json: "
+          f"vision_config, image_token_id, video_token_id) -- erst dort nachsehen, bevor "
+          f"ein Cloud-Modell dafuer angefasst wird.")
+    return 0
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args:
+        return cmd_zeigen(None)
+    if args[0] == "holen":
+        nur = args[args.index("--quelle") + 1] if "--quelle" in args else None
+        return cmd_holen(nur)
+    if args[0] == "zeigen":
+        return cmd_zeigen(args[1] if len(args) > 1 else None)
+    if args[0] == "rangliste":
+        grenze = float(args[args.index("--bis") + 1]) if "--bis" in args else 0.0
+        return cmd_rangliste(grenze)
+    if args[0] == "kann":
+        grenze = 0.0
+        rest = []
+        i = 1
+        while i < len(args):
+            if args[i] == "--bis":
+                # Der WERT nach --bis darf nicht als Modalitaet mitgezaehlt werden, sonst sucht
+                # das Werkzeug nach einer Eingabeart namens "1.0" und findet nie etwas.
+                grenze = float(args[i + 1])
+                i += 2
+                continue
+            if not args[i].startswith("--"):
+                rest.append(args[i])
+            i += 1
+        return cmd_kann(rest, grenze)
+    if args[0] == "quellen":
+        return cmd_quellen()
+    if args[0] == "json":
+        print(json.dumps(lies(), indent=1, ensure_ascii=False))
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

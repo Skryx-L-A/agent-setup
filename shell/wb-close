@@ -100,14 +100,50 @@ resolve(){ # arg -> pane_id. accepts %id directly or a @wb_worker name.
 # Slug/Sanitizing dupliziert bewusst context-guard's eigene socket_slug()/
 # sanitize_name() (dort: Kommentarblock ueber STATE_BASE) -- beide Skripte muessen
 # bitgleich denselben Pfad berechnen; ein gemeinsames Sourcing waere hier mehr
-# Kopplung als die paar Zeilen wert sind.
+# Kopplung als die paar Zeilen wert sind. Aus demselben Grund ist die Sperre unten
+# eine EIGENE, duplizierte Fassung von context-guards acquire_done_lock() (siehe
+# dessen Kommentar bei LOCK_DIR) -- kein Sourcing, keine zusaetzliche Kopplung.
+#
+# Sperre gegen context-guard (2026-08-22, Auftrag "Fertigmeldung: Sperre gebaut"):
+# ohne sie kann eine Fertigmeldung sichtbar werden, WAEHREND dieser Schreibzugriff
+# hier gerade laeuft -- context-guards eigene "frisch nachpruefen"-Stelle schliesst
+# nur das Fenster VOR ihrem nudge()-Aufruf, nicht das Fenster INNERHALB davon. Zwei
+# Deckel: WBCLOSE_LOCK_TIMEOUT_S begrenzt die Wartezeit auf die Sperre, danach wird
+# OHNE sie geschrieben (zweite Auflage: kein Ausfall, nur dieselbe Reihenfolge wie
+# vorher); WBCLOSE_LOCK_STALE_S uebernimmt eine Sperre, die laenger steht, statt sie
+# fuer immer zu respektieren (erste Auflage: ein abgestuerzter Halter darf den Guard
+# nie dauerhaft verstummen lassen).
+WBCLOSE_LOCK_TIMEOUT_S="${WBCLOSE_LOCK_TIMEOUT_S:-5}"
+WBCLOSE_LOCK_STALE_S="${WBCLOSE_LOCK_STALE_S:-20}"
+acquire_close_lock() {   # <sperrverzeichnis> -> 0 erworben, 1 Deckel erreicht
+  local d="$1" deadline age mtime
+  deadline=$((SECONDS + WBCLOSE_LOCK_TIMEOUT_S))
+  while :; do
+    mkdir "$d" 2>/dev/null && return 0
+    if [ -d "$d" ]; then
+      mtime="$(stat -L -c %Y "$d" 2>/dev/null || stat -L -f %m "$d" 2>/dev/null || echo 0)"
+      age=$(( $(date +%s) - mtime ))
+      if [ "$age" -gt "$WBCLOSE_LOCK_STALE_S" ]; then
+        rmdir "$d" 2>/dev/null || rm -rf "$d" 2>/dev/null
+        continue
+      fi
+    fi
+    [ $SECONDS -lt $deadline ] || return 1
+    sleep 0.1
+  done
+}
 mark_worker_done(){   # socket-path session-name worker-name -> setzt das done-notified-Flag, best effort
-  local sp="$1" sess="$2" wname="$3" slug base
+  local sp="$1" sess="$2" wname="$3" slug base lockdir lockpath have_lock=0
   [ -n "$wname" ] && [ -n "$sp" ] || return 0
   slug="$(printf '%s|%s' "$sp" "$sess" | tr -c 'a-zA-Z0-9' '-')"
   base="$HOME/.local/state/wb-context-guard/$slug.done-notified"
   mkdir -p "$base" 2>/dev/null || return 0
+  lockdir="$HOME/.local/state/wb-context-guard/$slug.done-lock"
+  mkdir -p "$lockdir" 2>/dev/null || true
+  lockpath="$lockdir/$(printf '%s' "$wname" | tr -c 'a-zA-Z0-9' '-')"
+  acquire_close_lock "$lockpath" && have_lock=1
   touch "$base/$(printf '%s' "$wname" | tr -c 'a-zA-Z0-9' '-')" 2>/dev/null || true
+  [ "$have_lock" = 1 ] && rmdir "$lockpath" 2>/dev/null
 }
 
 # Worktree-Aufraeumen (2026-08-04). Ein geschlossener Worker laesst sonst seinen

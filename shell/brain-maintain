@@ -54,6 +54,20 @@ run_contradict_queue() {
   "$BRAIN" --vault "$VAULT" contradict --queue --write
 }
 
+# Anlass (2026-08-22, dieselbe Bugfamilie wie wb-budget): '--status' und
+# '--contradict-only' standen bisher als zwei eigenstaendige 'if', ohne
+# gemeinsamen Riegel gegen alles andere -- ein Tippfehler (z.B. '--staus')
+# traf keinen der beiden und fiel bis zum vollen Wartungslauf durch, inklusive
+# 'contradict --queue --write' (schreibt in den Vault). Wer nur den Status
+# lesen wollte, haette ungewollt geschrieben, ohne jede Fehlermeldung.
+case "${1:-}" in
+  ''|--status|--contradict-only) ;;
+  *)
+    echo "brain-maintain: unbekannte Option '$1' -- erlaubt: (ohne Argument) | --status | --contradict-only." >&2
+    exit 1
+    ;;
+esac
+
 if [ "${1:-}" = "--status" ]; then
   echo "== gardener =="
   "$BRAIN" gardener status 2>&1 | head -4

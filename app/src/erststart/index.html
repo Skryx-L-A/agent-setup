@@ -9,36 +9,19 @@
       content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:"
     />
     <title>Agent Workbench — First Steps</title>
+    <!-- DAS TOKEN-SYSTEM, an einer Stelle: main/thema.ts (ROLLEN, rollenCss()),
+         identisch in allen fuenf Fenstern. -->
+    <link rel="stylesheet" href="tokens.css" />
     <style>
-      /* Farben der drei anderen Fenster (app/src/verbrauch/index.html), damit vier Fenster
-         desselben Programms wie vier Fenster desselben Programms aussehen. */
+      /* Zwei eigene Namen fuer bestehende Rollen (gut/schlecht statt laeuft/aus
+         -- diese Seite prueft Vorbedingungen, keine Sitzungszustaende), aus
+         tokens.css uebernommen statt ein zweites Mal als Hex geschrieben. */
       :root {
-        color-scheme: dark;
-        --grund: #101216;
-        --leiste: #171a20;
-        --linie: #262b34;
-        --schrift: #d8dee9;
-        --gedaempft: #8b93a1;
-        --fern: #6a7fd0;
-        --wahl: #222833;
-        --gut: #46a758;
-        --schlecht: #d24c4c;
+        --gut: var(--laeuft);
+        --schlecht: var(--aus);
       }
-      /* HELL UND DUNKEL (Farben durchreichen, 11.08.), dieselbe Mechanik wie in
-         den anderen Fenstern: `data-thema` traegt den von main/thema.ts
-         AUFGELOESTEN Wert ('hell'/'dunkel'), gesetzt in erststart.ts. */
-      :root[data-thema='hell'] {
-        color-scheme: light;
-        --grund: #ffffff;
-        --leiste: #f4f5f7;
-        --linie: #d8dbe1;
-        --schrift: #1b1f27;
-        --gedaempft: #5c6472;
-        --fern: #3355c4;
-        --wahl: #e4e8f4;
-        --gut: #22803c;
-        --schlecht: #b3261e;
-      }
+      /* `data-thema` traegt den von main/thema.ts AUFGELOESTEN Wert
+         ('hell'/'dunkel'), gesetzt in erststart.ts. */
       html,
       body {
         margin: 0;
@@ -47,7 +30,7 @@
         color: var(--schrift);
       }
       body {
-        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui;
         display: flex;
         flex-direction: column;
         overflow: hidden;
@@ -107,11 +90,11 @@
         cursor: pointer;
       }
       .chip:hover {
-        background: #1e232b;
+        background: var(--erhoben);
       }
       .chip.gewaehlt {
-        border-color: var(--fern);
-        color: var(--fern);
+        border-color: var(--akzent);
+        color: var(--akzent-text);
         background: var(--wahl);
       }
       .chip .zeichen {
@@ -168,7 +151,7 @@
       }
       .kontexteintrag.gewaehlt {
         background: var(--wahl);
-        color: var(--fern);
+        color: var(--akzent-text);
       }
       .kontexteintrag .zeile1 {
         display: flex;
@@ -217,11 +200,11 @@
         cursor: pointer;
       }
       .knopf:hover {
-        background: #1e232b;
+        background: var(--erhoben);
       }
       .knopf.hervor {
-        border-color: var(--fern);
-        color: var(--fern);
+        border-color: var(--akzent);
+        color: var(--akzent-text);
       }
       .zusammenfassung {
         margin: 6px 0 14px;

@@ -1,6 +1,6 @@
 ---
 name: design-harvest
-description: Capture UI/design elements and design tokens from existing websites to reuse as inspiration when building new sites. Use when the user wants to "harvest"/"grab"/"analyze" the design of a site, pull UI elements or styling from reference sites, build a design reference library, or gather visual inspiration before designing a website. Extracts screenshots + palette/typography/spacing/component patterns into a structured reference library. Harvests patterns and tokens — never copies copyrighted assets wholesale.
+description: "Extract visual patterns and design tokens from specified public websites into a reusable reference brief. Use for a requested design harvest; do not copy assets, text or implementation."
 ---
 
 # design-harvest
@@ -12,18 +12,18 @@ new site can be designed from real references instead of guesswork. Built for ha
 
 ## Copyright guardrail (read first)
 Harvest **patterns + design tokens** (colors, type scale, spacing, layout/interaction ideas) —
-these are not copyrightable. **Do NOT** lift a site's exact CSS, images, logos, copy, or
+treat them as inspiration for an original design. **Do NOT** lift a site's exact CSS, images, logos, copy, or
 proprietary components wholesale; that's trade-dress/copyright risk. The output is raw material
 for an **original** synthesis, not a clone. Never harvest anything behind a login or paywall.
 
 ## Workflow
 
 ### 1. Scope
-Confirm with the user: the target URL(s), and what they're building (so the synthesis is aimed).
+Use the request to establish: the target URL(s), and what they're building (so the synthesis is aimed).
 Pick a project slug for the output folder (e.g. `school-site`, `studio-site`).
 
-### 2. Harvest each site (use the Playwright MCP tools)
-For each URL:
+### 2. Harvest each site (use available browser capabilities)
+The tool names below describe Playwright operations. Use the corresponding navigation, screenshot and DOM-evaluation capabilities of the current browser tool; never assume these exact names are callable. For each URL:
 - `browser_navigate` to the URL; resize to a desktop width (e.g. 1440) and let it settle.
 - **Screenshots:** `browser_take_screenshot` full-page, plus a few targeted shots (hero,
   nav, a card/section, footer). Mobile width (390) too if responsive design matters.
@@ -78,7 +78,7 @@ merged from two independent research sources, 2026-07-29):
   known anti-patterns worth banning outright (adapt to the project; don't copy a fixed list).
 
 ## Notes
-- If the Playwright MCP isn't available, fall back to the `claude-in-chrome` browser tools, or a
+- If the Playwright MCP isn't available, use another available browser tool, or a
   standalone Playwright Python/Node script (`browser_evaluate` equivalent = `page.evaluate`).
 - `extract_design_tokens.js` samples up to ~6000 elements and ranks by frequency, so the top
   entries approximate the site's actual design system. It reads computed styles only — no network

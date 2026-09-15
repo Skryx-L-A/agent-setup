@@ -148,6 +148,24 @@ Terminal-Sitzung eine SSH-Trennung übersteht. Das Werkzeug ist vollständig
 plattformneutral (kein Linux-spezifischer Pfad oder Aufruf); es liegt trotzdem
 hier, weil bislang nur eine Fassung auf Peer-Rechner bekannt ist.
 
+## agent-workbench und orch-ws6
+
+Diese beiden kamen am 2026-09-05 aus der Prüfung des Auftrags `peersauber`
+dazu: `wb-consistency` meldete sie als EIGEN-NICHT-IM-REPO, weil sie nur
+installiert lagen und nirgends versioniert waren.
+
+`agent-workbench` startet die Electron-App aus `app/` in diesem Repo sichtbar
+auf Peer-Rechner — das Linux-Gegenstück zu `app/tools/buendel-bauen.sh`, das nur auf
+dem Mac baut. Der Quelltext wird nicht kopiert, gestartet wird immer der
+Stand unter `~/AI/claude-workbench/app`; fehlt das Bauergebnis, baut das
+Skript einmal selbst.
+
+`orch-ws6` ist eine Testumgebung für einen virtuellen Hyprland-Headless-
+Output („Workspace 6"): Apps starten und Screenshots entstehen dort komplett
+isoliert von den echten Monitoren, ohne Fokuswechsel und ohne den sichtbaren
+Bildschirm anzufassen — dieselbe Haltung wie bei `orch-launch`/`orch-bare`
+oben, nur für automatisierte Testläufe statt für eine echte Arbeitssitzung.
+
 ## Was zu anderen Projekten gehört, nicht hierher
 
 Die zweite Prüfrunde fand weitere Werkzeuge auf Peer-Rechner, die zunächst wie

@@ -2,99 +2,136 @@
    nicht daneben -- die Panes sollen ihre Flaeche behalten, solange niemand
    hinsieht. Dieselbe Sprache wie der Rest: dunkel, monospace, ruhige Farben,
    Gelb ist fuer "etwas will etwas" reserviert. */
-/* Die Schublade steht IN der Reihe zwischen Sessionleiste und Buehne, nicht
-   darueber -- Vorgabe des Nutzers vom 05.08.: "so wie es auch rechts aussieht".
-   Als schwebende Flaeche lag sie ueber der Buehne und liess die linke Seite
-   wie zwei uebereinandergeschobene Leisten wirken. Jetzt endet die Buehne an
-   ihr, genau wie sie rechts an der Workerleiste endet. Zugeklappt ist sie
-   `display: none` und nimmt keine Breite -- das ersetzt die alte Schiebe-
-   Animation, die in der Reihe die Buehne bei jedem Bild neu vermessen haette. */
+/* NEUE STELLE UND NEUE GESTALT (03.09.2026), gleiche Logik. Das Blatt liegt
+   nicht mehr im Schubladenplatz neben den drei anderen, sondern als Blatt UEBER
+   der Flaeche, von rechts. Der Grund steht in freigaben-view.ts: die
+   Entscheidung selbst faellt in der Leiste quer oben, dieses Blatt ist der
+   vollstaendige Posteingang dahinter -- Antraege, angehaltene Worker, Verlauf.
+   Deshalb liegt es absolut und nicht in der Reihe: es soll die Panes nicht
+   schmaler machen, nur um eine Liste zu zeigen, die man gleich wieder
+   wegklickt. */
+#freigaben-platz { position: fixed; inset: 0; pointer-events: none; z-index: 20; }
+#freigaben-platz .fg-panel { pointer-events: auto; }
+/* AUCH DAS FREIGABENBLATT IST EINE KARTE (04.09.2026). Es lag bis dahin bis an
+   den Fensterrand und trug links eine Trennlinie -- die letzte Flaeche im
+   Fenster, die noch so gebaut war. Jetzt haelt es dieselbe Fuge wie alles
+   andere, hat denselben Eckenradius und braucht keine Linie: es liegt sichtbar
+   ueber den Karten darunter. */
 .fg-panel {
-  flex: 0 0 auto; width: min(480px, 45vw); height: 100%; box-sizing: border-box;
-  background: #14171c; border-right: 1px solid #262b34; color: #d8dee9;
-  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  position: absolute; right: var(--fuge);
+  top: calc(var(--fuge) + var(--titelhoehe) + var(--fuge));
+  bottom: calc(var(--fuge) + var(--statushoehe) + var(--fuge));
+  width: min(460px, 46vw); box-sizing: border-box;
+  border-radius: var(--r-karte); overflow: hidden;
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--tinte) 22%, transparent);
+  background: var(--leiste); color: var(--schrift);
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui;
   display: none; flex-direction: column;
-  /* Ein Pfad oder ein anderes unbrechbares langes Wort (kein Leerzeichen)
-     lief sonst ueber den rechten Rand der Schublade hinaus, statt umzubrechen
-     -- gefunden am Belegbild vom 05.08., beim Verzeichnis eines Antrags. Gilt
-     fuer die ganze Schublade, damit keine neue Stelle denselben Fehler wieder
-     einfuehrt. */
+  /* Ein Pfad oder ein anderes unbrechbares langes Wort (kein Leerzeichen) lief
+     sonst ueber den rechten Rand hinaus, statt umzubrechen -- gefunden am
+     Belegbild vom 05.08., beim Verzeichnis eines Antrags. Gilt fuer das ganze
+     Blatt, damit keine neue Stelle denselben Fehler wieder einfuehrt. */
   overflow-wrap: anywhere;
 }
 .fg-panel.offen { display: flex; }
 
 .fg-kopf {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 10px 12px; border-bottom: 1px solid #262b34; flex: 0 0 auto;
+  padding: 12px; flex: 0 0 auto;
 }
 .fg-titel { font-weight: 700; font-size: 13px; }
 .fg-schliessen {
-  background: none; border: 0; color: #8b93a1; font-size: 18px; line-height: 1;
+  background: none; border: 0; color: var(--gedaempft); font-size: 18px; line-height: 1;
   cursor: pointer; padding: 2px 6px;
 }
-.fg-schliessen:hover { color: #d8dee9; }
+.fg-schliessen:hover { color: var(--schrift); }
 
 .fg-inhalt { flex: 1 1 auto; overflow-y: auto; padding: 4px 0 16px; }
 .fg-abschnitt-titel {
-  margin: 14px 12px 6px; color: #8b93a1; font-size: 11px; text-transform: uppercase;
+  margin: 14px 12px 6px; color: var(--gedaempft); font-size: 11px; text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 .fg-liste { display: flex; flex-direction: column; gap: 8px; padding: 0 12px; }
-.fg-leer { color: #8b93a1; padding: 4px 0 8px; }
+.fg-leer { color: var(--gedaempft); padding: 4px 0 8px; }
 
+/* Karte statt Kasten, wie ueberall sonst: die Flaeche traegt, die Umrandung
+   faellt weg. Die farbige Kante links BLEIBT -- sie ist eine Marke fuer die
+   Rubrik (Block, Antrag, Verlauf) und keine Umrandung. */
 .fg-eintrag {
-  background: #1a1e25; border: 1px solid #262b34; border-radius: 6px; padding: 8px 10px;
+  background: var(--erhoben); border: 0; border-radius: var(--r-mittel); padding: 8px 10px;
 }
-.fg-block { border-left: 3px solid #e0a020; }
+.fg-block { border-left: 3px solid var(--will); }
 /* Die mittlere Stufe: ein Befehl, der auf eine Antwort wartet, statt
    endgueltig abgelehnt zu sein. Kraeftiger als eine harte Ablehnung, weil hier
    etwas ZU TUN ist -- dieselbe Rubrik, deutlich unterscheidbar. */
-.fg-block-wartet { border-left-width: 5px; border-left-color: #e8b23a; background: #1e2028; }
-.fg-muster { margin-top: 6px; color: #e8b23a; font-size: 11px; }
-.fg-verzeichnis { margin-top: 4px; color: #8b93a1; font-size: 11px; }
-.fg-antrag { border-left: 3px solid #6a7fd0; }
+/* Die mittlere Stufe hebt sich seit dem 05.09.2026 ueber die Wartefarbe als
+   FLAECHE ab: seit die Eintragskarte selbst auf `--erhoben` liegt, waere ein
+   zweites `--erhoben` kein Unterschied mehr. Dieselbe getoente Flaeche, die
+   auch die Freigabeleiste oben traegt. */
+.fg-block-wartet { border-left-width: 5px; border-left-color: var(--will); background: var(--wartet-matt); }
+.fg-muster { margin-top: 6px; color: var(--will); font-size: 11px; }
+.fg-verzeichnis { margin-top: 4px; color: var(--gedaempft); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.fg-antrag { border-left: 3px solid var(--fern); }
 /* Verlauf (V17): gedaempft statt gefaerbt -- eine Gruppe ist Geschichte, kein
    aktiver Wunsch wie ein Block (gelb) oder ein Antrag (blau). */
-.fg-verlauf { border-left: 3px solid #545c6b; }
+.fg-verlauf { border-left: 3px solid var(--gedaempft); }
 
 .fg-eintrag-kopf { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .fg-wer { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.fg-wann { color: #8b93a1; font-size: 11px; white-space: nowrap; }
-.fg-zusatz { color: #8b93a1; font-size: 11px; margin-top: 2px; }
+.fg-wann { color: var(--gedaempft); font-size: 11px; white-space: nowrap; }
+.fg-zusatz { color: var(--gedaempft); font-size: 11px; margin-top: 2px; }
 
 .fg-grund { margin-top: 6px; white-space: pre-wrap; }
 .fg-befehl {
-  margin-top: 6px; padding: 4px 6px; background: #0e1014; border-radius: 4px;
-  color: #b9c0cc; white-space: pre-wrap; word-break: break-all;
+  margin-top: 6px; padding: 4px 6px; background: var(--grund); border-radius: 4px;
+  color: var(--schrift); white-space: pre-wrap; word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .fg-feld { margin-top: 4px; }
-.fg-feld b { color: #8b93a1; font-weight: 600; }
-.fg-hinweis { margin-top: 8px; margin-bottom: 8px; color: #8b93a1; font-size: 11px; }
+.fg-feld b { color: var(--gedaempft); font-weight: 600; }
+.fg-hinweis { margin-top: 8px; margin-bottom: 8px; color: var(--gedaempft); font-size: 11px; }
+/* Derselbe seitliche Einzug wie .fg-abschnitt-titel und .fg-liste. NUR fuer den
+   Hinweis, der direkt im Abschnitt steht: der zweite Ort, an dem .fg-hinweis
+   vorkommt, liegt INNERHALB eines .fg-eintrag, und der bringt seine Polsterung
+   schon mit. Ohne diese Regel begann der Erklaersatz unter "Guard-Verlauf" rund
+   zwoelf Pixel weiter links als alles andere im Panel (gesehen am 03.09.). */
+.fg-abschnitt > .fg-hinweis { margin-left: 12px; margin-right: 12px; }
 
-.fg-grundfeld { display: block; margin-top: 8px; color: #8b93a1; font-size: 11px; }
+.fg-grundfeld { display: block; margin-top: 8px; color: var(--gedaempft); font-size: 11px; }
+/* EIN FELD IST EINE FLAECHE, KEIN KASTEN (05.09.2026, Electron-Befund 9). */
 .fg-grund-eingabe {
   display: block; width: 100%; margin-top: 3px; box-sizing: border-box;
-  background: #0e1014; border: 1px solid #262b34; border-radius: 4px; color: #d8dee9;
-  font: inherit; padding: 4px 6px;
+  background: var(--erhoben); border: 0; border-radius: var(--r-klein); color: var(--schrift);
+  font: inherit; padding: 5px 8px;
 }
+.fg-grund-eingabe:focus { outline: 2px solid var(--akzent); outline-offset: -2px; }
 
+/* EINE KNOPFSPRACHE, AUCH HIER (05.09.2026, Regelbruch 5 und Electron-Befund
+   10). „Annehmen" und „Ablehnen" waren umrandete Kaesten in Gruen und Rot --
+   ein Bildpunkt (70,167,88) beziehungsweise die Ablehnfarbe, Radius 8, Hoehe
+   36. Zusammen mit dem blauen Rand um die Antragskarte und dem gelben Banner
+   standen vier Farben auf einem Blatt. Jetzt gilt dieselbe Sprache wie im
+   Hauptfenster: „Annehmen" ist die gefuellte Akzent-Pille, alles andere eine
+   graue. Gruen und Rot bleiben dem Zustandspunkt vorbehalten. */
 .fg-aktionen { display: flex; gap: 8px; margin-top: 8px; }
 .fg-btn {
-  font: inherit; color: #d8dee9; background: #21262f; border: 1px solid #262b34;
-  border-radius: 4px; padding: 3px 10px; cursor: pointer;
+  font: inherit; color: var(--schrift); background: var(--erhoben); border: 0;
+  border-radius: var(--r-klein); padding: 4px 13px; font-size: 12px; font-weight: 500;
+  cursor: pointer;
 }
-.fg-btn:hover { background: #2a3140; }
-.fg-btn-an { border-color: #46a758; }
-.fg-btn-ab { border-color: #d24c4c; }
-.fg-ergebnis { margin-top: 6px; color: #8b93a1; }
-.fg-ergebnis.fg-fehler { color: #d24c4c; }
+.fg-btn:hover { background: var(--linie); }
+.fg-btn-an { background: var(--akzent); color: var(--akzent-tinte); }
+.fg-btn-an:hover { background: var(--akzent); filter: brightness(1.08); }
+.fg-ergebnis { margin-top: 6px; color: var(--gedaempft); }
+.fg-ergebnis.fg-fehler { color: var(--aus); }
 
-/* Der Knopf links traegt einen kleinen Punkt, solange etwas wartet -- dieselbe
-   Farbe wie das Gelb der Tab-Marken: "etwas will etwas". */
-.knopf[data-tot="freigaben"] { position: relative; }
-.knopf[data-tot="freigaben"].fg-hat-wartende::after {
-  content: ''; position: absolute; top: 4px; right: 6px; width: 7px; height: 7px;
-  border-radius: 50%; background: #e0a020;
-}
-.schmal .knopf[data-tot="freigaben"].fg-hat-wartende::after { right: 10px; }
+/* HIER LAG DER BRAUNE PUNKT (05.09.2026, Regelbruch 9). Der Knopf trug,
+   solange etwas wartete, einen sieben Bildpunkte grossen Kreis in der
+   Wartefarbe -- aus der Zeit, als er ein schlichter Knopf in der linken
+   Leiste war. Seit dem Neubau IST er das Abzeichen: er steht in der
+   Titelleiste, traegt die Wartefarbe als Flaeche und die Zahl der offenen
+   Freigaben als Ziffer. Der Punkt lag genau auf dieser Ziffer und sagte
+   nichts, was die Ziffer nicht schon sagt. Die Klasse `fg-hat-wartende`
+   bleibt -- der Steuerkanal liest sie, und sie ist die einzige Stelle, an der
+   ohne das offene Blatt ablesbar ist, ob etwas wartet. */

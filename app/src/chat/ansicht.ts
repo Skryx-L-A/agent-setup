@@ -21,10 +21,13 @@ import type { ChatNachricht, ChatStand } from './typen';
 import { setzeSprache, t } from './texte';
 import { markdownZuHtml } from './markdown';
 import { bildmass } from './bildplatzhalter';
+import { pfadKlickAnbinden, pfadeVerlinken, type PfadHaken } from './pfadlinks';
 
 export interface AnsichtHaken {
   /** Der Mensch will zurueck zum Terminal. */
   aufTerminal(): void;
+  /** Pfade in einer Nachricht pruefen und oeffnen lassen (chat/pfadlinks.ts). */
+  pfade: PfadHaken;
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -93,6 +96,8 @@ export class ChatAnsicht {
     this.verlauf = el('div', 'chat-verlauf');
     this.fuss = el('div', 'chat-fuss');
     this.wurzel.append(this.leiste, this.verlauf, this.fuss);
+    // EIN Klick-Behandler fuer alle anklickbaren Pfade im Verlauf (chatdatei).
+    pfadKlickAnbinden(this.verlauf, this.haken.pfade);
     this.verlauf.addEventListener('scroll', () => {
       const rest = this.verlauf.scrollHeight - this.verlauf.scrollTop - this.verlauf.clientHeight;
       this.amEnde = rest < 40;
@@ -183,8 +188,12 @@ export class ChatAnsicht {
       }
     }
     const feld = el('div', 'chat-text');
-    if (n.rolle === 'mensch' || n.rolle === 'agent') feld.innerHTML = markdownZuHtml(n.text);
-    else feld.textContent = n.text;
+    if (n.rolle === 'mensch' || n.rolle === 'agent') {
+      feld.innerHTML = markdownZuHtml(n.text);
+      // NACH dem Sanitizing: die Pfade werden in den fertigen Textknoten
+      // markiert, nie als Zeichenkette ins HTML gesetzt (chat/pfadlinks.ts).
+      void pfadeVerlinken(feld, n.text, this.haken.pfade);
+    } else feld.textContent = n.text;
     return feld;
   }
 

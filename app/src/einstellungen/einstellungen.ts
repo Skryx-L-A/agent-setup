@@ -49,6 +49,7 @@ interface HarnessSicht {
   label: string;
   modelle: number;
   binaer: boolean;
+  orchestratorDefaultModel?: string;
 }
 
 /** Multi-Token-Vorhersage (2026-08-20) -- Spiegel von RegistryVorhersage in extension/src/models.ts. */
@@ -208,6 +209,8 @@ interface Daten {
   orchestratorModelle: ModellSicht[];
   workerModelle: ModellSicht[];
   maschinen: string[];
+  /** Welche davon pausiert sind (04.09.) -- eingetragen, aber ohne Abruf. */
+  maschinenPausiert: string[];
   askMuster: AskMuster[];
   guards: GuardZeile[];
   wache: Record<string, WacheRolle>;
@@ -473,11 +476,19 @@ function gleichwie(a: unknown, b: unknown): boolean {
   return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 }
 
+/**
+ * Eine Gruppe: Ueberschrift UEBER der Karte, Inhalt darin -- die Form der
+ * macOS-Systemeinstellungen. Zurueck kommt deshalb der KOERPER, nicht die
+ * Gruppe: alles, was der Aufrufer anhaengt, gehoert in die Karte, die
+ * Ueberschrift steht davor und ausserhalb.
+ */
 function gruppe(seite: HTMLElement, titel: string, klasse = 'gruppe'): HTMLElement {
   const g = el('div', klasse);
   g.appendChild(el('h2', undefined, titel));
+  const koerper = el('div', 'koerper');
+  g.appendChild(koerper);
   seite.appendChild(g);
-  return g;
+  return koerper;
 }
 
 /** Ein Satz im Klartext, wo kein Schalter steht. Nie ein graues Feld. */
@@ -606,6 +617,26 @@ function feld(g: HTMLElement, o: FeldOpt): HTMLElement {
   return f;
 }
 
+/**
+ * Eine Wertspalte der Abweichungstabelle. Wo es fuer den Wert eine
+ * Beschriftung gibt (`wort.<schluessel>.<wert>`, dieselbe, die das Bedienelement
+ * traegt), steht sie vorn; der Rohwert bleibt klein in Monospace daneben, denn
+ * er ist es, der in der Einstellungsdatei steht. Wo es keine gibt -- die
+ * Denkstufen `low` bis `max` etwa, die im ganzen Haus so heissen --, steht der
+ * Wert allein, wie bisher.
+ */
+function wertZelle(schluessel: string, v: unknown): HTMLElement {
+  const roh = kurzWert(v);
+  const label = typeof v === 'string' ? tOpt(`wort.${schluessel}.${v}`) : '';
+  // Wo die Beschriftung der Rohwert IST ("dunkel"), waere die zweite Anzeige
+  // desselben Wortes nur Rauschen.
+  if (!label || label === roh) return el('td', 'wert', roh);
+  const td = el('td');
+  td.appendChild(el('span', undefined, label));
+  td.appendChild(el('code', 'roh', roh));
+  return td;
+}
+
 function kurzWert(v: unknown): string {
   if (Array.isArray(v)) {
     if (v.length === 0) return t('wort.leereListe');
@@ -719,12 +750,61 @@ interface Segment {
   klasse?: string;
 }
 
+/**
+ * Ab sieben Eintraegen: das Aufklappmenue, nicht die Leiste.
+ *
+ * Eine Segmentleiste traegt eine Handvoll Abteile. Die Programmliste hat
+ * siebzehn; als Leiste war das eine Wand, als Wolke flacher Chips fuellte sie
+ * die rechte Spalte ueber sechshundert Punkte, waehrend links nichts stand. Die
+ * Mac-Form fuer eine Wahl unter vielen ist der Pop-up-Button, und das ist im
+ * Fenster ein `<select>` -- dieselbe Bauart, die die Deckel-Tabelle auf der
+ * Seite „Programme und Modelle" schon benutzt.
+ *
+ * Er wird nicht nachgebaut: ein `<select>` bringt Tastaturbedienung,
+ * Tippsuche und VoiceOver mit, und auf dem Mac verlangt die Regel, dass jede
+ * Handlung mit der Maus auch mit der Tastatur erreichbar ist. Ein eigener
+ * Knopf mit eigenem Menue muesste das alles nachbauen.
+ *
+ * Die Beschriftung bleibt dieselbe wie in der Leiste -- bei den Programmen also
+ * Name und Zahl der passenden Modelle. Der Rohwert steht an jedem Eintrag als
+ * `data-wert`, damit ein Test dieselbe Auswahl trifft wie an der Leiste.
+ */
+function aufklappliste(
+  id: string,
+  wahl: string,
+  stufen: Segment[],
+  auf: (wert: string, echt: boolean) => void,
+): HTMLElement {
+  const w = el('select', 'aufklapp') as HTMLSelectElement;
+  w.id = id;
+  for (const s of stufen) {
+    const o = el('option') as HTMLOptionElement;
+    o.value = s.wert;
+    o.textContent = s.label;
+    o.dataset.wert = s.wert;
+    if (s.titel) o.title = s.titel;
+    if (s.klasse) o.classList.add(s.klasse);
+    if (s.gesperrt) o.disabled = true;
+    if (s.wert === wahl) o.selected = true;
+    w.appendChild(o);
+  }
+  // Steht der gespeicherte Wert nicht in der Liste, waehlt der Browser von
+  // selbst den ersten Eintrag -- dann behauptete das Menue eine Wahl, die
+  // niemand getroffen hat. Ein leerer Stand sagt stattdessen nichts.
+  const gewaehlt = stufen.find((s) => s.wert === wahl);
+  if (gewaehlt) w.title = gewaehlt.label;
+  else w.selectedIndex = -1;
+  w.addEventListener('change', (e) => auf(w.value, e.isTrusted));
+  return w;
+}
+
 function segmente(
   id: string,
   wahl: string,
   stufen: Segment[],
   auf: (wert: string, echt: boolean) => void,
 ): HTMLElement {
+  if (stufen.length > 6) return aufklappliste(id, wahl, stufen, auf);
   const box = el('div', 'segmente');
   box.id = id;
   for (const s of stufen) {
@@ -843,7 +923,7 @@ function frage(
 function modellwahl(
   g: HTMLElement,
   schluessel: string,
-  o: { name: string; wirkung: string; info: string; etikett?: string },
+  o: { name: string; wirkung: string; info: string; etikett?: string; wartet?: boolean },
   modelle: ModellSicht[],
   gewaehlt: string,
   auf: (id: string) => void,
@@ -965,7 +1045,7 @@ function modellwahl(
 function stufenwahl(
   g: HTMLElement,
   schluessel: 'orchestratorEffort',
-  o: { name: string; wirkung: string; info: string; etikett?: string },
+  o: { name: string; wirkung: string; info: string; etikett?: string; wartet?: boolean },
   modell: ModellSicht | undefined,
   deckel: DeckelSicht | undefined,
   stufen: string[],
@@ -1043,7 +1123,7 @@ function kontextwahl(
   gewaehlt: unknown,
 ): void {
   if (!modell?.lokal) return;
-  const o = texte('orchestratorKontext', { modell: modell.label });
+  const o = { ...texte('orchestratorKontext', { modell: modell.label }), wartet: true };
   const antwort = kontextStand[modell.id];
   if (!antwort) {
     kontextHolen(modell.id);
@@ -1138,6 +1218,11 @@ function seiteSitzung(d: Daten): HTMLElement {
   s.appendChild(el('p', 'unterzeile', t('seite.sitzung.unterzeile')));
 
   const harness = String(d.settings.orchestratorHarness ?? 'claude');
+  const setzeHarness = async (id: string): Promise<void> => {
+    await setze('orchestratorHarness', id);
+    const modell = d.harnesses.find((h) => h.id === id)?.orchestratorDefaultModel;
+    if (modell) await setze('orchestratorModel', modell);
+  };
   const g1 = gruppe(s, t('gruppe.sitzung.start'));
   feld(g1, {
     ...texte('orchestratorHarness', { maschine: d.machine }),
@@ -1148,10 +1233,10 @@ function seiteSitzung(d: Daten): HTMLElement {
       harness,
       d.harnesses.map((h) => ({
         wert: h.id,
-        label: `${h.label} ${h.modelle}${h.binaer ? '' : ' · fehlt hier'}`,
+        label: `${h.label} ${h.modelle}${h.binaer ? '' : ` · ${t('wort.fehltHier')}`}`,
         titel: h.binaer ? undefined : t('wort.nichtStartbar', { maschine: d.machine }),
       })),
-      (w) => void setze('orchestratorHarness', w),
+      (w) => void setzeHarness(w),
     ),
   });
 
@@ -1167,11 +1252,11 @@ function seiteSitzung(d: Daten): HTMLElement {
       steuer: el('div', 'leerhinweis', t('satz.keinModellFuerProgramm', { harness })),
     });
   } else {
-    modellwahl(g1, 'orchestratorModel', texte('orchestratorModel', { anzahl: eigene.length }),
+    modellwahl(g1, 'orchestratorModel', { ...texte('orchestratorModel', { anzahl: eigene.length }), wartet: true },
       eigene, gewaehlt, (id) => void setze('orchestratorModel', id));
   }
   const orchModell = d.orchestratorModelle.find((m) => m.id === gewaehlt);
-  stufenwahl(g1, 'orchestratorEffort', texte('orchestratorEffort'),
+  stufenwahl(g1, 'orchestratorEffort', { ...texte('orchestratorEffort'), wartet: true },
     orchModell,
     d.deckel[gewaehlt],
     d.deckel[gewaehlt]?.efforts ?? d.harnessStufen[orchModell?.harness ?? ''] ?? [],
@@ -1272,6 +1357,10 @@ function seiteErlaubnisse(d: Daten): HTMLElement {
   // Anheben auf bypassPermissions IMMER ablehnt. Genau dasselbe gilt fuer Guard,
   // Wache und Deckel oben und unten auf dieser Seite -- keiner von ihnen traegt
   // `schluessel`, aus demselben Grund.
+  // Die sechs Werte von `claude --permission-mode` sind Feldnamen, keine
+  // Beschriftungen. Sichtbar steht das deutsche (bzw. englische) Wort, der
+  // Rohwert haengt als Titel daran -- er ist der Bezug zur Einstellungsdatei
+  // und zum Aufruf der CLI, und ohne ihn faende ihn niemand wieder.
   const permissionModi = ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'];
   const permissionModeWert = String(d.settings.orchestratorPermissionMode ?? 'bypassPermissions');
   feld(v, {
@@ -1281,7 +1370,7 @@ function seiteErlaubnisse(d: Daten): HTMLElement {
     steuer: segmente(
       'orchestratorPermissionMode',
       permissionModeWert,
-      permissionModi.map((wert) => ({ wert, label: wert })),
+      permissionModi.map((wert) => ({ wert, label: t(`wort.permissionMode.${wert}`), titel: wert })),
       (wert, echt) => {
         if (wert === permissionModeWert) return;
         if (wert !== 'bypassPermissions') {
@@ -1517,9 +1606,13 @@ function seiteHarnesses(d: Daten): HTMLElement {
   st.id = 'harnessTabelle';
   const sk = el('tr');
   for (const h of [
-    t('spalte.programm'), t('spalte.hier', { maschine: d.machine }), t('spalte.anmeldung'),
+    t('spalte.programm'), t('spalte.hier'), t('spalte.anmeldung'),
     t('spalte.stufen'), t('spalte.modelle'), t('spalte.chat'),
   ]) sk.appendChild(el('th', undefined, h));
+  // Der Rechnername stand bis zum 03.09. in der Ueberschrift selbst. Er ist
+  // laenger als jeder Wert der Spalte und brach mitten im Namen um; hier steht
+  // er als Titel, und in der Zeile steht er ohnehin ("startet auf X nicht").
+  (sk.children[1] as HTMLElement).title = d.machine;
   st.appendChild(sk);
   for (const h of d.harnesses) {
     const stufen = d.harnessStufen[h.id];
@@ -1545,7 +1638,10 @@ function seiteHarnesses(d: Daten): HTMLElement {
     // "kennt keine Stufen" (das Programm hat keine) und "nicht ermittelt"
     // (die Frage blieb unbeantwortet). Am Bild gesehen, 06.08.: eine
     // gescheiterte Abfrage stand als Tatsachenbehauptung in der Tabelle.
-    r.appendChild(el('td', 'stufenzelle', stufen === undefined
+    // `stufenspalte` haelt die Liste der Denkstufen in EINER Zeile: sonst
+    // steht "low medium high xhigh max" untereinander und sieht aus wie fuenf
+    // Zeilen Text (am Bild gesehen, 03.09.).
+    r.appendChild(el('td', 'stufenzelle stufenspalte', stufen === undefined
       ? t('wort.stufenNichtErmittelt')
       : (stufen.length ? stufen.join(' ') : t('wort.keineStufen'))));
     r.appendChild(el('td', undefined, String(h.modelle)));
@@ -1562,16 +1658,24 @@ function seiteHarnesses(d: Daten): HTMLElement {
       }));
       const wie = el('span', 'grund',
         quelle.live ? t('satz.chatKannLive') : t('satz.chatKannNichtLive'));
-      kasten.appendChild(wie);
+      // Was die Ansicht NICHT zeigt, haengt am Schalter statt in der Zeile:
+      // ausgeschrieben trieb es siebzehn Zeilen auf je fuenf Textzeilen, und es
+      // nannte dabei die internen Namen der Bestandteile. Der Unterschied, den
+      // die Spalte beim Ueberfliegen tragen soll, ist der Schalter und die eine
+      // Zeile daneben.
       if (quelle.zeigtNicht.length) {
-        kasten.appendChild(el('div', 'grund', t('satz.chatZeigtNicht', { liste: quelle.zeigtNicht.join(', ') })));
+        wie.title = t('satz.chatZeigtNicht', { liste: quelle.zeigtNicht.join(', ') });
       }
+      kasten.appendChild(wie);
       chatZelle.appendChild(kasten);
     } else {
+      // Derselbe Deckel wie im Zweig darueber (`chatzelle`): der Grund, warum
+      // ein Programm keine Chat-Ansicht hat, ist mitunter ein halber Absatz und
+      // zoege die Spalte sonst ueber den Kartenrand.
       chatZelle.className = 'stufenzelle';
-      chatZelle.textContent = quelle && quelle.via && !quelle.probe
+      chatZelle.appendChild(el('div', 'chatzelle-text', quelle && quelle.via && !quelle.probe
         ? t('satz.chatOhneMessung')
-        : (quelle?.grund || t('satz.chatKannNicht'));
+        : (quelle?.grund || t('satz.chatKannNicht'))));
     }
     r.appendChild(chatZelle);
     st.appendChild(r);
@@ -1583,6 +1687,35 @@ function seiteHarnesses(d: Daten): HTMLElement {
     schluessel: 'chatAnsicht',
     breit: true,
     steuer: el('div', 'klartext', t('satz.chatKannNicht')),
+  });
+
+  // WORAN EIN WORKER-PANE HAENGT (04.09.2026, Probe fuer Option E). Der
+  // Schalter stand seit der Probe in den VORGABEN und wirkte, aber kein Menue
+  // schrieb ihn -- `wb-consistency` nannte das UNSICHTBAR-VERSTELLBAR, und ein
+  // Wert, den nur eine Textdatei erreicht, ist fuer den Menschen am Fenster
+  // nicht vorhanden.
+  //
+  // WARUM AUF DIESER SEITE: die Frage ist, WORAUF das Programm eines Workers
+  // startet -- ein tmux-Pane oder ein Pseudo-Terminal, das die Werkbank selbst
+  // haelt. Damit gehoert er in die Gruppe „Die Programme auf dieser Maschine"
+  // und nicht auf die Seite „Sitzung", deren Unterzeile ausdruecklich sagt, dass
+  // die Worker dort nicht eingestellt werden.
+  feld(g1, {
+    ...texte('workerTransport'),
+    wartet: true,
+    schluessel: 'workerTransport',
+    steuer: segmente(
+      'workerTransport',
+      String(d.settings.workerTransport ?? 'tmux'),
+      [
+        // Die beiden Werte heissen im ganzen Haus so und werden nicht
+        // uebersetzt -- 'tmux' und 'pty' stehen genauso in der
+        // Einstellungsdatei, im Protokoll und in der Pane-Kennung `pty:<n>`.
+        { wert: 'tmux', label: 'tmux' },
+        { wert: 'pty', label: 'pty' },
+      ],
+      (w) => void setze('workerTransport', w),
+    ),
   });
 
   const g2 = gruppe(s, t('gruppe.harnesses.lokal'));
@@ -1848,9 +1981,28 @@ function seiteMaschinen(d: Daten): HTMLElement {
     liste.appendChild(el('div', 'leerhinweis', t('satz.keineMaschine')));
   }
   for (const m of d.maschinen) {
-    const z = el('div', 'zeile');
+    const pausiert = d.maschinenPausiert.includes(m);
+    // Derselbe Schalter wie bei den Rueckfrage-Mustern weiter oben (z.abgeschaltet,
+    // ein Haken als erstes Kind der Zeile) -- keine neue Gestaltung, dieselbe
+    // Klasse traegt den Kommentar "Listen mit Zeilen (Muster, Guards, Maschinen)".
+    const z = el('div', pausiert ? 'zeile abgeschaltet' : 'zeile');
     z.dataset.maschine = m;
+    const schalter = haken(`maschinePause-${m}`, !pausiert, (an) => {
+      const neu = an ? d.maschinenPausiert.filter((x) => x !== m) : [...d.maschinenPausiert, m];
+      void setze('remoteMachinesPausiert', neu);
+    });
+    schalter.title = t('wort.maschineLaden');
+    z.appendChild(schalter);
     z.appendChild(el('span', 'titel', m));
+    // DIE AUFSCHRIFT AM KAESTCHEN (05.09.2026). Bis heute stand hier ein
+    // blankes Kaestchen; was es bedeutet, stand nur im Titel-Attribut und in
+    // der Wirkungszeile vier Zeilen weiter unten. Ein Kaestchen ohne
+    // Aufschrift liest sich als „ausgewaehlt", nicht als „Sitzungen laden".
+    // Ein <label for> statt eines blossen Wortes: so schaltet auch die
+    // Aufschrift, nicht nur das Kaestchen.
+    const aufschrift = el('label', 'hakenwort', t('wort.sitzungenLaden'));
+    aufschrift.htmlFor = schalter.id;
+    z.appendChild(aufschrift);
     z.appendChild(el('span', 'grund', t('satz.fremdeMaschine', { name: m })));
     const rechts = el('div', 'rechts');
     const antwort = el('span', 'antwort', '');
@@ -1897,6 +2049,10 @@ function seiteMaschinen(d: Daten): HTMLElement {
   const box = el('div');
   box.append(liste, anlegen);
   feld(g, { ...texte('remoteMachines'), schluessel: 'remoteMachines', breit: true, steuer: box });
+  // Die Wirkungszeile des Pause-Schalters, unter der Liste: was NICHT
+  // passiert, wenn eine Maschine pausiert wird -- ihre Sitzungen laufen dort
+  // ungestoert weiter, pausiert ist nur der Blick dieser Werkbank darauf.
+  g.appendChild(el('div', 'klartext', t('feld.remoteMachinesPausiert.wirkung')));
 
   const g2 = gruppe(s, t('gruppe.maschinen.last'));
   feld(g2, {
@@ -2267,13 +2423,13 @@ function seiteAussehen(d: Daten): HTMLElement {
   feld(g2, {
     ...texte('terminalFontSize'),
     schluessel: 'terminalFontSize',
-    steuer: zahl('terminalFontSize', Number(d.settings.terminalFontSize ?? 13), 8, 32, 'Punkt',
+    steuer: zahl('terminalFontSize', Number(d.settings.terminalFontSize ?? 13), 8, 32, t('wort.einheit.punkt'),
       (n) => void setze('terminalFontSize', n)),
   });
   feld(g2, {
     ...texte('terminalScrollLines'),
     schluessel: 'terminalScrollLines',
-    steuer: zahl('terminalScrollLines', Number(d.settings.terminalScrollLines ?? 3), 1, 20, 'Zeilen',
+    steuer: zahl('terminalScrollLines', Number(d.settings.terminalScrollLines ?? 3), 1, 20, t('wort.einheit.zeilen'),
       (n) => void setze('terminalScrollLines', n)),
   });
 
@@ -2281,7 +2437,7 @@ function seiteAussehen(d: Daten): HTMLElement {
   feld(g3, {
     ...texte('minWorkerPaneWidth'),
     schluessel: 'minWorkerPaneWidth',
-    steuer: zahl('minWorkerPaneWidth', Number(d.settings.minWorkerPaneWidth ?? 80), 20, 1000, 'Spalten',
+    steuer: zahl('minWorkerPaneWidth', Number(d.settings.minWorkerPaneWidth ?? 80), 20, 1000, t('wort.einheit.spalten'),
       (n) => void setze('minWorkerPaneWidth', n)),
   });
   feld(g3, {
@@ -2380,8 +2536,8 @@ function seiteProgramm(d: Daten): HTMLElement {
     const r = el('tr');
     r.dataset.abweichung = k;
     r.appendChild(el('td', undefined, t(`bezeichnung.${k}`)));
-    r.appendChild(el('td', 'wert', kurzWert(d.settings[k])));
-    r.appendChild(el('td', 'wert', kurzWert(d.vorgaben[k])));
+    r.appendChild(wertZelle(k, d.settings[k]));
+    r.appendChild(wertZelle(k, d.vorgaben[k]));
     const zelle = el('td');
     zelle.appendChild(knopf(t('wort.zuruecksetzen'), () => void setze(k, d.vorgaben[k])));
     r.appendChild(zelle);
@@ -2498,6 +2654,53 @@ function seiteProgramm(d: Daten): HTMLElement {
   return s;
 }
 
+/**
+ * Das Symbol jeder Seite in der linken Liste -- gezeichnet, nicht erzeugt und
+ * nie ein Emoji: ein Strichbild in der Textfarbe, damit es hell und dunkel
+ * ohne zweite Fassung traegt und in der gewaehlten Zeile den Akzent annimmt.
+ * Ein Symbol je Seite, in der Bedeutung der Seite: Terminalfenster, Schild,
+ * Baustein, Bildschirm, Auge, Kontrastkreis, Ablage.
+ */
+const SEITENZEICHEN: Record<string, { strich?: string; flaeche?: string }> = {
+  sitzung: { strich: 'M2 3.4h12a1 1 0 0 1 1 1v7.2a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V4.4a1 1 0 0 1 1-1zM4.4 6.6l2 1.8-2 1.8M8.6 10.4h3.2' },
+  erlaubnisse: { strich: 'M8 1.6l5.2 1.9v3.7c0 3.1-2.2 5.5-5.2 6.9-3-1.4-5.2-3.8-5.2-6.9V3.5zM5.8 7.9l1.6 1.6 3-3.3' },
+  harnesses: { strich: 'M4.4 4.4h7.2v7.2H4.4zM6.4 1.4v3M9.6 1.4v3M6.4 11.6v3M9.6 11.6v3M1.4 6.4h3M1.4 9.6h3M11.6 6.4h3M11.6 9.6h3' },
+  maschinen: { strich: 'M1.6 3.2h12.8v7.4H1.6zM5.6 13.6h4.8M8 10.6v3' },
+  aufsicht: { strich: 'M1.4 8s2.5-4.4 6.6-4.4S14.6 8 14.6 8s-2.5 4.4-6.6 4.4S1.4 8 1.4 8zM8 6.1a1.9 1.9 0 1 0 0 3.8 1.9 1.9 0 0 0 0-3.8z' },
+  aussehen: { strich: 'M8 2.2a5.8 5.8 0 1 0 0 11.6 5.8 5.8 0 0 0 0-11.6z', flaeche: 'M8 2.2a5.8 5.8 0 0 1 0 11.6z' },
+  programm: { strich: 'M1.6 2.4h12.8v2.8H1.6zM2.8 5.2h10.4v7.2a1 1 0 0 1-1 1H3.8a1 1 0 0 1-1-1zM6.4 8h3.2' },
+};
+
+/** Das Symbol einer Seite als SVG-Knoten. Ohne Eintrag: gar keins, nie ein Ersatzzeichen. */
+function seitenzeichen(name: string): SVGSVGElement | null {
+  const form = SEITENZEICHEN[name];
+  if (!form) return null;
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('class', 'zeichen');
+  svg.setAttribute('width', '16');
+  svg.setAttribute('height', '16');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  if (form.flaeche) {
+    const p = document.createElementNS(NS, 'path');
+    p.setAttribute('d', form.flaeche);
+    p.setAttribute('fill', 'currentColor');
+    svg.appendChild(p);
+  }
+  if (form.strich) {
+    const p = document.createElementNS(NS, 'path');
+    p.setAttribute('d', form.strich);
+    p.setAttribute('fill', 'none');
+    p.setAttribute('stroke', 'currentColor');
+    p.setAttribute('stroke-width', '1.2');
+    p.setAttribute('stroke-linecap', 'round');
+    p.setAttribute('stroke-linejoin', 'round');
+    svg.appendChild(p);
+  }
+  return svg;
+}
+
 const SEITEN: { name: string; bau: (d: Daten) => HTMLElement }[] = [
   { name: 'sitzung', bau: seiteSitzung },
   { name: 'erlaubnisse', bau: seiteErlaubnisse },
@@ -2541,13 +2744,29 @@ function zeichne(): void {
   gezeichneteFelder = [];
   // Die Kopfzeile steht im Markup und bleibt stehen; die Knoepfe entstehen bei
   // JEDEM Zeichnen neu, weil ihre Beschriftung an der Sprache haengt.
+  //
+  // NACHTRAG 03.09.2026: genau daran hing ein sichtbarer Fehler. Weil die Kopfzeile
+  // im Markup steht, blieb sie deutsch, waehrend alles daneben der eingestellten
+  // Sprache folgte -- im englischen Fenster stand "Einstellungen" ueber "Appearance"
+  // und "Permissions". Sie haengt genauso an der Sprache wie die Knoepfe und wird
+  // deshalb hier mitgesetzt. Der Text im Markup bleibt als Anzeige vor dem ersten
+  // Zeichnen stehen.
+  const kopfzeileEl = seitenlisteEl.querySelector('.kopfzeile');
+  if (kopfzeileEl) kopfzeileEl.textContent = t('wort.einstellungen');
   for (const alt of seitenlisteEl.querySelectorAll('button')) alt.remove();
   for (const s of SEITEN) {
     const b = el('button') as HTMLButtonElement;
     b.type = 'button';
     b.dataset.seite = s.name;
-    b.appendChild(document.createTextNode(t(`seite.${s.name}.titel`)));
-    b.appendChild(el('span', 'zweitzeile', t(`seite.${s.name}.wofuer`)));
+    const zeichen = seitenzeichen(s.name);
+    if (zeichen) b.appendChild(zeichen);
+    b.appendChild(el('span', 'name', t(`seite.${s.name}.titel`)));
+    // Der Wofuer-Satz stand bis zum 03.09. als zweite Zeile unter jedem Namen.
+    // Die Liste der Systemeinstellungen traegt eine Zeile je Seite, und
+    // ausgeschrieben steht derselbe Gedanke ohnehin als Unterzeile ueber der
+    // Seite selbst. Er bleibt hier als Titel am Knopf -- weggeworfen wird er
+    // nicht.
+    b.title = t(`seite.${s.name}.wofuer`);
     b.addEventListener('click', () => waehle(s.name));
     b.classList.toggle('gewaehlt', s.name === aktuelleSeite);
     seitenlisteEl.appendChild(b);
@@ -2555,8 +2774,33 @@ function zeichne(): void {
   stapelEl.textContent = '';
   for (const s of SEITEN) {
     const seite = s.bau(daten);
+    entdoppelteUeberschrift(seite);
     if (s.name === aktuelleSeite) seite.classList.add('offen');
     stapelEl.appendChild(seite);
+  }
+}
+
+/**
+ * Eine Gruppe mit genau EINEM Feld, das denselben Namen traegt wie die Gruppe,
+ * bekommt keine zweite Ueberschrift. Auf der Seite "Programm" stand
+ * "Sichern, zuruecksetzen, uebertragen" so zweimal untereinander -- einmal
+ * ueber der Karte, einmal als Feldname darin.
+ *
+ * WARUM HIER UND NICHT AN JEDER `gruppe()`-STELLE: die Ueberschrift entsteht,
+ * bevor das erste Feld darin steht, und sie ist auch nicht falsch gewaehlt --
+ * eine Gruppe braucht einen Namen. Doppelt ist erst das FERTIGE Ergebnis, und
+ * genau das sieht dieser Durchgang, fuer alle sieben Seiten nach derselben
+ * Regel.
+ */
+function entdoppelteUeberschrift(seite: HTMLElement): void {
+  for (const g of Array.from(seite.querySelectorAll('.gruppe, .vorsicht'))) {
+    const h2 = g.querySelector(':scope > h2');
+    const felder = g.querySelectorAll(':scope > .koerper > .feld');
+    if (!h2 || felder.length !== 1) continue;
+    const name = felder[0].querySelector(':scope > .kopf > .name');
+    if (!name) continue;
+    if (name.textContent?.trim() !== h2.textContent?.trim()) continue;
+    h2.remove();
   }
 }
 

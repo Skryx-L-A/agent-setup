@@ -76,6 +76,17 @@
       <key>SockType</key><string>stream</string>
       <key>SockFamily</key><string>IPv4</string>
     </dict>
+    <!-- Bedarfsschaltung des oMLX-Servers (2026-09-01), damit auch interaktiv
+         geoeffnetes pi das abliterierte qwen38u benutzen kann. Schluessel 'omlx'
+         = 'socketName' im backends.json-Eintrag '8079'. Backend lauscht dahinter
+         auf 8078 (wb-omlx-server) und startet erst beim ersten Zugriff. -->
+    <key>omlx</key>
+    <dict>
+      <key>SockNodeName</key><string>127.0.0.1</string>
+      <key>SockServiceName</key><string>8079</string>
+      <key>SockType</key><string>stream</string>
+      <key>SockFamily</key><string>IPv4</string>
+    </dict>
   </dict>
   <key>EnvironmentVariables</key>
   <dict>

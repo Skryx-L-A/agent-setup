@@ -95,11 +95,12 @@ def scan(command_text, varmap, depth=0):
     for stmt_idx, stmt in enumerate(statements):
         varmap = varmaps[stmt_idx]
         if stmt is None:
-            return _deny(
-                "Kommando enthaelt 'screencapture', laesst sich aber wegen unausgeglichener "
-                "Anfuehrungszeichen nicht sauber in Teilbefehle zerlegen -- nicht entscheidbar, "
-                "ob die Aufnahme auf ein Fenster begrenzt waere."
-            )
+            # Seit der Freigabe vom 2026-08-22 gegenstandslos: es gibt nichts mehr zu
+            # entscheiden, weil auch das Vollbild erlaubt ist. Frueher stand hier ein
+            # Default-Deny fuer ein Kommando, das sich nicht in Teilbefehle zerlegen liess.
+            # Das traf in der Praxis vor allem Befehle, deren FLIESSTEXT das Wort nur
+            # nannte -- ein Statusbericht in einem Heredoc reichte.
+            return None
         for stage in cs.split_pipeline(stmt):
             name, _idx, remaining = cs.resolve_command(stage, varmap)
             if name is None:
@@ -161,35 +162,38 @@ def scan(command_text, varmap, depth=0):
                 # nicht auf Vollbild zurueck). Genau diese Form benutzt wb-shot.
                 continue
             if not args:
-                return _deny(
-                    "screencapture ohne jedes Argument nimmt den GESAMTEN Bildschirm auf. "
-                    "Stehende Regel: jede Aufnahme wird exakt auf ein Fenster begrenzt."
-                )
+                # FREIGABE 2026-08-22 (woertlich): "Die Maschine gehoert Dir, Du
+                # kannst Bildschirmfotos machen, Bildschirmaufnahmen, auch vom ganzen
+                # Bildschirm, vollkommen egal, alles Deins, mach wie es am besten
+                # funktioniert." Damit ist das Vollbild-Verbot vom 2026-07-25 aufgehoben.
+                # Der alte Deny-Text bleibt als Kommentar stehen, damit nachvollziehbar
+                # ist, was bis dahin galt:
+                #   "Aufnahme ohne jedes Argument nimmt den GESAMTEN Bildschirm auf.
+                #    Stehende Regel: jede Aufnahme wird exakt auf ein Fenster begrenzt."
+                continue
             if _unresolvable(remaining):
-                return _deny(
-                    "screencapture mit Argumenten aus einer nicht aufloesbaren Variablen/"
-                    "Kommandosubstitution und ohne literal sichtbares -l/-R -- es ist statisch "
-                    "nicht entscheidbar, ob die Aufnahme auf ein Fenster begrenzt bleibt. "
-                    "Teilbefehl: %s" % cs.stage_text(stage)
-                )
+                # Ebenfalls von der Freigabe vom 2026-08-22 gedeckt: ob die Aufnahme auf ein
+                # Fenster begrenzt bleibt, muss nicht mehr entscheidbar sein, weil auch die
+                # Vollbildaufnahme erlaubt ist. Frueher galt hier ein Default-Deny, weil eine
+                # Variable statisch nicht aufloesbar ist.
+                continue
             if any(a in ('-i', '-w', '-W') or
                    (a.startswith('-') and not a.startswith('--') and
                     re.search(r'[iwW]', re.match(r'^-([A-Za-z]*)', a).group(1)))
                    for a in args):
                 return _deny(
-                    "screencapture im interaktiven Auswahlmodus (-i/-w/-W). Die Auswahl trifft zwar "
-                    "ein Mensch, aber der Aufruf kommt von einem Agenten: er legt ein Fadenkreuz "
-                    "ueber den Bildschirm des Nutzers, erzwingt eine Eingabe und laesst per Leertaste/Klick "
-                    "trotzdem den ganzen Schirm zu -- damit ist weder die Fensterbegrenzung garantiert "
-                    "noch der Fokus unangetastet, die beiden Punkte, um die es in der Regel geht. "
+                    "Interaktiver Auswahlmodus (-i/-w/-W). Das Vollbild-Verbot ist seit dem "
+                    "2026-08-22 aufgehoben, dieser Modus bleibt aber gesperrt -- aus einem "
+                    "technischen Grund, nicht aus dem alten Regelgrund: er legt ein Fadenkreuz "
+                    "ueber den Bildschirm und WARTET auf eine Eingabe. Sitzt niemand davor, "
+                    "haengt der Aufruf, bis ihn jemand abbricht. Nimm die Aufnahme ohne -i/-w/-W. "
                     "Teilbefehl: %s" % cs.stage_text(stage)
                 )
-            return _deny(
-                "screencapture ohne Fensterbegrenzung (weder -l <windowid> noch -R x,y,w,h) -- "
-                "nimmt einen ganzen Bildschirm auf. Stehende Regel: NIEMALS den gesamten "
-                "Bildschirm, jede Aufnahme exakt auf ein Fenster begrenzt. Teilbefehl: %s"
-                % cs.stage_text(stage)
-            )
+            # Aufnahme ohne Fensterbegrenzung: seit der Freigabe vom 2026-08-22 erlaubt.
+            # Frueher stand hier ein Deny mit der Begruendung, eine Aufnahme ohne -l/-R nehme
+            # einen ganzen Bildschirm auf und die stehende Regel verlange Fenstergenauigkeit.
+            # Beides gilt nicht mehr; fenstergenau bleibt die bessere Wahl, aber keine Pflicht.
+            continue
     return None
 
 

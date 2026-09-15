@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""wb-registry-sync — cloud/subscription entries of ~/.claude/workbench/models.json
+between mac and peer; local (ollama/mlx/llamacpp/…) entries stay on their own
+machine, untouched.
+
+Auftrag (2026-09-10, Entscheidung des Nutzers ueber AskUserQuestion: "Cloud-
+Eintraege teilen, lokale je Maschine"). Befund desselben Tages: die Registry
+ist auf beiden Maschinen unabhaengig gewachsen -- Mac traegt 809 Eintraege,
+die peer nicht kennt (ueberwiegend der OpenRouter-Katalog als
+aider-openrouter-*/opencode-openrouter-*/agy-*, aber auch aider-ollama-*
+mit Mac-eigenen Kontextfenstern), peer traegt 6 eigene. Dutzende
+aider-ollama-*/goose-*/…-Eintraege stehen auf BEIDEN Seiten unter demselben
+id, mit abweichenden Feldern (Kontextfenster, Pfade) -- die duerfen NIE
+zusammengefuehrt werden, jede Maschine behaelt ihre eigenen, tatsaechlich
+gemessenen Werte. Folge des Auseinanderlaufens: `wb-consistency` meldet auf
+peer VERWEIS-INS-LEERE fuer Kennungen, die es dort nie gab (z.B.
+agy-gemini-3-7-flash-medium) -- Regeltexte (CLAUDE.md, regeln/*.md) nennen
+Kennungen aus EINER der beiden Registries, ohne zu wissen, dass es zwei
+gibt.
+
+REGEL GETEILT/LOKAL (is_shared_entry() unten) -- folgt aus dem Eintrag
+selbst, keine handgepflegte Liste:
+  * ein MODELL ist GETEILT, wenn sein Provider keinen lokalen Prozess
+    braucht (provider.kind in cloud|subscription -- openrouter, agy,
+    claude-subscription, chatgpt, github-copilot, …); LOKAL, wenn
+    provider.kind=="local" (ollama, llamacpp, mlx-lokal, omlx-lokal --
+    Pfad oder Port auf DIESER Maschine).
+  * ein PROVIDER ist GETEILT, wenn sein eigenes kind != "local" ist.
+  * ein HARNESS hat keine Maschinenbindung (er beschreibt nur, WIE ein
+    Prozess gestartet wird) und gilt darum immer als geteilt.
+  * jede der drei Formen darf das mit einem ausdruecklichen Feld
+    "geteilt": true|false uebersteuern -- die Vorgabe kommt sonst aus dem
+    Provider (SPEC-V3 kennt dasselbe Muster schon bei dataStaysLocal/
+    supportsEffort in shell/wb-state: explizites Feld gewinnt, sonst der
+    Provider). Unbekannter Provider faellt wie ueberall sonst in dieser
+    Registry auf "cloud" zurueck (== geteilt), nie auf "local".
+
+Usage:
+  wb-registry-sync <mac|peer> [--dry-run] [--fremd <datei>]
+
+<mac|peer> ist die MASCHINE, mit der abgeglichen wird -- ssh-Host gleichen
+Namens (SSH/scp/rsync sind laut CLAUDE.md dauerhaft erlaubt), NICHT die
+Maschine, auf der dieser Lauf selbst startet (die wird wie in wb-state per
+platform.system() erkannt und darf nicht mit dem Ziel uebereinstimmen).
+
+--fremd <datei> ersetzt den ssh-Transport durch eine gewoehnliche Datei, die
+GELESEN und (im echten Lauf) zurueckgeschrieben wird -- der Weg, auf dem die
+Testsuite zwei Fake-Registries gegeneinander laufen laesst, ganz ohne
+Netzwerk und ohne die echte Registry der Gegenseite je anzufassen. Fehlt die
+Datei, gilt die Gegenseite als leere/neue Registry (kein Fehler -- derselbe
+Fall wie eine frische Installation).
+
+Das lokale Ziel ist $WB_MODELS_FILE (dieselbe Umbiegung, die auch
+shell/wb-state kennt) oder sonst ~/.claude/workbench/models.json.
+
+--dry-run zeigt den vollen Plan (was zu welcher Seite hinzukommt, jeder
+Konflikt und seine Aufloesung), schreibt NICHTS -- auch keinen Schnappschuss,
+denn ohne Schreibvorgang gibt es nichts zu sichern. Ohne --dry-run: zuerst
+ein Schnappschuss BEIDER Seiten (Stand vor dem Zusammenfuehren) nach
+~/.local/trash-snapshots/<datum>-registry/<uhrzeit>-…, danach beide Dateien
+schreiben.
+
+Konfliktregel (zwei Fassungen desselben geteilten id, Inhalt weicht ab):
+neuerer Zeitstempel (updated/discoveredAt/addedAt, in dieser Reihenfolge,
+der erste vorhandene Wert je Seite) gewinnt; ist keiner der beiden vorhanden
+oder gleich, gewinnt die Fassung mit mehr belegten Feldern; bleibt auch das
+gleich, bleibt die lokale Fassung stehen. Die Entscheidung wird IMMER in
+den Lauf-Bericht aufgenommen (Auftrag, woertlich: "Konflikte werden
+aufgelistet, nicht still entschieden") -- automatisch geloest heisst hier
+nicht schweigend geloest.
+
+Exit 0: Lauf durch, auch wenn er Konflikte aufloesen musste. Exit 1: echter
+Fehler (Transport, ungueltiges JSON auf einer der beiden Seiten, Ziel ==
+eigene Maschine).
+
+Bewusst NICHT nachgebaut: shell/wb-states validate() (Rollen, Effort-Stufen,
+Alias-Kollisionen mit RESERVED, …) laeuft hier nicht noch einmal -- ein
+Eintrag, der auf der Herkunftsmaschine schon ueber `wb-state models add/set`
+in die Registry kam, ist dort bereits geprueft; dieses Werkzeug kopiert nur.
+"""
+import argparse
+import datetime
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import atomar_schreiben  # noqa: E402  (siehe Kopfkommentar dort: liegt neben diesem Skript)
+
+MACHINE = "mac" if platform.system() == "Darwin" else "peer"
+MACHINES = ("mac", "peer")
+KEYS = ("providers", "harnesses", "models")
+TIMESTAMP_FIELDS = ("updated", "discoveredAt", "addedAt")
+# Nur die beiden eingebauten Provider aus shell/wb-state (BUILTIN_PROVIDERS) --
+# ein Provider, der nur als eingebauter Adapter existiert und in keiner der
+# beiden models.json-Dateien auftaucht. Bei einer Aenderung dort auch hier
+# nachziehen (zwei Fassungen derselben kleinen Tabelle, aber eine reine
+# Konstante, keine Logik -- ein import aus dem Bash/Python-Heredoc von
+# wb-state ist nicht moeglich).
+BUILTIN_PROVIDER_KIND = {"claude-subscription": "subscription", "ollama": "local"}
+
+
+def die(msg):
+    sys.stderr.write("wb-registry-sync: FEHLER: %s\n" % msg)
+    sys.exit(1)
+
+
+def local_models_file():
+    override = os.environ.get("WB_MODELS_FILE")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".claude", "workbench", "models.json")
+
+
+def load_cfg(path, label):
+    """Fehlende Datei == frische/leere Registry, kein Fehler (derselbe Fall
+    wie shell/wb-states load_raw()). Kaputtes JSON dagegen IST ein Fehler --
+    ein Sync-Werkzeug, das eine unlesbare Quelle still als leer behandelt,
+    wuerde im schlimmsten Fall eine ganze Seite loeschen."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        die("%s ('%s') ist kein gueltiges JSON (%s)." % (label, path, e))
+    if not isinstance(raw, dict):
+        die("%s ('%s') ist kein JSON-Objekt." % (label, path))
+    return raw
+
+
+def fetch_remote_ssh(host):
+    try:
+        p = subprocess.run(
+            ["ssh", host, "cat ~/.claude/workbench/models.json 2>/dev/null || true"],
+            capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        die("ssh %s nicht erreichbar (%s)." % (host, e))
+    text = (p.stdout or "").strip()
+    if not text:
+        return {}
+    try:
+        raw = json.loads(text)
+    except Exception as e:
+        die("Registry auf %s ist kein gueltiges JSON (%s)." % (host, e))
+    if not isinstance(raw, dict):
+        die("Registry auf %s ist kein JSON-Objekt." % host)
+    return raw
+
+
+def push_remote_ssh(host, cfg):
+    text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+    tmp_name = "~/.claude/workbench/models.json.wbsync-tmp-%d" % os.getpid()
+    remote_cmd = ("mkdir -p ~/.claude/workbench && cat > %s && "
+                  "mv %s ~/.claude/workbench/models.json") % (tmp_name, tmp_name)
+    try:
+        p = subprocess.run(["ssh", host, remote_cmd], input=text,
+                            capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        die("Schreiben auf %s fehlgeschlagen (%s)." % (host, e))
+    if p.returncode != 0:
+        die("Schreiben auf %s fehlgeschlagen: %s" % (host, (p.stderr or "").strip()))
+
+
+def index_by_id(lst):
+    out = {}
+    for e in (lst or []):
+        if isinstance(e, dict) and e.get("id"):
+            out[e["id"]] = e
+    return out
+
+
+def provider_kind_lookup(local_cfg, remote_cfg):
+    """Provider-kind aus beiden Seiten kombiniert (die Provider-Liste selbst
+    ist laut Befund NICHT das, was auseinandergelaufen ist -- nur 'models'
+    hat sich getrennt entwickelt), Fallback auf die beiden eingebauten
+    Provider, dann auf 'cloud' (derselbe Regelfall wie in shell/wb-states
+    data_stays_local())."""
+    kinds = dict(BUILTIN_PROVIDER_KIND)
+    for cfg in (remote_cfg, local_cfg):  # local zuletzt, gewinnt bei Widerspruch
+        for p in (cfg.get("providers") or []):
+            if isinstance(p, dict) and p.get("id"):
+                kinds[p["id"]] = p.get("kind") or "cloud"
+
+    def kind_of(provider_id):
+        return kinds.get(provider_id or "", "cloud")
+    return kind_of
+
+
+def is_shared_entry(key, entry, provider_kind_of):
+    if isinstance(entry.get("geteilt"), bool):
+        return entry["geteilt"]
+    if key == "providers":
+        return (entry.get("kind") or "cloud") != "local"
+    if key == "harnesses":
+        return True
+    return provider_kind_of(entry.get("provider")) != "local"  # key == "models"
+
+
+def entry_timestamp(e):
+    for f in TIMESTAMP_FIELDS:
+        v = e.get(f)
+        if isinstance(v, str) and v:
+            return f, v
+    return None, None
+
+
+def field_richness(e):
+    return sum(1 for v in e.values() if v not in (None, "", [], {}))
+
+
+def resolve_conflict(a, b):
+    """a = lokale Fassung, b = Fassung der Gegenseite, beide dicts,
+    inhaltlich verschieden. Gibt (gewinner, begruendung) zurueck -- die
+    Begruendung ist Pflichtbestandteil des Berichts (Auftrag: Konflikte
+    werden aufgelistet, nicht still entschieden)."""
+    fa, ta = entry_timestamp(a)
+    fb, tb = entry_timestamp(b)
+    if ta and tb and ta != tb:
+        if ta > tb:
+            return a, "neuerer Zeitstempel lokal (%s=%s > Gegenseite %s=%s)" % (fa, ta, fb, tb)
+        return b, "neuerer Zeitstempel auf Gegenseite (%s=%s > lokal %s=%s)" % (fb, tb, fa, ta)
+    ra, rb = field_richness(a), field_richness(b)
+    if ra != rb:
+        return (a, "mehr belegte Felder lokal (%d > %d)" % (ra, rb)) if ra > rb else \
+               (b, "mehr belegte Felder auf Gegenseite (%d > %d)" % (rb, ra))
+    return a, "unentschieden (kein nutzbarer Zeitstempel, gleich viele Felder) -- lokale Fassung behalten"
+
+
+def merge_key(key, local_cfg, remote_cfg, provider_kind_of, target_label):
+    local_list = list(local_cfg.get(key) or [])
+    remote_list = list(remote_cfg.get(key) or [])
+    local_by_id = index_by_id(local_list)
+    remote_by_id = index_by_id(remote_list)
+    report = {"added_local": [], "added_remote": [], "conflicts": [],
+              "local_only": 0, "remote_only": 0, "local_both": 0, "unchanged_shared": 0}
+
+    def upsert(lst, by_id, id_, entry):
+        for i, e in enumerate(lst):
+            if isinstance(e, dict) and e.get("id") == id_:
+                lst[i] = entry
+                return
+        lst.append(entry)
+
+    for id_ in sorted(set(local_by_id) | set(remote_by_id)):
+        a, b = local_by_id.get(id_), remote_by_id.get(id_)
+        probe = a if a is not None else b
+        if not is_shared_entry(key, probe, provider_kind_of):
+            # LOKAL: niemals anfassen, gleich ob es die Kennung auf einer
+            # oder auf beiden Seiten (mit abweichenden Feldern) gibt.
+            if a is not None and b is not None:
+                report["local_both"] += 1  # beide Seiten haben eine EIGENE, absichtlich abweichende Fassung
+            elif a is not None:
+                report["local_only"] += 1
+            else:
+                report["remote_only"] += 1
+            continue
+        if a is not None and b is None:
+            upsert(remote_list, remote_by_id, id_, a)
+            report["added_remote"].append(id_)
+        elif b is not None and a is None:
+            upsert(local_list, local_by_id, id_, b)
+            report["added_local"].append(id_)
+        elif a == b:
+            report["unchanged_shared"] += 1
+        else:
+            winner, note = resolve_conflict(a, b)
+            upsert(local_list, local_by_id, id_, winner)
+            upsert(remote_list, remote_by_id, id_, winner)
+            report["conflicts"].append({"id": id_, "key": key, "note": note})
+
+    return local_list, remote_list, report
+
+
+def snapshot(local_path, remote_bytes, target):
+    stempel = datetime.date.today().isoformat()
+    zeit = time.strftime("%H%M%S")
+    snapdir = os.path.expanduser("~/.local/trash-snapshots/%s-registry" % stempel)
+    os.makedirs(snapdir, exist_ok=True)
+    if os.path.exists(local_path):
+        shutil.copy2(local_path, os.path.join(snapdir, "%s-models-lokal.json" % zeit))
+    with open(os.path.join(snapdir, "%s-models-%s.json" % (zeit, target)), "w", encoding="utf-8") as f:
+        f.write(remote_bytes)
+    return snapdir
+
+
+def print_report(reports):
+    for key in KEYS:
+        r = reports[key]
+        print("== %s ==" % key)
+        print("  geteilt, neu lokal: %d%s" % (
+            len(r["added_local"]), (" (" + ", ".join(r["added_local"][:8]) +
+            (", …" if len(r["added_local"]) > 8 else "") + ")") if r["added_local"] else ""))
+        print("  geteilt, neu auf Gegenseite: %d%s" % (
+            len(r["added_remote"]), (" (" + ", ".join(r["added_remote"][:8]) +
+            (", …" if len(r["added_remote"]) > 8 else "") + ")") if r["added_remote"] else ""))
+        print("  geteilt, unveraendert gleich: %d" % r["unchanged_shared"])
+        print("  lokal (unberuehrt): %d nur lokal, %d nur auf Gegenseite, %d auf beiden (eigene Fassung je Maschine)" %
+              (r["local_only"], r["remote_only"], r["local_both"]))
+        if r["conflicts"]:
+            print("  KONFLIKTE (%d) -- automatisch geloest, hier gemeldet:" % len(r["conflicts"]))
+            for c in r["conflicts"]:
+                print("    %s: %s" % (c["id"], c["note"]))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="wb-registry-sync", add_help=True)
+    ap.add_argument("target", choices=MACHINES)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--fremd", metavar="DATEI")
+    args = ap.parse_args()
+
+    if args.target == MACHINE:
+        die("Ziel '%s' ist diese Maschine selbst -- nichts zum Abgleichen." % args.target)
+
+    local_path = local_models_file()
+    local_cfg = load_cfg(local_path, "lokale Registry")
+
+    if args.fremd:
+        remote_cfg = load_cfg(args.fremd, "Gegenseite (--fremd)")
+    else:
+        remote_cfg = fetch_remote_ssh(args.target)
+
+    provider_kind_of = provider_kind_lookup(local_cfg, remote_cfg)
+
+    new_local = dict(local_cfg) if local_cfg else {"version": 1}
+    new_remote = dict(remote_cfg) if remote_cfg else {"version": 1}
+    reports = {}
+    for key in KEYS:
+        ll, rl, rep = merge_key(key, local_cfg, remote_cfg, provider_kind_of, args.target)
+        new_local[key] = ll
+        new_remote[key] = rl
+        reports[key] = rep
+
+    print("Lokal (%s) <-> %s%s" % (
+        MACHINE, args.target, " ueber --fremd %s" % args.fremd if args.fremd else " ueber ssh"))
+    print_report(reports)
+
+    total_changes = sum(len(reports[k]["added_local"]) + len(reports[k]["added_remote"])
+                         + len(reports[k]["conflicts"]) for k in KEYS)
+    if args.dry_run:
+        print("\n--dry-run: nichts geschrieben, kein Schnappschuss (%d Aenderung(en) geplant)."
+              % total_changes)
+        return
+
+    remote_text = json.dumps(new_remote, indent=2, ensure_ascii=False) + "\n"
+    snapdir = snapshot(local_path, remote_text, args.target)
+    local_text = json.dumps(new_local, indent=2, ensure_ascii=False) + "\n"
+    atomar_schreiben.schreiben(local_path, local_text)
+    if args.fremd:
+        atomar_schreiben.schreiben(args.fremd, remote_text)
+    else:
+        push_remote_ssh(args.target, new_remote)
+    print("\nSchnappschuss vor dem Schreiben: %s" % snapdir)
+    print("Geschrieben: %s (lokal), %s (%s)." % (
+        local_path, args.fremd or ("ssh " + args.target + ":~/.claude/workbench/models.json"),
+        args.target))
+
+
+if __name__ == "__main__":
+    main()

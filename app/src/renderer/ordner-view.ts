@@ -28,6 +28,8 @@
 // und verlorener Rollposition, obwohl sich nichts getan hat.
 import './ordner-view.css';
 import { registriere, umschalten } from './flaeche';
+// `t2`, nicht `t`: in dieser Datei heisst ein Suchtreffer schon `t`.
+import { t as t2 } from './texte';
 
 interface EintragInfo { name: string; path: string; isDir: boolean; size: number; mtimeMs: number }
 interface OrdnerPayload { root: string; entries: EintragInfo[] }
@@ -55,7 +57,7 @@ export function ordnerUiState(): {
   const eingabe = panel?.querySelector<HTMLInputElement>('.or-suche-eingabe');
   return {
     offen,
-    wurzel: panel?.querySelector('.or-wurzel')?.textContent ?? '',
+    wurzel: panel?.dataset.wurzel ?? '',
     zeilen: zeilen.length,
     sucheAktiv: !!eingabe?.value.trim(),
     // Die Namen in der Reihenfolge, in der sie stehen. Eine blosse Anzahl
@@ -72,6 +74,19 @@ export function ordnerUiState(): {
 /** Von `initOrdnerView` gesetzt; ohne Ansicht wird nichts nachgesehen. */
 let beobachteteOrdner: () => number = () => 0;
 
+/** Von `initOrdnerView` gesetzt: einen Ordner im Blatt aufklappen (chatdatei, 05.09.2026). */
+let blattZeigen: (pfad: string) => void = () => {};
+
+/**
+ * EIN VERZEICHNIS AUS DEM CHAT (chatdatei, 05.09.2026): das Blatt geht auf, und
+ * der Baum klappt bis zu diesem Ordner auf -- sofern er unter der Wurzel liegt.
+ * Liegt er ausserhalb, bleibt es beim geoeffneten Blatt; die Wurzel bestimmt
+ * der Hauptprozess (ordnerWurzel), nicht ein Pfad aus einer Nachricht.
+ */
+export function ordnerBlattZeigen(pfad: string): void {
+  blattZeigen(pfad);
+}
+
 export function initOrdnerView(): void {
   const knopf = document.querySelector<HTMLButtonElement>('.knopf[data-tot="ordner"]');
   if (!knopf) return;
@@ -81,14 +96,13 @@ export function initOrdnerView(): void {
   panel.className = 'or-panel';
   panel.innerHTML = `
     <div class="or-kopf">
-      <div class="or-titel">Ordner</div>
-      <button type="button" class="or-schliessen" title="Schliessen">&times;</button>
+      <div class="or-titel" data-text="panel.ordner.titel"></div>
+      <button type="button" class="or-schliessen" data-text-title="wort.schliessen">&times;</button>
     </div>
     <div class="or-suchleiste">
-      <input type="text" class="or-suche-eingabe" data-tipp="suche" placeholder="Inhalt durchsuchen (rg) …" />
+      <input type="text" class="or-suche-eingabe" data-tipp="suche" data-text-placeholder="panel.ordner.suche" />
     </div>
     <div class="or-inhalt">
-      <div class="or-wurzel"></div>
       <div class="or-baum"></div>
       <div class="or-treffer"></div>
     </div>`;
@@ -97,7 +111,6 @@ export function initOrdnerView(): void {
   // legen. Fehlt der Platzhalter, bleibt der Rumpf die Notloesung.
   (document.getElementById('schublade') ?? document.body).appendChild(panel);
 
-  const wurzelEl = panel.querySelector<HTMLDivElement>('.or-wurzel')!;
   const baumEl = panel.querySelector<HTMLDivElement>('.or-baum')!;
   const trefferEl = panel.querySelector<HTMLDivElement>('.or-treffer')!;
   const sucheEl = panel.querySelector<HTMLInputElement>('.or-suche-eingabe')!;
@@ -170,7 +183,7 @@ export function initOrdnerView(): void {
     if (!(kinder.get(wurzel) ?? []).length) {
       const leer = document.createElement('div');
       leer.className = 'or-leer';
-      leer.textContent = 'Leer, oder alles hier ist ausgeschlossen.';
+      leer.textContent = t2('panel.ordner.leer');
       baumEl.appendChild(leer);
     }
   }
@@ -183,14 +196,14 @@ export function initOrdnerView(): void {
     if (p.treffer === null) {
       const fehler = document.createElement('div');
       fehler.className = 'or-leer';
-      fehler.textContent = 'Suche nicht verfuegbar (rg fehlt oder abgebrochen).';
+      fehler.textContent = t2('panel.ordner.ohneSuche');
       trefferEl.appendChild(fehler);
       return;
     }
     if (!p.treffer.length) {
       const leer = document.createElement('div');
       leer.className = 'or-leer';
-      leer.textContent = 'Kein Treffer.';
+      leer.textContent = t2('panel.ordner.keinTreffer');
       trefferEl.appendChild(leer);
       return;
     }
@@ -200,7 +213,7 @@ export function initOrdnerView(): void {
       const name = t.pfad.split('/').pop() ?? t.pfad;
       el.innerHTML = `<div class="or-treffer-kopf"><span class="or-name"></span><span class="or-zeilennr"></span></div><div class="or-treffer-text"></div>`;
       el.querySelector('.or-name')!.textContent = name;
-      el.querySelector('.or-zeilennr')!.textContent = `Zeile ${t.zeile}`;
+      el.querySelector('.or-zeilennr')!.textContent = t2('panel.ordner.zeile', { zeile: t.zeile });
       el.querySelector('.or-treffer-text')!.textContent = t.text;
       el.title = t.pfad;
       el.addEventListener('click', () => window.awbBridge.bedienung('ordner-oeffnen', t.pfad));
@@ -310,6 +323,43 @@ export function initOrdnerView(): void {
   // der Baum nach einem Sessionwechsel auf der alten Wurzel stehen.
   let wurzelAngefragt = false;
 
+  // Der Ordner, bis zu dem der Baum aufklappen soll (ordnerBlattZeigen). Leer,
+  // sobald alle Stufen dorthin gelesen sind.
+  let zielPfad = '';
+
+  /** Klappt die Stufen bis `zielPfad` auf und fordert an, was noch fehlt. Gibt zurueck, ob sich am Baum etwas getan hat. */
+  function zielVerfolgen(): boolean {
+    if (!zielPfad || !wurzel) return false;
+    if (zielPfad !== wurzel && !zielPfad.startsWith(`${wurzel}/`)) {
+      zielPfad = '';
+      return false;
+    }
+    const rel = zielPfad === wurzel ? '' : zielPfad.slice(wurzel.length + 1);
+    let hier = wurzel;
+    let fertig = true;
+    aufgeklappt.add(wurzel);
+    for (const teil of rel ? rel.split('/') : []) {
+      hier = `${hier}/${teil}`;
+      aufgeklappt.add(hier);
+      if (!kinder.has(hier)) {
+        window.awbBridge.bedienung('ordner-liste', hier);
+        fertig = false;
+      }
+    }
+    if (fertig) zielPfad = '';
+    return true;
+  }
+
+  blattZeigen = (pfad: string): void => {
+    zielPfad = pfad;
+    if (!offen) {
+      // `oeffnen()` fragt die Wurzel an; die Antwort (unten) verfolgt das Ziel.
+      umschalten('ordner');
+      return;
+    }
+    if (zielVerfolgen() && !letzteAnfrage) zeichneBaum();
+  };
+
   function oeffnen(): void {
     offen = true;
     panel.classList.add('offen');
@@ -337,17 +387,25 @@ export function initOrdnerView(): void {
         kinder.clear();
         aufgeklappt.clear();
         aufgeklappt.add(wurzel);
-        wurzelEl.textContent = wurzel;
-        wurzelEl.title = wurzel;
+        // DER PFAD STEHT NICHT ZWEIMAL IM BILD (05.09.2026, Kleinigkeit 5).
+        // Er stand als eigene Zeile ueber dem Baum, waehrend der Inhaltskopf
+        // daneben denselben Pfad schon traegt -- und die Zeile ueber dem Blatt
+        // nennt ausserdem das Projekt. Fuer den Steuerkanal bleibt er am
+        // Element haengen, gezeichnet wird er nicht mehr.
+        panel.dataset.wurzel = wurzel;
+        panel.title = wurzel;
       }
     }
     const unveraendert = gleich(kinder.get(p.root), p.entries);
     kinder.set(p.root, p.entries);
+    // Ein Ziel aus dem Chat (ordnerBlattZeigen) will aufgeklappt werden, auch
+    // wenn sich am Inhalt nichts geaendert hat.
+    const zielGeaendert = zielVerfolgen();
     // Waehrend einer Suche steht der Baum nicht auf dem Schirm -- der Stand
     // wird trotzdem nachgefuehrt, gezeichnet wird er erst, wenn die Eingabe
     // wieder leer ist. Ohne diesen Wall wuerde jede Runde die Trefferliste
     // durch den Baum ersetzen.
-    if (letzteAnfrage || unveraendert) return;
+    if (letzteAnfrage || (unveraendert && !zielGeaendert)) return;
     aufraeumen();
     zeichneBaum();
   });

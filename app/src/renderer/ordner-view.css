@@ -1,16 +1,15 @@
 /* Die Ordneransicht (4c.2) mit eingebauter Inhaltssuche (4c.1). Dieselbe
    Bildsprache wie die anderen beiden Schubladen. */
-/* Die Schublade steht IN der Reihe zwischen Sessionleiste und Buehne, nicht
-   darueber -- Vorgabe des Nutzers vom 05.08.: "so wie es auch rechts aussieht".
-   Als schwebende Flaeche lag sie ueber der Buehne und liess die linke Seite
-   wie zwei uebereinandergeschobene Leisten wirken. Jetzt endet die Buehne an
-   ihr, genau wie sie rechts an der Workerleiste endet. Zugeklappt ist sie
-   `display: none` und nimmt keine Breite -- das ersetzt die alte Schiebe-
-   Animation, die in der Reihe die Buehne bei jedem Bild neu vermessen haette. */
+/* NEUE GESTALT (03.09.2026), gleiche Logik. Das Blatt liegt jetzt im
+   Inspektor rechts und nicht mehr als Schublade zwischen Leiste und Flaeche:
+   es fuellt seine Spalte ganz, traegt den Ton der Leisten und braucht keine
+   eigene Kante mehr -- die Spalte hat schon eine. Seine Kopfzeile ist weg, weil
+   der Reiter darueber den Namen schon nennt; ein zweiter Titel unmittelbar
+   darunter waere dieselbe Auskunft zweimal. */
 .or-panel {
-  flex: 0 0 auto; width: min(480px, 45vw); height: 100%; box-sizing: border-box;
-  background: #14171c; border-right: 1px solid #262b34; color: #d8dee9;
-  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  flex: 1 1 auto; width: 100%; min-width: 0; height: 100%; box-sizing: border-box;
+  background: var(--leiste); color: var(--schrift);
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui;
   display: none; flex-direction: column;
   overflow-wrap: anywhere;
 }
@@ -18,46 +17,62 @@
 
 .or-kopf {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 10px 12px; border-bottom: 1px solid #262b34; flex: 0 0 auto;
+  padding: 10px 12px; flex: 0 0 auto;
 }
 .or-titel { font-weight: 700; font-size: 13px; }
 .or-schliessen {
-  background: none; border: 0; color: #8b93a1; font-size: 18px; line-height: 1;
+  background: none; border: 0; color: var(--gedaempft); font-size: 18px; line-height: 1;
   cursor: pointer; padding: 2px 6px;
 }
-.or-schliessen:hover { color: #d8dee9; }
+.or-schliessen:hover { color: var(--schrift); }
 
-.or-suchleiste { padding: 8px 12px; border-bottom: 1px solid #262b34; flex: 0 0 auto; }
+.or-suchleiste { padding: 8px 12px; flex: 0 0 auto; }
+/* DAS SUCHFELD IST EINE PILLE (05.09.2026, Electron-Befund 9). Es war ein
+   Kasten aus einem Bildpunkt `--linie` mit vier Bildpunkten Radius -- die
+   Bauart, die im uebrigen Fenster gefallen ist. Jetzt traegt es die Flaeche
+   (`--erhoben` auf `--leiste`) und den runden Schnitt einer Suchzeile; der
+   Fokus steht als Ring darin, nicht als eingefaerbte Umrandung. */
 .or-suche-eingabe {
   display: block; width: 100%; box-sizing: border-box;
-  background: #0e1014; border: 1px solid #262b34; border-radius: 4px; color: #d8dee9;
-  font: inherit; padding: 5px 8px;
+  background: var(--erhoben); border: 0; border-radius: 999px; color: var(--schrift);
+  font: inherit; padding: 5px 12px;
 }
-.or-suche-eingabe:focus { outline: none; border-color: #3a4351; }
+.or-suche-eingabe:focus { outline: 2px solid var(--akzent); outline-offset: -2px; }
 
 .or-inhalt { flex: 1 1 auto; overflow-y: auto; padding: 8px 0 16px; }
-.or-wurzel {
-  padding: 0 12px 8px; color: #8b93a1; font-size: 11px; white-space: nowrap;
-  overflow: hidden; text-overflow: ellipsis;
-}
-.or-leer { color: #8b93a1; padding: 4px 12px; }
+.or-leer { color: var(--gedaempft); padding: 4px 12px; }
 
 .or-zeile { display: flex; align-items: center; gap: 5px; padding: 3px 10px; cursor: pointer; }
-.or-zeile:hover { background: #1e232b; }
-.or-pfeil { flex: 0 0 12px; color: #8b93a1; font-size: 10px; text-align: center; }
+.or-zeile:hover { background: var(--erhoben); }
+.or-pfeil { flex: 0 0 12px; color: var(--gedaempft); font-size: 10px; text-align: center; }
+/* Systemschrift, NICHT Monospace: hier steht ein einzelner Datei- oder
+   Ordnername, kein Pfad. Der Pfad steht im Inhaltskopf daneben;
+   Monospace bleibt, wo wirklich Inhalt steht -- der Trefferauszug unten.
+   Finder und der Navigator in Xcode setzen Namen genauso in der Systemschrift;
+   mit Monospace sah der Baum am 03.09. neben seiner eigenen Kopfzeile wie ein
+   Terminalauszug aus. */
 .or-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; }
 .or-ordner .or-name { font-weight: 600; }
-.or-datei .or-name { color: #b9c0cc; }
-.or-zzusatz { color: #8b93a1; font-size: 10px; flex: 0 0 auto; }
+.or-datei .or-name { color: var(--schrift); }
+.or-zzusatz { color: var(--gedaempft); font-size: 10px; flex: 0 0 auto; }
 
+/* Trefferzeilen ohne Trennstrich (05.09.2026): getrennt wird ueber die Fuge,
+   wie ueberall sonst im Fenster. */
 .or-treffer-zeile {
-  padding: 6px 12px; cursor: pointer; border-bottom: 1px solid #1a1e25;
+  padding: 6px 12px 8px; cursor: pointer;
 }
-.or-treffer-zeile:hover { background: #1e232b; }
+.or-treffer-zeile:hover { background: var(--erhoben); }
 .or-treffer-kopf { display: flex; justify-content: space-between; gap: 8px; }
 .or-treffer-kopf .or-name { font-weight: 600; flex: 0 1 auto; }
-.or-zeilennr { color: #8b93a1; font-size: 10px; white-space: nowrap; }
+.or-zeilennr { color: var(--gedaempft); font-size: 10px; white-space: nowrap; }
 .or-treffer-text {
-  margin-top: 2px; color: #b9c0cc; font-size: 11px; white-space: pre-wrap;
+  margin-top: 2px; color: var(--schrift); font-size: 11px; white-space: pre-wrap;
   max-height: 3.2em; overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+
+/* Die eigene Kopfzeile des Blattes bleibt weg -- der Reiter darueber nennt den
+   Namen schon, und ein zweiter Titel unmittelbar darunter waere dieselbe
+   Auskunft zweimal. Sie steht weiter im Baum, damit der Schliessen-Knopf darin
+   erreichbar bleibt (die Blaetter binden ihn beim Aufbau). */
+.or-kopf { display: none; }
