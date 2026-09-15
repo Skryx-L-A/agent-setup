@@ -2,6 +2,11 @@
 # Zweck: blockt destruktive Befehle, wenn von den betroffenen Daten kein
 #        Snapshot existiert.
 # Event: PreToolUse, matcher Bash.
+# NICHT REGISTRIERT: Klassifikationslogik seit 2026-08-05 in hooks/lib/
+#        snapshot_classify.py, von bash-guard.py (dessen PreToolUse/Bash-
+#        Sammelpunkt) importiert und unveraendert ausgefuehrt -- diese Datei
+#        traegt nur noch die Original-Begruendung, kein Eintrag in
+#        settings.json zeigt hierher.
 # Warum: Stehende Regel (CLAUDE.md): "Snapshot before destructive ops: copy
 #        non-trivial data to ~/.local/trash-snapshots/<date>-<name>/ before
 #        deleting or overwriting it." Bisher reine Disziplin -- wer sie

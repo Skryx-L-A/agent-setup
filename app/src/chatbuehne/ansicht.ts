@@ -13,6 +13,7 @@
 // Eingabefeld, weil die Eingabe dort am Pane bleibt. Hier ist das Feld der
 // Kern -- die Sitzung gehoert der App.
 import { markdownZuHtml } from '../chat/markdown';
+import { pfadKlickAnbinden, pfadeVerlinken, type PfadHaken } from '../chat/pfadlinks';
 import type {
   Block, FreigabeBlock, Gespraech, Slashbefehl, TextBlock, WerkzeugBlock,
 } from '../chat/sdkstrom';
@@ -81,6 +82,8 @@ export interface AnsichtHaken {
   dateien(): Promise<{ quelle: 'git' | 'dateisystem'; dateien: Dateivorschlag[] }>;
   /** Der Mensch will zu einem Worker dieser Sitzung wechseln (Punkt 1). */
   aufWorker(paneId: string): void;
+  /** Pfade in einer Nachricht pruefen und oeffnen lassen (chat/pfadlinks.ts). */
+  pfade: PfadHaken;
 }
 
 /** Eine Zahl kurz: 46k, 1.0M -- dieselbe Form wie in der Statuszeile des Terminals. */
@@ -204,6 +207,8 @@ export class Chatansicht {
     this.wurzel = el('div', 'chatsdk');
     this.kopf = el('div', 'csdk-kopf');
     this.verlauf = el('div', 'csdk-verlauf');
+    // EIN Klick-Behandler fuer alle anklickbaren Pfade im Verlauf (chatdatei).
+    pfadKlickAnbinden(this.verlauf, this.haken.pfade);
 
     const fuss = el('div', 'csdk-fuss');
     const kasten = el('div', 'csdk-eingabekasten');
@@ -653,6 +658,7 @@ export class Chatansicht {
     if (b.art === 'mensch') {
       const kasten = el('div', 'csdk-mensch');
       kasten.innerHTML = markdownZuHtml(b.text);
+      void pfadeVerlinken(kasten, b.text, this.haken.pfade);
       return kasten;
     }
 
@@ -667,6 +673,10 @@ export class Chatansicht {
     zeile.appendChild(el('span', 'csdk-punkt'));
     const koerper = el('div', 'csdk-koerper csdk-agenttext');
     koerper.innerHTML = markdownZuHtml(b.text);
+    // Erst wenn der Text fertig eingelaufen ist: waehrend des Stroms wird der
+    // Block bei jedem Stueck neu gebaut, und ein `stat`-Ruf je Stueck waere
+    // Arbeit fuer Text, der gleich wieder ersetzt wird.
+    if (!b.offen) void pfadeVerlinken(koerper, b.text, this.haken.pfade);
     zeile.appendChild(koerper);
     return zeile;
   }

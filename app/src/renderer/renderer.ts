@@ -1,78 +1,58 @@
-// Die Oberflaeche: linke Symbolleiste mit den Sessions, in der Mitte ein
-// echter tmux-Pane, rechts der Wechsel zwischen Orchestrator und Workern.
-import { Terminal } from '@xterm/xterm';
-import { WebglAddon } from '@xterm/addon-webgl';
-import { CanvasAddon } from '@xterm/addon-canvas';
-import '@xterm/xterm/css/xterm.css';
+// DIE OBERFLAECHE DES HAUPTFENSTERS -- neu gebaut am 03.09.2026.
+//
+// WARUM NEU UND NICHT UMGEBAUT. Urteil des Nutzers ueber den Stand davor:
+// „Mach einfach eine ganz neue Version, orientiere dich nicht an der alten
+// Werkbank, bau einfach eine neue Benutzeroberfläche." Der Aufbau hier folgt
+// deshalb dem Entwurf und nicht der alten Fassung: Titelleiste mit Kontext und
+// dem Ort der Arbeitsmodi, Freigabeleiste quer darunter, links ein Baum aus
+// Projekten und ihren Orchestratoren, in der Mitte die Tab-Leiste ueber der
+// Pane-Flaeche mit dem Dreifachschalter, rechts der Inspektor, unten die
+// Statusleiste.
+//
+// WAS DIESE DATEI NICHT MEHR TUT: Terminals zeichnen. Das steht seit dem
+// Neubau in `paneflaeche.ts` -- unveraendert, weil es gemessenes Verhalten ist
+// (Bildlauf, Groessensprung, Alternativschirm, Mausverfolgung, Rueckblick).
+// Hier stehen nur noch die Leisten darum und die Frage, WAS auf der Flaeche
+// liegen soll.
+//
+// DIE DREI FRAGEN, die die Oberflaeche in einer Sekunde beantworten muss:
+//   Wartet etwas auf mich?  Die Freigabeleiste oben, quer, ueber alle Projekte
+//                           hinweg -- plus das Abzeichen in der Titelleiste.
+//   Was laeuft gerade?      Zustandspunkte auf drei Ebenen: Projekt,
+//                           Orchestrator, Tab. Farbe UND Form.
+//   Wo greife ich ein?      Pane anklicken, zoomen, tippen.
+//
+// Der Renderer hat NULL Direktzugriffe auf den Hauptprozess; alles laeuft ueber
+// `window.awbBridge` (preload/preload.ts). Das bleibt so.
+import './werkbank.css';
+import {
+  flaecheMelden,
+  initPaneflaeche,
+  paneflaecheBericht,
+  paneflaecheHaken,
+  paneflaecheNachziehen,
+  schilderNachziehen,
+  setzeSchrift,
+  setzeScroll,
+  terminalThemaAnwenden,
+  type LayoutPayload,
+  type SessionPayload,
+} from './paneflaeche';
 import { initFreigabenView, freigabenUiState } from './freigaben-view';
+import { figurenFarbenNeu } from './agentenfigur';
+import { initWeltenView, weltenAnzeigen, weltenAufgaben, weltenSichtbar, weltenUiState, weltenSpracheGesetzt } from './welten-view';
 import { initAktivitaetView, aktivitaetUiState } from './aktivitaet-view';
 import { initOrdnerView, ordnerUiState } from './ordner-view';
 import { initProtokolleView, protokolleUiState } from './protokolle-view';
+import { kurzerPfad } from './kurzpfad';
 import { ErgebnisMeldung, Meldungen } from './meldungen';
 import { initEditorView } from './editor-view';
 import { Seiten, type PlanAnzeige } from './seiten-view';
-import { initFussStatus, zeichneStatuszeile } from './fuss-status';
-// SPEC-V4 Abschnitt 6: die Chat-Ansicht liegt UEBER dem Pane, nicht an seiner
-// Stelle -- der Pane bleibt darunter, laeuft weiter und wird weiter ausgewertet.
-// Deshalb haengt sie an dem Kasten, in dem auch das Terminal zeichnet, und
-// deshalb sind es hier nur diese wenigen Zeilen (Anlegen, Aufraeumen).
-import { ChatAnbindung } from '../chat/anbindung';
-import { setzeSprache as setzeChatSprache, t as chatT } from '../chat/texte';
-import '../chat/ansicht.css';
-// Die CHAT-SITZUNG (13.08.) -- nicht zu verwechseln mit der Lese-Ansicht eines
-// Panes darueber: das hier ist eine eigene Sitzung mit eigenem Prozess, die
-// anstelle der Kacheln auf der Buehne liegt. Ihre Ansicht ist reines DOM
-// (chatbuehne/ansicht.ts), diese Datei haengt sie nur ein.
+import { initFussStatus, zeichneStatuszeile, type MaschinenStand } from './fuss-status';
+import { setzeSprache as setzeChatSprache } from '../chat/texte';
+import { setzeSprache, t } from './texte';
 import { Chatbuehne, type ChatBruecke } from './chatbuehne-view';
 import '../chatbuehne/ansicht.css';
-
-interface SessionPayload {
-  session: string;
-  cols: number;
-  rows: number;
-  sizePolicy: string;
-  panes: { paneId: string; width: number; height: number; active: boolean }[];
-  activePane: string;
-  initialContent: string;
-}
-
-interface PaneBox { paneId: string; x: number; y: number; cols: number; rows: number }
-interface LayoutPayload {
-  art: 'pane' | 'tab';
-  /**
-   * Ob die geltende Flaeche VORGEGEBEN wurde (Steuerkanal) statt von der Buehne
-   * gemeldet. Dann fordert die Buehne nichts nach -- eine Vorgabe, die das
-   * Fenster gleich wieder ueberschreibt, waere keine.
-   */
-  vorgegeben?: boolean;
-  cols: number;
-  rows: number;
-  aktiv: string;
-  panes: PaneBox[];
-  inhalt: Record<string, string>;
-  /** Der Rueckblick eines Panes -- kommt nur beim ERSTEN Zeichnen mit. */
-  historie?: Record<string, string>;
-  /** Ob die Anwendung im Pane die Maus verfolgt, und in welcher Kodierung. */
-  maus?: Record<string, { an: boolean; sgr: boolean }>;
-  /** Nur fuer 'tab': Spalten des Gitters, aus der Kapazitaetsrechnung. */
-  spalten?: number;
-  /**
-   * Nur fuer 'tab': die Fenstergroesse, in der die Kaesten der Panes stehen.
-   * Ist sie da, kommt die Kachel jedes Panes aus seiner WIRKLICHEN Lage in
-   * diesem Fenster statt aus seinem Platz in der Anforderung -- siehe
-   * `kachelAusRaster` und main.ts, `tabZeigen`.
-   */
-  raster?: { cols: number; rows: number };
-  /**
-   * Wie `raster`, aber der Tab zeigt nur einen TEIL der Panes dieses Fensters
-   * (Layout 'split': der Orchestrator sitzt mit im Fenster). Die Lage der
-   * gezeigten Panes ist dann immer noch die von tmux -- es fehlen nur Zellen
-   * dazwischen, und die werden zusammengeschoben.
-   */
-  rasterTeil?: { cols: number; rows: number };
-  /** Angeforderte Panes, die es nicht (mehr) gibt -- mit dem Grund. */
-  fehlend?: { pane: string; grund: string }[];
-}
 
 interface Subagent { paneId: string; name: string; type: string; agentId: string }
 interface Worker {
@@ -102,30 +82,16 @@ interface Session {
   alive: boolean; reachable: boolean; state: string; initials: string;
   owned: boolean; orchestratorPane: string; workers: Worker[];
   pendingApprovals: number; orphanSubagents: Subagent[];
-  /** V14: die Unterhaltung dieser Session -- leer, wenn keine gemerkt ist. */
   claudeSessionId: string;
-  /**
-   * Sie lief noch, als dieses Programm zuletzt hinsah, und ist jetzt weg
-   * (11.08.). Gilt nur zusammen mit `state === 'stopped'`; gezeigt wird sie
-   * deshalb, obwohl beendete Sitzungen sonst ausgeblendet sind.
-   */
+  /** Sie lief noch, als dieses Programm zuletzt hinsah, und ist jetzt weg (11.08.). */
   verloren?: boolean;
-  /**
-   * Fuer diesen Ordner laeuft gerade ein Start (21.08.): die Zustandsdatei ist
-   * da, die tmux-Sitzung noch nicht. Bei einem lokalen Modell dauert das
-   * Minuten. Gilt wie `verloren` nur zusammen mit `state === 'stopped'`.
-   */
+  /** Fuer diesen Ordner laeuft gerade ein Start (21.08.). */
   startet?: boolean;
   /** Der letzte Start fuer diesen Ordner ist gescheitert (21.08.). */
   startFehler?: boolean;
   sessionKey: string;
-  /** Harness und Modell, mit denen sie lief -- aus ihrer Zustandsdatei. */
   harness?: string;
   model?: string;
-  /**
-   * Nur bei einer toten Session: was der Knopf tun wird. Kommt fertig aus dem
-   * Hauptprozess, damit hier kein zweites Urteil entsteht.
-   */
   revive?: { conversation: 'resumed' | 'fresh'; reason: string };
 }
 interface AmpelBefund { quelle: string; vorhanden: boolean; rot: boolean; ueberfaellig: boolean; ueberholt: boolean; ageDays: number; text: string }
@@ -134,8 +100,7 @@ interface AmpelStand { machine: string; befunde: AmpelBefund[]; farbe: 'rot' | '
  * Farben durchreichen (11.08.): dieselbe Form wie `ThemaPayload` in
  * main/thema.ts, hier noch einmal deklariert statt importiert -- Renderer und
  * Hauptprozess bleiben getrennte Prozesse, keine Datei dieses Fensters
- * importiert bisher aus main/, und ein Nur-Typ-Import waere die erste
- * Ausnahme davon.
+ * importiert bisher aus main/, und ein Nur-Typ-Import waere die erste Ausnahme.
  */
 interface ThemaPayload {
   thema: string;
@@ -143,15 +108,38 @@ interface ThemaPayload {
   zustandsfarben: Record<string, string>;
   zustandsfarbenLesbar: Record<string, string>;
   zustandsfarbenTinte: Record<string, string>;
+  akzent: string;
+  akzentTinte: string;
+  akzentText: string;
+  systemAkzentfarbe: string;
 }
 interface BudgetStand { ok: boolean; heuteTokens: number; heuteStunden: number; hochrechnung24h: number; text: string }
 interface Model {
   sessions: Session[];
   all: number;
-  ui: { sidebarWidth: number; showStopped: boolean; sort: string; order: string[]; selected: string; workerTab: number; rightWidth: number };
+  ui: {
+    sidebarWidth: number; showStopped: boolean; sort: string; order: string[];
+    selected: string; workerTab: number;
+    /** Je Sitzung: zeigt die Flaeche den Orchestrator oder die Worker (04.09.). */
+    flaecheSitzung?: Record<string, string>;
+    /** Breite eines GEOEFFNETEN Blattes, getrennt vom Reiterstreifen (04.09.). */
+    blattBreite?: number;
+    /** Ob der Editor eingeklappt steht (05.09.); editor-view.ts liest es. */
+    editorEingeklappt?: boolean;
+  };
   selected: string;
   machine: string;
-  capacity: { perRow: number; perColumn: number; perTab: number; cappedBySetting: boolean; tabs: number; workerCount: number };
+  capacity: {
+    perRow: number; perColumn: number; perTab: number; cappedBySetting: boolean; tabs: number; workerCount: number;
+    spalten: number; zeilen: number;
+  };
+  /**
+   * DIE MASCHINEN, die dieses Programm kennt (03.09.). Neu im Modell -- der
+   * Baum und die Statusleiste brauchen die Erreichbarkeit je Maschine, und die
+   * liess sich bisher nur aus den Sitzungen ableiten, die zufaellig auf ihr
+   * liefen. Eine Maschine ohne Sitzung gab damit gar keine Auskunft.
+   */
+  maschinen?: MaschinenStand[];
   /** Wieviele FREMDE Clients an der gezeichneten Session haengen (06.08.). */
   fremdeClients: number;
   /** Schriftgroesse der Terminals in Pixeln, aus den Einstellungen (06.08.). */
@@ -160,414 +148,306 @@ interface Model {
   scrollZeilen: number;
   streamPane: string;
   mayArrange: boolean;
-  /**
-   * Die Chat-Sitzungen (12.08.) -- eine EIGENE Liste neben `sessions`. Sie
-   * haben keinen Pane, keinen Worker und keinen tmux-Zustand; sie in
-   * `sessions` zu mischen haette jede Verzweigung dort um die Frage
-   * erweitert, welche Sorte gerade vorliegt.
-   */
   chats?: {
     id: string; name: string; ordner: string; zuletzt: string; laeuft: boolean;
-    /** Die tmux-Session, in der die Worker DIESER Sitzung landen (Punkt 1). */
     tmuxSession?: string;
-    /** Was gerade darin steht -- gemessen an tmux, bei jedem Takt. */
     worker?: { name: string; paneId: string; laeuft: boolean }[];
   }[];
-  /**
-   * DIE REIHENFOLGE DER LEISTE -- eine Liste fuer beide Sorten (Punkt 4). Der
-   * Hauptprozess sortiert sie EINMAL mit derselben Funktion und derselben
-   * Voreinstellung, die die Terminal-Sitzungen schon hatten; hier steht nur
-   * noch, welche Zeile an welche Stelle gehoert und aus welcher der beiden
-   * Listen ihr Inhalt kommt.
-   */
   leiste?: { art: 'terminal' | 'chat'; id: string }[];
-  /**
-   * Liegt statt eines Gespraechs ein WORKER einer Chat-Sitzung auf der Buehne
-   * (Punkt 1)? Dann bleibt ihre Zeile hervorgehoben -- der Mensch ist bei
-   * dieser Sitzung, nur eben bei einem ihrer Worker.
-   */
   chatWerkstattGezeigt?: string;
-  /**
-   * WELCHE Chat-Sitzung auf der Buehne liegt (13.08.). Leer heisst: die Kacheln
-   * der gewaehlten Terminal-Sitzung. Der Hauptprozess entscheidet das, nicht
-   * dieser Renderer -- hier steht nur, was daraus folgt (chatbuehne-view.ts).
-   */
   chatGezeigt?: string;
   ampel: AmpelStand[];
   budget: BudgetStand | null;
 }
 
+/** Die Nutzlast der Freigabe-Ansicht (V20) -- hier nur, was die Leiste oben braucht. */
+interface GuardBlockEintrag {
+  path: string; pane: string; guard: string; reason: string; command: string;
+  cwd: string; ts: string; sessionId: string; sessionName: string; machine: string;
+  workerName: string; unbekannterPane: boolean;
+  wartet: boolean; muster: string; musterGrund: string; schluessel: string;
+}
+interface AntragEintrag {
+  path: string; ts: string; parent: string; parentModel: string;
+  childName: string; childModel: string; childEffort: string; dir: string;
+  files: string[]; task: string; doneCriterion: string; whySeparable: string; est: string;
+}
+interface FreigabenNutzlast { requests: AntragEintrag[]; guardBlocks: GuardBlockEintrag[] }
+
 declare global {
   interface Window {
     awbBridge: {
+      /** `process.platform` des Hauptprozesses -- siehe preload.ts. */
+      plattform: string;
+      /** AWB_TESTHAKEN=1 -- siehe preload.ts. */
+      testhaken?: boolean;
       ready(): void;
       onSession(fn: (p: SessionPayload) => void): void;
       onOutput(fn: (p: { paneId: string; data: string }) => void): void;
       onLayout(fn: (p: LayoutPayload) => void): void;
       onModel(fn: (p: Model) => void): void;
+      /** Welten und Fusszeile des Tabs Agents -- siehe preload.ts. */
+      onAufgaben(fn: (p: unknown) => void): void;
+      aufgabenDaten(): Promise<unknown>;
+      aufgabe(befehl: string, opt?: { echt?: boolean; bestaetigt?: boolean }): Promise<unknown>;
+      aufgabenSichtbar(an: boolean): void;
       onKanal(fn: (p: { pfad: string; fehler: string | null }) => void): void;
-      // V20: die Freigabe-Ansicht -- ihre eigene Nutzlast, siehe freigaben-view.ts.
       onFreigaben(fn: (p: unknown) => void): void;
       onErgebnis(fn: (p: ErgebnisMeldung) => void): void;
-      // 4c: Ordneransicht, Aktivitaetsliste, Inhaltssuche -- eigene Nutzlast je Datei.
       onOrdner(fn: (p: unknown) => void): void;
       onMaus(fn: (p: Record<string, { an: boolean; sgr: boolean }>) => void): void;
       onAktivitaet(fn: (p: unknown) => void): void;
       onSuche(fn: (p: unknown) => void): void;
       onSeite(fn: (p: { name: string }) => void): void;
-      // Reste-Auftrag Punkt 3: die Datei hinter einer Seite hat sich von
-      // aussen geaendert -- ob deshalb neu gezeichnet wird, entscheidet
-      // 'seiten.aufDateiAendern', nicht dieser Kanal.
       onDateiGeaendert(fn: (p: { name: string }) => void): void;
       onPlan(fn: (p: PlanAnzeige) => void): void;
       onPlanErgebnis(fn: (p: { ok: boolean; ausgabe: string }) => void): void;
       input(paneId: string, base64: string): void;
       bedienung(aktion: string, wert: unknown): void;
-      /**
-       * Dieses Terminal hat keinen Rueckblick -- der Hauptprozess soll ihn
-       * schicken. Der Renderer ist die einzige Stelle, die das WEISS: nur hier
-       * liegt der Puffer (siehe rueckblickAnfordern).
-       */
       rueckblickFehlt(paneId: string): void;
       /** Rechtsklick auf eine Sitzung -- die Echtheit des Ereignisses reist mit. */
       sitzungsMenue(id: string, echt: boolean): void;
-      /** Der Hauptprozess fragt nach einem neuen Namen fuer diese Sitzung. */
       onUmbenennen(fn: (p: { id: string; name: string; dir: string }) => void): void;
-      /** Was ein Griff ergeben hat -- Text fuer die Zeile ueber der Buehne. */
-      onMeldung(fn: (p: { text: string }) => void): void;
-      /** Dieser Pane zeigt ab jetzt das Gespraech (oder wieder das Terminal). */
+      onMeldung(fn: (p: { text: string; dauerMs?: number }) => void): void;
       onChatAnsicht(fn: (p: { paneId: string; an: boolean }) => void): void;
-      /** Der eingegebene Name -- geschrieben wird er ueber `wb-state`. */
       umbenennen(id: string, name: string): Promise<{ ok: boolean; meldung: string; aufruf: string }>;
-      /** Farben durchreichen (11.08.): einmal alles, aus main/thema.ts. */
       thema(): Promise<ThemaPayload>;
-      /** Dieselben Daten, erneut -- die Einstellungsdatei hat sich geaendert oder das System das Thema. */
       onThema(fn: (p: ThemaPayload) => void): void;
-      /** Die System-Zwischenablage, fuer Strg+Umschalt+C/V im Terminal (siehe terminalZwischenablageHaken). */
       zwischenablageLesen(): Promise<string>;
       zwischenablageSchreiben(text: string): Promise<void>;
     };
-    /**
-     * Die Chat-Sitzung auf der Buehne (13.08.). Eigener Namensraum, kein Teil
-     * von `awbBridge` -- siehe preload/preload.ts. Fehlt er (ein Fenster ohne
-     * diese Bruecke), bleibt der Kasten leer statt dass etwas bricht.
-     */
     awbChat?: ChatBruecke;
-    __awb: { bufferText(): string; schirmText(): string; uiState(): unknown; seitenState(): Promise<unknown>; seiteRollen(a: string): Promise<boolean>; seiteKlick(a: string): Promise<boolean>; seiteFokus(a: string): Promise<boolean>; seiteUnfokus(): Promise<boolean>; seiteSchliessenKlick(): boolean; trefferBei(x: number, y: number): { tag: string; id: string; klassen: string }; rad(paneId: string, schritte: number, shift?: boolean): Promise<unknown>; radmass(p: { deltas: number[]; modus?: number; zeilen?: number; zellhoehe?: number }): unknown; radAufnahme(paneId: string, an: boolean): unknown; rendererArt(paneId: string): string; scrollLeistung(paneId: string, p: { bilder?: number; raster?: number }): Promise<{ deltas: number[]; renderer: string; laenge: number; zeilen: number; baseY: number }>; webglSperren(): boolean; zwischenablageAuswahl(paneId: string, an: boolean): boolean; zwischenablageTaste(paneId: string, opt: { taste: string; shift?: boolean }): { verhindert: boolean }; zwischenablageGesendet(): string; zwischenablageKontextmenuZiel(ziel: string): { x: number; y: number } | null; kontextZiel(x: number, y: number): { paneId: string; hatAuswahl: boolean; auswahlText: string } | null; kontextEinfuegen(paneId: string, text: string): boolean };
+    __awb: Record<string, unknown>;
   }
 }
 
-/**
- * Die Schriftgroesse der Terminals. 13 ist nur die Vorgabe fuer den Augenblick
- * VOR der ersten Modell-Meldung -- die gueltige Zahl steht in der geteilten
- * Einstellungsdatei (`terminalFontSize`, 8 bis 32) und kommt mit jedem Modell
- * mit. Sie hier fest zu lassen hiesse, dem Menschen die Schriftgroesse seines
- * eigenen Fensters vorzuschreiben.
- */
-let schriftgroesse = 13;
-
-/**
- * Wie lange xterm einen Bildlauf interpoliert. Wirkt nur noch dort, wo EIN
- * Ereignis in einem Bild ankommt -- die Rastung eines Mausrades; bei einem
- * Trackpad-Fluss wird sie beim Abgeben abgeschaltet (siehe rollenSpaeter).
- */
-const SCROLL_ANIMATION_MS = 10;
-/**
- * Bis zu diesem Abstand gilt ein Rad-Ereignis als Teil derselben Bewegung.
- * Grosszuegig gewaehlt: ein Trackpad liefert alle 8 bis 16 ms, ein Mausrad im
- * schnellsten Fall alle 30 bis 50 ms -- 60 ms trennt beides, ohne dass ein
- * einzelner Ausreisser im Ereignisstrom die Bewegung zerschneidet.
- */
-const ROLLEN_FLUSS_MS = 60;
-
-const TERMOPT = {
-  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-  fontSize: schriftgroesse,
-  theme: { background: '#101216', foreground: '#d8dee9' },
-  scrollback: 5000,
-  cursorBlink: false,
-  allowProposedApi: true,
-  /**
-   * Ohne das hier springt jeder Rad-Schritt den Ausschnitt sofort um seine
-   * Zeilen (bis zu RAD_DECKEL = 6, siehe radZeilen) -- das ist das
-   * "sprunghaft", das alice gemeldet hat, unabhaengig von der Bildzeit:
-   * `Terminal.scrollLines()`, genau der Aufruf im Rad-Haken unten, interpoliert
-   * den scrollTop des Ausschnitts nur, wenn dieser Wert gesetzt ist (xterm.js,
-   * Viewport.ts).
-   *
-   * NICHT die uebliche Vorgabe von 100ms (VS Code u.a.): gemessen (12.08.,
-   * test-app-scroll-leistung.sh mit einem Rad-Ereignis je Bild, dauerhaft --
-   * ein zuegiger Wisch, keine Uebertreibung) faellt `scrollLines()` bei jedem
-   * neuen Ereignis auf die GERADE ERST interpolierte Position zurueck und
-   * faengt von dort einen neuen, kurzen Lauf an, statt den vorigen Zielpunkt
-   * weiterzufuehren. Bei andauerndem Rad-Fluss schneller als die Animation
-   * bleibt der Ausschnitt dadurch systematisch zurueck: bei 100ms erreichte er
-   * in 150 Bildern nur 76 von 900 erwarteten Zeilen (8 %) -- das waere kein
-   * sanfteres Scrollen, sondern ein haengendes. Bei 10ms waren es 741 von 900
-   * (82 %), nah genug am Original, um unter Dauerfluss nicht aufzufallen. Fuer
-   * den haeufigen Fall -- einzelne Rad-Notches mit Luft dazwischen -- reichen
-   * 10ms trotzdem, um aus dem Sprung eine kurze Bewegung zu machen: die Pause
-   * bis zum naechsten Ereignis ist dort um ein Vielfaches laenger als die
-   * Animation selbst.
-   */
-  smoothScrollDuration: SCROLL_ANIMATION_MS,
-  /**
-   * Bewusst bei der Vorgabe 1 belassen, aber ausgeschrieben statt implizit:
-   * dieser Wert wirkt nur in `Viewport.handleWheel`, und genau dorthin kommt
-   * ein Rad-Ereignis in diesem Fenster so gut wie nie -- der eigene Haken
-   * unten (`attachCustomWheelEventHandler`) faengt jedes Ereignis auf dem
-   * Normalschirm ab und ruft `scrollLines()` selbst mit der ueber
-   * `scrollZeilen`/RAD_DECKEL bemessenen Zeilenzahl. Nur auf dem
-   * Alternativschirm ohne Mausverfolgung (Editor, weniger, top) gibt xterm das
-   * Ereignis an seine eigene Wandlung in Pfeiltasten weiter, und dort ist die
-   * Vorgabe die richtige -- eine andere Zahl haette dort eine Wirkung, die an
-   * keiner anderen Stelle dieses Fensters vorkommt und niemand vermuten wuerde.
-   */
-  scrollSensitivity: 1,
-};
-
-/** Welcher Renderer je Pane wirklich zeichnet -- siehe ladeRenderer(). */
-const rendererJePane = new Map<string, 'webgl' | 'canvas' | 'dom'>();
-/** Schluessel des Mass-Terminals in `rendererJePane` -- kein echter Pane hat je diese Kennung. */
-const MASS_TERMINAL_ID = '__mass__';
-/**
- * Das GELADENE WebGL-Stueck je Terminal, damit es sich auch wieder abwerfen
- * laesst. Gebraucht wird das an genau einer Stelle: `__awb.webglSperren()`
- * (nur fuer Tests) stellt damit auch schon bestehende Terminals auf Canvas um
- * -- siehe die Begruendung dort. Eingetragen wird ausschliesslich in
- * `ladeRenderer()`, der einzigen Stelle, die WebglAddon ueberhaupt laedt.
- */
-const webglJeTerminal = new Map<string, { addon: WebglAddon; term: Terminal }>();
-
-/**
- * Canvas laden und festhalten, was jetzt wirklich zeichnet. Steht hier oben und
- * nicht mehr nur in `ladeRenderer()`, weil `webglSperren()` denselben Weg
- * braucht -- zwei Kopien davon liefen genau in dem Moment auseinander, in dem
- * es darauf ankaeme.
- */
-function canvasLaden(paneId: string, t: Terminal): void {
-  try {
-    t.loadAddon(new CanvasAddon());
-    rendererJePane.set(paneId, 'canvas');
-  } catch {
-    // Weder WebGL noch Canvas verfuegbar -- der eingebaute DOM-Renderer
-    // zeichnet weiter, nur ohne Beschleunigung. Kein Fehlerfall: xterm
-    // selbst braucht keinen der beiden Zusaetze, um etwas zu zeigen.
-    rendererJePane.set(paneId, 'dom');
-  }
-}
-
-/**
- * WebGL zuerst, mit Rueckfall auf Canvas und zuletzt den blossen DOM-Renderer
- * von xterm selbst (12.08.). Ohne einen der beiden Zusaetze zeichnet xterm 5.5
- * jede sichtbare Zeile als eigenes DOM-Element neu, sobald sich der Ausschnitt
- * verschiebt -- bei einem Bildlaufpuffer von 5000 Zeilen der uebliche Grund
- * fuer haekeliges Scrollen auf langsamerer Hardware als der, auf der gemessen
- * wurde (Bericht vom 12.08.: auf dieser Maschine blieb sogar der DOM-Renderer
- * unter 16,7ms je Bild, auch bei drei vollen Panes mit laufendem Zustrom).
- *
- * Der Grafikkontext kann jederzeit wegbrechen -- Treiberwechsel, zu viele
- * gleichzeitige Kontexte, ein ausgelagerter Tab. Ohne die Behandlung des
- * `webglcontextlost`-Ereignisses (hier ueber `onContextLoss`) bliebe das
- * Terminal danach schwarz, und das faellt erst Tage spaeter auf.
- *
- * GILT AUCH FUERS MASS-TERMINAL, nicht nur fuer echte Panes (12.08., gemessen
- * in test-app-schriftgroesse.sh): der WebGL/Canvas-Zusatz misst eine Zellbreite
- * ueber `measureText` auf einer Canvas, der DOM-Renderer ueber die gerenderte
- * Breite eines echten Zeichens im Baum -- beides landet zwar nah beieinander,
- * aber nicht auf dem Bildpunkt. Zeichnet das Mass-Terminal weiter pur ueber
- * das DOM, waehrend jeder echte Pane WebGL bekommt, laufen die beiden
- * Zellmasse auseinander, auf die sich Spalten, Zeilen und Kacheln stuetzen --
- * genau die Klasse Fehler, vor der der Kommentar bei `flaecheInZellen`
- * (EINE ZELLGROESSE, NICHT ZWEI, 06.08.) schon einmal gewarnt hat, nur ueber
- * einen neuen Weg. Beide Terminals brauchen denselben Renderer.
- */
-function ladeRenderer(paneId: string, t: Terminal): void {
-  const aufCanvas = (): void => canvasLaden(paneId, t);
-  // SOFORTMASSNAHME 2026-08-16, AUFGEHOBEN 2026-08-19 auf Wort des Nutzers. Die
-  // Geschichte bleibt hier stehen, weil sie erklaert, wofuer diese Konstante
-  // ueberhaupt da ist -- und weil der Weg zurueck eine Zeile ist.
-  //
-  // Damals: alice konnte nicht mehr arbeiten -- Text wurde ueber alten
-  // Inhalt geschrieben, ohne dass die Zeile geloescht wurde, zwei
-  // Bildschirmzustaende verschmolzen (Belege: ~/Downloads/Fehlerhaft*.png,
-  // 18:24-18:28). Der beschleunigte Renderer kam am 12.08. mit 21219e6 dazu,
-  // und genau diese Fehlerbilder sind bei xterm.js unter WebGL bekannt, vor
-  // allem nach Groessenaenderungen. Ob WebGL wirklich die Ursache ist, war
-  // NICHT belegt -- deshalb stand hier eine Massnahme und keine Diagnose:
-  // Canvas ist der naechstschnellste Weg und faellt als Fehlerquelle aus.
-  //
-  // Inzwischen ist es gemessen, und WebGL war es NICHT: Bildpunktvergleich,
-  // zehn Proben, null Unterschied (Ergebnis: ~/.pi-workers/results/
-  // termdarstellung/). Die Ursache waren zwei Naehte in
-  // app/src/main/tmux.ts, beide behoben in f050ee5 -- eine mitten in einer
-  // Steuerfolge zerschnittene Ausgabe, deren erste Haelfte verworfen wurde
-  // (Fingerabdruck im Foto von 18:24: `machen8;5;153mcontext`, Rest von
-  // ESC[38;5;153m), und Bildschirminhalt plus Cursor aus zwei getrennten
-  // tmux-Befehlen mit einem Lesevorgang dazwischen (bei 10 von 129 Aufnahmen
-  // gemessen). Damit traegt die Sperre nichts mehr; sie kostete nur
-  // Zeichengeschwindigkeit.
-  //
-  // Wieder aufziehen heisst: `false` auf `true`. Die Zusage in
-  // shell/tests/test-app-scroll-renderer.sh liest den Wert hier und dreht
-  // sich von selbst mit, in beide Richtungen -- niemand muss daran denken.
-  // Offen und ausdruecklich unerklaert bleiben die grauen Balken auf dem
-  // Bildschirmfoto vom 16.08., 21:52; kommen sie unter WebGL wieder, ist das
-  // das Zeichen, hier wieder zuzumachen.
-  const WEBGL_AUS = false;
-  if (WEBGL_AUS) { aufCanvas(); return; }
-  try {
-    const webgl = new WebglAddon();
-    webgl.onContextLoss(() => {
-      webgl.dispose();
-      webglJeTerminal.delete(paneId);
-      aufCanvas();
-    });
-    t.loadAddon(webgl);
-    rendererJePane.set(paneId, 'webgl');
-    webglJeTerminal.set(paneId, { addon: webgl, term: t });
-  } catch {
-    aufCanvas();
-  }
-}
-
-// Das Mass-Terminal. Es zeichnet nichts, es sagt nur, wie gross eine Zelle in
-// dieser Schrift ist -- daraus folgen Spalten, Zeilen und die Lage jedes Panes.
-const term = new Terminal({ cols: 80, rows: 24, ...TERMOPT });
-
-const paneEl = document.getElementById('pane') as HTMLDivElement;
-const buehne = document.getElementById('buehne') as HTMLDivElement;
-const linksEl = document.getElementById('links') as HTMLDivElement;
-const rechtsEl = document.getElementById('rechts') as HTMLDivElement;
+// --- Die Teile des Fensters -------------------------------------------------
+const rahmenEl = document.getElementById('rahmen') as HTMLDivElement;
+const linksEl = document.getElementById('links') as HTMLElement;
+const rechtsEl = document.getElementById('rechts') as HTMLElement;
 const sessionsEl = document.getElementById('sessions') as HTMLDivElement;
 const rechtsListeEl = document.getElementById('rechtsliste') as HTMLDivElement;
+const inspBereichEl = document.getElementById('insp-bereich') as HTMLDivElement;
 const tabsEl = document.getElementById('tabs') as HTMLDivElement;
+const lageEl = document.getElementById('lage') as HTMLDivElement;
+const ordnenEl = document.getElementById('ordnen') as HTMLButtonElement;
+const uebersichtEl = document.getElementById('uebersicht') as HTMLDivElement;
+const leerEl = document.getElementById('leer') as HTMLDivElement;
+const kTeilerEl = document.getElementById('k-teiler') as HTMLSpanElement;
 const hinweisEl = document.getElementById('hinweis') as HTMLDivElement;
 const griffEl = document.getElementById('griff') as HTMLDivElement;
 const griffRechtsEl = document.getElementById('griff-rechts') as HTMLDivElement;
 const notizEl = document.getElementById('notiz') as HTMLDivElement;
 const kanalwarnungEl = document.getElementById('kanalwarnung') as HTMLDivElement;
+const freigabeleisteEl = document.getElementById('freigabeleiste') as HTMLDivElement;
+const abzeichenEl = document.getElementById('freigabe-abzeichen') as HTMLButtonElement;
+const inspKnopfEl = document.getElementById('insp-knopf') as HTMLButtonElement;
+const kPunktEl = document.getElementById('k-punkt') as HTMLSpanElement;
+const kProjektEl = document.getElementById('k-projekt') as HTMLSpanElement;
+const kOrchEl = document.getElementById('k-orch') as HTMLSpanElement;
+const kNebenEl = document.getElementById('k-neben') as HTMLSpanElement;
+const stWorkerEl = document.getElementById('st-worker') as HTMLDivElement;
+// Der Inhaltskopf (04.09.) -- Name, Herkunft, Statuspille, Umschalter, Zahnrad.
+const inhaltskopfEl = document.getElementById('inhaltskopf') as HTMLDivElement;
+const ikNameEl = document.getElementById('ik-name') as HTMLDivElement;
+const ikHerkunftEl = document.getElementById('ik-herkunft') as HTMLDivElement;
+const ikWorkerEl = document.getElementById('ik-worker') as HTMLButtonElement;
+const workerlisteEl = document.getElementById('workerliste') as HTMLDivElement;
+const ikModusEl = document.getElementById('ik-modus') as HTMLDivElement;
+const modiEl = document.getElementById('modi') as HTMLDivElement;
+const ikZahnradEl = document.getElementById('ik-zahnrad') as HTMLButtonElement;
+const tabstreifenEl = document.getElementById('tabstreifen') as HTMLDivElement;
+// Die Sitzungskarte hinter dem Zahnrad.
+const skEl = document.getElementById('sitzungskarte') as HTMLDivElement;
+const skNameEl = document.getElementById('sk-name') as HTMLInputElement;
+const skListeEl = document.getElementById('sk-liste') as HTMLDListElement;
+const skKnoepfeEl = document.getElementById('sk-knoepfe') as HTMLDivElement;
 /**
  * DIE CHAT-SITZUNG AUF DER BUEHNE (13.08.). Der Kasten liegt UEBER dem
  * Kachelgitter und ist zu, solange keine Chat-Sitzung gewaehlt ist -- das
- * Gitter darunter wird nicht angefasst, damit die Buehne fuer
+ * Gitter darunter wird nicht angefasst, damit die Flaeche fuer
  * Terminal-Sitzungen genau bleibt, was sie war.
  */
-const chatbuehneEl = document.getElementById('chatbuehne') as HTMLDivElement;
-const chatbuehne = new Chatbuehne(chatbuehneEl, window.awbChat);
+const chatbuehne = new Chatbuehne(document.getElementById('chatbuehne') as HTMLDivElement, window.awbChat);
 (window as unknown as Record<string, unknown>).__awbChat = chatbuehne.haken();
-term.open(paneEl);
-ladeRenderer(MASS_TERMINAL_ID, term);
 
-// Tastatur in den Pane. onData liefert die Bytes, die ein Terminal auch
-// bekaeme -- Sondertasten, Steuerzeichen und eingefuegter Text eingeschlossen.
-// Hat die Anwendung im Pane die Klammer-Einfuegung angefordert, verpackt xterm
-// den eingefuegten Text selbst darin, und ein Absatz wird nicht Zeile fuer
-// Zeile abgeschickt.
-/**
- * Alles, was aus dem Fenster in einen Pane geht, laeuft hier durch -- und wird
- * dabei mitgeschrieben. Das Mitschreiben ist der einzige Weg, „das Rad tut in
- * diesem Zustand etwas" auch dort zu belegen, wo es keinen Bildlauf gibt: auf
- * dem Alternativschirm bewegt sich kein Puffer, es gehen nur Bytes hinaus.
- */
-let letzteEingabe: { pane: string; daten: string } | null = null;
-function paneEingabe(paneId: string, daten: string): void {
-  letzteEingabe = { pane: paneId, daten };
-  window.awbBridge.input(paneId, alsBase64(daten));
-}
-
-/** Die zuletzt gesendeten Bytes als Text, Steuerzeichen als ^X geschrieben. */
-function eingabeLesbar(): string {
-  const e = letzteEingabe;
-  if (!e) return '';
-  return [...e.daten].map((z) => (z < ' ' ? `^${String.fromCharCode(z.charCodeAt(0) + 64)}` : z)).join('');
-}
-
-function alsBase64(daten: string): string {
-  const bytes = new TextEncoder().encode(daten);
-  let s = '';
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s);
-}
-
-// KOPIEREN UND EINFUEGEN IM TERMINAL (SSH-clipfix, Meldung des Nutzers vom
-// 16.08.: geht nirgends). Ohne eigene Tastenbehandlung entscheidet xterm.js
-// selbst ueber jedes Strg+<Buchstabe> (siehe node_modules/@xterm/xterm/src/
-// common/input/Keyboard.ts, evaluateKeyboardEvent): Strg+C wird IMMER zu
-// Byte 0x03 (SIGINT), egal ob etwas markiert ist, und Strg+V wird woertlich
-// zu Byte 0x16 -- xterm haelt keine der beiden Tasten fuer Zwischenablage,
-// weil ein echtes Terminal das auch nicht tut. Auf Linux ist die uebliche
-// Antwort darauf Strg+Umschalt+C/V, und die fehlte hier komplett: kein
-// `attachCustomKeyEventHandler`, kein Zugriff auf die Zwischenablage, an
-// keiner der beiden Stellen, an denen ein Pane entsteht.
-//
-// AUF DEM MAC AENDERT SICH NICHTS: Cmd+C/Cmd+V tragen `metaKey`, nicht
-// `ctrlKey`, xterms eigene Auswertung fasst sie in keinem Zweig an (der
-// Klammer-Einfuege-Kommentar unten betrifft nur den Fall, dass eingefuegter
-// Text SELBST eingefuegt wird), und der Browser erledigt sie am versteckten
-// Eingabefeld des Terminals von sich aus -- das ist bereits gemessen der
-// Grund, warum auf dem Mac niemand das Fehlen bemerkt hat.
-const AUF_MAC = /Mac OS X|Macintosh/.test(navigator.userAgent);
-
-/**
- * An EINEM Terminal (`t`) angebracht: faengt Strg+Umschalt+C (kopiert eine
- * Auswahl, wenn eine da ist) und Strg+Umschalt+V (setzt die Zwischenablage
- * ein) ab, bevor xterm sie sieht. Alles andere -- auch das blosse Strg+C/V --
- * geht unveraendert weiter: ein Terminal, das SIGINT verliert, waere kaputter
- * als eines ohne Kopieren.
- */
-function terminalZwischenablageHaken(t: Terminal): void {
-  if (AUF_MAC) return;
-  t.attachCustomKeyEventHandler((ev) => {
-    if (ev.type !== 'keydown' || !ev.ctrlKey || !ev.shiftKey || ev.altKey || ev.metaKey) return true;
-    const taste = ev.key.toLowerCase();
-    if (taste === 'c') {
-      if (t.hasSelection()) {
-        void window.awbBridge.zwischenablageSchreiben(t.getSelection());
-      }
-      ev.preventDefault();
-      return false;
-    }
-    if (taste === 'v') {
-      void window.awbBridge.zwischenablageLesen().then((text) => {
-        if (text) t.paste(text);
-      });
-      ev.preventDefault();
-      return false;
-    }
-    return true;
-  });
-}
-
+// --- Zustand dieses Fensters ------------------------------------------------
 let modell: Model | null = null;
 /** Was die Kopfzeile hergab: bleibt abrufbar, braucht aber keinen Dauerplatz. */
-let auskunft = { session: '-', pane: '-', groesse: '-', regel: '-', layout: '-', ansicht: '-' };
-
+const auskunft = { session: '-', pane: '-', groesse: '-', regel: '-', layout: '-', ansicht: '-' };
 /** Leer heisst: es gibt einen Steuerkanal. Sonst der Grund, warum nicht. */
 let kanalGrund = '';
+/** Welche Projekte im Baum aufgeklappt sind. Neue sind es von Anfang an. */
+const offeneProjekte = new Set<string>();
+/** Ob je ein Projekt zugeklappt wurde -- vorher gilt „alle offen". */
+let baumBeruehrt = false;
+/** Liegt die Uebersicht ueber der Flaeche? Die beiden anderen Ansichten kommen aus der Lage selbst. */
+let uebersichtAn = false;
+
+/**
+ * WELCHE BUEHNE STEHT -- Code oder Agents (08.09.2026, Auftrag macagents; seit
+ * dem 14.09.2026 zeigt Agents die Welten, Auftrag agentsui Nr. 6).
+ *
+ * Eine EIGENE Achse neben `flaechenmodus` (Orchestrator | Worker): der hier
+ * sagt, WAS vorn liegt, jener ordnet die Code-Buehne. Im Zustand Agents legt
+ * welten-view.ts seine Flaeche mit Leiste der Welt, Mitte, Inspektor und
+ * Fusszeile ueber das Fenster; die Pane-Flaeche darunter behaelt ihre Masse.
+ *
+ * Die Wahl gehoert dem Fenster und nicht dem Kern: `ui.json` hat keinen
+ * Schluessel dafuer. Sie ueberlebt den Neustart deshalb nicht -- dieselbe
+ * Entscheidung wie in der Mac-Fassung (Fenster.swift, `Buehnenmodus`).
+ */
+let buehnenmodus: 'code' | 'agents' = 'code';
+
+function modusSetzen(neu: 'code' | 'agents'): void {
+  if (buehnenmodus === neu) return;
+  buehnenmodus = neu;
+  weltenAnzeigen(neu === 'agents');
+  for (const b of modiEl.querySelectorAll<HTMLButtonElement>('[data-modus]')) {
+    const an = b.dataset.modus === neu;
+    b.classList.toggle('gewaehlt', an);
+    b.setAttribute('aria-selected', String(an));
+  }
+  if (modell) { zeichneInhaltskopf(modell); zeichneStreifen(modell); }
+}
+
+/**
+ * WAS DIE FLAECHE ZEIGT -- Orchestrator oder Worker (04.09.2026, des Nutzers
+ * Entscheidung). Beides sind Panes derselben Sitzung, aber sie beantworten
+ * verschiedene Fragen: der Orchestrator ist EIN Pane und fuellt die Flaeche,
+ * ohne dass es etwas zu kacheln gaebe; die Worker sind viele und brauchen
+ * Tabs und den Dreifachschalter. Deshalb bestimmt der Umschalter im
+ * Inhaltskopf, ob der Streifen darunter ueberhaupt dasteht.
+ *
+ * Die Wahl gehoert der SITZUNG und wird in ui.json gemerkt (uistate.ts,
+ * `flaecheSitzung`): wer an einem Projekt am Orchestrator arbeitet und an
+ * einem anderen an den Workern, findet beim Zurueckwechseln das wieder, was er
+ * verlassen hat.
+ */
+type Flaechenmodus = 'orchestrator' | 'worker';
+
+/**
+ * WAS AUF DER FLAECHE LIEGT, SCHLAEGT DIE GEMERKTE WAHL (04.09.2026, im selben
+ * Geist wie Befund 6 der Inventur: der Schalter zeigt keinen Zustand an, den
+ * man gerade nicht sieht).
+ *
+ * Der gemerkte Wert sagt, womit eine Sitzung AUFGEHEN soll; angezeigt wird
+ * aber, was WIRKLICH gezeichnet ist. Ohne diese Ableitung stand der Umschalter
+ * auf „Orchestrator", waehrend drei Worker-Kacheln danebenlagen -- gemessen am
+ * Belegbild vom 04.09., nachdem ein `show-tab` ueber den Steuerkanal kam.
+ */
+let gezeichnetePanes: string[] = [];
+
+function flaechenmodus(m: Model): Flaechenmodus {
+  const s = m.sessions.find((x) => x.id === m.selected);
+  if (s && gezeichnetePanes.length) {
+    const nurOrchestrator = gezeichnetePanes.length === 1
+      && !!s.orchestratorPane && gezeichnetePanes[0] === s.orchestratorPane;
+    return nurOrchestrator ? 'orchestrator' : 'worker';
+  }
+  return gemerkterModus(m, m.selected);
+}
+
+/** Die gemerkte Wahl dieser Sitzung -- womit sie aufgehen soll. */
+function gemerkterModus(m: Model, id: string): Flaechenmodus {
+  return m.ui.flaecheSitzung?.[id] === 'orchestrator' ? 'orchestrator' : 'worker';
+}
+
+/**
+ * LIEGT WENIGSTENS EIN WORKER-PANE AUF DER BUEHNE? (05.09.2026, des Nutzers
+ * Beanstandung am Belegbild `ObenLeiste.png`.)
+ *
+ * Der Tab-Streifen traegt ausschliesslich Dinge, die es nur zu WORKERN gibt:
+ * die Tabs, die Kachelform, den Dreifachschalter und „Ordnen". Liegt der
+ * Orchestrator auf der Buehne, oder hat die Sitzung gar keine Worker, hat er
+ * nichts zu schalten -- und ein Streifen ohne Wirkung nimmt der Buehne 34
+ * Bildpunkte weg, in einer Sitzung mehr als in der anderen. Genau das war zu
+ * sehen: `Studium` mit dem Orchestrator auf der Flaeche hatte einen zweizeiligen
+ * Kopf, `Workbench` im selben Zustand einen einzeiligen.
+ *
+ * GEMESSEN WIRD DIE BUEHNE, nicht die gemerkte Wahl. Die beiden liefen bis
+ * heute auseinander: `Studium` hatte „Worker" gemerkt, gezeichnet war der
+ * Orchestrator. Was man SIEHT, entscheidet -- dieselbe Regel, nach der sich
+ * schon der Umschalter richtet (`flaechenmodus`). Die gemerkte Wahl bleibt
+ * unberuehrt; sie ist das, was der naechste Klick auf „Worker" wiederherstellt.
+ *
+ * GEFRAGT WIRD NACH DEN WORKER-PANES, nicht nach „alles ausser dem
+ * Orchestrator". Beides faellt fast immer zusammen, aber nicht immer: kennt
+ * eine Sitzung ihren Orchestrator-Pane nicht (kein `@wb_role orchestrator` am
+ * Pane), waere jeder gezeichnete Pane ein Worker, und der Streifen stuende
+ * wieder ohne Tabs da. Die Panes der Worker samt ihren Subagenten sind genau
+ * das, was der Streifen in Tabs fasst (`flacheWorker`).
+ */
+function workerAufDerBuehne(m: Model): boolean {
+  const s = m.sessions.find((x) => x.id === m.selected);
+  if (!s) return false;
+  const workerPanes = new Set<string>();
+  for (const w of flacheWorker(s)) {
+    if (w.paneId) workerPanes.add(w.paneId);
+    for (const sub of w.subagents) if (sub.paneId) workerPanes.add(sub.paneId);
+  }
+  for (const sub of s.orphanSubagents) if (sub.paneId) workerPanes.add(sub.paneId);
+  return gezeichnetePanes.some((p) => workerPanes.has(p));
+}
+
+/**
+ * DIE GEMERKTE WAHL EINMAL ANWENDEN, wenn die Sitzung gewechselt hat. Sie ist
+ * eine Vorliebe („in diesem Projekt arbeite ich am Orchestrator"), und eine
+ * Vorliebe wirkt beim Aufgehen, nicht dauernd -- wer danach von Hand einen
+ * Worker zeigt, soll ihn sehen und nicht zurueckgeschoben werden.
+ */
+let modusAngewandtFuer = '';
+
+/** Ist die Sitzungskarte hinter dem Zahnrad gerade offen? */
+let sitzungskarteAuf = false;
+/**
+ * Fuer WELCHE tote Sitzung die Rueckfrage vor dem Wiederbeleben offen steht --
+ * leer heisst: fuer keine. Sie haengt an der Kennung und nicht an einem
+ * Merkmal der Zeile, damit sie das Neuzeichnen im Takt uebersteht.
+ */
+let wiederFrage = '';
+/** Welche Freigabe die Leiste gerade zeigt, und ob ihre Begruendung aufgeklappt ist. */
+let freigabeNr = 0;
+let begruendungAuf = false;
+let freigabenStand: FreigabenNutzlast = { requests: [], guardBlocks: [] };
+/**
+ * Wieviele Neuzeichnungen der Leisten ueber jede der drei Quellen kamen. Ein
+ * Test liest den Stand zweimal im Abstand einer festen Zeitspanne und bildet
+ * die Differenz -- so wird "wie oft in zehn Sekunden" zur Messung statt zur
+ * Vermutung (test-app-rechts-takt.sh).
+ */
+const rechtsZaehler = { model: 0, layout: 0, session: 0 };
 
 let notizUhr: number | undefined;
-
-/** Kurze Rueckmeldung ueber der Buehne. Verschwindet von selbst wieder. */
-function notiz(text: string): void {
+/**
+ * Kurze Rueckmeldung ueber der Flaeche. Verschwindet von selbst wieder --
+ * nach vier Sekunden, oder nach `dauerMs`, wenn der Absender es so will
+ * (der Absturz-Hinweis, main/absturz.ts: 30 s). Eine Meldung, die laenger
+ * steht, geht auch mit dem naechsten Klick irgendwo im Fenster.
+ */
+function notiz(text: string, dauerMs = 4000): void {
   if (notizUhr !== undefined) clearTimeout(notizUhr);
+  document.removeEventListener('click', notizWeg, true);
   notizEl.textContent = text;
   notizEl.classList.toggle('sichtbar', !!text);
   if (text) {
-    notizUhr = setTimeout(() => {
-      notizEl.classList.remove('sichtbar');
-      notizEl.textContent = '';
-    }, 4000) as unknown as number;
+    notizUhr = setTimeout(notizWeg, dauerMs) as unknown as number;
+    if (dauerMs > 4000) document.addEventListener('click', notizWeg, true);
   }
 }
-
-/** Zwei Zeichen aus einem Namen, so wie die Sessions links ihre tragen. */
-function kuerzel(name: string): string {
-  const teile = name.split(/[-_. ]+/).filter(Boolean);
-  if (teile.length >= 2) return (teile[0][0] + teile[1][0]).toUpperCase();
-  return (name.slice(0, 2) || '?').toUpperCase();
+function notizWeg(): void {
+  if (notizUhr !== undefined) clearTimeout(notizUhr);
+  notizUhr = undefined;
+  document.removeEventListener('click', notizWeg, true);
+  notizEl.classList.remove('sichtbar');
+  notizEl.textContent = '';
 }
 
+/**
+ * Die Zustandsklasse einer SITZUNG. Die Namen sind die des Farbsystems
+ * (main/thema.ts): `laeuft`, `will`, `fern`, `aus` -- vier Rollen, vier
+ * Farben, und dieselbe Bedeutung in allen fuenf Fenstern.
+ */
 function farbklasse(zustand: string): string {
   if (zustand === 'running') return 'laeuft';
   if (zustand === 'attention') return 'will';
@@ -585,649 +465,1839 @@ function startfarbe(s: Session): string {
   return s.startet ? 'will' : farbklasse(s.state);
 }
 
-/** Schmal, mittel oder breit -- was ein Eintrag zeigt, haengt an der Breite. */
-function breitenmodus(w: number): 'schmal' | 'mittel' | 'breit' {
-  if (w <= 64) return 'schmal';
-  if (w <= 200) return 'mittel';
-  return 'breit';
+/** Die Zustandsklasse eines WORKERS. */
+function zustandFarbe(state: string): string {
+  if (state === 'running') return 'laeuft';
+  if (state === 'blocked') return 'will';
+  if (state === 'stalled') return 'will';
+  if (state === 'unknown') return 'fern';
+  return 'ruhig';
+}
+
+/** Schmal oder aufgezogen -- was eine Leiste zeigt, haengt an ihrer Breite. */
+function schmalLinks(w: number): boolean { return w <= 64; }
+
+/** Welches Blatt beim letzten Zeichnen offen stand -- fuer das Nachziehen der Buehne. */
+let zuletztOffenesBlatt = '';
+/**
+ * Welches Blatt zuletzt gelesen wurde. Der Schalter oben rechts oeffnet es
+ * wieder -- wer die Aktivitaet zugeklappt hat, bekommt beim naechsten Griff
+ * die Aktivitaet und nicht wieder den Ordner (Electron-Befund 1).
+ */
+let letztesBlatt = 'ordner';
+
+/**
+ * KEIN WORT WIRD HALB ABGESCHNITTEN (04.09.2026, Befund des Nutzers am
+ * Belegbild: „Aktivi…", „Proto…").
+ *
+ * Vorher stand hier eine feste Zahl -- unter 230 Bildpunkten Symbol allein,
+ * darueber Wort. Eine feste Zahl ist bei uebersetzten Aufschriften immer
+ * falsch: „Protokolle" und „Logs" brauchen nicht dieselbe Breite, und wer die
+ * Zahl fuer die eine Sprache richtig waehlt, hat sie fuer die andere geraten.
+ *
+ * Gemessen wird deshalb am gezeichneten Element. Passt auch nur EINE der drei
+ * Aufschriften nicht ganz, faellt die ganze Reihe auf ihre Symbole zurueck --
+ * drei Symbole nebeneinander sind eine Reihe, zwei Woerter und ein Stummel
+ * sind keine. Das Wort steht dann im Hilfeschildchen.
+ *
+ * Gemessen wird nur, wenn sich die Breite geaendert hat: die Messung erzwingt
+ * einen Umbruch, und `zeichneInspektor` laeuft in jedem Modelltakt.
+ */
+let reiterGemessenBei = -1;
+
+function reiterAufschriftPruefen(breite: number): void {
+  if (breite === reiterGemessenBei) return;
+  reiterGemessenBei = breite;
+  rechtsEl.classList.remove('nur-symbole');
+  const aufschriften = [...rechtsEl.querySelectorAll<HTMLElement>('.insp-reiter .beschriftung')];
+  // Ein verborgener Inspektor misst 0 gegen 0 und gilt damit als passend --
+  // richtig so: gemessen wird erst wieder, wenn er wirklich dasteht.
+  const passt = aufschriften.every((el) => el.scrollWidth <= el.clientWidth + 1);
+  rechtsEl.classList.toggle('nur-symbole', !passt);
+}
+
+function dauer(sekunden: number): string {
+  if (!Number.isFinite(sekunden) || sekunden < 0) return '';
+  const min = Math.floor(sekunden / 60);
+  if (min < 1) return t('zeit.geradeEben');
+  if (min < 60) return t('zeit.minuten', { n: min });
+  return t('zeit.stundenMinuten', { std: Math.floor(min / 60), min: min % 60 });
+}
+
+/** Was ein Worker gerade tut, in einem halben Satz. */
+function zustandText(w: Worker): string {
+  if (w.state === 'blocked') {
+    return w.blockedReason === 'guard' ? t('worker.guard') : t('worker.entscheidung');
+  }
+  if (w.state === 'stalled') return t('worker.haengt', { dauer: dauer(w.idleSeconds) });
+  if (w.state === 'unknown') return t('worker.nichtEinsehbar');
+  if (w.state === 'done') return w.resultPath ? t('worker.fertigMitErgebnis') : t('worker.fertigOhneErgebnis');
+  if (w.contextPercent >= 0) return t('worker.kontext', { prozent: w.contextPercent });
+  return t('worker.laeuftSchlicht');
+}
+
+/** Tokenstand eines Workers, kompakt -- leer, solange keiner bekannt ist. */
+function tokenKurz(w: Worker): string {
+  if (!w.contextTokens) return '';
+  if (w.contextTokens >= 1_000_000) return `${(w.contextTokens / 1_000_000).toFixed(1)}M`;
+  if (w.contextTokens >= 1000) return `${Math.round(w.contextTokens / 1000)}k`;
+  return String(w.contextTokens);
+}
+
+function svg(inhalt: string, groesse = 12, strich = 1.4): SVGSVGElement {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  el.setAttribute('width', String(groesse));
+  el.setAttribute('height', String(groesse));
+  el.setAttribute('viewBox', '0 0 16 16');
+  el.setAttribute('fill', 'none');
+  el.setAttribute('stroke', 'currentColor');
+  el.setAttribute('stroke-width', String(strich));
+  el.setAttribute('stroke-linecap', 'round');
+  el.setAttribute('stroke-linejoin', 'round');
+  el.innerHTML = inhalt;
+  return el;
 }
 
 /**
- * DIE SESSIONLEISTE -- EINE Liste fuer beide Sorten (Punkt 4, alice am
- * 12.08.: „die session soll links nicht anders behandelt werden als die
- * terminal sessions, das sortieren sollte nicht ansichtsabhaengig sein").
+ * DAS SYMBOL EINER ZEILE (04.09.2026, Regel 7 des Auftrags). Jede Zeile mit
+ * Bedeutung traegt einen gezeichneten Umriss von 16 Bildpunkten in der
+ * gedaempften Schrift -- Ordner fuer ein Projekt, Terminal fuer eine
+ * Orchestrator-Sitzung, Sprechblase fuer eine Chat-Sitzung. Inline gezeichnet,
+ * kein Emoji, keine Symbolschrift; in der aktiven Zeile faerbt es die Regel in
+ * werkbank.css auf den Akzent um.
  *
- * Bis heute standen die Chat-Sitzungen in einem eigenen Abschnitt darunter,
- * hinter einem Trenner, und wurden nach einer eigenen Regel sortiert. Jetzt
- * kommt die Reihenfolge fertig aus dem Hauptprozess (`m.leiste`), gebaut mit
- * genau der Funktion, die die Terminal-Sitzungen schon sortiert hat -- und was
- * die Zeilen unterscheidet, ist allein das Sprechblasen-Kennzeichen.
- *
- * Der Rueckfall ohne `m.leiste` (aeltere Fassung des Hauptprozesses) stellt die
- * alte Ordnung her, statt die Chat-Sitzungen unsichtbar zu machen.
+ * Der ZUSTANDSPUNKT daneben bleibt: er sagt, wie es der Zeile geht, das Symbol
+ * sagt, was sie ist. Zwei Fragen, zwei Zeichen.
  */
-function zeichneSessions(m: Model): void {
-  const modus = breitenmodus(m.ui.sidebarWidth);
-  linksEl.classList.toggle('schmal', modus === 'schmal');
-  linksEl.style.width = `${m.ui.sidebarWidth}px`;
-  sessionsEl.replaceChildren();
+/**
+ * DAS KUERZEL EINER ZEILE (Befund 7 der Inventur). Eingeklappt blieb von jeder
+ * Zeile nur ihr Punkt -- bei drei laufenden Sitzungen dreimal derselbe, und
+ * damit keine Auskunft mehr darueber, WELCHE Sitzung welche ist. Der alte
+ * Stand trug dort zwei Buchstaben in der Zustandsfarbe; sie kommen zurueck.
+ *
+ * Sichtbar sind sie NUR in der eingeklappten Leiste (werkbank.css); aufgezogen
+ * steht der Name da, und dann waeren sie dieselbe Auskunft zweimal.
+ */
+function kuerzelMarke(quelle: string, farbe: string): HTMLSpanElement {
+  const el = document.createElement('span');
+  el.className = `kuerzel ${farbe}`;
+  el.textContent = kuerzelAus(quelle);
+  return el;
+}
 
-  const chats = m.chats ?? [];
-  const nachId = new Map(m.sessions.map((s) => [s.id, s]));
-  const chatNachId = new Map(chats.map((c) => [c.id, c]));
-  const reihenfolge = m.leiste ?? [
-    ...m.sessions.map((s) => ({ art: 'terminal' as const, id: s.id })),
-    ...chats.map((c) => ({ art: 'chat' as const, id: c.id })),
-  ];
+/**
+ * Zwei Buchstaben aus einem Namen. `initials` aus dem Modell wird bevorzugt --
+ * es kommt aus derselben Ableitung, die auch die alte Oberflaeche benutzte --,
+ * und fehlt es, entstehen sie hier aus den ersten Zeichen der Wortanfaenge.
+ */
+function kuerzelAus(quelle: string): string {
+  const roh = (quelle ?? '').trim();
+  if (roh.length <= 2) return roh.toUpperCase();
+  const woerter = roh.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  if (woerter.length >= 2) return (woerter[0][0] + woerter[1][0]).toUpperCase();
+  return roh.slice(0, 2).toUpperCase();
+}
 
-  for (const eintrag of reihenfolge) {
-    if (eintrag.art === 'chat') {
-      const c = chatNachId.get(eintrag.id);
-      if (c) sessionsEl.appendChild(chatZeile(c, m, modus));
-      continue;
+/**
+ * DIE ZUSATZZEILE UNTER DEM NAMEN (Befund 8). Sie sagt, auf welcher Maschine
+ * die Sitzung laeuft und wie viele Worker sie hat -- und waehrend eines Starts
+ * stattdessen, dass gestartet wird oder dass der Start gescheitert ist.
+ *
+ * Erst ab 200 Bildpunkten Leistenbreite: darunter verdraengte sie den Namen,
+ * um dessentwillen die Leiste ueberhaupt aufgezogen wird. Dieselbe Schwelle
+ * wie im alten Stand.
+ */
+const ZUSATZ_AB = 200;
+
+/**
+ * DIE WICHTIGE HAELFTE STEHT VORN. Die Zeile kuerzt von rechts mit
+ * Auslassungspunkten, und ein Rechnername ist lang: stand er vorn, blieb bei
+ * 232 Bildpunkten „MacBook-Pro-von-alice…" stehen und die Worker-Zahl fiel
+ * weg -- gemessen am Belegbild vom 04.09. Also erst die Zahl, dann die
+ * Maschine; beides steht da, und was zuerst weicht, ist das, was man am
+ * ehesten schon weiss.
+ */
+
+/**
+ * DIE UNTERZEILE SAGT, WAS DIESE ZEILE VON DEN ANDEREN UNTERSCHEIDET
+ * (05.09.2026, Electron-Befund 3 und Regelbruch 10).
+ *
+ * Sie trug bis heute an JEDER Zeile „n Worker · MacBook-Pro-von-alice". Der
+ * Maschinenname war damit in jeder Zeile derselbe, kostete bei 232 Bildpunkten
+ * Leistenbreite die ganze verfuegbare Breite und wurde trotzdem abgeschnitten.
+ * Er steht deshalb nur noch da, wo er wirklich etwas unterscheidet: auf einer
+ * FREMDEN Maschine. Auf der eigenen traegt die Zeile nur ihre Worker-Zahl.
+ *
+ * Und eine VERLORENE Sitzung sagt jetzt, dass sie verloren ist. Vorher trug sie
+ * dieselbe Unterzeile wie eine gestoppte („0 Worker · …"), und die gelbe
+ * Schrift war der einzige Unterschied -- eine Auskunft, die ohne Farbe nicht
+ * mehr da ist. Ihre Worker-Zahl ist ohnehin null, also nimmt der Satz nichts weg.
+ */
+function zusatzzeile(s: Session, m: Model): string {
+  if (m.ui.sidebarWidth < ZUSATZ_AB) return '';
+  const fremd = Boolean(s.machine) && s.machine !== m.machine;
+  if (s.verloren) return t('sitzung.verlorenKurz');
+  if (s.startFehler) {
+    return fremd ? t('sitzung.startFehlerKurzFremd', { maschine: s.machine }) : t('sitzung.startFehlerKurz');
+  }
+  if (s.startet) {
+    return fremd ? t('sitzung.startetKurzFremd', { maschine: s.machine }) : t('sitzung.startetKurz');
+  }
+  const n = s.workers.filter((w) => w.alive).length;
+  return fremd ? t('sitzung.workerZahlFremd', { maschine: s.machine, n }) : t('sitzung.workerZahl', { n });
+}
+
+function zeilensymbol(art: 'projekt' | 'sitzung' | 'chat'): HTMLSpanElement {
+  const pfad = art === 'projekt'
+    ? '<path d="M1.9 12.4V3.6h4l1.4 1.7h6.8v7.1z"/>'
+    : art === 'chat'
+      ? '<path d="M2.6 4.2a1.6 1.6 0 011.6-1.6h7.6a1.6 1.6 0 011.6 1.6v4.6a1.6 1.6 0 01-1.6 1.6H6.4L3.4 13V10.4h-.8z"/>'
+      : '<rect x="1.8" y="2.9" width="12.4" height="10.2" rx="2"/><path d="M4.6 6.6l2 1.7-2 1.7M8.4 10.4h3"/>';
+  const el = document.createElement('span');
+  el.className = 'zeilensymbol';
+  el.appendChild(svg(pfad, 16, 1.3));
+  return el;
+}
+
+function punkt(klasse: string): HTMLSpanElement {
+  const el = document.createElement('span');
+  el.className = `punkt ${klasse}`;
+  return el;
+}
+
+// --- Projekt, Orchestrator, Maschine ----------------------------------------
+/**
+ * WOHER DER BAUM SEINE DREI EBENEN NIMMT (gemessen 03.09., vor dem Bau).
+ *
+ * Nachgesehen wurde in `awb:model` (main.ts), in der Zustandsdatei einer
+ * Sitzung (main/sessions.ts, `SessionInfo`) und in `wb-rolle`. Ergebnis: alles
+ * Noetige ist schon da, es war nur nie so gelesen worden.
+ *
+ *   Projekt        `session.dir` -- das Verzeichnis, in dem die Sitzung laeuft.
+ *                  Sein letzter Teil ist der Name. Mehrere Orchestrator im
+ *                  selben Verzeichnis sind der Normalfall, auch auf
+ *                  verschiedenen Maschinen; sie landen deshalb unter DEMSELBEN
+ *                  Knoten, und der Knoten heisst nach dem Verzeichnis.
+ *   Orchestrator   die Sitzung selbst. Jede hiesige Sitzung HAT einen
+ *                  Orchestrator-Pane (`orchestratorPane`, gesetzt ueber
+ *                  `wb-rolle setzen <pane> orchestrator`); ihre Worker haengen
+ *                  darunter und erscheinen im Baum nicht.
+ *   Maschine       `session.machine`.
+ *
+ * Ergaenzt werden musste im Hauptprozess deshalb NUR die Maschinenliste selbst
+ * (`maschinen` in `awb:model`) -- fuer die Statusleiste, die eine Maschine auch
+ * dann nennen soll, wenn gerade keine Sitzung auf ihr laeuft.
+ */
+type Chat = NonNullable<Model['chats']>[number];
+
+/**
+ * EINE ZEILE DES BAUMS -- Terminal-Sitzung ODER Chat-Sitzung (04.09.2026,
+ * Befund 5 der Inventur). Vorgabe des Nutzers vom 12.08. lautet: „die session
+ * soll links nicht anders behandelt werden als die terminal sessions". Der
+ * Kommentar im Baum versprach das schon, der Code sammelte die Chats in einen
+ * eigenen Kasten hinter alle Projekte -- eine Chat-Sitzung im Ordner `beta`
+ * stand also nicht unter `beta`, sondern als letzte Zeile ganz unten.
+ *
+ * Jetzt tragen beide Sorten dieselbe Form: eine Kennung, einen Ordner und ihre
+ * Nutzlast. Wo sie stehen, entscheidet allein der Ordner, in welcher
+ * Reihenfolge allein `m.leiste` -- dieselbe, die der Hauptprozess EINMAL fuer
+ * beide Sorten sortiert.
+ */
+type Baumzeile =
+  | { art: 'terminal'; id: string; ordner: string; sitzung: Session }
+  | { art: 'chat'; id: string; ordner: string; chat: Chat };
+
+interface Projektknoten { id: string; name: string; pfad: string; zeilen: Baumzeile[] }
+
+function projektName(pfad: string): string {
+  const teile = pfad.split('/').filter(Boolean);
+  return teile[teile.length - 1] || pfad || '?';
+}
+
+function projekte(m: Model): Projektknoten[] {
+  const nachPfad = new Map<string, Projektknoten>();
+  const sitzungen = new Map(m.sessions.map((x) => [x.id, x]));
+  const chats = new Map((m.chats ?? []).map((c) => [c.id, c]));
+  // Die Reihenfolge kommt aus `m.leiste`: der Hauptprozess sortiert EINMAL,
+  // mit derselben Funktion und derselben Voreinstellung fuer beide Sorten.
+  // Ein Projekt steht dort, wo seine erste Zeile steht.
+  const reihenfolge: { art: 'terminal' | 'chat'; id: string }[] = m.leiste
+    ?? m.sessions.map((x) => ({ art: 'terminal' as const, id: x.id }));
+  for (const e of reihenfolge) {
+    let zeile: Baumzeile | null = null;
+    if (e.art === 'chat') {
+      const c = chats.get(e.id);
+      if (c) zeile = { art: 'chat', id: c.id, ordner: c.ordner || '?', chat: c };
+    } else {
+      const x = sitzungen.get(e.id);
+      if (x) zeile = { art: 'terminal', id: x.id, ordner: x.dir || '?', sitzung: x };
     }
-    const s = nachId.get(eintrag.id);
-    if (s) sessionsEl.appendChild(terminalZeile(s, m, modus));
+    if (!zeile) continue;
+    let knoten = nachPfad.get(zeile.ordner);
+    if (!knoten) {
+      knoten = { id: zeile.ordner, name: projektName(zeile.ordner), pfad: zeile.ordner, zeilen: [] };
+      nachPfad.set(zeile.ordner, knoten);
+    }
+    knoten.zeilen.push(zeile);
+  }
+  return [...nachPfad.values()];
+}
+
+/**
+ * WAS LIEGT AUF DER BUEHNE? (04.09.2026, Befund 6 der Inventur.)
+ *
+ * Gewaehlt heisst: das siehst Du gerade. Bis heute prueften beide Zeilenarten
+ * nur ihre eigene Haelfte -- eine Terminal-Zeile `s.id === m.selected`, eine
+ * Chat-Zeile `c.id === m.chatGezeigt` --, und mit einem Gespraech auf der
+ * Buehne waren deshalb ZWEI Zeilen hervorgehoben. Die Titelleiste beschrieb
+ * dabei die Terminal-Sitzung und der Dreifachschalter stand auf „Gezoomt";
+ * beides sagte etwas ueber eine Flaeche, die gerade niemand sah.
+ *
+ * Es gibt genau drei Faelle, und `buehne()` gibt zurueck, welcher gilt:
+ *   'chat'      ein Gespraech liegt auf der Buehne (`chatGezeigt`)
+ *   'werkstatt' ein WORKER einer Chat-Sitzung liegt darauf (`chatWerkstattGezeigt`)
+ *   'terminal'  die Kacheln der gewaehlten Terminal-Sitzung
+ */
+function buehneZeigt(m: Model): { art: 'chat' | 'werkstatt' | 'terminal'; chatId: string } {
+  const chat = m.chatGezeigt ?? '';
+  if (chat) return { art: 'chat', chatId: chat };
+  const werkstatt = m.chatWerkstattGezeigt ?? '';
+  if (werkstatt) return { art: 'werkstatt', chatId: werkstatt };
+  return { art: 'terminal', chatId: '' };
+}
+
+/** Wartet in dieser Sitzung etwas auf einen Menschen? */
+function sitzungWartet(s: Session): boolean {
+  return s.state === 'attention' || s.pendingApprovals > 0 || s.workers.some((w) => w.state === 'blocked');
+}
+
+// --- Titelleiste ------------------------------------------------------------
+function zeichneKopf(m: Model): void {
+  // DIE TITELLEISTE BESCHREIBT, WAS AUF DER BUEHNE LIEGT (04.09., Befund 6).
+  // Liegt dort ein Gespraech, stand hier bis heute weiter die zuletzt
+  // gewaehlte Terminal-Sitzung -- ein Satz ueber etwas, das gerade niemand
+  // sieht.
+  const b = buehneZeigt(m);
+  if (b.art !== 'terminal') {
+    const c = (m.chats ?? []).find((x) => x.id === b.chatId);
+    if (c) {
+      kPunktEl.className = `punkt ${c.laeuft ? 'laeuft' : 'ruhig'}`;
+      kProjektEl.textContent = projektName(c.ordner);
+      kProjektEl.title = c.ordner;
+      kopfNameSetzen(projektName(c.ordner), c.name);
+      // Ein Gespraech laeuft immer hier: keine fremde Maschine, also nichts
+      // daneben (05.09.2026, Regelbruch 4).
+      kNebenEl.textContent = '';
+      return;
+    }
+  }
+  const s = m.sessions.find((x) => x.id === m.selected);
+  // Der Schraegstrich trennt Projekt und Orchestrator -- ohne Sitzung gibt es
+  // nichts zu trennen, und er stand als einzelnes Zeichen hinter dem Satz
+  // „Keine Sitzung gewaehlt" (gemessen am ersten Blick, 03.09.).
+  if (!s) {
+    kTeilerEl.hidden = true;
+    kPunktEl.className = 'punkt ruhig';
+    kProjektEl.textContent = t('kopf.keineSitzung');
+    kOrchEl.textContent = '';
+    kNebenEl.textContent = '';
+    return;
+  }
+  kPunktEl.className = `punkt ${startfarbe(s)}`;
+  kProjektEl.textContent = projektName(s.dir);
+  kopfNameSetzen(projektName(s.dir), s.name);
+  // NUR DIE FREMDE MASCHINE, UND KEIN ZUSTANDSWORT (05.09.2026, Regelbruch 4).
+  //
+  // Hier standen Maschinenname und Zustand als Wort. Beides steht schon
+  // anderswo -- der Zustand als Farbe im Punkt links daneben, in der Pille des
+  // Inhaltskopfes und in der Statusleiste, die Maschine im Inhaltskopf und in
+  // der Sitzungskarte. Bei schmalem Fenster kostete es genau den Platz, den der
+  // Titel brauchte: der Text endete bei x = 434, das Segment begann bei x = 436,
+  // und „MacBook-Pro-…" stand abgeschnitten da.
+  //
+  // Was BLEIBT, ist die Maschine, wenn sie nicht die eigene ist. Sie
+  // unterscheidet dann etwas, und genau dafuer ist der Platz da.
+  kNebenEl.textContent = s.machine && s.machine !== m.machine ? s.machine : '';
+  kProjektEl.title = s.dir;
+}
+
+/**
+ * PROJEKT UND SITZUNG, ABER KEINE ZWEIMAL (05.09.2026, Kleinigkeit 1).
+ *
+ * Der Normalfall im Haus ist eine Sitzung, die nach ihrem Projekt heisst --
+ * dann stand oben „claude-workbench / claude-workbench", und der Schraegstrich
+ * trennte einen Namen von sich selbst. Steht dort zweimal dasselbe, bleibt es
+ * bei einem; sonst bleibt beides samt Trenner.
+ */
+function kopfNameSetzen(projekt: string, sitzung: string): void {
+  const doppelt = projekt === sitzung;
+  kTeilerEl.hidden = doppelt;
+  kOrchEl.textContent = doppelt ? '' : sitzung;
+}
+
+// --- Freigabeleiste ---------------------------------------------------------
+/**
+ * WARUM DIE FREIGABEN OBEN STEHEN UND NICHT IM INSPEKTOR (alice am 03.09.:
+ * „Ich will immer sehen, wenn eine Freigabe angefordert wird."). Etwas, das
+ * immer sichtbar sein soll, kann nicht in einer Leiste liegen, die man
+ * zuklappen kann und die ohnehin nur eines von drei Blaettern zeigt. Die
+ * Leiste hier liegt quer ueber der ganzen Breite und zeigt JEDE offene
+ * Freigabe des Programms, nicht nur die des gewaehlten Projekts.
+ *
+ * OHNE BEGRUENDUNG (sein zweiter Satz: „ich keinen Grund angeben muss").
+ * Zwei Knoepfe, mehr nicht. Wer eine hinterlassen will, klappt sie auf; der
+ * Satz darunter sagt, dass sie freiwillig ist und dass die Entscheidung sofort
+ * an den Worker zurueckgeht -- den Rueckkanal gibt es seit dd756d2
+ * (shell/wb-freigabe).
+ */
+interface OffeneFreigabe {
+  art: 'guard' | 'antrag';
+  wer: string;
+  wo: string;
+  worum: string;
+  sessionId: string;
+  pane: string;
+  schluessel: string;
+  pfad: string;
+}
+
+function offeneFreigaben(): OffeneFreigabe[] {
+  const raus: OffeneFreigabe[] = [];
+  for (const b of freigabenStand.guardBlocks) {
+    // Nur die mittlere Stufe wartet auf eine Entscheidung; eine harte
+    // Ablehnung ist keine Frage, sondern ein Befund.
+    if (!b.wartet) continue;
+    raus.push({
+      art: 'guard',
+      wer: b.workerName || b.pane,
+      wo: `${b.sessionName || b.sessionId} · ${b.machine}`,
+      worum: b.command,
+      sessionId: b.sessionId,
+      pane: b.pane,
+      schluessel: b.schluessel,
+      pfad: b.path,
+    });
+  }
+  for (const r of freigabenStand.requests) {
+    raus.push({
+      art: 'antrag',
+      wer: r.parent,
+      // DER PROJEKTNAME, NICHT DER VOLLPFAD (05.09.2026, Electron-Befund 2).
+      // Derselbe Pfad stand bis zu fuenfmal im Fenster; voll steht er noch in
+      // der Sitzungskarte, hier reicht der Name des Ordners.
+      wo: projektName(r.dir),
+      worum: t('freigabe.antragUeber', { name: r.childName, modell: r.childModel }),
+      sessionId: '',
+      pane: '',
+      schluessel: '',
+      pfad: r.path,
+    });
+  }
+  return raus;
+}
+
+function entscheiden(f: OffeneFreigabe, aktion: 'approve' | 'reject', grund: string, echt: boolean): void {
+  if (f.art === 'guard') {
+    window.awbBridge.bedienung('muster-entscheiden', {
+      schluessel: f.schluessel, action: aktion, reason: grund, echt,
+    });
+  } else {
+    window.awbBridge.bedienung('freigaben-entscheiden', { path: f.pfad, action: aktion, reason: grund });
+  }
+  notiz(aktion === 'approve' ? t('freigabe.erteilt', { name: f.wer }) : t('freigabe.abgelehnt', { name: f.wer }));
+}
+
+function zeichneFreigaben(): void {
+  const liste = offeneFreigaben();
+  freigabeleisteEl.replaceChildren();
+  // DAS ABZEICHEN VERSCHWINDET NIE (04.09.2026, Befund 2 der Inventur).
+  //
+  // Es war der EINZIGE Weg zum Freigabenblatt, und `hidden = liste.length === 0`
+  // nahm ihn weg, sobald nichts mehr wartete. Damit war der ganze Posteingang
+  // unerreichbar -- offene Antraege, angehaltene Worker UND der Verlauf der
+  // Entscheidungen. Wer nachsehen wollte, was er gestern freigegeben hat,
+  // hatte keine Flaeche dafuer.
+  //
+  // Jetzt steht es immer da und zeigt immer die Zahl: bei null gedaempft und
+  // ohne Farbe, ab eins in der Wartefarbe. Das ist dasselbe, was alice am
+  // Vorbild unterstrichen hat -- „0 working" steht dort auch dann, wenn nichts
+  // laeuft. Ein Element, das nur erscheint, wenn etwas los ist, kann man nicht
+  // suchen lernen.
+  abzeichenEl.hidden = false;
+  abzeichenEl.classList.toggle('leer', liste.length === 0);
+  abzeichenEl.querySelector('.zahl')!.textContent = String(liste.length);
+  if (!liste.length) return;
+  if (freigabeNr >= liste.length) freigabeNr = 0;
+  const f = liste[freigabeNr];
+
+  const zeile = document.createElement('div');
+  zeile.className = 'fr-zeile';
+
+  const marke = document.createElement('span');
+  marke.className = 'fr-marke';
+  marke.appendChild(svg('<path d="M8 2.2l5.9 10.3H2.1z"/><path d="M8 6.4v2.8M8 10.9v.1"/>', 15, 1.5));
+  zeile.appendChild(marke);
+
+  // EINE ZEILE, OHNE PFAD (05.09.2026, Regelbruch 8). Die Leiste trug den
+  // vollen Ordnerpfad des Antrags, umgebrochen auf zwei bis drei Zeilen, und
+  // schob beim Eintreffen eines Antrags das ganze Fenster um 50 (breit) bis
+  // 67 (schmal) Bildpunkte nach unten. Jetzt steht dort, was der Mensch
+  // wirklich entscheiden muss -- wer wartet, worauf --, in einer Zeile mit
+  // Auslassungszeichen. Wo genau, sagt das Blatt dahinter.
+  const text = document.createElement('div');
+  text.className = 'fr-text';
+  const wer = document.createElement('b');
+  wer.className = 'fr-wer';
+  wer.textContent = f.wer;
+  const leise = document.createElement('span');
+  leise.className = 'leise';
+  leise.textContent = ` ${t('freigabe.wartetAufDich')} · ${f.worum}`;
+  text.append(wer, leise);
+  text.title = `${f.wer} · ${f.wo}\n${f.worum}`;
+  zeile.appendChild(text);
+
+  const mehr = document.createElement('button');
+  mehr.className = 'fr-mehr';
+  // Eine Kennung, damit der Steuerkanal ihn anklicken kann (`awb-ctl klick
+  // freigabe-mehr`) -- die Belegbilder zeigen sonst nie, dass die Begruendung
+  // aufklappt und freiwillig ist.
+  mehr.id = 'freigabe-mehr';
+  mehr.setAttribute('aria-expanded', String(begruendungAuf));
+  const pfeil = svg('<path d="M5.5 3.5L10.5 8l-5 4.5"/>', 11, 1.6);
+  pfeil.classList.add('pfeil');
+  mehr.append(pfeil, document.createTextNode(t('freigabe.begruendung')));
+  mehr.addEventListener('click', () => { begruendungAuf = !begruendungAuf; zeichneFreigaben(); });
+  zeile.appendChild(mehr);
+
+  const knoepfe = document.createElement('div');
+  knoepfe.className = 'fr-knoepfe';
+  const feld = document.createElement('input');
+  feld.type = 'text';
+  feld.className = 'fr-grund';
+  const ja = document.createElement('button');
+  ja.className = 'knopf-voll';
+  ja.textContent = t('freigabe.freigeben');
+  ja.addEventListener('click', (e) => entscheiden(f, 'approve', feld.value.trim(), e.isTrusted));
+  const nein = document.createElement('button');
+  nein.className = 'knopf-rand';
+  nein.textContent = t('freigabe.ablehnen');
+  nein.addEventListener('click', (e) => entscheiden(f, 'reject', feld.value.trim(), e.isTrusted));
+  knoepfe.append(ja, nein);
+  zeile.appendChild(knoepfe);
+
+  if (liste.length > 1) {
+    const blaettern = document.createElement('div');
+    blaettern.className = 'fr-blaettern';
+    const zurueck = document.createElement('button');
+    zurueck.appendChild(svg('<path d="M10 3.5L5.5 8l4.5 4.5"/>', 11, 1.7));
+    zurueck.title = t('freigabe.vorige');
+    zurueck.addEventListener('click', () => { freigabeNr = (freigabeNr - 1 + liste.length) % liste.length; zeichneFreigaben(); });
+    const zaehlung = document.createElement('span');
+    zaehlung.className = 'fr-zaehlung';
+    zaehlung.textContent = t('freigabe.vonN', { i: freigabeNr + 1, n: liste.length });
+    const vor = document.createElement('button');
+    vor.appendChild(svg('<path d="M6 3.5L10.5 8 6 12.5"/>', 11, 1.7));
+    vor.title = t('freigabe.naechste');
+    vor.addEventListener('click', () => { freigabeNr = (freigabeNr + 1) % liste.length; zeichneFreigaben(); });
+    blaettern.append(zurueck, zaehlung, vor);
+    zeile.appendChild(blaettern);
+  }
+
+  if (f.pane) {
+    const hin = document.createElement('button');
+    hin.className = 'knopf-schlicht';
+    hin.title = t('freigabe.hinspringen');
+    hin.appendChild(svg('<path d="M6.5 3h6.2v6.2M12.7 3L7 8.7"/><path d="M12.2 10.8v1.7a.9.9 0 01-.9.9H3.8a.9.9 0 01-.9-.9V4.9a.9.9 0 01.9-.9h1.7"/>', 14, 1.4));
+    hin.addEventListener('click', () => {
+      if (f.sessionId) window.awbBridge.bedienung('select', f.sessionId);
+      window.awbBridge.bedienung('show-pane', f.pane);
+      uebersichtAn = false;
+    });
+    zeile.appendChild(hin);
+  }
+
+  freigabeleisteEl.appendChild(zeile);
+
+  if (begruendungAuf) {
+    const kasten = document.createElement('div');
+    kasten.className = 'fr-begruendung';
+    feld.placeholder = t('freigabe.begruendungPlatzhalter');
+    const hinweis = document.createElement('div');
+    hinweis.className = 'fr-hinweis';
+    hinweis.textContent = t('freigabe.begruendungHinweis');
+    kasten.append(feld, hinweis);
+    freigabeleisteEl.appendChild(kasten);
+    feld.focus();
   }
 }
 
+abzeichenEl.addEventListener('click', () => {
+  // DAS BLATT GEHT IMMER AUF -- das besorgt freigaben-view.ts an demselben
+  // Knopf (`data-tot="freigaben"`). Hier kommt nur dazu, was es zu springen
+  // gibt: wartet wirklich etwas, landet der Klick beim Worker, der wartet.
+  // Wartet nichts, bleibt es beim Blatt, und dort steht der Verlauf.
+  const liste = offeneFreigaben();
+  if (!liste.length) return;
+  const f = liste[freigabeNr] ?? liste[0];
+  if (f.sessionId) window.awbBridge.bedienung('select', f.sessionId);
+  if (f.pane) window.awbBridge.bedienung('show-pane', f.pane);
+  uebersichtAn = false;
+});
+
+// --- Linke Leiste: Projekte, darunter die Orchestrator ----------------------
+function projektOffen(id: string): boolean {
+  return baumBeruehrt ? offeneProjekte.has(id) : true;
+}
+
+function zeichneBaum(m: Model): void {
+  const schmal = schmalLinks(m.ui.sidebarWidth);
+  linksEl.classList.toggle('schmal', schmal);
+  linksEl.style.width = `${m.ui.sidebarWidth}px`;
+  sessionsEl.replaceChildren();
+
+  for (const p of projekte(m)) {
+    const wartet = p.zeilen.some((z) => z.art === 'terminal' && sitzungWartet(z.sitzung));
+    const kasten = document.createElement('div');
+    kasten.className = `projekt${projektOffen(p.id) ? '' : ' zu'}`;
+
+    const kopf = document.createElement('button');
+    kopf.className = 'projekt-zeile';
+    kopf.title = p.pfad;
+    // Die Kennung des Projekts steht am Element: der Steuerkanal liest sie
+    // (`uiState`), und das Ziehen eines ganzen Blocks braucht sie waehrend des
+    // Zuges, wo `dataTransfer` noch nicht gelesen werden darf.
+    kopf.dataset.projekt = p.id;
+    const pfeil = svg('<path d="M5.5 3.5L10.5 8l-5 4.5"/>', 11, 1.6);
+    pfeil.classList.add('pfeil');
+    kopf.appendChild(pfeil);
+    kopf.appendChild(zeilensymbol('projekt'));
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = p.name;
+    kopf.appendChild(name);
+    if (wartet) {
+      const merker = document.createElement('span');
+      merker.className = 'merker';
+      merker.title = t('baum.merkerWartet');
+      kopf.appendChild(merker);
+    }
+    const anzahl = document.createElement('span');
+    anzahl.className = 'anzahl';
+    anzahl.textContent = String(p.zeilen.length);
+    kopf.appendChild(anzahl);
+    kopf.addEventListener('click', () => {
+      if (!baumBeruehrt) {
+        // Beim ersten Griff steht fest, was offen war: alles. Von da an fuehrt
+        // die Menge Buch, und nur noch sie.
+        baumBeruehrt = true;
+        for (const q of projekte(m)) offeneProjekte.add(q.id);
+      }
+      if (offeneProjekte.has(p.id)) offeneProjekte.delete(p.id);
+      else offeneProjekte.add(p.id);
+      zeichneBaum(m);
+    });
+    ziehbarProjekt(kopf, p.id, m);
+    kasten.appendChild(kopf);
+
+    const kinder = document.createElement('div');
+    kinder.className = 'orchestratoren';
+    // BEIDE SORTEN IN DERSELBEN LISTE, unter dem Projekt ihres Ordners und in
+    // der gemeinsamen Reihenfolge (Befund 5). Wie eine Zeile AUSSIEHT,
+    // entscheidet ihre Sorte -- wo sie steht, nicht.
+    for (const z of p.zeilen) {
+      kinder.appendChild(z.art === 'chat' ? chatZeile(z.chat, m) : orchZeile(z.sitzung, m));
+    }
+    kasten.appendChild(kinder);
+    sessionsEl.appendChild(kasten);
+  }
+
+  // KEIN PROJEKT, KEINE SITZUNG, KEIN CHAT -- dann steht hier dieselbe Art
+  // Zeile wie auf der Buehne statt einer leeren Spalte. Der Baum kennt nur
+  // Projekte, in denen eine Sitzung liegt: die Einstellungen fuehren keine
+  // Liste von Projekten, aus der sich ein leeres Projekt zeigen liesse.
+  if (!sessionsEl.firstElementChild) {
+    const zeile = document.createElement('div');
+    zeile.className = 'baum-leer';
+    zeile.textContent = t('leer.baum');
+    sessionsEl.appendChild(zeile);
+  }
+}
+
+function orchZeile(s: Session, m: Model): HTMLElement {
+  const el = document.createElement('div');
+  // GEWAEHLT NUR, WENN AUCH WIRKLICH IHRE KACHELN AUF DER BUEHNE LIEGEN
+  // (Befund 6): liegt dort ein Gespraech oder der Worker einer Chat-Sitzung,
+  // ist diese Zeile es nicht, auch wenn sie die zuletzt gewaehlte war.
+  const gewaehlt = s.id === m.selected && buehneZeigt(m).art === 'terminal';
+  // VERLOREN UND GESCHEITERT SIND EIGENE ZUSTAENDE (Befund 9). Ein Start, der
+  // scheitert, ist eine Aufforderung; er darf nicht aussehen wie ein sauberes
+  // Ende. Beide Klassen stehen wieder an der Zeile, und der Satz dazu steht im
+  // Hilfeschildchen -- die Felder lagen im Modell und wurden von keiner Zeile
+  // gelesen.
+  const merkmale = [
+    s.startFehler ? 'startfehler' : '',
+    s.verloren ? 'verloren' : '',
+    gewaehlt ? 'gewaehlt' : '',
+  ].filter(Boolean).join(' ');
+  el.className = `eintrag orch-zeile zustand-${s.state}${merkmale ? ` ${merkmale}` : ''}`;
+  el.dataset.id = s.id;
+  // WELCHEM PROJEKT DIE ZEILE GEHOERT. Der Ordner bestimmt das Projekt, nicht
+  // die Reihenfolge (siehe `ziehbarSitzung`): waehrend eines Zuges muss die
+  // Zeile unter dem Zeiger sagen koennen, ob sie ueberhaupt ein Ziel ist, und
+  // `dataTransfer` gibt das dort nicht her.
+  el.dataset.projekt = s.dir || '?';
+  el.appendChild(punkt(startfarbe(s)));
+  el.appendChild(kuerzelMarke(s.initials || s.name, startfarbe(s)));
+  el.appendChild(zeilensymbol('sitzung'));
+  // NAME UND ZUSATZZEILE UNTEREINANDER (Befund 8). Ab 200 Bildpunkten
+  // Leistenbreite steht unter dem Namen, auf welcher Maschine die Sitzung
+  // laeuft und wie viele Worker sie hat -- beim Start stattdessen der Satz
+  // dazu. Die Schluessel dafuer standen unveraendert in texte.ts und wurden von
+  // keiner Zeile mehr abgerufen.
+  const leib = document.createElement('span');
+  leib.className = 'zeilenleib';
+  const name = document.createElement('span');
+  name.className = 'name';
+  name.textContent = s.name;
+  leib.appendChild(name);
+  const zusatz = zusatzzeile(s, m);
+  if (zusatz) {
+    const unten = document.createElement('span');
+    unten.className = 'zusatz';
+    unten.textContent = zusatz;
+    leib.appendChild(unten);
+    el.classList.add('zweizeilig');
+  }
+  el.appendChild(leib);
+  // DIE MASCHINE STEHT NUR DA, WENN SIE NICHT DIE EIGENE IST -- und nur dann,
+  // wenn die Zusatzzeile sie nicht ohnehin schon nennt. Der Normalfall ist die
+  // hiesige, und ein Hostname, der an jeder Zeile klebt, verdraengt in einer
+  // schmalen Leiste genau das, wofuer sie da ist.
+  if (s.machine && s.machine !== m.machine && !zusatz) {
+    const maschine = document.createElement('span');
+    maschine.className = 'maschine';
+    maschine.textContent = s.machine;
+    el.appendChild(maschine);
+  }
+  el.title = [
+    `${s.name} · ${s.machine} · ${s.dir}`,
+    s.startFehler ? t('sitzung.startFehler') : '',
+    s.verloren ? t('sitzung.verloren') : '',
+  ].filter(Boolean).join('\n');
+  el.addEventListener('click', () => window.awbBridge.bedienung('select', s.id));
+  el.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    window.awbBridge.sitzungsMenue(s.id, e.isTrusted);
+  });
+  // V14: der Knopf einer wirklich toten Sitzung -- klein und gedaempft. Eine
+  // Sitzung, die gerade startet, bekommt ihn nicht: da laeuft schon etwas.
+  if (s.state === 'stopped' && !s.startet) {
+    const wieder = document.createElement('button');
+    wieder.className = 'wieder';
+    // Eine Kennung, damit `awb-ctl klick` die Frage auch AUFmachen kann und
+    // nicht nur beantworten (`wieder-ja`, `wieder-nein`). Ohne sie liesse sich
+    // die Rueckfrage kopflos nicht ansehen.
+    wieder.id = `wieder-${s.id}`;
+    wieder.title = s.revive?.reason ?? t('sitzung.wiederherstellen');
+    wieder.appendChild(svg('<path d="M13 8a5 5 0 11-1.6-3.7"/><path d="M13.2 2.6v2.9h-2.9"/>', 12, 1.4));
+    wieder.addEventListener('click', (e) => {
+      e.stopPropagation();
+      wiederFrage = wiederFrage === s.id ? '' : s.id;
+      zeichneBaum(m);
+    });
+    el.appendChild(wieder);
+  }
+  ziehbarZeile(el, s.id, m);
+  // Die Zeile und ihre Rueckfrage stehen zusammen in einem Kasten: die Frage
+  // gehoert unter GENAU diese Sitzung und nicht irgendwo ins Fenster.
+  if (s.state === 'stopped' && !s.startet && wiederFrage === s.id) {
+    const kasten = document.createElement('div');
+    kasten.className = 'orch-eintrag';
+    kasten.append(el, wiederFrageKasten(s));
+    return kasten;
+  }
+  return el;
+}
+
 /**
- * EINE ZEILE VON HAND UMHAENGEN -- fuer BEIDE Sorten dieselbe Fassung (Punkt 4).
+ * DIE RUECKFRAGE VOR DEM WIEDERBELEBEN (03.09.2026, Prueferbefund 3).
  *
- * Bis heute waren nur die Terminal-Zeilen ziehbar, und die Reihenfolge, in die
- * gelegt wurde, kam aus `m.sessions`. Eine Chat-Sitzung liess sich damit nicht
- * umhaengen und rutschte hinter jede von Hand gelegte Terminal-Sitzung --
- * genau die Ungleichbehandlung, um die es geht. Gearbeitet wird jetzt auf der
- * gemeinsamen Reihenfolge `m.leiste`; sie enthaelt beide Sorten und ist dieselbe,
- * die der Hauptprozess zurueckbekommt.
+ * Sie war eine Sicherung, die beim Neubau still weggefallen ist: die alte
+ * Oberflaeche zeigte vor `revive` ein `window.confirm` mit Ordner, Harness,
+ * Modell und der Auskunft, ob das Gespraech fortgesetzt oder neu begonnen wird.
+ * Der neue Knopf rief unmittelbar auf, und die Auskunft stand nur noch im
+ * Hilfeschildchen.
+ *
+ * KEIN `window.confirm`: das ist ein Systemdialog, der das ganze Fenster
+ * anhaelt und in einer Oberflaeche, die sonst nichts davon benutzt, fremd
+ * aussieht. Die Frage steht stattdessen unter der Zeile, zu der sie gehoert,
+ * und geht mit ihrer Antwort wieder zu.
+ *
+ * DER SATZ ZUR FORTSETZUNG kommt aus dem Hauptprozess, aus derselben Funktion,
+ * die den Aufruf baut (main.ts, `revive`-Vorschau). Der Rueckfall gilt fuer den
+ * Fall, dass die Vorschau fehlt; er kannte bis zum 06.08. nur einen Harness und
+ * behauptete eine Fortsetzung auch fuer eine Sitzung, die mit pi oder codex
+ * lief -- deshalb steht die Vorschau vorn.
  */
-function ziehbar(zeile: HTMLDivElement, id: string, m: Model): void {
+function wiederFrageKasten(s: Session): HTMLElement {
+  const kasten = document.createElement('div');
+  kasten.className = 'wieder-frage';
+  const frage = document.createElement('div');
+  frage.className = 'wieder-titel';
+  frage.textContent = t('sitzung.wiederherstellen.frage', { name: s.name, maschine: s.machine });
+  kasten.appendChild(frage);
+
+  const zeile = (was: string, wert: string, fest = false): void => {
+    if (!wert) return;
+    const z = document.createElement('div');
+    z.className = 'wieder-zeile';
+    const k = document.createElement('span');
+    k.className = 'wieder-was';
+    k.textContent = was;
+    const v = document.createElement('span');
+    v.className = fest ? 'wieder-wert fest' : 'wieder-wert';
+    v.textContent = wert;
+    z.append(k, v);
+    kasten.appendChild(z);
+  };
+  zeile(t('sitzung.wiederherstellen.ordner'), s.dir, true);
+  zeile(t('sitzung.wiederherstellen.harness'), [s.harness, s.model].filter(Boolean).join(' · '), true);
+
+  const fortsetzung = document.createElement('div');
+  fortsetzung.className = 'wieder-satz';
+  fortsetzung.textContent = s.revive?.reason
+    ?? (s.claudeSessionId
+      ? t('sitzung.fortsetzen', { id: `${s.claudeSessionId.slice(0, 8)}…` })
+      : t('sitzung.neuStart'));
+  kasten.appendChild(fortsetzung);
+
+  const knoepfe = document.createElement('div');
+  knoepfe.className = 'wieder-knoepfe';
+  const ja = document.createElement('button');
+  ja.className = 'knopf-voll';
+  ja.id = 'wieder-ja';
+  ja.textContent = t('sitzung.wiederherstellen.jetzt');
+  ja.addEventListener('click', (e) => {
+    e.stopPropagation();
+    wiederFrage = '';
+    window.awbBridge.bedienung('revive', s.id);
+    if (modell) zeichneBaum(modell);
+  });
+  const nein = document.createElement('button');
+  nein.className = 'knopf-rand';
+  nein.id = 'wieder-nein';
+  nein.textContent = t('wort.abbrechen');
+  nein.addEventListener('click', (e) => {
+    e.stopPropagation();
+    wiederFrage = '';
+    if (modell) zeichneBaum(modell);
+  });
+  knoepfe.append(ja, nein);
+  kasten.appendChild(knoepfe);
+  return kasten;
+}
+
+function chatZeile(c: Chat, m: Model): HTMLElement {
+  const el = document.createElement('div');
+  // GEWAEHLT, wenn ihr Gespraech ODER einer ihrer Worker auf der Buehne liegt
+  // (Befund 6): beides ist diese Sitzung, und in beiden Faellen beschreibt
+  // keine Terminal-Zeile, was zu sehen ist.
+  const b = buehneZeigt(m);
+  const gewaehlt = b.chatId === c.id;
+  el.className = `eintrag orch-zeile chat${c.laeuft ? ' laeuft' : ''}${gewaehlt ? ' gewaehlt' : ''}`;
+  el.dataset.id = c.id;
+  // Auch eine Chat-Sitzung gehoert ihrem Ordner und wird darin gezogen.
+  el.dataset.projekt = c.ordner || '?';
+  const farbe = c.laeuft ? 'laeuft' : 'ruhig';
+  el.appendChild(punkt(farbe));
+  el.appendChild(kuerzelMarke(c.name, farbe));
+  el.appendChild(zeilensymbol('chat'));
+  const leib = document.createElement('span');
+  leib.className = 'zeilenleib';
+  const name = document.createElement('span');
+  name.className = 'name';
+  name.textContent = c.name;
+  leib.appendChild(name);
+  // Dieselbe Zusatzzeile wie an einer Terminal-Sitzung, mit dem, was eine
+  // Chat-Sitzung davon hat: ihre Worker.
+  if (m.ui.sidebarWidth >= ZUSATZ_AB) {
+    const unten = document.createElement('span');
+    unten.className = 'zusatz';
+    // Ohne Maschine: ein Gespraech laeuft immer hier (05.09.2026,
+    // Electron-Befund 3).
+    unten.textContent = t('sitzung.workerZahl', {
+      n: (c.worker ?? []).filter((w) => w.laeuft).length,
+    });
+    leib.appendChild(unten);
+    el.classList.add('zweizeilig');
+  }
+  el.appendChild(leib);
+  el.title = `${c.name} · ${c.ordner}`;
+  el.addEventListener('click', () => window.awbBridge.bedienung('chat-zeigen', c.id));
+  el.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    window.awbBridge.sitzungsMenue(c.id, e.isTrusted);
+  });
+  ziehbarZeile(el, c.id, m);
+  return el;
+}
+
+/**
+ * ZIEHEN IN ZWEI EBENEN (04.09.2026, alice: „ich will sitzungen in projekten
+ * ziehen können und projekte unter sich").
+ *
+ * WAS VORHER KAPUTT WAR, UND ZWAR UNSICHTBAR. `ziehbar()` setzte die FLACHE
+ * Reihenfolge ueber `bedienung('order', …)`, und `projekte()` gruppierte
+ * unmittelbar danach wieder nach Ordner. Wer eine Sitzung auf ein fremdes
+ * Projekt zog, sah sie an ihren alten Platz zurueckspringen: die flache Liste
+ * hatte sich geaendert, die Gruppierung hatte die Aenderung eingeebnet. Es gab
+ * keine Fehlermeldung, weil nichts fehlgeschlagen war -- es waren zwei
+ * Ordnungen, die einander widersprachen.
+ *
+ * DIE FLACHE LISTE BLEIBT DAS DATENMODELL (so steht es schon im Kommentar von
+ * `projekte()`: ein Projekt steht dort, wo seine erste Sitzung steht). Neu ist,
+ * dass beide Zuege sie so umbauen, dass die Gruppierung sie nicht mehr
+ * zunichtemachen KANN: geschrieben wird immer die Verkettung ganzer
+ * Projektbloecke, nie eine Liste, in der zwei Sitzungen eines Projekts durch
+ * eine fremde getrennt waeren. Was danach gruppiert wird, kommt genauso wieder
+ * heraus.
+ *
+ * WAS WAEHREND DES ZUGES BEKANNT SEIN MUSS: ob die Zeile unter dem Zeiger
+ * ueberhaupt ein Ziel ist. `dataTransfer` gibt seinen Inhalt in `dragover`
+ * nicht her (das ist die Schutzregel des Browsers), deshalb merkt sich diese
+ * eine Variable, was gerade gezogen wird. Sie lebt genau so lange wie der Zug.
+ */
+type Zug =
+  | { art: 'zeile'; id: string; projekt: string }
+  | { art: 'projekt'; id: string };
+
+let zug: Zug | null = null;
+
+/**
+ * Aus Projektbloecken wieder eine flache Liste. Die Bloecke stehen darin
+ * VOLLSTAENDIG hintereinander -- das ist die Zusage, an der das Zurueckspringen
+ * scheitert. Chat- und Terminal-Sitzungen stehen darin gemischt, so wie im
+ * Baum: sie gehoeren beide ihrem Ordner (Befund 5).
+ */
+function flacheReihenfolge(bloecke: Projektknoten[]): string[] {
+  return bloecke.flatMap((b) => b.zeilen.map((z) => z.id));
+}
+
+/**
+ * Eine Zeile an eine andere Stelle IHRES Projekts -- gleich welcher Sorte. Ein
+ * Zug auf ein fremdes Projekt wird gar nicht erst angenommen: der Ordner
+ * bestimmt das Projekt, nicht die Reihenfolge.
+ */
+function zeileVerschieben(m: Model, gezogen: string, ziel: string): void {
+  const bloecke = projekte(m);
+  const block = bloecke.find((b) => b.zeilen.some((z) => z.id === gezogen));
+  if (!block || !block.zeilen.some((z) => z.id === ziel)) return;
+  const gezogeneZeile = block.zeilen.find((z) => z.id === gezogen);
+  const ohne = block.zeilen.filter((z) => z.id !== gezogen);
+  const stelle = ohne.findIndex((z) => z.id === ziel);
+  if (stelle < 0 || !gezogeneZeile) return;
+  ohne.splice(stelle, 0, gezogeneZeile);
+  block.zeilen = ohne;
+  window.awbBridge.bedienung('order', flacheReihenfolge(bloecke));
+}
+
+/**
+ * Ein ganzer Projektblock ueber oder unter ein anderes Projekt.
+ *
+ * ZWEI LISTEN, WEIL ES ZWEI FRAGEN SIND (08.09.2026). Bis heute schrieb dieser
+ * Zug nur die flache `order`, und das Projekt stand danach dort, wo seine
+ * erste Zeile stand. Seit die Mac-Fassung Projekte ebenfalls ziehen kann, hat
+ * der Kern dafuer einen eigenen Schluessel (`projektReihenfolge`, uistate.ts),
+ * und er stellt die Bloecke damit selbst -- er wuerde einen Zug, der nur
+ * `order` schreibt, beim naechsten Zeichnen wieder ueberstimmen. Also sagt
+ * dieser Zug beides: die Zeilen in ihrer Folge und die Ordner in ihrer.
+ */
+function projektVerschieben(m: Model, gezogen: string, ziel: string): void {
+  const bloecke = projekte(m);
+  const von = bloecke.findIndex((b) => b.id === gezogen);
+  if (von < 0 || !bloecke.some((b) => b.id === ziel)) return;
+  const [block] = bloecke.splice(von, 1);
+  const nach = bloecke.findIndex((b) => b.id === ziel);
+  if (nach < 0) return;
+  bloecke.splice(nach, 0, block);
+  window.awbBridge.bedienung('projekt-order', bloecke.map((b) => b.id));
+  window.awbBridge.bedienung('order', flacheReihenfolge(bloecke));
+}
+
+/**
+ * Der gemeinsame Teil aller drei Zuege: anfassen, die Zielmarke zeigen ODER
+ * eben nicht, loslassen. `nimmtAn` entscheidet, ob diese Zeile fuer den
+ * laufenden Zug ueberhaupt ein Ziel ist -- sagt sie nein, wird das Ereignis
+ * nicht angenommen, und damit erscheint auch keine Zielmarke. Genau daran
+ * sieht ein Mensch, dass der Zug hier nichts zu suchen hat.
+ */
+function ziehbarGrundform(
+  zeile: HTMLElement,
+  beginn: () => Zug,
+  nimmtAn: (laufend: Zug) => boolean,
+  ablegen: (laufend: Zug) => void,
+): void {
   zeile.draggable = true;
   zeile.addEventListener('dragstart', (e) => {
+    zug = beginn();
     zeile.classList.add('zieht');
-    e.dataTransfer?.setData('text/plain', id);
+    e.dataTransfer?.setData('text/plain', zug.id);
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
   });
-  zeile.addEventListener('dragend', () => zeile.classList.remove('zieht'));
+  zeile.addEventListener('dragend', () => {
+    zug = null;
+    zeile.classList.remove('zieht');
+  });
   zeile.addEventListener('dragover', (e) => {
+    if (!zug || !nimmtAn(zug)) return;
     e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
     zeile.classList.add('ziel');
   });
   zeile.addEventListener('dragleave', () => zeile.classList.remove('ziel'));
   zeile.addEventListener('drop', (e) => {
-    e.preventDefault();
     zeile.classList.remove('ziel');
-    const gezogen = e.dataTransfer?.getData('text/plain') ?? '';
-    if (!gezogen || gezogen === id) return;
-    const alle = (m.leiste ?? m.sessions.map((x) => ({ id: x.id }))).map((x) => x.id);
-    const ids = alle.filter((x) => x !== gezogen);
-    const stelle = ids.indexOf(id);
-    if (stelle < 0) return;
-    ids.splice(stelle, 0, gezogen);
-    window.awbBridge.bedienung('order', ids);
-  });
-}
-
-/** Eine Zeile fuer eine TERMINAL-Sitzung. */
-function terminalZeile(
-  s: Session,
-  m: Model,
-  modus: 'schmal' | 'mittel' | 'breit',
-): HTMLDivElement {
-  {
-    const zeile = document.createElement('div');
-    // `startet` und `startfehler` kommen als eigene Klassen dazu, nicht statt
-    // `zustand-stopped`: der Zustand ist weiter 'stopped' (es gibt keinen
-    // Pane), die Klasse sagt nur, warum er hier trotzdem steht.
-    const startKlasse = s.startet ? ' startet' : (s.startFehler ? ' startfehler' : '');
-    zeile.className = `eintrag zustand-${s.state}${startKlasse}`;
-    zeile.dataset.id = s.id;
-    // Eine verlorene Sitzung steht hier, obwohl beendete ausgeblendet sind --
-    // dann gehoert auch der Grund dran, sonst sieht sie aus wie eine Leiche,
-    // die der Filter vergessen hat. Dasselbe gilt fuer die beiden Start-Faelle.
-    const verlorenSatz = s.verloren ? '\nlief noch, als dieses Fenster zuletzt hinsah' : '';
-    const startSatz = s.startet
-      ? '\nstartet gerade — bei einem lokalen Modell dauert das Minuten'
-      : (s.startFehler ? '\nder Start ist gescheitert; der Grund stand in der Meldung' : '');
-    zeile.title = `${s.name} — ${s.machine} — ${s.tmuxSession || 'keine tmux-Session'}${verlorenSatz}${startSatz}`;
-    // Gewaehlt ist die Sitzung, die man SIEHT. Liegt eine Chat-Sitzung auf der
-    // Buehne, ist das keine Terminal-Sitzung -- zwei hervorgehobene Zeilen
-    // waeren die Frage, welche von beiden gilt.
-    if (s.id === m.selected && !(m.chatGezeigt ?? '') && !(m.chatWerkstattGezeigt ?? '')) {
-      zeile.classList.add('gewaehlt');
-    }
-
-    if (modus === 'schmal') {
-      // Schmal gibt es nur die zwei Buchstaben, also faerben sie sich selbst.
-      const kuerzel = document.createElement('div');
-      kuerzel.className = `kuerzel ${startfarbe(s)}`;
-      kuerzel.textContent = s.initials;
-      zeile.appendChild(kuerzel);
-    } else {
-      // Aufgezogen wandert die Farbe auf einen Punkt, die Schrift wird neutral.
-      const punkt = document.createElement('div');
-      punkt.className = `punkt ${startfarbe(s)}-bg`;
-      zeile.appendChild(punkt);
-
-      const texte = document.createElement('div');
-      texte.className = 'texte';
-      const name = document.createElement('div');
-      name.className = 'name';
-      name.textContent = s.name;
-      texte.appendChild(name);
-      if (modus === 'breit') {
-        const zusatz = document.createElement('div');
-        zusatz.className = 'zusatz';
-        // Was NICHT fertig ist, nicht was gesehen wurde: bei einer nicht
-        // einsehbaren Sitzung stand hier sonst "0 Worker" -- eine Zahl, die
-        // niemand nachgesehen hat, und die schlimmste der drei moeglichen
-        // (sie liest sich wie "da ist nichts mehr"). Solange die Panes
-        // abzufragen sind, ist es dieselbe Zahl wie vorher.
-        const anzahl = s.workers.filter((w) => w.state !== 'done').length;
-        // Waehrend eines Starts ist die Zahl der Worker die uninteressanteste
-        // Auskunft, die hier stehen kann -- und „0 Worker" liest sich wie
-        // „da ist nichts". Solange etwas laeuft oder gescheitert ist, steht das.
-        zusatz.textContent = s.startet
-          ? `${s.machine} · startet…`
-          : (s.startFehler ? `${s.machine} · Start gescheitert` : `${s.machine} · ${anzahl} Worker`);
-        texte.appendChild(zusatz);
-      }
-      zeile.appendChild(texte);
-
-      // V14: nur eine WIRKLICH tote Session bekommt den Knopf -- kein Pane
-      // mehr, ihre Maschine antwortet aber (main.ts prueft das beim Klick
-      // ein zweites Mal gegen den dann aktuellen Stand). Zeigt vorher, was
-      // passieren wird: Ordner und welche Unterhaltung fortgesetzt wird.
-      // NICHT waehrend eines laufenden Starts (21.08.): der Knopf wuerde einen
-      // zweiten Start neben den ersten setzen, und der Zustand 'stopped' ist
-      // hier nur die Vorstufe zur Sitzung, nicht ihr Ende. Nach einem
-      // GESCHEITERTEN Start steht er wieder da -- da ist er genau richtig.
-      if (s.state === 'stopped' && !s.startet) {
-        const wiederherstellen = document.createElement('button');
-        wiederherstellen.type = 'button';
-        wiederherstellen.className = 'wiederherstellen';
-        wiederherstellen.title = 'Session wiederherstellen';
-        wiederherstellen.innerHTML =
-          '<svg width="15" height="15" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6">' +
-          '<path d="M16 6.5A6.5 6.5 0 1 0 17 11" stroke-linecap="round" /><path d="M17 3v4h-4" stroke-linecap="round" stroke-linejoin="round" /></svg>';
-        wiederherstellen.addEventListener('click', (e) => {
-          e.stopPropagation();
-          // Der Satz kommt aus dem Hauptprozess, aus derselben Funktion, die
-          // den Aufruf baut (main.ts, `revive`-Vorschau). Bis zum 06.08. stand
-          // hier eine eigene Regel, und sie kannte nur einen Harness: sie las
-          // `claudeSessionId` und behauptete danach eine Fortsetzung -- auch
-          // fuer eine Session, die mit pi oder codex lief. Der Rueckfall gilt
-          // fuer den Fall, dass die Vorschau fehlt (aeltere Fassung des
-          // Hauptprozesses).
-          const fortsetzung =
-            s.revive?.reason ??
-            (s.claudeSessionId
-              ? `Setzt die zuletzt gemerkte Unterhaltung fort (${s.claudeSessionId.slice(0, 8)}…).`
-              : 'Startet neu -- keine Unterhaltung war gemerkt.');
-          const harnessZeile = s.harness ? `\nHarness: ${s.harness}${s.model ? ` · ${s.model}` : ''}` : '';
-          const ok = window.confirm(`"${s.name}" auf ${s.machine} wiederherstellen?\n\nOrdner: ${s.dir}${harnessZeile}\n${fortsetzung}`);
-          if (ok) window.awbBridge.bedienung('revive', s.id);
-        });
-        zeile.appendChild(wiederherstellen);
-      }
-    }
-
-    zeile.addEventListener('click', () => window.awbBridge.bedienung('select', s.id));
-    // Rechtsklick: das Kontextmenue zu GENAU DIESER Sitzung -- nicht zu der,
-    // die gerade gewaehlt ist. Die Kennung reist deshalb mit, und die Auswahl
-    // bleibt unberuehrt: ein Rechtsklick ist eine Frage, kein Wechsel.
-    //
-    // `isTrusted` geht mit, aus demselben Grund wie beim Zahnrad und beim Plus:
-    // `Menu.popup` bringt eine Flaeche auf den Bildschirm, und das darf nur ein
-    // Mensch ausloesen. Ein synthetisches Ereignis aus dem Steuerkanal traegt
-    // false, und der Hauptprozess klappt dann nichts auf (main.ts,
-    // 'awb:sitzung-menue').
-    zeile.addEventListener('contextmenu', (e) => {
-      e.preventDefault();
-      window.awbBridge.sitzungsMenue(s.id, e.isTrusted);
-    });
-    ziehbar(zeile, s.id, m);
-
-    return zeile;
-  }
-}
-
-/**
- * EINE ZEILE FUER EINE CHAT-SITZUNG -- in DERSELBEN Liste und an derselben
- * Stelle wie eine Terminal-Sitzung (Punkt 4). Sie sieht absichtlich gleich aus
- * -- es sind beides Sitzungen -- und traegt absichtlich ein Kennzeichen: was
- * hier klickt, legt ein Gespraech auf die Buehne statt Kacheln, und wer das
- * verwechselt, sucht sein Terminal.
- *
- * Bis zum 12.08. stand hier ein eigener Abschnitt hinter einem Trenner „Chat".
- * Er ist weg, und mit ihm die zweite Sortierregel.
- *
- * Der Punkt links nimmt dieselben Farbklassen wie eine Terminal-Sitzung, damit
- * „laeuft" ueberall dasselbe heisst.
- */
-function chatZeile(
-  c: NonNullable<Model['chats']>[number],
-  m: Model,
-  modus: 'schmal' | 'mittel' | 'breit',
-): HTMLDivElement {
-  // Hervorgehoben ist sie auch dann, wenn statt des Gespraechs einer IHRER
-  // Worker auf der Buehne liegt: der Mensch ist bei dieser Sitzung.
-  const gezeigt = m.chatGezeigt ?? '';
-  const beiIhr = c.id === gezeigt || c.id === (m.chatWerkstattGezeigt ?? '');
-  const zeile = document.createElement('div');
-  zeile.className = `eintrag chat${c.laeuft ? ' laeuft' : ''}${beiIhr ? ' gewaehlt' : ''}`;
-  zeile.dataset.chat = c.id;
-  zeile.title = `${c.name} — ${c.ordner}\nChat-Sitzung (Gespräch auf der Bühne, kein Terminal)`;
-
-  if (modus === 'schmal') {
-    // Nicht `kuerzel` nennen: das verdeckt die gleichnamige Funktion, aus
-    // der der Text kommt.
-    const kuerzelEl = document.createElement('div');
-    kuerzelEl.className = `kuerzel ${c.laeuft ? 'laeuft' : 'ruhig'}`;
-    kuerzelEl.textContent = kuerzel(c.name);
-    zeile.appendChild(kuerzelEl);
-  } else {
-    const punkt = document.createElement('div');
-    punkt.className = `punkt ${c.laeuft ? 'laeuft' : 'ruhig'}-bg`;
-    zeile.appendChild(punkt);
-
-    const texte = document.createElement('div');
-    texte.className = 'texte';
-    const name = document.createElement('div');
-    name.className = 'name';
-    name.textContent = c.name;
-    texte.appendChild(name);
-    if (modus === 'breit') {
-      const zusatz = document.createElement('div');
-      zusatz.className = 'zusatz';
-      zusatz.textContent = c.ordner.split('/').pop() ?? c.ordner;
-      texte.appendChild(zusatz);
-    }
-    zeile.appendChild(texte);
-
-    // Das Kennzeichen. Ein gezeichnetes Sprechblasen-Zeichen, kein Emoji --
-    // dieselbe Auflage wie im Rest des Hauses.
-    const marke = document.createElement('span');
-    marke.className = 'chatmarke';
-    marke.innerHTML =
-      '<svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7">' +
-      '<path d="M17 12a2 2 0 0 1-2 2H8l-4 3v-3H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" ' +
-      'stroke-linecap="round" stroke-linejoin="round" /></svg>';
-    zeile.appendChild(marke);
-  }
-
-  // Dieselbe Zweiteilung wie beim Plus: der ECHTE Klick legt das Gespraech
-  // auf die Buehne, ein unechter (Test, Steuerkanal) startet es nur.
-  zeile.addEventListener('click', (ereignis) => {
-    window.awbBridge.bedienung(ereignis.isTrusted ? 'chat-zeigen' : 'chat-bauen', c.id);
-  });
-  // DAS KONTEXTMENUE, wie bei jeder anderen Zeile der Leiste (Punkt 4 und
-  // Luecken 5a/5b). Es geht ueber DENSELBEN Kanal wie das der Terminal-Zeilen
-  // und mit derselben Echtheitspruefung -- der Hauptprozess sieht an der
-  // Kennung, welche Sorte gemeint ist (chat-* aus `neueId`).
-  zeile.addEventListener('contextmenu', (e) => {
+    if (!zug || !nimmtAn(zug)) return;
     e.preventDefault();
-    window.awbBridge.sitzungsMenue(c.id, e.isTrusted);
+    ablegen(zug);
+    zug = null;
   });
-  // Und ziehbar wie jede andere Zeile -- dieselbe Fassung, dieselbe
-  // gemeinsame Reihenfolge.
-  ziehbar(zeile, c.id, m);
+}
+
+function ziehbarZeile(zeile: HTMLElement, id: string, m: Model): void {
+  const projekt = zeile.dataset.projekt ?? '';
+  ziehbarGrundform(
+    zeile,
+    () => ({ art: 'zeile', id, projekt }),
+    (l) => l.art === 'zeile' && l.id !== id && l.projekt === projekt,
+    (l) => zeileVerschieben(m, l.id, id),
+  );
+}
+
+function ziehbarProjekt(zeile: HTMLElement, id: string, m: Model): void {
+  ziehbarGrundform(
+    zeile,
+    () => ({ art: 'projekt', id }),
+    (l) => l.art === 'projekt' && l.id !== id,
+    (l) => projektVerschieben(m, l.id, id),
+  );
+}
+
+
+
+// --- Tab-Leiste und die drei Ansichten --------------------------------------
+/**
+ * Die Reihenfolge, in der die Worker in den Panes liegen: jeder obere,
+ * unmittelbar gefolgt von dem, was auf seinen Antrag entstanden ist. Ein
+ * Kind-Worker hat einen EIGENEN Pane und belegt deshalb einen Platz im Gitter
+ * -- die Tabs muessen ihn also mitzaehlen, sonst weicht die Zahl der Marken von
+ * der Kapazitaetsrechnung ab.
+ */
+function flacheWorker(s: Session): Worker[] {
+  const lebende = s.workers.filter((w) => w.alive);
+  const namen = new Set(lebende.map((w) => w.name));
+  const kinderVon = (name: string): Worker[] => lebende.filter((w) => w.requestedBy === name && namen.has(w.requestedBy));
+  const obere = lebende.filter((w) => !w.requestedBy || !namen.has(w.requestedBy));
+  return obere.flatMap((w) => [w, ...kinderVon(w.name)]);
+}
+
+function workerImTab(s: Session, m: Model, i: number): Worker[] {
+  const flach = flacheWorker(s);
+  return flach.slice(i * m.capacity.perTab, (i + 1) * m.capacity.perTab);
+}
+
+/** Die Farbe eines Tabs: die dringendste seiner Panes. */
+function tabFarbe(ws: Worker[]): string {
+  if (ws.some((w) => w.state === 'blocked' || w.state === 'stalled')) return 'will';
+  if (ws.some((w) => w.state === 'running')) return 'laeuft';
+  if (ws.some((w) => w.state === 'unknown')) return 'fern';
+  return 'ruhig';
+}
+
+/** Welche der drei Ansichten gerade gilt. */
+function lageJetzt(): 'uebersicht' | 'gekachelt' | 'gezoomt' {
+  if (uebersichtAn) return 'uebersicht';
+  return auskunft.ansicht.startsWith('Tab') ? 'gekachelt' : 'gezoomt';
+}
+
+function tabZeigen(m: Model, s: Session, i: number): void {
+  window.awbBridge.bedienung('worker-tab', i);
+  const panes = workerImTab(s, m, i).map((w) => w.paneId).filter(Boolean);
+  if (panes.length) window.awbBridge.bedienung('show-tab', panes);
+}
+
+// --- Der Inhaltskopf --------------------------------------------------------
+/**
+ * DAS FEHLENDE STUECK (04.09.2026). Oben in der Inhaltskarte steht seither,
+ * WORAN gearbeitet wird und WAS die Flaeche zeigt -- die Hierarchie, die im
+ * Vorbild „Cold outreach operator / Powered by Claude Code" traegt: der Name
+ * gross, die Herkunft klein darunter.
+ *
+ * Links der Sitzungsname in 17 Punkt halbfett, darunter in 11,5 Punkt
+ * gedaempft Harness, Modell und Ordner. Was die Bruecke nicht kennt, steht
+ * nicht da; erfunden wird nichts.
+ *
+ * Rechts, in dieser Reihenfolge: die Statuspille mit der Zahl laufender Worker
+ * DIESER Sitzung (bei null gedaempft, ab eins mit gefaerbtem Punkt), der
+ * Umschalter zwischen Orchestrator und Worker, das Zahnrad der Sitzung.
+ */
+function laufendeWorker(s: Session): number {
+  return s.workers.filter((w) => w.alive && (w.state === 'running' || w.state === 'blocked' || w.state === 'stalled')).length;
+}
+
+function zeichneInhaltskopf(m: Model): void {
+  // AUCH DER INHALTSKOPF BESCHREIBT DIE BUEHNE (Befund 6). Eine Chat-Sitzung
+  // hat weder Orchestrator-Pane noch Worker-Tabs -- der Umschalter und das
+  // Zahnrad haetten dort nichts zu schalten und stehen deshalb nicht da.
+  const b = buehneZeigt(m);
+  if (b.art !== 'terminal') {
+    const c = (m.chats ?? []).find((x) => x.id === b.chatId);
+    if (c) {
+      inhaltskopfEl.classList.remove('leer');
+      inhaltskopfEl.classList.add('gespraech');
+      ikNameEl.textContent = c.name;
+      ikNameEl.title = c.name;
+      ikHerkunftEl.textContent = kurzerPfad(c.ordner);
+      ikHerkunftEl.title = c.ordner;
+      const laufend = (c.worker ?? []).filter((w) => w.laeuft).length;
+      ikWorkerEl.classList.toggle('aktiv', laufend > 0);
+      const p = ikWorkerEl.querySelector('.punkt');
+      if (p) p.className = `punkt ${laufend > 0 ? 'laeuft' : 'ruhig'}`;
+      const z = ikWorkerEl.querySelector('.zahl');
+      if (z) z.textContent = t('flaeche.workerLaufen', { n: laufend });
+      sitzungskarteZu();
+      return;
+    }
+  }
+  inhaltskopfEl.classList.remove('gespraech');
+  const s = m.sessions.find((x) => x.id === m.selected);
+  // OHNE SITZUNG GIBT ES KEINEN KOPF. Ein Kopf, der nichts benennt, waere ein
+  // leerer Streifen -- genau der Fehler, gegen den der Neubau steht. Die
+  // Buehne sagt in dem Fall selbst, was zu tun ist (`#leer`).
+  inhaltskopfEl.classList.toggle('leer', !s);
+  if (!s) {
+    ikNameEl.textContent = '';
+    ikHerkunftEl.textContent = '';
+    sitzungskarteZu();
+    return;
+  }
+  ikNameEl.textContent = s.name;
+  ikNameEl.title = s.name;
+  // Harness, Modellkennung, Ordner -- getrennt durch denselben Mittelpunkt,
+  // den auch die Titelleiste benutzt. Leere Angaben fallen weg statt als
+  // Luecke stehenzubleiben.
+  const herkunft = [s.harness ?? '', s.model ?? '', kurzerPfad(s.dir)].filter(Boolean);
+  ikHerkunftEl.textContent = herkunft.join(' · ');
+  ikHerkunftEl.title = s.dir;
+
+  const laufend = laufendeWorker(s);
+  ikWorkerEl.classList.toggle('aktiv', laufend > 0);
+  const pkt = ikWorkerEl.querySelector('.punkt');
+  if (pkt) pkt.className = `punkt ${laufend > 0 ? 'laeuft' : 'ruhig'}`;
+  const zahl = ikWorkerEl.querySelector('.zahl');
+  if (zahl) zahl.textContent = t('flaeche.workerLaufen', { n: laufend });
+  ikWorkerEl.title = t('flaeche.workerLaufen.tipp');
+
+  const modus = flaechenmodus(m);
+  // ORCHESTRATOR | WORKER WIRD GRAU, NICHT UNSICHTBAR, solange der Tab Agents
+  // steht (08.09.2026): er ordnet die Code-Buehne, und die liegt dann nicht
+  // vorn. Ausblenden haette den Kopf bei jedem Umschalten umgebaut und Pille
+  // und Zahnrad springen lassen -- dieselbe Entscheidung wie in der Mac-Fassung.
+  const agents = buehnenmodus !== 'code';
+  for (const b of ikModusEl.querySelectorAll<HTMLButtonElement>('[data-flaeche]')) {
+    const an = !agents && b.dataset.flaeche === modus;
+    b.classList.toggle('gewaehlt', an);
+    b.setAttribute('aria-selected', String(an));
+    b.disabled = agents;
+  }
+  ikModusEl.classList.toggle('aus', agents);
+}
+
+// DER UMSCHALTER CODE | AGENTS IN DER TITELLEISTE (08.09.2026). Im Modulraum,
+// wie die Verdrahtung des Umschalters darunter: einmal beim Laden, nicht bei
+// jedem Zeichnen -- sonst haengt an jedem Knopf nach einer Minute ein Dutzend
+// Behandler, und der Zustand wird bei jedem Takt ueberschrieben.
+for (const b of modiEl.querySelectorAll<HTMLButtonElement>('[data-modus]')) {
+  const an = b.dataset.modus === 'code';
+  b.classList.toggle('gewaehlt', an);
+  b.setAttribute('aria-selected', String(an));
+  b.addEventListener('click', () => modusSetzen(b.dataset.modus === 'agents' ? 'agents' : 'code'));
+}
+
+/** Den Umschalter bedienen: die Wahl merken und die Flaeche danach richten. */
+function flaechenmodusSetzen(m: Model, modus: Flaechenmodus): void {
+  const s = m.sessions.find((x) => x.id === m.selected);
+  if (!s) return;
+  window.awbBridge.bedienung('flaeche-modus', { id: s.id, modus });
+  if (modus === 'orchestrator') {
+    // Der Orchestrator FUELLT die Flaeche -- es gibt nichts zu kacheln.
+    uebersichtAn = false;
+    if (s.orchestratorPane) window.awbBridge.bedienung('show-pane', s.orchestratorPane);
+  } else {
+    tabZeigen(m, s, Math.min(m.ui.workerTab, Math.max(0, m.capacity.tabs - 1)));
+  }
+}
+
+for (const b of ikModusEl.querySelectorAll<HTMLButtonElement>('[data-flaeche]')) {
+  b.addEventListener('click', () => {
+    if (modell) flaechenmodusSetzen(modell, b.dataset.flaeche === 'orchestrator' ? 'orchestrator' : 'worker');
+  });
+}
+
+// --- Die Sitzungskarte hinter dem Zahnrad -----------------------------------
+/**
+ * WAS SIE IST (04.09.2026). Alles, was eine Sitzung ausmacht, an EINER Stelle
+ * und an Ort und Stelle: als Blatt unter dem Zahnrad, aus dem sie kommt. Bis
+ * heute steckte das im Rechtsklickmenue der Zeile links -- ein Ort, an dem
+ * niemand danach sucht.
+ *
+ * KEIN NEUER KANAL. Der Name geht ueber `awbBridge.umbenennen` hinaus, denselben
+ * Weg, den die Namensabfrage seit jeher nimmt; „Ordner oeffnen" und
+ * „Fortsetzen" ueber dieselben Bedienungen wie an der Zeile. Die Bruecke
+ * (preload.ts) bleibt unveraendert.
+ *
+ * WAS HIER NICHT STEHT UND WARUM: Denkstufe und Kontextstufe. Beide gibt es im
+ * Sessionmodell nicht -- die Zustandsdatei einer Sitzung fuehrt `harness` und
+ * `model`, mehr nicht (main/sessions.ts). Eine Zeile dafuer waere eine
+ * erfundene Angabe, und die ist schlimmer als eine fehlende.
+ */
+function sitzungskarteZu(): void {
+  sitzungskarteAuf = false;
+  skEl.classList.remove('sichtbar');
+  ikZahnradEl.setAttribute('aria-expanded', 'false');
+}
+
+function sitzungskarteZeichnen(m: Model): void {
+  const s = m.sessions.find((x) => x.id === m.selected);
+  if (!s) { sitzungskarteZu(); return; }
+  skNameEl.value = s.name;
+  skListeEl.replaceChildren();
+  const zeile = (was: string, wert: string, fest = false): void => {
+    if (!wert) return;
+    const dt = document.createElement('dt');
+    dt.textContent = was;
+    const dd = document.createElement('dd');
+    dd.className = fest ? 'fest' : '';
+    dd.textContent = wert;
+    skListeEl.append(dt, dd);
+  };
+  zeile(t('sitzungskarte.harness'), s.harness ?? '', true);
+  zeile(t('sitzungskarte.modell'), s.model ?? '', true);
+  zeile(t('sitzungskarte.maschine'), s.machine);
+  zeile(t('sitzungskarte.ordner'), s.dir, true);
+
+  skKnoepfeEl.replaceChildren();
+  const knopf = (text: string, klasse: string, tun: () => void): void => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = klasse;
+    b.textContent = text;
+    b.addEventListener('click', tun);
+    skKnoepfeEl.appendChild(b);
+  };
+  // Fortsetzen gibt es nur an einer wirklich beendeten Sitzung -- an einer
+  // laufenden gibt es nichts fortzusetzen.
+  if (s.state === 'stopped' && !s.startet) {
+    knopf(t('sitzung.wiederherstellen.jetzt'), 'knopf-voll', () => {
+      window.awbBridge.bedienung('revive', s.id);
+      sitzungskarteZu();
+    });
+  }
+  knopf(t('sitzungskarte.ordnerOeffnen'), 'knopf-rand', () => {
+    window.awbBridge.bedienung('ordner-oeffnen', s.dir);
+  });
+}
+
+// --- Die Worker-Liste hinter der Pille --------------------------------------
+/**
+ * BEFUND 11 DER INVENTUR, und die Antwort darauf steht dort, wo die Frage
+ * entsteht.
+ *
+ * Die Worker-Liste kostet seit dem Neubau die Buehne: sie steht in der
+ * Uebersicht, und die Uebersicht ERSETZT das Terminalbild, statt daneben zu
+ * stehen. Das war eine bewusste Entscheidung und bleibt -- aber „wo sehe ich
+ * meine Worker, ohne die Panes aufzugeben" braucht trotzdem eine Antwort.
+ *
+ * Sie liegt hinter der Zahl, die ohnehin schon dasteht: ein Klick auf die
+ * Pille „N laufen" klappt die Liste als Blatt ueber der Flaeche auf -- je
+ * Worker Zustand, Name, Modell, Tokenstand und Herkunft, ein Klick springt in
+ * seinen Pane. Sie nimmt der Buehne nichts weg und geht mit dem naechsten
+ * Klick wieder zu.
+ */
+let workerlisteAuf = false;
+
+function workerlisteZu(): void {
+  workerlisteAuf = false;
+  workerlisteEl.classList.remove('sichtbar');
+  ikWorkerEl.setAttribute('aria-expanded', 'false');
+}
+
+function workerlisteZeichnen(m: Model): void {
+  const s = m.sessions.find((x) => x.id === m.selected);
+  if (!s) { workerlisteZu(); return; }
+  workerlisteEl.replaceChildren();
+  const lebende = flacheWorker(s);
+  const namen = new Set(lebende.map((w) => w.name));
+  const kinderZahl = new Map<string, number>();
+  for (const w of lebende) {
+    if (w.requestedBy && namen.has(w.requestedBy)) {
+      kinderZahl.set(w.requestedBy, (kinderZahl.get(w.requestedBy) ?? 0) + 1);
+    }
+  }
+  if (!lebende.length) {
+    const leer = document.createElement('div');
+    leer.className = 'wl-leer';
+    leer.textContent = t('uebersicht.leer');
+    workerlisteEl.appendChild(leer);
+    return;
+  }
+  // In welchem Tab ein Worker liegt, entscheidet die Kapazitaet -- ein Klick
+  // soll auf demselben Tab landen, auf dem der Pane wirklich liegt.
+  const proTab = Math.max(1, m.capacity.perTab);
+  // WOHER DER WORKER KOMMT (05.09.2026, Gestalt-Auftrag vom 04.09.): die
+  // Maschine, wenn es nicht diese hier ist -- die Liste hat keinen Kopf, der
+  // sie sonst nennen wuerde --, und der Antragsteller, wenn er auf Antrag
+  // laeuft. Beides als Wort in der Unterzeile, in derselben Farbe wie sie.
+  const fremd = Boolean(s.machine) && s.machine !== m.machine ? s.machine : '';
+  lebende.forEach((w, n) => {
+    const kind = !!w.requestedBy && namen.has(w.requestedBy);
+    const eigene = kinderZahl.get(w.name) ?? 0;
+    workerlisteEl.appendChild(workerZeile({
+      klasse: `worker zustand-${w.state}${kind ? ' kind' : ''}`,
+      farbe: zustandFarbe(w.state),
+      name: w.name,
+      marke: eigene ? `+${eigene}` : '',
+      neben: w.model,
+      herkunft: [fremd, kind ? t('worker.aufAntrag', { name: w.requestedBy }) : ''].filter(Boolean).join(' · '),
+      unten: w.titel || zustandText(w),
+      tokens: tokenKurz(w),
+      pane: w.paneId,
+      tab: Math.floor(n / proTab),
+    }));
+  });
+}
+
+ikWorkerEl.addEventListener('click', () => {
+  if (workerlisteAuf) { workerlisteZu(); return; }
+  if (!modell?.sessions.some((x) => x.id === modell?.selected)) return;
+  sitzungskarteZu();
+  workerlisteAuf = true;
+  workerlisteEl.classList.add('sichtbar');
+  ikWorkerEl.setAttribute('aria-expanded', 'true');
+  workerlisteZeichnen(modell);
+});
+
+ikZahnradEl.addEventListener('click', () => {
+  if (sitzungskarteAuf) { sitzungskarteZu(); return; }
+  if (!modell?.sessions.some((x) => x.id === modell?.selected)) return;
+  workerlisteZu();
+  sitzungskarteAuf = true;
+  skEl.classList.add('sichtbar');
+  ikZahnradEl.setAttribute('aria-expanded', 'true');
+  sitzungskarteZeichnen(modell);
+  skNameEl.focus();
+  skNameEl.select();
+});
+
+(document.getElementById('sk-zu') as HTMLButtonElement).addEventListener('click', () => sitzungskarteZu());
+
+function sitzungsnameUebernehmen(): void {
+  const s = modell?.sessions.find((x) => x.id === modell?.selected);
+  const name = skNameEl.value.trim();
+  if (!s || !name || name === s.name) { sitzungskarteZu(); return; }
+  void window.awbBridge.umbenennen(s.id, name);
+  sitzungskarteZu();
+}
+
+(document.getElementById('sk-name-ok') as HTMLButtonElement).addEventListener('click', sitzungsnameUebernehmen);
+skNameEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sitzungsnameUebernehmen();
+  if (e.key === 'Escape') sitzungskarteZu();
+});
+
+function zeichneStreifen(m: Model): void {
+  tabsEl.replaceChildren();
+  const s = m.sessions.find((x) => x.id === m.selected);
+  const lage = lageJetzt();
+  // DER STREIFEN STEHT NUR DA, WENN ER ETWAS ZU SCHALTEN HAT (05.09.2026,
+  // Beanstandung des Nutzers am Belegbild `ObenLeiste.png`): wenigstens ein
+  // Worker-Pane muss auf der Buehne liegen. Der Orchestrator fuellt die Flaeche
+  // allein, und eine Sitzung ohne Worker hat nichts zu kacheln -- in beiden
+  // Faellen ist der Kopf genau eine Zeile hoch, in JEDER Sitzung dieselbe.
+  //
+  // GEMESSEN WIRD DIE BUEHNE, nicht die gemerkte Wahl. Bis heute hing der
+  // Streifen an `gemerkterModus`, und der Grund dafuer war die Stabilitaet des
+  // Aufbaus: der Streifen ist 34 Bildpunkte hoch, und wenn er auf jede
+  // Lage-Meldung hin kommen und gehen kann, springt die Buehne darunter um
+  // diese 34 Punkte -- am 04.09. wichen Belegbild und Lagemeldung um genau eine
+  // Streifenhoehe voneinander ab. Der Sprung kam aber nicht daher, dass der
+  // Streifen der Buehne folgt, sondern daher, dass die Kacheln danach in der
+  // alten Hoehe stehenblieben. Das ist unten behoben: aendert sich die
+  // Anwesenheit des Streifens, wird die Flaeche sofort neu vermessen und
+  // gezeichnet (`paneflaecheNachziehen`) -- derselbe Handgriff, den auch ein
+  // auf- oder zugehendes Blatt ausloest.
+  //
+  // Was der Umschalter HERVORHEBT, folgt derselben Quelle (`flaechenmodus`):
+  // beide zeigen, was zu sehen ist.
+  const streifenVerborgen = !workerAufDerBuehne(m) || buehneZeigt(m).art !== 'terminal';
+  if (streifenVerborgen !== tabstreifenEl.hidden) {
+    tabstreifenEl.hidden = streifenVerborgen;
+    // ERST DEN STAND SETZEN, DANN NACHZIEHEN: `paneflaecheNachziehen` zeichnet
+    // die letzte Lage neu, ohne die Lage-Meldung noch einmal auszuloesen -- es
+    // entsteht also keine Schleife, und beim naechsten Zeichnen steht der
+    // Streifen schon richtig.
+    paneflaecheNachziehen();
+  }
+  // OHNE SITZUNG STEHT DER SCHALTER AUF NICHTS (03.09.2026, dritter Durchgang).
+  // Vorher zeigte er „Gezoomt" als gewaehlt, weil `lageJetzt()` auf die
+  // Auskunft der Flaeche sieht und die ohne Pane „ein Pane" meldet. Gewaehlt
+  // heisst aber: das siehst Du gerade. Zu sehen ist nichts, also ist keiner der
+  // drei gewaehlt und keiner bedienbar -- ein Schalter, der nichts schalten
+  // kann, gehoert abgeschaltet und nicht falsch beschriftet.
+  // DER SCHALTER ZEIGT KEINEN ZUSTAND, DEN MAN GERADE NICHT SIEHT (Befund 6).
+  // Liegt ein Gespraech auf der Buehne, gilt keine der drei Ansichten -- er
+  // stand bis heute auf „Gezoomt" und beschrieb damit die Kacheln einer
+  // Sitzung, die verdeckt war.
+  const kacheln = !!s && buehnenmodus === 'code' && buehneZeigt(m).art === 'terminal';
+  for (const b of lageEl.querySelectorAll<HTMLButtonElement>('[data-lage]')) {
+    const an = kacheln && b.dataset.lage === lage;
+    b.classList.toggle('gewaehlt', an);
+    b.setAttribute('aria-selected', String(an));
+    b.disabled = !kacheln;
+  }
+  lageEl.classList.toggle('aus', !kacheln);
+  // Die Buehne sagt selbst, dass sie leer ist -- eine schwarze Flaeche ohne ein
+  // Wort war der erste Blick auf ein frisches Programm.
+  leerEl.classList.toggle('an', !s);
+  // Der Ordnen-Knopf ordnet KACHELN -- in den beiden anderen Ansichten gibt es
+  // nichts zu ordnen, also ist er dort nicht da.
+  ordnenEl.hidden = lage !== 'gekachelt' || !m.mayArrange || !s;
+  if (!s) return;
+
+  const tabs = Math.max(1, m.capacity.tabs);
+  const gewaehlt = Math.min(m.ui.workerTab, tabs - 1);
+  // ERST AB ZWEI TABS (05.09.2026, Electron-Befund 6). Bei einem einzigen Tab
+  // stand dort „● Tab 1 4" -- ein Etikett fuer eine Auswahl, die es nicht gibt.
+  // Was der Streifen sonst noch traegt (der Dreifachschalter, „Ordnen"), bleibt
+  // stehen: der wechselt die Ansicht und hat auch mit einem Tab zu tun.
+  // Die Zahl der Tabs selbst aendert sich dadurch NICHT -- sie steht im
+  // Kapazitaetsblock (`capacity.tabs`), und die Buehne rechnet unveraendert
+  // damit.
+  if (tabs < 2) { tabsEl.classList.add('ganz'); return; }
+  for (let i = 0; i < tabs; i++) {
+    const drin = workerImTab(s, m, i);
+    if (!drin.length && i > 0) continue;
+    const k = document.createElement('button');
+    k.className = `tab${i === gewaehlt ? ' gewaehlt' : ''}`;
+    k.setAttribute('role', 'tab');
+    k.setAttribute('aria-selected', String(i === gewaehlt));
+    k.appendChild(punkt(tabFarbe(drin)));
+    k.appendChild(document.createTextNode(t('tab.marke', { n: i + 1 })));
+    const anzahl = document.createElement('span');
+    anzahl.className = 'anzahl';
+    anzahl.textContent = String(drin.length);
+    k.appendChild(anzahl);
+    k.title = drin.map((w) => w.name).join(', ');
+    k.addEventListener('click', () => {
+      uebersichtAn = false;
+      tabZeigen(m, s, i);
+    });
+    tabsEl.appendChild(k);
+  }
+  // Rollt der Streifen wirklich? Nur dann traegt er den Randverlauf -- sonst
+  // saehe der letzte Tab blass aus, ohne dass es etwas zu sehen gaebe.
+  tabsEl.classList.toggle('ganz', tabsEl.scrollWidth <= tabsEl.clientWidth + 1);
+}
+
+// --- Die Uebersicht ---------------------------------------------------------
+/**
+ * „Man will ja auch mal nur die Worker-Tabs sehen" (alice am 03.09.). Je Tab
+ * eine Karte mit den Workern darin -- Zustand, Name, Modell, Tokenstand und
+ * eine Zeile, die sagt, woran der Worker gerade ist. Kein Terminalbild: bei
+ * neun Panes sieht man dort neunmal denselben Begruessungstext und muss
+ * trotzdem lesen, um zu wissen, welcher Worker woran haengt.
+ *
+ * Ein Klick auf den Tabkopf landet in „Gekachelt" auf diesem Tab, ein Klick auf
+ * eine Worker-Zeile in „Gezoomt" auf diesem Worker.
+ */
+function zeichneUebersicht(m: Model): void {
+  uebersichtEl.classList.toggle('an', uebersichtAn);
+  if (!uebersichtAn) return;
+  uebersichtEl.replaceChildren();
+  const s = m.sessions.find((x) => x.id === m.selected);
+  if (!s) return;
+  // Wer ist Kind, und wer hat wie viele? Beides EINMAL fuer die ganze Karte
+  // gerechnet statt je Zeile (Befund 10).
+  const lebendeNamen = new Set(s.workers.filter((w) => w.alive).map((w) => w.name));
+  const kinderZahl = new Map<string, number>();
+  for (const w of s.workers) {
+    if (!w.alive || !w.requestedBy || !lebendeNamen.has(w.requestedBy)) continue;
+    kinderZahl.set(w.requestedBy, (kinderZahl.get(w.requestedBy) ?? 0) + 1);
+  }
+  const tabs = Math.max(1, m.capacity.tabs);
+  const gewaehlt = Math.min(m.ui.workerTab, tabs - 1);
+  let leer = true;
+  for (let i = 0; i < tabs; i++) {
+    const drin = workerImTab(s, m, i);
+    if (!drin.length && i > 0) continue;
+    leer = false;
+    const karte = document.createElement('div');
+    karte.className = `tabkarte${i === gewaehlt ? ' gewaehlt' : ''}`;
+    const kopf = document.createElement('button');
+    kopf.className = 'tabkarte-kopf';
+    kopf.appendChild(punkt(tabFarbe(drin)));
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = t('tab.marke', { n: i + 1 });
+    kopf.appendChild(name);
+    const anzahl = document.createElement('span');
+    anzahl.className = 'anzahl';
+    anzahl.textContent = t('worker.anzahl', { n: drin.length });
+    kopf.appendChild(anzahl);
+    kopf.addEventListener('click', () => {
+      uebersichtAn = false;
+      tabZeigen(m, s, i);
+    });
+    karte.appendChild(kopf);
+
+    for (const w of drin) {
+      // DIE HERKUNFT STEHT WIEDER DA (04.09.2026, Befund 10 der Inventur).
+      // Ein Worker, der auf Antrag eines anderen entstanden ist, sagt es in
+      // seiner Unterzeile und rueckt unter ihn ein; der Antragsteller traegt
+      // die Zahl seiner Kinder als `+n` neben dem Namen. Die Zugehoerigkeit
+      // steht damit in der GEOMETRIE und im Wort, nicht in einer Farbe -- die
+      // ist fuer den Zustand reserviert.
+      const kind = !!w.requestedBy && lebendeNamen.has(w.requestedBy);
+      const eigene = kinderZahl.get(w.name) ?? 0;
+      karte.appendChild(workerZeile({
+        klasse: `worker zustand-${w.state}${kind ? ' kind' : ''}`,
+        farbe: zustandFarbe(w.state),
+        name: w.name,
+        marke: eigene ? `+${eigene}` : '',
+        neben: w.model,
+        unten: [kind ? t('worker.aufAntrag', { name: w.requestedBy }) : '', w.titel || zustandText(w)]
+          .filter(Boolean).join(' · '),
+        tokens: tokenKurz(w),
+        pane: w.paneId,
+        tab: i,
+      }));
+      // V19: Subagenten stehen EINGERUECKT unter ihrem Worker. Sie haben einen
+      // eigenen Pane, zaehlen aber in der Kapazitaetsrechnung nicht mit -- die
+      // Zugehoerigkeit steckt deshalb in der Einrueckung und nicht in einer
+      // zweiten Farbe.
+      for (const sub of w.subagents) {
+        karte.appendChild(workerZeile({
+          klasse: 'subagent kind',
+          farbe: 'laeuft',
+          name: sub.name || sub.agentId,
+          neben: sub.type,
+          unten: '',
+          tokens: '',
+          pane: sub.paneId,
+          tab: i,
+        }));
+      }
+    }
+    uebersichtEl.appendChild(karte);
+  }
+
+  /**
+   * WAS KEINEN PANE MEHR HAT, VERSCHWINDET TROTZDEM NICHT. Vor dem Neubau
+   * standen fertige Worker, nicht einsehbare und elternlose Subagenten unter
+   * eigenen Ueberschriften in der rechten Leiste. Die Leiste gibt es nicht
+   * mehr; die Auskunft schon -- sie steht jetzt hier, in eigenen Karten unter
+   * den Tabs. „Nicht einsehbar" ist ausdruecklich NICHT „fertig": niemand
+   * konnte nachsehen, und das ist etwas anderes als ein Ende.
+   */
+  const karteFuer = (titel: string, zeilen: HTMLElement[]): void => {
+    if (!zeilen.length) return;
+    leer = false;
+    const karte = document.createElement('div');
+    karte.className = 'tabkarte';
+    const kopf = document.createElement('div');
+    kopf.className = 'tabkarte-kopf rubrik';
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = titel;
+    const anzahl = document.createElement('span');
+    anzahl.className = 'anzahl';
+    anzahl.textContent = t('worker.anzahl', { n: zeilen.length });
+    kopf.append(name, anzahl);
+    karte.appendChild(kopf);
+    for (const z of zeilen) karte.appendChild(z);
+    uebersichtEl.appendChild(karte);
+  };
+  karteFuer(t('worker.rubrikFertig'), s.workers.filter((w) => w.state === 'done').map((w) => workerZeile({
+    klasse: 'worker fertig', farbe: 'ruhig', name: w.name, neben: w.model,
+    unten: zustandText(w), tokens: tokenKurz(w), pane: '', tab: -1,
+  })));
+  karteFuer(t('worker.rubrikNichtEinsehbar'), s.workers.filter((w) => w.state === 'unknown').map((w) => workerZeile({
+    klasse: 'worker unbekannt', farbe: 'fern', name: w.name, neben: w.model,
+    unten: zustandText(w), tokens: '', pane: '', tab: -1,
+  })));
+  karteFuer(t('worker.rubrikUnbekannt'), s.orphanSubagents.map((sub) => workerZeile({
+    klasse: 'subagent ohne-eltern', farbe: 'laeuft', name: sub.name || sub.agentId,
+    neben: sub.type, unten: '', tokens: '', pane: sub.paneId, tab: -1,
+  })));
+
+  if (leer) {
+    const hinweis = document.createElement('div');
+    hinweis.className = 'uebersicht-leer';
+    hinweis.textContent = t('uebersicht.leer');
+    uebersichtEl.appendChild(hinweis);
+  }
+}
+
+/** Eine Zeile der Uebersicht. Ohne Pane ist sie nur Auskunft, kein Weg. */
+function workerZeile(opt: {
+  klasse: string; farbe: string; name: string; neben: string; unten: string;
+  tokens: string; pane: string; tab: number;
+  /** `+n` neben dem Namen: so viele Worker sind auf seinen Antrag entstanden. */
+  marke?: string;
+  /**
+   * Woher der Worker kommt -- Maschine und/oder Antragsteller. Steht VOR dem
+   * Text der Unterzeile, in derselben Zeile und derselben Farbe; ein eigener
+   * Span nur, damit der Lesehaken (`awb-ctl ui`) es getrennt zusagen kann.
+   */
+  herkunft?: string;
+}): HTMLElement {
+  const zeile = document.createElement('button');
+  zeile.className = `worker-zeile ${opt.klasse}`;
+  zeile.appendChild(punkt(opt.farbe));
+  const leib = document.createElement('span');
+  leib.className = 'leib';
+  const oben = document.createElement('span');
+  oben.className = 'oben';
+  const wname = document.createElement('span');
+  wname.className = 'wname';
+  wname.textContent = opt.name;
+  oben.appendChild(wname);
+  if (opt.marke) {
+    const marke = document.createElement('span');
+    marke.className = 'wkinder';
+    marke.textContent = opt.marke;
+    oben.appendChild(marke);
+  }
+  if (opt.neben) {
+    const wmodell = document.createElement('span');
+    wmodell.className = 'wmodell';
+    wmodell.textContent = opt.neben;
+    oben.appendChild(wmodell);
+  }
+  leib.appendChild(oben);
+  if (opt.unten || opt.herkunft) {
+    const letzte = document.createElement('span');
+    letzte.className = 'letzte';
+    if (opt.herkunft) {
+      const herkunft = document.createElement('span');
+      herkunft.className = 'wherkunft';
+      herkunft.textContent = opt.herkunft;
+      letzte.appendChild(herkunft);
+      if (opt.unten) letzte.appendChild(document.createTextNode(' · '));
+    }
+    if (opt.unten) letzte.appendChild(document.createTextNode(opt.unten));
+    leib.appendChild(letzte);
+  }
+  zeile.appendChild(leib);
+  if (opt.tokens) {
+    const wtokens = document.createElement('span');
+    wtokens.className = 'wtokens';
+    wtokens.textContent = opt.tokens;
+    zeile.appendChild(wtokens);
+  }
+  const untenText = [opt.herkunft, opt.unten].filter(Boolean).join(' · ');
+  zeile.title = `${opt.name}${opt.neben ? ` · ${opt.neben}` : ''}${untenText ? ` — ${untenText}` : ''}`;
+  if (opt.pane) {
+    zeile.addEventListener('click', () => {
+      uebersichtAn = false;
+      // Die Liste geht zu: sonst deckt sie genau den Pane, zu dem sie fuehrt.
+      workerlisteZu();
+      if (opt.tab >= 0) window.awbBridge.bedienung('worker-tab', opt.tab);
+      window.awbBridge.bedienung('show-pane', opt.pane);
+    });
+  } else {
+    zeile.disabled = true;
+  }
   return zeile;
 }
 
+for (const b of lageEl.querySelectorAll<HTMLButtonElement>('[data-lage]')) {
+  b.addEventListener('click', () => {
+    const m = modell;
+    const s = m?.sessions.find((x) => x.id === m.selected);
+    const welche = b.dataset.lage;
+    if (welche === 'uebersicht') {
+      uebersichtAn = true;
+    } else if (welche === 'gekachelt') {
+      uebersichtAn = false;
+      if (m && s) tabZeigen(m, s, Math.min(m.ui.workerTab, Math.max(0, m.capacity.tabs - 1)));
+    } else {
+      uebersichtAn = false;
+      // Gezoomt heisst: der Pane, der die Tastatur hat -- und wenn keiner sie
+      // hat, der erste des Tabs. Ein Zoom auf nichts waere kein Zoom.
+      const ziel = m?.streamPane
+        || (m && s ? workerImTab(s, m, Math.min(m.ui.workerTab, Math.max(0, m.capacity.tabs - 1)))[0]?.paneId : '');
+      if (ziel) window.awbBridge.bedienung('show-pane', ziel);
+    }
+    if (m) alles(m);
+  });
+}
+// ORDNEN heisst: den aktuellen Tab noch einmal anfordern. `show-tab` laesst den
+// Hauptprozess `fitWindow` mit `umraeumen` laufen, und genau das ist Ordnen.
+// Bis zum 03.09. stand hier `bedienung('arrange')` -- diese Aktion gibt es im
+// `switch` des Hauptprozesses nicht, der Knopf tat also nichts.
+ordnenEl.addEventListener('click', () => {
+  const m = modell;
+  const s = m?.sessions.find((x) => x.id === m.selected);
+  if (m && s) tabZeigen(m, s, Math.min(m.ui.workerTab, Math.max(0, m.capacity.tabs - 1)));
+});
+
+// --- Inspektor --------------------------------------------------------------
 /**
- * Die Farbe einer Tab-Marke fasst die Worker darin zusammen. Die Regel, damit
- * der Naechste sie nicht raet:
- *
- *   gelb   sobald EINER etwas will -- ein offener Antrag wartet auf eine
- *          Entscheidung. Gelb schlaegt gruen, weil eine Aufforderung nicht
- *          untergehen darf, nur weil daneben jemand arbeitet.
- *   gruen  sonst, solange einer laeuft.
- *   grau   wenn keiner mehr laeuft.
- *
- * Fertige Worker stehen in keinem Tab -- sie haben keinen Pane mehr. Dass in
- * einer Session etwas fertig geworden ist, sagt die Sessionleiste links (sie
- * wird gelb); in der rechten Leiste stehen sie aufgezogen unter "Fertig".
+ * Ordner, Aktivitaet und Protokolle. Ueber dem Inhalt sagt eine schmale Zeile,
+ * WOZU das Blatt gehoert: der Ordner haengt am PROJEKT und bleibt stehen, wenn
+ * der Orchestrator wechselt; Aktivitaet und Protokolle wechseln mit ihm. Ohne
+ * diese Zeile sieht man einer Liste nicht an, worauf sie sich bezieht -- und
+ * bei mehreren Orchestratoren im selben Projekt ist das die halbe Auskunft.
  */
-function tabFarbe(workers: { state: string }[]): string {
-  if (!workers.length) return 'ruhig';
-  // Dieselbe Rangfolge wie bei einem einzelnen Worker: was steht, schlaegt
-  // was laeuft -- sonst geht ein haengender Worker neben vier arbeitenden
-  // unter, und genau das soll die Farbe verhindern.
-  if (workers.some((w) => w.state === 'blocked' || w.state === 'stalled')) return 'will';
-  // Ein Tab, ueber dessen Worker nichts bekannt ist, ist NICHT gruen (07.08.).
-  // Gruen hiesse hier "alles laeuft", und das ist die eine Auskunft, die
-  // niemand geben kann, solange die Panes nicht abzufragen waren. Er faerbt
-  // sich auch nicht gelb: gelb ist eine Aufforderung, und es gibt nichts zu
-  // tun. Er bekommt die Farbe der Sitzung, die ihn traegt.
-  if (workers.some((w) => w.state === 'unknown')) return 'fern';
-  return 'laeuft';
+/**
+ * WIE BREIT EIN GEOEFFNETES BLATT STEHT (04.09.2026, Befund 1).
+ *
+ * Der Reiterstreifen und das Blatt sind zwei verschiedene Masse. Der Streifen
+ * darf vierzig Bildpunkte schmal sein -- er traegt nur drei Reiter. Ein Blatt
+ * bei vierzig Bildpunkten ist unlesbar, und genau das war der Zustand: das
+ * Blatt fuellte seine Spalte, und die Spalte war der Streifen.
+ *
+ * Untergrenze 280 (darunter bleibt vom Dateibaum kein lesbarer Name),
+ * Obergrenze 45 % der Fensterbreite (darueber nimmt das Blatt der Buehne mehr,
+ * als es selbst braucht), dazwischen der Wert, den der Mensch gezogen hat.
+ */
+function blattBreiteJetzt(m: Model): number {
+  const gewuenscht = m.ui.blattBreite ?? 360;
+  const obergrenze = Math.max(280, Math.round(window.innerWidth * 0.45));
+  return Math.max(280, Math.min(obergrenze, gewuenscht));
+}
+
+/** Steht gerade eines der drei Blaetter offen? Wenn ja, welches. */
+function offenesBlatt(): string {
+  // DIE KENNUNG DES PROTOKOLLBLATTES IST `pl-panel` (05.09.2026, Regelbruch 1).
+  // Hier stand `pr-panel`, und diesen Kasten gibt es nicht: der Fund war immer
+  // leer, das Blatt galt als zu, und die Spalte blieb auf der Reiterbreite von
+  // vierzig Bildpunkten stehen -- der Text lief darin senkrecht Buchstabe fuer
+  // Buchstabe. Ordner und Aktivitaet trafen ihre Kaesten und klappten auf.
+  const kasten: Record<string, string> = { ordner: 'or', aktivitaet: 'ak', protokolle: 'pl' };
+  return Object.keys(kasten).find(
+    (n) => document.getElementById(`${kasten[n]}-panel`)?.classList.contains('offen'),
+  ) ?? '';
 }
 
 /**
- * Die Farbe eines Worker-Zustands (V1).
- *   gruen  laeuft
- *   gelb   blockiert oder haengt -- beide verlangen eine Handlung
- *   grau   fertig, also kein Pane mehr
- *   fern   nicht einsehbar -- niemand konnte nachsehen (07.08.)
+ * ZU HEISST NULL BILDPUNKTE (05.09.2026, Electron-Befund 1).
  *
- * Die letzte Zeile ist DIESELBE Farbe, die die Sitzung links traegt, wenn ihre
- * Panes nicht abzufragen sind. Zwei Ebenen, eine Aussage, eine Farbe: ein
- * Worker ohne Auskunft darf weder wie ein fertiger aussehen (grau, dann sucht
- * niemand mehr nach ihm) noch wie ein Fehler (gelb, dann sucht jemand nach
- * einer Handlung, die es nicht gibt).
+ * Rechts stand ein vierzig Bildpunkte breiter Streifen, solange kein Blatt
+ * offen war. Er war leer: die drei Reiter darin fielen in einer Spaltenreihe
+ * auf null Hoehe zusammen (`flex: 1 1 0` auf der Hauptachse schlaegt ihre
+ * 22 Bildpunkte), und was blieb, war eine Karte ohne Inhalt neben der Buehne.
+ *
+ * Der Inspektor ist jetzt eine Spalte, die es nur GIBT, solange ein Blatt
+ * offen steht. Der Schalter oben rechts ist der Weg hinein und hinaus: er
+ * oeffnet das zuletzt gelesene Blatt und schliesst das offene. Die drei Reiter
+ * stehen weiter oben in der Spalte, also bleibt der Wechsel zwischen den
+ * Blaettern da, wo er war.
+ *
+ * DAMIT FAELLT DIE ZWEITE BREITE WEG: `rightWidth` war das Mass des
+ * Reiterstreifens, und den gibt es nicht mehr. Die eine Breite, die noch
+ * gezogen wird, ist die des Blattes (`blattBreite`).
  */
-function zustandFarbe(state: string): string {
-  if (state === 'blocked' || state === 'stalled') return 'will';
-  if (state === 'done') return 'ruhig';
-  if (state === 'unknown') return 'fern';
-  return 'laeuft';
-}
-
-/**
- * Die Unterzeile eines Workers. Sie sagt, WORAN man ist -- nicht die CPU-Zahl,
- * die dort bis heute stand: `ps` mittelt sie ueber die Lebenszeit, und ein
- * Client, der auf eine Antwort wartet, rechnet nicht (gemessen 1,3 Sekunden
- * CPU in 82 Minuten Arbeit). Die Kontextauslastung kommt dagegen aus dem
- * Transcript und ist die Zahl, wegen der man ueberhaupt hinsieht.
- */
-function zustandText(w: Worker): string {
-  const teile = [w.kind];
-  // Ohne Fenster in der Modell-Registry gibt es keine Prozentzahl. Dann stehen
-  // die belegten Tokens da statt einer erfundenen Quote -- und der fehlende
-  // Registry-Eintrag faellt auf, statt sich zu verstecken.
-  if (w.contextPercent >= 0) teile.push(`${w.contextPercent} % Kontext`);
-  else if (w.contextTokens > 0) teile.push(`${Math.round(w.contextTokens / 1000)}k Kontext`);
-  if (w.state === 'blocked') {
-    teile.push(w.blockedReason === 'guard' ? 'angehalten vom Guard' : 'wartet auf Entscheidung');
-  } else if (w.state === 'stalled') teile.push(`haengt seit ${dauer(w.idleSeconds)}`);
-  else if (w.state === 'done') teile.push(w.resultPath ? 'fertig, Ergebnis da' : 'fertig, kein Ergebnis');
-  // Warum das Fenster nicht nachsehen konnte, steht EINMAL -- an der Sitzung,
-  // die den Grund kennt (Meldung aus dem tmux-Befund). Hier steht nur, dass
-  // dieser Satz ueber diesen Worker nicht gilt.
-  else if (w.state === 'unknown') teile.push('nicht einsehbar');
-  return teile.filter(Boolean).join(' · ');
-}
-
-/** Eine Dauer in Sekunden, kurz geschrieben. */
-function dauer(sekunden: number): string {
-  if (sekunden < 0) return '?';
-  if (sekunden < 90) return `${sekunden} s`;
-  if (sekunden < 5400) return `${Math.round(sekunden / 60)} min`;
-  return `${Math.round(sekunden / 360) / 10} h`;
-}
-
-function zeichneRechts(m: Model): void {
-  // EINE stufenlose Breite, wie links. Kein zweiter, diskreter Zustand
-  // daneben: der hat sich mit der Breite gestritten -- die Untergrenze 120 des
-  // einen gegen die 40 des anderen --, und deshalb tat der Griff nichts.
-  // Was gezeigt wird, haengt allein an der Breite.
-  const schmal = m.ui.rightWidth <= 64;
-  rechtsEl.classList.toggle('schmal', schmal);
-  rechtsEl.style.width = `${m.ui.rightWidth}px`;
+function zeichneInspektor(m: Model): void {
+  const offen = offenesBlatt();
+  rechtsEl.hidden = !offen;
+  griffRechtsEl.hidden = !offen;
+  inspKnopfEl.setAttribute('aria-pressed', String(Boolean(offen)));
+  if (offen) letztesBlatt = offen;
+  const breite = blattBreiteJetzt(m);
+  rechtsEl.style.width = `${breite}px`;
   rechtsListeEl.replaceChildren();
-  tabsEl.replaceChildren();
-  hinweisEl.textContent = '';
 
   const s = m.sessions.find((x) => x.id === m.selected);
-  if (!s) return;
-
-  // GESEHENE Panes, nicht "nicht fertig": in die Tabs unten geht nur, was auch
-  // einen Pane hat, den man zeigen kann. Ein Worker im Zustand 'unknown' hat
-  // keinen -- nicht weil er weg waere, sondern weil niemand nachsehen konnte --
-  // und bekommt weiter unten eine eigene Rubrik statt einer Kachel ins Leere.
-  const lebende = s.workers.filter((w) => w.alive);
-  const lebendeNamen = new Set(lebende.map((w) => w.name));
-  /**
-   * Ein Worker gilt hier als Kind, wenn er auf den ANTRAG eines Workers
-   * entstanden ist, der selbst noch laeuft. Ist der Antragsteller weg, steht
-   * das Kind wieder oben -- eine Einrueckung unter etwas, das nicht mehr da
-   * ist, waere eine Behauptung ueber eine Zugehoerigkeit, die niemand sieht.
-   */
-  const kinderVon = (name: string): typeof lebende =>
-    lebende.filter((w) => w.requestedBy === name && lebendeNamen.has(w.requestedBy));
-  const obere = lebende.filter((w) => !w.requestedBy || !lebendeNamen.has(w.requestedBy));
-  /**
-   * Ein Worker spawnt in diesem Haus NIE selbst -- er beantragt, und der
-   * Orchestrator entscheidet und spawnt. Die Zeile muss das sagen: nicht
-   * "X hat Y gestartet", sondern dass Y auf Antrag von X entstanden ist.
-   */
-  const herkunft = (w: (typeof lebende)[number]): string =>
-    w.requestedBy && lebendeNamen.has(w.requestedBy) ? `auf Antrag von ${w.requestedBy}` : '';
-
-  const tabs = Math.max(1, m.capacity.tabs);
-  const tab = Math.min(m.ui.workerTab, tabs - 1);
-  if (tabs > 1) {
-    for (let i = 0; i < tabs; i++) {
-      const k = document.createElement('button');
-      k.className = `tab${i === tab ? ' gewaehlt' : ''}`;
-      k.textContent = String(i + 1);
-      k.addEventListener('click', () => window.awbBridge.bedienung('worker-tab', i));
-      tabsEl.appendChild(k);
-    }
+  for (const k of rechtsEl.querySelectorAll<HTMLButtonElement>('.knopf[data-tot]')) {
+    k.classList.toggle('gewaehlt', k.dataset.tot === offen);
+  }
+  reiterAufschriftPruefen(rechtsEl.hidden ? -1 : Math.round(rechtsEl.getBoundingClientRect().width));
+  // Ein Blatt, das gerade aufgegangen ist, macht die Spalte breiter -- und
+  // damit die Buehne schmaler. Ohne dieses Nachziehen bekaeme tmux die alte
+  // Zellenzahl, und der Inhalt liefe ueber seine Kachel hinaus.
+  if (offen !== zuletztOffenesBlatt) {
+    const vorherOffen = Boolean(zuletztOffenesBlatt);
+    zuletztOffenesBlatt = offen;
+    // DER HAUPTPROZESS MUSS ES WISSEN (Electron-Befund 7): er rechnet die
+    // Kapazitaet, und ein offenes Blatt senkt die Mindestbreite je Pane auf
+    // den gemessenen Boden, statt die Buehne auf eine Spalte fallen zu lassen.
+    // Gemeldet wird nur der WECHSEL -- eine Meldung je Klick, nicht je Zeichnen.
+    if (vorherOffen !== Boolean(offen)) window.awbBridge.bedienung('blatt-offen', Boolean(offen));
+    paneflaecheNachziehen();
+  }
+  inspBereichEl.replaceChildren();
+  if (s && offen) {
+    const wort = offen === 'ordner' ? t('inspektor.projekt') : t('inspektor.orchestrator');
+    const wert = document.createElement('b');
+    wert.textContent = offen === 'ordner' ? projektName(s.dir) : s.name;
+    inspBereichEl.append(document.createTextNode(`${wort} `), wert);
+  }
+  // DER SCHLIESSEN-KNOPF WIRD SICHTBAR (04.09.2026, Befund 12). Die drei
+  // Blaetter bringen je einen eigenen mit, aber ihre Kopfzeile steht auf
+  // `display: none` -- fuer ein Skript erreichbar, fuer eine Maus nicht.
+  //
+  // Er steht hier und nicht in den drei Blaettern: die Zeile darueber nennt
+  // ohnehin schon, WOZU das offene Blatt gehoert, und ein × an ihrem rechten
+  // Ende ist eine Reihe Bedienelemente statt dreier. Er tut genau das, was ein
+  // zweiter Klick auf den Reiter tut -- dieselbe eine Stelle (`flaeche.ts`,
+  // `umschalten`), erreicht ueber den Reiter, den es schon gibt.
+  if (offen) {
+    const zu = document.createElement('button');
+    zu.className = 'insp-zu';
+    // EINE KENNUNG, DAMIT DER STEUERKANAL IHN ERREICHT (05.09.2026). `awb-ctl
+    // klick` faellt auf `getElementById` zurueck, wenn kein `data-tot` passt --
+    // ohne diese Zeile liess sich der Knopf kopflos nicht ausloesen, und damit
+    // war die Zusage „ein Klick darauf schliesst das Blatt" nicht pruefbar.
+    zu.id = 'blatt-schliessen';
+    zu.type = 'button';
+    zu.title = t('inspektor.blattSchliessen');
+    zu.appendChild(svg('<path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/>', 13, 1.5));
+    zu.addEventListener('click', () => {
+      rechtsEl.querySelector<HTMLButtonElement>(`.knopf[data-tot="${offen}"]`)?.click();
+    });
+    inspBereichEl.appendChild(zu);
   }
 
-  const zeile = (opt: {
-    klasse: string; farbe: string; kopf: string; unten: string; pane: string;
-    marke?: string; zusatz?: string; tabIndex?: number; tabPanes?: string[];
-  }): void => {
-    const el = document.createElement('div');
-    el.className = `zeile ${opt.klasse}`;
-    if (opt.pane && opt.pane === m.streamPane) el.classList.add('gewaehlt');
-    // Statt eines Punktes ohne Auskunft ein kleines Feld mit ein bis zwei
-    // Zeichen: eingeklappt sagt es nicht nur, WIE der Eintrag steht, sondern
-    // auch, WER er ist -- und genau das braucht man beim Wechseln. Dieselbe
-    // Bildsprache wie die Kuerzel der Sessions links.
-    const punkt = document.createElement('div');
-    punkt.className = `punkt ${opt.farbe}-bg ${opt.farbe}`;
-    punkt.textContent = opt.marke ?? '';
-    el.appendChild(punkt);
-    const text = document.createElement('div');
-    text.className = 'text';
-    const oben = document.createElement('div');
-    oben.className = 'name';
-    const nam = document.createElement('span');
-    nam.textContent = opt.kopf;
-    oben.appendChild(nam);
-    if (opt.zusatz) {
-      const z = document.createElement('span');
-      z.className = 'anhang';
-      z.textContent = opt.zusatz;
-      oben.appendChild(z);
-    }
-    text.appendChild(oben);
-    if (opt.unten) {
-      const unten = document.createElement('div');
-      unten.className = 'last';
-      unten.textContent = opt.unten;
-      text.appendChild(unten);
-    }
-    el.appendChild(text);
-    el.title = `${opt.kopf}${opt.zusatz ? ` (${opt.zusatz})` : ''} ${opt.unten}`.trim();
-    if (opt.tabIndex !== undefined) {
-      el.addEventListener('click', () => {
-        window.awbBridge.bedienung('worker-tab', opt.tabIndex);
-        // ALLE Panes des Tabs nebeneinander -- nicht einer davon.
-        if (opt.tabPanes?.length) window.awbBridge.bedienung('show-tab', opt.tabPanes);
-      });
-    } else if (opt.pane) {
-      el.addEventListener('click', () => window.awbBridge.bedienung('show-pane', opt.pane));
-    }
-    rechtsListeEl.appendChild(el);
-  };
-
-  /**
-   * Ein Subagent. Seine Farbe traegt jetzt den ZUSTAND wie bei allen anderen --
-   * er laeuft, also gruen. Frueher stand hier das Blau des vierten Zustands,
-   * und damit hiess dieselbe Farbe im selben Fenster zweierlei: links
-   * "Maschine nicht erreichbar", rechts "Subagent". Dass er ein Subagent ist,
-   * sagen jetzt die Einrueckung, die kleinere Marke, die Linie zum Elternteil
-   * und die Art in der Unterzeile.
-   */
-  const subagentZeile = (sub: Subagent, klasse: string): void => {
-    zeile({
-      klasse: `subagent ${klasse}`,
-      farbe: 'laeuft',
-      kopf: sub.name || sub.agentId,
-      unten: sub.type,
-      pane: sub.paneId,
-      marke: kuerzel(sub.name || sub.agentId),
-    });
-  };
-
-  /** Eine Ueberschrift mit Linie. Eingeklappt bleibt nur die Linie uebrig. */
-  const rubrik = (text: string): void => {
-    const el = document.createElement('div');
-    el.className = 'rubrik';
-    const t = document.createElement('span');
-    t.textContent = text;
-    el.appendChild(t);
-    rechtsListeEl.appendChild(el);
-  };
-
-  zeile({
-    klasse: 'orchestrator',
-    farbe: farbklasse(s.state),
-    kopf: 'Orchestrator',
-    unten: s.tmuxSession,
-    pane: s.orchestratorPane,
-    marke: 'O',
-  });
-
-  /** Ein Worker mit allem, was unter ihm haengt: Kind-Worker und Subagenten. */
-  const workerMitAnhang = (w: (typeof lebende)[number], nurAus?: typeof lebende): void => {
-    // Gezeigt werden die Kinder, die in demselben Tab liegen; die uebrigen
-    // stehen bei ihrem eigenen Tab. Die Zahl am Worker zaehlt trotzdem ALLE.
-    const alleKinder = kinderVon(w.name);
-    const kinder = nurAus ? alleKinder.filter((k) => nurAus.some((x) => x.name === k.name)) : alleKinder;
-    const anhang = alleKinder.length + w.subagents.length;
-    zeile({
-      klasse: `worker zustand-${w.state}`,
-      farbe: zustandFarbe(w.state),
-      kopf: w.name,
-      // Die Zahl steht beim Worker selbst, damit sie auch dann zu sehen ist,
-      // wenn die Ebene darunter nicht ins Bild passt.
-      zusatz: anhang ? `+${anhang}` : '',
-      // Die Herkunft haengt am Worker, nicht an seiner Einrueckung: liegt er
-      // in einem anderen Tab als sein Antragsteller, steht sie trotzdem da.
-      //
-      // EIN WORKER AUS EINEM PANE (19.08., `fremdePanes` in sessions.ts) hat
-      // keine Zustandsdatei und damit weder Modell noch Kontextzahl. Was ihn
-      // beschreibt, ist der Pane-Titel -- er steht hier statt einer Zustands-
-      // zeile, die aus lauter Unbekannten bestuende.
-      unten: herkunft(w) || (w.titel || zustandText(w)),
-      pane: w.paneId,
-      marke: kuerzel(w.name),
-    });
-    for (const k of kinder) {
-      zeile({
-        klasse: `worker kind zustand-${k.state}`,
-        farbe: zustandFarbe(k.state),
-        kopf: k.name,
-        unten: herkunft(k) || zustandText(k),
-        pane: k.paneId,
-        marke: kuerzel(k.name),
-      });
-      for (const sub of k.subagents) subagentZeile(sub, 'kind tief');
-    }
-    // V19: eingerueckt unter ihrem Worker, ohne Platz in der Rechnung.
-    for (const sub of w.subagents) subagentZeile(sub, 'kind');
-  };
-
-  /**
-   * Die Reihenfolge, in der die Worker in den Panes liegen: jeder obere,
-   * unmittelbar gefolgt von dem, was auf seinen Antrag entstanden ist. Ein
-   * Kind-Worker hat einen EIGENEN Pane und belegt deshalb einen Platz im
-   * Gitter -- die Tabs muessen ihn also mitzaehlen, sonst weicht die Zahl der
-   * Marken von der Kapazitaetsrechnung ab.
-   */
-  const flach = obere.flatMap((w) => [w, ...kinderVon(w.name)]);
-  const imTab = (i: number): typeof flach => flach.slice(i * m.capacity.perTab, (i + 1) * m.capacity.perTab);
-
-  // Der Tab ist IMMER ein Eintrag, den man anklicken kann -- schmal steht er
-  // allein, aufgezogen stehen die Worker dieses Tabs eingerueckt darunter. Ein
-  // Klick auf den Tab zeigt ALLE seine Panes nebeneinander, ein Klick auf einen
-  // Worker nur diesen.
-  for (let i = 0; i < tabs; i++) {
-    const drin = imTab(i);
-    if (!drin.length && i > 0) continue;
-    zeile({
-      klasse: `tabmarke${i === tab ? ' gewaehlt' : ''}`,
-      farbe: tabFarbe(drin),
-      kopf: `Tab ${i + 1}`,
-      unten: schmal ? drin.map((w) => w.name).join(', ') : `${drin.length} Worker`,
-      pane: '',
-      tabIndex: i,
-      tabPanes: drin.map((w) => w.paneId).filter(Boolean),
-      marke: String(i + 1),
-    });
-    if (schmal) continue;
-    for (const w of drin) {
-      if (w.requestedBy && lebendeNamen.has(w.requestedBy) && drin.some((x) => x.name === w.requestedBy)) continue;
-      workerMitAnhang(w, drin);
-    }
-  }
-
-  if (!schmal) {
-    // NICHT EINSEHBAR IST NICHT FERTIG (07.08.). Hier stand `!x.alive`, und
-    // damit ruecken bei ausgefallenem tmux ALLE Worker der Sitzung unter die
-    // Ueberschrift "Fertig" -- die Ueberschrift selbst behauptet dann etwas,
-    // das niemand nachgesehen hat. Sie fuehrt jetzt nur noch, was wirklich
-    // keinen Pane mehr hat; die uebrigen stehen darunter unter ihrer eigenen.
-    const fertige = s.workers.filter((x) => x.state === 'done');
-    const unbekannte = s.workers.filter((x) => x.state === 'unknown');
-    if (fertige.length) rubrik('Fertig');
-    for (const w of fertige) {
-      // Dieselbe Stelle formuliert den Zustand wie oben -- ein Worker soll
-      // nicht an zwei Orten verschieden beschrieben werden. Ob ein Ergebnis
-      // daliegt, steht dabei getrennt von "kein Pane mehr": ein Worker kann
-      // geschlossen worden sein, ohne je eines geschrieben zu haben.
-      zeile({
-        klasse: 'worker fertig',
-        farbe: 'ruhig',
-        kopf: w.name,
-        unten: zustandText(w),
-        pane: '',
-        marke: kuerzel(w.name),
-      });
-    }
-    // Die eigene Rubrik: sie sagt in ihrer Ueberschrift, was mit diesen Zeilen
-    // los ist, statt es jeder einzelnen zu ueberlassen. Anklickbar ist hier
-    // nichts -- ohne Pane gibt es nichts zu zeigen --, und die Farbe ist die
-    // der Sitzung, die den Grund traegt.
-    if (unbekannte.length) rubrik('Nicht einsehbar');
-    for (const w of unbekannte) {
-      zeile({
-        klasse: 'worker unbekannt',
-        farbe: 'fern',
-        kopf: w.name,
-        unten: zustandText(w),
-        pane: '',
-        marke: kuerzel(w.name),
-      });
-    }
-    for (const sub of s.orphanSubagents) {
-      subagentZeile(sub, 'ohne-eltern');
-    }
-  }
-
-  // Was die Kopfzeile hergab, hat hier seinen Platz: die Groessenregel und die
-  // Zusage aus F14. Beides steht ausserdem in `awb-ctl state`, und der Titel
-  // der Leiste nennt beim Ueberfahren auch Session, Pane und Groesse.
-  const teile = [`${m.capacity.perTab} Panes je Tab (${m.capacity.perRow}x${m.capacity.perColumn})`];
-  if (m.capacity.cappedBySetting) teile.push('Obergrenze aus den Einstellungen greift');
-  // Drei Faelle, und sie sehen verschieden aus -- das gehoert gesagt, sonst
-  // liest sich eine halb gefuellte Kachel wie ein Zeichenfehler.
-  const eigene = auskunft.regel.startsWith('eigene');
+  // Die Kachelform bleibt als Hilfeschildchen erreichbar, steht aber nicht mehr
+  // dauerhaft im Bild (A14: kein Dauerhinweis, der um Aufmerksamkeit wirbt).
+  const kurz = [t('satz.kachelungKurz', {
+    proTab: m.capacity.perTab, spalten: m.capacity.spalten, zeilen: m.capacity.zeilen,
+  })];
+  const teile = [t('satz.kachelung', {
+    proTab: m.capacity.perTab,
+    spalten: m.capacity.spalten,
+    zeilen: m.capacity.zeilen,
+    maxSpalten: m.capacity.perRow,
+    maxZeilen: m.capacity.perColumn,
+  })];
+  if (m.capacity.cappedBySetting) teile.push(t('satz.obergrenze'));
   if (!m.mayArrange) {
-    teile.push(
-      `Fremde Session, ${m.fremdeClients} weitere${m.fremdeClients === 1 ? 'r' : ''} Client${m.fremdeClients === 1 ? '' : 's'} haengt daran: die Aufteilung der Panes wird gezeichnet und nicht umgeraeumt -- die GROESSE des Fensters folgt trotzdem der Buehne, solange hier gezeichnet wird, und wird beim Abloesen zurueckgestellt`,
-    );
-  } else if (eigene) {
-    teile.push('Eigene Session: Groesse zugewiesen (window-size manual)');
+    const eineMehrzahl = m.fremdeClients === 1 ? '.eins' : '';
+    teile.push(t(`satz.fremdeSitzung${eineMehrzahl}`, { n: m.fremdeClients }));
+    kurz.push(t(`satz.fremdeSitzungKurz${eineMehrzahl}`, { n: m.fremdeClients }));
+  } else if (auskunft.regel.startsWith('eigene')) {
+    teile.push(t('satz.eigeneSitzung'));
   } else if (auskunft.regel !== '-') {
-    teile.push('Uebernommene Session, kein anderer Client daran: wird gekachelt und beim Abloesen zurueckgestellt');
+    teile.push(t('satz.uebernommeneSitzung'));
   }
-  hinweisEl.textContent = teile.join('. ') + '.';
+  hinweisEl.textContent = kurz.join(' · ');
+  hinweisEl.title = teile.map((z) => (z.endsWith('.') ? z : `${z}.`)).join(' ');
+  // Sie steht da, solange es etwas zu kacheln gibt. Liegt ein Gespraech auf der
+  // Buehne oder ist der Streifen im Orchestrator-Modus gar nicht da, sagt sie
+  // nichts ueber das, was man sieht.
+  hinweisEl.hidden = Boolean(m.chatGezeigt ?? '') || Boolean(m.chatWerkstattGezeigt ?? '') || tabstreifenEl.hidden;
   rechtsEl.title = [
     `Session ${auskunft.session}`,
     `Pane ${auskunft.pane}`,
@@ -1237,1363 +2307,149 @@ function zeichneRechts(m: Model): void {
   ].join('\n');
 }
 
-/**
- * Die Flaeche bestimmt die Zahlen, nicht umgekehrt.
- *
- * Frueher stand hier eine Skalierung: das Gitter bekam die Groesse der
- * tmux-Session und wurde mit transform: scale() in die Flaeche gequetscht.
- * Daraus kamen drei Fehler auf einmal -- ein leerer Rand oben und unten, weil
- * die Seitenverhaeltnisse selten zusammenpassen; ein falsch gezeichneter
- * Worker-Pane, weil die Zahl vom FENSTER kam und der Inhalt vom PANE; und ein
- * unscharfes Bild, weil ein skaliertes Gitter kein gezeichnetes Gitter ist.
- *
- * Jetzt wird gemessen, wieviele ganze Zellen in die Flaeche passen, und tmux
- * bekommt genau diese Zahlen. Damit sind Gitter und Pane per Konstruktion
- * gleich gross, und es bleibt nichts uebrig, das man verteilen muesste.
- *
- * EINE ZELLGROESSE, NICHT ZWEI (06.08.). Hier stand das Zubehoer von xterm.js
- * (`FitAddon.proposeDimensions`). Es rechnet gegen SEIN Terminal: gegen dessen
- * Innenabstand, dessen Bildlaufleiste und dessen Elternkasten -- und keines
- * davon ist die Buehne, auf der gezeichnet wird. Gemessen an der laufenden
- * Instanz: Buehne 1414 Bildpunkte, Zelle 7,825 -- es passen 180 Spalten,
- * angeboten wurden 144. Die fehlenden 287 Bildpunkte sind genau der Rand, den
- * alice gesehen hat. Deshalb kommen Spalten und Zeilen jetzt aus derselben
- * Rechnung wie die Kacheln: die Flaeche der Buehne, geteilt durch die EINE
- * gemessene Zellgroesse (zellmass).
- */
-let gemeldet = { cols: 0, rows: 0 };
-
-/** Wieviele ganze Zellen die Buehne fasst -- die Zahl, die tmux bekommt. */
-function flaecheInZellen(): { cols: number; rows: number } | null {
-  const zelle = zellmass();
-  const { b, h } = gitterFlaeche();
-  if (!(zelle.breite > 0) || !(zelle.hoehe > 0) || !(b > 0) || !(h > 0)) return null;
-  return { cols: Math.max(20, Math.floor(b / zelle.breite)), rows: Math.max(5, Math.floor(h / zelle.hoehe)) };
-}
-
-function passeAn(): void {
-  const mass = flaecheInZellen();
-  if (!mass) return;
-  if (mass.cols === gemeldet.cols && mass.rows === gemeldet.rows) return;
-  gemeldet = mass;
-  window.awbBridge.bedienung('flaeche', mass);
-}
-
-window.addEventListener('resize', passeAn);
-
-// Das Fenster ist nicht die einzige Quelle einer neuen Flaeche: seit die
-// Schubladen in der Reihe stehen, macht auch das Aufklappen die Buehne
-// schmaler, und dabei aendert sich die Fenstergroesse nicht. Beobachtet wird
-// deshalb die Buehne selbst -- das deckt jede kuenftige Aenderung an der
-// Anordnung mit ab. `passeAn` meldet nur bei wirklich anderer Zellenzahl,
-// also entsteht daraus keine Schleife.
-// Das Fenster ist nicht die einzige Quelle einer neuen Flaeche: seit die
-// Schubladen in der Reihe stehen, macht auch das Aufklappen die Buehne
-// schmaler, und dabei aendert sich die Fenstergroesse nicht.
-//
-// Ein ResizeObserver auf der Buehne waere der allgemeine Weg -- und er ist
-// GEMESSEN falsch: mit ihm fielen fuenf Zusagen der Oberflaechen-Suite, die
-// ohne ihn halten (63 zu 0 gegen 58 zu 5, beide Male derselbe Baum). Er meldet
-// auch Aenderungen, die aus dem Zeichnen selbst kommen, und eine Zahl aus dem
-// Zwischenzustand bleibt als `gemeldet` stehen und sperrt die richtige danach.
-// Ein Aufschub ins naechste Einzelbild reichte nicht. Deshalb meldet die
-// Stelle, die die Breite wirklich aendert -- die Schublade --, und sonst
-// niemand.
-//
-// GEZEICHNET WIRD SOFORT MIT, ohne auf tmux zu warten: die Kacheln liegen in
-// Bildpunkten, und eine Kachel, die auf die alte Breite gerechnet ist, laesst
-// beim Zuklappen genau den leeren Streifen stehen, um den es hier geht. Was
-// tmux dazu sagt, kommt hinterher und veraendert nur noch den Inhalt.
-document.addEventListener('awb:flaeche-geaendert', () => requestAnimationFrame(() => {
-  passeAn();
-  if (letzteLage) zeichneLage(letzteLage);
-}));
-
-// Beide Leisten lassen sich aufziehen (A15): die linke nach rechts, die rechte
-// nach links. Dieselbe Bauart, nur die Rechnung ist gespiegelt.
-let zieht: '' | 'links' | 'rechts' = '';
-griffEl.addEventListener('mousedown', (e) => {
-  zieht = 'links';
-  e.preventDefault();
+// DER SCHALTER OBEN RECHTS OEFFNET UND SCHLIESST DAS BLATT (05.09.2026,
+// Electron-Befund 1). Vorher blendete er die Spalte aus und wieder ein, und
+// die Spalte konnte dabei leer sein. Jetzt gibt es nur noch die zwei
+// Zustaende, die man auch sieht: ein Blatt steht da, oder rechts ist nichts.
+// Gedrueckt wird derselbe Reiter, den auch eine Maus draufklickt -- ein Weg,
+// nicht zwei (flaeche.ts, `umschalten`).
+inspKnopfEl.addEventListener('click', () => {
+  const offen = offenesBlatt();
+  rechtsEl.querySelector<HTMLButtonElement>(`.knopf[data-tot="${offen || letztesBlatt}"]`)?.click();
 });
-griffRechtsEl.addEventListener('mousedown', (e) => {
-  zieht = 'rechts';
-  e.preventDefault();
-});
-/**
- * WAEHREND DES ZIEHENS BLEIBT ALLES IM FENSTER (16.08.).
- *
- * Bis heute schickte jede Mausbewegung ein `bedienung('sidebar-width')` an den
- * Hauptprozess, und der schrieb je Meldung `ui.json` (uistate.ts: writeFileSync
- * plus renameSync) und schickte das VOLLE Modell zurueck. Bei den ueblichen
- * 60-120 Ereignissen je Sekunde waren das ebenso viele Dateischreibvorgaenge
- * und Voll-Updates pro Sekunde -- fuer eine Breite, die niemand ausser diesem
- * Fenster braucht, solange die Maus noch unten ist.
- *
- * Jetzt folgt die Breite der Maus rein oertlich (CSS, hoechstens einmal je
- * Einzelbild), und GESPEICHERT wird beim Loslassen -- einmal.
- *
- * ZWEI AUSNAHMEN, die kein Schmuck sind:
- *   * Wechselt die BREITENSTUFE (schmal/mittel/breit bzw. schmal rechts), aendert
- *     sich nicht nur die Breite, sondern der Inhalt der Leiste -- und der wird
- *     aus dem Modell gezeichnet. Dann geht die Meldung sofort raus, damit das
- *     Bild waehrend des Ziehens nicht luegt. Das passiert ein- bis zweimal je
- *     Zug, nicht sechzigmal je Sekunde.
- *   * BEIM LOSLASSEN meldet die Buehne ihre neue Flaeche
- *     (`awb:flaeche-geaendert`) -- einmal, nicht je Einzelbild. Je Bild waere
- *     je Spaltenwechsel ein `resize-pane` an tmux, also ein Sturm fuer eine
- *     Bewegung; bis heute geschah dabei ueberhaupt nichts, und das Terminal
- *     blieb bis zur naechsten Fensteraenderung in der alten Spaltenzahl.
- *
- * Die Grenzen stehen hier UND in main.ts ('sidebar-width'/'right-width'). Die
- * hiesigen sind nur fuers Zeichnen da -- was gespeichert wird, klemmt der
- * Hauptprozess weiterhin selbst ab; er bleibt die Instanz, diese Zahl ist nur
- * das Bild davon.
- */
-const ZIEH_GRENZEN = { links: { min: 48, max: 480 }, rechts: { min: 40, max: 560 } };
-let ziehBreite = 0;
-let ziehRahmen = 0;
-
-function ziehBreiteZeichnen(welche: 'links' | 'rechts', breite: number): void {
-  if (welche === 'links') {
-    linksEl.classList.toggle('schmal', breitenmodus(breite) === 'schmal');
-    linksEl.style.width = `${breite}px`;
-  } else {
-    rechtsEl.classList.toggle('schmal', breite <= 64);
-    rechtsEl.style.width = `${breite}px`;
-  }
-}
-
-function ziehMelden(welche: 'links' | 'rechts', breite: number): void {
-  window.awbBridge.bedienung(welche === 'links' ? 'sidebar-width' : 'right-width', breite);
-}
-
-/** Die Stufe, in der die Leiste gerade GEZEICHNET ist -- aus dem Modell, nicht geraten. */
-function ziehStufe(welche: 'links' | 'rechts', breite: number): string {
-  return welche === 'links' ? breitenmodus(breite) : (breite <= 64 ? 'schmal' : 'breit');
-}
-
-window.addEventListener('mousemove', (e) => {
-  if (!zieht) return;
-  const g = ZIEH_GRENZEN[zieht];
-  const roh = zieht === 'links' ? e.clientX : window.innerWidth - e.clientX;
-  const breite = Math.max(g.min, Math.min(g.max, Math.round(roh)));
-  const vorher = zieht === 'links'
-    ? (modell?.ui.sidebarWidth ?? 48)
-    : (modell?.ui.rightWidth ?? 210);
-  if (ziehStufe(zieht, vorher) !== ziehStufe(zieht, breite)) {
-    // Stufenwechsel: der Inhalt der Leiste haengt daran, also einmal den
-    // vollen Weg gehen. Danach steht die neue Stufe im Modell, und die naechste
-    // Bewegung faellt wieder in den billigen Fall.
-    ziehMelden(zieht, breite);
-    ziehBreite = breite;
-    return;
-  }
-  ziehBreite = breite;
-  if (ziehRahmen) return;
-  const welche = zieht;
-  ziehRahmen = requestAnimationFrame(() => {
-    ziehRahmen = 0;
-    ziehBreiteZeichnen(welche, ziehBreite);
+for (const k of rechtsEl.querySelectorAll<HTMLButtonElement>('.knopf[data-tot]')) {
+  // Die Blaetter schalten sich selbst um (flaeche.ts, `umschalten`); hier wird
+  // nur nachgezogen, welcher Reiter danach gewaehlt aussieht.
+  k.addEventListener('click', () => {
+    requestAnimationFrame(() => { if (modell) zeichneInspektor(modell); });
   });
-});
-window.addEventListener('mouseup', () => {
-  if (!zieht) return;
-  const welche = zieht;
-  zieht = '';
-  if (ziehRahmen) {
-    cancelAnimationFrame(ziehRahmen);
-    ziehRahmen = 0;
+}
+
+// --- Maschinenkarten und Fusszeile der linken Leiste ------------------------
+const statuszeileEl = initFussStatus();
+
+function zeichneStatus(m: Model): void {
+  if (statuszeileEl) zeichneStatuszeile(statuszeileEl, m.ampel, m.budget, m.maschinen ?? [], m.machine);
+  const laufend = m.sessions.reduce(
+    (n, s) => n + s.workers.filter((w) => w.state === 'running' || w.state === 'blocked' || w.state === 'stalled').length,
+    0,
+  );
+  stWorkerEl.replaceChildren();
+  const zahl = document.createElement('b');
+  zahl.textContent = String(laufend);
+  stWorkerEl.append(zahl, document.createTextNode(` ${t('status.workerLaufen')}`));
+}
+
+// --- Alles zusammen ---------------------------------------------------------
+function alles(m: Model): void {
+  if (m.selected && m.selected !== modusAngewandtFuer) {
+    modusAngewandtFuer = m.selected;
+    const s = m.sessions.find((x) => x.id === m.selected);
+    if (s?.orchestratorPane && gemerkterModus(m, m.selected) === 'orchestrator') {
+      window.awbBridge.bedienung('show-pane', s.orchestratorPane);
+    }
   }
-  if (!ziehBreite) return;
-  ziehBreiteZeichnen(welche, ziehBreite);
-  // ERST JETZT wird gespeichert: ein Zug ist eine Entscheidung, nicht sechzig.
-  ziehMelden(welche, ziehBreite);
-  document.dispatchEvent(new CustomEvent('awb:flaeche-geaendert'));
-  ziehBreite = 0;
+  zeichneKopf(m);
+  zeichneInhaltskopf(m);
+  if (sitzungskarteAuf) sitzungskarteZeichnen(m);
+  if (workerlisteAuf) workerlisteZeichnen(m);
+  zeichneBaum(m);
+  zeichneStreifen(m);
+  zeichneUebersicht(m);
+  zeichneInspektor(m);
+  zeichneStatus(m);
+}
+
+// --- Die Flaeche in der Mitte ----------------------------------------------
+initPaneflaeche({
+  /**
+   * WAS IN DER KOPFZEILE EINES PANES STEHT. Der Name kommt aus dem Modell, das
+   * Modell und der Tokenstand aus dem Worker dahinter -- und was die Bruecke
+   * nicht kennt, bleibt leer. Ein Orchestrator-Pane hat weder Modell noch
+   * Tokenstand in dieser Liste; ein Subagent hat seine Art statt eines Modells.
+   */
+  kopfZuPane(paneId) {
+    const leer = { name: paneId, zustand: 'ruhig', modell: '', tokens: '' };
+    const s = modell?.sessions.find((x) => x.id === modell?.selected);
+    if (!s) return leer;
+    if (paneId === s.orchestratorPane) {
+      return { name: t('pane.orchestrator'), zustand: farbklasse(s.state), modell: s.model ?? '', tokens: '' };
+    }
+    const w = s.workers.find((x) => x.paneId === paneId);
+    if (w) return { name: w.name, zustand: zustandFarbe(w.state), modell: w.model, tokens: tokenKurz(w) };
+    for (const x of s.workers) {
+      const sub = x.subagents.find((y) => y.paneId === paneId);
+      if (sub) return { name: sub.name || sub.agentId, zustand: 'laeuft', modell: sub.type, tokens: '' };
+    }
+    const os = s.orphanSubagents.find((y) => y.paneId === paneId);
+    if (os) return { name: os.name || os.agentId, zustand: 'laeuft', modell: os.type, tokens: '' };
+    return leer;
+  },
+  /**
+   * Der Zoom-Knopf einer Kopfzeile. Was auf der Flaeche liegt, entscheidet der
+   * Hauptprozess -- hier wird nur gesagt, was gewuenscht ist: aus den Kacheln
+   * heraus dieser eine Pane, aus dem Zoom zurueck zu allen Panes des Tabs.
+   */
+  aufZoom(paneId, gezoomt) {
+    uebersichtAn = false;
+    const m = modell;
+    const s = m?.sessions.find((x) => x.id === m.selected);
+    if (gezoomt && m && s) {
+      tabZeigen(m, s, Math.min(m.ui.workerTab, Math.max(0, m.capacity.tabs - 1)));
+      return;
+    }
+    window.awbBridge.bedienung('show-pane', paneId);
+  },
+  aufAktivemPane(paneId) {
+    auskunft.pane = paneId || '-';
+  },
+  aufLage(p) {
+    // WELCHE PANES WIRKLICH GEZEICHNET SIND. Daran haengt der Umschalter im
+    // Inhaltskopf: er zeigt, was zu sehen ist, nicht was gemerkt wurde.
+    gezeichnetePanes = p.panes.map((b) => b.paneId).filter(Boolean);
+    auskunft.groesse = `${p.cols}x${p.rows}`;
+    auskunft.ansicht = p.art === 'tab'
+      ? `Tab mit ${p.panes.length} Panes${p.fehlend?.length ? `, ${p.fehlend.length} fehlen` : ''}`
+      : 'ein Pane';
+    // Eine neue Lage heisst: eine andere Ansicht liegt auf der Flaeche. Der
+    // Dreifachschalter und die Tabs muessen das sofort zeigen, sonst behauptet
+    // der Streifen etwas, das darunter nicht mehr stimmt.
+    // AUCH DER INHALTSKOPF ZIEHT SOFORT NACH. Sein Umschalter zeigt, was auf
+    // der Flaeche liegt; ohne diesen Aufruf bliebe er bis zum naechsten
+    // Modelltakt auf dem vorigen Stand -- gemessen am Belegbild vom 04.09.:
+    // „Orchestrator" gewaehlt, daneben drei Worker-Kacheln.
+    if (modell) {
+      rechtsZaehler.layout++;
+      zeichneInhaltskopf(modell);
+      zeichneStreifen(modell);
+      zeichneInspektor(modell);
+    }
+  },
+  aufSitzung(p) {
+    auskunft.session = p.session || '-';
+    auskunft.pane = p.activePane || '-';
+    auskunft.regel = p.sizePolicy === 'owned'
+      ? 'eigene Session (manual)'
+      : p.sizePolicy ? 'fremde Session (uebernommen)' : '-';
+    if (modell) { rechtsZaehler.session++; zeichneInspektor(modell); }
+  },
 });
 
-// Das Zahnrad steht an seinem Platz, damit das Layout stimmt; seine Ansicht
-// kommt in einer spaeteren Stufe. Wer darauf klickt, soll das hoeren -- ein
-// Knopf, der schweigt, sieht kaputt aus. Die drei anderen (ordner, aktivitaet,
-// freigaben) haben je ihre eigene Ansicht und bleiben deshalb aussen vor.
-const spaeter: Record<string, string> = {};
-for (const knopf of document.querySelectorAll<HTMLButtonElement>('.knopf[data-tot]:not([data-tot="freigaben"]):not([data-tot="ordner"]):not([data-tot="aktivitaet"]):not([data-tot="protokolle"]):not([data-tot="einstellungen"])')) {
-  knopf.addEventListener('click', () => notiz(spaeter[knopf.dataset.tot ?? ''] ?? ''));
-}
+// --- Die Blaetter -----------------------------------------------------------
 initFreigabenView();
 initEditorView();
+// DER TAB AGENTS: DIE WELTEN (Auftrag agentsui Nr. 4, seit Nr. 6 im Tab). Ihre Daten kommen
+// ueber `awb:aufgaben`, ihre Handlungen `welt:*` gehen ueber denselben Weg wie am Mac.
+initWeltenView({
+  handlung(befehl, opt) { return window.awbBridge.aufgabe(befehl, opt); },
+  daten() { return window.awbBridge.aufgabenDaten(); },
+  sichtbar(an) { window.awbBridge.aufgabenSichtbar(an); },
+  testhaken: window.awbBridge.testhaken === true,
+});
+window.awbBridge.onAufgaben((p) => { weltenAufgaben(p); });
 initAktivitaetView();
 initOrdnerView();
 initProtokolleView();
-const statuszeileEl = initFussStatus();
-
-/**
- * Die Mitte zeichnet MEHRERE Panes, so wie tmux sie im Fenster liegen hat.
- *
- * Die Aufteilung kommt aus `#{window_layout}` und traegt fuer jeden Pane seine
- * Lage in ZELLEN. Multipliziert mit der Zellgroesse ergibt das den Kasten in
- * Pixeln -- die Trennlinien stecken schon in den Abstaenden, weil tmux fuer
- * jede eine Spalte beziehungsweise Zeile mitrechnet.
- *
- * Ein Terminal je Pane: xterm haelt Puffer, Cursor und Umbruch je Instanz, und
- * genau das braucht jeder Pane fuer sich.
- */
-interface PaneEintrag {
-  term: Terminal;
-  el: HTMLDivElement;
-  /**
-   * Ob DIESES Terminal seinen Rueckblick bekommen hat. Die Angabe haengt am
-   * Terminal, nicht am Pane: `reset()` wirft den Puffer weg, ein neu angelegtes
-   * Terminal faengt ohnehin leer an -- beides nimmt den Rueckblick, und beides
-   * setzt die Angabe zurueck. Der Hauptprozess schickt ihn nur EINMAL je Pane
-   * (main.ts, historieHolen); ohne diese Buchfuehrung hier bliebe jedes zweite
-   * Terminal fuer immer ohne, und genau das war der Fehler vom 06.08.
-   */
-  rueckblickDa: boolean;
-  /** Ob fuer dieses Terminal schon einer angefordert wurde -- genau einmal. */
-  rueckblickGefragt: boolean;
-}
-const paneTerms = new Map<string, PaneEintrag>();
-/** Je Pane eine Chat-Ansicht, die ueber ihm liegt (SPEC-V4 Abschnitt 6). */
-const chatAnbindungen = new Map<string, ChatAnbindung>();
-/**
- * Die Kachel-Geometrie, WIE SIE GESETZT wurde -- nicht wie sie hinterher aus
- * dem DOM zurueckgelesen wird.
- *
- * `uiState()` mass frueher jede `.panekasten`-Kante einzeln per
- * `getBoundingClientRect()` und rundete x, y, b und h je fuer sich. Zwei
- * Kacheln, deren Grenze auf demselben Wert `kachel.y` beruht (Kachel 2 endet,
- * wo Kachel 3 beginnt -- dieselbe Zahl aus `kachelLage()`), rundeten dabei
- * UNABHAENGIG: einmal ueber "gerundete Position plus gerundete Hoehe", einmal
- * ueber "gerundete eigene Position" -- und konnten dadurch bis zu einem Pixel
- * auseinanderlaufen, obwohl sie sich in Wirklichkeit nur beruehrten. Diese
- * Karte haelt die Zahl fest, die tatsaechlich in `style.left/top/width/height`
- * gelandet ist; `uiState()` liest daraus, nicht mehr aus dem DOM zurueck.
- */
-const letzteKacheln = new Map<string, { x: number; y: number; b: number; h: number; fehlt: boolean }>();
-/**
- * Ob die Anwendung in einem Pane die Maus verfolgt. Die Quelle ist tmux, nicht
- * das Terminal im Fenster: eine Momentaufnahme traegt Text und Farben, aber
- * keine Modus-Umschaltungen. Ein frisch angelegtes Terminal wuesste also nichts
- * davon -- und genau deshalb landete das Rad im Puffer des Fensters statt bei
- * der Anwendung (gemeldet 06.08.: "ich verschiebe den Worker-Tab einfach als
- * ganzen Tab nach oben und nach unten").
- */
-const mausModus = new Map<string, { an: boolean; sgr: boolean }>();
-const gitterEl = document.getElementById('gitter') as HTMLDivElement;
-let letzteLage: LayoutPayload | null = null;
-
-/**
- * Wie gross EINE ZELLE ist -- gemessen am MASS-TERMINAL, und nur ersatzweise an
- * einem gezeichneten Pane.
- *
- * Die Reihenfolge ist Absicht und gemessen (06.08.). Das Mass-Terminal wird nie
- * umgestellt: seine Zellbreite steht still, solange die Schrift steht. Ein
- * gezeichneter Pane dagegen taugt in genau zwei Lagen NICHT als Mass -- waehrend
- * eines Groessenwechsels (`term.cols` ist schon neu, gezeichnet ist noch das
- * alte Bild) und wenn sein Inhalt breiter ist als seine Kachel (dann steht dort
- * die beschnittene Breite). Beide Male kommt eine um ein bis zwei Prozent zu
- * kleine Zelle heraus, daraus zu viele Spalten, daraus ein zu breiter Inhalt --
- * und der naechste Durchgang misst noch kleiner. GEMESSEN als Pendeln zwischen
- * 127 und 129 Spalten, das von selbst nicht aufhoerte.
- *
- * Im Ruhezustand sind beide dieselbe Zahl (gemessen 7,825 gegen 7,828 -- der
- * Unterschied ist die Rundung des Kastens). Es gibt also weiter nur EINE
- * Zellgroesse; sie wird nur dort abgelesen, wo sie stillsteht.
- */
-function zellmass(): { breite: number; hoehe: number } {
-  const g = paneEl.querySelector('.xterm-screen')?.getBoundingClientRect();
-  if (g && term.cols && term.rows && g.width > 0) {
-    return { breite: g.width / term.cols, hoehe: g.height / term.rows };
-  }
-  for (const [, e] of paneTerms) {
-    const s = e.el.querySelector('.xterm-screen')?.getBoundingClientRect();
-    if (s && s.width > 0 && e.term.cols && e.term.rows) {
-      return { breite: s.width / e.term.cols, hoehe: s.height / e.term.rows };
-    }
-  }
-  // Rueckfall, solange das Mass-Terminal noch nichts gezeichnet hat. Er stand
-  // als 7,8 und 15 hier -- die Zellgroesse EINER Schrift in EINER Groesse, und
-  // bei jeder anderen falsch. Jetzt waechst er mit der eingestellten Schrift:
-  // gemessen sind 0,6 der Schriftgroesse in der Breite und 1,15 in der Hoehe
-  // (bei 13 Pixeln 7,8 und 15 -- also genau die alten Zahlen, nur nicht mehr
-  // festgenagelt).
-  return { breite: schriftgroesse * 0.6, hoehe: schriftgroesse * 1.15 };
-}
-
-/**
- * Eine neue Schriftgroesse anwenden.
- *
- * Alles Uebrige zieht von selbst nach: die Zellgroesse wird gemessen (zellmass),
- * daraus meldet `passeAn` neue Spalten und Zeilen an tmux, und aus DENEN fallen
- * Kachelrechnung, Mindestbreite und die Zahl der Panes je Tab. Deshalb wird
- * hier nur die Groesse gesetzt und die Flaechenmeldung erzwungen -- der Rest
- * ist der gewoehnliche Weg.
- */
-function setzeSchrift(px: number): void {
-  if (!Number.isFinite(px) || px < 8 || px > 32 || px === schriftgroesse) return;
-  schriftgroesse = px;
-  term.options.fontSize = px;
-  for (const [, e] of paneTerms) e.term.options.fontSize = px;
-  // Die zuletzt gemeldete Zellenzahl gilt nicht mehr: sie stammt aus der alten
-  // Schrift und wuerde die neue Meldung als "unveraendert" verwerfen.
-  gemeldet = { cols: 0, rows: 0 };
-  requestAnimationFrame(() => {
-    passeAn();
-    if (letzteLage) zeichneLage(letzteLage);
-  });
-}
-
-/**
- * Das Gitter eines Tabs -- von der Oberflaeche gelegt, nicht von tmux.
- *
- * Fuer die Panes EINES Fensters ist die Aufteilung von tmux die Wahrheit, und
- * fuer 'pane' bleibt sie es auch. Ein Tab dagegen zeigt Panes aus MEHREREN
- * Fenstern, und deren Koordinaten zaehlen je Fenster: nebeneinandergelegt
- * ergeben sie kein gemeinsames Gitter, sondern zufaellige Abstaende -- zwei
- * Panes diagonal in den Ecken, zwei leere Haelften dazwischen, und zwei Panes
- * mit derselben Koordinate liegen uebereinander.
- *
- * Die Zahl der Spalten kommt aus der Kapazitaetsrechnung (main, capacity.ts).
- * Die letzte Reihe zieht sich auf die volle Breite: drei Kacheln in einem
- * zweispaltigen Gitter lassen sonst ein leeres Viertel stehen.
- */
-/**
- * Die Flaeche, auf der ein Tab seine Kacheln legt.
- *
- * EINE Quelle fuer eine Zahl, die sonst zweimal gemessen wurde: `clientWidth`/
- * `clientHeight` runden auf ganze Pixel, `getBoundingClientRect()` liefert die
- * echte Nachkommazahl -- an derselben Flaeche kamen so zwei leicht
- * verschiedene Werte heraus (639 gegen 638.x), und die letzte Kachel eines
- * Rasters ragte um den Rundungsrest hinaus. Die Kacheln selbst werden mit
- * Nachkommastellen positioniert (toFixed(1)); `getBoundingClientRect()` ist
- * also nicht nur die praezisere Zahl, sondern die, die zur Positionierung
- * passt. `uiState()` liest dieselbe Funktion fuer die gemeldete Buehnengroesse
- * -- damit koennen Lage und Meldung nicht mehr auseinanderlaufen.
- */
-function gitterFlaeche(): { b: number; h: number } {
-  const g = gitterEl.getBoundingClientRect();
-  if (g.width && g.height) return { b: g.width, h: g.height };
-  const f = buehne.getBoundingClientRect();
-  return { b: f.width, h: f.height };
-}
-
-/**
- * Die Kachel EINES Panes aus seiner wirklichen Lage im tmux-Fenster.
- *
- * DER GRUND (Messung des Nutzers vom 06.08.): Kacheln nach der Reihenfolge zu
- * vergeben und die Groessen von tmux zu nehmen, sind zwei Geometrien -- und sie
- * lagen gegeneinander verschoben. Ein Pane bekam die volle Breite auf der
- * Buehne und die halbe Spaltenzahl im Terminal, ein anderer umgekehrt; die
- * rechte Haelfte blieb schwarz, der Nachbar lief ueber seine Kachel hinaus. Wo
- * alle gezeigten Panes in EINEM Fenster liegen, gibt es diesen zweiten Ursprung
- * nicht mehr: die Kachel folgt der Lage, und Spaltenzahl und Kachelbreite
- * kommen damit aus derselben Zahl. Das gilt fuer jede Zahl von Panes, auch fuer
- * eine ungerade -- die letzte Kachel einer Reihe ist genau so breit, wie tmux
- * ihren Pane gemacht hat.
- *
- * DIE TRENNLINIE GEHOERT ZUR KACHEL. tmux laesst zwischen zwei Panes eine
- * Spalte bzw. Zeile fuer seinen Rahmen. Ohne sie blieben zwischen den Kacheln
- * Streifen der Buehne stehen, und die Flaeche waere nicht gedeckt; also
- * bekommt sie die Kachel LINKS bzw. OBEN davon dazu. Der Inhalt sitzt darin
- * weiterhin in seiner eigenen Groesse -- die eine Zelle Unterschied ist genau
- * der Rahmen, den auch tmux dort zeichnet.
- */
-function kachelAusRaster(
-  box: PaneBox,
-  raster: { cols: number; rows: number },
-): { x: number; y: number; b: number; h: number } {
-  const { b: flaecheB, h: flaecheH } = gitterFlaeche();
-  const trennerRechts = box.x + box.cols >= raster.cols ? 0 : 1;
-  const trennerUnten = box.y + box.rows >= raster.rows ? 0 : 1;
-  return {
-    x: (box.x / raster.cols) * flaecheB,
-    y: (box.y / raster.rows) * flaecheH,
-    b: ((box.cols + trennerRechts) / raster.cols) * flaecheB,
-    h: ((box.rows + trennerUnten) / raster.rows) * flaecheH,
-  };
-}
-
-/**
- * `breiten` ist die Spaltenzahl JE PANE, in der Reihenfolge der Kacheln, und
- * `flaecheCols` die Spaltenzahl der ganzen Buehne. Damit teilt eine Reihe ihre
- * Breite nach dem, was die Panes wirklich brauchen, statt zu gleichen Teilen.
- *
- * DER GRUND: tmux teilt eine Reihe nicht gleichmaessig, sondern verteilt den
- * Rest -- bei drei Spalten auf 133 Zellen werden daraus 44, 44 und 45. Bei
- * gleich breiten Kacheln (je ein Drittel) ist der Pane mit 45 Spalten dann
- * breiter als seine Kachel, und das letzte Zeichen jeder Zeile wird
- * abgeschnitten. GEMESSEN am 19.08. kopflos mit sieben und acht Workern im
- * Layout 'split': Schirm 338 Bildpunkte in einer Kachel von 334.
- *
- * Verteilt wird nur, wenn die Reihe zusammen NICHT breiter ist als die Buehne
- * -- sonst waere die Rechnung ein Verschieben des Abschnitts von einem Pane auf
- * den naechsten. Fehlt eine Zahl (ein angeforderter Pane, den es nicht gibt),
- * bleibt es bei gleichen Teilen.
- */
-/**
- * DIE KACHELN, WENN DER TAB NUR EINEN TEIL EINES FENSTERS ZEIGT.
- *
- * Die Lage der gezeigten Panes ist die von tmux -- zwischen ihnen fehlen aber
- * Zellen (im Layout 'split' die des Orchestrators). Zwei Zusagen zugleich:
- *
- *   - KEINE LUECKE. Jede Reihe wird auf die volle Breite verteilt, die Reihen
- *     zusammen auf die volle Hoehe. Was fehlt, hinterlaesst kein leeres Viertel.
- *   - NICHTS ABGESCHNITTEN. Verteilt wird nach der Spalten- und Zeilenzahl der
- *     Panes selbst. Weil die gezeigten Panes einer Reihe zusammen nie mehr
- *     Spalten haben als das Fenster, ist jede Kachel mindestens so breit wie
- *     ihr Inhalt; fuer die Hoehe gilt dasselbe.
- *
- * Bis dahin fiel dieser Fall auf das gleichmaessige Gitter zurueck, das die
- * wirkliche Groesse der Panes nicht kennt. GEMESSEN am 19.08. kopflos mit vier
- * Workern im Layout 'split': tmux hatte dem letzten Pane 133 Spalten gegeben
- * (998 Bildpunkte), seine Kachel war 501 breit -- die halbe Ausgabe stand
- * ausserhalb.
- */
-function kachelnAusTeilraster(
-  boxen: PaneBox[],
-  buehneZellen: { cols: number; rows: number },
-): { x: number; y: number; b: number; h: number }[] {
-  const { b: flaecheB, h: flaecheH } = gitterFlaeche();
-  // Die Reihen des Fensters, in der Reihenfolge von oben nach unten; leere
-  // Reihen (nur ungezeigte Panes) fallen dabei ganz weg.
-  const reihen = [...new Set(boxen.map((b) => b.y))].sort((a, b) => a - b);
-  const hoeheJeReihe = reihen.map((y) => Math.max(...boxen.filter((b) => b.y === y).map((b) => b.rows)));
-  const summeHoehe = hoeheJeReihe.reduce((a, b) => a + b, 0) || 1;
-  // Der Riegel gegen eine Aufteilung, die den Inhalt doch beschneiden wuerde:
-  // gemessen wird gegen die BUEHNE in Zellen, nicht gegen das Fenster. Das
-  // Fenster ist in diesem Fall absichtlich groesser (main.ts, zweiter
-  // Durchgang); massgeblich ist, ob die gezeigten Panes zusammen auf die Buehne
-  // passen. Tun sie es nicht, gleiche Teile -- dann ist ohnehin nichts zu
-  // retten.
-  const hoehePasst = summeHoehe <= buehneZellen.rows;
-  const lagen = new Map<string, { x: number; y: number; b: number; h: number }>();
-  let oben = 0;
-  for (const [n, y] of reihen.entries()) {
-    const inReihe = boxen.filter((b) => b.y === y).sort((a, b) => a.x - b.x);
-    const summeBreite = inReihe.reduce((a, b) => a + b.cols, 0) || 1;
-    const breitePasst = summeBreite <= buehneZellen.cols;
-    const h = hoehePasst ? (hoeheJeReihe[n] / summeHoehe) * flaecheH : flaecheH / reihen.length;
-    let links = 0;
-    for (const box of inReihe) {
-      const b = breitePasst ? (box.cols / summeBreite) * flaecheB : flaecheB / inReihe.length;
-      lagen.set(box.paneId, { x: links, y: oben, b, h });
-      links += b;
-    }
-    oben += h;
-  }
-  return boxen.map((box) => lagen.get(box.paneId) ?? { x: 0, y: 0, b: flaecheB, h: flaecheH });
-}
-
-function kachelLage(
-  anzahl: number,
-  spalten: number,
-  breiten?: number[],
-  flaecheCols?: number,
-): { x: number; y: number; b: number; h: number }[] {
-  const { b: flaecheB, h: flaecheH } = gitterFlaeche();
-  const zeilen = Math.max(1, Math.ceil(anzahl / spalten));
-  const hoehe = flaecheH / zeilen;
-  const lagen: { x: number; y: number; b: number; h: number }[] = [];
-  for (let z = 0; z < zeilen; z++) {
-    const inZeile = Math.min(spalten, anzahl - z * spalten);
-    if (inZeile <= 0) break;
-    const cols = breiten?.slice(z * spalten, z * spalten + inZeile) ?? [];
-    const summe = cols.reduce((a, b) => a + b, 0);
-    const nachMass =
-      cols.length === inZeile && cols.every((c) => c > 0) && !!flaecheCols && summe <= flaecheCols;
-    let x = 0;
-    for (let i = 0; i < inZeile; i++) {
-      const breite = nachMass ? (cols[i] / summe) * flaecheB : flaecheB / inZeile;
-      lagen.push({ x, y: z * hoehe, b: breite, h: hoehe });
-      x += breite;
-    }
-  }
-  return lagen;
-}
-
-/**
- * Ein gezeichnetes Terminal ohne Rueckblick fordert einen an -- EINMAL.
- *
- * Der Hauptprozess schickt den Rueckblick einmal je Pane und merkt sich das.
- * Diese Buchfuehrung ist eine Annahme darueber, was im Fenster steht, und sie
- * kann falsch werden: laedt das Fenster neu (oder wirft eine leere Lage alle
- * Terminals weg), entstehen sie neu, waehrend der Merkposten drueben bleibt.
- * Dann gaebe es nie wieder einen Rueckblick. Also sagt die Stelle Bescheid,
- * die es als einzige WEISS -- hier liegt der Puffer.
- *
- * Genau einmal je Terminal: kommt daraufhin ein Rueckblick, wird das Terminal
- * zurueckgesetzt und die Frage darf wiederkommen; kommt keiner (der Pane hat
- * wirklich keinen), bleibt es bei dem einen Anlauf. So kann daraus kein Kreis
- * aus Fragen und Neuzeichnen werden.
- */
-function rueckblickAnfordern(paneId: string): void {
-  const eintrag = paneTerms.get(paneId);
-  if (!eintrag || eintrag.rueckblickDa || eintrag.rueckblickGefragt) return;
-  eintrag.rueckblickGefragt = true;
-  window.awbBridge.rueckblickFehlt(paneId);
-}
-
-/** Nach dem Zeichnen: steht wirklich etwas ueber dem Schirm? */
-function rueckblickPruefen(paneId: string): void {
-  const eintrag = paneTerms.get(paneId);
-  if (!eintrag) return;
-  const buf = eintrag.term.buffer.active;
-  // Auf dem Alternativschirm gibt es keinen Rueckblick und soll auch keiner
-  // sein -- dort waere die Frage sinnlos und der Neuaufbau schaedlich.
-  if (buf.type === 'alternate' || buf.baseY > 0) return;
-  rueckblickAnfordern(paneId);
-}
-
-function zeichneLage(p: LayoutPayload): void {
-  letzteLage = p;
-  const zelle = zellmass();
-  // Der gezeigte Ausschnitt wird auf die Flaeche normiert: zeigt ein Tab nur
-  // einen Teil der Panes eines Fensters, sitzt er trotzdem oben links.
-  const x0 = Math.min(...p.panes.map((b) => b.x), 0);
-  const y0 = Math.min(...p.panes.map((b) => b.y), 0);
-  const gesehen = new Set<string>();
-  letzteKacheln.clear();
-  for (const [id, m] of Object.entries(p.maus ?? {})) mausModus.set(id, m);
-  // Mit Raster kommt die Kachel aus der Lage des Panes (kachelAusRaster), ohne
-  // Raster aus seinem Platz in der Anforderung. Die zweite Form bleibt fuer die
-  // Faelle, in denen es kein gemeinsames Raster GIBT: Panes aus mehreren
-  // Fenstern, oder ein Fenster, von dem nur ein Teil gezeigt wird.
-  const raster = p.art === 'tab' ? p.raster : undefined;
-  const teilraster = p.art === 'tab' && !raster ? p.rasterTeil : undefined;
-  const teilKacheln = teilraster ? kachelnAusTeilraster(p.panes, { cols: p.cols, rows: p.rows }) : null;
-  // Ein EINZELN gezeigter Pane bekommt die ganze Buehne als Kachel -- dieselbe
-  // Regel wie im Tab: die Kachel bestimmt den Kasten, nicht der Inhalt. Bis
-  // zum 06.08. bekam er die Groesse seines Inhalts, und damit wanderte jede
-  // Zahl, die tmux gerade hergab, unmittelbar in die Flaeche: 144 Spalten von
-  // einem angehaengten Terminal liessen 287 Bildpunkte leer, 197 Spalten
-  // liessen ihn 127 Bildpunkte ueber die Buehne hinauslaufen (beides von
-  // alice gemessen). Ob der Inhalt die Kachel auch fuellt, ist eine andere
-  // Frage -- die beantwortet die Groesse, die tmux bekommt.
-  const kacheln =
-    p.art === 'tab'
-      ? (raster || teilKacheln
-          ? null
-          : kachelLage(
-              p.panes.length + (p.fehlend?.length ?? 0),
-              Math.max(1, p.spalten ?? 1),
-              [...p.panes.map((b) => b.cols), ...(p.fehlend ?? []).map(() => 0)],
-              p.cols,
-            ))
-      : [{ x: 0, y: 0, ...gitterFlaeche() }];
-
-  for (const [i, box] of p.panes.entries()) {
-    gesehen.add(box.paneId);
-    let eintrag = paneTerms.get(box.paneId);
-    const neu = !eintrag;
-    if (!eintrag) {
-      const el = document.createElement('div');
-      el.className = 'panekasten';
-      el.dataset.pane = box.paneId;
-      // Die Schriftgroesse kommt aus der EINSTELLUNG, nicht aus TERMOPT: das
-      // Objekt wird einmal beim Laden gebaut und traegt die Vorgabe von damals.
-      // Ein Pane, der nach einer Aenderung neu angelegt wird, saehe sonst
-      // anders aus als seine Nachbarn.
-      const t = new Terminal({ cols: box.cols, rows: box.rows, ...TERMOPT, fontSize: schriftgroesse });
-      t.open(el);
-      ladeRenderer(box.paneId, t);
-      t.onData((daten) => paneEingabe(box.paneId, daten));
-      terminalZwischenablageHaken(t);
-      /**
-       * WEM DAS RAD GEHOERT -- und warum die Vorgabe seit dem 06.08. umgedreht
-       * ist.
-       *
-       * Vorher gehoerte es der Anwendung, sobald sie die Maus verfolgte. Das
-       * ist die Sitte in einem Terminal und trotzdem die falsche Vorgabe hier,
-       * denn dieser Weg KANN INS LEERE LAUFEN: die Anwendung bekommt die
-       * Rad-Meldung und muss nichts damit tun. Genau das hat alice gemeldet
-       * („manchmal kann ich auch immernoch garnicht scrollen"), und im
-       * Normalfall seiner Sitzung ist die Mausverfolgung an. Der Ausweg war
-       * Umschalt+Rad -- den kennt niemand, der es nicht gebaut hat.
-       *
-       * Jetzt: auf einem normalen Schirm bewegt das Rad den RUECKBLICK des
-       * Panes. Der ist immer da, die Bewegung ist immer sichtbar und immer
-       * umkehrbar. An die Anwendung geht es dort nur mit Umschalt.
-       *
-       * DER ALTE GRUND, und wie er jetzt aufgeht: der bestehende Kommentar
-       * fuerchtete, dass „der ganze aufgenommene Schirm samt Eingabezeile mit
-       * nach oben wandert". Das tut er auch weiterhin -- nur ist das kein
-       * Fehler, sondern was Zurueckblaettern heisst: man sieht nach oben, und
-       * die Eingabezeile steht unten ausserhalb des Ausschnitts. Dasselbe tut
-       * der Kopiermodus in tmux. Der Unterschied zum alten Verhalten ist, dass
-       * man es SIEHT und mit einer Bewegung nach unten wieder verlaesst, statt
-       * vor einem Bild zu stehen, in dem nichts passiert.
-       *
-       * Auf dem ALTERNATIVSCHIRM (weniger, top, ein Editor) bleibt es bei der
-       * Anwendung: dort gibt es keinen Rueckblick, den man bewegen koennte --
-       * der Schirm gehoert ihr wirklich. Verfolgt sie die Maus, bekommt sie die
-       * Rad-Meldung; sonst macht xterm daraus Pfeiltasten. Beides schickt
-       * Bytes, beides ist messbar, keiner der drei Zustaende tut still nichts.
-       */
-      t.attachCustomWheelEventHandler((ev) => {
-        if (!ev.deltaY) return false;
-        // Ob die Anwendung die Maus verfolgt, sagt tmux (mausModus) ODER das
-        // Terminal selbst: das eine kennt den Stand VOR dem Zeichnen, das
-        // andere jede Umschaltung, die seither ueber den Strom lief.
-        const mausAn = !!el.querySelector('.xterm.enable-mouse-events') || !!mausModus.get(box.paneId)?.an;
-        if (t.buffer.active.type === 'alternate') {
-          if (mausAn && !ev.shiftKey) {
-            radAnAnwendung(box.paneId, ev);
-            return false;
-          }
-          return true;
-        }
-        if (mausAn && ev.shiftKey) {
-          radAnAnwendung(box.paneId, ev);
-          return false;
-        }
-        const zeilen = radZeilen(ev, t.rows, paneZellhoehe(el, t.rows));
-        // DER RUECKFALL, und er macht den Fehler vom 06.08. unmoeglich, auch
-        // wenn der Rueckblick irgendwann wieder ausbleibt.
-        //
-        // Der Bildlauf oben setzt voraus, dass es etwas zu bewegen GIBT. Steht
-        // der Ausschnitt schon am Anschlag -- ganz oben beim Hochrollen, ganz
-        // unten beim Herunterrollen, und beides gilt bei baseY 0 immer --,
-        // dann bewegt `scrollLines` nichts und niemand bekaeme etwas zu sehen.
-        // Verfolgt die Anwendung die Maus, gehoert ihr das Ereignis in diesem
-        // Fall: sie kann damit etwas tun, das Fenster kann es nicht. Sonst
-        // bleibt es beim Bildlauf, der dann eben am Anschlag steht.
-        //
-        // Und weil ein fehlender Rueckblick auch ein Fehler sein KANN, wird er
-        // bei der Gelegenheit angefordert (einmal je Terminal). Beim naechsten
-        // Rad-Ereignis ist er dann da.
-        const buf = t.buffer.active;
-        const amAnschlag = zeilen < 0 ? buf.viewportY <= 0 : buf.viewportY >= buf.baseY;
-        if (zeilen && amAnschlag) {
-          if (buf.baseY === 0) rueckblickAnfordern(box.paneId);
-          if (mausAn) {
-            radAnAnwendung(box.paneId, ev);
-            return false;
-          }
-        }
-        if (zeilen) rollenSpaeter(t, zeilen);
-        return false;
-      });
-      el.addEventListener('mousedown', () => setzeAktiv(box.paneId));
-      gitterEl.appendChild(el);
-      eintrag = { term: t, el, rueckblickDa: false, rueckblickGefragt: false };
-      paneTerms.set(box.paneId, eintrag);
-      chatAnbindungen.set(box.paneId, new ChatAnbindung(el, box.paneId, window.awbEditorBridge, false));
-    }
-    if (eintrag.term.cols !== box.cols || eintrag.term.rows !== box.rows) {
-      eintrag.term.resize(box.cols, box.rows);
-    }
-    const kachel = raster ? kachelAusRaster(box, raster) : (teilKacheln?.[i] ?? kacheln?.[i]);
-    const kx = kachel ? kachel.x : (box.x - x0) * zelle.breite;
-    const ky = kachel ? kachel.y : (box.y - y0) * zelle.hoehe;
-    // Die Kachel bestimmt den Kasten, nicht der Inhalt.
-    //
-    // Vorher bekam der Kasten die Groesse des Panes, sobald die kleiner war --
-    // und bei einer Session, die wir nur lesen, ist jeder Pane anders gross.
-    // Gemessen an der laufenden AI-Session: drei Kacheln von 673x420, 673x435
-    // und 681x420, und die letzte Reihe zog sich nicht auf. Ein ungleiches
-    // Gitter ist in keinem Fall richtig; der Inhalt sitzt jetzt IN der Kachel,
-    // so gross wie er eben ist, und was nicht hineinpasst, wird beschnitten.
-    const kb = kachel ? kachel.b : box.cols * zelle.breite;
-    const kh = kachel ? kachel.h : box.rows * zelle.hoehe;
-    eintrag.el.style.left = `${kx.toFixed(1)}px`;
-    eintrag.el.style.top = `${ky.toFixed(1)}px`;
-    eintrag.el.style.width = `${kb.toFixed(1)}px`;
-    eintrag.el.style.height = `${kh.toFixed(1)}px`;
-    letzteKacheln.set(box.paneId, { x: kx, y: ky, b: kb, h: kh, fehlt: false });
-    // Passt der Pane nicht in seine Kachel, wird das UNTERE Ende gezeigt.
-    //
-    // Das kommt bei einer uebernommenen Session vor, deren Fenster groesser ist
-    // als unsere Buehne: dort wird nichts umgestellt (F14), also ist der Inhalt
-    // groesser als die Kachel. Oben abzuschneiden ist dann die richtige Wahl --
-    // in einem Terminal steht unten, was gerade passiert, und oben, was vorbei
-    // ist.
-    const ueberhang = Math.max(0, box.rows * zelle.hoehe - (kachel?.h ?? Infinity));
-    const schirmEl = eintrag.el.querySelector<HTMLElement>('.xterm');
-    if (schirmEl) schirmEl.style.marginTop = ueberhang ? `${-ueberhang.toFixed(1)}px` : '';
-    const inhalt = p.inhalt[box.paneId];
-    if (inhalt !== undefined) {
-      const historie = p.historie?.[box.paneId];
-      // Zurueckgesetzt wird nur ein FRISCHES Terminal (und der Sonderfall des
-      // zweiten Schirms, in dem es ohnehin keinen Rueckblick gibt): reset()
-      // wirft den Rueckblick weg, und weil jeder Groessenwechsel und jeder
-      // Wechsel der Ansicht neu zeichnet, stand danach nichts mehr zum
-      // Hochrollen da. Der Inhalt beginnt ohnehin mit "Schirm loeschen,
-      // Cursor nach oben".
-      //
-      // DAZU der dritte Fall, und er traegt den Fehler vom 06.08.: kommt ein
-      // Rueckblick fuer ein Terminal, das noch keinen hat, wird ebenfalls
-      // zurueckgesetzt. Sonst haenge er sich unter den gezeigten Schirm statt
-      // ueber ihn. Verloren geht dabei nichts -- Rueckblick und Inhalt sind
-      // EINE Aufnahme desselben Augenblicks (main.ts, paneZeigen), und was das
-      // Terminal bis dahin hatte, steht in ihr drin.
-      //
-      // Bis dahin hing das Schreiben an `neu`, also am ERSTEN Zeichnen eines
-      // Panes. Beim Anhaengen entsteht das Terminal aber schon vorher, aus dem
-      // ersten Wurf ohne Rueckblick (main.ts, attachTmux, F1); der Rueckblick
-      // kam einen Zug spaeter und fiel damit still weg. Gemessen am
-      // Orchestrator-Pane: laenge 57 bei zeilen 57, baseY 0 -- kein
-      // Rueckblick, also ein Rad, das nichts bewegen kann.
-      if (neu || eintrag.term.buffer.active.type === 'alternate' || (historie && !eintrag.rueckblickDa)) {
-        eintrag.term.reset();
-        eintrag.rueckblickDa = false;
-        eintrag.rueckblickGefragt = false;
-      }
-      if (historie && !eintrag.rueckblickDa) {
-        eintrag.term.write(historie);
-        eintrag.rueckblickDa = true;
-      }
-      // Der Haken laeuft, wenn xterm den Inhalt wirklich verarbeitet hat:
-      // `write` arbeitet aufgeschoben, und ein sofort gelesener Puffer wuesste
-      // von diesem Schreiben noch nichts.
-      eintrag.term.write(inhalt, () => rueckblickPruefen(box.paneId));
-    }
-  }
-
-  for (const [id, e] of [...paneTerms]) {
-    if (gesehen.has(id)) continue;
-    // Der Versuch bleibt (12.08.): mit @xterm/addon-webgl 0.19.0 warf
-    // `term.dispose()` hier zuverlaessig einen TypeError mitten in der eigenen
-    // Aufraeumkette der WebGL-Erweiterung (Kie.clear -> ... -> undefined._isDisposed,
-    // gemessen ueber test-app-flaeche.sh: eine Kachel blieb danach stehen,
-    // weil die Ausnahme diese ganze Schleife abbrach). @xterm/addon-webgl@0.18.0
-    // legt dieselbe Aufraeumkette OHNE Ausnahme durch -- daher die Version. Der
-    // Versuch bleibt trotzdem stehen: eine dritte Erweiterung soll diese
-    // Schleife nie wieder mitten im Aufraeumen eines Panes abbrechen koennen.
-    // Ein weggeworfenes Terminal hat in der Sammelstelle des Rades nichts mehr
-    // verloren: bliebe sein Rest dort stehen, versuchte ihn das naechste
-    // Rad-Ereignis eines ANDEREN Panes mit abzugeben (rollenAnwenden).
-    rollenOffen.delete(e.term);
-    try {
-      e.term.dispose();
-    } catch {
-      // nichts zu tun -- der Pane wird trotzdem vollstaendig entfernt, siehe oben.
-    }
-    e.el.remove();
-    paneTerms.delete(id);
-    rendererJePane.delete(id);
-    // Sonst hielte die Sammelstelle ein weggeworfenes Terminal fest, und
-    // `webglSperren()` liefe spaeter darauf zu.
-    webglJeTerminal.delete(id);
-    chatAnbindungen.get(id)?.weg();
-    chatAnbindungen.delete(id);
-  }
-  // Ein angeforderter Pane, den es nicht gibt, behaelt seinen Platz im Gitter
-  // und sagt, warum er leer ist. Ein Worker, der ohne ein Wort verschwindet,
-  // ist schlimmer als einer, der schlecht sitzt.
-  for (const el of [...gitterEl.querySelectorAll('.panefehlt')]) el.remove();
-  (p.fehlend ?? []).forEach((f, n) => {
-    const kachel = kacheln?.[p.panes.length + n];
-    if (!kachel) return;
-    const el = document.createElement('div');
-    el.className = 'panefehlt';
-    el.dataset.pane = f.pane;
-    el.style.left = `${kachel.x.toFixed(1)}px`;
-    el.style.top = `${kachel.y.toFixed(1)}px`;
-    el.style.width = `${kachel.b.toFixed(1)}px`;
-    el.style.height = `${kachel.h.toFixed(1)}px`;
-    el.textContent = `${f.pane}: ${f.grund}`;
-    gitterEl.appendChild(el);
-    letzteKacheln.set(f.pane, { x: kachel.x, y: kachel.y, b: kachel.b, h: kachel.h, fehlt: true });
-  });
-  setzeAktiv(p.aktiv);
-  namenSpaeter();
-  auskunft.groesse = `${p.cols}x${p.rows}`;
-  auskunft.ansicht =
-    p.art === 'tab'
-      ? `Tab mit ${p.panes.length} Panes${p.fehlend?.length ? `, ${p.fehlend.length} fehlen` : ''}`
-      : 'ein Pane';
-  // NICHT SOFORT. xterm legt seine Zellgroesse erst beim Zeichnen fest, und ein
-  // eben angelegtes Terminal hat noch keine -- `zellmass` faellt dann auf das
-  // Mass-Terminal zurueck, also auf die andere der beiden Zahlen, um die es
-  // hier geht. GEMESSEN: sofort gefragt kommt 213 heraus (Mass-Terminal,
-  // 7,709 Bildpunkte je Zelle), nach dem Zeichnen 209 (der gezeichnete Pane,
-  // 7,826) -- und 209 ist die Zahl, mit der der Text wirklich gesetzt wird.
-  // Zwei Einzelbilder reichten dafuer nicht; derselbe Aufschub wie bei den
-  // Namensschildern reicht.
-  nachfordernSpaeter(p);
-}
-
-let nachforderUhr: number | undefined;
-function nachfordernSpaeter(p: LayoutPayload): void {
-  if (nachforderUhr !== undefined) clearTimeout(nachforderUhr);
-  nachforderUhr = setTimeout(() => {
-    nachforderUhr = undefined;
-    nachfordern(p);
-  }, 250) as unknown as number;
-}
-
-/**
- * Passt der gezeichnete Pane nicht zur Buehne, wird die Flaeche NOCH EINMAL
- * gemeldet.
- *
- * `gemeldet` sperrt sonst genau den Fall, um den es geht: die Buehne hat ihre
- * Zahl schon einmal geschickt, also schweigt sie -- auch wenn inzwischen etwas
- * ANDERES die Groesse bestimmt hat (ein angehaengtes Terminal, ein
- * zurueckgestelltes window-size) oder eine frisch uebernommene Sitzung noch in
- * der Groesse dasteht, die tmux ihr beim Anlegen gab. Ohne dieses Nachfordern
- * bleibt der Rand fuer immer stehen.
- *
- * Gegen die Schleife: gefragt wird hoechstens EINMAL je gezeichneter Groesse.
- * Kann tmux nicht folgen (uebernommene Sitzung, harte Grenze), kommt dieselbe
- * Zahl zurueck und es wird nicht weiter gefragt.
- */
-const nachgefordert = new Set<string>();
-function nachfordern(p: LayoutPayload): void {
-  if (p.art !== 'pane' || !p.panes.length || p.vorgegeben) return;
-  const mass = flaecheInZellen();
-  if (!mass) return;
-  const box = p.panes[0];
-  if (Math.abs(box.cols - mass.cols) <= 1 && Math.abs(box.rows - mass.rows) <= 1) {
-    nachgefordert.clear();
-    return;
-  }
-  const marke = `${box.cols}x${box.rows}->${mass.cols}x${mass.rows}`;
-  if (nachgefordert.has(marke)) return;
-  nachgefordert.add(marke);
-  gemeldet = mass;
-  window.awbBridge.bedienung('flaeche', mass);
-}
-
-/**
- * Die Schilder noch einmal ansehen, wenn sich der Inhalt bewegt hat.
- *
- * Zweimal noetig: xterm verarbeitet ein `write` verzoegert, das Bild steht
- * also erst kurz NACH dem Zeichnen; und waehrend Ausgabe laeuft, wandert der
- * Text unter dem Schild durch. Gebuendelt, damit nicht jede Ausgabezeile eine
- * Neuberechnung ausloest.
- */
-let namenUhr: number | undefined;
-function namenSpaeter(): void {
-  if (namenUhr !== undefined) clearTimeout(namenUhr);
-  namenUhr = setTimeout(() => {
-    namenUhr = undefined;
-    zeigeNamen();
-  }, 200) as unknown as number;
-}
-
-/**
- * WIEVIELE ZEILEN EIN RAD-EREIGNIS BEDEUTET -- die eine Stelle dafuer.
- *
- * Vorher rechneten beide Wege (der Ruecklauf im eigenen Puffer und die
- * Mausmeldung an die Anwendung) jeder fuer sich, und beide teilten den
- * Pixel-Weg durch die ZELLHOEHE. Daraus wurde ein Verhalten, das vom Geraet und
- * von der Schriftgroesse abhing: ein Trackpad schickt viele Ereignisse mit
- * kleinem Weg, eine Maus wenige mit grossem, und je kleiner die Zeile, desto
- * mehr Zeilen kamen heraus. Mit der genauer gemessenen Zellhoehe fiel es
- * zuletzt so hoch aus, dass alice es als „viel zu schnell" gemeldet hat.
- *
- * DIE ZWISCHENSTUFE VOM 12.08. UND WARUM SIE AUCH FALSCH WAR. Danach stand
- * hier ein festes Raster: 100 Bildpunkte sind `scrollZeilen` Zeilen (Vorgabe
- * 3). Das ist geraeteunabhaengig, aber es ist fuer ein Trackpad um ein
- * Mehrfaches zu grob. GEMESSEN am 12.08. durch den echten Eingabeweg
- * (`awb-ctl rad-strom`, Zellhoehe 15): ein ruhiger Wisch aus 30 Ereignissen zu
- * je 3 Bildpunkten bewegte ZWEI Zeilen, 28 der 30 Ereignisse bewirkten gar
- * nichts. Vier kurze ruhige Gesten mit einer halben Sekunde dazwischen
- * bewegten NULL Zeilen -- alle 32 Ereignisse ohne Wirkung, weil die Pause den
- * angesammelten Bruchteil jedesmal wegwarf, bevor eine ganze Zeile daraus
- * werden konnte. Das ist des Nutzers „reagiert manchmal gar nicht", und es ist
- * kein Gefuehl, sondern diese Null.
- *
- * JETZT: ein Rad-Weg in Bildpunkten wird ueber die TATSAECHLICHE Zellhoehe
- * DIESES Terminals in Zeilen umgerechnet -- 15 Bildpunkte Finger sind eine
- * Zeile, wenn die Zeile 15 Bildpunkte hoch ist. Der Inhalt folgt dem Finger
- * eins zu eins; das ist das Mass, das jede andere Anwendung auf diesem Rechner
- * verwendet, und es ist von der Schriftgroesse nicht unabhaengig, sondern
- * richtigerweise an sie gebunden: eine kleinere Zeile heisst mehr Zeilen auf
- * demselben Weg, weil auf demselben Weg mehr Zeilen liegen.
- *
- * `scrollZeilen` bleibt die Einstellung, aber als FAKTOR gegen die Vorgabe:
- * 3 ist eins zu eins, 6 doppelt so schnell, 1 ein Drittel. Wer die alte Zahl im
- * Menue stehen laesst, bekommt das natuerliche Mass.
- *
- * DER SAMMELREST wird nur noch bei einem RICHTUNGSWECHSEL weggeworfen, nicht
- * mehr nach einer Pause. Eine Pause ist kein Grund: wer langsam wischt, soll
- * langsam scrollen und nicht gar nicht, und mehr als eine angefangene Zeile
- * kann der Rest nie sein -- ein spaeterer „Ruck" daraus ist hoechstens eine
- * einzige Zeile und faellt gegen das Nichts von vorher nicht ins Gewicht.
- */
-/**
- * Faktor auf das natuerliche Mass, als Zeilen-je-Rasterung geschrieben, damit
- * die Einstellung `terminalScrollLines` dieselbe Bedeutung behaelt wie bisher.
- * Kommt aus der Einstellungsdatei, siehe setzeScroll.
- */
-let scrollZeilen = 3;
-/** Bei diesem Wert folgt der Inhalt dem Finger eins zu eins. */
-const SCROLL_VORGABE = 3;
-/** Ein Rasterschritt im Zeilen-Modus -- so melden es die Browser. */
-const RASTER_ZEILEN = 3;
-/**
- * Der Rasterschritt, den die Leistungsmessung als „ein Rad-Schritt" schickt.
- * Nur noch dort in Gebrauch: die Rechnung selbst kennt kein festes Raster mehr.
- */
-const RASTER_PIXEL = 100;
-
-let radRest = 0;
-
-/**
- * MITSCHRIFT DER ECHTEN RAD-EREIGNISSE -- nur fuer Messungen.
- *
- * Ein nachgestelltes Ereignis, das eine ganze Zeile schickt, beweist nichts
- * ueber ein Trackpad: das schickt viele Ereignisse mit einem Weg von wenigen
- * Bildpunkten, und genau daran entschied sich, ob ueberhaupt etwas passiert.
- * Ist die Mitschrift an, haelt jede Rechnung fest, WAS ankam (deltaY, Modus)
- * und WAS herauskam (Zeilen) -- die beiden Zahlen, aus denen sich "so viele
- * Ereignisse bewirkten gar nichts" ablesen laesst.
- */
-let radMitschrift: { deltaY: number; modus: number; zeilen: number }[] | null = null;
-
-function setzeScroll(zeilen: number): void {
-  if (!Number.isFinite(zeilen) || zeilen < 1 || zeilen > 20) return;
-  scrollZeilen = Math.floor(zeilen);
-}
-
-/**
- * Ganze Zeilen aus einem Rad-Ereignis. Vorzeichen wie `deltaY`: positiv ist
- * nach unten. Der Bruchteil bleibt fuer das naechste Ereignis liegen.
- *
- * `zellhoehe` ist die gemessene Hoehe EINER Zeile in diesem Pane -- das Mass,
- * ueber das ein Weg in Bildpunkten zu einer Zeilenzahl wird.
- */
-function radZeilen(
-  ev: { deltaY: number; deltaMode: number },
-  zeilenImPane: number,
-  zellhoehe: number,
-): number {
-  if (!ev.deltaY) return 0;
-  // Nur der Richtungswechsel leert den Sammelrest. Eine Pause tut das NICHT
-  // mehr -- daran starb der ruhige Wisch (siehe die Messung oben).
-  if (Math.sign(ev.deltaY) !== Math.sign(radRest || ev.deltaY)) radRest = 0;
-  let zeilen: number;
-  if (ev.deltaMode === 2) {
-    // Seitenweise: eine Seite ist der Pane ohne die eine Zeile, die den
-    // Anschluss zeigt.
-    zeilen = ev.deltaY * Math.max(1, zeilenImPane - 1);
-  } else {
-    // Im Zeilen-Modus traegt das Ereignis schon Zeilen -- drei je Rastung des
-    // Rades, und eine Rastung soll `scrollZeilen` Zeilen bewegen; das bleibt
-    // wie bisher. Im Pixel-Modus traegt es einen WEG, und was daraus an Zeilen
-    // wird, sagt die Zellhoehe.
-    radRest +=
-      ev.deltaMode === 1
-        ? (ev.deltaY / RASTER_ZEILEN) * scrollZeilen
-        : (ev.deltaY / Math.max(1, zellhoehe)) * (scrollZeilen / SCROLL_VORGABE);
-    zeilen = Math.trunc(radRest);
-    radRest -= zeilen;
-  }
-  if (!zeilen) {
-    radMitschrift?.push({ deltaY: ev.deltaY, modus: ev.deltaMode, zeilen: 0 });
-    return 0;
-  }
-  // DER DECKEL, und warum er jetzt eine Seite ist statt sechs Zeilen.
-  //
-  // Bei festem Raster war er noetig: dort wuchs ein Ereignis mit grossem Weg
-  // ungebremst, und sechs Zeilen waren die Notbremse. Mit der Zellhoehe als
-  // Mass ist die Zeilenzahl genau der Fingerweg -- ein Deckel darunter wuerfe
-  // die Bewegung weg, die der Mensch gerade gemacht hat, und das ist der
-  // „springt und verliert dann"-Fall, um den es hier geht. GEMESSEN: ein
-  // schneller Wisch (25 Ereignisse, 40 bis 120 Bildpunkte) traegt bei Zellhoehe
-  // 15 hoechstens 8 Zeilen je Ereignis, lief also bei sechs jedesmal an. Was
-  // bleibt, ist die Grenze gegen ein widersinniges Ereignis: mehr als eine
-  // Seite auf einmal ist kein Wischen mehr. Was darueber liegt, wird
-  // abgeworfen und NICHT in den Rest geschoben -- sonst rieselte es nach.
-  const deckel = Math.max(6, zeilenImPane - 1);
-  const gedeckelt = Math.max(-deckel, Math.min(deckel, zeilen));
-  if (gedeckelt !== zeilen) radRest = 0;
-  radMitschrift?.push({ deltaY: ev.deltaY, modus: ev.deltaMode, zeilen: gedeckelt });
-  return gedeckelt;
-}
-
-/**
- * EIN BILDLAUF JE BILD statt einer je Ereignis -- sonst frisst die Animation
- * die Bewegung.
- *
- * `smoothScrollDuration` (10 ms, siehe TERMOPT) laesst xterm den Ausschnitt
- * interpolieren. Jeder neue `scrollLines()`-Aufruf setzt den Anfang dieser
- * Interpolation auf die GERADE ERREICHTE Zwischenposition und beginnt von dort
- * neu -- was vom vorigen Lauf noch ausstand, ist damit weg. Ein Trackpad
- * schickt alle acht bis sechzehn Millisekunden ein Ereignis, also schneller,
- * als ein Lauf fertig wird, und der Verlust ist kein Randfall: GEMESSEN am
- * 12.08. durch den echten Eingabeweg bewegte ein schneller Wisch, fuer den 132
- * Zeilen ausgerechnet waren, nur 45 -- ein Drittel. Das ist das „scrollt dann
- * super viel auf einmal und bleibt dann stehen".
- *
- * Deshalb werden die Zeilen bis zum naechsten Einzelbild gesammelt und in EINEM
- * Aufruf abgegeben. Zwischen zwei Bildern liegen rund 16,7 ms, mehr als die
- * 10 ms der Animation -- jeder Lauf wird fertig, bevor der naechste anfaengt,
- * und es geht nichts verloren. GEMESSEN nach dem Umbau: 132 gerechnet, 132
- * bewegt.
- */
-const rollenOffen = new Map<Terminal, number>();
-let rollenBild: number | undefined;
-let rollenUhr: number | undefined;
-let rollenZuletzt = 0;
-/** Zaehlt die abgegebenen Buendel -- das Nachsehen unten gilt nur fuer seines. */
-let rollenZug = 0;
-/** Wann zuletzt wirklich gerollt wurde -- die Auskunft, ab wann Nachmessen Sinn hat. */
-let rollenAngewandt = 0;
-
-/**
- * KEIN BILDLAUF OHNE FRAME-GARANTIE -- zwei Stellen, an denen ein ausbleibendes
- * Einzelbild die Bewegung verschluckte (Befund 1 der Bugjagd, 15.08.).
- *
- * `requestAnimationFrame` ist ein VERSPRECHEN AUF DAS NAECHSTE BILD, und wo
- * kein Bild mehr entsteht, faellt es aus. Gemessen im kopflosen Fenster mit
- * ZWEI Panes und vorgerolltem Ausschnitt: ein `rad +20` blieb ueber zwoelf
- * Sekunden liegen (Ausschnitt unveraendert, Polls im Sekundentakt), und erst
- * das naechste Rad-Ereignis brachte alles gemeinsam zur Wirkung
- * (274 + 14 − 6 = 282 statt der 268, die ein Hochrollen ergibt). Genau daran
- * scheiterte die Zusage „bei Maus-Verfolgung rollt das Rad ohne Sondertaste den
- * Rueckblick" in test-app-tab-kachel.sh.
- *
- * ERSTE STELLE, das Sammeln hier: neben das rAF tritt ein Zeitgeber. Kommt ein
- * Bild, gewinnt das Bild (am sichtbaren Fenster der Normalfall, rund 16,7 ms);
- * bleibt es aus, gibt der Zeitgeber die gesammelten Zeilen nach 32 ms ab. Wer
- * zuerst kommt, raeumt den anderen weg -- angewandt wird genau einmal. Der
- * Zeitgeber ist dabei zugleich die AUSKUNFT, dass kein Bild kam: in diesem
- * Zweig geht die Animationsdauer auf 0, damit der Ausschnitt sofort steht.
- *
- * ZWEITE STELLE, xterm selbst: `smoothScrollDuration` (TERMOPT, 10 ms) laesst
- * xterm den Ausschnitt UEBER EINZELBILDER interpolieren -- auch diese Bewegung
- * braucht also Bilder. GEMESSEN in der Nacht zum 16.08.: mit dem Zeitgeber allein blieb der
- * Fehlschlag Zeile fuer Zeile derselbe (274 -> 282), die abgegebene Bewegung lag
- * jetzt in xterms Animation fest; mit `smoothScrollDuration = 0` lief dieselbe
- * Suite durch. Weil die Animation am sichtbaren Fenster aber genau das ist, was
- * eine einzelne Rastung ruhig aussehen laesst, bleibt sie -- und bekommt ein
- * NACHSEHEN: ist der Ausschnitt 32 ms spaeter nicht dort, wo er sein sollte,
- * wird der Rest ohne Animation nachgezogen. So bewegt sich der Ausschnitt in
- * derselben Lage von 274 auf 288, und die Suite ist gruen.
- */
-const ROLLEN_RUECKFALL_MS = 32;
-
-function rollenAnwenden(ohneBild = false): void {
-  if (rollenBild !== undefined) cancelAnimationFrame(rollenBild);
-  if (rollenUhr !== undefined) clearTimeout(rollenUhr);
-  rollenBild = undefined;
-  rollenUhr = undefined;
-  // ZUERST LEEREN, DANN ROLLEN. Wirft `scrollLines()` -- an einem gerade
-  // weggeworfenen Terminal ist das kein Gedankenspiel, siehe den Kommentar in
-  // der Aufraeumschleife von zeichneLage --, bliebe der Eintrag sonst stehen
-  // und wuerde beim naechsten Rad ein ZWEITES Mal angewandt. Und ein
-  // Fehlschlag an einem Terminal darf die anderen nicht mitnehmen.
-  const stapel = [...rollenOffen];
-  rollenOffen.clear();
-  const zug = ++rollenZug;
-  for (const [term, offen] of stapel) {
-    if (!offen) continue;
-    try {
-      if (ohneBild) term.options.smoothScrollDuration = 0;
-      const vorher = term.buffer.active.viewportY;
-      term.scrollLines(offen);
-      if (!ohneBild) rollenNachsehen(term, vorher + offen, zug);
-    } catch {
-      // Dieses Terminal nimmt nichts mehr an -- die uebrigen schon.
-    }
-  }
-  if (stapel.length) rollenAngewandt = Date.now();
-}
-
-/**
- * WARTEN, BIS DER BILDLAUF WIRKLICH STEHT -- statt eine Zeit zu raten.
- *
- * Nur fuer den Messhaken `rad()` weiter unten. Wer nach einem Rad-Ereignis den
- * Ausschnitt abliest, muss zwei Schritte abwarten: die Abgabe in
- * `rollenAnwenden` und das `rollenNachsehen`, das ROLLEN_RUECKFALL_MS spaeter
- * den Rest ohne Animation nachzieht. Dafuer stand hier ein festes
- * `setTimeout(50)` -- achtzehn Millisekunden Luft ueber dem Nachsehen. Unter der
- * Last des vollen Testlaufs reichten die nicht: GEMESSEN auf peer am 21.08.
- * fiel in test-app-rueckblick.sh eine von neunzehn Zusagen mit „das Rad bewegt
- * nichts (viewportY bleibt 382)", waehrend dieselbe Suite einzeln gefahren
- * neunzehn von neunzehn hielt.
- *
- * Gewartet wird deshalb auf den Zustand statt auf die Uhr: solange ein Buendel
- * offen ist oder das Nachsehen noch aussteht, wird weiter nachgesehen. Bewegt
- * sich gar nichts -- der Fall, den die Zusage FINDEN soll --, laeuft der Deckel
- * ab und der Ausschnitt wird unveraendert gemeldet, wie vorher.
- */
-async function rollenBeruhigt(deckelMs = 500): Promise<void> {
-  const ende = Date.now() + deckelMs;
-  for (;;) {
-    const offen = rollenOffen.size > 0 || rollenBild !== undefined || rollenUhr !== undefined;
-    if (!offen && Date.now() - rollenAngewandt > ROLLEN_RUECKFALL_MS + 16) return;
-    if (Date.now() >= ende) return;
-    await new Promise((r) => setTimeout(r, 8));
-  }
-}
-
-/**
- * Ist die Bewegung wirklich angekommen? Nur fuer den Weg ueber das Einzelbild:
- * dort laeuft xterms Animation, und die braucht weitere Bilder (siehe oben).
- *
- * Ein spaeteres Buendel macht dieses Nachsehen gegenstandslos -- es hat den
- * Ausschnitt selbst bewegt, und sein eigenes Nachsehen laeuft ohnehin. Ein
- * Ziel jenseits des Puffers ist kein Fehlschlag: xterm deckelt, der Rest
- * bewegt dann nichts mehr.
- */
-function rollenNachsehen(t: Terminal, ziel: number, zug: number): void {
-  setTimeout(() => {
-    if (zug !== rollenZug) return;
-    try {
-      const rest = ziel - t.buffer.active.viewportY;
-      if (!rest) return;
-      t.options.smoothScrollDuration = 0;
-      t.scrollLines(rest);
-    } catch {
-      // Ein weggeworfenes Terminal braucht kein Nachsehen mehr.
-    }
-  }, ROLLEN_RUECKFALL_MS);
-}
-
-function rollenSpaeter(t: Terminal, zeilen: number): void {
-  // IM FLUSS ODER EINZELN -- danach entscheidet sich, ob die Animation laufen
-  // darf. Ein Finger auf dem Trackpad schickt alle acht bis sechzehn
-  // Millisekunden ein Ereignis; eine Rastung am Mausrad steht allein. Nur die
-  // Rastung springt ohne Animation sichtbar, und nur sie hat die Zeit, den Lauf
-  // zu Ende zu bringen.
-  const jetzt = Date.now();
-  const imFluss = jetzt - rollenZuletzt < ROLLEN_FLUSS_MS;
-  rollenZuletzt = jetzt;
-  t.options.smoothScrollDuration = imFluss ? 0 : SCROLL_ANIMATION_MS;
-  rollenOffen.set(t, (rollenOffen.get(t) ?? 0) + zeilen);
-  if (rollenBild !== undefined || rollenUhr !== undefined) return;
-  rollenBild = requestAnimationFrame(() => rollenAnwenden());
-  rollenUhr = setTimeout(() => rollenAnwenden(true), ROLLEN_RUECKFALL_MS) as unknown as number;
-}
-
-/**
- * Die gemessene Hoehe EINER Zeile in diesem Pane. Der Rueckfall auf `zellmass`
- * greift, solange dieser Pane noch nichts gezeichnet hat -- dann steht keine
- * eigene Zahl zur Verfuegung, und die des Mass-Terminals ist die naechstbeste.
- */
-function paneZellhoehe(el: HTMLElement, zeilen: number): number {
-  const s = el.querySelector('.xterm-screen')?.getBoundingClientRect();
-  if (s && s.height > 0 && zeilen > 0) return s.height / zeilen;
-  return Math.max(1, zellmass().hoehe);
-}
-
-/**
- * Ein Rad-Ereignis als MAUSMELDUNG an die Anwendung im Pane.
- *
- * Rad hoch ist Knopf 64, Rad runter 65. Kodiert wird so, wie die Anwendung es
- * angefordert hat: SGR (ESC [ < 64 ; spalte ; zeile M) ist der heutige Weg,
- * die alte Form (ESC [ M und drei Zeichen mit Versatz 32) der Rueckfall fuer
- * Anwendungen, die nur sie kennen.
- */
-function radAnAnwendung(paneId: string, ev: WheelEvent): void {
-  const eintrag = paneTerms.get(paneId);
-  if (!eintrag) return;
-  const schirm = eintrag.el.querySelector('.xterm-screen')?.getBoundingClientRect();
-  if (!schirm || schirm.width <= 0) return;
-  const zb = schirm.width / Math.max(1, eintrag.term.cols);
-  const zh = schirm.height / Math.max(1, eintrag.term.rows);
-  const spalte = Math.min(eintrag.term.cols, Math.max(1, Math.floor((ev.clientX - schirm.left) / zb) + 1));
-  const zeile = Math.min(eintrag.term.rows, Math.max(1, Math.floor((ev.clientY - schirm.top) / zh) + 1));
-  const knopf = ev.deltaY < 0 ? 64 : 65;
-  // Dieselbe Rechnung wie fuer den eigenen Puffer: die Anwendung im Pane soll
-  // sich nicht anders anfuehlen als das Fenster.
-  const schritte = Math.abs(radZeilen(ev, eintrag.term.rows, zh));
-  if (!schritte) return;
-  const sgr = mausModus.get(paneId)?.sgr !== false;
-  let folge = '';
-  for (let i = 0; i < schritte; i++) {
-    folge += sgr
-      ? `\x1b[<${knopf};${spalte};${zeile}M`
-      : `\x1b[M${String.fromCharCode(32 + knopf, 32 + spalte, 32 + zeile)}`;
-  }
-  paneEingabe(paneId, folge);
-}
-
-/** Welcher Pane die Tastatur bekommt -- und wessen Name oben steht. */
-function setzeAktiv(paneId: string): void {
-  aktiverPane = paneId;
-  auskunft.pane = paneId || '-';
-  for (const [id, e] of paneTerms) e.el.classList.toggle('aktiv', id === paneId);
-  zeigeNamen();
-}
-
-/**
- * Wieviele BESCHRIEBENE Zellen unter einem Rechteck liegen. Das ist die
- * Grundlage der Schild-Platzierung: eine Ecke, in der nichts steht, deckt
- * nichts zu -- und "nichts steht dort" heisst leere Zellen im sichtbaren
- * Schirm des Terminals, nicht ein Eindruck vom Foto.
- */
-function belegteZellen(paneId: string, r: DOMRect): number {
-  const eintrag = paneTerms.get(paneId);
-  if (!eintrag) return 0;
-  const schirm = eintrag.el.querySelector('.xterm-screen')?.getBoundingClientRect();
-  if (!schirm || schirm.width <= 0 || schirm.height <= 0) return 0;
-  const zb = schirm.width / Math.max(1, eintrag.term.cols);
-  const zh = schirm.height / Math.max(1, eintrag.term.rows);
-  const x0 = Math.max(0, Math.floor((r.left - schirm.left) / zb));
-  const x1 = Math.min(eintrag.term.cols - 1, Math.ceil((r.right - schirm.left) / zb) - 1);
-  const y0 = Math.max(0, Math.floor((r.top - schirm.top) / zh));
-  const y1 = Math.min(eintrag.term.rows - 1, Math.ceil((r.bottom - schirm.top) / zh) - 1);
-  if (x1 < x0 || y1 < y0) return 0;
-  const buf = eintrag.term.buffer.active;
-  let n = 0;
-  for (let y = y0; y <= y1; y++) {
-    const zeile = buf.getLine(buf.baseY + y);
-    if (!zeile) continue;
-    for (let x = x0; x <= x1; x++) {
-      const c = zeile.getCell(x)?.getChars() ?? '';
-      if (c && c.trim()) n++;
-    }
-  }
-  return n;
-}
-
-/** Die Ecke, in der ein Schild liegt -- als Wort, fuer die Messung. */
-function eckenName(schild: HTMLDivElement): string {
-  const unten = schild.classList.contains('unten');
-  const links = schild.classList.contains('li');
-  return `${unten ? 'unten' : 'oben'} ${links ? 'links' : 'rechts'}`;
-}
-
-/**
- * Punkt 1: WEN sehe ich hier gerade? Die Kopfzeile ist weg und soll es
- * bleiben; die eine Auskunft, die gefehlt hat, steht deshalb als kleines Schild
- * in der Ecke des Panes -- ohne eine Zeile ueber die volle Breite zu kosten und
- * auch dann sichtbar, wenn beide Leisten eingeklappt sind.
- */
-function zeigeNamen(): void {
-  for (const [id, e] of paneTerms) {
-    let schild = e.el.querySelector<HTMLDivElement>('.panename');
-    if (!schild) {
-      schild = document.createElement('div');
-      schild.className = 'panename';
-      e.el.appendChild(schild);
-    }
-    // Das Schild nimmt hoechstens die HALBE Breite und die HALBE Hoehe seines
-    // Panes. In dieser Reihenfolge:
-    //   1. passt die Hoehe nicht, wird das Schild flacher;
-    //   2. passt sie dann immer noch nicht, faellt es ganz weg -- ein Pane von
-    //      einer Zeile hat keinen Platz, den man ihm nehmen koennte;
-    //   3. passt die Breite nicht, steht dort das zweibuchstabige Kuerzel.
-    // Abgeschnitten wird nie: in einem Pane von siebzehn Spalten deckte
-    // "Orchestrator" in der neuen Groesse sonst fast die ganze Zeile zu, und im
-    // entarteten Gitter schnitt der Kasten das Schild unten durch.
-    //
-    // Die Schwelle haengt an der Schriftgroesse und wandert mit ihr. Gemessen
-    // bei 15 Pixeln (Schild 23 Pixel hoch, flach 19): voll bis herunter zu
-    // einem Pane von 60 Pixeln, flach ab 45, ganz weg ab 30. Bei 18 Pixeln war
-    // das Schild 27 hoch und wurde entsprechend frueher flach. Wer die Groesse
-    // wieder aendert, aendert diese drei Zahlen mit -- sie stehen deshalb nicht
-    // als Konstante im Code, sondern fallen aus der Messung
-    // (test-app-oberflaeche.sh, Abschnitt 4c).
-    const voll = nameZuPane(id);
-    schild.classList.remove('kurz', 'flach');
-    schild.style.display = '';
-    schild.textContent = voll;
-    const breite = e.el.clientWidth / 2;
-    const hoehe = e.el.clientHeight / 2;
-    if (hoehe > 0 && schild.offsetHeight > hoehe) schild.classList.add('flach');
-    if (hoehe > 0 && schild.offsetHeight > hoehe) schild.style.display = 'none';
-    if (breite > 0 && schild.scrollWidth > breite) {
-      schild.textContent = kuerzel(voll);
-      schild.classList.add('kurz');
-    }
-    schild.classList.toggle('aktiv', id === aktiverPane);
-  }
-}
-
-/**
- * Das Schild bleibt OBEN RECHTS. Immer.
- *
- * Zwischendurch suchte es sich die Ecke, unter der nichts geschrieben stand.
- * Das funktionierte -- gemessen wanderte "Orchestrator" nach unten rechts,
- * sobald oben Text stand -- und war trotzdem falsch: ein Name, den man als
- * Ankerpunkt liest, darf nicht mit dem Textstand die Ecke wechseln (alice,
- * 06.08.: "Als ich angefangen habe zu schreiben, ist der Name von unten rechts
- * nach oben rechts gerutscht. Das ist auch falsch.").
- *
- * Dass es dabei ein paar Zellen verdeckt, bleibt und ist der bewusste Tausch:
- * drei verdeckte Zellen an einer festen Stelle stoeren weniger als ein Schild,
- * das springt. Wieviele es sind, zaehlt `belegteZellen` und die Auskunft der
- * Oberflaeche nennt sie als `deckt` -- gemessen, nicht geschaetzt.
- */
-
-function nameZuPane(paneId: string): string {
-  const s = modell?.sessions.find((x) => x.id === modell?.selected);
-  if (!s) return paneId;
-  if (paneId === s.orchestratorPane) return 'Orchestrator';
-  const w = s.workers.find((x) => x.paneId === paneId);
-  if (w) return w.name;
-  for (const x of s.workers) {
-    const sub = x.subagents.find((y) => y.paneId === paneId);
-    if (sub) return sub.name || sub.agentId;
-  }
-  const os = s.orphanSubagents.find((y) => y.paneId === paneId);
-  return os ? os.name || os.agentId : paneId;
-}
-
-let aktiverPane = '';
-
-window.awbBridge.onSession((p) => {
-  auskunft.session = p.session || '-';
-  auskunft.pane = p.activePane || '-';
-  auskunft.regel = p.sizePolicy === 'owned' ? 'eigene Session (manual)' : p.sizePolicy ? 'fremde Session (uebernommen)' : '-';
-  if (modell) zeichneRechts(modell);
-  // Beim Anhaengen hat der Pane noch die Groesse, die er vorher hatte. Die
-  // Meldung der Flaeche bringt beide auf dieselbe Zahl.
-  gemeldet = { cols: 0, rows: 0 };
-  requestAnimationFrame(passeAn);
-});
-
-window.awbBridge.onLayout((p) => {
-  zeichneLage(p);
-  if (modell) zeichneRechts(modell);
-  requestAnimationFrame(passeAn);
-});
-
-window.awbBridge.onOutput((o) => {
-  const ziel = paneTerms.get(o.paneId);
-  if (!ziel) return;
-  const bin = atob(o.data);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  ziel.term.write(bytes);
-});
-
-window.awbBridge.onModel((m) => {
-  modell = m;
-  setzeSchrift(m.schriftgroesse);
-  setzeScroll(m.scrollZeilen);
-  // Was auf der Buehne liegt, entscheidet der Hauptprozess -- hier wird es nur
-  // ausgefuehrt. Zuerst, damit die Sessionleiste darunter schon den neuen Stand
-  // zeichnet.
-  // Die Worker der GEZEIGTEN Chat-Sitzung reisen mit: die Leiste in der Ansicht
-  // wird aus dem Modell gefuellt, nicht aus dem Gespraechsstand (Punkt 1).
-  chatbuehne.nachModell(
-    m.chatGezeigt ?? '',
-    (m.chats ?? []).find((c) => c.id === (m.chatGezeigt ?? ''))?.worker ?? [],
-  );
-  auskunft.layout = m.mayArrange ? 'eigene Session, darf geordnet werden' : 'fremde Session, nur gezeichnet';
-  zeichneSessions(m);
-  zeichneRechts(m);
-  // DIE NAMENSSCHILDER HAENGEN AM MODELL, nicht nur an der Lage.
-  //
-  // `zeigeNamen()` lief bisher allein beim Zeichnen einer Lage und beim Wechsel
-  // des aktiven Panes. Der NAME eines Panes kommt aber aus dem Modell, und das
-  // trifft eigenen Takt: ein Pane, der beim letzten Zeichnen noch keinen Worker
-  // hatte, behielt sein Schild -- und das ist dann die rohe Kennung. GEMESSEN am
-  // 19.08. kopflos: bei zwei Workern stand auf dem zweiten Pane dauerhaft "%2"
-  // statt "mlxsrv", waehrend das Modell im Hauptprozess den Namen laengst
-  // fuehrte (`awb-ctl sessions`: paneId %2, name mlxsrv); acht Sekunden spaeter
-  // stand dort immer noch "%2". Bei drei Workern stimmte es, weil dort zufaellig
-  // nach dem Modell noch einmal gezeichnet wurde.
-  zeigeNamen();
-  if (statuszeileEl) zeichneStatuszeile(statuszeileEl, m.ampel, m.budget);
-  // Jede stehende Ergebnismeldung gegen den laufenden Auftrag halten: `resultPath`
-  // ist die Datei des Auftrags, an dem der Worker JETZT haengt (leer, solange er
-  // nichts geschrieben hat). Weicht sie von der Meldung ab, ist die Meldung
-  // ueberholt -- genau der Fall, in dem eine spaet eintreffende Fertigmeldung
-  // sonst zu einer Handlung an einem arbeitenden Worker verleitet.
-  const aktuell = new Map<string, string>();
-  for (const s of m.sessions) for (const w of s.workers) aktuell.set(w.name, w.resultPath);
-  meldungen.abgleich(aktuell);
-  requestAnimationFrame(passeAn);
-});
 
 // V2: Die Ergebnisdatei meldet sich selbst. Keine Dauerflaeche (A14) -- eine
 // Meldung, die von selbst geht, mit zwei Wegen zum Ergebnis.
@@ -2606,12 +2462,8 @@ const meldungen = new Meldungen({
   },
 });
 window.awbBridge.onErgebnis((e) => meldungen.zeigen(e));
-window.awbBridge.onMaus((m) => {
-  mausModus.clear();
-  for (const [id, wert] of Object.entries(m)) mausModus.set(id, wert);
-});
 
-// Schritt 7: die uebernommenen Seiten. Sie liegen ueber der Buehne und gehen
+// Schritt 7: die uebernommenen Seiten. Sie liegen ueber der Flaeche und gehen
 // wieder zu -- keine Dauerflaeche (A14), wie bei allem anderen hier.
 const seiten = new Seiten({
   nachricht: (seite, daten) => {
@@ -2622,38 +2474,7 @@ const seiten = new Seiten({
   ausfuehren: () => window.awbBridge.bedienung('plan-ausfuehren', null),
   abbrechen: () => window.awbBridge.bedienung('plan-abbrechen', null),
 });
-// A9: Das Zahnrad oeffnet die Einstellungen in einem EIGENEN FENSTER ueber
-// diesem -- nicht mehr als Flaeche darueber. Bis zum 05.08. zeigte es die
-// uebernommene Seite der VS-Code-Erweiterung in einem Rahmen; das war eine
-// Flaeche mit Reiterzeile, und genau die vier Punkte, die alice beanstandet
-// hat, hingen daran.
-//
-// DIE AUFLAGE AUS DIESEM HAUS, hier durchgesetzt: Das Fenster geht auf, weil
-// ein MENSCH geklickt hat -- nie, weil ein Test oder ein Agent es anfordert.
-// Unterschieden wird an `isTrusted`, nicht an einem Namen oder einem Flag:
-//
-//   * Ein echter Klick mit Maus oder Trackpad traegt `isTrusted === true`.
-//     Nur er schickt 'einstellungen-zeigen', und nur dort steht show().
-//   * `element.click()` aus einem Skript -- der Weg JEDES Tests und jedes
-//     Steuerbefehls, `awb-ctl klick einstellungen` eingeschlossen -- erzeugt
-//     ein Ereignis mit `isTrusted === false`. Es schickt 'einstellungen-bauen':
-//     das Fenster entsteht und ist lesbar und fotografierbar, aber es
-//     erscheint auf keinem Bildschirm.
-//
-// Kein Umweg fuehrt daran vorbei: `isTrusted` ist nicht setzbar, und ein
-// synthetisches MouseEvent traegt es immer false. Gemessen in
-// shell/tests/test-app-einstellungen.sh -- nach `awb-ctl klick einstellungen`
-// steht das Fenster mit seinen sieben Seiten da und meldet `sichtbar: false`.
-const einstellungenKnopf = document.querySelector<HTMLButtonElement>('.knopf[data-tot="einstellungen"]');
-einstellungenKnopf?.addEventListener('click', (ereignis) => {
-  window.awbBridge.bedienung(ereignis.isTrusted ? 'einstellungen-zeigen' : 'einstellungen-bauen', null);
-});
-
 window.awbBridge.onSeite((p) => seiten.zeige(p.name));
-// Reste-Auftrag Punkt 3: eine Datei hat sich von aussen geaendert. Ob
-// tatsaechlich neu gezeichnet wird (offen? kein Feld im Fokus?), prueft
-// 'aufDateiAendern' selbst -- dieser Kanal meldet nur, WELCHE Seite betroffen
-// ist (siehe app/src/main/dateiwaechter.ts).
 window.awbBridge.onDateiGeaendert((p) => seiten.aufDateiAendern(p.name));
 // Die Seite liegt in einem Rahmen mit EIGENER Herkunft und redet deshalb ueber
 // postMessage mit uns -- so, wie ein Webview mit seinem Wirt redet.
@@ -2662,780 +2483,81 @@ window.addEventListener('message', (e) => {
   if (!d || d.__awbSeite !== true) return;
   window.awbBridge.bedienung('seiten-nachricht', d.daten);
 });
-// Vor jeder Handlung mit Nebenwirkung: zeigen, was geschehen wird.
 window.awbBridge.onPlan((p) => seiten.frage(p));
 window.awbBridge.onPlanErgebnis((p) => seiten.ergebnis(p.ausgabe, p.ok));
+
+/**
+ * DIE AUFLAGE AUS DIESEM HAUS, an Zahnrad, Plus und Sitzungsfenster
+ * gleichermassen: Das Fenster geht auf, weil ein MENSCH geklickt hat -- nie,
+ * weil ein Test oder ein Agent es anfordert. Unterschieden wird an
+ * `isTrusted`, nicht an einem Namen: ein echter Klick traegt `true` und
+ * schickt 'einstellungen-zeigen' (dort steht show()), ein `element.click()`
+ * aus einem Skript -- der Weg jedes Tests und jedes Steuerbefehls -- traegt
+ * `false` und schickt 'einstellungen-bauen': das Fenster entsteht, ist lesbar
+ * und fotografierbar, erscheint aber auf keinem Bildschirm.
+ */
+document.querySelector<HTMLButtonElement>('.knopf[data-tot="einstellungen"]')
+  ?.addEventListener('click', (ereignis) => {
+    window.awbBridge.bedienung(ereignis.isTrusted ? 'einstellungen-zeigen' : 'einstellungen-bauen', null);
+  });
+document.getElementById('neue-session')?.addEventListener('click', (ereignis) => {
+  window.awbBridge.bedienung(ereignis.isTrusted ? 'sitzung-zeigen' : 'sitzung-bauen', null);
+});
+
+// --- Das Modell -------------------------------------------------------------
+window.awbBridge.onModel((m) => {
+  modell = m;
+  setzeSchrift(m.schriftgroesse);
+  setzeScroll(m.scrollZeilen);
+  // Was auf der Flaeche liegt, entscheidet der Hauptprozess -- hier wird es nur
+  // ausgefuehrt. Zuerst, damit der Baum darunter schon den neuen Stand zeichnet.
+  chatbuehne.nachModell(
+    m.chatGezeigt ?? '',
+    (m.chats ?? []).find((c) => c.id === (m.chatGezeigt ?? ''))?.worker ?? [],
+  );
+  auskunft.layout = m.mayArrange ? 'eigene Session, darf geordnet werden' : 'fremde Session, nur gezeichnet';
+  rechtsZaehler.model++;
+  alles(m);
+  // DIE NAMENSSCHILDER HAENGEN AM MODELL, nicht nur an der Lage: der NAME eines
+  // Panes kommt aus dem Modell, und das trifft eigenen Takt. Ein Pane, der beim
+  // letzten Zeichnen noch keinen Worker hatte, behielte sonst die rohe Kennung
+  // (gemessen 19.08.: dauerhaft "%2" statt "mlxsrv").
+  schilderNachziehen();
+  // Jede stehende Ergebnismeldung gegen den laufenden Auftrag halten:
+  // `resultPath` ist die Datei des Auftrags, an dem der Worker JETZT haengt.
+  // Weicht sie von der Meldung ab, ist die Meldung ueberholt.
+  const aktuell = new Map<string, string>();
+  for (const s of m.sessions) for (const w of s.workers) aktuell.set(w.name, w.resultPath);
+  meldungen.abgleich(aktuell);
+  // Die Breite beider Leisten kommt aus dem Modell -- hat sie sich geaendert,
+  // ist die Flaeche daneben eine andere, und tmux muss die neue Zellenzahl
+  // bekommen. Ein Fenster-`resize` gibt es dabei nicht.
+  flaecheMelden();
+});
+
+window.awbBridge.onFreigaben((roh) => {
+  const p = (roh ?? {}) as Partial<FreigabenNutzlast>;
+  freigabenStand = { requests: p.requests ?? [], guardBlocks: p.guardBlocks ?? [] };
+  zeichneFreigaben();
+});
 
 // Ohne Steuerkanal laeuft das Fenster weiter -- aber es sagt es. Die Meldung
 // bleibt stehen, solange der Zustand gilt; sie verschwindet nicht von selbst
 // wie eine Notiz.
 window.awbBridge.onKanal((k) => {
   kanalGrund = k.fehler ?? '';
-  kanalwarnungEl.textContent = kanalGrund
-    ? `Kein Steuerkanal: ${kanalGrund} — das Fenster laeuft weiter, Befehle von aussen kommen nicht an.`
-    : '';
+  kanalwarnungEl.textContent = kanalGrund ? t('satz.keinKanal', { grund: kanalGrund }) : '';
   kanalwarnungEl.classList.toggle('sichtbar', !!kanalGrund);
 });
 
-// Rueckkanal fuer den Steuerkanal: was im Puffer steht und was die Oberflaeche
-// gerade zeigt. Damit laesst sich ein Foto gegen den Text pruefen.
-window.__awb = {
-  /**
-   * Wer an dieser Stelle den Zeiger faengt. Ein Foto zeigt, WAS uebereinander
-   * liegt, aber nicht, wer den Klick bekommt -- und genau daran hing der
-   * Ziehgriff, den eine zugeklappte Schublade verdeckte (05.08.). Gibt Kennung
-   * und Klassen des obersten Elements zurueck, damit ein Test die Schicht
-   * benennen kann statt sie zu vermuten.
-   */
-  trefferBei(x: number, y: number): { tag: string; id: string; klassen: string } {
-    const el = document.elementFromPoint(x, y);
-    if (!el) return { tag: '', id: '', klassen: '' };
-    return { tag: el.tagName.toLowerCase(), id: el.id || '', klassen: el.className?.toString?.() || '' };
-  },
+window.awbBridge.onMeldung((p) => notiz(p.text ?? '', p.dauerMs));
 
-  /**
-   * Ein echtes Rad-Ereignis auf einem Pane -- und was danach im Puffer steht.
-   *
-   * Ohne diesen Haken laesst sich "das Rad bewegt den Rueckblick nicht" nur
-   * behaupten: ein Foto zeigt keinen Bildlauf, und `bufferText` sagt nicht,
-   * WELCHER Ausschnitt zu sehen ist. `viewportY` ist genau das, `laenge` die
-   * Zahl der Zeilen im Puffer und `zeilen` die des Schirms -- sind beide
-   * gleich, gibt es keinen Rueckblick, den man bewegen koennte.
-   *
-   * `mausmodus` sagt, ob die Anwendung im Pane die Maus verfolgt. Dann gehen
-   * Rad-Ereignisse an SIE und nicht in den Bildlauf; das ist das Verhalten
-   * eines Terminals und kein Fehler, aber es muss messbar sein.
-   */
-  /**
-   * Wieviele ZEILEN eine Folge von Rad-Ereignissen ergibt. Genau die Zahl, um
-   * die es bei „viel zu schnell" geht -- ohne Umweg ueber einen Puffer, und
-   * damit fuer ein Trackpad (viele kleine Wege) und eine Maus (wenige grosse)
-   * gleichermassen nachrechenbar. Der Sammelrest wird vorher geleert, sonst
-   * misst man den Rest der vorigen Messung mit.
-   */
-  radmass(p: { deltas: number[]; modus?: number; zeilen?: number; zellhoehe?: number }): unknown {
-    radRest = 0;
-    const zeilenImPane = p?.zeilen ?? 40;
-    // Die Zellhoehe darf vorgegeben werden: sonst haengt eine Rechenprobe an
-    // der Schrift, mit der das Fenster gerade zeichnet, und misst zwei Dinge
-    // auf einmal.
-    const zellhoehe = p?.zellhoehe && p.zellhoehe > 0 ? p.zellhoehe : Math.max(1, zellmass().hoehe);
-    const je = (p?.deltas ?? []).map((d) =>
-      radZeilen({ deltaY: d, deltaMode: p?.modus ?? 0 }, zeilenImPane, zellhoehe),
-    );
-    return {
-      je,
-      summe: je.reduce((a, b) => a + b, 0),
-      // Wieviele Ereignisse gar nichts bewirkt haben -- die Zahl hinter
-      // „reagiert manchmal gar nicht".
-      null: je.filter((z) => !z).length,
-      zeilenJeRasterung: scrollZeilen,
-      deckel: Math.max(6, zeilenImPane - 1),
-      zellhoehe: Math.round(zellhoehe * 100) / 100,
-    };
-  },
-
-  /**
-   * DIE MITSCHRIFT AN- ODER ABSCHALTEN -- und beim Abschalten ausgeben.
-   *
-   * `an: true` leert sie und faengt an mitzuschreiben; `an: false` gibt zurueck,
-   * was seither an echten Rad-Ereignissen durch die Rechnung lief. Dazu die
-   * Stelle des Panes im Fenster und sein Zellmass, denn der Weg nach draussen
-   * (`sendInputEvent`, siehe main.ts 'rad-strom') braucht einen Punkt, an dem
-   * das Ereignis landen soll, und die Auswertung die Zeilenhoehe, gegen die
-   * sich die Zeilenzahl rechnen laesst.
-   */
-  radAufnahme(paneId: string, an: boolean): unknown {
-    const eintrag = paneTerms.get(paneId) ?? paneTerms.get(aktiverPane);
-    const schirm = eintrag?.el.querySelector('.xterm-screen')?.getBoundingClientRect();
-    const ereignisse = radMitschrift ?? [];
-    if (an) {
-      radMitschrift = [];
-      radRest = 0;
-    } else {
-      radMitschrift = null;
-    }
-    const buf = eintrag?.term.buffer.active;
-    return {
-      ereignisse: an ? [] : ereignisse,
-      null: an ? 0 : ereignisse.filter((e) => !e.zeilen).length,
-      summe: an ? 0 : ereignisse.reduce((a, e) => a + e.zeilen, 0),
-      x: schirm ? Math.round(schirm.left + schirm.width / 2) : 0,
-      y: schirm ? Math.round(schirm.top + schirm.height / 2) : 0,
-      zellhoehe: schirm && eintrag?.term.rows ? Math.round((schirm.height / eintrag.term.rows) * 100) / 100 : 0,
-      viewportY: buf?.viewportY ?? -1,
-      baseY: buf?.baseY ?? -1,
-      zeilen: eintrag?.term.rows ?? 0,
-    };
-  },
-
-  async rad(paneId: string, schritte: number, shift?: boolean): Promise<unknown> {
-    const eintrag = paneTerms.get(paneId) ?? paneTerms.get(aktiverPane);
-    if (!eintrag) return { pane: paneId, fehlt: true };
-    // Auf WELCHEM Pane das Ereignis wirklich landet -- der Haken faellt auf den
-    // aktiven zurueck, und die Auskunft muss denselben meinen.
-    const gemeint = [...paneTerms].find(([, e]) => e === eintrag)?.[0] ?? paneId;
-    const el = eintrag.el.querySelector<HTMLElement>('.xterm') ?? eintrag.el;
-    // Vorher leeren: was danach hier steht, hat GENAU dieses Rad-Ereignis
-    // hinausgeschickt.
-    letzteEingabe = null;
-    // Der Testweg schickt weiter ein Vielfaches der ZELLHOEHE -- er heisst
-    // „schritte" und ist als Weg gemeint, nicht als Zeilenzahl. Wieviele Zeilen
-    // daraus werden, entscheidet radZeilen, und genau das soll gemessen werden.
-    el.dispatchEvent(
-      new WheelEvent('wheel', {
-        deltaY: schritte * Math.max(1, zellmass().hoehe),
-        deltaMode: 0,
-        bubbles: true,
-        cancelable: true,
-        shiftKey: !!shift,
-      }),
-    );
-    // `smoothScrollDuration` (TERMOPT, 12.08.) macht `scrollLines()` asynchron:
-    // der Puffer bewegt sich erst ueber ein paar Einzelbilder, nicht mehr in
-    // demselben Durchlauf wie das Rad-Ereignis. Ohne diese Wartezeit laese
-    // dieser Haken den Stand VOR der Bewegung -- gemessen in
-    // test-app-flaeche.sh: "das Rad bewegt nichts", obwohl es das sehr wohl
-    // tat, nur noch nicht in derselben Millisekunde. Hier stand dafuer ein
-    // festes `setTimeout(50)`; warum daraus ein Warten auf den Zustand wurde,
-    // steht bei rollenBeruhigt().
-    await rollenBeruhigt();
-    const buf = eintrag.term.buffer.active;
-    return {
-      pane: gemeint,
-      viewportY: buf.viewportY,
-      baseY: buf.baseY,
-      laenge: buf.length,
-      zeilen: eintrag.term.rows,
-      typ: buf.type,
-      mausmodus: !!eintrag.el.querySelector('.xterm.enable-mouse-events'),
-      // Was der Haken WIRKLICH gerechnet hat. `mausmodus` oben liest nur das
-      // Terminal im Fenster, und das weiss von einer Umschaltung nichts, die
-      // vor seinem Aufbau kam -- die kennt nur tmux (mausModus). Wer den
-      // Rueckfall messen will, braucht die Zahl, nach der entschieden wird.
-      mausAn: !!eintrag.el.querySelector('.xterm.enable-mouse-events') || !!mausModus.get(gemeint)?.an,
-      // Ob dieses Terminal seinen Rueckblick hat -- die Buchfuehrung, an der
-      // haengt, ob nachgefordert wird.
-      rueckblick: eintrag.rueckblickDa,
-      // Was dieses Ereignis an den Pane geschickt hat -- lesbar gemacht, damit
-      // sich auch auf dem Alternativschirm belegen laesst, DASS es etwas tat.
-      gesendet: eingabeLesbar(),
-    };
-  },
-
-  /**
-   * NUR FUER TESTS: WebGL fuer dieses Fenster unbrauchbar machen -- damit sich
-   * der Rueckfall auf Canvas ueberhaupt ausloesen laesst, ohne auf einen
-   * Chromium-Schalter angewiesen zu sein, der je nach Treiber und
-   * Software-Rasterisierer (SwiftShader) trotzdem noch einen Kontext liefert.
-   * Wirkt nur auf DIESEN Fensterprozess, nur bis zum naechsten Neuladen.
-   *
-   * ZWEI HAELFTEN, und die zweite kam am 19.08. dazu:
-   *
-   *   1. `getContext('webgl2')` gibt nichts mehr her. Das gilt fuer jedes
-   *      Terminal, das DANACH entsteht -- der Rueckfall in `ladeRenderer()`
-   *      greift dort von selbst.
-   *   2. Jedes Terminal, das SEIN WebGL SCHON GELADEN hat, wird hier
-   *      umgestellt: Zusatz abwerfen, Canvas laden, Buchfuehrung nachziehen.
-   *
-   * Warum die zweite Haelfte fehlte und warum das niemandem auffiel: Bis zum
-   * 19.08. stand `WEBGL_AUS = true` in `ladeRenderer()`, und die Konstante
-   * sorgte fuer Canvas, ganz gleich ob diese Sperre etwas taugte. Der Riegel
-   * hier war also nie gemessen, sondern vom anderen verdeckt. Mit dem Fall der
-   * Konstante kam es heraus: `test-app-zweitblick-verschmelzung.sh` sperrt
-   * WebGL, NACHDEM das Terminal seines Messpanes laengst steht, und bekam
-   * weiterhin 'webgl' zurueck -- die Zusage, an der die ganze Suite haengt,
-   * war damit wertlos.
-   *
-   * Der Name ist die Begruendung: was `webglSperren` heisst, muss WebGL
-   * sperren, nicht nur den naechsten Kontextwunsch. Eine Sperre, die einen
-   * schon laufenden Fall auslaesst, ist eine Zusage mit einer Ausnahme, die
-   * nirgends steht.
-   *
-   * Was das fuer `test-app-scroll-renderer.sh` bedeutet, die denselben Helfer
-   * benutzt: nichts. Dort wird 'im Normallauf ist WebGL aktiv' an P1 gemessen,
-   * BEVOR diese Sperre faellt; danach misst die Suite nur noch P2, und der
-   * kommt so oder so auf Canvas.
-   */
-  webglSperren(): boolean {
-    const original = HTMLCanvasElement.prototype.getContext;
-    HTMLCanvasElement.prototype.getContext = function (this: HTMLCanvasElement, art: string, ...rest: unknown[]) {
-      if (art === 'webgl2' || art === 'webgl') return null;
-      return (original as (...a: unknown[]) => unknown).apply(this, [art, ...rest]);
-    } as typeof HTMLCanvasElement.prototype.getContext;
-    // Ueber eine Kopie laufen: `canvasLaden()` schreibt in `rendererJePane`,
-    // und `delete` waehrend des Durchlaufs waere ein Griff in die Sammelstelle,
-    // aus der gerade gelesen wird.
-    for (const [id, { addon, term }] of [...webglJeTerminal]) {
-      webglJeTerminal.delete(id);
-      try {
-        addon.dispose();
-      } catch {
-        // Schon abgeworfen oder nie richtig oben -- der naechste Schritt
-        // (Canvas laden) ist trotzdem der richtige, und er ist der einzige,
-        // an dem die Messung danach haengt.
-      }
-      canvasLaden(id, term);
-    }
-    return true;
-  },
-
-  /**
-   * NUR FUER TESTS (clipfixtest): eine Auswahl im Terminal setzen oder
-   * loeschen, ohne einen echten Ziehvorgang der Maus. `hasSelection()` ist
-   * genau das, wonach `terminalZwischenablageHaken` selbst fragt -- damit
-   * misst der Test dieselbe Bedingung, die auch die Produktionslogik prueft.
-   */
-  zwischenablageAuswahl(paneId: string, an: boolean): boolean {
-    const eintrag = paneTerms.get(paneId) ?? paneTerms.get(aktiverPane);
-    if (!eintrag) return false;
-    if (an) eintrag.term.selectAll();
-    else eintrag.term.clearSelection();
-    return eintrag.term.hasSelection();
-  },
-
-  /**
-   * NUR FUER TESTS (clipfixtest): eine echte Taste auf dem versteckten
-   * Textfeld des Terminals ausloesen -- xterm.js haengt seinen `keydown`-
-   * Zuhoerer GENAU DORT an (node_modules/@xterm/xterm, `addDisposableDomListener
-   * (this.textarea, "keydown", ...)`), nicht an `document`. Ein `dispatchEvent`
-   * dort durchlaeuft denselben Weg wie ein echter Tastendruck: erst
-   * `attachCustomKeyEventHandler` (unser Haken aus `terminalZwischenablageHaken`),
-   * erst wenn DER nichts abfaengt xterms eigene Auswertung. `verhindert` ist
-   * `true`, wenn irgendetwas in dieser Kette `preventDefault()` gerufen hat --
-   * bei Strg+Umschalt+C/V unser Haken, bei einem blossen Strg+C xterm selbst
-   * (SIGINT zu senden verhindert das Neuschreiben des Feldes durch den Browser).
-   * `letzteEingabe` wird vorher geleert: was danach dort steht, kam GENAU aus
-   * diesem einen Tastendruck.
-   */
-  zwischenablageTaste(paneId: string, opt: { taste: string; shift?: boolean }): { verhindert: boolean } {
-    const eintrag = paneTerms.get(paneId) ?? paneTerms.get(aktiverPane);
-    if (!eintrag) return { verhindert: false };
-    const feld = eintrag.el.querySelector<HTMLTextAreaElement>('textarea.xterm-helper-textarea');
-    if (!feld) return { verhindert: false };
-    letzteEingabe = null;
-    const taste = opt.taste.length === 1 && opt.shift ? opt.taste.toUpperCase() : opt.taste.toLowerCase();
-    const ev = new KeyboardEvent('keydown', {
-      key: taste,
-      code: `Key${taste.toUpperCase()}`,
-      keyCode: taste.toUpperCase().charCodeAt(0),
-      ctrlKey: true,
-      shiftKey: !!opt.shift,
-      altKey: false,
-      metaKey: false,
-      bubbles: true,
-      cancelable: true,
-    });
-    const nichtVerhindert = feld.dispatchEvent(ev);
-    return { verhindert: !nichtVerhindert };
-  },
-
-  /** NUR FUER TESTS (clipfixtest): was der letzte {@link zwischenablageTaste}-Aufruf an den Pane geschickt hat. */
-  zwischenablageGesendet(): string {
-    return eingabeLesbar();
-  },
-
-  /**
-   * NUR FUER TESTS (clipfixtest): die Bildschirmmitte eines Zielfeldes fuer
-   * einen ECHTEN Rechtsklick (`sendInputEvent` in main.ts, wie bei
-   * `rad-strom`) -- ein `dispatchEvent(new MouseEvent('contextmenu'))` erreicht
-   * Electrons browser-seitiges 'context-menu'-Ereignis nachweislich NICHT
-   * (gemessen; siehe der Kommentar bei 'kontextmenu-fake' in main.ts).
-   * `'editierbar'` trifft das Umbenennen-Feld -- es steckt hinter `.sichtbar`
-   * und wird hier eigens dafuer eingeblendet, sonst liefert `getBoundingClientRect`
-   * eine Nullflaeche und der Klick traefe, was zufaellig an Pixel (0,0) liegt.
-   * Jede andere Kennung zielt auf `.xterm-screen`, die sichtbare Zeichenflaeche
-   * des Terminals -- NICHT auf sein `xterm-helper-textarea`. Erster Anlauf
-   * dieser Suite zielte auf die Textarea und mass dort `isEditable: true`:
-   * folgerichtig, ein `<textarea>` ist per Definition editierbar, aber am
-   * Terminal klickt niemand dort -- ein echter Rechtsklick trifft die
-   * Zeichenflaeche, die im DOM darueber liegt und die Textarea unsichtbar
-   * verdeckt.
-   */
-  zwischenablageKontextmenuZiel(ziel: string): { x: number; y: number } | null {
-    let el: HTMLElement | null = null;
-    if (ziel === 'editierbar') {
-      document.getElementById('umbenennen')?.classList.add('sichtbar');
-      el = document.getElementById('umbenennen-feld');
-    } else {
-      const eintrag = paneTerms.get(ziel) ?? paneTerms.get(aktiverPane);
-      el = eintrag?.el.querySelector<HTMLElement>('.xterm-screen') ?? null;
-    }
-    if (!el) return null;
-    const r = el.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) return null;
-    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
-  },
-
-  /**
-   * NUR FUER TESTS UND DEN HAUPTPROZESS (clipmenu, 17.08.): fuer das
-   * `context-menu`-Ereignis in main.ts -- `params.isEditable` folgt dort dem
-   * FOKUS (xterms verstecke Hilfs-Textarea), nicht der Klickposition, deshalb
-   * fragt der Hauptprozess hier eigens nach, welcher Pane unter (x, y) liegt.
-   * `.closest('.panekasten')` findet den Kasten unabhaengig davon, ob der
-   * Treffer die Zeichenflaeche selbst oder ein Kind darin ist -- derselbe
-   * Kasten, den zeichneLage() mit `dataset.pane` anlegt. `auswahlText` wird
-   * SOFORT mitgegeben statt erst beim Klick auf "Kopieren" neu abgefragt: das
-   * Menue soll genau die Auswahl kopieren, die beim Oeffnen bestand, nicht was
-   * zufaellig noch markiert ist, wenn der Klick Millisekunden spaeter kommt.
-   */
-  kontextZiel(x: number, y: number): { paneId: string; hatAuswahl: boolean; auswahlText: string } | null {
-    const el = document.elementFromPoint(x, y);
-    const kasten = el?.closest<HTMLElement>('.panekasten');
-    const paneId = kasten?.dataset.pane ?? '';
-    const eintrag = paneId ? paneTerms.get(paneId) : undefined;
-    if (!eintrag) return null;
-    const hatAuswahl = eintrag.term.hasSelection();
-    return { paneId, hatAuswahl, auswahlText: hatAuswahl ? eintrag.term.getSelection() : '' };
-  },
-
-  /**
-   * NUR FUER DEN HAUPTPROZESS (clipmenu, 17.08.): "Einfuegen" aus dem
-   * Terminal-Kontextmenue. Derselbe Griff wie Strg+Umschalt+V in
-   * `terminalZwischenablageHaken` -- `t.paste(text)` --, nur dass der Text
-   * schon da ist: der Hauptprozess hat die Zwischenablage selbst gelesen
-   * (`clipboard.readText()`, kein zweiter Weg dorthin) und schickt ihn mit.
-   */
-  kontextEinfuegen(paneId: string, text: string): boolean {
-    const eintrag = paneTerms.get(paneId) ?? paneTerms.get(aktiverPane);
-    if (!eintrag || !text) return false;
-    eintrag.term.paste(text);
-    return true;
-  },
-
-  /** Welcher Renderer auf diesem Pane wirklich zeichnet -- webgl, canvas oder dom. */
-  rendererArt(paneId: string): string {
-    return rendererJePane.get(paneId) ?? (paneTerms.has(paneId) ? 'dom' : '');
-  },
-
-  /**
-   * Wieviel Zeit zwischen aufeinanderfolgenden Bildern liegt, waehrend
-   * fortlaufend Rad-Ereignisse denselben Pane hochrollen -- die Zahl, ohne die
-   * "haekelig" eine Meinung bleibt (12.08.).
-   *
-   * Jedes Bild: ein Rad-Ereignis wie in `rad()` (deckelt sich selbst ueber
-   * RAD_DECKEL), dann ein `requestAnimationFrame`. Xterm plant sein eigenes
-   * Neuzeichnen ebenfalls ueber ein rAF, registriert waehrend des synchronen
-   * `dispatchEvent` -- es laeuft also VOR unserem Aufruf im selben Bild, und
-   * der Abstand zwischen zwei aufeinanderfolgenden rAF-Zeitstempeln traegt
-   * damit die Zeichenarbeit dieses Bildes mit. `backgroundThrottling: false`
-   * und `paintWhenInitiallyHidden: true` (main.ts, `fensterBauen`) sorgen
-   * dafuer, dass das trotz `show:false` echte Bildabstaende sind und keine
-   * gedrosselten.
-   */
-  async scrollLeistung(paneId: string, p: { bilder?: number; raster?: number }): Promise<{
-    deltas: number[]; renderer: string; laenge: number; zeilen: number; baseY: number;
-  }> {
-    const eintrag = paneTerms.get(paneId) ?? paneTerms.get(aktiverPane);
-    if (!eintrag) return { deltas: [], renderer: '', laenge: 0, zeilen: 0, baseY: 0 };
-    const el = eintrag.el.querySelector<HTMLElement>('.xterm') ?? eintrag.el;
-    const bilder = Math.max(2, Math.floor(p?.bilder ?? 120));
-    const raster = Math.max(1, p?.raster ?? 3);
-    const deltas: number[] = [];
-    let voriger: number | null = null;
-    for (let i = 0; i < bilder; i++) {
-      el.dispatchEvent(
-        new WheelEvent('wheel', {
-          // Negativ: rad hoch, in den Rueckblick hinein -- das ist der
-          // Fall, den alice gemeldet hat, und er braucht Puffer darueber.
-          deltaY: -RASTER_PIXEL * raster,
-          deltaMode: 0,
-          bubbles: true,
-          cancelable: true,
-        }),
-      );
-      const t = await new Promise<number>((res) => requestAnimationFrame(res));
-      if (voriger !== null) deltas.push(t - voriger);
-      voriger = t;
-    }
-    const buf = eintrag.term.buffer.active;
-    const gemeint = [...paneTerms].find(([, e]) => e === eintrag)?.[0] ?? paneId;
-    return {
-      deltas,
-      renderer: rendererJePane.get(gemeint) ?? 'dom',
-      laenge: buf.length,
-      zeilen: eintrag.term.rows,
-      baseY: buf.baseY,
-    };
-  },
-
-  /**
-   * Der Text des gezeichneten Panes. Zeigt die Mitte mehrere, kommt der Text
-   * des GEWAEHLTEN zuerst und die uebrigen darunter -- so bleibt eine Pruefung
-   * auf "steht das im Fenster?" in beiden Ansichten richtig.
-   */
-  bufferText(): string {
-    const reihenfolge = [
-      ...(paneTerms.has(aktiverPane) ? [aktiverPane] : []),
-      ...[...paneTerms.keys()].filter((id) => id !== aktiverPane),
-    ];
-    const teile: string[] = [];
-    for (const id of reihenfolge) {
-      const buf = paneTerms.get(id)!.term.buffer.active;
-      const zeilen: string[] = [];
-      for (let i = 0; i < buf.length; i++) zeilen.push(buf.getLine(i)?.translateToString(true) ?? '');
-      teile.push(zeilen.join('\n').replace(/\n+$/, ''));
-    }
-    return teile.join('\n');
-  },
-  /** Was in der uebernommenen Seite steht -- pruefbar ohne Foto. */
-  // Alle drei fragen die Seite und geben deshalb ein Versprechen zurueck --
-  // executeJavaScript loest es auf, der Aufrufer merkt nichts davon.
-  seitenState(): Promise<unknown> {
-    return seiten.zustand();
-  },
-  seiteRollen(auswahl: string): Promise<boolean> {
-    return seiten.rolleZu(auswahl);
-  },
-  seiteKlick(auswahl: string): Promise<boolean> {
-    return seiten.klick(auswahl);
-  },
-  /** Nur fuer die Pruefung der Auffrischung: ein Feld gezielt fokussieren. */
-  seiteFokus(auswahl: string): Promise<boolean> {
-    return seiten.fokussiere(auswahl);
-  },
-  /** Nur fuer die Pruefung der Auffrischung: ein fokussiertes Feld gezielt verlassen. */
-  seiteUnfokus(): Promise<boolean> {
-    return seiten.entfokussiere();
-  },
-  /** Nur fuer die Pruefung: die echte Schliessen-Schaltflaeche im Rahmen anklicken. */
-  seiteSchliessenKlick(): boolean {
-    return seiten.schliessenKlick();
-  },
-  /**
-   * Nur der SICHTBARE Schirm je Pane -- das Gegenstueck zu `capture-pane -p`.
-   *
-   * bufferText() gibt den ganzen Puffer aus, Bildlauf eingeschlossen, und das
-   * ist fuer die Frage "steht das im Fenster?" richtig. Fuer die Frage "zeigt
-   * das Fenster denselben Schirm wie tmux?" ist es falsch: xterm bricht beim
-   * Verkleinern die alten Zeilen neu um und schiebt sie in den Bildlauf, tmux
-   * kennt dort nichts davon. Ein Vergleich, der die letzten n Zeilen des
-   * ganzen Puffers nimmt, greift dann in den Bildlauf und meldet einen
-   * Unterschied, wo nur eine Vorgeschichte steht. Gemessen: mit einer
-   * Oberflaeche, die sich bei jedem Groessenwechsel vollstaendig neu zeichnet,
-   * traf das etwa jeden dritten Lauf.
-   */
-  schirmText(): string {
-    const reihenfolge = [
-      ...(paneTerms.has(aktiverPane) ? [aktiverPane] : []),
-      ...[...paneTerms.keys()].filter((id) => id !== aktiverPane),
-    ];
-    const teile: string[] = [];
-    for (const id of reihenfolge) {
-      const t = paneTerms.get(id)!.term;
-      const buf = t.buffer.active;
-      const zeilen: string[] = [];
-      for (let i = 0; i < t.rows; i++) {
-        zeilen.push(buf.getLine(buf.baseY + i)?.translateToString(true) ?? '');
-      }
-      teile.push(zeilen.join('\n').replace(/\n+$/, ''));
-    }
-    return teile.join('\n');
-  },
-  uiState(): unknown {
-    const eintraege = [...sessionsEl.querySelectorAll<HTMLDivElement>('.eintrag')].map((e) => {
-      const k = e.querySelector('.kuerzel');
-      const r = k?.getBoundingClientRect();
-      return {
-        id: e.dataset.id ?? '',
-        text: (e.textContent ?? '').trim(),
-        zustand: [...e.classList].find((c) => c.startsWith('zustand-'))?.slice(8) ?? '',
-        gewaehlt: e.classList.contains('gewaehlt'),
-        kuerzelFarbe: k?.className.split(' ')[1] ?? '',
-        punktFarbe: e.querySelector('.punkt')?.className.split(' ')[1] ?? '',
-        // Wo das Kuerzel auf dem Bild liegt -- damit ein Foto an genau der
-        // Stelle nachgemessen werden kann statt nach Augenmass.
-        kuerzelRect: r ? [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] : null,
-      };
-    });
-    const rechts = [...rechtsListeEl.querySelectorAll<HTMLDivElement>('.zeile, .rubrik')].map((e) => ({
-      klasse: e.className,
-      text: (e.textContent ?? '').trim(),
-      subagent: e.classList.contains('subagent'),
-      rubrik: e.classList.contains('rubrik'),
-      hoehe: Math.round(e.getBoundingClientRect().height),
-      marke: (e.querySelector('.punkt')?.textContent ?? '').trim(),
-      // Welche Zustandsfarbe die Marke traegt -- damit eine Pruefung sagen
-      // kann, dass Lila hier NICHT mehr vorkommt.
-      farbe: (e.querySelector('.punkt')?.className ?? '').match(/\b(laeuft|will|aus|fern|ruhig)\b/)?.[1] ?? '',
-      // Wie weit die Marke vom linken Rand der Leiste einrueckt. Daran haengt
-      // die Aussage, dass man die Gliederung Tab > Worker > Anhang SIEHT und
-      // nicht an der Aufschrift ablesen muss.
-      markeLinks: Math.round(
-        ((e.querySelector('.punkt') ?? e).getBoundingClientRect().left) - rechtsListeEl.getBoundingClientRect().left,
-      ),
-      // Der Name weicht zuletzt: wird es eng, schrumpft der Zustand daneben.
-      nameBreite: Math.round(e.querySelector('.name')?.getBoundingClientRect().width ?? 0),
-      zustandBreite: Math.round(e.querySelector('.last')?.getBoundingClientRect().width ?? 0),
-    }));
-    // Die Ergebnismeldungen als Daten -- damit eine Pruefung sie ohne Foto
-    // nachweisen kann, so wie die Leisten oben.
-    const meldungenJetzt = [...document.querySelectorAll<HTMLDivElement>('#meldungen .meldung')].map((e) => ({
-      worker: e.dataset.worker ?? '',
-      pfad: e.dataset.pfad ?? '',
-      veraltet: e.dataset.veraltet === '1',
-      text: (e.textContent ?? '').trim(),
-    }));
-    const buehneRect = buehne.getBoundingClientRect();
-    // Der Kasten um ALLE gezeichneten Panes -- das ist das Gitter, das die
-    // Flaeche fuellen soll, nicht mehr ein einzelnes Terminal.
-    const kaesten = [...gitterEl.querySelectorAll<HTMLDivElement>('.panekasten')].map((e) => e.getBoundingClientRect());
-    const gitter = kaesten.length
-      ? {
-          left: Math.min(...kaesten.map((r) => r.left)),
-          top: Math.min(...kaesten.map((r) => r.top)),
-          right: Math.max(...kaesten.map((r) => r.right)),
-          bottom: Math.max(...kaesten.map((r) => r.bottom)),
-          width: Math.max(...kaesten.map((r) => r.right)) - Math.min(...kaesten.map((r) => r.left)),
-          height: Math.max(...kaesten.map((r) => r.bottom)) - Math.min(...kaesten.map((r) => r.top)),
-        }
-      : undefined;
-    const pane = gitter ?? buehneRect;
-    // Dieselbe Flaeche, die auch die Kacheln legt (gitterFlaeche()) -- nicht
-    // noch einmal eigens ueber buehneRect gemessen. Sonst melden Lage und
-    // Zustand zwei leicht verschiedene Zahlen fuer dieselbe Flaeche.
-    const flaeche = gitterFlaeche();
-    return {
-      // Wieviel vom Terminal zu sehen ist und wie der Rand verteilt liegt.
-      buehne: {
-        breite: Math.round(flaeche.b),
-        hoehe: Math.round(flaeche.h),
-        // Das gezeichnete Gitter, nicht der Kasten darum.
-        paneBreite: Math.round(gitter?.width ?? pane.width),
-        paneHoehe: Math.round(gitter?.height ?? pane.height),
-        spalten: letzteLage?.cols ?? 0,
-        zeilen: letzteLage?.rows ?? 0,
-        panes: letzteLage?.panes.length ?? 0,
-        art: letzteLage?.art ?? '-',
-        // Die Spalte, die xterm fuer die Bildlaufleiste freihaelt. Sie gehoert
-        // zum Terminal und ist kein ungenutzter Rand.
-        bildlaufleiste: Math.round(buehneRect.width - (gitter?.width ?? buehneRect.width)),
-        // DIE GEMESSENE ZELLE EINES GEZEICHNETEN PANES -- nicht mehr die Flaeche
-        // geteilt durch das Mass-Terminal.
-        //
-        // Das Mass-Terminal (`term`) steht in der Tab-Ansicht unberuehrt auf
-        // seinen Anfangswerten 80x24. Die Flaeche dadurch zu teilen ergab eine
-        // Zahl, die mit dem Gezeichneten nichts zu tun hat: bei einer Buehne von
-        // 1384x876 meldete sie 17,3 x 36,5, waehrend die Zellen in Wirklichkeit
-        // 7,5 x 15,4 gross waren (184 Spalten, 57 Zeilen). Aus dem Verhaeltnis
-        // der beiden Zahlen (2,3) liess sich ein Fehler bei der Umrechnung
-        // zwischen Geraetepixeln und CSS-Punkten lesen, den es nicht gibt --
-        // 184 x 7,5 = 1380 und 57 x 15,4 = 878 gehen sauber auf. `zellmass()`
-        // misst am gezeichneten Pane und ist dieselbe Zahl, mit der auch
-        // gerechnet wird.
-        zelle: {
-          breite: Number(zellmass().breite.toFixed(2)),
-          hoehe: Number(zellmass().hoehe.toFixed(2)),
-        },
-        // Lage im FENSTER, nicht in der Buehne: damit laesst sich auf einem
-        // Selbstfoto genau der Bereich nachmessen, in dem der Pane steht.
-        paneRect: [Math.round(pane.left), Math.round(pane.top), Math.round(pane.width), Math.round(pane.height)],
-        randLinks: Math.round((gitter?.left ?? pane.left) - buehneRect.left),
-        randRechts: Math.round(buehneRect.right - (gitter?.right ?? pane.right)),
-        randOben: Math.round((gitter?.top ?? pane.top) - buehneRect.top),
-        randUnten: Math.round(buehneRect.bottom - (gitter?.bottom ?? pane.bottom)),
-      },
-      notiz: notizEl.classList.contains('sichtbar') ? (notizEl.textContent ?? '') : '',
-      // Der Plus-Knopf: dass es ihn gibt und wo er steht. WAS er aufmacht,
-      // steht seit dem 06.08. nicht mehr hier -- es ist ein eigenes Fenster,
-      // und das liest der Steuerkanal mit `awb-ctl sitzung`.
-      neu: {
-        knopf: !!document.getElementById('neue-session'),
-        knopfOben: Math.round(document.getElementById('neue-session')?.getBoundingClientRect().top ?? -1),
-        sessionsOben: Math.round(sessionsEl.getBoundingClientRect().top),
-      },
-      // Das Feld fuer den neuen Namen: ob es offen steht, zu welcher Sitzung
-      // und was darin steht. Ohne diese Auskunft liesse sich der Weg
-      // „Rechtsklick, Namen ändern, tippen, bestaetigen" nur am Bild pruefen.
-      umbenennen: {
-        offen: umbenennenEl.classList.contains('sichtbar'),
-        id: umbenennenId,
-        wert: umbenennenFeld.value,
-        alt: umbenennenAltEl.textContent ?? '',
-      },
-      // V2: welche Ergebnismeldungen gerade stehen. Leer ist der Normalfall --
-      // sie sind fluechtig und bekommen nach A14 keine Dauerflaeche.
-      meldungen: meldungenJetzt,
-      // Leer, solange ein Steuerkanal da ist. Steht hier etwas, zeigt das
-      // Fenster die Warnung -- und dann ist diese Auskunft ohnehin nur ueber
-      // ein Selbstfoto oder --startfoto zu bekommen.
-      kanal: kanalGrund,
-      kanalwarnung: kanalwarnungEl.classList.contains('sichtbar') ? (kanalwarnungEl.textContent ?? '') : '',
-      // Die Namensschilder auf den Panes: Text, Lage im Fenster und ob das
-      // Schild auf das Kuerzel ausgewichen ist. Damit laesst sich Groesse und
-      // Kontrast am Bildpunkt nachmessen statt nach Augenmass.
-      schilder: [...gitterEl.querySelectorAll<HTMLDivElement>('.panekasten')].map((k) => {
-        const s = k.querySelector<HTMLDivElement>('.panename');
-        const r = s?.getBoundingClientRect();
-        const id = k.dataset.pane ?? '';
-        return {
-          pane: id,
-          text: s?.textContent ?? '',
-          kurz: !!s?.classList.contains('kurz'),
-          flach: !!s?.classList.contains('flach'),
-          verborgen: !!s && s.style.display === 'none',
-          aktiv: !!s?.classList.contains('aktiv'),
-          // In welcher Ecke das Schild liegt und wieviele beschriebene Zellen
-          // es zudeckt. Die zweite Zahl ist die Zusage: ein Name, der auf dem
-          // Text liegt, ist keine Auskunft, sondern ein Fleck -- und ob er
-          // daraufliegt, wird gezaehlt und nicht geschaetzt.
-          ecke: s ? eckenName(s) : '',
-          deckt: s && s.style.display !== 'none' && r ? belegteZellen(id, r) : 0,
-          schriftgroesse: s ? Math.round(parseFloat(getComputedStyle(s).fontSize)) : 0,
-          paneBreite: Math.round(k.getBoundingClientRect().width),
-          paneHoehe: Math.round(k.getBoundingClientRect().height),
-          rect: r ? [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] : null,
-        };
-      }),
-      // Wo die Kacheln auf der Buehne liegen -- Lage UND Groesse, bezogen auf
-      // die Buehne. Ohne diese Zahlen laesst sich "die Flaeche wird ausgenutzt"
-      // nur behaupten: `terminals` nennt die Groesse eines Kastens, aber nicht
-      // seinen Platz, und genau der war beim diagonalen Tab-Bild falsch.
-      //
-      // Die Zahlen kommen aus `letzteKacheln` -- der Geometrie, WIE SIE
-      // GESETZT wurde -- und nicht mehr aus einer eigenen
-      // `getBoundingClientRect()` je Kasten. Zwei Kacheln, deren Grenze auf
-      // demselben `kachelLage()`-Wert beruht, rundeten sonst UNABHAENGIG
-      // (einmal ueber die eigene Position, einmal ueber Position der
-      // Nachbarkachel plus deren Hoehe) und liefen dabei bis zu einem Pixel
-      // auseinander, obwohl sie sich nur beruehrten. UNGERUNDET, aus demselben
-      // Grund: `Math.round(y) + Math.round(h)` ist nicht dasselbe wie
-      // `Math.round(y + h)`, und genau diese Differenz war die Ueberdeckung,
-      // die es in Wirklichkeit nie gab -- zwei Kacheln, deren gemeinsame Kante
-      // auf derselben Fliesskommazahl beruht, beruehren sich exakt, nur ihre
-      // UNABHAENGIG gerundeten Melder stimmten nicht mehr ueberein. Ein Kasten
-      // ohne Cache-Eintrag (sollte nicht vorkommen, ist aber kein Grund, ihn
-      // zu verschweigen) faellt auf die gerundete Messung zurueck.
-      lagen: [...gitterEl.querySelectorAll<HTMLDivElement>('.panekasten, .panefehlt')].map((k) => {
-        const pane = k.dataset.pane ?? '';
-        const kachel = letzteKacheln.get(pane);
-        if (kachel) {
-          return { pane, x: kachel.x, y: kachel.y, b: kachel.b, h: kachel.h, fehlt: kachel.fehlt };
-        }
-        const r = k.getBoundingClientRect();
-        return {
-          pane,
-          x: Math.round(r.left - buehneRect.left),
-          y: Math.round(r.top - buehneRect.top),
-          b: Math.round(r.width),
-          h: Math.round(r.height),
-          fehlt: k.classList.contains('panefehlt'),
-        };
-      }),
-      // Angefordert, aber nicht zu zeichnen -- mit dem Grund. Ein Worker, der
-      // ohne ein Wort verschwindet, ist schlimmer als einer, der schlecht sitzt.
-      fehlend: letzteLage?.fehlend ?? [],
-      // Was die xterm-Instanzen WIRKLICH halten -- nicht, was die letzte
-      // Layout-Meldung sagte. Bei einem Groessensprung koennen beide
-      // auseinanderlaufen, und nur der Vergleich zeigt, welche der drei
-      // Zahlenreihen (Renderer, tmux, capture-pane) danebenliegt.
-      // Ob die Anwendung im Pane die Maus verfolgt -- die Zahl, an der sich
-      // entscheidet, wem das Rad gehoert.
-      maus: [...mausModus].map(([pane, m]) => ({ pane, an: m.an, sgr: m.sgr })),
-      terminals: [...paneTerms].map(([pane, e]) => {
-        // Der Kasten, den wir dem Pane geben, und die Flaeche, die xterm
-        // WIRKLICH zeichnet. Laufen sie auseinander, wird die unterste Zeile
-        // angeschnitten -- und genau dort steht die Eingabezeile.
-        const kasten = e.el.getBoundingClientRect();
-        const schirm = e.el.querySelector('.xterm-screen')?.getBoundingClientRect();
-        return {
-          pane,
-          cols: e.term.cols,
-          rows: e.term.rows,
-          kasten: [Math.round(kasten.width * 100) / 100, Math.round(kasten.height * 100) / 100],
-          schirm: schirm ? [Math.round(schirm.width * 100) / 100, Math.round(schirm.height * 100) / 100] : null,
-        };
-      }),
-      // Bildpunkte je CSS-Pixel. Bei 1 entsteht jedes Selbstfoto in halber
-      // Aufloesung, und feine Verschiebungen fallen unter die Messschwelle.
-      bildpunkte: window.devicePixelRatio,
-      // Die eingestellte Schriftgroesse und die Zellgroesse, die daraus faellt.
-      // Beide Zellmasse nebeneinander: das des gezeichneten Panes (das gilt)
-      // und das des Mass-Terminals. Sie gingen am 06.08. um anderthalb Prozent
-      // auseinander und haben damit die Spaltenzahl verdorben -- wer das
-      // wieder sucht, soll die zwei Zahlen sehen und nicht raten.
-      schrift: {
-        groesse: schriftgroesse,
-        zelle: zellmass(),
-        zelleMassTerminal: (() => {
-          const g = paneEl.querySelector('.xterm-screen')?.getBoundingClientRect();
-          return g && term.cols && term.rows && g.width > 0
-            ? { breite: g.width / term.cols, hoehe: g.height / term.rows }
-            : null;
-        })(),
-      },
-      // Mittelachse jedes Eintrags der linken Leiste -- Symbolknoepfe oben,
-      // Kuerzel in der Mitte, Fussknopf unten. Sie muessen alle dieselbe sein.
-      achsen: [...linksEl.querySelectorAll<HTMLElement>('.knopf svg, .eintrag .kuerzel, .eintrag .punkt')].map((e) => {
-        const r = e.getBoundingClientRect();
-        const knopf = e.closest('.knopf') as HTMLElement | null;
-        const eintrag = e.closest('.eintrag') as HTMLElement | null;
-        return { was: knopf?.dataset.tot ?? eintrag?.dataset.id ?? '', mitte: Math.round((r.left + r.right) / 2) };
-      }),
-      modus: breitenmodus(modell?.ui.sidebarWidth ?? 48),
-      sidebarWidth: modell?.ui.sidebarWidth ?? 0,
-      rightWidth: modell?.ui.rightWidth ?? 0,
-      linksBreite: linksEl.getBoundingClientRect().width,
-      rechtsBreite: rechtsEl.getBoundingClientRect().width,
-      eintraege,
-      rechts,
-      tabs: [...tabsEl.querySelectorAll('.tab')].map((t) => (t.textContent ?? '').trim()),
-      hinweis: hinweisEl.textContent ?? '',
-      // Die Kopfzeile ist weg; ihre Auskuenfte sind es nicht.
-      auskunft,
-      rechtsTitel: rechtsEl.title,
-      rechtsKlasse: rechtsEl.className,
-      // Oberkante des ersten Eintrags je Leiste: beide sollen buendig sein.
-      obenLinks: Math.round(linksEl.firstElementChild?.getBoundingClientRect().top ?? -1),
-      obenRechts: Math.round((rechtsEl.querySelector('.zeile, .tab') as HTMLElement)?.getBoundingClientRect().top ?? -1),
-      freigaben: freigabenUiState(),
-      aktivitaet: aktivitaetUiState(),
-      ordner: ordnerUiState(),
-      protokolle: protokolleUiState(),
-      // Farben durchreichen (11.08.): der aufgeloeste Zustand, gelesen aus dem
-      // DOM statt aus einer eigenen Buchfuehrung -- was hier steht, ist auch
-      // das, was das Fenster wirklich zeichnet.
-      thema: {
-        dataThema: document.documentElement.dataset.thema ?? '',
-        zustandLaeuft: getComputedStyle(document.documentElement).getPropertyValue('--zustand-laeuft').trim(),
-        zustandWartet: getComputedStyle(document.documentElement).getPropertyValue('--zustand-wartet').trim(),
-        zustandFertig: getComputedStyle(document.documentElement).getPropertyValue('--zustand-fertig').trim(),
-        zustandTot: getComputedStyle(document.documentElement).getPropertyValue('--zustand-tot').trim(),
-        grund: getComputedStyle(document.documentElement).getPropertyValue('--grund').trim(),
-      },
-    };
-  },
-};
-
+// --- Umbenennen -------------------------------------------------------------
 /**
- * Der Plus-Knopf ueber den Sessions: das Sitzungsfenster.
- *
- * Bis zum 06.08. klappte hier eine Flaeche ueber der Buehne auf, die genau
- * einen der beiden Wege konnte -- Ordner waehlen und starten. Der zweite, eine
- * alte Sitzung fortsetzen, lag am Knopf ihrer Zeile in der Leiste und war
- * unsichtbar, solange der Haken fuer beendete Sitzungen nicht stand. Beide Wege
- * stehen jetzt in einem eigenen Fenster nebeneinander (main/sitzungsfenster.ts).
- *
- * DIE AUFLAGE AUS DIESEM HAUS, hier genauso durchgesetzt wie beim Zahnrad
- * darueber: Das Fenster geht auf, weil ein MENSCH geklickt hat. Unterschieden
- * wird an `isTrusted`, nicht an einem Namen -- ein echter Klick schickt
- * 'sitzung-zeigen' (dort steht show()), ein `element.click()` aus einem Skript
- * oder aus `awb-ctl klick neue-session` schickt 'sitzung-bauen': das Fenster
- * entsteht und ist lesbar und fotografierbar, erscheint aber auf keinem
- * Bildschirm.
- */
-document.getElementById('neue-session')?.addEventListener('click', (ereignis) => {
-  window.awbBridge.bedienung(ereignis.isTrusted ? 'sitzung-zeigen' : 'sitzung-bauen', null);
-});
-
-/**
- * „Namen ändern" aus dem Kontextmenue der Sessionleiste.
- *
- * Gefragt wird IM PROGRAMM, nicht in einem Terminal -- ein Zeilenfeld ueber der
- * Buehne, das mit der Antwort wieder zugeht. Geschrieben wird der Name hier
- * NICHT: die Antwort geht zurueck an den Hauptprozess, und dort schreibt
- * `wb-state` sie (main.ts, 'awb:sitzung-umbenennen'). Das Fenster kennt den
- * Weg in die Zustandsdatei gar nicht.
+ * „Namen ändern" aus dem Kontextmenue der Leiste. Gefragt wird IM PROGRAMM,
+ * nicht in einem Terminal -- ein Zeilenfeld ueber der Flaeche, das mit der
+ * Antwort wieder zugeht. Geschrieben wird der Name hier NICHT: die Antwort geht
+ * zurueck an den Hauptprozess, und dort schreibt `wb-state` sie.
  */
 const umbenennenEl = document.getElementById('umbenennen') as HTMLDivElement;
 const umbenennenAltEl = document.getElementById('umbenennen-alt') as HTMLDivElement;
@@ -3447,20 +2569,9 @@ function umbenennenZu(): void {
   umbenennenId = '';
 }
 
-window.awbBridge.onMeldung((p) => notiz(p.text ?? ''));
-
-// SOFORT WIRKSAM (12.08.): der Rechtsklick auf eine Sitzung hat ihre Ansicht
-// umgestellt, und der Pane wechselt hier -- ohne Neuaufbau des Fensters, ohne
-// dass die Sitzung angefasst wird. Kennt der Renderer den Pane (noch) nicht,
-// passiert nichts: die Entscheidung steht in ui.json, und der naechste Aufbau
-// dieses Panes fragt sie beim Hauptprozess ohnehin ab (chat/anbindung.ts).
-window.awbBridge.onChatAnsicht((p) => {
-  chatAnbindungen.get(p?.paneId ?? '')?.zeigen(p?.an === true);
-});
-
 window.awbBridge.onUmbenennen((p) => {
   umbenennenId = p.id;
-  umbenennenAltEl.textContent = `Bisher: ${p.name}${p.dir ? ` — ${p.dir}` : ''}`;
+  umbenennenAltEl.textContent = t('umbenennen.bisher', { name: p.name }) + (p.dir ? ` — ${p.dir}` : '');
   umbenennenFeld.value = p.name;
   umbenennenEl.classList.add('sichtbar');
   umbenennenFeld.focus();
@@ -3484,38 +2595,652 @@ umbenennenFeld.addEventListener('keydown', (e) => {
   else if (e.key === 'Escape') umbenennenZu();
 });
 
-// Die Buehne meldet ihre Flaeche EINMAL von sich aus, sobald sie steht. Ohne
-// das kennt der Hauptprozess sie erst, wenn das Fenster zum ersten Mal seine
-// Groesse aendert oder eine Schublade auf- und zugeht -- und alles, was vorher
-// gezeichnet wird, bleibt in der Groesse stehen, die tmux gerade hergibt.
-requestAnimationFrame(() => requestAnimationFrame(passeAn));
+// --- Die beiden Leisten aufziehen -------------------------------------------
+/**
+ * WAEHREND DES ZIEHENS BLEIBT ALLES IM FENSTER (16.08.). Die Breite folgt der
+ * Maus rein oertlich (hoechstens einmal je Einzelbild), GESPEICHERT wird beim
+ * Loslassen -- einmal. Vorher schickte jede Mausbewegung eine Meldung an den
+ * Hauptprozess, und der schrieb je Meldung `ui.json` und gab das volle Modell
+ * zurueck: bei 60 bis 120 Ereignissen je Sekunde ebenso viele Schreibvorgaenge
+ * fuer eine Zahl, die niemand ausser diesem Fenster braucht, solange die Maus
+ * noch unten ist.
+ *
+ * ZWEI AUSNAHMEN, die kein Schmuck sind: wechselt die BREITENSTUFE, aendert
+ * sich der Inhalt der Leiste, und die Meldung geht sofort raus -- ein- bis
+ * zweimal je Zug, nicht sechzigmal je Sekunde. Und beim Loslassen meldet die
+ * Flaeche ihre neue Groesse, ebenfalls einmal.
+ */
+// Rechts ist die Untergrenze die des Blattes (280) -- der Griff steht nur
+// da, solange ein Blatt offen ist.
+const ZIEH_GRENZEN = { links: { min: 48, max: 480 }, rechts: { min: 280, max: 900 } };
+let zieht: '' | 'links' | 'rechts' = '';
+let ziehBreite = 0;
+let ziehRahmen = 0;
+griffEl.addEventListener('mousedown', (e) => { zieht = 'links'; e.preventDefault(); });
+griffRechtsEl.addEventListener('mousedown', (e) => { zieht = 'rechts'; e.preventDefault(); });
 
-// Die Sprache EINMAL beim Start holen (derselbe geteilte Kanal wie bei der Verbrauchsseite) --
-// das Hauptfenster traegt weit mehr als die Chat-Ansicht und bleibt sonst grossteils
-// unuebersetzt, aber `<html lang>`, der Dokumenttitel und die Chat-Ansicht selbst sollen nicht
-// falsch behaupten, sie seien noch auf der Auslieferungssprache von vor dem Abruf.
+function ziehStufe(welche: 'links' | 'rechts', breite: number): string {
+  if (welche === 'links') return schmalLinks(breite) ? 'schmal' : 'breit';
+  // Rechts gibt es die schmale Stufe nicht mehr: der Griff steht nur da,
+  // solange ein Blatt offen ist, und dessen Untergrenze liegt bei 280
+  // (Electron-Befund 1).
+  return 'breit';
+}
+
+function ziehBreiteZeichnen(welche: 'links' | 'rechts', breite: number): void {
+  const el = welche === 'links' ? linksEl : rechtsEl;
+  el.classList.toggle('schmal', ziehStufe(welche, breite) === 'schmal');
+  el.style.width = `${breite}px`;
+}
+
+window.addEventListener('mousemove', (e) => {
+  if (!zieht) return;
+  const g = ZIEH_GRENZEN[zieht];
+  const roh = zieht === 'links' ? e.clientX : window.innerWidth - e.clientX;
+  const breite = Math.max(g.min, Math.min(g.max, Math.round(roh)));
+  const vorher = zieht === 'links'
+    ? (modell?.ui.sidebarWidth ?? 48)
+    : (modell ? blattBreiteJetzt(modell) : 360);
+  if (ziehStufe(zieht, vorher) !== ziehStufe(zieht, breite)) {
+    window.awbBridge.bedienung(zieht === 'links' ? 'sidebar-width' : 'blatt-breite', breite);
+    ziehBreite = breite;
+    return;
+  }
+  ziehBreite = breite;
+  if (ziehRahmen) return;
+  const welche = zieht;
+  ziehRahmen = requestAnimationFrame(() => {
+    ziehRahmen = 0;
+    ziehBreiteZeichnen(welche, ziehBreite);
+  });
+});
+window.addEventListener('mouseup', () => {
+  if (!zieht) return;
+  const welche = zieht;
+  zieht = '';
+  if (ziehRahmen) { cancelAnimationFrame(ziehRahmen); ziehRahmen = 0; }
+  if (!ziehBreite) return;
+  ziehBreiteZeichnen(welche, ziehBreite);
+  // ERST JETZT wird gespeichert: ein Zug ist eine Entscheidung, nicht sechzig.
+  window.awbBridge.bedienung(welche === 'links' ? 'sidebar-width' : 'blatt-breite', ziehBreite);
+  paneflaecheNachziehen();
+  ziehBreite = 0;
+});
+
+// --- Sprache, Thema, Fensterknoepfe ----------------------------------------
 void window.awbEditorBridge.sprache().then((sp) => {
+  setzeSprache(sp);
   setzeChatSprache(sp);
   document.documentElement.lang = sp === 'de' ? 'de' : 'en';
-  document.title = chatT('fenster.titel');
+  document.title = t('fenster.titel');
+  beschriftungenSetzen();
+  if (modell) alles(modell);
+  weltenSpracheGesetzt();
 });
 
 /**
- * Farben durchreichen (11.08.): dieselbe Mechanik wie im Einstellungsfenster
- * (einstellungen.ts, `themaAnwenden`) -- `data-thema` traegt hier immer den
- * AUFGELOESTEN Wert ('hell'/'dunkel'), nie 'system': `wirksam` kommt schon so
+ * Die FESTEN Beschriftungen nachtragen -- die aus index.html und die, die die
+ * Blaetter beim Laden in ihr `innerHTML` schreiben. Drei Attribute, je eines
+ * fuer die Stelle, an die der Text gehoert:
+ *
+ *   data-text              Aufschrift; sie geht in das `.beschriftung`-Kind,
+ *                          wenn es eines gibt, sonst in das Element selbst.
+ *                          Das Schildchen kommt aus demselben Schluessel mit
+ *                          `.tipp`; fehlt der, wird die Aufschrift auch das
+ *                          Schildchen.
+ *   data-text-title        nur das Schildchen (Knoepfe, die ein Zeichen tragen)
+ *   data-text-placeholder  nur der Platzhalter eines Eingabefeldes
+ *
+ * WARUM NICHT GLEICH BEIM BAUEN: die Sprache steht erst fest, wenn der
+ * Hauptprozess geantwortet hat, und die Blaetter bauen ihr Geruest schon beim
+ * Laden des Moduls -- also davor. Was einmal gebaut wird, traegt deshalb nur
+ * den SCHLUESSEL, und der Text kommt von hier, wenn die Sprache bekannt ist.
+ */
+function beschriftungenSetzen(): void {
+  for (const el of document.querySelectorAll<HTMLElement>('[data-text]')) {
+    const schluessel = el.dataset.text ?? '';
+    if (!schluessel) continue;
+    const aufschrift = t(schluessel);
+    const ziel = el.querySelector<HTMLElement>('.beschriftung') ?? el;
+    ziel.textContent = aufschrift;
+    const tipp = t(`${schluessel}.tipp`);
+    el.title = tipp.startsWith('[fehlender Text:') ? aufschrift : tipp;
+  }
+  for (const el of document.querySelectorAll<HTMLElement>('[data-text-title]')) {
+    el.title = t(el.dataset.textTitle ?? '');
+  }
+  for (const el of document.querySelectorAll<HTMLInputElement>('[data-text-placeholder]')) {
+    el.placeholder = t(el.dataset.textPlaceholder ?? '');
+  }
+}
+
+/**
+ * Farben durchreichen (11.08.): `data-thema` traegt hier immer den
+ * AUFGELOESTEN Wert ('hell'/'dunkel'), nie 'system' -- `wirksam` kommt schon so
  * aus main/thema.ts, damit dieses Fenster nie selbst raten muss. Die vier
  * Zustandsfarben kommen bereits kontrastangepasst (`zustandsfarbenLesbar`),
- * ihre Tinte (fuer die gefuellte Flaeche der Kuerzel) separat dazu.
+ * ihre Tinte (fuer eine gefuellte Flaeche in dieser Farbe) separat dazu.
  */
 function themaAnwenden(d: ThemaPayload): void {
   document.documentElement.dataset.thema = d.wirksam;
+  document.documentElement.style.setProperty('--akzent', d.akzent);
+  document.documentElement.style.setProperty('--akzent-tinte', d.akzentTinte);
+  document.documentElement.style.setProperty('--akzent-text', d.akzentText);
+  // ERST das Attribut setzen, DANN lesen: terminalThemaAnwenden() fragt die
+  // Rollen ueber getComputedStyle ab, und die kennen das neue Thema erst,
+  // nachdem data-thema oben schon steht.
+  terminalThemaAnwenden();
   for (const [zustand, farbe] of Object.entries(d.zustandsfarbenLesbar)) {
     document.documentElement.style.setProperty(`--zustand-${zustand}`, farbe);
     document.documentElement.style.setProperty(`--zustand-${zustand}-tinte`, d.zustandsfarbenTinte[zustand] ?? '#05070a');
   }
+  // Die Agentenfiguren lesen Grund und Zustandsfarben selbst -- nach einem
+  // Themenwechsel einmal neu.
+  figurenFarbenNeu();
+  // Die uebernommene Seite bekommt Thema und Akzent nicht ueber ihre eigene
+  // Auslieferung, sondern hier durchgereicht -- ueber denselben Steg wie
+  // `acquireVsCodeApi` (postMessage): fremde Herkunft, ihr Dokument ist von hier
+  // aus nicht lesbar, aber schreibbar per Botschaft.
+  seiten.themaSetzen(d.wirksam, d.akzent, d.akzentTinte, d.akzentText);
 }
 window.awbBridge.onThema(themaAnwenden);
 void window.awbBridge.thema().then(themaAnwenden);
 
+/**
+ * PLATZ FUER DIE DREI FENSTERKNOEPFE (main.ts: `titleBarStyle: 'hiddenInset'`).
+ * Er wird IN DER TITELLEISTE genommen: sie ist die einzige Flaeche, die oben
+ * durchlaeuft, und ihr Inhalt rueckt einfach hinter den Knoepfen an. Ein
+ * fensterbreiter, fester Streifen darueber -- die Fassung vom 03.09. vormittags
+ * -- deckte die obersten 28 Bildpunkte JEDER anderen Flaeche mit ab und brach
+ * drei Suiten.
+ *
+ * Ziehen laesst sich am ganzen freien Grund der Titelleiste
+ * (`-webkit-app-region: drag` in werkbank.css); jedes Bedienelement darin nimmt
+ * sich ausdruecklich davon aus.
+ */
+if (window.awbBridge.plattform === 'darwin') document.documentElement.dataset.mac = 'ja';
+
+// --- Der Rueckkanal fuer den Steuerkanal ------------------------------------
+// Was im Puffer steht und was die Oberflaeche gerade zeigt. Damit laesst sich
+// ein Foto gegen den Text pruefen.
+window.__awb = {
+  ...paneflaecheHaken(),
+
+  /**
+   * Wer an dieser Stelle den Zeiger faengt. Ein Foto zeigt, WAS uebereinander
+   * liegt, aber nicht, wer den Klick bekommt. Gibt Kennung und Klassen des
+   * obersten Elements zurueck, damit ein Test die Schicht benennen kann statt
+   * sie zu vermuten.
+   */
+  trefferBei(x: number, y: number): { tag: string; id: string; klassen: string } {
+    const el = document.elementFromPoint(x, y);
+    if (!el) return { tag: '', id: '', klassen: '' };
+    // `className` IST BEI SVG KEINE ZEICHENKETTE (05.09.2026). Dort ist es ein
+    // `SVGAnimatedString`, und `toString()` darauf ergibt „[object
+    // SVGAnimatedString]" -- ein Treffer auf ein gezeichnetes Symbol meldete
+    // also nicht seine Klassen, sondern den Namen seines Wrappers. Das
+    // Attribut liest beides richtig.
+    return { tag: el.tagName.toLowerCase(), id: el.id || '', klassen: el.getAttribute('class') || '' };
+  },
+
+  /**
+   * Wieviele Neuzeichnungen der Leisten seit dem Start dieses Fensters ueber
+   * jede der drei Quellen kamen (`onModel`, `onLayout`, `onSession`).
+   */
+  rechtsTakt(): { model: number; layout: number; session: number } {
+    return { ...rechtsZaehler };
+  },
+
+  /** Was in der uebernommenen Seite steht -- pruefbar ohne Foto. */
+  seitenState(): Promise<unknown> { return seiten.zustand(); },
+  seiteRollen(auswahl: string): Promise<boolean> { return seiten.rolleZu(auswahl); },
+  seiteKlick(auswahl: string): Promise<boolean> { return seiten.klick(auswahl); },
+  seiteFokus(auswahl: string): Promise<boolean> { return seiten.fokussiere(auswahl); },
+  seiteUnfokus(): Promise<boolean> { return seiten.entfokussiere(); },
+  seiteSchliessenKlick(): boolean { return seiten.schliessenKlick(); },
+
+  /**
+   * EINEN ZUG WIRKLICH AUSFUEHREN -- fuer die Pruefung des Ziehens in zwei
+   * Ebenen. Es werden die ECHTEN Ereignisse gefeuert (`dragstart`, `dragover`,
+   * `drop`) und nicht die Umbaufunktionen dahinter gerufen: sonst pruefte man
+   * die Rechnung und nicht die Verdrahtung, und genau die war kaputt.
+   *
+   * `zielmarke` sagt, ob die Zeile unter dem Zeiger sich als Ziel gemeldet hat.
+   * Bei einem Zug auf ein FREMDES Projekt muss sie false sein -- das ist die
+   * sichtbare Haelfte der Zusage „ein Zug auf ein fremdes Projekt wird nicht
+   * angenommen".
+   */
+  ziehprobe(p: { gezogen: string; ziel: string }): { gefunden: boolean; zielmarke: boolean } {
+    const finde = (k: string): HTMLElement | null =>
+      sessionsEl.querySelector<HTMLElement>(`.eintrag[data-id="${k}"]`)
+      ?? sessionsEl.querySelector<HTMLElement>(`.projekt-zeile[data-projekt="${k}"]`);
+    const von = finde(String(p?.gezogen ?? ''));
+    const nach = finde(String(p?.ziel ?? ''));
+    if (!von || !nach) return { gefunden: false, zielmarke: false };
+    const daten = new DataTransfer();
+    const feuere = (el: HTMLElement, art: string): void => {
+      el.dispatchEvent(new DragEvent(art, { bubbles: true, cancelable: true, dataTransfer: daten }));
+    };
+    feuere(von, 'dragstart');
+    feuere(nach, 'dragover');
+    const zielmarke = nach.classList.contains('ziel');
+    feuere(nach, 'drop');
+    feuere(von, 'dragend');
+    return { gefunden: true, zielmarke };
+  },
+
+  uiState(): unknown {
+    // Die Zeilen der linken Leiste. `.eintrag` und `data-id` heissen weiter so
+    // wie vor dem Neubau: der Steuerkanal liest sie, und eine Umbenennung
+    // haette nur den Bericht gebrochen, nicht die Gestalt verbessert.
+    const eintraege = [...sessionsEl.querySelectorAll<HTMLElement>('.eintrag')].map((e) => {
+      const p = e.querySelector('.punkt');
+      const r = p?.getBoundingClientRect();
+      return {
+        id: e.dataset.id ?? '',
+        text: (e.textContent ?? '').trim(),
+        /** NUR der Name -- `text` klebt Kuerzel, Name und Zusatzzeile aneinander. */
+        name: (e.querySelector('.name')?.textContent ?? '').trim(),
+        zustand: [...e.classList].find((c) => c.startsWith('zustand-'))?.slice(8) ?? '',
+        // Die Merkmale einer Zeile, die NICHT ihr Zustand sind (Befund 9):
+        // verloren, gescheiterter Start. Beide standen im Modell und wurden von
+        // keiner Zeile gelesen; jetzt tragen sie eine eigene Klasse, und eine
+        // Pruefung kann sie sehen.
+        merkmale: ['verloren', 'startfehler', 'chat'].filter((c) => e.classList.contains(c)),
+        gewaehlt: e.classList.contains('gewaehlt'),
+        punktFarbe: p?.className.split(' ')[1] ?? '',
+        // Ob der NAME wirklich zu sehen ist. `text` traegt ihn auch dann, wenn
+        // er weggeblendet ist -- `textContent` kennt kein `display: none`, und
+        // eine Pruefung auf „eingeklappt bleibt nur der Punkt" haette daran
+        // still danebengegriffen.
+        nameBreite: Math.round(e.querySelector('.name')?.getBoundingClientRect().width ?? 0),
+        // Das Kuerzel (Befund 7) und die Zusatzzeile (Befund 8) -- beide nur,
+        // wenn sie wirklich zu sehen sind. `textContent` allein wuesste nichts
+        // von `display: none`, und genau daran haengen beide Zusagen.
+        kuerzel: (e.querySelector<HTMLElement>('.kuerzel')?.getBoundingClientRect().width ?? 0) > 0
+          ? (e.querySelector('.kuerzel')?.textContent ?? '') : '',
+        kuerzelFarbe: (e.querySelector<HTMLElement>('.kuerzel')?.getBoundingClientRect().width ?? 0) > 0
+          ? (e.querySelector('.kuerzel')?.className.split(' ')[1] ?? '') : '',
+        zusatz: (e.querySelector<HTMLElement>('.zusatz')?.getBoundingClientRect().width ?? 0) > 0
+          ? (e.querySelector('.zusatz')?.textContent ?? '').trim() : '',
+        punktRect: r ? [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] : null,
+        // Steht der Punkt wirklich im SICHTBAREN Teil der Leiste, mit Rand?
+        // Eine lange Liste rollt, und eine herausgerollte Zeile hat zwar eine
+        // Lage, aber keine Bildpunkte -- wer dort misst, misst den Fensterrand
+        // daneben. Die drei Bildpunkte Rand sind der Ausschnitt, den eine
+        // Pixelmessung um den Punkt herum braucht (test-app-oberflaeche.sh).
+        sichtbar: (() => {
+          if (!r) return false;
+          const k = linksEl.getBoundingClientRect();
+          return r.top - 3 >= k.top && r.bottom + 3 <= k.bottom
+            && r.left - 3 >= k.left && r.right + 3 <= k.right;
+        })(),
+      };
+    });
+    // Die Projekte darueber -- die Ebene, die es vor dem Neubau nicht gab.
+    const projektzeilen = [...sessionsEl.querySelectorAll<HTMLElement>('.projekt-zeile')].map((e) => ({
+      name: (e.querySelector('.name')?.textContent ?? '').trim(),
+      pfad: e.title,
+      // Die Kennung des Projekts -- dieselbe, auf die sich ein Zug bezieht.
+      id: e.dataset.projekt ?? '',
+      offen: !e.closest('.projekt')?.classList.contains('zu'),
+      wartet: !!e.querySelector('.merker'),
+      anzahl: Number((e.querySelector('.anzahl')?.textContent ?? '0').trim()) || 0,
+      /**
+       * Die SITZUNGEN dieses Blocks, in ihrer gezeichneten Reihenfolge. Ohne
+       * sie liesse sich „ein Projektblock wandert vollstaendig mit allen
+       * seinen Sitzungen" nur aus der flachen Liste erraten.
+       */
+      sitzungen: [...(e.closest('.projekt')?.querySelectorAll<HTMLElement>('.orch-zeile') ?? [])]
+        .map((z) => z.dataset.id ?? ''),
+      hoehe: Math.round(e.getBoundingClientRect().height),
+    }));
+    return {
+      ...paneflaecheBericht(),
+      notiz: notizEl.classList.contains('sichtbar') ? (notizEl.textContent ?? '') : '',
+      neu: {
+        knopf: !!document.getElementById('neue-session'),
+        knopfOben: Math.round(document.getElementById('neue-session')?.getBoundingClientRect().top ?? -1),
+        sessionsOben: Math.round(sessionsEl.getBoundingClientRect().top),
+      },
+      umbenennen: {
+        offen: umbenennenEl.classList.contains('sichtbar'),
+        id: umbenennenId,
+        wert: umbenennenFeld.value,
+        alt: umbenennenAltEl.textContent ?? '',
+      },
+      meldungen: [...document.querySelectorAll<HTMLDivElement>('#meldungen .meldung')].map((e) => ({
+        worker: e.dataset.worker ?? '',
+        pfad: e.dataset.pfad ?? '',
+        veraltet: e.dataset.veraltet === '1',
+        text: (e.textContent ?? '').trim(),
+        /** NUR der Name -- `text` klebt Kuerzel, Name und Zusatzzeile aneinander. */
+        name: (e.querySelector('.name')?.textContent ?? '').trim(),
+      })),
+      kanal: kanalGrund,
+      kanalwarnung: kanalwarnungEl.classList.contains('sichtbar') ? (kanalwarnungEl.textContent ?? '') : '',
+      // WO der Streifen liegt, in CSS-Punkten. Seit dem Neubau steht er quer
+      // unter der Titelleiste statt in der Pane-Flaeche; ein Test, der seine
+      // Farbe am Bildpunkt nachmisst, soll die Stelle erfragen koennen statt
+      // sie zu raten.
+      kanalwarnungRect: (() => {
+        const r = kanalwarnungEl.getBoundingClientRect();
+        return [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)];
+      })(),
+      // Die Titelleiste: was sie ueber das Gewaehlte sagt, und dass die
+      // Fensterknoepfe frei bleiben.
+      kopf: {
+        projekt: kProjektEl.textContent ?? '',
+        orchestrator: kOrchEl.textContent ?? '',
+        neben: kNebenEl.textContent ?? '',
+        punktFarbe: kPunktEl.className.split(' ')[1] ?? '',
+        hoehe: Math.round((document.getElementById('titelleiste')?.getBoundingClientRect().height ?? 0)),
+        kontextLinks: Math.round(document.getElementById('kontext')?.getBoundingClientRect().left ?? -1),
+        // Der Umschalter Code | Agents. Bis zum 08.09.2026 stand hier ein
+        // `spaeter`-Merkmal: „Agents" war ein gedaempftes Segment mit einem
+        // Schildchen „kommt noch" daneben. Beides ist weg, seit der Schalter
+        // etwas tut -- was zaehlt, ist jetzt, welches Segment gewaehlt ist.
+        modi: [...document.querySelectorAll<HTMLElement>('#modi > *')].map((e) => ({
+          text: (e.textContent ?? '').replace(/\s+/g, ' ').trim(),
+          gewaehlt: e.classList.contains('gewaehlt'),
+        })),
+      },
+      // Die Freigabeleiste: ob sie steht, wen sie nennt und was auf dem
+      // Abzeichen daneben zaehlt.
+      freigabeleiste: {
+        offen: freigabeleisteEl.childElementCount > 0,
+        anzahl: offeneFreigaben().length,
+        abzeichen: abzeichenEl.hidden ? '' : (abzeichenEl.querySelector('.zahl')?.textContent ?? ''),
+        // Das Abzeichen steht immer da; `leer` sagt, ob es gerade nichts zu
+        // melden hat (Befund 2).
+        abzeichenLeer: abzeichenEl.classList.contains('leer'),
+        wer: (freigabeleisteEl.querySelector('.fr-wer')?.textContent ?? '').trim(),
+        // Seit der Leiste EINE Zeile genuegt (Regelbruch 8), steht das „worum"
+        // in derselben Zeile wie der Name -- gelesen wird der gedaempfte Teil.
+        worum: (freigabeleisteEl.querySelector('.fr-text .leise')?.textContent ?? '').trim(),
+        knoepfe: [...freigabeleisteEl.querySelectorAll('.fr-knoepfe button')].map((b) => (b.textContent ?? '').trim()),
+        begruendungOffen: begruendungAuf,
+      },
+      projekte: projektzeilen,
+      eintraege,
+      /**
+       * DER INHALTSKOPF. Was er benennt, was die Statuspille zaehlt, welche
+       * Ansicht der Umschalter zeigt -- und ob der Tab-Streifen darunter
+       * ueberhaupt dasteht. Genau daran haengt die Zusage „bei Orchestrator
+       * gibt es nichts zu kacheln".
+       */
+      inhaltskopf: {
+        da: !inhaltskopfEl.classList.contains('leer'),
+        name: ikNameEl.textContent ?? '',
+        nameGroesse: Math.round(parseFloat(getComputedStyle(ikNameEl).fontSize) * 10) / 10,
+        nameGewicht: getComputedStyle(ikNameEl).fontWeight,
+        herkunft: ikHerkunftEl.textContent ?? '',
+        herkunftGroesse: Math.round(parseFloat(getComputedStyle(ikHerkunftEl).fontSize) * 10) / 10,
+        pille: (ikWorkerEl.querySelector('.zahl')?.textContent ?? '').trim(),
+        pilleFarbe: ikWorkerEl.querySelector('.punkt')?.className.split(' ')[1] ?? '',
+        pilleHoehe: Math.round(ikWorkerEl.getBoundingClientRect().height),
+        modus: [...ikModusEl.querySelectorAll<HTMLButtonElement>('[data-flaeche]')]
+          .find((b) => b.classList.contains('gewaehlt'))?.dataset.flaeche ?? '',
+        // Ob er ueberhaupt etwas zu schalten hat: seit dem 08.09. ist er grau,
+        // solange der Tab Agents vorn liegt (Auftrag macagents, seit 14.09. die Welten).
+        modusAus: ikModusEl.classList.contains('aus'),
+        modusHoehe: Math.round(ikModusEl.getBoundingClientRect().height),
+        streifen: !tabstreifenEl.hidden,
+        /**
+         * WIEVIEL DER KOPF DER BUEHNE WEGNIMMT, in Bildpunkten: vom oberen
+         * Rand der Inhaltskarte bis zur Oberkante der Buehne. Genau diese Zahl
+         * hat alice am 05.09. beanstandet -- sie war in der einen Sitzung
+         * groesser als in der anderen. Gemessen wird der Abstand und nicht die
+         * Summe zweier Hoehen: was dazwischen steht, zaehlt mit.
+         */
+        kopfHoehe: (() => {
+          const mitte = document.getElementById('mitte')?.getBoundingClientRect();
+          const buehne = document.getElementById('buehne')?.getBoundingClientRect();
+          return mitte && buehne ? Math.round(buehne.top - mitte.top) : -1;
+        })(),
+        zahnrad: !!document.getElementById('ik-zahnrad'),
+      },
+      /**
+       * Die Worker-Liste hinter der Pille (Befund 11): ob sie offen ist, was
+       * sie zeigt, und wie breit sie steht -- damit eine Pruefung sagen kann,
+       * dass die Auskunft da ist, OHNE dass die Buehne dafuer weichen musste.
+       */
+      workerliste: {
+        offen: workerlisteAuf,
+        breite: workerlisteAuf ? Math.round(workerlisteEl.getBoundingClientRect().width) : 0,
+        zeilen: [...workerlisteEl.querySelectorAll<HTMLButtonElement>('.worker-zeile')].map((z) => ({
+          name: (z.querySelector('.wname')?.textContent ?? '').trim(),
+          modell: (z.querySelector('.wmodell')?.textContent ?? '').trim(),
+          unten: (z.querySelector('.letzte')?.textContent ?? '').trim(),
+          kinder: (z.querySelector('.wkinder')?.textContent ?? '').trim(),
+          // Der Tokenstand steht seit dem Neubau in der Zeile; er fehlte hier
+          // nur im Lesehaken, und was nicht abzulesen ist, laesst sich auch
+          // nicht zusagen.
+          tokens: (z.querySelector('.wtokens')?.textContent ?? '').trim(),
+          // Maschine und Antragsteller, getrennt vom Rest der Unterzeile --
+          // und die Hoehe der Zeile: die Herkunft darf sie nicht wachsen
+          // lassen (Sitzungszeile 44 Punkte, die Worker-Zeile bleibt darunter).
+          herkunft: (z.querySelector('.wherkunft')?.textContent ?? '').trim(),
+          hoehe: Math.round(z.getBoundingClientRect().height),
+          klasse: z.className,
+          wegDa: !z.disabled,
+        })),
+      },
+      /**
+       * Der Inspektor: wie breit er steht, welches Blatt offen ist, ob seine
+       * Reiter ihre Aufschrift tragen und ob der Schliessen-Knopf sichtbar
+       * ist (Befunde 1 und 12).
+       */
+      inspektor: {
+        blatt: offenesBlatt(),
+        breite: rechtsEl.hidden ? 0 : Math.round(rechtsEl.getBoundingClientRect().width),
+        // Die BREITE DES INHALTS, nicht die der Spalte: daran haengt die
+        // Zusage „ein geoeffnetes Blatt ist mindestens 280 Punkte breit".
+        blattBreite: Math.round(
+          document.querySelector<HTMLElement>(
+            '#schublade .or-panel.offen, #schublade .ak-panel.offen, #schublade .pl-panel.offen',
+          )?.getBoundingClientRect().width ?? 0,
+        ),
+        nurSymbole: rechtsEl.classList.contains('nur-symbole'),
+        // Traegt eine Aufschrift Auslassungspunkte? Dann waere ein Wort halb
+        // abgeschnitten, und genau das darf nicht vorkommen.
+        aufschriftGekuerzt: [...rechtsEl.querySelectorAll<HTMLElement>('.insp-reiter .beschriftung')]
+          .some((el) => el.scrollWidth > el.clientWidth + 1),
+        schliessenSichtbar:
+          (document.querySelector<HTMLElement>('.insp-zu')?.getBoundingClientRect().width ?? 0) > 0,
+      },
+      /**
+       * Die Knoepfe in den Kopfzeilen der Kacheln. Der Gespraechs-Knopf ist
+       * seit dem 04.09. einer davon; vorher schwebte er ueber dem Terminal.
+       */
+      panekopfKnoepfe: [...document.querySelectorAll<HTMLElement>('.panekopf')].map((k) => ({
+        pane: k.dataset.pane ?? '',
+        zoom: !!k.querySelector('.pk-zoom'),
+        gespraech: !!k.querySelector('.chat-griff'),
+      })),
+      /** Schwebt irgendwo noch ein Gespraechs-Knopf ausserhalb einer Kopfzeile? */
+      gespraechSchwebend: [...document.querySelectorAll('.chat-griff')]
+        .filter((el) => !el.closest('.panekopf')).length,
+      /** Die Sitzungskarte hinter dem Zahnrad, wenn sie offen ist. */
+      sitzungskarte: {
+        offen: sitzungskarteAuf,
+        name: skNameEl.value,
+        felder: [...skListeEl.querySelectorAll('dt')].map((dt, i) => [
+          (dt.textContent ?? '').trim(),
+          (skListeEl.querySelectorAll('dd')[i]?.textContent ?? '').trim(),
+        ]),
+        knoepfe: [...skKnoepfeEl.querySelectorAll('button')].map((b) => (b.textContent ?? '').trim()),
+      },
+      /**
+       * DIE GESTALT IN ZAHLEN -- damit eine Pruefung die neun Regeln des
+       * Auftrags MESSEN kann statt sie am Bild zu schaetzen. Alles hier ist am
+       * gezeichneten Fenster abgelesen, nichts steht doppelt im Quelltext.
+       */
+      gestalt: (() => {
+        const wert = (el: Element | null, name: string): string =>
+          el ? getComputedStyle(el).getPropertyValue(name).trim() : '';
+        const rahmen = document.getElementById('rahmen');
+        const links = linksEl.getBoundingClientRect();
+        const mitte = document.getElementById('mitte')?.getBoundingClientRect();
+        const zeile = sessionsEl.querySelector('.orch-zeile');
+        return {
+          // Der Fenstergrund und die Kartenflaeche -- sie muessen verschieden sein.
+          fenstergrund: getComputedStyle(document.documentElement).getPropertyValue('--fenster').trim(),
+          rahmenPolster: wert(rahmen, 'padding-left'),
+          kartenRadius: wert(linksEl, 'border-top-left-radius'),
+          // Die Fuge zwischen linker Leiste und Mitte, in Bildpunkten.
+          fugeLinks: mitte ? Math.round(mitte.left - links.right) : -1,
+          // Seit dem 05.09.2026 steht unter der Mitte keine Karte mehr: die
+          // Fuge unten ist die Polsterung des Rahmens bis zum Fensterrand.
+          fugeUnten: mitte && rahmen ? Math.round(rahmen.getBoundingClientRect().bottom - mitte.bottom) : -1,
+          // Keine Trennlinien mehr: die vier Kanten der Spalten und der
+          // Fusszeile.
+          linien: [linksEl, document.getElementById('mitte'), rechtsEl, document.getElementById('statusleiste')]
+            .filter(Boolean)
+            .map((el) => [
+              wert(el, 'border-top-width'), wert(el, 'border-right-width'),
+              wert(el, 'border-bottom-width'), wert(el, 'border-left-width'),
+            ].join(' ')),
+          zeilenhoehe: zeile ? Math.round(zeile.getBoundingClientRect().height) : -1,
+          zeilenradius: wert(zeile, 'border-top-left-radius'),
+          zeilenpolster: wert(zeile, 'padding-right'),
+          zeilensymbol: zeile ? Math.round(zeile.querySelector('.zeilensymbol svg')?.getBoundingClientRect().width ?? 0) : -1,
+          // Die Zeilenhoehe des Fliesstextes.
+          zeilenabstand: getComputedStyle(document.body).lineHeight,
+          // Die Karte der Inhaltsflaeche traegt ihren Innenabstand am Kopf.
+          kopfpolster: wert(inhaltskopfEl, 'padding-left'),
+        };
+      })(),
+      // Die Tab-Leiste ueber der Flaeche und der Dreifachschalter daneben.
+      tabs: [...tabsEl.querySelectorAll('.tab')].map((e) => (e.textContent ?? '').trim()),
+      tabsRollen: tabsEl.scrollWidth > tabsEl.clientWidth + 1,
+      lage: lageJetzt(),
+      // DER LEERZUSTAND, damit eine Pruefung ihn lesen kann, ohne ihn aus dem
+      // Bild zu raten: die Zeile auf der Buehne, die Zeile im Baum und der
+      // abgeschaltete Dreifachschalter.
+      leer: {
+        buehne: leerEl.classList.contains('an'),
+        buehneText: (leerEl.textContent ?? '').trim(),
+        baum: !!sessionsEl.querySelector('.baum-leer'),
+        baumText: (sessionsEl.querySelector('.baum-leer')?.textContent ?? '').trim(),
+        schalterAus: lageEl.classList.contains('aus'),
+        schalterGewaehlt: [...lageEl.querySelectorAll('.gewaehlt')].length,
+      },
+      // Der Umschalter Code | Agents und die Welten dahinter (08.09.2026, seit 14.09. die Welten).
+      // Er heisst hier `buehnenmodus`, weil `modus` schon vergeben ist: das
+      // sagt seit dem Neubau, ob die linke Leiste schmal oder breit steht.
+      buehnenmodus,
+      modusKnoepfe: [...modiEl.querySelectorAll<HTMLButtonElement>('[data-modus]')].map((b) => ({
+        id: b.dataset.modus ?? '',
+        text: (b.textContent ?? '').trim(),
+        gewaehlt: b.classList.contains('gewaehlt'),
+      })),
+      welten: weltenUiState(),
+      weltenSichtbar: weltenSichtbar(),
+      uebersicht: {
+        an: uebersichtAn,
+        karten: [...uebersichtEl.querySelectorAll('.tabkarte')].map((k) => ({
+          kopf: (k.querySelector('.tabkarte-kopf .name')?.textContent ?? '').trim(),
+          rubrik: !!k.querySelector('.tabkarte-kopf.rubrik'),
+          zeilen: [...k.querySelectorAll<HTMLButtonElement>('.worker-zeile')].map((z) => ({
+            text: (z.textContent ?? '').trim(),
+            name: (z.querySelector('.wname')?.textContent ?? '').trim(),
+            klasse: z.className,
+            // Welche Zustandsfarbe der Punkt traegt -- damit eine Pruefung
+            // sagen kann, dass hier eine bestimmte Farbe NICHT vorkommt.
+            farbe: z.querySelector('.punkt')?.className.split(' ')[1] ?? '',
+            // Wie weit der Punkt vom linken Rand der Karte einrueckt. Daran
+            // haengt die Aussage, dass man die Gliederung Worker > Anhang
+            // SIEHT und nicht an der Aufschrift ablesen muss.
+            punktLinks: Math.round(
+              ((z.querySelector('.punkt') ?? z).getBoundingClientRect().left) - k.getBoundingClientRect().left,
+            ),
+            nameBreite: Math.round(z.querySelector('.wname')?.getBoundingClientRect().width ?? 0),
+            // Ohne Pane gibt es nichts zu zeigen: die Zeile ist reine Auskunft.
+            wegDa: !z.disabled,
+          })),
+        })),
+      },
+      hinweis: hinweisEl.textContent ?? '',
+      hinweisTitel: hinweisEl.title,
+      hinweisVerborgen: hinweisEl.hidden,
+      auskunft,
+      modus: schmalLinks(modell?.ui.sidebarWidth ?? 48) ? 'schmal' : 'breit',
+      sidebarWidth: modell?.ui.sidebarWidth ?? 0,
+      linksBreite: linksEl.getBoundingClientRect().width,
+      rechtsBreite: rechtsEl.hidden ? 0 : rechtsEl.getBoundingClientRect().width,
+      inspektorOffen: !rechtsEl.hidden,
+      rechtsTitel: rechtsEl.title,
+      rechtsKlasse: rechtsEl.className,
+      // Oberkante der ersten Zeile je Leiste -- beide sollen buendig sein.
+      obenLinks: Math.round(linksEl.firstElementChild?.getBoundingClientRect().top ?? -1),
+      obenRechts: Math.round((rechtsEl.querySelector('.insp-reiter') as HTMLElement)?.getBoundingClientRect().top ?? -1),
+      // Die Fusszeile der linken Leiste (bis 05.09.2026 die Statusleiste
+      // unten): Maschinenkarten darueber, Worker, Verbrauch, Zahnrad darin.
+      // Die Feldnamen bleiben, damit die Suiten weiterlesen koennen.
+      status: {
+        hoehe: Math.round(document.getElementById('statusleiste')?.getBoundingClientRect().height ?? 0),
+        breite: Math.round(document.getElementById('statusleiste')?.getBoundingClientRect().width ?? 0),
+        // Sitzt die Leiste in der linken Karte, und reicht die Mitte bis zum
+        // unteren Fensterrand? Beides ist die Zusage vom 05.09.
+        inLinkerLeiste: !!document.getElementById('statusleiste')?.closest('#links'),
+        mitteBisUnten: (() => {
+          const rahmen = document.getElementById('rahmen')?.getBoundingClientRect();
+          const mitte = document.getElementById('mitte')?.getBoundingClientRect();
+          return rahmen && mitte ? Math.round(rahmen.bottom - mitte.bottom) : -1;
+        })(),
+        maschinenKarten: document.querySelectorAll('#maschinen .masch').length,
+        maschinen: [...document.querySelectorAll<HTMLElement>('#maschinen .masch')].map((e) => ({
+          name: (e.querySelector('.masch-name')?.textContent ?? '').trim(),
+          punktFarbe: e.querySelector('.punkt')?.className.split(' ')[1] ?? '',
+          feldOffen: !e.querySelector<HTMLElement>('.masch-feld')?.hidden,
+          feld: (e.querySelector('.masch-feld')?.textContent ?? '').trim(),
+          // Die Kurzzeile der Karte (05.09.): was ohne Klick dasteht.
+          kurz: (e.querySelector('.masch-kurz')?.textContent ?? '').trim(),
+          // Steht die Karte auf dem Schirm, ohne dass jemand geklickt hat?
+          sichtbar: e.getBoundingClientRect().height > 0,
+          // Der Maschinen-Schalter (05.09.): pausiert die Leiste diese
+          // Maschine, und steht der Umschalter im Feld auf „laden"? Beides
+          // aus dem DOM gelesen, nicht aus einer zweiten Buchfuehrung.
+          pausiert: e.classList.contains('pausiert'),
+          wort: (e.querySelector('.masch-wort')?.textContent ?? '').trim(),
+          schalter: e.querySelector<HTMLInputElement>('.masch-schalter input')?.checked ?? null,
+        })),
+        worker: (stWorkerEl.textContent ?? '').trim(),
+        verbrauch: (document.querySelector('#fuss .sz-budget')?.textContent ?? '').trim(),
+        zahnrad: !!document.querySelector('#statusleiste .knopf[data-tot="einstellungen"]'),
+      },
+      // Die anklickbaren Pfade im Chat (chatdatei, 05.09.2026) -- gelesen aus dem
+      // DOM, nicht aus einer Buchfuehrung: was hier steht, ist auch anklickbar.
+      chatPfade: [...document.querySelectorAll<HTMLElement>('.chat-pfad')].map((e) => ({
+        text: e.textContent ?? '',
+        pfad: e.dataset.pfad ?? '',
+        art: e.dataset.art ?? '',
+        zeile: Number(e.dataset.zeile ?? 0) || 0,
+        title: e.title,
+        buehne: !!e.closest('#chatbuehne'),
+      })),
+      freigaben: freigabenUiState(),
+      aktivitaet: aktivitaetUiState(),
+      ordner: ordnerUiState(),
+      protokolle: protokolleUiState(),
+      // Farben durchreichen (11.08.): der aufgeloeste Zustand, gelesen aus dem
+      // DOM statt aus einer eigenen Buchfuehrung -- was hier steht, ist auch
+      // das, was das Fenster wirklich zeichnet.
+      thema: {
+        dataThema: document.documentElement.dataset.thema ?? '',
+        zustandLaeuft: getComputedStyle(document.documentElement).getPropertyValue('--zustand-laeuft').trim(),
+        zustandWartet: getComputedStyle(document.documentElement).getPropertyValue('--zustand-wartet').trim(),
+        zustandFertig: getComputedStyle(document.documentElement).getPropertyValue('--zustand-fertig').trim(),
+        zustandTot: getComputedStyle(document.documentElement).getPropertyValue('--zustand-tot').trim(),
+        grund: getComputedStyle(document.documentElement).getPropertyValue('--grund').trim(),
+        leiste: getComputedStyle(document.documentElement).getPropertyValue('--leiste').trim(),
+      },
+    };
+  },
+};
+
+// Ohne diese Zeile bekommt das Fenster nie ein Modell: der Hauptprozess wartet
+// darauf, dass die Oberflaeche steht.
+void rahmenEl;
 window.awbBridge.ready();

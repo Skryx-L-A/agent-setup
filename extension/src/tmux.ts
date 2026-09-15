@@ -80,7 +80,12 @@ export function exact(session: string): string {
 
 function run(args: string[], stdin?: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = execFile('tmux', args, { timeout: 5000 }, (err, stdout) => {
+    // killSignal:SIGKILL (2026-09-03, Audit "tmux-Aufrufe ohne Frist"): the
+    // default SIGTERM is catchable — measured in this house's main process
+    // (sessions.ts/befehle.ts) to leave a child hanging past the timeout for
+    // over two minutes. execFile has taken the same `killSignal` option as
+    // spawnSync since Node 15.11; nothing here relied on the old default.
+    const child = execFile('tmux', args, { timeout: 5000, killSignal: 'SIGKILL' }, (err, stdout) => {
       if (err) {
         reject(err);
         return;
@@ -93,12 +98,33 @@ function run(args: string[], stdin?: string): Promise<string> {
   });
 }
 
-/** Runs tmux, returning '' instead of throwing (missing session, tmux not running, ...). */
-async function runQuiet(args: string[], stdin?: string): Promise<string> {
+/**
+ * Runs tmux, returning `{ out: '', ok: false }` instead of throwing (missing
+ * session, tmux not runnable, a hang past the 5s timeout, ...).
+ *
+ * `ok` is the whole point of this shape (2026-09-03, Audit "tmux-Aufrufe ohne
+ * Frist"): every failure used to collapse into a bare `''`, indistinguishable
+ * from "tmux answered, there is nothing to say" — exactly the ambiguity that
+ * once erased every guard/approval marker at once in this house's main
+ * process (app/src/main/freigaben.ts, `readGuardBlocks`/`alleTmuxPanes`,
+ * measured 2026-08-15/16), because an empty result there read as "nothing is
+ * running" instead of "we could not ask". `listWorkerPanes`/`listRolePanes`/
+ * `listWorkerTabWindows` below carry `ok` through for exactly that reason.
+ * `killViewSession` is the one caller that genuinely does not need it — a
+ * missing view session is not a failure, see its own comment — and stays on
+ * the bare call.
+ *
+ * The empty-string fallback itself is unchanged: no caller fails louder than
+ * before, `ok` only ADDS the option to tell the two cases apart. Logged via
+ * `console.error` so a hang or a missing binary is visible even where a
+ * caller does not look at `ok`.
+ */
+async function runQuiet(args: string[], stdin?: string): Promise<{ out: string; ok: boolean }> {
   try {
-    return await run(args, stdin);
-  } catch {
-    return '';
+    return { out: await run(args, stdin), ok: true };
+  } catch (error) {
+    console.error(`tmux ${args.join(' ')} failed: ${(error as Error)?.message ?? error} -- treated as empty.`);
+    return { out: '', ok: false };
   }
 }
 
@@ -149,8 +175,9 @@ export function parseWorkerTabWindows(out: string): string[] {
  * still owed a terminal, or whether one it opened earlier must close because
  * wb-grid has since folded that window away again.
  */
-export async function listWorkerTabWindows(session: string): Promise<string[]> {
-  return parseWorkerTabWindows(await runQuiet(listWindowsArgs(baseSessionName(session))));
+export async function listWorkerTabWindows(session: string): Promise<{ windows: string[]; ok: boolean }> {
+  const { out, ok } = await runQuiet(listWindowsArgs(baseSessionName(session)));
+  return { windows: parseWorkerTabWindows(out), ok };
 }
 
 /**
@@ -184,8 +211,9 @@ export async function hasSession(session: string): Promise<boolean> {
   return (await sessionStatus(session)) === 'alive';
 }
 
-export async function listWorkerPanes(session: string): Promise<WorkerPane[]> {
-  return parseWorkerPanes(await runQuiet(listPanesArgs(WORKER_FORMAT)), session);
+export async function listWorkerPanes(session: string): Promise<{ panes: WorkerPane[]; ok: boolean }> {
+  const { out, ok } = await runQuiet(listPanesArgs(WORKER_FORMAT));
+  return { panes: parseWorkerPanes(out, session), ok };
 }
 
 export function parseWorkerPanes(out: string, session: string): WorkerPane[] {
@@ -200,8 +228,9 @@ export function parseWorkerPanes(out: string, session: string): WorkerPane[] {
   return panes;
 }
 
-export async function listRolePanes(session: string): Promise<RolePane[]> {
-  return parseRolePanes(await runQuiet(listPanesArgs(ROLE_FORMAT)), session);
+export async function listRolePanes(session: string): Promise<{ panes: RolePane[]; ok: boolean }> {
+  const { out, ok } = await runQuiet(listPanesArgs(ROLE_FORMAT));
+  return { panes: parseRolePanes(out, session), ok };
 }
 
 export function parseRolePanes(out: string, session: string): RolePane[] {
@@ -227,7 +256,8 @@ export function pickOrchestrator(panes: RolePane[]): OrchestratorLookup {
 }
 
 export async function findOrchestratorPane(session: string): Promise<OrchestratorLookup> {
-  return pickOrchestrator(await listRolePanes(session));
+  const { panes } = await listRolePanes(session);
+  return pickOrchestrator(panes);
 }
 
 export function killSessionArgs(session: string): string[] {

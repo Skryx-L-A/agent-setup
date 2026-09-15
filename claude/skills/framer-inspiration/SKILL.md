@@ -1,6 +1,6 @@
 ---
 name: framer-inspiration
-description: Pull modern web-design inspiration from Framer's public galleries (the "Made in Framer" showcase, the template marketplace, and live *.framer.website demos) before and while building any website. Use this WHENEVER building, designing, redesigning, restyling, or mocking up a website, landing page, marketing site, portfolio, blog, agency/business site, web app frontend, or any web UI — even if the user never mentions Framer. Run it at the start of the design/build, automatically, without being asked.
+description: "Gather public Framer references before a new web design or substantial redesign. Reuse the existing brief for small iterations; implementation stays in the project stack."
 ---
 
 # framer-inspiration
@@ -13,18 +13,13 @@ This skill is the **inspiration front-half** of a website build. After gathering
 references here, you build in the user's own stack (Astro, Next, plain HTML/CSS, etc.) —
 **not** inside Framer.
 
-## Honest constraints (read once)
+## Umfang
 
-- Framer is a GUI SaaS builder. It has **no site-building CLI** and **no public read API**.
-  Its AI features (Wireframer, Workshop, Server API, MCP plugin) all need a Framer login +
-  an open editor — unusable from here.
-- The **only** login-free way to use Framer is reading its **public hosted pages**. That is
-  exactly what this skill does. Treat everything as **inspiration**: study layout, section
-  order, type scale, color, spacing, and motion — **never copy assets, text, or code**.
+Lies öffentliche Galerien und Live-Demos als Inspiration. Dafür ist kein Framer-Baukonto erforderlich. Verwende verfügbare Browser-/Fetch-Werkzeuge; Aussagen über andere Framer-APIs sind für diesen Ablauf nicht nötig.
 
 ## When to run
 
-Automatically, at the start of any website/web-UI design or build — no prompt needed.
+At the start of a new web design or substantial redesign. Reuse gathered references for small iterations on the same direction.
 The global rule in `~/.claude/CLAUDE.md` mandates this; this skill is how you satisfy it.
 Skip only if the user explicitly says not to, or the task has nothing to do with web UI.
 
@@ -96,11 +91,7 @@ Carry the four-part prompt (built in step 5) into the build in the user's own st
 `frontend-design` skill for polished, non-generic implementation. Re-derive everything in
 the user's code/brand — Framer is the muse, not the source.
 
-For genuinely new designs with real creative range (not a small iteration on an already-fixed
-look), consider the **fan-out procedure** instead of a single build: build 5 aesthetic directions
-in parallel (worker grid) or in sequence (solo session), compare side by side, narrow to 3 layout
-variants of the winner, then 1 — see `design-research/bausteine/faecher-verfahren.md` for the full
-procedure in both operating modes.
+Compare additional visual directions only when requested or a material design choice remains unresolved; `design-bausteine` governs this decision.
 
 ## Guardrails
 - Inspiration and patterns only. No wholesale copying of copyrighted layouts, assets, copy, or code.

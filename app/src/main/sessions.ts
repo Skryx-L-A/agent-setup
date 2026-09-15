@@ -327,6 +327,46 @@ export interface PaneRow {
   dead: boolean;
 }
 
+/**
+ * Welcher Pane einer Sitzung ist der Orchestrator?
+ *
+ * NORMALFALL: der Pane, der `@wb_role orchestrator` traegt. Daran haengt der
+ * Umschalter der Werkbank, das Schreiben aus dem Editor, die Zuordnung offener
+ * Freigaben und das Anzeigen des Orchestrator-Chats.
+ *
+ * DER RUECKFALL, und warum es ihn gibt (2026-09-05, gemessen). In der
+ * Companion-Sitzung trug das Claude-Pane `placeholder` statt `orchestrator`, weil
+ * `wb-workers-window` seine Platzhalter-Markierung am Fenster vorbei auf den
+ * Orchestrator gesetzt hatte (Ursache dort behoben, Kette im Kopf jenes Skripts).
+ * Fuer alice sah das so aus: der Umschalter oben in der Sitzung tat nichts
+ * mehr. Eine falsche Rolle auf EINEM Pane legte damit die ganze Bedienung der
+ * Sitzung still -- ein Missverhaeltnis, das der Hauptprozess auffangen kann, ohne
+ * etwas zu erfinden.
+ *
+ * WAS DER RUECKFALL BEHAUPTET, und woran er sich messen laesst: Eine
+ * Workbench-Sitzung hat den Orchestrator immer allein im ERSTEN Fenster; jedes
+ * weitere Fenster ('workers', 'workers-2', ...) entsteht erst danach und traegt
+ * nur Worker und Platzhalter. Steht in diesem ersten Fenster genau EIN lebender
+ * Pane, der kein Worker ist, dann ist er der Orchestrator -- unabhaengig davon,
+ * was in seiner Rollen-Option steht. Sind es mehrere, wird nichts geraten: dann
+ * bleibt das Feld leer wie bisher.
+ *
+ * WAS ER NICHT TUT: die Rolle korrigieren. Das darf nur `wb-rolle` (es schreibt
+ * auch das Register, das die Guards als zweite Quelle lesen), und den Befund
+ * meldet `wb-doctor` in Pruefung 13. Hier wird nur ANGEZEIGT, worauf die
+ * Bedienung zeigen muss.
+ */
+export function orchestratorPaneOf(sessionPanes: PaneRow[]): string {
+  const echt = sessionPanes.find((p) => p.role === 'orchestrator');
+  if (echt) return echt.paneId;
+  if (!sessionPanes.length) return '';
+  const erstesFenster = Math.min(...sessionPanes.map((p) => p.windowIndex));
+  const kandidaten = sessionPanes.filter(
+    (p) => p.windowIndex === erstesFenster && !p.dead && p.role !== 'worker' && p.role !== 'agent',
+  );
+  return kandidaten.length === 1 ? kandidaten[0].paneId : '';
+}
+
 /** `tmux list-sessions -F '#{session_name}\t#{@awb_owner}'`, roh -- lokal wie ueber SSH gleich. */
 export const SESSION_LIST_FORMAT = '#{session_name}\t#{@awb_owner}';
 /** Dieselbe Formatzeile wie `readPanes`, exportiert, damit ein Fernabruf (V10) genau dasselbe fragt. */
@@ -386,7 +426,14 @@ function tmuxAntwort(socket: string, args: string[]): TmuxAntwort {
   // GANZEN Hauptprozess angehalten. 2s wie jeder andere oertliche
   // bare-tmux-Aufruf dieses Hauses (eine Fernmaschine geht nicht hier durch,
   // siehe den RemotePoller-Verweis im Kopf dieser Datei).
-  const r = spawnSync('tmux', [...base, ...args], { encoding: 'utf8', env: mitMaschinenLocale(), timeout: 2000 });
+  // killSignal:SIGKILL (2026-08-22, gemessen): die Node-Vorgabe SIGTERM laesst
+  // sich abfangen -- ein Kind, das es ignoriert, liess spawnSync in der Messung
+  // ueber zwei Minuten haengen, obwohl die Frist laengst um war. SIGKILL kann
+  // kein Prozess im Nutzerraum ablehnen. BudgetPoller und RemotePoller machen
+  // es an ihrer jeweils eigenen Frist schon so.
+  const r = spawnSync('tmux', [...base, ...args], {
+    encoding: 'utf8', env: mitMaschinenLocale(), timeout: 2000, killSignal: 'SIGKILL',
+  });
   if (r.error) {
     return {
       ausfuehrbar: false,
@@ -422,10 +469,6 @@ function tmuxAntwort(socket: string, args: string[]): TmuxAntwort {
     };
   }
   return { ausfuehrbar: true, raw: (r.stdout || '').replace(/\n$/, ''), fehler: '' };
-}
-
-function tmux(socket: string, args: string[]): string {
-  return tmuxAntwort(socket, args).raw;
 }
 
 /**
@@ -570,6 +613,21 @@ export function fremdePanes(
 }
 
 /**
+ * SPIEGEL-PANES EINER PAUSIERTEN MASCHINE, LOKAL (04.09.).
+ *
+ * `wb-remote-view` legt fuer jede gespiegelte Fernsitzung einen lokalen Pane
+ * mit `@wb_worker` = `REMOTE-<maschine>-<sitzung>` an (siehe dort, PREFIX).
+ * Pausiert die Maschinen-Seite eine Maschine, muss ein schon bestehender
+ * Spiegel verschwinden -- er zeigt sonst eine Sicht, deren Quelle diese
+ * Werkbank nicht mehr abruft. Rein lokal: kein ssh-Aufruf, keine neue
+ * Abhaengigkeit von der Erreichbarkeit der pausierten Maschine.
+ */
+export function fremdeSpiegelPanes(panes: PaneRow[], host: string): string[] {
+  const praefix = `REMOTE-${host}-`;
+  return panes.filter((p) => p.worker.startsWith(praefix) && !p.dead).map((p) => p.paneId);
+}
+
+/**
  * Zwei Buchstaben aus dem Projektnamen, sonst nichts. Bei mehreren Wortteilen
  * die Anfangsbuchstaben der ersten beiden, bei einem Wort seine ersten zwei.
  */
@@ -641,9 +699,101 @@ export function agentFlags(args: string): { agentId: string; name: string; type:
   return { agentId: hol('--agent-id'), name: hol('--agent-name'), type: hol('--agent-type') };
 }
 
+/**
+ * EIN HINWEIS STATT EINES ZWEITEN PROZESSES (2026-09-03, Audit "gleiche
+ * Pane-Liste mehrfach im selben Takt"). `readPanes()` hier und
+ * `alleTmuxPanes()` in freigaben.ts fragten bis heute unabhaengig
+ * voneinander dieselbe Vollserver-Auflistung ab, im selben 2000-ms-Takt
+ * (main.ts) -- zwei Prozesse je Takt, wo einer reicht; allein das sind 30
+ * ueberfluessige Prozesse je Minute.
+ *
+ * EIN ZEITFENSTER ALLEIN WAERE HIER FALSCH GEWESEN -- GEMESSEN, NICHT
+ * VERMUTET. Ein erster Entwurf cachte das Ergebnis fuer eine halbe Sekunde,
+ * unabhaengig vom Aufrufer. Das brach test-app-tmux-schweigt.sh: die Suite
+ * ruft `readGuardBlocks()` zweimal kurz hintereinander mit demselben Socket,
+ * aber ABSICHTLICH unterschiedlichem tmux-Verhalten (erst ein stummes tmux,
+ * dann eines, das nur einen fremden Pane nennt) -- ein blindes Zeitfenster
+ * kann diese beiden Momente nicht auseinanderhalten und haette der zweiten
+ * Anfrage die Antwort der ersten untergeschoben. Und in main.ts's echtem Takt
+ * liegen zwischen `modellLesen()` und `freigabenAktualisieren()` mehrere
+ * `await`-Aufruf (clientsNachlesen/panesNachlesen/mausNachfuehren) -- ihre
+ * tatsaechliche Dauer ist nicht verlaesslich kuerzer als die einer
+ * Testsuite, die zwischen zwei Aufrufen Dateien liest und schreibt. Es gibt
+ * also KEINE Millisekundenzahl, die "derselbe Takt" von "ein anderer Moment"
+ * zuverlaessig trennt.
+ *
+ * DIE LOESUNG IST EINMALIGKEIT STATT ZEIT: `readPanes()` hinterlaesst einen
+ * Hinweis, sobald es einen echten Fetch gemacht hat. `panesHinweisOderFrisch()`
+ * NIMMT ihn beim ersten Lesen unwiderruflich AB -- benutzt oder nicht, er ist
+ * danach weg. Ein Aufrufer, der (wie main.ts's Takt) kurz NACH `modellLesen()`
+ * fragt, bekommt exakt dessen frischen Fetch. Jeder andere Aufrufer (jede
+ * Testsuite, ein Klick ausserhalb des Taktes, oder derselbe Takt ein zweites
+ * Mal) findet keinen Hinweis vor und fragt ganz normal frisch nach, GENAU WIE
+ * VORHER -- keine Aenderung, kein Risiko. Eine Hoechstalter-Schranke
+ * (PANES_HINWEIS_MAX_ALTER_MS) ist nur ein Sicherheitsnetz gegen einen
+ * Hinweis, den NIEMAND abgeholt hat (z. B. weil `readGuardBlocks()` vorher
+ * an einem fehlenden Verzeichnis abbricht): sie liegt klar unter einem
+ * Takt (2000 ms), ein liegengebliebener Hinweis kann also nie in den
+ * NAECHSTEN Takt hineinwirken.
+ *
+ * `alleTmuxPanes()` fragte bis heute NUR `#{pane_id}` ab -- eine echte
+ * Teilmenge dessen, was diese Datei ohnehin schon in voller Breite abfragt
+ * (`PANE_LIST_FORMAT`). Geteilt wird deshalb nicht der rohe Prozess (die
+ * Formate unterscheiden sich), sondern das schon ZERLEGTE Ergebnis: dieselben
+ * `PaneRow[]`, aus denen freigaben.ts nur die Pane-IDs herausliest.
+ *
+ * DIE FEHLERBEHANDLUNG BLEIBT UNTERSCHEIDBAR: `tmuxDa=false` heisst weiterhin
+ * "wir konnten nicht fragen" (haengender oder nicht ausfuehrbarer tmux) und
+ * ist damit von einer echten leeren Liste (`tmuxDa=true, panes=[]`) getrennt
+ * -- exakt die Unterscheidung, deren Fehlen frueher (15./16.08.) jede
+ * Freigabe-Marke bei einem einzigen haengenden Takt geloescht hat. `tmuxDa`
+ * kommt aus `tmuxAntwort()`, DERSELBEN Stelle, die diese Datei fuer die
+ * Sitzungsliste laengst benutzt (siehe TmuxAntwort oben) -- inklusive ihrer
+ * Erkennung von "kein Server laeuft" als GUELTIGE leere Antwort, nicht als
+ * Fehlschlag. `alleTmuxPanes()` in freigaben.ts hatte diese Unterscheidung
+ * bisher nicht und behandelte auch ein "kein Server laeuft" als unbekannt;
+ * jetzt gilt fuer beide Dateien dieselbe, bereits an der Sitzungsliste
+ * bewaehrte Antwort auf dieselbe Frage.
+ */
+interface PanesHinweis {
+  socket: string;
+  atMs: number;
+  tmuxDa: boolean;
+  panes: PaneRow[];
+}
+const PANES_HINWEIS_MAX_ALTER_MS = 1500;
+let panesHinweis: PanesHinweis | null = null;
+
+function panesFrisch(socket: string): { tmuxDa: boolean; panes: PaneRow[]; fehler: string } {
+  const antwort = tmuxAntwort(socket, ['list-panes', '-a', '-F', PANE_LIST_FORMAT]);
+  return {
+    tmuxDa: antwort.ausfuehrbar,
+    panes: antwort.ausfuehrbar && antwort.raw ? parsePaneRows(antwort.raw) : [],
+    fehler: antwort.fehler,
+  };
+}
+
+/**
+ * Nimmt einen frischen, noch unbenutzten Hinweis ab, oder fragt frisch nach,
+ * wenn keiner da ist -- siehe die grosse Erklaerung oben. `freigaben.ts` ist
+ * der einzige externe Aufrufer.
+ */
+export function panesHinweisOderFrisch(socket: string): { tmuxDa: boolean; panes: PaneRow[]; fehler: string } {
+  const h = panesHinweis;
+  panesHinweis = null; // abgeholt, ob passend oder nicht -- ein Hinweis gilt hoechstens einmal
+  if (h && h.socket === socket && Date.now() - h.atMs <= PANES_HINWEIS_MAX_ALTER_MS) {
+    return { tmuxDa: h.tmuxDa, panes: h.panes, fehler: '' };
+  }
+  return panesFrisch(socket);
+}
+
 function readPanes(socket: string): PaneRow[] {
-  const roh = tmux(socket, ['list-panes', '-a', '-F', PANE_LIST_FORMAT]);
-  return roh ? parsePaneRows(roh) : [];
+  const ergebnis = panesFrisch(socket);
+  // Der Hinweis fuer `panesHinweisOderFrisch()` (siehe oben): dieser Fetch ist
+  // per Definition frisch, JETZT geschehen -- ein Aufrufer, der gleich danach
+  // fragt, bekommt genau diesen Stand statt eines eigenen Prozesses.
+  panesHinweis = { socket, atMs: Date.now(), tmuxDa: ergebnis.tmuxDa, panes: ergebnis.panes };
+  return ergebnis.panes;
 }
 
 /**
@@ -813,7 +963,7 @@ export function leseSessions(opt: SessionsOptions): SessionsBefund {
     const einsehbar = tmuxDa && reachable;
 
     const sessionPanes = panes.filter((p) => p.session === tmuxSession);
-    const orchestrator = sessionPanes.find((p) => p.role === 'orchestrator');
+    const orchestratorPane = orchestratorPaneOf(sessionPanes);
 
     const rohWorker = Array.isArray(roh.workers) ? (roh.workers as Record<string, unknown>[]) : [];
     const workerNamen = rohWorker.map((w) => String(w.name ?? ''));
@@ -998,7 +1148,7 @@ export function leseSessions(opt: SessionsOptions): SessionsBefund {
       initials: initialsOf(name),
       lastActive: String(roh.lastActive ?? ''),
       owned: eigene.get(tmuxSession) === true,
-      orchestratorPane: orchestrator?.paneId ?? '',
+      orchestratorPane,
       workers,
       pendingApprovals: offen,
       orphanSubagents: heimatlos,
@@ -1050,7 +1200,7 @@ function remoteSessions(snapshots: RemoteSnapshot[], verlorene: Set<string>): Se
     for (const rec of snap.sessionFiles) {
       const alive = snap.reachable && snap.lebende.has(rec.tmuxSession);
       const sessionPanes = snap.panes.filter((p) => p.session === rec.tmuxSession);
-      const orchestrator = sessionPanes.find((p) => p.role === 'orchestrator');
+      const orchestratorPane = orchestratorPaneOf(sessionPanes);
       const workerNamen = rec.workers.map((w) => w.name);
 
       const subagenten = new Map<string, SubagentInfo[]>();
@@ -1145,7 +1295,7 @@ function remoteSessions(snapshots: RemoteSnapshot[], verlorene: Set<string>): Se
         initials: initialsOf(rec.name || rec.fileBase),
         lastActive: rec.lastActive,
         owned: snap.eigene.get(rec.tmuxSession) === true,
-        orchestratorPane: orchestrator?.paneId ?? '',
+        orchestratorPane,
         workers,
         pendingApprovals: 0,
         orphanSubagents: heimatlos,

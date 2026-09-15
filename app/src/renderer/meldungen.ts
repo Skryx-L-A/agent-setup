@@ -31,6 +31,8 @@
 // Aussehen bringt sie selbst mit -- ein eigener <style>-Block statt eines
 // Eingriffs in index.html, an der gerade andere arbeiten.
 
+import { t } from './texte';
+
 export interface ErgebnisMeldung {
   name: string;
   path: string;
@@ -38,22 +40,37 @@ export interface ErgebnisMeldung {
   size: number;
 }
 
-/** Wie lange eine Meldung steht, bevor sie von selbst geht. */
-const STANDZEIT_MS = 30_000;
+/**
+ * Wie lange eine Meldung steht, bevor sie von selbst geht (05.09.2026,
+ * Regelbruch 2: von 30 auf 8 Sekunden). Eine Meldung ist ein Hinweis im
+ * Vorbeigehen -- gelesen wird im Worker-Tab oder in der Datei, und beide Wege
+ * bleiben nach ihrem Verschwinden offen.
+ */
+const STANDZEIT_MS = 8_000;
 
 const STIL = `
+/* SIE LIEGT UEBER DER BUEHNE, NIE UEBER DER STATUSLEISTE (05.09.2026,
+   Regelbruch 2). Bei 1004 Bildpunkten Fensterbreite standen zwei Meldungen von
+   je 415 Bildpunkten und deckten „7 Worker laufen" samt Zahnrad zu -- die
+   Statusleiste ist der eine Ort, an dem immer steht, was gerade laeuft, und
+   den darf nichts verdecken. Der Abstand unten ist deshalb die Hoehe der
+   Statusleiste plus die Fuge darum. Und schmaler: 320 statt 420, hoechstens
+   ein Drittel des Fensters. */
 #meldungen {
-  position: fixed; right: 12px; bottom: 12px; z-index: 40;
+  position: fixed; right: calc(var(--fuge) + 8px); z-index: 40;
+  bottom: calc(var(--fuge) + var(--statushoehe) + var(--fuge) + 4px);
   display: flex; flex-direction: column; gap: 6px;
-  max-width: min(420px, 60vw); pointer-events: none;
+  max-width: min(320px, 34vw); pointer-events: none;
 }
+/* Karte statt Kasten, wie ueberall sonst: keine Umrandung, die Flaeche traegt.
+   Die farbige Kante links bleibt -- sie ist eine Marke, keine Umrandung. */
 #meldungen .meldung {
   pointer-events: auto;
-  background: var(--leiste); border: 1px solid var(--linie);
+  background: var(--erhoben); border: 0;
   border-left: 3px solid var(--laeuft);
-  border-radius: 4px; padding: 6px 8px;
+  border-radius: var(--r-mittel); padding: 6px 8px;
   display: flex; align-items: center; gap: 8px;
-  box-shadow: 0 6px 18px rgba(0,0,0,.45);
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--tinte) 34%, transparent);
 }
 #meldungen .meldung .text { flex: 1 1 auto; overflow: hidden; cursor: pointer; }
 #meldungen .meldung .kopf { display: flex; gap: 6px; align-items: baseline; }
@@ -64,12 +81,14 @@ const STIL = `
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   direction: rtl; text-align: left;
 }
+/* Dieselbe Knopfsprache wie im uebrigen Fenster: eine graue Pille, kein
+   umrandeter Kasten (Electron-Befund 10). */
 #meldungen .meldung button {
-  flex: 0 0 auto; background: transparent; color: var(--schrift);
-  border: 1px solid var(--linie); border-radius: 3px;
-  font: inherit; font-size: 11px; padding: 2px 6px; cursor: pointer;
+  flex: 0 0 auto; background: var(--linie); color: var(--schrift);
+  border: 0; border-radius: var(--r-klein);
+  font: inherit; font-size: 11px; padding: 3px 9px; cursor: pointer;
 }
-#meldungen .meldung button:hover { background: #222833; }
+#meldungen .meldung button:hover { background: var(--wahl); }
 #meldungen .meldung .zu { border: 0; color: var(--gedaempft); padding: 2px 4px; }
 /* Ueberholt: derselbe Text, aber sichtbar entwertet -- und nicht nur ueber die
    Farbe, damit die Aussage auch ohne Farbe traegt. */
@@ -94,6 +113,8 @@ interface Stehend {
   pfad: string;
   el: HTMLElement;
   veraltet: boolean;
+  /** Wann sie erschienen ist -- die Standzeit haengt an dieser Zahl, nicht allein am Wecker. */
+  seit: number;
 }
 
 export class Meldungen {
@@ -129,7 +150,7 @@ export class Meldungen {
     name.textContent = e.name;
     const was = document.createElement('span');
     was.className = 'was';
-    was.textContent = 'Ergebnis da';
+    was.textContent = t('meldung.ergebnisDa');
     kopf.append(name, was);
     const pfad = document.createElement('div');
     pfad.className = 'pfad';
@@ -146,7 +167,7 @@ export class Meldungen {
     });
 
     const datei = document.createElement('button');
-    datei.textContent = 'Datei';
+    datei.textContent = t('meldung.datei');
     datei.addEventListener('click', () => {
       this.wege.dateiOeffnen(e.path);
       el.remove();
@@ -155,13 +176,13 @@ export class Meldungen {
     const zu = document.createElement('button');
     zu.className = 'zu';
     zu.textContent = '✕';
-    zu.title = 'Meldung schliessen';
+    zu.title = t('meldung.schliessen');
     zu.addEventListener('click', () => el.remove());
 
     el.append(text, datei, zu);
-    el.title = `${e.name}: Ergebnis unter ${e.path}`;
+    el.title = t('meldung.ergebnisUnter', { name: e.name, pfad: e.path });
     this.wurzel.appendChild(el);
-    const stehend: Stehend = { worker: e.name, pfad: e.path, el, veraltet: false };
+    const stehend: Stehend = { worker: e.name, pfad: e.path, el, veraltet: false, seit: Date.now() };
     this.stehende.push(stehend);
     const wegnehmen = (): void => {
       el.remove();
@@ -185,6 +206,16 @@ export class Meldungen {
    * er soll lesen, dass es ueberholt ist.
    */
   abgleich(aktuell: Map<string, string>): void {
+    // ZUERST DIE ABGELAUFENEN (05.09.2026, Regelbruch 2). Die Standzeit hing
+    // allein an einem `setTimeout`, und ein Wecker ist kein verlaesslicher
+    // Weg: Electron drosselt die Zeitgeber eines Fensters, das nicht im
+    // Vordergrund steht (`backgroundThrottling`), und kopflos steht es nie im
+    // Vordergrund. Gemessen hat der Kritiker dieselben zwei Meldungen ueber
+    // mehr als zehn Minuten in jedem seiner neunzig Bilder. Der Wecker bleibt
+    // -- er ist der Weg, auf dem eine Meldung im Normalfall verschwindet --,
+    // aber die Zeit wird hier zusaetzlich an der Uhr geprueft, und dieser
+    // Abgleich laeuft bei jeder Modellmeldung.
+    this.abgelaufeneWegnehmen();
     for (const s of this.stehende) {
       if (s.veraltet) continue;
       if (!aktuell.has(s.worker)) continue;   // Worker unbekannt: nichts zu sagen
@@ -193,10 +224,20 @@ export class Meldungen {
       s.el.classList.add('veraltet');
       const hinweis = document.createElement('div');
       hinweis.className = 'ueberholt';
-      hinweis.textContent = 'ueberholt — dieser Auftrag ist nicht mehr der laufende';
+      hinweis.textContent = t('meldung.ueberholt');
       s.el.querySelector('.text')?.appendChild(hinweis);
       s.el.dataset.veraltet = '1';
-      s.el.title = `${s.worker}: Ergebnis unter ${s.pfad} — ueberholt, der Worker hat inzwischen einen anderen Auftrag`;
+      s.el.title = t('meldung.ergebnisUeberholt', { name: s.worker, pfad: s.pfad });
+    }
+  }
+
+  /** Was laenger steht als die Standzeit, geht -- gemessen an der Uhr. */
+  private abgelaufeneWegnehmen(): void {
+    const jetzt = Date.now();
+    for (const s of [...this.stehende]) {
+      if (jetzt - s.seit < STANDZEIT_MS) continue;
+      s.el.remove();
+      this.stehende = this.stehende.filter((x) => x !== s);
     }
   }
 }

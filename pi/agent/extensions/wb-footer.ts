@@ -85,10 +85,17 @@ export default function (pi: ExtensionAPI) {
           const ctxWin = ctx.model?.contextWindow;
 
           // same look as the Claude statusline: model · dir branch · ▓▓░░░ tokens
-          const left =
-            theme.fg("accent", `● ${ctx.model?.id ?? "local"}`) +
-            theme.fg("dim", " · ") +
-            `${dir}${branch ? " " + branch : ""}`;
+          // Modellkennung nur als Basisname: ein MLX-Pfad wie
+          // $HOME/AI/mlx-models/qwen38-27b-mlx-4bit frass in einem 99 Spalten
+          // breiten Pane die ganze Zeile, truncateToWidth schnitt rechts den
+          // Kontextwert ab, und der Kontext-Guard meldete den Pane als BLIND
+          // (gemessen 2026-09-10, Worker stophook). Der Kontextwert steht rechts
+          // und ist das, was die Wache liest -- er bleibt, der Pfad weicht.
+          const modelId = String(ctx.model?.id ?? "local").split("/").filter(Boolean).pop() ?? "local";
+          const leftPlain = (d: string) => `● ${modelId} · ${d}${branch ? " " + branch : ""}`;
+          const leftFor = (d: string) =>
+            theme.fg("accent", `● ${modelId}`) + theme.fg("dim", " · ") + `${d}${branch ? " " + branch : ""}`;
+          let left = leftFor(dir);
 
           let right = theme.fg("dim", `↑${fmt(input)} ↓${fmt(output)}`);
           const r = rateInfo();
@@ -103,6 +110,14 @@ export default function (pi: ExtensionAPI) {
             const filled = Math.min(10, Math.floor(pct / 10));
             const bar = "▓".repeat(filled) + "░".repeat(10 - filled);
             right += theme.fg("dim", " · ") + theme.fg(color, `${bar} ${fmt(lastUsed)}/${fmt(ctxWin)}`);
+          }
+          // Passt es nicht: erst das Verzeichnis kuerzen, dann weglassen; nie den
+          // rechten Teil mit dem Kontextwert abschneiden.
+          const rightPlain = right.replace(/\x1b\[[0-9;]*m/g, "");
+          const need = (d: string) => leftPlain(d).length + 3 + rightPlain.length;
+          if (need(dir) > width) {
+            const kurz = "…/" + dir.split("/").slice(-1).join("/");
+            left = need(kurz) <= width ? leftFor(kurz) : theme.fg("accent", `● ${modelId}`);
           }
           return [truncateToWidth(left + theme.fg("dim", " · ") + right, width)];
         },

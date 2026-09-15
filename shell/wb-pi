@@ -9,6 +9,15 @@ case "$MODEL" in
   qwen)    MODEL="qwen3.6:35b-a3b-coding-nvfp4" ;;
   ornith)  MODEL="ornith:35b" ;;
   ornith9) MODEL="ornith:9b" ;;
+  *)
+    # Anlass (2026-08-22, dieselbe Bugfamilie wie wb-budget): ohne diesen Zweig lief
+    # ein unbekannter Alias unveraendert durch, direkt in `pi --model` INNERHALB der
+    # neu erzeugten Pane -- wb-pi selbst meldete Erfolg (Pane angelegt, wb-grid
+    # gerufen), der eigentliche Fehlschlag (Ollama kennt das Modell nicht) tauchte
+    # erst dort auf, unsichtbar fuer den Aufrufer im Moment des Aufrufs.
+    echo "wb-pi: unbekanntes Modell '$MODEL' -- bekannt: qwen | ornith | ornith9." >&2
+    exit 1
+    ;;
 esac
 
 panes=$(tmux list-panes -F '#{pane_id} #{@wb_role}')

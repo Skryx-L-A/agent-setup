@@ -1,6 +1,6 @@
 ---
 name: debugging-protocol
-description: Structured root-cause debugging workflow — form an explicit hypothesis, find the smallest reproducing case, change exactly one thing per iteration, verify with a regression test, and record which hypotheses were falsified (null results), not only the fix that worked. Use when a bug resists a quick fix, comes back after being "fixed", or the cause is unclear after one or two attempts — not for trivial, obvious one-line fixes. Triggers include "debug this", "this bug keeps coming back", "root cause", "why does this keep happening", "hartnaeckiger Bug", "wiederkehrender Fehler", "Root-Cause-Analyse", "das Problem taucht immer wieder auf", "finde die Ursache".
+description: "Diagnose recurring or unclear failures through a falsifiable hypothesis and smallest reproducer. Preserve the successful regression case; skip obvious routine edits."
 ---
 
 # Debugging Protocol
@@ -16,7 +16,7 @@ stick, or the cause isn't obvious after a look or two.
 - Mehrere plausible Ursachen konkurrieren und geraten wuerde teuer (Produktionscode, Live-System).
 
 Nicht anwenden bei: einem offensichtlichen Tippfehler, einer klaren Off-by-one-Stelle, einem
-Fix, den man in unter einer Minute sieht und verifiziert. Dafuer reicht der normale Edit-Test-
+Fix, den man in unter einer Minute sieht und verifiziert. Dafuer reicht der normale Bearbeitungs-
 Zyklus — dieses Protokoll waere dort reine Bremse.
 
 ## Ablauf
@@ -62,10 +62,10 @@ Chat-Output, nicht nur intern gedacht):
 | 2 | Stale Cache-Eintrag nach Restart   | Cache-Key nach Restart   | bestaetigt         |
 ```
 
-### 5. Regressionstest
+### 5. Regressionstest erhalten
 
 Sobald die Ursache gefunden und behoben ist: den kleinsten reproduzierenden Fall aus Schritt 2
-in einen dauerhaften Test ueberfuehren (nicht nur manuell verifizieren und wegwerfen). Der Test
+als denselben dauerhaften Test erhalten; keinen zweiten Test mit identischer Aussage bauen. Falls bisher nur manuell reproduziert, in einen Test ueberfuehren (nicht nur manuell verifizieren und wegwerfen). Der Test
 faengt exakt das urspruengliche Symptom ab, damit derselbe Bug nicht unbemerkt zurueckkommt.
 
 ## Wenn nichts greift

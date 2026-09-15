@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  NICHT INSTALLIERT: Ansage des Nutzers vom 22.08.2026 -- "Mac keine automatischen
+  Laeufe, die sich wiederholen". Alle zehn LaunchAgents mit Zeitplan sind an dem
+  Tag abgeschaltet und aus ~/Library/LaunchAgents entfernt worden; die Hygiene stoesst der Orchestrator an, zusammen mit dem Testlauf.
+  Die Datei bleibt hier als Vorlage fuer den Rueckweg stehen. Die abgeschaltete
+  Fassung liegt unter ~/.local/state/wb-launchagents-deaktiviert/ -- solange sie
+  dort liegt, weigert sich wb-ausrollen, diese plist zu installieren (Schalter
+  --trotz-deaktivierung hebt das fuer einen Lauf auf).
+-->
+<!--
+  Ins Repo aufgenommen 2026-08-22: bis dahin lag diese Datei nur installiert unter
+  ~/Library/LaunchAgents/agent-workbench.wb-hygiene.plist, im Repo gab es sie nicht --
+  nicht ausgerollt, nicht reproduzierbar. Dieser Abzug spiegelt genau den Inhalt,
+  der auf diesem Mac lief (verglichen 2026-08-22, deckungsgleich).
+
+  Installation (wie bei agent-workbench.wb-testsuite.plist): diese Datei nach
+  ~/Library/LaunchAgents/agent-workbench.wb-hygiene.plist kopieren, dann
+  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/agent-workbench.wb-hygiene.plist`
+  (oder `launchctl load ...` je nach macOS-Version). Nach jeder Aenderung: bootout,
+  dann erneut bootstrap, sonst laeuft die alte Fassung weiter.
+
+  ProgramArguments zeigt bewusst auf die INSTALLIERTE Kopie (~/.local/bin/wb-hygiene),
+  anders als bei wb-testsuite: wb-hygiene braucht keine Geschwister-Dateien relativ zu
+  seinem eigenen Pfad (siehe dessen Kopfkommentar, REPO_SHELL ist dort fest verdrahtet
+  auf ~/AI/claude-workbench/shell, unabhaengig vom eigenen Aufrufort) -- die installierte
+  Kopie unter ~/.local/bin ist hier also kein Kompromiss, sondern der vorgesehene Weg.
+
+  Montags 9 Uhr, mit --report: schreibt zusaetzlich zum Exit-Code nach
+  ~/.local/state/wb-hygiene-report.md, denselben Bericht, den Schritt 2b des
+  session-end-Skills liest. Siehe shell/systemd/wb-hygiene.service fuer das
+  Gegenstueck auf peer.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>agent-workbench.wb-hygiene</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/.local/bin/wb-hygiene</string>
+    <string>--report</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>1</integer>
+    <key>Hour</key><integer>9</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key><string>$HOME/.local/state/wb-hygiene.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.local/state/wb-hygiene.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>

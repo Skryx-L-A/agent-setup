@@ -20,6 +20,8 @@
 // `window`, und die Seite liefe in ihr eigenes `acquireVsCodeApi is not
 // defined`.
 
+import { t } from './texte';
+
 export interface SeitenWege {
   /** Eine Nachricht der Seite an den Hauptprozess. */
   nachricht(seite: string, daten: unknown): void;
@@ -56,12 +58,27 @@ const STIL = `
   background: transparent; color: var(--schrift); border: 1px solid var(--linie);
   border-radius: 3px; font: inherit; font-size: 11px; padding: 2px 8px; cursor: pointer;
 }
-#seiten .kopf button:hover { background: #222833; }
-#seiten .kopf button.gewaehlt { background: #222833; border-color: var(--fern); }
+/* Das Schliessen-Zeichen, gleich gebaut wie in den vier Schubladen
+   (.or-schliessen und ihre drei Geschwister): kein Rahmen, gedaempft, erst
+   beim Ueberfahren in voller Schrift. Vorher stand hier ein Knopf mit der
+   Aufschrift "Schliessen" -- die Bedienung eines Browsers, nicht die eines
+   Mac-Fensters. */
+#seiten .kopf button.schliessen {
+  border: 0; color: var(--gedaempft); font-size: 18px; line-height: 1; padding: 2px 6px;
+}
+#seiten .kopf button.schliessen:hover { color: var(--schrift); background: transparent; }
+/* Vorher #222833 fest, ohne Hellwert -- der Grund, warum der Reiter
+   "Startseite" im Hellmodus dunklen Text auf dunklem Grund zeigte, sobald er
+   gewaehlt war (Befund vom 03.09.). --wahl traegt beide Toene schon. */
+#seiten .kopf button:hover { background: var(--erhoben); }
+#seiten .kopf button.gewaehlt { background: var(--wahl); border-color: var(--akzent); }
 #seiten iframe { flex: 1 1 auto; width: 100%; border: 0; background: var(--grund); }
 /* Die Rueckfrage vor jeder Handlung mit Nebenwirkung. Sie liegt UEBER der
    Seite und nimmt ihr die Bedienung ab, solange sie steht -- ein zweiter Klick
-   auf denselben Knopf soll nicht zwei Handlungen ausloesen. */
+   auf denselben Knopf soll nicht zwei Handlungen ausloesen. Der Schleier
+   dahinter bleibt bewusst schwarz-transluzent in BEIDEN Themen (ein Schleier
+   ist keine Flaeche mit Text darauf, dieselbe Konvention wie ein natives
+   Blatt/Sheet auf macOS). */
 #seiten .rueckfrage {
   position: absolute; inset: 0; z-index: 40;
   display: flex; align-items: center; justify-content: center;
@@ -73,10 +90,12 @@ const STIL = `
   box-shadow: 0 10px 30px rgba(0,0,0,.5);
 }
 #seiten .rueckfrage .was { font-weight: 600; }
+/* Der woertliche Aufruf (HIG-Ausnahme fuer Monospace: Code/Terminalinhalt). */
 #seiten .rueckfrage .aufruf {
   color: var(--gedaempft); font-size: 11px; background: var(--grund);
   border: 1px solid var(--linie); border-radius: 3px; padding: 6px 8px;
   white-space: pre-wrap; word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 #seiten .rueckfrage .grund { color: var(--will); }
 #seiten .rueckfrage .reihe { display: flex; gap: 8px; justify-content: flex-end; }
@@ -94,9 +113,17 @@ const STIL = `
  * weiter, und shell/tests/test-app-seiten.sh prueft sie ueber den Steuerkanal.
  * Was verschwunden ist, ist der Weg eines MENSCHEN dorthin.
  */
-const TITEL: Record<string, string> = {
-  start: 'Startseite',
-};
+/**
+ * Die Aufschrift einer Seite, bei jedem Zeichnen frisch geholt: diese Datei
+ * wird geladen, bevor die Sprache feststeht, eine Konstante haette deshalb
+ * dauerhaft die Auslieferungssprache getragen.
+ *
+ * Gebraucht wird sie noch von `titelEl` -- der Reiterzeile, aus der sie stammt,
+ * gibt es seit dem 03.09. nicht mehr (siehe Kommentar im Aufbau der Kopfzeile).
+ */
+function titelFuer(name: string): string {
+  return name === 'start' ? t('seite.start') : name;
+}
 
 /** Muss mit SEITEN_SCHEMA in main/seiten.ts uebereinstimmen. */
 const SCHEMA = 'awb-seite';
@@ -106,6 +133,13 @@ export class Seiten {
   private zaehler = 0;
   private rahmen: HTMLIFrameElement;
   private titelEl: HTMLElement;
+  /**
+   * Bleibt seit dem Wegfall der Reiterzeile LEER. Nicht entfernt, weil
+   * `SEITEN` weiterhin mehr als einen Eintrag bekommen kann (die
+   * Renderfunktion der Einstellungsseite gibt es noch, siehe oben) -- dann
+   * braucht es wieder eine Auswahl, und die beiden Schleifen weiter unten
+   * sind schon dafuer da.
+   */
   private knoepfe = new Map<string, HTMLButtonElement>();
   private aktuell = '';
   /**
@@ -118,6 +152,18 @@ export class Seiten {
    * stimmt, das Ereignis bleibt aus) -- deshalb wird GEFRAGT statt gemeldet.
    */
   private ausstehend = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * Thema und Akzent, wie renderer.ts sie zuletzt gemeldet hat -- main/seiten.ts
+   * kennt sie beim Ausliefern des Dokuments nicht (kein main.ts-Eingriff, siehe
+   * OFFEN-farbsystem.md), also traegt SIE der Rahmen selbst nach: einmal beim
+   * Laden (`load`-Ereignis unten) und erneut bei jedem `themaSetzen()`-Aufruf,
+   * solange schon eine Seite offen ist -- ein Themawechsel MITTEN in der
+   * Sitzung zieht so nach, ohne neu zu laden.
+   */
+  private wirksam: 'hell' | 'dunkel' = 'dunkel';
+  private akzent = '';
+  private akzentTinte = '';
+  private akzentText = '';
 
   constructor(private wege: SeitenWege, ziel: HTMLElement = document.body) {
     const stil = document.createElement('style');
@@ -133,31 +179,47 @@ export class Seiten {
     // Kein eigener Titel neben den Reitern -- der gewaehlte Reiter sagt es
     // bereits, und zweimal dasselbe Wort nebeneinander liest sich wie ein Fehler
     // (am Bild gesehen).
+    // KEINE REITERZEILE MEHR (03.09.). Sie war fuer zwei Seiten gebaut; seit
+    // dem 05.08. ist nur noch eine uebrig (siehe SEITEN oben), und ein
+    // einzelner Reiter, der die Seite oeffnet, auf der man schon steht, tut
+    // nichts. Er sah ausserdem nach Browser aus, nicht nach Mac-Fenster --
+    // zumal das Fenster inzwischen eine echte Titelleiste und ein Menue hat.
+    // Der Weg zur Startseite fuehrt jetzt ueber das Menue "Ansicht"
+    // (main.ts, `startseiteOeffnen`), also dorthin, wo ein Mac-Programm ihn
+    // hat. Was die Seite ist, sagt sie in ihrer eigenen Ueberschrift.
     this.titelEl = document.createElement('span');
     this.titelEl.className = 'titel';
     this.titelEl.hidden = true;
     kopf.appendChild(this.titelEl);
-    for (const name of Object.keys(TITEL)) {
-      const b = document.createElement('button');
-      b.textContent = TITEL[name];
-      b.dataset.seite = name;
-      b.addEventListener('click', () => this.oeffne(name));
-      kopf.appendChild(b);
-      this.knoepfe.set(name, b);
-    }
     const fueller = document.createElement('div');
     fueller.className = 'fueller';
     kopf.appendChild(fueller);
+    // DASSELBE ZEICHEN WIE IN DEN VIER SCHUBLADEN (ordner-, aktivitaet-,
+    // protokolle-, freigaben-view): ein Mal-Zeichen, kein Wort. Ein Knopf mit
+    // der Aufschrift "Schliessen" in einer eigenen Leiste ist die Bedienung
+    // eines Browsers; eine Flaeche, die sich ueber den Inhalt legt, schliesst
+    // man auf dem Mac an ihrer Ecke -- und mit Escape, was die vier Schubladen
+    // ebenfalls schon koennen.
     const zu = document.createElement('button');
     zu.className = 'schliessen';
-    zu.textContent = 'Schliessen';
+    zu.textContent = '\u00d7';
+    zu.title = t('wort.schliessen');
+    zu.setAttribute('aria-label', t('wort.schliessen'));
     zu.addEventListener('click', () => this.schliesse());
     kopf.appendChild(zu);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && this.aktuell) this.schliesse();
+    });
 
     this.rahmen = document.createElement('iframe');
-    this.rahmen.setAttribute('title', 'uebernommene Seite');
+    this.rahmen.setAttribute('title', t('seite.rahmen'));
     // about:blank, damit das window schon existiert, bevor geschrieben wird.
     // Die Seite kommt ueber ihr eigenes Schema (siehe zeige()).
+    // Bei JEDEM Laden traegt der Rahmen das zuletzt gemeldete Thema sofort
+    // nach (siehe themaSetzen()) -- die frisch geholte Seite startet mit dem
+    // eingebetteten VORGABE-Thema (dunkel, main/seiten.ts) und wechselt hier,
+    // meist bevor ueberhaupt ein Bild gezeichnet wurde.
+    this.rahmen.addEventListener('load', () => this.themaSenden());
     // Antworten der Seite auf unsere Fragen einsammeln (siehe bootstrap()).
     window.addEventListener('message', (e) => {
       const d = e.data as { __awbAntwort?: boolean; nr?: number; antwort?: unknown } | null;
@@ -175,6 +237,26 @@ export class Seiten {
   /** Welche Seite gerade offen ist -- leer, wenn keine. */
   offen(): string {
     return this.wurzel.classList.contains('offen') ? this.aktuell : '';
+  }
+
+  /**
+   * Thema und Akzent von renderer.ts uebernehmen und, falls gerade ein
+   * Dokument im Rahmen laeuft, sofort hineinreichen -- ein Themawechsel MITTEN
+   * in der Sitzung zieht so nach, auch wenn diese Seite nicht neu laedt.
+   */
+  themaSetzen(wirksam: 'hell' | 'dunkel', akzent: string, akzentTinte: string, akzentText: string): void {
+    this.wirksam = wirksam;
+    this.akzent = akzent;
+    this.akzentTinte = akzentTinte;
+    this.akzentText = akzentText;
+    this.themaSenden();
+  }
+
+  private themaSenden(): void {
+    this.rahmen.contentWindow?.postMessage(
+      { __awbThema: true, wirksam: this.wirksam, akzent: this.akzent, akzentTinte: this.akzentTinte, akzentText: this.akzentText },
+      '*',
+    );
   }
 
   /** Ein Klick auf einen Reiter: das HTML holen. Gezeigt wird es in `zeige`. */
@@ -265,7 +347,7 @@ export class Seiten {
     if (this.aktuell !== name) {
       this.aktuell = name;
       this.wurzel.classList.add('offen');
-      this.titelEl.textContent = TITEL[name] ?? name;
+      this.titelEl.textContent = titelFuer(name);
       for (const [n, b] of this.knoepfe) b.classList.toggle('gewaehlt', n === name);
     }
     // Eine wartende Auffrischung ist mit diesem Zeichnen ohnehin erledigt.
@@ -329,10 +411,10 @@ export class Seiten {
     was.textContent = plan.art === 'bestaetigen'
       ? plan.beschreibung
       : plan.art === 'offen'
-        ? `'${plan.command}' hat hier noch keinen Empfaenger.`
+        ? t('seite.ohneEmpfaenger', { befehl: plan.command })
         : plan.command === 'ergebnis'
           ? plan.beschreibung
-          : `'${plan.command}' wird nicht ausgefuehrt.`;
+          : t('seite.nichtAusgefuehrt', { befehl: plan.command });
     kasten.appendChild(was);
 
     if (plan.grund) {
@@ -361,7 +443,7 @@ export class Seiten {
     if (plan.art === 'bestaetigen') {
       const tun = document.createElement('button');
       tun.className = 'tun';
-      tun.textContent = 'Ausfuehren';
+      tun.textContent = t('seite.ausfuehren');
       tun.addEventListener('click', () => {
         huelle.remove();
         this.wege.ausfuehren();

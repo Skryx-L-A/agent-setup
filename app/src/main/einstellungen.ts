@@ -192,6 +192,10 @@ export const VORGABEN: Readonly<Record<string, unknown>> = {
   // der alten Programmdatei war es nicht.
   maxWorkerPanesPerTab: 6,
   minWorkerPaneWidth: 80,
+  // Woran ein Worker-Pane haengt (04.09.2026, Probe fuer Option E). 'tmux' ist
+  // und bleibt die Vorgabe; 'pty' schaltet den Prototyp aus pty.ts ein. Zweite
+  // Stelle: workerTransport() weiter unten.
+  workerTransport: 'tmux',
   // Programm-Schriftgroesse der Terminals in Pixeln (06.08.). Sie stand bis
   // dahin fest im Renderer und gehoert dorthin, wo der Mensch sie erreicht.
   terminalFontSize: 13,
@@ -264,6 +268,11 @@ export const VORGABEN: Readonly<Record<string, unknown>> = {
   // Maschinen. Leer bleibt leer: ein SSH-Ziel ist ein echter Netzzugriff und
   // darf nie von selbst anspringen (gemessen 05.08., siehe config.ts).
   remoteMachines: [],
+  // Pausierte Maschinen (04.09.): eingetragen, aber ihre Sitzungen werden
+  // nicht mehr abgerufen. Der Name bleibt in `remoteMachines` stehen -- der
+  // Schalter ist umkehrbar, die Adresse geht nicht verloren. Leer bleibt
+  // leer: nichts ist pausiert, bis ein Mensch es anordnet.
+  remoteMachinesPausiert: [],
   // --- 2026-08-11, SPEC-V4 Abschnitt 3: die sieben neuen Schluessel ---------
   //
   // Die Adresse des lokalen Modell-Servers. Sie stand an sieben Stellen fest im
@@ -337,6 +346,14 @@ export const VORGABEN: Readonly<Record<string, unknown>> = {
   // `wb-state settings set erststartErledigt false`, danach erscheint der Weg
   // beim nächsten Start erneut.
   erststartErledigt: false,
+  // Das Agents-Blatt (08.09.2026): holte die Aufgaben-Tabelle aus Fassung 26
+  // hinter dem Platzhalter hervor (`wb-state settings set agentsBlattVorschau
+  // true`). SEIT DEM 14.09.2026 OHNE WIRKUNG (Auftrag agentsui Nr. 6): der Tab
+  // „Agents" zeigt die Welten, keine Oberflaeche und kein Kern liest den
+  // Schluessel mehr. Er steht nur noch hier, weil shell/wb-state ihn in seinen
+  // VORGABEN fuehrt und test-vorgaben-paritaet.sh beide Listen vergleicht;
+  // entfernt wird er an beiden Stellen zugleich.
+  agentsBlattVorschau: false,
 };
 
 export function einstellungenPfad(env: NodeJS.ProcessEnv = process.env): string {
@@ -514,6 +531,29 @@ export function maschinenliste(pfad = einstellungenPfad()): string[] {
   return textlisteAus('remoteMachines', pfad);
 }
 
+/**
+ * Pausierte Fernmaschinen (04.09.): eingetragen, aber ohne Abruf. Das ist die
+ * EINE Stelle, die `remoteMachinesPausiert` liest -- `maschinenAktiv()`
+ * darunter und jeder andere Aufrufer geht ueber diese Funktion, nie ein
+ * zweites Mal an den rohen Schluessel.
+ */
+export function maschinenPausiert(pfad = einstellungenPfad()): string[] {
+  return textlisteAus('remoteMachinesPausiert', pfad);
+}
+
+/**
+ * `maschinenliste()` ohne die pausierten -- das, was der Poller wirklich
+ * abrufen darf (main.ts:7506) und was beim Start in `config.remoteMachines`
+ * gehoert (config.ts). Eine pausierte Maschine bleibt in `remoteMachinesPausiert`
+ * stehen, auch wenn sie inzwischen aus `remoteMachines` entfernt wurde --
+ * `filter` traegt das ohne Sonderfall mit, ein toter Name in der Pausenliste
+ * bewirkt dann einfach nichts.
+ */
+export function maschinenAktiv(pfad = einstellungenPfad()): string[] {
+  const pausiert = new Set(maschinenPausiert(pfad));
+  return maschinenliste(pfad).filter((m) => !pausiert.has(m));
+}
+
 // --- Die sieben Schluessel vom 11.08., je mit ihrem Leser -------------------
 //
 // JEDE dieser Funktionen ist die eine Stelle, an der ihr Schluessel gelesen
@@ -615,10 +655,57 @@ export function meldungen(pfad = einstellungenPfad()): MeldeEinstellung {
   };
 }
 
-/** Die Sprache der Oberflaeche. Alles, was keine bekannte Sprache ist, heisst Deutsch. */
+/**
+ * DIE SPRACHE DES SYSTEMS, einmal vom Hauptprozess gesetzt.
+ *
+ * Sie steht hier und nicht bei den Aufrufern, weil `sprache()` an zehn Stellen
+ * gerufen wird -- aus dem Hauptfenster, dem Einstellungsfenster, dem
+ * Verbrauchsfenster, dem Sitzungsfenster und den uebernommenen Seiten. Jede
+ * dieser Stellen um einen zweiten Parameter zu erweitern, hiesse zehnmal
+ * dasselbe durchzureichen; und `app.getLocale()` laesst sich hier nicht selbst
+ * holen, weil diese Datei bewusst nichts aus `electron` importiert (die
+ * wb-Werkzeuge und die Tests lesen sie ohne laufendes Programm).
+ *
+ * Gesetzt wird sie EINMAL beim Start, bevor ein Fenster entsteht.
+ */
+let systemSprache = '';
+
+/** Was der Hauptprozess vom System bekommt (`app.getLocale()`), z. B. `de-DE`. */
+export function systemSpracheSetzen(locale: string): void {
+  systemSprache = typeof locale === 'string' ? locale : '';
+}
+
+/** Aus einer Systemkennung die Sprache: alles, was mit `de` beginnt, ist Deutsch. */
+export function spracheAusLocale(locale: string): 'de' | 'en' {
+  return locale.trim().toLowerCase().startsWith('de') ? 'de' : 'en';
+}
+
+/**
+ * Die Sprache der Oberflaeche.
+ *
+ * Die EINSTELLUNG schlaegt alles. Fehlt sie, entscheidet die Sprache des
+ * Systems (03.09.2026): vorher fiel ein frisches Programm auf Englisch, und
+ * alice sah beim ersten Start eine englische Oberflaeche, obwohl sein Mac
+ * auf Deutsch steht. Weiss auch das System nichts, bleibt es bei der Vorgabe.
+ */
 export function sprache(pfad = einstellungenPfad()): string {
   const roh = alleEinstellungen(pfad).sprache;
-  return roh === 'en' || roh === 'de' ? roh : String(VORGABEN.sprache);
+  if (roh === 'en' || roh === 'de') return roh;
+  if (systemSprache) return spracheAusLocale(systemSprache);
+  return String(VORGABEN.sprache);
+}
+
+/**
+ * Woran ein Worker-Pane haengt: an tmux (Vorgabe, der Stand seit V1) oder an
+ * einem Pseudo-Terminal, das dieses Programm selbst haelt (Probe fuer Option E,
+ * 04.09.2026; siehe app/src/main/pty.ts und DIREKTWEG-BEFUND.md, Abschnitt 7).
+ *
+ * Ein unbekannter Wert heisst 'tmux' und nicht "Fehler": ein Tippfehler in
+ * dieser Zeile darf die Anwendung nicht auf einen Prototyp umstellen.
+ */
+export function workerTransport(pfad = einstellungenPfad()): 'tmux' | 'pty' {
+  const roh = alleEinstellungen(pfad).workerTransport;
+  return roh === 'pty' ? 'pty' : 'tmux';
 }
 
 /** Hell, dunkel oder wie das System. */
@@ -647,11 +734,20 @@ export function zustandsfarben(pfad = einstellungenPfad()): Record<string, strin
 }
 
 /**
- * Je Harness: soll die Werkbank das Gespraech statt des Terminalbilds zeichnen?
+ * Je Harness: die EXPLIZITE Wahl auf "Programme und Modelle", soll die
+ * Werkbank das Gespraech statt des Terminalbilds zeichnen?
  *
  * Das ist ein WUNSCH und keine Faehigkeit. Ob ein Harness es kann, steht im
  * `session`-Block seines Registry-Eintrags; diese Tabelle sagt nur, was der
- * Mensch will, wo es geht.
+ * Mensch explizit gewaehlt hat.
+ *
+ * FEHLT EIN HARNESS IN DER RUECKGABE, heisst das "nie gewaehlt" -- und NICHT
+ * "aus": erst `harnessErlaubt()` (chat/ansichtsregel.ts) macht daraus die
+ * Antwort "an, wo der Harness es kann", solange niemand ausdruecklich
+ * widersprochen hat. Bis 22.08. warf diese Funktion ein explizites `false`
+ * und ein nie gesetztes Feld in denselben Topf (beide fielen aus der
+ * Rueckgabe heraus) -- ein Aufrufer konnte die beiden Faelle also gar nicht
+ * unterscheiden.
  */
 export function chatAnsicht(pfad = einstellungenPfad()): Record<string, boolean> {
   const roh = alleEinstellungen(pfad).chatAnsicht;
@@ -659,7 +755,9 @@ export function chatAnsicht(pfad = einstellungenPfad()): Record<string, boolean>
     ? (roh as Record<string, unknown>)
     : {};
   const raus: Record<string, boolean> = {};
-  for (const [harness, wert] of Object.entries(quelle)) if (wert === true) raus[harness] = true;
+  for (const [harness, wert] of Object.entries(quelle)) {
+    if (wert === true || wert === false) raus[harness] = wert;
+  }
   return raus;
 }
 

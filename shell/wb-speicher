@@ -85,18 +85,19 @@ def fussabdruecke():
 
 
 def prozessbaum():
-    """(kinder, args, ppid, laufzeit_sekunden) fuer jeden Prozess."""
-    kinder, args, eltern, alter = {}, {}, {}, {}
-    for zeile in sh("ps", "-Ao", "pid=,ppid=,etime=,args=").splitlines():
-        f = zeile.split(None, 3)
-        if len(f) < 4:
+    """(kinder, args, ppid, laufzeit_sekunden, tty) fuer jeden Prozess."""
+    kinder, args, eltern, alter, tty = {}, {}, {}, {}, {}
+    for zeile in sh("ps", "-Ao", "pid=,ppid=,etime=,tty=,args=").splitlines():
+        f = zeile.split(None, 4)
+        if len(f) < 5:
             continue
         pid, ppid = int(f[0]), int(f[1])
         kinder.setdefault(ppid, []).append(pid)
-        args[pid] = f[3]
+        args[pid] = f[4]
         eltern[pid] = ppid
         alter[pid] = etime_sekunden(f[2])
-    return kinder, args, eltern, alter
+        tty[pid] = f[3]
+    return kinder, args, eltern, alter, tty
 
 
 def etime_sekunden(s):
@@ -149,7 +150,13 @@ def wb_tmux():
 
 # --- Reste -----------------------------------------------------------------
 
-def reste_finden(args, eltern, alter):
+# Eine nackte interaktive Login-Shell -- der Bindestrich zeigt eine LOGIN-
+# Shell an, tmux startet Panes standardmaessig so. Siehe reste_finden() unten
+# fuer die Begruendung, warum PPID 1 hier allein schon "tot" heisst.
+LOGIN_SHELLS = ("-zsh", "zsh", "-bash", "bash", "-sh", "sh", "-ksh", "ksh")
+
+
+def reste_finden(args, eltern, alter, tty):
     """Was liegengeblieben ist. 'tot' heisst: es kann seinen Zweck nicht mehr
     erfuellen, weil sein Ziel verschwunden ist — nicht bloss 'sieht alt aus'."""
     funde = []
@@ -205,6 +212,39 @@ def reste_finden(args, eltern, alter):
                 "was": "MCP-Server ohne die Sitzung, die ihn gestartet hat",
                 "ziel": "-", "alter_s": alter.get(pid, 0), "tot": True,
                 "grund": "Elternprozess ist PID 1, also ist seine Sitzung beendet",
+            })
+            continue
+
+        # 4. Eine verwaiste LOGIN-SHELL (2026-08-22, Auftrag "413 verwaiste
+        #    Shells"): ein Pane, dessen tmux-Server mit `kill-server` stirbt,
+        #    kann Panes zurueckLASSEN, deren Shell das SIGHUP nie bekommt (ein
+        #    Rennen zwischen dem Sterben des Servers und der asynchronen
+        #    Zustellung des Hangup, gemessen an fuenf Laeufen zu je zehn
+        #    Panes: 0, 4, 4, 6, 0 Ueberlebende). Solche Shells behalten dabei
+        #    ihr ECHTES Terminal (ttysNNN, nicht "??") -- anders als ein
+        #    launchd-Job, der so gut wie nie eines hat; das trennt diese
+        #    Klasse von den drei obigen, ohne die tty=="??"-Bedingung zu
+        #    verwenden, die dort gilt.
+        #
+        #    PPID 1 heisst hier, anders als bei einem abgeloest gestarteten
+        #    Prozess, bereits "tot" ohne weitere Pruefung: ein Modellserver
+        #    wird ABSICHTLICH abgeloest gestartet, um unabhaengig von seinem
+        #    Starter andere Anfragen zu bedienen -- das ist sein Zweck. Eine
+        #    Login-Shell hat keinen Zweck ausser der interaktiven Verbindung
+        #    zu genau dem Pane, das sie erzeugt hat, und PPID 1 beweist, dass
+        #    es das nicht mehr gibt. Niemand startet eine nackte Shell
+        #    absichtlich abgeloest, um sie unabhaengig von ihrem Terminal
+        #    weiterlaufen zu lassen (dafuer gibt es `wb-nohup` fuer den
+        #    PROZESS, den man behalten will, nie fuer die Shell selbst).
+        #
+        #    Praezise wie die drei Kategorien oben: nur EXAKT eine nackte
+        #    Login-Shell (kein Argument, kein Skript mit demselben Namen).
+        if tty.get(pid, "??").startswith("ttys") and a.strip() in LOGIN_SHELLS:
+            funde.append({
+                "pid": pid, "art": "verwaiste-login-shell",
+                "was": "Login-Shell ohne das Terminal/Pane, das sie erzeugt hat",
+                "ziel": tty.get(pid, "-"), "alter_s": alter.get(pid, 0), "tot": True,
+                "grund": "Elternprozess ist PID 1, also ist ihr Terminal/Pane weg",
             })
 
     return funde
@@ -315,7 +355,7 @@ def hinweise(posten, panes, args):
 
 def erheben():
     mem = fussabdruecke()
-    kinder, args, eltern, alter = prozessbaum()
+    kinder, args, eltern, alter, tty = prozessbaum()
     server, panes = wb_tmux()
 
     posten = {k: {"mib": 0.0, "pids": []} for k in
@@ -329,7 +369,7 @@ def erheben():
         posten[schluessel]["mib"] += mem[pid]
         posten[schluessel]["pids"].append(pid)
 
-    funde = reste_finden(args, eltern, alter)
+    funde = reste_finden(args, eltern, alter, tty)
     for f in funde:
         eintragen("reste", f["pid"])
 

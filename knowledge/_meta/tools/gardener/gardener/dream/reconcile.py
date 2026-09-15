@@ -210,7 +210,7 @@ def text_hash(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def embed_claims(rows: list[dict], client, store: ReconcileStore, *,
-                 preflight=None) -> dict[str, list[float]]:
+                 preflight=None, dry_run: bool = False) -> dict[str, list[float]]:
     """Embed every claim's TEXT, reusing the cache by (claim_id, text hash).
 
     `preflight` is called once, before the first uncached embedding, and is the
@@ -218,6 +218,14 @@ def embed_claims(rows: list[dict], client, store: ReconcileStore, *,
     not start without looking at the machine first. It is a parameter rather
     than a hard import so a test injects its own and never shells out. When
     every vector is already cached, no model runs and no preflight is needed.
+
+    `dry_run=True` never calls the model, only the cache: claims already
+    embedded on a prior run still get their vector, everything else is left
+    out of the returned dict. Auftrag "zeitgrenze" (04.09.2026): a dry run
+    used to embed every claim regardless - `--dry-run` alone loaded
+    embeddinggemma, 673 MB of GPU memory, exactly what the preflight check is
+    there to prevent. The caller (`build_plan`) reports how many claims came
+    back without a vector - that count is what a real run would still do.
     """
     vectors: dict[str, list[float]] = {}
     todo: list[dict] = []
@@ -227,7 +235,7 @@ def embed_claims(rows: list[dict], client, store: ReconcileStore, *,
             vectors[row["claim_id"]] = cached
         else:
             todo.append(row)
-    if not todo:
+    if not todo or dry_run:
         return vectors
     if preflight is not None:
         resources = preflight()
@@ -568,7 +576,27 @@ def claim_subject_candidates(claim: dict,
     `<ein eigenes Mailwerkzeug>` (named twice). Committing to the longest here dropped the claim
     onto a rare term, the frequency rule then refused it a page, and a genuine
     supersession about <ein eigenes Mailwerkzeug> lost its target.
-    """
+
+    A term in BACKTICKS must clear the same document-share test as a bare
+    token, not only `is_function_word`. Gefunden 02.09.2026 beim Nachmessen von
+    ENTSCHEIDUNG-KALTSTART.md gegen den echten Vault: die Stoppliste deckt nur
+    die geschlossene Menge der Funktionswoerter, aber ein haeufiges Inhaltswort,
+    das jemand oft in Backticks setzt (im Test: `skript`, 33 Prozent
+    Dokumentanteil; im echten Vault: `Prüfung`, 132 Fundstellen, laut der
+    eigenen Zusage von `marked_vocabulary` laengst abgelehnt), ist keins - und
+    kam ohne diese Zeile ungefiltert durch, weil der markierte Pfad
+    `vocabulary` nie fragte. Ausgenommen bleibt, was wie ein Bezeichner
+    aussieht: der sieht nie aus wie ein haeufiges Wort.
+
+    Ein WIKILINK bekommt die Schranke NICHT: `[[Lange Session-Notiz-Titel wie
+    dieser hier]]` ist oft laenger als die 60 Zeichen, ab denen
+    `marked_vocabulary` einen Begriff ueberhaupt aufnimmt, und genau darin
+    liegt der Unterschied zum Fuellwort-Fall - ein Mensch hat bewusst auf einen
+    konkreten Notiztitel verwiesen, kein Wort ist ihm einfach passiert. Am
+    echten Vault gemessen (02.09.2026): eine Fassung, die beide Muster
+    gleich behandelt, verwirft 13 echte Notiztitel wie `Eine Testsuite tippte
+    in die laufende Session — und gab ihr einen Auftrag` - eine bestehende
+    Notiz dieses Namens."""
     text = str(claim.get("text") or "")
     quote = str(claim.get("quote") or "")
     norm_quote = claims_mod.normalize(quote)
@@ -577,12 +605,19 @@ def claim_subject_candidates(claim: dict,
         return term in quote or claims_mod.normalize(term) in norm_quote
 
     marked: list[str] = []
-    for pattern in (_WIKILINK_RE, _BACKTICK_RE):
-        for m in pattern.finditer(text):
-            term = m.group(1).strip()
-            if term and not is_machine_stem(term) \
-                    and not is_function_word(term) and quoted(term):
-                marked.append(term)
+    for m in _WIKILINK_RE.finditer(text):
+        term = m.group(1).strip()
+        if term and not is_machine_stem(term) \
+                and not is_function_word(term) and quoted(term):
+            marked.append(term)
+    for m in _BACKTICK_RE.finditer(text):
+        term = m.group(1).strip()
+        if not term or is_machine_stem(term) or is_function_word(term) \
+                or not quoted(term):
+            continue
+        if not (_is_identifier_shaped(term) or term.lower() in vocabulary):
+            continue
+        marked.append(term)
     plain = _BACKTICK_RE.sub(" ", _WIKILINK_RE.sub(" ", text))
     bare: list[str] = []
     for m in _TOKEN_RE.finditer(plain):
@@ -1292,6 +1327,13 @@ def build_plan(vault: Path, rows: list[dict], *, run_id: str,
         "budget_stopped": budget_stopped,
         "claims": len(rows),
         "claims_with_vector": sum(1 for r in rows if r["claim_id"] in vectors),
+        # Auftrag "zeitgrenze" Punkt 2 (04.09.2026): die Zahl, die einen
+        # Trockenlauf erst nuetzlich macht - wie viel der echte Lauf an
+        # dieser Stelle noch zusaetzlich einbetten wuerde. Ausserhalb eines
+        # Trockenlaufs sollte sie 0 sein; bleibt sie es nicht, ist ein
+        # einzelner Einbettungsversuch fehlgeschlagen (embed_claims faengt
+        # das ab und macht mit den anderen Aussagen weiter).
+        "claims_missing_vector": sum(1 for r in rows if r["claim_id"] not in vectors),
         "groups": len(plan.groups),
         "groups_multi": sum(1 for g in plan.groups if len(g.members) > 1),
         "claims_with_target": len(plan.targets),
@@ -1353,7 +1395,10 @@ def format_reconcile_report(plan: Plan, dry_run: bool = False) -> str:
     lines = [f"dream reconcile{' (dry-run)' if dry_run else ''} "
              f"(Lauf {plan.run_id})", "",
              f"Aussagen betrachtet: {s.get('claims', 0)}",
-             f"  davon eingebettet: {s.get('claims_with_vector', 0)}",
+             f"  davon eingebettet: {s.get('claims_with_vector', 0)}"
+             + (f" (ohne Vektor: {s['claims_missing_vector']} - das wuerde "
+                "ein echter Lauf an dieser Stelle zusaetzlich einbetten)"
+                if s.get("claims_missing_vector") else ""),
              f"Gruppen: {s.get('groups', 0)} "
              f"(mehr als eine Aussage: {s.get('groups_multi', 0)})",
              f"Zusammengefuehrt, mechanisch: {s.get('mechanical_merges', 0)}",

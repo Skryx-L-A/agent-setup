@@ -53,7 +53,13 @@ await buildAtomic({
   ...common,
   entryPoints: [join(root, 'src/main/main.ts')],
   outfile: join(out, 'main/main.js'),
-  external: ['electron'],
+  // `node-pty` ist der einzige BINAERTEIL dieser Anwendung (Probe fuer Option E,
+  // 04.09.2026): es laedt eine .node-Datei, und die laesst sich nicht buendeln.
+  // Es steht deshalb neben 'electron' und wird zur Laufzeit aus node_modules
+  // geladen -- und zwar erst dann, wenn der Schalter `workerTransport` auf
+  // 'pty' steht (pty.ts, `ladePty`). `@xterm/headless` ist reines JavaScript
+  // und faehrt gebuendelt mit.
+  external: ['electron', 'node-pty'],
 });
 
 await buildAtomic({
@@ -324,6 +330,16 @@ await buildAtomic({
   outfile: join(out, 'test/remote.mjs'),
 });
 
+// Der Absturz-Hinweis (05.09.), aus demselben Grund: `absturzText` und
+// `FernAbsturzSpur` sind rein, und die Linux-Form des Signals (die NUMMER,
+// gemessen auf peer) laesst sich auf dem Mac nur so pruefen.
+await buildAtomic({
+  ...common,
+  format: 'esm',
+  entryPoints: [join(root, 'src/main/absturz.ts')],
+  outfile: join(out, 'test/absturz.mjs'),
+});
+
 // V13, aus demselben Grund: `parseBudget` ist rein, `BudgetPoller` treibt
 // einen echten Kindprozess.
 await buildAtomic({
@@ -398,6 +414,30 @@ await buildAtomic({
   outfile: join(out, 'test/freigaben.mjs'),
 });
 
+// BEIDE ZUSAMMEN, IN EINEM BUeNDEL (2026-09-03, Audit "gleiche Pane-Liste mehrfach
+// im selben Takt"): `alleTmuxPanes()` in freigaben.ts liest jetzt einen Hinweis, den
+// `readPanes()` in sessions.ts ueber eine geteilte MODUL-Variable hinterlaesst --
+// das funktioniert nur, wenn beide Dateien tatsaechlich dieselbe, EINE eingebaute
+// Kopie dieser Variable teilen. Getrennt gebaut (wie `sessions.mjs`/`freigaben.mjs`
+// oben, je ein eigener esbuild-Lauf mit eigenem Modulgraphen) bekommt JEDES Buendel
+// seine EIGENE, unabhaengige Kopie von sessions.ts eingebettet -- der Hinweis der
+// einen waere fuer die andere unsichtbar, obwohl im echten `dist/main/main.js`
+// (ein einziger Bau, main.ts als Einstieg) genau eine Kopie existiert. Nur dieses
+// gemeinsame Buendel misst also, was main.ts tatsaechlich erlebt.
+await buildAtomic({
+  ...common,
+  format: 'esm',
+  stdin: {
+    contents: [
+      `export { readSessions, leseSessions } from ${JSON.stringify(join(root, 'src/main/sessions.ts'))};`,
+      `export { readGuardBlocks } from ${JSON.stringify(join(root, 'src/main/freigaben.ts'))};`,
+    ].join('\n'),
+    resolveDir: root,
+    loader: 'ts',
+  },
+  outfile: join(out, 'test/sessions-freigaben.mjs'),
+});
+
 // Die Freigabe-ANSICHT einzeln (19.08.), als IIFE fuer ein kopfloses Fenster.
 // Geprueft werden muss hier etwas, das nur ein echtes Dokument hat: dass der
 // getippte Satz im Begruendungsfeld, der Fokus und die Schreibmarke ein
@@ -467,6 +507,20 @@ await buildAtomic({
   outfile: join(out, 'test/thema.mjs'),
 });
 
+// Das Farbsystem als STATISCHE Datei, aus GENAU DIESEM Buendel erzeugt --
+// nicht von Hand zweimal hingeschrieben. `thema.ts` (`rollenCss()`) traegt die
+// Hex-Werte einmal; hier wird das frisch gebaute, Electron-freie Buendel
+// importiert und sein Text nach `thema/tokens.css` geschrieben. Jedes der
+// fuenf Fenster verlinkt dieselbe Datei (siehe der Kopiervorgang weiter unten);
+// main/seiten.ts holt sich denselben Text ein zweites Mal ueber `rollenCss()`
+// direkt, fuer die uebernommenen VSCode-Seiten ohne <link>.
+{
+  const { rollenCss } = await import(`${join(out, 'test/thema.mjs')}?t=${Date.now()}`);
+  const tokensCss = `/* ERZEUGT von build.mjs aus main/thema.ts (rollenCss()). Nicht von Hand aendern --\n   die Quelle ist main/thema.ts, ROLLEN. */\n${rollenCss()}`;
+  mkdirSync(join(out, 'thema'), { recursive: true });
+  writeFileSync(join(out, 'thema/tokens.css'), tokensCss);
+}
+
 // Der Worker-Zustand einzeln, und diesmal aus einem eng umrissenen Grund:
 // `STALL_SECONDS_DEFAULT` ist eine ANGEMELDETE Doppelung -- dieselbe Schwelle
 // steht als `stallMinutes` in shell/wb-state, nur in einer anderen Einheit.
@@ -510,6 +564,18 @@ await buildAtomic({
   format: 'esm',
   entryPoints: [join(root, 'src/verbrauch/rechnen.ts')],
   outfile: join(out, 'test/verbrauch-rechnen.mjs'),
+});
+
+// Die Umschrift einzeln, und aus einem eigenen Grund: sie ist die EINE Stelle, an der beide
+// Fenster haengen -- das Verbrauchsfenster fuer die Saetze aus wb-budget, das
+// Einstellungsfenster fuer die Registrytexte. Dass es wirklich eine ist und nicht zwei Kopien,
+// laesst sich nur zeigen, indem beide Buendel nebeneinander dasselbe antworten
+// (shell/tests/test-app-verbrauch.sh, Abschnitt J).
+await buildAtomic({
+  ...common,
+  format: 'esm',
+  entryPoints: [join(root, 'src/gemeinsam/umlaute.ts')],
+  outfile: join(out, 'test/gemeinsam-umlaute.mjs'),
 });
 
 // Die Beschriftungstabelle ebenfalls einzeln: dass jeder Schluessel, den die Oberflaeche
@@ -667,16 +733,16 @@ await buildAtomic({
   outfile: join(out, 'test/chatwache.mjs'),
 });
 
-mkdirSync(join(out, 'renderer'), { recursive: true });
-cpSync(join(root, 'src/renderer/index.html'), join(out, 'renderer/index.html'));
-mkdirSync(join(out, 'einstellungen'), { recursive: true });
-cpSync(join(root, 'src/einstellungen/index.html'), join(out, 'einstellungen/index.html'));
-mkdirSync(join(out, 'sitzung'), { recursive: true });
-cpSync(join(root, 'src/sitzung/index.html'), join(out, 'sitzung/index.html'));
-mkdirSync(join(out, 'verbrauch'), { recursive: true });
-cpSync(join(root, 'src/verbrauch/index.html'), join(out, 'verbrauch/index.html'));
-mkdirSync(join(out, 'erststart'), { recursive: true });
-cpSync(join(root, 'src/erststart/index.html'), join(out, 'erststart/index.html'));
+// Dasselbe `thema/tokens.css` (gerade eben aus main/thema.ts erzeugt) liegt
+// in JEDEM der fuenf Fensterordner -- ein <link rel="stylesheet"
+// href="tokens.css"> darin findet so seine Datei, ohne einen Pfad ausserhalb
+// des eigenen Ordners zu verlassen (dieselbe Namensgebung wie bei
+// renderer.css nebenan).
+for (const fenster of ['renderer', 'einstellungen', 'sitzung', 'verbrauch', 'erststart']) {
+  mkdirSync(join(out, fenster), { recursive: true });
+  cpSync(join(root, `src/${fenster}/index.html`), join(out, `${fenster}/index.html`));
+  cpSync(join(out, 'thema/tokens.css'), join(out, `${fenster}/tokens.css`));
+}
 
 // EIN BAU UNTER EINER LAUFENDEN APP WIRD GESAGT (16.08.).
 //

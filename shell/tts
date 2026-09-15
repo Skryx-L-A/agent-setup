@@ -7,6 +7,8 @@
 #   tts "text"                     fast English default (Kokoro)
 #   tts --expressive "text"        expressive English (Chatterbox-Turbo)
 #   tts --de "text"                German (Qwen3-TTS) — ONLY on explicit request
+#   tts --breeze "text"            Breeze TTS 2, 4-bit MLX (English and Chinese only;
+#                                  needs mlx-audio >= 0.5.1, see below)
 #   tts --model <hf-repo> "text"   any mlx-audio model
 #   tts --voice <voice> ...        pass a voice name through
 #   tts -o /path/prefix ...        output prefix (default /tmp/tts-<epoch>)
@@ -16,24 +18,51 @@ set -euo pipefail
 VENV="$HOME/AI/audio-tools/.venv"
 MODEL="mlx-community/Kokoro-82M-bf16"
 OUT="/tmp/tts-$(date +%s)"
-VOICE=""; PLAY=0; TEXT=""
+VOICE=""; PLAY=0; TEXT=""; BREEZE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --expressive) MODEL="mlx-community/chatterbox-turbo-8bit"; shift ;;
     --de) MODEL="mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"; shift ;;
+    --breeze) MODEL="mlx-community/Breeze-TTS-2-mlx-4bit"; BREEZE=1; shift ;;
     --model) MODEL="$2"; shift 2 ;;
     --voice) VOICE="$2"; shift 2 ;;
     -o) OUT="$2"; shift 2 ;;
     --play) PLAY=1; shift ;;
+    # Anlass (2026-08-22, dieselbe Bugfamilie wie wb-budget): ein getipptes
+    # '--expresive' landete vorher genauso im Catchall wie der echte Text, und der
+    # naechste Durchlauf (der echte Text) ueberschrieb TEXT wieder -- der Text stimmte
+    # am Ende, aber MODEL blieb still bei der Vorgabe (Kokoro) statt der verlangten
+    # Stimme. Jeder Aufruf hier uebergibt den Text als eigenes, letztes Argument.
+    -*) echo "tts: unbekannte Option '$1'" >&2; exit 2 ;;
     *) TEXT="$1"; shift ;;
   esac
 done
-[ -n "$TEXT" ] || { echo "usage: tts [--expressive|--de|--model M] [--voice V] [-o prefix] [--play] \"text\"" >&2; exit 2; }
+[ -n "$TEXT" ] || { echo "usage: tts [--expressive|--de|--breeze|--model M] [--voice V] [-o prefix] [--play] \"text\"" >&2; exit 2; }
+
+PYTHON="$VENV/bin/python"
+# Breeze TTS 2 came to mlx-audio on 2026-08-26 (release 0.5.1); the house venv above is
+# older. The companion's speech server runs from the uv tool installation, and that is
+# the one its setup script upgrades, so that comes first. TTS_BREEZE_PYTHON overrides.
+if [ "$BREEZE" = 1 ]; then
+  PYTHON=""
+  for candidate in "${TTS_BREEZE_PYTHON:-}" "$HOME/.local/share/uv/tools/mlx-audio/bin/python" "$VENV/bin/python"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ] && \
+       compgen -G "$(dirname "$candidate")/../lib/python3*/site-packages/mlx_audio/tts/models/breeze_tts" >/dev/null; then
+      PYTHON="$candidate"; break
+    fi
+  done
+  if [ -z "$PYTHON" ]; then
+    echo "tts: Breeze TTS 2 needs mlx-audio >= 0.5.1 (uv tool install --force 'mlx-audio>=0.5.1')" >&2
+    exit 1
+  fi
+  # Breeze's own default speaker tag; without it mlx-audio hands over a Kokoro voice name.
+  [ -n "$VOICE" ] || VOICE="S0"
+fi
 
 ARGS=(--model "$MODEL" --text "$TEXT" --file_prefix "$OUT")
 [ -n "$VOICE" ] && ARGS+=(--voice "$VOICE")
-"$VENV/bin/python" -m mlx_audio.tts.generate "${ARGS[@]}" >/dev/null 2>&1
+"$PYTHON" -m mlx_audio.tts.generate "${ARGS[@]}" >/dev/null 2>&1
 
 WAV="${OUT}_000.wav"
 [ -s "$WAV" ] || { echo "tts failed: no output ($MODEL)" >&2; exit 1; }

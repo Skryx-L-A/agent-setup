@@ -1,8 +1,8 @@
 {
   "lastChangelogVersion": "0.84.2",
   "theme": "dark",
-  "defaultProvider": "mlx-lokal",
-  "defaultModel": "$HOME/AI/mlx-models/qwen38-27b-mlx-4bit",
+  "defaultProvider": "ollama",
+  "defaultModel": "ornith:35b-256k",
   "enabledModels": [
     "mlx-lokal/$HOME/AI/mlx-models/grug-27b-mlx-q4",
     "ollama/ornith:35b-256k",
@@ -12,5 +12,7 @@
     "ollama/qwen3.6:27b-coding-nvfp4-256k"
   ],
   "hideThinkingBlock": true,
-  "defaultProjectTrust": "always"
+  "defaultProjectTrust": "always",
+  "outputPad": 1,
+  "autocompleteMaxVisible": 20
 }

@@ -1,75 +1,20 @@
-# regeln/prozess-hygiene.md
-
-Inhalt: was gestartet wird, wird auch beendet (volle Aufzählung) und geteilte MCP-Server. Gilt seit: 2026-07-20 / 2026-07-28.
-Diese Datei ist ausgelagert aus CLAUDE.md; sie gilt unverändert weiter.
+# prozess-hygiene
 
 Auslöser: bevor ein länger laufender Prozess gestartet wird (Server, Watcher, Modell,
 Background-Job, Tunnel), nach jeder abgeschlossenen Teilaufgabe, vor dem Sessionende —
 und nach einem Plugin-Update. Der Merksatz steht weiter in CLAUDE.md; hier steht die
 vollständige Aufzählung samt NIE-beenden-Liste.
 
-## Standing rules — Prozess-Hygiene
+Stand der Gliederung: 2026-09-12. Vor der Handlung die passenden Abschnitte unten lesen,
+keine Volllektüre aller Referenzen. Die bisherigen Inhalte sind wortgetreu ausgelagert;
+neuere ausdrückliche Entscheidungen ersetzen ältere abweichende Absätze.
+Für Prüfbedarf gilt immer `~/.claude/regeln/verifikation.md`: keine automatische Doppelprüfung.
 
-- **Ein laufendes Shell-Skript wird nicht bearbeitet (2026-08-16).** Bash liest die Datei über
-  einen Byte-Versatz nach; eine Änderung im Kopf verschiebt alles dahinter, und der laufende
-  Prozess setzt an einer sinnlosen Stelle fort — ohne Fehlermeldung. Erst beenden, dann ändern,
-  dann neu starten ([[session-2026-08-16-abend-fenstergrenze-und-aufseher]]).
-- **Ein abgelöster Prozess bekommt einen Eigentümer (2026-08-11).** Statt `nohup <befehl> &
-  disown` heißt es `wb-nohup <name> -- <befehl> [args…]`: das trägt PID, Startbefehl, Startzeit,
-  Worker und Pane ein, und `wb-waisen` liest den Eintrag, statt aus Verbindungen zu raten. Grund:
-  in der Nacht zum 11.08. überlebte ein Modellserver mit 21,9 GB das Ende seines Panes, und
-  niemandem fiel es auf. `wb-waisen` beendet nie selbst; den `kill`-Befehl schlägt es nur vor, wo
-  der Eigentümer nachweislich tot ist UND keine Benutzung gemessen wurde (offene Verbindung,
-  CPU-Bewegung oder **wachsender** Speicher — ein ladendes Modell sieht sonst zwanzig Minuten aus
-  wie eine Leiche).
-- **Vor einem großen Modellstart wird belegt (2026-08-11).** `wb-belegung nimm --modell <m>
-  --gewichte-gb <n> --parallel <n> --kontext <n> --zweck "<…>"`, nach dem Laden `wb-belegung
-  geladen <kennung>`, danach `wb-belegung gib <kennung>`. Belegt wird die SPITZE (Gewichte +
-  gleichzeitige Anfragen × Kontext × KV je Token + Zuschlag), nicht das Gewicht: zwei Kernel-Paniken
-  in einer Nacht entstanden genau in dieser Lücke, ausgelöst durch GPU-Speichermangel. Ein Nein
-  nennt den Halter; `wb-post` ist der Weg, ihn anzusprechen.
-- **Prozess-Hygiene: was gestartet wird, wird auch beendet (2026-07-20).** Alles, was Orchestrator
-  oder Worker starten, wird beendet, sobald es nicht mehr gebraucht wird — sofort nach der
-  Teilaufgabe, nicht erst am Sessionende: Dev-/Preview-/API-Server, Watcher, Test-Runner,
-  Playwright/Chromium, Tunnels, Background-Jobs (`&`, `nohup`, `run_in_background`), geladene lokale
-  Modelle (`ollama stop <modell>`, llama-server), temporäre tmux-Panes/-Sessions fertiger Worker.
-  Auf BEIDEN Maschinen (Mac und Peer-Rechner), auch für per `ssh`/`run-on` remote gestartete Jobs. Worker:
-  eigene Prozesse beenden VOR dem Result-File und dort nennen, was beendet wurde. Orchestrator: nach
-  jeder abgeschlossenen Teilaufgabe und vor dem Sessionende selbst auf Waisen prüfen und beenden
-  (`ps`/`pgrep -af`, `lsof -i -P | grep LISTEN`, `ollama ps`, `tmux ls`, auf peer zusätzlich
-  `nvidia-smi`). Beendigung wird VERIFIZIERT, nie angenommen: Prozess weg, Port frei, VRAM/RAM
-  zurück. **NIE beendet werden:** Prozesse des Users (Apps, Editoren, Browser-Fenster, Discord/Steam,
-  another service/whisper-server, laufende Aufnahmen), geschützte Dienste (a protected service auf Peer-Rechner) und alles, was
-  `check-resources` als PROTECTED listet — dort gilt die Konfliktregel: im Zweifel der Nutzer fragen,
-  nie eigenmächtig killen. Vor dem Beenden eines Panes/Workers dessen Wissen sichern
-  (Result-File/Handoff), bei uncommitteten Änderungen Snapshot nach
-  `~/.local/trash-snapshots/<datum>-<name>/`.
+## Abschnitte
 
-- **MCP-Server laufen geteilt, nicht pro Session (2026-07-28):** `basic-memory` und `playwright`
-  hängen als HTTP-Server an LaunchAgents (Ports 8766/8767, nur 127.0.0.1) — stdio startete je
-  Session eigene Prozesse (gemessen: 72 Stück, 6,6 GB). Bedienung: `mcp-shared status|restart|reap`;
-  nach einem Plugin-Update `mcp-shared apply`, sonst fällt Playwright auf stdio zurück.
+- [regeln/prozess-hygiene.md](references/prozess-hygiene/00.md)
+- [Standing rules — Prozess-Hygiene](references/prozess-hygiene/01.md)
+- [Nie unbegrenzt warten (ausgelagert aus roles/orchestrator.md, 2026-08-20)](references/prozess-hygiene/02.md)
 
-- **Kein Prozess läuft dauerhaft, nur solange er gebraucht wird (2026-08-16, globale des Nutzers Regel: „ich will das die wächter nicht dauerhaft aktiv sind… das gilt für alle
-  prozesse um systemressourcen zu sparen").** Betrifft ausdrücklich die Wächter — Kontext-Guard,
-  `traum-wache.sh`, Beobachter auf Meldedateien, Wartelaufe — und jeden Hintergrundjob: sie
-  werden ZUM ANLASS gestartet und beendet, sobald der Anlass weg ist, nicht auf Vorrat
-  gehalten. Konkret: keine Wache ohne laufenden Lauf, kein Kontext-Guard ohne laufende Worker,
-  kein Wartelauf, dessen Ziel schon fertig ist. Wer einen Wächter startet, plant sein Ende mit;
-  ein Wächter, der nach dem Ende seines Schützlings weiterläuft, ist selbst eine Waise.
-  Unberührt bleiben die geteilten Dienste, die es aus Sparsamkeit GIBT (`mcp-shared`,
-  LaunchAgents) — sie ersetzen viele Einzelprozesse und sind der Grund, nicht der Verstoß.
-
-## Nie unbegrenzt warten (ausgelagert aus roles/orchestrator.md, 2026-08-20)
-
-Die Regel gilt unverändert; sie steht hier, weil die Rollendatei über der Größengrenze lag.
-
-Jedes Warten auf Prozess, Worker, Download oder Service braucht (a) eine Deadline und (b)
-Liveness- und Fortschrittsprüfung: Lebt genau dieser Prozess (präzise matchen; ein
-`pgrep -f`-Muster darf nicht den eigenen Watcher treffen) UND wächst seine Ausgabe, Größe oder
-sein Log noch? Nach Deadline stehengeblieben heißt gescheitert: killen, loggen, ein- bis zweimal
-mit Backoff neu versuchen, dann den Fehler melden statt weiter zu warten.
-
-pi-Worker laufen per `gtimeout` aus (Default 30 min, `PI_WORKER_TIMEOUT` überschreibt; Exit 124
-heißt hängt oder Timeout). Womit Fortschritt überhaupt gemessen wird, steht in
-`regeln/worker-panes.md` — die CPU-Zeit eines wartenden Clients ist kein Fortschrittsmaß.
+Erhaltungsnachweis: `references/prozess-hygiene/manifest.json` enthält Reihenfolge und SHA-256
+aller Abschnitte; ihre Verkettung ergibt die vollständige vorherige Datei.

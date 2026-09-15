@@ -8,6 +8,24 @@
   border-bottom: 1px solid var(--linie);
 }
 .ed-tabs:empty { display: none; }
+/* DER GRIFF AM RAND (05.09.2026): ein Winkel rechts in der Tab-Zeile klappt
+   den Editor auf die schmale Leiste zusammen. Eingeklappt bleibt von der
+   Zeile genau diese Leiste -- Winkel, Dateiname, Aenderungspunkt -- und die
+   Buehne darunter hat ihren Platz zurueck. Keine neue Farbe, keine Linie:
+   dieselbe Flaeche wie die Tab-Zeile. */
+.ed-klapp {
+  flex: 0 0 auto; margin-left: auto; width: 26px; height: 26px; align-self: center;
+  display: grid; place-items: center; border-radius: 6px; color: var(--gedaempft);
+}
+.ed-klapp:hover { color: var(--schrift); background: var(--erhoben); }
+.ed-tabs.eingeklappt { border-bottom: 0; }
+.ed-zu {
+  display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0;
+  padding: 3px 8px 3px 4px; color: var(--gedaempft); text-align: left; cursor: pointer;
+}
+.ed-zu:hover { color: var(--schrift); background: var(--erhoben); }
+.ed-zu .ed-klapp { margin-left: 0; }
+.ed-zu-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .ed-tab {
   display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
@@ -16,12 +34,17 @@
   max-width: 220px; white-space: nowrap;
 }
 .ed-tab span:first-child { overflow: hidden; text-overflow: ellipsis; }
-.ed-tab:hover { color: var(--schrift); background: #1e232b; }
-.ed-tab.gewaehlt { color: var(--schrift); background: #222833; box-shadow: inset 0 -2px 0 var(--laeuft); }
+.ed-tab:hover { color: var(--schrift); background: var(--erhoben); }
+.ed-tab.gewaehlt { color: var(--schrift); background: var(--wahl); box-shadow: inset 0 -2px 0 var(--laeuft); }
 .ed-tab-x {
   flex: 0 0 auto; opacity: 0.6; border-radius: 3px; padding: 0 3px;
 }
-.ed-tab-x:hover { opacity: 1; background: #333b48; }
+/* Das X liegt AUF dem Tab und muss sich von dessen Hover-Flaeche noch einmal
+   abheben. Eine eigene Rolle waere fuer diesen einen Ort zu viel: stattdessen
+   die Auswahlflaeche einen Schritt Richtung Schrift, wie main/seiten.ts es
+   beim Knopf-Hover vormacht. Der feste Wert, der hier stand (#333b48), kannte
+   nur das dunkle Thema. */
+.ed-tab-x:hover { opacity: 1; background: color-mix(in srgb, var(--schrift) 15%, var(--wahl)); }
 
 .ed-host { position: relative; flex: 1 1 auto; min-height: 0; min-width: 0; background: var(--grund); }
 /* Der eigentliche Monaco-Mount fuellt den Host; die Notiz liegt daneben, statt
@@ -79,7 +102,7 @@
 }
 .ed-qo-list { overflow-y: auto; }
 .ed-qo-item { padding: 6px 14px; color: var(--gedaempft); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ed-qo-item.gewaehlt { background: #222833; color: var(--schrift); }
+.ed-qo-item.gewaehlt { background: var(--wahl); color: var(--schrift); }
 .ed-qo-leer { padding: 10px 14px; color: var(--gedaempft); }
 
 /* Kurze Rueckmeldung ueber dem Editor -- dieselbe Bildsprache wie #notiz in
@@ -88,7 +111,7 @@
 .ed-notiz {
   position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
   z-index: 5; display: none; width: max-content; max-width: 80%;
-  padding: 5px 12px; border-radius: 6px; background: #222833;
+  padding: 5px 12px; border-radius: 6px; background: var(--wahl);
   border: 1px solid var(--linie); color: var(--schrift); font-size: 12px;
 }
 .ed-notiz.sichtbar { display: block; }

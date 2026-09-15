@@ -79,8 +79,138 @@ done
 CMD="${1:-}"
 PANE="${2:-}"
 
+# ZEITSCHRANKE (2026-08-26): jeder tmux-Aufruf dieses Werkzeugs laeuft durch `timeout`.
+# Grund, gemessen: am 25.08. um 23:26:48 blieb ein `tmux send-keys` dieses Werkzeugs
+# 3 h 42 min in poll() haengen, weil der tmux-Server auf genau diese eine Anfrage nie
+# antwortete (andere Anfragen liefen zur selben Zeit normal durch). Der Aufrufer war die
+# Kontextwache; ihre Poll-Schleife stand seitdem, und mit ihr die Beobachtung von fuenf
+# Panes. Ein Werkzeug, das im Auftrag eines Waechters schreibt, darf nie unbegrenzt
+# warten -- lieber ein gemeldeter Fehlschlag als ein stiller Stillstand beim Aufrufer.
+TM_TIMEOUT="${TM_TIMEOUT:-15}"
+# WELCHE Zeitschranke (GEMESSEN 2026-08-28): `timeout` gehoert auf macOS nicht zum
+# Grundsystem, es kommt aus Homebrews coreutils. Die erste Fassung rief es unbedingt
+# auf -- fehlt es im PATH, scheitert JEDER Schreibversuch mit "timeout: command not
+# found", und das Werkzeug meldet nur noch "send-keys an %N fehlgeschlagen". Aus einer
+# Schutzmassnahme wird so ein Totalausfall. Drei Stufen: `timeout`, `gtimeout`, sonst
+# ein Eigenbau in der Shell, der dieselbe Zusage haelt (nichts haengt unbegrenzt).
+TIMEOUT_BIN=""
+for _tb in timeout gtimeout; do
+    if command -v "$_tb" >/dev/null 2>&1; then TIMEOUT_BIN="$_tb"; break; fi
+done
+
+mit_frist() {   # <sekunden> <programm> [args...] -- Rueckgabe 124 bei Ablauf, wie timeout(1)
+    local sek="$1"; shift
+    local kind i=0 grenze
+    if [ -n "$TIMEOUT_BIN" ]; then
+        command "$TIMEOUT_BIN" -k 2 "$sek" "$@"
+        return $?
+    fi
+    grenze=$(( sek * 10 ))
+    # `<&0` ist NICHT kosmetisch (gemessen 2026-08-28): ein Hintergrundjob bekommt in
+    # einem Skript ohne Jobsteuerung von sich aus /dev/null als Eingabe. Ohne diese
+    # ausdrueckliche Umleitung kam der gepipete Text nie bei tmux an -- `load-buffer -`
+    # legte einen leeren Puffer an und das spaetere `paste-buffer` meldete "no buffer".
+    "$@" <&0 &
+    kind=$!
+    while kill -0 "$kind" 2>/dev/null; do
+        if [ "$i" -ge "$grenze" ]; then
+            kill -TERM "$kind" 2>/dev/null
+            sleep 0.2
+            kill -KILL "$kind" 2>/dev/null
+            wait "$kind" 2>/dev/null
+            return 124
+        fi
+        i=$(( i + 1 ))
+        sleep 0.1
+    done
+    wait "$kind"
+}
+
 tm() {
-    if [ -n "$SOCKET" ]; then tmux -L "$SOCKET" "$@"; else tmux "$@"; fi
+    local rc
+    if [ -n "$SOCKET" ]; then
+        mit_frist "$TM_TIMEOUT" tmux -L "$SOCKET" "$@"
+    else
+        mit_frist "$TM_TIMEOUT" tmux "$@"
+    fi
+    rc=$?
+    if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+        echo "wb-pane-write: 'tmux $1' hat nach ${TM_TIMEOUT}s nicht geantwortet und wurde abgebrochen." >&2
+    fi
+    return $rc
+}
+
+# --- Der zweite Weg: ein Pane ohne tmux (04.09.2026) -----------------------
+#
+# Probe fuer Option E (DIREKTWEG-BEFUND.md, Abschnitt 7): ein Worker, dessen
+# Pseudo-Terminal die Werkbank selbst haelt. Er hat keinen tmux-Pane, seine
+# Kennung heisst `pty:<n>`, und Rolle wie Schreibweg gehen ueber den Steuerkanal
+# der Anwendung.
+#
+# DIE REGEL DARUEBER AENDERT SICH NICHT, und das ist der Punkt: die Rolle wird
+# weiter GEMESSEN statt geglaubt, die Antwort kommt weiter aus einer Quelle, die
+# der Bewachte selbst nicht beschreiben kann, und der Zweifelsfall bleibt
+# fail-closed ein Orchestrator. Nur die Frage geht an eine andere Stelle.
+#
+# WELCHE INSTANZ gefragt wird, entscheidet `AWB_CONTROL_SOCKET` -- genau wie
+# `WB_TMUX_SOCKET` weiter oben entscheidet, welcher tmux-Server gefragt wird,
+# und aus demselben Grund ungefaehrlich: Rollenabfrage UND Schreiben gehen an
+# DENSELBEN Kanal. Wer eine fremde Werkbank angibt, schreibt in deren Panes und
+# kommt an den hiesigen Orchestrator damit nicht heran.
+#
+# DIE SUCHKETTE (2026-09-04, dritter Durchgang von "maschinenschalter"; voller
+# Befund und die Begruendung fuer die drei Kandidaten steht in context-guard,
+# Kommentar "AWB-CTL KETTE" -- hier dieselbe Kette, wortgleich, nur mit
+# `BASH_SOURCE[0]` statt `SELF_PATH` als eigenem Pfad. Kurzfassung: bis heute
+# gab es nur "neben diesem Skript" und "$HOME/.local/bin", und BEIDES ist auf
+# dieser Maschine leer -- `wb-ausrollen` installiert app/bin/awb-ctl nicht.
+_WPW_HIER="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+# ZUERST auf "" setzen, sonst (set -u): bleibt AWB_CTL echt UNGESETZT, weil kein
+# Kandidat greift, bricht jede spaetere bare Referenz (die Warnzeile unten,
+# `ctl()`) das ganze Skript mit "unbound variable" ab.
+AWB_CTL="${AWB_CTL:-}"
+if [ -z "$AWB_CTL" ] || [ ! -f "$AWB_CTL" ]; then
+    for _ac in \
+        "$(dirname "$_WPW_HIER")/app/bin/awb-ctl" \
+        "$_WPW_HIER/awb-ctl" \
+        "$HOME/.local/bin/awb-ctl" \
+        "${WB_AWB_CTL_BUNDLE:-/Applications/Agent Workbench.app/Contents/Resources/app/bin/awb-ctl}"
+    do
+        [ -f "$_ac" ] && { AWB_CTL="$_ac"; break; }
+    done
+fi
+
+ist_pty_pane() { case "$1" in pty:*) return 0 ;; *) return 1 ;; esac; }
+
+# `node` aufgeloest statt ueber den PATH gesucht, aus demselben Grund wie in
+# context-guard: es liegt auf dieser Maschine in /opt/homebrew/bin und nicht im
+# Grundsystem, und ein Aufrufer mit schlankem PATH bekaeme sonst eine stille
+# Ablehnung statt einer Zustellung.
+NODE_BIN="$(command -v node 2>/dev/null || true)"
+for _nb in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node; do
+    [ -n "$NODE_BIN" ] && break
+    [ -x "$_nb" ] && NODE_BIN="$_nb"
+done
+
+# DAS FEHLEN WIRD LAUT (2026-09-04) -- hoechstens EINMAL je Aufruf dieses
+# Werkzeugs, nicht bei jedem der bis zu zwei ctl()-Aufrufe eines einzelnen
+# Schreibversuchs (Rollenpruefung, dann die Aktion selbst). Anders als der
+# Kontext-Guard ist dieses Werkzeug kein Dauerprozess -- "einmal" bedeutet
+# hier "einmal pro Prozess", nicht "einmal pro Poll-Takt".
+_WPW_AWB_CTL_GEWARNT=0
+awb_ctl_fehlt_melden() {
+    [ "$_WPW_AWB_CTL_GEWARNT" = 1 ] && return
+    _WPW_AWB_CTL_GEWARNT=1
+    echo "wb-pane-write: awb-ctl nirgends gefunden (geprueft: Baum ueber diesem Skript, daneben, \$HOME/.local/bin, /Applications/Agent Workbench.app) -- Pane '$PANE' hat keinen tmux-Pane und ist ueber diesen zweiten Weg gerade nicht erreichbar." >&2
+}
+
+ctl() {
+    if [ -z "$AWB_CTL" ] || [ ! -f "$AWB_CTL" ]; then
+        awb_ctl_fehlt_melden
+        return 1
+    fi
+    [ -n "$NODE_BIN" ] || return 1
+    mit_frist "$TM_TIMEOUT" "$NODE_BIN" "$AWB_CTL" "$@"
 }
 
 # --- Herkunft messen -------------------------------------------------------
@@ -222,6 +352,20 @@ ROLLE=""
 ROLLE_QUELLE=""
 rolle_lesen() {
     local r reg=""
+    if ist_pty_pane "$PANE"; then
+        # Die Werkbank haelt diesen Pane selbst, also weiss sie seine Rolle --
+        # sie hat ihn gestartet. Antwortet sie nicht, ist das ein Zweifelsfall,
+        # und ein Zweifelsfall ist ein Orchestrator (Regel 3 im Kopf).
+        r=$(ctl pane-info "$PANE" 2>/dev/null | sed -nE 's/.*"rolle":"([^"]*)".*/\1/p' | head -1)
+        if [ -z "$r" ]; then
+            ROLLE=orchestrator
+            ROLLE_QUELLE="pty-Pane $PANE: der Steuerkanal antwortet nicht, fail-closed als Orchestrator behandelt"
+        else
+            ROLLE="$r"
+            ROLLE_QUELLE="pty-Pane, Steuerkanal sagt rolle=$r"
+        fi
+        return
+    fi
     r=$(tm display -p -t "$PANE" '#{@wb_role}' 2>/dev/null) || r=""
     if [ -n "$ROLLEN_PY" ]; then
         if [ -n "$SOCKET" ]; then
@@ -325,9 +469,29 @@ case "$CMD" in
         # der Datei. Der Kopfkommentar von `tippen` verspricht "wortwoertlich als
         # Tastendruecke" -- das gilt erst mit -l.
         TEXT=$(cat)
-        tm send-keys -l -t "$PANE" "$TEXT" || { echo "wb-pane-write: send-keys an $PANE fehlgeschlagen." >&2; exit 1; }
+        if ist_pty_pane "$PANE"; then
+            # In ein Pseudo-Terminal geschrieben, heisst: die Bytes gehen in den
+            # Master-Deskriptor. Das ist genau das, was `send-keys -l` tut, nur
+            # ohne die Zwischenstufe -- und ohne den Grund fuer `-l`, denn hier
+            # deutet niemand ein Argument als Tastennamen.
+            ctl pane-tippen "$PANE" "$TEXT" >/dev/null \
+                || { echo "wb-pane-write: pane-tippen an $PANE fehlgeschlagen." >&2; exit 1; }
+        else
+            tm send-keys -l -t "$PANE" "$TEXT" || { echo "wb-pane-write: send-keys an $PANE fehlgeschlagen." >&2; exit 1; }
+        fi
         ;;
     einfuegen)
+        if ist_pty_pane "$PANE"; then
+            # Klammer-Einfuegen (bracketed paste) von Hand: derselbe Rahmen, den
+            # `paste-buffer -p` setzt, damit die Ziel-Anwendung EIN Einfuegen
+            # liest statt Zeile fuer Zeile Tastendruecke. Ohne ihn nimmt eine TUI
+            # jede Zeile des Auftragstexts als eigene Absendung -- gemessen und
+            # ausgeschrieben in shell/tests/fake-tui.py.
+            TEXT=$(cat)
+            ctl pane-tippen "$PANE" "$(printf '\033[200~%s\033[201~' "$TEXT")" >/dev/null \
+                || { echo "wb-pane-write: pane-tippen (einfuegen) an $PANE fehlgeschlagen." >&2; exit 1; }
+            exit 0
+        fi
         # Der Weg von pi-worker und dem Editor: kein Zeichen des Textes laeuft je durch
         # die zeilenbasierte tmux-Befehlssyntax, und -p setzt den Klammer-Einfuege-Modus,
         # damit die Ziel-Anwendung EIN Einfuegen liest statt Zeile fuer Zeile Tastendruecke.
@@ -351,7 +515,12 @@ case "$CMD" in
             *[!A-Za-z0-9_^-]*|'')
                 echo "wb-pane-write: unzulaessiger Tastenname '$NAME'." >&2; exit 2 ;;
         esac
-        tm send-keys -t "$PANE" "$NAME" || { echo "wb-pane-write: Taste $NAME an $PANE fehlgeschlagen." >&2; exit 1; }
+        if ist_pty_pane "$PANE"; then
+            ctl pane-taste "$PANE" "$NAME" >/dev/null \
+                || { echo "wb-pane-write: Taste $NAME an $PANE fehlgeschlagen." >&2; exit 1; }
+        else
+            tm send-keys -t "$PANE" "$NAME" || { echo "wb-pane-write: Taste $NAME an $PANE fehlgeschlagen." >&2; exit 1; }
+        fi
         ;;
 esac
 exit 0

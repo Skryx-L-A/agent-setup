@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Eine Welt dieser Maschine auf eine Agent-Maschine bringen (agents_weltumzug.py).
+if [ "${1:-}" = "umziehen" ]; then
+  shift
+  exec python3 "$SCRIPT_DIR/agents_weltumzug.py" "$@"
+fi
+# Eine Welt <host>:/pfad liegt verbindlich auf einer anderen Maschine: der ganze Befehl laeuft dort.
+for arg in "$@"; do
+  case "$arg" in
+    [a-z]*:/*)
+      if python3 "$SCRIPT_DIR/agents_fernweg.py" pruefen welt "$@"; then
+        exec python3 "$SCRIPT_DIR/agents_fernweg.py" ausfuehren welt "$@"
+      fi
+      break ;;
+  esac
+done
+if [ "${1:-}" = "antwort" ]; then
+  # Nach erfolgreichem Schreiben den Traeger der Welt wecken, falls einer konfiguriert ist.
+  status=0
+  python3 "$SCRIPT_DIR/agents_data.py" welt "$@" || status=$?
+  if [ "$status" -eq 0 ]; then
+    python3 "$SCRIPT_DIR/agents_traeger_wecken.py" welt "$@" || true
+  fi
+  exit "$status"
+fi
+exec python3 "$SCRIPT_DIR/agents_data.py" welt "$@"

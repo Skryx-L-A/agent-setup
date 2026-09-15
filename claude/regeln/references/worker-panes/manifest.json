@@ -1,0 +1,32 @@
+{
+  "source": "$HOME/.claude/regeln/worker-panes.md",
+  "sha256": "9b8b879e10ecfeb9735caf75d9c59d17c412392a94f6ea0a980483d6037fbe9b",
+  "bytes": 15039,
+  "sections": [
+    {
+      "file": "00.md",
+      "heading": "regeln/worker-panes.md",
+      "sha256": "e586a3599873a95c0b04b32672a2c0cc8e1438754fc2163567a83c8b983744c4"
+    },
+    {
+      "file": "01.md",
+      "heading": "Pane ansteuern",
+      "sha256": "74f61788d6ed0db3fabe511f7655ffec525392180b7be3352d4f2d06ab43b033"
+    },
+    {
+      "file": "02.md",
+      "heading": "Zustand beurteilen",
+      "sha256": "933eb1834b3f7936683781695887925dcae7250990ef3c6503492a6898f91ee1"
+    },
+    {
+      "file": "03.md",
+      "heading": "Namen und Sichtbarkeit",
+      "sha256": "440b6acadebf812682a568a42b8ac41f904baabc0b683b835ffc8f14f759e6d4"
+    },
+    {
+      "file": "04.md",
+      "heading": "Sessions schliessen",
+      "sha256": "d56afde38d756a3418486ef89b2c71ccf61dcad2f195326a8cfd3db85b78f032"
+    }
+  ]
+}

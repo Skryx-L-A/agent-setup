@@ -14,7 +14,7 @@ and does no harm where there is nothing to replace.
 | Template | Problem it solves |
 |---|---|
 | `launchd/agent-workbench.mcp-basic-memory.plist` | MCP servers started per session pile up. Measured on a working machine: 21 processes holding 3.7 GB for this one tool alone. One shared server over HTTP on localhost instead. Needs the `basic-memory` command, which is not part of this repository. |
-| `launchd/agent-workbench.mcp-playwright.plist` | The same, for the browser MCP: 51 processes, 3.0 GB. Runs headless and isolated, so a shared server never opens a window in front of you. |
+| `launchd/agent-workbench.mcp-playwright.plist` | The same, for the browser MCP: 51 processes, 3.0 GB. Runs headless and isolated, so a shared server never opens a window in front of you. The local browser is the default. `mcp-shared browser browserbase` switches the MCP to a hosted Browserbase session instead, and after every halt the choice falls back to local automatically, so a forgotten switch cannot burn hosted minutes. `wb-browserbase nutzung` shows the monthly browser budget. |
 | `launchd/agent-workbench.mcp-reaper.plist` | Ends the MCP helpers whose session died. A clean exit tidies up after itself; a crash or a hard-closed pane leaves 100 to 200 MB standing per orphan. |
 | `launchd/agent-workbench.limit-survivor.plist` | When an agent hits its rate limit the pane stops and stays stopped. This reads the reset time out of the message and nudges it back to work once that time has passed — not before, not repeatedly. |
 | `launchd/agent-workbench.brain-backup.plist` | Bundles the knowledge base weekly, so a bad git day is not a lost brain. |

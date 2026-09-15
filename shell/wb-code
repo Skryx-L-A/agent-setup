@@ -127,7 +127,7 @@ fi
 # appends its sessionKey, so two sessions of the same folder never collide.
 #
 # Paths use $HOME, never a hardcoded home: ONE script set runs on the Mac
-# ($HOME) and on Peer-Rechner ($HOME). Same target, same behaviour.
+# ($HOME) and on Peer-Rechner (/home/<user>). Same target, same behaviour.
 if [ -n "$KEY" ]; then
   SESSION="$($HOME/.local/bin/wb-state session "$DIR" --key "$KEY")" && STATE_RC=0 || STATE_RC=$?
   STATEFILE="$($HOME/.local/bin/wb-state path "$DIR" --key "$KEY" 2>/dev/null || true)"
@@ -173,7 +173,8 @@ fi
 # FROM the registry entry — the id already says which CLI it belongs to, and having
 # to name both is a trap (the settings harness would silently win and start the
 # wrong CLI). An explicit --harness always wins over this.
-if [ -n "$MODEL_FLAG" ] && [ -z "$HARNESS_FLAG" ]; then
+[ -n "$MODEL" ] || MODEL="$($HOME/.local/bin/wb-state settings get orchestratorModel || true)"
+if [ -n "$MODEL" ] && [ -z "$HARNESS_FLAG" ]; then
   RH="$($HOME/.local/bin/wb-state models get "$MODEL" --field harness 2>/dev/null || true)"
   if [ -n "$RH" ]; then
     HARNESS="$RH"
@@ -188,6 +189,24 @@ fi
 [ -n "$EFFORT" ]  || EFFORT="$($HOME/.local/bin/wb-state settings get orchestratorEffort || true)"
 [ -n "$HARNESS" ] || HARNESS="claude"
 [ -n "$EFFORT" ]  || EFFORT="xhigh"
+# Einen unbekannten expliziten Harness zuerst benennen. Sonst meldet eine noch
+# gespeicherte Modellwahl irrefuehrend nur den Harness-/Modell-Mischmasch.
+case "$HARNESS" in
+  claude|pi) ;;
+  *)
+    if ! $HOME/.local/bin/wb-state harness get "$HARNESS" >/dev/null 2>&1; then
+      echo "wb-code: unbekannter Harness '$HARNESS' (claude|pi oder ein registrierter Adapter)." >&2
+      echo "  In den Settings unter 'Modelle & Harnesses' anlegen." >&2
+      exit 1
+    fi
+    ;;
+esac
+# A registered model has exactly one adapter, including the built-in branches.
+MH="$($HOME/.local/bin/wb-state models get "$MODEL" --field harness 2>/dev/null || true)"
+if [ -n "$MH" ] && [ "$MH" != "$HARNESS" ]; then
+  echo "wb-code: Modell '$MODEL' gehoert zu Harness '$MH', gestartet werden soll '$HARNESS'." >&2
+  exit 1
+fi
 case "$HARNESS" in
   claude)
     [ -n "$MODEL" ] || MODEL="claude-opus-5"
@@ -205,12 +224,18 @@ case "$HARNESS" in
     # V3 (SPEC-V3 C): every REGISTERED harness may drive the orchestrator pane. The
     # claude branch below stays separate on purpose — crash recovery hangs off Claude
     # transcripts and is not bent into a generic adapter.
-    if ! $HOME/.local/bin/wb-state harness get "$HARNESS" >/dev/null 2>&1; then
-      echo "wb-code: unbekannter Harness '$HARNESS' (claude|pi oder ein registrierter Adapter)." >&2
-      echo "  In den Settings unter 'Modelle & Harnesses' anlegen." >&2
-      exit 1
+    # --resume fuer einen Registry-Harness (2026-09-06): frueher hart abgelehnt, jetzt
+    # angenommen, WENN sein resume-Block eine Kennung traegt ({resumeId} in resume.args).
+    # Der Pane baut seine Startzeile ueber wb-harness-run neu; dorthin geht die Kennung
+    # als --resume-args (unten bei REG_CMD), und der Shim haelt sie gegen die Registry.
+    # Ein Harness ohne {resumeId} kann mit einer Kennung nichts anfangen -- klar sagen.
+    if [ -n "$RESUME" ]; then
+      if ! $HOME/.local/bin/wb-state harness get "$HARNESS" 2>/dev/null \
+           | /usr/bin/python3 -c 'import json,sys; a=(json.load(sys.stdin).get("resume") or {}).get("args") or []; sys.exit(0 if any("{resumeId}" in str(x) for x in a) else 1)'; then
+        echo "wb-code: Harness '$HARNESS' nimmt keine Sitzungskennung (--resume) an." >&2
+        exit 1
+      fi
     fi
-    [ -n "$RESUME" ] && { echo "wb-code: --resume gilt nur fuer den Claude-Harness." >&2; exit 1; }
     if [ -z "$MODEL" ]; then
       echo "wb-code: Harness '$HARNESS' braucht ein Modell: --model <id>." >&2
       echo "  Auswahl: wb-state models list --role orchestrator --harness $HARNESS" >&2
@@ -559,6 +584,7 @@ if [ "$HARNESS" = "pi" ]; then
     *)      VORH_ID="$MODEL" ;;
   esac
   VORH_BAUART=""; VORH_MODELL=""; VORH_GEWICHTE_GB=""; VORH_WEG_LABEL=""; VORH_WEG_WARNUNG=""
+  VORH_DRAFTKIND=""; VORH_DRAFTBLOCK=""
   VORH_AN="$($HOME/.local/bin/wb-state settings get orchestratorVorhersage 2>/dev/null || true)"
   VORH_WEG="$($HOME/.local/bin/wb-state settings get orchestratorVorhersageWeg 2>/dev/null || true)"
   if [ "$VORH_AN" = "true" ] && ist_mlx_lokal "$PIPROVIDER"; then
@@ -599,12 +625,22 @@ if gewaehlt:
         warnung = ("Weg %r ist fuer dieses Modell nicht hinterlegt (bekannt: %s) -- "
                    "es gilt der Vorgabeweg." % (gewaehlt, ", ".join(w["id"] for w in wege) or "keiner"))
 gb = weg.get("gewichteGb")
+# draftKind/draftBlockSize (2026-09-13): ohne sie waehlt wb-mlx-server fuer
+# einen Entwerfer-Weg mlx-dspark statt mlx_vlm.server, und der MTP-Kopf
+# scheitert dort mit "config is missing required DeepSpec drafter fields".
+# pi-worker reicht die Felder seit dem 27.08. durch, dieser Zweig bis heute nicht.
+if weg is vorgabe and not wege:
+    dk, dbs = d.get("draftKind"), d.get("draftBlockSize")
+else:
+    dk, dbs = weg.get("draftKind"), weg.get("draftBlockSize")
 print("\t".join([
     weg.get("bauart") or "",
     weg.get("modell") or "",
     "" if gb is None else str(gb),
     weg.get("label") or weg.get("id") or "",
     warnung,
+    dk or "",
+    "" if dbs is None else str(dbs),
 ]))
 ' "$VORH_WEG" 2>/dev/null)"
       VORH_BAUART="$(printf '%s' "$VORH_FELDER" | cut -f1)"
@@ -612,6 +648,8 @@ print("\t".join([
       VORH_GEWICHTE_GB="$(printf '%s' "$VORH_FELDER" | cut -f3)"
       VORH_WEG_LABEL="$(printf '%s' "$VORH_FELDER" | cut -f4)"
       VORH_WEG_WARNUNG="$(printf '%s' "$VORH_FELDER" | cut -f5)"
+      VORH_DRAFTKIND="$(printf '%s' "$VORH_FELDER" | cut -f6)"
+      VORH_DRAFTBLOCK="$(printf '%s' "$VORH_FELDER" | cut -f7)"
     fi
     [ -n "$VORH_WEG_WARNUNG" ] && echo "wb-code: $VORH_WEG_WARNUNG" >&2
     if [ -n "$VORH_BAUART" ]; then
@@ -767,6 +805,8 @@ print("\t".join([
     MLXAUS="$(WB_MLX_SERVER_VORHERSAGE_BAUART="$VORH_BAUART" \
       WB_MLX_SERVER_VORHERSAGE_MODELL="$VORH_MODELL" \
       WB_MLX_SERVER_VORHERSAGE_GEWICHTE_GB="$VORH_GEWICHTE_GB" \
+      WB_MLX_SERVER_VORHERSAGE_DRAFTKIND="$VORH_DRAFTKIND" \
+      WB_MLX_SERVER_VORHERSAGE_DRAFTBLOCKSIZE="$VORH_DRAFTBLOCK" \
       "$HOME/.local/bin/wb-mlx-server" ensure "$PIMODEL" --kontext "$KSTUFE" \
         "${GEFAHR_ARGS[@]+"${GEFAHR_ARGS[@]}"}")" || {
       echo "wb-code: 'wb-mlx-server ensure' fuer Kontext $KSTUFE fehlgeschlagen — kein Start." >&2
@@ -837,7 +877,7 @@ elif [ "$HARNESS" != "claude" ]; then
   if [ -n "$MENSCH" ]; then
     CAP="$($HOME/.local/bin/wb-state models cap "$MODEL" 2>/dev/null | cut -f1)"
     if [ -n "$CAP" ] && [ "$CAP" != "-" ] \
-       && [ "$($HOME/.local/bin/wb-state models effort "$MODEL" --effort "$CAP" 2>/dev/null)" != "$EFFORT" ]; then
+       && ! "$HOME/.local/bin/wb-state" models effort "$MODEL" --effort "$EFFORT" >/dev/null 2>&1; then
       {
         echo "wb-code: '--mensch' geht auf Harness '$HARNESS' nicht ueber den Deckel hinaus."
         echo "  Der Pane dieses Harness baut seine Startzeile selbst neu und prueft dabei erneut;"
@@ -851,6 +891,18 @@ elif [ "$HARNESS" != "claude" ]; then
   $HOME/.local/bin/wb-state models resolve "$MODEL" --role orchestrator \
       --effort "$EFFORT" --dir "$DIR" --name "$ORCHNAME" >/dev/null || exit 1
   REG_CMD="exec $HOME/.local/bin/wb-harness-run --model $(printf %q "$MODEL") --role orchestrator --effort $(printf %q "$EFFORT") --dir $(printf %q "$DIR") --name $(printf %q "$ORCHNAME")"
+  # Fortsetzen (2026-09-06): die Kennung geht als --resume-args an wb-harness-run, das
+  # sie gegen den resume-Block der Registry haelt, bevor es sie in die innere Startzeile
+  # einsetzt. Gebaut wird die Flag-Folge aus resume.args mit {resumeId} -> $RESUME,
+  # damit hier keine zweite Fassung der Vorlage entsteht -- die eine steht in der Registry.
+  if [ -n "$RESUME" ]; then
+    REG_RESUME="$($HOME/.local/bin/wb-state harness get "$HARNESS" 2>/dev/null \
+      | RID="$RESUME" /usr/bin/python3 -c 'import json,os,shlex,sys
+a=(json.load(sys.stdin).get("resume") or {}).get("args") or []
+rid=os.environ["RID"]
+print(shlex.join(rid if x=="{resumeId}" else str(x) for x in a))')"
+    [ -n "$REG_RESUME" ] && REG_CMD="$REG_CMD --resume-args $(printf %q "$REG_RESUME")"
+  fi
   CLAUDE_CMD="bash -lc $(printf %q "$REG_CMD")"
 else
   # No explicit --resume: pick up the conversation this session was running when

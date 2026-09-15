@@ -1,0 +1,27 @@
+#!/bin/bash
+# Startet die Agent Workbench (Electron) sichtbar -- der Linux-Weg zum
+# Programmsymbol, Pendant zu app/tools/buendel-bauen.sh (das nur macOS baut).
+#
+# Warum --show: das Fenster geht ausschliesslich mit dieser Angabe auf
+# (app/src/main/main.ts, Kopf). Ein Klick auf das Symbol IST die Absicht eines
+# Menschen; ein Ereignis oder ein Steuerbefehl kommt hier nie an.
+#
+# Der Quelltext wird NICHT kopiert: gestartet wird immer der Stand in
+# ~/AI/claude-workbench/app. Fehlt das Bauergebnis, wird einmal gebaut.
+set -euo pipefail
+
+wurzel="$HOME/AI/claude-workbench/app"
+cd "$wurzel"
+
+if [ ! -f dist/main/main.js ]; then
+  npm run build >/dev/null
+fi
+
+# Schon offen? Dann nicht ein zweites Mal starten -- ein zweiter Hauptprozess
+# faende den Steuersocket belegt.
+if pgrep -f "$wurzel/node_modules/electron/dist/electron .*--show" >/dev/null 2>&1; then
+  echo "Agent Workbench laeuft bereits." >&2
+  exit 0
+fi
+
+exec ./node_modules/electron/dist/electron . --show "$@"

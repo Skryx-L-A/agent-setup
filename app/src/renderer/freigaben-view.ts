@@ -11,6 +11,8 @@
 //                        beantworten. Der Knopf hier springt dorthin.
 import './freigaben-view.css';
 import { registriere, umschalten } from './flaeche';
+import { t } from './texte';
+import { kurzerPfad } from './kurzpfad';
 
 interface RequestEntry {
   path: string; ts: string; parent: string; parentModel: string;
@@ -40,10 +42,10 @@ function seitHer(ts: string): string {
 function seitHerMs(dann: number): string {
   if (!dann) return '-';
   const min = Math.max(0, Math.round((Date.now() - dann) / 60000));
-  if (min < 1) return 'gerade eben';
-  if (min < 60) return `seit ${min} Min.`;
+  if (min < 1) return t('zeit.geradeEben');
+  if (min < 60) return t('zeit.minuten', { n: min });
   const std = Math.floor(min / 60);
-  return `seit ${std} Std. ${min % 60} Min.`;
+  return t('zeit.stundenMinuten', { std, min: min % 60 });
 }
 
 /**
@@ -71,6 +73,27 @@ export function freigabenUiState(): {
   };
 }
 
+/**
+ * DIE OFFENEN ANTRAEGE ALS AUFGABEN-TABELLE (08.09.2026, fuer das Agents-Blatt).
+ *
+ * Ein Antrag traegt den Auftragstext des Workers, auf den er zielt -- und das
+ * ist die EINZIGE Stelle, an der dieses Fenster ihn kennt, ohne eine Datei zu
+ * lesen. Ein Worker ohne offenen Antrag hat hier deshalb keinen Eintrag; das
+ * Agents-Blatt laesst das Feld dann leer, statt etwas zu behaupten.
+ */
+/**
+ * Die zuletzt empfangene Nutzlast. Sie steht im MODULRAUM und nicht mehr in
+ * `initFreigabenView`, seit `offeneAuftraege()` sie von aussen liest -- es
+ * bleibt EINE Fassung, die der Kanal fuellt und die beide lesen.
+ */
+let letzte: FreigabenPayload = { requests: [], guardBlocks: [], guardLog: [] };
+
+export function offeneAuftraege(): Map<string, string> {
+  const raus = new Map<string, string>();
+  for (const r of letzte.requests) if (r.childName) raus.set(r.childName, r.task);
+  return raus;
+}
+
 export function initFreigabenView(): void {
   const knopf = document.querySelector<HTMLButtonElement>('.knopf[data-tot="freigaben"]');
   if (!knopf) return;
@@ -81,34 +104,41 @@ export function initFreigabenView(): void {
   panel.className = 'fg-panel';
   panel.innerHTML = `
     <div class="fg-kopf">
-      <div class="fg-titel">Freigaben</div>
-      <button type="button" class="fg-schliessen" title="Schliessen">&times;</button>
+      <div class="fg-titel" data-text="panel.freigaben.titel"></div>
+      <button type="button" class="fg-schliessen" data-text-title="wort.schliessen">&times;</button>
     </div>
     <div class="fg-inhalt">
       <div class="fg-abschnitt" data-abschnitt="blocks">
-        <div class="fg-abschnitt-titel">Angehaltene Worker</div>
+        <div class="fg-abschnitt-titel" data-text="panel.freigaben.blocks"></div>
         <div class="fg-liste" data-liste="blocks"></div>
       </div>
       <div class="fg-abschnitt" data-abschnitt="verlauf">
-        <div class="fg-abschnitt-titel">Guard-Verlauf</div>
-        <div class="fg-hinweis">Welche Muster WIEDERHOLT anschlagen -- gruppiert, nicht nur der laufende Block oben (V17).</div>
+        <div class="fg-abschnitt-titel" data-text="panel.freigaben.verlauf"></div>
+        <div class="fg-hinweis" data-text="panel.freigaben.verlauf.hinweis"></div>
         <div class="fg-liste" data-liste="verlauf"></div>
       </div>
       <div class="fg-abschnitt" data-abschnitt="requests">
-        <div class="fg-abschnitt-titel">Antraege</div>
+        <div class="fg-abschnitt-titel" data-text="panel.freigaben.antraege"></div>
         <div class="fg-liste" data-liste="requests"></div>
       </div>
     </div>`;
   // Die Schublade haengt in der Reihe zwischen Sessionleiste und Buehne,
   // nicht am Rumpf: nur dort nimmt sie Platz weg, statt sich darueber zu
   // legen. Fehlt der Platzhalter, bleibt der Rumpf die Notloesung.
-  (document.getElementById('schublade') ?? document.body).appendChild(panel);
+  // NEUE STELLE (03.09.2026), gleiche Logik. Bis zum Neubau lag dieses Blatt
+  // im Schubladenplatz neben den drei anderen. Die Freigaben sind von dort
+  // WEGGEZOGEN: eine offene Freigabe soll an jedem Ort des Programms sichtbar
+  // sein, und ein Blatt in einer zuklappbaren Leiste, die ohnehin nur eines von
+  // dreien zeigt, kann das nicht halten. Die Entscheidung selbst faellt jetzt in
+  // der Leiste quer oben; DIESES Blatt bleibt der vollstaendige Posteingang mit
+  // Antraegen, angehaltenen Workern und dem Verlauf, und es geht als Blatt ueber
+  // der Flaeche auf, wenn man das Abzeichen oben anklickt.
+  (document.getElementById('freigaben-platz') ?? document.body).appendChild(panel);
 
   const listeBlocks = panel.querySelector<HTMLDivElement>('[data-liste="blocks"]')!;
   const listeVerlauf = panel.querySelector<HTMLDivElement>('[data-liste="verlauf"]')!;
   const listeRequests = panel.querySelector<HTMLDivElement>('[data-liste="requests"]')!;
 
-  let letzte: FreigabenPayload = { requests: [], guardBlocks: [], guardLog: [] };
   /** Die zuletzt GEZEICHNETE Nutzlast als Zeichenkette -- siehe `onFreigaben` unten. */
   let letzteSignatur = '';
   let offen = false;
@@ -228,24 +258,34 @@ export function initFreigabenView(): void {
   function zeileBlock(b: GuardBlockEntry): HTMLDivElement {
     const el = document.createElement('div');
     el.className = b.wartet ? 'fg-eintrag fg-block fg-block-wartet' : 'fg-eintrag fg-block';
-    const wer = b.unbekannterPane ? `Pane ${b.pane} (keiner bekannten Session zugeordnet)` : b.workerName;
+    // b.workerName, b.sessionName, b.machine und b.guard stammen aus einer
+    // JSON-Datei, die ein WORKER schreibt (bash-guard.py) -- fremder Text, der
+    // ueber Repo, Webseite oder Fehlermeldung eingeschleustes Markup tragen
+    // kann. Deshalb Wortlaut, nie Markup: leere Elemente im festen Geruest,
+    // Inhalt erst danach per `textContent`.
     el.innerHTML = `
       <div class="fg-eintrag-kopf">
-        <span class="fg-wer">${wer}</span>
+        <span class="fg-wer"></span>
         <span class="fg-wann">${seitHer(b.ts)}</span>
       </div>
-      <div class="fg-zusatz">${b.sessionName ? `${b.sessionName} &middot; ` : ''}${b.machine ? `${b.machine} &middot; ` : ''}Guard: ${b.guard}</div>
+      <div class="fg-zusatz"></div>
       <div class="fg-muster"></div>
       <div class="fg-grund"></div>
       <div class="fg-befehl"></div>
       <div class="fg-verzeichnis"></div>
       <div class="fg-aktionen"></div>
       <div class="fg-ergebnis"></div>`;
+    el.querySelector('.fg-wer')!.textContent = b.unbekannterPane
+      ? t('panel.freigaben.ohneSitzung', { pane: b.pane })
+      : b.workerName;
+    el.querySelector('.fg-zusatz')!.textContent =
+      [b.sessionName, b.machine, `Guard: ${b.guard}`].filter(Boolean).join(' · ');
     wannBinden(el.querySelector<HTMLSpanElement>('.fg-wann')!, Date.parse(b.ts));
     const musterZeile = el.querySelector<HTMLDivElement>('.fg-muster')!;
     const grundZeile = el.querySelector<HTMLDivElement>('.fg-grund')!;
     if (b.wartet) {
-      musterZeile.textContent = `Wartet auf Freigabe · Muster: ${b.muster}${b.musterGrund ? ` — ${b.musterGrund}` : ''}`;
+      musterZeile.textContent = t('panel.freigaben.wartet', { muster: b.muster })
+        + (b.musterGrund ? ` — ${b.musterGrund}` : '');
       // Der volle Ablehnungstext gehoert dem WORKER -- er steht in dessen
       // Pane und sagt ihm, dass er wartet und den Befehl wiederholen soll.
       // Hier liest ihn ein Mensch, der entscheiden will; fuer ihn ist alles
@@ -258,14 +298,17 @@ export function initFreigabenView(): void {
       grundZeile.textContent = b.reason;
     }
     el.querySelector('.fg-befehl')!.textContent = b.command;
-    el.querySelector('.fg-verzeichnis')!.textContent = b.cwd;
+    // Mit `~` gekuerzt (Electron-Befund 2) -- der volle Pfad steht im
+    // Hilfeschildchen und in der Sitzungskarte.
+    el.querySelector('.fg-verzeichnis')!.textContent = kurzerPfad(b.cwd);
+    el.querySelector<HTMLElement>('.fg-verzeichnis')!.title = b.cwd;
     const aktionen = el.querySelector('.fg-aktionen')!;
     const ergebnis = el.querySelector<HTMLDivElement>('.fg-ergebnis')!;
     if (!b.unbekannterPane) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'fg-btn';
-      btn.textContent = 'Pane zeigen';
+      btn.textContent = t('panel.freigaben.paneZeigen');
       btn.addEventListener('click', () => {
         window.awbBridge.bedienung('select', b.sessionId);
         window.awbBridge.bedienung('show-pane', b.pane);
@@ -283,19 +326,18 @@ export function initFreigabenView(): void {
       // FREIWILLIG seit dem 19.08.: das Feld bleibt, der Zwang faellt. Steht
       // etwas darin, landet es im Verlauf; steht nichts darin, wird trotzdem
       // entschieden.
-      label.textContent = 'Begruendung (freiwillig)';
+      label.textContent = t('panel.freigaben.grund');
       const eingabe = document.createElement('input');
       eingabe.type = 'text';
       eingabe.className = 'fg-grund-eingabe';
-      eingabe.placeholder = 'optional -- ein Satz genuegt';
+      eingabe.placeholder = t('panel.freigaben.grund.platzhalter');
       label.appendChild(eingabe);
       feldBinden(eingabe, ergebnis, kennung);
       el.insertBefore(label, aktionen);
 
       const hinweis = document.createElement('div');
       hinweis.className = 'fg-hinweis';
-      hinweis.textContent = 'Annehmen gilt fuer genau einen Durchlauf dieses Befehls und ist danach '
-        + 'verbraucht. Der Worker fuehrt ihn selbst noch einmal aus; hier startet nichts.';
+      hinweis.textContent = t('panel.freigaben.einmalig');
       el.insertBefore(hinweis, label);
 
       // `echt` ist `isTrusted` des Klicks und wird mitgeschickt, nicht hier
@@ -312,18 +354,18 @@ export function initFreigabenView(): void {
         // der Eintrag nach der Auffrischung stehen, hat es nicht geklappt --
         // der Grund steht dann im Verlauf darunter.
         ergebnisSetzen(ergebnis, kennung, aktion === 'approve'
-          ? 'Freigabe erteilt -- der Eintrag verschwindet, sobald sie gilt; der Worker wiederholt den Befehl selbst.'
-          : 'Abgelehnt -- der Befehl bleibt angehalten.');
+          ? t('panel.freigaben.erteilt')
+          : t('panel.freigaben.abgelehnt'));
       };
       const an = document.createElement('button');
       an.type = 'button';
       an.className = 'fg-btn fg-btn-an';
-      an.textContent = 'Annehmen';
+      an.textContent = t('panel.freigaben.annehmen');
       an.addEventListener('click', (ev) => entscheiden('approve', ev.isTrusted));
       const ab = document.createElement('button');
       ab.type = 'button';
       ab.className = 'fg-btn fg-btn-ab';
-      ab.textContent = 'Ablehnen';
+      ab.textContent = t('panel.freigaben.ablehnen');
       // Ablehnen braucht keinen Nachweis: es nimmt nichts weg, es laesst den
       // Befehl angehalten. Deshalb hier bewusst ohne `isTrusted`-Bedingung.
       ab.addEventListener('click', (ev) => entscheiden('reject', ev.isTrusted));
@@ -337,13 +379,16 @@ export function initFreigabenView(): void {
   function zeileVerlauf(g: GuardLogGruppe): HTMLDivElement {
     const el = document.createElement('div');
     el.className = 'fg-eintrag fg-verlauf';
+    // g.guard ist der Name aus dem Ablehnungs-Datensatz -- fremder Text, siehe
+    // zeileBlock oben.
     el.innerHTML = `
       <div class="fg-eintrag-kopf">
-        <span class="fg-wer">${g.guard}</span>
-        <span class="fg-wann">${g.anzahl}&times; &middot; zuletzt ${seitHerMs(g.letzteMs)}</span>
+        <span class="fg-wer"></span>
+        <span class="fg-wann">${g.anzahl}× · zuletzt ${seitHerMs(g.letzteMs)}</span>
       </div>
       <div class="fg-grund"></div>
       <div class="fg-befehl"></div>`;
+    el.querySelector('.fg-wer')!.textContent = g.guard;
     wannBinden(el.querySelector<HTMLSpanElement>('.fg-wann')!, g.letzteMs, `${g.anzahl}× · zuletzt `);
     el.querySelector('.fg-grund')!.textContent = g.reason;
     el.querySelector('.fg-befehl')!.textContent = g.letzterBefehl;
@@ -354,26 +399,30 @@ export function initFreigabenView(): void {
     const el = document.createElement('div');
     el.className = 'fg-eintrag fg-antrag';
     const modell = r.childEffort ? `${r.childModel}:${r.childEffort}` : r.childModel;
+    // r.parent, r.childName, modell und r.dir kommen aus dem Antrag selbst --
+    // ein Worker schreibt diese Datei, siehe zeileBlock oben.
     el.innerHTML = `
       <div class="fg-eintrag-kopf">
-        <span class="fg-wer">${r.parent} &rarr; ${r.childName}</span>
+        <span class="fg-wer"></span>
         <span class="fg-wann">${seitHer(r.ts)}</span>
       </div>
-      <div class="fg-zusatz">${modell} &middot; ${r.dir}</div>
+      <div class="fg-zusatz"></div>
       <div class="fg-feld"><b>Aufgabe:</b> <span></span></div>
       <div class="fg-feld"><b>Warum abtrennbar:</b> <span></span></div>
       <div class="fg-feld"><b>Fertig-Kriterium:</b> <span></span></div>
       <div class="fg-feld"><b>Dateien:</b> <span></span></div>
       <div class="fg-feld"><b>Umfang:</b> <span></span></div>
-      <div class="fg-hinweis">Annehmen heisst: der Orchestrator startet diesen Worker von Hand. Es spawnt hier nichts von selbst.</div>
-      <label class="fg-grundfeld">Begruendung (freiwillig)
-        <input type="text" class="fg-grund-eingabe" placeholder="optional -- ein Satz genuegt" />
+      <div class="fg-hinweis">${t('panel.freigaben.antragHinweis')}</div>
+      <label class="fg-grundfeld">${t('panel.freigaben.grund')}
+        <input type="text" class="fg-grund-eingabe" placeholder="${t('panel.freigaben.grund.platzhalter')}" />
       </label>
       <div class="fg-aktionen">
-        <button type="button" class="fg-btn fg-btn-an">Annehmen</button>
-        <button type="button" class="fg-btn fg-btn-ab">Ablehnen</button>
+        <button type="button" class="fg-btn fg-btn-an">${t('panel.freigaben.annehmen')}</button>
+        <button type="button" class="fg-btn fg-btn-ab">${t('panel.freigaben.ablehnen')}</button>
       </div>
       <div class="fg-ergebnis"></div>`;
+    el.querySelector('.fg-wer')!.textContent = `${r.parent} → ${r.childName}`;
+    el.querySelector('.fg-zusatz')!.textContent = `${modell} · ${kurzerPfad(r.dir)}`;
     wannBinden(el.querySelector<HTMLSpanElement>('.fg-wann')!, Date.parse(r.ts));
     const felder = el.querySelectorAll('.fg-feld span');
     felder[0].textContent = r.task;
@@ -390,7 +439,7 @@ export function initFreigabenView(): void {
       const grund = eingabe.value.trim();
       window.awbBridge.bedienung('freigaben-entscheiden', { path: r.path, action: aktion, reason: grund });
       ergebnisSetzen(ergebnis, r.path,
-        aktion === 'approve' ? 'Angenommen -- wird neu geladen …' : 'Abgelehnt -- wird neu geladen …');
+        aktion === 'approve' ? t('panel.freigaben.angenommenLaedt') : t('panel.freigaben.abgelehntLaedt'));
     };
     el.querySelector('.fg-btn-an')!.addEventListener('click', () => entscheiden('approve'));
     el.querySelector('.fg-btn-ab')!.addEventListener('click', () => entscheiden('reject'));
@@ -408,7 +457,7 @@ export function initFreigabenView(): void {
     if (!letzte.guardBlocks.length) {
       const leer = document.createElement('div');
       leer.className = 'fg-leer';
-      leer.textContent = 'Kein Worker wartet gerade auf eine Guard-Entscheidung.';
+      leer.textContent = t('panel.freigaben.keinBlock');
       listeBlocks.appendChild(leer);
     } else {
       for (const b of letzte.guardBlocks) listeBlocks.appendChild(zeileBlock(b));
@@ -418,7 +467,7 @@ export function initFreigabenView(): void {
     if (!letzte.guardLog.length) {
       const leer = document.createElement('div');
       leer.className = 'fg-leer';
-      leer.textContent = 'Noch keine Ablehnung aufgezeichnet.';
+      leer.textContent = t('panel.freigaben.keinVerlauf');
       listeVerlauf.appendChild(leer);
     } else {
       for (const g of letzte.guardLog) listeVerlauf.appendChild(zeileVerlauf(g));
@@ -428,7 +477,7 @@ export function initFreigabenView(): void {
     if (!letzte.requests.length) {
       const leer = document.createElement('div');
       leer.className = 'fg-leer';
-      leer.textContent = 'Kein offener Antrag.';
+      leer.textContent = t('panel.freigaben.keinAntrag');
       listeRequests.appendChild(leer);
     } else {
       for (const r of letzte.requests) listeRequests.appendChild(zeileRequest(r));

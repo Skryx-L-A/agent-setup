@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Eine Welt <host>:/pfad liegt verbindlich auf einer anderen Maschine: der ganze Befehl laeuft dort.
+for arg in "$@"; do
+  case "$arg" in
+    [a-z]*:/*)
+      if python3 "$SCRIPT_DIR/agents_fernweg.py" pruefen kanal "$@"; then
+        exec python3 "$SCRIPT_DIR/agents_fernweg.py" ausfuehren kanal "$@"
+      fi
+      break ;;
+  esac
+done
+if [ "${1:-}" = "senden" ]; then
+  # Nach erfolgreichem Schreiben den Traeger der Welt wecken, falls einer konfiguriert ist.
+  status=0
+  python3 "$SCRIPT_DIR/agents_data.py" kanal "$@" || status=$?
+  if [ "$status" -eq 0 ]; then
+    python3 "$SCRIPT_DIR/agents_traeger_wecken.py" kanal "$@" || true
+  fi
+  exit "$status"
+fi
+exec python3 "$SCRIPT_DIR/agents_data.py" kanal "$@"

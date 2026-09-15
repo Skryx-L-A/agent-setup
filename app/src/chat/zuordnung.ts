@@ -151,7 +151,7 @@ export function kandidatWaehlen(
     if (zweiteZaehlt) {
       return {
         kandidat: null,
-        grund: 'Zwei lebende Sitzungen in diesem Ordner — welche zu diesem Pane gehoert, ist von aussen nicht zu entscheiden.',
+        grund: 'Zwei lebende Sitzungen in diesem Ordner – welche zu diesem Pane gehoert, ist von aussen nicht zu entscheiden.',
         herkunft: '',
       };
     }

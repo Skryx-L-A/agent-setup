@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+"""wb-companion — kleiner Client für den Companion-Daemon: die Meldung einer
+Werkbank-Aufgabe an ihn (Bau-Schritt 3 des Agents-Features, docs/AGENTS-PLAN.md,
+Abschnitt 4 „Kommunikation zwischen Agenten", Abschnitt 6, Abschnitt 9 Punkt 3,
+Anhang „Companion-Socket"). Aufrufer ist `wb-traeger` (`melden()`), nicht der
+Mensch.
+
+(`shell/wb-companion`) und trägt diese Zeile, damit `wb-consistency` das nicht
+als Lücke meldet.
+
+DAS PROTOKOLL (gelesen aus ~/AI/companion/app/protocol/schema/*.json und
+~/AI/companion/app/crates/companion-protocol/src/message.rs, Stand 10.09.2026 —
+nur gelesen, dort steht die Wahrheit, hier nur eine Kopie des Nötigen). Eine
+Zeile je JSON-Objekt über einen Unix-Socket: `hello` mit Token und Rolle
+`agent` (die Rolle folgt beim Daemon aus dem Token, nicht aus einem Feld),
+dann `{"type":"request","id":<n>,"request":"…", …}`, Antwort
+`{"type":"response","id":<n>,"status":"ok"|"error","payload":…}`. Jede
+Sitzungskennung ist nur INNERHALB der Verbindung gültig, die sie zuerst per
+`report_status` gemeldet hat (`own_session` beim Daemon prüft den Namensraum
+der Verbindung, nicht die rohe Kennung) — deshalb schicken `frage` und
+`bericht` zuerst ihren eigenen `report_status` und erst danach `ask_question`
+bzw. `report`, in derselben Verbindung, statt eine gehaltene Sitzung
+vorauszusetzen.
+
+SELF_REPORTED, GEPRÜFT (10.09., gegen den echten Quelltext, nicht behauptet):
+`Request::ReportStatus`, `Request::AskQuestion` und `Request::Report` rufen im
+Daemon `AdapterEvent::for_session(…).self_reported()` unabhängig davon, ob die
+Verbindung neu oder alt ist — das Feld hängt an der Rolle des Absenders und an
+der Anfrageart, NICHT an einer gehaltenen Verbindung. Der Satz im Plan „der
+Träger hält je Aufgabe eine Verbindung … damit self_reported gilt" trifft auf
+den heutigen Code nicht zu; dieses Werkzeug hält deshalb keine Verbindung
+offen, wie es der Auftrag verlangt (ein Aufruf je Ereignis).
+
+ZUSÄTZLICHE FELDER (`task_state`, `task_reason`, `task_title`, `task_wake_at`,
+`task_machine`) reitet dieses Werkzeug additiv im `status`-Feld mit; der
+heutige Daemon (vor dem Merge von companion3) hat keine `deny_unknown_fields`
+auf `SessionStatus`, verwirft sie also nach dem serde-Vorgabeverhalten still —
+gemessen im Quelltext (`companion-protocol/src/session.rs`), nicht behauptet.
+
+TOKEN, WIE ES DIE CLI TUT (companion-cli/src/main.rs, `human_token()`):
+`<config_dir>/tokens.json`, Feld `agent` statt `human`. `config_dir` folgt
+`companion-core/src/paths.rs`: `$COMPANION_CONFIG_DIR`, sonst macOS
+`~/Library/Application Support/companion`, sonst `$XDG_CONFIG_HOME/companion`,
+sonst `~/.config/companion`. Der Socket folgt derselben Datei: `$COMPANION_SOCKET`,
+sonst `$XDG_RUNTIME_DIR/companion/companion.sock`, sonst `<config_dir>/companion.sock`.
+Das Token wird nie ausgegeben, auch nicht mit `--json`.
+
+AUFRUFE:
+  wb-companion status <auftrag-id> --stand <s> [--grund <text>]
+                       [--titel <text>] [--weckzeit <iso>] [--maschine <name>]
+      `s` eines der neuen additiven Stände (snake_case): offen, laeuft,
+      steckt, pausiert_kontingent, pausiert_nacht, pausiert_weckzeit,
+      wartet_auf_nutzer, zur_abnahme, aufgegeben, aufgegeben_modell,
+      abgenommen, verworfen.
+  wb-companion frage <auftrag-id> --text <text> [--grund <text>]
+                     [--titel <text>] [--weckzeit <iso>] [--maschine <name>]
+      Sendet zuerst den eigenen Stand (wartet_auf_nutzer), dann
+      `ask_question`; `question_id` = <auftrag-id>-<Zeitstempel>.
+  wb-companion bericht <auftrag-id> --pfad <ergebnispfad> --text <text>
+                       [--grund <text>] [--titel <text>] [--weckzeit <iso>]
+                       [--maschine <name>]
+      Sendet zuerst den eigenen Stand (zur_abnahme), dann `report`.
+  wb-companion sende <json>
+      Allgemeiner Weg: `<json>` sind die anfrage-eigenen Felder (ohne `type`,
+      `id`), z. B. '{"request":"report_status","status":{…}}'. Für Tests und
+      Fälle, die die drei Unterbefehle oben nicht decken.
+
+Jeder Unterbefehl: `--json` gibt die Antwort des Daemons aus (nie das Token).
+Exit 0 nur bei `status:"ok"`, 2 bei `status:"error"` oder `type:"rejected"`,
+3 ohne Verbindung (kein Socket, keine Antwort, kein lesbares Token).
+
+VERTRAGSGRENZEN (wie der Daemon, `check_task_fields`), geprüft vor dem Socket:
+Die Auftragskennung muss `YYYYMMDD-<slug>[-<n>]` sein, wie wb-aufgabe sie macht
+(`^\\d{8}-[a-z0-9]+(-[a-z0-9]+)*$`, gültiges Datum, Slug höchstens 40 Zeichen,
+alles höchstens 64), sonst Exit 2 ohne Verbindung. Titel, Grund und Maschine
+verlieren Steuer- und unsichtbare Zeichen, ihr Leerraum wird zusammengezogen,
+dann werden sie auf 200, 500 bzw. 64 Zeichen gekürzt (der Daemon würde sie
+ablehnen). Die Weckzeit geht als RFC 3339 hinaus; eine Zeit ohne Zone gilt als
+UTC, eine unlesbare wird weggelassen. `sende` hält ein report_status mit
+task_*-Feldern an dieselbe Grenze.
+
+TESTHAKEN: `WB_COMPANION_SOCKET` überschreibt den Socket-Pfad; `--base <dir>`
+setzt `$HOME` für die Token-/Socket-Herleitung nach der Vorgabe-Regel (wirkt
+nur, wenn weder `WB_COMPANION_SOCKET` noch `COMPANION_CONFIG_DIR`/
+`COMPANION_SOCKET` gesetzt sind). Kein Tippen, kein `send_to_session`, kein
+Zugriff auf einen echten Companion-Daemon aus diesem Werkzeug selbst — das
+prüft nur ein Testlauf mit einem Schirm-Daemon.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import socket
+import sys
+
+PROTOCOL_VERSION = 2  # companion-protocol/src/lib.rs PROTOCOL_VERSION, Stand 10.09.2026
+CLIENT_NAME = "wb-companion"
+VERBINDUNGSFRIST_S = 10.0
+
+TASK_STAENDE = (
+    "offen", "laeuft", "steckt",
+    "pausiert_kontingent", "pausiert_nacht", "pausiert_weckzeit",
+    "wartet_auf_nutzer", "zur_abnahme",
+    "aufgegeben", "aufgegeben_modell",
+    "abgenommen", "verworfen",
+)
+
+# Grobe Abbildung auf SessionState (companion-protocol/src/session.rs): 'pausiert'
+# gilt bewusst NICHT als 'waiting' (Anhang „Companion-Socket": „damit 'pausiert'
+# nicht als waiting gilt"), 'zur_abnahme' ist ein fertiger Zug, keine offene Frage.
+SESSION_STATE_AUS_TASK_STATE = {
+    "offen": "idle",
+    "laeuft": "busy",
+    "steckt": "error",
+    "pausiert_kontingent": "idle",
+    "pausiert_nacht": "idle",
+    "pausiert_weckzeit": "idle",
+    "wartet_auf_nutzer": "waiting",
+    "zur_abnahme": "done",
+    "aufgegeben": "done",
+    "aufgegeben_modell": "done",
+    "abgenommen": "done",
+    "verworfen": "done",
+}
+
+
+class VerbindungsFehler(Exception):
+    """Kein Socket, Verbindung weg, keine lesbare Antwort — Exit 3."""
+
+
+class Abgelehnt(Exception):
+    """Der Daemon hat mit `error` oder `rejected` geantwortet — Exit 2."""
+
+    def __init__(self, code, meldung):
+        super().__init__(meldung)
+        self.code = code
+
+
+# ---------------------------------------------------------- Pfade, Token --
+def config_dir(base=None):
+    override = os.environ.get("COMPANION_CONFIG_DIR")
+    if override:
+        return override
+    heim = base or os.environ.get("HOME") or os.path.expanduser("~")
+    if sys.platform == "darwin":
+        return os.path.join(heim, "Library", "Application Support", "companion")
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return os.path.join(xdg, "companion")
+    return os.path.join(heim, ".config", "companion")
+
+
+def socket_pfad(base=None):
+    override = os.environ.get("WB_COMPANION_SOCKET")
+    if override:
+        return override
+    override = os.environ.get("COMPANION_SOCKET")
+    if override:
+        return override
+    laufzeit = os.environ.get("XDG_RUNTIME_DIR")
+    if laufzeit:
+        return os.path.join(laufzeit, "companion", "companion.sock")
+    return os.path.join(config_dir(base), "companion.sock")
+
+
+def token_lesen(base=None):
+    """Das agent-Token aus tokens.json — nie ausgegeben, auch nicht bei einem Fehler."""
+    pfad = os.path.join(config_dir(base), "tokens.json")
+    try:
+        with open(pfad, encoding="utf-8") as f:
+            daten = json.load(f)
+    except OSError as e:
+        raise VerbindungsFehler("Token-Datei %s nicht lesbar: %s" % (pfad, e.strerror or e)) from None
+    except json.JSONDecodeError:
+        raise VerbindungsFehler("Token-Datei %s ist kein gültiges JSON." % pfad) from None
+    token = daten.get("agent") if isinstance(daten, dict) else None
+    if not isinstance(token, str) or not token:
+        raise VerbindungsFehler("Token-Datei %s hat kein Feld 'agent'." % pfad)
+    return token
+
+
+# --------------------------------------------------------------- Socket --
+class Verbindung:
+    def __init__(self, base=None):
+        self.sock_pfad = socket_pfad(base)
+        self.token = token_lesen(base)
+        self.puffer = b""
+        self.naechste_id = 1
+        self.sock = None
+
+    def __enter__(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(VERBINDUNGSFRIST_S)
+        try:
+            self.sock.connect(self.sock_pfad)
+        except OSError as e:
+            self.sock.close()
+            raise VerbindungsFehler("kein Companion-Daemon an %s: %s" % (self.sock_pfad, e.strerror or e)) from None
+        self._hello()
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        return False
+
+    def _zeile_senden(self, objekt):
+        try:
+            self.sock.sendall((json.dumps(objekt, ensure_ascii=False) + "\n").encode("utf-8"))
+        except OSError as e:
+            raise VerbindungsFehler("Schreiben an %s fehlgeschlagen: %s" % (self.sock_pfad, e.strerror or e)) from None
+
+    def _zeile_lesen(self):
+        while b"\n" not in self.puffer:
+            try:
+                stueck = self.sock.recv(65536)
+            except OSError as e:
+                raise VerbindungsFehler("Lesen von %s fehlgeschlagen: %s" % (self.sock_pfad, e.strerror or e)) from None
+            if not stueck:
+                raise VerbindungsFehler("Verbindung zu %s wurde geschlossen." % self.sock_pfad)
+            self.puffer += stueck
+        zeile, rest = self.puffer.split(b"\n", 1)
+        self.puffer = rest
+        try:
+            return json.loads(zeile.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise VerbindungsFehler("unlesbare Antwort vom Daemon: %s" % e) from None
+
+    def _hello(self):
+        self._zeile_senden({
+            "type": "hello",
+            "protocol_version": PROTOCOL_VERSION,
+            "min_protocol_version": PROTOCOL_VERSION,
+            "max_protocol_version": PROTOCOL_VERSION,
+            "token": self.token,
+            "client_name": CLIENT_NAME,
+            "audio_formats": [],
+        })
+        antwort = self._zeile_lesen()
+        art = antwort.get("type")
+        if art == "welcome":
+            return antwort
+        if art == "rejected":
+            raise Abgelehnt(antwort.get("code") or "rejected", antwort.get("message") or "Verbindung abgelehnt")
+        raise VerbindungsFehler("unerwartete Antwort auf hello: %r" % antwort)
+
+    def anfrage(self, felder):
+        """`felder` ist das Anfrage-eigene Dict (mit `request`); Rückgabe die
+        rohe Response (`type`, `id`, `status`, `payload`)."""
+        eigene_id = self.naechste_id
+        self.naechste_id += 1
+        nachricht = dict(felder)
+        nachricht["type"] = "request"
+        nachricht["id"] = eigene_id
+        self._zeile_senden(nachricht)
+        while True:
+            antwort = self._zeile_lesen()
+            if antwort.get("type") == "event":
+                continue
+            if antwort.get("type") == "response" and antwort.get("id") == eigene_id:
+                return antwort
+            if antwort.get("type") == "rejected":
+                raise Abgelehnt(antwort.get("code") or "rejected", antwort.get("message") or "abgelehnt")
+            # eine Antwort mit fremder id (sollte bei einer Verbindung ohne
+            # Nebenläufigkeit nicht vorkommen) wird übersprungen, nicht als
+            # Fehler behandelt -- der Takt darf nie daran scheitern.
+
+
+def anfrage_werten(antwort):
+    """(rc, payload): 0 bei ok, 2 bei error, wirft VerbindungsFehler sonst."""
+    status = antwort.get("status")
+    if status == "ok":
+        return 0, antwort.get("payload")
+    if status == "error":
+        return 2, antwort.get("payload")
+    raise VerbindungsFehler("Antwort ohne 'status': %r" % antwort)
+
+
+# ------------------------------------------------------------- SessionStatus --
+def _unbekannt():
+    return {"origin": "unknown"}
+
+
+def _gemessen(wert):
+    return {"origin": "measured", "value": wert}
+
+
+def session_id_fuer(auftrag_id):
+    return "wb-traeger:%s" % auftrag_id
+
+
+# Vertragsgrenzen des Daemons (companion3, server.rs `check_task_fields`,
+# `is_task_id`, `clean_task_text`). Kennung und Weckzeit lehnt der Daemon ab,
+# überlangen Text ebenfalls; hier wird Text vorher gekürzt und eine unlesbare
+# Weckzeit weggelassen, damit der Takt keine Meldung an einer Ablehnung verliert.
+TASK_ID_MAX = 64
+TASK_SLUG_MAX = 40
+TITEL_MAX, GRUND_MAX, MASCHINE_MAX = 200, 500, 64
+TASK_FELDER = ("task_state", "task_reason", "task_title", "task_wake_at", "task_machine")
+# `char::is_control` (Unicode Cc) plus die unsichtbaren Zeichen aus `is_hidden_char`.
+VERSTECKTE_ZEICHEN = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+SLUG_MUSTER = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _text_normieren(text, grenze):
+    """Wie `clean_task_text`: versteckte Zeichen zu Leerzeichen, Leerraum
+    zusammengezogen; danach auf `grenze` Zeichen gekürzt statt abgelehnt.
+    Leer heißt: kein Feld."""
+    if text is None:
+        return None
+    sauber = " ".join(VERSTECKTE_ZEICHEN.sub(" ", str(text)).split())
+    return sauber[:grenze].rstrip() or None
+
+
+def ist_auftrag_id(kennung):
+    """Wie `is_task_id`: `YYYYMMDD-<slug>[-<n>]`, gültiges Datum, Slug aus
+    Wörtern `[a-z0-9]` mit einfachen Bindestrichen, höchstens 40 Zeichen,
+    Zähler ab 2 ohne führende Null, alles höchstens 64 Zeichen."""
+    if not isinstance(kennung, str) or len(kennung) > TASK_ID_MAX or "-" not in kennung:
+        return False
+    datum, rest = kennung.split("-", 1)
+    if len(datum) != 8 or not datum.isascii() or not datum.isdigit():
+        return False
+    try:
+        datetime.datetime.strptime(datum, "%Y%m%d")
+    except ValueError:
+        return False
+
+    def slug(s):
+        return len(s) <= TASK_SLUG_MAX and bool(SLUG_MUSTER.match(s))
+    if slug(rest):
+        return True
+    if "-" not in rest:
+        return False
+    vorn, zaehler = rest.rsplit("-", 1)
+    return slug(vorn) and zaehler.isascii() and zaehler.isdigit() \
+        and not zaehler.startswith("0") and int(zaehler) >= 2
+
+
+def auftrag_id_pruefen(auftrag_id):
+    if not ist_auftrag_id(auftrag_id):
+        raise argparse.ArgumentTypeError(
+            "'%s' ist keine Auftragskennung wie wb-aufgabe sie macht "
+            "(YYYYMMDD-<slug>[-<n>], Slug höchstens 40, alles höchstens 64 Zeichen)" % auftrag_id)
+    return auftrag_id
+
+
+def weckzeit_normieren(text):
+    """RFC 3339 oder nichts. Eine Zeit ohne Zone gilt als UTC wie in
+    wb-traegers `iso_zu_punkt`; was sich nicht lesen lässt, fällt weg."""
+    text = _text_normieren(text, 128)
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        punkt = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if punkt.tzinfo is None:
+        punkt = punkt.replace(tzinfo=datetime.timezone.utc)
+    return punkt.isoformat().replace("+00:00", "Z")
+
+
+def status_felder(grund=None, titel=None, weckzeit=None, maschine=None):
+    return (_text_normieren(grund, GRUND_MAX), _text_normieren(titel, TITEL_MAX),
+            weckzeit_normieren(weckzeit), _text_normieren(maschine, MASCHINE_MAX))
+
+
+def anfrage_vertrag_pruefen(felder):
+    """Schließt auch den allgemeinen ``sende``-Weg an dieselbe Grenze an:
+    ein rohes report_status mit task_*-Feldern braucht eine gültige
+    Auftragskennung (sonst Exit 2, ohne zu verbinden), sein Text wird wie bei
+    den drei Unterbefehlen normalisiert. Ein Status ohne task_*-Felder bleibt
+    unberührt, wie beim Daemon."""
+    if felder.get("request") != "report_status":
+        return felder
+    status = felder.get("status")
+    if not isinstance(status, dict):
+        raise ValueError("report_status braucht ein status-Objekt.")
+    if not any(status.get(f) is not None for f in TASK_FELDER):
+        return felder
+    try:
+        auftrag_id_pruefen(status.get("auftrag_id"))
+    except argparse.ArgumentTypeError as e:
+        raise ValueError(str(e)) from None
+    status = dict(status)
+    for feld, grenze in (("task_reason", GRUND_MAX), ("task_title", TITEL_MAX),
+                         ("task_machine", MASCHINE_MAX)):
+        if feld in status:
+            status[feld] = _text_normieren(status[feld], grenze)
+    if "task_wake_at" in status:
+        status["task_wake_at"] = weckzeit_normieren(status["task_wake_at"])
+    felder = dict(felder)
+    felder["status"] = status
+    return felder
+
+
+def session_status_bauen(auftrag_id, task_state, grund=None, titel=None, weckzeit=None, maschine=None):
+    grund, titel, weckzeit, maschine = status_felder(grund, titel, weckzeit, maschine)
+    status = {
+        "id": session_id_fuer(auftrag_id),
+        "adapter": "wb-traeger",
+        "machine": _gemessen(maschine) if maschine else _unbekannt(),
+        # `project`, `last_output`: Option<String> in SessionStatus, also null
+        # und nie ein Provenance-Objekt. `last_activity_ms`/`transcript_path`
+        # sind optional (serde default) und fehlen, weil der Träger sie nicht kennt.
+        "project": None,
+        "model": _unbekannt(),
+        "state": SESSION_STATE_AUS_TASK_STATE.get(task_state, "unknown"),
+        "runtime_ms": _unbekannt(),
+        "context": _unbekannt(),
+        "budget": _unbekannt(),
+        "iteration": _unbekannt(),
+        "last_output": None,
+        "open_question": None,
+        "auftrag_id": auftrag_id,
+        "kind": _gemessen("orchestrator"),
+        "display_name": _gemessen(titel) if titel else _unbekannt(),
+        "machine_identity": _unbekannt(),
+        # additive Felder, Bau-Schritt 3 -- der heutige Daemon verwirft sie
+        # nach serde-Vorgabe still, companion3s Merge liest sie.
+        "task_state": task_state,
+        "task_reason": grund or None,
+        "task_title": titel or None,
+        "task_wake_at": weckzeit or None,
+        "task_machine": maschine or None,
+    }
+    return status
+
+
+def report_status_senden(verbindung, auftrag_id, task_state, grund=None, titel=None, weckzeit=None, maschine=None):
+    status = session_status_bauen(auftrag_id, task_state, grund, titel, weckzeit, maschine)
+    return verbindung.anfrage({"request": "report_status", "status": status})
+
+
+# ------------------------------------------------------------------- CLI --
+def jetzt_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fehler_ausgeben(text):
+    sys.stderr.write("wb-companion: %s\n" % text)
+
+
+def ausgeben(args, rc, ergebnis):
+    """`ergebnis` traegt mindestens 'status' ('ok'/'error'/'no_connection').
+    `--json` gibt es unveraendert aus, sonst eine kurze Zeile."""
+    if args.json:
+        print(json.dumps(ergebnis, ensure_ascii=False))
+    else:
+        zusatz = ergebnis.get("message") or ergebnis.get("payload")
+        print("%s%s" % (ergebnis.get("status"), (": %r" % zusatz) if zusatz else ""))
+    return rc
+
+
+def _verbunden_anfragen(args, sende_fn):
+    """Rahmen fuer jeden Unterbefehl: Verbindung auf, `sende_fn(v)` liefert
+    (rc, ergebnis-dict); jeder Fehlschlag wird zu genau einem Exit-Code
+    (0 ok, 2 abgelehnt, 3 keine Verbindung), nie zu einer Ausnahme nach aussen."""
+    try:
+        with Verbindung(args.base) as v:
+            rc, ergebnis = sende_fn(v)
+    except Abgelehnt as e:
+        fehler_ausgeben("abgelehnt (%s): %s" % (e.code, e))
+        return ausgeben(args, 2, {"status": "error", "code": e.code, "message": str(e)})
+    except VerbindungsFehler as e:
+        fehler_ausgeben(str(e))
+        return ausgeben(args, 3, {"status": "no_connection", "message": str(e)})
+    if rc != 0:
+        fehler_ausgeben("abgelehnt: %r" % ergebnis.get("payload"))
+    return ausgeben(args, rc, ergebnis)
+
+
+def cmd_status(args):
+    def senden(v):
+        antwort = report_status_senden(v, args.auftrag_id, args.stand, args.grund, args.titel,
+                                        args.weckzeit, args.maschine)
+        rc, payload = anfrage_werten(antwort)
+        return rc, {"status": "ok" if rc == 0 else "error", "payload": payload}
+    return _verbunden_anfragen(args, senden)
+
+
+def cmd_frage(args):
+    frage_id = "%s-%s" % (args.auftrag_id, jetzt_iso())
+
+    def senden(v):
+        status_antwort = report_status_senden(v, args.auftrag_id, "wartet_auf_nutzer", args.grund,
+                                              args.titel, args.weckzeit, args.maschine)
+        rc, payload = anfrage_werten(status_antwort)
+        if rc != 0:
+            return rc, {"status": "error", "payload": payload, "message": "eigener Stand abgelehnt, keine Frage gesendet"}
+        frage_antwort = v.anfrage({
+            "request": "ask_question",
+            "session_id": session_id_fuer(args.auftrag_id),
+            "question_id": frage_id,
+            "question": args.text,
+        })
+        rc, payload = anfrage_werten(frage_antwort)
+        return rc, {"status": "ok" if rc == 0 else "error", "question_id": frage_id, "payload": payload}
+    return _verbunden_anfragen(args, senden)
+
+
+def cmd_bericht(args):
+    def senden(v):
+        status_antwort = report_status_senden(v, args.auftrag_id, "zur_abnahme", args.grund,
+                                              args.titel, args.weckzeit, args.maschine)
+        rc, payload = anfrage_werten(status_antwort)
+        if rc != 0:
+            return rc, {"status": "error", "payload": payload, "message": "eigener Stand abgelehnt, kein Bericht gesendet"}
+        bericht_antwort = v.anfrage({
+            "request": "report",
+            "session_id": session_id_fuer(args.auftrag_id),
+            "message": args.text,
+            "result_path": args.pfad,
+        })
+        rc, payload = anfrage_werten(bericht_antwort)
+        return rc, {"status": "ok" if rc == 0 else "error", "payload": payload}
+    return _verbunden_anfragen(args, senden)
+
+
+def cmd_sende(args):
+    try:
+        felder = json.loads(args.json_text)
+    except json.JSONDecodeError as e:
+        fehler_ausgeben("kein gültiges JSON: %s" % e)
+        return 2
+    if not isinstance(felder, dict) or "request" not in felder:
+        fehler_ausgeben("die Anfrage braucht mindestens das Feld 'request'.")
+        return 2
+    try:
+        felder = anfrage_vertrag_pruefen(felder)
+    except ValueError as e:
+        fehler_ausgeben(str(e))
+        return 2
+
+    def senden(v):
+        antwort = v.anfrage(felder)
+        rc, payload = anfrage_werten(antwort)
+        return rc, {"status": "ok" if rc == 0 else "error", "payload": payload}
+    return _verbunden_anfragen(args, senden)
+
+
+def main():
+    # --base und --json wie bei wb-aufgabe/wb-traeger: eine gemeinsame Elternschablone,
+    # damit beide nach dem Unterbefehl stehen dürfen ("--base wie üblich").
+    gemeinsam = argparse.ArgumentParser(add_help=False)
+    gemeinsam.add_argument("--base", default=None, help="ersetzt $HOME für Token-/Socket-Herleitung (Test)")
+    gemeinsam.add_argument("--json", action="store_true")
+
+    ap = argparse.ArgumentParser(prog="wb-companion", add_help=True)
+    sub = ap.add_subparsers(dest="befehl")
+
+    p = sub.add_parser("status", parents=[gemeinsam])
+    p.add_argument("auftrag_id", type=auftrag_id_pruefen)
+    p.add_argument("--stand", required=True, choices=TASK_STAENDE)
+    p.add_argument("--grund", default=None)
+    p.add_argument("--titel", default=None)
+    p.add_argument("--weckzeit", default=None)
+    p.add_argument("--maschine", default=None)
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("frage", parents=[gemeinsam])
+    p.add_argument("auftrag_id", type=auftrag_id_pruefen)
+    p.add_argument("--text", required=True)
+    p.add_argument("--grund", default=None)
+    p.add_argument("--titel", default=None)
+    p.add_argument("--weckzeit", default=None)
+    p.add_argument("--maschine", default=None)
+    p.set_defaults(func=cmd_frage)
+
+    p = sub.add_parser("bericht", parents=[gemeinsam])
+    p.add_argument("auftrag_id", type=auftrag_id_pruefen)
+    p.add_argument("--pfad", required=True)
+    p.add_argument("--text", required=True)
+    p.add_argument("--grund", default=None)
+    p.add_argument("--titel", default=None)
+    p.add_argument("--weckzeit", default=None)
+    p.add_argument("--maschine", default=None)
+    p.set_defaults(func=cmd_bericht)
+
+    p = sub.add_parser("sende", parents=[gemeinsam])
+    p.add_argument("json_text")
+    p.set_defaults(func=cmd_sende)
+
+    args = ap.parse_args()
+    if not args.befehl:
+        ap.print_help()
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

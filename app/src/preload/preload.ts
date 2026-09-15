@@ -35,12 +35,28 @@ contextBridge.exposeInMainWorld('awbEditorBridge', {
   // SPEC-V4 Abschnitt 6: der Gespraechsstand eines Panes. Nur lesen -- die
   // Eingabe bleibt am Pane, und dieser Weg fuehrt in keine Richtung zurueck.
   chatStand: (paneId: string) => ipcRenderer.invoke('awb:chat-stand', paneId),
+  // Der Griff und die Ansicht setzen die Sitzungs-Uebersteuerung selbst, statt
+  // sich nur lokal zu zeigen -- derselbe Schreibweg wie der Rechtsklick auf
+  // die Sitzung (main.ts, Menuepunkt 'chat-ansicht').
+  chatAnsichtSetzen: (paneId: string, an: boolean) => ipcRenderer.invoke('awb:chat-ansicht-setzen', paneId, an),
+  // PFADE IM CHAT, ANKLICKBAR (chatdatei, 05.09.2026): je Nachricht EINE Liste von
+  // Kandidaten pruefen, und einen gemeldeten Treffer oeffnen (main/chatpfade.ts).
+  chatPfade: (paneId: string, kandidaten: string[]) => ipcRenderer.invoke('awb:chat-pfade', paneId, kandidaten),
+  chatPfadOeffnen: (abs: string) => ipcRenderer.invoke('awb:chat-pfad-oeffnen', abs),
   // Die Sprache der Oberflaeche -- derselbe geteilte Kanal wie bei der Verbrauchsseite
   // (main.ts, `awb:sprache`), hier fuer den Dokumenttitel und `<html lang>` des Hauptfensters.
   sprache: () => ipcRenderer.invoke('awb:sprache'),
 });
 
 contextBridge.exposeInMainWorld('awbBridge', {
+  // Ein einzelner, feststehender Wert (kein IPC-Umweg): der Renderer braucht
+  // ihn nur, um auf dem Mac Platz fuer die drei Fensterknoepfe freizuhalten
+  // (`titleBarStyle: 'hiddenInset'`, siehe main.ts). `process.platform` gibt
+  // es im Renderer selbst nicht -- er laeuft mit `nodeIntegration: false`.
+  plattform: process.platform,
+  // AWB_TESTHAKEN=1: die schreibenden Testhaken des Tabs Agents sind da
+  // (Reviewer-Befund M4, 11.09.2026). Ohne die Variable gibt es sie nicht.
+  testhaken: process.env.AWB_TESTHAKEN === '1',
   ready: () => ipcRenderer.send('awb:ready'),
   onSession: (fn: (p: SessionPayload) => void) => ipcRenderer.on('awb:session', (_e, p) => fn(p)),
   onOutput: (fn: (p: { paneId: string; data: string }) => void) => ipcRenderer.on('awb:output', (_e, d) => fn(d)),
@@ -49,6 +65,16 @@ contextBridge.exposeInMainWorld('awbBridge', {
   onModel: (fn: (p: unknown) => void) => ipcRenderer.on('awb:model', (_e, p) => fn(p)),
   // V20: die Freigabe-Ansicht -- Antraege und angehaltene Worker.
   onFreigaben: (fn: (p: unknown) => void) => ipcRenderer.on('awb:freigaben', (_e, p) => fn(p)),
+  // Der Tab „Agents" (main/aufgaben.ts, main/welten.ts): der Stand im Takt,
+  // einmal auf Zuruf, und eine Handlung `welt:<handlung> <JSON>`.
+  // `opt.bestaetigt` ist die zweite Stufe nach einer Rueckfrage; `echt` kommt
+  // wie beim Sitzungsmenue aus `isTrusted` und wird hier nur weitergereicht.
+  onAufgaben: (fn: (p: unknown) => void) => ipcRenderer.on('awb:aufgaben', (_e, p) => fn(p)),
+  aufgabenDaten: () => ipcRenderer.invoke('awb:aufgaben-daten'),
+  aufgabe: (befehl: string, opt: { echt?: boolean; bestaetigt?: boolean } = {}) =>
+    ipcRenderer.invoke('awb:aufgabe', String(befehl), { echt: opt.echt === true, bestaetigt: opt.bestaetigt === true }),
+  // Zeigt die Oberflaeche die Ansicht? Verborgen taktet der Kern mit 30 statt 2 s.
+  aufgabenSichtbar: (an: boolean) => ipcRenderer.send('awb:aufgaben-sichtbar', an === true),
   // Schritt 7: das HTML einer uebernommenen Seite, fertig gerendert.
   onSeite: (fn: (p: unknown) => void) => ipcRenderer.on('awb:seite', (_e, p) => fn(p)),
   // Reste-Auftrag Punkt 3: die Datei hinter einer Seite hat sich von aussen

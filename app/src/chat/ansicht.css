@@ -1,6 +1,6 @@
 /* Die Chat-Ansicht (SPEC-V4 Abschnitt 6). Dieselbe Sprache wie der Rest der
-   Werkbank: dunkel, monospace, ruhige Farben, Gelb ist fuer "etwas will etwas"
-   reserviert.
+   Werkbank: Systemschrift, ruhige Farben aus main/thema.ts (ROLLEN), Gelb ist
+   fuer "etwas will etwas" reserviert.
 
    SIE LIEGT UEBER DEM PANE, deshalb `position: absolute` im Pane-Kasten und
    `display: none`, solange sie aus ist -- das Terminal darunter behaelt seine
@@ -11,15 +11,15 @@
 .chatansicht {
   position: absolute; inset: 0; z-index: 5;
   display: none; flex-direction: column;
-  background: #14171c; color: #d8dee9;
-  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--grund); color: var(--schrift);
+  font: 13px/1.55 -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui;
   overflow-wrap: anywhere;
 }
 .chatansicht.an { display: flex; }
 
 .chat-leiste {
   flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
-  padding: 6px 10px; border-bottom: 1px solid #262b34; background: #171b21;
+  padding: 6px 10px; border-bottom: 1px solid var(--linie); background: var(--leiste);
 }
 .chat-titel { font-weight: 700; }
 
@@ -28,87 +28,104 @@
    Datei nicht, darf nicht zwischen zwei Absaetzen verschwinden. */
 .chat-marke {
   padding: 1px 7px; border-radius: 9px; font-size: 11px;
-  border: 1px solid #2c323c; color: #8b93a1;
+  border: 1px solid var(--linie); color: var(--gedaempft);
 }
-.chat-marke.freigabe { color: #1b1d22; background: #d7b955; border-color: #d7b955; font-weight: 700; }
-.chat-marke.last { color: #9aa4b2; }
-.chat-marke.last.unbekannt { color: #6b7280; font-style: italic; }
-.chat-marke.arbeitet { color: #7fb069; border-color: #3c5a34; }
-.chat-marke.ruhig { color: #6b7280; }
+.chat-marke.freigabe { color: var(--tinte); background: var(--will); border-color: var(--will); font-weight: 700; }
+.chat-marke.last { color: var(--gedaempft); }
+.chat-marke.last.unbekannt { color: var(--gedaempft); font-style: italic; }
+.chat-marke.arbeitet { color: var(--laeuft); border-color: var(--laeuft); }
+.chat-marke.ruhig { color: var(--gedaempft); }
 /* Die Herkunft der Zuordnung: die eindeutigen Wege ruhig, der Rueckfall
    sichtbar anders -- er kann bei zwei Sitzungen im selben Ordner danebengreifen,
    und das soll man der Marke ansehen, ohne den Mauszeiger darauf zu halten. */
-.chat-marke.herkunft { color: #8b93a1; }
-.chat-marke.herkunft.ordner { color: #d7b955; border-color: #5a4f2a; font-style: italic; }
+.chat-marke.herkunft { color: var(--gedaempft); }
+.chat-marke.herkunft.ordner { color: var(--will); border-color: var(--will); font-style: italic; }
 
 .chat-knopf {
-  margin-left: auto; background: #1d222a; border: 1px solid #2c323c; color: #d8dee9;
+  margin-left: auto; background: var(--erhoben); border: 1px solid var(--linie); color: var(--schrift);
   font: inherit; padding: 2px 10px; border-radius: 4px; cursor: pointer;
 }
-.chat-knopf:hover { background: #242a34; }
+.chat-knopf:hover { background: var(--linie); }
 
 .chat-verlauf { flex: 1 1 auto; overflow-y: auto; padding: 10px 12px; }
 
 .chat-zeile { margin: 0 0 12px; }
 .chat-kopf { display: flex; gap: 8px; align-items: baseline; margin-bottom: 2px; }
 .chat-sprecher { font-weight: 700; font-size: 11px; }
-.chat-art, .chat-zeit { color: #6b7280; font-size: 10px; }
+.chat-art, .chat-zeit { color: var(--gedaempft); font-size: 10px; }
 .chat-text { white-space: pre-wrap; }
 
-.chat-zeile.rolle-mensch .chat-sprecher { color: #7aa2f7; }
-.chat-zeile.rolle-agent .chat-sprecher { color: #9ece6a; }
-.chat-zeile.rolle-system .chat-sprecher { color: #8b93a1; }
-.chat-zeile.rolle-werkzeug .chat-sprecher { color: #c0a36e; }
+.chat-zeile.rolle-mensch .chat-sprecher { color: var(--fern); }
+.chat-zeile.rolle-agent .chat-sprecher { color: var(--laeuft); }
+.chat-zeile.rolle-system .chat-sprecher { color: var(--gedaempft); }
+.chat-zeile.rolle-werkzeug .chat-sprecher { color: var(--will); }
 
 /* Ueberlegungen und Werkzeugaufrufe sind Beiwerk: sie stehen da, aber sie
    draengen sich nicht vor die Antwort. */
 .chat-zeile.art-denken .chat-text,
-.chat-zeile.art-werkzeug .chat-text { color: #8b93a1; }
+.chat-zeile.art-werkzeug .chat-text { color: var(--gedaempft); }
 .chat-zeile.art-werkzeug .chat-text { font-size: 11px; }
 
 /* Der Bild-Platzhalter (chat/bildplatzhalter.ts): ein knapper, eigener Satz
    statt Harness-Interna -- deshalb sichtbar anders als ein Gespraechsabsatz. */
-.chat-bild { color: #8b93a1; font-style: italic; }
+.chat-bild { color: var(--gedaempft); font-style: italic; }
 
-/* DER KLEINE MARKDOWN-RENDERER (chat/markdown.ts). Die Ansicht ist bereits
-   monospace und dunkel -- diese Regeln geben den Bloecken nur ihre eigene
-   Kontur, keine zweite Typografie. */
+/* DER KLEINE MARKDOWN-RENDERER (chat/markdown.ts). `code`/`.md-code` bleiben
+   Monospace ueber den UA-Vorgabestil von <code> (kein eigenes font-family noetig)
+   -- alles andere folgt der Systemschrift der Ansicht. */
 .chat-text :is(.md-h, .md-p, .md-liste, .md-tabelle, .md-zitat, .md-code) { margin: 0 0 8px; }
 .chat-text > :last-child { margin-bottom: 0; }
-.chat-text .md-h { font-weight: 700; color: #e5e9f0; }
+.chat-text .md-h { font-weight: 700; color: var(--schrift); }
 .chat-text h1.md-h { font-size: 15px; }
 .chat-text h2.md-h { font-size: 14px; }
 .chat-text h3.md-h, .chat-text h4.md-h, .chat-text h5.md-h, .chat-text h6.md-h { font-size: 13px; }
-.chat-text code { background: #1d222a; border: 1px solid #262b34; border-radius: 3px; padding: 0 4px; }
-.chat-text .md-code { background: #1d222a; border: 1px solid #262b34; border-radius: 4px; padding: 8px 10px; overflow-x: auto; }
+.chat-text code { background: var(--erhoben); border: 1px solid var(--linie); border-radius: 3px; padding: 0 4px; }
+.chat-text .md-code { background: var(--erhoben); border: 1px solid var(--linie); border-radius: 4px; padding: 8px 10px; overflow-x: auto; }
 .chat-text .md-code code { background: none; border: none; padding: 0; }
 .chat-text .md-liste { padding-left: 20px; }
-.chat-text .md-zitat { border-left: 2px solid #2c323c; padding-left: 10px; color: #a7afbd; }
+.chat-text .md-zitat { border-left: 2px solid var(--linie); padding-left: 10px; color: var(--gedaempft); }
 .chat-text .md-tabelle { border-collapse: collapse; }
 .chat-text .md-tabelle th, .chat-text .md-tabelle td {
-  border: 1px solid #262b34; padding: 3px 8px; text-align: left;
+  border: 1px solid var(--linie); padding: 3px 8px; text-align: left;
 }
-.chat-text .md-tabelle th { background: #1d222a; }
+.chat-text .md-tabelle th { background: var(--erhoben); }
 
 /* Ein Nein bekommt Platz und einen ganzen Satz -- kein graues Feld
    (SPEC-V4 6.3 Punkt 6). */
-.chat-grund { color: #8b93a1; padding: 24px 8px; max-width: 60ch; }
+.chat-grund { color: var(--gedaempft); padding: 24px 8px; max-width: 60ch; }
 
 .chat-fuss {
   flex: 0 0 auto; display: flex; gap: 12px; justify-content: space-between;
-  padding: 4px 10px; border-top: 1px solid #262b34; color: #6b7280; font-size: 10px;
+  padding: 4px 10px; border-top: 1px solid var(--linie); color: var(--gedaempft); font-size: 10px;
 }
 .chat-quelle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-hinweis { flex: 0 0 auto; }
 
 /* Der Griff zurueck ins Gespraech. Er sitzt in der Ecke des Panes, solange die
    Ansicht aus ist -- ohne ihn gaebe es keinen Weg zurueck, sobald jemand einmal
-   auf Terminal gestellt hat. Klein und halbdurchsichtig: er nimmt dem Terminal
-   darunter nichts weg. */
+   auf Terminal gestellt hat.
+   ER FOLGT SEIT DEM 03.09.2026 DEM THEMA (Prueferbefund 2). Bis dahin trug er
+   drei feste Werte und dazu `opacity: 0.55`, begruendet als Ausnahme vom
+   Token-System -- er liege ueber einem Terminal, dessen Inhalt jede Farbe
+   tragen koenne, und muesse in jedem Fall lesbar bleiben. Der Zweck war
+   richtig, die Ausnahme nicht: seit die Terminals dem Thema folgen, stand im
+   hellen Thema ein mittelgrauer Klotz auf hellem Grund, gemessen `#82878e` auf
+   `#8f9298`, also 1,16:1. Ein Griff, den man nicht findet, ist kein Rueckweg.
+   Jetzt `--erhoben` als Flaeche, `--linie` als Rand und `--schrift` als
+   Aufschrift, alle drei aus main/thema.ts: gemessen 11,68:1 dunkel und
+   14,21:1 hell. Die Durchsichtigkeit faellt weg -- sie war der Grund, warum
+   die gerechneten Werte am Bild nicht mehr galten.
+   Der Verweis, der hier bis heute stand ("dieselbe Begruendung wie
+   .panekasten.aktiv in renderer/index.html"), war doppelt ueberholt: die Regel
+   steht seit dem Neubau in renderer/werkbank.css und kommt dort ohne Hexwert
+   aus. */
+/* DER GRIFF STEHT IN DER KOPFZEILE DES PANES (04.09.2026), nicht mehr als
+   beschrifteter Knopf ueber dem Terminal. Befund des Nutzers am Belegbild: bei
+   drei Kacheln lagen drei gleiche Knoepfe „Gespräch zeigen" gleichzeitig im
+   Bild. Seine Gestalt steht jetzt in werkbank.css bei `.panekopf`, zusammen
+   mit dem Zoom-Knopf daneben -- hier bleibt nur der Rueckfall fuer den Fall,
+   dass er einmal ohne Kopfzeile gebaut wird. */
 .chat-griff {
-  position: absolute; right: 6px; bottom: 4px; z-index: 4;
-  background: rgba(29, 34, 42, 0.82); border: 1px solid #2c323c; color: #8b93a1;
-  font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
-  padding: 1px 7px; border-radius: 9px; cursor: pointer; opacity: 0.55;
+  border: 0; background: none; color: var(--gedaempft);
+  padding: 0; cursor: pointer;
 }
-.chat-griff:hover { opacity: 1; color: #d8dee9; }

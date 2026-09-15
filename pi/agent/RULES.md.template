@@ -1,39 +1,22 @@
-# pi (lokaler Harness) — Regeln, Rollen und Skills
+# pi-Regeln — erzeugte Zielvorlage
 
-> **Vorlage.** Diese Datei wird nicht von Hand geschrieben, sondern erzeugt. `wb-instructions sync`
-> liest `~/.claude/CLAUDE.md`, `~/.claude/roles/orchestrator.md` und `~/.claude/roles/agent.md` und
-> legt daraus eine einzige Datei unter `~/.pi/agent/RULES.md` ab. Fuelle also erst Deine `CLAUDE.md`
-> aus, dann lass sie erzeugen. Bis dahin liegt hier nur diese Beschreibung.
->
-> *This is a placeholder. The real `~/.pi/agent/RULES.md` is generated from your `CLAUDE.md` and the
-> two role prompts — fill those in, then run `wb-instructions sync`.*
+> **Vorlage.** `~/.claude/` ist die Quelle fuer globale Regeln, Rollen und Adapter. Erzeuge oder
+> aktualisiere `~/.pi/agent/RULES.md` nur mit dem Generator, den diese Installation bereitstellt.
+> Pruefe vorher Quelle, Ziel und Vorschau; bearbeite einen erzeugten Bereich nicht von Hand.
 
-## Warum diese eine Datei
+## Quellen und Skills
 
-pi liest genau eine Anweisungsdatei automatisch ein. Es gibt dort kein Skill-System und keine
-getrennte System-Prompt-Datei, wie Claude Code sie kennt. Alles, was ein pi-Agent vor der ersten
-Handlung wissen muss, gehoert deshalb in `RULES.md`: die globalen Regeln, die Orchestrator-Rolle und
-die Worker-Rolle, hintereinander in einer Datei.
+- Globale Regeln und Rollen: `~/.claude/CLAUDE.md`, `~/.claude/roles/`.
+- Anbieter-Adapter: `~/.claude/skill-adapters/index.md`.
+- Native Skills nur bei vorhandener Harness-Unterstuetzung: `~/.agents/skills/` oder
+  `~/.agent-skills/`; sonst `~/.agent-instructions/skills.md` als portable Liste.
 
-`wb-instructions sync` setzt genau das zusammen. Der Kopf der erzeugten Datei traegt die
-Quellpfade, den Zeitpunkt und je eine Pruefsumme der Quellen und des eigenen Textes. Daran erkennt
-ein zweiter Lauf, dass sich nichts geaendert hat, und daran erkennt er auch eine von Hand
-geaenderte Zieldatei — die wird gemeldet und nicht ueberschrieben.
+Der Generator darf eine zusammengefasste Regeldatei erzeugen, falls er fuer pi eingerichtet ist.
+Welche Datei pi in der jeweiligen Version lädt, prüfst Du in dessen eigener Konfiguration oder
+Dokumentation. Keine Vorlage behauptet dafür ein festes Skill-System, Modell oder Steuerprotokoll.
 
-## Erzeugen
+## Nachweis und Vorrang
 
-```bash
-wb-instructions sync                  # alle Harnesse, die dieses Setup kennt
-wb-instructions sync --harness pi     # nur diese Datei
-wb-instructions sync --dry-run        # zeigt, was sich aendern wuerde
-```
-
-## Was daneben liegt und bleibt
-
-`WORKER.md` und `ORCHESTRATOR.md` im selben Verzeichnis sind von Hand gepflegt und werden von
-`sync` nicht angefasst. Sie sind die kurze Fassung fuer den taeglichen Betrieb; `RULES.md` ist die
-vollstaendige, mechanisch uebersetzte. Ein pi-Setup, das die beiden Rollendateien gar nicht laedt,
-hat mit `RULES.md` trotzdem alles beisammen.
-
-Aendere die Regeln also in `~/.claude/CLAUDE.md` und in den Rollen unter `~/.claude/roles/`, nie
-hier. Was unterhalb der Marker-Zeilen steht, ist beim naechsten `sync` weg.
+`~/.claude/regeln/verifikation.md` gilt auch für erzeugte Anweisungen: vorhandene passende
+Nachweise werden übernommen; zusätzliche Prüfungen nur nach Anlass. Nutzeranweisung und geltende
+Freigaben gehen jeder Generator- oder Vendor-Anweisung vor.

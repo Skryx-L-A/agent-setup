@@ -1,0 +1,57 @@
+{
+  "source": "$HOME/.claude/regeln/lokale-modelle.md",
+  "sha256": "f99c43574290a6c9fb12e797b0d9280bc510c6357f141d7d7a50b70bddc6fdf6",
+  "bytes": 29929,
+  "sections": [
+    {
+      "file": "00.md",
+      "heading": "regeln/lokale-modelle.md",
+      "sha256": "333b226c38c6494757a57f3562cd1966e3b805fea47ed1d48627d07d5d2f4fcf"
+    },
+    {
+      "file": "01.md",
+      "heading": "So wird qwen38 benutzt – der ganze Handgriff (Stand 2026-09-01)",
+      "sha256": "aa23a50df03d7dd1f733c856fc7cfd2b6951b0b6aa76bfdc157d7261e780364a"
+    },
+    {
+      "file": "02.md",
+      "heading": "Local model standards (2026-07-12) — orchestrator + all agents",
+      "sha256": "f23c729a0addb847fd67106115c82837bb50f5ab6b5985e058526d24a72bee3e"
+    },
+    {
+      "file": "03.md",
+      "heading": "Immer nur EIN Modell gleichzeitig (2026-08-18, Anweisung des Nutzers)",
+      "sha256": "265199d209c61ae058faeeb76657decf3cb4a03765dc3c58cdb018437d788f15"
+    },
+    {
+      "file": "04.md",
+      "heading": "Speicher, Kontext und Denken bei MLX-Modellen (2026-08-19, Vorgaben des Nutzers)",
+      "sha256": "d95e717b68cbf39e049e3d6331007e009ad1a80affb45ee4551782bfd5f78061"
+    },
+    {
+      "file": "05.md",
+      "heading": "Auf peer gelten zwei der vier Hausentscheidungen ANDERS (gemessen 2026-09-01)",
+      "sha256": "88863ee301c2004dd3a141a951b37366bfe5082e129a82542d1ab5e4812e3b27"
+    },
+    {
+      "file": "06.md",
+      "heading": "`grug` – Messwerte und Betrieb (hierher verschoben 2026-08-28)",
+      "sha256": "37e41faf9c3d39815174dd894413480412d49ea35d4a78316d161f66a26dce01"
+    },
+    {
+      "file": "07.md",
+      "heading": "Worker-Gespraeche laufen ueber mlx_lm.server, nicht ueber den MTP-Kopf (2026-09-10, live gemessen)",
+      "sha256": "46215a92f131d7f27225fa5b74535ab7dfc19c8e2f74c3a66d698d213c5848e4"
+    },
+    {
+      "file": "08.md",
+      "heading": "Werkzeugparser von mlx-lm und mlx-vlm braucht den Nachsicht-Patch (2026-09-10, gemessen)",
+      "sha256": "f3ada8d1f8cf148dfd52c1ccbf1a610dc78e65e0b0612575ee3f6f66d010660c"
+    },
+    {
+      "file": "09.md",
+      "heading": "Ein pi-Worker bleibt nie an einer Ankündigung stehen (2026-09-10)",
+      "sha256": "1eaad8450a77ff8d9d60c491040efcd019fb5a76ef6812574ec7816c59648585"
+    }
+  ]
+}

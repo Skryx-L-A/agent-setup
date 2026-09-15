@@ -1,0 +1,1057 @@
+#!/usr/bin/env python3
+"""wb-profil — Rollenprofile des Agents-Features anlegen, prüfen, auflisten
+und aus der Bibliothek holen (Bau-Schritt 1, siehe docs/AGENTS-PLAN.md,
+Abschnitt 9, Punkt 1 und Anhang „Rollenprofile").
+
+Ausgerollt seit dem 10.09.2026 (Bau-Schritt 1 des Agents-Features, AUFTRAG-agents1.md);
+Aufrufer sind wb-traeger, der Stop-Hook und die Hauptagenten der Werkbank-Aufgaben.
+
+Der Name ist Absicht: `wb-rolle` setzt seit dem 07.08. die Pane-Rolle
+(Sicherheitsmerkmal eines tmux-Panes) — ein Profilverwalter gehört nicht in
+dasselbe Werkzeug.
+
+EINE ROLLE ist eine Markdown-Datei mit YAML-Frontmatter (Positivliste unten,
+POSITIVLISTE) und dem Rollen-Prompt als Text darunter. Kein Modell, keine
+Denkstufe, kein permissionMode, keine hooks/mcpServers/memory/isolation im
+Frontmatter — das setzt der Spawn aus der Zuweisung des Auftraggebers.
+
+ORTE:
+  global      <base>/.claude/workbench/rollen/<name>.md
+              <base>/.claude/workbench/teams/<name>.md
+  Projekt     <projekt>/.werkbank/rollen/<name>.md   (überlagert global)
+              <projekt>/.werkbank/teams/<name>.md
+  vorläufig   <projekt-der-aufgabe>/.companion/auftraege/<aufgabe_id>.rollen/<name>.md
+Alle Wurzeln für Tests überschreibbar: --base, WB_ROLLEN (ersetzt den
+globalen Rollen-Ordner; der Team-Ordner liegt daneben, "teams" statt
+"rollen" im selben Elternverzeichnis — dieselbe Bauart wie --vorrat/
+WB_VORRAT bei wb-aufgabe).
+
+GESPERRTE WERKZEUGE UND MUSTER stehen in wb-profil-gesperrt.json (Daten,
+kein Code) — Mail-Versand, Verdrängen, Push-Weg, Erlaubnisstufen, rm -rf,
+wb-rolle setzen. Ein Profil darf keinen Eintrag davon in `tools` oder `bash`
+nennen (geprüft als Teilzeichenkette je Eintrag — sicher in die vorsichtige
+Richtung: lieber ein falscher Alarm als ein übersehenes Loch).
+
+DER MENSCHEN-BELEG läuft wie bei wb-aufgabe: `wb-mensch pruefen` (Exit 0 =
+Mensch) oder `--mensch-beleg <pfad>` — eine Datei, deren erstes Wort
+„mensch" lautet.
+
+MODELL- UND FALLBACK-VORBELEGUNG (docs/AGENTS-PLAN.md, Abschnitt 4, Absatz
+„Das Fallback-Modell"): ein Profil trägt selbst weiterhin weder `model` noch
+`fallback` (die Positivliste bleibt unverändert) — `spawn-argumente <rolle>`
+liefert stattdessen `modell_vorbelegung`/`fallback_vorbelegung` als Vorschlag
+für den Auftraggeber, gelesen aus `agents.rollen.<rolle>.modell`/`.fallback`
+in settings.json (nur lesen; geschrieben wird dort ausschließlich über
+`wb-state settings set`, vom Nutzer). Ohne Eintrag für `fallback` gilt
+global `agents.fallbackModell`, ohne den wiederum FALLBACK_VORGABE unten.
+`--modell`/`--fallback` am Aufruf überschreiben beide Vorbelegungen; ein
+Fable-Modell als Fallback ist Exit 2.
+
+Unterbefehle: siehe `wb-profil --help` bzw. AUFTRAG-agents1.md, Abschnitt 2.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import unicodedata
+
+SKRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BIBLIOTHEK = os.path.normpath(os.path.join(SKRIPT_DIR, "..", "profile"))
+GESPERRT_DATEI = os.path.join(SKRIPT_DIR, "wb-profil-gesperrt.json")
+
+POSITIVLISTE = [
+    "name", "description", "tools", "disallowedTools", "bash", "skills",
+    "maxTurns", "stufe", "kontextgrenze", "absender", "stand", "begruendung",
+    "schreibsperre",
+]
+PFLICHTFELDER = ["name", "description", "tools", "stufe", "absender", "stand"]
+STUFEN = ["mitglied", "teamleiter", "hauptagent"]
+
+# Teamdateien (Reviewer-Befund 5): eigene, kuerzere Positivliste -- "leiter"
+# und "mitglieder" stehen nicht im Rollenformat, und "tools"/"stufe" sind fuer
+# ein Team sinnlos.
+POSITIVLISTE_TEAM = ["name", "description", "leiter", "mitglieder", "absender", "stand", "begruendung"]
+PFLICHTFELDER_TEAM = ["name", "leiter", "mitglieder", "absender", "stand"]
+
+# Wie in shell/wb-aufgabe (dieselbe Begruendung dort): "ohne Eintrag [in den
+# Agent-Einstellungen] mit der Spur ohne Claude-Kontingent, die der Plan
+# vorschlaegt" (docs/AGENTS-PLAN.md, "Das Fallback-Modell").
+FALLBACK_VORGABE = "opencode-openrouter-z-ai-glm-5-3-flash:medium"
+
+# Grobe Zuordnung: welches Stichwort in tools/bash braucht welche Freigabe
+# der Aufgabe (Abschnitt 2 der Tabelle: fenster, vollbild, ton, kamera,
+# fable). Bewusst knapp — genau das Beispiel aus dem Auftrag (wb-shot,
+# Fable) und die naheliegenden Nachbarn, keine erschoepfende Liste.
+FREIGABE_ZUORDNUNG = [
+    {"stichwoerter": ["wb-shot", "peer-shot", "wb-window", "wb-workers-window",
+                       "wb-remote-view"], "freigabe": "fenster"},
+    {"stichwoerter": ["--vollbild", "--fullscreen"], "freigabe": "vollbild"},
+    {"stichwoerter": ["tts", "stt", "medien-ui"], "freigabe": "ton"},
+    {"stichwoerter": ["kamera", "camera", "webcam"], "freigabe": "kamera"},
+    {"stichwoerter": ["fable"], "freigabe": "fable"},
+]
+
+
+def fehler(text):
+    sys.stderr.write("wb-profil: FEHLER — %s\n" % text)
+    sys.exit(2)
+
+
+def ausgabe(args, text, daten=None):
+    if getattr(args, "json", False) and daten is not None:
+        print(json.dumps(daten, ensure_ascii=False))
+    else:
+        print(text)
+
+
+# ---------------------------------------------------------------- Mensch --
+def _wb_mensch_pfad():
+    p = os.path.join(os.path.expanduser("~"), ".local", "bin", "wb-mensch")
+    if os.access(p, os.X_OK):
+        return p
+    return shutil.which("wb-mensch") or None
+
+
+def _ist_mensch_gemessen():
+    pfad = _wb_mensch_pfad()
+    if not pfad:
+        return False
+    try:
+        return subprocess.run([pfad, "pruefen"], timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _beleg_datei_sagt_mensch(pfad):
+    if not pfad:
+        return False
+    try:
+        with open(pfad, "r", encoding="utf-8") as f:
+            inhalt = f.read()
+    except OSError:
+        return False
+    erstes_wort = inhalt.strip().split()[0] if inhalt.strip() else ""
+    return erstes_wort.split("\t")[0] == "mensch"
+
+
+# --mensch-beleg gilt NUR im Testbett (Reviewer-Befund 2/7, 2026-09-10) --
+# siehe dieselbe Begruendung in shell/wb-aufgabe. Im echten HOME (kein
+# --base/--vorrat/WB_VORRAT/WB_ROLLEN nach ausserhalb zeigend) zaehlt
+# ausschliesslich die gemessene Herkunft ueber `wb-mensch pruefen`.
+def im_testbett(args):
+    home = os.path.realpath(os.path.expanduser("~"))
+
+    def aussen(pfad):
+        if not pfad:
+            return False
+        real = os.path.realpath(pfad)
+        return real != home and not real.startswith(home + os.sep)
+
+    if aussen(getattr(args, "base", None)):
+        return True
+    if aussen(os.environ.get("WB_VORRAT")):
+        return True
+    if aussen(os.environ.get("WB_ROLLEN")):
+        return True
+    if aussen(getattr(args, "vorrat", None)):
+        return True
+    return False
+
+
+def mensch_verlangen(args, wofuer):
+    if _ist_mensch_gemessen():
+        return
+    beleg = getattr(args, "mensch_beleg", None)
+    if beleg:
+        if not im_testbett(args):
+            fehler(
+                "--mensch-beleg gilt nur im Testbett (--base/--vorrat/WB_VORRAT/"
+                "WB_ROLLEN ausserhalb des echten HOME) — im echten HOME zaehlt "
+                "ausschliesslich 'wb-mensch pruefen'."
+            )
+        if _beleg_datei_sagt_mensch(beleg):
+            return
+    fehler(
+        "%s darf nur ein MENSCH — gemessen von 'wb-mensch pruefen' oder, im "
+        "Testbett, belegt ueber --mensch-beleg <pfad> (erstes Wort 'mensch')." % wofuer
+    )
+
+
+# --------------------------------------------------------- Vorrat (wie wb-aufgabe)
+def vorrat_root_bestimmen(args):
+    if getattr(args, "vorrat", None):
+        return args.vorrat
+    umgebung = os.environ.get("WB_VORRAT")
+    if umgebung:
+        return umgebung
+    return os.path.join(args.base, ".claude", "workbench", "vorrat")
+
+
+def aufgabe_lesen(args, aufgabe_id):
+    vorrat_root = vorrat_root_bestimmen(args)
+    vorrat_datei = os.path.join(vorrat_root, "%s.json" % aufgabe_id)
+    if not os.path.isfile(vorrat_datei):
+        fehler("Aufgabe '%s' steht nicht im Vorrat (%s)" % (aufgabe_id, vorrat_datei))
+    with open(vorrat_datei, "r", encoding="utf-8") as f:
+        eintrag = json.load(f)
+    auftrag_pfad = eintrag["auftrag"]
+    with open(auftrag_pfad, "r", encoding="utf-8") as f:
+        auftrag = json.load(f)
+    verlauf_pfad = os.path.join(os.path.dirname(auftrag_pfad), "%s.verlauf.json" % aufgabe_id)
+    verlauf = None
+    if os.path.isfile(verlauf_pfad):
+        with open(verlauf_pfad, "r", encoding="utf-8") as f:
+            verlauf = json.load(f)
+    return eintrag, auftrag, verlauf, verlauf_pfad
+
+
+def vorlaeufig_verzeichnis(args, aufgabe_id):
+    eintrag, _, _, _ = aufgabe_lesen(args, aufgabe_id)
+    return os.path.join(eintrag["projekt"], ".companion", "auftraege", "%s.rollen" % aufgabe_id)
+
+
+# ---------------------------------------------------------------- Wurzeln --
+def globale_wurzeln(base):
+    rollen = os.environ.get("WB_ROLLEN") or os.path.join(base, ".claude", "workbench", "rollen")
+    teams = os.path.join(os.path.dirname(rollen), "teams")
+    return rollen, teams
+
+
+def projekt_wurzeln(projekt):
+    return (os.path.join(projekt, ".werkbank", "rollen"),
+            os.path.join(projekt, ".werkbank", "teams"))
+
+
+# --------------------------------------------------- Einstellungen/Modelle --
+def einstellung(schluessel, vorgabe, base):
+    """Dieselbe Bauart wie in shell/wb-aufgabe (siehe dortige Begruendung):
+    `wb-state settings get <schluessel>`, wenn das eine nicht-leere Ausgabe
+    liefert, sonst punktweise direkt aus <base>/.claude/workbench/settings.json
+    gelesen."""
+    try:
+        r = subprocess.run(["wb-state", "settings", "get", schluessel],
+                            capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    pfad = os.path.join(base, ".claude", "workbench", "settings.json")
+    try:
+        with open(pfad, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return vorgabe
+    node = cfg
+    for teil in schluessel.split("."):
+        if not isinstance(node, dict) or teil not in node:
+            return vorgabe
+        node = node[teil]
+    if node is None:
+        return vorgabe
+    return node
+
+
+def ist_fable(model_id):
+    """'Fable ist nie ein Fallback' (docs/AGENTS-PLAN.md) -- siehe dieselbe
+    Funktion in shell/wb-aufgabe."""
+    return "fable" in model_id.lower()
+
+
+def modell_effort_teilen(roh, effort_vorgabe):
+    if ":" in roh:
+        modell, effort = roh.rsplit(":", 1)
+    else:
+        modell, effort = roh, effort_vorgabe
+    return modell, effort
+
+
+# -------------------------------------------------------- Frontmatter I/O --
+def _entquoten(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1].replace('\\"', '"')
+    return s
+
+
+def _quoten_falls_noetig(s):
+    s = str(s)
+    if s == "" or any(c in s for c in [":", "#", '"']) or s != s.strip():
+        return '"%s"' % s.replace('"', '\\"')
+    return s
+
+
+def frontmatter_lesen(pfad):
+    with open(pfad, "r", encoding="utf-8") as f:
+        inhalt = f.read()
+    if not inhalt.startswith("---"):
+        return {}, inhalt
+    zeilen = inhalt.split("\n")
+    ende = None
+    for i in range(1, len(zeilen)):
+        if zeilen[i].strip() == "---":
+            ende = i
+            break
+    if ende is None:
+        return {}, inhalt
+    kopf = zeilen[1:ende]
+    rumpf = "\n".join(zeilen[ende + 1:]).lstrip("\n")
+    daten = {}
+    i = 0
+    while i < len(kopf):
+        zeile = kopf[i]
+        if not zeile.strip() or zeile.strip().startswith("#"):
+            i += 1
+            continue
+        m = re.match(r"^([A-Za-z0-9_]+):\s*(.*)$", zeile)
+        if not m:
+            i += 1
+            continue
+        schluessel, wert = m.group(1), m.group(2)
+        if wert.strip() == "":
+            werte, j = [], i + 1
+            while j < len(kopf) and re.match(r"^\s*-\s+", kopf[j]):
+                werte.append(_entquoten(re.sub(r"^\s*-\s+", "", kopf[j])))
+                j += 1
+            if werte:
+                daten[schluessel] = werte
+                i = j
+                continue
+            daten[schluessel] = None
+            i += 1
+            continue
+        daten[schluessel] = _entquoten(wert)
+        i += 1
+    if "maxTurns" in daten and daten["maxTurns"] is not None:
+        try:
+            daten["maxTurns"] = int(daten["maxTurns"])
+        except (TypeError, ValueError):
+            pass
+    if "schreibsperre" in daten and daten["schreibsperre"] is not None:
+        # Ein neues Feld, kein Text: "true"/"false" (auch grossgeschrieben)
+        # werden zu einem echten bool, damit die Ausgabe (--json) und jeder
+        # Aufrufer (reviewer-sperre.sh) nicht selbst raten muessen.
+        daten["schreibsperre"] = str(daten["schreibsperre"]).strip().lower() == "true"
+    return daten, rumpf
+
+
+def frontmatter_schreiben(daten, rumpf, reihenfolge=POSITIVLISTE):
+    zeilen = ["---"]
+    for schluessel in reihenfolge:
+        if schluessel not in daten or daten[schluessel] in (None, [], ""):
+            continue
+        wert = daten[schluessel]
+        if isinstance(wert, list):
+            zeilen.append("%s:" % schluessel)
+            for element in wert:
+                # Reviewer-Hinweis 12: ohne Quoting rundet ein Element mit
+                # ':', '"', '#' oder Randleerzeichen (z.B. ein Skill-Name wie
+                # 'caveman:caveman-review') beim naechsten Lesen nicht zurueck.
+                zeilen.append("  - %s" % _quoten_falls_noetig(element))
+        elif isinstance(wert, bool):
+            # bool ist in Python eine int-Unterklasse -- ohne diesen Zweig
+            # zuerst wuerde er in den int-Zweig fallen und "1"/"0" statt
+            # "true"/"false" schreiben.
+            zeilen.append("%s: %s" % (schluessel, "true" if wert else "false"))
+        elif isinstance(wert, int):
+            zeilen.append("%s: %d" % (schluessel, wert))
+        else:
+            zeilen.append("%s: %s" % (schluessel, _quoten_falls_noetig(wert)))
+    zeilen.append("---")
+    kopf = "\n".join(zeilen) + "\n"
+    return kopf + (rumpf or "")
+
+
+def datei_atomar_schreiben(pfad, inhalt):
+    os.makedirs(os.path.dirname(pfad), exist_ok=True)
+    tmp = "%s.tmp-%d" % (pfad, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(inhalt)
+    os.replace(tmp, pfad)
+
+
+# ------------------------------------------------------------ Pruefung --
+def gesperrt_laden():
+    try:
+        with open(GESPERRT_DATEI, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"programme": [], "muster": []}
+
+
+_GRENZE = r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])"
+
+
+def _programm_in_text(programm, text):
+    """Wort-/Tokengrenzen um den Programmnamen, sonst faellt z.B. 'kill' auch
+    innerhalb 'Skill' (dem Claude-Tool-Namen) hin -- ein Werkzeugname ist
+    kein Fragment eines anderen (gefunden beim Pruefen der eigenen
+    Profil-Bibliothek: 'Skill' wurde faelschlich als 'kill' gesperrt).
+    Beide Seiten kommen bereits NFKC-normalisiert und kleingeschrieben herein
+    (siehe gesperrt_verstoss) -- hier nur noch die Grenzpruefung."""
+    return re.search(_GRENZE % re.escape(programm), text) is not None
+
+
+def _erstes_wort(text):
+    text = text.strip()
+    return text.split()[0] if text else ""
+
+
+def nicht_lateinischer_name(text):
+    """True, wenn das ERSTE WORT eines tools/bash-Eintrags ein Zeichen
+    ausserhalb von ASCII traegt (Reviewer-Befund 6: 'Кill' mit kyrillischem
+    К faellt durch jede NFKC-Normalisierung, weil es kein Kompatibilitaets-
+    zeichen fuer lateinisches 'K' ist, sondern ein eigener Buchstabe --
+    NFKC vereinheitlicht nur INNERHALB eines Skripts, nie ueber Skripte
+    hinweg). Ein pauschales Verbot statt einer Ausnahmeliste: jeder
+    Programmname, der nicht in der Hausliste steht, waere sonst derselbe
+    blinde Fleck."""
+    wort = _erstes_wort(text)
+    return any(ord(c) > 127 for c in wort)
+
+
+def gesperrt_verstoss(text, gesperrt):
+    """Case-unabhaengig und NFKC-normalisiert (Reviewer-Befund 6: 'Kill',
+    'PKill', 'Git push' und Fullwidth-Aequivalente sollen genauso treffen wie
+    die Kleinschreibung aus der Liste). Zusaetzlich zur Textsuche wird der
+    BASISNAME des ersten Worts explizit gegen jeden Programmnamen geprueft --
+    'Bash-Muster, deren erstes Wort ein Pfad ist (/bin/kill, ./kill), werden
+    am Basisnamen geprueft' (Auftrag Nr. 2, Punkt 6) --, nicht nur ueber die
+    zufaellige Randeigenschaft, dass '/' schon eine Wortgrenze ist."""
+    text_norm = unicodedata.normalize("NFKC", text).lower()
+    erstes = _erstes_wort(text)
+    basisname_norm = unicodedata.normalize("NFKC", os.path.basename(erstes)).lower() if erstes else ""
+    for regel in gesperrt.get("programme", []):
+        programm_norm = unicodedata.normalize("NFKC", regel["programm"]).lower()
+        treffer = _programm_in_text(programm_norm, text_norm) or basisname_norm == programm_norm
+        if not treffer:
+            continue
+        erfordert_norm = [unicodedata.normalize("NFKC", t).lower() for t in regel.get("erfordert", [])]
+        if all(teil in text_norm for teil in erfordert_norm):
+            return regel["grund"]
+    for regel in gesperrt.get("muster", []):
+        enthaelt_norm = unicodedata.normalize("NFKC", regel["enthaelt"]).lower()
+        if enthaelt_norm in text_norm:
+            return regel["grund"]
+    return None
+
+
+# Reviewer-Befund 1: ein Skalar in einem dieser Felder ("tools: Bash, <ein eigenes Mailwerkzeug>,
+# kill" statt einer YAML-Liste) landete bisher ungeprueft als String und wurde
+# von list(...) in EINZELZEICHEN zerlegt -- jede Pruefung darueber lief ins
+# Leere (Exit 0 trotz gesperrtem Werkzeug), und spawn-argumente haette
+# "B","a","s","h" ausgegeben.
+LISTENFELDER = ["tools", "disallowedTools", "bash", "skills"]
+
+
+def profil_pruefen(daten, aufgabe_freigaben=None, max_stufe=None):
+    verstoesse = []
+    unbekannt = sorted(set(daten.keys()) - set(POSITIVLISTE))
+    for u in unbekannt:
+        verstoesse.append("Feld '%s' steht nicht auf der Positivliste" % u)
+    for pflicht in PFLICHTFELDER:
+        if not daten.get(pflicht):
+            verstoesse.append("Pflichtfeld '%s' fehlt oder ist leer" % pflicht)
+    stufe = daten.get("stufe")
+    if stufe is not None and stufe not in STUFEN:
+        verstoesse.append("Feld 'stufe' ist ungueltig ('%s', erlaubt: %s)" % (stufe, ", ".join(STUFEN)))
+    if max_stufe is not None and stufe in STUFEN:
+        if STUFEN.index(stufe) > STUFEN.index(max_stufe):
+            verstoesse.append(
+                "Stufe '%s' ueberschreitet die erlaubte Hoechststufe '%s' fuer eine "
+                "vom Hauptagenten angelegte Rolle" % (stufe, max_stufe))
+
+    for feld in LISTENFELDER:
+        wert = daten.get(feld)
+        if wert is not None and not isinstance(wert, list):
+            verstoesse.append(
+                "Feld '%s' muss eine YAML-Liste sein, kein Text ('%s')" % (feld, wert))
+
+    gesperrt = gesperrt_laden()
+    tools_liste = daten.get("tools") if isinstance(daten.get("tools"), list) else []
+    bash_liste = daten.get("bash") if isinstance(daten.get("bash"), list) else []
+    text_werte = list(tools_liste) + list(bash_liste)
+    for text in text_werte:
+        if nicht_lateinischer_name(text):
+            verstoesse.append(
+                "'%s': nicht-lateinischer Programmname ('%s')" % (text, _erstes_wort(text)))
+            continue
+        grund = gesperrt_verstoss(text, gesperrt)
+        if grund:
+            verstoesse.append("'%s' ist gesperrt: %s" % (text, grund))
+    if aufgabe_freigaben is not None:
+        for text in text_werte:
+            for zuordnung in FREIGABE_ZUORDNUNG:
+                if any(s.lower() in text.lower() for s in zuordnung["stichwoerter"]):
+                    if not aufgabe_freigaben.get(zuordnung["freigabe"]):
+                        verstoesse.append(
+                            "'%s' braucht die Freigabe '%s', die die Aufgabe nicht traegt"
+                            % (text, zuordnung["freigabe"]))
+    return verstoesse
+
+
+def ist_team(pfad, daten):
+    """Erkannt am Pfad (irgendwo ein Ordner 'teams') oder am Feld 'leiter'
+    (Reviewer-Befund 5, Auftrag Nr. 2 Punkt 5)."""
+    teile = os.path.normpath(pfad).split(os.sep)
+    return "teams" in teile or "leiter" in daten
+
+
+def _team_rollen_wurzel(team_pfad):
+    """'teams' und 'rollen' liegen in jeder der drei Lagen (global, Projekt,
+    Bibliothek) als Geschwister unter derselben Wurzel -- rein strukturell,
+    ohne dass dieser Aufruf wissen muss, in welcher Lage er gerade steht."""
+    eltern = os.path.dirname(os.path.dirname(os.path.abspath(team_pfad)))
+    return os.path.join(eltern, "rollen")
+
+
+def team_pruefen(daten, team_pfad):
+    verstoesse = []
+    unbekannt = sorted(set(daten.keys()) - set(POSITIVLISTE_TEAM))
+    for u in unbekannt:
+        verstoesse.append("Feld '%s' steht nicht auf der Team-Positivliste" % u)
+    for pflicht in PFLICHTFELDER_TEAM:
+        if not daten.get(pflicht):
+            verstoesse.append("Pflichtfeld '%s' fehlt oder ist leer" % pflicht)
+
+    mitglieder = daten.get("mitglieder")
+    if mitglieder is not None and not isinstance(mitglieder, list):
+        verstoesse.append("Feld 'mitglieder' muss eine YAML-Liste sein, kein Text ('%s')" % mitglieder)
+        mitglieder = []
+    mitglieder = mitglieder or []
+
+    rollen_wurzel = _team_rollen_wurzel(team_pfad)
+    leiter = daten.get("leiter")
+    if leiter:
+        leiter_pfad = os.path.join(rollen_wurzel, "%s.md" % leiter)
+        if not os.path.isfile(leiter_pfad):
+            verstoesse.append("Leiter-Rolle '%s' existiert nicht (%s)" % (leiter, leiter_pfad))
+        else:
+            leiter_daten, _ = frontmatter_lesen(leiter_pfad)
+            if leiter_daten.get("stufe") != "teamleiter" and not (daten.get("begruendung") or "").strip():
+                verstoesse.append(
+                    "Leiter-Rolle '%s' hat nicht die Stufe 'teamleiter' (hat '%s') und die "
+                    "Teamdatei begruendet die Ausnahme nicht (Feld 'begruendung')"
+                    % (leiter, leiter_daten.get("stufe")))
+
+    for mitglied in mitglieder:
+        mitglied_pfad = os.path.join(rollen_wurzel, "%s.md" % mitglied)
+        if not os.path.isfile(mitglied_pfad):
+            verstoesse.append("Mitglied-Rolle '%s' existiert nicht (%s)" % (mitglied, mitglied_pfad))
+
+    return verstoesse
+
+
+def rolle_datei_finden(name_oder_pfad, args, aufgabe_id=None):
+    """Sucht eine Rollendatei: direkter Pfad zuerst, sonst nach Namen —
+    vorläufig (wenn aufgabe_id gegeben) vor Projekt vor global."""
+    if os.sep in name_oder_pfad or name_oder_pfad.endswith(".md"):
+        if os.path.isfile(name_oder_pfad):
+            return name_oder_pfad
+        return None
+    if aufgabe_id:
+        kandidat = os.path.join(vorlaeufig_verzeichnis(args, aufgabe_id), "%s.md" % name_oder_pfad)
+        if os.path.isfile(kandidat):
+            return kandidat
+    projekt = getattr(args, "projekt", None)
+    if projekt:
+        p_rollen, _ = projekt_wurzeln(projekt)
+        kandidat = os.path.join(p_rollen, "%s.md" % name_oder_pfad)
+        if os.path.isfile(kandidat):
+            return kandidat
+    g_rollen, _ = globale_wurzeln(args.base)
+    kandidat = os.path.join(g_rollen, "%s.md" % name_oder_pfad)
+    if os.path.isfile(kandidat):
+        return kandidat
+    return None
+
+
+# -------------------------------------------------------------- anlegen --
+def cmd_anlegen(args):
+    if args.stufe not in STUFEN:
+        fehler("--stufe kennt '%s' nicht (erlaubt: %s)" % (args.stufe, ", ".join(STUFEN)))
+
+    if args.absender == "person-1":
+        # Reviewer-Befund 2: ohne diese Pruefung konnte sich ein AGENT als
+        # "person-1" ausgeben und damit sowohl den Stufen-Deckel als auch die
+        # Freigabe-Pruefung umgehen (Exit 0 fuer eine globale hauptagent-Rolle
+        # mit wb-shot/Fable, ohne dass je ein Mensch beteiligt war).
+        mensch_verlangen(args, "eine Rolle als der Nutzer anlegen")
+        absender = "person-1"
+        aufgabe_id = args.aufgabe
+    elif args.absender.startswith("hauptagent"):
+        teile = args.absender.split(":")
+        if len(teile) == 3:
+            aufgabe_id = args.aufgabe or teile[1]
+            if args.aufgabe and args.aufgabe != teile[1]:
+                fehler("--aufgabe '%s' widerspricht der Aufgabe in --absender ('%s')"
+                       % (args.aufgabe, teile[1]))
+            absender = args.absender
+        elif len(teile) == 1:
+            if not args.aufgabe:
+                fehler("--absender hauptagent braucht --aufgabe <id>")
+            aufgabe_id = args.aufgabe
+            absender = "hauptagent:%s:%s" % (aufgabe_id, datetime.date.today().isoformat())
+        else:
+            fehler("--absender 'hauptagent:<aufgabe_id>:<datum>' erwartet genau zwei Doppelpunkte")
+    else:
+        fehler("--absender muss 'person-1' oder 'hauptagent[:<aufgabe_id>:<datum>]' sein")
+
+    tools = [t.strip() for t in args.tools.split(",") if t.strip()]
+    skills = [s.strip() for s in (args.skills or "").split(",") if s.strip()]
+
+    daten = {
+        "name": args.name,
+        "description": args.bereich,
+        "tools": tools,
+        "disallowedTools": [],
+        "bash": list(args.bash or []),
+        "skills": skills,
+        "maxTurns": None,
+        "stufe": args.stufe,
+        "kontextgrenze": args.kontextgrenze,
+        "absender": absender,
+        "stand": "vorlaeufig" if absender != "person-1" else "behalten",
+        "begruendung": args.begruendung,
+    }
+
+    # Der Stufen-Deckel gilt nur fuer den hauptagent-Weg (der Nutzer darf
+    # weiterhin Stufe "hauptagent" anlegen, jetzt aber nur noch MIT Beleg,
+    # siehe oben). Die Freigabe-Pruefung dagegen laeuft fuer JEDEN Absender,
+    # sobald eine Aufgabe genannt ist (Reviewer-Befund 2, Auftrag Nr. 2
+    # Punkt 2: "Freigabe-Pruefung (wb-shot, Fable) laeuft fuer jeden
+    # Absender") -- eine globale Rolle ohne --aufgabe hat nichts, wogegen sie
+    # geprueft werden koennte, und bleibt wie zuvor ungeprueft.
+    max_stufe = "teamleiter" if absender != "person-1" else None
+    aufgabe_freigaben = None
+    if aufgabe_id:
+        _, auftrag, _, _ = aufgabe_lesen(args, aufgabe_id)
+        aufgabe_freigaben = auftrag.get("freigaben", {})
+
+    verstoesse = profil_pruefen(daten, aufgabe_freigaben=aufgabe_freigaben, max_stufe=max_stufe)
+    if verstoesse:
+        for v in verstoesse:
+            sys.stderr.write("wb-profil: %s\n" % v)
+        sys.exit(2)
+
+    if absender == "person-1":
+        if args.projekt:
+            ziel_dir, _ = projekt_wurzeln(args.projekt)
+        else:
+            ziel_dir, _ = globale_wurzeln(args.base)
+    else:
+        ziel_dir = vorlaeufig_verzeichnis(args, aufgabe_id)
+
+    ziel_pfad = os.path.join(ziel_dir, "%s.md" % args.name)
+    rumpf = ""
+    if args.prompt_datei:
+        with open(args.prompt_datei, "r", encoding="utf-8") as f:
+            rumpf = f.read()
+    inhalt = frontmatter_schreiben(daten, rumpf)
+    datei_atomar_schreiben(ziel_pfad, inhalt)
+    ausgabe(args, "wb-profil: Rolle '%s' angelegt (%s, Stand %s)." % (args.name, ziel_pfad, daten["stand"]),
+            daten={"name": args.name, "pfad": ziel_pfad, "stand": daten["stand"]})
+    return 0
+
+
+# -------------------------------------------------------------- pruefen --
+def cmd_pruefen(args):
+    # Der direkte Pfad zuerst (Bibliotheksdateien, Teams eingeschlossen);
+    # rolle_datei_finden kennt nur die drei Rollen-Lagen, ein Team ueber
+    # seinen Namen zu finden ist hier nicht vorgesehen.
+    if os.sep in args.ziel or args.ziel.endswith(".md"):
+        pfad = args.ziel if os.path.isfile(args.ziel) else None
+    else:
+        pfad = rolle_datei_finden(args.ziel, args, aufgabe_id=args.aufgabe)
+    if not pfad:
+        fehler("Rolle oder Team '%s' nicht gefunden." % args.ziel)
+    daten, _ = frontmatter_lesen(pfad)
+
+    if ist_team(pfad, daten):
+        verstoesse = team_pruefen(daten, pfad)
+    else:
+        aufgabe_freigaben = None
+        if args.aufgabe:
+            _, auftrag, _, _ = aufgabe_lesen(args, args.aufgabe)
+            aufgabe_freigaben = auftrag.get("freigaben", {})
+        verstoesse = profil_pruefen(daten, aufgabe_freigaben=aufgabe_freigaben)
+
+    # Meldungsweg (Reviewer-Hinweis 9): Verstoesse nach stderr, stdout nur bei
+    # --json oder im Erfolgsfall.
+    if args.json:
+        print(json.dumps({"pfad": pfad, "verstoesse": verstoesse}, ensure_ascii=False))
+    else:
+        if verstoesse:
+            for v in verstoesse:
+                sys.stderr.write(v + "\n")
+        else:
+            print("wb-profil pruefen %s: keine Verstoesse" % pfad)
+    return 2 if verstoesse else 0
+
+
+# --------------------------------------------------------------- liste --
+def cmd_liste(args):
+    eintraege = {}
+    g_rollen, _ = globale_wurzeln(args.base)
+    if os.path.isdir(g_rollen):
+        for name in sorted(os.listdir(g_rollen)):
+            if name.endswith(".md"):
+                eintraege[name[:-3]] = {"herkunft": "global", "pfad": os.path.join(g_rollen, name)}
+    if args.projekt:
+        p_rollen, _ = projekt_wurzeln(args.projekt)
+        if os.path.isdir(p_rollen):
+            for name in sorted(os.listdir(p_rollen)):
+                if name.endswith(".md"):
+                    eintraege[name[:-3]] = {"herkunft": "projekt", "pfad": os.path.join(p_rollen, name)}
+    if args.aufgabe:
+        v_rollen = vorlaeufig_verzeichnis(args, args.aufgabe)
+        if os.path.isdir(v_rollen):
+            for name in sorted(os.listdir(v_rollen)):
+                if name.endswith(".md"):
+                    eintraege[name[:-3]] = {
+                        "herkunft": "vorlaeufig (Aufgabe %s)" % args.aufgabe,
+                        "pfad": os.path.join(v_rollen, name)}
+
+    ergebnis = []
+    for name in sorted(eintraege):
+        info = eintraege[name]
+        daten, _ = frontmatter_lesen(info["pfad"])
+        ergebnis.append({"name": name, "herkunft": info["herkunft"],
+                          "stand": daten.get("stand"), "pfad": info["pfad"]})
+
+    if args.json:
+        print(json.dumps(ergebnis, ensure_ascii=False))
+    else:
+        for e in ergebnis:
+            print("%-24s %-28s %s" % (e["name"], e["herkunft"], e["stand"]))
+    return 0
+
+
+# --------------------------------------------------------------- zeigen --
+def cmd_zeigen(args):
+    pfad = rolle_datei_finden(args.name, args)
+    if not pfad:
+        fehler("Rolle '%s' nicht gefunden." % args.name)
+    daten, rumpf = frontmatter_lesen(pfad)
+    if args.json:
+        print(json.dumps({"pfad": pfad, "frontmatter": daten, "prompt": rumpf}, ensure_ascii=False))
+        return 0
+    with open(pfad, "r", encoding="utf-8") as f:
+        print(f.read(), end="")
+    return 0
+
+
+# ----------------------------------------------------- behalten/verwerfen --
+def schnappschuss(datei, base):
+    """Kopie der ALTEN Datei nach <base>/.local/trash-snapshots/<datum>-wb-profil/
+    VOR dem Ueberschreiben (Hausregel, Auftrag Nr. 2 Punkt 4). Ein Namenskonflikt
+    innerhalb desselben Tages haengt einen Zaehler an, statt den vorigen
+    Schnappschuss stillschweigend zu ersetzen."""
+    ziel_dir = os.path.join(base, ".local", "trash-snapshots",
+                             "%s-wb-profil" % datetime.date.today().strftime("%Y%m%d"))
+    os.makedirs(ziel_dir, exist_ok=True)
+    basisname = os.path.basename(datei)
+    kandidat = os.path.join(ziel_dir, basisname)
+    n = 2
+    while os.path.exists(kandidat):
+        kandidat = os.path.join(ziel_dir, "%s.%d" % (basisname, n))
+        n += 1
+    shutil.copy2(datei, kandidat)
+    return kandidat
+
+
+def cmd_behalten(args):
+    mensch_verlangen(args, "eine vorlaeufige Rolle behalten")
+    quelle = os.path.join(vorlaeufig_verzeichnis(args, args.aufgabe), "%s.md" % args.name)
+    if not os.path.isfile(quelle):
+        fehler("Vorlaeufige Rolle '%s' fuer Aufgabe '%s' nicht gefunden (%s)."
+               % (args.name, args.aufgabe, quelle))
+    daten, rumpf = frontmatter_lesen(quelle)
+
+    # Reviewer-Befund 4: erst pruefen, dann schreiben -- eine von Hand
+    # manipulierte vorlaeufige Datei (z.B. mit einem gesperrten Werkzeug)
+    # durfte bisher trotzdem global uebernommen werden.
+    _, auftrag, _, _ = aufgabe_lesen(args, args.aufgabe)
+    verstoesse = profil_pruefen(daten, aufgabe_freigaben=auftrag.get("freigaben", {}))
+    if verstoesse:
+        for v in verstoesse:
+            sys.stderr.write("wb-profil: %s\n" % v)
+        sys.exit(2)
+
+    daten["stand"] = "behalten"
+    g_rollen, _ = globale_wurzeln(args.base)
+    ziel = os.path.join(g_rollen, "%s.md" % args.name)
+    if os.path.isfile(ziel) and not args.ersetzen:
+        fehler("Ziel '%s' liegt schon vor -- '--ersetzen' erzwingt das Ueberschreiben "
+               "(mit Schnappschuss der alten Datei)." % ziel)
+    if os.path.isfile(ziel):
+        schnappschuss(ziel, args.base)
+    datei_atomar_schreiben(ziel, frontmatter_schreiben(daten, rumpf))
+    ausgabe(args, "wb-profil: Rolle '%s' ins globale Team uebernommen (%s)." % (args.name, ziel),
+            daten={"name": args.name, "pfad": ziel})
+    return 0
+
+
+def cmd_verwerfen(args):
+    mensch_verlangen(args, "eine vorlaeufige Rolle verwerfen")
+    _, _, verlauf, _ = aufgabe_lesen(args, args.aufgabe)
+    if verlauf:
+        for w in verlauf.get("worker", []):
+            if w.get("rolle") == args.name and w.get("zustand") == "arbeitet":
+                fehler("Rolle '%s' hat noch einen arbeitenden Worker ('%s') bei Aufgabe '%s'."
+                       % (args.name, w.get("name"), args.aufgabe))
+    quelle = os.path.join(vorlaeufig_verzeichnis(args, args.aufgabe), "%s.md" % args.name)
+    if not os.path.isfile(quelle):
+        fehler("Vorlaeufige Rolle '%s' fuer Aufgabe '%s' nicht gefunden (%s)."
+               % (args.name, args.aufgabe, quelle))
+    os.remove(quelle)
+    ausgabe(args, "wb-profil: vorlaeufige Rolle '%s' verworfen." % args.name, daten={"name": args.name})
+    return 0
+
+
+# ------------------------------------------------------------ hinzufuegen --
+def cmd_hinzufuegen(args):
+    if args.projekt:
+        ziel_rollen, ziel_teams = projekt_wurzeln(args.projekt)
+    else:
+        ziel_rollen, ziel_teams = globale_wurzeln(args.base)
+
+    kopiert = []
+
+    def _kopiere(quelle, ziel):
+        if os.path.isfile(ziel) and not args.ersetzen:
+            print("wb-profil: '%s' liegt schon vor -- uebersprungen (--ersetzen erzwingt)." % ziel)
+            return
+        os.makedirs(os.path.dirname(ziel), exist_ok=True)
+        shutil.copy2(quelle, ziel)
+        kopiert.append(ziel)
+
+    team_quelle = os.path.join(BIBLIOTHEK, "teams", "%s.md" % args.bibliotheksname)
+    if os.path.isfile(team_quelle):
+        _kopiere(team_quelle, os.path.join(ziel_teams, "%s.md" % args.bibliotheksname))
+        daten, _ = frontmatter_lesen(team_quelle)
+        rollen = [daten.get("leiter")] + list(daten.get("mitglieder") or [])
+        for rolle in rollen:
+            if not rolle:
+                continue
+            rolle_quelle = os.path.join(BIBLIOTHEK, "rollen", "%s.md" % rolle)
+            if os.path.isfile(rolle_quelle):
+                _kopiere(rolle_quelle, os.path.join(ziel_rollen, "%s.md" % rolle))
+        ausgabe(args, "wb-profil: Team '%s' hinzugefuegt (%d Datei(en) kopiert)."
+                % (args.bibliotheksname, len(kopiert)),
+                daten={"team": args.bibliotheksname, "kopiert": kopiert})
+        return 0
+
+    rolle_quelle = os.path.join(BIBLIOTHEK, "rollen", "%s.md" % args.bibliotheksname)
+    if os.path.isfile(rolle_quelle):
+        _kopiere(rolle_quelle, os.path.join(ziel_rollen, "%s.md" % args.bibliotheksname))
+        ausgabe(args, "wb-profil: Rolle '%s' hinzugefuegt." % args.bibliotheksname,
+                daten={"rolle": args.bibliotheksname, "kopiert": kopiert})
+        return 0
+
+    fehler("'%s' steht weder unter profile/rollen/ noch unter profile/teams/." % args.bibliotheksname)
+
+
+# ------------------------------------------------------------------ team --
+def cmd_team(args):
+    if args.projekt:
+        _, p_teams = projekt_wurzeln(args.projekt)
+        kandidat = os.path.join(p_teams, "%s.md" % args.name)
+        if os.path.isfile(kandidat):
+            pfad = kandidat
+        else:
+            pfad = None
+    else:
+        pfad = None
+    if not pfad:
+        _, g_teams = globale_wurzeln(args.base)
+        pfad = os.path.join(g_teams, "%s.md" % args.name)
+    if not os.path.isfile(pfad):
+        fehler("Team '%s' nicht gefunden (%s)." % (args.name, pfad))
+    daten, rumpf = frontmatter_lesen(pfad)
+    if args.json:
+        print(json.dumps({"pfad": pfad, "frontmatter": daten, "beschreibung": rumpf}, ensure_ascii=False))
+        return 0
+    print("Team %s" % args.name)
+    print("  Leiter:     %s" % daten.get("leiter"))
+    print("  Mitglieder: %s" % ", ".join(daten.get("mitglieder") or []))
+    return 0
+
+
+def cmd_erlaubt(args):
+    if args.projekt:
+        _, p_teams = projekt_wurzeln(args.projekt)
+        kandidat = os.path.join(p_teams, "%s.md" % args.team)
+        pfad = kandidat if os.path.isfile(kandidat) else None
+    else:
+        pfad = None
+    if not pfad:
+        _, g_teams = globale_wurzeln(args.base)
+        pfad = os.path.join(g_teams, "%s.md" % args.team)
+    if not os.path.isfile(pfad):
+        return 1
+    daten, _ = frontmatter_lesen(pfad)
+    rollen = set([daten.get("leiter")] + list(daten.get("mitglieder") or []))
+    return 0 if args.rolle in rollen else 1
+
+
+# ----------------------------------------------------------- spawn-argumente
+def _vorbelegung_teilen(roh):
+    """roh ist entweder 'model[:effort]' oder None (nichts vorbelegt) oder
+    'keins' -- gibt {model, effort} oder None zurueck."""
+    if not roh or roh == "keins":
+        return None
+    modell, effort = modell_effort_teilen(roh, "medium")
+    return {"model": modell, "effort": effort}
+
+
+def cmd_spawn_argumente(args):
+    if args.harness not in ("claude", "pi"):
+        fehler("--harness kennt '%s' nicht (erlaubt: claude, pi)" % args.harness)
+
+    # Modell-/Fallback-Vorbelegung (docs/AGENTS-PLAN.md, "Das Fallback-Modell";
+    # AUFTRAG-agents1-nr3.md Punkt 2): je Rolle aus den Einstellungen, sonst
+    # (nur beim Fallback) global; --modell/--fallback am Aufruf ueberschreiben
+    # beides. Ein Profil selbst traegt weder model noch fallback.
+    modell_roh = args.modell or einstellung("agents.rollen.%s.modell" % args.name, None, args.base)
+    fallback_roh = args.fallback or einstellung(
+        "agents.rollen.%s.fallback" % args.name, None, args.base)
+    if not fallback_roh:
+        fallback_roh = einstellung("agents.fallbackModell", FALLBACK_VORGABE, args.base)
+    modell_vorbelegung = _vorbelegung_teilen(modell_roh)
+    fallback_vorbelegung = _vorbelegung_teilen(fallback_roh)
+    if fallback_vorbelegung and ist_fable(fallback_vorbelegung["model"]):
+        fehler("Fable ist nie ein Fallback ('%s')." % fallback_vorbelegung["model"])
+
+    pfad = rolle_datei_finden(args.name, args, aufgabe_id=args.aufgabe)
+    if not pfad:
+        fehler("Rolle '%s' nicht gefunden." % args.name)
+    daten, _ = frontmatter_lesen(pfad)
+
+    # Reviewer-Befund 8: erst pruefen, sonst ist die anlegen-Pruefung (die ein
+    # von Hand veraendertes Profil nicht ein zweites Mal sieht) die einzige
+    # Sperre -- Exit 2, NICHTS auf stdout.
+    aufgabe_freigaben = None
+    if args.aufgabe:
+        _, auftrag, _, _ = aufgabe_lesen(args, args.aufgabe)
+        aufgabe_freigaben = auftrag.get("freigaben", {})
+    verstoesse = profil_pruefen(daten, aufgabe_freigaben=aufgabe_freigaben)
+    if verstoesse:
+        for v in verstoesse:
+            sys.stderr.write("wb-profil: %s\n" % v)
+        sys.exit(2)
+
+    tools = list(daten.get("tools") or [])
+    disallowed = list(daten.get("disallowedTools") or [])
+    bash_muster = list(daten.get("bash") or [])
+    skills = list(daten.get("skills") or [])
+
+    if args.harness == "claude":
+        ergebnis = {
+            "tools": tools, "disallowedTools": disallowed,
+            "prompt_datei": pfad, "bash_muster": bash_muster,
+        }
+    else:
+        ergebnis = {
+            "tools": tools, "no_skills": True,
+            "skill": [os.path.expanduser("~/.claude/skills/%s/SKILL.md" % s) for s in skills],
+            "prompt_datei": pfad, "bash_muster": bash_muster,
+        }
+    ergebnis["modell_vorbelegung"] = modell_vorbelegung
+    ergebnis["fallback_vorbelegung"] = fallback_vorbelegung
+    print(json.dumps(ergebnis, ensure_ascii=False))
+    return 0
+
+
+# ------------------------------------------------------------------ CLI --
+def main():
+    gemeinsam = argparse.ArgumentParser(add_help=False)
+    gemeinsam.add_argument("--base", default=os.path.expanduser("~"))
+    gemeinsam.add_argument("--vorrat", default=None)
+    gemeinsam.add_argument("--json", action="store_true")
+
+    ap = argparse.ArgumentParser(prog="wb-profil")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("anlegen", parents=[gemeinsam])
+    p.add_argument("name")
+    p.add_argument("--bereich", required=True)
+    # Kein choices= (Reviewer-Hinweis 9): siehe fehler()-Weg unten statt der
+    # englischen argparse-Meldung.
+    p.add_argument("--stufe", required=True)
+    p.add_argument("--tools", required=True)
+    p.add_argument("--bash", action="append")
+    p.add_argument("--skills")
+    p.add_argument("--kontextgrenze")
+    p.add_argument("--absender", required=True)
+    p.add_argument("--aufgabe")
+    p.add_argument("--begruendung")
+    p.add_argument("--projekt")
+    p.add_argument("--prompt-datei", dest="prompt_datei")
+    p.add_argument("--mensch-beleg", dest="mensch_beleg")
+    p.set_defaults(func=cmd_anlegen)
+
+    p = sub.add_parser("pruefen", parents=[gemeinsam])
+    p.add_argument("ziel")
+    p.add_argument("--aufgabe")
+    p.set_defaults(func=cmd_pruefen)
+
+    p = sub.add_parser("liste", parents=[gemeinsam])
+    p.add_argument("--projekt")
+    p.add_argument("--aufgabe")
+    p.set_defaults(func=cmd_liste)
+
+    p = sub.add_parser("zeigen", parents=[gemeinsam])
+    p.add_argument("name")
+    p.add_argument("--projekt")
+    p.set_defaults(func=cmd_zeigen)
+
+    p = sub.add_parser("behalten", parents=[gemeinsam])
+    p.add_argument("name")
+    p.add_argument("--aufgabe", required=True)
+    p.add_argument("--mensch-beleg", dest="mensch_beleg")
+    p.add_argument("--ersetzen", action="store_true")
+    p.set_defaults(func=cmd_behalten)
+
+    p = sub.add_parser("verwerfen", parents=[gemeinsam])
+    p.add_argument("name")
+    p.add_argument("--aufgabe", required=True)
+    p.add_argument("--mensch-beleg", dest="mensch_beleg")
+    p.set_defaults(func=cmd_verwerfen)
+
+    p = sub.add_parser("hinzufuegen", parents=[gemeinsam])
+    p.add_argument("bibliotheksname")
+    p.add_argument("--projekt")
+    p.add_argument("--ersetzen", action="store_true")
+    p.set_defaults(func=cmd_hinzufuegen)
+
+    p = sub.add_parser("team", parents=[gemeinsam])
+    p.add_argument("name")
+    p.add_argument("--projekt")
+    p.set_defaults(func=cmd_team)
+
+    p = sub.add_parser("erlaubt", parents=[gemeinsam])
+    p.add_argument("team")
+    p.add_argument("rolle")
+    p.add_argument("--projekt")
+    p.set_defaults(func=cmd_erlaubt)
+
+    p = sub.add_parser("spawn-argumente", parents=[gemeinsam])
+    p.add_argument("name")
+    # Kein choices= (Reviewer-Hinweis 9); geprueft in cmd_spawn_argumente.
+    p.add_argument("--harness", default="claude")
+    p.add_argument("--aufgabe")
+    p.add_argument("--projekt")
+    p.add_argument("--modell")
+    p.add_argument("--fallback")
+    p.set_defaults(func=cmd_spawn_argumente)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

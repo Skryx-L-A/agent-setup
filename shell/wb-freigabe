@@ -20,6 +20,15 @@
 # oder `--alle` ausdruecklich ALLE freigibt. Der einfache Fall (nur ein Wortlaut)
 # laeuft unveraendert.
 #
+# RUECKKANAL (03.09.2026, Wort des Nutzers: "ich will ... dass die Nachricht mit der
+# Freigabe direkt an den Agent zurueckgeht"): `erteilen` schickt nach dem Schreiben
+# des Zettels einen kurzen Hinweis in den Pane des Antragstellers -- ausschliesslich
+# ueber `wb-pane-write` (dieselbe Stelle, die auch `wb-post` dafuer benutzt), nie mit
+# einer Absende-Taste. Das ist NUR eine Benachrichtigung: sie erteilt nichts und
+# aendert nichts an der Pruefung oben, wer freigeben darf. Lehnt `wb-pane-write darf`
+# ab (z.B. ein Orchestrator-Pane), bleibt die Freigabe trotzdem gueltig -- der Hinweis
+# unterbleibt dann und die Ausgabezeile "Rueckkanal: ..." sagt, warum.
+#
 # WARUM ES DIESES WERKZEUG GIBT (Durchsicht 2026-08-07, gemessen)
 # Die Rueckfrage-Stufe haelt an, was weder harmlos noch verboten ist — `sudo`,
 # `chmod -R`, `git push --force`, `npm publish` — und wartet auf einen Menschen.
@@ -236,19 +245,43 @@ PANE="${1:-}"
 # und der Verlauf sagt es ausdruecklich. Was die Freigabe TRAEGT, ist die
 # gemessene Herkunft ein paar Zeilen weiter -- nie ein Satz Text.
 
+# RUECKKANAL (Auftrag 03.09., Wort des Nutzers): wer die Rueckfrage gestellt hat, soll
+# es sofort erfahren, statt zwischen Erteilung und naechstem Versuch im Dunkeln zu
+# stehen oder blind noch einmal zu probieren. Zugestellt wird ausschliesslich ueber
+# `wb-pane-write` -- dieselbe Stelle, die `wb-post` fuer denselben Zweck benutzt, und
+# aus demselben Grund: es ist die EINE Stelle, die entscheidet, wer in einen Pane
+# schreiben darf, ein zweiter Weg daneben waere ein Loch in genau dieser Sicherung.
+# Wie dort wird NIE ein Absende-Taste geschickt (`taste`/Enter) -- der Hinweis bleibt
+# ein Hinweis, kein automatisch abgeschicktes Kommando in einem fremden Chat.
+# Reihenfolge wie bei wb-post/pi-worker: ausdrueckliche Umlenkung, installierte
+# Fassung, Schwesterdatei im Arbeitsbaum (solange es nur dort lebt).
+PANE_WRITE_BIN="${WB_PANE_WRITE:-}"
+if [ -n "$PANE_WRITE_BIN" ] && [ ! -x "$PANE_WRITE_BIN" ]; then
+    echo "wb-freigabe: WB_PANE_WRITE zeigt auf '$PANE_WRITE_BIN' — dort ist nichts Ausfuehrbares." >&2
+    exit 2
+fi
+if [ -z "$PANE_WRITE_BIN" ]; then
+    if [ -x "$HOME/.local/bin/wb-pane-write" ]; then
+        PANE_WRITE_BIN="$HOME/.local/bin/wb-pane-write"
+    else
+        NACHBAR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/wb-pane-write"
+        [ -x "$NACHBAR" ] && PANE_WRITE_BIN="$NACHBAR"
+    fi
+fi
+
 messen || ablehnen "hier ruft kein gemessener Mensch."
 
 ART="$(herkunft_art)"
 "$PY" - "$BLOCKS" "$GRANTS" "$PANE" "$GRUND" "$ART" "$MENSCH_GRUND" "$TTL" "$ERWARTETER_SCHLUESSEL" \
-      "$VERLAUF" "$INDEX" "$ALLE" <<'PY'
+      "$VERLAUF" "$INDEX" "$ALLE" "$PANE_WRITE_BIN" <<'PY'
 # Der Zettel wird aus dem MARKER gebaut, den der Hook selbst geschrieben hat --
 # nicht aus dem, was auf der Kommandozeile steht. Damit gilt die Freigabe genau
 # dem Befehl, der wirklich angehalten wurde, und nicht einem aehnlich
 # aussehenden: dieselbe Eigenschaft, die die Freigabe-Ansicht hat.
-import hashlib, hmac, json, os, re, stat, sys, time
+import hashlib, hmac, json, os, re, stat, subprocess, sys, time
 
 (blocks, grants, pane, grund, art, beleg, ttl_roh, erwartet, verlauf,
- index_roh, alle_roh) = sys.argv[1:12]
+ index_roh, alle_roh, pane_write_bin) = sys.argv[1:13]
 sicher = re.sub(r'[^A-Za-z0-9_.-]', '_', pane)
 pfad = os.path.join(blocks, sicher + '.json')
 try:
@@ -271,6 +304,36 @@ def kuerzen(text, max_len=700, rand=300):
         return text
     fehlt = len(text) - 2 * rand
     return '%s\n    ...[%d Zeichen gekuerzt]...\n    %s' % (text[:rand], fehlt, text[-rand:])
+
+
+def hinweis_geben(pane_write_bin, pane, text):
+    # NUR eine Benachrichtigung -- keine zweite Pruefung, wer freigeben darf, und
+    # kein zweiter Weg an `wb-pane-write` vorbei. Ob der Hinweis ankommt, entscheidet
+    # allein `wb-pane-write darf`; lehnt es ab (z.B. ein Orchestrator-Pane), kommt
+    # nichts an, und genau das wird hier gemeldet statt verschwiegen. Wie bei
+    # `wb-post` wird NIE eine Absende-Taste geschickt -- der Hinweis liegt im Pane,
+    # abgeschickt wird nichts.
+    if not pane_write_bin:
+        return 'kein wb-pane-write gefunden -- kein Hinweis in Pane %s geschickt.' % pane
+    try:
+        d = subprocess.run([pane_write_bin, 'darf', pane], capture_output=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return 'wb-pane-write "darf" antwortete nicht (%s) -- kein Hinweis geschickt.' % e
+    if d.returncode == 77:
+        return ('Hinweis in Pane %s NICHT geschickt (wb-pane-write lehnt ab) -- '
+                'die Freigabe gilt trotzdem, der Agent sieht sie beim naechsten Versuch.' % pane)
+    if d.returncode != 0:
+        return 'wb-pane-write "darf" meldete Fehler (Exit %d) -- kein Hinweis geschickt.' % d.returncode
+    try:
+        e = subprocess.run([pane_write_bin, 'einfuegen', pane], input=text.encode('utf-8'),
+                            capture_output=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError) as ex:
+        return 'wb-pane-write "einfuegen" antwortete nicht (%s) -- kein Hinweis geschickt.' % ex
+    if e.returncode == 0:
+        return 'Hinweis in Pane %s eingefuegt (ohne Enter).' % pane
+    if e.returncode == 77:
+        return 'Hinweis in Pane %s NICHT geschickt (wb-pane-write lehnt ab).' % pane
+    return 'wb-pane-write "einfuegen" scheiterte (Exit %d).' % e.returncode
 
 
 primaer_command = str(merker.get('command', ''))
@@ -426,6 +489,33 @@ for e in zu_erteilen:
     print('Freigegeben fuer EINEN Durchlauf, gueltig %d Minuten:' % max(1, TTL // 60))
     print('  %s' % kuerzen(command))
     print('  Herkunft: %s (%s)' % (art, kuerzen(beleg, max_len=200, rand=80)))
+
+# RUECKKANAL: der Agent, der die Rueckfrage gestellt hat, erfaehrt es JETZT, im
+# eigenen Pane -- statt erst beim naechsten (blinden) Versuch. Eine Nachricht fuer
+# alle gewaehlten Eintraege zusammen, nicht je Eintrag: ein `--alle` soll den Pane
+# nicht mit mehreren Hinweisen hintereinander bombardieren.
+#
+# IMMER EINE ZEILE, und `einzeilig()` erzwingt das auch dann, wenn der freigegebene
+# Befehl selbst Zeilenumbrueche enthaelt (ein Heredoc, ein mehrzeiliges Skript): ein
+# eingefuegter Text, der einen echten Zeilenumbruch traegt, wuerde in einem Pane, das
+# im RAW-Modus liest (jede interaktive CLI, anders als eine Shell im kanonischen
+# Modus), als Enter ankommen -- genau die Absende-Taste, die dieser Hinweis laut
+# Kopfkommentar nie schickt. Ein zusammenhaengender Fliesstext ohne Zeilenumbruch
+# kann das nicht.
+def einzeilig(text):
+    return ' '.join((text or '').split())
+
+
+minuten = max(1, TTL // 60)
+if len(zu_erteilen) == 1:
+    hinweistext = '[wb-freigabe] Freigegeben (%s): %s -- gueltig %d Min., wiederhole den Befehl jetzt.' % (
+        merker.get('muster', '') or '?', kuerzen(zu_erteilen[0]['command'], max_len=300, rand=120), minuten)
+else:
+    teile = ['[%d] %s' % (i, kuerzen(e['command'], max_len=150, rand=60))
+             for i, e in enumerate(zu_erteilen, start=1)]
+    hinweistext = ('[wb-freigabe] %d Befehle freigegeben (%s), gueltig %d Min., wiederhole sie jetzt: %s'
+                   % (len(zu_erteilen), merker.get('muster', '') or '?', minuten, '  '.join(teile)))
+print('Rueckkanal: %s' % hinweis_geben(pane_write_bin, pane, einzeilig(hinweistext)))
 
 # Der Merker wird geloescht, sobald der PRIMAERE Eintrag mit dabei war -- er
 # ist die einzige STEHENDE Frage, die die Ansicht als "offen" fuehrt. Wurde

@@ -20,6 +20,7 @@
 import {
   Chatansicht, type Dateivorschlag, type Stand, type Werkstattworker,
 } from '../chatbuehne/ansicht';
+import { chatPfadHaken } from './chatdatei';
 
 /** Die Bruecke des Hauptfensters, soweit die Chat-Sitzung sie braucht. */
 export interface ChatBruecke {
@@ -274,6 +275,9 @@ export class Chatbuehne {
         if (!this.chat) return;
         window.awbBridge.bedienung('chat-worker', `${this.chat}|${paneId}`);
       },
+      // Pfade im Gespraech (chatdatei, 05.09.2026): leere Pane-Kennung heisst
+      // „die Sitzung auf der Buehne“ -- den Ordner kennt der Hauptprozess.
+      pfade: chatPfadHaken(''),
     });
     this.kasten.replaceChildren(a.element());
     return a;

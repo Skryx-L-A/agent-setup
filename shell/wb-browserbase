@@ -1,0 +1,317 @@
+#!/bin/bash
+# wb-browserbase — gehosteter Browser (Browserbase) auf Anforderung.
+#
+# Zweck: der Playwright-MCP laeuft normalerweise lokal (headless). Braucht eine
+# Aufgabe einen gehosteten Browser, schaltet `mcp-shared browser browserbase`
+# um; dieses Werkzeug verwaltet die Browserbase-Sitzung dahinter.
+#
+# Anlass (2026-09-09): Free-Plan mit 60 Browserminuten im Monat. Die Wahl faellt
+# nach jedem Halt automatisch auf lokal zurueck, damit kein vergessener Schalter
+# Minuten verbrennt. Lokal bleibt die Vorgabe.
+#
+# Bedienung:
+#   wb-browserbase nutzung [--json]         Monatsbudget anzeigen (--json: JSON-Objekt auf stdout)
+#   wb-browserbase sitzung neu [--minuten N]  Sitzung oeffnen (Vorgabe 15 min), gibt nur die ID aus
+#   wb-browserbase sitzung liste            laufende Sitzungen
+#   wb-browserbase sitzung ende <id>|--alle   Sitzung(en) beenden
+#   wb-browserbase cdp-url <id>             wss-URL fuer --cdp-endpoint (ENTHAELT DEN KEY)
+#   wb-browserbase schau <id> [--oeffnen]   Live-Ansicht (debuggerFullscreenUrl)
+#   wb-browserbase env                      export-Zeilen fuer eval
+#   wb-browserbase hilfe
+#
+# Zugangsdaten (in dieser Reihenfolge): Umgebung BROWSERBASE_API_KEY und
+# BROWSERBASE_PROJECT_ID, macOS-Schluesselbund (browserbase-api-key /
+# browserbase-project-id), Datei ~/.config/agent-workbench/browserbase.env.
+# Der Key wird nie auf stdout/stderr ausgegeben.
+set -uo pipefail
+
+API="${BROWSERBASE_API:-https://api.browserbase.com}"
+STATE="${WB_BROWSERBASE_STATE:-$HOME/.local/state/wb-browserbase}"
+MINUTEN_MONAT="${BROWSERBASE_MINUTEN_MONAT:-60}"
+RESERVE_MINUTEN="${BROWSERBASE_RESERVE_MINUTEN:-10}"
+ENV_DATEI="$HOME/.config/agent-workbench/browserbase.env"
+TSV="$STATE/sitzungen.tsv"
+mkdir -p "$STATE"
+
+# --- Zugangsdaten -------------------------------------------------------------
+
+_key_lesen() {
+  local teil="$1"
+  case "$teil" in
+    KEY) local var=BROWSERBASE_API_KEY schluessel=browserbase-api-key ;;
+    PROJEKT) local var=BROWSERBASE_PROJECT_ID schluessel=browserbase-project-id ;;
+    *) return 1 ;;
+  esac
+  if [ -n "${!var:-}" ]; then printf '%s' "${!var}"; return 0; fi
+  if command -v security >/dev/null 2>&1; then
+    local wert
+    wert="$(security find-generic-password -s "$schluessel" -w 2>/dev/null)" \
+      && [ -n "$wert" ] && { printf '%s' "$wert"; return 0; }
+  fi
+  if [ -f "$ENV_DATEI" ]; then
+    local zeile
+    zeile="$(grep -m1 "^${var}=" "$ENV_DATEI" 2>/dev/null)" || true
+    if [ -n "${zeile:-}" ]; then printf '%s' "${zeile#*=}"; return 0; fi
+  fi
+  return 1
+}
+
+# Die Hilfe braucht keinen Schluessel -- wer das Werkzeug erst einrichtet, soll
+# sie lesen koennen (Nachbesserung 2026-09-09 nach dem Review des Worker-Stands).
+case "${1:-hilfe}" in
+  hilfe|-h|--help) ;;
+  *)
+    API_KEY="$(_key_lesen KEY || true)"
+    PROJECT_ID="$(_key_lesen PROJEKT || true)"
+    if [ -z "$API_KEY" ]; then
+      echo "wb-browserbase: kein API-Key (Umgebung, Schluesselbund oder $ENV_DATEI)" >&2
+      exit 2
+    fi ;;
+esac
+API_KEY="${API_KEY:-}"; PROJECT_ID="${PROJECT_ID:-}"
+
+# --- Helfer -------------------------------------------------------------------
+
+eigentuemer() { printf '%s' "${TMUX_PANE:-pid:$PPID}"; }
+
+fehler_api() {
+  # $1 = HTTP-Status, $2 = Antworttext. Kuerzen, damit der Key nie durchlaeuft.
+  local text="${2:0:200}"
+  echo "wb-browserbase: API-Fehler (HTTP $1): $text" >&2
+  exit 4
+}
+
+aufruf() {
+  # $1 = Methode, $2 = Pfad, $3 = Body (leer erlaubt). Antworttext auf stdout,
+  # HTTP-Status in $HTTP_STATUS, Fehler -> Exit 4.
+  local methode="$1" pfad="$2" body="${3:-}" tmp
+  tmp="$(mktemp)"
+  local status
+  if [ -n "$body" ]; then
+    status="$(curl -sS --max-time 20 -o "$tmp" -w '%{http_code}' \
+      -X "$methode" -H "X-BB-API-Key: $API_KEY" \
+      -H 'Content-Type: application/json' -d "$body" "$API$pfad")"
+  else
+    status="$(curl -sS --max-time 20 -o "$tmp" -w '%{http_code}' \
+      -X "$methode" -H "X-BB-API-Key: $API_KEY" "$API$pfad")"
+  fi
+  # AUFRUF_TOLERANT nennt einen Status, der KEIN Fehler ist (404 beim Beenden:
+  # die Sitzung ist serverseitig schon weg, genau das wollte der Aufrufer).
+  if [ "$status" -ge 400 ] && [ "$status" != "${AUFRUF_TOLERANT:-}" ]; then
+    local text; text="$(cat "$tmp")"; rm -f "$tmp"
+    fehler_api "$status" "$text"
+  fi
+  HTTP_STATUS="$status"
+  cat "$tmp"
+  rm -f "$tmp"
+}
+
+json_wert() {
+  # $1 = JSON, $2 = Schluessel. /usr/bin/python3 statt jq.
+  /usr/bin/python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+print(d.get(sys.argv[2], ""))
+' "$1" "$2"
+}
+
+budget_pruefen() {
+  local zeile nutzung minuten
+  zeile="$(aufruf GET "/v1/projects/$PROJECT_ID/usage")"
+  nutzung="$(json_wert "$zeile" browserMinutes)"
+  [ -z "$nutzung" ] && nutzung=0
+  minuten=$((MINUTEN_MONAT - RESERVE_MINUTEN))
+  if [ "$nutzung" -ge "$minuten" ]; then
+    echo "wb-browserbase: Budget aufgebraucht ($nutzung von $MINUTEN_MONAT Minuten, Grenze $minuten)" >&2
+    exit 3
+  fi
+  printf '%s' "$nutzung"
+}
+
+# --- Befehle ------------------------------------------------------------------
+
+cmd_nutzung() {
+  local json=0 zeile nutzung limit reserve frei ok
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      *) echo "wb-browserbase: unbekannte Option '$1' fuer 'nutzung'" >&2; exit 1 ;;
+    esac
+  done
+  zeile="$(aufruf GET "/v1/projects/$PROJECT_ID/usage")"
+  nutzung="$(json_wert "$zeile" browserMinutes)"
+  [ -z "$nutzung" ] && nutzung=0
+  limit="$MINUTEN_MONAT"
+  reserve="$RESERVE_MINUTEN"
+  frei="$((limit - reserve - nutzung))"
+  [ "$frei" -lt 0 ] && frei=0
+  if [ "$nutzung" -lt "$((limit - reserve))" ]; then ok="true"; else ok="false"; fi
+  if [ "$json" -eq 1 ]; then
+    # JSON-Objekt via /usr/bin/python3 (json.dumps), nicht von Hand gebaut.
+    # Geht in beiden Zustanden auf stdout, der Exit-Code traegt den Zustand.
+    /usr/bin/python3 -c '
+import json, sys
+print(json.dumps({"browserMinutes": int(sys.argv[1]), "limit": int(sys.argv[2]),
+                  "reserve": int(sys.argv[3]), "frei": int(sys.argv[4]),
+                  "budgetOk": sys.argv[5] == "true"}))
+' "$nutzung" "$limit" "$reserve" "$frei" "$ok"
+  else
+    if [ "$ok" = "false" ]; then
+      echo "Browserzeit: $nutzung von $limit Minuten (Reserve $reserve)" >&2
+    else
+      echo "Browserzeit: $nutzung von $limit Minuten (Reserve $reserve)"
+    fi
+  fi
+  if [ "$ok" = "false" ]; then
+    exit 3
+  fi
+}
+
+cmd_sitzung_neu() {
+  local minuten=15
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --minuten) minuten="$2"; shift 2 ;;
+      *) echo "wb-browserbase: unbekannte Option '$1' fuer 'sitzung neu'" >&2; exit 1 ;;
+    esac
+  done
+  budget_pruefen >/dev/null
+  local body antwort id
+  body="{\"projectId\": \"$PROJECT_ID\", \"timeout\": $((minuten * 60))}"
+  antwort="$(aufruf POST /v1/sessions "$body")"
+  id="$(json_wert "$antwort" id)"
+  if [ -z "$id" ]; then
+    echo "wb-browserbase: API lieferte keine Sitzungs-ID" >&2
+    exit 4
+  fi
+  printf '%s\t%s\t%s\n' "$id" "$(date -u +%FT%TZ)" "$(eigentuemer)" >> "$TSV"
+  printf '%s\n' "$id"
+}
+
+cmd_sitzung_liste() {
+  local antwort
+  antwort="$(aufruf GET '/v1/sessions?status=RUNNING')"
+  /usr/bin/python3 -c '
+import json, sys, pathlib
+antwort = sys.argv[1]
+tsv = pathlib.Path(sys.argv[2])
+eigene = set()
+if tsv.exists():
+    for zeile in tsv.read_text().splitlines():
+        if zeile.strip():
+            eigene.add(zeile.split("\t")[0])
+d = json.loads(antwort)
+sitzungen = d if isinstance(d, list) else d.get("sessions", d.get("data", []))
+for s in sitzungen:
+    sid = s.get("id", "")
+    art = "eigen" if sid in eigene else "fremd"
+    # Kein Backslash im f-String-Ausdruck: /usr/bin/python3 ist 3.9 (gemessen 2026-09-09).
+    angelegt = s.get("createdAt", "")
+    print(f"{sid}  {angelegt}  ({art})")
+' "$antwort" "$TSV"
+}
+
+cmd_sitzung_ende() {
+  local alles=0 ziel=""
+  case "${1:-}" in
+    --alle) alles=1 ;;
+    "") echo "wb-browserbase: 'sitzung ende' braucht <id> oder --alle" >&2; exit 1 ;;
+    *) ziel="$1" ;;
+  esac
+  enden() {
+    local id="$1"
+    # 404 ist hier kein Fehler: die Sitzung ist serverseitig schon weg. Ohne die
+    # Toleranz haette aufruf() das ganze Werkzeug mit Exit 4 beendet, und der
+    # Eintrag waere stehen geblieben (Fund im Review 2026-09-09).
+    AUFRUF_TOLERANT=404 aufruf POST "/v1/sessions/$id" \
+      "{\"projectId\": \"$PROJECT_ID\", \"status\": \"REQUEST_RELEASE\"}" >/dev/null
+    # Eintrag entfernen; fehlt die Sitzung serverseitig (404), trotzdem Exit 0.
+    if [ -f "$TSV" ]; then
+      /usr/bin/python3 -c '
+import sys, pathlib
+tsv = pathlib.Path(sys.argv[1]); sid = sys.argv[2]
+zeilen = [z for z in tsv.read_text().splitlines() if z.strip() and z.split("\t")[0] != sid]
+tsv.write_text("".join(z + "\n" for z in zeilen))
+' "$TSV" "$id"
+    fi
+  }
+  if [ "$alles" = 1 ]; then
+    if [ ! -f "$TSV" ]; then echo "wb-browserbase: keine eigene Sitzungen eingetragen"; return 0; fi
+    local ids
+    ids="$(/usr/bin/python3 -c '
+import sys, pathlib
+for z in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    if z.strip(): print(z.split("\t")[0])
+' "$TSV")"
+    for id in $ids; do enden "$id"; done
+    : > "$TSV"
+  else
+    enden "$ziel"
+  fi
+}
+
+cmd_cdp_url() {
+  local id="${1:-}"
+  [ -z "$id" ] && { echo "wb-browserbase: cdp-url braucht <id>" >&2; exit 1; }
+  # ACHTUNG: Ausgabe enthaelt den API-Key. Nur in $(...) verwenden, nie loggen,
+  # nie in eine Datei schreiben, die jemand liest.
+  printf 'wss://connect.browserbase.com?apiKey=%s&sessionId=%s\n' "$API_KEY" "$id"
+}
+
+cmd_schau() {
+  local oeffnen=0 id=""
+  for a in "$@"; do
+    case "$a" in
+      --oeffnen) oeffnen=1 ;;
+      *) id="$a" ;;
+    esac
+  done
+  [ -z "$id" ] && { echo "wb-browserbase: schau braucht <id>" >&2; exit 1; }
+  local antwort url
+  antwort="$(aufruf GET "/v1/sessions/$id/debug")"
+  url="$(json_wert "$antwort" debuggerFullscreenUrl)"
+  [ -z "$url" ] && { echo "wb-browserbase: keine Live-Ansicht fuer $id" >&2; exit 4; }
+  printf '%s\n' "$url"
+  if [ "$oeffnen" = 1 ] && [ "$(uname)" = Darwin ]; then
+    open "$url"
+  fi
+}
+
+cmd_env() {
+  # ACHTUNG: Ausgabe enthaelt den API-Key. Nur in eval "$(wb-browserbase env)"
+  # verwenden, nie loggen.
+  printf 'export BROWSERBASE_API_KEY=%q\n' "$API_KEY"
+  printf 'export BROWSERBASE_PROJECT_ID=%q\n' "$PROJECT_ID"
+}
+
+hilfe() {
+  cat <<'EOF'
+wb-browserbase — gehosteter Browser (Browserbase) auf Anforderung.
+
+  wb-browserbase nutzung [--json]            Monatsbudget anzeigen (--json: JSON-Objekt auf stdout)
+  wb-browserbase sitzung neu [--minuten N]   Sitzung oeffnen (Vorgabe 15 min), gibt nur die ID aus
+  wb-browserbase sitzung liste               laufende Sitzungen (eigen|fremd)
+  wb-browserbase sitzung ende <id>|--alle    Sitzung(en) beenden
+  wb-browserbase cdp-url <id>                wss-URL fuer --cdp-endpoint (ENTHAELT DEN KEY, nie loggen)
+  wb-browserbase schau <id> [--oeffnen]      Live-Ansicht (debuggerFullscreenUrl)
+  wb-browserbase env                         export-Zeilen fuer eval (ENTHAELT DEN KEY, nie loggen)
+  wb-browserbase hilfe
+
+Exit-Codes: 0 ok, 2 kein Key, 3 Budget aufgebraucht, 4 API-Fehler.
+EOF
+}
+
+case "${1:-hilfe}" in
+  nutzung) shift; cmd_nutzung "$@" ;;
+  sitzung)
+    case "${2:-}" in
+      neu)   shift 2; cmd_sitzung_neu "$@" ;;
+      liste) cmd_sitzung_liste ;;
+      ende)  shift 2; cmd_sitzung_ende "${1:-}" ;;
+      *) echo "wb-browserbase: 'sitzung' braucht neu|liste|ende" >&2; exit 1 ;;
+    esac ;;
+  cdp-url) shift; cmd_cdp_url "${1:-}" ;;
+  schau)   shift; cmd_schau "$@" ;;
+  env)     cmd_env ;;
+  hilfe|*) hilfe ;;
+esac

@@ -29,6 +29,7 @@ import {
   filterModelle,
   filterSitzungen,
   filterTage,
+  gemeinsamerVorspann,
   harnessAuswahlliste,
   kompakt,
   kostenBild,
@@ -41,10 +42,12 @@ import {
   sitzungenTeilweise,
   summiere,
   tagesreihe,
+  umlaute,
   usd,
   vergleicheHarnesses,
   vergleicheWerte,
   vorherigerZeitraum,
+  wochenbudget,
   zahl,
   zeitpunkt,
   type Auswahl,
@@ -85,6 +88,8 @@ interface ThemaPayload {
   zustandsfarben: Record<string, string>;
   zustandsfarbenLesbar: Record<string, string>;
   zustandsfarbenTinte: Record<string, string>;
+  /** Bereitgestellt fuer den Worker 'farbsystem' -- siehe main/thema.ts. Dieses Fenster liest sie nicht. */
+  systemAkzentfarbe: string;
 }
 
 const NS = 'http://www.w3.org/2000/svg';
@@ -194,6 +199,10 @@ function legende(arten: string[]): HTMLElement {
 function zeichneZeitraum(): void {
   zeitraumEl.replaceChildren();
   zeitraumEl.appendChild(el('span', 'marke', `${t('zeitraum.titel')}:`));
+  // Die fuenf Zeitraeume sind EINE Wahl, nicht fuenf Schalter -- deshalb eine
+  // Segmentleiste statt fuenf einzelner Chips. Der Vergleichsknopf steht
+  // daneben und ausserhalb: er waehlt nicht mit, er schaltet etwas dazu.
+  const streifen = el('div', 'segmente');
   for (const n of ZEITRAEUME) {
     const k = el('button', `knopf${n === tage ? ' gewaehlt' : ''}`, t(`zeitraum.${n}`));
     k.type = 'button';
@@ -205,8 +214,9 @@ function zeichneZeitraum(): void {
       vergleichsDaten = null;
       void laden();
     });
-    zeitraumEl.appendChild(k);
+    streifen.appendChild(k);
   }
+  zeitraumEl.appendChild(streifen);
   const v = el('button', `knopf${vergleichAn ? ' gewaehlt' : ''}`, vergleichAn ? t('vergleich.aus') : t('vergleich.knopf'));
   v.type = 'button';
   v.id = 'vergleich-knopf';
@@ -257,17 +267,23 @@ function umschalten(liste: string[], id: string): void {
 
 // --- Die Abschnitte ---------------------------------------------------------
 
+/**
+ * Eine Zahl, wie sie hier ueberall steht: Beschriftung klein und gedaempft
+ * darueber, die Zahl gross darunter, ein Farbstrich in der Farbe der Tokenart.
+ * Kein Kasten -- die Zahl braucht keinen Rahmen, um eine Zahl zu sein.
+ */
 function kachel(klasse: string, titel: string, wert: string, neben?: string, titelText?: string): HTMLElement {
-  const k = el('div', `kachel ${klasse}`);
+  const k = el('div', `zahlenfeld ${klasse}`);
   if (titelText) k.title = titelText;
   k.appendChild(el('div', 'titel', titel));
   k.appendChild(el('div', 'wert', wert));
+  k.appendChild(el('div', 'strich'));
   if (neben) k.appendChild(el('div', 'neben', neben));
   return k;
 }
 
 function abschnittSummen(w: Werte): HTMLElement {
-  const k = el('div', 'kacheln');
+  const k = el('div', 'zahlenreihe');
   k.appendChild(kachel('summe', t('summe.gesamt'), zahl(w.ohne_cache_read), t('summe.nachrichten') + ': ' + zahl(w.nachrichten), t('summe.gesamt.hinweis')));
   k.appendChild(kachel('ein', t('summe.input'), zahl(w.input), kompakt(w.input)));
   k.appendChild(kachel('raus', t('summe.output'), zahl(w.output), kompakt(w.output)));
@@ -385,7 +401,7 @@ function tempoMarke(z: ModellZeile): HTMLElement {
   const art = z.tempo?.art ?? 'unbekannt';
   const klasse = art === 'gemessen' ? 'gemessen' : art === 'naeherung' ? 'naeherung' : 'fehlt';
   const m = el('span', `marke-art ${klasse}`, t(`tempo.${art}`));
-  m.title = z.tempo?.grund ?? '';
+  m.title = umlaute(z.tempo?.grund ?? '');
   return m;
 }
 
@@ -492,10 +508,11 @@ function abschnittTempo(modelle: ModellZeile[]): HTMLElement {
   const sortiert = [...mit].sort((a, b) => (b.tempo.wert ?? 0) - (a.tempo.wert ?? 0));
   const warnung = el('p', 'hinweis einschraenkung', t('tempo.warnung', t('tempo.gemessen')));
   if (sortiert.length === 0) return abschnitt(t('tempo.titel'), warnung, el('p', 'hinweis', t('leer')));
-  const zeilen = sortiert.map((z) => {
-    const grund = el('span', 'fein', z.tempo.grund);
-    return [z.harness, z.modell, tempoWert(z), tempoMarke(z), grund];
-  });
+  // KEINE SPALTE "GRUND". Der Satz aus `wb-budget` ist fuer alle Zeilen
+  // derselbe -- zehnmal untereinander verdoppelte er jede Zeilenhoehe und sagte
+  // nichts, was nicht schon in der Warnzeile ueber der Tabelle steht. Er haengt
+  // weiter als `title` an der Marke, wo ihn findet, wer ihn sucht.
+  const zeilen = sortiert.map((z) => [z.harness, z.modell, tempoWert(z), tempoMarke(z)]);
   return abschnitt(
     t('tempo.titel'),
     warnung,
@@ -505,16 +522,15 @@ function abschnittTempo(modelle: ModellZeile[]): HTMLElement {
         { text: t('modell.spalte') },
         { text: t('tempo.spalte'), zahl: true },
         { text: t('kosten.art') },
-        { text: t('luecke.grund') },
       ],
       zeilen,
     ),
   );
 }
 
-function abschnittKosten(modelle: ModellZeile[], d: Verbrauch): HTMLElement {
+function abschnittKosten(modelle: ModellZeile[]): HTMLElement {
   const bild = kostenBild(modelle);
-  const k = el('div', 'kacheln');
+  const k = el('div', 'zahlenreihe');
   const aequivalent = kachel('summe', t('kosten.summe.aequivalent'), usd(bild.aequivalent));
   aequivalent.appendChild(el('div', 'einschraenkung', t('kosten.nie_abgebucht')));
   k.appendChild(aequivalent);
@@ -522,54 +538,212 @@ function abschnittKosten(modelle: ModellZeile[], d: Verbrauch): HTMLElement {
   if (bild.aiu > 0) k.appendChild(kachel('cw', t('kosten.aiu'), bild.aiu.toLocaleString('de-DE', { maximumFractionDigits: 3 })));
   if (bild.ohnePreis.length > 0) k.appendChild(kachel('cr', t('kosten.ohne'), String(bild.ohnePreis.length), bild.ohnePreis.join(', ')));
 
-  const kontingent = kontingentTabelle(d);
-  return abschnitt(t('kosten.titel'), el('p', 'hinweis', t('kosten.zwei')), k, kontingent);
+  return abschnitt(t('kosten.titel'), el('p', 'hinweis', t('kosten.zwei')), k);
 }
 
-function kontingentTabelle(d: Verbrauch): HTMLElement {
-  const wurzel = el('div');
-  wurzel.appendChild(el('h2', undefined, t('kontingent.titel')));
+/**
+ * Ein Balken je Kontingent -- die erste Frage beim Aufmachen dieses Fensters,
+ * und deshalb der erste Abschnitt.
+ *
+ * DER BALKEN TRAEGT ZWEI ANGABEN, und sie sind nicht dieselbe: die Fuellung
+ * sagt, wieviel verbraucht IST, die Marke darauf, wieviel bis heute Abend
+ * verbraucht sein DARF. Ohne die Marke liest sich jeder Stand unter hundert
+ * als reichlich.
+ *
+ * NUR ZAHLEN AUS DER BRUECKE. Wo eine Grenze fehlt, gibt es keinen Balken --
+ * ein Balken ohne Nenner waere eine erfundene Zahl. Wer kein Kontingent hat,
+ * verschwindet nicht, sondern bekommt eine Zeile mit dem Grund.
+ */
+function balkenZeile(o: {
+  name: string;
+  wert: string;
+  anteil: number | null;
+  marke?: number;
+  rechts?: string;
+  fuss?: Node | null;
+  lage?: 'knapp' | 'voll';
+}): HTMLElement {
+  const z = el('div', 'balkenzeile');
+  if (o.lage) z.dataset.lage = o.lage;
+  const oben = el('div', 'oben');
+  oben.appendChild(el('span', 'name', o.name));
+  if (o.rechts) oben.appendChild(el('span', 'rechts', o.rechts));
+  z.appendChild(oben);
+  z.appendChild(el('div', 'wert', o.wert));
+  // Kein Nenner, kein Balken: eine leere Bahn behauptete eine Grenze, die die
+  // Bruecke gar nicht kennt.
+  if (o.anteil !== null) {
+    const bahn = el('div', 'bahn');
+    const fuellung = el('div', 'fuellung');
+    fuellung.style.width = `${Math.max(0, Math.min(100, o.anteil * 100)).toFixed(1)}%`;
+    bahn.appendChild(fuellung);
+    if (o.marke !== undefined && o.marke > 0 && o.marke < 1) {
+      const marke = el('div', 'marke');
+      marke.style.left = `${(o.marke * 100).toFixed(1)}%`;
+      bahn.appendChild(marke);
+    }
+    z.appendChild(bahn);
+  }
+  if (o.fuss) z.appendChild(o.fuss);
+  return z;
+}
+
+/**
+ * Abkuerzungen, die `wb-kontingent` mitbringt, ausgeschrieben. "AIC" steht im
+ * Fenster nirgends sonst und wird auch nirgends aufgeloest -- eine Abkuerzung,
+ * die nur ihr Erfinder kennt, ist keine Beschriftung. Was hier nicht steht,
+ * bleibt unveraendert stehen (nur die Umschrift wird zurueckgeholt).
+ */
+const EINHEIT_LANG: Record<string, string> = { AIC: 'einheit.aic' };
+
+function einheitLesbar(e: string): string {
+  const schluessel = EINHEIT_LANG[e];
+  return schluessel ? t(schluessel) : umlaute(e);
+}
+
+/**
+ * Ein Kontingentstand ohne Nenner. Die Nachkommastellen richten sich nach dem,
+ * was die Zahl traegt: 2,6888 verbrauchte Credits sind auf Hundertstel genau
+ * eine Aussage, auf Zehntausendstel eine Behauptung ueber die Messgenauigkeit
+ * der Quelle. Ab hundert faellt der Rest ganz weg.
+ */
+function kontingentZahl(v: number): string {
+  const stellen = Math.abs(v) >= 100 ? 0 : Math.abs(v) >= 10 ? 1 : 2;
+  return v.toLocaleString(sprache() === 'en' ? 'en-US' : 'de-DE', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: stellen,
+  });
+}
+
+function abschnittKontingente(d: Verbrauch): HTMLElement {
+  const liste = el('div', 'balkenliste');
+  let balken = 0;
+
+  // 1. Das Wochenfenster mit der Marke "erlaubt bis heute Abend".
+  const woche = wochenbudget(d.limits ?? []);
+  if (woche) {
+    const fuss = el('div', 'fuss');
+    fuss.appendChild(document.createTextNode(`${t('wochen.erlaubt')} `));
+    fuss.appendChild(el('b', undefined, prozent(woche.erlaubt)));
+    fuss.appendChild(document.createTextNode(' · '));
+    fuss.appendChild(
+      document.createTextNode(
+        woche.luft >= 0
+          // Punkte, nicht Prozent: die Luft ist die DIFFERENZ zweier
+          // Prozentwerte, und "6 % Luft" hiesse etwas anderes als "6 Punkte".
+          ? t('wochen.luft', zahl(woche.luft))
+          : t('wochen.darueber', zahl(Math.abs(woche.luft))),
+      ),
+    );
+    liste.appendChild(
+      balkenZeile({
+        name: t('limit.7d'),
+        wert: prozent(woche.verbraucht),
+        anteil: woche.verbraucht / 100,
+        marke: woche.erlaubt / 100,
+        rechts: t('wochen.tag', woche.tag),
+        fuss,
+        lage: woche.luft < 0 ? 'knapp' : undefined,
+      }),
+    );
+    balken += 1;
+  }
+
+  // 2. Je Harness, was `wb-kontingent` ueber ihn weiss.
   const roh = d.kontingent as Record<string, unknown> | undefined;
   const harnesses = roh && typeof roh === 'object' ? (roh['harnesses'] as Record<string, Record<string, unknown>> | undefined) : undefined;
-  if (!harnesses) {
-    const grund = roh && typeof roh['fehler'] === 'string' ? String(roh['fehler']) : t('kontingent.werkzeug.fehlt');
-    wurzel.appendChild(el('p', 'hinweis', t('kontingent.fehlt', grund)));
-    return wurzel;
-  }
-  const zeilen: (Node | string)[][] = [];
-  for (const [id, e] of Object.entries(harnesses)) {
-    const kont = (e['kontingent'] ?? {}) as Record<string, unknown>;
-    const art = String(kont['art'] ?? '');
-    if (art === 'keins' || art === '') {
-      zeilen.push([id, t('kontingent.keins'), '', '', String(e['hinweis'] ?? '')]);
-      continue;
+  const ohne: { wer: string; grund: string }[] = [];
+  const ohneStand: { wer: string; grund: string }[] = [];
+  if (harnesses) {
+    for (const [id, e] of Object.entries(harnesses)) {
+      const kont = (e['kontingent'] ?? {}) as Record<string, unknown>;
+      const art = String(kont['art'] ?? '');
+      const einheit = einheitLesbar(String(kont['einheit'] ?? ''));
+      // `Number(null)` ist 0, nicht NaN: bis zum 03.09. wurde daraus eine
+      // grosse, nackte "0" fuer jeden Harness, dessen Stand die Bruecke gar
+      // nicht kennt (agy, codex). Eine erfundene Null ist schlimmer als keine
+      // Zahl -- deshalb zaehlt nur, was wirklich als Zahl ankommt.
+      const verbraucht = typeof kont['verbraucht'] === 'number' ? (kont['verbraucht'] as number) : NaN;
+      const grenze = typeof kont['grenze'] === 'number' ? (kont['grenze'] as number) : NaN;
+      const rest = kont['rest'];
+      const zurueck = kont['faellt_zurueck_am'];
+      const erschoepft = e['erschoepft'] === true;
+      if (art === 'keins' || art === '' || !Number.isFinite(verbraucht)) {
+        // Zwei Ueberschriften, weil es zwei verschiedene Aussagen sind: "hat
+        // kein Kontingent" und "hat eines, aber niemand kann seinen Stand
+        // lesen". codex unter "kein Kontingent" zu fuehren waere schlicht
+        // falsch.
+        const wohin = art === 'keins' || art === '' ? ohne : ohneStand;
+        wohin.push({ wer: id, grund: umlaute(String(e['hinweis'] ?? '')) || t('kontingent.keins') });
+        continue;
+      }
+      const teile: string[] = [];
+      if (rest !== null && rest !== undefined) teile.push(`${t('kontingent.rest')} ${String(rest)}`);
+      if (zurueck) teile.push(t('kontingent.zurueck', zeitpunkt(String(zurueck))));
+      const hatGrenze = Number.isFinite(grenze) && grenze > 0;
+      // Die Bedeutungszeile unter der Zahl. Steht ein Prozentwert da, sagt die
+      // Einheit, WOVON er Prozent sind; steht der rohe Wert da, fehlt ohne
+      // dieses Wort jeder Bezug -- "2,69" allein ist keine Aussage.
+      const bedeutung = hatGrenze ? einheit : [einheit, t('kontingent.verbraucht')].filter(Boolean).join(' ');
+      const fuss = el('div', 'fuss', bedeutung);
+      if (erschoepft) {
+        fuss.textContent = '';
+        fuss.appendChild(el('b', undefined, t('kontingent.erschoepft')));
+        if (bedeutung) fuss.appendChild(document.createTextNode(` · ${bedeutung}`));
+      }
+      liste.appendChild(
+        balkenZeile({
+          name: id,
+          // Ohne Grenze keine Prozentzahl: dann steht der rohe Wert da, und der
+          // Balken bleibt leer, statt einen Nenner zu behaupten.
+          wert: hatGrenze ? prozent((verbraucht / grenze) * 100) : kontingentZahl(verbraucht),
+          anteil: hatGrenze ? verbraucht / grenze : null,
+          rechts: teile.join(' · '),
+          fuss,
+          lage: erschoepft ? 'voll' : undefined,
+        }),
+      );
+      balken += 1;
     }
-    const einheit = String(kont['einheit'] ?? '');
-    const verbraucht = kont['verbraucht'];
-    const rest = kont['rest'];
-    const zurueck = kont['faellt_zurueck_am'];
-    const zustand = e['erschoepft'] === true ? el('span', 'marke-art fehlt', t('kontingent.erschoepft')) : el('span', 'fein', '');
-    zeilen.push([
-      id,
-      verbraucht === null || verbraucht === undefined ? '—' : `${String(verbraucht)} ${einheit}`,
-      rest === null || rest === undefined ? '—' : String(rest),
-      zurueck ? t('kontingent.zurueck', zeitpunkt(String(zurueck))) : '',
-      zustand,
-    ]);
   }
-  wurzel.appendChild(
-    tabelle(
-      [
-        { text: t('harness.spalte') },
-        { text: t('kontingent.verbraucht') },
-        { text: t('kontingent.rest'), zahl: true },
-        { text: '' },
-        { text: '' },
-      ],
-      zeilen,
-    ),
-  );
-  return wurzel;
+
+  const teile: (Node | null)[] = [];
+  if (balken > 0) teile.push(liste);
+  if (!harnesses) {
+    // DIE MELDUNG SAGT DEN NAECHSTEN SCHRITT, DER ROHTEXT STEHT IM SCHILDCHEN
+    // (08.09.2026). Vorher stand der Rohtext IN der Zeile, und wer kein
+    // `wb-kontingent` hat, las hier „JSONDecodeError: Expecting value…" --
+    // eine wahre Angabe, die niemandem sagt, was zu tun ist.
+    const grund = roh && typeof roh['fehler'] === 'string' && roh['fehler'].trim()
+      ? String(roh['fehler']).trim()
+      : t('kontingent.werkzeug.fehlt');
+    const zeile = el('p', 'hinweis', t('kontingent.fehlt'));
+    zeile.dataset.grund = grund;
+    zeile.title = t('kontingent.fehlt.tipp', grund);
+    teile.push(zeile);
+  }
+  if (!woche) teile.push(el('p', 'hinweis', t('wochen.fehlt')));
+  for (const [ueberschrift, zeilen] of [
+    [t('kontingent.ohnestand'), ohneStand],
+    [t('kontingent.keins'), ohne],
+  ] as [string, { wer: string; grund: string }[]][]) {
+    if (zeilen.length === 0) continue;
+    teile.push(el('div', 'untertitel', ueberschrift));
+    // Was in JEDER Zeile gleich steht, steht einmal ueber der Liste. Vierzehn
+    // Zeilen mit demselben ersten Satz verdecken genau das, was sie
+    // unterscheidet -- dieselbe Regel wie bei der Token-je-Sekunde-Tabelle.
+    const vorspann = gemeinsamerVorspann(zeilen.map((z) => z.grund));
+    if (vorspann) teile.push(el('p', 'hinweis', vorspann));
+    const kasten = el('div');
+    for (const z of zeilen) {
+      const zeile = el('div', 'ohnekontingent');
+      zeile.appendChild(el('span', 'wer', z.wer));
+      zeile.appendChild(el('span', undefined, z.grund.slice(vorspann.length).trim()));
+      kasten.appendChild(zeile);
+    }
+    teile.push(kasten);
+  }
+  return abschnitt(t('kontingent.titel'), ...teile);
 }
 
 function abschnittLimit(d: Verbrauch): HTMLElement {
@@ -705,7 +879,7 @@ function abschnittVergleich(d: Verbrauch, gefiltert: ModellZeile[]): HTMLElement
 }
 
 function abschnittLuecken(d: Verbrauch): HTMLElement {
-  const zeilen = (d.luecken ?? []).map((l) => [l.harness, l.grund]);
+  const zeilen = (d.luecken ?? []).map((l) => [l.harness, umlaute(l.grund)]);
   return abschnitt(
     t('luecke.titel'),
     el('p', 'hinweis', t('luecke.einleitung')),
@@ -723,7 +897,7 @@ function abschnittQuellen(d: Verbrauch): HTMLElement {
       t(`quelle.zustand.${q.zustand}`),
       q.pfad,
       t('quelle.nachrichten', zahl(q.nachrichten)),
-      el('span', 'fein', q.hinweis),
+      el('span', 'fein', umlaute(q.hinweis)),
     ];
   });
   return abschnitt(
@@ -764,12 +938,16 @@ function zeichne(): void {
   standEl.textContent = t('stand', zeitpunkt(d.erzeugt), zeitpunkt(d.fenster.von), zeitpunkt(d.fenster.bis));
 
   inhaltEl.replaceChildren();
+  // Die Kontingente zuerst: "wieviel darf ich heute noch" ist die Frage, wegen
+  // der dieses Fenster aufgeht. Der Zeitraumfilter beruehrt sie nicht -- ein
+  // Kontingentstand ist immer der von jetzt.
+  inhaltEl.appendChild(abschnittKontingente(d));
   inhaltEl.appendChild(abschnittSummen(gesamt));
   inhaltEl.appendChild(abschnittTage(d, filterTage(d.je_tag ?? [], auswahl), gesamt));
   inhaltEl.appendChild(abschnittHarnesses(gefiltert));
   inhaltEl.appendChild(abschnittModelle(gefiltert));
   inhaltEl.appendChild(abschnittTempo(gefiltert));
-  inhaltEl.appendChild(abschnittKosten(gefiltert, d));
+  inhaltEl.appendChild(abschnittKosten(gefiltert));
   inhaltEl.appendChild(abschnittLimit(d));
   inhaltEl.appendChild(abschnittSitzungen(filterSitzungen(d.je_sitzung ?? [], auswahl)));
   const v = abschnittVergleich(d, gefiltert);

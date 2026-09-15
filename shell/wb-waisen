@@ -39,7 +39,7 @@
 #   2026-08-11, Befund 1: sonst wiederholt sich Fund 2 nur über den
 #   Eigentümer-Eintrag statt über PPID 1). Deshalb läuft für diese
 #   Kandidaten dieselbe Benutzungsmessung wie Weg B (unten); schlägt eines
-#   der drei Signale an, bleibt die Klasse `waise`, aber der `kill`-Vorschlag
+#   der (seit 08.09.2026: vier) Signale an, bleibt die Klasse `waise`, aber der `kill`-Vorschlag
 #   entfällt zugunsten der genannten Gegenstelle. Nur ein `waise`-Fund OHNE
 #   Benutzungssignal bekommt den `kill`-Vorschlag — das ist die einzige
 #   Ausgabe, die diese Klasse zum Beenden vorschlägt.
@@ -47,10 +47,18 @@
 #   WEG B, KEIN EINTRAG (Verdacht, nie ein Vorschlag): Prozesse, die vor
 #   `wb-nohup` entstanden sind oder von Hand per rohem `nohup … & disown`
 #   gestartet wurden, haben keinen Eintrag. Für sie bleibt nur die MESSUNG —
-#   und genau die hat Fund 2 erzeugt. Drei billige, deutungsarme Signale,
-#   ODER-verknüpft, jedes für sich reicht für „benutzt":
+#   und genau die hat Fund 2 erzeugt. Vier billige, deutungsarme Signale
+#   (bis 08.09.2026 drei, siehe Nachtrag unten), ODER-verknüpft, jedes für
+#   sich reicht für „benutzt":
 #     - offene ESTABLISHED-TCP-Verbindungen (lsof) — das direkte Gegenstück
 #       zu Fund 2.
+#     - offene UNIX-Domain-Sockets MIT Gegenstelle (lsof -U, Nachtrag
+#       08.09.2026, Folgeauftrag waisen): das TCP-Signal darüber ist blind
+#       für Prozesse, die nur über UNIX-Sockets reden (die Mac-Werkbank etwa
+#       — Kern und App tauschen sich ausschließlich über mantel.sock/
+#       awb.sock/awbmac.sock aus, nie über TCP) — ohne dieses Signal sähe ein
+#       lebender, gerade benutzter Kern/App exakt wie ein echter Waise aus.
+#       Siehe unix_verbindungen_von() weiter unten für die genaue Messung.
 #     - CPU-Zeit bewegt sich in einem kurzen Messfenster (Standard 3 s,
 #       empirisch: ein aktiver Prozess zeigte messbare Bewegung schon nach
 #       1,5 s).
@@ -62,7 +70,7 @@
 #       wächst, weil das Laden selbst die Zeit ist, in der er alt wird. Ein
 #       Mindestalter würde das NICHT retten (das Laden braucht ja Zeit); nur
 #       die Wachstumsmessung tut es.
-#   Trifft KEINES der drei zu, ist das Ergebnis Klasse `unregistriert` mit dem
+#   Trifft KEINES der vier zu, ist das Ergebnis Klasse `unregistriert` mit dem
 #   Vermerk „keine Anhaltspunkte" — IMMER NOCH KEIN kill-Vorschlag, denn diese
 #   Klasse beruht auf genau der Art Heuristik, die Fund 2 widerlegt hat.
 #   `unregistriert` ist selbst schon ein Befund (der Prozess wurde am
@@ -107,10 +115,17 @@
 #      verwaltete `llama-server` hat PPID=<ollama-pid>, nicht 1, und fällt
 #      schon hier heraus — stirbt Ollama unerwartet und sein `llama-server`
 #      überlebt, reparentet er ebenfalls zu PID 1 und wird zu Recht gesucht.
-#   4. Die Befehlszeile passt zu einer der vier Kategorien aus dem
-#      ursprünglichen Auftrag (Muster unten in match_kategorie()):
-#      Modellserver, Playwright/Chromium im Kopflos-Betrieb,
-#      Entwicklungsserver, Tunnel.
+#   4. Die Befehlszeile passt zu einer der Kategorien aus dem ursprünglichen
+#      Auftrag (Muster unten in match_kategorie()): Modellserver,
+#      Playwright/Chromium im Kopflos-Betrieb, Entwicklungsserver, Tunnel --
+#      ERGÄNZT am 08.09.2026 (Folgeauftrag waisen) um eine fünfte: die
+#      kopflose Mac-Werkbank (App und Electron-Kern), siehe deren eigenen
+#      Kommentar bei match_kategorie().
+#
+#   EINE FUENFTE BEDINGUNGSGRUPPE, NUR FUER LOGIN-SHELLS (2026-08-22): Punkt 1
+#   gilt fuer sie umgekehrt (ein ECHTES Terminal statt "??"), Punkt 4 entfaellt
+#   (keine Kategorie noetig) -- Begruendung und Messung stehen bei
+#   ist_login_shell() weiter unten, nicht hier verdoppelt.
 #
 # WAS DIESES WERKZEUG BEWUSST NICHT ERKENNT (lieber eine Lücke als ein
 # falscher Treffer — Standing Rule 2026-07-25):
@@ -179,7 +194,7 @@ for arg in "$@"; do
     --lines) MODE="lines" ;;
     --quiet) MODE="quiet" ;;
     --nur-waisen) NUR_WAISEN=1 ;;
-    -h|--help) sed -n '2,172p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,177p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "wb-waisen: unbekannte Option '$arg'" >&2; exit 2 ;;
   esac
 done
@@ -251,6 +266,36 @@ match_kategorie() {
   if [[ "$cmd" =~ /(ms-playwright|puppeteer)/ ]] && [[ "$cmd" =~ --headless ]]; then
     echo "Headless-Browser (Playwright/Puppeteer)"; return 0
   fi
+  # Mac-Werkbank kopflos: `mac/bin/starten` haengt sein eigener `abbruch`
+  # jetzt an einen `trap`, der auch bei einem externen Signal aufraeumt
+  # (08.09.2026, Folgeauftrag waisen -- Begruendung und Messung im Commit).
+  # Fuer den Fall, dass trotzdem einer durchrutscht (ein Vorfall vom selben
+  # Tag zeigte genau das, `wb-waisen` sah die zwei Kerne NICHT, weil keine der
+  # vier Kategorien passte), erkennt dieses Werkzeug beide Haelften: die
+  # kopflose App (Swift/AppKit-Binary, Flag `--kopflos`) und den Electron-Kern
+  # darunter (`--headless` gegen ein `app`-Verzeichnis). Meldet NUR -- ob und
+  # wie sicher es ein Fund ist, entscheidet wie ueberall in diesem Werkzeug
+  # Weg A/B danach (Eigentuemer-Eintrag, Benutzungsmessung), nie diese Zeile
+  # allein.
+  #
+  # GEGENLESEN 08.09.2026 (zweite Runde): beide Muster nennen jetzt den Pfad
+  # im Etikett -- die Werkbank gibt es je Arbeitsbaum als eigenen Bau
+  # (`/Applications` fuer echte des Nutzers App, `.../worktrees/<name>/mac/
+  # build` je Worktree), ohne den Pfad im Fund waere nicht zu unterscheiden,
+  # WELCHER Bau gemeint ist. Das App-Muster bleibt bewusst pfadoffen (der
+  # Binaryname "Werkbank.app" ist eindeutig genug, und ein Treffer unter
+  # `/Applications` -- echte des Nutzers App, sollte sie je mit `--kopflos`
+  # laufen -- soll NICHT verschwiegen, sondern klar als solcher benannt
+  # werden). Das Kern-Muster dagegen war zu weit gefasst: `[[:space:]]/app
+  # --headless` traf JEDES Verzeichnis, das zufaellig "app" heisst, auch
+  # voellig fremde Electron-Werkzeuge. Jetzt auf das bekannte Layout dieses
+  # Projekts eingeengt: `claude-workbench/app` oder `worktrees/<name>/app`.
+  if [[ "$cmd" =~ ^([^[:space:]]*)/Werkbank\.app/Contents/MacOS/Werkbank([[:space:]].*)?[[:space:]]--kopflos([[:space:]]|$) ]]; then
+    echo "Mac-Werkbank kopflos (Build: ${BASH_REMATCH[1]})"; return 0
+  fi
+  if [[ "$cmd" =~ [Ee]lectron[[:space:]]+([^[:space:]]*/(claude-workbench|worktrees/[^/[:space:]]+))/app[[:space:]]--headless([[:space:]]|$) ]]; then
+    echo "Mac-Werkbank kopflos (Electron-Kern, Build: ${BASH_REMATCH[1]})"; return 0
+  fi
   if [[ "$cmd" =~ (^|/)(vite|webpack-dev-server|http-server|live-server|caddy)([[:space:]]|$) ]]; then
     echo "Entwicklungsserver"; return 0
   fi
@@ -275,6 +320,95 @@ match_kategorie() {
   return 1
 }
 
+# VIERTE KLASSE, WEDER WEG A NOCH WEG B: eine verwaiste LOGIN-SHELL (2026-08-22,
+# Auftrag "413 verwaiste Shells, und ein Waechter, der sie nicht sah"). Anlass:
+# 413 solcher Shells hielten 430 von 511 PTYs (kern.tty.ptmx_max) auf dieser
+# Maschine, alle mit Elternprozess 1 -- und keine der vier Bedingungen oben
+# fand sie, weil Bedingung 1 ein FEHLENDES Terminal verlangt (diese Shells
+# haben noch ein ECHTES) und Bedingung 4 (match_kategorie) damals nur
+# Modellserver, Headless-Browser, Entwicklungsserver und Tunnel kannte --
+# eine nackte Shell passt in keine dieser vier Kategorien. (Stand 2026-08-22;
+# seit 08.09.2026 kennt match_kategorie() eine fuenfte, die kopflose
+# Mac-Werkbank -- am Argument dieses Absatzes aendert das nichts, eine nackte
+# Shell passt in keine der inzwischen fuenf Kategorien.)
+#
+# WOHER SIE KOMMEN, GEMESSEN statt vermutet: ein tmux-Server auf eigenem
+# Testsocket, mit `kill-server` regulaer beendet, laesst einen Teil seiner
+# Panes zurueck -- gemessen an fuenf Laeufen zu je zehn Panes: 0, 4, 4, 6, 0
+# blieben sofort nach dem `kill-server` am Leben, in zwei der fuenf Laeufe
+# auch noch nach drei Sekunden. Ein manuelles `kill -HUP` gegen eine dieser
+# Shells beendete sie sofort -- sie ignoriert SIGHUP nicht, sie hat es nur nie
+# bekommen: ein Rennen zwischen dem Sterben des Servers und der (asynchronen)
+# Zustellung des Hangup an seine Panes, das nicht immer aufgeloest wird, bevor
+# der Server selbst schon weg ist. Die eigentliche Abhilfe gehoert dorthin, wo
+# das passiert (die Testsuiten und ihr gemeinsames Aufraeummuster) -- diese
+# Klasse hier ist das Sicherheitsnetz, kein Ersatz dafuer.
+#
+# WARUM BEDINGUNG 1 FUER DIESE KLASSE UMGEKEHRT GILT: ein ECHTES Terminal
+# (ttysNNN) statt "??" ist hier gerade das Erkennungsmerkmal, nicht der
+# Ausschlussgrund -- ein launchd-Job (der einzige andere Weg zu PPID 1) hat so
+# gut wie nie ein Terminal, ein verwaistes Pane behaelt seins, solange es
+# lebt. Gemessen: unter allen eigenen Prozessen mit PPID 1 und TTY "??" auf
+# dieser Maschine trug keiner den Befehl einer nackten Shell -- die zwei
+# Merkmale trennen die Faelle bereits in der Praxis, nicht nur auf dem Papier.
+#
+# WARUM DAS SOFORT KLASSE "waise" IST, OHNE DEN UMWEG UEBER "unregistriert":
+# der Fehler in der ERSTEN Fassung dieses Werkzeugs (siehe Fund 2 oben) war,
+# PPID 1 mit "abgeloest" zu verwechseln -- und genau das gilt fuer eine
+# Login-Shell NICHT. Ein Modellserver wird ABSICHTLICH abgeloest gestartet, um
+# unabhaengig von seinem Starter weiterzulaufen und andere Anfragen zu
+# bedienen; das ist sein Zweck. Eine Login-Shell hat keinen Zweck ausser der
+# interaktiven Verbindung zu genau dem Pane, das sie erzeugt hat -- und PPID 1
+# beweist bei ihr, im Unterschied zum Modellserver, dass es GENAU DAS nicht
+# mehr gibt. Niemand startet eine nackte Shell absichtlich abgeloest, um sie
+# unabhaengig von ihrem Terminal weiterlaufen zu lassen (dafuer gibt es
+# `wb-nohup` fuer den PROZESS, den man behalten will, nie fuer die Shell
+# selbst, die ihn gestartet hat). Trotzdem laeuft auch dieser Fund durch
+# dieselbe Benutzungsmessung wie Weg A/B (miss_grund, unten) -- ein Vorbehalt
+# bleibt: ein noch laufender Kindprozess (ein vergessenes `make`, ein REPL)
+# zeigt sich dort als CPU- oder Speicherbewegung und nimmt dem Fund den
+# kill-Vorschlag, genau wie bei Fund 1.
+#
+# DIE GEGENPROBE (lebende_pane_pids, unten) ist reine Zusatzsicherung gegen
+# PID-Wiederverwendung ZWISCHEN Messung und Handeln (ein Bericht kann Stunden
+# alt sein, bevor jemand danach `kill` tippt) -- strukturell kann eine PPID-1-
+# Shell nie gleichzeitig der lebende Pane eines lebenden Servers sein, das
+# Ergebnis sollte also immer leer bleiben. Geprueft wird ueber ALLE
+# vorhandenen Sockets, nicht nur Test-Sockets -- auch 'default', die echte
+# Sitzung, zaehlt mit.
+#
+# PRAEZISION wie bei Fall F (Kopfkommentar): nur eine Befehlszeile, die EXAKT
+# einer nackten interaktiven Shell entspricht (`-zsh`, `zsh`, `-bash`, `bash`,
+# `-sh`, `sh`, `-ksh`, `ksh` — der Bindestrich zeigt eine LOGIN-Shell an, tmux
+# startet Panes standardmaessig so). Eine Shell MIT Argumenten oder ein
+# Skript, dessen Name zufaellig "zsh" heisst, faellt bewusst NICHT hierunter.
+ist_echtes_pty() {   # <tty> -> 0, wenn ein echtes allokiertes PTY (ttysNNN)
+  case "$1" in
+    ttys[0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ist_login_shell() {   # <befehl> -> 0, wenn EXAKT eine nackte Login-Shell
+  case "$1" in
+    -zsh|zsh|-bash|bash|-sh|sh|-ksh|ksh) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# lebende_pane_pids -> druckt jede PID, die GERADE Pane irgendeines
+# vorhandenen tmux-Servers ist (alle Sockets, nicht nur Test-Sockets). Rein
+# LESEND (list-panes), kein Server wird angefasst.
+lebende_pane_pids() {
+  local sockdir="${TMUX_TMPDIR:-/tmp}/tmux-$MEINE_UID" sock
+  [ -n "$TMUX_BIN" ] || return 0
+  [ -d "$sockdir" ] || return 0
+  for sock in "$sockdir"/*; do
+    [ -S "$sock" ] || continue
+    "$TMUX_BIN" -S "$sock" list-panes -a -F '#{pane_pid}' 2>/dev/null
+  done
+}
+
 # Nur TCP-LISTEN-Ports (fuer die Anzeige) — kein Ausschlussgrund, wenn leer.
 ports_von() {
   lsof -nP -iTCP -sTCP:LISTEN -a -p "$1" 2>/dev/null \
@@ -289,6 +423,39 @@ etablierte_verbindungen_von() {
   n="$(printf '%s\n' "$out" | grep -c . || true)"
   remotes="$(printf '%s\n' "$out" | sort -u | paste -sd, -)"
   printf '%s|%s' "${n:-0}" "$remotes"
+}
+
+# VIERTES BENUTZUNGSSIGNAL (08.09.2026, Gegenlesen-Pflichtpunkt): Kern und
+# App der Mac-Werkbank reden NUR ueber UNIX-Sockets (mantel.sock, awb.sock,
+# awbmac.sock) -- nie ueber TCP. Die drei bestehenden Signale sind fuer sie
+# strukturell blind: keine ESTABLISHED-TCP-Verbindung (es gibt keine),
+# zwischen zwei Befehlen keine CPU-Bewegung, kein RSS-Wachstum nach dem
+# Anlaufen. Ein LEBENDER, GERADE BENUTZTER Kern/App saehe damit exakt wie ein
+# echter Waise aus -- "keine Anhaltspunkte fuer Benutzung" fuer einen Prozess,
+# an dem gerade jemand haengt, waere die Einladung, ihn zu killen.
+#
+# `lsof -U -a -p <pid>` zeigt jeden UNIX-Socket-Deskriptor des Prozesses.
+# Gemessen (eigener Server/Client-Aufbau, python3 socket.AF_UNIX): ein bloss
+# GEBUNDENER, noch unbenutzter Listen-Socket erscheint EINMAL, mit dem reinen
+# Pfad als NAME. Verbindet sich ein Client, kommen zwei Formen dazu, je nach
+# Blickwinkel: auf der CLIENT-Seite ein NAME, das mit "->" beginnt (Zeiger auf
+# die Gegenstelle); auf der SERVER-Seite (unser Fall: Kern/App sind die
+# lauschende Seite) KEIN "->" -- stattdessen ein ZWEITER lsof-Eintrag mit
+# DEMSELBEN Pfad (der akzeptierte Verbindungs-Deskriptor neben dem
+# urspruenglichen Listen-Deskriptor). "Gegenstelle vorhanden" heisst hier
+# deshalb: mindestens ein NAME beginnt mit "->", ODER derselbe Pfad taucht
+# mehr als einmal auf.
+unix_verbindungen_von() {
+  local pid="$1"
+  lsof -U -a -p "$pid" 2>/dev/null | awk 'NR>1 {
+    name=$NF
+    if (name ~ /^->/) { peers++; next }
+    zaehler[name]++
+  }
+  END {
+    for (n in zaehler) if (zaehler[n] > 1) peers += zaehler[n]-1
+    print peers+0
+  }'
 }
 
 rss_lesbar() {
@@ -471,18 +638,25 @@ PY
 # BSD-ps NICHT die Schnittmenge, sondern die Vereinigung (gemessen) — deshalb
 # ein voller Sweep ohne -p, gefiltert in bash. ALLE_PIDS haelt JEDE gesehene
 # PID fest (fuer das Aufraeumen verwaister Registrierungen unten), CANDIDATES
-# nur die, die Bedingungen 1-4 erfuellen.
+# die, die Bedingungen 1-4 erfuellen. SHELL_CANDIDATES ist die vierte Klasse
+# (siehe deren Kommentar oben, vor ist_login_shell()): PPID 1 wie die anderen,
+# aber mit einem ECHTEN Terminal statt "??" -- Bedingung 1 gilt fuer sie
+# ABSICHTLICH umgekehrt, Bedingung 4 (Kategorie) entfaellt.
 ALLE_PIDS=""
 CANDIDATES=""
+SHELL_CANDIDATES=""
 while IFS=$'\t' read -r uid pid ppid tty rss etime cmd; do
   [ -n "$pid" ] || continue
   ALLE_PIDS="${ALLE_PIDS}${pid}"$'\n'
   [ "$uid" = "$MEINE_UID" ] || continue
-  [ "$tty" = "??" ] || continue
   [ "$ppid" = "1" ] || continue
   ist_launchd_dienst "$pid" && continue
-  kategorie="$(match_kategorie "$cmd")" || continue
-  CANDIDATES="${CANDIDATES}${pid}|${rss}|${etime}|${kategorie}|${cmd}"$'\n'
+  if [ "$tty" = "??" ]; then
+    kategorie="$(match_kategorie "$cmd")" || continue
+    CANDIDATES="${CANDIDATES}${pid}|${rss}|${etime}|${kategorie}|${cmd}"$'\n'
+  elif ist_echtes_pty "$tty" && ist_login_shell "$cmd"; then
+    SHELL_CANDIDATES="${SHELL_CANDIDATES}${pid}|${rss}|${etime}|${tty}|${cmd}"$'\n'
+  fi
 done < <(ps -axwwo uid=,pid=,ppid=,tty=,rss=,etime=,command= \
           | awk 'BEGIN{OFS="\t"} {
               uid=$1; pid=$2; ppid=$3; tty=$4; rss=$5; etime=$6;
@@ -516,8 +690,8 @@ fi
 # statt ueber PPID 1 wiederholt. Ein Kandidat mit totem Eigentuemer laeuft
 # deshalb erst durch dasselbe Messfenster wie Weg B (unten); die Klasse
 # bleibt "waise" (der Eigentuemer IST tot, das bleibt wahr), aber der
-# kill-Vorschlag entfaellt, wenn eines der drei Signale anschlaegt -- die
-# Gegenstelle wird dann stattdessen genannt.
+# kill-Vorschlag entfaellt, wenn eines der vier Signale anschlaegt (siehe
+# Kopfkommentar) -- die Gegenstelle wird dann stattdessen genannt.
 WAISE_TOT_META=""
 UNREG_META=""
 while IFS='|' read -r pid rss etime kategorie cmd; do
@@ -570,6 +744,29 @@ done <<EOF
 $CANDIDATES
 EOF
 
+# == Vierte Klasse: verwaiste Login-Shells (Begruendung siehe oben, vor
+#    ist_login_shell()). Kein Registry-Eintrag (Weg A passt nicht, wb-nohup
+#    startet nie eine nackte Shell) und keine Kategorie (Weg B passt nicht) --
+#    trotzdem ist der Fund so hart wie Weg A: PPID 1 bei einer Shell beweist
+#    bereits, dass ihr Terminal/Pane weg ist. Die Gegenprobe gegen alle
+#    LEBENDEN Panes ist reine Zusatzsicherung gegen PID-Wiederverwendung
+#    zwischen Messung und Handeln -- strukturell kann eine PPID-1-Shell nie
+#    zu einem lebenden Server gehoeren.
+if [ -n "$SHELL_CANDIDATES" ]; then
+  LEBENDE_PANES=$'\n'"$(lebende_pane_pids)"$'\n'
+  while IFS='|' read -r pid rss etime tty cmd; do
+    [ -n "$pid" ] || continue
+    case "$LEBENDE_PANES" in
+      *$'\n'"$pid"$'\n'*) continue ;;   # doch (noch) ein lebender Pane -- kein Fund
+    esac
+    detail="Eigentuemer: keiner mehr -- Terminal/Pane von $tty ist weg (PPID 1)"
+    [ -n "$TMUX_FEHLT" ] && detail="$detail; tmux nicht auffindbar, Gegenprobe gegen lebende Panes uebersprungen"
+    WAISE_TOT_META="${WAISE_TOT_META}${pid}|${rss}|${etime}|Login-Shell (verwaist)|${cmd}|${detail}"$'\n'
+  done <<EOF
+$SHELL_CANDIDATES
+EOF
+fi
+
 # == Gemeinsames Messfenster: Weg-A-Kandidaten mit totem Eigentuemer UND
 #    Weg-B-Kandidaten teilen sich EINEN Schlaf statt je einem eigenen -- die
 #    Gesamtlaufzeit haengt nicht von der Anzahl der Kandidaten ab. Wird
@@ -593,18 +790,21 @@ EOF
   # Anhaltspunkte...") und RSS_NEU. Dieselbe Messung fuer Weg A und Weg B --
   # sonst kehrt Fund 2 auf dem jeweils ungeprueften Weg zurueck.
   miss_grund() {
-    local pid="$1" zt_v_zeile zeit_v rss_v zeit_n rss_n verb verb_n verb_remote delta_zeit delta_rss
+    local pid="$1" zt_v_zeile zeit_v rss_v zeit_n rss_n verb verb_n verb_remote verb_u delta_zeit delta_rss
     zt_v_zeile="$(printf '%s\n' "$VORHER" | awk -F'|' -v p="$pid" '$1==p{print;exit}')"
     IFS='|' read -r _ zeit_v rss_v <<< "$zt_v_zeile"
     zeit_n="$(ps -o time= -p "$pid" 2>/dev/null | tr -d ' ')"
     rss_n="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
     verb="$(etablierte_verbindungen_von "$pid")"
     IFS='|' read -r verb_n verb_remote <<< "$verb"
+    verb_u="$(unix_verbindungen_von "$pid")"
     delta_zeit="$(awk -v a="$(zeit_zu_sekunden "${zeit_v:-0:00.00}")" -v b="$(zeit_zu_sekunden "${zeit_n:-0:00.00}")" 'BEGIN{printf "%.2f", b-a}')"
     delta_rss=$(( ${rss_n:-0} - ${rss_v:-0} ))
     RSS_NEU="${rss_n:-0}"
     if [ "${verb_n:-0}" -gt 0 ] 2>/dev/null; then
       GRUND="benutzt — $verb_n offene ESTABLISHED-Verbindung(en) von ${verb_remote:-unbekannt}"
+    elif [ "${verb_u:-0}" -gt 0 ] 2>/dev/null; then
+      GRUND="benutzt — $verb_u offene UNIX-Socket-Verbindung(en) mit Gegenstelle (Kern/App reden nur darueber, siehe unix_verbindungen_von)"
     elif awk -v d="$delta_zeit" 'BEGIN{exit !(d>0.05)}'; then
       GRUND="benutzt — CPU-Zeit bewegt sich (+${delta_zeit}s in ${SLEEP_SEK}s)"
     elif [ "$delta_rss" -gt 1024 ] 2>/dev/null; then

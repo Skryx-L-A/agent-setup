@@ -30,7 +30,17 @@ export class Erststartfenster {
   private fenster: BrowserWindow | null = null;
   private bereit: Promise<void> | null = null;
 
-  constructor(private readonly eltern: () => BrowserWindow | null) {}
+  /**
+   * `sperre` sagt vor jedem `new BrowserWindow`, ob ein Fenster ueberhaupt
+   * entstehen darf, und nennt sonst den Grund (main.ts, `fenstersperre`): im
+   * Mantelbetrieb bringt die Mac-native Oberflaeche dieses Blatt selbst mit,
+   * und ein zweites, unsichtbares Electron-Fenster daneben waere eine Buehne
+   * ohne Publikum (Auftrag 4.1). Ohne die Funktion baut die Klasse wie bisher.
+   */
+  constructor(
+    private readonly eltern: () => BrowserWindow | null,
+    private readonly sperre?: () => string | null,
+  ) {}
 
   /** Das Fenster, wenn es existiert -- für Auskunft und Foto. */
   aktuell(): BrowserWindow | null {
@@ -39,6 +49,8 @@ export class Erststartfenster {
 
   /** Bauen und laden, OHNE zu zeigen. Ein stehendes Fenster wird wiederverwendet. */
   async baue(): Promise<BrowserWindow> {
+    const gesperrt = this.sperre?.();
+    if (gesperrt) throw new Error(gesperrt);
     const da = this.aktuell();
     if (da && this.bereit) {
       await this.bereit;
@@ -56,7 +68,7 @@ export class Erststartfenster {
       show: false,
       parent: eltern ?? undefined,
       modal: false,
-      title: 'Agent-Workbench — Erste Schritte',
+      title: 'Agent-Workbench – Erste Schritte',
       backgroundColor: '#101216',
       paintWhenInitiallyHidden: true,
       webPreferences: {

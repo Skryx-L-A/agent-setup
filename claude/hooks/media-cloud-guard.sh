@@ -2,6 +2,10 @@
 # Zweck: WARNT (blockt nie) bei Aufrufen an bekannte Cloud-Bild-/Video-/Audio-
 #        APIs, verweist auf die lokalen Tools bild/video/tts/stt.
 # Event: PreToolUse, matcher Bash + WebFetch.
+# NICHT REGISTRIERT: der Bash-Zweig ist seit 2026-08-05 in bash-guard.py dupliziert
+#        (dessen PreToolUse/Bash-Sammelpunkt); registriert in settings.json ist
+#        heute nur media-cloud-guard.PY (WebFetch/MCP-Medien-Tools), diese .sh-
+#        Datei kommt in keinem Eintrag mehr vor.
 # Warum: LOCAL-FIRST-Media-Regel ("website/landing-page images ... never a
 #        paid cloud model/connector") gilt fuer Orchestrator UND jeden Worker,
 #        ist aber nirgends technisch erzwungen — nur Prosa in CLAUDE.md.

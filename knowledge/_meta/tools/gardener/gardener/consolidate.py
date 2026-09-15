@@ -60,8 +60,10 @@ def run_consolidation(notes: list[Note], vectors: dict[str, list[float]],
                       ) -> ConsolidateResult:
     result = ConsolidateResult()
     queue = queue or ReviewQueue(writer)
-    for a, b, sim in merge_candidates(notes, vectors):
-        if deadline is not None and deadline.expired():
+    candidates = merge_candidates(notes, vectors)
+    for i, (a, b, sim) in enumerate(candidates):
+        if deadline is not None and deadline.expired(
+                "consolidate", done=i, total=len(candidates)):
             break
         # Session notes are an immutable archive (vault convention): never merge.
         if a.ntype == "session" or b.ntype == "session":

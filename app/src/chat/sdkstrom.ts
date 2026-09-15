@@ -909,8 +909,19 @@ export class Gespraechsstrom {
 
   /** Ein Fehler von aussen (Prozess weg, Zeile unlesbar) gehoert sichtbar ins Gespraech. */
   melde(text: string): void {
-    this.g.fehler = text;
+    this.hinweis(text);
     this.g.arbeitet = false;
+  }
+
+  /**
+   * Eine Meldung von aussen, die den laufenden Zug NICHT beendet. Die
+   * Kontextwache meldet aus ihrem eigenen Takt, und der kann mitten in einen
+   * Zug fallen: ueber `melde` stand der Kopf dann auf „wartet", der Halt-Knopf
+   * verschwand, und der Harness schrieb weiter (gemessen 13.09. an
+   * test-mac-chat.sh, Zusage 10, etwa jeder zweite Lauf).
+   */
+  hinweis(text: string): void {
+    this.g.fehler = text;
     this.g.bloecke.push(this.beruehre<TextBlock>({
       art: 'system', id: this.neueId('s'), rev: 0, text, offen: false,
     }));

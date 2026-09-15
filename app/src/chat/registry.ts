@@ -141,7 +141,7 @@ export function urteil(
     return {
       moeglich: false,
       via: block.via,
-      grund: 'Das Protokoll wird nicht waehrend der Sitzung fortgeschrieben — eine Ansicht, die erst am Ende erscheint, ist keine.',
+      grund: 'Das Protokoll wird nicht waehrend der Sitzung fortgeschrieben – eine Ansicht, die erst am Ende erscheint, ist keine.',
     };
   }
   if (!block.zuordnung) {

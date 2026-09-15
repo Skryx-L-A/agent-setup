@@ -119,7 +119,17 @@ export class Verbrauchsfenster {
   private fenster: BrowserWindow | null = null;
   private bereit: Promise<void> | null = null;
 
-  constructor(private readonly eltern: () => BrowserWindow | null) {}
+  /**
+   * `sperre` sagt vor jedem `new BrowserWindow`, ob ein Fenster ueberhaupt
+   * entstehen darf, und nennt sonst den Grund (main.ts, `fenstersperre`): im
+   * Mantelbetrieb bringt die Mac-native Oberflaeche dieses Blatt selbst mit,
+   * und ein zweites, unsichtbares Electron-Fenster daneben waere eine Buehne
+   * ohne Publikum (Auftrag 4.1). Ohne die Funktion baut die Klasse wie bisher.
+   */
+  constructor(
+    private readonly eltern: () => BrowserWindow | null,
+    private readonly sperre?: () => string | null,
+  ) {}
 
   /** Das Fenster, wenn es existiert -- fuer Foto und Auskunft. */
   aktuell(): BrowserWindow | null {
@@ -128,6 +138,8 @@ export class Verbrauchsfenster {
 
   /** Bauen und laden, OHNE zu zeigen. Ein stehendes Fenster wird wiederverwendet. */
   async baue(): Promise<BrowserWindow> {
+    const gesperrt = this.sperre?.();
+    if (gesperrt) throw new Error(gesperrt);
     const da = this.aktuell();
     if (da && this.bereit) {
       await this.bereit;
@@ -146,7 +158,7 @@ export class Verbrauchsfenster {
       show: false,
       parent: eltern ?? undefined,
       modal: false,
-      title: 'Agent-Workbench — Verbrauch',
+      title: 'Agent-Workbench – Verbrauch',
       backgroundColor: '#101216',
       paintWhenInitiallyHidden: true,
       webPreferences: {

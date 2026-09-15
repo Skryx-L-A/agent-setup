@@ -43,6 +43,27 @@
       debug: true,
       segments: segments,
     });
+
+    // Der Schluss haelt bewusst: das letzte Segment ist ein Standbild, und ab
+    // dem Punkt, an dem seine Copy ausgeschrieben dasteht, bewegt sich nichts
+    // mehr. Das ist kein toter Scroll, aber es muss ERKLAERT werden, sonst kann
+    // die Seitenpruefung es nicht von einem unterscheiden. Gelesen wird ein
+    // Bild spaeter: die Engine rechnet ihre Deckkraefte in einer rAF-Schleife,
+    // wer im Scroll-Handler misst, liest die Werte des vorigen Bildes.
+    // Siehe reference/seiten-pruefung.md.
+    (function erklaerterSchluss() {
+      const schluss = document.querySelector('[data-sw-seg="produkt"]');
+      const copy = document.querySelectorAll('.sw-copy')[segments.filter(s => s.copy || s.label || s.title).length - 1];
+      if (!schluss) return;
+      const lesen = () => {
+        const st = window.welt.state().find(s => s.id === 'produkt');
+        const co = copy ? (parseFloat(getComputedStyle(copy).opacity) || 0) : 0;
+        schluss.setAttribute('data-sw-verify-hold',
+          (st && st.opacity > 0.99 && co > 0.999) ? 'true' : 'false');
+      };
+      addEventListener('scroll', () => requestAnimationFrame(lesen), { passive: true });
+      requestAnimationFrame(lesen);
+    }());
   </script>
 </body>
 </html>

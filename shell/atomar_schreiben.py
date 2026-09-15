@@ -134,22 +134,35 @@ def kopieren(quelle, ziel):
         raise
 
 
-def schreiben(ziel, inhalt, modus=None, newline=None):
+def schreiben(ziel, inhalt, modus=None, newline=None, *, dauerhaft=False):
     """Erzeugten Text (`str`, als UTF-8) oder `bytes` unteilbar nach `ziel`
     schreiben. `modus` wird nur gesetzt, wenn angegeben (sonst bleiben die
     engen 0600-Rechte von `tempfile.mkstemp` stehen). `newline` reicht
-    unveraendert an `open()` durch, nur fuer Text relevant."""
+    unveraendert an `open()` durch, nur fuer Text relevant. dauerhaft=True
+    synchronisiert den Inhalt vor dem Ersetzen und den Verzeichniseintrag danach."""
     tmp = _tmp_anlegen(ziel)
     try:
         if isinstance(inhalt, bytes):
             with open(tmp, "wb") as f:
                 f.write(inhalt)
+                if dauerhaft:
+                    f.flush()
+                    os.fsync(f.fileno())
         else:
             with open(tmp, "w", encoding="utf-8", newline=newline) as f:
                 f.write(inhalt)
+                if dauerhaft:
+                    f.flush()
+                    os.fsync(f.fileno())
         if modus is not None:
             os.chmod(tmp, modus)
         os.replace(tmp, ziel)
+        if dauerhaft:
+            directory = os.open(os.path.dirname(os.path.abspath(ziel)), os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     except BaseException:
         try:
             os.unlink(tmp)

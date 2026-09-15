@@ -17,10 +17,12 @@
 #                                       Faellt IMMER auf <dir> zurueck, wenn kein
 #                                       Worktree moeglich ist (kein git, kein Repo,
 #                                       abgeschaltet) — der Normalfall bricht nie.
-#                                       Verlinkt dabei app/node_modules auf den
+#                                       Verlinkt dabei app/node_modules UND
+#                                       extension/node_modules auf den
 #                                       Hauptbaum, wenn der Hauptbaum eines hat und
 #                                       der neue/wiederverwendete Baum keins (siehe
-#                                       link_app_node_modules() unten) — Anlass war
+#                                       link_app_node_modules() unten; extension/
+#                                       seit 2026-08-22, davor ging es leer aus) — Anlass war
 #                                       eine macOS-Meldung, die der Werkbank ein
 #                                       Aendern/Loeschen von Apps verweigerte,
 #                                       ausgeloest von einem `npm install`, das
@@ -41,6 +43,15 @@
 #
 # Abschaltbar: `wb-state settings set workerWorktrees false` — dann verhaelt sich
 # `ensure` wie frueher und gibt <dir> unveraendert zurueck. Vorgabe: an.
+#
+# EIN WORKTREE ROLLT SEINE ARBEIT NIE SELBST AUS (2026-08-22, Regel, nicht nur
+# Konvention). Zwei Worker-Worktrees, die unabhaengig voneinander nach
+# ~/.local/bin/~/.claude/hooks schreiben, koennten sich gegenseitig ueberschreiben
+# -- genau die Kollisionsgefahr, gegen die dieses Werkzeug oben gebaut wurde, nur
+# eine Ebene tiefer. Durchgesetzt wird das in `shell/wb-ausrollen` (dort "DER
+# RIEGEL"): ein AGENT, der mit `--repo` auf einen Worktree zeigt, wird abgewiesen,
+# ein MENSCH nur gewarnt. Diese Datei haelt nur den Verweis, nicht die Pruefung
+# selbst -- die steht dort, gemessen ueber `wb-mensch`.
 #
 # KEIN DATENVERLUST, NIE. Vor jedem Entfernen wird auf zweierlei geprueft:
 # unbeachtete Aenderungen im Worktree (`git status --porcelain -uall`) UND Commits
@@ -201,12 +212,19 @@ clone_flag_available() {
   rm -f "$probe_src" "$probe_dst" 2>/dev/null
   return 1
 }
+# Der dritte Parameter ist der Unterordner, dessen node_modules geklont wird.
+# Bis 2026-08-22 war 'app' fest verdrahtet, und extension/ ging leer aus: dort
+# scheiterte `npm run check` in JEDEM Worktree mit Exit 127 und `sh: tsc: command
+# not found`, weil das Werkzeug schlicht nicht da war. Der volle Suitenlauf eines
+# Workers meldete dadurch eine rote Zeile, die mit seiner Arbeit nichts zu tun
+# hatte — ein Nachweis, der laut ist, ohne etwas zu messen, ist schlimmer als
+# keiner. Gemeldet als OPEN von einem Worker am 21.08.
 link_app_node_modules() {
-  local repo="$1" wt="$2" src dst
-  src="$repo/app/node_modules"
-  dst="$wt/app/node_modules"
+  local repo="$1" wt="$2" sub="${3:-app}" src dst
+  src="$repo/$sub/node_modules"
+  dst="$wt/$sub/node_modules"
   [ -d "$src" ] || return 0
-  [ -d "$wt/app" ] || return 0
+  [ -d "$wt/$sub" ] || return 0
   # -L zusaetzlich zu -e: ein bereits vorhandener (auch kaputter) Symlink soll
   # genauso wenig ueberschrieben werden wie ein echtes Verzeichnis -- -e allein
   # liefert bei einem kaputten Symlink faelschlich falsch.
@@ -214,16 +232,16 @@ link_app_node_modules() {
     return 0
   fi
   local clone_flag
-  clone_flag="$(clone_flag_available "$wt/app")"
+  clone_flag="$(clone_flag_available "$wt/$sub")"
   if [ -n "$clone_flag" ] && cp "$clone_flag" -R "$src" "$dst" 2>/dev/null; then
-    say "app/node_modules vom Hauptbaum geklont ($src, copy-on-write) — kein npm install noetig."
+    say "$sub/node_modules vom Hauptbaum geklont ($src, copy-on-write) — kein npm install noetig."
     return 0
   fi
   rm -rf "$dst" 2>/dev/null
   if ln -s "$src" "$dst" 2>/dev/null; then
-    say "Hinweis: app/node_modules liess sich nicht klonen (kein APFS/btrfs-Klon auf diesem Volume) — stattdessen auf den Hauptbaum verlinkt ($src). ACHTUNG: kein npm ci/install in diesem Verweis, das raeumt beim Neuinstallieren durch den Symlink hindurch im HAUPTBAUM auf."
+    say "Hinweis: $sub/node_modules liess sich nicht klonen (kein APFS/btrfs-Klon auf diesem Volume) — stattdessen auf den Hauptbaum verlinkt ($src). ACHTUNG: kein npm ci/install in diesem Verweis, das raeumt beim Neuinstallieren durch den Symlink hindurch im HAUPTBAUM auf."
   else
-    say "Hinweis: app/node_modules liess sich weder klonen noch verlinken — 'npm install' bleibt noetig."
+    say "Hinweis: $sub/node_modules liess sich weder klonen noch verlinken — 'npm install' bleibt noetig."
   fi
 }
 
@@ -268,7 +286,40 @@ cmd_ensure() {
       || meta_write "$name" "$repo" "$wtpath" \
            "$(git -C "$wtpath" symbolic-ref --quiet --short HEAD 2>/dev/null || printf '%s' "$branch")" \
            "${base:-HEAD}" "$basecommit"
-    say "'$name' arbeitet weiter im vorhandenen Worktree $wtpath."
+    # Ein wiederverwendeter Baum kann beliebig weit hinter dem Zielzweig
+    # zurueckliegen, ohne dass es je auffaellt (Befund 2026-09-04: bis zu 1065
+    # Commits ueber 50 Baeume; ein Worker hat dadurch fast eine 1065 Commits
+    # alte Fassung eines Werkzeugs bearbeitet und ausgerollt). Der Rueckstand
+    # wird deshalb bei JEDER Wiederverwendung gemessen und so deutlich
+    # gemeldet wie der Hinweis auf unbeachtete Aenderungen weiter unten.
+    if [ -n "$base" ] && git -C "$repo" show-ref --verify --quiet "refs/heads/$base"; then
+      local lag ahead
+      lag="$(git -C "$wtpath" rev-list --count "HEAD..$base" 2>/dev/null)"
+      ahead="$(git -C "$wtpath" rev-list --count "$base..HEAD" 2>/dev/null)"
+      if [ -z "$lag" ] || [ -z "$ahead" ]; then
+        say "'$name': bestehender Baum $wtpath (Zweig $branch) — Rueckstand zu $base liess sich nicht messen."
+      elif [ "$lag" -eq 0 ]; then
+        say "'$name': bestehender Baum $wtpath (Zweig $branch), kein Rueckstand zu $base."
+      elif [ "$ahead" -eq 0 ] && [ -z "$(dirty_lines "$wtpath")" ]; then
+        # Sauber UND keine eigenen Commits: hier ist nichts zu verlieren, also
+        # selbst nachziehen statt nur zu warnen (Auftrag Schritt 2).
+        local mout mrc=0
+        mout="$(git -C "$wtpath" merge --ff-only "$base" 2>&1)" || mrc=$?
+        if [ "$mrc" -eq 0 ]; then
+          local newlag
+          newlag="$(git -C "$wtpath" rev-list --count "HEAD..$base" 2>/dev/null)"
+          say "'$name': bestehender Baum $wtpath (Zweig $branch) war $lag Commit(s) hinter $base — automatisch nachgezogen (sauber, keine eigenen Commits), Rueckstand jetzt ${newlag:-?}."
+        else
+          say "'$name': bestehender Baum $wtpath (Zweig $branch), $lag Commit(s) hinter $base — Nachziehen fehlgeschlagen: $(printf '%s' "$mout" | tr '\n' ' ')"
+        fi
+      elif [ "$ahead" -gt 0 ]; then
+        say "'$name': bestehender Baum $wtpath (Zweig $branch), Stand $lag Commit(s) hinter $base — NICHT angefasst, $ahead eigene Commit(s) auf $branch. Aufholen: git -C $wtpath merge $base"
+      else
+        say "'$name': bestehender Baum $wtpath (Zweig $branch), Stand $lag Commit(s) hinter $base — NICHT angefasst, unbeachtete Aenderungen im Baum. Erst sichern/committen, dann: git -C $wtpath merge $base"
+      fi
+    else
+      say "'$name' arbeitet weiter im vorhandenen Worktree $wtpath (Zweig $branch)."
+    fi
   elif [ -e "$wtpath" ]; then
     # Etwas liegt dort, aber git kennt es nicht. NICHTS anfassen, nichts loeschen.
     fallback "$wtpath existiert, ist aber kein angemeldeter Worktree von $repo"
@@ -288,7 +339,7 @@ cmd_ensure() {
       return 0
     fi
     meta_write "$name" "$repo" "$wtpath" "$branch" "${base:-HEAD}" "$basecommit"
-    say "'$name' arbeitet im Worktree $wtpath (Zweig $branch, aus ${base:-$basecommit})."
+    say "'$name': neu aus ${base:-$basecommit} erzeugt (Zweig $branch, Worktree $wtpath)."
     # Der Worktree steht auf HEAD. Was im Hauptbaum noch unbeachtet herumliegt,
     # ist dort NICHT enthalten — das muss sichtbar sein, sonst sucht der Worker
     # eine Aenderung, die er nie zu sehen bekommt.
@@ -309,7 +360,8 @@ cmd_ensure() {
   # laenger schon bestehender Worktree soll app/node_modules bekommen, sobald
   # der Hauptbaum eines hat, ohne dass jemand ihn erst loeschen und neu anlegen
   # muss. Baut nichts an, wenn schon etwas unter app/node_modules liegt.
-  link_app_node_modules "$repo" "$wtpath"
+  link_app_node_modules "$repo" "$wtpath" app
+  link_app_node_modules "$repo" "$wtpath" extension
 
   # Zeigte der Auftrag auf einen UNTERordner des Repos, laeuft der Worker auch im
   # Worktree in genau diesem Unterordner — sonst faende er seine Dateien nicht.
@@ -346,6 +398,22 @@ unmerged_count() { # unmerged_count <repo> <branch> <base> <basecommit>
     printf '99'; return   # nichts vergleichbar: gilt als "nicht uebernommen"
   fi
   git -C "$repo" rev-list --count "$ref..$branch" 2>/dev/null || printf '0'
+}
+
+# behind_count <repo> <branch> <base> <basecommit> — Gegenrichtung zu
+# unmerged_count(): wieviele Commits hat der Zielzweig, die der Worker-Zweig
+# noch nicht hat (Rueckstand, siehe cmd_ensure oben und `wb-worktree list`).
+behind_count() {
+  local repo="$1" branch="$2" base="$3" basecommit="$4" ref=""
+  git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" || { printf '0'; return; }
+  if [ -n "$base" ] && git -C "$repo" show-ref --verify --quiet "refs/heads/$base"; then
+    ref="$base"
+  elif [ -n "$basecommit" ] && git -C "$repo" cat-file -e "$basecommit^{commit}" 2>/dev/null; then
+    ref="$basecommit"
+  else
+    printf '0'; return   # kein Zielzweig bekannt: kein Rueckstand messbar
+  fi
+  git -C "$repo" rev-list --count "$branch..$ref" 2>/dev/null || printf '0'
 }
 
 load_meta() { # load_meta <worker> -> setzt MW_* ; 1 = kein Merkzettel
@@ -540,9 +608,9 @@ cmd_diff() {
 }
 
 cmd_list() {
-  printf '%-16s %-14s %-9s %-6s %s\n' WORKER ZWEIG ZUSTAND COMMITS WORKTREE
+  printf '%-16s %-14s %-9s %-6s %-9s %s\n' WORKER ZWEIG ZUSTAND COMMITS RUECKSTAND WORKTREE
   [ -d "$METADIR" ] || return 0
-  local f name state n
+  local f name state n b
   for f in "$METADIR"/*; do
     [ -f "$f" ] || continue
     name="$(basename "$f")"
@@ -551,7 +619,8 @@ cmd_list() {
     elif [ -n "$(dirty_lines "$MW_WT")" ]; then state="schmutzig"
     else state="sauber"; fi
     n="$(unmerged_count "$MW_REPO" "$MW_BRANCH" "$MW_BASE" "$MW_BASECOMMIT")"
-    printf '%-16s %-14s %-9s %-6s %s\n' "$name" "$MW_BRANCH" "$state" "${n:-0}" "$MW_WT"
+    b="$(behind_count "$MW_REPO" "$MW_BRANCH" "$MW_BASE" "$MW_BASECOMMIT")"
+    printf '%-16s %-14s %-9s %-6s %-9s %s\n' "$name" "$MW_BRANCH" "$state" "${n:-0}" "${b:-0}" "$MW_WT"
   done
 }
 

@@ -89,16 +89,27 @@ def cache_key(note: Note) -> str:
 
 
 def embed_notes(notes: list[Note], store: Store, client,
-                deadline=None) -> dict[str, list[float]]:
+                deadline=None, dry_run: bool = False) -> dict[str, list[float]]:
     """Embed all notes, reusing the SQLite cache via content hash.
-    Stops early on deadline; callers must skip notes without a vector."""
+    Stops early on deadline; callers must skip notes without a vector.
+
+    `dry_run=True` never calls the model, only the cache: a note already
+    embedded on a prior run still gets its vector, everything else is left
+    out of the returned dict. Auftrag "zeitgrenze" Nachtrag (04.09.2026):
+    the gardener's own dry run had the same bug the dream's reconcile step
+    did - `embed_notes` called the real Ollama client regardless of
+    `args.dry_run`, so `gardener run --dry-run` embedded every uncached
+    note for real."""
     vectors: dict[str, list[float]] = {}
     for n in notes:
         cached = store.get_embedding(n.rel, cache_key(n))
         if cached is not None:
             vectors[n.rel] = cached
             continue
-        if deadline is not None and deadline.expired():
+        if dry_run:
+            continue
+        if deadline is not None and deadline.expired(
+                "embed", done=len(vectors), total=len(notes)):
             log.warning("deadline during embedding: %d/%d notes embedded",
                         len(vectors), len(notes))
             break
@@ -229,16 +240,41 @@ def confidence_of(verdict: dict) -> float | None:
         return None
 
 
-def judge_pair(client, a: Note, b: Note) -> dict:
-    prompt = (
+def _link_prompt(a: Note, b: Note) -> str:
+    return (
         f"Note A: {a.title} ({a.rel})\n---\n{a.text[:1500]}\n\n"
         f"Note B: {b.title} ({b.rel})\n---\n{b.text[:1500]}\n\n"
         "Should these notes be linked?"
     )
-    verdict = client.judge(JUDGE_SYSTEM, prompt)
+
+
+def judge_pair(client, a: Note, b: Note) -> dict:
+    verdict = client.judge(JUDGE_SYSTEM, _link_prompt(a, b))
     if not verdict:
         return {}  # judge failed (non-JSON): caller must not treat as "no"
     return validate_verdict(verdict, a, b)
+
+
+def judge_pairs(client, pairs: list[tuple[Note, Note]], *,
+                parallel: int) -> list[dict]:
+    """Wie `judge_pair`, aber fuer mehrere Paare auf einmal - nutzt
+    `client.judge_many` (gleichzeitige Stroeme, siehe grug_client.py), wenn
+    der Client das anbietet, sonst seriell wie bisher. Ergebnisreihenfolge
+    entspricht `pairs`.
+
+    `parallel` wird EXPLIZIT durchgereicht statt `judge_many` seinen eigenen
+    Vorgabewert waehlen zu lassen - sonst waeren `run_linking`s Buendelgroesse
+    und die tatsaechliche Strom-Zahl im Client zwei verschiedene Zahlen, und
+    "eine Stelle, an der die Zahl aenderbar ist" (Auftrag "modellwege") waere
+    keine mehr."""
+    prompts = [(JUDGE_SYSTEM, _link_prompt(a, b)) for a, b in pairs]
+    judge_many = getattr(client, "judge_many", None)
+    if judge_many is not None:
+        raw = judge_many(prompts, parallel=parallel)
+    else:
+        raw = [client.judge(system, prompt) for system, prompt in prompts]
+    return [validate_verdict(v, a, b) if v else {}
+           for (a, b), v in zip(pairs, raw)]
 
 
 def _apply_relation(text: str, rel_type: str, title: str) -> str:
@@ -267,7 +303,23 @@ def add_link(writer: VaultWriter, src: Note, dst: Note,
 
 def run_linking(notes: list[Note], vectors: dict[str, list[float]],
                 store: Store, client, writer: VaultWriter,
-                deadline=None) -> LinkResult:
+                deadline=None, parallel: int | None = None) -> LinkResult:
+    """DEFEKT 2 (Nachtrag zum Auftrag "modellwege", 02.09.2026): die
+    Urteilsaufrufe laufen jetzt in Buendeln von bis zu `parallel` Paaren
+    gleichzeitig (Vorgabe: `grug_client.GRUG_JUDGE_PARALLEL`, gemessen am
+    Extraktionspfad, vier ist der Suesspunkt - siehe dort). Ein Paar wird nur
+    dann ins Buendel aufgenommen, wenn die vom NOTIZINHALT abhaengigen
+    Vorfilter (schon verlinkt, unsichere Titel, Blockliste) zum Buendel-
+    Startzeitpunkt zutreffen; die einzige Pruefung, die von zuvor in DIESEM
+    Lauf geschriebenen Links abhaengt (`MAX_NEW_LINKS_PER_NOTE`), wird
+    deshalb erst NACH dem Urteil erneut geprueft, mit dem dann aktuellen
+    Stand - genau da, wo seriell auch geschrieben wuerde. Das kostet
+    hoechstens ein paar bereits verbrauchte Urteile fuer ein inzwischen
+    gedeckeltes Paar; es lockert die Deckelung selbst nicht."""
+    if parallel is None:
+        from .grug_client import GRUG_JUDGE_PARALLEL
+        parallel = GRUG_JUDGE_PARALLEL
+    parallel = max(1, parallel)
     result = LinkResult()
     new_links_count: dict[str, int] = {n.rel: 0 for n in notes}
 
@@ -279,48 +331,63 @@ def run_linking(notes: list[Note], vectors: dict[str, list[float]],
     candidates.sort(key=lambda t: -t[2])
     log.info("%d link candidates", len(candidates))
 
-    for a, b, sim in candidates:
-        if deadline is not None and deadline.expired():
+    i = 0
+    while i < len(candidates):
+        if deadline is not None and deadline.expired(
+                "linking", done=i, total=len(candidates)):
             result.skipped.append("deadline reached")
             break
-        if vault.linked_pair(a, b):
-            continue
-        # Titles like "overview"/"MOC" repeat across projects; a [[title]] link
-        # would resolve to the same-named note in the source's own folder.
-        if a.title_key == b.title_key:
-            continue
-        # Titles containing wikilink syntax would produce broken/mis-parsed links.
-        if any(ch in a.title or ch in b.title for ch in "[]|#\n"):
-            result.skipped.append(f"unsafe title: {a.rel} <-> {b.rel}")
-            continue
-        if store.is_blocked(a.rel, b.rel, "link"):
-            continue
-        if (new_links_count[a.rel] >= config.MAX_NEW_LINKS_PER_NOTE
-                or new_links_count[b.rel] >= config.MAX_NEW_LINKS_PER_NOTE):
-            result.skipped.append(f"cap: {a.rel} <-> {b.rel}")
-            continue
-        verdict = judge_pair(client, a, b)
-        if not verdict:
-            # transient judge failure: skip WITHOUT blocklisting, retry next run
-            result.skipped.append(f"judge failed: {a.rel} <-> {b.rel}")
-            continue
-        if verdict.get("link"):
-            conf = confidence_of(verdict)
-            if conf is not None and conf < config.LINK_MIN_CONFIDENCE:
-                # an unsure "yes" is not a "no": skip it, do NOT blocklist -
-                # a later run (better context, more text) may be sure.
-                result.skipped.append(
-                    f"low confidence {conf:.2f}: {a.rel} <-> {b.rel}")
+        batch: list[tuple[Note, Note, float]] = []
+        while len(batch) < parallel and i < len(candidates):
+            a, b, sim = candidates[i]
+            i += 1
+            if vault.linked_pair(a, b):
                 continue
-            rel_type = verdict["type"]
-            if not add_link(writer, a, b, rel_type, verdict["placement"]):
+            # Titles like "overview"/"MOC" repeat across projects; a
+            # [[title]] link would resolve to the same-named note in the
+            # source's own folder.
+            if a.title_key == b.title_key:
                 continue
-            back = rel_type if rel_type in ("relates-to", "contradicts") else "relates-to"
-            add_link(writer, b, a, back, "relations")
-            new_links_count[a.rel] += 1
-            new_links_count[b.rel] += 1
-            result.added.append((a.rel, b.rel, rel_type))
-        else:
-            store.block(a.rel, b.rel, "link", verdict.get("reason", ""))
-            result.rejected.append((a.rel, b.rel, verdict.get("reason", "")))
+            # Titles containing wikilink syntax would produce broken/mis-parsed links.
+            if any(ch in a.title or ch in b.title for ch in "[]|#\n"):
+                result.skipped.append(f"unsafe title: {a.rel} <-> {b.rel}")
+                continue
+            if store.is_blocked(a.rel, b.rel, "link"):
+                continue
+            batch.append((a, b, sim))
+        if not batch:
+            continue
+
+        verdicts = judge_pairs(client, [(a, b) for a, b, _ in batch],
+                              parallel=parallel)
+        for (a, b, sim), verdict in zip(batch, verdicts):
+            # Deferred cap check (see docstring): live counts, evaluated in
+            # the same order the candidates were originally sorted in.
+            if (new_links_count[a.rel] >= config.MAX_NEW_LINKS_PER_NOTE
+                    or new_links_count[b.rel] >= config.MAX_NEW_LINKS_PER_NOTE):
+                result.skipped.append(f"cap: {a.rel} <-> {b.rel}")
+                continue
+            if not verdict:
+                # transient judge failure: skip WITHOUT blocklisting, retry next run
+                result.skipped.append(f"judge failed: {a.rel} <-> {b.rel}")
+                continue
+            if verdict.get("link"):
+                conf = confidence_of(verdict)
+                if conf is not None and conf < config.LINK_MIN_CONFIDENCE:
+                    # an unsure "yes" is not a "no": skip it, do NOT blocklist -
+                    # a later run (better context, more text) may be sure.
+                    result.skipped.append(
+                        f"low confidence {conf:.2f}: {a.rel} <-> {b.rel}")
+                    continue
+                rel_type = verdict["type"]
+                if not add_link(writer, a, b, rel_type, verdict["placement"]):
+                    continue
+                back = rel_type if rel_type in ("relates-to", "contradicts") else "relates-to"
+                add_link(writer, b, a, back, "relations")
+                new_links_count[a.rel] += 1
+                new_links_count[b.rel] += 1
+                result.added.append((a.rel, b.rel, rel_type))
+            else:
+                store.block(a.rel, b.rel, "link", verdict.get("reason", ""))
+                result.rejected.append((a.rel, b.rel, verdict.get("reason", "")))
     return result

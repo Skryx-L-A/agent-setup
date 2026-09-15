@@ -189,6 +189,23 @@ if not (passt(res.get("args")) or passt(res.get("fallbackArgs"))):
     sys.stderr.write("wb-harness-run: %r steht nicht im resume-Block von %s.\n"
                      % (uebergeben, h.get("id")))
     sys.exit(2)
+# resume.anker (2026-09-05): das Wort, HINTER das die Flags gehoeren, wenn es nicht der
+# Basisname von command ist. forge startet als /bin/sh -c mit einem Einzeiler, der auf
+# exec forge endet -- der
+# Basisname waere "sh", und ein Flag hinter "sh" zerbraeche den Aufruf, statt forge
+# fortzusetzen (Befund resume2, 04.09.). Mit anker "forge" landen die Flags hinter dem
+# LETZTEN Vorkommen des Wortes, also hinter dem exec im Einzeiler. Roh eingefuegt, nicht
+# einzeln gequotet: die Stelle liegt im Inneren des schon gequoteten -c-Textes, und die
+# Folge besteht nachweislich nur aus Registry-Flags und einer Kennung ohne Sonderzeichen.
+anker = (res.get("anker") or "").strip()
+if anker:
+    treffer = list(re.finditer(r"(?:^|[\s/\x27\"])" + re.escape(anker) + r"(?=[\s\x27\"]|$)", cmd))
+    if not treffer:
+        sys.stderr.write("wb-harness-run: anker %s steht nicht in der Startzeile.\n" % anker)
+        sys.exit(2)
+    ende = treffer[-1].end()
+    print(cmd[:ende] + " " + " ".join(toks) + cmd[ende:])
+    sys.exit(0)
 # Eingefuegt direkt hinter dem Programmnamen, nicht am Ende: das Fortsetzen von codex ist
 # ein UNTERBEFEHL ("resume --last"), und der steht hinter dem Programm, nicht hinter
 # den Argumenten.

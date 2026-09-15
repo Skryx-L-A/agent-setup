@@ -23,6 +23,13 @@
 # machines, pane title, result directory ~/.pi-workers/results/SSH-<name>/ on the
 # TARGET machine, and the entry in the workbench state file (with `machine`).
 # Result: `wb-result SSH-<name>` (it finds the machine itself).
+#
+# EIGENTUEMER (2026-08-27): dieses Skript stempelt die Ziel-Session drueben mit
+# `@wb_owner <eigene-maschine>:<eigene-lokale-session>` (tmux-SESSION-Option, siehe Kopf
+# von wb-remote-view). Nur so kann ein spaeterer automatischer Poll (context-guard) oder
+# eine Ansage von drueben diese Session zuverlaessig der richtigen lokalen Session
+# zuordnen, statt — wie am 27.08. geschehen — ALLE Sessions der Zielmaschine blind in die
+# gerade zufaellig angehaengte lokale Session zu mischen.
 set -u
 
 MACHINE="${1:?machine (mac|peer)}"; KIND="${2:?claude|pi}"
@@ -31,6 +38,31 @@ TASK="$*"
 
 case "$MACHINE" in mac|peer) ;; *) echo "wb-ssh-worker: unbekannte Maschine '$MACHINE' (mac|peer)" >&2; exit 1 ;; esac
 case "$KIND" in claude|pi) ;; *) echo "wb-ssh-worker: unbekannte Worker-Art '$KIND' (claude|pi)" >&2; exit 1 ;; esac
+
+# Eigentuemer-Markierung fuer den Spiegel (2026-08-27, siehe Kopf von wb-remote-view):
+# WIR sind die einzige Stelle, die beim Entstehen eines entfernten Workers sowohl die
+# eigene Maschine als auch die eigene lokale Session kennt -- die Zielmaschine erfaehrt
+# das nur, wenn wir es ihr mitgeben. Ohne diese Markierung bleibt die entfernte Session
+# "unmarkiert" und wird nur noch auf ausdruecklichen Zuruf gespiegelt (Entscheidung im
+# Kopf von wb-remote-view), nie mehr automatisch -- ein Worker, der trotzdem laeuft,
+# ist besser als einer, der der falschen Session zugeordnet wird.
+case "$(uname -s)" in Darwin) SELF=mac ;; *) SELF=peer ;; esac
+local_owner_session() {
+  local s=""
+  if [ -n "${TMUX_PANE:-}" ]; then
+    s=$(tmux list-panes -a -F '#{pane_id}|#{session_name}' 2>/dev/null \
+        | awk -F'|' -v p="$TMUX_PANE" '$1==p{print $2; exit}')
+  fi
+  if [ -z "$s" ]; then
+    s=$(tmux list-sessions -F '#{session_attached} #{session_name}' 2>/dev/null \
+        | awk '$1>=1 && $2 ~ /^wb-/{print $2; exit}')
+  fi
+  while [ "${s%-view}" != "$s" ]; do s="${s%-view}"; done
+  printf '%s' "$s"
+}
+LOCALSESS="$(local_owner_session)"
+OWNER=""
+[ -n "$LOCALSESS" ] && OWNER="$SELF:$LOCALSESS"
 
 # `SSH-` is added once, never twice — callers may already carry the prefix.
 BASE="${NAME#SSH-}"
@@ -54,7 +86,7 @@ TASK_B64=$(printf '%s' "$TASK" | base64 | tr -d '\n')
 # (see the delivery check below).
 REMOTE_SCRIPT=$(cat <<'REMOTE'
 set -u
-SESS="$1"; WIN="$2"; NAME="$3"; MODEL="$4"; WORKDIR="$5"; KIND="$6"; TASK_B64="$7"
+SESS="$1"; WIN="$2"; NAME="$3"; MODEL="$4"; WORKDIR="$5"; KIND="$6"; TASK_B64="$7"; OWNER="${8:-}"
 TASK=$(printf '%s' "$TASK_B64" | base64 -d 2>/dev/null || printf '%s' "$TASK_B64" | base64 -D)
 
 if [ -z "$SESS" ]; then
@@ -66,6 +98,10 @@ if [ -z "$SESS" ]; then
   [ -z "$SESS" ] && { echo "FEHLER: Ziel-Workbench auf der Zielmaschine nicht eindeutig (keine/mehrere wb-* Sessions)." >&2; exit 1; }
 fi
 tmux has-session -t "=$SESS" 2>/dev/null || tmux new-session -d -s "$SESS" -n orch
+# @wb_owner (siehe Kopf von wb-remote-view): bei JEDEM Aufruf neu gesetzt, nicht nur
+# beim ersten -- ueberlebt so einen Neustart dieser Session (der naechste Worker-Spawn
+# stempelt sie erneut) und verfaellt sauber, wenn niemand mehr hier hineinspawnt.
+[ -n "$OWNER" ] && tmux set-option -t "=$SESS:" @wb_owner "$OWNER" 2>/dev/null
 
 # Own window per ssh worker — only that makes a mirror of exactly ONE worker possible.
 wid=$(tmux list-windows -t "=$SESS" -F '#{window_id} #{window_name}' | awk -v n="$WIN" '$2==n{print $1; exit}')
@@ -108,7 +144,7 @@ REMOTE
 
 remote_spawn() {
   printf '%s\n' "$REMOTE_SCRIPT" | ssh -o BatchMode=yes -o ConnectTimeout=10 "$MACHINE" \
-    "bash -s -- $(q "$RSESS") $(q "$WIN") $(q "$SSHNAME") $(q "$MODEL") $(q "$WORKDIR") $(q "$KIND") $(q "$TASK_B64")"
+    "bash -s -- $(q "$RSESS") $(q "$WIN") $(q "$SSHNAME") $(q "$MODEL") $(q "$WORKDIR") $(q "$KIND") $(q "$TASK_B64") $(q "$OWNER")"
 }
 
 REMOTE_OUT=$(remote_spawn) \
@@ -202,12 +238,36 @@ find_local_pane() {
   tmux list-panes -a -F '#{session_name}|#{pane_id}|#{@wb_worker}|#{pane_dead}' 2>/dev/null \
     | awk -F'|' -v p="REMOTE-$MACHINE-" '$1 ~ /^wb-/ && index($3, p)==1 {print $2" "$4; exit}'
 }
+# --owned-only (2026-08-27): dieser Aufruf ist automatisch, kein Mensch hat gerade nach
+# GENAU dieser entfernten Session gefragt. Ohne die Markierung von oben liefe er sonst
+# ALLE Sessions der Zielmaschine ein und mischte fremde hinein (Befund 27.08.) -- mit ihr
+# landet nur die Session, die WIR gerade eben selbst markiert haben, sicher am richtigen
+# Ort, egal welche lokale Session hier zufaellig angehaengt ist.
 if [ -x "$HOME/.local/bin/wb-remote-view" ]; then
-  "$HOME/.local/bin/wb-remote-view" "$MACHINE" || true
+  "$HOME/.local/bin/wb-remote-view" "$MACHINE" --owned-only || true
 else
   echo "WARNUNG: wb-remote-view fehlt — der Worker laeuft auf $MACHINE, aber ohne Spiegel im Worker-Tab." >&2
 fi
 info=$(find_local_pane); pane=${info%% *}; dead=${info##* }
+
+# PAUSE CHECK. Pausierte Maschine (2026-09-04): einen Worker DORT zu starten ist eine gueltige
+# Entscheidung -- "pausiert ist der Blick, nicht die Maschine" -- der Start oben
+# ist deshalb unveraendert durchgelaufen. Fehlt der Spiegel-Pane aus GENAU diesem
+# Grund, ist das kein Fehlerfall wie der allgemeine unten: `wb-remote-view
+# $MACHINE` von Hand aufzurufen wuerde nichts aendern, solange die Maschine
+# pausiert bleibt, und "Selbst herstellen" waere darum falscher Rat.
+MASCHINE_PAUSIERT=0
+if [ -z "$pane" ]; then
+  if "$HOME/.local/bin/wb-state" settings get remoteMachinesPausiert 2>/dev/null \
+       | /usr/bin/python3 -c 'import json, sys
+try:
+    liste = json.load(sys.stdin)
+    sys.exit(0 if isinstance(liste, list) and sys.argv[1] in liste else 1)
+except Exception:
+    sys.exit(1)' "$MACHINE"; then
+    MASCHINE_PAUSIERT=1
+  fi
+fi
 
 # Register in the workbench state file — with the machine, so the sidebar and
 # wb-result know where this worker lives. Old entries have no `machine`. Die
@@ -222,10 +282,14 @@ $HOME/.local/bin/wb-state add-worker "$SSHNAME" "$KIND" "$WBMODEL" "$WORKDIR" "$
 echo "Remote-Worker '$SSHNAME' laeuft auf $MACHINE (Session $RSESS_REAL, Fenster $RWIN)."
 if [ -n "$pane" ]; then
   echo "Lokaler Spiegel-Pane: $pane — zeigt die Worker-Session '$RSESS_REAL' von $MACHINE."
+elif [ "$MASCHINE_PAUSIERT" = 1 ]; then
+  echo "Kein lokaler Spiegel-Pane: '$MACHINE' ist pausiert (Einstellungen -> Maschinen) — der Worker laeuft dort, diese Werkbank laedt seine Sitzungen nur nicht. Erst wieder einschalten, dann erscheint der Spiegel von selbst."
+  echo "Direkt ansehen: ssh -t $MACHINE 'tmux attach -t =$RSESS_REAL'"
 else
   echo "WARNUNG: kein lokaler Spiegel-Pane — der Worker laeuft, ist hier aber NICHT sichtbar." >&2
   echo "         Selbst herstellen: wb-remote-view $MACHINE    (sagt, woran es liegt)" >&2
   echo "         Direkt ansehen:    ssh -t $MACHINE 'tmux attach -t =$RSESS_REAL'" >&2
 fi
+# PAUSE CHECK ENDE.
 [ -n "$RRES" ] && echo "Ergebnis-Datei auf $MACHINE: $RRES"
 echo "Ergebnis holen (Deadline-tauglich, 0 = da / 1 = noch nicht): wb-result $SSHNAME"

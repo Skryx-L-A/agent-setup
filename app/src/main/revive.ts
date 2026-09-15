@@ -184,8 +184,8 @@ function alterInWorten(minuten: number): string {
 export function fortsetzenHinweis(alterMinuten: number, tokens: number): string {
   if (!fragtBeimFortsetzen(alterMinuten, tokens)) return '';
   return `Achtung: die Unterhaltung ist ${alterInWorten(alterMinuten)} alt und traegt `
-    + `${Math.round(tokens / 1000)}k Tokens — Claude fragt beim Fortsetzen sehr wahrscheinlich `
-    + 'zuerst „Resume from summary or full session". Der Pane steht dann an dieser Frage, '
+    + `${Math.round(tokens / 1000)}k Tokens – Claude fragt beim Fortsetzen sehr wahrscheinlich `
+    + 'zuerst „Resume from summary or full session“. Der Pane steht dann an dieser Frage, '
     + 'bis Du sie dort beantwortest.';
 }
 
@@ -209,6 +209,14 @@ export function reviveCommand(
    * Richtung, denn ein unbekanntes Flag beendet `wb-code` mit exit 1.
    */
   kenntKontext = false,
+  /**
+   * Die Kennung der Unterhaltung DIESES Ordners, aufgeloest vom Hauptprozess ueber
+   * `wb-resume-id` (2026-09-06) -- dieselbe Aufloesung wie im Pane-Weg shell/wb-revive,
+   * nur einmal gepflegt. Nur fuer Registry-Harnesses (nicht builtin) mit `{resumeId}`
+   * im resume-Block; leer, wenn keine gefunden wurde. Fuer claude bleibt es bei der
+   * gemerkten `claudeSessionId` (die Krisen-Wiederherstellung haengt an ihr).
+   */
+  resolvedId?: string,
 ): ReviveCommand {
   const args = [s.dir];
 
@@ -249,22 +257,36 @@ export function reviveCommand(
       conversation = 'resumed';
       conversationReason = 'Unterhaltung wird fortgesetzt.';
     } else {
-      conversationReason = 'Keine Unterhaltung gemerkt — die Session faengt neu an.';
+      conversationReason = 'Keine Unterhaltung gemerkt – die Session fängt neu an.';
     }
   } else if (!harness.args || harness.args.length === 0) {
     harnessFlags();
-    conversationReason = `Harness '${harness.id}' kann nicht fortsetzen — die Session faengt neu an.`;
+    conversationReason = `Harness '${harness.id}' kann nicht fortsetzen – die Session fängt neu an.`;
   } else if (!harness.builtin) {
-    // Registry-Weg: der Pane baut seine Startzeile ueber `wb-harness-run` neu,
-    // und dorthin reicht `wb-code` kein Fortsetzen-Flag durch. Gesagt statt
-    // vorgetaeuscht -- derselbe Befund wie im Pane-Weg (test-harness-wiederbelebung.sh).
-    // Diese Verzweigung steht VOR der Kennungsfrage: ein registrierter Harness
-    // mit `{resumeId}` bekaeme sonst ein `--resume`, und das nimmt `wb-code`
-    // ausserhalb des claude-Zweigs nicht an (gemessen, Zeile 166).
+    // Registry-Weg (2026-09-06): der Pane baut seine Startzeile ueber `wb-harness-run`
+    // neu. Seit wb-code fuer einen Registry-Harness `--resume <id>` annimmt (es reicht
+    // die Kennung als `--resume-args` an wb-harness-run durch), kann der Knopf hier
+    // fortsetzen -- WENN der Hauptprozess eine Kennung aufgeloest hat. Aufgeloest wird
+    // sie ueber `wb-resume-id`, dieselbe Quelle wie im Pane-Weg (shell/wb-revive), damit
+    // die Logik nur an einer Stelle steht.
     harnessFlags();
-    conversationReason =
-      `Harness '${harness.id}' startet ueber wb-harness-run; dorthin reicht wb-code kein ` +
-      'Fortsetzen-Flag durch — die Session faengt neu an.';
+    if (nimmtSitzungskennung(harness)) {
+      if (resolvedId) {
+        args.push('--resume', resolvedId);
+        conversation = 'resumed';
+        conversationReason = `Unterhaltung ${resolvedId} wird fortgesetzt.`;
+      } else {
+        conversationReason =
+          `Harness '${harness.id}': keine Unterhaltung fuer diesen Ordner gefunden – `
+          + 'startet ueber wb-harness-run, die Session fängt neu an.';
+      }
+    } else {
+      // Ein Registry-Harness OHNE `{resumeId}` (z.B. nur `--continue`): dafuer gibt es
+      // keinen Weg ueber wb-code, das dieses Flag nicht annimmt. Gesagt statt vorgetaeuscht.
+      conversationReason =
+        `Harness '${harness.id}' startet ueber wb-harness-run; dorthin reicht wb-code kein `
+        + 'Fortsetzen-Flag durch – die Session fängt neu an.';
+    }
   } else if (nimmtSitzungskennung(harness) && !eigenerHarness) {
     // Der Vorgabe-Harness, und sein Block verlangt eine Kennung: genau der Fall,
     // fuer den `wb-code --resume <id>` gebaut ist.
@@ -276,7 +298,7 @@ export function reviveCommand(
       // `fallbackArgs` (`--continue`) hilft hier NICHT: `wb-code` lehnt das Flag
       // ab, und sein eigener Ersatzweg (`recorded_conversation`) liest genau die
       // Kennung, die hier schon fehlt -- dieselbe Zustandsdatei, dasselbe Feld.
-      conversationReason = 'Keine Unterhaltung gemerkt — die Session faengt neu an.';
+      conversationReason = 'Keine Unterhaltung gemerkt – die Session fängt neu an.';
     }
   } else {
     // Eingebauter Zweig, der ohne Kennung fortsetzt: `wb-code` haengt das Flag

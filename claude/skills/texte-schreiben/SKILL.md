@@ -1,16 +1,6 @@
 ---
 name: texte-schreiben
-description: >-
-  Wie ein Text formuliert wird, den ein Mensch liest. Verwende dieses Skill
-  AUTOMATISCH und UNGEFRAGT für JEDEN Fließtext, der gelesen wird — jede Gattung,
-  jedes Medium, ob er an den Nutzer geht oder an jemand anderen. E-Mails,
-  Bewerbungen, Briefe, Nachrichten, Formularfelder, Dokumente, Berichte,
-  Webseiten- und Oberflächentexte, README und Doku, Angebote, Beiträge,
-  Präsentationen, Zusammenfassungen zum Vorlegen sind Beispiele und keine
-  Abgrenzung: Im Zweifel gilt es. Eine Gattung, die hier nicht steht, ist nicht
-  ausgenommen. Auch dann, wenn das Wort "Skill" nie fällt. Es steuert die
-  FORMULIERUNG, nicht den Inhalt: Ton, Satzbau, Rhythmus, Typografie und die
-  Muster, an denen Maschinentext erkannt wird. Gilt für Orchestrator und Worker.
+description: "Write or revise human-facing prose with concrete facts, clear sentences and an appropriate voice. Applies to documents, messages and UI text; does not change code, quotes or technical identifiers."
 ---
 
 # texte-schreiben
@@ -26,10 +16,7 @@ Auftrag; wo es eine Faktenbasis gibt, gilt sie (`material/profil/facts.yaml` bei
 
 ## Die zwei Regeln, die alles tragen
 
-**1. Erst schreiben, dann messen, dann nachbessern.** Der Selbsteindruck taugt nicht: Ein
-Text fühlt sich beim Schreiben flüssig an und trägt trotzdem jedes Merkmal. `pruefen.py` in
-diesem Ordner zählt die mechanisch zählbaren Muster. Es ist ein Zähler, kein Urteil —
-aber ein Wert außerhalb der Schwelle ist immer eine Stelle zum Nachsehen.
+**1. Klar schreiben; nur bei Anlass messen.** `pruefen.py` zählt sprachliche Muster, urteilt aber nicht über die Qualität. Nutze es bei einem konkreten Stilproblem, einer ausdrücklichen Prüfung oder vor einer Veröffentlichung, wenn sein Befund helfen kann. Kein automatischer Lauf für jeden Text und keine zweite Prüfrunde bei der Übergabe.
 
 **2. Ein Text darf sich stoßen.** Das stärkste Gegenmittel ist ein konkretes Detail, das
 niemand erfunden hätte: eine Zahl mit dem, was sie misst, ein Ort, ein Gerät, ein Fehlschlag.
@@ -45,7 +32,7 @@ Ein Absatz ohne so ein Detail ist ein Absatz, den jedes Modell geschrieben haben
 3. **Schreiben**, mit dem Aufbau, der zum Genre passt. Bei Bewerbungen und Anfragen:
    Anlass zuerst (die Stelle, an der er steht), dann das Gebaute mit Beleg, dann die eigenen
    Grenzen, dann eine konkrete Frage oder ein konkretes Angebot.
-4. **`python3 pruefen.py <datei>` laufen lassen** und jeden Befund einzeln entscheiden.
+4. **Bei einem konkreten Stilproblem:** optional `python3 <skillordner>/pruefen.py <datei>`; Befunde beurteilen, keine starre Punktzahl erzwingen.
 5. **Vorlesen im Kopf.** Was man laut nicht sagen würde, streichen.
 
 ## Die Merkmale, an denen man Maschinentext erkennt
@@ -59,7 +46,7 @@ Vollständiger Katalog mit Beispielen und Ersatzformulierungen:
 | Ketten paralleler Verben („schneidet zu, wählt, verteilt, nimmt ab") | vier gleichgebaute Glieder schreibt kein Mensch am Stück | in einzelne Sätze zerlegen, Reihenfolge variieren |
 | Essayistischer Aufhänger („Interessant wird es an der Stelle, an der …") | Aufsatzformel, kein Sprechdeutsch | direkt sagen, was war |
 | Gestelzte Nominalisierung („Bei mir ist daraus Gebautes geworden") | Modelle nominalisieren, wenn ihnen ein Verb fehlt | Verb zurückholen: „Ich mache seit Monaten wenig anderes." |
-| Geviertstrich — statt Halbgeviertstrich – | im deutschen Satz falsch, ein reines Maschinen-Artefakt | – mit Leerzeichen, und sparsam |
+| Geviertstrich — statt Halbgeviertstrich – | entspricht nicht dem Hausstil | – mit Leerzeichen, und sparsam |
 | Gleichförmige Satzlänge | menschliche Texte schwanken stark | kurze Sätze einstreuen, Spanne 5 bis 35 Wörter anstreben |
 
 Dazu die Dauerverbote: keine Emojis, keine Superlative über sich selbst, keine Zahl ohne

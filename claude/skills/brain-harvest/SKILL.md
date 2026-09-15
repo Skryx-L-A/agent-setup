@@ -1,14 +1,6 @@
 ---
 name: brain-harvest
-description: >-
-  Process a Harvest-Manifest into the ~/Knowledge vault: update or create entity
-  notes, copy durable-value files into _assets/ with stub notes, and link everything
-  to the owning MOC. Use ONLY when given a Harvest-Manifest (bullet list: entities
-  with a one-line what's-new, plus files with lasting value and a target branch) by
-  the orchestrator or a session-end handoff. Narrow, mechanical, low-error-budget.
-  The orchestrator runs this itself — vault filing is never delegated to a worker
-  (standing rule 2026-07-27). No creative writing, no scope beyond the manifest,
-  no git commit/push.
+description: "Process an explicit Harvest-Manifest into the Knowledge vault: integrate notes, copy durable assets and link their MOC. Run as the lead; no publishing or additions outside the manifest."
 ---
 
 # Brain-Harvest — Manifest verarbeiten
@@ -28,7 +20,7 @@ KEIN Cap: alles Substanzielle aus dem Manifest wird abgearbeitet, keine Auswahl 
 
 Format der Zeile: `<Entity-Name>: <was ist neu>` (+ optional Zielbranch).
 
-1. Suche bestehende Note — **beides**, weil ein Duplikat teurer ist als eine zweite Abfrage:
+1. Suche eine bestehende Note; ergänze die exakte Suche nur bei unklarem Treffer:
    - `brain search "<Entity-Name> <was ist neu>" -k 5` findet die Note auch dann, wenn sie
      die Entity beschreibt, ohne sie wörtlich zu nennen.
    - `rg -il "<Entity-Name>" ~/Knowledge --glob '!90-secrets/**'` für die wörtliche Nennung.
@@ -78,8 +70,7 @@ Format der Zeile: `<Filepfad> — <Dauerwert-Grund> — Zielbranch: <branch>`.
 
 - Keine Session-Notes anlegen oder verändern (die sind immutable, gehören dem
   Orchestrator/der Session selbst).
-- Keine Gardener-Aufgaben (Lint, Topic-Hub-Vorschläge, Embeddings) — das macht der
-  nächtliche Gardener.
+- Keine Gardener-Aufgaben (Lint, Topic-Hub-Vorschläge, Embeddings) — diese gehören nicht zum Manifestauftrag.
 - Keine eigenen Ergänzungen erfinden, die nicht im Manifest stehen.
 - Kein `git commit`/`git push`/`git add`.
 

@@ -1,0 +1,57 @@
+{
+  "source": "$HOME/.claude/skills/recherche/SKILL.md",
+  "sha256": "f1c04290ba6e86b32123bb5161137b0bb46f4ac92a7265f2d2fcad89ad9bd72a",
+  "bytes": 14472,
+  "sections": [
+    {
+      "file": "00.md",
+      "heading": "Recherche",
+      "sha256": "087470f7fe193c053d73b820ba7a28e42e26cd6e0b1c24ea173bae8c7be5f9c3"
+    },
+    {
+      "file": "01.md",
+      "heading": "Die zwei Regeln, die alles tragen",
+      "sha256": "b9e7d0ac52f2286d8a45bac2049486a3a9d28f02783a230677c7d68acaa383e8"
+    },
+    {
+      "file": "02.md",
+      "heading": "Reihenfolge",
+      "sha256": "9397f9c6616e124258c7080257f3f4ba1fe1bb6c0fa73ae90ede574b5a6d9e30"
+    },
+    {
+      "file": "03.md",
+      "heading": "Die Werkzeuge, mit gemessenen Zeiten",
+      "sha256": "36669932beb61be75a348eee5713e079955afca1001274a5fa59eba8c2e4b9b5"
+    },
+    {
+      "file": "04.md",
+      "heading": "Der Treiber, seit dem 31.08.2026",
+      "sha256": "5ef256af7e103916f2accb46f3c2dc3800135a9e0a64192c39f334db999797ed"
+    },
+    {
+      "file": "05.md",
+      "heading": "Das Ablageformat",
+      "sha256": "91cf5826ba3f08d327b5fcbd71f1436ac557f6ba268efc19a9a10d6ecaa870ec"
+    },
+    {
+      "file": "06.md",
+      "heading": "Belegpflicht",
+      "sha256": "d3b860da5ab4e17f00617054e4ceebe29f721d995d4810639e60564aa6680826"
+    },
+    {
+      "file": "07.md",
+      "heading": "Vier Wachen gegen den Zerfall in langen Schleifen",
+      "sha256": "e57dd1b911a0cc209d4cc3cb7c95ca31e1d4516b03fb8c905b7406fab2b052f9"
+    },
+    {
+      "file": "08.md",
+      "heading": "Lokal oder Cloud",
+      "sha256": "524bc46873b7afffafde1faf3dc92297655e6db101522c35881f1a83d3548412"
+    },
+    {
+      "file": "09.md",
+      "heading": "Verdächtig schnelle Ergebnisse",
+      "sha256": "d11a7e92e35bece743a02cf095a2c78ae34df2669909fbafcb5b4848c32c31a4"
+    }
+  ]
+}

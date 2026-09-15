@@ -154,6 +154,6 @@ export function acpUrteil(agent: AcpAgent | null): { moeglich: boolean; grund: s
   }
   return {
     moeglich: false,
-    grund: `${agent.name || 'Der Harness'} spricht ACP (Handschlag und Sitzungsliste gemessen), aber dass darueber das Gespraech eines im Pane laufenden TUI herauskommt, ist an keinem Harness gemessen — deshalb zeichnet die Ansicht daraus nichts.`,
+    grund: `${agent.name || 'Der Harness'} spricht ACP (Handschlag und Sitzungsliste gemessen), aber dass darueber das Gespraech eines im Pane laufenden TUI herauskommt, ist an keinem Harness gemessen – deshalb zeichnet die Ansicht daraus nichts.`,
   };
 }

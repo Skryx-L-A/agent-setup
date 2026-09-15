@@ -1,0 +1,52 @@
+{
+  "source": "$HOME/.claude/regeln/maschinen.md",
+  "sha256": "018b0781bdfe06d1b332e2188e5fdf60cabf69afd9518938806c60c4bb2b0ef7",
+  "bytes": 17537,
+  "sections": [
+    {
+      "file": "00.md",
+      "heading": "regeln/maschinen.md",
+      "sha256": "a3ba175ee109acfefae1b9d2b4752cb9ab124a1eb80b290f3c7e3b0c66d19be5"
+    },
+    {
+      "file": "01.md",
+      "heading": "Standing grants — Maschinen",
+      "sha256": "4e8a3801792eafb0563fe20eb5dec332a1d1ea53930d7dccb127bbffbf0bc290"
+    },
+    {
+      "file": "02.md",
+      "heading": "Aus der Orchestrator-Rolle ausgelagert (2026-08-03)",
+      "sha256": "0914b68ddd13d45e8d3efee846291ad9fcdfc0ec8237a898cf2e5e5e0803bbb7"
+    },
+    {
+      "file": "03.md",
+      "heading": "Worker der anderen Maschine sichtbar machen",
+      "sha256": "54ebe6ae046aff9bbf60bec2934a6833ede58eb7de3b78ed6d91ba77d027359f"
+    },
+    {
+      "file": "04.md",
+      "heading": "Peer-Rechner — zweite Live-Maschine (Zugang + Projekt-Routing: oben in dieser Datei)",
+      "sha256": "6baf369497d4f746f69799d6f0e2de3f51aa332aece9769e37043f2e094e1fef"
+    },
+    {
+      "file": "05.md",
+      "heading": "Cross-Machine Compute — Ressourcen-Check + best-fit Routing (2026-07-19)",
+      "sha256": "ce24ac9285c84cb3eb4c070f4a21402f2df0830da76b714bcec4a311f116beb8"
+    },
+    {
+      "file": "06.md",
+      "heading": "Text mit Backticks nie durch eine Shell-Ebene schicken (2026-07-30)",
+      "sha256": "0c8028077bbce4925e44ba80f9192009eb3037a53975ffe78c00013232d2017c"
+    },
+    {
+      "file": "07.md",
+      "heading": "Die Electron-Werkbank auf peer vom Mac aus neu starten (2026-09-08, gemessen)",
+      "sha256": "c329187d68c59a9eb5d8a8b024084e7fbe98c3138c1a975c23fb375fa4cb547a"
+    },
+    {
+      "file": "08.md",
+      "heading": "Modell-Registry: geteilt und lokal (2026-09-10, Entscheidung des Nutzers per Frage)",
+      "sha256": "4a9bb5cb0ea75bf75d4fd7b33a7f6cc7a6dd0482e78f990e10fa27386c67d0d6"
+    }
+  ]
+}

@@ -132,7 +132,7 @@ set -euo pipefail
 
 STATEDIR="$HOME/.claude/workbench/sessions"
 LOCKDIR="$HOME/.claude/workbench/locks"
-SETTINGS="$HOME/.claude/workbench/settings.json"
+SETTINGS="${AWB_SETTINGS_FILE:-$HOME/.claude/workbench/settings.json}"
 # WB_MODELS_FILE (2026-08-09): biegt die Registry-Datei fuer EINEN Lauf um — gebaut
 # fuer den Ersteinbau eines Harness, der noch nirgends eingetragen ist (wb-harness-probe
 # --models-file). Unbesetzt aendert sich nichts: derselbe Vorgabepfad wie immer, und ein
@@ -425,9 +425,17 @@ try:
     except Exception:
         st = {}
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    old = next((w for w in st.get("workers", []) if w.get("name") == name), None)
-    workers = [w for w in st.get("workers", []) if w.get("name") != name]
-    entry = {"name": name, "kind": kind, "model": model, "dir": dir_, "spawnedAt": now}
+    workers = st.get("workers", [])
+    idx = next((i for i, w in enumerate(workers) if w.get("name") == name), None)
+    old = workers[idx] if idx is not None else None
+    # spawnedAt PRESERVED across an update call, not reset to now (2026-08-22,
+    # Leisten-Springen-Bugjagd): the field means the moment the worker started,
+    # not the moment it was last re-registered -- the pi-worker background
+    # watcher calls add-worker a second time within the first ~40s once the
+    # transcript shows up, and that call must not make the worker look
+    # younger than it is.
+    entry = {"name": name, "kind": kind, "model": model, "dir": dir_,
+             "spawnedAt": (old.get("spawnedAt") if old else None) or now}
     # PRESERVE, do not just set-if-given (Reviewer-Befund 3+4, round 5): every
     # add-worker call replaces the whole entry, so a caller that omits --machine or
     # --claude-session must not silently erase a value an EARLIER call already
@@ -448,7 +456,22 @@ try:
         entry["claudeSessionId"] = csess_val
     if kontext_val:
         entry["kontext"] = kontext_val
-    workers.append(entry)
+    # AN DERSELBEN STELLE aktualisiert, nicht ans Ende gehaengt (2026-08-22,
+    # Leisten-Springen-Bugjagd, der Nutzer 22.08. ~21:15 "die Worker-Tabs...
+    # springen auf und ab"): bis heute filterte dieser Befehl den alten
+    # Eintrag heraus und haengte den neuen ans Ende der Liste -- das renderer-
+    # seitige Sidebar-Modell (app/src/renderer/renderer.ts, zeichneRechts)
+    # zeigt Worker/Subagenten GENAU in dieser Array-Reihenfolge, ohne eigene
+    # Sortierung. Jede Aktualisierung eines schon laufenden Workers (der
+    # verzoegerte claudeSessionId-Fund aus pi-worker, s.o.) schob ihn damit
+    # sichtbar ans Ende der Liste und alles dazwischen eine Position nach
+    # oben -- bei einem Dutzend Agenten, die laufend neu registriert werden,
+    # eine Liste, die staendig umsortiert aussieht, obwohl sich an WER LAEUFT
+    # nichts geaendert hat.
+    if idx is not None:
+        workers[idx] = entry
+    else:
+        workers.append(entry)
     st["workers"] = workers
     st["lastActive"] = now
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(file))
@@ -694,6 +717,11 @@ DEFAULTS = {
     # measured (2 MINW=80 columns x 3 rows of >=17 readable rows on the
     # reference 197x54 window), not guessed.
     "maxWorkerPanesPerTab": 6,
+    # Woran ein Worker-Pane haengt (04.09.2026, Probe fuer Option E). 'tmux' ist
+    # und bleibt die Vorgabe; 'pty' schaltet den Prototyp ein, bei dem die
+    # Werkbank das Pseudo-Terminal selbst haelt (app/src/main/pty.ts). Zweite
+    # Stelle: VORGABEN in app/src/main/einstellungen.ts.
+    "workerTransport": "tmux",
     "defaultWorkerMachine": "local",
     # 2026-08-04: jeder Worker bekommt in einem git-Repo seinen eigenen Worktree
     # und Zweig (~/.pi-workers/worktrees/<worker>, Zweig wb/<worker>), damit
@@ -844,6 +872,12 @@ DEFAULTS = {
     # Stand bis zum 06.08. in der Programmdatei und ist hierher gewandert,
     # weil die Maschinen-Seite des Menues sie pflegt.
     "remoteMachines": [],
+    # Pausierte Maschinen (2026-09-04): eingetragen, aber ihre Sitzungen
+    # werden nicht mehr abgerufen -- kein ssh, keine Sitzungen im Modell,
+    # vorhandene Spiegel-Panes werden abgeraeumt. Der Name bleibt in
+    # `remoteMachines` stehen; der Schalter ist umkehrbar. Leser:
+    # app/src/main/einstellungen.ts (maschinenPausiert/maschinenAktiv).
+    "remoteMachinesPausiert": [],
     # Die Rueckfrage-Muster. Sie standen bis zum 06.08. in der Programmdatei
     # (~/.config/agent-workbench/config.json) und sind hierher gewandert, weil
     # das Menue jeden Eintrag einzeln abschalten koennen muss und dieser Weg
@@ -941,6 +975,18 @@ DEFAULTS = {
     # VORGABEN in app/src/main/einstellungen.ts (test-vorgaben-paritaet.sh
     # vergleicht beide).
     "erststartErledigt": False,
+    # Das Agents-Blatt (08.09.2026). Der Umschalter „Code | Agents" steht in
+    # beiden Fassungen, das Blatt dahinter ist gebaut -- gezeigt wird es aber
+    # nicht: der Nutzer plant das Feature erst noch mit dem Orchestrator ("wir
+    # planen und bauen es, wenn der Rest steht"), und was er im Fenster sieht,
+    # soll nichts versprechen, was noch nicht entschieden ist. Im Zustand
+    # „Agents" steht deshalb ein Platzhalter. Dieser Schluessel holt die fertige
+    # Tabelle zurueck; einen Menuepunkt hat er absichtlich nicht -- er ist fuer
+    # die Suiten und fuer den Tag, an dem das Feature freigegeben wird:
+    # `wb-state settings set agentsBlattVorschau true`. Zweite Stelle: VORGABEN
+    # in app/src/main/einstellungen.ts (test-vorgaben-paritaet.sh vergleicht
+    # beide).
+    "agentsBlattVorschau": False,
 }
 file, key = sys.argv[1:3]
 try:
@@ -1091,6 +1137,11 @@ try:
            "maxWorkers": (1, 64), "maxWorkerPanesPerTab": (0, 64),
            "stallMinutes": (1, 120), "terminalFontSize": (8, 32)}
     ENUM = {"workerLayout": ["split", "window"],
+            # 2026-09-04: woran ein Worker-Pane haengt. Derselbe Grund wie bei
+            # workerZustellung darunter -- ein Tippfehler wuerde still auf die
+            # Vorgabe zurueckfallen, und der Mensch saehe im Menue einen Wert,
+            # der etwas anderes tut als er sagt.
+            "workerTransport": ["tmux", "pty"],
             # 2026-08-20: die drei Zustellwege. Ein Tippfehler hier waere teuer --
             # 'sockett' wuerde als unbekannter Wert auf 'auto' fallen und der
             # Mensch saehe im Menue einen Wert, der etwas anderes tut als er sagt.
@@ -1107,8 +1158,8 @@ try:
             # startet. Was der Harness annimmt, steht in `wb-state models effort
             # <id> --liste`; ob die gewaehlte Stufe zum Modell passt, entscheidet
             # dort die Politik und nicht diese Formpruefung.
-            "orchestratorEffort": ["low", "medium", "high", "xhigh", "max"],
-            "workerEffort": ["low", "medium", "high", "xhigh", "max"],
+            "orchestratorEffort": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "workerEffort": ["low", "medium", "high", "xhigh", "max", "ultra"],
             # 2026-08-16: genau die sechs Werte von 'claude --help' fuer
             # --permission-mode (gemessen, nicht geraten). Die Auflage darunter
             # (Anheben auf bypassPermissions nur mit wb-mensch + --grund) steht
@@ -1120,8 +1171,9 @@ try:
             "orchestratorHarness": None}          # free, but must be a string
     BOOL = ("terminalStartMaximized", "contextGuardAutostart", "modelDiscoveryAuto",
             "closeSessionOnWindowClose", "workerWorktrees", "workerSkipPermissions",
-            "guardMeldetWorkerStatus", "orchestratorVorhersage", "workerVorhersage")
-    LIST = ("secretExcludeDirs", "secretExcludePatterns", "remoteMachines")
+            "guardMeldetWorkerStatus", "orchestratorVorhersage", "workerVorhersage",
+            "agentsBlattVorschau")
+    LIST = ("secretExcludeDirs", "secretExcludePatterns", "remoteMachines", "remoteMachinesPausiert")
     NAME = ("defaultWorkerMachine",)
     # 2026-08-06: die drei Objekt-Schluessel. Geprueft wird die FORM, nicht der
     # Inhalt -- welche Modell-/Guard-Namen es gibt, weiss der jeweilige Setzer
@@ -1131,7 +1183,7 @@ try:
     # auch am rohen `settings set` haengen -- sonst ist der Umweg drumherum die
     # bequemste Art, sie zu umgehen.
     OBJ = ("effortCaps", "guards", "kontextwache")
-    RANG = ("low", "medium", "high", "xhigh", "max")
+    RANG = ("low", "medium", "high", "xhigh", "max", "ultra")
     if key == "askPatterns":
         # Die Rueckfrage-Muster (06.08.). Ein Eintrag ohne Befehlsnamen waere
         # eine Textsuche ueber die ganze Zeile -- genau das, woran die erste
@@ -1369,7 +1421,7 @@ import json, subprocess, sys
 CMD, SUB, ALT, SELF = sys.argv[1:5]
 ARGV = sys.argv[5:]
 KEY = {"effort-cap": "effortCaps", "guard": "guards", "wache": "kontextwache"}[CMD]
-RANG = ["low", "medium", "high", "xhigh", "max"]
+RANG = ["low", "medium", "high", "xhigh", "max", "ultra"]
 
 def die(*zeilen):
     for z in zeilen:
@@ -1709,8 +1761,8 @@ MACHINE = "mac" if platform.system() == "Darwin" else "peer"
 # beide Harnesses es annehmen. WELCHE Stufen tatsaechlich waehlbar sind,
 # entscheidet aber nicht diese Tabelle, sondern der Harness (harness_efforts):
 # hier steht nur, welche Stufe ueber welcher liegt.
-RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
-SETTINGS_FILE = os.path.join(HOME, ".claude", "workbench", "settings.json")
+RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4, "ultra": 5}
+SETTINGS_FILE = os.environ.get("AWB_SETTINGS_FILE") or os.path.join(HOME, ".claude", "workbench", "settings.json")
 
 def read_setting_bool(key, default):
     # A tiny, single-key reader -- the full DEFAULTS table lives in the bash 'settings
@@ -1767,6 +1819,8 @@ CLASS_LABEL = {
     "review":       "unabhaengiger Reviewer-Pass",
     "zweitmeinung": "Zweitmeinung / A-B",
     "visuell":      "kundengerichtet visuell",
+    "bild":         "Bildgenerierung / Bildbearbeitung",
+    "computer":     "Computer Use / Browser / Apps",
     # Eigene Klasse, seit klar ist, dass sich die Harnesses hier deutlich unterscheiden
     # (gemessen 2026-07-29): agy bringt search_web und read_url_content von Haus aus mit,
     # codex kann Websuche nur mit --search, aider gar nicht. Wer recherchieren oder eine
@@ -1786,10 +1840,22 @@ CLASS_LABEL_LOCAL = {
 # Ids that pi-worker/claude-worker resolve THEMSELVES (fast path, no JSON parse).
 # A registry entry may not take one of them: the built-in always wins, so the
 # entry would silently never be used (SPEC-V3 A.3).
-RESERVED = set("""qwen ornith ornith9 grug default -
+# NACHGETRAGEN 2026-08-27: `qwen38` fehlte hier, seit es am 19.08. als eigener Zweig in
+# pi-worker dazukam (dort Zeile ~399, Vorgabemodell fuer lokale Arbeit). Folge: JEDER
+# `wb-state models set qwen38-27b <feld> <wert>` brach mit "alias 'qwen38' ist kein
+# eingebauter Alias" ab -- also jede Aenderung am meistgenutzten lokalen Eintrag, und
+# zwar unabhaengig davon, welches Feld gesetzt werden sollte. Gefunden, als ein Auftrag
+# ein Feld an dessen Vorhersage-Wegen ergaenzen wollte und die Registry ersatzweise von
+# Hand geschrieben werden musste.
+# NACHGETRAGEN 2026-09-05, derselbe Fehler noch einmal: die Umbenennung auf Fable 5.1
+# am 02.09. brachte den Alias `fable51` (pi-worker Zeile ~431), hier fehlte er. Folge:
+# `wb-state models set claude-fable-5-1 <feld> <wert>` brach ab, und test-registry.sh
+# fiel an zwei Stellen, sobald die Vorlage die Umbenennung trug. `fable5` bleibt
+# stehen, weil pi-worker die Altform weiter auf 5.1 abbildet.
+RESERVED = set("""qwen qwen38 ornith ornith9 grug default -
 claude claude-sonnet claude-sonnet5 claude-haiku claude-haiku45 claude-fable
-claude-fable5 claude-opus5 claude-opus48 claude-opus
-haiku45 sonnet5 opus5 opus48 fable5 haiku sonnet opus fable""".split())
+claude-fable5 claude-fable51 claude-opus5 claude-opus48 claude-opus
+haiku45 sonnet5 opus5 opus48 fable5 fable51 haiku sonnet opus fable""".split())
 
 def die(msg, *rest):
     sys.stderr.write(msg + "\n")
@@ -2031,13 +2097,64 @@ def opts(argv, names, flags=()):
             pos.append(a); i += 1
     return vals, fl, pos
 
+def byalias(lst, a):
+    return next((e for e in lst if e.get("alias") == a), None)
+
+def aehnliche_ids(mid, grenze=6):
+    # Was der Suchende vermutlich gemeint hat, statt aller Kennungen. Die volle
+    # Liste ist inzwischen ueber 40 KB lang; sie wird in jeder Vorschau
+    # abgeschnitten und fuehrt dann vom Ziel weg statt hin.
+    #
+    # Teilstring allein reicht nicht: 'qwen39' enthaelt 'qwen38-27b' nicht und
+    # wird davon auch nicht enthalten -- ausgerechnet der Vertipper haette also
+    # keinen Vorschlag bekommen. Deshalb zusaetzlich ein Aehnlichkeitsmass.
+    import difflib
+
+    def flach(s):
+        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+    stamm = flach(mid)
+    namen = {}
+    for e in MODELS:
+        kennung = e.get("id", "")
+        alias = e.get("alias") or ""
+        beschriftung = kennung + (" (Alias %s)" % alias if alias else "")
+        namen.setdefault(flach(kennung), beschriftung)
+        if alias:
+            namen.setdefault(flach(alias), beschriftung)
+
+    treffer, gesehen = [], set()
+    for schluessel in list(namen):
+        if stamm and (stamm in schluessel or schluessel in stamm):
+            if namen[schluessel] not in gesehen:
+                gesehen.add(namen[schluessel]); treffer.append(namen[schluessel])
+    for schluessel in difflib.get_close_matches(stamm, list(namen), n=grenze, cutoff=0.6):
+        if namen[schluessel] not in gesehen:
+            gesehen.add(namen[schluessel]); treffer.append(namen[schluessel])
+    return treffer[:grenze]
+
 def need_model(mid):
-    m = byid(MODELS, mid)
+    # Erst die Kennung, dann der Alias. Die Reihenfolge ist wichtig: eine
+    # Kennung gewinnt immer, sonst koennte ein Alias eine gleichnamige Kennung
+    # verdecken. Aliase aufzuloesen ist neu (2026-08-29) -- vorher scheiterte
+    # `resolve qwen38` mit "nicht registriert", obwohl der Alias in der
+    # Registry steht und pi-worker ihn versteht. Ein Agent, der der Regel folgt
+    # und den Deckel bei wb-state erfragt, las das als "gibt es nicht" und
+    # nahm ein anderes Modell.
+    m = byid(MODELS, mid) or byalias(MODELS, mid)
     if not m:
-        die("FEHLER: Modell '%s' ist nicht registriert." % mid,
-            "In den Settings unter 'Modelle & Harnesses' hinzufuegen,",
-            "oder: wb-state models add '<json>'.",
-            "Registriert: " + (" ".join(e["id"] for e in MODELS) or "(keins)"))
+        nah = aehnliche_ids(mid)
+        hinweise = ["In den Settings unter 'Modelle & Harnesses' hinzufuegen,",
+                    "oder: wb-state models add '<json>'."]
+        if nah:
+            hinweise.append("Gemeint sein koennte: " + ", ".join(nah))
+        hinweise.append("Volle Liste: wb-state models list")
+        # Der Wortlaut "ist nicht registriert" bleibt erhalten: test-registry.sh
+        # prueft seit langem auf genau diesen Teilstring, und andere Werkzeuge
+        # koennten es ebenso tun. Der Zusatz sagt nur, dass BEIDE Schreibweisen
+        # geprueft wurden -- er ersetzt die alte Meldung nicht, er praezisiert sie.
+        die("FEHLER: Modell '%s' ist nicht registriert (weder als Kennung noch als Alias)." % mid,
+            *hinweise)
     return m
 
 # ── secrets: presence only, never the value ─────────────────────────────────────
@@ -2575,6 +2692,17 @@ def cmd_resolve():
                 parts.append(("q", spf))
             else:
                 parts.append(("r", '"$(cat %s)"' % shlex.quote(spf)))
+    elif style == "config-content":
+        # Session-local instructions: no shared project file and no role collision.
+        if not spf or not os.path.isfile(spf):
+            die("FEHLER: Rollendatei fuer '%s' (%s) fehlt: %s" % (h["id"], role, spf))
+        key = sp.get("key")
+        if not key or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", key):
+            die("FEHLER: systemPrompt.key von '%s' ist ungueltig." % h["id"])
+        with open(spf, encoding="utf-8") as f:
+            content = f.read()
+        parts.append(("q", sp.get("flag") or "-c"))
+        parts.append(("q", key + "=" + json.dumps(content, ensure_ascii=False)))
     elif style == "file":
         # Seit dem 2026-08-06 gibt es den Generator: wb-harness-run schreibt die Datei
         # unmittelbar vor dem exec. Der Hinweis sagt deshalb, WOHIN sie geht, statt eine
@@ -3587,12 +3715,16 @@ def compute_id(dc, hid, model_ref):
 #     DECKEL ist die Selbstbindung der Agenten, und die hebt sich nicht von selbst
 #     an, nur weil eine Stufe darueber existiert. `max` erreicht damit, wer es
 #     ausdruecklich will: ein Mensch (--mensch) oder ein Deckel, den der Nutzer
-#     bewusst dorthin setzt. 'ultra' kennt RANK nicht und wird still uebergangen.
+#     bewusst dorthin setzt.
+# 2026-09-13: seit 7c4263d kennt RANK auch 'ultra' (Codex). Es landet in
+# `efforts`, weil der Harness es annimmt, liegt aber UEBER `max` und damit
+# ebenso ueber dem Deckel -- vorher schloss die Zeile unten nur 'max' aus, und
+# jedes neu gefundene Codex-Modell bekam `maxEffort: ultra`.
 def derive_efforts(effort_map):
     keys = sorted((k for k in effort_map if k in RANK), key=lambda k: RANK[k])
     if not keys:
         return None
-    ohne_max = [k for k in keys if k != "max"] or keys
+    ohne_max = [k for k in keys if RANK[k] < RANK["max"]] or keys
     return {"efforts": keys, "maxEffort": ohne_max[-1],
             "defaultEffort": "medium" if "medium" in keys else keys[0]}
 
@@ -4175,7 +4307,9 @@ def cmd_effort():
         if not h:
             die("FEHLER: Harness '%s' ist nicht registriert." % vals["harness"])
         liste = harness_efforts(h)
-        ohne_max = [e for e in liste if e != "max"]
+        # RANK statt `!= "max"`: seit 7c4263d steht 'ultra' ueber 'max' in der
+        # Rangfolge und waere sonst selbst der Deckel geworden (13.09.).
+        ohne_max = [e for e in liste if RANK[e] < RANK["max"]]
         # `_deckel_vom_harness` sagt der Meldung, WOHER der Deckel kommt. Ohne
         # das Merkmal nennt sie die "Modell-Registry" -- und genau dort steht
         # dieses Modell ja nicht, sonst haetten wir es nicht bauen muessen.

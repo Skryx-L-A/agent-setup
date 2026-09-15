@@ -1,0 +1,107 @@
+{
+  "source": "$HOME/.claude/skills/omarchy/SKILL.md",
+  "sha256": "c8f417afbcca5ee4435ca1b6f8dacef249dac2710bc62d5523535b6faaaf0bc2",
+  "bytes": 14048,
+  "sections": [
+    {
+      "file": "00.md",
+      "heading": "Omarchy Skill",
+      "sha256": "1bac9975055639d5a7afb89175ed24bc639f3bfe6873c161ec43f1130afd1c4d"
+    },
+    {
+      "file": "01.md",
+      "heading": "When This Skill MUST Be Used",
+      "sha256": "1bba4048c375437b330a186117a92eb4176e306da6115a93ce8eedc0c5710aad"
+    },
+    {
+      "file": "02.md",
+      "heading": "Topic Guides",
+      "sha256": "294bcac5adf3583cc788ebba2adc3be393de4d707dfa79aec2e9cffe69f82eda"
+    },
+    {
+      "file": "03.md",
+      "heading": "Critical Safety Rules",
+      "sha256": "ac8aa053ed768826a7f060f60731441ce04784c29b988028ef90b1c7a34f8737"
+    },
+    {
+      "file": "04.md",
+      "heading": "Privilege Escalation",
+      "sha256": "5461b332b3ac633030a6f3f00d24b275e90de9489f6d32b38cd1ac56080b6d0c"
+    },
+    {
+      "file": "05.md",
+      "heading": "System Architecture",
+      "sha256": "9d43ded953fa2ac53709af3084d885146dce22ab582de93e2ce769d31435e950"
+    },
+    {
+      "file": "06.md",
+      "heading": "Command Discovery",
+      "sha256": "0d8b133d5f8d974ab61fddcbf122d024ebadfa7b1aaa023806f0db3b91da0372"
+    },
+    {
+      "file": "07.md",
+      "heading": "Command Groups",
+      "sha256": "7719996a769c14be19de2ad1cfb12b315c959a72f38d8694c07cb42b0753bb6d"
+    },
+    {
+      "file": "08.md",
+      "heading": "Configuration Locations",
+      "sha256": "b4d6571dd0fe1069b549ed7bd2d556a077fe6a62223247052c9c694926a36c52"
+    },
+    {
+      "file": "09.md",
+      "heading": "Terminals",
+      "sha256": "206b9286cd384f6e0a1785cd2a8922dc3c508f1c291ef5a2b79beb552592400c"
+    },
+    {
+      "file": "10.md",
+      "heading": "Other Configs",
+      "sha256": "a3b28c712a1a469c4d6a8da41988b33bd65fb49af03440ef60d1f02e427fe96d"
+    },
+    {
+      "file": "11.md",
+      "heading": "Safe Customization Patterns",
+      "sha256": "33fbab178ad3def1c29067509ed804d1b9653e4f32dc54e503db5b5d34d63369"
+    },
+    {
+      "file": "12.md",
+      "heading": "Edit User Config Directly",
+      "sha256": "ca04d90dd4f7eee69ee4aa8487ab2ab25c53024b8633f88a79838afa3f6b9e68"
+    },
+    {
+      "file": "13.md",
+      "heading": "Reset to Defaults -- ALWAYS SEEK USER CONFIRMATION BEFORE RUNNING",
+      "sha256": "1403f140398b993f6379f59e648b64e0e8ea2376985f2f935c0cc31b708e2f42"
+    },
+    {
+      "file": "14.md",
+      "heading": "System Commands",
+      "sha256": "3ea675c0181280916e1a2c40e6f85dc3c1a10015942dfb0c0fce376568cd1831"
+    },
+    {
+      "file": "15.md",
+      "heading": "Troubleshooting",
+      "sha256": "c5a6aa1b7825ebb066861d2e198cad3d9aa50d9effd44ecc57d365975a7f539d"
+    },
+    {
+      "file": "16.md",
+      "heading": "Decision Framework",
+      "sha256": "50fff867b809f4aae6a8e7095bf4385b2c35e66cd087c4ec2e9e5fcc3ae74225"
+    },
+    {
+      "file": "17.md",
+      "heading": "Reminder Requests",
+      "sha256": "0242ccf533f5f97f7f1014f5abafc75e6cca091f48df14479169e66767a5a3ae"
+    },
+    {
+      "file": "18.md",
+      "heading": "Out of Scope",
+      "sha256": "a861bcdd4ba7d30ccfc6374b30e151fdb76c9402c5090ccbc6a04b3be81e4d9e"
+    },
+    {
+      "file": "19.md",
+      "heading": "Example Requests",
+      "sha256": "9bc76ddea87ea7f6cdc74a169db1adb2e5dba1c4ac240d6b07b81ffdca4bd04b"
+    }
+  ]
+}

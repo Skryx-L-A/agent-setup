@@ -87,7 +87,7 @@ const DEMO_SEGMENTS = [
     kind: 'szene', id: 'hof', label: 'Der Hof',
     scroll: 1.7, linger: 0.42,
     render: hofSzene,
-    accent: '#6D9668',
+    accent: '#446B3F',
     eyebrow: 'Wo es anfaengt',
     title: 'Auf dem Hof.',
     body: 'Der Scroll bewegt hier keine Videodatei, sondern eine Kamera durch vier gezeichnete Ebenen. Jeder Frame entsteht frisch, auch rueckwaerts.',
@@ -103,7 +103,7 @@ const DEMO_SEGMENTS = [
     // and this demo has no second camera to render a portrait clip from.
     clipMobile: 'assets/vid/hof-zur-werkstatt-m.mp4',
     still: 'assets/seams/hof-t1.png',
-    accent: '#A87C56',
+    accent: '#7A5230',
   },
   {
     kind: 'szene', id: 'werkstatt', label: 'Die Werkstatt',
@@ -114,7 +114,7 @@ const DEMO_SEGMENTS = [
     // motion. 'hof' deliberately has none, so it takes the other route — one
     // render at staticT. Both branches are in this one page on purpose.
     still: 'assets/seams/werkstatt-t0.png',
-    accent: '#A87C56',
+    accent: '#7A5230',
     eyebrow: 'Wo es entsteht',
     title: 'In der Werkstatt.',
     body: 'Das Videosegment davor beginnt exakt auf dem Frame, auf dem der Hof endet, und endet exakt auf diesem hier. Die Naht ist gebaut, nicht geraten.',
@@ -124,7 +124,7 @@ const DEMO_SEGMENTS = [
     kind: 'still', id: 'produkt', label: 'Das Produkt',
     scroll: 1.2,
     still: 'assets/produkt-still.png',
-    accent: '#3C6440',
+    accent: '#2C4A2E',
     eyebrow: 'Und am Ende',
     title: 'Eine Flasche.',
     body: 'Ein Standbild-Segment bewegt nur die Copy. Es kostet nichts und beendet die Kette ruhig.',

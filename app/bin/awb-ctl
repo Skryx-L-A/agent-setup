@@ -34,9 +34,26 @@ function usage() {
       '  select <kennung>     Session waehlen (Kennung, Name oder tmux-Name)',
       '  show-pane <%id>      diesen Pane zeichnen (gezoomt, fuellt die Flaeche)',
       '  show-tab <%a,%b,..>  ALLE diese Panes nebeneinander zeichnen',
+      '',
+      '  -- Worker auf einem eigenen Pseudo-Terminal, ohne tmux (Probe fuer',
+      '     Option E, 04.09.2026; nur mit workerTransport: "pty") --',
+      '  pane-liste           alle pty-Panes mit Groesse, Herkunft und PID',
+      '  pane-info <pty:n>    Auskunft ueber einen pty-Pane',
+      '  pane-schirm <pty:n> [zeilen]',
+      '                       sein Bildschirm als Text -- genau die Form von',
+      '                       `capture-pane -p`; mit <zeilen> zusaetzlich der',
+      '                       Rueckblick davor',
+      '  pane-tippen <pty:n> <text>',
+      '                       Text wortwoertlich hineinschreiben (ohne Enter)',
+      '  pane-taste <pty:n> <name>',
+      '                       eine benannte Taste (Enter, Escape, C-c, ...)',
+      '  pane-groesse <pty:n> <spalten> <zeilen>',
+      '  pane-starten <json>  einen Worker starten (Auftrag als JSON)',
+      '  pane-beenden <pty:n>',
       '  ui                   Zustand der Oberflaeche, wie sie gerade gezeichnet ist',
-      '  set-ui <feld=wert>   Oberflaeche stellen (sidebarWidth, rightExpanded,',
-      '                       showStopped, sort, workerTab, order=a,b,c)',
+      '  set-ui <feld=wert>   Oberflaeche stellen (sidebarWidth, blattBreite,',
+      '                       showStopped, sort, workerTab, order=a,b,c,',
+      '                       projektReihenfolge=/a,/b)',
       '  type <text>          Text in den gezeichneten Pane tippen',
       '  key <name>           benannte Taste senden (Enter, C-c, Escape)',
       '  flaeche <s>x<z>      Zeichenflaeche vorgeben; der Pane wird darauf gesetzt',
@@ -52,6 +69,10 @@ function usage() {
       '  einstellungen-blaettern <css>  eine lange Seite an diese Stelle rollen',
       '  einstellungen-zustand <css>  ein Bedienelement LESEN, ohne es anzufassen',
       '  einstellungen-schuss [seite] [datei]  Belegbild des Einstellungsfensters',
+      '  verbrauch-lesen <css>  eine Stelle der Verbrauchsseite LESEN (Text,',
+      '                       Hilfeschildchen, data-grund) -- baut das Fenster, zeigt es nie',
+      '  verbrauch-schuss [datei] [css]  Belegbild des Verbrauchsfensters,',
+      '                       optional zu einem Abschnitt gerollt',
       '  sitzung              das Sitzungsfenster hinter dem Plus bauen (NICHT',
       '                       zeigen) und lesen: Gruppen, Zeilen, Status',
       '  sitzung-klick <css>  ein Bedienelement IM Sitzungsfenster anklicken',
@@ -96,6 +117,9 @@ function usage() {
       '  seiten-schliessen-klick  die echte Schliessen-Schaltflaeche im Rahmen anklicken (nur fuer Tests)',
       '  seiten-nachricht <command>  einen Sofort-Plan wie eine Seite ausloesen, z.B. refresh (nur fuer Tests)',
       '  plan-ausfuehren      den gezeigten Plan bestaetigen und ausfuehren',
+      '  maschine-klick <name> [laden]  die Maschinenanzeige in der Statusleiste',
+      '                       anklicken: ohne Argument den Namen (klappt ihr Feld',
+      '                       auf oder zu), mit "laden" den Umschalter darin',
       '  klick <knopf>        auf einen Knopf ohne Ansicht klicken (ordner,',
       '                       aktivitaet, freigaben, einstellungen, neue-session;',
       '                       die letzten beiden BAUEN ihr Fenster, ohne es zu zeigen)',
@@ -112,6 +136,14 @@ function usage() {
       '  revive <kennung>     eine Session im Zustand stopped neu starten (V14,',
       '                       ruft wb-code --resume; lehnt jeden anderen Zustand ab)',
       '  treffer <x> <y>      wer an dieser Stelle den Zeiger faengt (Schichtprobe)',
+      '  ziehen <a> <b>       Zeile a auf Zeile b ziehen (echte drag-Ereignisse);',
+      '                       beide sind Sitzungskennungen ODER Projektpfade.',
+      '                       Meldet, ob die Zielmarke ueberhaupt erschienen ist',
+      '  pane-chat-klick <%pane> [css]  NUR FUER TESTS: den Griff (oder mit css',
+      '                       ".chat-knopf" den Rueckweg) dieses Panes wirklich anklicken',
+      '  pane-chat-takt <%pane> [zuruecksetzen]  NUR FUER TESTS: echte',
+      '                       chat-stand-Aufrufe dieses Panes zaehlen (Beleg fuer',
+      '                       "kein Takt, solange die Ansicht zu ist")',
       '  neue-session <ordner> [name]  eine neue Session anlegen (ruft wb-code)',
       '  fokus <weg|zurueck>  dem Fenster den Fokus nehmen oder geben (nur fuer',
       '                       Tests: der Weg "andere Anwendung und zurueck")',
@@ -144,6 +176,10 @@ function usage() {
       '  ordner [pfad]        Ordneransicht listen (leer = aktuelle Wurzel, 4c.2)',
       '  ordner-oeffnen <pfad>  Datei im Programm des Menschen oeffnen',
       '  ordner-auf <pfad>    NUR FUER TESTS: einen Ordner im Baum aufklappen',
+      '  modus <code|agents>  den Umschalter in der Titelleiste',
+      '                       wirklich anklicken',
+      '  welten [was] [wert]  die Welten im Tab Agents bedienen und lesen: zustand;',
+      '                       druecke <data-w>|<arg>; tippe <feld>|<wert>; welt <name>',
       '  aktivitaet           Aktivitaetsliste lesen (4c.1)',
       '  aktivitaet-oeffnen <pfad>  Inhalt eines Eintrags lesen (V15/V18, erster Klick)',
       '  aktivitaet-diff <pfad>  Diff eines Aenderung-Eintrags (V15, zweiter Klick)',
@@ -169,7 +205,7 @@ function parse(argv) {
     else if (argv[i].startsWith('--socket=')) socket = argv[i].slice(9);
     else rest.push(argv[i]);
   }
-  return { socket: socket || defaultSocketPath(process.env), args: rest };
+  return { socket: socket || defaultSocketPath(process.env), args: rest, explizit: !!socket };
 }
 
 function request(socketPath, payload) {
@@ -208,8 +244,30 @@ function request(socketPath, payload) {
   });
 }
 
+// Wer den Steuerkanal OHNE Adresse aufruft, landet auf dem Socket der laufenden,
+// installierten Anwendung. Aus dem Hauptbaum heraus ist das gemeint. Aus jedem
+// anderen Baum (Worktree eines Workers, Dev-Fassung) ist es der Fehler vom
+// 03.09.2026: ein Worker holte so sieben Belegbilder aus laufender des Nutzers
+// Werkbank statt aus seiner Dev-Fassung, weil er die Variable falsch benannt
+// hatte. Deshalb: ohne AWB_CONTROL_SOCKET und ohne XDG_RUNTIME_DIR (das setzen
+// die Suiten) verweigert ein awb-ctl ausserhalb des Hauptbaums den Zugriff.
+// AWB_CTL_LIVE=1 hebt das bewusst auf.
+function fremderBaumOhneAdresse(env) {
+  if (env.AWB_CONTROL_SOCKET || env.XDG_RUNTIME_DIR || env.AWB_CTL_LIVE) return null;
+  const hier = path.resolve(__dirname, '..', '..');
+  const haupt = path.join(os.homedir(), 'AI', 'claude-workbench');
+  if (hier === haupt) return null;
+  return `awb-ctl: keine Adresse fuer den Steuerkanal, und dieser Aufruf kommt nicht aus dem Hauptbaum (${hier}).\n` +
+    `  Ohne AWB_CONTROL_SOCKET ginge er an die LAUFENDE Anwendung. Setze AWB_CONTROL_SOCKET auf den Socket\n` +
+    `  Deiner Fassung (wb-dev: $WB_DEV_DATEN/awb-dev.sock) oder AWB_CTL_LIVE=1, wenn die laufende gemeint ist.`;
+}
+
 async function main() {
-  const { socket, args } = parse(process.argv.slice(2));
+  const { socket, args, explizit } = parse(process.argv.slice(2));
+  if (!explizit) {
+    const halt = fremderBaumOhneAdresse(process.env);
+    if (halt) { process.stderr.write(halt + '\n'); process.exit(78); }
+  }
   const cmd = args[0];
   if (!cmd || cmd === '-h' || cmd === '--help') {
     usage();
@@ -240,6 +298,35 @@ async function main() {
   } else if (cmd === 'key') {
     if (!args[1]) throw new Error('key braucht einen Tastennamen');
     payload = { cmd: 'key', name: args[1] };
+  } else if (cmd === 'pane-liste') {
+    payload = { cmd: 'pane-liste' };
+  } else if (cmd === 'pane-info') {
+    if (!args[1]) throw new Error('pane-info braucht eine Pane-Kennung');
+    payload = { cmd: 'pane-info', pane: args[1] };
+  } else if (cmd === 'pane-schirm') {
+    // Der EINE Befehl, an dem die Probe haengt: er liefert den Bildschirm eines
+    // pty-Panes in derselben Form, in der `capture-pane -p` ihn liefert. Die
+    // Wache unterscheidet daran nichts -- sie liest Text.
+    if (!args[1]) throw new Error('pane-schirm braucht eine Pane-Kennung');
+    payload = { cmd: 'pane-schirm', pane: args[1] };
+    if (args[2]) payload.zeilen = Number(args[2]);
+  } else if (cmd === 'pane-tippen') {
+    if (!args[1]) throw new Error('pane-tippen braucht eine Pane-Kennung');
+    // Der Text ist ALLES ab dem zweiten Argument, wortwoertlich und mit
+    // Leerzeichen -- er wird nicht gedeutet, nicht zerlegt und nicht ergaenzt.
+    payload = { cmd: 'pane-tippen', pane: args[1], text: args.slice(2).join(' ') };
+  } else if (cmd === 'pane-taste') {
+    if (!args[1] || !args[2]) throw new Error('pane-taste braucht Pane und Tastenname');
+    payload = { cmd: 'pane-taste', pane: args[1], name: args[2] };
+  } else if (cmd === 'pane-groesse') {
+    if (!args[1] || !args[2] || !args[3]) throw new Error('pane-groesse braucht Pane, Spalten und Zeilen');
+    payload = { cmd: 'pane-groesse', pane: args[1], cols: Number(args[2]), rows: Number(args[3]) };
+  } else if (cmd === 'pane-starten') {
+    if (!args[1]) throw new Error('pane-starten braucht den Auftrag als JSON');
+    payload = { cmd: 'pane-starten', auftrag: JSON.parse(args[1]) };
+  } else if (cmd === 'pane-beenden') {
+    if (!args[1]) throw new Error('pane-beenden braucht eine Pane-Kennung');
+    payload = { cmd: 'pane-beenden', pane: args[1] };
   } else if (cmd === 'show-tab') {
     if (!args[1]) throw new Error('show-tab braucht Pane-Kennungen, mit Komma getrennt');
     payload = { cmd: 'show-tab', panes: args[1] };
@@ -274,6 +361,13 @@ async function main() {
     payload = { cmd: 'einstellungen-schuss' };
     if (args[1]) payload.seite = args[1];
     if (args[2]) payload.datei = args[2];
+  } else if (cmd === 'verbrauch-lesen') {
+    if (!args[1]) throw new Error('verbrauch-lesen braucht eine CSS-Auswahl');
+    payload = { cmd: 'verbrauch-lesen', knopf: args[1] };
+  } else if (cmd === 'verbrauch-schuss') {
+    payload = { cmd: 'verbrauch-schuss' };
+    if (args[1]) payload.datei = args[1];
+    if (args[2]) payload.knopf = args[2];
   } else if (cmd === 'sitzung') {
     payload = { cmd: 'sitzung' };
   } else if (cmd === 'sitzung-klick') {
@@ -362,6 +456,10 @@ async function main() {
   } else if (cmd === 'seiten-nachricht') {
     if (!args[1]) throw new Error('seiten-nachricht braucht einen command-Namen');
     payload = { cmd: 'seiten-nachricht', command: args[1] };
+  } else if (cmd === 'maschine-klick') {
+    if (!args[1]) throw new Error('maschine-klick braucht einen Maschinennamen');
+    payload = { cmd: 'maschine-klick', maschine: args[1] };
+    if (args[2]) payload.ziel = args[2];
   } else if (cmd === 'klick') {
     if (!args[1]) throw new Error('klick braucht einen Knopfnamen');
     payload = { cmd: 'klick', knopf: args[1] };
@@ -446,6 +544,15 @@ async function main() {
   } else if (cmd === 'treffer') {
     if (!args[1] || !args[2]) throw new Error('treffer braucht <x> <y> in CSS-Pixeln');
     payload = { cmd: 'treffer', x: Number(args[1]), y: Number(args[2]) };
+  } else if (cmd === 'ziehen') {
+    if (!args[1] || !args[2]) throw new Error('ziehen braucht <gezogen> <ziel>');
+    payload = { cmd: 'ziehen', gezogen: args[1], ziel: args[2] };
+  } else if (cmd === 'pane-chat-klick') {
+    if (!args[1]) throw new Error('pane-chat-klick braucht <%pane> [css]');
+    payload = { cmd: 'pane-chat-klick', paneId: args[1], css: args[2] || '.chat-griff' };
+  } else if (cmd === 'pane-chat-takt') {
+    if (!args[1]) throw new Error('pane-chat-takt braucht <%pane> [zuruecksetzen]');
+    payload = { cmd: 'pane-chat-takt', paneId: args[1], zuruecksetzen: args[2] === 'zuruecksetzen' };
   } else if (cmd === 'ordner') {
     payload = { cmd: 'ordner', pfad: args[1] || '' };
   } else if (cmd === 'ordner-oeffnen') {
@@ -454,6 +561,11 @@ async function main() {
   } else if (cmd === 'ordner-auf') {
     if (!args[1]) throw new Error('ordner-auf braucht einen Pfad');
     payload = { cmd: 'ordner-auf', pfad: args[1] };
+  } else if (cmd === 'modus') {
+    if (!args[1]) throw new Error('modus braucht code oder agents');
+    payload = { cmd: 'modus', modus: args[1] };
+  } else if (cmd === 'welten') {
+    payload = { cmd: 'welten', was: args[1] ?? 'zustand', wert: args.slice(2).join(' ') };
   } else if (cmd === 'aktivitaet-oeffnen') {
     if (!args[1]) throw new Error('aktivitaet-oeffnen braucht einen Pfad');
     payload = { cmd: 'aktivitaet-oeffnen', pfad: args[1] };
@@ -476,7 +588,7 @@ async function main() {
       if (i < 0) throw new Error(`set-ui erwartet feld=wert, nicht '${paar}'`);
       const feld = paar.slice(0, i);
       const roh = paar.slice(i + 1);
-      if (feld === 'order') payload[feld] = roh ? roh.split(',') : [];
+      if (feld === 'order' || feld === 'projektReihenfolge') payload[feld] = roh ? roh.split(',') : [];
       else if (roh === 'true' || roh === 'false') payload[feld] = roh === 'true';
       else if (/^-?\d+$/.test(roh)) payload[feld] = Number(roh);
       else payload[feld] = roh;
@@ -493,6 +605,16 @@ async function main() {
   if (cmd === 'get') {
     const value = reply[args[1]];
     process.stdout.write((typeof value === 'object' ? JSON.stringify(value) : String(value)) + '\n');
+    return;
+  }
+  // ROHER TEXT, KEIN JSON (04.09.2026). `pane-schirm` steht an der Stelle, an
+  // der heute `tmux capture-pane -p` steht, und sein Aufrufer ist eine Shell,
+  // die den Text durch grep und sed schickt. Waere die Antwort JSON, muesste
+  // JEDE dieser Stellen erst auspacken -- und genau daran haette sich der
+  // Unterschied zwischen den beiden Wegen festgesetzt, den es nicht geben soll.
+  // Der abschliessende Umbruch ist derselbe, den `capture-pane -p` schreibt.
+  if (cmd === 'pane-schirm') {
+    process.stdout.write(String(reply.text ?? '') + '\n');
     return;
   }
   process.stdout.write(JSON.stringify(reply) + '\n');

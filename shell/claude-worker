@@ -1,5 +1,5 @@
 #!/bin/bash
-# claude-worker [--mensch] <name> <haiku45|sonnet5|opus5|opus48|fable5>[:effort] <dir> <task...>
+# claude-worker [--mensch] <name> <haiku45|sonnet5|opus5|opus48|fable51>[:effort] <dir> <task...>
 # Permanent Claude chat agent pane (pi-worker mechanics). Model is REQUIRED.
 #
 # `--mensch` (2026-08-06) hebt den Effort-Deckel fuer diesen einen Start auf. Es
@@ -19,7 +19,7 @@
 #                  presentation, visual asset for a client) — since 2026-07-29 this
 #                  replaces fable5 there: higher design-arena website Elo at half the
 #                  price. The former fable self-service exception is REVOKED.
-#   fable5         NEVER without the user's explicit word, for any task. Effort cap
+#   fable51        (Fable 5.1; ersetzt Fable 5 am 2026-09-02) NEVER without the user's explicit word, for any task. Effort cap
 #                  `high` (raised from medium 2026-07-30). Enforced in pi-worker,
 #                  which reads the cap from the model registry — not from this comment.
 # Effort cap is xhigh everywhere (never `max`). Legacy aliases haiku|sonnet|opus|fable
@@ -53,7 +53,7 @@ if [ "${1:-}" = "--on" ]; then
   exec "$HOME/.local/bin/wb-ssh-worker" "$ONMACHINE" claude "$@"
 fi
 
-NAME="${1:?name}"; MODEL="${2:?model (haiku45|sonnet5|opus5|opus48|fable5[:effort]|default)}"; DIR="${3:?dir}"
+NAME="${1:?name}"; MODEL="${2:?model (haiku45|sonnet5|opus5|opus48|fable51[:effort]|default)}"; DIR="${3:?dir}"
 
 # defaultWorkerMachine (SPEC-V2 A): applies ONLY when no machine was given explicitly
 # (no --on — handled above and already returned) AND the name is not already an SSH
@@ -98,7 +98,7 @@ esac
 # order: alias -> registry -> installed Ollama id -> error.
 BASE="${MODEL%%:*}"
 case "$BASE" in
-  haiku45|sonnet5|opus5|opus48|fable5|haiku|sonnet|opus|fable)
+  haiku45|sonnet5|opus5|opus48|fable5|fable51|haiku|sonnet|opus|fable)
     exec "$HOME/.local/bin/pi-worker" ${MENSCHFLAG:+"$MENSCHFLAG"} "$NAME" "claude-$MODEL" "$DIR" "${@:4}" ;;
 esac
 exec "$HOME/.local/bin/pi-worker" ${MENSCHFLAG:+"$MENSCHFLAG"} "$NAME" "$MODEL" "$DIR" "${@:4}"

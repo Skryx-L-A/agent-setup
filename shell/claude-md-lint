@@ -108,7 +108,14 @@ def slugify(title):
 
 
 def has_date(block_text):
-    return bool(re.search(r"\(\d{4}-\d{2}-\d{2}", block_text))
+    # Das Datum steht in Klammern, aber nicht immer als erstes darin: neben
+    # "(2026-08-19)" gibt es "(ausgelagert 2026-09-01)" und "(2026-07-30 von medium
+    # angehoben)". Bis zum 2026-09-04 verlangte das Muster die Ziffern unmittelbar
+    # hinter der Klammer und meldete deshalb datierte Regeln als undatiert -- ein
+    # Pruefer mit Fehlalarmen bringt einem bei, ihn zu ueberlesen. Die 40 Zeichen
+    # Vorlauf decken die vorkommenden Einleitungen ab und lassen ein Datum, das
+    # irgendwo im Fliesstext des Blocks steht, weiterhin nicht als Datierung gelten.
+    return bool(re.search(r"\([^)\n]{0,40}\d{4}-\d{2}-\d{2}", block_text))
 
 
 def is_incident_candidate(block_text, line_count):

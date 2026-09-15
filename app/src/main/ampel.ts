@@ -7,15 +7,17 @@
 // `~/.local/state/wb-testsuite-status.txt`:
 //   ts_epoch=... ts_iso=... parse_ok=1 exit_code=0 pass=38 fail=0 skip=0
 //   total=38 failed_suites=
-//   Rot: fail>0. Ueberfaellig: aelter als 9 Tage (Job laeuft woechentlich).
+//   Rot: fail>0. Ueberfaellig: aelter als 9 Tage (kein Takt mehr seit dem
+//   22.08. -- Begruendung der Schwelle siehe NEUN_TAGE_SEK unten).
 //   Seit dem 21.08. zusaetzlich `repo_dir`, `repo_commit`, `repo_commit_ts`:
 //   welchen Stand dieser Lauf geprueft hat. Fehlen sie (aeltere Datei), bleibt
 //   alles wie bisher.
 //
 // UEBERHOLT IST NICHT UEBERFAELLIG -- zwei Dinge, nicht eines (21.08.).
-// `ueberfaellig` misst den TAKT und rechnet gegen die UHR: der Job laeuft
-// woechentlich, seit neun Tagen kam nichts, also fehlt eine Messung, ganz
-// gleich was der Code macht. `ueberholt` misst die GELTUNG und rechnet gegen
+// `ueberfaellig` misst das ALTER und rechnet gegen die UHR: seit neun Tagen
+// kam keine Messung, ganz gleich was der Code macht. (Bis zum 22.08. stand
+// hier ein woechentlicher Job als Begruendung; den gibt es nicht mehr, die
+// Zahl bleibt -- warum, steht bei NEUN_TAGE_SEK.) `ueberholt` misst die GELTUNG und rechnet gegen
 // das REPO: der Lauf hat einen Baum geprueft, den es nicht mehr gibt, seine
 // Aussage ist damit hinfaellig, ganz gleich wie jung sie ist. Die beiden
 // fallen auseinander: ein Lauf von vorgestern ist ueberholt, wenn der Baum
@@ -33,6 +35,21 @@
 //   Rot: NUR exit_code!=0 (die drei Einzelzahlen faerben laut Hook-Kommentar
 //   ausdruecklich NICHT rot, sonst waere die Ampel praktisch jede Woche rot).
 //   Ueberfaellig: aelter als 9 Tage.
+/**
+ * Ab welchem Alter ein Befund als ueberfaellig gilt.
+ *
+ * Bis zum 22.08. war das 7 Tage (der Job lief woechentlich) plus 2 Tage
+ * Puffer gegen einen einmalig verschobenen Lauf -- seit alice an diesem
+ * Tag alle zeitgesteuerten Mac-LaunchAgents abgeschaltet hat, loest niemand
+ * mehr automatisch aus, Testsuite wie Hygiene starten von Hand
+ * (`wb-testsuite-run`, `wb-hygiene --report`). Die Herleitung aus dem Takt
+ * traegt also nicht mehr, der WERT bleibt trotzdem: 9 Tage sind weiterhin die
+ * Grenze, ab der ein Befund als Auskunft ueber den HEUTIGEN Code zu alt ist,
+ * um ihn stillschweigend zu glauben -- unabhaengig davon, ob und wann jemand
+ * den naechsten Lauf anstoesst. Ueberfaellig heisst deshalb nicht mehr "der
+ * Job ist faellig", sondern "dieser Befund ist alt, stoss einen neuen Lauf
+ * an" -- die Aufforderungstexte weiter unten sagen das so.
+ */
 const NEUN_TAGE_SEK = 9 * 86400;
 /**
  * Ab welchem Abstand zwischen geprueftem Stand und heutigem HEAD ein Befund
@@ -203,7 +220,7 @@ export function bewerteTestsuite(raw: string, jetztSek: number, repo?: RepoStand
     : rot
       ? `Testsuite: ${fail} rote Suite(n) (${ageDays} Tage her)${kv.failed_suites ? ': ' + kv.failed_suites : ''}`
       : ueberfaellig
-        ? `Testsuite: letzter Lauf ${ageDays} Tage her (ueberfaellig, Job laeuft woechentlich)`
+        ? `Testsuite: letzter Lauf ${ageDays} Tage her (ueberfaellig, niemand loest automatisch aus -- starte ihn mit wb-testsuite-run)`
         : ueberholt
           // Gruen und ueberholt bleibt GRUEN (Begruendung im Kopf dieser Datei
           // und in ampelFuerMaschine) -- der Satz sagt es trotzdem, damit
@@ -225,7 +242,7 @@ export function bewerteHygiene(raw: string, jetztSek: number): AmpelBefund {
   const text = rot
     ? `Hygiene: rot -- Widersprueche ${kv.consistency_count ?? '?'}, undatierte Regeln ${kv.lint_undated_count ?? '?'}, veraltete STATUS.md ${kv.freshness_stale_count ?? '?'} (${ageDays} Tage her)`
     : ueberfaellig
-      ? `Hygiene: letzter Lauf ${ageDays} Tage her (ueberfaellig, Job laeuft woechentlich)`
+      ? `Hygiene: letzter Lauf ${ageDays} Tage her (ueberfaellig, niemand loest automatisch aus -- starte ihn mit wb-hygiene --report)`
       : `Hygiene: gruen (${ageDays} Tage her)`;
   // `ueberholt` bleibt hier immer `false`: `wb-hygiene` schreibt den geprueften
   // Stand nicht mit, also gibt es die zweite Zahl nicht -- und ohne Messung

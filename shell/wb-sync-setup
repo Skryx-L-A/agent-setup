@@ -45,12 +45,18 @@ FILES=(
   # 2026-08-10: wb-messung lag bis heute in keinem Repo -- auf peer fehlte es, waehrend
   # regeln/messungen.md es dort als Werkzeug nannte. Jetzt versioniert und ausgerollt.
   ".local/bin/wb-messung"
+  # 2026-08-27: wb-fremdmessung holt Modellbewertungen aus offenen Fremdquellen (Artificial
+  # Analysis, Aiders Polyglot-Leaderboard, OpenRouter-Preise), damit nicht jede Zahl selbst
+  # erkauft werden muss. Gehoert auf beide Maschinen: die Ablage liegt im geteilten Vault,
+  # das Werkzeug, das sie liest und schreibt, darf dort nicht fehlen.
+  ".local/bin/wb-fremdmessung"
   # 2026-08-03 dazugekommen: bis dahin standen diese zehn auf keiner Liste und liefen
   # auf peer entweder gar nicht oder in einer Fassung vom 25.07. — bei `wb-state` waren
   # das 543 gegen 2.496 Zeilen. Alle zehn sind maschinen-unabhaengig; wo eine Maschine
   # gemeint ist, entscheidet der Code das selbst (`wb-state` liest `platform.system()`,
   # die Registry liegt ohnehin je Maschine unter ~/.claude/workbench/models.json).
   ".local/bin/wb-state" ".local/bin/wb-code" ".local/bin/wb-grid" ".local/bin/wb-revive"
+  ".local/bin/wb-resume-id"
   ".local/bin/wb-workers-window" ".local/bin/wb-session-close" ".local/bin/wb-session-sweep"
   ".local/bin/wb-sessions" ".local/bin/wb-harness-probe" ".local/bin/wb-harness-run"
   ".local/bin/wb-budget" ".local/bin/wb-sync-setup"
@@ -112,7 +118,7 @@ FILES=(
   # (ruft von HIER aus peer, `ssh peer`/`mosh peer` fest verdrahtet — auf peer gestartet
   # waere das ein Selbstaufruf). peer-shot steht bewusst auf KEINER Seite dieser Liste:
   # es lebt nur in ~/AI/claude-workbench/shell/, nicht in ~/.local/bin, Shebang fest auf
-  # `$HOME/.local/bin/peer-shot-py3` und KWin/Wayland-DBus — kann auf dem Mac
+  # `/home/<user>/.local/bin/peer-shot-py3` und KWin/Wayland-DBus — kann auf dem Mac
   # nicht laufen. Dieses Werkzeug kennt aber nur EINE Richtung (SELF -> OTHER, je nachdem
   # von wo es gestartet wird) und keine "nur dorthin"-Markierung — von peer aus gestartet
   # wuerde ein Eintrag hier peer-shot blind auf den Mac schieben. Deshalb bleibt es
@@ -138,6 +144,12 @@ FILES=(
   # meldet, kam zusammen mit wb-hygienes eigener Statusdatei-Erweiterung dazu. Gleich
   # eingetragen statt wie beim Testsuite-Hook erst nachtraeglich gefunden.
   ".claude/hooks/sessionstart-hygiene-status.sh"
+  # 2026-08-27: der Hook, der erschoepfte oder knappe Modell-Kontingente beim Sessionstart
+  # meldet. Anlass war ein Vormittag, an dem vier Antigravity-Worker gemeinsam ausfielen und
+  # ein Rauchtest 34 von 50 taeglichen OpenRouter-Anfragen verbrauchte, ohne dass irgendwo
+  # gestanden haette, wie viel noch da ist. Gleich mit eingetragen -- auf peer laufen
+  # dieselben Spuren gegen dieselben Konten, dort ist die Meldung genauso noetig.
+  ".claude/hooks/sessionstart-kontingente.sh"
   # 2026-08-11, vierter Nachtrag zu genau demselben Fehler: der Hook, der die
   # LEBENDE Unterhaltungs-Kennung in die Zustandsdatei schreibt (jedes /clear
   # beginnt eine neue, und ohne ihn setzt eine Wiederherstellung die

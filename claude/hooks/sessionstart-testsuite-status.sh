@@ -1,6 +1,9 @@
 #!/bin/bash
-# Zweck: meldet einen roten oder ueberfaelligen woechentlichen Testlauf
-#        (launchd-Job wb-testsuite, siehe claude-workbench/shell/wb-testsuite-run)
+# Zweck: meldet einen roten oder ueberfaelligen Testlauf (angestossen von Hand
+#        mit wb-testsuite-run, siehe claude-workbench/shell/wb-testsuite-run --
+#        bis zum 22.08. lief das ueber einen woechentlichen launchd-Job, der
+#        seither zusammen mit allen zeitgesteuerten Mac-LaunchAgents abgeschaltet
+#        ist)
 #        direkt bei Session-Start, statt dass der Bericht unter
 #        ~/.local/state/wb-testsuite-report.md ungelesen liegen bleibt.
 # Event: SessionStart.
@@ -14,8 +17,13 @@
 #        * sie leer oder mit kaputten/nicht-numerischen Werten geschrieben ist,
 #        * der letzte Lauf gruen UND nicht aelter als 9 Tage ist.
 #        Genau EINE Zeile, wenn der letzte Lauf FAIL-Suiten hatte oder aelter
-#        als 9 Tage ist (Job laeuft woechentlich = 7 Tage, 9 Tage Puffer
-#        gegen Fehlalarm bei einem einmalig verschobenen Lauf).
+#        als 9 Tage ist. Seit dem 22.08. loest niemand mehr automatisch aus
+#        (alle zeitgesteuerten Mac-LaunchAgents sind ab) -- der Job war bis
+#        dahin woechentlich, die Schwelle (7 Tage + 2 Tage Puffer) traegt
+#        ihre Herleitung nicht mehr, bleibt aber als WERT: 9 Tage sind die
+#        Grenze, ab der ein Befund als Auskunft ueber den heutigen Code zu
+#        alt ist. Wer den Lauf braucht, stoesst ihn von Hand an
+#        (wb-testsuite-run).
 # Performance: nur grep/cut auf einer <15-Zeilen-Datei, keine Subprozesse
 #        ausser date -- Ziel ist spuerbar keine zusaetzliche Session-Start-
 #        Verzoegerung (siehe Messung im Ergebnisprotokoll dieser Aufgabe).
@@ -53,7 +61,7 @@ if [ "$fail" -gt 0 ]; then
     echo "Testsuite: letzter Lauf ($age_days Tage her) hat $fail rote Suite(n) (Namen nicht parsbar, siehe wb-testsuite-report.md)"
   fi
 else
-  echo "Testsuite: letzter Lauf ist $age_days Tage her (ueberfaellig, Job laeuft woechentlich)"
+  echo "Testsuite: letzter Lauf ist $age_days Tage her (ueberfaellig, niemand loest automatisch aus -- starte ihn mit wb-testsuite-run)"
 fi
 
 exit 0

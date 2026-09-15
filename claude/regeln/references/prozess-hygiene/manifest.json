@@ -1,0 +1,22 @@
+{
+  "source": "$HOME/.claude/regeln/prozess-hygiene.md",
+  "sha256": "c1e2808e5932851fcd927143608991465f59e0059b8d1ff4aca8f2808ca513b9",
+  "bytes": 9999,
+  "sections": [
+    {
+      "file": "00.md",
+      "heading": "regeln/prozess-hygiene.md",
+      "sha256": "5f5e44b627d60763366e7f025ceb79f22a5d4e4d993f00a18464af22c3293818"
+    },
+    {
+      "file": "01.md",
+      "heading": "Standing rules — Prozess-Hygiene",
+      "sha256": "4a4bc8e88475f959b02e5bdc3759044fb11e33d9f80c4f7700bf4c5629d54311"
+    },
+    {
+      "file": "02.md",
+      "heading": "Nie unbegrenzt warten (ausgelagert aus roles/orchestrator.md, 2026-08-20)",
+      "sha256": "531b1dd7b8e3d8c8db2fb75563a6f5a2e115a0de4fa49005d4aa2a6807110fb8"
+    }
+  ]
+}

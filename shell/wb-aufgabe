@@ -1,0 +1,1405 @@
+#!/usr/bin/env python3
+"""wb-aufgabe — die Aufgabendatei des Agents-Features anlegen, freigeben,
+fortschreiben und lesen (Bau-Schritt 1, siehe docs/AGENTS-PLAN.md, Abschnitt 9,
+Punkt 1 und Abschnitt 2 „Die Aufgabe").
+
+Ausgerollt seit dem 10.09.2026 (Bau-Schritt 1 des Agents-Features, AUFTRAG-agents1.md);
+Aufrufer sind wb-traeger, der Stop-Hook und die Hauptagenten der Werkbank-Aufgaben.
+
+ZWEI DATEIEN JE AUFGABE, dieselbe Kennung:
+  <projekt>/.companion/auftraege/<id>.json           Auftragsdatei — das
+      Auftragsformat des Companions (schema_version, id, project, goal,
+      done_criterion, reference, guardrails, gate_commands, limits,
+      loop_type, model, approval) ergaenzt um die Hausfelder freigaben,
+      hauptagent, maschine, grenzen. Aendert sich nach der Freigabe (Feld
+      approval gesetzt) nicht mehr — ausser durch `freigeben --neu-freigeben`,
+      der die Freigabe loescht.
+  <projekt>/.companion/auftraege/<id>.verlauf.json   Verlaufsdatei — stand,
+      grund, maschine, worker, team, verlauf, ergebnis, kosten,
+      wiederaufnahme, weckzeit, frage. Aendert sich staendig.
+
+DER VORRAT (~/.claude/workbench/vorrat/ oder --vorrat/WB_VORRAT/--base) ist
+das Vorratsverzeichnis: eine Datei <id>.json je Aufgabe mit rang, projekt,
+auftrag (Pfad der Auftragsdatei), maschine, aufgenommen. Eine Auftragsdatei
+wird erst durch ihren Eintrag dort zur Werkbank-Aufgabe; Umsortieren
+(`rang`) beruehrt nur diesen Eintrag, nie die Auftragsdatei.
+
+DER HAUPTAGENT: `anlegen --hauptagent <model[:effort]>` nimmt eine
+Registry-Kennung oder einen Alias an und speichert die Kennung (`sonnet5:high`
+wird `claude-sonnet-5`); ein Modell, das weder das eine noch das andere ist,
+endet mit Exit 2. Aufgelöst wird in `registry_eintrag()`, derselben Stelle,
+die wb-traeger für jeden Start benutzt.
+
+DAS FALLBACK-MODELL (docs/AGENTS-PLAN.md, Abschnitt 4, Absatz „Das
+Fallback-Modell", der Nutzer 10.09. 17:55/18:00): `hauptagent` traegt neben
+`model`/`effort` ein `fallback` (`{model, effort}` oder `null` fuer „keins").
+`anlegen --fallback <model[:effort]|keins>` setzt es, vorbelegt aus
+`agents.fallbackModell` (Vorgabe ohne Eintrag: siehe FALLBACK_VORGABE unten).
+Ein Fable-Modell ist nie ein Fallback (Exit 2); bei `--daten-lokal` muss das
+Fallback lokal sein oder „keins" (Exit 2 sonst). `verlauf <id>
+fallback-gewechselt <text> --grund <text>` haelt fest, wenn der Traeger beim
+naechsten Start auf das Fallback wechselt — ein laufender Agent wechselt
+nie, nur ein neuer Start.
+
+DER MENSCHEN-BELEG. `freigeben`, `stand abgenommen|verworfen` und `antwort`
+verlangen einen Menschen — gemessen von `wb-mensch pruefen` (Exit 0 = Mensch),
+oder ueber `--mensch-beleg <pfad>`: eine Datei, deren erstes Wort „mensch"
+lautet (dasselbe Format wie `wb-mensch beleg`, TAB-getrennt: „mensch<TAB>
+<Begruendung>" — nur das erste Wort zaehlt). Ein Test setzt diese Datei
+selbst; ohne einen der beiden Nachweise: Exit 2.
+
+Jeder Unterbefehl: Exit 0 bei Erfolg, Exit 2 bei Ablehnung mit einer
+deutschen Meldung nach stderr. `--json` liefert bei Erfolg zusaetzlich (oder
+statt Klartext) eine maschinenlesbare Zeile.
+
+Unterbefehle: siehe `wb-aufgabe --help` bzw. AUFTRAG-agents1.md, Abschnitt 1.
+
+BAU-SCHRITT 2 (Träger wb-traeger, AUFTRAG-agents2.md): neue Verlaufsfelder und
+Unterbefehle, die der Träger liest und schreibt:
+  pfade                Liste der Pfade, die der Hauptagent als seine führt —
+      `wb-aufgabe pfade <id> setzen <pfad>…` und `entfernen <pfad>…`. Der
+      Stop-Hook (Bau-Schritt 2, Worker stopphook) committet beim Zugende genau
+      diese Pfade; beim lokalen Hauptagenten tut das der Träger.
+  hauptagent_sitzung   die lebende Sitzung des Hauptagenten (tmux_session, pane,
+      claude_session_id, pid, gestartet, zuletzt_gesehen) — `wb-aufgabe
+      sitzung <id> setzen|gesehen|leeren`. Der Träger setzt sie beim Start,
+      stempelt `gesehen` je Takt und leert sie, wenn die Sitzung endgültig
+      weg ist.
+  steckt_vorher        der Stand, auf dem die Aufgabe stand, bevor sie auf
+      „steckt" ging (Gründe: Hauptagent weg, Umgebung, Deadline). Setzt
+      `stand steckt --grund …` automatisch; der Träger stellt den vorigen
+      Stand mit einem normalen `stand`-Wechsel wieder her, wodurch das Feld
+      wieder leer wird.
+  naechste [--maschine <name>] [--ausser <id>]… --json
+      die vorderste offene, freigegebene Aufgabe nach Rang, deren Repo von
+      keiner Aufgabe im Stand „läuft" belegt ist (Exit 1: keine). Das JSON
+      trägt dazu `zurueckgestellt`: die davor liegenden Aufgaben, die nur am
+      belegten Repo scheiterten, je mit dem Grund „Repo belegt durch Aufgabe
+      <id>". `--ausser` überspringt Aufgaben, die der Träger in diesem Takt
+      schon verworfen hat. Bei Nichtstart schreibt der Träger den Grund mit
+      `wb-aufgabe verlauf <id> nicht-gestartet <grund>` — die Gründe stehen
+      wörtlich in docs/AGENTS-PLAN.md, Abschnitt 2.
+  aufnehmen <projekt> <id> [--rang <n>]
+      Vorratseintrag für eine Auftragsdatei, die im Projekt liegt (der Weg,
+      über den der Träger eines MAC ausgestellte Aufgaben per ssh auf der
+      Zielmaschine in den Vorrat legt — Projekt- und Verlaufsdatei werden
+      nicht kopiert, sie liegen im Repo dort schon). Stößt danach wie
+      `freigeben` den Träger dort an.
+  verschieben <id> --nach <maschine>
+      Maschine einer Aufgabe wechseln: verlangt keine laufende Worker-Spur,
+      kein „Daten bleiben auf der Maschine" und einen gepushten Repo-Stand;
+      trägt `verschoben` in den Verlauf und stellt den Vorratseintrag auf
+      die neue Maschine um (in den Vorrat der Zielmaschine übernimmt ihn der
+      Träger dort).
+Nach `freigeben`, `antwort` und `stand` wird — abgelöst, nicht blockierend —
+`wb-traeger nachsehen` gerufen, wenn es im PATH liegt (sonst Hinweis auf
+stderr); eine Umgebungsvariable WB_TRAEGER_NACHSEHEN=0 unterdrückt den Ruf,
+damit der Träger seine eigenen wb-aufgabe-Aufrufe keine Kette von
+Nachsehen-Kindprozessen erzeugen lässt. WB_TRAEGER_JETZT=<ISO> ersetzt die Uhr
+der Verlaufseinträge wie im Träger (Testhaken, damit beide dieselbe Zeit sehen).
+
+Nachgezogen nach dem Reviewer-Pass (Auftrag traeger Nr. 2): freigegeben ist nur,
+wessen Hash zum Auftrag passt (`freigabe_gueltig`, auch im Träger); jeder Schreibweg
+hält flock auf <verlauf>.lock; `verlauf <id> wach <text> --bis <iso>` hält Weg 1
+fest (bis dahin keine Sicherung); `pfade setzen` nimmt nur relative Pfade im Repo;
+`verschieben` verlangt zusätzlich, dass die Aufgabe nicht läuft und kein
+Hauptagent lebt; `aufnehmen` liest die Maschine aus dem Verlauf oder aus
+`--maschine`; `anlegen` ergänzt `.companion/auftraege/` in .gitignore eines git-Projekts.
+"""
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+import atomar_schreiben
+
+SKRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+STAENDE = [
+    "offen", "läuft", "steckt",
+    "pausiert (Kontingent)", "pausiert (Nacht)", "pausiert (Weckzeit)",
+    "wartet auf den Nutzer", "zur Abnahme",
+    "aufgegeben", "aufgegeben (Modell)",
+    "abgenommen", "verworfen",
+]
+STAENDE_MENSCH_PFLICHT = {"abgenommen", "verworfen"}
+STAENDE_ENDGUELTIG = {"abgenommen", "verworfen"}
+FREIGABE_ARTEN = ["fenster", "vollbild", "ton", "kamera", "fable"]
+NACHTMODUS_WERTE = ["weiter-lokal", "pausieren"]
+
+# docs/AGENTS-PLAN.md, "Das Fallback-Modell": "ohne Eintrag [in den
+# Agent-Einstellungen] mit der Spur ohne Claude-Kontingent, die der Plan
+# vorschlaegt" -- gemessen am 27.08., ein Vorschlag des Plans, keine
+# Entscheidung des Betreibers; AUFTRAG-agents1-nr3.md nennt die Denkstufe dazu.
+FALLBACK_VORGABE = "opencode-openrouter-z-ai-glm-5-3-flash:medium"
+
+PFLICHTFELDER_AUFTRAG = [
+    "schema_version", "id", "project", "goal", "done_criterion", "loop_type",
+    "model", "approval", "freigaben", "hauptagent", "maschine", "grenzen",
+]
+PFLICHTFELDER_VERLAUF = [
+    "id", "stand", "grund", "maschine", "worker", "team", "verlauf",
+    "ergebnis", "kosten", "wiederaufnahme", "weckzeit", "frage",
+    "pfade", "hauptagent_sitzung", "steckt_vorher",
+]
+
+
+# wb-aufgabe stoesst den Träger nicht an, wenn es VOM TRAEGER ausgerufen wird:
+# sonst waere jeder von wb-traeger gesetzte Stand ein neuer Nachsehen-Kinderprozess,
+# der selbst wieder Staende setzt — der Anlauf passt sich so ab.
+TRAEGER_NACHSEHEN_AN = os.environ.get("WB_TRAEGER_NACHSEHEN", "1") != "0"
+
+
+def traeger_anstossen(args):
+    """`wb-traeger nachsehen` abgelöst starten, wenn es im PATH liegt (sonst
+    Hinweis auf stderr). Bewusst Popen und kein wait: der Aufrufer (Mensch,
+    Oberflaeche, Companion) wartet nie auf den Takt."""
+    wb = shutil.which("wb-traeger")
+    if not wb:
+        sys.stderr.write(
+            "wb-aufgabe: wb-traeger liegt nicht im PATH — es wurde kein "
+            "Träger-Nachsehen angestoßen.\n")
+        return
+    try:
+        subprocess.Popen(
+            [wb, "nachsehen", "--base", os.path.abspath(args.base),
+             "--vorrat", os.path.abspath(vorrat_root_bestimmen(args))],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        sys.stderr.write(
+            "wb-aufgabe: wb-traeger nachsehen liess sich nicht starten (%s).\n" % e)
+
+
+def fehler(text):
+    sys.stderr.write("wb-aufgabe: FEHLER — %s\n" % text)
+    sys.exit(2)
+
+
+def jetzt_iso():
+    roh = os.environ.get("WB_TRAEGER_JETZT", "").strip()
+    if roh:
+        d = datetime.datetime.fromisoformat(roh[:-1] + "+00:00" if roh.endswith("Z") else roh)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return d.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def jetzt_ms():
+    return int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+
+
+def ausgabe(args, text, daten=None):
+    if getattr(args, "json", False) and daten is not None:
+        print(json.dumps(daten, ensure_ascii=False))
+    else:
+        print(text)
+
+
+# ---------------------------------------------------------------- Mensch --
+def _wb_mensch_pfad():
+    p = os.path.join(os.path.expanduser("~"), ".local", "bin", "wb-mensch")
+    if os.access(p, os.X_OK):
+        return p
+    from shutil import which
+    return which("wb-mensch") or None
+
+
+def _ist_mensch_gemessen():
+    pfad = _wb_mensch_pfad()
+    if not pfad:
+        return False
+    try:
+        return subprocess.run([pfad, "pruefen"], timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _beleg_datei_sagt_mensch(pfad):
+    if not pfad:
+        return False
+    try:
+        with open(pfad, "r", encoding="utf-8") as f:
+            inhalt = f.read()
+    except OSError:
+        return False
+    erstes_wort = inhalt.strip().split()[0] if inhalt.strip() else ""
+    return erstes_wort.split("\t")[0] == "mensch"
+
+
+# --mensch-beleg gilt NUR im Testbett (Reviewer-Befund 2/7, 2026-09-10): eine
+# Belegdatei, deren Gueltigkeit nirgends an eine Testumgebung gebunden ist, kann
+# sich ein autonomer Hauptagent im echten Betrieb selbst schreiben und sich damit
+# Freigabe, Abnahme oder Verwerfen erteilen. Im echten HOME (kein --base/--vorrat/
+# WB_VORRAT nach ausserhalb zeigend) zaehlt deshalb ausschliesslich die GEMESSENE
+# Herkunft ueber `wb-mensch pruefen`.
+def im_testbett(args):
+    home = os.path.realpath(os.path.expanduser("~"))
+
+    def aussen(pfad):
+        if not pfad:
+            return False
+        real = os.path.realpath(pfad)
+        return real != home and not real.startswith(home + os.sep)
+
+    if aussen(getattr(args, "base", None)):
+        return True
+    if aussen(os.environ.get("WB_VORRAT")):
+        return True
+    if aussen(getattr(args, "vorrat", None)):
+        return True
+    return False
+
+
+def mensch_verlangen(args, wofuer):
+    if _ist_mensch_gemessen():
+        return
+    beleg = getattr(args, "mensch_beleg", None)
+    if beleg:
+        if not im_testbett(args):
+            fehler(
+                "--mensch-beleg gilt nur im Testbett (--base/--vorrat/WB_VORRAT "
+                "ausserhalb des echten HOME) — im echten HOME zaehlt ausschliesslich "
+                "'wb-mensch pruefen'."
+            )
+        if _beleg_datei_sagt_mensch(beleg):
+            return
+    fehler(
+        "%s darf nur ein MENSCH — gemessen von 'wb-mensch pruefen' oder, im "
+        "Testbett, belegt ueber --mensch-beleg <pfad> (erstes Wort 'mensch')." % wofuer
+    )
+
+
+# STAENDE_ENDGUELTIG-Sperre, EINE Funktion statt mehrerer Kopien (Reviewer-Befund
+# 3): jeder Schreibweg, der den Stand oder die laufenden Felder einer Aufgabe
+# aendert, prueft hierueber, ob die Aufgabe schon abgeschlossen ist.
+def endgueltig_pruefen(verlauf, id_):
+    stand = verlauf.get("stand")
+    if stand in STAENDE_ENDGUELTIG:
+        fehler("'%s' steht auf '%s' — daraus fuehrt kein Weg mehr heraus." % (id_, stand))
+
+
+# --------------------------------------------------------- Einstellungen --
+def einstellung(schluessel, vorgabe, base):
+    """`wb-state settings get <schluessel>`, wenn das geht (nicht-leere
+    Ausgabe, Exit 0); sonst direkt aus <base>/.claude/workbench/settings.json
+    gelesen, punktweise verschachtelt (agents.standardMaschine -> cfg["agents"]
+    ["standardMaschine"]). wb-state kennt diesen punktierten Schluessel heute
+    nicht (flache DEFAULTS, siehe dessen 'settings get') — der Fallback ist
+    deshalb der Normalfall, nicht ein Sonderfall fuer kaputte Installationen."""
+    try:
+        r = subprocess.run(["wb-state", "settings", "get", schluessel],
+                            capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    pfad = os.path.join(base, ".claude", "workbench", "settings.json")
+    try:
+        with open(pfad, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return vorgabe
+    node = cfg
+    for teil in schluessel.split("."):
+        if not isinstance(node, dict) or teil not in node:
+            return vorgabe
+        node = node[teil]
+    if node is None:
+        return vorgabe
+    return node
+
+
+# -------------------------------------------------------- Modell-Klasse --
+# Die EINE Stelle, an der eine Modellangabe zum Registry-Eintrag wird; wb-traeger
+# lädt sie von hier (wa().registry_eintrag), damit Anlegen und Träger nie
+# verschieden urteilen. Gemessen am 11.09.: `anlegen --hauptagent sonnet5:high`
+# ging durch, der Träger meldete „Modell nicht in der Registry: sonnet5".
+def registry_eintrag(model_id, base):
+    """Der Registry-Eintrag zu einer Kennung oder einem Alias, in der
+    Reihenfolge von `wb-state models resolve` (erst die Kennung, dann der
+    Alias, case-sensitiv). Es gilt die Registry <base>/.claude/workbench/
+    models.json, dieselbe Datei, die wb-state liest; nur wenn sie fehlt oder
+    unlesbar ist, die Auslieferung shell/models.default.json neben diesem
+    Skript. Ein Eintrag, den nur die Auslieferung kennt, gilt also nicht,
+    solange es eine Registry gibt, genau wie bei wb-state. None, wenn unbekannt."""
+    for pfad in (os.path.join(base, ".claude", "workbench", "models.json"),
+                 os.path.join(SKRIPT_DIR, "models.default.json")):
+        try:
+            with open(pfad, "r", encoding="utf-8") as f:
+                reg = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        modelle = [e for e in reg.get("models") or [] if isinstance(e, dict) and e.get("id")]
+        return (next((e for e in modelle if e["id"] == model_id), None)
+                or next((e for e in modelle if e.get("alias") == model_id), None))
+    return None
+
+
+def modell_klasse(model_id, base):
+    """'cloud' | 'lokal' | 'unbekannt', gemessen an harness/provider des
+    Registry-Eintrags (registry_eintrag)."""
+    eintrag = registry_eintrag(model_id, base)
+    if eintrag is None:
+        return "unbekannt"
+    if eintrag.get("harness") == "claude" or eintrag.get("provider") == "claude-subscription":
+        return "cloud"
+    return "lokal"
+
+
+def ist_fable(model_id):
+    """'Fable ist nie ein Fallback' (docs/AGENTS-PLAN.md) -- Fable-Modelle
+    heissen immer 'fable...' (Alias) oder 'claude-fable-...' (id), eine
+    Teilzeichenkette reicht, case-insensitiv."""
+    return "fable" in model_id.lower()
+
+
+def modell_effort_teilen(roh, effort_vorgabe):
+    if ":" in roh:
+        modell, effort = roh.rsplit(":", 1)
+    else:
+        modell, effort = roh, effort_vorgabe
+    return modell, effort
+
+
+# --------------------------------------------------------------- Kennung --
+_UMLAUTE = str.maketrans({
+    "ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss",
+    "Ä": "Ae", "Ö": "Oe", "Ü": "Ue",
+})
+
+
+def slug_aus_text(text, laenge=40):
+    s = text.translate(_UMLAUTE).lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    if len(s) > laenge:
+        s = s[:laenge].rstrip("-")
+    return s or "aufgabe"
+
+
+def kennung_erzeugen(ziel, vorrat_root):
+    basis = "%s-%s" % (datetime.date.today().strftime("%Y%m%d"), slug_aus_text(ziel))
+    kandidat, n = basis, 2
+    while os.path.exists(os.path.join(vorrat_root, "%s.json" % kandidat)):
+        kandidat = "%s-%d" % (basis, n)
+        n += 1
+    return kandidat
+
+
+# ----------------------------------------------------------------- Pfade --
+def vorrat_root_bestimmen(args):
+    if getattr(args, "vorrat", None):
+        return args.vorrat
+    umgebung = os.environ.get("WB_VORRAT")
+    if umgebung:
+        return umgebung
+    return os.path.join(args.base, ".claude", "workbench", "vorrat")
+
+
+def vorrat_pfad(vorrat_root, id_):
+    return os.path.join(vorrat_root, "%s.json" % id_)
+
+
+def vorrat_eintrag_lesen(vorrat_root, id_):
+    pfad = vorrat_pfad(vorrat_root, id_)
+    if not os.path.isfile(pfad):
+        fehler("Aufgabe '%s' steht nicht im Vorrat (%s)" % (id_, pfad))
+    with open(pfad, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def auftrag_lesen(pfad):
+    if not os.path.isfile(pfad):
+        fehler("Auftragsdatei fehlt: %s" % pfad)
+    with open(pfad, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def verlauf_pfad_aus(id_, auftrag_pfad):
+    return os.path.join(os.path.dirname(auftrag_pfad), "%s.verlauf.json" % id_)
+
+
+def verlauf_lesen(pfad):
+    if not os.path.isfile(pfad):
+        fehler("Verlaufsdatei fehlt: %s" % pfad)
+    with open(pfad, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def json_schreiben(pfad, daten):
+    atomar_schreiben.schreiben(
+        pfad, json.dumps(daten, ensure_ascii=False, indent=2) + "\n", modus=0o644)
+
+
+def verlauf_eintrag(art, text, von=None, zusatz=None):
+    eintrag = {"zeit": jetzt_iso(), "art": art, "text": text}
+    if von:
+        eintrag["von"] = von
+    if zusatz:
+        eintrag.update(zusatz)
+    return eintrag
+
+
+def verlauf_anhaengen(verlauf, eintrag):
+    verlauf.setdefault("verlauf", []).append(eintrag)
+
+
+def auftrag_hash(auftrag):
+    ohne_approval = {k: v for k, v in auftrag.items() if k != "approval"}
+    kanonisch = json.dumps(ohne_approval, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(kanonisch.encode("utf-8")).hexdigest()
+
+
+# Gemeinsame Prüfungen, die auch wb-traeger aus dieser Datei lädt, damit beide
+# Werkzeuge nie verschieden urteilen.
+def freigabe_gueltig(auftrag):
+    """Freigegeben ist nur, wessen Hash zum heutigen Auftragstext passt; ein
+    von Hand eingetragenes oder nach der Freigabe verändertes approval zählt nicht."""
+    approval = auftrag.get("approval")
+    return isinstance(approval, dict) and approval.get("text_sha256") == auftrag_hash(auftrag)
+
+
+def repo_schluessel(pfad):
+    """Vergleichsform eines Projektpfads: Symlinks aufgelöst; auf macOS ohne
+    Groß- und Kleinschreibung, weil APFS sie in der Vorgabe nicht unterscheidet."""
+    if not pfad:
+        return None
+    echt = os.path.realpath(pfad)
+    return echt.lower() if sys.platform == "darwin" else os.path.normcase(echt)
+
+
+def pid_lebt(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def belegt_repo(verlauf):
+    """Das Repo einer Aufgabe ist belegt, solange sie läuft, ihr Hauptagent
+    lebt, oder sie in einem Stand, in dem der Hauptagent weiterarbeiten darf,
+    noch arbeitende Worker führt."""
+    stand = verlauf.get("stand") or ""
+    if stand == "läuft":
+        return True
+    sitzung = verlauf.get("hauptagent_sitzung") or {}
+    if sitzung.get("pid") and pid_lebt(sitzung["pid"]):
+        return True
+    weiterarbeitend = stand in ("wartet auf den Nutzer", "zur Abnahme") or stand.startswith("pausiert")
+    return weiterarbeitend and any(w.get("zustand") == "arbeitet" for w in (verlauf.get("worker") or []))
+
+
+def pfad_gueltig(pfad):
+    """Ein Eintrag in `pfade`: relativ, innerhalb des Repos, nie die Wurzel."""
+    if not isinstance(pfad, str) or not pfad.strip() or os.path.isabs(pfad):
+        return False
+    if ".." in pfad.replace("\\", "/").split("/"):
+        return False
+    return os.path.normpath(pfad) not in (".", "")
+
+
+_SPERREN = []
+
+
+def verlauf_sperren(verlauf_datei):
+    """flock auf <verlauf>.lock bis zum Prozessende: jeder Lese-Ändere-
+    Schreib-Weg eines Aufrufs liegt damit unter einer Sperre."""
+    f = open(verlauf_datei + ".lock", "a")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    _SPERREN.append(f)
+
+
+GITIGNORE_ZEILE = ".companion/auftraege/"
+
+
+def gitignore_sichern(projekt):
+    """In einem git-Projekt gehört .companion/auftraege/ in .gitignore: die
+    Verlaufsdatei ändert sich je Takt, und über die Maschinengrenze gehen
+    Auftrag und Verlauf per scp, nicht über git. Rückgabe True, wenn ergänzt."""
+    if subprocess.run(["git", "-C", projekt, "rev-parse", "--git-dir"],
+                      capture_output=True, timeout=30).returncode != 0:
+        return False
+    pfad = os.path.join(projekt, ".gitignore")
+    try:
+        with open(pfad, "r", encoding="utf-8") as f:
+            vorhanden = f.read()
+    except OSError:
+        vorhanden = ""
+    gedeckt = (GITIGNORE_ZEILE, "/" + GITIGNORE_ZEILE, ".companion/", "/.companion/", ".companion", "/.companion")
+    if any(z.strip() in gedeckt for z in vorhanden.splitlines()):
+        return False
+    with open(pfad, "a", encoding="utf-8") as f:
+        f.write(("" if not vorhanden or vorhanden.endswith("\n") else "\n") + GITIGNORE_ZEILE + "\n")
+    return True
+
+
+def geladen_aus_id(args):
+    vorrat_root = vorrat_root_bestimmen(args)
+    eintrag = vorrat_eintrag_lesen(vorrat_root, args.id)
+    auftrag_pfad = eintrag["auftrag"]
+    auftrag = auftrag_lesen(auftrag_pfad)
+    verlauf_datei = verlauf_pfad_aus(args.id, auftrag_pfad)
+    verlauf_sperren(verlauf_datei)
+    verlauf = verlauf_lesen(verlauf_datei)
+    return vorrat_root, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf
+
+
+# ------------------------------------------------------------- anlegen --
+def cmd_anlegen(args):
+    base = args.base
+    projekt = os.path.abspath(args.projekt)
+    vorrat_root = vorrat_root_bestimmen(args)
+    os.makedirs(vorrat_root, exist_ok=True)
+
+    maschine = args.maschine or einstellung("agents.standardMaschine", "peer", base)
+    hauptagent_roh = args.hauptagent or einstellung("agents.hauptagentModell", "opus5:xhigh", base)
+    modell, effort = modell_effort_teilen(hauptagent_roh, "high")
+    # Gespeichert wird die Registry-Kennung, nicht der Alias: der Träger kann
+    # auf einer Maschine laufen, deren Registry den Alias nicht kennt.
+    eintrag = registry_eintrag(modell, base)
+    if eintrag is None:
+        fehler("Modell '%s' ist nicht in der Registry (weder Kennung noch Alias); "
+               "die Liste zeigt 'wb-state models list'." % modell)
+    modell = eintrag["id"]
+
+    fallback_roh = args.fallback or einstellung("agents.fallbackModell", FALLBACK_VORGABE, base)
+    if fallback_roh == "keins":
+        fallback = None
+    else:
+        fb_modell, fb_effort = modell_effort_teilen(fallback_roh, "medium")
+        if ist_fable(fb_modell):
+            fehler("Fable ist nie ein Fallback ('%s')." % fb_modell)
+        if args.daten_lokal and modell_klasse(fb_modell, base) != "lokal":
+            fehler("--daten-lokal verlangt ein lokales Fallback-Modell oder 'keins' "
+                   "('%s' ist nicht als lokal bekannt)." % fb_modell)
+        fallback = {"model": fb_modell, "effort": fb_effort}
+
+    nachtmodus = args.nachtmodus or "pausieren"
+    if nachtmodus not in NACHTMODUS_WERTE:
+        fehler("--nachtmodus muss einer von %s sein" % ", ".join(NACHTMODUS_WERTE))
+
+    freigaben = {a: (a in (args.freigabe or [])) for a in FREIGABE_ARTEN}
+    for a in (args.freigabe or []):
+        if a not in FREIGABE_ARTEN:
+            fehler("--freigabe kennt '%s' nicht (erlaubt: %s)" % (a, ", ".join(FREIGABE_ARTEN)))
+
+    id_ = kennung_erzeugen(args.ziel, vorrat_root)
+    auftrag_pfad = os.path.join(projekt, ".companion", "auftraege", "%s.json" % id_)
+    verlauf_datei = verlauf_pfad_aus(id_, auftrag_pfad)
+
+    stand_anfang, grund_anfang = "offen", ""
+    if args.daten_lokal:
+        klasse = modell_klasse(modell, base)
+        if klasse == "cloud":
+            grund_anfang = "Daten lokal, Hauptagent Cloud"
+        else:
+            grund_anfang = "Daten lokal, lokaler Hauptagent noch nicht gemessen"
+        stand_anfang = "wartet auf den Nutzer"
+
+    auftrag = {
+        "schema_version": 1,
+        "id": id_,
+        "project": projekt,
+        "goal": args.ziel,
+        "done_criterion": args.fertig,
+        "reference": None,
+        "guardrails": [],
+        "gate_commands": [],
+        "limits": {"iterations": None, "tokens": None, "time_seconds": None},
+        "loop_type": "loop",
+        "model": modell,
+        "approval": None,
+        "freigaben": freigaben,
+        "hauptagent": {"model": modell, "effort": effort, "fallback": fallback},
+        "maschine": maschine,
+        "grenzen": {
+            "frist": args.frist,
+            "runden": args.runden,
+            "nachtmodus": nachtmodus,
+            "nachtfenster": None,
+            "daten-lokal": bool(args.daten_lokal),
+        },
+    }
+    verlauf = {
+        "id": id_,
+        "stand": stand_anfang,
+        "grund": grund_anfang,
+        "maschine": maschine,
+        "worker": [],
+        "team": [],
+        "verlauf": [],
+        "ergebnis": {"pfad": None, "commit": None, "belege": [], "reviewer_befunde": []},
+        "kosten": {"token_schaetzung": None, "lokale_stunden": None},
+        "wiederaufnahme": "",
+        "weckzeit": None,
+        "frage": None,
+        "pfade": [],
+        "hauptagent_sitzung": None,
+        "steckt_vorher": None,
+    }
+    verlauf_anhaengen(verlauf, verlauf_eintrag("gestartet", "Aufgabe angelegt: %s" % args.ziel))
+    if grund_anfang:
+        verlauf_anhaengen(verlauf, verlauf_eintrag("pausiert", grund_anfang))
+
+    if gitignore_sichern(projekt):
+        verlauf_anhaengen(verlauf, verlauf_eintrag(
+            "gitignore", "'%s' in .gitignore des Projekts ergänzt." % GITIGNORE_ZEILE))
+    json_schreiben(auftrag_pfad, auftrag)
+    json_schreiben(verlauf_datei, verlauf)
+
+    bestehende_raenge = []
+    for name in os.listdir(vorrat_root) if os.path.isdir(vorrat_root) else []:
+        if name.endswith(".json") and not name.startswith("."):
+            try:
+                with open(os.path.join(vorrat_root, name), "r", encoding="utf-8") as f:
+                    bestehende_raenge.append(json.load(f).get("rang", 0))
+            except (OSError, json.JSONDecodeError):
+                continue
+    rang = args.rang if args.rang is not None else (max(bestehende_raenge) + 1 if bestehende_raenge else 1)
+
+    vorrat_eintrag = {
+        "rang": rang, "projekt": projekt, "auftrag": auftrag_pfad,
+        "maschine": maschine, "aufgenommen": jetzt_iso(),
+    }
+    json_schreiben(vorrat_pfad(vorrat_root, id_), vorrat_eintrag)
+
+    ausgabe(args, id_, daten={"id": id_, "auftrag": auftrag_pfad, "stand": stand_anfang})
+    return 0
+
+
+# ------------------------------------------------------------ freigeben --
+def cmd_freigeben(args):
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+
+    if args.neu_freigeben:
+        mensch_verlangen(args, "eine bestehende Freigabe zurueckziehen (--neu-freigeben)")
+        if auftrag.get("approval") is None:
+            ausgabe(args, "wb-aufgabe: '%s' war nicht freigegeben — nichts zu tun." % args.id,
+                    daten={"id": args.id, "approval": None})
+            return 0
+        auftrag["approval"] = None
+        json_schreiben(auftrag_pfad, auftrag)
+        verlauf_anhaengen(verlauf, verlauf_eintrag(
+            "neu-freigabe", "Freigabe zurueckgezogen — neue Freigabe noetig.", von="mensch"))
+        json_schreiben(verlauf_datei, verlauf)
+        ausgabe(args, "wb-aufgabe: Freigabe von '%s' zurueckgezogen." % args.id,
+                daten={"id": args.id, "approval": None})
+        return 0
+
+    if auftrag.get("approval") is not None:
+        fehler("'%s' ist bereits freigegeben — erst 'wb-aufgabe freigeben %s --neu-freigeben'."
+               % (args.id, args.id))
+    mensch_verlangen(args, "eine Aufgabe freigeben")
+
+    approval = {
+        "approved_at_ms": jetzt_ms(),
+        "text_sha256": auftrag_hash(auftrag),
+        "device": None,
+        "confirmation": "shell",
+    }
+    auftrag["approval"] = approval
+    json_schreiben(auftrag_pfad, auftrag)
+    verlauf_anhaengen(verlauf, verlauf_eintrag("annahme", "Aufgabe freigegeben.", von="mensch"))
+    json_schreiben(verlauf_datei, verlauf)
+    ausgabe(args, "wb-aufgabe: '%s' freigegeben." % args.id,
+            daten={"id": args.id, "text_sha256": approval["text_sha256"]})
+    if TRAEGER_NACHSEHEN_AN:
+        traeger_anstossen(args)
+    return 0
+
+
+# ---------------------------------------------------------------- stand --
+def cmd_stand(args):
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+
+    if args.stand not in STAENDE:
+        fehler("Stand '%s' ist ungueltig (erlaubt: %s)" % (args.stand, ", ".join(STAENDE)))
+    endgueltig_pruefen(verlauf, args.id)
+
+    von = args.von
+    if args.stand in STAENDE_MENSCH_PFLICHT:
+        mensch_verlangen(args, "eine Aufgabe auf '%s' setzen" % args.stand)
+        von = "mensch"
+
+    alt = verlauf.get("stand")
+    verlauf["stand"] = args.stand
+    verlauf["grund"] = args.grund or ""
+    if args.weckzeit is not None:
+        verlauf["weckzeit"] = None if args.weckzeit == "keine" else args.weckzeit
+    # steckt_vorher (Bau-Schritt 2): beim UEBERGANG auf „steckt" merkt sich das
+    # Feld den vorigen Stand, damit der Träger ihn wiederherstellen kann, wenn
+    # die Umgebung wieder da ist. Jeder Wechsel WEG von „steckt" leert es.
+    if args.stand == "steckt":
+        if alt != "steckt":
+            verlauf["steckt_vorher"] = alt
+    else:
+        verlauf["steckt_vorher"] = None
+    if args.stand == "steckt":
+        verlauf_anhaengen(verlauf, verlauf_eintrag(
+            "steckt", "Stand '%s' -> 'steckt'%s" % (alt, (" (%s)" % args.grund) if args.grund else ""),
+            von=von))
+    else:
+        verlauf_anhaengen(verlauf, verlauf_eintrag(
+            "pausiert" if args.stand.startswith("pausiert") else "runde",
+            "Stand '%s' -> '%s'%s" % (alt, args.stand, (" (%s)" % args.grund) if args.grund else ""),
+            von=von))
+    json_schreiben(verlauf_datei, verlauf)
+    ausgabe(args, "wb-aufgabe: '%s' steht jetzt auf '%s'." % (args.id, args.stand),
+            daten={"id": args.id, "stand": args.stand})
+    if TRAEGER_NACHSEHEN_AN:
+        traeger_anstossen(args)
+    return 0
+
+
+# -------------------------------------------------------------- verlauf --
+def cmd_verlauf(args):
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+
+    if args.art == "zustellung" and args.kennung:
+        for e in verlauf.get("verlauf", []):
+            if e.get("art") == "zustellung" and e.get("kennung") == args.kennung:
+                ausgabe(args, "schon quittiert", daten={"id": args.id, "schon_quittiert": True})
+                return 0
+
+    zusatz = {}
+    if args.kennung:
+        zusatz["kennung"] = args.kennung
+    if args.grund:
+        zusatz["grund"] = args.grund
+    # `wach --bis <iso>`: Weg 1 des Plans (wach bleiben, sich selbst wecken).
+    # Bis zu dieser Zeit gilt der Hauptagent für die Sicherung als entschieden.
+    if args.art == "wach" and not args.bis:
+        fehler("'verlauf <id> wach' braucht --bis <ISO-Zeit>.")
+    if args.bis:
+        try:
+            datetime.datetime.fromisoformat(args.bis[:-1] + "+00:00" if args.bis.endswith("Z") else args.bis)
+        except ValueError:
+            fehler("--bis '%s' ist keine ISO-Zeit." % args.bis)
+        zusatz["bis"] = args.bis
+    verlauf_anhaengen(verlauf, verlauf_eintrag(args.art, args.text, von=args.von, zusatz=zusatz or None))
+    json_schreiben(verlauf_datei, verlauf)
+    ausgabe(args, "wb-aufgabe: Verlaufseintrag '%s' fuer '%s' angehaengt." % (args.art, args.id),
+            daten={"id": args.id, "art": args.art})
+    return 0
+
+
+# --------------------------------------------------------------- worker --
+def cmd_worker(args):
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+    worker = verlauf.setdefault("worker", [])
+
+    if args.aktion == "setzen":
+        endgueltig_pruefen(verlauf, args.id)
+        neuer = {
+            "name": args.name, "rolle": args.rolle, "zustand": args.zustand,
+            "pane": args.pane, "ergebnispfad": args.ergebnis, "aufgabe_id": args.id,
+        }
+        for i, w in enumerate(worker):
+            if w.get("name") == args.name:
+                worker[i] = neuer
+                break
+        else:
+            worker.append(neuer)
+        team = verlauf.setdefault("team", [])
+        if not any(t.get("rolle") == args.rolle for t in team):
+            team.append({"rolle": args.rolle, "herkunft": "besetzt"})
+        verlauf_anhaengen(verlauf, verlauf_eintrag(
+            "worker-vergeben", "Worker '%s' (Rolle %s) -> %s" % (args.name, args.rolle, args.zustand)))
+        json_schreiben(verlauf_datei, verlauf)
+        ausgabe(args, "wb-aufgabe: Worker '%s' gesetzt." % args.name,
+                daten={"id": args.id, "worker": args.name})
+        return 0
+
+    # entfernen
+    vorher = len(worker)
+    verlauf["worker"] = [w for w in worker if w.get("name") != args.name]
+    if len(verlauf["worker"]) == vorher:
+        fehler("Worker '%s' ist bei '%s' nicht bekannt." % (args.name, args.id))
+    verlauf_anhaengen(verlauf, verlauf_eintrag("worker-vergeben", "Worker '%s' entfernt." % args.name))
+    json_schreiben(verlauf_datei, verlauf)
+    ausgabe(args, "wb-aufgabe: Worker '%s' entfernt." % args.name,
+            daten={"id": args.id, "worker": args.name})
+    return 0
+
+
+# ---------------------------------------------------------------- frage --
+def cmd_frage(args):
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+    endgueltig_pruefen(verlauf, args.id)
+    if args.empfehlung and args.empfehlung not in args.option:
+        fehler("--empfehlung muss eine der --option-Werte sein.")
+    verlauf["frage"] = {
+        "text": args.text, "optionen": list(args.option),
+        "empfehlung": args.empfehlung, "antwort": None,
+    }
+    verlauf["stand"] = "wartet auf den Nutzer"
+    verlauf_anhaengen(verlauf, verlauf_eintrag("frage", args.text))
+    json_schreiben(verlauf_datei, verlauf)
+    ausgabe(args, "wb-aufgabe: Frage fuer '%s' gestellt." % args.id, daten={"id": args.id})
+    return 0
+
+
+def cmd_antwort(args):
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+    endgueltig_pruefen(verlauf, args.id)
+    mensch_verlangen(args, "eine Frage beantworten")
+    if not verlauf.get("frage"):
+        fehler("'%s' hat gerade keine offene Frage." % args.id)
+    verlauf["frage"]["antwort"] = args.text
+    verlauf_anhaengen(verlauf, verlauf_eintrag("antwort", args.text, von="mensch"))
+    verlauf["frage"] = None
+    verlauf["stand"] = "offen"
+    verlauf["grund"] = "Antwort liegt"
+    json_schreiben(verlauf_datei, verlauf)
+    ausgabe(args, "wb-aufgabe: Antwort fuer '%s' vermerkt." % args.id, daten={"id": args.id})
+    if TRAEGER_NACHSEHEN_AN:
+        traeger_anstossen(args)
+    return 0
+
+
+# --------------------------------------------------- wiederaufnahme/weckzeit
+def cmd_wiederaufnahme(args):
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+    endgueltig_pruefen(verlauf, args.id)
+    verlauf["wiederaufnahme"] = args.text
+    verlauf_anhaengen(verlauf, verlauf_eintrag("wiederaufnahme", args.text))
+    json_schreiben(verlauf_datei, verlauf)
+    ausgabe(args, "wb-aufgabe: Wiederaufnahme-Stand von '%s' aktualisiert." % args.id, daten={"id": args.id})
+    return 0
+
+
+def cmd_weckzeit(args):
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+    endgueltig_pruefen(verlauf, args.id)
+    verlauf["weckzeit"] = None if args.wert == "keine" else args.wert
+    json_schreiben(verlauf_datei, verlauf)
+    ausgabe(args, "wb-aufgabe: Weckzeit von '%s' gesetzt auf %s." % (args.id, verlauf["weckzeit"]),
+            daten={"id": args.id, "weckzeit": verlauf["weckzeit"]})
+    return 0
+
+
+# ------------------------------------------------------- pfade (Schritt 2) --
+def cmd_pfade(args):
+    """Verlaufsfeld `pfade`: die Pfade, die der Hauptagent als seine führt und
+    die der Stop-Hook (bzw. der Träger beim lokalen Hauptagenten) beim Zugende
+    committet. Gesetzt und entfernt wird einzeln genannt — nie ein Verzeichnis
+    pauschal (Hausregel „Wer committet, nennt seine Pfade")."""
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+    endgueltig_pruefen(verlauf, args.id)
+    pfade = verlauf.setdefault("pfade", [])
+    if args.aktion == "setzen":
+        falsch = [p for p in args.pfad if not pfad_gueltig(p)]
+        if falsch:
+            fehler("ungültige Pfade %s: erlaubt sind relative Pfade im Repo, nie '.', '..', "
+                   "leer, absolut oder mit '..'-Segment." % ", ".join(repr(p) for p in falsch))
+        geaendert = []
+        for p in args.pfad:
+            if p not in pfade:
+                pfade.append(p)
+                geaendert.append(p)
+        if not geaendert:
+            ausgabe(args, "wb-aufgabe: alle genannten Pfade stehen schon bei '%s'." % args.id,
+                    daten={"id": args.id, "pfade": pfade})
+            return 0
+        verlauf_anhaengen(verlauf, verlauf_eintrag(
+            "pfade", "Pfade geführt: %s" % ", ".join(geaendert)))
+    else:
+        vorher = len(pfade)
+        verlauf["pfade"] = [p for p in pfade if p not in args.pfad]
+        if len(verlauf["pfade"]) == vorher:
+            fehler("keiner der genannten Pfade wird bei '%s' geführt." % args.id)
+        verlauf_anhaengen(verlauf, verlauf_eintrag(
+            "pfade", "Pfade entfernt: %s" % ", ".join(p for p in args.pfad if p not in verlauf["pfade"])))
+    json_schreiben(verlauf_datei, verlauf)
+    ausgabe(args, "wb-aufgabe: Pfade von '%s' aktualisiert (%d geführt)." % (args.id, len(verlauf["pfade"])),
+            daten={"id": args.id, "pfade": verlauf["pfade"]})
+    return 0
+
+
+# ------------------------------------------------------ sitzung (Schritt 2) --
+def cmd_sitzung(args):
+    """Verlaufsfeld `hauptagent_sitzung`: die lebende Sitzung des Hauptagenten.
+    `setzen` übernimmt die genannten Felder und stempelt `gestartet`; `gesehen`
+    stempelt nur `zuletzt_gesehen` (der Takt des Trägers); `leeren` löscht das
+    ganze Feld."""
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+    if args.aktion == "leeren":
+        verlauf["hauptagent_sitzung"] = None
+        verlauf_anhaengen(verlauf, verlauf_eintrag(
+            "sitzung", "Sitzung des Hauptagenten geleert (Sitzung endgültig weg).", von="traeger"))
+        json_schreiben(verlauf_datei, verlauf)
+        ausgabe(args, "wb-aufgabe: hauptagent_sitzung von '%s' geleert." % args.id,
+                daten={"id": args.id, "hauptagent_sitzung": None})
+        return 0
+    if args.aktion == "gesehen":
+        sitzung = verlauf.get("hauptagent_sitzung") or {}
+        sitzung["zuletzt_gesehen"] = jetzt_iso()
+        verlauf["hauptagent_sitzung"] = sitzung
+        json_schreiben(verlauf_datei, verlauf)
+        ausgabe(args, "wb-aufgabe: '%s' zuletzt gesehen %s." % (args.id, sitzung["zuletzt_gesehen"]),
+                daten={"id": args.id, "zuletzt_gesehen": sitzung["zuletzt_gesehen"]})
+        return 0
+    sitzung = verlauf.get("hauptagent_sitzung") or {}
+    for feld in ("tmux_session", "pane", "claude_session_id", "pid"):
+        wert = getattr(args, feld, None)
+        if wert is not None:
+            sitzung[feld] = wert
+    sitzung["gestartet"] = args.gestartet or jetzt_iso()
+    sitzung.setdefault("zuletzt_gesehen", sitzung["gestartet"])
+    verlauf["hauptagent_sitzung"] = sitzung
+    endgueltig_pruefen(verlauf, args.id)
+    verlauf_anhaengen(verlauf, verlauf_eintrag(
+        "sitzung", "Hauptagent-Sitzung gesetzt: %s%s" % (
+            sitzung.get("tmux_session") or sitzung.get("pane") or "?",
+            (" (PID %s)" % sitzung["pid"]) if sitzung.get("pid") else ""),
+        von="traeger"))
+    json_schreiben(verlauf_datei, verlauf)
+    ausgabe(args, "wb-aufgabe: hauptagent_sitzung von '%s' gesetzt." % args.id,
+            daten={"id": args.id, "hauptagent_sitzung": sitzung})
+    return 0
+
+
+# ------------------------------------------------------ naechste (Schritt 2) --
+def cmd_naechste(args):
+    """Die vorderste offene Aufgabe nach Rang, die freigegeben ist und deren
+    Repo von keiner Aufgabe im Stand „läuft" belegt ist. Exit 0 mit JSON, wenn
+    es eine gibt; Exit 1 mit einer deutschen Meldung, wenn nicht."""
+    vorrat_root = vorrat_root_bestimmen(args)
+    kandidaten = []
+    for name in sorted(os.listdir(vorrat_root)) if os.path.isdir(vorrat_root) else []:
+        if not name.endswith(".json") or name.startswith("."):
+            continue
+        try:
+            with open(os.path.join(vorrat_root, name), "r", encoding="utf-8") as f:
+                eintrag = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        kandidaten.append((eintrag.get("rang", 0), name[:-len(".json")], eintrag))
+    kandidaten.sort(key=lambda k: (k[0], k[1]))
+
+    belegte = []
+    for rang, id_, eintrag in kandidaten:
+        try:
+            verlauf = verlauf_lesen(verlauf_pfad_aus(id_, eintrag["auftrag"]))
+        except (SystemExit, KeyError, TypeError):
+            continue
+        if belegt_repo(verlauf):
+            belegte.append((repo_schluessel(eintrag.get("projekt")), id_))
+    ausser = set(args.ausser or [])
+    zurueckgestellt = []
+    for rang, id_, eintrag in kandidaten:
+        if id_ in ausser:
+            continue
+        # Ein Eintrag ohne Maschine gilt als einer der eigenen Maschine.
+        if args.maschine and (eintrag.get("maschine") or args.maschine) != args.maschine:
+            continue
+        try:
+            verlauf = verlauf_lesen(verlauf_pfad_aus(id_, eintrag["auftrag"]))
+            auftrag = auftrag_lesen(eintrag["auftrag"])
+        except (SystemExit, KeyError, TypeError):
+            continue
+        if verlauf.get("stand") != "offen":
+            continue
+        if not auftrag.get("approval"):
+            continue
+        if not freigabe_gueltig(auftrag):
+            zurueckgestellt.append({"id": id_, "grund": "Freigabe ungültig", "warten": True})
+            continue
+        schluessel = repo_schluessel(eintrag.get("projekt"))
+        andere = next((b for s, b in belegte if s == schluessel and b != id_), None) if schluessel else None
+        if andere:
+            zurueckgestellt.append({"id": id_, "grund": "Repo belegt durch Aufgabe %s" % andere})
+            continue
+        hauptagent = auftrag.get("hauptagent") or {}
+        ausgabe(args, "%s" % id_, daten={
+            "id": id_, "rang": rang, "projekt": eintrag.get("projekt"),
+            "maschine": eintrag.get("maschine"), "hauptagent": hauptagent,
+            "freigegeben": bool(auftrag.get("approval")), "stand": "offen",
+            "zurueckgestellt": zurueckgestellt,
+        })
+        return 0
+    if args.json:
+        print(json.dumps({"id": None, "zurueckgestellt": zurueckgestellt}, ensure_ascii=False))
+    sys.stderr.write("wb-aufgabe: keine startbare Aufgabe im Vorrat.\n")
+    return 1
+
+
+# ----------------------------------------------------- aufnehmen (Schritt 2) --
+def cmd_aufnehmen(args):
+    """Vorratseintrag für eine schon im Projekt liegende Auftragsdatei — der
+    Weg, über den der Träger die Aufgabe eines fremden Trägers per ssh auf der
+    Zielmaschine in dessen Vorrat legt. Idempotent: steht sie schon drin, tut
+    der Aufruf nichts."""
+    vorrat_root = vorrat_root_bestimmen(args)
+    os.makedirs(vorrat_root, exist_ok=True)
+    projekt = os.path.abspath(args.projekt)
+    auftrag_pfad = os.path.join(projekt, ".companion", "auftraege", "%s.json" % args.id)
+    auftrag = auftrag_lesen(auftrag_pfad)
+    # Die aktuelle Maschine steht im Verlauf (verschieben ändert nur ihn, der
+    # Auftrag bleibt wegen des Freigabe-Hashes unverändert).
+    maschine = args.maschine
+    if not maschine:
+        try:
+            with open(verlauf_pfad_aus(args.id, auftrag_pfad), "r", encoding="utf-8") as f:
+                maschine = json.load(f).get("maschine")
+        except (OSError, json.JSONDecodeError):
+            maschine = None
+    maschine = maschine or auftrag.get("maschine")
+    ziel = vorrat_pfad(vorrat_root, args.id)
+    if os.path.exists(ziel):
+        ausgabe(args, "wb-aufgabe: '%s' steht schon im Vorrat (%s) — nichts zu tun."
+                % (args.id, ziel), daten={"id": args.id, "schon_aufgenommen": True})
+        return 0
+    bestehende_raenge = []
+    for name in os.listdir(vorrat_root) if os.path.isdir(vorrat_root) else []:
+        if name.endswith(".json") and not name.startswith("."):
+            try:
+                with open(os.path.join(vorrat_root, name), "r", encoding="utf-8") as f:
+                    bestehende_raenge.append(json.load(f).get("rang", 0))
+            except (OSError, json.JSONDecodeError):
+                continue
+    rang = args.rang if args.rang is not None else (max(bestehende_raenge) + 1 if bestehende_raenge else 1)
+    eintrag = {
+        "rang": rang, "projekt": projekt, "auftrag": auftrag_pfad,
+        "maschine": maschine, "aufgenommen": jetzt_iso(),
+    }
+    json_schreiben(ziel, eintrag)
+    ausgabe(args, "wb-aufgabe: '%s' in den Vorrat aufgenommen (%s)." % (args.id, ziel),
+            daten={"id": args.id, "rang": rang, "maschine": eintrag["maschine"]})
+    if TRAEGER_NACHSEHEN_AN:
+        traeger_anstossen(args)
+    return 0
+
+
+# ---------------------------------------------------- verschieben (Schritt 2) --
+def cmd_verschieben(args):
+    """Maschine einer Aufgabe wechseln. Verlangt (docs/AGENTS-PLAN.md, Abschnitt
+    4, „Die Maschine"): keine Worker-Spur im Zustand „arbeitet", kein „Daten
+    bleiben auf der Maschine", und einen gepushten Repo-Stand (sauberer
+    Arbeitsbaum und nichts über der Upstream-Referenz). In den Vorrat der
+    Zielmaschine übernimmt ihn der Träger — hier wird nur der Vorratseintrag
+    auf die neue Maschine umgestellt und der Verlauf geschrieben."""
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+    endgueltig_pruefen(verlauf, args.id)
+    arbeitende = [w.get("name") for w in verlauf.get("worker", [])
+                  if w.get("zustand") == "arbeitet"]
+    if arbeitende:
+        fehler("'%s' hat Worker im Zustand 'arbeitet' (%s) — erst einsammeln, dann verschieben."
+               % (args.id, ", ".join(arbeitende)))
+    if verlauf.get("stand") == "läuft":
+        fehler("'%s' läuft — erst pausieren oder abschließen, dann verschieben." % args.id)
+    sitzung = verlauf.get("hauptagent_sitzung") or {}
+    if sitzung.get("pid") and pid_lebt(sitzung["pid"]):
+        fehler("'%s' hat einen lebenden Hauptagenten (PID %s) — erst schließen, dann verschieben."
+               % (args.id, sitzung["pid"]))
+    if auftrag.get("grenzen", {}).get("daten-lokal"):
+        fehler("'%s' trägt 'Daten bleiben auf der Maschine' — ein Verschieben ist mechanisch gesperrt." % args.id)
+    projekt = eintrag.get("projekt")
+    if subprocess.run(["git", "-C", projekt, "rev-parse", "--git-dir"],
+                      capture_output=True, timeout=30).returncode != 0:
+        fehler("'%s' liegt nicht in einem git-Repo (%s) — Repo-Stand kann nicht als gepusht gelten." % (args.id, projekt))
+    if subprocess.run(["git", "-C", projekt, "status", "--porcelain"],
+                      capture_output=True, timeout=30).stdout.strip():
+        fehler("'%s' hat uncommittete Aenderungen — erst committen und pushen, dann verschieben." % args.id)
+    hinter = subprocess.run(["git", "-C", projekt, "log", "@{u}..HEAD", "--oneline"],
+                            capture_output=True, timeout=30)
+    if hinter.returncode != 0:
+        fehler("'%s' hat keinen Upstream-Zweig — ein gepushter Stand ist nicht belegt (Verschieben abgelehnt)." % args.id)
+    if hinter.stdout.strip():
+        fehler("'%s' hat Commits über dem Upstream — erst pushen, dann verschieben." % args.id)
+    alt = verlauf.get("maschine")
+    verlauf["maschine"] = args.nach
+    verlauf_anhaengen(verlauf, verlauf_eintrag(
+        "verschoben", "Maschine '%s' -> '%s'" % (alt, args.nach)))
+    json_schreiben(verlauf_datei, verlauf)
+    vorrat_root = vorrat_root_bestimmen(args)
+    vorrat_eintrag_lesen(vorrat_root, args.id)
+    eintrag["maschine"] = args.nach
+    json_schreiben(vorrat_pfad(vorrat_root, args.id), eintrag)
+    ausgabe(args, "wb-aufgabe: '%s' soll auf '%s' laufen — der Vorratseintrag wurde umgestellt; "
+                  "der Träger übernimmt ihn dort." % (args.id, args.nach),
+            daten={"id": args.id, "maschine": args.nach})
+    return 0
+
+
+# ---------------------------------------------------------------- rang --
+def cmd_rang(args):
+    vorrat_root = vorrat_root_bestimmen(args)
+    pfad = vorrat_pfad(vorrat_root, args.id)
+    eintrag = vorrat_eintrag_lesen(vorrat_root, args.id)
+    eintrag["rang"] = args.n
+    json_schreiben(pfad, eintrag)
+    ausgabe(args, "wb-aufgabe: Rang von '%s' auf %d gesetzt." % (args.id, args.n),
+            daten={"id": args.id, "rang": args.n})
+    return 0
+
+
+# --------------------------------------------------------------- liste --
+def cmd_liste(args):
+    vorrat_root = vorrat_root_bestimmen(args)
+    zeilen = []
+    for name in sorted(os.listdir(vorrat_root)) if os.path.isdir(vorrat_root) else []:
+        if not name.endswith(".json") or name.startswith("."):
+            continue
+        id_ = name[:-len(".json")]
+        try:
+            with open(os.path.join(vorrat_root, name), "r", encoding="utf-8") as f:
+                eintrag = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        stand = None
+        hauptagent = None
+        try:
+            verlauf = verlauf_lesen(verlauf_pfad_aus(id_, eintrag["auftrag"]))
+            stand = verlauf.get("stand")
+            auftrag = auftrag_lesen(eintrag["auftrag"])
+            hauptagent = auftrag.get("hauptagent")
+        except SystemExit:
+            stand = "unbekannt"
+        if args.stand and stand != args.stand:
+            continue
+        zeilen.append({
+            "id": id_, "rang": eintrag.get("rang", 0), "projekt": eintrag.get("projekt"),
+            "maschine": eintrag.get("maschine"), "stand": stand, "hauptagent": hauptagent,
+        })
+    zeilen.sort(key=lambda z: (z["rang"], z["id"]))
+
+    if args.json:
+        print(json.dumps(zeilen, ensure_ascii=False))
+    else:
+        for z in zeilen:
+            print("%-4s %-30s %-20s %s" % (z["rang"], z["id"], z["stand"], z["projekt"]))
+    return 0
+
+
+# --------------------------------------------------------------- zeigen --
+def cmd_zeigen(args):
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+    if args.json:
+        print(json.dumps({"vorrat": eintrag, "auftrag": auftrag, "verlauf": verlauf}, ensure_ascii=False))
+        return 0
+    hauptagent = auftrag.get("hauptagent") or {}
+    fallback = hauptagent.get("fallback")
+    fallback_text = ("%s:%s" % (fallback["model"], fallback["effort"])) if fallback else "keins"
+    print("Aufgabe %s" % args.id)
+    print("  Ziel:   %s" % auftrag.get("goal"))
+    print("  Fertig: %s" % auftrag.get("done_criterion"))
+    print("  Stand:  %s%s" % (verlauf.get("stand"), (" (%s)" % verlauf["grund"]) if verlauf.get("grund") else ""))
+    print("  Rang:   %s" % eintrag.get("rang"))
+    print("  Maschine: %s" % verlauf.get("maschine"))
+    print("  Hauptagent: %s:%s (Fallback: %s)" % (hauptagent.get("model"), hauptagent.get("effort"), fallback_text))
+    print("  Freigabe: %s" % ("keine" if not auftrag.get("approval") else
+                              "gültig" if freigabe_gueltig(auftrag) else "UNGÜLTIG (Hash passt nicht zum Auftrag)"))
+    return 0
+
+
+# -------------------------------------------------------------- pruefen --
+def cmd_pruefen(args):
+    _, eintrag, auftrag_pfad, auftrag, verlauf_datei, verlauf = geladen_aus_id(args)
+    verstoesse = []
+    for feld in PFLICHTFELDER_AUFTRAG:
+        if feld not in auftrag:
+            verstoesse.append("Auftragsdatei: Pflichtfeld '%s' fehlt" % feld)
+    for feld in PFLICHTFELDER_VERLAUF:
+        if feld not in verlauf:
+            verstoesse.append("Verlaufsdatei: Pflichtfeld '%s' fehlt" % feld)
+    if verlauf.get("stand") not in STAENDE:
+        verstoesse.append("Verlaufsdatei: ungueltiger Stand '%s'" % verlauf.get("stand"))
+    if auftrag.get("approval") and not freigabe_gueltig(auftrag):
+        erwartet = auftrag_hash(auftrag)
+        tatsaechlich = auftrag["approval"].get("text_sha256") if isinstance(auftrag["approval"], dict) else None
+        if tatsaechlich != erwartet:
+            verstoesse.append(
+                "Auftragsdatei: Hash der Freigabe stimmt nicht mehr (erwartet %s, gefunden %s)"
+                % (erwartet, tatsaechlich))
+
+    hauptagent = auftrag.get("hauptagent")
+    if isinstance(hauptagent, dict):
+        if "fallback" not in hauptagent:
+            verstoesse.append("Auftragsdatei: hauptagent.fallback fehlt")
+        else:
+            fallback = hauptagent["fallback"]
+            if fallback is not None:
+                if not isinstance(fallback, dict) or "model" not in fallback or "effort" not in fallback:
+                    verstoesse.append("Auftragsdatei: hauptagent.fallback ist kein gueltiges {model, effort}")
+                else:
+                    if ist_fable(fallback["model"]):
+                        verstoesse.append(
+                            "Auftragsdatei: hauptagent.fallback ist ein Fable-Modell ('%s') — "
+                            "Fable ist nie ein Fallback" % fallback["model"])
+                    if auftrag.get("grenzen", {}).get("daten-lokal") \
+                            and modell_klasse(fallback["model"], args.base) != "lokal":
+                        verstoesse.append(
+                            "Auftragsdatei: 'Daten bleiben auf der Maschine' verlangt ein lokales "
+                            "Fallback oder 'keins' ('%s' ist nicht als lokal bekannt)" % fallback["model"])
+
+    if args.json:
+        print(json.dumps({"id": args.id, "verstoesse": verstoesse}, ensure_ascii=False))
+    else:
+        if verstoesse:
+            for v in verstoesse:
+                sys.stderr.write(v + "\n")
+        else:
+            print("wb-aufgabe pruefen %s: keine Verstoesse" % args.id)
+    return 2 if verstoesse else 0
+
+
+# ------------------------------------------------------------------ CLI --
+def main():
+    gemeinsam = argparse.ArgumentParser(add_help=False)
+    gemeinsam.add_argument("--base", default=os.path.expanduser("~"))
+    gemeinsam.add_argument("--vorrat", default=None)
+    gemeinsam.add_argument("--json", action="store_true")
+
+    ap = argparse.ArgumentParser(prog="wb-aufgabe")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("anlegen", parents=[gemeinsam])
+    p.add_argument("projekt")
+    p.add_argument("--ziel", required=True)
+    p.add_argument("--fertig", required=True)
+    p.add_argument("--maschine")
+    p.add_argument("--hauptagent")
+    p.add_argument("--fallback")
+    p.add_argument("--rang", type=int, default=None)
+    # Kein choices= (Reviewer-Hinweis 9): argparse lehnt einen ungueltigen Wert
+    # sonst selbst ab, mit einer englischen Meldung, bevor unser eigener,
+    # deutscher fehler()-Weg unten je zum Zug kommt.
+    p.add_argument("--nachtmodus")
+    p.add_argument("--daten-lokal", action="store_true")
+    p.add_argument("--frist")
+    p.add_argument("--runden", type=int, default=None)
+    p.add_argument("--freigabe", action="append")
+    p.set_defaults(func=cmd_anlegen)
+
+    p = sub.add_parser("freigeben", parents=[gemeinsam])
+    p.add_argument("id")
+    p.add_argument("--mensch-beleg", dest="mensch_beleg")
+    p.add_argument("--neu-freigeben", action="store_true")
+    p.set_defaults(func=cmd_freigeben)
+
+    p = sub.add_parser("stand", parents=[gemeinsam])
+    p.add_argument("id")
+    p.add_argument("stand")
+    p.add_argument("--grund")
+    p.add_argument("--von")
+    p.add_argument("--weckzeit")
+    p.add_argument("--mensch-beleg", dest="mensch_beleg")
+    p.set_defaults(func=cmd_stand)
+
+    p = sub.add_parser("verlauf", parents=[gemeinsam])
+    p.add_argument("id")
+    p.add_argument("art")
+    p.add_argument("text")
+    p.add_argument("--von")
+    p.add_argument("--kennung")
+    p.add_argument("--grund")
+    p.add_argument("--bis")
+    p.set_defaults(func=cmd_verlauf)
+
+    p = sub.add_parser("worker", parents=[gemeinsam])
+    p.add_argument("id")
+    wsub = p.add_subparsers(dest="aktion", required=True)
+    ws = wsub.add_parser("setzen", parents=[gemeinsam])
+    ws.add_argument("name")
+    ws.add_argument("--rolle", required=True)
+    ws.add_argument("--zustand", required=True)
+    ws.add_argument("--pane")
+    ws.add_argument("--ergebnis")
+    we = wsub.add_parser("entfernen", parents=[gemeinsam])
+    we.add_argument("name")
+    p.set_defaults(func=cmd_worker)
+
+    p = sub.add_parser("frage", parents=[gemeinsam])
+    p.add_argument("id")
+    p.add_argument("--text", required=True)
+    p.add_argument("--option", action="append", required=True)
+    p.add_argument("--empfehlung")
+    p.set_defaults(func=cmd_frage)
+
+    p = sub.add_parser("antwort", parents=[gemeinsam])
+    p.add_argument("id")
+    p.add_argument("text")
+    p.add_argument("--mensch-beleg", dest="mensch_beleg")
+    p.set_defaults(func=cmd_antwort)
+
+    p = sub.add_parser("wiederaufnahme", parents=[gemeinsam])
+    p.add_argument("id")
+    p.add_argument("text")
+    p.set_defaults(func=cmd_wiederaufnahme)
+
+    p = sub.add_parser("weckzeit", parents=[gemeinsam])
+    p.add_argument("id")
+    p.add_argument("wert")
+    p.set_defaults(func=cmd_weckzeit)
+
+    p = sub.add_parser("rang", parents=[gemeinsam])
+    p.add_argument("id")
+    p.add_argument("n", type=int)
+    p.set_defaults(func=cmd_rang)
+
+    p = sub.add_parser("pfade", parents=[gemeinsam])
+    p.add_argument("id")
+    psub = p.add_subparsers(dest="aktion", required=True)
+    ps = psub.add_parser("setzen", parents=[gemeinsam])
+    ps.add_argument("pfad", nargs="+")
+    pe = psub.add_parser("entfernen", parents=[gemeinsam])
+    pe.add_argument("pfad", nargs="+")
+    p.set_defaults(func=cmd_pfade)
+
+    p = sub.add_parser("sitzung", parents=[gemeinsam])
+    p.add_argument("id")
+    psub = p.add_subparsers(dest="aktion", required=True)
+    ws = psub.add_parser("setzen", parents=[gemeinsam])
+    ws.add_argument("--tmux-session")
+    ws.add_argument("--pane")
+    ws.add_argument("--claude-session-id")
+    ws.add_argument("--pid", type=int)
+    ws.add_argument("--gestartet")
+    psub.add_parser("gesehen", parents=[gemeinsam])
+    psub.add_parser("leeren", parents=[gemeinsam])
+    p.set_defaults(func=cmd_sitzung)
+
+    p = sub.add_parser("naechste", parents=[gemeinsam])
+    p.add_argument("--maschine")
+    p.add_argument("--ausser", action="append")
+    p.set_defaults(func=cmd_naechste)
+
+    p = sub.add_parser("aufnehmen", parents=[gemeinsam])
+    p.add_argument("projekt")
+    p.add_argument("id")
+    p.add_argument("--rang", type=int, default=None)
+    p.add_argument("--maschine")
+    p.set_defaults(func=cmd_aufnehmen)
+
+    p = sub.add_parser("verschieben", parents=[gemeinsam])
+    p.add_argument("id")
+    p.add_argument("--nach", required=True)
+    p.set_defaults(func=cmd_verschieben)
+
+    p = sub.add_parser("liste", parents=[gemeinsam])
+    p.add_argument("--stand")
+    p.set_defaults(func=cmd_liste)
+
+    p = sub.add_parser("zeigen", parents=[gemeinsam])
+    p.add_argument("id")
+    p.set_defaults(func=cmd_zeigen)
+
+    p = sub.add_parser("pruefen", parents=[gemeinsam])
+    p.add_argument("id")
+    p.set_defaults(func=cmd_pruefen)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

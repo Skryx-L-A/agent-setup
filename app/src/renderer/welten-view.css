@@ -1,0 +1,199 @@
+/* DIE WELTEN-ANSICHT (welten-view.ts, Auftrag agentsui Nr. 4). Dieselbe Bildsprache
+   wie das fruehere Aufgaben-Blatt: Tokens aus tokens.css, Pillenknoepfe, Segmente, Punkte.
+   Die Flaeche liegt fest ueber dem Fensterinhalt unter der Titelleiste (`top` setzt
+   die Ansicht aus der Lage von #app), damit keine Spalte des Fensters ihre Breite
+   aendert. */
+#weltenblatt {
+  position: fixed; left: 0; right: 0; bottom: 0; top: 0; z-index: 30;
+  display: none; flex-direction: column; min-height: 0;
+  background: var(--grund); color: var(--schrift); font-size: 12.5px;
+}
+#weltenblatt.an { display: flex; }
+/* Ohne Kennungsgewicht: mit `#weltenblatt button` schlug die Grundform die Klassen
+   `.segment button.gewaehlt` und `.wv-zeile.gewaehlt`, und keine Wahl war zu sehen
+   (Belegbild Electron vom 14.09.2026). */
+:where(#weltenblatt) button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+:where(#weltenblatt) button:disabled { cursor: default; opacity: 0.5; }
+#weltenblatt .knopf-voll { background: var(--akzent); color: var(--akzent-tinte); }
+#weltenblatt .knopf-rand { background: var(--erhoben); }
+#weltenblatt .gefahr { color: var(--zustand-tot); }
+#weltenblatt .knopf-voll.gefahr { background: var(--zustand-tot); color: var(--zustand-tot-tinte); }
+
+.wv-kopfleiste {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 7px 14px; border-bottom: 1px solid var(--linie);
+}
+.wv-kopf-titel { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.wv-kopf-titel > :first-child { flex: 0 0 auto; }
+.wv-kopf-titel .wv-leise { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wv-kopf-rechts { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+/* `.knopf-schlicht` ist sonst ein 28 px breiter Symbolknopf; hier traegt er ein Wort. */
+.wv-kopf-rechts .knopf-schlicht { width: auto; padding: 0 9px; }
+.wv-zaehler { color: var(--gedaempft); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.wv-pause.aus { opacity: 0.45; }
+
+.wv-raster { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: 270px minmax(0, 1fr) 320px; }
+.wv-raster.ohne-inspektor { grid-template-columns: 270px minmax(0, 1fr); }
+
+/* --- Leiste --------------------------------------------------------------------- */
+.wv-leiste { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--linie); background: var(--leiste); }
+.wv-leiste-kopf { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px 8px; }
+.wv-zeilen { flex: 1 1 auto; overflow-y: auto; padding: 0 6px 12px; display: flex; flex-direction: column; gap: 1px; }
+.wv-zeile {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  padding: 5px 8px; border-radius: var(--r-klein, 6px); min-height: 38px;
+}
+.wv-zeile:hover { background: var(--erhoben); }
+.wv-zeile.gewaehlt { background: var(--akzent-matt); }
+.wv-zeile.ebene-2 { padding-left: 26px; }
+.wv-zeile-text { min-width: 0; flex: 1 1 auto; }
+.wv-name { font-weight: 600; display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.wv-unter { color: var(--gedaempft); display: flex; align-items: center; gap: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wv-unter span:last-child { overflow: hidden; text-overflow: ellipsis; }
+.wv-stufe { font-size: 10.5px; font-weight: 500; color: var(--gedaempft); padding: 0 5px; border-radius: 8px; background: var(--erhoben); }
+.wv-zahl { flex: 0 0 auto; min-width: 18px; text-align: center; font-size: 11px; font-variant-numeric: tabular-nums; padding: 1px 5px; border-radius: 9px; background: var(--erhoben); }
+.wv-kopf { margin: 10px 8px 3px; font-size: 11px; font-weight: 600; color: var(--gedaempft); }
+.wv-team { display: flex; align-items: center; gap: 5px; padding: 4px 8px; margin-top: 4px; font-weight: 600; text-align: left; }
+.wv-klappe { width: 12px; color: var(--gedaempft); }
+.wv-kanal-symbol { width: 28px; text-align: center; font-size: 17px; color: var(--gedaempft); }
+.wv-kanal-symbol.gross { width: 40px; font-size: 24px; }
+.wv-vorlagen { display: flex; flex-wrap: wrap; gap: 2px 8px; align-items: baseline; }
+/* Auftrag agentsux Nr. 1: „Agent anlegen" beschriftet, der Weg zu einer neuen Welt, der Hinweis ohne Hauptagent. */
+.wv-anlegen { align-self: flex-start; }
+.wv-anlegen-grund { font-size: 11.5px; }
+.wv-weltneu { display: flex; flex-direction: column; gap: 6px; text-align: left; }
+.wv-weltneu > .knopf-rand { align-self: flex-start; }
+.wv-leiste-kopf .wv-weltneu { padding: 8px 10px; border-radius: 10px; background: var(--erhoben); }
+.wv-hinweis { margin: 2px 8px 6px; }
+.wv-einladung { gap: 12px; }
+.wv-einladung .wv-karte { width: min(560px, 100%); padding: 14px 16px; gap: 8px; }
+.wv-einladung-text { max-width: 560px; line-height: 1.45; }
+.wv-einladung-band { display: flex; gap: 12px; padding: 14px 16px; margin: 12px 14px 0; border-radius: 10px; background: var(--akzent-matt); }
+.wv-einladung-band-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+
+/* --- Mitte ------------------------------------------------------------------------ */
+.wv-mitte { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.wv-mkopf { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--linie); }
+.wv-mkopf-text { min-width: 0; flex: 1 1 auto; }
+.wv-mkopf-rechts { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.wv-mtitel { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.wv-titel { font-size: 15px; font-weight: 600; }
+.wv-leise { color: var(--gedaempft); }
+.wv-leise.klein, .klein { font-size: 11px; }
+.wv-mono { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 11.5px; }
+.wv-ziffern { font-variant-numeric: tabular-nums; }
+.wv-meldung { display: flex; align-items: center; gap: 10px; padding: 6px 14px; border-bottom: 1px solid var(--linie); }
+.wv-meldung.abgelehnt { background: var(--vorsichtgrund); }
+.wv-meldung-text { flex: 1 1 auto; }
+.wv-frageband { display: flex; align-items: center; gap: 8px; padding: 6px 14px; border-bottom: 1px solid var(--linie); background: var(--vorsichtgrund); }
+.wv-frageband-text { flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wv-verweis { color: var(--akzent-text) !important; padding: 2px 4px; }
+.wv-warnung { color: var(--zustand-wartet); font-size: 11.5px; white-space: pre-wrap; }
+
+.wv-chat { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+.wv-verlauf { flex: 1 1 auto; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+.wv-nachricht, .wv-frage { max-width: 78%; padding: 8px 11px; border-radius: 12px; background: var(--erhoben); display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+.wv-nachricht.vom-menschen { align-self: flex-end; background: var(--akzent-matt); }
+.wv-nachricht.markiert { box-shadow: inset 0 0 0 1.5px var(--zustand-wartet); }
+.wv-frage.offen { box-shadow: inset 0 0 0 1.5px var(--zustand-wartet); max-width: 92%; }
+.wv-nkopf { font-size: 11.5px; }
+.wv-ntext { white-space: pre-wrap; line-height: 1.4; }
+.wv-marke { font-size: 11px; font-weight: 600; color: var(--zustand-wartet); }
+.wv-optionen { display: flex; flex-wrap: wrap; gap: 6px; }
+.wv-eingabe { display: flex; align-items: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--linie); }
+.wv-an { display: flex; flex-direction: column; gap: 2px; width: 170px; }
+.wv-eingabe textarea { flex: 1 1 auto; }
+.wv-feld, .wv-textfeld, .wv-auswahl {
+  font: inherit; color: var(--schrift); background: var(--fenster); border: 1px solid var(--linie);
+  border-radius: 6px; padding: 5px 7px; box-sizing: border-box; min-width: 0;
+}
+.wv-textfeld { width: 100%; min-height: 54px; resize: vertical; line-height: 1.4; }
+.wv-feld:focus, .wv-textfeld:focus, .wv-auswahl:focus { outline: 2px solid var(--akzent); outline-offset: -1px; }
+.wv-zeile-knoepfe { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wv-zeile-knoepfe.rechts { justify-content: flex-end; }
+.wv-zeile-knoepfe .wv-feld { flex: 1 1 160px; }
+.wv-rechtsbuendig { margin-left: auto; }
+.wv-leer { padding: 32px; text-align: center; display: flex; flex-direction: column; gap: 6px; align-items: center; }
+.wv-leer.wv-ganz { flex: 1 1 auto; justify-content: center; }
+.wv-leer-titel { font-size: 18px; font-weight: 600; color: var(--gedaempft); }
+
+.wv-tickets, .wv-formular { flex: 1 1 auto; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+.wv-ticket { display: flex; flex-direction: column; gap: 3px; text-align: left; padding: 8px 10px; border-radius: 10px; background: var(--erhoben); }
+.wv-ticket-oben { display: flex; align-items: center; gap: 6px; }
+.wv-detail { display: flex; flex-direction: column; gap: 10px; max-width: 860px; }
+.wv-karte { display: flex; flex-direction: column; gap: 7px; padding: 10px 12px; border-radius: 10px; background: var(--erhoben); }
+.wv-karte-titel { font-weight: 600; color: var(--gedaempft); font-size: 11.5px; }
+.wv-wert { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 8px; }
+.wv-inspektor .wv-wert { grid-template-columns: 1fr; gap: 1px; }
+.wv-wert-name { color: var(--gedaempft); font-size: 11.5px; }
+.wv-wert-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.wv-diff, .wv-md {
+  margin: 0; padding: 8px; border-radius: 6px; background: var(--fenster); max-height: 320px; overflow: auto;
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 11px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.wv-diff .plus { color: var(--zustand-laeuft); }
+.wv-diff .minus { color: var(--zustand-tot); }
+.wv-liste { display: flex; flex-direction: column; gap: 3px; }
+
+/* --- Anlege-Menue ------------------------------------------------------------------- */
+.wv-abschnitt h3 { margin: 6px 2px 5px; font-size: 12px; font-weight: 600; }
+.wv-formzeile { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 10px; align-items: center; }
+.wv-formname { color: var(--gedaempft); }
+.wv-formwert { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.wv-formwert .wv-feld, .wv-formwert .wv-textfeld, .wv-formwert .wv-auswahl { flex: 1 1 auto; }
+.wv-werkzeuge { display: flex; flex-wrap: wrap; gap: 6px; }
+.wv-wahl { padding: 3px 10px; border-radius: 12px; background: var(--fenster) !important; box-shadow: inset 0 0 0 1px var(--linie); }
+.wv-wahl.an { background: var(--akzent-matt) !important; box-shadow: inset 0 0 0 1.5px var(--akzent); }
+.wv-fuss { display: flex; align-items: center; gap: 8px; padding: 9px 14px; border-top: 1px solid var(--linie); }
+.wv-luecke { flex: 1 1 auto; }
+
+/* --- Inspektor ----------------------------------------------------------------------- */
+.wv-inspektor, .wv-vorschau { display: flex; flex-direction: column; min-height: 0; min-width: 0; border-left: 1px solid var(--linie); background: var(--leiste); }
+.wv-vorschau { border-left: 0; flex: 1 1 auto; }
+.wv-ikopf { padding: 9px 12px; border-bottom: 1px solid var(--linie); font-weight: 600; }
+.wv-iinhalt { flex: 1 1 auto; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+.wv-profilkopf { display: flex; align-items: center; gap: 12px; }
+.wv-skill { display: flex; flex-direction: column; gap: 3px; padding: 4px 0; border-bottom: 1px solid var(--linie); }
+.wv-skill:last-of-type { border-bottom: 0; }
+.wv-klappe-knopf { width: 16px; color: var(--gedaempft) !important; }
+.wv-messung { display: flex; flex-direction: column; gap: 1px; }
+
+.wv-dialog-schicht { position: absolute; inset: 0; display: grid; place-items: center; background: color-mix(in srgb, var(--grund) 55%, transparent); z-index: 5; }
+.wv-dialog { width: min(440px, 90%); display: flex; flex-direction: column; gap: 10px; padding: 16px; border-radius: 12px; background: var(--fenster); box-shadow: 0 10px 40px rgb(0 0 0 / 0.35); }
+
+/* --- Fusszeile (bis 14.09.2026 im Aufgaben-Blatt, agents-view.css) --------------- */
+.wv-traegerfuss {
+  flex: 0 0 auto;
+  padding: 6px 12px; border-top: 1px solid var(--linie);
+  color: var(--gedaempft); font-size: 11.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+.wv-traegerfuss-teil.warnung { color: var(--zustand-wartet); font-weight: 600; }
+
+/* --- Vorschau der Agentenfiguren (figurenblatt.ts, Knopf „Figuren" im Kopf) ------- */
+.wv-figuren-knopf[aria-pressed='true'] { background: var(--akzent-matt); color: var(--akzent-text); }
+.wv-figuren { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 14px 18px 24px; display: flex; flex-direction: column; gap: 18px; }
+.fg-kopf { display: flex; flex-direction: column; gap: 4px; }
+.fg-haupttitel { margin: 0; font-size: 17px; font-weight: 600; }
+.fg-einleitung, .fg-hinweis { margin: 0; color: var(--gedaempft); max-width: 72ch; line-height: 1.45; }
+.fg-abschnitt { background: var(--leiste); border-radius: var(--r-karte); padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
+.fg-titel { margin: 0; font-size: 11.5px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--gedaempft); }
+.fg-untertitel { font-weight: 600; margin-bottom: 6px; }
+.fg-zwei { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }
+.fg-reihe { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px; }
+.fg-kachel { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 64px; }
+.fg-cap { font-size: 12px; color: var(--schrift); text-align: center; }
+.fg-unter { font-size: 10.5px; color: var(--gedaempft); font-family: ui-monospace, 'SF Mono', Menlo, monospace; text-align: center; }
+.fg-team { display: flex; flex-direction: column; gap: 6px; }
+.fg-team + .fg-team { padding-top: 10px; border-top: 1px solid var(--linie); }
+.fg-team-kopf { display: flex; align-items: baseline; gap: 8px; }
+.fg-team-name { font-weight: 600; }
+.fg-team-art { color: var(--gedaempft); }
+.fg-artreihe { display: grid; grid-template-columns: 72px 1fr; align-items: center; gap: 10px; padding: 4px 6px; border-radius: var(--r-mittel); }
+.fg-artreihe.gewaehlt { background: var(--erhoben); }
+.fg-artname { color: var(--gedaempft); }
+.fg-artreihe.gewaehlt .fg-artname { color: var(--schrift); font-weight: 500; }
+.fg-groessen { align-items: flex-end; gap: 24px; }
+.fg-groesse { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.fg-groesse .fg-reihe { gap: 8px; }

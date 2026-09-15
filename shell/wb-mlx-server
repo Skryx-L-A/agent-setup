@@ -1,10 +1,12 @@
 #!/bin/bash
 # wb-mlx-server — bedarfsweiser MLX-Server fuer MEHRERE Modelle auf Port 8081.
-# Vier Motoren stehen dahinter, und welcher laeuft, entscheidet dieses Werkzeug
-# aus Registry-Angaben und der verlangten Stromzahl: mlx_lm.server (der
-# allgemeine Weg), mlx-dspark (externer Entwerfer), mtplx (eingebauter
-# MTP-Kopf, der Standard fuer den einzelnen Strom) und seit dem 21.08.2026
-# vllm-metal (Buendelung fuer mehrere gleichzeitige Worker, siehe NACHTRAG 10).
+# Fuenf Motoren stehen dahinter, und welcher laeuft, entscheidet dieses
+# Werkzeug aus Registry-Angaben und der verlangten Stromzahl: mlx_lm.server
+# (der allgemeine Weg), mlx-dspark (externer Entwerfer), mtplx (eingebauter
+# MTP-Kopf, der Standard fuer den einzelnen Strom), seit dem 21.08.2026
+# vllm-metal (Buendelung fuer mehrere gleichzeitige Worker, siehe NACHTRAG 10)
+# und seit dem 27.08.2026 mlx_vlm.server (externer Entwerfer MIT
+# unterschiedener Bauart -- dflash/eagle3/mtp, siehe NACHTRAG 22).
 # Nachfolger von grug-server: dieselben Sicherungen, verallgemeinert
 # auf "welches Modell auch immer gerade gewaehlt ist" statt fest auf grug-27b.
 # grug-server bleibt als duenner Vorspann bestehen (siehe Fussnote unten) und
@@ -59,12 +61,28 @@
 #                         WELCHEN der in der Registry hinterlegten
 #                         Vorhersage-Wege dieser Start nehmen soll
 #                         (`vorhersage.wege`, Nachtrag 19, 2026-08-21 --
-#                         fuer qwen38-27b: mtplx, dflash2, dspark-diminfer).
-#                         Wirkt nur, wenn der Aufrufer die Umgebungsvariablen
-#                         oben NICHT gesetzt hat, denn dann hat er den Weg
-#                         schon gewaehlt. Ohne die Option gilt der Vorgabeweg
-#                         (`vorhersage.wegVorgabe`), ein unbekannter Weg faellt
-#                         laut gemeldet ebenfalls darauf zurueck.
+#                         fuer qwen38-27b: mtplx, dflash2, dspark-diminfer,
+#                         mtp-kopf). Wirkt nur, wenn der Aufrufer die
+#                         Umgebungsvariablen oben NICHT gesetzt hat, denn dann
+#                         hat er den Weg schon gewaehlt. Ohne die Option gilt
+#                         der Vorgabeweg (`vorhersage.wegVorgabe`), ein
+#                         unbekannter Weg faellt laut gemeldet ebenfalls
+#                         darauf zurueck.
+#                         FUENFTER MOTOR mlx_vlm.server (Nachtrag 22,
+#                         2026-08-27): ein Weg mit bauart="entwerfer" UND
+#                         einem gesetzten Registry-Feld `draftKind`
+#                         (`vorhersage.wege[].draftKind`, dflash/eagle3/mtp --
+#                         optional dazu `draftBlockSize`) startet ab jetzt
+#                         ueber mlx_vlm.server statt mlx-dspark, mit
+#                         `--draft-kind`/`--draft-block-size` ausdruecklich
+#                         gesetzt. Ein Weg OHNE draftKind (dspark-diminfer)
+#                         bleibt unveraendert bei mlx-dspark. Zwei weitere,
+#                         gleichrangige Umgebungsvariablen fuer einen
+#                         Aufrufer, der den Weg schon selbst gewaehlt hat:
+#                         WB_MLX_SERVER_VORHERSAGE_DRAFTKIND/
+#                         _DRAFTBLOCKSIZE. Siehe Kopfkommentar "NACHTRAG 22"
+#                         fuer die volle Form, die Messung und die zwei
+#                         offenen Stellen (KV-Quantisierung, Denkstufen-Falle).
 #   wb-mlx-server stop [<modell>]
 #                         beendet den laufenden Server und PRUEFT das Ende
 #                         (Prozess weg, Port frei), statt es anzunehmen. Mit
@@ -681,6 +699,159 @@
 # mlx_lm.server. Dasselbe Registry-Feld `chatTemplateArgs` wird deshalb auch
 # hier durchgereicht. Ohne das stuende Qwen3.8s eigene Vorlage auf xhigh, und
 # eine einzelne Anfrage kann dann ueber 28 Minuten brauchen.
+#
+# NACHTRAG 22 (2026-08-27) -- FUENFTER MOTOR: mlx_vlm.server. ANLASS: von vier
+# Vorhersage-Wegen fuer qwen38-27b konnte diese Werkbank bis heute nur zwei
+# fahren, mtplx (eingebauter Kopf) und mlx-dspark (externer Entwerfer,
+# `--drafter`). Der MTP-Kopf als SEPARATER Entwerfer (nicht der 20-GB-MTPLX-
+# Koerper aus NACHTRAG 8, sondern der reine 247-MB-Kopf,
+# Qwen3.8-27B-MTP-4bit) hatte keinen Ladepfad -- weder mlx_lm.server noch
+# mlx-dspark laden `mlx_lm_extra_tensors`/eine eigene MTP-Kopf-Generierschleife
+# als externen Entwerfer (das Null-Resultat aus NACHTRAG 7 galt unveraendert
+# weiter). DFlash2 lief zwar schon ueber mlx-dspark, aber ueber dessen
+# generischen `--mode dflash`-Aufruf, nicht ueber einen Motor, der die Bauart
+# des Entwerfers als ERSTKLASSIGES Konzept kennt.
+#
+# `mlx_vlm.server` (seit 2026-08-27 installiert, `uv tool install --with
+# jinja2 mlx-vlm`) schliesst beide Luecken auf einmal: `--draft-model
+# <entwerfer> --draft-kind {dflash,eagle3,mtp} [--draft-block-size <n>]`
+# unterscheidet die Bauart AUSDRUECKLICH, statt sie wie mlx-dspark nur an der
+# config.json zu erraten (dspark_ist_dflash_entwerfer). GEMESSEN (gleicher
+# Prompt, gleiche Ausgabelaenge, ruhige Maschine, Tok/s kalt/warm):
+#   MTP-Kopf ueber mlx_vlm   24,19 / 21,70   (247 MB Zusatzgewicht)
+#   MTPLX (eingebauter Kopf) 22,92 / 18,69   (19,83 GB Zusatzgewicht)
+#   DFlash2 ueber mlx_vlm    21,83 / 20,55   (3,58 GB)
+#   DSpark ueber mlx-dspark  18,98 kalt      (3,46 GB)
+# Der kleinste Entwerfer ist hier der schnellste -- und ausgerechnet der war
+# bislang nicht fahrbar. NACHTRAG 2026-08-27, nachdem alle vier Wege ueber
+# echte Worker nachgemessen wurden: `vorhersage.wegVorgabe` steht jetzt auf
+# mtp-kopf. Die Begruendung samt Zahlen steht weiter unten beim Motorwahl-
+# Block; die Kurzfassung ist, dass MTPLX zwar die hoechste Rate hat, fuer
+# dieselbe Aufgabe aber doppelt so viele Token braucht und deshalb in der
+# Wanduhr verliert -- bei 19,83 GB statt 0,25 GB Zusatzgewicht.
+#
+# MOTORWAHL: reine Registry-Aussage, wie bei allen anderen Wegen -- ein Weg
+# unter `vorhersage.wege` mit bauart="entwerfer" UND einem gesetzten Feld
+# `draftKind` waehlt ab jetzt motor=mlx-vlm statt motor=mlx-dspark (siehe
+# vorhersage_weg_waehlen und der Motorwahl-Block in cmd_ensure). Ein Weg OHNE
+# draftKind (dspark-diminfer -- Modelltyp Qwen3DSparkModel, den mlx_vlm nicht
+# kennt) bleibt UNVERAENDERT bei mlx-dspark. draftKind selbst kommt NUR aus
+# der Registry (vorhersage.wege[].draftKind/.draftBlockSize) oder von einem
+# kuenftigen Aufrufer, der es explizit als WB_MLX_SERVER_VORHERSAGE_DRAFTKIND/
+# _DRAFTBLOCKSIZE mitgibt -- nie geraten, dieselbe Regel wie bei bauart/modell/
+# gewichteGb.
+#
+# ZWEI FALLSTRICKE, ECHT ERLEBT BEIM EINRICHTEN (siehe die Codestellen fuer
+# den vollen Text):
+#   1. `mlx_vlm.server` erwartet den VOLLEN PFAD als `model` im
+#      Anfragekoerper -- ein Kurzname loest einen HuggingFace-Ladeversuch aus
+#      und antwortet 400. bedienter_modellname() meldet fuer diesen Motor
+#      deshalb den Pfad, nicht die Registry-Kennung (dieselbe Regel gilt
+#      schon fuer mlx-lm/mlx-dspark/vllm-metal, NUR mtplx ist die
+#      dokumentierte Ausnahme).
+#   2. Ohne `jinja2` im selben Werkzeugbaum scheitert jede Chat-Anfrage mit
+#      "apply_chat_template requires jinja2" (HTTP 500) -- der Server startet
+#      TROTZDEM sauber und meldet "Drafter ready". Ein Rauchtest, der nur
+#      `/health` prueft, uebersieht das; die Probeanfrage in cmd_ensure prueft
+#      seit jeher eine ECHTE Antwort (choices im JSON), nicht nur den
+#      Statuscode -- genau deshalb faengt sie diesen Fehler ab, ohne dass
+#      dieser Nachtrag daran etwas aendern musste.
+#
+# ZWEI OFFENE STELLEN, NICHT GERATEN (siehe die Codestellen fuer den vollen
+# Text): erstens, --kv-bits (KV-Cache-Quantisierung, Hausregel "immer 8 Bit")
+# ist fuer DIESEN Koerper an DIESEM Motor nicht gemessen -- der Schalter
+# existiert (`mlx_vlm.server --help`), bleibt aber weg, kv_quant_buchung
+# bucht "off" wie bei mlx-dsparks Hybridfall. Zweitens, es gibt KEIN
+# Gegenstueck zu --chat-template-args/--reasoning-effort (Denkstufen-Falle) --
+# --enable-thinking/--thinking-budget sind ein anderer Mechanismus (Ein/Aus
+# plus Token-Deckel, keine Stufe "low"). Beide Luecken sind gemeldet, nicht
+# verschwiegen -- siehe err()-Zeilen im Motorwahl-Block und im Start-Zweig.
+#
+# NACHTRAG (2026-09-08, Messlauf "motor-ab", Ergebnis
+# ~/.pi-workers/results/motor-ab/20260908-220231.md) -- HOT-SWAP-FALLE: jeder
+# `model`-Name im Anfragekoerper, der NICHT auf das gerade geladene Modell
+# passt, loest bei mlx_vlm.server einen LADEVERSUCH aus und ENTLAEDT dabei
+# das laufende Modell -- auch wenn der Ladeversuch danach scheitert. Konkret
+# beobachtet: eine Anfrage mit "model": "default" (ein Skript, das dieses
+# Feld aus Gewohnheit mitschickte, weil mlx_lm.server es ignoriert) fuehrte
+# zu einem HuggingFace-Ladeversuch fuer ein Modell "default", 404, UND
+# DANACH war /health's loaded_model null -- das vorher laufende, echte
+# Modell war weg, ohne dass die fehlgeschlagene Anfrage selbst irgendeinen
+# Erfolg gemeldet haette. Das ist eine ANDERE Falle als der Kurzname-Fall
+# oben (Fallstrick 1: Kurzname statt Pfad => 400, Modell bleibt geladen) --
+# hier fuehrt JEDER unpassende Name, ob Kurzname oder nicht, sofort zu einem
+# Entladen, nicht nur zu einer Fehlermeldung. Betroffen ist jeder Aufrufer,
+# der (wie mlx_lm.server-Clients gewohnt) das Feld `model` unreflektiert
+# mitschickt, ohne den exakten, von bedienter_modellname() gemeldeten Pfad
+# zu treffen.
+# Geprueft (2026-09-08, `mlx_vlm.server --help`, Fassung 0.7.0, nur --help,
+# kein echter Start): es gibt KEINEN Schalter, der das Modell gegen
+# Hot-Swap-Anfragen festnagelt. `--model-discovery {served,hf-cache}`
+# betrifft nur, was `/v1/models` LISTET, nicht was der Server bei einer
+# Chat-Anfrage LAEDT. `--api-key` verlangt zwar ein Bearer-Token fuer jede
+# Anfrage, verhindert aber nicht, dass ein Aufrufer MIT gueltigem Token
+# einen falschen `model`-Namen schickt. OFFEN: kein Code-Gegenmittel in
+# dieser Werkzeugfassung; wer wb-mlx-server als einzigen Torwart zum echten
+# Server betrachtet, muss selbst sicherstellen, dass jede Anfrage den von
+# bedienter_modellname() gemeldeten exakten Pfad verwendet.
+#
+# NACHTRAG (2026-09-08, Auftrag "buchung", Gegenleser: fuenf Fehler, elf
+# Risiken im ENDSTAND von c9c5c3d) -- DER ENTWURFSFEHLER HINTER DEN FUENF
+# EINZELFEHLERN: die Gewichte-Buchung eines Serverstarts hing bisher am PANE,
+# der `ensure` aufgerufen hat -- der SERVER selbst kann aber viel laenger
+# leben als dieser (oft kurzlebige) Pane. Stirbt der Pane (Worker fertig),
+# verfiel die Buchung, waehrend der Server unveraendert weiterlief -- gemessen:
+# Summe 0 bei N laufenden Stroemen. Aus diesem einen Entwurfsfehler folgten
+# vier weitere, alle im Kapazitaets-Neustart-Pfad (dem alten "Server bucht
+# Gewichte + ALLE Stroeme"-Ratchet, siehe die UEBERHOLT-Notiz bei
+# gebuchte_kennungen() weiter unten): eine Geschwister-Freigabe, die VOR der
+# Bestaetigung des neuen Starts lief; ein Rueckfall auf 'wb-belegung gib
+# --eigene', der in einer Sonderlage die brandneue Buchung mit sich riss; und
+# eine Fehlermeldung, die "Buchung steht" sagte, waehrend die naechste Zeile
+# sie freigab UND die Kennungsdatei des noch laufenden alten Servers loeschte.
+#
+# DIE LOESUNG AENDERT ZWEI DINGE GRUNDSAETZLICH, BEIDE IN wb-belegung DOKUMENTIERT
+# (siehe dessen Kopfkommentar "EIN PROZESS KANN AUCH DER HALTER SEIN" und "JEDER
+# STROM WIRD VOM WORKER GEBUCHT"):
+#   1. Der Serverstart bucht NUR NOCH seine eigenen Gewichte (+ Entwerfer +
+#      Prompt-/APC-Cache), gehalten vom PROZESS selbst (`wb-belegung geladen
+#      ... --pid <n> --prozess-haelt`), nicht mehr vom startenden Pane -- die
+#      Buchung lebt jetzt so lange wie der Prozess, nicht so lange wie der Pane,
+#      der ihn ausgeloest hat.
+#   2. JEDER Strom wird vom Worker gebucht, der ihn faehrt, auch der erste
+#      (siehe shell/pi-worker, "Eigene Sequenz buchen") -- der Serverstart
+#      bucht `--nur-gewichte` (siehe belegung_nehmen()), NIE eine Strom-Zahl
+#      fuer den Aufrufer stellvertretend. Damit entfaellt der alte
+#      `gestartet=frisch`-Sonderfall in pi-worker vollstaendig, und mit ihm die
+#      Geschwister-Freigabe und der Ratchet: ein Kapazitaets-Neustart ruehrt
+#      Strom-Buchungen anderer Worker nicht mehr an, es gibt keine mehr, die
+#      dem Serverstart je gehoert haetten.
+# Kapazitaets-Neustart bleibt als Mechanismus bestehen (ein Server mit zu
+# kleiner --decode-concurrency wird durch einen groesseren ersetzt), aber ohne
+# den alten Ratchet: die alte Buchung wird ueber ihre GEZIELT eingefangene
+# eigene Kennung freigegeben (belegung_freigeben_gezielt, KAPAZITAETS_ALTE_
+# KENNUNG), nie ueber einen Pane-weiten Fallback.
+#
+# NACHTRAG (2026-09-08, ZWEITE RUNDE, Gegenleser-Befunde zu 78c865d) -- PUNKT
+# 2 OBEN IST UEBERHOLT: "der Serverstart bucht `--nur-gewichte`, NIE eine
+# Strom-Zahl fuer den Aufrufer stellvertretend" liess GENAU EINEN
+# Verbraucherkreis aus -- jeden Aufrufer, der KEIN pi-Worker ist und deshalb
+# nie selbst bucht (der grug-server-Weg, wb-modell-proxy, der
+# brain-contradict-Richter, ein blanker curl-Aufruf, Risiko 10). Der
+# Serverstart bucht seither einen FESTEN Basisstrom (--parallel 1, siehe
+# belegung_nehmen(), "BASISSTROM STATT --nur-gewichte") statt gar keinen --
+# `--nur-gewichte` bleibt als Faehigkeit in wb-belegung bestehen (getestet),
+# wird von hier aus aber nicht mehr aufgerufen. Ausserdem in dieser Runde
+# behoben: Fehler 1 (ein Prozess-Halter gehoerte bislang JEDEM Aufrufer ohne
+# --fremd, siehe wb-belegungs eigen-Regel in cmd_gib), Befund 2/3 (der
+# --eigene/Datei-Rueckfall in belegung_freigeben() bzw.
+# _stop_pruefen_und_beenden() konnte trotz gezielter Kennung noch fremde
+# Buchungen treffen -- jetzt auf die eigene Port-Marke eingeschraenkt bzw. eine
+# LEERE, aber ausdruecklich uebergebene Kennung heisst "nichts freizugeben",
+# nie "zurueckfallen"), und Risiko 11 (der Halter-Wechsel Pane -> Prozess lief
+# bisher erst NACH Health/Probeanfrage -- ein mehrminuetiges Ladefenster blieb
+# damit weiterhin pane-gehalten; jetzt sofort nach dem Start ueber
+# `wb-belegung uebernehmen --pid`, siehe dort).
 
 set -uo pipefail
 
@@ -692,6 +863,17 @@ MODELSFILE="${WB_MODELS_FILE:-$HOME/.claude/workbench/models.json}"
 STATEDIR="$HOME/.local/state/wb-mlx-server"
 KENNUNG_DATEI="$STATEDIR/belegung-kennung"
 AKTUELL_DATEI="$STATEDIR/aktuell.json"
+# HF_HUB_CACHE (Nachtrag 2026-09-08, Ergaenzung zur vierten Runde): ein
+# leeres, eigenes Verzeichnis fuer den HF-Cache jedes der fuenf Motoren.
+# HF_HUB_OFFLINE=1 allein sperrt nur NEUE Netzwerkzugriffe -- ein Fremdmodell,
+# das zufaellig schon im ECHTEN HF-Cache dieser Maschine liegt (von einem
+# frueheren, unabhaengigen Vorgang), waere trotzdem ladbar. Die lokalen
+# Modellordner dieser Werkbank (z.B. qwen38-27b-mlx-4bit, der MTP-Kopf)
+# tragen Tokenizer, Chat-Template und Prozessor-Konfiguration vollstaendig im
+# eigenen Ordner und keine Hub-Verweise in ihren JSON-Dateien (vorgeprueft,
+# 2026-09-08) -- ein Laden ueber den vollen Pfad braucht den HF-Cache gar
+# nicht, deshalb ist ein leeres Ersatzverzeichnis fuer diesen Weg folgenlos.
+HF_HUB_CACHE_LEER="${XDG_CACHE_HOME:-$HOME/.cache}/wb-mlx-server/hf-leer"
 
 # Nebenlaeufigkeit — seit NACHTRAG 6 (siehe Kopfkommentar) die ENTSCHEIDUNG
 # des Aufrufers, nicht mehr eine feste Serverkonstante. Vorgabe 1 -- ein
@@ -711,6 +893,14 @@ PROMPT_PARALLEL_VORGABE=${WB_MLX_SERVER_PROMPT_PARALLEL:-$DECODE_PARALLEL_VORGAB
 VORHERSAGE_BAUART_VORGABE="${WB_MLX_SERVER_VORHERSAGE_BAUART:-}"
 VORHERSAGE_MODELL_VORGABE="${WB_MLX_SERVER_VORHERSAGE_MODELL:-}"
 VORHERSAGE_GEWICHTE_GB_VORGABE="${WB_MLX_SERVER_VORHERSAGE_GEWICHTE_GB:-}"
+# draftKind/draftBlockSize (Nachtrag 22, 2026-08-27, fuenfter Motor mlx-vlm):
+# dieselbe Rolle wie die drei Variablen oben, nur fuer das eine zusaetzliche
+# Feld, das mlx_vlm.server von einem Entwerfer-Weg braucht (--draft-kind,
+# siehe Motorwahl-Block in cmd_ensure) -- gesetzt vom Aufrufer, wenn er den
+# Weg selbst schon aus der Registry gelesen hat; sonst holt cmd_ensure es wie
+# bei den drei Variablen oben ueber vorhersage_weg_waehlen() selbst nach.
+VORHERSAGE_DRAFTKIND_VORGABE="${WB_MLX_SERVER_VORHERSAGE_DRAFTKIND:-}"
+VORHERSAGE_DRAFTBLOCKSIZE_VORGABE="${WB_MLX_SERVER_VORHERSAGE_DRAFTBLOCKSIZE:-}"
 # GESETZT-UND-LEER ist etwas anderes als GAR NICHT GESETZT (Nachtrag 15,
 # 2026-08-21). wb-code und pi-worker setzen die Variable IMMER -- leer, wenn die
 # Sitzungs-Einstellung die Vorhersage ausdruecklich abschaltet. Wer sie gar nicht
@@ -848,6 +1038,48 @@ PROMPT_CACHE_PLAETZE=${WB_MLX_SERVER_PROMPT_CACHE_PLAETZE:-10}
 # ueber --prefix-cache-max-ram-mb, was hier bislang niemand setzt. Fuer beide
 # bleibt der Posten wie bisher 0 -- eine ungemessene Zahl waere dort schlechter
 # als keine.
+#
+# WARUM DER DECKEL DAS DOPPELTE HAELT -- IM QUELLTEXT NACHGESEHEN (Nachtrag
+# 2026-09-08, DRITTE RUNDE, Auftrag (B), ~/.local/share/uv/tools/mlx-lm/lib/
+# python3.12/site-packages/mlx_lm/server.py und models/cache.py, Fassung auf
+# dieser Maschine): `--prompt-cache-bytes` wirkt NICHT als harte
+# Aufnahmegrenze, sondern als Zielwert fuer `LRUPromptCache.trim_to(n_bytes=
+# ...)` (models/cache.py:1739) -- die wirft ganze gecachte Sequenzen aus dem
+# LRU, bis die Summe wieder unter dem Ziel liegt (models/cache.py:1750-1754,
+# `while self._n_bytes > n_bytes: ... pop()`), NIE Teile einer Sequenz.
+#
+# UND SIE LAEUFT NUR AUF EINEM VON ZWEI CODEPFADEN. server.py ruft `trim_to()`
+# GENAU EINMAL auf, direkt im GEBUENDELTEN (BatchGenerator-)Pfad
+# (server.py:795-798). Der ANDERE Pfad, `_serve_single()` (server.py:922-1023,
+# fuer nicht buendelbare Anfragen -- `if not self._is_batchable(args):
+# self._serve_single(...)`, server.py:813-814), fuegt seinen Cache-Eintrag am
+# Ende genauso in `self.prompt_cache` ein (server.py:1019,
+# `self.prompt_cache.insert_cache(...)`), OHNE je `trim_to()` aufzurufen --
+# der Cache waechst auf diesem Pfad UNBEGRENZT, egal welcher Deckel gesetzt
+# ist. Ob eine Anfrage ueber `_serve_single()` oder gebuendelt laeuft,
+# entscheidet `_is_batchable()` (server.py:685-686): kein Entwerfer (fuer
+# wb-mlx-server IMMER wahr, siehe der Nachtrag-7-Kommentar oben -- kein
+# --draft-model an mlx_lm.server) UND JEDE Cache-Klasse des Modells hat eine
+# `merge()`-Methode (server.py:371-373, `make_prompt_cache(model)`,
+# architekturabhaengig, fuer qwen38-27b in dieser Sitzung NICHT nachgesehen --
+# das braeuchte einen echten Lauf, siehe unten).
+#
+# DAS ERKLAERT DIE 6 SEQUENZEN/5,94 GB BEI 4 GIB DECKEL AUS DEM AUFTRAGSTEXT
+# VOLLSTAENDIG, WENN qwen38-27b NICHT BATCHFAEHIG IST: dann liefe JEDE Anfrage
+# (bei --parallel 1, dem heutigen Regelfall) ueber `_serve_single()`, und der
+# Deckel griffe NIE -- kein Rundungsfehler, kein Faktor-2,2-Schaetzfehler wie
+# bei den 1-GiB-Messungen oben, sondern ein Pfad, der die Trimmung schlicht
+# NIE aufruft. NICHT nachgesehen in dieser Sitzung, ob genau das hier
+# zutrifft (braeuchte `is_batchable` fuer qwen38-27b oder eine Log-Zeile
+# "Prompt Cache:" nach einer sequenziellen gegen eine gebuendelte Anfrage,
+# beides ein echter Lauf) -- diese Session fasst laut ausdruecklicher
+# Anweisung keinen echten MLX-Server an (der gehoert jetzt dem
+# Messlauf-Worker "motor-ab"). AUSWIRKUNG, falls zutreffend: ein groesserer
+# Deckel-Wert (Kontext x KV je Token statt fest 1 GiB) wuerde das gemessene
+# Symptom NICHT beheben, nur den Punkt verschieben, an dem es auffaellt --
+# die Vorgabe bleibt deshalb ABSICHTLICH unveraendert bei 1, bis diese Frage
+# an einem echten Lauf geklaert ist (siehe OPEN in der Ergebnisdatei dieses
+# Auftrags).
 PROMPT_CACHE_GIB=${WB_MLX_SERVER_PROMPT_CACHE_GIB:-1}
 
 # QUANTISIERTER KV-CACHE (NACHTRAG 11, 2026-08-21) — die Hausregel stand schon,
@@ -892,12 +1124,43 @@ PROMPT_CACHE_GIB=${WB_MLX_SERVER_PROMPT_CACHE_GIB:-1}
 #                        INNERHALB dieses Budgets. Eine KV-Quantisierung aendert dort
 #                        nicht die gebuchte Zahl, sondern nur, wieviel Kontext in
 #                        dasselbe Budget passt.
+#   mlx_vlm.server  JA, ABER UNGEPRUEFT AN DIESEM KOERPER (Nachtrag 22, 2026-08-27).
+#                        Der Schalter existiert (`--kv-bits KV_BITS`, `mlx_vlm.server
+#                        --help`) -- OB er fuer qwen38-27bs Hybridarchitektur denselben
+#                        Fehler wirft wie bei mlx-dspark (siehe Zeile darueber), ist NICHT
+#                        gemessen: ein echter Start mit --kv-bits war am 27.08.2026 wegen
+#                        akuter Speicherknappheit (98 % GPU-Auslastung durch eine lebende
+#                        Sitzung, siehe Ergebnisprotokoll dieses Auftrags) nicht gefahrlos
+#                        moeglich. Der Schalter bleibt deshalb WEG (kv_quant_buchung
+#                        "off", derselbe Fallback wie bei allen anderen Motoren, die hier
+#                        nicht ausdruecklich JA bekommen) -- eine ungemessene Behauptung
+#                        waere schlimmer als eine bekannte Luecke. Nachmessen, sobald die
+#                        Maschine wieder frei ist, siehe OPEN im Ergebnisprotokoll.
 #
 # Der SATZ, DER DIE REGEL ZWEI TAGE AUSSER KRAFT GESETZT HAT, steht in
 # SESSION-STATE.md: "8-Bit-KV ist auf dem MLX-Weg nicht aktiv und waere ein
 # Nullposten". Gemessen wurde er an mlx_lm.server und mlx-dspark — fuer mtplx galt
 # er nie, und mtplx ist der Betriebsmotor fuer qwen38-27b.
 KV_QUANT=${WB_MLX_SERVER_KV_QUANT:-q8}
+# NUR fuer den Motor mlx-vlm (NACHTRAG 2026-09-10): dort gilt die Hausregel q8
+# NICHT mehr als Vorgabe, sondern nur, wenn WB_MLX_SERVER_KV_QUANT ausdruecklich
+# gesetzt ist. GEMESSEN 2026-09-10 (tokrate, 38k Praefix, 300 Token, MTP-Kopf,
+# je zwei Laeufe, zweiter mit Cache-Treffer = reine Dekodierung):
+#   --kv-bits 8 --kv-group-size 64   14,6 / 14,5 tok/s   Prefill 316 tok/s
+#   ohne --kv-bits                   19,6 / 19,3 tok/s   Prefill 378 tok/s
+#   ohne, --prefill-step-size 8192   20,2 / 19,6 tok/s   Prefill 400 tok/s
+# Bei 9,5k Praefix 23,4 gegen 22,9 -- der Unterschied entsteht mit dem Kontext:
+# das Entquantisieren des Caches kostet je Token, und bei 38k ist das ein
+# Drittel der Rate. Der Cache kostet dafuer 0,0625 statt 0,0332 MiB/Token
+# (bei 131k Fenster 8,0 statt 4,3 GiB); das Register fuehrt fuer
+# qwen38-27b-mlx-4bit ohnehin nur den unquantisierten Wert, die Buchung war
+# also schon vorher auf den grossen Wert gestellt. Mehrere Stroeme liefen bei
+# diesem Motor sowieso nur ohne Quantisierung (NACHTRAG 24). Der Umweg ueber
+# die Messreihe: der erste "kv-off"-Lauf ueber wb-mlx-server ergab 14,1 --
+# weil der Schalter WB_MLX_SERVER_KV_QUANT diesen Zweig nie erreichte, der
+# Server fuhr weiter mit --kv-bits 8 (Startzeile im Protokoll). Erst der
+# manuelle Start zeigte den Unterschied.
+KV_QUANT_MLX_VLM="${WB_MLX_SERVER_KV_QUANT:-off}"
 
 # DIE PREFILL-SPITZE IST DER GROESSTE POSTEN BEI LANGEM KONTEXT (Nachtrag 17,
 # 2026-08-21, gemessen). Ein mtplx-Server mit 19,83 GiB Gewichten erreichte je
@@ -929,11 +1192,34 @@ PREFILL_CHUNK_TOKENS=${WB_MLX_SERVER_PREFILL_CHUNK:-2048}
 # GRUG_SERVER_FRIST_MIN / lauf-fenster.sh).
 BELEGUNG_FRIST_MIN_VORGABE=${WB_MLX_SERVER_FRIST_MIN:-180}
 
-# Mindestfreier Speicher vor dem Start, in MiB (20 GB) — unveraendert scharf,
-# siehe Kopfkommentar und
+# WAR: Mindestfreier Speicher vor dem Start, in MiB (20 GB) — unveraendert
+# scharf, siehe Kopfkommentar und
 # ~/Knowledge/10-global/incident-2026-08-11-kernel-panik-durch-gpu-speichermangel.md.
 # Eine abgelehnte Stufe wird NIE von Hand nachgefordert.
-MIN_FREE_MIB=20480
+#
+# AUF NULL GESETZT (2026-08-27, ausdrueckliche des Nutzers Anweisung: "aendere
+# die Rechnung so, dass sie nicht mehr aufschlaegt, was das Modell per
+# Rechnung braucht"). Diese Schwelle war ein PAUSCHALER Boden, unabhaengig von
+# der Groesse des angeforderten Modells -- ein winziges Modell mit 3 GiB
+# Bedarf musste denselben 20-GiB-Boden ueberstehen wie ein 30-GiB-Koloss.
+# Gemessen am 27.08.2026: ein Spawn mit 21,3 GiB errechnetem Bedarf gegen
+# 25,1 GiB frei scheiterte an genau diesem Zusammenspiel mehrerer
+# uebereinanderliegender Reserven (diese hier, wb-kontexts RESERVE_MIB,
+# wb-belegungs RESERVE_GIB + Zuschlag) -- rechnerisch war genug frei.
+# Entscheidung: WEGFALL statt Umrechnung auf den tatsaechlichen Bedarf,
+# weil die echte, praezise Pruefung ohnehin unmittelbar danach laeuft --
+# `belegung_nehmen()` weiter unten ruft `wb-belegung nimm` mit den
+# tatsaechlichen Gewichten/Kontext/Parallelitaet DIESES Starts auf und lehnt
+# dort ab, wenn es wirklich nicht passt. Ein zweiter, gröberer Boden davor,
+# der nur die Gesamtgroesse kennt statt den echten Bedarf, ist redundant und
+# genau er hat heute abgelehnt, obwohl Platz war. Was diese Schwelle bisher
+# auffing (siehe die beiden Faelle im Kommentar bei ihrer Pruefstelle unten),
+# faengt ab jetzt NICHT mehr eine Vorbedingung, sondern `wb-notbremse` als
+# Notabschaltung NACH dem Start ab, siehe dort weiter unten
+# ("DIE NOTBREMSE") -- sie beendet den gerade gestarteten Modellprozess per
+# PID, wenn der wirklich freie Speicher trotz allem unter die Schwelle
+# faellt, statt vorher zu raten, wieviel "genug" ist.
+MIN_FREE_MIB=0
 
 # Werkbank-Vorgabe fuer lokale Arbeit, wenn `ensure` ohne <modell> aufgerufen
 # wird UND kein zuletzt gewaehltes Modell in aktuell.json steht (siehe
@@ -1101,13 +1387,21 @@ sys.exit(0 if any(t == "linear_attention" for t in lagentypen(d)) else 1)
 # resolve_modell setzt, weil `wb-state models get --field` keine Punktpfade
 # kann: 'vorhersage.bauart' liefert nichts, geprueft). Gibt eine Zeile aus,
 # tabulatorgetrennt:
-#   bauart <TAB> modell <TAB> gewichteGb <TAB> label <TAB> warnung
+#   bauart <TAB> modell <TAB> gewichteGb <TAB> label <TAB> warnung <TAB> draftKind <TAB> draftBlockSize
 # Der Tabulator kommt in keinem Pfad und keinem Etikett vor. EIN python3-Aufruf
 # fuer alle Felder, nicht fuenf: die Wahl ist eine Entscheidung und darf nicht
 # in fuenf getrennten Prozessen fallen, die jeder fuer sich anders ausgehen
 # koennten -- dieselbe Ueberlegung wie in shell/wb-code an der gleichen Stelle.
 # Ohne `wege` in der Registry (oder ohne gewaehlte id) sind es genau die Felder
 # auf oberster Ebene, also der Stand vor dem 21.08.
+#
+# draftKind/draftBlockSize (Nachtrag 22, 2026-08-27, fuenfter Motor mlx-vlm):
+# NUR fuer Wege mit bauart="entwerfer" sinnvoll -- die Bauart des externen
+# Entwerfers (dflash/eagle3/mtp), die mlx_vlm.server ausdruecklich unterscheidet
+# (--draft-kind). Ein Weg OHNE draftKind (z.B. dspark-diminfer, Modelltyp
+# Qwen3DSparkModel, den mlx_vlm nicht kennt) bleibt beim bisherigen
+# mlx-dspark-Motor -- das Feld entscheidet die Motorwahl in cmd_ensure, nicht
+# dieses Skript hier.
 vorhersage_weg_waehlen() {
   local gewaehlt="$1"
   [ -n "${RES_VORHERSAGE:-}" ] && [ "$RES_VORHERSAGE" != "null" ] || return 0
@@ -1138,12 +1432,15 @@ if gewaehlt:
         warnung = ("Vorhersage-Weg %r ist fuer dieses Modell nicht hinterlegt (bekannt: %s) -- "
                    "es gilt der Vorgabeweg." % (gewaehlt, ", ".join(w["id"] for w in wege) or "keiner"))
 gb = weg.get("gewichteGb")
+bs = weg.get("draftBlockSize")
 print("\t".join([
     weg.get("bauart") or "",
     weg.get("modell") or "",
     "" if gb is None else str(gb),
     weg.get("label") or weg.get("id") or "",
     warnung,
+    weg.get("draftKind") or "",
+    "" if bs is None else str(bs),
 ]))
 ' "$gewaehlt" 2>/dev/null
 }
@@ -1194,6 +1491,28 @@ deckel_waehlen() {
 # ist. Wer aus einem Arbeitsbaum ausdruecklich gegen dessen eigenen Stand messen
 # will, setzt die dafuer vorgesehene Variable -- eine Behauptung im Aufruf, nicht
 # eine stille Vorfahrt im Pfad.
+# Nachtrag 2026-09-08, VIERTE RUNDE, Auftrag (C) Punkt 2: der APC-Blockpool
+# (mlx-vlm 0.7.0) muss wie der Prompt-Cache von mlx_lm.server als Speicher
+# gebucht werden -- "Block-Pool = Kontext x KV je Token, konservativ". Die
+# KV-Zahl je Token lebt einzig in wb-belegungs eigenem Register
+# (`wb-belegung kv liste`) -- keine zweite, eigene Herleitung hier ("eine
+# Quelle, nicht zwei", derselbe Grundsatz wie bei kv_quant_buchung oben).
+# Liefert den UNQUANTISIERTEN Wert fuer $basisname zurueck (die konservative,
+# groessere Zahl -- APC hat kein eigenes, gemessenes Quantisierungsschema),
+# leer wenn nichts eingetragen ist.
+kv_mib_je_token_fuer() {   # <basisname> -> MiB/Token oder leer
+  local basisname="$1" wbb
+  wbb="$(belegung_bin)"
+  [ -n "$wbb" ] || return 0
+  # NACHTRAG 2026-09-08, Auftrag "buchung", Kleinkram-Befund "grep -F": der
+  # bisherige Weg (grep -i "^  *${basisname} ") liest $basisname als REGEX, nicht
+  # als literale Zeichenkette -- ein Modellname mit einem Punkt (ueblich, z.B.
+  # "Qwen3.8-27B-...") matcht damit JEDES Zeichen an dieser Stelle. awk mit
+  # exaktem Feldvergleich ($1==m) ist unabhaengig vom Inhalt der Zeichenkette
+  # immer ein exakter Treffer -- das Register hat keine Leerzeichen in Namen.
+  "$wbb" kv liste 2>/dev/null | awk -v m="$basisname" '$1==m{print $2; exit}'
+}
+
 belegung_bin() {
   local p="$HOME/.local/bin/wb-belegung"
   if [ -x "$p" ]; then printf '%s' "$p"; return 0; fi
@@ -1208,13 +1527,16 @@ find_pid() {
 
 is_ours() {
   local pid="$1"
-  # mlx_lm.server, mlx-dspark serve (Nachtrag 7), mtplx serve (Nachtrag 8)
-  # ODER vllm serve (Nachtrag 10) -- welcher Motor gerade laeuft, ist eine
-  # reine ps-Beobachtung, keine Annahme. Das Muster fuer vllm-metal ist
-  # bewusst "vllm" und nicht der venv-Pfad: welches venv das Werkzeug
-  # mitbringt, sagt die Registry je Modell, ein fester Pfad hier waere eine
-  # zweite, stillschweigend veraltende Quelle.
-  [ -n "$pid" ] && ps -o command= -p "$pid" 2>/dev/null | grep -qE "mlx_lm|mlx-dspark|mtplx|vllm"
+  # mlx_lm.server, mlx-dspark serve (Nachtrag 7), mtplx serve (Nachtrag 8),
+  # vllm serve (Nachtrag 10) ODER mlx_vlm.server (Nachtrag 22, 2026-08-27) --
+  # welcher Motor gerade laeuft, ist eine reine ps-Beobachtung, keine
+  # Annahme. Das Muster fuer vllm-metal ist bewusst "vllm" und nicht der
+  # venv-Pfad: welches venv das Werkzeug mitbringt, sagt die Registry je
+  # Modell, ein fester Pfad hier waere eine zweite, stillschweigend
+  # veraltende Quelle. "mlx_vlm" (Unterstrich) trifft NICHT das Muster
+  # "mlx_lm" (kein gemeinsamer Substring: 'mlx_lm' gegen 'mlx_vlm' --
+  # nachgesehen), braucht also ein eigenes Muster.
+  [ -n "$pid" ] && ps -o command= -p "$pid" 2>/dev/null | grep -qE "mlx_lm|mlx_vlm|mlx-dspark|mtplx|vllm"
 }
 
 # Das Modell, das GERADE unter dieser PID laeuft — aus dem lebenden
@@ -1309,13 +1631,228 @@ laufende_decode_concurrency() {
   printf '%s' "$wert"
 }
 
+# Nachtrag 2026-09-08 (Auftrag "kontextgewichte", ZWEITER TEIL, gemessen 19:20):
+# `ensure` meldete "laeuft bereits (PID 98588) -- kein Start noetig", obwohl der
+# laufende Server mit --parallel 1 (siehe laufende_decode_concurrency oben)
+# gestartet war. Der zweite gleichzeitige Strom (ein pi-Worker neben einem
+# laufenden brain-contradict-Richter) bekam danach HTTP 500 "'tuple' object has
+# no attribute 'shape'" -- genau der Fall aus NACHTRAG 24 oben (Quantisierung bei
+# einem Strom an, ab zwei aus). Die vorhandene "laeuft schon dasselbe"-Pruefung
+# (Pfad, Entwerfer, Motor, Kontext) fragte nie, ob der laufende Server ueberhaupt
+# noch einen WEITEREN Strom traegt.
+#
+# Wieviele Stroeme sind FUER DIESES MODELL schon zugesagt? Die einzige Quelle
+# dafuer ist wb-belegung: der Serverstart bucht seine EIGENE Zahl (--parallel,
+# dieselbe wie die Server-Kapazitaet, siehe NACHTRAG 6 im Kopfkommentar), jeder
+# zusaetzliche lokale Worker bucht seine eigene Sequenz obendrauf (pi-worker,
+# "Eigene Sequenz buchen", --parallel 1 je Buchung) -- die SUMME aller
+# rechnung.parallel-Werte fuer denselben Modellnamen ist die Zahl gleichzeitiger
+# Stroeme, die der laufende Server gerade tragen soll. "eine Quelle, nicht
+# zwei": wb-belegung entscheidet, dieselbe Buchfuehrung, die auch den Speicher
+# entscheidet (siehe Kopfkommentar von shell/wb-belegung).
+#
+# UEBERHOLT (Nachtrag 2026-09-08, ZWEITE RUNDE, Auftrag "buchung", Befund 8):
+# der ERSTE Satz oben stimmt nicht mehr -- der Serverstart bucht seit der
+# ersten Runde dieses Auftrags NICHT MEHR "seine EIGENE Zahl, dieselbe wie die
+# Server-Kapazitaet", sondern einen FESTEN Basisstrom (--parallel 1, siehe
+# belegung_nehmen() weiter unten, "BASISSTROM STATT --nur-gewichte"). Diese
+# Server-eigene Buchung wird deshalb jetzt AUSDRUECKLICH aus der Summe
+# ausgeschlossen (ueber ihren zweck, siehe die Python-Abfrage unten) -- die
+# Summe zaehlt seither NUR NOCH Worker-Stroeme, nicht mehr Server + Worker
+# gemischt. Der Rest des Absatzes (jeder Worker bucht seine eigene Sequenz,
+# die Summe entscheidet ueber die noetige Kapazitaet) gilt unveraendert.
+# NAMENSABGLEICH (Nachtrag 2026-09-08, DRITTE RUNDE, Gegenleser-Befund Punkt
+# 6): der reine Vergleich gegen $basisname verfehlt die eigene Serverbuchung
+# GENAU im Anlassfall -- ein mlx-vlm-Server mit EINEM Strom bucht unter
+# "<basisname>-kv8" (siehe cmd_ensure weiter unten, kv_modellname_buchung),
+# nicht unter dem blanken Basisnamen. Ohne diesen zweiten Namen zaehlte die
+# Summe den Server selbst mit 0 -- die Kapazitaetspruefung haette den
+# gemessenen Fehler (Server bei --parallel 1, zweiter Strom scheitert) NICHT
+# erkannt. Beide Namen werden deshalb IMMER gegengeprueft, unabhaengig davon,
+# welchen Namen DIESER Aufruf gerade selbst waehlen wuerde -- eine fremde,
+# schon bestehende Buchung darf nicht von der Namenswahl des NEUEN Versuchs
+# abhaengen.
+#
+# UEBERFAELLIG ZAEHLT WEITER MIT, ABSICHTLICH (Gegenleser-Befund Punkt 8): der
+# Zustand "ueberfaellig" (siehe zustand_bestimmen() in shell/wb-belegung)
+# bedeutet PER DEFINITION "die Frist ist um, ABER der Pane ist gerade
+# nachweislich noch lebendig" -- genau das Gegenteil von "verfallen" (Pane
+# tot). Eine Buchung mit lebendigem Pane hier NICHT mitzuzaehlen waere die
+# gefaehrliche Richtung (Sicherheitsregel dieses Auftrags: im Zweifel zu viel
+# buchen, nie zu wenig) -- ein wiederverwendeter Pane, der laengst etwas
+# anderes tut, waere die einzige Faehrte, die eine "ueberfaellig"-Buchung
+# unbegrenzt am Leben hielte, und das ist ein SELTENER Rand, kein Regelfall.
+# "wb-belegung aufraeumen" laeuft trotzdem VORHER (billig, gleiche Sperre wie
+# jede andere Operation) -- es entfernt "tot" und laengst "verfallene"
+# Karteileichen aus dem Buch, bevor gezaehlt wird; es aendert nichts an
+# "ueberfaellig" (das bleibt bewusst gezaehlt) und nichts an "offen".
+gebuchte_sequenzen_summe() {   # <basisname> -> Summe rechnung.parallel der WORKER-Buchungen
+  # (Nachtrag 2026-09-08, ZWEITE RUNDE, Auftrag "buchung", Risiko 10): schliesst
+  # die Server-eigene Buchung (Gewichte + Basisstrom, zweck beginnt mit
+  # "wb-mlx-server:") ausdruecklich aus -- ihr Basisstrom deckt Nicht-Worker-
+  # Verbraucher (grug-server, wb-modell-proxy, brain-contradict-Richter, curl),
+  # ist aber KEIN Slot, der einem Worker weggenommen wird (siehe die
+  # Kapazitaetsrechnung bei belegung_nehmen()). Ohne diesen Ausschluss zaehlte
+  # der Basisstrom hier doppelt mit -- einmal als Teil von "wieviel ist gebucht"
+  # UND ein zweites Mal implizit ueber die reale --decode-concurrency, die schon
+  # auf ihn ausgelegt war -- und haette jede Kapazitaetsrechnung um eins nach
+  # oben verschoben, ohne dass je ein zusaetzlicher WORKER dazukam.
+  local basisname="$1" wbb
+  wbb="$(belegung_bin)"
+  [ -n "$wbb" ] || { printf '0'; return 0; }
+  "$wbb" aufraeumen --json >/dev/null 2>&1
+  "$wbb" wer --json 2>/dev/null | python3 -c '
+import json, sys
+basisname = sys.argv[1]
+namen = {basisname, basisname + "-kv8"}
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(0)
+    sys.exit(0)
+summe = 0
+for b in (d.get("belegungen") or []):
+    if b.get("_zustand") == "tot":
+        continue
+    if (b.get("modell") or "") not in namen:
+        continue
+    if (b.get("zweck") or "").startswith("wb-mlx-server:"):
+        continue
+    try:
+        summe += int((b.get("rechnung") or {}).get("parallel") or 0)
+    except (TypeError, ValueError):
+        pass
+print(summe)
+' "$basisname" 2>/dev/null || printf '0'
+}
+
+# UEBERHOLT (Nachtrag 2026-09-08, Auftrag "buchung", Befunde 1/2/3/4/5): die
+# ganze ENTSCHEIDUNG unten -- "der Serverstart bucht Gewichte + ALLE Stroeme,
+# Geschwister werden danach freigegeben" -- ist NICHT MEHR IN KRAFT. Ein
+# Gegenleser fand darin den eigentlichen Entwurfsfehler: die Buchung des
+# Serverstarts hing an dessen aufrufendem PANE, nicht am Serverprozess selbst,
+# und starb deshalb regelmaessig VOR ihm (Befund 1, "Summe 0 bei N laufenden
+# Stroemen"); die Geschwister-Freigabe unten lief zudem VOR der Bestaetigung des
+# neuen Starts (Befund 3) und konnte in einer Sonderlage sogar die brandneue
+# Buchung mit sich reissen (Befund 2). Die neue Loesung (siehe wb-belegungs
+# eigener Kopfkommentar "JEDER STROM WIRD VOM WORKER GEBUCHT" und "EIN PROZESS
+# KANN AUCH DER HALTER SEIN"): der Serverstart bucht NUR NOCH seine Gewichte,
+# gehalten vom PROZESS selbst (`wb-belegung geladen ... --prozess-haelt`), NIE
+# eine Strom-Zahl fuer einen Aufrufer stellvertretend; JEDER Strom wird vom
+# Worker gebucht, der ihn faehrt, auch der erste. Damit gibt es keine
+# Geschwister-Buchungen mehr, die einem Serverstart je "gehoert" haetten, und
+# `gebuchte_kennungen()` unten wird nicht mehr aufgerufen (siehe cmd_ensure).
+# Der Text bleibt stehen, weil er die damalige Entscheidung und ihre Abwaegung
+# ehrlich dokumentiert -- nicht, weil er noch beschreibt, was das Skript tut.
+#
+# Nachtrag 2026-09-08, ZWEITE RUNDE, Auftrag (A) -- Doppelbuchung beim ersten
+# Strom, siehe OPEN Punkt 2 der ersten Runde und kapazitaet_pruefen() darunter.
+#
+# ENTSCHEIDUNG (im Kopf dokumentiert, wie verlangt -- EINE Quelle, nicht zwei
+# Politiken nebeneinander): bei einem kapazitaetsbedingten Neustart bucht der
+# NEUE Serverstart Gewichte + ALLE Stroeme (die schon gebuchten Geschwister
+# PLUS diesen neuen), nicht nur seine eigene EINE Sequenz. Die ALTEN
+# Einzelbuchungen der Geschwister werden danach freigegeben. NICHT gewaehlt:
+# "Server bucht nur Gewichte + eigene, Geschwister behalten ihre" -- das wuerde
+# die wb-belegung-Buchung von der REALEN --decode-concurrency des Prozesses
+# entkoppeln (Nachtrag 6, Kopfkommentar: "DIESELBE Zahl geht ... an mlx_lm.server
+# als Server-Kapazitaet, ... UND an `wb-belegung nimm --parallel`" -- eine
+# bewusste Kopplung, kein Zufall). Bleibt die Buchung bei parallel=1 stehen,
+# waehrend der echte Prozess mit --decode-concurrency N+1 laeuft, ist die
+# wb-belegung-Zahl kleiner als der wirkliche Speicherbedarf -- genau die
+# gefaehrliche Richtung (Sicherheitsregel dieses Auftrags: im Zweifel zu viel
+# buchen, nie zu wenig).
+#
+# REIHENFOLGE, NICHT VERHANDELBAR: die alten Geschwister-Buchungen werden ERST
+# NACH einer ERFOLGREICHEN neuen Buchung freigegeben (siehe cmd_ensure, direkt
+# nach belegung_nehmen()), nie vorher und nie ungeprueft. Zwischen "alter
+# Server beendet" und "neue Buchung steht" zaehlen die alten Geschwister-
+# Buchungen also WEITER mit -- eine ueberschaetzte, nie eine unterschaetzte
+# Zwischenlage.
+#
+# BEKANNTE, OFFEN BENANNTE RESTLUECKE: die Liste der zu loeschenden Kennungen
+# wird HIER, kurz vor dem Freigeben, neu erhoben (kleinstmoegliches Fenster,
+# nicht Null) -- eine Buchung, die GENAU in diesem kurzen Fenster neu entsteht
+# (ein weiterer Geschwister-Spawn waehrend dieses Neustarts), wuerde faelschlich
+# mitgeloescht, obwohl sie zur neuen Gesamtzahl nicht mehr passt. Das ist ein
+# echtes, seltenes Zeitfenster, keine False-Positive-Uebervorsicht -- siehe
+# Ergebnisdatei dieses Auftrags fuer die Abwaegung, warum es hier offen bleibt
+# (ein voller Lock ueber den ganzen Neustart, der auch pi-workers eigene
+# Buchungsversuche blockiert, waere ein deutlich groesserer Eingriff).
+# NICHT MEHR AUFGERUFEN (Nachtrag 2026-09-08, Auftrag "buchung") -- siehe die
+# UEBERHOLT-Notiz oben. Stehen gelassen als Beleg der frueheren Entscheidung.
+gebuchte_kennungen() {   # <basisname> <ausgenommene-kennung> -> eine Kennung je Zeile
+  # Derselbe Namensabgleich wie gebuchte_sequenzen_summe() (siehe dort,
+  # Gegenleser-Befund Punkt 6) -- sonst wuerde eine Buchung unter
+  # "<basisname>-kv8" hier nie gefunden und nie freigegeben.
+  local basisname="$1" ausgenommen="${2:-}" wbb
+  wbb="$(belegung_bin)"
+  [ -n "$wbb" ] || return 0
+  "$wbb" wer --json 2>/dev/null | python3 -c '
+import json, sys
+basisname, ausgenommen = sys.argv[1], sys.argv[2]
+namen = {basisname, basisname + "-kv8"}
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for b in (d.get("belegungen") or []):
+    if b.get("_zustand") == "tot":
+        continue
+    if (b.get("modell") or "") not in namen:
+        continue
+    kennung = b.get("id") or ""
+    if kennung and kennung != ausgenommen:
+        print(kennung)
+' "$basisname" "$ausgenommen" 2>/dev/null
+}
+
+# Traegt der laufende Server (PID $1) noch EINEN weiteren Strom fuer $2
+# (Basisname, wie gebuchte_sequenzen_summe() ihn braucht)? $3 ist ein
+# ausdruecklich vom Aufrufer verlangtes --parallel (leer, wenn keins gegeben) --
+# eine ausdrueckliche Zahl gewinnt, wenn sie groesser ist als die errechnete
+# Mindestzahl. Ausgabe (durch Leerzeichen getrennt, EIN Aufruf statt drei, damit
+# `wer --json` nur einmal laeuft): "ja|nein <benoetigt> <laufende-kapazitaet-oder-?>".
+#
+# BEKANNTE GRENZE (ausdruecklich offen gelassen, siehe Ergebnisdatei dieses
+# Auftrags): diese Pruefung sitzt in cmd_ensure NACH der Motorwahl (mtplx-Klemme,
+# vllm-metal-Umschlagpunkt) -- ein Neustart mit hoeherem --parallel laesst den
+# schon gewaehlten Motor unveraendert stehen, auch wenn die neue Stromzahl
+# eigentlich einen Motorwechsel verlangen wuerde (buendelung.umschlagpunktStroeme).
+# Sicherer als der bisherige Fehler (stiller Weiterbetrieb ueber Kapazitaet), aber
+# kein vollstaendiger Ersatz fuer eine Motorwahl VOR dieser Pruefung.
+kapazitaet_pruefen() {   # <pid> <basisname> <explizites-parallel-oder-leer>
+  local pid="$1" basisname="$2" explizit="${3:-}"
+  local kap; kap="$(laufende_decode_concurrency "$pid")"
+  local gebucht; gebucht="$(gebuchte_sequenzen_summe "$basisname")"
+  case "$gebucht" in ''|*[!0-9]*) gebucht=0 ;; esac
+  local benoetigt=$((gebucht + 1))
+  if [ -n "$explizit" ] && [ "$explizit" -gt "$benoetigt" ] 2>/dev/null; then
+    benoetigt="$explizit"
+  fi
+  if [ -z "$kap" ]; then
+    # Kapazitaet an der lebenden Kommandozeile nicht ablesbar (unbekannter Motor
+    # oder Schalter) -- konservativ als ausreichend behandeln, sonst wuerde jeder
+    # Motor ohne lesbaren Schalter bei jedem 'ensure' unnoetig neu gestartet.
+    printf 'ja %s ?\n' "$benoetigt"
+    return 0
+  fi
+  if [ "$benoetigt" -le "$kap" ] 2>/dev/null; then
+    printf 'ja %s %s\n' "$benoetigt" "$kap"
+  else
+    printf 'nein %s %s\n' "$benoetigt" "$kap"
+  fi
+}
+
 # Leer, wenn der laufende Prozess KEINEN Entwerfer traegt -- wichtig fuer den
 # "schon laeuft, gleiches Modell"-Vergleich in cmd_ensure: zwei
 # Registry-Eintraege koennen denselben modelRef teilen (das Ziel mit und ohne
 # Entwerfer), der Pfadvergleich allein wuerde sie faelschlich als gleich
-# behandeln. Zwei moegliche Schalter, je nach Motor (Nachtrag 7):
-# --draft-model (mlx_lm.server, heute unbenutzt -- siehe Null-Resultat) oder
-# --drafter (mlx-dspark serve, der tatsaechlich funktionierende Weg).
+# behandeln. Zwei moegliche Schalter, je nach Motor: --draft-model
+# (mlx_lm.server, dort nach wie vor unbenutzt -- siehe Null-Resultat
+# Nachtrag 7 -- ABER seit Nachtrag 22, 2026-08-27 der ECHTE Schalter des
+# vierten Motors mlx_vlm.server, der ihn tatsaechlich versteht) oder
+# --drafter (mlx-dspark serve, der andere funktionierende Weg).
 laufender_draft_pfad() {
   local pid="$1"
   ps -o command= -p "$pid" 2>/dev/null | sed -n -e 's/.*--draft-model \([^ ]*\).*/\1/p' -e 's/.*--drafter \([^ ]*\).*/\1/p'
@@ -1323,16 +1860,17 @@ laufender_draft_pfad() {
 
 # Mit welcher Kontextstufe dieser Prozess WIRKLICH laeuft (Nachtrag
 # 21.08.2026, GEMESSEN am echten Doppelstart, siehe der lange Kommentar in
-# cmd_ensure ueber dem "laeuft schon dasselbe"-Vergleich): mtplx und
-# vllm-metal tragen ihr Kontextfenster als echten Serverschalter
-# (--context-window / --max-model-len) in der lebenden Kommandozeile -- dort
-# ist DAS die Wahrheit, genau wie bei laufender_motor/laufender_draft_pfad.
-# mlx_lm.server und mlx-dspark kennen KEINEN solchen Schalter (siehe
-# Kopfkommentar "WARUM ES KEINEN --context-SCHALTER AN mlx_lm.server GIBT" --
-# der Server laedt bei diesen beiden IMMER das volle native Fenster, egal
-# welches --kontext gebucht wurde). Fuer diese zwei faellt die Funktion auf
-# aktuell.json zurueck, ABER NUR, wenn deren "modell"-Feld mit dem Pfad
-# uebereinstimmt, den der Aufrufer gerade LIVE bestaetigt hat ($2) -- sonst
+# cmd_ensure ueber dem "laeuft schon dasselbe"-Vergleich): mtplx, vllm-metal
+# UND mlx-vlm (Nachtrag 22, 2026-08-27) tragen ihr Kontextfenster als echten
+# Serverschalter (--context-window / --max-model-len / --max-kv-size) in der
+# lebenden Kommandozeile -- dort ist DAS die Wahrheit, genau wie bei
+# laufender_motor/laufender_draft_pfad. mlx_lm.server und mlx-dspark kennen
+# KEINEN solchen Schalter (siehe Kopfkommentar "WARUM ES KEINEN
+# --context-SCHALTER AN mlx_lm.server GIBT" -- der Server laedt bei diesen
+# zwei IMMER das volle native Fenster, egal welches --kontext gebucht
+# wurde). Fuer diese zwei faellt die Funktion auf aktuell.json zurueck, ABER
+# NUR, wenn deren "modell"-Feld mit dem Pfad uebereinstimmt, den der
+# Aufrufer gerade LIVE bestaetigt hat ($2) -- sonst
 # koennte die Datei von einem laengst beendeten oder von aussen ersetzten
 # Lauf stammen und eine falsche Zahl vortaeuschen (dieselbe Vorsicht, die
 # laufendes_modell() schon gegen die reine Merkdatei hat). Leer heisst
@@ -1343,7 +1881,7 @@ laufender_draft_pfad() {
 laufender_kontext() {
   local pid="$1" erwarteter_pfad="$2" aus_cmd
   aus_cmd="$(ps -o command= -p "$pid" 2>/dev/null \
-    | sed -n -e 's/.*--context-window \([0-9]*\).*/\1/p' -e 's/.*--max-model-len \([0-9]*\).*/\1/p')"
+    | sed -n -e 's/.*--context-window \([0-9]*\).*/\1/p' -e 's/.*--max-model-len \([0-9]*\).*/\1/p' -e 's/.*--max-kv-size \([0-9]*\).*/\1/p')"
   if [ -n "$aus_cmd" ]; then
     printf '%s' "$aus_cmd"
     return 0
@@ -1360,7 +1898,7 @@ if d.get("modell") == sys.argv[2] and d.get("kontext") is not None:
 ' "$AKTUELL_DATEI" "$erwarteter_pfad" 2>/dev/null
 }
 
-# Welcher der vier Motoren gerade laeuft -- aus der lebenden Kommandozeile
+# Welcher der fuenf Motoren gerade laeuft -- aus der lebenden Kommandozeile
 # gelesen, nicht aus einer Merkdatei (Nachtrag 10). Gebraucht wird das seit
 # vllm-metal: es ist der erste Motor, der DENSELBEN Modellpfad ohne Entwerfer
 # faehrt wie mlx_lm.server. Bis dahin genuegten Pfad und Entwerferzustand fuer
@@ -1368,7 +1906,11 @@ if d.get("modell") == sys.argv[2] and d.get("kontext") is not None:
 # mlx-dspark traegt einen --drafter. Bei vllm-metal stimmen beide ueberein und
 # der Server waere trotzdem ein anderer; ohne diese Pruefung haette `ensure`
 # einen laufenden mlx_lm.server faelschlich fuer den angeforderten vllm-metal
-# gehalten und gar nicht erst gewechselt.
+# gehalten und gar nicht erst gewechselt. Derselbe Grund gilt jetzt fuer den
+# fuenften Motor, mlx-vlm (Nachtrag 22, 2026-08-27): auch er traegt einen
+# --draft-model (denselben Schalternamen wie das nie benutzte mlx_lm.server-
+# Feld), der Pfadvergleich allein koennte die beiden Motoren also
+# verwechseln.
 laufender_motor() {
   local pid="$1" cmd
   cmd="$(ps -o command= -p "$pid" 2>/dev/null)"
@@ -1376,6 +1918,7 @@ laufender_motor() {
     *mlx-dspark*) printf 'mlx-dspark' ;;
     *mtplx*)      printf 'mtplx' ;;
     *vllm*)       printf 'vllm-metal' ;;
+    *mlx_vlm*)    printf 'mlx-vlm' ;;
     *mlx_lm*)     printf 'mlx-lm' ;;
     *)            printf '' ;;
   esac
@@ -1444,14 +1987,21 @@ PY
 )"
       ;;
     *)
-      # Erst als Registry-KENNUNG versuchen (wb-state kennt nur Kennungen).
-      if wb-state models get "$eingabe" >/dev/null 2>&1; then
-        id="$eingabe"
-      else
-        # Kein Treffer als Kennung -- als ALIAS in der Registry suchen.
-        # wb-state selbst loest Aliase nicht auf (gemessen: `wb-state models
-        # get grug` scheitert, `get grug-27b` klappt); die Suche passiert
-        # deshalb hier, direkt in der Registry-Datei.
+      # Die kanonische Kennung direkt erfragen -- `--field id` antwortet fuer
+      # eine Kennung wie fuer einen Alias mit derselben Kennung.
+      #
+      # Bis zum 2026-08-29 stand hier stattdessen die Frage, OB `wb-state models
+      # get "$eingabe"` gelingt, und aus dem Scheitern wurde geschlossen, die
+      # Eingabe sei ein Alias. Seit wb-state Aliase aufloest, gelingt der Aufruf
+      # auch fuer einen Alias -- und dann wurde der Alias selbst zur Kennung.
+      # Sichtbar wurde das an `--served-model-name … qwen38` statt `… qwen38-27b`,
+      # was vLLM zurueckweist, weil es den Modellnamen im Gegensatz zu
+      # mlx_lm.server tatsaechlich prueft. Aus einem Fehlschlag zu schliessen ist
+      # bruechig; gefragt wird jetzt nach dem Wert, um den es geht.
+      id="$(wb-state models get "$eingabe" --field id 2>/dev/null)"
+      if [ -z "$id" ]; then
+        # Rueckfall fuer eine wb-state-Fassung ohne Alias-Aufloesung: als ALIAS
+        # direkt in der Registry-Datei suchen.
         id="$(python3 - "$eingabe" "$MODELSFILE" <<'PY'
 import json, sys
 alias, registry = sys.argv[1], sys.argv[2]
@@ -1591,14 +2141,14 @@ gewichte_gb_ermitteln() {
   # Ordner trotzdem. Ueber dem Registry-Wert gilt die Messung immer -- mehr
   # Gewicht als eingetragen ist eine Tatsache, keine Auffaelligkeit.
   local zu_klein
-  zu_klein="$(awk -v r="$registry_wert" -v g="$gemessen" 'BEGIN { print (g < r * 0.75) ? "ja" : "nein" }')"
+  zu_klein="$(LC_ALL=C awk -v r="$registry_wert" -v g="$gemessen" 'BEGIN { print (g < r * 0.75) ? "ja" : "nein" }')"
   if [ "$zu_klein" = "ja" ]; then
     err "Gewichte: gemessen wurden nur $gemessen GiB, eingetragen sind $registry_wert GiB — das ist zu wenig, um eine Messung zu sein. Der Ordner ist vermutlich unvollstaendig; gebucht wird der EINGETRAGENE Wert, damit die Buchung nicht zu klein ausfaellt."
     printf '%s' "$registry_wert"
     return 0
   fi
   local abw
-  abw="$(awk -v r="$registry_wert" -v g="$gemessen" 'BEGIN { d = r - g; if (d < 0) d = -d; printf "%.0f", (g > 0 ? d / g * 100 : 0) }')"
+  abw="$(LC_ALL=C awk -v r="$registry_wert" -v g="$gemessen" 'BEGIN { d = r - g; if (d < 0) d = -d; printf "%.0f", (g > 0 ? d / g * 100 : 0) }')"
   if [ "$abw" -ge 5 ]; then
     err "Gewichte: Registry sagt $registry_wert GiB, gemessen sind $gemessen GiB ($abw % Abweichung) — gebucht wird der GEMESSENE Wert. Der Registry-Eintrag gehoert korrigiert (haeufigste Ursache: dezimale GB statt GiB eingetragen)."
   fi
@@ -1700,10 +2250,14 @@ BELEGUNG_KENNUNG=""
 # unsere eigene Marke. Und es ist eindeutig: auf einem Port kann nur ein Server
 # lauschen -- laeuft dort keiner, kann keine Belegung fuer diesen Port noch
 # jemandem gehoeren.
-belegungen_dieses_ports_freigeben() {
+# Gemeinsame Abfrage fuer belegungen_dieses_ports_freigeben() UND
+# belegung_freigebens Rueckfall ohne Kennungsdatei (Nachtrag 2026-09-08,
+# ZWEITE RUNDE, Auftrag "buchung", Befund 2) -- eine Quelle fuer "welche
+# Belegungen gehoeren zu DIESEM Port", nicht zwei auseinanderlaufende Kopien
+# derselben Abfrage.
+_port_marke_kennungen() {   # <wbb> -> eine Kennung je Zeile
   local wbb="$1"
-  local ids
-  ids="$("$wbb" wer --json 2>/dev/null | python3 -c '
+  "$wbb" wer --json 2>/dev/null | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -1714,7 +2268,13 @@ for b in d.get("belegungen", []):
     z = b.get("zweck") or ""
     if z.startswith("wb-mlx-server:") and marke in z:
         print(b.get("id"))
-' "$PORT" 2>/dev/null)"
+' "$PORT" 2>/dev/null
+}
+
+belegungen_dieses_ports_freigeben() {
+  local wbb="$1"
+  local ids
+  ids="$(_port_marke_kennungen "$wbb")"
   [ -n "$ids" ] || return 0
   local id
   for id in $ids; do
@@ -1778,7 +2338,24 @@ for b in d.get("belegungen", []):
 }
 
 belegung_nehmen() {
-  local modell_basisname="$1" gewichte_gb="$2" kontext="$3" frist_min="$4" zweck="$5" parallel="$6" draft_gewichte_gb="$7" cache_gib="${8:-0}" metal_fraktion="${9:-}" kv_quant="${10:-}" auf_eigene_gefahr="${11:-0}"
+  local modell_basisname="$1" gewichte_gb="$2" kontext="$3" frist_min="$4" zweck="$5" parallel="$6" draft_gewichte_gb="$7" cache_gib="${8:-0}" metal_fraktion="${9:-}" kv_quant="${10:-}" auf_eigene_gefahr="${11:-0}" kv_modellname="${12:-}" cache_ist_exakt="${13:-0}"
+  # cache_ist_exakt (Nachtrag 2026-09-08, Auftrag "buchung", Kleinkram-Befund "APC
+  # ohne 2,2-Faktor"): mlx-vlms APC-Blockpool ist eine EXAKTE Zuteilung (Bloecke x
+  # Blockgroesse x KV-Bedarf je Token), kein weicher Deckel, der wie bei
+  # mlx_lm.server gemessen ueberschritten wird -- gebucht wird deshalb ueber
+  # --prompt-cache-exakt-gb (kein PROMPT_CACHE_DECKEL_FAKTOR), nicht ueber
+  # --prompt-cache-gb. Vorgabe 0 (Deckel wie bisher) aendert nichts am bestehenden
+  # mlx_lm.server-Pfad.
+  # kv_modellname (NACHTRAG 23, 2026-08-27): der Name, unter dem wb-belegung den
+  # KV-Bedarf je Token NACHSCHLAEGT -- normalerweise derselbe Basisname, aber
+  # nicht zwingend. wb-belegungs KV-Register rechnet ABSICHTLICH nichts um: ein
+  # Faktor auf einen gemessenen Wert waere wieder eine Annahme. Derselbe Koerper
+  # kostet aber je nach Motor verschieden viel, weil nur manche Motoren einen
+  # Quantisierungsschalter haben -- unter mlx_lm.server 0,0625 MiB/Token, unter
+  # mlx_vlm.server mit --kv-bits 8 nur 0,0332. Beide Zahlen sind gemessen, beide
+  # stehen im Register, und dieser Parameter waehlt die richtige aus, statt eine
+  # davon still auf den anderen Fall zu uebertragen.
+  [ -n "$kv_modellname" ] || kv_modellname="$modell_basisname"
   # Die beiden zusaetzlichen Schalter, gemeinsam fuer beide Buchungsarten unten:
   # --kv-quant sagt der Buchung, womit der Motor gleich faehrt (NACHTRAG 11),
   # --auf-eigene-gefahr ist der Weg des Menschen an einer Ablehnung vorbei
@@ -1814,7 +2391,7 @@ belegung_nehmen() {
   # mit: sie gehen bei dieser Buchungsart NICHT in die Spitze ein, stehen aber
   # im Buch und sind damit das, was `status` als gebuchten Kontext anzeigt.
   if [ -n "$metal_fraktion" ]; then
-    set -- nimm --metal-fraktion "$metal_fraktion" --modell "$modell_basisname" \
+    set -- nimm --metal-fraktion "$metal_fraktion" --modell "$kv_modellname" \
       --parallel "$parallel" --kontext "$kontext" \
       --zweck "$zweck" --frist "$frist_min" ${zusatz[@]+"${zusatz[@]}"}
     local mf_out mf_rc
@@ -1841,17 +2418,62 @@ belegung_nehmen() {
     return 1
   fi
 
-  set -- nimm --gewichte-gb "$gewichte_gb" --modell "$modell_basisname" \
-    --parallel "$parallel" --kontext "$kontext" \
+  # BASISSTROM STATT --nur-gewichte (Nachtrag 2026-09-08, ZWEITE RUNDE, Auftrag
+  # "buchung", Entwurfsentscheidung zu Risiko 10 -- loest damit auch Risiko 6):
+  #
+  # URSPRUENGLICHE FASSUNG (erste Runde -- --nur-gewichte bleibt in wb-belegung
+  # implementiert und getestet, wird hier ab jetzt aber NICHT mehr benutzt):
+  # "Der Serverstart bucht ab jetzt NUR NOCH Gewichte (+ Entwerfer + Cache), NIE
+  # eine Strom-KV-Zahl fuer den Aufrufer stellvertretend mit -- jeder Strom wird
+  # vom Worker, der ihn faehrt, einzeln gebucht." Das liess GENAU EINEN
+  # Verbraucherkreis aus: jeden Aufrufer, der KEIN pi-Worker ist und deshalb nie
+  # selbst bucht -- der grug-server-Weg, wb-modell-proxy, der
+  # brain-contradict-Richter, ein blanker curl-Aufruf (Risiko 10). Deren
+  # KV-Bedarf stand in KEINER Buchung -- Grenze A/B unterschaetzten die reale
+  # Spitze um genau diesen Anteil, die gefaehrliche Richtung.
+  #
+  # KORREKTUR: der Serverstart bucht Gewichte + Entwerfer + Cache + EINEN
+  # Basisstrom -- --parallel FEST AUF 1 (nicht $parallel: das ist die reale
+  # --decode-concurrency und kann bei einem Kapazitaets-Neustart groesser
+  # sein), gehalten vom PROZESS (siehe 'uebernehmen --pid'/--prozess-haelt
+  # weiter unten). Dieser eine Strom deckt Richter/Proxy/curl, die selbst nie
+  # buchen. Jeder pi-Worker bucht WEITERHIN seinen eigenen Strom obendrauf
+  # (unveraendert, "Eigene Sequenz buchen" in pi-worker) -- der ERSTE Worker
+  # gegen einen frischen Server ist damit rechnerisch um einen Strom
+  # UEBERBUCHT (Basisstrom + sein eigener, obwohl nur einer wirklich laeuft).
+  # Bewusst so: zu viel buchen ist die sichere Richtung, ein ungebuchter
+  # Nicht-Worker-Verbraucher waere die gefaehrliche.
+  #
+  # KAPAZITAETSRECHNUNG (Risiko 10, dokumentiert wie verlangt): der Basisstrom
+  # zaehlt NICHT in die reale --decode-concurrency-Sizing-Entscheidung
+  # (gebuchte_sequenzen_summe() unten schliesst die Server-eigene Buchung ueber
+  # ihren zweck aus, siehe dort und kapazitaet_pruefen()) -- er ist ein
+  # WB-BELEGUNG-Speicherposten, kein Slot, der Workern weggenommen wird. Ein
+  # Nicht-Worker-Request, der GLEICHZEITIG mit allen gebuchten Worker-Stroemen
+  # eintrifft, wird vom echten Server QUEUED statt sofort bedient (dieselbe
+  # "langsamer statt falsch"-Richtung wie bei 'neustart=abgelehnt', siehe
+  # pi-worker) -- ein Durchsatz-, kein Speicherproblem: die reale Speicherspitze
+  # bleibt innerhalb dessen, was --decode-concurrency ohnehin zulaesst, plus dem
+  # einen zusaetzlich GEBUCHTEN (nicht real parallel laufenden) Basisstrom als
+  # Sicherheitsmarge.
+  set -- nimm --gewichte-gb "$gewichte_gb" --modell "$kv_modellname" \
+    --parallel 1 --kontext "$kontext" \
     --zweck "$zweck" --frist "$frist_min" ${zusatz[@]+"${zusatz[@]}"}
   if [ -n "$draft_gewichte_gb" ]; then
     set -- "$@" --gewichte-entwerfer-gb "$draft_gewichte_gb"
   fi
   # Prompt-Cache (Nachtrag 8, auf den DECKEL umgestellt in Nachtrag 16) --
   # derselbe Grundsatz wie bei den Entwerfer-Gewichten oben: ein eigenes,
-  # sichtbares Feld statt vorab in gewichte_gb hineingerechnet.
+  # sichtbares Feld statt vorab in gewichte_gb hineingerechnet. cache_ist_exakt
+  # (Nachtrag 2026-09-08, siehe oben): --prompt-cache-exakt-gb statt
+  # --prompt-cache-gb, kein PROMPT_CACHE_DECKEL_FAKTOR fuer eine bereits exakt
+  # berechnete Zuteilung (APC).
   if [ -n "$cache_gib" ] && [ "$cache_gib" != "0" ]; then
-    set -- "$@" --prompt-cache-gb "$cache_gib"
+    if [ "$cache_ist_exakt" = "1" ]; then
+      set -- "$@" --prompt-cache-exakt-gb "$cache_gib"
+    else
+      set -- "$@" --prompt-cache-gb "$cache_gib"
+    fi
   fi
   local nimm_out nimm_rc
   nimm_out="$("$wbb" "$@" 2>&1)"
@@ -1912,21 +2534,108 @@ belegung_freigeben() {
     err "WARNUNG: Belegung $kennung liess sich NICHT freigeben (beide Versuche gescheitert) — sie steht weiter im Buch, bis ihre Frist verfaellt. Kennungsdatei bleibt bewusst stehen: $KENNUNG_DATEI. Von Hand pruefen: wb-belegung wer / wb-belegung gib $kennung --fremd"
     return 1
   fi
-  if "$wbb" gib --eigene 2>&1; then
+  # Rueckfall OHNE Kennungsdatei (Nachtrag 2026-09-08, ZWEITE RUNDE, Auftrag
+  # "buchung", Befund 2): NIE MEHR 'wb-belegung gib --eigene' -- das traf
+  # JEDE Belegung ohne Pane, egal wem oder welchem Port sie gehoert. GEMESSEN:
+  # ein 'stop' ohne Kennungsdatei konnte so die Gewichtebuchung eines voellig
+  # FREMDEN, Prozess-gehaltenen Servers treffen (der hat per Definition kein
+  # Pane, siehe wb-belegungs Kopfkommentar "EIN PROZESS KANN AUCH DER HALTER
+  # SEIN"). Stattdessen nur Belegungen, deren zweck die eigene Port-Marke
+  # traegt -- dieselbe Abfrage wie belegungen_dieses_ports_freigeben() oben
+  # (_port_marke_kennungen), eng genug, um garantiert nur DIESEN Port zu
+  # treffen, nie einen anderen.
+  local ids
+  ids="$(_port_marke_kennungen "$wbb")"
+  if [ -z "$ids" ]; then
+    # Nichts da, war schon leer -- kein Fehler. Trotzdem als Zustand nach
+    # aussen tragen (Rueckgabe 1), damit ein Aufrufer, der es pruefen will,
+    # es auch kann; es warnt nur derjenige, der wirklich etwas freigeben
+    # wollte (kennung war gesetzt, oben).
+    return 1
+  fi
+  local id ok=1
+  for id in $ids; do
+    if "$wbb" gib "$id" 2>&1 || "$wbb" gib "$id" --fremd 2>&1; then
+      :
+    else
+      err "WARNUNG: Belegung '$id' (Port $PORT) liess sich NICHT freigeben. Von Hand: wb-belegung gib $id --fremd"
+      ok=0
+    fi
+  done
+  [ "$ok" -eq 1 ]
+}
+
+# belegung_freigeben_gezielt (Nachtrag 2026-09-08, Auftrag "buchung", Befund 2):
+# gibt GENAU die uebergebene Kennung frei, NIE einen Pane-weiten Fallback
+# ("wb-belegung gib --eigene"). Fuer den einen Moment im Kapazitaets-Neustart,
+# in dem im SELBEN Pane bereits eine neue, andere Buchung offen steht
+# ($BELEGUNG_KENNUNG) -- ein Fallback auf --eigene wuerde genau diese neue
+# Buchung mit abraeumen, weil beide demselben Pane gehoeren. Das war die
+# Ursache des Befunds: fehlte die Kennungsdatei des ALTEN Servers (z.B. weil er
+# ohne wb-belegung gestartet wurde, oder weil belegung_freigeben() ganz normal
+# ohne Argument aufgerufen worden waere), fiel die alte Freigabe auf --eigene
+# zurueck und loeschte die BRANDNEUE Buchung gleich mit -- N Worker ohne
+# Buchung, waehrend der (fehlgeschlagene oder erfolgreiche) neue Start
+# weiterlaeuft. Leere Kennung (der alte Server hatte gar keine eigene, im Buch
+# nachweisbare Buchung): nichts zu tun, KEIN Fallback, das ist die sichere
+# Richtung.
+belegung_freigeben_gezielt() {   # <kennung>
+  local kennung="$1" wbb
+  [ -n "$kennung" ] || return 0
+  wbb="$(belegung_bin)"
+  [ -n "$wbb" ] || return 0
+  if "$wbb" gib "$kennung" 2>&1 || "$wbb" gib "$kennung" --fremd 2>&1; then
     return 0
   fi
-  # Exit 1 von '--eigene' heisst haeufig nur "nichts da, war schon leer" --
-  # kein Fehler. Trotzdem als Zustand nach aussen tragen (Rueckgabe 1), damit
-  # ein Aufrufer, der es pruefen will, es auch kann; es warnt nur derjenige,
-  # der wirklich etwas freigeben wollte (kennung war gesetzt, oben).
+  err "WARNUNG: Belegung $kennung (alter Server) liess sich NICHT freigeben -- sie steht weiter im Buch, bis ihre Frist verfaellt. Von Hand pruefen: wb-belegung wer / wb-belegung gib $kennung --fremd"
   return 1
 }
 
-belegung_abbrechen() {
+belegung_abbrechen() {   # [--pid <halb-gestartete-pid>] [--kennungsdatei-behalten]
+  # Erweitert 2026-09-08, Auftrag "buchung", Befund 3/4, Risiko 12:
+  #   --pid <n>                    ein wirklich exec'ter, aber nie gesund gewordener
+  #                                 Prozess wird beendet statt als Karteileiche
+  #                                 weiterzulaufen (Befund 3, zweite Haelfte: bisher
+  #                                 blieb er unbeaufsichtigt stehen, unbebucht). Die
+  #                                 ERSTE Fassung schickte dafuer ein blankes 'kill'
+  #                                 OHNE jede Nachpruefung und gab die Buchung sofort
+  #                                 frei -- ignorierte einen Prozess, der SIGTERM
+  #                                 ignoriert (ZWEITE RUNDE, Risiko 12). Jetzt ueber
+  #                                 dieselbe TERM-warten-KILL-nachweisen-Folge wie ein
+  #                                 regulaerer Stopp (_prozess_beenden_verifiziert,
+  #                                 siehe dort), und die Buchung wird ERST NACH
+  #                                 bestaetigtem Tod freigegeben -- "Speicher-
+  #                                 Untergrenze ist die gefaehrliche Richtung": bleibt
+  #                                 der Tod unbestaetigt, bleibt auch die Buchung
+  #                                 stehen, statt einen moeglicherweise noch
+  #                                 verbrauchten Speicherposten verschwinden zu lassen.
+  #   --kennungsdatei-behalten     $KENNUNG_DATEI NICHT loeschen -- fuer den einen
+  #                                 Fall (Kapazitaets-Neustart, alter Server liess
+  #                                 sich nicht stoppen), in dem die Datei noch
+  #                                 korrekt auf den ALTEN, weiterhin laufenden
+  #                                 Server zeigt (Befund 4: das unbedingte 'rm -f'
+  #                                 loeschte bisher genau diesen gueltigen Verweis).
+  local pid_beenden="" kennungsdatei_anfassen=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pid) pid_beenden="${2:-}"; shift 2 ;;
+      --kennungsdatei-behalten) kennungsdatei_anfassen=0; shift ;;
+      *) shift ;;
+    esac
+  done
+  local prozess_tot=1
+  if [ -n "$pid_beenden" ]; then
+    if _prozess_beenden_verifiziert "$pid_beenden"; then
+      err "Halb gestarteter Server (PID $pid_beenden) beendet -- der Start ist gescheitert, kein unbeaufsichtigter Prozess bleibt zurueck."
+    else
+      err "WARNUNG: halb gestarteter Server (PID $pid_beenden) liess sich NICHT sicher beenden -- die Buchung bleibt STEHEN, weil er moeglicherweise noch Speicher verbraucht. Von Hand pruefen: ps -p $pid_beenden, wb-belegung wer."
+      prozess_tot=0
+    fi
+  fi
   local wbb; wbb="$(belegung_bin)"
-  if [ -n "$wbb" ] && [ -n "$BELEGUNG_KENNUNG" ]; then
+  if [ -n "$wbb" ] && [ -n "$BELEGUNG_KENNUNG" ] && [ "$prozess_tot" -eq 1 ]; then
     "$wbb" gib "$BELEGUNG_KENNUNG" 2>&1
-    rm -f "$KENNUNG_DATEI"
+    [ "$kennungsdatei_anfassen" -eq 1 ] && rm -f "$KENNUNG_DATEI"
   fi
   return 1
 }
@@ -1973,15 +2682,21 @@ cmd_status() {
     # teilen sich zwei Eintraege denselben modelRef (Ziel mit und ohne
     # Entwerfer), waere die Kennung/Alias-Aufloesung mehrdeutig -- der
     # tatsaechliche Entwerferzustand des LAUFENDEN Prozesses ist es nicht.
-    local laufender_draft; laufender_draft="$(laufender_draft_pfad "$pid")"
-    if [ -n "$laufender_draft" ]; then
-      # Ein lebender Entwerferpfad kommt heute ausschliesslich vom
+    local laufender_draft laufender_mot; laufender_draft="$(laufender_draft_pfad "$pid")"
+    laufender_mot="$(laufender_motor "$pid")"
+    if [ -n "$laufender_draft" ] && [ "$laufender_mot" = "mlx-vlm" ]; then
+      # motor=mlx-vlm (Nachtrag 22, 2026-08-27) -- eigener Motor, kennt
+      # --draft-kind explizit (dflash/eagle3/mtp), --parallel meint hier
+      # --max-num-seqs (gleichzeitige Dekodierung, ungemessen mit Entwerfer).
+      echo "  Entwerfer: $laufender_draft (mlx_vlm.server, --draft-kind, spekulatives Decoding aktiv)"
+    elif [ -n "$laufender_draft" ]; then
+      # Ein lebender Entwerferpfad kommt sonst ausschliesslich vom
       # motor=mlx-dspark-Zweig (Nachtrag 7) -- mlx_lm.servers eigener
       # --draft-model-Weg ist retired (Null-Resultat). --parallel meint hier
       # "N gleichzeitig vorgehaltene Praefixe" (--prefix-cache-slots), nicht
       # gleichzeitige Dekodierung.
       echo "  Entwerfer: $laufender_draft (mlx-dspark, spekulatives Decoding aktiv, --parallel = Prompt-Cache-Plaetze)"
-    elif [ "$(laufender_motor "$pid")" = "mtplx" ]; then
+    elif [ "$laufender_mot" = "mtplx" ]; then
       # motor=mtplx (Nachtrag 8) -- kein SEPARATER Entwerferpfad, der
       # MTP-Kopf steckt im geladenen Modellkoerper selbst.
       echo "  Vorhersage: eingebaut (mtplx, natives MTP im Modellkoerper, --scheduler-mode serial -- Buendelung nicht verfuegbar)"
@@ -2025,7 +2740,32 @@ for b in d.get("belegungen", []):
   fi
   echo "wb-mlx-server: nicht aktiv (Port $PORT frei)"
   if [ -n "$kennung" ]; then
-    echo "  ACHTUNG: Belegung $kennung ist noch eingetragen, obwohl der Server nicht laeuft (wb-belegung wer / wb-belegung gib $kennung)."
+    # Erst nachsehen, ob die Belegung ueberhaupt noch im Buch steht. Die
+    # Kennungsdatei bleibt liegen, wenn der Server abgestuerzt ist oder jemand
+    # die Belegung von Hand freigegeben hat -- dann ist der Rat 'wb-belegung gib
+    # <kennung>' falsch und laeuft ins Leere (gemessen 2026-08-29, nach einem
+    # Neustart des Rechners: Buch leer, Datei da, status riet trotzdem zum gib).
+    # status aendert bewusst nichts; aufgeraeumt wird beim naechsten 'ensure'.
+    kennung_im_buch=""
+    wbb_status="$(belegung_bin 2>/dev/null)"
+    if [ -n "$wbb_status" ]; then
+      kennung_im_buch="$("$wbb_status" wer --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for b in d.get("belegungen", []):
+    if b.get("id") == sys.argv[1]:
+        print("ja")
+        break
+' "$kennung" 2>/dev/null)"
+    fi
+    if [ "$kennung_im_buch" = "ja" ]; then
+      echo "  ACHTUNG: Belegung $kennung ist noch eingetragen, obwohl der Server nicht laeuft (wb-belegung wer / wb-belegung gib $kennung)."
+    else
+      echo "  Hinweis: Kennungsdatei traegt noch '$kennung', im Buch steht sie nicht mehr -- Karteileiche, der naechste 'ensure' verwirft sie."
+    fi
   fi
   return 1
 }
@@ -2058,10 +2798,16 @@ PY
 }
 
 # ── ensure ───────────────────────────────────────────────────────────────────
-_stop_pruefen_und_beenden() {
-  # Beendet, was auf $PORT laeuft, und PRUEFT das Ende (Prozess weg, Port
-  # frei) statt es anzunehmen -- dieselbe Pruefung wie `stop` heute, geteilt
-  # zwischen `cmd_stop` und dem Modellwechsel in `cmd_ensure`.
+# _prozess_beenden_verifiziert (Nachtrag 2026-09-08, ZWEITE RUNDE, Auftrag
+# "buchung", Risiko 12): aus _stop_pruefen_und_beenden herausgezogen, damit
+# belegung_abbrechen --pid dieselbe TERM-warten-KILL-nachweisen-Folge nutzt,
+# statt eines blanken 'kill' ohne jede Nachpruefung (siehe dort). Prueft NUR
+# den Prozess, nicht den Port -- _stop_pruefen_und_beenden macht die
+# Port-Pruefung selbst, weil sie dort semantisch dazugehoert (ein anderer
+# Prozess koennte den Port schon wieder belegt haben); fuer einen halb
+# gestarteten, nie gesund gewordenen Prozess ist "lebt er noch" die einzige
+# Frage, die belegung_abbrechen braucht.
+_prozess_beenden_verifiziert() {   # <pid> -> 0 wenn nachweislich tot, 1 wenn er noch lebt
   local pid="$1"
   kill "$pid" 2>/dev/null
   local waited=0
@@ -2077,18 +2823,157 @@ _stop_pruefen_und_beenden() {
     err "PID $pid laeuft immer noch — Beenden fehlgeschlagen."
     return 1
   fi
+  return 0
+}
+
+_stop_pruefen_und_beenden() {   # <pid> [<gezielte-kennung-des-halters, auch leer>]
+  # Beendet, was auf $PORT laeuft, und PRUEFT das Ende (Prozess weg, Port
+  # frei) statt es anzunehmen -- dieselbe Pruefung wie `stop` heute, geteilt
+  # zwischen `cmd_stop` und dem Modellwechsel in `cmd_ensure`.
+  #
+  # <gezielte-kennung> (Nachtrag 2026-09-08, Auftrag "buchung", Befund 2, IN
+  # DER ZWEITEN RUNDE KORRIGIERT -- Befund 3): wird ein ZWEITES Argument
+  # UEBERGEBEN (auch eine LEERE Zeichenkette), gilt der gezielte Modus: NUR
+  # diese eine Kennung wird freigegeben (belegung_freigeben_gezielt), NIE der
+  # Datei/--eigene-Fallback von belegung_freigeben. Eine leere gezielte
+  # Kennung heisst dort "nichts freizugeben", NIE "zurueckfallen" --
+  # belegung_freigeben_gezielt("") ist selbst schon ein no-op. Die ERSTE
+  # Fassung dieser Funktion pruefte stattdessen nur "$gezielte_kennung"
+  # NICHT-LEER ist, und fiel bei einer leeren, aber ausdruecklich uebergebenen
+  # Kennung (der Kapazitaets-Neustart hat GENAU diesen Fall: der alte Server
+  # hatte keine eigene Buchung) auf belegung_freigeben() zurueck -- und DAS
+  # landet, mangels Kennungsdatei, wieder beim selben --eigene/Port-Fallback,
+  # der im selben Pane die brandneue Buchung ($BELEGUNG_KENNUNG) treffen kann.
+  # Der Unterschied "Argument gegeben, aber leer" gegen "kein Argument
+  # gegeben" ist deshalb absichtlich ueber die Argumentzahl geprueft, nicht
+  # ueber den Inhalt. Ohne ein zweites Argument (cmd_stop, gewoehnlicher
+  # Modellwechsel) bleibt das alte Verhalten unveraendert.
+  local pid="$1"
+  local gezielt_modus=0 gezielte_kennung=""
+  if [ $# -ge 2 ]; then
+    gezielt_modus=1
+    gezielte_kennung="$2"
+  fi
+  if ! _prozess_beenden_verifiziert "$pid"; then
+    return 1
+  fi
   local stillpid; stillpid="$(find_pid)"
   if [ -n "$stillpid" ]; then
     err "Prozess $pid ist weg, aber Port $PORT ist weiterhin belegt (PID $stillpid) — pruefen."
     return 1
   fi
   echo "wb-mlx-server: beendet — Prozess $pid weg, Port $PORT frei." >&2
-  belegung_freigeben
+  if [ "$gezielt_modus" -eq 1 ]; then
+    belegung_freigeben_gezielt "$gezielte_kennung"
+  else
+    belegung_freigeben
+  fi
   return 0
 }
 
 cmd_ensure() {
   local eingabe="" kontext_arg="" frist_min="$BELEGUNG_FRIST_MIN_VORGABE" parallel_arg=""
+  # Nachtrag 2026-09-08 (siehe kapazitaet_pruefen() oben): gesetzt, wenn dieser
+  # Aufruf den laufenden Server NICHT wiederverwendet hat, weil er keinen
+  # weiteren Strom mehr trug -- der Aufrufer (pi-worker) soll das melden
+  # koennen, statt einen stillen Neustart fuer ein "kein Start noetig" zu halten.
+  local KAPAZITAETS_NEUSTART=0
+  # Nachtrag 2026-09-08, DRITTE RUNDE, Gegenleser-Befund Punkt 9/11: die PID
+  # des ALTEN Servers, dessen Kapazitaet nicht mehr reicht -- aufgehoben, um
+  # ihn ERST NACH einer erfolgreichen neuen Buchung zu stoppen (Rollback-
+  # Sicherheit, siehe unten bei belegung_nehmen). Leer heisst "kein
+  # Kapazitaets-Neustart im Gange".
+  local KAPAZITAETS_ALTER_PID=""
+  # KAPAZITAETS_ALTE_KENNUNG (Nachtrag 2026-09-08, Auftrag "buchung", Befund 2):
+  # die Kennung, unter der der ALTE Server seine EIGENE Gewichtebuchung haelt --
+  # aus $KENNUNG_DATEI gelesen, BEVOR irgendetwas sie anfasst. Damit laesst sich
+  # der alte Server spaeter GEZIELT ueber diese eine Kennung freigeben
+  # (belegung_freigeben_gezielt), statt auf 'wb-belegung gib --eigene'
+  # zurueckzufallen, sobald die Datei aus irgendeinem Grund fehlt -- --eigene
+  # gibt ALLE Buchungen dieses Panes frei, und genau in diesem Pane steht zu
+  # diesem Zeitpunkt bereits die BRANDNEUE Buchung fuer den Neustart (siehe
+  # cmd_ensure weiter unten). Leer heisst: der alte Server hatte gar keine
+  # eigene, im Buch nachweisbare Buchung (z.B. mit WB_MLX_SERVER_OHNE_BELEGUNG
+  # gestartet) -- dann gibt es dort auch nichts freizugeben.
+  local KAPAZITAETS_ALTE_KENNUNG=""
+  # Nachtrag 2026-09-08, VIERTE RUNDE, Auftrag (C), VORGABE GEAENDERT IN DER
+  # FUENFTEN RUNDE: der Messlauf (Ergebnis motor-ab, 20260908-220231.md) hat
+  # entschieden -- mlx-vlm 0.7.0 + mtp-kopf + APC wird Vorgabe fuer Worker.
+  # "auto" (Vorgabe ohne --apc/WB_MLX_SERVER_APC) heisst: APC an, SOBALD die
+  # Fassung >= 0.7.0 ist, sonst aus -- OHNE WARNUNG (die Fassung ist dann
+  # einfach zu alt, das ist kein Fehler des Aufrufers, der nichts verlangt
+  # hat). "1" (--apc oder WB_MLX_SERVER_APC=1) ist der ausdrueckliche Wunsch:
+  # zu alt bedeutet dort weiterhin eine LAUTE Warnung (siehe apc_aktiv weiter
+  # unten). "0" (WB_MLX_SERVER_APC=0) bleibt der ausdrueckliche Verzicht,
+  # unabhaengig von der Fassung.
+  local apc_gewuenscht="${WB_MLX_SERVER_APC:-auto}"
+  # NACHTRAG 2026-09-08, Auftrag "buchung", Kleinkram-Befund "WB_MLX_SERVER_APC
+  # schluckt true/yes/on als aus": die Pruefung weiter unten (apc_aktiv) kennt
+  # NUR 'auto'/'1'/'0' -- jeder andere Wert (z.B. 'true', 'yes', 'on', ein
+  # Tippfehler) traf bisher WEDER die "an"- noch die "Warnung, zu alt"-Bedingung
+  # und blieb dadurch STILL auf AUS, ohne jede Fehlermeldung. Wer WB_MLX_SERVER_
+  # APC=true setzt, in der (falschen) Annahme, das schalte APC ein, bekam keinen
+  # Hinweis, dass APC gerade NICHT lief. Ab jetzt ein harter Fehler statt einer
+  # stillen Fehldeutung.
+  case "$apc_gewuenscht" in
+    auto|1|0) ;;
+    *)
+      echo "wb-mlx-server: WB_MLX_SERVER_APC='$apc_gewuenscht' ist ungueltig -- erlaubt sind 'auto', '1' oder '0'. Andere Werte (z.B. 'true'/'yes'/'on') wuerden APC still als AUS behandeln, ohne Fehlermeldung -- genau das soll dieser Fehler verhindern." >&2
+      exit 2 ;;
+  esac
+  # NACHTRAG 2026-09-10, Auftrag "apcspeicher": Speicher des APC bei langen
+  # Gespraechen. qwen38-27b ist ein Hybridmodell, mlx_vlm haelt seinen Cache
+  # deshalb als ganze Schnappschuesse (exact/checkpoint-Modus), und im
+  # buendelnden Weg legt JEDE Anfrage zwei davon an (Wachpunkt bei N-1 und den
+  # vollen Prompt), jede mit drei Kopien der Schluessel und Werte. Bei 60k Token
+  # lag der Server damit bei 40-43 GB und starb am Metal-Speichermangel.
+  # Die Knoepfe (alle werden in den Bloecken unten direkt aus der Umgebung
+  # gelesen, nicht ueber Locals -- test-mlx-server-mlx-vlm-070.sh fuehrt die
+  # Bloecke einzeln aus):
+  #   WB_MLX_SERVER_APC_EINTRAEGE   Schnappschuesse im Speicher (APC_EXACT_CACHE_ENTRIES);
+  #                                 Vorgabe: einer je Strom mit Patch, sonst 2
+  #   WB_MLX_SERVER_APC_SCHLANK     Vorgabe 1 (seit 2026-09-10, Messreihe im Auftrag
+  #                                 "apcspeicher"), 0 = Verhalten von mlx_vlm.
+  #                                 ein Schnappschuss je Anfrage, eine Kopie, Platz
+  #                                 vorher freigeraeumt; eine fertige Anfrage gibt
+  #                                 ihren Cache sofort frei statt erst nach dem
+  #                                 naechsten Prefill -- braucht den Patch
+  #                                 shell/messungen/apc-speicher/patch-apc-speicher.py
+  #   WB_MLX_SERVER_APC_SNAPSHOT_BITS=8  Schnappschuss 8-bittig ablegen (nie weniger)
+  #   WB_MLX_SERVER_APC_MEMLOG=1    Speicherzeilen "APC-WB" ins Serverprotokoll
+  #   WB_MLX_SERVER_APC_DISK=<pfad> Schnappschuesse zusaetzlich auf die SSD
+  #                                 (WB_MLX_SERVER_APC_DISK_GB, Vorgabe 64)
+  # Hier nur die Pruefung, damit ein Tippfehler vor dem Laden scheitert und nicht
+  # still als Vorgabe gilt (derselbe Grund wie bei WB_MLX_SERVER_APC oben).
+  case "${WB_MLX_SERVER_APC_EINTRAEGE:-2}" in
+    ''|*[!0-9]*)
+      echo "wb-mlx-server: WB_MLX_SERVER_APC_EINTRAEGE='${WB_MLX_SERVER_APC_EINTRAEGE:-}' ist ungueltig -- erlaubt ist eine ganze Zahl ab 0." >&2
+      exit 2 ;;
+  esac
+  case "${WB_MLX_SERVER_APC_SCHLANK:-1}" in
+    0|1) ;;
+    *)
+      echo "wb-mlx-server: WB_MLX_SERVER_APC_SCHLANK='${WB_MLX_SERVER_APC_SCHLANK:-}' ist ungueltig -- erlaubt sind '0' oder '1'." >&2
+      exit 2 ;;
+  esac
+  case "${WB_MLX_SERVER_APC_SNAPSHOT_BITS:-}" in
+    ''|8) ;;
+    *)
+      echo "wb-mlx-server: WB_MLX_SERVER_APC_SNAPSHOT_BITS='${WB_MLX_SERVER_APC_SNAPSHOT_BITS:-}' ist ungueltig -- erlaubt ist nur 8 (unter 8 Bit wird nie quantisiert, Hausregel)." >&2
+      exit 2 ;;
+  esac
+  # WB_MLX_SERVER_APC_POOL_GB: Deckel fuer MLXs Vorrat freigegebener Puffer in GiB
+  # (Vorgabe 0 = kein Deckel; ein Deckel kostet Dekodierrate), siehe den exec-Zweig.
+  case "${WB_MLX_SERVER_APC_POOL_GB:-0}" in
+    ''|*[!0-9.]*|.*|*.*.*)
+      echo "wb-mlx-server: WB_MLX_SERVER_APC_POOL_GB='${WB_MLX_SERVER_APC_POOL_GB:-}' ist ungueltig -- erlaubt ist eine Zahl in GiB, 0 schaltet den Deckel ab." >&2
+      exit 2 ;;
+  esac
+  # apc_aktiv/model_discovery_ok/MLX_VLM_BIN/MLX_VLM_VERSION/MLX_VLM_AB_070:
+  # von der mlx-vlm-Ausfuehrbarkeitspruefung weiter unten gesetzt, hier nur
+  # vorab deklariert (lokal, wie der Rest dieser Funktion).
+  local apc_aktiv=0 model_discovery_ok=0
+  local MLX_VLM_BIN="" MLX_VLM_VERSION="" MLX_VLM_AB_070=0
   # NACHTRAG 12 (2026-08-21): der Weg des MENSCHEN an der Buchung vorbei. Er ist
   # bewusst NUR eine Befehlszeilenoption und ausdruecklich KEINE Umgebungsvariable
   # (anders als WB_MLX_SERVER_OHNE_BELEGUNG daneben, das jeder Agent beilaeufig
@@ -2125,6 +3010,14 @@ cmd_ensure() {
           ''|*[!0-9]*|0) echo "wb-mlx-server: --parallel braucht eine Zahl ab 1" >&2; exit 2 ;;
         esac
         parallel_arg="$2"; shift 2 ;;
+      --apc)
+        # Nachtrag 2026-09-08, VIERTE RUNDE, Auftrag (C): APC (Automatic
+        # Prefix Cache) existiert erst ab mlx-vlm 0.7.0 und wirkt NUR auf den
+        # Motor mlx-vlm -- ausserhalb davon wirkungslos, siehe apc_aktiv weiter
+        # unten fuer die Versionspruefung. WB_MLX_SERVER_APC=1 ist derselbe
+        # Schalter fuer wb-code/pi-worker, die keine eigene Befehlszeilenoption
+        # an 'ensure' durchreichen (Muster wie WB_MLX_SERVER_DECODE_PARALLEL).
+        apc_gewuenscht=1; shift ;;
       --*) echo "wb-mlx-server: unbekannte Option '$1'" >&2; exit 2 ;;
       *)
         if [ -n "$eingabe" ]; then echo "wb-mlx-server: nur ein Modell je Aufruf" >&2; exit 2; fi
@@ -2164,6 +3057,20 @@ cmd_ensure() {
 
   resolve_modell "$eingabe" || return 1
   local MODEL_PATH="$RES_PATH"
+  # NACHTRAG 2026-09-08, Auftrag "buchung", Kleinkram-Befund "HF_HUB_CACHE mkdir
+  # ohne Erfolgspruefung, Leerheit ungeprueft": die ganze Isolation gegen einen
+  # ECHTEN, moeglicherweise fremdbelegten HF-Cache (siehe HF_HUB_CACHE_LEER oben)
+  # setzt voraus, dass dieses Verzeichnis wirklich existiert UND leer ist -- ein
+  # stillschweigend gescheitertes mkdir oder ein Verzeichnis, in das zwischenzeitlich
+  # doch etwas geschrieben wurde, hebelt die Isolation lautlos aus. Beides bricht
+  # den Start NICHT ab (dieselbe Haltung wie ueberall in dieser Datei: eine
+  # fehlende Bremse ist schlechter als keine, aber ein verhinderter Start ist es
+  # auch), meldet sich aber laut.
+  if ! mkdir -p "$HF_HUB_CACHE_LEER" 2>/dev/null; then
+    err "WARNUNG: HF_HUB_CACHE-Verzeichnis liess sich nicht anlegen ($HF_HUB_CACHE_LEER) -- der Start laeuft trotzdem, aber OHNE die Isolation gegen einen fremdbelegten HF-Cache (siehe Kopfkommentar HF_HUB_CACHE)."
+  elif [ -n "$(ls -A "$HF_HUB_CACHE_LEER" 2>/dev/null)" ]; then
+    err "WARNUNG: HF_HUB_CACHE-Verzeichnis ist NICHT leer ($HF_HUB_CACHE_LEER) -- die Isolation gegen einen fremdbelegten HF-Cache gilt nur, solange es leer bleibt. Von Hand pruefen, was dort liegt."
+  fi
 
   # MOTORWAHL (Nachtrag 7, siehe Kopfkommentar): der Aufrufer (wb-code/
   # pi-worker) hat die Registry (Feld `vorhersage`) UND seine eigene
@@ -2173,6 +3080,16 @@ cmd_ensure() {
   local vorh_bauart="$VORHERSAGE_BAUART_VORGABE"
   local vorh_modell="$VORHERSAGE_MODELL_VORGABE"
   local vorh_gewichte_gb="$VORHERSAGE_GEWICHTE_GB_VORGABE"
+  # draftKind/draftBlockSize (Nachtrag 22, siehe Kopfkommentar FUENFTER MOTOR):
+  # nur gesetzt, wenn ein Aufrufer sie kennt (kuenftige wb-code/pi-worker-
+  # Fassungen) ODER die Registry-Suche gleich unten sie liefert. Ein AELTERER
+  # Aufrufer, der WB_MLX_SERVER_VORHERSAGE_BAUART/_MODELL schon selbst gesetzt
+  # hat (VORHERSAGE_GENANNT=1) aber das neue Feld noch nicht kennt, bekommt
+  # hier bewusst NICHTS nachgereicht -- er hat den Weg bereits gewaehlt, siehe
+  # der Vorrang-Grundsatz oben ("die Umgebungsvariable behaelt den Vorrang").
+  # Leer heisst dann: derselbe alte mlx-dspark-Weg wie vor diesem Nachtrag.
+  local vorh_draftkind="$VORHERSAGE_DRAFTKIND_VORGABE"
+  local vorh_draftblocksize="$VORHERSAGE_DRAFTBLOCKSIZE_VORGABE"
   # DIE REGISTRY ANTWORTET, WENN NIEMAND GEFRAGT WURDE (Nachtrag 15, 2026-08-21).
   # Bis heute las dieses Skript `vorhersage` gar nicht; es verliess sich darauf,
   # dass wb-code/pi-worker es tun. Fuer JEDEN anderen Aufrufer -- ein Mensch am
@@ -2195,17 +3112,20 @@ cmd_ensure() {
   # die Felder auf oberster Ebene -- der Aufruf ohne Option verhaelt sich also
   # genau wie vor dem 21.08.
   if [ "$VORHERSAGE_GENANNT" -eq 0 ]; then
-    local reg_bauart reg_modell reg_gewichte reg_label reg_warnung reg_felder
+    local reg_bauart reg_modell reg_gewichte reg_label reg_warnung reg_felder reg_draftkind reg_draftblocksize
     reg_felder="$(vorhersage_weg_waehlen "$vorhersage_weg")"
     reg_bauart="$(printf '%s' "$reg_felder" | cut -f1)"
     reg_modell="$(printf '%s' "$reg_felder" | cut -f2)"
     reg_gewichte="$(printf '%s' "$reg_felder" | cut -f3)"
     reg_label="$(printf '%s' "$reg_felder" | cut -f4)"
     reg_warnung="$(printf '%s' "$reg_felder" | cut -f5)"
+    reg_draftkind="$(printf '%s' "$reg_felder" | cut -f6)"
+    reg_draftblocksize="$(printf '%s' "$reg_felder" | cut -f7)"
     [ -n "$reg_warnung" ] && err "$reg_warnung"
     if [ -n "$reg_bauart" ] && [ -n "$reg_modell" ]; then
       vorh_bauart="$reg_bauart"; vorh_modell="$reg_modell"; vorh_gewichte_gb="$reg_gewichte"
-      err "Vorhersage aus der Registry uebernommen (bauart=$reg_bauart, Koerper '$reg_modell'${reg_label:+, Weg '$reg_label'}) -- der Aufrufer hat WB_MLX_SERVER_VORHERSAGE_BAUART nicht gesetzt. Wer sie ausdruecklich NICHT will, setzt die Variable leer."
+      vorh_draftkind="$reg_draftkind"; vorh_draftblocksize="$reg_draftblocksize"
+      err "Vorhersage aus der Registry uebernommen (bauart=$reg_bauart, Koerper '$reg_modell'${reg_label:+, Weg '$reg_label'}${reg_draftkind:+, draftKind=$reg_draftkind}) -- der Aufrufer hat WB_MLX_SERVER_VORHERSAGE_BAUART nicht gesetzt. Wer sie ausdruecklich NICHT will, setzt die Variable leer."
     elif [ -n "$vorhersage_weg" ]; then
       err "--vorhersage-weg '$vorhersage_weg' laeuft ins Leere: fuer '${RES_ID:-$MODEL_PATH}' fuehrt die Registry ueberhaupt keine Vorhersage. Der Server startet ohne."
     fi
@@ -2280,6 +3200,48 @@ cmd_ensure() {
     if [ -z "$vorh_modell" ]; then
       err "WB_MLX_SERVER_VORHERSAGE_BAUART=entwerfer gesetzt, aber WB_MLX_SERVER_VORHERSAGE_MODELL fehlt -- kein Entwerferpfad, kein Start mit Vorhersage. Laeuft als gewoehnliches Modell weiter."
       vorh_bauart=""
+    elif [ -n "$vorh_draftkind" ]; then
+      # FUENFTER MOTOR (Nachtrag 22, 2026-08-27) -- mlx_vlm.server. Waehlt sich
+      # NUR fuer einen Entwerfer-Weg, der eine Bauart nennt (draftKind aus der
+      # Registry): mlx_vlm kennt `--draft-kind {dflash,eagle3,mtp}` ausdruecklich
+      # -- unterscheidet also die Bauart des Entwerfers, was mlx-dspark nicht
+      # tut (dort nur "auto" gegen "--mode dflash", siehe dspark_ist_dflash_
+      # entwerfer). Ein Weg OHNE draftKind (dspark-diminfer, Modelltyp
+      # Qwen3DSparkModel, den mlx_vlm nicht kennt) bleibt beim mlx-dspark-Zweig
+      # oben.
+      #
+      # GEMESSEN, und zwar zweimal. Zuerst am Server allein (gleicher Prompt,
+      # ruhige Maschine, Tok/s kalt/warm): MTP-Kopf 24,19/21,70, MTPLX
+      # 22,92/18,69, DFlash2 21,83/20,55, DSpark 18,98 kalt. Diese Zahlen sind
+      # die Obergrenze, nicht der Alltag -- ein Worker erreicht sie nicht.
+      #
+      # Danach ueber ECHTE Worker, jeder frisch gespawnt, zwei gleich grosse
+      # Schreibauftraege (der erste kalt, der zweite warm im selben Gespraech),
+      # 2026-08-27:
+      #
+      #   Weg              Zusatz    Tok/s kalt/warm   Wanduhr kalt/warm
+      #   mtp-kopf         0,25 GB   19,1 / 20,3       256 s / 245 s
+      #   mtplx           19,83 GB   22,3 / 22,8       394 s / 315 s
+      #   dflash2          3,58 GB   17,6 / --          306 s / --
+      #   dspark-diminfer  3,46 GB   -- (kein Zaehler) 381 s / 345 s
+      #
+      # Der Sieger ist der MTP-Kopf, aber NICHT wegen der hoechsten Tok/s --
+      # die hat MTPLX. MTPLX braucht fuer dieselbe Aufgabe rund doppelt so
+      # viele Token (7438 statt 3487 im kalten, 6065 statt 3291 im warmen Lauf)
+      # und ist damit trotz hoeherer Rate in der WANDUHR langsamer, bei
+      # 19,83 statt 0,25 GB Zusatzgewicht. Wer Worker vergleicht, misst die
+      # Zeit bis zum fertigen Ergebnis, nicht die Token pro Sekunde.
+      #
+      # Zwei Luecken, offen: dflash2 hat keinen warmen Wert (der zweite Auftrag
+      # lief zweimal in "Error: 400 status code (no body)"), und mlx-dspark
+      # protokolliert ueberhaupt keine Rate, dort steht nur die Wanduhr.
+      motor="mlx-vlm"
+      vergleich_entwerfer="$vorh_modell"
+      err "Vorhersage aktiv: '${RES_ID:-$MODEL_PATH}' startet ueber mlx_vlm.server mit Entwerfer '$vorh_modell' (--draft-kind $vorh_draftkind${vorh_draftblocksize:+, --draft-block-size $vorh_draftblocksize}) -- UEBER ECHTE WORKER GEMESSEN 19,1/20,3 Tok/s kalt/warm fuer den MTP-Kopf. MTPLX erreicht zwar 22,3/22,8 Tok/s, braucht aber rund doppelt so viele Token fuer dieselbe Aufgabe und ist in der Wanduhr langsamer (315 s statt 245 s warm), bei 19,83 statt 0,25 GB Zusatzgewicht."
+      err "LUECKE, ungelöst: mlx_vlm.server hat KEIN Gegenstueck zu --chat-template-args/--reasoning-effort (siehe --help) -- die Denkstufen-Falle (Qwen3.8 ohne gesetzten reasoning_effort waehlt xhigh, siehe Kopfkommentar 'DENKSTUFEN-FALLE') ist auf diesem Motor NICHT geschlossen. --enable-thinking/--thinking-budget sind ein anderer Mechanismus (Ein/Aus plus Token-Deckel, keine Stufe 'low'/'xhigh')."
+      if [ "$parallel" -gt 1 ]; then
+        err "Vorhersage mit --parallel $parallel ueber mlx_vlm.server: GEMESSEN am 01.09.2026 (300 Token je Strom, gleiche Laenge erzwungen, Tok/s gesamt / je Strom) -- 1: 20,2/20,2  2: 32,1/16,0  3: 31,2/10,5  4: 30,8/7,7. Der Gewinn sitzt bei ZWEI Stroemen (+59 % gesamt), darueber bleibt die Gesamtrate stehen. Dafuer faellt --kv-bits weg (siehe Meldung beim Start), der KV-Cache kostet also das Doppelte."
+      fi
     else
       motor="mlx-dspark"
       vergleich_entwerfer="$vorh_modell"
@@ -2399,6 +3361,44 @@ cmd_ensure() {
     if [ "$laufend" = "$MODEL_PATH" ] && [ "$laufender_draft" = "$vergleich_entwerfer" ] \
        && [ "$(laufender_motor "$pid")" = "$motor" ] \
        && [ "$(laufender_kontext "$pid" "$laufend")" = "$kontext" ]; then
+      # KAPAZITAET, NICHT NUR IDENTITAET (Nachtrag 2026-09-08, siehe
+      # kapazitaet_pruefen() weiter oben fuer den gemessenen Anlass): dieselbe
+      # Bauart, derselbe Pfad, derselbe Kontext heisst noch nicht, dass noch
+      # PLATZ fuer einen weiteren gleichzeitigen Strom ist. Traegt der
+      # Server nicht mehr, faellt dieser Zweig NICHT in "kein Start noetig",
+      # sondern faellt durch in den Neustart-Pfad weiter unten -- mit
+      # decode_conc/prompt_conc/parallel schon auf die noetige Zahl angehoben.
+      local kap_basisname; kap_basisname="$(basename "$MODEL_PATH")"
+      local kap_zeile kap_ausreichend kap_benoetigt kap_laufend
+      kap_zeile="$(kapazitaet_pruefen "$pid" "$kap_basisname" "$parallel_arg")"
+      kap_ausreichend="${kap_zeile%% *}"
+      kap_zeile="${kap_zeile#* }"
+      kap_benoetigt="${kap_zeile%% *}"
+      kap_laufend="${kap_zeile#* }"
+      if [ "$kap_ausreichend" != ja ]; then
+        # EIGENER ZWEIG, NICHT DER "ANDERES MODELL LAEUFT"-PFAD (Gegenleser-
+        # Befund Punkt 9): derselbe Pfad haette B4 gegen ein Modell geprueft,
+        # das mit dem angeforderten IDENTISCH ist ("es laeuft 'X', angefordert
+        # 'X'"), und im Erfolgsfall den ALTEN Server VOR jeder neuen Buchung
+        # gestoppt (Punkt 11: kein Rollback, wenn die groessere Buchung dann
+        # abgelehnt wird). Stattdessen: KAPAZITAETS_NEUSTART=1 setzt den
+        # ganzen "Anderes Modell laeuft"-Block (B4, frueher Stopp) weiter unten
+        # ausdruecklich AUSSER KRAFT (siehe die Bedingung dort) -- der Ablauf
+        # geht direkt in die normale Motor-/Gewichte-Berechnung weiter, GENAU
+        # WIE BEI EINEM KALTSTART fuer dieses Modell, nur mit hoeherem
+        # --parallel. Gestoppt wird der alte Server ($pid, gemerkt als
+        # KAPAZITAETS_ALTER_PID) ERST NACH einer erfolgreichen neuen Buchung
+        # (siehe dort, direkt nach belegung_nehmen()) -- schlaegt die Buchung
+        # fehl, bleibt der alte Server unangetastet stehen, kein Rollback
+        # noetig, weil nie etwas zerstoert wurde.
+        err "'$eingabe' laeuft (PID $pid, --parallel $kap_laufend), traegt aber keinen weiteren Strom mehr -- $kap_benoetigt Stroeme sind jetzt noetig (gebuchte Sequenzen + diese neue). Kapazitaets-Neustart versucht (der alte Server bleibt bis zu einer bestaetigten neuen Buchung unangetastet), rund eine Minute."
+        decode_conc="$kap_benoetigt"; prompt_conc="$kap_benoetigt"; parallel="$kap_benoetigt"
+        KAPAZITAETS_NEUSTART=1
+        KAPAZITAETS_ALTER_PID="$pid"
+        # Befund 2: jetzt einfangen, VOR jeder weiteren Buchung -- siehe die
+        # Deklaration oben.
+        [ -f "$KENNUNG_DATEI" ] && KAPAZITAETS_ALTE_KENNUNG="$(tr -d '[:space:]' < "$KENNUNG_DATEI" 2>/dev/null)"
+      else
       echo "wb-mlx-server: '$eingabe' laeuft bereits (PID $pid) — kein Start noetig." >&2
       # Auf stdout, nicht stderr: das ist die Auskunft an den Aufrufer, nicht eine
       # Meldung an den Menschen. Dieselbe Bauart wie `wb-kontext ensure` mit
@@ -2426,7 +3426,14 @@ cmd_ensure() {
         fi
       fi
       return 0
+      fi
     fi
+    # NUR fuer den EIGENTLICHEN Modellwechsel, NICHT fuer einen Kapazitaets-
+    # Neustart (Gegenleser-Befund Punkt 9): KAPAZITAETS_NEUSTART=1 wurde oben
+    # bereits gesetzt und ueberspringt B4 samt dem fruehen Stopp hier ganz --
+    # der eigentliche Stopp fuer diesen Fall folgt weiter unten, ERST nach
+    # einer erfolgreichen neuen Buchung (Punkt 11, Rollback-Sicherheit).
+    if [ "$KAPAZITAETS_NEUSTART" -ne 1 ]; then
     # Anderes Modell laeuft: BEVOR es beendet wird, EINE Sperre pruefen
     # (Pruefer-Befund B4, 19.08.2026) -- die zweite, B11, stand hier bis zum
     # 21.08.2026 und ist jetzt entfernt; die Begruendung steht im naechsten
@@ -2527,8 +3534,9 @@ cmd_ensure() {
     echo "wb-mlx-server: es laeuft '$laufend', angefordert ist '$MODEL_PATH' — beende das laufende Modell zuerst." >&2
     _stop_pruefen_und_beenden "$pid" || return 1
     err "WICHTIG: '$laufend' ist jetzt beendet — bis der angeforderte Start ('$MODEL_PATH') gelingt, laeuft KEIN mlx-lokal-Server mehr. Scheitert der Start, bleibt das so; die naechste Fehlermeldung nennt den Grund."
+    fi
   elif [ -n "$pid" ]; then
-    err "Port $PORT ist belegt, aber von keinem der vier bekannten Motoren (mlx_lm.server, mlx-dspark, mtplx, vllm) -- PID $pid. Kein Start."
+    err "Port $PORT ist belegt, aber von keinem der fuenf bekannten Motoren (mlx_lm.server, mlx-dspark, mtplx, vllm, mlx_vlm.server) -- PID $pid. Kein Start."
     return 1
   fi
 
@@ -2554,8 +3562,14 @@ cmd_ensure() {
     err "check-resources lieferte keinen lesbaren Wert — kein Start ohne Speicherpruefung."
     return 1
   fi
+  # MIN_FREE_MIB steht seit 2026-08-27 auf 0 (siehe die Konstante oben) --
+  # diese Pruefung bleibt stehen, damit ein spaeter wieder gesetzter,
+  # positiver Boden ohne weitere Aenderung greift, feuert aber mit der
+  # heutigen Vorgabe nie. Der freie Wert wird trotzdem geloggt: informativ,
+  # keine Schwelle mehr.
+  err "freier Speicher vor dem Start: ${free_mib} MiB (informativ -- die scharfe Grenze ist jetzt wb-notbremse NACH dem Start, siehe dort)."
   if [ "$free_mib" -lt "$MIN_FREE_MIB" ]; then
-    err "nur ${free_mib} MiB frei, mindestens ${MIN_FREE_MIB} MiB (20 GB) noetig — Start abgebrochen."
+    err "nur ${free_mib} MiB frei, mindestens ${MIN_FREE_MIB} MiB noetig — Start abgebrochen."
     err "Grund: siehe Kopfkommentar dieser Datei und ~/Knowledge/10-global/incident-2026-08-11-kernel-panik-durch-gpu-speichermangel.md"
     return 1
   fi
@@ -2578,6 +3592,171 @@ cmd_ensure() {
       err "'$buendel_bin' ist nicht (mehr) ausfuehrbar -- kein Start ueber vllm-metal."
       return 1
     fi
+  elif [ "$motor" = "mlx-vlm" ]; then
+    # WB_MLX_VLM_BIN (Nachtrag 2026-09-08, VIERTE RUNDE, Auftrag (C)): Pfad zur
+    # mlx_vlm.server-Binaerdatei, Vorgabe wie bisher ueber PATH
+    # (`command -v mlx_vlm.server`). Der Anlass: ein Messlauf soll die
+    # Fassung 0.7.0 unter einem eigenen venv (z.B.
+    # ~/.venv-mlx-vlm-070/bin/mlx_vlm.server) MIT Buchung starten koennen,
+    # OHNE die auf dieser Maschine installierte 0.6.17 zu verdraengen -- kein
+    # zweiter, ungebuchter Weg am Werkzeug vorbei.
+    MLX_VLM_BIN="${WB_MLX_VLM_BIN:-$(command -v mlx_vlm.server)}"
+    if [ -z "$MLX_VLM_BIN" ] || [ ! -x "$MLX_VLM_BIN" ]; then
+      err "mlx_vlm.server nicht gefunden oder nicht ausfuehrbar (WB_MLX_VLM_BIN='${WB_MLX_VLM_BIN:-}', aufgeloest '$MLX_VLM_BIN') -- kein Start mit Vorhersage ueber diesen Motor moeglich."
+      return 1
+    fi
+    # Fassung ins Log, VOR jedem Start (Auftrag (C), Punkt 1): dasselbe
+    # Python, das $MLX_VLM_BIN mitbringt -- ein `import mlx_vlm` gegen ein
+    # ANDERES, zufaellig im PATH stehendes Python koennte eine andere Fassung
+    # oder gar keine finden, obwohl $MLX_VLM_BIN selbst laeuft.
+    #
+    # NACHTRAG (2026-09-08, SECHSTE RUNDE, echter Ladetest): `command -v
+    # mlx_vlm.server` liefert bei `uv tool install` ueblicherweise einen
+    # SYMLINK (z.B. ~/.local/bin/mlx_vlm.server -> .../uv/tools/mlx-vlm/
+    # bin/mlx_vlm.server) -- dirname DES SYMLINKS (~/.local/bin) hat kein
+    # eigenes python, das python liegt nur im AUFGELOESTEN venv-Verzeichnis.
+    # macOS' `readlink` kennt kein garantiertes `-f`, deshalb die Kette hier
+    # von Hand aufgeloest (portabel, ohne GNU-readlink/python3-Annahme).
+    local MLX_VLM_REAL="$MLX_VLM_BIN" MLX_VLM_ZIEL="" MLX_VLM_PY="" MLX_VLM_SHEBANG=""
+    while [ -L "$MLX_VLM_REAL" ]; do
+      MLX_VLM_ZIEL="$(readlink "$MLX_VLM_REAL")"
+      case "$MLX_VLM_ZIEL" in
+        /*) MLX_VLM_REAL="$MLX_VLM_ZIEL" ;;
+        *) MLX_VLM_REAL="$(cd "$(dirname "$MLX_VLM_REAL")" && pwd)/$MLX_VLM_ZIEL" ;;
+      esac
+    done
+    MLX_VLM_PY="$(dirname "$MLX_VLM_REAL")/python"
+    if [ ! -x "$MLX_VLM_PY" ]; then
+      # Rueckfall: die Shebang-Zeile der aufgeloesten Datei nennt ihr Python
+      # direkt (#!/pfad/zu/python) -- deckt venv-Layouts ab, die kein
+      # "python" neben der Binaerdatei ablegen.
+      MLX_VLM_SHEBANG="$(head -1 "$MLX_VLM_REAL" 2>/dev/null)"
+      case "$MLX_VLM_SHEBANG" in
+        '#!'*) MLX_VLM_PY="${MLX_VLM_SHEBANG#\#!}"; MLX_VLM_PY="${MLX_VLM_PY%% *}" ;;
+      esac
+    fi
+    MLX_VLM_VERSION="$("$MLX_VLM_PY" -c 'import mlx_vlm; print(mlx_vlm.__version__)' 2>/dev/null)"
+    if [ -n "$MLX_VLM_VERSION" ]; then
+      err "mlx_vlm.server: $MLX_VLM_BIN (Fassung $MLX_VLM_VERSION, Python $MLX_VLM_PY)."
+    else
+      err "WARNUNG: Fassung von mlx_vlm unter '$MLX_VLM_BIN' nicht ermittelbar (import ueber '$MLX_VLM_PY' fehlgeschlagen) -- APC und --model-discovery bleiben deshalb aus (siehe apc_aktiv/model_discovery_ok unten), sicherer als eine geratene Fassung."
+      MLX_VLM_VERSION=""
+    fi
+    # URSPRUENGLICH STAND HIER (erste Runde, GELOESCHT und jetzt per
+    # Loeschverbot wiederhergestellt, ZWEITE RUNDE, Wiederherstellung b) der
+    # damalige, wortwoertliche Kommentar samt Code:
+    #
+    #   # Version >= 0.7.0? `sort -V` (auf dieser Maschine vorhanden, GEPRUEFT) --
+    #   # kein eigener Versions-Parser fuer ein Format, das die Bibliothek selbst
+    #   # schon herausgibt.
+    #   MLX_VLM_AB_070=0
+    #   if [ -n "$MLX_VLM_VERSION" ] \
+    #      && [ "$(printf '%s\n%s\n' "0.7.0" "$MLX_VLM_VERSION" | sort -V | head -1)" = "0.7.0" ]; then
+    #     MLX_VLM_AB_070=1
+    #   fi
+    #
+    # UEBERHOLT: dieser Vergleich war falsch, siehe die Korrektur unten.
+    #
+    # Version >= 0.7.0? UEBERARBEITET (Nachtrag 2026-09-08, Auftrag "buchung",
+    # Kleinkram-Befund "sort -V reiht 0.7.0rc0 NACH 0.7.0"): `sort -V` (BSD-
+    # Fassung dieser Maschine, GEPRUEFT: `sort --version` -> "2.3-Apple") sortiert
+    # rein lexikographisch UEBER den gemeinsamen Praefix hinaus und kennt keine
+    # SemVer-/PEP-440-Vorrangregel fuer Vorabversionen -- GEMESSEN:
+    # `printf '0.7.0\n0.7.0rc0\n' | sort -V` liefert "0.7.0" VOR "0.7.0rc0", als
+    # sei die Vorabversion NEUER als die fertige Fassung. Der alte Vergleich
+    # haette APC/--model-discovery deshalb schon fuer eine 0.7.0rc0-Vorabversion
+    # aktiviert, die eigentlich noch AELTER als 0.7.0 gilt.
+    #
+    # ERSTER VERSUCH (verworfen, nicht nur dokumentiert -- GEMESSEN am eigenen
+    # Fehlschlag): `packaging.version` waere die naheliegende Bibliothek, aber
+    # sie ist auf dieser Maschine ein PIP-INSTALL-USER-Paket unter
+    # $HOME/Library/Python/.../site-packages, KEIN Python-Standardpaket -- unter
+    # einem ANDEREN $HOME (jeder Test mit eigenem HOME, jede Maschine ohne genau
+    # dieses pip-Paket, z.B. peer ungeprueft) schlaegt der Import fehl und die
+    # konservative Ausweichung (NEIN) griff dann IMMER, auch fuer eine echte
+    # 0.7.0 -- GEMESSEN in test-mlx-server-mlx-vlm-070.sh, das mit eigenem HOME
+    # arbeitet: Faelle 3/6/7/8 (alle "0.7.0, sollte AN sein") schlugen fehl.
+    #
+    # Ersetzt durch einen KLEINEN, selbstgeschriebenen PEP-440-Teilvergleich
+    # ohne jede Fremdbibliothek (nur `re`/`sys`, Python-Standardbibliothek,
+    # ueberall vorhanden): numerischer Anteil ("0.7.0") wird verglichen, ein
+    # ANGEHAENGTER Rest ("rc0", "b1", ".dev0", …) gilt als Vorabversion und ist
+    # bei gleicher Zahl IMMER kleiner als die reine Fassung -- exakt die eine
+    # Regel, die hier gebraucht wird, nicht die volle PEP-440-Spezifikation.
+    # Kein Parsen moeglich (kein fuehrendes "X.Y..."): konservativ NEIN, nie
+    # failoffen in Richtung "neu genug" bei einer Zahl, die sich nicht verstehen
+    # laesst (dieselbe Sicherheitsrichtung wie ueberall in dieser Datei).
+    MLX_VLM_AB_070=0
+    if [ -n "$MLX_VLM_VERSION" ] && python3 -c '
+import re, sys
+
+def parse(v):
+    m = re.match(r"^(\d+(?:\.\d+)*)", v)
+    if not m:
+        raise ValueError(v)
+    release = tuple(int(x) for x in m.group(1).split("."))
+    ist_vorab = bool(v[m.end():])
+    return release, ist_vorab
+
+def ge(v, ziel):
+    rv, vorab_v = parse(v)
+    rz, vorab_z = parse(ziel)
+    laenge = max(len(rv), len(rz))
+    rv = rv + (0,) * (laenge - len(rv))
+    rz = rz + (0,) * (laenge - len(rz))
+    if rv != rz:
+        return rv > rz
+    # gleiche Zahl: eine Vorabversion ist NIE >= der reinen Fassung.
+    return not (vorab_v and not vorab_z)
+
+try:
+    sys.exit(0 if ge(sys.argv[1], "0.7.0") else 1)
+except Exception:
+    sys.exit(1)
+' "$MLX_VLM_VERSION" 2>/dev/null; then
+      MLX_VLM_AB_070=1
+    fi
+    # APC (Automatic Prefix Cache, Auftrag (C) Punkt 2, VORGABE GEAENDERT IN
+    # DER FUENFTEN RUNDE, siehe apc_gewuenscht oben): existiert laut Auftrag
+    # erst ab 0.7.0.
+    #   apc_gewuenscht=auto (Vorgabe seit der fuenften Runde): APC an, sobald
+    #     die Fassung reicht -- KEINE Warnung, wenn nicht: eine Vorgabe, die
+    #     sich an die verfuegbare Fassung anpasst, ist kein Fehler des
+    #     Aufrufers.
+    #   apc_gewuenscht=1 (--apc/WB_MLX_SERVER_APC=1, ausdruecklicher Wunsch):
+    #     zu alt heisst laute Warnung, Start OHNE APC -- kein Abbruch, ein
+    #     Wunsch nach einer Beschleunigung ist kein Grund, den Start ganz zu
+    #     verweigern.
+    #   apc_gewuenscht=0 (WB_MLX_SERVER_APC=0, ausdruecklicher Verzicht):
+    #     bleibt aus, unabhaengig von der Fassung, keine Warnung.
+    apc_aktiv=0
+    if [ "$MLX_VLM_AB_070" -eq 1 ] && { [ "$apc_gewuenscht" = auto ] || [ "$apc_gewuenscht" = 1 ]; }; then
+      apc_aktiv=1
+    elif [ "$apc_gewuenscht" = 1 ]; then
+      err "WARNUNG: --apc verlangt, aber mlx_vlm ${MLX_VLM_VERSION:-<Fassung unbekannt>} ist aelter als 0.7.0 (APC existiert dort nicht) -- Start OHNE APC."
+    fi
+    # NACHTRAG 2026-09-10, Auftrag "apcspeicher": die schlanken APC-Knoepfe
+    # wirken nur mit dem lokalen Patch (Markierung "wb-apcspeicher" in
+    # mlx_vlm/apc.py). Ohne ihn liest mlx_vlm die Variablen gar nicht -- der
+    # Server liefe mit dem alten Speicherbedarf, und nichts saehe danach aus.
+    # apc_patch_ok entscheidet im exec-Zweig, ob SCHLANK (Vorgabe) wirklich
+    # gesetzt wird.
+    local apc_patch_ok=0
+    if [ "$apc_aktiv" -eq 1 ]; then
+      local apc_patch_datei
+      apc_patch_datei="$("$MLX_VLM_PY" -c 'import importlib.util, os; print(os.path.join(os.path.dirname(importlib.util.find_spec("mlx_vlm").origin), "apc.py"))' 2>/dev/null)"
+      if [ -n "$apc_patch_datei" ] && grep -q "wb-apcspeicher" "$apc_patch_datei" 2>/dev/null; then
+        apc_patch_ok=1
+      elif [ "${WB_MLX_SERVER_APC_SCHLANK:-1}" = 1 ] || [ -n "${WB_MLX_SERVER_APC_SNAPSHOT_BITS:-}" ]; then
+        err "WARNUNG: mlx_vlm ist nicht gepatcht (${apc_patch_datei:-apc.py nicht gefunden}) -- APC laeuft mit dem alten Speicherbedarf (gemessen 2026-09-10: bei 60k Token rund 44 GiB, darueber Metal-Speichermangel). Nachholen: shell/messungen/apc-speicher/patch-apc-speicher.py anwenden"
+      fi
+    fi
+    # --model-discovery (Auftrag (C) Punkt 3): nur setzen, wenn die Fassung
+    # den Schalter WIRKLICH kennt (0.7.0), sonst lehnt ein aelterer Server den
+    # unbekannten Schalter unter Umstaenden ab. Dieselbe Versionspruefung wie
+    # bei APC -- eine zweite, unabhaengige `--help`-Sonde waere eine zweite
+    # Quelle fuer dieselbe Frage.
+    model_discovery_ok="$MLX_VLM_AB_070"
   elif ! command -v mlx_lm.server >/dev/null 2>&1; then
     err "mlx_lm.server nicht im PATH gefunden."
     return 1
@@ -2635,9 +3814,83 @@ cmd_ensure() {
   # nicht mehr die Plaetzezahl mal einer angenommenen Platzgroesse. Die Plaetze
   # bleiben gesetzt -- sie bestimmen, wie viele verschiedene Praefixe der Cache
   # vorhaelt --, aber wie viel SPEICHER er nehmen darf, sagt jetzt der Deckel.
-  local cache_gib=0
+  # GEKLAERT (Nachtrag 2026-09-08, ZWEITE RUNDE, Auftrag "buchung", Risiko 13,
+  # "allokiert mlx-vlm KV je laufendem Strom oder haelt es decode-concurrency
+  # Slots vorab?"): PER LAUFENDEM STROM, kein Vorab-Reservat. Quelltext dieser
+  # Maschine gelesen (kein echter Serverstart), Fassung 0.7.0-Installation
+  # unter ~/.local/share/uv/tools/mlx-vlm/lib/python3.12/site-packages/
+  # mlx_vlm/server/generation.py, Zeilen ~1686-1707: der Generierungs-Thread
+  # haelt ein dict `active` ("uid -> {rqueue, tokens, gen_kwargs}"), das NUR
+  # waechst, wenn eine ECHTE Anfrage eintrifft (`_collect_pending_requests`);
+  # `--max-num-seqs` (Umgebungsvariable MLX_VLM_MAX_NUM_SEQS, gesetzt ueber
+  # `--max-num-seqs $parallel` bei mehreren Stroemen, siehe exec-Zweig weiter
+  # unten) wirkt NUR als Aufnahme-Obergrenze
+  # ("capacity = max_num_seqs - len(active)"), keine Vorab-Zuteilung. Damit
+  # ist die bestehende Buchung (parallel x kontext x KV-Bedarf je Token, siehe
+  # spitze_rechnen() in wb-belegung) das richtige Modell fuer diesen Motor --
+  # es gibt kein zusaetzliches, decode-concurrency-breites Vorab-Reservat, das
+  # separat gebucht werden muesste.
+  local cache_gib=0 cache_ist_exakt=0
   if [ "$motor" = "mlx-lm" ]; then
     cache_gib="$PROMPT_CACHE_GIB"
+  elif [ "$motor" = "mlx-vlm" ] && [ "$apc_aktiv" -eq 1 ]; then
+    # URSPRUENGLICH STAND HIER (erste Runde, GELOESCHT und jetzt per
+    # Loeschverbot wiederhergestellt, ZWEITE RUNDE, Wiederherstellung c) der
+    # damalige, wortwoertliche Kommentar:
+    #
+    #   # APC-Blockpool (Auftrag (C) Punkt 2): APC_NUM_BLOCKS Bloecke a 16 Token
+    #   # (siehe der Umgebungsaufbau im exec-Zweig weiter unten) decken zusammen
+    #   # GENAU $kontext Token ab -- derselbe Speicherbedarf wie ein Prompt-Cache
+    #   # in Kontextgroesse. Gebucht wird ueber DIESELBE wb-belegung-Buchung
+    #   # (--prompt-cache-gb), die auch fuer mlx_lm.server den Deckelfaktor
+    #   # (PROMPT_CACHE_DECKEL_FAKTOR) anwendet -- eine Quelle fuer "wie viel
+    #   # bucht ein Cache-Deckel wirklich", nicht zwei.
+    #
+    # UEBERHOLT: sowohl die Bloeckezahl (nur $kontext, nicht x $parallel) als
+    # auch die Buchungsart (--prompt-cache-gb mit dem Deckelfaktor) waren
+    # falsch, siehe die Korrektur unten.
+    #
+    # APC-Blockpool (Auftrag (C) Punkt 2, UEBERARBEITET 2026-09-08, Auftrag
+    # "buchung", Kleinkram-Befunde "KV-Wert der tatsaechlichen Quantisierung
+    # statt des 2,2-Faktors" und "APC_NUM_BLOCKS x parallel"):
+    #
+    # APC_NUM_BLOCKS Bloecke a 16 Token (siehe der Umgebungsaufbau im exec-Zweig
+    # weiter unten) decken zusammen $kontext x $parallel Token ab, NICHT nur
+    # $kontext -- EIN Strom allein waere zu wenig, sobald mehrere gleichzeitige
+    # Stroeme unterschiedliche, nicht geteilte Praefixe im selben Pool halten.
+    #
+    # Gebucht wird ueber --prompt-cache-exakt-gb (cache_ist_exakt=1, siehe
+    # belegung_nehmen()), NICHT ueber --prompt-cache-gb: der Blockpool ist eine
+    # EXAKTE, feste Zuteilung, kein weicher Deckel, der wie mlx_lm.servers
+    # LRUPromptCache gemessen ueberschritten wird -- der PROMPT_CACHE_DECKEL_
+    # FAKTOR (x2,2, hergeleitet fuer genau diese Ueberschreitung) waere hier
+    # eine Ueberbuchung ohne Gegenstueck in der Wirklichkeit.
+    #
+    # Die KV-ZAHL muss zur tatsaechlichen Quantisierung passen: bei einem Strom
+    # faehrt der Motor mit --kv-bits 8 (kv_quant_buchung/kv_modellname_buchung
+    # weiter unten), ab zwei Stroemen OHNE (mlx-vlm 0.6.17, NACHTRAG 24) --
+    # derselbe kv8-Name, den die spaetere KV-Buchung dafuer waehlt, gilt deshalb
+    # auch hier, nicht blind der groessere unquantisierte Basiswert.
+    #
+    # NACHTRAG 2026-09-10, Auftrag "apcspeicher": der kv8-Name gilt nur noch, wenn
+    # der Motor wirklich quantisiert faehrt. Seit heute ist die Vorgabe dieses
+    # Motors unquantisiert (KV_QUANT_MLX_VLM=off); die Bedingung hier kannte das
+    # nicht und buchte den APC-Topf mit 0,0332 statt 0,0625 MiB/Token -- halb so
+    # viel, wie die Schnappschuesse in bf16 wirklich belegen.
+    local apc_kv_modellname="$basisname"
+    if [ "$parallel" -le 1 ] && [ "${KV_QUANT_MLX_VLM:-off}" = q8 ] && [ -n "$(kv_mib_je_token_fuer "${basisname}-kv8")" ]; then
+      apc_kv_modellname="${basisname}-kv8"
+    fi
+    local apc_kv_mib; apc_kv_mib="$(kv_mib_je_token_fuer "$apc_kv_modellname")"
+    if [ -n "$apc_kv_mib" ]; then
+      # LC_ALL=C: awk formatiert Kommazahlen nach LC_NUMERIC. Unter de_DE stand
+      # hier "2,0000", und wb-belegung lehnte --prompt-cache-exakt-gb als
+      # "invalid float value" ab -- kein Start (gemessen 2026-09-13).
+      cache_gib="$(LC_ALL=C awk -v k="$kontext" -v p="$parallel" -v m="$apc_kv_mib" 'BEGIN { printf "%.4f", k * p * m / 1024 }')"
+      cache_ist_exakt=1
+    else
+      err "WARNUNG: kein KV-Bedarf fuer '$basisname' im Register (wb-belegung kv liste) -- der APC-Blockpool wird OHNE Buchung gestartet (keine geratene Zahl). Eintragen mit: wb-belegung kv setzen $basisname <mib-je-token> --herkunft gemessen"
+    fi
   fi
 
   # MIT WELCHER KV-QUANTISIERUNG DIESER SERVER GLEICH FAEHRT (NACHTRAG 11).
@@ -2661,11 +3914,62 @@ cmd_ensure() {
     kv_quant_buchung="$KV_QUANT"
   elif [ "$motor" = "mlx-dspark" ]; then
     [ "$dspark_ziel_hybrid" -eq 1 ] || kv_quant_buchung="$KV_QUANT"
+  elif [ "$motor" = "mlx-vlm" ]; then
+    # NACHTRAG 23 (2026-08-27): dieser Motor faehrt mit --kv-bits 8 (siehe den
+    # exec-Zweig weiter unten, dort steht die Messung). Die Buchung muss denselben
+    # Wert kennen, sonst bucht sie den doppelt so grossen unquantisierten Cache
+    # und lehnt Starts ab, die in Wahrheit passen.
+    #
+    # NACHTRAG 24 (2026-09-01): ab ZWEI Stroemen faehrt er OHNE, weil quantisierter
+    # Cache und gebuendeltes spekulatives Dekodieren sich in mlx-vlm 0.6.17
+    # ausschliessen (Begruendung und Messung im exec-Zweig). Die Buchung muss
+    # denselben Weg gehen, sonst bucht sie halb so viel, wie der Server nimmt --
+    # und das ist die gefaehrliche Richtung: zu klein gebucht heisst, ein zweiter
+    # Verbraucher bekommt Platz zugesagt, den es nicht gibt. Der Cache kostet
+    # dann 0,0625 statt 0,0332 MiB/Token, bei 32768 Token also 2,00 statt 1,06
+    # GiB je Strom.
+    #
+    # NACHTRAG 2026-09-10: auch beim Einzelstrom ist die Vorgabe jetzt "off"
+    # (Messung bei KV_QUANT_MLX_VLM); quantisiert wird nur auf ausdrueckliche
+    # Anweisung, und genau das bucht die Zeile hier mit.
+    if [ "$parallel" -gt 1 ]; then
+      kv_quant_buchung="off"
+    else
+      case "${KV_QUANT_MLX_VLM:-off}" in q8|q4) kv_quant_buchung="$KV_QUANT_MLX_VLM" ;; *) kv_quant_buchung="off" ;; esac
+    fi
   elif [ "$motor" = "vllm-metal" ]; then
     # Bei diesem Motor geht der KV-Cache gar nicht in die gebuchte Zahl ein
     # (--metal-fraktion bucht sein Gesamtbudget) -- eine Angabe waere hier eine
     # Aussage ueber eine Groesse, die diese Buchung nicht rechnet.
     kv_quant_buchung=""
+  fi
+
+  # Unter WELCHEM Namen der KV-Bedarf nachgeschlagen wird (NACHTRAG 23). Das
+  # Register rechnet nichts um, es schlaegt nach -- also braucht der 8-Bit-Fall
+  # einen eigenen Schluessel. Er wird nur benutzt, wenn er wirklich eingetragen
+  # ist: sonst faellt die Buchung auf den Ersatzwert eines unbekannten Modells
+  # zurueck, und das waere fuer ein Modell, dessen unquantisierter Wert sauber
+  # gemessen im Register steht, ein Rueckschritt statt einer Verbesserung.
+  local kv_modellname_buchung=""
+  # NACHTRAG 24 (2026-09-01): nur beim EINZELSTROM. Ab zwei Stroemen faehrt der
+  # Motor ohne --kv-bits (siehe oben), und dann ist der kv8-Name die falsche
+  # Auskunft -- er nennt den halben Verbrauch. Die Buchung bleibt in dem Fall
+  # beim unquantisierten Grundnamen, und das ist die sichere Richtung: lieber
+  # eine Buchung, die zu gross ist, als ein zweiter Verbraucher, dem Platz
+  # zugesagt wird, den es nicht gibt.
+  # NACHTRAG 2026-09-10: der kv8-Schluessel gilt nur noch, wenn der Motor auch
+  # wirklich mit --kv-bits 8 faehrt (KV_QUANT_MLX_VLM=q8, Vorgabe ist off).
+  if [ "$motor" = "mlx-vlm" ] && [ "$parallel" -le 1 ] && [ "${KV_QUANT_MLX_VLM:-off}" = q8 ]; then
+    local kv_kandidat="${basisname}-kv8"
+    # NACHTRAG 2026-09-08, Auftrag "buchung", Kleinkram-Befund "grep -F": ueber
+    # kv_mib_je_token_fuer() statt eines eigenen grep-Musters -- derselbe exakte
+    # Feldvergleich, eine Quelle fuer "steht dieser Schluessel im Register".
+    if [ -n "$(kv_mib_je_token_fuer "$kv_kandidat")" ]; then
+      kv_modellname_buchung="$kv_kandidat"
+    else
+      err "HINWEIS: '$kv_kandidat' steht nicht im KV-Register — die Buchung rechnet mit dem unquantisierten Wert von '$basisname', obwohl der Motor mit --kv-bits 8 faehrt. Sie ueberschaetzt damit, sie unterschaetzt nicht. Eintragen mit: wb-belegung kv setzen $kv_kandidat <mib-je-token> --herkunft gemessen --kv-quant q8"
+      kv_quant_buchung="off"
+    fi
   fi
 
   # Nachtrag 10: leer fuer die drei alten Motoren (dann laeuft die bisherige
@@ -2675,7 +3979,7 @@ cmd_ensure() {
     metal_fraktion="$buendel_fraktion"
   fi
 
-  if ! belegung_nehmen "$basisname" "$gewichte_gb" "$kontext" "$frist_min" "$zweck" "$parallel" "$vorh_gewichte_gb" "$cache_gib" "$metal_fraktion" "$kv_quant_buchung" "$auf_eigene_gefahr"; then
+  if ! belegung_nehmen "$basisname" "$gewichte_gb" "$kontext" "$frist_min" "$zweck" "$parallel" "$vorh_gewichte_gb" "$cache_gib" "$metal_fraktion" "$kv_quant_buchung" "$auf_eigene_gefahr" "$kv_modellname_buchung" "$cache_ist_exakt"; then
     # Die AUTOMATISCHE Vorgabe darf hier noch einmal kleiner werden, bevor
     # ganz aufgegeben wird — das ist kein blinder zweiter Versuch derselben
     # abgelehnten Anfrage (der ist verboten), sondern ein zweiter, kleinerer,
@@ -2685,10 +3989,140 @@ cmd_ensure() {
     if [ "$kontext_automatisch" -eq 1 ] && [ "$kontext" -ne "$VORGABE_KONTEXT_ALT" ]; then
       err "wb-kontext-Empfehlung ($kontext Token) abgelehnt — letzter Rueckfall: der alte Festwert $VORGABE_KONTEXT_ALT."
       kontext="$VORGABE_KONTEXT_ALT"
-      belegung_nehmen "$basisname" "$gewichte_gb" "$kontext" "$frist_min" "$zweck" "$parallel" "$vorh_gewichte_gb" "$cache_gib" "$metal_fraktion" "$kv_quant_buchung" "$auf_eigene_gefahr" || return 1
+      if ! belegung_nehmen "$basisname" "$gewichte_gb" "$kontext" "$frist_min" "$zweck" "$parallel" "$vorh_gewichte_gb" "$cache_gib" "$metal_fraktion" "$kv_quant_buchung" "$auf_eigene_gefahr" "$kv_modellname_buchung" "$cache_ist_exakt"; then
+        # ROLLBACK-SICHERHEIT (Gegenleser-Befund Punkt 11): der alte Server
+        # ($KAPAZITAETS_ALTER_PID) wurde in diesem Zweig NIE gestoppt (siehe
+        # die KAPAZITAETS_NEUSTART-Bedingung weiter oben) -- eine abgelehnte
+        # groessere Buchung zerstoert also nichts. $KENNUNG_DATEI zeigt noch
+        # unveraendert auf die ALTE Buchung, nicht angefasst.
+        if [ "$KAPAZITAETS_NEUSTART" -eq 1 ] && [ -n "$KAPAZITAETS_ALTER_PID" ]; then
+          err "Kapazitaets-Neustart abgelehnt (wb-belegung: auch der kleinere Rueckfallkontext $kontext passt nicht) -- der bisherige Server (PID $KAPAZITAETS_ALTER_PID) laeuft unveraendert mit seiner alten Kapazitaet weiter."
+          printf 'modell=%s\n' "$(bedienter_modellname "$motor" "$MODEL_PATH")"
+          printf 'pid=%s\n' "$KAPAZITAETS_ALTER_PID"
+          printf 'neustart=abgelehnt\n'
+          return 0
+        fi
+        return 1
+      fi
     else
+      # Siehe der Kommentar im Zweig oben (Rollback-Sicherheit, Punkt 11):
+      # der alte Server steht hier noch unangetastet.
+      if [ "$KAPAZITAETS_NEUSTART" -eq 1 ] && [ -n "$KAPAZITAETS_ALTER_PID" ]; then
+        err "Kapazitaets-Neustart abgelehnt (wb-belegung: keine groessere Buchung moeglich) -- der bisherige Server (PID $KAPAZITAETS_ALTER_PID) laeuft unveraendert mit seiner alten Kapazitaet weiter."
+        printf 'modell=%s\n' "$(bedienter_modellname "$motor" "$MODEL_PATH")"
+        printf 'pid=%s\n' "$KAPAZITAETS_ALTER_PID"
+        printf 'neustart=abgelehnt\n'
+        return 0
+      fi
       return 1
     fi
+  fi
+  # Kapazitaets-Neustart: JETZT, ERST NACH der erfolgreichen (groesseren)
+  # Buchung, wird der alte Server wirklich gestoppt (Gegenleser-Befund Punkt
+  # 11) -- vorher lief er unveraendert weiter, die neue Buchung zaehlte ihn
+  # (ueber die alte, noch stehende Buchung) einfach zusaetzlich mit, die
+  # sichere, nie die gefaehrliche Richtung.
+  if [ "$KAPAZITAETS_NEUSTART" -eq 1 ] && [ -n "$KAPAZITAETS_ALTER_PID" ]; then
+    # IN-FLIGHT-PRUEFUNG (Gegenleser-Befund Punkt 10): nie still mitten in
+    # einer fremden Anfrage abreissen. Bestmoegliches Signal ohne Protokoll-
+    # kenntnis des jeweiligen Motors: offene TCP-Verbindungen auf $PORT.
+    # Wartet bis zu KAPAZITAETS_INFLIGHT_FRIST_S (Vorgabe 20s), druckt IMMER
+    # eine Meldung -- ob leer oder nicht -- und beendet danach so oder so
+    # (ein unbegrenztes Warten wuerde den Kapazitaetsengpass, der diesen
+    # Neustart ausgeloest hat, nur verlaengern).
+    local kap_frist="${WB_MLX_SERVER_KAPAZITAET_INFLIGHT_S:-20}" kap_gewartet=0 kap_offene
+    kap_offene="$(lsof -nP -iTCP:"$PORT" -sTCP:ESTABLISHED -t 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${kap_offene:-0}" -eq 0 ] 2>/dev/null; then
+      err "Kapazitaets-Neustart: keine offene Verbindung auf Port $PORT -- kein laufendes Gespraech wird unterbrochen."
+    else
+      err "Kapazitaets-Neustart: ${kap_offene} offene Verbindung(en) auf Port $PORT -- warte bis zu ${kap_frist}s, bevor der alte Server (PID $KAPAZITAETS_ALTER_PID) beendet wird."
+      while [ "$kap_gewartet" -lt "$kap_frist" ]; do
+        sleep 1; kap_gewartet=$((kap_gewartet + 1))
+        kap_offene="$(lsof -nP -iTCP:"$PORT" -sTCP:ESTABLISHED -t 2>/dev/null | wc -l | tr -d ' ')"
+        if [ "${kap_offene:-0}" -eq 0 ] 2>/dev/null; then
+          err "Kapazitaets-Neustart: Verbindung(en) nach ${kap_gewartet}s geschlossen -- beende jetzt."
+          break
+        fi
+      done
+      if [ "${kap_offene:-0}" -gt 0 ] 2>/dev/null; then
+        err "WARNUNG: nach ${kap_frist}s immer noch ${kap_offene} offene Verbindung(en) auf Port $PORT -- beende trotzdem (ein laengerer Aufschub verlaengert nur den Kapazitaetsengpass). Mindestens eine laufende Anfrage wird jetzt unterbrochen."
+      fi
+    fi
+    # Befund 2 (siehe KAPAZITAETS_ALTE_KENNUNG oben): der alte Server wird ueber
+    # SEINE EIGENE, frueh eingefangene Kennung freigegeben, NIE ueber den
+    # --eigene-Fallback von belegung_freigeben -- der wuerde in diesem Pane auch
+    # die brandneue Buchung $BELEGUNG_KENNUNG treffen.
+    if ! _stop_pruefen_und_beenden "$KAPAZITAETS_ALTER_PID" "$KAPAZITAETS_ALTE_KENNUNG"; then
+      # URSPRUENGLICHE FASSUNG (bis 2026-09-08, Auftrag "buchung", Befund 4;
+      # stehen gelassen als Beleg der frueheren Entscheidung, siehe unten fuer
+      # die Korrektur): "Die neue, groessere Buchung STEHT bereits
+      # (BELEGUNG_KENNUNG) -- der alte Prozess laesst sich aber nicht beenden.
+      # Bekanntes, nicht neu eingefuehrtes Risiko (derselbe Ausgang wie beim
+      # normalen Modellwechsel oben, der an derselben Stelle ebenfalls
+      # 'return 1' macht): zwei Buchungen fuer eine Weile im Buch, bis jemand
+      # von Hand nachsieht. Kein sichereres Verhalten ohne einen
+      # Rueckabwicklungspfad fuer eine schon bestaetigte Buchung, den es an
+      # dieser Stelle im Werkzeug nicht gibt." Die zugehoerige Meldung sagte
+      # damals "die neue Buchung ... steht trotzdem" UND rief direkt danach
+      # das unveraenderte belegung_abbrechen() auf, das genau diese Buchung
+      # freigab UND $KENNUNG_DATEI loeschte -- ein WIDERSPRUCH zur eigenen
+      # Aussage, und (schwerer) ein Loeschen der Kennungsdatei des noch
+      # laufenden, unangetasteten alten Servers (Befund 4).
+      #
+      # KORREKTUR (Befund 4): die neue Buchung STEHT bereits (BELEGUNG_
+      # KENNUNG), aber der alte Prozess laesst sich nicht beenden -- ohne ihn
+      # kann der neue nicht auf denselben Port. Der Versuch wird deshalb
+      # VERWORFEN: die neue Buchung wird wieder freigegeben (die Meldung sagt
+      # das jetzt auch so). $KENNUNG_DATEI bleibt UNANGETASTET
+      # (--kennungsdatei-behalten) -- sie zeigt weiterhin korrekt auf den
+      # alten, WEITERHIN LAUFENDEN Server, dessen eigene Buchung nie
+      # angefasst wurde (der Stopp ist ja gescheitert). Kein "zwei Buchungen
+      # im Buch"-Risiko mehr: es bleibt nur die eine, gueltige, alte.
+      err "Kapazitaets-Neustart: alter Server (PID $KAPAZITAETS_ALTER_PID) liess sich nicht beenden -- die neue Buchung $BELEGUNG_KENNUNG wird verworfen, der alte Server laeuft mit seiner alten Kapazitaet unveraendert weiter. Von Hand pruefen: wb-mlx-server status, wb-belegung wer."
+      belegung_abbrechen --kennungsdatei-behalten
+      return 1
+    fi
+    # Ab hier ist der alte Server SICHER beendet und seine eigene Buchung
+    # (KAPAZITAETS_ALTE_KENNUNG) SICHER freigegeben (belegung_freigeben_gezielt
+    # in _stop_pruefen_und_beenden lief bereits) -- kein weiterer Freigabeschritt
+    # noetig.
+    #
+    # URSPRUENGLICH STAND HIER (erste Runde dieses Auftrags, GELOESCHT und
+    # jetzt per Loeschverbot wiederhergestellt, ZWEITE RUNDE, Wiederherstellung
+    # a) folgender, damals AKTIVER Code mit seiner Begruendung:
+    #
+    #   # Geschwister-Einzelbuchungen freigeben (Nachtrag 2026-09-08, siehe
+    #   # gebuchte_kennungen() weiter oben fuer die Entscheidung und ihre
+    #   # Begruendung): NUR bei einem kapazitaetsbedingten Neustart, und ERST HIER,
+    #   # nachdem die neue, groessere Buchung ($BELEGUNG_KENNUNG) bereits steht --
+    #   # nie davor. "wb-belegung gib ... --fremd", weil diese Buchungen fremden
+    #   # Panes gehoeren (pi-workers eigene "Eigene Sequenz"-Buchungen), nicht
+    #   # diesem wb-mlx-server-Prozess.
+    #   if [ "$KAPAZITAETS_NEUSTART" -eq 1 ] && [ -n "$BELEGUNG_KENNUNG" ]; then
+    #     local wbb_release alte_kennung
+    #     wbb_release="$(belegung_bin)"
+    #     if [ -n "$wbb_release" ]; then
+    #       gebuchte_kennungen "$basisname" "$BELEGUNG_KENNUNG" | while IFS= read -r alte_kennung; do
+    #         [ -n "$alte_kennung" ] || continue
+    #         if "$wbb_release" gib "$alte_kennung" --fremd >/dev/null 2>&1; then
+    #           err "Geschwister-Buchung $alte_kennung freigegeben -- in der neuen Buchung $BELEGUNG_KENNUNG (Kapazitaet $parallel) bereits mitgezaehlt."
+    #         else
+    #           err "WARNUNG: Geschwister-Buchung $alte_kennung liess sich nicht freigeben -- sie zaehlt jetzt zusaetzlich zur neuen Buchung $BELEGUNG_KENNUNG, also ueberschaetzt statt unterschaetzt (die sichere Richtung)."
+    #         fi
+    #       done
+    #     fi
+    #   fi
+    #
+    # ENTFAELLT SEIT DER ERSTEN RUNDE (nicht mehr aufgerufen -- gebuchte_kennungen()
+    # selbst bleibt aus demselben Loeschverbot als UEBERHOLT markiert stehen, siehe
+    # dort): der neue Server bucht NIE mehr Stroeme fuer andere Worker mit --
+    # zuerst ueber --nur-gewichte (erste Runde), inzwischen (ZWEITE RUNDE, siehe
+    # "BASISSTROM STATT --nur-gewichte" bei belegung_nehmen()) ueber einen FESTEN,
+    # eigenen Basisstrom, der KEINE fremde Worker-Buchung ersetzt oder beruehrt.
+    # In BEIDEN Fassungen gilt: es gibt keine Geschwister-Buchungen mehr, die dem
+    # Serverstart je gehoert haetten -- jede Strom-Buchung bleibt unangetastet
+    # beim Worker, der sie haelt, ein Kapazitaets-Neustart aendert daran nichts.
+    err "WICHTIG: '$laufend' (PID $KAPAZITAETS_ALTER_PID) ist jetzt beendet -- bis der angeforderte Neustart gelingt, laeuft KEIN mlx-lokal-Server mehr. Scheitert er, bleibt das so; die naechste Fehlermeldung nennt den Grund."
   fi
   mkdir -p "$(dirname "$KENNUNG_DATEI")" 2>/dev/null
   if [ -n "$BELEGUNG_KENNUNG" ]; then
@@ -2761,7 +4195,22 @@ cmd_ensure() {
     if [ -n "$denken" ]; then
       set -- "$@" --reasoning-effort "$denken"
     fi
-    newpid="$("$HOME/.local/bin/wb-nohup" "$NAME" -- mlx-dspark "$@")" || {
+    # HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE=1 an ALLEN FUENF Motor-Starts
+    # (Nachtrag 2026-09-08, Auftrag "kontextgewichte", FUENFTER TEIL, SICHERHEIT):
+    # gemessen, dass mlx_vlm.server JEDEN im Feld 'model' einer Anfrage
+    # genannten Namen von Hugging Face nachlaedt, auch wenn der Server mit
+    # einem ganz anderen Modell gestartet wurde -- eine Anfrage mit
+    # "Tongyi-MAI/Z-Image-Turbo" lud 31 GB in ~8 min, /v1/models listete danach
+    # den ganzen HF-Cache. `mlx_vlm.server --help` kennt keinen Schalter, der
+    # Fremdmodelle ablehnt. HF_HUB_OFFLINE=1 ist der Standardweg der
+    # Huggingface-Hub-Bibliothek, jeden Netzwerkzugriff hart abzulehnen, statt
+    # ihn stillschweigend auszufuehren -- lokale MLX-Modellverzeichnisse (der
+    # einzige Weg, den diese Werkbank benutzt) sind davon nicht betroffen, nur
+    # ein Nachladeversuch von aussen. Gesetzt an allen fuenf Motoren, nicht nur
+    # mlx_vlm.server: dieselbe Vorsicht kostet bei den anderen vier nichts, und
+    # ob sie dieselbe Luecke haben, ist ungemessen.
+    newpid="$(HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_CACHE="$HF_HUB_CACHE_LEER" \
+      "$HOME/.local/bin/wb-nohup" "$NAME" -- mlx-dspark "$@")" || {
       err "wb-nohup konnte mlx-dspark nicht starten — siehe $LOG"
       belegung_abbrechen; return 1
     }
@@ -2776,9 +4225,9 @@ cmd_ensure() {
     #
     # --paged-kv-quantization (NACHTRAG 11, 2026-08-21): der KV-Cache laeuft
     # auf 8 Bit, siehe KV_QUANT oben und die Hausregel dort. mtplx ist der
-    # EINZIGE der vier Motoren, der den Schalter ueberhaupt hat -- deshalb
-    # steht die Hausregel bis heute nur hier im Code, und deshalb muss sie
-    # gerade hier stehen: fuer diesen Motor gab es keinen Grund, sie nicht
+    # EINZIGE der fuenf Motoren, der den Schalter FEST GESETZT bekommt --
+    # deshalb steht die Hausregel bis heute nur hier im Code, und deshalb muss
+    # sie gerade hier stehen: fuer diesen Motor gab es keinen Grund, sie nicht
     # einzuhalten, ausser dass niemand den Schalter gesucht hat.
     #
     # --context-window: der Server faehrt mit dem Fenster, das GEBUCHT wurde.
@@ -2795,7 +4244,8 @@ cmd_ensure() {
     if [ -n "$denken" ]; then
       set -- "$@" --reasoning-effort "$denken"
     fi
-    newpid="$("$HOME/.local/bin/wb-nohup" "$NAME" -- mtplx "$@")" || {
+    newpid="$(HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_CACHE="$HF_HUB_CACHE_LEER" \
+      "$HOME/.local/bin/wb-nohup" "$NAME" -- mtplx "$@")" || {
       err "wb-nohup konnte mtplx nicht starten — siehe $LOG"
       belegung_abbrechen; return 1
     }
@@ -2835,8 +4285,237 @@ cmd_ensure() {
     # gehoerte zur gemessenen Fassung und bleibt deshalb gesetzt.
     newpid="$(VLLM_METAL_MEMORY_FRACTION="$buendel_fraktion" \
       VLLM_METAL_USE_PAGED_ATTENTION=1 \
+      HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_CACHE="$HF_HUB_CACHE_LEER" \
       "$HOME/.local/bin/wb-nohup" "$NAME" -- "$buendel_bin" "$@")" || {
       err "wb-nohup konnte vllm nicht starten — siehe $LOG"
+      belegung_abbrechen; return 1
+    }
+  elif [ "$motor" = "mlx-vlm" ]; then
+    # mlx_vlm.server (Nachtrag 22, 2026-08-27) -- eigenstaendiges Werkzeug,
+    # dasselbe Modell wie mlx_lm.server ueber denselben MLX-Kern, aber ein
+    # eigener Ladepfad, der (anders als mlx_lm.server, siehe Null-Resultat
+    # Nachtrag 7) einen externen Entwerfer wirklich annimmt UND dessen Bauart
+    # unterscheidet: --draft-kind {dflash,eagle3,mtp} kommt aus der Registry
+    # (vorh_draftkind, siehe Motorwahl oben), NICHT geraten.
+    #
+    # FALLSTRICK 1 (Auftrag 2026-08-27, echt erlebt): der Server nimmt fuer
+    # `model` im Anfragekoerper NUR einen vollen Pfad an -- ein Kurzname loest
+    # einen HuggingFace-Ladeversuch aus und antwortet 400. bedienter_modellname()
+    # weiss das schon (motor != "mtplx" -> Fallback bleibt der Pfad), hier
+    # steht nur die Erinnerung, warum $MODEL_PATH unten unveraendert bleibt.
+    #
+    # FALLSTRICK 2 (Auftrag 2026-08-27, echt erlebt): ohne jinja2 im selben
+    # Werkzeugbaum scheitert jede Chat-Anfrage mit "apply_chat_template
+    # requires jinja2" (HTTP 500) -- der Server startet trotzdem sauber und
+    # meldet "Drafter ready". Die Probeanfrage weiter unten prueft eine ECHTE
+    # Antwort, kein reiner /health-Rauchtest -- genau deshalb faengt sie das ab.
+    set -- --model "$MODEL_PATH" --draft-model "$vorh_modell" \
+      --draft-kind "$vorh_draftkind" \
+      --host 127.0.0.1 --port "$PORT"
+    if [ -n "$vorh_draftblocksize" ]; then
+      set -- "$@" --draft-block-size "$vorh_draftblocksize"
+    fi
+    # --enable-thinking: Vorgabe des Nutzers vom 2026-08-29, "ja immer enable
+    # thinking". Sie stellt die stehende Regel "Worker denken immer, mindestens
+    # low" auf diesem Weg ueberhaupt erst wieder her.
+    #
+    # ANLASS, GEMESSEN gegen den laufenden Server, dreimal dieselbe Aufgabe:
+    #   ohne Angabe            398 Antwort-Token, Denkspur    0 Zeichen
+    #   enable_thinking=True   292 Antwort-Token, Denkspur  570 Zeichen
+    # Der MTP-Weg dachte also GAR NICHT. Die Schutzvorgabe aus der Registry
+    # (chatTemplateArgs={"reasoning_effort":"low"}, Nachtrag 3) greift hier
+    # nicht: sie ist fuer mlx_lm.server gebaut, und mlx_vlm.server kennt
+    # `reasoning_effort` nicht -- drei Anfragen mit xhigh, low und ohne Angabe
+    # lieferten Token fuer Token dieselbe Antwort. Dieser Motor hat stattdessen
+    # eigene Schalter (--enable-thinking, --thinking-budget, siehe
+    # `mlx_vlm.server --help`), und seit er am 2026-08-27 der Vorgabeweg wurde,
+    # lief jeder qwen38-Worker ohne Denkleistung.
+    #
+    # Bewusst OHNE --thinking-budget: die Denktiefe soll nicht beschnitten
+    # werden (der Nutzer am selben Tag: hohe Denkstufe bleibt, angepasst werden
+    # die ANWEISUNGEN). Ein Aufrufer, der es anders braucht, setzt
+    # enable_thinking oder thinking_budget je Anfrage -- beides ueberschreibt
+    # diese Vorgabe, wie `--help` des Motors ausdruecklich sagt.
+    set -- "$@" --enable-thinking
+    # --max-kv-size: der einzige Kontextschalter, den dieser Motor kennt
+    # (siehe laufender_kontext -- ohne ihn liefe der Server auf dem
+    # Modellmaximum, waehrend das Buch $kontext eintraegt). Was gebucht ist,
+    # laeuft, wie bei mtplx/vllm-metal.
+    set -- "$@" --max-kv-size "$kontext"
+    # --max-tokens: NACHGETRAGEN 2026-08-27, an einem echten Worker-Lauf gefunden.
+    # Ohne diesen Schalter gilt die Vorgabe des Werkzeugs von 2048 Token je Antwort --
+    # und die ist fuer einen Worker viel zu klein: der Messlauf brach mitten im Schreiben
+    # ab, der Server meldete `finish_reason=length` bei genau 2048, und im Pane stand
+    # "Response was truncated before completion".
+    #
+    # KORRIGIERT wenige Stunden spaeter, am selben Tag, weil die erste Fassung
+    # (kontext/2) einen zweiten Fehler einbaute: dieser Motor prueft `Prompt +
+    # max_tokens <= MAX_KV_SIZE` und lehnt sonst mit HTTP 400 ab. Der Deckel ist
+    # also nicht nur eine Obergrenze fuer die Antwort, er NIMMT dem Prompt genau
+    # so viel Platz weg. Mit kontext/2 blieben von 32768 Token nur 16384 fuer das
+    # Gespraech -- ein Worker, dessen Sitzung darueber hinauswuchs, bekam auf JEDE
+    # weitere Anfrage "Error: 400 status code (no body)" (erlebt im warmen Lauf von
+    # dflash2, zweimal; der Wortlaut des Servers dazu lautet "Request needs 37540
+    # context tokens (37520 prompt + 20 max generation), but MAX_KV_SIZE is 32768").
+    # Ein Viertel laesst dem Gespraech drei Viertel des Fensters und deckt trotzdem
+    # jede Antwort, die heute gemessen wurde (die laengste hatte 5216 Token).
+    set -- "$@" --max-tokens "$(( kontext / 4 ))"
+    # --kv-bits: seit 2026-08-27 GEMESSEN und deshalb gesetzt. Die Lueckennotiz,
+    # die hier stand ("existiert, ist aber an dieser Hybridarchitektur nicht
+    # gemessen"), ist damit geschlossen. Anders als mlx-dspark, das den Schalter
+    # fuer diesen Koerper rundheraus ablehnt ("their recurrent-state caches are
+    # not KV caches"), nimmt mlx_vlm.server ihn an und sagt es beim Start:
+    # "KV cache quantization: bits=8.0 scheme=uniform". Gemessen wurde nicht nur
+    # der Start, sondern eine echte Antwort -- eine Anfrage mit 10556 Prompt-Token
+    # kam inhaltlich korrekt und mit intakten Umlauten zurueck, und 3000 Token
+    # liefen mit 22,8 Tok/s, also in derselben Spanne wie ohne Quantisierung
+    # (24,19 kalt / 21,70 warm). Der Cache kostet damit 0,0332 statt 0,0625
+    # MiB/Token, bei 32768 Token also 1,06 statt 2,00 GiB.
+    #
+    # --kv-group-size 64 steht ausdruecklich da und ist keine Kosmetik: der
+    # gebuchte Wert wurde mit QuantizedKVCache(bits=8, group_size=64) gemessen,
+    # und eine andere Gruppengroesse waere eine andere Zahl. Was gebucht ist,
+    # laeuft.
+    #
+    # NACHTRAG 24 (2026-09-01) -- KV-QUANTISIERUNG UND MEHRERE STROEME SCHLIESSEN
+    # EINANDER AUS, UND ZWAR AN EINER EINZIGEN ZEILE FREMDEN CODES:
+    #   mlx_vlm/models/qwen3_5/language.py:827
+    #     if hasattr(cache, "bits") or queries.ndim != 4 or keys.ndim != 4:
+    #         return None
+    # Sobald der Cache quantisiert ist, steigt die gebuendelte Aufmerksamkeit aus
+    # und der Rueckfall dahinter greift -- der erwartet ein Array, bekommt aber
+    # die quantisierten Keys als Tupel und stirbt mit
+    #   AttributeError: 'tuple' object has no attribute 'shape'
+    #   speculative_verifier.py:1269, prefix_length = keys.shape[-2] - length
+    # GEMESSEN am 01.09.2026, vier Konfigurationen, je eigener Serverstart:
+    #   --kv-bits 8                                  -> HTTP 500 ab 2 Stroemen
+    #   --kv-bits 8 --quantized-kv-start 2048        -> HTTP 500 ab 2 Stroemen
+    #   --kv-bits 8 --kv-key-bits 16 --kv-value-bits 8 -> HTTP 500 ab 2 Stroemen
+    #   ohne --kv-bits                               -> laeuft bis 4 Stroeme
+    # Der Startindex hilft nicht, weil die Pruefung am TYP des Caches haengt und
+    # nicht daran, ob schon quantisiert wurde; getrennte Bitbreiten helfen aus
+    # demselben Grund nicht. mlx-vlm 0.6.17 ist die neueste Fassung -- ein
+    # Update behebt es nicht, weil es schon das Update ist. Nicht blind gepatcht:
+    # der Rueckfall schneidet danach in keys/values hinein, das ist mehr als eine
+    # Zeile, und ein falscher Fix erzeugt hier stille Zahlenfehler statt eines
+    # Absturzes.
+    #
+    # ALSO: EIN Strom behaelt die Quantisierung (der Cache kostet dann 0,0332
+    # statt 0,0625 MiB/Token), MEHRERE bekommen sie nicht. Entscheidung des Nutzers
+    # vom 01.09.2026 im Wortlaut: "wenn kv quant dann wirklich nicht geht, dann
+    # denk daran das es bei einem modell immernoch an bleibt nur bei mehreren aus".
+    # Was mehrere Stroeme dafuer einbringen, GEMESSEN am selben Abend (300 Token
+    # je Strom, gleiche Laenge erzwungen, Tok/s gesamt / je Strom):
+    #   1 Strom   20,2 / 20,2      2 Stroeme 32,1 / 16,0
+    #   3 Stroeme 31,2 / 10,5      4 Stroeme 30,8 /  7,7
+    # Der Gewinn sitzt bei ZWEI (+59 % gesamt); darueber bleibt die Gesamtrate
+    # stehen. Ab drei Stroemen ist die Buendelung OHNE Vorhersage besser
+    # (51,5 Tok/s gesamt, NACHTRAG 9) -- der Motorwechsel dort bleibt richtig.
+    # MESSBEDINGUNG, die dazugehoert: die Zahlen oben entstanden am 01.09.2026
+    # auf der damals INSTALLIERTEN Fassung dieses Skripts, und die trug
+    # --enable-thinking noch nicht (das Repo schon -- die Kopie unter
+    # ~/.local/bin war aelter, aufgefallen erst durch wb-consistency danach).
+    # Gemessen wurde also ohne Denkspur. Fuer die Frage, OB der Durchsatz mit
+    # der Stromzahl waechst, aendert das nichts; die absoluten Raten koennen
+    # mit Denken anders liegen, weil je Aufgabe mehr Token entstehen.
+    if [ "$parallel" -gt 1 ]; then
+      err "Mehrere Stroeme ($parallel): --kv-bits bleibt WEG. Quantisierter KV-Cache und gebuendeltes spekulatives Dekodieren schliessen sich in mlx-vlm 0.6.17 aus (language.py:827, dann AttributeError in speculative_verifier.py:1269) -- GEMESSEN 01.09.2026, auch mit --quantized-kv-start und getrennten Key/Value-Bits. Der Cache kostet dadurch 0,0625 statt 0,0332 MiB/Token."
+      set -- "$@" --max-num-seqs "$parallel"
+    else
+      # NACHTRAG 2026-09-10: Vorgabe OHNE --kv-bits (Messung bei KV_QUANT_MLX_VLM
+      # oben: 19,6 statt 14,5 tok/s bei 38k Kontext). Wer den kleineren Cache
+      # braucht, setzt WB_MLX_SERVER_KV_QUANT=q8 oder q4 ausdruecklich.
+      # ${...:-off}: test-mlx-server-mlx-vlm-070.sh sourct nur diesen Block, ohne
+      # den Kopf, in dem KV_QUANT_MLX_VLM gesetzt wird.
+      case "${KV_QUANT_MLX_VLM:-off}" in
+        q8) set -- "$@" --kv-bits 8 --kv-group-size 64 ;;
+        q4) set -- "$@" --kv-bits 4 --kv-group-size 64 ;;
+        *)  err "KV-Cache unquantisiert (Vorgabe fuer mlx_vlm.server seit 2026-09-10: 19,6 statt 14,5 tok/s bei 38k Kontext; WB_MLX_SERVER_KV_QUANT=q8 schaltet zurueck)." ;;
+      esac
+    fi
+    # --model-discovery served (Auftrag (C) Punkt 3, nur ab 0.7.0, siehe
+    # model_discovery_ok oben): ohne den Schalter listet /v1/models den
+    # GANZEN Hugging-Face-Cache dieser Maschine (gemessen 20:59 Uhr, siehe
+    # SICHERHEIT weiter oben bei HF_HUB_OFFLINE) -- "served" begrenzt das auf
+    # das wirklich geladene Modell.
+    if [ "$model_discovery_ok" -eq 1 ]; then
+      set -- "$@" --model-discovery served
+    fi
+    # APC-Umgebung (Auftrag (C) Punkt 2, nur wenn apc_aktiv=1, siehe oben):
+    # APC hat KEINE Befehlszeilenschalter, nur Umgebungsvariablen. 16 Token je
+    # Block ist die im Auftrag genannte Blockgroesse; APC_NUM_BLOCKS x 16
+    # deckt damit genau $kontext Token ab (Vorgabe im Auftrag: 2048 Bloecke x
+    # 16 = 32768 fuer einen 32k-Kontext -- dieselbe Formel, allgemein
+    # geschrieben). APC_EXACT_CACHE_ENTRIES=2 ist der im Auftrag genannte
+    # Wert; Hybridmodelle laufen im APC laut dessen eigenem Kopfkommentar
+    # (apc.py) im checkpoint/exact-Modus.
+    #
+    # x $parallel (Nachtrag 2026-09-08, Auftrag "buchung", Kleinkram-Befund
+    # "APC_NUM_BLOCKS deckt nur einen Strom"): der Pool ist EIN gemeinsamer Topf
+    # fuer ALLE gleichzeitigen Stroeme, nicht je Strom ein eigener -- bei
+    # mehreren Stroemen mit unterschiedlichen, nicht geteilten Praefixen deckt
+    # ein Pool fuer nur $kontext Token (statt $kontext x $parallel) den
+    # Bedarf nicht, der Pool wirft dann staendig noch relevante Eintraege
+    # hinaus. Dieselbe Skalierung wie bei der Buchung selbst (siehe cache_gib
+    # weiter oben, cache_ist_exakt) -- eine Quelle fuer "wie gross muss der
+    # Pool sein", nicht zwei auseinanderlaufende.
+    local apc_env=()
+    if [ "$apc_aktiv" -eq 1 ]; then
+      # APC_EXACT_CACHE_ENTRIES und die Knoepfe darunter: NACHTRAG 2026-09-10,
+      # Auftrag "apcspeicher" (Bedeutung und Pruefung bei apc_gewuenscht oben).
+      # VORGABE: SCHLANK an, sobald der Patch da ist (apc_patch_ok, siehe die
+      # mlx-vlm-Pruefung), und ein Schnappschuss je Strom. Ohne Patch bleiben
+      # es zwei Eintraege: mlx_vlm legt dann je Anfrage zwei Schnappschuesse an
+      # (N-1 und N), und nur N-1 trifft eine Fortsetzung -- mit einem Eintrag
+      # bliebe ausgerechnet der nutzlose uebrig (gemessen, Stufe 38k Runde 1).
+      local apc_schlank_wirkt=0 apc_eintraege_vorgabe=2
+      if [ "${WB_MLX_SERVER_APC_SCHLANK:-1}" = 1 ] && [ "${apc_patch_ok:-0}" -eq 1 ]; then
+        apc_schlank_wirkt=1
+        apc_eintraege_vorgabe="$parallel"
+      fi
+      apc_env=(APC_ENABLED=1 "APC_NUM_BLOCKS=$(( kontext * parallel / 16 ))" "APC_EXACT_CACHE_ENTRIES=${WB_MLX_SERVER_APC_EINTRAEGE:-$apc_eintraege_vorgabe}")
+      if [ "$apc_schlank_wirkt" -eq 1 ]; then
+        # APC_WB_CACHE_LIMIT_GB (WB_MLX_SERVER_APC_POOL_GB, Vorgabe 0 = kein
+        # Deckel): Deckel fuer MLXs Vorrat freigegebener Puffer. Er ist belegter
+        # Metal-Speicher (bei 60k Token lagen 10 GiB darin, neben 24 GiB aktiv),
+        # aber MLX gibt ihn selbst frei, sobald aktiv + Vorrat 95 % des
+        # Metal-Arbeitssatzes erreichen (gemessen bei 128k: 25,6 + 14,0 GiB).
+        # Ob ein Deckel Dekodierrate kostet, ist UNBELEGT: der Lauf mit 2 GiB
+        # brach bei 38k ein, der Kontrolllauf OHNE Deckel unter derselben
+        # Fremdlast genauso (2026-09-10). Vorgabe bleibt deshalb das unveraenderte
+        # Verhalten von mlx_vlm; der Deckel ist fuer knappe Lagen da.
+        apc_env+=(APC_WB_ONE_STORE=1 APC_WB_LEAN_STORE=1 APC_WB_LEAN_LOOKUP=1 APC_WB_FREE_DONE=1)
+        if [ "${WB_MLX_SERVER_APC_POOL_GB:-0}" != 0 ]; then
+          apc_env+=("APC_WB_CACHE_LIMIT_GB=$WB_MLX_SERVER_APC_POOL_GB")
+        fi
+      fi
+      if [ -n "${WB_MLX_SERVER_APC_SNAPSHOT_BITS:-}" ]; then
+        apc_env+=("APC_WB_SNAPSHOT_BITS=$WB_MLX_SERVER_APC_SNAPSHOT_BITS")
+      fi
+      # 2 = zusaetzlich eine Zeile je Prefill-Chunk (Fehlersuche).
+      case "${WB_MLX_SERVER_APC_MEMLOG:-0}" in
+        1|2) apc_env+=("APC_WB_MEMLOG=$WB_MLX_SERVER_APC_MEMLOG") ;;
+      esac
+      if [ -n "${WB_MLX_SERVER_APC_DISK:-}" ]; then
+        # APC_DISK_MIN_FREE_RAM_GB=0: sonst laedt mlx_vlm nichts von der SSD
+        # zurueck, sobald "frei + inaktiv" unter 2 GB liegt -- auf diesem Mac der
+        # Normalzustand (vm_stat; psutil fehlt im venv).
+        apc_env+=("APC_DISK_PATH=$WB_MLX_SERVER_APC_DISK" "APC_DISK_MAX_GB=${WB_MLX_SERVER_APC_DISK_GB:-64}" APC_DISK_MIN_FREE_RAM_GB=0)
+      fi
+    fi
+    # "env ..." statt Array-Elemente direkt vor den Befehl zu stellen: ein per
+    # "${arr[@]}" expandiertes Element wird von bash NICHT als
+    # Umgebungszuweisung erkannt (das geht nur bei woertlich im Quelltext
+    # stehenden VAR=wert-Woertern) -- GEMESSEN, das fruehere "${apc_env[@]}"
+    # direkt vor wb-nohup scheiterte mit "APC_ENABLED=1: command not found".
+    # `env` nimmt VAR=wert-Argumente dagegen ausdruecklich als eigene, nicht
+    # als Shell-Syntax entgegen und setzt sie fuer den Kindprozess -- bei
+    # leerem apc_env (APC nicht aktiv) ruft es "env" ohne Zusatzargumente auf,
+    # was wirkungslos ist (keine Verhaltensaenderung ausserhalb von APC).
+    newpid="$(HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_CACHE="$HF_HUB_CACHE_LEER" \
+      env "${apc_env[@]+"${apc_env[@]}"}" \
+      "$HOME/.local/bin/wb-nohup" "$NAME" -- "$MLX_VLM_BIN" "$@")" || {
+      err "wb-nohup konnte mlx_vlm.server nicht starten — siehe $LOG"
       belegung_abbrechen; return 1
     }
   else
@@ -2845,7 +4524,7 @@ cmd_ensure() {
     # die niemand einhaelt -- genau der Fehler, den --context-window bei mtplx
     # behoben hat.
     local cache_bytes
-    cache_bytes="$(awk -v g="$PROMPT_CACHE_GIB" 'BEGIN { printf "%d", g * 1024 * 1024 * 1024 }')"
+    cache_bytes="$(LC_ALL=C awk -v g="$PROMPT_CACHE_GIB" 'BEGIN { printf "%d", g * 1024 * 1024 * 1024 }')"
     set -- --model "$MODEL_PATH" --port "$PORT" \
       --decode-concurrency "$decode_conc" \
       --prompt-concurrency "$prompt_conc" \
@@ -2868,32 +4547,70 @@ cmd_ensure() {
     # Entwerfer-Weg ist fuer diese Architektur nachweislich unmoeglich (siehe
     # Kopfkommentar) -- ein Entwerfer laeuft ausschliesslich ueber den
     # motor=mlx-dspark-Zweig oben.
-    newpid="$("$HOME/.local/bin/wb-nohup" "$NAME" -- mlx_lm.server "$@")" || {
+    newpid="$(HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_CACHE="$HF_HUB_CACHE_LEER" \
+      "$HOME/.local/bin/wb-nohup" "$NAME" -- mlx_lm.server "$@")" || {
       err "wb-nohup konnte den Server nicht starten — siehe $LOG"
       belegung_abbrechen; return 1
     }
   fi
   echo "wb-mlx-server: gestartet (PID $newpid, Modell ${RES_ID:-$MODEL_PATH}), warte auf Antwortbereitschaft..." >&2
 
+  # SOFORT auf Prozess-Halter umhaengen (Nachtrag 2026-09-08, ZWEITE RUNDE,
+  # Auftrag "buchung", Risiko 11): NICHT erst nach Health/Probeanfrage. Das
+  # Laden eines grossen Modells dauert Minuten (siehe health_frist weiter
+  # unten, bis zu 300s) -- solange die Buchung bis dahin noch am aufrufenden
+  # Pane haengt, verfaellt sie, wenn GENAU DIESER (oft kurzlebige) Pane
+  # waehrend des Ladens stirbt, obwohl der Serverprozess selbst voellig
+  # gesund weiterlaedt (genau das Fenster, das Befund 1 fuer den ABGESCHLOSSENEN
+  # Zustand schon behoben hat -- hier bleibt es fuer den LADENDEN Zustand offen,
+  # solange der Umhaenge-Aufruf erst nach 'wait_health' faellt).
+  #
+  # 'wb-belegung uebernehmen --pid' statt 'geladen --pid --prozess-haelt': Der
+  # Unterschied ist entscheidend. 'geladen' markiert 'realisiert=True' -- das
+  # Modell steht DANN im Speicher, Grenze A hoert auf, die Buchung als "laedt
+  # noch" abzuziehen. Waere DAS schon hier, vor jedem echten Fortschritt,
+  # gesetzt, verloere Grenze A genau den Schutz gegen eine zweite, gleichzeitig
+  # ladende Buchung, den der Kopfkommentar von wb-belegung ausdruecklich
+  # beschreibt ("EINE BELEGUNG LAEDT ERST UND IST DANN REALISIERT"). 'uebernehmen
+  # --pid' aendert NUR den Halter (Pane -> Prozess), ruehrt 'realisiert' nicht
+  # an -- die spaetere 'geladen --pid --prozess-haelt' nach Health/Probeanfrage
+  # bleibt UNVERAENDERT bestehen und markiert weiterhin exakt den Moment, in dem
+  # das Modell wirklich antwortet (dort jetzt ein wirkungsloses, aber
+  # unschaedliches zweites Umhaengen auf denselben Halter).
+  if [ -n "$BELEGUNG_KENNUNG" ]; then
+    local wbb_frueh; wbb_frueh="$(belegung_bin)"
+    [ -n "$wbb_frueh" ] && "$wbb_frueh" uebernehmen "$BELEGUNG_KENNUNG" --pid "$newpid" 2>&1
+  fi
+
   # DIE NOTBREMSE, ab jetzt bei jedem Modellstart (NACHTRAG 13, Auftrag des Nutzers
   # vom 21.08.2026). Sie ist die letzte Sicherung UNTERHALB der Buchung: faellt der
-  # freie Speicher trotz allem unter 1 GiB, beendet sie die lokalen Modelle, bevor
+  # freie Speicher trotz allem unter die Schwelle (WAR 1 GiB; seit 2026-08-27
+  # 512 MiB, siehe wb-notbremse SCHWELLE_MIB), beendet sie das Modell, bevor
   # die Maschine steht. Sie wird HIER gestartet und nicht dauerhaft gehalten
   # (stehende Regel vom 20.08.: kein Prozess laeuft auf Vorrat) und endet von
-  # selbst, sobald kein Modellprozess mehr laeuft. Ein zweiter Aufruf ist
-  # wirkungslos. Sie darf einen Serverstart NIE verhindern -- deshalb `|| true`
-  # samt eigener, sichtbarer Zeile statt eines Abbruchs: eine fehlende Bremse ist
-  # schlechter als keine, aber ein verhinderter Start ist es auch.
+  # selbst, sobald der Modellprozess weg ist. Sie darf einen Serverstart NIE
+  # verhindern -- deshalb `|| true` samt eigener, sichtbarer Zeile statt eines
+  # Abbruchs: eine fehlende Bremse ist schlechter als keine, aber ein
+  # verhinderter Start ist es auch.
   # Auch hier die installierte Fassung zuerst, aus demselben Grund wie bei
   # belegung_bin() -- ein Test mit eigenem HOME muss eine Attrappe unterschieben
   # koennen, sonst startet er im Testbett eine echte Wache.
+  #
+  # --pid "$newpid" (Nachtrag 27.08.2026): die PID kommt direkt von `wb-nohup`
+  # weiter oben -- keine Musterjagd durch die Prozesstabelle noetig, wenn der
+  # Aufrufer seine eigene PID schon kennt (Hausregel: `pgrep -f` trifft auch
+  # den Agenten-Prompt, in dem der Suchbegriff vorkommt). Ein zweiter Aufruf
+  # mit DERSELBEN PID bleibt wirkungslos wie bisher; ein Modellwechsel (neue
+  # PID) startet jetzt korrekt eine EIGENE Wache fuer den neuen Prozess, statt
+  # sich auf eine alte zu verlassen, die noch in ihrer Anlauffrist auf das
+  # Verschwinden des vorigen Modells wartet (siehe piddatei_fuer() dort).
   local notbremse="$HOME/.local/bin/wb-notbremse"
   [ -x "$notbremse" ] || notbremse="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/wb-notbremse"
   if [ -x "$notbremse" ]; then
-    "$notbremse" start >&2 \
-      || err "WARNUNG: wb-notbremse liess sich nicht starten — dieser Server laeuft OHNE die Notabschaltung unter 1 GiB frei."
+    "$notbremse" start --pid "$newpid" >&2 \
+      || err "WARNUNG: wb-notbremse liess sich nicht starten — dieser Server laeuft OHNE die Notabschaltung."
   else
-    err "WARNUNG: wb-notbremse fehlt ($notbremse) — dieser Server laeuft OHNE die Notabschaltung unter 1 GiB frei."
+    err "WARNUNG: wb-notbremse fehlt ($notbremse) — dieser Server laeuft OHNE die Notabschaltung."
   fi
 
   # Wartefrist je Motor. Die 90 s reichen fuer die drei MLX-Motoren, die die
@@ -2907,20 +4624,24 @@ cmd_ensure() {
   if [ "$motor" = "vllm-metal" ]; then health_frist=300; fi
   if ! wait_health "$health_frist"; then
     err "Server antwortet nach ${health_frist}s nicht auf /health — siehe $LOG"
-    belegung_abbrechen; return 1
+    # --pid (Nachtrag 2026-09-08, Auftrag "buchung", Befund 3): der Prozess IST
+    # exec't, wurde aber nie gesund -- ohne ihn zu beenden bliebe er als
+    # unbeaufsichtigte, unbebuchte Karteileiche stehen (belegung_abbrechen gibt
+    # nur die Buchung frei, nicht den Prozess selbst).
+    belegung_abbrechen --pid "$newpid"; return 1
   fi
 
   echo "wb-mlx-server: /health antwortet, sende Probeanfrage..." >&2
   local resp
   if ! resp="$(probe_request "$MODEL_PATH")"; then
     err "Probeanfrage fehlgeschlagen — Server ist erreichbar, liefert aber keine gueltige Antwort. Siehe $LOG"
-    belegung_abbrechen; return 1
+    belegung_abbrechen --pid "$newpid"; return 1
   fi
   if ! printf '%s' "$resp" | python3 -c 'import json,sys
 d=json.load(sys.stdin)
 sys.exit(0 if d.get("choices") else 1)' 2>/dev/null; then
     err "Probeanfrage lieferte kein gueltiges Ergebnis: $resp"
-    belegung_abbrechen; return 1
+    belegung_abbrechen --pid "$newpid"; return 1
   fi
 
   if [ -n "$BELEGUNG_KENNUNG" ]; then
@@ -2933,7 +4654,11 @@ sys.exit(0 if d.get("choices") else 1)' 2>/dev/null; then
     # eingeschlossen -- $newpid ist die PID, die gerade wirklich antwortet
     # (health/Probeanfrage sind bereits durch), also dieselbe, die spaeter
     # gegen 'tot' geprueft werden soll.
-    [ -n "$wbb" ] && "$wbb" geladen "$BELEGUNG_KENNUNG" --pid "$newpid" 2>&1
+    # --prozess-haelt (Nachtrag 2026-09-08, Auftrag "buchung", Befund 1): ab
+    # jetzt haelt der PROZESS diese Buchung, nicht mehr der (moeglicherweise
+    # laengst wieder geschlossene) Pane, der 'ensure' aufgerufen hat -- siehe
+    # wb-belegungs Kopfkommentar "EIN PROZESS KANN AUCH DER HALTER SEIN".
+    [ -n "$wbb" ] && "$wbb" geladen "$BELEGUNG_KENNUNG" --pid "$newpid" --prozess-haelt 2>&1
   fi
 
   aktuell_schreiben "$RES_ID" "$RES_ALIAS" "$MODEL_PATH" "$kontext" "$BELEGUNG_KENNUNG"
@@ -2944,6 +4669,28 @@ sys.exit(0 if d.get("choices") else 1)' 2>/dev/null; then
   # ist und keine Meldung an den Menschen.
   printf 'modell=%s\n' "$(bedienter_modellname "$motor" "$MODEL_PATH")"
   printf 'pid=%s\n' "$newpid"
+  # gestartet=frisch (Nachtrag 2026-09-08, ZWEITE RUNDE, Auftrag (A);
+  # BEDEUTUNG GEAENDERT 2026-09-08, Auftrag "buchung", Befund 1/5): dieser
+  # Rueckgabepunkt ist der EINZIGE Erfolgspfad in cmd_ensure, der einen echten
+  # (Neu-)Start durchlaeuft -- der "kein Start noetig"-Kurzschluss kehrt weiter
+  # oben, vor diesem Punkt, mit einem eigenen return 0 zurueck (siehe dort) und
+  # druckt diese Zeile nie. FRUEHER bedeutete das: der Serverstart bucht schon
+  # EINE Sequenz mit, pi-worker liest diese Zeile und laesst seine eigene
+  # "Eigene Sequenz"-Buchung deshalb aus. Das galt nur, solange der Serverstart
+  # ueberhaupt Stroeme buchte (KAPAZITAETS_NEUSTART-Ratchet) -- seit
+  # --nur-gewichte (siehe belegung_nehmen()) bucht der Serverstart NIE mehr
+  # einen Strom fuer den Aufrufer, jeder Worker bucht IMMER seine eigene
+  # Sequenz, auch beim allerersten Kaltstart (siehe shell/pi-worker, "Eigene
+  # Sequenz buchen" -- der dortige Sonderfall fuer diese Zeile ist entfallen).
+  # Diese Zeile bleibt als reine Information stehen ("es war wirklich ein
+  # (Neu-)Start, kein Wiederverwenden"), steuert aber keine Buchungsentscheidung
+  # mehr.
+  printf 'gestartet=frisch\n'
+  # Nachtrag 2026-09-08: Marker fuer den Aufrufer (siehe KAPAZITAETS_NEUSTART
+  # oben) -- ohne ihn liest sich dieser Start wie ein ganz gewoehnlicher
+  # Kaltstart, obwohl er in Wahrheit einen zu klein gewordenen Server abgeloest
+  # hat. pi-worker liest diese Zeile und meldet den Neustart weiter.
+  [ "$KAPAZITAETS_NEUSTART" -eq 1 ] && printf 'neustart=kapazitaet\n'
   return 0
 }
 
@@ -2963,7 +4710,7 @@ cmd_stop() {
     return 0
   fi
   if ! is_ours "$pid"; then
-    err "Port $PORT ist belegt von PID $pid, aber von keinem der vier bekannten Motoren (mlx_lm.server, mlx-dspark, mtplx, vllm) — nichts beendet."
+    err "Port $PORT ist belegt von PID $pid, aber von keinem der fuenf bekannten Motoren (mlx_lm.server, mlx-dspark, mtplx, vllm, mlx_vlm.server) — nichts beendet."
     return 1
   fi
 

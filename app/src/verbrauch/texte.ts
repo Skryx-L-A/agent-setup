@@ -15,7 +15,7 @@ export type Sprache = 'de' | 'en';
 /** Sortiert wie die Oberflaeche: Rahmen, dann Abschnitt fuer Abschnitt von oben nach unten. */
 export const DE: Record<string, string> = {
   // --- Rahmen ---------------------------------------------------------------
-  'fenster.titel': 'Agent-Workbench — Verbrauch',
+  'fenster.titel': 'Agent-Workbench – Verbrauch',
   'kopf.titel': 'Verbrauch',
   'kopf.unterzeile': 'Alle Harnesses, die auf dieser Maschine eine lesbare Spur hinterlassen. Zeitraum, Harness und Modell lassen sich unten einschränken.',
   'laden': 'wird gelesen …',
@@ -54,7 +54,7 @@ export const DE: Record<string, string> = {
 
   // --- Cache-Lesen ----------------------------------------------------------
   'cache.titel': 'Cache-Lesen, getrennt gezeichnet',
-  'cache.grund': 'Cache-Lesen ist im gewählten Zeitraum {0}-mal so groß wie alles übrige zusammen. Auf einer gemeinsamen linearen Achse bliebe vom Rest ein Strich — deshalb zwei Diagramme statt eines.',
+  'cache.grund': 'Cache-Lesen ist im gewählten Zeitraum {0}-mal so groß wie alles übrige zusammen. Auf einer gemeinsamen linearen Achse bliebe vom Rest ein Strich – deshalb zwei Diagramme statt eines.',
   'cache.grund.klein': 'Cache-Lesen ist im gewählten Zeitraum {0}-mal so groß wie alles übrige. Das trägt eine gemeinsame Achse noch.',
   'cache.diagramm.ohne': 'Eingabe, Ausgabe, Cache-Schreiben',
   'cache.diagramm.nur': 'Cache-Lesen allein',
@@ -84,28 +84,38 @@ export const DE: Record<string, string> = {
 
   // --- Kosten ---------------------------------------------------------------
   'kosten.titel': 'Geld und Kontingent',
-  'kosten.zwei': 'Zwei Größen mit verschiedenen Nennern, die nie zu einer Zahl addiert werden: ein Dollarbetrag gilt nur, wo ein Anbieter pro Token abrechnet — die Abo-Zugänge zahlen stattdessen einen Anteil ihres Kontingents.',
+  'kosten.zwei': 'Zwei Größen mit verschiedenen Nennern, die nie zu einer Zahl addiert werden: ein Dollarbetrag gilt nur, wo ein Anbieter pro Token abrechnet – die Abo-Zugänge zahlen stattdessen einen Anteil ihres Kontingents.',
   'kosten.usd': 'Betrag',
   'kosten.art': 'Art',
   'kosten.art.abo-aequivalent': 'API-Äquivalent',
   'kosten.art.katalogpreis': 'Listenpreis',
   'kosten.art.harness-angabe': 'vom Harness selbst gerechnet',
   'kosten.art.kein-preis': 'kein Preis bekannt',
-  'kosten.nie_abgebucht': 'nie abgebucht — dieser Betrag sagt, was derselbe Verbrauch über die API gekostet hätte. Bezahlt wurde ein Abo.',
+  'kosten.nie_abgebucht': 'nie abgebucht – dieser Betrag sagt, was derselbe Verbrauch über die API gekostet hätte. Bezahlt wurde ein Abo.',
   'kosten.aiu': 'AIC (Copilots eigene Abrechnungseinheit)',
   'kosten.summe.aequivalent': 'Summe API-Äquivalent (nie abgebucht)',
   'kosten.summe.katalog': 'Summe Listenpreis',
   'kosten.ohne': 'ohne Preis',
 
   // --- Kontingent -----------------------------------------------------------
-  'kontingent.titel': 'Kontingent je Harness',
+  'kontingent.titel': 'Kontingente',
   'kontingent.verbraucht': 'verbraucht',
   'kontingent.rest': 'übrig',
   'kontingent.zurueck': 'fällt zurück am {0}',
   'kontingent.erschoepft': 'erschöpft',
   'kontingent.keins': 'kein Kontingent',
-  'kontingent.fehlt': 'Kein Kontingentstand verfügbar: {0}',
-  'kontingent.werkzeug.fehlt': 'wb-kontingent liegt auf diesem Stand des Programms nicht vor.',
+  'kontingent.ohnestand': 'Kontingent ohne lesbaren Stand',
+  'einheit.aic': 'AI Credits',
+  // WAS SCHIEFGING UND WIE ES WEITERGEHT (08.09.2026). Hier stand bis dahin
+  // „Kein Kontingentstand verfügbar: {0}", und {0} war die rohe Ausgabe des
+  // Werkzeugs -- an einem Rechner ohne `wb-kontingent` las der Mensch
+  // „JSONDecodeError: Expecting value…". Ein Fehler, der die Sprache seines
+  // Erzeugers spricht, sagt nichts darüber, was jetzt zu tun ist
+  // (apple-native-design, abnahme.md: „Die Fehlermeldung sagt, was schiefging
+  // und wie es weitergeht"). Der Rohtext bleibt -- im Hilfeschildchen.
+  'kontingent.fehlt': 'Das Werkzeug wb-kontingent fehlt oder antwortet nicht – Stand abfragen mit `wb-kontingent` im Terminal.',
+  'kontingent.fehlt.tipp': 'Was das Werkzeug gemeldet hat: {0}',
+  'kontingent.werkzeug.fehlt': 'Das Werkzeug hat keine Ausgabe hinterlassen.',
 
   // --- Limit ----------------------------------------------------------------
   'limit.titel': 'Der Weg zum Limit',
@@ -118,13 +128,20 @@ export const DE: Record<string, string> = {
   'limit.leer': 'Für diesen Zeitraum ist kein Limit-Stand geloggt.',
   'limit.quelle': 'Aus ~/.claude/workbench/limits.jsonl, das die Statusleiste bei jedem Zeichnen fortschreibt. Es gilt für das Anthropic-Konto als Ganzes, nicht je Modell.',
 
+  // --- Das Tagesbudget des Wochenfensters -----------------------------------
+  'wochen.erlaubt': 'erlaubt bis heute Abend',
+  'wochen.tag': 'Tag {0} von 7',
+  'wochen.luft': 'Luft {0} Punkte',
+  'wochen.darueber': 'darüber um {0} Punkte',
+  'wochen.fehlt': 'Für das Wochenfenster ist kein Stand geloggt.',
+
   // --- Sitzungen und Worker -------------------------------------------------
   'sitzung.titel': 'Je Sitzung und Worker',
   'sitzung.spalte': 'Sitzung',
   'sitzung.worker': 'Worker',
   'sitzung.ordner': 'Ordner',
   'sitzung.zeitraum': 'von … bis',
-  'sitzung.ohne_worker': '—',
+  'sitzung.ohne_worker': '–',
   'sitzung.mehr': 'weitere {0} Sitzungen nicht gezeigt',
 
   // --- Vergleich ------------------------------------------------------------
@@ -135,7 +152,7 @@ export const DE: Record<string, string> = {
   'vergleich.vorher': 'der gleich lange davor',
   'vergleich.differenz': 'Unterschied',
   'vergleich.laedt': 'der frühere Zeitraum wird gelesen …',
-  'vergleich.kein_vorher': 'Im früheren Zeitraum ist nichts verbucht — ein Prozentwert wäre hier eine Division durch null.',
+  'vergleich.kein_vorher': 'Im früheren Zeitraum ist nichts verbucht – ein Prozentwert wäre hier eine Division durch null.',
 
   // --- Lücken ---------------------------------------------------------------
   'luecke.titel': 'Was hier nicht stehen kann',
@@ -252,14 +269,17 @@ export const EN: Record<string, string> = {
   'kosten.ohne': 'no price',
 
   // --- Quota -----------------------------------------------------------
-  'kontingent.titel': 'Quota by harness',
+  'kontingent.titel': 'Quotas',
   'kontingent.verbraucht': 'used',
   'kontingent.rest': 'left',
   'kontingent.zurueck': 'resets on {0}',
   'kontingent.erschoepft': 'exhausted',
   'kontingent.keins': 'no quota',
-  'kontingent.fehlt': 'No quota status available: {0}',
-  'kontingent.werkzeug.fehlt': 'wb-kontingent is not present on this build of the program.',
+  'kontingent.ohnestand': 'quota with no readable reading',
+  'einheit.aic': 'AI credits',
+  'kontingent.fehlt': 'The tool wb-kontingent is missing or does not answer — run `wb-kontingent` in a terminal to read the status.',
+  'kontingent.fehlt.tipp': 'What the tool reported: {0}',
+  'kontingent.werkzeug.fehlt': 'The tool left no output.',
 
   // --- Limit ----------------------------------------------------------------
   'limit.titel': 'The path to the limit',
@@ -271,6 +291,13 @@ export const EN: Record<string, string> = {
   'limit.reset.naechster': 'next reset point: {0}',
   'limit.leer': 'No limit status is logged for this range.',
   'limit.quelle': 'From ~/.claude/workbench/limits.jsonl, which the status bar appends to on every draw. It applies to the Anthropic account as a whole, not per model.',
+
+  // --- Das Tagesbudget des Wochenfensters -----------------------------------
+  'wochen.erlaubt': 'allowed by tonight',
+  'wochen.tag': 'day {0} of 7',
+  'wochen.luft': '{0} points to spare',
+  'wochen.darueber': '{0} points over',
+  'wochen.fehlt': 'No reading logged for the weekly window.',
 
   // --- Sessions and workers -------------------------------------------------
   'sitzung.titel': 'By session and worker',

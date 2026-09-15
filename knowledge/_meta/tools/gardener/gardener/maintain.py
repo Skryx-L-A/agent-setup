@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import blocks, config, frontmatter, heat as heat_mod, orphans as orphans_mod
+from .ollama import OllamaError
 from .queue import ReviewQueue
 from .vault import Note, VaultWriter, STAND_RE, read_text
 
@@ -35,6 +36,7 @@ class MaintainResult:
     orphans_queued: list[str] = field(default_factory=list)
     mocs_updated: list[str] = field(default_factory=list)
     hot_updated: bool = False
+    hot_degraded: bool = False   # HOT.md written without the local model - see regenerate_hot
     markers_added: list[str] = field(default_factory=list)
     resurfaced: list[str] = field(default_factory=list)
     cold_queued: list[str] = field(default_factory=list)
@@ -134,9 +136,20 @@ def update_mocs(notes: list[Note], writer: VaultWriter) -> list[str]:
 
 
 def regenerate_hot(notes: list[Note], writer: VaultWriter, client,
-                   heat: dict | None = None) -> tuple[bool, list[str]]:
+                   heat: dict | None = None) -> tuple[bool, list[str], bool]:
     """HOT.md = LLM recent-context summary + read-heat top list + resurfacing.
-    Returns (written, resurfaced rels)."""
+    Returns (written, resurfaced rels, degraded).
+
+    `degraded` is True when HOT.md was written WITHOUT the local model - either
+    because none was passed in, or because Ollama failed while asked for the
+    summary. Point 1, 2026-09-02: an Ollama outage used to reach this call as
+    an unguarded `client.judge()`, so a judge that stopped answering mid-run
+    took down maintain (and, via the same bug, every phase after it) even
+    though every other thing maintain does - orphan healing, MOC updates,
+    recency markers, the decision/open-question indexes - needs no model at
+    all. The LLM summary is a nice-to-have; the plain listing below already
+    existed as the fallback for "no client given", it just was not also the
+    fallback for "client given but not answering"."""
     vault = writer.vault
     heat = heat if heat is not None else heat_mod.load_heat(vault)
     git_log = _git(vault, "log", "--since=14.days", "--oneline", "--no-merges")[:4000]
@@ -144,12 +157,21 @@ def regenerate_hot(notes: list[Note], writer: VaultWriter, client,
     hot_read = heat_mod.hottest(notes, heat, k=5)
     recent_txt = "\n\n".join(f"## {n.title} ({n.rel})\n{n.text[:800]}" for n in recent)
     summary = ""
+    degraded = client is None
     if client is not None:
-        verdict = client.judge(
-            HOT_SYSTEM,
-            f"Git log (14 days):\n{git_log or '(empty)'}\n\nRecent notes:\n{recent_txt}\n\n"
-            'Answer as JSON: {"summary": "<~300 words markdown>"}')
+        try:
+            verdict = client.judge(
+                HOT_SYSTEM,
+                f"Git log (14 days):\n{git_log or '(empty)'}\n\nRecent notes:\n{recent_txt}\n\n"
+                'Answer as JSON: {"summary": "<~300 words markdown>"}')
+        except OllamaError as e:
+            log.warning("HOT.md summary via judge failed: %s - falling back "
+                        "to a plain listing, no model needed", e)
+            verdict = {}
+            degraded = True
         summary = (verdict.get("summary") or "").strip()
+        if not summary:
+            degraded = True
     if not summary:
         summary = ("Recent notes:\n" +
                    "\n".join(f"- [[{n.title}]]" for n in recent) +
@@ -169,7 +191,7 @@ def regenerate_hot(notes: list[Note], writer: VaultWriter, client,
                      "\n".join(f"- [[{n.title}]] - {first_hook_line(n)}"
                                for n in resurfaced))
     writer.write(vault / "HOT.md", "\n".join(parts) + "\n")
-    return True, [n.rel for n in resurfaced]
+    return True, [n.rel for n in resurfaced], degraded
 
 
 def add_recency_markers(notes: list[Note], writer: VaultWriter) -> list[str]:
@@ -205,7 +227,7 @@ def run_maintenance(notes: list[Note], writer: VaultWriter, client,
     cold = heat_mod.cold_notes(notes, heat)
     r.orphans_queued = heal_orphans(notes, writer, queue)
     r.mocs_updated = update_mocs(notes, writer)
-    r.hot_updated, r.resurfaced = regenerate_hot(notes, writer, client, heat)
+    r.hot_updated, r.resurfaced, r.hot_degraded = regenerate_hot(notes, writer, client, heat)
     r.markers_added = add_recency_markers(notes, writer)
     r.decisions_written = indexes.update_decisions(notes, writer, today)
     _changed, r.open_questions = indexes.update_open_questions(notes, writer, today)

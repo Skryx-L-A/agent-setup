@@ -33,7 +33,7 @@ Usage:
     uv run dream status                                  # counts per class/wave/status
     uv run dream extract --limit 40 --dry-run             # build batches, call nothing
     uv run dream extract --limit 40                       # real cloud calls, capped
-    uv run dream reconcile --no-cloud --dry-run           # groups only, zero cost
+    uv run dream reconcile --dry-run                      # groups only, zero cost
     uv run dream reconcile --max-cloud 10                 # real judgements, capped
     uv run dream shadow --dry-run                         # changeset, no writes at all
     uv run dream shadow --plan <f>                        # changeset from a plan
@@ -345,12 +345,23 @@ def run_reconcile(args, budget=None, lock: bool = True) -> reconcile_mod.Plan:
     own cache plus `plan.json` in the versioned audit path. Takes the dream's
     own lock only - it never touches a note (DREAM-PLAN.md Abschnitt 4).
 
-    `grug-server stop` runs in `finally`, unconditionally whenever `--no-cloud`
-    is not set: `ensure` inside `reconcile_local_call` is called lazily per
-    pair, so this is the one place that knows the run is over, whether or not
-    a pair ever actually needed the model. Stopping an idle server is a
-    documented no-op (Prozess-Hygiene: was gestartet wird, wird auch
-    beendet)."""
+    `--dry-run` calls no model at all: `embed_claims` reads the cache only
+    (see its docstring), and `call` stays `None` exactly like `--no-cloud` -
+    `judge_pair` then leaves every divergent group `DECIDED_UNJUDGED` instead
+    of asking grug-27b, the same code path `--no-cloud` already exercises.
+    Auftrag "zeitgrenze" (04.09.2026): before this, a dry run started
+    embeddinggemma AND, for any group with a divergent pair, `grug-server`
+    itself via `reconcile_local_call`'s lazy `ensure_grug_server()` - a
+    "report only" step that measurably loaded two models.
+
+    `grug-server stop` in `finally` mirrors that: it now runs only when
+    `--no-cloud` is unset AND this is not a dry run - a dry run never starts
+    the server (see above), so it has nothing of its own to stop either.
+    `ensure` inside `reconcile_local_call` is called lazily per pair on a
+    real run, so this stays the one place that knows the run is over,
+    whether or not a pair ever actually needed the model. Stopping an idle
+    server is a documented no-op (Prozess-Hygiene: was gestartet wird, wird
+    auch beendet)."""
     vault = Path(args.vault).expanduser().resolve()
     with held(dcfg.DREAM_LOCK, enabled=lock):
         claim_store = ClaimStore(dcfg.DREAM_EXTRACT_CLAIMS_DB, read_only=True)
@@ -365,14 +376,15 @@ def run_reconcile(args, budget=None, lock: bool = True) -> reconcile_mod.Plan:
         try:
             vectors = reconcile_mod.embed_claims(
                 rows, OllamaClient(), store,
-                preflight=extract_mod.run_check_resources)
-            call = None if args.no_cloud else reconcile_local_call()
+                preflight=extract_mod.run_check_resources,
+                dry_run=args.dry_run)
+            call = None if (args.no_cloud or args.dry_run) else reconcile_local_call()
             plan = reconcile_mod.build_plan(
                 vault, rows, run_id=new_run_id(), vectors=vectors, store=store,
                 call=call, max_cloud_calls=args.max_cloud, budget=budget)
         finally:
             store.close()
-            if not args.no_cloud:
+            if not args.no_cloud and not args.dry_run:
                 extract_mod.stop_grug_server()
         if not args.dry_run:
             path = reconcile_mod.write_plan(plan, vault)
@@ -687,7 +699,10 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_p.add_argument("--limit", type=int, default=None,
                              help="use at most this many stored claims")
     reconcile_p.add_argument("--dry-run", action="store_true",
-                             help="report only: no cache writes, no plan.json")
+                             help="report only: no cache writes, no plan.json, "
+                                  "no new embeddings or judge calls (cached "
+                                  "vectors are still used where present, same "
+                                  "as --no-cloud for the judgements)")
     reconcile_p.add_argument("--no-cloud", action="store_true",
                              help="skip every judgement (grug-27b, local since "
                                   "2026-08-12, kept the flag's old name); "

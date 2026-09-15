@@ -25,12 +25,16 @@ import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { renderHtml as renderHomeHtml, type SessionCard } from '../../../extension/src/homeHtml.ts';
+import {
+  renderHtml as renderHomeHtml, DEFAULT_TEXTE as STARTSEITE_DE,
+  type HomeTexte, type SessionCard,
+} from '../../../extension/src/homeHtml.ts';
 import { renderSettingsHtml } from '../../../extension/src/settingsHtml.ts';
 import { parseModelsRegistry, effectiveHarnesses } from '../../../extension/src/models.ts';
 import { parseSettings } from '../../../extension/src/settings.ts';
 import { ausschlussOrdner, ausschlussMuster, sprache } from './einstellungen';
 import { protokollListe } from './protokolle';
+import { rollenCss } from './thema';
 import type { WorkerView } from '../../../extension/src/workers.ts';
 import type { SessionInfo } from './sessions';
 
@@ -69,20 +73,35 @@ function bootstrap(nonceWert: string): string {
 
   // 2. Das Thema. Im Webview setzt es der Wirt in das Dokument; hier tut es
   //    dieses Stueck, weil der Wirt wegen der eigenen Herkunft nicht mehr
-  //    hineingreifen kann. Genau dieselben Werte wie in der Oberflaeche.
+  //    hineingreifen kann. Die Rollen (main/thema.ts, ROLLEN) stehen fuer
+  //    HELL UND DUNKEL im Dokument; welches gilt, entscheidet data-thema
+  //    unten -- als VORGABE dunkel (wie jedes andere Fenster startet), bis
+  //    seiten-view.ts das echte Thema durchreicht (Punkt 3b).
   document.addEventListener('DOMContentLoaded', function () {
     var st = document.createElement('style');
     st.id = 'awb-thema';
-    st.textContent = ${JSON.stringify(THEMA)};
+    st.textContent = ${JSON.stringify(VSCODE_FARBEN)};
     (document.head || document.documentElement).appendChild(st);
   });
 
-  // 3. Die Auskunft an den Wirt. Er kann das Dokument nicht mehr lesen, also
+  // 3a. Die Auskunft an den Wirt. Er kann das Dokument nicht mehr lesen, also
   //    beantwortet die Seite seine Fragen selbst -- dieselben drei, die eine
   //    Pruefung und die Abnahme am Auge brauchen: was steht da, klick das,
   //    roll dorthin.
+  // 3b. Thema und Akzent VOM Wirt: kein main.ts-Eingriff traegt sie in dieses
+  //    Dokument (main/seiten.ts liefert nur einmalig aus, ohne das lebende
+  //    Thema zu kennen -- siehe OFFEN-farbsystem.md), also schickt
+  //    seiten-view.ts sie per Botschaft, bei jedem Laden und bei jedem
+  //    spaeteren Wechsel. Keine Antwort noetig, deshalb fruehes 'return'.
   window.addEventListener('message', function (e) {
     var f = e.data;
+    if (f && f.__awbThema === true) {
+      document.documentElement.dataset.thema = f.wirksam;
+      if (f.akzent) document.documentElement.style.setProperty('--akzent', f.akzent);
+      if (f.akzentTinte) document.documentElement.style.setProperty('--akzent-tinte', f.akzentTinte);
+      if (f.akzentText) document.documentElement.style.setProperty('--akzent-text', f.akzentText);
+      return;
+    }
     if (!f || f.__awbAn !== true) return;
     var antwort = null;
     try {
@@ -180,66 +199,86 @@ function symbolStylesheet(): string {
     // sie gar nicht zu zeigen.
     css = '';
   }
-  symboleCache = `data:text/css;base64,${Buffer.from(css + FARBEN_SHIM, 'utf8').toString('base64')}`;
+  symboleCache = `data:text/css;base64,${Buffer.from(css + VSCODE_FARBEN, 'utf8').toString('base64')}`;
   return symboleCache;
 }
 
 /**
  * Die Seiten sind in den Farbvariablen von VS Code geschrieben
  * (`var(--vscode-foreground)` und rund dreissig weitere). Ohne einen Host, der
- * sie setzt, waeren sie unlesbar -- schwarze Schrift auf schwarzem Grund. Die
- * Werte hier sind die der eigenen Oberflaeche (index.html, :root), damit beide
- * Haelften des Fensters gleich aussehen.
+ * sie setzt, waeren sie unlesbar -- schwarze Schrift auf schwarzem Grund.
  *
- * Das ist KEINE Aenderung an den Seiten: Sie fragen dieselben Variablen wie
- * vorher, nur beantwortet sie jetzt jemand anders. Der Weg dorthin ist genau
- * der eine Slot, den der Plan freigibt -- die Ressourcen-URI.
+ * JEDER `--vscode-*`-Name ist hier ein VERWEIS auf eine ROLLE aus main/thema.ts
+ * (`rollenCss()`, dieselbe Quelle wie `thema/tokens.css` fuer die fuenf echten
+ * Fenster) -- kein einziger Hex-Wert steht mehr eigens hier. `--vscode-button-*`
+ * zeigt auf `--akzent` statt auf eine eigene gruene Markenfarbe: der Knopf
+ * dieser Seiten fuehrt dieselbe Farbe wie der Hauptknopf jedes anderen
+ * Fensters. HELL UND DUNKEL tragen beide vollstaendig -- welches gilt,
+ * entscheidet `data-thema` auf diesem Dokument (bootstrap() oben, Punkt 3b).
+ *
+ * `FARBEN_SHIM` und `THEMA` waren bis 03.09. zwei fast identische, leicht
+ * auseinandergelaufene Kopien derselben Werte (verschiedene Rotoene fuer
+ * Link/Fehler/Diagramm) -- genau die Art Drift, die ein Token-System
+ * verhindern soll. Jetzt ist es eine Konstante, zweimal gebraucht.
  */
-const FARBEN_SHIM = `
+const VSCODE_FARBEN = `
+${rollenCss()}
 :root {
-  --vscode-font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  --vscode-font-size: 12px;
-  --vscode-foreground: #d8dee9;
-  --vscode-descriptionForeground: #8b93a1;
-  --vscode-editor-background: #101216;
-  --vscode-editor-foreground: #d8dee9;
-  --vscode-panel-border: #262b34;
-  --vscode-widget-border: #262b34;
-  --vscode-focusBorder: #6a7fd0;
-  --vscode-button-background: #2f6f4a;
-  --vscode-button-foreground: #eaf3ee;
-  --vscode-button-border: #3a7d56;
-  --vscode-button-hoverBackground: #38855a;
-  --vscode-button-secondaryBackground: #262b34;
-  --vscode-button-secondaryForeground: #d8dee9;
-  --vscode-button-secondaryHoverBackground: #313845;
-  --vscode-input-background: #171a20;
-  --vscode-input-foreground: #d8dee9;
-  --vscode-input-border: #262b34;
-  --vscode-inputOption-activeBorder: #6a7fd0;
-  --vscode-dropdown-background: #171a20;
-  --vscode-dropdown-foreground: #d8dee9;
-  --vscode-dropdown-border: #262b34;
-  --vscode-list-hoverBackground: #1e232b;
-  --vscode-list-activeSelectionBackground: #222833;
-  --vscode-textLink-foreground: #6a7fd0;
-  --vscode-textPreformat-foreground: #d8dee9;
-  --vscode-textBlockQuote-background: #171a20;
-  --vscode-editorWidget-background: #171a20;
-  --vscode-badge-background: #262b34;
-  --vscode-badge-foreground: #d8dee9;
-  --vscode-errorForeground: #d24c4d;
-  --vscode-editorWarning-foreground: #e0a020;
-  --vscode-charts-orange: #d18616;
-  --vscode-testing-iconPassed: #46a758;
-  --vscode-charts-green: #46a758;
-  --vscode-charts-red: #d24c4d;
-  --vscode-charts-blue: #6a7fd0;
-  --vscode-scrollbarSlider-background: #262b34aa;
-  --vscode-scrollbarSlider-hoverBackground: #313845;
+  --vscode-font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui;
+  --vscode-font-size: 13px;
+  --vscode-foreground: var(--schrift);
+  --vscode-descriptionForeground: var(--gedaempft);
+  --vscode-editor-background: var(--grund);
+  --vscode-editor-foreground: var(--schrift);
+  --vscode-panel-border: var(--linie);
+  --vscode-widget-border: var(--linie);
+  --vscode-focusBorder: var(--akzent);
+  --vscode-button-background: var(--akzent);
+  --vscode-button-foreground: var(--akzent-tinte);
+  /* NEUTRAL, nicht --akzent: homeHtml.ts gibt diesen Rahmen JEDEM Knopf, auch
+     den zweitrangigen ("Einstellungen", "Aktualisieren"). Mit dem Akzent darin
+     sahen alle drei Knoepfe gleich wichtig aus -- auf einem Mac traegt genau
+     EIN Knopf je Bereich die Akzentfarbe, die uebrigen einen grauen Rand. */
+  --vscode-button-border: var(--linie);
+  /* Heller/dunkler statt einer zweiten fest verdrahteten Farbe: --akzent kommt
+     live vom System und kann jeder Farbton sein -- color-mix() Richtung der
+     eigenen Tinte wirkt auf jeden Farbton gleich (dunkle Tinte: abdunkeln;
+     helle Tinte: aufhellen), dasselbe Prinzip wie filter: brightness() beim
+     Hauptknopf des Sitzungsfensters. */
+  --vscode-button-hoverBackground: color-mix(in srgb, var(--akzent) 85%, var(--akzent-tinte) 15%);
+  --vscode-button-secondaryBackground: var(--erhoben);
+  --vscode-button-secondaryForeground: var(--schrift);
+  --vscode-button-secondaryHoverBackground: var(--linie);
+  --vscode-input-background: var(--leiste);
+  --vscode-input-foreground: var(--schrift);
+  --vscode-input-border: var(--linie);
+  --vscode-inputOption-activeBorder: var(--akzent);
+  --vscode-dropdown-background: var(--leiste);
+  --vscode-dropdown-foreground: var(--schrift);
+  --vscode-dropdown-border: var(--linie);
+  --vscode-list-hoverBackground: var(--erhoben);
+  --vscode-list-activeSelectionBackground: var(--wahl);
+  /* SCHRIFT auf dem Grund, nicht Flaeche: deshalb --akzent-text (kontrast-
+     angepasst), nicht --akzent. Siehe akzentAufloesen() in main/thema.ts. */
+  --vscode-textLink-foreground: var(--akzent-text);
+  --vscode-textPreformat-foreground: var(--schrift);
+  --vscode-textBlockQuote-background: var(--leiste);
+  --vscode-editorWidget-background: var(--leiste);
+  --vscode-badge-background: var(--linie);
+  --vscode-badge-foreground: var(--schrift);
+  --vscode-errorForeground: var(--aus);
+  --vscode-editorWarning-foreground: var(--will);
+  --vscode-charts-orange: var(--will);
+  --vscode-testing-iconPassed: var(--laeuft);
+  --vscode-charts-green: var(--laeuft);
+  --vscode-charts-red: var(--aus);
+  --vscode-charts-blue: var(--akzent);
+  --vscode-scrollbarSlider-background: var(--linie);
+  --vscode-scrollbarSlider-hoverBackground: var(--erhoben);
 }
-html, body { background: var(--vscode-editor-background); }
+html, body { background: var(--vscode-editor-background); color: var(--vscode-foreground); }
 `;
+
 
 /**
  * Die Quelle, die die CSP der Seiten fuer Stylesheet und Schrift zulaesst. Im
@@ -247,57 +286,6 @@ html, body { background: var(--vscode-editor-background); }
  */
 const CSP_QUELLE = 'data:';
 
-/**
- * Die Farbwerte, die im Webview der Wirt stellt. Die Seiten sind in
- * `var(--vscode-…)` geschrieben; ohne Antwort darauf staenden sie in
- * Serifenschrift auf Weiss (am Bild gesehen, 05.08.). Es sind die Werte der
- * eigenen Oberflaeche, damit beide Haelften des Fensters gleich aussehen.
- */
-const THEMA = `
-:root {
-  --vscode-font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  --vscode-font-size: 12px;
-  --vscode-foreground: #d8dee9;
-  --vscode-descriptionForeground: #8b93a1;
-  --vscode-editor-background: #101216;
-  --vscode-editor-foreground: #d8dee9;
-  --vscode-panel-border: #262b34;
-  --vscode-widget-border: #262b34;
-  --vscode-focusBorder: #6a7fd0;
-  --vscode-button-background: #2f6f4a;
-  --vscode-button-foreground: #eaf3ee;
-  --vscode-button-border: #3a7d56;
-  --vscode-button-hoverBackground: #38855a;
-  --vscode-button-secondaryBackground: #262b34;
-  --vscode-button-secondaryForeground: #d8dee9;
-  --vscode-button-secondaryHoverBackground: #313845;
-  --vscode-input-background: #171a20;
-  --vscode-input-foreground: #d8dee9;
-  --vscode-input-border: #262b34;
-  --vscode-inputOption-activeBorder: #6a7fd0;
-  --vscode-dropdown-background: #171a20;
-  --vscode-dropdown-foreground: #d8dee9;
-  --vscode-dropdown-border: #262b34;
-  --vscode-list-hoverBackground: #1e232b;
-  --vscode-list-activeSelectionBackground: #222833;
-  --vscode-textLink-foreground: #8fa4ff;
-  --vscode-textPreformat-foreground: #d8dee9;
-  --vscode-textBlockQuote-background: #171a20;
-  --vscode-editorWidget-background: #171a20;
-  --vscode-badge-background: #262b34;
-  --vscode-badge-foreground: #d8dee9;
-  --vscode-errorForeground: #ef6b6b;
-  --vscode-editorWarning-foreground: #e0a020;
-  --vscode-charts-orange: #d18616;
-  --vscode-testing-iconPassed: #46a758;
-  --vscode-charts-green: #46a758;
-  --vscode-charts-red: #ef6b6b;
-  --vscode-charts-blue: #8fa4ff;
-  --vscode-scrollbarSlider-background: #262b34;
-  --vscode-scrollbarSlider-hoverBackground: #313845;
-}
-html, body { background: var(--vscode-editor-background); color: var(--vscode-foreground); }
-`;
 
 function nonce(): string {
   return randomBytes(16).toString('base64');
@@ -343,10 +331,40 @@ export function startseitenKarten(sessions: SessionInfo[]): SessionCard[] {
   });
 }
 
+/**
+ * DIE STARTSEITE AUF ENGLISCH. `homeHtml.ts` traegt die deutschen Worte selbst
+ * (`DEFAULT_TEXTE`) -- sie sind die Vorgabe, damit die VSCode-Erweiterung, die
+ * dieselbe Datei benutzt, unveraendert dieselbe Seite bekommt. Die englische
+ * Fassung braucht nur die Werkbank, deshalb steht sie hier und nicht dort.
+ */
+const STARTSEITE_EN: HomeTexte = {
+  titel: 'Claude Workbench',
+  neu: 'New session',
+  einstellungen: 'Settings',
+  aktualisieren: 'Refresh',
+  fortsetzenUeberschrift: 'Resume a session',
+  leer: 'No sessions yet. Start one in a project folder.',
+  laedt: 'Loading the Peer sessions over SSH …',
+  unerreichbar: 'Peer cannot be reached. Check the SSH connection (ssh peer) and refresh.',
+  weitere: 'Another session',
+  laeuft: 'running',
+  beendet: 'stopped',
+  eineSitzung: '1 session',
+  mehrereSitzungen: '{n} sessions',
+  ohneNachricht: 'No message found.',
+  loeschen: 'Delete',
+  fortsetzen: 'Resume',
+  loeschenTipp: 'Remove this session — project files and the vault stay untouched',
+  unsicherTipp: 'Several sessions in this folder; the transcript could not be matched to this one '
+    + 'for certain. What is shown is the folder\'s most recently used transcript.',
+  unsicher: 'Uncertain match — the preview and Resume may belong to another session in this folder.',
+};
+
 export function renderStartseite(
   sessions: SessionInfo[],
   machine: string,
   remoteMachines: readonly string[] = [],
+  sprachwahl = 'de',
 ): string {
   const n = nonce();
   // Die Seite kennt zwei Reiter ('mac' | 'peer'). WELCHER Rechnername die
@@ -373,7 +391,7 @@ export function renderStartseite(
     machine: m,
     reachable: true,
     loading: false,
-  }, false), n);
+  }, false, sprachwahl === 'de' ? STARTSEITE_DE : STARTSEITE_EN), n);
 }
 
 // --- Daten fuer Einstellungen und Modelle ----------------------------------
@@ -475,6 +493,6 @@ export function renderEinstellungen(q: SeitenQuellen, machine: string): string {
 
 export function renderSeite(name: SeitenName, sessions: SessionInfo[], machine: string, q: SeitenQuellen): string {
   return name === 'start'
-    ? renderStartseite(sessions, machine, q.remoteMachines ?? [])
+    ? renderStartseite(sessions, machine, q.remoteMachines ?? [], sprache(q.settingsFile))
     : renderEinstellungen(q, machine);
 }

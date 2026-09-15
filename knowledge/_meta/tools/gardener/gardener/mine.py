@@ -140,8 +140,10 @@ def run_mining(vault: Path, notes: list[Note], writer: VaultWriter, client,
     known_titles = sorted({n.title for n in notes})[:200]
     seen_slugs: set[str] = set()   # two transcripts must not fight over one filename
 
-    for path in recent_transcripts(root):
-        if deadline is not None and deadline.expired():
+    transcripts = recent_transcripts(root)
+    for i, path in enumerate(transcripts):
+        if deadline is not None and deadline.expired(
+                "mine", done=i, total=len(transcripts)):
             result.skipped.append("deadline reached")
             break
         result.transcripts += 1

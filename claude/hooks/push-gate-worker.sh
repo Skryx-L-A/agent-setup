@@ -2,6 +2,11 @@
 # Zweck: blockt `git push` und `gh pr create`, wenn der eigene tmux-Pane als
 #        Worker markiert ist (@wb_role=worker).
 # Event: PreToolUse, matcher Bash.
+# NICHT REGISTRIERT: Klassifikationslogik seit 2026-08-05 in hooks/lib/
+#        push_gate_classify.py, von bash-guard.py (dessen PreToolUse/Bash-
+#        Sammelpunkt) importiert und unveraendert ausgefuehrt -- diese Datei
+#        traegt nur noch die Original-Begruendung, kein Eintrag in
+#        settings.json zeigt hierher.
 # Warum: "Push authority: nur der Orchestrator entscheidet und fuehrt git
 #        push/PRs/Publishing aus" ist heute reine Rollenprompt-Anweisung
 #        (WORKER.md: "NEVER git push"), kein technisches Gate.

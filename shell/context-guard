@@ -46,6 +46,14 @@
 # What it does, per poll:
 #   * WORKER >= WARN_PCT  -> tells it to write a full handoff into a project file, then /compact.
 #     Only once per worker per compaction cycle (it re-arms after the load drops).
+#   * WORKER compacted -> the guard remembers this on disk (ANSCHLUSS_DIR, survives a guard
+#     restart) and, on a LATER poll once the load has genuinely dropped below half of what it
+#     was AND the pane sits truly idle, types the resume prompt exactly once. This is decoupled
+#     from whether the /compact submission itself could be verified in the same second it was
+#     typed (2026-09-03, Vorfall wache2/neubau %138): a submission that looked "NICHT
+#     verifiziert" can still have been accepted into a running turn's queue, and the old code
+#     only ever sent the resume prompt on the spot, right after typing -- if that one check
+#     missed, nobody ever came back to look again.
 #   * ORCHESTRATOR >= ORCH_PCT -> tells IT to update SESSION-STATE.md and the vault note NOW,
 #     before the harness compacts it. The brain is the backstop a summary cannot shrink.
 #   * ORCHESTRATOR + sentinel file -> compacts IMMEDIATELY, whatever the load. The orchestrator
@@ -87,6 +95,223 @@
 #   Nothing readable at all: the pane is announced as BLIND once, on stdout, and skipped -- never
 #   silently ignored.
 set -uo pipefail
+# Der Start dieser Wache ist der PROZESSSTART, nicht die Stelle weiter unten,
+# an der die Sentinel-Logik steht: nur ein Sentinel, der NACH diesem Zeitpunkt
+# geschrieben wurde, zaehlt (siehe SENTINEL / "ALTER Sentinel" unten). Bis zum
+# 2026-09-05 wurde GUARD_START erst rund 1200 Zeilen spaeter gesetzt, hinter
+# Registry- und Einstellungsaufrufen -- unter Last lagen dazwischen Sekunden,
+# und ein Sentinel aus genau diesem Fenster galt als alt und wurde geloescht
+# (test-context-guard-kompakt-einmal.sh, rot unter run-all --jobs 8).
+GUARD_START=$(date +%s)
+
+# --- ZEITSCHRANKE UM JEDEN FREMDPROZESS (2026-08-26) ---------------------------------
+# Befund der Nacht vom 25./26.08.: die Wache von Pane %2 hat ihre Warnung bei 76 %
+# KORREKT ausgeloest und ist danach in dem `tmux send-keys` steckengeblieben, mit dem
+# sie sie zustellen wollte -- 3 h 42 min in poll(), auf eine Antwort des tmux-Servers,
+# die nie kam (gemessen an PID 2590247, wchan poll_schedule_timeout). Darunter hing
+# `wb-pane-write`, darunter die Wache selbst in do_wait. Ihre Poll-Schleife stand
+# seitdem still: keine Warnung, keine Notbremse, KEIN Logeintrag -- das `echo` steht
+# hinter dem `nudge`, das nie zurueckkam -- und kein einziger der fuenf bewachten Panes
+# wurde noch beobachtet. Der Orchestrator lief von 76 % auf 92 %, und weil eine Wache,
+# die schweigt, aussieht wie eine Wache, der nichts auffaellt, hat es niemand bemerkt.
+#
+# Eine Wache mit EINER Schleife hat genau einen Ausfallpunkt, und ein Aufruf an einen
+# fremden Prozess ohne Zeitschranke ist er. Ab hier laeuft deshalb JEDER tmux-Aufruf
+# dieses Skripts durch `timeout`. Die Shell-Funktion verdeckt das Programm; `command
+# timeout` startet timeout als Programm, und das startet tmux wiederum als Programm --
+# die Funktion kann sich also nicht selbst rufen. Ein Abbruch wird LAUT gemeldet: ein
+# stiller Abbruch waere derselbe Fehler noch einmal, nur leiser.
+TMUX_TIMEOUT="${TMUX_TIMEOUT:-15}"
+# WELCHE Zeitschranke (GEMESSEN 2026-08-28, nachdem die erste Fassung zwoelf Suiten
+# rot gemacht hat): `timeout` gehoert auf macOS NICHT zum Grundsystem, es kommt aus
+# Homebrews coreutils und liegt in /opt/homebrew/bin. Die erste Fassung dieses
+# Wrappers rief es unbedingt auf -- fehlt es im PATH, scheitert damit JEDER
+# tmux-Aufruf dieses Skripts, socket_slug() liefert "unknown", und die Wache bricht
+# schon beim Start ab ("tmux-Socket/Session von Pane ... nicht bestimmbar"). Genau
+# das ist in den Testsuiten passiert, deren PATH bewusst schlank ist, und es haette
+# jede echte Sitzung mit schlankem PATH genauso getroffen: eine Wache, die gar nicht
+# erst anlaeuft, ist schlimmer als eine ohne Zeitschranke.
+#
+# Deshalb drei Stufen, in dieser Reihenfolge: `timeout`, dann `gtimeout` (so heisst
+# es, wenn coreutils ohne die g-losen Namen installiert ist), sonst ein Eigenbau in
+# der Shell. Der Eigenbau kostet bis zu 100 ms je Aufruf (er sieht im 0,1-s-Takt
+# nach), haelt aber genau dieselbe Zusage: kein tmux-Aufruf haengt die Wache auf.
+TIMEOUT_BIN=""
+for _tb in timeout gtimeout; do
+    if command -v "$_tb" >/dev/null 2>&1; then TIMEOUT_BIN="$_tb"; break; fi
+done
+[ -n "$TIMEOUT_BIN" ] || echo "context-guard: weder 'timeout' noch 'gtimeout' im PATH — die Zeitschranke fuer tmux-Aufrufe laeuft als Eigenbau in der Shell (bis zu 0,1 s je Aufruf langsamer, sonst gleichwertig). Auf macOS liegt 'timeout' in /opt/homebrew/bin und gehoert nicht zum Grundsystem." >&2
+
+# Eigenbau-Zeitschranke: tmux im Hintergrund, im 0,1-s-Takt nachsehen, nach Ablauf
+# erst TERM, dann KILL. Die Ausgabe laeuft unveraendert ueber dieselben Dateizeiger,
+# `$(tmux ...)` faengt sie also weiterhin ein; `wait` liefert den echten Rueckgabewert.
+# Rueckgabe 124 bei Ablauf, wie bei timeout(1) -- der Aufrufer unten unterscheidet nicht.
+tmux_frist_eigenbau() {
+    local kind i=0 grenze
+    grenze=$(( TMUX_TIMEOUT * 10 ))
+    # `<&0` ist NICHT kosmetisch (gemessen 2026-08-28): ein Hintergrundjob bekommt in
+    # einem Skript ohne Jobsteuerung von sich aus /dev/null als Eingabe. Ohne diese
+    # ausdrueckliche Umleitung kam der gepipete Text nie bei tmux an -- `load-buffer -`
+    # legte einen leeren Puffer an und das spaetere `paste-buffer` meldete "no buffer".
+    command tmux "$@" <&0 &
+    kind=$!
+    while kill -0 "$kind" 2>/dev/null; do
+        if (( i >= grenze )); then
+            kill -TERM "$kind" 2>/dev/null
+            sleep 0.2
+            kill -KILL "$kind" 2>/dev/null
+            wait "$kind" 2>/dev/null
+            return 124
+        fi
+        i=$(( i + 1 ))
+        sleep 0.1
+    done
+    wait "$kind"
+}
+
+# --- DER ZWEITE LESEWEG: EIN WORKER OHNE TMUX (04.09.2026) -------------------
+# Probe fuer Option E (DIREKTWEG-BEFUND.md, Abschnitt 7): die Werkbank haelt das
+# Pseudo-Terminal eines Workers selbst, es gibt fuer ihn kein tmux und keinen
+# Pane. Seine Kennung traegt das Praefix `pty:`, und genau daran -- an nichts
+# sonst -- entscheidet diese Wache, welchen Weg sie nimmt. Es gibt keine Liste,
+# keinen Schalter und keine Umgebungsvariable, die den Weg waehlt: die Kennung
+# IST die Auskunft, und sie steht in jedem Aufruf schon drin.
+#
+# WARUM DIE WEICHE HIER LIEGT UND NICHT AN DEN 25 AUFRUFSTELLEN: die Wache ruft
+# tmux an 25 Stellen, aber nur mit sechs verschiedenen Fragen -- den Bildschirm,
+# die Startzeile, das Arbeitsverzeichnis, den Vordergrundprozess, die Groesse
+# und den Sessionnamen. Diese Funktion beantwortet sie fuer einen pty-Pane aus
+# dem Steuerkanal der Anwendung; jede der 25 Stellen darueber bleibt WORTGLEICH
+# stehen. Das ist die eigentliche Messung dieser Probe: was ein Pane ist, geht
+# die Wache nichts an, solange sie denselben Text bekommt.
+# `AWB_CTL` steht NICHT hier, sondern unten bei SELF_PATH -- diese Zeilen laufen
+# vor dessen Zuweisung, und `set -u` bricht bei einer unbelegten Variablen ab.
+# (Gemessen 2026-09-04: "SELF_PATH: unbound variable" in Zeile 179, die Wache
+# lief danach zwar weiter, aber ohne den zweiten Leseweg.)
+
+# Ein Aufruf an den Steuerkanal, mit derselben Zeitschranke wie um tmux und aus
+# demselben Grund (25.08., 3 h 42 min in einem haengenden Schreibvorgang): ein
+# Programm, das nicht antwortet, haelt die Wache sonst still an.
+# `node` wird EINMAL aufgeloest und nicht bei jedem Aufruf ueber den PATH
+# gesucht (gemessen 2026-09-04, erster Lauf der Suite): auf dieser Maschine liegt
+# node in /opt/homebrew/bin und NICHT im Grundsystem. Ein Aufrufer mit schlankem
+# PATH -- eine Testsuite, ein launchd-Job, ein Cron -- haette den zweiten Leseweg
+# damit still verloren, und "still verloren" ist bei einer Wache der schlimmste
+# Ausgang. Dieselbe Ueberlegung wie bei TIMEOUT_BIN weiter oben.
+NODE_BIN="$(command -v node 2>/dev/null || true)"
+for _nb in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node; do
+    [ -n "$NODE_BIN" ] && break
+    [ -x "$_nb" ] && NODE_BIN="$_nb"
+done
+
+awb_ctl() {
+    [ -n "${AWB_CTL:-}" ] && [ -f "$AWB_CTL" ] && [ -n "$NODE_BIN" ] || return 1
+    if [ -n "$TIMEOUT_BIN" ]; then
+        command "$TIMEOUT_BIN" -k 2 "$TMUX_TIMEOUT" "$NODE_BIN" "$AWB_CTL" "$@"
+    else
+        "$NODE_BIN" "$AWB_CTL" "$@"
+    fi
+}
+
+# EIN AUSFALL DES STEUERKANALS WIRD LAUT (04.09.2026). Ohne diese Buchfuehrung
+# waere der zweite Leseweg die einzige Stelle der Wache, die still versagen kann:
+# antwortet der Kanal nicht, liefert `pane-liste` nichts, die pty-Worker fallen
+# aus der Pane-Liste, und die Schleife uebergeht sie wortlos. Fuer tmux meldet
+# diese Wache jeden abgebrochenen Aufruf -- fuer den Kanal tut sie es jetzt auch.
+# Gemeldet wird nur der WECHSEL, nicht jeder Poll: eine Wache, die im
+# Minutentakt dieselbe Zeile schreibt, wird ueberlesen.
+#
+# Und sie meldet nur, wenn es etwas zu verlieren GIBT: erst wenn diese Wache
+# mindestens einmal einen pty-Pane gesehen hat, ist ein Ausfall des Kanals ein
+# Verlust. Eine Werkbank ohne pty-Worker schliesst der Mensch jeden Abend, und
+# eine Wache, die das jedes Mal als Stoerung meldet, erzieht zum Weghoeren.
+_CG_KANAL_ANTWORTET=-1   # -1 = noch nie gefragt, 1 = antwortet, 0 = antwortet nicht
+_CG_PTY_GESEHEN=0
+kanal_stand() {   # <rueckgabewert von awb_ctl>
+    local jetzt=0
+    (( $1 == 0 )) && jetzt=1
+    (( jetzt == _CG_KANAL_ANTWORTET )) && return 0
+    if (( jetzt == 0 )) && (( _CG_KANAL_ANTWORTET == 1 )) && (( _CG_PTY_GESEHEN )); then
+        echo "$(date +%H:%M) context-guard: der Steuerkanal der Werkbank antwortet nicht mehr ($AWB_CTL) -- Worker ohne tmux (pty:*) sind fuer diese Wache ab jetzt UNSICHTBAR und werden nicht mehr gemessen. Die tmux-Worker laufen unveraendert weiter." >&2
+    elif (( jetzt == 1 )) && (( _CG_KANAL_ANTWORTET == 0 )) && (( _CG_PTY_GESEHEN )); then
+        echo "$(date +%H:%M) context-guard: der Steuerkanal antwortet wieder -- Worker ohne tmux werden wieder gemessen." >&2
+    fi
+    _CG_KANAL_ANTWORTET=$jetzt
+    return 0
+}
+
+# Ein Feld aus `pane-info`, ohne JSON-Werkzeug: die Antwort ist einzeiliges JSON
+# mit flachen Feldern, und `sed` reicht dafuer. Ein Feld, das es nicht gibt,
+# liefert leer -- genau wie ein `tmux display -p` auf ein unbekanntes Format.
+pty_feld() {   # <pane> <feld> -> Wert oder leer
+    awb_ctl pane-info "$1" 2>/dev/null \
+        | sed -nE "s/.*\"$2\":\"?([^\",}]*)\"?.*/\1/p" | head -1
+}
+
+# Die tmux-Frage eines pty-Panes, beantwortet aus dem Steuerkanal. Rueckgabe 1
+# heisst "diese Frage kenne ich fuer einen pty-Pane nicht" -- der Aufrufer sieht
+# dann dasselbe wie bei einem fehlgeschlagenen tmux-Aufruf, also leer, und das
+# ist ehrlicher als eine erfundene Antwort.
+pty_tmux() {   # <unterbefehl> <ziel> [rest...]
+    local unter="$1" ziel="$2" a fmt=""; shift 2
+    case "$unter" in
+        capture-pane)
+            # `-S -<n>` heisst Rueckblick; alles andere ist der reine Schirm.
+            local zeilen=""
+            while [ $# -gt 0 ]; do
+                case "$1" in -S) zeilen="${2#-}"; shift 2 ;; *) shift ;; esac
+            done
+            if [ -n "$zeilen" ]; then awb_ctl pane-schirm "$ziel" "$zeilen"; else awb_ctl pane-schirm "$ziel"; fi
+            return ;;
+        show-options)
+            # Die Wache fragt hier nach `@wb_cmd`, der Startzeile des Panes. Ein
+            # pty-Pane hat keine tmux-Optionen, aber er hat eine Startzeile.
+            case " $* " in *" @wb_cmd "*) pty_feld "$ziel" startbefehl; return ;; esac
+            return 1 ;;
+        display|display-message)
+            for a in "$@"; do case "$a" in '#{'*) fmt="$a" ;; esac; done
+            case "$fmt" in
+                '#{pane_start_command}') pty_feld "$ziel" startbefehl ;;
+                '#{pane_current_path}')  pty_feld "$ziel" cwd ;;
+                '#{pane_current_command}') basename "$(pty_feld "$ziel" startbefehl | awk '{print $1}')" ;;
+                '#{pane_pid}')           pty_feld "$ziel" pid ;;
+                '#{pane_id}')            printf '%s\n' "$ziel" ;;
+                '#{pane_width}x#{pane_height}')
+                    printf '%sx%s\n' "$(pty_feld "$ziel" cols)" "$(pty_feld "$ziel" rows)" ;;
+                # Ein pty-Worker gehoert zu keiner Session und zu keiner Gruppe.
+                # Leer ist hier die richtige Antwort und keine Luecke: der Slug
+                # der Wache faellt damit auf ihren ORCHESTRATOR-Pane zurueck, und
+                # der lebt weiter in tmux.
+                '#{session_name}'|'#{session_group}'|'#{socket_path}') printf '\n' ;;
+                *) return 1 ;;
+            esac
+            return ;;
+    esac
+    return 1
+}
+
+tmux() {
+    local rc a ziel="" unter="${1:-}"
+    # DIE WEICHE. Sie steht VOR der Zeitschranke, weil ein pty-Pane gar keinen
+    # tmux-Server hat, den man fragen koennte -- `awb_ctl` bringt seine eigene
+    # Frist mit.
+    for a in "$@"; do case "$a" in pty:*) ziel="$a"; break ;; esac; done
+    if [ -n "$ziel" ]; then
+        pty_tmux "$unter" "$ziel" "$@"
+        return $?
+    fi
+    if [ -n "$TIMEOUT_BIN" ]; then
+        command "$TIMEOUT_BIN" -k 2 "$TMUX_TIMEOUT" tmux "$@"
+        rc=$?
+    else
+        tmux_frist_eigenbau "$@"
+        rc=$?
+    fi
+    if (( rc == 124 || rc == 137 )); then
+        echo "$(date +%H:%M) context-guard: 'tmux $1' hat nach ${TMUX_TIMEOUT}s nicht geantwortet und wurde abgebrochen -- die Schleife laeuft weiter. Am 25.08. hielt genau so ein Aufruf die ganze Wache 3h42 an." >&2
+    fi
+    return $rc
+}
 
 # STOP_FILE/lock live per INSTANCE (round-4 point A, refined round 5 point 1). An
 # instance is ONE WORKBENCH -- one orchestrator tmux SESSION -- not one tmux SERVER
@@ -217,6 +442,74 @@ esac
 # 11.08. daneben statt eingebettet -- derselbe Grund wie bei SELF_PATH: die
 # Testkopie soll IHREN Leser finden, nicht einen installierten.
 SESSION_LOAD_PY="$(dirname "$SELF_PATH")/wb-session-load"
+# AWB-CTL KETTE. Das Werkzeug fuer den zweiten Leseweg (die Panes ohne tmux,
+# siehe `pty_tmux` weiter oben) -- BEFUND 04.09.2026 (dritter Durchgang von
+# "maschinenschalter"): bis heute gab es dafuer genau EINEN Ort, "neben
+# SELF_PATH", und der ist fuer eine INSTALLIERTE Fassung (SELF_PATH unter
+# $HOME/.local/bin) immer leer -- `wb-ausrollen` installiert app/bin/awb-ctl
+# nicht, weder shell/awb-ctl noch $HOME/.local/bin/awb-ctl existieren auf
+# dieser Maschine. `awb_ctl()` weiter oben faengt das mit `[ -f "$AWB_CTL" ]`
+# STILL ab -- der zweite Leseweg fiel lautlos aus, ohne dass irgendwo eine
+# Zeile davon sprach.
+#
+# DREI KANDIDATEN, der Reihe nach, jeder billiger als ein ssh- oder
+# Netzzugriff waere:
+#   1. Der Baum UEBER diesem Skript: liegt context-guard unter <baum>/shell/,
+#      liegt awb-ctl unter <baum>/app/bin/ -- aus SELF_PATH ableitbar, ohne
+#      Umgebungsvariable. Trifft jeden git-Arbeitsbaum (Haupt- wie Worktree)
+#      UND jede Testkopie, die IHRE eigene Testfassung finden soll statt
+#      einer installierten (derselbe Grund wie bei SESSION_LOAD_PY zwei
+#      Zeilen darueber).
+#   2. Neben SELF_PATH selbst (der bisherige, alleinige Weg) -- falls jemand
+#      awb-ctl von Hand daneben legt oder verlinkt (test-pty-wache.sh tut das
+#      fuer ihre bestehenden Zusagen A-I weiterhin so).
+#   3. Der feste Ort der ausgelieferten macOS-App: das Bundle traegt
+#      Contents/Resources/app als SYMLINK auf den Hauptbaum (siehe wb-dev,
+#      Kopfkommentar "ausgelieferte Werkbank unter /Applications/Agent
+#      Workbench.app ... SYMLINK auf app/") -- ein Pfad, den weder eine
+#      Umgebungsvariable noch ein Baum ueber der installierten Kopie hergibt,
+#      aber das Dateisystem selbst schon. Nachgemessen 04.09.: existiert und
+#      ist ausfuehrbar. Mac-spezifisch (die Electron-App gibt es nur dort);
+#      auf Linux liefert der Kandidat einfach "nicht da", kein Sonderfall
+#      noetig.
+#
+# ENTSCHEIDUNG GEGEN "wb-ausrollen installiert es mit": das wuerde
+# `kopie_vergleiche()` (wb-consistency) -- kalibriert auf shell/*-Dateien
+# gegen ~/.local/bin -- um eine App-Datei aus einem ANDEREN Wurzelverzeichnis
+# erweitern, ein eigener, groesserer Umbau der Ausroll-Konfiguration, den
+# dieser Auftrag nicht verlangt. Kandidat 3 loest dasselbe Problem, ohne dort
+# etwas anzufassen.
+#
+# `AWB_CTL="${AWB_CTL:-}"` ZUERST, sonst NICHT NUR fuer den Fall, dass sie
+# fehlt (set -u): jede spaetere Stelle, die $AWB_CTL bar referenziert --
+# `kanal_stand()`s Meldung oben nennt ihn woertlich --, bricht das ganze
+# Skript mit "unbound variable" ab, wenn kein Kandidat greift und die
+# Variable dadurch echt UNGESETZT bliebe statt bloss leer.
+AWB_CTL="${AWB_CTL:-}"
+# WB_AWB_CTL_BUNDLE nur fuer die Testsuite: sie zeigt damit auf einen
+# garantiert leeren Ort statt auf die echte, ausgelieferte App -- die laeuft
+# auf dieser Maschine tatsaechlich und liesse sich sonst aus keinem Testlauf
+# heraus "unsichtbar" machen (derselbe Grund wie bei WB_SSH/WB_BIN anderswo
+# in diesem Haus). Im Betrieb bleibt es beim festen Pfad.
+if [ -z "$AWB_CTL" ] || [ ! -f "$AWB_CTL" ]; then
+    for _ac in \
+        "$(dirname "$(dirname "$SELF_PATH")")/app/bin/awb-ctl" \
+        "$(dirname "$SELF_PATH")/awb-ctl" \
+        "${WB_AWB_CTL_BUNDLE:-/Applications/Agent Workbench.app/Contents/Resources/app/bin/awb-ctl}"
+    do
+        [ -f "$_ac" ] && { AWB_CTL="$_ac"; break; }
+    done
+fi
+# DAS FEHLEN WIRD EINMAL LAUT (nicht bei jedem Takt: diese Zeile steht vor der
+# Poll-Schleife und laeuft deshalb ohnehin nur einmal je Start). Ohne sie war
+# "Datei gar nicht da" der einzige Ausfall dieser Wache, der nirgends stand --
+# die bestehende Meldung in `kanal_stand()` weiter oben greift erst, wenn der
+# Kanal EINMAL geantwortet hatte und danach wegbricht; ein Kanal, der von
+# Anfang an fehlt, erreicht diesen Zustand nie.
+if [ -z "$AWB_CTL" ] || [ ! -f "$AWB_CTL" ]; then
+    echo "$(date +%H:%M) context-guard: awb-ctl nirgends gefunden (geprueft: Baum ueber diesem Skript, daneben, /Applications/Agent Workbench.app) -- der zweite Leseweg (Worker ohne tmux, pty:*) ist fuer diese Wache UNSICHTBAR: solche Worker werden nicht gemessen, sobald workerTransport auf pty steht. tmux-Worker sind davon nicht betroffen." >&2
+fi
+# AWB-CTL KETTE ENDE.
 
 mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }  # Linux || macOS
 
@@ -224,7 +517,7 @@ mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; 
 # Argument der Kommandozeile (der Programmpfad), NICHT ein Vorkommen des Wortes irgendwo in der
 # Zeile: in dieser Umgebung tragen die Claude-Prozesse ihren Rollen-Prompt im argv, und darin steht
 # der Text "context-guard --auto". `pgrep -f "context-guard --auto"` meldet deshalb den
-# ORCHESTRATOR selbst als laufenden Guard (gemessen 2026-08-03: PID 2807, wb-myproject) -- mit
+# ORCHESTRATOR selbst als laufenden Guard (gemessen 2026-08-03: PID 2807, <ein eigenes Mailwerkzeug>) -- mit
 # diesem Kriterium wuerde nie wieder einer gestartet. Ausgewertet wird darum: Programmname ist
 # `context-guard` (auch als `bash /pfad/context-guard`, so starten wb-code und Hand-Starts es),
 # es ist kein `--ensure`/`--stop`-Aufruf, und das erste Nicht-Options-Argument ist der gesuchte
@@ -286,13 +579,51 @@ guard_ist_guard() {   # <args-zeile> -> 0, wenn es ein laufender Guard ist
 
 guard_pidfile() { printf '%s/%s.pid' "$STATE_BASE" "$1"; }
 
+# Prozess-Startzeit als STABILES zweites Merkmal (2026-08-23, Auftrag guardkollision, gemessen
+# auf beiden Maschinen): `ps -o lstart=` liefert ueber die Lebensdauer eines Prozesses einen
+# unveraenderlichen Wert (zwei Lesungen desselben PIDs mit Sekunden Abstand -- Mac UND peer --
+# lieferten identische Strings; `etime=` waere dagegen VERAENDERLICH und deshalb untauglich).
+# `LC_ALL=C` haelt das Format maschinenunabhaengig gleich (ohne C weicht z.B. der
+# Wochentagsname je nach Locale ab -- gemessen "Sun" auf dem Mac gegen "So" auf peer unter der
+# jeweiligen Systemlocale); verglichen wird ohnehin nur INNERHALB derselben Maschine, ein
+# Formatunterschied zwischen den Maschinen spielt also nie eine Rolle. macOS haengt zusaetzlich
+# Fuellzeichen an (gemessen), deshalb wird nachlaufender Leerraum immer abgeschnitten.
+process_starttime() {   # <pid> -> stabiler Startzeit-String, leer wenn nicht lesbar
+    LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | sed 's/[[:space:]]*$//'
+}
+
 running_guard_pid() {   # <slug> <orch-pane> [--jeder-pane] -> PID des laufenden Guards dieser Instanz
-    local pf pid args
+    local pf pid args stored_start live_start
     pf="$(guard_pidfile "$1")"
     [ -f "$pf" ] || return 0
     pid="$(head -1 "$pf" 2>/dev/null | tr -dc '0-9')"
-    [ -n "$pid" ] && [ "$pid" != "$$" ] || { rm -f "$pf"; return 0; }
+    # Der eigene Eintrag wird NICHT geloescht (2026-08-28): seit der Starter die Merkdatei
+    # schreibt, findet ein frisch gestarteter Guard bei seiner eigenen Selbstpruefung genau
+    # seine eigene PID darin. Wegwerfen und neu schreiben waere ein zweites, unnoetiges
+    # Zeitfenster -- und eine Registrierung zu loeschen, die einen selbst meint, ist ohnehin
+    # nie richtig. Gemeldet wird trotzdem "kein fremder Guard da", damit der Aufrufer normal
+    # weiterlaeuft.
+    [ -n "$pid" ] || { rm -f "$pf"; return 0; }
+    [ "$pid" != "$$" ] || return 0
     kill -0 "$pid" 2>/dev/null || { rm -f "$pf"; return 0; }
+    # Gegen PID-Wiederverwendung ueber Sockets hinweg (gemessen, siehe Ergebnisdatei
+    # 20260823-131526.md): eine Merkdatei bleibt nach SIGKILL mit einer toten PID stehen (siehe
+    # Kommentar unten bei "Punkt 3"); vergibt das Betriebssystem diese Nummer kurz danach an
+    # einen VOELLIG ANDEREN, gleichzeitig laufenden Guard auf einem FREMDEN Socket, meldet
+    # `kill -0` faelschlich "lebt", und ein reiner Programm+Pane-Abgleich kann den Fremden nicht
+    # von der eigenen Instanz unterscheiden -- Pane-Ids wie `%0` sind nur pro tmux-Server
+    # eindeutig, und `%0` ist auf praktisch jedem frischen Server der erste Pane. Traegt die
+    # Merkdatei eine gespeicherte Startzeit (jede seit dieser Aenderung neu geschriebene tut
+    # das) und weicht sie von der Startzeit des jetzt lebenden Prozesses ab, ist die PID
+    # zwischenzeitlich wiederverwendet worden -- dieselbe Regel wie bei jedem anderen Zweifel
+    # hier: der Fund faellt auf "kein Guard da", die Merkdatei wird verworfen, es wird
+    # gestartet. Eine Merkdatei OHNE zweite Zeile (aus einer Fassung vor dieser Aenderung, oder
+    # falls `ps` beim Eintragen einmal nichts lieferte) ist genau dieselbe Art Zweifel und faellt
+    # aus demselben Grund auf STARTEN, statt den fehlenden Beleg als Freispruch zu werten.
+    stored_start="$(sed -n '2p' "$pf" 2>/dev/null)"
+    live_start="$(process_starttime "$pid")"
+    [ -n "$stored_start" ] && [ -n "$live_start" ] && [ "$stored_start" = "$live_start" ] \
+        || { rm -f "$pf"; return 0; }
     args="$(ps -p "$pid" -o args= 2>/dev/null)"
     # `--jeder-pane` (2026-08-13): ein Guard im Worker-Modus ZIEHT seinen Anker nach, wenn
     # der alte Worker fertig ist (siehe die Nachzieh-Stelle im Poll). Seine Kommandozeile
@@ -387,7 +718,13 @@ if [[ "${1:-}" == "--ensure" ]]; then
         echo "context-guard: laeuft bereits fuer $ORCH_P (PID $GPID, Session $SESS) — kein zweiter gestartet."
         exit 0
     fi
-    GLOG="$HOME/.local/state/context-guard-$SESS.log"
+    # Ueber ENSURE_SLUG (Socket + Session), nicht ueber $SESS allein (2026-08-23,
+    # Nebenbefund aus 20260823-131526.md): zwei Sockets mit zufaellig gleichem Session-Namen
+    # schrieben sonst beide in dieselbe Log-Datei -- keine Fehlfunktion der Bewachung selbst
+    # (die haengt an GUARD_SLUG/PID, nicht am Log), aber vermischte Zeilen zweier Instanzen
+    # kosten bei der naechsten Fehlersuche unnoetig Zeit. ENSURE_SLUG traegt den Session-Namen
+    # ohnehin schon als Teil seines Strings, der Dateiname bleibt also lesbar.
+    GLOG="$HOME/.local/state/context-guard-$ENSURE_SLUG.log"
     mkdir -p "$HOME/.local/state" 2>/dev/null || true
     # PROJECT (Sentinel + HANDOFF-Dateien) aus der Umgebung, sonst das Arbeitsverzeichnis des
     # Orchestrator-Panes -- das ist das Projekt, in dem die Session laeuft. Bleibt es leer,
@@ -397,6 +734,25 @@ if [[ "${1:-}" == "--ensure" ]]; then
     [ "$ENSURE_MODE" = workers-only ] && ENSURE_FLAGS="--workers-only"
     PROJECT="$GPROJECT" nohup "$SELF_PATH" --auto $ENSURE_FLAGS --exit-when-session-gone "$ORCH_P" >>"$GLOG" 2>&1 &
     NEWPID=$!
+    # DIE MERKDATEI SCHREIBT DER STARTER, NICHT ERST DAS KIND (2026-08-28, gemessen).
+    # Bis heute trug sich der neue Guard erst SELBST ein, und zwar am Ende seines eigenen
+    # Anlaufs -- nach dem Auswerten der Argumente, dem Ermitteln von Socket und Session und
+    # dem Lesen der Einstellungen. Die Sperre hier wurde aber schon vorher wieder
+    # freigegeben. Zwischen beidem lagen auf einer ruhigen Maschine 51 ms (gemessen: der
+    # `--ensure`-Aufruf kehrte nach 346 ms zurueck, die Merkdatei erschien nach 396 ms), und
+    # in genau diesem Fenster sieht ein zweites `--ensure` "kein Guard da" und startet einen
+    # zweiten. Die Sperre half dagegen nicht: sie war zu diesem Zeitpunkt bereits offen.
+    # pi-worker ruft `--ensure` nach JEDEM Pane-Start auf, zwei Spawns kurz hintereinander
+    # sind also der Normalfall und nicht die Ausnahme.
+    #
+    # Der Starter kennt die PID des Kindes sofort und kann seine Startzeit unmittelbar lesen
+    # -- beides sind dieselben Werte, die das Kind gleich selbst eintragen wuerde. Also wird
+    # hier eingetragen, und erst DANACH die Sperre freigegeben. Damit ist die Merkdatei fuer
+    # jeden weiteren Aufrufer da, bevor er ueberhaupt pruefen kann. Stirbt das Kind kurz
+    # darauf (unbestimmbarer Socket, fehlendes tmux), bleibt eine Merkdatei mit toter PID
+    # stehen -- running_guard_pid() erkennt genau das und startet neu, wie bei jedem anderen
+    # Zweifel auch.
+    printf '%s\n%s\n' "$NEWPID" "$(process_starttime "$NEWPID")" > "$(guard_pidfile "$ENSURE_SLUG")" 2>/dev/null || true
     [ "$locked" = 1 ] && rmdir "$LOCK" 2>/dev/null
     if [ "$ENSURE_MODE" = workers-only ]; then
         echo "context-guard: gestartet fuer die reine Worker-Session $SESS (PID $NEWPID, Anker-Pane $ORCH_P, PROJECT=${GPROJECT:-\$PWD}, Log $GLOG) — bewacht die Worker, tippt NICHTS in den Anker-Pane, endet mit der Session."
@@ -500,7 +856,9 @@ fi
 # gehoert der Eintrag ihm. Bleibt eine Merkdatei doch einmal stehen (SIGKILL laesst keine Falle
 # zu), erkennt `--ensure` sie als tot und startet trotzdem.
 GUARD_PIDFILE="$(guard_pidfile "$GUARD_SLUG")"
-printf '%s\n' "$$" > "$GUARD_PIDFILE" 2>/dev/null || true
+# Zweite Zeile = eigene Startzeit (siehe process_starttime()/running_guard_pid() oben) --
+# das Merkmal, an dem ein spaeterer Aufrufer PID-Wiederverwendung erkennt.
+printf '%s\n%s\n' "$$" "$(process_starttime "$$")" > "$GUARD_PIDFILE" 2>/dev/null || true
 guard_unregister() {
     [ -n "${GUARD_PIDFILE:-}" ] || return 0
     [ "$(head -1 "$GUARD_PIDFILE" 2>/dev/null | tr -dc '0-9')" = "$$" ] && rm -f "$GUARD_PIDFILE"
@@ -522,6 +880,92 @@ trap guard_unregister EXIT
 DONE_DIR="$STATE_BASE/$GUARD_SLUG.done-notified"
 KNOWN_WORKERS_FILE="$STATE_BASE/$GUARD_SLUG.known-workers"
 mkdir -p "$DONE_DIR" 2>/dev/null || true
+# Anschluss nach dem Kompaktieren eines WORKERS (2026-09-03, Vorfall wache2/neubau %138,
+# 20:18-20:52): eine Datei pro Worker mit Anschluss-Bedarf, Inhalt = die Auslastung VOR
+# dem Kompaktier-Tippversuch. Ueberlebt einen Neustart des Guards aus demselben Grund wie
+# DONE_DIR -- verankert ueber GUARD_SLUG, nicht ueber die PID dieses Prozesses. Siehe
+# die Anschluss-Pruefung im Worker-Block weiter unten.
+ANSCHLUSS_DIR="$STATE_BASE/$GUARD_SLUG.kompakt-anschluss"
+mkdir -p "$ANSCHLUSS_DIR" 2>/dev/null || true
+
+# Sperre gegen wb-close (2026-08-22, Auftrag "Fertigmeldung: der Rest-Laerm...",
+# Sperre gebaut): Die "frisch nachpruefen"-Stelle in check_worker_results() (siehe
+# dortigen Kommentar) schliesst nur das Fenster zwischen IHRER EIGENEN Pruefung und
+# IHREM EIGENEN Schreiben -- nicht das Fenster INNERHALB von nudge() selbst. nudge()
+# tippt den Text ueber eigene Unterprozesse (BUSY-Check, schreib_text()), die unter
+# Last selbst auf CPU warten muessen, und die Meldung wird sichtbar, SOBALD
+# schreib_text() zurueckkehrt -- vor dem eigenen Markierungs-Schreiben des Guards.
+# Laeuft wb-close's mark_worker_done() in genau diesem Fenster, war die Meldung
+# schon unterwegs. Gemessen: 1-3 % Rest-Rate unter Last, unveraendert durch reine
+# Timing-Aenderungen im Test (siehe Ergebnisdatei des vorherigen Auftrags-Laufs).
+#
+# LOCK_DIR liegt sibling zu DONE_DIR, ueber denselben Slug -- ein Verzeichnis pro
+# Worker, `mkdir` als atomarer Test-and-Set (die einzige portable Atomaritaet, die
+# eine einfache Shell hat). Zwei Deckel, keiner davon optional (erste Auflage):
+# DONE_LOCK_TIMEOUT_S begrenzt, wie lange EIN Aufrufer auf die Sperre wartet, bevor
+# er ohne sie weiterarbeitet -- also GENAU das Verhalten von vor dieser Aenderung,
+# nur ohne Garantie gegen das beschriebene Fenster (zweite Auflage: kein Ausfall).
+# DONE_LOCK_STALE_S bestimmt, ab wann eine bestehende Sperre als verwaist gilt und
+# UEBERNOMMEN statt respektiert wird -- ein abgestuerzter wb-close (oder Guard) mitten
+# im Halten der Sperre darf den Guard nie dauerhaft verstummen lassen. 20s ist
+# grosszuegig ueber der laengsten gemessenen legitimen Haltezeit (nudge() traegt ein
+# eingebautes sleep 1 plus Unterprozess-Zeit, unter extremer Last im eigenen
+# Lasttest bis zu einigen Sekunden) und trotzdem kurz genug, dass eine echte
+# Verwaisung nicht lange unbemerkt bleibt.
+LOCK_DIR="$STATE_BASE/$GUARD_SLUG.done-lock"
+mkdir -p "$LOCK_DIR" 2>/dev/null || true
+DONE_LOCK_TIMEOUT_S="${DONE_LOCK_TIMEOUT_S:-5}"
+DONE_LOCK_STALE_S="${DONE_LOCK_STALE_S:-20}"
+
+# NOTIFY_SETTLE_S -- gemessen NOETIG, nicht nur vorsorglich (2026-08-22, dieselbe
+# Auftragsstufe): die Sperre allein wurde gebaut, unter Last erneut gemessen, und
+# schloss die Luecke NICHT -- 3 Treffer in 110 Laeufen, keine Verbesserung
+# gegenueber der reinen Neupruefung ohne Sperre. Grund: eine Sperre serialisiert nur
+# ZWEI TATSAECHLICHE Zugriffe. wb-close ist ein frisch geforkter Prozess -- eigener
+# Interpreter-Start, mehrere eigene Unterprozesse (resolve/exists/role_of/kill-pane),
+# bevor er ueberhaupt bei seiner eigenen Sperre ankommt. Pollt der Guard GENAU in
+# diesem Vorlauf, gibt es fuer ihn noch gar keine Sperre, gegen die er warten
+# koennte -- er gewinnt den `mkdir`-Wettlauf kampflos und tippt, weil wb-close
+# diesen Punkt seines Ablaufs schlicht noch nicht erreicht hat. Eine Sperre kann
+# nicht auf einen Zugriff warten, der noch nicht begonnen hat.
+# NOTIFY_SETTLE_S ist deshalb eine reine, unbedingte Verzoegerung VOR dem ersten
+# Sperr-Erwerb fuer ein FRISCHES Ergebnis (ausserhalb jeder Sperre) -- sie gibt
+# einem gerade erst gestarteten wb-close genau die fehlende Zeit, seinen eigenen
+# Vorlauf zu durchlaufen und die Markierung zu setzen, BEVOR der Guard ueberhaupt
+# hinsieht. 2s liegen grosszuegig ueber jeder gemessenen Prozessstart- und
+# Unterprozesszeit unter Last (nudge() selbst braucht dokumentiert "ueber eine
+# Sekunde") und kosten nur EINMAL pro neuem Ergebnis, nicht bei jedem Poll. Die
+# Sperre bleibt trotzdem bestehen, wird nicht verworfen: sie schliesst weiterhin
+# das (viel kuerzere) Fenster INNERHALB von nudge() selbst, das diese Verzoegerung
+# allein nicht anfasst -- beide Mechanismen wirken auf unterschiedliche Fenster,
+# siehe Kommentar bei der Neupruefung unten.
+NOTIFY_SETTLE_S="${NOTIFY_SETTLE_S:-2}"
+# acquire_done_lock <sanitierter-worker-name> -> 0 erworben (Aufrufer MUSS
+# spaeter release_done_lock aufrufen), 1 = Deckel erreicht, ohne Sperre weiter.
+# Verwaiste Sperren (aelter als DONE_LOCK_STALE_S, an der mtime des Sperr-
+# verzeichnisses gemessen -- `mkdir` setzt sie beim Erwerb) werden dabei
+# uebernommen: rmdir/rm -rf, dann ein neuer Versuch in derselben Schleife. Ein
+# gleichzeitiger zweiter Uebernahme-Versuch verliert dabei hoechstens den
+# `mkdir`-Wettlauf und wartet danach ganz normal auf die (dann frische) Sperre --
+# kein Datenverlust, keine doppelte Uebernahme.
+acquire_done_lock() {
+    local d="$LOCK_DIR/$1" deadline age mtime
+    deadline=$((SECONDS + DONE_LOCK_TIMEOUT_S))
+    while :; do
+        mkdir "$d" 2>/dev/null && return 0
+        if [ -d "$d" ]; then
+            mtime="$(stat -L -c %Y "$d" 2>/dev/null || stat -L -f %m "$d" 2>/dev/null || echo 0)"
+            age=$(( $(date +%s) - mtime ))
+            if [ "$age" -gt "$DONE_LOCK_STALE_S" ]; then
+                rmdir "$d" 2>/dev/null || rm -rf "$d" 2>/dev/null
+                continue
+            fi
+        fi
+        [ $SECONDS -lt $deadline ] || return 1
+        sleep 0.1
+    done
+}
+release_done_lock() { rmdir "$LOCK_DIR/$1" 2>/dev/null || true; }
 touch "$KNOWN_WORKERS_FILE" 2>/dev/null || true
 # Blockierte Worker (2026-08-04, N5 der Masterliste): `fensterzu` stand rund
 # eine Stunde vor der CLI-eigenen Rueckfrage "Dangerous rm operation on
@@ -796,6 +1240,23 @@ WORKER_REARM_GAP=$(rearm_gap "$WARN_PCT")
 ORCH_REARM_GAP=$(rearm_gap "$ORCH_PCT")
 POLL="${POLL:-60}"
 COMPACT_SETTLE="${COMPACT_SETTLE:-120}"   # hands off this long right after typing /compact
+# WIRKSAMKEIT DES KOMPAKTIERENS (2026-08-28, an der companion-Session gemessen).
+# Bis heute galt der Zyklus nach dem getippten Kompaktierbefehl als verbraucht --
+# absichtlich, damit nie zwei Kompaktierungen hintereinander genau den Kontext
+# wegwerfen, den die erste gerettet hat. Der Fall, den das nicht bedacht hat: eine
+# Kompaktierung, die gar nichts befreit. Am 27.08. um 23:18 tippte der Guard
+# /compact, die Last blieb danach bei rund 78 % (viel gepinntes Material), und
+# damit war der Zyklus tot: neu scharf wird er erst unterhalb von mahnenAb minus
+# ORCH_REARM_GAP, und diesen Abfall gibt es ohne wirksame Kompaktierung nie. Der
+# Guard schwieg regelkonform, ein zweiter Sentinel wurde ignoriert -- ein Patt, das
+# von aussen wie eine ruhige Wache aussieht.
+#
+# Also wird nach dem Kompaktieren nachgemessen. Faellt die Last nicht deutlich, sagt
+# der Guard das laut und gibt den Zyklus nach einer KARENZ wieder frei. Die Karenz
+# ist genau die Sicherung, die oben beschrieben ist: sie haelt die zweite
+# Kompaktierung von der ersten fern, statt sie fuer immer zu verbieten.
+KOMPAKT_WIRKUNG_MIN="${KOMPAKT_WIRKUNG_MIN:-10}"    # Punkte, die die Last fallen MUSS, damit die Kompaktierung als wirksam gilt
+KOMPAKT_KARENZ_POLLS="${KOMPAKT_KARENZ_POLLS:-2}"   # Polls, die zwischen einer wirkungslosen Kompaktierung und der Freigabe liegen
 # BUSY detection decides whether it is safe to type at all, so it errs towards "busy".
 # 'esc to interrupt' alone was NOT enough: on 2026-07-25 the guard typed /compact into a
 # pane that was mid-turn and only showed its spinner line ("✽ Flibbertigibbeting… (18m ·
@@ -804,8 +1265,24 @@ COMPACT_SETTLE="${COMPACT_SETTLE:-120}"   # hands off this long right after typi
 BUSY_RE='esc to interrupt|Compacting|Summariz|tokens\)|↓ [0-9]|Running [0-9]+ (shell|tool)|^[[:space:]]*[✢✳✶✻✽·][[:space:]]+[A-Za-z].*…'
 PROJECT="${PROJECT:-$PWD}"   # .wb-knowledge-saved lives here; HANDOFF-<name>.md is only the
                               # fallback candidate for a worker's handoff -- see handoff_candidates()
-SENTINEL="$PROJECT/.wb-knowledge-saved"   # orchestrator writes it when its knowledge is safe
-GUARD_START=$(date +%s)                   # only a sentinel written after this counts (see below)
+# 2026-09-10 (geteilter Sentinel, Befund "context-guard kompaktiert die FALSCHE
+# Orchestrator-Sitzung"): zwei Orchestratoren mit gleichem PROJECT=$PWD (zwei tmux-
+# Sessions im selben Ordner) teilten sich frueher denselben $PROJECT/.wb-knowledge-saved.
+# Guard A schrieb ihn nach seiner eigenen Warnung, Guard B sah dieselbe Datei mit einer
+# mtime > seinem eigenen GUARD_START und kompaktierte SEINEN Orchestrator (unter 40%
+# Last, ohne je gewarnt zu haben) -- reines Wettrennen ueber einen gemeinsamen Pfad.
+# Der Sentinel ist jetzt session-eindeutig: der tmux-Sessionname des ueberwachten
+# Orchestrator-Panes geht in den Dateinamen, Sonderzeichen ausser [A-Za-z0-9._-] werden
+# zu '-'. Der Nudge-Text (siehe unten) nennt ${SENTINEL} ohnehin -- der Orchestrator
+# lernt den richtigen Pfad direkt aus der Warnung, tippt ihn nie selbst zusammen.
+SENTINEL_SESS="$(tmux display -p -t "$ORCH" '#{session_name}' 2>/dev/null || true)"
+SENTINEL_SLUG="$(printf '%s' "${SENTINEL_SESS:-unbekannt}" | tr -c 'A-Za-z0-9._-' '-')"
+SENTINEL="$PROJECT/.wb-knowledge-saved-${SENTINEL_SLUG}"   # orchestrator writes it when its knowledge is safe
+# Der ALTE, geteilte Pfad bleibt als Fallback erkennbar (ein bereits gewarnter
+# Orchestrator kann die alte Formulierung noch im Kontext haben), zaehlt aber nur noch
+# nach einer Warnung DIESES Guards -- siehe die Pruefung um Z. ~3015ff unten.
+SENTINEL_OLD="$PROJECT/.wb-knowledge-saved"
+# GUARD_START steht am Prozessanfang (direkt nach `set -uo pipefail`); only a sentinel written after it counts (see below).
 # (mtime() is defined further up, next to the --ensure block that needs it.)
 # (POLL and COMPACT_SETTLE are overridable so the guard can be verified in minutes instead of
 # hours; the defaults are the production values.)
@@ -871,6 +1348,47 @@ session_gone() {   # -> wahr (Exit 0), wenn die beim Start gemerkte Session nich
 #   * DEAD-Panes zaehlen als DA. `wb-revive`/`wb-autorevive` beleben einen abgestuerzten Pane mit
 #     `respawn-pane -k` unter DERSELBEN Pane-ID wieder; ein Guard, der beim ersten Absturz geht,
 #     laesst den wiederbelebten Orchestrator unbewacht zurueck.
+# EINE PANE-LISTE JE POLL-ZYKLUS (2026-09-03, Audit "gleiche Pane-Liste mehrfach im
+# selben Takt"): `orch_pane_gone()`, `check_worker_results()`, `check_post_mail()`, der
+# Kompaktier-Block weiter unten und der Worker-Durchlauf riefen bis heute JEDER fuer
+# sich `tmux list-panes -a` auf -- gemessen 3+N Aufrufe je Zyklus (N = Zahl der
+# Worker-Panes), und daran haengt real Zeit, nicht nur Prozesse: der tatsaechliche
+# Takt betrug dadurch 95-97s statt der codierten 60s (Herzschlag-Dateien).
+#
+# `POLL_NR` zaehlt bereits GENAU EINMAL pro Zyklus hoch (Hauptschleife weiter unten) --
+# das ist der natuerliche Frischeschluessel, kein Zeitfenster und keine Schaetzung: der
+# gleiche Zyklus liest denselben Cache, ein neuer verwirft ihn unbedingt. Absichtlich
+# ZWEI Funktionen statt einer: `_cg_pane_liste_aktualisieren` MUSS als eigenstaendige
+# Anweisung im aktuellen Prozess laufen (nie in einer Pipe, nie in `$(...)` )  --
+# eine bash-Pipe/Kommandosubstitution laeuft in einer Subshell, und Variablenzuweisungen
+# darin gingen beim Verlassen der Subshell verloren, der Cache bliebe also leer.
+# `alle_pane_ids` liest danach nur noch, gefahrlos in jeder Form verwendbar.
+_CG_PANES_POLL=""
+_CG_PANES_CACHE=""
+_cg_pane_liste_aktualisieren() {
+    if [ "$_CG_PANES_POLL" != "$POLL_NR" ]; then
+        _CG_PANES_CACHE="$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null)"
+        # Die Panes ohne tmux kommen dazu (04.09.2026, Probe fuer Option E). Sie
+        # stehen in KEINER tmux-Auflistung, und ohne diese Zeile faende die
+        # Schleife weiter unten ihren Worker nicht ("grep -qx ... || continue")
+        # und uebergaenge ihn still -- also genau das Versagen, gegen das diese
+        # Wache gebaut ist.
+        local ptys antwort rc
+        antwort="$(awb_ctl pane-liste 2>/dev/null)"; rc=$?
+        kanal_stand "$rc"
+        if (( rc == 0 )); then
+            ptys="$(printf '%s' "$antwort" | tr ',' '\n' | sed -nE 's/.*"id":"(pty:[0-9]+)".*/\1/p')"
+            if [ -n "$ptys" ]; then
+                _CG_PANES_CACHE="$_CG_PANES_CACHE${_CG_PANES_CACHE:+$'\n'}$ptys"
+                _CG_PTY_GESEHEN=1
+            fi
+        fi
+        _CG_PANES_POLL="$POLL_NR"
+    fi
+    return 0   # sicher in einer &&-Kette einsetzbar, unabhaengig vom Cache-Treffer
+}
+alle_pane_ids() { _cg_pane_liste_aktualisieren; printf '%s\n' "$_CG_PANES_CACHE"; }
+
 ORCH_PANE_GONE_POLLS="${ORCH_PANE_GONE_POLLS:-2}"
 orch_pane_missing=0
 
@@ -878,8 +1396,8 @@ orch_pane_gone() {   # -> wahr (Exit 0), wenn der bewachte Pane in einer erfolgr
     # Nur fuer eine echte Pane-ID. `$ORCH` darf laut socket_slug() auch ein Sessionname sein --
     # dafuer ist diese Frage nicht gestellt und wird nicht beantwortet.
     case "$ORCH" in %[0-9]*) ;; *) return 1 ;; esac
-    local panes
-    panes="$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null)" || return 1
+    _cg_pane_liste_aktualisieren
+    local panes="$_CG_PANES_CACHE"
     [ -n "$panes" ] || return 1
     grep -qxF -- "$ORCH" <<<"$panes" && return 1
     return 0
@@ -915,10 +1433,12 @@ transcript_load() {   # pane [name] -> "<percent> transcript" or nothing
     # Gemessen: die Worker 'komm' und 'wache' galten deshalb als BLIND, obwohl die
     # Wache den Transkriptpfad in derselben Zeile schon nannte.
     [[ -n "$name" ]] && wbpath=$("$HOME/.local/bin/wb-state" worker-transcript "$name" 2>/dev/null)
-    /usr/bin/python3 - "$pid" "$cwd" "$HOME/.claude/projects" "$wbpath" <<'PY'
+    /usr/bin/python3 - "$pid" "$cwd" "$HOME/.claude/projects" "$wbpath" "$1" "$HOME/.claude/sessions" <<'PY'
 import json, os, glob, re, subprocess, sys
 pane_pid, cwd, projects = sys.argv[1], sys.argv[2], sys.argv[3]
 explicit_path = sys.argv[4] if len(sys.argv) > 4 else ""
+pane_id = sys.argv[5] if len(sys.argv) > 5 else ""
+sessions_dir = sys.argv[6] if len(sys.argv) > 6 else ""
 
 def cmdline(pid):
     try:
@@ -957,6 +1477,71 @@ if cl:
     def opt(name):
         return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else ""
     model, sid = opt("--model"), opt("--resume")
+
+# 2026-09-10 (Befund "Pane %46 (200x49) wird als BLIND gemeldet"): ein Orchestrator
+# ohne --resume (frisch gestartet, nicht wiederaufgenommen) hat keinen sid ueber die
+# Kommandozeile, auch wenn sein Projektordner mehrere .jsonl haelt -- die einzige
+# sichere Quelle war dann `len(cands) == 1`, was in einem geteilten Projektordner
+# (z. B. ~/.claude/projects/-Users-<user>-AI/, mehrere Sitzungen) fast nie zutrifft.
+# Der Harness setzt CLAUDE_CODE_SESSION_ID in der Umgebung des Prozesses schon beim
+# Start, --resume oder nicht -- das macht die Sitzungsdatei genauso eindeutig wie ein
+# echtes --resume. Nur wenn das fehlschlaegt (Prozess weg, Umgebung nicht lesbar),
+# bleibt die bisherige Ein-Datei-Regel unten als letzter Rueckfall.
+def env_session_id(pid):
+    if sys.platform == "darwin":
+        # macOS: `ps eww` haengt die Umgebung als "VAR=wert ..." hinter den Befehl.
+        try:
+            out = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)],
+                                  capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            return ""
+        m = re.search(r"CLAUDE_CODE_SESSION_ID=(\S+)", out)
+        return m.group(1) if m else ""
+    else:
+        # Linux: /proc/<pid>/environ, NUL-getrennt.
+        try:
+            with open("/proc/%s/environ" % pid, "rb") as fh:
+                data = fh.read()
+        except Exception:
+            return ""
+        for kv in data.split(b"\0"):
+            if kv.startswith(b"CLAUDE_CODE_SESSION_ID="):
+                return kv.split(b"=", 1)[1].decode("utf-8", "replace")
+        return ""
+
+# 2026-09-10, zweite Runde (Befund der Sitzung agents-plan, gemessen an zwei laufenden
+# Sitzungen): `ps eww` zeigt nur die STARTumgebung des Prozesses, und dort steht
+# CLAUDE_CODE_SESSION_ID nicht -- der Harness setzt sie erst fuer seine Kindprozesse.
+# env_session_id() lieferte deshalb immer "" und die Ein-Datei-Regel griff wieder.
+# Die belegte Quelle ist ~/.claude/sessions/<pid>.json, vom Harness je Sitzung
+# geschrieben, mit den Feldern pid, sessionId, cwd und tmux ("<session>:@<win>.<pane>").
+# Zuerst die Datei zur PID des gefundenen Claude-Prozesses, sonst die Datei, deren
+# tmux-Feld auf diesen Pane endet (der Prozess kann ein Kind sein, dessen PID nicht
+# die der Datei ist). Die Umgebung bleibt als letzter, praktisch toter Rueckfall.
+def sessions_json_session_id(pid, pane):
+    if not sessions_dir or not os.path.isdir(sessions_dir):
+        return ""
+    def lies(pfad):
+        try:
+            with open(pfad, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
+    d = lies(os.path.join(sessions_dir, "%s.json" % pid))
+    if d.get("sessionId"):
+        return d["sessionId"]
+    if pane:
+        for pfad in glob.glob(os.path.join(sessions_dir, "*.json")):
+            d = lies(pfad)
+            t = d.get("tmux") or ""
+            if t.endswith("." + pane) and d.get("sessionId"):
+                return d["sessionId"]
+    return ""
+
+if not sid and cl:
+    sid = sessions_json_session_id(p, pane_id)
+if not sid and cl:
+    sid = env_session_id(p)
 
 path = ""
 if explicit_path and os.path.exists(explicit_path):
@@ -1254,6 +1839,27 @@ read_load() { # pane [name] -> "<percent> <exact|bar|transcript|registry|session
         echo "$(( ${#filled} * 10 )) bar"
         return
     fi
+    # 2b) Die Statuszeile, die aus den letzten FUENF Zeilen herausgerutscht ist
+    #     (2026-08-26). Gemessen an den fuenf lebenden Claude-Panes dieser Nacht: die
+    #     Statuszeile stand zwei bis drei Zeilen ueber dem unteren Rand, also mit zwei
+    #     bis drei Zeilen Luft. Ein zusaetzlicher Hinweis unter der Eingabezeile ("Press
+    #     up to edit queued messages") oder eine ueber mehrere Zeilen umgebrochene
+    #     Eingabe reicht, um sie herauszudruecken -- und dann ist der Pane blind, obwohl
+    #     er breit genug ist und die Zahlen dastehen.
+    #     Gesucht wird deshalb tiefer, aber NUR in einer Zeile, die auch wirklich wie
+    #     eine Statuszeile aussieht: Zahlenpaar UND Balken in DERSELBEN Zeile. Genau das
+    #     unterscheidet sie von einem alten, hochgescrollten Balken -- dem Fehlgriff,
+    #     vor dem der Kommentar oben warnt und der am 25.07. eine Kompaktierung
+    #     ausgeloest hat, die nicht haette stattfinden duerfen. Diese Quelle ERGAENZT die
+    #     beiden oberen, sie ueberschreibt keine: sie kommt nur zum Zug, wenn die
+    #     letzten fuenf Zeilen gar nichts hergaben.
+    pair=$(printf '%s\n' "$cap" | tail -15 \
+           | grep -E '[▓░]{6,12}' \
+           | grep -oE '[0-9]+(\.[0-9]+)?[kKmM]?/[0-9]+(\.[0-9]+)?[kKmM]' | tail -1)
+    if [[ -n "$pair" ]]; then
+        num=$(tonum "${pair%%/*}"); den=$(tonum "${pair##*/}")
+        if [[ -n "$den" ]] && (( den > 0 )); then echo "$(( num * 100 / den )) exact-tief"; return; fi
+    fi
     # 3) last resort: the transcript (pane so narrow that the status line is cut before the bar)
     t=$(transcript_load "$1" "$wname")
     [[ -n "$t" ]] && { echo "$t"; return; }
@@ -1280,9 +1886,54 @@ read_load() { # pane [name] -> "<percent> <exact|bar|transcript|registry|session
 }
 
 announce_blind() {   # say it ONCE per pane instead of silently never warning
-    local pane="$1" label="$2" is_worker="${3:-0}" msg tpath
+    local pane="$1" label="$2" is_worker="${3:-0}" msg tpath groesse laeuft
     [[ "$blind" == *" $pane"* ]] && return
-    msg="$(date +%H:%M) $label ($pane): BLIND — weder Transcript noch Statuszeile lesbar; dieser Pane wird NICHT ueberwacht. Vermutlich schmaler als minWorkerPaneWidth=${MINW} Spalten — mit wb-grid gegenpruefen."
+    [[ "$kein_agent" == *" $pane"* ]] && return
+    # KEIN AGENT, KEINE FRAGE (2026-08-26). Zwei Bedingungen zusammen, nicht eine:
+    # der Vordergrundprozess ist eine nackte Schale UND der Startbefehl gehoert zu
+    # keinem bekannten Harness. Die zweite haelt den Fall offen, in dem eine CLI
+    # hinter einem Shell-Wrapper laeuft -- dort ist `pane_current_command` zwar
+    # ebenfalls eine Schale, der Harness aber erkannt, und der Pane gehoert weiter
+    # bewacht. Gemessen am 26.08.: der Spiegel %5 meldet `bash` ohne Harness, die
+    # echten Sitzungen %2/%15/%28 melden `claude`, auch waehrend sie Unterprozesse
+    # laufen lassen.
+    laeuft=$(tmux display -p -t "$pane" '#{pane_current_command}' 2>/dev/null)
+    harness_info "$pane"
+    if [[ "$laeuft" =~ ^(bash|zsh|sh|fish|dash|ksh)$ ]] && [[ -z "$HID" ]]; then
+        echo "$(date +%H:%M) $label ($pane): kein Agenten-Pane (Vordergrundprozess '$laeuft', kein bekannter Harness) — keine Kontextmessung, und das ist kein Mangel. Einmalig gemeldet, danach uebergangen."
+        kein_agent="$kein_agent $pane"
+        return
+    fi
+    # DIE GROESSE WIRD GEMESSEN, NICHT GERATEN (2026-08-26). Hier stand bis heute
+    # "Vermutlich schmaler als minWorkerPaneWidth=N Spalten — mit wb-grid
+    # gegenpruefen". Das war zweimal falsch: es nannte nur die Breite, obwohl auch
+    # die HOEHE reicht, um die Statuszeile verschwinden zu lassen (Pane %15 war
+    # 40x4), und es zeigte auf wb-grid, obwohl die Groesse dort gar nicht
+    # herkam. Die Zahl steht in einem einzigen tmux-Aufruf da; sie zu nennen
+    # kostet nichts und spart die Handmessung, die am 26.08. fuer zwei Sessions
+    # noetig war.
+    #
+    # DIE SCHWELLEN SIND ABGENOMMEN (2026-08-26, an einer echten Claude-Sitzung, deren Fenster
+    # schrittweise verkleinert und danach zurueckgestellt wurde -- am eigenen Pane, weil das die
+    # einzige Sitzung ist, die man dafuer stoeren darf):
+    #     200x10 -> Zahlenpaar     200x9 -> nichts
+    #      80x23 -> Zahlenpaar     70x23 und 60x23 -> nur der Balken     50x23 -> nichts
+    # Hier stand vorher "unter etwa acht Zeilen", geschaetzt und um zwei daneben. Eine Meldung,
+    # die eine Zahl nennt, muss sie gemessen haben; sonst ist sie eine Vermutung mit dem
+    # Selbstbewusstsein einer Messung. Der Balken-Fall gehoert mitgesagt, weil er still schadet:
+    # bei 60-79 Spalten liest die Wache noch etwas, aber nur in 10-Prozent-Stufen, und die
+    # 75-Prozent-Schwelle des Orchestrators rutscht dann auf 70 (siehe ORCH_WARN_EFF unten).
+    groesse=$(tmux display -p -t "$pane" '#{pane_width}x#{pane_height}' 2>/dev/null)
+    msg="$(date +%H:%M) $label ($pane): BLIND — weder Transcript noch Statuszeile lesbar; dieser Pane wird NICHT ueberwacht. Gemessen: ${groesse:-Groesse nicht lesbar} Zeichen. Die Schwellen sind ABGENOMMEN, nicht geschaetzt (2026-08-26, an einer echten Claude-Sitzung schrittweise vermessen): ab 10 Zeilen Hoehe steht die Statuszeile, bei 9 Zeilen nicht mehr; ab 80 Spalten ist das Zahlenpaar lesbar, zwischen 60 und 79 nur noch der Balken (10-Prozent-Stufen, die 75-Prozent-Schwelle des Orchestrators rutscht dann auf 70), unter 60 Spalten gar nichts. Was hier hilft, ist also 80x10 als Untergrenze und 200x50 als bequemes Mass."
+    # WOHER DIE GROESSE KOMMT, wenn sie nicht von wb-grid kommt (gemessen 2026-08-26,
+    # an den Panes %14 und %15): ein tmux-FENSTER ist immer so gross wie der
+    # KLEINSTE angeschlossene Client, und ein Pane, der in einer Session UND in
+    # deren '-view' haengt, zaehlt die Clients beider. Haengt dort einmal ein
+    # kleines Terminal, schrumpft der Pane -- und wenn dieser Client sich wieder
+    # abmeldet, BEHAELT tmux die erzwungene Groesse, ohne dass noch jemand zu
+    # sehen ist, der sie verursacht. Beide Panes standen so bei 39x5 bzw. 40x4 und
+    # waren dauerhaft unbeobachtet, waehrend ihre Wache lief und gruen aussah.
+    msg="$msg Kommt die Groesse nicht von wb-grid: ein tmux-Fenster ist so gross wie der KLEINSTE angeschlossene Client, und ohne Client behaelt es die zuletzt erzwungene Groesse. Nachsehen mit 'tmux list-clients'; geradeziehen mit 'tmux set-option -t <session> window-size manual' und 'tmux resize-window -t <session> -x 200 -y 50' (gemessen 2026-08-26, wirkt beim naechsten Poll ohne Neustart)."
     # SPEC-V2 B: for a worker (never the orchestrator, whose own transcript_load() above
     # already tried this pane's OWN process/cwd mapping and failed for a different
     # reason) name the RECORDED transcript file. pi-worker's background watcher stores
@@ -1298,8 +1949,23 @@ announce_blind() {   # say it ONCE per pane instead of silently never warning
     # Warum blind, wenn der Pane breit genug ist (2026-08-06): Ein fremder Harness hat weder
     # Claudes Statuszeile noch sein Transcript. Dann ist die Ursache nicht die Breite, sondern
     # ein fehlendes Muster — und das gehoert gesagt, sonst sucht man an der falschen Stelle.
+    # harness_info() steht schon oben (Ausstieg "kein Agent") und liest hier aus
+    # seinem Zwischenspeicher.
     harness_info "$pane"
-    if [ -n "$HID" ] && [ -z "$HCTX" ] && [ -z "$HSESS" ]; then
+    # RICHTIGSTELLUNG 2026-08-26: fuer den Harness 'claude' war dieser Satz eine falsche
+    # Faehrte, und er hat am 25.08. genau in die Irre gefuehrt. Ein contextPattern kann
+    # es hier NICHT geben: der Vertrag der Registry verlangt in der ersten Gruppe eine
+    # Prozentzahl, und Claudes Statuszeile nennt fuer den Kontext keine -- nur das
+    # Zahlenpaar. Die beiden Prozentzahlen, die dort stehen, sind die Kontingente
+    # (5h/7d); wer die als Kontext liest, misst etwas voellig anderes und merkt es nie.
+    # Eine fuenfte Quelle gaebe es ebenso wenig: wb-session-load kennt sieben Formate,
+    # keines davon ist Claudes Transkript -- und dessen Leser steht ohnehin schon als
+    # DRITTE Quelle in dieser Datei. Fuer 'claude' sind die Statuszeile und das
+    # Transkript die Leser, und wenn beide nichts hergeben, liegt es an der PANE-GROESSE
+    # oder an einem mehrdeutigen Projektordner, nicht an einem fehlenden Muster.
+    if [ "$HID" = "claude" ]; then
+        msg="$msg Fuer den Harness 'claude' ist ein contextPattern NICHT nachzutragen — seine Statuszeile nennt fuer den Kontext keine Prozentzahl, sondern nur das Zahlenpaar (die 5h- und 7d-Prozente sind Kontingente und duerfen nie als Kontext gelesen werden). Gelesen wird er aus der Statuszeile und, wenn die fehlt, aus dem Transkript. Sind beide stumm, ist der Pane zu klein (Statuszeile wird nicht gerendert) oder sein Projektordner traegt mehrere Sitzungsdateien, zwischen denen sich nicht raten laesst. Pane vergroessern ist der Weg, nicht die Registry."
+    elif [ -n "$HID" ] && [ -z "$HCTX" ] && [ -z "$HSESS" ]; then
         msg="$msg Harness '$HID' hat weder contextPattern noch eine lesbare Sitzungsquelle in der Registry — fuer ihn gibt es weder eine vierte noch eine fuenfte Quelle. Zeigt er eine Auslastung an, Muster messen und eintragen (wb-state models set --kind harness $HID contextPattern ...); zeigt er keine, aber schreibt eine Sitzungsdatei mit Tokenzahlen, gehoert sie in den session-Block (via 'sessionFile', ort, format — und das Format braucht einen Leser in dieser Wache). Sonst bleibt dieser Harness dauerhaft unbewacht."
     fi
     # Die fuenfte Quelle IST eingetragen und hat trotzdem nichts geliefert. Der haeufigste
@@ -1319,14 +1985,66 @@ announce_blind() {   # say it ONCE per pane instead of silently never warning
 # Loch, das offen steht, sobald jemand die Installation halb ausliefert.
 PANE_WRITE="$HOME/.local/bin/wb-pane-write"
 
+# Dieselbe Zeitschranke wie um tmux, aus demselben Grund (2026-08-26): wb-pane-write
+# ist ein eigener Prozess, der seinerseits tmux ruft. Die Schranke oben deckt IHN nicht
+# ab -- sie gilt nur fuer die tmux-Aufrufe DIESES Skripts. Genau hier hing die Wache am
+# 25.08.: `wb-pane-write tippen %2` kehrte nie zurueck. Die Wache verlaesst sich also
+# nicht darauf, dass wb-pane-write sich selbst begrenzt, auch wenn es das inzwischen tut.
+PANE_WRITE_TIMEOUT="${PANE_WRITE_TIMEOUT:-30}"
+# Dieselbe Zeitschranke wie bei tmux, fuer JEDES fremde Programm (2026-08-28):
+# `timeout` fehlt auf macOS im Grundsystem, und ein unbedingter Aufruf macht aus
+# einer Schutzmassnahme einen Totalausfall -- die beiden Aufrufe unten liefen
+# deshalb bis heute in "timeout: command not found", der Text wurde nie getippt.
+mit_frist() {   # <sekunden> <programm> [args...] -- Rueckgabe 124 bei Ablauf
+    local sek="$1"; shift
+    local kind i=0 grenze
+    if [ -n "$TIMEOUT_BIN" ]; then
+        command "$TIMEOUT_BIN" -k 2 "$sek" "$@"
+        return $?
+    fi
+    grenze=$(( sek * 10 ))
+    # `<&0` ist NICHT kosmetisch (gemessen 2026-08-28): ein Hintergrundjob bekommt in
+    # einem Skript ohne Jobsteuerung von sich aus /dev/null als Eingabe. Ohne diese
+    # ausdrueckliche Umleitung kam der gepipete Text nie bei tmux an -- `load-buffer -`
+    # legte einen leeren Puffer an und das spaetere `paste-buffer` meldete "no buffer".
+    "$@" <&0 &
+    kind=$!
+    while kill -0 "$kind" 2>/dev/null; do
+        if (( i >= grenze )); then
+            kill -TERM "$kind" 2>/dev/null
+            sleep 0.2
+            kill -KILL "$kind" 2>/dev/null
+            wait "$kind" 2>/dev/null
+            return 124
+        fi
+        i=$(( i + 1 ))
+        sleep 0.1
+    done
+    wait "$kind"
+}
+
+schreib_abbruch() {   # <rc> <was> -> meldet einen Abbruch laut, gibt den rc zurueck
+    local rc="$1"
+    if (( rc == 124 || rc == 137 )); then
+        echo "$(date +%H:%M) context-guard: '$2' hat nach ${PANE_WRITE_TIMEOUT}s nicht geantwortet und wurde abgebrochen -- nichts wurde zugestellt, die Schleife laeuft weiter." >&2
+    fi
+    return "$rc"
+}
+
 schreib_text() {   # <pane> <text> -> wortwoertlich tippen, ohne Enter
+    local rc
     [ -x "$PANE_WRITE" ] || { echo "context-guard: $PANE_WRITE fehlt — es wird NICHTS in einen Pane getippt." >&2; return 1; }
-    printf '%s' "$2" | "$PANE_WRITE" tippen "$1"
+    printf '%s' "$2" | mit_frist "$PANE_WRITE_TIMEOUT" "$PANE_WRITE" tippen "$1"
+    rc=$?
+    schreib_abbruch "$rc" "wb-pane-write tippen $1"
 }
 
 schreib_taste() {  # <pane> <tastenname>
+    local rc
     [ -x "$PANE_WRITE" ] || return 1
-    "$PANE_WRITE" taste "$1" "$2"
+    mit_frist "$PANE_WRITE_TIMEOUT" "$PANE_WRITE" taste "$1" "$2"
+    rc=$?
+    schreib_abbruch "$rc" "wb-pane-write taste $1 $2"
 }
 
 # --- Absende-Pruefung ---------------------------------------------------------------
@@ -1380,13 +2098,27 @@ schreib_taste() {  # <pane> <tastenname>
 # die Verifikation scheitert.
 GUARD_PROMPT_RE='^❯'
 GUARD_PROMPT_IGNORE='^❯ Press up to edit queued messages'
-absenden_verifizieren() {   # <pane> [nachhilfe=1] -> 0: Eingabezeile frei (oder Queue-Platzhalter), 1: Text haengt noch
-    local pane="$1" nachhilfe="${2:-1}" versuch inbox
+# EIN LAUFENDER ZUG GILT EBENFALLS ALS ANGENOMMEN (2026-09-03, Vorfall wache2/neubau
+# %138, 20:18-20:52): der Kompaktierbefehl ging an einen Pane, der GENAU in dem Moment
+# mitten in einem fremden Zug steckte -- das Redraw des Platzhalters "Press up to edit
+# queued messages" hinkte dem tatsaechlichen Queuing hinterher, die Eingabezeile zeigte
+# 1s nach Enter noch den zuletzt getippten Text. Der Guard meldete "NICHT verifiziert"
+# und tippte darum (richtig) kein zweites Mal -- aber der Befehl WAR angenommen: er lief
+# als Warteschlangeneintrag durch, /compact griff spaeter tatsaechlich (Anzeige 0/1.0M),
+# und niemand tippte danach den Anschluss, weil die Wache den Erfolg nie sah. Ein
+# sichtbarer Zug (Spinner, "esc to interrupt", "Compacting", ...) IRGENDWO im Pane ist
+# unabhaengiger Beleg fuer "angenommen": eine wirklich haengende, unabgeschickte Eingabe
+# zeigt nie gleichzeitig einen laufenden Zug -- der laeuft nur, wenn die Gegenseite
+# gerade etwas verarbeitet (unseren Text, ob sofort oder aus der Warteschlange).
+absenden_verifizieren() {   # <pane> [nachhilfe=1] -> 0: Eingabezeile frei, Warteschlange (Platzhalter) oder laufender Zug, 1: Text haengt noch
+    local pane="$1" nachhilfe="${2:-1}" versuch cap inbox
     for versuch in 1 2; do
         sleep 1
         [[ -n "$(pane_dialog_question "$pane")" ]] && return 1
-        inbox=$(tmux capture-pane -p -t "$pane" 2>/dev/null | grep -E "$GUARD_PROMPT_RE" | tail -1)
+        cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null)
+        inbox=$(printf '%s\n' "$cap" | grep -E "$GUARD_PROMPT_RE" | tail -1)
         printf '%s' "$inbox" | grep -qE "$GUARD_PROMPT_IGNORE" && return 0
+        printf '%s\n' "$cap" | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && return 0
         printf '%s' "$inbox" | grep -qE "${GUARD_PROMPT_RE}[[:space:]]+[^[:space:]]" || return 0
         (( versuch == 2 )) && break
         (( nachhilfe )) || break            # nachhilfe=0: EIN Check reicht, keine zweite Sekunde warten
@@ -1456,6 +2188,24 @@ nudge_kompakt_einmalig() {
     absenden_verifizieren "$pane" 0 && return 0
     echo "$(date +%H:%M) context-guard: Kompaktierbefehl an $pane NICHT verifiziert -- Text stand nach Enter noch in der Eingabezeile. Lieber einmal ungesendet gemeldet als zweimal gesendet: KEIN erneuter Versuch in diesem Zyklus. Selbst pruefen: tmux capture-pane -p -t $pane" >&2
     return 1
+}
+
+# Vorbedingung fuer den Anschluss nach dem Kompaktieren (2026-09-03, siehe ANSCHLUSS_DIR
+# oben): "der Pane leer wartet" heisst kein Dialog, kein laufender Zug, keine
+# Warteschlange (der Platzhalter "Press up to edit queued messages" zaehlt hier NICHT als
+# leer -- da haengt noch etwas) und keine haengende, unabgeschickte Eingabe. Eine ganz
+# unlesbare Eingabezeile (kein '❯' im Capture -- schmaler Pane, oder eine TUI, die gar
+# keinen Prompt zeichnet) gilt wie ueberall sonst in dieser Datei als "nichts im Weg",
+# nicht als Blockade.
+pane_wartet_leer() {   # <pane> -> 0: wirklich idle, 1: Dialog/Zug/Warteschlange/haengender Text
+    local pane="$1" cap inbox
+    [[ -n "$(pane_dialog_question "$pane")" ]] && return 1
+    cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null)
+    printf '%s\n' "$cap" | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && return 1
+    inbox=$(printf '%s\n' "$cap" | grep -E "$GUARD_PROMPT_RE" | tail -1)
+    printf '%s' "$inbox" | grep -qE "$GUARD_PROMPT_IGNORE" && return 1
+    printf '%s' "$inbox" | grep -qE "${GUARD_PROMPT_RE}[[:space:]]+[^[:space:]]" && return 1
+    return 0
 }
 
 # Queue a message even when the pane is BUSY. Claude Code queues keystrokes typed mid-turn and
@@ -1575,7 +2325,8 @@ check_dialog_block() {   # pane name -> meldet dem Orchestrator, wenn noetig
 # gesetzt (Pane also nicht BUSY) -- bei BUSY bleibt der Worker unmarkiert und wird beim
 # naechsten Poll automatisch erneut versucht, bis es durchkommt.
 check_worker_results() {
-    tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$ORCH" || return
+    _cg_pane_liste_aktualisieren
+    grep -qx "$ORCH" <<<"$_CG_PANES_CACHE" || return
     local name resfile donefile machine self msg
     case "$(uname -s)" in Darwin) self=mac ;; *) self=peer ;; esac
     local ident prev ziel
@@ -1672,11 +2423,48 @@ check_worker_results() {
             echo "$(date +%H:%M) worker $name fertig -> Meldung unterdrueckt (guardMeldetWorkerStatus aus), Merker gesetzt (${machine:-lokal})"
             continue
         fi
+        # Frisch nachpruefen, unmittelbar vor nudge() (2026-08-22, Auftrag fertigmeldung):
+        # zwischen der Pruefung oben und HIER liegt echte Zeit -- nudge() selbst tippt in
+        # den Pane und kann unter Last ueber eine Sekunde brauchen (gemessen: Entscheidung
+        # um 16.8s, Log-Eintrag erst um 18.0s). Genau in diesem Fenster kann wb-close (ein
+        # EIGENER Prozess) die Markierung inzwischen gesetzt haben -- ohne diese zweite,
+        # billige Pruefung waere die Meldung schon unterwegs, obwohl der Orchestrator den
+        # Worker laengst geschlossen hat: exakt der Laerm, den die Markierung verhindern
+        # soll (siehe wb-close, mark_worker_done). Geprueft wird der INHALT, nicht nur das
+        # Vorhandensein -- ein leerer Merker (wb-close war schneller) oder derselbe $ident
+        # (wir selbst oder ein paralleler Poll haben es schon gemeldet) bedeuten "nicht
+        # mehr melden"; ein ANDERER, aelterer Merker bedeutet "das hier ist ein NEUES
+        # Ergebnis desselben Workers" und muss weiterhin durch (Fall j). Die erste Pruefung
+        # oben bleibt bestehen -- sie faengt den Normalfall billig ab, ohne fuer jeden
+        # Worker bei jedem Poll zweimal zu stat'en; nur wer bis hierher kommt, zahlt den
+        # zweiten Stat.
+        #
+        # Karenzzeit + Sperre um Neupruefung+nudge()+Markieren (2026-08-22, Auftrag
+        # "Sperre gebaut", siehe NOTIFY_SETTLE_S/LOCK_DIR/acquire_done_lock oben): erst
+        # die Verzoegerung (gibt einem frisch gestarteten wb-close Zeit, ueberhaupt bei
+        # seiner eigenen Sperre anzukommen), dann die Sperre (schliesst das kuerzere
+        # Fenster INNERHALB von nudge() selbst, das die Verzoegerung allein nicht
+        # anfasst). Erwirbt der Guard die Sperre nicht innerhalb ihres Deckels (z. B.
+        # weil wb-close sie laenger als DONE_LOCK_TIMEOUT_S haelt), macht er GENAU das,
+        # was er vor dieser Aenderung tat: die Neupruefung von oben, dann nudge() ohne
+        # weitere Sperrung -- zweite Auflage, kein Verhalten faellt ganz aus.
+        sleep "$NOTIFY_SETTLE_S"
+        local slug_name have_lock=0
+        slug_name="$(basename "$donefile")"
+        acquire_done_lock "$slug_name" && have_lock=1
+        if [ -f "$donefile" ]; then
+            prev="$(cat "$donefile" 2>/dev/null)"
+            if [ -z "$prev" ] || [ "$prev" = "$ident" ]; then
+                [ "$have_lock" = 1 ] && release_done_lock "$slug_name"
+                continue
+            fi
+        fi
         if nudge "$ORCH" "$msg"; then
             printf '%s\n' "$ident" >"$donefile" 2>/dev/null || true
             echo "$(date +%H:%M) worker $name fertig -> orchestrator benachrichtigt (${machine:-lokal})"
             log_orch_notify "worker $name fertig (${machine:-lokal}): $msg"
         fi
+        [ "$have_lock" = 1 ] && release_done_lock "$slug_name"
     done <"$KNOWN_WORKERS_FILE"
 }
 
@@ -1735,9 +2523,34 @@ REMOTE_VIEW_EVERY="${REMOTE_VIEW_EVERY:-180}"
 REMOTE_VIEW_LAST=0
 REMOTE_VIEW_AN=1
 [ "$("$HOME/.local/bin/wb-state" settings get guardRemoteView 2>/dev/null)" = "false" ] && REMOTE_VIEW_AN=0
+# Welche Maschine ein Aufruf OHNE Argument anspraeche -- dieselbe Ableitung wie
+# in wb-remote-view (SELF/OTHER), gebraucht fuer die pausierte-Maschine-Pruefung
+# gleich darunter: die soll den Prozessstart selbst sparen, nicht nur dessen
+# Wirkung abwarten.
+case "$(uname -s)" in Darwin) REMOTE_VIEW_SELF=mac ;; *) REMOTE_VIEW_SELF=peer ;; esac
+REMOTE_VIEW_ZIEL=$([ "$REMOTE_VIEW_SELF" = mac ] && echo peer || echo mac)
+
+# Pausierte Maschine (2026-09-04): "nicht nur nicht mehr gezeigt, sondern gar
+# nicht mehr geladen" gilt auch fuer DIESEN Poll selbst, nicht erst fuer den
+# Riegel in wb-remote-view (der bleibt als zweite Sicherung stehen, falls
+# jemand die Maschine anders anspricht). `remoteMachinesPausiert` ist die EINE
+# Wahrheit, gelesen ueber `wb-state settings get` -- derselbe Weg wie ueberall
+# sonst in dieser Datei. Ein Fehlschlag beim Nachsehen (kein wb-state, kaputtes
+# JSON) heisst "nicht pausiert": lieber einmal zu oft fragen als eine echte
+# Maschine grundlos verstummen lassen, wenn die Auskunft selbst fehlt.
+remote_view_maschine_pausiert() {
+    "$HOME/.local/bin/wb-state" settings get remoteMachinesPausiert 2>/dev/null \
+      | /usr/bin/python3 -c 'import json, sys
+try:
+    liste = json.load(sys.stdin)
+    sys.exit(0 if isinstance(liste, list) and sys.argv[1] in liste else 1)
+except Exception:
+    sys.exit(1)' "$1"
+}
 
 check_remote_view() {
     (( REMOTE_VIEW_AN )) || return 0
+    remote_view_maschine_pausiert "$REMOTE_VIEW_ZIEL" && return 0
     local rv now
     rv="${WB_REMOTE_VIEW:-$HOME/.local/bin/wb-remote-view}"
     [ -x "$rv" ] || return 0
@@ -1747,7 +2560,12 @@ check_remote_view() {
     # Ohne Argument nimmt wb-remote-view die jeweils ANDERE Maschine. Der Aufruf legt
     # den Spiegel an, belebt ihn wieder oder raeumt ihn ab -- je nachdem, was drueben
     # laeuft. Seine Ausgabe gehoert ins Guard-Log, nicht in den Chat.
-    ( "$rv" --quiet >/dev/null 2>&1 || true ) &
+    # --owned-only (2026-08-27): dieser Poll ist automatisch und laeuft in JEDER Session
+    # mit einem Worker, unabhaengig davon, ob sie ueberhaupt etwas mit der anderen
+    # Maschine zu tun hat. Ohne die Bremse holte er blind ALLE Sessions der anderen
+    # Maschine in die zufaellig gerade angehaengte lokale Session (Befund 27.08.: zwei
+    # fremde Mac-Sessions landeten so im Worker-Tab von peers Polarschern-Session).
+    ( "$rv" --quiet --owned-only >/dev/null 2>&1 || true ) &
 }
 
 check_post_mail() {
@@ -1759,7 +2577,8 @@ check_post_mail() {
     werkzeug="$(post_werkzeug)"
     [ -n "$werkzeug" ] || return 0
     [ -n "$GUARD_SESSION" ] || return 0
-    tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$ORCH" || return 0
+    _cg_pane_liste_aktualisieren
+    grep -qx "$ORCH" <<<"$_CG_PANES_CACHE" || return 0
     # `lesen --sitzung` fasst kein tmux an und ruft nichts nach aussen; es liest
     # Dateien. Exit 1 heisst schlicht "nichts Ungelesenes da".
     roh="$("$werkzeug" lesen --sitzung "$GUARD_SESSION" --json 2>/dev/null)" || return 0
@@ -1813,19 +2632,56 @@ EOF
 
 warned=""    # "pane1 pane2" -- panes already told this cycle
 compacted="" # orchestrator panes already compacted this cycle
+# Wirkungslose Kompaktierung: welcher Pane, wie viele Polls Karenz noch, und die
+# beiden gemessenen Zahlen fuer die Meldung. Leer = nichts anhaengig.
+kompakt_wirkungslos=""
+kompakt_karenz=0
+kompakt_vorher=-1
+kompakt_nachher=-1
 blind=""     # panes we cannot read at all -- announced once, never silently ignored
+
+# --- HERZSCHLAG UND WIEDERHOLTE BLIND-MELDUNG (2026-08-26) ---------------------------
+# Beides gegen dieselbe Schwaeche: Schweigen im Protokoll ist zweideutig. Eine Wache,
+# die steht, sieht darin genauso aus wie eine, der nichts aufgefallen ist -- und ein
+# Pane, der einmal als BLIND gemeldet wurde und es bleibt, verschwindet nach dieser
+# einen Zeile aus dem Blick. Runnerideen hat das am 26.08. genau benannt: die
+# gefaehrlichere Form ist nicht die tote Wache, sondern die lebende, die nichts sieht,
+# weil ihr Protokoll dabei gruen aussieht.
+#
+# HERZSCHLAG: nach jedem vollstaendigen Poll wird die Sekunde in eine Datei geschrieben.
+# Wer wissen will, ob eine Wache wirklich pollt, sieht auf deren mtime -- ein lebender
+# Prozess in `ps` beweist das nicht, wie die Nacht gezeigt hat.
+# UEBERFAELLIG: dauert die Arbeit eines Polls laenger als das Poll-Intervall selbst,
+# steht das im Protokoll. Damit ist ein Stillstand sichtbar, statt nur verhindert.
+HEARTBEAT="$STATE_BASE/$GUARD_SLUG.heartbeat"
+POLL_NR=0
+BLIND_WIEDERHOLUNG="${BLIND_WIEDERHOLUNG:-30}"   # alle N Polls erneut melden (0 = nie)
+
+# Panes, bei denen die Frage nach dem Kontext gar nicht gestellt gehoert (2026-08-26,
+# Einwand von Polarschern). Der Mac-Spiegel %5 ist eine nackte `bash` in einem
+# ssh-Aufruf; sie hat keine Statuszeile und wird nie eine haben. Die -- richtige --
+# wiederholte Blindheitsmeldung waere ausgerechnet dort am lautesten, wo sie nichts
+# bedeutet, und genau so gewoehnt man sich das Hinsehen ab. Diese Liste wird deshalb
+# NIE geleert: so ein Pane wird einmal benannt und danach uebergangen.
+kein_agent=""
 nocompact="" # Panes, deren Harness kein Kompaktieren kennt -- ebenfalls genau einmal gesagt
 
 # Compact the orchestrator and hand the job straight back. Used by BOTH triggers (sentinel and
 # the load-based emergency brake) so the follow-up is identical either way: a compacted
 # orchestrator without a prompt has an empty window and no task and simply stalls -- the exact
 # failure the human should never be the one to notice.
-compact_orchestrator() {   # $1 = reason (log only) -> 0 verifiziert getippt / 1 nichts getippt (busy/Harness) ODER getippt-aber-unverifiziert (dann `compacted` trotzdem gesetzt, siehe unten -- kein zweiter Versuch in diesem Zyklus)
-    local reason="$1"
+compact_orchestrator() {   # $1 = reason (log only), $2 = optionaler weiterer Sentinelpfad, der bei Erfolg mit-entfernt wird (2026-09-10: der ALTE geteilte Pfad, nur wenn ER den Zyklus ausgeloest hat -- siehe SENTINEL_OLD oben) -> 0 verifiziert getippt / 1 nichts getippt (busy/Harness) ODER getippt-aber-unverifiziert (dann `compacted` trotzdem gesetzt, siehe unten -- kein zweiter Versuch in diesem Zyklus)
+    local reason="$1" extra_sentinel="${2:-}"
     # Der Kompaktierbefehl kommt aus der Registry (2026-08-06). Bis heute stand hier ein fest
     # verdrahtetes /compact, das auch in einen pi-Pane getippt wurde, wo es nichts bewirkt.
     # Kennt ein Harness das Kompaktieren nicht, wird nichts getippt und genau das gesagt.
     harness_info "$ORCH"
+    # Die Last VOR dem Kompaktieren. Sie wird hier eigens gelesen und nicht vom
+    # Aufrufer durchgereicht, weil beide Ausloeser hier hereinkommen und nur einer
+    # von ihnen ueberhaupt eine Zahl hat: der Sentinel-Weg feuert absichtlich auch
+    # dann, wenn die Last gar nicht lesbar ist.
+    local vorher_pct vorher_src
+    read -r vorher_pct vorher_src <<<"$(read_load "$ORCH")"
     if [[ -z "$HCOMPACT" ]]; then
         if [[ "$nocompact" != *" $ORCH"* ]]; then
             echo "$(date +%H:%M) orchestrator ($ORCH): Harness '${HID:-unbekannt}' kennt kein Kompaktieren (compactCommand leer) — NICHT getippt ($reason). Der Kontext muss von Hand entlastet werden."
@@ -1857,7 +2713,25 @@ compact_orchestrator() {   # $1 = reason (log only) -> 0 verifiziert getippt / 1
         tmux capture-pane -p -t "$ORCH" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" || break
         sleep 30
     done
+    # NACHMESSEN (2026-08-28): erst jetzt, nach COMPACT_SETTLE und der Busy-Schleife,
+    # steht ein Ergebnis auf dem Schirm. Verglichen wird gegen die Last von vor dem
+    # Tippen; beide muessen lesbar sein, sonst wird nichts behauptet.
+    local nachher_pct nachher_src
+    read -r nachher_pct nachher_src <<<"$(read_load "$ORCH")"
+    if (( vorher_pct >= 0 && nachher_pct >= 0 && nachher_pct > vorher_pct - KOMPAKT_WIRKUNG_MIN )); then
+        kompakt_wirkungslos="$ORCH"
+        kompakt_karenz="$KOMPAKT_KARENZ_POLLS"
+        kompakt_vorher="$vorher_pct"
+        kompakt_nachher="$nachher_pct"
+        echo "$(date +%H:%M) orchestrator ($ORCH): Kompaktierung WIRKUNGSLOS — Last vorher ${vorher_pct}% (${vorher_src}), nachher ${nachher_pct}% (${nachher_src}), erwartet war ein Abfall von mindestens ${KOMPAKT_WIRKUNG_MIN} Punkten. Ohne Freigabe waere der Zyklus jetzt tot (neu scharf erst unter $(( ORCH_PCT - ORCH_REARM_GAP ))%). Karenz: ${KOMPAKT_KARENZ_POLLS} Polls, danach ist ein zweiter Versuch erlaubt."
+        log_orch_notify "Kompaktierung wirkungslos (${vorher_pct}% -> ${nachher_pct}%), Zyklus wird nach ${KOMPAKT_KARENZ_POLLS} Polls wieder freigegeben"
+    elif (( vorher_pct >= 0 && nachher_pct >= 0 )); then
+        echo "$(date +%H:%M) orchestrator ($ORCH): Kompaktierung wirksam — Last ${vorher_pct}% -> ${nachher_pct}% (${nachher_src})."
+    else
+        echo "$(date +%H:%M) orchestrator ($ORCH): Wirksamkeit der Kompaktierung NICHT messbar (vorher ${vorher_pct}%, nachher ${nachher_pct}%) — der Zyklus bleibt verbraucht, wie bisher."
+    fi
     rm -f "$SENTINEL"                      # cycle is armed again for the next rise
+    [[ -n "$extra_sentinel" ]] && rm -f "$extra_sentinel"   # 2026-09-10: nur entfernt, wenn dieser Aufruf ihn selbst konsumiert hat (siehe Aufrufer)
     warned="${warned/ $ORCH/}"
     # Die Kette Handoff-Aufforderung -> $HCOMPACT -> WEITERARBEITEN laeuft in dieser
     # Reihenfolge und jede Stufe loggt ihr eigenes Ergebnis (2026-08-12): die
@@ -1893,6 +2767,7 @@ else
     (( !WACHE_ORCH_AN   || WACHE_ORCH_EINGRIFF ))   || echo "context-guard: ORCHESTRATOR — Wache MELDET nur, sie greift nicht ein (kein /compact)."
     (( !WACHE_WORKER_AN || WACHE_WORKER_EINGRIFF )) || echo "context-guard: WORKER — Wache MELDET nur, sie greift nicht ein (kein /compact)."
 fi
+echo "context-guard: Herzschlag nach jedem Poll in $HEARTBEAT — daran (und NICHT an einem lebenden Prozess in ps) erkennt man, ob diese Wache wirklich pollt."
 (( GUARD_MELDET_STATUS )) || echo "context-guard: guardMeldetWorkerStatus ist AUS — weder Fertig- noch Haengt-Meldung im Orchestrator-Pane, die Merker laufen still weiter. (wb-state settings get guardMeldetWorkerStatus)"
 (( EXIT_WHEN_EMPTY )) && echo "context-guard: endet selbst, sobald ${EXIT_EMPTY_POLLS} Polls in Folge kein lebender Worker-Pane da ist (fruehestens ${EXIT_GRACE}s nach dem Start)"
 (( EXIT_WHEN_SESSION_GONE )) && echo "context-guard: endet selbst, sobald die Session '${GUARD_SESSION:-?}' nicht mehr existiert (spaetestens ${POLL}s nach dem Verschwinden, siehe unten)"
@@ -1909,6 +2784,15 @@ prune_known_workers
 
 while true; do
     [[ -f "$STOP_FILE" ]] && { echo "context-guard: stopped"; exit 0; }
+    ZYKLUS_START=$(date +%s)
+    POLL_NR=$(( POLL_NR + 1 ))
+    # Blindheit ist ein ZUSTAND, kein Ereignis. Der Merker wird deshalb regelmaessig
+    # geleert, damit ein Pane, der unbeobachtet BLEIBT, das auch weiterhin sagt. Ohne
+    # das steht die Meldung einmal im Protokoll und danach sieht Stundenlanges
+    # Nichtbeobachten aus wie Ruhe.
+    if (( BLIND_WIEDERHOLUNG > 0 )) && (( POLL_NR % BLIND_WIEDERHOLUNG == 0 )); then
+        blind=""
+    fi
 
     # --exit-when-session-gone (2026-08-04): unbedingt geprueft, VOR der
     # --exit-when-no-workers-Karenz unten und vor jeder Kompaktierung in diesem Zyklus -- ein
@@ -1988,6 +2872,16 @@ while true; do
         else
             set --
         fi
+        # Dazu die Worker, die auf einem eigenen Pseudo-Terminal laufen und
+        # deshalb in keiner tmux-Auflistung stehen (04.09.2026). Sie kommen aus
+        # derselben Quelle wie ihr Bildschirm, dem Steuerkanal der Werkbank, und
+        # in derselben Form "<pane>:<name>" wie die tmux-Worker -- ab hier
+        # unterscheidet die Schleife sie nicht mehr.
+        set -- "$@" $(awb_ctl pane-liste 2>/dev/null \
+                        | tr '{' '\n' \
+                        | sed -nE 's/.*"id":"(pty:[0-9]+)","name":"([^"]+)".*/\1:\2/p')
+        # Kein zweites `kanal_stand` hier: `_cg_pane_liste_aktualisieren` fragt
+        # denselben Kanal im selben Poll und meldet einen Ausfall schon.
     fi
 
     # --- workers
@@ -1997,10 +2891,18 @@ while true; do
     # Kontextwache, nicht die Beobachtung der Worker ueberhaupt. Wer die Meldung
     # "Worker fertig" verlieren wollte, haette etwas anderes abgeschaltet.
     for entry in "$@"; do
-        pane="${entry%%:*}"; name="${entry##*:}"
+        # Ein tmux-Pane heisst "%12", ein pty-Pane "pty:1" -- letzterer traegt
+        # den Doppelpunkt SELBST, und "${entry%%:*}" haette davon nur "pty"
+        # uebriggelassen. Der tmux-Zweig bleibt buchstabengleich, damit ein Name
+        # mit Doppelpunkt sich weiter genau so verhaelt wie bisher.
+        case "$entry" in
+            pty:*) pane="${entry%:*}"; name="${entry##*:}" ;;
+            *)     pane="${entry%%:*}"; name="${entry##*:}" ;;
+        esac
         record_known_worker "$name"
         (( WACHE_WORKER_AN )) || continue
-        tmux list-panes -a -F '#{pane_id}' | grep -qx "$pane" || continue
+        _cg_pane_liste_aktualisieren
+        grep -qx "$pane" <<<"$_CG_PANES_CACHE" || continue
 
         # Blockiert-Erkennung LAEUFT UNABHAENGIG von der Kontextmessung unten
         # (auch wenn read_load() gleich BLIND meldet -- der Dialog kann genau
@@ -2010,6 +2912,34 @@ while true; do
         read -r pct src <<<"$(read_load "$pane" "$name")"
         if (( pct < 0 )); then announce_blind "$pane" "$name" 1; continue; fi
         blind="${blind/ $pane/}"
+
+        # Anschluss nach dem Kompaktieren (2026-09-03, siehe ANSCHLUSS_DIR/Vorfall
+        # wache2/neubau oben): laeuft UNABHAENGIG von der Warn-/Kompaktier-Verzweigung
+        # unten und deshalb VOR ihr, sonst wuerde genau der Poll, an dem die Auslastung
+        # endlich faellt, in den fruehen "continue" des Rearms laufen, ohne dass der
+        # Anschluss je geprueft wird. Getippt wird GENAU EINMAL, auch nach einem
+        # Neustart der Wache: der Merker wird VERBRAUCHT (geloescht), bevor ueberhaupt
+        # versucht wird zu tippen -- dieselbe Regel wie bei nudge_kompakt_einmalig,
+        # "lieber einmal ungesendet gemeldet als zweimal getippt".
+        anschluss_datei="$ANSCHLUSS_DIR/$(sanitize_name "$name")"
+        if [[ -f "$anschluss_datei" ]] && (( WACHE_WORKER_EINGRIFF )); then
+            anschluss_vorher="$(tr -dc '0-9' < "$anschluss_datei" 2>/dev/null)"
+            if [[ -n "$anschluss_vorher" ]] && (( anschluss_vorher > 0 )) && (( pct * 2 < anschluss_vorher )) \
+               && pane_wartet_leer "$pane"; then
+                anschluss_handoff=""
+                while IFS= read -r cand; do
+                    [[ -f "$cand" ]] && { anschluss_handoff="$cand"; break; }
+                done < <(handoff_candidates "$pane" "$name")
+                rm -f "$anschluss_datei"    # verbraucht, VOR dem Tippversuch -- nie ein zweiter Anschluss
+                if [[ -z "$anschluss_handoff" ]]; then
+                    echo "$(date +%H:%M) $name ($pane): kein Anschluss getippt -- nach dem Abfall von ${anschluss_vorher}% auf ${pct}% liegt keine Uebergabedatei mehr da."
+                elif nudge_verifiziert "$pane" "Weiter nach der Kompaktierung: lies $anschluss_handoff vollstaendig und fuehre den darin genannten naechsten Schritt aus; Ergebnisdatei wie im Auftrag."; then
+                    echo "$(date +%H:%M) $name ($pane) -> resumed (Anschluss nach Kompaktierung, ${anschluss_vorher}% -> ${pct}%)"
+                else
+                    echo "$(date +%H:%M) $name ($pane): Anschluss NICHT verifiziert nach Kompaktierung -- Pane steht moeglicherweise leer und ohne Auftrag. Selbst pruefen: tmux capture-pane -p -t $pane"
+                fi
+            fi
+        fi
 
         if (( pct < WARN_PCT - WORKER_REARM_GAP )); then
             warned="${warned/ $pane/}"          # load dropped: re-arm for the next cycle
@@ -2069,23 +2999,23 @@ while true; do
             # denselben Kompaktierbefehl noch einmal in denselben Worker.
             nudge_kompakt_einmalig "$pane" "$HCOMPACT"
             kompaktstatus=$?
+            # Anschluss-Merker wird bei JEDEM getippten Versuch geschrieben, verifiziert
+            # oder nicht (2026-09-03, Vorfall wache2/neubau %138): der Vorfall zeigte
+            # genau den Fall, in dem "NICHT verifiziert" ein falscher Negativbefund war
+            # -- der Kompaktierbefehl WAR angenommen (er lief in die Warteschlange eines
+            # fremden Zugs), lief spaeter durch, und niemand tippte danach den Anschluss,
+            # weil die alte Kette (sofortiges sleep+WEITERARBEITEN direkt hier) nur auf
+            # dem sofort-verifizierten Erfolgspfad lief. Der Merker macht das Warten auf
+            # den Anschluss unabhaengig von dieser einen Momentaufnahme: die Pruefung
+            # weiter oben im Worker-Block (vor der Warn-/Kompaktier-Verzweigung) beobachtet
+            # jeden weiteren Poll, ob die Auslastung WIRKLICH gefallen ist, und tippt den
+            # Anschluss dann selbst -- verifiziert oder nicht spielt hier keine Rolle mehr.
             if (( kompaktstatus != 2 )); then
                 compacted="$compacted $pane"          # getippt, unabhaengig von der Verifikation -- kein zweiter Versuch
+                printf '%s\n' "$pct" > "$ANSCHLUSS_DIR/$(sanitize_name "$name")" 2>/dev/null || true
             fi
             if (( kompaktstatus == 0 )); then
                 echo "$(date +%H:%M) $name ($pane) -> $HCOMPACT typed (handoff persisted)"
-                sleep 90
-                for _ in 1 2 3 4 5 6 7 8 9 10; do
-                    tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" || break
-                    sleep 30
-                done
-                # Gleiche Begruendung wie bei compact_orchestrator: der Erfolg des
-                # WEITERARBEITEN-Prompts wird geprueft, nicht unterstellt (2026-08-12).
-                if nudge_verifiziert "$pane" "WEITERARBEITEN (automatisch nach deiner Kompaktierung, kein Nutzer-Input noetig). Lies ZUERST $found_handoff — das ist deine eigene Uebergabe, dort steht dein Auftrag und der naechste Schritt. Dazu GOALS.md (verbindliche Ziele), SESSION-STATE.md (Live-Zustand), QUALITY.md (Pruefkatalog, Abnahme am AUGE) und PERF-STATE.md (gemessene Sackgassen — nicht wiederholen). Dann arbeite selbstaendig weiter und melde wie gewohnt ins Result-File."; then
-                    echo "$(date +%H:%M) $name ($pane) -> resumed"
-                else
-                    echo "$(date +%H:%M) $name ($pane): WEITERARBEITEN NICHT verifiziert nach $HCOMPACT -- Pane steht moeglicherweise leer und ohne Auftrag. Selbst pruefen: tmux capture-pane -p -t $pane"
-                fi
             fi
         fi
     done
@@ -2107,8 +3037,46 @@ while true; do
     # abschalten deshalb auch, dass niemand mehr angesprochen wird. Wer das setzt,
     # bekommt vor dem Ueberlauf keine Warnung mehr; genau so steht es im
     # Beschreibungstext des Menues.
-    if (( WACHE_ORCH_AN )) && tmux list-panes -a -F '#{pane_id}' | grep -qx "$ORCH"; then
+    if (( WACHE_ORCH_AN )) && _cg_pane_liste_aktualisieren && grep -qx "$ORCH" <<<"$_CG_PANES_CACHE"; then
         read -r pct src <<<"$(read_load "$ORCH")"
+
+        # KARENZ NACH EINER WIRKUNGSLOSEN KOMPAKTIERUNG (2026-08-28). Sie laeuft in
+        # Polls, nicht in Sekunden, weil genau ein Poll die Einheit ist, in der dieser
+        # Guard ueberhaupt handelt. Ist sie abgelaufen, wird der Zyklus freigegeben --
+        # $ORCH faellt aus `compacted`, damit Sentinel und Notbremse wieder greifen
+        # koennen. Die urspruengliche Sicherung bleibt dabei unangetastet: zwischen der
+        # ersten und einer moeglichen zweiten Kompaktierung liegen jetzt COMPACT_SETTLE,
+        # die Busy-Schleife UND diese Karenz, also nie zwei Kompaktierungen unmittelbar
+        # hintereinander. Und die Notbremse ist erst wieder erreichbar, nachdem der
+        # Warnzweig erneut um die Wissenssicherung gebeten hat -- die Reihenfolge
+        # "erst warnen, dann kompaktieren" gilt fuer den zweiten Versuch genauso.
+        if [[ -n "$kompakt_wirkungslos" ]] && [[ "$kompakt_wirkungslos" == "$ORCH" ]]; then
+            if (( kompakt_karenz > 0 )); then
+                kompakt_karenz=$(( kompakt_karenz - 1 ))
+            else
+                compacted="${compacted/ $ORCH/}"
+                echo "$(date +%H:%M) orchestrator ($ORCH): Karenz abgelaufen — Zyklus nach der wirkungslosen Kompaktierung (${kompakt_vorher}% -> ${kompakt_nachher}%) wieder freigegeben."
+                log_orch_notify "Zyklus nach wirkungsloser Kompaktierung wieder freigegeben"
+                # Und der Mensch/Orchestrator erfaehrt, WARUM gleich wieder gemahnt
+                # wird. Ohne diesen Satz sieht die zweite Runde aus wie eine Wache, die
+                # sich wiederholt, statt wie eine, die etwas Neues gemessen hat.
+                #
+                # SICHTBAR, ABER NICHT LAUTER (2026-09-03, Audit "tmux-Aufrufe ohne
+                # Frist"): der Rueckgabewert von nudge() verschwand bisher unbesehen in
+                # `|| true` -- ob der Hinweis wirklich ankam (der Pane kann busy sein,
+                # oder `schreib_text` kann an tmux scheitern) stand nirgends. Der Zyklus
+                # wird trotzdem freigegeben, genau wie bisher (ein ausbleibender Hinweis
+                # ist kein Grund, den Zyklus laenger zu sperren als die Karenz es vorsieht)
+                # -- nur die Ursache eines Fehlschlags bleibt jetzt nicht mehr stumm.
+                nudge "$ORCH" "KONTEXT-HINWEIS (automatisch): Die Kompaktierung von eben hat kaum Kontext befreit — Last vorher ${kompakt_vorher}%, danach ${kompakt_nachher}%. Ein zweites Kompaktieren allein wird daran nichts aendern; typischerweise haengt es an dauerhaft gehaltenem Material (angeheftete Dateien, sehr grosse Anhaenge, ein langer Systemteil). Sieh nach, was sich davon loesen laesst. Ich gebe den Zyklus jetzt wieder frei und melde mich normal weiter." >/dev/null \
+                    || echo "$(date +%H:%M) context-guard: Hinweis an $ORCH (Karenz abgelaufen) NICHT zugestellt — Pane war busy oder das Schreiben schlug fehl. Der Zyklus wird trotzdem freigegeben, siehe naechsten Poll." >&2
+                kompakt_wirkungslos=""   # einmal freigeben, einmal sagen -- nicht bei jedem Poll erneut
+                kompakt_karenz=0
+            fi
+        elif [[ -n "$kompakt_wirkungslos" ]]; then
+            kompakt_wirkungslos=""   # anderer Pane -- nichts anhaengig
+        fi
+
         # On the bar fallback a 75 threshold is unreachable (ten blocks = 10% steps), so it rounds
         # DOWN to 70: earlier, never later. With the transcript or the exact figures 75 IS 75.
         if [[ "$src" == "bar" ]]; then ORCH_WARN_EFF=$(( ORCH_PCT / 10 * 10 )); else ORCH_WARN_EFF=$ORCH_PCT; fi
@@ -2120,16 +3088,46 @@ while true; do
         # brand-new orchestrator at 26% load within one poll — measured on 2026-07-25,
         # der Nutzer caught the typed /compact himself. So only a sentinel written AFTER this
         # guard started counts; an older one is removed with a visible line.
+        # Die mtime-Frische-Regel bleibt, gilt aber nur noch fuer den EIGENEN,
+        # session-eindeutigen Pfad (2026-09-10): der ALTE, geteilte Pfad kann dem
+        # ANDEREN Guard auf demselben PROJECT gehoeren, dessen mtime sagt hier gar
+        # nichts -- ihn blind zu loeschen waere derselbe Fehler noch einmal, nur
+        # eine Zeile weiter unten.
         if [[ -f "$SENTINEL" ]] && (( $(mtime "$SENTINEL") < GUARD_START )); then
             echo "$(date +%H:%M) orchestrator ($ORCH): ALTER Sentinel ($(date -r "$SENTINEL" +%H:%M) < Guard-Start) — ignoriert und entfernt, KEINE Kompaktierung."
             rm -f "$SENTINEL"
+        fi
+        # Der geteilte Alt-Pfad zaehlt nur, wenn DIESER Guard $ORCH in DIESEM Zyklus
+        # selbst gewarnt hat -- nicht schon deshalb, weil eine Datei mit passender
+        # mtime dort liegt (genau das war das Wettrennen). Ohne eigene Warnung wird
+        # er sichtbar ignoriert und NIE geloescht, denn er koennte dem anderen Guard
+        # gehoeren, der ihn noch nicht abgeholt hat.
+        if [[ -f "$SENTINEL_OLD" ]] && [[ "$warned" != *" $ORCH"* ]]; then
+            echo "$(date +%H:%M) orchestrator ($ORCH): alter geteilter Sentinel ($SENTINEL_OLD) ohne eigene Warnung dieses Guards — ignoriert, NICHT geloescht."
+        fi
+        sentinel_hit=""
+        if [[ -f "$SENTINEL" ]]; then
+            sentinel_hit="$SENTINEL"
+        elif [[ -f "$SENTINEL_OLD" ]] && [[ "$warned" == *" $ORCH"* ]]; then
+            sentinel_hit="$SENTINEL_OLD"
         fi
         # `eingreifen: false` nimmt der Wache die HAND, nicht die Stimme: gemahnt
         # wird weiter (der Zweig unten), aber weder ein Sentinel noch die Notbremse
         # tippen dann noch `/compact` in die Sitzung. Der Sentinel bleibt liegen und
         # wird beim naechsten Einschalten wieder aufgegriffen.
-        if [[ -f "$SENTINEL" ]] && [[ "$compacted" != *" $ORCH"* ]] && (( WACHE_ORCH_EINGRIFF )); then
-            compact_orchestrator "Sentinel $SENTINEL"
+        if [[ -n "$sentinel_hit" ]] && [[ "$compacted" != *" $ORCH"* ]] && (( WACHE_ORCH_EINGRIFF )); then
+            # Sentinel zaehlt nur nach eigener Warnung (2026-09-10, siehe Befund oben):
+            # eine Datei allein ist kein Signal, das SIGNAL ist "ich habe $ORCH selbst
+            # gewarnt und $ORCH hat mir geantwortet".
+            if [[ "$warned" == *" $ORCH"* ]]; then
+                if [[ "$sentinel_hit" == "$SENTINEL_OLD" ]]; then
+                    compact_orchestrator "Sentinel $sentinel_hit" "$SENTINEL_OLD"
+                else
+                    compact_orchestrator "Sentinel $sentinel_hit"
+                fi
+            else
+                echo "$(date +%H:%M) orchestrator ($ORCH): Sentinel ohne eigene Warnung — ignoriert."
+            fi
         elif (( pct < 0 )); then
             announce_blind "$ORCH" "orchestrator"
         else
@@ -2165,5 +3163,12 @@ while true; do
         fi
     fi
 
+    # Herzschlag: erst NACH der ganzen Runde, damit die mtime wirklich einen
+    # abgeschlossenen Poll bezeugt und nicht nur einen begonnenen.
+    date +%s > "$HEARTBEAT" 2>/dev/null || true
+    ZYKLUS_DAUER=$(( $(date +%s) - ZYKLUS_START ))
+    if (( ZYKLUS_DAUER > POLL )); then
+        echo "$(date +%H:%M) context-guard: dieser Poll hat ${ZYKLUS_DAUER}s gebraucht (Intervall ${POLL}s) -- irgendein Aufruf haelt die Schleife auf. Herzschlag: $HEARTBEAT"
+    fi
     sleep "$POLL"
 done

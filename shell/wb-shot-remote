@@ -8,11 +8,22 @@
 # Fallback, mehrdeutiges Muster bricht ab, kein Treffer bricht ab) sitzt in
 # peer-shot selbst; dieses Skript reicht dessen Exitcodes unveraendert durch.
 #
+# GEAENDERT 2026-08-22, aber NUR auf dem Mac: Freigabe des Nutzers hat das
+# Vollbild-Verbot fuer direkte `screencapture`-Aufrufe auf DIESER Maschine
+# aufgehoben (regeln/aufnahmen.md, hooks/lib/screencapture_classify.py). Sie
+# war ausdruecklich an "die Maschine" (Mac) gebunden. Fuer peer gilt die Regel
+# oben unveraendert weiter -- peer-shot bekommt keinen Vollbild-Fallback, und
+# dieses Skript aendert daran nichts.
+#
 #   wb-shot-remote <titel-muster> <ziel.png>
 set -uo pipefail
 
 REMOTE=peer
-REMOTE_TOOL=$HOME/.local/bin/peer-shot
+# Kein fester Nutzerpfad (Befund 2026-09-05): $HOME war der Nutzer der
+# ABGELOESTEN Linux-Maschine; auf peer heisst er <user>, und der alte Pfad existiert
+# dort nicht -- jede entfernte Aufnahme scheiterte damit. Das Werkzeug liegt im
+# Home des Nutzers, mit dem ssh sich anmeldet; die Tilde loest die entfernte Shell auf.
+REMOTE_TOOL='.local/bin/peer-shot'   # relativ zum Home des ssh-Nutzers, siehe CMD unten
 
 usage() { echo "usage: wb-shot-remote <titel-muster> <ziel.png>" >&2; exit 1; }
 
@@ -44,6 +55,9 @@ ssh_mit_frist() {   # ssh_mit_frist <sekunden> <ssh-argumente...>
   fi
 }
 
+# Das Werkzeug steht relativ zum Home, weil `printf %q` eine Tilde als Zeichen
+# schuetzen wuerde und die entfernte Shell sie dann nicht mehr aufloest. ssh startet
+# die Shell ohnehin im Home des Nutzers, also reicht der relative Pfad.
 CMD=$(printf '%q %q %q' "$REMOTE_TOOL" "$PATTERN" "$REMOTE_TMP")
 ssh_mit_frist 30 "$REMOTE" "$CMD"
 rc=$?

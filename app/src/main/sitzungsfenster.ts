@@ -134,7 +134,7 @@ export function sitzungsZeilen(
     } else if (s.state === 'unreachable') {
       grund = `Die Maschine '${s.machine}' antwortet gerade nicht.`;
     } else if (s.state !== 'stopped') {
-      grund = 'Läuft noch — sie steht schon in der Sessionleiste.';
+      grund = 'Läuft noch – sie steht schon in der Sessionleiste.';
     } else if (s.startet) {
       grund = 'Startet gerade. Bei einem lokalen Modell wird jetzt der Modellkörper geladen; das dauert Minuten.';
     } else if (s.startFehler) {
@@ -190,7 +190,17 @@ export class Sitzungsfenster {
   private fenster: BrowserWindow | null = null;
   private bereit: Promise<void> | null = null;
 
-  constructor(private readonly eltern: () => BrowserWindow | null) {}
+  /**
+   * `sperre` sagt vor jedem `new BrowserWindow`, ob ein Fenster ueberhaupt
+   * entstehen darf, und nennt sonst den Grund (main.ts, `fenstersperre`): im
+   * Mantelbetrieb bringt die Mac-native Oberflaeche dieses Blatt selbst mit,
+   * und ein zweites, unsichtbares Electron-Fenster daneben waere eine Buehne
+   * ohne Publikum (Auftrag 4.1). Ohne die Funktion baut die Klasse wie bisher.
+   */
+  constructor(
+    private readonly eltern: () => BrowserWindow | null,
+    private readonly sperre?: () => string | null,
+  ) {}
 
   /** Das Fenster, wenn es existiert -- fuer Foto und Auskunft. */
   aktuell(): BrowserWindow | null {
@@ -202,6 +212,8 @@ export class Sitzungsfenster {
    * wird wiederverwendet, damit ein zweiter Klick nicht ein zweites aufmacht.
    */
   async baue(): Promise<BrowserWindow> {
+    const gesperrt = this.sperre?.();
+    if (gesperrt) throw new Error(gesperrt);
     const da = this.aktuell();
     if (da && this.bereit) {
       await this.bereit;
@@ -225,7 +237,7 @@ export class Sitzungsfenster {
       // mehr, aus dem heraus man eine zweite Sitzung aufmacht.
       parent: eltern ?? undefined,
       modal: false,
-      title: 'Agent-Workbench — Sitzungen',
+      title: 'Agent-Workbench – Sitzungen',
       backgroundColor: '#101216',
       paintWhenInitiallyHidden: true,
       webPreferences: {

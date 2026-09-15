@@ -66,6 +66,16 @@ Kopf der Orchestrator-Rolle — hier steht, wie man sie durchsetzt.
 
 ## Sentinel
 
+- **Sentinel je Sitzung eindeutig (2026-09-10):** der Pfad ist
+  `$PROJECT/.wb-knowledge-saved-<tmux-session>` und steht wörtlich in der Warnzeile des Guards —
+  den Pfad von dort nehmen, nie den alten Namen raten. Gemessen am 10.09.: zwei Orchestratoren
+  mit demselben cwd `~/AI` teilten `.wb-knowledge-saved`, der eine touchte, der Guard des anderen
+  kompaktierte dessen Sitzung bei unter 40 % ohne Warnung. Seither zählt ein Sentinel nur, wenn
+  DIESER Guard vorher selbst gewarnt hat; der alte Name wird ohne eigene Warnung ignoriert und
+  nicht gelöscht (Test `test-context-guard-sentinel-fremd.sh`). Ebenso seit 10.09.: der Guard liest
+  die Sitzungs-ID des Orchestrators aus dessen Prozessumgebung (`CLAUDE_CODE_SESSION_ID`), damit
+  mehrere Sitzungen im selben Projektordner ihn nicht mehr BLIND machen.
+
 - **Sentinel erst NACH dem Guard-Start setzen (2026-07-29):** `context-guard` verwirft ein
   `.wb-knowledge-saved`, das älter ist als er selbst, entfernt es und kompaktiert NICHT —
   richtig ist: Guard starten, dann `touch`. Gemessen, als der Guard einer Session unbemerkt

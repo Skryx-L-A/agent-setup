@@ -65,7 +65,7 @@ export function bruecke(lage: PaneLage | null): Bruecke {
   const freigabeOffen = blockiert || lage.antraegeOffen > 0;
   let freigabeText = '';
   if (blockiert && lage.blockGrund === 'guard') {
-    freigabeText = 'Ein Guard hat einen Befehl verweigert — der Pane wartet auf eine Entscheidung.';
+    freigabeText = 'Ein Guard hat einen Befehl verweigert – der Pane wartet auf eine Entscheidung.';
   } else if (blockiert && lage.blockGrund === 'request') {
     freigabeText = 'Ein Antrag wartet auf die Entscheidung des Orchestrators.';
   } else if (freigabeOffen) {

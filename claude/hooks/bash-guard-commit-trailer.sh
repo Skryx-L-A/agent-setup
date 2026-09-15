@@ -2,6 +2,9 @@
 # Zweck: BLOCKT einen `git commit`, dessen Nachricht einen Claude-Co-Author-Trailer
 #        oder eine Generated-with-Zeile traegt.
 # Event: PreToolUse, matcher Bash.
+# NICHT REGISTRIERT: Logik seit 2026-08-05 direkt in bash-guard.py neu geschrieben
+#        (dessen PreToolUse/Bash-Sammelpunkt) -- diese Datei traegt nur noch die
+#        Original-Begruendung, kein Eintrag in settings.json zeigt hierher.
 # Warum: Stehende Regel (CLAUDE.md, Standing rules): Commits laufen auf dem
 #        Git-Handle des Repo-Besitzers, englische Nachricht, nie ein Claude-
 #        Co-Author-Trailer — sie ueberschreibt ausdruecklich die Voreinstellung

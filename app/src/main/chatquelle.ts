@@ -24,7 +24,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { chatAnsicht, chatAnsichtVorgabe } from './einstellungen';
 import { sessionBloeckeAus, urteil } from '../chat/registry';
-import { ansichtOffen, type PaneRolle } from '../chat/ansichtsregel';
+import { ansichtOffen, harnessErlaubt, type PaneRolle } from '../chat/ansichtsregel';
 import { leserVorhanden, nachrichtenAus, kopfAus } from '../chat/leser';
 import { kandidatWaehlen } from '../chat/zuordnung';
 import { bruecke } from '../chat/bruecke';
@@ -453,7 +453,7 @@ function ausCopilotDb(
   if (zeilen.length > 1 && String(zeilen[0].updated_at ?? '').slice(0, 10) === String(zeilen[1].updated_at ?? '').slice(0, 10)) {
     return leererStand(
       a,
-      'Zwei Copilot-Sitzungen in diesem Ordner am selben Tag — welche zu diesem Pane gehoert, ist von aussen nicht zu entscheiden.',
+      'Zwei Copilot-Sitzungen in diesem Ordner am selben Tag – welche zu diesem Pane gehoert, ist von aussen nicht zu entscheiden.',
       block.via,
       opt.jetztMs,
       opt.vorgabe,
@@ -687,7 +687,7 @@ function ausJcode(a: PaneAnfrage, block: SessionBlock, jetztMs: number, vorgabe:
   const sitzungen = jcodeSitzungen(roh).filter((s) => !s.verzeichnis || s.verzeichnis === a.cwd);
   const stand = leererStand(
     a,
-    'jcode meldet ueber seinen Kanal nur den Zustand seiner Sitzungen, keine Nachrichten — ein Leser dafuer ist an keiner Messung belegt.',
+    'jcode meldet ueber seinen Kanal nur den Zustand seiner Sitzungen, keine Nachrichten – ein Leser dafuer ist an keiner Messung belegt.',
     block.via,
     jetztMs,
     vorgabe,
@@ -796,24 +796,49 @@ export function anfrageFuerPane(
   // Namens im Arbeitsverzeichnis statt den benannten Socket im tmux-Verzeichnis zu oeffnen,
   // der Aufruf schlaegt fehl, und cwd/PID/Sitzungskennung dieser Funktion bleiben leer.
   const basis = tmuxSocket ? ['-L', tmuxSocket] : [];
-  const frag = (format: string): string => {
+  // EIN AUFRUF STATT DREI (2026-09-03, Audit "gleiche Pane-Liste mehrfach im selben
+  // Takt"): cwd/pid/sitzungsId liefen bis heute als drei sequenzielle, unabhaengige
+  // `display-message`-Aufrufe -- `display-message -p` liefert aber beliebig viele
+  // Platzhalter in EINEM Format. \x1f (ASCII Unit Separator) trennt die drei Werte in
+  // der einen Antwortzeile; er kommt in keinem der drei denkbaren Werte vor (ein
+  // Dateipfad, eine Zahl, die vom Hook gesetzte Sitzungskennung), anders als ein
+  // sichtbares Zeichen wie Tab oder Komma.
+  const FRAG_TRENNER = '\x1f';
+  const [cwd, pidRoh, sitzungsIdRoh] = (() => {
+    const format = ['#{pane_current_path}', '#{pane_pid}', '#{@wb_chat_session}'].join(FRAG_TRENNER);
+    // killSignal:SIGKILL (2026-09-03, Audit "tmux-Aufrufe ohne Frist"): SIGTERM
+    // (die Node-Vorgabe) ist abfangbar und liess spawnSync in der Messung in
+    // sessions.ts ueber zwei Minuten haengen.
     const r = spawnSync('tmux', [...basis, 'display-message', '-p', '-t', paneId, format], {
       encoding: 'utf8',
       timeout: FRIST_MS,
+      killSignal: 'SIGKILL',
     });
-    return r.status === 0 ? (r.stdout || '').trim() : '';
-  };
+    // SICHTBAR, ABER NICHT LAUTER (2026-09-03): bisher wurde weder r.error noch ein
+    // Fehlschlag geloggt -- ein haengendes oder fehlendes tmux sah genauso aus wie ein
+    // Pane ohne diese Werte. Der Aufrufer bekommt weiterhin drei leere Zeichenketten
+    // (cwd/pid/sitzungsId bleiben dann unbekannt, wie bisher bei jedem der drei
+    // einzelnen Fehlschlaege), aber die Ursache steht jetzt im Log statt
+    // stillschweigend zu verschwinden.
+    if (r.status !== 0) {
+      process.stderr.write(`chatquelle.ts anfrageFuerPane(): display-message an Pane ${paneId}: ${
+        r.error ? r.error.message : r.signal ? `nach ${FRIST_MS}ms abgebrochen` : `Exitcode ${r.status}`
+      } -- cwd/pid/sitzungsId bleiben leer.\n`);
+      return ['', '', ''];
+    }
+    return (r.stdout || '').replace(/\n$/, '').split(FRAG_TRENNER);
+  })();
   return {
     paneId,
     harness,
     sitzung,
     rolle,
-    cwd: frag('#{pane_current_path}'),
-    pid: Number(frag('#{pane_pid}')) || 0,
+    cwd: cwd ?? '',
+    pid: Number(pidRoh) || 0,
     // Die Sitzungskennung, die der Harness selbst gemeldet hat -- geschrieben
     // von der Hook-Installation in shell/wb-harness-run, gelesen ueber die
     // Pane-Option, in die sie der Hook legt. Fehlt sie, sagt die Zuordnung das.
-    sitzungsId: frag('#{@wb_chat_session}'),
+    sitzungsId: sitzungsIdRoh ?? '',
     // Was die WERKBANK sich notiert hat -- die zweite Stufe der Zuordnung. Sie
     // steht im Modell und kostet deshalb keinen weiteren Aufruf nach aussen.
     vermerkteId,
@@ -833,13 +858,16 @@ export async function chatStand(a: PaneAnfrage, opt: QuellenOptionen): Promise<C
   const jetztMs = opt.jetztMs ?? Date.now();
   const home = opt.home ?? homedir();
   const block = sessionBloecke(opt.modelsFile)[a.harness] ?? null;
-  const harnessSchalter = chatAnsicht(opt.settingsFile)[a.harness] === true;
   // ZWEI URTEILE AUS DERSELBEN QUELLE, und der Unterschied ist genau die
   // zweite Ebene: das erste fragt nur nach der FAEHIGKEIT (`gewuenscht: true`),
   // das zweite nach dem, was dieser Lauf wirklich tun darf. Die Faehigkeit
   // braucht die Aufloesungsregel getrennt -- ein Nein wegen "nicht
   // eingeschaltet" ist etwas anderes als ein Nein wegen "kann es nicht".
   const kann = urteil(block, true, leserDa).moeglich;
+  // OHNE EXPLIZITE WAHL GILT: an, wo der Harness es kann (harnessErlaubt(),
+  // chat/ansichtsregel.ts) -- ein nie besuchter Schalter auf "Programme und
+  // Modelle" darf den Griff an einem faehigen Harness nicht zusperren.
+  const harnessSchalter = harnessErlaubt(chatAnsicht(opt.settingsFile)[a.harness], kann);
   const vorgabe = ansichtOffen({
     kann,
     erlaubt: harnessSchalter,

@@ -24,7 +24,7 @@ import { join } from 'node:path';
 // geschrieben wird ausschliesslich ueber `wb-state settings set`.
 import {
   askMuster as askMusterAusEinstellungen,
-  maschinenliste,
+  maschinenAktiv,
   zahlAus,
   type AskMuster,
 } from './einstellungen';
@@ -42,6 +42,15 @@ export interface Config {
   shotDir: string;
   /** Kopfloser Modus (V7): kein Dock, kein Menue, Fenster bleibt ungezeigt. */
   headless: boolean;
+  /**
+   * Pfad des Mantel-Sockets (06.09.2026, mantel.ts): der Kanal der Mac-nativen
+   * Oberflaeche. Leer = kein Mantel, die Electron-Fassung laeuft unveraendert.
+   * Nur ueber die Umgebung, nicht ueber die Konfigurationsdatei: wer den Kern
+   * fuer einen Mantel startet, setzt ihn -- er gehoert dem Startvorgang.
+   */
+  mantelSocket: string;
+  /** Der Handschlag-Token des Mantel-Sockets (AWB_MANTEL_TOKEN), leer = ohne Token. */
+  mantelToken: string;
   /** Spaltenzahl, die eine SELBST angelegte Session bekommt. */
   ownedCols: number;
   /** Zeilenzahl, die eine SELBST angelegte Session bekommt. */
@@ -59,6 +68,13 @@ export interface Config {
   wbDecideBin: string;
   /** V14: Aufruf fuer `wb-code` -- derselbe Grund wie bei wbDecideBin (PATH statt fester Pfad). */
   wbCodeBin: string;
+  /**
+   * Aufruf fuer `wb-resume-id` (2026-09-06). Der Wiederherstellungs-Knopf loest damit die
+   * Sitzungskennung eines Registry-Harness (cline/forge) genauso auf wie shell/wb-revive --
+   * EINE Aufloesung fuer beide Wege, statt sie in TypeScript zu doppeln. PATH-Aufruf wie
+   * wbCodeBin; ein Test setzt AWB_WB_RESUME_ID.
+   */
+  wbResumeIdBin: string;
   /**
    * Aufruf fuer `wb-mensch` (21.08.2026). Gebraucht wird er an genau einer Stelle: bevor
    * dieses Programm einem Sitzungsstart `--mensch` mitgibt, fragt es VORHER, ob der Nachweis
@@ -255,6 +271,8 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
     controlSocket: flag('control-socket') ?? defaultControlSocketPath(env),
     shotDir: flag('shot-dir') ?? env.AWB_SHOT_DIR ?? file.shotDir ?? join(tmpdir(), 'agent-workbench-shots'),
     headless: argv.includes('--headless') || env.AWB_HEADLESS === '1' || file.headless === true,
+    mantelSocket: env.AWB_MANTEL_SOCKET ?? '',
+    mantelToken: env.AWB_MANTEL_TOKEN ?? '',
     ownedCols: num(flag('cols') ?? env.AWB_COLS, file.ownedCols ?? 120),
     ownedRows: num(flag('rows') ?? env.AWB_ROWS, file.ownedRows ?? 34),
     sessionsDir: env.AWB_SESSIONS_DIR ?? file.sessionsDir ?? join(homedir(), '.claude', 'workbench', 'sessions'),
@@ -263,6 +281,7 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
     guardLogFile: env.AWB_GUARD_LOG ?? file.guardLogFile ?? join(homedir(), '.pi-workers', 'guard-blocks.log'),
     wbDecideBin: env.AWB_WB_DECIDE ?? file.wbDecideBin ?? 'wb-decide',
     wbCodeBin: env.AWB_WB_CODE ?? file.wbCodeBin ?? 'wb-code',
+    wbResumeIdBin: env.AWB_WB_RESUME_ID ?? file.wbResumeIdBin ?? 'wb-resume-id',
     wbMenschBin: env.AWB_WB_MENSCH ?? file.wbMenschBin ?? 'wb-mensch',
     wbPaneWriteBin: env.AWB_WB_PANE_WRITE ?? file.wbPaneWriteBin ?? 'wb-pane-write',
     wbFreigabeBin: env.AWB_WB_FREIGABE ?? file.wbFreigabeBin ?? 'wb-freigabe',
@@ -304,9 +323,13 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
     // leer bleibt leer. Seit dem 06.08. steht die Liste in der GETEILTEN Datei,
     // weil die Maschinen-Seite des Menues sie pflegt und der einzige
     // Schreibweg dorthin `wb-state settings set` ist.
+    // Pausierte Maschinen (04.09.) fallen schon HIER raus, nicht erst beim
+    // ersten Takt: `remotePoller.start()` ruft `tick()` sofort auf, vor dem
+    // ersten `hostsSetzen()`-Refresh in main.ts -- ohne diesen Filter waere
+    // eine pausierte Maschine trotzdem fuer EINEN ssh-Versuch drangewesen.
     remoteMachines: (env.AWB_REMOTE_MACHINES !== undefined
       ? env.AWB_REMOTE_MACHINES.split(',').map((s) => s.trim()).filter(Boolean)
-      : maschinenliste(einstellungen)),
+      : maschinenAktiv(einstellungen)),
     remotePollMs: num(env.AWB_REMOTE_POLL_MS, file.remotePollMs ?? 10000),
     remoteTimeoutMs: num(env.AWB_REMOTE_TIMEOUT_MS, file.remoteTimeoutMs ?? 6000),
     testsuiteStatusFile: env.AWB_TESTSUITE_STATUS_FILE ?? file.testsuiteStatusFile ?? join(homedir(), '.local', 'state', 'wb-testsuite-status.txt'),

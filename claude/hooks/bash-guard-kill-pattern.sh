@@ -2,6 +2,11 @@
 # Zweck: blockt zu breite pkill/killall/kill $(pgrep …)/tmux kill-server/
 #        tmux kill-session-Aufrufe.
 # Event: PreToolUse, matcher Bash.
+# NICHT REGISTRIERT: Klassifikationslogik seit 2026-08-05 in hooks/lib/
+#        kill_pattern_classify.py, von bash-guard.py (dessen PreToolUse/Bash-
+#        Sammelpunkt) importiert und unveraendert ausgefuehrt -- diese Datei
+#        traegt nur noch die Original-Begruendung, kein Eintrag in
+#        settings.json zeigt hierher.
 # Warum: ECHTER Vorfall — `pkill -f "tmux attach -t =wb-"` in einem Testskript
 #        hat den LIVE-Client des Nutzers zweimal beendet (Muster endete auf den
 #        Praefix "wb-", traf dadurch JEDE Session mit dem Praefix). CLAUDE.md:

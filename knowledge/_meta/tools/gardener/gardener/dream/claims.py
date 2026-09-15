@@ -444,6 +444,68 @@ def uncovered_values(text: str, quote: str, *,
     return missing
 
 
+# ---------------------------------------------------------------------------
+# Negation. Found 02.09.2026: a source line marked a set of options with ❌
+# ("Alle Bypass-Optionen aktivieren" - do NOT do this) and the extracted
+# claim turned it into an instruction to do exactly that, the cross lost on
+# the way through the model. Neither `verify_quote` nor anything else in this
+# module compared a claim's polarity against its own quote - value coverage
+# checks that every NUMBER in `text` is backed by `quote`, nothing checked
+# whether `text` still says the OPPOSITE of what `quote` says. This is that
+# check: coarse and marker-based like the rest of the gate, not a semantic
+# reading, so it catches the shape of the incident (a marker present in the
+# quote and silently absent from the text) without claiming to understand
+# either sentence.
+# ---------------------------------------------------------------------------
+
+_NEGATION_WORD_RE = re.compile(
+    r"\b(nicht|kein\w*|nie|niemals|statt|ohne)\b", re.IGNORECASE)
+# "Rotes Kreuz" and its family, plus the checkmark's counterpart - the visual
+# vocabulary a source uses for "do not" where the IBKR doc used exactly ❌.
+_NEGATION_SYMBOLS = "❌✗✘☒🚫⛔"
+# Durchgestrichener Text: Markdown-Strikethrough oder die kombinierende
+# Unicode-Durchstreichung, beides in freier Notiz-Prosa vorkommend.
+_STRIKETHROUGH_RE = re.compile(r"~~[^~\n]+~~|̶")
+
+
+def _carries_negation(s: str) -> bool:
+    return bool(_NEGATION_WORD_RE.search(s) or _STRIKETHROUGH_RE.search(s)
+                or any(ch in s for ch in _NEGATION_SYMBOLS))
+
+
+def _main_clause(quote: str) -> str:
+    """The part of `quote` up to its first comma or semicolon.
+
+    Measured 02.09.2026 against the existing test suite: an unscoped check
+    (the whole quote) tripped on three unrelated, genuine sentences whose
+    negation sat in a trailing, APPENDED clause after a comma - "wurde die
+    Sache entschieden, nicht frueher", "wurde heute geaendert, mehr nicht",
+    "laeuft in der Cloud, nicht lokal" - and one, "schreibt nur ... Markerblock,
+    nie daneben", where the trailing clause is pure emphasis restating what
+    "nur" already said. In every one of those the fact itself sits in the
+    clause BEFORE the comma and carries no negation - dropping the emphasis
+    afterwards changes nothing. The 02.09.2026 incident's own marker (❌) sits
+    at the very start of its quote, before any comma, so this scoping does not
+    weaken the one case it exists to catch. The trade a coarse marker check
+    has to make either way: this narrows recall (a negation genuinely living
+    in a trailing clause is no longer seen) to buy the precision the task asks
+    for over an unscoped check that would have fired on one in several dozen
+    unrelated real sentences."""
+    idx = min((i for i in (quote.find(","), quote.find(";")) if i != -1),
+              default=-1)
+    return quote if idx == -1 else quote[:idx]
+
+
+def negation_mismatch(text: str, quote: str) -> bool:
+    """True if `quote`'s main clause carries a negation marker `text` does
+    not - the shape that flips "vermeiden" into "aktivieren". One-directional
+    on purpose: a `text` that ADDS a negation the quote never had is a
+    different failure (an invented claim) already caught by the
+    value-coverage gate's spirit, and is not what the 02.09.2026 incident
+    looked like."""
+    return _carries_negation(_main_clause(quote)) and not _carries_negation(text)
+
+
 def quote_in_source(quote: str, source_text: str) -> bool:
     """The literal-substring half of the quote gate, on its own - lets a
     caller test a quote against several candidate source texts (a batch's
@@ -460,6 +522,8 @@ def verify_quote(text: str, quote: str, source_text: str) -> tuple[bool, str | N
         return False, "empty-quote"
     if not quote_in_source(quote, source_text):
         return False, "quote-not-found"
+    if negation_mismatch(text, quote):
+        return False, "negation-mismatch"
     missing = uncovered_values(text, quote)
     if missing:
         return False, "value-not-in-quote:" + ",".join(missing[:5])

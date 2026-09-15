@@ -117,7 +117,7 @@ fi
 echo "$now" >"$key"
 log "reviving (${free:-?}% free)"
 # $HOME instead of a hardcoded $HOME: the same script has to run on peer
-# ($HOME) once both machines share one script set. Same target, same behaviour.
+# (/home/<user>) once both machines share one script set. Same target, same behaviour.
 #
 # KEIN `exec` mehr (2026-08-16, Regression aus dem *claude*-Substring-Fix): `exec`
 # ERSETZT diesen Prozess durch wb-revive -- danach kann wb-autorevive nichts mehr in

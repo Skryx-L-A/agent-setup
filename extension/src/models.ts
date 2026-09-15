@@ -119,6 +119,8 @@ export interface RegistryHarness {
   id: string;
   label: string;
   command: string;
+  /** Modell, das ein bewusster Wechsel auf diesen Harness vorauswaehlt. */
+  orchestratorDefaultModel?: string;
   args?: string[];
   cwdMode?: string;
   env?: Record<string, string>;
@@ -224,6 +226,9 @@ export interface RegistryModel {
   efforts: Effort[];
   maxEffort: Effort;
   defaultEffort: Effort;
+  /** Native model window advertised by the provider. `contextWindow` remains the
+   *  effective window of this harness and is used for context monitoring. */
+  nativeContextWindow?: number;
   contextWindow?: number;
   cost?: RegistryCost;
   machines?: RegistryMachine[];
@@ -539,6 +544,7 @@ function validateHarness(raw: unknown): RegistryHarness | undefined {
     id,
     label,
     command,
+    orchestratorDefaultModel: asString(r.orchestratorDefaultModel),
     args: asStringArray(r.args),
     cwdMode: asString(r.cwdMode) ?? 'cd',
     env: asStringRecord(r.env),
@@ -640,8 +646,8 @@ function validateVorhersageWeg(raw: unknown): RegistryVorhersageWeg | undefined 
 /**
  * A single model entry. `maxEffort` deckelt jeden Spawn (SPEC-V3 A.3, Policy-Caps
  * bleiben scharf): `efforts` wird auf alles <= `maxEffort` beschnitten, und ein
- * `maxEffort` außerhalb der bekannten Effort-Stufen (also insbesondere `"max"`,
- * das nirgends existiert) macht den ganzen Eintrag ungültig.
+ * `maxEffort` außerhalb der bekannten harnessübergreifenden Effort-Stufen
+ * macht den ganzen Eintrag ungültig.
  */
 function validateModel(raw: unknown): RegistryModel | undefined {
   if (typeof raw !== 'object' || raw === null) {
@@ -700,6 +706,7 @@ function validateModel(raw: unknown): RegistryModel | undefined {
     efforts,
     maxEffort,
     defaultEffort,
+    nativeContextWindow: asPositiveNumber(r.nativeContextWindow),
     contextWindow: asPositiveNumber(r.contextWindow),
     cost: validateCost(r.cost),
     machines: machines.length > 0 ? machines : undefined,
@@ -779,7 +786,7 @@ const CLAUDE_WORKER_CLASS: Record<string, WorkerClass> = {
   'claude-sonnet-5': 'coding-kurz',
   'claude-opus-5': 'reasoning',
   'claude-opus-4-8': 'review',
-  'claude-fable-5': 'visuell',
+  'claude-fable-5-1': 'visuell',
 };
 
 const CLAUDE_GOOD_FOR: Record<string, string> = {
@@ -787,7 +794,7 @@ const CLAUDE_GOOD_FOR: Record<string, string> = {
   'claude-sonnet-5': 'Kurz spezifizierte Coding-Tasks; bei xhigh auch größere Cross-File-Refactors.',
   'claude-opus-5': 'Lang/mehrstufige Aufgaben, Debugging, Design-Entscheidungen, Ambiguität.',
   'claude-opus-4-8': 'Zweitmeinung, unabhängiger Reviewer-Pass, A/B-Vergleich.',
-  'claude-fable-5': 'Kundengerichtetes visuelles Deliverable (Landing-Page, Kundenpräsentation).',
+  'claude-fable-5-1': 'Kundengerichtetes visuelles Deliverable (Landing-Page, Kundenpräsentation).',
 };
 
 const CLAUDE_NOT_FOR: Record<string, string> = {
@@ -795,7 +802,7 @@ const CLAUDE_NOT_FOR: Record<string, string> = {
   'claude-sonnet-5': 'Offene Ambiguität, Architektur-Entscheidungen.',
   'claude-opus-5': 'Mechanische Bulk-Arbeit, die günstiger geht.',
   'claude-opus-4-8': 'Erststart einer Aufgabe ohne Kontext.',
-  'claude-fable-5': 'Internes/Standard-Coding — dafür gesperrt (FABLE-SPERRE).',
+  'claude-fable-5-1': 'Internes/Standard-Coding — dafür gesperrt (FABLE-SPERRE).',
 };
 
 const PI_GOOD_FOR: Record<string, string> = {
@@ -822,7 +829,7 @@ export const BUILTIN_MODELS: readonly RegistryModel[] = [
       roles: ['worker', 'orchestrator'],
       efforts,
       maxEffort: efforts[efforts.length - 1],
-      defaultEffort: id === 'claude-fable-5' ? 'medium' : 'high',
+      defaultEffort: id === 'claude-fable-5-1' ? 'medium' : 'high',
       workerClass: CLAUDE_WORKER_CLASS[id],
       goodFor: CLAUDE_GOOD_FOR[id],
       notFor: CLAUDE_NOT_FOR[id],

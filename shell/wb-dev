@@ -1,0 +1,536 @@
+#!/bin/bash
+# wb-dev — die Entwicklungsfassung der Werkbank starten, ohne die laufende anzufassen.
+#
+#   wb-dev [--mac|--electron] [--bauen] [--frisch] [--status] [--stop] [--kopflos] [--inaktiv]
+#          [-- <weitere electron-argumente>]
+#
+# WELCHE FASSUNG (2026-09-06, Auftrag 4.4). Es gibt die Werkbank seit dem 06.09. zweimal:
+# als Electron-Programm (app/, auf jeder Plattform) und als Mac-native Fassung (mac/,
+# SwiftUI/AppKit um denselben Kern). Auf dem MAC nimmt ein neuer Start die Mac-Fassung,
+# auf Linux Electron; `--electron` bzw. `--mac` entscheiden von Hand. Ist die Mac-Fassung
+# nicht gebaut, faellt der Start auf Electron zurueck und sagt es -- ein Werkzeug, das
+# wegen eines fehlenden Bauschritts gar nicht startet, hilft niemandem.
+#
+# WARUM ES DIESES WERKZEUG GIBT (2026-09-03). Die ausgelieferte Werkbank unter
+# /Applications/Agent Workbench.app traegt in Contents/Resources/app einen SYMLINK auf
+# app/ im Hauptbaum. Wer dort baut, veraendert das laufende Programm im selben Augenblick.
+# Zum Entwickeln braucht es deshalb einen zweiten, vollstaendig getrennten Stand: eigener
+# Arbeitsbaum, eigene Daten, eigener tmux-Server, eigene Werkzeuge. Diese Datei stellt
+# genau das her und prueft es nach, statt es anzunehmen.
+#
+# DIE DREI TRENNUNGEN, und warum jede einzelne noetig ist:
+#
+#   1. ARBEITSBAUM. Der Dev-Stand liegt in einem eigenen git-worktree
+#      (~/AI/claude-workbench-dev, Zweig `dev`). Der Hauptbaum bleibt unberuehrt, und
+#      damit auch das Programm, das dem Nutzer gerade offen hat.
+#
+#   2. DATEN. Alle Pfade der Anwendung sind ueber AWB_*-Variablen umlenkbar; sie zeigen
+#      hier samtlich unter ~/.claude/workbench-dev/. Die Dev-Fassung sieht die echten
+#      Sitzungen also NICHT und kann sie auch nicht schliessen. Das ist Absicht: eine
+#      Entwicklungsfassung, die in den Produktivbestand schreiben kann, ist keine.
+#
+#   3. TMUX UND WERKZEUGE — der Punkt, an dem eine blosse Variable NICHT reicht.
+#      Gemessen am 03.09.2026 (nachgemessen im DIREKTWEG-BEFUND, Abschnitt 3): 39 Werkzeuge
+#      in ~/.local/bin setzen einen tmux-Unterbefehl ab, und GENAU EINES davon liest die
+#      Variable AWB_TMUX_SOCKET -- diese Datei selbst. Die uebrigen waehlen ihren Server
+#      ueber -L, ueber WB_TMUX_SOCKET oder gar nicht und landen dann auf dem Vorgabesocket.
+#      Eine Dev-Anwendung, die eines dieser Werkzeuge aufruft, haette also trotz eigener
+#      Socket-Variable in den Produktivserver geschrieben. (Die aeltere Zaehlung "sechs
+#      respektieren, 33 nackt" stand hier bis zum 03.09. abends und war zu freundlich.) Deshalb ein PATH-SCHIRM: ein Verzeichnis, das vor
+#      allem anderen im PATH steht und ein eigenes `tmux` mitbringt, das jeden Aufruf auf
+#      den Dev-Socket zwingt. Dasselbe Verfahren benutzt die Testsuite seit langem
+#      (shell/tests/*.sh, Abschnitt ISOLATION) — hier ist es nur dauerhaft eingerichtet
+#      statt je Testlauf.
+#      Im selben Schirm liegt shell/ des Dev-Baums vor ~/.local/bin, damit die Dev-Fassung
+#      ihre EIGENEN wb-Werkzeuge benutzt. Andernfalls muesste man sie nach ~/.local/bin
+#      kopieren, und das sind Kopien, keine Verweise — man wuerde die Produktivwerkzeuge
+#      ueberschreiben.
+#
+# WAS DIESES WERKZEUG NIE TUT: es fasst weder den Vorgabe-tmux-Server an noch
+# ~/.claude/workbench/, noch ~/.local/bin. Wer das Gegenteil beobachtet, hat einen Fehler
+# gefunden; die Selbstpruefung weiter unten soll ihn vorher abfangen.
+set -uo pipefail
+
+DEV_BAUM="${WB_DEV_BAUM:-$HOME/AI/claude-workbench-dev}"
+DEV_DATEN="${WB_DEV_DATEN:-$HOME/.claude/workbench-dev}"
+DEV_SOCKET="${WB_DEV_SOCKET:-wbdev}"
+SCHIRM="$DEV_DATEN/schirm"
+LOG="$DEV_DATEN/app.log"
+PIDDATEI="$DEV_DATEN/app.pid"
+# Das Laufverzeichnis der Mac-Fassung: eigene Sockets, eigene PID-Dateien, unter den
+# Dev-Daten -- die ausgelieferte Fassung benutzt ~/.config/agent-workbench/mac-lauf.
+MAC_LAUF="${WB_DEV_MAC_LAUF:-$DEV_DATEN/mac-lauf}"
+MAC_BUENDEL="$DEV_BAUM/mac/build/Werkbank.app"
+
+rot()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+gruen(){ printf '\033[32m%s\033[0m\n' "$*"; }
+info() { printf '%s\n' "$*"; }
+
+# ---------------------------------------------------------------- Vorbedingungen
+
+if [ ! -d "$DEV_BAUM/app" ]; then
+  rot "wb-dev: den Entwicklungsbaum '$DEV_BAUM' gibt es nicht."
+  info "  Anlegen mit:  git -C ~/AI/claude-workbench worktree add $DEV_BAUM dev"
+  exit 1
+fi
+
+# Das ECHTE tmux, einmal aufgeloest. Der Schirm darf sich nicht selbst aufrufen, sonst
+# entsteht eine Endlosschleife, die als 'zu viele offene Dateien' endet statt als Fehler.
+#
+# WELCHE FASSUNG (2026-09-03): die Entwicklungsfassung nimmt bewusst die NEUESTE im Cellar,
+# nicht die, auf die der Symlink gerade zeigt. Grund: tmux 3.7c baut auf macOS gegen jemalloc
+# statt gegen den System-Allokator -- laut eigenem Changelog "to avoid what appears to be a
+# bug in calloc" (tmux-Issue 5385) -- und behebt zusaetzlich eine Zeitpruefung, die vorher in
+# jedem Schleifendurchlauf lief (Issue 5367). Beides trifft genau die zwei Symptome, die am
+# 03.09. gemessen wurden: Allokations-Churn bei leerem Rueckblick und Dauerlast auf der CPU.
+# Der PRODUKTIVE Server laeuft weiter mit der Fassung, mit der er gestartet wurde -- ein
+# laufender tmux-Server kann sein Programm nicht austauschen. Die Entwicklungsfassung startet
+# dagegen ihren eigenen Server und bekommt die neue Fassung deshalb sofort.
+# Gemessen am selben Tag: ein 3.7c-Client spricht einwandfrei mit einem laufenden
+# 3.7b-Server (list-panes, capture-pane, has-session, Steuerkanal) -- es gibt hier also
+# keine Protokollhuerde, nur den fehlenden Neustart.
+waehle_tmux() {
+  local kandidat
+  # Hoechste Fassung im Cellar zuerst; `sort -V` ordnet 3.7c vor 3.7b.
+  for kandidat in $(ls -d /opt/homebrew/Cellar/tmux/*/bin/tmux 2>/dev/null | sort -Vr); do
+    [ -x "$kandidat" ] && { printf '%s' "$kandidat"; return 0; }
+  done
+  # Kein Cellar (andere Maschine, andere Paketverwaltung): der normale Weg.
+  PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin command -v tmux 2>/dev/null
+}
+TMUX_ECHT="${WB_DEV_TMUX:-$(waehle_tmux)}"
+if [ -z "$TMUX_ECHT" ] || [ ! -x "$TMUX_ECHT" ]; then
+  rot "wb-dev: kein tmux gefunden. Ohne tmux startet die Werkbank nicht."
+  exit 1
+fi
+
+# ---------------------------------------------------------------- Schirm herstellen
+
+schirm_bauen() {
+  mkdir -p "$SCHIRM" "$DEV_DATEN/sessions" "$DEV_DATEN/state" "$DEV_DATEN/results" \
+           "$DEV_DATEN/requests" "$DEV_DATEN/guard-blocks" "$DEV_DATEN/guard-grants"
+
+  # Der tmux-Wrapper. Er fuegt '-L <socket>' NUR ein, wenn der Aufrufer nicht schon selbst
+  # einen Server gewaehlt hat (-L oder -S): ein Werkzeug, das ausdruecklich einen eigenen
+  # Testsocket benutzt, soll ihn behalten duerfen.
+  cat > "$SCHIRM/tmux" <<EOF
+#!/bin/bash
+# Erzeugt von wb-dev. Zwingt jeden tmux-Aufruf der Entwicklungsfassung auf den
+# Dev-Server '$DEV_SOCKET', damit kein Werkzeug versehentlich in den Produktivserver
+# schreibt. NICHT von Hand bearbeiten -- wb-dev schreibt die Datei bei jedem Start neu.
+for a in "\$@"; do
+  case "\$a" in
+    -L|-S) exec "$TMUX_ECHT" "\$@" ;;
+    --) break ;;
+  esac
+done
+exec "$TMUX_ECHT" -L "$DEV_SOCKET" "\$@"
+EOF
+  chmod +x "$SCHIRM/tmux"
+}
+
+# ---------------------------------------------------------------- Umgebung
+
+umgebung_setzen() {
+  # Schirm zuerst, dann die Werkzeuge des Dev-Baums, dann erst der normale PATH.
+  export PATH="$SCHIRM:$DEV_BAUM/shell:$PATH"
+
+  # Der Socket wird der Anwendung ZUSAETZLICH ausdruecklich genannt. Der Schirm allein
+  # wuerde reichen, aber doppelt genaeht haelt hier besser: die Anwendung schreibt den
+  # Socket in ihre eigenen Aufrufe, und ein spaeterer Umbau, der den Schirm umgeht, faellt
+  # dann nicht still auf den Vorgabeserver zurueck.
+  export AWB_TMUX_SOCKET="$DEV_SOCKET"
+
+  # Saemtliche Datenpfade. Die Namen stammen aus app/src/main/config.ts; wer dort einen
+  # neuen Pfad einfuehrt, traegt ihn hier nach, sonst greift die Dev-Fassung an dieser
+  # einen Stelle wieder in den Produktivbestand.
+  export AWB_CONFIG="$DEV_DATEN/config.json"
+  export AWB_SETTINGS_FILE="$DEV_DATEN/settings.json"
+  export AWB_SESSIONS_DIR="$DEV_DATEN/sessions"
+  export AWB_STATE_DIR="$DEV_DATEN/state"
+  export AWB_RESULTS_DIR="$DEV_DATEN/results"
+  export AWB_REQUESTS_DIR="$DEV_DATEN/requests"
+  export AWB_GUARD_BLOCKS_DIR="$DEV_DATEN/guard-blocks"
+  export AWB_GUARD_GRANTS_DIR="$DEV_DATEN/guard-grants"
+  export AWB_GUARD_LOG="$DEV_DATEN/guard-blocks.log"
+  export AWB_MODELS_FILE="$DEV_DATEN/models.json"
+  export AWB_SHOT_DIR="$DEV_DATEN/shots"
+  # Der Steuersocket, ueber den `awb-ctl` die Anwendung fernbedient. Seine Vorgabe ist
+  # $TMPDIR/awb-<uid>.sock und damit fuer BEIDE Fassungen derselbe Pfad -- ohne diese
+  # Zeile spraeche awb-ctl mit der falschen Instanz, oder die zweite koennte den Socket
+  # gar nicht erst binden. Gefunden von der Gegenprobe weiter unten, am 03.09.2026.
+  export AWB_CONTROL_SOCKET="$DEV_DATEN/awb-dev.sock"
+  export AWB_HYGIENE_STATUS_FILE="$DEV_DATEN/hygiene-status.txt"
+  export AWB_TESTSUITE_STATUS_FILE="$DEV_DATEN/testsuite-status.txt"
+  # Die Projektverzeichnisse bleiben GETEILT und werden nur gelesen: sie gehoeren nicht
+  # der Werkbank, sondern Claude Code selbst. Eine Kopie waere hier falsch -- die
+  # Dev-Fassung soll dieselben Projekte anzeigen wie die echte.
+  export AWB_PROJECTS_DIR="$HOME/.claude/projects"
+
+  # Kennzeichen fuer die Anwendung selbst: sie darf sich im Fenstertitel als Dev-Fassung
+  # zu erkennen geben. Ohne das steht man vor zwei gleich aussehenden Fenstern.
+  export AWB_DEV=1
+}
+
+# ---------------------------------------------------------------- Erstbefuellung
+
+daten_vorbereiten() {
+  # models.json wird aus dem Produktivstand KOPIERT, nicht verlinkt: die Dev-Fassung soll
+  # dieselben Modelle kennen, aber eine Aenderung darin darf nicht zurueckschlagen.
+  if [ ! -f "$DEV_DATEN/models.json" ] && [ -f "$HOME/.claude/workbench/models.json" ]; then
+    cp "$HOME/.claude/workbench/models.json" "$DEV_DATEN/models.json"
+    info "  models.json aus dem Produktivstand uebernommen (Kopie, keine Verbindung)."
+  fi
+  if [ ! -f "$DEV_DATEN/settings.json" ] && [ -f "$HOME/.claude/workbench/settings.json" ]; then
+    cp "$HOME/.claude/workbench/settings.json" "$DEV_DATEN/settings.json"
+    info "  settings.json aus dem Produktivstand uebernommen (Kopie, keine Verbindung)."
+  fi
+}
+
+# ---------------------------------------------------------------- Selbstpruefung
+
+# Diese Pruefung ist der Grund, warum man dem Werkzeug glauben darf. Sie faellt aus, BEVOR
+# die Anwendung startet, wenn eine der drei Trennungen nicht haelt.
+selbstpruefung() {
+  local fehler=0
+
+  local welches; welches="$(command -v tmux)"
+  if [ "$welches" != "$SCHIRM/tmux" ]; then
+    rot "  FEHLER  'tmux' zeigt auf '$welches', nicht auf den Schirm '$SCHIRM/tmux'."
+    fehler=1
+  fi
+
+  # Der Beweis, dass der Schirm wirkt: der Wrapper muss einen ANDEREN Server ansprechen
+  # als der Vorgabeaufruf. Gemessen wird an der Socketdatei, die tmux selbst nennt.
+  local dev_socketpfad prod_socketpfad
+  dev_socketpfad="$(tmux display-message -p '#{socket_path}' 2>/dev/null)"
+  prod_socketpfad="$("$TMUX_ECHT" display-message -p '#{socket_path}' 2>/dev/null)"
+  if [ -n "$dev_socketpfad" ] && [ "$dev_socketpfad" = "$prod_socketpfad" ]; then
+    rot "  FEHLER  Der Schirm spricht denselben tmux-Server an wie der Produktivstand:"
+    rot "          $dev_socketpfad"
+    fehler=1
+  fi
+
+  # Jede SCHREIBENDE Pfadvariable wird geprueft, nicht nur eine ausgewaehlte. Wer spaeter
+  # eine neue hinzufuegt und hier zu ergaenzen vergisst, faellt beim naechsten Punkt auf:
+  # die Liste wird gegen config.ts gehalten.
+  local v pfad
+  for v in AWB_CONFIG AWB_SETTINGS_FILE AWB_SESSIONS_DIR AWB_STATE_DIR AWB_RESULTS_DIR \
+           AWB_REQUESTS_DIR AWB_GUARD_BLOCKS_DIR AWB_GUARD_GRANTS_DIR AWB_GUARD_LOG \
+           AWB_MODELS_FILE AWB_SHOT_DIR AWB_HYGIENE_STATUS_FILE AWB_TESTSUITE_STATUS_FILE; do
+    pfad="${!v}"
+    case "$pfad" in
+      "$HOME/.claude/workbench"/*|"$HOME/.claude/workbench")
+        rot "  FEHLER  $v zeigt in den Produktivbestand: $pfad"
+        fehler=1 ;;
+      "$HOME/.pi-workers"/*)
+        rot "  FEHLER  $v zeigt in den geteilten Worker-Bestand: $pfad"
+        fehler=1 ;;
+    esac
+  done
+
+  # Gegenprobe zur Liste oben: kennt config.ts eine schreibende AWB_*-Pfadvariable, die
+  # hier gar nicht gesetzt ist, faellt sie still auf den Produktivpfad zurueck. Das ist
+  # genau der Fehler, den man nicht sieht, bis Daten am falschen Ort liegen.
+  local quelle="$DEV_BAUM/app/src/main/config.ts"
+  if [ -r "$quelle" ]; then
+    # Bekannt = hier gesetzt ODER bewusst nicht umgelenkt (Testhaken, reine Schalter,
+    # geteilte Lesepfade). Eine Variable, die in keiner der beiden Listen steht, ist neu
+    # und muss entschieden werden.
+    local bekanntdatei fehlend
+    bekanntdatei="$(mktemp)"
+    printf '%s\n' \
+      AWB_CONFIG AWB_SETTINGS_FILE AWB_SESSIONS_DIR AWB_STATE_DIR AWB_RESULTS_DIR \
+      AWB_REQUESTS_DIR AWB_GUARD_BLOCKS_DIR AWB_GUARD_GRANTS_DIR AWB_GUARD_LOG \
+      AWB_MODELS_FILE AWB_SHOT_DIR AWB_HYGIENE_STATUS_FILE AWB_TESTSUITE_STATUS_FILE \
+      AWB_PROJECTS_DIR AWB_TMUX_SOCKET AWB_DEV AWB_CONTROL_SOCKET \
+      AWB_ASK_GRANT_TTL AWB_BUDGET_POLL_MS AWB_BUDGET_TIMEOUT_MS AWB_COLS AWB_ROWS \
+      AWB_EXCLUDE_GLOBS AWB_HEADLESS AWB_MIN_PANE_ROWS AWB_ORDNER_DIALOG \
+      AWB_REMOTE_POLL_MS AWB_REMOTE_TIMEOUT_MS AWB_RUECKFRAGE AWB_START_SHOT \
+      AWB_MACHINE AWB_SESSION AWB_CHAT_CMD AWB_BUDGET_BIN \
+      AWB_WB_CODE AWB_WB_DECIDE AWB_WB_FREIGABE AWB_WB_MENSCH AWB_WB_PANE_WRITE \
+      AWB_WB_STATE AWB_WB_KONTEXT AWB_WB_SESSION_CLOSE AWB_WB_SESSION_DELETE \
+      AWB_DEBUG AWB_REACHABLE AWB_REMOTE_MACHINES AWB_STALL_SECONDS AWB_NOTAUSGANG_MS \
+      AWB_MIN_PANE_COLS AWB_MAX_WORKERS_PER_TAB AWB_ERLAUBE_ECHTES_VOLLBILD \
+      | sort -u > "$bekanntdatei"
+    fehlend="$(grep -ohE 'env\.AWB_[A-Z_]+' "$quelle" 2>/dev/null | sed 's/env\.//' | sort -u \
+      | grep -vxF -f "$bekanntdatei" 2>/dev/null | grep -v '^AWB_TEST_' | tr '\n' ' ')"
+    rm -f "$bekanntdatei"
+    if [ -n "${fehlend// /}" ]; then
+      rot "  FEHLER  config.ts kennt AWB-Variablen, die wb-dev nicht setzt: $fehlend"
+      rot "          Jede davon faellt auf den Produktivpfad zurueck. In umgebung_setzen() nachtragen."
+      fehler=1
+    fi
+  fi
+
+  return $fehler
+}
+
+# ---------------------------------------------------------------- Unterbefehle
+
+bauen() {
+  info "Baue den Dev-Stand ..."
+  ( cd "$DEV_BAUM/app" && npm run build >"$DEV_DATEN/build.log" 2>&1 )
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    rot "wb-dev: der Bau ist fehlgeschlagen. Letzte Zeilen aus $DEV_DATEN/build.log:"
+    tail -20 "$DEV_DATEN/build.log" >&2
+    return 1
+  fi
+  gruen "  Bau in Ordnung."
+}
+
+laeuft_pid() {
+  [ -f "$PIDDATEI" ] || return 1
+  local p; p="$(cat "$PIDDATEI" 2>/dev/null)"
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && { printf '%s' "$p"; return 0; }
+  return 1
+}
+
+status() {
+  local p
+  if p="$(laeuft_pid)"; then
+    gruen "Dev-Werkbank laeuft (PID $p)."
+  else
+    info "Dev-Werkbank laeuft nicht."
+  fi
+  info "  Baum:    $DEV_BAUM"
+  info "  Daten:   $DEV_DATEN"
+  info "  Socket:  $DEV_SOCKET"
+  info "  tmux:    $("$TMUX_ECHT" -V 2>/dev/null) aus $TMUX_ECHT"
+  if otool -L "$TMUX_ECHT" 2>/dev/null | grep -q jemalloc; then
+    info "           mit jemalloc (der Allokator, der den macOS-calloc-Fehler umgeht)"
+  else
+    info "           OHNE jemalloc -- diese Fassung hat den Allokator-Fix nicht"
+  fi
+  local n; n="$("$TMUX_ECHT" -L "$DEV_SOCKET" list-sessions 2>/dev/null | wc -l | tr -d ' ')"
+  info "  Dev-tmux-Sitzungen: ${n:-0}"
+  info "  Protokoll: $LOG"
+}
+
+stoppen() {
+  local p
+  if p="$(laeuft_pid)"; then
+    kill "$p" 2>/dev/null
+    # Auf das Ende warten, statt es anzunehmen.
+    local i=0
+    while kill -0 "$p" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+    if kill -0 "$p" 2>/dev/null; then
+      kill -9 "$p" 2>/dev/null
+      info "  Anwendung erzwungen beendet (PID $p)."
+    else
+      gruen "  Anwendung beendet (PID $p)."
+    fi
+  else
+    info "  Anwendung lief nicht."
+  fi
+  rm -f "$PIDDATEI"
+
+  # Der Dev-tmux-Server wird MIT beendet: er gehoert zu dieser Fassung und niemandem
+  # sonst. Der Produktivserver ist davon nicht betroffen, er hoert auf einen anderen
+  # Socket.
+  #
+  # NICHT ueber `has-session` pruefen (Fehler vom 03.09., beim ersten Gebrauch gefunden):
+  # ein Server OHNE Sitzungen antwortet darauf mit Fehlschlag, und der Server blieb dann
+  # stehen -- genau der Fall, der nach einem Testlauf entsteht. Gefragt wird deshalb, ob es
+  # den Server ueberhaupt gibt (`list-sessions` antwortet auch bei null Sitzungen mit
+  # Ruecklaufwert 0, solange der Server lebt), und zur Sicherheit wird der uebrig
+  # gebliebene Prozess danach noch einmal nachgesehen.
+  if "$TMUX_ECHT" -L "$DEV_SOCKET" list-sessions >/dev/null 2>&1 \
+     || [ -S "${TMUX_TMPDIR:-/private/tmp}/tmux-$(id -u)/$DEV_SOCKET" ]; then
+    "$TMUX_ECHT" -L "$DEV_SOCKET" kill-server 2>/dev/null
+    gruen "  Dev-tmux-Server '$DEV_SOCKET' beendet."
+  fi
+  # Verifizieren statt annehmen: was gestartet wurde, muss auch wirklich weg sein.
+  local rest
+  rest="$(pgrep -f "tmux -L $DEV_SOCKET" 2>/dev/null | head -3)"
+  if [ -n "$rest" ]; then
+    warn "  Der Dev-tmux-Server laeuft noch (PID $rest) -- beende ihn direkt."
+    for p in $rest; do kill "$p" 2>/dev/null; done
+  fi
+}
+
+frisch() {
+  stoppen
+  if [ -d "$DEV_DATEN" ]; then
+    local sicherung="$HOME/.local/trash-snapshots/$(date +%Y-%m-%d-%H%M%S)-workbench-dev-daten"
+    mkdir -p "$(dirname "$sicherung")"
+    cp -R "$DEV_DATEN" "$sicherung"
+    info "  Alte Dev-Daten gesichert nach $sicherung"
+    rm -rf "$DEV_DATEN"
+  fi
+  gruen "  Dev-Daten zurueckgesetzt."
+}
+
+# ---------------------------------------------------------- Welche Fassung
+
+# Die Vorgabe haengt an der Plattform (Auftrag 4.4): auf dem Mac die
+# Mac-native Fassung, sonst Electron. Sie laesst sich mit `--mac`/`--electron`
+# ueberstimmen, und WB_DEV_FASSUNG setzt sie fuer eine ganze Sitzung.
+fassung_vorgabe() {
+  case "${WB_DEV_FASSUNG:-}" in
+    mac|electron) printf '%s' "$WB_DEV_FASSUNG"; return ;;
+  esac
+  [ "$(uname -s)" = "Darwin" ] && printf 'mac' || printf 'electron'
+}
+
+# Ist die Mac-Fassung ueberhaupt startbar? Nur dann darf sie genommen werden.
+mac_gebaut() { [ -x "$MAC_BUENDEL/Contents/MacOS/Werkbank" ]; }
+
+# Die Fassung, die WIRKLICH startet -- mit Meldung, wenn der Wunsch nicht geht.
+# `$1` ist die gewuenschte, `$2` sagt, ob der Wunsch ausdruecklich getippt wurde.
+fassung_entscheiden() {
+  local wunsch="$1" getippt="$2"
+  if [ "$wunsch" != "mac" ]; then printf 'electron'; return; fi
+  if [ "$(uname -s)" != "Darwin" ]; then
+    [ "$getippt" = 1 ] && rot "wb-dev: --mac geht nur auf macOS; es startet die Electron-Fassung." >&2
+    printf 'electron'; return
+  fi
+  if ! mac_gebaut; then
+    info "wb-dev: die Mac-Fassung ist nicht gebaut ($MAC_BUENDEL fehlt) -- es startet Electron." >&2
+    info "        Bauen:  $DEV_BAUM/mac/bin/bauen   (oder: wb-dev --mac --bauen)" >&2
+    printf 'electron'; return
+  fi
+  printf 'mac'
+}
+
+# Start, Stopp und Auskunft der Mac-Fassung gehen ueber ihr eigenes Skript --
+# es kennt Handschlag, Token, Socketpfade und den Abbau. Ein zweiter Aufbau
+# hier waere eine zweite Wahrheit darueber, wie die Fassung startet.
+mac_starten() {   # $1 = 1 fuer kopflos
+  local args=()
+  [ "$1" = 1 ] && args+=(--kopflos)
+  AWBMAC_LAUFDIR="$MAC_LAUF" "$DEV_BAUM/mac/bin/starten" "${args[@]+"${args[@]}"}"
+}
+mac_stoppen() { AWBMAC_LAUFDIR="$MAC_LAUF" "$DEV_BAUM/mac/bin/starten" --stop >/dev/null 2>&1; }
+mac_laeuft()  { AWBMAC_LAUFDIR="$MAC_LAUF" "$DEV_BAUM/mac/bin/starten" --status >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- Hauptlauf
+
+BAUEN=0; NUR_STATUS=0; NUR_STOP=0; FRISCH=0; KOPFLOS=0; INAKTIV=0; EXTRA=()
+FASSUNG="$(fassung_vorgabe)"; FASSUNG_GETIPPT=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --bauen)  BAUEN=1 ;;
+    --mac)      FASSUNG=mac; FASSUNG_GETIPPT=1 ;;
+    --electron) FASSUNG=electron; FASSUNG_GETIPPT=1 ;;
+    --status) NUR_STATUS=1 ;;
+    --stop)   NUR_STOP=1 ;;
+    --frisch) FRISCH=1; BAUEN=1 ;;
+    # Ohne sichtbares Fenster starten. Fuer Pruefungen und fuer jeden Lauf, der der Nutzer
+    # nicht den Fokus wegnehmen darf: ein sichtbar gestartetes Fenster landet auf dem
+    # Schreibtisch, an dem er gerade arbeitet (regeln/aufnahmen.md).
+    --kopflos) KOPFLOS=1 ;;
+    --inaktiv) INAKTIV=1 ;;
+    --)       shift; EXTRA=("$@"); break ;;
+    -h|--help)
+      sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) rot "wb-dev: unbekannte Angabe '$1'"; exit 2 ;;
+  esac
+  shift
+done
+
+# BEENDET WIRD IMMER BEIDES, unabhaengig von der gewaehlten Fassung: wer
+# `wb-dev --stop` tippt, will die Dev-Werkbank los -- und welche Fassung beim
+# letzten Start lief, muss er dafuer nicht wissen.
+if [ "$NUR_STOP" = 1 ]; then umgebung_setzen; mac_stoppen; stoppen; exit 0; fi
+if [ "$FRISCH" = 1 ]; then umgebung_setzen; mac_stoppen; frisch; fi
+
+schirm_bauen
+umgebung_setzen
+daten_vorbereiten
+
+if [ "$NUR_STATUS" = 1 ]; then
+  status
+  if mac_laeuft; then gruen "Mac-Fassung laeuft (Laufverzeichnis $MAC_LAUF)."
+  else info "Mac-Fassung laeuft nicht.  Buendel: $MAC_BUENDEL$(mac_gebaut || printf ' (nicht gebaut)')"; fi
+  exit 0
+fi
+
+info "Pruefe die Trennung von der laufenden Werkbank ..."
+if ! selbstpruefung; then
+  rot "wb-dev: ABGEBROCHEN. Die Dev-Fassung ist nicht sauber getrennt; sie wird nicht gestartet."
+  exit 1
+fi
+gruen "  Getrennt: eigener tmux-Server, eigene Daten, eigene Werkzeuge."
+
+[ "$BAUEN" = 1 ] && { bauen || exit 1; }
+# Der Bau der Mac-Fassung gehoert zu `--bauen`, sobald sie gemeint ist: sonst
+# baute `wb-dev --mac --bauen` den Kern neu und startete daneben ein Buendel von
+# gestern.
+if [ "$BAUEN" = 1 ] && [ "$FASSUNG" = mac ] && [ "$(uname -s)" = "Darwin" ]; then
+  info "Baue die Mac-Fassung ..."
+  if "$DEV_BAUM/mac/bin/bauen" --debug >"$DEV_DATEN/bau-mac.log" 2>&1; then
+    gruen "  Mac-Fassung gebaut."
+  else
+    rot "wb-dev: der Bau der Mac-Fassung ist fehlgeschlagen. Letzte Zeilen aus $DEV_DATEN/bau-mac.log:"
+    tail -20 "$DEV_DATEN/bau-mac.log" >&2
+    exit 1
+  fi
+fi
+
+# Erst JETZT entscheiden: ein `--bauen` davor kann die Mac-Fassung gerade eben
+# erst hergestellt haben.
+FASSUNG="$(fassung_entscheiden "$FASSUNG" "$FASSUNG_GETIPPT")"
+
+if [ "$FASSUNG" = mac ]; then
+  if mac_laeuft; then
+    info "Mac-Fassung laeuft bereits. Zum Neustart:  wb-dev --stop && wb-dev"
+    exit 0
+  fi
+  # `--inaktiv` kennt die Mac-Fassung nicht: ein AppKit-Fenster kommt entweder
+  # nach vorn oder gar nicht auf den Schirm (Fenster.swift). Wer den Fokus nicht
+  # abgeben will, nimmt `--kopflos`.
+  [ "$INAKTIV" = 1 ] && info "wb-dev: --inaktiv gibt es in der Mac-Fassung nicht; sie startet gewoehnlich." >&2
+  [ ${#EXTRA[@]} -gt 0 ] && info "wb-dev: die Angaben nach -- sind Electron-Argumente und werden von der Mac-Fassung nicht gelesen." >&2
+  if [ "$KOPFLOS" = 1 ]; then info "Starte die Mac-Fassung kopflos ..."; else info "Starte die Mac-Fassung ..."; fi
+  if mac_starten "$KOPFLOS"; then
+    gruen "Mac-Fassung laeuft (Laufverzeichnis $MAC_LAUF)."
+    info "  Protokoll:  $MAC_LAUF/app.log und $MAC_LAUF/kern.log"
+    info "  Beenden:    wb-dev --stop"
+    info "  Electron statt dessen:  wb-dev --electron"
+    exit 0
+  fi
+  rot "wb-dev: die Mac-Fassung ist nicht gestartet (Grund in den Zeilen darueber)."
+  exit 1
+fi
+
+if p="$(laeuft_pid)"; then
+  info "Dev-Werkbank laeuft bereits (PID $p). Zum Neustart:  wb-dev --stop && wb-dev"
+  exit 0
+fi
+
+cd "$DEV_BAUM/app" || exit 1
+ARGS=()
+if [ "$KOPFLOS" = 1 ]; then
+  ARGS+=(--headless --force-device-scale-factor=2)
+else
+  # OHNE `--show` ZEIGT DIE ANWENDUNG KEIN FENSTER (2026-09-03, beim ersten
+  # sichtbaren Start gefunden). Sie laeuft dann zwar, samt Steuerkanal, aber
+  # `windowVisible` bleibt falsch -- fuer einen Messlauf richtig, fuer einen
+  # Menschen unbrauchbar. Der Fehler war schwer zu sehen, weil auf dem
+  # Schreibtisch ein Fenster STAND: das der ausgelieferten Fassung.
+  # `--inaktiv` (2026-09-03): das Fenster erscheint, nimmt aber den Fokus nicht --
+  # fuer den Sichtkontrollstart aus einer Agentensitzung, waehrend der Nutzer arbeitet.
+  if [ "$INAKTIV" = 1 ]; then ARGS+=(--show-inaktiv); else ARGS+=(--show); fi
+fi
+if [ "$KOPFLOS" = 1 ]; then info "Starte die Dev-Werkbank kopflos ..."; else info "Starte die Dev-Werkbank ..."; fi
+"$DEV_BAUM/app/node_modules/.bin/electron" . "${ARGS[@]+"${ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" >>"$LOG" 2>&1 &
+APPPID=$!
+printf '%s' "$APPPID" > "$PIDDATEI"
+
+# Kurz nachsehen, ob sie den Start ueberlebt hat. Ein sofortiger Absturz ist der haeufigste
+# Fall, und ohne diese Pruefung meldet das Werkzeug faelschlich Erfolg.
+sleep 2
+if kill -0 "$APPPID" 2>/dev/null; then
+  gruen "Dev-Werkbank laeuft (PID $APPPID)."
+  info "  Protokoll:  $LOG"
+  info "  Beenden:    wb-dev --stop"
+  info "  Neu bauen:  wb-dev --stop && wb-dev --bauen"
+else
+  rot "wb-dev: die Anwendung ist sofort wieder beendet. Letzte Zeilen aus $LOG:"
+  tail -25 "$LOG" >&2
+  rm -f "$PIDDATEI"
+  exit 1
+fi

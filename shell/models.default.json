@@ -352,12 +352,20 @@
       "apiKeyEnv": null,
       "keychainService": null,
       "notes": "Login-Zugang von opencode selbst, kein eigener API-Key — darueber laufen die opencode/...-Modelle aus 'opencode models' (SPEC-V3-MODELS discover, Vertrag 2026-07-29)."
+    },
+    {
+      "id": "omlx-lokal",
+      "label": "oMLX (omlx serve, lokal)",
+      "kind": "local",
+      "baseUrl": "http://127.0.0.1:8079/v1",
+      "notes": "Bedarfsweiser oMLX-Server (Port 8079, Proxy davor) ueber wb-omlx-server ensure/stop. Backend lauscht auf 8078. Fuer Modelle im oMLX-Format (oQ4e/oQ6e, eingebauter MTP-Kopf), die mlx_lm/mlx_vlm.server nicht laden. Getrennt von mlx-lokal, damit ein Fehler die uebrige lokale Flotte nicht trifft."
     }
   ],
   "harnesses": [
     {
       "id": "claude",
       "label": "Claude Code",
+      "orchestratorDefaultModel": "claude-opus-5",
       "builtin": true,
       "command": "~/.local/bin/claude",
       "args": [
@@ -539,6 +547,7 @@
     {
       "id": "codex",
       "label": "OpenAI Codex CLI",
+      "orchestratorDefaultModel": "codex-gpt-5-6-sol",
       "command": "codex",
       "args": [
         "--model",
@@ -556,12 +565,17 @@
         "map": {
           "low": "low",
           "medium": "medium",
-          "high": "high"
+          "high": "high",
+          "xhigh": "xhigh",
+          "max": "max",
+          "ultra": "ultra"
         }
       },
       "systemPrompt": {
-        "style": "file",
+        "style": "config-content",
         "path": "~/.codex/AGENTS.md",
+        "key": "developer_instructions",
+        "flag": "-c",
         "projectPath": "AGENTS.md",
         "worker": "~/.claude/roles/agent.md",
         "orchestrator": "~/.claude/roles/orchestrator.md"
@@ -622,7 +636,7 @@
       ],
       "supportsPaste": true,
       "altScreen": true,
-      "notes": "Erste Welle. /compact stammt aus Issues des offiziellen Repos, nicht aus der Doku (mittlere Konfidenz); eine CTX-Anzeige gibt es entgegen derselben Quelle nicht, siehe probe. Anbietergebunden: eigene Base-URL ist NICHT belegt. ENTFERNT 2026-08-09: promptIgnore (eine Alternation aus sieben gemessenen Platzhaltern der leeren Eingabezeile) trug seit 2026-08-06 nichts mehr bei, sobald pi-worker die Eingabezeile VOR dem Einfuegen merkt und hinterher wortlos dagegen haelt (derselbe Vergleich faengt JEDEN Platzhalter, nicht nur die gelisteten sieben) -- der Eintrag war ausdruecklich ein Pflaster fuer die Zeit vor diesem Vergleich. Nachgeprueft von Hand (eigener tmux-Socket, echtes codex-cli 0.146.0, echtes Modell codex-gpt5): die Eingabezeile zeigte vorher den Platzhalter 'Find and fix a bug in @filename', nach dem Einfuegen unseren Text -- der Vergleich unterscheidet beides ohne promptIgnore einwandfrei, genau das Verhalten, auf das sich die Entfernung stuetzt. NICHT abschliessend gemessen werden konnte die volle Zustellung bis zur Antwort: zwei NEUE, von diesem Eintrag unabhaengige Befunde blockierten den Lauf danach -- codex-cli zeigt inzwischen NACH der Verzeichnis-Vertrauensfrage einen zweiten Dialog ('Hooks need review', bislang weder in trustStore noch in readyPattern beruecksichtigt), und der ChatGPT-Abo-Token dieses codex-gpt5-Kontos war zum Messzeitpunkt abgelaufen ('token_expired' / 'refresh token was already used'). Beides gehoert nicht zu diesem Feld und steht deshalb nur hier vermerkt, nicht behoben. Die Vertrauensfrage beim ersten Start in einem Verzeichnis beantwortet codex NICHT ueber promptIgnore: sie steht in ~/.codex/config.toml als [projects.\"<pfad>\"] trust_level = \"trusted\", mit dem AUFGELOESTEN Pfad (auf macOS /private/var/... statt /var/...). Ein frischer Worktree steht dort nicht, der Dialog kommt, das readyPattern trifft ihn richtigerweise nicht — der Spawn scheitert dann sichtbar nach 60s, statt den Auftrag zu verlieren. Seit 2026-08-08 traegt wb-harness-run das Arbeitsverzeichnis vor dem Start selbst ein (trustStore, style toml-section); der Dialog erscheint dann gar nicht erst, und der Satz davor beschreibt, was ohne diesen Eintrag passiert.",
+      "notes": "Erste Welle. /compact stammt aus Issues des offiziellen Repos, nicht aus der Doku (mittlere Konfidenz); eine CTX-Anzeige gibt es entgegen derselben Quelle nicht, siehe probe. Anbietergebunden: eigene Base-URL ist NICHT belegt. ENTFERNT 2026-08-09: promptIgnore (eine Alternation aus sieben gemessenen Platzhaltern der leeren Eingabezeile) trug seit 2026-08-06 nichts mehr bei, sobald pi-worker die Eingabezeile VOR dem Einfuegen merkt und hinterher wortlos dagegen haelt (derselbe Vergleich faengt JEDEN Platzhalter, nicht nur die gelisteten sieben) -- der Eintrag war ausdruecklich ein Pflaster fuer die Zeit vor diesem Vergleich. Nachgeprueft von Hand (eigener tmux-Socket, echtes codex-cli 0.146.0, echtes Modell codex-gpt5): die Eingabezeile zeigte vorher den Platzhalter 'Find and fix a bug in @filename', nach dem Einfuegen unseren Text -- der Vergleich unterscheidet beides ohne promptIgnore einwandfrei, genau das Verhalten, auf das sich die Entfernung stuetzt. NICHT abschliessend gemessen werden konnte die volle Zustellung bis zur Antwort: zwei NEUE, von diesem Eintrag unabhaengige Befunde blockierten den Lauf danach -- codex-cli zeigt inzwischen NACH der Verzeichnis-Vertrauensfrage einen zweiten Dialog ('Hooks need review', bislang weder in trustStore noch in readyPattern beruecksichtigt), und der ChatGPT-Abo-Token dieses codex-gpt5-Kontos war zum Messzeitpunkt abgelaufen ('token_expired' / 'refresh token was already used'). Beides gehoert nicht zu diesem Feld und steht deshalb nur hier vermerkt, nicht behoben. Die Vertrauensfrage beim ersten Start in einem Verzeichnis beantwortet codex NICHT ueber promptIgnore: sie steht in ~/.codex/config.toml als [projects.\"<pfad>\"] trust_level = \"trusted\", mit dem AUFGELOESTEN Pfad (auf macOS /private/var/... statt /var/...). Ein frischer Worktree steht dort nicht, der Dialog kommt, das readyPattern trifft ihn richtigerweise nicht — der Spawn scheitert dann sichtbar nach 60s, statt den Auftrag zu verlieren. Seit 2026-08-08 traegt wb-harness-run das Arbeitsverzeichnis vor dem Start selbst ein (trustStore, style toml-section); der Dialog erscheint dann gar nicht erst, und der Satz davor beschreibt, was ohne diesen Eintrag passiert. NACHTRAG 2026-09-12: ChatGPT Plus ist angemeldet. Die Effort-Map bildet low..max ab; Agenten bleiben durch den Modell-Deckel gebunden, Menschen duerfen die vom Harness angebotenen Stufen waehlen.",
       "promptPattern": "^›",
       "discover": {
         "source": "file-json",
@@ -1664,7 +1678,17 @@
           "true"
         ]
       },
-      "resume": null,
+      "resume": {
+        "args": [
+          "--id",
+          "{resumeId}"
+        ],
+        "probe": "revive-only",
+        "kennung": {
+          "verfahren": "cline-sessions",
+          "ort": "~/.cline-wb/sessions/*/*.json"
+        }
+      },
       "readyPattern": "^[[:space:]]*>[[:space:]]",
       "promptPattern": "^[[:space:]]*>",
       "promptIgnore": "^[[:space:]]*>[[:space:]]+(What can I do for you\\?|Ask anything\\.\\.\\.|Plan something\\.\\.\\.)",
@@ -1694,7 +1718,7 @@
       "altScreen": true,
       "probe": "gemessen 2026-08-08 mit Cline CLI 0.0.13 (npm i -g @cline/cli) auf eigenem tmux-Socket mit PID im Namen, umgelenktem HOME, Modelle ornith:9b und qwen3:1.7b ueber Ollama. DER BEFEHL HEISST NICHT 'cline': das Paket @cline/cli liefert genau EIN Programm, und das heisst 'clite' (package.json, Feld bin). Wer 'cline' eintraegt, bekommt 'command not found'. OHNE GITHUB- ODER CLINE-KONTO, und das ist der Kern dieses Eintrags: die CLI kann einen eigenen OpenAI-kompatiblen Anbieter fahren, und dann faellt jede Anmeldung weg. Eingerichtet wird er EINMAL ueber 'clite auth openai -b <url>/v1 -m <modell> -k <platzhalter>'; der Anbieter heisst danach 'openai-native' (die Ausgabe sagt es selbst: 'Provider configured: openai-native'). Die Basis-URL laesst sich NUR so setzen — 'clite auth ollama -b …' lehnt ab mit 'base URL is only supported for OpenAI and OpenAI-compatible providers', der eingebaute ollama-Anbieter nimmt also keine. Deshalb liegt die Bruecke von der Registry zur CLI in einer Datei: shell/cline-providers.default.json gehoert nach ~/.cline-wb/settings/providers.json, also in den Ordner, den '--data-dir {sessionDir}' bestellt (WARUM nicht der voreingestellte Ort: siehe notes, das ist gemessen). Das MODELL steht darin auch, wird aber je Start von -m ueberschrieben — nachgemessen mit zwei Startzeilen: mit '-m qwen3:1.7b' nannte die Fusszeile 'qwen3:1.7b (0) $0.0000', mit '-m ornith:9b' entsprechend. READY: die Eingabezeile beginnt mit einem Groesser-Zeichen, deshalb readyPattern '^[[:space:]]*>[[:space:]]'. Fuehrende Leerzeichen sind Pflicht im Muster und kein Schoenheitsfehler: die Oberflaeche zeichnet den Startbildschirm ZENTRIERT (gemessen: die Eingabezeile begann in einem 200 Spalten breiten Pane bei Spalte 69) und rueckt erst nach dem ersten Auftrag nach links (dann Spalte 2). Ein Muster mit '^>' traefe keinen der beiden Zustaende. Die drei Zustaende, alle gemessen: LEER steht dort '> What can I do for you?' — ein PLATZHALTER, kein Text; GETIPPT '> wie lautet das Kennwort dieses Arbeitsverzeichnisses? antwor' und die Fortsetzung bricht OHNE Groesser-Zeichen in die naechste Zeile um; WAEHREND DER ANTWORT ist die Box wieder leer und zeigt einen ANDEREN Platzhalter, '> Ask anything...'. DASS DER PLATZHALTER WECHSELT, ist die Falle dieses Harness und derselbe Fehler wie bei codex. Es sind genau drei, aus dem Programm selbst gelesen und nicht geraten: 'What can I do for you?' auf dem Startbildschirm, 'Ask anything...' im laufenden Gespraech, 'Plan something...' im Plan-Modus. Alle drei stehen in promptIgnore. Ohne sie haelt die Absende-Pruefung von pi-worker die leere Box fuer haengenden Text und tippt Enter nach. WARUM promptPattern OHNE das Leerzeichen am Ende steht: die Pruefung haengt '[[:space:]]+[^[:space:]]' an das Muster. Endete das Muster selbst auf einem Leerzeichen, verlangte sie ein ZWEITES und traefe nie — das ist der Fehler, an dem goose gescheitert ist. EINEN VERTRAUENSDIALOG stellt die CLI nicht, und einen Anmeldedialog auch nicht, solange der eigene Anbieter eingerichtet ist: im frischen HOME kam sie unmittelbar mit der Oberflaeche hoch. Ein trustStore-Block ist deshalb nicht noetig, und das ist gemessen.",
       "contextProbe": "gemessen 2026-08-08, gleiche Sitzung: die Cline CLI zeigt in ihrer Fusszeile den Modellnamen, eine TOKENZAHL und die Kosten — 'ornith:9b (4,728) $0.0000' nach einem Zug, 'ornith:9b (0) $0.0000' davor. Was sie NICHT zeigt, ist ein Nenner: keine Fenstergroesse, kein Prozentwert, kein Balken. Der Vertrag der Kontextwache verlangt aber, dass die erste Gruppe des contextPattern eine Auslastung IN PROZENT faengt. Aus '(4,728)' laesst sich die nicht bilden, ohne die Fenstergroesse dazuzuerfinden, und eine erfundene Zahl ist schlimmer als keine. contextPattern bleibt deshalb leer. (Im Programm liegt die Fenstergroesse als contextWindow der Modellkonfiguration vor und wuerde bei einem Anbieter mit Katalog auch angezeigt; fuer ein Ollama-Modell hinter dem OpenAI-kompatiblen Anbieter ist sie unbekannt und bleibt es.) NACHGEMESSEN 2026-08-10, und der Befund von damals war falsch: die CLI schreibt ihre Tokenzahlen sehr wohl waehrend des Laufs mit. Am 08.08. stand hier, unter dem Datenverzeichnis liege waehrend der Messung keine Datei mit Tokenzahlen und der Verlauf wandere erst beim Beenden dorthin — gesucht wurde damals im falschen Ordner. Richtig ist: <data-dir>/sessions/<id>/<id>.json nennt die Sitzung mit ihrem Arbeitsverzeichnis (Feld cwd, in AUFGELOESTER Schreibweise: '/private/tmp/...'), und daneben traegt <id>.messages.json je Antwort einen Block metrics mit inputTokens und outputTokens. Beide werden JE ZUG geschrieben, bei lebendem Prozess — nachgemessen mit zwei Zuegen: nach dem ersten stand dort eine Metrik (mtime 19:15:12), nach dem zweiten zwei (19:16:07), der Prozess lief in beiden Faellen weiter. Gegengeprueft an der Fusszeile: sie zeigte '(3,673)' und '(3,698)', und das sind genau die inputTokens der jeweils letzten Antwort — die Anzeige nennt also nur den EINGANG. Die Kontextwache rechnet trotzdem inputTokens + outputTokens, wie bei crush, gptme und copilot: das ist der Stand, der in den naechsten Zug wieder hineingeht. Der Nenner kommt weiterhin aus contextWindow des Modells, denn eine Fenstergroesse nennt auch die Datei nicht. Damit ist dieser Harness BEWACHT (Format 'cline-sessions'), und die Fusszeile bleibt ungenutzt: contextPattern kann sie nicht faengen, weil dort keine Prozentzahl steht.",
-      "notes": "Zweite Welle (2026-08-08). Installation ueber 'npm i -g @cline/cli'; npm meldet dabei, dass das postinstall-Skript uebersprungen wurde ('allow-scripts') — das ist folgenlos, das Skript legt nur einen Hardlink auf die schon entpackte Binaerdatei an, und 'clite --version' antwortete danach mit 0.0.13. Das Skript wurde vor der Installation gelesen; es tut nichts weiter. MITGELIEFERTE KONFIGURATION: shell/cline-providers.default.json gehoert nach ~/.cline-wb/settings/providers.json — in den Ordner, den '--data-dir {sessionDir}' bestellt, NICHT in das voreingestellte ~/.cline. Das ist gemessen und nicht Geschmackssache: dieselbe Datei unter ~/.cline/settings/providers.json UND unter ~/.cline/data/settings/providers.json (der Pfad, den die eigene Hilfe als Vorgabe nennt) liess die CLI trotzdem im Anmeldebildschirm stehen ('Connect a model provider to get started' mit 'Sign in with Cline' / 'Sign in with ChatGPT' / 'Bring your own provider'), und der Spawn scheiterte sichtbar nach 60 s; mit '--data-dir <ordner>' und der Datei unter <ordner>/settings/providers.json kam die Oberflaeche sofort. Der Ordner kommt aus sessionDir, weil der Aufloeser NUR dort die Tilde ausschreibt — wer eines von beiden aendert, aendert beide. Seit dem 10.08. haengt eine DRITTE Stelle daran: contextSession.path zeigt mit '~/.cline-wb/sessions/*/*.json' in denselben Ordner, dort schreibt die CLI ihre Tokenzahlen hin. Wandert das Datenverzeichnis, muessen alle drei mitwandern, sonst sucht die Kontextwache still an einem Ort, an dem nichts steht. Sie traegt Anbieter ('openai-native'), Basis-URL (Ollama, mit /v1) und einen Platzhalter als Schluessel; ein echter Schluessel steht nie darin. Sie ist fuer jedes Modell dieselbe, weil -m das Modell je Start ueberschreibt — gleiche Bauart wie shell/crushrc.default. Erzeugen laesst sie sich auch mit 'clite auth openai -b http://127.0.0.1:11434/v1 -m <modell> -k wb-lokal-ohne-schluessel'. Weil die Basis-URL darin auf Ollama zeigt, gilt dieser Harness-Eintrag AUSSCHLIESSLICH fuer lokale Modelle; ein Cloud-Anbieter braucht einen zweiten Eintrag, denn env und Anbieterdatei gehoeren dem Harness und nicht dem Modell. ROLLEN-PROMPT ueber AGENTS.md im ARBEITSVERZEICHNIS, und das ist zweimal gemessen: im nicht-interaktiven Lauf nannte der mitgeschriebene Gedankengang die Datei woertlich ('there is a note that says \"Das Kennwort dieses Arbeitsverzeichnisses lautet TANNENZAPFEN\"'), in der Oberflaeche antwortete die CLI auf die Frage nach dem Kennwort mit 'TANNENZAPFEN' und sagte dazu, es stehe 'in the system prompt'. Das Flag -s/--system nimmt einen TEXT und keinen Pfad und taugt deshalb nicht als Rollen-Weg aus der Registry; der Weg ueber die Datei ist der richtige. EFFORT: die CLI hat ein echtes Denkstufen-Flag, --thinking mit none|low|medium|high|xhigh — der erste lokale Harness mit einer Effort-Spur. Eingetragen sind low, medium, high und xhigh; 'none' ist bewusst nicht abgebildet, weil die Werkbank keine solche Stufe kennt, und 'max' ebenfalls nicht, weil die CLI sie nicht hat. Ob die Stufe bei einem Ollama-Modell wirklich etwas veraendert, ist NICHT gemessen (ornith:9b denkt ohnehin sichtbar); das Flag wird von der CLI aber angenommen, ohne zu klagen. AUTONOMIE ueber '--auto-approve true'. Laut eigener Hilfe ist true ohnehin die Vorgabe; ausgeschrieben steht es trotzdem da, damit ein spaeterer Vorgabewechsel den Worker nicht stillschweigend an jeder Freigabe anhaelt. In der Fusszeile ist der Zustand ablesbar: '⏵⏵ Auto-approve all enabled (Shift+Tab)' (gemessen). FORTSETZEN: NICHT moeglich, resume ist null. Die CLI kennt nur '--id <session-id>' und '--resume' ueber die Auswahl im laufenden Programm — eine feste Flagfolge, die 'die letzte Sitzung dieses Verzeichnisses' bedeutet, gibt es nicht, und eine Sitzungs-ID kann die Registry nicht kennen. Das ist kein Mangel des Eintrags, sondern der Stand der CLI: ein wiederbelebter cline-Pane kommt LEER zurueck. Wer es aendern will, braucht einen Weg, die zuletzt benutzte ID aus 'clite history' zu holen, und dafuer eine Stelle in wb-revive, nicht in der Registry. KOMPAKTIEREN mit /compact (aus der Befehlsliste der Oberflaeche, in dieser Messung nicht ausgeloest). NEBENWIRKUNG im Arbeitsverzeichnis: keine gesehen — Zustand und Verlauf liegen unter ~/.cline. NICHT benutzt: '-z/--zen' (Hintergrund-Hub), '--acp' (Editor-Anbindung), 'clite hub' und 'clite serve' — alles eigene Betriebsarten, die eine eigene Messung braeuchten.",
+      "notes": "Zweite Welle (2026-08-08). Installation ueber 'npm i -g @cline/cli'; npm meldet dabei, dass das postinstall-Skript uebersprungen wurde ('allow-scripts') — das ist folgenlos, das Skript legt nur einen Hardlink auf die schon entpackte Binaerdatei an, und 'clite --version' antwortete danach mit 0.0.13. Das Skript wurde vor der Installation gelesen; es tut nichts weiter. MITGELIEFERTE KONFIGURATION: shell/cline-providers.default.json gehoert nach ~/.cline-wb/settings/providers.json — in den Ordner, den '--data-dir {sessionDir}' bestellt, NICHT in das voreingestellte ~/.cline. Das ist gemessen und nicht Geschmackssache: dieselbe Datei unter ~/.cline/settings/providers.json UND unter ~/.cline/data/settings/providers.json (der Pfad, den die eigene Hilfe als Vorgabe nennt) liess die CLI trotzdem im Anmeldebildschirm stehen ('Connect a model provider to get started' mit 'Sign in with Cline' / 'Sign in with ChatGPT' / 'Bring your own provider'), und der Spawn scheiterte sichtbar nach 60 s; mit '--data-dir <ordner>' und der Datei unter <ordner>/settings/providers.json kam die Oberflaeche sofort. Der Ordner kommt aus sessionDir, weil der Aufloeser NUR dort die Tilde ausschreibt — wer eines von beiden aendert, aendert beide. Seit dem 10.08. haengt eine DRITTE Stelle daran: contextSession.path zeigt mit '~/.cline-wb/sessions/*/*.json' in denselben Ordner, dort schreibt die CLI ihre Tokenzahlen hin. Wandert das Datenverzeichnis, muessen alle drei mitwandern, sonst sucht die Kontextwache still an einem Ort, an dem nichts steht. Sie traegt Anbieter ('openai-native'), Basis-URL (Ollama, mit /v1) und einen Platzhalter als Schluessel; ein echter Schluessel steht nie darin. Sie ist fuer jedes Modell dieselbe, weil -m das Modell je Start ueberschreibt — gleiche Bauart wie shell/crushrc.default. Erzeugen laesst sie sich auch mit 'clite auth openai -b http://127.0.0.1:11434/v1 -m <modell> -k wb-lokal-ohne-schluessel'. Weil die Basis-URL darin auf Ollama zeigt, gilt dieser Harness-Eintrag AUSSCHLIESSLICH fuer lokale Modelle; ein Cloud-Anbieter braucht einen zweiten Eintrag, denn env und Anbieterdatei gehoeren dem Harness und nicht dem Modell. ROLLEN-PROMPT ueber AGENTS.md im ARBEITSVERZEICHNIS, und das ist zweimal gemessen: im nicht-interaktiven Lauf nannte der mitgeschriebene Gedankengang die Datei woertlich ('there is a note that says \"Das Kennwort dieses Arbeitsverzeichnisses lautet TANNENZAPFEN\"'), in der Oberflaeche antwortete die CLI auf die Frage nach dem Kennwort mit 'TANNENZAPFEN' und sagte dazu, es stehe 'in the system prompt'. Das Flag -s/--system nimmt einen TEXT und keinen Pfad und taugt deshalb nicht als Rollen-Weg aus der Registry; der Weg ueber die Datei ist der richtige. EFFORT: die CLI hat ein echtes Denkstufen-Flag, --thinking mit none|low|medium|high|xhigh — der erste lokale Harness mit einer Effort-Spur. Eingetragen sind low, medium, high und xhigh; 'none' ist bewusst nicht abgebildet, weil die Werkbank keine solche Stufe kennt, und 'max' ebenfalls nicht, weil die CLI sie nicht hat. Ob die Stufe bei einem Ollama-Modell wirklich etwas veraendert, ist NICHT gemessen (ornith:9b denkt ohnehin sichtbar); das Flag wird von der CLI aber angenommen, ohne zu klagen. AUTONOMIE ueber '--auto-approve true'. Laut eigener Hilfe ist true ohnehin die Vorgabe; ausgeschrieben steht es trotzdem da, damit ein spaeterer Vorgabewechsel den Worker nicht stillschweigend an jeder Freigabe anhaelt. In der Fusszeile ist der Zustand ablesbar: '⏵⏵ Auto-approve all enabled (Shift+Tab)' (gemessen). FORTSETZEN: NICHT moeglich, resume ist null. Die CLI kennt nur '--id <session-id>' und '--resume' ueber die Auswahl im laufenden Programm — eine feste Flagfolge, die 'die letzte Sitzung dieses Verzeichnisses' bedeutet, gibt es nicht, und eine Sitzungs-ID kann die Registry nicht kennen. Das ist kein Mangel des Eintrags, sondern der Stand der CLI: ein wiederbelebter cline-Pane kommt LEER zurueck. Wer es aendern will, braucht einen Weg, die zuletzt benutzte ID aus 'clite history' zu holen, und dafuer eine Stelle in wb-revive, nicht in der Registry. KOMPAKTIEREN mit /compact (aus der Befehlsliste der Oberflaeche, in dieser Messung nicht ausgeloest). NEBENWIRKUNG im Arbeitsverzeichnis: keine gesehen — Zustand und Verlauf liegen unter ~/.cline. NICHT benutzt: '-z/--zen' (Hintergrund-Hub), '--acp' (Editor-Anbindung), 'clite hub' und 'clite serve' — alles eigene Betriebsarten, die eine eigene Messung braeuchten. NACHGEMESSEN 2026-09-04 (Anlass: DIREKTWEG-BEFUND fand '--id <session-id>' aus 'clite --help'): eigener tmux-Socket, umgelenktes HOME, Modell qwen3:1.7b. Ein Merksatz ('Merke dir das Wort AMSEL') stand unveraendert in '<data-dir>/sessions/<id>/<id>.messages.json' vor UND nach einem harten 'kill -9' auf den Client-Prozess (Groesse identisch, 5096 Byte) — die Datei waechst also JE ZUG. 'clite --data-dir ~/.cline-wb -P openai-native -m qwen3:1.7b -i --id <id>' TRUG nach dem Kill: dieselbe Sitzung kam mit demselben Tokenstand zurueck, und die Gegenfrage 'Welches Wort solltest du dir merken?' wurde korrekt mit 'AMSEL' beantwortet. Damit ist '--id' als Flag beleget bestaetigt. Am Registry-Eintrag AENDERT DAS NICHTS: eine ID kennt die Registry weiterhin nicht im Voraus (siehe oben), und '{resumeId}' loest in wb-revive bis heute AUSSCHLIESSLICH fuer den Harness 'claude' auf (STATEDIR-Feld 'claudeSessionId', ausdruecklich harness-eigen benannt, siehe wb-revive/wb-state) — eine generische, harness-uebergreifende Aufloesung ueber das eigene 'session'-Feld dieses Eintrags existiert nicht und wurde in dieser Messung nicht gebaut, das war ausserhalb des Auftrags. resume bleibt deshalb null, mit staerkerem Beleg als zuvor, aber unveraendertem Ergebnis. NACHGEZOGEN 2026-09-06 (Auftrag reviveids): resume ist jetzt gesetzt statt null. wb-revive loest die Sitzungskennung je Harness auf (neuer Block resume.kennung, verfahren=cline-sessions, ort=~/.cline-wb/sessions/*/*.json): es liest cwd und started_at je Sitzung und nimmt die Unterhaltung DIESES Panes (gleiches Arbeitsverzeichnis, entstanden zwischen @wb_started und pane_dead_time). Gemessen auf eigenem Socket wbtest-reviveids, umgelenktes HOME, qwen3:1.7b: ein Worker mit Merkwort AMSEL, sauberes Ende UND kill -9, kam beide Male ueber 'clite --id <id>' mit derselben session-id zurueck, und die Gegenfrage wurde mit AMSEL beantwortet (messages.json der Sitzung). fallbackArgs entfaellt: clite hat kein '--continue', ohne Kennung kommt der Pane leer zurueck und sagt es. probe bleibt revive-only (der erste Spawn bekommt kein --id); die Messung steht hier in notes, weil probe ein Enum ist und keine zwei Panes desselben Verzeichnisses unter einem HOME sich verwechseln duerfen — genau das prueft test-harness-wiederbelebung.sh Abschnitt 9.",
       "discover": {
         "source": "ollama",
         "provider": "ollama",
@@ -1751,7 +1775,13 @@
       "autonomy": {
         "args": []
       },
-      "resume": null,
+      "resume": {
+        "args": [
+          "--resume",
+          "--last"
+        ],
+        "probe": "revive-only"
+      },
       "readyPattern": "\\^a Select all",
       "promptPattern": "^[[:space:]]*│",
       "promptIgnore": "^[[:space:]]*│[[:space:]]+Type your message, @mention a file",
@@ -1783,9 +1813,9 @@
       ],
       "supportsPaste": true,
       "altScreen": true,
-      "probe": "gemessen 2026-08-08 mit OpenHands CLI v1.16.0 / SDK v1.21.0 auf eigenem tmux-Socket mit PID im Namen, umgelenktem HOME, Modell ornith:9b ueber Ollama. OHNE DOCKER, und das war die Frage: die Oberflaeche startet und arbeitet ohne jeden Container — Docker braucht nur der Unterbefehl 'serve' (die grafische Oberflaeche im Browser), und der wird hier nicht benutzt. Auf dieser Maschine ist Docker nicht einmal installiert ('docker' nicht gefunden), und die CLI kam trotzdem hoch, beantwortete einen Auftrag und meldete '▶ Loaded: 7 tools, system prompt'. DAS PAKET HEISST 'openhands', NICHT 'openhands-ai': 'uv tool install openhands-ai' laeuft durch und bricht am Ende ab mit 'No executables are provided by package openhands-ai; removing tool'. 'uv tool install openhands' liefert die beiden Programme 'openhands' und 'openhands-acp'. ZWEI FLAGS ENTSCHEIDEN ueber den Erststart, und beide muessen dran sein. Ohne '--override-with-envs' ignoriert die CLI die LLM_-Variablen und oeffnet einen EINRICHTUNGS-DIALOG ueber dem Bildschirm ('LLM Model:' mit einer Auswahlliste, 'API Key:' mit einem Eingabefeld, darunter 'Save / Cancel') — gemessen, und ein Spawn bliebe darin stehen. MIT dem Flag meldet sie 'All set up!' und 'Initialized conversation <id>' und zeigt die Eingabezeile. '--always-approve' ist die Autonomie. READY: NICHT die Eingabebox, sondern die unterste Tastenzeile. Der Grund ist gemessen: der Einrichtungs-Dialog liegt als Fenster UEBER dem normalen Bildschirm, und die Eingabebox samt ihrem Rahmen ist daneben weiterhin sichtbar — ein Muster auf die Box traefe also mitten im Dialog und der Auftrag verschwaende in einem Eingabefeld fuer einen Schluessel. Genau der Fehler, an dem agy gescheitert ist. Die Tastenzeile dagegen WECHSELT mit dem Zustand: im Dialog steht dort '^c Exit  esc Cancel', im normalen Betrieb '^a Select all  ^x Open external editor  ^l Toggle single/multi-line input …'. Deshalb readyPattern '\\^a Select all'. Nachgemessen an allen aufgezeichneten Bildschirmen: die Zeile steht im LEEREN, im GETIPPTEN und im ARBEITENDEN Zustand da und im Dialog nicht. Die drei Zustaende der Eingabebox selbst, ebenfalls gemessen: LEER '│ Type your message, @mention a file, or / for commands' — ein Platzhalter; GETIPPT '│ wie lautet das Kennwort dieses Arbeitsverzeichnisses? antworte nur mit dem Wort.'; WAEHREND DER ANTWORT wieder der Platzhalter, und darueber eine Zeile '⠧ Working (4s • ESC: pause)'. promptPattern '^[[:space:]]*│' trifft nur die Textzeile der Box (Ober- und Unterkante sind mit '╭' und '╰' gezeichnet, nicht mit '│'), und die Pruefung von pi-worker erkennt den getippten Text damit richtig als 'haengt noch'. promptIgnore faengt den Platzhalter. EINEN VERTRAUENSDIALOG stellt die CLI nicht, und einen Anmeldedialog auch nicht (die Anmeldung 'openhands login' gilt der Cloud und wird hier nicht benutzt) — im frischen HOME kam nach den beiden Flags unmittelbar die Oberflaeche. Ein trustStore-Block ist deshalb nicht noetig, und das ist gemessen.",
+      "probe": "gemessen 2026-08-08 mit OpenHands CLI v1.16.0 / SDK v1.21.0 auf eigenem tmux-Socket mit PID im Namen, umgelenktem HOME, Modell ornith:9b ueber Ollama. OHNE DOCKER, und das war die Frage: die Oberflaeche startet und arbeitet ohne jeden Container — Docker braucht nur der Unterbefehl 'serve' (die grafische Oberflaeche im Browser), und der wird hier nicht benutzt. Auf dieser Maschine ist Docker nicht einmal installiert ('docker' nicht gefunden), und die CLI kam trotzdem hoch, beantwortete einen Auftrag und meldete '▶ Loaded: 7 tools, system prompt'. DAS PAKET HEISST 'openhands', NICHT 'openhands-ai': 'uv tool install openhands-ai' laeuft durch und bricht am Ende ab mit 'No executables are provided by package openhands-ai; removing tool'. 'uv tool install openhands' liefert die beiden Programme 'openhands' und 'openhands-acp'. ZWEI FLAGS ENTSCHEIDEN ueber den Erststart, und beide muessen dran sein. Ohne '--override-with-envs' ignoriert die CLI die LLM_-Variablen und oeffnet einen EINRICHTUNGS-DIALOG ueber dem Bildschirm ('LLM Model:' mit einer Auswahlliste, 'API Key:' mit einem Eingabefeld, darunter 'Save / Cancel') — gemessen, und ein Spawn bliebe darin stehen. MIT dem Flag meldet sie 'All set up!' und 'Initialized conversation <id>' und zeigt die Eingabezeile. '--always-approve' ist die Autonomie. READY: NICHT die Eingabebox, sondern die unterste Tastenzeile. Der Grund ist gemessen: der Einrichtungs-Dialog liegt als Fenster UEBER dem normalen Bildschirm, und die Eingabebox samt ihrem Rahmen ist daneben weiterhin sichtbar — ein Muster auf die Box traefe also mitten im Dialog und der Auftrag verschwaende in einem Eingabefeld fuer einen Schluessel. Genau der Fehler, an dem agy gescheitert ist. Die Tastenzeile dagegen WECHSELT mit dem Zustand: im Dialog steht dort '^c Exit  esc Cancel', im normalen Betrieb '^a Select all  ^x Open external editor  ^l Toggle single/multi-line input …'. Deshalb readyPattern '\\^a Select all'. Nachgemessen an allen aufgezeichneten Bildschirmen: die Zeile steht im LEEREN, im GETIPPTEN und im ARBEITENDEN Zustand da und im Dialog nicht. Die drei Zustaende der Eingabebox selbst, ebenfalls gemessen: LEER '│ Type your message, @mention a file, or / for commands' — ein Platzhalter; GETIPPT '│ wie lautet das Kennwort dieses Arbeitsverzeichnisses? antworte nur mit dem Wort.'; WAEHREND DER ANTWORT wieder der Platzhalter, und darueber eine Zeile '⠧ Working (4s • ESC: pause)'. promptPattern '^[[:space:]]*│' trifft nur die Textzeile der Box (Ober- und Unterkante sind mit '╭' und '╰' gezeichnet, nicht mit '│'), und die Pruefung von pi-worker erkennt den getippten Text damit richtig als 'haengt noch'. promptIgnore faengt den Platzhalter. EINEN VERTRAUENSDIALOG stellt die CLI nicht, und einen Anmeldedialog auch nicht (die Anmeldung 'openhands login' gilt der Cloud und wird hier nicht benutzt) — im frischen HOME kam nach den beiden Flags unmittelbar die Oberflaeche. Ein trustStore-Block ist deshalb nicht noetig, und das ist gemessen. FORTSETZEN GEMESSEN 2026-09-05 (Auftrag fortsetzen): echter pi-worker-Spawn (openhands-ornith-9b, Auftrag 'Merke dir das Merkwort ZIRBELKIEFER') auf eigenem tmux-Socket wbtest-fortsetzen-<pid> mit umgelenktem HOME (auch in der tmux-Serverumgebung, siehe notes), Antwort 'Gemerkt: ZIRBELKIEFER', Sitzung 49b6aa9c… unter <HOME>/.openhands/conversations/. Dann ZWEI Neustarts ueber den echten Revive-Weg (wb-harness-run --resume-args '--resume --last', Startzeile 'openhands --resume --last --always-approve --override-with-envs'): (1) nach sauberem /exit und (2) nach kill -9 des Python-Prozesses. Beide Male 'Initialized conversation 49b6aa9c…' (dieselbe Kennung, keine neue), und die Frage 'Welches Merkwort habe ich dir genannt?' bzw. 'Nenne mir nochmals das Merkwort' wurde mit genau 'ZIRBELKIEFER' beantwortet; ctx sprang nach der ersten Antwort auf 17.7K (Verlauf geladen). Ohne die Flags legte derselbe Weg eine neue Unterhaltung an (7357559a…), also traegt das Flag und nicht der Zufall.",
       "contextProbe": "gemessen 2026-08-08, gleiche Sitzung: die OpenHands CLI zeigt ihre Auslastung in der vorletzten Zeile, rechtsbuendig — vor dem ersten Zug 'ctx N/A • $ 0.00 (↑ 0 ↓ 0 cache N/A)', danach 'ctx 12.85K • $ 0.00'. Das ist eine ABSOLUTE Tokenzahl ohne Nenner: keine Fenstergroesse, kein Prozentwert, kein Balken. Der Vertrag der Kontextwache verlangt aber, dass die erste Gruppe des contextPattern eine Auslastung in PROZENT faengt; aus '12.85K' laesst sich die nicht bilden, ohne die Fenstergroesse dazuzuerfinden. contextPattern bleibt deshalb leer, und das ist ein Messergebnis. Eine Sitzungsdatei mit Tokenzahlen wurde in dieser Messung NICHT gesucht — die Zeit reichte nicht; die CLI fuehrt sichtbar Unterhaltungen mit eigener Kennung ('Initialized conversation e458221af019…') und legt sie unter dem Heimatverzeichnis ab. NACHGEHOLT 2026-08-10, und dort war sie: ~/.openhands/conversations/<id>/base_state.json fuehrt unter stats.usage_to_metrics.agent.token_usages je LLM-Aufruf prompt_tokens und completion_tokens mit, dazu unter workspace.working_dir das Arbeitsverzeichnis in AUFGELOESTER Schreibweise ('/private/tmp/...') — die Zuordnung zum Pane laeuft darueber, wie bei codex. Geschrieben wird JE ZUG und bei lebendem Prozess (nachgemessen mit zwei Zuegen: mtime 19:11:08 nach dem ersten, 19:11:30 nach dem zweiten). Gegengeprueft an der Fusszeile: sie zeigte 'ctx 11.88K' zu prompt_tokens 11878 und 'ctx 11.9K' zu 11903 — die Anzeige nennt also nur den EINGANG, waehrend die Wache prompt + completion rechnet (11973 bzw. 12028), wie bei crush, gptme und copilot. NICHT genommen wird accumulated_token_usage daneben: das ist die Summe ueber alle Zuege und stuende nach drei Zuegen beim Dreifachen des Kontextstands. Der Nenner kommt aus contextWindow des Modells: das Feld context_window in der Datei ist bei einem Ollama-Modell hinter dem OpenAI-Endpunkt 0. Damit ist dieser Harness BEWACHT (Format 'openhands-state'). Zu wissen ist ausserdem: der erste Zug startet nicht bei null — schon die Frage nach einem Kennwort stand bei 12,85k Token, die CLI laedt vorher '57 skills' und '7 tools'.",
-      "notes": "Zweite Welle (2026-08-08). Installation ueber 'uv tool install openhands' (NICHT openhands-ai, siehe probe). MODELLWAHL ueber die Umgebung: LLM_MODEL in LiteLLM-Schreibweise mit dem Anbieter-Praefix, hier 'openai/<modell>', dazu LLM_BASE_URL auf den OpenAI-kompatiblen Endpunkt von Ollama (muss auf /v1 enden) und LLM_API_KEY mit einem Platzhalter, weil der lokale Server keinen Schluessel prueft; ein echter Schluessel steht hier nie. Wirksam werden die drei nur zusammen mit '--override-with-envs' (siehe probe). Weil LLM_BASE_URL auf Ollama zeigt, gilt dieser Harness-Eintrag AUSSCHLIESSLICH fuer lokale Modelle — ein Cloud-Anbieter braucht einen zweiten Eintrag, denn env gehoert dem Harness und nicht dem Modell. ROLLEN-PROMPT ueber AGENTS.md im ARBEITSVERZEICHNIS (systemPrompt.style file mit projectPath). Gemessen mit einer AGENTS.md, die ein Kennwort trug: die CLI antwortete mit genau diesem Wort ('TANNENZAPFEN'). AUTONOMIE ueber '--always-approve' in args und NICHT ueber autonomy.args: das Flag muss schon beim Erststart dran sein, sonst haelt die CLI an der ersten Werkzeugfreigabe an, und es steht in derselben festen Startzeile wie '--override-with-envs'. Folge, die in die Routing-Tabelle gehoert: der Schalter workerSkipPermissions erreicht diesen Harness NICHT — die Autonomie steht fest, wie bei goose und nanocoder. FORTSETZEN: resume ist null, und das ist eine Entscheidung nach einer unklaren Messung, keine Auslassung. Die CLI hat '--last' und '--resume [id]'. Gemessen: ein Start OHNE Flag legt eine frische Unterhaltung an ('Initialized conversation e458221a…') — der erste Spawn ist also sauber. Ein Start MIT '--last' nannte dieselbe Kennung wie der unmittelbar vorangegangene Start, zeigte aber KEINEN alten Verlauf im Bild. Damit ist die dritte Stufe des Dreiklangs (der Verlauf muss sichtbar zurueckkommen) NICHT belegt, und ein Flag, dessen Wirkung nicht belegt ist, gehoert nicht in die Registry. Folge: ein wiederbelebter openhands-Pane kommt leer zurueck. Wer es aendern will, misst '--last' gegen eine Unterhaltung mit echtem Verlauf. EFFORT: kein Flag gesehen, style 'none'. KOMPAKTIEREN mit /compact (aus der Befehlsliste der Oberflaeche, in dieser Messung nicht ausgeloest). NICHT benutzt werden 'openhands serve' (grafische Oberflaeche, braucht Docker), 'openhands web', 'openhands cloud' und 'openhands acp' — eigene Betriebsarten mit eigener Messung. SPAWN-BELEG NACHGEHOLT (2026-08-09): ein echter pi-worker-Lauf (openhands-ornith-9b, Auftrag 'schreibe das Wort BEREIT und sonst nichts') scheitert an der Absende-Pruefung von pi-worker — Exit 1, 'Prompt haengt noch in der Inputbox'. URSACHE, am Pane nachgemessen: der eingefuegte Text ist DREIZEILIG (Auftrag, Leerzeile, das eingebettete [Protokoll]-Kommando, das pi-worker jedem Auftrag anhaengt), und OpenHands schaltet bei einem mehrzeiligen Paste selbststaendig in einen 'Multi-line'-Eingabemodus um — die Fusszeile wechselt von '[Ctrl+L for multi-line ...]' auf '[Multi-line: Ctrl+J to submit ...]' — und darin fuegt Enter eine neue Zeile ein statt abzusenden. pi-worker sendet aber ausschliesslich Enter, fest verdrahtet und harnessunabhaengig. Nachgewiesen per Hand: ein zusaetzliches Ctrl+J auf denselben, bereits haengenden Pane hat sofort abgesendet; die CLI hat daraufhin gearbeitet und die Ergebnisdatei mit genau 'BEREIT' geschrieben. Env, Modellrouting und der Rollen-Weg ueber AGENTS.md sind damit fuer den ECHTEN Lauf bestaetigt — nur die Absende-Taste passt nicht. Das ist ein Fehler in pi-worker (Enter ist bei mehrzeiligen Auftraegen kein universeller Absende-Schluessel), keiner in diesem Registry-Eintrag; eine Korrektur wuerde die gemeinsame Absende-Logik aller 15 Harnesses aendern und liegt ausserhalb dieser Aufgabe. DER VORBEHALT IST BEHOBEN (2026-08-09): pi-worker erkennt jetzt je Harness einen zweiten Absende-Weg (Registry-Feld altSubmit: trigger/key) und sendet ihn NUR, wenn die Fusszeile den Mehrzeilen-Hinweis dieses Harness tatsaechlich zeigt — hier trigger 'Multi-line: Ctrl\\+J to submit', key 'C-j'. Nachgemessen mit einem echten, unbeaufsichtigten pi-worker-Lauf (Modell openhands-ornith-9b, Auftrag 'schreibe das Wort BEREIT und sonst nichts', eigener tmux-Socket, umgelenktes HOME): pi-worker meldete 'Fusszeile zeigt den zweiten Absende-Weg dieses Harness an — sende 'C-j' statt Enter' und danach 'Submission verifiziert', ohne dass jemand von Hand nachgeholfen hat. Die Ergebnisdatei enthielt anschliessend genau 'BEREIT'. (Zwei Versuche im selben, bereits gefuellten Gespraech blieben ohne Dateischreibvorgang — das Modell antwortete nur im Chat, ohne ein Werkzeug aufzurufen; im FRISCHEN Gespraech, der ersten Nachricht, hat es zuverlaessig geschrieben. Das ist ein Befund zum Modellverhalten in einem laengeren Gespraech, kein Absende-Fehler mehr.) Aufraeumen nach der Messung: der Pane wurde ueber wb-close geschlossen, und OpenHands' EIGENER tmux-Server (immer '-Lopenhands', ein Pool-Server fuer Werkzeugausfuehrung) wurde per 'tmux -Lopenhands kill-server' beendet und als weg verifiziert — er ueberlebt das Schliessen des Panes NICHT von selbst.",
+      "notes": "Zweite Welle (2026-08-08). Installation ueber 'uv tool install openhands' (NICHT openhands-ai, siehe probe). MODELLWAHL ueber die Umgebung: LLM_MODEL in LiteLLM-Schreibweise mit dem Anbieter-Praefix, hier 'openai/<modell>', dazu LLM_BASE_URL auf den OpenAI-kompatiblen Endpunkt von Ollama (muss auf /v1 enden) und LLM_API_KEY mit einem Platzhalter, weil der lokale Server keinen Schluessel prueft; ein echter Schluessel steht hier nie. Wirksam werden die drei nur zusammen mit '--override-with-envs' (siehe probe). Weil LLM_BASE_URL auf Ollama zeigt, gilt dieser Harness-Eintrag AUSSCHLIESSLICH fuer lokale Modelle — ein Cloud-Anbieter braucht einen zweiten Eintrag, denn env gehoert dem Harness und nicht dem Modell. ROLLEN-PROMPT ueber AGENTS.md im ARBEITSVERZEICHNIS (systemPrompt.style file mit projectPath). Gemessen mit einer AGENTS.md, die ein Kennwort trug: die CLI antwortete mit genau diesem Wort ('TANNENZAPFEN'). AUTONOMIE ueber '--always-approve' in args und NICHT ueber autonomy.args: das Flag muss schon beim Erststart dran sein, sonst haelt die CLI an der ersten Werkzeugfreigabe an, und es steht in derselben festen Startzeile wie '--override-with-envs'. Folge, die in die Routing-Tabelle gehoert: der Schalter workerSkipPermissions erreicht diesen Harness NICHT — die Autonomie steht fest, wie bei goose und nanocoder. FORTSETZEN: resume ist null, und das ist eine Entscheidung nach einer unklaren Messung, keine Auslassung. Die CLI hat '--last' und '--resume [id]'. Gemessen: ein Start OHNE Flag legt eine frische Unterhaltung an ('Initialized conversation e458221a…') — der erste Spawn ist also sauber. Ein Start MIT '--last' nannte dieselbe Kennung wie der unmittelbar vorangegangene Start, zeigte aber KEINEN alten Verlauf im Bild. Damit ist die dritte Stufe des Dreiklangs (der Verlauf muss sichtbar zurueckkommen) NICHT belegt, und ein Flag, dessen Wirkung nicht belegt ist, gehoert nicht in die Registry. Folge: ein wiederbelebter openhands-Pane kommt leer zurueck. Wer es aendern will, misst '--last' gegen eine Unterhaltung mit echtem Verlauf. EFFORT: kein Flag gesehen, style 'none'. KOMPAKTIEREN mit /compact (aus der Befehlsliste der Oberflaeche, in dieser Messung nicht ausgeloest). NICHT benutzt werden 'openhands serve' (grafische Oberflaeche, braucht Docker), 'openhands web', 'openhands cloud' und 'openhands acp' — eigene Betriebsarten mit eigener Messung. SPAWN-BELEG NACHGEHOLT (2026-08-09): ein echter pi-worker-Lauf (openhands-ornith-9b, Auftrag 'schreibe das Wort BEREIT und sonst nichts') scheitert an der Absende-Pruefung von pi-worker — Exit 1, 'Prompt haengt noch in der Inputbox'. URSACHE, am Pane nachgemessen: der eingefuegte Text ist DREIZEILIG (Auftrag, Leerzeile, das eingebettete [Protokoll]-Kommando, das pi-worker jedem Auftrag anhaengt), und OpenHands schaltet bei einem mehrzeiligen Paste selbststaendig in einen 'Multi-line'-Eingabemodus um — die Fusszeile wechselt von '[Ctrl+L for multi-line ...]' auf '[Multi-line: Ctrl+J to submit ...]' — und darin fuegt Enter eine neue Zeile ein statt abzusenden. pi-worker sendet aber ausschliesslich Enter, fest verdrahtet und harnessunabhaengig. Nachgewiesen per Hand: ein zusaetzliches Ctrl+J auf denselben, bereits haengenden Pane hat sofort abgesendet; die CLI hat daraufhin gearbeitet und die Ergebnisdatei mit genau 'BEREIT' geschrieben. Env, Modellrouting und der Rollen-Weg ueber AGENTS.md sind damit fuer den ECHTEN Lauf bestaetigt — nur die Absende-Taste passt nicht. Das ist ein Fehler in pi-worker (Enter ist bei mehrzeiligen Auftraegen kein universeller Absende-Schluessel), keiner in diesem Registry-Eintrag; eine Korrektur wuerde die gemeinsame Absende-Logik aller 15 Harnesses aendern und liegt ausserhalb dieser Aufgabe. DER VORBEHALT IST BEHOBEN (2026-08-09): pi-worker erkennt jetzt je Harness einen zweiten Absende-Weg (Registry-Feld altSubmit: trigger/key) und sendet ihn NUR, wenn die Fusszeile den Mehrzeilen-Hinweis dieses Harness tatsaechlich zeigt — hier trigger 'Multi-line: Ctrl\\+J to submit', key 'C-j'. Nachgemessen mit einem echten, unbeaufsichtigten pi-worker-Lauf (Modell openhands-ornith-9b, Auftrag 'schreibe das Wort BEREIT und sonst nichts', eigener tmux-Socket, umgelenktes HOME): pi-worker meldete 'Fusszeile zeigt den zweiten Absende-Weg dieses Harness an — sende 'C-j' statt Enter' und danach 'Submission verifiziert', ohne dass jemand von Hand nachgeholfen hat. Die Ergebnisdatei enthielt anschliessend genau 'BEREIT'. (Zwei Versuche im selben, bereits gefuellten Gespraech blieben ohne Dateischreibvorgang — das Modell antwortete nur im Chat, ohne ein Werkzeug aufzurufen; im FRISCHEN Gespraech, der ersten Nachricht, hat es zuverlaessig geschrieben. Das ist ein Befund zum Modellverhalten in einem laengeren Gespraech, kein Absende-Fehler mehr.) Aufraeumen nach der Messung: der Pane wurde ueber wb-close geschlossen, und OpenHands' EIGENER tmux-Server (immer '-Lopenhands', ein Pool-Server fuer Werkzeugausfuehrung) wurde per 'tmux -Lopenhands kill-server' beendet und als weg verifiziert — er ueberlebt das Schliessen des Panes NICHT von selbst. NACHGEMESSEN 2026-09-04 (Anlass: DIREKTWEG-BEFUND fand '--resume [ID]'/'--last' aus '--help'): eigener tmux-Socket, umgelenktes HOME, Modell qwen3:1.7b. Ein Merksatz ('Merke dir das Wort AMSEL') stand unveraendert in '<HOME>/.openhands/conversations/<id>/base_state.json' vor UND nach einem harten 'kill -9' auf den Client-Prozess (Groesse identisch, 448028 Byte) — die Datei waechst also JE ZUG. 'openhands --always-approve --override-with-envs --resume <id>' nach dem Kill zeigte 'ctx N/A' (kein geladener Verlauf im Bild, wie schon am 08.08. mit '--last' gemessen) und ANTWORTETE auf die Gegenfrage 'Welches Wort solltest du dir merken?' NICHT mit 'AMSEL', sondern mit der rohen, unaufgeloesten Werkzeugaufruf-Zeichenkette '{\"name\": \"finish\", \"arguments\": {\"message\": \"OK\"}}' — das Wort kam NICHT zurueck, und die Antwort zeigt zusaetzlich, dass der resumierte Zustand die Modell/Werkzeug-Schleife durcheinanderbrachte statt sie nur fortzusetzen. Trotzdem verdoppelte sich der Tokenstand ungefaehr (12,16K vor dem Kill, 24,35K nach der Gegenfrage) — irgendein Zustand wurde also mitgeschleppt, nur nicht nutzbar. Damit ist der schon am 08.08. vorsichtig formulierte Befund ('dritte Stufe des Dreiklangs nicht belegt') jetzt mit einem echten Fehlschlag direkt belegt: resume bleibt null. FORTSETZEN, NEU 2026-09-05: resume ist NICHT mehr null. Die Messungen vom 08.08. und 04.09. prueften '--last' ohne echten Verlauf bzw. '--resume <id>' nach Kill-9 mit qwen3:1.7b und sahen kein Merkwort. Heute mit ornith:9b und dem ID-freien Paar '--resume --last' kam das Merkwort nach sauberem Ende UND nach Kill-9 zurueck (Beleg in probe). Der Fehlschlag vom 04.09. war also ein Modellfehler des 1,7B-Modells (roher Werkzeugaufruf), kein Harnessfehler. probe 'revive-only' wie bei goose: der erste Spawn bekommt die Flags nicht (sonst erbte er die letzte Unterhaltung des HOME), wb-revive haengt sie beim Wiederbeleben an. '--last' meint die JUENGSTE Unterhaltung unter ~/.openhands/conversations, nicht die des Arbeitsverzeichnisses — bei zwei openhands-Panes unter demselben HOME kann ein Revive die falsche erwischen; eine Aufloesung ueber die eigene Kennung braeuchte die generische {resumeId}-Aufloesung, die es nur fuer claude gibt. MESSFALLE, gemessen 2026-09-05: ein tmux-Testserver, der mit dem echten HOME gestartet wurde, gibt jedem Pane das echte HOME, auch wenn pi-worker selbst mit umgelenktem HOME lief — openhands schrieb dann nach ~/.openhands/conversations. Abhilfe: HOME VOR new-session exportieren (wie lib-zustellbett.sh) oder 'tmux set-environment -g HOME'.",
       "discover": {
         "source": "ollama",
         "provider": "ollama",
@@ -1827,7 +1857,18 @@
       "autonomy": {
         "args": []
       },
-      "resume": null,
+      "resume": {
+        "args": [
+          "--conversation-id",
+          "{resumeId}"
+        ],
+        "probe": "revive-only",
+        "anker": "forge",
+        "kennung": {
+          "verfahren": "forge-sqlite",
+          "ort": "~/.forge/.forge.db"
+        }
+      },
       "readyPattern": "^󰄾",
       "promptPattern": "^󰄾",
       "promptIgnore": null,
@@ -1864,7 +1905,7 @@
       "altScreen": false,
       "probe": "gemessen 2026-08-09 mit Forge CLI 2.13.21 (npm i -g @antinomyhq/forge, Befehl 'forge' — das npm-Postinstall-Skript install.js waehlt nur die passende Plattform-Binaerdatei aus einem bereits mitgelieferten Satz aus und wurde von npm wegen 'allow-scripts' uebersprungen; 'forge --version' lief trotzdem sofort, das Skript wurde vorher gelesen und enthaelt nur Plattformerkennung, keinen Netzzugriff). Gemessen auf eigenem tmux-Socket mit PID im Namen, umgelenktem HOME, Modell ornith:9b ueber Ollama. KEIN CLI-FLAG FUER DAS MODELL: anders als bei allen 15 bisherigen Harnesses gibt es kein '-m/--model'; die Modellwahl ist ZUSTANDSBEHAFTET ueber 'forge config set model <anbieter> <modell>' in ~/.forge/.forge.toml, global fuer die ganze Maschine und NICHT je Prozess. Deshalb ist 'command' hier '/bin/sh' und 'args' ein '-c'-Einzeiler, der den Zustand vor jedem Start explizit auf das bestellte Modell UND die bestellte Denkstufe setzt und danach 'exec forge' aufruft — ohne dieses Vorschalten wuerde ein zweiter, gleichzeitig gestarteter Worker mit einem anderen Modell den ersten stillschweigend umschalten (gemessen: das Umschalten wirkt sofort und maschinenweit). ANBIETER 'ollama' ist ein EIGENER, ohne jeden Schluessel funktionierender Provider-Typ von Forge selbst (in 'forge provider list' unter OLLAMA gelistet, neben OpenAI, Anthropic, OpenRouter, LM_Studio, Llama.cpp und rund 30 weiteren) — 'forge config set model ollama {model}' fragt NUR beim ALLERERSTEN Mal interaktiv nach OLLAMA_SSL_SCHEME/OLLAMA_HOST/OLLAMA_PORT/API-Key (Menue- bzw. Texteingaben, mit Enter fuer den Vorgabewert 'http' und leerer Eingabe fuer 'kein Schluessel' beantwortet); danach steht der Anbieter in ~/.forge/.credentials.json und jeder weitere Aufruf laeuft ohne Rueckfrage durch — siehe configFiles. READY: die Eingabezeile ist EINZEILIG und beginnt mit einem Nerd-Font-Symbol aus dem Private-Use-Bereich (U+F013E, UTF-8 vierbyte-kodiert; kein Rahmen, kein Platzhaltertext dahinter — im LEEREN Zustand steht dort NUR das Symbol, sonst nichts), deshalb readyPattern '^e'. Nachgerechnet mit demselben grep -E, den pi-worker benutzt: das Muster trifft die Zeile in allen DREI gemessenen Zustaenden (leer: nur das Symbol; getippt: Symbol + Leerzeichen + Text, auch mehrzeilig eingefuegter Text bleibt auf der ERSTEN Zeile hinter dem Symbol und die Folgezeilen tragen KEIN Symbol, siehe promptPattern-Anmerkung; waehrend der Antwort: wieder nur das Symbol, waehrend darueber '⠏ Forging/Contemplating/Processing NNs · Ctrl+C to interrupt' steht) — und es trifft NICHT den Bannerbildschirm beim Start (Initialisierung dauert unter 0,2 s, in 0,1-s-Schritten abgetastet: bei 0,1 s noch kein Symbol, ab 0,2 s durchgehend da) und NICHT die beiden Erststart-Dialoge von 'forge provider login'/'forge config set model' (Menueauswahl mit '❯'/'▌' bzw. Textfragen '? Enter …' — ein voellig anderes, nicht-Symbol-basiertes Layout, nachgemessen an den aufgezeichneten Bildschirmen dieser beiden Dialoge). promptPattern ist DASSELBE Muster wie readyPattern: die Absende-Pruefung von pi-worker nimmt die LETZTE Zeile, auf die es passt, und weil nur die ERSTE Zeile eines mehrzeiligen Einfuegens das Symbol traegt, waehlt 'grep -E … | tail -1' bei getipptem Text richtig genau diese eine Zeile — anders als bei nanocoder (wo '^┃' allein die leere Randzeile getroffen haette) gibt es hier keine zweite, tiefere Zeile mit demselben Anfangszeichen, also auch keine Notwendigkeit fuer ein engeres Muster oder promptIgnore. KEIN VERTRAUENSDIALOG: ein foellig neues, nie gesehenes Arbeitsverzeichnis startete ohne jede Rueckfrage direkt in die Eingabezeile (gemessen). KEINE FREIGABE-RUECKFRAGEN: ein Auftrag, der ausdruecklich ein Werkzeug zum Anlegen einer Datei verlangte, wurde OHNE jede Bestaetigung ausgefuehrt (Datei stand danach mit dem verlangten Inhalt da) — Forge ist also von Haus aus autonom, autonomy.args bleibt leer und es gibt keinen erkennbaren Gegenschalter in der Hilfe ('-r/--restricted' steht zwar in einer aelteren README-Fassung, taucht aber in 'forge --help' 2.13.21 nicht mehr auf; 'restricted = false' als Konfigurationswert wurde nicht angetastet, weil seine Wirkung nicht gemessen ist).",
       "contextProbe": "gemessen 2026-08-09, gleiche Sitzung: die Fusszeile zeigt nach dem ersten Zug einen ABSOLUTEN Tokenwert direkt hinter dem Modellnamen ('FORGE 12.1k  ornith:9b MEDIUM'), vor dem ersten Zug faellt das Feld ganz weg. Wie bei cline und openhands gibt es KEINEN Nenner auf dem Bildschirm — keine Fenstergroesse, kein Prozentwert —, und contextPattern bleibt deshalb leer; eine erfundene Prozentzahl waere schlimmer als keine. Eine zweite Quelle wurde gezielt gesucht: ~/.forge/.forge.db (SQLite) fuehrt eine Tabelle 'conversations' mit einer Spalte 'metrics' (JSON) und einer Spalte 'context' (JSON, die volle Nachrichtenliste inklusive Systemprompt) — nachgesehen an einer echten Sitzung trug 'metrics' nur 'started_at' und 'files_changed', keine einzige Tokenzahl; 'context' traegt den Systemprompt und die Nachrichten im Klartext, ebenfalls ohne Tokenzahl. contextSession bleibt deshalb leer, und das ist ein Messergebnis: ein forge-Worker ist bezueglich der Kontextwache UNBEWACHT, genau wie cline und openhands.",
-      "notes": "Dritte Welle (2026-08-09), erster von drei neu integrierten Harnesses dieser Runde. Installation ueber 'npm i -g @antinomyhq/forge'. ROLLEN-PROMPT ueber AGENTS.md im ARBEITSVERZEICHNIS, aber ANDERS ALS BEHAUPTET dokumentiert: eine Web-Dokumentation nennt AGENTS.md als Ort fuer 'persistent instructions', OHNE zu sagen, DASS der Inhalt automatisch in den Systemprompt wandert. Selbst nachgemessen (SQLite-Spalte 'context' einer echten Sitzung ausgelesen): der Inhalt von AGENTS.md landet als EIGENE zweite System-Nachricht in einem '<project_guidelines>'-Block, VOR jeder Nutzernachricht — der erste Testlauf mit ornith:9b antwortete auf die Kennwortfrage trotzdem falsch und verwirrt (Modell verlor sich in einer langen, durch mehrere Testfragen VERSCHACHTELTEN Unterhaltung und erfand einen nicht existierenden Dateinamen); eine FRISCHE, unverschachtelte Unterhaltung mit derselben Frage traf die richtige Antwort ('TANNENZAPFEN') sofort und nannte die Quelle ('project_guidelines section'). Das ist ein Befund ueber ornith:9b in einer langen Sitzung, kein Fehler an AGENTS.md — mit einer neuen Unterhaltung ist der Rollen-Weg zuverlaessig. AUTONOMIE ist die VORGABE (siehe probe); autonomy.args bleibt leer. EFFORT: 'forge config set reasoning-effort <stufe>' kennt GENAU das Vokabular der Werkbank (none, minimal, low, medium, high, xhigh, max — laut '--help', keine Erfindung) und ist damit der VOLLSTAENDIGSTE Denkstufen-Schalter aller lokalen Harnesses bisher (cline deckt nur low..xhigh ab). Trotzdem steht effort.style hier auf 'none' und nicht auf 'arg': der Mechanismus ist wie die Modellwahl ZUSTANDSBEHAFTET, kein anhaengbares Flag, und wurde deshalb direkt in die Startzeile ('args', s.o.) statt in effort.args gebaut — {effort} wird von wb-state beim Aufloesen der BASIS-args genauso ersetzt wie {model} (nachgelesen in wb-state, Funktion 'cmd_resolve': ctx[\"effort\"] wird IMMER berechnet, unabhaengig von effort.style). Ob die Stufe bei ornith:9b, das ohnehin sichtbar 'denkt', tatsaechlich etwas veraendert, ist NICHT gemessen (derselbe ehrliche Vorbehalt wie bei cline). RESUME: es gibt KEIN einzelnes Flag 'letzte Unterhaltung dieses Verzeichnisses fortsetzen'. Gemessen: Unterhaltungen sind per WORKSPACE (== Arbeitsverzeichnis) VONEINANDER GETRENNT ('forge list conversation --porcelain', aus DEM Verzeichnis heraus aufgerufen, zeigt nur dessen eigene Historie), und '--conversation-id <id>' stellt eine benannte Unterhaltung VOLLSTAENDIG wieder her (nachgemessen: eine Folgefrage 'was habe ich dich eben gefragt' wurde nach einem Neustart mit --conversation-id korrekt aus dem Verlauf beantwortet). Ein Verzeichnis-gebundenes 'letzte-ID-holen' waere nur ueber 'forge list conversation --porcelain | tail -1' UND einen zweiten Prozessaufruf VOR dem eigentlichen Start moeglich — das passt nicht in das einfache 'resume.args wird angehaengt'-Modell der Registry, sobald 'command' schon ein '/bin/sh -c'-Einzeiler ist (ein angehaengtes '--conversation-id <id>' waere ein zusaetzliches Argument an 'sh', nicht an 'forge'). resume bleibt deshalb null; ein wiederbelebter forge-Pane kommt leer zurueck. KOMPAKTIEREN: 'forge conversation compact' existiert nur als EIGENES CLI-Unterkommando AUSSERHALB der laufenden Sitzung (neuer Prozessaufruf, keine Eingabe IN die TUI); im Banner der laufenden Sitzung selbst steht keine ':compact'- oder vergleichbare Kurzform (Befehle dort: :new :info :usage :help :conversation :model :forge/:muse/:agent :update :exit, nachgesehen in der Bannerzeile und zusaetzlich mit ':help' angetestet). compactCommand bleibt deshalb null. NEBENWIRKUNG: '~/.forge/' (SQLite-Datenbank, Konfiguration, Zugangsdaten, Modell-Cache) ist GLOBAL fuer die ganze Maschine und wird von JEDEM forge-Worker gemeinsam benutzt — dieselbe Eigenschaft wie ~/.config/nanocoder und ~/.cline-wb, nur dass hier sogar das AKTIVE MODELL geteilter Zustand ist (siehe oben); zwei forge-Worker mit unterschiedlichem Modell, die exakt gleichzeitig starten, koennten sich das Modell gegenseitig unterschreiben. Fuer die Grossserie dieser Werkbank (ein Worker pro Arbeitsverzeichnis, selten exakt gleichzeitig gestartet) ist das ein AKZEPTIERTES Risiko und kein Ausschlussgrund, aber es gehoert dokumentiert.",
+      "notes": "Dritte Welle (2026-08-09), erster von drei neu integrierten Harnesses dieser Runde. Installation ueber 'npm i -g @antinomyhq/forge'. ROLLEN-PROMPT ueber AGENTS.md im ARBEITSVERZEICHNIS, aber ANDERS ALS BEHAUPTET dokumentiert: eine Web-Dokumentation nennt AGENTS.md als Ort fuer 'persistent instructions', OHNE zu sagen, DASS der Inhalt automatisch in den Systemprompt wandert. Selbst nachgemessen (SQLite-Spalte 'context' einer echten Sitzung ausgelesen): der Inhalt von AGENTS.md landet als EIGENE zweite System-Nachricht in einem '<project_guidelines>'-Block, VOR jeder Nutzernachricht — der erste Testlauf mit ornith:9b antwortete auf die Kennwortfrage trotzdem falsch und verwirrt (Modell verlor sich in einer langen, durch mehrere Testfragen VERSCHACHTELTEN Unterhaltung und erfand einen nicht existierenden Dateinamen); eine FRISCHE, unverschachtelte Unterhaltung mit derselben Frage traf die richtige Antwort ('TANNENZAPFEN') sofort und nannte die Quelle ('project_guidelines section'). Das ist ein Befund ueber ornith:9b in einer langen Sitzung, kein Fehler an AGENTS.md — mit einer neuen Unterhaltung ist der Rollen-Weg zuverlaessig. AUTONOMIE ist die VORGABE (siehe probe); autonomy.args bleibt leer. EFFORT: 'forge config set reasoning-effort <stufe>' kennt GENAU das Vokabular der Werkbank (none, minimal, low, medium, high, xhigh, max — laut '--help', keine Erfindung) und ist damit der VOLLSTAENDIGSTE Denkstufen-Schalter aller lokalen Harnesses bisher (cline deckt nur low..xhigh ab). Trotzdem steht effort.style hier auf 'none' und nicht auf 'arg': der Mechanismus ist wie die Modellwahl ZUSTANDSBEHAFTET, kein anhaengbares Flag, und wurde deshalb direkt in die Startzeile ('args', s.o.) statt in effort.args gebaut — {effort} wird von wb-state beim Aufloesen der BASIS-args genauso ersetzt wie {model} (nachgelesen in wb-state, Funktion 'cmd_resolve': ctx[\"effort\"] wird IMMER berechnet, unabhaengig von effort.style). Ob die Stufe bei ornith:9b, das ohnehin sichtbar 'denkt', tatsaechlich etwas veraendert, ist NICHT gemessen (derselbe ehrliche Vorbehalt wie bei cline). RESUME: es gibt KEIN einzelnes Flag 'letzte Unterhaltung dieses Verzeichnisses fortsetzen'. Gemessen: Unterhaltungen sind per WORKSPACE (== Arbeitsverzeichnis) VONEINANDER GETRENNT ('forge list conversation --porcelain', aus DEM Verzeichnis heraus aufgerufen, zeigt nur dessen eigene Historie), und '--conversation-id <id>' stellt eine benannte Unterhaltung VOLLSTAENDIG wieder her (nachgemessen: eine Folgefrage 'was habe ich dich eben gefragt' wurde nach einem Neustart mit --conversation-id korrekt aus dem Verlauf beantwortet). Ein Verzeichnis-gebundenes 'letzte-ID-holen' waere nur ueber 'forge list conversation --porcelain | tail -1' UND einen zweiten Prozessaufruf VOR dem eigentlichen Start moeglich — das passt nicht in das einfache 'resume.args wird angehaengt'-Modell der Registry, sobald 'command' schon ein '/bin/sh -c'-Einzeiler ist (ein angehaengtes '--conversation-id <id>' waere ein zusaetzliches Argument an 'sh', nicht an 'forge'). resume bleibt deshalb null; ein wiederbelebter forge-Pane kommt leer zurueck. KOMPAKTIEREN: 'forge conversation compact' existiert nur als EIGENES CLI-Unterkommando AUSSERHALB der laufenden Sitzung (neuer Prozessaufruf, keine Eingabe IN die TUI); im Banner der laufenden Sitzung selbst steht keine ':compact'- oder vergleichbare Kurzform (Befehle dort: :new :info :usage :help :conversation :model :forge/:muse/:agent :update :exit, nachgesehen in der Bannerzeile und zusaetzlich mit ':help' angetestet). compactCommand bleibt deshalb null. NEBENWIRKUNG: '~/.forge/' (SQLite-Datenbank, Konfiguration, Zugangsdaten, Modell-Cache) ist GLOBAL fuer die ganze Maschine und wird von JEDEM forge-Worker gemeinsam benutzt — dieselbe Eigenschaft wie ~/.config/nanocoder und ~/.cline-wb, nur dass hier sogar das AKTIVE MODELL geteilter Zustand ist (siehe oben); zwei forge-Worker mit unterschiedlichem Modell, die exakt gleichzeitig starten, koennten sich das Modell gegenseitig unterschreiben. Fuer die Grossserie dieser Werkbank (ein Worker pro Arbeitsverzeichnis, selten exakt gleichzeitig gestartet) ist das ein AKZEPTIERTES Risiko und kein Ausschlussgrund, aber es gehoert dokumentiert. NACHGEMESSEN 2026-09-04 mit dem vollen Dreiklang (Anlass: DIREKTWEG-BEFUND fand '--conversation-id <ID>' aus '--help'): eigener tmux-Socket, umgelenktes HOME, Modell qwen3:1.7b. Ein Merksatz ('Merke dir das Wort AMSEL') stand unveraendert in '~/.forge/.forge.db' vor UND nach einem harten 'kill -9' auf Client- UND Node-Kindprozess (57344 Byte, keine Aenderung). 'forge --conversation-id <id>' nach dem Kill zeigte 'Continue <id>' und denselben Tokenstand wie vor dem Kill, und die Gegenfrage 'Welches Wort solltest du dir merken?' wurde (nach einer verwirrten Zwischenrunde ueber eine fehlgeschlagene todo_write-Werkzeugstruktur, ein Modellbefund bei qwen3:1.7b, kein Harnessfehler) am Ende korrekt beantwortet: 'The word \"AMSEL\" has been remembered.' Das Flag TRAEGT also, mit Beleg. TROTZDEM bleibt resume null, und zwar aus einem STRUKTURELLEN, nicht einem Messgrund: 'command' ist hier bereits '/bin/sh' mit '-c <einzeiler>' (siehe oben, ZUSTANDSBEHAFTETE Modellwahl); die Einfuege-Mechanik von wb-revive/wb-harness-run sucht den Basisnamen von 'command' ('sh') als eigenes Wort in der Startzeile und haengt die Fortsetzen-Flags UNMITTELBAR DAHINTER an (wb-harness-run, Abschnitt '--resume-args', Funktion 'einfuegen'/'base'). Ein angehaengtes '--conversation-id <id>' laende damit ZWISCHEN '/bin/sh' und '-c', also als Argument an 'sh' selbst — das zerbricht den Aufruf, statt forge fortzusetzen (nachvollzogen am Code, nicht am Programm: 'sh -c' erwartet an dieser Stelle den Skripttext, kein weiteres Flag). Eine Loesung braeuchte entweder eine zweite Einfuegestelle IM '-c'-Einzeiler selbst oder ein eigenes Vorlage-Feld fuer zustandsbehaftete Kommandos — beides aendert den Registry-Vertrag und liegt ausserhalb dieser Messung. resume bleibt deshalb null, jetzt mit einer PRAEZISEREN Begruendung: nicht 'kein Flag', sondern 'ein tragendes Flag, das die heutige Einfuege-Mechanik nicht platzieren kann'. NACHGEZOGEN 2026-09-06 (Auftrag reviveids): resume ist jetzt gesetzt statt null. Der strukturelle Grund von 2026-09-04 (command ist /bin/sh -c und die Flags landeten zwischen 'sh' und '-c') ist mit dem neuen Feld resume.anker geloest: 'anker':'forge' sagt wb-harness-run, die Fortsetzen-Flags hinter das LETZTE 'forge' im Einzeiler zu setzen, also hinter 'exec forge'. wb-revive loest die conversation_id je Pane ueber resume.kennung (verfahren=forge-sqlite, ort=~/.forge/.forge.db): das Arbeitsverzeichnis steht im context-Feld als <current_working_directory>, die Zeit in created_at. Gemessen mit zwei Panes in EINEM Verzeichnis (qwen3:1.7b): kill -9 auf den einen, ':exit' auf den anderen; jeder kam ueber 'forge --conversation-id <id>' mit SEINER id zurueck (df2f5399 bzw. 988f5cb2), 'Continue <id>' und der alte Zug sichtbar. probe bleibt revive-only, Messung hier in notes (siehe cline).",
       "discover": {
         "source": "ollama",
         "provider": "ollama",
@@ -1892,6 +1933,7 @@
       "label": "jcode (1jehuang, Rust-Harness mit Server/Client, lokal ueber Ollama)",
       "command": "jcode",
       "args": [
+        "--no-update",
         "-p",
         "ollama",
         "-m",
@@ -1952,7 +1994,7 @@
       "altScreen": true,
       "probe": "gemessen 2026-08-09 mit jcode v0.72.0 (curl -fsSL https://jcode.sh/install | bash — KEIN npm-Paket, anders als der Auftrag behauptete: '@jcode/cli' existiert auf npm, ist aber ein anderes, unbeteiligtes Projekt ('Just another nodejs mvc framework'); das echte jcode ist ein in Rust geschriebener Client/Server-Harness von Solo Systems / 1jehuang, installiert per Shell-Skript nach ~/.local/bin/jcode). Installationsskript vorher gelesen: laedt eine SHA-256-gepruefte Plattform-Binaerdatei von GitHub-Releases, meldet optionale Telemetrie (abschaltbar ueber JCODE_NO_TELEMETRY=1/DO_NOT_TRACK=1, hier gesetzt) und schreibt eine PATH-Zeile in ~/.zshenv, ~/.bashrc und ~/.profile — das einzige Installationsskript dieser Runde, das RC-Dateien anfasst, kein anderer hier integrierter Harness tut das. Gemessen auf eigenem tmux-Socket mit PID im Namen, umgelenktem HOME (per $HOME UND $JCODE_HOME, siehe notes), Modell ornith:9b ueber den eingebauten Ollama-Anbieter ('-p ollama', kein Login, kein Schluessel, keine Konfigurationsdatei noetig — anders als bei Forge). READY: die Eingabezeile ist eine durchnummerierte Zeile '<N>> ' (N steigt mit jeder Runde: '1>', '2>', …), deshalb readyPattern '^[0-9]+>'. Nachgerechnet mit demselben grep -E, den pi-worker benutzt: das Muster trifft die beiden Zustaende LEER und GETIPPT ('N>' allein am Zeilenanfang, kein Platzhaltertext danach; bzw. 'N> <Text>'). WAEHREND DER ANTWORT zeigt die Zeile NICHT mehr 'N>', sondern 'N…' (Ellipse statt Groesser-Zeichen, mit einem Spinner '⠋ thinking… Ns · https' daneben) — das Muster trifft diesen Zustand also NICHT, und das ist FOLGENLOS: pi-worker prueft readyPattern nur EINMAL, vor dem allerersten Einfuegen (siehe pi-worker, Zeilen um 633-640); ob es waehrend einer laufenden Antwort weiter trifft, spielt fuer den echten Ablauf keine Rolle. Es trifft NICHT den Bannerbildschirm (Update-Kasten, kein '<Ziffer>>' darin) und NICHT den ERSTSTART-Dialog ('Welcome to jcode onboarding' / 'Log in to OpenAI? Yes/No', reine Text-/Knopf-Optik ohne Ziffernpraefix). WICHTIGER UNTERSCHIED zur historischen Anzeige: eine bereits ABGESENDETE Zeile wird spaeter mit '‹N›' erneut angezeigt — U+203A statt des ASCII '>' der LEBENDEN Eingabezeile — die beiden sehen im Terminal aehnlich aus, sind aber unterschiedliche Zeichen und das Muster trifft nur die lebende Zeile. NEUE FALLE, HIER ZUM ERSTEN MAL GEMESSEN: die Kontext-Fusszeile ('3.1k/200k ▱▱▱▱▱▱ 2%') steht RECHTSBUENDIG AUF DERSELBEN PHYSISCHEN ZEILE wie die Eingabezeile, durch Terminal-Fuellzeichen getrennt. Die generische Absende-Pruefung von pi-worker (Muster gefolgt von Leerraum, gefolgt von einem Nicht-Leerraum-Zeichen) haelt diese rechtsbuendige Ziffernfolge sonst IMMER fuer haengenden Text, auch wenn die Box tatsaechlich LEER ist — nachgerechnet: ohne Gegenmassnahme meldete die Pruefung eine leere Box faelschlich als 'haengt noch'. Behoben durch promptIgnore '^[0-9]+>[[:space:]]+[0-9.]+k/[0-9]+k' — dieses Muster trifft NUR die Zeile, wenn UNMITTELBAR nach dem Leerraum hinter '>' schon die Kontextzahl kommt (also NICHTS Echtes getippt wurde), und trifft NICHT, wenn davor echter Text steht (dann bricht das Muster an den Buchstaben ab). Nachgerechnet an beiden Zustaenden: leer -> trifft, getippt (auch mit sichtbarer Kontextzahl weiter rechts) -> trifft nicht. ERSTSTART-DIALOG 'Welcome to jcode onboarding': erscheint auf einem NOCH NIE benutzten $HOME einmalig (Login-Frage zu OpenAI, mit 'Esc to skip onboarding'); er verschwindet nach einem Escape und kam in einer FORTLAUFENDEN Server-Sitzung danach nicht wieder — ob er rein dateibasiert unterdrueckt werden kann, ist NICHT gemessen (keine Datei mit einem klaren 'onboarding done'-Flag gefunden, siehe notes); ein Spawn auf einem WIRKLICH frischen $HOME braeuchte also einmalig ein Escape, das die Werkbank heute nicht automatisch sendet. AUTONOMIE: Werkzeugaufrufe liefen in der Messung OHNE Bestaetigungsdialog durch (Verzeichnislisten, Dateisuche); EIN bash-Aufruf wurde von der CLI SELBST als 'irreversible' klassifiziert und verweigert (keine Rueckfrage, sondern ein Fehlschlag mit Tastaturhinweisen '[⌥] [⇧] [S]' zum Erzwingen) — das ist ein interner Sicherheitsfilter der CLI und kein Freigabedialog, an dem autonomy.args etwas aendern koennte; autonomy.args bleibt leer.",
       "contextProbe": "gemessen 2026-08-09, gleiche Sitzung: jcode zeigt als EINZIGER lokaler Harness dieser Runde eine ECHTE Prozentanzeige mit Nenner direkt in der Fusszeile — Format '<zahl>k/<zahl>k <balkenzeichen> <prozent>%' (gemessen '3.1k/200k ▱▱▱▱▱▱ 2%' vor dem ersten Zug, '13k/200k ▱▱▱▱▱▱ 7%' danach). contextPattern faengt die Prozentzahl direkt aus dieser Zeile, ohne Umrechnung — anders als bei fast allen anderen lokalen Harnesses dieser und der letzten Welle (forge, cline, openhands: nur ein absoluter Tokenwert ohne Nenner). Bemerkenswert UND ehrlich zu nennen: bei einer einzelnen, simplen Frage ohne vorhandene Rolle sprang die Auslastung einmal auf ueber 13.000 Token und loeste eine 'Emergency compaction' aus — die CLI selbst meldete das ('before ~13,064 tokens · now ~161 tokens'); die Kontextwache wuerde diesen Sprung korrekt als Prozentzahl sehen, er ist also kein blinder Fleck, nur ein Hinweis darauf, dass die Grundauslastung von jcode hoeher ist, als die 3,1k vor dem ersten Zug vermuten lassen. contextSession bleibt leer: eine zusaetzliche Sitzungsdatei mit Tokenzahlen wurde nicht gesucht, weil die Fusszeile bereits eine verlaessliche Prozentzahl liefert.",
-      "notes": "Erster von drei neu integrierten Harnesses dieser Runde (2026-08-09). ABWEICHUNG VOM AUFTRAG: der Auftrag nannte 'npm i -g @jcode/cli' als Installationsweg; das ist FALSCH bzw. bezeichnet ein anderes Projekt (siehe probe). Installiert wurde stattdessen ueber das offizielle Shell-Skript, vorher komplett gelesen (kein Netzzugriff ausser dem geprueften Release-Download und der abschaltbaren Telemetrie, keine verdeckten Handlungen). GROESSTER UNTERSCHIED ZU JEDEM ANDEREN HARNESS DIESER WERKBANK: jcode ist client/server, nicht ein einzelner Prozess. JEDER Start von 'jcode' verbindet sich mit einem im Hintergrund laufenden, PERSISTENTEN Server-Prozess (startet ihn, falls er fehlt) — schliesst man nur den Client-Pane (wie wb-close es tut), bleibt dieser Server-Prozess als eigenstaendiger, von der tmux-Sitzung UNABHAENGIGER Hintergrundprozess zurueck. Beleg: nach dem Schliessen eines Test-Panes ueber 'tmux kill-session' lief 'jcode -p ollama -m ornith:9b serve' als eigener Prozess unter derselben Nutzerkennung weiter und musste eigens mit 'jcode server stop --force' (oder direktem kill) beendet werden. Fuer den Produktivbetrieb ist das eher ein Merkmal als ein Fehler (die eigene Webseite wirbt ausdruecklich mit 'persistent server/client workflows' fuer viele parallele, guenstige Sitzungen) — ein EINZIGER Server kann mehrere Worker-Verzeichnisse gleichzeitig bedienen, muss also nicht je Worker neu gestartet werden. Es aendert aber die Prozess-Hygiene-Pflicht: ein voelliges Aufraeumen nach einer Messreihe braucht 'jcode server stop --force' zusaetzlich zum Schliessen der Panes, sonst bleibt ein Ollama-Client-Prozess aktiv im Hintergrund stehen. ZWEITER, GROESSERER NEBENEFFEKT, NEU FUER DIESE WERKBANK: das Installationsskript registriert einen MACOS-WEITEN globalen Hotkey-Dienst (LaunchAgent 'com.jcode.hotkey', startet 'jcode setup-hotkey --listen-macos-hotkey' automatisch bei jeder Anmeldung) UND ein Menuleisten-Symbol ('jcode menubar') — beide sind OS-Singletons, nicht an $HOME oder ein Arbeitsverzeichnis gebunden, und BEIDE liefen wieder an, obwohl in dieser Messung mit umgelenktem $HOME/$JCODE_HOME gearbeitet wurde: reines Ausfuehren des Client-Binaries reicht, um sie erneut anzustossen, unabhaengig vom isolierten Testverzeichnis. JCODE_NO_MENUBAR=1 (aus den Zeichenketten des Binaries geborgen, nicht dokumentiert) unterdrueckt nachweislich das Menuleisten-Symbol; fuer den Hotkey-Dienst wurde KEINE gleichwertige Umgebungsvariable gefunden — er bleibt ohne eine Freigabe fuer 'launchctl unload ~/Library/LaunchAgents/com.jcode.hotkey.plist' bestehen (in dieser Sitzung stand genau diese Freigabe aus, siehe Ergebnisbericht). Wer diesen Harness auf einer frischen Maschine ausrollt, sollte VOR dem ersten Start entscheiden, ob der globale Hotkey ueberhaupt gewollt ist. MODELLWAHL ueber '-p ollama -m {model}' — ein echtes CLI-Flag, kein zustandsbehafteter Umweg wie bei Forge; kein Login, kein Schluessel und keine Konfigurationsdatei noetig, weil 'ollama' ein EINGEBAUTER Anbieter von jcode selbst ist. ROLLEN-PROMPT ueber AGENTS.md im ARBEITSVERZEICHNIS, automatisch gelesen: mit einer AGENTS.md, die ein Kennwort trug, antwortete ornith:9b in einer FRISCHEN Unterhaltung sofort und korrekt ('TANNENZAPFEN', 4,1s). GEGENPROBE, ehrlich dokumentiert: OHNE AGENTS.md (keine Datei, kein Kennwort vorhanden) verlor sich dasselbe Modell auf dieselbe Frage in einer langen, frei erfundenen Geschichte ueber angebliche Berechtigungsfehler und nicht existierende Dateien und sprang dabei von 3,1k auf 13k Token (siehe contextProbe) — ein MODELL-Befund (ornith:9b konfabuliert lieber, als 'ich weiss es nicht' zu sagen), kein Harness-Fehler: mit der erwarteten Datei war die Antwort schnell und richtig. AUTONOMIE: siehe probe — Werkzeuge laufen ohne Bestaetigung, ein interner Sicherheitsfilter kann aber einzelne Befehle als 'irreversible' verweigern; das ist keine Einstellung, die die Registry umschalten kann. RESUME: '--resume' OHNE ID oeffnet eine INTERAKTIVE Auswahlliste ('Space select · Enter in place …') und wuerde einen Spawn genauso anhalten wie bei opencode; eine ID kennt die Registry nicht im Voraus. resume bleibt deshalb null. KOMPAKTIEREN: keinen manuell auslösbaren Befehl in der Kurzhilfe gesehen — die CLI kompaktiert bei Bedarf SELBST ('Emergency compaction', siehe contextProbe), aber nichts, das die Kontextwache gezielt antriggern koennte; compactCommand bleibt null. NICHT benutzt: 'jcode serve'/'jcode acp'/'jcode api-bridge' (eigene Betriebsarten), 'jcode swarm' (Mehrfach-Agenten), 'jcode ambient' (Hintergrundzyklen), 'jcode cloud'/'jcode account' (Cloud-Funktionen) — alles mit eigener Messung noetig.",
+      "notes": "Erster von drei neu integrierten Harnesses dieser Runde (2026-08-09). ABWEICHUNG VOM AUFTRAG: der Auftrag nannte 'npm i -g @jcode/cli' als Installationsweg; das ist FALSCH bzw. bezeichnet ein anderes Projekt (siehe probe). Installiert wurde stattdessen ueber das offizielle Shell-Skript, vorher komplett gelesen (kein Netzzugriff ausser dem geprueften Release-Download und der abschaltbaren Telemetrie, keine verdeckten Handlungen). GROESSTER UNTERSCHIED ZU JEDEM ANDEREN HARNESS DIESER WERKBANK: jcode ist client/server, nicht ein einzelner Prozess. JEDER Start von 'jcode' verbindet sich mit einem im Hintergrund laufenden, PERSISTENTEN Server-Prozess (startet ihn, falls er fehlt) — schliesst man nur den Client-Pane (wie wb-close es tut), bleibt dieser Server-Prozess als eigenstaendiger, von der tmux-Sitzung UNABHAENGIGER Hintergrundprozess zurueck. Beleg: nach dem Schliessen eines Test-Panes ueber 'tmux kill-session' lief 'jcode -p ollama -m ornith:9b serve' als eigener Prozess unter derselben Nutzerkennung weiter und musste eigens mit 'jcode server stop --force' (oder direktem kill) beendet werden. Fuer den Produktivbetrieb ist das eher ein Merkmal als ein Fehler (die eigene Webseite wirbt ausdruecklich mit 'persistent server/client workflows' fuer viele parallele, guenstige Sitzungen) — ein EINZIGER Server kann mehrere Worker-Verzeichnisse gleichzeitig bedienen, muss also nicht je Worker neu gestartet werden. Es aendert aber die Prozess-Hygiene-Pflicht: ein voelliges Aufraeumen nach einer Messreihe braucht 'jcode server stop --force' zusaetzlich zum Schliessen der Panes, sonst bleibt ein Ollama-Client-Prozess aktiv im Hintergrund stehen. ZWEITER, GROESSERER NEBENEFFEKT, NEU FUER DIESE WERKBANK: das Installationsskript registriert einen MACOS-WEITEN globalen Hotkey-Dienst (LaunchAgent 'com.jcode.hotkey', startet 'jcode setup-hotkey --listen-macos-hotkey' automatisch bei jeder Anmeldung) UND ein Menuleisten-Symbol ('jcode menubar') — beide sind OS-Singletons, nicht an $HOME oder ein Arbeitsverzeichnis gebunden, und BEIDE liefen wieder an, obwohl in dieser Messung mit umgelenktem $HOME/$JCODE_HOME gearbeitet wurde: reines Ausfuehren des Client-Binaries reicht, um sie erneut anzustossen, unabhaengig vom isolierten Testverzeichnis. JCODE_NO_MENUBAR=1 (aus den Zeichenketten des Binaries geborgen, nicht dokumentiert) unterdrueckt nachweislich das Menuleisten-Symbol; fuer den Hotkey-Dienst wurde KEINE gleichwertige Umgebungsvariable gefunden — er bleibt ohne eine Freigabe fuer 'launchctl unload ~/Library/LaunchAgents/com.jcode.hotkey.plist' bestehen (in dieser Sitzung stand genau diese Freigabe aus, siehe Ergebnisbericht). Wer diesen Harness auf einer frischen Maschine ausrollt, sollte VOR dem ersten Start entscheiden, ob der globale Hotkey ueberhaupt gewollt ist. MODELLWAHL ueber '-p ollama -m {model}' — ein echtes CLI-Flag, kein zustandsbehafteter Umweg wie bei Forge; kein Login, kein Schluessel und keine Konfigurationsdatei noetig, weil 'ollama' ein EINGEBAUTER Anbieter von jcode selbst ist. ROLLEN-PROMPT ueber AGENTS.md im ARBEITSVERZEICHNIS, automatisch gelesen: mit einer AGENTS.md, die ein Kennwort trug, antwortete ornith:9b in einer FRISCHEN Unterhaltung sofort und korrekt ('TANNENZAPFEN', 4,1s). GEGENPROBE, ehrlich dokumentiert: OHNE AGENTS.md (keine Datei, kein Kennwort vorhanden) verlor sich dasselbe Modell auf dieselbe Frage in einer langen, frei erfundenen Geschichte ueber angebliche Berechtigungsfehler und nicht existierende Dateien und sprang dabei von 3,1k auf 13k Token (siehe contextProbe) — ein MODELL-Befund (ornith:9b konfabuliert lieber, als 'ich weiss es nicht' zu sagen), kein Harness-Fehler: mit der erwarteten Datei war die Antwort schnell und richtig. AUTONOMIE: siehe probe — Werkzeuge laufen ohne Bestaetigung, ein interner Sicherheitsfilter kann aber einzelne Befehle als 'irreversible' verweigern; das ist keine Einstellung, die die Registry umschalten kann. RESUME: '--resume' OHNE ID oeffnet eine INTERAKTIVE Auswahlliste ('Space select · Enter in place …') und wuerde einen Spawn genauso anhalten wie bei opencode; eine ID kennt die Registry nicht im Voraus. resume bleibt deshalb null. KOMPAKTIEREN: keinen manuell auslösbaren Befehl in der Kurzhilfe gesehen — die CLI kompaktiert bei Bedarf SELBST ('Emergency compaction', siehe contextProbe), aber nichts, das die Kontextwache gezielt antriggern koennte; compactCommand bleibt null. NICHT benutzt: 'jcode serve'/'jcode acp'/'jcode api-bridge' (eigene Betriebsarten), 'jcode swarm' (Mehrfach-Agenten), 'jcode ambient' (Hintergrundzyklen), 'jcode cloud'/'jcode account' (Cloud-Funktionen) — alles mit eigener Messung noetig. NACHGEMESSEN 2026-09-04, RESUME MIT ECHTER ID (Anlass: DIREKTWEG-BEFUND fand '--resume [ID]' aus --help, die Registry fuehrte resume trotzdem als null): eigener tmux-Socket, umgelenktes HOME/JCODE_HOME, Modell qwen3:1.7b. Ein Merksatz ('Merke dir das Wort AMSEL') landete unveraendert im Journal '<sessionDir>/session_<name>_<ts>_<hash>.journal.jsonl' (3 Fundstellen fuer AMSEL), Groesse VOR und NACH einem harten 'kill -9' auf Client- UND Server-Prozess identisch (2673 Byte) — die Datei waechst also JE ZUG, nicht erst beim Beenden. 'jcode --resume <id>' nach dem harten Kill REKONSTRUIERTE die Unterhaltung nachweislich: der Bildschirm zeigte den vorigen Zug wortgleich erneut ('1› Merke dir das Wort AMSEL...' samt der Antwort 'OK'), UND mit erneut angehaengtem '-p ollama -m qwen3:1.7b' vor '--resume' bestand die anschliessende Gegenfrage 'Welches Wort solltest du dir merken?' zuverlaessig auf 'AMSEL' bezogen (Fusszeile korrekt 'api-key:ollama · Qwen3:1.7b'). ABER: 'jcode --resume <id>' OHNE erneut mitgegebenes '-p'/'-m' wechselte den Anbieter STILL auf den harnesseigenen Standard ('claude · Claude 5 Opus', hier nicht eingerichtet) und eine Folgefrage scheiterte mit 'No tokens/providers left' — die Session selbst blieb dabei korrekt (der alte Zug samt AMSEL war weiter sichtbar), nur der Anbieter sprang um. UND: von vier Resume-Versuchen haengten zwei reproduzierbar dauerhaft bei 'Starting server...' (0% CPU auf Client UND Server-Kindprozess, ueber 30s ohne Fortschritt, nur durch harten Kill zu beenden) — kein Einzelfall. NEBENFUND, EBENFALLS 2026-09-04, unabhaengig von resume: der erste Testlauf aktualisierte Client UND Server MITTEN IN DER MESSUNG still von v0.72.0 auf v0.81.5 ('Connected server is running an older release... Reloading it before applying session state'), trotz umgelenktem HOME/JCODE_HOME/TMPDIR — die neue Version ignorierte '-p ollama -m {model}' beim Erststart vollstaendig und stieg mit 'claude · Claude 5 Opus' ein ('No tokens/providers left'). '--no-update' (aus 'jcode --help', Punkt 'Skip the automatic update check') verhinderte das in einer sauberen zweiten Messung nachweislich; deshalb steht das Flag jetzt fest in args, VOR '-p ollama' — ohne aendert sich die gemessene Grundlage dieses gesamten Eintrags unter der Hand. FAZIT ZU RESUME: der Rueckweg TRAEGT (Wort kommt nachweislich zurueck), ist aber ohne wiederholte Anbieterflags UND wegen der reproduzierbaren Haenger nicht verlaesslich genug fuer eine automatisierte Registry-Einfuegung; resume bleibt deshalb null, jetzt mit Beleg statt mit der alten Vermutung ueber die interaktive Auswahlliste allein (die bleibt fuer den ID-losen Fall weiterhin zutreffend). Nebenbefund zum Hotkey-Dienst: 'com.jcode.hotkey' registrierte sich diesmal MIT einem eigenen Plist-Pfad unter dem umgelenkten HOME ('<HOME>/Library/LaunchAgents/com.jcode.hotkey.plist'), aber im ECHTEN launchd-GUI-Bereich des Nutzers (gui/501) — 'launchctl bootout gui/501/com.jcode.hotkey' war noetig und reichte. NACHGEMESSEN 2026-09-06 (Auftrag reviveids): resume BLEIBT null. Anders als cline und forge liess sich jcode nicht verdrahten. Zwei harte Gruende, beide gemessen auf eigenem Socket mit umgelenktem HOME/TMPDIR/JCODE_HOME und qwen3:1.7b: (1) In einem frischen HOME zeigt JEDER Start den Onboarding-Bildschirm 'Log in to OpenAI? Yes/No', der nur interaktiv mit Escape zu ueberspringen ist ('Esc to skip onboarding'); der automatische Spawn-Weg (pi-worker/wb-harness-run) wartet auf das readyPattern, das nie erscheint, und bricht nach 60 s ab — weder JCODE_PROVIDER_SETUP_OK=1 noch JCODE_CLI_BOOTSTRAP_LOGIN=0 noch JCODE_DEFERRED_AUTH_BOOTSTRAP=0 unterdrueckten den Bildschirm. (2) '--resume <id>' startet einen frischen Server, der denselben Onboarding-Bildschirm zeigt und dabei eine NEUE, leere Sitzung anlegt statt die genannte sauber zu laden; von zehn automatisierten Resume-Versuchen kam keiner zu einem nutzbaren Prompt. Das deckt sich mit dem Befund vom 04.09. (2 von 4 Versuchen hingen bei 'Starting server...', stiller Anbieterwechsel auf claude ohne erneute -p/-m-Flags). Ein tragender, aber unzuverlaessiger und nur interaktiv erreichbarer Weg gehoert nicht in die automatische Registry-Wiederbelebung. Zusaetzlicher Hygiene-Befund: der Client-Start registriert com.jcode.hotkey erneut im echten gui/501 (KeepAlive=true), auch bei umgelenktem HOME; nach der Messung mit 'launchctl bootout gui/501/com.jcode.hotkey' entfernt.",
       "discover": {
         "source": "ollama",
         "provider": "ollama",
@@ -2100,12 +2142,12 @@
       "contextWindow": 1000000
     },
     {
-      "id": "claude-fable-5",
-      "label": "Claude Fable 5",
-      "alias": "fable5",
+      "id": "claude-fable-5-1",
+      "label": "Claude Fable 5.1",
+      "alias": "fable51",
       "harness": "claude",
       "provider": "claude-subscription",
-      "modelRef": "claude-fable-5",
+      "modelRef": "claude-fable-5-1",
       "roles": [
         "worker"
       ],
@@ -2119,7 +2161,8 @@
       "goodFor": "Nur auf ausdrueckliche des Nutzers Anweisung (Fable-Sperre 2026-07-12; Ausnahme fuer kundengerichtet-visuell am 2026-07-29 aufgehoben).",
       "notFor": "Standard-Coding, Internes, Visuelles fuer den Nutzer selbst — UND seit 2026-07-29 auch kundengerichtete visuelle Deliverables (dafuer jetzt opus5:xhigh).",
       "enabled": true,
-      "contextWindow": 1000000
+      "contextWindow": 1000000,
+      "notes": "ABGELOEST 2026-09-02: Fable 5 durch Fable 5.1 ersetzt (Anweisung des Nutzers, 'Fable 5 soll nicht mehr verwendet werden'). Der alte Alias fable5 ist mit dem Wechsel ENTFALLEN -- die Registry kennt keine Zweitaliase, nur fable51 loest auf (nachgemessen 2026-09-05: 'wb-state models resolve fable5' meldet 'nicht registriert'). FABLE-SPERRE und Effort-Deckel high gelten unveraendert. | "
     },
     {
       "id": "ornith-35b",
@@ -2185,7 +2228,7 @@
     },
     {
       "id": "qwen38-27b",
-      "label": "qwen3.8-27b (lokal, MLX 4bit)",
+      "label": "qwen3.8-27b Basis (lokal, MLX 4bit, MTP-Kopf an)",
       "alias": "qwen38",
       "harness": "pi",
       "provider": "mlx-lokal",
@@ -2205,11 +2248,11 @@
         "reasoning_effort": "low"
       },
       "vorhersage": {
-        "bauart": "eingebaut",
-        "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-MTPLX-Optimized-Speed",
-        "gewichteGb": 19.83,
-        "herkunft": "Endgueltiger Sieger, gemessen 2026-08-20 (Worker 'nebenlauf', alle vier Kandidaten fertig gemessen, ruhige Maschine, temperature 0): MTPLX Speed 4bit ueber den eigenstaendigen mtplx-Motor (--scheduler-mode serial) liefert 31,5 Tok/s kurz / 35,8 Tok/s warm bei 4737 Prompt-Token und haelt dabei den Hausgrundwert bei der Guete (48/50 auf pruef3, in 392 statt 718 Sekunden) -- schneller UND gleich gut. Schlaegt DSpark-DimInfer (15,3 kalt/30,3 warm), DFlash2 (12,5/29,5) und den Betrieb ganz ohne Vorhersage (11,1/17,2). Die 8-Bit-Guetefassung (Qwen3.8-27B-MTPLX-Optimized-Quality, $HOME/AI/mlx-models/Qwen3.8-27B-MTPLX-Optimized-Quality) bringt KEINE messbare Guete gegenueber der 4-Bit-Fassung (dieselben 48/50), dafuer 8,6 GiB mehr Speicher (30,2 statt 21,6 GiB) und deutlich weniger Tempo (23,0 statt 31,5 Tok/s kurz, 24,9 statt 35,8 Tok/s warm). Entscheidung des Nutzers (2026-08-20): sie bleibt trotzdem als zweite, ausdruecklich waehlbare Moeglichkeit erhalten -- Vorgabe/Standardwahl bleibt MTPLX Speed 4bit, wer stattdessen die Quality-Fassung will, setzt 'vorhersage.modell' auf den Optimized-Quality-Pfad und kennt dann den Preis. Buendelung UND Vorhersage gibt es fuer dieses Modell architekturbedingt nicht (mtp_batch scheitert nach sieben erfuellten Bedingungen an QwenRowOwnedRouterConfigError) -- wb-mlx-server klemmt --parallel deshalb fest auf 1 fuer diesen Motor, bei beiden Koerpern.",
-        "wegVorgabe": "mtplx",
+        "bauart": "entwerfer",
+        "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-MTP-4bit",
+        "gewichteGb": 0.25,
+        "herkunft": "STAND 2026-08-31: DER VORGABEWEG IST 'mtp-kopf', NICHT MTPLX. Wer nur diesen Herkunftstext liest, landet beim falschen Motor -- genau das ist am 31.08.2026 einem Orchestrator passiert, weil hier bis dahin 'Vorgabe/Standardwahl bleibt MTPLX Speed 4bit' stand. Massgeblich ist 'wegVorgabe' (= mtp-kopf) und die Vergleichstabelle in regeln/orchestrierung.md: der reine 247-MB-Kopf als separater Entwerfer, gefahren von mlx_vlm.server mit --draft-kind mtp --draft-block-size 3, ueber echte Worker gemessen mit 19,1/20,3 Tok/s kalt/warm und 256/245 s Wanduhr. MTPLX hat die hoehere Rate (22,3/22,8), braucht aber rund doppelt so viele Token fuer dieselbe Aufgabe und ist in der Wanduhr langsamer (394/315 s), bei 19,83 statt 0,25 GB Zusatzgewicht. NEBENLAEUFIGKEIT, GEMESSEN 2026-09-01 und ANDERS ALS EINEN TAG ZUVOR NOTIERT: der MTP-Kopf traegt mehrere Stroeme, ABER NUR OHNE KV-QUANTISIERUNG. Mit --kv-bits enden zwei gleichzeitige Anfragen in HTTP 500 ('tuple' object has no attribute 'shape', speculative_verifier.py:1269), weil die gebuendelte Aufmerksamkeit in language.py:827 an 'hasattr(cache, bits)' aussteigt und der Rueckfall dahinter quantisierte Keys nicht kennt. Weder --quantized-kv-start noch getrennte Key/Value-Bits helfen -- die Pruefung haengt am TYP des Caches. OHNE --kv-bits laeuft es bis vier Stroeme. Gemessen ueber wb-mlx-server (300 Token je Strom, gleiche Laenge erzwungen): 1 Strom 25,0 Tok/s, 2 Stroeme 41,6 gesamt / 20,8 je Strom -- also +66 Prozent, und je Strom faellt es kaum. Direkt am Server, zweiter Messsatz: 1: 20,2  2: 32,1  3: 31,2  4: 30,8 gesamt. Der Gewinn sitzt bei ZWEI; darueber bleibt die Gesamtrate stehen, und ab drei ist die Buendelung ohne Vorhersage besser (51,5). REGEL (der Nutzer, 01.09.2026): bei EINEM Strom bleibt die Quantisierung an, bei MEHREREN faellt sie weg -- wb-mlx-server macht das selbst und bucht den doppelten KV-Bedarf (0,0625 statt 0,0332 MiB/Token). -- Historie ab hier: Endgueltiger Sieger, gemessen 2026-08-20 (Worker 'nebenlauf', alle vier Kandidaten fertig gemessen, ruhige Maschine, temperature 0): MTPLX Speed 4bit ueber den eigenstaendigen mtplx-Motor (--scheduler-mode serial) liefert 31,5 Tok/s kurz / 35,8 Tok/s warm bei 4737 Prompt-Token und haelt dabei den Hausgrundwert bei der Guete (48/50 auf pruef3, in 392 statt 718 Sekunden) -- schneller UND gleich gut. Schlaegt DSpark-DimInfer (15,3 kalt/30,3 warm), DFlash2 (12,5/29,5) und den Betrieb ganz ohne Vorhersage (11,1/17,2). Die 8-Bit-Guetefassung (Qwen3.8-27B-MTPLX-Optimized-Quality, $HOME/AI/mlx-models/Qwen3.8-27B-MTPLX-Optimized-Quality) bringt KEINE messbare Guete gegenueber der 4-Bit-Fassung (dieselben 48/50), dafuer 8,6 GiB mehr Speicher (30,2 statt 21,6 GiB) und deutlich weniger Tempo (23,0 statt 31,5 Tok/s kurz, 24,9 statt 35,8 Tok/s warm). Entscheidung des Nutzers (2026-08-20): sie bleibt trotzdem als zweite, ausdruecklich waehlbare Moeglichkeit erhalten -- Vorgabe/Standardwahl bleibt MTPLX Speed 4bit, wer stattdessen die Quality-Fassung will, setzt 'vorhersage.modell' auf den Optimized-Quality-Pfad und kennt dann den Preis. Buendelung UND Vorhersage gibt es fuer dieses Modell architekturbedingt nicht (mtp_batch scheitert nach sieben erfuellten Bedingungen an QwenRowOwnedRouterConfigError) -- wb-mlx-server klemmt --parallel deshalb fest auf 1 fuer diesen Motor, bei beiden Koerpern.",
+        "wegVorgabe": "mtp-kopf",
         "wege": [
           {
             "id": "mtplx",
@@ -2225,7 +2268,8 @@
             "bauart": "entwerfer",
             "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-DFlash2",
             "gewichteGb": 3.58,
-            "herkunft": "Zweiter Weg, Wahl des Nutzers vom 21.08.2026 ('ich will mich entscheiden koennen'). GEMESSEN 2026-08-20 (Worker 'nebenlauf'): 12,5 Tok/s kalt / 29,5 warm, Trefferquote 98 % auf pruef3 -- die BESTE Guete der vier Kandidaten, aber deutlich langsamer als MTPLX. Vergleichswert ohne jede Vorhersage, gemessen im selben Lauf: 11,1 Tok/s kalt / 17,2 warm. Der Entwerfer laeuft ueber mlx-dspark NEBEN dem Zielmodell, sein Gewicht kommt also zum Ziel hinzu (3,58 GiB, gemessen am safetensors dieses Ordners am 21.08.2026, Worker 'vorhersagewahl'). Die config.json traegt 'dflash_config' -- wb-mlx-server setzt deshalb '--mode dflash'."
+            "herkunft": "Zweiter Weg, Wahl des Nutzers vom 21.08.2026 ('ich will mich entscheiden koennen'). GEMESSEN 2026-08-20 (Worker 'nebenlauf'): 12,5 Tok/s kalt / 29,5 warm, Trefferquote 98 % auf pruef3 -- die BESTE Guete der vier Kandidaten, aber deutlich langsamer als MTPLX. Vergleichswert ohne jede Vorhersage, gemessen im selben Lauf: 11,1 Tok/s kalt / 17,2 warm. Der Entwerfer laeuft ueber mlx-dspark NEBEN dem Zielmodell, sein Gewicht kommt also zum Ziel hinzu (3,58 GiB, gemessen am safetensors dieses Ordners am 21.08.2026, Worker 'vorhersagewahl'). Die config.json traegt 'dflash_config' -- wb-mlx-server setzt deshalb '--mode dflash'.",
+            "draftKind": "dflash"
           },
           {
             "id": "dspark-diminfer",
@@ -2234,18 +2278,45 @@
             "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-DSpark-DimInfer",
             "gewichteGb": 3.46,
             "herkunft": "Dritter Weg, Wahl des Nutzers vom 21.08.2026. GEMESSEN 2026-08-20 (Worker 'nebenlauf'): 15,3 Tok/s kalt / 30,3 warm -- schneller als DFlash2, aber die GUETE IST FUER DIESEN KOERPER NICHT GEMESSEN, weder auf pruef3 noch sonstwo. Wer ihn waehlt, waehlt eine ungepruefte Trefferquote. Vergleichswert ohne jede Vorhersage, gemessen im selben Lauf: 11,1 Tok/s kalt / 17,2 warm. Der Entwerfer laeuft ueber mlx-dspark NEBEN dem Zielmodell, sein Gewicht kommt also zum Ziel hinzu (3,46 GiB, gemessen am safetensors dieses Ordners am 21.08.2026, Worker 'vorhersagewahl'). Die config.json traegt die DeepSpec-Felder oben -- mlx-dsparks eigene Erkennung greift, kein '--mode'."
+          },
+          {
+            "id": "mtp-kopf",
+            "bauart": "entwerfer",
+            "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-MTP-4bit",
+            "gewichteGb": 0.25,
+            "motor": null,
+            "herkunft": "VORGABEWEG seit 2026-08-27. Der reine MTP-Kopf aus den Qwen3.8-Gewichten (config.json: model_type qwen3_5_mtp, 247 MB) als SEPARATER Entwerfer zum gewoehnlichen Modellkoerper -- im Unterschied zum Weg 'mtplx', der einen eigenen 20-GB-Koerper mit eingebautem Kopf laedt. GEMESSEN ueber echte Worker (nicht am Server allein): 19,1 Tok/s kalt / 20,3 warm, Wanduhr 256 s kalt / 245 s warm -- der schnellste Weg zum fertigen Ergebnis bei 0,25 GB Zusatzgewicht. Die Vergleichstabelle aller vier Wege steht in regeln/orchestrierung.md. NEBENLAEUFIGKEIT, GEMESSEN 2026-09-01 und ANDERS ALS EINEN TAG ZUVOR NOTIERT: der MTP-Kopf traegt mehrere Stroeme, ABER NUR OHNE KV-QUANTISIERUNG. Mit --kv-bits enden zwei gleichzeitige Anfragen in HTTP 500 ('tuple' object has no attribute 'shape', speculative_verifier.py:1269), weil die gebuendelte Aufmerksamkeit in language.py:827 an 'hasattr(cache, bits)' aussteigt und der Rueckfall dahinter quantisierte Keys nicht kennt. Weder --quantized-kv-start noch getrennte Key/Value-Bits helfen -- die Pruefung haengt am TYP des Caches. OHNE --kv-bits laeuft es bis vier Stroeme. Gemessen ueber wb-mlx-server (300 Token je Strom, gleiche Laenge erzwungen): 1 Strom 25,0 Tok/s, 2 Stroeme 41,6 gesamt / 20,8 je Strom -- also +66 Prozent, und je Strom faellt es kaum. Direkt am Server, zweiter Messsatz: 1: 20,2  2: 32,1  3: 31,2  4: 30,8 gesamt. Der Gewinn sitzt bei ZWEI; darueber bleibt die Gesamtrate stehen, und ab drei ist die Buendelung ohne Vorhersage besser (51,5). REGEL (der Nutzer, 01.09.2026): bei EINEM Strom bleibt die Quantisierung an, bei MEHREREN faellt sie weg -- wb-mlx-server macht das selbst und bucht den doppelten KV-Bedarf (0,0625 statt 0,0332 MiB/Token). ",
+            "draftKind": "mtp",
+            "draftBlockSize": 3
           }
-        ]
+        ],
+        "draftKind": "mtp",
+        "draftBlockSize": 3
       },
       "workerClass": [
         {
           "class": "bulk",
           "effort": "medium",
-          "goodFor": "Token-freier Default-Coder (MLX 4bit); Bulk, Inventur, DSGVO, Overnight."
+          "goodFor": "Token-frei; Bulk, Inventur, DSGVO, Overnight."
+        },
+        {
+          "class": "mechanisch",
+          "effort": "medium",
+          "goodFor": "Umbenennungen, Formatierung, Mehrdatei-Muster -- token-frei statt Kontingent."
+        },
+        {
+          "class": "coding-kurz",
+          "effort": "high",
+          "goodFor": "ERSTE WAHL fuer kurze, klar umrissene Coding-Auftraege (der Nutzer, 2026-08-27: 'immer wenn moeglich Qwen3.8 lokal nehmen, wenn es fuer eine Aufgabe gut genug ist, und sonst erst auf ein Cloud-Modell zugreifen'). Einordnung: Artificial Analysis gibt dem Modell Intelligence-Index 52,0 gegenueber 63,1 fuer Claude Opus 5 und 57,5 fuer glm-5.3-flash -- fremde Messung, von uns nicht nachgemessen."
+        },
+        {
+          "class": "recherche",
+          "effort": "medium",
+          "goodFor": "Auslesen und Vorsortieren, wo die Daten die Maschine nicht verlassen sollen."
         }
       ],
-      "goodFor": "Token-freier Default-Coder seit 2026-08-19 (Entscheidung des Nutzers, siehe GEMEINSAME-FAKTEN.md / Auftrag A-C 'lokales Modell als Orchestrator + waehlbares Kontextfenster'), Nachfolger von grug (grug bleibt vollstaendig erhalten und waehlbar). Dieselbe Bauform wie grug-27b-mlx-q4 (config.json: model_type qwen3_5, Qwen3_5ForConditionalGeneration, 4bit/group_size 64, 64 Lagen, full_attention_interval 4 -- 16 volle Attention-Lagen, num_key_value_heads 4, head_dim 256) -- also derselbe KV-Bedarf je Token (0,0625 MiB, angenommen aus der Architektur, nicht lastgetestet, siehe wb-belegung kv liste 'qwen38-27b-mlx-4bit'). 262144 Kontext-Token nativ (max_position_embeddings). Gewichte rund 16,05 GB (drei safetensors-Dateien). GEMESSEN am echten Gardener-Extraktionspfad (dieselben 15 Einheiten, vier gleichzeitige Buendel, 2026-08-15/16, Laeufe unter ~/Knowledge/_meta/messungen/strecken/modellvergleich/laeufe/2026-08-15-*.json, siehe gardener/dream/config.py Zeilen 388-414): mit Denkstufe 'low' (Gardeners gewaehlte Einstellung) 129 gefundene Aussagen bei 62,2 s/Einheit, 36,7 Tok/s, Ablehnungsquote des Zitattors nur 19,4 % (gegen 31,1 % bei grug); mit Denken aus 99 Aussagen bei 29,5 s/Einheit, 37,0 Tok/s, Ablehnungsquote 31,7 %. Rechengeschwindigkeit praktisch gleich wie grug (37 Tok/s) -- qwen3.8 findet WENIGER Aussagen, ist aber je gefundener Aussage deutlich belastbarer, und langsamer je Einheit, weil es mit Denkstufe 'low' mehr schreibt. Gardener wechselte deshalb am 16.08.2026 von grug auf qwen3.8 (mit reasoning_effort='low') als Extraktionsmodell.",
-      "notFor": "Latenzkritisches -- laeuft langsamer als jede Cloud-Spur (Erwartung, nicht eigens gemessen). Braucht vor dem Start 20 GB freien Speicher (wb-mlx-server ensure prueft das) und laeuft nicht dauerhaft -- bewusst kein LaunchAgent, damit Bild-/Videoerzeugung denselben Speicher weiter bekommt. DENKSTUFEN-FALLE (GEMESSEN 2026-08-19, siehe gardener/dream/config.py Zeilen 415-420): ohne gesetzten reasoning_effort waehlt Qwen3.8s eigene Chat-Vorlage xhigh, und eine einzelne Anfrage kann dann ueber 28 Minuten statt rund einer Minute brauchen. pi gibt --thinking NICHT an den Server weiter (gemessen: der Anfragekoerper im DEBUG-Log von mlx_lm.server enthaelt kein chat_template_kwargs/reasoning_effort-Feld) -- wb-mlx-server setzt deshalb serverseitig chatTemplateArgs={\"reasoning_effort\":\"low\"} aus diesem Registry-Eintrag (--chat-template-args beim Start von mlx_lm.server), unabhaengig davon, was der Aufrufer schickt.",
+      "goodFor": "SIEHT: nimmt Bild UND Video auf (config.json fuehrt vision_config, image_token_id, video_token_id). Damit kann das lokale Modell etwas, das Claude Opus nicht kann -- bei visuellen Aufgaben also erst recht hier anfangen. VORGABE-MODELL fuer Worker (der Nutzer, 2026-08-27): erst pruefen, ob Qwen3.8 lokal fuer die Aufgabe reicht; ein Cloud-Modell kommt erst, wenn es das nicht tut. Token-frei, kein Kontingent, kein Datenabfluss -- der Punkt wiegt schwer, seit am 25.08. beim Vermessen freier Cloud-Modelle echte Projektdaten abgeflossen sind. Token-freier Default-Coder seit 2026-08-19 (Entscheidung des Nutzers, siehe GEMEINSAME-FAKTEN.md / Auftrag A-C 'lokales Modell als Orchestrator + waehlbares Kontextfenster'), Nachfolger von grug (grug bleibt vollstaendig erhalten und waehlbar). Dieselbe Bauform wie grug-27b-mlx-q4 (config.json: model_type qwen3_5, Qwen3_5ForConditionalGeneration, 4bit/group_size 64, 64 Lagen, full_attention_interval 4 -- 16 volle Attention-Lagen, num_key_value_heads 4, head_dim 256) -- also derselbe KV-Bedarf je Token (0,0625 MiB, angenommen aus der Architektur, nicht lastgetestet, siehe wb-belegung kv liste 'qwen38-27b-mlx-4bit'). 262144 Kontext-Token nativ (max_position_embeddings). Gewichte rund 16,05 GB (drei safetensors-Dateien). GEMESSEN am echten Gardener-Extraktionspfad (dieselben 15 Einheiten, vier gleichzeitige Buendel, 2026-08-15/16, Laeufe unter ~/Knowledge/_meta/messungen/strecken/modellvergleich/laeufe/2026-08-15-*.json, siehe gardener/dream/config.py Zeilen 388-414): mit Denkstufe 'low' (Gardeners gewaehlte Einstellung) 129 gefundene Aussagen bei 62,2 s/Einheit, 36,7 Tok/s, Ablehnungsquote des Zitattors nur 19,4 % (gegen 31,1 % bei grug); mit Denken aus 99 Aussagen bei 29,5 s/Einheit, 37,0 Tok/s, Ablehnungsquote 31,7 %. Rechengeschwindigkeit praktisch gleich wie grug (37 Tok/s) -- qwen3.8 findet WENIGER Aussagen, ist aber je gefundener Aussage deutlich belastbarer, und langsamer je Einheit, weil es mit Denkstufe 'low' mehr schreibt. Gardener wechselte deshalb am 16.08.2026 von grug auf qwen3.8 (mit reasoning_effort='low') als Extraktionsmodell.",
+      "notFor": "Latenzkritisches -- laeuft langsamer als jede Cloud-Spur (Erwartung, nicht eigens gemessen). Braucht vor dem Start 20 GB freien Speicher (wb-mlx-server ensure prueft das) und laeuft nicht dauerhaft -- bewusst kein LaunchAgent, damit Bild-/Videoerzeugung denselben Speicher weiter bekommt. DENKSTUFEN-FALLE (GEMESSEN 2026-08-19, siehe gardener/dream/config.py Zeilen 415-420): ohne gesetzten reasoning_effort waehlt Qwen3.8s eigene Chat-Vorlage xhigh, und eine einzelne Anfrage kann dann ueber 28 Minuten statt rund einer Minute brauchen. pi gibt --thinking NICHT an den Server weiter (gemessen: der Anfragekoerper im DEBUG-Log von mlx_lm.server enthaelt kein chat_template_kwargs/reasoning_effort-Feld) -- wb-mlx-server setzt deshalb serverseitig chatTemplateArgs={\"reasoning_effort\":\"low\"} aus diesem Registry-Eintrag (--chat-template-args beim Start von mlx_lm.server), unabhaengig davon, was der Aufrufer schickt. Nicht fuer lange mehrstufige Arbeit mit Zweideutigkeit und nicht fuer Design-Deliverables; dort bleibt ein grosses Cloud-Modell die richtige Wahl. Und nie neben einem zweiten grossen Modell starten: 48 GB gemeinsamer Speicher, vorher check-resources.",
       "enabled": true,
       "supportsEffort": true,
       "notes": "Server bedarfsweise ueber wb-mlx-server ensure qwen38 (shell/wb-mlx-server, Nachfolger von grug-server -- ein Server fuer mehrere MLX-Modelle, grug und qwen3.8 teilen sich Port 8081, immer nur eines geladen), gestartet via wb-nohup; davor sitzt wb-modell-proxy auf 8080, der bei der ersten Anfrage selbst hochfaehrt und nach 20 Minuten Leerlauf wieder stoppt. supportsEffort=true, weil pi --thinking als eigenen CLI-Schalter annimmt -- GEMESSEN 2026-08-19: pi gibt --thinking NICHT als chat_template_kwargs/reasoning_effort an den mlx-lokal-Provider weiter (Anfragekoerper im DEBUG-Log von mlx_lm.server ohne dieses Feld). Die Denkintensitaet dieses Modells wird deshalb ausschliesslich ueber den Server-Start gesteuert, siehe chatTemplateArgs und die Denkstufen-Falle in notFor. Nur auf dem Mac installiert (MLX/Metal, unified memory) -- nicht auf peer (CUDA).",
@@ -2256,6 +2327,40 @@
         "umschlagpunktStroeme": 2,
         "herkunft": "Zweiter Motor neben MTPLX, Entscheidung des Nutzers vom 20.08.2026: MTPLX bleibt der Standard fuer den einzelnen Strom, vllm-metal uebernimmt, sobald mehrere lokale Worker gleichzeitig laufen. GEMESSEN (Worker 'nebenlauf', 2026-08-20, qwen38-27b-mlx-4bit, 200 Token je Anfrage, temperature 0, Denkstufe low, --max-model-len 2048, VLLM_METAL_MEMORY_FRACTION=0.5; Gesamtdurchsatz Tok/s): 17,22 / 32,63 / 53,81 / 59,44 / 66,68 bei 1 / 2 / 4 / 8 / 16 Stroemen, gegen 16,44 / 30,49 / 51,99 / 54,56 / 63,52 bei mlx_lm.server -- auf JEDER Stufe vorn, auch im Einzelstrom. MTPLX bleibt intern seriell (31,5 / 31,3 / 30,2 bei 1 / 2 / 4) und ist unter zwei Stroemen mit Abstand schneller; der Umschlagpunkt liegt rechnerisch bei 1,89 Stroemen und damit ganzzahlig bei zwei, wo vllm-metal mit 32,63 gegen 31,3 Tok/s gesamt und 16,32 gegen 15,65 je Worker auf beiden Achsen vorn liegt (Herleitung im Quelltext bei VLLM_UMSCHLAGPUNKT_STROEME in shell/wb-mlx-server). FALLE, die in derselben Tabelle steht: bei ZWOELF Stroemen faellt der Durchsatz auf 52,89 zurueck, unter die 59,44 bei acht, bevor er bei sechzehn auf 66,68 springt -- derselbe Knick wie bei mlx_lm.server (50,51 bei zwoelf). Der Deckel (--max-num-seqs) rastet deshalb auf acht bzw. sechzehn ein und liegt nie dazwischen. KEINE VORHERSAGE ueber diesen Motor: MTP ist dort nur fuer Gemma4 gebaut, ein Entwurfsmodell wird bei gemischten Lagentypen abgewiesen (draft_model_proposer.py:585-614, und die ganze Qwen3.5/3.6/3.8-Familie ist hybrid), und n-Gramm stirbt beim ersten Dekodierschritt mit 'NotImplementedError: Speculative decode verification is not supported for hybrid GDN models on Metal yet.' -- deshalb ein eigenes Feld neben 'vorhersage' und nicht darin. GUETE ist fuer diesen Wechsel ausdruecklich NICHT gemessen und das ist keine Luecke: es sind dieselben Gewichte ueber denselben MLX-Kern, gierig dekodiert; nur die Schicht darueber und damit die Geschwindigkeit aendert sich. SPEICHER: VLLM_METAL_MEMORY_FRACTION bezieht sich auf Metals max_recommended_working_set_size (42,0 GiB), NICHT auf die 48 GiB der Maschine -- mit 0,5 blieb der ganze Prozess gemessen unter 21 GiB. wb-belegung bucht genau dieses Budget (--metal-fraktion). WARNUNG: der Motor setzt beim Start 'Set Metal wired_limit to 42.0 GB', auch bei kleiner Fraktion -- genau der Hebel aus der Kernel-Panik vom 11.08.; wer die Fraktion erhoeht, muss das wissen. NACHGEMESSEN am 21.08.2026 (Worker 'motor', beide Motoren selbst gefahren, je ein frisch gestarteter Server ueber wb-mlx-server ensure, --kontext 2048, 200 Token je Anfrage, temperature 0): MTPLX 28,63 / 30,57 / 29,65 gegen vllm-metal 17,25 / 32,59 / 54,47 Tok/s bei 1 / 2 / 4 Stroemen -- derselbe Schnittpunkt (1,87 statt 1,89), dieselbe Schwelle bei zwei, und bei vier Stroemen fast das Doppelte."
       }
+    },
+    {
+      "id": "qwen38u-27b",
+      "label": "qwen3.8-27b UNCENSORED (lokal, oMLX oQ4e, MTP an)",
+      "alias": "qwen38u",
+      "harness": "pi",
+      "provider": "omlx-lokal",
+      "modelRef": "$HOME/.omlx/models/pyros-vault/Qwen3.8-27B-Uncensored-oQ4e-mtp",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "medium",
+      "contextWindow": 262144,
+      "machines": [
+        "mac"
+      ],
+      "gewichteGb": 15.8,
+      "chatTemplateArgs": {
+        "reasoning_effort": "low"
+      },
+      "workerClass": [
+        {
+          "class": "uncensored",
+          "effort": "medium",
+          "goodFor": "Abliteriertes Qwen3.8-27B fuer Aufgaben, an denen ein aligntes Modell grundlos ablehnt (Red-Teaming, Sicherheitsforschung, sensible Inhalte). GEMESSEN 2026-09-01: 0/16 Looping, 16/16 korrekt in einer mehrschrittigen Werkzeugschleife."
+        }
+      ],
+      "goodFor": "Abliterierte (uncensored) Fassung von Qwen3.8-27B (Quelle orcarouter/Qwen3.8-27B-Uncensored, oMLX oQ4e Mixed-Precision). SIEHT: Bild und Video (VLM). Nativer MTP-Kopf, ueber omlx serve als Lightning MTP IMMER AN (model_settings.json mtp_enabled=true) -- GEMESSEN 2026-09-01: 28,9 statt 16,7 Tok/s = 1,73x, Ausgabequalitaet unveraendert. Looping-/Werkzeugtest 0/16 geloopt, 16/16 korrekt. NUR wenn eine Aufgabe wirklich ein unzensiertes Modell braucht -- fuer normale Arbeit ist qwen38 (aligned) die Vorgabe. Token-frei, lokal, kein Datenabfluss.",
+      "notFor": "Kein Ersatz fuer qwen38 im Alltag -- abliterierte Modelle koennen bei Standardaufgaben leicht schwaecher sein und geben ungefiltert aus. Laeuft ueber wb-omlx-server (Port 8079), NICHT ueber wb-mlx-server -- das oQ4e-Format laedt nur ueber omlx serve. Braucht rund 16 GB frei; nie neben einem zweiten grossen Modell (check-resources, wb-belegung). Nur Mac (oMLX/Metal).",
+      "notes": "Serving getrennt von qwen38: wb-omlx-server ensure qwen38u startet omlx serve auf 8079 (Belegung + check-resources + Probeanfrage + 20-min-Leerlauf-Stopp wie wb-mlx-server, aber isoliert). pi-worker ruft es selbst (Provider omlx-lokal). MTP ist nativ im Modell und ueber ~/.omlx/model_settings.json immer an -- kein vorhersage-Block wie bei qwen38 noetig. model_alias in model_settings.json = der modelRef-Pfad, damit pi's --model aufloest. Getestet 2026-09-01, Testgeruest ~/AI/mlx-models/ablit-ab.",
+      "enabled": true,
+      "supportsEffort": true
     },
     {
       "id": "ornith-9b",
@@ -2318,7 +2423,223 @@
       "goodFor": "Lange Coding-Tasks mit klarer Spez; Terminal-Automatisierung.",
       "notFor": "Design-Entscheidungen mit viel Ambiguitaet.",
       "enabled": false,
-      "notes": "modelRef ungeprueft — vor dem ersten Start gegen 'codex --help' / die Modellliste pruefen."
+      "notes": "GESPERRT 2026-09-10 (der Nutzer, 22:40: 'ChatGPT Plus jetzt verfuegbar, du kannst codex worker benutzen, aber nur luna und terra worker erlaubt'): kein Worker-Modell, auch nicht als Fallback. Eintrag bleibt, damit die Erkennung ihn nicht als neu wieder freischaltet. Regel: regeln/orchestrierung.md, Abschnitt 'Codex-Worker ueber ChatGPT Plus'. modelRef ungeprueft — vor dem ersten Start gegen 'codex --help' / die Modellliste pruefen.",
+      "updated": "2026-09-10T22:55:00Z"
+    },
+    {
+      "id": "codex-gpt-5-3-codex-spark",
+      "label": "GPT-5.3 Codex Spark",
+      "harness": "codex",
+      "provider": "chatgpt",
+      "modelRef": "gpt-5.3-codex-spark",
+      "contextWindow": 128000,
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "low",
+      "machines": [
+        "mac",
+        "peer"
+      ],
+      "workerClass": [
+        {
+          "class": "coding-kurz",
+          "effort": "low",
+          "goodFor": "Sehr schnelle, kurze Coding-Auftraege mit klarer Spezifikation."
+        }
+      ],
+      "goodFor": "Sehr schnelle, kurze Coding-Auftraege mit klarer Spezifikation. Eigener Codex-Spark-Kontingenttopf: zuerst fuer passende Text-Coding-Kleinarbeit pruefen, damit das allgemeine Codex-Kontingent frei bleibt.",
+      "notFor": "Lange, mehrstufige oder mehrdeutige Aufgaben; reine Texteingabe, daher keine Bildpruefung, Bildbearbeitung oder Computer-Use-Aufgabe mit sichtbarem Zustand.",
+      "enabled": true,
+      "notes": "Seit 2026-09-12 fuer Menschen voll waehlbar und fuer Agenten als schnelle Coding-Spur vorgesehen.",
+      "updated": "2026-09-12T00:00:00Z"
+    },
+    {
+      "id": "codex-gpt-5-5",
+      "label": "GPT-5.5",
+      "harness": "codex",
+      "provider": "chatgpt",
+      "modelRef": "gpt-5.5",
+      "nativeContextWindow": 1050000,
+      "contextWindow": 272000,
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "medium",
+      "machines": [
+        "mac",
+        "peer"
+      ],
+      "goodFor": "Manuelle Modellwahl und Vergleiche mit der vorherigen Generation.",
+      "notFor": "Keine Agenten-Vorgabe; neuere GPT-Modelle decken die regulaeren Worker-Klassen ab.",
+      "enabled": true,
+      "notes": "Seit 2026-09-12 fuer Menschen voll waehlbar; Agenten waehlen es nur fuer einen ausdruecklichen Vergleich.",
+      "updated": "2026-09-12T00:00:00Z"
+    },
+    {
+      "id": "codex-gpt-5-6-luna",
+      "label": "GPT-5.6 Luna",
+      "harness": "codex",
+      "provider": "chatgpt",
+      "modelRef": "gpt-5.6-luna",
+      "nativeContextWindow": 1050000,
+      "contextWindow": 272000,
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "medium",
+      "machines": [
+        "mac",
+        "peer"
+      ],
+      "workerClass": [
+        {
+          "class": "coding-kurz",
+          "effort": "medium",
+          "goodFor": "Schnelle, klar umrissene Coding-Auftraege und Terminal-Automatisierung."
+        },
+        {
+          "class": "bulk",
+          "effort": "low",
+          "goodFor": "Cloud-Bulk, Extraktion und Klassifikation, wenn lokal nicht reicht und das Codex-Kontingent Luft hat."
+        },
+        {
+          "class": "recherche",
+          "effort": "medium",
+          "goodFor": "Breite Websuche, Seiten auslesen und Material vorsortieren; Quellenpflicht bleibt."
+        },
+        {
+          "class": "bild",
+          "effort": "medium",
+          "goodFor": "Klare Bildgenerierung oder Bildbearbeitung ueber das GPT-Bildwerkzeug; die Bildengine erzeugt die Pixel, Luna steuert den einfachen Auftrag sparsam."
+        }
+      ],
+      "goodFor": "Schnelle und volumenstarke Arbeit: kurze Coding-Auftraege, Extraktion, Recherche-Vorsortierung und klar beschriebene GPT-Bildauftraege. Nimmt Text und Bilder auf und kann Websuche, Dateisuche, Bildgenerierung, Code-Interpreter, Shell, Skills und Computer Use nutzen, sofern das jeweilige Werkzeug im Harness vorhanden ist.",
+      "notFor": "Tiefe Ambiguitaet, schwierige visuelle Leitung, lange Architekturarbeit oder anspruchsvoller Computer-Use-Ablauf.",
+      "enabled": true,
+      "notes": "Seit 2026-09-12 Teil der kuratierten GPT-Worker-Auswahl.",
+      "updated": "2026-09-12T00:00:00Z"
+    },
+    {
+      "id": "codex-gpt-5-6-sol",
+      "label": "GPT-5.6 Sol",
+      "harness": "codex",
+      "provider": "chatgpt",
+      "modelRef": "gpt-5.6-sol",
+      "nativeContextWindow": 1050000,
+      "contextWindow": 272000,
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "medium",
+      "machines": [
+        "mac",
+        "peer"
+      ],
+      "workerClass": [
+        {
+          "class": "reasoning",
+          "effort": "xhigh",
+          "goodFor": "Lange oder mehrstufige GPT-Arbeit, Debugging und Ambiguitaet."
+        },
+        {
+          "class": "review",
+          "effort": "high",
+          "goodFor": "Unabhaengiger Gegenpass ueber Arbeit einer anderen Modellfamilie."
+        },
+        {
+          "class": "visuell",
+          "effort": "xhigh",
+          "goodFor": "Komplexe sichtbare Deliverables, Art Direction und visuelle Entscheidungen mit Bildpruefung."
+        },
+        {
+          "class": "bild",
+          "effort": "high",
+          "goodFor": "Anspruchsvolle Bildgenerierung oder Bildbearbeitung mit Komposition, Typografie, Referenzen und iterativer Sichtpruefung ueber das GPT-Bildwerkzeug."
+        },
+        {
+          "class": "computer",
+          "effort": "high",
+          "goodFor": "Mehrstufige Bedienung von Browsern und Apps mit sichtbarer Zustandspruefung, sofern Computer Use im Harness vorhanden ist."
+        },
+        {
+          "class": "recherche",
+          "effort": "high",
+          "goodFor": "Schwierige Recherche mit Synthese, widerspruechlichen Quellen oder fachlichem Urteil."
+        }
+      ],
+      "goodFor": "Vorgabemodell, sobald ein Mensch OpenAI Codex CLI als Orchestrator waehlt; lange und anspruchsvolle GPT-Arbeit, Recherche-Synthese, visuelle Leitung, Bildarbeit und mehrstufiges Computer Use.",
+      "notFor": "Kurze Routinearbeit, fuer die Spark, Luna oder Terra genuegen.",
+      "enabled": true,
+      "notes": "Seit 2026-09-12 Codex-Orchestrator-Vorgabe, ohne Claude + Opus als allgemeinen Standard zu ersetzen.",
+      "updated": "2026-09-12T00:00:00Z"
+    },
+    {
+      "id": "codex-gpt-6-astra",
+      "label": "GPT-6 Astra",
+      "harness": "codex",
+      "provider": "chatgpt",
+      "modelRef": "gpt-6-astra",
+      "nativeContextWindow": 1050000,
+      "contextWindow": 272000,
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "medium",
+      "machines": [
+        "mac",
+        "peer"
+      ],
+      "goodFor": "Staerkstes GPT-Modell fuer ausdruecklich angeforderte Agenten-Einsaetze und jede manuelle Wahl.",
+      "notFor": "Agenten duerfen Astra ohne ausdrueckliche Anweisung vom Nutzer nicht waehlen.",
+      "enabled": true,
+      "notes": "Menschen duerfen Astra jederzeit waehlen. Ein Agent setzt Astra nur nach ausdruecklicher Anweisung fuer den konkreten Einsatz ein.",
+      "updated": "2026-09-12T00:00:00Z"
     },
     {
       "id": "aider-ornith-35b",
@@ -2474,11 +2795,13 @@
       "notFor": "Tiefe Analysen und heikle Entscheidungen — dafuer die Pro-Variante oder Claude."
     },
     {
-      "id": "codex-gpt5",
-      "label": "Codex + GPT-5.6 (Abo)",
+      "id": "codex-gpt-5-6-terra",
+      "label": "GPT-5.6 Terra",
       "harness": "codex",
       "provider": "chatgpt",
       "modelRef": "gpt-5.6-terra",
+      "nativeContextWindow": 1050000,
+      "contextWindow": 272000,
       "roles": [
         "worker",
         "orchestrator"
@@ -2486,16 +2809,35 @@
       "efforts": [
         "low",
         "medium",
-        "high"
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
       ],
-      "maxEffort": "high",
+      "maxEffort": "xhigh",
       "defaultEffort": "medium",
       "workerClass": [
-        "coding-lang"
+        {
+          "class": "coding-lang",
+          "effort": "high",
+          "goodFor": "Groessere Coding-Auftraege mit klarer Spezifikation und Terminal-Automatisierung."
+        },
+        {
+          "class": "recherche",
+          "effort": "medium",
+          "goodFor": "Recherche mit Auswertung und Zusammenfuehrung, wenn Luna fuer reine Breite nicht genuegt."
+        },
+        {
+          "class": "computer",
+          "effort": "medium",
+          "goodFor": "Klar definierte Browser- und App-Ablaeufe mit Bildzustand, sofern Computer Use im Harness vorhanden ist."
+        }
       ],
-      "goodFor": "Lange Coding-Tasks mit klarer Spez und Terminal-Automatisierung; Websuche ist mit --search aktiviert. Zweite Frontier-Spur, wenn Claudes Kontingent knapp ist.",
+      "goodFor": "Ausgewogene GPT-Spur fuer groessere klar spezifizierte Coding-Auftraege, Recherche-Auswertung, Bildpruefung und klar definierte Computer-Use-Ablaeufe.",
       "enabled": true,
-      "notFor": "Aufgaben ohne klare Spez — dann lieber Claude Opus. Keine lokale Datenhaltung."
+      "notFor": "Aufgaben ohne klare Spez — dann lieber Claude Opus. Keine lokale Datenhaltung.",
+      "updated": "2026-09-12T00:00:00Z",
+      "notes": "Seit 2026-09-12 Teil der kuratierten GPT-Worker-Auswahl. Kontingent ueber wb-kontingent."
     },
     {
       "id": "goose-ornith-9b",

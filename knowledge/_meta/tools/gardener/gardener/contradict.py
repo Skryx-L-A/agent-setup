@@ -221,8 +221,10 @@ def _queue_rel(vault: Path, arg: str) -> str:
 #
 # Session-end used to run the full judge scan inline (~100s/note). That blocked
 # every session close. Now session-end only appends paths here (milliseconds);
-# `brain contradict --queue --write` (via brain-maintain, Mo/Mi launchd, or by
-# hand) does the actual scan and empties the queue afterwards. See cli.py.
+# `brain contradict --queue --write`, run by hand (seit 2026-08-22 laeuft auf
+# dem Mac kein zeitgesteuerter LaunchAgent mehr, auch der Gaertner selbst nur
+# noch manuell - siehe gardener/cli.py), does the actual scan and empties the
+# queue afterwards. See cli.py.
 
 def queue_read(vault: Path) -> list[str]:
     """Vault-relative paths currently queued, in the order they were added."""
@@ -576,7 +578,8 @@ def run_contradict(to_check: list[Note], all_notes: list[Note],
             if key in seen:
                 continue
             seen.add(key)
-            if deadline is not None and deadline.expired():
+            if deadline is not None and deadline.expired(
+                    "contradict", done=result.pairs_checked):
                 return result
             other = by_rel.get(other_rel)
             if other is None:

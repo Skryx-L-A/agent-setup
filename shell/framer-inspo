@@ -100,6 +100,12 @@ case "${1:-}" in
   --list)       list_all;    exit 0 ;;
   --urls) shift; [ "$#" -gt 0 ] || { echo "need a brief" >&2; exit 1; }
           resolve "$@"; emit_urls; exit 0 ;;
+  # Anlass (2026-08-22, dieselbe Bugfamilie wie wb-budget): dieser case-Block hatte
+  # keinen Default-Zweig -- ein getipptes '--lst' traf keinen der drei Zweige oben und
+  # lief unten in `resolve "$@"`, das die gesamte Eingabe (Flag samt Rest) als freien
+  # Text behandelt: kein Fehler, nur ein Ergebnis, in dem der Tippfehler wortwoertlich
+  # im "Brief:"-Feld auftaucht. Ein Brief beginnt in keinem Aufruf mit '-'.
+  -*) echo "framer-inspo: unbekannte Option '$1'" >&2; exit 1 ;;
 esac
 
 resolve "$@"

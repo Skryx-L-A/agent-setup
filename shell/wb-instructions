@@ -10,23 +10,20 @@ Canonical sources (never written by this tool, only read):
   ~/.claude/roles/agent.md
   ~/.claude/skills/*/SKILL.md
 
-For every non-Claude harness these three files get concatenated into ONE generated
-instructions file (each such CLI only auto-reads a single file -- no separate system-prompt
-slot, no native skill feature), with a small, table-driven set of Claude-Code-specific
-substitutions applied (see REPLACEMENTS below) and a skills index appended. Each generated
-file starts with a marker block (source paths, timestamp, SHA-256 of sources AND of its own
-body) so a second `sync` is a true no-op when nothing changed, and a hand-edited target is
-detected (content hash mismatch) and refused rather than silently overwritten.
+The default creates compact, role-aware entry points using registry adapter paths,
+plus a fallback skill index and directory links for native skill discovery. Sources,
+YAML and relative assets remain intact. Existing divergent skill copies require explicit
+--adopt-skills and are snapshotted. No provider-name substitutions occur in this mode.
+Generated content hashes preserve idempotence and detect hand edits.
 
-Separately, `sync` also drops a `<!-- wb:routing-table:start/end -->` marker pair around the
-existing worker-routing table in ~/.claude/CLAUDE.md and around the matching reference line in
-~/.claude/roles/orchestrator.md -- insertion only, not one other word touched -- so a future
-`wb-state models table` fill-in can keep that table current without hand edits.
+--layout bundle retains the historical full-copy renderer for compatibility; it is
+not the default and does not describe current harness capabilities.
 """
 import argparse
 import atomar_schreiben
 import datetime
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -620,6 +617,17 @@ def sync_routing_block(path, label, anchor_fn, table_md, table_err, dry_run, day
                         verb if not table_err else "%s (Fuellbefehl: %s)" % (verb, table_err), path))
         return "conflict-would-force" if status == "foreign" else None
 
+    # Eine gefuellte Tabelle wird NIE geleert, nur weil die Quelle gerade nicht
+    # lesbar war (Befund 01.09.2026: ueber ssh ohne Login-Shell fehlt ~/.local/bin
+    # im PATH, `wb-state` war nicht auffindbar, und der Lauf meldete "left-empty" --
+    # er hatte die vollstaendige Routing-Tabelle auf peer geloescht). Leer bleiben
+    # darf nur, was schon leer war.
+    if not desired and between.strip():
+        report.append(("routing-table:%s" % label,
+                        "behalten -- Quelle nicht lesbar (%s)" % (table_err or "kein Grund gemeldet"),
+                        path))
+        return
+
     snapshot_before_overwrite(path, day_tag)
     new_region = "%s%s\n%s%s%s\n" % (indent, ROUTING_START, desired, indent, ROUTING_END)
     new_text = text[:m.start()] + new_region + text[m.end():]
@@ -670,7 +678,158 @@ def sync_routing_markers(dry_run, day_tag, force, report):
 # main
 # ---------------------------------------------------------------------------
 
+def router_harnesses():
+    """Read adapter paths from the same registry used by the launcher.
+
+    The historical seven adapters are only a bootstrap for an absent registry.
+    Project-only adapters receive rules through their injected role, not invented
+    global filenames. Registry metadata describes wiring, not proof of runtime support.
+    """
+    path = hp("~/.claude/workbench/models.json")
+    if not os.path.isfile(path):
+        return [{"id": h["id"], "target": h["target"], "systemPrompt": {}}
+                for h in HARNESSES]
+    data = json.loads(read_text(path))
+    entries = data.get("harnesses", [])
+    if isinstance(entries, dict):
+        entries = [dict(value, id=key) for key, value in entries.items()]
+    result = []
+    for h in entries:
+        sp = h.get("systemPrompt") or {}
+        target = sp.get("path")
+        if h["id"] == "claude":
+            target = None  # canonical source, never overwrite with its own router
+        if h["id"] in ("pi", "pi-llamacpp"):
+            target = "~/.pi/agent/RULES.md"
+        if not target and h["id"] != "claude":
+            legacy = HARNESS_BY_ID.get(h["id"], {}).get("target")
+            if legacy and os.path.isfile(hp(legacy)):
+                target = legacy  # keep an already installed manual entry point current
+        result.append({"id": h["id"], "target": target, "systemPrompt": sp})
+    return result
+
+
+def render_router(harness):
+    return (
+        "# Werkbank: gemeinsame Anweisungen\n\n"
+        "Diese Regeln gelten fuer jeden Harness und jedes Modell. Lies vor der ersten\n"
+        "Aufgabe `~/.claude/CLAUDE.md`; dort stehen Grundregeln und Ausloeser fuer\n"
+        "weitere Dateien. Die Pfade sind echte Speicherorte, keine Produktnamen zum\n"
+        "Uebersetzen. Bereits gelesene identische Quellen nicht erneut laden.\n\n"
+        "Die Rolle kommt aus dem aktuellen Auftrag bzw. dem injizierten Rollen-Prompt.\n"
+        "Ohne delegierten Auftrag bist du Ansprechpartner des Menschen. Lies nur die\n"
+        "passende Rolle: `~/.claude/roles/orchestrator.md` oder\n"
+        "`~/.claude/roles/agent.md`. Eine alte Projektdatei macht einen Hauptagenten\n"
+        "nicht zum Worker. Schutzregeln und ausdrueckliche Nutzerentscheidungen gelten\n"
+        "weiter; hoeherrangige Vorgaben des laufenden Harness haben Vorrang.\n\n"
+        "Skills: nativen Katalog verwenden; fehlt er, vor einer passenden Aufgabe\n"
+        "`~/.agent-instructions/skills.md` lesen und den dort genannten Skill laden.\n"
+        "Relative Referenzen werden am jeweiligen Quellverzeichnis aufgeloest.\n"
+        "Fuer Plugin-/System-Skills anderer Harnesses steht der Faehigkeitsadapter in\n"
+        "`~/.claude/skill-adapters/index.md`; nur die passende Route daraus laden.\n"
+        "Fehlende Werkzeuge konkret melden oder einen belegten Adapter nutzen; niemals\n"
+        "Befehle, Modellnamen oder Pfade durch globale Textersetzung erfinden.\n\n"
+        "Werkbank-Adapter: `%s`. Start-/Rollenweg und Faehigkeiten kommen aus\n"
+        "`~/.claude/workbench/models.json`; `wb-state harness get %s` zeigt den Eintrag.\n"
+        "Eine Registrierung ist kein erfolgreicher Lauf. Werkzeuge und Grenzen der\n"
+        "aktuellen Sitzung pruefen; nur benoetigte Zusatzregeln laden.\n"
+        % (harness["id"], harness["id"])
+    )
+
+
+def sync_skill_links(skills, args, day_tag, report):
+    """Native discovery requires YAML at byte zero and all relative assets present.
+
+    Directory links retain both. Divergent copies are never silently discarded;
+    adoption is explicit and snapshots the complete directory before replacing it.
+    """
+    conflicts = 0
+    for root in (AGENT_SKILLS_DIR, hp("~/.agents/skills")):
+        for skill in skills:
+            source = os.path.realpath(skill["dir"])
+            target = os.path.join(root, skill["name"])
+            if os.path.realpath(target) == source:
+                report.append(("skill:" + skill["name"], "unchanged", target))
+                continue
+            exists = os.path.lexists(target)
+            if exists and not args.adopt_skills:
+                report.append(("skill:" + skill["name"], "conflict", target))
+                conflicts += 1
+                continue
+            status = "would-adopt" if exists else "new"
+            if not args.dry_run:
+                os.makedirs(root, exist_ok=True)
+                if exists:
+                    base = os.path.join(SNAPSHOT_ROOT, day_tag + "-skill-links",
+                                        root.lstrip(os.sep), skill["name"])
+                    destination = base
+                    suffix = 1
+                    while os.path.lexists(destination):
+                        destination = base + "." + str(suffix)
+                        suffix += 1
+                    os.makedirs(os.path.dirname(destination), exist_ok=True)
+                    shutil.move(target, destination)
+                os.symlink(source, target, target_is_directory=True)
+                status = "adopted" if exists else "new"
+            report.append(("skill:" + skill["name"], status, target))
+    return conflicts
+
+
+def sync_router(args):
+    """Generate small entry points; never reinsert roles or rule bodies globally."""
+    required = (SRC_CLAUDE, SRC_ORCH, SRC_AGENT)
+    missing = [p for p in required if not os.path.isfile(p)]
+    if missing:
+        print("wb-instructions: Quelle fehlt: " + ", ".join(missing), file=sys.stderr)
+        return 1
+    try:
+        harnesses = router_harnesses()
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print("wb-instructions: Registry unlesbar: " + str(exc), file=sys.stderr)
+        return 1
+    if args.harness and args.harness not in {h["id"] for h in harnesses}:
+        print("wb-instructions: unbekannter Harness: " + args.harness, file=sys.stderr)
+        return 1
+    report = []
+    conflicts = 0
+    day_tag = datetime.date.today().isoformat()
+    hashes = {p: sha256_text(read_text(p)) for p in required}
+    skills = discover_skills()
+    artifacts = [(hp("~/.agent-instructions/skills.md"),
+                  "# Skills der Werkbank\n\nNur den zum Auftrag passenden Skill lesen.\n\n"
+                  "Plugin- und System-Skills: `~/.claude/skill-adapters/index.md`.\n"
+                  "Native Werkzeuge nur bei tatsaechlich verfuegbarer Faehigkeit nutzen.\n\n"
+                  + render_skills_index(skills), "skills-index")]
+    seen = set()
+    for h in harnesses:
+        if args.harness and h["id"] != args.harness:
+            continue
+        if not h["target"]:
+            report.append((h["id"], "role-injection", h["systemPrompt"].get("projectPath", "via launcher")))
+            continue
+        target = hp(h["target"])
+        if target in seen:
+            continue
+        seen.add(target)
+        artifacts.append((target, render_router(h), h["id"]))
+    for target, body, label in artifacts:
+        digest = sha256_text(body)
+        full = build_marker(required, hashes, digest, now_generated_at_for(target, digest)) + body
+        status = write_generated(target, full, digest, args.dry_run, day_tag, args.force)
+        conflicts += status == "conflict"
+        report.append((label, status, target))
+    conflicts += sync_skill_links(skills, args, day_tag, report)
+    print("%-28s %-24s %s" % ("HARNESS/ZIEL", "STATUS", "DATEI"))
+    for row in report:
+        print("%-28s %-24s %s" % row)
+    if conflicts:
+        print("wb-instructions: %d Konflikt(e); nichts davon ueberschrieben." % conflicts, file=sys.stderr)
+    return 1 if conflicts else 0
+
+
 def cmd_sync(args):
+    if args.layout == "router":
+        return sync_router(args)
     for p in (SRC_CLAUDE, SRC_ORCH, SRC_AGENT):
         if not os.path.isfile(p):
             print("wb-instructions: Quelle fehlt: %s" % p, file=sys.stderr)
@@ -739,6 +898,10 @@ def main():
     sp.add_argument("--dry-run", action="store_true")
     sp.add_argument("--harness", default=None)
     sp.add_argument("--force", action="store_true")
+    sp.add_argument("--layout", choices=("router", "bundle"), default="router",
+                    help="router: bedarfsweise Quellen laden; bundle: historische Vollkopie")
+    sp.add_argument("--adopt-skills", action="store_true",
+                    help="bestehende Skillkopien sichern und durch Quellenverweise ersetzen")
     args = ap.parse_args()
     if args.cmd == "sync":
         sys.exit(cmd_sync(args))

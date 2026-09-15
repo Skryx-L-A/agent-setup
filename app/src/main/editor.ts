@@ -9,8 +9,9 @@
 // Session (4c: "gezeigt wird der Ordner der gewaehlten Session"), nie
 // darueber hinaus -- das haelt den Editor auf denselben Umfang wie der
 // Schnelloeffner und macht einen Pfadausbruch unmoeglich.
+import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, statSync, readdirSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, statSync, readdirSync, realpathSync, watch, type FSWatcher } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
 import { assertPaneId } from './tmux';
 import { ausschlussFilter } from './einstellungen';
@@ -138,7 +139,19 @@ export function readFileSafe(root: string, pfad: string): { abs: string; content
 export function writeFileSafe(root: string, pfad: string, content: string): { abs: string; bytes: number } {
   const abs = aufloesen(root, pfad);
   writeFileSync(abs, content, 'utf8');
+  // Der eigene Schreibvorgang darf nicht als fremde Aenderung zurueckkommen
+  // (siehe startEditorWaechter): gemerkt wird der Fingerabdruck des Inhalts,
+  // nicht eine Uhrzeit -- eine Frist wuerde einen ECHTEN fremden Schreibvorgang
+  // im selben Augenblick verschlucken.
+  eigeneSchrift.set(abs, fingerabdruck(content));
   return { abs, bytes: Buffer.byteLength(content, 'utf8') };
+}
+
+/** Was diese Anwendung zuletzt in eine Datei geschrieben hat (Fingerabdruck). */
+const eigeneSchrift = new Map<string, string>();
+
+function fingerabdruck(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
 /**
@@ -165,20 +178,33 @@ export function sendSelectionToOrchestrator(tmuxSocket: string, paneId: string, 
   const bufName = `awb-editor-${process.pid}-${Date.now()}`;
   const baseArgs = tmuxSocket ? ['-L', tmuxSocket] : [];
   return new Promise((resolvePromise, reject) => {
-    const load = spawn('tmux', [...baseArgs, 'load-buffer', '-b', bufName, '-'], { stdio: ['pipe', 'ignore', 'pipe'] });
+    // FRIST (2026-09-03, Audit "tmux-Aufrufe ohne Frist"): dieser Aufruf hatte
+    // GAR KEIN Timeout -- ein haengendes tmux liess die Zusage dieser Funktion
+    // nie mehr auflösen. `spawn()` traegt seit Node 15.14 dieselben Optionen
+    // wie `spawnSync` (dieses Haus nutzt ein deutlich neueres ueber Electron
+    // 40); 2s wie jeder andere oertliche bare-tmux-Aufruf, SIGKILL aus
+    // demselben Grund wie in sessions.ts/befehle.ts (SIGTERM ist abfangbar).
+    const load = spawn('tmux', [...baseArgs, 'load-buffer', '-b', bufName, '-'], {
+      stdio: ['pipe', 'ignore', 'pipe'], timeout: 2000, killSignal: 'SIGKILL',
+    });
     let stderr = '';
     load.stderr.on('data', (b: Buffer) => {
       stderr += b.toString('utf8');
     });
     load.on('error', reject);
-    load.on('exit', (code) => {
-      if (code !== 0) {
-        reject(new Error(`tmux load-buffer schlug fehl: ${stderr.trim() || `Exitcode ${code}`}`));
+    load.on('exit', (code, signal) => {
+      if (code !== 0 || signal) {
+        reject(new Error(`tmux load-buffer schlug fehl: ${
+          signal ? `nach 2000ms abgebrochen (${signal})` : (stderr.trim() || `Exitcode ${code}`)}`));
         return;
       }
       // FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden): oertlich,
       // 2s wie die anderen bare-tmux-Aufrufe dieses Hauses.
-      const paste = spawnSync('tmux', [...baseArgs, 'paste-buffer', '-p', '-b', bufName, '-d', '-t', paneId], { encoding: 'utf8', timeout: 2000 });
+      // killSignal:SIGKILL (2026-09-03, ergaenzt im selben Audit): SIGTERM
+      // (die Node-Vorgabe) ist abfangbar, siehe sessions.ts/befehle.ts.
+      const paste = spawnSync('tmux', [...baseArgs, 'paste-buffer', '-p', '-b', bufName, '-d', '-t', paneId], {
+        encoding: 'utf8', timeout: 2000, killSignal: 'SIGKILL',
+      });
       if (paste.status !== 0) {
         reject(new Error(`tmux paste-buffer schlug fehl: ${paste.signal ? 'nach 2000ms abgebrochen' : (paste.stderr || '').trim()}`));
         return;
@@ -188,4 +214,106 @@ export function sendSelectionToOrchestrator(tmuxSocket: string, paneId: string, 
     load.stdin.write(text);
     load.stdin.end();
   });
+}
+
+/**
+ * DER WAECHTER UEBER DIE OFFENEN DATEIEN (06.09.2026, Auftrag 3.4).
+ *
+ * Bis heute merkte keine Oberflaeche, wenn eine offene Datei von aussen
+ * geschrieben wurde -- ein Worker legt in derselben Datei los, im Editor steht
+ * weiter der Stand von vorhin, und ein Speichern haette seine Arbeit
+ * ueberschrieben. Beobachtet werden deshalb genau die Dateien, die gerade
+ * offen sind: nichts auf Vorrat, kein Baum, keine Uhr.
+ *
+ * Wie `dateiwaechter.ts` meldet er nur, WELCHE Datei sich geaendert hat; ob
+ * daraus ein Hinweis wird oder still neu geladen wird, entscheidet die
+ * Oberflaeche -- sie allein weiss, ob der Mensch gerade in dieser Datei tippt.
+ *
+ * `setzen` ist die ganze Bedienung: die Liste der offenen Dateien, jedes Mal
+ * vollstaendig. Was nicht mehr darin steht, wird abgeraeumt; was schon
+ * beobachtet wird, bleibt stehen (ein Neuaufbau bei jedem Tabwechsel waere ein
+ * Ereignissturm). Ein `watch()`, das fehlschlaegt (Datei weg, Kontingent
+ * erschoepft), wird still uebergangen -- die Auffrischung faellt dann fuer
+ * diese Datei aus, das Programm laeuft weiter.
+ */
+export interface EditorWaechterHandle {
+  /** Die Pfade, die gerade wirklich beobachtet werden (absolut). */
+  readonly beobachtet: readonly string[];
+  /** Die offenen Dateien setzen -- relativ zu `root` oder absolut. */
+  setzen(root: string, pfade: readonly string[]): void;
+  close(): void;
+}
+
+export function startEditorWaechter(
+  auf: (abs: string) => void,
+  debounceMs = 300,
+): EditorWaechterHandle {
+  const watcher = new Map<string, FSWatcher>();
+  const timer = new Map<string, NodeJS.Timeout>();
+  let zu = false;
+
+  const melden = (abs: string): void => {
+    const bestehend = timer.get(abs);
+    if (bestehend) clearTimeout(bestehend);
+    timer.set(abs, setTimeout(() => {
+      timer.delete(abs);
+      if (zu) return;
+      // Der eigene Schreibvorgang meldet sich selbst zurueck -- er ist keine
+      // fremde Aenderung. Verglichen wird der INHALT, nicht die Uhrzeit.
+      const eigen = eigeneSchrift.get(abs);
+      if (eigen !== undefined) {
+        try {
+          if (fingerabdruck(readFileSync(abs, 'utf8')) === eigen) {
+            eigeneSchrift.delete(abs);
+            return;
+          }
+        } catch {
+          // Nicht lesbar: dann gilt es als fremde Aenderung, wie jede andere.
+        }
+      }
+      auf(abs);
+    }, debounceMs));
+  };
+
+  return {
+    get beobachtet(): readonly string[] {
+      return [...watcher.keys()];
+    },
+    setzen(root: string, pfade: readonly string[]): void {
+      if (zu) return;
+      const gewuenscht = new Set<string>();
+      for (const p of pfade) {
+        if (!p) continue;
+        // Derselbe Weg wie beim Lesen und Schreiben: nichts ausserhalb des
+        // Projektordners, nichts von der Ausschlussliste.
+        try {
+          gewuenscht.add(aufloesen(root, p));
+        } catch {
+          // Ein Pfad, den der Editor nicht oeffnen duerfte, wird auch nicht beobachtet.
+        }
+      }
+      for (const [abs, w] of watcher) {
+        if (gewuenscht.has(abs)) continue;
+        w.close();
+        watcher.delete(abs);
+        const t = timer.get(abs);
+        if (t) { clearTimeout(t); timer.delete(abs); }
+      }
+      for (const abs of gewuenscht) {
+        if (watcher.has(abs)) continue;
+        try {
+          watcher.set(abs, watch(abs, () => melden(abs)));
+        } catch {
+          // Kein Beobachter fuer diese Datei -- kein Grund, die uebrigen zu verlieren.
+        }
+      }
+    },
+    close(): void {
+      zu = true;
+      for (const [, w] of watcher) w.close();
+      watcher.clear();
+      for (const [, t] of timer) clearTimeout(t);
+      timer.clear();
+    },
+  };
 }

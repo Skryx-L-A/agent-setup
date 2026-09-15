@@ -996,13 +996,24 @@ def review_changeset(vault: Path, hunks: list[dict], call, *, run_id: str,
             serie_verbuchen()
             log.warning("dream review: %s - dieses und alle weiteren Pakete "
                         "bleiben unbeurteilt", e)
+            # Erst das im selben Fenster bereits Geglueckte retten, dann den
+            # Rest als offen markieren - und die geretteten NICHT doppelt
+            # eintragen. Dieselbe Reihenfolge wie beim Zeitfrist-Stopp oben:
+            # bis 02.09.2026 stand hier die Markierung VOR der Rettung, und
+            # ein Paket mit hoeherem Index, das im selben Fenster nebenlaeufig
+            # schon geurteilt war, bekam so ZWEI Eintraege - einen echten und
+            # einen falschen `budget-stopped`-Geist, der `budget_left_over`
+            # aufblaehte (gemessen 02.09.2026: 4 statt 3 bei fuenf Paketen und
+            # Platz fuer zwei Aufrufe).
+            gerettet = vorab_verbuchen()
             for rest_index, rest in list(enumerate(packages))[index:]:
+                if rest_index in gerettet:
+                    continue
                 result.packages.append(PackageOutcome(
                     index=rest_index, target=rest.target, hunks=rest.hunk_ids,
                     chars=rest.chars, risky=rest.risky, state=STATE_BUDGET,
                     error=str(e)))
             result.budget_stopped = str(e)
-            vorab_verbuchen()
             break
 
         if outcome.state == STATE_UNREADABLE:
@@ -1103,10 +1114,13 @@ def own_paths(vault: Path, result: ReviewResult) -> list[str]:
     # Anfang an; hier fehlte sie.
     pfade = {f"{audit_rel}/{dcfg.JUDGMENTS_FILE}", dcfg.ISSUES_FILE,
              dcfg.REVIEW_QUEUE_FILE}
-    # Das Journal nur, wenn es existiert: ohne `journal`-Pfad (Tests, Aufrufe
-    # aus der Kette) gibt es keines, und git bekaeme einen Pfad ins Leere.
+    # Journal und Eskalations-Wortlaut nur, wenn es sie gibt: ohne Pakete mit
+    # Eskalation (Tests, Aufrufe aus der Kette) entsteht keine Datei, und git
+    # bekaeme sonst einen Pfad ins Leere.
     if (audit_dir / dcfg.JOURNAL_FILE).exists():
         pfade.add(f"{audit_rel}/{dcfg.JOURNAL_FILE}")
+    if (audit_dir / dcfg.ESCALATION_DETAIL_FILE).exists():
+        pfade.add(f"{audit_rel}/{dcfg.ESCALATION_DETAIL_FILE}")
     return sorted(pfade)
 
 
@@ -1232,7 +1246,8 @@ def run_review(vault: Path, changeset_path: Path, call, *,
                               / dcfg.JOURNAL_FILE)
     if not dry_run:
         write_judgments(vault, result)
-        issues_mod.record(vault, issues_from(result), dry_run=dry_run)
+        issues_mod.record(vault, issues_from(result), dry_run=dry_run,
+                          hunks=hunks, run_id=result.run_id)
         if commit:
             git_commit_fn(vault, f"dream: review {result.run_id}",
                           own_paths(vault, result), dry_run=dry_run)

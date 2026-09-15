@@ -1,0 +1,59 @@
+#!/bin/bash
+# mcp-playwright-start — Startwrapper fuer den geteilten Playwright-MCP (plist).
+#
+# Entscheidet anhand der Zustandsdatei $MCP_SHARED_STATE/playwright-browser
+# (`lokal` oder `browserbase`, fehlt = `lokal`), wie der Browser gestartet wird:
+#
+#   lokal       npx @playwright/mcp@latest --headless --isolated (wie bisher)
+#   browserbase gehosteter Browser: wb-browserbase oeffnet eine 20-Minuten-Sitzung,
+#               der MCP haengt sich per --cdp-endpoint an sie. Scheitert das,
+#               Rueckfall auf lokal (Zustandsdatei zurueckgesetzt).
+#
+# Umschalten macht `mcp-shared browser [lokal|browserbase]`. Nach jedem Halt
+# faellt die Wahl automatisch auf lokal zurueck (mcp-shared halt playwright),
+# damit kein vergessener Schalter Browserminuten verbrennt (2026-09-09).
+set -uo pipefail
+
+MCP_SHARED_STATE="${MCP_SHARED_STATE:-$HOME/.local/state/mcp-shared}"
+NPX="${WB_PLAYWRIGHT_NPX:-/opt/homebrew/bin/npx}"
+PORT="${WB_PLAYWRIGHT_PORT:-8777}"
+ZUSTANDS_DATEI="$MCP_SHARED_STATE/playwright-browser"
+
+# Host-Check von @playwright/mcp (gemessen 2026-09-09 mit 0.0.80): der Server
+# nimmt nur Anfragen an, deren Host-Header dem gebundenen Host:Port entspricht
+# ("Access is only allowed at localhost:8777"). Hinter wb-modell-proxy tragen
+# alle Anfragen aber localhost:8767 -- JEDE Session lief damit auf 403, lange
+# vor der Browserwahl. Deshalb ausdruecklich beide Ports, beide Schreibweisen.
+ERLAUBTE_HOSTS="${WB_PLAYWRIGHT_ALLOWED_HOSTS:-localhost:$PORT,127.0.0.1:$PORT,localhost:8767,127.0.0.1:8767}"
+
+wahl="$(cat "$ZUSTANDS_DATEI" 2>/dev/null || echo lokal)"
+[ "$wahl" = "browserbase" ] || wahl="lokal"
+
+if [ "$wahl" = "lokal" ]; then
+  echo "mcp-playwright-start: Browser lokal" >&2
+  exec "$NPX" @playwright/mcp@latest --port "$PORT" --host 127.0.0.1 --allowed-hosts "$ERLAUBTE_HOSTS" --headless --isolated
+fi
+
+id="$(wb-browserbase sitzung neu --minuten 20)"
+rc=$?
+if [ $rc -ne 0 ] || [ -z "$id" ]; then
+  echo "mcp-playwright-start: Browserbase nicht verfuegbar (Exit $rc), Rueckfall lokal" >&2
+  mkdir -p "$MCP_SHARED_STATE"
+  echo lokal > "$ZUSTANDS_DATEI"
+  echo "mcp-playwright-start: Browser lokal" >&2
+  exec "$NPX" @playwright/mcp@latest --port "$PORT" --host 127.0.0.1 --allowed-hosts "$ERLAUBTE_HOSTS" --headless --isolated
+fi
+
+mkdir -p "$MCP_SHARED_STATE"
+printf '%s' "$id" > "$MCP_SHARED_STATE/playwright-browserbase-session"
+echo "mcp-playwright-start: Browser browserbase, Sitzung $id" >&2
+# ACHTUNG: die cdp-URL enthaelt den API-Key. Sie wird an exec uebergeben,
+# steht aber in keinem Log und wird nie ausgegeben.
+# OHNE --isolated (gemessen 2026-09-09): mit --isolated legt @playwright/mcp einen
+# eigenen Kontext an und setzt dabei einen lokalen Download-Pfad, den der
+# entfernte Chrome ablehnt ("download path targets a restricted directory") --
+# jede Navigation scheiterte. Ohne --isolated laeuft die Seite im Standardkontext
+# des gehosteten Browsers; getrennt ist er trotzdem, denn jede Browserbase-
+# Sitzung ist ein frischer Browser, und sie endet, sobald der CDP-Client trennt.
+exec "$NPX" @playwright/mcp@latest --port "$PORT" --host 127.0.0.1 --allowed-hosts "$ERLAUBTE_HOSTS" \
+  --cdp-endpoint "$(wb-browserbase cdp-url "$id")" --cdp-timeout 30000

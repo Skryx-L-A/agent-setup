@@ -1,0 +1,27 @@
+{
+  "source": "$HOME/.claude/regeln/tests-und-eingriffe.md",
+  "sha256": "72e818fde2878db661f2d75efc943a57bce601193797271829a4d6aea890659d",
+  "bytes": 20000,
+  "sections": [
+    {
+      "file": "00.md",
+      "heading": "regeln/tests-und-eingriffe.md",
+      "sha256": "e7c78b2d5686711d99e0c18aabc0f3972d658f21f6e919b7cb757f7347961071"
+    },
+    {
+      "file": "01.md",
+      "heading": "Standing rules — Tests und Eingriffe",
+      "sha256": "61f7b4f0fc64a644d2a305b8422e1b3ae4e7d3627c17d61c7b48a514b074d3a1"
+    },
+    {
+      "file": "02.md",
+      "heading": "Die eigene Testsuite laufen lassen",
+      "sha256": "e89a2fd99b85d09349548006e79e0ec8e45c33ca0684754fa3edce15af1c07b7"
+    },
+    {
+      "file": "03.md",
+      "heading": "Ein tmux-Testserver erbt die Umgebung des SERVERS, nicht des Aufrufers (2026-09-05)",
+      "sha256": "4a16e61d7335e3e432fac707388f245512a11d1403df91275a37fce582784dd4"
+    }
+  ]
+}

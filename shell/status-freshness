@@ -10,8 +10,12 @@
 # BENUTZUNG: status-freshness            (gegen den echten Vault ~/Knowledge)
 #            status-freshness --vault <pfad>   (gegen eine Kopie, z.B. zum Testen)
 #
-# Rein lesend: kein git pull, kein git add, kein Schreiben. Exit-Code ist IMMER 0 —
-#   das Tool meldet, es blockiert nichts (kein CI-Gate, reine Information).
+# Rein lesend: kein git pull, kein git add, kein Schreiben. Fuer seine eigentliche Arbeit
+#   (Befunde ueber veraltete STATUS.md) ist der Exit-Code IMMER 0 — das Tool meldet, es
+#   blockiert nichts (kein CI-Gate, reine Information). Eine unbekannte Option ist keiner
+#   dieser Befunde, sondern ein Bedienfehler, und endet seit 2026-08-22 ungleich 0 (vorher
+#   stand "Unbekannte Option: ..." auf stderr UND Exit 0 -- fuer jeden Aufrufer, der den
+#   Rueckgabewert prueft, sah das wie ein regulaerer, befundloser Lauf aus).
 #
 # GRENZEN (bewusst einfach gehalten):
 #   - Freshness-Datum kommt aus "Stand (YYYY-MM-DD...)"-Markern im STATUS.md-Fliesstext
@@ -31,7 +35,7 @@ VAULT="$HOME/Knowledge"
 while [ $# -gt 0 ]; do
   case "$1" in
     --vault) VAULT="$2"; shift 2 ;;
-    *) echo "Unbekannte Option: $1" >&2; exit 0 ;;
+    *) echo "Unbekannte Option: $1" >&2; exit 1 ;;
   esac
 done
 

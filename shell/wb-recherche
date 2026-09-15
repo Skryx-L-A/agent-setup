@@ -1,0 +1,7 @@
+#!/bin/bash
+# wb-recherche — Recherche mit lokalem Modell, Belegen und Pruefung.
+# Duenner Vorspann; die Schleife steht in recherche/treiber.py des Workbench-Repos.
+# -u: ein Lauf dauert Minuten, und ohne ungepufferte Ausgabe steht in einer
+# Protokolldatei minutenlang nichts. Der Fortschritt gehoert dorthin, wo
+# jemand hinsieht, nicht in einen Puffer.
+exec python3 -u "$HOME/AI/claude-workbench/recherche/treiber.py" "$@"

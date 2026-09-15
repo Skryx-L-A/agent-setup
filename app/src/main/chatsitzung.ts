@@ -277,9 +277,13 @@ export class Chatsitzung {
    * Eine Meldung von aussen sichtbar ins Gespraech legen -- etwa der Hinweis
    * nach einem Fehlstart (Befund B3). Der Hauptprozess braucht diesen Weg,
    * weil nur er weiss, WARUM ein Start scheiterte.
+   *
+   * Ein Hinweis beendet keinen Zug: die Kontextwache ruft diesen Weg aus ihrem
+   * Takt, auch waehrend der Harness schreibt. Ist der Prozess wirklich weg,
+   * hat der exit-Zweig oben den Zug schon beendet.
    */
   melde(text: string): void {
-    this.strom.melde(text);
+    this.strom.hinweis(text);
     this.haken.aufStand(this.strom.stand());
   }
 

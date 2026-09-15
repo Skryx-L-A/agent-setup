@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Duenner Vorspann; die Schleife steht in ~/AI/autoresearch/wb_autoresearch.py.
+exec python3 -u "$HOME/AI/autoresearch/wb_autoresearch.py" "$@"

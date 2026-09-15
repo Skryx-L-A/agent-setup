@@ -3,14 +3,19 @@
 # Worker-Tab an die richtige tmux-Session an, oder sagt verstaendlich, warum es
 # keine gibt.
 #
-# --window (2026-08-04): welches Worker-Tab-Fenster gezeigt wird — 'workers'
+# --window (2026-08-04): welches Worker-Fenster gezeigt wird — 'workers'
 # (Default, unveraendertes Verhalten jedes bestehenden Aufrufers) oder
-# 'workers-2', 'workers-3', ... Das Fenster selbst legt dieses Werkzeug fuer
-# ein Ueberlauf-Fenster NICHT an — das ist wb-grids Job, sobald
-# maxWorkerPanesPerTab ueberschritten wird (siehe shell/wb-grid). Wer hier ein
-# noch nicht existierendes Ueberlauf-Fenster verlangt, bekommt eine Erklaerung
-# und faellt auf 'workers' zurueck, statt auf ein Fenster zu zeigen, das es
-# nicht gibt — Regel 2 dieser Aufgabe: kein Tab, der ins Leere zeigt.
+# 'workers-2', 'workers-3', ... Das Fenster selbst legt dieses Werkzeug NICHT an
+# — das ist wb-grids Job (siehe shell/wb-grid). Wer hier ein noch nicht
+# existierendes Fenster verlangt, bekommt eine Erklaerung und faellt auf
+# 'workers' zurueck, statt auf ein Fenster zu zeigen, das es nicht gibt —
+# Regel 2 dieser Aufgabe: kein Tab, der ins Leere zeigt.
+#
+# SEIT DEM 03.09.2026 HAT JEDER WORKER SEIN EIGENES FENSTER (Stufe A). Ein
+# angehaengtes Terminal zeigt deshalb immer genau EINEN Worker und nicht mehr
+# alle nebeneinander; wer alle sehen will, nimmt die Werkbank, die sie frei
+# nebeneinander kachelt. Das ist hingenommen und keine Verschlechterung dieses
+# Werkzeugs: es zeigte auch vorher immer nur ein Fenster.
 #
 # Warum das ein eigenes Werkzeug ist (2026-08-04): dieselbe Logik stand vorher als
 # zehnzeilige Shell-Kette IN der VS-Code-Extension (`workerViewCommand`). Dort war
@@ -21,7 +26,7 @@
 #   1. `tmux new-session -d -t <fehlende-Basis> -s X` SCHEITERT NICHT. tmux legt
 #      stattdessen eine neue, leere Session an, deren '#{session_group}' die
 #      ZEICHENKETTE '=wb-…' ist. So entstanden 'wb-LocalAI-d0220f-view' und
-#      'wb-myproject-87cd2f-4ba4b4-view': Sicht-Sessions ohne Basis, in denen nur
+#      '<ein eigenes Mailwerkzeug>-87cd2f-4ba4b4-view': Sicht-Sessions ohne Basis, in denen nur
 #      eine leere Shell stand. Der Worker-Tab zeigte nichts, waehrend die Worker
 #      liefen.
 #   2. Aus einer Sicht wurde eine Sicht ('wb-a project-view-view-view'), weil der

@@ -13,28 +13,28 @@
 export type Sprache = 'de' | 'en';
 
 export const DE: Record<string, string> = {
-  'fenster.titel': 'Agent-Workbench — Chat',
+  'fenster.titel': 'Agent-Workbench – Chat',
 
   'eingabe.platzhalter': 'Claude fragen …',
   'eingabe.senden': 'Senden',
-  'eingabe.hinweis': 'Eingabe sendet, Umschalt+Eingabe macht einen Zeilenumbruch. „/" zeigt die Befehle, „@" die Dateien.',
-  'eingabe.haengtNach': 'Du hast hochgerollt — die Ansicht folgt neuen Zeilen nicht mehr. Nach unten rollen holt sie zurück.',
+  'eingabe.hinweis': 'Eingabe sendet, Umschalt+Eingabe macht einen Zeilenumbruch. „/“ zeigt die Befehle, „@“ die Dateien.',
+  'eingabe.haengtNach': 'Du hast hochgerollt – die Ansicht folgt neuen Zeilen nicht mehr. Nach unten rollen holt sie zurück.',
   'knopf.neustart': 'Frisch starten',
   'knopf.halt': 'Den laufenden Zug unterbrechen (Escape)',
 
-  'modus.wechseln': 'Freigabemodus: {modus} — Klick schaltet zum nächsten weiter.',
+  'modus.wechseln': 'Freigabemodus: {modus} – Klick schaltet zum nächsten weiter.',
   'modus.abgelehnt': 'Der Harness hat die Umschaltung abgelehnt: {grund}',
 
   'worker.titel': 'Worker',
-  'worker.wechseln': 'Zu „{name}" wechseln — das Gespräch bleibt im Hintergrund und läuft weiter.',
-  'worker.beendet': '„{name}" läuft nicht mehr. Der Pane steht noch; ein Klick zeigt, was zuletzt darin stand.',
+  'worker.wechseln': 'Zu „{name}“ wechseln – das Gespräch bleibt im Hintergrund und läuft weiter.',
+  'worker.beendet': '„{name}“ läuft nicht mehr. Der Pane steht noch; ein Klick zeigt, was zuletzt darin stand.',
 
   'vervoll.befehle': 'Befehle',
   'vervoll.dateien': 'Dateien im Projektordner',
-  'vervoll.dateien.ohneGit': 'Dateien im Projektordner — ohne git gelesen, nur die .gitignore der Wurzel gilt',
+  'vervoll.dateien.ohneGit': 'Dateien im Projektordner – ohne git gelesen, nur die .gitignore der Wurzel gilt',
 
   'status.modell': 'Das Modell, mit dem diese Sitzung läuft.',
-  'status.kontext': 'Kontextfenster zu {prozent} % belegt — belegte Tokens des letzten Zuges gegen die Fenstergröße aus der Modell-Registry.',
+  'status.kontext': 'Kontextfenster zu {prozent} % belegt – belegte Tokens des letzten Zuges gegen die Fenstergröße aus der Modell-Registry.',
   'status.kontext.ohneFenster': 'Belegte Tokens des letzten Zuges. Die Fenstergröße dieses Modells steht nicht in der Registry, deshalb kein Balken.',
   'status.5h': 'Anteil des 5-Stunden-Kontingents des Anthropic-Kontos{reset}. Dieselbe Quelle wie die Statuszeile im Terminal.',
   'status.7d': 'Anteil des 7-Tage-Kontingents des Anthropic-Kontos. Dieselbe Quelle wie die Statuszeile im Terminal.',
@@ -65,7 +65,7 @@ export const DE: Record<string, string> = {
   'freigabe.abgelehnt': 'Abgelehnt',
   'freigabe.grund': 'Vom Menschen abgelehnt.',
   'freigabe.zurueckgezogen': 'Zurückgezogen',
-  'freigabe.defekt': 'Ohne Kennung — diese Frage lässt sich nicht beantworten.',
+  'freigabe.defekt': 'Ohne Kennung – diese Frage lässt sich nicht beantworten.',
 
   'leer.titel': 'Noch kein Gespräch',
   'leer.satz': 'Schreib unten etwas, und die Sitzung beginnt.',

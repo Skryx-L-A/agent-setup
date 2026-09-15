@@ -77,9 +77,15 @@ fi
 # Eine Grenze, die diesen Text mitzaehlt, ist auf peer unerreichbar und damit genauso
 # wertlos wie eine, die die drei Mac-Bloecke oben nicht einrechnet. Die peer-Werte sind
 # deshalb 16.000 plus der gemessene Unterschied, nicht ein gegriffener Aufschlag.
+# NACHGEMESSEN 2026-09-05 (regelsync): seit die Regeldateien beider Maschinen
+# zusammengefuehrt sind, ist CLAUDE.md auf peer byte-gleich mit dem Mac (Aufschlag 0
+# statt 1447) und roles/orchestrator.md nur noch 510 Bytes groesser (statt 3111) --
+# drei benannte maschinenlokale Stellen plus der erzeugte Block. Die alten Werte
+# haetten ein echtes Ueberlaufen auf peer um bis zu 2600 Bytes verdeckt. Dieselbe
+# Regel wie oben, mit den heutigen Zahlen: 16.000 plus gemessener Unterschied.
 case "$(uname -s)" in
   Darwin) CAP_CLAUDE=16000; CAP_ORCH=16000 ;;
-  *)      CAP_CLAUDE=17447; CAP_ORCH=19111 ;;
+  *)      CAP_CLAUDE=16000; CAP_ORCH=16600 ;;
 esac
 
 findings=0
@@ -233,12 +239,31 @@ echo "$out"
 # Exit-Code aus den harten Kriterien: Groessengrenze und wb-consistency. Der Linter
 # und status-freshness melden Hinweise, keine Fehler — sie sollen den Job nicht
 # dauerhaft rot faerben und damit unlesbar machen.
-echo "$out" | grep -q 'UEBER GRENZE' && findings=1
-[ "$CONS_DA" = 1 ] && [ "$CONS_RC" -ne 0 ] && findings=1
+#
+# rot_gruende (2026-09-04): Statusdatei und Hook meldeten bisher drei Zaehlwerte
+# (Widersprueche, undatierte Regeln, veraltete STATUS.md), von denen laut diesem
+# Kommentar zwei (lint, freshness) exit_code gar nicht beeinflussen koennen — und
+# den dritten harten Grund (Speicher-Ampel) gar nicht erst mit ausgaben. Gemessen
+# am 04.09.: exit_code=1 ausschliesslich wegen Speicher-Ampel ROT bei 4,47 GiB,
+# die ausgegebene Zeile nannte trotzdem nur Widersprueche/Regeln/STATUS.md — der
+# tatsaechliche Grund blieb unsichtbar, obwohl genau diese Zahl entscheidet, ob
+# neben einem grossen lokalen Modell noch Platz ist. rot_gruende haelt fest,
+# welches der drei harten Kriterien unten tatsaechlich zugeschlagen hat, an
+# denselben drei Stellen gesetzt, die auch findings=1 setzen — Grund und Ergebnis
+# koennen dadurch nicht auseinanderlaufen.
+rot_gruende=""
+echo "$out" | grep -q 'UEBER GRENZE' && { findings=1; rot_gruende="${rot_gruende:+$rot_gruende,}groesse"; }
+if [ "$CONS_DA" = 1 ] && [ "$CONS_RC" -ne 0 ]; then
+  findings=1
+  rot_gruende="${rot_gruende:+$rot_gruende,}consistency"
+fi
 # ROT ist ein hartes Kriterium, GELB ein Hinweis: gelb heisst "sieh nach, was
 # liegengeblieben ist", rot heisst, dass die Werkbank allein knapp die Haelfte
 # dessen haelt, was der Maschine neben einem grossen Modell ueberhaupt bleibt.
-printf '%s\n' "$SPEICHER_OUT" | grep -q 'Ampel: ROT' && findings=1
+if printf '%s\n' "$SPEICHER_OUT" | grep -q 'Ampel: ROT'; then
+  findings=1
+  rot_gruende="${rot_gruende:+$rot_gruende,}speicher"
+fi
 
 # Statusdatei fuer den SessionStart-Hook (2026-08-04, selber Anlass wie oben):
 # Bericht und Job-Exit-Code gab es schon, aber ohne maschinenlesbare Ablage
@@ -340,6 +365,11 @@ if [ "$WRITE" = 1 ]; then
     echo "freshness_stale_count=$freshness_stale_count"
     echo "speicher_ampel=$speicher_ampel"
     echo "speicher_gesamt=$speicher_gib"
+    # rot_gruende (2026-09-04, siehe Kommentar oben bei der Setzung): direkt aus
+    # denselben drei harten Kriterien wie $findings, nicht aus den obigen
+    # Zaehlwerten -- bleibt deshalb auch dann richtig, wenn status_parse_ok=0
+    # eine der Zahlen leert. Leer bei gruen (WRITE laeuft immer, egal ob rot).
+    echo "rot_gruende=$rot_gruende"
   } > "$STATUS.tmp" && mv "$STATUS.tmp" "$STATUS"
   echo "Status: $STATUS"
 fi

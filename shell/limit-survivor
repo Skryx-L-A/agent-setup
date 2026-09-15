@@ -113,6 +113,17 @@ def claude_panes():
 
 
 def main() -> int:
+    # Anlass (2026-08-22, dieselbe Bugfamilie wie wb-budget): 'dry = "--dry-run" in
+    # sys.argv' prueft nur, OB das Flag vorkommt -- ein Tippfehler ('--dryrun', ein
+    # falsch gesetztes Flag) faellt still auf dry=False zurueck, also auf den LIVE-Pfad,
+    # der echte Tasten in Panes schickt (siehe der Vorfall im Kopfkommentar). Der
+    # Cron-/LaunchAgent-Aufruf ruft dieses Skript immer ohne Argumente auf; jedes
+    # uebrige argv ist ein Bedienfehler und soll laut scheitern statt live zu laufen.
+    unbekannt = [a for a in sys.argv[1:] if a != "--dry-run"]
+    if unbekannt:
+        print(f"limit-survivor: unbekanntes Argument {unbekannt!r} -- erlaubt ist nur --dry-run.",
+              file=sys.stderr)
+        return 1
     now = datetime.now().astimezone()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     dry = "--dry-run" in sys.argv

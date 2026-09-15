@@ -1,8 +1,27 @@
 #!/bin/bash
+# Data-model subcommands share this historical name.  No-argument and legacy
+# pane invocations continue through the original implementation below.
+case "${1:-}" in
+  antrag|antrag-entscheiden)
+    # Ein Antrag weckt den Hauptagenten, eine Entscheidung den Teamleiter: danach den Traeger wecken.
+    SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    status=0
+    python3 "$SCRIPT_DIR/agents_data.py" agent "$@" || status=$?
+    if [ "$status" -eq 0 ]; then
+      python3 "$SCRIPT_DIR/agents_traeger_wecken.py" agent "$@" || true
+    fi
+    exit "$status"
+    ;;
+  neu|liste|zeigen|pause|start|stop|profil|gedaechtnis|vorlagen|entwurf|anlegen)
+    SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    exec python3 "$SCRIPT_DIR/agents_data.py" agent "$@"
+    ;;
+esac
+
 # wb-agent — add one Claude agent pane; wb-grid arranges everything afterwards.
 set -u
 # $HOME instead of a hardcoded $HOME: the same script has to run on peer
-# ($HOME) once both machines share one script set. Same target, same behaviour.
+# (/home/<user>) once both machines share one script set. Same target, same behaviour.
 # Remote Control stays OFF here (Vorgabe des Nutzers 2026-08-05: nur der
 # Orchestrator bekommt sie) -- an agent pane is never the orchestrator.
 #

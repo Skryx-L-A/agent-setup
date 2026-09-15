@@ -151,7 +151,16 @@ def note_block(pane, guard, reason, command, cwd, session_id, extra=None):
             'pane': pane,
             'guard': guard,
             'reason': reason,
-            'command': (command or '')[:2000],
+            # DER VOLLE WORTLAUT, nie gekuerzt (05.09.2026, Befund: "ich habe
+            # gerade eine anfrage oben fuer eine erlaubnis freigegeben, sie ist
+            # aber noch da"). Bis dahin stand hier [:2000], der Schluessel in
+            # `extra` aber ueber den vollen Befehl. Erteilt wurde damit, was im
+            # Marker stand -- der gekuerzte Wortlaut --, und die Wiederholung des
+            # Workers fand keine passende Freigabe, wurde erneut angehalten und
+            # stand als derselbe Eintrag wieder in der Leiste. Ein Marker, der
+            # einen Schluessel traegt, muss genau das tragen, worueber er
+            # gebildet wurde. Gekuerzt wird beim ANZEIGEN (wb-freigabe kuerzen()).
+            'command': command or '',
             'cwd': cwd or '',
             'session_id': session_id or '',
             'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
@@ -205,7 +214,10 @@ def append_block_log(pane, guard, reason, command, cwd, session_id):
             'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'guard': guard,
             'reason': reason,
-            'command': (command or '')[:2000],
+            # Ungekuerzt, aus demselben Grund wie in note_block: wb-freigabe liest
+            # aus diesem Verlauf die weiteren Wortlaute einer wartenden Pane
+            # ('muster-anderer-wortlaut-wartend') und erteilt sie woertlich.
+            'command': command or '',
             'cwd': cwd or '',
             'session_id': session_id or '',
             'pane': pane or '',

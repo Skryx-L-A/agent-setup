@@ -1,10 +1,10 @@
 ---
 name: grill-me
-description: Interview the user relentlessly about a plan or design until reaching shared understanding, resolving each branch of the decision tree. Use when user wants to stress-test a plan, get grilled on their design, or mentions "grill me".
+description: "Clarify a new project or stress-test a plan through focused questions, one at a time. Reuse decisions already made and inspect the project before asking."
 ---
 
-Interview me relentlessly about every aspect of this plan until we reach a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one. For each question, provide your recommended answer and always use multiple choice questions if there is any possibility the user could want to pick more than one answer.
+# Plan klären
 
-Ask the questions one at a time.
+Lies Auftrag, bestehende Entscheidungen und relevante Projektdateien. Frage nach der nächsten ungeklärten Entscheidung, deren Antwort den Plan tatsächlich verändert; eine Frage zur Zeit, mit begründeter Empfehlung. Nutze die verfügbare Fragefunktion, sonst eine kurze Textfrage. Mehrfachauswahl nur, wenn Antworten kombinierbar sind und das Werkzeug sie unterstützt.
 
-If a question can be answered by exploring the codebase, explore the codebase instead.
+Bereits beantwortete Fragen nicht wiederholen. Aus dem Code beantwortbare Fragen selbst klären. Sobald Ziel, Randbedingungen und nächster umkehrbarer Schritt feststehen, arbeiten; für einen neuen Projektstart ist kein vollständiges Interview über hypothetische Zukunftsfragen nötig. Ein ausdrücklich gewünschtes gründliches Interview darf entsprechend tiefer gehen.

@@ -25,7 +25,7 @@
   /* Die Schrift stand vorher am `body` des eigenen Fensters. Auf der Buehne
      erbt der Kasten sonst die des Hauptfensters, und die Ansicht saehe je nach
      Nachbarschaft anders aus. */
-  font: 13px/1.55 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font: 13px/1.55 -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui;
   color: var(--schrift);
   background: var(--grund);
 }
@@ -38,7 +38,10 @@
   align-items: center;
   flex-wrap: wrap;
   padding: 7px 14px;
-  border-bottom: 1px solid var(--linie);
+  /* KEINE TRENNLINIE (05.09.2026, Regelbruch 6). Sie lief als ein Bildpunkt
+     (38,43,52) quer durch die Buehne, unter dem Pillenstreifen. Getrennt wird
+     ueber die Flaeche: der Kopf liegt auf `--leiste`, der Verlauf darunter auf
+     `--grund`. Dieselbe Sprache wie im Rest des Fensters. */
   background: var(--leiste);
 }
 .csdk-marke {
@@ -71,7 +74,6 @@
   align-items: center;
   flex-wrap: wrap;
   padding: 6px 14px;
-  border-bottom: 1px solid var(--linie);
   background: var(--leiste);
 }
 .csdk-workermarke {
@@ -203,8 +205,18 @@
   background: none;
   padding: 0;
 }
+/* EINE SYSTEMMELDUNG BEKOMMT IHRE FLAECHE (05.09.2026, Kleinigkeit 6). Sie
+   stand als roter Satz frei ueber der leeren Buehne -- die einzige Stelle im
+   Fenster, an der eine Farbe allein eine Aussage trug, und auf einem weissen
+   Grund las sie sich wie ein Absturz. Jetzt liegt sie auf `--vorsichtgrund`,
+   derselben Flaeche, die auch die Warnzeile ohne Steuerkanal traegt, und die
+   Schrift darauf ist die gewoehnliche: die Flaeche sagt, worum es geht, die
+   Farbe muss es nicht allein tragen. */
 .csdk-systemtext {
-  color: var(--aus);
+  color: var(--schrift);
+  background: var(--vorsichtgrund);
+  border-radius: var(--r-mittel);
+  padding: 7px 10px;
 }
 
 /* Denken: gedimmt und aufklappbar (Foto). */
@@ -268,8 +280,9 @@
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
 }
+/* Zwei Zeilen im selben Kasten trennt die Fuge, nicht der Strich. */
 .csdk-paar + .csdk-paar {
-  border-top: 1px solid var(--linie);
+  margin-top: 2px;
 }
 .csdk-paar.fehler .csdk-wert {
   color: var(--aus);
@@ -483,19 +496,28 @@
 /* Dieselben Groessen wie die Zeile unter einer Terminal-Sitzung, deshalb auch
    dieselbe Anmutung: eine schmale, gedimmte Zeile ganz unten, die im
    Vorbeigehen gelesen wird und nichts wegnimmt. */
+/* EINE ZEILE, UND DER PFAD IST DAS EINZIGE, WAS WEICHT (05.09.2026,
+   Regelbruch 7). Der Fuss brach bei 1196 Bildpunkten in zwei Zeilen um, und
+   der Pfad endete hart an der Kante: aus „main" wurde „mair". Die Ellipse
+   stand am FELD, und ein Flex-Kasten gibt sie nicht an sein Kind weiter -- der
+   Wert darin wurde einfach abgeschnitten. Jetzt bricht die Zeile nicht mehr
+   um, jedes Feld behaelt seine Breite, und allein der Pfad schrumpft, mit
+   Auslassungszeichen. Der Zweig daneben bleibt ganz: er ist kurz, und ein
+   halber Zweigname ist schlimmer als keiner. */
 .csdk-status {
   flex: 0 0 auto;
   display: flex;
   gap: 12px;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   padding: 4px 16px 6px;
-  border-top: 1px solid var(--linie);
+  /* Und keine Linie ueber dem Fuss: auch hier traegt die Flaeche. */
   background: var(--leiste);
   font-size: 11px;
   color: var(--gedaempft);
 }
 .csdk-statusfeld {
+  flex: 0 0 auto;
   display: flex;
   gap: 6px;
   align-items: baseline;
@@ -503,8 +525,14 @@
   min-width: 0;
 }
 .csdk-statusfeld.ordner {
+  flex: 0 1 auto;
+  overflow: hidden;
+}
+.csdk-statusfeld.ordner .csdk-statuswert {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .csdk-statusfeld.modell .csdk-statuswert {
   color: var(--zustand-laeuft);
@@ -520,6 +548,7 @@
   color: var(--aus);
 }
 .csdk-zweig {
+  flex: 0 0 auto;
   color: var(--gedaempft);
   opacity: 0.8;
 }

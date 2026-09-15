@@ -18,6 +18,25 @@ Richtungs-Logik waeren genau die Fehlerklasse, um die es hier geht):
                   ~/.local/trash-snapshots/, dann ersetzen.
   fehlt        -> noch nie ausgerollt, nichts zu verlieren: kopieren.
   eigenmaechtig/unklar -> NICHT angefasst, nur gemeldet.
+  worktree_unpruefbar (2026-08-22) -> NICHT angefasst, sichtbar gemeldet, aber
+                  NICHT als Fund gezaehlt (kein Exit 1 dafuer): ein Worker-
+                  Worktree rollt nach ~/.local/bin/~/.claude/hooks ohnehin nie
+                  aus, seine eigene Branch-Historie kennt bloss nicht jeden
+                  Stand, den der Hauptbaum inzwischen dorthin gebracht hat.
+  deaktiviert (2026-08-22, Zaehlung nachgebessert 22.08.) -> NICHT angefasst,
+                  sichtbar gemeldet, aber in einer EIGENEN Sammlung, nicht bei
+                  eigenmaechtig/unklar: liegt eine gleichnamige Datei unter
+                  ~/.local/state/wb-launchagents-deaktiviert/, ist ein fehlendes
+                  oder veraltetes Ziel keine Luecke, sondern ausdrueckliche des Nutzers Entscheidung -- Anlass war ein Lauf am 22.08.,
+                  der drei bewusst abgeschaltete LaunchAgent-plists kommentarlos
+                  wieder installiert hat. Die erste Fassung dieser Unterscheidung
+                  zaehlte deaktiviert noch MIT in "eigenmaechtig/unklar" und faerbte
+                  den Exit-Code -- gemessen (22.08.): drei bewusst abgeschaltete
+                  plists sind der DAUERZUSTAND dieser Maschine, kein Vorfall, und
+                  ein Lauf, der dafuer im Normalbetrieb rot meldet, wird nach zwei
+                  Wochen ignoriert. deaktiviert zaehlt daher NICHT fuer Exit 1.
+                  Ueberschreibbar mit --trotz-deaktivierung, wenn das Ausrollen
+                  ausdruecklich gewuenscht ist.
 
 Usage:
   wb-ausrollen [--dry-run] [--base DIR] [--repo DIR] [--config FILE]
@@ -27,10 +46,40 @@ Schnappschuss). --base/--repo/--config wie bei wb-consistency, aus demselben
 Grund: ein Test zeigt auf ein eigenes, kleines Verzeichnis statt auf die
 echte Maschine.
 
-Exit 0: nichts zu tun oder alles ausgerollt, keine eigenmaechtige Kopie im Weg.
+Exit 0: nichts zu tun oder alles ausgerollt, keine eigenmaechtige Kopie im Weg --
+        auch dann, wenn dabei eine oder mehrere bewusst abgeschaltete plists
+        uebersprungen wurden (deaktiviert ist eine Meldung, kein Fehler).
 Exit 1: mindestens eine eigenmaechtige/unklare Kopie wurde NICHT angefasst --
         das ist kein Fehler dieses Werkzeugs, sondern der Grund, von Hand
-        nachzusehen (dieselbe Bedeutung wie wb-consistencys Exit 1).
+        nachzusehen (dieselbe Bedeutung wie wb-consistencys Exit 1). Eine
+        deaktivierte plist zaehlt dafuer NICHT.
+Exit 3 (2026-08-22): ein AGENT hat versucht, aus einem git-Worktree auszurollen,
+        und wurde abgewiesen -- siehe DER RIEGEL unten.
+
+DER RIEGEL: NIE AUS EINEM WORKTREE AUSROLLEN, AUSSER EIN MENSCH WILL ES (2026-08-22).
+Ein Worker-Worktree kennt in seiner eigenen Branch-Historie nicht jeden Stand, den
+der Hauptbaum inzwischen ausgerollt hat (siehe wc.ist_worktree(), wb-consistencys
+KOPIE-WORKTREE-UNPRUEFBAR) -- UND zwei Worker-Worktrees, die unabhaengig voneinander
+nach ~/.local/bin/~/.claude/hooks schreiben, koennten sich gegenseitig ueberschreiben
+(genau die Kollisionsgefahr, gegen die shell/wb-worktree gebaut wurde). "Worker rollen
+von dort nichts mehr aus" stand bisher nur als Kommentar in betriebslauf.sh -- ein
+Riegel, den niemand lesen muss, ist hier das staerkere Mittel.
+
+Die Unterscheidung ist dieselbe wie beim Effort-Deckel (pi-worker/wb-code, `--mensch`):
+`wb-mensch pruefen` MISST die Herkunft am Prozess, es wird nichts behauptet und nichts
+geglaubt. Ein AGENT, der aus einem Worktree (--repo oder gemessen) ausrollen will --
+ausser mit --dry-run, das schreibt nichts und bleibt deshalb immer erlaubt --, wird mit
+Exit 3 abgewiesen; die Meldung sagt, was stattdessen zu tun ist (committen, den Merge
+dem Orchestrator ueberlassen). Ein MENSCH bekommt dieselbe Begruendung als Warnung auf
+stderr und rollt dann trotzdem aus, wenn er will -- die Werkbank haelt einen Menschen
+nie auf (stehende Regel). Anders als bei pi-worker/wb-code gibt es dafuer KEIN
+--mensch-Flag: der Riegel misst automatisch, ohne dass ein Mensch etwas mitschicken
+muesste, um durchzukommen -- nur ein Agent haette einen Grund, sich als Mensch
+auszugeben, und genau davor schuetzt wb-mensch.
+
+ist_worktree() unterscheidet NICHT zwischen einem Worker-Worktree und einem, den
+der Nutzer sich selbst anlegt -- das muss sie auch nicht, solange der Menschenweg
+(Warnung, kein Abbruch) fuer beide offen bleibt.
 """
 import argparse
 import atomar_schreiben
@@ -56,6 +105,73 @@ def _lade_wb_consistency():
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod
+
+
+def _wb_mensch_pfad():
+    """Woher `wb-mensch` kommt -- dasselbe echte $HOME wie bei pi-worker/wb-code
+    (`"$HOME/.local/bin/wb-mensch"`), NICHT --base: --base ist die Vorlage fuer
+    wb-consistencys install_map-Templating (siehe dortiger Kopfkommentar), kein
+    Umlenkziel fuer Systemwerkzeuge. Ein Test, der HIER umlenken will, setzt wie
+    pi-worker/wb-code auch $HOME um -- os.path.expanduser("~") liest dasselbe
+    $HOME wie eine Bash-Zeile "$HOME/..."."""
+    p = os.path.join(os.path.expanduser("~"), ".local", "bin", "wb-mensch")
+    if os.access(p, os.X_OK):
+        return p
+    return shutil.which("wb-mensch") or None
+
+
+def _ist_mensch():
+    """True = ein Mensch ruft, gemessen von wb-mensch (unforgebar, siehe dessen
+    eigener Kopfkommentar). Faellt wb-mensch aus -- Werkzeug fehlt, Absturz,
+    Zeitueberschreitung --, ist die Antwort False: die sichere Seite fuer einen
+    Riegel ist "kein Mensch bewiesen", nie "im Zweifel durchlassen"."""
+    pfad = _wb_mensch_pfad()
+    if not pfad:
+        return False
+    try:
+        return subprocess.run([pfad, "pruefen"], timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _wb_mensch_beleg():
+    pfad = _wb_mensch_pfad()
+    if not pfad:
+        return "wb-mensch nicht gefunden"
+    try:
+        aus = subprocess.run([pfad, "beleg"], capture_output=True, text=True,
+                             timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "kein Beleg"
+    teile = aus.split("\t", 1)
+    return teile[1] if len(teile) > 1 else (aus or "kein Beleg")
+
+
+def _worktree_riegel(wc, repo, trocken):
+    """Der Riegel aus dem Kopfkommentar (DER RIEGEL). Gibt True zurueck, wenn
+    abgewiesen wurde (der Aufrufer soll dann sofort mit Exit 3 enden) -- sonst
+    False, egal ob weil kein Worktree, --dry-run, oder ein Mensch ruft."""
+    if trocken or not wc.ist_worktree(repo):
+        return False
+    if _ist_mensch():
+        print("wb-ausrollen: WARNUNG -- %s ist ein git-Worktree, kein Hauptbaum. "
+              "Ausgerollt wird trotzdem, weil hier ein Mensch entscheidet -- ein "
+              "Agent waere hier abgewiesen worden." % repo, file=sys.stderr)
+        return False
+    beleg = _wb_mensch_beleg()
+    print("wb-ausrollen: ABGEWIESEN -- %s ist ein git-Worktree, kein Hauptbaum." % repo,
+          file=sys.stderr)
+    print("  Erkannt wurde: %s" % beleg, file=sys.stderr)
+    print("  Ein Worker-Worktree rollt nach ~/.local/bin/~/.claude/hooks nie selbst aus --",
+          file=sys.stderr)
+    print("  zwei Worktrees, die das gleichzeitig taeten, koennten sich gegenseitig",
+          file=sys.stderr)
+    print("  ueberschreiben. Committen und den Merge dem Orchestrator ueberlassen --",
+          file=sys.stderr)
+    print("  der rollt aus dem Hauptbaum aus.", file=sys.stderr)
+    print("  --dry-run bleibt erlaubt (schreibt nichts).", file=sys.stderr)
+    print("  Diagnose: wb-mensch beleg ; wb-mensch ahnen", file=sys.stderr)
+    return True
 
 
 def _schnappschuss(inst_datei, base, lauf_id, trocken):
@@ -100,6 +216,21 @@ def _kopieren(quelle, ziel, trocken):
     atomar_schreiben.kopieren(quelle, ziel)
 
 
+def _deaktiviert_pfad(name, base):
+    """Pfad unter <base>/.local/state/wb-launchagents-deaktiviert/<name>, wenn dort
+    eine gleichnamige Datei liegt -- sonst None.
+
+    Anlass (22.08.2026): der Nutzer hat alle zehn zeitgesteuerten Mac-LaunchAgents
+    abschalten lassen; die plists liegen seither hier statt in
+    ~/Library/LaunchAgents. `wb-ausrollen` kannte diesen Ort nicht und hat drei
+    davon beim naechsten Lauf KOMMENTARLOS wieder installiert (Fund fehlt ==
+    'noch nie ausgerollt', obwohl in Wahrheit 'bewusst entfernt'). <base>, nicht
+    ein hartes '~' -- derselbe Grund wie bei _schnappschuss: ein Test prueft
+    seine eigene, kleine Kopie und nie die echte Maschine."""
+    kandidat = os.path.join(base, ".local", "state", "wb-launchagents-deaktiviert", name)
+    return kandidat if os.path.isfile(kandidat) else None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
@@ -118,6 +249,10 @@ def main():
                          "Ratewert.")
     ap.add_argument("--config", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "wb-consistency.config.json"))
+    ap.add_argument("--trotz-deaktivierung", action="store_true",
+                    help="eine plist ausrollen, obwohl sie unter "
+                         "wb-launchagents-deaktiviert liegt -- der Deckel gilt dem "
+                         "versehentlichen Ausrollen, nicht einem ausdruecklichen Wunsch.")
     a = ap.parse_args()
 
     wc = _lade_wb_consistency()
@@ -131,6 +266,10 @@ def main():
             # unbemerkt aus der falschen Quelle ausrollen.
             print("wb-ausrollen: ACHTUNG -- Arbeitsbaum %s" % repo_quelle, file=sys.stderr)
     print("wb-ausrollen: Arbeitsbaum -- %s" % repo_quelle)
+
+    if _worktree_riegel(wc, repo, a.dry_run):
+        return 3
+
     cfg = wc.load_config(a.config, a.base, repo)
     c7 = cfg.get("check7_kopien")
     c9 = cfg.get("check9_harness_konfig")
@@ -139,7 +278,15 @@ def main():
               "Konfiguration -- nichts zu tun.")
         return 0
 
-    ausgerollt, uebersprungen = [], []
+    # deaktiviert bewusst NICHT in derselben Liste wie uebersprungen (Nachbesserung
+    # 22.08.2026, gemessen: die Sammelzeile hiess faelschlich "eigenmaechtig/unklar" fuer
+    # einen Fund, der weder das eine noch das andere ist, und der Exit-Code faerbte JEDEN
+    # normalen Lauf rot, obwohl drei bewusst abgeschaltete plists der DAUERZUSTAND dieser
+    # Maschine sind, kein Vorfall -- eine Pruefung, die im Normalbetrieb rot meldet, wird
+    # nach zwei Wochen ignoriert. deaktiviert bekommt deshalb eine eigene Sammlung, eine
+    # eigene Zusammenfassungszeile und faerbt den Exit-Code nicht; echte eigenmaechtige/
+    # unklare Funde bleiben unveraendert ein Grund fuer Exit 1.
+    ausgerollt, uebersprungen, deaktiviert = [], [], []
     lauf_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
     if c7:
@@ -157,6 +304,16 @@ def main():
             if status in ("gleich", "andere_maschine"):
                 continue
             if status == "fehlt":
+                name = os.path.basename(fall["inst_datei"])
+                deakt = None if a.trotz_deaktivierung else _deaktiviert_pfad(name, a.base)
+                if deakt:
+                    warum = ("liegt unter %s -- bewusst abgeschaltet (LaunchAgents-"
+                              "Aufraeumung 2026-08-22), kein Versehen. Zurueckholen: "
+                              "diese Datei dort loeschen, oder wb-ausrollen mit "
+                              "--trotz-deaktivierung erneut aufrufen." % deakt)
+                    deaktiviert.append((fall["rel"], "deaktiviert", warum))
+                    print("  %s UEBERSPRUNGEN (bewusst abgeschaltet: %s)" % (fall["rel"], warum))
+                    continue
                 _kopieren(fall["repo_datei"], fall["inst_datei"], a.dry_run)
                 ausgerollt.append((fall["rel"], "neu installiert (lag noch nicht vor)"))
                 print("  %s NEU installiert nach %s" % (fall["rel"], fall["inst_datei"]))
@@ -164,11 +321,29 @@ def main():
             # status == "verschieden"
             richtung, warum = fall["richtung"], fall["warum"]
             if richtung == "veraltet":
+                name = os.path.basename(fall["inst_datei"])
+                deakt = None if a.trotz_deaktivierung else _deaktiviert_pfad(name, a.base)
+                if deakt:
+                    warum = ("liegt unter %s -- bewusst abgeschaltet (LaunchAgents-"
+                              "Aufraeumung 2026-08-22), kein Versehen. Zurueckholen: "
+                              "diese Datei dort loeschen, oder wb-ausrollen mit "
+                              "--trotz-deaktivierung erneut aufrufen." % deakt)
+                    deaktiviert.append((fall["rel"], "deaktiviert", warum))
+                    print("  %s UEBERSPRUNGEN (bewusst abgeschaltet: %s)" % (fall["rel"], warum))
+                    continue
                 schnappschuss = _schnappschuss(fall["inst_datei"], a.base, lauf_id, a.dry_run)
                 _kopieren(fall["repo_datei"], fall["inst_datei"], a.dry_run)
                 ausgerollt.append((fall["rel"], warum))
                 print("  %s ausgerollt (%s) — Schnappschuss: %s"
                       % (fall["rel"], warum, schnappschuss))
+            elif richtung == "worktree_unpruefbar":
+                # NICHT in uebersprungen (2026-08-22): ein Worktree deployt nach
+                # ~/.local/bin/~/.claude/hooks ohnehin nie (siehe wb-consistency,
+                # ist_worktree()) -- diese Zeile ist sichtbar, zaehlt aber nicht als
+                # Fund, sonst waere jeder Lauf aus einem Worker-Worktree dauerhaft
+                # "uebersprungen (eigenmaechtig/unklar)", ohne dass irgendetwas zu
+                # pruefen waere.
+                print("  %s WORKTREE -- Vergleich von hier bedeutungslos: %s" % (fall["rel"], warum))
             else:
                 grund = ("traegt eigene, im Repo unbekannte Aenderungen" if richtung == "eigenmaechtig"
                          else "Richtung nicht bestimmbar")
@@ -241,6 +416,34 @@ def main():
             print("  %s UEBERSPRUNGEN (registry-abweichung: %s) — von Hand pruefen."
                   % (pfad_text, warum))
 
+    # Fremd-Kopien (Sorte D, wb-consistency: fremd_kopien_befunde()) -- installiert,
+    # aber nirgends im Repo bekannt. Anlass (2026-08-22): posttooluse-agent-reach-
+    # skin.sh und sessionstart-limit-budget.sh lagen beide monatelang nur unter
+    # ~/.claude/hooks, ohne dass ein Lauf das je meldete -- der Kopierschleife oben
+    # sieht nur Dateien, die im Repo SCHON stehen; eine Datei, die nie aufgenommen
+    # wurde, faellt durch kein Raster davon. Reines Melden, kein Kopieren: die
+    # Richtung (ins Repo aufnehmen oder verwerfen) ist eine Handentscheidung.
+    if c7:
+        for fund in wc.fremd_kopien_befunde(c7, a.base):
+            if fund.severity != "error":
+                continue
+            uebersprungen.append((fund.file, "nicht-im-repo", fund.truth))
+            print("  %s UEBERSPRUNGEN (nicht-im-repo: %s) — von Hand pruefen."
+                  % (fund.file, fund.truth))
+
+    # Hooks, die installiert UND im Repo bekannt sind, aber nirgends in
+    # settings.json registriert (Check 12, wb-consistency: check12_hook_
+    # registrierung()) -- "ausgerollt" ist hier keine Zusage ueber "aktiv". Anlass:
+    # genau diese Verwechslung war der Anlass fuer diesen ganzen Auftrag.
+    hook_funde = wc.check12_hook_registrierung(cfg, a.base)
+    if hook_funde:
+        print()
+        print("  -- Hooks installiert, aber nicht in settings.json registriert --")
+    for fund in hook_funde:
+        uebersprungen.append((fund.file, "nicht-registriert", fund.truth))
+        print("  %s UEBERSPRUNGEN (nicht-registriert: %s) — von Hand pruefen."
+              % (fund.file, fund.truth))
+
     vorsatz = "WUERDE " if a.dry_run else ""
     print()
     print("wb-ausrollen: %s%d ausgerollt, %d uebersprungen (eigenmaechtig/unklar)."
@@ -249,6 +452,20 @@ def main():
         print("  Von Hand pruefen, dann entweder die installierte Fassung ins Repo "
               "uebernehmen oder die Aenderung dort verwerfen:")
         for rel, richtung, warum in uebersprungen:
+            print("    %-40s %-13s %s" % (rel, richtung, warum))
+    # Eigene Zeile, eigene Zaehlung, KEIN Exit 1 (Nachbesserung 22.08.2026, siehe
+    # Kopfkommentar "deaktiviert"): eine bewusst abgeschaltete plist ist weder
+    # eigenmaechtig noch unklar, und der Rat dafuer ("ins Repo uebernehmen oder
+    # verwerfen") passt nicht -- es gibt keine installierte Fassung, das ist ja
+    # der gewollte Zustand. Der richtige Rat steht schon in der Einzelzeile
+    # (Marker loeschen oder --trotz-deaktivierung), hier nur zusammengefasst.
+    if deaktiviert:
+        print("wb-ausrollen: %s%d uebersprungen (deaktiviert) -- bewusst abgeschaltet, "
+              "kein Fehler." % (vorsatz, len(deaktiviert)))
+        print("  Gewollt so lassen, oder zurueckholen: Marker-Datei unter "
+              "wb-launchagents-deaktiviert loeschen, oder erneut mit "
+              "--trotz-deaktivierung aufrufen:")
+        for rel, richtung, warum in deaktiviert:
             print("    %-40s %-13s %s" % (rel, richtung, warum))
     return 1 if uebersprungen else 0
 

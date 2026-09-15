@@ -5,28 +5,34 @@
 // fuehrt ueber capturePage() auf einem unsichtbaren Fenster. Der EINZIGE Aufruf
 // von show() haengt an der Befehlszeilen-Angabe --show, die ein Mensch selbst
 // tippt -- kein Ereignis, kein Steuerbefehl und kein Test erreicht ihn.
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, shell, protocol } from 'electron';
+import {
+  app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, shell, protocol, systemPreferences,
+} from 'electron';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { readFileSync, statSync, mkdirSync, openSync, closeSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, relative, dirname, basename } from 'node:path';
 import { loadConfig, Config } from './config';
+import { MantelKanal } from './mantel';
 import { fernAufruf, findetWerkzeug, pfadHerrichten } from './pfad';
 import { Ergebnis, ErgebnisWaechter } from './results';
-import { TmuxControl, PaneInfo, WindowInfo, assertSessionName } from './tmux';
+import { TmuxControl, PaneInfo, WindowInfo, assertSessionName, assertPaneId } from './tmux';
 import { ControlChannel, ControlRequest } from './control';
 import { captureWindow } from './shot';
-import { leseSessions, SessionInfo } from './sessions';
+import { leseSessions, SessionInfo, panesHinweisOderFrisch, fremdeSpiegelPanes } from './sessions';
 import { RemotePoller } from './remote';
 import { ampelFuerMaschine, parseRepoStand, repoStandLokal, AmpelStand, RepoStand } from './ampel';
 import { BudgetPoller } from './budget';
+import { AufgabenQuelle, aufgabenOptionenAusUmgebung } from './aufgaben';
 import { AusgabeBuendel } from './ausgabe';
-import { darfWiederherstellen, fortsetzenHinweis, reviveCommand } from './revive';
+import { darfWiederherstellen, fortsetzenHinweis, nimmtSitzungskennung, reviveCommand } from './revive';
 import { kontextFenster, transcriptPfad, transcriptStand } from './workerstate';
 import type { HarnessResume, ReviveCommand } from './revive';
-import { capacity, tabsFor, mayArrange, gitterFuer, tiledRaster } from './capacity';
-import { UiStore, sortSessions, UiState } from './uistate';
+import { capacity, tabsFor, mayArrange, gitterFuer, gitterFrei, tiledRaster, kachelZellen } from './capacity';
+import { UiStore, sortSessions, sortProjekte, UiState } from './uistate';
+import { fensterzustandLesen, fensterzustandVerfolgen, gemerktesBoundsGueltig } from './fensterzustand';
 import { LebensSpur } from './lebensspur';
+import { ABSTURZ_FERN_LOG_NAME, ABSTURZ_HOOK, AbsturzSpur, FernAbsturzSpur, absturzHookBefehl, absturzText } from './absturz';
 import { readRequests, readGuardBlocks, decideRequest, RequestEntry, GuardBlockEntry } from './freigaben';
 import {
   meldungsEinstellungen, melden, budgetProzent, NeuheitsFilter, SchwellenMelder, STANDARD_WEGE,
@@ -37,6 +43,10 @@ import {
   Einstellungsfenster, einstellungsDaten, wacheLesen, type EinstellungsDaten,
 } from './einstellungsfenster';
 import { kontextStufen, wbCodeKenntKontext, KONTEXT_PROBE_ARGS } from './kontext';
+import { DE as TEXTE_DE, EN as TEXTE_EN } from '../einstellungen/texte';
+import { DE as SITZ_TEXTE_DE, EN as SITZ_TEXTE_EN } from '../sitzung/texte';
+import { DE as ERST_TEXTE_DE, EN as ERST_TEXTE_EN } from '../erststart/texte';
+import { DE as VERB_TEXTE_DE, EN as VERB_TEXTE_EN } from '../verbrauch/texte';
 import { startBefund, kurzfassung } from './startprotokoll';
 import { Sitzungsfenster, sitzungsZeilen, type SitzungsDaten } from './sitzungsfenster';
 import { Chatbuehne } from './chatbuehne';
@@ -47,16 +57,18 @@ import { projektDateien } from './chatdateien';
 import { Chatwerkstatt } from './chatwerkstatt';
 import { Verbrauchsfenster, verbrauchLesen, type VerbrauchsFrage } from './verbrauchsfenster';
 import { Erststartfenster } from './erststartfenster';
+import { PtyVerwaltung, type PtyAuftrag } from './pty';
 import { plane, fuehreAus, gruppeAngehaengt, type Plan, type BefehlsUmgebung } from './befehle';
-import { listFiles, readFileSafe, writeFileSafe, sendSelectionToOrchestrator } from './editor';
+import { listFiles, readFileSafe, writeFileSafe, sendSelectionToOrchestrator, startEditorWaechter, type EditorWaechterHandle } from './editor';
 // Die Chat-Ansicht (SPEC-V4 Abschnitt 6) haengt mit genau diesen zwei Namen am
 // Hauptprozess: die Anfrage wird aus dem Sessionmodell gebaut, der Stand daraus
 // gelesen. Alles Weitere steht in chatquelle.ts und app/src/chat/.
 import { anfrageFuerPane, chatFaehigkeit, chatStand } from './chatquelle';
+import { oeffnungBestimmen, pfadeAufloesen } from './chatpfade';
 // Die Aufloesungsregel der Chat-Ansicht steht an EINER Stelle (chat/ansichtsregel.ts)
 // und wird hier fuer den Menuepunkt gefragt -- dieselbe Funktion, die auch
 // chatquelle.ts fuer den Stand eines Panes fragt.
-import { ansichtsUrteil } from '../chat/ansichtsregel';
+import { ansichtsUrteil, harnessErlaubt } from '../chat/ansichtsregel';
 import { listDir, isExcluded, EintragInfo } from './folder';
 import { leseAktivitaet, leseInhalt, leseDiffFuerEintrag, leseAuftragFuerErgebnis, AktivitaetEintrag } from './aktivitaet';
 import { sucheInhalt, Treffer } from './suche';
@@ -65,10 +77,10 @@ import { readGuardLog, GuardLogGruppe } from './freigaben';
 // Die mittlere Stufe (Muster-Erkennung riskanter Befehle): erteilen und
 // verweigern liegen in freigaben.ts, hier steht nur die Verdrahtung.
 import { freigabeErteilen, freigabeVerweigern, type FreigabeErgebnis } from './freigaben';
-import { startDateiWaechter } from './dateiwaechter';
+import { startDateiWaechter, type DateiWaechterHandle } from './dateiwaechter';
 import {
-  zahlAus, schalterAus, maschinenliste, sprache, erststartErledigt, chatAnsicht, chatAnsichtVorgabe,
-  alleEinstellungen,
+  zahlAus, schalterAus, maschinenliste, maschinenAktiv, maschinenPausiert, sprache, erststartErledigt, chatAnsicht, chatAnsichtVorgabe,
+  alleEinstellungen, systemSpracheSetzen, workerTransport,
 } from './einstellungen';
 // Farben durchreichen (11.08.): das Einstellungsfenster wendet Thema und
 // Zustandsfarben schon auf sich selbst an (einstellungen.ts, `themaAnwenden`);
@@ -76,7 +88,6 @@ import {
 // steht in thema.ts, ohne 'electron' -- hier wird nur noch `nativeTheme` angereicht.
 import { themaPayload } from './thema';
 import { schluesselSetzenFuerAnbieter, schluesselStatusAlle } from './schluesselbund';
-import type { FSWatcher } from 'node:fs';
 
 // KEIN FENSTER FUER EINEN FEHLER, DEN NIEMAND ERWARTET HAT (Auftrag 2026-08-19).
 //
@@ -184,6 +195,125 @@ for (const werkzeug of ['tmux', 'wb-code']) {
 
 const started = Date.now();
 const config: Config = loadConfig(process.argv.slice(1));
+// DER MENSCHEN-NACHWEIS WIRD NIE GEERBT (08.09.2026, gemessen). Ein Terminal,
+// das aus dieser Werkbank heraus entstanden ist, traegt WB_MENSCH_QUELLE und
+// WB_APP_PID der Werkbank, die es gestartet hat -- und ein Kern, der aus so
+// einem Terminal startet (Pruefung, `wb-dev`, ein zweiter Kern fuer den
+// Mac-Mantel), reichte beides mit `...process.env` an JEDES Kind weiter: ein
+// Sitzungsstart ueber den Steuerkanal galt dann als Klick eines Menschen, und
+// der Effort-Deckel war fuer jeden Agenten offen. Die beiden Variablen setzt
+// ausschliesslich dieser Prozess selbst, an genau den Stellen, an denen ein
+// echter Klick belegt ist (`sessionAnlegen`, `fuehreAus`, freigaben.ts) --
+// alles, was von aussen kommt, ist ein Erbe und wird hier verworfen.
+// Suite: shell/tests/test-app-mensch-sitzungsstart.sh (Zusage 2 stellt das
+// Erbe her und prueft, dass es nicht ankommt).
+delete process.env.WB_MENSCH_QUELLE;
+delete process.env.WB_APP_PID;
+
+/**
+ * DIE BRUECKE, ZWEIMAL ANGESCHLOSSEN (06.09.2026, Auftrag macplan).
+ *
+ * Jeder Kanal, den der Electron-Renderer ueber preload.ts erreicht, wird hier
+ * registriert -- bei `ipcMain` wie bisher UND in einer Tabelle, aus der der
+ * Mantel-Socket (mantel.ts) dieselben Handler ruft. Es gibt damit EINE
+ * Fassung jedes Kanals fuer beide Oberflaechen; wer einen Kanal anlegt, legt
+ * ihn fuer beide an, ohne es zu wissen. `anOberflaeche` ist das Gegenstueck
+ * fuer die Richtung hinaus: was das Hauptfenster bekommt, bekommt der Mantel.
+ *
+ * Der Mantel ruft die Handler mit einem Ereignis, dessen `sender` das
+ * Hauptfenster ist: `vomHauptfenster(e)` bleibt damit wahr, und die Regel
+ * „bedient wird die Sitzung auf der Buehne" gilt fuer beide Oberflaechen.
+ */
+type IpcHandler = (e: Electron.IpcMainInvokeEvent, ...args: unknown[]) => unknown;
+type IpcHoerer = (e: Electron.IpcMainEvent, ...args: unknown[]) => void;
+const ipcHandler = new Map<string, IpcHandler>();
+const ipcHoerer = new Map<string, IpcHoerer>();
+const ipc = {
+  handle(kanal: string, fn: (e: Electron.IpcMainInvokeEvent, ...args: any[]) => unknown): void {
+    ipcMain.handle(kanal, fn);
+    ipcHandler.set(kanal, fn as IpcHandler);
+  },
+  on(kanal: string, fn: (e: Electron.IpcMainEvent, ...args: any[]) => void): void {
+    ipcMain.on(kanal, fn);
+    ipcHoerer.set(kanal, fn as IpcHoerer);
+  },
+};
+let mantel: MantelKanal | null = null;
+
+/**
+ * DER MANTELBETRIEB: DIESER PROZESS IST NUR NOCH KERN (06.09.2026, Auftrag 4.1).
+ *
+ * Bis heute baute der Hauptprozess sein Electron-Fenster auch dann, wenn die
+ * Mac-native Oberflaeche ueber den Mantel-Socket haengt -- zwei Buehnen fuer
+ * dieselbe Sitzung. Die zweite sah niemand: sie kostete einen Renderer-Prozess,
+ * bekam jeden `webContents.send` mit, zeichnete Terminal und Chat neben der
+ * echten Oberflaeche her und hielt beim Beenden alles auf.
+ *
+ * Mit `AWB_MANTEL_SOCKET` entsteht deshalb GAR KEIN `BrowserWindow` mehr --
+ * weder das Hauptfenster noch eines der vier Nebenfenster (Einstellungen,
+ * Sitzung, Verbrauch, erster Start): die Mac-Fassung bringt jedes davon selbst
+ * mit. `awb:mantel-flaeche` ist dann die einzige Buehne.
+ *
+ * Was daran haengt, steht an drei Stellen: die Bruecke des Mantels schickt
+ * ihre Ereignisse mit `MANTEL_SENDER` statt mit dem Fenster los (siehe
+ * `vomHauptfenster`), `handle()` wartet nicht mehr auf einen Renderer, den es
+ * nie geben wird, und jeder Steuerbefehl, der doch in einen greifen wollte,
+ * antwortet mit `KEIN_RENDERER` statt mit einem Absturz.
+ */
+const mantelBetrieb = !!config.mantelSocket;
+
+/**
+ * Die Antwort jedes Steuerbefehls, der einen Renderer braucht und keinen
+ * findet -- im Mantelbetrieb immer, in der Electron-Fassung nur, wenn das
+ * Fenster fort ist.
+ */
+const KEIN_RENDERER = 'kein Renderer: dieser Befehl greift in ein Electron-Fenster. '
+  + 'Im Mantelbetrieb (AWB_MANTEL_SOCKET) gibt es keines -- die Mac-Oberflaeche ist die Buehne.';
+
+/**
+ * Ob ein Fenster gebaut werden darf. Die vier Nebenfenster fragen das vor
+ * jedem `new BrowserWindow` (ihre Klassen bekommen diese Funktion im
+ * Konstruktor); `null` heisst „ja".
+ */
+function fenstersperre(): string | null {
+  return mantelBetrieb ? KEIN_RENDERER : null;
+}
+
+/**
+ * DER ABSENDER DER MANTEL-BRUECKE. Er steht dort, wo sonst
+ * `win.webContents` steht: die Handler bekommen ein Ereignis, das aussieht wie
+ * eines aus dem Hauptfenster, und `vomHauptfenster()` erkennt es an dieser
+ * einen Kennung wieder. Ein echtes `webContents` gibt es im Mantelbetrieb
+ * nicht mehr, und keiner der Handler liest daran etwas anderes als die
+ * Herkunft (geprueft: `.sender` kommt in main.ts genau einmal vor).
+ */
+const MANTEL_SENDER = { __awbMantel: true } as unknown as Electron.WebContents;
+
+/** webContents.send an das Hauptfenster -- und an den Mantel, wenn einer haengt. */
+function anOberflaeche(kanal: string, nutzlast?: unknown): void {
+  win?.webContents.send(kanal, nutzlast);
+  mantel?.push(kanal, nutzlast);
+}
+
+/**
+ * Dasselbe fuer die Nebenfenster (Einstellungen, Sitzung): ihr Fenster, falls
+ * es steht, und der Mantel.
+ *
+ * Die Nutzlast darf eine FUNKTION sein, und die wird nur gerufen, wenn es
+ * einen Empfaenger gibt. Der Grund ist gemessen (06.09.2026, Auftrag
+ * seitenfix): `einstellungenDatenJetzt()` kostet rund 800 ms synchron
+ * (`which` je Harness, `wb-state` je Deckel), und `fenster?.webContents.send(
+ * kanal, einstellungenDatenJetzt())` hatte sie bei geschlossenem Fenster nie
+ * ausgewertet -- der Umbau auf diese Funktion tat es bei JEDEM Ereignis des
+ * Dateiwaechters, und die Auffrischung der offenen Seite im Hauptfenster kam
+ * eine Sekunde spaeter als vorher (test-app-seiten-auffrischung.sh, rot).
+ */
+function anFenster(fenster: BrowserWindow | null | undefined, kanal: string, nutzlast?: unknown | (() => unknown)): void {
+  if (!fenster && !mantel) return;
+  const daten = typeof nutzlast === 'function' ? (nutzlast as () => unknown)() : nutzlast;
+  fenster?.webContents.send(kanal, daten);
+  mantel?.push(kanal, daten);
+}
 // KOPFLOS UNTER LINUX: DER BILDTAKT MUSS ERST GELOEST WERDEN.
 //
 // Das Fenster entsteht immer mit show:false. Unter Linux nimmt Chromium ein
@@ -212,6 +342,65 @@ const ui = new UiStore(config.stateDir);
 // aussieht wie eine, die jemand geschlossen hat. Der Grund steht in
 // lebensspur.ts.
 const lebensspur = new LebensSpur(config.stateDir);
+// WIE eine Sitzung endete (05.09., „nur bei Absturz"): der tmux-Hook schreibt
+// Status oder Signal jedes gestorbenen Panes hierher, der Takt liest es und
+// sagt einen Satz -- nur bei Status ungleich 0. Der Grund und die Messung der
+// drei Wege stehen in absturz.ts.
+const absturzspur = new AbsturzSpur(join(config.stateDir, 'absturz.log'));
+/**
+ * Wann der Hook zuletzt gesetzt wurde, 0 heisst: steht nicht. Er wird bei
+ * jedem Takt nachgesetzt, solange es nicht gelang (kein Server, solange keine
+ * Sitzung laeuft -- der Hook kann erst mit der ersten entstehen), und danach
+ * einmal je Minute erneuert, falls der Server zwischendurch neu entstand.
+ */
+let absturzHookGesetztAm = 0;
+const ABSTURZ_HOOK_ERNEUERN_MS = 60_000;
+
+function absturzHookSetzen(): void {
+  const jetzt = Date.now();
+  if (absturzHookGesetztAm && jetzt - absturzHookGesetztAm < ABSTURZ_HOOK_ERNEUERN_MS) return;
+  const base = config.tmuxSocket ? ['-L', config.tmuxSocket] : [];
+  // Dieselbe Frist und dasselbe Signal wie jeder oertliche tmux-Aufruf im Takt
+  // (sessions.ts, tmuxAntwort): ein haengendes tmux darf hier nicht den
+  // Hauptprozess anhalten.
+  const r = spawnSync('tmux', [...base, 'set-hook', '-g', ABSTURZ_HOOK, absturzHookBefehl(absturzspur.datei)], {
+    encoding: 'utf8', timeout: 2000, killSignal: 'SIGKILL',
+  });
+  absturzHookGesetztAm = !r.error && r.status === 0 ? jetzt : 0;
+}
+
+/** Was seit dem letzten Takt gestorben ist -- und davon nur, was ein Absturz war. */
+function abstuerzeMelden(): void {
+  for (const e of absturzspur.neue()) {
+    const s = sessions.find((x) => x.tmuxSession === e.session);
+    const text = absturzText(s?.name ?? e.session, e);
+    if (!text) continue;
+    process.stderr.write(`${text} -- Pane ${e.paneId}, Rolle '${e.role}'\n`);
+    melde(text, ABSTURZ_HINWEIS_MS);
+  }
+}
+/** Der Absturz-Satz steht laenger als eine gewoehnliche Rueckmeldung: 30 s oder bis zum naechsten Klick. */
+const ABSTURZ_HINWEIS_MS = 30_000;
+/**
+ * Dasselbe fuer FERNE Maschinen (05.09., absturz.ts, Kopf „FERNE MASCHINEN"):
+ * die Zeilen kommen mit dem Fernabruf, nur ein GELUNGENER Abruf zaehlt --
+ * ein ausgefallener traegt den alten Stand weiter, und der wuerde nach dem
+ * Wiederkommen alles Alte als neu ausgeben. Der Satz nennt die Maschine.
+ */
+const fernAbsturzspur = new FernAbsturzSpur();
+function fernAbstuerzeMelden(): void {
+  const hosts = new Set(remotePoller.hostliste());
+  for (const snap of remotePoller.snapshots()) {
+    if (snap.error || !hosts.has(snap.machine)) continue;
+    for (const e of fernAbsturzspur.neue(snap.machine, snap.absturzRaw)) {
+      const s = sessions.find((x) => x.machine === snap.machine && x.tmuxSession === e.session);
+      const text = absturzText(s?.name ?? e.session, e, snap.machine);
+      if (!text) continue;
+      process.stderr.write(`${text} -- Pane ${e.paneId}, Rolle '${e.role}'\n`);
+      melde(text, ABSTURZ_HINWEIS_MS);
+    }
+  }
+}
 // V10: der eigene, langsamere Takt fuer Fernmaschinen -- siehe remote.ts fuer
 // den Grund, warum das NICHT im 2s-Takt von modellLesen() passieren darf.
 const remotePoller = new RemotePoller({
@@ -221,8 +410,22 @@ const remotePoller = new RemotePoller({
   relSessionsDir: relative(homedir(), config.sessionsDir),
   relTestsuiteStatus: relative(homedir(), config.testsuiteStatusFile),
   relHygieneStatus: relative(homedir(), config.hygieneStatusFile),
+  relAbsturzLog: relative(homedir(), join(config.stateDir, ABSTURZ_FERN_LOG_NAME)),
 });
 const budgetPoller = new BudgetPoller({ intervalMs: config.budgetPollMs, timeoutMs: config.budgetTimeoutMs, bin: config.budgetBin });
+// DER TAB „AGENTS" (aufgaben.ts, welten.ts): eigener Kanal `awb:aufgaben` mit den
+// Welten und der Fusszeile des Traegers, im Zwei-Sekunden-Takt, solange eine
+// Oberflaeche ihn zeigt; die Handlungen als `welt:<handlung> <JSON>` -- beides
+// fuer Renderer und Mantel.
+const aufgabenQuelle = new AufgabenQuelle({
+  ...aufgabenOptionenAusUmgebung(process.env, homedir(), config),
+  sitzungen: () => sessions,
+  aufNeu: (p) => anOberflaeche('awb:aufgaben', p),
+});
+ipc.handle('awb:aufgaben-daten', () => aufgabenQuelle.aktuell());
+ipc.handle('awb:aufgabe', (_e, befehl: unknown, opt: unknown) => aufgabenQuelle.ausfuehren(String(befehl ?? ''), 'oberflaeche', opt));
+// Ob eine Oberflaeche die Ansicht zeigt: dann taktet der Kern schnell, sonst langsam (Befund M4).
+ipc.on('awb:aufgaben-sichtbar', (_e, an: unknown) => aufgabenQuelle.sichtbarSetzen(an === true));
 
 function leseStatusdatei(pfad: string): string {
   try {
@@ -318,14 +521,14 @@ let awbLetzterKontextmenuAktionen: { kopieren?: () => void; einfuegen?: () => Pr
  * einzige show()-Aufruf haengt an einem echten Klick im Hauptfenster
  * (einstellungsfenster.ts, Klassendoc).
  */
-const einstellungsfenster = new Einstellungsfenster(() => win);
+const einstellungsfenster = new Einstellungsfenster(() => win, fenstersperre);
 /**
  * Das Sitzungsfenster hinter dem Plus-Knopf. Dieselbe Bauform und dieselbe
  * Auflage wie beim Einstellungsfenster: es entsteht erst, wenn jemand danach
  * fragt, und es wird NIE von hier aus gezeigt -- der einzige show()-Aufruf
  * haengt an einem echten Klick im Hauptfenster (sitzungsfenster.ts, Klassendoc).
  */
-const sitzungsfenster = new Sitzungsfenster(() => win);
+const sitzungsfenster = new Sitzungsfenster(() => win, fenstersperre);
 
 // Die Chat-Sitzungen (12.08.) -- eigene Welt neben den Terminal-Sitzungen:
 // eigene Buchfuehrung (chats.json neben ui.json), eigene Prozesse. Die
@@ -410,6 +613,11 @@ const chatbuehne = new Chatbuehne(
     }),
     fenster: (modell: string) => kontextFenster(modell, config.modelsFile),
   }),
+  // DER STAND GEHT AN BEIDE OBERFLAECHEN (06.09.2026, Auftrag 3.1 von
+  // mac/PLAN.md): `anOberflaeche` schickt an das Electron-Fenster UND an den
+  // Mantel. Vorher lief `awb:chat-stand-neu` als einziger Kanal direkt an
+  // `win.webContents` vorbei am Mantel (mac/PROTOKOLL.md, Offen aus Phase 1).
+  (nachricht) => anOberflaeche('awb:chat-stand-neu', nachricht),
 );
 
 /**
@@ -429,14 +637,20 @@ function chatModellVorgabe(): string {
  * Nachfrage und wird NIE von hier aus gezeigt (verbrauchsfenster.ts,
  * Klassendoc).
  */
-const verbrauchsfenster = new Verbrauchsfenster(() => win);
+const verbrauchsfenster = new Verbrauchsfenster(() => win, fenstersperre);
 /**
  * Der geführte erste Start (SPEC-V4 3.8). Viertes Fenster derselben Bauform -- entsteht erst auf
  * Nachfrage oder beim ersten echten Start und wird nie von HIER aus gezeigt
  * (erststartfenster.ts, Klassendoc).
  */
-const erststartfenster = new Erststartfenster(() => win);
-let dateiWaechter: FSWatcher[] = [];
+const erststartfenster = new Erststartfenster(() => win, fenstersperre);
+let dateiWaechter: DateiWaechterHandle | null = null;
+/**
+ * Der Waechter ueber die im Editor OFFENEN Dateien (06.09.2026, Auftrag 3.4).
+ * Er entsteht erst, wenn eine Oberflaeche `awb:editor-watch` schickt -- ohne
+ * offenen Editor beobachtet niemand etwas.
+ */
+let editorWaechter: EditorWaechterHandle | null = null;
 let tmux: TmuxControl | null = null;
 let channel: ControlChannel | null = null;
 /** Warum es keinen Steuerkanal gibt -- null heisst: es gibt einen. */
@@ -450,6 +664,14 @@ let freigaben: { requests: RequestEntry[]; guardBlocks: GuardBlockEntry[]; guard
 let streamPane = '';
 /** Zuletzt vom Renderer gemeldete Zeichenflaeche in Spalten und Zeilen. */
 let flaeche: { cols: number; rows: number } | null = null;
+/**
+ * Steht rechts ein Blatt des Inspektors offen? Der Renderer meldet es, sobald
+ * es sich aendert. Gebraucht in `kapazitaet()`: ein offenes Blatt nimmt der
+ * Buehne rund 360 Bildpunkte, und ohne diese Auskunft faellt sie dabei von zwei
+ * Spalten auf eine (Electron-Befund 7). Nicht gemerkt und nicht in ui.json:
+ * ein Blatt ist ein Zustand des Augenblicks, kein Vorzug.
+ */
+let blattOffen = false;
 /** Was die Mitte gerade zeigt: einen einzelnen Pane oder einen ganzen Tab. */
 let ansicht: { art: 'pane'; pane: string } | { art: 'tab'; panes: string[] } = { art: 'pane', pane: '' };
 /**
@@ -467,7 +689,71 @@ let uhr: NodeJS.Timeout | null = null;
  * viele IPC-Nachrichten, wenn jedes einzeln faehrt, und zwei, wenn sie
  * gebuendelt werden (shell/tests/test-app-ausgabe-buendel.sh).
  */
-const ausgabeBuendel = new AusgabeBuendel((paneId, data) => win?.webContents.send('awb:output', { paneId, data }));
+const ausgabeBuendel = new AusgabeBuendel((paneId, data) => anOberflaeche('awb:output', { paneId, data }));
+
+/**
+ * DIE PROBE FUER OPTION E (04.09.2026): ein Worker auf einem eigenen
+ * Pseudo-Terminal, ohne tmux, gehalten von diesem Prozess.
+ *
+ * Sie haengt vollstaendig an einem Schalter (`workerTransport` in den
+ * Einstellungen, Vorgabe 'tmux'). Steht er nicht auf 'pty', wird `node-pty`
+ * nicht einmal geladen: dieselbe Anwendung, derselbe Weg wie bisher, und der
+ * Zweig `dev` laeuft mit dem Prototyp im Baum genauso wie ohne ihn.
+ *
+ * Die Ausgabe geht durch DIESELBE Buendelung wie die tmux-Ausgabe und ueber
+ * dieselbe Bruecke (`awb:output`); der Renderer sieht keinen Unterschied und
+ * ist unveraendert geblieben. Genau das ist der Punkt der Probe -- was ein
+ * Pane IST, geht die Zeichenflaeche nichts an.
+ */
+let ptyPanes: PtyVerwaltung | null = null;
+function ptyVerwaltung(): PtyVerwaltung {
+  if (!ptyPanes) {
+    const v = new PtyVerwaltung(join(config.stateDir, 'pty-panes.json'));
+    v.on('ausgabe', (paneId: string, data: Buffer) => ausgabeBuendel.nimm(paneId, data));
+    v.on('ende', (paneId: string, code: number) => {
+      process.stderr.write(`pty ${paneId} beendet (Code ${code})\n`);
+    });
+    ptyPanes = v;
+  }
+  return ptyPanes;
+}
+
+/** Ob der Prototyp ueberhaupt eingeschaltet ist. Zweite Stelle: einstellungen.ts. */
+function ptyTransport(): boolean {
+  return workerTransport(config.settingsFile) === 'pty';
+}
+
+/**
+ * Ein tmux-Tastenname als Bytes. `null` heisst "kenne ich nicht" -- und das ist
+ * eine Ablehnung, keine leere Sendung: wer 'Enter' schreibt und nichts bekommt,
+ * sucht den Fehler am falschen Ende.
+ *
+ * Die Namen sind die von `send-keys`, damit die Werkzeuge unveraendert dieselben
+ * Woerter benutzen koennen. Mehr als diese Liste braucht die Wache nicht; sie
+ * tippt Enter, Escape und C-c, sonst nichts.
+ */
+function tastenBytes(name: string): string | null {
+  const fest: Record<string, string> = {
+    Enter: '\r',
+    Escape: '\x1b',
+    Tab: '\t',
+    Space: ' ',
+    BSpace: '\x7f',
+    Up: '\x1b[A',
+    Down: '\x1b[B',
+    Right: '\x1b[C',
+    Left: '\x1b[D',
+  };
+  if (fest[name]) return fest[name];
+  // C-a bis C-z und die Steuerzeichen daneben, in derselben Schreibweise wie
+  // tmux sie nimmt.
+  const strg = /^C-([A-Za-z@[\]\\^_])$/.exec(name);
+  if (strg) {
+    const z = strg[1].toUpperCase().charCodeAt(0);
+    return String.fromCharCode(z & 0x1f);
+  }
+  return null;
+}
 
 /**
  * Die EINE Stelle, an der eine Lage-Meldung hinausgeht -- und damit die eine
@@ -478,16 +764,21 @@ const ausgabeBuendel = new AusgabeBuendel((paneId, data) => win?.webContents.sen
  */
 function lageSenden(nutzlast: unknown): void {
   ausgabeBuendel.abgeben();
-  win?.webContents.send('awb:layout', nutzlast);
+  anOberflaeche('awb:layout', nutzlast);
 }
 
 function createWindow(cols: number, rows: number): BrowserWindow {
   // Grob an der Pane-Groesse ausgerichtet; der Renderer skaliert genau.
   const breite = Math.max(640, cols * 8 + 140);
   const hoehe = Math.max(360, rows * 17 + 60);
+  // Zustand aus dem letzten Lauf (siehe fensterzustand.ts) schlaegt die
+  // Pane-Groesse, wenn er zum aktuellen Bildschirm passt -- ein Mensch, der
+  // das Fenster von Hand groesser gezogen oder verschoben hat, soll das nach
+  // einem Neustart wiederfinden, nicht wieder auf 34 Zeilen zurueckfallen.
+  const gemerkt = fensterzustandLesen(config.stateDir);
+  const bounds = gemerktesBoundsGueltig(gemerkt) ? gemerkt : null;
   const w = new BrowserWindow({
-    width: breite,
-    height: hoehe,
+    ...(bounds ? bounds : { width: breite, height: hoehe }),
     // Die Zahlen meinen den Inhalt, nicht den Rahmen -- das Selbstfoto zeigt
     // den Inhalt, also soll er die angegebene Groesse haben.
     useContentSize: true,
@@ -496,6 +787,11 @@ function createWindow(cols: number, rows: number): BrowserWindow {
     // Selbstfoto einen aelteren Stand als der Puffer (V6).
     paintWhenInitiallyHidden: true,
     backgroundColor: '#101216',
+    // Die drei Fensterknoepfe bleiben am gewohnten Mac-Platz oben links, aber
+    // OHNE die separate graue Titelleiste darueber -- der Inhalt (die
+    // Sessionleiste) laeuft bis unter sie durch. Nur macOS kennt diesen Wert;
+    // auf jeder anderen Plattform bleibt der Rahmen wie er war.
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' as const } : {}),
     webPreferences: {
       preload: join(__dirname, '..', 'preload', 'preload.js'),
       contextIsolation: true,
@@ -507,7 +803,42 @@ function createWindow(cols: number, rows: number): BrowserWindow {
   // Ohne nutzbaren Bildschirm setzt Electron das Fenster auf seine Vorgabe von
   // 800x600 bei 0,0 und ignoriert die Groesse aus dem Aufruf -- gemessen im
   // kopflosen Lauf. Nachgesetzt gilt sie trotzdem.
-  w.setContentSize(breite, hoehe);
+  //
+  // DAS GILT AUCH FUER EINEN GEMERKTEN RAHMEN (03.09.2026). Bis dahin wurde nur
+  // nachgesetzt, wenn KEINER vorlag -- lag einer vor, blieb es beim Konstruktor,
+  // und genau der wird ohne nutzbaren Bildschirm ignoriert. Gemessen mit einer
+  // fenster.json von 1600x900: die Buehne kam mit 818x534 heraus, also aus der
+  // Panezahl. Kopflos meldet Electron dabei einen erfundenen Bildschirm von
+  // 800x600; ein gemerkter Rahmen gilt dort nur, wenn seine Mitte darin liegt
+  // (fensterzustand.ts) -- ein Test, der eine bestimmte Buehnengroesse braucht,
+  // setzt seine x/y deshalb entsprechend.
+  //
+  // `bounds.width`/`.height` sind die INHALTS-Groesse (siehe fensterzustand.ts),
+  // und `useContentSize` steht -- der Aufruf schreibt also denselben Wert noch
+  // einmal, den der Konstruktor schon bekommen hat, und ist dort, wo dieser
+  // gewirkt hat, folgenlos.
+  if (bounds) w.setContentSize(bounds.width, bounds.height);
+  else w.setContentSize(breite, hoehe);
+  fensterzustandVerfolgen(w, config.stateDir);
+
+  // ENTWICKLUNGSFASSUNG SICHTBAR MACHEN (2026-09-03). Die Dev-Fassung laeuft
+  // neben der ausgelieferten, mit eigenen Daten und eigenem tmux-Server -- aber
+  // sie trug denselben Fenstertitel. Zwei gleich aussehende Fenster
+  // nebeneinander sind eine Falle, und es ist genau die, in die alice am
+  // 10.08. schon einmal gelaufen ist: damals standen zwei Symbole im Dock, und
+  // er klickte auf das falsche (siehe den Kopf von shell/make-app.sh).
+  //
+  // Der Titel wird vom RENDERER gesetzt (renderer.ts, `document.title`), damit
+  // er der eingestellten Sprache folgt. Deshalb wird hier nicht einmalig ein
+  // Titel gesetzt, sondern jede Meldung des Renderers abgefangen und ergaenzt.
+  // `setTitle` aus dem Hauptprozess loest das Ereignis nicht erneut aus, es
+  // entsteht also keine Schleife.
+  if (process.env.AWB_DEV === '1') {
+    w.on('page-title-updated', (e) => {
+      e.preventDefault();
+      w.setTitle(`${w.webContents.getTitle()} – Entwicklungsfassung`);
+    });
+  }
   return w;
 }
 
@@ -521,7 +852,7 @@ function neuerWaechter(): { p: Promise<void>; melden: () => void } {
   return { p, melden };
 }
 let waechter = neuerWaechter();
-ipcMain.on('awb:ready', () => {
+ipc.on('awb:ready', () => {
   rendererReady = true;
   waechter.melden();
 });
@@ -535,6 +866,85 @@ async function waitForRenderer(timeoutMs = 15000): Promise<void> {
       t = setTimeout(() => reject(new Error('Renderer meldete sich nicht')), timeoutMs);
     }),
   ]).finally(() => clearTimeout(t));
+}
+
+/**
+ * IST DER RENDERER DIESES FENSTERS UEBERHAUPT NOCH DA (Prueferbefund vom
+ * 05.09.2026, hier nachgestellt und gemessen)?
+ *
+ * WAS GEMESSEN WURDE: Stirbt der Renderer-Prozess des Fensters, laeuft der
+ * Hauptprozess weiter und tickt weiter -- aber jeder Ruf in den Renderer
+ * (`executeJavaScript`) loest sein Versprechen NIE mehr auf. `awb-ctl state`
+ * liest ueber `bufferText()` und `schirmText()` genau dort und blieb deshalb
+ * ohne Antwort stehen; weil `ControlChannel.answer()` eine Anfrage nach der
+ * anderen abarbeitet, stand mit ihr der ganze Steuerkanal. Von aussen sieht
+ * das aus wie ein totes Programm: keine Antwort auf `state`, keine auf alles
+ * Weitere. Im Protokoll steht davor die Kette „Render frame was disposed
+ * before WebFrameMain could be accessed" -- Electrons eigene Meldung ueber
+ * jedes `webContents.send()`, das ins Leere ging.
+ *
+ * Ein Steuerbefehl, der das Programm unerreichbar macht, ist eine Waffe gegen
+ * seinen eigenen Benutzer. Also wird VOR dem Ruf gefragt, ob es ueberhaupt
+ * jemanden gibt, der ihn beantworten kann.
+ *
+ * MASSGEBLICH IST `rendererReady`, NICHT DAS OBJEKT (gemessen, 05.09.): nach
+ * dem Tod des Renderer-Prozesses meldet weder `isDestroyed()` noch der Zugriff
+ * auf `mainFrame` etwas Auffaelliges -- das Fenster steht, das Objekt
+ * antwortet, und erst der Ruf hinein bleibt offen. Was den Unterschied
+ * wirklich kennt, ist der Merker, den `awb:ready` setzt und den
+ * 'render-process-gone' wieder loescht. Die beiden Abfragen davor bleiben
+ * trotzdem stehen: sie kosten nichts und fangen den Fall ab, in dem das
+ * Fenster schon fort ist, bevor irgendein Ereignis gelaufen ist.
+ */
+function rendererErreichbar(ziel: BrowserWindow | null = win): boolean {
+  if (!ziel || ziel.isDestroyed() || ziel.webContents.isDestroyed()) return false;
+  try {
+    if (!ziel.webContents.mainFrame) return false;
+  } catch {
+    return false;
+  }
+  return rendererReady;
+}
+
+/**
+ * Wie lange ein Steuerbefehl auf einen wiedergekommenen Renderer wartet. Der
+ * Hauptprozess holt ihn nach einem Absturz von selbst zurueck (siehe den
+ * `render-process-gone`-Zuhoerer bei der Fenstererzeugung); dieser Weg dauert
+ * einen Neustart des Renderers lang, also wenige hundert Millisekunden. Fuenf
+ * Sekunden sind reichlich dafuer und kurz genug, dass ein Mensch am Terminal
+ * nicht glaubt, sein Befehl sei verlorengegangen.
+ */
+const RENDERER_RUECKKEHR_MS = 5000;
+
+/**
+ * Die Befehle, die ohne lebenden Renderer beantwortet werden -- Begruendung
+ * je Eintrag am Eingang von `handle()`.
+ */
+const STEUERBEFEHLE_OHNE_RENDERER = new Set(['ping', 'quit', 'reload']);
+
+/** Wann der Renderer zuletzt nach einem Absturz neu geladen wurde. */
+let rendererNeustartAm = 0;
+/** Und wie dicht zwei solche Neustarts hoechstens aufeinander folgen duerfen. */
+const RENDERER_NEUSTART_ABSTAND_MS = 5000;
+
+/**
+ * Warten, bis der Renderer wieder da ist -- oder mit einem lesbaren Satz
+ * aufgeben. Aufgeben ist hier ausdruecklich das bessere Ende: eine Antwort
+ * „der Renderer ist weg" sagt, was los ist, ein Haengenbleiben sagt nichts und
+ * nimmt den Kanal fuer jeden weiteren Befehl mit.
+ */
+async function rendererZurueck(frist = RENDERER_RUECKKEHR_MS): Promise<void> {
+  const bis = Date.now() + frist;
+  for (;;) {
+    if (rendererErreichbar()) return;
+    if (Date.now() >= bis) {
+      throw new Error(
+        `der Renderer dieses Fensters ist weg und in ${frist} ms nicht wiedergekommen -- `
+        + 'dieser Befehl braucht ihn. Das Protokoll nennt den Grund (render-process-gone).',
+      );
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
 }
 
 // --- Sessionmodell ---------------------------------------------------------
@@ -560,6 +970,42 @@ function erreichbareMaschinen(): string[] {
  * Meldung nach vier Sekunden von selbst verschwindet und der Zustand bleibt.
  */
 let tmuxBefund = { ausfuehrbar: true, fehler: '' };
+
+/**
+ * DAS ANHAENGEN BEIM START WIRD NACHGEHOLT, WENN TMUX BEIM START NICHT
+ * GEANTWORTET HAT (2026-08-24, Auftrag "was bei zwanzig gleichzeitig
+ * passiert").
+ *
+ * Der Start haengt genau EINMAL an: er liest das Modell, nimmt die gewaehlte
+ * Sitzung und zeichnet sie, falls sie laeuft. Ob sie laeuft, beantwortet ein
+ * `spawnSync('tmux', ['list-sessions', …])` mit einer Frist von 2000 ms
+ * (sessions.ts). Reisst diese Frist, ist `alive` fuer JEDE Sitzung false --
+ * nicht weil keine laeuft, sondern weil niemand nachsehen konnte. Das Programm
+ * haengte sich dann an nichts, und weil das Anhaengen nur am Start und beim
+ * Klick passiert, blieb es dabei: die Mitte blieb leer, bis ein Mensch die
+ * Sitzung anklickte. Der 2s-Takt darunter las das Modell laengst wieder
+ * richtig -- er zog nur keine Folgerung daraus.
+ *
+ * GEMESSEN, warum die Frist ueberhaupt reisst (2026-08-24, diese Maschine):
+ * Jede Testsuite schreibt ihren tmux-Schirm frisch in ein eigenes HOME, und
+ * macOS prueft jede FRISCH GESCHRIEBENE ausfuehrbare Datei beim ERSTEN Start --
+ * `XprotectService`, maschinenweit hintereinander, rund 100 bis 250 ms je
+ * Datei. Bei 24 gleichzeitigen ersten Starts stand der langsamste 2,6 s an;
+ * das Programm sah davon nur seinen abgelaufenen tmux-Aufruf. Von 24
+ * gleichzeitig gestarteten Instanzen bekamen 15 nie eine Lage -- und alle 15
+ * trugen genau diesen abgelaufenen Aufruf im Protokoll, die neun anderen
+ * keinen.
+ *
+ * Die Frist bleibt, wie sie ist: sie schuetzt den Hauptprozess davor, an einem
+ * haengenden tmux stehenzubleiben, und laenger machen hiesse nur, dieselbe
+ * Wette bei mehr Last erneut zu verlieren. Was hier falsch war, ist nicht die
+ * Frist, sondern dass eine GESCHEITERTE MESSUNG zu einer ENDGUELTIGEN
+ * ENTSCHEIDUNG wurde. Dieser Merker haelt fest, dass der Start ohne Auskunft
+ * entschieden hat; der naechste Takt, in dem tmux wieder antwortet, holt das
+ * Anhaengen einmalig nach -- und nur dann, wenn seither nichts anderes
+ * angehaengt wurde.
+ */
+let startAnhaengenNachholen = false;
 let tmuxGemeldetAm = 0;
 const TMUX_MELDUNG_WIEDERHOLUNG_MS = 60_000;
 
@@ -744,7 +1190,7 @@ function startFehlschlagMelden(
       + (befund.protokoll ? `\n\nVollstaendig: ${befund.protokoll}` : '')
     : `Die Sitzung in ${befund.ort} ist NICHT gestartet, und wb-code hat keinen Grund hinterlassen.`
       + (befund.protokoll ? ` Protokoll: ${befund.protokoll}` : ''));
-  sitzungsfenster.aktuell()?.webContents.send('awb:sitz-startfehler', {
+  anFenster(sitzungsfenster.aktuell(), 'awb:sitz-startfehler', {
     ort: befund.ort, kurz: befund.kurz, grund: befund.grund, protokoll: befund.protokoll,
   });
   if (ziel) {
@@ -766,13 +1212,13 @@ async function planSofort(plan: Plan): Promise<void> {
   if (plan.command === 'settings') {
     seiteOffen = 'einstellungen';
     sessions = modellLesen();
-    win?.webContents.send('awb:seite', { name: 'einstellungen' });
+    anOberflaeche('awb:seite', { name: 'einstellungen' });
     return;
   }
   if (plan.command === 'refresh') {
     sessions = modellLesen();
     modellSenden();
-    if (seiteOffen) win?.webContents.send('awb:seite', { name: seiteOffen });
+    if (seiteOffen) anOberflaeche('awb:seite', { name: seiteOffen });
     return;
   }
   if (plan.command === 'resume' && plan.daten?.bereitsAktiv) {
@@ -810,6 +1256,7 @@ function sessionWiederherstellen(id: string, mensch = false): { command: string;
     : [config.wbCodeBin, ...KONTEXT_PROBE_ARGS]);
   const cmd = reviveCommand(
     s, config.machine, config.wbCodeBin, harnessResume(s.harness), kenntKontext,
+    reviveKennung(s, true),
   );
   // DERSELBE UMGANG WIE BEIM PLUS-MENUE (21.08.), und zwar in allen drei
   // Punkten. Bis heute stand hier `stdio: 'ignore'` und sonst nichts: der Grund
@@ -915,6 +1362,49 @@ function harnessResume(id: string): HarnessResume | undefined {
     registryMerker = { ...st, harnesses };
   }
   return registryMerker.harnesses[id];
+}
+
+/**
+ * Die Kennung der Unterhaltung EINES Ordners fuer einen Registry-Harness (cline/forge),
+ * aufgeloest ueber `wb-resume-id` -- dieselbe Aufloesung wie im Pane-Weg shell/wb-revive,
+ * nur einmal gepflegt (2026-09-06). Nur fuer NICHT-builtin Harnesses mit `{resumeId}`;
+ * fuer claude bleibt es bei der gemerkten `claudeSessionId`. Ohne eindeutigen Treffer
+ * (leere Ausgabe) `undefined`, und reviveCommand faengt dann neu an.
+ *
+ * `erlaubeFern` steuert den Preis: die Vorschau ruft dies fuer JEDE gestoppte Session bei
+ * jedem Auffrischen, und ein `ssh` je Fernsitzung waere dort zu teuer -- deshalb loest die
+ * Vorschau nur LOKAL auf (fern: `undefined`). Die WIRKLICHE Wiederherstellung (ein Klick)
+ * loest auch fern auf.
+ */
+function reviveKennung(
+  s: Pick<SessionInfo, 'harness' | 'dir' | 'machine'>,
+  erlaubeFern = false,
+): string | undefined {
+  const h = harnessResume(s.harness);
+  if (!h || h.builtin || !nimmtSitzungskennung(h) || !s.dir) return undefined;
+  let bin: string;
+  let argv: string[];
+  if (s.machine === config.machine) {
+    bin = config.wbResumeIdBin;
+    argv = [s.harness, '--dir', s.dir, '--models', config.modelsFile];
+  } else {
+    if (!erlaubeFern) return undefined;
+    [bin, ...argv] = fernAufruf(s.machine, ['wb-resume-id', s.harness, '--dir', s.dir]);
+  }
+  try {
+    const r = spawnSync(bin, argv, { encoding: 'utf8', timeout: 6000 });
+    if (r.status !== 0 || !r.stdout) return undefined;
+    for (const line of r.stdout.split('\n')) {
+      const idx = line.indexOf('\t');
+      if (idx < 0) continue;
+      if (line.slice(0, idx) !== 'id') continue;
+      const id = line.slice(idx + 1).trim();
+      if (/^[A-Za-z0-9._-]{1,128}$/.test(id)) return id;
+    }
+  } catch {
+    /* eine kaputte Aufloesung darf den Knopf nie sprengen -- dann faengt die Session neu an */
+  }
+  return undefined;
 }
 
 /**
@@ -1160,7 +1650,7 @@ function startGrundBeobachten(
         ? `Die Sitzung in ${ort} ist NICHT gestartet:\n${befund.grund}\n\nVollstaendig: ${protokollPfad}`
         : `Die Sitzung in ${ort} ist NICHT gestartet, und wb-code hat keinen Grund hinterlassen. Protokoll: ${protokollPfad}`;
       melde(text);
-      sitzungsfenster.aktuell()?.webContents.send('awb:sitz-startfehler', {
+      anFenster(sitzungsfenster.aktuell(), 'awb:sitz-startfehler', {
         ort, kurz, grund: befund.grund, protokoll: protokollPfad,
       });
       // Damit die Zeile in der Leiste nachzieht: der Ordner steht jetzt als
@@ -1501,7 +1991,7 @@ function freigabenAktualisieren(): void {
     // nicht nur der Momentanwert des laufenden Blocks (das ist guardBlocks).
     guardLog: readGuardLog(config.guardLogFile),
   };
-  win?.webContents.send('awb:freigaben', freigaben);
+  anOberflaeche('awb:freigaben', freigaben);
   // Benachrichtigung 'freigabeWartet': beide Quellen zaehlen (Antrag UND
   // wartende Rueckfrage), ueber eigene Vorsilben getrennt, damit derselbe
   // Schluessel nie aus zwei verschiedenen Anlaessen kommen kann.
@@ -1692,7 +2182,7 @@ function ergebnissePruefen(): Ergebnis[] {
   const neu = waechterErgebnisse.durchgang(namen);
   for (const e of neu) {
     gemeldeteErgebnisse.push(e);
-    win?.webContents.send('awb:ergebnis', e);
+    anOberflaeche('awb:ergebnis', e);
     melden('workerFertig', `Worker '${e.name}' ist fertig.`, meldungsEinstellungen(config.settingsFile), STANDARD_WEGE);
   }
   if (gemeldeteErgebnisse.length > 50) gemeldeteErgebnisse.splice(0, gemeldeteErgebnisse.length - 50);
@@ -1783,7 +2273,7 @@ async function mausNachfuehren(): Promise<void> {
   }
   if (JSON.stringify(neu) === JSON.stringify(mausStand)) return;
   mausStand = neu;
-  win?.webContents.send('awb:maus', neu);
+  anOberflaeche('awb:maus', neu);
 }
 
 /**
@@ -1834,6 +2324,29 @@ async function panesNachlesen(): Promise<void> {
   if (!windows || !panes || panes.length === 0) return;
   const vorher = paneFingerabdruck(attachState.windows, attachState.panes);
   attachState = { ...attachState, windows, panes };
+  // DER ZWEITE ANLASS FUER DEN GROESSENABGLEICH (08.09.2026, Auftrag
+  // geometrie). Bis heute lief `lageAbgleichen` NUR auf `%layout-change` --
+  // und es gibt Aenderungen der Panegroesse, die tmux nicht meldet. GEMESSEN
+  // auf tmux 3.7c mit einem Steuerclient am Fenster: ein
+  // `set-option -g -w pane-border-status off` macht aus einem Pane von 51
+  // Zeilen einen von 52, und ueber den Steuerkanal kam kein `%layout-change`,
+  // sondern nur das `%output` der Anwendung, die sich neu zeichnete. Die Buehne
+  // stand danach dauerhaft eine Zeile neben ihrem Pane, bis irgendetwas anderes
+  // eine Neuzeichnung ausloeste.
+  //
+  // Die Groessen loesen deshalb weiterhin NICHTS unmittelbar aus -- der
+  // Fingerabdruck darueber traegt sie bewusst nicht, und das bleibt so. Sie
+  // stellen nur die eine Frage an `lageAbgleichen`, die dieses schon immer
+  // beantwortet, mit seinen drei Riegeln und seiner Abklingzeit: hat sich
+  // gegenueber dem, was zuletzt GEZEICHNET wurde, wirklich etwas geaendert?
+  // Damit ist es derselbe Weg wie beim gemeldeten Layoutwechsel, nur mit einem
+  // zweiten Anlass -- und er kostet nichts, weil die Liste hier ohnehin schon
+  // gelesen ist.
+  const groessenAnders = gezeichneteLage.some((p) => {
+    const jetzt = panes.find((q) => q.paneId === p.paneId);
+    return !!jetzt && (jetzt.width !== p.cols || jetzt.height !== p.rows);
+  });
+  if (groessenAnders) lageSpaeter(ABKLINGZEIT_MS);
   if (paneFingerabdruck(windows, panes) === vorher) return;
   process.stderr.write(`Panes nachgelesen: ${panes.map((p) => p.paneId).join(' ')}\n`);
   // Das eine, was wirklich nachgezogen wird: ist der GEZEICHNETE Pane weg,
@@ -1885,6 +2398,58 @@ function minBreiteJetzt(): number {
 }
 
 /**
+ * DIE GEMESSENE UNTERGRENZE, unter der zwei Spalten wirklich unlesbar werden:
+ * 65 Zeichen (Report `20260804-033646.md`, Messung 4).
+ *
+ * Dort wurde mit einer echten `claude`-CLI und dem echten Repo-Pfad (32
+ * Zeichen) ueber die Pane-Groessen gemessen, die das Kacheln wirklich erzeugt.
+ * 65x17 ist der schmalste Fall, in dem die Statuszeile noch etwas zeigt (den
+ * Balken in Zehnerschritten); alles Schmalere wurde nur mit KURZEM Pfad
+ * gemessen und ist mit einem echten Pfad ungeprueft. 65 ist also nicht die
+ * theoretische Grenze (die liegt bei 52), sondern die kleinste Zahl, fuer die
+ * ein Beleg existiert -- und genau das soll eine Untergrenze sein.
+ */
+const ZWEISPALTEN_BODEN = 65;
+
+/**
+ * MIT WELCHER MINDESTBREITE GERECHNET WIRD (05.09.2026, Electron-Befund 7).
+ *
+ * Im Normalfall mit `minWorkerPaneWidth` (Vorgabe 80) -- das ist die Zusage an
+ * den Menschen, und sie bleibt.
+ *
+ * SOLANGE ABER EIN BLATT DES INSPEKTORS OFFEN STEHT, gilt der gemessene Boden.
+ * Ein Blatt nimmt der Buehne rund 360 Bildpunkte; bei 1604 Bildpunkten
+ * Fensterbreite fiel sie damit von 175 auf 132 Spalten, `floor(132/80)` ergab
+ * EINE Spalte statt zweier, und aus vier Workern in einem 2x2 wurden drei in
+ * einer Spalte plus ein zweiter Tab. Beim Zuklappen sprang alles zurueck. Ein
+ * Nachschlagen, das die Arbeitsflaeche umbaut, ist kein Nachschlagen.
+ *
+ * Der Boden gilt NUR fuer diesen einen Fall und NUR nach unten: liegt
+ * `minWorkerPaneWidth` schon darunter, bleibt der kleinere Wert stehen.
+ */
+function mindestbreiteFuerRechnung(): number {
+  const gesetzt = minBreiteJetzt();
+  return blattOffen ? Math.min(gesetzt, ZWEISPALTEN_BODEN) : gesetzt;
+}
+
+/**
+ * Sitzen die Worker in EIGENEN tmux-Fenstern (`workerLayout: window`, seit dem
+ * 03.09.2026 eines je Worker) oder als Panes unter dem Orchestrator (`split`)?
+ *
+ * Gebraucht wird die Antwort nur fuer die FORM, die die rechte Leiste als
+ * Kachelung ankuendigt: bei eigenen Fenstern hat tmux nichts anzuordnen und die
+ * Buehne kachelt frei (`gitterFrei`), sonst gilt das Raster, das tmux baut
+ * (`gitterFuer`). Die Buehne selbst entscheidet das nicht hier, sondern an den
+ * wirklich gezeigten Panes (`tabZeigen`) -- ein Schildchen, das etwas anderes
+ * ankuendigt als die Buehne dann legt, waere aber genau die Art Widerspruch,
+ * gegen die dieser Abschnitt steht.
+ */
+function eigeneFensterJeWorker(): boolean {
+  const roh = alleEinstellungen(config.settingsFile).workerLayout;
+  return typeof roh === 'string' && roh === 'window';
+}
+
+/**
  * Kapazitaet und Tabs der gewaehlten Session, abgeleitet aus der Flaeche.
  *
  * WELCHE Flaeche, das war bis zum 07.08. die falsche: gerechnet wurde mit
@@ -1909,10 +2474,15 @@ function minBreiteJetzt(): number {
  * Meldung des Renderers (kopfloser Start, Tests) dieselbe Zahl bekommt wie
  * bisher.
  */
-function kapazitaet(): { perRow: number; perColumn: number; perTab: number; cappedBySetting: boolean; tabs: number; workerCount: number } {
+function kapazitaet(): {
+  perRow: number; perColumn: number; perTab: number; cappedBySetting: boolean; tabs: number; workerCount: number;
+  spalten: number; zeilen: number;
+} {
   const cols = flaeche?.cols ?? attachState?.cols ?? config.ownedCols;
   const rows = flaeche?.rows ?? attachState?.rows ?? config.ownedRows;
-  const k = capacity({ cols, rows, minCols: minBreiteJetzt(), minRows: config.minPaneRows, maxPerTab: maxProTabJetzt() });
+  const k = capacity({
+    cols, rows, minCols: mindestbreiteFuerRechnung(), minRows: config.minPaneRows, maxPerTab: maxProTabJetzt(),
+  });
   const s = gewaehlte();
   // Subagenten sind hier bewusst nicht dabei (V19).
   //
@@ -1923,7 +2493,19 @@ function kapazitaet(): { perRow: number; perColumn: number; perTab: number; capp
   // eine leere Kachel, und bei ausgefallenem tmux waere das gleich ein ganzes
   // Gitter aus leeren Kacheln. Dass es ihn gibt, sagt die rechte Leiste.
   const workerCount = s ? s.workers.filter((w) => w.alive).length : 0;
-  return { ...k, tabs: tabsFor(workerCount, k.perTab), workerCount };
+  // `perRow`/`perColumn` sind die rohe FLAECHENKAPAZITAET (wieviele Panes bei
+  // dieser Mindestbreite ueberhaupt noch reinpassen wuerden) -- nicht die Form,
+  // in der ein voller Tab tatsaechlich gekachelt wird. Die Leiste zeigte bisher
+  // `perRow x perColumn` als sei es diese Form; fuer sechs Panes bei perRow=2/
+  // perColumn=4 stand dort "(2x4)", waehrend `gitterFuer` (dieselbe Funktion,
+  // die `tabZeigen` fuers echte Kacheln benutzt) fuer sechs Panes 2x3 anwendet.
+  // `spalten`/`zeilen` ist deshalb das GITTER fuer einen VOLLEN Tab (perTab
+  // Panes) -- dieselbe Rechnung, die die Buehne auch fuer die Aufteilung
+  // heranzieht, kein zweiter, eigens fuer die Leiste erfundener Wert.
+  const gitter = eigeneFensterJeWorker()
+    ? gitterFrei(k.perTab, k.perRow, k.perColumn)
+    : gitterFuer(k.perTab, k.perRow, k.perColumn);
+  return { ...k, tabs: tabsFor(workerCount, k.perTab), workerCount, spalten: gitter.spalten, zeilen: gitter.zeilen };
 }
 
 /**
@@ -1938,7 +2520,7 @@ function kapazitaet(): { perRow: number; perColumn: number; perTab: number; capp
 function mitReviveVorschau(liste: SessionInfo[]): unknown[] {
   return liste.map((s) => {
     if (s.state !== 'stopped') return s;
-    const v = reviveCommand(s, config.machine, config.wbCodeBin, harnessResume(s.harness));
+    const v = reviveCommand(s, config.machine, config.wbCodeBin, harnessResume(s.harness), false, reviveKennung(s));
     return { ...s, revive: { conversation: v.conversation, reason: fortsetzenGrund(s, v) } };
   });
 }
@@ -1969,6 +2551,68 @@ function fortsetzenGrund(s: SessionInfo, v: ReviveCommand): string {
   return hinweis ? `${v.conversationReason}\n\n${hinweis}` : v.conversationReason;
 }
 
+/**
+ * DIE MASCHINEN, DIE DIESES PROGRAMM KENNT (03.09.2026, fuer die neue
+ * Statusleiste).
+ *
+ * Warum es das Feld gibt: die Erreichbarkeit einer Maschine liess sich bisher
+ * nur aus den Sitzungen ableiten, die zufaellig auf ihr liefen -- eine Maschine
+ * ohne Sitzung gab gar keine Auskunft, und „keine Sitzung" sah aus wie „nicht
+ * da". Gelesen wird ausschliesslich, was ohnehin schon gemessen ist: die
+ * Hostliste aus den Einstellungen (config.ts) und die Momentaufnahmen des
+ * Abrufs (remote.ts). Hier entsteht KEINE neue Messung und keine Zahl, die es
+ * nicht gibt -- die Auslastung einer Maschine etwa liefert der Abruf nicht, und
+ * sie steht deshalb auch nicht hier.
+ *
+ * Kein bestehendes Feld wird angefasst; `maschinen` kommt neben `machine`
+ * (die eigene) und `ampel` (der Pruefstand je Maschine) dazu.
+ */
+function maschinenStand(sichtbar: SessionInfo[]): {
+  name: string; eigen: boolean; erreichbar: boolean | null;
+  alter: number; fehler: string; sitzungen: number; worker: number; pausiert: boolean;
+}[] {
+  const jetzt = Date.now();
+  const schnappschuesse = new Map(remotePoller.snapshots().map((x) => [x.machine, x]));
+  // EINE PAUSIERTE MASCHINE BLEIBT SICHTBAR (05.09.2026). Sie faellt aus der
+  // Hostliste des Abrufs -- das ist ihre ganze Wirkung --, und damit waere sie
+  // aus der Statusleiste verschwunden. Verschwinden hiesse aber, dass der
+  // Schalter zum Wiedereinschalten dort nicht mehr steht, wo er gerade
+  // umgelegt wurde. Sie kommt deshalb aus der EINGETRAGENEN Liste zurueck,
+  // gedaempft und mit ihrem eigenen Wort. Ein Name, der nur noch in der
+  // Pausenliste steht und nicht mehr in `remoteMachines`, kommt nicht wieder:
+  // er ist keine eingetragene Maschine mehr.
+  const eingetragen = maschinenliste(config.settingsFile);
+  const pausiert = maschinenPausiert(config.settingsFile).filter((n) => eingetragen.includes(n));
+  // DIE REIHENFOLGE DER EINGETRAGENEN LISTE BLEIBT. Sonst spraenge eine
+  // Maschine ans Ende der Leiste, sobald man sie pausiert -- der Schalter
+  // waere dann nicht mehr da, wo er eben noch war. Ein Name, den nur der
+  // Abruf kennt (Testlauf mit AWB_REMOTE_MACHINES), haengt hinten an.
+  const fern = [...remotePoller.hostliste(), ...pausiert];
+  const namen = [
+    config.machine,
+    ...eingetragen.filter((n) => fern.includes(n)),
+    ...fern.filter((n) => !eingetragen.includes(n)),
+  ].filter((n, i, alle) => n && alle.indexOf(n) === i);
+  return namen.map((name) => {
+    const eigen = name === config.machine;
+    const snap = schnappschuesse.get(name);
+    const drauf = sichtbar.filter((x) => x.machine === name);
+    return {
+      name,
+      eigen,
+      pausiert: pausiert.includes(name),
+      // Die eigene Maschine wird nie abgefragt -- sie ist erreichbar, sonst
+      // liefe dieses Programm nicht. Eine fremde ohne Momentaufnahme ist NICHT
+      // unerreichbar, sondern noch nicht nachgesehen: dafuer steht null.
+      erreichbar: eigen ? true : (snap ? snap.reachable : null),
+      alter: eigen ? 0 : (snap?.fetchedAt ? Math.max(0, Math.round((jetzt - snap.fetchedAt) / 1000)) : -1),
+      fehler: eigen ? '' : (snap?.error || snap?.formatFehler || ''),
+      sitzungen: drauf.length,
+      worker: drauf.reduce((n, x) => n + x.workers.filter((w) => w.state === 'running').length, 0),
+    };
+  });
+}
+
 function modellSenden(): void {
   const z = ui.get();
   const s = gewaehlte();
@@ -1977,13 +2621,14 @@ function modellSenden(): void {
   // `sichtbare()` zu rufen hiesse, zwei Listen zu haben, die nur zufaellig
   // dieselbe sind.
   const sichtbar = sichtbare(sessions);
-  win?.webContents.send('awb:model', {
+  anOberflaeche('awb:model', {
     sessions: mitReviveVorschau(sichtbar),
     all: sessions.length,
     ui: z,
     selected: s?.id ?? '',
     machine: config.machine,
     capacity: kapazitaet(),
+    maschinen: maschinenStand(sichtbar),
     // Die Schriftgroesse der Terminals gehoert dem Menschen und steht in der
     // geteilten Einstellungsdatei. Gelesen wird sie HIER und nicht beim Start:
     // `alleEinstellungen` liest die Datei nur nach, wenn sie sich geaendert
@@ -1993,6 +2638,10 @@ function modellSenden(): void {
     // Dieselbe Bauart und derselbe Grund: die Zahl gehoert dem Menschen, wird
     // im Takt nachgelesen und wirkt sofort.
     scrollZeilen: zahlAus('terminalScrollLines', 1, 20, config.settingsFile),
+    // `agentsBlattVorschau` stand hier bis zum 14.09.2026: der Schalter fuer das
+    // Aufgaben-Blatt aus Fassung 26. Seit der Tab „Agents" die Welten zeigt
+    // (Auftrag agentsui Nr. 6), gibt es nichts mehr freizuschalten; die
+    // Einstellung wird nicht mehr gelesen.
     ampel: ampelStandJetzt(),
     budget: budgetPoller.aktuell(),
     // Die Chat-Sitzungen (12.08.) -- eigene Liste NEBEN `sessions`, nicht
@@ -2033,17 +2682,26 @@ function modellSenden(): void {
      * Reihenfolge: WIE eine Zeile aussieht, entscheidet der Renderer an ihrer
      * Sorte, und nur daran.
      */
-    leiste: sortSessions(
-      [
-        ...sichtbar.map((s) => ({
-          id: s.id, name: s.name, dir: s.dir, lastActive: s.lastActive, art: 'terminal' as const,
-        })),
-        ...chatRegistry.alle().map((c) => ({
-          id: c.id, name: c.name, dir: c.ordner, lastActive: c.zuletzt, art: 'chat' as const,
-        })),
-      ],
-      z.sort,
-      z.order,
+    leiste: sortProjekte(
+      sortSessions(
+        [
+          ...sichtbar.map((s) => ({
+            // `state` reist mit, damit „zuletzt aktiv" Lebendes vor Totes stellt
+            // (Kleinigkeit 2, siehe `sortSessions`).
+            id: s.id, name: s.name, dir: s.dir, lastActive: s.lastActive, state: s.state, art: 'terminal' as const,
+          })),
+          ...chatRegistry.alle().map((c) => ({
+            id: c.id, name: c.name, dir: c.ordner, lastActive: c.zuletzt, art: 'chat' as const,
+          })),
+        ],
+        z.sort,
+        z.order,
+      ),
+      // DIE PROJEKTE ZULETZT (08.09.2026): erst die Zeilen sortieren, dann die
+      // Bloecke stellen. Beides in einem Zug ginge nicht -- `sortSessions`
+      // ordnet Zeilen, und ein Projekt hat gar keine eigene Zeile, an der man
+      // sortieren koennte. Ohne Handreihenfolge bleibt die Liste, wie sie war.
+      z.projektReihenfolge,
     ).map((e) => ({ art: e.art, id: e.id })),
     // WELCHE Chat-Sitzung gerade auf der Buehne liegt (13.08.) -- leer heisst:
     // die Kacheln der gewaehlten Terminal-Sitzung. Die Frage reist im Modell
@@ -2108,7 +2766,7 @@ function verbindungVerloren(maschine: string, grund: string): void {
   attachError = `Die Verbindung zu ${maschine} ist abgerissen (${grund}). Das Terminal wird nicht mehr `
     + 'gezeichnet -- ein stehengebliebenes Bild waere hier das Schlimmere. Ein Klick auf die Sitzung '
     + 'baut die Verbindung neu auf; Fortsetzen, Schließen und Löschen laufen weiter drüben.';
-  win?.webContents.send('awb:session', {
+  anOberflaeche('awb:session', {
     session: '', cols: 80, rows: 24, sizePolicy: '', windows: [], panes: [],
     activePane: '', initialContent: '',
   });
@@ -2188,7 +2846,7 @@ async function attachTmuxJetzt(sessionName: string, maschine = ''): Promise<void
     // Fenster sind das zwei verschiedene Zahlen, und gezeichnet wird der Pane
     // (B11). Sobald der Renderer seine Flaeche meldet, wird beides ohnehin auf
     // dieselbe Zahl gebracht.
-    win?.webContents.send('awb:session', {
+    anOberflaeche('awb:session', {
       session: res.session,
       cols: active?.width ?? res.cols,
       rows: active?.height ?? res.rows,
@@ -2274,7 +2932,7 @@ async function attachTmuxJetzt(sessionName: string, maschine = ''): Promise<void
     if (maschine) {
       // DER UNTERSCHIED WIRD GESAGT, nicht versteckt. Er ist echt: jede Taste
       // und jedes Zeichen Ausgabe laeuft ueber die Leitung, und die kann enden.
-      melde(`Terminal von ${maschine} über ssh — Ausgabe und Tastendrücke laufen über die Verbindung. `
+      melde(`Terminal von ${maschine} über ssh – Ausgabe und Tastendrücke laufen über die Verbindung. `
         + 'Reißt sie ab, wird die Bühne geräumt und es steht hier, statt ein totes Bild stehen zu lassen.');
     }
   } catch (e) {
@@ -2289,7 +2947,7 @@ async function attachTmuxJetzt(sessionName: string, maschine = ''): Promise<void
       streamPane = '';
       ansicht = { art: 'pane', pane: '' };
       gezeichneteLage = [];
-      win?.webContents.send('awb:session', {
+      anOberflaeche('awb:session', {
         session: '', cols: 80, rows: 24, sizePolicy: '', windows: [], panes: [],
         activePane: '', initialContent: '',
       });
@@ -2305,6 +2963,7 @@ async function attachTmuxJetzt(sessionName: string, maschine = ''): Promise<void
  * Orchestrator und Worker aendert sie sich, also wird jedes Mal neu gesetzt.
  */
 async function paneZeigen(paneId: string, zoomen = true, groesseSetzen = true): Promise<void> {
+  if (PtyVerwaltung.istPty(paneId)) return ptyPaneZeigen(paneId);
   if (!tmux) throw new Error('nicht angehaengt');
   streamPane = paneId;
   ansicht = { art: 'pane', pane: paneId };
@@ -2319,7 +2978,13 @@ async function paneZeigen(paneId: string, zoomen = true, groesseSetzen = true): 
   // wieder der alte Pane aktiv war. Dann wird eben so gross gezeichnet, wie
   // tmux es hergibt; das ist ehrlicher als eine Zahl, die nur wir glauben.
   let groesse = await paneGroesse(paneId);
+  // ANHALTEN, BEVOR GESTELLT WIRD (08.09.2026, siehe tmux.ts `anhalten`): die
+  // Anwendung im Pane zeichnet sich auf ihr SIGWINCH hin neu, und diese Bytes
+  // gelten schon fuer die neue Groesse. Kommen sie beim Fenster an, bevor die
+  // neue Lage dort ist, malen sie in ein Terminal der alten Groesse. Das
+  // `finally` unten setzt in jedem Fall fort.
   if (flaeche && groesseSetzen) {
+    tmux.anhalten(paneId);
     // DIE BUEHNE GIBT DIE ZAHLEN VOR -- auch dann, wenn das Programm bloss eine
     // Aenderung von aussen nachzieht. Vorher stand hier nur der Zoom, und der
     // faellt beim Nachziehen weg; die Groesse fiel damit mit weg, und die
@@ -2366,6 +3031,47 @@ async function paneZeigen(paneId: string, zoomen = true, groesseSetzen = true): 
     // auf dem Bild auf, das gerade abgeschickt wurde.
     tmux.fortsetzen(paneId);
   }
+}
+
+/**
+ * Ein pty-Pane auf die Buehne, ueber genau denselben Weg wie ein tmux-Pane:
+ * eine Lage-Meldung mit einem Pane, seiner Groesse und seinem Inhalt.
+ *
+ * Der ganze Unterschied steht in drei Zeilen -- die Groesse kommt aus der
+ * Buehne statt aus tmux, der Inhalt aus dem kopflosen Emulator statt aus
+ * `capture-pane`, und es gibt nichts anzuhalten und fortzusetzen (der
+ * `try/finally` um `capturePane` oben hat hier kein Gegenstueck, weil der Strom
+ * nie unterbrochen wird: der Emulator hat den Inhalt schon).
+ *
+ * Was hier NICHT steht, ist der eigentliche Gewinn: keine Uebersetzung eines
+ * Kachelrasters in tmux-Fenster, keine gemeinsame Ganzzahl-Rasterung, keine
+ * drei vorgegebenen Aufteilungen.
+ */
+async function ptyPaneZeigen(paneId: string): Promise<void> {
+  const v = ptyVerwaltung();
+  const stand = v.standVon(paneId);
+  if (!stand) throw new Error(`kein pty-Pane ${paneId}`);
+  streamPane = paneId;
+  ansicht = { art: 'pane', pane: paneId };
+  if (flaeche) v.groesse(paneId, flaeche.cols, flaeche.rows);
+  const cols = flaeche?.cols ?? stand.cols;
+  const rows = flaeche?.rows ?? stand.rows;
+  const inhalt = v.schirm(paneId);
+  const historie = historieGesendet.has(paneId) ? {} : { [paneId]: v.historie(paneId, RUECKBLICK_ZEILEN) };
+  if (!historieGesendet.has(paneId)) historieGesendet.add(paneId);
+  gezeichneteLage = [{ paneId, cols, rows }];
+  zuletztGezeichnet = Date.now();
+  lageSenden({
+    art: 'pane',
+    vorgegeben: flaecheVorgegeben,
+    cols,
+    rows,
+    aktiv: paneId,
+    panes: [{ paneId, x: 0, y: 0, cols, rows }],
+    inhalt: { [paneId]: inhalt },
+    historie,
+    maus: { [paneId]: { an: false, sgr: true } },
+  });
 }
 
 /**
@@ -2426,7 +3132,21 @@ async function ansichtZeichnen(): Promise<void> {
  * EINMAL gezeichnet statt je Frage.
  */
 let rueckblickUhr: ReturnType<typeof setTimeout> | null = null;
-ipcMain.on('awb:rueckblick-fehlt', (_e, n: { paneId: string }) => {
+/**
+ * DIE FLAECHE DES MANTELS (06.09.2026, mac/PLAN-TERMINAL.md). Im Mantelbetrieb
+ * zeichnet der versteckte Electron-Renderer weiter mit und meldet seine eigene
+ * Buehne ueber `bedienung flaeche`; die Buehne des Mantels kam ueber denselben
+ * Weg, und beide ueberschrieben sich -- gemessen: vier Groessenwechsel in 30 s
+ * an einem Fenster mit zwei Zeichnern. Der Mantel meldet deshalb wie der
+ * Steuerkanal MIT Vorgabe: danach ignoriert `flaecheSetzen` die Meldungen des
+ * Renderers (`flaecheVorgegeben`), und es gibt nur noch eine Buehne je Kern.
+ */
+ipc.handle('awb:mantel-flaeche', async (_e, cols: number, rows: number) => {
+  await flaecheSetzen(Number(cols), Number(rows), true);
+  return { cols: flaeche?.cols ?? Number(cols), rows: flaeche?.rows ?? Number(rows) };
+});
+
+ipc.on('awb:rueckblick-fehlt', (_e, n: { paneId: string }) => {
   const paneId = String(n?.paneId ?? '');
   if (!paneId || !tmux) return;
   // Nur fuer einen Pane, der auch gezeichnet ist: eine Meldung aus einer
@@ -2458,14 +3178,6 @@ async function tabZeigen(paneIds: string[]): Promise<void> {
   // zwei Wahrheiten: die Leiste rechts verspraeche vier Panes je Tab, und die
   // Buehne legte sie anders hin.
   const kap = kapazitaet();
-  // Das Raster ist jetzt das, das tmux zu dieser Zahl von Panes auch BAUT
-  // (gitterFuer/tiledRaster). Vorher stand hier `min(perRow, anzahl)` Spalten
-  // und `ceil(anzahl / spalten)` Reihen -- eine zweite Form neben der von tmux,
-  // und bei sieben Panes wich sie ab: die Buehne verlangte zwei Spalten, tmux
-  // legte drei.
-  const gitter = gitterFuer(paneIds.length, kap.perRow, kap.perColumn);
-  const spalten = gitter.spalten;
-  const zeilen = gitter.zeilen;
   const flaecheJetzt = flaeche ?? { cols: config.ownedCols, rows: config.ownedRows };
 
   // Die Panes eines Tabs stammen aus VERSCHIEDENEN tmux-Fenstern: ein Worker
@@ -2481,6 +3193,95 @@ async function tabZeigen(paneIds: string[]): Promise<void> {
   const erledigt = new Set<string>();
   /** Je Fenster: seine Groesse und wieviele Panes tmux darin fuehrt. */
   const fensterLage = new Map<string, { cols: number; rows: number; panes: number }>();
+
+  /**
+   * DER TAB UEBER MEHRERE FENSTER (03.09.2026, des Nutzers „die Worker-Panes sind
+   * nicht richtig angeordnet").
+   *
+   * Ueberschreitet ein Tab `maxWorkerPanesPerTab`, laufen seine Panes auf ein
+   * zweites tmux-Fenster ueber -- der Live-Fall waren sieben Worker auf den
+   * Fenstern `workers` (sechs) und `workers-2` (einer). Bis hierher bekam dann
+   * JEDES Fenster die ganze Buehne, und tmux teilte sie unter SEINEN Panes auf:
+   * das Fenster mit sechs Panes machte jeden 495 Bildpunkte breit, waehrend die
+   * Buehne fuer sieben Panes ein dreispaltiges Raster legte und ihm eine Kachel
+   * von 334 gab. Sechs von sieben Panes liefen um 48 Prozent ueber ihre Kachel
+   * hinaus, der siebte war um das Dreifache zu hoch (gemessen mit
+   * messungen/direktweg-zweifenster.sh, Befund: DIREKTWEG-BEFUND.md).
+   *
+   * Zwei Geometrien, dieselbe Krankheit wie am 06.08. -- nur lagen sie damals
+   * innerhalb eines Fensters und jetzt zwischen zweien. Die zweite faellt weg,
+   * indem nicht mehr die BUEHNE, sondern die KACHEL die gemeinsame Groesse ist:
+   * jedes Fenster wird so gross gestellt, dass seine eigene Aufteilung genau
+   * die Kacheln ergibt, die die Buehne fuer seine Panes legt. Bei einem einzigen
+   * Fenster bleibt alles, wie es war -- dort ist die Aufteilung von tmux selbst
+   * das Raster (siehe „DAS RASTER" weiter unten).
+   */
+  const fensterDerAnforderung = new Set(
+    paneIds.map((id) => fensterVon.get(id)).filter((w): w is string => !!w),
+  );
+
+  /**
+   * DARF DIE BUEHNE FREI KACHELN? (03.09.2026, Stufe A)
+   *
+   * Nur dann, wenn KEIN gezeigtes Fenster mehr als einen Pane traegt. Ein
+   * Fenster mit einem Pane hat keine Aufteilung -- seine Groesse ist die
+   * Panegroesse, tmux ordnet nichts an, und die Form gehoert der Werkbank.
+   * Sitzen dagegen mehrere Panes in einem Fenster (Layout 'split', eine
+   * uebernommene fremde Sitzung), teilt `select-layout tiled` sie nach SEINER
+   * Ordnung auf, und eine schoenere Verteilung waere wieder eine zweite
+   * Geometrie daneben -- genau der Fehler, gegen den diese ganze Rechnung
+   * steht. Dann gilt weiter das Raster, das tmux auch baut.
+   */
+  const frei =
+    fensterDerAnforderung.size > 1 &&
+    [...fensterDerAnforderung].every((w) => alle.filter((p) => p.windowId === w).length === 1);
+  // Das Raster: frei gewaehlt, wo tmux nichts anzuordnen hat, sonst genau das,
+  // das tmux zu dieser Zahl von Panes auch BAUT (gitterFuer/tiledRaster).
+  // Vorher stand hier `min(perRow, anzahl)` Spalten und `ceil(anzahl / spalten)`
+  // Reihen -- eine zweite Form neben der von tmux, und bei sieben Panes wich sie
+  // ab: die Buehne verlangte zwei Spalten, tmux legte drei.
+  const gitter = frei
+    ? gitterFrei(paneIds.length, kap.perRow, kap.perColumn)
+    : gitterFuer(paneIds.length, kap.perRow, kap.perColumn);
+  const spalten = gitter.spalten;
+  const zeilen = gitter.zeilen;
+  const kacheln =
+    fensterDerAnforderung.size > 1
+      ? kachelZellen(paneIds.length, spalten, frei, flaecheJetzt)
+      : null;
+  /**
+   * DIESELBE ORDNUNG WIE DER RENDERER (Pruefer, Befund 1). `kacheln` ist eine
+   * flache Liste ohne eigene Paneszugehoerigkeit -- Platz `i` gehoert zu dem
+   * Pane, den auch der Renderer an Platz `i` zeichnet. Der Renderer
+   * (paneflaeche.ts, `kachelLage`) legt seine Kacheln erst fuer alle
+   * VORHANDENEN Panes in Anforderungsreihenfolge, danach fuer alle FEHLENDEN --
+   * er kennt `paneIds` selbst nicht, nur die schon getrennten Listen `panes`
+   * und `fehlend`. Vorher zaehlte hier die rohe Position in `paneIds`, in der
+   * ein fehlender Pane mitten drin seinen Platz behaelt; ab dem naechsten
+   * vorhandenen Pane liefen beide Ordnungen dann um eins auseinander. Ob ein
+   * Pane fehlt, steht schon hier fest: derselbe Grund, den die Fehlend-Liste
+   * unten benutzt (`fensterVon.has`), nur vorgezogen, weil die Kachelindizes
+   * VOR der Fensterschleife gebraucht werden.
+   */
+  const vorabVorhanden = paneIds.filter((id) => fensterVon.has(id));
+  const vorabFehlend = paneIds.filter((id) => !fensterVon.has(id));
+  const kachelIndexVon = new Map(
+    [...vorabVorhanden, ...vorabFehlend].map((id, i) => [id, i]),
+  );
+
+  // ANHALTEN, BEVOR AN DEN GROESSEN GEDREHT WIRD (08.09.2026, siehe tmux.ts
+  // `anhalten`). Gleich unten stellt `fensterAufKachel` die Fenster; jede
+  // Anwendung darin bekommt ihr SIGWINCH und zeichnet sich neu, und diese
+  // Bytes gelten schon fuer die neue Groesse. Waeren sie vor der neuen Lage am
+  // Fenster, malten sie in ein Terminal der alten -- gemessen als ein Bild,
+  // das um eine Zeile verschoben stehenblieb. Angehalten wird fuer JEDEN
+  // angeforderten Pane, nicht nur fuer die, die am Ende gezeigt werden: die
+  // Liste `gezeigt` gibt es hier noch nicht, und `fortsetzen` auf einen Pane,
+  // der nicht angehalten war, tut nichts. Freigegeben wird auf beiden Wegen
+  // hinaus: im `finally` der Aufnahmen weiter unten, und -- weil das von hier
+  // aus noch nicht erreicht ist -- im `catch` am Stellen selbst.
+  for (const id of paneIds) tmux.anhalten(id);
+
   // Teilen sich mehrere gezeigte Panes ein Fenster, gilt die Kachel des
   // ERSTEN von ihnen: eine Fenstergroesse kann nur eine sein, und tmux teilt
   // sie unter allen Panes des Fensters auf.
@@ -2500,7 +3301,29 @@ async function tabZeigen(paneIds: string[]): Promise<void> {
     // damit auf halber Breite abgeschnitten.
     const imFenster = alle.filter((p) => p.windowId === fenster).length;
     const ausDiesemFenster = new Set(paneIds.filter((x) => fensterVon.get(x) === fenster));
-    const lage = await fensterAufKachel(id, spalten, zeilen, imFenster, flaecheJetzt, ausDiesemFenster);
+    // Die KLEINSTE Kachel unter den Panes dieses Fensters, nie die groesste:
+    // eine Fenstergroesse gilt fuer alle seine Panes, und lieber bleibt ein
+    // schwarzer Rand als dass Text abgeschnitten wird.
+    let kachel: { cols: number; rows: number } | undefined;
+    if (kacheln) {
+      const meine = paneIds
+        .map((x) => (fensterVon.get(x) === fenster ? kacheln[kachelIndexVon.get(x)!] : null))
+        .filter((k): k is { cols: number; rows: number } => !!k);
+      if (meine.length) {
+        kachel = {
+          cols: Math.min(...meine.map((k) => k.cols)),
+          rows: Math.min(...meine.map((k) => k.rows)),
+        };
+      }
+    }
+    const lage = await fensterAufKachel(id, spalten, zeilen, imFenster, flaecheJetzt, ausDiesemFenster, kachel)
+      .catch((e) => {
+        // Bricht das Stellen ab, bleibt kein Pane angehalten stehen (Befund 4
+        // der Bugjagd, 15.08.): das `finally` weiter unten wird von hier aus
+        // nicht mehr erreicht, also wird hier freigegeben und weitergereicht.
+        for (const x of paneIds) tmux!.fortsetzen(x);
+        throw e;
+      });
     fensterLage.set(fenster, { cols: lage.cols, rows: lage.rows, panes: lage.panes.length });
     for (const b of lage.panes) kaesten.set(b.paneId, b);
   }
@@ -2591,12 +3414,16 @@ async function tabZeigen(paneIds: string[]): Promise<void> {
       historie,
       maus,
       spalten,
+      frei,
       raster,
       rasterTeil,
       fehlend,
     });
   } finally {
-    for (const p of gezeigt) tmux.fortsetzen(p.paneId);
+    // ANGEHALTEN WURDE FUER ALLE ANGEFORDERTEN Panes, nicht nur fuer die
+    // gezeigten (08.09.2026) -- also wird auch fuer alle fortgesetzt. Ein Pane,
+    // der aus der Anforderung fiel, bliebe sonst dauerhaft stumm.
+    for (const id of paneIds) tmux.fortsetzen(id);
   }
 }
 
@@ -2634,6 +3461,12 @@ async function fensterAufKachel(
   panesImFenster: number,
   flaecheJetzt: { cols: number; rows: number },
   gezeigteIds: Set<string>,
+  /**
+   * Die Kachel, die jeder Pane DIESES Fensters auf der Buehne bekommt -- gesetzt
+   * nur, wenn der Tab ueber mehrere Fenster laeuft (siehe `tabZeigen`). Dann
+   * folgt die Fenstergroesse der Kachel statt der Buehne.
+   */
+  kachelZelle?: { cols: number; rows: number },
 ): Promise<{ cols: number; rows: number; panes: { paneId: string; x: number; y: number; cols: number; rows: number }[] }> {
   const leer = { cols: 0, rows: 0, panes: [] };
   if (!tmux) return leer;
@@ -2701,10 +3534,20 @@ async function fensterAufKachel(
   // 'split'), werden sie eben kleiner -- die Buehne schiebt sie dann zusammen
   // (kachelnAusTeilraster), und lieber ein schwarzer Rand als abgeschnittener
   // Text.
-  const cols = flaecheJetzt.cols;
-  const rows = flaecheJetzt.rows;
-  const gitter = await tmux.fitWindow(paneId, cols, rows, aufteilung, umraeumen).catch(() => null);
-  if (!gitter) return leer;
+  //
+  // AUSSER, DER TAB LAEUFT UEBER MEHRERE FENSTER. Dann ist die Buehne nicht
+  // mehr die Groesse EINES Fensters, und ihr blind zu folgen war der
+  // Sieben-Worker-Fehler: jedes Fenster teilte die ganze Buehne unter seinen
+  // eigenen Panes auf, waehrend die Buehne fuer die Gesamtzahl kachelte. Das
+  // Fenster bekommt dann so viele Kacheln, wie seine eigene Aufteilung breit
+  // und hoch ist, plus die Trennlinien dazwischen -- danach ist jeder seiner
+  // Panes genau eine Kachel gross.
+  let cols = kachelZelle
+    ? eigen.spalten * kachelZelle.cols + (eigen.spalten - 1)
+    : flaecheJetzt.cols;
+  let rows = kachelZelle
+    ? eigen.zeilen * kachelZelle.rows + (eigen.zeilen - 1)
+    : flaecheJetzt.rows;
 
   /**
    * ZEIGT DER TAB NUR EINEN TEIL DES FENSTERS, WIRD DAS FENSTER GROESSER.
@@ -2726,31 +3569,45 @@ async function fensterAufKachel(
    * liefe die dichteste ueber ihre Kacheln hinaus, und abgeschnittener Text ist
    * schlimmer als ein schwarzer Rand.
    *
-   * Ein zweiter Durchgang, kein Kreis: das Ziel folgt allein aus dem Raster und
-   * der Buehne, nicht aus einer Messung des eingestellten Zustands -- steht das
-   * Fenster schon richtig, wird nichts geschrieben.
+   * Kein zweiter Durchgang mehr, und kein Kreis (05.09., Auftrag tmuxreste):
+   * das Ziel folgt allein aus dem Raster und der Buehne, nicht aus einer
+   * Messung des eingestellten Zustands. Bis heute wurde das Raster aus dem
+   * ERGEBNIS eines ersten `fitWindow` auf die Buehne gelesen und danach ein
+   * zweites Mal gestellt -- zwei Groessenwechsel je Neuzeichnung, gemessen
+   * mit test-fenster-tab-weg.sh (140x41, dann 140x57; zu zweit 100x30,
+   * 100x43, 100x41, 100x43), und zwischen beiden stand die Buehnenzahl in der
+   * Anmeldung fuer den anderen Zeichner. Das Raster haengt bei allen drei
+   * Aufteilungen nicht von der Groesse ab, also wird ERST die Aufteilung
+   * gestellt, dann das Raster gelesen, und die Groesse danach genau einmal
+   * geschrieben.
    */
-  const gezeigteBoxen = gitter.panes.filter((p) => gezeigteIds.has(p.paneId));
-  if (gezeigteBoxen.length && gezeigteBoxen.length < gitter.panes.length) {
-    const R = new Set(gitter.panes.map((p) => p.y)).size;
-    const C = new Set(gitter.panes.map((p) => p.x)).size;
-    const reihen = new Set(gezeigteBoxen.map((p) => p.y));
-    const Kr = reihen.size;
-    const Kc = Math.max(...[...reihen].map((y) => gezeigteBoxen.filter((p) => p.y === y).length));
-    // Ist die dichteste gezeigte Reihe schon so dicht wie das Raster, bleibt es
-    // bei der Flaeche der Buehne -- die Trennlinien dazuzurechnen machte das
-    // Fenster dann um genau sie zu gross, und ein Pane, den tmux ueber die
-    // ganze Reihe zieht, liefe um diese Zellen ueber seine Kachel hinaus
-    // (gemessen: 1005 gegen 1002 Bildpunkte bei vier Workern, 675 gegen 501 bei
-    // sieben).
-    const neuCols = Kc >= C ? flaecheJetzt.cols : Math.floor((C * flaecheJetzt.cols) / Kc) + (C - 1);
-    const neuRows = Kr >= R ? flaecheJetzt.rows : Math.floor((R * flaecheJetzt.rows) / Kr) + (R - 1);
-    if (neuCols !== gitter.cols || neuRows !== gitter.rows) {
-      const zweiter = await tmux.fitWindow(paneId, neuCols, neuRows, aufteilung, umraeumen).catch(() => null);
-      if (zweiter) return zweiter;
+  //
+  // NICHT, WENN DIE KACHEL DIE GROESSE VORGIBT: dieser Dreisatz rechnet
+  // gegen die BUEHNE, und ueber mehrere Fenster ist die Buehne nicht das Mass
+  // eines einzelnen Fensters. Dort ist ohnehin schon jeder Pane genau eine
+  // Kachel gross -- auch die, die dieser Tab nicht zeigt.
+  if (!kachelZelle) {
+    if (umraeumen) await tmux.aufteilungSetzen(paneId, aufteilung).catch(() => undefined);
+    const lage = await tmux.leseFensterLage(paneId).catch(() => null);
+    const gezeigteBoxen = lage ? lage.panes.filter((p) => gezeigteIds.has(p.paneId)) : [];
+    if (lage && gezeigteBoxen.length && gezeigteBoxen.length < lage.panes.length) {
+      const R = new Set(lage.panes.map((p) => p.y)).size;
+      const C = new Set(lage.panes.map((p) => p.x)).size;
+      const reihen = new Set(gezeigteBoxen.map((p) => p.y));
+      const Kr = reihen.size;
+      const Kc = Math.max(...[...reihen].map((y) => gezeigteBoxen.filter((p) => p.y === y).length));
+      // Ist die dichteste gezeigte Reihe schon so dicht wie das Raster, bleibt es
+      // bei der Flaeche der Buehne -- die Trennlinien dazuzurechnen machte das
+      // Fenster dann um genau sie zu gross, und ein Pane, den tmux ueber die
+      // ganze Reihe zieht, liefe um diese Zellen ueber seine Kachel hinaus
+      // (gemessen: 1005 gegen 1002 Bildpunkte bei vier Workern, 675 gegen 501 bei
+      // sieben).
+      cols = Kc >= C ? flaecheJetzt.cols : Math.floor((C * flaecheJetzt.cols) / Kc) + (C - 1);
+      rows = Kr >= R ? flaecheJetzt.rows : Math.floor((R * flaecheJetzt.rows) / Kr) + (R - 1);
     }
   }
-  return gitter;
+  const gitter = await tmux.fitWindow(paneId, cols, rows, aufteilung, umraeumen).catch(() => null);
+  return gitter ?? leer;
 }
 
 /**
@@ -2922,6 +3779,39 @@ let flaechenLauf: Promise<void> | null = null;
 let flaechenLaeuft = false;
 
 /**
+ * WIE LANGE DIE FLAECHE STILLSTEHEN MUSS, BEVOR TMUX SIE ERFAEHRT.
+ *
+ * Jeder Wunsch, der hier durchkommt, wird zu einem `resize-window`, und jeder
+ * Groessenwechsel bricht die Zeichnung des Programms um, das gerade im Pane
+ * laeuft. EIN Wechsel bleibt sauber -- das Programm zeichnet danach neu. Zwei
+ * kurz hintereinander sind es nicht: der Zeichner ueberschreibt nur so viele
+ * Zeilen, wie seine LETZTE Zeichnung hoch war, und was eine fruehere, breitere
+ * davon rechts stehen liess, raeumt er nie mehr ab. GEMESSEN am 04.09. gegen
+ * den Zeichner aus `test-app-fenster-umbruch-naht.sh`: nach 188 -> 123 -> 143
+ * stehen zwei Zeichnungen zugleich im Puffer, und sie stehen dort auch fuenf
+ * Sekunden spaeter noch. Der Abstand entscheidet nichts -- dieselbe Folge
+ * erzeugt den Salat bei 10 ms Abstand wie bei einer Sekunde. Es ist kein
+ * Wettlauf, den Abwarten heilt, sondern ein Rest, den niemand mehr abraeumt.
+ *
+ * UND DIE ZWEITE MELDUNG KOMMT VON SELBST. Die Buehne haengt an vielen
+ * Ausloesern -- am `resize` des Fensters, an `awb:flaeche-geaendert`, an jedem
+ * `onSession`/`onLayout`, an `setzeSchrift`. Gemessen am Stand 646a9f3, an dem
+ * die Suite unter Last umkippte: beim Anhaengen meldete sie 123x34 und eine
+ * Millisekunde spaeter 143x34, und der Hauptprozess machte pflichtschuldig zwei
+ * Umbrueche daraus. Die 123 war nie eine Groesse, die jemand sehen sollte; sie
+ * entstand, waehrend die Anordnung um die Buehne noch stand.
+ *
+ * Deshalb wird ein Wunsch nicht sofort ausgefuehrt, sondern erst, wenn
+ * `FLAECHE_RUHE_MS` lang kein neuer nachkam -- laengstens aber
+ * `FLAECHE_RUHE_MAX_MS`, damit ein durchgehender Strom (jemand zieht das
+ * Fenster an der Kante) nicht ewig wartet. Wer eine Flaeche setzt und auf sie
+ * wartet, wartet unveraendert bis zum Ende: das Warten liegt INNERHALB des
+ * Durchgangs, auf den `flaechenLauf` zeigt.
+ */
+const FLAECHE_RUHE_MS = 40;
+const FLAECHE_RUHE_MAX_MS = 200;
+
+/**
  * WOHER die geltende Flaeche kommt. Meldet sie die Buehne selbst, darf sie sie
  * auch nachfordern, wenn das Gezeichnete nicht dazu passt. Gibt sie ein Skript
  * ueber den Steuerkanal vor (`awb-ctl flaeche 100x30`), dann gilt genau diese
@@ -2950,16 +3840,39 @@ async function flaecheSetzen(cols: number, rows: number, vorgegeben = false): Pr
   // Deshalb: der Wunsch wird hinterlegt, ein laufender Durchgang nimmt ihn beim
   // naechsten Umlauf mit, und wer wartet, wartet bis die Reihe leer ist. Damit
   // gibt es keine zwei Momentaufnahmen mehr, die sich ueberholen koennen.
+  //
+  // SOFORT, nicht erst nach der Ruhefrist: `flaeche` ist die geltende Zahl, an
+  // der sich Kachelrechnung, `wb-workers-window` und jede Groessenauskunft
+  // ausrichten. Aufgeschoben wird nur der Umbruch in tmux -- wer die Flaeche
+  // liest, liest die neue (gemessen an test-app-fenster-zu-klein.sh, deren
+  // Zusagen 2 und 6 fielen, solange auch diese Zuweisung wartete).
+  flaeche = { cols, rows };
   flaechenWunsch = { cols, rows };
   if (!flaechenLaeuft) {
     flaechenLaeuft = true;
     flaechenLauf = (async () => {
       try {
         while (flaechenWunsch) {
-          const w = flaechenWunsch;
+          // ZUERST die Frage, ob ueberhaupt gezeichnet wird -- und erst dann
+          // warten. Haengt das Programm an keiner Sitzung, ist eine Meldung nur
+          // eine Zahl, die `flaeche` schon aufgenommen hat; sie hier
+          // aufzuheben, hiesse eine Groesse von VOR dem Anhaengen aufzubewahren
+          // und sie danach nach tmux zu schicken. GEMESSEN am 04.09. am Stand
+          // 646a9f3, mit der Wartezeit VOR dieser Frage: die Buehne meldete
+          // 123x34, bevor der Pane stand, das Warten hob die Zahl ueber den
+          // Augenblick des Anhaengens hinweg, und tmux bekam sie 45 ms spaeter
+          // als ersten von zwei Umbruechen zugestellt -- acht von acht Laeufen
+          // rot. Mit dieser Reihenfolge faellt sie da, wo sie hingehoert.
+          if (!tmux || !streamPane) {
+            flaechenWunsch = null;
+            continue;
+          }
+          const spaetestens = Date.now() + FLAECHE_RUHE_MAX_MS;
+          do {
+            flaechenWunsch = null;
+            await new Promise((f) => setTimeout(f, FLAECHE_RUHE_MS));
+          } while (flaechenWunsch && Date.now() < spaetestens);
           flaechenWunsch = null;
-          flaeche = w;
-          if (!tmux || !streamPane) continue;
           // Dieselbe Ansicht noch einmal zeichnen, jetzt in der neuen Flaeche.
           //
           // OHNE ZOOM (`false`). Eine neue Flaeche ist keine neue ANSICHT: sie
@@ -2992,9 +3905,18 @@ async function eingabe(bytes: Buffer): Promise<void> {
   await tmux.sendBytes(streamPane, bytes);
 }
 
-ipcMain.on('awb:input', (_e, n: { paneId: string; base64: string }) => {
+ipc.on('awb:input', (_e, n: { paneId: string; base64: string }) => {
   const ziel = n?.paneId || streamPane;
   void (async () => {
+    // DERSELBE WEG AUS DEM RENDERER, ZWEI ZIELE (04.09.2026). Der Renderer
+    // schickt weiter nur Pane-Kennung und Bytes; woran der Pane haengt,
+    // entscheidet sich hier und nirgends sonst. `paneflaeche.ts` ist deshalb
+    // unveraendert geblieben.
+    if (PtyVerwaltung.istPty(ziel)) {
+      streamPane = ziel;
+      ptyVerwaltung().schreiben(ziel, Buffer.from(n.base64, 'base64'));
+      return;
+    }
     if (!tmux) throw new Error('nicht angehaengt');
     if (!ziel) throw new Error('kein Pane gewaehlt');
     // Tippen macht den Pane zum gewaehlten -- sonst tippt man in den einen und
@@ -3008,7 +3930,7 @@ ipcMain.on('awb:input', (_e, n: { paneId: string; base64: string }) => {
 
 // Bedienung aus der Oberflaeche. Sie geht denselben Weg wie der Steuerkanal,
 // damit es nur eine Fassung jeder Handlung gibt.
-ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) => {
+ipc.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) => {
   void (async () => {
     const { aktion, wert } = nachricht;
     switch (aktion) {
@@ -3068,11 +3990,25 @@ ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) =
         ui.set({ sidebarWidth: Math.max(48, Math.min(480, Number(wert) || 48)) });
         modellSenden();
         break;
-      case 'right-width':
-        // Dieselbe Bauart wie links, nur andersherum aufgezogen.
-        // Untergrenze ist die Breite der Tab-Marken, nicht 120: sonst laesst
-        // sich die Leiste nicht mehr schmal machen.
-        ui.set({ rightWidth: Math.max(40, Math.min(560, Number(wert) || 210)) });
+      // DIE BREITE DES INSPEKTORS. Seit dem 05.09.2026 (Electron-Befund 1) ist
+      // es seine einzige: der vierzig Bildpunkte schmale Reiterstreifen daneben
+      // ist weggefallen, zu heisst null. Grenzen: nie unter 280, nie ueber die
+      // Haelfte des Fensters; die Obergrenze rechnet der Renderer, der das
+      // Fenster kennt.
+      case 'blatt-breite':
+        ui.set({ blattBreite: Math.max(280, Math.min(1200, Number(wert) || 360)) });
+        modellSenden();
+        break;
+      // OB EIN BLATT OFFEN STEHT. Der Renderer meldet den Wechsel; gerechnet
+      // wird damit in `kapazitaet()` (Electron-Befund 7).
+      case 'blatt-offen':
+        blattOffen = !!wert;
+        modellSenden();
+        break;
+      // OB DER EDITOR EINGEKLAPPT STEHT (05.09.2026). Der Renderer meldet den
+      // Wechsel, ui.json merkt ihn wie die uebrigen Ansichtswahlen.
+      case 'editor-eingeklappt':
+        ui.set({ editorEingeklappt: !!wert });
         modellSenden();
         break;
       case 'show-stopped':
@@ -3083,8 +4019,28 @@ ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) =
         ui.set({ workerTab: Math.max(0, Number(wert) || 0) });
         modellSenden();
         break;
+      // WAS DIE FLAECHE DIESER SITZUNG ZEIGT (04.09.): der Orchestrator allein
+      // oder die Worker in Tabs. Die Wahl gehoert der Sitzung und wird in
+      // ui.json gemerkt -- welcher Pane daraufhin gezeichnet wird, sagt der
+      // Renderer im selben Zug ueber 'show-pane'/'show-tab'; hier wird nur
+      // gemerkt, nicht gezeichnet.
+      case 'flaeche-modus': {
+        const w = wert as { id?: string; modus?: string };
+        ui.flaecheSetzen(String(w?.id ?? ''), String(w?.modus ?? ''));
+        modellSenden();
+        break;
+      }
       case 'order':
         ui.set({ order: Array.isArray(wert) ? (wert as string[]).map(String) : [] });
+        modellSenden();
+        break;
+      // DIE REIHENFOLGE DER PROJEKTE (08.09.2026, Befund des Nutzers an der
+      // Mac-Fassung). Ein Ordner je Eintrag; 'order' daneben ordnet die Zeilen
+      // INNERHALB eines Projekts. Beide Fassungen gehen denselben Weg -- der
+      // Mac-Mantel ueber `awb:bedienung` durch mantel.ts, der Renderer ueber
+      // dieselbe Bruecke.
+      case 'projekt-order':
+        ui.set({ projektReihenfolge: Array.isArray(wert) ? (wert as string[]).map(String) : [] });
         modellSenden();
         break;
       case 'freigaben-entscheiden': {
@@ -3097,7 +4053,33 @@ ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) =
         // `echt` traegt `isTrusted` aus dem Fenster -- nur ein wirklicher Klick
         // gibt frei. Ein `el.click()` traegt false und kommt damit nicht durch.
         const w = wert as { schluessel: string; action: 'approve' | 'reject'; reason: string; echt?: boolean };
-        musterEntscheiden(String(w.schluessel ?? ''), w.action, String(w.reason ?? ''), w.echt === true);
+        const erg = musterEntscheiden(String(w.schluessel ?? ''), w.action, String(w.reason ?? ''), w.echt === true);
+        // Scheitert es, sagt das Fenster es (05.09.2026): die Leiste meldet
+        // "erteilt", sobald der Knopf gedrueckt ist -- lief `wb-freigabe`
+        // dann ins Leere, stand der Eintrag weiter da, und nirgends stand
+        // warum. Der Grund steht schon im Verlauf; hier kommt er auf die Buehne.
+        if (!erg.ok) melde(erg.output);
+        break;
+      }
+      // DAS KONTEXTMENUE DER SITZUNG ALS BEDIENUNG (06.09.2026, Auftrag mac21).
+      // Der Mac-Mantel baut sein Menue selbst (NSMenu) und loest den Punkt hier
+      // aus -- derselbe `menuePunktAusfuehren` wie beim Popup der
+      // Electron-Fassung und beim Steuerbefehl 'sitzung-menue-punkt', damit es
+      // EINE Fassung jeder Handlung gibt. `echt` traegt, ob ein Mensch geklickt
+      // hat; `bestaetigt` sagt, dass die Oberflaeche die Rueckfrage vor dem
+      // Loeschen SELBST gestellt hat (NSAlert-Sheet im Mantel) -- dann fragt
+      // der Kern nicht ein zweites Mal ueber seinen Electron-Dialog, der im
+      // Mantelbetrieb an einem versteckten Fenster hinge.
+      case 'sitzung-menue-punkt': {
+        const w = (wert ?? {}) as { id?: unknown; punkt?: unknown; echt?: unknown; bestaetigt?: unknown };
+        const id = String(w.id ?? '');
+        const punkt = String(w.punkt ?? '');
+        const echt = w.echt === true;
+        const r = istChat(id)
+          ? await chatMenuePunktAusfuehren(id, punkt, echt)
+          : await menuePunktAusfuehren(id, punkt, echt, w.bestaetigt === true);
+        process.stderr.write(`Bedienung 'sitzung-menue-punkt' ${punkt} auf ${id}: ok=${r.ok} ${r.meldung}\n`);
+        melde(r.meldung);
         break;
       }
       case 'revive':
@@ -3109,7 +4091,7 @@ ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) =
         break;
       case 'ordner-liste': {
         const antwort = ordnerLesen(String(wert ?? ''));
-        win?.webContents.send('awb:ordner', antwort);
+        anOberflaeche('awb:ordner', antwort);
         break;
       }
       case 'ordner-oeffnen': {
@@ -3119,7 +4101,7 @@ ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) =
         break;
       }
       case 'aktivitaet-lesen': {
-        win?.webContents.send('awb:aktivitaet', { entries: aktivitaetLesen() });
+        anOberflaeche('awb:aktivitaet', { entries: aktivitaetLesen() });
         break;
       }
       // Der Inhalt eines Eintrags (V15/V18) braucht sofort eine Antwort, um
@@ -3129,7 +4111,7 @@ ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) =
       // hier dafuer, dieselbe Ueberlegung wie beim Editor.
       case 'suche-lesen': {
         const w = wert as { query: string; pfad?: string };
-        win?.webContents.send('awb:suche', sucheLesen(String(w?.query ?? ''), String(w?.pfad ?? '')));
+        anOberflaeche('awb:suche', sucheLesen(String(w?.query ?? ''), String(w?.pfad ?? '')));
         break;
       }
       case 'seite': {
@@ -3143,7 +4125,7 @@ ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) =
         }
         sessions = modellLesen();
         seiteOffen = name;
-        win?.webContents.send('awb:seite', { name });
+        anOberflaeche('awb:seite', { name });
         break;
       }
       // A9: das Einstellungsfenster. Die beiden Faelle unterscheiden sich in
@@ -3201,7 +4183,7 @@ ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) =
         letzterPlan = plan;
         process.stderr.write(`Seiten-Befehl '${plan.command}': ${plan.art}${plan.grund ? ` — ${plan.grund}` : ''}\n`);
         if (plan.art === 'sofort') await planSofort(plan);
-        else win?.webContents.send('awb:plan', plan);
+        else anOberflaeche('awb:plan', plan);
         break;
       }
     case 'plan-ausfuehren': {
@@ -3215,11 +4197,11 @@ ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) =
         const ergebnis = await fuehreAus(letzterPlan, befehlsUmgebung());
         letzterAusgang = { plan: letzterPlan, ...ergebnis };
         process.stderr.write(`Plan '${letzterPlan.command}' ausgefuehrt: ok=${ergebnis.ok} ${ergebnis.ausgabe}\n`);
-        win?.webContents.send('awb:plan-ergebnis', letzterAusgang);
+        anOberflaeche('awb:plan-ergebnis', letzterAusgang);
         // Danach steht die Welt anders da: Sessionmodell und Seite neu lesen.
         sessions = modellLesen();
         modellSenden();
-        if (seiteOffen) win?.webContents.send('awb:seite', { name: seiteOffen });
+        if (seiteOffen) anOberflaeche('awb:seite', { name: seiteOffen });
         letzterPlan = null;
         break;
       }
@@ -3238,6 +4220,43 @@ ipcMain.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) =
         await shell.openPath(pfad);
         break;
       }
+      /**
+       * DER MASCHINEN-SCHALTER IN DER STATUSLEISTE (05.09.2026).
+       *
+       * Anlass des Nutzers war Aufraeumen und Ressourcen sparen, und beides
+       * passiert, waehrend er die Werkbank benutzt -- nicht, waehrend er in
+       * den Einstellungen sitzt. Der Schalter steht deshalb auch dort, wo die
+       * Maschine ohnehin genannt wird.
+       *
+       * Es ist derselbe Schalter, nicht ein zweiter: geschrieben wird
+       * `remoteMachinesPausiert` ueber `einstellungSchreiben()`, also ueber
+       * `wb-state settings set` -- genau der Weg, den die Seite „Maschinen"
+       * geht. Zwei Bedienwege, eine Wahrheit.
+       *
+       * Eine Maschine, die gar nicht eingetragen ist, laesst sich hier nicht
+       * pausieren: der Renderer bestimmt nicht, welche Namen in die
+       * Einstellungsdatei geraten.
+       */
+      case 'maschine-laden': {
+        const w = (wert ?? {}) as { maschine?: unknown; laden?: unknown };
+        const name = String(w.maschine ?? '');
+        const laden = w.laden === true;
+        if (!name || name === config.machine) {
+          process.stderr.write(`maschine-laden abgelehnt (kein Fernrechner): '${name}'\n`);
+          break;
+        }
+        if (!maschinenliste(config.settingsFile).includes(name)) {
+          process.stderr.write(`maschine-laden abgelehnt (nicht eingetragen): '${name}'\n`);
+          break;
+        }
+        const bisher = maschinenPausiert(config.settingsFile);
+        const neu = laden ? bisher.filter((x) => x !== name) : [...new Set([...bisher, name])];
+        await einstellungSchreiben('remoteMachinesPausiert', neu);
+        // Ohne diese Zeile zoege die Leiste erst mit dem naechsten Takt nach,
+        // und der Schalter saehe fuer einen Augenblick unbewegt aus.
+        modellSenden();
+        break;
+      }
       default:
         process.stderr.write(`unbekannte Bedienung: ${aktion}\n`);
     }
@@ -3254,7 +4273,7 @@ function editorFehler(e: unknown): { ok: false; error: string } {
   return { ok: false, error: (e as Error).message ?? String(e) };
 }
 
-ipcMain.handle('awb:editor-list-files', (_e, root: string) => {
+ipc.handle('awb:editor-list-files', (_e, root: string) => {
   try {
     return { ok: true, value: listFiles(root) };
   } catch (e) {
@@ -3262,7 +4281,7 @@ ipcMain.handle('awb:editor-list-files', (_e, root: string) => {
   }
 });
 
-ipcMain.handle('awb:editor-read-file', (_e, root: string, rel: string) => {
+ipc.handle('awb:editor-read-file', (_e, root: string, rel: string) => {
   try {
     return { ok: true, value: readFileSafe(root, rel) };
   } catch (e) {
@@ -3270,7 +4289,7 @@ ipcMain.handle('awb:editor-read-file', (_e, root: string, rel: string) => {
   }
 });
 
-ipcMain.handle('awb:editor-write-file', (_e, root: string, rel: string, content: string) => {
+ipc.handle('awb:editor-write-file', (_e, root: string, rel: string, content: string) => {
   try {
     return { ok: true, value: writeFileSafe(root, rel, content) };
   } catch (e) {
@@ -3278,7 +4297,23 @@ ipcMain.handle('awb:editor-write-file', (_e, root: string, rel: string, content:
   }
 });
 
-ipcMain.handle('awb:editor-send-selection', async (_e, paneId: string, text: string) => {
+/**
+ * WELCHE DATEIEN DER EDITOR OFFEN HAT (06.09.2026, Auftrag 3.4). Die
+ * Oberflaeche schickt die vollstaendige Liste bei jeder Aenderung; der Kern
+ * beobachtet genau diese Dateien und meldet eine Aenderung von aussen ueber
+ * denselben Kanal wie die Seiten (`awb:datei-geaendert`, hier mit
+ * `name: 'editor'` und dem Pfad). Ob daraus ein Hinweis wird oder still neu
+ * geladen wird, entscheidet die Oberflaeche.
+ */
+ipc.on('awb:editor-watch', (_e, root: unknown, pfade: unknown) => {
+  const liste = Array.isArray(pfade) ? pfade.map((p) => String(p)) : [];
+  if (!editorWaechter) {
+    editorWaechter = startEditorWaechter((abs) => anOberflaeche('awb:datei-geaendert', { name: 'editor', pfad: abs }));
+  }
+  editorWaechter.setzen(String(root ?? ''), liste);
+});
+
+ipc.handle('awb:editor-send-selection', async (_e, paneId: string, text: string) => {
   try {
     await sendSelectionToOrchestrator(config.tmuxSocket, paneId, text);
     return { ok: true, value: { sent: true } };
@@ -3294,7 +4329,7 @@ ipcMain.handle('awb:editor-send-selection', async (_e, paneId: string, text: str
 // (der Pfad muss aus der zuletzt gelesenen Aktivitaet stammen) steckt in den
 // drei Funktionen selbst -- hier nur die Uebersetzung nach { ok, value|error }.
 
-ipcMain.handle('awb:aktivitaet-read', (_e, pfad: string) => {
+ipc.handle('awb:aktivitaet-read', (_e, pfad: string) => {
   try {
     return { ok: true, value: aktivitaetOeffnen(pfad) };
   } catch (e) {
@@ -3302,7 +4337,7 @@ ipcMain.handle('awb:aktivitaet-read', (_e, pfad: string) => {
   }
 });
 
-ipcMain.handle('awb:aktivitaet-diff', (_e, pfad: string) => {
+ipc.handle('awb:aktivitaet-diff', (_e, pfad: string) => {
   try {
     return { ok: true, value: aktivitaetDiffLesen(pfad) };
   } catch (e) {
@@ -3310,7 +4345,7 @@ ipcMain.handle('awb:aktivitaet-diff', (_e, pfad: string) => {
   }
 });
 
-ipcMain.handle('awb:aktivitaet-auftrag', (_e, pfad: string) => {
+ipc.handle('awb:aktivitaet-auftrag', (_e, pfad: string) => {
   try {
     return { ok: true, value: aktivitaetAuftragLesen(pfad) };
   } catch (e) {
@@ -3320,7 +4355,7 @@ ipcMain.handle('awb:aktivitaet-auftrag', (_e, pfad: string) => {
 
 // --- Protokolle (V16, Schritt 9) --------------------------------------------
 
-ipcMain.handle('awb:protokolle-list', () => {
+ipc.handle('awb:protokolle-list', () => {
   try {
     return { ok: true, value: protokollListe(config.settingsFile) };
   } catch (e) {
@@ -3332,8 +4367,15 @@ ipcMain.handle('awb:protokolle-list', () => {
 //
 // Der Renderer FRAGT, statt dass der Hauptprozess bei jedem Takt fuer jeden Pane
 // eine Datei liest: gelesen wird nur, was gerade jemand ansieht.
-ipcMain.handle('awb:chat-stand', async (_e, paneId: string) => {
+//
+// DER ZAEHLER (22.08.), NUR FUER 'pane-chat-takt': wie oft dieser Griff je
+// Pane WIRKLICH gefragt hat -- der Beleg, dass `zeigen(false)`
+// (chat/anbindung.ts) den Takt tatsaechlich stoppt, gemessen an echten
+// IPC-Ankuenften und nicht am Code geschlossen.
+const chatStandZaehler = new Map<string, number>();
+ipc.handle('awb:chat-stand', async (_e, paneId: string) => {
   try {
+    chatStandZaehler.set(paneId, (chatStandZaehler.get(paneId) ?? 0) + 1);
     const anfrage = anfrageFuerPane(paneId, sessions, config.tmuxSocket);
     if (!anfrage) return { ok: false, error: `Zu ${paneId} ist keine laufende Sitzung bekannt.` };
     const stand = await chatStand(anfrage, {
@@ -3354,7 +4396,89 @@ ipcMain.handle('awb:chat-stand', async (_e, paneId: string) => {
   }
 });
 
-ipcMain.handle('awb:protokolle-read', (_e, pfad: string) => {
+/**
+ * DER GRIFF AN EINEM PANE UND DIE ANSICHT SELBST WOLLEN DASSELBE SAGEN KOENNEN
+ * WIE DER RECHTSKLICK (22.08.): "zeig mir das Gespraech" / "zeig mir das
+ * Terminal", jederzeit und verlaesslich (Wortlaut des Nutzers: "ich will, dass
+ * man das jederzeit wechseln kann"). Bis heute war der Griff rein oertlich --
+ * ein Klick blendete die Ansicht im Renderer ein, ohne je nach ui.json zu
+ * schreiben. Stand dort schon eine Sitzungs-Uebersteuerung auf `false` (vom
+ * Rechtsklick, oder aus einem frueheren Klick auf "Terminal zeigen" in der
+ * Ansicht selbst), blieb sie stehen: der naechste `chat-stand`-Aufruf verweigerte
+ * den Zugriff trotz des gerade erst erfolgten Klicks, und die Ansicht zeigte
+ * den Grund statt des Gespraechs -- ein Knopf, der etwas verspricht und dann
+ * nicht haelt.
+ *
+ * NUR DER ORCHESTRATOR-PANE schreibt die Uebersteuerung, aus demselben Grund
+ * wie oben bei `chat-stand`: sie gilt der Sitzung, und die Sitzung ist ihr
+ * Orchestrator. Ein Klick an einem Worker-Pane bleibt lokal (er bekommt seine
+ * Antwort ueber den naechsten `chat-stand`); er kann sie nicht erzwingen, das
+ * ist keine Regression -- das konnte er vorher auch nicht.
+ */
+ipc.handle('awb:chat-ansicht-setzen', (_e, paneId: string, an: boolean) => {
+  try {
+    const anfrage = anfrageFuerPane(paneId, sessions, config.tmuxSocket);
+    if (!anfrage) return { ok: false, error: `Zu ${paneId} ist keine laufende Sitzung bekannt.` };
+    if (anfrage.rolle === 'orchestrator') ui.chatUebersteuerungSetzen(anfrage.sitzung, an);
+    return { ok: true, value: { gesetzt: anfrage.rolle === 'orchestrator' } };
+  } catch (e) {
+    return editorFehler(e);
+  }
+});
+
+/**
+ * PFADE IM CHAT, ANKLICKBAR (Auftrag chatdatei, 05.09.2026). Der Renderer
+ * schickt je Nachricht EINE Liste von Kandidaten; geprueft wird mit `fs.stat`
+ * gegen das Arbeitsverzeichnis der Sitzung und gegen `~` (main/chatpfade.ts).
+ * `paneId` nennt einen Pane der Lese-Ansicht; ist er leer, gilt die
+ * Chat-Sitzung auf der Buehne. Was gefunden wurde, merkt sich dieser Prozess:
+ * nur ein gemerkter Pfad laesst sich danach oeffnen -- der Renderer bestimmt
+ * nicht, welche Datei gelesen wird (dieselbe Regel wie bei Aktivitaet und
+ * Ergebnissen oben).
+ */
+const chatPfadeGemerkt = new Set<string>();
+function chatPfadWurzel(e: Electron.IpcMainInvokeEvent, paneId: string): string {
+  if (paneId) {
+    const anfrage = anfrageFuerPane(paneId, sessions, config.tmuxSocket);
+    const s = anfrage ? sessions.find((x) => x.id === anfrage.sitzung) : null;
+    if (s?.dir) return s.dir;
+  } else {
+    const id = chatIdVon(e);
+    const eintrag = id ? chatRegistry.einer(id) : null;
+    if (eintrag?.ordner) return eintrag.ordner;
+  }
+  return ordnerWurzel();
+}
+ipc.handle('awb:chat-pfade', (e, paneId: string, kandidaten: unknown) => {
+  try {
+    if (!vomHauptfenster(e)) return { ok: true, value: [] };
+    const liste = Array.isArray(kandidaten) ? kandidaten.filter((k): k is string => typeof k === 'string').slice(0, 200) : [];
+    const cwd = chatPfadWurzel(e, String(paneId ?? ''));
+    const treffer = pfadeAufloesen(liste, cwd, homedir())
+      .filter((t) => !isExcluded(t.abs, config.excludeGlobs));
+    for (const t of treffer) chatPfadeGemerkt.add(t.abs);
+    return { ok: true, value: treffer };
+  } catch (err) {
+    return editorFehler(err);
+  }
+});
+ipc.handle('awb:chat-pfad-oeffnen', async (e, abs: string) => {
+  try {
+    const pfad = String(abs ?? '');
+    if (!vomHauptfenster(e) || !chatPfadeGemerkt.has(pfad)) {
+      throw new Error(`Pfad wurde nicht als Chat-Treffer gemeldet: ${pfad}`);
+    }
+    const o = oeffnungBestimmen(pfad);
+    // Bilder, PDFs und alles Binaere gehen an das System -- hier, nicht im
+    // Renderer, der kein `shell` hat.
+    if (o.art === 'extern') await shell.openPath(pfad);
+    return { ok: true, value: o };
+  } catch (err) {
+    return editorFehler(err);
+  }
+});
+
+ipc.handle('awb:protokolle-read', (_e, pfad: string) => {
   try {
     return { ok: true, value: protokollLesen(pfad, config.settingsFile) };
   } catch (e) {
@@ -3383,7 +4507,7 @@ ipcMain.handle('awb:protokolle-read', (_e, pfad: string) => {
 
 /** Wann das Fenster mit seinem ersten Zeichnen fertig war -- fuer den Steuerkanal. */
 let einstellungenBereit = false;
-ipcMain.on('awb:ein-bereit', () => {
+ipc.on('awb:ein-bereit', () => {
   einstellungenBereit = true;
 });
 
@@ -3431,7 +4555,22 @@ function maschinePruefen(name: string): Promise<{ ok: boolean; ausgabe: string }
   });
 }
 
-ipcMain.handle('awb:ein-daten', () => einstellungenDatenJetzt());
+ipc.handle('awb:ein-daten', () => einstellungenDatenJetzt());
+
+/**
+ * DIE TEXTTABELLE DES EINSTELLUNGSFENSTERS, EINMAL FUER BEIDE OBERFLAECHEN
+ * (Auftrag 2.6, 06.09.2026). Die Electron-Fassung importiert `texte.ts` direkt
+ * in ihren Renderer; der Mac-Mantel kann das nicht und darf keine zweite Kopie
+ * der 1100 Schluessel fuehren -- zwei Tabellen laufen eines Tages auseinander.
+ * Also liefert der Kern die Tabelle der eingestellten Sprache, ueber Deutsch
+ * gelegt (derselbe Rueckfall wie `t()` in texte.ts), als EIN Kanal. Der Mantel
+ * setzt Platzhalter selbst ein, mit derselben Regel: `{name}` bleibt stehen,
+ * wenn der Wert fehlt.
+ */
+ipc.handle('awb:ein-texte', () => {
+  const s = sprache(config.settingsFile);
+  return { sprache: s, tabelle: { ...TEXTE_DE, ...(s === 'en' ? TEXTE_EN : {}) } };
+});
 
 /**
  * DIE KONTEXTSTUFEN EINES LOKALEN MODELLS -- ein Kanal fuer ZWEI Fenster
@@ -3448,7 +4587,7 @@ ipcMain.handle('awb:ein-daten', () => einstellungenDatenJetzt());
  * neuen Datenstand des Fensters wiederholt und sonst nicht.
  */
 const wbKontextBin = process.env.AWB_WB_KONTEXT ?? 'wb-kontext';
-ipcMain.handle('awb:kontext-stufen', (_e, modellId: string) =>
+ipc.handle('awb:kontext-stufen', (_e, modellId: string) =>
   kontextStufen(wbKontextBin, String(modellId ?? '')));
 
 /**
@@ -3461,7 +4600,17 @@ ipcMain.handle('awb:kontext-stufen', (_e, modellId: string) =>
  * in der Fusszeile, samt Aufruf. Der eine Schalter, der trotzdem fragt
  * (contextGuardAutostart), fragt im Fenster selbst, vor dem Absenden.
  */
-ipcMain.handle('awb:ein-setzen', async (_e, key: string, value: unknown) => {
+/**
+ * Der Schreibvorgang selbst, EINMAL. Seit dem 05.09. hat die Einstellung
+ * `remoteMachinesPausiert` zwei Bedienwege -- die Seite „Maschinen" und das
+ * Aufklappfeld in der Statusleiste --, und zwei Wege duerfen nicht zwei
+ * Schreibvorgaenge heissen: sonst laufen sie eines Tages auseinander. Beide
+ * rufen diese Funktion, sie ruft `plane()`/`fuehreAus()`, und danach ziehen
+ * dieselben Fenster nach.
+ */
+async function einstellungSchreiben(
+  key: string, value: unknown,
+): Promise<{ ok: boolean; ausgabe: string; aufruf: string }> {
   const plan = plane({ command: 'set', key, value }, befehlsUmgebung());
   const aufruf = (plan.aufruf ?? []).join(' ');
   if (plan.art !== 'bestaetigen') {
@@ -3470,10 +4619,12 @@ ipcMain.handle('awb:ein-setzen', async (_e, key: string, value: unknown) => {
   const ergebnis = await fuehreAus(plan, befehlsUmgebung());
   process.stderr.write(`Einstellung '${key}': ok=${ergebnis.ok} ${ergebnis.ausgabe}\n`);
   // Die offene Seite im Hauptfenster zieht nach, falls sie dieselbe Datei zeigt.
-  if (seiteOffen) win?.webContents.send('awb:seite', { name: seiteOffen });
-  einstellungsfenster.aktuell()?.webContents.send('awb:ein-daten-neu', einstellungenDatenJetzt());
+  if (seiteOffen) anOberflaeche('awb:seite', { name: seiteOffen });
+  anFenster(einstellungsfenster.aktuell(), 'awb:ein-daten-neu', () => einstellungenDatenJetzt());
   return { ...ergebnis, aufruf };
-});
+}
+
+ipc.handle('awb:ein-setzen', (_e, key: string, value: unknown) => einstellungSchreiben(key, value));
 
 /**
  * showStopped (A12) und sort (A16) liegen NICHT in settings.json, sondern im
@@ -3489,7 +4640,7 @@ ipcMain.handle('awb:ein-setzen', async (_e, key: string, value: unknown) => {
  * lockert, muss ein Mensch sein. Beides prueft `wb-state`, nicht dieses
  * Fenster; hier wird nur der Aufruf gebaut und ausgefuehrt.
  */
-ipcMain.handle('awb:ein-werkzeug', async (_e, nachricht: Record<string, unknown>, echt: boolean) => {
+ipc.handle('awb:ein-werkzeug', async (_e, nachricht: Record<string, unknown>, echt: boolean) => {
   const plan = plane(nachricht, befehlsUmgebung());
   const aufruf = (plan.aufruf ?? []).join(' ');
   if (plan.art !== 'bestaetigen') {
@@ -3503,11 +4654,11 @@ ipcMain.handle('awb:ein-werkzeug', async (_e, nachricht: Record<string, unknown>
     `Werkzeug '${String(nachricht.command ?? '')}' (echter Klick: ${echt === true}): `
     + `ok=${ergebnis.ok} ${ergebnis.ausgabe}\n`,
   );
-  einstellungsfenster.aktuell()?.webContents.send('awb:ein-daten-neu', einstellungenDatenJetzt());
+  anFenster(einstellungsfenster.aktuell(), 'awb:ein-daten-neu', () => einstellungenDatenJetzt());
   return { ...ergebnis, aufruf };
 });
 
-ipcMain.handle('awb:ein-maschine-pruefen', async (_e, name: string) => {
+ipc.handle('awb:ein-maschine-pruefen', async (_e, name: string) => {
   const ziel = String(name ?? '').trim();
   if (!ziel) return { ok: false, ausgabe: 'kein Name' };
   const r = await maschinePruefen(ziel);
@@ -3515,13 +4666,13 @@ ipcMain.handle('awb:ein-maschine-pruefen', async (_e, name: string) => {
   return r;
 });
 
-ipcMain.handle('awb:ein-ui', (_e, key: string, value: unknown) => {
+ipc.handle('awb:ein-ui', (_e, key: string, value: unknown) => {
   if (key === 'showStopped') ui.set({ showStopped: value === true });
   else if (key === 'sort' && (value === 'recent' || value === 'folder' || value === 'name')) ui.set({ sort: value });
   else return { ok: false };
   sessions = modellLesen();
   modellSenden();
-  einstellungsfenster.aktuell()?.webContents.send('awb:ein-daten-neu', einstellungenDatenJetzt());
+  anFenster(einstellungsfenster.aktuell(), 'awb:ein-daten-neu', () => einstellungenDatenJetzt());
   return { ok: true };
 });
 
@@ -3539,9 +4690,9 @@ function registryRohGelesen(): string | undefined {
   }
 }
 
-ipcMain.handle('awb:ein-schluessel-status', () => schluesselStatusAlle(registryRohGelesen()));
+ipc.handle('awb:ein-schluessel-status', () => schluesselStatusAlle(registryRohGelesen()));
 
-ipcMain.handle('awb:ein-schluessel-setzen', (_e, providerId: unknown, wert: unknown) => {
+ipc.handle('awb:ein-schluessel-setzen', (_e, providerId: unknown, wert: unknown) => {
   const id = String(providerId ?? '');
   const ok = schluesselSetzenFuerAnbieter(registryRohGelesen(), id, String(wert ?? ''));
   process.stderr.write(`Schluessel '${id}': ok=${ok}\n`);
@@ -3549,7 +4700,7 @@ ipcMain.handle('awb:ein-schluessel-setzen', (_e, providerId: unknown, wert: unkn
 });
 
 /** Der Testknopf 'Test senden' (12.08., siehe main/melden.ts) -- EINE echte Probe, Rueckmeldung je Weg. */
-ipcMain.handle('awb:ein-meldung-testen', () => (
+ipc.handle('awb:ein-meldung-testen', () => (
   meldenTesten(meldungsEinstellungen(config.settingsFile), STANDARD_TEST_WEGE)
 ));
 
@@ -3567,7 +4718,7 @@ ipcMain.handle('awb:ein-meldung-testen', () => (
 
 /** Wann das Sitzungsfenster mit seinem ersten Zeichnen fertig war -- fuer den Steuerkanal. */
 let sitzungBereit = false;
-ipcMain.on('awb:sitz-bereit', () => {
+ipc.on('awb:sitz-bereit', () => {
   sitzungBereit = true;
 });
 
@@ -3600,7 +4751,7 @@ function sitzungsDatenJetzt(): SitzungsDaten {
       // Derselbe Satz wie an der Leiste, samt der Warnung vor der Rueckfrage
       // der CLI -- siehe `fortsetzenGrund`.
       (s) => {
-        const v = reviveCommand(s, config.machine, config.wbCodeBin, harnessResume(s.harness));
+        const v = reviveCommand(s, config.machine, config.wbCodeBin, harnessResume(s.harness), false, reviveKennung(s));
         return { ...v, conversationReason: fortsetzenGrund(s, v) };
       },
       grundFuerMaschine,
@@ -3610,7 +4761,23 @@ function sitzungsDatenJetzt(): SitzungsDaten {
 
 /** Das Fenster nachziehen lassen -- nach jeder Handlung, die die Lage aendert. */
 function sitzungsfensterAuffrischen(): void {
-  sitzungsfenster.aktuell()?.webContents.send('awb:sitz-daten-neu', sitzungsDatenJetzt());
+  anFenster(sitzungsfenster.aktuell(), 'awb:sitz-daten-neu', () => sitzungsDatenJetzt());
+}
+
+/**
+ * Die System-Akzentfarbe, frisch gelesen -- `getAccentColor()` gibt es erst ab
+ * macOS 10.14 und nur unter Electrons `SystemPreferences`; auf jeder anderen
+ * Plattform (oder wenn der Aufruf selbst wirft) bleibt das Feld leer, statt
+ * das Fenster daran scheitern zu lassen. Nur BEREITGESTELLT hier -- verwendet
+ * wird sie vom Worker 'farbsystem'.
+ */
+function systemAkzentfarbeLesen(): string {
+  if (process.platform !== 'darwin') return '';
+  try {
+    return systemPreferences.getAccentColor() || '';
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -3623,10 +4790,11 @@ function sitzungsfensterAuffrischen(): void {
  * keine Einstellungsdatei, deshalb der zweite Weg.
  */
 function themaSenden(): void {
-  const daten = themaPayload(nativeTheme.shouldUseDarkColors, config.settingsFile);
+  const daten = themaPayload(nativeTheme.shouldUseDarkColors, config.settingsFile, systemAkzentfarbeLesen());
   for (const w of [win, sitzungsfenster.aktuell(), verbrauchsfenster.aktuell(), erststartfenster.aktuell()]) {
     if (w && !w.isDestroyed()) w.webContents.send('awb:thema-neu', daten);
   }
+  mantel?.push('awb:thema-neu', daten);
 }
 nativeTheme.on('updated', themaSenden);
 
@@ -3645,12 +4813,25 @@ function nachStartNachlesen(): void {
   }
 }
 
-ipcMain.handle('awb:sitz-daten', () => sitzungsDatenJetzt());
+ipc.handle('awb:sitz-daten', () => sitzungsDatenJetzt());
+
+/**
+ * Die Beschriftungen des Sitzungsfensters in der eingestellten Sprache --
+ * dieselbe Bauart wie `awb:ein-texte`: der Mantel (Mac, Auftrag 2.7) fuehrt
+ * keine zweite Kopie von `sitzung/texte.ts`, Deutsch als Grundlage, Englisch
+ * darueber gelegt.
+ */
+ipc.handle('awb:sitz-texte', () => {
+  const s = sprache(config.settingsFile);
+  return { sprache: s, tabelle: { ...SITZ_TEXTE_DE, ...(s === 'en' ? SITZ_TEXTE_EN : {}) } };
+});
 
 // Thema und Zustandsfarben, fuer jedes Fenster ausser dem Einstellungsfenster
 // (das hat seine eigene Anwendung, siehe thema.ts Kopf). `nativeTheme` wird bei
 // JEDER Anfrage frisch gelesen -- kein Rateversuch beim Start.
-ipcMain.handle('awb:thema-daten', () => themaPayload(nativeTheme.shouldUseDarkColors, config.settingsFile));
+ipc.handle('awb:thema-daten', () => themaPayload(
+  nativeTheme.shouldUseDarkColors, config.settingsFile, systemAkzentfarbeLesen(),
+));
 
 // --- Verbrauchsseite ---------------------------------------------------------
 //
@@ -3661,16 +4842,25 @@ ipcMain.handle('awb:thema-daten', () => themaPayload(nativeTheme.shouldUseDarkCo
 // Dieselbe SPUR wie beim Bauen und Zeigen des Fensters: wer auf die Token-Anzeige
 // drueckt und nichts sieht, liest an den Zeilen mit dem Praefix `Verbrauchsfenster:`
 // ab, wie weit es gekommen ist -- bis hierher heisst, die Seite hat gezeichnet.
-ipcMain.on('awb:verbrauch-bereit', () => {
+ipc.on('awb:verbrauch-bereit', () => {
   process.stderr.write('Verbrauchsfenster: erstes Zeichnen fertig\n');
 });
-ipcMain.handle('awb:verbrauch-daten', (_e, frage: VerbrauchsFrage) =>
+ipc.handle('awb:verbrauch-daten', (_e, frage: VerbrauchsFrage) =>
   verbrauchLesen(frage ?? {}, { bin: config.budgetBin }),
 );
+/**
+ * Die Beschriftungen der Verbrauchsseite -- dieselbe Bauart wie `awb:ein-texte`
+ * und `awb:sitz-texte`: der Mantel (Mac, Auftrag 3.8) fuehrt keine zweite Kopie
+ * von `verbrauch/texte.ts`, Deutsch als Grundlage, Englisch darueber gelegt.
+ */
+ipc.handle('awb:verbrauch-texte', () => {
+  const s = sprache(config.settingsFile);
+  return { sprache: s, tabelle: { ...VERB_TEXTE_DE, ...(s === 'en' ? VERB_TEXTE_EN : {}) } };
+});
 // Dieselbe Sprache wie im Einstellungsfenster (daten.sprache dort) -- fuer Fenster, die keinen
 // eigenen Datenabruf mit der Einstellungstabelle teilen. Ein einziger geteilter Kanal statt
 // eines je Fenster.
-ipcMain.handle('awb:sprache', () => sprache(config.settingsFile));
+ipc.handle('awb:sprache', () => sprache(config.settingsFile));
 
 // --- Erststart (SPEC-V4 3.8) -------------------------------------------------
 //
@@ -3678,12 +4868,17 @@ ipcMain.handle('awb:sprache', () => sprache(config.settingsFile));
 // Funktion, die auch das Einstellungsfenster fuellt -- Anmeldung, Maschinenliste, Modelle, alles
 // bereits gemessen). Geschrieben wird ueber denselben Weg wie dort: `plane()`/`fuehreAus()`, also
 // `wb-state settings set`.
-ipcMain.handle('awb:erststart-daten', () => {
+ipc.handle('awb:erststart-daten', () => {
   const d = einstellungenDatenJetzt() as EinstellungsDaten;
   return {
     machine: d.machine,
     maschinen: d.maschinen,
     sprache: d.sprache,
+    // Ob der Weg schon einmal zu Ende gegangen wurde. Der Kern zeigt sein
+    // eigenes Fenster danach nie wieder von selbst (`zeigeAutomatisch`); der
+    // Mantel (Mac, 3.8) braucht dieselbe Auskunft fuer sein Sheet und soll sie
+    // nicht aus einer zweiten Quelle raten.
+    erledigt: erststartErledigt(config.settingsFile),
     harnesses: d.harnesses.map((h) => ({ id: h.id, label: h.label, startbar: h.binaer })),
     // `lokal` faehrt mit, weil der dritte Schritt danach entscheidet, ob unter
     // der Modellwahl das Feld "Kontextfenster" erscheint. Die Stufen selbst
@@ -3705,7 +4900,7 @@ ipcMain.handle('awb:erststart-daten', () => {
   };
 });
 
-ipcMain.handle('awb:erststart-setzen', async (_e, key: string, value: unknown) => {
+ipc.handle('awb:erststart-setzen', async (_e, key: string, value: unknown) => {
   const plan = plane({ command: 'set', key, value }, befehlsUmgebung());
   if (plan.art !== 'bestaetigen') return { ok: false, ausgabe: plan.grund ?? `abgelehnt (${plan.art})` };
   const ergebnis = await fuehreAus(plan, befehlsUmgebung());
@@ -3713,8 +4908,18 @@ ipcMain.handle('awb:erststart-setzen', async (_e, key: string, value: unknown) =
   return ergebnis;
 });
 
-ipcMain.on('awb:erststart-bereit', () => {
+ipc.on('awb:erststart-bereit', () => {
   process.stderr.write('Erststartfenster: erstes Zeichnen fertig\n');
+});
+
+/**
+ * Die Beschriftungen des ersten Starts -- dieselbe Bauart wie `awb:ein-texte`
+ * und `awb:sitz-texte`: der Mantel (Mac, Auftrag 3.8) fuehrt keine zweite Kopie
+ * von `erststart/texte.ts`, Deutsch als Grundlage, Englisch darueber gelegt.
+ */
+ipc.handle('awb:erststart-texte', () => {
+  const s = sprache(config.settingsFile);
+  return { sprache: s, tabelle: { ...ERST_TEXTE_DE, ...(s === 'en' ? ERST_TEXTE_EN : {}) } };
 });
 
 // --- Das Kontextmenue an der Sessionleiste -----------------------------------
@@ -3767,7 +4972,9 @@ function chatAnsichtLage(s: SessionInfo): {
   offen: boolean; hindernis: string; grund: string; pane: string;
 } {
   const faehig = chatFaehigkeit(s.harness, config.modelsFile);
-  const erlaubt = chatAnsicht(config.settingsFile)[s.harness] === true;
+  // OHNE EXPLIZITE WAHL GILT: an, wo der Harness es kann -- harnessErlaubt()
+  // (chat/ansichtsregel.ts), siehe dort fuer den Grund.
+  const erlaubt = harnessErlaubt(chatAnsicht(config.settingsFile)[s.harness], faehig.kann);
   const u = ansichtsUrteil({
     kann: faehig.kann,
     erlaubt,
@@ -3779,8 +4986,8 @@ function chatAnsichtLage(s: SessionInfo): {
   if (u.hindernis === 'kann') {
     grund = faehig.grund || `Fuer '${s.harness}' steht kein gemessener session-Block in der Registry.`;
   } else if (u.hindernis === 'erlaubt') {
-    grund = `Die Chat-Ansicht ist für „${s.harness}" nicht eingeschaltet — der Schalter dafür steht `
-      + 'in den Einstellungen unter „Programme und Modelle".';
+    grund = `Die Chat-Ansicht ist für „${s.harness}“ nicht eingeschaltet – der Schalter dafür steht `
+      + 'in den Einstellungen unter „Programme und Modelle“.';
   }
   return { offen: u.offen, hindernis: u.hindernis, grund, pane: s.orchestratorPane };
 }
@@ -3888,28 +5095,28 @@ async function chatMenuePunktAusfuehren(
   if (punkt === 'umbenennen') {
     // Derselbe Weg wie bei einer Terminal-Sitzung: das Hauptfenster macht sein
     // kleines Feld auf, geschrieben wird erst, wenn der Name zurueckkommt.
-    win?.webContents.send('awb:umbenennen', { id: c.id, name: c.name, dir: c.ordner });
+    anOberflaeche('awb:umbenennen', { id: c.id, name: c.name, dir: c.ordner });
     return { ok: true, meldung: 'Nach dem neuen Namen gefragt.', aufruf: '' };
   }
 
   if (punkt === 'fortsetzen') {
     if (chatbuehne.laufende().includes(c.id)) {
-      return { ok: true, meldung: `„${c.name}" läuft bereits.`, aufruf: '' };
+      return { ok: true, meldung: `„${c.name}“ läuft bereits.`, aufruf: '' };
     }
     const gelungen = await chatbuehne.baue(c.id);
     modellSenden();
     return {
       ok: gelungen,
       meldung: gelungen
-        ? `„${c.name}" läuft wieder.`
-        : `„${c.name}" ließ sich nicht starten — der Grund steht auf stderr.`,
+        ? `„${c.name}“ läuft wieder.`
+        : `„${c.name}“ ließ sich nicht starten – der Grund steht auf stderr.`,
       aufruf: '',
     };
   }
 
   if (punkt === 'schliessen') {
     if (!chatbuehne.laufende().includes(c.id)) {
-      return { ok: true, meldung: `„${c.name}" lief nicht mehr.`, aufruf: '' };
+      return { ok: true, meldung: `„${c.name}“ lief nicht mehr.`, aufruf: '' };
     }
     chatbuehne.schliesse(c.id);
     return {
@@ -3917,7 +5124,7 @@ async function chatMenuePunktAusfuehren(
       // EHRLICH BESCHRIFTET: geschlossen ist der Prozess, nicht die
       // Unterhaltung. Wer „geschlossen" liest und annimmt, der Verlauf sei
       // weg, waehlt beim naechsten Mal den falschen Weg.
-      meldung: `„${c.name}" ist beendet. Der Eintrag bleibt; ein Start setzt die Unterhaltung fort.`,
+      meldung: `„${c.name}“ ist beendet. Der Eintrag bleibt; ein Start setzt die Unterhaltung fort.`,
       aufruf: '',
     };
   }
@@ -3925,8 +5132,8 @@ async function chatMenuePunktAusfuehren(
   // loeschen
   const ja = await rueckfrage(
     'Chat-Sitzung endgültig löschen?',
-    `„${c.name}" (${c.ordner}) wird aus der Liste entfernt. Ein laufender Prozess wird beendet. `
-    + 'Der Mitschnitt des Harness bleibt liegen — er gehört ihm, nicht diesem Programm.',
+    `„${c.name}“ (${c.ordner}) wird aus der Liste entfernt. Ein laufender Prozess wird beendet. `
+    + 'Der Mitschnitt des Harness bleibt liegen – er gehört ihm, nicht diesem Programm.',
     echt,
   );
   if (!ja) return { ok: false, meldung: 'Nicht gelöscht.', aufruf: '' };
@@ -3943,7 +5150,7 @@ async function chatMenuePunktAusfuehren(
   modellSenden();
   return {
     ok: weg,
-    meldung: weg ? `„${c.name}" gelöscht.` : `„${c.name}" war schon weg.`,
+    meldung: weg ? `„${c.name}“ gelöscht.` : `„${c.name}“ war schon weg.`,
     aufruf: '',
   };
 }
@@ -3991,6 +5198,9 @@ async function menuePunktAusfuehren(
   id: string,
   punkt: string,
   echt: boolean,
+  // Die Oberflaeche hat die Rueckfrage vor dem Loeschen schon gestellt und
+  // ein Ja bekommen (Mac-Mantel, 'sitzung-menue-punkt' in awb:bedienung).
+  bestaetigt = false,
 ): Promise<{ ok: boolean; meldung: string; aufruf: string }> {
   // Gegen den JETZIGEN Stand: zwischen Aufklappen und Klick koennen Sekunden
   // liegen, und in denen kann dieselbe Sitzung enden oder wieder laufen.
@@ -4015,7 +5225,7 @@ async function menuePunktAusfuehren(
     // Eintrag ist gesperrt) und sagt danach, woran es liegt -- bis heute meldete
     // er „Im Finder gezeigt: /home/alice/…", und gezeigt wurde nichts.
     if (fern) {
-      const meldung = `Der Ordner liegt auf ${s.machine}: ${s.dir} — der Finder dieses Rechners kann ihn nicht zeigen.`;
+      const meldung = `Der Ordner liegt auf ${s.machine}: ${s.dir} – der Finder dieses Rechners kann ihn nicht zeigen.`;
       process.stderr.write(`Menue 'ordner-zeigen' fern (${s.machine}): ${s.dir}\n`);
       return { ok: false, meldung, aufruf: '' };
     }
@@ -4045,16 +5255,16 @@ async function menuePunktAusfuehren(
       // steht im Klartext da, statt dass ein grauer Eintrag es vorwegnimmt.
       return {
         ok: false,
-        meldung: `Für „${s.name}" gemerkt, wirksam wird es noch nicht: ${lage.grund}`,
+        meldung: `Für „${s.name}“ gemerkt, wirksam wird es noch nicht: ${lage.grund}`,
         aufruf: '',
       };
     }
-    if (lage.pane) win?.webContents.send('awb:chat-ansicht', { paneId: lage.pane, an: ziel });
+    if (lage.pane) anOberflaeche('awb:chat-ansicht', { paneId: lage.pane, an: ziel });
     return {
       ok: true,
       meldung: ziel
-        ? `„${s.name}" zeigt jetzt das Gespräch.`
-        : `„${s.name}" zeigt jetzt das Terminal.`,
+        ? `„${s.name}“ zeigt jetzt das Gespräch.`
+        : `„${s.name}“ zeigt jetzt das Terminal.`,
       aufruf: '',
     };
   }
@@ -4062,7 +5272,7 @@ async function menuePunktAusfuehren(
     // Der Name wird IM PROGRAMM eingegeben, nicht in einem Terminal: das
     // Hauptfenster macht dafuer ein kleines Feld auf (renderer.ts). Geschrieben
     // wird erst, wenn es zurueckkommt -- ueber 'sitzung-umbenennen'.
-    win?.webContents.send('awb:umbenennen', { id: s.id, name: s.name, dir: s.dir });
+    anOberflaeche('awb:umbenennen', { id: s.id, name: s.name, dir: s.dir });
     return { ok: true, meldung: 'Nach dem neuen Namen gefragt.', aufruf: '' };
   }
   if (punkt === 'fortsetzen') {
@@ -4111,9 +5321,9 @@ async function menuePunktAusfuehren(
   if (plan.art !== 'bestaetigen') {
     return { ok: false, meldung: plan.grund ?? `abgelehnt (${plan.art})`, aufruf };
   }
-  if (vorlage.rueckfrage) {
+  if (vorlage.rueckfrage && !bestaetigt) {
     const ja = await rueckfrage(
-      `„${s.name}" endgültig löschen?`,
+      `„${s.name}“ endgültig löschen?`,
       `${plan.beschreibung}\n\nDanach lässt sie sich nicht mehr fortsetzen.`,
       echt,
     );
@@ -4146,10 +5356,14 @@ async function menuePunktAusfuehren(
   return { ok: ergebnis.ok, meldung: ergebnis.ausgabe, aufruf };
 }
 
-/** Ein Satz ins Fenster, ueber die Buehne. Leer heisst: nichts zu sagen. */
-function melde(text: string): void {
+/**
+ * Ein Satz ins Fenster, ueber die Buehne. Leer heisst: nichts zu sagen.
+ * `dauerMs` laesst ihn laenger stehen als die ueblichen vier Sekunden (der
+ * Absturz-Hinweis, absturz.ts); ohne Angabe bleibt alles wie bisher.
+ */
+function melde(text: string, dauerMs?: number): void {
   if (!text) return;
-  win?.webContents.send('awb:meldung', { text });
+  anOberflaeche('awb:meldung', dauerMs ? { text, dauerMs } : { text });
 }
 
 /**
@@ -4183,7 +5397,7 @@ async function weiterOhneDieSitzung(weg: string): Promise<void> {
     return;
   }
   ui.set({ selected: '' });
-  win?.webContents.send('awb:session', {
+  anOberflaeche('awb:session', {
     session: '', cols: 80, rows: 24, sizePolicy: '', windows: [], panes: [],
     activePane: '', initialContent: '',
   });
@@ -4195,7 +5409,7 @@ async function weiterOhneDieSitzung(weg: string): Promise<void> {
  * bringt, und sie haengt an `isTrusted` aus dem Renderer. Ohne echten Klick
  * passiert hier nichts; die Vorlage laesst sich trotzdem lesen (Steuerkanal).
  */
-ipcMain.on('awb:sitzung-menue', (_e, n: { id: string; echt: boolean }) => {
+ipc.on('awb:sitzung-menue', (_e, n: { id: string; echt: boolean }) => {
   const id = String(n?.id ?? '');
   if (n?.echt !== true) {
     process.stderr.write(`Sitzungsmenue: kein echter Klick -- nichts aufgeklappt (${id})\n`);
@@ -4254,11 +5468,11 @@ async function sitzungUmbenennen(id: string, name: string): Promise<{ ok: boolea
   // --, und ein Aufruf dorthin liefe ins Leere und meldete trotzdem Erfolg.
   if (istChat(id)) {
     const neu = String(name ?? '').trim();
-    if (!neu) return { ok: false, meldung: 'Kein Name angegeben — nichts geändert.', aufruf: '' };
+    if (!neu) return { ok: false, meldung: 'Kein Name angegeben – nichts geändert.', aufruf: '' };
     const e = chatRegistry.aendern(id, { name: neu });
     modellSenden();
     return e
-      ? { ok: true, meldung: `Umbenannt in „${e.name}".`, aufruf: '' }
+      ? { ok: true, meldung: `Umbenannt in „${e.name}“.`, aufruf: '' }
       : { ok: false, meldung: `Diese Chat-Sitzung gibt es nicht mehr: ${id}`, aufruf: '' };
   }
   sessions = modellLesen();
@@ -4288,7 +5502,7 @@ async function sitzungUmbenennen(id: string, name: string): Promise<{ ok: boolea
   return { ok: ergebnis.ok, meldung: ergebnis.ausgabe, aufruf };
 }
 
-ipcMain.handle('awb:sitzung-umbenennen', (_e, id: string, name: string) =>
+ipc.handle('awb:sitzung-umbenennen', (_e, id: string, name: string) =>
   sitzungUmbenennen(String(id ?? ''), String(name ?? '')));
 
 /**
@@ -4310,9 +5524,25 @@ ipcMain.handle('awb:sitzung-umbenennen', (_e, id: string, name: string) =>
  *    Damit prueft eine Suite, was mit dem gewaehlten Pfad GESCHIEHT
  *    (Ausschlussliste, Aufruf, Meldung) -- und nie den Finder.
  */
-async function ordnerDialog(echt: boolean): Promise<{ pfad: string; grund: string }> {
+async function ordnerDialog(echt: boolean, vorgewaehlt = ''): Promise<{ pfad: string; grund: string }> {
   if (config.ordnerDialogAttrappe) {
     return { pfad: config.ordnerDialogAttrappe, grund: '' };
+  }
+  // 3. DER MANTEL (06.09., Auftrag 2.7): die Mac-Oberflaeche zeigt ihren
+  //    eigenen NSOpenPanel und reicht den gewaehlten Ordner herein -- der
+  //    Electron-Dialog an einem versteckten Fenster waere dort unsichtbar.
+  //    Nur bei einem echten Klick, aus demselben Grund wie in 1; die Pruefung
+  //    des Pfads (Ausschlussliste, unter HOME, Verzeichnis) bleibt bei
+  //    `sessionAnlegen`, wo sie fuer jeden Weg gilt.
+  //    ERWEITERT AM 08.09.2026: der Ordner gilt AUCH OHNE echten Klick. Der
+  //    Haken `echt` schuetzt den DIALOG -- er soll sich nicht ohne Zutun eines
+  //    Menschen oeffnen. Steht der Ordner aber schon fest (Mantel: der
+  //    Plusknopf am Projektkopf startet in genau diesem Ordner, ohne Dialog),
+  //    gibt es nichts zu schuetzen, und eine Pruefung konnte diesen Weg vorher
+  //    gar nicht gehen. Was der Pfad darf, entscheidet weiterhin
+  //    `sessionAnlegen`: Ausschlussliste, unter HOME, wirklich ein Verzeichnis.
+  if (vorgewaehlt.trim()) {
+    return { pfad: vorgewaehlt.trim(), grund: '' };
   }
   if (!echt) {
     return { pfad: '', grund: 'Ohne echten Klick wird kein Ordner-Dialog geoeffnet.' };
@@ -4346,7 +5576,7 @@ async function ordnerDialog(echt: boolean): Promise<{ pfad: string; grund: strin
  * es oeffnet sich kein Fenster des Betriebssystems, das ein Test nicht sehen
  * darf.
  */
-ipcMain.handle('awb:sitz-neu', async (_e, name: string, machine: string, fernPfad: string, echt: boolean) => {
+ipc.handle('awb:sitz-neu', async (_e, name: string, machine: string, fernPfad: string, echt: boolean, ordner?: string) => {
   const ziel = String(machine ?? '').trim() || config.machine;
   let pfad: string;
   if (ziel !== config.machine) {
@@ -4355,7 +5585,7 @@ ipcMain.handle('awb:sitz-neu', async (_e, name: string, machine: string, fernPfa
       return { ok: false, meldung: `Erst einen Ordner auf '${ziel}' eintragen.`, command: '' };
     }
   } else {
-    const wahl = await ordnerDialog(echt === true);
+    const wahl = await ordnerDialog(echt === true, String(ordner ?? ''));
     if (!wahl.pfad) {
       process.stderr.write(`Sitzungsfenster: Ordnerwahl ohne Ergebnis -- ${wahl.grund}\n`);
       return { ok: false, meldung: wahl.grund, command: '' };
@@ -4383,9 +5613,9 @@ ipcMain.handle('awb:sitz-neu', async (_e, name: string, machine: string, fernPfa
  * zwei Stellen, an denen die Ausschlussliste, der Doppelklick-Schutz und die
  * Schlüsselvergabe auseinanderlaufen können.
  */
-ipcMain.handle(
+ipc.handle(
   'awb:sitz-neu-wahl',
-  async (_e, name: string, machine: string, fernPfad: string, wahl: SitzungsWahl, echt: boolean) => {
+  async (_e, name: string, machine: string, fernPfad: string, wahl: SitzungsWahl, echt: boolean, ordner?: string) => {
     const ziel = String(machine ?? '').trim() || config.machine;
     let pfad: string;
     if (ziel !== config.machine) {
@@ -4394,7 +5624,7 @@ ipcMain.handle(
         return { ok: false, meldung: `Erst einen Ordner auf '${ziel}' eintragen.`, command: '' };
       }
     } else {
-      const w = await ordnerDialog(echt === true);
+      const w = await ordnerDialog(echt === true, String(ordner ?? ''));
       if (!w.pfad) {
         process.stderr.write(`Sitzungsfenster: Ordnerwahl ohne Ergebnis -- ${w.grund}\n`);
         return { ok: false, meldung: w.grund, command: '' };
@@ -4436,7 +5666,7 @@ ipcMain.handle(
  * Quelle wie im Einstellungsfenster und im Erststart, damit es über Modelle,
  * Programme und Stufen genau EINE Auskunft gibt.
  */
-ipcMain.handle('awb:sitz-wahl-daten', () => {
+ipc.handle('awb:sitz-wahl-daten', () => {
   const d = einstellungenDatenJetzt() as EinstellungsDaten;
   return {
     harnesses: d.harnesses.map((h) => ({ id: h.id, label: h.label, binaer: h.binaer })),
@@ -4447,8 +5677,18 @@ ipcMain.handle('awb:sitz-wahl-daten', () => {
       harnessLabel: m.harnessLabel,
       lokal: m.lokal,
       startbar: m.startbar,
+      deckelRegistry: m.deckelRegistry,
     })),
     harnessStufen: d.harnessStufen,
+    // Der Deckel je Modell, damit die Stufenwahl im Sitzungsfenster ihn nennen
+    // kann, ohne eine zweite Tabelle (Mantel, Auftrag 2.7, 06.09.): `deckel`
+    // ist die Antwort von `wb-state models cap` fuer die beiden gewaehlten
+    // Modelle (einstellungsfenster.ts, mehr Aufrufe waeren eine halbe Minute),
+    // `effortCaps` sind die gesetzten Deckel aus der Einstellungsdatei, und
+    // `deckelRegistry` je Modell die Auslieferung -- dieselben drei Quellen,
+    // aus denen die Modelle-Seite ihre Tabelle zeichnet.
+    deckel: d.deckel,
+    effortCaps: d.effortCaps,
     einstellung: {
       harness: String(d.settings.orchestratorHarness ?? d.vorgaben.orchestratorHarness ?? ''),
       model: String(d.settings.orchestratorModel ?? d.vorgaben.orchestratorModel ?? ''),
@@ -4467,8 +5707,8 @@ ipcMain.handle('awb:sitz-wahl-daten', () => {
  * kein tmux-Fenster, das jemand wiederfinden muesste, sondern ein Eintrag in
  * der eigenen Buchfuehrung und eine Ansicht auf der Buehne dieses Fensters.
  */
-ipcMain.handle('awb:sitz-neu-chat', async (_e, name: string, echt: boolean) => {
-  const wahl = await ordnerDialog(echt === true);
+ipc.handle('awb:sitz-neu-chat', async (_e, name: string, echt: boolean, ordner?: string) => {
+  const wahl = await ordnerDialog(echt === true, String(ordner ?? ''));
   if (!wahl.pfad) {
     process.stderr.write(`Chatbuehne: Ordnerwahl ohne Ergebnis -- ${wahl.grund}\n`);
     return { ok: false, meldung: wahl.grund, command: '' };
@@ -4505,6 +5745,11 @@ ipcMain.handle('awb:sitz-neu-chat', async (_e, name: string, echt: boolean) => {
 // der Buehne liegt (`gezeigter()`), und nur, wenn die Nachricht auch aus dem
 // Hauptfenster kommt.
 function vomHauptfenster(e: Electron.IpcMainInvokeEvent | Electron.IpcMainEvent): boolean {
+  // Der Mantel IST das Hauptfenster (06.09., Auftrag 4.1): im Mantelbetrieb
+  // gibt es kein `win` mehr, an dem sich die Herkunft ablesen liesse, und ohne
+  // diese Zeile faende jede Freigabe und jeder Chat-Griff der Mac-Oberflaeche
+  // eine leere Sitzung vor.
+  if (e.sender === MANTEL_SENDER) return true;
   return !!win && BrowserWindow.fromWebContents(e.sender) === win;
 }
 
@@ -4512,27 +5757,27 @@ function chatIdVon(e: Electron.IpcMainInvokeEvent | Electron.IpcMainEvent): stri
   return vomHauptfenster(e) ? chatbuehne.gezeigter() : '';
 }
 
-ipcMain.handle('awb:chat-daten', (e, seit: number) =>
+ipc.handle('awb:chat-daten', (e, seit: number) =>
   chatbuehne.stand(chatIdVon(e), Number(seit) || 0));
 
-ipcMain.handle('awb:chat-senden', (e, text: string) =>
+ipc.handle('awb:chat-senden', (e, text: string) =>
   chatbuehne.senden(chatIdVon(e), String(text ?? '')));
 
-ipcMain.handle('awb:chat-freigabe', (e, anfrageId: string, erlauben: boolean) =>
+ipc.handle('awb:chat-freigabe', (e, anfrageId: string, erlauben: boolean) =>
   chatbuehne.freigabe(chatIdVon(e), String(anfrageId ?? ''), erlauben === true));
 
 // Frisch starten, nachdem ein `--resume` auf eine verschwundene Unterhaltung
 // gescheitert ist (Befund B3, 12.08.).
-ipcMain.handle('awb:chat-neustart', (e) => chatbuehne.neustart(chatIdVon(e)));
+ipc.handle('awb:chat-neustart', (e) => chatbuehne.neustart(chatIdVon(e)));
 
 // Den Freigabemodus zur LAUFZEIT umstellen (Luecke 5c). Dass das geht, ist
 // gemessen -- siehe `Chatsitzung.setzeModus`.
-ipcMain.handle('awb:chat-modus', (e, modus: string) =>
+ipc.handle('awb:chat-modus', (e, modus: string) =>
   chatbuehne.setzeModus(chatIdVon(e), String(modus ?? '')));
 
 // Einen laufenden Zug unterbrechen (Punkt 6) -- das Gegenstueck zu Escape im
 // Terminal.
-ipcMain.handle('awb:chat-halt', (e) => chatbuehne.halte(chatIdVon(e)));
+ipc.handle('awb:chat-halt', (e) => chatbuehne.halte(chatIdVon(e)));
 
 /**
  * DIE DATEILISTE FUER DAS `@` IM EINGABEFELD (Punkt 3).
@@ -4548,7 +5793,7 @@ ipcMain.handle('awb:chat-halt', (e) => chatbuehne.halte(chatIdVon(e)));
  * Sitzung, die gerade auf der Buehne liegt -- derselbe, in dem ihr Prozess
  * laeuft.
  */
-ipcMain.handle('awb:chat-dateien', async (e) => {
+ipc.handle('awb:chat-dateien', async (e) => {
   const id = chatIdVon(e);
   const eintrag = id ? chatRegistry.einer(id) : null;
   if (!eintrag) return { ordner: '', quelle: 'git', dateien: [] };
@@ -4559,7 +5804,7 @@ ipcMain.handle('awb:chat-dateien', async (e) => {
 // Die Buehne hat gezeichnet. Die Kennung kommt MIT: auf sie wartet
 // `zeigeAufBuehne()`, und eine Meldung aus einem Wechsel, der ueberholt wurde,
 // darf das Warten nicht beenden.
-ipcMain.on('awb:chat-bereit', (e, id: string) => {
+ipc.on('awb:chat-bereit', (e, id: string) => {
   if (!vomHauptfenster(e)) return;
   chatbuehne.bereitGemeldet(String(id ?? ''));
 });
@@ -4574,10 +5819,20 @@ ipcMain.on('awb:chat-bereit', (e, id: string) => {
  * und ohne das Warten griffe der naechste Befehl in eine Ansicht, die noch
  * nicht steht.
  */
-async function chatAufBuehne(id: string): Promise<BrowserWindow> {
+async function chatAufBuehneLegen(id: string): Promise<void> {
   if (!id) throw new Error('Feld id fehlt');
-  if (!win) throw new Error('kein Fenster');
   if (!(await chatbuehne.zeigeAufBuehne(id))) throw new Error(`keine Chat-Sitzung '${id}'`);
+}
+
+/**
+ * Dasselbe UND das Fenster dazu -- fuer die Griffe, die wirklich in die
+ * gezeichnete Buehne fassen. Im Mantelbetrieb gibt es die nicht (Auftrag 4.1);
+ * die Sitzung liegt trotzdem auf der Buehne, denn das ist Sache des Kerns.
+ * Wer nur das braucht, ruft `chatAufBuehneLegen`.
+ */
+async function chatAufBuehne(id: string): Promise<BrowserWindow> {
+  await chatAufBuehneLegen(id);
+  if (!win) throw new Error(KEIN_RENDERER);
   return win;
 }
 
@@ -4589,10 +5844,10 @@ async function chatAufBuehne(id: string): Promise<BrowserWindow> {
  * ssh-Verbindung, die derselben Zeitgrenze unterliegt wie jeder andere
  * Fernaufruf.
  */
-ipcMain.handle('awb:sitz-fern-pruefen', (_e, machine: string, pfad: string) =>
+ipc.handle('awb:sitz-fern-pruefen', (_e, machine: string, pfad: string) =>
   fernOrdnerPruefen(String(machine ?? ''), String(pfad ?? '')));
 
-ipcMain.handle('awb:sitz-fortsetzen', (_e, id: string, echt: boolean) => {
+ipc.handle('awb:sitz-fortsetzen', (_e, id: string, echt: boolean) => {
   try {
     // Gegen den JETZIGEN Stand, nicht gegen den, aus dem die Zeile gezeichnet
     // wurde: zwischen Zeichnen und Klick koennen Sekunden liegen, und in denen
@@ -4624,13 +5879,18 @@ ipcMain.handle('awb:sitz-fortsetzen', (_e, id: string, echt: boolean) => {
  * Sitzung soll nicht aus einem Fehlklick geschehen. Dieselbe `rueckfrage()`-
  * Funktion wie beim Loeschen, dieselbe Attrappe (`AWB_RUECKFRAGE`) fuer Tests.
  */
-ipcMain.handle('awb:sitz-beenden', async (_e, id: string, echt: boolean) => {
+ipc.handle('awb:sitz-beenden', async (_e, id: string, echt: boolean, bestaetigt?: boolean) => {
   const kennung = String(id ?? '');
   sessions = modellLesen();
   const s = sessions.find((x) => x.id === kennung);
   if (!s) return { ok: false, meldung: `Diese Sitzung gibt es nicht mehr: ${kennung}`, command: '' };
-  const ja = await rueckfrage(
-    `„${s.name}" beenden?`,
+  // `bestaetigt` (06.09., Auftrag 2.7): die Oberflaeche hat die Rueckfrage
+  // schon selbst gestellt -- der Mantel als NSAlert-Sheet an seinem Fenster,
+  // kopflos ueber dieselbe Attrappe `AWB_RUECKFRAGE`. Dann fragt der Kern nicht
+  // ein zweites Mal ueber einen Electron-Dialog an seinem versteckten Fenster;
+  // derselbe Griff wie `bestaetigt` bei `sitzung-menue-punkt`.
+  const ja = bestaetigt === true || await rueckfrage(
+    `„${s.name}“ beenden?`,
     'Der Pane schliesst; die Zustandsdatei bleibt, die Sitzung laesst sich danach fortsetzen.',
     echt === true,
   );
@@ -4709,10 +5969,10 @@ async function sessionWaehlen(kennung: string): Promise<SessionInfo | null> {
     ansicht = { art: 'pane', pane: '' };
     gezeichneteLage = [];
     attachError = fern
-      ? `Auf ${fern} läuft diese Sitzung gerade nicht — oder die Maschine antwortet nicht. Deshalb steht hier `
+      ? `Auf ${fern} läuft diese Sitzung gerade nicht – oder die Maschine antwortet nicht. Deshalb steht hier `
         + 'kein Terminal. Fortsetzen, Umbenennen, Schließen und Löschen wirken trotzdem: sie laufen drüben.'
       : null;
-    win?.webContents.send('awb:session', {
+    anOberflaeche('awb:session', {
       session: treffer.tmuxSession, cols: 80, rows: 24, sizePolicy: '', windows: [], panes: [],
       activePane: '', initialContent: '',
     });
@@ -4839,7 +6099,50 @@ function steuerkanalDarfSchreiben(paneId: string, was: string): void {
   );
 }
 
+interface MenuBaumEintrag {
+  label: string;
+  role?: string;
+  type: string;
+  accelerator?: string | null;
+  submenu?: MenuBaumEintrag[];
+}
+
+/** `Menu.getApplicationMenu()` als reines JSON -- siehe 'menu-dump' unten. */
+function menuBaum(menu: Menu | null): MenuBaumEintrag[] {
+  if (!menu) return [];
+  return menu.items.map((it) => ({
+    label: it.label,
+    role: it.role,
+    type: it.type,
+    accelerator: it.accelerator,
+    submenu: it.submenu ? menuBaum(it.submenu) : undefined,
+  }));
+}
+
 async function handle(req: ControlRequest): Promise<unknown> {
+  // KEIN BEFEHL GREIFT IN EINEN RENDERER, DER NICHT MEHR DA IST (Prueferbefund
+  // vom 05.09.2026). Fast jeder Befehl unter dieser Verzweigung liest oder
+  // klickt am Ende ueber `executeJavaScript` im Fenster, und genau dieser Ruf
+  // loest sein Versprechen nie mehr auf, wenn der Frame fort ist (Herleitung
+  // bei `rendererErreichbar`). Diese eine Zeile fragt vorher -- und wartet
+  // kurz, weil der Zuhoerer bei der Fenstererzeugung den Renderer nach einem
+  // Absturz von selbst zurueckholt.
+  //
+  // DREI AUSNAHMEN, jede notwendig: `ping` soll gerade dann antworten, wenn
+  // sonst nichts mehr geht -- es ist die Frage „lebst du ueberhaupt noch?" --,
+  // `quit` muss ein Programm ohne Renderer erst recht beenden koennen, und
+  // `reload` ist der Befehl, der den Renderer ZURUECKHOLT; ihn auf einen
+  // lebenden Renderer warten zu lassen waere ein Kreis ohne Ausgang.
+  //
+  // UND IM MANTELBETRIEB WIRD GAR NICHT GEWARTET (06.09., Auftrag 4.1): dort
+  // ist „kein Renderer" der Dauerzustand und kein Ausfall. Fuenf Sekunden auf
+  // ein Fenster zu warten, das dieser Prozess nie baut, machte jeden Befehl
+  // langsam und die Auskunft am Ende falsch („in 5000 ms nicht
+  // wiedergekommen"). Wer trotzdem in den Renderer greift, faellt eine Zeile
+  // spaeter auf seine eigene Pruefung (`if (!win) throw KEIN_RENDERER`) --
+  // sofort und mit dem richtigen Satz; alles andere (state, sessions, type,
+  // select …) lebt im Kern und laeuft weiter.
+  if (!mantelBetrieb && !STEUERBEFEHLE_OHNE_RENDERER.has(req.cmd) && !rendererErreichbar()) await rendererZurueck();
   switch (req.cmd) {
     case 'ping':
       return { pong: true };
@@ -4861,6 +6164,16 @@ async function handle(req: ControlRequest): Promise<unknown> {
         // Muss immer false sein: das Fenster nimmt niemandem den Fokus.
         windowFocused: win ? win.isFocused() : false,
         contentSize: win ? win.getContentSize() : [0, 0],
+        // DER FENSTERTITEL (03.09.2026). Die Dev-Fassung haengt „--
+        // Entwicklungsfassung" an, damit zwei gleich aussehende Fenster
+        // unterscheidbar sind (siehe `page-title-updated` weiter oben). Ohne
+        // diese Auskunft liesse sich das kopflos gar nicht pruefen: ein Titel
+        // ist nichts, was auf einem Selbstfoto der Zeichenflaeche steht.
+        fenstertitel: win ? win.getTitle() : '',
+        // Der Ansichtszustand aus ui.json (sidebarWidth, blattBreite, sort …),
+        // wie er JETZT gilt -- damit eine Suite den Stand liest, den der Mantel
+        // oder der Renderer gemeldet hat (Mac-Auftrag 2.8), ohne die Datei zu oeffnen.
+        ui: ui.get(),
         controlSocket: config.controlSocket,
         // Wer diese Antwort liest, hat einen Kanal -- die Angabe steht trotzdem
         // hier, damit `state` eine vollstaendige Auskunft ueber den Start gibt.
@@ -4910,6 +6223,15 @@ async function handle(req: ControlRequest): Promise<unknown> {
       };
     }
 
+    // NUR FUER DEN NACHWEIS (Fenster-Auftrag Punkt 2): die Menueleiste laesst
+    // sich kopflos nicht ansehen -- `--kopflos` setzt ohnehin `null`, und
+    // selbst mit `--show-inaktiv` faellt kein Bildschirmfoto ab, das ein
+    // Menue zeigt (es klappt erst nach einem echten Klick auf). Dieser Weg
+    // liest stattdessen `Menu.getApplicationMenu()` direkt und gibt sie als
+    // Baum zurueck -- dieselbe Auskunft, die eine spaetere Regression prueft.
+    case 'menu-dump':
+      return { menu: menuBaum(Menu.getApplicationMenu()) };
+
     case 'seite': {
       // Schritt 7 ueber den Steuerkanal: eine Seite zeichnen und ihren
       // gerenderten Zustand zurueckgeben -- pruefbar ohne Foto.
@@ -4918,7 +6240,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
       sessions = modellLesen();
       const html = seiteHtml(name);
       seiteOffen = name;
-      win?.webContents.send('awb:seite', { name });
+      anOberflaeche('awb:seite', { name });
       // Der Rahmen laedt die Seite selbst ueber das Schema; hier wird nur
       // gewartet, bis sie steht.
       await win?.webContents.executeJavaScript(
@@ -4945,7 +6267,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
       // Textfeld den Fokus nicht zuverlaessig -- ein eigener, direkter Weg.
       const auswahl = String(req.knopf ?? '');
       if (!auswahl) throw new Error('Feld knopf fehlt');
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const getroffen = (await win.webContents.executeJavaScript(
         `window.__awb.seiteFokus(${JSON.stringify(auswahl)})`,
       )) as boolean;
@@ -4956,7 +6278,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
       // Nur fuer die Pruefung der Auffrischung: ein fokussiertes Feld gezielt
       // verlassen, ohne auf die Nebenwirkungen eines anderen Knopfs angewiesen
       // zu sein.
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const getroffen = (await win.webContents.executeJavaScript('window.__awb.seiteUnfokus()')) as boolean;
       return { getroffen };
     }
@@ -4965,7 +6287,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
       // Nur fuer die Pruefung: die ECHTE Schliessen-Schaltflaeche im Rahmen
       // anklicken (nicht seiteOffen von Hand zuruecksetzen) -- derselbe Weg,
       // den ein Mensch im Fenster geht.
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const getroffen = (await win.webContents.executeJavaScript('window.__awb.seiteSchliessenKlick()')) as boolean;
       return { getroffen };
     }
@@ -4978,7 +6300,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
       const plan = plane({ command: String(req.command ?? '') }, befehlsUmgebung());
       letzterPlan = plan;
       if (plan.art === 'sofort') await planSofort(plan);
-      else win?.webContents.send('awb:plan', plan);
+      else anOberflaeche('awb:plan', plan);
       return { plan };
     }
 
@@ -4997,7 +6319,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
       // ein Mensch sie bedient, statt die Nachricht nachzubauen.
       const auswahl = String(req.knopf ?? '');
       if (!auswahl) throw new Error('Feld knopf fehlt');
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const getroffen = (await win.webContents.executeJavaScript(
         `window.__awb.seiteKlick(${JSON.stringify(auswahl)})`,
       )) as boolean;
@@ -5134,6 +6456,56 @@ async function handle(req: ControlRequest): Promise<unknown> {
       return { ...r, sichtbar: w.isVisible() };
     }
 
+    case 'verbrauch-schuss': {
+      // Ein Belegbild des Verbrauchsfensters, nach demselben Muster wie
+      // 'einstellungen-schuss' und 'sitzung-schuss': capturePage() auf einem
+      // nie gezeigten Fenster. Das Fenster hat EINE Seite, es gibt hier also
+      // nichts zu waehlen; hell und dunkel stellt man vorher im
+      // Einstellungsfenster ein, wie ein Mensch es auch taete.
+      const w = await verbrauchsfenster.baue();
+      const auswahl = String(req.knopf ?? '');
+      if (auswahl) {
+        // Dieselbe Rolle wie 'einstellungen-blaettern': eine lange Seite an die
+        // Stelle rollen, die belegt werden soll. Ein Beleg, der nur den Kopf
+        // zeigt, belegt auch nur den Kopf.
+        await w.webContents.executeJavaScript(`(() => {
+          const e = document.querySelector(${JSON.stringify(auswahl)});
+          if (!e) return false;
+          e.scrollIntoView({ block: 'start' });
+          return true;
+        })()`);
+      }
+      await w.webContents.executeJavaScript(
+        'new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))',
+      );
+      const r = await captureWindow(w, config.shotDir, req.datei ? String(req.datei) : undefined);
+      return { ...r, sichtbar: w.isVisible() };
+    }
+
+    /**
+     * EINE STELLE DER VERBRAUCHSSEITE LESEN (08.09.2026). Bisher liess sich
+     * dieses Fenster nur fotografieren; damit ist eine Zusage ueber einen
+     * WORTLAUT nur aus einem Bild zu holen, und das taugt nicht. Dieselbe
+     * Bauart wie 'einstellungen-zustand': bauen, lesen, nichts anfassen --
+     * `show()` erreicht auch dieser Befehl nicht.
+     *
+     * Gelesen werden Text, Hilfeschildchen und `data-grund`. Das Schildchen
+     * traegt bei der Kontingent-Meldung den Rohtext des Werkzeugs, der seit
+     * dem 08.09. nicht mehr in der Zeile selbst steht.
+     */
+    case 'verbrauch-lesen': {
+      const auswahl = String(req.knopf ?? '');
+      if (!auswahl) throw new Error('verbrauch-lesen braucht eine CSS-Auswahl');
+      const w = await verbrauchsfenster.baue();
+      const r = (await w.webContents.executeJavaScript(`(() => {
+        const e = document.querySelector(${JSON.stringify(auswahl)});
+        if (!e) return null;
+        return { text: (e.textContent || '').trim(), titel: e.title || '', grund: (e.dataset && e.dataset.grund) || '' };
+      })()`)) as { text: string; titel: string; grund: string } | null;
+      if (!r) throw new Error(`kein Element '${auswahl}' im Verbrauchsfenster`);
+      return { auswahl, ...r };
+    }
+
     // --- Sitzungsfenster ---------------------------------------------------
     //
     // Wieder gilt: KEIN BEFEHL HIER ERREICHT show(). Bauen, lesen, tippen,
@@ -5229,7 +6601,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
       // echten Rechtsklick gibt es hier bewusst nicht.
       const kennung = String(req.session ?? '');
       if (!kennung) throw new Error('Feld session fehlt');
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       // BEIDE Sorten: eine Terminal-Zeile traegt `data-id`, eine Chat-Zeile
       // `data-chat` -- seit sie in derselben Liste stehen (Punkt 4), muss auch
       // dieser Griff beide finden.
@@ -5373,6 +6745,9 @@ async function handle(req: ControlRequest): Promise<unknown> {
       else if (name === 'taste') js = `window.__awbChat.taste(${JSON.stringify(wert)})`;
       else if (name === 'vervoll') js = 'window.__awbChat.vervoll()';
       else if (name === 'status') js = 'window.__awbChat.status()';
+      // NUR FUER TESTS (chatdatei, 05.09.2026): einen Stand zeichnen, ohne dass ein
+      // Harness laeuft -- der Haken `zeichne` bestand schon, hier bekommt er sein Wort.
+      else if (name === 'zeichne') js = `window.__awbChat.zeichne(${JSON.stringify(JSON.parse(wert))})`;
       else throw new Error(`unbekannter Griff '${name}'`);
       const antwort = await w.webContents.executeJavaScript(js);
       return typeof antwort === 'object' && antwort !== null
@@ -5402,7 +6777,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
       // weiss, was er angeordnet hat; die Oberflaeche zeigt, was daraus
       // geworden ist. Nur wenn beide dasselbe sagen, ist die Auskunft etwas
       // wert (ein Modell unterwegs ist noch keine gezeichnete Buehne).
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const dom = await win.webContents.executeJavaScript(
         '(() => { const b = document.getElementById("chatbuehne");'
         + ' if (!b) return { da: false, an: false, chat: "", anzeige: "" };'
@@ -5414,7 +6789,14 @@ async function handle(req: ControlRequest): Promise<unknown> {
 
     case 'chat-stand': {
       const id = String(req.id ?? '');
-      const w = await chatAufBuehne(id);
+      // DIE BUEHNE IST SACHE DES KERNS, das Zeichnen Sache der Oberflaeche
+      // (Auftrag 4.1). Deshalb wird zuerst gelegt und erst danach gefragt, ob
+      // es hier ueberhaupt einen Renderer gibt: im Mantelbetrieb ist genau
+      // dieser Befehl der Weg, mit dem eine Pruefung eine Chat-Sitzung auf die
+      // Buehne der MAC-Oberflaeche holt -- sie zeichnet, dieser Prozess nicht.
+      await chatAufBuehneLegen(id);
+      if (!win) return { id, gezeigt: chatbuehne.gezeigter(), renderer: false };
+      const w = win;
       if (req.gespraech !== undefined) {
         // Einen fertigen Stand einsetzen -- die Bloecke kommen alle auf
         // einmal, deshalb `seit: 0` und die Ordnung aus ihnen selbst.
@@ -5494,6 +6876,16 @@ async function handle(req: ControlRequest): Promise<unknown> {
 
     case 'chat-tippen': {
       const id = String(req.id ?? '');
+      // Ohne Renderer gibt es kein Eingabefeld, das man leeren koennte -- also
+      // geht der Text denselben Weg, den das Feld am Ende auch nimmt
+      // (`awb:chat-senden` -> `chatbuehne.senden`). Der Befehl bleibt damit im
+      // Mantelbetrieb brauchbar, statt an einer Bedienung zu scheitern, die
+      // die Mac-Oberflaeche selbst mitbringt.
+      if (!win) {
+        await chatAufBuehneLegen(id);
+        const gesendet = chatbuehne.senden(id, String(req.text ?? ''));
+        return { id, geleert: false, gesendet, renderer: false };
+      }
       const w = await chatAufBuehne(id);
       const geleert = await w.webContents.executeJavaScript(
         `window.__awbChat.tippen(${JSON.stringify(String(req.text ?? ''))})`,
@@ -5530,10 +6922,10 @@ async function handle(req: ControlRequest): Promise<unknown> {
       }
       const ergebnis = await fuehreAus(letzterPlan, befehlsUmgebung());
       letzterAusgang = { plan: letzterPlan, ...ergebnis };
-      win?.webContents.send('awb:plan-ergebnis', letzterAusgang);
+      anOberflaeche('awb:plan-ergebnis', letzterAusgang);
       sessions = modellLesen();
       modellSenden();
-      if (seiteOffen) win?.webContents.send('awb:seite', { name: seiteOffen, html: seiteHtml(seiteOffen) });
+      if (seiteOffen) anOberflaeche('awb:seite', { name: seiteOffen, html: seiteHtml(seiteOffen) });
       const plan = letzterPlan;
       letzterPlan = null;
       return { plan, ...ergebnis };
@@ -5590,18 +6982,84 @@ async function handle(req: ControlRequest): Promise<unknown> {
       return { state: ui.get(), capacity: kapazitaet(), rendered: gezeichnet };
     }
 
+    // Nur LESEN, wie oft die Leiste rechts seit Fensterstart neu gezeichnet
+    // wurde und ueber welche der drei Quellen (renderer.ts, rechtsZaehler) --
+    // Messhaken fuer den Befund vom 22.08. ("Worker-Tabs springen Auf und Ab").
+    case 'rechts-takt': {
+      const takt = await win?.webContents.executeJavaScript('window.__awb.rechtsTakt()').catch(() => null);
+      return { takt };
+    }
+
     // Wer an einer Stelle den Zeiger faengt. Ein Foto beweist nicht, welche
     // Schicht einen Klick bekommt; eine zugeklappte Schublade lag unsichtbar
     // ueber dem Ziehgriff und nahm ihm jeden Zug (05.08.).
     case 'treffer': {
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const x = Number(req.x);
       const y = Number(req.y);
       if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('Felder x und y fehlen');
+      // DIE KLASSEN WERDEN AUS DEM ATTRIBUT GELESEN, NICHT AUS `className`
+      // (Prueferbefund vom 05.09.2026). Bei einem SVG-Element ist `className`
+      // kein Text, sondern ein `SVGAnimatedString`; sein `toString()` ergibt
+      // die Zeichenkette „[object SVGAnimatedString]". Genau auf einem Symbol
+      // war die Schichtprobe damit unlesbar -- und Symbole sind der Fall, fuer
+      // den man sie am ehesten braucht. `getAttribute('class')` antwortet fuer
+      // HTML und SVG gleich.
+      //
+      // WARUM HIER UND NICHT IN `window.__awb.trefferBei` (renderer.ts), wo
+      // dieselbe Zeile ebenfalls steht: `app/src/renderer/` gehoert derzeit
+      // einem anderen Auftrag; diese Fassung ist ausdruecklich die des
+      // Steuerkanals. Wer den Renderer wieder anfassen darf, laesst
+      // `trefferBei` auf diese Stelle zeigen oder streicht es -- ausser dem
+      // Steuerkanal ruft es niemand.
       const treffer = await win.webContents.executeJavaScript(
-        `window.__awb.trefferBei(${JSON.stringify(x)}, ${JSON.stringify(y)})`,
+        `(() => {
+          const el = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
+          if (!el) return { tag: '', id: '', klassen: '' };
+          return { tag: el.tagName.toLowerCase(), id: el.id || '', klassen: el.getAttribute('class') || '' };
+        })()`,
       );
       return { x, y, treffer };
+    }
+
+    // NUR FUER TESTS (22.08.): den Griff eines Panes wirklich anklicken --
+    // dasselbe `<button>.click()`, das auch ein echter Mausklick ausloest, am
+    // echten Element im echten, laufenden Fenster. Kein Nachbau der Logik: der
+    // Klick durchlaeuft den vollen Weg (chat/anbindung.ts -> IPC
+    // 'awb:chat-ansicht-setzen' -> ui.json -> naechster 'awb:chat-stand' ->
+    // Neuzeichnung), genau der Beleg, den ein Bildschirmabzug einfordert.
+    case 'pane-chat-klick': {
+      if (!win) throw new Error(KEIN_RENDERER);
+      const paneId = String(req.paneId ?? '');
+      const css = String(req.css ?? '.chat-griff');
+      if (!paneId) throw new Error('Feld paneId fehlt');
+      const geklickt = await win.webContents.executeJavaScript(
+        `(() => {
+          const kasten = document.querySelector('[data-pane="' + ${JSON.stringify(paneId)} + '"]');
+          if (!kasten) return { gefunden: false };
+          const el = kasten.querySelector(${JSON.stringify(css)});
+          if (!el) return { gefunden: true, elementDa: false };
+          el.click();
+          return { gefunden: true, elementDa: true };
+        })()`,
+      );
+      return { paneId, css, ...(geklickt as Record<string, unknown>) };
+    }
+
+    // NUR FUER TESTS (22.08.): zaehlt echte 'awb:chat-stand'-Aufrufe fuer einen
+    // Pane -- der Beleg, dass die Ansicht nur liest, waehrend sie offen ist
+    // (chat/anbindung.ts, `zeigen()` startet und stoppt den Takt). Dieselbe
+    // Bauart wie 'chat-zeiten <id> [leeren]': lesen oder zuruecksetzen. Gezaehlt
+    // wird an der IPC-Ankunft selbst (oben bei 'awb:chat-stand'), nicht ueber
+    // einen Nachbau im Renderer -- `contextBridge.exposeInMainWorld()` friert
+    // das dort exponierte Objekt ein, ein Ueberschreiben von aussen wirkt still
+    // nicht.
+    case 'pane-chat-takt': {
+      const paneId = String(req.paneId ?? '');
+      if (!paneId) throw new Error('Feld paneId fehlt');
+      const zuruecksetzen = req.zuruecksetzen === true;
+      if (zuruecksetzen) chatStandZaehler.set(paneId, 0);
+      return { paneId, zuruecksetzen, zaehler: chatStandZaehler.get(paneId) ?? 0 };
     }
 
     // Der Weg, den alice am 06.08. gegangen ist: Fenster verliert den
@@ -5610,7 +7068,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
     // werden angefasst: das Fenster selbst und die Ereignisse, die eine
     // Oberflaeche davon sieht.
     case 'fokus': {
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const an = req.an !== false;
       if (an) win.focus();
       else win.blur();
@@ -5628,7 +7086,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
     // zeigt keinen Bildlauf, und der Puffertext sagt nicht, welcher Ausschnitt
     // gerade sichtbar ist.
     case 'rad': {
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const pane = String(req.pane ?? '');
       const schritte = Number(req.schritte);
       if (!Number.isFinite(schritte)) throw new Error('Feld schritte fehlt');
@@ -5643,7 +7101,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
     // um wieviel je Ereignis -- und genau das unterscheidet ein Trackpad (viele
     // kleine Wege) von einer Maus (wenige grosse).
     case 'radmass': {
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const deltas = (Array.isArray(req.deltas) ? req.deltas : []).map(Number).filter((n) => Number.isFinite(n));
       if (!deltas.length) throw new Error('Feld deltas fehlt');
       const modus = Number(req.modus ?? 0);
@@ -5672,7 +7130,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
     // Gemessen wird, was am Ende zaehlt: wieviele Zeilen sich der Ausschnitt
     // bewegt hat, und wieviele Ereignisse gar nichts bewirkt haben.
     case 'rad-strom': {
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const pane = String(req.pane ?? '');
       const deltas = (Array.isArray(req.deltas) ? req.deltas : []).map(Number).filter((n) => Number.isFinite(n));
       if (!deltas.length) throw new Error('Feld deltas fehlt');
@@ -5745,7 +7203,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
     // dem Bericht vom 12.08. Ohne diesen Weg bleibt „haekeliges Scrollen" eine
     // Meinung; siehe window.__awb.scrollLeistung fuer die Rechnung.
     case 'scroll-leistung': {
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const pane = String(req.pane ?? '');
       const bilder = Number(req.bilder ?? 120);
       const raster = Number(req.raster ?? 3);
@@ -5758,7 +7216,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
     // Welcher Renderer gerade zeichnet -- ohne Rad-Ereignis, fuer die Zusage
     // "der Zusatz ist wirklich aktiv" getrennt von der Messung selbst.
     case 'renderer-art': {
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const pane = String(req.pane ?? '');
       const art = await win.webContents.executeJavaScript(`window.__awb.rendererArt(${JSON.stringify(pane)})`);
       return { pane, art };
@@ -5768,7 +7226,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
     // BEVOR ein Pane angelegt wird -- der einzige zuverlaessige Weg, den
     // Canvas-Rueckfall in ladeRenderer() auszuloesen (siehe __awb.webglSperren).
     case 'webgl-sperren': {
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const ok = await win.webContents.executeJavaScript('window.__awb.webglSperren()');
       return { gesperrt: !!ok };
     }
@@ -5777,7 +7235,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
     // loeschen -- die Vorbedingung fuer "Strg+Umschalt+C kopiert nur MIT
     // Auswahl".
     case 'zwischenablage-auswahl': {
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const pane = String(req.pane ?? '');
       if (!pane) throw new Error('Feld pane fehlt');
       const an = req.an === true;
@@ -5794,7 +7252,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
     // Moment, deshalb wird `gesendet` erst NACH einer kurzen Wartezeit erneut
     // gelesen statt aus derselben Antwort wie `verhindert`.
     case 'zwischenablage-taste': {
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const pane = String(req.pane ?? '');
       const taste = String(req.taste ?? '');
       if (!pane || !taste) throw new Error('zwischenablage-taste braucht <%pane> <taste>');
@@ -5831,7 +7289,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
     // Kein natives Menue zeigt sich trotzdem: AWB_TEST_KONTEXTMENUE_STUMM
     // schaltet `.popup()` in app.whenReady stumm.
     case 'kontextmenu-fake': {
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const ziel = String(req.ziel ?? '');
       if (!ziel) throw new Error('Feld ziel fehlt');
       awbLetzterKontextmenu = null;
@@ -5864,13 +7322,13 @@ async function handle(req: ControlRequest): Promise<unknown> {
 
     case 'set-ui': {
       const teil: Record<string, unknown> = {};
-      for (const feld of ['sidebarWidth', 'showStopped', 'sort', 'order', 'workerTab', 'rightWidth'] as const) {
+      for (const feld of ['sidebarWidth', 'showStopped', 'sort', 'order', 'projektReihenfolge', 'workerTab', 'blattBreite', 'editorEingeklappt'] as const) {
         if (req[feld] !== undefined) teil[feld] = req[feld];
       }
       if (typeof teil.sort === 'string' && !['recent', 'folder', 'name'].includes(teil.sort)) {
         throw new Error(`unbekannte Sortierung: ${teil.sort}`);
       }
-      if (teil.rightWidth !== undefined) teil.rightWidth = Math.max(40, Math.min(560, Number(teil.rightWidth) || 210));
+      if (teil.blattBreite !== undefined) teil.blattBreite = Math.max(280, Math.min(1200, Number(teil.blattBreite) || 360));
       ui.set(teil as Partial<UiState>);
       sessions = modellLesen();
       modellSenden();
@@ -5911,7 +7369,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
       // durchlaeuft dabei Dutzende Zwischengroessen, und jede davon meldet der
       // Renderer. Ohne diesen Befehl liesse sich der Fall nur von Hand
       // nachstellen, also genau einmal und nie wieder.
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const was = String(req.was ?? '');
       switch (was) {
         case 'maximieren': win.maximize(); break;
@@ -5953,7 +7411,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
       // sich pruefen, dass ein Klick darauf wirklich etwas sagt.
       const knopf = String(req.knopf ?? '');
       if (!/^[a-z-]+$/.test(knopf)) throw new Error(`unzulaessiger Knopf: ${knopf}`);
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       // Zwei Bauarten von Knopf: die Werkzeuge tragen `data-tot`, der
       // Plus-Knopf ueber den Sessions eine Kennung. Geklickt wird der ECHTE
       // Knopf, nicht die Nachricht dahinter -- sonst prueft man die Verdrahtung
@@ -5963,6 +7421,59 @@ async function handle(req: ControlRequest): Promise<unknown> {
       )) as boolean;
       if (!getroffen) throw new Error(`kein Knopf '${knopf}'`);
       return { knopf };
+    }
+
+    /**
+     * DIE MASCHINENANZEIGE IN DER STATUSLEISTE ANKLICKEN (05.09.2026).
+     *
+     * Zwei Ziele, beide echte Klicks auf das echte Element -- nicht die
+     * Nachricht dahinter, sonst prueft man die Verdrahtung nicht mit:
+     *   `maschine-klick <name>`        auf den Namen, klappt ihr Feld auf/zu
+     *   `maschine-klick <name> laden`  auf den Umschalter IM Feld
+     * Der Name reist als JSON-Zeichenkette in die Seite, damit ein Punkt oder
+     * ein Bindestrich im Maschinennamen nicht als CSS gelesen wird.
+     */
+    case 'maschine-klick': {
+      if (!win) throw new Error(KEIN_RENDERER);
+      const name = String(req.maschine ?? '');
+      if (!name) throw new Error('maschine-klick braucht einen Maschinennamen');
+      const ziel = req.ziel === 'laden' ? 'laden' : 'name';
+      const getroffen = (await win.webContents.executeJavaScript(
+        `(() => {
+          const n = ${JSON.stringify(name)};
+          const stueck = [...document.querySelectorAll('#maschinen .masch')]
+            .find((e) => (e.querySelector('.masch-name')?.textContent ?? '').trim() === n);
+          if (!stueck) return 'keine Maschine';
+          const el = ${JSON.stringify(ziel)} === 'laden'
+            ? stueck.querySelector('.masch-schalter input')
+            : stueck.querySelector('.masch-name');
+          if (!el) return 'kein Bedienelement';
+          el.click();
+          return '';
+        })()`,
+      )) as string;
+      if (getroffen) throw new Error(`maschine-klick '${name}' (${ziel}): ${getroffen}`);
+      return { maschine: name, ziel };
+    }
+
+    /**
+     * EINE ZEILE DER LINKEN LEISTE AUF EINE ANDERE ZIEHEN -- mit echten
+     * Ereignissen, so wie ein Mensch es tut. Beide Kennungen sind entweder
+     * Sitzungskennungen oder Projektpfade; welcher Zug daraus wird, entscheidet
+     * die Zeile selbst (renderer.ts, `ziehbarGrundform`).
+     */
+    case 'ziehen': {
+      if (!win) throw new Error(KEIN_RENDERER);
+      const gezogen = String(req.gezogen ?? '');
+      const ziel = String(req.ziel ?? '');
+      if (!gezogen || !ziel) throw new Error('Felder gezogen und ziel noetig');
+      const ergebnis = await win.webContents.executeJavaScript(
+        `window.__awb.ziehprobe(${JSON.stringify({ gezogen, ziel })})`,
+      );
+      // Der Umbau laeuft ueber 'order' und damit ueber den Hauptprozess; kurz
+      // warten, sonst liest der naechste Befehl die Reihenfolge von vorher.
+      await new Promise((r) => setTimeout(r, 200));
+      return { gezogen, ziel, ...(ergebnis as Record<string, unknown>) };
     }
 
     case 'editor': {
@@ -5983,7 +7494,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
           + 'Diesen Weg geht nur ein Mensch im Fenster (Knopf oder Strg-Umschalt-Eingabe).',
         );
       }
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const argJson = JSON.stringify(req.arg ?? null);
       // { ok, wert } bzw. { ok: false, error } als EIGENE Huelle: der
       // Rueckgabewert eines Hooks kann eine nackte Zahl, ein Boolean oder ein
@@ -6016,7 +7527,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
       const ziel = String(req.ziel ?? '');
       const text = String(req.text ?? '');
       if (!/^[a-z-]+$/.test(ziel)) throw new Error(`unzulaessiges Ziel: ${ziel}`);
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const getroffen = (await win.webContents.executeJavaScript(
         `(() => { const el = document.querySelector('[data-tipp="${ziel}"]'); if (!el) return false;
           el.value = ${JSON.stringify(text)}; el.dispatchEvent(new Event('input', {bubbles:true})); return true; })()`,
@@ -6120,12 +7631,70 @@ async function handle(req: ControlRequest): Promise<unknown> {
     case 'ordner-auf': {
       const pfad = String(req.pfad ?? '');
       if (!pfad) throw new Error('Feld pfad fehlt');
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       const getroffen = (await win.webContents.executeJavaScript(
         `(() => { const h = window.__awbOrdner; return !!(h && h.auf(${JSON.stringify(pfad)})); })()`,
       )) as boolean;
       if (!getroffen) throw new Error(`keine Baumzeile fuer '${pfad}' -- steht sie ueberhaupt auf dem Schirm?`);
       return { pfad };
+    }
+
+    // Der Tab "Agents" (aufgaben.ts, welten.ts): der Stand und eine Handlung
+    // `welt:<handlung> <JSON>`. Ueber diesen Weg spricht per Bauart ein Skript --
+    // welten.ts schreibt es als `cli-operator` (Herkunft 'steuerkanal').
+    case 'aufgaben': {
+      // `frisch`: erst einen Takt abwarten -- fuer Pruefungen, die nicht zwei Sekunden raten wollen.
+      return req.frisch === true ? aufgabenQuelle.frisch() : aufgabenQuelle.aktuell();
+    }
+
+    case 'aufgabe': {
+      const befehl = String(req.befehl ?? '');
+      if (!befehl) throw new Error('Feld befehl fehlt');
+      return aufgabenQuelle.ausfuehren(befehl, 'steuerkanal', { bestaetigt: req.bestaetigt === true, echt: false });
+    }
+
+    // Die Sichtbarkeit der Ansicht lesen und (fuer Pruefungen) setzen.
+    case 'aufgaben-sichtbar': {
+      if (typeof req.sichtbar === 'boolean') aufgabenQuelle.sichtbarSetzen(req.sichtbar);
+      return { sichtbar: aufgabenQuelle.istSichtbar() };
+    }
+
+    /**
+     * DIE WELTEN-ANSICHT IM TAB „AGENTS" (Auftrag agentsui Nr. 4, seit Nr. 6 der Tab).
+     * Dieselbe Bauart wie 'editor' und 'ordner-auf': der Steuerkanal ruft einen Haken
+     * der Ansicht (`window.__awbWelten`), statt einen Klick an Bildschirmkoordinaten zu
+     * raten; `druecke` klickt das gezeichnete Bedienelement, `tippe` setzt ein Feld wie
+     * getippt. Ein Testzugang zur Oberflaeche, kein neuer Weg in den Kern. Das
+     * Aufgaben-Blatt aus Fassung 26 (`agents`, `window.__awbAgents`) gibt es nicht mehr.
+     */
+    case 'welten': {
+      if (!win) throw new Error(KEIN_RENDERER);
+      const was = String(req.was ?? 'zustand');
+      if (!/^[a-z]+$/.test(was)) throw new Error(`unzulaessige Welten-Methode: ${was}`);
+      const wert = JSON.stringify(String(req.wert ?? ''));
+      const ergebnis = (await win.webContents.executeJavaScript(
+        `(() => { const h = window.__awbWelten; if (!h) return { ok: false, error: 'keine Welten-Ansicht' };
+          if (typeof h[${JSON.stringify(was)}] !== 'function') return { ok: false, error: 'unbekannt: ' + ${JSON.stringify(was)} };
+          try { return { ok: true, wert: h[${JSON.stringify(was)}](${wert}) }; } catch (e) { return { ok: false, error: String(e && e.message || e) }; } })()`,
+      )) as { ok: boolean; wert?: unknown; error?: string };
+      if (!ergebnis.ok) throw new Error(ergebnis.error ?? 'Welten-Ansicht meldete einen Fehler');
+      return { was, ...(ergebnis.wert as Record<string, unknown>) };
+    }
+
+    /**
+     * DEN UMSCHALTER CODE | AGENTS BEDIENEN (08.09.2026). Geklickt wird der
+     * ECHTE Knopf in der Titelleiste, nicht die Funktion dahinter -- sonst
+     * prueft eine Suite die Verdrahtung nicht mit.
+     */
+    case 'modus': {
+      if (!win) throw new Error(KEIN_RENDERER);
+      const modus = String(req.modus ?? '');
+      if (modus !== 'code' && modus !== 'agents') throw new Error("modus kennt code|agents");
+      const getroffen = (await win.webContents.executeJavaScript(
+        `(() => { const k = document.querySelector('#modi [data-modus="${modus}"]'); if (!k) return false; k.click(); return true; })()`,
+      )) as boolean;
+      if (!getroffen) throw new Error(`kein Umschalter fuer '${modus}'`);
+      return { modus };
     }
 
     case 'aktivitaet': {
@@ -6167,8 +7736,85 @@ async function handle(req: ControlRequest): Promise<unknown> {
     }
 
     case 'shot': {
-      if (!win) throw new Error('kein Fenster');
+      if (!win) throw new Error(KEIN_RENDERER);
       return await captureWindow(win, config.shotDir, req.path ? String(req.path) : undefined);
+    }
+
+    // --- DER PROTOTYP AUS pty.ts, UEBER DEN STEUERKANAL --------------------
+    //
+    // Diese acht Befehle sind das, was von tmux uebrigbleibt, wenn die
+    // Anwendung die Pseudo-Terminals selbst haelt. Zum Vergleich: die
+    // Kerngruppe der Werkzeuge ruft heute zwanzig tmux-Unterbefehle in 273
+    // Aufrufen (DIREKTWEG-BEFUND, Abschnitt 5), davon vierzig reine
+    // Fenster-Buchhaltung, die hier ersatzlos entfaellt.
+    //
+    // Der Kanal bleibt, was er ist: ein Werkzeug fuer die Werkbank, nicht fuer
+    // die Agenten in den Panes (control.ts, F17).
+    case 'pane-starten': {
+      const a = req.auftrag as PtyAuftrag | undefined;
+      if (!a || !a.befehl || !a.cwd) throw new Error('pane-starten braucht auftrag mit befehl und cwd');
+      const id = ptyVerwaltung().starten({
+        name: a.name || 'worker',
+        befehl: a.befehl,
+        args: Array.isArray(a.args) ? a.args.map(String) : [],
+        cwd: a.cwd,
+        env: a.env,
+        cols: Number(a.cols) > 0 ? Number(a.cols) : 80,
+        rows: Number(a.rows) > 0 ? Number(a.rows) : 24,
+        harness: a.harness,
+        rolle: a.rolle,
+        wiederaufnahme: a.wiederaufnahme,
+      });
+      return { pane: id, stand: ptyVerwaltung().standVon(id) };
+    }
+
+    case 'pane-liste':
+      return { panes: ptyVerwaltung().liste() };
+
+    case 'pane-info': {
+      const stand = ptyVerwaltung().standVon(String(req.pane ?? ''));
+      if (!stand) throw new Error(`kein pty-Pane ${req.pane}`);
+      return stand;
+    }
+
+    // DIE STELLE, AN DER DIE PROBE HAENGT: derselbe Text, den
+    // `capture-pane -p` liefert -- alle sichtbaren Zeilen, rechts
+    // beschnitten, mit "\n" verbunden, ohne Umbruch am Ende (pty.ts, M1).
+    case 'pane-schirm': {
+      const pane = String(req.pane ?? '');
+      const zeilen = Number(req.zeilen ?? 0);
+      const v = ptyVerwaltung();
+      return { pane, text: zeilen > 0 ? v.historie(pane, zeilen) : v.schirm(pane) };
+    }
+
+    case 'pane-tippen': {
+      const pane = String(req.pane ?? '');
+      ptyVerwaltung().schreiben(pane, Buffer.from(String(req.text ?? ''), 'utf8'));
+      return { pane, getippt: String(req.text ?? '').length };
+    }
+
+    // Benannte Tasten, uebersetzt an EINER Stelle. `send-keys` nimmt sie als
+    // Namen entgegen; ein Pseudo-Terminal nimmt Bytes, und die Uebersetzung
+    // gehoert damit hierher statt in jedes rufende Werkzeug.
+    case 'pane-taste': {
+      const pane = String(req.pane ?? '');
+      const name = String(req.name ?? '');
+      const bytes = tastenBytes(name);
+      if (bytes === null) throw new Error(`unbekannte Taste '${name}'`);
+      ptyVerwaltung().schreiben(pane, Buffer.from(bytes, 'binary'));
+      return { pane, taste: name };
+    }
+
+    case 'pane-groesse': {
+      const pane = String(req.pane ?? '');
+      ptyVerwaltung().groesse(pane, Number(req.cols), Number(req.rows));
+      return ptyVerwaltung().standVon(pane);
+    }
+
+    case 'pane-beenden': {
+      const pane = String(req.pane ?? '');
+      ptyVerwaltung().beenden(pane);
+      return { pane, beendet: true };
     }
 
     case 'quit':
@@ -6374,6 +8020,7 @@ async function shutdown(code: number): Promise<void> {
   if (uhr) clearInterval(uhr);
   remotePoller.stop();
   budgetPoller.stop();
+  aufgabenQuelle.stop();
   // Was diese App gestartet hat, beendet sie auch -- und wartet darauf, dass
   // es wirklich weg ist (Befund B5, 12.08.). Ohne das `await` lief
   // `app.exit()` in aller Regel frueher als das Nachfassen nach zwei
@@ -6382,9 +8029,19 @@ async function shutdown(code: number): Promise<void> {
   // eine eigene Zusage der Chat-Sitzung, keine dieser Funktion hier -- eine
   // Sitzung, die sie bricht, darf trotzdem nicht das GANZE Beenden aufhalten.
   await mitFrist(chatbuehne.alleBeenden(), 5000, 'Chat-Sitzungen beenden');
+  // Der Prototyp haelt seine Kinder SELBST -- also beendet er sie auch selbst,
+  // und zwar hier, an derselben Stelle wie die Chat-Sitzungen. Genau das ist
+  // der Preis von Option E: mit dem Programm geht auch der laufende Zug jedes
+  // pty-Workers (DIREKTWEG-BEFUND, Abschnitt 4 -- ein bis zwei Zuege je Woche).
+  // Die Unterhaltung bleibt, sie steht in der Sitzungsdatei des Harness, und
+  // `wiederaufnehmen()` holt sie beim naechsten Start zurueck.
+  ptyPanes?.merken();
+  ptyPanes?.allesBeenden();
   chatRegistry.alleFreigeben();
-  for (const w of dateiWaechter) w.close();
-  dateiWaechter = [];
+  dateiWaechter?.close();
+  dateiWaechter = null;
+  editorWaechter?.close();
+  editorWaechter = null;
   // Die Lebensspur auch auf DIESEM Weg loeschen (11.08.). `zurueckstellen`
   // haengt an before-quit/will-quit und faengt das Beenden ueber das Menue
   // oder ein Signal; hier faellt das Schliessen des letzten Fensters an, denn
@@ -6416,6 +8073,7 @@ async function shutdown(code: number): Promise<void> {
     // Verbindungen, nicht nur auf sich selbst -- ein Client, der seinen Socket
     // nicht schliesst, liesse dieses `await` ohne Ende stehen.
     if (channel) await mitFrist(channel.close(), 2000, 'Steuerkanal schliessen');
+    if (mantel) await mitFrist(mantel.close(), 2000, 'Mantel-Socket schliessen');
   } catch {
     // dito fuer den Steuerkanal
   }
@@ -6445,57 +8103,70 @@ async function shutdown(code: number): Promise<void> {
   app.exit(code);
 }
 
-app.whenReady().then(async () => {
-  // DAS FENSTER ZUERST. Frueher stand der Steuerkanal davor, und ein belegter
-  // Socket liess `listen()` scheitern, BEVOR ueberhaupt ein Fenster entstand --
-  // die Ablehnung flog ungefangen aus diesem then(), der Prozess lief weiter,
-  // und wer auf das Symbol im Dock drueckte, sah nichts, weil es nichts zu
-  // sehen gab. Der Kanal ist nuetzlich, aber er ist keine Bedingung dafuer,
-  // dass das Programm erscheint: am Fenster haengt ein Mensch, am Kanal ein
-  // Skript, und das Skript kann es noch einmal versuchen.
-  // Die Seiten liefert das Programm selbst aus -- kein Server, keine Datei auf
-  // der Platte, nichts aus dem Netz. Was hier zurueckgeht, ist genau das, was
-  // renderSeite() erzeugt hat; ein anderer Pfad bekommt nichts.
-  protocol.handle(SEITEN_SCHEMA, (req) => {
-    const name = new URL(req.url).hostname as SeitenName;
-    if (name !== 'start' && name !== 'einstellungen') {
-      return new Response('unbekannte Seite', { status: 404 });
-    }
-    sessions = modellLesen();
-    return new Response(seiteHtml(name), {
-      status: 200,
-      headers: { 'content-type': 'text/html; charset=utf-8' },
-    });
-  });
-
-  // EIN ANWENDUNGSMENUE MIT DEN STANDARDROLLEN (SSH-clipfix). Ohne eigenes
-  // Menue verlaesst sich das Programm auf das, was Electron von sich aus
-  // zusammenbaut -- pro Version und Plattform verschieden, und nirgends im
-  // Quelltext nachlesbar. Mit den eingebauten Rollen (`editMenu` traegt
-  // Rueckgaengig/Wiederholen/Ausschneiden/Kopieren/Einfuegen/Alles waehlen)
-  // steht es fest, und dieselben Rollen bedienen auch Screenreader und das
-  // Systemwerkzeug fuer Barrierefreiheit -- ein Menuepunkt, der nie existierte,
-  // konnte das nicht. Im kopflosen Lauf (kein `--show`/`--show-inaktiv`, siehe
-  // Kommentar zu `app.dock?.hide()` oben) bleibt es weg wie Dock und Fenster.
-  if (zeigen || zeigenInaktiv) {
-    const isMac = process.platform === 'darwin';
-    Menu.setApplicationMenu(Menu.buildFromTemplate([
-      ...(isMac ? [{ role: 'appMenu' as const }] : []),
-      { role: 'fileMenu' as const },
-      { role: 'editMenu' as const },
-      { role: 'viewMenu' as const },
-      { role: 'windowMenu' as const },
-    ]));
-  } else {
-    Menu.setApplicationMenu(null);
-  }
-
+/**
+ * DAS HAUPTFENSTER AUFBAUEN -- alles, was zwischen `createWindow()` und dem
+ * geladenen Renderer liegt: die Zuhoerer auf Protokoll, Absturz und
+ * Rechtsklick, der gemerkte Rahmen, die Testschalter, das Laden der Seite.
+ *
+ * Eigene Funktion seit dem 06.09.2026 (Auftrag 4.1), damit der Mantelbetrieb
+ * sie SCHLICHT NICHT RUFT: er baut kein Fenster, und ein `if` um 170 Zeilen
+ * mitten in `whenReady` haette dieselbe Sache gesagt, nur unlesbar.
+ */
+async function hauptfensterAufbauen(): Promise<void> {
   win = createWindow(config.ownedCols, config.ownedRows);
   win.webContents.on('console-message', (_e, level, message, line, source) => {
     if (level >= 2) process.stderr.write(`renderer(${source}:${line}): ${message}\n`);
   });
   win.webContents.on('preload-error', (_e, pfad, error) => {
     process.stderr.write(`preload ${pfad}: ${error.message}\n`);
+  });
+  // DER RENDERER STIRBT, DAS PROGRAMM BLEIBT (Prueferbefund vom 05.09.2026).
+  //
+  // Bis heute gab es fuer diesen Fall gar keinen Zuhoerer. Gemessen: wird der
+  // Renderer-Prozess des Fensters beendet, laeuft der Hauptprozess weiter, sein
+  // Takt schreibt weiter in ein Fenster, das niemand mehr zeichnet, und jeder
+  // `executeJavaScript` bleibt fuer immer offen -- `awb-ctl state` bekam keine
+  // Antwort mehr, und mit ihm kein weiterer Befehl. Uebrig blieb ein Programm
+  // ohne Oberflaeche und ohne Steuerkanal, das aus jeder Entfernung tot
+  // aussieht, aber nicht beendet ist.
+  //
+  // Die Antwort darauf ist derselbe Weg, den `awb-ctl reload` geht: Renderer
+  // neu laden, auf seine Bereitschaft warten, wieder anhaengen. Er steht in
+  // `handle({ cmd: 'reload' })` und wird hier NICHT nachgebaut -- eine zweite
+  // Fassung desselben Weges waere eine zweite Wahrheit darueber, was ein
+  // Neuladen bedeutet.
+  //
+  // MIT ABKUEHLUNG, und zwar aus Erfahrung mit dem umgekehrten Fehler: ein
+  // Renderer, der beim Laden zuverlaessig stirbt, ergaebe ohne sie eine
+  // Endlosschleife aus Absturz und Neustart, die die Maschine belegt und im
+  // Protokoll nicht mehr lesbar ist. Nach `reason: 'clean-exit'` und waehrend
+  // des Beendens wird gar nichts unternommen: dann ist der Renderer nicht
+  // abgestuerzt, sondern fertig.
+  win.webContents.on('render-process-gone', (_e, details) => {
+    process.stderr.write(`Renderer des Hauptfensters weg (${details.reason}, exitCode ${details.exitCode})\n`);
+    rendererReady = false;
+    if (shuttingDown || details.reason === 'clean-exit') return;
+    // Der Neustart wird VERZOEGERT, nicht verworfen: ein Renderer, der beim
+    // Laden zuverlaessig stirbt, ergaebe sonst eine Endlosschleife aus Absturz
+    // und Neustart; ein uebersprungener Neustart dagegen liesse das Programm
+    // fuer immer ohne Oberflaeche stehen. Beides ist vermeidbar, indem der
+    // naechste Versuch einfach wartet, bis der Abstand voll ist.
+    const wartet = Math.max(0, rendererNeustartAm + RENDERER_NEUSTART_ABSTAND_MS - Date.now());
+    rendererNeustartAm = Date.now() + wartet;
+    if (wartet > 0) process.stderr.write(`Renderer: Neustart in ${wartet} ms -- der letzte liegt noch keine 5 s zurueck.\n`);
+    // UND NICHT AUS DIESEM ZUHOERER HERAUS (gemessen am 05.09.2026): ein
+    // `webContents.reload()` mitten in der Zustellung von
+    // 'render-process-gone' laesst Chromium seine Beobachterliste doppelt
+    // fuellen -- „NOTREACHED hit. Observers can only be added once!", und der
+    // Hauptprozess endete mit SIGTRAP. Der Absturz des Renderers haette so den
+    // ganzen Prozess mitgenommen, also genau das, was dieser Zuhoerer
+    // verhindern soll. Deshalb geht der Neustart auch bei `wartet === 0` ueber
+    // die Uhr und nicht direkt.
+    setTimeout(() => {
+      handle({ cmd: 'reload' })
+        .then(() => process.stderr.write('Renderer nach Absturz neu geladen.\n'))
+        .catch((e) => process.stderr.write(`Renderer nach Absturz NICHT neu geladen: ${(e as Error).message}\n`));
+    }, wartet);
   });
   // DAS RECHTSKLICK-MENUE EINES TEXTFELDS ODER EINES TERMINALS (SSH-clipfix,
   // clipmenu 17.08.). Electron zeigt anders als ein gewoehnlicher Browser-Tab
@@ -6615,16 +8286,155 @@ app.whenReady().then(async () => {
     win.webContents.setUserAgent(process.env.AWB_TEST_USERAGENT);
   }
   await win.loadFile(join(__dirname, '..', 'renderer', 'index.html'));
+}
+
+app.whenReady().then(async () => {
+  // DIE SPRACHE DES SYSTEMS, bevor irgendein Fenster entsteht (03.09.2026).
+  // Ohne Einstellung fiel die Oberflaeche bisher auf Englisch, und der erste
+  // Blick auf ein frisches Programm war englisch, obwohl der Mac auf Deutsch
+  // steht. `app.getLocale()` gibt es erst nach `whenReady`; die Einstellung
+  // schlaegt diesen Wert weiterhin (einstellungen.ts, `sprache`).
+  systemSpracheSetzen(app.getLocale());
+  // DAS FENSTER ZUERST. Frueher stand der Steuerkanal davor, und ein belegter
+  // Socket liess `listen()` scheitern, BEVOR ueberhaupt ein Fenster entstand --
+  // die Ablehnung flog ungefangen aus diesem then(), der Prozess lief weiter,
+  // und wer auf das Symbol im Dock drueckte, sah nichts, weil es nichts zu
+  // sehen gab. Der Kanal ist nuetzlich, aber er ist keine Bedingung dafuer,
+  // dass das Programm erscheint: am Fenster haengt ein Mensch, am Kanal ein
+  // Skript, und das Skript kann es noch einmal versuchen.
+  // Die Seiten liefert das Programm selbst aus -- kein Server, keine Datei auf
+  // der Platte, nichts aus dem Netz. Was hier zurueckgeht, ist genau das, was
+  // renderSeite() erzeugt hat; ein anderer Pfad bekommt nichts.
+  protocol.handle(SEITEN_SCHEMA, (req) => {
+    const name = new URL(req.url).hostname as SeitenName;
+    if (name !== 'start' && name !== 'einstellungen') {
+      return new Response('unbekannte Seite', { status: 404 });
+    }
+    sessions = modellLesen();
+    return new Response(seiteHtml(name), {
+      status: 200,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  });
+
+  // EIN ANWENDUNGSMENUE MIT DEN STANDARDROLLEN (SSH-clipfix), seit 03.09. mit
+  // den eigenen Funktionen darin (Fenster-Auftrag Punkt 2). Ohne eigenes Menue
+  // verlaesst sich das Programm auf das, was Electron von sich aus
+  // zusammenbaut -- pro Version und Plattform verschieden, und nirgends im
+  // Quelltext nachlesbar. Mit den eingebauten Rollen (`editMenu` traegt
+  // Rueckgaengig/Wiederholen/Ausschneiden/Kopieren/Einfuegen/Alles waehlen)
+  // steht es fest, und dieselben Rollen bedienen auch Screenreader und das
+  // Systemwerkzeug fuer Barrierefreiheit -- ein Menuepunkt, der nie existierte,
+  // konnte das nicht. Im kopflosen Lauf (kein `--show`/`--show-inaktiv`, siehe
+  // Kommentar zu `app.dock?.hide()` oben) bleibt es weg wie Dock und Fenster --
+  // das ist unveraendert richtig: ein Messlauf soll kein Fenster UND kein
+  // Menue zeigen, beides zusammen ist "unsichtbar", eines von beiden waere es
+  // nicht mehr.
+  if (zeigen || zeigenInaktiv) {
+    const isMac = process.platform === 'darwin';
+    // Jeder Punkt mit eigener Handlung geht denselben Weg wie der passende
+    // Klick im Fenster (`zeigeNachEchtemKlick`, `case 'reload'` im
+    // Steuerkanal weiter unten) -- ein Menuepunkt ist wie ein echter Klick ein
+    // Ereignis, das ein Mensch selbst ausgeloest hat, kein synthetisches
+    // DOM-Ereignis aus einem Skript, und braucht deshalb keine eigene Pruefung.
+    const einstellungenOeffnen = (): void => {
+      einstellungsfenster.zeigeNachEchtemKlick()
+        .catch((e) => process.stderr.write(`Einstellungen (Menue) abgelehnt: ${(e as Error).message}\n`));
+    };
+    const neueSitzungOeffnen = (): void => {
+      sitzungsfenster.zeigeNachEchtemKlick()
+        .catch((e) => process.stderr.write(`Neue Sitzung (Menue) abgelehnt: ${(e as Error).message}\n`));
+    };
+    const aktualisieren = (): void => {
+      handle({ cmd: 'reload' })
+        .catch((e) => process.stderr.write(`Aktualisieren (Menue) abgelehnt: ${(e as Error).message}\n`));
+    };
+    // DER WEG ZUR STARTSEITE (03.09.). Bis heute gab es keinen: `seiteOffen`
+    // beginnt leer, und ausser dem Steuerkanal setzte es niemand auf 'start'.
+    // Die Seite war fuer einen Menschen also gar nicht erreichbar -- der Reiter
+    // im Fenster oeffnete nur die Seite, auf der man ohnehin schon stand, und
+    // ist deshalb weggefallen (seiten-view.ts). Ein Mac-Programm haelt so einen
+    // Punkt im Menue "Ansicht", also steht er dort.
+    const startseiteOeffnen = (): void => {
+      handle({ cmd: 'seite', wert: 'start' })
+        .catch((e) => process.stderr.write(`Startseite (Menue) abgelehnt: ${(e as Error).message}\n`));
+    };
+    Menu.setApplicationMenu(Menu.buildFromTemplate([
+      ...(isMac ? [{
+        // role: 'appMenu' allein baut Ueber/Dienste/Ausblenden/Beenden --
+        // "Einstellungen" gehoert NICHT zu dieser Rolle und muss von Hand
+        // dazwischen, an der Stelle, an der ein Mac-Nutzer sie erwartet
+        // (gleich unter "Ueber ...", mit dem Kuerzel Cmd+,).
+        label: app.name,
+        submenu: [
+          { role: 'about' as const },
+          { type: 'separator' as const },
+          { label: 'Einstellungen …', accelerator: 'Cmd+,', click: einstellungenOeffnen },
+          { type: 'separator' as const },
+          { role: 'services' as const },
+          { type: 'separator' as const },
+          { role: 'hide' as const },
+          { role: 'hideOthers' as const },
+          { role: 'unhide' as const },
+          { type: 'separator' as const },
+          { role: 'quit' as const },
+        ],
+      }] : []),
+      {
+        role: 'fileMenu' as const,
+        submenu: [
+          { label: 'Neue Sitzung …', accelerator: 'CmdOrCtrl+N', click: neueSitzungOeffnen },
+          { type: 'separator' as const },
+          isMac ? { role: 'close' as const } : { role: 'quit' as const },
+        ],
+      },
+      { role: 'editMenu' as const },
+      {
+        role: 'viewMenu' as const,
+        submenu: [
+          // Ersetzt die eingebauten Punkte "Reload"/"Force Reload": die riefen
+          // nur `webContents.reload()` auf, ohne das Nachziehen von tmux und
+          // Sessionmodell, das der Steuerkanal-Fall 'reload' bereits leistet
+          // (siehe weiter unten, `case 'reload'` in `handle()`). Derselbe Weg
+          // gilt jetzt auch fuer den Menuepunkt und sein Kuerzel.
+          { label: 'Startseite', accelerator: 'CmdOrCtrl+Shift+H', click: startseiteOeffnen },
+          { label: 'Aktualisieren', accelerator: 'CmdOrCtrl+R', click: aktualisieren },
+          { type: 'separator' as const },
+          { role: 'toggleDevTools' as const },
+          { type: 'separator' as const },
+          { role: 'togglefullscreen' as const },
+        ],
+      },
+      { role: 'windowMenu' as const },
+      // role: 'help' OHNE eigenes Untermenue: macOS haengt bei dieser Rolle von
+      // sich aus das Suchfeld ueber alle Menuepunkte an ("In der Hilfe
+      // suchen"). Ein eigener Menuepunkt daneben braeuchte ein Hilfedokument
+      // fuer Menschen, das es nicht gibt -- erfunden waere er falscher als ein
+      // Menue ohne eigenen Punkt.
+      { role: 'help' as const },
+    ]));
+  } else {
+    Menu.setApplicationMenu(null);
+  }
+
+  // DAS HAUPTFENSTER -- ausser im Mantelbetrieb (Auftrag 4.1). Dort ist die
+  // Mac-native Oberflaeche die Buehne, und dieser Prozess bleibt reiner Kern:
+  // kein BrowserWindow, kein Renderer, kein Warten auf einen.
+  if (!mantelBetrieb) await hauptfensterAufbauen();
   // Die Bruecke fuer Strg+Umschalt+C/V IM TERMINAL (SSH-clipfix, siehe
   // preload.ts). `clipboard` statt `navigator.clipboard`: das eine ist
   // Electrons eigenes Modul und braucht keine Berechtigungsabfrage, das andere
   // schon -- und der Renderer hat unter `contextIsolation: true` ohnehin
   // keinen Zugriff auf Node/Electron-Module ausser ueber genau diesen Kanal.
-  ipcMain.handle('awb:zwischenablage-lesen', () => clipboard.readText());
-  ipcMain.handle('awb:zwischenablage-schreiben', (_e, text: unknown) => {
+  ipc.handle('awb:zwischenablage-lesen', () => clipboard.readText());
+  ipc.handle('awb:zwischenablage-schreiben', (_e, text: unknown) => {
     clipboard.writeText(String(text ?? ''));
   });
-  await waitForRenderer();
+  // Ohne Fenster gibt es niemanden, der sich melden koennte: `waitForRenderer`
+  // liefe im Mantelbetrieb in seine 15-Sekunden-Frist und riefe danach
+  // „Renderer meldete sich nicht" ueber einen Renderer, den nie jemand
+  // bestellt hat (Auftrag 4.1).
+  if (!mantelBetrieb) await waitForRenderer();
 
   // Erst jetzt der Kanal -- und sein Ausfall beendet nichts. Er wird gemeldet,
   // im Fenster angezeigt und steht in `state`, damit niemand raten muss.
@@ -6636,10 +8446,78 @@ app.whenReady().then(async () => {
     kanalFehler = (e as Error).message;
     process.stderr.write(`kein Steuerkanal: ${kanalFehler}\n`);
   }
-  win.webContents.send('awb:kanal', { pfad: config.controlSocket, fehler: kanalFehler });
+  anOberflaeche('awb:kanal', { pfad: config.controlSocket, fehler: kanalFehler });
+
+  // DER MANTEL-SOCKET (06.09.2026, mantel.ts): nur, wenn ein Startvorgang ihn
+  // verlangt. Sein Ausfall beendet ebenfalls nichts -- er steht im Protokoll.
+  if (config.mantelSocket) {
+    try {
+      const m = new MantelKanal(config.mantelSocket, config.mantelToken, {
+        // Der Absender ist `MANTEL_SENDER`, nicht mehr das Fenster (Auftrag
+        // 4.1): im Mantelbetrieb gibt es keines, und die Bruecke haette sonst
+        // jeden Kanal mit „unbekannter Kanal" abgewiesen.
+        send: (kanal, args) => {
+          const fn = ipcHoerer.get(kanal);
+          if (!fn) throw new Error(`unbekannter Kanal ${kanal}`);
+          fn({ sender: MANTEL_SENDER } as Electron.IpcMainEvent, ...args);
+        },
+        invoke: async (kanal, args) => {
+          const fn = ipcHandler.get(kanal);
+          if (!fn) throw new Error(`unbekannter Kanal ${kanal}`);
+          return fn({ sender: MANTEL_SENDER } as Electron.IpcMainInvokeEvent, ...args);
+        },
+        verbunden: () => {
+          // Der Anfangszustand, so wie ihn ein frisch geladener Renderer bekaeme:
+          // Kanal, Modell, und -- falls angehaengt -- Sitzung und Lage.
+          mantel?.push('awb:kanal', { pfad: config.controlSocket, fehler: kanalFehler });
+          modellSenden();
+          mantel?.push('awb:aufgaben', aufgabenQuelle.aktuell());
+          if (attachState) {
+            const active = attachState.panes.find((p) => p.paneId === streamPane) ?? attachState.panes[0];
+            mantel?.push('awb:session', {
+              session: attachState.session,
+              cols: active?.width ?? attachState.cols,
+              rows: active?.height ?? attachState.rows,
+              sizePolicy: attachState.sizePolicy,
+              windows: attachState.windows,
+              panes: attachState.panes,
+              activePane: streamPane,
+            });
+            void ansichtZeichnen().catch((e) =>
+              process.stderr.write(`Mantel: Lage nicht gezeichnet: ${(e as Error).message}\n`));
+          }
+        },
+      });
+      await m.listen();
+      mantel = m;
+      process.stderr.write(`Mantel-Socket: ${config.mantelSocket}\n`);
+    } catch (e) {
+      process.stderr.write(`kein Mantel-Socket: ${(e as Error).message}\n`);
+    }
+  }
+
+  // DIE WIEDERAUFNAHME DER PTY-WORKER (04.09.2026, Probe fuer Option E).
+  //
+  // Sie steht NACH dem Kanal, weil sie sich melden koennen muss: was
+  // wiederaufgenommen wurde und womit, gehoert ins Protokoll und nicht in eine
+  // Vermutung. Und sie steht hinter dem Schalter -- ohne `workerTransport:
+  // "pty"` wird die Momentaufnahme nicht einmal gelesen, geschweige denn ein
+  // Prozess gestartet.
+  if (ptyTransport()) {
+    try {
+      const zurueck = ptyVerwaltung().wiederaufnehmen();
+      for (const s of zurueck) {
+        process.stderr.write(`pty ${s.id} (${s.name}) wieder da: ${s.herkunft} -- ${s.startbefehl}\n`);
+      }
+      if (!zurueck.length) process.stderr.write('pty: nichts wiederaufzunehmen\n');
+    } catch (e) {
+      process.stderr.write(`pty: Wiederaufnahme fehlgeschlagen: ${(e as Error).message}\n`);
+    }
+  }
 
   remotePoller.start();
   budgetPoller.start();
+  aufgabenQuelle.start();
   // Reste-Auftrag, Punkt 3: die Seiten frischen sich auf, wenn ihre Datei sich
   // von aussen aendert -- gemeldet wird nur die betroffene Seite; ob wirklich
   // neu gezeichnet wird, entscheidet allein der Renderer (aufDateiAendern).
@@ -6648,7 +8526,7 @@ app.whenReady().then(async () => {
     modelsFile: config.modelsFile,
     sessionsDir: config.sessionsDir,
     auf: (seite) => {
-      win?.webContents.send('awb:datei-geaendert', { name: seite });
+      anOberflaeche('awb:datei-geaendert', { name: seite });
       // Das EINSTELLUNGSFENSTER zieht ebenfalls nach (06.08.). Es zeichnet aus
       // Dateien, die auch von aussen beschrieben werden -- von `wb-state` am
       // Terminal, von einem Worker, vom Menschen. Ohne diese Zeile stand darin
@@ -6656,7 +8534,7 @@ app.whenReady().then(async () => {
       // Werkzeug laengst "aus" meldete (am Test gesehen, 06.08.). Gezeichnet
       // wird immer die ganze Seite: dieses Fenster haelt keinen Entwurf, den
       // eine Auffrischung zerstoeren koennte.
-      einstellungsfenster.aktuell()?.webContents.send('awb:ein-daten-neu', einstellungenDatenJetzt());
+      anFenster(einstellungsfenster.aktuell(), 'awb:ein-daten-neu', () => einstellungenDatenJetzt());
       // Das SITZUNGSFENSTER aus demselben Grund, nur an der anderen Datei: seine
       // Liste IST der Inhalt von ~/.claude/workbench/sessions/, und die schreibt
       // `wb-code` von aussen. Ein eingetippter Name ueberlebt die Auffrischung
@@ -6671,6 +8549,9 @@ app.whenReady().then(async () => {
   sessions = modellLesen();
   const z = ui.get();
   const start = sichtbare(sessions).find((s) => s.id === z.selected) ?? sichtbare(sessions)[0] ?? null;
+  // Der Befund gehoert VOR das Anhaengen gelesen: `modellLesen` hat ihn gerade
+  // gesetzt, und attachTmux kann ihn nicht mehr aendern.
+  startAnhaengenNachholen = !tmuxBefund.ausfuehrbar;
   await attachTmux(start?.alive ? start.tmuxSession : config.session);
   if (start) ui.set({ selected: start.id });
   modellSenden();
@@ -6682,6 +8563,28 @@ app.whenReady().then(async () => {
     void (async () => {
       try {
         sessions = modellLesen();
+        // Der Absturz-Hook und seine Zeilen (absturz.ts): nur, solange tmux
+        // antwortet -- ohne Server gibt es weder Hook noch Tod zu melden.
+        if (tmuxBefund.ausfuehrbar) {
+          absturzHookSetzen();
+          abstuerzeMelden();
+        } else {
+          absturzHookGesetztAm = 0;
+        }
+        // Ferne Abstuerze haengen nicht am oertlichen tmux, sondern am Fernabruf.
+        fernAbstuerzeMelden();
+        // Das beim Start ausgefallene Anhaengen nachholen -- siehe
+        // `startAnhaengenNachholen`. Einmalig, und nur solange nichts anderes
+        // angehaengt ist: ein Klick, eine Chat-Werkstatt oder ein reload haben
+        // dann laengst entschieden, und diese Stelle hat sich herauszuhalten.
+        if (startAnhaengenNachholen && tmuxBefund.ausfuehrbar) {
+          startAnhaengenNachholen = false;
+          if (!tmux) {
+            const nachzuholen = gewaehlte();
+            await attachTmux(nachzuholen?.alive ? nachzuholen.tmuxSession : config.session);
+            if (nachzuholen) ui.set({ selected: nachzuholen.id });
+          }
+        }
         // ERST nachsehen, wer an der Session haengt, dann das Modell schicken:
         // an dieser Zahl haengt die Auskunft, ob umgeraeumt werden darf, und
         // eine Auskunft, die einen Takt hinterherhinkt, sagt das Falsche.
@@ -6694,8 +8597,32 @@ app.whenReady().then(async () => {
         await mausNachfuehren();
         // Die Maschinenliste gehoert zu den drei Werten, die das Menue mit
         // „sofort" anbietet (06.08.). Ohne diese Zeile griffe sie erst beim
-        // naechsten Start.
-        if (!process.env.AWB_REMOTE_MACHINES) remotePoller.hostsSetzen(maschinenliste(config.settingsFile));
+        // naechsten Start. `maschinenAktiv()` bereinigt die Liste um die
+        // pausierten Maschinen (04.09.) -- fuer sie darf kein ssh-Aufruf mehr
+        // entstehen, und `hostsSetzen()` raeumt ihren gemerkten Stand ohnehin
+        // schon ab, sobald sie aus der uebergebenen Liste faellt (remote.ts).
+        if (!process.env.AWB_REMOTE_MACHINES) remotePoller.hostsSetzen(maschinenAktiv(config.settingsFile));
+        // Spiegel-Panes pausierter Maschinen abraeumen (04.09.): rein lokal,
+        // aus dem Pane-Stand, den `modellLesen()` eben schon geholt hat (siehe
+        // `panesHinweisOderFrisch`) -- kein zusaetzlicher tmux-Aufruf im
+        // Regelfall, in dem nichts zu tun ist. Neue Spiegel legt diese
+        // Werkbank ohnehin nie selbst an (siehe main.ts weiter oben); dieser
+        // Schritt entfernt nur, was von einem frueheren Lauf oder einem
+        // von Hand getippten `wb-remote-view` noch steht.
+        const pausiert = maschinenPausiert(config.settingsFile);
+        if (pausiert.length) {
+          const { panes: allePanesJetzt } = panesHinweisOderFrisch(config.tmuxSocket);
+          const tmuxArgs = config.tmuxSocket ? ['-L', config.tmuxSocket] : [];
+          for (const host of pausiert) {
+            for (const paneId of fremdeSpiegelPanes(allePanesJetzt, host)) {
+              try {
+                spawnSync('tmux', [...tmuxArgs, 'kill-pane', '-t', assertPaneId(paneId)], { encoding: 'utf8', timeout: 2000 });
+              } catch (e) {
+                process.stderr.write(`Spiegel-Pane von '${host}' nicht abgeraeumt: ${(e as Error).message}\n`);
+              }
+            }
+          }
+        }
         modellSenden();
         freigabenAktualisieren();
         ergebnissePruefen();
@@ -6716,29 +8643,38 @@ app.whenReady().then(async () => {
 
   // Sichtbar startet das Fenster nur, wenn ein MENSCH es ausdruecklich
   // verlangt. Kein Automatismus fuehrt hierher.
-  if (zeigen) win.show();
-  else if (zeigenInaktiv) win.showInactive();
+  if (win && zeigen) win.show();
+  else if (win && zeigenInaktiv) win.showInactive();
 
   // Der geführte erste Start (SPEC-V4 3.8): „beim ersten Start, und danach nie
   // wieder von selbst". `baue()` läuft IMMER (auch --headless), damit ein Test
   // ohne einen einzigen echten Klick prüfen kann, ob der Weg überhaupt anläuft
   // (erststartfenster.ts, Klassendoc) -- `zeigeAutomatisch()` zeigt das
   // Fenster nur, wenn auch das Hauptfenster wirklich sichtbar wird (`zeigen`).
-  if (!erststartErledigt(config.settingsFile)) {
+  //
+  // Im Mantelbetrieb NICHT (Auftrag 4.1): die Mac-Fassung fuehrt den ersten
+  // Start als eigenes Blatt (Erststart.swift), und `baue()` liefe hier gegen
+  // die Fenstersperre -- ein geworfener Fehler mitten im Start, fuer ein
+  // Fenster, das niemand haben will.
+  if (!mantelBetrieb && !erststartErledigt(config.settingsFile)) {
     await erststartfenster.zeigeAutomatisch(zeigen);
   }
 
   // Das eine Selbstfoto aus --startfoto: der einzige Weg an ein Bild, wenn es
   // keinen Steuerkanal gibt. Ein Fehler daran haelt den Start nicht auf.
-  if (config.startShot) {
+  // Ohne Fenster gibt es nichts zu fotografieren -- das Bild der Mac-Fassung
+  // macht `awbmac-ctl schuss`.
+  if (win && config.startShot) {
     await captureWindow(win, config.shotDir, config.startShot)
       .catch((e) => process.stderr.write(`startfoto fehlgeschlagen: ${(e as Error).message}\n`));
   }
 
   // Die Bereitschaftszeile nennt beides: dass das Fenster steht, und ob ein
   // Kanal daran haengt. Wer den Kanal braucht, wartet weiter auf 'awb-ready ' --
-  // die zweite Zeile matcht das absichtlich nicht.
-  const groesse = win.getContentSize();
+  // die zweite Zeile matcht das absichtlich nicht. Ohne Fenster steht dort
+  // 0x0: der Kern hat keine Groesse, und `mac/bin/starten` liest nur auf das
+  // Wort 'awb-ready'.
+  const groesse = win ? win.getContentSize() : [0, 0];
   if (kanalFehler) {
     process.stdout.write(`awb-fenster-ohne-kanal ${groesse[0]}x${groesse[1]} ${config.controlSocket}: ${kanalFehler}\n`);
   } else {
