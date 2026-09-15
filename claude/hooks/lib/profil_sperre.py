@@ -13,7 +13,7 @@ das Profil nicht lesen oder die Hausliste gesperrter Programme
 (wb-profil-gesperrt.json neben wb-profil) nicht laden, wird jedes Werkzeug
 verweigert (fail-closed).
 
-Drei Pruefungen:
+Vier Pruefungen:
 
   1. Werkzeug: nur Werkzeuge aus `tools` (MultiEdit zaehlt als Edit).
   2. Bash: jede ausfuehrbare Stufe -- auch in $( ), Backticks, eval,
@@ -41,6 +41,12 @@ Drei Pruefungen:
                   damit wie Weltskills nie beschreibbar.
      Die Kontextgrenze sperrt Pfade, die sie in `...` oder als Pfadwort nennt,
      auch fuer das Lesen.
+  4. Zugaenge der Welt (<WB_WELT>/zugaenge.json, docs/AGENTS-SPERREN.md): nur
+     wenn der Traeger sie im Zug bereitgestellt hat (WB_ZUGAENGE nennt den
+     Ordner, darin je Zugang ein Unterordner). Ihre Muster geben ssh, scp und
+     rsync frei, aber nur ueber den nackten Programmnamen (die Huelle des
+     Zuges), ohne Wrapper, Variablen, Umleitung von PATH oder fremde Optionen;
+     der Zugangsordner selbst ist fuer jeden Zugriff gesperrt.
 
 Die Bash-Zerlegung ist lib/cmdshell.py. Grenzen: siehe hooks/README.md.
 """
@@ -86,7 +92,18 @@ SONDERVARIABLE_RE = re.compile(r'\$\{?[0-9@*#]')
 MIT_I_OPTION = {'sed', 'perl', 'ruby'}
 SYSTEM_PROGRAMME = ('/bin', '/usr/bin', '/usr/sbin', '/sbin', '/usr/local/bin', '/usr/libexec')
 GESCHUETZT_EIGEN = {'agent.json', 'skills.json', 'history.json', 'runtime.json'}
-GESCHUETZT_UEBERALL = {'freigaben.json', 'traeger.json'}
+GESCHUETZT_UEBERALL = {'freigaben.json', 'traeger.json', 'zugaenge.json'}
+ZUGANG_PROGRAMME = {'ssh', 'scp', 'rsync'}
+ZUGANG_NAME_RE = re.compile(r'^[a-z][a-z0-9-]{0,39}$')
+ZUGANG_LIMIT = 256 * 1024
+# Optionen ohne eigenes Argument, die lokal nichts ausfuehren; alles andere (-e, -o, -F, -S, --rsh, ...) ist gesperrt.
+SCP_BUCHSTABEN = set('rpqCv346')
+RSYNC_BUCHSTABEN = set('avzrlptgoDhPcnuqiHmx')
+RSYNC_LANG = {'--archive', '--verbose', '--compress', '--recursive', '--links', '--perms', '--times', '--delete',
+              '--progress', '--partial', '--dry-run', '--checksum', '--update', '--human-readable', '--stats',
+              '--itemize-changes', '--mkpath', '--one-file-system'}
+RSYNC_LANG_WERT = ('--exclude=', '--include=')
+PATH_RE = re.compile(r'(?<![A-Za-z0-9_])PATH(?![A-Za-z0-9_])')
 IFS_RE = re.compile(r'\$\{?IFS')
 # Funktionsdefinition am Anfang einer Anweisung: `f() {`, `f () (` oder `function f`. Gesucht wird im
 # Text ohne Anfuehrungen, damit `echo "curl()"` keine Funktion curl erfindet.
@@ -277,6 +294,8 @@ class Profil:
         self.tmp = verzeichnis('WB_AGENT_TMP')
         self.bibliothek = verzeichnis('WB_SKILL_BIBLIOTHEK')
         self.skriptbibliothek = verzeichnis('WB_SKRIPT_BIBLIOTHEK')
+        self.zugang_ordner = verzeichnis('WB_ZUGAENGE')
+        self.zugaenge = zugaenge_laden(welt, self.zugang_ordner)
         # Skill- und Skriptpfade aus skills.json (skills_umgebung): lesbar und ausfuehrbar, nie beschreibbar.
         self.skillpfade = [os.path.realpath(p) for name in ('WB_SKILL_PFADE', 'WB_SKRIPT_PFADE')
                            for p in (umgebung.get(name) or '').split(os.pathsep) if p and os.path.isabs(p)]
@@ -308,6 +327,9 @@ class Profil:
         ausserhalb der Weltgrenze liegt oder geschuetzt ist."""
         if real in HARMLOSE_ZIELE:
             return
+        if self.zugang_ordner and _unter(real, self.zugang_ordner):
+            raise Verweigert("'%s' liegt im Zugangsordner des Zuges; Schluessel und Konfiguration liest nur ssh selbst"
+                             % roh)
         treffer = self.kontext_trifft(real)
         if treffer:
             raise Verweigert("'%s' liegt in der Kontextgrenze des Profils (%s)" % (roh, treffer))
@@ -330,6 +352,40 @@ class Profil:
         if not any(_unter(real, w) for w in wurzeln):
             raise Verweigert("'%s' liegt ausserhalb der Welt (lesen nur Projekt, Worktree, Weltablage, Skills und "
                              "Skripte aus skills.json, ~/Knowledge und ~/.local/bin)" % roh)
+
+
+def zugaenge_laden(welt, ordner):
+    """Zugaenge der Welt, die der Traeger in diesem Zug bereitgestellt hat: {name: [muster]}.
+
+    Ohne WB_ZUGAENGE, ohne zugaenge.json oder bei unlesbarer Datei keine Freigabe; ein Zugang
+    zaehlt nur, wenn sein Unterordner im Zugangsordner liegt."""
+    if not ordner:
+        return {}
+    pfad = os.path.join(welt, 'zugaenge.json')
+    try:
+        daten = json.loads(_datei_lesen(pfad, ZUGANG_LIMIT).decode('utf-8'))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    eintraege = daten.get('zugaenge') if isinstance(daten, dict) else None
+    result = {}
+    for eintrag in eintraege if isinstance(eintraege, list) else []:
+        if not isinstance(eintrag, dict):
+            continue
+        name = eintrag.get('name')
+        muster = eintrag.get('muster')
+        if not isinstance(name, str) or not ZUGANG_NAME_RE.match(name) or (eintrag.get('art') or 'ssh') != 'ssh':
+            continue
+        if muster is None:
+            muster = ['ssh %s *' % name, 'scp *%s:*' % name, 'rsync *%s:*' % name]
+        if not isinstance(muster, list) or not all(isinstance(m, str) for m in muster):
+            continue
+        unter = os.path.join(ordner, name)
+        if os.path.islink(unter) or not os.path.isdir(unter):
+            continue
+        gueltig, _generisch = muster_aufteilen([m for m in muster if m.split()[:1] and m.split()[0] in ZUGANG_PROGRAMME])
+        if gueltig:
+            result[name] = gueltig
+    return result
 
 
 def programmordner(home):
@@ -542,11 +598,20 @@ class Pruefung:
                 return cwd
         if name == 'xargs':
             innen = cs.xargs_inner(rest) or ['echo']
+            if self.p.zugaenge and os.path.basename(_variablen(innen[0], varmap)) in ZUGANG_PROGRAMME | {'hash'}:
+                raise Verweigert('Zugangsbefehle laufen nicht ueber xargs; ihre Argumente muessen im Befehl stehen')
             if depth >= MAX_DEPTH:
                 raise Verweigert('Kommando zu tief verschachtelt')
             return self.stufe(innen, varmap, cwd, depth + 1, funktionen) or cwd
         if name in BAUSTEINE:
             return cwd  # keine Programme, keine Dateien ausser Umleitungen (oben geprueft)
+        if self.p.zugaenge and name == 'hash':
+            raise Verweigert('hash ist gesperrt, solange Zugaenge bereitstehen')
+        if self.p.zugaenge and name in ZUGANG_PROGRAMME and name not in funktionen:
+            zugang = self.zugang_treffer(text, voll)
+            if zugang is not None:
+                self.zugang(zugang, name, stage, idx, rest, varmap, cwd)
+                return cwd
         if name not in funktionen:
             self.muster(text, voll)
         schreibend = name in MUTIERENDE or (name in MIT_I_OPTION and any(w.startswith('-i') for w in worte))
@@ -557,6 +622,72 @@ class Pruefung:
                 art = 'lesen'
             self.zugriff(wort, varmap, cwd, art)
         return cwd
+
+
+    def zugang_treffer(self, text, voll):
+        for zugang, muster in sorted(self.p.zugaenge.items()):
+            if any(muster_passt(text, m) or muster_passt(voll, m) for m in muster):
+                return zugang
+        return None
+
+    def zugang(self, zugang, name, stage, idx, rest, varmap, cwd):
+        """Ein Befehl ueber einen Zugang: nackter Programmname ohne Vorspann, feste Argumente, kein fremdes Ziel,
+        nur harmlose Optionen; lokale Pfade von scp und rsync pruefen Welt- und Schreibgrenze."""
+        if stage[idx] != name or any(t not in cs.BLOCK_KEYWORDS for t in stage[:idx]):
+            raise Verweigert("'%s' ueber einen Zugang laeuft nur als nacktes '%s ...' ohne Pfad, Wrapper oder "
+                             "Zuweisung davor" % (' '.join(stage), name))
+        for wort in rest:
+            if '$' in wort or '`' in wort:
+                raise Verweigert("'%s' ueber einen Zugang braucht feste Argumente ohne Variablen oder Substitution"
+                                 % ' '.join(stage))
+        worte = list(rest)  # die Zerlegung hat Anfuehrungen schon entfernt
+        if name == 'ssh':
+            if not worte or worte[0] != zugang:
+                raise Verweigert("ssh ueber einen Zugang beginnt mit dem Zugangsnamen: 'ssh %s <befehl>'" % zugang)
+            if len(worte) < 2:
+                raise Verweigert("ssh %s braucht einen Befehl; eine offene Sitzung gibt es nicht" % zugang)
+            if worte[1].startswith('-'):
+                raise Verweigert("ssh %s: nach dem Zugangsnamen folgt der entfernte Befehl, keine ssh-Option" % zugang)
+            # Der entfernte Befehl ist nicht an die Bash-Muster gebunden (der Server ist der freigegebene Bereich),
+            # die Hausliste gilt aber auch dort: jede erkennbare Stufe und jedes gesperrte Textmuster.
+            entfernt = ' '.join(worte[1:])
+            self.hausliste_text(entfernt)
+            for stmt in cs.all_statements(entfernt):
+                for teil in cs.split_pipeline(stmt or []):
+                    programm, i, weiter = cs.resolve_command(teil, {})
+                    if programm is not None and programm not in (cs.SUBSHELL_TOKEN, cs.PROCSUB_TOKEN):
+                        self.hausliste_stufe(teil[i], list(weiter))
+            return
+        positionen = []
+        for wort in worte:
+            if name == 'scp' and wort.startswith('-'):
+                if wort == '-' or not set(wort[1:]) <= SCP_BUCHSTABEN:
+                    raise Verweigert("scp-Option '%s' ist ueber einen Zugang gesperrt (erlaubt: -r -p -q -C -v -3 -4 -6)"
+                                     % wort)
+                continue
+            if name == 'rsync' and wort.startswith('--'):
+                if wort not in RSYNC_LANG and not wort.startswith(RSYNC_LANG_WERT):
+                    raise Verweigert("rsync-Option '%s' ist ueber einen Zugang gesperrt" % wort)
+                continue
+            if name == 'rsync' and wort.startswith('-'):
+                if wort == '-' or not set(wort[1:]) <= RSYNC_BUCHSTABEN:
+                    raise Verweigert("rsync-Option '%s' ist ueber einen Zugang gesperrt (kein -e, keine Shell)" % wort)
+                continue
+            positionen.append(wort)
+        if len(positionen) < 2:
+            raise Verweigert('%s ueber einen Zugang braucht Quelle und Ziel' % name)
+        entfernt = 0
+        for n, wort in enumerate(positionen):
+            kopf, trenner, _ = wort.partition(':')
+            if trenner and '/' not in kopf:
+                if kopf != zugang:
+                    raise Verweigert("'%s' nennt ein anderes Ziel als den Zugang '%s'" % (wort, zugang))
+                entfernt += 1
+                continue
+            art = 'schreiben' if n == len(positionen) - 1 else 'lesen'
+            self.zugriff(wort, varmap, cwd, art, immer=True)
+        if not entfernt:
+            raise Verweigert("%s ueber den Zugang '%s' braucht ein Ziel '%s:<pfad>'" % (name, zugang, zugang))
 
 
 def _unbestimmt(wort, varmap):
@@ -615,6 +746,9 @@ def entscheiden(eingabe):
             if not isinstance(befehl, str) or not befehl.strip():
                 return None
             profil.pfad(cwd, os.path.realpath(cwd), 'lesen')
+            if profil.zugaenge and PATH_RE.search(befehl):
+                return ('Solange Zugaenge bereitstehen, aendert oder nennt kein Befehl PATH -- ssh, scp und rsync '
+                        'laufen nur ueber die Huellen des Zuges')
             pruefung.hausliste_text(befehl)
             pruefung.bash(befehl, cwd)
             return None

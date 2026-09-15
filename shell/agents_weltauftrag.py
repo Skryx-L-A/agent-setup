@@ -17,7 +17,9 @@ Auftraege (Feld ``befehl``):
 
 - ``hallo``: Maschine, Home und Python -- die Erreichbarkeitsprobe.
 - ``lesen``: ``welt``, ``grenze``; die Ansicht (``agents_data.world_snapshot``), die Skills
-  (``agents_skills_ansicht.skills_view``) und der Traeger der Welt (``traeger.json``, laeuft seine Unit).
+  (``agents_skills_ansicht.skills_view``), der Traeger der Welt (``traeger.json``, laeuft seine Unit) und, wenn
+  er eingerichtet ist, unter ``zug`` das Lebenszeichen je Agent aus ``agents_traeger.py status --nur-zug``
+  (``agenten``, oder ``zug_fehler`` mit dem Grund).
 - ``finden``: ``wurzeln``, ``projekte``, ``global`` wie ``wb-welt finden``, Pfade mit ``~``.
 - ``ausfuehren``: ``skript`` (``agents_data.py`` oder ``agents_skills.py``), ``argv`` (Texte oder
   ``{"datei": inhalt}``), ``welt`` und ``wecken``. Nach Exit 0 weckt er den Traeger der Welt
@@ -188,7 +190,33 @@ def lesen(job: dict[str, Any]) -> dict[str, Any]:
         skills = agents_skills_ansicht.skills_view(root)
     except Exception as exc:  # noqa: BLE001 - die Welt bleibt lesbar; der Grund steht bei den Skills
         skills_fehler = str(exc)[:300]
-    return {"ansicht": ansicht, "skills": skills, "skills_fehler": skills_fehler, "traeger": traeger_stand(root)}
+    traeger = traeger_stand(root)
+    raus = {"ansicht": ansicht, "skills": skills, "skills_fehler": skills_fehler, "traeger": traeger}
+    if traeger.get("eingerichtet"):
+        raus["zug"] = zug_stand(root)
+    return raus
+
+
+def zug_stand(world_root: Path) -> dict[str, Any]:
+    """Das Lebenszeichen je Agent aus ``agents_traeger.py status --nur-zug``: ein Aufruf je Lesung, nicht je Agent.
+
+    ``agenten`` je Kennung laeuft/seit/art/zustellung_offen/wartet_seit/grund/naechster_wecker/letzter; scheitert
+    der Aufruf, steht der Grund in ``zug_fehler`` und die Oberflaeche nennt den Traeger nicht erreichbar.
+    Ein eigener Prozess mit Frist: der Status nimmt die Weckersperre, und ein haengender Traeger haelt das Lesen nicht auf.
+    """
+    try:
+        done = subprocess.run([sys.executable, str(HIER / "agents_traeger.py"), "status", "--konfig", str(world_root / KONFIGNAME),
+                               "--nur-zug"], text=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"zug_fehler": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+    try:
+        data = json.loads(done.stdout) if done.returncode == 0 else None
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or not isinstance(data.get("agenten"), dict):
+        zeile = (done.stderr.strip().splitlines() or done.stdout.strip().splitlines() or ["Exit %d" % done.returncode])[-1]
+        return {"zug_fehler": zeile[:300]}
+    return {"agenten": data["agenten"]}
 
 
 def finden(job: dict[str, Any]) -> dict[str, Any]:

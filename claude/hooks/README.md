@@ -792,6 +792,16 @@ auf. Ein Schreibziel oder Programm aus einer Variablen, die erst zur Laufzeit
 feststeht (Schleifenvariable, `read`, `$1`), und ein Ziel mit
 Kommandosubstitution werden verweigert.
 
+**Zugänge der Welt (15.09.2026).** Liegt in der Weltablage `zugaenge.json`
+und hat der Träger die Zugänge im Zug bereitgestellt (`WB_ZUGAENGE` nennt den
+Zugangsordner mit `<name>/` und den Hüllen `ssh`, `scp`, `rsync`), erlaubt die
+Sperre `ssh <name> <befehl>`, `scp` und `rsync` mit diesem Namen als Ziel —
+nur als nacktes Programm, ohne Option hinter dem Namen, ohne Wrapper, `PATH`
+oder `hash`; der entfernte Befehl geht durch die Hausliste. Der Zugangsordner
+ist für Read, Grep, Glob und Bash-Pfade gesperrt, `zugaenge.json` für jedes
+Schreiben. Ohne Bereitstellung gibt eine Welt mit Zugängen nichts frei
+(`docs/AGENTS-SPERREN.md`, Abschnitt „Zugänge der Welt").
+
 **Prüfkette.** Die Profil-Sperre steht in der `PRUEFKETTE` der
 Skills-Sperre. Der Inhalt eines Skill-Skripts wird damit auch gegen
 Werkzeugliste, Muster, Hausliste und Weltgrenze geprüft

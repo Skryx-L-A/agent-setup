@@ -1662,7 +1662,7 @@ _STAGE_WORDS = {"hauptagent": "Hauptagent", "teamleiter": "Teamleiter", "mitglie
 INSTRUCTIONS_LIMITS_MARK = "<!-- wb-agent: verbindliche Grenzen aus dem Profil -->"
 
 
-def _limits_lines(draft: dict[str, Any]) -> list[str]:
+def _limits_lines(draft: dict[str, Any], zugaenge: Iterable[str] = ()) -> list[str]:
     tools = ", ".join(t for t in draft["tools"] if t != "Bash")
     lines = ["- Werkzeuge: %s." % (tools or "keine außer Bash")]
     if draft["bash"]:
@@ -1670,16 +1670,41 @@ def _limits_lines(draft: dict[str, Any]) -> list[str]:
     lines.append("- Skills: %s." % (", ".join(draft["skills"]) if draft["skills"] else "keine vorgeladenen"))
     if draft.get("context_limit"):
         lines.append("- Was du nicht erfährst und nicht erfragst: %s" % draft["context_limit"])
-    lines += ["- Kein Eingriff außerhalb der Welt. Freigaben, Regeln und Profile erweiterst du nicht.",
+    # Zugaenge der Welt (zugaenge.json) sind die einzige Tuer nach draussen; die Anweisung nennt nur Name und Aufruf.
+    zugaenge = list(zugaenge)
+    if zugaenge:
+        lines.append("- Zugänge: %s." % ", ".join("%s (ssh) – `ssh %s <befehl>`" % (name, name) for name in zugaenge))
+    lines += ["- Kein Eingriff außerhalb der Welt%s. Freigaben, Regeln und Profile erweiterst du nicht." % (
+                  " außer über die Zugänge" if zugaenge else ""),
               "- Deploy, Veröffentlichung, E-Mail und Ausgaben nur mit bestehender Freigabe (`wb-freigabe pruefen`).",
               "- Die Regeln für Agenten stehen in `regeln/agenten.md`."]
     return lines
 
 
-def _with_profile_limits(text: str, draft: dict[str, Any]) -> str:
+def _with_profile_limits(text: str, draft: dict[str, Any], zugaenge: Iterable[str] = ()) -> str:
     """An own instruction file (menu, model proposal) ends with the limits of the profile, rewritten each time."""
     head = text.split(INSTRUCTIONS_LIMITS_MARK)[0].rstrip()
-    return "%s\n\n%s\n## Verbindliche Grenzen aus dem Profil\n\n%s\n" % (head, INSTRUCTIONS_LIMITS_MARK, "\n".join(_limits_lines(draft)))
+    return "%s\n\n%s\n## Verbindliche Grenzen aus dem Profil\n\n%s\n" % (
+        head, INSTRUCTIONS_LIMITS_MARK, "\n".join(_limits_lines(draft, zugaenge)))
+
+
+def world_access_names(root: Path) -> list[str]:
+    """Names of the world's accesses (zugaenge.json) for instructions; an unreadable file names none."""
+    return [item["name"] for item in _snapshot_zugaenge(root)]
+
+
+def _snapshot_zugaenge(root: Path) -> list[dict[str, str]]:
+    """Name and kind of each access in zugaenge.json -- never target or key path."""
+    path = root / "zugaenge.json"
+    if path.is_symlink():
+        raise AgentsError("zugaenge.json darf kein Symlink sein")
+    if not path.exists():
+        return []
+    data = _read_json(path)
+    if not isinstance(data, dict) or not isinstance(data.get("zugaenge"), list):
+        raise AgentsError("zugaenge.json hat eine unbekannte Form")
+    return [{"name": str(item.get("name")), "art": str(item.get("art") or "ssh")}
+            for item in data["zugaenge"] if isinstance(item, dict) and isinstance(item.get("name"), str)]
 
 
 def render_agent_instructions(root: Path, draft: dict[str, Any]) -> str:
@@ -1714,7 +1739,11 @@ def render_agent_instructions(root: Path, draft: dict[str, Any]) -> str:
         lines += ["- Du verteilst Tickets, nimmst ab, führst zusammen und legst Agenten an.",
                   "- Den Menschen fragst du nur in den Fällen aus `regeln/agenten.md`; alles andere entscheidest du und schreibst es ins Ticket."]
     # The limits close the file behind the mark, exactly as for an own instruction file.
-    return _with_profile_limits("\n".join(line.rstrip() for line in lines), draft)
+    try:
+        zugaenge = world_access_names(root)
+    except AgentsError:
+        zugaenge = []
+    return _with_profile_limits("\n".join(line.rstrip() for line in lines), draft, zugaenge)
 
 
 def preview_agent_draft(root: Path, draft: dict[str, Any]) -> dict[str, Any]:
@@ -2116,10 +2145,11 @@ def world_snapshot(root: Path, limit: int = SNAPSHOT_LIMIT, text_limit: int = SN
         chats = section("direct_chats", lambda: _snapshot_direct_chats(root, limit), [])
         questions = section("questions", lambda: _snapshot_questions(root), [])
         humans = section("humans", lambda: _snapshot_humans(root, limit), {})
+        zugaenge = section("zugaenge", lambda: _snapshot_zugaenge(root), [])
     return {"schema_version": SCHEMA_VERSION, "path": str(root), "consistent": consistent,
             "read_at": now(), "world": world, "agents": agents, "tickets": tickets,
             "channel": channel[-limit:], "channel_total": len(channel),
-            "direct_chats": chats, "questions": questions, "humans": humans, "errors": errors}
+            "direct_chats": chats, "questions": questions, "humans": humans, "zugaenge": zugaenge, "errors": errors}
 
 
 def find_worlds(roots: Iterable[str] = (), projects: Iterable[str] = (),
@@ -2277,6 +2307,12 @@ def parser_for(kind: str) -> argparse.ArgumentParser:
         p = sub.add_parser("gelesen"); p.add_argument("world"); p.add_argument("--gespraech", required=True); p.add_argument("--zeit", required=True); p.add_argument("--nachricht", required=True); p.add_argument("--mensch", default=WORLD_HUMAN); p.add_argument("--absender", default=WORLD_HUMAN); p.add_argument("--rolle"); p.add_argument("--json", action="store_true")
         for name, state in (("liste", None), ("zeigen", None), ("pause", "pausiert"), ("start", "läuft"), ("stop", "gestoppt")):
             p = sub.add_parser(name); p.add_argument("world"); p.add_argument("--grund"); p.add_argument("--absender", default="cli-operator"); p.add_argument("--rolle"); p.add_argument("--json", action="store_true")
+        try:
+            import agents_zugaenge
+        except ImportError:  # the RPC copy in a turn carries no access module
+            agents_zugaenge = None
+        if agents_zugaenge is not None:
+            agents_zugaenge.parser_ergaenzen(sub)
         return parser
     if kind == "agent":
         p = sub.add_parser("neu"); p.add_argument("world"); p.add_argument("--name", required=True); p.add_argument("--stufe", required=True, choices=STAGES); p.add_argument("--team"); p.add_argument("--beschreibung", required=True); p.add_argument("--figur"); p.add_argument("--werkzeug", action="append", default=[]); p.add_argument("--skill", action="append", default=[]); p.add_argument("--modell"); p.add_argument("--denkweise"); p.add_argument("--fallback"); p.add_argument("--fallback-denkweise"); p.add_argument("--maschine", default="lokal"); p.add_argument("--absender", default="cli-operator"); p.add_argument("--rolle"); p.add_argument("--json", action="store_true")
@@ -2343,6 +2379,12 @@ def run(kind: str, argv: list[str]) -> int:
             elif args.command == "neu": data = create_world(Path(args.world), args.name, args.hauptagent, args.beschreibung, args.modell, args.denkweise, args.fallback, args.fallback_denkweise, args.maschine, args.global_world, not args.without_main); _json_or_text(args, data, data["world"]["id"])
             elif args.command == "liste": _json_or_text(args, [read_world(Path(args.world))] if (Path(args.world) / "world.json").exists() else [])
             elif args.command == "zeigen": _json_or_text(args, read_world(Path(args.world)))
+            elif args.command == "zugang":
+                import agents_zugaenge
+                data = agents_zugaenge.cli(args)
+                if args.json or args.aktion != "liste": _json_or_text(args, data, data.get("name", "") if isinstance(data, dict) else "")
+                else:
+                    for entry in data: print("%s (%s) -> %s" % (entry["name"], entry["art"], entry["ziel"]))
             else: _json_or_text(args, set_world_state(Path(args.world), {"pause": "pausiert", "start": "läuft", "stop": "gestoppt"}[args.command], args.grund, args.absender, args.rolle))
         elif kind == "agent":
             if args.command == "neu": data = create_agent(Path(args.world), args.name, args.stufe, args.team, args.beschreibung, args.figur, args.werkzeug, args.modell, args.denkweise, args.fallback, args.fallback_denkweise, args.maschine, args.absender, args.rolle, args.skill); _json_or_text(args, data, data["id"])
@@ -2676,6 +2718,8 @@ def deliver_to_session_inbox(root: Path, ticket: dict[str, Any] | str,
 
 if __name__ == "__main__":
     # Internal entry point: agents_data.py <welt|agent|ticket|kanal> ...
+    # Modules imported from here (agents_zugaenge) see this module, not a second copy with its own AgentsError.
+    sys.modules.setdefault("agents_data", sys.modules[__name__])
     if len(sys.argv) < 2 or sys.argv[1] not in {"welt", "agent", "ticket", "kanal"}:
         print("agents_data: interner Einstiegspunkt", file=sys.stderr)
         raise SystemExit(2)

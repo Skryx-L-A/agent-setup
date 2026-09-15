@@ -56,3 +56,9 @@ gelten in der Auswahl, die die Stufe braucht; bei Widerspruch gilt diese Datei f
 - `MEMORY.md` bleibt kurz: Lehren, keine Erzählungen; Altes zusammenfassen statt anhängen.
   Skills werden nach Bedarf geladen, nicht auf Vorrat. Die Tokenzahl je Ticketart ist ein
   Maß; ein Skill, der sie senkt, ist ein Beleg.
+
+## Zugänge (der Nutzer, 15.09.2026)
+
+- Zugänge einer Welt (`zugaenge.json`, `wb-welt zugang … --bestaetigt`) sind die einzige Tür
+  nach draußen: Netz und ein `ssh <name>`-Weg für alle Agenten der Welt. Der Mensch richtet sie
+  je Welt ein; ein Agent erweitert sie nie, liest keinen Schlüssel und nennt kein anderes Ziel.

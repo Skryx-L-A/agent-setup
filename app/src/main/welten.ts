@@ -61,10 +61,20 @@
 // shell/agents_weltauftrag.py). Nach jedem Schreiben, das eine Zustellung erzeugt, weckt der Kern den
 // Traeger der Welt, fern wie lokal, wenn sie eine `traeger.json` hat.
 //
-// WAS DIE DATEN NICHT HERGEBEN, steht nicht da. „Arbeitet" heisst: ein Ticket
-// dieses Agenten steht auf „läuft"; ob gerade ein Prozess laeuft, weiss erst der
-// Traeger. Eine Weckzeit, „schläft seit" und das Zugprotokoll mit
-// Werkzeugaufrufen gibt es in den Weltdateien noch nicht.
+// WAS DIE DATEN NICHT HERGEBEN, steht nicht da. Ohne Traeger heisst „arbeitet": ein
+// Ticket dieses Agenten steht auf „läuft". Das Zugprotokoll mit Werkzeugaufrufen gibt
+// es in den Weltdateien noch nicht.
+//
+// DAS LEBENSZEICHEN (Auftrag agentaktiv, 15.09.2026). Hat die Welt einen Traeger
+// (`traeger.json`), liest jede Lesung einmal `agents_traeger.py status --nur-zug` -- fern
+// ueber `agents_weltauftrag.py lesen`, lokal direkt -- und traegt je Agent `zug` (laeuft,
+// seit, Art, offene Zustellung, Grund, naechster Wecker, letzter Zug), `leben` (arbeitet,
+// wartet, schlaeft, nicht erreichbar) und `antwort` (der Stand unter der eigenen, noch
+// unbeantworteten Nachricht im Einzelchat) in die Nutzlast. Mit Traeger heisst „arbeitet"
+// dann: ein Zug laeuft. Ohne Traeger bleiben alle drei null. Die 30 Sekunden bis „Träger
+// hat den Zug nicht gestartet" und die laufende Uhr „arbeitet seit 0:12" rechnen die
+// Oberflaechen selbst; der Kern liefert dafuer nur Zeiten, damit die Nutzlast nicht jede
+// Sekunde anders aussieht.
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
@@ -140,6 +150,8 @@ export interface RohAnsicht {
   agents?: RohAgent[]; tickets?: RohTicket[]; channel?: RohNachricht[]; channel_total?: number;
   direct_chats?: { id: string; participants?: string[]; messages?: RohNachricht[]; total?: number }[];
   questions?: RohFrage[]; humans?: Record<string, RohMensch>; errors?: { section?: string; text?: string }[];
+  /** Zugaenge der Welt (`zugaenge.json`): nur Name und Art, nie Ziel oder Schluesselpfad. */
+  zugaenge?: { name?: string; art?: string }[];
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +200,31 @@ export interface WeltAgent {
   anweisungen: { text: string; gekuerzt: boolean };
   verlauf: unknown[];
   tickets: string[]; direktchats: string[]; einzelchat: ChatEintrag[];
+  /** Auftrag agentaktiv: der Zug laut Traeger; null ohne Traeger oder wenn er nicht lesbar war. */
+  zug: WeltZug | null;
+  /** Das Lebenszeichen am Avatar; null ohne Traeger. */
+  leben: WeltLeben | null;
+  /** Der Stand unter der eigenen, noch unbeantworteten Nachricht im Einzelchat; null ohne Traeger oder ohne offene Nachricht. */
+  antwort: WeltAntwortStand | null;
+}
+/** Je Agent aus `agents_traeger.py status --nur-zug` (shell/agents_traeger.py, `zug_stand`). */
+export interface WeltZug {
+  laeuft: boolean; seit: string | null; art: 'nachricht' | 'ticket' | 'frage' | 'recovery' | null;
+  zustellung_offen: boolean; wartet_seit: string | null;
+  /** Warum eine offene Zustellung keinen Zug hat: kontingent, anmeldung, recovery_limit, pausiert, gestoppt, ungeklaert, ein Urteil. */
+  grund: string | null;
+  naechster_wecker: string | null;
+  letzter: { ende: string | null; ergebnis: string; art: string | null } | null;
+}
+export type LebenStand = 'arbeitet' | 'wartet' | 'schlaeft' | 'nicht_erreichbar';
+export interface WeltLeben { stand: LebenStand; seit: string | null; grund: string | null; wecker: string | null }
+/**
+ * Unter der eigenen Nachricht: `zugestellt` (die Oberflaeche macht daraus nach 30 Sekunden „nicht gestartet"),
+ * `arbeitet`, `beendet` (ein Zug endete ohne Antwort) oder `nicht_erreichbar`. `wecken`: was das Wecken nach dem
+ * Senden aus diesem Kern ergab (`gestartet`, `laeuft`, `fehler`), leer, wenn der Kern es nicht weiss.
+ */
+export interface WeltAntwortStand {
+  nachricht: string; zeit: string; stand: 'zugestellt' | 'arbeitet' | 'beendet' | 'nicht_erreichbar'; grund: string | null; wecken: string;
 }
 export interface WeltTeam { name: string; leiter: string | null; mitglieder: string[]; aktiv: number }
 export interface WeltSkill {
@@ -235,8 +272,13 @@ export interface Welt {
   ablage: string;
   /** Die Verbindung zur Maschine der Welt; lokal immer ok. `seit`: seit wann sie nicht erreichbar ist. */
   verbindung: { ok: boolean; seit: string | null; text: string };
-  /** `traeger.json` in der Ablage; `laeuft` null, wo es sich nicht feststellen laesst; `moeglich`: dort kann ein Traeger laufen. */
-  traeger: { eingerichtet: boolean; laeuft: boolean | null; moeglich: boolean };
+  /** Zugaenge nach draussen, die der Mensch fuer die Welt eingerichtet hat (nur Anzeige). */
+  zugaenge: { name: string; art: string }[];
+  /**
+   * `traeger.json` in der Ablage; `laeuft` null, wo es sich nicht feststellen laesst; `moeglich`: dort kann ein Traeger laufen;
+   * `zug_fehler`: warum das Lebenszeichen nicht lesbar war (Auftrag agentaktiv), sonst leer.
+   */
+  traeger: { eingerichtet: boolean; laeuft: boolean | null; moeglich: boolean; zug_fehler: string };
 }
 /** Eine Maschine fuer Anlegen, Umzug und Fusszeile. */
 export interface WeltMaschine {
@@ -272,6 +314,8 @@ export interface WeltenOptionen {
   python: string;
   /** Pfad zu `agents_data.py`; leer = nicht gefunden (steht dann in `fehler`). */
   daten: string;
+  /** `agents_traeger.py` fuer das Lebenszeichen einer lokalen Welt mit `traeger.json` (AWB_AGENTS_TRAEGER, sonst neben `daten`). */
+  traeger: string;
   wurzeln: string[];
   global: string;
   fristMs: number;
@@ -308,6 +352,7 @@ export function weltenOptionenAusUmgebung(env: NodeJS.ProcessEnv, home: string, 
   return {
     python: env.AWB_PYTHON ?? 'python3',
     daten,
+    traeger: env.AWB_AGENTS_TRAEGER ?? (daten ? join(dirname(daten), 'agents_traeger.py') : ''),
     wurzeln: (env.AWB_WELTEN_WURZELN ?? join(home, 'AI')).split(':').filter(Boolean),
     global: env.AWB_WELTEN_GLOBAL ?? join(home, '.claude', 'workbench', 'agents'),
     fristMs: Number(env.AWB_WELTEN_FRIST_MS ?? 8000),
@@ -607,6 +652,7 @@ export function weltAus(roh: RohAnsicht, fund: RohFund, grenze = 500): Welt {
       tickets: rohTickets.filter((t) => t.assignee === a.id || (t.recipients ?? []).includes(a.id) || (!!t.team && t.team === a.team && !t.assignee)).map((t) => t.id),
       direktchats: direktchats.filter((c) => c.teilnehmer.includes(a.id) && c.teilnehmer.some((t) => t !== a.id && agentIds.has(t))).map((c) => c.id),
       einzelchat: [],
+      zug: null, leben: null, antwort: null,
     };
   });
   for (const a of agenten) a.einzelchat = einzelchat(a.id, agentIds, kanal, direktchats, fragen).slice(-grenze);
@@ -635,6 +681,7 @@ export function weltAus(roh: RohAnsicht, fund: RohFund, grenze = 500): Welt {
     teams, ohne_team: ohneTeam, liste: listeOrdnen(agenten),
     agenten, tickets, kanal, kanal_gesamt: roh.channel_total ?? kanal.length, direktchats, fragen, antraege,
     skill_verlauf: [], skills_fehler: '',
+    zugaenge: (roh.zugaenge ?? []).filter((x) => s(x.name)).map((x) => ({ name: s(x.name), art: s(x.art) || 'ssh' })),
     mensch: { postfach_offen: rohMensch.postbox?.open ?? offen.size, markiert_offen: markiertOffen, gelesen },
     ungelesen,
     ...ORT_LOKAL(roh.path || fund.path),
@@ -648,6 +695,7 @@ export function weltMitFehler(fund: RohFund, text: string): Welt {
     id: fund.id ?? fund.path, name: fund.name ?? basename(fund.project ?? fund.path), stand: fund.state ?? '', stand_seit: '', stand_grund: null,
     konsistent: false, gelesen: '', fehler: [text], zaehler: { brauchen_dich: 0, laufen: 0, tickets_offen: 0 },
     hauptagent: null, teams: [], ohne_team: [], liste: [], agenten: [], tickets: [], kanal: [], kanal_gesamt: 0, direktchats: [], fragen: [], antraege: [], skill_verlauf: [], skills_fehler: '',
+    zugaenge: [],
     mensch: { postfach_offen: 0, markiert_offen: [], gelesen: {} }, ungelesen: {},
     ...ORT_LOKAL(fund.path),
   };
@@ -655,7 +703,100 @@ export function weltMitFehler(fund: RohFund, text: string): Welt {
 
 /** Der Ort einer Welt, bis `lesen` ihn kennt: lokal, ohne Traeger. */
 function ORT_LOKAL(ablage: string): Pick<Welt, 'maschine' | 'fern' | 'ablage' | 'verbindung' | 'traeger'> {
-  return { maschine: '', fern: false, ablage, verbindung: { ok: true, seit: null, text: '' }, traeger: { eingerichtet: false, laeuft: null, moeglich: false } };
+  return { maschine: '', fern: false, ablage, verbindung: { ok: true, seit: null, text: '' }, traeger: { eingerichtet: false, laeuft: null, moeglich: false, zug_fehler: '' } };
+}
+
+// ---------------------------------------------------------------------------
+// Das Lebenszeichen (Auftrag agentaktiv) -- reine Ableitungen, die Kern-Suite prueft sie ohne Prozess.
+// ---------------------------------------------------------------------------
+
+const ZUG_ARTEN = new Set(['nachricht', 'ticket', 'frage', 'recovery']);
+const optIso = (v: unknown): string | null => (typeof v === 'string' && v ? v : null);
+
+/** Ein Eintrag aus `agenten` von `status --nur-zug`; alles andere heisst: kein Zug lesbar. */
+export function zugAus(roh: unknown): WeltZug | null {
+  if (!roh || typeof roh !== 'object' || typeof (roh as { laeuft?: unknown }).laeuft !== 'boolean') return null;
+  const r = roh as Record<string, unknown>;
+  const l = r.letzter && typeof r.letzter === 'object' ? r.letzter as Record<string, unknown> : null;
+  return {
+    laeuft: r.laeuft === true, seit: optIso(r.seit), art: ZUG_ARTEN.has(s(r.art)) ? s(r.art) as WeltZug['art'] : null,
+    zustellung_offen: r.zustellung_offen === true, wartet_seit: optIso(r.wartet_seit), grund: optIso(r.grund),
+    naechster_wecker: optIso(r.naechster_wecker),
+    letzter: l && typeof l.ergebnis === 'string' ? { ende: optIso(l.ende), ergebnis: l.ergebnis, art: optIso(l.art) } : null,
+  };
+}
+
+/** Das Lebenszeichen am Avatar: arbeitet (ein Zug laeuft), wartet (Zustellung ohne Zug), schlaeft, nicht erreichbar. */
+export function lebenAus(zug: WeltZug | null, erreichbar: boolean): WeltLeben {
+  if (!erreichbar || !zug) return { stand: 'nicht_erreichbar', seit: null, grund: null, wecker: null };
+  if (zug.laeuft) return { stand: 'arbeitet', seit: zug.seit, grund: null, wecker: null };
+  if (zug.zustellung_offen) return { stand: 'wartet', seit: zug.wartet_seit, grund: zug.grund, wecker: zug.naechster_wecker };
+  return { stand: 'schlaeft', seit: null, grund: null, wecker: zug.naechster_wecker };
+}
+
+const zeitWert = (iso: string | null): number => (iso ? Date.parse(iso) || 0 : 0);
+
+/**
+ * Der Stand unter der eigenen Nachricht: die juengste Nachricht eines Menschen im Einzelchat, nach der der
+ * Agent weder geschrieben noch gefragt hat. Ohne Traeger oder ohne solche Nachricht null.
+ */
+export function antwortStand(a: WeltAgent, leben: WeltLeben | null, traegerLaeuft: boolean | null, wecken = ''): WeltAntwortStand | null {
+  if (!leben) return null;
+  let i = a.einzelchat.length - 1;
+  while (i >= 0 && !a.einzelchat[i].nachricht?.von_mensch) {
+    const e = a.einzelchat[i];
+    if (e.art === 'frage' || (e.nachricht && e.nachricht.von === a.id)) return null;
+    i--;
+  }
+  const m = i >= 0 ? a.einzelchat[i].nachricht : null;
+  if (!m) return null;
+  const zug = a.zug;
+  let stand: WeltAntwortStand['stand'] = 'zugestellt';
+  let grund: string | null = null;
+  if (leben.stand === 'nicht_erreichbar') stand = 'nicht_erreichbar';
+  else if (zug?.laeuft) stand = 'arbeitet';
+  else if (zug && !zug.zustellung_offen && zug.letzter && zeitWert(zug.letzter.ende) >= zeitWert(m.zeit)) {
+    stand = 'beendet';
+    grund = zug.letzter.ergebnis;
+  } else {
+    grund = zug?.grund ?? (traegerLaeuft === false ? 'traeger_aus' : null);
+  }
+  return { nachricht: m.id, zeit: m.zeit, stand, grund, wecken };
+}
+
+/**
+ * Das Lebenszeichen in eine gelesene Welt einsetzen. Mit Traeger heisst „arbeitet" dann: ein Zug laeuft --
+ * ein Ticket auf „läuft" ohne Zug schlaeft, ein Zug ohne laufendes Ticket arbeitet (eine Nachricht); braucht
+ * dich, Pause und Stopp bleiben. Zaehler, Liste und Teams folgen dem neuen Zustand.
+ */
+export function zugEinsetzen(w: Welt, roh: Record<string, unknown> | null | undefined, geweckt: Record<string, string> = {}): Welt {
+  if (!w.traeger.eingerichtet) return w;
+  const erreichbar = w.verbindung.ok && !!roh;
+  const titel = (id: string | null): string => `„${w.tickets.find((t) => t.id === id)?.titel ?? id}“`;
+  const agenten = w.agenten.map((a): WeltAgent => {
+    const zug = roh ? zugAus(roh[a.id]) : null;
+    // Ein Agent, den der Status (noch) nicht nennt -- eben angelegt --, hat kein Lebenszeichen; nicht erreichbar
+    // heisst nur: der Status selbst fehlt oder die Maschine antwortet nicht.
+    const leben = erreichbar && !zug ? null : lebenAus(zug, erreichbar);
+    let { zustand, zustand_text: text, ticket } = a;
+    if (zug?.laeuft && !['braucht_dich', 'pausiert', 'gestoppt', 'archiviert'].includes(zustand)) {
+      const laufend = w.tickets.find((t) => t.stand === 'läuft' && t.bearbeiter === a.id);
+      zustand = 'arbeitet';
+      text = zug.art === 'ticket' && laufend ? `arbeitet an ${titel(laufend.id)}` : 'arbeitet';
+      if (laufend) ticket = laufend.id;
+    } else if (zug && !zug.laeuft && zustand === 'arbeitet') {
+      zustand = 'schlaeft';
+      text = `schläft, ${titel(a.ticket)} läuft`;
+    }
+    const neu: WeltAgent = { ...a, zug, leben, zustand, zustand_text: text, figur_zustand: FIGUR_ZUSTAND[zustand], ticket, antwort: null };
+    neu.antwort = antwortStand(neu, leben, w.traeger.laeuft, geweckt[a.id] ?? '');
+    return neu;
+  });
+  const { teams, ohneTeam } = teamsBilden(agenten);
+  return {
+    ...w, agenten, teams, ohne_team: ohneTeam, liste: listeOrdnen(agenten),
+    zaehler: { ...w.zaehler, laufen: agenten.filter((a) => a.zustand === 'arbeitet').length },
+  };
 }
 
 /** Die Kennung einer Welt in Nutzlast und Handlungen: der Pfad, bei einer Fernwelt `<maschine>:<pfad>`. */
@@ -672,6 +813,12 @@ export function weckSatz(r: { wecken?: unknown; wecken_fehler?: unknown }): stri
   if (r.wecken === 'gestartet') return ' Träger geweckt.';
   if (r.wecken === 'laeuft') return ' Träger läuft schon.';
   return '';
+}
+
+/** Dieselbe Antwort als Wort fuer den Stand unter der Nachricht: `gestartet`, `laeuft`, `fehler` oder leer. */
+export function weckWort(r: { wecken?: unknown; wecken_fehler?: unknown }): string {
+  if (typeof r.wecken_fehler === 'string' && r.wecken_fehler) return 'fehler';
+  return r.wecken === 'gestartet' || r.wecken === 'laeuft' ? r.wecken : '';
 }
 
 /** Adressen der Eingabe in Kennungen: `alle`, `team:<name>` (Leiter und Mitglieder) oder ein Agent. */
@@ -742,7 +889,12 @@ function jsonAus<T>(l: Lauf): T | null {
 interface Gemerkt { welt: Welt; gelesen: number; schmutzig: boolean }
 
 /** `agents_weltauftrag.py lesen`: Ansicht, Skills und Traeger einer Fernwelt in einem Aufruf. */
-interface RohLesen { ansicht: RohAnsicht; skills: RohSkillAnsicht | null; skills_fehler?: string; traeger?: { eingerichtet?: boolean; laeuft?: boolean | null } }
+interface RohLesen {
+  ansicht: RohAnsicht; skills: RohSkillAnsicht | null; skills_fehler?: string;
+  traeger?: { eingerichtet?: boolean; laeuft?: boolean | null };
+  /** Auftrag agentaktiv: das Lebenszeichen je Agent, nur mit eingerichtetem Traeger. */
+  zug?: { agenten?: Record<string, unknown>; zug_fehler?: string };
+}
 interface RohAnlegen { pfad: string; projekt: string | null; name: string; vorhanden: boolean; traeger?: { eingerichtet?: boolean; fehler?: string } }
 
 export class WeltenQuelle {
@@ -770,6 +922,12 @@ export class WeltenQuelle {
   private gewaehlt = '';
   /** Welten, die gerade umziehen: an sie geht keine andere Handlung. */
   private umzug = new Set<string>();
+  /** Auftrag agentaktiv: was das Wecken nach dem letzten Senden an einen Agenten ergab, je Welt und Agent. */
+  private weckStand = new Map<string, Record<string, string>>();
+
+  private geweckt(pfad: string): Record<string, string> {
+    return this.weckStand.get(pfad) ?? {};
+  }
 
   constructor(private readonly opt: WeltenOptionen, private readonly lauf: Laeufer, private readonly geaendert: () => void) {
     this.fern = new FernWeg(opt.fern);
@@ -932,20 +1090,28 @@ export class WeltenQuelle {
     const alt = this.gemerkt.get(fund.path);
     if (alt) alt.schmutzig = false;
     const skillSkript = join(dirname(this.opt.daten), 'agents_skills_ansicht.py');
-    const [l, sl] = await Promise.all([
+    // Auftrag agentaktiv: mit `traeger.json` ein dritter Aufruf, das Lebenszeichen je Agent.
+    const konfig = join(fund.path, 'traeger.json');
+    const mitTraeger = existsSync(konfig);
+    const [l, sl, zl] = await Promise.all([
       this.daten(['welt', 'ansicht', fund.path, `--grenze=${this.opt.grenze}`, '--json']),
       existsSync(skillSkript)
         ? this.lauf(this.opt.python, [skillSkript, fund.path, '--json'], this.opt.fristMs)
         : Promise.resolve<Lauf>({ code: null, out: '', err: '', fehler: `agents_skills_ansicht.py fehlt neben ${this.opt.daten}` }),
+      mitTraeger && this.opt.traeger
+        ? this.lauf(this.opt.python, [this.opt.traeger, 'status', '--konfig', konfig, '--nur-zug'], this.opt.fristMs)
+        : Promise.resolve<Lauf | null>(null),
     ]);
     const roh = l.code === 0 ? jsonAus<RohAnsicht>(l) : null;
     const rohSkills = sl.code === 0 ? jsonAus<RohSkillAnsicht>(sl) : null;
     const gelesen = roh ? weltAus(roh, fund, this.opt.grenze) : weltMitFehler(fund, `wb-welt ansicht: ${kurz(l)}`);
-    const welt: Welt = {
+    const rohZug = zl && zl.code === 0 ? jsonAus<{ agenten?: Record<string, unknown> }>(zl)?.agenten ?? null : null;
+    const zugFehler = !mitTraeger || rohZug ? '' : zl ? `agents_traeger.py status: ${kurz(zl)}` : 'agents_traeger.py nicht gefunden';
+    const welt: Welt = zugEinsetzen({
       ...(roh ? skillsEinsetzen(gelesen, rohSkills, rohSkills ? '' : `Skills: ${kurz(sl)}`) : gelesen),
       maschine: this.eigene, fern: false, ablage: fund.path,
-      traeger: { eingerichtet: existsSync(join(fund.path, 'traeger.json')), laeuft: null, moeglich: this.traegerMoeglich(this.eigene) },
-    };
+      traeger: { eingerichtet: mitTraeger, laeuft: null, moeglich: this.traegerMoeglich(this.eigene), zug_fehler: zugFehler },
+    }, rohZug, this.geweckt(fund.path));
     const jetzt = this.gemerkt.get(fund.path);
     this.gemerkt.set(fund.path, { welt, gelesen: Date.now(), schmutzig: jetzt?.schmutzig ?? false });
   }
@@ -986,17 +1152,20 @@ export class WeltenQuelle {
     if (alt) alt.schmutzig = false;
     const r = await this.fern.auftrag<RohLesen>(m.name, m.ssh, { befehl: 'lesen', welt: fund.path, grenze: this.opt.grenze });
     const stand = this.fern.maschinenStand(m.name);
-    const ort = (w: Welt, traeger?: RohLesen['traeger']): Welt => ({
+    const ort = (w: Welt, traeger?: RohLesen['traeger'], zug?: RohLesen['zug']): Welt => zugEinsetzen({
       ...w, pfad: schluessel, maschine: m.name, fern: true, ablage: fund.path,
       verbindung: r.ok || r.verbindung ? { ok: true, seit: null, text: '' } : { ok: false, seit: stand.seit, text: r.text },
       traeger: traeger
-        ? { eingerichtet: traeger.eingerichtet === true, laeuft: typeof traeger.laeuft === 'boolean' ? traeger.laeuft : null, moeglich: this.traegerMoeglich(m.name) }
-        : alt?.welt.traeger ?? { eingerichtet: false, laeuft: null, moeglich: this.traegerMoeglich(m.name) },
-    });
+        ? {
+          eingerichtet: traeger.eingerichtet === true, laeuft: typeof traeger.laeuft === 'boolean' ? traeger.laeuft : null, moeglich: this.traegerMoeglich(m.name),
+          zug_fehler: zug?.agenten ? '' : s(zug?.zug_fehler) || (traeger.eingerichtet ? 'agents_weltauftrag.py lieferte kein Lebenszeichen (Laufzeit dort aktuell?)' : ''),
+        }
+        : alt?.welt.traeger ?? { eingerichtet: false, laeuft: null, moeglich: this.traegerMoeglich(m.name), zug_fehler: '' },
+    }, zug?.agenten ?? null, this.geweckt(schluessel));
     let welt: Welt;
     if (r.ok && r.daten?.ansicht) {
       const gelesen = weltAus(r.daten.ansicht, fund, this.opt.grenze);
-      welt = ort(skillsEinsetzen(gelesen, r.daten.skills ?? null, r.daten.skills ? '' : `Skills: ${r.daten.skills_fehler || 'nicht lesbar'}`), r.daten.traeger);
+      welt = ort(skillsEinsetzen(gelesen, r.daten.skills ?? null, r.daten.skills ? '' : `Skills: ${r.daten.skills_fehler || 'nicht lesbar'}`), r.daten.traeger, r.daten.zug);
     } else if (!r.ok && !r.verbindung && alt && alt.welt.gelesen) {
       welt = ort(alt.welt);
     } else {
@@ -1089,7 +1258,12 @@ export class WeltenQuelle {
     const jetzt = Date.now();
     await Promise.all(this.funde.map(async (f) => {
       const g = this.gemerkt.get(f.path);
-      if (g && !g.schmutzig && jetzt - g.gelesen < this.opt.nachlesenMs) return;
+      // Auftrag agentaktiv: der Zustand des Traegers liegt nicht in der Welt, fs.watch sieht einen Zugbeginn nicht.
+      // Laeuft ein Zug oder wartet eine Zustellung, liest der Takt die Welt so oft wie die gewaehlte Fernwelt.
+      // Ein Status, der gerade nicht lesbar war, fragt der Takt ebenso oft wieder.
+      const takt = g && (g.welt.traeger.zug_fehler || g.welt.agenten.some((a) => a.zug?.laeuft || a.zug?.zustellung_offen))
+        ? Math.min(this.opt.nachlesenMs, this.opt.fern.taktMs) : this.opt.nachlesenMs;
+      if (g && !g.schmutzig && jetzt - g.gelesen < takt) return;
       await this.lesen(f);
     }));
     this.fernTakt();
@@ -1121,17 +1295,20 @@ export class WeltenQuelle {
    * ueber ssh. `wecken` weckt nach Exit 0 den Traeger der Welt, wenn sie eine `traeger.json` hat.
    * Grosse Texte (Gedaechtnis, Entwurf) gehen fern als Datei auf der Maschine der Welt.
    */
-  private async datenFuer(welt: Welt, args: string[], opt: { skript?: 'agents_data.py' | 'agents_skills.py'; wecken?: boolean } = {}): Promise<Lauf & { weck: string }> {
+  private async datenFuer(welt: Welt, args: string[], opt: { skript?: 'agents_data.py' | 'agents_skills.py'; wecken?: boolean } = {}): Promise<Lauf & { weck: string; weckRoh: string }> {
     const skript = opt.skript ?? 'agents_data.py';
     if (!welt.fern) {
       const bin = skript === 'agents_data.py' ? this.opt.daten : join(dirname(this.opt.daten), skript);
       const l = await this.lauf(this.opt.python, [bin, ...args], this.opt.fristMs);
       let weck = '';
+      let weckRoh = '';
       if (opt.wecken && l.code === 0 && existsSync(join(welt.ablage, 'traeger.json'))) {
         const w = await this.lauf(this.opt.python, [join(dirname(this.opt.daten), 'agents_weltauftrag.py'), 'wecken', welt.ablage], this.opt.fristMs);
-        weck = weckSatz(jsonAus<{ wecken?: unknown; wecken_fehler?: unknown }>(w) ?? { wecken_fehler: kurz(w) });
+        const r = jsonAus<{ wecken?: unknown; wecken_fehler?: unknown }>(w) ?? { wecken_fehler: kurz(w) };
+        weck = weckSatz(r);
+        weckRoh = weckWort(r);
       }
-      return { ...l, weck };
+      return { ...l, weck, weckRoh };
     }
     const gedaechtnis = args[0] === 'agent' && args[1] === 'gedaechtnis';
     const argv = args.map((a): string | { datei: string; vor: string } => {
@@ -1144,10 +1321,10 @@ export class WeltenQuelle {
       m.name, m.ssh, { befehl: 'ausfuehren', skript, argv, welt: welt.ablage, wecken: opt.wecken === true });
     if (!r.ok) {
       const text = r.verbindung ? r.text : `${m.name} nicht erreichbar: ${r.text}`;
-      return { code: null, out: '', err: '', fehler: text, weck: '' };
+      return { code: null, out: '', err: '', fehler: text, weck: '', weckRoh: '' };
     }
     const d = r.daten;
-    return { code: typeof d.code === 'number' ? d.code : null, out: d.out ?? '', err: d.err ?? '', fehler: '', weck: weckSatz(d) };
+    return { code: typeof d.code === 'number' ? d.code : null, out: d.out ?? '', err: d.err ?? '', fehler: '', weck: weckSatz(d), weckRoh: weckWort(d) };
   }
 
   welt(pfad: string): Welt | null {
@@ -1373,8 +1550,10 @@ export class WeltenQuelle {
     const agent = s(daten.agent);
     if (agent && !welt.agenten.some((a) => a.id === agent)) return antwort(false, `Kein Agent „${agent}“ in ${welt.name}.`);
     const text = s(daten.text).trim();
-    const ausgefuehrt = async (args: string[], erfolg: string): Promise<WeltenHandlungsErgebnis> => {
+    const ausgefuehrt = async (args: string[], erfolg: string, geweckt: string[] = []): Promise<WeltenHandlungsErgebnis> => {
       const l = await this.datenFuer(welt, args, { wecken: WECKEN.has(handlung) });
+      // Auftrag agentaktiv: das Wecken merken, bevor neu gelesen wird; der Stand unter der Nachricht nennt es.
+      if (l.code === 0 && geweckt.length) this.weckStand.set(pfad, { ...this.geweckt(pfad), ...Object.fromEntries(geweckt.map((id) => [id, l.weckRoh])) });
       await this.nachHandlung(pfad);
       return l.code === 0 ? antwort(true, erfolg + l.weck) : antwort(false, kurz(l));
     };
@@ -1392,7 +1571,7 @@ export class WeltenQuelle {
         if (direkt) args.push('--direkt');
         if (ticket) args.push(`--ticket=${ticket}`);
         const namen = r.ids.map((id) => (id === 'alle' ? 'alle' : welt.agenten.find((a) => a.id === id)?.name ?? id)).join(', ');
-        return ausgefuehrt(args, direkt ? `Nachricht an ${namen} gesendet.` : `Im Kanal an ${namen} gesendet.`);
+        return ausgefuehrt(args, direkt ? `Nachricht an ${namen} gesendet.` : `Im Kanal an ${namen} gesendet.`, direkt ? r.ids : []);
       }
 
       case 'antworten': {

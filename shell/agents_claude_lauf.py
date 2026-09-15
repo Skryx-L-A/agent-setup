@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import agents_data as ad
+import agents_zugaenge as az
 from agents_claude import (
     ClaudeAdapterFehler, ClaudeZug, StreamBefund, ZugUrteil, ausgabe_lesen, start_spec,
     stream_befund, zug_schreiben, zug_urteil,
@@ -75,7 +76,7 @@ class ClaudeLauf:
                  workspace: Path, agent_state: Path, zug: ClaudeZug, backend: BackendConfig,
                  auth_headers: Optional[Callable[[], tuple[tuple[str, str], ...]]],
                  extra_read_paths: tuple[Path, ...] = (), launcher_options: Optional[dict[str, Any]] = None,
-                 unit_prefix: str = "wb-agents-linux-claude-"):
+                 unit_prefix: str = "wb-agents-linux-claude-", netz: bool = False):
         self.orte = orte
         self.world_root = Path(world_root)
         self.world = ad.read_world(self.world_root)
@@ -91,6 +92,8 @@ class ClaudeLauf:
         self.extra_read_paths = tuple(Path(path) for path in extra_read_paths)
         self.launcher_options = dict(launcher_options or {})
         self.unit_prefix = unit_prefix
+        # Netz nur fuer einen Zug mit bereitgestellten Zugaengen (agents_zugaenge); sonst bleibt es getrennt.
+        self.netz = bool(netz)
         if backend.model != zug.model:
             raise ClaudeAdapterFehler("Backend und Zug nennen verschiedene Modelle")
         self.proxy: Optional[AgentsModelProxy] = None
@@ -136,7 +139,8 @@ class ClaudeLauf:
                 self.orte.launcher_state, read_paths=read_paths,
                 write_paths=(self.workspace, self.agent_state),
                 socket_bindings=(SocketBinding(self.proxy.socket_path, "/run/wb-model.sock"), self.endpoint.binding),
-                output_dir=self.orte.output, unit_prefix=self.unit_prefix, **self.launcher_options)
+                output_dir=self.orte.output, unit_prefix=self.unit_prefix, network=self.netz,
+                **self.launcher_options)
             spec = start_spec(self.orte.runtime, turn_file, self.workspace, self.zug.runner)
             self.handle = self.controller(self.launcher).start(self.world_id, self.agent_id, self.run_id, spec)
             return self.handle
@@ -196,6 +200,11 @@ class ClaudeLauf:
 
     def close(self) -> None:
         errors: list[BaseException] = []
+        # Zugangskopien gehen mit den Kanaelen: Schluessel verlassen den Zugordner nie laenger als der Zug.
+        try:
+            az.aufraeumen(self.orte.turns / self.run_id)
+        except OSError as exc:
+            errors.append(exc)
         if self.endpoint is not None:
             try:
                 self.endpoint.close()
