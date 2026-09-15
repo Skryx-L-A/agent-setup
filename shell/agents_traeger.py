@@ -272,7 +272,7 @@ def zeitgeber_unit(konfig: TraegerKonfig) -> str:
 
 def _claude_lauf_fabrik(traeger: "WeltTraeger", *, agent_id: str, run_id: str, zug: ClaudeZug,
                         workspace: Path, agent_state: Path, extra_read_paths: tuple[Path, ...] = (),
-                        netz: bool = False):
+                        netz: bool = False, extra_write_paths: tuple[Path, ...] = ()):
     from agents_claude_lauf import ClaudeLauf, LaufOrte
     k, orte = traeger.konfig, traeger.orte
     lauf_orte = LaufOrte(orte.runs, orte.launcher, orte.output, orte.sockets, orte.turns, orte.runtime)
@@ -283,7 +283,30 @@ def _claude_lauf_fabrik(traeger: "WeltTraeger", *, agent_id: str, run_id: str, z
     return ClaudeLauf(lauf_orte, world_root=k.world_root, agent_id=agent_id, run_id=run_id, workspace=workspace,
                       agent_state=agent_state, zug=zug, backend=k.backend_fuer(zug.model, "pi" if pi else "claude"),
                       auth_headers=None if pi else traeger.anmeldequelle.auth_headers, extra_read_paths=extra_read_paths,
-                      launcher_options=dict(k.launcher), unit_prefix=k.unit_prefix, netz=netz)
+                      launcher_options=dict(k.launcher), unit_prefix=k.unit_prefix, netz=netz,
+                      extra_write_paths=extra_write_paths)
+
+
+PROJEKT_ARBEITSORDNER = "work"
+
+
+def projekt_pfade(world_root: Path) -> tuple[Optional[Path], Optional[Path]]:
+    """Projektwurzel der Welt und ihr gemeinsamer Ordner ``work/`` (der Nutzer, 15.09.2026: jeder Agent sieht
+    das Projekt, geschrieben wird im eigenen Ordner und in ``work/``).
+
+    Die Wurzel wird nur lesbar eingebunden, ``work/`` beschreibbar; der Ordner entsteht beim ersten Zug.
+    Ohne Projekt (Welt ausserhalb von ``<projekt>/.werkbank/agents``) gibt es beides nicht."""
+    projekt = ask.world_project(world_root)
+    if projekt is None or not projekt.is_dir():
+        return None, None
+    projekt = projekt.resolve(strict=True)
+    if projekt in (Path("/"), Path.home()):
+        return None, None
+    arbeit = projekt / PROJEKT_ARBEITSORDNER
+    if arbeit.is_symlink():
+        raise TraegerFehler("%s ist ein Symlink; der gemeinsame Ordner muss ein echter Ordner sein" % arbeit)
+    arbeit.mkdir(mode=0o700, exist_ok=True)
+    return projekt, arbeit
 
 
 def _claude_observer(traeger: "WeltTraeger"):
@@ -374,6 +397,16 @@ class WeltTraeger:
                                                dauerhaft=True)
         for name in RUNTIME_MODULES:
             data = (quelle / name).read_bytes()
+            target = runtime / name
+            if not target.exists() or target.read_bytes() != data:
+                atomar_schreiben.schreiben(target, data, modus=0o600, dauerhaft=True)
+        # Lesende Postfachwerkzeuge fuer Mail-Zugaenge (agents_zugaenge.MAIL_WERKZEUGE): ihre Huelle im Zug ruft sie
+        # ueber den Interpreter, deshalb reicht 0600. Fehlt eines an der Quelle, gibt es dafuer keine Huelle.
+        for name in az.MAIL_WERKZEUGE:
+            source = quelle / name
+            if not source.is_file():
+                continue
+            data = source.read_bytes()
             target = runtime / name
             if not target.exists() or target.read_bytes() != data:
                 atomar_schreiben.schreiben(target, data, modus=0o600, dauerhaft=True)
@@ -892,8 +925,10 @@ class WeltTraeger:
 
     def _anweisung(self, world: dict[str, Any], agent: dict[str, Any], run_dir: Path,
                    verzeichnis: Optional[dict[str, Any]], skills_fehler: Optional[str],
-                   zugang: Optional[az.Bereitstellung] = None, zugang_fehler: Optional[str] = None) -> str:
-        """Anweisungsdatei des Zuges: eigene Anweisungen, Gedaechtnis, Skills mit Pfad, Zugende mit Lernschritt."""
+                   zugang: Optional[az.Bereitstellung] = None, zugang_fehler: Optional[str] = None,
+                   projekt: Optional[Path] = None, projekt_arbeit: Optional[Path] = None) -> str:
+        """Anweisungsdatei des Zuges: eigene Anweisungen, Gedaechtnis, Skills mit Pfad, Projekt, Zugende mit
+        Lernschritt."""
         folder = ad._agent_dir(self.root, agent["id"])
 
         def lesen(name: str, limit: int) -> str:
@@ -924,11 +959,18 @@ class WeltTraeger:
         if not skills:
             lines.append("Keine Skills verzeichnet." if not skills_fehler else
                          "Skillverzeichnis nicht lesbar: %s" % skills_fehler)
+        if projekt is not None:
+            lines += ["", "## Projekt", "",
+                      "Das Projekt der Welt liegt unter `%s` und ist im Zug lesbar (Regeln, Dokumente, Quelltext). "
+                      "Geschrieben wird nur im eigenen Arbeitsordner und im gemeinsamen Ordner `%s`; dort legen "
+                      "Team und Agenten ihre Ergebnisdateien ab (Unterordner je Team oder Thema)." % (
+                          projekt, projekt_arbeit)]
         if zugang is not None or zugang_fehler:
             lines += ["", "## Zugänge", ""]
             if zugang is not None:
-                lines += ["Die Welt hat Zugänge nach draußen; nur über sie erreichst du andere Rechner. Rufe sie genau "
-                          "so auf, ohne Pfad, Variablen oder zusätzliche ssh-Optionen:"] + az.anweisung(zugang.namen)
+                lines += ["Die Welt hat Zugänge nach draußen; nur über sie erreichst du andere Rechner, das Netz und "
+                          "Postfächer. Rufe sie genau so auf, ohne Pfad, Variablen oder zusätzliche Optionen:"
+                          ] + az.anweisung(zugang.eintraege or zugang.namen)
             else:
                 lines.append("Die Zugänge der Welt sind in diesem Zug nicht bereit: %s" % zugang_fehler)
         if agent["stage"] == "hauptagent":
@@ -1036,12 +1078,16 @@ class WeltTraeger:
             if harness == "claude" and self.konfig.sperren:
                 # Zugaenge nur mit Profil-Sperre: ohne sie gaebe es keine Grenze zwischen Agent und Schluessel.
                 try:
-                    zugang = az.bereitstellen(self.root, turn_dir)
+                    zugang = az.bereitstellen(self.root, turn_dir, werkzeuge=self.orte.runtime)
                 except (ad.AgentsError, OSError, ValueError, subprocess.SubprocessError) as exc:
                     zugang_fehler = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+            # Das Projekt der Welt: Wurzel lesbar, `work/` beschreibbar (projekt_pfade). Die Profil-Sperre kennt
+            # beides schon ueber WB_WELT_PROJEKT; ohne Einbindung saehe der Zug den Ordner trotzdem nicht.
+            projekt, projekt_arbeit = projekt_pfade(self.root)
             anweisung = turn_dir / "ANWEISUNG.md"
             atomar_schreiben.schreiben(anweisung, self._anweisung(world, agent, run_dir, verzeichnis, skills_fehler,
-                                                                  zugang, zugang_fehler),
+                                                                  zugang, zugang_fehler, projekt=projekt,
+                                                                  projekt_arbeit=projekt_arbeit),
                                        modus=0o600, dauerhaft=True)
             agent_dir = ad._agent_dir(self.root, agent_id)
             libraries = [Path(str((verzeichnis or {}).get(key) or "")) for key in ("bibliothek", "skript_bibliothek")]
@@ -1050,7 +1096,8 @@ class WeltTraeger:
             read_paths = tuple(Path(item["pfad"]) for item in skills) + (agent_dir / "agent.json",) + (
                 (agent_dir / "skills.json",) if verzeichnis else ()) + tuple(
                 path for path in libraries if path.is_absolute() and path.is_dir()) + (
-                (zugang.weltdatei,) if zugang is not None else ())
+                (zugang.weltdatei,) if zugang is not None else ()) + ((projekt,) if projekt is not None else ())
+            write_paths = (projekt_arbeit,) if projekt_arbeit is not None else ()
             env = self._zugumgebung(agent_id, workspace, run_dir, rpc, verzeichnis is not None)
             prompt = self._prompt(world, agent, posten, resume, ticket, nachricht, frage, run_dir, skills)
             if harness == "pi":
@@ -1087,7 +1134,8 @@ class WeltTraeger:
                                               "zugaenge": list(zugang.namen) if zugang is not None else [],
                                               "zugaenge_fehler": zugang_fehler})
             lauf = self._zug_fabrik(self, agent_id=agent_id, run_id=run_id, zug=zug, workspace=workspace,
-                                    agent_state=agent_state, extra_read_paths=read_paths, netz=zugang is not None)
+                                    agent_state=agent_state, extra_read_paths=read_paths, netz=zugang is not None,
+                                    extra_write_paths=write_paths)
             self.laeufe[run_id] = lauf
             lauf.start()
         except Exception as exc:  # noqa: BLE001 - jeder Startfehler wird sichtbar abgeschlossen

@@ -50,7 +50,9 @@ const KANAL = 'kanal';
 const EINZEL = 'einzel';
 const MERKER = 'awb.welten.darstellung';
 const DENKSTUFEN = ['low', 'medium', 'high', 'xhigh'];
-const WERKZEUGE = ['Read', 'Grep', 'Glob', 'Bash', 'Write', 'Edit'];
+// WebFetch und WebSearch sind je Agent wählbar (Rechercheagenten, 2026-09-15); Vorgabe bleibt ohne Web.
+const WERKZEUGE = ['Read', 'Grep', 'Glob', 'Bash', 'Write', 'Edit', 'WebFetch', 'WebSearch'];
+const WERKZEUGE_VORGABE = ['Read', 'Grep', 'Glob', 'Bash', 'Write', 'Edit'];
 const FIGUR_ARTEN = ['roboter', 'tier', 'linse'];
 const FIGUR_FARBEN = ['entwicklung', 'recherche', 'pruefung', 'gestaltung'];
 const STAENDE = ['offen', 'läuft', 'wartet', 'braucht dich', 'zur Abnahme', 'abgenommen', 'zurückgegeben', 'unterbrochen', 'verworfen'];
@@ -570,7 +572,7 @@ async function senden(w: Welt, echt: boolean): Promise<void> {
 
 function entwurfLeer(): Entwurf {
   return { id: '', stufe: 'mitglied', team: '', spezialgebiet: '', modell: 'sonnet5', denkstufe: 'high', fallback: '', fallbackDenkstufe: '', maschine: 'peer',
-    werkzeuge: ['Read'], bash: '', skills: '', kontextgrenze: '', figurArt: 'roboter', figurFarbe: 'entwicklung', anweisungen: '', vorlage: '' };
+    werkzeuge: [...WERKZEUGE_VORGABE], bash: '', skills: '', kontextgrenze: '', figurArt: 'roboter', figurFarbe: 'entwicklung', anweisungen: '', vorlage: '' };
 }
 const basis = (m: string): string => m.split(':')[0] ?? m;
 const suffix = (m: string): string => (m.includes(':') ? m.split(':')[1] : '');
