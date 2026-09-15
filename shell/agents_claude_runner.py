@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from agents_model_bridge import ModelBridge  # noqa: E402
 
 PLACEHOLDER_TOKEN = "wb-agents-placeholder"
-ALLOWED_TOOLS = frozenset({"Bash", "Read", "Write", "Edit", "Glob", "Grep"})
+ALLOWED_TOOLS = frozenset({"Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch"})
 KEYS = frozenset({"claude_binary", "model", "prompt", "session_id", "config_dir", "resume",
                   "tools", "append_system_prompt", "extra_env", "effort", "append_system_prompt_file",
                   "settings_file"})

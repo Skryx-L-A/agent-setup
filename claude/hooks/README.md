@@ -802,6 +802,20 @@ ist für Read, Grep, Glob und Bash-Pfade gesperrt, `zugaenge.json` für jedes
 Schreiben. Ohne Bereitstellung gibt eine Welt mit Zugängen nichts frei
 (`docs/AGENTS-SPERREN.md`, Abschnitt „Zugänge der Welt").
 
+**Projekt und Web-Werkzeuge (15.09.2026).** Der Träger bindet das Projekt der
+Welt (`WB_WELT_PROJEKT`) nur lesbar in den Zug ein und seinen Ordner `work/`
+beschreibbar; die Sperre kannte den Projektordner schon, ohne Einbindung sah
+der Zug ihn nur nicht. `WebFetch` und `WebSearch` stehen auf der Positivliste
+der Werkzeuge und greifen nur, wenn das Profil sie nennt; ein Pfad hängt an
+ihnen nicht, die Weltgrenze bleibt unberührt. Das Netz bekommt der Zug
+weiterhin nur über die Zugänge der Welt, die seit demselben Tag drei Arten
+haben: `ssh`, `web` (nur Netz) und `mail` (Passwortdateien und Hüllen der
+lesenden Postfachwerkzeuge `<ein eigenes Mailwerkzeug>`, `<ein eigenes Mailwerkzeug>` im Zugangsordner). Die Hülle
+läuft über das normale Bash-Muster des Profils (`<ein eigenes Mailwerkzeug> *`); die Passwortdatei
+liegt im Zugangsordner und ist damit wie ein ssh-Schlüssel gesperrt
+(`tests/test-profil-sperre.sh`, Fälle 8m bis 8o). `<ein eigenes Mailwerkzeug>` und `msmtp`
+bleiben auf der Hausliste: über einen Zugang wird nie gesendet.
+
 **Prüfkette.** Die Profil-Sperre steht in der `PRUEFKETTE` der
 Skills-Sperre. Der Inhalt eines Skill-Skripts wird damit auch gegen
 Werkzeugliste, Muster, Hausliste und Weltgrenze geprüft

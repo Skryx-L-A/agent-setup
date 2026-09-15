@@ -32,9 +32,17 @@ import atomar_schreiben
 DATEI = "zugaenge.json"
 ORDNER = "zugaenge"
 VERSION = 1
-ARTEN = ("ssh",)
+# Drei Arten (15.09.2026): `ssh` (Ziel, Schluessel, known_hosts, Huellen), `web` (nur Netz -- fuer Agenten mit
+# WebFetch/WebSearch im Profil) und `mail` (lesende Postfachwerkzeuge mit Passwoertern aus dem Schluesselbund des
+# Traegerhosts). Senden bleibt Menschensache: <ein eigenes Mailwerkzeug> und msmtp stehen auf der Hausliste und bekommen keine Huelle.
+ARTEN = ("ssh", "web", "mail")
 PROGRAMME = ("ssh", "scp", "rsync")
-FELDER = ("name", "art", "ziel", "schluessel", "known_hosts", "port", "muster")
+FELDER = ("name", "art", "ziel", "schluessel", "known_hosts", "port", "muster", "dienste")
+# Lesende Postfachwerkzeuge aus shell/, die ein Mail-Zugang als Huelle in den Zug legt; der Dienstname ist der
+# Schluesselbund-Eintrag, den das Werkzeug selbst kennt (<ein eigenes Mailwerkzeug> -> <ein eigenes Mailwerkzeug>, <ein eigenes Mailwerkzeug> -> <ein eigenes Mailwerkzeug>-imap).
+MAIL_WERKZEUGE = {"<ein eigenes Mailwerkzeug>": "<ein eigenes Mailwerkzeug>", "<ein eigenes Mailwerkzeug>": "<ein eigenes Mailwerkzeug>-imap"}
+KONTO_RE = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\Z")
+GEHEIMNIS_GRENZE = 4096
 NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,39}\Z")
 _USER = r"[A-Za-z_][A-Za-z0-9._-]{0,31}"
 _HOST = r"[A-Za-z0-9][A-Za-z0-9.:-]{0,252}"
@@ -107,6 +115,32 @@ def normalisieren(eintrag: Any) -> dict[str, Any]:
     art = eintrag.get("art") or "ssh"
     if art not in ARTEN:
         raise ZugangFehler("Zugangsart muss %s sein" % ", ".join(ARTEN))
+    if art != "ssh":
+        fremd = sorted(k for k in eintrag if k not in ("name", "art") and eintrag.get(k) not in (None, [], ""))
+        if art == "web":
+            if fremd:
+                raise ZugangFehler("Ein Web-Zugang hat nur Name und Art (zu viel: %s)" % ", ".join(fremd))
+            return {"name": name, "art": art}
+        if fremd != ["dienste"]:
+            raise ZugangFehler("Ein Mail-Zugang hat Name, Art und dienste (zu viel oder zu wenig: %s)"
+                               % ", ".join(fremd))
+        dienste = eintrag.get("dienste")
+        if not isinstance(dienste, list) or not dienste or len(dienste) > len(MAIL_WERKZEUGE):
+            raise ZugangFehler("dienste muss eine Liste mit 1 bis %d Eintraegen sein" % len(MAIL_WERKZEUGE))
+        result_dienste, gesehen = [], set()
+        for item in dienste:
+            if not isinstance(item, dict) or set(item) != {"werkzeug", "konto"}:
+                raise ZugangFehler("Ein Dienst nennt werkzeug und konto")
+            werkzeug, konto = item["werkzeug"], item["konto"]
+            if werkzeug not in MAIL_WERKZEUGE:
+                raise ZugangFehler("Werkzeug muss %s sein" % ", ".join(sorted(MAIL_WERKZEUGE)))
+            if not isinstance(konto, str) or not KONTO_RE.fullmatch(konto):
+                raise ZugangFehler("konto muss eine Mailadresse sein")
+            if werkzeug in gesehen:
+                raise ZugangFehler("Werkzeug '%s' steht doppelt" % werkzeug)
+            gesehen.add(werkzeug)
+            result_dienste.append({"werkzeug": werkzeug, "konto": konto})
+        return {"name": name, "art": art, "dienste": result_dienste}
     ziel = eintrag.get("ziel")
     if not isinstance(ziel, str) or not ZIEL_RE.fullmatch(ziel):
         raise ZugangFehler("Ziel muss user@host oder ein ssh-Alias sein")
@@ -144,8 +178,15 @@ def lesen(root: Path) -> list[dict[str, Any]]:
 
 
 def oeffentlich(eintraege: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """Was Oberflaeche und Anweisungen sehen duerfen: Name und Art, nie Ziel oder Schluesselpfad."""
-    return [{"name": item["name"], "art": item["art"]} for item in eintraege]
+    """Was Oberflaeche und Anweisungen sehen duerfen: Name und Art, bei Mail die Werkzeuge; nie Ziel, Konto oder
+    Schluesselpfad."""
+    result = []
+    for item in eintraege:
+        entry: dict[str, Any] = {"name": item["name"], "art": item["art"]}
+        if item["art"] == "mail":
+            entry["werkzeuge"] = [dienst["werkzeug"] for dienst in item["dienste"]]
+        result.append(entry)
+    return result
 
 
 def _lesbare_datei(path: str, label: str, limit: int) -> None:
@@ -170,8 +211,9 @@ def hinzufuegen(root: Path, eintrag: dict[str, Any], *, bestaetigt: bool, absend
     if not bestaetigt:
         raise ZugangFehler("Ein Zugang erweitert die Rechte aller Agenten der Welt; --bestaetigt fehlt")
     entry = normalisieren(eintrag)
-    _lesbare_datei(entry["schluessel"], "Schluessel", SCHLUESSEL_GRENZE)
-    _lesbare_datei(entry["known_hosts"], "known_hosts", KNOWN_HOSTS_GRENZE)
+    if entry["art"] == "ssh":
+        _lesbare_datei(entry["schluessel"], "Schluessel", SCHLUESSEL_GRENZE)
+        _lesbare_datei(entry["known_hosts"], "known_hosts", KNOWN_HOSTS_GRENZE)
     with ad.transaction(root):
         actor = ad._require_human(root, absender or "cli-operator", None, "Zugaenge einrichten")
         ad.read_world(root)
@@ -206,11 +248,45 @@ def _meldung(root: Path, absender: str, text: str) -> None:
 # Bereitstellung im Zug ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Bereitstellung:
-    """Die Zugaenge eines Zuges: Ordner (Huellen, ssh_config, Kopien), Namen und die Weltdatei."""
+    """Die Zugaenge eines Zuges: Ordner (Huellen, ssh_config, Kopien), Namen, die oeffentliche Form der
+    Eintraege (Name, Art, bei Mail die Werkzeuge) und die Weltdatei."""
 
     ordner: Path
     namen: tuple[str, ...]
     weltdatei: Path
+    eintraege: tuple[dict[str, Any], ...] = ()
+
+
+def _geheimnis(dienst: str, konto: str, runner: Callable[..., Any] = subprocess.run) -> str:
+    """Passwort eines Postfachdienstes aus dem Schluesselbund des Traegerhosts (macOS security, Linux secret-tool).
+
+    Der Wert wandert nur in die 0600-Datei des Zugangsordners; er wird weder geloggt noch zurueckgegeben, ausser an
+    den Aufrufer, der ihn schreibt."""
+    if os.uname().sysname == "Darwin":
+        cmd = ["security", "find-generic-password", "-s", dienst, "-a", konto, "-w"]
+    else:
+        cmd = ["secret-tool", "lookup", "service", dienst, "account", konto]
+    try:
+        result = runner(cmd, text=True, capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ZugangFehler("Schluesselbund fuer Dienst '%s' nicht abfragbar: %s" % (dienst, type(exc).__name__)) from exc
+    wert = (result.stdout or "").strip()
+    if result.returncode != 0 or not wert:
+        raise ZugangFehler("Dienst '%s' hat kein Passwort im Schluesselbund des Traegerhosts" % dienst)
+    if len(wert) > GEHEIMNIS_GRENZE or "\n" in wert:
+        raise ZugangFehler("Passwort von Dienst '%s' hat keine brauchbare Form" % dienst)
+    return wert
+
+
+def _mail_huelle(werkzeug: str, quelle: Path, geheimnisse: Path) -> str:
+    """Huelle eines lesenden Postfachwerkzeugs: das Werkzeug aus der Laufzeit, die Passwoerter aus dem Zugangsordner."""
+    return "\n".join([
+        "#!/bin/sh",
+        "# Werkbank-Zugang: %s liest das Postfach nur ueber den Mail-Zugang dieses Zuges (agents_zugaenge.py)."
+        % werkzeug,
+        "set -eu",
+        "WB_MAIL_GEHEIMNISSE='%s'; export WB_MAIL_GEHEIMNISSE" % geheimnisse,
+        "exec /usr/bin/python3 '%s' \"$@\"" % quelle, ""])
 
 
 def _ssh_g(alias: str, runner: Callable[..., Any] = subprocess.run) -> dict[str, str]:
@@ -263,8 +339,12 @@ def _huelle(programm: str, ordner: Path, namen: tuple[str, ...]) -> str:
 
 
 def bereitstellen(root: Path, zugordner: Path, *, eintraege: Optional[list[dict[str, Any]]] = None,
-                  runner: Callable[..., Any] = subprocess.run) -> Optional[Bereitstellung]:
-    """Legt die Zugaenge der Welt im Zugordner an; ohne Zugaenge None und nichts auf der Platte."""
+                  runner: Callable[..., Any] = subprocess.run,
+                  werkzeuge: Optional[Path] = None) -> Optional[Bereitstellung]:
+    """Legt die Zugaenge der Welt im Zugordner an; ohne Zugaenge None und nichts auf der Platte.
+
+    ``werkzeuge`` ist der shell/-Ordner der Laufzeit, aus dem ein Mail-Zugang seine lesenden Postfachwerkzeuge
+    als Huellen in den Zug legt; ohne ihn gibt es die Passwortdateien, aber keine Huellen."""
     root = ad.world_path(str(root))
     entries = lesen(root) if eintraege is None else eintraege
     aufraeumen(zugordner)
@@ -275,14 +355,30 @@ def bereitstellen(root: Path, zugordner: Path, *, eintraege: Optional[list[dict[
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
         raise ZugangFehler("Zugordner muss eigener privater Ordner sein")
     ordner = base / ORDNER
+    ssh_entries = [entry for entry in entries if entry["art"] == "ssh"]
     try:
         ordner.mkdir(mode=0o700)
         if " " in str(ordner) or not PFAD_RE.fullmatch(str(ordner)):
             raise ZugangFehler("Zugordner-Pfad eignet sich nicht fuer ssh_config und Huellen")
-        if not Path(WERKZEUGE["ssh"]).is_file():
+        if ssh_entries and not Path(WERKZEUGE["ssh"]).is_file():
             raise ZugangFehler("ssh fehlt auf dem Traegerhost (%s)" % WERKZEUGE["ssh"])
-        config = ["# Zugaenge dieses Zuges; nur ueber die Huellen im selben Ordner benutzt.", ""]
         for entry in entries:
+            if entry["art"] == "web":
+                # Nur Netz: der leere Ordner belegt, dass der Zugang in diesem Zug bereitstand.
+                (ordner / entry["name"]).mkdir(mode=0o700)
+            elif entry["art"] == "mail":
+                folder = ordner / entry["name"]
+                folder.mkdir(mode=0o700)
+                for dienst in entry["dienste"]:
+                    schluesselbund = MAIL_WERKZEUGE[dienst["werkzeug"]]
+                    atomar_schreiben.schreiben(folder / (schluesselbund + ".pw"),
+                                               _geheimnis(schluesselbund, dienst["konto"], runner) + "\n", modus=0o600)
+                    quelle = (werkzeuge / dienst["werkzeug"]) if werkzeuge is not None else None
+                    if quelle is not None and quelle.is_file():
+                        atomar_schreiben.schreiben(ordner / dienst["werkzeug"],
+                                                   _mail_huelle(dienst["werkzeug"], quelle, folder), modus=0o700)
+        config = ["# Zugaenge dieses Zuges; nur ueber die Huellen im selben Ordner benutzt.", ""]
+        for entry in ssh_entries:
             host, user, port = _ziel(entry, runner)
             folder = ordner / entry["name"]
             folder.mkdir(mode=0o700)
@@ -299,15 +395,17 @@ def bereitstellen(root: Path, zugordner: Path, *, eintraege: Optional[list[dict[
                 "  StrictHostKeyChecking yes", "  UpdateHostKeys no", "  BatchMode yes", "  ConnectTimeout 15",
                 "  ProxyCommand none", "  ProxyJump none", "  PermitLocalCommand no", "  ControlMaster no",
                 "  ForwardAgent no", "  ForwardX11 no", "  ClearAllForwardings yes", "  LogLevel ERROR", ""]
-        atomar_schreiben.schreiben(ordner / "ssh_config", "\n".join(config), modus=0o600)
         namen = tuple(entry["name"] for entry in entries)
-        for programm in PROGRAMME:
-            if Path(WERKZEUGE[programm]).is_file():
-                atomar_schreiben.schreiben(ordner / programm, _huelle(programm, ordner, namen), modus=0o700)
+        if ssh_entries:
+            atomar_schreiben.schreiben(ordner / "ssh_config", "\n".join(config), modus=0o600)
+            ssh_namen = tuple(entry["name"] for entry in ssh_entries)
+            for programm in PROGRAMME:
+                if Path(WERKZEUGE[programm]).is_file():
+                    atomar_schreiben.schreiben(ordner / programm, _huelle(programm, ordner, ssh_namen), modus=0o700)
     except BaseException:
         aufraeumen(zugordner)
         raise
-    return Bereitstellung(ordner, namen, datei(root))
+    return Bereitstellung(ordner, namen, datei(root), tuple(oeffentlich(entries)))
 
 
 def aufraeumen(zugordner: Path) -> bool:
@@ -322,12 +420,21 @@ def aufraeumen(zugordner: Path) -> bool:
     return True
 
 
-def anweisung(namen: tuple[str, ...] | list[str]) -> list[str]:
-    """Zeilen fuer Anweisungen: Zugangsnamen mit Aufruf, ohne Ziel oder Pfad."""
+def anweisung(eintraege: tuple[dict[str, Any], ...] | list[dict[str, Any]] | tuple[str, ...] | list[str]) -> list[str]:
+    """Zeilen fuer Anweisungen: Zugangsnamen mit Aufruf, ohne Ziel, Konto oder Pfad. Nackte Namen gelten als ssh."""
     lines = []
-    for name in namen:
-        lines.append("- Zugang `%s` (ssh): `ssh %s <befehl>`, Dateien mit `scp <datei> %s:<pfad>` oder "
-                     "`rsync -a <ordner> %s:<pfad>`." % (name, name, name, name))
+    for item in eintraege:
+        entry = item if isinstance(item, dict) else {"name": item, "art": "ssh"}
+        name = entry["name"]
+        if entry["art"] == "web":
+            lines.append("- Zugang `%s` (web): Netz fuer WebFetch und WebSearch, sofern dein Profil sie fuehrt." % name)
+        elif entry["art"] == "mail":
+            werkzeuge = ", ".join("`%s`" % w for w in entry.get("werkzeuge") or [])
+            lines.append("- Zugang `%s` (mail): Postfach nur lesen mit %s (`<werkzeug> recent 20`, `search <wort>`, "
+                         "`read <uid>`); gesendet wird nichts, Entwuerfe legst du als Datei ab." % (name, werkzeuge))
+        else:
+            lines.append("- Zugang `%s` (ssh): `ssh %s <befehl>`, Dateien mit `scp <datei> %s:<pfad>` oder "
+                         "`rsync -a <ordner> %s:<pfad>`." % (name, name, name, name))
     return lines
 
 
@@ -340,17 +447,31 @@ def cli(args: Any) -> Any:
         if not args.name:
             raise ZugangFehler("--name fehlt")
         return entfernen(root, args.name, absender=args.absender)
-    missing = [flag for flag, value in (("--name", args.name), ("--ziel", args.ziel), ("--schluessel", args.schluessel))
-               if not value]
-    if missing:
-        raise ZugangFehler("Es fehlen: %s" % ", ".join(missing))
-    known_hosts = args.known_hosts or str(Path(args.schluessel).parent / "known_hosts")
-    entry: dict[str, Any] = {"name": args.name, "art": args.art, "ziel": args.ziel, "schluessel": args.schluessel,
-                             "known_hosts": known_hosts}
-    if args.port is not None:
-        entry["port"] = args.port
-    if args.muster:
-        entry["muster"] = args.muster
+    if not args.name:
+        raise ZugangFehler("Es fehlen: --name")
+    if args.art == "web":
+        entry: dict[str, Any] = {"name": args.name, "art": "web"}
+    elif args.art == "mail":
+        dienste = []
+        for wert in args.dienst or []:
+            werkzeug, trenner, konto = wert.partition("=")
+            if not trenner:
+                raise ZugangFehler("--dienst braucht die Form werkzeug=konto, z. B. <ein eigenes Mailwerkzeug>=<konto>")
+            dienste.append({"werkzeug": werkzeug.strip(), "konto": konto.strip()})
+        if not dienste:
+            raise ZugangFehler("Es fehlen: --dienst werkzeug=konto")
+        entry = {"name": args.name, "art": "mail", "dienste": dienste}
+    else:
+        missing = [flag for flag, value in (("--ziel", args.ziel), ("--schluessel", args.schluessel)) if not value]
+        if missing:
+            raise ZugangFehler("Es fehlen: %s" % ", ".join(missing))
+        known_hosts = args.known_hosts or str(Path(args.schluessel).parent / "known_hosts")
+        entry = {"name": args.name, "art": args.art, "ziel": args.ziel, "schluessel": args.schluessel,
+                 "known_hosts": known_hosts}
+        if args.port is not None:
+            entry["port"] = args.port
+        if args.muster:
+            entry["muster"] = args.muster
     return hinzufuegen(root, entry, bestaetigt=args.bestaetigt, absender=args.absender, ersetzen=args.ersetzen)
 
 
@@ -365,12 +486,15 @@ def parser_ergaenzen(sub: Any) -> None:
     p.add_argument("--known-hosts")
     p.add_argument("--port", type=int)
     p.add_argument("--muster", action="append", default=[])
+    p.add_argument("--dienst", action="append", default=[],
+                   help="Mail-Zugang: werkzeug=konto, z. B. <ein eigenes Mailwerkzeug>=<konto> (mehrfach)")
     p.add_argument("--ersetzen", action="store_true")
     p.add_argument("--bestaetigt", action="store_true")
     p.add_argument("--absender", default="cli-operator")
     p.add_argument("--json", action="store_true")
 
 
-__all__ = ["ARTEN", "Bereitstellung", "DATEI", "ORDNER", "PROGRAMME", "ZugangFehler", "anweisung", "aufraeumen",
+__all__ = ["ARTEN", "Bereitstellung", "DATEI", "MAIL_WERKZEUGE", "ORDNER", "PROGRAMME", "ZugangFehler", "anweisung",
+           "aufraeumen",
            "bereitstellen", "entfernen", "hinzufuegen", "lesen", "muster_pruefen", "normalisieren", "oeffentlich",
            "vorgabe_muster"]

@@ -1492,8 +1492,11 @@ def mark_read(root: Path, conversation: str, message_time: str, message_id: str,
 AGENT_DRAFT_FIELDS = ("id", "stage", "team", "specialty", "model", "effort", "fallback_model",
                       "fallback_effort", "machine", "tools", "bash", "skills", "context_limit",
                       "figure", "instructions", "template")
-# The tools the carrier's runner accepts (agents_claude_runner.ALLOWED_TOOLS).
-AGENT_TOOLS = ("Bash", "Read", "Write", "Edit", "Glob", "Grep")
+# The tools the carrier's runner accepts (agents_claude_runner.ALLOWED_TOOLS).  WebFetch and
+# WebSearch are opt-in per agent (research agents need them, 2026-09-15); the turn gets the
+# host network only through the world's accesses (agents_zugaenge), never by the tool alone.
+AGENT_TOOLS = ("Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch")
+WEB_TOOLS = ("WebFetch", "WebSearch")
 FIGURE_FAMILIES = ("roboter", "tier", "linse")
 FIGURE_COLORS = ("entwicklung", "recherche", "pruefung", "gestaltung")
 SPECIALTY_LIMIT = 300
@@ -1503,11 +1506,11 @@ LIBRARY_DIR = Path(__file__).resolve().parent.parent / "agents" / "bibliothek"
 AGENT_REQUEST_KIND = "agent-antrag"
 # Defaults for a profile created without tools (`create_world`, `create_agent`): the
 # profile lock refuses every tool that is not listed, so an empty list stops a turn
-# before its first step.  Main agent and team leader work in their worktree; a member
-# reads and reports.
+# before its first step.  Every stage writes (2026-09-15: members draft documents, not only
+# reports); web tools stay opt-in.
 DEFAULT_TOOLS = {"hauptagent": ("Bash", "Read", "Grep", "Glob", "Write", "Edit"),
                  "teamleiter": ("Bash", "Read", "Grep", "Glob", "Write", "Edit"),
-                 "mitglied": ("Bash", "Read", "Grep", "Glob")}
+                 "mitglied": ("Bash", "Read", "Grep", "Glob", "Write", "Edit")}
 # The Bash patterns a turn needs in any case: the controller RPC client in the turn
 # directory, stored scripts (`agents/bibliothek/skripte`), skill scripts and reading git.
 # An interpreter pattern without a narrower argument (`python3 *`) grants nothing.

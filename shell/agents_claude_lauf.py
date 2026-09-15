@@ -76,7 +76,8 @@ class ClaudeLauf:
                  workspace: Path, agent_state: Path, zug: ClaudeZug, backend: BackendConfig,
                  auth_headers: Optional[Callable[[], tuple[tuple[str, str], ...]]],
                  extra_read_paths: tuple[Path, ...] = (), launcher_options: Optional[dict[str, Any]] = None,
-                 unit_prefix: str = "wb-agents-linux-claude-", netz: bool = False):
+                 unit_prefix: str = "wb-agents-linux-claude-", netz: bool = False,
+                 extra_write_paths: tuple[Path, ...] = ()):
         self.orte = orte
         self.world_root = Path(world_root)
         self.world = ad.read_world(self.world_root)
@@ -90,6 +91,9 @@ class ClaudeLauf:
         self.backend = backend
         self.auth_headers = auth_headers
         self.extra_read_paths = tuple(Path(path) for path in extra_read_paths)
+        # Beschreibbar neben Arbeits- und Zustandsordner: der gemeinsame Ordner `work/` des Projekts
+        # (agents_traeger.projekt_pfade); alles andere vom Projekt ist nur lesbar eingebunden.
+        self.extra_write_paths = tuple(Path(path) for path in extra_write_paths)
         self.launcher_options = dict(launcher_options or {})
         self.unit_prefix = unit_prefix
         # Netz nur fuer einen Zug mit bereitgestellten Zugaengen (agents_zugaenge); sonst bleibt es getrennt.
@@ -137,7 +141,7 @@ class ClaudeLauf:
             read_paths = (self.orte.runtime, turn_dir, *self.zug.lese_pfade(), *self.extra_read_paths)
             self.launcher = ClaudeZugLauncher(
                 self.orte.launcher_state, read_paths=read_paths,
-                write_paths=(self.workspace, self.agent_state),
+                write_paths=(self.workspace, self.agent_state, *self.extra_write_paths),
                 socket_bindings=(SocketBinding(self.proxy.socket_path, "/run/wb-model.sock"), self.endpoint.binding),
                 output_dir=self.orte.output, unit_prefix=self.unit_prefix, network=self.netz,
                 **self.launcher_options)

@@ -57,8 +57,26 @@ gelten in der Auswahl, die die Stufe braucht; bei Widerspruch gilt diese Datei f
   Skills werden nach Bedarf geladen, nicht auf Vorrat. Die Tokenzahl je Ticketart ist ein
   Maß; ein Skill, der sie senkt, ist ein Beleg.
 
+## Fähigkeiten der Agenten (der Nutzer, 15.09.2026, nach dem Myproject-Plan)
+
+- Rechercheagenten brauchen Webzugriff; er ist je Agent wählbar (Web-Werkzeuge im Profil),
+  nicht Vorgabe für alle.
+- Jeder Agent sieht das Projekt seiner Welt (Projektwurzel lesend); geschrieben wird im eigenen
+  Arbeitsverzeichnis und im gemeinsamen Ordner `work/` des Projekts.
+- Mitglieder bekommen Write und Edit wie Teamleiter; Lesen-und-Berichten ist keine Vorgabe mehr.
+- Mail läuft auch auf peer: gmail, gmx und das Myproject-Postfach, mit denselben Sende- und
+  Freigaberegeln wie auf dem Mac (`regeln/email.md`, Projekt-COMPLIANCE).
+- Agenten sind Cloud zuerst oder haben einen Cloud-Fallback. Auf peer immer Cloud (die lokalen
+  Modelle dort sind zu schwach): Sonnet oder Opus, der Fallback ebenfalls Cloud.
+- Kein täglicher Lauf als Vorgabe; Wecker nur, wo ein Anlass sie verlangt. Tägliche Züge ohne
+  Anlass sind Verschwendung.
+
 ## Zugänge (der Nutzer, 15.09.2026)
 
 - Zugänge einer Welt (`zugaenge.json`, `wb-welt zugang … --bestaetigt`) sind die einzige Tür
   nach draußen: Netz und ein `ssh <name>`-Weg für alle Agenten der Welt. Der Mensch richtet sie
   je Welt ein; ein Agent erweitert sie nie, liest keinen Schlüssel und nennt kein anderes Ziel.
+- Drei Arten (15.09.2026): `ssh`, `web` (nur Netz, für Agenten mit WebFetch/WebSearch im Profil)
+  und `mail` (lesende Postfachwerkzeuge `<ein eigenes Mailwerkzeug>`, `<ein eigenes Mailwerkzeug>` mit Passwort aus dem Schlüsselbund des
+  Trägerhosts). Über einen Zugang wird nie gesendet: `<ein eigenes Mailwerkzeug>` und `msmtp` bleiben auf der Hausliste;
+  Entwürfe legt der Agent als Datei ab, der Mensch sendet nach `regeln/email.md`.

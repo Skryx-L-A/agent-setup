@@ -32,7 +32,7 @@ RUNTIME_MODULES = (
     RUNNER, "agents_pi_runner.py", "agents_codex_runner.py", "agents_model_bridge.py", "agents_rpc_client.py", "agents_controller.py",
     "agents_data.py", "atomar_schreiben.py",
 )
-ALLOWED_TOOLS = frozenset({"Bash", "Read", "Write", "Edit", "Glob", "Grep"})
+ALLOWED_TOOLS = frozenset({"Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch"})
 MAX_CREDENTIAL_BYTES = 64 * 1024
 MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
 _TOKEN = re.compile(r"[A-Za-z0-9._~+/=-]{16,1024}\Z")
