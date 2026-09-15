@@ -45,6 +45,7 @@ if __name__ == "__main__":
 
 import agents_data as ad  # noqa: E402
 import agents_skills as ask  # noqa: E402
+import agents_zugaenge as az  # noqa: E402
 import atomar_schreiben  # noqa: E402
 from agents_claude import (  # noqa: E402
     RUNTIME_MODULES, AnmeldungMitRueckfall, AnmeldungNichtVerfuegbar, ClaudeAdapterFehler, ClaudeAnmeldungNurLesen,
@@ -270,7 +271,8 @@ def zeitgeber_unit(konfig: TraegerKonfig) -> str:
 
 
 def _claude_lauf_fabrik(traeger: "WeltTraeger", *, agent_id: str, run_id: str, zug: ClaudeZug,
-                        workspace: Path, agent_state: Path, extra_read_paths: tuple[Path, ...] = ()):
+                        workspace: Path, agent_state: Path, extra_read_paths: tuple[Path, ...] = (),
+                        netz: bool = False):
     from agents_claude_lauf import ClaudeLauf, LaufOrte
     k, orte = traeger.konfig, traeger.orte
     lauf_orte = LaufOrte(orte.runs, orte.launcher, orte.output, orte.sockets, orte.turns, orte.runtime)
@@ -281,7 +283,7 @@ def _claude_lauf_fabrik(traeger: "WeltTraeger", *, agent_id: str, run_id: str, z
     return ClaudeLauf(lauf_orte, world_root=k.world_root, agent_id=agent_id, run_id=run_id, workspace=workspace,
                       agent_state=agent_state, zug=zug, backend=k.backend_fuer(zug.model, "pi" if pi else "claude"),
                       auth_headers=None if pi else traeger.anmeldequelle.auth_headers, extra_read_paths=extra_read_paths,
-                      launcher_options=dict(k.launcher), unit_prefix=k.unit_prefix)
+                      launcher_options=dict(k.launcher), unit_prefix=k.unit_prefix, netz=netz)
 
 
 def _claude_observer(traeger: "WeltTraeger"):
@@ -464,8 +466,11 @@ class WeltTraeger:
                     "WB_PROFIL_BIN": str(self.orte.runtime / "wb-profil")})
         return sorted((key, value) for key, value in env.items() if value)
 
-    def _sperr_einstellungen(self) -> dict[str, Any]:
-        """Zug-eigene Claude-Code-Einstellungen mit Skills- und Profil-Sperre aus den Snippets."""
+    def _sperr_einstellungen(self, zugang: Optional[az.Bereitstellung] = None) -> dict[str, Any]:
+        """Zug-eigene Claude-Code-Einstellungen mit Skills- und Profil-Sperre aus den Snippets.
+
+        Mit Zugaengen stehen deren Huellen vorn im PATH von Bash und Hooks, und ``WB_ZUGAENGE`` nennt der
+        Profil-Sperre den Zugangsordner; ``extra_env`` des Zuges kennt beides nicht."""
         hooks = self.orte.runtime / "hooks"
 
         def eintrag(matcher: str, name: str) -> dict[str, Any]:
@@ -473,7 +478,28 @@ class WeltTraeger:
                                                    "command": 'bash "%s"' % (hooks / name)}]}
         skills = [eintrag(m, "skills-sperre.sh") for m in ("Bash", "Skill", "Read|Grep|Glob",
                                                           "Write|Edit|MultiEdit|NotebookEdit")]
-        return {"hooks": {"PreToolUse": skills + [eintrag("*", "profil-sperre.sh")]}}
+        settings: dict[str, Any] = {"hooks": {"PreToolUse": skills + [eintrag("*", "profil-sperre.sh")]}}
+        if zugang is not None:
+            settings["env"] = {"PATH": "%s:/usr/local/bin:/usr/bin:/bin" % zugang.ordner,
+                               "WB_ZUGAENGE": str(zugang.ordner)}
+        return settings
+
+    def _zugaenge_aufraeumen(self) -> list[str]:
+        """Loescht Zugangskopien jedes Zugordners, dessen Zug beendet ist oder nicht mehr im Register steht.
+
+        Faengt einen Absturz zwischen Zugende und ``close`` ab; ein laufender Zug behaelt seine Kopien."""
+        if not self.orte.turns.is_dir():
+            return []
+        runs = self._zuege_lesen()["runs"]
+        removed = []
+        for folder in sorted(self.orte.turns.iterdir()):
+            entry = runs.get(folder.name)
+            if entry is not None and entry.get("outcome") is None:
+                continue
+            with contextlib.suppress(OSError):
+                if az.aufraeumen(folder):
+                    removed.append(folder.name)
+        return removed
 
     def _skills(self, agent_id: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
         """Schreibt ``skills.json`` vor dem Zug; ein Fehler startet den Zug ohne Skills und bleibt sichtbar."""
@@ -589,6 +615,7 @@ class WeltTraeger:
         world = ad.read_world(self.root)
         world_id = world["id"]
         self._laeufe_pruefen(world_id, summary)
+        self._zugaenge_aufraeumen()
         busy = {entry["agent"] for entry in self._zuege_lesen()["runs"].values() if entry.get("outcome") is None}
         runs = self.runs()
         freigabe_cache: dict[str, Startfreigabe] = {}
@@ -864,7 +891,8 @@ class WeltTraeger:
         return "\n".join(lines)
 
     def _anweisung(self, world: dict[str, Any], agent: dict[str, Any], run_dir: Path,
-                   verzeichnis: Optional[dict[str, Any]], skills_fehler: Optional[str]) -> str:
+                   verzeichnis: Optional[dict[str, Any]], skills_fehler: Optional[str],
+                   zugang: Optional[az.Bereitstellung] = None, zugang_fehler: Optional[str] = None) -> str:
         """Anweisungsdatei des Zuges: eigene Anweisungen, Gedaechtnis, Skills mit Pfad, Zugende mit Lernschritt."""
         folder = ad._agent_dir(self.root, agent["id"])
 
@@ -896,6 +924,13 @@ class WeltTraeger:
         if not skills:
             lines.append("Keine Skills verzeichnet." if not skills_fehler else
                          "Skillverzeichnis nicht lesbar: %s" % skills_fehler)
+        if zugang is not None or zugang_fehler:
+            lines += ["", "## Zugänge", ""]
+            if zugang is not None:
+                lines += ["Die Welt hat Zugänge nach draußen; nur über sie erreichst du andere Rechner. Rufe sie genau "
+                          "so auf, ohne Pfad, Variablen oder zusätzliche ssh-Optionen:"] + az.anweisung(zugang.namen)
+            else:
+                lines.append("Die Zugänge der Welt sind in diesem Zug nicht bereit: %s" % zugang_fehler)
         if agent["stage"] == "hauptagent":
             draft = {"id": "NAME", "stage": "mitglied", "team": "TEAM", "specialty": "Ein Satz zur Aufgabe",
                      "model": "sonnet5:high"}
@@ -997,8 +1032,16 @@ class WeltTraeger:
             skills = (verzeichnis or {}).get("skills") or []
             turn_dir = _private_dir(self.orte.turns / run_id, "Zugordner des Laufs")
             rpc = self._rpc_bereitstellen(run_dir)
+            zugang, zugang_fehler = None, None
+            if harness == "claude" and self.konfig.sperren:
+                # Zugaenge nur mit Profil-Sperre: ohne sie gaebe es keine Grenze zwischen Agent und Schluessel.
+                try:
+                    zugang = az.bereitstellen(self.root, turn_dir)
+                except (ad.AgentsError, OSError, ValueError, subprocess.SubprocessError) as exc:
+                    zugang_fehler = "%s: %s" % (type(exc).__name__, str(exc)[:200])
             anweisung = turn_dir / "ANWEISUNG.md"
-            atomar_schreiben.schreiben(anweisung, self._anweisung(world, agent, run_dir, verzeichnis, skills_fehler),
+            atomar_schreiben.schreiben(anweisung, self._anweisung(world, agent, run_dir, verzeichnis, skills_fehler,
+                                                                  zugang, zugang_fehler),
                                        modus=0o600, dauerhaft=True)
             agent_dir = ad._agent_dir(self.root, agent_id)
             libraries = [Path(str((verzeichnis or {}).get(key) or "")) for key in ("bibliothek", "skript_bibliothek")]
@@ -1006,7 +1049,8 @@ class WeltTraeger:
             # sind oeffentlich und nur lesbar eingebunden.
             read_paths = tuple(Path(item["pfad"]) for item in skills) + (agent_dir / "agent.json",) + (
                 (agent_dir / "skills.json",) if verzeichnis else ()) + tuple(
-                path for path in libraries if path.is_absolute() and path.is_dir())
+                path for path in libraries if path.is_absolute() and path.is_dir()) + (
+                (zugang.weltdatei,) if zugang is not None else ())
             env = self._zugumgebung(agent_id, workspace, run_dir, rpc, verzeichnis is not None)
             prompt = self._prompt(world, agent, posten, resume, ticket, nachricht, frage, run_dir, skills)
             if harness == "pi":
@@ -1030,7 +1074,7 @@ class WeltTraeger:
                 settings = None
                 if self.konfig.sperren:
                     settings = turn_dir / "settings.json"
-                    atomar_schreiben.schreiben(settings, json.dumps(self._sperr_einstellungen(), indent=2) + "\n",
+                    atomar_schreiben.schreiben(settings, json.dumps(self._sperr_einstellungen(zugang), indent=2) + "\n",
                                                modus=0o600, dauerhaft=True)
                 tools = tuple(t for t in agent.get("tools") or [] if t in ALLOWED_TOOLS) or self.konfig.tools
                 zug = ClaudeZug(self.konfig.claude_binary, model, prompt, session_id, str(config_dir), resume, tools,
@@ -1039,9 +1083,11 @@ class WeltTraeger:
             with self._zuege() as state:
                 state["runs"][run_id].update({"denkstufe": stufe, "skills": [item["name"] for item in skills],
                                               "skills_fehler": skills_fehler, "sperren": bool(self.konfig.sperren
-                                                                                             and harness == "claude")})
+                                                                                             and harness == "claude"),
+                                              "zugaenge": list(zugang.namen) if zugang is not None else [],
+                                              "zugaenge_fehler": zugang_fehler})
             lauf = self._zug_fabrik(self, agent_id=agent_id, run_id=run_id, zug=zug, workspace=workspace,
-                                    agent_state=agent_state, extra_read_paths=read_paths)
+                                    agent_state=agent_state, extra_read_paths=read_paths, netz=zugang is not None)
             self.laeufe[run_id] = lauf
             lauf.start()
         except Exception as exc:  # noqa: BLE001 - jeder Startfehler wird sichtbar abgeschlossen
@@ -1049,6 +1095,8 @@ class WeltTraeger:
             if lauf is not None:
                 with contextlib.suppress(Exception):
                     lauf.close()
+            with contextlib.suppress(OSError):
+                az.aufraeumen(self.orte.turns / run_id)
             detail = "%s: %s" % (type(exc).__name__, str(exc)[:200])
             self._nachbereiten(world["id"], entry, "startfehler", detail, marker)
             return None
@@ -1091,6 +1139,9 @@ class WeltTraeger:
         if lauf is not None:
             with contextlib.suppress(Exception):  # das Urteil haengt nicht am Kanalabbau
                 lauf.close()
+        # Auch ohne Laufobjekt (Traeger neu gestartet): die Zugangskopien des beendeten Zuges gehen jetzt.
+        with contextlib.suppress(OSError):
+            az.aufraeumen(self.orte.turns / run_id)
         receipt = LaunchReceipt.from_dict(record["receipt"]) if record.get("receipt") else None
         data = self._ausgabe(self, receipt) if receipt is not None else b""
         pi = entry.get("harness") == "pi"
@@ -1397,7 +1448,85 @@ class WeltTraeger:
                 "naechster_weckzeitpunkt": self.naechster_weckzeitpunkt(),
                 "offene_zuege": [entry for entry in state["runs"].values() if entry.get("outcome") is None],
                 "letzte_zuege": sorted((entry for entry in state["runs"].values() if entry.get("outcome")),
-                                       key=lambda entry: entry.get("ended_at") or 0)[-10:]}
+                                       key=lambda entry: entry.get("ended_at") or 0)[-10:],
+                "agenten": self.zug_stand()}
+
+    def zug_stand(self) -> dict[str, dict[str, Any]]:
+        """Das Lebenszeichen je Agent fuer die Oberflaeche (Auftrag agentaktiv, docs/AGENTS-OBERFLAECHE.md).
+
+        ``laeuft``/``seit``/``art``: der offene Zug. ``zustellung_offen``: eine Zustellung wartet auf einen Zug
+        (Postfach, beantwortete Frage, faelliger Wecker), ``wartet_seit`` die aelteste davon. ``grund``: warum
+        sie keinen Zug hat, soweit der Traeger es festhaelt (``kontingent``, ``anmeldung``, ``recovery_limit``,
+        ``pausiert``, ``gestoppt``, ``ungeklaert``, ein Wecker-Grund oder das Urteil des letzten Zuges dafuer).
+        ``naechster_wecker``: wann ein Selbstwecker oder das Ende des Schlafs den Agenten wieder weckt.
+        ``letzter``: Ende, Urteil und Art des letzten beendeten Zuges. Liest nur; beansprucht nichts.
+        """
+        state = self._zuege_lesen()
+        world = ad.read_world(self.root)
+        world_id = world["id"]
+        now = self._now()
+        ungeklaert = {item.get("agent") for item in RunController(self.orte.runs).ungeklaert()
+                      if item.get("world") == world_id} if self.orte.runs.exists() else set()
+        offene = self.wecker.offene(world_id)
+        raus: dict[str, dict[str, Any]] = {}
+        for agent in ad.list_agents(self.root):
+            agent_id = agent["id"]
+            eigene = [entry for entry in state["runs"].values() if entry.get("agent") == agent_id]
+            laufend = sorted((e for e in eigene if e.get("outcome") is None), key=lambda e: float(e.get("started_at") or 0))
+            beendet = sorted((e for e in eigene if e.get("outcome")), key=lambda e: float(e.get("ended_at") or 0))
+            zug = laufend[-1] if laufend else None
+            wecker_zeiten: list[float] = []
+            schlaf = state["schlaf"].get(agent_id)
+            if schlaf and float(schlaf.get("bis") or 0) > now:
+                wecker_zeiten.append(float(schlaf["bis"]))
+            wartend: list[tuple[Posten, Optional[str]]] = []
+            if zug is None:
+                for posten in self._posten(world_id, agent_id):
+                    if posten.art == "aufwachen":
+                        continue
+                    try:
+                        status = self.wecker.status(posten.delivery.delivery_id)
+                    except WeckerFehler:
+                        status = None
+                    if status is not None and status.status == "completed":
+                        continue
+                    if posten.delivery.cause in {"self_timer", "recovery"} and posten.delivery.due_at > now + 1.0:
+                        continue
+                    wartend.append((posten, status.reason if status is not None else None))
+            for delivery, status in offene:
+                if delivery.agent == agent_id and delivery.cause in {"self_timer", "recovery"} and delivery.due_at > now \
+                        and status.reason not in {"recovery_limit", "paused", "stopped"}:
+                    wecker_zeiten.append(float(delivery.due_at))
+            grund: Optional[str] = None
+            if zug is None and wartend:
+                ids = {posten.delivery.delivery_id for posten, _ in wartend}
+                fehlgeschlagen = [e for e in beendet if e.get("delivery_id") in ids and e.get("outcome") not in {"erfolg", "bereits_erledigt"}]
+                gruende = [reason for _, reason in wartend if reason and reason not in {"not_due", "claim_in_flight", "active_run"}]
+                if world.get("state") in {"pausiert", "gestoppt"}:
+                    grund = world["state"]
+                elif agent.get("state") in {"pausiert", "gestoppt", "archiviert"}:
+                    grund = "gestoppt" if agent["state"] == "archiviert" else agent["state"]
+                elif schlaf and float(schlaf.get("bis") or 0) > now:
+                    grund = str(schlaf.get("grund") or "schlaeft")
+                elif agent_id in ungeklaert:
+                    grund = "ungeklaert"
+                elif gruende:
+                    grund = {"paused": "pausiert", "stopped": "gestoppt"}.get(gruende[0], gruende[0])
+                elif fehlgeschlagen:
+                    grund = str(fehlgeschlagen[-1]["outcome"])
+            letzter = beendet[-1] if beendet else None
+            raus[agent_id] = {
+                "laeuft": zug is not None,
+                "seit": _iso(zug.get("started_at")) if zug else None,
+                "art": _zug_art(zug) if zug else None,
+                "zustellung_offen": bool(wartend),
+                "wartet_seit": _iso(min(posten.delivery.due_at for posten, _ in wartend)) if wartend else None,
+                "grund": grund,
+                "naechster_wecker": _iso(min(wecker_zeiten)) if wecker_zeiten else None,
+                "letzter": {"ende": _iso(letzter.get("ended_at")), "ergebnis": str(letzter["outcome"]),
+                            "art": _zug_art(letzter)} if letzter else None,
+            }
+        return raus
 
     # Lebenszyklus ----------------------------------------------------------------
     def laufen(self, *, frist_s: float = 3600.0, poll_s: float = 0.5,
@@ -1436,6 +1565,25 @@ class WeltTraeger:
                                 self.runs().stop(self.world_id(), entry["agent"], expected_run_id=entry["run_id"])
                     deadline = time.monotonic() + 60
                 time.sleep(poll_s)
+
+
+def _iso(zeit: Any) -> Optional[str]:
+    """Epoch-Sekunden als ISO-Zeit in UTC, wie die Weltdateien sie schreiben (``agents_data.now``)."""
+    if not isinstance(zeit, (int, float)) or isinstance(zeit, bool) or zeit <= 0:
+        return None
+    return _dt.datetime.fromtimestamp(float(zeit), _dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _zug_art(entry: dict[str, Any]) -> str:
+    """Die Art eines Zuges fuer die Oberflaeche: ``recovery``, ``ticket``, ``frage`` oder ``nachricht``."""
+    if entry.get("cause") == "recovery":
+        return "recovery"
+    art = entry.get("art")
+    if art in {"ticket", "fortsetzen"} or (entry.get("ticket_id") and art not in {"nachricht", "rueckmeldung", "antrag", "antwort"}):
+        return "ticket"
+    if art == "antwort":
+        return "frage"
+    return "nachricht"
 
 
 def _skill_aufrufe(data: bytes, namen: list[str], pfade: dict[str, str]) -> list[dict[str, str]]:
@@ -1655,6 +1803,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             p.add_argument("--nicht-wecken", action="store_true")
         if name == "laufen":
             p.add_argument("--frist", type=float, default=3600.0)
+        if name == "status":
+            # Nur das Lebenszeichen je Agent: ohne Messungen, Autostart und Kontingentquelle, fuer den Takt der Oberflaeche.
+            p.add_argument("--nur-zug", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "einrichten":
@@ -1677,6 +1828,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(json.dumps(traeger.laufen(frist_s=args.frist, log=log), ensure_ascii=False), flush=True)
             return 0
         traeger = WeltTraeger(konfig)
+        if args.command == "status" and args.nur_zug:
+            print(json.dumps({"world": traeger.world_id(), "agenten": traeger.zug_stand()}, ensure_ascii=False))
+            return 0
         if args.command == "status":
             print(json.dumps(traeger.status(), ensure_ascii=False, indent=2))
             return 0

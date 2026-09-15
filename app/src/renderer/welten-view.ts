@@ -207,6 +207,7 @@ const ZUG_MUSTER: [RegExp, string][] = [
   [/^wartet bei ([\s\S]+)$/, 'welten.zug.wartetBei'],
   [/^schläft, ([\s\S]+) zurückgegeben$/, 'welten.zug.schlaeftZurueck'],
   [/^schläft, (\d+) Tickets offen$/, 'welten.zug.schlaeftTickets'],
+  [/^schläft, ([\s\S]+) läuft$/, 'welten.zug.schlaeftLaeuft'],
   [/^schläft, ([\s\S]+) offen$/, 'welten.zug.schlaeftOffen'],
 ];
 function zugText(roh: string): string {
@@ -235,6 +236,121 @@ function alter(iso: string): string {
   if (s < 86400) return t('welten.zeit.stunden', { n: Math.floor(s / 3600) });
   return uhrzeit(iso);
 }
+// --- Das Lebenszeichen (Auftrag agentaktiv) ------------------------------------------------
+// Der Kern liefert je Agent `leben` und `antwort` mit Zeiten; die laufende Uhr und die 30 Sekunden bis
+// „nicht gestartet" rechnet die Ansicht, damit die Nutzlast nicht jede Sekunde anders aussieht.
+
+/** Nach so vielen Millisekunden ohne Zugbeginn heisst eine zugestellte Nachricht „nicht gestartet". */
+export const NICHT_GESTARTET_MS = 30_000;
+
+/** m:ss, ab einer Stunde h:mm:ss, seit einer ISO-Zeit. */
+export function dauerSeit(iso: string | null | undefined, jetzt = Date.now()): string {
+  const d = iso ? Date.parse(iso) : NaN;
+  if (Number.isNaN(d)) return '';
+  const sek = Math.max(0, Math.floor((jetzt - d) / 1000));
+  const h = Math.floor(sek / 3600);
+  const m = Math.floor((sek % 3600) / 60);
+  return h ? `${h}:${zweistellig(m)}:${zweistellig(sek % 60)}` : `${m}:${zweistellig(sek % 60)}`;
+}
+
+function grundWort(g: string | null | undefined): string { return g ? wort('grund', g) : ''; }
+
+/**
+ * Das Wort neben dem Avatar, wenn der Traeger etwas zu sagen hat: arbeitet seit, wartet auf den Traeger,
+ * Traeger nicht erreichbar. null heisst: es gilt das Zustandswort (schläft, braucht dich, hat Ergebnis …).
+ */
+export function lebenWort(a: Pick<WeltAgent, 'leben' | 'zustand'>, jetzt = Date.now()): string | null {
+  const l = a.leben;
+  if (!l) return null;
+  if (l.stand === 'arbeitet') return l.seit ? t('welten.leben.arbeitetSeit', { dauer: dauerSeit(l.seit, jetzt) }) : t('welten.leben.arbeitet');
+  if (['braucht_dich', 'pausiert', 'gestoppt', 'archiviert'].includes(a.zustand)) return null;
+  if (l.stand === 'wartet') return t('welten.leben.wartet');
+  if (l.stand === 'nicht_erreichbar') return t('welten.leben.weg');
+  return null;
+}
+
+/** Der Punkt zum Wort: steht das Lebenszeichen da, zeigt auch der Punkt es (arbeitet gefuellt, wartet hohl, weg aus). */
+function agentPunkt(a: WeltAgent): string {
+  if (lebenWort(a) === null) return zustandPunkt(a.zustand);
+  return a.leben?.stand === 'arbeitet' ? 'laeuft' : a.leben?.stand === 'wartet' ? 'ruhig' : 'aus';
+}
+
+/** Das Wort neben dem Punkt: das Lebenszeichen, sonst das Zustandswort. */
+function agentWort(a: WeltAgent, jetzt = Date.now()): string { return lebenWort(a, jetzt) ?? zustandWort(a.zustand); }
+
+/** Der Ring um die Figur: `arbeitet` (bewegt), `wartet` (gepunktet, still), sonst keiner. */
+export function ringVon(a: Pick<WeltAgent, 'leben'>): '' | 'arbeitet' | 'wartet' {
+  return a.leben?.stand === 'arbeitet' ? 'arbeitet' : a.leben?.stand === 'wartet' ? 'wartet' : '';
+}
+
+/** Der Stand unter der eigenen Nachricht; null, wenn keiner gilt. */
+export function antwortText(a: Pick<WeltAgent, 'antwort' | 'name'>, jetzt = Date.now()): { text: string; art: string } | null {
+  const st = a.antwort;
+  if (!st) return null;
+  if (st.stand === 'arbeitet') return { text: t('welten.antwort.arbeitet', { name: a.name }), art: 'arbeitet' };
+  if (st.stand === 'beendet') return { text: t('welten.antwort.beendet', { grund: grundWort(st.grund) }), art: 'beendet' };
+  if (st.stand === 'nicht_erreichbar') return { text: t('welten.antwort.weg'), art: 'weg' };
+  const gesendet = Date.parse(st.zeit);
+  if (!Number.isNaN(gesendet) && jetzt - gesendet >= NICHT_GESTARTET_MS) {
+    return { text: st.grund ? t('welten.antwort.nichtGestartetGrund', { grund: grundWort(st.grund) }) : t('welten.antwort.nichtGestartet'), art: 'nicht_gestartet' };
+  }
+  const k = st.wecken === 'gestartet' ? 'welten.antwort.geweckt' : st.wecken === 'laeuft' ? 'welten.antwort.lief' : st.wecken === 'fehler' ? 'welten.antwort.nichtGeweckt' : 'welten.antwort.zugestellt';
+  return { text: t(k), art: 'zugestellt' };
+}
+
+/** Der Punkt der Zeile unter der Nachricht: gefuellt beim Arbeiten, hohl beim Zustellen, sonst der Hinweis. */
+function antwortPunkt(art: string): string { return art === 'arbeitet' ? 'laeuft' : art === 'zugestellt' ? 'ruhig' : 'will'; }
+
+/** Ein Wort, dessen Text die Uhr jede Sekunde neu setzt (`uhrenStellen`). */
+function uhrWort(klasse: string, agent: string, form: 'leben' | 'antwort', text: string): HTMLSpanElement {
+  const sp = el('span', klasse, text);
+  sp.dataset.uhr = form;
+  sp.dataset.agent = agent;
+  return sp;
+}
+
+let uhr: ReturnType<typeof setInterval> | null = null;
+/** Jede Sekunde: die Worte mit `data-uhr` neu setzen, ohne das Blatt neu zu zeichnen (Fokus und Auswahl bleiben). */
+function uhrenStellen(): void {
+  const w = welt();
+  if (!blatt || !sichtbarAn || !w) return;
+  const jetzt = Date.now();
+  for (const sp of blatt.querySelectorAll<HTMLElement>('[data-uhr]')) {
+    const a = agentVon(w, sp.dataset.agent ?? '');
+    if (!a) continue;
+    if (sp.dataset.uhr === 'leben') {
+      const neu = agentWort(a, jetzt);
+      if (sp.textContent !== neu) sp.textContent = neu;
+    } else {
+      const at = antwortText(a, jetzt);
+      const zeile = sp.closest<HTMLElement>('.wv-antwortstand');
+      if (!at || !zeile) continue;
+      if (sp.textContent !== at.text) sp.textContent = at.text;
+      // Nach 30 Sekunden wechselt mit dem Wort auch die Art: Farbe und Punkt der Zeile folgen ihr.
+      if (zeile.dataset.art !== at.art) {
+        zeile.dataset.art = at.art;
+        zeile.querySelector('.punkt')?.replaceWith(punkt(antwortPunkt(at.art)));
+      }
+    }
+  }
+}
+
+/** Ein Umlauf des Bogens: ruhig genug fuer den Blick zur Seite, schnell genug, um Bewegung zu sehen. */
+const ZUG_UMLAUF_MS = 1800;
+
+const ZUG_STIL = `
+#weltenblatt .wv-figur { position: relative; display: inline-flex; flex: 0 0 auto; }
+#weltenblatt .wv-figur::before, #weltenblatt .wv-figur::after { content: ''; position: absolute; inset: -3px; border-radius: 50%; pointer-events: none; box-sizing: border-box; }
+#weltenblatt .wv-figur.ring-arbeitet::before { border: 2px solid var(--zustand-laeuft); opacity: 0.28; }
+#weltenblatt .wv-figur.ring-arbeitet::after { border: 2px solid transparent; border-top-color: var(--zustand-laeuft); border-right-color: var(--zustand-laeuft); animation: wv-zug-dreh ${ZUG_UMLAUF_MS}ms linear infinite; animation-delay: var(--wv-verzug, 0ms); }
+#weltenblatt .wv-figur.ring-wartet::before { border: 1.5px dashed var(--gedaempft); }
+#weltenblatt.ruhig .wv-figur.ring-arbeitet::after { animation: none; border-color: var(--zustand-laeuft); }
+@media (prefers-reduced-motion: reduce) { #weltenblatt .wv-figur.ring-arbeitet::after { animation: none; border-color: var(--zustand-laeuft); } }
+@keyframes wv-zug-dreh { to { transform: rotate(360deg); } }
+#weltenblatt .wv-antwortstand { align-self: flex-end; margin-top: -6px; font-size: 11px; color: var(--gedaempft); display: flex; align-items: center; gap: 5px; }
+#weltenblatt .wv-antwortstand[data-art="nicht_gestartet"], #weltenblatt .wv-antwortstand[data-art="beendet"], #weltenblatt .wv-antwortstand[data-art="weg"] { color: var(--zustand-wartet); }
+`;
+
 function stufeWort(s: string): string { return wort('stufe', s); }
 function teamWort(t: string): string { return t ? t.charAt(0).toUpperCase() + t.slice(1) : t; }
 function zustandWort(zu: string): string { return wort('zustand', zu); }
@@ -895,14 +1011,25 @@ function eingabe(schluessel: string, wert: string): void {
 // --- Zeichnen ----------------------------------------------------------------------------
 
 const figurenCache = new Map<string, HTMLCanvasElement>();
-function agentFigur(a: WeltAgent, groesse: number): HTMLCanvasElement {
+/**
+ * Die Figur eines Agenten, in einer Huelle mit dem Ring des Lebenszeichens (Auftrag agentaktiv): ein ruhig
+ * kreisender Bogen, solange ein Zug laeuft, ein gepunkteter Ring, solange eine Zustellung auf den Traeger
+ * wartet. Bei „Bewegung reduzieren" (System oder `welten bewegung reduziert`) steht der Bogen als voller Ring.
+ */
+function agentFigur(a: WeltAgent, groesse: number): HTMLElement {
   const art: Art = a.figur.art === 'tier' ? 'tier' : 'roboter';
   const rolle = a.figur.art === 'kern' ? 'hauptagent' : a.figur.art === 'linse' ? 'reviewer' : a.id;
   const team = a.figur.art === 'kern' ? 'hauptagent' : (a.figur.farbe || a.team || 'entwicklung');
   const schluessel = `${a.id}|${groesse}|${a.figur_zustand}|${a.figur.art}|${team}`;
   const c = figur({ rolle, stufe: a.stufe, name: a.id, team, art, groesse, zustand: figurZustandVon(a.figur_zustand), titel: a.name }, figurenCache.get(schluessel));
   figurenCache.set(schluessel, c);
-  return c;
+  const ring = ringVon(a);
+  const huelle = el('span', `wv-figur${ring ? ` ring-${ring}` : ''}`);
+  huelle.dataset.ring = ring;
+  // Der Bogen dreht nach der Uhr weiter, statt bei jedem Neuzeichnen (alle paar Sekunden) von vorn zu beginnen.
+  if (ring === 'arbeitet') huelle.style.setProperty('--wv-verzug', `-${Date.now() % ZUG_UMLAUF_MS}ms`);
+  huelle.appendChild(c);
+  return huelle;
 }
 function entwurfFigur(e: Entwurf, groesse: number): HTMLCanvasElement {
   const name = e.id || 'neu';
@@ -961,7 +1088,7 @@ function leisteZeichnen(w: Welt, n: WeltenNutzlast): HTMLElement {
     if (a.stufe !== 'mitglied') nameZeile.append(el('span', 'wv-stufe', a.stufe === 'hauptagent' ? stufeWort('hauptagent') : t('welten.stufe.leiterKurz')));
     if (mitTeam && a.team) nameZeile.append(el('span', 'wv-stufe', teamWort(a.team)));
     const unter = el('div', 'wv-unter');
-    unter.append(punkt(zustandPunkt(a.zustand)), el('span', undefined, ` ${zustandWort(a.zustand)} · ${a.spezialgebiet}`));
+    unter.append(punkt(agentPunkt(a)), el('span', undefined, ' '), uhrWort('wv-leben', a.id, 'leben', agentWort(a)), el('span', undefined, ` · ${a.spezialgebiet}`));
     tz.append(nameZeile, unter);
     b.appendChild(tz);
     const u = ungelesen(w, `einzel:${id}`);
@@ -1007,7 +1134,9 @@ function mitteZeichnen(w: Welt): HTMLElement {
     const oben = el('div', 'wv-mtitel');
     oben.append(el('span', 'wv-titel', a.name), el('span', 'wv-leise', `${stufeWort(a.stufe)}${a.team ? ` · ${teamText(a.team)}` : ''}`));
     const unten = el('div', 'wv-unter');
-    unten.append(el('span', 'wv-mono', a.modell), el('span', undefined, ` · ${a.maschine === 'mac' ? 'Mac' : a.maschine} · `), punkt(zustandPunkt(a.zustand)), el('span', undefined, ` ${zugText(a.zustand_text)}`));
+    unten.append(el('span', 'wv-mono', a.modell), el('span', undefined, ` · ${a.maschine === 'mac' ? 'Mac' : a.maschine} · `), punkt(agentPunkt(a)), el('span', undefined, ' '));
+    if (lebenWort(a) !== null) unten.append(uhrWort('wv-leben', a.id, 'leben', agentWort(a)), el('span', 'wv-leise', a.zustand === 'arbeitet' && a.zustand_text !== 'arbeitet' ? ` · ${zugText(a.zustand_text)}` : ''));
+    else unten.append(el('span', 'wv-leben', zugText(a.zustand_text)));
     kt.append(oben, unten);
     kopf.appendChild(kt);
   } else {
@@ -1106,9 +1235,19 @@ function chatZeichnen(w: Welt, a: WeltAgent | undefined): HTMLElement {
     leer.append(el('div', 'wv-leer-titel', t('welten.chat.leer')), el('div', 'wv-leise', a ? t('welten.chat.leerAgent', { name: a.name }) : t('welten.chat.leerKanal')));
     verlauf.appendChild(leer);
   }
+  const stand = k.startsWith('einzel:') && a ? antwortText(a) : null;
   for (const e of eintraege) {
     const karte = e.nachricht ? nachrichtKarte(w, e.nachricht) : e.frage ? frageKarte(w, e.frage) : null;
     if (karte) verlauf.appendChild(karte);
+    // Auftrag agentaktiv: direkt unter der eigenen, noch unbeantworteten Nachricht, bis die Antwort da ist.
+    if (stand && a && e.nachricht && e.id === a.antwort?.nachricht) {
+      const zeile = el('div', 'wv-antwortstand');
+      zeile.setAttribute('role', 'status');
+      zeile.dataset.art = stand.art;
+      const wortEl = uhrWort('wv-antwortstand-text', a.id, 'antwort', stand.text);
+      zeile.append(punkt(antwortPunkt(stand.art)), wortEl);
+      verlauf.appendChild(zeile);
+    }
   }
   box.appendChild(verlauf);
   const eing = el('div', 'wv-eingabe');
@@ -1267,6 +1406,9 @@ function inspektorZeichnen(w: Welt): HTMLElement {
       if (ziele.length) mk.appendChild(el('div', 'wv-leise', t('welten.maschine.umziehenText')));
       inhalt.appendChild(mk);
     }
+    if (w.zugaenge.length) {
+      inhalt.appendChild(karte(t('welten.zugaenge.titel'), el('div', undefined, t('welten.zugaenge.zeile', { liste: w.zugaenge.map((x) => `${x.name} (${x.art})`).join(', ') }))));
+    }
     const stopp = karte(t('welten.welt.sofortstopp'), el('div', 'wv-leise', t('welten.welt.sofortstoppText')));
     if (w.stand !== 'gestoppt') stopp.appendChild(knopf(t('welten.welt.stoppen'), 'stoppen', '', 'knopf-rand gefahr'));
     inhalt.appendChild(stopp);
@@ -1314,9 +1456,13 @@ function inspektorZeichnen(w: Welt): HTMLElement {
 function profilBlatt(w: Welt, a: WeltAgent, inhalt: HTMLElement): void {
   const kopf = el('div', 'wv-profilkopf');
   const pt = el('div');
-  pt.append(el('div', 'wv-titel', a.name), el('div', 'wv-leise', `${stufeWort(a.stufe)}${a.team ? ` · ${teamText(a.team)}` : ''}`), el('div', undefined, zustandWort(a.zustand)));
+  const zeile = el('div');
+  zeile.append(uhrWort('wv-leben', a.id, 'leben', agentWort(a)));
+  pt.append(el('div', 'wv-titel', a.name), el('div', 'wv-leise', `${stufeWort(a.stufe)}${a.team ? ` · ${teamText(a.team)}` : ''}`), zeile);
   kopf.append(agentFigur(a, 64), pt);
   inhalt.appendChild(kopf);
+  const lk = lebenszeichenKarte(w, a);
+  if (lk) inhalt.appendChild(lk);
   const betrieb = karte(t('welten.profil.betrieb'));
   const schalter = el('div', 'wv-zeile-knoepfe');
   const pausiert = a.stand === 'pausiert';
@@ -1344,6 +1490,22 @@ function profilBlatt(w: Welt, a: WeltAgent, inhalt: HTMLElement): void {
     wert(t('welten.feld.werkzeuge'), a.werkzeuge.join(', ') || t('welten.wort.keineEingetragen'), true), wert(t('welten.blatt.skills'), a.skills.join(', ') || t('welten.wort.keineEingetragen')),
     a.bash.length ? wert(t('welten.feld.bash'), a.bash.join(' · '), true) : null, a.kontextgrenze ? wert(t('welten.feld.kontextgrenze'), a.kontextgrenze) : null,
     wert(t('welten.detail.angelegt'), `${uhrzeit(a.angelegt)}${a.angelegt_von ? ` ${t('welten.profil.angelegtVon', { name: anzeigename(w, a.angelegt_von) })}` : ''}${a.vorlage ? `, ${t('welten.profil.vorlage', { name: a.vorlage })}` : ''}`), wert(t('welten.profil.kennung'), a.id, true)));
+}
+
+/** Auftrag agentaktiv: was der Traeger ueber den Zug dieses Agenten sagt; ohne Traeger keine Karte. */
+function lebenszeichenKarte(w: Welt, a: WeltAgent): HTMLElement | null {
+  if (!a.leben) return null;
+  const z2 = a.zug;
+  const jetzt = el('div', 'wv-wert');
+  jetzt.append(el('div', 'wv-wert-name', t('welten.lebenszeichen.jetzt')), uhrWort('wv-wert-text', a.id, 'leben', lebenWort(a) ?? t(a.leben.stand === 'schlaeft' ? 'welten.leben.schlaeft' : 'welten.leben.wartet')));
+  const k = karte(t('welten.lebenszeichen.titel'), jetzt,
+    z2?.laeuft && z2.art ? wert(t('welten.lebenszeichen.art'), wort('zugart', z2.art)) : null,
+    a.leben.grund ? wert(t('welten.lebenszeichen.grund'), grundWort(a.leben.grund)) : null,
+    a.leben.wecker ? wert(t('welten.lebenszeichen.wecker'), uhrzeit(a.leben.wecker)) : null,
+    z2?.letzter ? wert(t('welten.lebenszeichen.letzter'), t('welten.lebenszeichen.letzterText', { zeit: uhrzeit(z2.letzter.ende), ergebnis: z2.letzter.ergebnis })) : null,
+    w.traeger.zug_fehler ? el('div', 'wv-warnung', t('welten.lebenszeichen.fehler', { text: w.traeger.zug_fehler })) : null);
+  k.classList.add('wv-lebenszeichen');
+  return k;
 }
 
 function skillBlatt(a: WeltAgent, inhalt: HTMLElement): void {
@@ -1634,6 +1796,7 @@ function zeichnen(): void {
     if (d) blatt.appendChild(d);
   }
   blatt.appendChild(fussZeichnen());
+  blatt.classList.toggle('ruhig', figurenStand().reduziert === true);
   for (const [schluessel, top] of scrolls) {
     const x = blatt.querySelector<HTMLElement>(`[data-scroll="${CSS.escape(schluessel)}"]`);
     if (x) x.scrollTop = top;
@@ -1750,6 +1913,8 @@ export function weltenAnzeigen(an: boolean): void {
   sichtbarAn = an;
   blatt.classList.toggle('an', an);
   if (an) { lageSetzen(); zeichnen(); const w = welt(); if (w) gesehen(w, true); }
+  if (an && !uhr) uhr = setInterval(uhrenStellen, 1000);
+  if (!an && uhr) { clearInterval(uhr); uhr = null; }
   sichtbarkeitMelden();
 }
 
@@ -1788,7 +1953,17 @@ export function weltenUiState(): Record<string, unknown> {
     zeilen: [...(blatt?.querySelectorAll<HTMLElement>('.wv-zeilen [data-id]') ?? [])].map((x) => ({
       id: x.dataset.id ?? '', text: (x.querySelector('.wv-name')?.textContent ?? x.textContent ?? '').trim(),
       ungelesen: Number(x.querySelector('.wv-zahl')?.textContent ?? 0), figur: x.querySelector<HTMLCanvasElement>('canvas.agentenfigur')?.dataset.gestalt ?? '',
+      leben: (x.querySelector('.wv-leben')?.textContent ?? '').trim(), ring: x.querySelector<HTMLElement>('.wv-figur')?.dataset.ring ?? '',
+      figurZustand: x.querySelector<HTMLCanvasElement>('canvas.agentenfigur')?.dataset.zustand ?? '',
     })),
+    kopfLeben: { text: text('.wv-mkopf .wv-unter'), ring: blatt?.querySelector<HTMLElement>('.wv-mkopf .wv-figur')?.dataset.ring ?? '' },
+    antwortStand: (() => {
+      const x = blatt?.querySelector<HTMLElement>('.wv-antwortstand');
+      return x ? { text: (x.textContent ?? '').trim(), art: x.dataset.art ?? '', nach: x.previousElementSibling instanceof HTMLElement ? x.previousElementSibling.dataset.id ?? '' : '' } : null;
+    })(),
+    lebenszeichen: text('.wv-lebenszeichen'),
+    inspektorRing: blatt?.querySelector<HTMLElement>('.wv-profilkopf .wv-figur')?.dataset.ring ?? '',
+    ruhig: !!blatt?.classList.contains('ruhig'),
     kopf: text('.wv-mkopf .wv-titel'), zaehler: text('[data-zaehler]'), pause: text('.wv-pause .gewaehlt'),
     chat: [...(blatt?.querySelectorAll<HTMLElement>('.wv-verlauf > [data-id]') ?? [])].map((x) => ({
       id: x.dataset.id ?? '', art: x.classList.contains('wv-frage') ? 'frage' : 'nachricht', text: (x.querySelector('.wv-ntext')?.textContent ?? '').trim(),
@@ -1838,6 +2013,11 @@ export function initWeltenView(b: WeltenBruecke): void {
   const d = document.createElement('div');
   d.id = 'weltenblatt';
   rahmen.appendChild(d);
+  // Auftrag agentaktiv: Ring und Stand unter der Nachricht; die Regeln stehen hier, weil sie nur diese Ansicht betreffen.
+  const stil = document.createElement('style');
+  stil.id = 'wv-zug-stil';
+  stil.textContent = ZUG_STIL;
+  document.head.appendChild(stil);
   blatt = d;
   figurenEl = document.createElement('div');
   figurenEl.className = 'wv-figuren';
@@ -1907,8 +2087,11 @@ export function initWeltenView(b: WeltenBruecke): void {
     bewegung: (wert) => {
       figurenBewegungErzwingen(wert === 'reduziert' ? true : wert === 'normal' ? false : null);
       if (z.figuren) figurenblattZeichnen(true);
+      zeichnen();
       return weltenUiState();
     },
+    /** Auftrag agentaktiv: die Uhr einmal stellen, als waere eine Sekunde vergangen (Suiten warten sonst 30 s). */
+    uhr: () => { uhrenStellen(); return weltenUiState(); },
     /** `hidden|visible` -- das Fenster verbirgt sich oder erscheint wieder, wie beim Wechsel des Space. */
     fenster: (wert) => {
       Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (wert === 'hidden' ? 'hidden' : 'visible') });

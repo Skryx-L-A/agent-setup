@@ -58,6 +58,9 @@ _SECRET_PARTS = frozenset({
     ".aws", ".config", ".docker", ".gnupg", ".kube", ".secrets-sync", ".ssh",
     "90-secrets", ".env",
 })
+# Nur mit freigegebenem Netz (Zugaenge einer Welt): Namensaufloesung und Zertifikate des Hosts, nur lesend.
+_NETZ_DATEIEN = ("/etc/resolv.conf", "/etc/hosts", "/etc/host.conf", "/etc/gai.conf", "/etc/ssl",
+                 "/etc/ca-certificates", "/etc/pki")
 _SYSTEM_DENY = tuple(Path(value) for value in (
     "/", "/dev", "/etc", "/home", "/proc", "/root", "/run", "/sys", "/tmp",
     "/var/run", "/var/lib/docker",
@@ -133,6 +136,9 @@ class LinuxLauncher:
     writable host paths visible inside the sandbox.
     """
 
+    # Fail-closed default, also for instances built without ``__init__``: no shared network.
+    network = False
+
     def __init__(
         self,
         state_dir: str | os.PathLike[str],
@@ -147,6 +153,7 @@ class LinuxLauncher:
         systemd_run: Optional[str] = None,
         bwrap: Optional[str] = None,
         output_dir: str | os.PathLike[str] | None = None,
+        network: bool = False,
     ):
         if sys.platform != "linux":
             raise LinuxNichtUnterstuetzt("Linux-Launcher laeuft nur auf Linux")
@@ -154,6 +161,10 @@ class LinuxLauncher:
             raise ValueError("unit_prefix muss mit wb-agents-linux- beginnen und mit - enden")
         if not isinstance(stop_timeout, (int, float)) or stop_timeout <= 0:
             raise ValueError("stop_timeout muss positiv sein")
+        if not isinstance(network, bool):
+            raise ValueError("network muss boolesch sein")
+        # Ohne Zugaenge bleibt der Netz-Namensraum getrennt; nur ein Zug mit Zugaengen teilt das Hostnetz.
+        self.network = network
 
         self.systemctl = self._tool(systemctl, "systemctl")
         self.systemd_run = self._tool(systemd_run, "systemd-run")
@@ -531,7 +542,8 @@ class LinuxLauncher:
         uid = os.geteuid()
         account = pwd.getpwuid(uid).pw_name
         command = [
-            self.bwrap, "--unshare-user", "--disable-userns", "--unshare-pid", "--unshare-net",
+            self.bwrap, "--unshare-user", "--disable-userns", "--unshare-pid",
+            "--share-net" if self.network else "--unshare-net",
             "--unshare-ipc", "--unshare-uts", "--unshare-cgroup", "--new-session",
             "--die-with-parent", "--cap-drop", "ALL", "--clearenv", "--hostname", "wb-agent",
             "--ro-bind", "/usr", "/usr",
@@ -545,6 +557,12 @@ class LinuxLauncher:
         for path in ("/etc/passwd", "/etc/group", "/etc/nsswitch.conf", "/etc/ld.so.cache"):
             if Path(path).exists():
                 command.extend(("--ro-bind", path, path))
+        if self.network:
+            for path in _NETZ_DATEIEN:
+                # /etc/resolv.conf zeigt oft nach /run (systemd-resolved); /run ist im Zug privat, also das Ziel binden.
+                source = Path(path).resolve(strict=False)
+                if source.exists():
+                    command.extend(("--ro-bind", str(source), path))
         command.extend((
             "--proc", "/proc", "--dev", "/dev",
             "--size", str(256 * 1024 * 1024), "--perms", "0700", "--tmpfs", "/tmp",
