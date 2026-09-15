@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Das Symbol der Mac-nativen Werkbank (06.09.2026, Auftrag 4.3).
+
+  GEZEICHNET, NICHT ERZEUGT (regeln/medien.md): ein Symbol ist eine einfache
+  Grafik und entsteht als Vektor. Aus dieser Datei baut `mac/bin/bauen` ueber
+  rsvg-convert und iconutil das .icns des Buendels — die PNG-Groessen sind
+  Zwischenschritte und bleiben nicht im Baum liegen.
+
+  DAS MOTIV ist die Werkbank selbst: vier Kacheln, eine davon die Buehne. Das
+  ist das, was ein Mensch beim Oeffnen sieht (Panes im Raster, eine gezeigt),
+  und es bleibt bei 16 Punkten noch unterscheidbar; ein Schriftzug oder ein
+  Terminal-Prompt waere dort ein grauer Fleck.
+
+  FESTE FARBEN sind hier richtig und widersprechen der Hausregel nicht: die
+  gilt fuer die Oberflaeche, die dem System folgt. Ein App-Symbol dagegen ist in
+  jedem Erscheinungsbild dasselbe Bild — macOS zeichnet es nie um.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="grund" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3E5C82"/>
+      <stop offset="1" stop-color="#1C2B3F"/>
+    </linearGradient>
+    <linearGradient id="buehne" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7FC4FF"/>
+      <stop offset="1" stop-color="#3E9BE8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Der Grund: die Squircle-naehe Rundung, die macOS fuer App-Symbole nimmt
+       (Radius rund 22,4 % der Kantenlaenge), mit dem ueblichen Rand. -->
+  <rect x="64" y="64" width="896" height="896" rx="200" ry="200" fill="url(#grund)"/>
+
+  <!-- Vier Kacheln im Raster. Die obere linke ist die Buehne: heller, und sie
+       traegt die Zeile, die auch im Terminal steht. -->
+  <g>
+    <rect x="204" y="236" width="272" height="248" rx="40" ry="40" fill="url(#buehne)"/>
+    <rect x="548" y="236" width="272" height="248" rx="40" ry="40" fill="#FFFFFF" opacity="0.24"/>
+    <rect x="204" y="540" width="272" height="248" rx="40" ry="40" fill="#FFFFFF" opacity="0.24"/>
+    <rect x="548" y="540" width="272" height="248" rx="40" ry="40" fill="#FFFFFF" opacity="0.24"/>
+  </g>
+
+  <!-- Die Eingabezeile auf der Buehne: Winkel und Strich, wie ein Prompt.
+       Sie liegt nur auf der einen Kachel, damit das Raster lesbar bleibt. -->
+  <g stroke="#16273A" stroke-width="30" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <polyline points="272,318 328,360 272,402"/>
+    <line x1="356" y1="402" x2="416" y2="402"/>
+  </g>
+</svg>
