@@ -1,13 +1,28 @@
+<img src="assets/werkbank.svg" width="88" align="left" alt="Workbench icon">
+
 # agent-setup
 
-A desktop workbench for running coding agents side by side. One lead session plans and verifies,
-several worker panes do the work in parallel, and the machinery around them keeps that from
-falling apart: a context guard, a result protocol, hooks that block the mistakes agents actually
-make, and a model registry that treats every harness as data instead of a code branch.
+**The complete setup behind a workbench for coding agents that work as a team.** One lead session
+plans, delegates and verifies; worker panes do the work in parallel; on the Agents tab, long-lived
+agents with a profile, a memory and a specialty take tickets, talk in a channel and only come to
+you with the questions that are yours to answer. Around all of it: the rules the agents read, the
+skills, the hooks that block the mistakes agents actually make, and an empty knowledge vault with
+its tooling.
+
+<br clear="left">
+
+<p align="center"><img src="assets/vorschau-code-dunkel.png" alt="The Code tab: a lead session and three worker panes side by side" width="900"></p>
+
+<p align="center"><img src="assets/vorschau-agents-dunkel.png" alt="The Agents tab: a world with a main agent, two teams, tickets and a channel" width="900"></p>
+
+Both pictures come from a demo world that the build creates on its own; nothing in them belongs to
+a real machine.
 
 The window is an Electron program that drives tmux over its control mode. Everything it shows —
 sessions, worker panes, output, the editor, the chat stage — is a live view on real tmux panes,
 so the same work is reachable from a terminal on the same machine or over SSH from another one.
+On a Mac there is also a native shell around the same core:
+**[agent-workbench-mac](https://github.com/<your-github-user>/agent-workbench-mac)**.
 
 It is not tied to one vendor. Claude Code, Codex, aider, opencode and local models via Ollama are
 entries in a JSON registry. A setup with no account at all is a supported path: Ollama plus the
