@@ -77,7 +77,8 @@ class ClaudeLauf:
                  auth_headers: Optional[Callable[[], tuple[tuple[str, str], ...]]],
                  extra_read_paths: tuple[Path, ...] = (), launcher_options: Optional[dict[str, Any]] = None,
                  unit_prefix: str = "wb-agents-linux-claude-", netz: bool = False,
-                 extra_write_paths: tuple[Path, ...] = ()):
+                 extra_write_paths: tuple[Path, ...] = (), verdeckt: tuple[Path, ...] = (),
+                 brain_vault: Optional[Path] = None):
         self.orte = orte
         self.world_root = Path(world_root)
         self.world = ad.read_world(self.world_root)
@@ -95,6 +96,10 @@ class ClaudeLauf:
         # (agents_traeger.projekt_pfade); alles andere vom Projekt ist nur lesbar eingebunden.
         self.extra_write_paths = tuple(Path(path) for path in extra_write_paths)
         self.launcher_options = dict(launcher_options or {})
+        # Brain (agents_brain.einbindung): Geheimordner des nur lesbaren Vaults als leeres tmpfs; nur der startende
+        # Launcher kennt die Lesepfade, der Beobachter nicht. Der Controller schreibt Notizen in dieses Vault.
+        self.verdeckt = tuple(Path(path) for path in verdeckt)
+        self.brain_vault = Path(brain_vault) if brain_vault is not None else None
         self.unit_prefix = unit_prefix
         # Netz nur fuer einen Zug mit bereitgestellten Zugaengen (agents_zugaenge); sonst bleibt es getrennt.
         self.netz = bool(netz)
@@ -136,7 +141,8 @@ class ClaudeLauf:
                 (self.workspace, self.agent_state), lambda _binding: self.is_current(),
                 auth_headers_provider=self.auth_headers)
             self.proxy.start()
-            self.control = AgentController(self.world_root, self.run_id, lambda _binding: self.is_current())
+            self.control = AgentController(self.world_root, self.run_id, lambda _binding: self.is_current(),
+                                           brain_vault=self.brain_vault)
             self.endpoint = ControllerEndpoint(self.control, self.agent_id, self.agent["stage"], run_dir / "rpc.sock")
             read_paths = (self.orte.runtime, turn_dir, *self.zug.lese_pfade(), *self.extra_read_paths)
             self.launcher = ClaudeZugLauncher(
@@ -144,7 +150,7 @@ class ClaudeLauf:
                 write_paths=(self.workspace, self.agent_state, *self.extra_write_paths),
                 socket_bindings=(SocketBinding(self.proxy.socket_path, "/run/wb-model.sock"), self.endpoint.binding),
                 output_dir=self.orte.output, unit_prefix=self.unit_prefix, network=self.netz,
-                **self.launcher_options)
+                **dict(self.launcher_options, **({"verdeckt": self.verdeckt} if self.verdeckt else {})))
             spec = start_spec(self.orte.runtime, turn_file, self.workspace, self.zug.runner)
             self.handle = self.controller(self.launcher).start(self.world_id, self.agent_id, self.run_id, spec)
             return self.handle

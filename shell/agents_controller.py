@@ -8,6 +8,7 @@ socket and can invoke the typed operations below.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 import struct
@@ -74,8 +75,29 @@ _FIELD_TYPES: dict[str, dict[str, tuple[str, bool]]] = {
         "options": ("str_list", False), "recommendation": ("str", False),
         "ticket_id": ("str", False),
     },
+    # Freigaben der Welt (der Nutzer, 16.09.2026): der Hauptagent gibt eigene Freigaben an Agenten seiner Welt weiter.
+    "freigabe.weitergeben": {
+        "agent_id": ("str", True), "art": ("str", True), "adressen": ("str_list", False), "ablauf": ("str", False),
+    },
+    "freigabe.entziehen": {"agent_id": ("str", True), "art": ("str", True)},
+    "freigabe.liste": {},
+    # Versand ausserhalb der Sandbox: Freigabe, Passwort und Versandlog bleiben beim Controller (agents_freigaben).
+    "mail.senden": {
+        "von": ("str", True), "an": ("str_list", True), "cc": ("str_list", False), "betreff": ("str", True),
+        "text": ("str", True), "ticket_id": ("str", False), "in_reply_to": ("str", False),
+        "references": ("str", False), "sendung_id": ("str", False),
+    },
+    # Brain (der Nutzer, 16.09.2026; agents_brain): schreiben nur in den eigenen Bereich, lesen als Rueckweg.
+    "brain.notiz": {
+        "titel": ("str", True), "text": ("str", True), "thema": ("str", False),
+        "anhaengen": ("bool", False), "bereich": ("str", False),
+    },
+    "brain.suche": {"frage": ("str", True), "k": ("int", False), "bereich": ("str", False)},
 }
 OPERATIONS = frozenset(_FIELD_TYPES)
+# Operationen, deren Antwort laenger als ein Frame-Zeitlimit brauchen darf (SMTP-Versand), in Sekunden.
+# Brain-Operationen warten auf Vaultsperre, Commit und Abgleich (agents_brain, Fristen bis 45 s je Schritt).
+SLOW_OPERATIONS = {"mail.senden": 120.0, "brain.notiz": 240.0, "brain.suche": 240.0}
 
 
 def _report_created_agent(root: Path, binding: AgentBinding, agent: dict[str, Any]) -> str | None:
@@ -103,6 +125,12 @@ def _report_rights(root: Path, binding: AgentBinding, before: dict[str, Any], ag
     return message_id
 
 
+def _report_freigabe(root: Path, binding: AgentBinding, text: str, message_id: str) -> str:
+    """Weitergabe und Entzug durch den Hauptagenten kommen beim Menschen als markiertes Ergebnis an."""
+    ad.send_marked_message(root, binding.agent_id, [ad.WORLD_HUMAN], text, "ergebnis", None, message_id, binding.role)
+    return message_id
+
+
 def _type_matches(value: Any, kind: str) -> bool:
     if kind == "str":
         return isinstance(value, str)
@@ -112,6 +140,8 @@ def _type_matches(value: Any, kind: str) -> bool:
         return isinstance(value, list) and all(isinstance(item, str) for item in value)
     if kind == "object":
         return isinstance(value, dict)
+    if kind == "int":
+        return isinstance(value, int) and not isinstance(value, bool)
     raise ControllerError("Unbekannter Payloadtyp")
 
 
@@ -243,12 +273,24 @@ class AgentClient:
         with self._lock:
             if self._closed:
                 raise ControllerError("Client ist geschlossen")
+            slow = SLOW_OPERATIONS.get(operation)
+            previous = self._sock.gettimeout()
             try:
+                if slow is not None and (previous is None or previous < slow):
+                    self._sock.settimeout(slow)
                 _send_frame(self._sock, request)
                 response = _recv_frame(self._sock)
-            except ControllerError:
+            except (ControllerError, OSError) as exc:
                 self.close()
-                raise
+                if isinstance(exc, ControllerError):
+                    raise
+                raise ControllerError("Verbindung konnte nicht gelesen werden") from exc
+            finally:
+                if slow is not None and not self._closed:
+                    try:
+                        self._sock.settimeout(previous)
+                    except OSError:
+                        pass
         if not isinstance(response, dict) or set(response) not in ({"ok", "data"}, {"ok", "error"}):
             self.close()
             raise ControllerError("Ungueltige Controllerantwort")
@@ -280,7 +322,8 @@ class AgentController:
     def __init__(self, world_root: Path, run_id: str,
                  current_run_checker: Callable[[AgentBinding], bool] | None,
                  io_timeout: float = DEFAULT_IO_TIMEOUT,
-                 session_timeout: float = DEFAULT_SESSION_TIMEOUT):
+                 session_timeout: float = DEFAULT_SESSION_TIMEOUT,
+                 brain_vault: Path | None = None):
         if current_run_checker is not None and not callable(current_run_checker):
             raise ControllerError("current-run-Pruefer muss aufrufbar sein")
         if io_timeout <= 0:
@@ -292,6 +335,8 @@ class AgentController:
         self._world_id = ad.valid_id(world["id"], "Weltkennung")
         self._run_id = ad.valid_id(run_id, "Laufkennung")
         self._checker = current_run_checker
+        # Vault des Traegerhosts fuer brain.notiz und brain.suche; ohne ihn weisen beide ab.
+        self._brain_vault = Path(brain_vault) if brain_vault is not None else None
         self._timeout = io_timeout
         self._session_timeout = session_timeout
         self._sessions: list[_Session] = []
@@ -398,6 +443,40 @@ class AgentController:
             changes = {key: payload[key] for key in ad.RIGHTS_FIELDS if key in payload}
             agent = ad.set_agent_rights(root, payload["agent_id"], changes, binding.agent_id, binding.role)
             return dict(agent, meldung=_report_rights(root, binding, before, agent))
+        if operation in ("freigabe.weitergeben", "freigabe.entziehen", "freigabe.liste", "mail.senden"):
+            # Erst hier geladen: die RPC-Kopie im Zug traegt dieses Modul nicht.
+            import agents_freigaben as af
+            if operation == "freigabe.liste":
+                return af.liste(root, binding.agent_id, binding.role)
+            if operation == "mail.senden":
+                return af.senden_agent(root, binding.agent_id, binding.role, payload)
+            if operation == "freigabe.weitergeben":
+                entry = af.weitergeben(root, binding.agent_id, binding.role, payload["agent_id"], payload["art"],
+                                       payload.get("adressen"), payload.get("ablauf"))
+                meldung = None
+                if entry.get("neu"):
+                    meldung = _report_freigabe(root, binding, "%s an %s weitergegeben durch %s%s." % (
+                        af.zusammenfassung(entry), entry["inhaber"], binding.agent_id,
+                        " (ersetzt %s)" % ", ".join(entry["ersetzt"]) if entry["ersetzt"] else ""),
+                        ad.derived_id("freigabe-weitergegeben", entry["id"]))
+                return dict(entry, meldung=meldung)
+            revoked = af.entziehen(root, binding.agent_id, binding.role, payload["agent_id"], payload["art"])
+            meldung = _report_freigabe(root, binding, "Freigabe %s von %s entzogen durch %s: %s." % (
+                payload["art"], payload["agent_id"], binding.agent_id, ", ".join(revoked)),
+                ad.derived_id("freigabe-entzogen", *revoked))
+            return {"entzogen": revoked, "meldung": meldung}
+        if operation in ("brain.notiz", "brain.suche"):
+            import agents_brain as ab  # spaet: der RPC-Client im Zug braucht das Modul nicht
+
+            if self._brain_vault is None:
+                raise ControllerError("Kein Brain-Vault auf diesem Traeger eingerichtet")
+            if operation == "brain.suche":
+                return ab.suche(self._brain_vault, root, binding.agent_id, payload["frage"], payload.get("k", 5),
+                                payload.get("bereich", "eigen"))
+            digest = hashlib.sha256(("%s\n%s" % (payload["titel"], payload["text"])).encode("utf-8")).hexdigest()
+            return ab.notiz(self._brain_vault, root, binding.agent_id, payload["titel"], payload["text"],
+                            thema=payload.get("thema"), anhaengen=payload.get("anhaengen", False),
+                            bereich_art=payload.get("bereich", "eigen"), zug="%s-%s" % (binding.run_id, digest[:8]))
         if operation == "question.ask":
             return ad.ask_question(root, payload["text"], payload.get("options", []),
                                    payload.get("recommendation"), payload.get("ticket_id"),

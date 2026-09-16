@@ -34,7 +34,9 @@ ORDNER = "zugaenge"
 VERSION = 1
 # Drei Arten (15.09.2026): `ssh` (Ziel, Schluessel, known_hosts, Huellen), `web` (nur Netz -- fuer Agenten mit
 # WebFetch/WebSearch im Profil) und `mail` (lesende Postfachwerkzeuge mit Passwoertern aus dem Schluesselbund des
-# Traegerhosts). Senden bleibt Menschensache: <ein eigenes Mailwerkzeug> und msmtp stehen auf der Hausliste und bekommen keine Huelle.
+# Traegerhosts). <ein eigenes Mailwerkzeug> und msmtp stehen auf der Hausliste und bekommen keine Huelle. Gesendet wird seit 16.09.2026 nur
+# mit einer Freigabe email ueber `<ein eigenes Mailwerkzeug> senden`, und das SMTP-Passwort kommt dafuer nie in den Zug: der Controller
+# sendet ausserhalb der Sandbox (agents_freigaben.py).
 ARTEN = ("ssh", "web", "mail")
 PROGRAMME = ("ssh", "scp", "rsync")
 FELDER = ("name", "art", "ziel", "schluessel", "known_hosts", "port", "muster", "dienste")
@@ -431,7 +433,8 @@ def anweisung(eintraege: tuple[dict[str, Any], ...] | list[dict[str, Any]] | tup
         elif entry["art"] == "mail":
             werkzeuge = ", ".join("`%s`" % w for w in entry.get("werkzeuge") or [])
             lines.append("- Zugang `%s` (mail): Postfach nur lesen mit %s (`<werkzeug> recent 20`, `search <wort>`, "
-                         "`read <uid>`); gesendet wird nichts, Entwuerfe legst du als Datei ab." % (name, werkzeuge))
+                         "`read <uid>`); gesendet wird nur mit einer Freigabe email (Abschnitt „Mail senden“), sonst "
+                         "legst du Entwuerfe als Datei ab." % (name, werkzeuge))
         else:
             lines.append("- Zugang `%s` (ssh): `ssh %s <befehl>`, Dateien mit `scp <datei> %s:<pfad>` oder "
                          "`rsync -a <ordner> %s:<pfad>`." % (name, name, name, name))

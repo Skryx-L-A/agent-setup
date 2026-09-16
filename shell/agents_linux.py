@@ -140,6 +140,8 @@ class LinuxLauncher:
     network = False
     # Ebenso ohne ``__init__``: kein Projekt-Repo eines Agenten-Worktrees eingebunden.
     git_einbindung = None
+    # Und nichts verdeckt (Brain-Vault: Geheimordner als leeres tmpfs, docs/AGENTS-LINUX.md).
+    verdeckt: tuple[Path, ...] = ()
 
     def __init__(
         self,
@@ -157,6 +159,7 @@ class LinuxLauncher:
         output_dir: str | os.PathLike[str] | None = None,
         network: bool = False,
         git_einbindung: Optional[Mapping[str, Any]] = None,
+        verdeckt: Iterable[str | os.PathLike[str]] = (),
     ):
         if sys.platform != "linux":
             raise LinuxNichtUnterstuetzt("Linux-Launcher laeuft nur auf Linux")
@@ -181,6 +184,7 @@ class LinuxLauncher:
         self.read_paths = self._paths(read_paths, writable=False)
         self.write_paths = self._paths(write_paths, writable=True)
         self.git_einbindung = self._git_plan(git_einbindung)
+        self.verdeckt = self._verdeckt(verdeckt)
         self.socket_bindings = tuple(socket_bindings)
         destinations = set()
         for binding in self.socket_bindings:
@@ -259,6 +263,26 @@ class LinuxLauncher:
             if path not in result:
                 result.append(path)
         result.sort(key=lambda item: (len(item.parts), str(item)))
+        return tuple(result)
+
+    def _verdeckt(self, values: Iterable[str | os.PathLike[str]]) -> tuple[Path, ...]:
+        """Ordner in einem Nur-Lese-Pfad, ueber die ein leeres tmpfs gelegt wird (Brain: ``90-secrets``).
+
+        Der Pfad bleibt woertlich (er muss nicht existieren); sein Elternordner liegt kanonisch in einem
+        Nur-Lese-Pfad und in keinem Schreibpfad. Ob er existiert, prueft erst der Start."""
+        result: list[Path] = []
+        for value in values:
+            raw = Path(value)
+            if not raw.is_absolute() or ".." in raw.parts or raw.name in ("", ".", ".."):
+                raise ValueError("Verdeckter Pfad muss absolut und kanonisch sein")
+            parent = raw.parent.resolve(strict=True)
+            path = parent / raw.name
+            if not any(_inside(path, root) and path != root for root in self.read_paths):
+                raise ValueError(f"Verdeckter Pfad liegt in keinem Nur-Lese-Pfad: {path}")
+            if any(_inside(path, root) or _inside(root, path) for root in self.write_paths):
+                raise ValueError(f"Verdeckter Pfad beruehrt einen Schreibpfad: {path}")
+            if path not in result:
+                result.append(path)
         return tuple(result)
 
     def _git_plan(self, value: Optional[Mapping[str, Any]]) -> Optional[tuple[Path, tuple[tuple[str, Path], ...]]]:
@@ -625,6 +649,13 @@ class LinuxLauncher:
             command.extend(("--size", str(4 * 1024 * 1024), "--perms", "0700", "--tmpfs", str(gitdir)))
             for art, path in plan:
                 command.extend(("--ro-bind" if art == "ro" else "--bind", str(path), str(path)))
+        for path in self.verdeckt:
+            # Nach den Einbindungen: ein vorhandener Ordner wird im Zug zu einem leeren tmpfs. Ein Symlink oder eine
+            # Datei an seiner Stelle bricht den Start ab (fail-closed), ein fehlender Ordner verbirgt nichts.
+            if path.is_symlink() or (path.exists() and not path.is_dir()):
+                raise ValueError(f"Verdeckter Pfad ist kein Ordner: {path}")
+            if path.is_dir():
+                command.extend(("--size", str(1024 * 1024), "--perms", "0700", "--tmpfs", str(path)))
         for binding in self.socket_bindings:
             binding.validate()
             command.extend(("--ro-bind", str(binding.host_path), binding.guest_path))

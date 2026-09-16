@@ -775,7 +775,7 @@ Maßgeblich ist `<WB_WELT>/agents/<id>/agent.json`, geprüft in drei Stufen:
 | lesen | Projektordner, Worktree, Weltablage, eigenes Temp-Verzeichnis, Skill- und Skriptpfade und beide Bibliotheken, `~/Knowledge`, `~/.local/bin` |
 | ausführen | wie lesen, dazu `/bin`, `/usr/bin`, `/usr/sbin`, `/sbin`, `/usr/local/bin`, `/usr/libexec` und die Ordner aus `PATH` außerhalb von `$HOME` |
 | schreiben | im Projektordner nur `work/`, dazu Worktree (`WB_AGENT_WORKTREE`, der private Arbeitsordner mit dem git-Worktree darin), eigenes Agentenverzeichnis, eigenes Temp-Verzeichnis; Hauptagent zusätzlich `~/Knowledge` |
-| nie schreiben | in der Weltablage alles außer dem eigenen Agentenverzeichnis; dort `agent.json`, `skills.json`, `history.json`, `runtime.json`, `postfach/`; überall `freigaben.json`, `traeger.json`, `zugaenge.json` und alles in einem `.git`-Ordner oder die `.git`-Datei eines Worktrees |
+| nie schreiben | in der Weltablage alles außer dem eigenen Agentenverzeichnis; dort `agent.json`, `skills.json`, `history.json`, `runtime.json`, `postfach/`; überall `freigaben.json`, `traeger.json`, `zugaenge.json`, `mail-versand.jsonl` und alles in einem `.git`-Ordner oder die `.git`-Datei eines Worktrees |
 
 Die **Kontextgrenze** `context_limit` ist ein Satz. Der Hook liest daraus nur
 Pfade: Text in Backticks und Wörter, die mit `/`, `~/` oder `./` beginnen;
@@ -815,6 +815,16 @@ läuft über das normale Bash-Muster des Profils (`<ein eigenes Mailwerkzeug> *`
 liegt im Zugangsordner und ist damit wie ein ssh-Schlüssel gesperrt
 (`tests/test-profil-sperre.sh`, Fälle 8m bis 8o). `<ein eigenes Mailwerkzeug>` und `msmtp`
 bleiben auf der Hausliste: über einen Zugang wird nie gesendet.
+
+**Mail senden (16.09.2026).** `<ein eigenes Mailwerkzeug> senden …` erlaubt die Sperre nur,
+wenn der Agent in `freigaben.json` der Welt eine gültige Freigabe `email`
+hält; dann ersetzt die Freigabe das Bash-Muster, eine `--von`-Adresse muss in
+ihr stehen. Ohne Freigabe verweigert sie mit dem Hinweis auf `wb-welt freigabe`
+(Mensch) und `freigabe.weitergeben` (Hauptagent). Gesendet wird nicht im Zug,
+sondern vom Controller außerhalb der Sandbox; `mail-versand.jsonl` steht mit
+`freigaben.json` auf der Liste der Dateien, die ein Agent nie schreibt
+(`tests/test-profil-sperre.sh`, Abschnitt 10; `docs/AGENTS-SPERREN.md`,
+„Mail senden“).
 
 **Worktree je Agent (16.09.2026).** Im Projekt schreibt die Sperre nur noch
 in `work/`; am Projekt arbeitet ein Agent in seinem eigenen git-Worktree auf

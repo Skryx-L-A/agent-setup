@@ -7,7 +7,7 @@ import json
 import socket
 import sys
 
-from agents_controller import AgentClient, ControllerError, MAX_FRAME, OPERATIONS, _validate_request
+from agents_controller import AgentClient, ControllerError, MAX_FRAME, OPERATIONS, SLOW_OPERATIONS, _validate_request
 
 SOCKET_PATH = '/run/wb-controller.sock'
 
@@ -27,7 +27,7 @@ def main(argv=None) -> int:
         sock = socket.socket(socket.AF_UNIX)
         sock.settimeout(5)
         sock.connect(SOCKET_PATH)
-        client = AgentClient(sock, 5)
+        client = AgentClient(sock, SLOW_OPERATIONS.get(operation, 5))
         result = client.request(operation, payload)
         print(json.dumps({'ok': True, 'data': result}, ensure_ascii=False))
         return 0
