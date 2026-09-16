@@ -1524,7 +1524,9 @@ DEFAULT_BASH = ("python3 */rpc/agents_rpc_client.py *",
                 "python3 */skills/*/scripts/*.py *", "*/skills/*/scripts/*.py *",
                 "git status", "git diff *", "git log *", "git show *",
                 "git add *", "git commit *", "git rebase *", "git checkout -- *",
-                "git merge agent/*", "git merge --abort")
+                "git merge agent/*", "git merge --abort",
+                # 16.09.2026, erster Zug im Worktree: Myproject konnte kein Verzeichnis auflisten, nur Glob/Grep.
+                "ls", "ls *", "pwd")
 _HOUSE_RULES: Any = None
 
 

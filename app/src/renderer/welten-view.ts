@@ -27,6 +27,7 @@
 // in den Zustand; gezeichnet wird bei neuer Nutzlast und nach Handlungen, mit
 // erhaltenem Fokus.
 import './welten-view.css';
+import { kurzerPfad } from './kurzpfad';
 import type { AufgabenNutzlast } from '../main/aufgaben';
 import type {
   ChatEintrag, GespraechZug, Welt, WeltAgent, WeltMaschine, WeltNachricht, WeltSkills, WeltTicket, WeltenHandlungsErgebnis, WeltenNutzlast,
@@ -1610,7 +1611,7 @@ function inspektorZeichnen(w: Welt): HTMLElement {
   if (!a) {
     box.appendChild(el('div', 'wv-ikopf', t('welten.welt.titel')));
     const inhalt = el('div', 'wv-iinhalt');
-    inhalt.append(el('div', 'wv-titel', w.name), karte(t('welten.welt.titel'), wert(t('welten.welt.art'), t(w.art === 'global' ? 'welten.global' : 'welten.welt.projekt')), wert(t('welten.welt.ablage'), w.fern ? `${w.maschine}:${w.ablage}` : w.pfad, true),
+    inhalt.append(el('div', 'wv-titel', w.name), karte(t('welten.welt.titel'), wert(t('welten.welt.art'), t(w.art === 'global' ? 'welten.global' : 'welten.welt.projekt')), wert(t('welten.welt.ablage'), w.fern ? `${w.maschine}:${w.ablage}` : kurzerPfad(w.pfad), true),
       wert(t('welten.welt.stand'), `${wort('stand', w.stand)}${w.stand_grund ? `, ${w.stand_grund}` : ''}`), wert(t('welten.stufe.hauptagent'), w.hauptagent ? anzeigename(w, w.hauptagent) : t('welten.wort.keiner')),
       wert(t('welten.leiste.agenten'), t(w.teams.length === 1 ? 'welten.welt.agentenTeamEins' : 'welten.welt.agentenTeamsViele', { n: w.agenten.length, m: w.teams.length })),
       wert(t('welten.reiter.tickets'), t('welten.welt.ticketsOffen', { n: w.tickets.length, m: w.zaehler.tickets_offen })), wert(t('welten.welt.fragen'), t('welten.welt.fragenOffen', { n: w.fragen.filter((f) => f.stand === 'offen').length, m: w.fragen.length }))));
@@ -2013,7 +2014,7 @@ function vorschauZeichnen(): void {
 function kopfZeichnen(w: Welt): HTMLElement {
   const kopf = el('header', 'wv-kopfleiste');
   const kt = el('div', 'wv-kopf-titel');
-  const herkunft = [w.art === 'global' ? t('welten.kopf.globaleWelt') : (w.projekt ?? ''), maschineWort(w.maschine ?? '')].filter(Boolean).join(' · ');
+  const herkunft = [w.art === 'global' ? t('welten.kopf.globaleWelt') : kurzerPfad(w.projekt ?? ''), maschineWort(w.maschine ?? '')].filter(Boolean).join(' · ');
   kt.append(el('span', 'wv-titel', w.name), el('span', 'wv-leise wv-herkunft', herkunft));
   const rechts = el('div', 'wv-kopf-rechts');
   const zaehler = el('span', 'wv-zaehler', zaehlerText(w));
