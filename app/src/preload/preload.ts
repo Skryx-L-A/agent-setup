@@ -54,6 +54,8 @@ contextBridge.exposeInMainWorld('awbBridge', {
   // (`titleBarStyle: 'hiddenInset'`, siehe main.ts). `process.platform` gibt
   // es im Renderer selbst nicht -- er laeuft mit `nodeIntegration: false`.
   plattform: process.platform,
+  // Das Home dieses Laufs fuer die Pfadkuerzung `~` (renderer/kurzpfad.ts).
+  heim: process.env.HOME ?? '',
   // AWB_TESTHAKEN=1: die schreibenden Testhaken des Tabs Agents sind da
   // (Reviewer-Befund M4, 11.09.2026). Ohne die Variable gibt es sie nicht.
   testhaken: process.env.AWB_TESTHAKEN === '1',

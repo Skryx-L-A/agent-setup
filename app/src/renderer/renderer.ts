@@ -179,6 +179,7 @@ declare global {
     awbBridge: {
       /** `process.platform` des Hauptprozesses -- siehe preload.ts. */
       plattform: string;
+      heim?: string;
       /** AWB_TESTHAKEN=1 -- siehe preload.ts. */
       testhaken?: boolean;
       ready(): void;

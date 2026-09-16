@@ -11,12 +11,12 @@ its tooling.
 
 <br clear="left">
 
-<p align="center"><img src="assets/vorschau-code-dunkel.png" alt="The Code tab: a lead session and three worker panes side by side" width="900"></p>
+<p align="center"><img src="assets/vorschau-code-dunkel.png" alt="The Code tab: the lead session and three worker panes, each a live tmux pane running Claude Code, with projects and sessions on the left" width="900"></p>
 
-<p align="center"><img src="assets/vorschau-agents-dunkel.png" alt="The Agents tab: a world with a main agent, two teams, tickets and a channel" width="900"></p>
+<p align="center"><img src="assets/vorschau-agents-dunkel.png" alt="The Agents tab: the main agent's chat with a question waiting for your answer, the teams on the left and the agent's profile on the right" width="900"></p>
 
-Both pictures come from a demo world that the build creates on its own; nothing in them belongs to
-a real machine.
+Both pictures are screenshots of the app itself at its normal size, taken with a demo project: the
+terminal panes replay an invented session, and nothing in them belongs to a real machine.
 
 The window is an Electron program that drives tmux over its control mode. Everything it shows —
 sessions, worker panes, output, the editor, the chat stage — is a live view on real tmux panes,
