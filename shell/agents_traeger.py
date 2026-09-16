@@ -45,6 +45,7 @@ if __name__ == "__main__":
 
 import agents_data as ad  # noqa: E402
 import agents_skills as ask  # noqa: E402
+import agents_worktree as aw  # noqa: E402
 import agents_zugaenge as az  # noqa: E402
 import atomar_schreiben  # noqa: E402
 from agents_claude import (  # noqa: E402
@@ -58,6 +59,7 @@ from agents_codex import CodexAnmeldung, CodexZug, codex_eintrag  # noqa: E402
 from agents_kontingent import RECHECK_S, KontingentQuelle, Startfreigabe  # noqa: E402
 from agents_lauf import LaufFehler, LaunchReceipt, RunController  # noqa: E402
 from agents_wecker import Delivery, WeckerController, WeckerFehler  # noqa: E402
+from agents_modellwahl import abo as modell_abo, ist_fable  # noqa: E402
 
 WELT_ZUSTAND = {"läuft": "running", "pausiert": "paused", "gestoppt": "stopped"}
 AGENT_ZUSTAND = {"aktiv": "running", "pausiert": "paused", "gestoppt": "stopped", "archiviert": "stopped"}
@@ -65,6 +67,8 @@ NACHRICHT_ARTEN = ("kanal", "direktchat", "ticket-ergebnis")
 RECOVERY_URTEILE = frozenset({"abgeschnitten", "harness_fehler", "ergebnis_fehlt", "unklar", "zeitlimit", "startfehler"})
 SCHLAF_URTEILE = frozenset({"kontingent", "anmeldung"})
 RECOVERY_ABSTAND_S = 300.0
+# Ein lokales Modell, das nicht frei ist („belegt“), wird nach dieser Zeit neu geprueft.
+BELEGT_ABSTAND_S = 300.0
 # Skills- und Profil-Sperre (docs/AGENTS-SPERREN.md) samt Pruefkern und Hausliste gesperrter Programme.
 SPERR_DATEIEN = ("skills-sperre.sh", "profil-sperre.sh", "lib/cmdshell.py", "lib/skills_sperre.py",
                  "lib/profil_sperre.py", "lib/reviewer_sperre.py", "lib/rollen.py", "wb-profil",
@@ -272,7 +276,8 @@ def zeitgeber_unit(konfig: TraegerKonfig) -> str:
 
 def _claude_lauf_fabrik(traeger: "WeltTraeger", *, agent_id: str, run_id: str, zug: ClaudeZug,
                         workspace: Path, agent_state: Path, extra_read_paths: tuple[Path, ...] = (),
-                        netz: bool = False, extra_write_paths: tuple[Path, ...] = ()):
+                        netz: bool = False, extra_write_paths: tuple[Path, ...] = (),
+                        git_einbindung: Optional[dict[str, Any]] = None):
     from agents_claude_lauf import ClaudeLauf, LaufOrte
     k, orte = traeger.konfig, traeger.orte
     lauf_orte = LaufOrte(orte.runs, orte.launcher, orte.output, orte.sockets, orte.turns, orte.runtime)
@@ -283,7 +288,8 @@ def _claude_lauf_fabrik(traeger: "WeltTraeger", *, agent_id: str, run_id: str, z
     return ClaudeLauf(lauf_orte, world_root=k.world_root, agent_id=agent_id, run_id=run_id, workspace=workspace,
                       agent_state=agent_state, zug=zug, backend=k.backend_fuer(zug.model, "pi" if pi else "claude"),
                       auth_headers=None if pi else traeger.anmeldequelle.auth_headers, extra_read_paths=extra_read_paths,
-                      launcher_options=dict(k.launcher), unit_prefix=k.unit_prefix, netz=netz,
+                      launcher_options=dict(k.launcher, **({"git_einbindung": git_einbindung} if git_einbindung
+                                                           else {})), unit_prefix=k.unit_prefix, netz=netz,
                       extra_write_paths=extra_write_paths)
 
 
@@ -307,6 +313,17 @@ def projekt_pfade(world_root: Path) -> tuple[Optional[Path], Optional[Path]]:
         raise TraegerFehler("%s ist ein Symlink; der gemeinsame Ordner muss ein echter Ordner sein" % arbeit)
     arbeit.mkdir(mode=0o700, exist_ok=True)
     return projekt, arbeit
+
+
+def _lokal_erreichbar(base_url: str, timeout: float = 1.0) -> bool:
+    """Vorgabe fuer „belegt“: der lokale Modellserver nimmt auf seinem Loopback-Port eine Verbindung an."""
+    from urllib.parse import urlsplit
+    teile = urlsplit(base_url)
+    try:
+        with socket.create_connection((teile.hostname or "127.0.0.1", teile.port or 80), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def _claude_observer(traeger: "WeltTraeger"):
@@ -348,8 +365,10 @@ class WeltTraeger:
                  ausgabe: Callable[["WeltTraeger", Any], bytes] = _claude_ausgabe,
                  anmeldequelle: Any = None, kontingentquelle: Any = "konfig",
                  zeitgeber: Optional[Callable[[Optional[float]], Any]] = None,
-                 clock: Callable[[], float] = time.time, runtime_quelle: Optional[Path] = None):
+                 clock: Callable[[], float] = time.time, runtime_quelle: Optional[Path] = None,
+                 lokal_frei: Optional[Callable[[str], bool]] = None):
         self.konfig = konfig
+        self._lokal_frei_pruefer = lokal_frei or _lokal_erreichbar
         self.orte = konfig.orte()
         self.root = konfig.world_root
         self._zug_fabrik = zug_fabrik
@@ -422,11 +441,11 @@ class WeltTraeger:
 
     def _zuege_lesen(self) -> dict[str, Any]:
         if not self.orte.zuege.exists():
-            return {"version": _VERSION, "runs": {}, "sessions": {}, "schlaf": {}, "zaehler": {}}
+            return {"version": _VERSION, "runs": {}, "sessions": {}, "schlaf": {}, "zaehler": {}, "fallback": {}}
         state = json.loads(self.orte.zuege.read_text(encoding="utf-8"))
         if state.get("version") != _VERSION:
             raise TraegerFehler("Zugregister hat unbekannte Version")
-        for name in ("sessions", "schlaf", "zaehler"):
+        for name in ("sessions", "schlaf", "zaehler", "fallback"):
             state.setdefault(name, {})
         return state
 
@@ -499,11 +518,13 @@ class WeltTraeger:
                     "WB_PROFIL_BIN": str(self.orte.runtime / "wb-profil")})
         return sorted((key, value) for key, value in env.items() if value)
 
-    def _sperr_einstellungen(self, zugang: Optional[az.Bereitstellung] = None) -> dict[str, Any]:
+    def _sperr_einstellungen(self, zugang: Optional[az.Bereitstellung] = None,
+                             git: Optional[dict[str, str]] = None) -> dict[str, Any]:
         """Zug-eigene Claude-Code-Einstellungen mit Skills- und Profil-Sperre aus den Snippets.
 
         Mit Zugaengen stehen deren Huellen vorn im PATH von Bash und Hooks, und ``WB_ZUGAENGE`` nennt der
-        Profil-Sperre den Zugangsordner; ``extra_env`` des Zuges kennt beides nicht."""
+        Profil-Sperre den Zugangsordner; ``extra_env`` des Zuges kennt beides nicht. Mit Worktree kommen die
+        Git-Einstellungen des Zuges dazu (``agents_worktree.Arbeitsbaum.git_umgebung``: Hooks aus, Identitaet)."""
         hooks = self.orte.runtime / "hooks"
 
         def eintrag(matcher: str, name: str) -> dict[str, Any]:
@@ -515,6 +536,8 @@ class WeltTraeger:
         if zugang is not None:
             settings["env"] = {"PATH": "%s:/usr/local/bin:/usr/bin:/bin" % zugang.ordner,
                                "WB_ZUGAENGE": str(zugang.ordner)}
+        if git:
+            settings.setdefault("env", {}).update(git)
         return settings
 
     def _zugaenge_aufraeumen(self) -> list[str]:
@@ -544,6 +567,28 @@ class WeltTraeger:
     def arbeitsorte(self, agent_id: str) -> tuple[Path, Path]:
         base = _private_dir(self.orte.agents / ad.valid_id(agent_id, "Agentenkennung"), "Agentenordner")
         return _private_dir(base / "work", "Arbeitsordner"), _private_dir(base / "state", "Agentenzustand")
+
+    def arbeitsbaum(self, agent_id: str, arbeitsordner: Path) -> tuple[Optional[aw.Arbeitsbaum], Optional[str]]:
+        """Worktree des Agenten im git-Projekt der Welt (agents_worktree, der Nutzer 16.09.2026).
+
+        Ohne git-Projekt ``(None, None)``. Laesst er sich nicht anlegen oder pruefen, laeuft der Zug wie ohne
+        git-Projekt, und der Grund steht als ``worktree_fehler`` im Zug und in der Anweisung."""
+        try:
+            projekt = ask.world_project(self.root)
+            if projekt is None or not projekt.is_dir():
+                return None, None
+            projekt = projekt.resolve(strict=True)
+            if projekt in (Path("/"), Path.home()):
+                return None, None
+            return aw.bereitstellen(projekt, arbeitsordner, agent_id), None
+        except Exception as exc:  # noqa: BLE001 - der Zug laeuft ohne Worktree weiter, der Grund bleibt sichtbar
+            return None, "%s: %s" % (type(exc).__name__, str(exc)[:200])
+
+    def _uebergabe_cwd(self, handoff_run: str) -> Optional[str]:
+        try:
+            return json.loads((self.orte.handoffs / handoff_run / "uebergabe.json").read_text(encoding="utf-8"))["cwd"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     # Zustellwege -----------------------------------------------------------------
     def _kette(self, sender: Optional[str], zeit: Optional[str]) -> tuple[Optional[str], tuple[str, ...]]:
@@ -707,16 +752,12 @@ class WeltTraeger:
             summary["wartend"].append(dict(info, reason="ungeklaerter_lauf", run=active.run_id))
             return True
         model = None
+        wahl = None
         if posten.art != "aufwachen":
-            model = self.modell(agent)
-            if model is None:
-                summary["wartend"].append(dict(info, reason="modell_nicht_aufloesbar"))
-                return False
-            # Lokale Pi-Agenten brauchen weder Abo-Anmeldung noch Abo-Kontingent.
-            gate = self._startsperre(agent_id, freigabe_cache) if self.harness(agent) == "claude" else None
-            if gate is not None:
-                summary["wartend"].append(dict(info, reason=gate["grund"], bis=gate["bis"]))
-                return True
+            zug_agent, model, wahl, erledigt = self._modellwahl(agent, info, summary, freigabe_cache)
+            if zug_agent is None:
+                return erledigt
+            agent = zug_agent
         marker = self._marker(posten.art, posten.ticket_id, posten.nachricht_id, posten.frage_id, agent_id)
         claim = self.wecker.claim(
             delivery, desired_world_state=WELT_ZUSTAND[world["state"]],
@@ -728,7 +769,7 @@ class WeltTraeger:
                                     outcome="aufgewacht")
                 summary["beendet"].append(dict(info, outcome="aufgewacht"))
                 return False
-            run_id = self._starten(world, agent, posten, claim.claim_id, model, marker)
+            run_id = self._starten(world, agent, posten, claim.claim_id, model, marker, wahl)
             if run_id is not None:
                 summary["gestartet"].append(dict(info, run=run_id, ticket=posten.ticket_id))
             return True
@@ -739,13 +780,22 @@ class WeltTraeger:
             dict(info, reason=claim.reason, status=claim.status))
         return claim.status == "unknown" or claim.reason in {"paused", "stopped", "active_run", "claim_in_flight"}
 
-    def _startsperre(self, agent_id: str, cache: dict[str, Startfreigabe]) -> Optional[dict[str, Any]]:
+    def _startsperre(self, agent_id: str, cache: dict[str, Startfreigabe],
+                     fallback: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
         """Prueft Anmeldung und Kontingent vor einem Claim; bei Sperre schlaeft der Agent bis zur Freigabe."""
+        sperre = self._abo_sperre(cache)
+        if sperre is None:
+            return None
+        quelle = dict(sperre["quelle"], fallback=fallback) if fallback is not None else sperre["quelle"]
+        self._schlafen(agent_id, sperre["grund"], sperre["bis"], quelle)
+        return {"grund": sperre["grund"], "bis": sperre["bis"]}
+
+    def _abo_sperre(self, cache: dict[str, Startfreigabe]) -> Optional[dict[str, Any]]:
+        """Anmeldung und Kontingent des Claude-Abos ohne Nebenwirkung: ``None`` oder Grund, Ende und Quelle."""
         credential = self.anmeldequelle.status()
         if not credential.get("available"):
-            bis = self._now() + RECHECK_S
-            self._schlafen(agent_id, "anmeldung", bis, {"anmeldung": credential.get("reason")})
-            return {"grund": "anmeldung", "bis": bis}
+            return {"grund": "anmeldung", "bis": self._now() + RECHECK_S,
+                    "quelle": {"anmeldung": credential.get("reason")}}
         if self.kontingentquelle is None:
             return None
         if "frei" not in cache:
@@ -753,9 +803,111 @@ class WeltTraeger:
         freigabe = cache["frei"]
         if freigabe.erlaubt:
             return None
-        bis = freigabe.naechster_start or (self._now() + RECHECK_S)
-        self._schlafen(agent_id, "kontingent", bis, freigabe.as_dict())
-        return {"grund": "kontingent", "bis": bis}
+        return {"grund": "kontingent", "bis": freigabe.naechster_start or (self._now() + RECHECK_S),
+                "quelle": freigabe.as_dict()}
+
+    # Modellwahl je Zug ---------------------------------------------------------------
+    def fallback_agent(self, agent: dict[str, Any]) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+        """Das Profil mit ``fallback_model``/``fallback_effort`` als Modell, oder ``None`` und der Grund dafuer.
+
+        Fable ist nie ein Fallback (Regel), auch wenn es im Profil steht."""
+        profile = agent.get("model_profile") or {}
+        name = profile.get("fallback_model")
+        if not name:
+            return None, "kein_fallback"
+        if ist_fable(name):
+            return None, "fallback_fable_verboten"
+        variant = dict(agent, model_profile=dict(profile, model=name, effort=profile.get("fallback_effort")))
+        if self.modell(variant) is None:
+            return None, "fallback_nicht_aufloesbar"
+        return variant, None
+
+    def _lokal_frei(self, agent: dict[str, Any]) -> bool:
+        """Ein lokales Pi-Modell ist frei, wenn sein Server antwortet; Claude und Codex sind nie „belegt“."""
+        if self.harness(agent) != "pi":
+            return True
+        try:
+            return bool(self._lokal_frei_pruefer(str(self.konfig.pi["base_url"])))
+        except Exception:  # noqa: BLE001 - ein kaputter Pruefer heisst: nicht frei
+            return False
+
+    def _modellwahl(self, agent: dict[str, Any], info: dict[str, Any], summary: dict[str, Any],
+                    cache: dict[str, Startfreigabe]) -> tuple[Optional[dict[str, Any]], Optional[str],
+                                                              Optional[dict[str, Any]], bool]:
+        """Modell des naechsten Zuges: das Profilmodell oder sein Fallback (der Nutzer, 16.09.2026).
+
+        Der Fallback greift bei erschoepftem Kontingent (Vorabsperre oder vorgemerkte 429 des Abos), wenn ein
+        lokales Modell belegt ist, und nach einem Startfehler. Ein Fallback im selben Abo hilft am Limit nicht:
+        dann schlaeft der Agent wie ohne Fallback, und die Schlafquelle nennt den Grund. Liefert
+        ``(agent_fuer_den_zug, modell, wahl, erledigt)``; ohne Zug ist das Agentenprofil ``None``, und
+        ``erledigt`` sagt, ob der Durchgang fuer diesen Agenten vorbei ist."""
+        agent_id = agent["id"]
+        profil = str((agent.get("model_profile") or {}).get("model") or "")
+        if ist_fable(profil):
+            summary["wartend"].append(dict(info, reason="fable_verboten"))
+            return None, None, None, False
+        model = self.modell(agent)
+        if model is None:
+            summary["wartend"].append(dict(info, reason="modell_nicht_aufloesbar"))
+            return None, None, None, False
+        harness = self.harness(agent)
+        wahl = {"profil": profil, "modell": profil, "harness": harness, "fallback": False, "grund": None}
+        fallback, fallback_fehlt = self.fallback_agent(agent)
+
+        def bereit(kandidat: dict[str, Any]) -> Optional[str]:
+            """Grund, warum der Kandidat jetzt nicht startet, ohne zu schlafen."""
+            if not self._lokal_frei(kandidat):
+                return "belegt"
+            if self.harness(kandidat) == "claude":
+                sperre = self._abo_sperre(cache)
+                return sperre["grund"] if sperre is not None else None
+            return None
+
+        def mit_fallback(grund: str) -> tuple[dict[str, Any], str, dict[str, Any], bool]:
+            assert fallback is not None
+            name = str(fallback["model_profile"]["model"])
+            return fallback, str(self.modell(fallback)), dict(wahl, modell=name, harness=self.harness(fallback),
+                                                               fallback=True, grund=grund), False
+
+        def warten(grund: str, bis: float, quelle: dict[str, Any], fallback_info: dict[str, Any]):
+            self._schlafen(agent_id, grund, bis, dict(quelle, fallback=fallback_info))
+            summary["wartend"].append(dict(info, reason=grund, bis=bis, fallback=fallback_info))
+            return None, None, None, True
+
+        vormerkung = self._zuege_lesen()["fallback"].get(agent_id)
+        if vormerkung is not None:
+            gueltig = vormerkung.get("profil") == profil and (
+                vormerkung.get("bis") is None or float(vormerkung["bis"]) > self._now())
+            if not gueltig or vormerkung.get("grund") == "startfehler":
+                with self._zuege() as state:  # ein Startfehler gilt fuer genau einen Zug
+                    state["fallback"].pop(agent_id, None)
+            if gueltig and fallback is not None and bereit(fallback) is None:
+                return mit_fallback(str(vormerkung.get("grund")))
+            if gueltig and vormerkung.get("grund") == "kontingent":
+                bis = float(vormerkung.get("bis") or (self._now() + RECHECK_S))
+                return warten("kontingent", bis, {"vorgemerkt": vormerkung},
+                              {"modell": (fallback or {}).get("model_profile", {}).get("model"),
+                               "grund": fallback_fehlt or "fallback_nicht_bereit"})
+        if not self._lokal_frei(agent):
+            if fallback is not None and bereit(fallback) is None:
+                return mit_fallback("belegt")
+            return warten("belegt", self._now() + BELEGT_ABSTAND_S, {"base_url": str((self.konfig.pi or {}).get("base_url"))},
+                          {"modell": (fallback or {}).get("model_profile", {}).get("model"),
+                           "grund": fallback_fehlt or "fallback_nicht_bereit"})
+        if harness == "claude":
+            sperre = self._abo_sperre(cache)
+            if sperre is not None:
+                if sperre["grund"] == "kontingent" and fallback is not None:
+                    if modell_abo(self.harness(fallback)) == modell_abo(harness):
+                        info_fb = {"modell": fallback["model_profile"]["model"], "grund": "gleiches_abo"}
+                    elif bereit(fallback) is None:
+                        return mit_fallback("kontingent")
+                    else:
+                        info_fb = {"modell": fallback["model_profile"]["model"], "grund": "fallback_nicht_bereit"}
+                else:
+                    info_fb = {"modell": (fallback or {}).get("model_profile", {}).get("model"), "grund": fallback_fehlt}
+                return warten(sperre["grund"], sperre["bis"], sperre["quelle"], info_fb)
+        return agent, model, wahl, False
 
     def _schlafen(self, agent_id: str, grund: str, bis: float, quelle: dict[str, Any],
                   timer_content: Optional[str] = None, caused_by: Optional[Delivery] = None) -> str:
@@ -926,7 +1078,9 @@ class WeltTraeger:
     def _anweisung(self, world: dict[str, Any], agent: dict[str, Any], run_dir: Path,
                    verzeichnis: Optional[dict[str, Any]], skills_fehler: Optional[str],
                    zugang: Optional[az.Bereitstellung] = None, zugang_fehler: Optional[str] = None,
-                   projekt: Optional[Path] = None, projekt_arbeit: Optional[Path] = None) -> str:
+                   projekt: Optional[Path] = None, projekt_arbeit: Optional[Path] = None,
+                   baum: Optional[aw.Arbeitsbaum] = None, baum_fehler: Optional[str] = None,
+                   arbeitsordner: Optional[Path] = None) -> str:
         """Anweisungsdatei des Zuges: eigene Anweisungen, Gedaechtnis, Skills mit Pfad, Projekt, Zugende mit
         Lernschritt."""
         folder = ad._agent_dir(self.root, agent["id"])
@@ -959,12 +1113,41 @@ class WeltTraeger:
         if not skills:
             lines.append("Keine Skills verzeichnet." if not skills_fehler else
                          "Skillverzeichnis nicht lesbar: %s" % skills_fehler)
-        if projekt is not None:
+        if projekt is not None and baum is not None:
+            # Worktree je Agent (der Nutzer, 16.09.2026): am Projekt arbeitet jeder Agent auf seinem eigenen Zweig.
+            haupt = aw.hauptzweig(baum.projekt) or "main"
+            lines += ["", "## Projekt", "",
+                      "Das Projekt der Welt liegt unter `%s` und ist im Zug nur lesbar; seinen Arbeitsbaum und den "
+                      "Hauptzweig `%s` berührst du nie." % (projekt, haupt),
+                      "Du arbeitest in deinem eigenen Worktree `%s` (dein Arbeitsverzeichnis) auf dem Zweig `%s`. "
+                      "Änderungen am Projekt machst und committest du dort: `git add <pfade>`, "
+                      "`git commit -m \"…\"` (immer mit `-m`, einen Editor gibt es nicht). Den neuesten Stand holst "
+                      "du mit `git rebase %s`; eine Datei stellst du mit `git checkout -- <pfad>` zurück." % (
+                          baum.pfad, baum.zweig, haupt),
+                      "Das Ergebnis eines Tickets mit Codeänderung nennt deinen Commit im Feld `commit` von "
+                      "`ticket.result` (im JSON neben `text`: `\"commit\": \"<sha>\"`; mit dem Skill "
+                      "ergebnis-schreiben `--commit <sha>`).",
+                      "Zusammengeführt wird nur durch Teamleiter und Hauptagent; gepusht wird nur vom Hauptagenten "
+                      "nach Abnahme. Kein `git push`, kein Wechsel auf andere Zweige, kein `git worktree`."]
+            if agent["stage"] == "teamleiter":
+                lines.append("Als Teamleiter führst du Zweige der Mitglieder deines Teams in deinen Zweig zusammen: "
+                             "`git merge agent/<mitglied>`; nach Konflikten `git add` und `git commit --no-edit`, "
+                             "abbrechen mit `git merge --abort`.")
+            elif agent["stage"] == "hauptagent":
+                lines.append("Als Hauptagent führst du jeden Agentenzweig in deinen Zweig zusammen: "
+                             "`git merge agent/<id>`; nach Konflikten `git add` und `git commit --no-edit`, "
+                             "abbrechen mit `git merge --abort`.")
+            lines.append("Dokumente für andere (Berichte, Entwürfe, Übergaben) legst du im gemeinsamen Ordner `%s` "
+                         "ab (Unterordner je Team oder Thema); eigene Notizen und Entwürfe gehören in deinen privaten "
+                         "Ordner `%s`." % (projekt_arbeit, arbeitsordner))
+        elif projekt is not None:
             lines += ["", "## Projekt", "",
                       "Das Projekt der Welt liegt unter `%s` und ist im Zug lesbar (Regeln, Dokumente, Quelltext). "
                       "Geschrieben wird nur im eigenen Arbeitsordner und im gemeinsamen Ordner `%s`; dort legen "
                       "Team und Agenten ihre Ergebnisdateien ab (Unterordner je Team oder Thema)." % (
                           projekt, projekt_arbeit)]
+            if baum_fehler:
+                lines.append("Dein eigener Worktree ist in diesem Zug nicht bereit: %s" % baum_fehler)
         if zugang is not None or zugang_fehler:
             lines += ["", "## Zugänge", ""]
             if zugang is not None:
@@ -975,13 +1158,26 @@ class WeltTraeger:
                 lines.append("Die Zugänge der Welt sind in diesem Zug nicht bereit: %s" % zugang_fehler)
         if agent["stage"] == "hauptagent":
             draft = {"id": "NAME", "stage": "mitglied", "team": "TEAM", "specialty": "Ein Satz zur Aufgabe",
-                     "model": "sonnet5:high"}
+                     "model": "sonnet5:high", "tools": ["Read", "Grep", "Glob", "Write", "Edit"], "bash": [],
+                     "skills": []}
+            rechte = {"agent_id": "NAME", "tools": ["Read", "Grep", "Glob", "Write", "Edit"], "bash": ["pytest *"],
+                      "skills": ["texte-schreiben"], "web": True}
             lines += ["", "## Agenten anlegen", "",
                       "Einen Agenten legst du über den RPC an: schreibe den Entwurf als JSON in eine Datei deines "
                       "Arbeitsordners und rufe `/usr/bin/python3 %s agent.create < entwurf.json` auf. Form: "
-                      "`{\"draft\": %s}`. Der Mensch erfährt es als markiertes Ergebnis." % (
-                          rpc, json.dumps(draft, ensure_ascii=False)),
-                      "Anträge von Teamleitern entscheidest du mit `agent.decide` (`request_id`, `accept`, `note`)."]
+                      "`{\"draft\": %s}`. `tools`, `bash` und `skills` sind die Rechte des neuen Agenten; ohne "
+                      "`tools` gelten die seiner Stufe, ohne `machine` die Maschine dieser Welt. Der Mensch erfährt "
+                      "es als markiertes Ergebnis mit den Rechten." % (rpc, json.dumps(draft, ensure_ascii=False)),
+                      "Anträge von Teamleitern entscheidest du mit `agent.decide` (`request_id`, `accept`, `note`).",
+                      "Rechte eines Agenten der Welt (nicht deine eigenen) setzt du mit `agent.rechte`: "
+                      "`/usr/bin/python3 %s agent.rechte < rechte.json`, Form `%s`. Jedes Feld außer `agent_id` ist "
+                      "optional: `tools` ersetzt die Werkzeugliste (erlaubt: %s; Bash bleibt immer), `bash` ersetzt die "
+                      "eigenen Muster, die Dienstwegmuster bleiben immer, `skills` ersetzt die Skills, `web` true oder "
+                      "false gibt oder nimmt WebFetch und WebSearch. Web gibt es nur mit einem Zugang der Art web, "
+                      "`ssh`/`scp`/`rsync`-Muster nur für eingerichtete ssh-Zugänge der Welt; sonst nennt die Antwort "
+                      "den Grund. Die Änderung gilt ab dem nächsten Zug des Agenten, steht in seinem Verlauf, und der "
+                      "Mensch erfährt sie als markiertes Ergebnis. Teamleiter beantragen Rechte bei dir." % (
+                          rpc, json.dumps(rechte, ensure_ascii=False), ", ".join(ad.AGENT_TOOLS))]
         lines += ["", "## Zugende", "",
                   "1. Ein Zug endet mit einer Entscheidung: fertig, Weckzeit, Übergabe oder „braucht dich“ über "
                   "den Dienstweg.",
@@ -1001,7 +1197,7 @@ class WeltTraeger:
         return "\n".join(lines) + "\n"
 
     def _starten(self, world: dict[str, Any], agent: dict[str, Any], posten: Posten, claim_id: str,
-                 model: str, marker: str) -> Optional[str]:
+                 model: str, marker: str, wahl: Optional[dict[str, Any]] = None) -> Optional[str]:
         agent_id = agent["id"]
         ticket = nachricht = frage = None
         if posten.art in {"ticket", "fortsetzen"} and posten.ticket_id:
@@ -1035,6 +1231,9 @@ class WeltTraeger:
             return None
         run_id = "zug-" + uuid.uuid4().hex[:20]
         workspace, agent_state = self.arbeitsorte(agent_id)
+        # Mit git-Projekt ist der eigene Worktree (im privaten Arbeitsordner) das Arbeitsverzeichnis des Zuges.
+        baum, baum_fehler = self.arbeitsbaum(agent_id, workspace)
+        cwd = baum.pfad if baum is not None else workspace
         # Der Zugordner traegt die Laufkennung: der Lernschritt ist je Zug eindeutig.
         run_dir = agent_state / run_id
         config_dir = run_dir / "claude-config"
@@ -1043,13 +1242,22 @@ class WeltTraeger:
         harness = self.harness(agent)
         # Claude setzt aus einer gesicherten Uebergabe fort, Pi ueber dieselbe Sitzungskennung im Sitzungsordner.
         resume = bool(session.get("session_id")) if harness == "pi" else bool(session.get("handoff_run"))
+        if session.get("harness") and session["harness"] != harness:
+            resume = False  # ein Fallback in einem anderen Harness kann die Sitzung des anderen nicht fortsetzen
+        if resume and harness == "claude" and self._uebergabe_cwd(session["handoff_run"]) != str(cwd):
+            # Eine Sitzung aus der Zeit vor dem Worktree haengt an ihrem alten Arbeitsordner; sie beginnt einmal neu.
+            resume = False
         session_id = session["session_id"] if resume else str(uuid.uuid4())
         entry = {"run_id": run_id, "agent": agent_id, "art": posten.art, "delivery_id": posten.delivery.delivery_id,
                  "cause": posten.delivery.cause, "chain": list(posten.delivery.chain), "claim_id": claim_id,
                  "ticket_id": posten.ticket_id, "nachricht_id": posten.nachricht_id, "frage_id": posten.frage_id,
                  "postfach_id": posten.postfach_id, "harness": harness,
                  "session_key": session_key, "session_id": session_id, "resume": resume, "model": model,
-                 "config_dir": str(config_dir), "run_dir": str(run_dir), "workspace": str(workspace),
+                 "modellwahl": wahl or {"profil": (agent.get("model_profile") or {}).get("model"),
+                                        "modell": (agent.get("model_profile") or {}).get("model"), "harness": harness,
+                                        "fallback": False, "grund": None},
+                 "config_dir": str(config_dir), "run_dir": str(run_dir), "workspace": str(cwd),
+                 "worktree": str(baum.pfad) if baum is not None else None, "worktree_fehler": baum_fehler,
                  "marker_before": marker,
                  "revision_before": int((ticket or {}).get("result_revision") or 0), "started_at": self._now(),
                  "outcome": None}
@@ -1069,7 +1277,7 @@ class WeltTraeger:
             _private_dir(run_dir, "Zugzustand")
             if resume and harness == "claude":
                 uebergabe_wiederherstellen(self.orte.handoffs, session["handoff_run"], config_dir,
-                                           world=world["id"], agent=agent_id, cwd=str(workspace))
+                                           world=world["id"], agent=agent_id, cwd=str(cwd))
             verzeichnis, skills_fehler = self._skills(agent_id)
             skills = (verzeichnis or {}).get("skills") or []
             turn_dir = _private_dir(self.orte.turns / run_id, "Zugordner des Laufs")
@@ -1087,7 +1295,8 @@ class WeltTraeger:
             anweisung = turn_dir / "ANWEISUNG.md"
             atomar_schreiben.schreiben(anweisung, self._anweisung(world, agent, run_dir, verzeichnis, skills_fehler,
                                                                   zugang, zugang_fehler, projekt=projekt,
-                                                                  projekt_arbeit=projekt_arbeit),
+                                                                  projekt_arbeit=projekt_arbeit, baum=baum,
+                                                                  baum_fehler=baum_fehler, arbeitsordner=workspace),
                                        modus=0o600, dauerhaft=True)
             agent_dir = ad._agent_dir(self.root, agent_id)
             libraries = [Path(str((verzeichnis or {}).get(key) or "")) for key in ("bibliothek", "skript_bibliothek")]
@@ -1097,7 +1306,10 @@ class WeltTraeger:
                 (agent_dir / "skills.json",) if verzeichnis else ()) + tuple(
                 path for path in libraries if path.is_absolute() and path.is_dir()) + (
                 (zugang.weltdatei,) if zugang is not None else ()) + ((projekt,) if projekt is not None else ())
-            write_paths = (projekt_arbeit,) if projekt_arbeit is not None else ()
+            # Mit Worktree ist er Arbeitsverzeichnis und Schreibpfad des Laufs; der private Arbeitsordner darum
+            # bleibt beschreibbar. Das Projekt-Repo bindet der Launcher ueber git_einbindung.
+            write_paths = ((projekt_arbeit,) if projekt_arbeit is not None else ()) + (
+                (workspace,) if baum is not None else ())
             env = self._zugumgebung(agent_id, workspace, run_dir, rpc, verzeichnis is not None)
             prompt = self._prompt(world, agent, posten, resume, ticket, nachricht, frage, run_dir, skills)
             if harness == "pi":
@@ -1121,8 +1333,9 @@ class WeltTraeger:
                 settings = None
                 if self.konfig.sperren:
                     settings = turn_dir / "settings.json"
-                    atomar_schreiben.schreiben(settings, json.dumps(self._sperr_einstellungen(zugang), indent=2) + "\n",
-                                               modus=0o600, dauerhaft=True)
+                    git = baum.git_umgebung(agent_id) if baum is not None else None
+                    atomar_schreiben.schreiben(settings, json.dumps(self._sperr_einstellungen(zugang, git), indent=2)
+                                               + "\n", modus=0o600, dauerhaft=True)
                 tools = tuple(t for t in agent.get("tools") or [] if t in ALLOWED_TOOLS) or self.konfig.tools
                 zug = ClaudeZug(self.konfig.claude_binary, model, prompt, session_id, str(config_dir), resume, tools,
                                 extra_env=tuple(env), effort=effort, append_system_prompt_file=str(anweisung),
@@ -1133,9 +1346,10 @@ class WeltTraeger:
                                                                                              and harness == "claude"),
                                               "zugaenge": list(zugang.namen) if zugang is not None else [],
                                               "zugaenge_fehler": zugang_fehler})
-            lauf = self._zug_fabrik(self, agent_id=agent_id, run_id=run_id, zug=zug, workspace=workspace,
+            lauf = self._zug_fabrik(self, agent_id=agent_id, run_id=run_id, zug=zug, workspace=cwd,
                                     agent_state=agent_state, extra_read_paths=read_paths, netz=zugang is not None,
-                                    extra_write_paths=write_paths)
+                                    extra_write_paths=write_paths,
+                                    **({"git_einbindung": baum.einbindung()} if baum is not None else {}))
             self.laeufe[run_id] = lauf
             lauf.start()
         except Exception as exc:  # noqa: BLE001 - jeder Startfehler wird sichtbar abgeschlossen
@@ -1146,9 +1360,32 @@ class WeltTraeger:
             with contextlib.suppress(OSError):
                 az.aufraeumen(self.orte.turns / run_id)
             detail = "%s: %s" % (type(exc).__name__, str(exc)[:200])
-            self._nachbereiten(world["id"], entry, "startfehler", detail, marker)
+            sofort = self._fallback_vormerken(agent, entry, "startfehler", None)
+            self._nachbereiten(world["id"], entry, "startfehler", detail, marker, sofort=sofort)
             return None
         return run_id
+
+    def _fallback_vormerken(self, agent: dict[str, Any], entry: dict[str, Any], grund: str,
+                            bis: Optional[float]) -> bool:
+        """Merkt nach Startfehler oder 429 den Fallback fuer den naechsten Zug vor; True, wenn er greifen kann.
+
+        Nur ein Zug mit dem Profilmodell merkt vor. Nach einer 429 hilft nur ein Fallback ausserhalb des Abos."""
+        if (entry.get("modellwahl") or {}).get("fallback"):
+            return False
+        try:
+            profil_agent = ad.read_agent(self.root, agent["id"])
+        except ad.AgentsError:
+            return False
+        fallback, _ = self.fallback_agent(profil_agent)
+        if fallback is None:
+            return False
+        harness = entry.get("harness") or self.harness(profil_agent)
+        if grund == "kontingent" and modell_abo(self.harness(fallback)) == modell_abo(harness):
+            return False
+        with self._zuege() as state:
+            state["fallback"][agent["id"]] = {"grund": grund, "bis": bis, "seit": self._now(), "run": entry["run_id"],
+                                              "profil": (profil_agent.get("model_profile") or {}).get("model")}
+        return True
 
     # Zugende -----------------------------------------------------------------------
     def _laeufe_pruefen(self, world_id: str, summary: dict[str, Any]) -> None:
@@ -1227,8 +1464,10 @@ class WeltTraeger:
             sessions = state["sessions"].setdefault(agent_id, {})
             previous = sessions.get(entry["session_key"]) or {}
             sessions[entry["session_key"]] = {
-                "session_id": entry["session_id"],
-                "handoff_run": run_id if handoff is not None else previous.get("handoff_run")}
+                "session_id": entry["session_id"], "harness": entry.get("harness"),
+                "handoff_run": run_id if handoff is not None else (
+                    previous.get("handoff_run") if previous.get("harness", entry.get("harness")) == entry.get("harness")
+                    else None)}
             state["runs"][run_id].update({"stream": befund.status, "exit_code": record.get("exit_code"),
                                           "handoff": handoff is not None, "upstream": counts,
                                           "anfragen_form": shapes, "lernschritt": lernschritt, "messung": messung,
@@ -1298,7 +1537,8 @@ class WeltTraeger:
                 for item in data.get("skills") or [] if isinstance(item, dict)}
 
     def _nachbereiten(self, world_id: str, entry: dict[str, Any], outcome: str, detail: str, marker: str, *,
-                      befund: Any = None, limit: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+                      befund: Any = None, limit: Optional[dict[str, Any]] = None,
+                      sofort: bool = False) -> Optional[dict[str, Any]]:
         """Speichert das Urteil, quittiert und plant Schlaf oder Recovery; startet selbst nichts."""
         run_id, agent_id, art = entry["run_id"], entry["agent"], entry.get("art", "ticket")
         delivery = Delivery(entry["delivery_id"], world_id, agent_id, entry.get("cause") or "ticket", 0.0, "",
@@ -1317,18 +1557,31 @@ class WeltTraeger:
         if outcome in SCHLAF_URTEILE and content is not None:
             freigabe = self._freigabe_nach_abweisung(outcome, befund, limit)
             bis = freigabe.naechster_start or (self._now() + RECHECK_S)
-            timer = self._schlafen(agent_id, outcome, bis, freigabe.as_dict(), content(outcome), delivery)
-            follow = {"schlaf": outcome, "bis": bis, "wecker": timer,
-                      "sperren": [item.as_dict() for item in freigabe.sperren]}
-        elif outcome in RECOVERY_URTEILE and content is not None:
+            # 429 des Abos mit einem Fallback ausserhalb dieses Abos: sofort mit dem Fallback fortsetzen, das Abo
+            # bleibt fuer diesen Agenten bis zum Ende der Sperre vorgemerkt.
+            if outcome == "kontingent" and self._fallback_vormerken({"id": agent_id}, entry, "kontingent", bis):
+                sofort = True
+            else:
+                fallback, fehlt = self.fallback_agent(ad.read_agent(self.root, agent_id))
+                quelle = dict(freigabe.as_dict(), fallback={
+                    "modell": (fallback or {}).get("model_profile", {}).get("model"),
+                    "grund": "bereits_fallback" if (entry.get("modellwahl") or {}).get("fallback")
+                    else fehlt or ("gleiches_abo" if outcome == "kontingent" else None)})
+                timer = self._schlafen(agent_id, outcome, bis, quelle, content(outcome), delivery)
+                follow = {"schlaf": outcome, "bis": bis, "wecker": timer,
+                          "sperren": [item.as_dict() for item in freigabe.sperren], "fallback": quelle["fallback"]}
+        if follow is None and (outcome in RECOVERY_URTEILE or sofort) and content is not None:
             with self._zuege() as state:
                 count = int(state["zaehler"].get("recovery", 0)) + 1
                 state["zaehler"]["recovery"] = count
+            # Mit vorgemerktem Fallback sofort, sonst mit Abstand: ein neuer Versuch mit demselben Modell braucht Zeit.
             recovery = Delivery(ad.derived_id("recovery", agent_id, count), world_id, agent_id, "recovery",
-                                self._now() + RECOVERY_ABSTAND_S, content(outcome), delivery.delivery_id,
-                                tuple(delivery.chain) + (delivery.delivery_id,))
+                                self._now() + (0.0 if sofort else RECOVERY_ABSTAND_S), content(outcome),
+                                delivery.delivery_id, tuple(delivery.chain) + (delivery.delivery_id,))
             self._registrieren(recovery)
             follow = {"recovery": recovery.delivery_id, "faellig": recovery.due_at}
+            if sofort:
+                follow["fallback"] = True
         with self._zuege() as state:
             state["runs"][run_id].update({"outcome": outcome, "detail": detail, "ended_at": self._now(),
                                           "marker_after": marker, "folge": follow})
@@ -1495,6 +1748,7 @@ class WeltTraeger:
                                   for item, status in self.wecker.offene(world_id)],
                 "naechster_weckzeitpunkt": self.naechster_weckzeitpunkt(),
                 "offene_zuege": [entry for entry in state["runs"].values() if entry.get("outcome") is None],
+                "fallback_vorgemerkt": state["fallback"],
                 "letzte_zuege": sorted((entry for entry in state["runs"].values() if entry.get("outcome")),
                                        key=lambda entry: entry.get("ended_at") or 0)[-10:],
                 "agenten": self.zug_stand()}
@@ -1572,7 +1826,10 @@ class WeltTraeger:
                 "grund": grund,
                 "naechster_wecker": _iso(min(wecker_zeiten)) if wecker_zeiten else None,
                 "letzter": {"ende": _iso(letzter.get("ended_at")), "ergebnis": str(letzter["outcome"]),
-                            "art": _zug_art(letzter)} if letzter else None,
+                            "art": _zug_art(letzter), "modellwahl": letzter.get("modellwahl")} if letzter else None,
+                "modellwahl": zug.get("modellwahl") if zug else None,
+                "fallback": (schlaf.get("quelle") or {}).get("fallback") if schlaf and float(schlaf.get("bis") or 0) > now
+                else None,
             }
         return raus
 

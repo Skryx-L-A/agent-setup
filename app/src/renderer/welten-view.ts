@@ -39,6 +39,8 @@ export interface WeltenBruecke {
   handlung(befehl: string, opt: { echt: boolean; bestaetigt: boolean }): Promise<unknown>;
   daten?(): Promise<unknown>;
   sichtbar?(an: boolean): void;
+  /** Auftrag agentsform: der Ordnerdialog des Systems fuer eine neue Welt (main.ts, `awb:welt-ordner`). */
+  ordnerWaehlen?(echt: boolean): Promise<{ pfad: string; grund: string }>;
   testhaken?: boolean;
 }
 
@@ -51,7 +53,9 @@ const EINZEL = 'einzel';
 const MERKER = 'awb.welten.darstellung';
 const DENKSTUFEN = ['low', 'medium', 'high', 'xhigh'];
 // WebFetch und WebSearch sind je Agent wählbar (Rechercheagenten, 2026-09-15); Vorgabe bleibt ohne Web.
-const WERKZEUGE = ['Read', 'Grep', 'Glob', 'Bash', 'Write', 'Edit', 'WebFetch', 'WebSearch'];
+// Auftrag agentsform: Bash gehoert zum Dienstweg und ist immer dabei; gewaehlt werden die uebrigen, Web nur mit Zugang.
+const WERKZEUGE = ['Read', 'Write', 'Edit', 'Glob', 'Grep'];
+const WEB = ['WebFetch', 'WebSearch'];
 const WERKZEUGE_VORGABE = ['Read', 'Grep', 'Glob', 'Bash', 'Write', 'Edit'];
 const FIGUR_ARTEN = ['roboter', 'tier', 'linse'];
 const FIGUR_FARBEN = ['entwicklung', 'recherche', 'pruefung', 'gestaltung'];
@@ -61,6 +65,8 @@ interface Entwurf {
   id: string; stufe: string; team: string; spezialgebiet: string; modell: string; denkstufe: string; fallback: string;
   fallbackDenkstufe: string; maschine: string; werkzeuge: string[]; bash: string; skills: string; kontextgrenze: string;
   figurArt: string; figurFarbe: string; anweisungen: string; vorlage: string;
+  /** Auftrag agentsform: Kennungen aus der Modellliste der Welt gehen woertlich hinaus (`sonnet5:high`, `haiku`). */
+  modellGenau: boolean;
 }
 interface Anlegen {
   entwurf: Entwurf; beschreibung: string; modell: string; neuesTeam: boolean; gesetzt: Set<string>; pruefung: string; info: string;
@@ -119,6 +125,10 @@ const z = {
   weltNeuMaschine: '',
   /** Die Maschinen wurden fuer „Neue Welt" schon einmal gefragt. */
   maschinenGefragt: false,
+  /** Auftrag agentsform: die Rechte eines bestehenden Agenten in Bearbeitung (Profil); `bash` nur die eigenen Muster. */
+  rechte: null as null | { agent: string; werkzeuge: string[]; bash: string; skills: string[] },
+  /** Im Gespraech: die Karte „Was der Agent darf" aufgeklappt. */
+  gRechteOffen: false,
 };
 /** Die Fernwelt, die der Kern zuletzt als gewaehlt kennt. */
 let gemeldetGewaehlt = '';
@@ -154,12 +164,13 @@ function feld(tag: 'input' | 'textarea', schluessel: string, wert: string, platz
   f.className = tag === 'textarea' ? 'wv-textfeld' : 'wv-feld';
   return f;
 }
-function auswahlFeld(schluessel: string, wert: string, optionen: [string, string][]): HTMLSelectElement {
+function auswahlFeld(schluessel: string, wert: string, optionen: [string, string][], gesperrt: Set<string> = new Set()): HTMLSelectElement {
   const s = el('select', 'wv-auswahl');
   s.dataset.feld = schluessel;
   for (const [v, text] of optionen) {
     const o = el('option', undefined, text);
     o.value = v;
+    o.disabled = gesperrt.has(v);
     s.appendChild(o);
   }
   s.value = wert;
@@ -572,29 +583,32 @@ async function senden(w: Welt, echt: boolean): Promise<void> {
 
 function entwurfLeer(): Entwurf {
   return { id: '', stufe: 'mitglied', team: '', spezialgebiet: '', modell: 'sonnet5', denkstufe: 'high', fallback: '', fallbackDenkstufe: '', maschine: 'peer',
-    werkzeuge: [...WERKZEUGE_VORGABE], bash: '', skills: '', kontextgrenze: '', figurArt: 'roboter', figurFarbe: 'entwicklung', anweisungen: '', vorlage: '' };
+    werkzeuge: [...WERKZEUGE_VORGABE], bash: '', skills: '', kontextgrenze: '', figurArt: 'roboter', figurFarbe: 'entwicklung', anweisungen: '', vorlage: '', modellGenau: false };
 }
 const basis = (m: string): string => m.split(':')[0] ?? m;
 const suffix = (m: string): string => (m.includes(':') ? m.split(':')[1] : '');
 const mitStufe = (m: string, s: string): string => (basis(m) ? (s ? `${basis(m)}:${s}` : basis(m)) : '');
-export function entwurfAus(j: Record<string, unknown>): Entwurf {
+export function entwurfAus(j: Record<string, unknown>, genau = false): Entwurf {
   const s = (k: string): string => (typeof j[k] === 'string' ? (j[k] as string) : '');
   const l = (k: string): string[] => (Array.isArray(j[k]) ? (j[k] as unknown[]).map(String) : []);
   const f = (j.figure ?? {}) as { family?: string; color?: string };
   return {
     id: s('id'), stufe: s('stage') || 'mitglied', team: s('team'), spezialgebiet: s('specialty'),
-    modell: basis(s('model')), denkstufe: s('effort') || suffix(s('model')), fallback: basis(s('fallback_model')),
+    modell: genau ? s('model') : basis(s('model')), denkstufe: s('effort') || suffix(s('model')), fallback: genau ? s('fallback_model') : basis(s('fallback_model')),
     fallbackDenkstufe: s('fallback_effort') || suffix(s('fallback_model')), maschine: s('machine'), werkzeuge: l('tools'),
-    bash: l('bash').join('\n'), skills: l('skills').join(', '), kontextgrenze: s('context_limit'),
-    figurArt: f.family || 'roboter', figurFarbe: f.color || 'entwicklung', anweisungen: s('instructions'), vorlage: s('template'),
+    // Auftrag agentsform: im Formular stehen nur die eigenen Muster; die Dienstwegmuster gibt die Bibliothek ohnehin dazu.
+    bash: eigeneMuster(l('bash'), s('stage') || 'mitglied').join('\n'), skills: l('skills').join(', '), kontextgrenze: s('context_limit'),
+    figurArt: f.family || 'roboter', figurFarbe: f.color || 'entwicklung', anweisungen: s('instructions'), vorlage: s('template'), modellGenau: genau,
   };
 }
+/** Was als `model` hinausgeht: woertlich aus der Modellliste der Welt, sonst Basis mit Denkstufe. */
+export function modellText(m: string, stufe: string, genau: boolean): string { return genau ? m : mitStufe(m, stufe); }
 export function entwurfJson(e: Entwurf): Record<string, unknown> {
   const j: Record<string, unknown> = {};
   const setze = (k: string, v: string): void => { const x = v.trim(); if (x) j[k] = x; };
   setze('id', e.id); setze('stage', e.stufe); if (e.stufe !== 'hauptagent') setze('team', e.team);
-  setze('specialty', e.spezialgebiet); setze('model', mitStufe(e.modell, e.denkstufe)); setze('effort', e.denkstufe);
-  if (e.fallback) { setze('fallback_model', mitStufe(e.fallback, e.fallbackDenkstufe)); setze('fallback_effort', e.fallbackDenkstufe); }
+  setze('specialty', e.spezialgebiet); setze('model', modellText(e.modell, e.denkstufe, e.modellGenau)); setze('effort', e.denkstufe);
+  if (e.fallback) { setze('fallback_model', modellText(e.fallback, e.fallbackDenkstufe, e.modellGenau)); setze('fallback_effort', e.fallbackDenkstufe); }
   setze('machine', e.maschine); setze('context_limit', e.kontextgrenze); setze('template', e.vorlage);
   j.tools = [...e.werkzeuge];
   j.bash = e.werkzeuge.includes('Bash') ? e.bash.split('\n').map((x) => x.trim()).filter(Boolean) : [];
@@ -620,8 +634,14 @@ function anlegenOeffnen(w: Welt, vorlage?: string, ansicht: Anlegen['ansicht'] =
   const e = entwurfLeer();
   e.team = w.teams[0]?.name ?? '';
   if (!w.hauptagent) { e.stufe = 'hauptagent'; e.team = ''; }
-  // Auftrag fernwelten: ein Agent laeuft, wo seine Welt liegt.
-  if (w.maschine) e.maschine = w.maschine;
+  // Auftrag fernwelten: ein Agent laeuft, wo seine Welt liegt; seit agentsform auf der Traegermaschine der Welt.
+  e.maschine = agentMaschine(w, e.maschine);
+  // Auftrag agentsform: mit einer Modellliste der Welt gehen die Kennungen woertlich hinaus; die Vorgabe ist die erste verfuegbare.
+  if (w.modelle) {
+    e.modellGenau = true;
+    const m = w.modelle.find((x) => x.verfuegbar && x.id === mitStufe(e.modell, e.denkstufe)) ?? w.modelle.find((x) => x.verfuegbar);
+    if (m) { e.modell = m.id; if (suffix(m.id)) e.denkstufe = suffix(m.id); }
+  }
   z.anlegen = {
     entwurf: e, beschreibung: '', modell: nutzlast?.entwurf_modelle[0] ?? 'sonnet5:high', neuesTeam: !w.teams.length, gesetzt: new Set(), pruefung: '', info: '',
     ansicht, verlauf: [], eingabe: '', gFelder: [], gFragen: [], gFertig: false, gInfo: '', sitzung: ++anlegenSitzung,
@@ -639,7 +659,12 @@ function vorlageAnwenden(w: Welt, name: string): void {
   while (w.agenten.some((a) => a.id === id)) id = `${e.id}-${n++}`;
   e.id = id;
   e.vorlage = v.name;
-  if (w.maschine) e.maschine = w.maschine;
+  e.maschine = agentMaschine(w, e.maschine);
+  if (w.modelle) {
+    e.modell = mitStufe(e.modell, e.denkstufe);
+    if (e.fallback) e.fallback = mitStufe(e.fallback, e.fallbackDenkstufe);
+    e.modellGenau = true;
+  }
   z.anlegen.entwurf = e;
   z.anlegen.neuesTeam = !w.teams.some((t) => t.name === e.team);
   z.anlegen.gesetzt = new Set();
@@ -657,7 +682,7 @@ async function vorschlag(w: Welt, echt: boolean, trocken = false): Promise<void>
   if (trocken) { z.anlegen.info = r.meldung ?? ''; zeichnen(); return; }
   if (r.entwurf) {
     const gesetzt = z.anlegen.gesetzt;
-    z.anlegen.entwurf = entwurfAus(r.entwurf);
+    z.anlegen.entwurf = entwurfAus(r.entwurf, z.anlegen.entwurf.modellGenau);
     if (r.anweisungen) z.anlegen.entwurf.anweisungen = r.anweisungen;
     z.anlegen.gesetzt = gesetzt;
     z.anlegen.neuesTeam = !!z.anlegen.entwurf.team && !w.teams.some((t) => t.name === z.anlegen!.entwurf.team);
@@ -712,7 +737,7 @@ async function gespraechSenden(w: Welt, echt: boolean, trocken = false): Promise
   if (trocken) { jetzt.gInfo = r.meldung ?? ''; zeichnen(); return; }
   if (r.entwurf) {
     // Was der Mensch waehrend des Zuges im Formular gesetzt hat, bleibt stehen.
-    const neu = entwurfAus({ ...r.entwurf, ...vorgaben(jetzt) });
+    const neu = entwurfAus({ ...r.entwurf, ...vorgaben(jetzt) }, jetzt.entwurf.modellGenau);
     neu.vorlage = neu.vorlage || jetzt.entwurf.vorlage;
     jetzt.entwurf = neu;
     jetzt.neuesTeam = !!neu.team && !w.teams.some((x) => x.name === neu.team);
@@ -775,12 +800,128 @@ async function weltAnlegen(global: boolean, echt: boolean): Promise<void> {
   zeichnen();
 }
 
+// --- Rechte und Modelle (Auftrag agentsform) ------------------------------------------------
+
+/** Die Maschine eines neuen Agenten: die Traegermaschine der Welt (`maschine_vorgabe`), sonst die Maschine ihrer Ablage. */
+export function agentMaschine(w: Pick<Welt, 'maschine' | 'maschine_vorgabe'>, sonst = ''): string {
+  return w.maschine_vorgabe || w.maschine || sonst;
+}
+
+/** Die Dienstwegmuster einer Stufe, wie die Bibliothek sie jedem Agenten gibt. */
+function dienstweg(stufe: string): string[] {
+  return nutzlast?.bash_vorgabe?.[stufe] ?? nutzlast?.bash_vorgabe?.mitglied ?? [];
+}
+
+/** Die eigenen Bash-Muster: ohne die Dienstwegmuster der Stufe und ohne Leerzeilen. */
+export function eigeneMuster(muster: string[], stufe: string, vorgabe: string[] = dienstweg(stufe)): string[] {
+  return muster.map((m) => m.trim()).filter((m) => m && !vorgabe.includes(m));
+}
+
+/** Die Modelle fuer Modell und Fallback: die der Welt (nicht verfuegbare gesperrt, mit Grund), sonst die Registry. */
+export function modellOptionen(w: Pick<Welt, 'modelle'>, registry: WeltenNutzlast['modelle'], eigene: string[]): { optionen: [string, string][]; gesperrt: Set<string> } {
+  const optionen: [string, string][] = [];
+  const gesperrt = new Set<string>();
+  const gesehen = new Set<string>();
+  if (w.modelle) {
+    // Die Kennung der Welt woertlich: der Traeger sucht genau diesen Namen.
+    for (const m of w.modelle) {
+      if (gesehen.has(m.id)) continue;
+      gesehen.add(m.id);
+      optionen.push([m.id, m.verfuegbar ? `${m.id} · ${m.harness}` : `${m.id} · ${t('welten.modell.nichtVerfuegbar', { grund: m.grund ? wort('modellgrund', m.grund) : '–' })}`]);
+      if (!m.verfuegbar) gesperrt.add(m.id);
+    }
+  } else {
+    for (const m of registry) { const b = basis(m.kennung); if (!gesehen.has(b)) { gesehen.add(b); optionen.push([b, `${b} · ${m.harness}`]); } }
+  }
+  for (const e of eigene) if (e && !gesehen.has(e)) { gesehen.add(e); optionen.push([e, e]); }
+  return { optionen, gesperrt };
+}
+
+/** Der Befehl, mit dem der Mensch einer Welt einen Zugang der Art web gibt. */
+function webBefehl(w: Welt): string {
+  return `wb-welt zugang ${w.ablage || w.pfad} hinzufuegen --art web --name netz --bestaetigt`;
+}
+
+/**
+ * Was ein Agent darf, als Zeilen einer Karte -- dieselben im Formular, im Gespraech und im Profil:
+ * Werkzeuge (Bash fest als Dienstweg), Web nur mit Zugang, eigene Bash-Muster ueber den festen
+ * Dienstwegmustern, Skills der Welt und der Bibliothek. `bereich` ist `anlegen` oder `rechte`.
+ */
+function rechteZeilen(w: Welt, r: { werkzeuge: string[]; bash: string; skills: string[]; stufe: string }, bereich: 'anlegen' | 'rechte'): HTMLElement[] {
+  const zeile = (name: string, ...inhalt: (HTMLElement | null)[]): HTMLElement => {
+    const z2 = el('div', 'wv-formzeile');
+    z2.appendChild(el('span', 'wv-formname', name));
+    const rechts = el('div', 'wv-formwert');
+    for (const i of inhalt) if (i) rechts.appendChild(i);
+    z2.appendChild(rechts);
+    return z2;
+  };
+  const wahl = (text: string, w2: string, arg: string, an: boolean, aus = false): HTMLButtonElement => {
+    const b = knopf(text, w2, arg, an ? 'wv-wahl an' : 'wv-wahl', aus);
+    b.setAttribute('aria-pressed', String(an));
+    return b;
+  };
+  const werkzeuge = el('div', 'wv-werkzeuge');
+  const bash = wahl(t('welten.rechte.bashFest'), `${bereich}-werkzeug`, 'Bash', true, true);
+  bash.title = t('welten.rechte.bashFestTipp');
+  werkzeuge.appendChild(bash);
+  for (const x of WERKZEUGE) werkzeuge.appendChild(wahl(x, `${bereich}-werkzeug`, x, r.werkzeuge.includes(x)));
+  let web: HTMLElement;
+  if (w.web_zugang) {
+    web = el('div', 'wv-werkzeuge');
+    for (const x of WEB) web.appendChild(wahl(x, `${bereich}-werkzeug`, x, r.werkzeuge.includes(x)));
+  } else {
+    web = el('div', 'wv-leise wv-rechte-web');
+    web.append(el('span', undefined, t('welten.rechte.webOhne')), el('code', 'wv-mono wv-befehl', webBefehl(w)));
+  }
+  const fest = dienstweg(r.stufe);
+  const muster = el('div', 'wv-rechte-muster');
+  const eigene = feld('textarea', `${bereich}:bash`, r.bash, t('welten.rechte.bashPlatzhalter'));
+  (eigene as HTMLTextAreaElement).rows = 2;
+  muster.appendChild(eigene);
+  const festBox = el('div', 'wv-rechte-fest');
+  festBox.appendChild(el('div', 'wv-leise klein', fest.length ? t('welten.rechte.dienstweg', { n: fest.length }) : t('welten.rechte.dienstwegUnbekannt')));
+  for (const m of fest) festBox.appendChild(el('div', 'wv-mono wv-rechte-festzeile', m));
+  muster.appendChild(festBox);
+  const skills = el('div', 'wv-rechte-skills');
+  const katalog = [...w.skill_katalog.welt.map((k) => ({ ...k, ebene: 'welt' })), ...w.skill_katalog.bibliothek.map((k) => ({ ...k, ebene: 'bibliothek' }))];
+  const namen = new Set(katalog.map((k) => k.name));
+  for (const k of katalog) {
+    const b = wahl(`${k.name} · ${wort('ebene', k.ebene)}`, `${bereich}-skill`, k.name, r.skills.includes(k.name));
+    b.title = k.beschreibung;
+    skills.appendChild(b);
+  }
+  for (const name of r.skills.filter((x) => !namen.has(x))) skills.appendChild(wahl(t('welten.rechte.skillFremd', { name }), `${bereich}-skill`, name, true));
+  if (!skills.childElementCount) skills.appendChild(el('span', 'wv-leise', t('welten.rechte.keineSkills')));
+  return [
+    zeile(t('welten.feld.werkzeuge'), werkzeuge),
+    zeile(t('welten.rechte.web'), web),
+    zeile(t('welten.feld.bash'), muster),
+    zeile(t('welten.blatt.skills'), skills),
+  ];
+}
+
+/** Die Rechte in einer Zeile: fuer den zugeklappten Stand im Gespraech und das Profil. */
+export function rechteKurz(r: { werkzeuge: string[]; bash: string[]; skills: string[] }, festAnzahl: number): string {
+  const wz = ['Bash', ...r.werkzeuge.filter((x) => x !== 'Bash')];
+  return t('welten.rechte.kurz', { werkzeuge: wz.join(', '), eigene: r.bash.length, fest: festAnzahl, skills: r.skills.join(', ') || '–' });
+}
+
 /** Ob und wie „Agent anlegen" geht; der Grund steht als Text da, nicht nur im Schildchen. */
 export function anlegenLage(w: Pick<Welt, 'hauptagent' | 'stand' | 'fehler'>): { titel: string; aktiv: boolean; grund: string } {
   const titel = t(w.hauptagent ? 'welten.anlegen.titel' : 'welten.anlegen.hauptagent');
   if (w.fehler.length) return { titel, aktiv: false, grund: t('welten.anlegen.grundFehler') };
   if (w.stand === 'läuft') return { titel, aktiv: true, grund: '' };
   return { titel, aktiv: false, grund: t('welten.anlegen.weltSteht', { stand: wort('stand', w.stand) }) };
+}
+
+/** Auftrag agentsform: „Ordner wählen …" -- der Dialog des Systems (main.ts), danach wie „Welt anlegen". */
+async function ordnerDialogUndAnlegen(echt: boolean): Promise<void> {
+  if (!bruecke?.ordnerWaehlen) { z.meldung = { text: t('welten.neu.dialogFehlt'), ok: false }; zeichnen(); return; }
+  const r = await bruecke.ordnerWaehlen(echt);
+  if (!r.pfad) { if (r.grund) { z.meldung = { text: r.grund, ok: false }; zeichnen(); } return; }
+  z.weltNeuOrdner = r.pfad;
+  await weltAnlegen(false, echt);
 }
 
 /** Die Wege zu einer neuen Welt: Projektordner als Text oder Global. Leiste und Leerzustand zeigen dasselbe. */
@@ -797,8 +938,11 @@ function weltNeuZeichnen(n: WeltenNutzlast | null): HTMLElement {
   const pz = el('div', 'wv-zeile-knoepfe');
   const f = feld('input', 'weltneu:ordner', z.weltNeuOrdner, t('welten.neu.ordnerPlatzhalter'));
   f.setAttribute('aria-label', t('welten.neu.ordner'));
-  pz.append(f, knopf(t('welten.neu.anlegen'), 'welt-neu', 'projekt', 'knopf-voll', z.laufend.has('neu')));
-  box.append(el('div', 'wv-karte-titel', t('welten.neu.projekt')), el('div', 'wv-leise', t('welten.neu.projektText')), pz);
+  pz.append(f, knopf(t('welten.neu.anlegen'), 'welt-neu', 'projekt', 'knopf-rand', z.laufend.has('neu')));
+  // Auftrag agentsform: der Dialog ist der erste Weg, der Pfad als Text bleibt daneben.
+  const dialogZeile = el('div', 'wv-zeile-knoepfe');
+  dialogZeile.append(knopf(t('welten.neu.ordnerWaehlen'), 'welt-neu-dialog', '', 'knopf-voll', z.laufend.has('neu')), el('span', 'wv-leise', t('welten.neu.oderPfad')));
+  box.append(el('div', 'wv-karte-titel', t('welten.neu.projekt')), el('div', 'wv-leise', t('welten.neu.projektText')), dialogZeile, pz);
   const globalDa = !!n?.welten.some((x) => x.art === 'global');
   box.append(el('div', 'wv-karte-titel', t('welten.neu.global')));
   if (globalDa) {
@@ -806,6 +950,19 @@ function weltNeuZeichnen(n: WeltenNutzlast | null): HTMLElement {
   } else {
     const pfad = n?.global_pfad || '~/.claude/workbench/agents';
     box.append(el('div', 'wv-leise', t('welten.neu.globalText', { pfad })), knopf(t('welten.neu.globalAnlegen'), 'welt-neu', 'global', 'knopf-rand', z.laufend.has('neu')));
+  }
+  // Auftrag agentsform: gemerkte Projektordner lassen sich aus der Liste nehmen; der Ordner bleibt unberuehrt.
+  const gemerkt = n?.gemerkte_projekte ?? [];
+  if (gemerkt.length) {
+    box.append(el('div', 'wv-karte-titel', t('welten.neu.gemerkt')), el('div', 'wv-leise', t('welten.neu.gemerktText')));
+    for (const ordner of gemerkt) {
+      const zeile = el('div', 'wv-zeile-knoepfe wv-gemerkt');
+      zeile.dataset.ordner = ordner;
+      const pfadEl = el('span', 'wv-mono wv-gemerkt-pfad', ordner);
+      pfadEl.title = ordner;
+      zeile.append(pfadEl, knopf(t('welten.neu.vergessen'), 'welt-vergessen', ordner, 'wv-verweis', z.laufend.has('vergessen')));
+      box.appendChild(zeile);
+    }
   }
   return box;
 }
@@ -844,6 +1001,8 @@ async function handeln(w: string, arg: string, echt: boolean): Promise<void> {
     return;
   }
   if (w === 'welt-neu') { await weltAnlegen(arg === 'global', echt); return; }
+  if (w === 'welt-neu-dialog') { await ordnerDialogUndAnlegen(echt); return; }
+  if (w === 'welt-vergessen') { await ausfuehren('vergessen', { ordner: arg }, echt); zeichnen(); return; }
   if (w === 'weltneu-maschine') { z.weltNeuMaschine = arg; zeichnen(); maschinenFragen(echt); return; }
   if (!wl || !n) return;
   const a = agentVon(wl, agentId());
@@ -954,12 +1113,49 @@ async function handeln(w: string, arg: string, echt: boolean): Promise<void> {
     case 'vorschlag': await vorschlag(wl, echt, arg === 'trocken'); return;
     case 'pruefen': await pruefen(wl, echt, arg === 'hausvorlage'); return;
     case 'anlegen-sichern': await anlegenSichern(wl, echt); return;
-    case 'werkzeug': {
+    case 'werkzeug':
+    case 'anlegen-werkzeug': {
       const an = z.anlegen;
-      if (!an) return;
+      if (!an || arg === 'Bash') return;
+      if (WEB.includes(arg) && !wl.web_zugang) { z.meldung = { text: t('welten.rechte.webOhneMeldung', { befehl: webBefehl(wl) }), ok: false }; break; }
       if (an.entwurf.werkzeuge.includes(arg)) an.entwurf.werkzeuge = an.entwurf.werkzeuge.filter((x) => x !== arg);
       else an.entwurf.werkzeuge = [...an.entwurf.werkzeuge, arg];
+      if (!an.entwurf.werkzeuge.includes('Bash')) an.entwurf.werkzeuge = ['Bash', ...an.entwurf.werkzeuge];
       an.gesetzt.add('werkzeuge');
+      break;
+    }
+    case 'anlegen-skill': {
+      const an = z.anlegen;
+      if (!an) return;
+      const liste = an.entwurf.skills.split(',').map((x) => x.trim()).filter(Boolean);
+      an.entwurf.skills = (liste.includes(arg) ? liste.filter((x) => x !== arg) : [...liste, arg]).join(', ');
+      an.gesetzt.add('skills');
+      break;
+    }
+    case 'gespraech-rechte': z.gRechteOffen = !z.gRechteOffen; break;
+    // --- Rechte eines bestehenden Agenten (Profil) ---
+    case 'rechte-bearbeiten':
+      if (a && wl.rechte_aenderbar) z.rechte = { agent: a.id, werkzeuge: a.werkzeuge.filter((x) => x !== 'Bash'), bash: eigeneMuster(a.bash, a.stufe).join('\n'), skills: [...a.skills] };
+      break;
+    case 'rechte-zu': z.rechte = null; break;
+    case 'rechte-werkzeug': {
+      const r = z.rechte;
+      if (!r || arg === 'Bash') return;
+      if (WEB.includes(arg) && !wl.web_zugang) { z.meldung = { text: t('welten.rechte.webOhneMeldung', { befehl: webBefehl(wl) }), ok: false }; break; }
+      r.werkzeuge = r.werkzeuge.includes(arg) ? r.werkzeuge.filter((x) => x !== arg) : [...r.werkzeuge, arg];
+      break;
+    }
+    case 'rechte-skill': {
+      const r = z.rechte;
+      if (!r) return;
+      r.skills = r.skills.includes(arg) ? r.skills.filter((x) => x !== arg) : [...r.skills, arg];
+      break;
+    }
+    case 'rechte-sichern': {
+      const r = z.rechte;
+      if (!r) return;
+      const res = await ausfuehren('rechte', { welt: wl.pfad, agent: r.agent, werkzeuge: ['Bash', ...r.werkzeuge], bash: r.bash.split('\n').map((x) => x.trim()).filter(Boolean), skills: r.skills }, echt);
+      if (res.ok) z.rechte = null;
       break;
     }
     default: return;
@@ -984,6 +1180,7 @@ function eingabe(schluessel: string, wert: string): void {
     case 'ticketfilter': void handeln('ticketfilter', wert, true); return;
     case 'ticket': if (z.neuesTicket) (z.neuesTicket as Record<string, string>)[name] = wert; return;
     case 'profil': if (z.profil) (z.profil as Record<string, string>)[name] = wert; return;
+    case 'rechte': if (z.rechte && name === 'bash') z.rechte.bash = wert; return;
     case 'gedaechtnis': if (z.gedaechtnis) z.gedaechtnis.text = wert; return;
     case 'anlegen': {
       if (!a) return;
@@ -999,15 +1196,32 @@ function eingabe(schluessel: string, wert: string): void {
           a.neuesTeam = false;
         }
         if (name === 'neues-team') { a.entwurf.team = wert; a.gesetzt.add('team'); vorschauZeichnen(); return; }
+        if ((name === 'modell' || name === 'fallback') && wert) {
+          const wl = welt();
+          const m = wl?.modelle?.find((x) => x.id === wert);
+          if (m && !m.verfuegbar) { z.meldung = { text: t('welten.modell.abgelehnt', { modell: wert, grund: wort('modellgrund', m.grund) }), ok: false }; zeichnen(); return; }
+          if (a.entwurf.modellGenau && suffix(wert) && DENKSTUFEN.includes(suffix(wert))) {
+            e[name === 'modell' ? 'denkstufe' : 'fallbackDenkstufe'] = suffix(wert);
+            a.gesetzt.add(name === 'modell' ? 'denkstufe' : 'fallback-denkstufe');
+          }
+        }
         e[karte[name] ?? name] = wert;
         a.gesetzt.add(name);
         if (['stufe', 'team', 'fallback'].includes(name)) { zeichnen(); return; }
       }
       vorschauZeichnen();
+      // Auftrag agentsform: „Anlegen" geht, sobald Name und Spezialgebiet stehen -- nicht erst nach dem naechsten Zeichnen.
+      if (name === 'name' || name === 'spezialgebiet') fussAktualisieren();
       return;
     }
     default:
   }
+}
+
+/** Die Fusszeile des Anlege-Menues neu, ohne das Blatt neu zu zeichnen (das Eingabefeld behaelt den Fokus). */
+function fussAktualisieren(): void {
+  const alt = blatt?.querySelector('.wv-anlegen > .wv-fuss');
+  if (alt && z.anlegen) alt.replaceWith(anlegenFuss(z.anlegen));
 }
 
 // --- Zeichnen ----------------------------------------------------------------------------
@@ -1172,8 +1386,15 @@ function mitteZeichnen(w: Welt): HTMLElement {
   if (offen.length && !imEinzel) {
     const f = offen[0];
     const band = el('div', 'wv-frageband');
+    band.dataset.frage = f.id;
     band.append(punkt('will'), el('span', 'wv-frageband-text', t('welten.frage.band', { name: anzeigename(w, f.von), text: f.text })), knopf(t('welten.frage.ansehen'), 'frage-ansehen', f.id));
     box.appendChild(band);
+    // Auftrag agentsform: „Braucht dich" -- gleich hier beantworten, mit Option oder eigenem Text.
+    const antwort = el('div', 'wv-frageband-antwort');
+    const optionen = [...f.optionen].sort((x, y) => (x === f.empfehlung ? -1 : y === f.empfehlung ? 1 : 0));
+    for (const o of optionen) antwort.appendChild(knopf(o === f.empfehlung ? t('welten.frage.empfohlen', { option: o }) : o, 'antworten', `${f.id}|${o}`, o === f.empfehlung ? 'knopf-voll' : 'knopf-rand', z.laufend.has('antworten')));
+    antwort.append(feld('input', `antwort:${f.id}`, z.antworten.get(f.id) ?? '', t('welten.frage.eigeneAntwort')), knopf(t('welten.frage.antworten'), 'antworten', f.id, 'knopf-rand', z.laufend.has('antworten')));
+    box.appendChild(antwort);
   }
   box.appendChild(z.reiter === 'tickets' ? ticketsZeichnen(w, a) : chatZeichnen(w, a));
   return box;
@@ -1489,9 +1710,37 @@ function profilBlatt(w: Welt, a: WeltAgent, inhalt: HTMLElement): void {
   }
   inhalt.appendChild(karte(t('welten.blatt.profil'), knopf(t('welten.knopf.bearbeiten'), 'profil-bearbeiten', '', 'wv-verweis rechts'), wert(t('welten.feld.spezialgebiet'), a.spezialgebiet),
     wert(t('welten.feld.modell'), a.modell, true), wert(t('welten.feld.fallback'), a.fallback, true), wert(t('welten.feld.maschine'), a.maschine === 'mac' ? 'Mac' : a.maschine),
-    wert(t('welten.feld.werkzeuge'), a.werkzeuge.join(', ') || t('welten.wort.keineEingetragen'), true), wert(t('welten.blatt.skills'), a.skills.join(', ') || t('welten.wort.keineEingetragen')),
-    a.bash.length ? wert(t('welten.feld.bash'), a.bash.join(' · '), true) : null, a.kontextgrenze ? wert(t('welten.feld.kontextgrenze'), a.kontextgrenze) : null,
+    a.kontextgrenze ? wert(t('welten.feld.kontextgrenze'), a.kontextgrenze) : null,
     wert(t('welten.detail.angelegt'), `${uhrzeit(a.angelegt)}${a.angelegt_von ? ` ${t('welten.profil.angelegtVon', { name: anzeigename(w, a.angelegt_von) })}` : ''}${a.vorlage ? `, ${t('welten.profil.vorlage', { name: a.vorlage })}` : ''}`), wert(t('welten.profil.kennung'), a.id, true)));
+  inhalt.appendChild(rechteKarte(w, a));
+}
+
+/** Auftrag agentsform: was der Agent darf; aendern nur, wenn die Bibliothek `agent rechte` kennt, sonst mit Grund. */
+function rechteKarte(w: Welt, a: WeltAgent): HTMLElement {
+  const r = z.rechte;
+  if (r && r.agent === a.id && w.rechte_aenderbar) {
+    const k = karte(t('welten.rechte.bearbeiten'), ...rechteZeilen(w, { werkzeuge: r.werkzeuge, bash: r.bash, skills: r.skills, stufe: a.stufe }, 'rechte'),
+      el('div', 'wv-leise', t('welten.rechte.abNaechstemZug')));
+    const knoepfe = el('div', 'wv-zeile-knoepfe rechts');
+    knoepfe.append(knopf(t('welten.knopf.abbrechen'), 'rechte-zu'), knopf(t('welten.knopf.sichern'), 'rechte-sichern', '', 'knopf-voll', z.laufend.has('rechte')));
+    k.appendChild(knoepfe);
+    k.classList.add('wv-rechtekarte');
+    return k;
+  }
+  const fest = dienstweg(a.stufe);
+  const eigene = eigeneMuster(a.bash, a.stufe);
+  const web = a.werkzeuge.filter((x) => WEB.includes(x));
+  const k = karte(t('welten.rechte.titel'),
+    wert(t('welten.feld.werkzeuge'), a.werkzeuge.filter((x) => !WEB.includes(x)).join(', ') || t('welten.wort.keineEingetragen'), true),
+    wert(t('welten.rechte.web'), web.length ? web.join(', ') : w.web_zugang ? t('welten.rechte.webAus') : t('welten.rechte.webKeinZugang')),
+    wert(t('welten.feld.bash'), `${eigene.join(' · ') || t('welten.rechte.keineEigenen')}${fest.length ? ` ${t('welten.rechte.plusDienstweg', { n: a.bash.length - eigene.length })}` : ''}`, true),
+    wert(t('welten.blatt.skills'), a.skills.join(', ') || t('welten.wort.keineEingetragen')));
+  k.classList.add('wv-rechtekarte');
+  const aendern = knopf(t('welten.rechte.aendernOffen'), 'rechte-bearbeiten', '', 'knopf-rand', !w.rechte_aenderbar);
+  aendern.title = w.rechte_aenderbar ? t('welten.rechte.aendernTipp') : t('welten.rechte.nichtAusgerollt');
+  k.appendChild(aendern);
+  if (!w.rechte_aenderbar) k.appendChild(el('div', 'wv-leise wv-rechte-grund', t('welten.rechte.nichtAusgerollt')));
+  return k;
 }
 
 /** Auftrag agentaktiv: was der Traeger ueber den Zug dieses Agenten sagt; ohne Traeger keine Karte. */
@@ -1591,10 +1840,7 @@ function anlegenZeichnen(w: Welt, a: Anlegen): HTMLElement {
     z2.appendChild(r);
     return z2;
   };
-  const modelle: [string, string][] = [];
-  const gesehenBasis = new Set<string>();
-  for (const m of n.modelle) { const b = basis(m.kennung); if (!gesehenBasis.has(b)) { gesehenBasis.add(b); modelle.push([b, `${b} · ${m.harness}`]); } }
-  for (const eigen of [e.modell, e.fallback]) if (eigen && !gesehenBasis.has(eigen)) { gesehenBasis.add(eigen); modelle.push([eigen, eigen]); }
+  const { optionen: modelle, gesperrt } = modellOptionen(w, n.modelle, [e.modell, e.fallback]);
   const vorschlagZeile = el('div', 'wv-zeile-knoepfe');
   vorschlagZeile.append(auswahlFeld('anlegen:modell-vorschlag', a.modell, (n.entwurf_modelle.length ? n.entwurf_modelle : ['sonnet5:high']).map((x): [string, string] => [x, x])),
     knopf(t(z.laufend.has('vorschlag') ? 'welten.anlegen.vorschlagLaeuft' : 'welten.anlegen.vorschlagErzeugen'), 'vorschlag', '', 'knopf-rand', z.laufend.has('vorschlag')));
@@ -1609,20 +1855,19 @@ function anlegenZeichnen(w: Welt, a: Anlegen): HTMLElement {
     e.stufe !== 'hauptagent' ? zeile(t('welten.anlegen.team'), auswahlFeld('anlegen:team', a.neuesTeam ? 'neu' : e.team, teams)) : null,
     e.stufe !== 'hauptagent' && a.neuesTeam ? zeile(t('welten.anlegen.neuesTeam'), feld('input', 'anlegen:neues-team', e.team, t('welten.anlegen.neuesTeamPlatzhalter'))) : null,
     zeile(t('welten.feld.spezialgebiet'), feld('textarea', 'anlegen:spezialgebiet', e.spezialgebiet, t('welten.anlegen.einSatz'))));
-  abschnitt(t('welten.anlegen.modellUndMaschine'), t('welten.anlegen.modellFuss'),
-    zeile(t('welten.feld.modell'), auswahlFeld('anlegen:modell', e.modell, modelle)), zeile(t('welten.feld.denkstufe'), auswahlFeld('anlegen:denkstufe', e.denkstufe, DENKSTUFEN.map((x): [string, string] => [x, x]))),
-    zeile(t('welten.feld.fallback'), auswahlFeld('anlegen:fallback', e.fallback, [['', t('welten.wort.keiner')], ...modelle])),
-    e.fallback ? zeile(t('welten.feld.fallbackDenkstufe'), auswahlFeld('anlegen:fallback-denkstufe', e.fallbackDenkstufe, DENKSTUFEN.map((x): [string, string] => [x, x]))) : null,
-    zeile(t('welten.feld.maschine'), feld('input', 'anlegen:maschine', e.maschine, 'peer')));
-  const werkzeuge = el('div', 'wv-werkzeuge');
-  for (const x of WERKZEUGE) {
-    const b = knopf(x, 'werkzeug', x, e.werkzeuge.includes(x) ? 'wv-wahl an' : 'wv-wahl');
-    b.setAttribute('aria-pressed', String(e.werkzeuge.includes(x)));
-    werkzeuge.appendChild(b);
-  }
-  abschnitt(t('welten.anlegen.werkzeugeUndGrenzen'), t('welten.anlegen.werkzeugeFuss'),
-    zeile(t('welten.feld.werkzeuge'), werkzeuge), e.werkzeuge.includes('Bash') ? zeile(t('welten.feld.bash'), feld('textarea', 'anlegen:bash', e.bash, t('welten.anlegen.einsJeZeile'))) : null,
-    zeile(t('welten.blatt.skills'), feld('input', 'anlegen:skills', e.skills, t('welten.anlegen.kommaGetrennt'))), zeile(t('welten.feld.kontextgrenze'), feld('textarea', 'anlegen:kontextgrenze', e.kontextgrenze, t('welten.anlegen.kontextPlatzhalter'))));
+  // Auftrag agentsform: was der Agent darf, in einem Blick -- gleich nach Name und Stufe.
+  const rechte = rechteZeilen(w, { werkzeuge: e.werkzeuge, bash: e.bash, skills: e.skills.split(',').map((x) => x.trim()).filter(Boolean), stufe: e.stufe }, 'anlegen');
+  const rechteAbschnitt = (): void => {
+    const sek = el('section', 'wv-abschnitt wv-rechte');
+    sek.appendChild(el('h3', undefined, t('welten.rechte.titel')));
+    const k = el('div', 'wv-karte');
+    k.append(...rechte, zeile(t('welten.feld.kontextgrenze'), feld('textarea', 'anlegen:kontextgrenze', e.kontextgrenze, t('welten.anlegen.kontextPlatzhalter'))));
+    sek.append(k, el('div', 'wv-leise klein', t('welten.anlegen.werkzeugeFuss')));
+    form.appendChild(sek);
+  };
+  rechteAbschnitt();
+  abschnitt(t('welten.anlegen.modellUndMaschine'), w.modelle ? t('welten.anlegen.modellFussWelt') : t('welten.anlegen.modellFuss'),
+    ...modellZeilen(w, e, 'anlegen', modelle, gesperrt, zeile));
   abschnitt(t('welten.anlegen.figur'), '', e.stufe === 'hauptagent' ? el('div', 'wv-leise', t('welten.anlegen.hauptagentKern')) : zeile(t('welten.welt.art'), auswahlFeld('anlegen:figur', e.figurArt, FIGUR_ARTEN.map((x): [string, string] => [x, t(`welten.figur.${x}`)]))),
     e.stufe === 'hauptagent' ? null : zeile(t('welten.anlegen.farbe'), auswahlFeld('anlegen:farbe', e.figurFarbe, FIGUR_FARBEN.map((x): [string, string] => [x, t(`welten.farbe.${x}`)]))));
   abschnitt(t('welten.anlegen.anweisungen'), t('welten.anlegen.anweisungenFuss'),
@@ -1630,6 +1875,20 @@ function anlegenZeichnen(w: Welt, a: Anlegen): HTMLElement {
   box.appendChild(form);
   box.appendChild(anlegenFuss(a));
   return box;
+}
+
+/** Modell, Denkstufe, Fallback, Fallback-Denkstufe und Maschine: im Formular und im Gespraech dieselben Felder. */
+function modellZeilen(w: Welt, e: Entwurf, bereich: string, modelle: [string, string][], gesperrt: Set<string>,
+  zeile: (name: string, ...inhalt: HTMLElement[]) => HTMLElement): (HTMLElement | null)[] {
+  const n = nutzlast;
+  const maschinen = [...new Set([e.maschine, agentMaschine(w), ...(n?.maschinen ?? []).map((m) => m.name)].filter(Boolean))];
+  const stufen = DENKSTUFEN.map((x): [string, string] => [x, x]);
+  return [
+    zeile(t('welten.feld.modell'), auswahlFeld(`${bereich}:modell`, e.modell, modelle, gesperrt)), zeile(t('welten.feld.denkstufe'), auswahlFeld(`${bereich}:denkstufe`, e.denkstufe, stufen)),
+    zeile(t('welten.feld.fallback'), auswahlFeld(`${bereich}:fallback`, e.fallback, [['', t('welten.wort.keiner')], ...modelle], gesperrt)),
+    e.fallback ? zeile(t('welten.feld.fallbackDenkstufe'), auswahlFeld(`${bereich}:fallback-denkstufe`, e.fallbackDenkstufe, stufen)) : null,
+    zeile(t('welten.feld.maschine'), auswahlFeld(`${bereich}:maschine`, e.maschine, maschinen.map((m): [string, string] => [m, m === agentMaschine(w) ? t(w.traeger.eingerichtet ? 'welten.rechte.maschineTraeger' : 'welten.rechte.maschineVorgabe', { maschine: maschineWort(m) }) : maschineWort(m)]))),
+  ];
 }
 
 /** Die Fusszeile des Anlege-Menues, in beiden Ansichten dieselbe. */
@@ -1669,6 +1928,31 @@ function gespraechZeichnen(w: Welt, a: Anlegen): HTMLElement {
     verlauf.appendChild(laeuft);
   }
   box.appendChild(verlauf);
+  // Auftrag agentsform: auch im Gespraech steht, was der Agent darf; aufgeklappt laesst es sich dort setzen.
+  const e = a.entwurf;
+  const skills = e.skills.split(',').map((x) => x.trim()).filter(Boolean);
+  const rechte = el('div', `wv-gespraech-rechte${z.gRechteOffen ? ' offen' : ''}`);
+  const kopf = el('div', 'wv-zeile-knoepfe');
+  kopf.append(el('span', 'wv-karte-titel', t('welten.rechte.titel')),
+    el('span', 'wv-leise wv-rechte-kurz', `${rechteKurz({ werkzeuge: e.werkzeuge, bash: e.bash.split('\n').filter((x) => x.trim()), skills }, dienstweg(e.stufe).length)} · ${modellText(e.modell, e.denkstufe, e.modellGenau) || '–'}${e.fallback ? ` / ${modellText(e.fallback, e.fallbackDenkstufe, e.modellGenau)}` : ''} · ${maschineWort(e.maschine)}`),
+    knopf(t(z.gRechteOffen ? 'welten.rechte.zuklappen' : 'welten.rechte.aendern'), 'gespraech-rechte', '', 'wv-verweis'));
+  rechte.appendChild(kopf);
+  if (z.gRechteOffen) {
+    const zeile = (name: string, ...inhalt: HTMLElement[]): HTMLElement => {
+      const z2 = el('div', 'wv-formzeile');
+      z2.appendChild(el('span', 'wv-formname', name));
+      const r = el('div', 'wv-formwert');
+      r.append(...inhalt);
+      z2.appendChild(r);
+      return z2;
+    };
+    const { optionen, gesperrt } = modellOptionen(w, nutzlast?.modelle ?? [], [e.modell, e.fallback]);
+    const karte = el('div', 'wv-karte');
+    karte.append(...rechteZeilen(w, { werkzeuge: e.werkzeuge, bash: e.bash, skills, stufe: e.stufe }, 'anlegen'));
+    for (const x of modellZeilen(w, e, 'anlegen', optionen, gesperrt, zeile)) if (x) karte.appendChild(x);
+    rechte.appendChild(karte);
+  }
+  box.appendChild(rechte);
   if (a.gFertig || a.gFelder.length || a.gInfo) {
     const hinweis = el('div', 'wv-gespraech-hinweis');
     hinweis.style.padding = '6px 14px 0';
@@ -1701,11 +1985,17 @@ function anlegenVorschau(a: Anlegen): HTMLElement {
   const e = a.entwurf;
   const kopf = el('div', 'wv-profilkopf');
   const vt = el('div');
-  vt.append(el('div', 'wv-titel', e.id || t('welten.vorschau.ohneNamen')), el('div', 'wv-leise', `${stufeWort(e.stufe)}${e.team && e.stufe !== 'hauptagent' ? ` · ${teamText(e.team)}` : ''}`), el('div', 'wv-mono wv-leise', mitStufe(e.modell, e.denkstufe)));
+  vt.append(el('div', 'wv-titel', e.id || t('welten.vorschau.ohneNamen')), el('div', 'wv-leise', `${stufeWort(e.stufe)}${e.team && e.stufe !== 'hauptagent' ? ` · ${teamText(e.team)}` : ''}`), el('div', 'wv-mono wv-leise', modellText(e.modell, e.denkstufe, e.modellGenau)));
   kopf.append(entwurfFigur(e, 96), vt);
-  inhalt.append(kopf, wert(t('welten.feld.spezialgebiet'), e.spezialgebiet), wert(t('welten.feld.werkzeuge'), e.werkzeuge.join(', ')),
-    ...(e.werkzeuge.includes('Bash') ? [wert('Bash', e.bash.split('\n').filter(Boolean).join(' · '), true)] : []),
-    wert(t('welten.feld.maschine'), e.maschine), ...(e.kontextgrenze ? [wert(t('welten.feld.kontextgrenze'), e.kontextgrenze)] : []),
+  const eigene = e.bash.split('\n').map((x) => x.trim()).filter(Boolean);
+  const skills = e.skills.split(',').map((x) => x.trim()).filter(Boolean);
+  const darf = karte(t('welten.rechte.titel'), wert(t('welten.feld.werkzeuge'), ['Bash', ...e.werkzeuge.filter((x) => x !== 'Bash')].join(', '), true),
+    wert(t('welten.feld.bash'), `${eigene.join(' · ') || t('welten.rechte.keineEigenen')} ${t('welten.rechte.plusDienstweg', { n: dienstweg(e.stufe).length })}`, true),
+    wert(t('welten.blatt.skills'), skills.join(', ') || '–'),
+    wert(t('welten.feld.modell'), `${modellText(e.modell, e.denkstufe, e.modellGenau) || '–'}${e.modellGenau ? ` · ${e.denkstufe}` : ''}${e.fallback ? ` · ${t('welten.feld.fallback')} ${modellText(e.fallback, e.fallbackDenkstufe, e.modellGenau)}` : ''}`, true),
+    wert(t('welten.feld.maschine'), maschineWort(e.maschine)));
+  darf.classList.add('wv-vorschau-darf');
+  inhalt.append(kopf, wert(t('welten.feld.spezialgebiet'), e.spezialgebiet), darf, ...(e.kontextgrenze ? [wert(t('welten.feld.kontextgrenze'), e.kontextgrenze)] : []),
     el('div', 'wv-karte-titel', t('welten.vorschau.anweisungen')), el('pre', 'wv-md', e.anweisungen || t('welten.vorschau.ausHausvorlage')));
   box.appendChild(inhalt);
   return box;
@@ -1750,7 +2040,7 @@ function dialogZeichnen(): HTMLElement | null {
   d.appendChild(el('div', 'wv-titel', rf.text));
   d.appendChild(el('div', 'wv-leise', rf.warnungen.length ? rf.warnungen.join('\n') : t('welten.dialog.hinweis')));
   const k = el('div', 'wv-zeile-knoepfe rechts');
-  k.append(knopf(t('welten.knopf.abbrechen'), 'abbrechen'), knopf(t(rf.handlung === 'stoppen' ? 'welten.dialog.stoppen' : rf.handlung === 'umziehen' ? 'welten.dialog.umziehen' : 'welten.dialog.zuruecknehmen'), 'bestaetigen', '', rf.handlung === 'umziehen' ? 'knopf-voll' : 'knopf-voll gefahr'));
+  k.append(knopf(t('welten.knopf.abbrechen'), 'abbrechen'), knopf(t(rf.handlung === 'stoppen' ? 'welten.dialog.stoppen' : rf.handlung === 'umziehen' ? 'welten.dialog.umziehen' : rf.handlung === 'vergessen' ? 'welten.dialog.entfernen' : 'welten.dialog.zuruecknehmen'), 'bestaetigen', '', rf.handlung === 'umziehen' || rf.handlung === 'vergessen' ? 'knopf-voll' : 'knopf-voll gefahr'));
   d.appendChild(k);
   schicht.appendChild(d);
   return schicht;
@@ -1902,7 +2192,13 @@ export function weltenAufgaben(p: unknown): void {
   const text = JSON.stringify(roh);
   if (text === letzterRoh) return;
   letzterRoh = text;
-  nutzlast = { ...roh, vorlagen: roh.vorlagen ?? [], modelle: roh.modelle ?? [], entwurf_modelle: roh.entwurf_modelle ?? [], global_pfad: roh.global_pfad ?? '' };
+  nutzlast = {
+    ...roh, vorlagen: roh.vorlagen ?? [], modelle: roh.modelle ?? [], entwurf_modelle: roh.entwurf_modelle ?? [], global_pfad: roh.global_pfad ?? '',
+    gemerkte_projekte: roh.gemerkte_projekte ?? [], bash_vorgabe: roh.bash_vorgabe ?? {},
+    // Ein Kern ohne die Felder von agentsform: die Welten tragen sie dann leer.
+    welten: roh.welten.map((x) => ({ ...x, modelle: x.modelle ?? null, maschine_vorgabe: x.maschine_vorgabe ?? '', skill_katalog: x.skill_katalog ?? { welt: [], bibliothek: [] },
+      web_zugang: x.web_zugang ?? false, rechte_aenderbar: x.rechte_aenderbar ?? false })),
+  };
   zeichnen();
   const w = welt();
   if (w) gesehen(w, true);
@@ -2004,6 +2300,32 @@ export function weltenUiState(): Record<string, unknown> {
     weltNeu: { offen: z.weltNeuOffen, ordner: z.weltNeuOrdner, global: !!blatt?.querySelector('[data-w="welt-neu"][data-arg="global"]') },
     anlegenKnopf: w ? { text: text('.wv-anlegen'), aus: !!blatt?.querySelector<HTMLButtonElement>('.wv-anlegen')?.disabled, grund: text('.wv-anlegen-grund') } : null,
     vorlagen: nutzlast?.vorlagen.map((v) => v.name) ?? [],
+    // Auftrag agentsform: Rechte, Modelle, gemerkte Ordner und die Frage im Band.
+    rechte: (() => {
+      const box = blatt?.querySelector<HTMLElement>('.wv-rechte, .wv-gespraech-rechte.offen, .wv-rechtekarte');
+      if (!box) return null;
+      const knoepfe = [...box.querySelectorAll<HTMLButtonElement>('.wv-wahl')];
+      return {
+        werkzeuge: knoepfe.filter((b) => b.dataset.w?.endsWith('-werkzeug')).map((b) => ({ name: b.dataset.arg ?? '', an: b.classList.contains('an'), aus: b.disabled })),
+        skills: knoepfe.filter((b) => b.dataset.w?.endsWith('-skill')).map((b) => ({ name: b.dataset.arg ?? '', an: b.classList.contains('an') })),
+        webSatz: (box.querySelector('.wv-rechte-web')?.textContent ?? '').trim(),
+        dienstweg: [...box.querySelectorAll('.wv-rechte-festzeile')].map((x) => x.textContent ?? ''),
+      };
+    })(),
+    gespraechRechte: { offen: z.gRechteOffen, kurz: text('.wv-gespraech-rechte .wv-rechte-kurz') },
+    modellOptionen: [...(blatt?.querySelectorAll<HTMLOptionElement>('select[data-feld="anlegen:modell"] option') ?? [])].map((o) => ({ wert: o.value, text: o.textContent ?? '', aus: o.disabled })),
+    maschineWahl: (blatt?.querySelector<HTMLSelectElement>('select[data-feld="anlegen:maschine"]')?.value) ?? '',
+    profilRechte: (() => {
+      const k = blatt?.querySelector<HTMLElement>('.wv-rechtekarte');
+      if (!k) return null;
+      const b = k.querySelector<HTMLButtonElement>('[data-w="rechte-bearbeiten"]');
+      return { text: (k.textContent ?? '').trim(), aendernAus: b ? b.disabled : null, grund: (k.querySelector('.wv-rechte-grund')?.textContent ?? '').trim(), bearbeiten: !!z.rechte };
+    })(),
+    gemerkt: [...(blatt?.querySelectorAll<HTMLElement>('.wv-gemerkt') ?? [])].map((x) => x.dataset.ordner ?? ''),
+    frageband: (() => {
+      const b = blatt?.querySelector<HTMLElement>('.wv-frageband');
+      return b ? { frage: b.dataset.frage ?? '', optionen: [...(blatt?.querySelectorAll<HTMLButtonElement>('.wv-frageband-antwort [data-w="antworten"]') ?? [])].map((x) => x.dataset.arg ?? '') } : null;
+    })(),
     antraege: w?.antraege.map((x) => x.id) ?? [],
     knoepfe: [...(blatt?.querySelectorAll<HTMLButtonElement>('[data-w]') ?? [])].slice(0, 400).map((b) => `${b.dataset.w}:${b.dataset.arg ?? ''}${b.disabled ? ':aus' : ''}`),
   };

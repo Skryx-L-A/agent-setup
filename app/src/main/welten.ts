@@ -75,6 +75,15 @@
 // hat den Zug nicht gestartet" und die laufende Uhr „arbeitet seit 0:12" rechnen die
 // Oberflaechen selbst; der Kern liefert dafuer nur Zeiten, damit die Nutzlast nicht jede
 // Sekunde anders aussieht.
+//
+// RECHTE UND MODELLE (Auftrag agentsform, 16.09.2026; alice: „Der Hauptagent darf entscheiden, wer
+// welche Berechtigung bekommt, und ich beim Erstellen."). Je Welt reisen `modelle` und `maschine_vorgabe`
+// aus `wb-welt ansicht` (Worker agentrechte; fehlt das Feld, bleibt `modelle` null und die Oberflaechen
+// nehmen die Registry), der Skillkatalog der Welt und der Bibliothek, ob es einen Zugang der Art `web`
+// gibt und ob die Bibliothek `agent rechte` kennt. `welt:rechte` ruft `wb-agent rechte <agent>
+// --werkzeuge … --bash … --skills …`; die Form der Listen liest der Kern aus der Hilfe des Unterbefehls
+// und prueft nach dem Schreiben, ob das Profil sie traegt. `welt:vergessen` nimmt einen gemerkten
+// Projektordner aus `welten-projekte.json`, ohne den Ordner anzufassen.
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
@@ -152,6 +161,10 @@ export interface RohAnsicht {
   questions?: RohFrage[]; humans?: Record<string, RohMensch>; errors?: { section?: string; text?: string }[];
   /** Zugaenge der Welt (`zugaenge.json`): nur Name und Art, nie Ziel oder Schluesselpfad. */
   zugaenge?: { name?: string; art?: string }[];
+  /** Auftrag agentsform (Feld vom Worker agentrechte): die Modelle, die der Traeger dieser Welt fahren kann. */
+  modelle?: unknown;
+  /** Auftrag agentsform (Feld vom Worker agentrechte): die Maschine eines neuen Agenten, die Traegermaschine der Welt. */
+  maschine_vorgabe?: unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +292,23 @@ export interface Welt {
    * `zug_fehler`: warum das Lebenszeichen nicht lesbar war (Auftrag agentaktiv), sonst leer.
    */
   traeger: { eingerichtet: boolean; laeuft: boolean | null; moeglich: boolean; zug_fehler: string };
+  /**
+   * Auftrag agentsform: die Modelle, die der Traeger dieser Welt fahren kann (`wb-welt ansicht`, Feld `modelle`);
+   * null, solange die Ansicht das Feld nicht liefert -- dann gilt `modelle` der Nutzlast. Fable nie.
+   */
+  modelle: WeltModell[] | null;
+  /** Die Maschine eines neuen Agenten (`maschine_vorgabe` der Ansicht); leer, solange die Ansicht sie nicht nennt. */
+  maschine_vorgabe: string;
+  /** Die Skills der Welt und der Bibliothek zur Auswahl beim Anlegen (`agents_skills_ansicht.py`, `katalog`). */
+  skill_katalog: { welt: WeltSkillAuswahl[]; bibliothek: WeltSkillAuswahl[] };
+  /** Ob die Welt einen Zugang der Art `web` hat: nur dann gibt es WebFetch und WebSearch fuer ihre Agenten. */
+  web_zugang: boolean;
+  /** Ob die Datenbibliothek auf der Maschine der Welt `agent rechte` kennt; sonst zeigt das Profil die Rechte nur an. */
+  rechte_aenderbar: boolean;
 }
+/** Auftrag agentsform: ein Modell des Traegers einer Welt; `grund` sagt, warum es nicht verfuegbar ist. */
+export interface WeltModell { id: string; harness: string; verfuegbar: boolean; grund: string }
+export interface WeltSkillAuswahl { name: string; beschreibung: string }
 /** Eine Maschine fuer Anlegen, Umzug und Fusszeile. */
 export interface WeltMaschine {
   name: string; ssh: string; eigene: boolean; standard: boolean;
@@ -307,6 +336,10 @@ export interface WeltenNutzlast {
   maschinen: WeltMaschine[];
   /** Die Vorgabe beim Anlegen: die Standardmaschine (peer), sonst die eigene. */
   maschine_vorgabe: string;
+  /** Auftrag agentsform: die gemerkten Projektordner (`welten-projekte.json`), zum Entfernen im Menue der Welten. */
+  gemerkte_projekte: string[];
+  /** Die Bash-Muster des Dienstwegs je Stufe, wie die Bibliothek sie jedem Entwurf gibt; nicht abwaehlbar. */
+  bash_vorgabe: Record<string, string[]>;
 }
 export interface WeltVorlage { name: string; title: string; summary: string; draft: Record<string, unknown> }
 
@@ -473,6 +506,8 @@ export function ticketAus(t: RohTicket, alle: RohTicket[]): WeltTicket {
 type RohObjekt = Record<string, unknown>;
 export interface RohSkillAnsicht {
   agenten?: Record<string, RohObjekt>; vorschlaege?: Record<string, RohObjekt>; verlauf?: RohObjekt[];
+  /** Auftrag agentsform: die gueltigen Skills der Welt und der Bibliothek. */
+  katalog?: { welt?: RohObjekt[]; bibliothek?: RohObjekt[] };
 }
 const zahlVon = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
 const liste = (v: unknown): RohObjekt[] => (Array.isArray(v) ? v.filter((x): x is RohObjekt => !!x && typeof x === 'object') : []);
@@ -538,7 +573,22 @@ export function skillsEinsetzen(welt: Welt, roh: RohSkillAnsicht | null, fehler:
     skill_verlauf: liste(roh.verlauf).map((e) => ({
       zeit: s(e.time), ereignis: s(e.event), skill: s(e.skill), ziel: s(e.ziel), agent: s(e.agent), ticket: s(e.ticket),
     })),
+    skill_katalog: skillKatalogAus(roh.katalog),
   };
+}
+
+/** Auftrag agentsform: der Skillkatalog der Welt und der Bibliothek; ohne Angabe leer. */
+export function skillKatalogAus(roh: RohSkillAnsicht['katalog']): Welt['skill_katalog'] {
+  const ebene = (x: unknown): WeltSkillAuswahl[] => liste(x).filter((e) => s(e.name)).map((e) => ({ name: s(e.name), beschreibung: s(e.beschreibung) }));
+  return { welt: ebene(roh?.welt), bibliothek: ebene(roh?.bibliothek) };
+}
+
+/** Auftrag agentsform: die Modelle einer Welt aus `wb-welt ansicht`; null, wenn das Feld fehlt. Fable nie. */
+export function modelleAus(roh: unknown): WeltModell[] | null {
+  if (!Array.isArray(roh)) return null;
+  return roh.filter((m): m is RohObjekt => !!m && typeof m === 'object')
+    .map((m) => ({ id: s(m.id), harness: s(m.harness), verfuegbar: m.verfuegbar === true, grund: s(m.grund) }))
+    .filter((m) => m.id && !/fable/i.test(m.id));
 }
 
 export function frageAus(f: RohFrage): WeltFrage {
@@ -685,6 +735,10 @@ export function weltAus(roh: RohAnsicht, fund: RohFund, grenze = 500): Welt {
     mensch: { postfach_offen: rohMensch.postbox?.open ?? offen.size, markiert_offen: markiertOffen, gelesen },
     ungelesen,
     ...ORT_LOKAL(roh.path || fund.path),
+    modelle: modelleAus(roh.modelle), maschine_vorgabe: s(roh.maschine_vorgabe),
+    skill_katalog: { welt: [], bibliothek: [] },
+    web_zugang: (roh.zugaenge ?? []).some((x) => s(x.name) && x.art === 'web'),
+    rechte_aenderbar: false,
   };
 }
 
@@ -698,6 +752,7 @@ export function weltMitFehler(fund: RohFund, text: string): Welt {
     zugaenge: [],
     mensch: { postfach_offen: 0, markiert_offen: [], gelesen: {} }, ungelesen: {},
     ...ORT_LOKAL(fund.path),
+    modelle: null, maschine_vorgabe: '', skill_katalog: { welt: [], bibliothek: [] }, web_zugang: false, rechte_aenderbar: false,
   };
 }
 
@@ -849,10 +904,89 @@ export function absenderFuer(herkunft: 'oberflaeche' | 'steuerkanal', echt: bool
   return herkunft === 'oberflaeche' && echt ? 'mensch' : 'cli-operator';
 }
 
+/**
+ * Auftrag agentsform: wie `agent rechte` seine Listen nimmt, gelesen aus der Hilfe des Unterbefehls, je Schalter --
+ * `nargs` (`--bash A B`), `mehrfach` (`--bash=A --bash=B`, „wiederholbar") oder `komma` (`--werkzeuge=Read,Write`).
+ * `ohneBash`: es gibt `--ohne-bash` fuer „keine eigenen Muster"; `welt`: die Welt geht als erstes Argument oder
+ * als `--welt=`. null: die Bibliothek kennt den Unterbefehl nicht (noch nicht ausgerollt). Gemessen am Zweig
+ * wb/agentrechte (643d4b3): `--werkzeuge` und `--skills` mit Komma, `--bash` wiederholbar, `--ohne-bash`.
+ */
+export type Listenform = 'nargs' | 'mehrfach' | 'komma';
+export interface RechteForm { werkzeuge: Listenform; bash: Listenform; skills: Listenform; ohneBash: boolean; welt: 'argument' | 'schalter' }
+
+/** Der Hilfetext eines Schalters: seine Zeile und die eingerueckten Folgezeilen bis zum naechsten Schalter. */
+function schalterHilfe(hilfe: string, schalter: string): string {
+  const zeilen = hilfe.split('\n');
+  const i = zeilen.findIndex((z) => new RegExp(`^\\s+(?:-\\w, )?${schalter}(?:[\\s=,]|$)`).test(z));
+  if (i < 0) return '';
+  const raus = [zeilen[i]];
+  for (const z of zeilen.slice(i + 1)) {
+    if (/^\s*-/.test(z) || !z.trim()) break;
+    raus.push(z);
+  }
+  return raus.join(' ');
+}
+
+export function rechteFormAusHilfe(code: number | null, hilfe: string): RechteForm | null {
+  if (code !== 0 || !/--werkzeuge\b/.test(hilfe)) return null;
+  const form = (schalter: string): Listenform => {
+    const name = schalter.replace(/^--/, '').toUpperCase().replace(/-/g, '_');
+    if (new RegExp(`${schalter}\\s+(?:${name}\\s+)?\\[${name}\\s+\\.\\.\\.\\]`).test(hilfe)) return 'nargs';
+    return /mehrfach|wiederhol|repeat/i.test(schalterHilfe(hilfe, schalter)) ? 'mehrfach' : 'komma';
+  };
+  return { werkzeuge: form('--werkzeuge'), bash: form('--bash'), skills: form('--skills'), ohneBash: /--ohne-bash\b/.test(hilfe),
+    welt: /\s--welt\b/.test(hilfe) ? 'schalter' : 'argument' };
+}
+
+export interface RechteWunsch { werkzeuge?: string[]; bash?: string[]; skills?: string[] }
+
+/** Die Befehlszeile von `wb-agent rechte <welt> <agent> --werkzeuge … --bash … --skills …` in der gelesenen Form. */
+export function rechteArgs(ort: string, agent: string, r: RechteWunsch, form: RechteForm, absender: string): string[] {
+  const args = form.welt === 'schalter' ? ['agent', 'rechte', agent, `--welt=${ort}`] : ['agent', 'rechte', ort, agent];
+  const liste = (schalter: string, werte: string[] | undefined, wie: Listenform): void => {
+    if (!werte) return;
+    if (wie === 'nargs') args.push(schalter, ...werte);
+    else if (wie === 'mehrfach') args.push(...werte.map((w) => `${schalter}=${w}`));
+    else args.push(`${schalter}=${werte.join(',')}`);
+  };
+  liste('--werkzeuge', r.werkzeuge, form.werkzeuge);
+  if (r.bash && !r.bash.length && form.bash !== 'komma') args.push(form.ohneBash ? '--ohne-bash' : '--bash=');
+  else liste('--bash', r.bash, form.bash);
+  liste('--skills', r.skills, form.skills);
+  args.push(`--absender=${absender}`, '--json');
+  return args;
+}
+
+/** Was das Profil nach `agent rechte` anders traegt als gewuenscht; leer, wenn es passt. Bash und die Dienstwegmuster gibt die Bibliothek selbst dazu. */
+export function rechteAbweichung(r: RechteWunsch, a: Pick<WeltAgent, 'werkzeuge' | 'bash' | 'skills'>): string {
+  const gleich = (x: string[], y: string[]) => x.length === y.length && x.every((v) => y.includes(v));
+  const teile: string[] = [];
+  if (r.werkzeuge && !gleich(r.werkzeuge.filter((w) => w !== 'Bash'), a.werkzeuge.filter((w) => w !== 'Bash'))) teile.push(`Werkzeuge ${a.werkzeuge.join(', ') || 'keine'}`);
+  if (r.bash && !r.bash.every((m) => a.bash.includes(m))) teile.push(`Bash-Muster ohne ${r.bash.filter((m) => !a.bash.includes(m)).join(' · ')}`);
+  if (r.skills && !gleich(r.skills, a.skills)) teile.push(`Skills ${a.skills.join(', ') || 'keine'}`);
+  return teile.join('; ');
+}
+
+/** Wie ein Zugang der Art `web` entsteht -- der Satz, den beide Oberflaechen ohne einen zeigen. */
+export function webZugangSatz(ablage: string): string {
+  return `WebFetch und WebSearch gibt es erst, wenn die Welt einen Zugang der Art web hat. Einrichten: wb-welt zugang ${ablage} hinzufuegen --art web --name netz --bestaetigt`;
+}
+
+export const WEB_WERKZEUGE = ['WebFetch', 'WebSearch'];
+
+/** Die Modellliste fuer die Prompts: die verfuegbaren Modelle der Welt, sonst die Registry. */
+export function promptModelle(welt: WeltModell[] | null, registry: ModellZeile[]): ModellZeile[] {
+  if (!welt) return registry;
+  return welt.filter((m) => m.verfuegbar).map((m) => ({
+    kennung: m.id, harness: m.harness,
+    aufgabe: registry.find((r) => r.kennung === m.id || r.kennung.split(':')[0] === m.id.split(':')[0])?.aufgabe ?? '',
+  }));
+}
+
 /** Ein Befehl `welt:<handlung> <JSON-Objekt>`. */
 export const WELT_HANDLUNGEN = ['senden', 'antworten', 'zuruecknehmen', 'pausieren', 'fortsetzen', 'stoppen', 'ticket',
   'zurueckgeben', 'profil', 'gedaechtnis', 'gelesen', 'quittieren', 'vorschlag', 'gespraech', 'entwurf', 'anlegen',
-  'skill_abnehmen', 'skill_ablehnen', 'neu', 'umziehen', 'maschinen', 'gewaehlt'] as const;
+  'skill_abnehmen', 'skill_ablehnen', 'neu', 'umziehen', 'maschinen', 'gewaehlt', 'rechte', 'vergessen'] as const;
 export type WeltHandlung = (typeof WELT_HANDLUNGEN)[number];
 
 export function weltBefehlLesen(befehl: string): { handlung: WeltHandlung; daten: Record<string, unknown> } | { fehler: string } {
@@ -887,6 +1021,27 @@ function jsonAus<T>(l: Lauf): T | null {
 }
 
 interface Gemerkt { welt: Welt; gelesen: number; schmutzig: boolean }
+
+/**
+ * Auftrag agentsform: die Bash-Muster, die die Bibliothek jedem Entwurf je Stufe gibt -- gefragt bei
+ * `validate_agent_draft` selbst, damit die Oberflaeche zeigt, was der Dienstweg ohnehin bekommt, auch wenn
+ * sich die Vorgabe aendert. Argument: der Ordner der Datenbibliothek.
+ */
+const BASH_VORGABE_PROBE = [
+  'import json, sys',
+  'sys.path.insert(0, sys.argv[1])',
+  'import agents_data as a',
+  'raus = {}',
+  'for stufe in a.STAGES:',
+  '    entwurf = {"id": "probe", "stage": stufe, "specialty": "Probe.", "tools": ["Read"]}',
+  '    if stufe != "hauptagent":',
+  '        entwurf["team"] = "probe"',
+  '    try:',
+  '        raus[stufe] = list(a.validate_agent_draft(entwurf)["bash"])',
+  '    except Exception:',
+  '        pass',
+  'print(json.dumps(raus))',
+].join('\n');
 
 /** `agents_weltauftrag.py lesen`: Ansicht, Skills und Traeger einer Fernwelt in einem Aufruf. */
 interface RohLesen {
@@ -924,6 +1079,11 @@ export class WeltenQuelle {
   private umzug = new Set<string>();
   /** Auftrag agentaktiv: was das Wecken nach dem letzten Senden an einen Agenten ergab, je Welt und Agent. */
   private weckStand = new Map<string, Record<string, string>>();
+  /** Auftrag agentsform: je Maschine, ob und wie ihre Bibliothek `agent rechte` kennt, und wann das gefragt wurde. */
+  private rechteFormen = new Map<string, { form: RechteForm | null; zeit: number }>();
+  private rechteFrageLaeuft = new Set<string>();
+  /** Die Bash-Muster des Dienstwegs je Stufe aus der Bibliothek dieser Maschine. */
+  private bashVorgabe: Record<string, string[]> = {};
 
   private geweckt(pfad: string): Record<string, string> {
     return this.weckStand.get(pfad) ?? {};
@@ -970,7 +1130,8 @@ export class WeltenQuelle {
   private gemerkteProjekte: string[] | null = null;
 
   static leer(): WeltenNutzlast {
-    return { geladen: false, fehler: [], welten: [], datenbibliothek: '', vorlagen: [], modelle: [], entwurf_modelle: [...ENTWURF_MODELLE], global_pfad: '', maschinen: [], maschine_vorgabe: '' };
+    return { geladen: false, fehler: [], welten: [], datenbibliothek: '', vorlagen: [], modelle: [], entwurf_modelle: [...ENTWURF_MODELLE], global_pfad: '', maschinen: [], maschine_vorgabe: '',
+      gemerkte_projekte: [], bash_vorgabe: {} };
   }
 
   /** Die Ordner, in denen hier eine Welt angelegt wurde; eine kaputte oder fehlende Datei heisst: keine. */
@@ -990,16 +1151,50 @@ export class WeltenQuelle {
   private projektMerken(ordner: string): void {
     const liste = this.bekannteProjekte();
     if (liste.includes(ordner) || !this.opt.projekteDatei) return;
-    const neu = [...liste, ordner].sort();
+    this.projekteSchreiben([...liste, ordner].sort());
+  }
+
+  /** Die gemerkten Ordner schreiben; ein Fehler laesst die Liste im Speicher gelten, bis der Kern neu startet. */
+  private projekteSchreiben(neu: string[]): boolean {
     this.gemerkteProjekte = neu;
     try {
       mkdirSync(dirname(this.opt.projekteDatei), { recursive: true });
       const tmp = `${this.opt.projekteDatei}.tmp-${process.pid}`;
       writeFileSync(tmp, `${JSON.stringify(neu, null, 2)}\n`, { mode: 0o600 });
       renameSync(tmp, this.opt.projekteDatei);
+      return true;
     } catch {
       // Ohne Datei bleibt die Welt bis zum Neustart des Kerns in der Liste; gefunden wird sie danach nur unter einer Wurzel.
+      return false;
     }
+  }
+
+  /**
+   * `welt:vergessen {"ordner"}`: einen gemerkten Projektordner aus `welten-projekte.json` nehmen. Der Ordner und
+   * seine Welt bleiben unberuehrt; die Werkbank sucht dort nur nicht mehr von selbst. Ohne `bestaetigt` fragt sie zurueck.
+   */
+  private async vergessen(daten: Record<string, unknown>, bestaetigt: boolean,
+    antwort: (ok: boolean, meldung: string, mehr?: Partial<WeltenHandlungsErgebnis>) => WeltenHandlungsErgebnis): Promise<WeltenHandlungsErgebnis> {
+    const ordner = s(daten.ordner).trim();
+    const liste = this.bekannteProjekte();
+    if (!ordner || !liste.includes(ordner)) return antwort(false, `„${ordner}“ steht nicht in der Liste der gemerkten Projektordner.`);
+    const bleibt = this.opt.wurzeln.some((w) => dirname(ordner) === resolve(w)) || this.sitzungsProjekte.includes(ordner);
+    if (!bestaetigt) {
+      return antwort(false, 'Rückfrage', {
+        rueckfrage: `${basename(ordner)} aus der Liste der Welten entfernen?`,
+        warnungen: [
+          `Der Ordner ${ordner} und seine Welt bleiben, wie sie sind; die Werkbank sucht dort nur nicht mehr von selbst.`,
+          ...(bleibt ? ['Er liegt unter einer Wurzel oder hat eine laufende Sitzung; die Welt erscheint deshalb weiter im Menü.'] : []),
+        ],
+      });
+    }
+    if (!this.projekteSchreiben(liste.filter((p) => p !== ordner))) {
+      return antwort(false, `${this.opt.projekteDatei} ließ sich nicht schreiben; ${basename(ordner)} fehlt nur bis zum Neustart.`);
+    }
+    await this.finden(this.projekteZumFinden());
+    this.fundSchluessel = this.projekteZumFinden().join('\n');
+    this.geaendert();
+    return antwort(true, `${basename(ordner)} steht nicht mehr in der Liste; der Ordner bleibt, wie er ist.`);
   }
 
   private projekteZumFinden(): string[] {
@@ -1025,7 +1220,37 @@ export class WeltenQuelle {
     const t = await this.lauf(this.opt.entwurf.wbState, ['models', 'table'], this.opt.fristMs);
     if (t.code === 0) this.modelle = modelleAusTabelle(t.out);
     else fehler.push({ quelle: 'wb-state models table', text: kurz(t) });
+    // Auftrag agentsform: kennt die Bibliothek hier `agent rechte`, und welche Bash-Muster gibt sie jeder Stufe?
+    const [h, b] = await Promise.all([
+      this.daten(['agent', 'rechte', '--help']),
+      this.lauf(this.opt.python, ['-c', BASH_VORGABE_PROBE, dirname(this.opt.daten)], this.opt.fristMs),
+    ]);
+    this.rechteFormen.set(this.eigene, { form: rechteFormAusHilfe(h.code, `${h.out}\n${h.err}`), zeit: Date.now() });
+    const vorgabe = b.code === 0 ? jsonAus<Record<string, unknown>>(b) : null;
+    if (vorgabe) this.bashVorgabe = Object.fromEntries(Object.entries(vorgabe).filter(([, v]) => Array.isArray(v)).map(([k, v]) => [k, (v as unknown[]).map(String)]));
     this.katalogFehler = fehler;
+  }
+
+  /** Auftrag agentsform: ob die Bibliothek auf der Maschine einer Welt `agent rechte` kennt; unbekannt heisst nein. */
+  private rechteFormFuer(w: Pick<Welt, 'fern' | 'maschine'>): RechteForm | null {
+    return this.rechteFormen.get(w.fern ? w.maschine : this.eigene)?.form ?? null;
+  }
+
+  /** Die Hilfe von `agent rechte` auf einer Agent-Maschine fragen, so selten wie das Finden; laeuft neben dem Takt. */
+  private rechteFernFragen(m: MaschinenAngabe): void {
+    const alt = this.rechteFormen.get(m.name);
+    if (this.rechteFrageLaeuft.has(m.name) || (alt && Date.now() - alt.zeit < this.opt.findenMs)) return;
+    this.rechteFrageLaeuft.add(m.name);
+    void this.fern.auftrag<{ code?: number; out?: string; err?: string }>(m.name, m.ssh, { befehl: 'ausfuehren', skript: 'agents_data.py', argv: ['agent', 'rechte', '--help'] })
+      .then((r) => {
+        // Eine nicht erreichbare Maschine laesst den letzten Stand stehen und fragt beim naechsten Takt wieder.
+        if (!r.ok) return;
+        const vorher = alt?.form ?? null;
+        const form = rechteFormAusHilfe(typeof r.daten.code === 'number' ? r.daten.code : null, `${r.daten.out ?? ''}\n${r.daten.err ?? ''}`);
+        this.rechteFormen.set(m.name, { form, zeit: Date.now() });
+        if (JSON.stringify(form) !== JSON.stringify(vorher)) this.geaendert();
+      })
+      .finally(() => this.rechteFrageLaeuft.delete(m.name));
   }
 
   private daten(args: string[]): Promise<Lauf> {
@@ -1179,6 +1404,7 @@ export class WeltenQuelle {
   /** Der Takt der Fernwelten: Finden und Lesen laufen im Hintergrund; ist eins fertig, stoesst es den naechsten Takt an. */
   private fernTakt(): void {
     const jetzt = Date.now();
+    for (const m of this.fernMaschinen()) this.rechteFernFragen(m);
     for (const m of this.fernMaschinen()) {
       if (this.fernFindenLaeuft.has(m.name) || jetzt - (this.fernFindenZeit.get(m.name) ?? 0) < this.opt.findenMs) continue;
       this.fernFindenLaeuft.add(m.name);
@@ -1229,7 +1455,8 @@ export class WeltenQuelle {
     const fehler: WeltenNutzlast['fehler'] = [];
     if (!this.opt.daten || !existsSync(this.opt.daten)) {
       return { geladen: true, fehler: [{ quelle: 'agents_data.py', text: `Datenbibliothek nicht gefunden${this.opt.daten ? `: ${this.opt.daten}` : ''} (AWB_AGENTS_DATA)` }], welten: [], datenbibliothek: '',
-        vorlagen: [], modelle: [], entwurf_modelle: [...ENTWURF_MODELLE], global_pfad: this.opt.global, maschinen: this.maschinenNutzlast(), maschine_vorgabe: this.maschineVorgabe() };
+        vorlagen: [], modelle: [], entwurf_modelle: [...ENTWURF_MODELLE], global_pfad: this.opt.global, maschinen: this.maschinenNutzlast(), maschine_vorgabe: this.maschineVorgabe(),
+        gemerkte_projekte: this.bekannteProjekte(), bash_vorgabe: {} };
     }
     this.sitzungsProjekte = [...new Set(projekte.filter(Boolean))];
     const liste = this.projekteZumFinden();
@@ -1271,7 +1498,8 @@ export class WeltenQuelle {
     return {
       geladen: this.geladen,
       fehler,
-      welten: [...this.funde, ...this.alleFernFunde()].map((f) => this.gemerkt.get(fundSchluessel(f))?.welt).filter((w): w is Welt => !!w),
+      welten: [...this.funde, ...this.alleFernFunde()].map((f) => this.gemerkt.get(fundSchluessel(f))?.welt).filter((w): w is Welt => !!w)
+        .map((w) => ({ ...w, rechte_aenderbar: !!this.rechteFormFuer(w) })),
       datenbibliothek: this.opt.daten,
       vorlagen: this.vorlagen,
       modelle: this.modelle,
@@ -1279,6 +1507,8 @@ export class WeltenQuelle {
       global_pfad: this.opt.global,
       maschinen: this.maschinenNutzlast(),
       maschine_vorgabe: this.maschineVorgabe(),
+      gemerkte_projekte: this.bekannteProjekte(),
+      bash_vorgabe: this.bashVorgabe,
     };
   }
 
@@ -1328,7 +1558,8 @@ export class WeltenQuelle {
   }
 
   welt(pfad: string): Welt | null {
-    return this.gemerkt.get(pfad)?.welt ?? null;
+    const w = this.gemerkt.get(pfad)?.welt;
+    return w ? { ...w, rechte_aenderbar: !!this.rechteFormFuer(w) } : null;
   }
 
   /**
@@ -1534,6 +1765,7 @@ export class WeltenQuelle {
     if (!this.opt.daten || !existsSync(this.opt.daten)) return antwort(false, 'Die Datenbibliothek agents_data.py ist nicht gefunden.');
     // Die einzige Handlung ohne gefundene Welt: sie legt eine an.
     if (handlung === 'neu') return this.weltAnlegen(daten);
+    if (handlung === 'vergessen') return this.vergessen(daten, bestaetigt, antwort);
     if (handlung === 'maschinen') return this.maschinenPruefen(antwort);
     if (handlung === 'gewaehlt') {
       this.gewaehlt = pfad;
@@ -1656,6 +1888,26 @@ export class WeltenQuelle {
         return ausgefuehrt(args, modell ? `Profil von ${name} gesichert; das Modell gilt ab dem nächsten Start.` : `Profil von ${name} gesichert.`);
       }
 
+      case 'rechte': {
+        if (!agent) return antwort(false, 'Die Angabe agent fehlt.');
+        const name = welt.agenten.find((a) => a.id === agent)?.name ?? agent;
+        const form = this.rechteFormFuer(welt);
+        if (!form) {
+          return antwort(false, `Rechte ändern ist ${welt.fern ? `auf ${welt.maschine}` : 'hier'} noch nicht ausgerollt: die Datenbibliothek kennt „wb-agent rechte“ noch nicht. Die Rechte von ${name} stehen im Profil nur zum Lesen.`);
+        }
+        const listeAus = (k: string): string[] | undefined => (Array.isArray(daten[k]) ? [...new Set((daten[k] as unknown[]).map((x) => String(x).trim()).filter(Boolean))] : undefined);
+        const wunsch: RechteWunsch = { werkzeuge: listeAus('werkzeuge'), bash: listeAus('bash'), skills: listeAus('skills') };
+        if (!wunsch.werkzeuge && !wunsch.bash && !wunsch.skills) return antwort(false, 'Keine Rechteänderung angegeben.');
+        if (wunsch.werkzeuge?.some((w) => WEB_WERKZEUGE.includes(w)) && !welt.web_zugang) return antwort(false, webZugangSatz(ort));
+        const l = await this.datenFuer(welt, rechteArgs(ort, agent, wunsch, form, absender));
+        await this.nachHandlung(pfad);
+        if (l.code !== 0) return antwort(false, kurz(l));
+        const jetzt = this.welt(pfad)?.agenten.find((a) => a.id === agent);
+        const abweichung = jetzt ? rechteAbweichung(wunsch, jetzt) : '';
+        if (abweichung) return antwort(false, `Die Rechte von ${name} sind geschrieben, aber das Profil trägt sie anders: ${abweichung}.`);
+        return antwort(true, `Rechte von ${name} gesichert; sie gelten ab dem nächsten Zug.`);
+      }
+
       case 'gedaechtnis': {
         if (!agent) return antwort(false, 'Die Angabe agent fehlt.');
         if (typeof daten.text !== 'string') return antwort(false, 'Der Text des Gedächtnisses fehlt.');
@@ -1686,7 +1938,8 @@ export class WeltenQuelle {
         await this.katalog();
         const prompt = entwurfPrompt(beschreibung, {
           name: welt.name, hauptagent: welt.hauptagent, teams: welt.teams.map((t) => ({ name: t.name, leiter: t.leiter })), agenten: welt.agenten.map((a) => a.id),
-        }, vorgaben, this.modelle);
+          maschine: welt.maschine_vorgabe || welt.maschine,
+        }, vorgaben, promptModelle(welt.modelle, this.modelle));
         const trocken = daten.trocken === true;
         const r = await vorschlagLaufen(m, prompt, this.opt.entwurf, trocken);
         const hinweis = m.hinweis ? ` ${m.hinweis}` : '';
@@ -1726,7 +1979,8 @@ export class WeltenQuelle {
           const belegt = welt.agenten.map((a) => a.id);
           const prompt = gespraechPrompt(eingabe, {
             name: welt.name, hauptagent: welt.hauptagent, teams: welt.teams.map((t) => ({ name: t.name, leiter: t.leiter })), agenten: belegt,
-          }, basis, vorgaben, this.modelle, verlauf);
+            maschine: welt.maschine_vorgabe || welt.maschine,
+          }, basis, vorgaben, promptModelle(welt.modelle, this.modelle), verlauf);
           const r = await vorschlagLaufen(m, prompt, this.opt.entwurf, trocken, undefined, GESPRAECH_SYSTEM);
           const hinweis = m.hinweis ? ` ${m.hinweis}` : '';
           if (trocken) {

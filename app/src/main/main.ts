@@ -10,7 +10,7 @@ import {
 } from 'electron';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { readFileSync, statSync, mkdirSync, openSync, closeSync, existsSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { join, relative, dirname, basename } from 'node:path';
 import { loadConfig, Config } from './config';
 import { MantelKanal } from './mantel';
@@ -426,6 +426,10 @@ ipc.handle('awb:aufgaben-daten', () => aufgabenQuelle.aktuell());
 ipc.handle('awb:aufgabe', (_e, befehl: unknown, opt: unknown) => aufgabenQuelle.ausfuehren(String(befehl ?? ''), 'oberflaeche', opt));
 // Ob eine Oberflaeche die Ansicht zeigt: dann taktet der Kern schnell, sonst langsam (Befund M4).
 ipc.on('awb:aufgaben-sichtbar', (_e, an: unknown) => aufgabenQuelle.sichtbarSetzen(an === true));
+// Auftrag agentsform (16.09.2026): „Neue Welt in einem Projektordner" waehlt den Ordner im Dialog des
+// Systems statt als Texteingabe (die bleibt als zweiter Weg). Dieselben Auflagen wie beim Ordner einer
+// Sitzung: nur auf einen echten Klick, und eine Suite bekommt mit AWB_ORDNER_DIALOG den Pfad ohne Dialog.
+ipc.handle('awb:welt-ordner', (_e, echt: unknown) => weltOrdnerDialog(echt === true));
 
 function leseStatusdatei(pfad: string): string {
   try {
@@ -5524,6 +5528,21 @@ ipc.handle('awb:sitzung-umbenennen', (_e, id: string, name: string) =>
  *    Damit prueft eine Suite, was mit dem gewaehlten Pfad GESCHIEHT
  *    (Ausschlussliste, Aufruf, Meldung) -- und nie den Finder.
  */
+/** Der Projektordner einer neuen Welt (Tab Agents); wie `ordnerDialog`, nur mit eigenem Text und ohne Mantel-Weg. */
+async function weltOrdnerDialog(echt: boolean): Promise<{ pfad: string; grund: string }> {
+  if (config.ordnerDialogAttrappe) return { pfad: config.ordnerDialogAttrappe, grund: '' };
+  if (!echt) return { pfad: '', grund: 'Ohne echten Klick wird kein Ordner-Dialog geöffnet.' };
+  const optionen: Electron.OpenDialogOptions = {
+    title: 'Projektordner für die neue Welt', buttonLabel: 'Welt hier anlegen',
+    message: 'Die Welt liegt danach dort unter .werkbank/agents.', properties: ['openDirectory', 'createDirectory'],
+  };
+  // Mit umgelenktem HOME (Abnahme) beginnt der Dialog dort, wie am Mac.
+  if (process.env.HOME && process.env.HOME !== userInfo().homedir) optionen.defaultPath = process.env.HOME;
+  const antwort = win ? await dialog.showOpenDialog(win, optionen) : await dialog.showOpenDialog(optionen);
+  const pfad = antwort.canceled ? '' : (antwort.filePaths[0] ?? '');
+  return { pfad, grund: pfad ? '' : 'Abgebrochen -- es wurde keine Welt angelegt.' };
+}
+
 async function ordnerDialog(echt: boolean, vorgewaehlt = ''): Promise<{ pfad: string; grund: string }> {
   if (config.ordnerDialogAttrappe) {
     return { pfad: config.ordnerDialogAttrappe, grund: '' };

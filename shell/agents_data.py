@@ -1514,10 +1514,17 @@ DEFAULT_TOOLS = {"hauptagent": ("Bash", "Read", "Grep", "Glob", "Write", "Edit")
 # The Bash patterns a turn needs in any case: the controller RPC client in the turn
 # directory, stored scripts (`agents/bibliothek/skripte`), skill scripts and reading git.
 # An interpreter pattern without a narrower argument (`python3 *`) grants nothing.
+# Since 2026-09-16 every agent works in its own worktree on branch `agent/<id>` (plan
+# section 8 item 9): add, commit, rebase and restoring files there.  `git merge agent/*`
+# is in the list for every stage because the list is not per stage; the profile lock
+# lets only team leads (branches of their own team's members) and the main agent merge.
+# No `git push`: it is on the house list, which every draft is checked against.
 DEFAULT_BASH = ("python3 */rpc/agents_rpc_client.py *",
                 "python3 */skripte/*/*.py *", "sh */skripte/*/*.sh *", "*/skripte/*/*.py *",
                 "python3 */skills/*/scripts/*.py *", "*/skills/*/scripts/*.py *",
-                "git status", "git diff *", "git log *", "git show *")
+                "git status", "git diff *", "git log *", "git show *",
+                "git add *", "git commit *", "git rebase *", "git checkout -- *",
+                "git merge agent/*", "git merge --abort")
 _HOUSE_RULES: Any = None
 
 
@@ -1550,11 +1557,28 @@ def _text_list(value: Any, label: str) -> list[str]:
     return list(dict.fromkeys(item.strip() for item in value))
 
 
-def validate_agent_draft(draft: dict[str, Any], for_agent: bool = False) -> dict[str, Any]:
+def _name_list(value: Any, label: str) -> list[str]:
+    """Tools or skills as a list; a model's draft may also write one text ("Read, Grep")."""
+    if isinstance(value, str):
+        value = [item for item in re.split(r"[,\s]+", value) if item]
+        if not value:
+            raise AgentsError("%s muss eine Liste nichtleerer Texte sein" % label)
+    return _text_list(value, label)
+
+
+def _tool_names(value: Any) -> list[str]:
+    """Tool names in the spelling of AGENT_TOOLS (`read` -> `Read`); unknown names stay for the error."""
+    spelling = {tool.lower(): tool for tool in AGENT_TOOLS}
+    return list(dict.fromkeys(spelling.get(item.lower(), item) for item in _name_list(value, "Werkzeuge")))
+
+
+def validate_agent_draft(draft: dict[str, Any], for_agent: bool = False,
+                         machine_default: str = "lokal") -> dict[str, Any]:
     """Check a creation draft without touching a world; return it normalized.
 
     `for_agent` applies the stricter rules for drafts an agent writes: no stage
-    above team leader.
+    above team leader.  `machine_default` is the machine of a draft without one
+    (the carrier host of the world, see `world_machine_default`).
     """
     if not isinstance(draft, dict):
         raise AgentsError("Entwurf muss ein Objekt sein")
@@ -1589,19 +1613,19 @@ def validate_agent_draft(draft: dict[str, Any], for_agent: bool = False) -> dict
         raise AgentsError("Spezialgebiet ist laenger als %d Zeichen; ein Satz genuegt" % SPECIALTY_LIMIT)
     model_profile = _model(draft.get("model") or None, draft.get("effort") or None,
                            draft.get("fallback_model") or None, draft.get("fallback_effort") or None)
-    machine = draft.get("machine") or "lokal"
+    machine = draft.get("machine") or machine_default
     if not isinstance(machine, str):
         raise AgentsError("Maschine muss ein Text sein")
     valid_id(machine, "Maschine")
-    tools = _text_list(draft.get("tools"), "Werkzeuge")
+    # A draft without tools gets those of its stage, exactly like `create_agent` (the example draft in the
+    # main agent's instructions names none); an explicitly empty list stays an error.
+    tools = _tool_names(draft["tools"]) if draft.get("tools") is not None else list(DEFAULT_TOOLS[stage])
     if not tools:
         raise AgentsError("Ein Agent braucht mindestens ein Werkzeug")
     foreign = [tool for tool in tools if tool not in AGENT_TOOLS]
     if foreign:
         raise AgentsError("Werkzeug nicht erlaubt: %s (erlaubt: %s)" % (", ".join(foreign), ", ".join(AGENT_TOOLS)))
     bash = _text_list(draft.get("bash"), "Bash-Muster")
-    if bash and "Bash" not in tools:
-        raise AgentsError("Bash-Muster brauchen das Werkzeug Bash")
     # The service path is not optional: a Claude turn answers, hands over and writes its
     # result only through the RPC client, and the profile lock reads tools and patterns
     # from agent.json.  A draft without Bash therefore gets Bash plus the default
@@ -1619,7 +1643,7 @@ def validate_agent_draft(draft: dict[str, Any], for_agent: bool = False) -> dict
         reason = module.gesperrt_verstoss(entry, blocked)
         if reason:
             raise AgentsError("Eintrag '%s' ist gesperrt: %s" % (entry, reason))
-    skills = _text_list(draft.get("skills"), "Skills")
+    skills = _name_list(draft.get("skills"), "Skills")
     for skill in skills:
         if not re.match(r"^[a-z0-9][a-z0-9:._-]{0,79}$", skill):
             raise AgentsError("Skillname ungueltig: %s" % skill)
@@ -1749,9 +1773,35 @@ def render_agent_instructions(root: Path, draft: dict[str, Any]) -> str:
     return _with_profile_limits("\n".join(line.rstrip() for line in lines), draft, zugaenge)
 
 
+CARRIER_CONFIG = "traeger.json"
+
+
+def world_carrier_config(root: Path) -> dict[str, Any] | None:
+    """The world's carrier configuration (`traeger.json`) as plain JSON, or None without one.
+
+    Read without importing the carrier: the view and the RPC copy of this module need only
+    `execution_host`, `modelle`, `pi`, `codex` and `registry`."""
+    path = Path(root) / CARRIER_CONFIG
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def world_machine_default(root: Path) -> str:
+    """Machine of a new agent without one: the carrier host of the world (`execution_host`), else `lokal`.
+
+    der Nutzer, 16.09.2026: agents of the world myproject run on peer; the world's carrier decides that."""
+    host = (world_carrier_config(root) or {}).get("execution_host")
+    return host if isinstance(host, str) and ID_RE.match(host) else "lokal"
+
+
 def preview_agent_draft(root: Path, draft: dict[str, Any]) -> dict[str, Any]:
     """Normalized draft plus the instruction file it would get; writes nothing."""
-    normalized = validate_agent_draft(draft)
+    normalized = validate_agent_draft(draft, machine_default=world_machine_default(world_path(str(root))))
     own = normalized["instructions"]
     instructions = _with_profile_limits(own, normalized) if own else render_agent_instructions(root, normalized)
     return {"draft": normalized, "instructions": instructions,
@@ -1767,7 +1817,8 @@ def create_agent_from_draft(root: Path, draft: dict[str, Any], sender: str | Non
     """
     root = world_path(str(root))
     actor = _actor(root, sender, claimed_role)
-    normalized = validate_agent_draft(draft, for_agent=actor.get("kind") == "agent")
+    normalized = validate_agent_draft(draft, for_agent=actor.get("kind") == "agent",
+                                      machine_default=world_machine_default(root))
     if request_id is not None:
         valid_id(request_id, "Antragskennung")
         try:
@@ -1898,6 +1949,140 @@ def decide_agent_request(root: Path, request_id: str, accept: bool, note: str | 
         send_message(root, actor["id"], [question["sender"]], reply,
                      None, derived_id("antrag-entschieden", request_id), "hauptagent", direct=True)
     return question
+
+
+RIGHTS_FIELDS = ("tools", "bash", "skills", "web")
+# Programs that reach another machine only through an ssh access of the world (agents_zugaenge), and
+# programs that reach the network only through an access of kind `web`.
+SSH_PROGRAMS = ("ssh", "scp", "rsync")
+WEB_PROGRAMS = ("curl", "wget")
+
+
+def _check_rights_against_accesses(root: Path, tools: list[str], extra_bash: list[str]) -> None:
+    """No right beyond the world's accesses: web tools need an access of kind web, ssh patterns an ssh access."""
+    accesses = _snapshot_zugaenge(root)
+    kinds = {item["art"] for item in accesses}
+    web = [tool for tool in tools if tool in WEB_TOOLS]
+    if web and "web" not in kinds:
+        raise AgentsError("%s braucht einen Zugang der Art web in der Welt; die Welt hat keinen "
+                          "(wb-welt zugang … --art web richtet der Mensch ein)" % " und ".join(web))
+    ssh_names = [item["name"] for item in accesses if item["art"] == "ssh"]
+    for pattern in extra_bash:
+        program = pattern.split(" ", 1)[0]
+        if program in WEB_PROGRAMS and "web" not in kinds:
+            raise AgentsError("Muster '%s' braucht einen Zugang der Art web in der Welt" % pattern)
+        if program not in SSH_PROGRAMS:
+            continue
+        if not ssh_names:
+            raise AgentsError("Muster '%s' braucht einen ssh-Zugang der Welt; die Welt hat keinen" % pattern)
+        import agents_zugaenge
+        for name in ssh_names:
+            try:
+                agents_zugaenge.muster_pruefen(name, [pattern])
+                break
+            except agents_zugaenge.ZugangFehler:
+                continue
+        else:
+            raise AgentsError("Muster '%s' nennt keinen eingerichteten ssh-Zugang der Welt (%s)" % (
+                pattern, ", ".join(ssh_names)))
+
+
+def set_agent_rights(root: Path, agent_id: str, changes: dict[str, Any], sender: str | None = None,
+                     claimed_role: str | None = None) -> dict[str, Any]:
+    """Set tools, Bash patterns, skills or web access of an agent (der Nutzer, 16.09.2026).
+
+    Allowed for the human and for the world's main agent on every other agent of the world; team
+    leaders and members ask the main agent.  `tools` replaces the tool list (Bash always stays),
+    `bash` replaces the own patterns on top of `DEFAULT_BASH`, `skills` replaces the skill list,
+    `web` true or false adds or removes WebFetch and WebSearch.  Nothing goes beyond the world's
+    accesses.  A running turn keeps its rights; the next turn reads agent.json anew.
+    """
+    root = world_path(str(root))
+    if not isinstance(changes, dict) or not changes:
+        raise AgentsError("Keine Rechteaenderung angegeben")
+    unknown = sorted(set(changes) - set(RIGHTS_FIELDS))
+    if unknown:
+        raise AgentsError("Rechtefeld unbekannt: %s (erlaubt: %s)" % (", ".join(unknown), ", ".join(RIGHTS_FIELDS)))
+    if "web" in changes and not isinstance(changes["web"], bool):
+        raise AgentsError("web muss true oder false sein")
+    with transaction(root):
+        actor = _actor(root, sender or WORLD_HUMAN, claimed_role)
+        if actor.get("kind") == "agent":
+            if actor.get("role") != "hauptagent":
+                raise AgentsError("Rechte vergibt der Hauptagent; %s beantragt sie bei ihm" % _STAGE_WORDS.get(
+                    actor.get("role"), actor.get("role")))
+            if actor["id"] == agent_id:
+                raise AgentsError("Der Hauptagent aendert seine eigenen Rechte nicht; das tut der Mensch")
+        agent = read_agent(root, agent_id)
+        old_tools = list(agent.get("tools") or [])
+        old_bash = list(agent.get("bash") or [])
+        old_skills = list(agent.get("skills") or [])
+        tools = _tool_names(changes["tools"]) if "tools" in changes else list(old_tools)
+        if changes.get("web") is True:
+            tools += [tool for tool in WEB_TOOLS if tool not in tools]
+        elif changes.get("web") is False:
+            tools = [tool for tool in tools if tool not in WEB_TOOLS]
+        foreign = [tool for tool in tools if tool not in AGENT_TOOLS]
+        if foreign:
+            raise AgentsError("Werkzeug nicht erlaubt: %s (erlaubt: %s)" % (", ".join(foreign), ", ".join(AGENT_TOOLS)))
+        if "Bash" not in tools:
+            tools.append("Bash")  # the service path (see validate_agent_draft)
+        defaults = list(DEFAULT_BASH)
+        if "bash" in changes:
+            extra = [pattern for pattern in (" ".join(item.split()) for item in _text_list(changes["bash"], "Bash-Muster"))
+                     if pattern not in defaults]
+        else:
+            extra = [pattern for pattern in old_bash if pattern not in defaults]
+        bash = list(dict.fromkeys(extra + defaults))
+        module, blocked = _house_rules()
+        for entry in tools + bash:
+            if module.nicht_lateinischer_name(entry):
+                raise AgentsError("Eintrag '%s' beginnt mit einem nicht lateinischen Zeichen" % entry)
+            reason = module.gesperrt_verstoss(entry, blocked)
+            if reason:
+                raise AgentsError("Eintrag '%s' ist gesperrt: %s" % (entry, reason))
+        skills = _name_list(changes["skills"], "Skills") if "skills" in changes else list(old_skills)
+        for skill in skills:
+            if not re.match(r"^[a-z0-9][a-z0-9:._-]{0,79}$", skill):
+                raise AgentsError("Skillname ungueltig: %s" % skill)
+        # Only what the change adds must fit the accesses: an older profile is not rejected for rights it has.
+        added_tools = [tool for tool in tools if tool not in old_tools]
+        added_bash = [pattern for pattern in extra if pattern not in old_bash]
+        _check_rights_against_accesses(root, added_tools, added_bash)
+        diff: dict[str, list[Any]] = {}
+        for key, old, new in (("tools", old_tools, tools), ("bash", old_bash, bash), ("skills", old_skills, skills)):
+            if old != new:
+                diff[key] = [old, new]
+        if not diff:
+            return agent
+        ts = now()
+        agent.update({"tools": tools, "bash": bash, "skills": skills, "rights_updated_at": ts,
+                      "rights_revision": int(agent.get("rights_revision") or 0) + 1})
+        path = _agent_dir(root, agent_id)
+        _write_json(path / "agent.json", agent)
+        # The instruction file ends with the limits of the profile; rewrite that block so both agree.
+        instructions = path / "AGENTS.md"
+        if instructions.is_file() and not instructions.is_symlink():
+            limits = {"tools": tools, "bash": bash, "skills": skills, "context_limit": agent.get("context_limit") or ""}
+            try:
+                accesses = world_access_names(root)
+            except AgentsError:
+                accesses = []
+            _write_text(instructions, _with_profile_limits(instructions.read_text(encoding="utf-8"), limits, accesses))
+        _append_history(root, agent_id, {
+            "id": new_id("h"), "time": ts, "event": "rechte", "actor": actor, "changes": diff,
+            "note": "Rechte gelten ab dem nächsten Zug; ein laufender Zug behält seine",
+        })
+        return agent
+
+
+def rights_summary(agent: dict[str, Any]) -> str:
+    """One sentence on an agent's rights for the human: tools, own Bash patterns beyond the service path, skills."""
+    tools = ", ".join(agent.get("tools") or []) or "keine"
+    extra = [pattern for pattern in agent.get("bash") or [] if pattern not in DEFAULT_BASH]
+    skills = ", ".join(agent.get("skills") or []) or "keine"
+    return "Rechte: Werkzeuge %s; Bash über den Dienstweg hinaus %s; Skills %s." % (
+        tools, ", ".join("`%s`" % item for item in extra) if extra else "keine", skills)
 
 
 def list_agent_templates(folder: Path | None = None) -> list[dict[str, Any]]:
@@ -2149,10 +2334,22 @@ def world_snapshot(root: Path, limit: int = SNAPSHOT_LIMIT, text_limit: int = SN
         questions = section("questions", lambda: _snapshot_questions(root), [])
         humans = section("humans", lambda: _snapshot_humans(root, limit), {})
         zugaenge = section("zugaenge", lambda: _snapshot_zugaenge(root), [])
-    return {"schema_version": SCHEMA_VERSION, "path": str(root), "consistent": consistent,
-            "read_at": now(), "world": world, "agents": agents, "tickets": tickets,
-            "channel": channel[-limit:], "channel_total": len(channel),
-            "direct_chats": chats, "questions": questions, "humans": humans, "zugaenge": zugaenge, "errors": errors}
+    result = {"schema_version": SCHEMA_VERSION, "path": str(root), "consistent": consistent,
+              "read_at": now(), "world": world, "agents": agents, "tickets": tickets,
+              "channel": channel[-limit:], "channel_total": len(channel),
+              "direct_chats": chats, "questions": questions, "humans": humans, "zugaenge": zugaenge,
+              "maschine_vorgabe": world_machine_default(root), "errors": errors}
+    # The models this world's carrier can run (agents_modellwahl); without traeger.json the field is absent
+    # and the interface keeps its fixed list.
+    try:
+        import agents_modellwahl
+    except ImportError:  # the RPC copy in a turn carries no model list
+        agents_modellwahl = None
+    if agents_modellwahl is not None:
+        models = section("modelle", lambda: agents_modellwahl.welt_modelle(root), None)
+        if models is not None:
+            result["modelle"] = models
+    return result
 
 
 def find_worlds(roots: Iterable[str] = (), projects: Iterable[str] = (),
@@ -2318,12 +2515,13 @@ def parser_for(kind: str) -> argparse.ArgumentParser:
             agents_zugaenge.parser_ergaenzen(sub)
         return parser
     if kind == "agent":
-        p = sub.add_parser("neu"); p.add_argument("world"); p.add_argument("--name", required=True); p.add_argument("--stufe", required=True, choices=STAGES); p.add_argument("--team"); p.add_argument("--beschreibung", required=True); p.add_argument("--figur"); p.add_argument("--werkzeug", action="append", default=[]); p.add_argument("--skill", action="append", default=[]); p.add_argument("--modell"); p.add_argument("--denkweise"); p.add_argument("--fallback"); p.add_argument("--fallback-denkweise"); p.add_argument("--maschine", default="lokal"); p.add_argument("--absender", default="cli-operator"); p.add_argument("--rolle"); p.add_argument("--json", action="store_true")
+        p = sub.add_parser("neu"); p.add_argument("world"); p.add_argument("--name", required=True); p.add_argument("--stufe", required=True, choices=STAGES); p.add_argument("--team"); p.add_argument("--beschreibung", required=True); p.add_argument("--figur"); p.add_argument("--werkzeug", action="append", default=[]); p.add_argument("--skill", action="append", default=[]); p.add_argument("--modell"); p.add_argument("--denkweise"); p.add_argument("--fallback"); p.add_argument("--fallback-denkweise"); p.add_argument("--maschine"); p.add_argument("--absender", default="cli-operator"); p.add_argument("--rolle"); p.add_argument("--json", action="store_true")
         for name, state in (("liste", None), ("zeigen", None), ("pause", "pausiert"), ("start", "aktiv"), ("stop", "gestoppt")):
             p = sub.add_parser(name); p.add_argument("world");
             if name != "liste": p.add_argument("agent")
             p.add_argument("--grund"); p.add_argument("--absender", default="cli-operator"); p.add_argument("--rolle"); p.add_argument("--json", action="store_true")
         p = sub.add_parser("profil"); p.add_argument("world"); p.add_argument("agent"); p.add_argument("--modell"); p.add_argument("--denkweise"); p.add_argument("--fallback"); p.add_argument("--fallback-denkweise"); p.add_argument("--maschine"); p.add_argument("--beschreibung"); p.add_argument("--absender", default=WORLD_HUMAN); p.add_argument("--rolle"); p.add_argument("--json", action="store_true")
+        p = sub.add_parser("rechte"); p.add_argument("world"); p.add_argument("agent"); p.add_argument("--werkzeuge", help="Liste mit Komma, z. B. Read,Grep,Write"); g = p.add_mutually_exclusive_group(); g.add_argument("--bash", action="append", help="eigenes Muster zusaetzlich zum Dienstweg, wiederholbar"); g.add_argument("--ohne-bash", action="store_true", help="nur die Dienstwegmuster"); p.add_argument("--skills", help="Liste mit Komma; leer entfernt alle"); g = p.add_mutually_exclusive_group(); g.add_argument("--web", dest="web", action="store_const", const=True); g.add_argument("--ohne-web", dest="web", action="store_const", const=False); p.add_argument("--absender", default=WORLD_HUMAN); p.add_argument("--rolle"); p.add_argument("--json", action="store_true")
         p = sub.add_parser("gedaechtnis"); p.add_argument("world"); p.add_argument("agent"); g = p.add_mutually_exclusive_group(required=True); g.add_argument("--text"); g.add_argument("--datei"); p.add_argument("--erwartet"); p.add_argument("--absender", default=WORLD_HUMAN); p.add_argument("--rolle"); p.add_argument("--json", action="store_true")
         p = sub.add_parser("vorlagen"); p.add_argument("--ordner"); p.add_argument("--json", action="store_true")
         for name in ("entwurf", "anlegen", "antrag"):
@@ -2390,7 +2588,7 @@ def run(kind: str, argv: list[str]) -> int:
                     for entry in data: print("%s (%s) -> %s" % (entry["name"], entry["art"], entry["ziel"]))
             else: _json_or_text(args, set_world_state(Path(args.world), {"pause": "pausiert", "start": "läuft", "stop": "gestoppt"}[args.command], args.grund, args.absender, args.rolle))
         elif kind == "agent":
-            if args.command == "neu": data = create_agent(Path(args.world), args.name, args.stufe, args.team, args.beschreibung, args.figur, args.werkzeug, args.modell, args.denkweise, args.fallback, args.fallback_denkweise, args.maschine, args.absender, args.rolle, args.skill); _json_or_text(args, data, data["id"])
+            if args.command == "neu": data = create_agent(Path(args.world), args.name, args.stufe, args.team, args.beschreibung, args.figur, args.werkzeug, args.modell, args.denkweise, args.fallback, args.fallback_denkweise, args.maschine or world_machine_default(world_path(args.world)), args.absender, args.rolle, args.skill); _json_or_text(args, data, data["id"])
             elif args.command == "liste": _json_or_text(args, list_agents(Path(args.world)))
             elif args.command == "zeigen": _json_or_text(args, read_agent(Path(args.world), args.agent))
             elif args.command == "profil":
@@ -2399,6 +2597,16 @@ def run(kind: str, argv: list[str]) -> int:
                            ("machine", args.maschine), ("specialty", args.beschreibung)) if value is not None}
                 data = update_agent_profile(Path(args.world), args.agent, changes, args.absender, args.rolle)
                 _json_or_text(args, data, data["id"])
+            elif args.command == "rechte":
+                changes: dict[str, Any] = {}
+                if args.werkzeuge is not None: changes["tools"] = args.werkzeuge
+                if args.bash is not None: changes["bash"] = args.bash
+                if args.ohne_bash: changes["bash"] = []
+                if args.skills is not None: changes["skills"] = args.skills if args.skills.strip() else []
+                if args.web is not None: changes["web"] = args.web
+                data = set_agent_rights(Path(args.world), args.agent, changes, args.absender, args.rolle)
+                if args.json: _json_or_text(args, data)
+                else: print("%s: %s" % (data["id"], rights_summary(data)))
             elif args.command == "gedaechtnis":
                 text = args.text if args.text is not None else Path(args.datei).read_text(encoding="utf-8")
                 _json_or_text(args, write_memory(Path(args.world), args.agent, text, args.erwartet, args.absender, args.rolle), args.agent)

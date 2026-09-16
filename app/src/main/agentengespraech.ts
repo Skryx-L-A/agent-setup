@@ -36,7 +36,9 @@ export interface GespraechZug {
 /** Wie viele Zuege in den Prompt gehen, wie viele der Speicher haelt, wie lang eine Nachricht sein darf. */
 export const GESPRAECH_GRENZEN = { imPrompt: 40, imSpeicher: 200, zeichen: 6000, fragen: 2 };
 
-export const GESPRAECH_SYSTEM = 'Du entwirfst mit einem Menschen im Gespräch einen neuen Agenten. Jede Antwort besteht aus kurzer deutscher Prosa an den Menschen und danach genau einem ```json-Block mit dem Stand des Entwurfs; nach dem Block steht nichts.';
+// Auftrag agentsform (16.09.2026): die Prosa spiegelt die Sprache des Menschen, gemessen an seiner letzten
+// Nachricht; ist sie nicht erkennbar, Deutsch. Die Felder des Entwurfs bleiben Daten der Werkbank und damit deutsch.
+export const GESPRAECH_SYSTEM = 'Du entwirfst mit einem Menschen im Gespräch einen neuen Agenten. Jede Antwort besteht aus kurzer Prosa an den Menschen in der Sprache seiner letzten Nachricht (ist sie nicht erkennbar, Deutsch) und danach genau einem ```json-Block mit dem Stand des Entwurfs; nach dem Block steht nichts.';
 
 /** Nur die Felder der Positivliste aus einem beliebigen Wert (Entwurf oder Vorgaben der Oberflaeche). */
 export function entwurfsFelder(roh: unknown): Record<string, unknown> {
@@ -59,6 +61,7 @@ export function gespraechPrompt(text: string, welt: EntwurfWelt, entwurf: Record
     `Welt: „${welt.name}“. Hauptagent: ${welt.hauptagent ?? 'noch keiner'}. Teams: ${teams}. Belegte Kennungen: ${welt.agenten.join(', ') || 'keine'}.`,
     '',
     'So führst du das Gespräch:',
+    '- Schreib die Prosa in der Sprache der neuen Nachricht des Menschen unten; ist sie nicht erkennbar, auf Deutsch. Die Werte im JSON-Block folgen weiter den Feldregeln.',
     '- Kläre der Reihe nach, was noch fehlt: Zweck, Persönlichkeit (Ton und Arbeitsstil; abgebildet in "specialty" und im Abschnitt "## Arbeitsweise" von "instructions"), Aufgaben, Grenzen ("context_limit", "bash"), Werkzeuge ("tools") und Modellwahl ("model", "fallback_model").',
     `- Höchstens ${GESPRAECH_GRENZEN.fragen} Fragen je Antwort. Knapp und sachlich, ohne Einleitung, ohne Lob, ohne Wiederholung dessen, was im Entwurf schon steht.`,
     '- Schlage konkrete Werte vor, statt nur zu fragen, und trage sie gleich in den Entwurf ein; der Mensch korrigiert, was nicht passt.',
@@ -74,7 +77,7 @@ export function gespraechPrompt(text: string, welt: EntwurfWelt, entwurf: Record
     '```',
     '',
     'Felder in "entwurf" (keine anderen):',
-    ...feldRegeln('das Gespräch'),
+    ...feldRegeln('das Gespräch', welt.maschine),
     '',
     FIGUR_ANLEITUNG,
     '',

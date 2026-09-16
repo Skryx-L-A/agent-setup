@@ -65,6 +65,10 @@ _FIELD_TYPES: dict[str, dict[str, tuple[str, bool]]] = {
     "agent.create": {"draft": ("object", True)},
     "agent.request": {"draft": ("object", True), "request_id": ("str", True)},
     "agent.decide": {"request_id": ("str", True), "accept": ("bool", True), "note": ("str", False)},
+    "agent.rechte": {
+        "agent_id": ("str", True), "tools": ("str_list", False), "bash": ("str_list", False),
+        "skills": ("str_list", False), "web": ("bool", False),
+    },
     "question.ask": {
         "text": ("str", True), "question_id": ("str", True),
         "options": ("str_list", False), "recommendation": ("str", False),
@@ -81,10 +85,20 @@ def _report_created_agent(root: Path, binding: AgentBinding, agent: dict[str, An
     profile = agent.get("model_profile") or {}
     stage = {"mitglied": "Mitglied", "teamleiter": "Teamleiter", "hauptagent": "Hauptagent"}.get(agent.get("stage"),
                                                                                              agent.get("stage"))
-    text = "Agent %s angelegt, Rolle %s%s, Modell %s (Denkstufe %s)." % (
+    text = "Agent %s angelegt, Rolle %s%s, Modell %s (Denkstufe %s), Maschine %s. %s" % (
         agent["id"], stage, " im Team %s" % agent["team"] if agent.get("team") else "", profile.get("model"),
-        profile.get("effort"))
+        profile.get("effort"), agent.get("machine"), ad.rights_summary(agent))
     message_id = ad.derived_id("agent-angelegt", agent["id"])
+    ad.send_marked_message(root, binding.agent_id, [ad.WORLD_HUMAN], text, "ergebnis", None, message_id, binding.role)
+    return message_id
+
+
+def _report_rights(root: Path, binding: AgentBinding, before: dict[str, Any], agent: dict[str, Any]) -> str | None:
+    """A main agent that changes an agent's rights tells the world's human, like a creation."""
+    if binding.role != "hauptagent" or all(before.get(key) == agent.get(key) for key in ("tools", "bash", "skills")):
+        return None
+    text = "Rechte von %s geändert durch %s. %s" % (agent["id"], binding.agent_id, ad.rights_summary(agent))
+    message_id = ad.derived_id("agent-rechte", agent["id"], agent.get("rights_revision") or 0)
     ad.send_marked_message(root, binding.agent_id, [ad.WORLD_HUMAN], text, "ergebnis", None, message_id, binding.role)
     return message_id
 
@@ -379,6 +393,11 @@ class AgentController:
             if created:
                 question = dict(question, meldung=_report_created_agent(root, binding, ad.read_agent(root, created)))
             return question
+        if operation == "agent.rechte":
+            before = ad.read_agent(root, payload["agent_id"])
+            changes = {key: payload[key] for key in ad.RIGHTS_FIELDS if key in payload}
+            agent = ad.set_agent_rights(root, payload["agent_id"], changes, binding.agent_id, binding.role)
+            return dict(agent, meldung=_report_rights(root, binding, before, agent))
         if operation == "question.ask":
             return ad.ask_question(root, payload["text"], payload.get("options", []),
                                    payload.get("recommendation"), payload.get("ticket_id"),

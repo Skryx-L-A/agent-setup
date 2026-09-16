@@ -64,6 +64,8 @@
 .wv-weltneu { display: flex; flex-direction: column; gap: 6px; text-align: left; }
 .wv-weltneu > .knopf-rand { align-self: flex-start; }
 .wv-leiste-kopf .wv-weltneu { padding: 8px 10px; border-radius: 10px; background: var(--erhoben); }
+/* Auftrag agentsform: mit gemerkten Ordnern wird die Tafel hoch; der Kopf der Leiste rollt dann in sich, statt unter die Fusszeile zu laufen. */
+.wv-leiste-kopf { flex: 0 1 auto; max-height: 72%; overflow-y: auto; }
 .wv-hinweis { margin: 2px 8px 6px; }
 .wv-einladung { gap: 12px; }
 .wv-einladung .wv-karte { width: min(560px, 100%); padding: 14px 16px; gap: 8px; }
@@ -145,6 +147,23 @@
 .wv-wahl { padding: 3px 10px; border-radius: 12px; background: var(--fenster) !important; box-shadow: inset 0 0 0 1px var(--linie); }
 .wv-wahl.an { background: var(--akzent-matt) !important; box-shadow: inset 0 0 0 1.5px var(--akzent); }
 .wv-fuss { display: flex; align-items: center; gap: 8px; padding: 9px 14px; border-top: 1px solid var(--linie); }
+/* Auftrag agentsform: was der Agent darf -- Flaeche, Abstand und Rundung statt Linien. */
+.wv-wahl:disabled { opacity: 1; cursor: default; }
+.wv-formwert > .wv-werkzeuge, .wv-rechte-muster, .wv-rechte-skills { flex: 1 1 100%; }
+.wv-rechte-muster { display: flex; flex-direction: column; gap: 6px; }
+.wv-rechte-fest { display: flex; flex-direction: column; gap: 2px; padding: 6px 9px; border-radius: 8px; background: var(--fenster); }
+.wv-rechte-festzeile { color: var(--gedaempft); }
+.wv-rechte-skills { display: flex; flex-wrap: wrap; gap: 6px; }
+.wv-rechte-web { display: flex; flex-direction: column; gap: 4px; }
+.wv-befehl { padding: 4px 7px; border-radius: 6px; background: var(--fenster); color: var(--schrift); user-select: text; overflow-wrap: anywhere; }
+.wv-gespraech-rechte { display: flex; flex-direction: column; gap: 8px; margin: 8px 14px 0; padding: 8px 10px; border-radius: var(--r-karte); background: var(--erhoben); }
+.wv-gespraech-rechte .wv-karte { background: var(--fenster); }
+.wv-gespraech-rechte .wv-rechte-fest, .wv-gespraech-rechte .wv-befehl { background: var(--erhoben); }
+.wv-rechte-kurz { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wv-gemerkt { justify-content: space-between; }
+.wv-gemerkt-pfad { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+.wv-frageband-antwort { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 14px 8px; border-bottom: 1px solid var(--linie); background: var(--vorsichtgrund); }
+.wv-frageband-antwort .wv-feld { flex: 1 1 180px; }
 .wv-luecke { flex: 1 1 auto; }
 
 /* --- Inspektor ----------------------------------------------------------------------- */
@@ -160,6 +179,7 @@
 
 .wv-dialog-schicht { position: absolute; inset: 0; display: grid; place-items: center; background: color-mix(in srgb, var(--grund) 55%, transparent); z-index: 5; }
 .wv-dialog { width: min(440px, 90%); display: flex; flex-direction: column; gap: 10px; padding: 16px; border-radius: 12px; background: var(--fenster); box-shadow: 0 10px 40px rgb(0 0 0 / 0.35); }
+.wv-dialog .wv-leise { white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* --- Fusszeile (bis 14.09.2026 im Aufgaben-Blatt, agents-view.css) --------------- */
 .wv-traegerfuss {
