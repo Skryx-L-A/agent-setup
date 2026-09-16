@@ -2,8 +2,8 @@
 
 Auslöser: ein Zug eines dauerhaften Agenten in einer Welt des Agents-Features (Hauptagent,
 Teamleiter, Mitglied). Der Träger verlinkt diese Datei in der Anweisungsdatei jedes Agenten.
-Quelle der Entscheidungen: `~/AI/claude-workbench/docs/AGENTS-PLAN.md`, Abschnitte 8, 13 und
-14 (der Nutzer, 11. bis 14.09.2026). Stand: 2026-09-14. Die Hausregeln aus `~/.claude/CLAUDE.md`
+Quelle der Entscheidungen: `~/AI/claude-workbench/docs/AGENTS-PLAN.md`, Abschnitte 8, 13, 14 und
+16 (der Nutzer, 11. bis 16.09.2026). Stand: 2026-09-16. Die Hausregeln aus `~/.claude/CLAUDE.md`
 gelten in der Auswahl, die die Stufe braucht; bei Widerspruch gilt diese Datei für Agenten.
 
 ## Entscheiden und fragen
@@ -16,14 +16,17 @@ gelten in der Auswahl, die die Stufe braucht; bei Widerspruch gilt diese Datei f
   Alles andere entscheidet der Hauptagent und schreibt es ins Ticket. Mitglieder und
   Teamleiter richten Fragen an ihren Teamleiter oder Hauptagenten, nie an den Nutzer.
 - Freigaben mit Dauer stehen in `freigaben.json` der Welt und entstehen nur aus einer als Mensch
-  belegten Oberfläche. Vor der Handlung `wb-freigabe pruefen <art> <ziel>`; ohne Treffer keine
-  Handlung. Kein Agent erweitert Freigaben, Regeln oder Profile selbst.
+  belegten Oberfläche (`wb-welt freigabe … --bestaetigt`). Vor der Handlung gilt nur eine gültige
+  Freigabe dort (der Hauptagent liest sie mit `freigabe.liste`); ohne Freigabe keine Handlung. Kein
+  Agent erweitert Freigaben, Regeln oder Profile selbst.
 
 ## Grenzen
 
 - Kein Eingriff außerhalb der Welt: nur Projektordner, eigener Worktree und eigenes
   Agentenverzeichnis sind beschreibbar; das Vault `~/Knowledge` liest jeder Agent über
-  `brain search`, schreibt nur der Hauptagent. Die Profil-Sperre setzt das mechanisch durch
+  `brain search` (im Zug nur lesbar, `90-secrets/` gesperrt), und jeder Agent schreibt seinen eigenen
+  Bereich im Brain über den Dienstweg (`brain.notiz`), der Hauptagent zusätzlich das Projekt
+  (`20-projects/<projekt>/`); direkt schreibt keiner. Die Profil-Sperre setzt das mechanisch durch
   (Werkzeugliste, Bash-Muster, Weltgrenze, Kontextgrenze).
 - Nur eigene und verzeichnete Skills (Agent, Welt, Bibliothek); Hausskills und Skills anderer
   Agenten sind gesperrt. Welt- und Bibliotheksskills ändern sich nur über ein Ticket
@@ -56,6 +59,18 @@ gelten in der Auswahl, die die Stufe braucht; bei Widerspruch gilt diese Datei f
 - `MEMORY.md` bleibt kurz: Lehren, keine Erzählungen; Altes zusammenfassen statt anhängen.
   Skills werden nach Bedarf geladen, nicht auf Vorrat. Die Tokenzahl je Ticketart ist ein
   Maß; ein Skill, der sie senkt, ist ein Beleg.
+- Gedächtnis und Brain (der Nutzer, 16.09.2026: „in Gedächnis.md steht nur das aller aller
+  wichtigste"): `MEMORY.md` hat eine harte Obergrenze von 2.000 Zeichen und 15 Zeilen unter dem festen
+  Kopf. Hinein gehören nur Regeln, die jeden Zug ändern, Zusagen an Menschen und offene
+  Verpflichtungen; Hergang, Belege und Themenwissen gehören ins Brain. Ist die Grenze gerissen, ist der
+  nächste Zug „Gedächtnis kürzen“, und bis dahin nimmt der Träger keinen anderen Posten.
+- Jeder Agent hat einen eigenen Bereich im Brain, `20-projects/<projekt>/agenten/<agent-id>/`
+  (globale Welt `10-global/agenten/<agent-id>/`), mit `lehren.md` als Archiv des Gedächtnisses und
+  Themen-Notizen. Vor der Arbeit liest er das Brain und holt sich nur, was er braucht:
+  `brain search "<Thema>" -k 5`, zuerst im eigenen Bereich, dann Projekt und Welt.
+- Der Lernschritt hat dafür drei Arten neben Anweisung und Skill: `lehre` (kurz, datiert, ins
+  Gedächtnis), `notiz` (ausführlich, als Notiz ins Brain) und `archiv` (verschiebt genannte Zeilen aus
+  `MEMORY.md` nach `lehren.md` und schreibt `MEMORY.md` neu).
 
 ## Fähigkeiten der Agenten (der Nutzer, 15.09.2026, nach dem Myproject-Plan)
 
@@ -78,5 +93,12 @@ gelten in der Auswahl, die die Stufe braucht; bei Widerspruch gilt diese Datei f
   je Welt ein; ein Agent erweitert sie nie, liest keinen Schlüssel und nennt kein anderes Ziel.
 - Drei Arten (15.09.2026): `ssh`, `web` (nur Netz, für Agenten mit WebFetch/WebSearch im Profil)
   und `mail` (lesende Postfachwerkzeuge `<ein eigenes Mailwerkzeug>`, `<ein eigenes Mailwerkzeug>` mit Passwort aus dem Schlüsselbund des
-  Trägerhosts). Über einen Zugang wird nie gesendet: `<ein eigenes Mailwerkzeug>` und `msmtp` bleiben auf der Hausliste;
-  Entwürfe legt der Agent als Datei ab, der Mensch sendet nach `regeln/email.md`.
+  Trägerhosts).
+- Senden (der Nutzer, 16.09.2026): nur über `<ein eigenes Mailwerkzeug> senden` mit einer Freigabe `email` in
+  `freigaben.json` der Welt. Freigaben erteilt der Mensch (`wb-welt freigabe <welt> erteilen … --bestaetigt`);
+  der Hauptagent gibt sie mit `freigabe.weitergeben` an einzelne Agenten weiter, nie weiter als seine
+  eigene. Der Umfang je Absenderadresse folgt `COMPLIANCE.md` des Projekts: Spalte „Ohne Rückfrage“;
+  „Nur mit Freigabe“ geht als Entwurf und Frage über den Hauptagenten an den Nutzer. `l.the user@` sendet
+  nie, `neuigkeiten@` nur `tools/einwilligung/versand.py`. Jede Sendung steht im Versandlog der Welt
+  (`mail-versand.jsonl`). `<ein eigenes Mailwerkzeug>` und `msmtp` bleiben auf der Hausliste; ohne Freigabe legt der Agent
+  Entwürfe als Datei ab, und der Mensch sendet nach `regeln/email.md`.

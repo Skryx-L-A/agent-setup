@@ -44,6 +44,9 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import agents_data as ad  # noqa: E402
+import agents_freigaben as af  # noqa: E402
+import agents_brain as ab  # noqa: E402
+import agents_gedaechtnis as ag  # noqa: E402
 import agents_skills as ask  # noqa: E402
 import agents_worktree as aw  # noqa: E402
 import agents_zugaenge as az  # noqa: E402
@@ -77,6 +80,9 @@ RPC_MODULE = ("agents_rpc_client.py", "agents_controller.py", "agents_data.py", 
 # Gespeichertes Skript der Bibliothek, das den Lernschritt schreibt; Prompt und Anweisung nennen es, wenn der Agent es hat.
 LERNSKRIPT = "lernschritt-schreiben"
 NACHRICHTEN_SITZUNG = "__nachrichten__"
+# Gedaechtnis und Brain (der Nutzer, 16.09.2026): eigene Sitzung fuer "Gedaechtnis kuerzen", Huelle `brain` im Zug.
+GEDAECHTNIS_SITZUNG = "__gedaechtnis__"
+BRAIN_BIN = "brain-bin"
 _MODELL = re.compile(r"claude-[a-z0-9.-]{3,100}\Z")
 _VERSION = 1
 
@@ -163,6 +169,7 @@ class TraegerKonfig:
     pi: Optional[dict[str, Any]] = None
     sperren: bool = True
     codex: Optional[dict[str, Any]] = None
+    brain: Optional[dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         for name in ("world_root", "state_dir", "agents_dir"):
@@ -199,6 +206,9 @@ class TraegerKonfig:
         if self.codex is not None and (not isinstance(self.codex, dict) or set(self.codex) - {"cli", "auth"}
                                        or not all(Path(str(self.codex.get(k) or "")).is_absolute() for k in ("cli", "auth"))):
             raise TraegerFehler("Codex-Konfiguration braucht cli und auth als absolute Pfade")
+        if self.brain is not None and (not isinstance(self.brain, dict) or set(self.brain) != {"vault"}
+                                       or not Path(str(self.brain.get("vault") or "")).is_absolute()):
+            raise TraegerFehler("brain braucht genau vault als absoluten Pfad")
         object.__setattr__(self, "tools", tuple(self.tools))
 
     @classmethod
@@ -209,6 +219,10 @@ class TraegerKonfig:
         # Eine in der Weltablage liegende Konfiguration nennt zusaetzlich Maschine und Modulpfad.
         data.pop("maschine", None)
         data.pop("traeger_modul", None)
+        # Ohne Eintrag liest der Zug das Vault des Traegerhosts, wenn es eines gibt; "brain": null schaltet ab.
+        if "brain" not in data:
+            vault = Path.home() / "Knowledge"
+            data["brain"] = {"vault": str(vault)} if vault.is_dir() and not vault.is_symlink() else None
         return cls(**data)
 
     def as_dict(self) -> dict[str, Any]:
@@ -223,6 +237,7 @@ class TraegerKonfig:
             "skill_bibliothek": self.skill_bibliothek, "registry": self.registry,
             "pi": dict(self.pi) if self.pi is not None else None, "sperren": self.sperren,
             "codex": dict(self.codex) if self.codex is not None else None,
+            "brain": dict(self.brain) if self.brain is not None else None,
         }
 
     def orte(self) -> TraegerOrte:
@@ -277,7 +292,8 @@ def zeitgeber_unit(konfig: TraegerKonfig) -> str:
 def _claude_lauf_fabrik(traeger: "WeltTraeger", *, agent_id: str, run_id: str, zug: ClaudeZug,
                         workspace: Path, agent_state: Path, extra_read_paths: tuple[Path, ...] = (),
                         netz: bool = False, extra_write_paths: tuple[Path, ...] = (),
-                        git_einbindung: Optional[dict[str, Any]] = None):
+                        git_einbindung: Optional[dict[str, Any]] = None, verdeckt: tuple[Path, ...] = (),
+                        brain_vault: Optional[Path] = None):
     from agents_claude_lauf import ClaudeLauf, LaufOrte
     k, orte = traeger.konfig, traeger.orte
     lauf_orte = LaufOrte(orte.runs, orte.launcher, orte.output, orte.sockets, orte.turns, orte.runtime)
@@ -285,12 +301,13 @@ def _claude_lauf_fabrik(traeger: "WeltTraeger", *, agent_id: str, run_id: str, z
         # Trockenlauf: Aufruf und Anmeldeweg sind gebaut, der Modelltransport mit der Codex-Anmeldung nicht.
         raise TraegerFehler("Codex-Zug ist nur als Trockenlauf gebaut; Modelltransport mit Codex-Anmeldung fehlt")
     pi = isinstance(zug, PiZug)
+    brain = {key: value for key, value in (("verdeckt", tuple(verdeckt)), ("brain_vault", brain_vault)) if value}
     return ClaudeLauf(lauf_orte, world_root=k.world_root, agent_id=agent_id, run_id=run_id, workspace=workspace,
                       agent_state=agent_state, zug=zug, backend=k.backend_fuer(zug.model, "pi" if pi else "claude"),
                       auth_headers=None if pi else traeger.anmeldequelle.auth_headers, extra_read_paths=extra_read_paths,
                       launcher_options=dict(k.launcher, **({"git_einbindung": git_einbindung} if git_einbindung
                                                            else {})), unit_prefix=k.unit_prefix, netz=netz,
-                      extra_write_paths=extra_write_paths)
+                      extra_write_paths=extra_write_paths, **brain)
 
 
 PROJEKT_ARBEITSORDNER = "work"
@@ -419,6 +436,15 @@ class WeltTraeger:
             target = runtime / name
             if not target.exists() or target.read_bytes() != data:
                 atomar_schreiben.schreiben(target, data, modus=0o600, dauerhaft=True)
+        # Brain im Zug (agents_brain.huelle): Modul neben den Laufzeitmodulen, die Huelle `brain` allein im Ordner
+        # brain-bin, den die Einstellungen des Zuges vorn in den PATH stellen.
+        data = (quelle / "agents_brain.py").read_bytes()
+        target = runtime / "agents_brain.py"
+        if not target.exists() or target.read_bytes() != data:
+            atomar_schreiben.schreiben(target, data, modus=0o600, dauerhaft=True)
+        huelle = _private_dir(runtime / BRAIN_BIN, "Brain-Huellenordner") / "brain"
+        if not huelle.exists() or huelle.read_text(encoding="utf-8") != ab.HUELLE:
+            atomar_schreiben.schreiben(huelle, ab.HUELLE, modus=0o700, dauerhaft=True)
         # Lesende Postfachwerkzeuge fuer Mail-Zugaenge (agents_zugaenge.MAIL_WERKZEUGE): ihre Huelle im Zug ruft sie
         # ueber den Interpreter, deshalb reicht 0600. Fehlt eines an der Quelle, gibt es dafuer keine Huelle.
         for name in az.MAIL_WERKZEUGE:
@@ -499,6 +525,12 @@ class WeltTraeger:
             return None, befund
         return (args[1].split("=", 1)[1] if harness == "codex" else args[1]), befund
 
+    def _freigaben_lesepfad(self) -> tuple[Path, ...]:
+        """freigaben.json der Welt nur lesend im Zug: die Profil-Sperre prueft daran `<werkzeug> senden`. Geschrieben
+        und fuer den Versand massgeblich gelesen wird sie nur ausserhalb (Datenschicht, Controller)."""
+        path = self.root / af.DATEI
+        return (path,) if path.is_file() and not path.is_symlink() else ()
+
     def _rpc_bereitstellen(self, run_dir: Path) -> Path:
         """RPC-Client im Zugordner: die Profil-Sperre erlaubt dem Agenten nur Pfade seiner Welt und seines Zuges.
 
@@ -519,7 +551,8 @@ class WeltTraeger:
         return sorted((key, value) for key, value in env.items() if value)
 
     def _sperr_einstellungen(self, zugang: Optional[az.Bereitstellung] = None,
-                             git: Optional[dict[str, str]] = None) -> dict[str, Any]:
+                             git: Optional[dict[str, str]] = None,
+                             brain: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """Zug-eigene Claude-Code-Einstellungen mit Skills- und Profil-Sperre aus den Snippets.
 
         Mit Zugaengen stehen deren Huellen vorn im PATH von Bash und Hooks, und ``WB_ZUGAENGE`` nennt der
@@ -538,6 +571,13 @@ class WeltTraeger:
                                "WB_ZUGAENGE": str(zugang.ordner)}
         if git:
             settings.setdefault("env", {}).update(git)
+        if brain is not None:
+            # Brain lesen (16.09.2026): `brain search` ueber die Huelle, die Profil-Sperre kennt das Vault des Hosts.
+            env = settings.setdefault("env", {})
+            env["PATH"] = ":".join(part for part in (str(zugang.ordner) if zugang is not None else "",
+                                                     str(self.orte.runtime / BRAIN_BIN), "/usr/local/bin:/usr/bin:/bin")
+                                   if part)
+            env["WB_BRAIN_VAULT"] = str(brain["vault"])
         return settings
 
     def _zugaenge_aufraeumen(self) -> list[str]:
@@ -666,11 +706,40 @@ class WeltTraeger:
             except ValueError:
                 continue
             art = content.get("art")
-            if art in {"fortsetzen", "aufwachen", "nachricht", "rueckmeldung", "antwort", "antrag"}:
+            if art in {"fortsetzen", "aufwachen", "nachricht", "rueckmeldung", "antwort", "antrag", "gedaechtnis"}:
                 items[delivery.delivery_id] = Posten(delivery, art, ticket_id=content.get("ticket_id"),
                                                      nachricht_id=content.get("nachricht_id"),
                                                      frage_id=content.get("frage_id"), grund=content.get("grund"))
-        return sorted(items.values(), key=lambda item: (item.delivery.due_at, item.delivery.delivery_id))
+        ordered = sorted(items.values(), key=lambda item: (item.delivery.due_at, item.delivery.delivery_id))
+        vorn = self._gedaechtnis_posten(world_id, agent_id)
+        if vorn is None:
+            return [item for item in ordered if item.art != "gedaechtnis"]
+        # Solange MEMORY.md die Grenze reisst, gibt es fuer diesen Agenten nur "Gedaechtnis kuerzen" (samt Recovery).
+        return [vorn] + [item for item in ordered if item.art == "gedaechtnis"
+                         and item.delivery.delivery_id != vorn.delivery.delivery_id]
+
+    def _gedaechtnis_ueber(self, agent_id: str) -> Optional[dict[str, Any]]:
+        try:
+            return ag.ueber_grenze(self.root, agent_id)
+        except (ad.AgentsError, OSError):
+            return None
+
+    def _gedaechtnis_posten(self, world_id: str, agent_id: str) -> Optional[Posten]:
+        """Posten "Gedaechtnis kuerzen": je Inhalt von MEMORY.md eine Zustellung, faellig seit der letzten Aenderung."""
+        ueber = self._gedaechtnis_ueber(agent_id)
+        if ueber is None:
+            return None
+        path = ag.pfad(self.root, agent_id)
+        due = path.stat().st_mtime if path.is_file() else 0.0
+        delivery = Delivery(ad.derived_id("gedaechtnis", agent_id, ueber["sha256"][:16]), world_id, agent_id,
+                            "fresh_message", due, _inhalt("gedaechtnis", sha256=ueber["sha256"][:16]))
+        return Posten(delivery, "gedaechtnis", grund="ueber_grenze")
+
+    def _brain_vault(self) -> Optional[Path]:
+        try:
+            return ab.vault_pfad((self.konfig.brain or {})["vault"]) if self.konfig.brain else None
+        except ab.BrainFehler:
+            return None
 
     @staticmethod
     def _wecker_id(agent_id: str, postfach_id: str) -> str:
@@ -683,6 +752,8 @@ class WeltTraeger:
             return "%s:%d" % (ticket_id, int(ticket.get("result_revision") or 0))
         if art == "antrag" and frage_id:
             return "antrag:%s:%s" % (frage_id, ad.read_question(self.root, frage_id).get("state"))
+        if art == "gedaechtnis" and agent_id:
+            return "gedaechtnis:%s" % ag.pruefsumme(ag.lesen(self.root, agent_id))[:16]
         if nachricht_id and agent_id:
             return "nachricht:%s:%d" % (nachricht_id, int(self._antwort_belegt(agent_id, nachricht_id)))
         return "%s:%s" % (art, frage_id or nachricht_id or "-")
@@ -1054,6 +1125,19 @@ class WeltTraeger:
                 "<<<", "printf '%%s' '%s' | /usr/bin/python3 %s message.reply" % (payload, rpc), ">>>",
                 "Then reply with a one-line summary.",
             ]
+        elif posten.art == "gedaechtnis":
+            text = ag.lesen(self.root, agent["id"])
+            messung = ag.messen(text)
+            lines += [
+                "Your memory file MEMORY.md is over its limit: %d characters and %d lines below the fixed header "
+                "(limit %d characters and %d lines). Until it is within the limit you get no other work." % (
+                    messung["zeichen"], messung["zeilen"], ag.GRENZE_ZEICHEN, ag.GRENZE_ZEILEN),
+                "Its numbered lines:", "---", ag.nummeriert(text), "---",
+                "Keep only what applies to every turn: rules that change every turn, promises to people, open "
+                "commitments. Move everything else (history, evidence, topic knowledge) to your archive lehren.md in "
+                "the brain. Do this with exactly one learning step of kind archiv: `zeilen` lists the line numbers to "
+                "move, `neu` optionally adds short condensed lines that replace them (a rule in one sentence).",
+            ]
         elif frage is not None:
             lines += [
                 "Your question %s was answered." % frage["id"],
@@ -1062,7 +1146,19 @@ class WeltTraeger:
                 "Take the answer into account for your work and reply with a one-line summary.",
             ]
         lernen = skill.get(LERNSKRIPT) or {}
-        if run_dir is not None and lernen.get("datei"):
+        if run_dir is not None and posten.art == "gedaechtnis":
+            if lernen.get("datei"):
+                lines += ["End the turn with this learning step: run your stored script %s exactly once, one --zeile "
+                          "per line number and one --neu per condensed line (or none):" % LERNSKRIPT,
+                          "<<<", "python3 %s --art archiv --zeile 1 --zeile 2 --neu \"CONDENSED RULE\" --grund \"REASON\""
+                          % lernen["datei"], ">>>"]
+            else:
+                lines.append("End the turn with this learning step: write %s/%s as "
+                             '{"art": "archiv", "zeilen": [1, 2], "neu": ["condensed rule"], "grund": "why"}.'
+                             % (run_dir, ask.LEARN_FILE))
+            lines.append("The carrier moves the lines to lehren.md in the brain and rewrites MEMORY.md after the "
+                         "turn. Then reply with a one-line summary.")
+        elif run_dir is not None and lernen.get("datei"):
             # Das gespeicherte Skript baut und prueft das JSON; kleine Modelle scheitern sonst am Quoting.
             lines += [
                 "End the turn with your learning step: run your stored script %s exactly once, replacing LESSON "
@@ -1080,7 +1176,7 @@ class WeltTraeger:
                    zugang: Optional[az.Bereitstellung] = None, zugang_fehler: Optional[str] = None,
                    projekt: Optional[Path] = None, projekt_arbeit: Optional[Path] = None,
                    baum: Optional[aw.Arbeitsbaum] = None, baum_fehler: Optional[str] = None,
-                   arbeitsordner: Optional[Path] = None) -> str:
+                   arbeitsordner: Optional[Path] = None, brain_im_zug: bool = False) -> str:
         """Anweisungsdatei des Zuges: eigene Anweisungen, Gedaechtnis, Skills mit Pfad, Projekt, Zugende mit
         Lernschritt."""
         folder = ad._agent_dir(self.root, agent["id"])
@@ -1095,10 +1191,11 @@ class WeltTraeger:
         lines = ["# Anweisung für Zug %s" % run_dir.name, "",
                  "Agent `%s` (%s) in der Welt „%s“." % (agent["id"], agent["stage"], world["name"]), "",
                  "## Deine Anweisungsdatei", "", lesen("AGENTS.md", ask.INSTRUCTIONS_LIMIT) or "(keine)", "",
-                 "## Dein Gedächtnis", "", lesen("MEMORY.md", ask.MEMORY_LIMIT) or "(leer)", "",
-                 "## Skills", "",
+                 "## Dein Gedächtnis", "", lesen("MEMORY.md", ask.MEMORY_LIMIT) or "(leer)", ""]
+        lines += self._gedaechtnis_anweisung(agent, rpc, brain_im_zug)
+        lines += ["## Skills", "",
                  "Lade einen Skill nur, wenn er passt: lies seine `SKILL.md` und rufe dann seine Skripte auf, "
-                 "statt die Schritte selbst neu zu beschreiben. Der RPC-Client steht in `WB_RPC_CLIENT` (%s)." % rpc, ""]
+                  "statt die Schritte selbst neu zu beschreiben. Der RPC-Client steht in `WB_RPC_CLIENT` (%s)." % rpc, ""]
         skills = (verzeichnis or {}).get("skills") or []
         for item in skills:
             if (item.get("art") or "skill") == "skript":
@@ -1156,6 +1253,17 @@ class WeltTraeger:
                           ] + az.anweisung(zugang.eintraege or zugang.namen)
             else:
                 lines.append("Die Zugänge der Welt sind in diesem Zug nicht bereit: %s" % zugang_fehler)
+        try:
+            freigaben = af.gueltige(self.root, agent["id"], "email")
+        except ad.AgentsError as exc:
+            freigaben, freigaben_fehler = [], "%s: %s" % (type(exc).__name__, str(exc)[:200])
+        else:
+            freigaben_fehler = None
+        if freigaben:
+            lines += self._mail_anweisung(agent, freigaben, rpc, projekt_arbeit)
+        elif freigaben_fehler:
+            lines += ["", "## Mail senden", "", "Die Freigaben der Welt sind nicht lesbar (%s); gesendet wird "
+                      "nichts." % freigaben_fehler]
         if agent["stage"] == "hauptagent":
             draft = {"id": "NAME", "stage": "mitglied", "team": "TEAM", "specialty": "Ein Satz zur Aufgabe",
                      "model": "sonnet5:high", "tools": ["Read", "Grep", "Glob", "Write", "Edit"], "bash": [],
@@ -1178,12 +1286,46 @@ class WeltTraeger:
                       "den Grund. Die Änderung gilt ab dem nächsten Zug des Agenten, steht in seinem Verlauf, und der "
                       "Mensch erfährt sie als markiertes Ergebnis. Teamleiter beantragen Rechte bei dir." % (
                           rpc, json.dumps(rechte, ensure_ascii=False), ", ".join(ad.AGENT_TOOLS))]
+            # Beispieladresse und gesperrte Adressen aus den Mailkonten des Hosts (mailkonten.json), nie aus dem Code.
+            weitergabe = {"agent_id": "NAME", "art": "email",
+                          "adressen": af.adressen_von(freigaben)[:1] or ["name@example.org"], "ablauf": "2026-12-31"}
+            gesperrt = []
+            for name in dict.fromkeys(item["konto"] for item in freigaben):
+                try:
+                    daten = af.konto(name)
+                except ad.AgentsError:
+                    continue
+                gesperrt += ["`%s`" % adresse for adresse in list(daten["nie"]) + list(daten["rundschreiben"])]
+            lines += ["", "## Mail-Freigaben weitergeben", "",
+                      "Deine Freigaben: %s." % ("; ".join(af.zusammenfassung(item) for item in freigaben)
+                                                if freigaben else "keine; Freigaben erteilt nur der Mensch"),
+                      "Eine Freigabe, die du hältst, gibst du einem Agenten deiner Welt mit "
+                      "`/usr/bin/python3 %s freigabe.weitergeben < freigabe.json`, Form `%s`. `adressen` und "
+                      "`ablauf` sind optional; ohne sie gelten deine Adressen und dein Ablauf. Nie weiter als deine "
+                      "eigene: nur Adressen, die du hältst, kein späterer Ablauf%s. Gib einem Agenten nur die "
+                      "Adressen, die seine Aufgabe braucht." % (
+                          rpc, json.dumps(weitergabe, ensure_ascii=False),
+                          "; %s gibt es nicht" % ", ".join(gesperrt) if gesperrt else ""),
+                      "Zurück nimmst du sie mit `freigabe.entziehen` (`{\"agent_id\": \"NAME\", \"art\": "
+                      "\"email\"}`), den Überblick gibt `freigabe.liste` (`{}`). Jede Weitergabe und jeder Entzug "
+                      "steht im Verlauf des Agenten und kommt beim Menschen als markiertes Ergebnis an; sie gilt ab "
+                      "dem nächsten Versand des Agenten.",
+                      "Schickt dir ein Agent einen Mailentwurf, den der Umfang des Kontos nicht ohne Rückfrage "
+                      "erlaubt, stellst du ihn dem Menschen mit `question.ask` als Frage (Pfad des Entwurfs, "
+                      "Empfänger, Absender); gesendet wird erst nach seiner Antwort."]
         lines += ["", "## Zugende", "",
                   "1. Ein Zug endet mit einer Entscheidung: fertig, Weckzeit, Übergabe oder „braucht dich“ über "
                   "den Dienstweg.",
                   "2. Danach der Lernschritt: Was hat gefehlt, was war umständlich, was war beim zweiten Mal anders? "
                   "Schreibe genau eine JSON-Datei `%s/%s`, eine dieser Formen:" % (run_dir, ask.LEARN_FILE),
-                  '   - `{"art": "lehre", "text": "kurze Lehre", "grund": "warum"}` (landet datiert in MEMORY.md)',
+                  '   - `{"art": "lehre", "text": "kurze Lehre", "grund": "warum"}` (landet datiert in MEMORY.md; nur, was '
+                  'jeden Zug gilt, z. B. `"Antworten an mensch immer mit Dateipfad statt Volltext."`)',
+                  '   - `{"art": "notiz", "titel": "…", "text": "ausführlich, mehrzeilig", "thema": "optional", '
+                  '"anhaengen": true, "grund": "warum"}` (landet als Notiz in deinem Bereich im Brain, z. B. Hergang und '
+                  'Belege einer Klärung: `"titel": "Hetzner-Box: Zugang geprüft", "thema": "hetzner-box"`)',
+                  '   - `{"art": "archiv", "zeilen": [1, 2], "neu": ["verdichtete Regel"], "grund": "warum"}` (verschiebt '
+                  'die genannten Zeilen aus MEMORY.md nach `lehren.md` im Brain und schreibt MEMORY.md neu; Zeilen nach '
+                  'Nummer unter dem Kopf oder mit genauem Text)',
                   '   - `{"art": "anweisung", "ziel": "AGENTS.md", "diff": "<unified diff, nur ergänzend>", "grund": "warum"}`',
                   '   - `{"art": "skill", "ziel": "<skillname>", "diff": "<unified diff relativ zum Skill>", "grund": "warum"}`',
                   '   - `{"art": "nichts", "text": "optional"}`, wenn du ausdrücklich nichts gelernt hast.',
@@ -1191,10 +1333,85 @@ class WeltTraeger:
         lernen = next((item for item in skills if item.get("name") == LERNSKRIPT and item.get("datei")), None)
         if lernen is not None:
             lines.append("3. Schreibe den Lernschritt mit deinem Skript `%s` statt JSON von Hand: "
-                         "`python3 %s --art lehre --text \"…\" --grund \"…\"`, für die übrigen Arten `--ziel` und "
-                         "`--diff-datei`, ohne Lernen `--art nichts`. Es prüft das Format und schreibt die Datei; "
-                         "Exit 1 nennt den Fehler in `error`." % (LERNSKRIPT, lernen["datei"]))
+                         "`python3 %s --art lehre --text \"…\" --grund \"…\"`; Notiz mit `--art notiz --titel \"…\" "
+                         "--text-datei notiz.md [--thema \"…\"] [--anhaengen]`, Archiv mit `--art archiv --zeile 3 "
+                         "--zeile 4 [--neu \"…\"]`; für die übrigen Arten `--ziel` und `--diff-datei`, ohne Lernen "
+                         "`--art nichts`. Es prüft das Format und schreibt die Datei; Exit 1 nennt den Fehler in "
+                         "`error`." % (LERNSKRIPT, lernen["datei"]))
         return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _mail_anweisung(agent: dict[str, Any], freigaben: list[dict[str, Any]], rpc: Path,
+                        projekt_arbeit: Optional[Path]) -> list[str]:
+        """Abschnitt „Mail senden“ fuer einen Agenten mit gueltiger Freigabe email (16.09.2026). Werkzeug, gesperrte
+        Adressen, Umfang und Hinweise kommen aus dem Mailkonto der Freigabe in mailkonten.json des Hosts."""
+        ablage = "`%s`" % projekt_arbeit if projekt_arbeit is not None else "deinem Arbeitsordner"
+        rueckfrage = ("stellst du dem Menschen mit `question.ask` als Frage" if agent["stage"] == "hauptagent" else
+                      "schickst du als Frage an den Hauptagenten (Pfad des Entwurfs, Empfänger, Absender); er stellt "
+                      "sie dem Menschen")
+        lines = ["", "## Mail senden", "",
+                 "Du hältst %s." % "; ".join(af.zusammenfassung(item) for item in freigaben),
+                 "- Vor jedem Versand liegt der Entwurf als Datei in %s (Unterordner je Thema); `--text` zeigt auf "
+                 "diese Datei." % ablage]
+        for name in dict.fromkeys(item["konto"] for item in freigaben):
+            try:
+                daten = af.konto(name)
+            except ad.AgentsError as exc:
+                lines.append("- Konto %s: %s. Darüber wird nichts gesendet." % (name, str(exc)[:300]))
+                continue
+            werkzeug = daten["werkzeug"]
+            lines += ["", "### Konto %s (@%s)" % (name, daten["domain"]), "",
+                      "- Gesendet wird nur so: `%s senden --von <adresse> --an <empfänger>[,…] [--cc …] --betreff "
+                      "\"<betreff>\" --text <datei> [--antwort-auf <uid> --box INBOX] [--ticket <id>]`. Der Controller "
+                      "prüft deine Freigabe, sendet und schreibt die Sendung ins Versandlog der Welt; ein Passwort "
+                      "siehst du nie. Exit 0 heißt gesendet, jeder andere Exit heißt nicht gesendet. Ohne das Werkzeug "
+                      "im Zug geht derselbe Versand über `/usr/bin/python3 %s mail.senden < mail.json` mit `von`, `an` "
+                      "(Liste), `betreff`, `text`, optional `cc`, `ticket_id`." % (werkzeug, rpc),
+                      "- Ohne Rückfrage sendest du nur, was der Umfang des Kontos für die Absenderadresse nennt: %s. "
+                      "Fälle, die er nur mit Freigabe erlaubt, sendest du nicht: Entwurf als Datei, dann %s." % (
+                          daten["umfang_quelle"], rueckfrage)]
+            lines += ["- `%s` sendet nie: %s" % (adresse, grund) for adresse, grund in daten["nie"].items()]
+            lines += ["- `%s` sendet nie über `%s senden`: %s" % (adresse, werkzeug, grund)
+                      for adresse, grund in daten["rundschreiben"].items()]
+            lines += ["- %s" % hinweis for hinweis in daten["hinweise"]]
+        return lines
+
+    def _gedaechtnis_anweisung(self, agent: dict[str, Any], rpc: Path, brain_im_zug: bool) -> list[str]:
+        """Unter ``## Dein Gedächtnis``: Groesse, Grenze und wie der Agent das Brain liest und beschreibt."""
+        messung = ag.stand(self.root, agent["id"])
+        lines = ["Größe: %d Zeichen, %d Zeilen unter dem Kopf (Grenze %d Zeichen, %d Zeilen)%s." % (
+            messung["zeichen"], messung["zeilen"], ag.GRENZE_ZEICHEN, ag.GRENZE_ZEILEN,
+            "; über der Grenze, der nächste Zug kürzt es" if messung["ueber_grenze"] else ""), ""]
+        vault = self._brain_vault()
+        if vault is None:
+            return lines + ["Auf diesem Träger ist kein Brain eingerichtet; ins Gedächtnis nur, was jeden Zug gilt.", ""]
+        try:
+            eigen = ab.bereich(self.root, agent["id"], "eigen", vault)
+            welt = ab.bereich(self.root, agent["id"], "welt", vault)
+        except ad.AgentsError as exc:
+            return lines + ["Brain-Bereich nicht bestimmbar: %s" % str(exc)[:200], ""]
+        suche = ('`printf \'%%s\' \'{"frage": "THEMA", "k": 5, "bereich": "eigen"}\' | /usr/bin/python3 %s brain.suche`'
+                 % rpc)
+        if brain_im_zug:
+            lines.append("Vor der Arbeit: `brain search \"<Thema des Tickets>\" -k 5 --pfad %s/%s` (dein Bereich im "
+                         "Brain), dann `--pfad %s/%s` (Projekt) und ohne `--pfad` (ganzes Brain, auch die Welt). Das "
+                         "Brain `%s` ist im Zug nur lesbar (Read, Grep, Glob gehen auch); `90-secrets/` bleibt gesperrt. "
+                         "Geht `brain` nicht, liefert der Dienstweg dasselbe: %s (`bereich` eigen, welt oder alles)."
+                         % (vault, eigen, vault, welt, vault, suche))
+        else:
+            lines.append("Vor der Arbeit: suche im Brain über den Dienstweg, zuerst im eigenen Bereich `%s`, dann im "
+                         "Projekt `%s` und im ganzen Brain: %s (`bereich` eigen, welt oder alles)." % (eigen, welt, suche))
+        notiz = {"titel": "TITEL", "text": "TEXT", "thema": "THEMA", "anhaengen": True}
+        if agent.get("stage") == "hauptagent":
+            notiz["bereich"] = "eigen"
+        lines += ["Ins Gedächtnis gehört nur, was jeden Zug gilt; alles andere als Notiz ins Brain: als Lernschritt "
+                  "`notiz` am Zugende oder sofort über den Dienstweg (JSON in eine Datei deines Arbeitsordners, dann "
+                  "`/usr/bin/python3 %s brain.notiz < notiz.json`, Form `%s`). Geschrieben wird nur in `%s`%s; der "
+                  "Träger committet und pusht das Brain." % (
+                      rpc, json.dumps(notiz, ensure_ascii=False), eigen,
+                      " und mit `\"bereich\": \"projekt\"` in `%s`" % welt if agent.get("stage") == "hauptagent"
+                      and welt != "10-global" else ""), ""]
+        return lines
 
     def _starten(self, world: dict[str, Any], agent: dict[str, Any], posten: Posten, claim_id: str,
                  model: str, marker: str, wahl: Optional[dict[str, Any]] = None) -> Optional[str]:
@@ -1226,6 +1443,10 @@ class WeltTraeger:
             if frage.get("state") != "beantwortet":
                 self._ohne_lauf_quittieren(agent_id, posten, claim_id, marker, "frage_offen")
                 return None
+        elif posten.art == "gedaechtnis":
+            if self._gedaechtnis_ueber(agent_id) is None:
+                self._ohne_lauf_quittieren(agent_id, posten, claim_id, marker, "bereits_erledigt")
+                return None
         else:
             self._ohne_lauf_quittieren(agent_id, posten, claim_id, marker, "unbekannte_zustellung")
             return None
@@ -1237,7 +1458,7 @@ class WeltTraeger:
         # Der Zugordner traegt die Laufkennung: der Lernschritt ist je Zug eindeutig.
         run_dir = agent_state / run_id
         config_dir = run_dir / "claude-config"
-        session_key = posten.ticket_id or NACHRICHTEN_SITZUNG
+        session_key = posten.ticket_id or (GEDAECHTNIS_SITZUNG if posten.art == "gedaechtnis" else NACHRICHTEN_SITZUNG)
         session = (self._zuege_lesen()["sessions"].get(agent_id) or {}).get(session_key) or {}
         harness = self.harness(agent)
         # Claude setzt aus einer gesicherten Uebergabe fort, Pi ueber dieselbe Sitzungskennung im Sitzungsordner.
@@ -1296,7 +1517,8 @@ class WeltTraeger:
             atomar_schreiben.schreiben(anweisung, self._anweisung(world, agent, run_dir, verzeichnis, skills_fehler,
                                                                   zugang, zugang_fehler, projekt=projekt,
                                                                   projekt_arbeit=projekt_arbeit, baum=baum,
-                                                                  baum_fehler=baum_fehler, arbeitsordner=workspace),
+                                                                  baum_fehler=baum_fehler, arbeitsordner=workspace,
+                                                                  brain_im_zug=harness == "claude" and self.konfig.sperren),
                                        modus=0o600, dauerhaft=True)
             agent_dir = ad._agent_dir(self.root, agent_id)
             libraries = [Path(str((verzeichnis or {}).get(key) or "")) for key in ("bibliothek", "skript_bibliothek")]
@@ -1305,11 +1527,17 @@ class WeltTraeger:
             read_paths = tuple(Path(item["pfad"]) for item in skills) + (agent_dir / "agent.json",) + (
                 (agent_dir / "skills.json",) if verzeichnis else ()) + tuple(
                 path for path in libraries if path.is_absolute() and path.is_dir()) + (
-                (zugang.weltdatei,) if zugang is not None else ()) + ((projekt,) if projekt is not None else ())
+                (zugang.weltdatei,) if zugang is not None else ()) + ((projekt,) if projekt is not None else ()) + (
+                self._freigaben_lesepfad())
             # Mit Worktree ist er Arbeitsverzeichnis und Schreibpfad des Laufs; der private Arbeitsordner darum
             # bleibt beschreibbar. Das Projekt-Repo bindet der Launcher ueber git_einbindung.
             write_paths = ((projekt_arbeit,) if projekt_arbeit is not None else ()) + (
                 (workspace,) if baum is not None else ())
+            # Brain (16.09.2026): Vault nur lesbar, Geheimordner verdeckt; nur mit Profil-Sperre (sie sperrt beide
+            # Geheimordner auch fuer Werkzeuge) und nur fuer den Claude-Harness mit Huelle und Einstellungen.
+            brain = ab.einbindung(self._brain_vault()) if harness == "claude" and self.konfig.sperren else None
+            if brain is not None:
+                read_paths += brain["lese_pfade"]
             env = self._zugumgebung(agent_id, workspace, run_dir, rpc, verzeichnis is not None)
             prompt = self._prompt(world, agent, posten, resume, ticket, nachricht, frage, run_dir, skills)
             if harness == "pi":
@@ -1334,8 +1562,8 @@ class WeltTraeger:
                 if self.konfig.sperren:
                     settings = turn_dir / "settings.json"
                     git = baum.git_umgebung(agent_id) if baum is not None else None
-                    atomar_schreiben.schreiben(settings, json.dumps(self._sperr_einstellungen(zugang, git), indent=2)
-                                               + "\n", modus=0o600, dauerhaft=True)
+                    atomar_schreiben.schreiben(settings, json.dumps(self._sperr_einstellungen(zugang, git, brain),
+                                                                    indent=2) + "\n", modus=0o600, dauerhaft=True)
                 tools = tuple(t for t in agent.get("tools") or [] if t in ALLOWED_TOOLS) or self.konfig.tools
                 zug = ClaudeZug(self.konfig.claude_binary, model, prompt, session_id, str(config_dir), resume, tools,
                                 extra_env=tuple(env), effort=effort, append_system_prompt_file=str(anweisung),
@@ -1349,7 +1577,9 @@ class WeltTraeger:
             lauf = self._zug_fabrik(self, agent_id=agent_id, run_id=run_id, zug=zug, workspace=cwd,
                                     agent_state=agent_state, extra_read_paths=read_paths, netz=zugang is not None,
                                     extra_write_paths=write_paths,
-                                    **({"git_einbindung": baum.einbindung()} if baum is not None else {}))
+                                    **({"git_einbindung": baum.einbindung()} if baum is not None else {}),
+                                    **({"verdeckt": brain["verdeckt"], "brain_vault": brain["vault"]}
+                                       if brain is not None else {}))
             self.laeufe[run_id] = lauf
             lauf.start()
         except Exception as exc:  # noqa: BLE001 - jeder Startfehler wird sichtbar abgeschlossen
@@ -1440,6 +1670,10 @@ class WeltTraeger:
             belegt = self._antrag_belegt(entry.get("frage_id"))
         elif art in {"antwort", "rueckmeldung"}:
             belegt = True
+        elif art == "gedaechtnis":
+            # Beleg des Kuerzungszuges ist ein angewendeter archiv-Lernschritt; der Lernschritt ist je Zug idempotent.
+            frueh = self._lernschritt(agent_id, entry)
+            belegt = frueh.get("art") == "archiv" and frueh.get("status") == "angewendet"
         verdict = zug_urteil(befund, record.get("exit_code"), stop_requested=record.get("desired_state") == "stopped",
                              ticket=ticket, agent_id=agent_id, result_revision_before=int(entry["revision_before"]),
                              proxy_counts=counts, ergebnis_belegt=belegt)
@@ -1504,10 +1738,14 @@ class WeltTraeger:
         """Wendet den Lernschritt des Zuges an; fehlt er, lautet das Urteil „kein Lernschritt“, ohne Wiederholung."""
         run_dir = entry.get("run_dir") or str(Path(entry["config_dir"]).parent)
         try:
-            result = ask.lernschritt_anwenden(self.root, agent_id, run_dir, library=self.konfig.skill_bibliothek)
+            result = ask.lernschritt_anwenden(self.root, agent_id, run_dir, library=self.konfig.skill_bibliothek,
+                                              brain=self._brain_vault())
         except (ad.AgentsError, OSError, ValueError) as exc:
             return {"status": "fehler", "fehler": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
-        keep = {key: result.get(key) for key in ("status", "art", "ziel", "fehler", "vorschlag_fehler") if result.get(key)}
+        keep = {key: result.get(key) for key in ("status", "art", "ziel", "fehler", "vorschlag_fehler", "ueber_grenze")
+                if result.get(key)}
+        if isinstance(result.get("brain"), dict):
+            keep["brain"] = {key: result["brain"].get(key) for key in ("rel", "commit", "sync")}
         if isinstance(result.get("vorschlag"), dict):
             keep["vorschlag"] = result["vorschlag"].get("ticket") or result["vorschlag"].get("id")
         if result.get("status") == "fehlt":
@@ -1554,6 +1792,8 @@ class WeltTraeger:
                                             grund=grund)
         elif art == "antwort":
             content = lambda grund: _inhalt("antwort", frage_id=entry["frage_id"], grund=grund)  # noqa: E731
+        elif art == "gedaechtnis":
+            content = lambda grund: _inhalt("gedaechtnis", grund=grund)  # noqa: E731
         if outcome in SCHLAF_URTEILE and content is not None:
             freigabe = self._freigabe_nach_abweisung(outcome, befund, limit)
             bis = freigabe.naechster_start or (self._now() + RECHECK_S)
@@ -1791,6 +2031,9 @@ class WeltTraeger:
                     except WeckerFehler:
                         status = None
                     if status is not None and status.status == "completed":
+                        if posten.art == "gedaechtnis":
+                            # Gekuerzt, aber noch ueber der Grenze: alles andere wartet, bis der Mensch es sieht.
+                            wartend.append((posten, "gedaechtnis_ueber_grenze"))
                         continue
                     if posten.delivery.cause in {"self_timer", "recovery"} and posten.delivery.due_at > now + 1.0:
                         continue
@@ -1888,6 +2131,8 @@ def _zug_art(entry: dict[str, Any]) -> str:
         return "ticket"
     if art == "antwort":
         return "frage"
+    if art == "gedaechtnis":
+        return "gedaechtnis"
     return "nachricht"
 
 

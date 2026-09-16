@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "konten": {
+    "beispiel": {
+      "domain": "example.org",
+      "smtp_host": "smtp.example.org",
+      "smtp_port": 465,
+      "smtp_modus": "ssl",
+      "benutzer": "postfach@example.org",
+      "schluesselbund": "wb-beispiel-smtp",
+      "werkzeug": "wb-beispiel",
+      "umfang_quelle": "COMPLIANCE.md des Projekts, Tabelle „Sendebefugnis je Adresse“, Spalte „Ohne Rückfrage“",
+      "ohne_rueckfrage": [
+        "info@example.org",
+        "kontakt@example.org"
+      ],
+      "nie": {
+        "privat@example.org": "privat@example.org wird nur gelesen; von dieser Adresse wird nie gesendet."
+      },
+      "rundschreiben": {
+        "neuigkeiten@example.org": "neuigkeiten@example.org sendet nur der Versandweg des Projekts mit Freigabe des Menschen."
+      },
+      "hinweise": [
+        "Die Tabelle „Sendebefugnis je Adresse“ in `COMPLIANCE.md` des Projekts gilt wörtlich. Lies sie vor dem ersten Versand im Zug."
+      ]
+    }
+  }
+}

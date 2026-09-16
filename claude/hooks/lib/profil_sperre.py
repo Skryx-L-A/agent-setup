@@ -28,14 +28,17 @@ Vier Pruefungen:
      Programme) und Read/Write/Edit/Glob/Grep:
        lesen:     Projektordner, Worktree, Weltablage, Agentenverzeichnis,
                   Skill- und Skriptpfade und beide Bibliotheken aus der
-                  Umgebung, ~/Knowledge, ~/.local/bin; Programme zusaetzlich
+                  Umgebung, das Brain (WB_BRAIN_VAULT, sonst ~/Knowledge;
+                  ohne 90-secrets/ und .secrets-sync/), ~/.local/bin; Programme zusaetzlich
                   aus den Systemordnern und den PATH-Ordnern ausserhalb von
                   $HOME;
        schreiben: im Projektordner nur der gemeinsame Ordner work/, dazu
                   Worktree (der private Arbeitsordner, darin der git-Worktree
                   des Agenten), eigenes Agentenverzeichnis, das eigene
-                  Temp-Verzeichnis (WB_AGENT_TMP); der Hauptagent zusaetzlich
-                  ~/Knowledge. Nie in einen git-Verwaltungsordner (.git): dort
+                  Temp-Verzeichnis (WB_AGENT_TMP). Das Brain schreibt kein Agent
+                  direkt, auch nicht der Hauptagent (Entscheidung vom 16.09.2026:
+                  nur ueber den Dienstweg brain.notiz). Die Geheimordner des
+                  Brains sind fuer jeden Zugriff gesperrt. Nie in einen git-Verwaltungsordner (.git): dort
                   schreibt nur git selbst. In der Weltablage nur das eigene
                   Agentenverzeichnis (eigene skills/ und skripte/ darin),
                   und dort nie agent.json, skills.json, history.json,
@@ -50,7 +53,16 @@ Vier Pruefungen:
      rsync frei, aber nur ueber den nackten Programmnamen (die Huelle des
      Zuges), ohne Wrapper, Variablen, Umleitung von PATH oder fremde Optionen;
      der Zugangsordner selbst ist fuer jeden Zugriff gesperrt.
-  5. git im eigenen Worktree (Entscheidung vom 16.09.2026; docs/AGENTS-TRAEGER.md,
+  5. Mail senden (Entscheidung vom 16.09.2026; docs/AGENTS-SPERREN.md, "Mail senden"):
+     `<werkzeug> senden ...` nur, wenn der Agent in <WB_WELT>/freigaben.json eine
+     gueltige Freigabe `email` fuer dieses Werkzeug haelt (nicht widerrufen, nicht
+     abgelaufen, eine Weitergabe nur mit gueltiger Quelle und nicht weiter als sie);
+     eine `--von`-Adresse ausserhalb der Freigabe wird schon hier abgewiesen. Die
+     Sendewerkzeuge sind das Feld `werkzeug` jedes Eintrags der Datei, dazu immer
+     der Rueckfall MAIL_WERKZEUG. Die Freigabe ersetzt dafuer das Bash-Muster; ohne
+     sie hilft auch `<werkzeug> *` nicht. Massgeblich bleibt der Controller (mail.senden), der dieselbe Pruefung
+     ausserhalb der Sandbox wiederholt.
+  6. git im eigenen Worktree (Entscheidung vom 16.09.2026; docs/AGENTS-TRAEGER.md,
      "Worktree je Agent"), zusaetzlich zu den Mustern: `git merge` nur fuer
      Teamleiter (Zweige agent/<id> von Mitgliedern des eigenen Teams) und den
      Hauptagenten (jeder Agentenzweig); kein `git worktree`, kein `git switch`,
@@ -59,6 +71,10 @@ Vier Pruefungen:
      --config-env, --exec-path, --git-dir, --work-tree oder --namespace und
      keine Aenderung von GIT_*-Variablen (setzen, unset, env -i, exec -c):
      sie kommen aus der Einstellungsdatei des Zuges und schalten Hooks ab.
+  6. Brain lesen (Entscheidung vom 16.09.2026): `brain search ...` ist ohne
+     eigenes Muster erlaubt, aber nur der Unterbefehl `search` und nur ueber
+     den nackten Programmnamen (die Huelle des Zuges); jeder andere Aufruf
+     von brain wird verweigert, auch wenn ein Profilmuster ihn freigaebe.
 
 Die Bash-Zerlegung ist lib/cmdshell.py. Grenzen: siehe hooks/README.md.
 """
@@ -104,8 +120,11 @@ SONDERVARIABLE_RE = re.compile(r'\$\{?[0-9@*#]')
 MIT_I_OPTION = {'sed', 'perl', 'ruby'}
 SYSTEM_PROGRAMME = ('/bin', '/usr/bin', '/usr/sbin', '/sbin', '/usr/local/bin', '/usr/libexec')
 GESCHUETZT_EIGEN = {'agent.json', 'skills.json', 'history.json', 'runtime.json'}
-GESCHUETZT_UEBERALL = {'freigaben.json', 'traeger.json', 'zugaenge.json'}
+GESCHUETZT_UEBERALL = {'freigaben.json', 'traeger.json', 'zugaenge.json', 'mail-versand.jsonl'}
 ZUGANG_PROGRAMME = {'ssh', 'scp', 'rsync'}
+# Brain (16.09.2026): Geheimordner im Vault, fuer jeden Zugriff gesperrt; lesen nur ueber `brain search`.
+BRAIN_GEHEIM = ('90-secrets', '.secrets-sync')
+BRAIN_PROGRAMM = 'brain'
 # Gemeinsamer Ordner des Projekts (agents_traeger.PROJEKT_ARBEITSORDNER); sonst ist das Projekt nur lesbar.
 PROJEKT_ARBEIT = 'work'
 GIT_UMGEBUNG_RE = re.compile(r'^GIT_[A-Za-z0-9_]*(=|$)')
@@ -118,6 +137,12 @@ REBASE_OPTIONEN = {'--continue', '--abort', '--skip', '--quit', '-q', '--quiet',
                    '--no-stat', '-m', '--merge', '--keep-empty', '--no-keep-empty', '--ignore-date',
                    '--committer-date-is-author-date', '--reset-author-date', '--no-ff', '--force-rebase', '-f',
                    '--no-autostash', '--no-verify'}
+FREIGABEN_LIMIT = 256 * 1024
+FREIGABE_TIEFE = 4
+# Rueckfall fuer Freigaben ohne Feld `werkzeug` (vor der Hostkonfiguration mailkonten.json erteilt); es braucht
+# immer eine Freigabe zum Senden. Weitere Sendewerkzeuge nennen die Eintraege selbst (agents_freigaben.WERKZEUG_RE).
+MAIL_WERKZEUG = '<ein eigenes Mailwerkzeug>'
+MAIL_WERKZEUG_RE = re.compile(r'^wb-[a-z0-9][a-z0-9-]{0,39}$')
 ZUGANG_NAME_RE = re.compile(r'^[a-z][a-z0-9-]{0,39}$')
 ZUGANG_LIMIT = 256 * 1024
 # Optionen ohne eigenes Argument, die lokal nichts ausfuehren; alles andere (-e, -o, -F, -S, --rsh, ...) ist gesperrt.
@@ -325,7 +350,9 @@ class Profil:
         self.skillpfade = [os.path.realpath(p) for name in ('WB_SKILL_PFADE', 'WB_SKRIPT_PFADE')
                            for p in (umgebung.get(name) or '').split(os.pathsep) if p and os.path.isabs(p)]
         self.kontext = _kontext_aufloesen(_kontext_muster(grenze, self.home), self.projekt)
-        self.knowledge = os.path.realpath(os.path.join(self.home, 'Knowledge'))
+        # Im Zug ist $HOME ein Sandbox-Ordner; das Vault des Traegerhosts nennt WB_BRAIN_VAULT.
+        self.knowledge = verzeichnis('WB_BRAIN_VAULT') or os.path.realpath(os.path.join(self.home, 'Knowledge'))
+        self.brain_geheim = [os.path.join(self.knowledge, name) for name in BRAIN_GEHEIM]
         self.localbin = os.path.realpath(os.path.join(self.home, '.local', 'bin'))
 
     def lesewurzeln(self):
@@ -336,10 +363,7 @@ class Profil:
         return os.path.join(self.projekt, PROJEKT_ARBEIT) if self.projekt else None
 
     def schreibwurzeln(self):
-        result = [w for w in (self.projekt_arbeit(), self.worktree, self.eigenes, self.tmp) if w]
-        if self.stufe == 'hauptagent':
-            result.append(self.knowledge)
-        return result
+        return [w for w in (self.projekt_arbeit(), self.worktree, self.eigenes, self.tmp) if w]
 
     def kontext_trifft(self, real):
         for m in self.kontext:
@@ -355,6 +379,10 @@ class Profil:
         ausserhalb der Weltgrenze liegt oder geschuetzt ist."""
         if real in HARMLOSE_ZIELE:
             return
+        # casefold: auf einem Dateisystem ohne Gross-/Kleinschreibung ist 90-SECRETS derselbe Ordner.
+        kandidaten = {real.casefold(), (os.path.normpath(roh) if os.path.isabs(roh) else real).casefold()}
+        if any(_unter(k, geheim.casefold()) for k in kandidaten for geheim in self.brain_geheim):
+            raise Verweigert("'%s' liegt in einem Geheimordner des Brains; Agenten lesen ihn nie" % roh)
         if self.zugang_ordner and _unter(real, self.zugang_ordner):
             raise Verweigert("'%s' liegt im Zugangsordner des Zuges; Schluessel und Konfiguration liest nur ssh selbst"
                              % roh)
@@ -374,6 +402,9 @@ class Profil:
                     raise Verweigert("'%s' schreibt nur die Werkbank, nicht der Agent selbst" % roh)
                 return
             if not any(_unter(real, w) for w in self.schreibwurzeln()):
+                if _unter(real, self.knowledge):
+                    raise Verweigert("'%s' liegt im Brain; Notizen schreibt der Traeger ueber den Dienstweg "
+                                     "brain.notiz, nie ein Agent direkt" % roh)
                 if self.projekt and _unter(real, self.projekt):
                     raise Verweigert("'%s' liegt im Projekt ausserhalb von %s/; am Projekt arbeitet ein Agent in "
                                      "seinem eigenen Worktree" % (roh, PROJEKT_ARBEIT))
@@ -418,6 +449,90 @@ def zugaenge_laden(welt, ordner):
         gueltig, _generisch = muster_aufteilen([m for m in muster if m.split()[:1] and m.split()[0] in ZUGANG_PROGRAMME])
         if gueltig:
             result[name] = gueltig
+    return result
+
+
+def _zeitpunkt(wert):
+    import datetime
+    try:
+        zeit = datetime.datetime.fromisoformat(str(wert).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return zeit if zeit.tzinfo else zeit.replace(tzinfo=datetime.timezone.utc)
+
+
+def _freigaben_eintraege(welt):
+    """Eintraege aus <welt>/freigaben.json; unlesbar oder fremde Form eine leere Liste."""
+    try:
+        daten = json.loads(_datei_lesen(os.path.join(welt, 'freigaben.json'), FREIGABEN_LIMIT).decode('utf-8'))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return []
+    eintraege = daten.get('freigaben') if isinstance(daten, dict) and daten.get('version') == 1 else None
+    if not isinstance(eintraege, list):
+        return []
+    return [e for e in eintraege if isinstance(e, dict) and isinstance(e.get('id'), str)]
+
+
+def _werkzeug_von(e):
+    """Sendewerkzeug eines Eintrags; ohne Feld der Rueckfall, eine fremde Form None (der Eintrag gilt dann nie)."""
+    werkzeug = e.get('werkzeug')
+    if werkzeug is None:
+        return MAIL_WERKZEUG
+    return werkzeug if isinstance(werkzeug, str) and MAIL_WERKZEUG_RE.match(werkzeug) else None
+
+
+def mail_werkzeuge(welt):
+    """Programmnamen, deren `senden` eine Freigabe braucht: der Rueckfall und das Werkzeug jedes Eintrags, auch
+    widerrufener oder abgelaufener, damit ein entzogenes Konto nicht auf die Bash-Muster zurueckfaellt."""
+    namen = {MAIL_WERKZEUG}
+    if welt:
+        namen |= {w for w in map(_werkzeug_von, _freigaben_eintraege(welt)) if w}
+    return namen
+
+
+def mail_freigabe(welt, agent, jetzt=None, werkzeug=MAIL_WERKZEUG):
+    """Absenderadressen der gueltigen Freigaben `email` eines Agenten fuer ein Sendewerkzeug aus <welt>/freigaben.json
+    (dieselben Regeln wie agents_freigaben.gueltig); unlesbar oder ohne Treffer eine leere Liste."""
+    import datetime
+    jetzt = jetzt or datetime.datetime.now(datetime.timezone.utc)
+    eintraege = _freigaben_eintraege(welt)
+    nach_id = {e['id']: e for e in eintraege}
+
+    def adressen(e):
+        liste = e.get('adressen')
+        return [a.get('adresse') for a in liste if isinstance(a, dict) and isinstance(a.get('adresse'), str)] \
+            if isinstance(liste, list) else []
+
+    def gilt(e, tiefe=0):
+        if tiefe > FREIGABE_TIEFE or e.get('widerrufen') or e.get('art') != 'email':
+            return False
+        if e.get('ablauf'):
+            ende = _zeitpunkt(e['ablauf'])
+            if ende is None or ende <= jetzt:
+                return False
+        von = e.get('erteilt_von') if isinstance(e.get('erteilt_von'), dict) else {}
+        if e.get('quelle') is None:
+            return von.get('art') == 'mensch'
+        quelle = nach_id.get(e.get('quelle'))
+        if quelle is None or von.get('art') != 'agent' or quelle.get('inhaber') != von.get('id') \
+                or quelle.get('konto') != e.get('konto') or quelle.get('werkzeug') != e.get('werkzeug') \
+                or not set(adressen(e)) <= set(adressen(quelle)):
+            return False
+        if quelle.get('ablauf'):
+            ende, quellende = _zeitpunkt(e.get('ablauf') or ''), _zeitpunkt(quelle['ablauf'])
+            if ende is None or quellende is None or ende > quellende:
+                return False
+        # Im Zug ist nur das eigene agent.json eingebunden: ist das Profil des Gebers nicht lesbar, prueft das
+        # der Controller (agents_freigaben.gueltig mit Weltablage); ein lesbares Profil ohne Stufe hauptagent zaehlt nie.
+        geber = _agent_profil(welt, str(von.get('id')))
+        if geber is not None and geber.get('stage') != 'hauptagent':
+            return False
+        return gilt(quelle, tiefe + 1)
+
+    result = []
+    for e in eintraege:
+        if e.get('inhaber') == agent and _werkzeug_von(e) == werkzeug and gilt(e):
+            result += [a for a in adressen(e) if a not in result]
     return result
 
 
@@ -649,7 +764,15 @@ class Pruefung:
             if zugang is not None:
                 self.zugang(zugang, name, stage, idx, rest, varmap, cwd)
                 return cwd
-        if name not in funktionen:
+        if name == BRAIN_PROGRAMM and name not in funktionen:
+            if roh != BRAIN_PROGRAMM or not worte or worte[0] != 'search':
+                raise Verweigert("Vom Brain ist im Zug nur `brain search` erlaubt (nackter Programmname); "
+                                 "geschrieben wird ueber den Dienstweg brain.notiz")
+            for wort in rest[1:]:
+                self.zugriff(wort, varmap, cwd, 'lesen')
+            return cwd
+        mail = name not in funktionen and name in mail_werkzeuge(self.p.welt) and self.mail_senden(name, worte)
+        if name not in funktionen and not mail:
             self.muster(text, voll)
             if name == 'git':
                 self.git(stage[:idx], worte)
@@ -662,6 +785,25 @@ class Pruefung:
             self.zugriff(wort, varmap, cwd, art)
         return cwd
 
+
+    def mail_senden(self, werkzeug, worte):
+        """True fuer `<werkzeug> senden ...` mit gueltiger Freigabe email fuer dieses Werkzeug (dann ersetzt sie das
+        Muster); ohne Freigabe Verweigert. Andere Unterbefehle (lesen) laufen weiter ueber die Bash-Muster."""
+        unter = next((w for w in worte if not w.startswith('-')), None)
+        if unter != 'senden':
+            return False
+        adressen = mail_freigabe(self.p.welt, self.p.agent, werkzeug=werkzeug)
+        if not adressen:
+            raise Verweigert("'%s senden' braucht eine Freigabe email in freigaben.json der Welt; der Mensch "
+                             "erteilt sie mit 'wb-welt freigabe <welt> erteilen --art email ...', der Hauptagent "
+                             "gibt seine mit freigabe.weitergeben an dich weiter" % werkzeug)
+        for i, wort in enumerate(worte):
+            von = worte[i + 1] if wort == '--von' and i + 1 < len(worte) else (
+                wort.split('=', 1)[1] if wort.startswith('--von=') else None)
+            if von is not None and von.strip().lower() not in adressen:
+                raise Verweigert("Absender '%s' steht nicht in deiner Freigabe email (erlaubt: %s)"
+                                 % (von, ', '.join(adressen)))
+        return True
 
     def git(self, vorspann, worte):
         """git im eigenen Worktree: Stufenregeln fuer merge, keine Umlenkung von Konfiguration und Umgebung."""

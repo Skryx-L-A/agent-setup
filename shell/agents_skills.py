@@ -47,6 +47,8 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import agents_data as ad  # noqa: E402
+import agents_brain as ab  # noqa: E402
+import agents_gedaechtnis as ag  # noqa: E402
 
 AgentsError = ad.AgentsError
 
@@ -78,11 +80,17 @@ REQUIRED_SECTIONS = ("ausloeser", "vorgehen", "grenzen")
 SECTION_TITLES = {"ausloeser": "Auslöser", "vorgehen": "Vorgehen", "grenzen": "Grenzen"}
 TICKET_DIFF_LIMIT = 12000
 SHOW_TEXT_LIMIT = 64 * 1024
-LEARN_KINDS = ("lehre", "anweisung", "skill", "skript", "nichts")
+LEARN_KINDS = ("lehre", "notiz", "archiv", "anweisung", "skill", "skript", "nichts")
+# Lernschritte ins Brain (der Nutzer, 16.09.2026): der Traeger schreibt sie ueber agents_brain, ausserhalb der
+# Welttransaktion, weil Commit und Abgleich im Vault dauern koennen.
+BRAIN_KINDS = ("notiz", "archiv")
+LEARN_FIELDS = ("schema_version", "art", "ziel", "text", "grund", "diff", "titel", "thema", "anhaengen", "zeilen", "neu")
 LEARN_FILE = "lernschritt.json"
 LEARN_FILE_LIMIT = 256 * 1024
 LESSON_TEXT_LIMIT = 500
 REASON_LIMIT = 300
+# Notbremse in Bytes; die eigentliche Grenze ist agents_gedaechtnis.GRENZE (2.000 Zeichen, 15 Zeilen), deren
+# Ueberschreitung der Traeger mit dem Posten "Gedaechtnis kuerzen" beantwortet.
 MEMORY_LIMIT = 12 * 1024
 INSTRUCTIONS_LIMIT = 64 * 1024
 INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")
@@ -1689,15 +1697,15 @@ def read_learning_step(run_dir: str | os.PathLike[str]) -> Optional[dict[str, An
         raise AgentsError("lernschritt.json ist kein gueltiges JSON") from exc
     if not isinstance(data, dict):
         raise AgentsError("lernschritt.json muss ein Objekt sein")
-    unknown = sorted(set(data) - {"schema_version", "art", "ziel", "text", "grund", "diff"})
+    unknown = sorted(set(data) - set(LEARN_FIELDS))
     if unknown:
         raise AgentsError("Unbekannte Felder im Lernschritt: %s" % ", ".join(unknown))
     if data.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION:
         raise AgentsError("Unbekannte Schema-Version des Lernschritts")
     kind = data.get("art")
     if kind not in LEARN_KINDS:
-        raise AgentsError("Art des Lernschritts muss lehre, anweisung, skill, skript oder nichts sein")
-    for key in ("ziel", "text", "grund", "diff"):
+        raise AgentsError("Art des Lernschritts muss %s sein" % ", ".join(LEARN_KINDS))
+    for key in ("ziel", "text", "grund", "diff", "titel", "thema"):
         if key in data and data[key] is not None and not isinstance(data[key], str):
             raise AgentsError("Feld %s muss Text sein" % key)
     step: dict[str, Any] = {"art": kind, "sha256": hashlib.sha256(raw).hexdigest(), "zug": folder.name}
@@ -1714,6 +1722,31 @@ def read_learning_step(run_dir: str | os.PathLike[str]) -> Optional[dict[str, An
         if len(text) > LESSON_TEXT_LIMIT:
             raise AgentsError("Lehre ist laenger als %d Zeichen; Lehren sind kurz" % LESSON_TEXT_LIMIT)
         step.update(ziel="MEMORY.md", text=text)
+    elif kind == "notiz":
+        titel = " ".join((data.get("titel") or "").split())
+        if not titel:
+            raise AgentsError("Titel der Notiz fehlt")
+        if len(titel) > ab.TITEL_LIMIT:
+            raise AgentsError("Titel ist laenger als %d Zeichen" % ab.TITEL_LIMIT)
+        text = (data.get("text") or "").strip("\n")
+        if not text.strip():
+            raise AgentsError("Text der Notiz fehlt")
+        if len(text.encode("utf-8")) > ab.TEXT_LIMIT:
+            raise AgentsError("Notiz ist groesser als %d Bytes" % ab.TEXT_LIMIT)
+        if data.get("anhaengen") is not None and not isinstance(data["anhaengen"], bool):
+            raise AgentsError("anhaengen muss true oder false sein")
+        thema = " ".join((data.get("thema") or "").split()) or None
+        step.update(ziel="brain", titel=titel, text=text, thema=thema, anhaengen=bool(data.get("anhaengen")))
+    elif kind == "archiv":
+        zeilen = data.get("zeilen")
+        if not isinstance(zeilen, list) or not zeilen or len(zeilen) > ag.AUSWAHL_LIMIT or not all(
+                isinstance(item, (int, str)) and not isinstance(item, bool) for item in zeilen):
+            raise AgentsError("zeilen nennt 1 bis %d Zeilen (Nummer oder genauer Text)" % ag.AUSWAHL_LIMIT)
+        neu = data.get("neu")
+        if neu is not None and (not isinstance(neu, list) or len(neu) > ag.NEU_LIMIT
+                                or not all(isinstance(item, str) for item in neu)):
+            raise AgentsError("neu ist eine Liste mit hoechstens %d Zeilen" % ag.NEU_LIMIT)
+        step.update(ziel="lehren.md", zeilen=list(zeilen), neu=list(neu or []))
     elif kind == "anweisung":
         target = data.get("ziel") or "AGENTS.md"
         if target not in INSTRUCTION_FILES:
@@ -1757,14 +1790,37 @@ def _apply_lesson(root: Path, agent_id: str, step: dict[str, Any], date: str) ->
     line = "- %s: %s Grund: %s" % (date, step["text"], step["grund"])
     if any(existing.endswith(": %s Grund: %s" % (step["text"], step["grund"])) for existing in before.split("\n")):
         return {"status": "vorhanden"}
-    after = _add_lesson(before, line)
+    after = ag.normalisieren(_add_lesson(before, line), agent_id)
     if len(after.encode("utf-8")) > MEMORY_LIMIT:
         return {"status": "abgewiesen",
                 "fehler": "MEMORY.md waere groesser als %d Bytes; erst Altes zusammenfassen" % MEMORY_LIMIT}
     ad._write_text(path, after)
-    return {"status": "angewendet", "zeile": line,
-            "sha256_vorher": hashlib.sha256(before.encode("utf-8")).hexdigest(),
-            "sha256_nachher": hashlib.sha256(after.encode("utf-8")).hexdigest()}
+    result = {"status": "angewendet", "zeile": line,
+              "sha256_vorher": hashlib.sha256(before.encode("utf-8")).hexdigest(),
+              "sha256_nachher": hashlib.sha256(after.encode("utf-8")).hexdigest()}
+    if ag.messen(after)["ueber_grenze"]:
+        # Die Lehre geht nicht verloren; der naechste Zug ist "Gedaechtnis kuerzen" (agents_traeger).
+        result.update(ueber_grenze=True, hinweis="MEMORY.md ist ueber der Grenze von %d Zeichen oder %d Zeilen; "
+                                                 "der naechste Zug kuerzt es" % (ag.GRENZE_ZEICHEN, ag.GRENZE_ZEILEN))
+    return result
+
+
+def _apply_brain_step(root: Path, agent_id: str, step: dict[str, Any], run_name: str, date: str,
+                      brain: Any) -> dict[str, Any]:
+    """Lernschritte notiz und archiv: ins Brain ueber agents_brain, ausserhalb der Welttransaktion."""
+    if not brain:
+        return {"status": "abgewiesen", "fehler": "Kein Brain-Vault auf diesem Traeger eingerichtet"}
+    try:
+        if step["art"] == "notiz":
+            result = ab.notiz(brain, root, agent_id, step["titel"], step["text"], thema=step.get("thema"),
+                              anhaengen=bool(step.get("anhaengen")), zug=run_name, datum=date)
+            return {"status": "angewendet", "brain": {key: result.get(key) for key in ("rel", "status", "commit", "sync")}}
+        result = ag.archivieren(root, agent_id, step["zeilen"], brain, zug=run_name, neu=step.get("neu"), datum=date)
+        brain_result = result.pop("brain")
+        result["brain"] = {key: brain_result.get(key) for key in ("rel", "status", "commit", "sync")}
+        return result
+    except (AgentsError, OSError, ValueError) as exc:
+        return {"status": "abgewiesen", "fehler": str(exc)[:300]}
 
 
 def _apply_instruction(root: Path, agent_id: str, step: dict[str, Any]) -> dict[str, Any]:
@@ -1834,7 +1890,8 @@ def _apply_skill_change(root: Path, agent_id: str, step: dict[str, Any],
 
 
 def apply_learning_step(root: Path, agent_id: str, run_dir: str | os.PathLike[str], *,
-                        library: str | os.PathLike[str] | None = None, date: str | None = None) -> dict[str, Any]:
+                        library: str | os.PathLike[str] | None = None, date: str | None = None,
+                        brain: str | os.PathLike[str] | None = None) -> dict[str, Any]:
     """Check and apply the learning step a turn left in its run directory.
 
     Result ``status``: ``fehlt`` (no file), ``ungueltig``, ``nichts``, ``angewendet``,
@@ -1856,6 +1913,12 @@ def apply_learning_step(root: Path, agent_id: str, run_dir: str | os.PathLike[st
         return {"status": "fehlt", "agent": agent_id, "zug": folder.name}
     step_id = ad.derived_id("lern", agent_id, folder.name, step["sha256"][:16])
     date = date or ad.now()[:10]
+    brain_outcome = None
+    if not step.get("fehler") and step["art"] in BRAIN_KINDS:
+        ad.read_agent(root, agent_id)
+        known = ad._read_optional_json(ad._agent_dir(root, agent_id) / "history.json", "Verlauf") or {}
+        if not any(entry.get("id") == step_id for entry in known.get("entries") or []):
+            brain_outcome = _apply_brain_step(root, agent_id, step, folder.name, date, brain)
     with ad.transaction(root):
         ad.read_agent(root, agent_id)
         history = ad._read_optional_json(ad._agent_dir(root, agent_id) / "history.json", "Verlauf") or {}
@@ -1868,6 +1931,8 @@ def apply_learning_step(root: Path, agent_id: str, run_dir: str | os.PathLike[st
                     outcome = {"status": "nichts"}
                 elif step["art"] == "lehre":
                     outcome = _apply_lesson(root, agent_id, step, date)
+                elif step["art"] in BRAIN_KINDS:
+                    outcome = brain_outcome or _apply_brain_step(root, agent_id, step, folder.name, date, None)
                 elif step["art"] == "anweisung":
                     outcome = _apply_instruction(root, agent_id, step)
                 else:
@@ -1875,7 +1940,8 @@ def apply_learning_step(root: Path, agent_id: str, run_dir: str | os.PathLike[st
             except AgentsError as exc:
                 outcome = {"status": "abgewiesen", "fehler": str(exc)}
             stored = {"id": step_id, "time": ad.now(), "event": "lernschritt", "art": step.get("art"),
-                      "ziel": step.get("ziel"), "grund": step.get("grund"), "text": step.get("text"),
+                      "ziel": step.get("ziel"), "grund": step.get("grund"),
+                      "text": step.get("text") if step.get("art") != "notiz" else step.get("titel"),
                       "zug": folder.name, "sha256": step["sha256"],
                       "actor": {"id": agent_id, "verified": False, "source": "lernschritt"}}
             stored.update(outcome)

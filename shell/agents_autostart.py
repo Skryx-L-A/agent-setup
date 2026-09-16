@@ -37,10 +37,10 @@ PLIST_LABEL = "de.werkbank.agents.autostart"
 ZUSTAND = Path("~/.local/state/werkbank-agents")
 LAUFZEIT = Path("~/.local/share/werkbank-agents/laufzeit")
 # Was die Laufzeit braucht: Traeger, Daten, Lauf, Proxy, Runner, Skills, Sperren und die Befehle.
-SHELL_DATEIEN = ("agents_autostart.py", "agents_claude.py", "agents_claude_lauf.py", "agents_claude_runner.py",
+SHELL_DATEIEN = ("agents_autostart.py", "agents_brain.py", "agents_claude.py", "agents_claude_lauf.py", "agents_claude_runner.py",
                  "agents_codex.py", "agents_codex_runner.py", "agents_controller.py", "agents_controller_endpoint.py",
-                 "agents_data.py", "agents_denkstufe.py",
-                 "agents_fernweg.py", "agents_kontingent.py", "agents_lauf.py", "agents_linux.py",
+                 "agents_data.py", "agents_denkstufe.py", "agents_freigaben.py",
+                 "agents_fernweg.py", "agents_gedaechtnis.py", "agents_kontingent.py", "agents_lauf.py", "agents_linux.py",
                  "agents_model_bridge.py", "agents_model_proxy.py", "agents_modellwahl.py", "agents_pi.py", "agents_pi_runner.py",
                  "agents_rpc_client.py", "agents_skills.py", "agents_skills_ansicht.py", "agents_traeger.py",
                  "agents_traeger_wecken.py", "agents_wecker.py", "agents_weltauftrag.py", "agents_weltumzug.py",

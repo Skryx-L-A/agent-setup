@@ -21,6 +21,12 @@ statt der Einzelfreigabe eine Befugnis JE ADRESSE; die Tabelle steht in
 `~/AI/myproject/COMPLIANCE.md`, Abschnitt „Sendebefugnis je Adresse". Für Gmail und GMX bleibt
 die Einzelfreigabe oben unverändert.
 
+**Agenten der Welt myproject (2026-09-16):** Der Hauptagent der Welt myproject hat für die Myproject-Adressen
+dieselben Sendebefugnisse wie der Orchestrator (Spalte „Ohne Rückfrage" der Tabelle) und gibt sie an
+einzelne Agenten weiter, nie weiter als seine eigene. Agenten senden nur über `<ein eigenes Mailwerkzeug> senden` mit
+einer Freigabe `email` in `freigaben.json` ihrer Welt; jede Sendung steht in `mail-versand.jsonl`. Die
+Regel im Wortlaut steht in `regeln/agenten.md`, Abschnitt „Zugänge".
+
 **Weitere Dauer-Freigaben für automatische Läufe** — der Myproject-Gesundheitswächter und die
 Scout-Agenten auf Peer-Rechner mit ihrer Empfänger-Whitelist — stehen im Wortlaut in
 `regeln/werkzeuge.md`, zusammen mit den Konten, dem Nachweis über

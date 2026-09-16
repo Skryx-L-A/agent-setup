@@ -574,7 +574,11 @@ def create_agent(root: Path, agent_id: str, stage: str, team: str | None,
             (stage_path / "postfach").mkdir()
             _write_json(stage_path / "agent.json", profile)
             _write_json(stage_path / "runtime.json", {"state": "aktiv", "updated_at": ts, "reason": None})
-            memory = "# %s – Gedächtnis\n\nNoch keine Einträge.\n" % agent_id
+            try:
+                import agents_gedaechtnis
+                memory = agents_gedaechtnis.vorlage(agent_id)
+            except ImportError:  # the RPC copy in a turn carries no memory module
+                memory = "# %s – Gedächtnis\n\nNoch keine Einträge.\n" % agent_id
             if atomar_schreiben is not None:
                 atomar_schreiben.schreiben(str(stage_path / "MEMORY.md"), memory, modus=0o600)
             else:
@@ -1705,7 +1709,8 @@ def _limits_lines(draft: dict[str, Any], zugaenge: Iterable[str] = ()) -> list[s
         lines.append("- Zugänge: %s." % ", ".join("%s (ssh) – `ssh %s <befehl>`" % (name, name) for name in zugaenge))
     lines += ["- Kein Eingriff außerhalb der Welt%s. Freigaben, Regeln und Profile erweiterst du nicht." % (
                   " außer über die Zugänge" if zugaenge else ""),
-              "- Deploy, Veröffentlichung, E-Mail und Ausgaben nur mit bestehender Freigabe (`wb-freigabe pruefen`).",
+              "- Deploy, Veröffentlichung, E-Mail und Ausgaben nur mit bestehender Freigabe in `freigaben.json` "
+              "der Welt (Mail: Abschnitt „Mail senden“; der Hauptagent sieht sie mit `freigabe.liste`).",
               "- Die Regeln für Agenten stehen in `regeln/agenten.md`."]
     return lines
 
@@ -1754,7 +1759,9 @@ def render_agent_instructions(root: Path, draft: dict[str, Any]) -> str:
              "- Du arbeitest an Tickets und Nachrichten, die an dich adressiert sind.",
              "- Ein Zug endet mit einer Entscheidung: fertig, Weckzeit, Übergabe oder „braucht dich“ über den Dienstweg.",
              "- Ergebnisse gehören ins Ticket, nicht in den Kanal. Nachrichten tragen Adressat und Handlung, kein Statusverkehr.",
-             "- Dein Gedächtnis ist `MEMORY.md` in deinem Agentenordner. Du pflegst es selbst.", "",
+             "- Dein Gedächtnis ist `MEMORY.md` in deinem Agentenordner. Du pflegst es selbst.",
+             "- Ins Gedächtnis nur das Wichtigste (höchstens 2.000 Zeichen, 15 Zeilen); Ausführliches und Hergang als "
+             "Notiz ins Brain, vor der Arbeit `brain search`.", "",
              "## Meldewege", ""]
     if stage == "mitglied":
         target = leader or main or "den Hauptagenten"
@@ -1766,7 +1773,8 @@ def render_agent_instructions(root: Path, draft: dict[str, Any]) -> str:
                   "- Einen neuen Agenten beantragst du mit `wb-agent antrag`; die Entscheidung trifft der Hauptagent."]
     else:
         lines += ["- Du verteilst Tickets, nimmst ab, führst zusammen und legst Agenten an.",
-                  "- Den Menschen fragst du nur in den Fällen aus `regeln/agenten.md`; alles andere entscheidest du und schreibst es ins Ticket."]
+                  "- Den Menschen fragst du nur in den Fällen aus `regeln/agenten.md`; alles andere entscheidest du und schreibst es ins Ticket.",
+                  "- Mail-Freigaben, die du hältst, gibst du mit `freigabe.weitergeben` an einzelne Agenten weiter, nie weiter als deine eigene; zurück nimmst du sie mit `freigabe.entziehen`."]
     # The limits close the file behind the mark, exactly as for an own instruction file.
     try:
         zugaenge = world_access_names(root)
@@ -2232,8 +2240,26 @@ def _read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
     return items
 
 
+def _snapshot_memory(root: Path, agent_id: str, memory: dict[str, Any], vault: Any) -> dict[str, Any] | None:
+    """Groesse des Gedaechtnisses und Brain-Bereich (der Nutzer, 16.09.2026); die volle Datei, nicht nur der Auszug."""
+    try:
+        import agents_gedaechtnis
+    except ImportError:  # the RPC copy in a turn carries no memory module
+        return None
+    try:
+        text = None if memory.get("truncated") else memory.get("text") or ""
+        return agents_gedaechtnis.stand(root, agent_id, vault, text=text)
+    except (AgentsError, OSError, ValueError):
+        return None
+
+
 def _snapshot_agents(root: Path, limit: int, text_limit: int) -> list[dict[str, Any]]:
     result = []
+    try:
+        import agents_gedaechtnis
+        vault = agents_gedaechtnis.welt_vault(root)
+    except ImportError:
+        vault = None
     for item in _visible_dirs(root / "agents", "Agentordner"):
         profile = _read_optional_json(item / "agent.json", "Profil")
         if profile is None:
@@ -2247,6 +2273,7 @@ def _snapshot_agents(root: Path, limit: int, text_limit: int) -> list[dict[str, 
         agent["postbox"] = {"open": len(unacknowledged), "total": len(deliveries),
                             "open_ids": [d.get("delivery_id") or d.get("id") for d in unacknowledged][-limit:]}
         agent["memory"] = _read_text_capped(item / "MEMORY.md", text_limit)
+        agent["gedaechtnis"] = _snapshot_memory(root, profile.get("id") or item.name, agent["memory"], vault)
         agent["instructions"] = _read_text_capped(item / "AGENTS.md", text_limit)
         agent["history"] = {"entries": entries[-limit:], "total": len(entries)}
         result.append(agent)
@@ -2515,6 +2542,18 @@ def parser_for(kind: str) -> argparse.ArgumentParser:
             agents_zugaenge = None
         if agents_zugaenge is not None:
             agents_zugaenge.parser_ergaenzen(sub)
+        try:
+            import agents_freigaben
+        except ImportError:  # the RPC copy in a turn carries no release module either
+            agents_freigaben = None
+        if agents_freigaben is not None:
+            agents_freigaben.parser_ergaenzen(sub)
+        try:
+            import agents_gedaechtnis
+        except ImportError:  # the RPC copy in a turn carries no memory module
+            agents_gedaechtnis = None
+        if agents_gedaechtnis is not None:
+            agents_gedaechtnis.parser_ergaenzen(sub)
         return parser
     if kind == "agent":
         p = sub.add_parser("neu"); p.add_argument("world"); p.add_argument("--name", required=True); p.add_argument("--stufe", required=True, choices=STAGES); p.add_argument("--team"); p.add_argument("--beschreibung", required=True); p.add_argument("--figur"); p.add_argument("--werkzeug", action="append", default=[]); p.add_argument("--skill", action="append", default=[]); p.add_argument("--modell"); p.add_argument("--denkweise"); p.add_argument("--fallback"); p.add_argument("--fallback-denkweise"); p.add_argument("--maschine"); p.add_argument("--absender", default="cli-operator"); p.add_argument("--rolle"); p.add_argument("--json", action="store_true")
@@ -2582,6 +2621,15 @@ def run(kind: str, argv: list[str]) -> int:
             elif args.command == "neu": data = create_world(Path(args.world), args.name, args.hauptagent, args.beschreibung, args.modell, args.denkweise, args.fallback, args.fallback_denkweise, args.maschine, args.global_world, not args.without_main); _json_or_text(args, data, data["world"]["id"])
             elif args.command == "liste": _json_or_text(args, [read_world(Path(args.world))] if (Path(args.world) / "world.json").exists() else [])
             elif args.command == "zeigen": _json_or_text(args, read_world(Path(args.world)))
+            elif args.command == "freigabe":
+                import agents_freigaben
+                agents_freigaben.ausgeben(args, agents_freigaben.cli(args))
+            elif args.command == "mailkonto":
+                import agents_freigaben
+                agents_freigaben.mailkonto_cli(args)
+            elif args.command == "gedaechtnis":
+                import agents_gedaechtnis
+                agents_gedaechtnis.cli(args)
             elif args.command == "zugang":
                 import agents_zugaenge
                 data = agents_zugaenge.cli(args)
