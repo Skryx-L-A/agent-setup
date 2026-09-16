@@ -44,7 +44,7 @@ SHELL_DATEIEN = ("agents_autostart.py", "agents_claude.py", "agents_claude_lauf.
                  "agents_model_bridge.py", "agents_model_proxy.py", "agents_pi.py", "agents_pi_runner.py",
                  "agents_rpc_client.py", "agents_skills.py", "agents_skills_ansicht.py", "agents_traeger.py",
                  "agents_traeger_wecken.py", "agents_wecker.py", "agents_weltauftrag.py", "agents_weltumzug.py",
-                 "agents_zugaenge.py",
+                 "agents_worktree.py", "agents_zugaenge.py",
                  "atomar_schreiben.py", "wb-agent", "<ein eigenes Mailwerkzeug>", "wb-kanal", "wb-profil",
                  "wb-profil-gesperrt.json", "<ein eigenes Mailwerkzeug>", "wb-skill", "wb-ticket", "wb-welt")
 HOOK_DATEIEN = ("skills-sperre.sh", "profil-sperre.sh", "lib/cmdshell.py", "lib/skills_sperre.py",

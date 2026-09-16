@@ -75,6 +75,8 @@ contextBridge.exposeInMainWorld('awbBridge', {
     ipcRenderer.invoke('awb:aufgabe', String(befehl), { echt: opt.echt === true, bestaetigt: opt.bestaetigt === true }),
   // Zeigt die Oberflaeche die Ansicht? Verborgen taktet der Kern mit 30 statt 2 s.
   aufgabenSichtbar: (an: boolean) => ipcRenderer.send('awb:aufgaben-sichtbar', an === true),
+  // Auftrag agentsform: der Ordnerdialog fuer eine neue Welt; `echt` aus `isTrusted`, sonst kein Dialog.
+  weltOrdnerWaehlen: (echt: boolean) => ipcRenderer.invoke('awb:welt-ordner', echt === true),
   // Schritt 7: das HTML einer uebernommenen Seite, fertig gerendert.
   onSeite: (fn: (p: unknown) => void) => ipcRenderer.on('awb:seite', (_e, p) => fn(p)),
   // Reste-Auftrag Punkt 3: die Datei hinter einer Seite hat sich von aussen

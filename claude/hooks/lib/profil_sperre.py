@@ -31,9 +31,12 @@ Vier Pruefungen:
                   Umgebung, ~/Knowledge, ~/.local/bin; Programme zusaetzlich
                   aus den Systemordnern und den PATH-Ordnern ausserhalb von
                   $HOME;
-       schreiben: Projektordner, Worktree, eigenes Agentenverzeichnis, das
-                  eigene Temp-Verzeichnis (WB_AGENT_TMP); der Hauptagent
-                  zusaetzlich ~/Knowledge. In der Weltablage nur das eigene
+       schreiben: im Projektordner nur der gemeinsame Ordner work/, dazu
+                  Worktree (der private Arbeitsordner, darin der git-Worktree
+                  des Agenten), eigenes Agentenverzeichnis, das eigene
+                  Temp-Verzeichnis (WB_AGENT_TMP); der Hauptagent zusaetzlich
+                  ~/Knowledge. Nie in einen git-Verwaltungsordner (.git): dort
+                  schreibt nur git selbst. In der Weltablage nur das eigene
                   Agentenverzeichnis (eigene skills/ und skripte/ darin),
                   und dort nie agent.json, skills.json, history.json,
                   runtime.json oder das Postfach; freigaben.json und
@@ -47,6 +50,15 @@ Vier Pruefungen:
      rsync frei, aber nur ueber den nackten Programmnamen (die Huelle des
      Zuges), ohne Wrapper, Variablen, Umleitung von PATH oder fremde Optionen;
      der Zugangsordner selbst ist fuer jeden Zugriff gesperrt.
+  5. git im eigenen Worktree (Entscheidung vom 16.09.2026; docs/AGENTS-TRAEGER.md,
+     "Worktree je Agent"), zusaetzlich zu den Mustern: `git merge` nur fuer
+     Teamleiter (Zweige agent/<id> von Mitgliedern des eigenen Teams) und den
+     Hauptagenten (jeder Agentenzweig); kein `git worktree`, kein `git switch`,
+     `git checkout` nur als `git checkout -- <pfade>`; `git rebase` ohne
+     --exec, ohne -i und ohne zweiten Zweig; keine Konfiguration ueber -c,
+     --config-env, --exec-path, --git-dir, --work-tree oder --namespace und
+     keine Aenderung von GIT_*-Variablen (setzen, unset, env -i, exec -c):
+     sie kommen aus der Einstellungsdatei des Zuges und schalten Hooks ab.
 
 Die Bash-Zerlegung ist lib/cmdshell.py. Grenzen: siehe hooks/README.md.
 """
@@ -94,6 +106,18 @@ SYSTEM_PROGRAMME = ('/bin', '/usr/bin', '/usr/sbin', '/sbin', '/usr/local/bin', 
 GESCHUETZT_EIGEN = {'agent.json', 'skills.json', 'history.json', 'runtime.json'}
 GESCHUETZT_UEBERALL = {'freigaben.json', 'traeger.json', 'zugaenge.json'}
 ZUGANG_PROGRAMME = {'ssh', 'scp', 'rsync'}
+# Gemeinsamer Ordner des Projekts (agents_traeger.PROJEKT_ARBEITSORDNER); sonst ist das Projekt nur lesbar.
+PROJEKT_ARBEIT = 'work'
+GIT_UMGEBUNG_RE = re.compile(r'^GIT_[A-Za-z0-9_]*(=|$)')
+GIT_GLOBAL_GESPERRT = ('-c', '--config-env', '--exec-path', '--git-dir', '--work-tree', '--namespace')
+# Umgebung leeren oder Variablen entfernen: env -i/-/-u, exec -c.
+UMGEBUNG_LEEREN = ('-i', '-', '--ignore-environment', '-u', '--unset', '-c')
+AGENTENZWEIG_RE = re.compile(r'^agent/([A-Za-z0-9][A-Za-z0-9._-]{0,63})$')
+MERGE_MIT_WERT = {'-m', '--message', '-F', '--file', '-X', '--strategy-option', '--into-name', '--cleanup'}
+REBASE_OPTIONEN = {'--continue', '--abort', '--skip', '--quit', '-q', '--quiet', '-v', '--verbose', '--stat', '-n',
+                   '--no-stat', '-m', '--merge', '--keep-empty', '--no-keep-empty', '--ignore-date',
+                   '--committer-date-is-author-date', '--reset-author-date', '--no-ff', '--force-rebase', '-f',
+                   '--no-autostash', '--no-verify'}
 ZUGANG_NAME_RE = re.compile(r'^[a-z][a-z0-9-]{0,39}$')
 ZUGANG_LIMIT = 256 * 1024
 # Optionen ohne eigenes Argument, die lokal nichts ausfuehren; alles andere (-e, -o, -F, -S, --rsh, ...) ist gesperrt.
@@ -265,6 +289,7 @@ class Profil:
         self.agent = agent
         self.home = os.path.realpath(os.path.expanduser('~'))
         self.stufe = daten.get('stage')
+        self.team = daten.get('team')
         tools = daten.get('tools')
         bash = daten.get('bash') if daten.get('bash') is not None else []
         grenze = daten.get('context_limit') or ''
@@ -307,8 +332,11 @@ class Profil:
         return [w for w in [self.projekt, self.worktree, self.welt, self.tmp, self.bibliothek, self.skriptbibliothek,
                             self.knowledge, self.localbin] + self.skillpfade if w]
 
+    def projekt_arbeit(self):
+        return os.path.join(self.projekt, PROJEKT_ARBEIT) if self.projekt else None
+
     def schreibwurzeln(self):
-        result = [w for w in (self.projekt, self.worktree, self.eigenes, self.tmp) if w]
+        result = [w for w in (self.projekt_arbeit(), self.worktree, self.eigenes, self.tmp) if w]
         if self.stufe == 'hauptagent':
             result.append(self.knowledge)
         return result
@@ -336,6 +364,8 @@ class Profil:
         if art == 'schreiben':
             if os.path.basename(real) in GESCHUETZT_UEBERALL:
                 raise Verweigert("'%s' ist eine Freigabe- oder Traegerdatei; Agenten schreiben sie nie" % roh)
+            if (os.sep + '.git' + os.sep) in (real + os.sep):
+                raise Verweigert("'%s' liegt in einem git-Verwaltungsordner; dort schreibt nur git selbst" % roh)
             if _unter(real, self.welt):
                 if not _unter(real, self.eigenes) or real == self.eigenes:
                     raise Verweigert("'%s' liegt in der Weltablage ausserhalb des eigenen Agentenverzeichnisses" % roh)
@@ -344,7 +374,10 @@ class Profil:
                     raise Verweigert("'%s' schreibt nur die Werkbank, nicht der Agent selbst" % roh)
                 return
             if not any(_unter(real, w) for w in self.schreibwurzeln()):
-                raise Verweigert("'%s' liegt ausserhalb von Projekt, Worktree und Agentenverzeichnis" % roh)
+                if self.projekt and _unter(real, self.projekt):
+                    raise Verweigert("'%s' liegt im Projekt ausserhalb von %s/; am Projekt arbeitet ein Agent in "
+                                     "seinem eigenen Worktree" % (roh, PROJEKT_ARBEIT))
+                raise Verweigert("'%s' liegt ausserhalb von work/ des Projekts, Worktree und Agentenverzeichnis" % roh)
             return
         wurzeln = self.lesewurzeln()
         if art == 'ausfuehren':
@@ -556,9 +589,13 @@ class Pruefung:
         if name is None:
             if any(t.startswith('IFS=') for t in stage):
                 raise Verweigert('IFS-Aenderung ist nicht sicher aufloesbar')
+            _git_umgebung_pruefen(stage)
             return cwd
         if name in (cs.SUBSHELL_TOKEN, cs.PROCSUB_TOKEN):
             return cwd
+        _git_umgebung_pruefen(stage[:idx])
+        if name in ZUWEISUNGS_BEFEHLE or name == 'unset':
+            _git_umgebung_pruefen(rest)
         roh = _variablen(stage[idx], varmap)
         worte = [_variablen(t, varmap) for t in rest]
         text = ' '.join([name] + worte)
@@ -614,6 +651,8 @@ class Pruefung:
                 return cwd
         if name not in funktionen:
             self.muster(text, voll)
+            if name == 'git':
+                self.git(stage[:idx], worte)
         schreibend = name in MUTIERENDE or (name in MIT_I_OPTION and any(w.startswith('-i') for w in worte))
         positionen = [w for w in rest if not (w.startswith('-') and not (w.startswith('--') and '=' in w))]
         for n, wort in enumerate(positionen):
@@ -623,6 +662,72 @@ class Pruefung:
             self.zugriff(wort, varmap, cwd, art)
         return cwd
 
+
+    def git(self, vorspann, worte):
+        """git im eigenen Worktree: Stufenregeln fuer merge, keine Umlenkung von Konfiguration und Umgebung."""
+        if any(t in UMGEBUNG_LEEREN or t.startswith(('--unset=', '-u')) for t in vorspann if t.startswith('-')):
+            raise Verweigert('git laeuft nur mit der Umgebung des Zuges (kein env -i, env -u oder exec -c davor)')
+        i = 0
+        while i < len(worte) and worte[i].startswith('-'):
+            if worte[i].split('=', 1)[0] in GIT_GLOBAL_GESPERRT or worte[i].startswith('-c'):
+                raise Verweigert("git-Option '%s' lenkt Konfiguration oder Repo um und ist im Zug gesperrt" % worte[i])
+            i += 1 + (worte[i] == '-C')
+        if i >= len(worte):
+            return
+        befehl, args = worte[i], worte[i + 1:]
+        if befehl == 'worktree':
+            raise Verweigert('git worktree ist Sache des Traegers; jeder Agent hat genau seinen Worktree')
+        if befehl == 'switch' or (befehl == 'checkout' and args[:1] != ['--']):
+            raise Verweigert('Kein Wechsel auf andere Zweige: der Agent bleibt auf agent/%s; Dateien stellt '
+                             "'git checkout -- <pfade>' zurueck" % self.p.agent)
+        if befehl == 'merge':
+            self.git_merge(args)
+        elif befehl == 'rebase':
+            self.git_rebase(args)
+
+    def git_merge(self, args):
+        if self.p.stufe not in ('teamleiter', 'hauptagent'):
+            raise Verweigert('Zusammengefuehrt wird nur durch Teamleiter oder Hauptagent')
+        ziele, i = [], 0
+        while i < len(args):
+            wort = args[i]
+            if wort in MERGE_MIT_WERT:
+                i += 2
+                continue
+            if wort in ('-s', '--strategy') or wort.startswith('--strategy='):
+                raise Verweigert('git merge mit eigener Strategie ist im Zug gesperrt')
+            if not wort.startswith('-'):
+                ziele.append(wort)
+            i += 1
+        if not ziele and not any(w in ('--abort', '--continue', '--quit') for w in args):
+            raise Verweigert('git merge nennt keinen Agentenzweig agent/<id>')
+        for ziel in ziele:
+            treffer = AGENTENZWEIG_RE.match(ziel)
+            if treffer is None:
+                raise Verweigert("git merge fuehrt nur Agentenzweige zusammen (agent/<id>), nicht '%s'" % ziel)
+            if self.p.stufe == 'teamleiter' and treffer.group(1) != self.p.agent:
+                anderer = _agent_profil(self.p.welt, treffer.group(1))
+                if anderer is None or anderer.get('stage') != 'mitglied' or not self.p.team \
+                        or anderer.get('team') != self.p.team:
+                    raise Verweigert("'%s' gehoert keinem Mitglied des Teams '%s'; Teamleiter fuehren nur Zweige "
+                                     "ihres Teams zusammen" % (ziel, self.p.team))
+
+    def git_rebase(self, args):
+        positionen, i = [], 0
+        while i < len(args):
+            wort = args[i]
+            if wort == '--onto':
+                i += 2
+                continue
+            if wort.startswith('-'):
+                if wort not in REBASE_OPTIONEN and not wort.startswith(('--onto=', '--empty=')):
+                    raise Verweigert("git rebase '%s' ist im Zug gesperrt (kein --exec, kein -i)" % wort)
+            else:
+                positionen.append(wort)
+            i += 1
+        if len(positionen) > 1:
+            raise Verweigert('git rebase mit einem zweiten Zweig wechselt den Arbeitsbaum; der Agent bleibt auf '
+                             'agent/%s' % self.p.agent)
 
     def zugang_treffer(self, text, voll):
         for zugang, muster in sorted(self.p.zugaenge.items()):
@@ -688,6 +793,25 @@ class Pruefung:
             self.zugriff(wort, varmap, cwd, art, immer=True)
         if not entfernt:
             raise Verweigert("%s ueber den Zugang '%s' braucht ein Ziel '%s:<pfad>'" % (name, zugang, zugang))
+
+
+def _git_umgebung_pruefen(tokens):
+    """GIT_*-Variablen kommen aus der Einstellungsdatei des Zuges (Hooks aus, Identitaet); kein Befehl aendert sie."""
+    for token in tokens:
+        if GIT_UMGEBUNG_RE.match(token):
+            raise Verweigert("'%s' aendert eine GIT_*-Variable des Zuges" % token)
+
+
+def _agent_profil(welt, agent):
+    """agent.json eines anderen Agenten derselben Welt, None wenn nicht lesbar."""
+    pfad = os.path.join(welt, 'agents', agent, 'agent.json')
+    if not ID_RE.fullmatch(agent) or os.path.islink(os.path.join(welt, 'agents', agent)):
+        return None
+    try:
+        daten = json.loads(_datei_lesen(pfad, PROFIL_LIMIT).decode('utf-8'))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return daten if isinstance(daten, dict) else None
 
 
 def _unbestimmt(wort, varmap):

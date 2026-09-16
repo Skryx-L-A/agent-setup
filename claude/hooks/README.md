@@ -774,8 +774,8 @@ Maßgeblich ist `<WB_WELT>/agents/<id>/agent.json`, geprüft in drei Stufen:
 |---|---|
 | lesen | Projektordner, Worktree, Weltablage, eigenes Temp-Verzeichnis, Skill- und Skriptpfade und beide Bibliotheken, `~/Knowledge`, `~/.local/bin` |
 | ausführen | wie lesen, dazu `/bin`, `/usr/bin`, `/usr/sbin`, `/sbin`, `/usr/local/bin`, `/usr/libexec` und die Ordner aus `PATH` außerhalb von `$HOME` |
-| schreiben | Projektordner, Worktree, eigenes Agentenverzeichnis, eigenes Temp-Verzeichnis; Hauptagent zusätzlich `~/Knowledge` |
-| nie schreiben | in der Weltablage alles außer dem eigenen Agentenverzeichnis; dort `agent.json`, `skills.json`, `history.json`, `runtime.json`, `postfach/`; überall `freigaben.json` und `traeger.json` |
+| schreiben | im Projektordner nur `work/`, dazu Worktree (`WB_AGENT_WORKTREE`, der private Arbeitsordner mit dem git-Worktree darin), eigenes Agentenverzeichnis, eigenes Temp-Verzeichnis; Hauptagent zusätzlich `~/Knowledge` |
+| nie schreiben | in der Weltablage alles außer dem eigenen Agentenverzeichnis; dort `agent.json`, `skills.json`, `history.json`, `runtime.json`, `postfach/`; überall `freigaben.json`, `traeger.json`, `zugaenge.json` und alles in einem `.git`-Ordner oder die `.git`-Datei eines Worktrees |
 
 Die **Kontextgrenze** `context_limit` ist ein Satz. Der Hook liest daraus nur
 Pfade: Text in Backticks und Wörter, die mit `/`, `~/` oder `./` beginnen;
@@ -815,6 +815,21 @@ läuft über das normale Bash-Muster des Profils (`<ein eigenes Mailwerkzeug> *`
 liegt im Zugangsordner und ist damit wie ein ssh-Schlüssel gesperrt
 (`tests/test-profil-sperre.sh`, Fälle 8m bis 8o). `<ein eigenes Mailwerkzeug>` und `msmtp`
 bleiben auf der Hausliste: über einen Zugang wird nie gesendet.
+
+**Worktree je Agent (16.09.2026).** Im Projekt schreibt die Sperre nur noch
+in `work/`; am Projekt arbeitet ein Agent in seinem eigenen git-Worktree auf
+`agent/<id>` im privaten Arbeitsordner (docs/AGENTS-TRAEGER.md, „Worktree je
+Agent“). Für `git` gilt zusätzlich zu den Mustern: `git merge` nur für
+Teamleiter (Zweige `agent/<id>` von Mitgliedern des eigenen Teams laut deren
+`agent.json`) und den Hauptagenten (jeder Agentenzweig), ohne `-s`; kein
+`git worktree`, kein `git switch`, `git checkout` nur als
+`git checkout -- <pfade>`; `git rebase` nur mit harmlosen Optionen (kein
+`--exec`, kein `-i`) und ohne zweiten Zweig; keine globalen Optionen `-c`,
+`--config-env`, `--exec-path`, `--git-dir`, `--work-tree`, `--namespace`. Kein
+Befehl setzt, exportiert oder entfernt eine `GIT_*`-Variable (auch nicht
+`env -i`, `env -u` oder `exec -c` vor `git`): der Träger setzt sie über die
+Einstellungsdatei des Zuges und schaltet damit Hooks, fsmonitor und Editor ab.
+`git push` bleibt auf der Hausliste (`tests/test-profil-sperre.sh`, Fall 9).
 
 **Prüfkette.** Die Profil-Sperre steht in der `PRUEFKETTE` der
 Skills-Sperre. Der Inhalt eines Skill-Skripts wird damit auch gegen

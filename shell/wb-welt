@@ -6,6 +6,11 @@ if [ "${1:-}" = "umziehen" ]; then
   shift
   exec python3 "$SCRIPT_DIR/agents_weltumzug.py" "$@"
 fi
+# Worktrees und Zweige aufgeloester Agenten entfernen, wenn gemergt (agents_worktree.py); Fernwelten dort selbst.
+if [ "${1:-}" = "worktree-aufraeumen" ]; then
+  shift
+  exec python3 "$SCRIPT_DIR/agents_worktree.py" aufraeumen "$@"
+fi
 # Eine Welt <host>:/pfad liegt verbindlich auf einer anderen Maschine: der ganze Befehl laeuft dort.
 for arg in "$@"; do
   case "$arg" in

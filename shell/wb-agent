@@ -12,7 +12,7 @@ case "${1:-}" in
     fi
     exit "$status"
     ;;
-  neu|liste|zeigen|pause|start|stop|profil|gedaechtnis|vorlagen|entwurf|anlegen)
+  neu|liste|zeigen|pause|start|stop|profil|rechte|gedaechtnis|vorlagen|entwurf|anlegen)
     SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
     exec python3 "$SCRIPT_DIR/agents_data.py" agent "$@"
     ;;

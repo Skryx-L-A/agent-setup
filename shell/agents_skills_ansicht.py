@@ -15,6 +15,10 @@ resolved the same way `wb-skill liste --agent` does), each skill with its `SKILL
 the skill and learning-step entries of the agent history and the token evaluation per
 ticket kind from `evaluate_measurements`.  Per skill proposal ticket: the stored
 proposal and its diff.  Plus the last entries of the world's `skill-verlauf.jsonl`.
+
+Since Auftrag agentsform (16.09.2026) also `katalog`: the valid skills of the world level and of the
+library (name and description), which the create menu offers as a choice.  Invalid folders are left
+out; they already show up as findings in an agent's skill tab.
 """
 from __future__ import annotations
 
@@ -127,6 +131,17 @@ def _world_log(root: Path) -> list[dict[str, Any]]:
     return entries
 
 
+def _catalog(root: Path, library: str | None) -> dict[str, list[dict[str, Any]]]:
+    """Valid skills of the world level and the library for the create menu; an unreadable level lists none."""
+    def level(name: str) -> list[dict[str, Any]]:
+        try:
+            units = sk.level_skills(sk.level_root(root, name, library=library), name)
+        except (ad.AgentsError, OSError):
+            return []
+        return [{"name": u["name"], "beschreibung": u.get("description") or ""} for u in units if u.get("gueltig", True)]
+    return {"welt": level("welt"), "bibliothek": level("bibliothek")}
+
+
 def skills_view(root: Path, library: str | None = None, last: int = 5) -> dict[str, Any]:
     root = ad.world_path(str(root))
     ad.read_world(root)  # a folder without world.json is no world
@@ -137,6 +152,7 @@ def skills_view(root: Path, library: str | None = None, last: int = 5) -> dict[s
             "agenten": {agent["id"]: _agent_view(root, agent, library, last) for agent in agents},
             "vorschlaege": _proposals(root),
             "verlauf": _world_log(root),
+            "katalog": _catalog(root, library),
         }
     return data
 

@@ -138,6 +138,8 @@ class LinuxLauncher:
 
     # Fail-closed default, also for instances built without ``__init__``: no shared network.
     network = False
+    # Ebenso ohne ``__init__``: kein Projekt-Repo eines Agenten-Worktrees eingebunden.
+    git_einbindung = None
 
     def __init__(
         self,
@@ -154,6 +156,7 @@ class LinuxLauncher:
         bwrap: Optional[str] = None,
         output_dir: str | os.PathLike[str] | None = None,
         network: bool = False,
+        git_einbindung: Optional[Mapping[str, Any]] = None,
     ):
         if sys.platform != "linux":
             raise LinuxNichtUnterstuetzt("Linux-Launcher laeuft nur auf Linux")
@@ -177,6 +180,7 @@ class LinuxLauncher:
 
         self.read_paths = self._paths(read_paths, writable=False)
         self.write_paths = self._paths(write_paths, writable=True)
+        self.git_einbindung = self._git_plan(git_einbindung)
         self.socket_bindings = tuple(socket_bindings)
         destinations = set()
         for binding in self.socket_bindings:
@@ -256,6 +260,43 @@ class LinuxLauncher:
                 result.append(path)
         result.sort(key=lambda item: (len(item.parts), str(item)))
         return tuple(result)
+
+    def _git_plan(self, value: Optional[Mapping[str, Any]]) -> Optional[tuple[Path, tuple[tuple[str, Path], ...]]]:
+        """Projekt-Repo eines Agenten-Worktrees (agents_worktree): ``.git`` als tmpfs, darin nur genannte Teile.
+
+        ``lesen`` und ``schreiben`` liegen unter ``gitdir`` und werden nach Tiefe gebunden, damit ein Nur-Lese-Teil
+        in einem Schreibteil (``objects/pack`` in ``objects``) den Schreibteil ueberdeckt. Neues im tmpfs sieht der
+        Host nie."""
+        if value is None:
+            return None
+        if not isinstance(value, Mapping) or set(value) != {"gitdir", "lesen", "schreiben"}:
+            raise ValueError("git_einbindung braucht gitdir, lesen und schreiben")
+        user_home = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=False)
+
+        def kanonisch(raw: Any) -> Path:
+            path = Path(str(raw))
+            if not path.is_absolute() or path.resolve(strict=True) != path:
+                raise ValueError(f"git_einbindung: Pfad muss absolut, vorhanden und ohne Symlink sein: {raw}")
+            if any(part in _SECRET_PARTS for part in path.parts):
+                raise ValueError(f"Secrets-/Konfigurationspfad ist gesperrt: {path}")
+            return path
+
+        gitdir = kanonisch(value["gitdir"])
+        if gitdir.name != ".git" or not gitdir.is_dir() or gitdir.stat().st_uid != os.geteuid() \
+                or gitdir.parent in (Path("/"), user_home):
+            raise ValueError("git_einbindung: gitdir muss ein eigener .git-Ordner eines Projekts sein")
+        plan: list[tuple[str, Path]] = []
+        for art, key in (("ro", "lesen"), ("rw", "schreiben")):
+            for raw in value[key]:
+                path = kanonisch(raw)
+                if path == gitdir or not _inside(path, gitdir):
+                    raise ValueError(f"git_einbindung: {path} liegt nicht in {gitdir}")
+                if art == "rw" and (not path.is_dir() or path.stat().st_uid != os.geteuid()
+                                    or not os.access(path, os.R_OK | os.W_OK | os.X_OK)):
+                    raise ValueError(f"git_einbindung: Schreibteil muss eigenes Verzeichnis sein: {path}")
+                plan.append((art, path))
+        plan.sort(key=lambda item: len(item[1].parts))
+        return gitdir, tuple(plan)
 
     def _check_host(self) -> None:
         if not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
@@ -532,6 +573,11 @@ class LinuxLauncher:
         if not (_inside(resolved_executable, Path("/usr")) or any(
                 _inside(resolved_executable, root) for root in (*self.read_paths, *self.write_paths))):
             raise ValueError("argv[0] liegt ausserhalb sichtbarer Laufzeit-/Sandbox-Pfade")
+        if self.git_einbindung is not None:
+            gitdir = self.git_einbindung[0]
+            if not any(_inside(gitdir, root) for root in self.read_paths) \
+                    or any(_inside(gitdir, root) or _inside(root, gitdir) for root in self.write_paths):
+                raise ValueError("git_einbindung muss im nur lesbaren Projekt liegen, ausserhalb der Schreibpfade")
         env = dict(spec.env)
         if len(env) != len(spec.env):
             raise ValueError("env enthaelt doppelte Namen")
@@ -574,6 +620,11 @@ class LinuxLauncher:
             command.extend(("--ro-bind", str(path), str(path)))
         for path in self.write_paths:
             command.extend(("--bind", str(path), str(path)))
+        if self.git_einbindung is not None:
+            gitdir, plan = self.git_einbindung
+            command.extend(("--size", str(4 * 1024 * 1024), "--perms", "0700", "--tmpfs", str(gitdir)))
+            for art, path in plan:
+                command.extend(("--ro-bind" if art == "ro" else "--bind", str(path), str(path)))
         for binding in self.socket_bindings:
             binding.validate()
             command.extend(("--ro-bind", str(binding.host_path), binding.guest_path))

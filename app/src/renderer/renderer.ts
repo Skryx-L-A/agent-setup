@@ -191,6 +191,7 @@ declare global {
       aufgabenDaten(): Promise<unknown>;
       aufgabe(befehl: string, opt?: { echt?: boolean; bestaetigt?: boolean }): Promise<unknown>;
       aufgabenSichtbar(an: boolean): void;
+      weltOrdnerWaehlen(echt: boolean): Promise<{ pfad: string; grund: string }>;
       onKanal(fn: (p: { pfad: string; fehler: string | null }) => void): void;
       onFreigaben(fn: (p: unknown) => void): void;
       onErgebnis(fn: (p: ErgebnisMeldung) => void): void;
@@ -2444,6 +2445,7 @@ initWeltenView({
   handlung(befehl, opt) { return window.awbBridge.aufgabe(befehl, opt); },
   daten() { return window.awbBridge.aufgabenDaten(); },
   sichtbar(an) { window.awbBridge.aufgabenSichtbar(an); },
+  ordnerWaehlen(echt) { return window.awbBridge.weltOrdnerWaehlen(echt); },
   testhaken: window.awbBridge.testhaken === true,
 });
 window.awbBridge.onAufgaben((p) => { weltenAufgaben(p); });

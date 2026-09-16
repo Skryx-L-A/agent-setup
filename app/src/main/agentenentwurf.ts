@@ -100,7 +100,11 @@ export function modellWaehlen(wahl: string, eintrag: unknown, deckel: unknown): 
   };
 }
 
-export interface EntwurfWelt { name: string; hauptagent: string | null; teams: { name: string; leiter: string | null }[]; agenten: string[] }
+export interface EntwurfWelt {
+  name: string; hauptagent: string | null; teams: { name: string; leiter: string | null }[]; agenten: string[];
+  /** Auftrag agentsform: die Maschine eines neuen Agenten in dieser Welt (Traegermaschine); ohne Angabe peer. */
+  maschine?: string;
+}
 
 /** Die feste Anleitung fuer die Figur -- auch fuer ein Modell ohne Bildfaehigkeit eindeutig abzuarbeiten. */
 export const FIGUR_ANLEITUNG = [
@@ -128,7 +132,7 @@ export function entwurfPrompt(beschreibung: string, welt: EntwurfWelt, vorgaben:
     gesetzt.length ? `Vom Menschen schon festgelegt (übernimm diese Werte unverändert): ${JSON.stringify(Object.fromEntries(gesetzt))}` : 'Der Mensch hat nichts außer der Beschreibung festgelegt.',
     '',
     'Felder des JSON-Objekts (keine anderen):',
-    ...feldRegeln('die Beschreibung'),
+    ...feldRegeln('die Beschreibung', welt.maschine),
     '',
     FIGUR_ANLEITUNG,
     '',
@@ -138,14 +142,14 @@ export function entwurfPrompt(beschreibung: string, welt: EntwurfWelt, vorgaben:
 }
 
 /** Die Regeln je Feld, gemeinsam fuer Vorschlag und Gespraech (agentengespraech.ts); `quelle` nennt, woraus der Entwurf kommt. */
-export function feldRegeln(quelle: string): string[] {
+export function feldRegeln(quelle: string, maschine = 'peer'): string[] {
   return [
     '- "id": Kennung aus Kleinbuchstaben, Ziffern und Bindestrich, höchstens 40 Zeichen, nicht belegt.',
     `- "stage": "mitglied" oder "teamleiter" ("hauptagent" nur, wenn die Welt keinen hat und ${quelle} ihn verlangt).`,
     '- "team": Name eines bestehenden Teams oder ein neuer kurzer Teamname in Kleinbuchstaben; Pflicht für teamleiter.',
     '- "specialty": das Spezialgebiet in genau einem deutschen Satz, der mit einem Verb beginnt, ohne Pronomen (z. B. "Prüft Änderungen …", nie "Er prüft …").',
     '- "model" und "fallback_model": Kennungen aus der Modellliste unten, mit Denkstufe als Suffix, z. B. "sonnet5:high". Lokal, wo es reicht; Claude oder Codex für schwere Arbeit. Nie Fable.',
-    '- "machine": "peer" als Vorgabe; "mac" nur, wenn die Arbeit am Mac sein muss.',
+    `- "machine": "${maschine || 'peer'}" als Vorgabe (die Trägermaschine der Welt); "mac" nur, wenn die Arbeit am Mac sein muss.`,
     `- "tools": Liste aus ${AGENT_WERKZEUGE.join(', ')}; so wenig wie möglich. Wer nur liest, bekommt kein Write und kein Edit.`,
     '- "bash": nur wenn "Bash" in tools steht: eng gefasste Befehlsmuster wie "git status" oder "npm test". Nie git push, rm -rf, kill, Mail-Versand oder wb-state.',
     '- "skills": Liste von Skillnamen in Kleinbuchstaben, eher leer als geraten.',
