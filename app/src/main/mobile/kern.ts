@@ -82,9 +82,11 @@ export interface MobilKonfig {
    * Automatische Replikation von Geraeteregister und Origin nach Kopplung und
    * Widerruf (replikation.ts). Fehlt der Schluessel, repliziert dieser Host nicht --
    * so laeuft sie nur auf der Quelle (Mac), nie zurueck. `maschinen` ist
-   * `remoteMachines`; die Ziele kommen aus `origins` ohne die eigene.
+   * `remoteMachines` OHNE Abzug der pausierten (die Pause gilt der Anzeige, nicht
+   * der Weitergabe); `pausiert` markiert nur, welche davon pausiert sind, damit
+   * das Protokoll es sagt. Die Ziele kommen aus `origins` ohne die eigene.
    */
-  readonly replikation?: Omit<ReplikKonfig, 'authVerzeichnis' | 'ziele' | 'protokoll'> & { readonly maschinen: readonly string[] };
+  readonly replikation?: Omit<ReplikKonfig, 'authVerzeichnis' | 'ziele' | 'protokoll'> & { readonly maschinen: readonly string[]; readonly pausiert?: readonly string[] };
 }
 
 export interface MobilKernQuellen {
@@ -442,7 +444,7 @@ export function mobilDienstBauen(konfig: MobilKonfig, quellen: MobilKernQuellen)
   const replik: Replikation | null = konfig.replikation ? replikationBauen({
     ...konfig.replikation,
     authVerzeichnis: konfig.authVerzeichnis ?? join(homedir(), '.claude', 'workbench', 'mobile'),
-    ziele: replikZiele(konfig.origins, konfig.origin, konfig.replikation.maschinen),
+    ziele: replikZiele(konfig.origins, konfig.origin, konfig.replikation.maschinen, konfig.replikation.pausiert),
     protokoll,
   }) : null;
   let push: MobilePushService | null = null;

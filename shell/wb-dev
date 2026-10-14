@@ -443,7 +443,7 @@ daten_vorbereiten
 
 if [ "$NUR_STATUS" = 1 ]; then
   status
-  if mac_laeuft; then gruen "Mac-Fassung laeuft (Laufverzeichnis $MAC_LAUF)."
+  if mac_laeuft; then gruen "Mac-Fassung laeuft (Laufverzeichnis $MAC_LAUF, Steuerkanal $MAC_LAUF/awb.sock)."
   else info "Mac-Fassung laeuft nicht.  Buendel: $MAC_BUENDEL$(mac_gebaut || printf ' (nicht gebaut)')"; fi
   exit 0
 fi
@@ -484,10 +484,14 @@ if [ "$FASSUNG" = mac ]; then
   # abgeben will, nimmt `--kopflos`.
   [ "$INAKTIV" = 1 ] && info "wb-dev: --inaktiv gibt es in der Mac-Fassung nicht; sie startet gewoehnlich." >&2
   [ ${#EXTRA[@]} -gt 0 ] && info "wb-dev: die Angaben nach -- sind Electron-Argumente und werden von der Mac-Fassung nicht gelesen." >&2
+  # Der Mac-Kern lauscht nicht auf $DEV_DATEN/awb-dev.sock: mac/bin/starten verwirft
+  # ein geerbtes AWB_CONTROL_SOCKET und setzt fest $LAUF/awb.sock (wz-mantel5, F1b).
+  export AWB_CONTROL_SOCKET="$MAC_LAUF/awb.sock"
   if [ "$KOPFLOS" = 1 ]; then info "Starte die Mac-Fassung kopflos ..."; else info "Starte die Mac-Fassung ..."; fi
   if mac_starten "$KOPFLOS"; then
     gruen "Mac-Fassung laeuft (Laufverzeichnis $MAC_LAUF)."
     info "  Protokoll:  $MAC_LAUF/app.log und $MAC_LAUF/kern.log"
+    info "  Steuern:    AWB_CONTROL_SOCKET=$AWB_CONTROL_SOCKET awb-ctl ..."
     info "  Beenden:    wb-dev --stop"
     info "  Electron statt dessen:  wb-dev --electron"
     exit 0

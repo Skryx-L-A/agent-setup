@@ -42,6 +42,8 @@ export interface ReplikZiel {
   readonly maschine: string;
   /** Die Origin dieser Maschine aus `mobileOrigins`; sie wird drueben je Geraet freigeschaltet. */
   readonly origin: string;
+  /** Die Maschine steht in `remoteMachinesPausiert`: die Weitergabe laeuft trotzdem, das Protokoll sagt es. */
+  readonly pausiert?: boolean;
 }
 
 export interface ReplikKonfig {
@@ -93,9 +95,10 @@ export function geraeteStand(authState: Buffer): string {
  * Ziele aus der Konfiguration: jede Origin ausser der eigenen, zugeordnet der
  * Maschine aus `remoteMachines`, deren Name das erste DNS-Label des Hosts ist
  * (`https://peer.tailnet.example.ts.net:8444` -> `peer`). Findet sich keine, bleibt
- * das Ziel mit leerer Maschine stehen und scheitert laut.
+ * das Ziel mit leerer Maschine stehen und scheitert laut. `maschinen` ist die
+ * volle Liste einschliesslich pausierter Maschinen; `pausiert` markiert nur.
  */
-export function replikZiele(origins: readonly string[], eigene: string, maschinen: readonly string[]): ReplikZiel[] {
+export function replikZiele(origins: readonly string[], eigene: string, maschinen: readonly string[], pausiert: readonly string[] = []): ReplikZiel[] {
   return origins.filter((o) => o !== eigene).map((origin) => {
     let label = '';
     try {
@@ -103,7 +106,8 @@ export function replikZiele(origins: readonly string[], eigene: string, maschine
     } catch {
       label = '';
     }
-    return { origin, maschine: maschinen.find((m) => m.toLowerCase() === label) ?? '' };
+    const maschine = maschinen.find((m) => m.toLowerCase() === label) ?? '';
+    return { origin, maschine, ...(maschine && pausiert.includes(maschine) ? { pausiert: true } : {}) };
   });
 }
 
@@ -229,7 +233,7 @@ export function replikationBauen(konfig: ReplikKonfig): Replikation {
   };
 
   const einZiel = async (ziel: ReplikZiel, daten: Buffer, skript: string): Promise<string> => {
-    if (!ziel.maschine) return `keine Maschine in remoteMachines fuer ${ziel.origin}`;
+    if (!ziel.maschine) return `keine Maschine in remoteMachines fuer ${ziel.origin} (auch nicht unter den pausierten)`;
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(ziel.maschine)) return `ungueltiger Maschinenname ${ziel.maschine}`;
     if (!/^https:\/\/[A-Za-z0-9.-]+(?::[0-9]+)?$/.test(ziel.origin)) return `ungueltige Origin ${ziel.origin}`;
     const name = `${PRAEFIX}${ziel.maschine}-${jetzt()}-${randomBytes(4).toString('hex')}.json`;
@@ -295,8 +299,9 @@ export function replikationBauen(konfig: ReplikKonfig): Replikation {
         const gruende: string[] = [];
         for (const ziel of konfig.ziele) {
           const g = await einZiel(ziel, daten, skript);
-          if (g) gruende.push(g);
-          else protokoll(`Mobil-Replikation nach ${ziel.maschine} geprueft (${anlass}; Geraetestand ${geraeteStand(daten).slice(0, 8)}).`);
+          const pause = ziel.pausiert ? ` ${ziel.maschine} ist pausiert (remoteMachinesPausiert); die Weitergabe lief trotzdem, weil eine Kopplung oder ein Widerruf nicht liegen bleiben darf.` : '';
+          if (g) gruende.push(`${g}${ziel.pausiert ? ` (${ziel.maschine} ist pausiert; die Weitergabe wurde trotzdem versucht)` : ''}`);
+          else protokoll(`Mobil-Replikation nach ${ziel.maschine} geprueft (${anlass}; Geraetestand ${geraeteStand(daten).slice(0, 8)}).${pause}`);
         }
         fehler = gruende.join('; ');
       }

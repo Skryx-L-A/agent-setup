@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# wb-mantel-env-raeumen -- nimmt AWB_MANTEL_TOKEN und AWB_MANTEL_SOCKET aus dem
+# globalen Env eines LAUFENDEN tmux-Servers (13.10.2026, Auftrag wz-mantel).
+#
+#   wb-mantel-env-raeumen [-L <socket>]... [--tmux <bin>] [--pruefen]
+#
+#   -L <socket>   tmux-Socketname (mehrfach). Ohne -L: der Socket aus
+#                 `tmuxSocket` in der Kern-Konfiguration ($AWB_CONFIG, sonst
+#                 ~/.config/agent-workbench/config.json) und der Standardserver.
+#   --pruefen     nichts aendern, nur je Server melden, ob die NAMEN noch im
+#                 globalen Env stehen (Exit 1, wenn ja).
+#
+# WOZU. Der Kern entfernt beide Variablen seit wz-mantel selbst aus seinem Env,
+# bevor er ein Kind startet (app/src/main/config.ts, mantelZugangEntnehmen). Ein
+# tmux-Server, den ein ALTER Kern gestartet hat, traegt sie aber weiter im
+# globalen Env und gibt sie jedem neuen Pane mit -- also jedem Agenten. Dieser
+# Schritt raeumt das einmal nach dem Ausrollen. Shells, die schon laufen,
+# behalten ihre Kopie, bis sie enden; der Kern verlangt seit wz-mantel ohnehin
+# die App als Gegenseite (Peer-PID), der Token allein gibt keine Menschenfreigabe.
+#
+# Werte werden nie ausgegeben, nur Namen.
+set -uo pipefail
+
+TMUX_BIN=tmux
+PRUEFEN=0
+SOCKETS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -L) SOCKETS+=("${2:?-L braucht einen Socketnamen}"); shift 2 ;;
+    --tmux) TMUX_BIN="${2:?--tmux braucht einen Pfad}"; shift 2 ;;
+    --pruefen) PRUEFEN=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "wb-mantel-env-raeumen: unbekanntes Argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ ${#SOCKETS[@]} -eq 0 ]; then
+  KONF="${AWB_CONFIG:-$HOME/.config/agent-workbench/config.json}"
+  eigen=""
+  [ -f "$KONF" ] && eigen="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("tmuxSocket") or "")
+except Exception: print("")' "$KONF" 2>/dev/null)"
+  [ -n "$eigen" ] && SOCKETS+=("$eigen")
+  SOCKETS+=("")   # der Standardserver
+fi
+
+VARS=(AWB_MANTEL_TOKEN AWB_MANTEL_SOCKET)
+rest=0
+for s in "${SOCKETS[@]}"; do
+  arg=(); name="Standardserver"
+  [ -n "$s" ] && { arg=(-L "$s"); name="-L $s"; }
+  if ! "$TMUX_BIN" ${arg[@]+"${arg[@]}"} list-sessions >/dev/null 2>&1; then
+    echo "$name: kein laufender Server"
+    continue
+  fi
+  if [ "$PRUEFEN" = 0 ]; then
+    for v in "${VARS[@]}"; do "$TMUX_BIN" ${arg[@]+"${arg[@]}"} set-environment -gu "$v" 2>/dev/null; done
+  fi
+  # Nur Namen: `show-environment -g` liefert NAME=wert, abgeschnitten wird am '='.
+  da="$("$TMUX_BIN" ${arg[@]+"${arg[@]}"} show-environment -g 2>/dev/null | sed -nE 's/^(AWB_MANTEL_TOKEN|AWB_MANTEL_SOCKET)=.*/\1/p' | tr '\n' ' ')"
+  if [ -n "$da" ]; then
+    echo "$name: noch im globalen Env: $da"; rest=1
+  else
+    echo "$name: sauber"
+  fi
+done
+exit "$rest"

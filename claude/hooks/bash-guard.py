@@ -1710,6 +1710,16 @@ def check_freigabe_pfad(command):
     # Pfadangabe (Variable, Teilstueck) faellt damit trotzdem auf.
     formen.extend(['guard-grants', ask_muster.SCHLUESSEL_NAME, 'pi-workers/rollen',
                    script_guard.AUSNAHMEN_NAME])
+    # DER MANTEL DER MAC-APP (13.10.2026, Auftrag wz-mantel): mit Token und
+    # Socket wird ein Prozess zum Fenster des Menschen. Der Kern prueft die
+    # Gegenseite inzwischen selbst (app/src/main/mantel.ts, Peer-PID); hier
+    # faellt nur der getippte Griff danach auf. `mantel.token` gibt es nur im
+    # Laufverzeichnis der App; der Socket nur mit `mac-lauf/` davor, weil
+    # Testsuiten eigene `mantel.sock` unter mktemp anlegen.
+    formen.extend(['mantel.token', 'mac-lauf/mantel.sock'])
+    laufdir = os.environ.get('AWBMAC_LAUFDIR', '')
+    if laufdir:
+        formen.append(os.path.join(laufdir, 'mantel.sock'))
     for form in formen:
         if form and form in command:
             return ("Der Befehl fasst eine geschuetzte Ablage an (%s). %s"

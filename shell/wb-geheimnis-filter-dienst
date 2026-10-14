@@ -25,6 +25,8 @@
 #
 # Aufruf:
 #   wb-geheimnis-filter-dienst installieren   einrichten bzw. auf den Repo-Stand bringen
+#     (aus dem Repo-Checkout aufrufen, z. B. ~/AI/claude-workbench/shell/wb-geheimnis-filter-dienst: eine Kopie in
+#     ~/.local/bin findet plist bzw. systemd-Units nicht und bricht vor jeder Aenderung ab -- Vorgabe 14.10.)
 #   wb-geheimnis-filter-dienst status         Dienstzustand und Zaehler
 #   wb-geheimnis-filter-dienst entfernen      Dienst abschalten (Harnesses VORHER zurueck!)
 # Entfernen bricht VOR jedem Dienst-Eingriff ab, solange Claude, Codex, pi,
@@ -112,7 +114,24 @@ unit_zeile() {   # unit_zeile DATEI -> ExecStart der Unit, %h durch $HOME ersetz
 # /opt/homebrew/bin/python3. Verglichen werden deshalb die Argumente ab dem zweiten Eintrag.
 ohne_programm() { printf '%s\n' "${1#* }"; }
 
+quellen_pruefen() {   # Alle Quellen da? Sonst Exit 1 mit Pfaden; schreibt NICHTS
+  # Vorher lief das Ersetzen der Dienstkopie vor dem Suchen der Units: fehlten die Units neben
+  # einer kopierten Fassung (~/.local/bin), blieb die Dienstkopie ersetzt und die Units ungeschrieben.
+  local fehlt=""
+  [ -f "$REPO/wb-geheimnis-filter" ] || fehlt="$fehlt $REPO/wb-geheimnis-filter"
+  if [ "$OS" = mac ]; then
+    [ -f "$PLIST_QUELLE" ] || fehlt="$fehlt $PLIST_QUELLE"
+  else
+    for u in socket service; do
+      [ -f "$REPO/systemd/$UNIT.$u" ] || fehlt="$fehlt $REPO/systemd/$UNIT.$u"
+    done
+  fi
+  [ -z "$fehlt" ] && return 0
+  fehler "Quellen fehlen:$(printf ' %s;' $fehlt) Abbruch ohne Aenderung. Installieren aus dem Repo-Checkout (shell/wb-geheimnis-filter-dienst installieren), nicht aus einer Kopie."
+}
+
 installieren() {
+  quellen_pruefen
   [ -x "$PY" ] || fehler "$PY fehlt"
   [ -f "$LIB/geheimnis_inhalt.py" ] || fehler "$LIB/geheimnis_inhalt.py fehlt (Hooks nicht ausgerollt)"
   printf 'x\n' | WB_GEHEIMNIS_LIB="$LIB" "$PY" "$REPO/wb-geheimnis-filter" filter >/dev/null \

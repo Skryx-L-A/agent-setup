@@ -1955,6 +1955,42 @@ def git_hook_link_faelle(c7):
     return faelle
 
 
+def root_kopie_faelle(c7):
+    """Ein Fall je Eintrag aus `root_kopien`: Kopien eines Repo-Werkzeugs, die einem
+    ANDEREN Konto gehoeren (root) und deshalb weder wb-ausrollen noch ein Agent
+    schreiben darf -- Anlass 14.10.2026: peer ruft im Zwangsbefehl des Gast-Schluessels
+    /usr/local/bin/wb-gast-tor auf, und diese Kopie stand seit 27.09. still, waehrend
+    ~/.local/bin laengst den Fix vom 09.10. trug. Status 'gleich', 'verschieden' oder
+    'nicht_da' (diese Maschine hat die Kopie nicht -- kein Befund). Gemeldet wird laut,
+    behoben nur von Hand: kein automatisches sudo.
+
+    EINE Berechnung fuer wb-consistency (Meldung) und wb-ausrollen (Meldung, Exit 1),
+    wie bei kopie_vergleiche()."""
+    faelle = []
+    for e in c7.get("root_kopien", ()):
+        repo_datei = os.path.join(c7["repo_dir"], e["repo"])
+        ziel = e["ziel"]
+        if not os.path.isfile(repo_datei) or not os.path.lexists(ziel):
+            faelle.append({"status": "nicht_da", "rel": e["repo"], "ziel": ziel})
+            continue
+        try:
+            gleich = open(repo_datei, "rb").read() == open(ziel, "rb").read()
+        except OSError as exc:
+            faelle.append({"status": "verschieden", "rel": e["repo"], "ziel": ziel,
+                           "repo_datei": repo_datei, "grund": e.get("grund", ""),
+                           "warum": "nicht lesbar: %s" % exc})
+            continue
+        faelle.append({"status": "gleich" if gleich else "verschieden", "rel": e["repo"],
+                       "ziel": ziel, "repo_datei": repo_datei, "grund": e.get("grund", ""),
+                       "warum": "Inhalt weicht vom Repo-Stand ab"})
+    return faelle
+
+
+def root_kopie_befehl(fall):
+    """Der Befehl, den ein Mensch mit Root-Rechten ausfuehrt -- nur angezeigt, nie ausgefuehrt."""
+    return "sudo install -m 755 %s %s" % (fall["repo_datei"], fall["ziel"])
+
+
 def _sorte_a(c7, findings, machine_tool_map=None, current_machine=None):
     for fall in kopie_vergleiche(c7, machine_tool_map, current_machine):
         if fall["status"] == "andere_maschine":
@@ -2732,6 +2768,13 @@ def check7_kopien(cfg, base):
                 "Git-Hook %s ist ein Symlink auf %s" % (fall["name"], fall["ziel"]),
                 "dort liegt etwas anderes (Datei oder Link mit anderem Ziel) -- von Hand "
                 "pruefen, wb-ausrollen ueberschreibt es nicht."))
+    for fall in root_kopie_faelle(c7):
+        if fall["status"] == "verschieden":
+            findings.append(Finding(
+                "KOPIE-ROOT-VERALTET", fall["rel"], 1,
+                "%s ist der Repo-Stand (%s)" % (fall["ziel"], fall["grund"] or "root-eigene Kopie"),
+                "%s -- weder wb-ausrollen noch ein Agent darf sie schreiben. Von Hand: %s"
+                % (fall["warum"], root_kopie_befehl(fall))))
     _sorte_b(c7, findings)
     _sorte_c(c7, findings)
     _sorte_d(c7, findings, base)

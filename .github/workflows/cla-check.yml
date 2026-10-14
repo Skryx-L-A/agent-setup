@@ -1,0 +1,73 @@
+# Place at .github/workflows/cla-check.yml in each public repository.
+# Sets the commit status "cla" on the head commit of every pull request:
+# success if the author is listed in CLA-SIGNATURES.md on the base branch or has posted the
+# acceptance sentence as a comment on the pull request, failure otherwise.
+# This workflow never checks out or runs pull request code, so pull_request_target is safe here.
+name: cla-check
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  cla:
+    if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const SENTENCE = 'I have read the Contributor License Agreement and I agree to it.';
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request
+              ? context.payload.pull_request.number
+              : context.payload.issue.number;
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            const author = pr.user;
+            const claUrl = `https://github.com/${owner}/${repo}/blob/${pr.base.ref}/CLA.md`;
+
+            let ok = false;
+            let reason = '';
+            if (author.type === 'Bot' || author.login === owner) {
+              ok = true;
+              reason = 'maintainer or bot';
+            }
+
+            if (!ok) {
+              try {
+                const { data: file } = await github.rest.repos.getContent({
+                  owner, repo, path: 'CLA-SIGNATURES.md', ref: pr.base.ref,
+                });
+                const text = Buffer.from(file.content, 'base64').toString('utf8');
+                ok = text.split('\n').some((line) => line.includes(`| ${author.id} |`));
+                if (ok) reason = 'listed in CLA-SIGNATURES.md';
+              } catch (e) {
+                if (e.status !== 404) throw e;
+              }
+            }
+
+            if (!ok) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: number, per_page: 100,
+              });
+              ok = comments.some((c) => c.user.id === author.id && c.body.trim() === SENTENCE);
+              if (ok) reason = 'accepted in this pull request';
+            }
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha: pr.head.sha,
+              state: ok ? 'success' : 'failure',
+              context: 'cla',
+              target_url: claUrl,
+              description: ok
+                ? `CLA accepted (${reason})`
+                : 'Please comment the acceptance sentence from CLA.md',
+            });
+            core.info(`PR #${number} by ${author.login}: ${ok ? 'ok' : 'missing'} ${reason}`);

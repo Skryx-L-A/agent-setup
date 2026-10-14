@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  agent-workbench.geheimnis-filter -- launchd haelt den Lauschsocket 127.0.0.1:8093, der
+  agent-workbench.geheimnis-filter - launchd haelt den Lauschsocket 127.0.0.1:8093, der
   Geheimnisfilter startet erst bei der ersten Verbindung (Auftrag filter-live,
   der Nutzer 2026-10-10: "Alle umlenkbaren sofort").
 
-  Bauart wie agent-workbench.modell-proxy: kein StartInterval -- also kein Zeitgeber
+  Bauart wie agent-workbench.modell-proxy: kein StartInterval - also kein Zeitgeber
   (KeepAlive seit 13.10., siehe unten). Beendet sich der Prozess (Absturz, kill,
   bootout), haelt launchd den Socket weiter und startet ihn bei der naechsten
   Verbindung neu. Wartende Verbindungen liegen solange im Kernel-Backlog.
@@ -20,7 +20,7 @@
   (~/.claude/hooks/lib/geheimnis_inhalt.py). Zaehler seit festem Zeitpunkt:
   ~/.local/state/wb-geheimnis-filter/zaehler.json (nur Zahlen).
 
-  Proxy-Modus (Auftrag wz-proxybau, 13.10.): --connect, derselbe Socket 8093 nimmt auch
+  Proxy-Modus (Auftrag wz-proxybau, 13.10.): -connect, derselbe Socket 8093 nimmt auch
   CONNECT an. Claude laeuft dann ohne ANTHROPIC_BASE_URL (Remote Control bleibt moeglich)
   mit HTTPS_PROXY=http://127.0.0.1:8093 und NODE_EXTRA_CA_CERTS=
   ~/.local/state/wb-geheimnis-filter/ca.pem; nur api.anthropic.com wird aufgebrochen,
@@ -35,7 +35,7 @@
 
   Einrichten:  shell/wb-geheimnis-filter-dienst installieren
   Abschalten:  launchctl bootout gui/$(id -u)/agent-workbench.geheimnis-filter
-               (vorher alle Harnesses zurueckstellen -- sonst stehen sie: fail-closed)
+               (vorher alle Harnesses zurueckstellen - sonst stehen sie: fail-closed)
   stdout/stderr: nur die Startzeile und Python-Ausnahmen, nie Inhalte oder Header.
 -->
 <plist version="1.0">

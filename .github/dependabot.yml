@@ -1,0 +1,8 @@
+# Only the pinned GitHub Actions are kept current. There are no version update pull requests
+# for packages: dependencies change when the maintainer decides to change them.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

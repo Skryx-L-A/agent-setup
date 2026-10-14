@@ -13,7 +13,7 @@ import { readFileSync, statSync, mkdirSync, openSync, closeSync, existsSync } fr
 import { homedir, hostname, userInfo } from 'node:os';
 import { createHash } from 'node:crypto';
 import { join, relative, dirname, basename } from 'node:path';
-import { loadConfig, Config } from './config';
+import { loadConfig, Config, mantelZugangEntnehmen } from './config';
 import { MantelKanal, socketVerwaist } from './mantel';
 import { fernAufruf, findetWerkzeug, pfadHerrichten } from './pfad';
 import { Ergebnis, ErgebnisWaechter } from './results';
@@ -110,6 +110,11 @@ import type { ClaudePaneSnapshot } from './mobile/dialogs/claude';
 import type { MobileDialogSession, OpenCodeDialogConnection } from './mobile/dialogs/opencode';
 import { schluesselSetzenFuerAnbieter, schluesselStatusAlle } from './schluesselbund';
 import { HarnessUpdateScheduler } from './harnessupdate';
+
+// DER MANTEL-ZUGANG VERLAESST DIE UMGEBUNG ALS ERSTES (13.10.2026, Auftrag
+// wz-mantel; config.ts, `mantelZugangEntnehmen`): vor jedem Kindstart, auch vor
+// `pfadHerrichten` weiter unten, das schon eine Anmelde-Shell startet.
+const mantelZugang = mantelZugangEntnehmen(process.env);
 
 // KEIN FENSTER FUER EINEN FEHLER, DEN NIEMAND ERWARTET HAT (Auftrag 2026-08-19).
 //
@@ -216,7 +221,7 @@ for (const werkzeug of ['tmux', 'wb-code']) {
 }
 
 const started = Date.now();
-const config: Config = loadConfig(process.argv.slice(1));
+const config: Config = loadConfig(process.argv.slice(1), process.env, mantelZugang);
 // DER MENSCHEN-NACHWEIS WIRD NIE GEERBT (08.09.2026, gemessen). Ein Terminal,
 // das aus dieser Werkbank heraus entstanden ist, traegt WB_MENSCH_QUELLE und
 // WB_APP_PID der Werkbank, die es gestartet hat -- und ein Kern, der aus so
@@ -9165,7 +9170,7 @@ function mobilDienstErzeugen(): MobilDienst {
     pushVerzeichnis: join(config.stateDir, 'mobile'),
     vapidDatei: config.mobileVapidFile,
     huellenVerzeichnis: join(__dirname, '..', 'mobile'),
-    ...(process.platform === 'darwin' ? { replikation: { maschinen: config.remoteMachines, werkzeugVerzeichnis: join(__dirname, '..', '..', '..', 'deploy', 'mobile') } } : {}),
+    ...(process.platform === 'darwin' ? { replikation: { maschinen: config.remoteMachinesAlle, pausiert: config.remoteMachinesPausiert, werkzeugVerzeichnis: join(__dirname, '..', '..', '..', 'deploy', 'mobile') } } : {}),
   }, {
     protokoll: mobilProtokoll,
     sitzungen: {
@@ -9974,6 +9979,16 @@ app.whenReady().then(async () => {
   if (config.mantelSocket) {
     try {
       const m = new MantelKanal(config.mantelSocket, config.mantelToken, {
+        // DIE APP IST DER ELTERNPROZESS (13.10.2026, Auftrag wz-mantel):
+        // Kernstart.swift startet die Electron-Binaerdatei direkt, also ist die
+        // Peer-PID der echten App `process.ppid` (live gemessen: Werkbank 6268,
+        // Kern 6286, ppid 6268). Seit 14.10. laesst auch `mac/bin/starten`
+        // die App den Kern starten. Jede andere Verbindung -- ein Agent mit
+        // Token -- darf in mantel.ts nur lesen (`fremdErlaubt`), nie tippen,
+        // und verliert jede Menschen-Markierung. `process.ppid` wird bei jeder Verbindung
+        // neu gelesen: stirbt die App, ist es 1 und niemand mehr.
+        istApp: (pid) => pid > 1 && pid === process.ppid,
+        fremd: (meldung) => melde(`Mantel: ${meldung}`),
         // Der Absender ist `MANTEL_SENDER`, nicht mehr das Fenster (Auftrag
         // 4.1): im Mantelbetrieb gibt es keines, und die Bruecke haette sonst
         // jeden Kanal mit „unbekannter Kanal" abgewiesen.

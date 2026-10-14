@@ -19,7 +19,7 @@
 // weiter, wird weiter ausgewertet, und die Eingabe geht weiterhin ueber
 // `wb-pane-write` in den Pane. Nichts in dieser Datei schreibt in eine Sitzung.
 import { execFileSync, spawnSync } from 'node:child_process';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { chatAnsicht, chatAnsichtVorgabe } from './einstellungen';
@@ -43,6 +43,16 @@ import { LEERE_BRUECKE } from '../chat/typen';
 
 /** Wie viel vom Ende einer Sitzungsdatei gelesen wird. Ein Transcript waechst auf Megabyte. */
 const TAIL_BYTES = 512 * 1024;
+
+/**
+ * Bis wohin das Ende waechst, wenn darin kaum Nachrichten stehen. Gemessen 14.10. auf peer:
+ * ein Claude-Transcript von 13 MB endete mit Anhangszeilen bis 766 KB; die letzten 512 KB
+ * enthielten keine einzige Nachricht, die Ansicht blieb leer.
+ */
+const TAIL_MAX_BYTES = 16 * 1024 * 1024;
+
+/** Unter so vielen Nachrichten im Ende wird weiter vorn gelesen. */
+const MIN_NACHRICHTEN = 20;
 
 /** Wie viele Nachrichten die Ansicht bekommt. Aelteres steht im Terminal-Rueckblick. */
 const MAX_NACHRICHTEN = 200;
@@ -250,20 +260,47 @@ function pfadeZuMuster(muster: string, deckel = 400): string[] {
   });
 }
 
+/** Liest `laenge` Bytes ab `start`, ohne die ganze Datei zu laden. */
+function ausschnitt(pfad: string, start: number, laenge: number): Buffer {
+  const puffer = Buffer.alloc(laenge);
+  const fd = openSync(pfad, 'r');
+  try {
+    let gelesen = 0;
+    while (gelesen < laenge) {
+      const n = readSync(fd, puffer, gelesen, laenge - gelesen, start + gelesen);
+      if (n === 0) break;
+      gelesen += n;
+    }
+    return puffer.subarray(0, gelesen);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /** Das Ende einer Datei, hoechstens TAIL_BYTES -- und ohne die erste, halbe Zeile. */
 function schwanz(pfad: string, bytes = TAIL_BYTES): string {
-  const st = statSync(pfad);
-  const roh = readFileSync(pfad);
-  if (st.size <= bytes) return roh.toString('utf8');
-  const teil = roh.subarray(st.size - bytes).toString('utf8');
+  const groesse = statSync(pfad).size;
+  if (groesse <= bytes) return ausschnitt(pfad, 0, groesse).toString('utf8');
+  const teil = ausschnitt(pfad, groesse - bytes, bytes).toString('utf8');
   const i = teil.indexOf('\n');
   return i >= 0 ? teil.slice(i + 1) : teil;
 }
 
+/**
+ * Nachrichten vom Dateiende. Stehen im Ende weniger als MIN_NACHRICHTEN (grosse Anhaenge),
+ * wird das Fenster vervierfacht, bis die Datei oder TAIL_MAX_BYTES erreicht ist.
+ */
+function nachrichtenVomEnde(format: string, pfad: string): ChatNachricht[] {
+  const groesse = statSync(pfad).size;
+  for (let bytes = TAIL_BYTES; ; bytes *= 4) {
+    const nachrichten = nachrichtenAus(format, schwanz(pfad, bytes));
+    if (nachrichten.length >= MIN_NACHRICHTEN || bytes >= groesse || bytes >= TAIL_MAX_BYTES) return nachrichten;
+  }
+}
+
 /** Der Kopf einer Datei -- fuer die Zuordnung genuegen die ersten Zeilen. */
 function kopf(pfad: string, bytes = 64 * 1024): string {
-  const roh = readFileSync(pfad);
-  return roh.subarray(0, Math.min(roh.length, bytes)).toString('utf8');
+  return ausschnitt(pfad, 0, Math.min(statSync(pfad).size, bytes)).toString('utf8');
 }
 
 /**
@@ -489,7 +526,7 @@ function ausSitzungsdatei(
 
   let nachrichten: ChatNachricht[];
   try {
-    nachrichten = nachrichtenAus(block.format, schwanz(wahl.kandidat.pfad));
+    nachrichten = nachrichtenVomEnde(block.format, wahl.kandidat.pfad);
   } catch (e) {
     return leererStand(a, `Die Quelle liess sich nicht lesen: ${(e as Error).message}`, block.via, opt.jetztMs, opt.vorgabe);
   }

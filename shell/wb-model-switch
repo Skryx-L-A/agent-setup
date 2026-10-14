@@ -25,6 +25,51 @@ TMUX_BASIS=(); [ -n "$tmux_socket" ] && TMUX_BASIS=(-L "$tmux_socket")
 tmux() { command tmux "${TMUX_BASIS[@]}" "$@"; }
 json() { /usr/bin/python3 -c 'import json,sys; print(json.dumps({"ok":sys.argv[1]=="1","mode":sys.argv[2],"model":sys.argv[3],"meldung":sys.argv[4],"command":sys.argv[5]}, ensure_ascii=False))' "$@"; }
 fail() { json 0 "" "${model:-}" "$1" ""; exit "${2:-1}"; }
+live_resume_id() {  # <pane_pid> -> sessionId des lebenden claude-Prozesses, sonst nichts
+  /usr/bin/python3 - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions" "$1" <<'PYL'
+import json, os, re, subprocess, sys
+ordner, pane_pid = sys.argv[1], sys.argv[2]
+if not pane_pid.isdigit():
+    sys.exit(0)
+umg = dict(os.environ, LC_ALL="C", TZ="UTC")
+def ps(feld, pid):
+    # Wie wb-revive/wb-inbox: lstart unter LC_ALL=C TZ=UTC, sonst leer.
+    try:
+        r = subprocess.run(["ps", "-o", feld + "=", "-p", str(pid)], env=umg,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return " ".join(r.stdout.split()) if r.returncode == 0 else ""
+try:
+    namen = sorted(os.listdir(ordner))
+except OSError:
+    namen = []
+for n in namen:
+    if not n.endswith(".json"):
+        continue
+    try:
+        d = json.load(open(os.path.join(ordner, n)))
+        pid = int(d.get("pid"))
+    except Exception:
+        continue
+    kennung = d.get("sessionId")
+    if not isinstance(kennung, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", kennung):
+        continue
+    if pid != int(pane_pid) and ps("ppid", pid) != pane_pid:
+        continue
+    stat = ps("stat", pid)
+    if not stat or stat.startswith("Z"):
+        continue
+    start = d.get("procStart")
+    if isinstance(start, str) and start.strip():
+        if " ".join(start.split()) != ps("lstart", pid):
+            continue
+    elif "claude" not in ps("command", pid):
+        continue
+    print(kennung)
+    break
+PYL
+}
 
 state="${AWB_WB_STATE:-$HOME/.local/bin/wb-state}"
 [[ -x "$state" ]] || state="$(command -v wb-state 2>/dev/null || true)"
@@ -123,9 +168,33 @@ if [ "$restart" = 1 ]; then
   args=(--force --yes --model "$target_id")
   [ -n "$effort" ] && args+=(--effort "$effort")
   [ -n "$tmux_socket" ] && args+=(--tmux-socket "$tmux_socket")
-  "$revive" "${args[@]}" "$pane" >/dev/null || fail "Der sichere Neustart ist fehlgeschlagen; Modellstand unveraendert."
+  # Die Unterhaltung des LEBENDEN Prozesses (14.10.2026, wz-revivefix OPEN 1): ohne
+  # @wb_chat_session verlor ein Modellwechsel sie, weil wb-revive das Register nur fuer
+  # tote Panes liest. Die Kennung kommt aus dem Register des Pane-Prozesses selbst oder
+  # eines direkten Kindes (procStart muss passen); sonst keine Kennung, wb-revive
+  # entscheidet wie bisher (frisch, mit Warnung). Nur claude.
+  if [ "$current_harness" = claude ]; then
+    pane_pid="$(tmux display-message -p -t "$pane" '#{pane_pid}' 2>/dev/null || true)"
+    live_id="$(live_resume_id "$pane_pid" 2>/dev/null || true)"
+    if [ -n "$live_id" ]; then
+      args+=(--resume-id "$live_id")
+    fi
+  fi
+  # wb-revive meldet einen frischen Start auf stderr ("startet FRISCH ... -- <Grund>").
+  # Nur ohne diese Zeile gilt das Gespraech als fortgesetzt; sonst laut und ehrlich.
+  rv_rc=0
+  rv_err="$("$revive" "${args[@]}" "$pane" 2>&1 >/dev/null)" || rv_rc=$?
+  [ -n "$rv_err" ] && printf '%s\n' "$rv_err" >&2
+  [ "$rv_rc" = 0 ] || fail "Der sichere Neustart ist fehlgeschlagen; Modellstand unveraendert."
   mode="restart"
-  message="Pane neu gestartet; Gespraech mit '$target_id' fortgesetzt."
+  if printf '%s\n' "$rv_err" | grep -q 'startet FRISCH'; then
+    fresh_grund="$(printf '%s\n' "$rv_err" | sed -n 's/.*startet FRISCH.*-- //p' | head -1)"
+    fresh_grund="${fresh_grund:-kein Grund von wb-revive}"
+    message="Modell gewechselt, Gespraech NICHT fortgesetzt: $fresh_grund"
+    echo "wb-model-switch: $message" >&2
+  else
+    message="Pane neu gestartet; Gespraech mit '$target_id' fortgesetzt."
+  fi
   actual="wb-revive --model $target_id"
 else
   mode="slash"

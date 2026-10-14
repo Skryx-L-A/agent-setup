@@ -583,6 +583,19 @@ def main():
             ausgerollt.append((rel, "Symlink auf %s angelegt" % fall["ziel"]))
             print("  %s NEU verlinkt auf %s" % (rel, fall["ziel"]))
 
+    # Root-eigene Kopien (root_kopien, Anlass 14.10.2026: /usr/local/bin/wb-gast-tor auf
+    # peer stand still, waehrend ~/.local/bin den Fix trug). Dieses Werkzeug schreibt sie
+    # nie und ruft kein sudo -- es meldet laut, nennt den Befehl und faerbt den Exit-Code.
+    if c7:
+        for fall in wc.root_kopie_faelle(c7):
+            if fall["status"] != "verschieden":
+                continue
+            uebersprungen.append((fall["ziel"], "root-kopie-veraltet", fall["warum"]))
+            zeile = ("  %s UEBERSPRUNGEN (root-kopie-veraltet: %s weicht vom Repo-Stand ab) — "
+                     "von Hand: %s" % (fall["rel"], fall["ziel"], wc.root_kopie_befehl(fall)))
+            print(zeile)
+            print("wb-ausrollen: WARNUNG --" + zeile[1:], file=sys.stderr)
+
     hub_fehler = 0
     if c7:
         hub_fehler = _hub_teil(c7["repo_dir"], a.base, lauf_id, a.dry_run, a.hub_laden, ausgerollt)

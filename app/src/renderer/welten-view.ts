@@ -141,6 +141,8 @@ const z = {
   rueckfrage: null as { handlung: string; daten: Record<string, unknown>; text: string; warnungen: string[]; echt: boolean } | null,
   inspektor: true,
   gelesen: new Map<string, { zeit: string; id: string }>(),
+  /** Die Marke, die je Gespraech zuletzt an den Kern ging (auch wenn er sie abgelehnt hat). */
+  gelesenGesendet: new Map<string, { zeit: string; id: string }>(),
   rueckgabe: '' as string, rueckgabeText: '',
   profil: null as null | { agent: string; modell: string; denkstufe: string; fallback: string; fallbackDenkstufe: string; maschine: string; spezialgebiet: string },
   gedaechtnis: null as null | { agent: string; text: string; sha: string },
@@ -615,7 +617,11 @@ export function ungelesen(w: Welt, schluessel: string): number {
   const marke = neuer(w.mensch.gelesen[schluessel], z.gelesen.get(`${w.id}|${schluessel}`));
   return nachrichtenVon(w, schluessel).filter((n) => !n.von_mensch && (!marke || n.zeit > marke.zeit || (n.zeit === marke.zeit && n.id > marke.id))).length;
 }
-function gesehen(w: Welt, echt: boolean): void {
+// Lesestand: die lokale Marke folgt jeder Ansicht. An den Kern geht die Marke nur nach einer
+// Nutzerhandlung (`nutzer` = isTrusted des Klicks; der Testhaken meldet false) und je neuer Marke
+// hoechstens einmal. `null` heisst Hintergrund (neue Nutzlast, Einblenden des Blatts): dann nur
+// die lokale Marke, nie ein Aufruf an den Kern.
+function gesehen(w: Welt, nutzer: boolean | null): void {
   if (!sichtbarAn) return;
   const k = gespraechSchluessel();
   if (z.reiter !== 'chat' && k !== KANAL) return;
@@ -625,9 +631,13 @@ function gesehen(w: Welt, echt: boolean): void {
   const lokal = `${w.id}|${k}`;
   const alt = z.gelesen.get(lokal);
   if (!alt || letzte.zeit > alt.zeit || (letzte.zeit === alt.zeit && letzte.id > alt.id)) z.gelesen.set(lokal, { zeit: letzte.zeit, id: letzte.id });
+  if (nutzer === null) return;
   const imWelt = w.mensch.gelesen[k];
   if (imWelt && (imWelt.zeit > letzte.zeit || (imWelt.zeit === letzte.zeit && imWelt.id >= letzte.id))) return;
-  void ausfuehren('gelesen', { welt: w.pfad, gespraech: k, zeit: letzte.zeit, id: letzte.id }, echt, false, true);
+  const gesendet = z.gelesenGesendet.get(lokal);
+  if (gesendet && (gesendet.zeit > letzte.zeit || (gesendet.zeit === letzte.zeit && gesendet.id >= letzte.id))) return;
+  z.gelesenGesendet.set(lokal, { zeit: letzte.zeit, id: letzte.id });
+  void ausfuehren('gelesen', { welt: w.pfad, gespraech: k, zeit: letzte.zeit, id: letzte.id }, nutzer, false, true);
 }
 
 // --- Handlungen ------------------------------------------------------------------------
@@ -3193,7 +3203,7 @@ export function weltenAufgaben(p: unknown): void {
   };
   zeichnen();
   const w = welt();
-  if (w) gesehen(w, true);
+  if (w) gesehen(w, null);
 }
 
 export function weltenSichtbar(): boolean { return sichtbarAn; }
@@ -3202,7 +3212,7 @@ export function weltenAnzeigen(an: boolean): void {
   if (!blatt) return;
   sichtbarAn = an;
   blatt.classList.toggle('an', an);
-  if (an) { lageSetzen(); zeichnen(); const w = welt(); if (w) gesehen(w, true); }
+  if (an) { lageSetzen(); zeichnen(); const w = welt(); if (w) gesehen(w, null); }
   if (an && !uhr) uhr = setInterval(uhrenStellen, 1000);
   if (!an && uhr) { clearInterval(uhr); uhr = null; }
   sichtbarkeitMelden();

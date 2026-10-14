@@ -27,6 +27,8 @@ import { gastQuellenAus, type GastQuelle } from './gasttor';
 import {
   askMuster as askMusterAusEinstellungen,
   maschinenAktiv,
+  maschinenliste,
+  maschinenPausiert,
   zahlAus,
   type AskMuster,
 } from './einstellungen';
@@ -189,6 +191,16 @@ export interface Config {
    */
   remoteMachines: string[];
   /**
+   * ALLE eingetragenen Fernmaschinen, auch die pausierten, und die pausierten
+   * fuer sich (14.10.). Die Pause (`remoteMachinesPausiert`) nimmt eine Maschine
+   * aus dem Abruf und der Anzeige, nicht aus der Sicherheit: die Weitergabe von
+   * Kopplung und Widerruf (mobile/replikation.ts) braucht den ssh-Namen auch
+   * dann, sonst bliebe ein widerrufenes Geraet auf der Gegenstelle gueltig.
+   * Mit `AWB_REMOTE_MACHINES` gilt dieselbe Liste fuer beide, ohne Pausen.
+   */
+  remoteMachinesAlle: string[];
+  remoteMachinesPausiert: string[];
+  /**
    * GAST-TOR-QUELLEN (27.09.2026, gasttor.ts): ferne Maschinen, die nur ueber
    * `wb-gast-tor` erreichbar sind. Nur ueber die Umgebung (`AWB_GAST_SOURCES`
    * oder ein Profil in `AWB_GAST_PROFILE`) -- der Starter des Gastes setzt sie;
@@ -295,7 +307,27 @@ function portAus(wert: unknown, vorgabe: number): number {
   return Number.isSafeInteger(n) && n >= 1 && n <= 65535 ? n : vorgabe;
 }
 
-export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env): Config {
+/**
+ * Den Zugang zum Mantel-Socket aus der Umgebung NEHMEN, nicht nur lesen
+ * (13.10.2026, Auftrag wz-mantel). Stehen AWB_MANTEL_SOCKET/AWB_MANTEL_TOKEN
+ * weiter in `process.env`, erbt sie jedes Kind: der tmux-Server und damit
+ * jede Agenten-Shell in jedem Pane (gemessen: beide Namen im Env des
+ * tmux-Servers und einer Agenten-Shell). Kein Kind braucht sie -- die
+ * Werkzeuge reden ueber den Steuerkanal, nur die App spricht am Mantel-Socket.
+ * main.ts ruft das VOR dem ersten Kindstart (`pfadHerrichten`).
+ */
+export function mantelZugangEntnehmen(env: NodeJS.ProcessEnv = process.env): { socket: string; token: string } {
+  const zugang = { socket: env.AWB_MANTEL_SOCKET ?? '', token: env.AWB_MANTEL_TOKEN ?? '' };
+  delete env.AWB_MANTEL_SOCKET;
+  delete env.AWB_MANTEL_TOKEN;
+  return zugang;
+}
+
+export function loadConfig(
+  argv: string[],
+  env: NodeJS.ProcessEnv = process.env,
+  mantel: { socket: string; token: string } = mantelZugangEntnehmen(env),
+): Config {
   const file = readConfigFile(env);
   // Die geteilte Datei. Sie wird HIER schon gebraucht, weil ein Teil der
   // Startwerte dort zuhause ist -- dieselbe Ableitung wie beim Feld
@@ -318,8 +350,8 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
     controlSocket: flag('control-socket') ?? defaultControlSocketPath(env),
     shotDir: flag('shot-dir') ?? env.AWB_SHOT_DIR ?? file.shotDir ?? join(tmpdir(), 'agent-workbench-shots'),
     headless: argv.includes('--headless') || env.AWB_HEADLESS === '1' || file.headless === true,
-    mantelSocket: env.AWB_MANTEL_SOCKET ?? '',
-    mantelToken: env.AWB_MANTEL_TOKEN ?? '',
+    mantelSocket: mantel.socket,
+    mantelToken: mantel.token,
     ownedCols: num(flag('cols') ?? env.AWB_COLS, file.ownedCols ?? 120),
     ownedRows: num(flag('rows') ?? env.AWB_ROWS, file.ownedRows ?? 34),
     sessionsDir: env.AWB_SESSIONS_DIR ?? file.sessionsDir ?? join(homedir(), '.claude', 'workbench', 'sessions'),
@@ -377,6 +409,10 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
     remoteMachines: (env.AWB_REMOTE_MACHINES !== undefined
       ? env.AWB_REMOTE_MACHINES.split(',').map((s) => s.trim()).filter(Boolean)
       : maschinenAktiv(einstellungen)),
+    remoteMachinesAlle: (env.AWB_REMOTE_MACHINES !== undefined
+      ? env.AWB_REMOTE_MACHINES.split(',').map((s) => s.trim()).filter(Boolean)
+      : maschinenliste(einstellungen)),
+    remoteMachinesPausiert: (env.AWB_REMOTE_MACHINES !== undefined ? [] : maschinenPausiert(einstellungen)),
     ...(() => {
       const g = gastQuellenAus(env);
       return { gastQuellen: g.quellen, gastQuellenFehler: g.fehler };

@@ -337,6 +337,14 @@
       "messungen",
       "systemd"
     ],
+    "_comment_root_kopien": "Kopien, die einem anderen Konto gehoeren (root) und die weder wb-ausrollen noch ein Agent schreiben darf. wb-consistency meldet KOPIE-ROOT-VERALTET (error), wb-ausrollen nennt den sudo-Befehl und endet mit Exit 1; ausgefuehrt wird nichts. Fehlt das Ziel auf einer Maschine, ist das kein Befund. Anlass 14.10.2026 (fi-b): /usr/local/bin/wb-gast-tor auf peer stand seit 27.09. still.",
+    "root_kopien": [
+      {
+        "repo": "shell/wb-gast-tor",
+        "ziel": "/usr/local/bin/wb-gast-tor",
+        "grund": "Zwangsbefehl des Gast-Schluessels in ~/.ssh/authorized_keys (peer), root-eigen, damit der Gast sie nicht aendern kann"
+      }
+    ],
     "repo_dir": "{REPO}",
     "install_map": [
       [
