@@ -22,6 +22,10 @@ Zwei Wege:
   gelesen wird der vorgemerkte Stand (`git show :pfad`).
 - `braincli.doctor` importiert `pruefe()` und `ist_wissensnotiz()`.
 
+Dazu der KERN-Hinweis (Idee 3, 2026-10-14): steht ein `20-projects/<p>/KERN.md` im Commit und
+waechst dabei oder liegt ueber dem Budget (3200 Zeichen Koerper), kommt eine Zeile auf stderr.
+Nur Text: der Commit geht immer durch. Schalter: BRAIN_KERN_HINWEIS=0.
+
 Nur Standardbibliothek: der Hook laeuft mit dem System-python3.
 """
 from __future__ import annotations
@@ -39,6 +43,9 @@ ZWEIGE = ("10-global/", "20-projects/", "30-topics/", "40-people/")
 AUSGENOMMEN_NAMEN = {"KERN.md", "MOC.md", "STATUS.md", "README.md", "brain-vorschlaege.md",
                      "review-queue.md", "DECISIONS.md"}  # DECISIONS.md: vom Gärtner erzeugt
 ERSTE_ZEILE = ("Für künftige Sessions", "Fuer kuenftige Sessions")
+# KERN-Hinweis: Budget wie braincli.doctor._kern und session-context.sh (Vorgabe 3200 Zeichen)
+KERN_BUDGET = 3200
+KERN_PFAD = re.compile(r"^20-projects/[^/]+/KERN\.md$")
 
 
 def ist_wissensnotiz(rel: str) -> bool:
@@ -123,27 +130,71 @@ def schema_zaehlung(vault: str, beispiele: int = 5) -> dict | None:
             "beispiele_neu": [f"{n.rel}: {n.text()}" for n in b.neu[:beispiele]]}
 
 
-def _staged_alle(top: str, namen: list[str]) -> dict[str, str]:
-    """Vorgemerkter Stand mehrerer Dateien in EINEM git-Aufruf (`cat-file --batch`): ein Aufruf je
-    Datei kostete bei 50 Dateien 1,4 s, so bleibt ein Commit unter einer halben Sekunde."""
-    if not namen:
-        return {}
-    eingabe = "".join(f":{n}\n" for n in namen).encode("utf-8")
+def _blobs(top: str, objekte: list[str]) -> list[str | None]:
+    """Inhalt mehrerer git-Objekte (`:pfad` = Index, `HEAD:pfad` = letzter Commit) in EINEM git-Aufruf
+    (`cat-file --batch`): ein Aufruf je Datei kostete bei 50 Dateien 1,4 s, so bleibt ein Commit unter
+    einer halben Sekunde. None, wo das Objekt fehlt."""
+    if not objekte:
+        return []
+    eingabe = "".join(f"{o}\n" for o in objekte).encode("utf-8")
     r = subprocess.run(["git", "-C", top, "cat-file", "--batch"], input=eingabe, capture_output=True)
-    out: dict[str, str] = {}
+    out: list[str | None] = []
     daten, pos = r.stdout, 0
-    for n in namen:
+    for _ in objekte:
         ende = daten.find(b"\n", pos)
         if ende == -1:
-            break
+            out.append(None)
+            continue
         kopf = daten[pos:ende].split()
         pos = ende + 1
         if len(kopf) != 3 or kopf[1] != b"blob":          # `<name> missing` u.a.
+            out.append(None)
             continue
         groesse = int(kopf[2])
-        out[n] = daten[pos:pos + groesse].decode("utf-8", errors="replace")
+        out.append(daten[pos:pos + groesse].decode("utf-8", errors="replace"))
         pos += groesse + 1
     return out
+
+
+def _staged_alle(top: str, namen: list[str]) -> dict[str, str]:
+    """Vorgemerkter Stand mehrerer Dateien in EINEM git-Aufruf (siehe `_blobs`)."""
+    if not namen:
+        return {}
+    texte = _blobs(top, [f":{n}" for n in namen])
+    return {n: t for n, t in zip(namen, texte) if t is not None}
+
+
+def kern_koerper(text: str) -> int:
+    """Zeichen des KERN-Koerpers: der Text ohne Frontmatter, gezaehlt wie `braincli.doctor._kern`."""
+    if text.startswith("---\n") and "\n---\n" in text[4:]:
+        text = text[4:].split("\n---\n", 1)[1]
+    return len(text)
+
+
+def kern_hinweise(top: str, praefix: str, namen: list[str]) -> list[str]:
+    """Eine Zeile je vorgemerkter KERN.md, die ueber dem Budget liegt (Zuwachs im Commit steht dabei). `praefix` wie in
+    main(). Ohne KERN im Commit kein git-Aufruf."""
+    if os.environ.get("BRAIN_KERN_HINWEIS", "1") == "0":
+        return []
+    kerns = [n for n in namen if KERN_PFAD.match(praefix + n)]
+    if not kerns:
+        return []
+    # Index und HEAD in einem git-Aufruf: jeder Aufruf kostet gemessen rund 12 ms Startzeit (macOS)
+    blobs = _blobs(top, [f":{n}" for n in kerns] + [f"HEAD:{n}" for n in kerns])
+    neu, alt = blobs[:len(kerns)], blobs[len(kerns):]
+    hinweise = []
+    for n, text, vorher_text in zip(kerns, neu, alt):
+        if text is None:
+            continue
+        zeichen = kern_koerper(text)
+        vorher = kern_koerper(vorher_text) if vorher_text is not None else 0
+        if zeichen <= KERN_BUDGET:
+            continue
+        zusatz = f", +{zeichen - vorher} in diesem Commit" if zeichen > vorher else ""
+        hinweise.append(f"KERN-Hinweis: {praefix + n}: {zeichen} Zeichen, Budget {KERN_BUDGET}{zusatz}. "
+                        "Neue Lehren nach FALLEN.yaml oder in eine Entscheidungsnotiz statt in den KERN; "
+                        "Älteres aus dem KERN kürzen. Nur ein Hinweis, der Commit geht durch.")
+    return hinweise
 
 
 def _staged(top: str, rel: str) -> str | None:
@@ -185,6 +236,9 @@ def main(argv: list[str] | None = None) -> int:
         print("Notiz-Lint (Warnung, blockiert nicht; Regeln: AGENTS.md \"Schreiben\", "
               "Vorlagen _meta/templates/):", file=sys.stderr)
         print("\n".join(befunde), file=sys.stderr)
+    hinweise = kern_hinweise(top, praefix, namen)       # nach dem Lint: ein Fehler hier nimmt ihm nichts
+    if hinweise:
+        print("\n".join(hinweise), file=sys.stderr)
     return 0
 
 

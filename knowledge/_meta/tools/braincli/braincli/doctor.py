@@ -132,6 +132,101 @@ def _standby(vault: Path, now: dt.datetime, lesen=None) -> dict | None:
         "important": wichtig, "examples": [text]}
 
 
+# Forgejo-Sicherung (SSH-backup-extern, 14.10.): peer schreibt nach jedem Dump eine age-verschluesselte Kopie auf
+# den my-server (`forgejo-backup-extern`) und testet monatlich die Wiederherstellung daraus
+# (`forgejo-restore-test`). Beide schreiben eine Statusdatei; doctor meldet Rot oder ein zu altes letztes Gruen.
+# Auf peer lokal gelesen, anderswo hoechstens 1x je Stunde per ssh peer. Keine Statusdatei erreichbar: still.
+SICHERUNG_STATUS = {"extern": "/var/lib/forgejo-backup-extern/status.json",
+                    "wiederherstellung": "/var/lib/forgejo-restore-test/status.json"}
+SICHERUNG_FELD = {"extern": "letzter_erfolg", "wiederherstellung": "letzter_gruen"}
+SICHERUNG_GRENZE_H = {"extern": 50, "wiederherstellung": 35 * 24}
+SICHERUNG_UNIT = {"extern": "forgejo-backup-extern", "wiederherstellung": "forgejo-restore-test"}
+SICHERUNG_NAME = {"extern": "Forgejo-Sicherung extern", "wiederherstellung": "Forgejo-Wiederherstellungstest"}
+SICHERUNG_SSH = "peer"
+SICHERUNG_INTERVALL_S = 3600
+
+
+def _sicherung_lesen() -> dict | None:
+    """Beide Statusdateien als {art: dict|None}; None, wenn keine erreichbar ist."""
+    if any(Path(p).exists() for p in SICHERUNG_STATUS.values()):
+        out = {}
+        for art, p in SICHERUNG_STATUS.items():
+            try:
+                d = json.loads(Path(p).read_text(encoding="utf-8"))
+                out[art] = d if isinstance(d, dict) else None
+            except (OSError, ValueError):
+                out[art] = None
+        return out
+    host = os.environ.get("BRAIN_SICHERUNG_SSH", SICHERUNG_SSH)
+    skript = "; ".join(f"jq -c . {p} 2>/dev/null || echo null" for p in SICHERUNG_STATUS.values())
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, skript],
+                           capture_output=True, text=True, timeout=STANDBY_ZEITLIMIT_S)
+        zeilen = r.stdout.splitlines() if r.returncode == 0 else []
+        werte = [json.loads(z) for z in zeilen]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if len(werte) != len(SICHERUNG_STATUS) or all(w is None for w in werte):
+        return None
+    return {art: (w if isinstance(w, dict) else None) for art, w in zip(SICHERUNG_STATUS, werte)}
+
+
+def _sicherung(vault: Path, now: dt.datetime, lesen=None) -> dict | None:
+    """Externe Kopie und monatlicher Wiederherstellungstest: wichtig bei ROT, fehlender Statusdatei oder
+    letztem Erfolg aelter als 50 h (extern) bzw. 35 Tage (Test). Zwischenspeicher `state/sicherung.json`."""
+    if os.environ.get("BRAIN_SICHERUNG_PRUEFUNG", "1") == "0":
+        return None
+    pfad = Path(vault) / "_meta" / "tools" / "state" / "sicherung.json"
+    lokal = any(Path(p).exists() for p in SICHERUNG_STATUS.values()) and lesen is None
+    try:
+        alt = json.loads(pfad.read_text(encoding="utf-8"))
+        alt = alt if isinstance(alt, dict) else {}
+    except (OSError, ValueError):
+        alt = {}
+    jetzt = now.timestamp()
+    versuch = alt.get("versuch")
+    if lokal or not isinstance(versuch, (int, float)) or not 0 <= jetzt - versuch < SICHERUNG_INTERVALL_S:
+        stand = (lesen or _sicherung_lesen)()
+        alt = {"versuch": jetzt, "stand": stand if stand is not None else alt.get("stand")}
+        if not lokal:
+            try:
+                pfad.parent.mkdir(parents=True, exist_ok=True)
+                tmp = pfad.with_suffix(".neu")
+                tmp.write_text(json.dumps(alt) + "\n", encoding="utf-8")
+                tmp.replace(pfad)
+            except OSError:
+                pass
+    stand = alt.get("stand")
+    if not isinstance(stand, dict):
+        return None
+    result, texte = {}, []
+    for art in SICHERUNG_STATUS:
+        d = stand.get(art)
+        name, unit = SICHERUNG_NAME[art], SICHERUNG_UNIT[art]
+        if not isinstance(d, dict):
+            result[art] = {"ergebnis": None, "important": True}
+            texte.append(f"{name}: keine Statusdatei ({SICHERUNG_STATUS[art]})")
+            continue
+        erg, letzt = d.get("ergebnis"), d.get(SICHERUNG_FELD[art]) or None
+        try:
+            alter_h = (now - dt.datetime.fromisoformat(letzt)).total_seconds() / 3600 if letzt else None
+        except (TypeError, ValueError):
+            alter_h = None
+        wichtig = erg == "ROT" or alter_h is None or alter_h > SICHERUNG_GRENZE_H[art]
+        result[art] = {"ergebnis": erg, "zeit": d.get("zeit"), SICHERUNG_FELD[art]: letzt,
+                       "alter_h": round(alter_h, 1) if alter_h is not None else None, "important": wichtig}
+        if erg == "ROT":
+            grund = d.get("grund") or "; ".join(d.get("rot_gruende") or [])
+            texte.append(f"{name} ROT ({d.get('zeit')}): {grund} (journalctl -u {unit})")
+        elif wichtig:
+            seit = f"seit {alter_h / 24:.0f} Tagen" if alter_h is not None else "noch nie"
+            texte.append(f"{name} {seit} nicht erfolgreich (systemctl status {unit})")
+    wichtig = any(v["important"] for v in result.values())
+    if not texte:
+        texte.append(" / ".join(f"{SICHERUNG_NAME[a]} {v['ergebnis']} ({v['alter_h']:.0f} h)" for a, v in result.items()))
+    return {**result, "important": wichtig, "examples": texte}
+
+
 def _last_success(vault: Path) -> dict:
     data = gardener_wrap.status(vault).get("last_run") or {}
     if data.get("status") != "ok" or not data.get("finished"):
@@ -726,6 +821,10 @@ def inspect(vault: Path, home: Path | None = None, now: dt.datetime | None = Non
     except Exception:  # die Standby-Pruefung darf doctor nie zu Fall bringen
         standby = None
     try:
+        sicherung = _sicherung(vault, now)
+    except Exception:  # die Sicherungspruefung darf doctor nie zu Fall bringen
+        sicherung = None
+    try:
         prot = protokoll(vault, now, len(notes))
     except Exception:  # das Protokoll darf doctor nie zu Fall bringen
         prot = None
@@ -762,6 +861,8 @@ def inspect(vault: Path, home: Path | None = None, now: dt.datetime | None = Non
         result["messwache"] = wache
     if standby is not None:
         result["standby"] = standby
+    if sicherung is not None:
+        result["sicherung"] = sicherung
     if kanon_result is not None:
         result["kanon"] = kanon_result
     result["important"] = any(item.get("important", False) for item in result.values() if isinstance(item, dict))
@@ -784,6 +885,8 @@ def inspect(vault: Path, home: Path | None = None, now: dt.datetime | None = Non
         important.append(f"Suchwache {wache['ergebnis']}: " + "; ".join(wache["examples"][:2]))
     if standby and standby["important"]:
         important.append(standby["examples"][0])
+    if sicherung and sicherung["important"]:
+        important.extend(sicherung["examples"])
     if kanon_result and kanon_result["important"]:
         important.append(f"{kanon_result['count']} kanonische Seite(n) veraltet (brain doctor --json, Feld kanon)")
     result["summary"] = ", ".join(important)
@@ -848,6 +951,10 @@ def run(vault: Path, as_json: bool = False) -> int:
         sb = result.get("standby")
         if sb:
             print(f"Standby: {sb['examples'][0]}{' ALARM' if sb['important'] else ''} (gemessen {sb['gemessen']})")
+        si = result.get("sicherung")
+        if si:
+            print(f"Sicherung: {'ALARM' if si['important'] else 'ok'}")
+            for example in si.get("examples", []): print(f"  {example}")
         n = result.get("nutzung")
         if n:
             sv = n["suche_vor_edit"]

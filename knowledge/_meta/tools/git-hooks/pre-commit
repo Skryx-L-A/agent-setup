@@ -3,6 +3,8 @@
 # Gilt fuer Kern, Kern-Worktrees und Space-Repos (20-projects/<p>/.git): der Linter wird in
 # der Repo-Wurzel oder einem Elternordner gesucht; die Vault-Wurzel ist der Ordner, der ihn
 # traegt. Installation: git-hooks/install-notiz-lint.sh. Abschalter: BRAIN_NOTIZ_LINT=0.
+# Zweiter Hinweis im selben Aufruf (2026-10-14): KERN.md ueber Budget oder im Commit gewachsen
+# (notiz_lint.py kern_hinweise, nur stderr). Abschalter nur dafuer: BRAIN_KERN_HINWEIS=0.
 [ "${BRAIN_NOTIZ_LINT:-1}" = "0" ] && exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 top="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0

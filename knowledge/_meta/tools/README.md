@@ -336,6 +336,9 @@ Jedes Stück lässt sich über die Umgebung abschalten.
   `sh _meta/tools/git-hooks/install-notiz-lint.sh [~/Knowledge]`; Kern-Worktrees teilen die Hooks des
   Kerns, Spaces brauchen den eigenen Eintrag. Abschalter `BRAIN_NOTIZ_LINT=0`. `brain doctor` meldet
   dieselben Befunde für die letzten 14 Tage (`notiz_lint`, nie „important“).
+  Seit 14.10. zusätzlich ein KERN-Hinweis: Liegt eine `KERN.md` im Commit über 3200 Zeichen Körper (Zählung wie
+  `brain doctor`), schlägt der Hook FALLEN.yaml oder eine Entscheidungsnotiz für neue Lehren vor; blockiert nie,
+  Abschalter `BRAIN_KERN_HINWEIS=0` (Idee 3c der Brain-Prüfung).
 - **Nutzungsmonitor (#6, `brain doctor`, Abschnitt `nutzung`):** Aus den Claude-Transkripten dieser
   Maschine der letzten 7 Tage: Anteil maschineller Auslöser des Auto-Recalls (Alarm über 10 %,
   erscheint dann in der SessionStart-Zeile „Vault-Pflege“), Anteil nichttrivialer Sitzungen mit
