@@ -86,6 +86,12 @@ export interface RemoteSnapshot {
    * fehlt.
    */
   absturzRaw: string;
+  /**
+   * NUR BEI EINER GAST-TOR-QUELLE (27.09.2026, gasttor.ts): wer dort als Gast
+   * gilt und welche Projektordner freigegeben sind -- so, wie das Tor es mit
+   * `liste --json` selbst meldet. Fehlt bei jeder gewoehnlichen Fernmaschine.
+   */
+  gast?: { person: string; projekte: string[] };
 }
 
 const SECTION_MARK = 'SECTION:';
@@ -109,6 +115,7 @@ function leererStand(machine: string, error: string, vorheriger?: RemoteSnapshot
     hygieneRaw: vorheriger?.hygieneRaw ?? '',
     repoRaw: vorheriger?.repoRaw ?? '',
     absturzRaw: vorheriger?.absturzRaw ?? '',
+    ...(vorheriger?.gast ? { gast: vorheriger.gast } : {}),
   };
 }
 
@@ -321,6 +328,14 @@ export interface RemotePollerOptions {
   relAbsturzLog?: string;
   /** Testhaken: ein anderes Programm statt `ssh` anspringen. */
   sshBin?: string;
+  /**
+   * GAST-TOR (27.09.2026, gasttor.ts): statt `ssh <host> bash -s` samt
+   * Fernskript eine feste Befehlszeile je Host, ohne stdin -- das Tor laesst
+   * keine Shell zu. Liefert die GANZE argv, Programm eingeschlossen.
+   */
+  befehlFuer?: (host: string) => string[];
+  /** Zu `befehlFuer`: wie die Antwort gelesen wird (sonst `parseFernAusgabe`). */
+  auswerten?: (host: string, raw: string) => RemoteSnapshot;
 }
 
 /**
@@ -398,6 +413,11 @@ export class RemotePoller {
     this.timer = null;
   }
 
+  /** Sofort einen Abruf anstossen (nach einem Start oder Schliessen), ohne den Takt zu verschieben. */
+  auffrischen(): void {
+    if (this.hosts.length) this.tick();
+  }
+
   snapshots(): RemoteSnapshot[] {
     return this.hosts.map((h) => this.cache.get(h)).filter((s): s is RemoteSnapshot => !!s);
   }
@@ -429,12 +449,21 @@ export class RemotePoller {
 
   private pollOne(host: string): Promise<void> {
     return new Promise((resolve) => {
-      const kind = spawn(
-        this.opt.sshBin ?? 'ssh',
-        ['-o', 'ConnectTimeout=4', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', host, 'bash', '-s'],
-        { stdio: ['pipe', 'pipe', 'pipe'] },
-      );
+      const eigene = this.opt.befehlFuer?.(host);
+      const kind = eigene
+        ? spawn(eigene[0], eigene.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
+        : spawn(
+          this.opt.sshBin ?? 'ssh',
+          ['-o', 'ConnectTimeout=4', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', host, 'bash', '-s'],
+          { stdio: ['pipe', 'pipe', 'pipe'] },
+        );
       let out = '';
+      // Nur fuer den Gast-Weg gelesen: dort sagt das Tor auf stderr, WARUM es
+      // ablehnt, und dieser Satz gehoert in den Grund statt nur der Code.
+      let fehlerText = '';
+      kind.stderr?.on('data', (d: Buffer) => {
+        if (fehlerText.length < 2000) fehlerText += d.toString('utf8');
+      });
       let fertig = false;
       const beenden = (grund: string) => {
         if (fertig) return;
@@ -467,12 +496,13 @@ export class RemotePoller {
         fertig = true;
         clearTimeout(uhr);
         if (code !== 0) {
-          this.fehlschlag(host, `ssh beendet mit Code ${code}`);
+          const letzte = eigene ? fehlerText.trim().split('\n').filter(Boolean).pop() ?? '' : '';
+          this.fehlschlag(host, `ssh beendet mit Code ${code}${letzte ? ` (${letzte})` : ''}`);
           resolve();
           return;
         }
         try {
-          this.cache.set(host, parseFernAusgabe(host, out));
+          this.cache.set(host, (this.opt.auswerten ?? parseFernAusgabe)(host, out));
           this.fehlversuche.delete(host);
         } catch (e) {
           this.fehlschlag(host, (e as Error).message);
@@ -484,6 +514,7 @@ export class RemotePoller {
       // genuegt --, faellt der Fehler ASYNCHRON an und waere ohne diesen
       // Listener eine unbehandelte Ausnahme im Hauptprozess. Ein misslungener
       // Abruf ist ein Fehlversuch, kein Grund, das Fenster mitzunehmen.
+      if (eigene || !kind.stdin) return;
       kind.stdin.on('error', (e: NodeJS.ErrnoException) => beenden(`Das Skript liess sich nicht schicken (${e.code ?? e.message})`));
       kind.stdin.write(fernSkript(this.opt.relSessionsDir, this.opt.relTestsuiteStatus, this.opt.relHygieneStatus, this.opt.relAbsturzLog ?? ''));
       kind.stdin.end();

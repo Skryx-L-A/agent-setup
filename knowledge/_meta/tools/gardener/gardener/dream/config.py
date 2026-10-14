@@ -552,7 +552,7 @@ TRASH_SNAPSHOT_REL = Path(".local") / "trash-snapshots"
 # Vault-relative areas the dream may never create or rewrite, whatever a
 # verdict says: 00-sources is the immutable input layer (DREAM-PLAN.md
 # Abschnitt 12), review-queue.md is written through issues.py's own section
-# only, and _meta/90-secrets are already refused by the write gate itself.
+# only, and _meta/secrets are already refused by the write gate itself.
 APPLY_FORBIDDEN_PREFIXES = (STAGING_DIR + "/",)
 APPLY_FORBIDDEN_FILES = ("review-queue.md", "HOT.md", "INDEX.md",
                          "CRITICAL-FACTS.md", "OPEN-QUESTIONS.md", "LOG.md")

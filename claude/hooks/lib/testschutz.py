@@ -186,7 +186,9 @@ def gate_commands_laden(id_, base):
 def genannte_pfade_aus_gate(gate_commands):
     pfade = []
     for befehl in gate_commands:
-        for tok in befehl.split():
+        # Trenner ohne Leerzeichen (`bash a/t.sh&&bash b/t.sh`) und Klammern
+        # zaehlen als Wortgrenze, sonst hiesse der erste Pfad `a/t.sh&&bash`.
+        for tok in re.split(r'[\s;&|()]+', befehl):
             if tok.startswith('-') or '/' not in tok:
                 continue
             pfade.append(tok.rstrip('/'))
@@ -720,7 +722,7 @@ def _befehl(stage, vm):
     return name, rest
 
 
-def _heredoc_pruefen(b, schutz, vm, depth):
+def _heredoc_pruefen(b, schutz, vm, depth, umdefiniert=False):
     anweisungen = cs.all_statements(b['prefix'])
     if not anweisungen or anweisungen[-1] is None:
         return "Here-Doc mit nicht zerlegbarem Kopf"
@@ -738,6 +740,51 @@ def _heredoc_pruefen(b, schutz, vm, depth):
     programm = cs.interpreter_program(name, rest)
     if programm and programm[0] == 'stdin' and schreibt(b['body']):
         return "Here-Doc an %s ruft eine Schreib- oder Loeschfunktion auf" % name
+    return _heredoc_empfaenger_pruefen(b, schutz, vm, depth, umdefiniert)
+
+
+def _heredoc_empfaenger_pruefen(b, schutz, vm, depth, umdefiniert):
+    """Zusatzpruefung seit 2026-10-09, nur verschaerfend: die Pruefung oben
+    sieht allein den Befehl vor dem `<<`. Empfaenger ist aber JEDE Stufe, die
+    den Rumpf liest -- auch die hinter dem Operator (`cat <<'EOF' | bash`).
+    Steht der Empfaenger nicht sicher in der Zeile (`|` am Zeilenende,
+    `> >(bash)`, `tee >(bash)`, Fortsetzungszeile), gilt der Rumpf als
+    Befehlstext, ebenso bei einem unbekannten Empfaenger. Definiert der
+    Befehl Funktionen/Aliase, liest er Dateien ein oder aendert PATH
+    (`cat() { bash; }`), sagt kein Empfaengername mehr etwas."""
+    def als_befehle(wer):
+        r = finde_verstoss(b['body'], schutz, vm, depth + 1)
+        return ("Here-Doc an %s: %s" % (wer, r)) if r else None
+
+    if umdefiniert:
+        return als_befehle("einen Empfaenger in einem Befehl, der Befehle umdefiniert")
+    empfaenger = cs.heredoc_receiver_stages(b)
+    if empfaenger is None:
+        return als_befehle("einen Empfaenger, der nicht in der Zeile steht")
+    for stufe in empfaenger:
+        name, rest = _befehl(stufe, vm)
+        if not name:
+            return als_befehle("einen nicht erkennbaren Empfaenger")
+        rest = [cs.resolve_vars(t, vm) for t in rest]
+        if name in cs.SHELL_INTERPRETERS:
+            if not cs.shell_c_script(rest)[0] and _shell_liest_stdin(rest):
+                return als_befehle(name)
+            continue
+        if name in ('source', '.') and rest[:1] in (['/dev/stdin'], ['-']):
+            return als_befehle(name)
+        programm = cs.interpreter_program(name, rest)
+        if programm:
+            if programm[0] == 'stdin' and schreibt(b['body']):
+                return "Here-Doc an %s ruft eine Schreib- oder Loeschfunktion auf" % name
+            continue
+        if name in NUR_LESEND:
+            continue
+        if cs.heredoc_stage_reads_data(stufe) and not (
+                name in ('git', 'gh') and cs.heredoc_kopf_unsicher(b)):
+            continue
+        r = als_befehle(name)
+        if r:
+            return r
     return None
 
 
@@ -827,9 +874,19 @@ def finde_verstoss(command_text, schutz, varmap=None, depth=0):
         r = finde_verstoss(inner, schutz, varmap, depth + 1)
         if r:
             return "Kommandosubstitution: %s" % r
+    # Here-Doc in einem mehrteiligen Befehl: jeder Rumpf, auch einer in
+    # `$( )`, wird zusaetzlich als Befehlstext geprueft, egal an wen er geht
+    # (cs.heredoc_mehrteilig, Betreiberentscheidung 2026-10-09).
+    if cs.heredoc_mehrteilig(teile):
+        for b in teile.bodies:
+            r = finde_verstoss(b['body'], schutz, varmap, depth + 1)
+            if r:
+                return ("Here-Doc in einem mehrteiligen Befehl (Rumpf als Befehl geprueft): %s. %s"
+                        % (r, cs.HEREDOC_MEHRTEILIG_AUSWEG))
+    umdefiniert = cs.may_redefine_commands(teile.text)
     for b in teile.bodies:
         if b['top']:
-            r = _heredoc_pruefen(b, schutz, varmap, depth)
+            r = _heredoc_pruefen(b, schutz, varmap, depth, umdefiniert)
             if r:
                 return r
 

@@ -9,12 +9,55 @@ er aendert keinen handgeschriebenen Satz - er haengt nur in seinem eigenen
 Markerblock an - und er pusht nie.
 
 Usage:
-    brain search <query> [-k N] [--json] [--no-validity]
-                          # Treffer mit abgeloesten Aussagen tragen [~], werden
-                          # abgewertet und nie ausgeblendet; --no-validity oder
+    brain search <query> [-k N] [--json] [--no-validity] [--space NAME]
+    brain frage <frage> [--motor peer|claude] [--modell M] [-k N] [--space NAME] [--json]
+                          # kurze Antwort, jeder Satz mit pfad:zeile, jedes Zitat
+                          # deterministisch geprueft; sonst "Nicht im Vault belegt."
+                          # Exit 1 ohne belegten Satz. Nicht fuer Hooks.
+                          # Abgeloeste Treffer (Frontmatter status/superseded-by/
+                          # valid-until, sonst claims.db) tragen [~], werden
+                          # abgewertet und nie ausgeblendet; ein fehlender Nachfolger
+                          # wird eingereiht [+] (BRAIN_VALIDITY_NACHFOLGER=0 aus); --no-validity oder
                           # BRAIN_VALIDITY=0 schaltet das ab, ohne den Index
-                          # anzufassen
+                          # anzufassen. --space filtert auf einen gemounteten
+                          # Space (`kern` = Wurzel), braucht `brain spaces sync`
+                          # BRAIN_EMBED_MODELL waehlt das Einbettungsmodell
+                          # (embeddinggemma | qwen3-embedding-0.6b); ohne
+                          # passenden eigenen Index laeuft embeddinggemma
+                          # Fragt zuerst den warmen Suchprozess (warm.py: Unix-
+                          # Socket nur fuer den Nutzer, Ende nach 30 min Leerlauf,
+                          # gleiche Ausgabe); BRAIN_WARM=0 = immer kalt
+    brain index bauen [--modell M] [--voll] [--json]
+                          # eigenen Index des Modells daneben bauen, dann atomar
+                          # tauschen (unveraenderte Vektoren werden uebernommen)
+    brain index status [--modell M] [--json]
+    brain spaces status                  # clean/ahead/behind je gemountetem Space
+    brain spaces sync [--dry-run] [--manifest-only] [--push]
+                          # fehlende Spaces klonen (nie in einen nicht-leeren
+                          # Ordner), vorhandene per `git pull --ff-only`
+                          # aktualisieren, Manifest .brain/spaces.lock +
+                          # .gitignore-Block schreiben (S1, siehe gardener.spaces)
+    brain run [status] [--profil all|gardener|lehren|dream] [--stufen S,S] [--limit N]
+              [--klassen transkript,worker,doku,memory] [--projekt P]
+              [--dry-run [--mit-modell]] [--json] [--budget-minutes N] [--remote HOST]
+                          # die eine lokale Pipeline (Brain 5): eine Sperre, eine
+                          # Lauf-ID, ein Bericht, ein Commit. Profil `lehren` =
+                          # Ernte -> Detektor -> Extraktion -> Abgleich -> Schreiben
+                          # (nur Vorschlaege). --dry-run laedt kein Modell und
+                          # schreibt nichts; --mit-modell misst dabei die Modellstufen.
+                          # --json: Ereigniszeilen + Abschlussobjekt (Brain.app)
+    brain runner --klon <vault-klon> (--einmal | --bis-leer) [--dienst URL]
+                 [--token-datei F] [--space S] [--push] [--ohne-doctor]
+                          # holt Pipeline-Jobs der Brain-App beim Brain-Dienst ab
+                          # und fuehrt `brain run --json` im eigenen Klon aus
+                          # (braincli/runner.py); kein Dauerprozess
+    brain abo-bruecke [pruefen] (--einmal | --bis-leer | --dauer 2h) [--dienst URL]
+                 [--token-datei F] [--programme claude,codex,opencode]
+                          # beantwortet Brain-Chat-Auftraege der eigenen Person mit
+                          # dem eigenen Abo (claude -p, codex exec, opencode run)
+                          # auf diesem Rechner (braincli/abo_bruecke.py)
     brain pipeline run [--dry-run] [--verbose] [--budget-minutes N]
+                          # Alias: brain run --profil all
                           # die ganze Kette in einem Befehl: erst der Gaertner
                           # (alle Phasen), dann der Traum (`dream run`).
                           # --dry-run prueft nur (Speicher, Modelle lokal
@@ -28,7 +71,7 @@ Usage:
                        #   ohne Bericht, Commit oder Schreibzugriff auf Notizen
                        [--audit] [--topic T] [--min-notes N] [--budget-minutes N]
     brain gardener status [--json]
-    brain dream run [--limit N] [--budget-points P] [--dry-run] [--no-cloud]
+    brain dream run [--limit N] [--dry-run] [--json]   # Alias: brain run --profil dream
     brain dream status | harvest | extract | reconcile | shadow | review |
                  apply | projects   (die einzelnen Schritte, siehe dream --help)
     brain sidecar scan [--path P] [--json]
@@ -40,7 +83,19 @@ Usage:
     brain contradict --resolve <id> --by <wer> --why <text> [--rule N] [--write]
     brain ingest <quelle> [--branch P] [--title T] [--source URL] [--write] [--json]
                           [--no-contradict]
+    brain index nachbetten     # veraltete Notizen jetzt nachbetten (wie der Commit-Hook)
+    brain server status [--frisch] [--json]
+    brain server waehlen [--still] [--frisch]
+                          # Client-Fallback (F6): peer oder my-server-Standby per
+                          # /health pruefen (2 s je Server, Ergebnis 10 min
+                          # zwischengespeichert) und Git repo-lokal per
+                          # url.<standby>.insteadOf umleiten bzw. zurueck
+                          # (braincli/server.py, Liste in braincli/server.json)
     brain stats [--json]
+    brain pruefen <notiz> [--von HANDLE] [--dry-run]
+                          # kanonische Seite (type system|decision|pitfall|term, KERN/STATUS)
+                          # als geprueft markieren: verified, verified-by, review-after +3 Monate;
+                          # nur Frontmatter; verweigert Sessions, secrets, fremde Autoren
     brain undo <satz> [--all] [--limit N] [--yes] [--json]
     brain undo --list [--json] | --last
                           # nimmt zurueck, was Traum oder Gaertner geschrieben
@@ -55,45 +110,134 @@ import os
 import datetime as dt
 import json
 import sys
+import time
 from pathlib import Path
 
 from gardener import config
 from gardener import contradict as contradict_mod
 from gardener import mlx_server
 from gardener import sidecar as sidecar_mod
+from gardener import spaces as spaces_mod
 from gardener.grug_client import GrugJudgeClient
 from gardener.linking import embed_notes
 from gardener.ollama import OllamaClient, OllamaError, OllamaUnavailable
-from gardener.runtime import Deadline
+from gardener.runtime import Deadline, LockHeldError
 from gardener.store import Store
 from gardener.vault import VaultWriter, load_notes
 
-from . import (gardener_wrap, ingest as ingest_mod, pipeline as pipeline_mod,
-               search as search_mod, stats as stats_mod)
+from . import (abo_bruecke as abo_mod, frage as frage_mod, gardener_wrap, ingest as ingest_mod,
+               pipeline as pipeline_mod, search as search_mod, stats as stats_mod,
+               doctor as doctor_mod, runner as runner_mod, server as server_mod,
+               kontext as kontext_mod, pruefen as pruefen_mod, rerank as rerank_mod,
+               eval_gate as eval_gate_mod, llm_sort as llm_sort_mod, rangkern,
+               hinweis as hinweis_mod)
 
 DEFAULT_VAULT = config.DEFAULT_VAULT
 
 
+def _protokolliere_suche(vault: Path, query: str, hits: list, dauer_ms: float,
+                        fallback: bool) -> None:
+    """Nutzungsprotokoll, Kanal search (Firmenniveau-Plan M3). Ruft der Recall-Hook die Suche
+    (BRAIN_NUTZUNGSLOG_QUELLE=hook), protokolliert er selbst als Kanal recall."""
+    if os.environ.get("BRAIN_NUTZUNGSLOG_QUELLE") == "hook":
+        return
+    from . import nutzungslog
+    nutzungslog.protokolliere(
+        "search", vault, anfrage=query, treffer=[(h.rel, h.score) for h in hits],
+        grund=None if hits else "keine_treffer", dauer_ms=dauer_ms, rolle_=nutzungslog.rolle(),
+        detail="fallback" if fallback else None)
+
+
 def cmd_search(args) -> int:
     vault = Path(args.vault)
+    # --rerank/--no-rerank gewinnt, sonst der Standard (BRAIN_SEARCH_RERANK); vor dem warmen Weg,
+    # damit beide Wege dasselbe tun.
+    if getattr(args, "rerank", None) is None:
+        args.rerank = rerank_mod.search_default()
+    # Erst der warme Suchprozess (warm.py, E4 vom 28.09.); None heisst: kalter Weg wie bisher.
+    from . import warm
+    rc = warm.try_search(vault, args)
+    if rc is not None:
+        return rc
     validity = False if getattr(args, "no_validity", False) else None
-    hits, used_fallback = search_mod.search(vault, args.query, args.k, validity)
-    idx = stats_mod.index_health(vault)
+    reranking = bool(getattr(args, "rerank", False))
+    # LLM-Listensortierung (BRAIN_SEARCH_LLM, llm_sort) nur hinter dem Reranker: der Recall-Hook
+    # ruft --no-rerank und bekommt sie also nie.
+    llm_info: dict = {}
+    llm = llm_sort_mod.aktiv(reranking, llm_info)
+    pool = llm_sort_mod.POOL if llm else rerank_mod.TOP_N
+    stand_token = rangkern.STAND_MIT_LLM.set(llm)
+    try:
+        return _cmd_search_kalt(args, vault, validity, reranking, llm, pool, llm_info)
+    finally:
+        rangkern.STAND_MIT_LLM.reset(stand_token)
+
+
+def _cmd_search_kalt(args, vault: Path, validity, reranking: bool, llm: bool, pool: int,
+                     llm_info: dict) -> int:
+    t0 = time.perf_counter()
+    hits, used_fallback = search_mod.search(
+        vault, args.query, max(args.k, pool) if reranking else args.k, validity,
+        getattr(args, "space", None))
+    rerank_info: dict = {}
+    werte = hinweis_mod.Werte()
+    hinweis_an = reranking and hinweis_mod.enabled()
+    hinweis_text = hinweis_sig = None
+    if reranking:
+        passage = rerank_mod.vault_passage(vault)
+        hits = rerank_mod.umsortieren(args.query, hits, passage,
+                                      url=rerank_mod.cli_url(), budget_s=rerank_mod.cli_budget_s(),
+                                      info=rerank_info, top_n=pool, werte=werte)
+        if llm:
+            hits = llm_sort_mod.sortieren(args.query, hits, passage, lambda h: h.rel, info=llm_info)
+        # Standseiten nach dem Umsortieren wieder vorn (BRAIN_SEARCH_STAND, rangkern)
+        hits = rangkern.apply_stand_rang(hits, args.query, top_n=rerank_mod.TOP_N)[:args.k]
+        # Hinweis bei unsicherem Platz 1 (BRAIN_SEARCH_HINWEIS, hinweis.py): liest nur, ordnet nichts um.
+        if hinweis_an:
+            hinweis_text, hinweis_sig = hinweis_mod.bewerten(hits, werte, llm_info, llm_sort_mod.abgeloest)
+            if hinweis_sig and hinweis_mod.signale_gewuenscht():  # Messlauf: BGE-Reihenfolge fuer die Dienst-Sicht
+                hinweis_sig["bge_reihe"] = [h.rel for h in werte.reihe[:10]]
+    _protokolliere_suche(vault, args.query, hits, (time.perf_counter() - t0) * 1000, used_fallback)
+    # Suchkorpus aus der Suche selbst wiederverwenden (nur fuer eigene Indizes
+    # relevant; embeddinggemma prueft gegen den Gaertner-Korpus).
+    idx = stats_mod.index_health(vault, notes=list(search_mod.LAST_NOTES))
     if args.json:
+        # Compact (no indent): this payload is read by agents/hooks far more
+        # often than by a human eye, and pretty-print whitespace alone was
+        # roughly a third of its token cost. See search.hit_to_json for the
+        # other half (dropping always-default optional fields).
         print(json.dumps({
             "query": args.query,
             "fallback": used_fallback,
             "index_stale": idx["stale"],
             "index_stale_reasons": idx["reasons"],
-            "hits": [h.__dict__ for h in hits],
-        }, ensure_ascii=False, indent=2))
+            # Modell der semantischen Seite ("" = nur BM25); die cosine-Werte
+            # der Treffer sind nur innerhalb eines Modells vergleichbar.
+            "embed_model": search_mod.LAST_EMBED["modell"],
+            **({"embed_model_fallback": search_mod.LAST_EMBED["grund"]}
+               if search_mod.LAST_EMBED["grund"] else {}),
+            **({"rerank": rerank_info} if reranking else {}),
+            **({"llm_sort": llm_info} if llm_info else {}),
+            **(hinweis_mod.json_felder(hinweis_text, hinweis_sig) if hinweis_an else {}),
+            "hits": [search_mod.hit_to_json(h) for h in hits],
+        }, ensure_ascii=False))
         return 0
     if idx["stale"]:
         print("[!] Such-Index veraltet auf dieser Maschine - semantischer Treffer "
               "kann fehlen oder daneben liegen:")
         for reason in idx["reasons"]:
             print(f"    {reason}")
-        print("    -> `brain gardener run` nachziehen. `brain stats` fuer Details.\n")
+        print(f"    -> `{idx.get('fix', 'brain gardener run')}` nachziehen. `brain stats` fuer Details.\n")
+    if search_mod.LAST_EMBED["grund"]:
+        print(f"[!] {search_mod.LAST_EMBED['grund']} - semantische Suche lief mit "
+              f"{search_mod.LAST_EMBED['modell']}; `brain index bauen` baut ihn.\n")
+    if reranking and rerank_info.get("grund"):
+        print(f"[!] Umsortieren aus ({rerank_info['grund']}) - Reihenfolge des Rangkerns.\n")
+    if llm_info.get("grund") == "gesamtlauf":
+        print("[!] ohne LLM-Sortierung (Gesamtlauf aktiv) - Reihenfolge des Rerankers; "
+              "BRAIN_SEARCH_LLM=1 erzwingt sie.\n")
+    elif llm_info.get("grund"):
+        print(f"[!] LLM-Sortierung aus ({llm_info['grund']}) - Reihenfolge des Rerankers.\n")
     if used_fallback:
         print("Ollama nicht erreichbar - rg-Volltextsuche als Fallback:\n")
     if not hits:
@@ -101,13 +245,18 @@ def cmd_search(args) -> int:
         return 0
     for h in hits:
         flag = "[!] " if h.contradiction else ""
-        flag += "[~] " if h.retired else ""
-        print(f"{flag}{h.rel}")
+        flag += "[~] " if h.retired or h.status else ""
+        space_tag = f" ({h.space})" if h.space and h.space != "kern" else ""
+        print(f"{flag}{h.rel}{space_tag}")
         if h.title:
             tag = f" [{h.match}]" if h.match else ""
             print(f"  Titel: {h.title}  (score {h.score:.3f}){tag}")
         if h.contradiction:
             print("  [!] traegt einen offenen Widerspruch - siehe review-queue.md")
+        if h.status:
+            print(f"  [~] {_status_zeile(h)}")
+        if h.match == "nachfolger":
+            print("  [+] Nachfolger eines abgeloesten Treffers, eingereiht")
         if h.retired:
             verb = "ist" if h.retired_claims == 1 else "sind"
             seit = f" (zuletzt {h.retired_since})" if h.retired_since else ""
@@ -117,6 +266,77 @@ def cmd_search(args) -> int:
         if h.snippet:
             print(f"  {h.snippet}")
         print()
+    if hinweis_text:
+        print(hinweis_text)
+    return 0
+
+
+def _status_zeile(h) -> str:
+    """Frontmatter-Gueltigkeit eines Treffers als eine Zeile."""
+    if h.superseded_by:
+        ziele = ", ".join(f"[[{t}]]" for t in h.superseded_by)
+        return f"abgelöst durch {ziele} - der Text steht noch da, gilt aber nicht mehr."
+    if h.status == "archived":
+        return "archiviert - nur zur Herkunft, gilt nicht mehr."
+    if h.status == "expired":
+        return "abgelaufen (valid-until) - gilt nicht mehr."
+    return "abgelöst - der Text steht noch da, gilt aber nicht mehr."
+
+
+def cmd_index_bauen(args) -> int:
+    from . import einbettung
+    vault = Path(args.vault)
+    modell = einbettung.aktives_modell(args.modell)
+    if not modell.eigener_index:
+        print(f"{modell.name} nutzt den Gaertner-Index: `brain gardener run --phase embed`.",
+              file=sys.stderr)
+        return 2
+    t0 = dt.datetime.now()
+
+    def fortschritt(i, n):
+        print(f"  {i}/{n} Notizen", file=sys.stderr, flush=True)
+
+    try:
+        stand = einbettung.bauen(vault, modell, voll=args.voll, fortschritt=fortschritt)
+    except OllamaError as e:
+        print(f"Index nicht gebaut, alter Stand bleibt: {e}", file=sys.stderr)
+        return 1
+    stand["sekunden"] = round((dt.datetime.now() - t0).total_seconds(), 1)
+    stand["modell"] = modell.name
+    if args.json:
+        print(json.dumps(stand, ensure_ascii=False))
+    else:
+        print(f"{modell.name}: {stand['notizen']} Notizen ({stand['uebernommen']} uebernommen, "
+              f"{stand['eingebettet']} neu) in {stand['sekunden']} s -> {stand['pfad']}")
+        for f in stand["fehlgeschlagen"]:
+            print(f"  fehlgeschlagen: {f}")
+    return 1 if stand["fehlgeschlagen"] else 0
+
+
+def cmd_index_nachbetten(args) -> int:
+    from . import nachbetten
+    return nachbetten.main(["--vault", str(args.vault), "--sofort"])
+
+
+def cmd_index_status(args) -> int:
+    from . import einbettung
+    vault = Path(args.vault)
+    modell = einbettung.aktives_modell(args.modell)
+    health = stats_mod.index_health(vault, modell=modell)
+    kopf = (einbettung.lies_kopf(einbettung.index_pfad(vault, modell))
+            if modell.eigener_index else {})
+    out = {"modell": modell.name, "aktiv": einbettung.aktives_modell().name,
+           "kopf": kopf, **health}
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    print(f"Modell: {modell.name} (aktiv: {out['aktiv']})")
+    for k in ("ollama", "ollama_digest", "dimension", "erstellt", "notizen"):
+        if k in kopf:
+            print(f"  {k}: {kopf[k]}")
+    print(f"  veraltet: {health['stale_notes_total']}/{health['embed_corpus_total']}")
+    for r in health["reasons"]:
+        print(f"  [!] {r}")
     return 0
 
 
@@ -370,7 +590,115 @@ def cmd_ingest(args) -> int:
 def cmd_pipeline_run(args) -> int:
     vault = Path(args.vault)
     return pipeline_mod.run(vault, dry_run=args.dry_run, verbose=args.verbose,
-                            budget_minutes=getattr(args, "budget_minutes", None))
+                            budget_minutes=getattr(args, "budget_minutes", None),
+                            json_mode=getattr(args, "json", False))
+
+
+def cmd_run(args) -> int:
+    from gardener.lauf import lauf as lauf_mod
+    vault = Path(args.vault)
+    if args.aktion == "abgleich-nachlauf":
+        if not args.bis_lauf:
+            print("brain run abgleich-nachlauf: --bis-lauf <lauf-id> fehlt", file=sys.stderr)
+            return 2
+        try:
+            info = lauf_mod.abgleich_nachlauf(vault, args.bis_lauf, dry_run=args.dry_run)
+        except (ValueError, LockHeldError) as exc:
+            print(f"brain run abgleich-nachlauf: {exc}", file=sys.stderr)
+            return 4 if isinstance(exc, LockHeldError) else 2
+        if args.json:
+            print(json.dumps(info, ensure_ascii=False))
+            return 0
+        print(f"{'wuerde zuruecksetzen' if args.dry_run else 'zurueckgesetzt'}: "
+              f"{info['pakete']} Pakete, {info['einheiten']} Einheiten (bis Lauf {info['bis_lauf']})")
+        if not args.dry_run:
+            print("weiter mit: brain run --profil lehren --stufen abgleichen,schreiben")
+        return 0
+    if args.aktion == "uebernehmen":
+        from gardener.lauf import uebernehmen as ueb_mod
+        from gardener.lauf.freigabe import NichtBerechtigt
+        listen = [Path(x) for x in args.liste] if args.liste else None
+        ok = [t for x in args.ok for t in x.replace(",", " ").split()] if args.ok else None
+        try:
+            info = lauf_mod.uebernehmen(vault, ok=ok, dry_run=args.dry_run, listen=listen,
+                                        zellen=Path(args.zellen) if args.zellen else None,
+                                        buch=Path(args.buch) if args.buch else None,
+                                        einbetten=not args.ohne_einbettung)
+        except NichtBerechtigt as exc:
+            print(f"brain run uebernehmen: {exc}", file=sys.stderr)
+            return 3
+        except (ValueError, LockHeldError) as exc:
+            print(f"brain run uebernehmen: {exc}", file=sys.stderr)
+            return 4 if isinstance(exc, LockHeldError) else 2
+        if args.json:
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+            return 0
+        if info["modus"] == "vorschlaege":
+            print(f"Vorschlaege zur Uebernahme: {len(info['vorschlaege'])} (nichts geschrieben; "
+                  "uebernehmen nur ein Orchestrator oder der Mensch: brain run uebernehmen --ok <id>[,<id>]")
+            for v in info["vorschlaege"]:
+                h = v["herkunft"]
+                print(f"- {v['id']}  {v['projekt']}/{v['typ']} -> {v['ziel']}  Auswahl: {v['auswahl']}")
+                print(f"    Herkunft: {h['klasse']} {h['pfad']} ({h['einheit']})")
+                print(f"    {v['aussage']}" + (f"  | Gegenmittel: {v['gegenmittel']}" if v["gegenmittel"] else ""))
+            if info["uebersprungen"]:
+                print("uebersprungen: " + ", ".join(f"{k} {v}" for k, v in sorted(info["uebersprungen"].items())))
+            return 0
+        print(f"Freigabe: {info['freigabe']}")
+        wort = "wuerde uebernehmen" if args.dry_run else "uebernommen"
+        print(f"{wort}: {info['uebernommen']} Pakete, Duplikate zusammengefuehrt: {info['duplikate']}"
+              f" (Einbettung: {'ja' if info['einbettung'] else 'nein, nur Textgleichheit'})")
+        if info["zellen"]:
+            print("belegte Zellen: " + ", ".join(info["zellen"]))
+        for rel, arten in sorted(info["je_datei"].items()):
+            print(f"  {rel}: " + ", ".join(f"{k} {v}" for k, v in sorted(arten.items())))
+        for rel in info["kern_voll"]:
+            print(f"  {rel}: nichts unter ## Gilt (Grenze {ueb_mod.KERN_MAX} Zeichen, KERN.md fehlt "
+                  "oder schon vorhanden)")
+        for rel, why in info["verweigert"]:
+            print(f"  NICHT geschrieben: {rel} ({why})")
+        for item in info["handkorrekturen"]:
+            fields = ", ".join(item["felder"])
+            action = "Handkorrektur aufgehoben" if item.get("aufgehoben") else "Handkorrektur behalten"
+            print(f"  {action}: {item['datei']} {item['paket_id']} ({fields})")
+        for item in info["unzugeordnet"]:
+            print(f"  unzugeordnet behalten: {item['datei']} {item.get('id', item.get('zeile'))}")
+        for item in info["wiederhergestellt"]:
+            print(f"  wiederhergestellt: {item['datei']} {item['paket_id']} (aus: {item['aus']})")
+        if info["uebersprungen"]:
+            print("uebersprungen: " + ", ".join(f"{k} {v}" for k, v in sorted(info["uebersprungen"].items())))
+        # Wie Befund 12 (14.10.2026): ein gescheiterter Commit gilt nicht als Erfolg.
+        fehl = [c for c in info.get("commits") or [] if c.get("error")]
+        for c in fehl:
+            print(f"  NICHT committet: {c.get('repo') or '.'} ({c['error']})")
+        return 0 if not info["verweigert"] and not fehl else 1
+    if args.aktion == "status":
+        info = lauf_mod.status(vault)
+        if args.json:
+            print(json.dumps(info, ensure_ascii=False, indent=2, default=str))
+            return 0
+        print(f"laeuft: {info['laeuft']}")
+        print("Einheiten: " + (", ".join(f"{k} {v}" for k, v in info["einheiten"].items()) or "keine"))
+        print("Pakete: " + (", ".join(f"{k} {v}" for k, v in info["pakete"].items()) or "keine"))
+        last = info.get("letzter_lauf")
+        if last:
+            print(f"letzter Lauf: {last.get('lauf_id')} [{last.get('profil')}] {last.get('status')}"
+                  f" -> {last.get('bericht')}")
+        return 0
+    lauf_mod.main_signals()
+    stufen = [s.strip() for s in args.stufen.split(",") if s.strip()] if args.stufen else None
+    gardener_args = {"phase": args.phase, "audit": args.audit, "verbose": args.verbose,
+                     "topic": args.topic, "min_notes": args.min_notes}
+    klassen = [k.strip() for k in args.klassen.split(",") if k.strip()] if args.klassen else None
+    try:
+        lauf_mod.klassen_aus(klassen)
+    except ValueError as exc:
+        print(f"brain run: {exc}", file=sys.stderr)
+        return 2
+    return lauf_mod.run(vault, profil=args.profil, stufen=stufen, limit=args.limit,
+                        dry_run=args.dry_run, mit_modell=args.mit_modell, json_mode=args.json,
+                        budget_minutes=args.budget_minutes, remote=args.remote,
+                        gardener_args=gardener_args, klassen=klassen, projekt=args.projekt)
 
 
 def cmd_gardener_run(args) -> int:
@@ -465,6 +793,38 @@ def cmd_sidecar_check(args) -> int:
     return 0
 
 
+def cmd_spaces_status(args) -> int:
+    vault = Path(args.vault)
+    entries = spaces_mod.status(vault)
+    if not entries:
+        print("Kein Manifest (.brain/spaces.lock) - `brain spaces sync` ausfuehren.")
+        return 0
+    for s in entries:
+        detail = f" {s.detail}" if s.detail else ""
+        print(f"{s.name}  [{s.mount}]  {s.state}{detail}")
+    return 0
+
+
+def cmd_spaces_sync(args) -> int:
+    vault = Path(args.vault)
+    try:
+        result = spaces_mod.sync(vault, dry_run=args.dry_run,
+                                 manifest_only=args.manifest_only,
+                                 push=args.push)
+    except (spaces_mod.SpaceConfigError, spaces_mod.ForgejoError) as e:
+        print(f"FEHLER: {e}")
+        return 1
+    # Der Timer (--push) zieht auch die Kern-Arbeitskopie per Fast-Forward nach (09.10.2026, spaces.kern_vorziehen).
+    if args.push and not args.dry_run and not args.manifest_only:
+        result.outcomes.insert(0, spaces_mod.kern_vorziehen(vault))
+    for o in result.outcomes:
+        detail = f": {o.detail}" if o.detail else ""
+        print(f"{o.name}  [{o.mount}]  {o.action}{detail}")
+    if not result.outcomes:
+        print("Keine Spaces (weder Forgejo-Umgebung noch .brain/spaces.yml).")
+    return 0 if result.ok else 1
+
+
 def cmd_stats(args) -> int:
     vault = Path(args.vault)
     result = stats_mod.collect(vault)
@@ -499,7 +859,7 @@ def cmd_stats(args) -> int:
         print("Such-Index: VERALTET")
         for reason in idx["reasons"]:
             print(f"  {reason}")
-        print("  -> `brain gardener run` auf dieser Maschine nachziehen.")
+        print("  -> `brain index nachbetten` auf dieser Maschine nachziehen.")
     else:
         print(f"Such-Index: aktuell ({idx['vectors_total']} Vektoren, "
               f"{idx['stale_notes_total']}/{idx['embed_corpus_total']} veraltet)")
@@ -606,10 +966,82 @@ def build_parser() -> argparse.ArgumentParser:
                           help="abgeloeste Aussagen weder kennzeichnen noch "
                                "abwerten (auch: BRAIN_VALIDITY=0); der Index "
                                "bleibt unberuehrt")
+    p_search.add_argument("--space", default=None,
+                          help="nur Treffer aus diesem Space (`kern` fuer die "
+                               "Wurzel); braucht .brain/spaces.lock "
+                               "(`brain spaces sync`)")
+    p_search.add_argument("--rerank", action="store_true", default=None,
+                          help="Top 20 vom Umsortier-Dienst auf peer umsortieren lassen "
+                               "(BRAIN_RERANK_URL, Budget BRAIN_RERANK_BUDGET_MS=1000); "
+                               "bei Stoerung unveraenderte Reihenfolge. Standard seit 29.09. "
+                               "(BRAIN_SEARCH_RERANK=0 schaltet ab). Danach ordnet haiku per `claude -p` "
+                               "die Top 30 (BRAIN_SEARCH_LLM=0 schaltet ab, ~2 s)")
+    p_search.add_argument("--no-rerank", dest="rerank", action="store_false",
+                          help="ohne Umsortier-Dienst (Reihenfolge des Rangkerns)")
     p_search.set_defaults(func=cmd_search)
+    p_frage = frage_mod.argumente(sub.add_parser(
+        "frage", help="kurze Antwort mit pfad:zeile-Zitaten (Motor peer oder claude)"))
+    p_frage.set_defaults(func=frage_mod.cmd_frage)
+
+    p_run = sub.add_parser(
+        "run", help="the one local pipeline (gardener care + lessons), see `brain run --help`")
+    p_run.add_argument("aktion", nargs="?", choices=["status", "abgleich-nachlauf", "uebernehmen"],
+                       default=None,
+                       help="status: Buch und letzten Lauf zeigen (nur lesend); abgleich-nachlauf: "
+                            "Pakete aus Laeufen bis --bis-lauf wieder auf `neu` setzen (nur Status, "
+                            "nichts geloescht), danach --stufen abgleichen,schreiben; uebernehmen: "
+                            "ohne --ok nur die Vorschlagsliste mit Herkunft (cloud-geprueft, Zellen); "
+                            "mit --ok <id> genau diese Pakete in FALLEN.yaml, Entscheidungsnotiz und "
+                            "KERN -- nur ein Orchestrator oder der Mensch (gemessen, der Nutzer 10.10.)")
+    p_run.add_argument("--ok", action="append", default=None,
+                       help="mit uebernehmen: Paket-IDs (brain-<id> oder Praefix ab 10 Zeichen, mehrfach "
+                            "oder mit Komma), die uebernommen werden; nur Orchestrator oder Mensch")
+    p_run.add_argument("--liste", action="append", default=None,
+                       help="mit uebernehmen: Datei mit einzeln geprueften Paket-IDs (mehrfach; Vorgabe "
+                            "eval/vorschlaege-stichprobe/richtig.tsv und eval/vorschlaege-qualitaet/"
+                            "kontrolle-richtig.tsv)")
+    p_run.add_argument("--zellen", default=None,
+                       help="mit uebernehmen: Zellen-Beleg (JSON) der Kontrollstichprobe; nur Zellen mit "
+                            ">= 90 %% und Untergrenze >= 0,8 zaehlen")
+    p_run.add_argument("--buch", default=None,
+                       help="mit uebernehmen --dry-run: eine Buchkopie statt state/dream/dream.db lesen")
+    p_run.add_argument("--ohne-einbettung", action="store_true",
+                       help="mit uebernehmen: Duplikate nur ueber Textgleichheit zusammenfuehren")
+    p_run.add_argument("--bis-lauf", default=None,
+                       help="mit abgleich-nachlauf: letzte Lauf-ID, deren Pakete neu abgeglichen werden")
+    p_run.add_argument("--profil", choices=["all", "gardener", "lehren", "dream"], default="all")
+    p_run.add_argument("--stufen", default=None,
+                       help="nur diese Stufen, Komma-getrennt: gardener, ernte, erkennen, "
+                            "extrahieren, grossmodell, projektwahl, abgleichen, pruefen, schreiben")
+    p_run.add_argument("--limit", type=int, default=None, help="hoechstens N Einheiten je Stufe")
+    p_run.add_argument("--klassen", default=None,
+                       help="nur diese Quellklassen, Komma-getrennt: transkript, worker, doku, memory "
+                            "(Vorgabe alle; Reihenfolge immer memory, transkript neueste zuerst, "
+                            "worker, doku, darin a machine-bound project zuerst)")
+    p_run.add_argument("--projekt", default=None,
+                       help="nur Einheiten dieses Vault-Projekts (20-projects/<p>) bearbeiten; "
+                            "die Ernte bleibt vollstaendig")
+    p_run.add_argument("--dry-run", action="store_true",
+                       help="nichts schreiben, kein Modell laden (Buch nur im Speicher)")
+    p_run.add_argument("--mit-modell", action="store_true",
+                       help="mit --dry-run: Modellstufen trotzdem rechnen (Zeitmessung), "
+                            "weiterhin ohne jeden Schreibzugriff")
+    p_run.add_argument("--json", action="store_true",
+                       help="Ereigniszeilen (JSON) auf stdout, zuletzt ein Abschlussobjekt")
+    p_run.add_argument("--budget-minutes", type=float, default=None)
+    p_run.add_argument("--remote", default=None,
+                       help="auch Transkripte und Auto-Memory dieser Maschine per ssh ernten "
+                            "(nur lesend), z.B. peer")
+    p_run.add_argument("--phase", choices=list(gardener_wrap.VALID_PHASES), default="all",
+                       help="Gaertner-Phase fuer Profil gardener/all")
+    p_run.add_argument("--audit", action="store_true")
+    p_run.add_argument("--topic", default=None)
+    p_run.add_argument("--min-notes", type=int, default=None)
+    p_run.add_argument("--verbose", action="store_true")
+    p_run.set_defaults(func=cmd_run)
 
     p_pipeline = sub.add_parser(
-        "pipeline", help="the whole chain in one command: gardener, then dream")
+        "pipeline", help="alias of `brain run --profil all`")
     pipesub = p_pipeline.add_subparsers(dest="pcmd", required=True)
 
     p_prun = pipesub.add_parser(
@@ -619,6 +1051,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "lock, vault cleanliness, duration estimate) - "
                              "starts nothing")
     p_prun.add_argument("--verbose", action="store_true")
+    p_prun.add_argument("--json", action="store_true")
     p_prun.add_argument("--budget-minutes", type=float, default=None,
                         help="override the gardener's time budget for this "
                              "run only (default: unchanged, see "
@@ -750,9 +1183,64 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Vorschau maschinenlesbar ausgeben und nichts tun")
     p_undo.set_defaults(func=cmd_undo)
 
+    p_spaces = sub.add_parser(
+        "spaces", help="other git repos mounted inside this vault (S1)")
+    spsub = p_spaces.add_subparsers(dest="spcmd", required=True)
+
+    p_sp_status = spsub.add_parser(
+        "status", help="clean/ahead/behind je gemountetem Space")
+    p_sp_status.set_defaults(func=cmd_spaces_status)
+
+    p_sp_sync = spsub.add_parser(
+        "sync", help="fehlende Spaces klonen, vorhandene ff-only aktualisieren")
+    p_sp_sync.add_argument("--dry-run", action="store_true",
+                           help="nur pruefen, nichts klonen/aktualisieren/schreiben")
+    p_sp_sync.add_argument("--manifest-only", action="store_true",
+                           help="Manifest + .gitignore aus dem aktuellen Stand "
+                                "neu schreiben, ohne zu klonen oder zu aktualisieren")
+    p_sp_sync.add_argument("--push", action="store_true",
+                           help="in beide Richtungen abgleichen: eigene Commits pushen, bei "
+                                "beidseitigen Aenderungen rebasen (nie force, nie ungesicherte "
+                                "Arbeit anfassen); fuer den Timer (Nr. 42)")
+    p_sp_sync.set_defaults(func=cmd_spaces_sync)
+
+    p_index = sub.add_parser(
+        "index", help="eigener Such-Index je Einbettungsmodell (BRAIN_EMBED_MODELL)")
+    isub = p_index.add_subparsers(dest="index_cmd", required=True)
+    p_ibau = isub.add_parser("bauen", help="Index des Modells neben dem alten bauen, dann atomar tauschen")
+    p_ibau.add_argument("--modell", default=None,
+                        help="Vorgabe: BRAIN_EMBED_MODELL bzw. Standard; z.B. qwen3-embedding-0.6b")
+    p_ibau.add_argument("--voll", action="store_true",
+                        help="alles neu einbetten statt unveraenderte Vektoren zu uebernehmen")
+    p_ibau.add_argument("--json", action="store_true")
+    p_ibau.set_defaults(func=cmd_index_bauen)
+    p_istat = isub.add_parser("status", help="Kopf und Veraltung des Index (nur lesend)")
+    p_istat.add_argument("--modell", default=None)
+    p_istat.add_argument("--json", action="store_true")
+    p_istat.set_defaults(func=cmd_index_status)
+    p_inach = isub.add_parser("nachbetten", help="veraltete Notizen jetzt nachbetten (wie der Commit-Hook)")
+    p_inach.set_defaults(func=cmd_index_nachbetten)
+
     p_stats = sub.add_parser("stats", help="vault health stats")
     p_stats.add_argument("--json", action="store_true")
     p_stats.set_defaults(func=cmd_stats)
+
+    p_doctor = sub.add_parser("doctor", help="compact vault ageing signals")
+    p_doctor.add_argument("--json", action="store_true")
+    p_doctor.add_argument("--cache", action="store_true",
+                          help="write the machine-readable doctor cache")
+    p_doctor.set_defaults(func=lambda args: doctor_mod.run(Path(args.vault), args.json))
+
+    runner_mod.add_parser(sub)
+    abo_mod.add_parser(sub)
+    server_mod.add_parser(sub)
+    kontext_mod.add_parser(sub)
+    pruefen_mod.add_parser(sub)
+    eval_gate_mod.add_parser(sub)
+
+    p_mcp = sub.add_parser("mcp", help="read-only MCP server over a vault (stdio)")
+    p_mcp.set_defaults(func=lambda args: __import__(
+        "braincli.mcp_server", fromlist=["main"]).main(["--vault", args.vault]))
 
     return p
 
@@ -768,12 +1256,36 @@ def cmd_dream(args) -> int:
     rest = list(args.dream_args or [])
     if not rest:
         rest = ["--help"]
+    if rest[0] == "run":
+        return _dream_run_alias(Path(args.vault), rest[1:])
     return dream_main(rest)
+
+
+def _dream_run_alias(vault: Path, rest: list[str]) -> int:
+    """`brain dream run` = `brain run --profil dream` (Brain 5). The old
+    cloud/budget flags have no meaning in the local pipeline and are ignored
+    with a note; the individual dream steps stay reachable as before."""
+    from gardener.lauf import lauf as lauf_mod
+    p = argparse.ArgumentParser(prog="brain dream run")
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--mit-modell", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--budget-minutes", type=float, default=None)
+    p.add_argument("--remote", default=None)
+    p.add_argument("--vault", default=None)
+    args, unknown = p.parse_known_args(rest)
+    if unknown:
+        print(f"brain dream run: ignoriert (lokale Pipeline): {' '.join(unknown)}", file=sys.stderr)
+    lauf_mod.main_signals()
+    return lauf_mod.run(Path(args.vault) if args.vault else vault, profil="dream", limit=args.limit,
+                        dry_run=args.dry_run, mit_modell=args.mit_modell, json_mode=args.json,
+                        budget_minutes=args.budget_minutes, remote=args.remote)
 
 
 def main(argv=None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(eval_gate_mod.trenner(list(sys.argv[1:] if argv is None else argv)))
     # Zustand an den Vault binden, BEVOR ein Unterbefehl einen Store aufmacht.
     # `brain --vault <wegwerf> contradict --write` hat am 2026-08-04 den
     # Embedding-Index des ECHTEN Vaults geloescht, weil nur der Korpus dem

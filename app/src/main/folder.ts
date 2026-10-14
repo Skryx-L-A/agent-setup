@@ -1,5 +1,5 @@
 // Die Ordneransicht (4c.2): ein Baum, der bei der Session anfaengt, in der man
-// gerade ist, und `~/Knowledge/90-secrets/` sowie `~/.ssh/` AUSLAESST -- nicht
+// gerade ist, und `~/Knowledge/secrets/` sowie `~/.ssh/` AUSLAESST -- nicht
 // nur ihren Inhalt verbirgt. Ein Pfad, der hier nicht drin ist, kann auch bei
 // einem Fehler nirgends auftauchen; ein nur verstecktes Kind waere ein
 // Versprechen, das ein spaeterer Bug einloesen kann.

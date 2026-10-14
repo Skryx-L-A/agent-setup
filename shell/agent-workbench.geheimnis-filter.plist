@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-workbench.geheimnis-filter -- launchd haelt den Lauschsocket 127.0.0.1:8093, der
+  Geheimnisfilter startet erst bei der ersten Verbindung (Auftrag filter-live,
+  der Nutzer 2026-10-10: "Alle umlenkbaren sofort").
+
+  Bauart wie agent-workbench.modell-proxy: kein StartInterval -- also kein Zeitgeber
+  (KeepAlive seit 13.10., siehe unten). Beendet sich der Prozess (Absturz, kill,
+  bootout), haelt launchd den Socket weiter und startet ihn bei der naechsten
+  Verbindung neu. Wartende Verbindungen liegen solange im Kernel-Backlog.
+
+  Grenze: launchd startet einen Job hoechstens alle ThrottleInterval Sekunden
+  (Vorgabe 10). Stuerzt der Filter direkt nach dem Start wieder ab, wartet die
+  naechste Verbindung bis zu 10 s; stuerzt er bei JEDER Anfrage ab, bekommt keine
+  Anfrage eine Antwort (fail-closed, kein Direktweg zum Anbieter).
+
+  Programm: Dienstkopie unter ~/.local/share/wb-geheimnis-filter/ (legt
+  `wb-geheimnis-filter-dienst installieren` an), Muster aus den ausgerollten Hooks
+  (~/.claude/hooks/lib/geheimnis_inhalt.py). Zaehler seit festem Zeitpunkt:
+  ~/.local/state/wb-geheimnis-filter/zaehler.json (nur Zahlen).
+
+  Proxy-Modus (Auftrag wz-proxybau, 13.10.): --connect, derselbe Socket 8093 nimmt auch
+  CONNECT an. Claude laeuft dann ohne ANTHROPIC_BASE_URL (Remote Control bleibt moeglich)
+  mit HTTPS_PROXY=http://127.0.0.1:8093 und NODE_EXTRA_CA_CERTS=
+  ~/.local/state/wb-geheimnis-filter/ca.pem; nur api.anthropic.com wird aufgebrochen,
+  alles andere ist ein reiner Tunnel. Die Pfadrouten (/anthropic/ usw.) bleiben.
+
+  KeepAlive mit SuccessfulExit=false (13.10., Robustheit: jeder Bash-Aufruf aus einer
+  Claude-Sitzung erbt HTTPS_PROXY): nach einem Absturz startet launchd den Filter sofort
+  neu (fruehestens nach ThrottleInterval), nicht erst bei der naechsten Verbindung; ein
+  sauberes Ende (bootout, SIGTERM -> Exit 0) bleibt ein Ende. Laut launchd.plist(5)
+  impliziert SuccessfulExit ein RunAtLoad: der Filter startet damit auch beim Laden des
+  Agents (Anmelden, bootstrap), nicht erst beim ersten Zugriff. Der Socket bleibt bei launchd.
+
+  Einrichten:  shell/wb-geheimnis-filter-dienst installieren
+  Abschalten:  launchctl bootout gui/$(id -u)/agent-workbench.geheimnis-filter
+               (vorher alle Harnesses zurueckstellen -- sonst stehen sie: fail-closed)
+  stdout/stderr: nur die Startzeile und Python-Ausnahmen, nie Inhalte oder Header.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>agent-workbench.geheimnis-filter</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>$HOME/.local/share/wb-geheimnis-filter/wb-geheimnis-filter</string>
+    <string>serve</string>
+    <string>--aktiviert</string>
+    <string>--connect</string>
+    <string>--zustand</string>
+    <string>$HOME/.local/state/wb-geheimnis-filter</string>
+  </array>
+  <key>Sockets</key>
+  <dict>
+    <key>filter</key>
+    <dict>
+      <key>SockNodeName</key><string>127.0.0.1</string>
+      <key>SockServiceName</key><string>8093</string>
+      <key>SockType</key><string>stream</string>
+      <key>SockFamily</key><string>IPv4</string>
+    </dict>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>WB_GEHEIMNIS_LIB</key>
+    <string>$HOME/.claude/hooks/lib</string>
+  </dict>
+  <key>StandardOutPath</key><string>$HOME/.local/state/wb-geheimnis-filter/launchd.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.local/state/wb-geheimnis-filter/launchd.log</string>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>

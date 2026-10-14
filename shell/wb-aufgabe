@@ -206,10 +206,13 @@ def ausgabe(args, text, daten=None):
 # ---------------------------------------------------------------- Mensch --
 def _wb_mensch_pfad():
     p = os.path.join(os.path.expanduser("~"), ".local", "bin", "wb-mensch")
-    if os.access(p, os.X_OK):
-        return p
-    from shutil import which
-    return which("wb-mensch") or None
+    return p if os.access(p, os.X_OK) else None
+
+
+def _wb_mensch_env():
+    return {"HOME": os.environ.get("HOME", ""),
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "TMPDIR": "/tmp"}
 
 
 def _ist_mensch_gemessen():
@@ -217,7 +220,7 @@ def _ist_mensch_gemessen():
     if not pfad:
         return False
     try:
-        return subprocess.run([pfad, "pruefen"], timeout=10).returncode == 0
+        return subprocess.run([pfad, "pruefen"], timeout=10, env=_wb_mensch_env()).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 

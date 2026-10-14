@@ -2791,7 +2791,12 @@ if not zeilen:
 for m in zeilen:
     ref = m.get("modelRef", "")
     marker = "  <- laeuft" if laufend and ref == laufend else ""
-    print("%s (Alias: %s)%s" % (m.get("id", "?"), m.get("alias") or "-", marker))
+    status = ""
+    if m.get("enabled") is False:
+        grund = m.get("disabledReason") or "kein Grund angegeben"
+        geloescht = " (GELÖSCHT)" if "gelöscht" in grund.lower() or "geloescht" in grund.lower() else ""
+        status = "  [DEAKTIVIERT%s: %s]" % (geloescht, grund)
+    print("%s (Alias: %s)%s%s" % (m.get("id", "?"), m.get("alias") or "-", marker, status))
     print("  Pfad: %s" % ref)
     print("  Kontext-Vorgabe: %s   Gewichte: %s GB" % (m.get("contextWindow", "-"), m.get("gewichteGb", "-")))
 PY

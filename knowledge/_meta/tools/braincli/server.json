@@ -1,0 +1,21 @@
+{
+  "_hinweis": "Serverliste fuer `brain server` (F6) und die App (web/src/server-wahl.ts, Bauzeit). Erster Eintrag = Heimat (peer); git = Basis-URLs in gleicher Reihenfolge (SSH, HTTPS). Standby-SSH-Nutzer: Forgejo-Builtin-SSH nimmt BUILTIN_SSH_SERVER_USER an, Vorgabe RUN_USER=brain-standby (brain-failover ini_umschreiben).",
+  "server": [
+    {
+      "name": "peer",
+      "dienst": "https://peer.tailnet.example.ts.net:8443",
+      "git": [
+        "ssh://forgejo@peer.tailnet.example.ts.net:2223/",
+        "https://peer.tailnet.example.ts.net/"
+      ]
+    },
+    {
+      "name": "my-server",
+      "dienst": "https://lan-dns.tailnet.example.ts.net:8443",
+      "git": [
+        "ssh://brain-standby@lan-dns.tailnet.example.ts.net:2240/",
+        "https://lan-dns.tailnet.example.ts.net/"
+      ]
+    }
+  ]
+}

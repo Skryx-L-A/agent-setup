@@ -17,7 +17,7 @@ NAMES = {"AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "GEMINI.md", "QWEN.md",
          ".goosehints", ".cursorrules", ".windsurfrules"}
 RULE_DIRS = {"regeln", "roles", "rules", "instructions", "commands"}
 SKIP = {".git", "node_modules", "__pycache__", "site-packages", ".venv", "venv",
-        ".local", "sessions", "transcripts", "90-secrets", ".secrets-sync"}
+        ".local", "sessions", "transcripts", "secrets", ".secrets-sync"}
 
 
 def digest(data):

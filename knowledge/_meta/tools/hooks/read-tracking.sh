@@ -21,7 +21,7 @@ esac
 rel="${file_path#"$VAULT"/}"
 
 case "$rel" in
-    90-secrets/*|_meta/tools/*|.git/*) exit 0 ;;
+    secrets/*|_meta/tools/*|.git/*) exit 0 ;;
 esac
 
 mkdir -p "$VAULT/_meta/tools/state" 2>/dev/null

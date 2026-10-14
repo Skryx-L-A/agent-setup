@@ -1,0 +1,371 @@
+#!/bin/bash
+# wb-geheimnis-filter-dienst -- den Geheimnisfilter als Dienst mit Start bei Zugriff
+# einrichten, pruefen oder entfernen (Auftrag filter-live, der Nutzer 2026-10-10).
+#
+#   macOS: launchd-Agent agent-workbench.geheimnis-filter (shell/agent-workbench.geheimnis-filter.plist)
+#   Linux: systemd-User-Socket wb-geheimnis-filter.socket + .service (shell/systemd/)
+#
+# In beiden Faellen haelt das System den Lauschsocket 127.0.0.1:8093; kein Zeitgeber.
+# systemd startet wb-geheimnis-filter bei der ersten Verbindung, launchd seit 13.10. auch
+# beim Laden (KeepAlive/SuccessfulExit impliziert RunAtLoad). Nach einem Absturz startet
+# er sofort neu (KeepAlive bzw. Restart=on-failure), sonst bei der naechsten Verbindung.
+# Derselbe Socket nimmt auch CONNECT an (--connect): Proxy-Modus fuer Claude (HTTPS_PROXY,
+# Auftrag wz-proxybau 13.10.). Installieren legt dafuer die lokale CA an (Buendel
+# ~/.local/state/wb-geheimnis-filter/ca.pem fuer NODE_EXTRA_CA_CERTS; nie Trust-Store).
+#
+# Programm: Dienstkopie ~/.local/share/wb-geheimnis-filter/wb-geheimnis-filter aus dem
+# Repo, aus dem dieser Befehl laeuft (nicht ~/.local/bin: die Kopie gehoert dem Dienst,
+# und ein Aendern hier startet den laufenden Filter gezielt neu). Muster:
+# ~/.claude/hooks/lib/geheimnis_inhalt.py (ausgerollte Hooks).
+# Zaehler seit festem Zeitpunkt: ~/.local/state/wb-geheimnis-filter/zaehler.json; der
+# Zeitpunkt ist das erste Einrichten. Neu beginnen: Datei loeschen.
+#
+# Vor dem Ueberschreiben einer abweichenden Dienstkopie, plist oder Unit liegt ein
+# Schnappschuss unter ~/.local/trash-snapshots/<Datum>-geheimnis-filter-dienst/.
+#
+# Aufruf:
+#   wb-geheimnis-filter-dienst installieren   einrichten bzw. auf den Repo-Stand bringen
+#   wb-geheimnis-filter-dienst status         Dienstzustand und Zaehler
+#   wb-geheimnis-filter-dienst entfernen      Dienst abschalten (Harnesses VORHER zurueck!)
+# Entfernen bricht VOR jedem Dienst-Eingriff ab, solange Claude, Codex, pi,
+# opencode, crush oder die Werkbank-Registry noch lokale Filter-URLs auf 8093 (Claude
+# auch HTTPS_PROXY)
+# enthalten. Nicht lesbare/ungueltige Konfigurationen werden ebenfalls abgewiesen.
+# Kein Erzwingen: erst Harnesses zurueckstellen. Claude: ANTHROPIC_BASE_URL und
+# ENABLE_TOOL_SEARCH entfernen; Befehl im Abschnitt Rueckweg von
+# ~/.pi-workers/results/claude-filter/20261011-034639.md.
+# Weitere Konfigurationen (etwa goose/aider YAML, projektlokale Dateien oder
+# Start-Umgebungsvariablen) vorher ebenfalls auf direkte Anbieter zurueckstellen.
+set -uo pipefail
+
+# wb-ausrollen installiert normalerweise Kopien nach ~/.local/bin. Bei einem
+# Symlink dagegen gehoert das plist zum echten Skriptstand im Repo.
+QUELLE="${BASH_SOURCE[0]}"
+while [ -L "$QUELLE" ]; do
+  QUELLEN_DIR="$(cd -P -- "$(dirname -- "$QUELLE")" >/dev/null 2>&1 && pwd)" \
+    || { echo "wb-geheimnis-filter-dienst: Skriptpfad nicht aufloesbar" >&2; exit 1; }
+  LINK="$(readlink "$QUELLE")" || { echo "wb-geheimnis-filter-dienst: Symlink nicht lesbar" >&2; exit 1; }
+  case "$LINK" in /*) QUELLE="$LINK" ;; *) QUELLE="$QUELLEN_DIR/$LINK" ;; esac
+done
+REPO="$(cd -P -- "$(dirname -- "$QUELLE")" && pwd)" \
+  || { echo "wb-geheimnis-filter-dienst: Skriptordner nicht aufloesbar" >&2; exit 1; }
+PORT=8093
+LABEL=agent-workbench.geheimnis-filter
+UNIT=wb-geheimnis-filter
+ZIEL="$HOME/.local/share/wb-geheimnis-filter"
+ZUSTAND="$HOME/.local/state/wb-geheimnis-filter"
+LIB="$HOME/.claude/hooks/lib"
+SNAP="$HOME/.local/trash-snapshots/$(date +%Y-%m-%d)-geheimnis-filter-dienst"
+PLIST_QUELLE="$REPO/agent-workbench.geheimnis-filter.plist"
+PLIST_ZIEL="$HOME/Library/LaunchAgents/$LABEL.plist"
+UNIT_DIR="$HOME/.config/systemd/user"
+case "$(uname -s)" in
+  Darwin) OS=mac; PY="${WB_GF_PY:-/opt/homebrew/bin/python3}" ;;
+  *) OS=linux; PY="${WB_GF_PY:-/usr/bin/python3}" ;;
+esac
+
+fehler() { echo "wb-geheimnis-filter-dienst: $*" >&2; exit 1; }
+
+sichern() {   # sichern DATEI -- Schnappschuss, falls vorhanden
+  [ -e "$1" ] || return 0
+  mkdir -p "$SNAP"
+  cp -p "$1" "$SNAP/$(basename "$1").$(date +%H%M%S)" || fehler "Schnappschuss von $1 gescheitert"
+}
+
+legen() {   # legen QUELLE ZIEL MODUS -> Exit 0 geaendert, 1 gleich
+  if [ -f "$2" ] && cmp -s "$1" "$2"; then return 1; fi
+  sichern "$2"
+  mkdir -p "$(dirname "$2")"
+  cp "$1" "$2.neu.$$" && chmod "$3" "$2.neu.$$" && mv -f "$2.neu.$$" "$2" || fehler "$2 nicht geschrieben"
+  return 0
+}
+
+probe() {   # probe -> Exit 0, wenn die Zaehlerseite antwortet
+  local i
+  for i in $(seq 30); do
+    curl -s -m 15 "http://127.0.0.1:$PORT/_wb/zaehler" 2>/dev/null | grep -q '"start"' && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# Argumente als eine Zeile, durch Leerzeichen getrennt (Pfade und Schalter ohne Leerzeichen).
+plist_zeile() {   # plist_zeile DATEI -> ProgramArguments, Exit 1 ohne Argumente
+  local n=0 wert zeile=""
+  while wert="$(plutil -extract "ProgramArguments.$n" raw -o - "$1" 2>/dev/null)"; do
+    zeile="${zeile:+$zeile }$wert"; n=$((n+1))
+  done
+  [ "$n" -gt 0 ] || return 1
+  printf '%s\n' "$zeile"
+}
+
+geladene_zeile() {   # geladene_zeile AUSGABE_VON_LAUNCHCTL_PRINT -> Argumente des geladenen Jobs
+  printf '%s\n' "$1" | awk '/^[[:space:]]*arguments = \{/ {f=1; next} f && /^[[:space:]]*\}/ {f=0}
+    f {sub(/^[[:space:]]+/, ""); z = z (z == "" ? "" : " ") $0} END {print z}'
+}
+
+unit_zeile() {   # unit_zeile DATEI -> ExecStart der Unit, %h durch $HOME ersetzt
+  sed -n 's/^ExecStart=//p' "$1" | head -n 1 | sed "s#%h#${HOME}#g"
+}
+
+# ps meldet den aufgeloesten Interpreter als argv[0] (live: .../Python.app/...), die plist nennt
+# /opt/homebrew/bin/python3. Verglichen werden deshalb die Argumente ab dem zweiten Eintrag.
+ohne_programm() { printf '%s\n' "${1#* }"; }
+
+installieren() {
+  [ -x "$PY" ] || fehler "$PY fehlt"
+  [ -f "$LIB/geheimnis_inhalt.py" ] || fehler "$LIB/geheimnis_inhalt.py fehlt (Hooks nicht ausgerollt)"
+  printf 'x\n' | WB_GEHEIMNIS_LIB="$LIB" "$PY" "$REPO/wb-geheimnis-filter" filter >/dev/null \
+    || fehler "Filter laeuft mit $LIB nicht"
+  # Vor jeder Dienstkopie/Neustart pruefen: kein stiller Ersatz bei gesperrtem Speicher.
+  WB_GEHEIMNIS_LIB="$LIB" "$PY" "$REPO/wb-geheimnis-filter" schluessel-pruefen \
+    || fehler "Schluesselbund nicht bereit; Dienstkopie und laufender Dienst unveraendert"
+  mkdir -p "$ZUSTAND" && chmod 700 "$ZUSTAND"
+  # CA vor dem ersten Claude-Start mit NODE_EXTRA_CA_CERTS: fehlt die Datei, verwirft Node
+  # sie still und jeder aufgebrochene Handshake scheitert (fail-closed, aber unnoetig).
+  WB_GEHEIMNIS_LIB="$LIB" "$PY" "$REPO/wb-geheimnis-filter" ca-anlegen --ca-ordner "$ZUSTAND" >/dev/null \
+    || fehler "lokale CA nicht anlegbar (openssl?)"
+  if [ ! -f "$ZUSTAND/zaehler.json" ]; then
+    printf '{"seit": "%s", "zaehler": {}, "latenz": {}}\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$ZUSTAND/zaehler.json"
+    chmod 600 "$ZUSTAND/zaehler.json"
+  fi
+  local prog_neu=0
+  legen "$REPO/wb-geheimnis-filter" "$ZIEL/wb-geheimnis-filter" 755 && prog_neu=1
+  if [ "$OS" = mac ]; then
+    plutil -lint "$PLIST_QUELLE" >/dev/null || fehler "plist ungueltig"
+    local domain="gui/$(id -u)" job="gui/$(id -u)/$LABEL"
+    local vorher geladen=0 plist_neu=0 def_alt=0 aenderung=0 soll="" alter_pid="" alte_startzeit="" neuer_pid="" neue_startzeit=""
+    vorher="$(launchctl print "$job" 2>/dev/null)" && geladen=1
+    if [ "$geladen" = 1 ]; then
+      alter_pid="$(printf '%s\n' "$vorher" | awk '/^[[:space:]]*pid = [0-9]+/ {print $3; exit}')"
+      if [ -n "$alter_pid" ]; then
+        alte_startzeit="$(ps -o lstart= -p "$alter_pid" 2>/dev/null | sed 's/^[[:space:]]*//')"
+      fi
+    fi
+    legen "$PLIST_QUELLE" "$PLIST_ZIEL" 644 && plist_neu=1
+    soll="$(plist_zeile "$PLIST_ZIEL")" || fehler "ProgramArguments in $PLIST_ZIEL nicht lesbar"
+    # Die GELADENE Definition zaehlt, nicht nur die Datei: liegt die neue plist schon auf der
+    # Platte, waehrend launchd die alte geladen hat, startet kickstart mit der alten Definition
+    # (13.10.: kein --connect nach kickstart). Dann wie bei einer geaenderten plist neu laden.
+    if [ "$geladen" = 1 ] && [ "$(geladene_zeile "$vorher")" != "$soll" ]; then def_alt=1; fi
+    if [ "$prog_neu" = 1 ] || [ "$plist_neu" = 1 ] || [ "$def_alt" = 1 ]; then aenderung=1; fi
+
+    # Aenderungen am plist muessen launchd neu laden, damit insbesondere der
+    # socket-aktivierte Listener bei launchd registriert bleibt. Danach startet
+    # kickstart den Dienstprozess gezielt neu; bei reiner Programmaenderung ist
+    # kein bootout/bootstrap des Sockets noetig.
+    if [ "$geladen" = 1 ] && { [ "$plist_neu" = 1 ] || [ "$def_alt" = 1 ]; }; then
+      launchctl bootout "$job" || fehler "launchctl bootout vor plist-Neuladen gescheitert"
+      local weg=0
+      for _ in $(seq 40); do
+        launchctl print "$job" >/dev/null 2>&1 || { weg=1; break; }
+        sleep 0.25
+      done
+      [ "$weg" = 1 ] || fehler "launchd-Agent blieb nach bootout geladen"
+    fi
+    if [ "$geladen" = 0 ] || [ "$plist_neu" = 1 ] || [ "$def_alt" = 1 ]; then
+      if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        fehler "Port $PORT ist von einem anderen Prozess belegt"
+      fi
+      launchctl bootstrap "$domain" "$PLIST_ZIEL" || fehler "launchctl bootstrap gescheitert"
+      echo "launchd-Agent $LABEL geladen (Socket 127.0.0.1:$PORT)"
+    fi
+    if [ "$aenderung" = 1 ]; then
+      launchctl kickstart -k "$job" || fehler "launchctl kickstart -k gescheitert; Dienstkopie installiert, Prozess nicht bestaetigt"
+    fi
+  else
+    local u neu=0 nachladen=0 alt_def=0 haupt="" laufend="" soll=""
+    for u in socket service; do
+      legen "$REPO/systemd/$UNIT.$u" "$UNIT_DIR/$UNIT.$u" 644 && neu=1
+    done
+    # Geladene Definition gegen die Unit auf der Platte: NeedDaemonReload=yes heisst, die Datei ist
+    # neuer als der Manager; laeuft der Prozess mit anderen Argumenten als ExecStart, ist er alt.
+    [ "$(systemctl --user show -p NeedDaemonReload --value "$UNIT.service" 2>/dev/null)" = yes ] && nachladen=1
+    haupt="$(systemctl --user show -p MainPID --value "$UNIT.service" 2>/dev/null)"
+    if [ -n "$haupt" ] && [ "$haupt" != 0 ]; then
+      laufend="$(ps -o args= -p "$haupt" 2>/dev/null | sed 's/^[[:space:]]*//')"
+    fi
+    soll="$(unit_zeile "$UNIT_DIR/$UNIT.service")"
+    [ "$nachladen" = 1 ] && alt_def=1
+    [ -n "$laufend" ] && [ "$(ohne_programm "$laufend")" != "$(ohne_programm "$soll")" ] && alt_def=1
+    systemctl --user daemon-reload || fehler "daemon-reload gescheitert"
+    if [ "$neu" = 1 ] || [ "$prog_neu" = 1 ] || [ "$alt_def" = 1 ]; then
+      systemctl --user stop "$UNIT.service" 2>/dev/null
+    fi
+    if ! systemctl --user is-active --quiet "$UNIT.socket"; then
+      ss -ltn 2>/dev/null | grep -q "127.0.0.1:$PORT " && fehler "Port $PORT ist von einem anderen Prozess belegt"
+    fi
+    systemctl --user enable --now "$UNIT.socket" || fehler "Socket-Unit nicht gestartet"
+    [ "$neu" = 1 ] && systemctl --user restart "$UNIT.socket"
+    echo "systemd-Socket $UNIT.socket aktiv (127.0.0.1:$PORT)"
+  fi
+  if [ "$OS" = mac ]; then
+    if [ "$aenderung" = 1 ]; then
+      for _ in $(seq 40); do
+        nachher="$(launchctl print "$job" 2>/dev/null)" || nachher=""
+        neuer_pid="$(printf '%s\n' "$nachher" | awk '/^[[:space:]]*pid = [0-9]+/ {print $3; exit}')"
+        [ -n "$neuer_pid" ] && break
+        sleep 0.25
+      done
+      [ -n "$neuer_pid" ] || fehler "launchd meldet nach Neustart keinen Prozess (PID fehlt)"
+      neue_startzeit="$(ps -o lstart= -p "$neuer_pid" 2>/dev/null | sed 's/^[[:space:]]*//')"
+      [ -n "$neue_startzeit" ] || fehler "Startzeit fuer neuen Prozess PID $neuer_pid nicht lesbar"
+      if [ "$neuer_pid" = "$alter_pid" ] && [ "$neue_startzeit" = "$alte_startzeit" ]; then
+        fehler "Prozessidentitaet unveraendert nach kickstart -k (PID $neuer_pid, Startzeit $neue_startzeit)"
+      fi
+      # Der neue Prozess muss mit genau den Argumenten laufen, die die plist verlangt (nur Argumente, keine Umgebung).
+      local neue_zeile
+      neue_zeile="$(ps -o args= -p "$neuer_pid" 2>/dev/null | sed 's/^[[:space:]]*//')"
+      [ "$(ohne_programm "$neue_zeile")" = "$(ohne_programm "$soll")" ] \
+        || fehler "Prozessargumente weichen von der plist ab: PID $neuer_pid laeuft mit '$(ohne_programm "$neue_zeile")', soll '$(ohne_programm "$soll")'"
+    fi
+  fi
+  probe || fehler "Dienst antwortet nicht auf 127.0.0.1:$PORT/_wb/zaehler"
+  if [ "$OS" = linux ] && { [ "$neu" = 1 ] || [ "$prog_neu" = 1 ] || [ "$alt_def" = 1 ]; }; then
+    # Der Probeaufruf hat den Socket-Dienst gestartet; jetzt muss sein Prozess die Unit-Argumente tragen.
+    haupt="$(systemctl --user show -p MainPID --value "$UNIT.service" 2>/dev/null)"
+    [ -n "$haupt" ] && [ "$haupt" != 0 ] || fehler "systemd meldet nach dem Start keinen Prozess (MainPID fehlt)"
+    laufend="$(ps -o args= -p "$haupt" 2>/dev/null | sed 's/^[[:space:]]*//')"
+    [ "$(ohne_programm "$laufend")" = "$(ohne_programm "$soll")" ] \
+      || fehler "Prozessargumente weichen von der Unit ab: PID $haupt laeuft mit '$(ohne_programm "$laufend")', soll '$(ohne_programm "$soll")'"
+  fi
+  if [ "$OS" = mac ]; then
+    if [ "$aenderung" = 1 ]; then
+      if [ -n "$alter_pid" ] && [ -n "$alte_startzeit" ]; then
+        echo "Filter neu gestartet: PID $alter_pid -> $neuer_pid; Startzeit $alte_startzeit -> $neue_startzeit (geaendert)"
+      else
+        echo "Filter neu gestartet: PID $neuer_pid; Startzeit $neue_startzeit (neuer Prozess)"
+      fi
+    else
+      echo "Dienstkopie unveraendert; kein Neustart."
+    fi
+  fi
+  echo "Dienst antwortet: http://127.0.0.1:$PORT  (Zaehler: wb-geheimnis-filter zaehler --lesbar)"
+  echo "Proxy-Modus: HTTPS_PROXY=http://127.0.0.1:$PORT NODE_EXTRA_CA_CERTS=$ZUSTAND/ca.pem"
+}
+
+status() {
+  if [ "$OS" = mac ]; then
+    launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
+      | grep -E '^\s*(state|pid|runs|last exit code|last exit reason) =' || echo "launchd-Agent $LABEL nicht geladen"
+  else
+    systemctl --user --no-pager status "$UNIT.socket" "$UNIT.service" 2>/dev/null | grep -E '●|Active:|Main PID:' \
+      || echo "$UNIT nicht eingerichtet"
+  fi
+  WB_GEHEIMNIS_LIB="$LIB" "$PY" "$REPO/wb-geheimnis-filter" zaehler --port "$PORT" --lesbar
+  if [ -f "$ZUSTAND/ca.pem" ]; then
+    echo "Proxy-Modus: 127.0.0.1:$PORT, CA-Buendel $ZUSTAND/ca.pem ($(grep -c 'BEGIN CERTIFICATE' "$ZUSTAND/ca.pem") CA)"
+  fi
+}
+
+entfernen_pruefen() {
+  "$PY" - "$HOME" "$PORT" <<'PY'
+import json, re, sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+heimat, port = Path(sys.argv[1]), int(sys.argv[2])
+blockiert = []
+def filter_url(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        u = urlsplit(value)
+        return u.scheme in ('http', 'https') and u.hostname in ('127.0.0.1', 'localhost', '::1') and u.port == port
+    except ValueError:
+        return False
+
+def urls(obj):
+    if isinstance(obj, dict):
+        return any(filter_url(v) if k in ('baseUrl', 'baseURL', 'base_url', 'openai_base_url') else urls(v)
+                   for k, v in obj.items())
+    if isinstance(obj, list):
+        return any(urls(v) for v in obj)
+    return False
+
+def lesen(path, art='json'):
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        blockiert.append(str(path) + ': nicht sicher pruefbar; erst Konfiguration berichtigen')
+        return None
+    try:
+        if art == 'toml':
+            import tomllib
+            return tomllib.loads(path.read_text())
+        text = path.read_text()
+        if art == 'jsonc':
+            # Strings (einschliesslich URL //) unveraendert, nur Kommentare weg.
+            text = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/',
+                          lambda m: m.group(1) or '', text, flags=re.S)
+            text = re.sub(r'("(?:\\.|[^"\\])*")|,\s*(?=[}\]])',
+                          lambda m: m.group(1) or '', text, flags=re.S)
+        return json.loads(text)
+    except Exception:
+        # Kein Ausnahmetext: Parser koennen Konfigurationsinhalte darin tragen.
+        blockiert.append(str(path) + ': nicht sicher pruefbar; erst Konfiguration berichtigen')
+        return None
+
+claude = lesen(heimat / '.claude/settings.json')
+if isinstance(claude, dict) and isinstance(claude.get('env'), dict) and filter_url(claude['env'].get('ANTHROPIC_BASE_URL')):
+    blockiert.append('Claude: env.ANTHROPIC_BASE_URL zeigt auf den lokalen Filter')
+if isinstance(claude, dict) and isinstance(claude.get('env'), dict) and any(
+        filter_url(claude['env'].get(k)) for k in ('HTTPS_PROXY', 'https_proxy')):
+    blockiert.append('Claude: env.HTTPS_PROXY zeigt auf den lokalen Filter (Proxy-Modus)')
+
+for path, art in ((heimat / '.codex/config.toml', 'toml'),
+                  (heimat / '.pi/agent/models.json', 'json'),
+                  (heimat / '.config/opencode/opencode.json', 'json'),
+                  (heimat / '.config/opencode/opencode.jsonc', 'jsonc'),
+                  (heimat / '.config/crush/crush.json', 'json')):
+    if urls(lesen(path, art)):
+        blockiert.append(str(path) + ': Basis-URL zeigt auf den lokalen Filter')
+
+registry = lesen(heimat / '.claude/workbench/models.json')
+if isinstance(registry, dict):
+    for harness in registry.get('harnesses') or []:
+        if isinstance(harness, dict) and isinstance(harness.get('env'), dict):
+            if any(filter_url(v) for v in harness['env'].values()):
+                blockiert.append('Werkbank-Registry: Harness-Umgebung zeigt auf den lokalen Filter')
+                break
+    if urls(registry):
+        blockiert.append('Werkbank-Registry: Provider-Basis-URL zeigt auf den lokalen Filter')
+
+if blockiert:
+    print('wb-geheimnis-filter-dienst: Entfernen abgebrochen; ohne Dienst werden diese Harnesses ausgesperrt:', file=sys.stderr)
+    for grund in blockiert:
+        print('  ' + grund, file=sys.stderr)
+    print('Rueckweg Claude: ANTHROPIC_BASE_URL und ENABLE_TOOL_SEARCH (Proxy-Modus: HTTPS_PROXY, '
+          'NODE_EXTRA_CA_CERTS) aus env entfernen. '
+          'Befehl: ~/.pi-workers/results/claude-filter/20261011-034639.md, Abschnitt Rueckweg.', file=sys.stderr)
+    print('Andere Harnesses zuerst zurueckstellen; Rueckwege: '
+          '~/.pi-workers/results/filter-rest/20261011-034645.md und filter-live-Ergebnis. '
+          'Auch goose/aider YAML, projektlokale Konfigurationen und Start-Umgebungsvariablen pruefen. '
+          'Kein Erzwingen-Schalter.', file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+entfernen() {
+  entfernen_pruefen || fehler "Dienst unveraendert; zuerst Harness-Konfigurationen zurueckstellen."
+  if [ "$OS" = mac ]; then
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+    [ -f "$PLIST_ZIEL" ] && sichern "$PLIST_ZIEL" && rm -f "$PLIST_ZIEL"
+  else
+    systemctl --user disable --now "$UNIT.socket" "$UNIT.service" 2>/dev/null
+    for u in socket service; do
+      [ -f "$UNIT_DIR/$UNIT.$u" ] && sichern "$UNIT_DIR/$UNIT.$u" && rm -f "$UNIT_DIR/$UNIT.$u"
+    done
+    systemctl --user daemon-reload
+  fi
+  echo "Dienst entfernt (Dienstkopie und Zaehler bleiben unter $ZIEL bzw. $ZUSTAND)"
+}
+
+case "${1:-}" in
+  installieren) installieren ;;
+  status) status ;;
+  entfernen) entfernen ;;
+  *) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

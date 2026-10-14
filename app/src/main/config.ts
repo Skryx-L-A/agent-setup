@@ -16,12 +16,14 @@
 // Schreibweg in die geteilte Datei `wb-state settings set` ist. Steht einer
 // der vier noch in einer alten config.json, wird er nicht mehr gelesen.
 import { homedir, hostname, tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 // Die GETEILTEN Werte kommen seit dem 06.08. aus der geteilten Datei
 // (~/.claude/workbench/settings.json), nicht mehr aus der Programmdatei --
 // siehe den Abschnitt "Die GETEILTEN Werte" dort. Diese Datei liest sie nur;
 // geschrieben wird ausschliesslich ueber `wb-state settings set`.
+import { gastQuellenAus, type GastQuelle } from './gasttor';
 import {
   askMuster as askMusterAusEinstellungen,
   maschinenAktiv,
@@ -152,7 +154,7 @@ export interface Config {
    * nur verborgen (4c.2). Gehoert bewusst hierher und nicht in eine Konstante
    * im Code, damit die Liste sichtbar und pruefbar ist (~/.config/agent-
    * workbench/config.json). Glob-Syntax: `*` = ein Pfadstueck, `**` = beliebig
-   * viele. Die Vorgabe deckt `~/Knowledge/90-secrets/`, `~/.ssh/` und die
+   * viele. Die Vorgabe deckt `~/Knowledge/secrets/`, `~/.ssh/` und die
    * gaengigen Zugangsdaten-Dateimuster ab (dieselben wie in
    * hooks/bash-guard-secrets.sh, aus demselben Grund).
    */
@@ -186,6 +188,17 @@ export interface Config {
    * Mac aus ist die andere bekannte Maschine peer, umgekehrt der Mac.
    */
   remoteMachines: string[];
+  /**
+   * GAST-TOR-QUELLEN (27.09.2026, gasttor.ts): ferne Maschinen, die nur ueber
+   * `wb-gast-tor` erreichbar sind. Nur ueber die Umgebung (`AWB_GAST_SOURCES`
+   * oder ein Profil in `AWB_GAST_PROFILE`) -- der Starter des Gastes setzt sie;
+   * ohne beides bleibt die Liste leer und nichts geht ins Netz.
+   */
+  gastQuellen: GastQuelle[];
+  /** Warum ein Eintrag der Gast-Quellen verworfen wurde -- fuer die Auskunft. */
+  gastQuellenFehler: string[];
+  /** Testhaken: ein anderes Programm statt `ssh` fuer die Gast-Quellen (AWB_GAST_SSH_BIN). */
+  gastSshBin: string;
   /** Takt des Fernabrufs in Millisekunden -- deutlich langsamer als der lokale 2s-Takt. */
   remotePollMs: number;
   /** Ab wann ein einzelner SSH-Abruf als haengend gilt und abgebrochen wird. */
@@ -214,6 +227,27 @@ export interface Config {
    */
   maxWorkersPerTab: number;
   /**
+   * DIE MOBILE WERKBANK (Paket 10, Spezifikation 2.1/2.2). Reine Startgroessen
+   * dieses Programms, deshalb hier und nicht in der geteilten Datei. Ob der
+   * Server ueberhaupt laeuft, ist dagegen eine Bedienentscheidung und steht als
+   * `mobileServer` in settings.json (einstellungen.ts, Vorgabe aus).
+   *
+   * KEINE ORIGIN STEHT IM QUELLTEXT: beide kommen aus config.json
+   * (`mobileOrigins`, `mobileOrigin`) oder der Umgebung. Fehlen sie, startet der
+   * Server nicht und sagt warum -- er raet keine Adresse aus einem Praefix
+   * (Spezifikation 2.2, `peer` gegen `peer-1`).
+   */
+  /** `127.0.0.1:<port>` fuer `tailscale serve` (AWB_MOBILE_PORT, Vorgabe 47321). */
+  mobilePort: number;
+  /** Beide API-Origins, vollstaendig mit Schema (AWB_MOBILE_ORIGINS, durch Komma getrennt). */
+  mobileOrigins: string[];
+  /** Die Origin DIESES Hosts; nur fuer sie nimmt der Server Signaturen an (AWB_MOBILE_ORIGIN). */
+  mobileOrigin: string;
+  /** Die Tailscale-Anmeldung, fuer die eine Kopplung gilt (AWB_MOBILE_OPERATOR); leer = keine Kopplung. */
+  mobileOperator: string;
+  /** Die 0600-VAPID-Datei ausserhalb des Repositories (AWB_MOBILE_VAPID); leer = kein Web Push. */
+  mobileVapidFile: string;
+  /**
    * Pfad fuer EIN Selbstfoto direkt nach dem Start (`--startfoto=<pfad>`).
    * Leer = keins. Gebraucht fuer den Fall, in dem es keinen Steuerkanal gibt
    * und `awb-ctl shot` deshalb nicht erreichbar ist: ohne diesen Weg liesse
@@ -224,15 +258,22 @@ export interface Config {
 }
 
 /**
- * Standardpfad des Steuersockets. Dieselbe Ableitung steht ein zweites Mal in
- * bin/awb-ctl, das ohne Bauschritt laufen soll und deshalb nichts aus dist/
- * laden kann. Die Testsuite vergleicht beide Ergebnisse gegeneinander.
+ * Standardpfad des Steuersockets. Der Produktivkern behält den historischen,
+ * mit bin/awb-ctl gemeinsamen Pfad. Ein Kern mit ausdrücklich abweichendem
+ * Zustandsverzeichnis erhält dagegen eine kurze Kennung daraus: Testkerne
+ * können so nie den Socket eines laufenden Produktivkerns belegen, auch wenn
+ * ein Test AWB_CONTROL_SOCKET vergisst.
  */
 export function defaultControlSocketPath(env: NodeJS.ProcessEnv = process.env): string {
   if (env.AWB_CONTROL_SOCKET) return env.AWB_CONTROL_SOCKET;
   const base = env.XDG_RUNTIME_DIR || tmpdir();
   // Unix-Socketpfade sind auf rund 104 Zeichen begrenzt, deshalb kurz halten.
-  return join(base, `awb-${process.getuid?.() ?? 0}.sock`);
+  const name = `awb-${process.getuid?.() ?? 0}`;
+  const produktivStateDir = resolve(homedir(), '.config', 'agent-workbench');
+  const stateDir = env.AWB_STATE_DIR;
+  if (!stateDir || resolve(stateDir) === produktivStateDir) return join(base, `${name}.sock`);
+  const lauf = createHash('sha256').update(resolve(stateDir), 'utf8').digest('hex').slice(0, 12);
+  return join(base, `${name}-${lauf}.sock`);
 }
 
 function configFilePath(env: NodeJS.ProcessEnv): string {
@@ -246,6 +287,12 @@ function readConfigFile(env: NodeJS.ProcessEnv): Partial<Config> {
     // Ein erster Start ohne alles muss funktionieren (Plan 3.5, Punkt 4).
     return {};
   }
+}
+
+/** Ein TCP-Port 1..65535; alles andere heisst Vorgabe (ein ungueltiger Wert waehlt nie einen Zufallsport). */
+function portAus(wert: unknown, vorgabe: number): number {
+  const n = typeof wert === 'number' ? wert : typeof wert === 'string' && /^[0-9]+$/.test(wert) ? Number(wert) : NaN;
+  return Number.isSafeInteger(n) && n >= 1 && n <= 65535 ? n : vorgabe;
 }
 
 export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env): Config {
@@ -299,7 +346,7 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
     excludeGlobs: (env.AWB_EXCLUDE_GLOBS?.split(',').map((s) => s.trim()).filter(Boolean))
       ?? file.excludeGlobs
       ?? [
-        '**/90-secrets', '**/90-secrets/**',
+        '**/secrets', '**/secrets/**',
         '**/.ssh', '**/.ssh/**',
         '**/.env', '**/.env.*',
         '**/id_rsa', '**/id_ed25519', '**/id_ecdsa',
@@ -330,6 +377,11 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
     remoteMachines: (env.AWB_REMOTE_MACHINES !== undefined
       ? env.AWB_REMOTE_MACHINES.split(',').map((s) => s.trim()).filter(Boolean)
       : maschinenAktiv(einstellungen)),
+    ...(() => {
+      const g = gastQuellenAus(env);
+      return { gastQuellen: g.quellen, gastQuellenFehler: g.fehler };
+    })(),
+    gastSshBin: env.AWB_GAST_SSH_BIN ?? '',
     remotePollMs: num(env.AWB_REMOTE_POLL_MS, file.remotePollMs ?? 10000),
     remoteTimeoutMs: num(env.AWB_REMOTE_TIMEOUT_MS, file.remoteTimeoutMs ?? 6000),
     testsuiteStatusFile: env.AWB_TESTSUITE_STATUS_FILE ?? file.testsuiteStatusFile ?? join(homedir(), '.local', 'state', 'wb-testsuite-status.txt'),
@@ -341,5 +393,12 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
     minPaneRows: num(env.AWB_MIN_PANE_ROWS, file.minPaneRows ?? 12),
     maxWorkersPerTab: num(env.AWB_MAX_WORKERS_PER_TAB, zahlAus('maxWorkerPanesPerTab', 0, 64, einstellungen)),
     startShot: flag('startfoto') ?? env.AWB_START_SHOT ?? '',
+    mobilePort: portAus(env.AWB_MOBILE_PORT ?? file.mobilePort, 47321),
+    mobileOrigins: (env.AWB_MOBILE_ORIGINS !== undefined
+      ? env.AWB_MOBILE_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
+      : Array.isArray(file.mobileOrigins) ? file.mobileOrigins.filter((s) => typeof s === 'string') : []),
+    mobileOrigin: env.AWB_MOBILE_ORIGIN ?? (typeof file.mobileOrigin === 'string' ? file.mobileOrigin : ''),
+    mobileOperator: env.AWB_MOBILE_OPERATOR ?? (typeof file.mobileOperator === 'string' ? file.mobileOperator : ''),
+    mobileVapidFile: env.AWB_MOBILE_VAPID ?? (typeof file.mobileVapidFile === 'string' ? file.mobileVapidFile : ''),
   };
 }

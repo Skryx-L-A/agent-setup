@@ -9,10 +9,13 @@ gardener's `_meta/tools/gardener/state/gardener.db` -- braincli must not write i
 another tool's state directory. `semantic_search()` merges this store with
 gardener's own at query time.
 
-Maintenance-only: run this after a MOC.md's content changes (content-hash
-gated, like gardener's own cache, so an unchanged note is a no-op). Not run
-automatically per query -- a live Ollama call per MOC.md would blow the
-auto-recall hook's 1.5s budget.
+Run by the gardener's embed phase (every `brain run` and `gardener --phase
+embed`) since Auftrag g5, 24.09.2026 - before that only the retired
+`brain-maintain` called it and the layer stood at 20.08. with 45 of 61 MOCs.
+Content-hash gated like gardener's own cache, so an unchanged note is a no-op.
+Not run per query -- a live Ollama call per MOC.md would blow the auto-recall
+hook's 1.5s budget. `brain doctor` reports MOCs whose vector is missing or
+older than their text (`stale`).
 """
 from __future__ import annotations
 
@@ -40,11 +43,12 @@ def moc_notes(vault: Path):
     return [n for n in load_search_notes(vault) if Path(n.rel).name == "MOC.md"]
 
 
-def build(vault: Path, db_path: Path | None = None) -> dict[str, str]:
-    """Embed every MOC.md (content-hash gated). Returns {rel: status}."""
+def build(vault: Path, db_path: Path | None = None, client=None) -> dict[str, str]:
+    """Embed every MOC.md (content-hash gated). Returns {rel: status}.
+    `client` defaults to a fresh OllamaClient; the gardener passes its own."""
     db_path = extra_db_path(vault) if db_path is None else Path(db_path)
     store = Store(db_path)
-    client = OllamaClient()
+    client = client if client is not None else OllamaClient()
     status: dict[str, str] = {}
     try:
         notes = moc_notes(vault)
@@ -66,6 +70,19 @@ def build(vault: Path, db_path: Path | None = None) -> dict[str, str]:
     finally:
         store.close()
     return status
+
+
+def stale(vault: Path, db_path: Path | None = None) -> list[str]:
+    """MOC.md files without a vector for their current text. Read-only."""
+    db_path = extra_db_path(vault) if db_path is None else Path(db_path)
+    notes = moc_notes(vault)
+    if not db_path.exists():
+        return [n.rel for n in notes]
+    store = Store(db_path, read_only=True)
+    try:
+        return [n.rel for n in notes if store.get_embedding(n.rel, cache_key(n)) is None]
+    finally:
+        store.close()
 
 
 def main() -> None:

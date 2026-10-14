@@ -590,6 +590,11 @@ def refresh_index(vault: Path, rels: list[str]) -> list[tuple[str, str, str]]:
     finally:
         for store in stores:
             store.close()
+    # Eigene Indizes weiterer Einbettungsmodelle (einbettung.py) folgen derselben
+    # Regel; ohne das fände die Suche mit BRAIN_EMBED_MODELL=qwen3-... weiter
+    # den zurückgenommenen Text.
+    from . import einbettung
+    einbettung.nachziehen(Path(vault), [r for r, _, _ in ergebnis])
     return ergebnis
 
 

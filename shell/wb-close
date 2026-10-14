@@ -186,10 +186,134 @@ cleanup_worktree(){ # $1 = worker name
   return 0
 }
 
+# Belegungstafel und Gruppen (2026-10-09, Plan Tafel und Gruppen): ein geschlossener Worker
+# haelt nichts mehr. VOR dem Schliessen traegt wb-close verbliebene Tafel-Eintraege und
+# Wartende dieses Panes aus -- als sein Orchestrator, ueber die Kennungen aus
+# `wb-tafel --json` -- und meldet jeden; ein toter Pane verfiele sonst erst beim naechsten
+# Tafel-Aufruf, und ein mit --pid gebundener Lauf ueberlebte das Schliessen gar. NACH dem
+# Schliessen kommt der Worker aus der Team-Gruppe (`wb-gruppe team weg`). Beides ist best
+# effort: fehlt ein Werkzeug oder scheitert es, bleibt Schliessen, Exit-Code und Ablauf
+# unveraendert, es gibt nur einen Hinweis. $WB_TAFEL/$WB_GRUPPE zeigen fuer Tests auf Kopien.
+tafel_austragen(){   # pane-id socket-path worker-name
+  local pane="$1" sp="$2" wname="$3" tafel="${WB_TAFEL:-$HOME/.local/bin/wb-tafel}" ids id platz out
+  [ -x "$tafel" ] || return 0
+  ids="$("$tafel" --json 2>/dev/null | /usr/bin/python3 -c '
+import json, os, sys
+pane, sp = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+def gleich(a, b):
+    return bool(a) and bool(b) and (a == b or os.path.realpath(a) == os.path.realpath(b))
+for p in d.get("plaetze") or []:
+    for e in (p.get("eintraege") or []) + (p.get("schlange") or []):
+        h = e.get("halter") or {}
+        if h.get("pane") == pane and gleich(h.get("socket", ""), sp):
+            print("%s\t%s" % (e.get("id", ""), p.get("name", "")))
+' "$pane" "$sp" 2>/dev/null)" || true
+  [ -n "$ids" ] || return 0
+  while IFS=$'\t' read -r id platz; do
+    [ -n "$id" ] || continue
+    if out="$("$tafel" gib "$id" 2>&1 </dev/null)"; then
+      echo "wb-close: Tafel -- $id ($platz) von ${wname:-$pane} ausgetragen."
+    else
+      echo "wb-close: HINWEIS -- Tafel-Eintrag $id ($platz) von ${wname:-$pane} liess sich nicht austragen: $(printf '%s\n' "$out" | tail -1)" >&2
+    fi
+  done <<< "$ids"
+  return 0
+}
+
+gruppe_austragen(){   # worker-name
+  local wname="$1" gruppe="${WB_GRUPPE:-$HOME/.local/bin/wb-gruppe}" out
+  [ -n "$wname" ] && [ -x "$gruppe" ] || return 0
+  # `--geschlossen` (14.10.2026): wb-close hat den Pane gerade geschlossen und sagt es der Gruppe;
+  # das gilt auch ueber ssh (kein Pane in der Ahnenreihe, sonst "Absender nicht bestimmbar").
+  # wb-gruppe prueft selbst, dass kein Pane den Namen mehr traegt. Eine aeltere wb-gruppe kennt
+  # die Option nicht (Exit 2): dann der bisherige Aufruf.
+  local rc=0
+  out="$("$gruppe" team weg "$wname" --geschlossen 2>&1)" || rc=$?
+  [ "$rc" -eq 2 ] && { rc=0; out="$("$gruppe" team weg "$wname" 2>&1)" || rc=$?; }
+  if [ "$rc" -eq 0 ]; then
+    [ -n "$out" ] && echo "wb-close: Gruppe -- $out"
+  else
+    echo "wb-close: HINWEIS -- $wname nicht aus der Team-Gruppe ausgetragen: $(printf '%s\n' "$out" | tail -1)" >&2
+  fi
+  return 0
+}
+
 # Zaehlt tatsaechliche Schliessungen dieses Aufrufs (nicht Kandidaten, nicht
 # Fehlversuche) -- warn_waisen laeuft nur, wenn hier wirklich etwas geschlossen
 # wurde, siehe Kopfkommentar.
 closed_count=0
+closed_workers=""
+
+capture_worker_context(){ # pane-id worker-name -> append pane, socket, worktree, process tree
+  local pane="$1" worker="$2" socket path marker pane_path worktree_root expected root tree rows record
+  socket="$($T display -p -t "$pane" '#{socket_path}' 2>/dev/null)"
+  marker="$($T display -p -t "$pane" '#{@wb_worktree}' 2>/dev/null)"
+  path=""
+  if [ -n "$marker" ]; then
+    path="$(cd -P "$marker" 2>/dev/null && pwd -P)"
+  elif [ -n "$worker" ]; then
+    pane_path="$($T display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)"
+    pane_path="$(cd -P "$pane_path" 2>/dev/null && pwd -P)"
+    worktree_root="$(cd -P "$HOME/.pi-workers/worktrees" 2>/dev/null && pwd -P)"
+    expected="$(cd -P "$worktree_root/$worker" 2>/dev/null && pwd -P)"
+    if [ -n "$worktree_root" ] && [ -n "$expected" ] \
+        && [ "${expected%/*}" = "$worktree_root" ] \
+        && [ "${expected##*/}" = "$worker" ] \
+        && [ "$pane_path" = "$expected" ]; then
+      path="$expected"
+    fi
+  fi
+  root="$($T display -p -t "$pane" '#{pane_pid}' 2>/dev/null)"
+  tree=""
+  if [[ "$root" =~ ^[0-9]+$ ]]; then
+    rows="$(ps -axo pid=,ppid= 2>/dev/null)"
+    tree="$(printf '%s\n' "$rows" | awk -v root="$root" '
+      { pid[NR]=$1; ppid[NR]=$2 }
+      END {
+        found[root]=1
+        for (pass=0; pass<NR; pass++)
+          for (i=1; i<=NR; i++) if (found[ppid[i]]) found[pid[i]]=1
+        sep=""
+        for (i=1; i<=NR; i++) if (found[pid[i]]) { printf "%s%s", sep, pid[i]; sep="," }
+      }')"
+  fi
+  printf -v record '%s\t%s\t%s\t%s\t%s\n' "$pane" "$worker" "$socket" "$path" "$tree"
+  closed_workers="${closed_workers}${record}"
+}
+
+waise_gehoert_dazu(){ # pid detail -> 0 if a closed worker matches
+  local pid="$1" detail="$2" owner owner_worker owner_socket cwd cwd_real pane worker socket path tree
+  owner="$(printf '%s\n' "$detail" | sed -n 's/.*zuletzt \(%[0-9][0-9]*\).*/\1/p')"
+  owner_worker="$(printf '%s\n' "$detail" | sed -n "s/.*Worker '\([^']*\)'.*/\1/p")"
+  if [ -n "$owner" ]; then
+    owner_socket="$(/usr/bin/python3 - "$HOME/.local/state/wb-nohup/eigentuemer/$pid.json" 2>/dev/null <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        print(json.load(source).get("socket_path") or "")
+except Exception:
+    pass
+PY
+)"
+  fi
+  while IFS=$'\t' read -r pane worker socket path tree; do
+    [ -n "$pane" ] || continue
+    if [ "$owner" = "$pane" ] && [ -n "$owner_socket" ] && [ "$owner_socket" = "$socket" ] \
+        && { [ -z "$worker" ] || [ "$worker" = "$owner_worker" ]; }; then return 0; fi
+    case ",$tree," in *",$pid,"*) return 0 ;; esac
+    if [ -n "$path" ] && command -v lsof >/dev/null 2>&1; then
+      cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+      case "$cwd" in "$path"|"$path (deleted)"|"$path/"*) return 0 ;; esac
+      cwd_real="$(cd -P "$cwd" 2>/dev/null && pwd -P)"
+      case "$cwd_real/" in "$path/"*) return 0 ;; esac
+    fi
+  done <<< "$closed_workers"
+  return 1
+}
 
 # Rein lesende Pruefung nach dem Schliessen: gibt es jetzt einen schweren
 # Hintergrundprozess ohne lebenden Besitzer, wird er benannt -- beendet wird
@@ -233,10 +357,20 @@ warn_waisen(){
   # rc==1 heisst "mindestens ein bestaetigter Waise".
   [ "$rc" -eq 1 ] || return 0
   echo
-  echo "wb-close: HINWEIS — nach dem Schliessen steht mindestens ein bestaetigter Waise da (Eigentuemer-Pane tot, nur gelesen, nichts beendet):"
+  local fremde=0 eigene=0
+  local tmp="$out" pid rss etime ports kategorie klasse detail cmd
+  while IFS='|' read -r pid rss etime ports kategorie klasse detail cmd; do
+    [ -n "$pid" ] || continue
+    [ "$klasse" = "waise" ] || continue
+    if waise_gehoert_dazu "$pid" "$detail"; then eigene=$((eigene+1)); else fremde=$((fremde+1)); fi
+  done <<EOF
+$tmp
+EOF
+  [ "$eigene" -gt 0 ] && echo "wb-close: HINWEIS — bestaetigte Waisen dieses geschlossenen Workers (Eigentuemer-Pane tot, nur gelesen, nichts beendet):"
   printf '%s\n' "$out" | while IFS='|' read -r pid rss etime ports kategorie klasse detail cmd; do
     [ -n "$pid" ] || continue
     [ "$klasse" = "waise" ] || continue
+    if ! waise_gehoert_dazu "$pid" "$detail"; then continue; fi
     printf '  PID %-8s %s%s\n' "$pid" "$kategorie" "${ports:+ (Port $ports)}"
     printf '      %s\n' "$detail"
     printf '      Befehl:  %s\n' "$cmd"
@@ -249,6 +383,7 @@ warn_waisen(){
       *) printf '      Beenden: kill %s\n' "$pid" ;;
     esac
   done
+  [ "$fremde" -gt 0 ] && echo "wb-close: $fremde weitere bestätigte Waisen auf dieser Maschine gehören nicht zu diesem Worker — ansehen mit wb-waisen"
   return 0
 }
 
@@ -276,9 +411,11 @@ close_one(){ # $1 = pane-id or worker-name ; echoes result, returns 0/2
   # Datei, die niemand liest -- die Meldung waere weiterhin da, nur unsichtbar
   # falsch benannt statt sichtbar falsch (gemessen 2026-08-04, systematischer Befund).
   wname="$(worker_of "$pid")"
+  capture_worker_context "$pid" "$wname"
   sp="$($T display -p -t "$pid" '#{socket_path}' 2>/dev/null)"
   sess="$(base_session_of "$pid")"
-  $T kill-pane -t "$pid" && { echo "wb-close: geschlossen $pid (worker=$wname arg=$arg)"; mark_worker_done "$sp" "$sess" "$wname"; cleanup_worktree "$wname"; remove_worker_entry "$wname" "$sess"; closed_count=$((closed_count+1)); }
+  tafel_austragen "$pid" "$sp" "$wname"
+  $T kill-pane -t "$pid" && { echo "wb-close: geschlossen $pid (worker=$wname arg=$arg)"; mark_worker_done "$sp" "$sess" "$wname"; cleanup_worktree "$wname"; remove_worker_entry "$wname" "$sess"; gruppe_austragen "$wname"; closed_count=$((closed_count+1)); }
   return 0
 }
 
@@ -298,6 +435,7 @@ list_workers(){
 [[ $# -eq 0 ]] && { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 case "${1:-}" in
+  --help|-h) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   --list|-l) list_workers; exit 0 ;;
   --all-workers|-a)
     rc=0

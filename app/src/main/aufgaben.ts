@@ -26,6 +26,7 @@
 // DER TAKT: zwei Sekunden, solange eine Oberflaeche die Ansicht zeigt, sonst
 // langsam (Befund M4). Die Welten stossen ueber ihre eigenen Waechter sofort
 // einen Takt an. `wb-budget` laeuft jede Minute, `wb-mensch` alle 15 s.
+import type { Herkunft, Herkunftsbeleg } from './herkunft';
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import type { SessionInfo } from './sessions';
@@ -71,12 +72,17 @@ export interface AufgabenOptionen {
   menschMs: number;
   /** Takt, solange keine Oberflaeche die Ansicht zeigt; die Waechter der Welten stossen weiter sofort an (Befund M4). */
   taktVerborgenMs: number;
-  /** Spaetestens so oft geht der Stand hinaus, auch unveraendert -- die Ansichten messen daran die Frische. */
+  /**
+   * Spaetestens so lange bleibt ein unveraenderter Stand ungesendet; danach geht er mit neuem `erzeugt`
+   * hinaus. Das Netz unter dem Vergleich in `aufgabenVergleichsform`: eine Anzeige kann hoechstens so lange
+   * veraltet sein, nie einfrieren.
+   */
   herzschlagMs: number;
   /** Die Welten (welten.ts): Datenbibliothek, Wurzeln, globale Welt, Takte. */
   welten: WeltenOptionen;
   sitzungen: () => SessionInfo[];
-  aufNeu: (p: AufgabenNutzlast) => void;
+  /** `geaendert`: der Stand hat sich fuer eine Anzeige geaendert; false beim Herzschlag und beim erzwungenen Senden. */
+  aufNeu: (p: AufgabenNutzlast, geaendert: boolean) => void;
 }
 
 /** Die Werkzeuge ueber PATH, jedes per Umgebungsvariable umlenkbar (Tests, Schirme). */
@@ -93,7 +99,7 @@ export function aufgabenOptionenAusUmgebung(env: NodeJS.ProcessEnv, home: string
     budgetMs: Number(env.AWB_AUFGABEN_BUDGET_MS ?? 60_000),
     menschMs: Number(env.AWB_AUFGABEN_MENSCH_MS ?? 15_000),
     taktVerborgenMs: Number(env.AWB_AUFGABEN_TAKT_VERBORGEN_MS ?? 30_000),
-    herzschlagMs: Number(env.AWB_AUFGABEN_HERZSCHLAG_MS ?? 10_000),
+    herzschlagMs: Number(env.AWB_AUFGABEN_HERZSCHLAG_MS ?? 30_000),
     welten: weltenOptionenAusUmgebung(env, home, __dirname, config.stateDir),
   };
 }
@@ -223,22 +229,64 @@ function kurz(l: Lauf): string {
   return (l.fehler || l.err.trim().split('\n').filter(Boolean).pop() || l.out.trim().split('\n').pop() || `Exit ${l.code}`).slice(0, 300);
 }
 
+/**
+ * Die Stufe, in der eine Dauer angezeigt wird (`dauerWort` in welten-view.ts, `WeltenWorte.dauerWort` in
+ * WeltenNutzlast.swift -- beide gleich): Sekunden unter einer Minute, dann abgerundete Minuten, Stunden, Tage.
+ */
+export function dauerStufe(sekunden: unknown): string {
+  const s = typeof sekunden === 'number' && Number.isFinite(sekunden) ? sekunden : 0;
+  if (s < 60) return `s${s}`;
+  if (s < 3600) return `m${Math.floor(s / 60)}`;
+  if (s < 86_400) return `h${Math.floor(s / 3600)}`;
+  return `d${Math.floor(s / 86_400)}`;
+}
+
+/**
+ * Die Vergleichsform von `awb:aufgaben` (09.10.2026, Auftrag perf-aufgaben). Gemessen im Leerlauf, mit
+ * Demo-Welten: von Nachricht zu Nachricht aenderten sich nur
+ *   * `erzeugt` (der Herzschlag; kein Empfaenger zeigt es an),
+ *   * `welten.welten[].gelesen` (wann der Kern die Welt zuletzt las; kein Empfaenger zeigt es an --
+ *     welten-view.ts liest nur `mensch.gelesen`, WeltenNutzlast.swift nutzt es allein im Gleichheitstest),
+ *   * `welten.welten[].tickets[].alter_s` und `.durchlaufzeit_s` (die Zeit zaehlt weiter; angezeigt als
+ *     `dauerWort`, also in der Stufe von `dauerStufe`).
+ * Alles andere -- auch eine Stufe, die kippt -- ist eine Aenderung und geht sofort hinaus.
+ */
+export function aufgabenVergleichsform(p: AufgabenNutzlast): string {
+  const { erzeugt: _erzeugt, welten, ...rest } = p;
+  const liste = (welten as { welten?: unknown } | null | undefined)?.welten;
+  if (!Array.isArray(liste)) return JSON.stringify({ ...rest, welten });
+  const jeWelt = liste.map((w: Record<string, unknown>) => {
+    const { gelesen: _gelesen, tickets, ...welt } = w;
+    if (!Array.isArray(tickets)) return { ...welt, tickets };
+    return {
+      ...welt,
+      tickets: tickets.map((t: Record<string, unknown>) => ({
+        ...t, alter_s: dauerStufe(t.alter_s), durchlaufzeit_s: dauerStufe(t.durchlaufzeit_s),
+      })),
+    };
+  });
+  return JSON.stringify({ ...rest, welten: { ...welten, welten: jeWelt } });
+}
+
 export class AufgabenQuelle {
   private timer: NodeJS.Timeout | null = null;
+  /** Der Herzschlag: ein Zeitgeber, der mit jedem Senden neu beginnt -- so liegen zwischen zwei Nachrichten hoechstens `herzschlagMs`. */
   private herz: NodeJS.Timeout | null = null;
   private anstoss: NodeJS.Timeout | null = null;
   /** Der laufende Takt -- `frisch()` wartet genau ihn ab (Reviewer-Hinweis H2). */
   private laeuftGerade: Promise<void> | null = null;
   private nochmal = false;
+  /** Zaehlt jedes `stop()`: ein Takt, der ueber ein `stop()` hinweg lief, sendet seinen Stand nicht mehr. */
+  private epoche = 0;
   /** Ob eine Oberflaeche die Ansicht gerade zeigt (`awb:aufgaben-sichtbar`). */
   private sichtbar = false;
-  private gesendetZeit = 0;
   private budget: Record<string, unknown> | null = null;
   private budgetFehler = '';
   private budgetZeit = 0;
   private mensch: boolean | null = null;
   private menschZeit = 0;
   private stand: AufgabenNutzlast;
+  /** Die Vergleichsform des zuletzt gesendeten Stands (`aufgabenVergleichsform`). */
   private zuletztGesendet = '';
   private readonly welten: WeltenQuelle;
 
@@ -266,7 +314,7 @@ export class AufgabenQuelle {
     if (this.timer) return;
     void this.takt();
     this.taktStellen();
-    this.herz = setInterval(() => this.herzschlag(), Math.max(500, Math.floor(this.opt.herzschlagMs / 2)));
+    this.herzStellen();
   }
 
   /**
@@ -293,24 +341,38 @@ export class AufgabenQuelle {
   }
 
   /**
-   * DER HERZSCHLAG (Befund H2 der Electron-Pruefung): der Stand geht spaetestens
-   * alle `herzschlagMs` hinaus, auch unveraendert und mit neuem `erzeugt`.
+   * DER HERZSCHLAG (Befund H2 der Electron-Pruefung): der Stand geht spaetestens alle `herzschlagMs`
+   * hinaus, auch unveraendert und mit neuem `erzeugt`. Seit perf-aufgaben dreissig statt zehn Sekunden und
+   * ohne Mobil-Ereignis: gemessen gingen im Leerlauf alle Nachrichten allein wegen `erzeugt` hinaus.
    */
-  private herzschlag(): void {
-    if (Date.now() - this.gesendetZeit < this.opt.herzschlagMs) return;
-    this.stand = { ...this.stand, erzeugt: new Date().toISOString() };
-    this.senden(this.stand);
+  private herzStellen(): void {
+    if (this.herz) clearTimeout(this.herz);
+    this.herz = this.timer ? setTimeout(() => this.herzschlag(), Math.max(500, this.opt.herzschlagMs)) : null;
   }
 
-  private senden(p: AufgabenNutzlast): void {
-    this.gesendetZeit = Date.now();
-    this.opt.aufNeu(p);
+  private herzschlag(): void {
+    this.stand = { ...this.stand, erzeugt: new Date().toISOString() };
+    this.senden(this.stand, false);
+  }
+
+  /** Den Stand jetzt an alle Oberflaechen schicken, auch unveraendert: fuer einen neuen Empfaenger (`awb:ready`). */
+  erzwingen(): void {
+    this.stand = { ...this.stand, erzeugt: new Date().toISOString() };
+    this.zuletztGesendet = aufgabenVergleichsform(this.stand);
+    this.senden(this.stand, false);
+  }
+
+  private senden(p: AufgabenNutzlast, geaendert: boolean): void {
+    this.herzStellen();
+    this.opt.aufNeu(p, geaendert);
   }
 
   stop(): void {
+    this.epoche++;
+    this.nochmal = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    if (this.herz) clearInterval(this.herz);
+    if (this.herz) clearTimeout(this.herz);
     this.herz = null;
     if (this.anstoss) clearTimeout(this.anstoss);
     this.anstoss = null;
@@ -356,13 +418,16 @@ export class AufgabenQuelle {
 
   /** Takte laufen strikt nacheinander (`laeuftGerade`); keiner kann einen spaeteren ueberholen. */
   private async taktAusfuehren(): Promise<void> {
+    const epoche = this.epoche;
     try {
       const neu = await this.sammeln();
+      // stop() raeumt die Werkzeuge ab, die dieser Takt gerade las: sein Stand waere ein Fehlerstand.
+      if (epoche !== this.epoche) return;
       this.stand = neu;
-      const vergleich = JSON.stringify({ ...neu, erzeugt: '' });
+      const vergleich = aufgabenVergleichsform(neu);
       if (vergleich !== this.zuletztGesendet) {
         this.zuletztGesendet = vergleich;
-        this.senden(neu);
+        this.senden(neu, true);
       }
     } catch (e) {
       process.stderr.write(`aufgaben: Takt gescheitert: ${(e as Error).message}\n`);
@@ -474,7 +539,7 @@ export class AufgabenQuelle {
   // Handlungen: nur noch an Welten (welten.ts, `welt:<handlung> <JSON>`).
   // -------------------------------------------------------------------------
 
-  async ausfuehren(befehl: string, herkunft: 'oberflaeche' | 'steuerkanal', opt: unknown = {}): Promise<WeltenHandlungsErgebnis> {
+  async ausfuehren(befehl: string, herkunft: Herkunft | Herkunftsbeleg, opt: unknown = {}): Promise<WeltenHandlungsErgebnis> {
     if (befehl.trim().startsWith('welt:')) {
       const r = await this.welten.ausfuehren(befehl, herkunft, opt);
       this.anstossen();

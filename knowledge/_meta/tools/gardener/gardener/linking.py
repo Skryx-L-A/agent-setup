@@ -30,13 +30,39 @@ JUDGE_SYSTEM = (
     "confidence is how sure you are that the link is useful."
 )
 
+# Auftrag g6 (24.09.2026): one call per source note with up to
+# BATCH_MAX_CANDIDATES candidates, prompt from the pilot
+# `_meta/tools/eval/v2-gaertner/vorversuch_sammelurteil.py` (15 notes, 58
+# pairs: 51/58 agreement with the run, stricter - 19 yes instead of 26), with
+# the reason capped at 8 words and candidates cut to BATCH_CANDIDATE_CHARS.
+# Splash is compute-bound (4 streams barely beat 1), so tokens are the cost:
+# measured on 16 groups / 80 pairs (eval/v2-gaertner/linking-bau/), 18.1 pairs
+# per minute with the pilot prompt, 22.1 with the short reason (80/80 same
+# verdicts), 29.9 with short reason plus 800-char candidates (77/80 same).
+BATCH_SYSTEM = (
+    "You maintain a personal markdown knowledge vault. You get ONE source note "
+    "and several candidate notes. For EACH candidate decide whether the source "
+    "should be wiki-linked to it. Link only when a reader of the source would "
+    "genuinely benefit from opening that candidate. Be conservative: shared "
+    "vocabulary, both being about this machine, or both being notes of the same "
+    "project is NOT a link. Answer ONLY with a JSON object: "
+    '{"verdicts": [{"id": <candidate number>, "link": true|false, '
+    '"type": "relates-to|depends-on|supersedes|part-of|contradicts", '
+    '"confidence": 0.0-1.0, "reason": "<at most 8 words>"}, ...]} '
+    "with exactly one entry per candidate. Use 'relates-to' unless a stronger "
+    "type is literally true."
+)
+# Batch prompting loses quality from 6-8 items per call (arXiv 2301.08721).
+BATCH_MAX_CANDIDATES = 5
+BATCH_CANDIDATE_CHARS = 800     # the source note keeps its 1500
+
 # Stems that say nothing about a note ("overview", "MOC"): they repeat across
 # projects, so finding them in a text is no evidence that THIS note is meant.
 GENERIC_KEYS = {"overview", "moc", "index", "plan", "notes", "readme", "log",
                 "setup", "session", "report"}
 
-RELATIONS_RE = re.compile(r"^## Relations[ \t]*\n(?:[ \t]*-[^\n]*\n?)*",
-                          re.MULTILINE)
+# canonical definition lives in vault (Note.embed_text cuts the same section)
+RELATIONS_RE = vault.RELATIONS_RE
 
 
 @dataclass
@@ -44,6 +70,8 @@ class LinkResult:
     added: list[tuple[str, str, str]] = field(default_factory=list)   # (a, b, type)
     rejected: list[tuple[str, str, str]] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    hub_filtered: int = 0     # candidate pairs dropped because of a hub partner
+    remaining: int = 0       # candidates left for a later run at the deadline
 
 
 def cosine(a: list[float], b: list[float]) -> float:
@@ -83,9 +111,12 @@ def embed_document(client, text: str) -> list[float]:
 
 
 def cache_key(note: Note) -> str:
-    """Content hash, versioned: bumping EMBED_VERSION retires vectors that were
-    produced by an older (truncating) embedding path."""
-    return f"v{config.EMBED_VERSION}:{note.content_hash}"
+    """Hash of the embedded text (``Note.embed_hash``), versioned: bumping
+    EMBED_VERSION retires vectors that were produced by an older embedding
+    path.  The ``r`` mark keeps vectors of the rollback rule
+    (``BRAIN_EMBED_RELATIONS=1``) apart.  Frontmatter-only edits keep the key."""
+    marke = "r" if vault.embed_relations() else ""
+    return f"v{config.EMBED_VERSION}{marke}:{note.embed_hash}"
 
 
 def embed_notes(notes: list[Note], store: Store, client,
@@ -114,7 +145,7 @@ def embed_notes(notes: list[Note], store: Store, client,
                         len(vectors), len(notes))
             break
         try:
-            vec = embed_document(client, n.embed_text)  # includes fm aliases
+            vec = embed_document(client, n.embed_text)  # title + aliases + prose
         except OllamaUnavailable:
             raise                              # Ollama is gone: abort the run
         except OllamaError as e:
@@ -200,7 +231,7 @@ def validate_verdict(verdict: dict, a: Note, b: Note) -> dict:
     """Normalize the judge's answer and downgrade claims it cannot support.
 
     A 9B judge happily asserts `depends-on` between two notes that never mention
-    each other (run 2026-07-12: `grundschule-beispiel overview` depends-on
+    each other (run 2026-07-12: `grundschule-wasbuettel overview` depends-on
     `BRAIN3-PLAN`). Structural types make a hard claim about the graph, so they
     are only accepted when one note actually references the other; otherwise the
     edge survives as the honest weaker claim, `relates-to`.
@@ -255,6 +286,11 @@ def judge_pair(client, a: Note, b: Note) -> dict:
     return validate_verdict(verdict, a, b)
 
 
+def _is_kern(note) -> bool:
+    """KERN.md files are session start context: never append links to them."""
+    return str(getattr(note, "rel", "")).rsplit("/", 1)[-1] == "KERN.md"
+
+
 def judge_pairs(client, pairs: list[tuple[Note, Note]], *,
                 parallel: int) -> list[dict]:
     """Wie `judge_pair`, aber fuer mehrere Paare auf einmal - nutzt
@@ -301,27 +337,209 @@ def add_link(writer: VaultWriter, src: Note, dst: Note,
     return True
 
 
+def is_hub(note) -> bool:
+    """KERN/STATUS/E&F/LOG/overview files and everything in the vault root.
+
+    Auftrag g6 (24.09.2026): in the sample of 40 links from the run of 24.09.
+    all 14 links with a hub partner were trivial - the hub is reachable from
+    the project folder anyway - and 28 % of all judged pairs had one. They are
+    dropped before the judge is asked, on either side of the pair."""
+    parts = Path(str(getattr(note, "rel", ""))).parts
+    if len(parts) <= 1:
+        return True
+    name = parts[-1]
+    if name in config.LINK_HUB_NAMES or name.endswith(config.LINK_HUB_SUFFIXES):
+        return True
+    # Some old overview files have ordinary names. A dense list of links with
+    # little prose is a hub regardless of its filename.
+    body = str(getattr(note, "text", ""))
+    lines = body.splitlines()
+    relation_lines = sum(bool(re.match(r"\s*-\s+(?:relates-to|part-of|depends-on|"
+                                       r"supersedes|contradicts)\s+\[\[", line))
+                         for line in lines)
+    links = len(re.findall(r"\[\[[^\]]+\]\]", body))
+    return (relation_lines >= 20 and relation_lines * 2 >= len(lines)
+            or links >= 8 and links * 35 >= len(body))
+
+
+def batch_prompt(a: Note, cands: list[Note]) -> str:
+    parts = [f"SOURCE: {a.title} ({a.rel})\n---\n{a.text[:1500]}\n"]
+    for i, b in enumerate(cands, 1):
+        parts.append(f"CANDIDATE {i}: {b.title} ({b.rel})\n---\n"
+                     f"{b.text[:BATCH_CANDIDATE_CHARS]}\n")
+    parts.append("Judge every candidate.")
+    return "\n".join(parts)
+
+
+def parse_batch(raw: dict | None, n: int) -> list[dict]:
+    """The judge's batch answer as one raw verdict per candidate (1..n).
+
+    A missing, duplicate-shadowed or malformed entry comes back as `{}`, the
+    same "judge failed" marker `judge_pair` uses: the caller skips that pair
+    without blocklisting it, so a later run asks again."""
+    out: list[dict] = [{} for _ in range(n)]
+    if not isinstance(raw, dict):
+        return out
+    entries = raw.get("verdicts")
+    if entries is None and n == 1 and "link" in raw:
+        entries = [dict(raw, id=1)]      # a bare verdict for a single candidate
+    if not isinstance(entries, list):
+        return out
+    for e in entries:
+        if not isinstance(e, dict) or "link" not in e:
+            continue
+        try:
+            idx = int(e.get("id")) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < n and not out[idx]:
+            out[idx] = {k: v for k, v in e.items() if k != "id"}
+    return out
+
+
+def judge_batches(client, groups: list[tuple[Note, list[Note]]], *,
+                  parallel: int) -> list[list[dict]]:
+    """One call per `(source, candidates)` group, up to `parallel` groups at
+    the same time via `client.judge_many` (serial `judge` otherwise). Returns,
+    per group, one validated verdict per candidate, `{}` where the judge left
+    the candidate out."""
+    prompts = [(BATCH_SYSTEM, batch_prompt(a, cands)) for a, cands in groups]
+    judge_many = getattr(client, "judge_many", None)
+    if judge_many is not None:
+        raw = judge_many(prompts, parallel=parallel)
+    else:
+        raw = [client.judge(system, prompt) for system, prompt in prompts]
+    return [[validate_verdict(v, a, b) if v else {}
+             for b, v in zip(cands, parse_batch(r, len(cands)))]
+            for (a, cands), r in zip(groups, raw)]
+
+
+def _capped(a: Note, b: Note, counts: dict[str, int]) -> bool:
+    return (counts[a.rel] >= config.MAX_NEW_LINKS_PER_NOTE
+            or counts[b.rel] >= config.MAX_NEW_LINKS_PER_NOTE)
+
+
+def _prefilter(a: Note, b: Note, store: Store, writer, result: LinkResult,
+               counts: dict[str, int] | None) -> tuple[Note, Note] | None:
+    """Everything decided BEFORE the model is asked, because after it the
+    verdict would be thrown away. Returns the pair oriented (source first)
+    or None. Run of 24.09.2026: 777 of 2213 candidates judged in 44 minutes,
+    43 links written, 192 rejected - the rest of the judge time went to pairs
+    dropped after the verdict (cap reached, note not writable).
+
+    `counts=None` leaves the cap to the caller (batch mode checks it per
+    round, right before the call)."""
+    if vault.linked_pair(a, b):
+        return None
+    # Titles like "overview"/"MOC" repeat across projects; a [[title]] link
+    # would resolve to the same-named note in the source's own folder.
+    if a.title_key == b.title_key:
+        return None
+    # Titles containing wikilink syntax would produce broken/mis-parsed links.
+    if any(ch in a.title or ch in b.title for ch in "[]|#\n"):
+        result.skipped.append(f"unsafe title: {a.rel} <-> {b.rel}")
+        return None
+    if is_hub(a) or is_hub(b):
+        result.hub_filtered += 1
+        return None
+    if store.is_blocked(a.rel, b.rel, "link"):
+        return None
+    if counts is not None and _capped(a, b, counts):
+        result.skipped.append(f"cap: {a.rel} <-> {b.rel}")
+        return None
+    # KERN.md is start context (injected every session, size-capped): it may
+    # be a link target, but nothing is ever appended to it. (The hub filter
+    # already drops KERN pairs; this stays as the hard guarantee, a9ac43a.)
+    if _is_kern(a) and _is_kern(b):
+        return None
+    if _is_kern(a):
+        a, b = b, a
+    can_rewrite = getattr(writer, "can_rewrite", None)
+    if can_rewrite is not None:
+        is_local = getattr(writer, "is_local")
+        if is_local(a.path) or is_local(b.path):
+            # IDENTITY/HANDOFF/gitignored: never source, never target
+            return None
+        ok_a, ok_b = can_rewrite(a.path, a.text), can_rewrite(b.path, b.text)
+        if not ok_a and not ok_b:
+            return None
+        if not ok_a:
+            # the link is written into the source first; a protected source
+            # (session, foreign author) would drop the whole link, a
+            # protected target only the back-link
+            a, b = b, a
+    if _is_kern(a):
+        return None
+    return a, b
+
+
+def _swappable(b: Note, writer) -> bool:
+    """True when the oriented pair's target could be the source as well."""
+    if _is_kern(b):
+        return False
+    can_rewrite = getattr(writer, "can_rewrite", None)
+    return can_rewrite is None or can_rewrite(b.path, b.text)
+
+
+def _apply_verdict(a: Note, b: Note, verdict: dict, store: Store, writer,
+                   result: LinkResult, counts: dict[str, int]) -> None:
+    # Deferred cap check: live counts, evaluated in the order the candidates
+    # were originally sorted in.
+    if _capped(a, b, counts):
+        result.skipped.append(f"cap: {a.rel} <-> {b.rel}")
+        return
+    if not verdict:
+        # transient judge failure or entry missing from a batch answer: skip
+        # WITHOUT blocklisting, retry next run
+        result.skipped.append(f"judge failed: {a.rel} <-> {b.rel}")
+        return
+    if verdict.get("link"):
+        conf = confidence_of(verdict)
+        if conf is not None and conf < config.LINK_MIN_CONFIDENCE:
+            # an unsure "yes" is not a "no": skip it, do NOT blocklist - a
+            # later run (better context, more text) may be sure.
+            result.skipped.append(f"low confidence {conf:.2f}: {a.rel} <-> {b.rel}")
+            return
+        rel_type = verdict["type"]
+        if not add_link(writer, a, b, rel_type, verdict["placement"]):
+            return
+        back = rel_type if rel_type in ("relates-to", "contradicts") else "relates-to"
+        if not _is_kern(b):
+            add_link(writer, b, a, back, "relations")
+        counts[a.rel] += 1
+        counts[b.rel] += 1
+        result.added.append((a.rel, b.rel, rel_type))
+    else:
+        store.block(a.rel, b.rel, "link", verdict.get("reason", ""))
+        result.rejected.append((a.rel, b.rel, verdict.get("reason", "")))
+
+
 def run_linking(notes: list[Note], vectors: dict[str, list[float]],
                 store: Store, client, writer: VaultWriter,
-                deadline=None, parallel: int | None = None) -> LinkResult:
-    """DEFEKT 2 (Nachtrag zum Auftrag "modellwege", 02.09.2026): die
-    Urteilsaufrufe laufen jetzt in Buendeln von bis zu `parallel` Paaren
-    gleichzeitig (Vorgabe: `grug_client.GRUG_JUDGE_PARALLEL`, gemessen am
-    Extraktionspfad, vier ist der Suesspunkt - siehe dort). Ein Paar wird nur
-    dann ins Buendel aufgenommen, wenn die vom NOTIZINHALT abhaengigen
-    Vorfilter (schon verlinkt, unsichere Titel, Blockliste) zum Buendel-
-    Startzeitpunkt zutreffen; die einzige Pruefung, die von zuvor in DIESEM
-    Lauf geschriebenen Links abhaengt (`MAX_NEW_LINKS_PER_NOTE`), wird
-    deshalb erst NACH dem Urteil erneut geprueft, mit dem dann aktuellen
-    Stand - genau da, wo seriell auch geschrieben wuerde. Das kostet
-    hoechstens ein paar bereits verbrauchte Urteile fuer ein inzwischen
-    gedeckeltes Paar; es lockert die Deckelung selbst nicht."""
+                deadline=None, parallel: int | None = None,
+                mode: str | None = None) -> LinkResult:
+    """Judge link candidates and write the accepted links.
+
+    `mode` (default `config.LINK_JUDGE_MODE`): "batch" groups the candidates
+    by source note and judges up to BATCH_MAX_CANDIDATES per call, `parallel`
+    calls at a time; "pair" is the old one-call-per-pair path (way back).
+
+    DEFEKT 2 (Nachtrag zum Auftrag "modellwege", 02.09.2026): die
+    Urteilsaufrufe laufen in Buendeln von bis zu `parallel` Aufrufen
+    gleichzeitig (Vorgabe: `grug_client.GRUG_JUDGE_PARALLEL`). Die einzige
+    Pruefung, die von zuvor in DIESEM Lauf geschriebenen Links abhaengt
+    (`MAX_NEW_LINKS_PER_NOTE`), wird NACH dem Urteil erneut geprueft, mit dem
+    dann aktuellen Stand - genau da, wo seriell auch geschrieben wuerde. Das
+    kostet hoechstens ein paar bereits verbrauchte Urteile fuer ein
+    inzwischen gedeckeltes Paar; es lockert die Deckelung selbst nicht."""
     if parallel is None:
         from .grug_client import GRUG_JUDGE_PARALLEL
-        parallel = GRUG_JUDGE_PARALLEL
+        engine = getattr(client, "engine", None)
+        parallel = getattr(engine, "parallel", GRUG_JUDGE_PARALLEL)
     parallel = max(1, parallel)
+    mode = mode or config.LINK_JUDGE_MODE
     result = LinkResult()
-    new_links_count: dict[str, int] = {n.rel: 0 for n in notes}
+    counts: dict[str, int] = {n.rel: 0 for n in notes}
 
     candidates = neighbor_candidates(notes, vectors) + mention_candidates(notes)
     seen: set[tuple[str, str]] = set()
@@ -329,65 +547,95 @@ def run_linking(notes: list[Note], vectors: dict[str, list[float]],
                   if not (key := tuple(sorted((c[0].rel, c[1].rel)))) in seen
                   and not seen.add(key)]
     candidates.sort(key=lambda t: -t[2])
-    log.info("%d link candidates", len(candidates))
+    log.info("%d link candidates, judge mode %s", len(candidates), mode)
 
+    if mode == "pair":
+        _run_pairs(candidates, store, client, writer, deadline, parallel,
+                   result, counts)
+    else:
+        _run_batches(candidates, store, client, writer, deadline, parallel,
+                     result, counts)
+    log.info("linking: %d added, %d rejected, %d hub pairs filtered",
+             len(result.added), len(result.rejected), result.hub_filtered)
+    return result
+
+
+def _run_pairs(candidates, store, client, writer, deadline, parallel,
+               result: LinkResult, counts: dict[str, int]) -> None:
     i = 0
     while i < len(candidates):
         if deadline is not None and deadline.expired(
                 "linking", done=i, total=len(candidates)):
             result.skipped.append("deadline reached")
+            result.remaining = len(candidates) - i
             break
-        batch: list[tuple[Note, Note, float]] = []
+        batch: list[tuple[Note, Note]] = []
         while len(batch) < parallel and i < len(candidates):
-            a, b, sim = candidates[i]
+            a, b, _sim = candidates[i]
             i += 1
-            if vault.linked_pair(a, b):
-                continue
-            # Titles like "overview"/"MOC" repeat across projects; a
-            # [[title]] link would resolve to the same-named note in the
-            # source's own folder.
-            if a.title_key == b.title_key:
-                continue
-            # Titles containing wikilink syntax would produce broken/mis-parsed links.
-            if any(ch in a.title or ch in b.title for ch in "[]|#\n"):
-                result.skipped.append(f"unsafe title: {a.rel} <-> {b.rel}")
-                continue
-            if store.is_blocked(a.rel, b.rel, "link"):
-                continue
-            batch.append((a, b, sim))
+            pair = _prefilter(a, b, store, writer, result, counts)
+            if pair is not None:
+                batch.append(pair)
         if not batch:
             continue
+        verdicts = judge_pairs(client, batch, parallel=parallel)
+        for (a, b), verdict in zip(batch, verdicts):
+            _apply_verdict(a, b, verdict, store, writer, result, counts)
 
-        verdicts = judge_pairs(client, [(a, b) for a, b, _ in batch],
-                              parallel=parallel)
-        for (a, b, sim), verdict in zip(batch, verdicts):
-            # Deferred cap check (see docstring): live counts, evaluated in
-            # the same order the candidates were originally sorted in.
-            if (new_links_count[a.rel] >= config.MAX_NEW_LINKS_PER_NOTE
-                    or new_links_count[b.rel] >= config.MAX_NEW_LINKS_PER_NOTE):
-                result.skipped.append(f"cap: {a.rel} <-> {b.rel}")
-                continue
-            if not verdict:
-                # transient judge failure: skip WITHOUT blocklisting, retry next run
-                result.skipped.append(f"judge failed: {a.rel} <-> {b.rel}")
-                continue
-            if verdict.get("link"):
-                conf = confidence_of(verdict)
-                if conf is not None and conf < config.LINK_MIN_CONFIDENCE:
-                    # an unsure "yes" is not a "no": skip it, do NOT blocklist -
-                    # a later run (better context, more text) may be sure.
-                    result.skipped.append(
-                        f"low confidence {conf:.2f}: {a.rel} <-> {b.rel}")
-                    continue
-                rel_type = verdict["type"]
-                if not add_link(writer, a, b, rel_type, verdict["placement"]):
-                    continue
-                back = rel_type if rel_type in ("relates-to", "contradicts") else "relates-to"
-                add_link(writer, b, a, back, "relations")
-                new_links_count[a.rel] += 1
-                new_links_count[b.rel] += 1
-                result.added.append((a.rel, b.rel, rel_type))
-            else:
-                store.block(a.rel, b.rel, "link", verdict.get("reason", ""))
-                result.rejected.append((a.rel, b.rel, verdict.get("reason", "")))
-    return result
+
+def _run_batches(candidates, store, client, writer, deadline, parallel,
+                 result: LinkResult, counts: dict[str, int]) -> None:
+    # Orient and filter every pair once, then group by source note in the
+    # order of each group's best similarity (candidates are sorted), so a
+    # deadline cuts the weakest groups.
+    pairs: list[tuple[int, Note, Note, bool]] = []
+    for idx, (a, b, _sim) in enumerate(candidates):
+        pair = _prefilter(a, b, store, writer, result, None)
+        if pair is not None:
+            pairs.append((idx, *pair, _swappable(pair[1], writer)))
+    # A pair whose target may just as well be the source (writable, not KERN)
+    # joins the note with more candidates: the source text is sent once per
+    # call, so fuller groups mean fewer tokens per pair. Run of 24.09. on a
+    # copy without this: 544 pairs in 200 calls (2.7 per call).
+    degree: dict[str, int] = {}
+    for _idx, a, b, _free in pairs:
+        degree[a.rel] = degree.get(a.rel, 0) + 1
+        degree[b.rel] = degree.get(b.rel, 0) + 1
+    groups: dict[str, list[tuple[int, Note, Note]]] = {}
+    for idx, a, b, free in pairs:
+        if free and degree[b.rel] > degree[a.rel]:
+            a, b = b, a
+        groups.setdefault(a.rel, []).append((idx, a, b))
+    chunks = [g[j:j + BATCH_MAX_CANDIDATES] for g in groups.values()
+              for j in range(0, len(g), BATCH_MAX_CANDIDATES)]
+    total = sum(len(c) for c in chunks)
+    log.info("%d pairs in %d batch calls after filtering (%d hub pairs dropped)",
+             total, len(chunks), result.hub_filtered)
+    done = 0
+    for r in range(0, len(chunks), parallel):
+        if deadline is not None and deadline.expired(
+                "linking", done=done, total=total):
+            result.skipped.append("deadline reached")
+            result.remaining = total - done
+            break
+        round_: list[tuple[Note, list[tuple[int, Note, Note]]]] = []
+        for chunk in chunks[r:r + parallel]:
+            done += len(chunk)
+            live = []
+            for item in chunk:
+                if _capped(item[1], item[2], counts):
+                    result.skipped.append(f"cap: {item[1].rel} <-> {item[2].rel}")
+                else:
+                    live.append(item)
+            if live:
+                round_.append((live[0][1], live))
+        if not round_:
+            continue
+        verdicts = judge_batches(
+            client, [(a, [it[2] for it in items]) for a, items in round_],
+            parallel=parallel)
+        flat = [(item, v) for (_a, items), vs in zip(round_, verdicts)
+                for item, v in zip(items, vs)]
+        flat.sort(key=lambda t: t[0][0])
+        for (_idx, a, b), verdict in flat:
+            _apply_verdict(a, b, verdict, store, writer, result, counts)

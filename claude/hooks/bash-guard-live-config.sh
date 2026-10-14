@@ -56,7 +56,7 @@ print(json.dumps({"hookSpecificOutput": {
   exit 0
 }
 
-# Die drei Ablagen, die kein Agent anfassen darf — dieselbe Liste wie im Guard
+# Die Ablagen, die kein Agent anfassen darf — dieselbe Liste wie im Guard
 # `freigabe-pfad` in bash-guard.py, hier fuer den Weg ueber die Datei-Werkzeuge.
 # BEFUND (Durchsicht 2026-08-07, gemessen): eine selbst geschriebene Freigabe in
 # ~/.pi-workers/guard-grants/ liess einen angehaltenen `sudo`-Befehl durchlaufen.
@@ -66,6 +66,7 @@ GESCHUETZT=(
   "${AWB_GUARD_GRANTS_DIR:-$HOME/.pi-workers/guard-grants}"
   "$HOME/.pi-workers/.freigabe-schluessel"
   "${AWB_ROLLEN_DIR:-$HOME/.pi-workers/rollen}"
+  "${XDG_CONFIG_HOME:-$HOME/.config}/agent-workbench/skript-ausnahmen.conf"
 )
 pfad_geschuetzt() {   # <datei>
   local ziel="$1" p

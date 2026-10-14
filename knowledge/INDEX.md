@@ -25,7 +25,7 @@ Zweig, den es nicht gibt, ist der haeufigste Grund dafuer, dass etwas gar nicht 
 
 ## Was hier nie liegt
 
-`90-secrets/` ist im Original per Maschine getrennt und wird nie synchronisiert. Wenn Du einen
+`secrets/` ist im Original per Maschine getrennt und wird nie synchronisiert. Wenn Du einen
 solchen Zweig anlegst, gehoert er in `.gitignore`, bevor die erste Datei darin entsteht.
 `IDENTITY.md` sagt, wer auf dieser Maschine sitzt, und wird ebenfalls nie eingecheckt — die
 Vorlage dafuer ist `IDENTITY.md.example`.

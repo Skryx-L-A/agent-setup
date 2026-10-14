@@ -22,8 +22,9 @@
 #   fable51        (Fable 5.1; ersetzt Fable 5 am 2026-09-02) NEVER without the user's explicit word, for any task. Effort cap
 #                  `high` (raised from medium 2026-07-30). Enforced in pi-worker,
 #                  which reads the cap from the model registry — not from this comment.
-# Effort cap is xhigh everywhere (never `max`). Legacy aliases haiku|sonnet|opus|fable
-# still work; `opus` stays pinned to 4.8 — write `opus5` for Opus 5.
+# Effort cap is xhigh everywhere (never `max`). The family aliases
+# haiku|sonnet|opus|fable resolve through registry data to the newest enabled
+# registered generation; versioned aliases such as opus5/opus48/opus55 stay fixed.
 #
 # V3: any model REGISTERED in ~/.claude/workbench/models.json can be typed here too
 # (`claude-worker w1 gpt-5-codex <dir> <task>`), whatever harness it runs on. The
@@ -38,6 +39,15 @@
 # never creates a pane itself, it only ever execs onward (below, or into
 # wb-ssh-worker just above) — so pi-worker's check already covers every path that
 # actually spawns something, on whichever machine that turns out to be.
+# Befristeter Deckel des Claude-Wochenlimits (der Nutzer 11.10.2026: bis Mo 12.10. 14:00 hoechstens
+# 95 %): solange ~/.claude/workbench/limit-deckel.json gilt, startet kein Claude-Worker. Nach
+# bis_epoch laeuft die Sperre von selbst aus. Arbeit geht an codex-worker oder pi-worker.
+if /usr/bin/python3 -c 'import json,os,sys,time
+d=json.load(open(os.path.expanduser("~/.claude/workbench/limit-deckel.json")))
+sys.exit(0 if time.time() < float(d["bis_epoch"]) else 1)' 2>/dev/null; then
+  echo "claude-worker: GESPERRT -- befristeter Deckel des Claude-Wochenlimits (limit-deckel.json, der Nutzer 11.10.); Worker an Codex oder lokal vergeben." >&2
+  exit 3
+fi
 MENSCHFLAG=""
 if [ "${1:-}" = "--mensch" ]; then MENSCHFLAG="--mensch"; shift; fi
 

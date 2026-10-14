@@ -1,13 +1,27 @@
 #!/bin/bash
 # wb-pi — open an INTERACTIVE local pi agent (chat window) as a workbench pane.
-# Usage: wb-pi [qwen|ornith|ornith9]   (default: ornith)
+# Usage: wb-pi [qwen|qwen38|ornith|ornith9|grug]   (default: qwen38)
 # NOTE: local model ids/quant depend on the machine's VRAM; on a 12 GB GPU a 35B
 # will not fit — pull a smaller Ollama model and adjust the aliases below / ~/.pi.
 set -u
-MODEL="${1:-ornith}"
+MODEL="${1:-qwen38}"
+PROVIDER=ollama
+PIMODEL=""
 case "$MODEL" in
   qwen)    MODEL="qwen3.6:35b-a3b-coding-nvfp4" ;;
-  ornith)  MODEL="ornith:35b" ;;
+  ornith|ornith-35b|ornith-35b-*|ornith:35b|ornith:35b-*)
+    echo "ornith:35b ist gelöscht, qwen3.8 übernimmt" >&2
+    MODEL=qwen38
+    PROVIDER=splash-lokal
+    PIMODEL="incoai/Qwen3.8-27B-Splash" ;;
+  grug|grug:*|grug-27b|grug-27b-mlx-q4|grug-27b-mlx-*)
+    echo "grug ist gelöscht, qwen3.8 übernimmt" >&2
+    MODEL=qwen38
+    PROVIDER=splash-lokal
+    PIMODEL="incoai/Qwen3.8-27B-Splash" ;;
+  qwen38)
+    PROVIDER=splash-lokal
+    PIMODEL="incoai/Qwen3.8-27B-Splash" ;;
   ornith9) MODEL="ornith:9b" ;;
   *)
     # Anlass (2026-08-22, dieselbe Bugfamilie wie wb-budget): ohne diesen Zweig lief
@@ -15,7 +29,7 @@ case "$MODEL" in
     # neu erzeugten Pane -- wb-pi selbst meldete Erfolg (Pane angelegt, wb-grid
     # gerufen), der eigentliche Fehlschlag (Ollama kennt das Modell nicht) tauchte
     # erst dort auf, unsichtbar fuer den Aufrufer im Moment des Aufrufs.
-    echo "wb-pi: unbekanntes Modell '$MODEL' -- bekannt: qwen | ornith | ornith9." >&2
+    echo "wb-pi: unbekanntes Modell '$MODEL' -- bekannt: qwen | qwen38 | ornith | ornith9 | grug." >&2
     exit 1
     ;;
 esac
@@ -24,8 +38,12 @@ panes=$(tmux list-panes -F '#{pane_id} #{@wb_role}')
 target=$(echo "$panes" | awk '$2=="orchestrator"{print $1; exit}')
 [ -z "${target:-}" ] && target=$(echo "$panes" | awk '$2!="sidebar"{print $1; exit}')
 
-CMD="PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH pi --provider ollama --model '$MODEL' --append-system-prompt \$HOME/.pi/agent/WORKER.md; echo '── pi beendet — Pane bleibt offen ──'; exec bash"
+if [ "$PROVIDER" = splash-lokal ]; then
+  CMD="PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH; SESSION=\$(tmux display-message -p -t \"\$TMUX_PANE\" '#{session_name}'); PI_AGENT_DIR=\$HOME/.pi-workers/sessions/wb-pi-\${TMUX_PANE#%}/agent; mkdir -p \"\${PI_AGENT_DIR%/agent}\" && wb-splash-server ensure qwen38-27b --kontext 131072 --rolle worker --sitzung \"\$SESSION\" --pane \"\$TMUX_PANE\" >/dev/null && wb-splash-server pi-agent-kontext \"\${PI_CODING_AGENT_DIR:-\$HOME/.pi/agent}\" \"\$PI_AGENT_DIR\" splash-lokal '$PIMODEL' 131072 && export PI_CODING_AGENT_DIR=\"\$PI_AGENT_DIR\" && exec pi --provider splash-lokal --model '$PIMODEL' --thinking xhigh --append-system-prompt \$HOME/.pi/agent/WORKER.md || { echo 'wb-pi: Splash-Setup oder pi-Start fehlgeschlagen.' >&2; }; echo '── pi beendet — Pane bleibt offen ──'; exec bash"
+else
+  CMD="PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH pi --provider ollama --model '$MODEL' --append-system-prompt \$HOME/.pi/agent/WORKER.md; echo '── pi beendet — Pane bleibt offen ──'; exec bash"
+fi
 new=$(tmux split-window -v -t "${target:-}" -P -F '#{pane_id}' -c "#{pane_current_path}" "bash -lc $(printf %q "$CMD")")
 tmux set -p -t "$new" @wb_role worker
-tmux select-pane -t "$new" -T "pi-chat:${1:-ornith}"
+tmux select-pane -t "$new" -T "pi-chat:${1:-qwen38}"
 "$HOME/.local/bin/wb-grid"

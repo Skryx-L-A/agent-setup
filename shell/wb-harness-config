@@ -174,7 +174,7 @@ def resolve_template(src):
     ANDEREN Ersetzung, die wb-state auf harness.env anwendet, nicht auf diese Datei) --
     eine reine Textersetzung ueber alle Vorlagen hinweg wuerde diesen Kommentar
     veraendern, obwohl crushrc.default nie ausserhalb dieses Auftrags angefasst werden
-    sollte. Die Endungspruefung haelt jede Vorlage ausserhalb von cline/kimi exakt beim
+    sollte. Die Endungspruefung haelt jede Vorlage ausserhalb von cline exakt beim
     alten Byte-Kopierverhalten."""
     with open(src, "r", encoding="utf-8", newline="") as fh:
         text = fh.read()

@@ -2,9 +2,15 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
-DEFAULT_VAULT = Path.home() / "Knowledge"
+# BRAIN_VAULT is the one path anchor for a non-Mac-der Nutzer machine (peer,
+# ein Mitnutzer's account, a test harness): everything else derives the vault from
+# a CLI --vault flag or from this default, never from a hardcoded
+# `$HOME/Knowledge` (brain5-architektur-entwurf.md Abschnitt 4.3).
+DEFAULT_VAULT = Path(os.environ["BRAIN_VAULT"]).expanduser() \
+    if os.environ.get("BRAIN_VAULT") else Path.home() / "Knowledge"
 TOOL_DIR = Path(__file__).resolve().parent.parent  # _meta/tools/gardener/
 STATE_DIR = TOOL_DIR / "state"
 LOG_DIR = TOOL_DIR / "logs"
@@ -56,8 +62,19 @@ EMBED_MAX_CHARS = 8000        # hard backstop for a single embed call
 EMBED_CHUNK_CHARS = 4000
 EMBED_CHUNK_OVERLAP = 200     # so a fact on a chunk border is not cut in half
 EMBED_MAX_CHUNKS = 8          # 8 x 4000 = 32k chars; beyond that a note is a book
-EMBED_VERSION = 2             # bump to invalidate cached (truncated) vectors
+# v3 (e28, 2026-09-27): embed_text no longer contains the gardener-managed
+# `## Relations` section (the machine-appended link lines changed every touched
+# note's vector; the leiteroptimierung note lost its replay warning over it).
+# v2 kept the Relations in the embedded text.  One full re-embed follows the
+# bump; `BRAIN_EMBED_RELATIONS=1` restores the v2 rule.
+# v4 (b6-embedfm, 2026-09-28): embed_text drops the frontmatter (title and
+# aliases stay as head) and the cache key hashes the embedded text instead of
+# the whole file, so frontmatter upkeep no longer invalidates vectors.
+EMBED_VERSION = 4             # bump to invalidate cached (truncated) vectors
 EMBED_MODEL = "embeddinggemma:latest"
+# Wie lange Ollama das Einbettungsmodell nach einer EINZELNEN Suchabfrage haelt (brain search,
+# Auto-Recall). Begruendung und Messung: braincli/search.py, semantic_search.
+SEARCH_KEEP_ALIVE = "30m"
 # Das kleine Modell: fuer Aufgaben, die eine Zusammenfassung von bereits
 # extrahiertem Text liefern statt ein Urteil ueber Struktur oder Wahrheit des
 # Vaults (Sidecar-Dateibeschreibung, Ingest-Asset-Beschreibung - siehe
@@ -84,7 +101,7 @@ VISION_MODEL = "qwen3-vl:8b"   # local image description; skipped when not pulle
 MAX_VISION_BYTES = 12 * 1024**2  # bigger images are left to a human
 
 # Hard exclusions: never read, never embed, never write anything below these.
-EXCLUDE_DIRS = {"90-secrets", ".obsidian", ".git", "_meta"}
+EXCLUDE_DIRS = {"secrets", ".obsidian", ".git", "_meta"}
 # Managed / generated top-level files: never part of the linking corpus.
 EXCLUDE_FILES = {"HOT.md", "INDEX.md", "CRITICAL-FACTS.md", "review-queue.md",
                  "OPEN-QUESTIONS.md", "LOG.md"}
@@ -93,7 +110,11 @@ EXCLUDE_ANY_DEPTH = {"review-queue.md", "MOC.md", "DECISIONS.md"}
 # `dream-report-` joins the two for the same reason they are here: a generated
 # report about the vault is not material the vault should link, embed or read
 # back in (see gardener/dream/apply.py write_report).
-EXCLUDE_PREFIXES = ("gardener-report-", "brain-health-", "dream-report-")
+# brain-vorschlaege: ungepruefte Pipeline-Vorschlaege je Projekt (gardener/lauf/schreiben.py)
+EXCLUDE_PREFIXES = ("gardener-report-", "brain-health-", "dream-report-", "brain-run-", "brain-vorschlaege")
+# Non-Markdown files the write gate accepts (vault.check_writable): only the
+# per-project trap book, written by `brain run` into its own section.
+WRITABLE_DATA_FILES = frozenset({"FALLEN.yaml"})
 
 # Sidecar layer (Brain 3.x): every non-.md file gets a `<name>.<ext>.md`
 # sibling note describing it, so an agent can skip opening the real file
@@ -102,6 +123,14 @@ SIDECAR_EXTRA_EXCLUDE_DIRS = {"__pycache__"}
 SIDECAR_EXCLUDE_FILE_NAMES = {".DS_Store"}
 SIDECAR_EXCLUDE_FILE_GLOBS = ("*.lock", "*.pyc", "*.pyo", "*.cache", "*.tmp",
                              "*.swp", "*.swo", "*~")
+# Structured config/data files in the knowledge branches are read by tools, not
+# by people: FALLEN.yaml (tripwire), .space.yml (spaces), tables and JSON.
+# They are plain text a model reads directly; a sidecar would only repeat them
+# and go stale with every pipeline write. A file of these types a human files
+# deliberately as an asset (below `_assets/`) keeps its sidecar, and so does
+# anything outside the knowledge branches (e.g. raw material in 00-sources).
+SIDECAR_KNOWLEDGE_DIRS = ("10-global", "20-projects", "30-topics", "40-people")
+SIDECAR_DATA_SUFFIXES = frozenset({".yaml", ".yml", ".json", ".tsv"})
 BRAINIGNORE_FILE = ".brainignore"
 SIDECAR_EXTRACT_MAX_CHARS = 6000   # first slice handed to the local judge
 SIDECAR_EXTERNAL_MB = 50           # matches the git-lfs commit cap (INDEX.md)
@@ -120,14 +149,32 @@ MAX_NEW_LINKS_PER_NOTE = 5
 NEIGHBOR_TOP_K = 5
 LINK_MIN_SIMILARITY = 0.55
 LINK_MIN_CONFIDENCE = 0.70   # an unsure "yes" from the judge is not a link
+# Auftrag g6 (24.09.2026): "batch" judges up to 5 candidates of one source note
+# per call (linking.judge_batches), "pair" is the old one-call-per-pair path
+# and the way back. Run of 24.09.: pair mode took 44 of 48 minutes.
+LINK_JUDGE_MODE = os.environ.get("GARDENER_LINK_JUDGE_MODE", "batch")
+# Hubs never become link candidates (either side): all 14 hub links in the
+# 24.09. sample were trivial. Vault-root files count as hubs too.
+LINK_HUB_NAMES = frozenset({"KERN.md", "STATUS.md", "ENTSCHEIDUNGEN-UND-FALLEN.md",
+                            "LOG.md", "overview.md"})
+LINK_HUB_SUFFIXES = ("-overview.md",)
 MERGE_MIN_SIMILARITY = 0.90
 MERGE_MIN_CONFIDENCE = 0.85
 STALE_MARKER_MONTHS = 6
+# Projekt- und Systemseiten aendern sich in Wochen, nicht in Halbjahren: KERN, STATUS und
+# `type: system` gelten schon nach 2 Monaten als veraltet (ana-struktur Empfehlung 12, 2026-09-28).
+STALE_MARKER_MONTHS_FAST = 2
+STALE_FAST_NAMES = frozenset({"KERN.md", "STATUS.md"})
+STALE_FAST_TYPES = frozenset({"system"})
 
 # Topic hubs
 TOPIC_MEMBER_SIM = 0.60      # note counts as hub member from this similarity
 TOPIC_MAX_AUTO_MEMBERS = 12
 CLUSTER_MIN_SIM = 0.70       # pairwise similarity inside a hub-suggestion cluster
+# Ein Cluster, dessen Notizen zu mindestens diesem Anteil in EINEM Projektordner liegen, ist ein
+# Projekt-Doppel: das Projekt hat seine eigene Themenseite (Projektzweig der Synthese), ein zweites
+# Thema ueber dieselben Notizen liefert nur Rauschen (ana-struktur Nr. 7, 2026-09-28).
+TOPIC_PROJECT_DOUBLE_SHARE = 0.8
 CLUSTER_MIN_SIZE = 4         # muss zu SYNTH_MIN_SOURCES passen: ein Cluster,
                              # aus dem keine Seite entstehen darf, wurde bei 3
                              # gefunden und bei 4 verworfen - Lauf fuer Lauf
@@ -138,6 +185,14 @@ COLD_MONTHS = 6              # no read in this many months -> review-queue hint
 COLD_QUEUE_MAX = 5           # at most this many cold-note hints per run
 RESURFACE_COUNT = 2          # "Vergessene Schaetze" per HOT.md run
 HOT_HEAT_DAYS = 30
+# Read-heat from the agents' own transcripts (Auftrag g5, 24.09.2026). The hook
+# log above had 239 lines since July against 1281 vault reads in the Claude
+# transcripts since 01.08. (v2-gaertner, nutzung-20260801.json), so
+# "Meistgelesen" and "Vergessene Schaetze" in HOT.md ranked noise. Both sources
+# are merged; False falls back to the hook log alone.
+HEAT_FROM_TRANSCRIPTS = os.environ.get("GARDENER_HEAT_TRANSCRIPTS", "1") != "0"
+CODEX_SESSION_DIR = Path.home() / ".codex" / "sessions"
+HEAT_TRANSCRIPT_CACHE = "transcript-heat.json"   # in STATE_DIR, per file mtime/size
 
 # Note size lint: rough token estimate = words * TOKENS_PER_WORD
 NOTE_MAX_TOKENS = 800
@@ -151,11 +206,27 @@ MINE_MAX_PER_TRANSCRIPT = 3      # a transcript rarely holds more durable facts
 MINE_MAX_PER_RUN = 8             # 00-sources is a queue for a human, not a dump
 
 RUN_BUDGET_SECONDS = 45 * 60
+# Share of the remaining budget linking may use (Auftrag g4, 24.09.2026) - the
+# first pass over a vault has thousands of candidates; what is left over is
+# picked up by the next run, the blocklist remembers every "no".
+LINKING_BUDGET_SHARE = 0.5
+LINKING_BUDGET_MAX_SECONDS = 15 * 60
+# Denkstufe der schreibenden Richter-Stellen (consolidate, HOT.md, synth, mine)
+# auf Splash; linking urteilt ohne Denken. Siehe cli.py bei `smart`.
+SMART_REASONING_EFFORT = os.environ.get("GARDENER_JUDGE_EFFORT", "low")
 LOCK_STALE_SECONDS = 15 * 60
 # 48-GB rule: abort if a big model is already loaded in Ollama.
 MAX_LOADED_MODEL_BYTES = 15 * 1024**3
 
-GIT_AUTHOR = "<your-github-user> <you@example.com>"
+# Wer die Gaertner-Commits schreibt und wessen Notizen als "eigen" gelten (protect.py). Auf einem
+# anderen Rechner (ein Mitnutzer, BRAIN5-PLAN Nr. 38) per GARDENER_GIT_AUTHOR setzen, sonst schriebe der
+# Gaertner dort unter Namen des Nutzers und hielte die Notizen des Besitzers fuer fremd.
+_STANDARD_AUTOR = "<your-github-user>"
+GIT_AUTHOR = os.environ.get("GARDENER_GIT_AUTHOR", "").strip() or _STANDARD_AUTOR + " <you@example.com>"
+# GitHub-Konto, unter dem die Haus-Repos liegen (`<konto>/<repo>` in Texten routet auf ein Projekt,
+# lauf/quellen.py). Eigener Wert, nicht aus GIT_AUTHOR: auf eines Mitnutzers Rechner aendert sich der Autor,
+# die Repos bleiben dieselben. Steht hier statt als Regex im Quelltext (oeffentlicher Export, 14.10.2026).
+GITHUB_HANDLE = os.environ.get("GARDENER_GITHUB_HANDLE", "").strip() or _STANDARD_AUTOR
 
 RELATION_TYPES = ("relates-to", "depends-on", "supersedes", "part-of", "contradicts")
 # Types that assert more than "these two are related". Only accepted when one
@@ -235,12 +306,23 @@ CONTRADICT_REVIEW_QUEUE = "review-queue.md"   # Wurzel, siehe queue.py
 # siehe gardener/cli.py).
 CONTRADICT_QUEUE_FILE = "_meta/state/contradiction-queue.txt"
 
+# Claude auto-memory files. A dead vault wikilink whose target is one of them
+# is reported as `memory-ziel` (lint), not as a dead link: the knowledge exists,
+# only outside the vault (v2-gaertner: 27 of 155 dead targets, 24.09.2026).
+MEMORY_GLOB = os.environ.get("GARDENER_MEMORY_GLOB",
+                             "~/.claude/projects/*/memory/*.md")
+
 # Topic synthesis (Brain 4.x, `brain gardener run --phase synth`). Unlike
 # topics.py's hand-curated hub + appended "further notes" block, a synth page
 # (`30-topics/<t>/MOC.md`, `class: derived`) is written end to end by the
 # gardener and treated as disposable/regenerable - see gardener/synth.py.
 SYNTH_MIN_SOURCES = 4              # a page over fewer notes is noise
-SYNTH_MAX_SOURCE_CHARS = 1200      # per-source excerpt handed to the judge
+SYNTH_MAX_SOURCE_CHARS = 2000      # per-source excerpt handed to the judge
+# V2 default since 27.09.2026 (v3-gaertner rounds 2-4): strict retention on two independent gold sets
+# V1 10/30 -> V2 23/30, full-copy run 19.8 min within the 45-min budget, repeat run rewrites nothing.
+# GARDENER_SYNTH_VERSION=1 restores the old synthesis.
+SYNTH_VERSION = int(os.environ.get("GARDENER_SYNTH_VERSION", "2"))
+SYNTH_PARALLEL = max(1, int(os.environ.get("GARDENER_SYNTH_PARALLEL", "1")))
 SYNTH_MAX_SOURCES_IN_PROMPT = 20   # keep the prompt bounded on a big topic
 SYNTH_MAX_CLUSTER_CANDIDATES = 5   # new wikilink/embedding-cluster pages per run
 

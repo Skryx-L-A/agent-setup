@@ -45,11 +45,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .. import blocks as blocks_mod
+from .. import protect as protect_mod
 from .. import vault as vault_mod
 from ..contradict import escalate_hit
 from ..frontmatter import parse as parse_frontmatter
 from ..frontmatter import render as frontmatter_render
-from ..runtime import dirty_paths, git_commit
+from ..runtime import commit_by_repo_single, dirty_paths
 from ..vault import UnsafeWriteError, VaultWriter, read_text
 from . import claims as claims_mod
 from . import config as dcfg
@@ -70,7 +71,8 @@ WRITER_CONFLICT = "refused-by-writer: expect-conflict"
 
 # Rules whose refusal is a case for a human rather than pure machine memory.
 ESCALATING_REASONS = ("ownership", "ownership-foreign-generator", "ownership-scope",
-                      "escalate-terms", "instruction-shaped", "negation-mismatch")
+                      "escalate-terms", "instruction-shaped", "negation-mismatch",
+                      "protected-foreign-author")
 
 # Regel 8: material that reads like an instruction is never applied. The
 # extraction prompt already frames every segment as material, but a prompt is
@@ -206,6 +208,23 @@ def gate_path(vault: Path, rel: str) -> str | None:
     if shadow_mod.is_forbidden_target(resolved):
         return "forbidden-target"
     return None
+
+
+def gate_protect(vault: Path, target: str, current_text: str,
+                 cache: protect_mod.AuthorCache) -> str | None:
+    """Auftrag "p0-schutztore": session/source notes and notes with a foreign
+    git author are refused before ownership is even asked about - a dream
+    marker block or `class: derived` proves nothing here, the file's own kind
+    and history do. Runs only when the target already exists (apply.py's one
+    caller checks `ownership.exists` first), matching protect.check's
+    contract: a create is not a change.
+
+    `VaultWriter.write` runs the identical check again at the actual write -
+    this is the earlier, explicit gate so a refusal is reported as
+    `refused-by-code: protected-*` like every other rule instead of the
+    generic `expect-conflict` a writer-level refusal alone would produce."""
+    verdict = protect_mod.check(vault, target, current_text, cache)
+    return verdict.reason if verdict.blocked else None
 
 
 def gate_ownership(op: str, ownership: shadow_mod.Ownership) -> str | None:
@@ -635,6 +654,12 @@ def apply_changeset(vault: Path, hunks: list[dict], verdicts: dict[str, dict], *
     # Datei faellt am Tor durch und steht als uebersprungen im Bericht.
     writer = writer or VaultWriter(vault, dry_run=dry_run,
                                    foreign=dirty_paths(vault))
+    # One cache for the whole run (protect.AuthorCache docstring: git log not
+    # per call). Reuses the writer's own cache when it has one, so a hunk
+    # that gate_protect already cleared does not pay for a second git log
+    # inside VaultWriter.write's identical backstop check.
+    protect_cache = getattr(writer, "protect_cache", None) or \
+        protect_mod.AuthorCache(vault)
     index = trace_index(trace_path) if trace_path is not None else None
     result = ApplyResult(run_id=run_id, dry_run=dry_run)
     snapshot_dir = snapshot_dir_for(snapshot_root, today)
@@ -745,10 +770,13 @@ def apply_changeset(vault: Path, hunks: list[dict], verdicts: dict[str, dict], *
                      if target in planned
                      else shadow_mod.read_ownership(vault, target))
         if reason is None:
-            reason = gate_ownership(op, ownership)
-        if reason is None:
             current_text = planned.get(target) or (
                 read_text(vault / target) if (vault / target).exists() else "")
+        if reason is None and ownership.exists:
+            reason = gate_protect(vault, target, current_text, protect_cache)
+        if reason is None:
+            reason = gate_ownership(op, ownership)
+        if reason is None:
             reason = gate_before(hunk, current_text, op)
         if reason is None:
             reason = gate_scope(op, ownership, hunk.get("before"), after)
@@ -999,7 +1027,7 @@ def run_apply(vault: Path, changeset_path: Path, verdicts_path: Path, *,
               snapshot_root: Path | None = None,
               today: dt.date | None = None,
               write_own_report: bool = True,
-              git_commit_fn=git_commit) -> ApplyResult:
+              git_commit_fn=commit_by_repo_single) -> ApplyResult:
     """CLI-facing: git snapshot, apply, audit files, issues, git snapshot.
     Never pushes - that decision is not an autonomous run's to make."""
     vault = Path(vault)

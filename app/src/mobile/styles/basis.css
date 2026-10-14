@@ -1,0 +1,193 @@
+/* GRUNDLAGEN DER MOBILEN WERKBANK.
+ *
+ * KEINE ZWEITE PALETTE (Spezifikation 7.4). Alle Farben kommen aus den
+ * Rollen von main/thema.ts (tokens.css, derselbe erzeugte Text wie in allen
+ * Fenstern) und aus den Zustandsfarben `--zustand-*`. Hier stehen nur
+ * Zuordnungen von Rollen zu Aufgaben der Mobilansicht, kein Hexwert.
+ *
+ * Gestalt der Werkbank: Flaeche gegen Flaeche statt Gitternetz. Karten auf
+ * dem Fenstergrund, zehn Bildpunkte Radius, kein Rahmen, kein Zierschatten.
+ * Mechanik von iOS 18: Tab-Leiste unten (49 pt, HIG-Stand vor System 26),
+ * Navigationsstapel mit grossem Titel, Ziele mit 44 pt (dichte Leisten nicht
+ * unter 28 pt, HIG Accessibility).
+ */
+
+:root {
+  /* Die Karte: im dunklen Thema die Leistenflaeche, im hellen die weisse
+     Grundflaeche -- jeweils die Rolle, die sich vom Fenstergrund abhebt. */
+  --karte: var(--leiste);
+  --fuge: 8px;
+  --r-karte: 10px;
+  --rand: 16px;
+  --nav-hoehe: 44px;
+  --tab-hoehe: 49px;
+  --liste-breite: clamp(300px, 36vw, 400px);
+  --sicher-oben: env(safe-area-inset-top, 0px);
+  --sicher-unten: env(safe-area-inset-bottom, 0px);
+  --sicher-links: env(safe-area-inset-left, 0px);
+  --sicher-rechts: env(safe-area-inset-right, 0px);
+  --mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, monospace;
+  --wartet-matt: color-mix(in srgb, var(--zustand-wartet) 15%, transparent);
+  --laeuft-matt: color-mix(in srgb, var(--zustand-laeuft) 14%, transparent);
+  --tot-matt: color-mix(in srgb, var(--zustand-tot) 14%, transparent);
+  --fertig-matt: color-mix(in srgb, var(--zustand-fertig) 14%, transparent);
+  --akzent-matt: color-mix(in srgb, var(--akzent) 16%, transparent);
+  --abdunkeln: color-mix(in srgb, var(--tinte) 45%, transparent);
+  --schatten: color-mix(in srgb, var(--tinte) 30%, transparent);
+}
+:root[data-thema='hell'] {
+  --karte: var(--grund);
+  --abdunkeln: color-mix(in srgb, var(--schrift) 35%, transparent);
+  --schatten: color-mix(in srgb, var(--schrift) 16%, transparent);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  /* Wurzelschrift: 17 px wie „Body“ in iOS; auf dem Geraet die Dynamic-Type-Groesse (geraet.ts). */
+  font-size: var(--grundschrift, 17px);
+  height: 100%;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+html, body {
+  margin: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: var(--fenster);
+  color: var(--schrift);
+}
+/* Bis das Thema feststeht, bleibt die Flaeche leer statt kurz im falschen Thema. */
+html:not([data-thema]) body { visibility: hidden; }
+body {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  font-size: 1rem;
+  line-height: 1.3;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+}
+button, input, textarea, select { font: inherit; color: inherit; }
+button {
+  background: none; border: 0; padding: 0; margin: 0; cursor: pointer; text-align: inherit;
+  touch-action: manipulation;
+}
+button:disabled { cursor: default; }
+h1, h2, h3, p { margin: 0; }
+[hidden] { display: none !important; }
+:focus-visible { outline: 2px solid var(--akzent); outline-offset: 2px; border-radius: 6px; }
+.mono { font-family: var(--mono); font-size: 0.88em; }
+.ohne-skript { padding: 24px; }
+
+/* --- Symbole: Strich wie SF Symbols „regular“ ------------------------------ */
+.symbol { flex: none; display: block; }
+.symbol path {
+  fill: none; stroke: currentColor; stroke-width: 1.7;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+
+/* --- Zustandspunkt (Form traegt mit, nicht nur Farbe) ----------------------
+ * Dieselben Formen wie app/src/renderer/werkbank.css: gefuellt laeuft, Hof
+ * wartet auf Dich, Ring fern, hohl rot beendet, hohl grau ruhig. Ein Punkt
+ * aus einem alten Stand wird hohl und grau: nie gruen nur wegen der Anzeige. */
+.punkt {
+  width: 10px; height: 10px; flex: none; border-radius: 50%; display: inline-block;
+}
+.punkt.laeuft { background: var(--zustand-laeuft); }
+.punkt.will { background: var(--zustand-wartet); box-shadow: 0 0 0 3px var(--wartet-matt); }
+.punkt.ruhig { border: 1.5px solid var(--gedaempft); }
+.punkt.aus { border: 1.5px solid var(--zustand-tot); }
+.punkt.fern { border: 2px solid var(--zustand-laeuft); }
+.punkt.fertig { background: var(--zustand-fertig); }
+.punkt.alt { background: transparent; box-shadow: none; border: 1.5px solid var(--gedaempft); opacity: 0.8; }
+
+.text-laeuft { color: var(--zustand-laeuft); }
+.text-will { color: var(--zustand-wartet); }
+.text-aus { color: var(--zustand-tot); }
+.text-fertig { color: var(--zustand-fertig); }
+.text-fern, .text-neutral, .text-ruhig { color: var(--gedaempft); }
+.text-akzent { color: var(--akzent-text); }
+
+/* --- Marken ---------------------------------------------------------------- */
+.marken { display: flex; flex-wrap: wrap; gap: 6px; }
+.marke {
+  display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px;
+  border-radius: 6px; font-size: 0.765rem; font-weight: 600; line-height: 1.2;
+  background: var(--erhoben); color: var(--gedaempft);
+}
+.marke.will { background: var(--wartet-matt); color: var(--zustand-wartet); }
+.marke.laeuft { background: var(--laeuft-matt); color: var(--zustand-laeuft); }
+.marke.aus { background: var(--tot-matt); color: var(--zustand-tot); }
+.marke.fertig { background: var(--fertig-matt); color: var(--zustand-fertig); }
+.marke.akzent { background: var(--akzent-matt); color: var(--akzent-text); }
+.marke.fern { background: transparent; color: var(--gedaempft); box-shadow: inset 0 0 0 1px var(--linie); }
+
+/* --- Knoepfe --------------------------------------------------------------- */
+.knopf {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-height: 44px; padding: 0 18px; border-radius: 12px;
+  font-weight: 600; font-size: 1rem; line-height: 1.2; text-align: center;
+}
+.knopf.primaer { background: var(--akzent); color: var(--akzent-tinte); }
+.knopf.getoent { background: var(--akzent-matt); color: var(--akzent-text); }
+.knopf.klein { min-height: 32px; padding: 0 12px; font-size: 0.882rem; border-radius: 8px; }
+.knopf.breit { width: 100%; max-width: 420px; align-self: center; }
+.knopf:disabled, .text-knopf:disabled { opacity: 0.42; }
+.knopf:not(:disabled):active, .text-knopf:not(:disabled):active { opacity: 0.6; }
+.text-knopf {
+  color: var(--akzent-text); font-weight: 600; min-height: 44px; padding: 0 4px;
+  display: inline-flex; align-items: center;
+}
+.text-knopf.zerstoerend { color: var(--aus); }
+
+/* --- Karten und Abschnitte -------------------------------------------------- */
+.karte { background: var(--karte); border-radius: var(--r-karte); }
+.karten { display: flex; flex-direction: column; gap: var(--fuge); padding: 0 var(--rand); }
+.gruppe { margin: 0 0 22px; }
+.abschnitt-kopf {
+  display: flex; align-items: baseline; gap: 12px; justify-content: space-between;
+  padding: 0 calc(var(--rand) + 4px) 8px;
+}
+.abschnitt-titel { font-size: 1.18rem; font-weight: 700; letter-spacing: 0.01em; }
+.abschnitt-zusatz { font-size: 0.882rem; color: var(--gedaempft); text-align: right; }
+.maschine-status.aus { color: var(--zustand-tot); }
+
+.hinweis {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; margin: 0 var(--rand) 14px;
+  padding: 10px 10px 10px 14px; border-radius: var(--r-karte); background: var(--karte);
+  font-size: 0.882rem; line-height: 1.35;
+}
+.hinweis .symbol { color: var(--gedaempft); }
+.hinweis.warnung { background: var(--vorsichtgrund); }
+.hinweis.warnung .symbol { color: var(--aus); }
+.hinweis-text { flex: 1 1 150px; }
+.hinweis-knopf {
+  flex: none; margin-left: auto; min-height: 36px; padding: 0 12px; border-radius: 8px;
+  background: var(--akzent-matt); color: var(--akzent-text); font-weight: 600; font-size: 0.882rem;
+}
+
+.leer { padding: 56px 32px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.leer-titel { font-size: 1.18rem; font-weight: 700; }
+.leer-text { color: var(--gedaempft); max-width: 34ch; line-height: 1.4; }
+
+.platzhalter-karten { display: flex; flex-direction: column; gap: var(--fuge); padding: 0 var(--rand); }
+.skelett { background: var(--karte); border-radius: var(--r-karte); animation: puls 1.4s ease-in-out infinite; }
+.karte.skelett { height: 104px; }
+.karte.skelett.gross { height: 220px; }
+.skelett.zeile { height: 14px; margin: 10px 0; border-radius: 7px; width: 70%; background: var(--erhoben); }
+.skelett.zeile.lang { width: 90%; }
+.skelett.zeile.kurz { width: 40%; }
+@keyframes puls { 50% { opacity: 0.45; } }
+
+.formular-notiz, .absender-notiz, .versions-zeile {
+  color: var(--gedaempft); font-size: 0.765rem; line-height: 1.4; padding: 4px calc(var(--rand) + 4px);
+}
+.versions-zeile { text-align: center; padding-top: 8px; }
+
+/* Bewegung reduzieren heisst hier: keine. Nicht nur die Dauer kuerzen -- eine
+   Dauer auf `*` gaebe jeder Eigenschaft (transition-property: all) einen
+   Uebergang, und berechnete Werte hinkten einen Frame hinterher. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

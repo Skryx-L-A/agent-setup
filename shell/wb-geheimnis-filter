@@ -1,0 +1,2058 @@
+#!/bin/sh
+"true" '''\'
+# Interpreter-Suche statt Maschinenpfad im Shebang (2026-10-11): dieselbe Datei
+# laeuft auf dem Mac (Homebrew-Python, /usr/bin/python3 ist dort 3.9) und auf peer
+# (/usr/bin/python3 = 3.14). Erster Treffer ab Python 3.14 gewinnt; sonst klare
+# Meldung und Exit 2, nie ein halber Lauf. Fuer Python ist der Block unten eine
+# Zeichenkette, fuer sh endet er mit exec/exit vor dem Schlussabschnitt.
+for p in python3.14 python3.15 python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  command -v "$p" >/dev/null 2>&1 || continue
+  "$p" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)' >/dev/null 2>&1 || continue
+  exec "$p" "$0" "$@"
+done
+echo "wb-geheimnis-filter: braucht Python 3.14 oder neuer, keins gefunden (PATH, Homebrew, /usr/bin)." >&2
+exit 2
+'''
+# wb-geheimnis-filter -- Geheimnisfilter fuer alle Harnesses und Modelle der Werkbank.
+#
+# WOFUER (Auftrag geheimnis-filter, der Nutzer 2026-10-10): Am 09.10. landeten ein
+# Client-Secret und eine Client-ID aus einer weitergeleiteten Mail im Toolergebnis
+# des Orchestrators und damit beim Modell. Der gemeinsame Punkt ALLER Harnesses
+# (claude, codex, pi, opencode, aider, goose, crush ...) ist der Weg zur Modell-API:
+# jede Werkzeugausgabe geht mit der naechsten Anfrage dorthin. Dieser Proxy sitzt
+# auf 127.0.0.1 vor den Anbietern und
+#   - ersetzt auf dem HINWEG jedes erkannte Geheimnis durch einen stabilen
+#     Platzhalter WB_GEHEIM_<16 hex> (HMAC-SHA256 mit dauerhaftem Schluessel aus
+#     Schluesselbund/Secret Service): dasselbe Geheimnis behaelt ueber alle Zuege
+#     denselben Platzhalter, das Modell sieht den Wert nie;
+#   - setzt auf dem RUECKWEG (auch gestreamt, SSE und NDJSON) bekannte Platzhalter
+#     in Text und Werkzeugaufrufen wieder zum echten Wert zurueck, bevor der Harness
+#     sie ausfuehrt. Ein Platzhalter, der ueber Chunk-Grenzen reicht, wird je
+#     Delta-Strom zurueckgehalten, bis er vollstaendig ist (siehe StromAufloeser).
+#   Folge: Harness und Transcript auf der Platte sehen den echten Wert, das Modell nie.
+#
+# MUSTER: ausschliesslich hooks/lib/geheimnis_inhalt.py (`treffer()`), keine zweite
+# Liste. Dazu kommt jeder Wert, den dieser Prozess schon einmal ersetzt hat: der
+# Harness schickt aufgeloeste Werkzeugaufrufe im Verlauf zurueck, und dort steht der
+# Wert oft ohne das Schluesselwort, an dem ihn das Muster erkannt hat.
+#
+# PROTOKOLL: keine Inhalte, keine Header, keine Tokens -- nur Zaehler
+# (GET /_wb/zaehler). Bindung ausschliesslich an 127.0.0.1.
+#
+# AUSFALL: fail-closed. Zeigt ein Harness auf diesen Proxy und der Proxy laeuft
+# nicht, scheitert die Anfrage (Verbindung abgelehnt) -- es gibt keinen stillen
+# Direktweg. Laesst sich ein Anfragekoerper nicht pruefen (unbekannte Kompression),
+# wird er abgewiesen (HTTP 502), nicht ungeprueft weitergereicht. WebSocket-Upgrades
+# werden abgelehnt (HTTP 426), weil ihre Rahmen hier nicht gefiltert werden; Clients
+# mit HTTP-Rueckfall (codex) nehmen dann SSE. 426 statt 501 (gemessen 2026-10-10, codex
+# 0.162.1 mit eingebautem Provider): bei 501 oder 404 versucht codex es siebenmal (+7 s je
+# Sitzungsstart), bei 426 einmal und faellt sofort auf HTTP zurueck.
+#
+# Aufruf:
+#   wb-geheimnis-filter serve --port P [--route NAME=URL ...] [--durchreichen]
+#       Routen (Pfadpraefix /NAME/...): anthropic, openai, chatgpt, openrouter,
+#       ollama, google; weitere oder abweichende per --route (Tests: Attrappe).
+#       --durchreichen: kein Filter (nur fuer Latenz-Vergleichsmessungen).
+#       --beobachte-env VAR: zaehlt nur, wie oft der Wert der Umgebungsvariable VAR
+#       in ausgehenden Anfragen bzw. eingehenden Antworten vorkommt (Pruefbeleg ohne
+#       Mitschnitt; Zaehler hinweg_wert / rueckweg_wert).
+#       --connect: derselbe Port nimmt zusaetzlich CONNECT an (HTTPS_PROXY-Betrieb fuer
+#       Claude, Proxy-Modus siehe unten; der Dienst startet so). --ca-ordner DIR (Vorgabe
+#       --zustand), --upstream-ca DATEI und --mitm HOST=ROUTE nur fuer Tests (lokaler
+#       TLS-Stub statt Anbieter). Gefiltert werden im Tunnel nur /v1/messages(/count_tokens);
+#       dazu der Remote-Control-Spiegel (Vorgabe --rc-spiegel filtern, der Nutzer 13.10.
+#       21:09Z: "Platzhalter auf dem Handy"; --rc-spiegel durchreichen schaltet ab);
+#       alles andere geht unveraendert durch.
+#       --struktur-datei F: Messhilfe, schreibt das JSON-Geruest (Schluessel, Typen, nie
+#       Werte) der RC-Spiegel-Anfragen nach F (0600).
+#   wb-geheimnis-filter ca-anlegen [--ca-ordner DIR] [--tage N]
+#       lokale CA des Proxy-Modus anlegen bzw. bei < 7 Tagen Rest erneuern; gibt den
+#       Pfad des Buendels ca.pem aus (fuer NODE_EXTRA_CA_CERTS). Nie in einen Trust-Store.
+#   wb-geheimnis-filter filter            stdin -> stdout, Funde als [GEHEIM:<regel>]
+#   wb-geheimnis-filter mit VAR=QUELLE ... -- BEFEHL ARG...
+#       setzt VAR aus QUELLE (kc:<Dienst> = macOS-Schluesselbund, env:<NAME>,
+#       datei:<PFAD>), ohne den Wert auszugeben; stdout/stderr des Befehls laufen
+#       durch den Filter, der eingesetzte Wert wird dort zu [GEHEIM:VAR].
+#   wb-geheimnis-filter serve --aktiviert --zustand DIR
+#       Dienstbetrieb: den Lauschsocket von launchd (Sockets-Dict, Name "filter") bzw.
+#       systemd (wb-geheimnis-filter.socket) uebernehmen; DIR haelt die Zaehler seit einem
+#       festen Zeitpunkt (zaehler.json, nur Zahlen). Einrichten: wb-geheimnis-filter-dienst.
+#   wb-geheimnis-filter zaehler [--port P] [--lesbar]
+#       Zaehlerseite des laufenden Proxys (Vorgabe: Dienstport 8093): Anfragen, Ersetzungen,
+#       Aufloesungen, Fehler, Latenz (Median/p90 je Groessenklasse) seit Prozessstart und
+#       dauerhaft seit dem festen Zeitpunkt.
+#   POST /_wb/sonde (Koerper: Testwert), GET/DELETE /_wb/sonde
+#       Beleg am laufenden Dienst: zaehlt einen zur Laufzeit erzeugten Testwert vor dem
+#       Filter, nach dem Filter (muss 0 bleiben) und auf dem Rueckweg; 30 Minuten gueltig.
+#
+# Nur Python-Standardbibliothek.
+
+import argparse
+import fcntl
+import gzip
+import hashlib
+import hmac
+import http.client
+import json
+import os
+import re
+import secrets
+import select
+import selectors
+import signal
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import zlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+HIER = os.path.dirname(os.path.realpath(__file__))
+
+
+def _lib_ordner():
+    """Musterbibliothek finden: ausdruecklich (WB_GEHEIMNIS_LIB), im Repo neben shell/,
+    sonst die ausgerollten Hooks. Die installierte Kopie unter ~/.local/bin fand vorher
+    nichts (HIER/../hooks/lib gibt es dort nicht; gemessen 2026-10-10)."""
+    kandidaten = [os.environ.get('WB_GEHEIMNIS_LIB'), os.path.join(HIER, '..', 'hooks', 'lib'),
+                  os.path.expanduser('~/.claude/hooks/lib')]
+    for k in kandidaten:
+        if k and os.path.isfile(os.path.join(k, 'geheimnis_inhalt.py')):
+            return k
+    return kandidaten[0] or kandidaten[1]
+
+
+LIB = _lib_ordner()
+sys.path.insert(0, LIB)
+import geheimnis_inhalt  # noqa: E402  (die eine Musterquelle)
+
+HOOKS_DIR = os.path.dirname(os.path.abspath(LIB))
+
+STANDARD_ROUTEN = {
+    'anthropic': 'https://api.anthropic.com',
+    'openai': 'https://api.openai.com',
+    'chatgpt': 'https://chatgpt.com/backend-api',
+    'openrouter': 'https://openrouter.ai/api',
+    'ollama': 'http://127.0.0.1:11434',
+    'google': 'https://generativelanguage.googleapis.com',
+    # Lokale Motoren (Sockets von wb-modell-proxy): nur fuer Harnesses, deren Provider
+    # ausdruecklich hierher zeigt.
+    'mlx': 'http://127.0.0.1:8080',
+    'omlx': 'http://127.0.0.1:8079',
+    'splash': 'http://127.0.0.1:8001',
+}
+
+PRAEFIX = 'WB_GEHEIM_'
+HEXLEN = 16
+PLATZHALTER_RX = re.compile(PRAEFIX + '[0-9a-f]{%d}' % HEXLEN)
+PLATZHALTER_LEN = len(PRAEFIX) + HEXLEN
+MAX_TABELLE = 20000
+
+# Undurchsichtige Felder: signierte Denkbloecke, verschluesselte Begruendungen,
+# Base64-Medien. Eine Aenderung dort bricht Signaturen oder Bilder; lesbar fuer das
+# Modell ist dort nichts, was ein Werkzeug ausgegeben haette.
+UNDURCHSICHTIG = {'signature', 'encrypted_content', 'data', 'thinking'}
+# Felder, deren Inhalt selbst JSON-Text ist: ein eingesetzter Wert muss JSON-maskiert
+# werden (Zeilenumbruch eines privaten Schluessels wird dort zu \n).
+JSON_TEXT_FELDER = {'partial_json', 'arguments'}
+# Felder, die in Stroemen stueckweise ankommen (Delta-Stroeme). Nur dort wird ein
+# moeglicher Platzhalteranfang am Ende zurueckgehalten.
+DELTA_FELDER = {'text', 'partial_json', 'content', 'arguments', 'delta', 'response', 'input'}
+# Nie aufloesen: Denktext. Bleibt er Platzhalter, schickt der Harness ihn unveraendert
+# zurueck und die Signatur des Denkblocks bleibt gueltig.
+NIE_AUFLOESEN = {'thinking', 'reasoning', 'reasoning_content', 'signature', 'encrypted_content'}
+
+HOP_BY_HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+              'te', 'trailer', 'trailers', 'transfer-encoding', 'upgrade', 'host',
+              'content-length', 'accept-encoding'}
+
+
+# Latenzverteilung (Dienstbetrieb, Auftrag filter-live 2026-10-10): je Groessenklasse der
+# Anfrage ein Histogramm mit geometrischen Eimern (Faktor 1.25, 0.1 ms bis 30 min). Median
+# und p90 werden als OBERE Eimergrenze gemeldet, also hoechstens 25 % zu hoch, nie zu niedrig.
+GROESSENKLASSEN = ((32 * 1024, 'bis_32k'), (256 * 1024, 'bis_256k'), (1024 * 1024, 'bis_1m'),
+                   (None, 'ueber_1m'))
+EIMER_MS = []
+_g = 0.1
+while _g < 1800000:
+    EIMER_MS.append(round(_g, 3))
+    _g *= 1.25
+EIMER_MS.append(float('inf'))
+# Latenzarten: filter = Hinweg im Proxy (Koerper lesen, pruefen, ersetzen) bis zum Absenden;
+# rueckweg = Rechenzeit des Rueckwegs ohne Warten auf den Anbieter; erstes_byte = bis die
+# Antwortkoepfe des Anbieters da sind (enthaelt die Modellzeit, nur zur Einordnung).
+LATENZARTEN = ('filter', 'rueckweg', 'erstes_byte')
+
+
+def groessenklasse(n):
+    for grenze, name in GROESSENKLASSEN:
+        if grenze is None or n <= grenze:
+            return name
+
+
+def _eimer(ms):
+    lo, hi = 0, len(EIMER_MS) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if ms <= EIMER_MS[mid]:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def quantil(eimer, q):
+    n = sum(eimer)
+    if not n:
+        return None
+    ziel, summe = q * n, 0
+    for i, c in enumerate(eimer):
+        summe += c
+        if summe >= ziel:
+            return EIMER_MS[i] if EIMER_MS[i] != float('inf') else None
+    return None
+
+
+def latenz_bild(latenz):
+    """{klasse: {art: [eimer]}} -> {klasse: {art: {n, median_ms, p90_ms}}}"""
+    aus = {}
+    for klasse, arten in sorted(latenz.items()):
+        for art, eimer in sorted(arten.items()):
+            aus.setdefault(klasse, {})[art] = {'n': sum(eimer), 'median_ms': quantil(eimer, 0.5),
+                                               'p90_ms': quantil(eimer, 0.9)}
+    return aus
+
+
+class Zaehler:
+    def __init__(self):
+        self._l = threading.Lock()
+        self.werte = {}
+        self.latenz = {}
+
+    def plus(self, name, n=1):
+        with self._l:
+            self.werte[name] = self.werte.get(name, 0) + n
+
+    def zeit(self, name, sek):
+        with self._l:
+            self.werte[name + '_ms_summe'] = round(self.werte.get(name + '_ms_summe', 0) + sek * 1000, 3)
+            self.werte[name + '_ms_max'] = round(max(self.werte.get(name + '_ms_max', 0), sek * 1000), 3)
+
+    def latenz_plus(self, klasse, art, sek):
+        with self._l:
+            eimer = self.latenz.setdefault(klasse, {}).setdefault(art, [0] * len(EIMER_MS))
+            eimer[_eimer(sek * 1000)] += 1
+
+    def bild(self):
+        with self._l:
+            return dict(self.werte)
+
+    def roh(self):
+        with self._l:
+            return dict(self.werte), {k: {a: list(e) for a, e in v.items()} for k, v in self.latenz.items()}
+
+
+# Zaehler, die nur einem Beleg gelten und nie in den Dauerbestand gehoeren.
+NUR_LAUF = ('hinweg_wert', 'rueckweg_wert', 'sonde_vor_filter')
+
+
+class Bestand:
+    """Dauerhafte Zaehler seit einem festen Zeitpunkt (Datei zaehler.json im Zustandsordner,
+    nur Zahlen). Der Prozess startet bei Zugriff und kann enden; die Summe ueber alle Laeufe
+    bleibt. Geschrieben wird nach einer Anfrage hoechstens alle SPEICHERABSTAND Sekunden und
+    beim Beenden -- kein eigener Zeitgeber. Ein Absturz verliert hoechstens dieses Fenster."""
+
+    SPEICHERABSTAND = 30.0
+
+    def __init__(self, ordner):
+        self.pfad = os.path.join(ordner, 'zaehler.json') if ordner else None
+        self._l = threading.Lock()
+        self._zuletzt = 0.0
+        self.seit = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+        self.zaehler, self.latenz = {}, {}
+        if not self.pfad:
+            return
+        os.makedirs(ordner, mode=0o700, exist_ok=True)
+        try:
+            with open(self.pfad, encoding='utf-8') as f:
+                d = json.load(f)
+            if isinstance(d.get('seit'), str):
+                self.seit = d['seit']
+            self.zaehler = {k: v for k, v in (d.get('zaehler') or {}).items()
+                            if isinstance(v, (int, float)) and k not in NUR_LAUF}
+            for klasse, arten in (d.get('latenz') or {}).items():
+                for art, eimer in (arten or {}).items():
+                    if isinstance(eimer, list) and len(eimer) == len(EIMER_MS):
+                        self.latenz.setdefault(klasse, {})[art] = [int(x) for x in eimer]
+        except FileNotFoundError:
+            pass
+        except Exception:
+            # Unlesbar: neu beginnen statt abstuerzen, die alte Datei bleibt daneben liegen.
+            try:
+                os.replace(self.pfad, self.pfad + '.unlesbar')
+            except OSError:
+                pass
+
+    def summe(self, z):
+        werte, latenz = z.roh()
+        zs = dict(self.zaehler)
+        for k, v in werte.items():
+            if k in NUR_LAUF:
+                continue
+            zs[k] = max(zs.get(k, 0), v) if k.endswith('_ms_max') else round(zs.get(k, 0) + v, 3)
+        ls = {k: {a: list(e) for a, e in v.items()} for k, v in self.latenz.items()}
+        for klasse, arten in latenz.items():
+            for art, eimer in arten.items():
+                ziel = ls.setdefault(klasse, {}).setdefault(art, [0] * len(EIMER_MS))
+                for i, c in enumerate(eimer):
+                    ziel[i] += c
+        return zs, ls
+
+    def speichern(self, z, erzwingen=False):
+        if not self.pfad:
+            return
+        jetzt = time.monotonic()
+        with self._l:
+            if not erzwingen and jetzt - self._zuletzt < self.SPEICHERABSTAND:
+                return
+            self._zuletzt = jetzt
+            zs, ls = self.summe(z)
+            tmp = '%s.%d.tmp' % (self.pfad, os.getpid())
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump({'seit': self.seit, 'zaehler': zs, 'latenz': ls}, f, sort_keys=True)
+                os.replace(tmp, self.pfad)
+            except OSError:
+                z.plus('zustand_schreibfehler')
+
+
+SCHLUESSEL_DIENST = 'wb-geheimnis-filter-hmac'
+SCHLUESSEL_KONTO = 'platzhalter-v1'
+
+
+def schluessel_fehler(grund):
+    # Niemals Ausnahmetext oder stdout/stderr der Speicherwerkzeuge weitergeben.
+    raise SystemExit('wb-geheimnis-filter: Schluesselbund: %s; kein Start (fail-closed). '
+                     'Rueckweg: Schluesselbund/Secret Service entsperren und Dienst erneut ansprechen; '
+                     'vor Abschalten zuerst alle Harnesses zurueckstellen '
+                     '(Claude: ANTHROPIC_BASE_URL und ENABLE_TOOL_SEARCH). '
+                     'wb-geheimnis-filter-dienst entfernen prueft die Rueckstellung.' % grund)
+
+
+def _schluessel_befehl(cmd, eingabe=None):
+    try:
+        return subprocess.run(cmd, input=eingabe, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        schluessel_fehler('Speicherwerkzeug fehlt oder ist nicht erreichbar')
+
+
+def _security_werkzeug():
+    # Eigener Adapter/Attrappe darf ueber PATH oder einen expliziten Pfad kommen.
+    tool = shutil.which(os.environ.get('WB_GEHEIMNIS_SECURITY', 'security'))
+    if tool is None:
+        schluessel_fehler('Speicherwerkzeug fehlt oder ist nicht erreichbar')
+    return os.path.realpath(tool)
+
+
+def _mac_eintrag(keychain, neu=None):
+    """System-security ersetzen: Dialogsperre und Zugriff im SELBEN Prozess.
+
+    SecKeychainSetUserInteractionAllowed im Elternprozess sperrt keine Dialoge
+    eines security-Kindprozesses. Daher fuer das Systemwerkzeug die zugehoerige
+    Security-API verwenden; eigene Werkzeugadapter bleiben per PATH austauschbar.
+    """
+    import ctypes
+    sec = ctypes.CDLL('/System/Library/Frameworks/Security.framework/Security')
+    cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+    pointer = ctypes.c_void_p
+    sec.SecKeychainSetUserInteractionAllowed.argtypes = [ctypes.c_bool]
+    if sec.SecKeychainSetUserInteractionAllowed(False) != 0:
+        schluessel_fehler('Dialogsperre nicht verfuegbar')
+    sec.SecKeychainOpen.argtypes = [ctypes.c_char_p, ctypes.POINTER(pointer)]
+    sec.SecKeychainFindGenericPassword.argtypes = [pointer, ctypes.c_uint32, ctypes.c_char_p,
+        ctypes.c_uint32, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(pointer), pointer]
+    sec.SecKeychainAddGenericPassword.argtypes = [pointer, ctypes.c_uint32, ctypes.c_char_p,
+        ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p, pointer]
+    sec.SecKeychainItemFreeContent.argtypes = [pointer, pointer]
+    cf.CFRelease.argtypes = [pointer]
+    ref = pointer()
+    if sec.SecKeychainOpen(os.fsencode(keychain), ctypes.byref(ref)) != 0:
+        schluessel_fehler('Keychain nicht erreichbar')
+    service, account = SCHLUESSEL_DIENST.encode(), SCHLUESSEL_KONTO.encode()
+    try:
+        if neu is not None:
+            value = neu.encode('ascii')
+            rc = sec.SecKeychainAddGenericPassword(ref, len(service), service,
+                                                  len(account), account, len(value), value, None)
+            return subprocess.CompletedProcess([], rc, '', '')
+        size, data = ctypes.c_uint32(), pointer()
+        rc = sec.SecKeychainFindGenericPassword(ref, len(service), service, len(account), account,
+                                               ctypes.byref(size), ctypes.byref(data), None)
+        value = ''
+        if rc == 0:
+            try:
+                value = ctypes.string_at(data, size.value).decode('ascii')
+            except UnicodeError:
+                schluessel_fehler('Eintrag hat ein ungueltiges Format; nicht ersetzt')
+            finally:
+                sec.SecKeychainItemFreeContent(None, data)
+        # Gleicher Fehlcode wie security find-generic-password, nur ItemNotFound.
+        return subprocess.CompletedProcess([], 44 if rc == -25300 else rc, value, '')
+    finally:
+        cf.CFRelease(ref)
+
+
+def _mac_keychain(keychain):
+    """Explizite/default Keychain aufloesen und Sperre ohne Entsperrdialog pruefen."""
+    import ctypes
+    sec = ctypes.CDLL('/System/Library/Frameworks/Security.framework/Security')
+    cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+    sec.SecKeychainSetUserInteractionAllowed.argtypes = [ctypes.c_bool]
+    if sec.SecKeychainSetUserInteractionAllowed(False) != 0:
+        schluessel_fehler('Dialogsperre nicht verfuegbar')
+    sec.SecKeychainOpen.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+    sec.SecKeychainCopyDefault.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    sec.SecKeychainGetStatus.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    sec.SecKeychainGetPath.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    ref = ctypes.c_void_p()
+    rc = sec.SecKeychainOpen(os.fsencode(keychain), ctypes.byref(ref)) if keychain else sec.SecKeychainCopyDefault(ctypes.byref(ref))
+    if rc != 0:
+        schluessel_fehler('Keychain nicht erreichbar')
+    try:
+        status = ctypes.c_uint32()
+        if sec.SecKeychainGetStatus(ref, ctypes.byref(status)) != 0 or not status.value & 1:
+            schluessel_fehler('Keychain gesperrt/nicht erreichbar (kein Entsperrdialog)')
+        laenge = ctypes.c_uint32(4096)
+        pfad = ctypes.create_string_buffer(laenge.value)
+        if sec.SecKeychainGetPath(ref, ctypes.byref(laenge), pfad) != 0:
+            schluessel_fehler('Keychain-Pfad nicht erreichbar')
+        return os.fsdecode(pfad.value)
+    finally:
+        cf.CFRelease(ref)
+
+
+def _schluessel_lesen(keychain):
+    if sys.platform == 'darwin':
+        security = _security_werkzeug()
+        cmd = [security, 'find-generic-password', '-s', SCHLUESSEL_DIENST,
+               '-a', SCHLUESSEL_KONTO, '-w'] + ([keychain] if keychain else [])
+        r = _mac_eintrag(keychain) if security == '/usr/bin/security' else _schluessel_befehl(cmd)
+        fehlt = r.returncode == 44  # errSecItemNotFound; andere Fehler NIE als fehlend werten
+    else:
+        if keychain:
+            schluessel_fehler('eine Keychain-Datei ist nur auf macOS zulaessig')
+        r = _schluessel_befehl(['secret-tool', 'lookup', 'service', SCHLUESSEL_DIENST,
+                               'account', SCHLUESSEL_KONTO])
+        # libsecret: kein Treffer = Exit 1 ohne Ausgabe; DBus-/Sperrfehler haben stderr.
+        fehlt = r.returncode == 1 and not r.stdout and not r.stderr
+    if fehlt:
+        return None
+    if r.returncode != 0:
+        schluessel_fehler('Eintrag nicht lesbar oder Speicher gesperrt/nicht erreichbar')
+    wert = r.stdout.rstrip('\n')
+    if not re.fullmatch('[0-9a-f]{64}', wert):
+        schluessel_fehler('Eintrag hat ein ungueltiges Format; nicht ersetzt')
+    return bytes.fromhex(wert)
+
+
+def schluessel_laden(keychain=None):
+    """Einmalig 256 Bit anlegen; kein Dateispeicher fuer den Wert, keine Rotation bei Fehlern.
+
+    Die nicht geheime Sperrdatei serialisiert gleichzeitige Erststarts. Tests
+    verwenden eigene security-/secret-tool-Adapter; keine echten Keychains.
+    """
+    if sys.platform == 'darwin' and _security_werkzeug() == '/usr/bin/security':
+        keychain = _mac_keychain(keychain)
+    try:
+        ordner = os.path.expanduser('~/.local/state/wb-geheimnis-filter')
+        os.makedirs(ordner, mode=0o700, exist_ok=True)
+        fd = os.open(os.path.join(ordner, 'schluessel.lock'),
+                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        schluessel_fehler('Startsperre nicht erreichbar')
+    with os.fdopen(fd, 'w') as sperre:
+        ende = time.monotonic() + 15
+        while True:
+            try:
+                fcntl.flock(sperre, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= ende:
+                    schluessel_fehler('Startsperre belegt (Zeitgrenze)')
+                time.sleep(.05)
+        wert = _schluessel_lesen(keychain)
+        if wert is not None:
+            return wert
+        neu = secrets.token_hex(32)
+        if sys.platform == 'darwin':
+            # Eigene security-Adapter lesen den Wert ueber stdin, nie als Prozessargument.
+            # Kein -U: vorhandene Eintraege werden niemals ueberschrieben.
+            import shlex
+            cmd = ['add-generic-password', '-s', SCHLUESSEL_DIENST, '-a', SCHLUESSEL_KONTO,
+                   '-T', '/usr/bin/security', '-w', neu] + ([keychain] if keychain else [])
+            security = _security_werkzeug()
+            r = (_mac_eintrag(keychain, neu) if security == '/usr/bin/security'
+                 else _schluessel_befehl([security, '-i'], shlex.join(cmd) + '\n'))
+        else:
+            r = _schluessel_befehl(['secret-tool', 'store', '--label=Workbench Geheimnisfilter HMAC',
+                                   'service', SCHLUESSEL_DIENST, 'account', SCHLUESSEL_KONTO], neu + '\n')
+        if r.returncode != 0:
+            schluessel_fehler('Eintrag konnte nicht angelegt werden')
+        # security -i kann trotz Befehlsfehler Exit 0 liefern: immer erneut lesen.
+        wert = _schluessel_lesen(keychain)
+        if wert is None or wert != bytes.fromhex(neu):
+            schluessel_fehler('Anlegen nicht bestaetigt; kein zufaelliger Ersatz')
+        return wert
+
+
+class Tabelle:
+    """Platzhalter <-> Wert im Speicher; stabil durch den uebergebenen HMAC-Schluessel."""
+
+    def __init__(self, schluessel):
+        self._schluessel = schluessel
+        self._l = threading.Lock()
+        self.zu_wert = {}
+        self.werte_nach_laenge = []
+        self._werte = set()
+        self.public = geheimnis_inhalt.load_public_values(HOOKS_DIR)
+
+    def platzhalter(self, wert):
+        h = hmac.new(self._schluessel, wert.encode('utf-8'), hashlib.sha256).hexdigest()[:HEXLEN]
+        p = PRAEFIX + h
+        with self._l:
+            if p not in self.zu_wert:
+                if len(self.zu_wert) >= MAX_TABELLE:
+                    alt = next(iter(self.zu_wert))
+                    del self.zu_wert[alt]
+                self.zu_wert[p] = wert
+                self._werte = set(self.zu_wert.values())
+                self.werte_nach_laenge = sorted(self._werte, key=len, reverse=True)
+        return p
+
+    def kennt(self, wert):
+        with self._l:
+            return wert in self._werte
+
+    def wert(self, p):
+        with self._l:
+            return self.zu_wert.get(p)
+
+    def bekannte_werte(self):
+        with self._l:
+            return list(self.werte_nach_laenge)
+
+
+def _privater_block(text, start):
+    """Der Musterfund private_key_block ist nur die BEGIN-Zeile; ersetzt wird der ganze
+    Block bis zur passenden END-Zeile, sonst bliebe der Schluesselkoerper lesbar."""
+    m = re.compile(r'-----END [A-Z ]*PRIVATE KEY-----').search(text, start)
+    return text[start:m.end()] if m else None
+
+
+def muster_funde(text, tabelle, regeln=None):
+    """Werte, die die Muster in `text` finden (privater Schluessel als ganzer Block).
+    regeln: optionales dict, bekommt je Fund den Regelnamen (fuer Zaehler, nie Werte)."""
+    funde = set()
+    for _zeile, regel, wert, _ent in geheimnis_inhalt.treffer(text, True, tabelle.public, True):
+        if regel == 'private_key_block':
+            block = _privater_block(text, text.find(wert))
+            wert = block or wert
+        funde.add(wert)
+        if regeln is not None:
+            regeln[wert] = regel
+    return funde
+
+
+def geheimnisse_in(text, tabelle, muster=True):
+    """Menge der zu ersetzenden Werte in `text` (Muster plus schon bekannte Werte)."""
+    funde = muster_funde(text, tabelle) if muster else set()
+    for w in tabelle.bekannte_werte():
+        if w in text:
+            funde.add(w)
+    return funde
+
+
+def ersetze_text(text, tabelle, z, muster=True):
+    if not text or len(text) < 8:
+        return text
+    funde = geheimnisse_in(text, tabelle, muster)
+    if not funde:
+        return text
+    for w in sorted(funde, key=len, reverse=True):
+        if PLATZHALTER_RX.fullmatch(w):
+            continue
+        n = text.count(w)
+        if n:
+            text = text.replace(w, tabelle.platzhalter(w))
+            z.plus('ersetzt', n)
+    return text
+
+
+def sammle_json(obj, tabelle, schluessel=None, z=None, opak=UNDURCHSICHTIG):
+    """Erster Durchgang des Hinwegs: die Musterfunde ALLER Zeichenketten anmelden, bevor
+    irgendwo ersetzt wird. Sonst haengt es von der Reihenfolge im Koerper ab, ob ein Wert,
+    der in einem frueheren Feld ohne Schluesselwort steht (aufgeloester Befehl, Zusammen-
+    fassung nach einer Kompaktierung), schon bekannt ist -- nach einem Neustart des Proxys
+    ist die Tabelle leer, und genau dann ginge er durch."""
+    if isinstance(obj, str):
+        if schluessel in opak or len(obj) < 8:
+            return
+        regeln = {}
+        for w in muster_funde(obj, tabelle, regeln):
+            if not PLATZHALTER_RX.fullmatch(w):
+                if z is not None and not tabelle.kennt(w):
+                    # Je NEU erkanntem Wert der Regelname (Fehlalarme sichtbar machen).
+                    z.plus('neu_regel_' + regeln.get(w, '?'))
+                tabelle.platzhalter(w)
+    elif isinstance(obj, list):
+        for v in obj:
+            sammle_json(v, tabelle, schluessel, z, opak)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            sammle_json(v, tabelle, k, z, opak)
+
+
+def ersetze_json(obj, tabelle, z, schluessel=None, muster=True, opak=UNDURCHSICHTIG):
+    """Alle Zeichenketten eines JSON-Objekts filtern (Hinweg). -> (neues Objekt, geaendert)."""
+    if isinstance(obj, str):
+        if schluessel in opak:
+            return obj, False
+        neu = ersetze_text(obj, tabelle, z, muster)
+        return neu, neu is not obj and neu != obj
+    if isinstance(obj, list):
+        geaendert = False
+        for i, v in enumerate(obj):
+            n, g = ersetze_json(v, tabelle, z, schluessel, muster, opak)
+            if g:
+                obj[i] = n
+                geaendert = True
+        return obj, geaendert
+    if isinstance(obj, dict):
+        geaendert = False
+        for k in list(obj.keys()):
+            n, g = ersetze_json(obj[k], tabelle, z, k, muster, opak)
+            if g:
+                obj[k] = n
+                geaendert = True
+        return obj, geaendert
+    return obj, False
+
+
+def _einsetzen(wert, json_text):
+    return json.dumps(wert)[1:-1] if json_text else wert
+
+
+def loese_auf(text, tabelle, z, json_text=False):
+    def ersatz(m):
+        w = tabelle.wert(m.group(0))
+        if w is None:
+            z.plus('platzhalter_unbekannt')
+            return m.group(0)
+        z.plus('aufgeloest')
+        return _einsetzen(w, json_text)
+    return PLATZHALTER_RX.sub(ersatz, text)
+
+
+def _moeglicher_anfang(t):
+    """Ist t ein echter Anfang eines Platzhalters (kuerzer als ein ganzer)?"""
+    if len(t) >= PLATZHALTER_LEN:
+        return False
+    if len(t) <= len(PRAEFIX):
+        return PRAEFIX.startswith(t)
+    return t.startswith(PRAEFIX) and all(c in '0123456789abcdef' for c in t[len(PRAEFIX):])
+
+
+def zurueckhalten(text):
+    """(sofort, zurueck): zurueck ist der laengste Rest am Ende, der Anfang eines
+    Platzhalters sein kann."""
+    for k in range(min(len(text), PLATZHALTER_LEN - 1), 0, -1):
+        if _moeglicher_anfang(text[-k:]):
+            return text[:-k], text[-k:]
+    return text, ''
+
+
+def _ist_json_text(pfad, typ):
+    letzter = pfad[-1] if pfad else None
+    if letzter in JSON_TEXT_FELDER:
+        return True
+    return letzter == 'delta' and 'arguments' in (typ or '')
+
+
+class StromAufloeser:
+    """Rueckweg fuer gestreamte Antworten. Je Delta-Strom (Feldpfad plus index-artige
+    Werte: Anthropic index, OpenAI choices[i]/tool_calls[].index, Responses
+    output_index/content_index) wird ein Rest am Ende, der Anfang eines Platzhalters
+    sein kann, bis zum naechsten Stueck desselben Stroms zurueckgehalten. Kommt ein
+    Ereignis, das diesen Strom nicht fortsetzt (Blockende, anderer Block, Strom-Ende),
+    wird der Rest als eigenes Delta-Ereignis nach dem Muster des letzten Stuecks
+    ausgegeben -- dann war es kein Platzhalter, und kein Zeichen geht verloren."""
+
+    def __init__(self, tabelle, z):
+        self.t = tabelle
+        self.z = z
+        self.rest = {}    # schluessel -> (zurueckgehalten, vorlage, pfad, ereignisname)
+
+    def _gehe(self, obj, pfad, idx, typ, beruehrt, vorlage, ereignis, nie):
+        if isinstance(obj, dict):
+            if 'type' in obj and isinstance(obj['type'], str) and not typ:
+                typ = obj['type']
+            neu_idx = idx
+            for k in ('index', 'output_index', 'content_index'):
+                if isinstance(obj.get(k), int):
+                    neu_idx = neu_idx + ((k, obj[k]),)
+            # Denk-Deltas: Anthropic {"type":"thinking_delta","thinking":...}
+            nie_hier = nie or obj.get('type') in ('thinking_delta', 'signature_delta')
+            for k in list(obj.keys()):
+                obj[k] = self._gehe(obj[k], pfad + (k,), neu_idx, typ, beruehrt, vorlage,
+                                    ereignis, nie_hier or k in NIE_AUFLOESEN)
+            return obj
+        if isinstance(obj, list):
+            for i, v in enumerate(obj):
+                obj[i] = self._gehe(v, pfad + (i,), idx, typ, beruehrt, vorlage, ereignis, nie)
+            return obj
+        if not isinstance(obj, str) or nie:
+            return obj
+        letzter = pfad[-1] if pfad else None
+        json_text = _ist_json_text(pfad, typ)
+        # Rueckhalten nur in Delta-Ereignissen: typlose Stuecke (OpenAI Chat, Ollama) oder
+        # ein Typ mit "delta" (Anthropic content_block_delta, Responses *.delta). Ein
+        # *.done-Ereignis traegt den ganzen Text; ein dort zurueckgehaltener Rest kaeme als
+        # zweites done-Ereignis heraus.
+        if letzter not in DELTA_FELDER or (typ is not None and 'delta' not in typ):
+            return loese_auf(obj, self.t, self.z, json_text) if PRAEFIX[:3] in obj else obj
+        schl = (typ, pfad, idx)
+        beruehrt.add(schl)
+        alt = self.rest.pop(schl, None)
+        text = (alt[0] if alt else '') + obj
+        sofort, zurueck = zurueckhalten(text)
+        if zurueck:
+            self.rest[schl] = (zurueck, vorlage, pfad, ereignis)
+            self.z.plus('zurueckgehalten')
+        return loese_auf(sofort, self.t, self.z, json_text)
+
+    def _ausgeben_rest(self, schl):
+        zurueck, vorlage, pfad, ereignis = self.rest.pop(schl)
+        obj = json.loads(vorlage)
+        ziel = obj
+        for k in pfad[:-1]:
+            ziel = ziel[k]
+        ziel[pfad[-1]] = zurueck
+        self.z.plus('rest_ausgegeben')
+        return ereignis, obj
+
+    def ereignis(self, obj, ereignisname=None):
+        """-> Liste von (ereignisname, obj) in Ausgabereihenfolge."""
+        vorlage = json.dumps(obj)
+        beruehrt = set()
+        obj = self._gehe(obj, (), (), None, beruehrt, vorlage, ereignisname, False)
+        aus = [self._ausgeben_rest(s) for s in list(self.rest) if s not in beruehrt]
+        aus.append((ereignisname, obj))
+        return aus
+
+    def ende(self):
+        return [self._ausgeben_rest(s) for s in list(self.rest)]
+
+
+def loese_json_auf(obj, tabelle, z, schluessel=None, typ=None, nie=False):
+    """Rueckweg fuer nicht gestreamte JSON-Antworten."""
+    if isinstance(obj, dict):
+        if isinstance(obj.get('type'), str):
+            typ = obj['type']
+        nie = nie or obj.get('type') in ('thinking', 'redacted_thinking', 'reasoning')
+        for k in list(obj.keys()):
+            obj[k] = loese_json_auf(obj[k], tabelle, z, k, typ, nie or k in NIE_AUFLOESEN)
+        return obj
+    if isinstance(obj, list):
+        return [loese_json_auf(v, tabelle, z, schluessel, typ, nie) for v in obj]
+    if isinstance(obj, str) and not nie and PRAEFIX[:3] in obj:
+        return loese_auf(obj, tabelle, z, schluessel in JSON_TEXT_FELDER)
+    return obj
+
+
+def dekomprimiere(body, kodierung):
+    k = (kodierung or '').strip().lower()
+    if k in ('', 'identity'):
+        return body
+    if k == 'gzip':
+        return gzip.decompress(body)
+    if k == 'deflate':
+        return zlib.decompress(body)
+    if k == 'zstd':
+        from compression import zstd
+        return zstd.decompress(body)
+    raise ValueError('unbekannte Kodierung')
+
+
+SONDE_DAUER = 1800.0   # eine Sonde gilt 30 Minuten, dann zaehlt nichts mehr
+
+
+class UngueltigeAnfrage(ValueError):
+    pass
+
+
+def fehlerklasse(exc):
+    """Feste Namen, niemals Ausnahmetext, errno-Text, Host oder dynamische Klassen."""
+    for typ, name in ((socket.gaierror, 'dns'), (ssl.SSLError, 'tls'),
+                      (TimeoutError, 'zeitlimit'), (ConnectionRefusedError, 'abgelehnt'),
+                      (BrokenPipeError, 'pipe'), (ConnectionResetError, 'reset'),
+                      (http.client.IncompleteRead, 'unvollstaendig'),
+                      (http.client.RemoteDisconnected, 'getrennt'),
+                      (http.client.HTTPException, 'http'), (UnicodeError, 'unicode'),
+                      (ValueError, 'wert'), (TypeError, 'typ'), (KeyError, 'schluessel'),
+                      (OSError, 'betriebssystem')):
+        if isinstance(exc, typ):
+            return name
+    return 'sonstig'
+
+
+class Proxy:
+    def __init__(self, routen, durchreichen=False, beobachte=None, zustand=None, schluessel=None,
+                 dns_frist=90.0):
+        self.routen = routen
+        self.dns_frist = dns_frist
+        self.durchreichen = durchreichen
+        self.tabelle = Tabelle(schluessel if schluessel is not None else schluessel_laden())
+        self.z = Zaehler()
+        self.bestand = Bestand(zustand)
+        self.start = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+        self.beobachte = beobachte.encode('utf-8') if beobachte else None
+        self.beobachte_bis = None   # Sonde ueber /_wb/sonde: Ablaufzeit (monotonic)
+        self.ctx = ssl.create_default_context()
+
+    def beobachtet(self):
+        """Der zu zaehlende Wert (Testoption oder laufende Sonde), sonst None."""
+        if self.beobachte and self.beobachte_bis is not None and time.monotonic() > self.beobachte_bis:
+            self.beobachte, self.beobachte_bis = None, None
+        return self.beobachte
+
+    def seite(self):
+        """Zaehlerseite: seit Prozessstart (flach, wie bisher) plus Latenz, dazu der Dauer-
+        bestand seit einem festen Zeitpunkt. Nur Zahlen, keine Inhalte."""
+        werte, latenz = self.z.roh()
+        aus = dict(werte)
+        aus['start'] = self.start
+        aus['latenz'] = latenz_bild(latenz)
+        if self.bestand.pfad:
+            zs, ls = self.bestand.summe(self.z)
+            aus['dauerhaft'] = {'seit': self.bestand.seit, 'zaehler': zs, 'latenz': latenz_bild(ls)}
+        return aus
+
+
+def baue_handler(proxy):
+    class H(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+        server_version = 'wb-geheimnis-filter'
+
+        def log_message(self, *a):   # keine Zugriffsprotokolle: Pfade koennen Inhalte tragen
+            pass
+
+        _durch = False   # Proxy-Modus: diese Anfrage unveraendert durchreichen
+
+        def _ohne_filter(self):
+            return proxy.durchreichen or self._durch
+
+        def _antwort(self, code, text):
+            body = (json.dumps({'error': {'type': 'wb_geheimnis_filter', 'message': text}}) + '\n').encode()
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, code, obj):
+            body = json.dumps(obj, sort_keys=True).encode()
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _wb(self):
+            """Eigene Seiten unter /_wb/. -> True, wenn beantwortet."""
+            pfad = self.path.split('?', 1)[0]
+            if pfad == '/_wb/zaehler' and self.command == 'GET':
+                self._json(200, proxy.seite())
+                return True
+            if pfad == '/_wb/sonde':
+                # Beleg am laufenden Dienst ohne Mitschnitt: ein zur Laufzeit erzeugter
+                # Testwert wird gezaehlt -- vor dem Filter, nach dem Filter (muss 0 bleiben)
+                # und auf dem Rueckweg. Der Wert selbst wird nie ausgegeben.
+                if self.command == 'POST':
+                    wert = self._koerper().strip()
+                    if len(wert) < 16:
+                        self._antwort(400, 'Sonde: Wert mit mindestens 16 Zeichen erwartet')
+                        return True
+                    proxy.beobachte, proxy.beobachte_bis = wert, time.monotonic() + SONDE_DAUER
+                    with proxy.z._l:
+                        for k in NUR_LAUF:
+                            proxy.z.werte.pop(k, None)
+                elif self.command == 'DELETE':
+                    proxy.beobachte, proxy.beobachte_bis = None, None
+                elif self.command != 'GET':
+                    return False
+                w = proxy.z.bild()
+                self._json(200, {'aktiv': proxy.beobachtet() is not None,
+                                 'vor_filter': w.get('sonde_vor_filter', 0),
+                                 'hinweg': w.get('hinweg_wert', 0), 'rueckweg': w.get('rueckweg_wert', 0)})
+                return True
+            return False
+
+        def _bearbeite(self):
+            self._phase = 'anfrage'
+            self._antwort_begonnen = False
+            try:
+                if self.path.startswith('/_wb/') and self._wb():
+                    return
+                self._weiter()
+            except Exception as exc:
+                if isinstance(exc, UngueltigeAnfrage):
+                    proxy.z.plus('anfrage_ungueltig')
+                    code, text = 400, 'ungueltige Anfragekoerper-Laenge'
+                elif self._phase == 'upstream_lesen' and isinstance(exc, (http.client.HTTPException, OSError)):
+                    proxy.z.plus('upstream_stream_fehler')
+                    proxy.z.plus('upstream_stream_fehler_' + fehlerklasse(exc))
+                    code, text = 502, 'Anbieterantwort abgebrochen'
+                elif isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+                    proxy.z.plus('client_abbruch')
+                    proxy.z.plus('client_abbruch_' + fehlerklasse(exc))
+                    code, text = None, None
+                else:
+                    proxy.z.plus('fehler_intern')
+                    proxy.z.plus('fehler_intern_' + fehlerklasse(exc))
+                    code, text = 500, 'interner Fehler im Geheimnisfilter'
+                try:
+                    # Nach begonnenem Rueckweg niemals eine zweite HTTP-Antwort senden.
+                    if code is not None and not self._antwort_begonnen:
+                        self._antwort(code, text)
+                except Exception:
+                    pass
+                self.close_connection = True
+            finally:
+                proxy.bestand.speichern(proxy.z)
+
+        do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = \
+            lambda self: self._bearbeite()
+
+        def _koerper(self):
+            if 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower():
+                teile = []
+                while True:
+                    zeile = self.rfile.readline()
+                    try:
+                        n = int(zeile.split(b';')[0].strip(), 16)
+                        if n < 0:
+                            raise ValueError()
+                    except ValueError:
+                        raise UngueltigeAnfrage() from None
+                    if n == 0:
+                        while self.rfile.readline() not in (b'\r\n', b'\n', b''):
+                            pass
+                        break
+                    teile.append(self.rfile.read(n))
+                    self.rfile.readline()
+                return b''.join(teile)
+            try:
+                n = int(self.headers.get('Content-Length') or 0)
+                if n < 0:
+                    raise ValueError()
+            except ValueError:
+                raise UngueltigeAnfrage() from None
+            return self.rfile.read(n) if n else b''
+
+        def _weiter(self):
+            z = proxy.z
+            z.plus('anfragen')
+            t0 = time.monotonic()
+            if (self.headers.get('Upgrade') or '').lower() == 'websocket':
+                z.plus('websocket_abgelehnt')
+                self._antwort(426, 'WebSocket wird vom Geheimnisfilter nicht gefiltert; bitte HTTP')
+                return
+            teile = self.path.split('/', 2)
+            name = teile[1] if len(teile) > 1 else ''
+            ziel = proxy.routen.get(name)
+            if not ziel:
+                z.plus('route_unbekannt')
+                self._antwort(404, 'unbekannte Route')
+                return
+            rest = '/' + (teile[2] if len(teile) > 2 else '')
+            u = urlsplit(ziel)
+            pfad = (u.path.rstrip('/') + rest) if u.path else rest
+            body = self._koerper()
+            kodierung = self.headers.get('Content-Encoding')
+            self._klasse = groessenklasse(len(body))
+            beob = proxy.beobachtet()
+            if body and not self._ohne_filter():
+                try:
+                    roh = dekomprimiere(body, kodierung)
+                except Exception:
+                    z.plus('abgewiesen_kodierung')
+                    self._antwort(502, 'Anfragekoerper nicht pruefbar (Kodierung); fail-closed')
+                    return
+                self._klasse = groessenklasse(len(roh))
+                if beob and beob in roh:
+                    z.plus('sonde_vor_filter')
+                neu = self._filtern(roh)
+                if neu is None:
+                    return
+                if neu is not roh or kodierung:
+                    body, kodierung = neu, None
+                else:
+                    body = neu
+            if beob and beob in body:
+                z.plus('hinweg_wert')
+            z.zeit('filter_hinweg', time.monotonic() - t0)
+            z.latenz_plus(self._klasse, 'filter', time.monotonic() - t0)
+            kopf = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP
+                    and k.lower() != 'content-encoding'}
+            if kodierung:
+                kopf['Content-Encoding'] = kodierung
+            kopf['Host'] = u.netloc
+            kopf['Accept-Encoding'] = 'identity'
+            kopf['Content-Length'] = str(len(body))
+            senden = body if body or self.command in ('POST', 'PUT', 'PATCH') else None
+            r = None
+            for versuch in (0, 1):
+                c = self._verbindung(u, neu=versuch > 0)
+                wiederverwendet = getattr(c, '_wb_benutzt', False)
+                c._wb_benutzt = True
+                try:
+                    if c.sock is None:
+                        self._verbinde_dns(c)
+                    c.request(self.command, pfad, body=senden, headers=kopf)
+                    r = c.getresponse()
+                    break
+                except Exception as exc:
+                    ursache = fehlerklasse(exc)
+                    z.plus('upstream_versuch_' + ursache)
+                    c.close()
+                    self._ups.pop((u.scheme, u.netloc), None)
+                    if not wiederverwendet:
+                        break
+                    # Bestehende Keepalive-Erholung: genau ein frischer Versuch,
+                    # wenn die wiederverwendete Verbindung still geschlossen war.
+                    # Dessen DNS darf vor dem Versand separat wiederholt werden.
+            if r is None:
+                z.plus('upstream_fehler')
+                z.plus('upstream_fehler_' + ursache)
+                self._antwort(502, 'Anbieter nicht erreichbar')
+                return
+            z.zeit('bis_erstes_byte', time.monotonic() - t0)
+            z.latenz_plus(self._klasse, 'erstes_byte', time.monotonic() - t0)
+            self._lesezeit = 0.0
+            t1 = time.monotonic()
+            try:
+                self._rueckweg(r)
+                z.latenz_plus(self._klasse, 'rueckweg', max(0.0, time.monotonic() - t1 - self._lesezeit))
+            finally:
+                if r.will_close or not r.isclosed():
+                    c.close()
+                    self._ups.pop((u.scheme, u.netloc), None)
+
+        def _verbinde_dns(self, c):
+            """Nur den Resolver wiederholen, vor TCP/TLS und HTTP-Versand.
+            Clients mit kuerzerem Zeitlimit als 90 s koennen vorher abbrechen;
+            keine ungefilterten Zwischenantworten. Ein blockierender Systemresolver
+            darf im Daemon-Thread auslaufen, sein Ergebnis wird danach verworfen.
+            """
+            ende = time.monotonic() + proxy.dns_frist
+
+            def aufloesen(host, port):
+                fertig = threading.Event()
+                ergebnis = []
+                def resolver():
+                    try:
+                        ergebnis.append(socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM))
+                    except Exception as exc:
+                        ergebnis.append(exc)
+                    finally:
+                        fertig.set()
+                threading.Thread(target=resolver, daemon=True, name='wb-filter-dns').start()
+                if not fertig.wait(max(0.0, ende - time.monotonic())):
+                    raise socket.gaierror(socket.EAI_AGAIN, 'DNS-Frist abgelaufen')
+                if isinstance(ergebnis[0], Exception):
+                    raise ergebnis[0]
+                return ergebnis[0]
+
+            def verbinden(address, timeout, source_address=None):
+                abstand = 0.25
+                while True:
+                    try:
+                        adressen = aufloesen(*address)
+                        break
+                    except socket.gaierror:
+                        rest = ende - time.monotonic()
+                        if rest <= abstand:
+                            if rest > 0:
+                                time.sleep(rest)
+                            proxy.z.plus('dns_aufgegeben')
+                            raise
+                        proxy.z.plus('upstream_versuch_dns')
+                        time.sleep(abstand)
+                        if time.monotonic() >= ende:
+                            proxy.z.plus('dns_aufgegeben')
+                            raise
+                        proxy.z.plus('dns_wiederholt')
+                        abstand = min(abstand * 2, 8.0)
+                # Wie socket.create_connection: IPv4/IPv6-Adressen probieren, aber
+                # niemals erneut aufloesen oder einen TCP/TLS-Fehler wiederholen.
+                letzter = OSError('Keine Zieladresse')
+                for af, typ, proto, _name, ziel in adressen:
+                    sk = None
+                    try:
+                        sk = socket.socket(af, typ, proto)
+                        sk.settimeout(timeout)
+                        if source_address:
+                            sk.bind(source_address)
+                        sk.connect(ziel)
+                        return sk
+                    except OSError as exc:
+                        letzter = exc
+                        if sk is not None:
+                            sk.close()
+                raise letzter
+
+            c._create_connection = verbinden
+            c.connect()
+
+        def _verbindung(self, u, neu=False):
+            """Upstream-Verbindung je Downstream-Verbindung wiederverwenden: spart je Zug
+            den TLS-Handshake zum Anbieter."""
+            if not hasattr(self, '_ups'):
+                self._ups = {}
+            schl = (u.scheme, u.netloc)
+            c = None if neu else self._ups.get(schl)
+            if c is None:
+                if u.scheme == 'https':
+                    c = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=600, context=proxy.ctx)
+                else:
+                    c = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=600)
+                self._ups[schl] = c
+            else:
+                proxy.z.plus('upstream_wiederverwendet')
+            return c
+
+        def finish(self):
+            for c in getattr(self, '_ups', {}).values():
+                c.close()
+            super().finish()
+
+        def _filtern(self, roh):
+            z = proxy.z
+            try:
+                obj = json.loads(roh)
+            except Exception:
+                obj = None
+            if obj is not None:
+                sammle_json(obj, proxy.tabelle, z=z)
+                obj, geaendert = ersetze_json(obj, proxy.tabelle, z, muster=False)
+                if not geaendert:
+                    return roh
+                z.plus('anfragen_gefiltert')
+                return json.dumps(obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+            try:
+                text = roh.decode('utf-8')
+            except UnicodeDecodeError:
+                # Binaer: Muster laufen ueber die lesbare Form; ein Fund laesst sich nicht
+                # sicher ersetzen -> abweisen statt durchlassen.
+                text = roh.decode('utf-8', errors='replace')
+                if geheimnisse_in(text, proxy.tabelle):
+                    z.plus('abgewiesen_binaer')
+                    self._antwort(502, 'Geheimnis in nicht ersetzbarem Anfragekoerper; fail-closed')
+                    return None
+                return roh
+            neu = ersetze_text(text, proxy.tabelle, z)
+            if neu == text:
+                return roh
+            z.plus('anfragen_gefiltert')
+            return neu.encode('utf-8')
+
+        def _rueckweg(self, r):
+            z = proxy.z
+            art = (r.getheader('Content-Type') or '').lower()
+            kodiert = (r.getheader('Content-Encoding') or '').lower() not in ('', 'identity')
+            if not art and not kodiert and self.command != 'HEAD':
+                # chatgpt.com/backend-api/codex (ChatGPT-Abo) liefert den SSE-Strom ohne
+                # Content-Type (gemessen 2026-10-10): am Anfang des Koerpers erkennen.
+                try:
+                    kopf = r.peek(64)[:64].lstrip()
+                except Exception:
+                    kopf = b''
+                if kopf.startswith((b'event:', b'data:', b':')):
+                    art = 'text/event-stream'
+                    z.plus('antwort_sse_erkannt')
+            strom = 'text/event-stream' in art or 'ndjson' in art
+            self._antwort_begonnen = True
+            self.send_response(r.status, r.reason)
+            for k, v in r.getheaders():
+                kl = k.lower()
+                if kl in HOP_BY_HOP or kl == 'content-length':
+                    continue
+                if kl == 'content-encoding' and not self._ohne_filter() and not kodiert:
+                    continue
+                self.send_header(k, v)
+            if self.command == 'HEAD' or r.status in (204, 304):
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            if self._ohne_filter() or kodiert or not (strom or 'json' in art):
+                if kodiert and not self._ohne_filter():
+                    z.plus('antwort_kodiert_unaufgeloest')
+                self._roh_streamen(r)
+                return
+            if strom:
+                self.send_header('Transfer-Encoding', 'chunked')
+                self.end_headers()
+                if 'ndjson' in art:
+                    self._ndjson(r)
+                else:
+                    self._sse(r)
+                self._chunk(b'')
+                return
+            daten = self._lies(r)
+            try:
+                obj = loese_json_auf(json.loads(daten), proxy.tabelle, z)
+                daten = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+            except Exception:
+                pass
+            beob = proxy.beobachtet()
+            if beob and beob in daten:
+                z.plus('rueckweg_wert')
+            self.send_header('Content-Length', str(len(daten)))
+            self.end_headers()
+            self.wfile.write(daten)
+
+        def _chunk(self, b):
+            beob = proxy.beobachte
+            if beob and b and beob in b:
+                proxy.z.plus('rueckweg_wert')
+            self.wfile.write(b'%x\r\n%s\r\n' % (len(b), b))
+            self.wfile.flush()
+
+        def _lies(self, r, n=None):
+            """Vom Anbieter lesen; die Wartezeit zaehlt nicht zur Rueckweg-Latenz."""
+            t = time.monotonic()
+            self._phase = 'upstream_lesen'
+            try:
+                return r.read1(n) if n else r.read()
+            finally:
+                self._lesezeit += time.monotonic() - t
+                if sys.exc_info()[0] is None:
+                    self._phase = 'antwort'
+
+        def _roh_streamen(self, r):
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            while True:
+                b = self._lies(r, 65536)
+                if not b:
+                    break
+                self._chunk(b)
+            self._chunk(b'')
+
+        def _zeilen(self, r):
+            puffer = b''
+            while True:
+                b = self._lies(r, 65536)
+                if not b:
+                    break
+                puffer += b
+                while b'\n' in puffer:
+                    zeile, puffer = puffer.split(b'\n', 1)
+                    yield zeile + b'\n'
+            if puffer:
+                yield puffer
+
+        def _sse(self, r):
+            sa = StromAufloeser(proxy.tabelle, proxy.z)
+            block = []
+
+            def schreibe(ereignisse):
+                aus = []
+                for name, obj in ereignisse:
+                    if name is not None:
+                        aus.append(b'event: ' + name.encode() + b'\n')
+                    aus.append(b'data: ' + json.dumps(obj, ensure_ascii=False).encode('utf-8') + b'\n\n')
+                return b''.join(aus)
+
+            def blockende():
+                name, daten, sonst = None, [], []
+                for z in block:
+                    s = z.rstrip(b'\r\n')
+                    if s.startswith(b'event:'):
+                        name = s[6:].strip().decode('utf-8', 'replace')
+                    elif s.startswith(b'data:'):
+                        daten.append(s[5:][1:] if s[5:6] == b' ' else s[5:])
+                    else:
+                        sonst.append(z)
+                roh = b'\n'.join(daten)
+                obj = None
+                if daten:
+                    try:
+                        obj = json.loads(roh)
+                    except Exception:
+                        obj = None
+                if obj is None or sonst:
+                    # Kein JSON (z. B. "[DONE]") oder Zusatzfelder (id:, retry:):
+                    # offene Reste zuerst, dann das Ereignis unveraendert.
+                    out = schreibe(sa.ende())
+                    self._chunk(out + b''.join(block))
+                    return
+                self._chunk(schreibe(sa.ereignis(obj, name)))
+
+            for zeile in self._zeilen(r):
+                if zeile.strip() == b'':
+                    if block:
+                        blockende()
+                        block = []
+                    continue
+                block.append(zeile)
+            if block:
+                blockende()
+            rest = sa.ende()
+            if rest:
+                self._chunk(schreibe(rest))
+
+        def _ndjson(self, r):
+            sa = StromAufloeser(proxy.tabelle, proxy.z)
+            for zeile in self._zeilen(r):
+                s = zeile.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    self._chunk(zeile)
+                    continue
+                self._chunk(b''.join(json.dumps(o, ensure_ascii=False).encode('utf-8') + b'\n'
+                                     for _n, o in sa.ereignis(obj)))
+            for _n, o in sa.ende():
+                self._chunk(json.dumps(o, ensure_ascii=False).encode('utf-8') + b'\n')
+
+    return H
+
+
+# ---------------------------------------------------------------------------
+# Proxy-Modus (Auftrag wz-proxybau, der Nutzer 13.10.: "remote control soll wieder gehen,
+# aber der filter soll noch gehen"). Claude verweigert Remote Control, sobald
+# ANTHROPIC_BASE_URL auf einen lokalen Port zeigt. Stattdessen laeuft Claude mit
+# HTTPS_PROXY=http://127.0.0.1:8093 und NODE_EXTRA_CA_CERTS=<zustand>/ca.pem (derselbe
+# Port wie die Pfadrouten, mit --connect; abgenommen vom WorkbenchOrchestrator 13.10.):
+#   - CONNECT zu einem Host aus MITM_HOSTS (nur api.anthropic.com) wird mit einem
+#     Blattzertifikat aus der lokalen CA aufgebrochen; die Anfragen darin laufen durch
+#     denselben Handler wie /anthropic/... auf 8093 (gleicher Filter, gleiche Tabelle,
+#     gleiche Zaehler) und gehen per TLS mit voller Zertifikatspruefung weiter;
+#   - CONNECT zu jedem anderen Host ist ein reiner Tunnel ohne Eingriff.
+# Die CA traegt die Namensbeschraenkung permitted DNS:api.anthropic.com: ein Blatt fuer
+# einen anderen Namen lehnt jeder pruefende Client ab, selbst wenn der Schluessel
+# abhanden kommt. Sie liegt nur im Zustandsordner (0700, Schluessel 0600) und kommt nie
+# in einen System-Trust-Store; vertraut wird ihr nur ueber NODE_EXTRA_CA_CERTS.
+
+MITM_HOSTS = {'api.anthropic.com': 'anthropic'}   # Host -> Route (STANDARD_ROUTEN)
+CA_TAGE = 30         # Gueltigkeit einer neuen CA
+CA_ERNEUERN_TAGE = 7     # beim Start erneuern, wenn weniger Rest bleibt
+BLATT_SEK = 3 * 86400    # Gueltigkeit eines Blattzertifikats
+BLATT_ERNEUERN_SEK = 86400   # neues Blatt, wenn weniger Rest bleibt
+TUNNEL_PUFFER = 65536
+TUNNEL_LEERLAUF = 900    # Sekunden ohne Bytes in beide Richtungen, dann schliessen
+# Was im aufgebrochenen Verkehr durch den Filter geht (Messung wz-proxy 13.10.): die
+# Modellanfragen. Alles andere (bootstrap, oauth, event_logging, mcp_servers, der lange
+# Remote-Control-Strom .../worker/events/stream) wird unveraendert durchgereicht.
+FILTER_PFADE = re.compile(r'^/v1/messages(/count_tokens)?/?$')
+# Remote-Control-Spiegel des Sitzungsprotokolls (POST/PUT/PATCH/DELETE unter /v1/code/sessions/,
+# u. a. .../worker/events, .../worker): Vorgabe filtern -- der Nutzer 13.10. 21:09Z,
+# Fragefunktion: "Platzhalter auf dem Handy". Das Handy (claude.ai) zeigt Platzhalter;
+# einen Rueckweg (Aufloesen) gibt es fuer den Spiegel nicht. Schalter --rc-spiegel
+# durchreichen schaltet das ab.
+# Ueberholt (nicht mehr gueltig): Vorgabe durchreichen -- der Nutzer 13.10. frueher:
+# "Handy wie Maschine", d. h. das Handy zeigt dasselbe wie das Terminal, der Filter wirkt
+# nur auf das, was das Modell bekommt. Durch die Antwort 21:09Z korrigiert.
+RC_PFADE = re.compile(r'^/v1/code/sessions/')
+# Im Spiegel ist nur Signiertes undurchsichtig; 'data' und 'thinking' sind dort Anzeige
+# (Werkzeugausgaben, Denktext) und werden gefiltert.
+RC_UNDURCHSICHTIG = {'signature', 'encrypted_content'}
+DURCH_ZEITLIMIT = 3600   # durchgereichte lange Stroeme (worker/events/stream) halten
+
+
+def _openssl():
+    for p in (os.environ.get('WB_GF_OPENSSL'), '/opt/homebrew/bin/openssl', shutil.which('openssl'),
+              '/usr/bin/openssl'):
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    raise SystemExit('wb-geheimnis-filter: openssl fehlt (fuer die lokale CA des Proxy-Modus)')
+
+
+def _ossl(*args):
+    p = subprocess.run((_openssl(),) + args, capture_output=True, text=True)
+    if p.returncode != 0:
+        # Nur die letzte Zeile: openssl gibt keine Schluesselinhalte aus, aber kurz halten.
+        raise RuntimeError('openssl %s: %s' % (args[0], (p.stderr.strip().splitlines() or ['?'])[-1]))
+    return p.stdout
+
+
+def _rest_sek(pem):
+    """Restlaufzeit eines Zertifikats in Sekunden (negativ: abgelaufen)."""
+    aus = _ossl('x509', '-in', pem, '-noout', '-enddate').strip()
+    return ssl.cert_time_to_seconds(aus.split('=', 1)[1]) - time.time()
+
+
+def _privat_schreiben_vorbereiten(ordner):
+    os.makedirs(ordner, mode=0o700, exist_ok=True)
+    os.chmod(ordner, 0o700)
+
+
+def _ca_erzeugen(ordner, name, tage, hosts):
+    """Neue CA ordner/<name>.key (0600) und <name>.pem mit Namensbeschraenkung."""
+    key, pem, cnf = (os.path.join(ordner, name + e) for e in ('.key', '.pem', '.cnf'))
+    with open(cnf, 'w') as f:
+        f.write('[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=ext\n'
+                '[dn]\nCN=wb-geheimnis-filter lokale CA %s\nO=Werkbank (nur lokal)\n'
+                '[ext]\nbasicConstraints=critical,CA:TRUE,pathlen:0\n'
+                'keyUsage=critical,keyCertSign,cRLSign\n'
+                'subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n'
+                'nameConstraints=critical,%s\n'
+                % (time.strftime('%Y-%m-%d'), ','.join('permitted;DNS:' + h for h in sorted(hosts))))
+    alt = os.umask(0o077)
+    try:
+        _ossl('ecparam', '-name', 'prime256v1', '-genkey', '-noout', '-out', key + '.neu')
+        os.chmod(key + '.neu', 0o600)
+        _ossl('req', '-new', '-x509', '-key', key + '.neu', '-days', str(tage), '-sha256',
+              '-config', cnf, '-out', pem + '.neu')
+    finally:
+        os.umask(alt)
+        os.unlink(cnf)
+    os.chmod(pem + '.neu', 0o644)
+    os.replace(key + '.neu', key)
+    os.replace(pem + '.neu', pem)
+
+
+def ca_sicherstellen(ordner, tage=CA_TAGE, erneuern_tage=CA_ERNEUERN_TAGE, hosts=None):
+    """CA anlegen oder erneuern; -> Pfad des Buendels ca.pem fuer NODE_EXTRA_CA_CERTS.
+
+    Bei Erneuerung wird die bisherige CA zu ca-alt.*: Claude liest NODE_EXTRA_CA_CERTS nur
+    beim Start, laufende Sitzungen kennen also nur die alte CA. Darum signiert der Proxy
+    weiter mit der alten, solange sie ein ganzes Blatt ueberdauert (blatt_signierer), und
+    ca.pem enthaelt beide (Buendel). Danach faellt ca-alt weg."""
+    hosts = set(hosts or MITM_HOSTS)
+    _privat_schreiben_vorbereiten(ordner)
+    neu = os.path.join(ordner, 'ca-neu.pem')
+    alt = os.path.join(ordner, 'ca-alt.pem')
+    if not (os.path.isfile(neu) and os.path.isfile(neu[:-4] + '.key')) or _rest_sek(neu) < erneuern_tage * 86400:
+        if os.path.isfile(neu) and os.path.isfile(neu[:-4] + '.key') and _rest_sek(neu) > 0:
+            os.replace(neu[:-4] + '.key', alt[:-4] + '.key')
+            os.replace(neu, alt)
+        _ca_erzeugen(ordner, 'ca-neu', tage, hosts)
+    if os.path.isfile(alt) and _rest_sek(alt) <= 0:
+        for p in (alt, alt[:-4] + '.key'):
+            os.unlink(p)
+    for p in (neu[:-4] + '.key', alt[:-4] + '.key'):
+        if os.path.exists(p):
+            os.chmod(p, 0o600)
+    buendel = os.path.join(ordner, 'ca.pem')
+    teile = [open(p).read() for p in (neu, alt) if os.path.isfile(p)]
+    with open(buendel + '.neu', 'w') as f:
+        f.write(''.join(teile))
+    os.chmod(buendel + '.neu', 0o644)
+    os.replace(buendel + '.neu', buendel)
+    return buendel
+
+
+def blatt_signierer(ordner):
+    """Die CA, mit der Blaetter entstehen: die alte, solange sie ein Blatt ueberdauert."""
+    alt = os.path.join(ordner, 'ca-alt.pem')
+    if os.path.isfile(alt) and _rest_sek(alt) > BLATT_SEK + 3600:
+        return alt
+    return os.path.join(ordner, 'ca-neu.pem')
+
+
+class Blaetter:
+    """Kurzlebige Blattzertifikate je MITM-Host, als Server-SSLContext zwischengespeichert."""
+
+    def __init__(self, ordner, sek=BLATT_SEK, hosts=None):
+        self.ordner = ordner
+        self.sek = sek
+        self.hosts = hosts
+        self._l = threading.Lock()
+        self._ctx = {}   # host -> (ablauf, ctx)
+
+    def ctx(self, host):
+        with self._l:
+            ablauf, ctx = self._ctx.get(host, (0, None))
+            if ctx is None or ablauf - time.time() < BLATT_ERNEUERN_SEK:
+                ablauf, ctx = self._erzeugen(host)
+                self._ctx[host] = (ablauf, ctx)
+            return ctx
+
+    def _erzeugen(self, host):
+        # Der Dienst laeuft unter launchd/systemd beliebig lange: CA-Erneuerung auch hier,
+        # nicht nur beim Start (sonst ueberlebte ein Blatt seine CA).
+        ca_sicherstellen(self.ordner, hosts=self.hosts)
+        ca = blatt_signierer(self.ordner)
+        d = os.path.join(self.ordner, 'blatt')
+        _privat_schreiben_vorbereiten(d)
+        key, csr, pem, cnf = (os.path.join(d, host + e) for e in ('.key', '.csr', '.pem', '.cnf'))
+        with open(cnf, 'w') as f:
+            f.write('[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=%s\n'
+                    '[ext]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n'
+                    'extendedKeyUsage=serverAuth\nsubjectAltName=DNS:%s\n'
+                    'subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n' % (host, host))
+        alt = os.umask(0o077)
+        try:
+            _ossl('ecparam', '-name', 'prime256v1', '-genkey', '-noout', '-out', key)
+            _ossl('req', '-new', '-key', key, '-config', cnf, '-out', csr)
+            tage = max(1, int(self.sek // 86400))
+            _ossl('x509', '-req', '-in', csr, '-CA', ca, '-CAkey', ca[:-4] + '.key', '-set_serial',
+                  str(int.from_bytes(os.urandom(8), 'big')), '-days', str(tage), '-sha256',
+                  '-extfile', cnf, '-extensions', 'ext', '-out', pem)
+            with open(pem, 'a') as f:   # Kette: Blatt + signierende CA
+                f.write(open(ca).read())
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.set_alpn_protocols(['http/1.1'])
+            ctx.load_cert_chain(pem, key)
+        finally:
+            os.umask(alt)
+            for p in (csr, cnf):
+                if os.path.exists(p):
+                    os.unlink(p)
+        return time.time() + _rest_sek(pem), ctx
+
+
+def _pumpe(a, b, z):
+    """Bytes in beide Richtungen unveraendert weiterreichen, bis eine Seite schliesst."""
+    # selectors (kqueue/epoll) statt select.select: Deskriptoren ueber 1024 (viele parallele
+    # Tunnel aus Bash-Aufrufen) sprengen FD_SETSIZE nicht.
+    for s in (a, b):
+        s.setblocking(True)
+    sel = selectors.DefaultSelector()
+    try:
+        sel.register(a, selectors.EVENT_READ, b)
+        sel.register(b, selectors.EVENT_READ, a)
+        while True:
+            bereit = sel.select(TUNNEL_LEERLAUF)
+            if not bereit:
+                z.plus('tunnel_leerlauf')
+                return
+            for schluessel, _ in bereit:
+                daten = schluessel.fileobj.recv(TUNNEL_PUFFER)
+                if not daten:
+                    return
+                schluessel.data.sendall(daten)
+    except OSError as exc:
+        z.plus('tunnel_abbruch_' + fehlerklasse(exc))
+    finally:
+        sel.close()
+
+
+def _struktur(obj, tiefe=0):
+    """JSON-Geruest ohne Werte: Schluessel und Typen. Schluessel, die wie Daten aussehen
+    (lang oder kein Bezeichner), werden zu <schluessel>."""
+    if tiefe > 12:
+        return '...'
+    if isinstance(obj, dict):
+        aus = {}
+        for k, v in obj.items():
+            name = k if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,39}', k) else '<schluessel>'
+            aus[name] = _struktur(v, tiefe + 1)
+        return aus
+    if isinstance(obj, list):
+        teile = []
+        for v in obj[:50]:
+            st = _struktur(v, tiefe + 1)
+            if st not in teile:
+                teile.append(st)
+        return teile
+    return type(obj).__name__
+
+
+class StrukturProtokoll:
+    """Messhilfe fuer den Remote-Control-Spiegel: je Pfadmuster und Geruest eine Zeile
+    (JSON) in einer 0600-Datei, nie Werte. Nur mit --struktur-datei."""
+
+    def __init__(self, pfad):
+        self.pfad = pfad
+        self._l = threading.Lock()
+        self._gesehen = set()
+
+    def notiere(self, methode, pfad, roh):
+        try:
+            obj = json.loads(roh)
+        except Exception:
+            obj = None
+        muster = re.sub(r'/sessions/[^/]+', '/sessions/*', pfad.split('?', 1)[0])
+        muster = re.sub(r'/[0-9a-fA-F-]{16,}(?=/|$)', '/*', muster)
+        zeile = json.dumps({'methode': methode, 'pfad': muster,
+                            'struktur': _struktur(obj) if obj is not None else 'kein JSON'}, sort_keys=True)
+        with self._l:
+            if zeile in self._gesehen:
+                return
+            self._gesehen.add(zeile)
+            fd = os.open(self.pfad, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, zeile.encode() + b'\n')
+            finally:
+                os.close(fd)
+
+
+def baue_proxy_handler(proxy, blaetter, mitm=None, rc_spiegel=True, struktur=None):
+    """Handler des Filterports mit CONNECT: Pfadrouten wie baue_handler, dazu HTTPS_PROXY."""
+    mitm = dict(MITM_HOSTS if mitm is None else mitm)
+    H = baue_handler(proxy)
+
+    class Aufgebrochen(H):
+        """Anfragen im aufgebrochenen Tunnel: Pfad bekommt das Routenpraefix, alles
+        weitere (Filter, Rueckweg, SSE, Keep-Alive) ist der Handler von 8093. Gefiltert
+        werden nur FILTER_PFADE und (Schalter) der Remote-Control-Spiegel; der Rest geht
+        unveraendert durch."""
+        route = None
+
+        def _bearbeite(self):
+            if not self.path.startswith('/'):
+                self._antwort(400, 'absolute Ziel-URL im Tunnel nicht erlaubt')
+                self.close_connection = True
+                return
+            pfad = self.path.split('?', 1)[0]
+            rc = RC_PFADE.match(pfad) and self.command in ('POST', 'PUT', 'PATCH', 'DELETE')
+            self._durch = not (FILTER_PFADE.match(pfad) or (rc and rc_spiegel))
+            proxy.z.plus('mitm_durchgereicht' if self._durch else 'mitm_gefiltert')
+            self._rc = bool(rc)
+            self.path = '/' + self.route + self.path
+            super()._bearbeite()
+
+        def do_CONNECT(self):   # kein CONNECT im aufgebrochenen Tunnel
+            self._antwort(400, 'CONNECT im Tunnel nicht erlaubt')
+            self.close_connection = True
+
+        def _filtern(self, roh):
+            if not self._rc:
+                return super()._filtern(roh)
+            if struktur is not None:
+                struktur.notiere(self.command, self.path, roh)
+            z = proxy.z
+            z.plus('rc_spiegel_gefiltert')
+            try:
+                obj = json.loads(roh)
+            except Exception:
+                obj = None
+            if obj is None:
+                neu = super()._filtern(roh)
+            else:
+                # Gleiches Geruest, nur Zeichenketten-Werte ersetzt; Content-Length setzt
+                # _weiter neu.
+                sammle_json(obj, proxy.tabelle, z=z, opak=RC_UNDURCHSICHTIG)
+                obj, geaendert = ersetze_json(obj, proxy.tabelle, z, muster=False, opak=RC_UNDURCHSICHTIG)
+                neu = json.dumps(obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8') if geaendert else roh
+            if neu is not None and neu is not roh:
+                z.plus('rc_spiegel_ersetzt')
+            return neu
+
+        def _verbindung(self, u, neu=False):
+            c = super()._verbindung(u, neu)
+            c.timeout = DURCH_ZEITLIMIT if self._durch else 600
+            if c.sock is not None:
+                c.sock.settimeout(c.timeout)
+            return c
+
+        def _wb(self):   # eigene Seiten nie ueber den Anbieter-Hostnamen
+            return False
+
+    class P(H):
+        def do_CONNECT(self):
+            self.close_connection = True
+            ziel = self.path
+            host, _, port = ziel.rpartition(':')
+            host = host.strip('[]').lower()
+            try:
+                port = int(port)
+            except ValueError:
+                self._antwort(400, 'CONNECT host:port erwartet')
+                return
+            if not host or not 0 < port < 65536:
+                self._antwort(400, 'CONNECT host:port erwartet')
+                return
+            if host in mitm and port == 443:
+                self._aufbrechen(host)
+            else:
+                self._tunnel(host, port)
+
+        def _tunnel(self, host, port):
+            proxy.z.plus('tunnel')
+            try:
+                # Gleiche DNS-Wiederholung wie der Filterweg (Messung wz-proxy: gaierror
+                # beim Telemetrie-CONNECT); TCP-Fehler werden nicht wiederholt.
+                c = http.client.HTTPConnection(host, port, timeout=30)
+                self._verbinde_dns(c)
+                oben = c.sock
+            except OSError as exc:
+                proxy.z.plus('tunnel_fehler_' + fehlerklasse(exc))
+                self._antwort(502, 'Ziel nicht erreichbar')
+                return
+            try:
+                self.send_response(200, 'Connection Established')
+                self.end_headers()
+                self.wfile.flush()
+                oben.settimeout(None)
+                _pumpe(self.connection, oben, proxy.z)
+            finally:
+                oben.close()
+
+        def _aufbrechen(self, host):
+            proxy.z.plus('mitm')
+            try:
+                ctx = blaetter.ctx(host)
+            except Exception as exc:
+                proxy.z.plus('mitm_blatt_fehler_' + fehlerklasse(exc))
+                self._antwort(502, 'Blattzertifikat nicht erzeugbar; fail-closed')
+                return
+            self.send_response(200, 'Connection Established')
+            self.end_headers()
+            self.wfile.flush()
+            try:
+                tls = ctx.wrap_socket(self.connection, server_side=True)
+            except (ssl.SSLError, OSError) as exc:
+                # Typisch: Client vertraut der CA nicht (NODE_EXTRA_CA_CERTS fehlt).
+                proxy.z.plus('mitm_handshake_fehler')
+                proxy.z.plus('mitm_handshake_fehler_' + fehlerklasse(exc))
+                return
+            Innen = type('Innen', (Aufgebrochen,), {'route': mitm[host]})
+            try:
+                Innen(tls, self.client_address, self.server)
+            finally:
+                try:
+                    tls.close()
+                except OSError:
+                    pass
+
+    return P
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = False
+    # Vorgabe von socketserver ist 5: unter vielen gleichzeitigen CONNECTs (Bash-Aufrufe mit
+    # geerbtem HTTPS_PROXY) liefen Verbindungen in Zeitlimits (Lasttest wz-proxybau 13.10.).
+    # Gilt fuer selbst gebundene Sockets; launchd/systemd setzen den Backlog ihres Sockets.
+    request_queue_size = 1024
+
+    def __init__(self, adresse, handler, sock=None):
+        if sock is None:
+            super().__init__(adresse, handler)
+            return
+        # Socket-Aktivierung: launchd bzw. systemd haelt den Lauschsocket; er wird
+        # uebernommen, nicht neu gebunden.
+        super().__init__(adresse, handler, bind_and_activate=False)
+        self.socket.close()
+        self.socket = sock
+        self.server_address = sock.getsockname()[:2]
+        self.server_name, self.server_port = self.server_address
+
+    def handle_error(self, request, client_address):
+        """socketserver druckt sonst jede Ausnahme samt Traceback auf stderr (launchd-Log);
+        gemessen waren es nur Verbindungsabbrueche, aber ein Ausnahmetext koennte Inhalt
+        tragen. Nur zaehlen, nichts ausgeben."""
+        z = getattr(self, 'zaehler', None)
+        if z is not None:
+            z.plus('verbindungsfehler')
+            z.plus('verbindungsfehler_' + fehlerklasse(sys.exc_info()[1]))
+
+
+LAUNCHD_SOCKETNAME = 'filter'
+
+
+def launchd_sockets(name):
+    """Von launchd gehaltene Deskriptoren fuer <name> (launch_activate_socket(3), wie in
+    wb-modell-proxy). Rueckgabewert ungleich 0 ist die errno (ESRCH: nicht von launchd
+    gestartet, ENOENT: Name fehlt im Sockets-Dict der plist)."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    fn = libc.launch_activate_socket
+    fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),
+                   ctypes.POINTER(ctypes.c_size_t)]
+    fn.restype = ctypes.c_int
+    libc.free.argtypes = [ctypes.c_void_p]
+    libc.free.restype = None
+    vektor = ctypes.POINTER(ctypes.c_int)()
+    anzahl = ctypes.c_size_t(0)
+    rc = fn(name.encode('utf-8'), ctypes.byref(vektor), ctypes.byref(anzahl))
+    if rc != 0:
+        raise OSError(rc, "launch_activate_socket('%s'): %s" % (name, os.strerror(rc)))
+    fds = [vektor[i] for i in range(anzahl.value)]
+    libc.free(vektor)
+    return fds
+
+
+def aktivierter_socket():
+    """Den von systemd (LISTEN_FDS, ab fd 3) oder launchd uebergebenen Lauschsocket holen.
+    Nur Loopback wird angenommen: ein falsch eingerichteter Socket auf einer anderen Adresse
+    beendet den Dienst, statt Anfragen von aussen zu filtern und weiterzuleiten."""
+    fds = []
+    if os.environ.get('LISTEN_PID') == str(os.getpid()) and os.environ.get('LISTEN_FDS', '').isdigit():
+        fds = list(range(3, 3 + int(os.environ['LISTEN_FDS'])))
+    elif sys.platform == 'darwin':
+        try:
+            fds = launchd_sockets(LAUNCHD_SOCKETNAME)
+        except OSError as e:
+            sys.exit('wb-geheimnis-filter: --aktiviert, aber kein Socket von launchd (%s)' % e)
+    if not fds:
+        sys.exit('wb-geheimnis-filter: --aktiviert, aber weder systemd noch launchd uebergab einen Socket')
+    socks = [socket.socket(fileno=fd) for fd in fds]
+    for sk in socks[1:]:
+        sk.close()
+    sk = socks[0]
+    if sk.getsockname()[0] != '127.0.0.1':
+        sys.exit('wb-geheimnis-filter: uebergebener Socket liegt nicht auf 127.0.0.1 -- Abbruch')
+    # Unter macOS erben angenommene Verbindungen O_NONBLOCK vom Lauschsocket.
+    sk.setblocking(True)
+    return sk
+
+
+def _fd_grenze_anheben(ziel=8192):
+    """launchd startet mit 256 offenen Dateien; jeder Tunnel braucht zwei. Weiche Grenze
+    bis zur harten anheben (keine Rechte noetig)."""
+    import resource
+    weich, hart = resource.getrlimit(resource.RLIMIT_NOFILE)
+    neu = ziel if hart == resource.RLIM_INFINITY else min(ziel, hart)
+    if weich != resource.RLIM_INFINITY and weich < neu:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (neu, hart))
+        except (ValueError, OSError):
+            pass
+
+
+def befehl_serve(a):
+    routen = dict(STANDARD_ROUTEN)
+    for r in a.route or []:
+        name, _, url = r.partition('=')
+        if not name or not url:
+            sys.exit('wb-geheimnis-filter: --route NAME=URL')
+        routen[name] = url.rstrip('/')
+    beob = os.environ.get(a.beobachte_env) if a.beobachte_env else None
+    zustand = os.path.expanduser(a.zustand) if a.zustand else None
+    mitm = dict(MITM_HOSTS)
+    for r in a.mitm or []:
+        host, _, route = r.partition('=')
+        if not host or route not in routen:
+            sys.exit('wb-geheimnis-filter: --mitm HOST=ROUTE (Route muss existieren)')
+        mitm[host.lower()] = route
+    proxy = Proxy(routen, a.durchreichen, beob, zustand, schluessel_laden(a.schluesselbund), a.dns_frist)
+    if a.upstream_ca:
+        proxy.ctx.load_verify_locations(cafile=a.upstream_ca)   # Tests: lokaler TLS-Stub
+    handler, connect = baue_handler(proxy), False
+    if a.connect:
+        # CA-Fehler (openssl fehlt o. a.) duerfen den Pfadrouten-Betrieb der anderen Harnesses
+        # nicht mitreissen: dann ohne CONNECT weiter (Claude ueber HTTPS_PROXY scheitert,
+        # fail-closed), und die Startzeile sagt es.
+        ca_ordner = os.path.expanduser(a.ca_ordner or zustand or '~/.local/state/wb-geheimnis-filter')
+        try:
+            ca_sicherstellen(ca_ordner, hosts=mitm)   # anlegen bzw. bei < 7 Tagen Rest erneuern
+            handler = baue_proxy_handler(proxy, Blaetter(ca_ordner, hosts=mitm), mitm,
+                                         rc_spiegel=a.rc_spiegel == 'filtern',
+                                         struktur=StrukturProtokoll(a.struktur_datei) if a.struktur_datei else None)
+            connect = True
+        except (Exception, SystemExit) as exc:
+            proxy.z.plus('connect_ohne_ca')
+            sys.stderr.write('wb-geheimnis-filter: CONNECT abgeschaltet, CA nicht bereit (%s)\n' % fehlerklasse(exc))
+        _fd_grenze_anheben()
+    if a.aktiviert:
+        srv = Server(None, handler, sock=aktivierter_socket())
+    elif a.port is None:
+        sys.exit('wb-geheimnis-filter serve: --port P oder --aktiviert')
+    else:
+        srv = Server(('127.0.0.1', a.port), handler)
+    srv.zaehler = proxy.z
+    if a.port_datei:
+        with open(a.port_datei, 'w') as f:
+            f.write('%d\n' % srv.server_address[1])
+    sys.stderr.write('wb-geheimnis-filter: 127.0.0.1:%d%s%s%s\n'
+                     % (srv.server_address[1], ' (durchreichen)' if a.durchreichen else '',
+                        ' (aktiviert)' if a.aktiviert else '', ' (CONNECT)' if connect else ''))
+    sys.stderr.flush()
+
+    def ende(_sig, _frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, ende)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proxy.bestand.speichern(proxy.z, erzwingen=True)
+
+
+def schwaerze(text, extra=None):
+    """Zweite Linie und `mit`: Funde nicht umkehrbar ersetzen."""
+    for name, wert in (extra or {}).items():
+        if wert:
+            text = text.replace(wert, '[GEHEIM:%s]' % name)
+    funde = []
+    for _z, regel, wert, _e in geheimnis_inhalt.treffer(
+            text, True, geheimnis_inhalt.load_public_values(HOOKS_DIR), True):
+        if regel == 'private_key_block':
+            wert = _privater_block(text, text.find(wert)) or wert
+        funde.append((wert, regel))
+    for wert, regel in sorted(funde, key=lambda x: len(x[0]), reverse=True):
+        text = text.replace(wert, '[GEHEIM:%s]' % regel)
+    return text
+
+
+def befehl_filter(_a):
+    sys.stdout.write(schwaerze(sys.stdin.read()))
+
+
+def quelle_lesen(q):
+    art, _, rest = q.partition(':')
+    if art == 'kc':
+        r = subprocess.run(['security', 'find-generic-password', '-s', rest, '-w'],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SystemExit('wb-geheimnis-filter: Schluesselbund-Eintrag nicht gefunden: %s' % rest)
+        return r.stdout.rstrip('\n')
+    if art == 'env':
+        v = os.environ.get(rest)
+        if v is None:
+            raise SystemExit('wb-geheimnis-filter: Umgebungsvariable fehlt: %s' % rest)
+        return v
+    if art == 'datei':
+        with open(os.path.expanduser(rest), encoding='utf-8') as f:
+            return f.read().rstrip('\n')
+    raise SystemExit('wb-geheimnis-filter: Quelle kc:|env:|datei: erwartet')
+
+
+def befehl_mit(argv):
+    if '--' not in argv:
+        sys.exit('wb-geheimnis-filter mit VAR=QUELLE ... -- BEFEHL ARG...')
+    i = argv.index('--')
+    zuweisungen, befehl = argv[:i], argv[i + 1:]
+    if not befehl:
+        sys.exit('wb-geheimnis-filter mit: Befehl fehlt')
+    env = dict(os.environ)
+    werte = {}
+    for zw in zuweisungen:
+        var, _, q = zw.partition('=')
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', var or '') or not q:
+            sys.exit('wb-geheimnis-filter mit: VAR=QUELLE erwartet')
+        werte[var] = env[var] = quelle_lesen(q)
+    p = subprocess.Popen(befehl, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    ausgaben = {p.stdout.fileno(): (p.stdout, sys.stdout), p.stderr.fileno(): (p.stderr, sys.stderr)}
+    puffer = {fd: b'' for fd in ausgaben}
+    offen = set(ausgaben)
+    while offen:
+        bereit, _, _ = select.select(list(offen), [], [])
+        for fd in bereit:
+            b = os.read(fd, 65536)
+            if not b:
+                offen.discard(fd)
+                rest = puffer.pop(fd)
+                if rest:
+                    ausgaben[fd][1].write(schwaerze(rest.decode('utf-8', 'replace'), werte))
+                    ausgaben[fd][1].flush()
+                continue
+            puffer[fd] += b
+            # Nur ganze Zeilen filtern: ein Wert, der ueber zwei Lesungen reicht, bleibt ganz.
+            if b'\n' in puffer[fd]:
+                fertig, _, puffer[fd] = puffer[fd].rpartition(b'\n')
+                ausgaben[fd][1].write(schwaerze(fertig.decode('utf-8', 'replace') + '\n', werte))
+                ausgaben[fd][1].flush()
+    return p.wait()
+
+
+DIENST_PORT = 8093   # Dienstbetrieb (launchd/systemd), siehe wb-geheimnis-filter-dienst
+
+FEHLERZAEHLER = ('upstream_fehler', 'fehler_intern', 'abgewiesen_kodierung', 'abgewiesen_binaer',
+                 'websocket_abgelehnt', 'route_unbekannt', 'platzhalter_unbekannt',
+                 'antwort_kodiert_unaufgeloest', 'zustand_schreibfehler', 'verbindungsfehler')
+
+
+def _lesbar(titel, werte, latenz):
+    zeilen = ['%s' % titel,
+              '  Anfragen %d, gefiltert %d, Ersetzungen %d, Aufloesungen %d'
+              % (werte.get('anfragen', 0), werte.get('anfragen_gefiltert', 0),
+                 werte.get('ersetzt', 0), werte.get('aufgeloest', 0))]
+    fehler = {k: v for k, v in werte.items() if v and
+              (k in FEHLERZAEHLER or k in ('client_abbruch', 'anfrage_ungueltig', 'upstream_stream_fehler',
+                                         'dns_wiederholt', 'dns_aufgegeben') or
+               k.startswith(('upstream_fehler_', 'upstream_versuch_', 'upstream_stream_fehler_',
+                             'fehler_intern_', 'verbindungsfehler_', 'client_abbruch_')))}
+    zeilen.append('  Fehler/Abweisungen: %s' % (', '.join('%s %d' % kv for kv in sorted(fehler.items()))
+                                                if fehler else 'keine'))
+    regeln = {k[len('neu_regel_'):]: v for k, v in werte.items() if k.startswith('neu_regel_')}
+    if regeln:
+        zeilen.append('  neu erkannte Werte je Regel: %s' % ', '.join('%s %d' % kv for kv in sorted(regeln.items())))
+    for klasse in [k for _g, k in GROESSENKLASSEN if k in latenz]:
+        teile = []
+        for art in LATENZARTEN:
+            q = latenz[klasse].get(art)
+            if q and q['n']:
+                teile.append('%s n=%d Median<=%s p90<=%s ms' % (art, q['n'], q['median_ms'], q['p90_ms']))
+        zeilen.append('  %-9s %s' % (klasse, '; '.join(teile)))
+    return '\n'.join(zeilen)
+
+
+def befehl_zaehler(a):
+    c = http.client.HTTPConnection('127.0.0.1', a.port, timeout=10)
+    c.request('GET', '/_wb/zaehler')
+    roh = c.getresponse().read().decode()
+    if not a.lesbar:
+        print(roh)
+        return
+    d = json.loads(roh)
+    print(_lesbar('seit Prozessstart %s:' % d.get('start'), d, d.get('latenz') or {}))
+    if d.get('dauerhaft'):
+        dd = d['dauerhaft']
+        print(_lesbar('seit %s (dauerhaft):' % dd.get('seit'), dd.get('zaehler') or {}, dd.get('latenz') or {}))
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == 'mit':
+        sys.exit(befehl_mit(argv[1:]))
+    ap = argparse.ArgumentParser(prog='wb-geheimnis-filter')
+    sub = ap.add_subparsers(dest='befehl', required=True)
+    s = sub.add_parser('serve')
+    s.add_argument('--port', type=int)
+    s.add_argument('--aktiviert', action='store_true')
+    s.add_argument('--zustand')
+    s.add_argument('--route', action='append')
+    s.add_argument('--durchreichen', action='store_true')
+    s.add_argument('--dns-frist', type=float, default=90.0,
+                   help='DNS-Wiederholungsfrist in Sekunden, 0 bis 90 (Tests: verkuerzen)')
+    s.add_argument('--beobachte-env')
+    s.add_argument('--port-datei')
+    s.add_argument('--schluesselbund', help='macOS: explizite Keychain-Datei (isolierte Tests)')
+    s.add_argument('--connect', action='store_true',
+                   help='CONNECT annehmen (HTTPS_PROXY-Betrieb fuer Claude, lokale CA)')
+    s.add_argument('--ca-ordner', help='lokale CA (Vorgabe: --zustand bzw. ~/.local/state/wb-geheimnis-filter)')
+    s.add_argument('--upstream-ca', help='zusaetzliche Upstream-CA (nur Tests: lokaler TLS-Stub)')
+    s.add_argument('--mitm', action='append', help='HOST=ROUTE aufbrechen (Vorgabe api.anthropic.com=anthropic)')
+    s.add_argument('--rc-spiegel', choices=('filtern', 'durchreichen'), default='filtern',
+                   help='Remote-Control-Spiegel (POST/PUT/PATCH/DELETE /v1/code/sessions/...) im Proxy-Modus; '
+                        'Vorgabe filtern (der Nutzer 13.10. 21:09Z: "Platzhalter auf dem Handy")')
+    s.add_argument('--struktur-datei', help='Messhilfe: JSON-Geruest (ohne Werte) des RC-Spiegels, Datei 0600')
+    sub.add_parser('filter')
+    ca = sub.add_parser('ca-anlegen', help='lokale CA des Proxy-Modus anlegen/erneuern, Pfad von ca.pem ausgeben')
+    ca.add_argument('--ca-ordner', default='~/.local/state/wb-geheimnis-filter')
+    ca.add_argument('--tage', type=int, default=CA_TAGE)
+    kk = sub.add_parser('schluessel-pruefen', help='Schluessel laden/einmalig anlegen, nie ausgeben')
+    kk.add_argument('--schluesselbund')
+    zz = sub.add_parser('zaehler')
+    zz.add_argument('--port', type=int, default=DIENST_PORT)
+    zz.add_argument('--lesbar', action='store_true')
+    a = ap.parse_args(argv)
+    if a.befehl == 'serve' and not 0 <= a.dns_frist <= 90:
+        ap.error('--dns-frist muss zwischen 0 und 90 Sekunden liegen')
+    if a.befehl == 'ca-anlegen':
+        print(ca_sicherstellen(os.path.expanduser(a.ca_ordner), tage=a.tage))
+    elif a.befehl == 'schluessel-pruefen':
+        schluessel_laden(a.schluesselbund)
+        print('Schluesselbund: HMAC-Eintrag lesbar (256 Bit); kein Wert ausgegeben')
+    else:
+        {'serve': befehl_serve, 'filter': befehl_filter, 'zaehler': befehl_zaehler}[a.befehl](a)
+
+
+if __name__ == '__main__':
+    main()

@@ -167,6 +167,16 @@ def aus_backend(rate_limit: Optional[Mapping[str, Any]], proxy_limit: Optional[M
     at = _zahl((proxy_limit or {}).get("at")) or jetzt
     if retry is not None and retry > 0:
         candidates.append(at + retry)
+    for scope in ("primary", "secondary"):
+        raw_absolute = headers.get("x-codex-%s-reset-at" % scope)
+        absolute = _zahl(raw_absolute) or _iso(raw_absolute)
+        if absolute is not None and absolute > 1e11:  # Unix-Millisekunden
+            absolute /= 1000
+        relative = _zahl(headers.get("x-codex-%s-reset-after-seconds" % scope))
+        if absolute is not None and absolute > jetzt:
+            candidates.append(absolute)
+        elif relative is not None and relative > 0:
+            candidates.append(at + relative)
     kind = (rate_limit or {}).get("rateLimitType") or headers.get("anthropic-ratelimit-unified-representative-claim") or "backend"
     future = [value for value in candidates if value > jetzt]
     return [Sperre("backend", max(future) if future else None, "429 %s" % kind)]

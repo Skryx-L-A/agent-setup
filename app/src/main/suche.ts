@@ -3,7 +3,7 @@
 // eigentliche Arbeit; diese Datei uebersetzt nur die Ausschlussliste in seine
 // Glob-Syntax und raeumt die Ausgabe fuer die Anzeige auf.
 //
-// Dieselbe Auflage wie beim Baum: eine Suche, die in `~/Knowledge/90-secrets/`
+// Dieselbe Auflage wie beim Baum: eine Suche, die in `~/Knowledge/secrets/`
 // oder `~/.ssh/` fuendig wird, hebt die Auflage aus 4c.2 auf. Deshalb bekommt
 // `rg` die Ausschlussliste als eigene `-g`-Argumente, zusaetzlich zur eigenen
 // Pruefung in folder.ts, die dieselbe Konfiguration liest.

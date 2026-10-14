@@ -37,7 +37,7 @@ from . import blocks, config, frontmatter
 from . import topics as topics_mod
 from .contradict import ContradictionStore
 from .linking import cosine
-from .ollama import OllamaError
+from .ollama import OllamaError, OllamaUnavailable
 from .vault import Note, VaultWriter, build_resolver, key_of, read_text
 
 log = logging.getLogger("gardener")
@@ -58,12 +58,34 @@ SYNTH_SYSTEM = (
     "into `text` except the fact itself: no citation, no wikilink, no date "
     "suffix - the source field carries that. State only what a source "
     "literally supports; when in doubt, leave the fact out. Do not repeat the "
-    "same fact twice. Write at most 8 facts, most important first. If two "
+    "same fact twice. Write up to 40 separate, concrete facts, at least two "
+    "per source when supported. Keep dates, numbers and conditions with each "
+    "fact. Do not compress several source facts into a vague summary. If two "
     "sources disagree about the same fact, leave that fact out entirely - it "
     "is reported separately. Never state the CURRENT STATE of a project - no "
     "release version, no progress, no what-is-done-and-what-is-left. That "
     "belongs to the project's own STATUS note and is linked, not repeated."
 )
+SYNTH_SYSTEM_V1 = SYNTH_SYSTEM.replace(
+    "Write up to 40 separate, concrete facts, at least two per source when "
+    "supported. Keep dates, numbers and conditions with each fact. Do not "
+    "compress several source facts into a vague summary.",
+    "Write at most 8 facts, most important first.")
+SYNTH_RETRY_SYSTEM = (
+    SYNTH_SYSTEM + " The previous response was unusable. Return a SMALL, "
+    "complete JSON object with at most 12 facts total. Finish the closing "
+    "braces. Prioritize decisions and setup details from each source."
+)
+
+# Changes to the synthesis contract must invalidate otherwise unchanged pages.
+SYNTH_PROMPT_VERSION = "facts-v2"
+
+
+def eligible_source(note: Note) -> bool:
+    """Only authored knowledge notes can substantiate a derived page."""
+    return (note.fm.get("class") == "knowledge"
+            and note.ntype not in ("session", "asset", "report")
+            and "sessions" not in Path(note.rel).parts)
 
 # Warum ein eigenes Feld statt "beende den Satz mit [[Titel]]" (gemessen 2026-07-29):
 # Die erste Fassung verlangte den Wikilink IM Satz und erlaubte daneben ein
@@ -90,10 +112,18 @@ def _fact_parts(item) -> tuple[str, str]:
 
 
 
+class JudgeUnanswered(Exception):
+    """The judge returned nothing usable for this topic - skip, retry next run."""
+
+
+PLACEHOLDER_FACT = "- (noch keine belastbare Zusammenfassung - siehe Quellnotizen)"
+
+
 @dataclass
 class TopicCandidate:
     name: str
     sources: list[Note]
+    is_cluster: bool = False     # named by topics.suggest_hubs, no hub/project yet
 
 
 @dataclass
@@ -106,6 +136,46 @@ class SynthResult:
     lines_dropped_no_link: int = 0
     lines_dropped_dead_link: int = 0
     lines_dropped_status: int = 0
+    judge_failed: list[str] = field(default_factory=list)
+    skipped_empty_new: list[str] = field(default_factory=list)
+    deadline_left: list[str] = field(default_factory=list)
+    retry_left: list[str] = field(default_factory=list)
+
+
+def recorded_sources(hub: Note, notes: list[Note]) -> list[Note] | None:
+    """Recover the source set written into a generated page.
+
+    A new cluster becomes a hub on the next run. Similarity to the *new page*
+    is a different membership rule from the cluster that created it, so using
+    that hub vector changes every source hash without any authored edit.
+    The page's source list is the stable record of its original membership.
+    Ambiguous or missing titles fail back to ordinary discovery.
+    """
+    if hub.fm.get("class") != "derived" or not hub.fm.get("gardener-sources-hash"):
+        return None
+    _fm, body = frontmatter.parse(hub.text)
+    _before, sep, section = body.partition("\n## Quellnotizen\n")
+    if not sep:
+        return None
+    by_title: dict[str, list[Note]] = {}
+    for note in notes:
+        by_title.setdefault(note.title_key, []).append(note)
+    selected: list[Note] = []
+    for line in section.splitlines():
+        if line.startswith("## "):
+            break
+        if not line.startswith("- [["):
+            continue
+        match = WIKILINK_RE.search(line)
+        if not match:
+            return None
+        matches = by_title.get(key_of(match.group(1)), [])
+        if len(matches) != 1:
+            return None
+        selected.append(matches[0])
+    if not selected or len({n.rel for n in selected}) != len(selected):
+        return None
+    return selected
 
 
 # -- candidate topics ---------------------------------------------------------
@@ -121,6 +191,8 @@ def discover_candidates(vault: Path, notes: list[Note], hubs: list[Note],
     3. Wikilink/embedding clusters inside `10-global/` with no hub yet, reusing
        topics.suggest_hubs (no new clustering mechanism).
     """
+    if config.SYNTH_VERSION != 1:
+        notes = [n for n in notes if eligible_source(n)]
     out: list[TopicCandidate] = []
     taken = topics_mod.existing_branch_names(vault)
 
@@ -131,6 +203,19 @@ def discover_candidates(vault: Path, notes: list[Note], hubs: list[Note],
         sources = [n for n in notes
                    if n.rel in vectors and n.ntype not in ("report", "asset")
                    and cosine(vectors[hub.rel], vectors[n.rel]) >= config.TOPIC_MEMBER_SIM]
+        if config.SYNTH_VERSION != 1:
+            pinned = recorded_sources(hub, notes)
+            if pinned is not None:
+                sources = pinned
+            # Existing derived project pages need their authored branch notes
+            # even when an old hub embedding no longer matches the stricter
+            # source pool. Otherwise the hub reserves the project name with
+            # zero sources and the project fallback below never runs.
+            project = Path(hub.rel).parts[1]
+            branch = f"20-projects/{project}/"
+            by_rel = {n.rel: n for n in sources}
+            by_rel.update((n.rel, n) for n in notes if n.rel.startswith(branch))
+            sources = list(by_rel.values())
         out.append(TopicCandidate(name, sources))
 
     claimed = {c.name for c in out}
@@ -161,7 +246,7 @@ def discover_candidates(vault: Path, notes: list[Note], hubs: list[Note],
             limit=config.SYNTH_MAX_CLUSTER_CANDIDATES, taken=taken):
         if name in claimed:
             continue
-        out.append(TopicCandidate(name, cluster))
+        out.append(TopicCandidate(name, cluster, is_cluster=True))
         claimed.add(name)
 
     return out
@@ -280,21 +365,30 @@ def status_pointer_lines(cand: TopicCandidate) -> list[str]:
 
 def sources_hash(sources: list[Note]) -> str:
     parts = sorted(f"{n.rel}:{n.content_hash}" for n in sources)
+    if config.SYNTH_VERSION != 1:
+        parts.insert(0, SYNTH_PROMPT_VERSION)
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
 # -- the judge call -------------------------------------------------------------
 
 def build_prompt(cand: TopicCandidate) -> str:
-    sources = sorted(cand.sources, key=lambda n: n.rel)[:config.SYNTH_MAX_SOURCES_IN_PROMPT]
+    if config.SYNTH_VERSION == 1:
+        sources = sorted(cand.sources, key=lambda n: n.rel)
+    else:
+        branch = f"20-projects/{cand.name}/"
+        sources = sorted(cand.sources,
+                         key=lambda n: (not n.rel.startswith(branch), n.rel))
+    sources = sources[:config.SYNTH_MAX_SOURCES_IN_PROMPT]
     parts = [f"Topic name: {cand.name}", "Source notes (title, then excerpt):"]
     for n in sources:
-        parts.append(f"### {n.title}\n{n.text[:config.SYNTH_MAX_SOURCE_CHARS]}")
+        limit = 1200 if config.SYNTH_VERSION == 1 else config.SYNTH_MAX_SOURCE_CHARS
+        parts.append(f"### {n.title}\n{n.text[:limit]}")
     parts.append("Write the topic page JSON now.")
     return "\n\n".join(parts)
 
 
-def synthesize(client, cand: TopicCandidate
+def synthesize(client, cand: TopicCandidate, verdict: dict | None = None
                ) -> tuple[str | None, list[str], int, int, int]:
     """(intro_or_None, fact_lines, dropped_no_link, dropped_dead_link,
     dropped_status).
@@ -305,7 +399,18 @@ def synthesize(client, cand: TopicCandidate
     something the model gets to do.
     """
     resolver = build_resolver(cand.sources)
-    verdict = client.judge(SYNTH_SYSTEM, build_prompt(cand))
+    if verdict is None:     # not prefetched by run_synth's batch
+        system = SYNTH_SYSTEM_V1 if config.SYNTH_VERSION == 1 else SYNTH_SYSTEM
+        verdict = client.judge(system, build_prompt(cand))
+    if not verdict and config.SYNTH_VERSION != 1:
+        verdict = client.judge(SYNTH_RETRY_SYSTEM, build_prompt(cand))
+    if not verdict:
+        # The judge did not answer (timeout, truncated, non-JSON): that is no
+        # page, not an empty page. Run of 24.09.2026 wrote eleven pages with
+        # "(noch keine belastbare Zusammenfassung)" this way - `zwei` with 85
+        # source links - and stored their sources hash, so the next run would
+        # have called them "unchanged" forever.
+        raise JudgeUnanswered(cand.name)
 
     def compose(item) -> str:
         """Aus {"text","source"} eine Zeile mit angehaengtem Wikilink bauen.
@@ -381,7 +486,7 @@ def render_body(cand: TopicCandidate, intro: str | None, facts: list[str],
     # zusammen, den keine Quelle deckte. Der Abschnitt sammelt belegte
     # Einzeltatsachen; so heisst er jetzt auch.
     content.append("## Belegte Fakten")
-    content += facts or ["- (noch keine belastbare Zusammenfassung - siehe Quellnotizen)"]
+    content += facts or [PLACEHOLDER_FACT]
     if contra_lines:
         content.append("")
         content.append("## Offene Widersprueche")
@@ -480,7 +585,7 @@ def run_synth(vault: Path, notes: list[Note], hubs: list[Note],
              vectors: dict[str, list[float]], writer: VaultWriter, client,
              contra_store: ContradictionStore, min_sources: int | None = None,
              only_topic: str | None = None,
-             today: dt.datetime | None = None) -> SynthResult:
+             today: dt.datetime | None = None, deadline=None) -> SynthResult:
     min_sources = config.SYNTH_MIN_SOURCES if min_sources is None else min_sources
     today = today or dt.datetime.now()
     result = SynthResult()
@@ -490,8 +595,11 @@ def run_synth(vault: Path, notes: list[Note], hubs: list[Note],
     if only_topic:
         candidates = [c for c in candidates if c.name == only_topic]
 
+    todo: list[tuple] = []
     for cand in candidates:
-        if len(cand.sources) < min_sources:
+        existing_derived = (config.SYNTH_VERSION != 1 and cand.sources
+                            and (vault / "30-topics" / cand.name / "MOC.md").exists())
+        if len(cand.sources) < min_sources and not existing_derived:
             result.skipped_small.append(cand.name)
             continue
 
@@ -525,26 +633,92 @@ def run_synth(vault: Path, notes: list[Note], hubs: list[Note],
                     # docstring rule 3. Report it, never clobber it.
                     result.skipped_hand_edited.append(cand.name)
                     continue
-                if existing_fm.get("gardener-sources-hash") == src_hash:
+                # A page that only carries the placeholder never got its
+                # summary (judge failed back then): same sources, but still
+                # to be done - not "unchanged".
+                if (existing_fm.get("gardener-sources-hash") == src_hash
+                        and PLACEHOLDER_FACT not in existing_body):
                     result.unchanged.append(cand.name)
                     continue
             # no stored hash yet: first-ever synth of this page - proceed.
             # (A hand-written page never reaches this point; the `class:
             # knowledge` guard above sent it away.)
 
-        try:
-            intro, facts, no_link, dead, status = synthesize(client, cand)
-        except OllamaError as e:
-            log.warning("synth failed for %s: %s - skipping this run", cand.name, e)
-            continue
-        result.lines_dropped_no_link += no_link
-        result.lines_dropped_dead_link += dead
-        result.lines_dropped_status += status
+        todo.append((cand, page_path, src_hash, existing_text))
 
-        contra_lines = contradiction_lines(cand, contra_store, full_resolver)
-        text = carry_over_dream_block(
-            render_page(cand, intro, facts, contra_lines, today, src_hash),
-            existing_text)
-        if writer.write(page_path, text, expect=existing_text):
-            result.written.append(f"30-topics/{cand.name}/MOC.md")
+    # Judge calls in batches of the engine's parallel streams (Splash: 4) -
+    # a topic page with thinking on takes about 45 s on the 27B model. The
+    # run budget is checked before each batch, not only at phase start (run
+    # of 24.09.2026: synth ran 96 minutes past an exhausted budget).
+    engine_parallel = max(1, int(getattr(getattr(client, "engine", None), "parallel", 1) or 1))
+    # Four simultaneous long-form V2 pages hit Splash's 300-second transport
+    # timeout in the real Vault (R3); the same pages finished serially in
+    # 127-235 seconds. Keep V1's old batch size for the rollback path.
+    parallel = (engine_parallel if config.SYNTH_VERSION == 1
+                else min(engine_parallel, config.SYNTH_PARALLEL))
+    judge_many = getattr(client, "judge_many", None)
+    for start in range(0, len(todo), parallel):
+        if deadline is not None and deadline.expired(
+                "synth", done=start, total=len(todo)):
+            result.deadline_left = [c.name for c, *_ in todo[start:]]
+            break
+        batch = todo[start:start + parallel]
+        verdicts: list = [None] * len(batch)
+        if judge_many is not None:
+            try:
+                system = SYNTH_SYSTEM_V1 if config.SYNTH_VERSION == 1 else SYNTH_SYSTEM
+                verdicts = judge_many([(system, build_prompt(c))
+                                       for c, *_ in batch], parallel=parallel)
+            except OllamaUnavailable:
+                raise       # the outage switch in cli._guard skips the phase
+            except OllamaError as e:
+                log.warning("synth batch failed (%s): %s - skipping it this run",
+                            ", ".join(c.name for c, *_ in batch), e)
+                result.retry_left = [c.name for c, *_ in todo[start:]]
+                break
+        for (cand, page_path, src_hash, existing_text), verdict in zip(batch, verdicts):
+            _synth_one(client, cand, verdict, page_path, src_hash, existing_text,
+                       writer, contra_store, full_resolver, today, result)
     return result
+
+
+def _synth_one(client, cand: TopicCandidate, verdict, page_path: Path,
+               src_hash: str, existing_text: str | None, writer: VaultWriter,
+               contra_store: ContradictionStore, full_resolver: dict,
+               today: dt.datetime, result: SynthResult) -> None:
+    try:
+        intro, facts, no_link, dead, status = (
+            synthesize(client, cand) if verdict is None
+            else synthesize(client, cand, verdict))
+    except JudgeUnanswered:
+        log.warning("synth: judge gave no answer for %s - page left as "
+                    "it is, next run retries", cand.name)
+        result.judge_failed.append(cand.name)
+        return
+    except OllamaUnavailable:
+        raise           # not one slow call: do not retry every further candidate
+    except OllamaError as e:
+        log.warning("synth failed for %s: %s - skipping this run", cand.name, e)
+        return
+    if not facts and config.SYNTH_VERSION == 1 and existing_text is None and cand.is_cluster:
+        result.skipped_empty_new.append(cand.name)
+        return
+    if not facts and config.SYNTH_VERSION != 1:
+        # A failed or ungrounded summary must not replace a useful page or
+        # store a sources hash that would hide the missing facts next run.
+        log.info("synth: topic %s has no sourced fact - not written", cand.name)
+        if existing_text is None and cand.is_cluster:
+            result.skipped_empty_new.append(cand.name)
+        else:
+            result.judge_failed.append(cand.name)
+        return
+    result.lines_dropped_no_link += no_link
+    result.lines_dropped_dead_link += dead
+    result.lines_dropped_status += status
+
+    contra_lines = contradiction_lines(cand, contra_store, full_resolver)
+    text = carry_over_dream_block(
+        render_page(cand, intro, facts, contra_lines, today, src_hash),
+        existing_text)
+    if writer.write(page_path, text, expect=existing_text):
+        result.written.append(f"30-topics/{cand.name}/MOC.md")

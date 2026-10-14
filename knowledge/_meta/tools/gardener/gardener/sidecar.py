@@ -153,6 +153,17 @@ def sidecar_path_for(asset_path: Path) -> Path:
     return asset_path.with_name(asset_path.name + ".md")
 
 
+def is_config_file(rel: str) -> bool:
+    """A hidden file, or a structured data file in a knowledge branch outside
+    `_assets/` (config.SIDECAR_DATA_SUFFIXES): tool configuration, no asset."""
+    parts = rel.split("/")
+    if parts[-1].startswith("."):
+        return True
+    return (parts[0] in config.SIDECAR_KNOWLEDGE_DIRS
+            and Path(parts[-1]).suffix.casefold() in config.SIDECAR_DATA_SUFFIXES
+            and config.ASSET_DIR not in parts[:-1])
+
+
 def iter_asset_candidates(vault: Path,
                           rules: list[IgnoreRule] | None = None) -> list[Path]:
     """Every non-.md file in the vault that is a sidecar candidate.
@@ -190,6 +201,8 @@ def iter_asset_candidates(vault: Path,
             rel = f"{rel_here}/{name}" if rel_here else name
             if rel.startswith(config.DROP_DIR):
                 continue    # raw ingest input, not corpus - ingest phase owns it
+            if is_config_file(rel):
+                continue
             if is_ignored(rules, rel, is_dir=False):
                 continue
             out.append(path)

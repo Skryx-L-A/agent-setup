@@ -1,7 +1,7 @@
 """Extraction (M2a cloud, M2b local): pulls claims with a literal quote out
 of batches of open ledger units, either via claude-sonnet-5 (headless CLI)
-or via grug-27b, local over MLX (`gardener.grug_client`, since 2026-08-12 -
-was Ollama's `ornith:35b`, see `call_ollama` below for the retired path). See
+or via the local judge (`gardener.grug_client`: Splash by default, MLX fallback qwen3.8;
+grug-27b and Ollama's `ornith:35b` are retired and deleted from the Mac since 30.09.2026). See
 DREAM-PLAN.md Abschnitt 0 (D1, revised 06.08.2026) - a model extracts, code
 verifies, and no model's own opinion of its citation is ever trusted.
 
@@ -39,6 +39,7 @@ from .budget import BudgetExhausted
 from . import secrets_scan
 from . import segment as segment_mod
 from .ledger import Ledger
+from .. import mlx_server
 
 log = logging.getLogger("gardener.dream")
 
@@ -329,26 +330,42 @@ def call_grug(prompt: str, *, system: str = dcfg.DREAM_EXTRACT_SYSTEM_PROMPT,
     return envelope
 
 
-def ensure_grug_server(timeout: float = 200.0) -> None:
+def ensure_grug_server(timeout: float = 200.0) -> bool:
     """Starts grug-27b's MLX server if it is not already running - the
     Belegung with `wb-belegung` and the 20 GB free-memory preflight both
     happen INSIDE `grug-server ensure` itself (see that script), not here.
-    Idempotent: a server already running returns immediately."""
-    proc = subprocess.run(["grug-server", "ensure"], capture_output=True,
-                          text=True, timeout=timeout)
-    if proc.returncode != 0:
-        raise CallError("grug-server ensure failed: "
-                        f"{(proc.stderr or proc.stdout)[-500:]}")
+    Idempotent: a server already running returns immediately.
+
+    Returns whether THIS call owns the resulting server - delegates to
+    `mlx_server.ensure`, the same ownership tracking the gardener's own
+    "smart" phases use (see that module's docstring). Until Auftrag
+    "p0-schutztore" this returned nothing and the caller always assumed
+    ownership, which is exactly the bug `mlx_server.py` documents itself as
+    the fix for on the gardener side: a server this run finds already
+    serving grug-27b - started by a human, a concurrent gardener run, or an
+    earlier dream step in the same run - is a guest situation, not something
+    this call may later stop.
+
+    Raises `CallError` (this module's own exception, kept for callers that
+    already catch it) instead of `mlx_server.MlxServerError` if provisioning
+    itself fails."""
+    try:
+        return mlx_server.ensure(timeout=timeout)
+    except mlx_server.MlxServerError as e:
+        raise CallError(str(e)) from e
 
 
-def stop_grug_server() -> None:
-    """Frees the 15 GB and the wb-belegung entry again. Safe to call even
-    when nothing was started - `grug-server stop` on an idle server is a
-    documented no-op, not an error (Prozess-Hygiene: was gestartet wird,
-    wird auch beendet, aber ein Aufraeumer, der nichts findet, meldet das nur
-    still)."""
-    subprocess.run(["grug-server", "stop"], capture_output=True, text=True,
-                   timeout=60)
+def stop_grug_server(owned: bool) -> None:
+    """Frees the 15 GB and the wb-belegung entry again - but ONLY when this
+    run's own `ensure_grug_server()` reported ownership (`owned=True`).
+
+    No default on purpose, like `mlx_server.release`: the old signature took
+    nothing and stopped unconditionally, which is exactly the bug Auftrag
+    "p0-schutztore" (pipeline-analyse Abschnitt 0 Punkt 6) names -
+    `dream/cli.py:388` stopped the server in a `finally` regardless of who
+    started it. A default would let a new call site silently fall back into
+    the same hole; every real caller must say which it means."""
+    mlx_server.release(owned, timeout=60)
 
 
 # ---------------------------------------------------------------------------
@@ -877,8 +894,12 @@ def run_extract(args, call: CallFn | None = None, budget=None,
                 return result
 
             if not dry_run:
-                ensure_grug_server()
-                started_local_server = True
+                # The return value, not the fact that we asked, is what
+                # decides ownership - a server already serving grug-27b for
+                # someone else answers `ensure_grug_server()` with False, and
+                # `started_local_server` must reflect that (see
+                # `stop_grug_server` below).
+                started_local_server = ensure_grug_server()
 
             def call(prompt: str) -> dict:  # noqa: F811 - intentional shadow
                 return call_grug(prompt)
@@ -1144,7 +1165,7 @@ def run_extract(args, call: CallFn | None = None, budget=None,
         ledger.close()
         claim_store.close()
         if started_local_server:
-            stop_grug_server()
+            stop_grug_server(started_local_server)
     return result
 
 

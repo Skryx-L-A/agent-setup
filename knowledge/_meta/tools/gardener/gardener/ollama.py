@@ -44,6 +44,7 @@ class OllamaClient:
         self.timeout = timeout
         self.failures = 0          # consecutive transport failures
         self.transient_failures = 0  # total, for the report
+        self.embed_options: dict | None = None  # e.g. {"num_gpu": 0}: embed on the CPU (braincli.nachbetten)
 
     def _ok(self) -> None:
         self.failures = 0
@@ -138,6 +139,8 @@ class OllamaClient:
         }
         if keep_alive is not None:
             nutzlast["keep_alive"] = keep_alive
+        if self.embed_options:
+            nutzlast["options"] = self.embed_options
         data = self._post_retrying("/api/embed", nutzlast, "embed")
         if data is None:
             raise OllamaError("embedding failed (transient)")

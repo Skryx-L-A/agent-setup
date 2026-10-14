@@ -66,6 +66,15 @@ import kill_pattern_classify   # noqa: E402
 import push_gate_classify      # noqa: E402
 import screencapture_classify  # noqa: E402
 import snapshot_classify       # noqa: E402
+import script_guard            # noqa: E402  (lokale Skripte, die ein Befehl startet)
+try:
+    import geheimnis_inhalt    # noqa: E402  (Inhaltspruefung der Secrets-Stufe)
+except ImportError:            # lib/ nur teilweise ausgerollt: die Stufe verweigert dann (fail-closed)
+    geheimnis_inhalt = None
+try:
+    import guard_log           # noqa: E402  (Ablehnungsverlauf mit Monatsrotation)
+except ImportError:            # lib/ nur teilweise ausgerollt: der Hook darf daran nie sterben
+    guard_log = None
 
 
 # ===========================================================================
@@ -203,13 +212,10 @@ def _guard_log_path():
 
 
 def append_block_log(pane, guard, reason, command, cwd, session_id):
-    if not reason:
+    if not reason or script_guard.PROBING[0] or _RUMPF[0]:
         return
     try:
         pfad = _guard_log_path()
-        d = os.path.dirname(pfad)
-        if d:
-            os.makedirs(d, exist_ok=True)
         eintrag = {
             'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'guard': guard,
@@ -222,8 +228,16 @@ def append_block_log(pane, guard, reason, command, cwd, session_id):
             'session_id': session_id or '',
             'pane': pane or '',
         }
-        with open(pfad, 'a') as fh:
-            fh.write(json.dumps(eintrag) + '\n')
+        # Anhaengen UND Monatsrotation (hooks/lib/guard_log.py): die aktive Datei haelt
+        # nur den aktuellen Monat, aeltere liegen als guard-blocks.YYYY-MM.log.gz daneben.
+        if guard_log is not None:
+            guard_log.anhaengen(pfad, json.dumps(eintrag))
+        else:
+            d = os.path.dirname(pfad)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(pfad, 'a') as fh:
+                fh.write(json.dumps(eintrag) + '\n')
     except OSError:
         pass
 
@@ -401,10 +415,10 @@ def run_git(args):
 # 1. bash-guard-secrets.sh
 # ===========================================================================
 # Zweck: verhindert `git add`/`git commit`, die .env-Dateien oder gaengige
-#        Secret-Dateimuster ausserhalb ~/Knowledge/90-secrets/ einschliessen.
+#        Secret-Dateimuster ausserhalb ~/Knowledge/secrets/ einschliessen.
 # Event: PreToolUse, matcher Bash.
 # Warum: CLAUDE.md sagt "Never commit a .env (or any secret) to GitHub" und
-#        "Secrets knowledge goes only into 90-secrets/" — bisher reine Prosa-
+#        "Secrets knowledge goes only into secrets/" — bisher reine Prosa-
 #        Regel ohne technische Durchsetzung (siehe research-skills Luecke #1).
 # Fix nach Review 2026-07-28 (M10): alle drei Trigger-Checks verlangten "git"
 #        UNMITTELBAR gefolgt vom Unterbefehl (add/commit) — `git -C <dir> add`
@@ -449,8 +463,16 @@ def _split_on_parens(text):
     Wortgrenze und keine Shell-Aufloesung: dieser Guard tokenisiert absichtlich
     naiv (siehe Kommentarblock oben), und daran soll sich nichts aendern ausser
     dem einen Punkt, an dem eine Klammer den Befehlsnamen verklebt hat.
+
+    Ebenso die Trenner ';', '&' und '|' (2026-10-09): sie werden zu eigenen
+    Woertern, damit `true&&git add -A` dasselbe Wort `git` zeigt wie
+    `true && git add -A` und GIT_ADD_SEPARATORS die Argumentliste dort
+    abschneidet. Vorher war `true&&git` ein Wort, und weder git-add noch
+    secrets sah einen git-Aufruf. `&&` wird dabei zu zwei Woertern '&', beide
+    sind Trenner; `2>&1` zu `2>`, '&', `1` -- nach einem `git add` endet die
+    Argumentliste damit an der Umleitung statt sie mitzunehmen.
     """
-    return text.replace('(', ' ').replace(')', ' ').split()
+    return re.sub(r'([;&|])', r' \1 ', text.replace('(', ' ').replace(')', ' ')).split()
 
 
 def find_git_invocation(command, targets):
@@ -504,11 +526,16 @@ def is_allowed_env_suffix(p):
 
 
 def is_secret_path(p):
-    if re.search(r'(^|/)90-secrets/', p):
+    if re.search(r'(^|/)secrets/', p):
         return False
     if is_allowed_env_suffix(p):
         return False
     if re.search(r'(^|/)\.env($|\.[A-Za-z0-9_-]+$)', p):
+        return True
+    # `*.env` (prod.env, docker.env, ...): der Dateiname ENDET auf `.env`. Seit 2026-10-09;
+    # vorher fiel `git commit -am` mit geaendertem `prod.env` durch. Ohne Gross/Klein-
+    # Unterschied, weil das Dateisystem hier keinen macht (`PROD.ENV` ist `prod.env`).
+    if re.search(r'\.env$', p, re.IGNORECASE):
         return True
     if re.search(
         r'(^|/)(id_rsa|id_ed25519|id_ecdsa)$|\.(pem|p12|pfx)$|(^|/)credentials\.json$'
@@ -516,6 +543,370 @@ def is_secret_path(p):
     ):
         return True
     return False
+
+
+# Obergrenze je unversioniertem Verzeichnis (Dateien darueber werden nicht gesehen).
+_UNVERSIONIERT_MAX = 5000
+
+
+def _status_eintraege_z(repo_dir):
+    """[(XY, wurzel-relativer Pfad)] aus `git status --porcelain -z` (bei Umbenennung das
+    Ziel). Anders als die Textform ohne Anfuehrungszeichen um Pfade mit Leerzeichen oder
+    Sonderzeichen -- sonst blieben solche Dateien fuer Pfad- und Inhaltspruefung
+    unsichtbar. Unversionierte Verzeichnisse stehen als 'ordner/'. None bei Fehler."""
+    out = run_git(['-C', repo_dir, 'status', '--porcelain', '-z'])
+    if out is None:
+        return None
+    teile = out.split('\0')
+    eintraege = []
+    i = 0
+    while i < len(teile):
+        eintrag = teile[i]
+        i += 1
+        if len(eintrag) < 4:
+            continue
+        xy, pfad = eintrag[:2], eintrag[3:]
+        if xy[0] in 'RC' or xy[1] in 'RC':
+            i += 1  # der Ursprungspfad folgt als eigener Eintrag
+        eintraege.append((xy, pfad))
+    return eintraege
+
+
+def _unversioniert_aufloesen(repo_dir, eintraege):
+    """Unversionierte Verzeichnisse ('?? ordner/') durch ihre Dateien ersetzen: status nennt
+    nur das Verzeichnis, ein Schluessel oder eine .env darin bliebe ungesehen (auch in der
+    alten Kette). .gitignore gilt weiter; Obergrenze je Verzeichnis, damit ein riesiger
+    unversionierter Baum den Hook nicht lahmlegt."""
+    out = []
+    for xy, pfad in eintraege:
+        if xy == '??' and pfad.endswith('/'):
+            drin = run_git(['-C', repo_dir, 'ls-files', '--others', '--exclude-standard',
+                            '-z', '--', pfad])
+            if drin is None:
+                out.append((xy, pfad))
+            else:
+                out.extend([(xy, d) for d in drin.split('\0') if d][:_UNVERSIONIERT_MAX])
+        else:
+            out.append((xy, pfad))
+    return out
+
+
+_COMMIT_MIT_WERT = frozenset(('-m', '-F', '-C', '-c', '-t', '--message', '--file', '--author',
+                              '--date', '--template', '--reuse-message', '--reedit-message',
+                              '--fixup', '--squash', '--cleanup', '--trailer'))
+
+
+def _unquote(tok):
+    tok = tok.strip()
+    for q in ('"', "'"):
+        if tok.endswith(q):
+            tok = tok[:-1]
+        if tok.startswith(q):
+            tok = tok[1:]
+    return tok
+
+
+def _dynamisch(tok):
+    """Ein Wort, dessen Ziel erst die Shell festlegt (Variable, Substitution, Muster)."""
+    return bool(re.search(r'[$`*?\[{\\~]', tok)) or tok.startswith(':(')
+
+
+def _commit_info(args):
+    """(alle_tracked, pfade) aus der Argumentliste eines `git commit`: -a/--all, und die
+    Pfadangaben, die einen Commit auf diese Dateien beschraenken."""
+    alle = False
+    pfade = []
+    i = 0
+    while i < len(args):
+        t = args[i]
+        i += 1
+        if t == '--':
+            pfade.extend(args[i:])
+            break
+        if t.startswith('--'):
+            if t == '--all':
+                alle = True
+            elif t in _COMMIT_MIT_WERT:
+                i += 1
+            continue
+        if t.startswith('-') and len(t) > 1:
+            for k, ch in enumerate(t[1:], 1):
+                if ch == 'a':
+                    alle = True
+                elif ch in 'mFCct':
+                    if k == len(t) - 1:
+                        i += 1  # Wert steht im naechsten Wort
+                    break
+            continue
+        pfade.append(t)
+    return alle, pfade
+
+
+def _merge_uebernommen(repo_dir, index_pfade):
+    """Pfade, die ein laufender Merge unveraendert aus veroeffentlichtem Stand uebernimmt --
+    seit 2026-10-09 in lib/geheimnis_inhalt.merge_uebernommen (gemeinsam mit dem
+    Git-Hook-Verteiler); Beschreibung dort. Fehlt die Lib, ist die Menge leer -- die
+    Inhaltspruefung verweigert dann ohnehin (fail-closed, _inhalt_pruefen). Eine aeltere Lib
+    ohne die Funktion (Teilausrollung): ebenfalls leer, also keine Ausnahme -- nie weniger scannen."""
+    funktion = getattr(geheimnis_inhalt, 'merge_uebernommen', None)
+    if funktion is None:
+        return set()
+    return funktion(repo_dir, index_pfade, run_git)
+
+
+def _staging_kandidaten(command, repo_dir, top, eintraege):
+    """Die Dateien, die dieser Befehl tatsaechlich staged bzw. committet -- Grundlage der
+    Inhaltspruefung (und der Pfadpruefung fuer reine Commits). Wurzel-relative Pfade.
+      - breites `git add` (-A, ., :/, *, -u ohne Pfad) oder ein Wort, das erst die Shell
+        aufloest (Variable, Substitution, Muster): alle Eintraege des Arbeitsbaums
+      - `git add a b`: genau diese Dateien; ein Verzeichnis: alles darunter; ein Pfad, den es
+        nicht gibt und der auch nicht als geloescht im Status steht: nicht aufloesbar, dann
+        ebenfalls alle (fail-closed)
+      - `git commit -a`: alle versionierten Aenderungen
+      - `git commit` (jede Form): der Index (`git diff --cached --name-only -z`)
+      - `git commit <pfad>`: diese Dateien
+    Ein einzelnes `git add ok.py` zieht damit eine unversionierte config.py daneben NICHT mehr
+    in die Inhaltspruefung (Fehlalarm, gemessen 2026-10-09).
+    Rueckgabe (kand, scan): kand = alle Pfade des Befehls (Pfadpruefung), scan = die Teilmenge
+    fuer die Inhaltspruefung. Bei einem Merge faellt aus scan, was der Index unveraendert aus
+    veroeffentlichtem Stand uebernimmt (_merge_uebernommen) UND nicht aus dem Arbeitsbaum
+    committet wird (`commit -a`/`commit <pfad>` mit abweichendem Arbeitsbaum, `git add`)."""
+    alle = _unversioniert_aufloesen(repo_dir, eintraege)
+    kand = []
+    scan = []
+    merge_frei = set()
+    arbeitsbaum_abw = []  # [Menge] -- erst beim ersten Bedarf gelesen; None = nicht lesbar
+
+    def dazu(pfad, scannen=True):
+        if not pfad:
+            return
+        if pfad not in kand:
+            kand.append(pfad)
+        if scannen and pfad not in scan:
+            scan.append(pfad)
+
+    def dazu_arbeitsbaum(pfad):
+        """Wird aus dem ARBEITSBAUM committet (-a, <pfad>): ein Merge-Pfad bleibt nur frei,
+        solange der Arbeitsbaum dem Index entspricht."""
+        if pfad in merge_frei:
+            if not arbeitsbaum_abw:
+                d = run_git(['-C', repo_dir, 'diff', '--name-only', '-z'])
+                arbeitsbaum_abw.append(None if d is None else set(d.split('\0')))
+            if arbeitsbaum_abw[0] is not None and pfad not in arbeitsbaum_abw[0]:
+                dazu(pfad, False)
+                return
+        dazu(pfad)
+
+    def alles():
+        for _xy, p in alle:
+            dazu(p)
+
+    def pfadangabe(a, streng):
+        """streng: nicht aufloesbar => alles (add); sonst nur ueberspringen (commit-Pfade)."""
+        ziel = dazu if streng else dazu_arbeitsbaum
+        a = _unquote(a)
+        if not a or a.startswith('-'):
+            return
+        if _dynamisch(a):
+            if streng:
+                alles()
+            return
+        ab = a if os.path.isabs(a) else os.path.join(repo_dir, a)
+        try:
+            rel = os.path.relpath(os.path.realpath(ab), os.path.realpath(top))
+        except ValueError:
+            rel = None
+        if rel is None or rel.startswith('..'):
+            if streng:
+                alles()
+            return
+        if os.path.isdir(ab):
+            if rel == '.':
+                alles()
+                return
+            for _xy, p in alle:
+                if p == rel or p.startswith(rel.rstrip('/') + '/'):
+                    ziel(p)
+        elif os.path.isfile(ab):
+            ziel(rel)
+        elif any(p == rel for _xy, p in alle):
+            ziel(rel)  # geloescht oder umbenannt: der Status kennt den Pfad
+        elif streng:
+            alles()
+
+    for args in _git_arg_lists(command, 'add'):
+        if (any(x in ('-A', '--all', '--no-ignore-removal') for x in args)
+                or (any(x in ('-u', '--update') for x in args)
+                    and not any(x and not x.startswith('-') for x in args))
+                or any(_unquote(x) in ('.', '*') or _unquote(x).startswith(':/') for x in args)):
+            alles()
+            continue
+        for a in args:
+            pfadangabe(a, True)
+
+    commits = _git_arg_lists(command, 'commit')
+    if commits:
+        index = run_git(['-C', repo_dir, 'diff', '--cached', '--name-only', '-z'])
+        if index is None:
+            alles()  # Index nicht lesbar: nicht raten
+        else:
+            index_pfade = [p for p in index.split('\0') if p]
+            merge_frei = _merge_uebernommen(repo_dir, index_pfade)
+            for p in index_pfade:
+                dazu(p, p not in merge_frei)
+    for args in commits:
+        mit_a, pfade = _commit_info(args)
+        if mit_a:
+            for xy, p in alle:
+                if xy != '??':
+                    dazu_arbeitsbaum(p)
+        for a in pfade:
+            pfadangabe(a, False)
+    return kand, scan
+
+
+def _inhalt_pruefen(kandidaten, repo_dir, git_nutzbar):
+    """Inhaltspruefung (Abschnitt 3 des Originals) fuer (relativ, absolut)-Paare.
+    -> Ablehnungstext oder None. Fail-closed: ein Fehler im Scanner selbst oder
+    eine nicht lesbare Datei ist KEIN sauberer Befund."""
+    if geheimnis_inhalt is None:
+        return (
+            "git add/commit (Repo: %s): die Inhaltspruefung auf Secrets ist nicht verfuegbar "
+            "(lib/geheimnis_inhalt.py fehlt). Fail-closed: Commit wird verweigert, bis die Datei "
+            "ausgerollt ist. Blockiert von bash-guard-secrets." % repo_dir
+        )
+    voll, generisch = geheimnis_inhalt.load_exceptions(HOOKS_DIR)
+    paare = [(rel, ab) for rel, ab in kandidaten
+             if os.path.isfile(ab) and not geheimnis_inhalt.is_exempt(rel, voll)]
+    if not paare:
+        return None
+    zusatz = '' if git_nutzbar else ', git unbenutzbar'
+    try:
+        fund, fehler = geheimnis_inhalt.scan_paths(paare, generisch,
+                                                       geheimnis_inhalt.load_public_values(HOOKS_DIR))
+    except Exception as e:
+        return (
+            "git add/commit (Repo: %s%s): die Inhaltspruefung auf Secrets konnte nicht "
+            "ausgefuehrt werden (%s). Fail-closed: Commit wird verweigert, bis das Werkzeug "
+            "wieder verfuegbar ist. Blockiert von bash-guard-secrets." % (repo_dir, zusatz, e)
+        )
+    if fehler is not None:
+        return (
+            "git add/commit (Repo: %s%s): eine Datei im Staging konnte nicht auf Secrets "
+            "geprueft werden (%s). Fail-closed: Commit wird verweigert. "
+            "Blockiert von bash-guard-secrets." % (repo_dir, zusatz, fehler)
+        )
+    if fund is not None:
+        if git_nutzbar:
+            return (
+                "git add/commit (Repo: %s) wuerde eine Datei mit einem wahrscheinlichen Secret "
+                "im INHALT einschliessen: %s. Blockiert von bash-guard-secrets "
+                "(Inhaltspruefung)." % (repo_dir, fund)
+            )
+        return (
+            "git add/commit nennt eine Datei mit einem wahrscheinlichen Secret im INHALT: %s. "
+            "(git war hier nicht benutzbar, best-effort Pruefung ausserhalb der Staging-Liste.) "
+            "Blockiert von bash-guard-secrets." % fund
+        )
+    return None
+
+
+# Befehle, die Index oder HEAD VERAENDERN und damit Inhalt in einen Commit bringen, den der
+# Hook-Lauf (PreToolUse, vor der Ausfuehrung) noch nicht sieht: kein MERGE_HEAD, ein Index ohne
+# den kommenden Inhalt -- `git merge --no-commit X && git commit` brachte so ungeprueft alles
+# aus X durch (guard-merge, 09.10.). Steht so ein Befehl VOR einem `git commit` im selben Aufruf,
+# prueft der Inhaltsscan nichts Verwertbares: fail-closed ablehnen, in zwei Aufrufe trennen.
+_INDEX_VERAENDERER = frozenset((
+    'merge', 'pull', 'cherry-pick', 'revert', 'am', 'rebase', 'read-tree', 'update-index',
+    'update-ref',
+))
+# Ihr "Aufraeumen" ist harmlos: bringt keinen neuen Inhalt in Index oder HEAD.
+_ABBRUCH_OPTIONEN = frozenset(('--abort', '--quit'))
+
+
+def _index_veraendernd(sub, args):
+    """Grund (Text) oder None: veraendert `git <sub> <args>` Index/HEAD so, dass ein folgender
+    Commit Inhalt traegt, den der Hook nicht sah? Die Mengen oben gelten ohne Ansehen der
+    Argumente; checkout/restore/reset/apply/stash nur in den Formen, die Inhalt von woanders
+    holen (Revision, Quelle, Patch, Stash). Nicht aufloesbar (dynamisches Wort) heisst: ja."""
+    if _dynamisch(sub):
+        return "git %s (Unterbefehl erst zur Laufzeit bekannt)" % sub
+    if sub in _INDEX_VERAENDERER:
+        if sub in ('merge', 'pull', 'cherry-pick', 'revert', 'am', 'rebase') \
+                and any(a in _ABBRUCH_OPTIONEN for a in args):
+            return None
+        return "git %s" % sub
+    mit_optionen = [a for a in args if a != '--']
+    vor_trenner = args[:args.index('--')] if '--' in args else args
+    revisionen = [a for a in vor_trenner if a and not a.startswith('-')]
+    if sub == 'reset':
+        # Entstagen (`reset`, `reset HEAD f`, `reset -- f`) holt nichts; jede andere Revision
+        # (`--soft HEAD~1`, `abc123 -- f`) verschiebt HEAD oder holt Inhalt in den Index.
+        # Ohne `--` ist nur das ERSTE Wort eine Revision, der Rest sind Pfade; ein erstes
+        # Wort, das ein Pfad sein koennte (`reset datei`), ist nicht zu unterscheiden -- ablehnen.
+        if revisionen[:1] and revisionen[0] not in ('HEAD', '@'):
+            return "git reset auf eine andere Revision"
+    elif sub == 'checkout':
+        # `checkout <rev> -- <pfad>` holt Inhalt aus <rev> in den Index. Branchwechsel und
+        # `checkout -- <pfad>` (aus dem Index) nicht.
+        if '--' in args and revisionen and not any(
+                a in ('-b', '-B', '--orphan') for a in vor_trenner):
+            return "git checkout <Revision> -- <Pfad>"
+        if any(a in ('-p', '--patch') for a in args):
+            return "git checkout --patch"
+    elif sub == 'restore':
+        if any(a in ('-s', '--source') or a.startswith('--source=') for a in args):
+            return "git restore --source"
+        if any(a in ('-p', '--patch') for a in args) and any(
+                a in ('-S', '--staged') for a in args):
+            return "git restore --staged --patch"
+    elif sub == 'apply':
+        if any(a in ('--index', '--cached', '-3', '--3way') for a in mit_optionen):
+            return "git apply --index/--cached"
+    elif sub == 'stash':
+        if revisionen and revisionen[0] in ('pop', 'apply', 'branch'):
+            return "git stash %s" % revisionen[0]
+    return None
+
+
+def _index_vor_commit(command):
+    """Ablehnungstext, wenn vor einem `git commit` dieses Aufrufs ein Befehl steht, der Index
+    oder HEAD veraendert (siehe _INDEX_VERAENDERER). Reihenfolge wie im Text (Zeile fuer Zeile,
+    je Zeile von links); `git add a && git commit` bleibt unberuehrt -- den Add-Weg prueft
+    _staging_kandidaten."""
+    erstes = None
+    for zeile in command.splitlines():
+        toks = _split_on_parens(zeile)
+        n = len(toks)
+        i = 0
+        while i < n:
+            if toks[i] != 'git':
+                i += 1
+                continue
+            j = i + 1
+            while j < n:
+                t = toks[j]
+                if t in ('-C', '-c'):
+                    j += 2
+                elif t.startswith('-'):
+                    j += 1
+                else:
+                    break
+            if j >= n:
+                break
+            sub = toks[j]
+            k = j + 1
+            args = []
+            while k < n and toks[k] not in GIT_ADD_SEPARATORS:
+                args.append(_unquote(toks[k]))
+                k += 1
+            if sub == 'commit':
+                if erstes:
+                    return erstes
+            elif erstes is None:
+                erstes = _index_veraendernd(sub, args)
+            i = k
+    return None
 
 
 def check_secrets(command, cwd):
@@ -527,26 +918,63 @@ def check_secrets(command, cwd):
         return None
 
     add_found, _ = find_git_invocation(command, ('add',))
+    commit_found, _ = find_git_invocation(command, ('commit',))
+    if commit_found:
+        # Vor dem Add-/Pfadweg: ein Commit nach merge/pull/rebase/... hat zur Pruefzeit weder
+        # den Index noch das MERGE_HEAD, die der Scan braeuchte.
+        vorher = _index_vor_commit(command)
+        if vorher:
+            return (
+                "%s steht in diesem Aufruf VOR einem git commit. Der Hook laeuft vor der "
+                "Ausfuehrung: Index und HEAD haben dann noch nicht den Inhalt, den der Commit "
+                "tragen wird, der Inhaltsscan pruefte nichts. In zwei Aufrufe trennen; der Commit "
+                "wird dann gegen den tatsaechlichen Index geprueft. Blockiert von "
+                "bash-guard-secrets." % vorher
+            )
     commit_dash_a = bool(re.search(r'commit\s+-a(m|\s|$)', command, re.MULTILINE))
-    if not (add_found or commit_dash_a):
+    if not (add_found or commit_found or commit_dash_a):
         return None
 
     _found2, dirhint = find_git_invocation(command, ('add', 'commit'))
     repo_dir = dirhint or cwd or os.getcwd()
 
     if run_git(['-C', repo_dir, 'rev-parse', '--show-toplevel']) is not None:
-        status = run_git(['-C', repo_dir, 'status', '--porcelain']) or ''
-        for line in status.splitlines():
-            path = re.sub(r'^.{2} ', '', line, count=1)
-            path = re.sub(r'.* -> ', '', path)
+        top = (run_git(['-C', repo_dir, 'rev-parse', '--show-toplevel']) or '').strip()
+        eintraege = _status_eintraege_z(repo_dir)
+        if eintraege is None:
+            # -z faellt aus: Textform wie bisher
+            status = run_git(['-C', repo_dir, 'status', '--porcelain']) or ''
+            eintraege = []
+            for line in status.splitlines():
+                path = re.sub(r'^.{2} ', '', line, count=1)
+                path = re.sub(r'.* -> ', '', path)
+                eintraege.append((line[:2], path))
+        kandidaten, zu_scannen = _staging_kandidaten(command, repo_dir, top, eintraege)
+        # PFADPRUEFUNG. Wie im Original ueber den ganzen Status, sobald ein `git add` oder
+        # `commit -a` im Spiel ist: die Namen im Kommando lassen sich beliebig umquoten
+        # (Stresstest B10), der tatsaechliche Arbeitsbaum nicht. Das ist absichtlich weiter
+        # als die Inhaltspruefung -- eine `.env` irgendwo im Baum haelt jedes `git add`
+        # an, wie vor dieser Aenderung. Reine Commits (ohne -a) pruefen nur den Index.
+        pfade = list(kandidaten)
+        if add_found or commit_dash_a or any(
+                _commit_info(a)[0] for a in _git_arg_lists(command, 'commit')):
+            pfade = [p for _xy, p in eintraege] + pfade
+        for path in pfade:
             if not path:
                 continue
             if is_secret_path(path):
                 return (
                     "git add/commit (breites Staging, Repo: %s) wuerde eine Secret-/.env-Datei "
-                    "einschliessen (%s) ausserhalb 90-secrets/. Blockiert von bash-guard-secrets."
+                    "einschliessen (%s) ausserhalb secrets/. Blockiert von bash-guard-secrets."
                     % (repo_dir, path)
                 )
+        # Abschnitt 3 (Inhalt): NUR die Dateien, die der Befehl wirklich staged oder
+        # committet. Seit 2026-10-09 auch hier -- bis dahin lag das nur in der
+        # stillgelegten bash-guard-secrets.sh, ein Schluessel in config.py ging durch.
+        grund = _inhalt_pruefen([(d, os.path.join(top, d)) for d in zu_scannen if d],
+                                repo_dir, True)
+        if grund:
+            return grund
         return None
     else:
         # git nicht benutzbar (fehlt im PATH, kein Repo): frueher endete der Hook hier
@@ -556,6 +984,7 @@ def check_secrets(command, cwd):
         # bleibt danach Unsicherheit, wird sie WENIGSTENS sichtbar gemacht.
         # Klammern auch hier als Wortgrenze -- sonst hiesse der Pfad in
         # `(git add .env)` ".env)" und kein Secret-Muster traefe darauf.
+        kandidaten = []
         for tok in _split_on_parens(command):
             if tok.startswith('-'):
                 continue
@@ -571,9 +1000,13 @@ def check_secrets(command, cwd):
             if is_secret_path(stripped):
                 return (
                     "git add/commit nennt '%s' — sieht nach einer Secret-/.env-Datei ausserhalb "
-                    "90-secrets/ aus. (git war hier nicht benutzbar, geprueft wurde deshalb nur der "
+                    "secrets/ aus. (git war hier nicht benutzbar, geprueft wurde deshalb nur der "
                     "Kommandotext.) Blockiert von bash-guard-secrets." % stripped
                 )
+            kandidaten.append((stripped, os.path.join(repo_dir, stripped)))
+        grund = _inhalt_pruefen(kandidaten, repo_dir, False)
+        if grund:
+            return grund
         sys.stderr.write(
             "bash-guard-secrets: WARNUNG — git ist hier nicht benutzbar (Repo '%s'); es wurde NUR "
             "der Kommandotext geprueft, nicht der Staging-Bereich.\n" % repo_dir
@@ -620,8 +1053,8 @@ def check_secrets(command, cwd):
 GIT_ADD_SEPARATORS = (';', '&', '|', '&&', '||')
 
 
-def _git_add_arg_lists(command):
-    """Fuer jedes `git add`-Vorkommen im (parens-getrennten) Kommando: die Liste
+def _git_arg_lists(command, sub):
+    """Fuer jedes `git <sub>`-Vorkommen (add oder commit) im (parens-getrennten) Kommando: die Liste
     seiner rohen Argument-Tokens, abgeschnitten am naechsten Trenner (;/&/|).
     Klammern zaehlen als Wortgrenze -- wortgleiche Behandlung zu
     find_git_invocation()/_split_on_parens() oben: `(git add -A)` ist
@@ -642,11 +1075,15 @@ def _git_add_arg_lists(command):
     ausgeschnitten zu werden."""
     out = []
     for zeile in command.splitlines():
-        out.extend(_git_add_arg_lists_einzeilig(zeile))
+        out.extend(_git_arg_lists_einzeilig(zeile, sub))
     return out
 
 
-def _git_add_arg_lists_einzeilig(command):
+def _git_add_arg_lists(command):
+    return _git_arg_lists(command, 'add')
+
+
+def _git_arg_lists_einzeilig(command, sub):
     toks = _split_on_parens(command)
     n = len(toks)
     out = []
@@ -668,7 +1105,7 @@ def _git_add_arg_lists_einzeilig(command):
                 j += 1
                 continue
             break
-        if j < n and toks[j] == 'add':
+        if j < n and toks[j] == sub:
             k = j + 1
             args = []
             while k < n and toks[k] not in GIT_ADD_SEPARATORS:
@@ -688,6 +1125,11 @@ def _git_add_grund(args, cwd):
     Verzeichnis-Test je Wort."""
     if any(a in ('-A', '--all', '--no-ignore-removal') for a in args):
         return "-A/--all sammelt den ganzen Arbeitsbaum ein"
+    # -u ohne Pfad nimmt jede Aenderung an verfolgten Dateien im ganzen Repo
+    # mit (seit git 2.0), also auch fremde -- mit Pfad bleibt es eng.
+    if (any(a in ('-u', '--update') for a in args)
+            and not any(a and not a.startswith('-') for a in args)):
+        return "-u/--update ohne Pfad nimmt jede Aenderung an verfolgten Dateien im ganzen Repo mit"
     if any(a == '.' for a in args):
         return "'.' sammelt alles unterhalb des Arbeitsverzeichnisses ein"
     if any(a == ':/' or a.startswith(':/') for a in args):
@@ -1058,6 +1500,79 @@ def check_rollen_option(command):
 
 
 # ===========================================================================
+# 3c2. worker-name (2026-10-09) -- der Workername eines Panes
+# ===========================================================================
+# Zweck: Kein Agent setzt, aendert oder loescht die Pane-Option `@wb_worker`.
+# BEFUND (gruppen-kern, 2026-10-09): wb-gruppe nennt den Absender nach
+#        `@wb_worker` des eigenen Panes (pi-worker setzt die Option beim Spawn).
+#        Ungeschuetzt koennte ein Worker sich einen fremden Workernamen geben und
+#        unter ihm in Gruppen schreiben oder Antraege stellen.
+# Policy, Grenzen und Lesen wie 3c (rolle), mit denselben Bausteinen: set /
+#        set-option / setw / set-window-option mit `@wb_worker` (auch -u, auch in
+#        tmux-Befehlsketten und ueber Variablen) gegen den hiesigen Server: DENY.
+#        Lesen (`display`, `show-options`, `list-panes -F`) bleibt erlaubt; ein
+#        eigener Server (-L/-S auf einen anderen Socket) darf setzen. Kein Schalter,
+#        aus demselben Grund wie 3c. Legitim setzen die Werkzeuge (pi-worker,
+#        wb-agent, wb-remote-view) -- in ihrem Code, nicht in der Zeile des Agenten.
+#        Ein Optionsname, der erst zur Laufzeit feststeht, lehnt schon 3c ab.
+
+WORKER_OPTION = '@wb_worker'
+
+WORKER_HINWEIS = (
+    "Der Workername eines Panes ist keine Behauptung, die der Bewachte selbst "
+    "umschreiben darf: unter ihm schreibt die Sitzung in Gruppen (wb-gruppe) und "
+    "steht auf der Tafel. Gesetzt wird er beim Spawn (pi-worker); ein Test arbeitet "
+    "auf einem eigenen Socket (tmux -L wbtest ...). Blockiert von worker-name."
+)
+
+
+def check_worker_option(command):
+    if not command:
+        return None
+    command = cmdshell.strip_heredocs(command)
+    stmts = cmdshell.all_statements(command)
+    if stmts == [None]:
+        if WORKER_OPTION in command:
+            return ("Befehl nicht zerlegbar, enthaelt aber '%s'. Im Zweifel gilt er als "
+                    "Versuch, den Workernamen zu setzen. %s" % (WORKER_OPTION, WORKER_HINWEIS))
+        return None
+    prefixes = cmdshell.assignment_prefixes(stmts)
+    for idx, stmt in enumerate(stmts):
+        if not stmt:
+            continue
+        varmap = prefixes[idx] if idx < len(prefixes) else {}
+        for stage in cmdshell.split_pipeline(cmdshell.strip_redirections(stmt)):
+            name, _i, rest = cmdshell.resolve_command(stage, varmap)
+            if name in ROLLEN_SET_VERBEN:
+                # tmux-Befehlskette: der Server ist nicht mehr zu sehen (wie 3c).
+                if any(WORKER_OPTION in cmdshell.resolve_vars(t, varmap) for t in rest):
+                    return ("`%s ... %s ...` steht ohne sichtbares `tmux` in der Zeile "
+                            "(tmux-Befehlskette). Welcher Server gemeint ist, laesst sich "
+                            "so nicht bestimmen. %s" % (name, WORKER_OPTION, WORKER_HINWEIS))
+                continue
+            if name != 'tmux':
+                continue
+            aufgeloest = [cmdshell.resolve_vars(t, varmap) for t in rest]
+            if not any(t in ROLLEN_SET_VERBEN for t in aufgeloest):
+                continue
+            if not any(WORKER_OPTION in t for t in aufgeloest):
+                continue
+            ziel = _rollen_zielsocket(aufgeloest)
+            hier = os.path.realpath((os.environ.get('TMUX', '') or '').split(',')[0]) \
+                if os.environ.get('TMUX') else ''
+            if ziel and hier and ziel != hier:
+                continue   # eigener Server, erreicht die hiesigen Panes nicht
+            woher = ('' if ziel and hier else
+                     ' Der gemeinte tmux-Server liess sich nicht bestimmen (%s gegen %s).'
+                     % (ziel or 'unbekannt', hier or 'unbekannt'))
+            return ("`tmux %s ...` nennt %s und veraendert den Workernamen eines Panes "
+                    "dieses Servers.%s %s"
+                    % (next(t for t in aufgeloest if t in ROLLEN_SET_VERBEN),
+                       WORKER_OPTION, woher, WORKER_HINWEIS))
+    return None
+
+
+# ===========================================================================
 # 3d. freigabe-pfad (2026-08-07) -- die Ablage der Freigaben und des Registers
 # ===========================================================================
 # Zweck: Kein Agent legt selbst eine Freigabe an, kein Agent liest den
@@ -1069,16 +1584,19 @@ def check_rollen_option(command):
 #        Herkunftsbeleg) ist die eine Haelfte der Antwort; diese hier ist die
 #        andere: der Weg zur Datei wird schon vorher versperrt, damit ein
 #        Agent nicht einmal in die Naehe des Schluessels kommt.
-# Policy: DENY fuer JEDEN Zugriff -- auch lesend. Ein Agent hat in diesen drei
+# Policy: DENY fuer JEDEN Zugriff -- auch lesend. Ein Agent hat in diesen
 #        Ablagen nichts zu suchen: die Freigaben schreibt ein Mensch (ueber
 #        `wb-freigabe` oder das Programmfenster), das Register fuehrt
 #        `wb-rolle`, und der Schluessel ist genau das, was eine Faelschung
-#        verhindern soll.
+#        verhindern soll. Seit 2026-09-26 gehoert die Ausnahmeliste des
+#        Skript-Schritts dazu (lib/script_guard.py): ein Eintrag dort nimmt ein
+#        Skript aus der Pruefung, also pflegt sie ein Mensch, kein Agent.
 # Kein Schalter, aus demselben Grund wie bei 3c.
 
 def _geschuetzte_pfade():
     grants = ask_muster.grants_dir()
-    return [grants, ask_muster.schluessel_datei(), rollen.verzeichnis()]
+    return [grants, ask_muster.schluessel_datei(), rollen.verzeichnis(),
+            script_guard.ausnahmen_datei()]
 
 
 FREIGABE_HINWEIS = (
@@ -1087,6 +1605,86 @@ FREIGABE_HINWEIS = (
     "sie zu glauben. Das Rollenregister fuehrt `wb-rolle`. Ein angehaltener "
     "Befehl wird wiederholt, nicht umgangen. Blockiert von freigabe-pfad."
 )
+
+
+# Zweite Linie (2026-10-13, Befund zur Herkunft der Freigaben): der Steuerkanal
+# der Mac-App trug bei `muster-entscheiden` in der sichtbaren App den Klick
+# eines Menschen. Die App gibt dort nicht mehr frei (Fenster.entscheiden mit
+# `echt: false`); hier wird der Weg zum LIVE-Socket (`mac-lauf/awbmac.sock`)
+# schon vorher versperrt. Testinstanzen haben ihren eigenen Socket und bleiben
+# frei; ein Socket, der sich aus der Zeile nicht ablesen laesst, gilt als live.
+LIVE_MAC_LAUF = 'mac-lauf'
+
+
+def _awbmac_freigabe_aufruf(args):
+    """True, wenn die Argumente von awbmac-ctl etwas annehmen wollen."""
+    if 'muster-entscheiden' in args and 'approve' in args:
+        return True
+    # Worker-Antraege (`entscheiden <antrag> approve`) und die Werkzeug-Rueckfrage
+    # der Chat-Buehne (`chat-klick freigabe-ja`), 13.10.2026, Folge zum
+    # Steuerkanal-Fix. Geprueft wird die Stelle der Aktion, damit ein Grund, der
+    # das Wort enthaelt, ein Ablehnen nicht sperrt.
+    for j, a in enumerate(args):
+        if a == 'entscheiden' and args[j + 2:j + 3] == ['approve']:
+            return True
+        if a == 'chat-klick' and args[j + 1:j + 2] == ['freigabe-ja']:
+            return True
+    # Die Menuepunkte Freigaben > Freigeben und Gespraech > Freigabe erlauben
+    # (`hauptmenue`), dieselben Wege mit Kuerzel.
+    return 'hauptmenue' in args and ('Freigeben' in args or 'Freigabe erlauben' in args)
+
+
+def _awbmac_socket(stage, idx, rest, varmap):
+    """Der Socket, den dieser Aufruf erreicht, aufgeloest so weit die Zeile es
+    hergibt; None heisst: keiner genannt (Vorgabe ohne mac-lauf)."""
+    for j, t in enumerate(rest):
+        if t == '--socket' and j + 1 < len(rest):
+            return cmdshell.resolve_vars(rest[j + 1], varmap)
+        if t.startswith('--socket='):
+            return cmdshell.resolve_vars(t[len('--socket='):], varmap)
+    for t in stage[:idx]:
+        if t.startswith('AWBMAC_CONTROL_SOCKET='):
+            return cmdshell.resolve_vars(t.split('=', 1)[1], varmap)
+    if 'AWBMAC_CONTROL_SOCKET' in varmap:
+        return cmdshell.resolve_vars(varmap['AWBMAC_CONTROL_SOCKET'], varmap)
+    return os.environ.get('AWBMAC_CONTROL_SOCKET') or None
+
+
+def _ist_live_socket(sock):
+    if sock is None:
+        return False
+    sock = sock.strip('\'"')
+    if '$' in sock or '`' in sock:
+        return True   # nicht ablesbar: im Zweifel live
+    return LIVE_MAC_LAUF + '/' in os.path.expanduser(sock)
+
+
+def check_awbmac_freigabe(command):
+    stmts = cmdshell.all_statements(command)
+    if stmts == [None]:
+        if 'awbmac-ctl' in command and any(w in command for w in (
+                'approve', 'Freigeben', 'freigabe-ja', 'Freigabe erlauben')):
+            return ("Befehl nicht zerlegbar, nennt aber awbmac-ctl mit einer Annahme. %s"
+                    % FREIGABE_HINWEIS)
+        return None
+    prefixes = cmdshell.assignment_prefixes(stmts)
+    for idx, stmt in enumerate(stmts):
+        if not stmt:
+            continue
+        varmap = prefixes[idx] if idx < len(prefixes) else {}
+        for stage in cmdshell.split_pipeline(cmdshell.strip_redirections(stmt)):
+            name, i, rest = cmdshell.resolve_command(stage, varmap)
+            if name != 'awbmac-ctl':
+                continue
+            args = [cmdshell.resolve_vars(t, varmap) for t in rest]
+            if not _awbmac_freigabe_aufruf(args):
+                continue
+            if _ist_live_socket(_awbmac_socket(stage, i, rest, varmap)):
+                return ("`awbmac-ctl` will ueber den Steuerkanal der laufenden Mac-App "
+                        "eine Rueckfrage oder einen Antrag annehmen (Socket %s/awbmac.sock "
+                        "oder nicht ablesbar). "
+                        "Der Steuerkanal ist kein Mensch. %s" % (LIVE_MAC_LAUF, FREIGABE_HINWEIS))
+    return None
 
 
 def check_freigabe_pfad(command):
@@ -1110,12 +1708,13 @@ def check_freigabe_pfad(command):
             formen.append('${HOME}' + rest)
     # Sprechende Bestandteile zusaetzlich: eine anders zusammengesetzte
     # Pfadangabe (Variable, Teilstueck) faellt damit trotzdem auf.
-    formen.extend(['guard-grants', ask_muster.SCHLUESSEL_NAME, 'pi-workers/rollen'])
+    formen.extend(['guard-grants', ask_muster.SCHLUESSEL_NAME, 'pi-workers/rollen',
+                   script_guard.AUSNAHMEN_NAME])
     for form in formen:
         if form and form in command:
             return ("Der Befehl fasst eine geschuetzte Ablage an (%s). %s"
                     % (form, FREIGABE_HINWEIS))
-    return None
+    return check_awbmac_freigabe(command)
 
 
 # ===========================================================================
@@ -1166,24 +1765,41 @@ def ist_worker_pane():
 # Warum: LOCAL-FIRST-Media-Regel ("website/landing-page images ... never a
 #        paid cloud model/connector") gilt fuer Orchestrator UND jeden Worker,
 #        ist aber nirgends technisch erzwungen — nur Prosa in CLAUDE.md.
-# Blockliste: ~/.claude/hooks/media-cloud-domains.txt (separat, leicht
-#        pflegbar ohne diesen Hook neu zu schreiben).
+# Blockliste: media-cloud-domains.txt NEBEN diesem Skript (Rueckfall
+#        $HOME/.claude/hooks); fehlt sie, warnt der Guard laut.
 # Policy: reines Warnen, kein Deny — die Liste veraltet schnell und manche
 #        Cloud-Aufrufe sind bewusst genehmigte Ausnahmen (z.B. creative-media-
 #        Skill nutzt Higgsfield gezielt); ein Hard-Block waere hier falsch.
 
+MEDIA_CLOUD_DOMAINS_NAME = 'media-cloud-domains.txt'
+
+
+def _media_cloud_domains_file():
+    """Liste neben dem eigenen Skript; Rueckfall auf $HOME/.claude/hooks nur,
+    wenn dort keine liegt (z. B. Skript ausserhalb des Hooks-Ordners kopiert)."""
+    neben = os.path.join(HOOKS_DIR, MEDIA_CLOUD_DOMAINS_NAME)
+    if os.path.isfile(neben):
+        return neben
+    return os.path.join(
+        os.environ.get('HOME', os.path.expanduser('~')), '.claude', 'hooks', MEDIA_CLOUD_DOMAINS_NAME)
+
+
 def check_media_cloud_bash(command):
-    domains_file = os.path.join(
-        os.environ.get('HOME', os.path.expanduser('~')), '.claude', 'hooks', 'media-cloud-domains.txt')
-    if not os.path.isfile(domains_file):
-        return None
     if not command:
         return None
+    domains_file = _media_cloud_domains_file()
     try:
         with open(domains_file, 'r', encoding='utf-8', errors='replace') as fh:
             lines = fh.read().splitlines()
     except OSError:
-        return None
+        lines = []
+    if not any(l.strip() and not l.startswith('#') for l in lines):
+        # Fehlende/leere/unlesbare Liste: laut warnen statt still erlauben.
+        return (
+            "media-cloud-guard: KEINE Domainliste (%s fehlt, ist leer oder unlesbar) -- Cloud-Media-"
+            "Aufrufe werden NICHT erkannt. Liste neben bash-guard.py ablegen. Reine Warnung, kein Block."
+            % MEDIA_CLOUD_DOMAINS_NAME
+        )
 
     hit = None
     for domain in lines:
@@ -1209,7 +1825,7 @@ def check_media_cloud_bash(command):
 # Zweck: BLOCKT einen `git commit`, dessen Nachricht einen Claude-Co-Author-Trailer
 #        oder eine Generated-with-Zeile traegt.
 # Event: PreToolUse, matcher Bash.
-# Warum: Stehende Regel (CLAUDE.md, Standing rules): Commits laufen auf dem
+# Warum: Stehende Regel (~/.claude/AGENTS.md, Schutz und Verifikation): Commits laufen auf dem
 #        Git-Handle des Repo-Besitzers, englische Nachricht, nie ein Claude-
 #        Co-Author-Trailer — sie ueberschreibt ausdruecklich die Voreinstellung
 #        des Harness, der solche Trailer von sich aus anhaengt. Bis 2026-08-03
@@ -1224,7 +1840,7 @@ def check_media_cloud_bash(command):
 #        Pruefzeit noch gar nicht gibt.
 
 COMMIT_TRAILER_MESSAGE = """git commit mit Claude-Trailer abgelehnt.
-  Stehende Regel (CLAUDE.md, Standing rules): Commits laufen auf dem Git-Handle
+  Stehende Regel (~/.claude/AGENTS.md, Schutz und Verifikation): Commits laufen auf dem Git-Handle
   des Repo-Besitzers, die Nachricht ist englisch, und ein Claude-Co-Author-
   Trailer kommt NIE hinein — diese Regel ueberschreibt die Voreinstellung des
   Harness.
@@ -1287,7 +1903,11 @@ def check_ask_muster(pane, command, cwd, session_id, wartender):
         }
 
     if not treffer:
-        return None
+        # Ein Muster in einem Skript, das der Befehl startet. Die Freigabe bindet dann an den
+        # Befehl plus einen Hash des Skripttexts (siehe lib/script_guard.py).
+        treffer, command = script_guard.ask_hit(command, cwd, muster_liste)
+        if not treffer:
+            return None
 
     freigabe_bericht = []
     eingeloest = ask_muster.freigabe_einloesen(pane, cwd, command, bericht=freigabe_bericht)
@@ -1366,6 +1986,12 @@ def check_ask_muster(pane, command, cwd, session_id, wartender):
                          "Neue Fassung waehrend eine andere Frage schon wartet (%s)" %
                          ask_muster.eintrag_label(treffer),
                          command, cwd, session_id)
+        # Auch fuer die neue Fassung kann der Agent im selben Zug warten (29.09.):
+        # ein Mensch kann sie per `--index` waehlen. Der Wortlaut liegt dafuer in
+        # einer eigenen Datei; `warten` erteilt nichts.
+        datei = ask_muster.wortlaut_ablegen(pane, cwd, command)
+        warten_zeile = ("  Auf eine Entscheidung ueber GENAU diese Fassung wartest du im selben Zug mit:\n"
+                        "    %s\n" % ask_muster.warten_aufruf(pane, cwd, datei)) if datei else ""
         return (
             "RUECKFRAGE, keine Ablehnung -- und in diesem Pane wartet bereits eine ANDERE.\n"
             "  Wartende Frage: %s\n"
@@ -1376,20 +2002,32 @@ def check_ask_muster(pane, command, cwd, session_id, wartender):
             "  Lesen und Klicken aendert, waere eine Zustimmung zu etwas Ungelesenem.\n"
             "  Richtig: die offene Frage beantworten lassen (Freigabe-Ansicht, Abschnitt\n"
             "  \"Angehaltene Worker\"), dann weiterarbeiten -- nicht selbst weiter variieren.\n"
+            "  Ist die wartende Frage UEBERFLUESSIG geworden (du brauchst den Befehl nicht\n"
+            "  mehr), nimm sie zurueck: `wb-freigabe zurueckziehen` -- das erteilt nichts,\n"
+            "  es gibt nur den Pane fuer die naechste Frage frei.\n"
+            "%s"
             "  Angehalten von bash-guard-muster."
-            % (wartender.get('command', ''))
+            % (wartender.get('command', ''), warten_zeile)
         )
 
-    reason = ask_muster.deny_text(treffer, max(1, ttl // 60))
+    # Der Wortlaut in einer Datei, damit der Agent IM SELBEN ZUG warten kann
+    # (`wb-freigabe warten`, 29.09.2026) statt seinen Zug zu beenden. Ohne Pane
+    # oder bei nicht schreibbarer Ablage bleibt es beim alten Text.
+    befehl_datei = ask_muster.wortlaut_ablegen(pane, cwd, command) if pane else None
+    reason = ask_muster.deny_text(treffer, max(1, ttl // 60),
+                                  warten=(pane, cwd, befehl_datei) if befehl_datei else None)
     if freigabe_bericht:
         # Der Fall, den es vor dem 07.08. nicht gab: eine Freigabe lag vor und
         # wurde verworfen. Wer das liest, muss beides erfahren -- dass sie da
-        # war, und warum sie nicht zaehlte.
-        reason += ("\n  HINWEIS zur vorliegenden Freigabe: %s\n"
-                   "  Gueltig wird sie nur mit gemessener Herkunft: im Terminal\n"
-                   "  `wb-freigabe erteilen %s <grund>` (ein Mensch am Terminal oder das\n"
-                   "  Programmfenster -- beides wird gemessen, nicht geglaubt)."
-                   % ('; '.join(freigabe_bericht), pane or '<pane>'))
+        # war, und warum sie nicht zaehlte. Seit 29.09. direkt unter der ersten
+        # Zeile statt am Ende: der Text mit dem warten-Aufruf ist laenger, und
+        # eine Anzeige, die nach ~1500 Zeichen kuerzt, verschluckte den Grund.
+        kopf, _, rest = reason.partition('\n')
+        reason = kopf + ("\n  HINWEIS zur vorliegenden Freigabe: %s\n"
+                         "  Gueltig wird sie nur mit gemessener Herkunft: im Terminal\n"
+                         "  `wb-freigabe erteilen %s <grund>` (ein Mensch am Terminal oder das\n"
+                         "  Programmfenster -- beides wird gemessen, nicht geglaubt).\n"
+                         % ('; '.join(freigabe_bericht), pane or '<pane>')) + rest
     if not pane:
         # Ohne TMUX_PANE laesst sich kein Marker schreiben, den die Ansicht
         # zeigen koennte -- die Rueckfrage bliebe unbeantwortbar. Sie
@@ -1422,9 +2060,61 @@ def check_ask_muster(pane, command, cwd, session_id, wartender):
 # Orchestrierung -- Reihenfolge identisch zur bisherigen settings.json-Liste.
 # ===========================================================================
 
-def main():
+# Here-Doc in einem mehrteiligen Befehl (Betreiberentscheidung 2026-10-09):
+# fast jeder Guard hier schneidet Here-Doc-Ruempfe weg (strip_heredocs in
+# rolle, freigabe-pfad, kill-pattern, push-gate, snapshot …), weil ein Rumpf
+# beim Einzelbefehl `cat > f <<'EOF'` nur Text ist. In einem mehrteiligen
+# Befehl kann eine andere Anweisung den Empfaenger umdefinieren oder eine
+# weitere Stufe den Rumpf lesen (cmdshell.heredoc_mehrteilig). Dann laeuft
+# jeder Rumpf zusaetzlich als eigener Befehl durch dieselbe Guard-Kette --
+# ohne Marker, Verlauf, Rueckfrage-Stufe und ohne Wirkung auf eine wartende
+# Freigabe; eine Ablehnung dort lehnt den ganzen Befehl ab. Fehlalarme bei
+# `cd x && cat > f <<'EOF'` mit gesperrten Woertern sind in Kauf genommen
+# (Ausweg: das Write-Werkzeug).
+_RUMPF = [False]
+_RUMPF_TREFFER = []
+
+
+def _rumpf_pruefen(data, rumpf):
+    """(Entscheidung, Guard, Grund), die die Guard-Kette fuer `rumpf` als
+    eigenen Befehl gaebe ('deny' oder 'ask'), sonst None."""
+    tool_input = dict(data.get('tool_input') or {})
+    tool_input['command'] = rumpf
+    payload = json.dumps(dict(data, tool_input=tool_input))
+    out, err = io.StringIO(), io.StringIO()
+    old = sys.stdout, sys.stderr, _RUMPF[0], list(_RUMPF_TREFFER)
+    del _RUMPF_TREFFER[:]
+    _RUMPF[0] = True
+    sys.stdout, sys.stderr = out, err
     try:
-        input_text = sys.stdin.read()
+        rc = main(rumpf_input=payload)
+    except Exception:
+        return None  # ein Absturz ist auch das, was der Hook beim getippten Befehl taete
+    finally:
+        guard = _RUMPF_TREFFER[0] if _RUMPF_TREFFER else 'heredoc'
+        sys.stdout, sys.stderr, _RUMPF[0] = old[0], old[1], old[2]
+        _RUMPF_TREFFER[:] = old[3]
+    if rc == 2:
+        return 'deny', guard, err.getvalue().strip()
+    for zeile in out.getvalue().splitlines():
+        try:
+            hso = json.loads(zeile).get('hookSpecificOutput') or {}
+        except ValueError:
+            continue
+        if hso.get('permissionDecision') in ('deny', 'ask'):
+            return hso['permissionDecision'], guard, hso.get('permissionDecisionReason') or ''
+    return None
+
+
+def main(probe_input=None, rumpf_input=None):
+    # probe_input: das Hook-JSON eines Skriptstuecks (lib/script_guard.py laesst main() ohne
+    # Nebenwirkung ueber Skripttext laufen).
+    # rumpf_input: das Hook-JSON eines Here-Doc-Rumpfs aus einem mehrteiligen Befehl
+    # (_rumpf_pruefen); ebenfalls ohne Nebenwirkung, aber mit allen Guards.
+    probe = probe_input is not None
+    rumpf = rumpf_input is not None
+    try:
+        input_text = probe_input if probe else rumpf_input if rumpf else sys.stdin.read()
     except Exception:
         return 0
     try:
@@ -1450,10 +2140,11 @@ def main():
     # Agent ueberhaupt etwas tun koennte, und dieser Lauf kommt ihm zuvor.
     # Kostet im Normalfall einen Verzeichnisblick; tmux wird nur gefragt,
     # solange noch kein gueltiger Eintrag da ist.
-    try:
-        rollen.erstsicht(pane)
-    except Exception:
-        pass
+    if not probe and not rumpf:
+        try:
+            rollen.erstsicht(pane)
+        except Exception:
+            pass
     session_id = data.get('session_id')
     if not isinstance(session_id, str):
         session_id = ''
@@ -1461,7 +2152,7 @@ def main():
     # Ablehnung gilt erst wieder, wenn DIESER Versuch ebenfalls abgelehnt wird.
     # Eine noch gueltige RUECKFRAGE ueberlebt das dagegen: sie ist erst
     # erledigt, wenn ein Mensch entschieden hat oder sie abgelaufen ist.
-    wartender = clear_block(pane)
+    wartender = None if probe or rumpf else clear_block(pane)
 
     # Der Zustand der Schalter wird EINMAL gelesen und die Pane-Rolle hoechstens
     # einmal ermittelt: `get_pane_role()` ruft tmux, und das darf nicht vor jedem
@@ -1479,9 +2170,16 @@ def main():
     if any(isinstance(guards.get(g), dict) and guards[g].get('aus') is True
            for g in GUARD_NAMES):
         rolle()
-    abschaltung_vermerken(guards, _rolle[0] or '')
+    if not probe and not rumpf:
+        abschaltung_vermerken(guards, _rolle[0] or '')
 
     warn_msgs = []
+
+    def laeuft(name):
+        """Im Probelauf (Skripttext) nur die Guards aus script_guard.SKRIPT_GUARDS,
+        sonst alle. Die uebrigen sehen in Skripten vor allem isolierte Testumgebungen
+        (eigener tmux-Socket, Temp-Repo, Temp-Ordner) und bleiben beim getippten Befehl."""
+        return not probe or name in script_guard.SKRIPT_GUARDS
 
     def abgeschaltet(name, reason):
         """True, wenn dieser Guard gerade nicht greift. Sammelt dann die
@@ -1501,12 +2199,18 @@ def main():
         Knoepfe und steht ohnehin im Verlauf. Wuerde sie die Frage
         ueberschreiben, waere genau der Befund vom 05.08. wieder da, nur mit
         einem anderen Ausloeser."""
+        if probe:
+            script_guard.PROBE_HITS.append(guard)
+            return
+        if rumpf:
+            _RUMPF_TREFFER.append(guard)
+            return
         if wartender is not None:
             return
         note_block(pane, guard, reason, command, cwd, session_id)
 
     # 1. secrets
-    reason = check_secrets(command, cwd)
+    reason = check_secrets(command, cwd) if laeuft('secrets') else None
     if reason and not abgeschaltet('secrets', reason):
         merken('secrets', reason)
         append_block_log(pane, 'secrets', reason, command, cwd, session_id)
@@ -1517,7 +2221,7 @@ def main():
     #     ein Fall, den secrets schon ablehnt (z.B. `git add -A` mit einem
     #     .env im Working Tree), ist damit laengst weg, bevor dieser Guard
     #     ueberhaupt drankommt.
-    reason = check_git_add(command, cwd)
+    reason = check_git_add(command, cwd) if laeuft('git-add') else None
     if reason and not abgeschaltet('git-add', reason):
         merken('git-add', reason)
         append_block_log(pane, 'git-add', reason, command, cwd, session_id)
@@ -1528,7 +2232,7 @@ def main():
     #    Ein abgeschalteter Guard verschluckt nur seine ABLEHNUNG. Was das
     #    lib-Modul sonst ausgibt (Warnung, Rueckfrage), geht unveraendert durch --
     #    abschalten heisst "lehnt nicht mehr ab", nicht "sagt nichts mehr".
-    kp_out = with_stdin(input_text, kill_pattern_classify.main)
+    kp_out = with_stdin(input_text, kill_pattern_classify.main) if laeuft('kill-pattern') else ''
     if kp_out.strip():
         kp_reason = _deny_reason_if_any(kp_out)
         if kp_reason is not None and abgeschaltet('kill-pattern', kp_reason):
@@ -1541,26 +2245,28 @@ def main():
             return 0
 
     # 3. live-config (Bash-Zweig) -- warnt nur, stoppt die Kette nicht.
-    lc_warn = check_live_config_bash(command, cwd)
+    lc_warn = check_live_config_bash(command, cwd) if laeuft('live-config') else None
     if lc_warn and not abgeschaltet('live-config', lc_warn):
         warn_msgs.append(lc_warn)
 
     # 3b. pane-write -- lehnt ab. Steht direkt hinter live-config, weil beide
     #     dieselbe Familie von Befehlen ansehen: die Warnung dort erklaert den
     #     Testfall, die Ablehnung hier zieht die Grenze.
-    pw_reason = check_pane_write_bash(command)
+    pw_reason = check_pane_write_bash(command) if laeuft('pane-write') else None
     if pw_reason and not abgeschaltet('pane-write', pw_reason):
         merken('pane-write', pw_reason)
         append_block_log(pane, 'pane-write', pw_reason, command, cwd, session_id)
         print_deny(pw_reason)
         return 0
 
-    # 3c/3d. rolle und freigabe-pfad -- beide ohne Schalter (Begruendung oben).
+    # 3c/3c2/3d. rolle, worker-name und freigabe-pfad -- ohne Schalter (Begruendung oben).
     #        Sie stehen VOR dem Push-Gate, weil sie dessen Grundlage schuetzen:
     #        wer die Rollenquelle umschreiben darf, hat das Push-Verbot schon
     #        beantwortet, bevor es gefragt wird.
-    for name, reason in (('rolle', check_rollen_option(command)),
-                         ('freigabe-pfad', check_freigabe_pfad(command))):
+    for name, pruefung in (('rolle', check_rollen_option),
+                           ('worker-name', check_worker_option),
+                           ('freigabe-pfad', check_freigabe_pfad)):
+        reason = pruefung(command) if laeuft(name) else None
         if reason:
             merken(name, reason)
             append_block_log(pane, name, reason, command, cwd, session_id)
@@ -1568,7 +2274,7 @@ def main():
             return 0
 
     # 4. push-gate-worker (lib, importiert, + Rollen-Check)
-    pg_out = with_stdin(input_text, push_gate_classify.main).strip()
+    pg_out = with_stdin(input_text, push_gate_classify.main).strip() if laeuft('push-gate') else ''
     if pg_out == '1':
         ist_worker, warum = ist_worker_pane()
         if ist_worker and not abgeschaltet('push-gate', PUSH_GATE_REASON):
@@ -1579,12 +2285,12 @@ def main():
             return 0
 
     # 5. media-cloud-guard (Bash-Zweig) -- warnt nur.
-    mc_warn = check_media_cloud_bash(command)
+    mc_warn = check_media_cloud_bash(command) if laeuft('media-cloud') else None
     if mc_warn and not abgeschaltet('media-cloud', mc_warn):
         warn_msgs.append(mc_warn)
 
     # 6. screencapture (lib, importiert)
-    sc_out = with_stdin(input_text, screencapture_classify.main)
+    sc_out = with_stdin(input_text, screencapture_classify.main) if laeuft('screencapture') else ''
     if sc_out.strip():
         sc_reason = _deny_reason_if_any(sc_out)
         if sc_reason is not None and abgeschaltet('screencapture', sc_reason):
@@ -1597,7 +2303,7 @@ def main():
             return 0
 
     # 7. snapshot (lib, importiert)
-    sn_out = with_stdin(input_text, snapshot_classify.main)
+    sn_out = with_stdin(input_text, snapshot_classify.main) if laeuft('snapshot') else ''
     if sn_out.strip():
         sn_reason = _deny_reason_if_any(sn_out)
         if sn_reason is not None and abgeschaltet('snapshot', sn_reason):
@@ -1611,12 +2317,55 @@ def main():
 
     # 8. commit-trailer -- einziger Guard mit exit(2)+stderr statt JSON-deny,
     #    exakt wie im Original.
-    if check_commit_trailer(command) and not abgeschaltet('commit-trailer',
+    trailer = (script_guard.commit_trailer_im_skript(command, check_commit_trailer) if probe
+               else check_commit_trailer(command))
+    if trailer and not abgeschaltet('commit-trailer',
                                                           COMMIT_TRAILER_MESSAGE):
         merken('commit-trailer', COMMIT_TRAILER_MESSAGE)
         append_block_log(pane, 'commit-trailer', COMMIT_TRAILER_MESSAGE, command, cwd, session_id)
         sys.stderr.write(COMMIT_TRAILER_MESSAGE)
         return 2
+
+    # 8a. Die harten Guards aus script_guard.SKRIPT_GUARDS ueber die Skripte, die dieser Befehl
+    #     startet (Kommentarblock in lib/script_guard.py). Ein Probelauf (main() fuer ein
+    #     Skriptstueck) endet hier: gefragt sind nur diese harten Guards.
+    if probe:
+        return 0
+    sh = script_guard.hard_hit(command, cwd, data, main)
+    if sh is not None:
+        decision, guard, reason = sh
+        merken(guard, reason)
+        append_block_log(pane, guard, reason, command, cwd, session_id)
+        if decision == 'deny':
+            print_deny(reason)
+        else:
+            print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse',
+                                                     'permissionDecision': 'ask',
+                                                     'permissionDecisionReason': reason}}))
+        return 0
+
+    # 8b. Here-Doc in einem mehrteiligen Befehl: jeder Rumpf (auch einer in
+    #     `$( )`) zusaetzlich als eigener Befehl durch diese Kette (Kommentar
+    #     bei _rumpf_pruefen). Ein Probelauf ueber Skripttext ist oben schon
+    #     zu Ende: dort ist fast jeder Befehl mehrteilig.
+    teile = cmdshell.heredoc_split(command)
+    if cmdshell.heredoc_mehrteilig(teile):
+        for b in teile.bodies:
+            treffer = _rumpf_pruefen(data, b['body'])
+            if treffer is None:
+                continue
+            decision, guard, reason = treffer
+            reason = ("Here-Doc in einem mehrteiligen Befehl, Rumpf als Befehl geprueft: %s\n\n%s"
+                      % (reason, cmdshell.HEREDOC_MEHRTEILIG_AUSWEG))
+            merken(guard, reason)
+            append_block_log(pane, guard, reason, command, cwd, session_id)
+            if decision == 'deny':
+                print_deny(reason)
+            else:
+                print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse',
+                                                         'permissionDecision': 'ask',
+                                                         'permissionDecisionReason': reason}}))
+            return 0
 
     # 9. Rueckfrage-Stufe (Muster-Erkennung riskanter Befehle).
     #    Steht mit Absicht GANZ UNTEN: alles, was die acht Guards oben hart
@@ -1624,6 +2373,8 @@ def main():
     #    bestehende Ablehnung aufweichen, nur etwas anhalten, das heute
     #    durchlaeuft. Und eine Freigabe wird ERST HIER gelesen -- sie ist nie
     #    ein Weg an einem der acht Guards vorbei.
+    if rumpf:
+        return 0
     reason = check_ask_muster(pane, command, cwd, session_id, wartender)
     if reason and not abgeschaltet('muster', reason):
         print_deny(reason)

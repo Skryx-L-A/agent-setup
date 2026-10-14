@@ -62,6 +62,18 @@ def tmux(*args: str) -> str:
         return ""
 
 
+def pane_frei(pane: str) -> str:
+    """Leer = frei, sonst der Grund. Unklar (Werkzeug fehlt, keine Antwort) = nicht frei."""
+    pw = Path.home() / ".local" / "bin" / "wb-pane-write"
+    if not pw.exists():
+        return "wb-pane-write fehlt"
+    try:
+        r = subprocess.run([str(pw), "frei", pane], capture_output=True, text=True, timeout=30)
+    except Exception:
+        return "Pruefung ohne Antwort"
+    return "" if r.returncode == 0 else (r.stdout.strip() or f"rc {r.returncode}")
+
+
 def log(msg: str) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with LOG.open("a", encoding="utf-8") as fh:
@@ -177,6 +189,13 @@ def main() -> int:
             print(f"{pane}: WUERDE Resume senden (Reset war {reset:%F %H:%M})")
             continue
 
+        # Nie in einen offenen Dialog oder auf ungesendeten Text tippen (2026-10-09):
+        # dieselbe Pruefung wie wb-pane-write. Nicht frei = diesmal kein Resume, der
+        # naechste Lauf versucht es erneut (der Stempel bleibt ungeschrieben).
+        frei = pane_frei(pane)
+        if frei:
+            log(f"{pane}: nicht frei ({frei}) — kein Resume, naechster Lauf prueft erneut")
+            continue
         tmux("send-keys", "-t", pane, RESUME)
         time.sleep(1)
         tmux("send-keys", "-t", pane, "Enter")

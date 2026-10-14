@@ -35,7 +35,22 @@ import hashlib
 import datetime
 
 STATE_DIR = os.path.expanduser("~/.local/state/claude-md-lint")
-DEFAULT_FILE = os.path.expanduser("~/.claude/CLAUDE.md")
+# Seit 25.09.2026 stehen die Hausregeln in ~/.claude/AGENTS.md; bis zur Umstellung in CLAUDE.md.
+def _regeldatei():
+    for kandidat in ("~/.claude/AGENTS.md", "~/.claude/CLAUDE.md"):
+        pfad = os.path.expanduser(kandidat)
+        try:
+            with open(pfad, encoding="utf-8") as fh:
+                if fh.read(4096).lstrip().startswith("# Werkbank: gemeinsame Regeln"):
+                    return pfad
+        except OSError:
+            pass
+    if os.path.exists(os.path.expanduser("~/.claude/CLAUDE.md")) and not os.path.exists(os.path.expanduser("~/.claude/AGENTS.md")):
+        return os.path.expanduser("~/.claude/CLAUDE.md")
+    return os.path.expanduser("~/.claude/AGENTS.md")
+
+
+DEFAULT_FILE = _regeldatei()
 INCIDENT_TEMPLATE = os.path.expanduser("~/Knowledge/templates/incident.md")
 
 LONG_BLOCK_LINES = 6      # ab dieser Zeilenzahl gilt ein Vorfall-Block als "lang"

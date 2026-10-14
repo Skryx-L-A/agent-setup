@@ -36,7 +36,11 @@ export interface SessionPayload {
   initialContent: string;
 }
 
-export interface PaneBox { paneId: string; x: number; y: number; cols: number; rows: number }
+export interface PaneBox {
+  paneId: string; x: number; y: number; cols: number; rows: number;
+  /** Gast-Tor (27.09.2026): ein pty-Terminal, das fuer diesen echten Pane der fernen Sitzung steht. */
+  stehtFuer?: string;
+}
 export interface LayoutPayload {
   art: 'pane' | 'tab';
   /**

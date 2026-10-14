@@ -64,12 +64,15 @@ def print_warn(reason):
 # Warum: LOCAL-FIRST-Media-Regel ("website/landing-page images ... never a
 #        paid cloud model/connector") gilt fuer Orchestrator UND jeden Worker,
 #        ist aber nirgends technisch erzwungen — nur Prosa in CLAUDE.md.
-# Blockliste: ~/.claude/hooks/media-cloud-domains.txt (separat, leicht
-#        pflegbar ohne diesen Hook neu zu schreiben).
+# Blockliste: media-cloud-domains.txt NEBEN diesem Skript (Rueckfall
+#        $HOME/.claude/hooks); fehlt sie, warnt der Guard laut.
 # Policy: reines Warnen, kein Deny — die Liste veraltet schnell und manche
 #        Cloud-Aufrufe sind bewusst genehmigte Ausnahmen (z.B. creative-media-
 #        Skill nutzt Higgsfield gezielt); ein Hard-Block waere hier falsch.
 DOMAINS_FILE = os.path.join(HOOKS_DIR, "media-cloud-domains.txt")
+if not os.path.isfile(DOMAINS_FILE):
+    DOMAINS_FILE = os.path.join(os.environ.get("HOME", os.path.expanduser("~")),
+                                ".claude", "hooks", "media-cloud-domains.txt")
 
 # MCP-Medien-Konnektoren: der wahrscheinlichere Weg als ein roher curl-Aufruf.
 # Bis 2026-08-03 war er ungedeckt — der Guard kannte nur Bash und WebFetch, waehrend
@@ -93,8 +96,6 @@ MCP_MEDIA_NOTICE = """HINWEIS (media-cloud-guard): '%s' erzeugt Medien in der CL
 
 
 def main():
-    if not os.path.isfile(DOMAINS_FILE):
-        return
     try:
         data = json.load(sys.stdin)
     except Exception:
@@ -117,15 +118,24 @@ def main():
     if not haystack:
         return
 
+    try:
+        with open(DOMAINS_FILE, encoding="utf-8", errors="replace") as f:
+            domains = [l.strip() for l in f]
+    except OSError:
+        domains = []
+    domains = [d for d in domains if d and not d.startswith("#")]
+    if not domains:
+        # Fehlende/leere/unlesbare Liste: laut warnen (kein Block), nicht still erlauben.
+        print_warn("media-cloud-guard: KEINE Domainliste (media-cloud-domains.txt fehlt, ist leer oder "
+                   "unlesbar) -- Cloud-Media-Aufrufe werden NICHT erkannt. Liste neben "
+                   "media-cloud-guard.py ablegen. Reine Warnung, kein Block.")
+        return
+
     hit = None
-    with open(DOMAINS_FILE) as f:
-        for line in f:
-            domain = line.strip()
-            if not domain or domain.startswith("#"):
-                continue
-            if domain in haystack:
-                hit = domain
-                break
+    for domain in domains:
+        if domain in haystack:
+            hit = domain
+            break
     if not hit:
         return
 

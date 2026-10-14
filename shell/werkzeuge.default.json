@@ -1,0 +1,195 @@
+{
+  "schema": "werkzeuge/1",
+  "_comment": [
+    "Eine Quelle fuer die Werkzeuge der Werkbank (MCP, Hooks, Prompts, Plugins, Rechte). Gelesen von wb-werkzeuge,",
+    "Plan: _recherche/werkzeug-plan-2026-10-13.md. Geheimnisse nur als Verweis (schluesselbund:<dienst>/<konto>",
+    "oder filter:<name>), nie als Wert. harnesses: Liste oder alle-mit-mcp / alle-mit-prompts / alle-mit-hooks",
+    "(aufgeloest ueber toolAdapter.<art> in models.default.json). maschinen filtert nach mac|peer.",
+    "basic-memory steht bewusst nicht hier (seit 23.09. stillgelegt).",
+    "hub: der Werkbank-Hub (wb-hub, Hub-Entwurf 5.1). Mit Abschnitt hub sind alle mcp-Eintraege ausser werkbank Hub-Backends: der Hub startet sie, die Adapter schreiben sie in keine Harness-Datei; harnesses ist dort die Sichtbarkeit im Hub. Jeder Harness mit MCP traegt nur den Eintrag werkbank (token hub: Bearer aus WB_HUB_TOKEN, {harness} in der url)."
+  ],
+  "hub": {
+    "port": 8790,
+    "idleMinutes": 10,
+    "maschinen": [
+      "mac",
+      "peer"
+    ]
+  },
+  "mcp": {
+    "werkbank": {
+      "transport": "http",
+      "url": "http://127.0.0.1:8790/mcp?harness={harness}",
+      "token": "hub",
+      "harnesses": "alle-mit-mcp",
+      "maschinen": [
+        "mac",
+        "peer"
+      ],
+      "zweck": "Werkbank-Hub: der eine MCP-Eintrag jedes Harness; brain, playwright, higgsfield, magic stehen als Backends dahinter"
+    },
+    "brain": {
+      "transport": "stdio",
+      "command": "wb-mcp-start",
+      "args": [
+        "brain"
+      ],
+      "start": [
+        "brain",
+        "mcp"
+      ],
+      "harnesses": "alle-mit-mcp",
+      "maschinen": [
+        "mac",
+        "peer"
+      ],
+      "zweck": "Vault-Suche als MCP"
+    },
+    "playwright": {
+      "transport": "http",
+      "url": "http://127.0.0.1:8767/mcp",
+      "harnesses": [
+        "claude",
+        "codex",
+        "opencode"
+      ],
+      "maschinen": [
+        "mac"
+      ],
+      "zweck": "geteilter Browser-Server (mcp-shared)"
+    },
+    "higgsfield": {
+      "transport": "http",
+      "url": "https://mcp.higgsfield.ai/mcp",
+      "ueber_hub": false,
+      "grund": "entfernter Server mit OAuth im Client; der Hub spricht nur lokales http und kann kein OAuth",
+      "harnesses": "alle-mit-mcp",
+      "maschinen": [
+        "mac",
+        "peer"
+      ],
+      "zweck": "Higgsfield-MCP (der Nutzer 13.10.: auf beiden Maschinen, in jedem MCP-faehigen Harness)",
+      "hinweis": "gemessen auf peer 13.10.: type http, keine headers, keine env. Claude traegt ihn direkt in die Plugin-.mcp.json (Anmeldung macht Claude); fuer die anderen Harnesses ist der Weg nicht gemessen (status OFFEN)"
+    },
+    "magic": {
+      "transport": "stdio",
+      "command": "wb-mcp-start",
+      "args": [
+        "magic"
+      ],
+      "start": [
+        "npx",
+        "-y",
+        "@21st-dev/magic@latest"
+      ],
+      "geheimnisse": {
+        "TWENTY_FIRST_API_KEY": "schluesselbund:magic-mcp/default"
+      },
+      "harnesses": "alle-mit-mcp",
+      "maschinen": [
+        "mac",
+        "peer"
+      ],
+      "zweck": "Magic-MCP (der Nutzer 13.10.: auf beiden Maschinen, in jedem MCP-faehigen Harness)",
+      "hinweis": "gemessen auf peer 13.10.: npx -y @21st-dev/magic@latest, liest API_KEY oder TWENTY_FIRST_API_KEY. README: Magic MCP ist jetzt der 21st MCP, alte Magic-Schluessel wurden zurueckgesetzt - der Schluessel unter magic-mcp/default muss evtl. neu erzeugt werden"
+    }
+  },
+  "hooks": {
+    "inbox-einspielen": {
+      "ereignisse": [
+        "PostToolUse:*",
+        "UserPromptSubmit"
+      ],
+      "befehl": "bash \"$HOME/.claude/hooks/inbox-einspielen.sh\"",
+      "timeout": 5,
+      "harnesses": "alle-mit-hooks",
+      "maschinen": [
+        "mac",
+        "peer"
+      ]
+    },
+    "ergebnis-beleg-gate": {
+      "ereignisse": [
+        "PreToolUse:Write|Edit"
+      ],
+      "befehl": "bash \"$HOME/.claude/hooks/ergebnis-beleg-gate.sh\"",
+      "timeout": 10,
+      "harnesses": "alle-mit-hooks",
+      "maschinen": [
+        "mac",
+        "peer"
+      ]
+    },
+    "profil-sperre": {
+      "ereignisse": [
+        "PreToolUse:*"
+      ],
+      "befehl": "bash \"$HOME/.claude/hooks/profil-sperre.sh\"",
+      "timeout": 10,
+      "harnesses": "nur-traeger",
+      "grund": "registriert der Agenten-Traeger selbst je Claude-Zug (agents_traeger.py, eigene turn-settings.json); nicht ins Plugin, in kein Harness-Ausrollen (WO 13.10. 19:52)",
+      "maschinen": [
+        "mac",
+        "peer"
+      ]
+    },
+    "reviewer-sperre": {
+      "ereignisse": [
+        "PreToolUse:Write|Edit|NotebookEdit",
+        "PreToolUse:Bash",
+        "PreToolUse:Skill"
+      ],
+      "befehl": "bash \"$HOME/.claude/hooks/reviewer-sperre.sh\"",
+      "timeout": 10,
+      "harnesses": "alle-mit-hooks",
+      "maschinen": [
+        "mac",
+        "peer"
+      ]
+    },
+    "skills-sperre": {
+      "ereignisse": [
+        "PreToolUse:Bash",
+        "PreToolUse:Skill",
+        "PreToolUse:Read|Grep|Glob",
+        "PreToolUse:Write|Edit|MultiEdit|NotebookEdit"
+      ],
+      "befehl": "bash \"$HOME/.claude/hooks/skills-sperre.sh\"",
+      "timeout": 10,
+      "harnesses": "nur-traeger",
+      "grund": "registriert der Agenten-Traeger selbst je Claude-Zug (agents_traeger.py, eigene turn-settings.json); nicht ins Plugin, in kein Harness-Ausrollen (WO 13.10. 19:52)",
+      "maschinen": [
+        "mac",
+        "peer"
+      ]
+    },
+    "stop-aufgabe-zugende": {
+      "ereignisse": [
+        "Stop"
+      ],
+      "befehl": "bash \"$HOME/.claude/hooks/stop-aufgabe-zugende.sh\"",
+      "timeout": 10,
+      "harnesses": "alle-mit-hooks",
+      "maschinen": [
+        "mac",
+        "peer"
+      ]
+    },
+    "testschutz-gate": {
+      "ereignisse": [
+        "PreToolUse:Bash",
+        "PreToolUse:Write|Edit"
+      ],
+      "befehl": "bash \"$HOME/.claude/hooks/testschutz-gate.sh\"",
+      "timeout": 10,
+      "harnesses": "alle-mit-hooks",
+      "maschinen": [
+        "mac",
+        "peer"
+      ]
+    }
+  },
+  "prompts": {},
+  "plugins": {},
+  "rechte": {}
+}

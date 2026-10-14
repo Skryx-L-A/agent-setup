@@ -5,7 +5,7 @@ Claude Code (SPEC-V3-MODELS.md section E).
   wb-instructions sync [--dry-run] [--harness <id>] [--force]
 
 Canonical sources (never written by this tool, only read):
-  ~/.claude/CLAUDE.md
+  ~/.claude/AGENTS.md  (the house rules; ~/.claude/CLAUDE.md until the switch, see regeldatei())
   ~/.claude/roles/orchestrator.md
   ~/.claude/roles/agent.md
   ~/.claude/skills/*/SKILL.md
@@ -41,7 +41,30 @@ def hp(p):
     return os.path.expanduser(p)
 
 
-SRC_CLAUDE = hp("~/.claude/CLAUDE.md")
+def regeldatei():
+    """The house rules file. der Nutzer, 25.09.2026: AGENTS.md is the one instruction file for
+    every harness, CLAUDE.md goes away (Claude Code reads AGENTS.md too -- measured with a
+    code word). During the switch either file may hold the rules; the one carrying the
+    house header wins, AGENTS.md first. A stray CLAUDE.md that Claude Code's /init or
+    /memory might create later therefore never takes over again."""
+    kopf = "# Werkbank: gemeinsame Regeln"
+    for kandidat in ("~/.claude/AGENTS.md", "~/.claude/CLAUDE.md"):
+        pfad = hp(kandidat)
+        try:
+            with open(pfad, encoding="utf-8") as fh:
+                if fh.read(4096).lstrip().startswith(kopf):
+                    return pfad
+        except OSError:
+            pass
+    # Keine traegt den Kopf (frische Maschine, Testvorlage): eine vorhandene CLAUDE.md
+    # bleibt die Quelle, bis AGENTS.md da ist.
+    if os.path.exists(hp("~/.claude/CLAUDE.md")) and not os.path.exists(hp("~/.claude/AGENTS.md")):
+        return hp("~/.claude/CLAUDE.md")
+    return hp("~/.claude/AGENTS.md")
+
+
+SRC_CLAUDE = regeldatei()
+SRC_CLAUDE_ANZEIGE = "~/.claude/" + os.path.basename(SRC_CLAUDE)
 SRC_ORCH = hp("~/.claude/roles/orchestrator.md")
 SRC_AGENT = hp("~/.claude/roles/agent.md")
 SRC_SKILLS_DIR = hp("~/.claude/skills")
@@ -382,9 +405,13 @@ def write_generated(target_path, full_content, body_hash, dry_run, day_tag, forc
 # Per-harness instruction file body
 # ---------------------------------------------------------------------------
 
+def _mit_regeldatei(text):
+    return text.replace("@@REGELDATEI@@", SRC_CLAUDE_ANZEIGE)
+
+
 def render_harness_body(harness, claude_text, orch_text, agent_text, skills_index):
     extra = ("\n" + harness["extra_note"] + "\n") if harness.get("extra_note") else ""
-    return (
+    return _mit_regeldatei(
         "# %s -- Regeln, Rollen und Skills (uebersetzt aus Claude Code)\n\n"
         "Diese Datei buendelt fuer diesen Harness alle drei kanonischen Quellen von des Nutzers\n"
         "Workbench, weil %s nur EINE automatisch gelesene Instruktionsdatei kennt (kein natives\n"
@@ -395,7 +422,7 @@ def render_harness_body(harness, claude_text, orch_text, agent_text, skills_inde
         "tragen einen Hinweis auf die Modell-Registry. Alles andere ist vollstaendig und\n"
         "unveraendert uebernommen -- Kuerzen gilt in dieser Workbench als Loeschen.\n"
         "%s\n"
-        "## Teil 1 -- Globale Regeln (Quelle: ~/.claude/CLAUDE.md)\n\n"
+        "## Teil 1 -- Globale Regeln (Quelle: @@REGELDATEI@@)\n\n"
         "%s\n\n"
         "## Teil 2 -- Orchestrator-Rolle (Quelle: ~/.claude/roles/orchestrator.md)\n\n"
         "Gilt, wenn dieser Harness die Orchestrator-Session dieser Workbench faehrt.\n\n"
@@ -710,10 +737,10 @@ def router_harnesses():
 
 
 def render_router(harness):
-    return (
+    return _mit_regeldatei(
         "# Werkbank: gemeinsame Anweisungen\n\n"
         "Diese Regeln gelten fuer jeden Harness und jedes Modell. Lies vor der ersten\n"
-        "Aufgabe `~/.claude/CLAUDE.md`; dort stehen Grundregeln und Ausloeser fuer\n"
+        "Aufgabe `@@REGELDATEI@@`; dort stehen Grundregeln und Ausloeser fuer\n"
         "weitere Dateien. Die Pfade sind echte Speicherorte, keine Produktnamen zum\n"
         "Uebersetzen. Bereits gelesene identische Quellen nicht erneut laden.\n\n"
         "Die Rolle kommt aus dem aktuellen Auftrag bzw. dem injizierten Rollen-Prompt.\n"

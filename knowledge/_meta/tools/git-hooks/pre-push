@@ -30,12 +30,12 @@ LARGE_FILE=$(mktemp)
 SECRETS_PATTERNS_FILE=$(mktemp)
 trap "rm -f $SECRETS_FILE $LARGE_FILE $SECRETS_PATTERNS_FILE" EXIT
 
-# Check 1: No files from 90-secrets/ directory
-printf "Checking for 90-secrets/ files...\n" >&2
-if git diff-tree --no-commit-id --name-only -r "$RANGE" 2>/dev/null | grep -q '^90-secrets/' || \
-   git diff --name-only "$RANGE" 2>/dev/null | grep -q '^90-secrets/'; then
-  SECRETS=$(git diff-tree --no-commit-id --name-only -r "$RANGE" 2>/dev/null | grep '^90-secrets/' || git diff --name-only "$RANGE" 2>/dev/null | grep '^90-secrets/')
-  printf "%b\n" "${RED}ERROR: Attempting to push files from 90-secrets/ directory:${NC}" > "$SECRETS_FILE"
+# Check 1: No files from secrets/ directory
+printf "Checking for secrets/ files...\n" >&2
+if git diff-tree --no-commit-id --name-only -r "$RANGE" 2>/dev/null | grep -q '^secrets/' || \
+   git diff --name-only "$RANGE" 2>/dev/null | grep -q '^secrets/'; then
+  SECRETS=$(git diff-tree --no-commit-id --name-only -r "$RANGE" 2>/dev/null | grep '^secrets/' || git diff --name-only "$RANGE" 2>/dev/null | grep '^secrets/')
+  printf "%b\n" "${RED}ERROR: Attempting to push files from secrets/ directory:${NC}" > "$SECRETS_FILE"
   printf "%b\n" "$SECRETS" >> "$SECRETS_FILE"
   HOOK_FAILED=1
 fi

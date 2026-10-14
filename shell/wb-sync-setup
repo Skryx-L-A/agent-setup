@@ -11,13 +11,30 @@
 #   wb-sync-setup --apply    kopiert die Unterschiede zur anderen Maschine
 #   wb-sync-setup --to peer  Ziel erzwingen (Default: die jeweils ANDERE Maschine)
 #
+# WAS ABGEGLICHEN WIRD: Werkzeuge (~/.local/bin), Hooks, Regeldateien (~/.claude/regeln),
+# die Rollen (~/.claude/roles/orchestrator.md und agent.md) und ~/.claude/git-hooks.
+#   - Die Rollen sind QUELLEN, keine erzeugte Ausgabe: `wb-instructions sync` liest sie nur
+#     (siehe dessen Kopf) und leitet daraus die Einstiegsdateien der Harnesses ab. Sie
+#     tragen keine Maschinenangabe, deshalb werden sie kopiert; auf dem Ziel erzeugen liesse
+#     sich nichts, es gibt auf der Zielmaschine keine andere Quelle. Danach gehoert
+#     `wb-instructions sync` auf dem Ziel (erzeugt dessen abgeleitete Dateien neu).
+#   - ~/.claude/git-hooks ist ein Verzeichnis aus EINER Datei (`_verteiler`) und je Git-Hook-
+#     Name einem Symlink darauf. Verglichen werden Name, Art (Datei/Link), Hash bzw.
+#     Link-Ziel und das Ausfuehrungsrecht; uebertragen werden Links als Links und Dateien
+#     mit demselben +x. Fremde Ablage auf dem Ziel (`._*`-Reste von macOS-Archiven) wird
+#     weder verglichen noch angefasst.
+#   - Bevor --apply auf dem Ziel etwas ueberschreibt, kommt die alte Fassung nach
+#     ~/.local/trash-snapshots/<Datum>-sync-setup/ (dort, auf dem Ziel). Schlaegt der
+#     Snapshot fehl, wird dieser Posten NICHT uebertragen.
+#
 # WAS NICHT SYNCHRONISIERT WIRD, und warum:
 #   - `~/.claude/settings.json`: enthaelt maschinenabhaengige Pfade und Hook-Listen.
 #     Der Abgleich zeigt Unterschiede an, kopiert die Datei aber nie — ein blind
 #     ueberschriebenes settings.json kann die Zielmaschine handlungsunfaehig machen.
-#   - `CLAUDE.md`: traegt oben die Maschinenbeschreibung ("Machine: MacBook Pro ..." bzw.
-#     "Machine: Peer-Rechner ..."). Wird nur GEMELDET, nie kopiert.
-#   - `IDENTITY.md`, alles unter `90-secrets/`: per Definition maschinenlokal.
+#   - `CLAUDE.md` und `AGENTS.md`: `CLAUDE.md` traegt oben die Maschinenbeschreibung
+#     ("Machine: MacBook Pro ..." bzw. "Machine: Peer-Rechner ..."); beide stehen in der Umstellung
+#     (AGENTS.md ist die kuenftige Regelquelle). Werden nur GEMELDET, nie kopiert.
+#   - `IDENTITY.md`, alles unter `secrets/`: per Definition maschinenlokal.
 set -uo pipefail
 
 case "$(uname -s)" in Darwin) SELF=mac; OTHER=peer ;; *) SELF=peer; OTHER=mac ;; esac
@@ -99,18 +116,45 @@ FILES=(
   # dass es nicht geprueft hat, statt "nichts gefunden" zu behaupten.
   ".local/bin/wb-nohup" ".local/bin/wb-waisen"
   ".local/bin/wb-belegung" ".local/bin/wb-post"
+  # 2026-10-09: die Belegungstafel. Jede Maschine hat ihre eigene Tafel (peer-ruhe,
+  # peer-suite, peer-gpu), und `wb-tafel --maschine peer` ruft drueben ~/.local/bin/wb-tafel.
+  # Die Vorlage gehoert daneben (wb-tafel liest sie, solange es auf der Maschine keine
+  # Live-Datei ~/.claude/workbench/tafel-plaetze.json gibt); die Live-Datei selbst steht
+  # absichtlich NICHT hier -- sie ist je Maschine einstellbar.
+  ".local/bin/wb-tafel" ".local/bin/tafel-plaetze.default.json"
+  # 2026-10-09: Gruppenkanal, Sitzungs-Inbox, Menschen-Nachweis und GPU-Slot. Alle vier
+  # standen auf peer nur, weil sie von Hand nachgezogen wurden (am 09.10. hashgleich zum
+  # Mac geprueft); ohne Listeneintrag driften sie beim naechsten Ausrollen auseinander.
+  # Maschinen-unabhaengig (wb-inbox verzweigt selbst nach sys.platform).
+  ".local/bin/wb-gruppe" ".local/bin/wb-inbox" ".local/bin/wb-mensch" ".local/bin/gpu-slot"
   # 2026-08-08: der Ausroller fuer Harness-Konfigurationsdateien und die beiden
   # Vorlagen, die er ausrollt. Die Vorlagen sind DATEN und trotzdem hier richtig —
   # sie liegen im Repo unter shell/ und gehoeren damit nach ~/.local/bin wie jede
   # andere Datei dieses Verzeichnisses (so sucht wb-harness-config sie auch).
-  # Genau dieser Eintrag ist der Grund, warum es die Sache gibt: crushrc.default und
-  # kimi-config.default.toml standen bis heute auf keiner Liste, und auf peer lagen
-  # ihre Ziele nur deshalb richtig, weil der Nutzer sie von Hand nachgezogen hat.
-  # Kopiert wird die VORLAGE, nicht das Ziel unter ~/.config bzw. ~/.kimi: was dort
+  # Genau dieser Eintrag ist der Grund, warum es die Sache gibt: crushrc.default (und
+  # bis 13.10. die kimi-Vorlage) stand auf keiner Liste, und auf peer lag das Ziel
+  # nur deshalb richtig, weil der Nutzer es von Hand nachgezogen hat.
+  # Kopiert wird die VORLAGE, nicht das Ziel unter ~/.config: was dort
   # liegt, kann der Nutzer angepasst haben, und das entscheidet drueben
   # `wb-harness-config apply` — es sichert vorher und laesst Angepasstes stehen.
   ".local/bin/wb-harness-config"
-  ".local/bin/crushrc.default" ".local/bin/kimi-config.default.toml"
+  ".local/bin/crushrc.default"
+  # 2026-10-13: die zentrale Werkzeugquelle der Werkbank (Plan werkzeug-plan-2026-10-13).
+  # wb-werkzeuge liest werkzeuge.default.json und models.default.json NEBEN seiner installierten
+  # Kopie und importiert die werkzeuge_*.py daneben; wb-mcp-start (Start der MCP-Server mit
+  # Schluesselbund-Verweis) und wb-werkzeuge-abgleich (Mac gegen peer) gehoeren dazu. Alle sind
+  # maschinen-unabhaengig (die Quelle filtert selbst nach mac|peer). Der Hub (wb-hub, wb_hub_kern.py,
+  # wb_hub_cli.py) laeuft auf beiden Maschinen (hub.maschinen). Was lokal noch nicht installiert
+  # ist, wird oben uebersprungen (`[ "$l" = MISSING ] && continue`) -- ein Eintrag hier stoert also
+  # auch dort nicht, wo Hub oder Werkzeug noch nicht ausgerollt sind; sobald die Datei hier liegt,
+  # fehlt sie drueben nicht mehr unbemerkt.
+  ".local/bin/wb-werkzeuge" ".local/bin/werkzeuge_kern.py" ".local/bin/werkzeuge_claude.py"
+  ".local/bin/werkzeuge_codex.py" ".local/bin/werkzeuge_familie.py" ".local/bin/werkzeuge_geheimnis.py"
+  ".local/bin/werkzeuge.default.json" ".local/bin/models.default.json"
+  ".local/bin/wb-mcp-start" ".local/bin/wb-werkzeuge-abgleich"
+  ".local/bin/wb-hub" ".local/bin/wb_hub_kern.py" ".local/bin/wb_hub_cli.py"
+  ".local/bin/atomar_schreiben.py"
+  ".local/bin/crushrc.default"
   # NICHT hier: wb-shot (macOS `screencapture` plus Swift-Helfer, im Skript selbst als
   # MAC-ONLY vermerkt), <ein eigenes Mailwerkzeug> (macOS-spezifischer Versandweg),
   # <ein eigenes Mailwerkzeug> (einmaliger launchd-Job dieser Maschine, 2026-08-08),
@@ -170,14 +214,21 @@ FILES=(
   # test-guard-parity2.sh die beiden GEGENEINANDER prueft: auf peer fehlte die .py-Datei,
   # und der Vergleich verglich elf von fuenfzehn Faellen gegen "Datei nicht gefunden".
   ".claude/hooks/media-cloud-guard.py"
+  # 2026-10-10: die Rollen standen bis heute unter REPORT_ONLY ("von Hand angleichen"),
+  # obwohl der Kopf sie als abgeglichen nannte -- auf peer blieb roles/agent.md deshalb
+  # auf einer alten Fassung. Sie sind Quellen von `wb-instructions sync`, ohne
+  # Maschinenangabe, also Kopie.
+  ".claude/roles/orchestrator.md" ".claude/roles/agent.md"
 )
 # .claude/skills bewusst NICHT dabei: auf peer liegen die project-kit-Skills einzeln
 # unter ~/.claude/skills/ (47 Stueck), auf dem Mac kommen dieselben als Plugin. Zwei
 # Installationsformen, kein Rueckstand - ein Sync wuerde hier Chaos stiften statt Ordnung.
 DIRS=( ".claude/regeln" ".claude/hooks/lib" )
+# Verzeichnisse mit Dateien UND Symlinks (Art, Link-Ziel und +x zaehlen mit). Nur die
+# Eintraege der Quellseite werden verglichen; was es nur auf dem Ziel gibt, bleibt stehen.
+LINKDIRS=( ".claude/git-hooks" )
 # Nur melden, nie kopieren.
-REPORT_ONLY=( ".claude/settings.json" ".claude/CLAUDE.md"
-              ".claude/roles/orchestrator.md" ".claude/roles/agent.md" )
+REPORT_ONLY=( ".claude/settings.json" ".claude/AGENTS.md" ".claude/CLAUDE.md" )
 
 # NUR DORTHIN (2026-08-13): Dateien, die im REPO liegen und ausschliesslich auf EINE
 # Maschine gehoeren — auf dieser hier soll es sie gar nicht geben. Bis heute konnte
@@ -248,6 +299,29 @@ manifest_remote() { # $1 = relativer Pfad
     | awk '{h=$1; sub(/^\.\//,"",$2); print $2"  "h}' | LC_ALL=C sort
 }
 
+# Eintraege eines Link-Verzeichnisses, je Zeile "<name> L <ziel>" (Symlink) oder
+# "<name> F <hash> <x|->" (Datei, x = ausfuehrbar), sortiert. Dasselbe POSIX-sh-Skript laeuft
+# hier und per ssh drueben (Linux sha256sum bzw. macOS shasum). `._*` (AppleDouble-Reste)
+# zaehlt nicht.
+linkdir_script() { # $1 = relativer Pfad
+  cat <<EOS
+cd "\$HOME/$1" 2>/dev/null || exit 0
+for e in ./* ./.[!.]*; do
+  { [ -e "\$e" ] || [ -L "\$e" ]; } || continue
+  n=\${e#./}
+  case "\$n" in ._*) continue ;; esac
+  if [ -L "\$e" ]; then echo "\$n L \$(readlink "\$e")"
+  elif [ -f "\$e" ]; then
+    h=\$( (sha256sum "\$e" 2>/dev/null || shasum -a 256 "\$e") | cut -d' ' -f1 )
+    if [ -x "\$e" ]; then x=x; else x=-; fi
+    echo "\$n F \$h \$x"
+  fi
+done | LC_ALL=C sort
+EOS
+}
+linkdir_local()  { sh -c "$(linkdir_script "$1")"; }
+linkdir_remote() { ssh_other "$(linkdir_script "$1")" 2>/dev/null; }
+
 for d in "${DIRS[@]}"; do
   [ -d "$HOME/$d" ] || continue
   lman="$(manifest_local "$d")"
@@ -260,6 +334,29 @@ for d in "${DIRS[@]}"; do
     abw="$(diff <(printf '%s\n' "$lman") <(printf '%s\n' "$rman") 2>/dev/null \
            | awk '/^</{print $2}' | LC_ALL=C sort -u | tr '\n' ' ')"
     echo "  ABWEICHEND   $d/  — ${abw:-Inhalt weicht ab}"; diffs+=("$d")
+  fi
+done
+
+# Link-Verzeichnisse: je Eintrag der Quellseite vergleichen (Name, Art, Hash/Ziel, +x).
+linkdir_todo=()    # "<verzeichnis>|<name>|<art>|<ziel oder x|->" -- was zu uebertragen ist
+for d in "${LINKDIRS[@]}"; do
+  [ -d "$HOME/$d" ] || continue
+  lman="$(linkdir_local "$d")"
+  rman="$(linkdir_remote "$d")"
+  if [ -z "$rman" ]; then
+    echo "  FEHLT dort   $d/  ($(printf '%s\n' "$lman" | grep -c .) Eintraege hier)"
+    missing+=("$d")
+  fi
+  abw=()
+  while IFS= read -r zeile; do
+    [ -n "$zeile" ] || continue
+    name="${zeile%% *}"
+    grep -qxF -- "$zeile" <<<"$rman" && continue
+    abw+=("$name")
+    linkdir_todo+=("$d|$zeile")
+  done <<<"$lman"
+  if [ -n "$rman" ] && [ "${#abw[@]}" -gt 0 ]; then
+    echo "  ABWEICHEND   $d/  — ${abw[*]}"; diffs+=("$d")
   fi
 done
 
@@ -310,20 +407,64 @@ if [ "$APPLY" != 1 ]; then
 fi
 
 echo "Uebertrage $n Posten nach $OTHER ..."
+
+# Snapshot VOR dem Ueberschreiben (Haus-Regel): die alte Fassung jedes Postens, den es auf
+# dem Ziel schon gibt, kommt nach ~/.local/trash-snapshots/<Datum>-sync-setup/ AUF DEM ZIEL.
+# Gibt es dort heute schon einen Snapshot (zweiter Lauf am selben Tag), bekommt dieser
+# Lauf einen eigenen Ordner mit Uhrzeit -- der erste bleibt unveraendert.
+SNAP=""
+snap_init() {
+  [ -n "$SNAP" ] && return 0
+  SNAP="$(ssh_other 'd="$HOME/.local/trash-snapshots/$(date +%F)-sync-setup"; [ -e "$d" ] && d="$d-$(date +%H%M%S)"; mkdir -p "$d" && echo "$d"' 2>/dev/null)"
+  [ -n "$SNAP" ]
+}
+# $1 = Pfad relativ zu $HOME; sichert ihn (Datei, Link oder Ordner), falls er drueben existiert.
+snap_item() {
+  snap_init || return 1
+  ssh_other "src=\$HOME/$1; if [ -e \"\$src\" ] || [ -L \"\$src\" ]; then mkdir -p \"$SNAP/\$(dirname $1)\" && cp -a \"\$src\" \"$SNAP/$1\"; fi" 2>/dev/null
+}
+
 # bash 3.2 (macOS) behandelt ein LEERES Array unter `set -u` als ungesetzt und
 # bricht ab — deshalb die +-Ersetzung, die bei leerem Array gar nichts einsetzt.
 for p in ${missing[@]+"${missing[@]}"} ${diffs[@]+"${diffs[@]}"}; do
+  case " ${LINKDIRS[*]} " in *" $p "*) continue ;; esac   # Link-Verzeichnisse: unten
   if [ -d "$HOME/$p" ]; then
+    snap_item "$p" || { echo "  FEHLER  $p/  (Snapshot auf $OTHER fehlgeschlagen — nicht uebertragen)"; continue; }
     ssh_other "mkdir -p \$HOME/$p" 2>/dev/null
     scp -q -r "$HOME/$p/." "$OTHER:~/$p/" && echo "  ok  $p/"
   else
+    snap_item "$p" || { echo "  FEHLER  $p  (Snapshot auf $OTHER fehlgeschlagen — nicht uebertragen)"; continue; }
     ssh_other "mkdir -p \$(dirname \$HOME/$p)" 2>/dev/null
     scp -q "$HOME/$p" "$OTHER:~/$p" && echo "  ok  $p"
     case "$p" in .local/bin/*|*.sh) ssh_other "chmod +x \$HOME/$p" 2>/dev/null ;; esac
   fi
 done
+
+# Link-Verzeichnisse: Links als Links, Dateien mit ihrem +x. Vorher wird der Zieleintrag
+# entfernt: scp auf einen vorhandenen Symlink schriebe sonst DURCH den Link in dessen Ziel
+# (ein Hook-Name, der noch auf _verteiler zeigt, wuerde den Verteiler ueberschreiben).
+for e in ${linkdir_todo[@]+"${linkdir_todo[@]}"}; do
+  d="${e%%|*}"; zeile="${e#*|}"
+  name="${zeile%% *}"; rest="${zeile#* }"; art="${rest%% *}"; wert="${rest#* }"
+  snap_item "$d/$name" || { echo "  FEHLER  $d/$name  (Snapshot auf $OTHER fehlgeschlagen — nicht uebertragen)"; continue; }
+  ssh_other "mkdir -p \$HOME/$d" 2>/dev/null
+  if [ "$art" = L ]; then
+    ssh_other "rm -f \$HOME/$d/$name && ln -s '$wert' \$HOME/$d/$name" 2>/dev/null \
+      && echo "  ok  $d/$name  (Link -> $wert)" || echo "  FEHLER  $d/$name"
+  else
+    modus=644; [ "${wert#* }" = x ] && modus=755
+    ssh_other "rm -f \$HOME/$d/$name" 2>/dev/null
+    if scp -q "$HOME/$d/$name" "$OTHER:~/$d/$name" && ssh_other "chmod $modus \$HOME/$d/$name" 2>/dev/null; then
+      echo "  ok  $d/$name  (Datei, $modus)"
+    else
+      echo "  FEHLER  $d/$name"
+    fi
+  fi
+done
+
 for e in ${remote_only_todo[@]+"${remote_only_todo[@]}"}; do
   rest="${e#*|}"; quelle="${rest%%|*}"; zielpfad="${rest#*|}"
+  snap_item "$zielpfad" || { echo "  FEHLER  $zielpfad  (Snapshot auf $OTHER fehlgeschlagen — nicht uebertragen)"; continue; }
   ssh_other "mkdir -p \$(dirname \$HOME/$zielpfad)" 2>/dev/null
   scp -q "$WB_REPO/$quelle" "$OTHER:~/$zielpfad" || { echo "  FEHLER  $zielpfad"; continue; }
   # Ausfuehrungsrecht ausdruecklich setzen: scp uebertraegt den Modus nicht zuverlassig,
@@ -332,5 +473,8 @@ for e in ${remote_only_todo[@]+"${remote_only_todo[@]}"}; do
   echo "  ok  $zielpfad  (nur dorthin, aus $quelle)"
 done
 echo
-echo "Uebertragen. NICHT automatisch angeglichen: settings.json und CLAUDE.md —"
+[ -n "$SNAP" ] && echo "Alte Fassungen gesichert nach $OTHER:$SNAP"
+echo "Uebertragen. NICHT automatisch angeglichen: settings.json, AGENTS.md und CLAUDE.md —"
 echo "die tragen maschinenabhaengige Teile und wollen von Hand nachgezogen werden."
+echo "Haben sich die Rollen geaendert: auf $OTHER danach 'wb-instructions sync' laufen lassen"
+echo "(die Rollen sind seine Quelle; er erzeugt daraus die Einstiegsdateien der Harnesses)."

@@ -89,6 +89,17 @@ export interface PaneAnfrage {
   model: string;
 }
 
+/**
+ * Das Uebersteuern der Chat-Ansicht in der MOBILEN Verdrahtung. Am Handy gibt es kein
+ * Terminal, der Chat ist die einzige Ansicht: fuer den Orchestrator-Pane zaehlt allein die
+ * Faehigkeit des Harness, nicht die Desktop-Ansichtswahl (`chatAnsichtSitzung` in ui.json).
+ * `true` schlaegt in `chatStand()` den Harness-Schalter; die Faehigkeit prueft `urteil()`
+ * weiterhin.
+ */
+export function mobileUebersteuerung(rolle: PaneRolle): boolean | null {
+  return rolle === 'orchestrator' ? true : null;
+}
+
 export interface QuellenOptionen {
   /** Die gepflegte Registry dieser Maschine. */
   modelsFile: string;
@@ -312,7 +323,7 @@ function auslastungAusDatei(
   modelsFile: string,
   herkunft: string,
 ): Bruecke {
-  const eindeutig = herkunft === 'hook' || herkunft === 'vermerk';
+  const eindeutig = herkunft === 'register' || herkunft === 'hook' || herkunft === 'vermerk';
   if (stand.auslastung >= 0 || stand.tokens > 0 || format !== 'claude-transcript' || !model || !eindeutig) return stand;
   const t = transcriptStand(pfad, model, modelsFile);
   if (t.tokens <= 0) return stand;
@@ -326,20 +337,114 @@ function auslastungAusDatei(
 
 // --- Weg 2: die Sitzungsdatei ------------------------------------------------
 
+/** Obergrenze fuer das Dateialter, wenn die Sitzung ueber das Register belegt ist (ein Jahr). */
+const KEIN_ALTERSLIMIT_SEC = 365 * 86400;
+
+/**
+ * Ob ein `ps -o args=` eines Prozesses ein Claude-Prozess ist. Dieselbe Regel wie der Hook in
+ * shell/wb-chat-hook-install (dort in sh): erstes Wort mit Basename `claude`, der volle
+ * Versionspfad `.../claude/versions/<v>`, oder `node` mit einem zweiten Wort, das auf
+ * Claude Code zeigt. comm taugt nicht: unter Linux auf 15 Zeichen gekuerzt, bei node nur "node".
+ */
+export function istClaudeArgs(args: string): boolean {
+  const w = args.trim().split(/\s+/);
+  const erstes = w[0] ?? '';
+  if (erstes.includes('/claude/versions/')) return true;
+  const name = basename(erstes);
+  if (name === 'claude') return true;
+  if (name === 'node' || name === 'nodejs') {
+    return /(\/claude-code\/|\/@anthropic-ai\/claude|\/claude(\.js)?$)/.test(w[1] ?? '');
+  }
+  return false;
+}
+
+/** Wie weit die Startzeit aus der Register-Datei und die gemessene auseinanderliegen duerfen. */
+const REGISTER_START_TOLERANZ_MS = 30_000;
+
+/**
+ * Das Alter eines Prozesses und sein Startpfad: `ps -o etime=,args=` (macOS und Linux; mit
+ * LC_ALL=C, damit nichts lokalisiert wird -- `lstart` kommt auf dieser Maschine deutsch).
+ * `etime` ist `[[dd-]hh:]mm:ss`. null, wenn es den Prozess nicht gibt.
+ */
+function prozessLesen(pid: number): { startMs: number; args: string } | null {
+  const r = spawnSync('/bin/ps', ['-o', 'etime=,args=', '-p', String(pid)], {
+    encoding: 'utf8',
+    timeout: FRIST_MS,
+    killSignal: 'SIGKILL',
+    env: { ...process.env, LC_ALL: 'C' },
+  });
+  if (r.status !== 0) return null;
+  const m = (r.stdout || '').trim().match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s+(.*)$/);
+  if (!m) return null;
+  const sekunden = Number(m[1] ?? 0) * 86400 + Number(m[2] ?? 0) * 3600 + Number(m[3]) * 60 + Number(m[4]);
+  return { startMs: Date.now() - sekunden * 1000, args: m[5] };
+}
+
+/**
+ * Die Sitzung, die Claude selbst fuer diesen Prozess fuehrt: `~/.claude/sessions/<pid>.json`
+ * (Felder `pid`, `sessionId`, `startedAt`, `procStart`; gemessen 13./14.10.). Anders als die
+ * Pane-Option kann ihn kein verschachtelter `claude -p` im selben Pane ueberschreiben -- jeder
+ * Lauf hat seine eigene PID-Datei. Nur gueltig, wenn
+ *   1  die Datei zu genau dieser PID gehoert (Feld `pid`),
+ *   2  unter dieser PID JETZT ein Claude-Prozess laeuft (`istClaudeArgs`) und
+ *   3  dessen Start zur Datei passt: eine stehengebliebene Datei, deren PID inzwischen ein
+ *      anderer Prozess traegt, faellt hier durch. Verglichen wird `startedAt` (Epoche, ms),
+ *      sonst `procStart` (UTC-Text), sonst die mtime der Datei (sie wird nach dem Start
+ *      geschrieben, also darf der Prozess nicht juenger sein). Toleranz 30 s: gemessen an 14
+ *      lebenden Registern liegt `startedAt` 0 bis 1,5 s (einmal 5,5 s) NACH dem Prozessstart;
+ *      eine wiederverwendete PID startet dagegen Minuten bis Tage nach dem alten Prozess.
+ * Sonst leer, und die Zuordnung faellt auf die Hook-Option zurueck.
+ */
+export function registerSitzung(pid: number, home: string): string {
+  if (!pid) return '';
+  const datei = join(home, '.claude', 'sessions', `${pid}.json`);
+  let d: Record<string, unknown>;
+  let mtimeMs: number;
+  try {
+    d = JSON.parse(readFileSync(datei, 'utf8')) as Record<string, unknown>;
+    mtimeMs = statSync(datei).mtimeMs;
+  } catch {
+    return '';
+  }
+  if (d.pid !== pid) return '';
+  const id = d.sessionId;
+  if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{8,}$/.test(id)) return '';
+  const prozess = prozessLesen(pid);
+  if (!prozess || !istClaudeArgs(prozess.args)) return '';
+  let passt: boolean;
+  if (typeof d.startedAt === 'number') {
+    passt = Math.abs(d.startedAt - prozess.startMs) <= REGISTER_START_TOLERANZ_MS;
+  } else if (typeof d.procStart === 'string' && Number.isFinite(Date.parse(`${d.procStart} UTC`))) {
+    passt = Math.abs(Date.parse(`${d.procStart} UTC`) - prozess.startMs) <= REGISTER_START_TOLERANZ_MS;
+  } else {
+    passt = prozess.startMs <= mtimeMs + REGISTER_START_TOLERANZ_MS;
+  }
+  return passt ? id : '';
+}
+
 function ausSitzungsdatei(
   a: PaneAnfrage,
   block: SessionBlock,
   opt: Required<Pick<QuellenOptionen, 'home'>> & { jetztMs: number; modelsFile: string; vorgabe: boolean },
 ): ChatStand {
-  const ort = ortFuellen(block.ort, {
-    cwd: a.cwd,
-    home: opt.home,
-    sessionId: a.sitzungsId,
-    tmpdir: process.env.TMPDIR ?? '/tmp',
-  });
-  // Ein relativer Ort ist einer IM Arbeitsverzeichnis des Panes (aider, crush).
-  const muster = ort.startsWith('/') ? ort : join(a.cwd, ort);
-  const pfade = pfadeZuMuster(muster);
+  const pfadeFuer = (sessionId: string): string[] => {
+    const ort = ortFuellen(block.ort, {
+      cwd: a.cwd,
+      home: opt.home,
+      sessionId,
+      tmpdir: process.env.TMPDIR ?? '/tmp',
+    });
+    // Ein relativer Ort ist einer IM Arbeitsverzeichnis des Panes (aider, crush).
+    return pfadeZuMuster(ort.startsWith('/') ? ort : join(a.cwd, ort));
+  };
+  // ERSTE STUFE: Claudes eigenes Register. Gilt nur, wenn es zur Pane-PID gehoert UND zu
+  // seiner Sitzung ein Transkript liegt; sonst weiter wie bisher mit der Hook-Option.
+  let registerId = a.harness === 'claude' && block.zuordnung === 'hook' ? registerSitzung(a.pid, opt.home) : '';
+  let pfade = registerId ? pfadeFuer(registerId) : [];
+  if (!pfade.length) {
+    registerId = '';
+    pfade = pfadeFuer(a.sitzungsId);
+  }
   const kandidaten: Kandidat[] = [];
   // OB DER ORDNERWEG UEBERHAUPT IN FRAGE KOMMT, entscheidet sich hier -- und nur
   // dann wird je Kandidat der Kopf gelesen. Der Hook-Weg mit gemeldeter Kennung
@@ -353,7 +458,7 @@ function ausSitzungsdatei(
   // Vermerk ueberhaupt eine Datei trifft; nur wenn nicht, kostet es Koepfe.
   const vermerkTrifft = !!a.vermerkteId && pfade.some((p) => p.includes(a.vermerkteId));
   const ordnerWegMoeglich = block.zuordnung === 'cwd'
-    || (block.zuordnung === 'hook' && !a.sitzungsId && !vermerkTrifft);
+    || (block.zuordnung === 'hook' && !registerId && !a.sitzungsId && !vermerkTrifft);
   for (const pfad of pfade) {
     try {
       const st = statSync(pfad);
@@ -370,13 +475,16 @@ function ausSitzungsdatei(
       // Verschwunden, waehrend wir hinsahen: uebergehen.
     }
   }
+  // Mit Register-Treffer ist die Sitzung ueber die lebende PID belegt: ein Alter der
+  // Datei spielt dann keine Rolle (ein wartender Orchestrator schreibt stundenlang nichts).
   const wahl = kandidatWaehlen(
     kandidaten,
     block.zuordnung,
-    { cwd: a.cwd, pid: a.pid, sitzungsId: a.sitzungsId, vermerkteId: a.vermerkteId },
+    { cwd: a.cwd, pid: a.pid, sitzungsId: registerId || a.sitzungsId, vermerkteId: a.vermerkteId },
     opt.jetztMs,
-    block.maxAgeSec,
+    registerId ? KEIN_ALTERSLIMIT_SEC : block.maxAgeSec,
   );
+  if (registerId && wahl.kandidat) wahl.herkunft = 'register';
   if (!wahl.kandidat) return leererStand(a, wahl.grund, block.via, opt.jetztMs, opt.vorgabe);
 
   let nachrichten: ChatNachricht[];

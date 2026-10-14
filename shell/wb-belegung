@@ -592,6 +592,20 @@ EINGEBAUTE_KV = {
         "wann": "2026-08-11",
         "notiz": "Messstrecke der Nachbarsitzung; die dort geerbte Konstante lag bei 0,11.",
     },
+    # Splash 1.3 mit Qwen3.8-27B (wb-splash-server, SPLASH_KV_SCHLUESSEL). Eingebaut statt
+    # nur im Zustand, weil wb-splash-server und wb-kontext ihn auf jeder Maschine brauchen.
+    "qwen3.8-27b-splash": {
+        "mib_je_token": 0.0524,
+        "herkunft": "gemessen",
+        "wann": "2026-10-10",
+        "kv_quant": "q8",
+        "notiz": ("Splash 1.3 (KV int8, Vorgabe), gemessen am freien Speicher (check-resources) wie "
+                  "die Splash-Messung vom 20.09.: geladen und untaetig 19,6 GiB, eine Anfrage mit "
+                  "162.698 Token 27,9 GiB, also 8,3 GiB fuer 162.698 Token = 0,0524 MiB/Token; vier "
+                  "Stroeme mit zusammen 74.293 Token 3,8 GiB = 0,052. Enthaelt alles, was Splash je "
+                  "Token haelt (KV, Seitentabellen), nicht nur den reinen KV-Cache (theoretisch "
+                  "0,0332 in q8). Grundsatz 19,6 GiB als --gewichte-gb."),
+    },
 }
 KV_NOTFALL = 1.05   # Ausgangswert fuer ein unbekanntes Modell, siehe oben.
 
@@ -714,15 +728,20 @@ def json_lesen(pfad, vorgabe):
 class Sperre(object):
     """Ausschliessliche Sperre mit FRIST. Blockierend zu warten waere hier der
     naechste Weg, die Maschine anzuhalten; nach der Frist gibt es eine klare
-    Meldung und Exit 3."""
+    Meldung und Exit 3.
 
-    def __init__(self, frist_s=30.0):
+    `pfad` (Nachtrag 2026-10-09, Auftrag tafel-kern): shell/wb-tafel laedt diese
+    Datei als Baustein und sperrt mit derselben Klasse ihre eigene Datei. Ohne
+    Angabe gilt wie bisher die Sperre des Belegungsbuchs."""
+
+    def __init__(self, frist_s=30.0, pfad=None):
         self.frist_s = frist_s
+        self.pfad = pfad or SPERRDATEI
         self.f = None
 
     def __enter__(self):
-        os.makedirs(STATE_DIR, exist_ok=True)
-        self.f = open(SPERRDATEI, "w")
+        os.makedirs(os.path.dirname(self.pfad), exist_ok=True)
+        self.f = open(self.pfad, "w")
         ende = time.monotonic() + self.frist_s
         while True:
             try:
@@ -731,7 +750,7 @@ class Sperre(object):
             except OSError:
                 if time.monotonic() >= ende:
                     fehler("das Buch ist seit %d s gesperrt (%s) — nichts geaendert."
-                           % (int(self.frist_s), SPERRDATEI), code=3)
+                           % (int(self.frist_s), self.pfad), code=3)
                 time.sleep(0.1)
 
     def __exit__(self, *_):
@@ -774,6 +793,107 @@ def tmux_ruf(argumente, socket_pfad="", frist=3.0):
         return 126, ""
 
 
+# --------------------------------------------- systemd-User-Unit als Eigentuemer
+#
+# Eine abgeloeste Unit (`systemd-run --user`, wie die Traegerprobe auf peer) hat keinen
+# tmux-Pane. Ihre Buchung hing damit nur an Frist + Karenz. Eigentuemer darf hier eine
+# Unit sein, aber nie ein selbst erklaerter Name: wb-belegung liest die Unit aus dem
+# cgroup DES EIGENEN PROZESSES (das Kernel-Urteil, kein Argument und keine Umgebungsvariable
+# des Aufrufers), und prueft ihre Lebendigkeit selbst -- `systemctl --user is-active <unit>`
+# UND die MainPID samt Startzeitpunkt (Muster wie shell/wb-nohup, 'PID-WIEDERVERWENDUNG').
+# Stirbt die Unit oder wechselt ihre MainPID, verfaellt die Buchung sofort. Die Frist bleibt
+# Pflicht (`nimm --frist` mindestens 1): sie macht die Buchung ueberfaellig und sichtbar,
+# genau wie beim Pane. Freigeben oder uebernehmen kann eine Unit-Buchung nur, wer im selben
+# cgroup laeuft, oder jeder, sobald die Unit nachweislich tot ist.
+
+def systemctl_binaer():
+    p = os.environ.get("WB_BELEGUNG_SYSTEMCTL_BIN", "")
+    if p:
+        if not os.access(p, os.X_OK):
+            fehler("WB_BELEGUNG_SYSTEMCTL_BIN zeigt auf '%s' — dort ist nichts Ausfuehrbares." % p)
+        return p
+    return shutil.which("systemctl") or ""
+
+
+def eigene_unit():
+    """Name der systemd-User-Unit (`....service`) dieses Prozesses laut seinem cgroup,
+    sonst ''. Nur Units des User-Managers dieses Benutzers (`user@<uid>.service`) zaehlen;
+    eine Login-Sitzung (`session-N.scope`) oder ein tmux-Scope ist keine Unit."""
+    pfad = os.environ.get("WB_BELEGUNG_CGROUP_DATEI", "") or "/proc/self/cgroup"
+    try:
+        with open(pfad, encoding="utf-8") as f:
+            zeilen = f.read().splitlines()
+    except OSError:
+        return ""
+    manager = "user@%d.service" % os.getuid()
+    for zeile in zeilen:
+        teile = zeile.split(":", 2)
+        if len(teile) != 3 or teile[0] not in ("0", ""):
+            continue            # cgroup v2: eine Zeile '0::/pfad'
+        komponenten = [k for k in teile[2].split("/") if k]
+        if manager not in komponenten:
+            continue
+        for k in komponenten[komponenten.index(manager) + 1:]:
+            if k.endswith(".service"):
+                return k
+    return ""
+
+
+def systemctl_user(*argumente):
+    """(rc, ausgabe) oder (None, '') bei fehlendem systemctl/Zeitueberschreitung. Nie ohne Limit."""
+    binaer = systemctl_binaer()
+    if not binaer:
+        return None, ""
+    try:
+        p = subprocess.run([binaer, "--user"] + list(argumente), capture_output=True,
+                           text=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        return None, ""
+    return p.returncode, p.stdout.strip()
+
+
+def unit_zustand(unit):
+    """('aktiv'|'tot'|'unklar', mainpid). 'tot' nur bei einer eindeutigen Antwort von
+    systemd (inactive/failed/deactivating), 'unklar' bei allem anderen -- nie als tot lesen."""
+    rc, aus = systemctl_user("is-active", unit)
+    if rc is None:
+        return "unklar", 0
+    if aus in ("inactive", "failed", "deactivating"):
+        return "tot", 0
+    if aus not in ("active", "activating", "reloading"):
+        return "unklar", 0
+    rc, pid = systemctl_user("show", "-p", "MainPID", "--value", unit)
+    if rc != 0 or not pid.isdigit():
+        return "unklar", 0
+    return "aktiv", int(pid)
+
+
+def unit_lebt(halter):
+    """True/False/None (None = nicht pruefbar, nie als tot lesen) fuer einen Unit-Halter."""
+    unit = halter.get("unit", "")
+    zustand, pid = unit_zustand(unit)
+    if zustand == "unklar":
+        return None
+    if zustand == "tot":
+        return False
+    if pid != halter.get("unit_mainpid") or pid <= 0:
+        return False            # neu gestartet: derselbe Name, aber nicht mehr dieser Lauf
+    return prozess_lebt(pid, halter.get("unit_lstart") or "") is not False
+
+
+def unit_halter_ergaenzen(halter):
+    """Haengt den Unit-Eigentuemer an `halter`, wenn dieser Prozess nachweislich in einer
+    laufenden User-Unit mit gueltiger MainPID steckt (nur ohne Pane)."""
+    unit = eigene_unit()
+    if not unit:
+        return
+    zustand, pid = unit_zustand(unit)
+    lstart = prozess_lstart(pid) if zustand == "aktiv" and pid > 0 else ""
+    if not lstart:
+        return
+    halter.update({"halter_art": "unit", "unit": unit, "unit_mainpid": pid, "unit_lstart": lstart})
+
+
 def eigener_halter():
     """Wer bin ich? Pane, Socket, Sitzung, Workername — soweit messbar.
 
@@ -791,6 +911,7 @@ def eigener_halter():
     if tmux_env:
         halter["socket"] = tmux_env.split(",")[0]
     if not pane:
+        unit_halter_ergaenzen(halter)
         return halter
     halter["pane"] = pane
     rc, aus = tmux_ruf(["display", "-p", "-t", pane,
@@ -1084,11 +1205,11 @@ def eine_abtastung(pfad):
         teil = d.get(schluessel) or {}
         f, g = teil.get("free_mib"), teil.get("total_mib")
         if isinstance(f, (int, float)) and isinstance(g, (int, float)) and g > 0:
-            paare.append((float(f), float(g)))
+            paare.append((float(f), float(g), schluessel))
     if not paare:
         return None
-    frei_mib, gesamt_mib = min(paare, key=lambda paar: paar[0])
-    return frei_mib, gesamt_mib, ollama_aus_antwort(d)
+    frei_mib, gesamt_mib, quelle = min(paare, key=lambda paar: paar[0])
+    return frei_mib, gesamt_mib, ollama_aus_antwort(d), quelle
 
 
 def frei_messen(abtastungen, abstand, beruhigen):
@@ -1106,7 +1227,7 @@ def frei_messen(abtastungen, abstand, beruhigen):
         wartezeit = min(float(beruhigen), 300.0)
         verfahren.append("Beruhigungsfrist %s s" % zahl(wartezeit))
         time.sleep(wartezeit)
-    werte, gesamtwerte, ollama_werte = [], [], []
+    werte, gesamtwerte, ollama_werte, knappe = [], [], [], []
     n = max(1, int(abtastungen))
     for i in range(n):
         if i:
@@ -1116,6 +1237,7 @@ def frei_messen(abtastungen, abstand, beruhigen):
             werte.append(w[0])
             gesamtwerte.append(w[1])
             ollama_werte.append(w[2])
+            knappe.append(w[3])
     # Blieb keine Abtastung uebrig, war auch Ollama nicht zu befragen -- 'unbekannt',
     # nie 'leer' (siehe OLLAMA_STABIL_SCHWELLE_S oben: unbekannt ist nicht frei).
     ollama = ollama_werte[-1] if ollama_werte else (
@@ -1140,6 +1262,9 @@ def frei_messen(abtastungen, abstand, beruhigen):
             "gesamt_gib": max(gesamtwerte) / MIB_JE_GIB,
             "verfahren": ", ".join(verfahren),
             "quelle": pfad,
+            # Welche Speicherart die kleinere freie Zahl lieferte (vram oder ram):
+            # nur zur Erklaerung einer Absage, die Rechnung bleibt unberuehrt.
+            "knappe_quelle": knappe[-1],
             "ollama": ollama}
 
 
@@ -1613,6 +1738,22 @@ def zustand_bestimmen(eintrag, panes_je_socket):
     karenz = float(eintrag.get("karenz_s", KARENZ_MIN * 60))
     halter = eintrag.get("halter") or {}
     pane = halter.get("pane", "")
+    if halter.get("halter_art") == "unit":
+        # UNIT-HALTER (siehe der Kopf 'systemd-User-Unit als Eigentuemer'): Lebendigkeit
+        # ist `is-active` plus MainPID samt Startzeitpunkt. Tot oder neu gestartet:
+        # sofort verfallen. Nicht pruefbar: erst nach Frist + Karenz. Lebt sie: offen,
+        # nach der Frist ueberfaellig (zaehlt weiter), nie ueber die Frist verfallen.
+        lebt = unit_lebt(halter)
+        if lebt is False:
+            return "verfallen", ("die Unit %s des Halters laeuft nicht mehr (oder ihre "
+                                 "MainPID wechselte)" % halter.get("unit"))
+        if lebt is None and alter > frist + karenz:
+            return "verfallen", ("die Lebendigkeit der Unit %s ist nicht messbar und Frist "
+                                 "samt Karenz sind seit %d min um"
+                                 % (halter.get("unit"), minuten(alter - frist - karenz)))
+        if alter > frist:
+            return "ueberfaellig", "die Frist ist seit %d min um" % minuten(alter - frist)
+        return "offen", ""
     if halter.get("halter_art") == "prozess":
         # PROZESS-HALTER (Nachtrag 2026-09-08, Auftrag "buchung", Befund 1, siehe
         # Kopfkommentar): der PRIMAERE Halter ist hier der Prozess selbst, nicht ein
@@ -1691,6 +1832,9 @@ def buch_pruefen(belegungen):
 
 def halter_text(eintrag):
     h = eintrag.get("halter") or {}
+    if h.get("halter_art") == "unit":
+        return "Unit %s (MainPID %s), Host %s" % (h.get("unit", "?"), h.get("unit_mainpid", "?"),
+                                                  h.get("host", "?"))
     if h.get("halter_art") == "prozess":
         # Nachtrag 2026-09-08, Auftrag "buchung": kein Pane mehr -- der Prozess
         # selbst ist der Halter, siehe zustand_bestimmen(). sitzung/worker/
@@ -2061,8 +2205,39 @@ def entscheiden(spitze_gb, gueltige, messung, reserve_gib, ohne_messung=False):
     return spitze_gb <= verfuegbar, verfuegbar, offen, grenze_a, grenze_b, "", widerspruch
 
 
+def knapp_grund(spitze_gb, gueltige, messung, reserve_gib, verfuegbar, offen, grenze_a, grenze_b):
+    """Der Satz zu einem Nein, das entscheiden() ohne Grund liefert: die Spitze passt
+    schlicht nicht in das, was verfuegbar ist (Fund piprobe, 2026-10-09: `nimm` lehnte auf
+    peer ab, JSON und Text trugen `grund` leer; die Ursache war der knappere RAM, aber das
+    stand nirgends). Immer nicht leer, wenn entscheiden() mit ja=False und grund="" kam.
+    Rechnet nichts neu: nennt nur die Zahlen, die entschieden haben."""
+    if verfuegbar is None:
+        return ("die Spitze von %s GiB passt nicht (kein Verfuegbarkeitswert ermittelt)"
+                % zahl(spitze_gb, 2))
+    if grenze_a is None:
+        return ("die Spitze von %s GiB passt nicht: Grenze B (allein aus den offenen "
+                "Belegungen, ohne Messung) = %s gesamt - %s Reserve - %s offen belegt = %s GiB"
+                % (zahl(spitze_gb, 2), zahl(messung["gesamt_gib"]), zahl(reserve_gib),
+                   zahl(offen), zahl(verfuegbar, 2)))
+    quelle = {"ram": "RAM", "vram": "VRAM"}.get(messung.get("knappe_quelle"), "")
+    quelle = (" (knapperer Speicher: %s)" % quelle) if quelle else ""
+    if grenze_a <= grenze_b:
+        engere = ("Grenze A = %s frei gemessen%s - %s Reserve - %s belegt, aber noch nicht "
+                  "geladen = %s GiB"
+                  % (zahl(messung["frei_gib"], 2), quelle, zahl(reserve_gib),
+                     zahl(nicht_geladen(gueltige)), zahl(grenze_a, 2)))
+    else:
+        engere = ("Grenze B = %s gesamt - %s Reserve - %s offen belegt (Buch + stabile "
+                  "Ollama-Ladungen) = %s GiB"
+                  % (zahl(messung["gesamt_gib"]), zahl(reserve_gib), zahl(offen),
+                     zahl(grenze_b, 2)))
+    return ("die Spitze von %s GiB passt nicht: verfuegbar sind nur %s GiB. Die engere "
+            "Grenze ist %s." % (zahl(spitze_gb, 2), zahl(verfuegbar, 2), engere))
+
+
 def entscheidung_zeigen(spitze_gb, zeilen, gueltige, messung, reserve_gib,
-                        ja, verfuegbar, offen, grenze_a, grenze_b, grund="", widerspruch=""):
+                        ja, verfuegbar, offen, grenze_a, grenze_b, grund="", widerspruch="",
+                        knapp=""):
     for z in zeilen:
         gib_aus(z)
     if messung["messbar"]:
@@ -2093,6 +2268,9 @@ def entscheidung_zeigen(spitze_gb, zeilen, gueltige, messung, reserve_gib,
         gib_aus("  NEIN: %s" % grund)
         gib_aus("  Wer trotzdem entscheiden muss, nimmt --ohne-messung; dann zaehlt allein,")
         gib_aus("  was im Buch steht.")
+    elif knapp:
+        gib_aus()
+        gib_aus("  NEIN: %s" % knapp)
     gib_aus()
     gib_aus("  Offene Belegungen:")
     belegungen_zeigen(gueltige)
@@ -2161,7 +2339,13 @@ def antwort_json(ja, spitze_gb, verfuegbar, offen, messung, gueltige, extra=None
 
 def wb_mensch_pfad():
     p = os.path.join(HOME, ".local", "bin", "wb-mensch")
-    return p if os.access(p, os.X_OK) else (shutil.which("wb-mensch") or "")
+    return p if os.access(p, os.X_OK) else ""
+
+
+def wb_mensch_env():
+    return {"HOME": HOME,
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "TMPDIR": "/tmp"}
 
 
 def mensch_oder_ende():
@@ -2180,7 +2364,7 @@ def mensch_oder_ende():
                "aufrufbar (~/.local/bin/wb-mensch). Im Zweifel gilt: kein Mensch, "
                "also kein Weg an der Buchung vorbei.")
     try:
-        rc = subprocess.run([pfad, "pruefen"], timeout=15).returncode
+        rc = subprocess.run([pfad, "pruefen"], timeout=15, env=wb_mensch_env()).returncode
     except (OSError, subprocess.SubprocessError) as e:
         fehler("'--auf-eigene-gefahr' braucht wb-mensch, und der Aufruf ist "
                "gescheitert (%s). Im Zweifel gilt: kein Mensch." % e)
@@ -2188,7 +2372,8 @@ def mensch_oder_ende():
         return
     beleg = ""
     try:
-        p = subprocess.run([pfad, "beleg"], capture_output=True, text=True, timeout=15)
+        p = subprocess.run([pfad, "beleg"], capture_output=True, text=True, timeout=15,
+                           env=wb_mensch_env())
         beleg = (p.stdout or "").strip()
     except (OSError, subprocess.SubprocessError):
         pass
@@ -2246,6 +2431,12 @@ def messung_holen(a):
 
 def cmd_darf(a):
     spitze, zeilen, _kv_herkunft, kv_ersatzwert = spitze_rechnen(a)
+    if getattr(a, "nur_spitze", False):
+        if a.json:
+            print(json.dumps({"spitze_gib": round(spitze, 3)}, ensure_ascii=False))
+        else:
+            gib_aus("%s GiB Spitze" % zahl(spitze))
+        return 0
     with Sperre():
         gueltige, entfernt = buch_pruefen(buch_lesen())
         pruefe_buch(gueltige)
@@ -2255,6 +2446,8 @@ def cmd_darf(a):
         messung = messung_holen(a)
         ja, verfuegbar, offen, ga, gb, grund, widerspruch = entscheiden(
             spitze, gueltige, messung, a.reserve_gb, a.ohne_messung)
+        knapp = "" if ja or grund else knapp_grund(
+            spitze, gueltige, messung, a.reserve_gb, verfuegbar, offen, ga, gb)
     # Der Mensch darf die Buchung uebergehen, ein Agent nicht (der Nutzer, 2026-08-21).
     # Die Ablehnung wird NICHT weggerechnet: sie steht weiter vollstaendig in der
     # Ausgabe, sie hoert nur auf, ein Nein zu sein.
@@ -2264,7 +2457,7 @@ def cmd_darf(a):
         ja = True
     if a.json:
         antwort_json(ja, spitze, verfuegbar, offen, messung, gueltige,
-                     {"verfallen": [e.get("id") for e in entfernt], "grund": grund,
+                     {"verfallen": [e.get("id") for e in entfernt], "grund": grund or knapp,
                       "ollama_widerspruch": widerspruch or None,
                       "auf_eigene_gefahr": gefahr or None,
                       "warnung_eigene_gefahr": "\n".join(z.strip() for z in warnzeilen if z.strip()) or None,
@@ -2289,7 +2482,8 @@ def cmd_darf(a):
         gib_aus(z)
     gib_aus()
     entscheidung_zeigen(spitze, zeilen, gueltige, messung, a.reserve_gb,
-                        ja, verfuegbar, offen, ga, gb, grund, widerspruch)
+                        ja, verfuegbar, offen, ga, gb, grund, widerspruch,
+                        "" if ja else knapp)
     if entfernt:
         gib_aus()
         for e in entfernt:
@@ -2307,12 +2501,17 @@ def cmd_nimm(a):
     halter = eigener_halter()
     if a.halter:
         halter["etikett"] = a.halter
+    if halter.get("halter_art") == "unit" and a.frist < 1:
+        fehler("--frist muss mit einer Unit als Eigentuemer mindestens 1 Minute sein: die Frist "
+               "bleibt Pflicht, sie macht die Buchung ueberfaellig und sichtbar.")
     with Sperre():
         gueltige, entfernt = buch_pruefen(buch_lesen())
         pruefe_buch(gueltige)
         messung = messung_holen(a)
         ja, verfuegbar, offen, ga, gb, grund, widerspruch = entscheiden(
             spitze, gueltige, messung, a.reserve_gb, a.ohne_messung)
+        knapp = "" if ja or grund else knapp_grund(
+            spitze, gueltige, messung, a.reserve_gb, verfuegbar, offen, ga, gb)
         # Siehe cmd_darf: der Mensch darf uebergehen, ein Agent nicht. Die Belegung
         # traegt danach ein eigenes Merkmal, damit `wer` und jeder spaetere Leser
         # sehen, dass diese eine Zahl NICHT durch die Pruefung gekommen ist.
@@ -2385,7 +2584,7 @@ def cmd_nimm(a):
         # brechen kann). 'verlaengern' bleibt der Rueckfall fuer Faelle ganz
         # ohne einen solchen Pane.
         warnung = None
-        if ja and not halter.get("pane"):
+        if ja and not halter.get("pane") and halter.get("halter_art") != "unit":
             warnung = ("kein tmux-Pane als Halter messbar — Frist %d min + Karenz %d min sind "
                        "das einzige Kriterium. Empfohlen: 'wb-belegung uebernehmen %s' EINMAL "
                        "aus dem tatsaechlichen Worker-Pane aufrufen, sobald er existiert -- "
@@ -2393,7 +2592,9 @@ def cmd_nimm(a):
                        "Versprechen. Ohne das verfaellt diese Belegung von selbst, auch wenn "
                        "die Sequenz noch laeuft.") % (int(a.frist), int(a.karenz), neu["id"])
         antwort_json(ja, spitze, verfuegbar, offen, messung, gueltige,
-                     {"kennung": neu["id"] if neu else None, "grund": grund,
+                     {"kennung": neu["id"] if neu else None, "grund": grund or knapp,
+                      "halter": halter_text(neu) if neu else None,
+                      "halter_unit": halter.get("unit") if neu else None,
                       "warnung": warnung, "ollama_widerspruch": widerspruch or None,
                       "auf_eigene_gefahr": gefahr or None,
                       "warnung_eigene_gefahr": "\n".join(z.strip() for z in warnzeilen if z.strip()) or None,
@@ -2415,7 +2616,10 @@ def cmd_nimm(a):
                    zahl(spitze), neu["id"], int(a.frist)))
         gib_aus("  Sobald das Modell IM Speicher steht: wb-belegung geladen %s" % neu["id"])
         gib_aus("  Freigeben, sobald es wieder heraus ist:  wb-belegung gib %s" % neu["id"])
-        if not halter.get("pane"):
+        if halter.get("halter_art") == "unit":
+            gib_aus("  Halter: Unit %s (MainPID %s) -- die Buchung verfaellt, sobald sie stoppt."
+                    % (halter["unit"], halter["unit_mainpid"]))
+        elif not halter.get("pane"):
             gib_aus("  ACHTUNG: kein tmux-Pane als Halter messbar. Hier ist die Frist das")
             gib_aus("  harte Kriterium — nach Frist + Karenz (%d min) verfaellt die Belegung"
                     % int(a.karenz))
@@ -2431,7 +2635,8 @@ def cmd_nimm(a):
                    "" if verfuegbar is None else (", nur %s GiB verfuegbar" % zahl(verfuegbar))))
         gib_aus()
     entscheidung_zeigen(spitze, zeilen, gueltige, messung, a.reserve_gb,
-                        ja, verfuegbar, offen, ga, gb, grund, widerspruch)
+                        ja, verfuegbar, offen, ga, gb, grund, widerspruch,
+                        "" if ja else knapp)
     absage_erklaeren(ja, gueltige, messung, grund)
     return 0 if ja else 1
 
@@ -2495,7 +2700,7 @@ def cmd_wer(a):
 
 def cmd_gib(a):
     halter = eigener_halter()
-    if a.eigene and not halter.get("pane"):
+    if a.eigene and not halter.get("pane") and halter.get("halter_art") != "unit":
         fehler("--eigene braucht einen eigenen tmux-Pane, sonst waere 'eigene' nicht von "
                "'alle ohne Pane' zu unterscheiden. Gib die Kennung an.")
     with Sperre():
@@ -2503,7 +2708,15 @@ def cmd_gib(a):
         bleiben, weg = [], []
         for e in gueltige:
             e_halter = e.get("halter") or {}
-            if e_halter.get("halter_art") == "prozess":
+            if e_halter.get("halter_art") == "unit":
+                # Eine Unit-Buchung gehoert nur dem, der im selben cgroup laeuft
+                # (eigener_halter() liest den cgroup des Aufrufers selbst) -- oder
+                # jedem, sobald die Unit nachweislich tot ist. Eine Kennung allein
+                # (oder fremde Unit, fremder Pane) gibt sie nie frei, ausser mit --fremd.
+                eigen = (halter.get("unit") == e_halter.get("unit") and bool(halter.get("unit"))
+                         and halter.get("unit_mainpid") == e_halter.get("unit_mainpid")) \
+                    or unit_lebt(e_halter) is False
+            elif e_halter.get("halter_art") == "prozess":
                 # Nachtrag 2026-09-08, ZWEITE RUNDE, Auftrag "buchung", Befund 1:
                 # ein Prozess-Halter hat KEIN Pane -- die Regel darunter ("ohne
                 # Pane = niemandem nachweisbar, jeder darf freigeben") traf ihn
@@ -2529,7 +2742,8 @@ def cmd_gib(a):
                 # sich kein Eigentum messen, also verlangt ihre Freigabe auch keinen
                 # Nachweis. Sonst waere eine ausserhalb tmux angelegte Belegung von
                 # niemandem mehr regulaer freizugeben.
-                eigen = (not fremder_pane) or (halter.get("pane") and fremder_pane == halter["pane"])
+                eigen = (((not fremder_pane) and (halter.get("pane") or not a.eigene))
+                         or (halter.get("pane") and fremder_pane == halter["pane"]))
             treffer = (a.eigene and eigen) or (a.kennung and e.get("id") == a.kennung)
             if not treffer:
                 bleiben.append(e)
@@ -2681,6 +2895,22 @@ def cmd_verlaengern(a):
     return 0
 
 
+def unit_fremd(e_halter, aufrufer):
+    """True, wenn `e_halter` eine LEBENDE Unit-Buchung ist, die nicht dem Aufrufer gehoert."""
+    if e_halter.get("halter_art") != "unit":
+        return False
+    if (aufrufer.get("unit") and aufrufer.get("unit") == e_halter.get("unit")
+            and aufrufer.get("unit_mainpid") == e_halter.get("unit_mainpid")):
+        return False
+    return unit_lebt(e_halter) is not False
+
+
+def unit_fremd_text(kennung):
+    return ("wb-belegung: Belegung %s wird von einer systemd-Unit gehalten (siehe 'wb-belegung "
+            "wer'); nur ein Prozess in genau dieser Unit uebernimmt sie. Wirklich gewollt: "
+            "'wb-belegung uebernehmen %s --fremd'." % (kennung, kennung))
+
+
 def cmd_uebernehmen(a):
     """Haengt eine bestehende Belegung an den GERADE AUFRUFENDEN Pane, statt an
     ihren urspruenglichen Halter (Befund N5, zweiter Pruefpass, 2026-08-19:
@@ -2745,6 +2975,9 @@ def cmd_uebernehmen(a):
             for e in gueltige:
                 if e.get("id") == a.kennung:
                     alter_halter = e.get("halter") or {}
+                    if unit_fremd(alter_halter, eigener_halter()) and not getattr(a, "fremd", False):
+                        print(unit_fremd_text(a.kennung), file=sys.stderr)
+                        return 1
                     neuer_halter = {"halter_art": "prozess",
                                     "host": os.uname().nodename.split(".")[0]}
                     # Herkunftsfelder mitnehmen (Nachtrag, Befund 4): sitzung/
@@ -2781,6 +3014,9 @@ def cmd_uebernehmen(a):
         getroffen = None
         for e in gueltige:
             if e.get("id") == a.kennung:
+                if unit_fremd(e.get("halter") or {}, neuer_halter) and not getattr(a, "fremd", False):
+                    print(unit_fremd_text(a.kennung), file=sys.stderr)
+                    return 1
                 if (e.get("halter") or {}).get("halter_art") == "prozess" and not getattr(a, "fremd", False):
                     # Befund 5, siehe Docstring oben.
                     print("wb-belegung: Belegung %s wird von einem PROZESS gehalten (siehe "
@@ -2963,6 +3199,8 @@ def rechen_argumente(p):
     p.add_argument("--ohne-messung", action="store_true",
                    help="entscheidet ALLEIN nach den offenen Belegungen, wenn der freie "
                         "Speicher nicht messbar ist (sonst: Nein)")
+    p.add_argument("--nur-spitze", action="store_true",
+                   help="nur die reine Spitze berechnen; keine Messung, Entscheidung oder Buchung")
     p.add_argument("--auf-eigene-gefahr", action="store_true",
                    help="NUR FUER DEN MENSCHEN (gemessen von wb-mensch, nicht "
                         "behauptet): eine Ablehnung wird zur lauten WARNUNG, und es "

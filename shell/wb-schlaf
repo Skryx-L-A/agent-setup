@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""wb-schlaf -- untaetige Agenten-Sitzungen aus dem Speicher nehmen und bei Bedarf
+wieder aufwecken. Gilt fuer JEDEN Harness mit einem Fortsetzungsweg (claude, pi,
+codex, opencode, ...), nicht nur fuer Claude.
+
+  wb-schlaf [-L <socket>] runde [--min <n>] [--trocken] [--gedrosselt <s>]
+  wb-schlaf [-L <socket>] legen <pane> [--grund <text>]
+  wb-schlaf [-L <socket>] wecken <pane> [--warten <s>]
+  wb-schlaf [-L <socket>] status
+  wb-schlaf [-L <socket>] warte <pane>          (laeuft IM schlafenden Pane)
+  wb-schlaf [-L <socket>] hook <pane>           (tmux after-select-pane: wecken, falls
+                                                 er schlaeft; dann gedrosselte Runde)
+
+ANLASS (der Nutzer, 25.09.2026): "ein Grund warum so viel Speicher verbraucht wird sind
+die vielen Sitzungen ... Sessions, die laenger untaetig sind, aus dem Speicher laden
+und erst, wenn man in der Werkbank wieder drauf drueckt oder Anfragen an die Session
+gehen, wieder in den Speicher laden" -- und ausdruecklich: "nicht nur Claude, auch
+andere Harnesse". Gemessen am selben Tag: 15 Claude-Prozesse belegten 5,6 GiB (0,25 bis
+0,56 GiB je Sitzung), mehrere liefen seit Tagen untaetig; zur selben Zeit verdraengte
+Splash unter Speicherdruck seinen Praefix-Cache (9 Fehlschlaege, je 342 s).
+
+WIE (fuer jeden Harness gleich):
+  schlafen  Der Harness-Prozess wird per `respawn-pane -k` durch `wb-schlaf warte`
+            ersetzt. Der Pane bleibt stehen, zeigt "schlaeft" und belegt fast nichts.
+            Vorher berechnet `wb-revive --trocken` den Befehl, mit dem der Pane seine
+            Unterhaltung fortsetzt; er steht danach in @wb_schlaf_cmd. Kennt der Harness
+            keinen Fortsetzungsweg, wird der Pane NICHT schlafen gelegt.
+  wecken    Derselbe Pane bekommt per `respawn-pane -k` den gespeicherten Befehl.
+            Ausloeser: eine Taste im Pane, die Auswahl des Panes (tmux-Hook
+            after-select-pane, also auch ein Klick auf die Kachel in der Werkbank) und
+            jede Zustellung ueber die Werkbank (wb-inbox sende, pi-worker).
+
+WANN UNTAETIG (fuer jeden Harness gleich, alle Bedingungen zusammen):
+  * sichtbarer Pane-Inhalt seit mindestens <min> Minuten unveraendert (beobachtet ueber
+    die Laeufe hinweg, Stand in ~/.local/state/wb-schlaf/beobachtung.json);
+  * unter dem Harness-Prozess laeuft keine Shell (ein Werkzeugaufruf, ein
+    Hintergrundjob, ein Monitor);
+  * der Prozessbaum rechnet nicht (CPU unter 2 %);
+  * bei claude zusaetzlich: das Sitzungsregister (~/.claude/sessions) meldet "idle"
+    seit mindestens <min> Minuten.
+  Nie: der eigene Pane des Aufrufers, ein Pane im Kopiermodus, ein Pane mit
+  @wb_schlaf_nie, ein Pane ohne @wb_cmd. (Wer in einem Pane tippt oder liest und
+  scrollt, veraendert den Inhalt oder steht im Kopiermodus -- beides haelt wach.)
+
+<min> kommt aus der Einstellung schlafNachMinuten (Vorgabe 60, 0 schaltet ab). 60
+Minuten sind die Lebensdauer des Prompt-Caches: danach kostet das Fortsetzen keine
+zusaetzlichen Token, der Cache waere ohnehin kalt.
+
+KEIN TIMER (der Nutzer hat am 22.08. alle zeitgesteuerten LaunchAgents abschalten
+lassen). Die Runde laeuft dort, wo Speicher gebraucht wird oder jemand arbeitet: beim
+Worker-Start, bei `wb-splash-server ensure` und gedrosselt beim Pane-Wechsel
+(--gedrosselt 600).
+
+GRENZE: Eine Nachricht ueber den eingebauten Sitzungsweg einer ANDEREN Claude-Sitzung
+(SendMessage) erreicht eine schlafende Sitzung nicht -- ihr Socket ist weg. Vorher
+`wb-schlaf wecken <pane> --warten 120`. Remote Control trennt beim Einschlafen und
+verbindet beim Aufwachen neu.
+"""
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, ".local", "bin")
+STATE = os.path.join(HOME, ".local", "state", "wb-schlaf")
+BEOBACHTUNG = os.path.join(STATE, "beobachtung.json")
+VERLAUF = os.path.join(STATE, "verlauf.log")
+DROSSEL = os.path.join(STATE, "letzte-runde")
+SESSIONS = os.path.join(HOME, ".claude", "sessions")
+SELBST = os.path.abspath(__file__)
+SOCKET = os.environ.get("WB_TMUX_SOCKET", "")
+SHELLS = {"bash", "zsh", "sh", "dash", "fish"}
+
+
+def tmux(*args, check=False):
+    cmd = ["tmux"] + (["-L", SOCKET] if SOCKET else []) + list(args)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "tmux %s fehlgeschlagen" % args[0])
+    return r.stdout
+
+
+def opt(pane, name):
+    return tmux("show-options", "-pqv", "-t", pane, name).rstrip("\n")
+
+
+def setopt(pane, name, wert):
+    tmux("set-option", "-p", "-t", pane, name, wert)
+
+
+def unsetopt(pane, name):
+    tmux("set-option", "-p", "-u", "-t", pane, name)
+
+
+def notiz(text):
+    os.makedirs(STATE, exist_ok=True)
+    with open(VERLAUF, "a", encoding="utf-8") as f:
+        f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+
+
+def einstellung_min():
+    try:
+        r = subprocess.run([os.path.join(BIN, "wb-state"), "settings", "get", "schlafNachMinuten"],
+                           capture_output=True, text=True, timeout=10)
+        w = r.stdout.strip()
+        return int(w) if w else 60
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 60
+
+
+def prozesse():
+    """pid -> (ppid, comm, %cpu)"""
+    # LC_ALL=C: unter LANG=de_DE schreibt ps "1,0", float() verwirft dann jede Zeile,
+    # die Tabelle bleibt leer und ein arbeitender Pane gilt als untaetig.
+    r = subprocess.run(["ps", "-axo", "pid=,ppid=,pcpu=,comm="], capture_output=True, text=True,
+                       env=dict(os.environ, LC_ALL="C"))
+    tab = {}
+    for zeile in r.stdout.splitlines():
+        teile = zeile.split(None, 3)
+        if len(teile) < 4:
+            continue
+        try:
+            tab[int(teile[0])] = (int(teile[1]), os.path.basename(teile[3].strip()), float(teile[2]))
+        except ValueError:
+            continue
+    return tab
+
+
+def nachkommen(tab, wurzel):
+    kinder = {}
+    for pid, (ppid, _c, _p) in tab.items():
+        kinder.setdefault(ppid, []).append(pid)
+    aus, stapel = [], list(kinder.get(wurzel, []))
+    while stapel:
+        p = stapel.pop()
+        aus.append(p)
+        stapel.extend(kinder.get(p, []))
+    return aus
+
+
+def ahnen(tab, pid):
+    kette = set()
+    while pid and pid not in kette and pid in tab:
+        kette.add(pid)
+        pid = tab[pid][0]
+    return kette
+
+
+def harness_prozess(tab, pane_pid):
+    """Die Pane-Wurzel, oder ihr einziges Kind, wenn die Wurzel nur eine Shell-Huelle ist."""
+    if pane_pid in tab and tab[pane_pid][1] in SHELLS:
+        kinder = [p for p, (pp, _c, _x) in tab.items() if pp == pane_pid]
+        if len(kinder) == 1:
+            return kinder[0]
+    return pane_pid
+
+
+def claude_register():
+    """pane-id -> Eintrag aus ~/.claude/sessions/<pid>.json (nur lebende)."""
+    aus = {}
+    try:
+        namen = os.listdir(SESSIONS)
+    except OSError:
+        return aus
+    for n in namen:
+        if not n.endswith(".json"):
+            continue
+        try:
+            d = json.load(open(os.path.join(SESSIONS, n), encoding="utf-8"))
+            os.kill(int(d["pid"]), 0)
+        except Exception:
+            continue
+        m = re.search(r"(%\d+)$", str(d.get("tmux", "")))
+        if m:
+            aus[m.group(1)] = d
+    return aus
+
+
+def panes():
+    fmt = "\t".join(["#{pane_id}", "#{pane_pid}", "#{pane_dead}", "#{pane_in_mode}",
+                     "#{@wb_role}", "#{@wb_schlaeft}", "#{@wb_schlaf_nie}", "#{session_name}",
+                     "#{pane_current_path}", "#{pane_active}", "#{window_active}",
+                     "#{session_attached}"])
+    gesehen, aus = set(), []
+    for zeile in tmux("list-panes", "-a", "-F", fmt).splitlines():
+        f = zeile.split("\t")
+        if len(f) < 12 or f[0] in gesehen:
+            continue
+        gesehen.add(f[0])
+        aus.append(dict(pane=f[0], pid=int(f[1] or 0), dead=f[2] == "1", mode=f[3] == "1",
+                        rolle=f[4], schlaeft=f[5], nie=f[6], session=f[7], cwd=f[8],
+                        aktiv=f[9] == "1" and f[10] == "1", angehaengt=f[11] not in ("", "0")))
+    return aus
+
+
+def inhalt_hash(pane):
+    return hashlib.sha256(tmux("capture-pane", "-p", "-t", pane).encode("utf-8", "replace")).hexdigest()
+
+
+def aufweckbefehl(pane, claude_eintrag):
+    # Das wb-revive NEBEN diesem Skript zuerst (Repo-Stand im Test), sonst das installierte.
+    nachbar = os.path.join(os.path.dirname(SELBST), "wb-revive")
+    args = [nachbar if os.access(nachbar, os.X_OK) else os.path.join(BIN, "wb-revive"), "--trocken"]
+    if SOCKET:
+        args += ["--tmux-socket", SOCKET]
+    if claude_eintrag and claude_eintrag.get("sessionId"):
+        args += ["--resume-id", str(claude_eintrag["sessionId"])]
+    args.append(pane)
+    r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    werte = {}
+    for zeile in r.stdout.splitlines():
+        if "\t" in zeile:
+            k, v = zeile.split("\t", 1)
+            werte[k] = v
+    return r.returncode, werte
+
+
+def pruefen(p, tab, reg, minuten, beob, jetzt, eigene):
+    """Grund, warum der Pane NICHT schlafen darf -- oder None."""
+    if p["dead"]:
+        return "toter Pane"
+    if p["schlaeft"]:
+        return "schlaeft schon"
+    if p["nie"]:
+        return "@wb_schlaf_nie"
+    if p["mode"]:
+        return "Kopiermodus"
+    if p["pid"] in eigene:
+        return "eigener Pane"
+    if not opt(p["pane"], "@wb_cmd"):
+        return "kein @wb_cmd"
+    h = harness_prozess(tab, p["pid"])
+    unter = nachkommen(tab, h)
+    if h in eigene or any(q in eigene for q in unter):
+        return "eigener Pane"
+    shells = [q for q in unter if tab[q][1] in SHELLS]
+    if shells:
+        return "laufender Werkzeugaufruf (%s)" % ", ".join(tab[q][1] for q in shells[:3])
+    cpu = tab.get(h, (0, "", 0.0))[2] + sum(tab[q][2] for q in unter)
+    if cpu >= 2.0:
+        return "rechnet (CPU %.1f %%)" % cpu
+    e = reg.get(p["pane"])
+    if e is not None:
+        if e.get("status") != "idle":
+            return "Register: %s" % e.get("status")
+        seit = (jetzt * 1000 - float(e.get("statusUpdatedAt") or jetzt * 1000)) / 60000
+        if seit < minuten:
+            return "Register: idle erst seit %d min" % seit
+    b = beob.get(p["pane"])
+    if not b:
+        return "erste Beobachtung"
+    seit = (jetzt - b["seit"]) / 60
+    if seit < minuten:
+        return "Inhalt unveraendert erst seit %d min" % seit
+    return None
+
+
+def beobachten(liste, beob, jetzt):
+    neu = {}
+    for p in liste:
+        if p["dead"] or p["schlaeft"]:
+            continue
+        h = inhalt_hash(p["pane"])
+        alt = beob.get(p["pane"])
+        neu[p["pane"]] = {"hash": h, "seit": alt["seit"] if alt and alt.get("hash") == h else jetzt}
+    return neu
+
+
+def legen(pane, grund, reg=None):
+    reg = reg if reg is not None else claude_register()
+    rc, w = aufweckbefehl(pane, reg.get(pane))
+    befehl = w.get("befehl", "")
+    warum = w.get("grund", "")
+    # "frischer Start" (wb-revive, 14.10.2026): claude ohne eigene Kennung bzw. Codex ohne
+    # Thread kommt ohne Unterhaltung zurueck -- schlafen legen hiesse sie beenden.
+    if rc != 0 or not befehl or "OHNE Unterhaltung" in warum or "frischer Start" in warum:
+        return False, "kein Fortsetzungsweg: %s" % (warum or "wb-revive rc=%d" % rc)
+    cwd = tmux("display", "-p", "-t", pane, "#{pane_current_path}").strip() or HOME
+    setopt(pane, "@wb_schlaf_cmd", befehl)
+    setopt(pane, "@wb_schlaf_cwd", cwd)
+    setopt(pane, "@wb_schlaf_harness", w.get("harness", ""))
+    setopt(pane, "@wb_schlaf_grund", grund)
+    setopt(pane, "@wb_schlaeft", str(int(time.time())))
+    warte = "%s warte %s" % (shlex.quote(SELBST), shlex.quote(pane))
+    if SOCKET:
+        warte = "WB_TMUX_SOCKET=%s %s" % (shlex.quote(SOCKET), warte)
+    r = subprocess.run(["tmux"] + (["-L", SOCKET] if SOCKET else []) +
+                       ["respawn-pane", "-k", "-c", cwd, "-t", pane, warte],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        for n in ("@wb_schlaeft", "@wb_schlaf_cmd", "@wb_schlaf_cwd", "@wb_schlaf_harness", "@wb_schlaf_grund"):
+            unsetopt(pane, n)
+        return False, "respawn-pane: %s" % r.stderr.strip()
+    notiz("gelegt %s (%s) -- %s" % (pane, w.get("harness") or "?", grund))
+    return True, warum
+
+
+def sperre(pane):
+    basis = os.path.join(STATE, "sperren")
+    os.makedirs(basis, exist_ok=True)
+    pfad = os.path.join(basis, re.sub(r"[^A-Za-z0-9]", "_", (SOCKET or "default") + pane))
+    for _ in range(50):
+        try:
+            os.mkdir(pfad)
+            return pfad
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(pfad).st_mtime > 60:
+                    os.rmdir(pfad)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.1)
+    return None
+
+
+def bereit(pane, harness, jetzt_start, frist):
+    muster = ""
+    if harness:
+        try:
+            r = subprocess.run([os.path.join(BIN, "wb-state"), "harness", "get", harness],
+                               capture_output=True, text=True, timeout=10)
+            muster = (json.loads(r.stdout) or {}).get("readyPattern") or ""
+        except Exception:
+            muster = ""
+    while time.time() - jetzt_start < frist:
+        text = tmux("capture-pane", "-p", "-t", pane)
+        if muster and re.search(muster, text):
+            if harness != "claude":
+                return True
+            e = claude_register().get(pane)
+            if e and e.get("status") == "idle":
+                return True
+        elif not muster and text.strip():
+            return True
+        time.sleep(1)
+    return False
+
+
+def wecken(pane, warten=0):
+    if not opt(pane, "@wb_schlaeft"):
+        return True, "schlaeft nicht"
+    s = sperre(pane)
+    if not s:
+        return False, "Sperre belegt"
+    try:
+        if not opt(pane, "@wb_schlaeft"):
+            return True, "schon geweckt"
+        befehl = opt(pane, "@wb_schlaf_cmd")
+        cwd = opt(pane, "@wb_schlaf_cwd") or HOME
+        harness = opt(pane, "@wb_schlaf_harness")
+        if not befehl:
+            return False, "kein gespeicherter Befehl"
+        start = time.time()
+        r = subprocess.run(["tmux"] + (["-L", SOCKET] if SOCKET else []) +
+                           ["respawn-pane", "-k", "-c", cwd, "-t", pane, befehl],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, "respawn-pane: %s" % r.stderr.strip()
+        for n in ("@wb_schlaeft", "@wb_schlaf_cmd", "@wb_schlaf_cwd", "@wb_schlaf_harness", "@wb_schlaf_grund"):
+            unsetopt(pane, n)
+        notiz("geweckt %s (%s)" % (pane, harness or "?"))
+    finally:
+        try:
+            os.rmdir(s)
+        except OSError:
+            pass
+    if warten > 0 and not bereit(pane, harness, start, warten):
+        return False, "geweckt, aber nach %d s noch nicht bereit" % warten
+    return True, "geweckt"
+
+
+def runde(minuten, trocken, gedrosselt):
+    os.makedirs(STATE, exist_ok=True)
+    jetzt = time.time()
+    if gedrosselt:
+        try:
+            if jetzt - os.stat(DROSSEL).st_mtime < gedrosselt:
+                return 0
+        except OSError:
+            pass
+        open(DROSSEL, "a").close()
+        os.utime(DROSSEL, None)
+    if minuten <= 0:
+        print("wb-schlaf: abgeschaltet (schlafNachMinuten=0).")
+        return 0
+    try:
+        beob = json.load(open(BEOBACHTUNG, encoding="utf-8"))
+    except Exception:
+        beob = {}
+    tab = prozesse()
+    eigene = ahnen(tab, os.getpid())
+    reg = claude_register()
+    liste = panes()
+    beob = beobachten(liste, beob, jetzt)
+    with open(BEOBACHTUNG + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(beob, f)
+    os.replace(BEOBACHTUNG + ".tmp", BEOBACHTUNG)
+    for p in liste:
+        grund = pruefen(p, tab, reg, minuten, beob, jetzt, eigene)
+        if grund:
+            if trocken:
+                print("%-6s bleibt  %s" % (p["pane"], grund))
+            continue
+        if trocken:
+            print("%-6s WUERDE schlafen" % p["pane"])
+            continue
+        ok, warum = legen(p["pane"], "untaetig seit mindestens %d min" % minuten, reg)
+        print("%-6s %s  %s" % (p["pane"], "schlaeft" if ok else "bleibt", warum))
+    return 0
+
+
+def warte(pane):
+    seit = opt(pane, "@wb_schlaeft")
+    harness = opt(pane, "@wb_schlaf_harness") or "?"
+    try:
+        zeit = time.strftime("%d.%m. %H:%M", time.localtime(int(seit)))
+    except ValueError:
+        zeit = "?"
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.write("Diese Sitzung schlaeft seit %s (%s) und belegt keinen Speicher.\n\n" % (zeit, harness))
+    sys.stdout.write("Eine Taste druecken oder den Pane anklicken weckt sie; die Unterhaltung\n")
+    sys.stdout.write("geht dort weiter, wo sie stand.\n")
+    sys.stdout.flush()
+    try:
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        alt = termios.tcgetattr(fd)
+        tty.setcbreak(fd, termios.TCSANOW)  # TCSAFLUSH verwarf eine schon getippte Taste
+        try:
+            os.read(fd, 1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, alt)
+    except Exception:
+        sys.stdin.read(1)
+    # Wecken im tmux-Server, nicht in diesem Prozess: respawn-pane -k beendet genau ihn.
+    befehl = "%s wecken %s" % (shlex.quote(SELBST), shlex.quote(pane))
+    if SOCKET:
+        befehl = "WB_TMUX_SOCKET=%s %s" % (shlex.quote(SOCKET), befehl)
+    tmux("run-shell", "-b", befehl)
+    time.sleep(60)
+
+
+def status():
+    for p in panes():
+        if p["schlaeft"]:
+            try:
+                zeit = time.strftime("%d.%m. %H:%M", time.localtime(int(p["schlaeft"])))
+            except ValueError:
+                zeit = "?"
+            print("%-6s schlaeft seit %s  %s  %s" % (p["pane"], zeit, opt(p["pane"], "@wb_schlaf_harness") or "?", p["session"]))
+
+
+def main(argv):
+    global SOCKET
+    if len(argv) >= 2 and argv[0] in ("-L", "--socket"):
+        SOCKET = argv[1]
+        os.environ["WB_TMUX_SOCKET"] = SOCKET
+        argv = argv[2:]
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.split("\n\n")[0])
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "runde":
+        minuten, trocken, gedrosselt = None, False, 0
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--min":
+                minuten = int(rest[i + 1]); i += 2
+            elif rest[i] == "--trocken":
+                trocken = True; i += 1
+            elif rest[i] == "--gedrosselt":
+                gedrosselt = int(rest[i + 1]); i += 2
+            else:
+                print("wb-schlaf: unbekannt: %s" % rest[i], file=sys.stderr); return 2
+        return runde(einstellung_min() if minuten is None else minuten, trocken, gedrosselt)
+    if cmd == "legen" and rest:
+        grund = rest[rest.index("--grund") + 1] if "--grund" in rest else "von Hand"
+        tab = prozesse()
+        eigene = ahnen(tab, os.getpid())
+        p = next((x for x in panes() if x["pane"] == rest[0]), None)
+        if p is None:
+            print("wb-schlaf: Pane %s nicht gefunden" % rest[0], file=sys.stderr); return 2
+        if p["pid"] in eigene or harness_prozess(tab, p["pid"]) in eigene:
+            print("wb-schlaf: den eigenen Pane legt man nicht schlafen", file=sys.stderr); return 3
+        h = harness_prozess(tab, p["pid"])
+        shells = [q for q in nachkommen(tab, h) if tab[q][1] in SHELLS]
+        e = claude_register().get(rest[0])
+        if shells or (e is not None and e.get("status") != "idle"):
+            print("wb-schlaf: %s arbeitet gerade -- nicht gelegt" % rest[0], file=sys.stderr); return 3
+        ok, warum = legen(rest[0], grund)
+        print("wb-schlaf: %s %s -- %s" % (rest[0], "schlaeft" if ok else "NICHT gelegt", warum))
+        return 0 if ok else 1
+    if cmd == "wecken" and rest:
+        warten = int(rest[rest.index("--warten") + 1]) if "--warten" in rest else 0
+        ok, warum = wecken(rest[0], warten)
+        print("wb-schlaf: %s %s" % (rest[0], warum))
+        return 0 if ok else 1
+    if cmd == "warte" and rest:
+        warte(rest[0]); return 0
+    if cmd == "status":
+        status(); return 0
+    if cmd == "hook" and rest:
+        if opt(rest[0], "@wb_schlaeft"):
+            wecken(rest[0])
+        return runde(einstellung_min(), False, 600)
+    print(__doc__.split("\n\n")[0], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

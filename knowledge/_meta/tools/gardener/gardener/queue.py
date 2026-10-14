@@ -9,6 +9,10 @@ places and checking one missed the other.
 
 Entries are deduplicated against what is already in the file AND against what
 this run already queued, so repeated runs do not pile up the same line.
+
+A buffered queue (``gepuffert=True``, the gardener run) collects its lines and
+writes the file once in ``flush()``: the queue is the largest root file, and a
+dry run listed it once per queued line (g3, 2026-09-24: twelve times).
 """
 from __future__ import annotations
 
@@ -23,12 +27,14 @@ HEADER = "# Review-Queue (Gardener)\n\nUnklare Faelle fuer den Nutzer.\n"
 
 
 class ReviewQueue:
-    def __init__(self, writer: VaultWriter):
+    def __init__(self, writer: VaultWriter, gepuffert: bool = False):
         self.writer = writer
         self.path = writer.vault / "review-queue.md"
         self.existing = (self.path.read_text(encoding="utf-8")
                          if self.path.exists() else "")
         self.added: list[str] = []
+        self.gepuffert = gepuffert
+        self.pending = ""
 
     def add(self, body: str, key: str | None = None,
             today: dt.date | None = None) -> bool:
@@ -38,10 +44,19 @@ class ReviewQueue:
             return False
         stamp = (today or dt.date.today()).isoformat()
         line = f"- {stamp}: {body}"
+        text = f"\n{line}\n"
         if not self.existing.strip():
-            self.writer.append(self.path, HEADER)
-            self.existing = HEADER
-        self.writer.append(self.path, f"\n{line}\n")
-        self.existing += f"\n{line}\n"
+            text = HEADER + text
+        self.existing += text
         self.added.append(line)
+        if self.gepuffert:
+            self.pending += text
+        else:
+            self.writer.append(self.path, text)
         return True
+
+    def flush(self) -> None:
+        """Write the buffered lines in one go (no-op when nothing is pending)."""
+        if self.pending:
+            self.writer.append(self.path, self.pending)
+            self.pending = ""

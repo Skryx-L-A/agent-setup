@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Switch the model of one running Workbench orchestrator pane.
+#
+# The registry decides whether a harness has a measured in-process command.
+# A prompt gate prevents typing into a busy model.  If the running CLI predates
+# the discovered model, or the CLI itself asks for an update, wb-revive replaces
+# the process in the SAME pane and resumes the pane's own conversation.
+set -euo pipefail
+
+pane=""; model=""; effort=""; tmux_socket=""; process_version=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pane) pane="${2:?pane}"; shift 2 ;;
+    --model) model="${2:?model}"; shift 2 ;;
+    --effort) effort="${2:?effort}"; shift 2 ;;
+    --tmux-socket) tmux_socket="${2:?socket}"; shift 2 ;;
+    --process-version) process_version="${2:?version}"; shift 2 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "wb-model-switch: unbekanntes Argument '$1'" >&2; exit 2 ;;
+  esac
+done
+[[ "$pane" =~ ^%[0-9]+$ && -n "$model" ]] || { echo "wb-model-switch: --pane %N und --model fehlen" >&2; exit 2; }
+
+TMUX_BASIS=(); [ -n "$tmux_socket" ] && TMUX_BASIS=(-L "$tmux_socket")
+tmux() { command tmux "${TMUX_BASIS[@]}" "$@"; }
+json() { /usr/bin/python3 -c 'import json,sys; print(json.dumps({"ok":sys.argv[1]=="1","mode":sys.argv[2],"model":sys.argv[3],"meldung":sys.argv[4],"command":sys.argv[5]}, ensure_ascii=False))' "$@"; }
+fail() { json 0 "" "${model:-}" "$1" ""; exit "${2:-1}"; }
+
+state="${AWB_WB_STATE:-$HOME/.local/bin/wb-state}"
+[[ -x "$state" ]] || state="$(command -v wb-state 2>/dev/null || true)"
+[[ -n "$state" ]] || fail "wb-state fehlt; nichts geaendert."
+revive="${AWB_WB_REVIVE:-$HOME/.local/bin/wb-revive}"
+[[ -x "$revive" ]] || revive="$(command -v wb-revive 2>/dev/null || true)"
+[[ -n "$revive" ]] || fail "wb-revive fehlt; nichts geaendert."
+
+cmd="$(tmux show-options -pqv -t "$pane" @wb_cmd 2>/dev/null || true)"
+[[ -n "$cmd" ]] || fail "Der Pane traegt keinen sicheren Startbefehl; nichts geaendert."
+current_model="$(printf '%s\n' "$cmd" | sed -nE 's/.*--model[= ]+([^ ]+).*/\1/p' | tr -d "'\"" | head -1)"
+[[ -n "$current_model" ]] || fail "Das laufende Modell ist nicht eindeutig; nichts geaendert."
+current_harness="$($state models get "$current_model" --field harness 2>/dev/null || true)"
+target_harness="$($state models get "$model" --field harness 2>/dev/null || true)"
+target_id="$($state models get "$model" --field id 2>/dev/null || true)"
+target_ref="$($state models get "$model" --field modelRef 2>/dev/null || true)"
+target_version="$($state models get "$model" --field discoveredVersion 2>/dev/null || true)"
+[[ -n "$target_id" && "$target_harness" = "$current_harness" ]] || fail "Das Zielmodell gehoert nicht zum laufenden Harness; nichts geaendert."
+hjson="$($state harness get "$current_harness" 2>/dev/null || true)"
+[[ "$hjson" = \{* ]] || fail "Der Harness ist nicht lesbar; nichts geaendert."
+
+encoded=()
+while IFS= read -r line; do encoded+=("$line"); done < <(printf '%s' "$hjson" | /usr/bin/python3 -c '
+import json, sys
+h=json.load(sys.stdin); s=h.get("modelSwitch") or {}
+for value in (h.get("promptPattern") or "", s.get("command") or "",
+              s.get("updateRequiredPattern") or "", "1" if s.get("versionGate") else "0"):
+    print(value.encode().hex())')
+decode_hex() { /usr/bin/python3 -c 'import sys; print(bytes.fromhex(sys.argv[1]).decode())' "$1"; }
+prompt_pattern="$(decode_hex "${encoded[0]:-}")"
+switch_command="$(decode_hex "${encoded[1]:-}")"
+update_pattern="$(decode_hex "${encoded[2]:-}")"
+version_gate="$(decode_hex "${encoded[3]:-30}")"
+[[ -n "$prompt_pattern" && -n "$switch_command" ]] || fail "Fuer Harness '$current_harness' ist kein belegter Live-Wechsel registriert."
+
+screen="$(tmux capture-pane -p -t "$pane" 2>/dev/null || true)"
+PROMPT_PATTERN="$prompt_pattern" SCREEN="$screen" /usr/bin/python3 - <<'PY' || fail "Die Sitzung ist beschaeftigt; nichts eingegeben und nicht neu gestartet." 3
+import os, re
+raise SystemExit(0 if re.search(os.environ["PROMPT_PATTERN"], os.environ["SCREEN"], re.M) else 1)
+PY
+
+older=0
+if [ "$version_gate" = 1 ] && [ -n "$target_version" ]; then
+  [ -n "$process_version" ] || older=1
+  if [ -n "$process_version" ]; then
+    /usr/bin/python3 - "$process_version" "$target_version" <<'PY' || older=1
+import re, sys
+def v(s):
+    m=re.search(r"\d+(?:\.\d+)+", s)
+    return tuple(int(x) for x in m.group(0).split('.')) if m else ()
+raise SystemExit(0 if v(sys.argv[1]) >= v(sys.argv[2]) else 1)
+PY
+  fi
+fi
+
+restart=0
+# An effort change has no measured in-process command in the registry.  Keep it
+# correct by applying it through the clean restart command instead of silently
+# ignoring it after a successful model slash.
+[ "$older" = 1 ] || [ -n "$effort" ] && restart=1
+if [ "$restart" = 0 ]; then
+  slash="${switch_command//\{model\}/$target_ref}"
+  # Nie in einen offenen Dialog oder auf ungesendeten Text (2026-10-09, wb-pane-write frei).
+  # Fundort: zuerst neben diesem Skript (Repo-Lauf, Testinstallation), dann die
+  # Installation. Bewusst keine Umgebungsvariable: die Pruefung darf sich der Aufrufer
+  # nicht selbst aussuchen. Fehlt das Werkzeug ganz, bleibt es fail-closed.
+  frei_pw="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wb-pane-write"
+  [ -x "$frei_pw" ] || frei_pw="$HOME/.local/bin/wb-pane-write"
+  [ -x "$frei_pw" ] || fail "wb-pane-write fehlt; ob die Sitzung frei ist, laesst sich nicht pruefen. Nichts eingegeben." 3
+  frei_grund="$(WB_TMUX_SOCKET="$tmux_socket" "$frei_pw" frei "$pane" 2>/dev/null)" \
+    || fail "Die Sitzung ist nicht frei (${frei_grund:-Pruefung ohne Antwort}); nichts eingegeben und nicht neu gestartet." 3
+  tmux send-keys -t "$pane" -l -- "$slash"
+  tmux send-keys -t "$pane" Enter
+  ready=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    after="$(tmux capture-pane -p -t "$pane" 2>/dev/null || true)"
+    # The old prompt remains visible until the TUI consumes the command.  It
+    # is not evidence of a completed switch; first wait for any screen change.
+    [ "$after" = "$screen" ] && continue
+    if [ -n "$update_pattern" ] && UPDATE_PATTERN="$update_pattern" SCREEN="$after" /usr/bin/python3 - <<'PY'
+import os, re
+raise SystemExit(0 if re.search(os.environ["UPDATE_PATTERN"], os.environ["SCREEN"], re.M) else 1)
+PY
+    then restart=1; break; fi
+    if PROMPT_PATTERN="$prompt_pattern" SCREEN="$after" /usr/bin/python3 - <<'PY'
+import os, re
+raise SystemExit(0 if re.search(os.environ["PROMPT_PATTERN"], os.environ["SCREEN"], re.M) else 1)
+PY
+    then ready=1; break; fi
+  done
+  [ "$ready" = 1 ] || restart=1
+fi
+
+if [ "$restart" = 1 ]; then
+  args=(--force --yes --model "$target_id")
+  [ -n "$effort" ] && args+=(--effort "$effort")
+  [ -n "$tmux_socket" ] && args+=(--tmux-socket "$tmux_socket")
+  "$revive" "${args[@]}" "$pane" >/dev/null || fail "Der sichere Neustart ist fehlgeschlagen; Modellstand unveraendert."
+  mode="restart"
+  message="Pane neu gestartet; Gespraech mit '$target_id' fortgesetzt."
+  actual="wb-revive --model $target_id"
+else
+  mode="slash"
+  message="Sofort auf '$target_id' gewechselt; Gespraech und Prozess laufen weiter."
+  actual="$slash"
+fi
+
+sess="$(tmux display-message -p -t "$pane" '#{session_name}' 2>/dev/null || true)"
+dir="$(tmux display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)"
+[[ -n "$sess" && -n "$dir" ]] && "$state" touch "$dir" "$sess" --harness "$target_harness" --model "$target_id" >/dev/null 2>&1 || true
+json 1 "$mode" "$target_id" "$message" "$actual"

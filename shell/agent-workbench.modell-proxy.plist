@@ -87,6 +87,20 @@
       <key>SockType</key><string>stream</string>
       <key>SockFamily</key><string>IPv4</string>
     </dict>
+    <!-- Bedarfsschaltung des Splash-Servers (2026-09-21, Befund des Nutzers):
+         steht eine lokale Sitzung lange still, stoppt die Leerlaufwache den
+         Server nach 20 Minuten, und die naechste Anfrage aus einem Worker oder
+         Orchestrator lief ins Leere -- der Pane blieb stehen, ohne dass etwas
+         passierte. Hinter diesem Socket faehrt der Server bei der naechsten
+         Anfrage von selbst wieder hoch. Schluessel 'splash' = 'socketName' im
+         backends.json-Eintrag '8001'; das Backend lauscht dahinter auf 8000. -->
+    <key>splash</key>
+    <dict>
+      <key>SockNodeName</key><string>127.0.0.1</string>
+      <key>SockServiceName</key><string>8001</string>
+      <key>SockType</key><string>stream</string>
+      <key>SockFamily</key><string>IPv4</string>
+    </dict>
   </dict>
   <key>EnvironmentVariables</key>
   <dict>

@@ -33,7 +33,7 @@
 #   3  Pane laeuft noch, nichts getan
 #   4  uebersprungen: zu wenig freier Speicher, Pane bleibt tot
 #   5  uebersprungen: Drossel (kurz zuvor schon wiederbelebt)
-#   6  kein Workbench-Pane, nichts zu tun
+#   6  kein Workbench-Pane oder kein Live-Server (Test-/Fremd-Socket), nichts zu tun
 set -euo pipefail
 
 pane="${1:?pane id}"
@@ -60,6 +60,51 @@ prole=$(tmux show-options -pqv -t "$pane" @wb_role 2>/dev/null || true)
 pworker=$(tmux show-options -pqv -t "$pane" @wb_worker 2>/dev/null || true)
 if [[ -z "$cmd" ]] || { [[ -z "$wbcmd" ]] && [[ -z "$prole" ]] && [[ -z "$pworker" ]]; }; then
   log "kein Workbench-Pane (weder @wb_cmd noch @wb_role/@wb_worker), skip"
+  exit 6
+fi
+
+# Nur der LIVE-Server darf wiederbeleben (2026-10-14). Der pane-died-Hook steht in
+# ~/.tmux.conf und laedt auch in jedem Test-tmux-Server ohne `-f /dev/null`. Ein
+# absichtlich getoeteter Testpane rief so dieses Skript mit dem echten HOME auf und
+# konnte einen echten claude im Testserver starten (Befund wz-testleck2, OPEN 5).
+# Live ist der Standard-Server der Werkbank: Socket `${TMUX_TMPDIR:-/private/tmp}/tmux-<uid>/default`
+# (ohne -L/-S gilt der umgebende Server, siehe shell/wb-inbox "WELCHER TMUX-SERVER";
+# die Werkbank-Sitzungen laufen dort, Beleg: wb-PraktikumNebenStudium-* auf dem Default-
+# Socket, `ps`-Zeile tmux new-session ohne -L). Test-Server
+# nutzen eigene Namen (`-L wbtest-*`, `-L wbk7c-*` aus test-wb-tafel-deckung.sh:421,
+# `-L $SOCKET`, `-S <tmp>`) und sind damit draussen. Gemessen 2026-10-14: kein Test in
+# shell/tests benennt einen Socket `default`. Das Muster `tmux-<uid>/default` trifft daher
+# nur den Standard-Server, auch wenn TMUX_TMPDIR umgelenkt ist (Attrappen-Ort der Suiten).
+# WB_TESTUMGEBUNG=1 erzwingt Ruhe, auch wenn der Socket wie der Live-Socket aussieht.
+# Die Werkbank kann einen eigenen Socket-Namen setzen (app/src/main/befehle.ts, tmux(); Schluessel
+# tmuxSocket in ~/.config/agent-workbench/config.json, Eigenbau 14.10.). Dieser Name gilt dann
+# zusaetzlich als Live-Socket, nur der Schluessel tmuxSocket wird gelesen. Test-Namen bleiben
+# draussen (wbtest-*, wbk*): sie waeren sonst ueber die Konfiguration erlaubt.
+cfg_socket() {
+  local cfg="${AWB_CONFIG:-$HOME/.config/agent-workbench/config.json}"
+  [[ -r "$cfg" ]] || return 0
+  /usr/bin/python3 -c '
+import json, sys
+try:
+    wert = json.load(open(sys.argv[1], encoding="utf-8")).get("tmuxSocket", "")
+    print(wert if isinstance(wert, str) else "")
+except (OSError, ValueError, AttributeError):
+    pass' "$cfg" 2>/dev/null
+}
+live_socket_ok() {
+  local sock="$1" base dir name
+  [[ -n "$sock" && "${WB_TESTUMGEBUNG:-}" != 1 ]] || return 1
+  base="${sock##*/}"; dir="${sock%/*}"
+  [[ "${dir##*/}" == "tmux-$(id -u)" ]] || return 1
+  [[ "$base" == default ]] && return 0
+  name="$(cfg_socket)"
+  [[ "$name" =~ ^[A-Za-z0-9._-]{1,64}$ && "$base" == "$name" ]] || return 1
+  case "$base" in wbtest-*|wbk*) return 1 ;; esac
+  return 0
+}
+sock=$(tmux display -p -t "$pane" '#{socket_path}' 2>/dev/null || true)
+if ! live_socket_ok "$sock"; then
+  log "kein Live-Server (Socket ${sock:-unbekannt}), skip: Test- oder fremder tmux-Server wird nicht wiederbelebt"
   exit 6
 fi
 

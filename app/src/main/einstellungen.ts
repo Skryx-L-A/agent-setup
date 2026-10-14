@@ -37,7 +37,7 @@ import { chatVorgabeAus, type ChatVorgabe } from '../chat/ansichtsregel';
  * Wer sie ändert, ändert BEIDE Stellen. Die Suite prüft genau das.
  */
 export const VORGABE_AUSSCHLUSS_ORDNER: readonly string[] = [
-  '90-secrets', '.ssh', '.gnupg',
+  'secrets', '.ssh', '.gnupg',
   'node_modules', '.git', 'dist', 'build', '__pycache__', '.venv', 'venv',
   '.mypy_cache', '.pytest_cache', '.next', '.turbo', 'target',
 ];
@@ -94,7 +94,12 @@ export const VORGABE_ASK_MUSTER: readonly AskMuster[] = [
   { befehl: 'git', unterbefehl: 'clean', muster: '(^|\\s)-[A-Za-z]*f[A-Za-z]*(\\s|$)', grund: 'Loescht nicht versionierte Dateien im Arbeitsbaum.' },
   { befehl: 'npm|pnpm|yarn|cargo', unterbefehl: 'publish', grund: 'Veroeffentlicht nach aussen -- eine Version draussen laesst sich nicht zurueckziehen.' },
   { befehl: 'twine', unterbefehl: 'upload', grund: 'Veroeffentlicht nach aussen -- eine Version draussen laesst sich nicht zurueckziehen.' },
-  { befehl: 'gh', unterbefehl: 'release', muster: '(^|\\s)create(\\s|$)', grund: 'Veroeffentlicht nach aussen -- eine Version draussen laesst sich nicht zurueckziehen.' },
+  { befehl: 'gh', unterbefehl: 'release', muster: '(^|\\s)release\\s+(create|upload|edit|delete)(\\s|$)', grund: 'Veroeffentlicht nach aussen -- eine Version draussen laesst sich nicht zurueckziehen.' },
+  { befehl: 'gh', unterbefehl: 'repo', muster: '(^|\\s)create\\s(.*\\s)?--public(\\s|=|$)', grund: 'Legt ein oeffentliches Repository an -- was dort einmal liegt, ist draussen.' },
+  { befehl: 'gh', unterbefehl: 'repo', muster: '(^|\\s)repo\\s+edit\\s(.*\\s)?--visibility(\\s+|=)public(\\s|$)', grund: 'Macht ein Repository oeffentlich -- was dort liegt, ist danach draussen.' },
+  { befehl: 'gh', unterbefehl: 'pr', muster: '(^|\\s)pr\\s+merge(\\s|$)', grund: 'Fuehrt einen Pull Request in den Zielzweig zusammen -- sichtbar fuer alle, nicht still zurueckzunehmen.' },
+  { befehl: 'docker|podman', unterbefehl: 'push', grund: 'Laedt ein Image in eine Registry hoch -- einmal gezogen, laesst es sich nicht zurueckholen.' },
+  { befehl: 'uv', unterbefehl: 'publish', grund: 'Veroeffentlicht nach aussen -- eine Version draussen laesst sich nicht zurueckziehen.' },
   { befehl: 'launchctl', unterbefehl: 'unload|bootout|disable|remove', grund: 'Haelt einen Hintergrunddienst an, der danach nicht von selbst wiederkommt.' },
   { befehl: 'crontab', muster: '(^|\\s)-[A-Za-z]*r(\\s|$)', grund: 'Loescht die gesamte Zeitplan-Tabelle.' },
   { befehl: 'diskutil', unterbefehl: 'erase[A-Za-z]*|reformat|partitionDisk', grund: 'Legt einen Datentraeger neu an -- der Inhalt ist danach weg.' },
@@ -137,8 +142,10 @@ export const VORGABEN: Readonly<Record<string, unknown>> = {
   // samt laufender Arbeit nicht. Wer den alten Weg will, schaltet ihn ein.
   closeSessionOnWindowClose: false,
   orchestratorHarness: 'claude',
-  orchestratorModel: 'claude-opus-5',
+  orchestratorModel: 'opus',
   orchestratorEffort: 'xhigh',
+  harnessUpdateAuto: true,
+  harnessUpdateIntervalHours: 6,
   // 2026-08-11: `workerLayout`, `newSessionDefaultDir` und `modelDiscoveryAuto`
   // standen bis heute NUR in der VS-Code-Erweiterung, obwohl dieses Programm
   // und die Werkzeuge sie laengst lesen. Sie sind in das Menue gewandert
@@ -185,6 +192,9 @@ export const VORGABEN: Readonly<Record<string, unknown>> = {
   // Wegwahl. Zweite Stelle: DEFAULTS in shell/wb-state.
   orchestratorVorhersageWeg: '',
   maxWorkers: 8,
+  // 2026-09-25: untaetige Sitzungen jedes Harness nach so vielen Minuten schlafen
+  // legen (shell/wb-schlaf); 0 = aus. Zweite Stelle: DEFAULTS in shell/wb-state.
+  schlafNachMinuten: 60,
   workerWorktrees: true,
   defaultWorkerMachine: 'local',
   // Die zusammengelegte Doublette (06.08.). 6 ist gemessen (2 Spalten a 80
@@ -199,6 +209,9 @@ export const VORGABEN: Readonly<Record<string, unknown>> = {
   // Programm-Schriftgroesse der Terminals in Pixeln (06.08.). Sie stand bis
   // dahin fest im Renderer und gehoert dorthin, wo der Mensch sie erreicht.
   terminalFontSize: 13,
+  // Bilder je Sekunde der Agentenfiguren und ihrer Ringe in der Mac-Fassung
+  // (09.10.2026, Auftrag figur-uhr), nur die Figuren. 30 ist der bisherige Wert.
+  figurenBildrate: 30,
   // Wieviele Zeilen EINE Rad-Rasterung bewegt (06.08.). Vorher fiel das aus der
   // Zellhoehe und dem Geraet -- ein Trackpad rollte anders als eine Maus, und
   // eine kleinere Schrift rollte schneller. Drei Zeilen sind die uebliche
@@ -233,6 +246,13 @@ export const VORGABEN: Readonly<Record<string, unknown>> = {
   // ist" ausgerechnet eine Meldeeinstellung nicht an. Zweite Stelle: DEFAULTS
   // in shell/wb-state.
   guardMeldetWorkerStatus: false,
+  // Der mobile Dienst (Web-App im Tailnet, 2026-09-18). Vorgabe AUS: er oeffnet
+  // einen Loopback-Port und nimmt signierte Anfragen gekoppelter Geraete an, und
+  // das soll nur laufen, wenn es jemand ausdruecklich eingeschaltet hat. Gelesen
+  // wird der Schluessel vom Kern ueber `mobilServerAn()`; hier steht er, damit
+  // test-vorgaben-paritaet.sh beide Tabellen gleich sieht. Zweite Stelle:
+  // DEFAULTS in shell/wb-state.
+  mobileServer: false,
   workerSkipPermissions: true,
   // Der Zustellweg zum Worker (2026-08-20). Zweite Stelle: DEFAULTS in
   // shell/wb-state, dort steht auch, was die drei Werte bedeuten.
@@ -492,6 +512,25 @@ export function schalterAus(key: string, pfad = einstellungenPfad()): boolean {
   const roh = alleEinstellungen(pfad)[key];
   if (typeof roh === 'boolean') return roh;
   return VORGABEN[key] === true;
+}
+
+/**
+ * Harness-Aktualisierungen haben absichtlich einen eigenen kleinen Leser:
+ * Das Shell-Werkzeug muss auch ohne laufende App dieselbe Vorgabe anwenden.
+ * Fehlend oder falsch typisiert bedeutet AN; nur ein ausdrueckliches `false`
+ * sperrt den automatischen Netzzugriff. Das Intervall ist auf 1..168 Stunden
+ * begrenzt, damit ein Tippfehler weder einen engen Dauerlauf noch ein faktisch
+ * nie laufendes Update erzeugt.
+ */
+export function harnessUpdateAuto(pfad = einstellungenPfad()): boolean {
+  const roh = alleEinstellungen(pfad).harnessUpdateAuto;
+  return typeof roh === 'boolean' ? roh : VORGABEN.harnessUpdateAuto === true;
+}
+
+export function harnessUpdateIntervalHours(pfad = einstellungenPfad()): number {
+  const roh = alleEinstellungen(pfad).harnessUpdateIntervalHours;
+  const n = typeof roh === 'number' ? Math.floor(roh) : NaN;
+  return Number.isFinite(n) && n >= 1 && n <= 168 ? n : Number(VORGABEN.harnessUpdateIntervalHours);
 }
 
 /** Eine Zeichenketten-Liste aus den Einstellungen. */
@@ -780,6 +819,19 @@ export function chatAnsichtVorgabe(pfad = einstellungenPfad()): ChatVorgabe {
  * baut. `wb-consistency` (Check 6) zaehlt einen Fund im Menue ausdruecklich
  * NICHT als Leser; diese Funktion steht deshalb hier und nicht dort.
  */
+/**
+ * DER SCHALTER DER MOBILEN WERKBANK (Paket 10). `wb-state settings set
+ * mobileServer true|false` -- derselbe einzige Schreibweg wie fuer jede geteilte
+ * Einstellung; das Menue schreibt ihn ueber `awb:ein-setzen`. VORGABE AUS: nur
+ * ein ausdrueckliches `true` startet den Server. Der Schluessel steht bewusst
+ * NICHT in VORGABEN: die Tabelle muss mit den DEFAULTS von shell/wb-state
+ * uebereinstimmen (test-vorgaben-paritaet.sh), und wb-state gehoert nicht zu
+ * diesem Auftrag. Ein fehlender Schluessel heisst hier wie dort „aus".
+ */
+export function mobilServerAn(pfad = einstellungenPfad()): boolean {
+  return alleEinstellungen(pfad).mobileServer === true;
+}
+
 export function erststartErledigt(pfad = einstellungenPfad()): boolean {
   return alleEinstellungen(pfad).erststartErledigt === true;
 }

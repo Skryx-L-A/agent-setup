@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -15,6 +16,30 @@ from . import config
 log = logging.getLogger("gardener")
 
 LAST_RUN_FILE = "last-run.json"
+
+
+def install_termination_handler() -> None:
+    """Make SIGTERM behave exactly like SIGINT (Ctrl-C): raise
+    `KeyboardInterrupt` in the main thread instead of killing the process on
+    the spot.
+
+    Auftrag "p0-schutztore" (pipeline-analyse Abschnitt 0 Punkt 6): before
+    this, nothing in the tree ever called `signal.signal` - SIGINT already
+    worked by Python's own default (it raises `KeyboardInterrupt`, which
+    `gardener/cli.py`'s `main()` already caught), but SIGTERM did not raise
+    anything at all. A hard kill skips every `finally` and every `with`
+    block on the way down - the lock is never released, a mid-write is never
+    reported as a conflict on the next run, nothing gets the chance to leave
+    a resumable state. `signal.default_int_handler` is the exact function
+    Python installs for SIGINT itself, so this does not reimplement the
+    "clean stop" path, it only routes a second signal into the one that
+    already existed.
+
+    Call once, from the main thread, at the top of a CLI entry point (`grug-
+    server`/model calls and the reviewer's worker threads never call this
+    themselves - a signal handler can only be installed on the main thread,
+    and every long run in this tree is driven from there)."""
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
 
 
 class LockHeldError(Exception):
@@ -29,6 +54,17 @@ class Deadline:
         # (Altaufrufer, oder ein Check, der nur wissen will ob Zeit uebrig ist)
         # bleibt der Aufruf folgenlos fuer diese Liste.
         self.stops: list[dict] = []
+
+    def share(self, fraction: float) -> "Deadline":
+        """A sub-budget: at most `fraction` of the time still left, never past
+        this deadline. Stops land in the same list, so the report sees them.
+        Run of 24.09.2026: linking alone used the whole 45-minute budget and
+        every later phase ran on an exhausted one."""
+        sub = Deadline.__new__(Deadline)
+        now = time.monotonic()
+        sub.end = min(self.end, now + max(0.0, self.end - now) * fraction)
+        sub.stops = self.stops
+        return sub
 
     def expired(self, phase: str | None = None, done: int | None = None,
                total: int | None = None) -> bool:
@@ -97,6 +133,9 @@ class CommitResult:
     paths: list = field(default_factory=list)      # eingestellt, vault-relativ
     foreign: list = field(default_factory=list)    # fremd, unangetastet
     message: str = ""
+    ignored: list = field(default_factory=list)    # von git ignoriert, nie eingestellt
+    error: str = ""                                # sichtbarer Fehler, leer = keiner
+    repo: str = ""
 
     def __bool__(self) -> bool:
         return self.committed
@@ -104,7 +143,8 @@ class CommitResult:
 
 def _porcelain(vault: Path) -> list[tuple[str, str]]:
     """(Status, Pfad) je Eintrag aus `git status --porcelain`."""
-    r = subprocess.run(["git", "-C", str(vault), "status", "--porcelain",
+    # core.quotePath=false: sonst kommen Namen mit Umlaut als Oktal-Escapes und treffen keinen Pfad.
+    r = subprocess.run(["git", "-C", str(vault), "-c", "core.quotePath=false", "status", "--porcelain",
                         "--untracked-files=all"],
                        capture_output=True, text=True, timeout=60)
     out = []
@@ -141,7 +181,8 @@ def foreign_changes(vault: Path, own=()) -> list[str]:
             if p not in eigene]
 
 
-def git_commit(vault: Path, message: str, paths, dry_run: bool = False
+def git_commit(vault: Path, message: str, paths, dry_run: bool = False,
+               author: str | None = None
                ) -> CommitResult:
     """Commit GENAU die Pfade, die dieser Lauf selbst geschrieben hat.
 
@@ -163,7 +204,7 @@ def git_commit(vault: Path, message: str, paths, dry_run: bool = False
     nicht so tun, als haette er nichts gesehen.
     """
     rel = sorted({str(p) for p in (paths or []) if str(p).strip()})
-    result = CommitResult(paths=rel, message=message)
+    result = CommitResult(paths=rel, message=message, repo=str(vault))
     if dry_run:
         log.info("dry-run: skipping git commit (%s)", message)
         return result
@@ -172,16 +213,34 @@ def git_commit(vault: Path, message: str, paths, dry_run: bool = False
         if result.foreign:
             log.info("git: %d fremde Aenderung(en) im Baum bleiben "
                      "unangetastet und uncommittet", len(result.foreign))
+        # Ignorierte Pfade vorher heraus: EIN ignorierter Pfad laesst `git
+        # add` mit Exit 1 scheitern, nachdem es die uebrigen schon in den
+        # Index gelegt hat - Lauf vom 24.09.2026 (`IDENTITY.md`): kein Commit,
+        # halb gestageter Index, Bericht "status ok".
+        result.ignored = _ignored_paths(vault, rel)
+        if result.ignored:
+            log.warning("git: %d ignorierte(r) Pfad(e) nicht eingestellt: %s",
+                        len(result.ignored), ", ".join(result.ignored))
+            rel = [p for p in rel if p not in set(result.ignored)]
+            result.paths = rel
         if not rel:
             log.info("git: nichts Eigenes zu committen (%s)", message)
             return result
         # `add` macht neue Dateien und Loeschungen bekannt, `--only` begrenzt
         # den Commit auf genau diese Pfade, auch wenn der Index Fremdes traegt.
-        subprocess.run(["git", "-C", str(vault), "add", "--"] + rel,
-                       check=True, capture_output=True, timeout=60)
+        a = subprocess.run(["git", "-C", str(vault), "add", "--"] + rel,
+                           capture_output=True, text=True, timeout=60)
+        if a.returncode != 0:
+            # Was `add` schon eingestellt hat, wieder heraus - nur die eigenen
+            # Pfade, der Index anderer bleibt, wie er war.
+            subprocess.run(["git", "-C", str(vault), "reset", "-q", "--"] + rel,
+                           capture_output=True, timeout=60)
+            result.error = f"git add: {(a.stderr or a.stdout).strip()[-300:]}"
+            log.error("git commit error in %s: %s", vault, result.error)
+            return result
         r = subprocess.run(
             ["git", "-C", str(vault), "commit", "--only",
-             "--author", config.GIT_AUTHOR, "-m", message, "--"] + rel,
+             "--author", author or config.GIT_AUTHOR, "-m", message, "--"] + rel,
             capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
             log.info("git commit: %s (%d Pfade)", message, len(rel))
@@ -191,11 +250,77 @@ def git_commit(vault: Path, message: str, paths, dry_run: bool = False
                 "no changes added" in (r.stdout + r.stderr):
             log.info("git: nothing to commit (%s)", message)
             return result
+        result.error = f"git commit: {(r.stdout + r.stderr).strip()[-300:]}"
         log.error("git commit failed: %s%s", r.stdout, r.stderr)
         return result
     except Exception as e:
+        result.error = f"{type(e).__name__}: {e}"[:300]
         log.error("git commit error: %s", e)
         return result
+
+
+def _ignored_paths(repo: Path, rel: list[str]) -> list[str]:
+    """Die Pfade aus `rel`, die git in `repo` ignoriert (`check-ignore`,
+    Exit 1 = keiner). Eine bereits versionierte Datei gilt nicht als ignoriert
+    (`--no-index` fehlt absichtlich): die darf ein Commit weiter tragen."""
+    if not rel:
+        return []
+    r = subprocess.run(["git", "-C", str(repo), "check-ignore", "--stdin", "-z"],
+                       input="\0".join(rel) + "\0", capture_output=True,
+                       text=True, timeout=60)
+    if r.returncode not in (0, 1):
+        return []
+    return sorted(p for p in r.stdout.split("\0") if p)
+
+
+def _repo_root_for(vault: Path, rel: str) -> Path:
+    """Nearest enclosing `.git`, walking up from `rel`'s directory but never
+    past `vault` itself -- a mounted space is its own repo directly under
+    the vault (S1, `gardener.spaces`), the vault root is the fallback repo
+    for everything not inside one."""
+    vault = vault.resolve()
+    here = (vault / rel).resolve().parent
+    while True:
+        if (here / ".git").exists():
+            return here
+        if here == vault:
+            return vault
+        here = here.parent
+
+
+def commit_by_repo(vault: Path, message: str, paths, dry_run: bool = False,
+                   author: str | None = None
+                   ) -> list[CommitResult]:
+    """Like `git_commit`, but for a vault with mounted space repos (S2):
+    groups vault-relative `paths` by the nearest enclosing `.git` and
+    commits each repo separately, with paths made relative to THAT repo --
+    the vault root's own `git commit --only` never sees a mounted space's
+    files (its `.gitignore` block excludes them), so a single commit there
+    would silently drop them. A run touching only the vault root behaves
+    exactly like a single `git_commit` call. Same argument order as
+    `git_commit` so either can sit behind a `git_commit_fn=` injection point.
+    """
+    vault = Path(vault)
+    groups: dict[Path, list[str]] = {}
+    for p in sorted({str(x) for x in (paths or []) if str(x).strip()}):
+        root = _repo_root_for(vault, p)
+        rel_in_repo = (vault / p).resolve().relative_to(root.resolve()).as_posix()
+        groups.setdefault(root, []).append(rel_in_repo)
+    return [git_commit(root, message, rel_paths, dry_run=dry_run, author=author)
+            for root, rel_paths in groups.items()]
+
+
+def commit_by_repo_single(vault: Path, message: str, paths, dry_run: bool = False
+                         ) -> CommitResult:
+    """`commit_by_repo`, folded into one `CommitResult` for call sites
+    (`dream/apply.py`, `dream/review.py`) whose `git_commit_fn=` injection
+    point expects exactly one result, same shape as `git_commit`."""
+    combined = CommitResult(message=message)
+    for r in commit_by_repo(vault, message, paths, dry_run=dry_run):
+        combined.committed = combined.committed or r.committed
+        combined.paths.extend(r.paths)
+        combined.foreign.extend(r.foreign)
+    return combined
 
 
 def write_last_run(state_dir: Path, data: dict) -> Path | None:

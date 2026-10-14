@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <!-- Kein user-scalable=no: Zoom bleibt fuer Barrierefreiheit erlaubt; das
+       Hineinzoomen beim Fokus verhindert die Schriftgroesse der Felder. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; manifest-src 'self'; worker-src 'self'; connect-src 'self' __AWB_MOBILE_ORIGINS__; base-uri 'none'; form-action 'none'">
+  <!-- Beide API-Origins; der Server ersetzt den Platzhalter aus seiner Konfiguration (Paket 10). -->
+  <meta name="awb-mobile-origins" content="__AWB_MOBILE_ORIGINS__">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0b0d10">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Werkbank">
+  <meta name="format-detection" content="telephone=no">
+  <title>Werkbank</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="stylesheet" href="tokens.css">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div id="app"></div>
+  <noscript><p class="ohne-skript">Die Werkbank braucht JavaScript.</p></noscript>
+</body>
+</html>

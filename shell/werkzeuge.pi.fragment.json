@@ -1,0 +1,22 @@
+{
+  "_comment": "Fragment fuer shell/werkzeuge.default.json (Schema werkzeuge/1), Abschnitt pi. Noch nicht eingefuehrt: die Quelle legt Spur S1 an, Einfuehrung ueber R. Enthaelt keine Geheimnisse und keine Werte, nur Dateiverweise. Plan: _recherche/werkzeug-plan-2026-10-13.md Abschnitt 2.4 und S7.",
+  "plugins": {
+    "pi": {
+      "erwartet": [],
+      "werkbank": [
+        {
+          "datei": "wb-inbox.ts",
+          "quelle": "shell/inbox/pi-wb-inbox.ts",
+          "ziel": "~/.pi/agent/extensions/wb-inbox.ts",
+          "beleg": "shell/wb-inbox, Eintrag pi, einrichten (Zeile 310)"
+        },
+        {
+          "datei": "brain-kontext.ts",
+          "quelle": null,
+          "ziel": "~/.pi/agent/extensions/brain-kontext.ts",
+          "offen": "Keine Quelle im Repo (git ls-files leer). Auf dem Mac liegt eine Kopie unter ~/.pi/agent/extensions/, auf peer fehlt sie (Inventur 2). Quelle durch Entscheidung festlegen."
+        }
+      ]
+    }
+  }
+}

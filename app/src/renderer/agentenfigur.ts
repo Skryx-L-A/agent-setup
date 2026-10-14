@@ -772,8 +772,30 @@ function animiert(): boolean {
   return !reduziert() && !document.hidden;
 }
 
+/**
+ * BILDRATE (Auftrag figur-electron, 09.10.2026). Die Einstellung `figurenBildrate`
+ * (10 bis 60, Vorgabe 30) kommt mit jedem `awb:model`. Der Animationsrahmen laeuft
+ * weiter im Takt des Bildschirms, gezeichnet wird aber nur, wenn seit dem letzten
+ * Bild mindestens ein Bildabstand vergangen ist. Die Pose bleibt eine Funktion der
+ * Uhrzeit: weniger Bilder, keine Zeitlupe. `document.hidden` haelt die Uhr ohnehin an
+ * (`animiert`), und der Browser ruft den Animationsrahmen einer verborgenen Seite nicht.
+ */
+const BILDRATE_VORGABE = 30;
+let bildrate = BILDRATE_VORGABE;
+let letztesBild = -Infinity;
+export function figurenBildrateSetzen(wert: unknown): void {
+  const n = typeof wert === 'number' ? wert : Number.NaN;
+  bildrate = Number.isFinite(n) && n >= 10 && n <= 60 ? n : BILDRATE_VORGABE;
+}
+/** Halber Bildschirmtakt bei 60 Hz als Spielraum: sonst faellt 30 auf 20 Bilder je Sekunde. */
+const SPIELRAUM_MS = 1000 / 120;
+
 function schleife(jetzt: number): void {
   if (!animiert() || !lebende.size) { rahmenLaeuft = false; return; }
+  const abstand = 1000 / bildrate;
+  if (jetzt - letztesBild < abstand - SPIELRAUM_MS) { requestAnimationFrame(schleife); return; }
+  // Rest des Abstands mitnehmen, damit der Durchschnitt auf der Soll-Rate bleibt.
+  letztesBild = jetzt - letztesBild < 2 * abstand ? letztesBild + abstand : jetzt;
   let gezeigt = 0;
   for (const f of lebende) {
     if (!f.c.isConnected) { austragen(f); continue; }

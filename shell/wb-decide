@@ -7,6 +7,9 @@
 # ~/.pi-workers/requests/log.tsv and, on approve, prints the ready-to-run spawn
 # command. It NEVER spawns anything itself: deciding and executing both stay with
 # the orchestrator, so an approval is always a deliberate second step.
+# Approving needs a MEASURED origin (orchestrator pane or a human, see HERKUNFT
+# below); a worker pane is refused with exit 3. Rejecting needs a measured origin
+# too (14.10.2026), with one exception: a worker may reject its OWN request.
 set -u
 
 REQ="${1:?Antrags-Datei}"; ACTION="${2:?approve|reject}"; shift 2
@@ -50,6 +53,225 @@ for feld in R_TS R_PARENT R_CHILD_NAME; do
   eval "wert=\"\${$feld:-}\""
   [ -n "$wert" ] || { echo "wb-decide: Antrag '$REQ' ist unvollstaendig ($feld fehlt) — nichts entschieden, nichts geschrieben." >&2; exit 2; }
 done
+
+# HERKUNFT DES ANNEHMENS (13.10.2026, Folge zum Steuerkanal-Fix 9c052599). Bis dahin
+# entschied, wer die Antragsdatei nannte: ein Worker konnte seinen eigenen Antrag oder
+# den eines anderen Workers annehmen, und ueber den Steuersocket der App jeder Prozess
+# des Benutzers. Annehmen braucht jetzt eine GEMESSENE Herkunft; Ablehnen seit 14.10.
+# ebenso, ausser dem eigenen Antrag eines Workers (Abschnitt HERKUNFT DES ABLEHNENS).
+#   * Die Ahnenkette dieses Aufrufs, soweit ihre Glieder die pane_pid eines Panes auf einem
+#     der eigenen tmux-Server sind (dasselbe Verfahren wie wb-mensch A3 und wb-inbox
+#     HERKUNFT; TMUX_PANE zaehlt nicht), entscheidet die Rolle. Strengste Lesart wie
+#     hooks/lib/rollen.py: Worker, sobald bei IRGENDEINEM Pane der Kette (auf welchem Server
+#     auch immer) @wb_role, @wb_worker ODER das Rollenregister das sagen -> abgelehnt.
+#   * Hauptagent nur, wenn der NAECHSTE Pane der Kette @wb_role=orchestrator traegt, das
+#     Register nicht widerspricht UND der Pane auf dem Werkbank-Server liegt: Standard-Socket
+#     (Darwin /private/tmp/tmux-<uid>/default, Linux /tmp/tmux-<uid>/default, fester Pfad je
+#     System) oder der Name aus tmuxSocket der config.json im Heimatverzeichnis laut
+#     Benutzerdatenbank (nie aus $HOME/AWB_CONFIG; nie Testnamen wbtest-*, wbk*). Gemessen:
+#     der echte Orchestrator hat oft keinen Registereintrag, also kann das Register nicht
+#     verlangt werden; und es ist allein nicht tragfaehig, weil es sich per
+#     AWB_ROLLEN_DIR/HOME umlenken laesst. Ein Pane auf einem anderen Server (`tmux -L x`,
+#     ein Aufrufer legt ihn selbst an und setzt dort @wb_role) ist ein Pane ohne Rolle und
+#     faellt auf wb-mensch zurueck.
+#     GRENZE: wer die echte config.json schreibt, kann einen Server benennen (gleiche Klasse
+#     wie ~/.local/bin schreiben). Die Testnaht ist eine Kopie dieses Skripts mit
+#     umgeschriebenen Konstanten (WB_SOCKET_BASIS, WB_CONFIG_DATEI), nie ein Schalter hier.
+#   * Sonst (kein Pane, Pane ohne Rolle) nur, wenn `wb-mensch pruefen` einen Menschen
+#     misst: Terminal ohne Agent darueber (M1) oder die Oberflaeche als Ahne (M2; der
+#     Kern setzt WB_MENSCH_QUELLE/WB_APP_PID nur nach einem echten Klick).
+# GRENZE wie bei wb-mensch: Code, der seine Herkunft aktiv verwischt (etwa ein neues
+# tmux-Fenster ohne Rolle aufmacht), wird hier nicht erkannt.
+wb_herkunft() {
+  /usr/bin/python3 - "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/hooks/lib" \
+    "$HOME/.claude/hooks/lib" <<'PY'
+import json, os, pwd, re, socket, subprocess, sys
+
+# FESTE ORTE (die Testnaht: eine KOPIE dieses Skripts, in der genau diese zwei Zeilen
+# umgeschrieben sind; shell/tests/lib-decide-kopie.sh. Das installierte Werkzeug hat keinen
+# Schalter, keine Variable, keine Datei daneben).
+#   Socketverzeichnis des Systems: tmux legt seine Sockets unter <Basis>/tmux-<uid>/ ab.
+#   Die Konfiguration der Werkbank: ~/.config/agent-workbench/config.json im Heimatverzeichnis
+#   laut Benutzerdatenbank, NIE aus $HOME oder AWB_CONFIG (beide setzt der Aufrufer).
+WB_SOCKET_BASIS = "/private/tmp" if sys.platform == "darwin" else "/tmp"
+WB_CONFIG_DATEI = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".config", "agent-workbench", "config.json")
+
+def tmux_fest():
+    for k in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux", "/bin/tmux"):
+        if os.access(k, os.X_OK):
+            return k
+    return None
+
+def sockets():
+    uid = os.getuid()
+    raus, gesehen = [], set()
+    t = os.environ.get("TMUX", "").split(",")[0]
+    kandidaten = [t] if t else []
+    for d in ("%s/tmux-%d" % (WB_SOCKET_BASIS, uid), "/private/tmp/tmux-%d" % uid, "/tmp/tmux-%d" % uid,
+              os.path.join(os.environ.get("TMPDIR", "/tmp"), "tmux-%d" % uid)):
+        try:
+            if os.stat(d).st_uid != uid:
+                continue
+            kandidaten += [os.path.join(d, n) for n in sorted(os.listdir(d))]
+        except OSError:
+            continue
+    for p in kandidaten:
+        try:
+            real = os.path.realpath(p)
+            st = os.stat(real)
+        except OSError:
+            continue
+        if real in gesehen or st.st_uid != uid:
+            continue
+        gesehen.add(real)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1)
+        try:
+            s.connect(real)
+        except (ConnectionRefusedError, FileNotFoundError):
+            continue
+        except OSError:
+            pass
+        finally:
+            s.close()
+        raus.append(real)
+    return raus
+
+def ahnen():
+    try:
+        r = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid="], capture_output=True,
+                           text=True, timeout=5, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    eltern = {}
+    for z in r.stdout.splitlines():
+        t = z.split()
+        if len(t) == 2 and t[0].isdigit() and t[1].isdigit():
+            eltern[int(t[0])] = int(t[1])
+    kette, pid = [], os.getppid()
+    for _ in range(64):
+        if pid <= 1 or pid not in eltern:
+            break
+        kette.append(pid)
+        pid = eltern[pid]
+    return kette
+
+def werkbank_sockets():
+    """Die Server der Werkbank, als realpath: der Standard-Socket des Benutzers unter dem
+    festen Verzeichnis des Systems (Darwin /private/tmp, sonst /tmp, je tmux-<uid>/default;
+    derselbe umgebende Server, den wb-inbox HERKUNFT nimmt) und, falls die Werkbank unter
+    eigenem Namen laeuft, der Name aus dem Schluessel tmuxSocket der config.json
+    (wie wb-autorevive: nur dieser Schluessel, nur ein schlichter Name, nie Testnamen
+    wbtest-*/wbk*). Weder TMUX noch TMPDIR noch TMUX_TMPDIR noch HOME noch AWB_CONFIG wirken
+    hier: wer selbst einen Server anlegt, macht ihn damit nicht zum Werkbank-Server.
+    GRENZE: wer die echte config.json des Benutzers schreibt, kann einen Server benennen --
+    dieselbe Klasse wie ~/.local/bin schreiben."""
+    basis = os.path.join(WB_SOCKET_BASIS, "tmux-%d" % os.getuid())
+    namen = ["default"]
+    try:
+        st = os.stat(WB_CONFIG_DATEI)
+        if st.st_uid == os.getuid() and not st.st_mode & 0o022:
+            with open(WB_CONFIG_DATEI, "r", encoding="utf-8") as fh:
+                wert = json.load(fh).get("tmuxSocket", "")
+            if (isinstance(wert, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", wert)
+                    and not wert.startswith(("wbtest-", "wbk"))):
+                namen.append(wert)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {os.path.realpath(os.path.join(basis, n)) for n in namen}
+
+tm = tmux_fest()
+panes = {}
+if tm:
+    for sock in sockets():
+        try:
+            r = subprocess.run([tm, "-S", sock, "list-panes", "-a", "-F",
+                                "#{pane_pid}\t#{pane_id}\t#{@wb_role}\t#{@wb_worker}"],
+                               capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for z in r.stdout.splitlines():
+            t = z.split("\t")
+            if len(t) == 4 and t[0].isdigit():
+                panes.setdefault(int(t[0]), (sock, t[1], t[2].strip(), t[3].strip()))
+kette = [panes[p] for p in ahnen() if p in panes]
+if not kette:
+    print("keiner\t-\t")
+    sys.exit(0)
+
+def registriert_von(sock, pane):
+    for lib in sys.argv[1:]:
+        if os.path.isfile(os.path.join(lib, "rollen.py")):
+            sys.path.insert(0, lib)
+            try:
+                import rollen
+                rollen.tmux_server_waehlen(["-S", sock])
+                return ((rollen.eintrag(pane) or {}).get("rolle") or "").strip()
+            except Exception:
+                return ""
+    return ""
+
+# Drei Felder, Tab-getrennt: Klasse, Pane, Worker-Name (leer, wenn keiner gesetzt ist).
+# Worker: JEDER Pane der Ahnenkette auf JEDEM Server, der nach @wb_role, @wb_worker oder
+# Register Worker ist -- ein Worker kommt nicht aus der Klasse, indem ein naeherer Pane
+# eines Fremdservers dazwischenliegt.
+for sock, pane, rolle, worker in kette:
+    if rolle == "worker" or worker or registriert_von(sock, pane) == "worker":
+        print("worker\t%s\t%s" % (pane, worker))
+        sys.exit(0)
+# Orchestrator: der NAECHSTE Pane, und nur auf dem Werkbank-Server. Ein Pane eines anderen
+# Servers, auch mit @wb_role=orchestrator, ist ein Pane ohne Rolle (-> wb-mensch pruefen).
+sock, pane, rolle, worker = kette[0]
+if rolle == "orchestrator" and sock in werkbank_sockets() \
+        and registriert_von(sock, pane) in ("", "orchestrator"):
+    print("orchestrator\t%s\t" % pane)
+else:
+    print("pane-ohne-rolle\t%s\t" % pane)
+PY
+}
+
+# HERKUNFT DES ABLEHNENS (14.10.2026). Ablehnen war bisher frei; ein Worker konnte damit
+# fremde Antraege sabotieren. Jetzt gilt fuer Ablehnen dieselbe Messung wie fuer Annehmen,
+# mit einer Ausnahme: ein Worker darf den EIGENEN Antrag ablehnen bzw. zurueckziehen.
+#   * Worker-Pane: nur wenn sein gemessener @wb_worker gleich dem Antragsteller (Feld
+#     "parent", von wb-request aus dem Pane des Antragstellers geschrieben) ist.
+#   * Orchestrator-Pane: darf jeden Antrag ablehnen.
+#   * Sonst (Pane ohne Rolle, kein Pane) nur mit gemessenem Menschen (wb-mensch pruefen).
+HERKUNFT="$(wb_herkunft 2>/dev/null)" || HERKUNFT=""
+H_KLASSE="${HERKUNFT%%	*}"; H_REST="${HERKUNFT#*	}"
+H_PANE="${H_REST%%	*}"; H_NAME="${H_REST#*	}"
+H_WO="${H_PANE}${H_NAME:+ $H_NAME}"; [ "$H_PANE" = "-" ] && H_WO=""
+if [ "$ACTION" = approve ]; then
+  case "$H_KLASSE" in
+    orchestrator) ;;
+    worker)
+      echo "wb-decide: ABGELEHNT — Annehmen aus einem Worker-Pane ($H_WO). Ueber Antraege entscheidet der Orchestrator oder der Mensch, nie ein Worker, auch nicht ueber den eigenen. Nichts geschrieben." >&2
+      exit 3 ;;
+    *)
+      MENSCH_BIN="$(dirname "${BASH_SOURCE[0]}")/wb-mensch"
+      [ -x "$MENSCH_BIN" ] || MENSCH_BIN="$HOME/.local/bin/wb-mensch"
+      if ! { [ -x "$MENSCH_BIN" ] && "$MENSCH_BIN" pruefen </dev/null >/dev/null 2>&1; }; then
+        echo "wb-decide: ABGELEHNT — Annehmen ohne gemessene Herkunft (${H_KLASSE:-unbestimmt}${H_WO:+ $H_WO}): weder ein Orchestrator-Pane noch ein Mensch (wb-mensch). Ablehnen geht ohne Nachweis. Nichts geschrieben." >&2
+        exit 3
+      fi ;;
+  esac
+else
+  case "$H_KLASSE" in
+    orchestrator) ;;
+    worker)
+      if [ -z "$H_NAME" ] || [ "$H_NAME" != "$R_PARENT" ]; then
+        echo "wb-decide: ABGELEHNT — Worker-Pane ($H_WO) lehnt nur den EIGENEN Antrag ab. Dieser Antrag gehoert '$R_PARENT'. Fremde Antraege lehnen nur Orchestrator oder Mensch ab. Nichts geschrieben." >&2
+        exit 3
+      fi ;;
+    *)
+      MENSCH_BIN="$(dirname "${BASH_SOURCE[0]}")/wb-mensch"
+      [ -x "$MENSCH_BIN" ] || MENSCH_BIN="$HOME/.local/bin/wb-mensch"
+      if ! { [ -x "$MENSCH_BIN" ] && "$MENSCH_BIN" pruefen </dev/null >/dev/null 2>&1; }; then
+        echo "wb-decide: ABGELEHNT — Ablehnen ohne gemessene Herkunft (${H_KLASSE:-unbestimmt}${H_WO:+ $H_WO}): weder ein Orchestrator-Pane noch ein Mensch (wb-mensch) noch der eigene Antrag eines Workers. Nichts geschrieben." >&2
+        exit 3
+      fi ;;
+  esac
+fi
 
 # Past tense, identical to the log column — wb-request greps '^decision: approved'
 # to find children that are still running.

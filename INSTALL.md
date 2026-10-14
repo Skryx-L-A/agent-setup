@@ -31,7 +31,7 @@ CI and scripts, `claude setup-token` produces a long-lived OAuth token for
 Do not set an API key on top of a subscription you want to use: the key wins, and the result is an
 authentication error that looks like something else. `/status` inside Claude Code shows which way
 is currently active. None of these values belongs in a repository, in a dotfile inside one, or in
-a knowledge-base note outside `90-secrets/`.
+a knowledge-base note outside `secrets/`.
 
 A setup with no cloud account at all is a supported path: Ollama plus the local worker lane runs
 entirely on your own hardware, and the model registry treats both the same way.
@@ -52,13 +52,11 @@ Node is often older; use [nodesource](https://github.com/nodesource/distribution
 ## 1. Get the repository
 
 ```bash
-git clone https://github.com/<your-github-user>/agent-setup.git ~/agent-setup
+git clone https://github.com/Skryx-L-A/agent-setup.git ~/agent-setup
 cd ~/agent-setup
 ```
 
-Any directory works. The tools do not care where the checkout lives. `<your-github-user>` stands
-for the account this repository is hosted under: the tool that extracts it from a working machine
-removes account names everywhere and cannot tell a public URL from a private path.
+Any directory works. The tools do not care where the checkout lives.
 
 ## 2. Build the workbench
 
@@ -208,7 +206,7 @@ A separate public repository that turns "new project" into a finished, scaffolde
 independent of this setup in both directions, and it installs as a Claude Code plugin:
 
 ```
-/plugin marketplace add <your-github-user>/project-kit
+/plugin marketplace add Skryx-L-A/project-kit
 /plugin install project-kit@project-kit
 ```
 
@@ -261,9 +259,10 @@ for macOS and systemd user units for Linux, with `__HOME__` and `__USER__` to re
 load one. [docs/SERVICES.md](docs/SERVICES.md) says what each one is for and carries the
 substitution command.
 
-Two more launchd files sit in `shell/` next to the tools they belong to, the model proxy and the
-session sweep. Those are real files rather than templates and carry a literal `$HOME`, which
-launchd does not expand — substitute it the same way before loading.
+More launchd files sit in `shell/` next to the tools they belong to: the model proxy, the session
+sweep, the secret filter, the tool hub and the agents' carrier, among others. Those are real files
+rather than templates and carry a literal `$HOME`, which launchd does not expand — substitute it
+the same way before loading. The model proxy and the secret filter need Python 3.14 or newer.
 
 ## What is not here
 

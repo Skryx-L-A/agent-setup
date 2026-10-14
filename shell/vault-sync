@@ -5,7 +5,7 @@
 # WARUM: "IMMER git pull --rebase vor dem Schreiben/Push, nie force-push" ist bisher nur
 #   eine Erinnerungsregel (CRITICAL-FACTS.md), keine Durchsetzung. Dieser Wrapper erzwingt sie
 #   technisch: pull --rebase VOR dem Commit, Abbruch statt Ueberschreiben bei Rebase-Konflikt,
-#   kategorische Weigerung bei force-push, Hard-Abbruch wenn 90-secrets/ im Commit landen wuerde.
+#   kategorische Weigerung bei force-push, Hard-Abbruch wenn secrets/ im Commit landen wuerde.
 #
 # BENUTZUNG:
 #   vault-sync -m "Nachricht"            committet (nach pull --rebase), pusht NICHT
@@ -42,15 +42,15 @@ fi
 
 g() { git -C "$VAULT" "$@"; }
 
-# --- 1) Secrets-Wächter: 90-secrets/ darf NIE Teil eines Commits werden. ---
+# --- 1) Secrets-Wächter: secrets/ darf NIE Teil eines Commits werden. ---
 # Greift bereits vor dem Staging (verhindert versehentliches "git add -A -f") UND danach
 # nochmal auf dem tatsächlichen Stage-Inhalt — doppelt, weil ein einzelner Check bei einer
 # .gitignore-Lücke stillschweigend versagen könnte.
-if g status --porcelain --ignored 2>/dev/null | awk '{print $2}' | grep -q '^90-secrets/'; then
-  # Nur relevant, falls 90-secrets/ NICHT ignoriert ist (Ignored-Dateien tauchen mit "!!" auf,
+if g status --porcelain --ignored 2>/dev/null | awk '{print $2}' | grep -q '^secrets/'; then
+  # Nur relevant, falls secrets/ NICHT ignoriert ist (Ignored-Dateien tauchen mit "!!" auf,
   # das wird hier absichtlich mitgeprüft statt gefiltert).
-  if g status --porcelain --ignored 2>/dev/null | grep -v '^!! ' | awk '{print $2}' | grep -q '^90-secrets/'; then
-    echo "vault-sync: ABBRUCH — 90-secrets/ enthaelt nicht-ignorierte Aenderungen. Kein Commit." >&2
+  if g status --porcelain --ignored 2>/dev/null | grep -v '^!! ' | awk '{print $2}' | grep -q '^secrets/'; then
+    echo "vault-sync: ABBRUCH — secrets/ enthaelt nicht-ignorierte Aenderungen. Kein Commit." >&2
     exit 1
   fi
 fi
@@ -143,9 +143,9 @@ if [ "${#SKIPPED[@]}" -gt 0 ]; then
   printf '  %s\n' "${SKIPPED[@]}" >&2
 fi
 
-SECRET_HITS=$(g diff --cached --name-only | grep -E '(^|/)90-secrets/' || true)
+SECRET_HITS=$(g diff --cached --name-only | grep -E '(^|/)secrets/' || true)
 if [ -n "$SECRET_HITS" ]; then
-  echo "vault-sync: ABBRUCH — folgende Dateien aus 90-secrets/ waeren mitcommittet worden:" >&2
+  echo "vault-sync: ABBRUCH — folgende Dateien aus secrets/ waeren mitcommittet worden:" >&2
   echo "$SECRET_HITS" >&2
   echo "vault-sync: nichts committet, Stage wird zurueckgesetzt. .gitignore pruefen." >&2
   g reset >/dev/null 2>&1

@@ -11,6 +11,10 @@ Kopf der Orchestrator-Rolle — hier steht, wie man sie durchsetzt.
 
 ## Guard-Bedienung
 
+> **Stand 2026-09-18:** `pi-worker` und `claude-worker` rufen beim Spawn selbst `context-guard --ensure <pane>` auf.
+> Der Handstart unten ist nur noch der Weg für Sitzungen, die nie spawnen. Wer spawnt, startet keinen zweiten;
+> der eigene Pane ist `$TMUX_PANE` (nicht `tmux display -p` ohne Ziel — das liefert den Pane des angehängten Clients).
+
 - **GUARD-BEDIENUNG — auswendig, weil `contextGuardAutostart` auf `false` BLEIBT (Entscheidung des Nutzers 2026-07-27).** Niemand startet ihn für dich; vergisst du ihn, merkt es keiner, bis ein
   Worker still schlechter geworden ist. Deshalb gehört der Start in denselben Handgriff wie der erste
   Spawn:
@@ -52,6 +56,11 @@ Kopf der Orchestrator-Rolle — hier steht, wie man sie durchsetzt.
   für dich — und schickt danach zwingend einen Resume-Prompt (auf `HANDOFF-<name>.md` bzw.
   SESSION-STATE.md + GOALS/QUALITY/PERF-STATE), sonst sitzt der frisch komprimierte Pane ohne Auftrag
   da und scheitert lautlos. Beide Hälften gehören zusammen: ohne Resume-Prompt keine Kompaktierung.
+- **Ein fremder Harness kompaktiert sich selbst (2026-09-18, gemessen an codex/mobil-spec):** fällt
+  die Auslastung eines gemahnten Workers, ohne dass der Guard getippt hat, tippt er den Anschluss
+  trotzdem genau einmal — Bedingung: Übergabe NACH der Mahnung und Pane wartet leer. Arbeitet der
+  Worker weiter, bleibt er unangetastet; eine Mahnung älter als `MAHNUNG_MAX_ALTER_S` (1800 s)
+  verfällt. Ein Lastabfall ist also keine Entwarnung. Hintergrund: Vault `10-global/kontext-guard.md`.
 
 ## Auslastung messen
 

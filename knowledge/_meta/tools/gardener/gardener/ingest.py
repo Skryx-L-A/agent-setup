@@ -190,7 +190,10 @@ def ingest_drop(vault: Path, writer: VaultWriter, client,
         if src.suffix.lower() == ".md":
             dst = free_path(vault / "00-sources" / src.name, taken)
             taken.add(dst)
-            writer.write(dst, src.read_text(encoding="utf-8", errors="replace"))
+            # A refused write (local name such as HANDOFF-*.md) leaves the drop file in place:
+            # it is the only copy (14.10.2026).
+            if not writer.write(dst, src.read_text(encoding="utf-8", errors="replace")):
+                continue
             if not writer.dry_run:
                 src.unlink()
             result.ingested.append((src.name, dst.relative_to(vault).as_posix()))

@@ -24,7 +24,7 @@ set -u
 
 STUNDEN=${1:-4}
 LAUFDIR=$HOME/AI/traum-lauf
-WERK=$HOME/Knowledge/_meta/tools/gardener
+WERK="${BRAIN_VAULT:-$HOME/Knowledge}/_meta/tools/gardener"
 FENSTER="$LAUFDIR/lauf-fenster.sh"
 STOPP="$LAUFDIR/STOPP"
 LOG="$LAUFDIR/dauerlauf-$(date +%Y%m%d-%H%M).log"

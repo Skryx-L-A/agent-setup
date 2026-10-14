@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "_kommentar": "Vorlage fuer ~/.claude/workbench/tafel-plaetze.json (Platzdefinitionen von wb-tafel). Fehlt die Datei dort, liest wb-tafel diese Vorlage neben sich selbst. Jede Maschine hat ihre eigene Tafel; ein Platz gilt nur auf der Maschine, die 'maschine' nennt. Arten: exklusiv (Kapazitaet 1), zaehlend (Kapazitaet n), menge (Speicher in GiB, gerechnet und gebucht ueber wb-belegung), zustaendigkeit (Anspruch statt Ressource, siehe 'zustaendigkeiten'). 'schwer': solange ein Platz mit 'sperrt_schwere' von einer anderen Sitzung gehalten wird, meldet wb-tafel schwere Plaetze als belegt; umgekehrt meldet ein Platz mit 'sperrt_schwere' belegt, solange eine andere Sitzung einen schweren Platz derselben Maschine haelt (Ruhe wartet auf die schweren Plaetze, wer Ruhe will, stellt sich mit --anstellen an). 'annahme_s': Annahmefrist nach der Nachricht 'dran'. 'nachtrag_s': Nachtragsfrist fuer einen unangemeldeten Start, danach Zwangseintrag (Vorgabe 120). 'muster': regulaere Ausdruecke auf das ausgefuehrte Programm bzw. die Skriptdatei laufender Prozesse, ohne dessen Argumente (Huellen wie env/nice/nohup/timeout und Interpreter wie bash/python3 werden aufgeloest, bei python -m gilt das Modul; ein Wort in einem -c-Text oder in einem Argument zaehlt nicht); ein Treffer ohne Eintrag, ohne Eintrag an einem Vorfahren oder Nachfahren, gilt als unangemeldeter Start. 'vorschlag_art': welche Dauerhistorie der Nachtragsbefehl vorschlaegt. 'abbruch_kill_s': Abstand SIGTERM -> SIGKILL nach der Gnadenfrist (Vorgabe 30). 'erlaubnis_s': Gueltigkeit einer Einmal-Erlaubnis 'trotzdem' (Vorgabe 120). 'ohne_abbruch': an diesem Platz wird nach der Gnadenfrist nie ein Prozess beendet, nur gemeldet. 'selbst_vorrang_arten': Wartende dieser --art duerfen sich selbst per vorrang nach vorn holen (unterbrechen aber nie den Halter). Stoerungswaechter (nur melden, nie beenden; je Platz oder oben fuer alle Plaetze setzbar, Ablauf im Kopf von shell/wb-tafel, Abschnitt STOERUNGEN): 'stoerung': ob ein exklusiver Eintrag einen Waechter bekommt, der schwere Laeufe ohne Eintrag meldet (Vorgabe true fuer exklusiv, sonst ohne Wirkung). 'stoerung_takt_s': Abstand der Abtastungen der Prozesstabelle in Sekunden (Vorgabe 5). 'stoerung_cpu': Kerne, die ein Lauf ueber 'stoerung_dauer_s' im Mittel (und in zwei Dritteln der Abtastabstaende selbst) erreichen muss, um als schwer zu gelten (Vorgabe 0.5). 'stoerung_dauer_s': so viele Sekunden muss die Last anhalten, eine kuerzere Spitze zaehlt nicht (Vorgabe 20). 'stoerung_ram_mib': Speicherzuwachs eines Laufs gegenueber seinem ersten Messwert in MiB, der die ganze Dauer ueber anhaelt und ebenfalls als schwer gilt (Vorgabe 1024). 'stoerung_ausnahmen': Liste regulaerer Ausdruecke auf das ausgefuehrte Programm samt Argumenten; ein Treffer ist nie eine Stoerung (Vorgabe leer). 'nicht_neben': Liste von Plaetzen; solange eine andere Sitzung einen davon haelt, meldet dieser Platz belegt, auch fuer Wartende beim Nachruecken (ein Mengenplatz erst ab 'schwer_ab'); nur in diese Richtung, der genannte Platz wartet nie auf diesen.",
+  "maschinen_je_os": {
+    "Darwin": "mac",
+    "Linux": "peer"
+  },
+  "ssh_ziel": {
+    "mac": "mac",
+    "peer": "peer"
+  },
+  "annahme_s": 300,
+  "nachtrag_s": 120,
+  "abbruch_kill_s": 30,
+  "erlaubnis_s": 120,
+  "plaetze": {
+    "mac-ruhe": {
+      "maschine": "mac",
+      "art": "exklusiv",
+      "sperrt_schwere": true,
+      "zweck": "Zeitmessungen auf ruhiger Maschine"
+    },
+    "mac-suite": {
+      "maschine": "mac",
+      "art": "exklusiv",
+      "schwer": true,
+      "zweck": "Werkbank-Gesamtlauf (shell/tests/run-all.sh)",
+      "muster": [
+        "(^|/)run-all\\.sh( |$)"
+      ],
+      "vorschlag_art": "gesamtlauf",
+      "stoerung_ram_mib": 4096,
+      "_stoerung_ram_grund": "2026-10-12: Gesamtlauf misst keine Zeit; das Einbettungsmodell von Ollama (+1,4 GiB) loeste bei jedem Lauf eine Meldung aus. Grosse Modelle und CPU-Last melden weiter."
+    },
+    "mac-gpu": {
+      "maschine": "mac",
+      "art": "exklusiv",
+      "schwer": true,
+      "zweck": "ein grosser GPU-Nutzer (kuenftig Huelle gpu-slot)",
+      "vorschlag_art": "lokal-modell",
+      "nicht_neben": [
+        "mac-suite"
+      ]
+    },
+    "mac-worker-schwer": {
+      "maschine": "mac",
+      "art": "zaehlend",
+      "kapazitaet": 3,
+      "schwer": true,
+      "zweck": "parallel laufende schwere Worker",
+      "nicht_neben": [
+        "mac-suite"
+      ],
+      "_nicht_neben_grund": "2026-10-14 (Auftrag wz-tafel): ein wartender schwerer Lauf startete neben einem inzwischen begonnenen Gesamtlauf; Ursache vieler NUR-UNTER-LAST-Fehler. Platz-Eigenschaft statt Option, damit es niemand vergessen kann."
+    },
+    "mac-speicher": {
+      "maschine": "mac",
+      "art": "menge",
+      "einheit": "GiB",
+      "schwer_ab": 16,
+      "zweck": "Speicher fuer Modelle und Messungen, gebucht in wb-belegung",
+      "nicht_neben": [
+        "mac-suite"
+      ]
+    },
+    "peer-ruhe": {
+      "maschine": "peer",
+      "art": "exklusiv",
+      "sperrt_schwere": true,
+      "zweck": "Zeitmessungen auf ruhiger Maschine"
+    },
+    "peer-suite": {
+      "maschine": "peer",
+      "art": "exklusiv",
+      "schwer": true,
+      "zweck": "Werkbank-Gesamtlauf auf peer (auch der Wochenlauf von wb-hygiene, beide ueber wb-tafel-dienst)",
+      "muster": [
+        "(^|/)run-all\\.sh( |$)"
+      ],
+      "vorschlag_art": "gesamtlauf"
+    },
+    "peer-gpu": {
+      "maschine": "peer",
+      "art": "exklusiv",
+      "schwer": true,
+      "zweck": "die GPU von peer (kuenftig Huelle gpu-slot)",
+      "vorschlag_art": "lokal-modell",
+      "nicht_neben": [
+        "peer-suite"
+      ]
+    },
+    "peer-speicher": {
+      "maschine": "peer",
+      "art": "menge",
+      "einheit": "GiB",
+      "schwer_ab": 16,
+      "zweck": "Speicher fuer Modelle, gebucht in wb-belegung",
+      "nicht_neben": [
+        "peer-suite"
+      ]
+    },
+    "frage-an-person-1": {
+      "art": "zustaendigkeit",
+      "ohne_abbruch": true,
+      "selbst_vorrang_arten": [
+        "sicherheit"
+      ],
+      "zweck": "Fragerecht an den Menschen: eine Sitzung zur Zeit oeffnet einen Fragedialog (der Nutzer, 2026-10-09). Gilt auf jeder Maschine (ohne 'maschine')."
+    }
+  },
+  "zustaendigkeiten": {
+    "praefixe": [
+      "pfad:",
+      "hauptbaum:",
+      "push:"
+    ],
+    "feste": []
+  },
+  "_muster_vorschlag_modelle": "Noch nicht aktiv, Entscheidung der Einbindung: Modellserver-Muster fuer mac-gpu/peer-gpu, etwa 'mlx_lm\\\\.server', 'llama-server', 'mtplx', 'vllm'. Aktiv geschaltet wuerde jeder heute ueber wb-belegung/Splash gestartete Modellserver zum unangemeldeten Start, solange diese Startwege noch nicht 'wb-tafel nimm' rufen."
+}

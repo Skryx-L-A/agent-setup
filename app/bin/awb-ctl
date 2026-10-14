@@ -6,17 +6,32 @@
 // soll auch dann noch da sein, wenn dist/ gerade neu gebaut wird.
 'use strict';
 
+const { createHash } = require('node:crypto');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { StringDecoder } = require('node:string_decoder');
 
 // Dieselbe Ableitung wie in src/main/config.ts (defaultControlSocketPath).
-// Die Testsuite vergleicht beide Ergebnisse, damit sie nicht auseinanderlaufen.
+// Die Testsuite vergleicht beide Ergebnisse, damit sie nicht auseinanderlaufen
+// (test-app-socket-isolation.sh, Punkt 2b: beide werden AUSGEFUEHRT und
+// verglichen, auch mit gesetztem AWB_STATE_DIR).
+//
+// Die Ableitung ist hier ein zweites Mal geschrieben, weil dieses Werkzeug ohne
+// Bauschritt und ohne dist/ funktionieren muss. Genau daran ist der Fix vom
+// 21.09.2026 (262fc545) zuerst gescheitert: er zog nur config.ts nach, worauf
+// der Kern unter einem Zustandsverzeichnis auf awb-<uid>-<hash>.sock hoerte,
+// waehrend jeder Aufruf hier weiter awb-<uid>.sock suchte und „connect ENOENT"
+// bekam. Wer eine der beiden Stellen aendert, aendert beide.
 function defaultSocketPath(env) {
   if (env.AWB_CONTROL_SOCKET) return env.AWB_CONTROL_SOCKET;
   const base = env.XDG_RUNTIME_DIR || os.tmpdir();
-  return path.join(base, `awb-${process.getuid ? process.getuid() : 0}.sock`);
+  const name = `awb-${process.getuid ? process.getuid() : 0}`;
+  const produktivStateDir = path.resolve(os.homedir(), '.config', 'agent-workbench');
+  const stateDir = env.AWB_STATE_DIR;
+  if (!stateDir || path.resolve(stateDir) === produktivStateDir) return path.join(base, `${name}.sock`);
+  const lauf = createHash('sha256').update(path.resolve(stateDir), 'utf8').digest('hex').slice(0, 12);
+  return path.join(base, `${name}-${lauf}.sock`);
 }
 
 function usage() {
@@ -144,7 +159,7 @@ function usage() {
       '  pane-chat-takt <%pane> [zuruecksetzen]  NUR FUER TESTS: echte',
       '                       chat-stand-Aufrufe dieses Panes zaehlen (Beleg fuer',
       '                       "kein Takt, solange die Ansicht zu ist")',
-      '  neue-session <ordner> [name]  eine neue Session anlegen (ruft wb-code)',
+      '  neue-session <ordner> [name] [--maschine M]  eine neue Session anlegen (ruft wb-code)',
       '  fokus <weg|zurueck>  dem Fenster den Fokus nehmen oder geben (nur fuer',
       '                       Tests: der Weg "andere Anwendung und zurueck")',
       '  rad <%id> <n> [shift]  Rad-Ereignis auf einem Pane; meldet viewportY,',
@@ -480,8 +495,12 @@ async function main() {
     if (!args[1]) throw new Error('revive braucht eine Session-Kennung');
     payload = { cmd: 'revive', id: args[1] };
   } else if (cmd === 'neue-session') {
-    if (!args[1]) throw new Error('neue-session braucht einen Ordner');
-    payload = { cmd: 'neue-session', dir: args[1], name: args.slice(2).join(' ') };
+    // `--maschine M` (27.09.2026): auf einer Fernmaschine oder Gast-Tor-Quelle starten.
+    const m = args.indexOf('--maschine');
+    const maschine = m > 0 ? String(args[m + 1] ?? '') : '';
+    const rest = m > 0 ? [...args.slice(0, m), ...args.slice(m + 2)] : args;
+    if (!rest[1]) throw new Error('neue-session braucht einen Ordner');
+    payload = { cmd: 'neue-session', dir: rest[1], name: rest.slice(2).join(' '), ...(maschine ? { machine: maschine } : {}) };
   } else if (cmd === 'fokus') {
     if (args[1] !== 'weg' && args[1] !== 'zurueck') throw new Error("fokus braucht 'weg' oder 'zurueck'");
     payload = { cmd: 'fokus', an: args[1] === 'zurueck' };

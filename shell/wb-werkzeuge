@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""wb-werkzeuge -- Werkzeuge (MCP, Hooks, Prompts, Plugins, Rechte) aus EINER Quelle in die
+Harnesses schreiben, ohne Fremdes anzufassen. Befehle und Vertrag: werkzeuge_kern.py;
+die Adapter tragen sich ueber werkzeuge_kern.adapter_registrieren in die Haken des Kerns ein."""
+import sys
+
+import werkzeuge_claude
+import werkzeuge_codex
+import werkzeuge_dateien
+import werkzeuge_familie
+import werkzeuge_kern
+
+werkzeuge_claude.registrieren()
+werkzeuge_codex.registrieren()
+werkzeuge_familie.registrieren()
+werkzeuge_dateien.registrieren()
+
+if __name__ == "__main__":
+    sys.exit(werkzeuge_kern.main(sys.argv))

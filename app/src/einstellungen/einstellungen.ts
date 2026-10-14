@@ -49,6 +49,10 @@ interface HarnessSicht {
   label: string;
   modelle: number;
   binaer: boolean;
+  installedVersion: string;
+  latestVersion: string;
+  lastChecked: string;
+  updateStatus: string;
   orchestratorDefaultModel?: string;
 }
 
@@ -200,6 +204,16 @@ interface MeldeTestErgebnis {
   ergebnisse: Partial<Record<string, MeldeWegErgebnis>>;
 }
 
+/** Was `awb:mobil-stand` liefert -- nie ein Code und nie Schluesselmaterial. */
+interface MobilStand {
+  an: boolean;
+  laeuft: boolean;
+  port: number;
+  fehler: string;
+  origin: string;
+  geraete: { device_id: string; device_name: string; status: 'active' | 'revoked'; paired_at: number; revoked_at: number | null }[];
+}
+
 interface Daten {
   settings: Record<string, unknown>;
   vorgaben: Record<string, unknown>;
@@ -256,6 +270,12 @@ declare global {
       kontextStufen(modellId: string): Promise<KontextAntwort>;
       /** Denselben Weg wie das Zahnrad im Hauptfenster: isTrusted entscheidet. */
       erststartZeigen(echt: boolean): void;
+      /** Die mobile Werkbank (Paket 10): Stand und Geraete lesen. */
+      mobilStand(): Promise<MobilStand>;
+      /** Kopplung starten -- nur mit echtem Klick; der Code kommt NUR hierher zur Anzeige. */
+      mobilKoppeln(echt: boolean): Promise<{ ok: boolean; code?: string; ablauf?: number; meldung?: string }>;
+      /** Ein Geraet widerrufen -- nur mit echtem Klick. */
+      mobilWiderrufen(deviceId: string, echt: boolean): Promise<{ ok: boolean; meldung: string }>;
     };
     /** Testhaken: was steht gerade da, und was ist gewaehlt. Nur Lesen und Klicken. */
     __awbEin: {
@@ -1333,13 +1353,16 @@ function seiteErlaubnisse(d: Daten): HTMLElement {
   feld(v, {
     ...texte('workerSkipPermissions'),
     wartet: true,
-    schluessel: 'workerSkipPermissions',
-    steuer: haken('workerSkipPermissions', d.settings.workerSkipPermissions !== false, (an) => {
+    // Wie beim Erlaubnismodus kein generisches Rueckstell-Zeichen: das
+    // Anheben braucht den Grund und den echten Bestaetigungsklick.
+    steuer: haken('workerSkipPermissions', d.settings.workerSkipPermissions !== false, (an, echt) => {
       if (!an) {
-        void setze('workerSkipPermissions', false);
+        void werkzeug({ command: 'worker-skip-permissions-set', value: false }, echt);
         return;
       }
-      frage(t('frage.skipAn.text'), t('frage.skipAn.tun'), () => void setze('workerSkipPermissions', true));
+      frage(t('frage.skipAn.text'), t('frage.skipAn.tun'),
+        (grund, echtJa) => void werkzeug({ command: 'worker-skip-permissions-set', value: true, grund }, echtJa),
+        true);
     }),
   });
   feld(v, {
@@ -1607,6 +1630,7 @@ function seiteHarnesses(d: Daten): HTMLElement {
   const sk = el('tr');
   for (const h of [
     t('spalte.programm'), t('spalte.hier'), t('spalte.anmeldung'),
+    t('spalte.installiert'), t('spalte.neueste'), t('spalte.zuletztGeprueft'),
     t('spalte.stufen'), t('spalte.modelle'), t('spalte.chat'),
   ]) sk.appendChild(el('th', undefined, h));
   // Der Rechnername stand bis zum 03.09. in der Ueberschrift selbst. Er ist
@@ -1633,6 +1657,21 @@ function seiteHarnesses(d: Daten): HTMLElement {
           : t('wort.anmeldungUnbekannt'));
     if (an?.grund) anZelle.title = an.grund;
     r.appendChild(anZelle);
+
+    const letztePruefung = h.lastChecked
+      ? new Date(h.lastChecked).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })
+      : t('wort.nochNichtGeprueft');
+    const installiert = el('td', 'wert', h.installedVersion || '–');
+    const neueste = el('td', 'wert', h.latestVersion || '–');
+    const geprueft = el('td', 'wert', letztePruefung);
+    if (h.updateStatus) {
+      installiert.title = h.updateStatus;
+      neueste.title = h.updateStatus;
+      geprueft.title = h.updateStatus;
+    }
+    r.appendChild(installiert);
+    r.appendChild(neueste);
+    r.appendChild(geprueft);
 
     // Drei verschiedene Aussagen, und sie werden nicht vermischt: eine Liste,
     // "kennt keine Stufen" (das Programm hat keine) und "nicht ermittelt"
@@ -1729,6 +1768,20 @@ function seiteHarnesses(d: Daten): HTMLElement {
     schluessel: 'ollamaEndpoint',
     breit: true,
     steuer: ollamaBox,
+  });
+  feld(g2, {
+    ...texte('harnessUpdateAuto'),
+    schluessel: 'harnessUpdateAuto',
+    steuer: haken('harnessUpdateAuto', d.settings.harnessUpdateAuto !== false,
+      (an) => void setze('harnessUpdateAuto', an)),
+  });
+  const intervalRoh = Number(d.settings.harnessUpdateIntervalHours);
+  const interval = Number.isInteger(intervalRoh) && intervalRoh >= 1 && intervalRoh <= 168 ? intervalRoh : 6;
+  feld(g2, {
+    ...texte('harnessUpdateIntervalHours'),
+    schluessel: 'harnessUpdateIntervalHours',
+    steuer: zahl('harnessUpdateIntervalHours', interval, 1, 168, t('wort.stunden'),
+      (n) => void setze('harnessUpdateIntervalHours', Math.max(1, Math.min(168, Math.floor(n))))),
   });
   feld(g2, {
     ...texte('modelDiscoveryAuto'),
@@ -2061,6 +2114,14 @@ function seiteMaschinen(d: Daten): HTMLElement {
     steuer: zahl('maxWorkers', Number(d.settings.maxWorkers ?? 8), 1, 64, 'Worker',
       (n) => void setze('maxWorkers', n)),
   });
+  const schlafRoh = Number(d.settings.schlafNachMinuten);
+  const schlaf = Number.isInteger(schlafRoh) && schlafRoh >= 0 && schlafRoh <= 10080 ? schlafRoh : 60;
+  feld(g2, {
+    ...texte('schlafNachMinuten'),
+    schluessel: 'schlafNachMinuten',
+    steuer: zahl('schlafNachMinuten', schlaf, 0, 10080, t('wort.minuten'),
+      (n) => void setze('schlafNachMinuten', Math.max(0, Math.min(10080, Math.floor(n))))),
+  });
   const maschinenwahl: Segment[] = [
     { wert: 'local', label: t('wort.dieseMaschine', { name: d.machine }) },
     ...d.maschinen.map((m) => ({ wert: m, label: m })),
@@ -2095,7 +2156,87 @@ function seiteMaschinen(d: Daten): HTMLElement {
       (w) => void setze('workerZustellung', w),
     ),
   });
+  mobilGruppe(s, d);
   return s;
+}
+
+/**
+ * DIE MOBILE WERKBANK (Paket 10). Der Schalter schreibt `mobileServer` ueber
+ * denselben Weg wie jede Einstellung; Koppeln und Widerrufen gehen ueber eigene
+ * Kanaele, die nur mit echtem Klick (isTrusted) und `wb-mensch` etwas tun. Der
+ * Kopplungscode steht NUR in dieser Anzeige -- er wird nicht gespeichert und
+ * nicht neu gezeichnet, wenn die Seite sich auffrischt.
+ */
+let mobilCode: { code: string; ablauf: number } | null = null;
+function mobilGruppe(s: HTMLElement, d: Daten): void {
+  const g = gruppe(s, t('gruppe.maschinen.mobil'));
+  feld(g, {
+    ...texte('mobileServer'),
+    steuer: haken('mobileServer', d.settings.mobileServer === true, (an) => void setze('mobileServer', an)),
+  });
+  const stand = el('div', 'klartext', '…');
+  stand.id = 'mobilStand';
+  const codeBox = el('div', 'klartext');
+  codeBox.id = 'mobilCode';
+  const geraete = el('div', 'zeilen');
+  geraete.id = 'mobilGeraete';
+  const zeichneCode = (): void => {
+    codeBox.textContent = '';
+    if (!mobilCode) return;
+    if (Date.now() > mobilCode.ablauf) {
+      codeBox.textContent = t('mobil.codeAbgelaufen');
+      mobilCode = null;
+      return;
+    }
+    const zeit = new Date(mobilCode.ablauf).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    codeBox.appendChild(el('div', 'titel', t('mobil.code', { code: mobilCode.code })));
+    codeBox.appendChild(el('div', 'grund', t('mobil.codeAblauf', { zeit })));
+    codeBox.appendChild(knopf(t('mobil.ausblenden'), () => { mobilCode = null; zeichneCode(); }));
+  };
+  const lade = async (): Promise<void> => {
+    const m = await window.awbEinstellungen.mobilStand();
+    stand.textContent = m.laeuft ? t('mobil.stand.laeuft', { port: m.port, origin: m.origin })
+      : m.fehler ? t('mobil.stand.fehler', { grund: m.fehler }) : t('mobil.stand.aus');
+    geraete.textContent = '';
+    if (!m.geraete.length) geraete.appendChild(el('div', 'leerhinweis', t('mobil.geraeteLeer')));
+    for (const geraet of m.geraete) {
+      const z = el('div', geraet.status === 'active' ? 'zeile' : 'zeile abgeschaltet');
+      z.dataset.geraet = geraet.device_id;
+      z.appendChild(el('span', 'titel', geraet.device_name));
+      const datum = new Date(geraet.status === 'active' ? geraet.paired_at : geraet.revoked_at ?? geraet.paired_at).toLocaleDateString();
+      z.appendChild(el('span', 'grund', t(geraet.status === 'active' ? 'mobil.geraetAktiv' : 'mobil.geraetWiderrufen', { datum })));
+      if (geraet.status === 'active') {
+        const rechts = el('div', 'rechts');
+        rechts.appendChild(knopf(t('mobil.widerrufen'), (echt) => {
+          void window.awbEinstellungen.mobilWiderrufen(geraet.device_id, echt).then((r) => {
+            melde(r.meldung, r.ok ? 'gut' : 'fehler');
+            void lade();
+          });
+        }, true));
+        z.appendChild(rechts);
+      }
+      geraete.appendChild(z);
+    }
+  };
+  const koppeln = knopf(t('mobil.koppeln'), (echt) => {
+    void window.awbEinstellungen.mobilKoppeln(echt).then((r) => {
+      if (!r.ok || !r.code || !r.ablauf) {
+        melde(r.meldung ?? '', 'fehler');
+        return;
+      }
+      mobilCode = { code: r.code, ablauf: r.ablauf };
+      zeichneCode();
+      // Nach Ablauf verschwindet der Code von selbst; ein neues Geraet erscheint nach dem Koppeln.
+      window.setTimeout(() => { zeichneCode(); void lade(); }, Math.max(0, r.ablauf - Date.now()) + 500);
+    });
+  });
+  koppeln.id = 'mobilKoppeln';
+  g.appendChild(stand);
+  g.appendChild(koppeln);
+  g.appendChild(codeBox);
+  g.appendChild(geraete);
+  zeichneCode();
+  void lade();
 }
 
 // --- Seite 5: Aufsicht und Meldungen ---------------------------------------
@@ -2431,6 +2572,16 @@ function seiteAussehen(d: Daten): HTMLElement {
     schluessel: 'terminalScrollLines',
     steuer: zahl('terminalScrollLines', Number(d.settings.terminalScrollLines ?? 3), 1, 20, t('wort.einheit.zeilen'),
       (n) => void setze('terminalScrollLines', n)),
+  });
+
+  // Nur die Agentenfiguren und ihre Ringe (FigurUhr.swift im Mac-Mantel); der Kern
+  // liest die Zahl im Takt nach und schickt sie mit awb:model.
+  const gFiguren = gruppe(s, t('gruppe.aussehen.figuren'));
+  feld(gFiguren, {
+    ...texte('figurenBildrate'),
+    schluessel: 'figurenBildrate',
+    steuer: zahl('figurenBildrate', Number(d.settings.figurenBildrate ?? 30), 10, 60, t('wort.einheit.bilderJeSekunde'),
+      (n) => void setze('figurenBildrate', n)),
   });
 
   const g3 = gruppe(s, t('gruppe.aussehen.panes'));

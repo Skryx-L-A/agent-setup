@@ -103,6 +103,11 @@ PROPOSAL_DIR = "skill-vorschlaege"
 WORLD_LOG = "skill-verlauf.jsonl"
 RESULT_ACCEPTED = "Skill übernommen:"
 RESULT_REJECTED = "Skill-Vorschlag abgelehnt:"
+# Lernschritt "anweisung" ist seit 09.10.2026 ein Vorschlag (der Nutzer): derselbe Ordner, dasselbe Ticket,
+# aber ``art: anweisung`` im Vorschlag und eigene Ergebnispraefixe.
+INSTRUCTION_ART = "anweisung"
+RESULT_INSTRUCTION_ACCEPTED = "Anweisung übernommen:"
+RESULT_INSTRUCTION_REJECTED = "Anweisung abgelehnt:"
 
 
 # ---------------------------------------------------------------------------
@@ -1313,6 +1318,8 @@ def _ticket_text(proposal: dict[str, Any], diff: str) -> tuple[str, str, str, di
     A skill proposal keeps its text and limits exactly as before stored scripts existed; a script
     proposal says ``Skript`` and carries ``einheit: skript`` in the limits.
     """
+    if proposal.get("art") == INSTRUCTION_ART:
+        return _instruction_ticket_text(proposal, diff)
     script = proposal.get("art") == "skript"
     unit = "Skript " if script else ""
     command = "wb-skill skript" if script else "wb-skill"
@@ -1338,6 +1345,30 @@ def _ticket_text(proposal: dict[str, Any], diff: str) -> tuple[str, str, str, di
               "version": proposal["version"], "basis_version": proposal.get("basis_version")}
     if script:
         limits["einheit"] = "skript"
+    return title, goal, done, limits
+
+
+def _instruction_ticket_text(proposal: dict[str, Any], diff: str) -> tuple[str, str, str, dict[str, Any]]:
+    """Ticket fields of an instruction proposal; the kind and the badge stay "Skill-Vorschlag"."""
+    title = "Skill-Vorschlag: Anweisung %s von %s" % (proposal["skill"], proposal["agent"])
+    shown = diff if len(diff) <= TICKET_DIFF_LIMIT else diff[:TICKET_DIFF_LIMIT] + "\n[... gekuerzt; vollstaendig in diff.txt]\n"
+    goal = "\n".join([
+        "Anweisung \"%s\" im Ordner von %s ergänzen." % (proposal["skill"], proposal["agent"]),
+        "Beschreibung: %s" % proposal.get("beschreibung"),
+        "Begründung: %s" % (proposal.get("begruendung") or "keine angegeben"),
+        "Stand %s, Datei bisher %s." % (proposal["version"][:12], (proposal.get("basis_version") or "neu")[:12]),
+        "Diff: %s/%s/diff.txt, vorgeschlagener Stand: %s/%s/stand/." % (
+            PROPOSAL_DIR, proposal["id"], PROPOSAL_DIR, proposal["id"]),
+        "Übernehmen: wb-skill abnehmen <welt> %s --absender <prüfer>" % proposal["id"],
+        "Ablehnen: wb-skill ablehnen <welt> %s --absender <prüfer> --grund TEXT" % proposal["id"],
+        "Prüfen: nur Ergänzungen, keine Agentenregel gelockert, keine Freigabe umgangen.",
+        "",
+        shown,
+    ])
+    done = "Diff geprüft; mit wb-skill abnehmen übernommen oder mit wb-skill ablehnen begründet abgelehnt."
+    limits = {"art": "skill-vorschlag", "skill": proposal["skill"], "ziel": proposal["ziel"],
+              "version": proposal["version"], "basis_version": proposal.get("basis_version"),
+              "einheit": INSTRUCTION_ART}
     return title, goal, done, limits
 
 
@@ -1442,6 +1473,109 @@ def propose_skill(root: Path, agent_id: str, name: str, target: str, source: str
             "diff": str(_proposal_dir(root, ticket_id) / "diff.txt"), "ticket_stand": ticket.get("state")}
 
 
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _instruction_change(root: Path, agent_id: str, target: str, diff: str) -> tuple[str, str]:
+    """Check a diff for the agent's ``AGENTS.md``/``CLAUDE.md`` and return the file text before and after.
+
+    Used when proposing and again when accepting, so both apply the same rules: no symlink, an
+    existing file, exactly this file in the diff, only added lines, at most ``INSTRUCTIONS_LIMIT`` bytes.
+    """
+    if target not in INSTRUCTION_FILES:
+        raise AgentsError("Ziel einer Anweisung muss AGENTS.md oder CLAUDE.md sein")
+    path = ad._agent_dir(root, agent_id) / target
+    if path.is_symlink():
+        raise AgentsError("Anweisungsdatei darf kein Symlink sein")
+    if not path.exists():
+        raise AgentsError("%s fehlt im Agentenordner" % target)
+    entries = parse_diff(diff)
+    if len(entries) != 1 or (entries[0]["neu"] or entries[0]["alt"]) != target:
+        raise AgentsError("Diff muss genau die Datei %s aendern" % target)
+    if any(tag == "-" for hunk in entries[0]["hunks"] for tag, _ in hunk["lines"]) or entries[0]["neu"] is None:
+        raise AgentsError("Anweisungsdiff entfernt bestehende Zeilen; automatisch gelten nur Ergaenzungen")
+    before = _read_file(path, INSTRUCTIONS_LIMIT).decode("utf-8")
+    after = _apply_file_diff(before, entries[0])
+    if after is None or len(after.encode("utf-8")) > INSTRUCTIONS_LIMIT:
+        raise AgentsError("Anweisungsdatei waere groesser als %d Bytes" % INSTRUCTIONS_LIMIT)
+    return before, after
+
+
+def propose_instruction(root: Path, agent_id: str, target: str, diff: str, reason: str | None = None,
+                        sender: str | None = None, expected_version: str | None = None) -> dict[str, Any]:
+    """Freeze an addition to the agent's own ``AGENTS.md``/``CLAUDE.md`` and open a ticket "Skill-Vorschlag".
+
+    The file stays unchanged until the reviewer accepts.  The reviewer is the same as for a skill
+    change of a member (team leader of the team, otherwise the main agent); a main agent's
+    proposal is addressed to the main agent and only a human accepts it.  Repeating the proposal
+    returns the same ticket; ``expected_version`` (from the stored learning step) reuses an
+    existing proposal even when the file has meanwhile changed.
+    """
+    root = ad.world_path(str(root))
+    reason = " ".join((reason or "").split())[:REASON_LIMIT] or None
+    with ad.transaction(root):
+        actor = _own_actor(root, agent_id, sender)
+        agent = ad.read_agent(root, agent_id)
+        ticket_id = ad.derived_id(INSTRUCTION_ART, agent_id, target, expected_version[:16]) if expected_version else None
+        if ticket_id is None or not _proposal_dir(root, ticket_id).exists():
+            before, after = _instruction_change(root, agent_id, target, diff)
+            if after == before:
+                raise AgentsError("Die Anweisungsdatei enthaelt diese Ergaenzung bereits")
+            version = _sha(after)
+            if expected_version and version != expected_version:
+                raise AgentsError("Anweisungsdatei hat sich seit dem Lernschritt geaendert")
+            ticket_id = ad.derived_id(INSTRUCTION_ART, agent_id, target, version[:16])
+        folder = _proposal_dir(root, ticket_id)
+        if folder.exists():
+            proposal = read_proposal(root, ticket_id)
+            if proposal.get("stand") == "abgelehnt":
+                raise AgentsError("Dieser Stand wurde bereits abgelehnt (%s)" % ticket_id)
+        else:
+            files_before = {target: (before.encode("utf-8"), False)}
+            files_after = {target: (after.encode("utf-8"), False)}
+            stored_diff = skill_diff(files_before, files_after)
+            proposal = {
+                "schema_version": SCHEMA_VERSION, "id": ticket_id, "ticket": ticket_id, "agent": agent_id,
+                "art": INSTRUCTION_ART, "skill": target, "ziel": "agent",
+                "quelle": {"ebene": "agent", "ort": agent_id}, "version": version,
+                "basis_version": _sha(before), "beschreibung": "Ergänzung der Anweisung %s" % target,
+                "begruendung": reason, "pruefer": _reviewer(root, agent, "welt"), "stand": "offen",
+                "erstellt_at": ad.now(), "actor": actor, "ticket_angelegt": False,
+            }
+            parent = ad.child(root, PROPOSAL_DIR)
+            parent.mkdir(exist_ok=True)
+            stage = parent / (".%s.creating-%s" % (ticket_id, uuid.uuid4().hex))
+            try:
+                (stage / "stand").mkdir(parents=True)
+                ad._write_text(stage / "stand" / target, after)
+                ad._write_text(stage / "diff.txt", stored_diff)
+                ad._write_json(stage / "vorschlag.json", proposal)
+                os.replace(stage, folder)
+            finally:
+                if stage.exists():
+                    shutil.rmtree(stage, ignore_errors=True)
+        diff_text = _read_file(folder / "diff.txt", SKILL_TOTAL_LIMIT * 2).decode("utf-8")
+    title, goal, done, limits = _ticket_text(proposal, diff_text)
+    ticket = ad.create_ticket(root, title, goal, done, [proposal["pruefer"]], agent_id, None,
+                              limits=limits, ticket_id=ticket_id)
+    with ad.transaction(root):
+        proposal = read_proposal(root, ticket_id)
+        if not proposal.get("ticket_angelegt"):
+            proposal["ticket_angelegt"] = True
+            ad._write_json(_proposal_dir(root, ticket_id) / "vorschlag.json", proposal)
+            _world_log(root, {"event": "vorschlag", "art": INSTRUCTION_ART, "skill": target, "ziel": "agent",
+                              "agent": agent_id, "ticket": ticket_id, "version": proposal["version"],
+                              "basis_version": proposal.get("basis_version"), "actor": actor})
+            _history(root, agent_id, {"event": "skill", "art": INSTRUCTION_ART, "aktion": "vorschlag",
+                                      "skill": target, "ziel": "agent", "ticket": ticket_id,
+                                      "version": proposal["version"], "actor": actor})
+    return {"ticket": ticket_id, "art": INSTRUCTION_ART, "skill": target, "ziel": "agent",
+            "pruefer": proposal["pruefer"], "version": proposal["version"],
+            "basis_version": proposal.get("basis_version"),
+            "diff": str(_proposal_dir(root, ticket_id) / "diff.txt"), "ticket_stand": ticket.get("state")}
+
+
 def _reviewer_actor(root: Path, proposal: dict[str, Any], ticket: dict[str, Any], sender: str | None) -> dict[str, Any]:
     if not sender:
         raise AgentsError("--absender fehlt")
@@ -1449,7 +1583,9 @@ def _reviewer_actor(root: Path, proposal: dict[str, Any], ticket: dict[str, Any]
     if actor.get("kind") == "external":
         return actor
     if actor["id"] == proposal["agent"]:
-        raise AgentsError("Der Vorschlagende nimmt seinen eigenen Skill nicht ab")
+        raise AgentsError("Der Vorschlagende nimmt seine eigene Anweisung nicht ab"
+                          if proposal.get("art") == INSTRUCTION_ART else
+                          "Der Vorschlagende nimmt seinen eigenen Skill nicht ab")
     if actor["id"] not in (ticket.get("recipients") or []):
         raise AgentsError("Nur der adressierte Pruefer nimmt diesen Vorschlag ab")
     role = actor.get("role")
@@ -1493,7 +1629,10 @@ def _finish_ticket(root: Path, ticket_id: str, assignee: str, actor: dict[str, A
     # ticket sent by a member of the team, and _reviewer_actor only lets that leader decide.
     if ticket.get("state") == "zur Abnahme" and (actor.get("kind") == "external"
                                                  or actor.get("role") in ("hauptagent", "teamleiter")):
-        ticket = ad.approve_ticket(root, ticket_id, actor["id"], None, note, True)
+        # Ein Skill-Vorschlag hat keine Code-Abnahme: die Pruefung ist die Pruefkarte selbst;
+        # die Definition of Done der Welt gilt hier als bestaetigt, sonst scheitert jede Welt
+        # mit DoD an "Definition of Done nicht bestaetigt" (Befund tickets4).
+        ticket = ad.approve_ticket(root, ticket_id, actor["id"], None, note, True, dod_checked=True)
     return ticket
 
 
@@ -1512,6 +1651,13 @@ def accept_proposal(root: Path, ticket_id: str, sender: str | None, note: str | 
     if proposal.get("stand") == "abgelehnt":
         raise AgentsError("Vorschlag wurde bereits abgelehnt")
     actor = _reviewer_actor(root, proposal, ticket, sender)
+    # Die Governance-Bindung muss vor JEDEM Schreibpfad stehen: schon das
+    # Beanspruchen des Tickets und erst recht das Ersetzen des Zielordners sind
+    # Teil derselben Entscheidung. Eine CLI-Rollenbehauptung darf keinen
+    # halboffenen Vorschlag und keinen installierten Skill hinterlassen.
+    actor = ad._require_governance_actor(root, sender, None, ("hauptagent", "teamleiter"))
+    if proposal.get("art") == INSTRUCTION_ART:
+        return _accept_instruction(root, ticket_id, ticket, proposal, actor, note)
     assignee = _begin_ticket(root, ticket, actor, RESULT_ACCEPTED)
     name, target, art = proposal["skill"], proposal["ziel"], valid_art(proposal.get("art") or "skill")
     with ad.transaction(root):
@@ -1555,6 +1701,48 @@ def accept_proposal(root: Path, ticket_id: str, sender: str | None, note: str | 
             "ticket_stand": ticket.get("state")}
 
 
+def _accept_instruction(root: Path, ticket_id: str, ticket: dict[str, Any], proposal: dict[str, Any],
+                        actor: dict[str, Any], note: str | None) -> dict[str, Any]:
+    """Apply the frozen diff to the agent's file; refuse when the file changed since the proposal."""
+    assignee = _begin_ticket(root, ticket, actor, RESULT_INSTRUCTION_ACCEPTED)
+    target, agent_id = proposal["skill"], proposal["agent"]
+    with ad.transaction(root):
+        proposal = read_proposal(root, ticket_id)
+        folder = _proposal_dir(root, ticket_id)
+        stand = folder / "stand" / target
+        if stand.is_symlink() or not stand.is_file() or _sha(_read_file(stand, INSTRUCTIONS_LIMIT).decode("utf-8")) != proposal["version"]:
+            raise AgentsError("Vorgeschlagener Stand wurde veraendert; Vorschlag ungueltig")
+        path = ad._agent_dir(root, agent_id) / target
+        if proposal.get("stand") != "übernommen":
+            if path.is_symlink():
+                raise AgentsError("Anweisungsdatei darf kein Symlink sein")
+            current = _sha(_read_file(path, INSTRUCTIONS_LIMIT).decode("utf-8")) if path.exists() else None
+            # current == version: a crash between writing the file and recording the decision.
+            if current != proposal["version"]:
+                if current != proposal.get("basis_version"):
+                    raise AgentsError("Die Anweisung %s hat sich seit dem Vorschlag geaendert; "
+                                      "neuer Vorschlag noetig" % target)
+                diff_text = _read_file(folder / "diff.txt", SKILL_TOTAL_LIMIT * 2).decode("utf-8")
+                _, after = _instruction_change(root, agent_id, target, diff_text)
+                if _sha(after) != proposal["version"]:
+                    raise AgentsError("Vorgeschlagener Stand wurde veraendert; Vorschlag ungueltig")
+                ad._write_text(path, after)
+            proposal.update({"stand": "übernommen", "entschieden_at": ad.now(), "entschieden_von": actor,
+                             "bemerkung": note})
+            ad._write_json(folder / "vorschlag.json", proposal)
+            _world_log(root, {"event": "abgenommen", "art": INSTRUCTION_ART, "skill": target, "ziel": "agent",
+                              "agent": agent_id, "ticket": ticket_id, "version": proposal["version"],
+                              "vorher": proposal.get("basis_version"), "actor": actor, "bemerkung": note})
+            _history(root, agent_id, {"event": "skill", "art": INSTRUCTION_ART, "aktion": "abgenommen",
+                                      "skill": target, "ziel": "agent", "ticket": ticket_id,
+                                      "version": proposal["version"], "actor": actor})
+    text = "%s %s Version %s." % (RESULT_INSTRUCTION_ACCEPTED, target, proposal["version"][:12])
+    ticket = _finish_ticket(root, ticket_id, assignee, actor, text, note)
+    return {"ticket": ticket_id, "art": INSTRUCTION_ART, "skill": target, "ziel": "agent",
+            "version": proposal["version"], "pfad": str(ad._agent_dir(root, agent_id) / target),
+            "vorher": None, "ticket_stand": ticket.get("state")}
+
+
 def reject_proposal(root: Path, ticket_id: str, sender: str | None, reason: str) -> dict[str, Any]:
     root = ad.world_path(str(root))
     reason = " ".join((reason or "").split())
@@ -1567,8 +1755,10 @@ def reject_proposal(root: Path, ticket_id: str, sender: str | None, reason: str)
     if proposal.get("stand") == "übernommen":
         raise AgentsError("Vorschlag wurde bereits uebernommen")
     actor = _reviewer_actor(root, proposal, ticket, sender)
-    assignee = _begin_ticket(root, ticket, actor, RESULT_REJECTED)
-    art = valid_art(proposal.get("art") or "skill")
+    actor = ad._require_governance_actor(root, sender, None, ("hauptagent", "teamleiter"))
+    instruction = proposal.get("art") == INSTRUCTION_ART
+    assignee = _begin_ticket(root, ticket, actor, RESULT_INSTRUCTION_REJECTED if instruction else RESULT_REJECTED)
+    art = INSTRUCTION_ART if instruction else valid_art(proposal.get("art") or "skill")
     with ad.transaction(root):
         proposal = read_proposal(root, ticket_id)
         if proposal.get("stand") != "abgelehnt":
@@ -1580,7 +1770,8 @@ def reject_proposal(root: Path, ticket_id: str, sender: str | None, reason: str)
             _history(root, proposal["agent"], {"event": "skill", "art": art, "aktion": "abgelehnt",
                                                "skill": proposal["skill"], "ziel": proposal["ziel"],
                                                "ticket": ticket_id, "actor": actor, "grund": reason})
-    text = "%s %s%s. Grund: %s" % (RESULT_REJECTED, "Skript " if art == "skript" else "", proposal["skill"],
+    text = "%s %s%s. Grund: %s" % (RESULT_INSTRUCTION_REJECTED if instruction else RESULT_REJECTED,
+                                   "Skript " if art == "skript" else "", proposal["skill"],
                                    proposal.get("grund") or reason)
     ticket = _finish_ticket(root, ticket_id, assignee, actor, text, reason)
     return {"ticket": ticket_id, "art": art, "skill": proposal["skill"], "stand": "abgelehnt",
@@ -1824,26 +2015,18 @@ def _apply_brain_step(root: Path, agent_id: str, step: dict[str, Any], run_name:
 
 
 def _apply_instruction(root: Path, agent_id: str, step: dict[str, Any]) -> dict[str, Any]:
-    path = ad._agent_dir(root, agent_id) / step["ziel"]
-    if path.is_symlink():
-        raise AgentsError("Anweisungsdatei darf kein Symlink sein")
-    if not path.exists():
-        return {"status": "abgewiesen", "fehler": "%s fehlt im Agentenordner" % step["ziel"]}
-    entries = parse_diff(step["diff"])
-    if len(entries) != 1 or (entries[0]["neu"] or entries[0]["alt"]) not in (step["ziel"],):
-        return {"status": "abgewiesen", "fehler": "Diff muss genau die Datei %s aendern" % step["ziel"]}
-    if any(tag == "-" for hunk in entries[0]["hunks"] for tag, _ in hunk["lines"]) or entries[0]["neu"] is None:
-        return {"status": "abgewiesen",
-                "fehler": "Anweisungsdiff entfernt bestehende Zeilen; automatisch gelten nur Ergaenzungen"}
-    before = _read_file(path, INSTRUCTIONS_LIMIT).decode("utf-8")
-    after = _apply_file_diff(before, entries[0])
-    if after is None or len(after.encode("utf-8")) > INSTRUCTIONS_LIMIT:
-        return {"status": "abgewiesen", "fehler": "Anweisungsdatei waere groesser als %d Bytes" % INSTRUCTIONS_LIMIT}
+    """Lernschritt anweisung: pruefen und als Vorschlag vormerken; die Datei bleibt unveraendert.
+
+    Das Ticket entsteht nach der Welttransaktion in ``apply_learning_step`` (``propose_instruction``).
+    """
+    before, after = _instruction_change(root, agent_id, step["ziel"], step["diff"])
     if after == before:
         return {"status": "vorhanden"}
-    ad._write_text(path, after)
-    return {"status": "angewendet", "sha256_vorher": hashlib.sha256(before.encode("utf-8")).hexdigest(),
-            "sha256_nachher": hashlib.sha256(after.encode("utf-8")).hexdigest()}
+    version = _sha(after)
+    ticket_id = ad.derived_id(INSTRUCTION_ART, agent_id, step["ziel"], version[:16])
+    if _proposal_dir(root, ticket_id).exists() and read_proposal(root, ticket_id).get("stand") == "abgelehnt":
+        return {"status": "abgewiesen", "fehler": "Dieselbe Aenderung wurde bereits abgelehnt (%s)" % ticket_id}
+    return {"status": "vorgeschlagen", "ticket": ticket_id, "version": version, "basis_version": _sha(before)}
 
 
 def _apply_skill_change(root: Path, agent_id: str, step: dict[str, Any],
@@ -1889,16 +2072,44 @@ def _apply_skill_change(root: Path, agent_id: str, step: dict[str, Any],
     return result
 
 
+def _jev_lehre(root: Path, agent_id: str, step: dict[str, Any], step_id: str, jev: Any) -> None:
+    """Reicht eine neue Lehre samt heutigem Gedaechtnis an den Jev-Schatten; Fehler bleiben folgenlos."""
+    try:
+        agent = ad.read_agent(root, agent_id)
+        known = ad._read_optional_json(ad._agent_dir(root, agent_id) / "history.json", "Verlauf") or {}
+        if any(entry.get("id") == step_id for entry in known.get("entries") or []):
+            return
+        path = ad._agent_dir(root, agent_id) / "MEMORY.md"
+        memory = "" if path.is_symlink() or not path.is_file() else \
+            _read_file(path, ad.MEMORY_WRITE_LIMIT).decode("utf-8", "replace")
+        lines = [line.rstrip() for line in memory.split("\n")
+                 if line.strip() and not line.startswith("#") and line.strip() != MEMORY_PLACEHOLDER]
+        zustand = {"agent": "%s (%s)" % (agent_id, str(agent.get("stage") or "?").capitalize()),
+                   "lernschritt_art": "lehre", "grund_des_agenten": step.get("grund") or "",
+                   "lehre": step["text"], "gedaechtnis_heute": lines or [MEMORY_PLACEHOLDER]}
+        jev(zustand, {"agent": agent_id, "lernschritt": step_id, "zug": step.get("zug"),
+                      "gedaechtnis_sha256": hashlib.sha256(memory.encode("utf-8")).hexdigest()})
+    except Exception:  # noqa: BLE001 - der Schatten aendert nie das Ergebnis des Lernschritts
+        pass
+
+
 def apply_learning_step(root: Path, agent_id: str, run_dir: str | os.PathLike[str], *,
                         library: str | os.PathLike[str] | None = None, date: str | None = None,
-                        brain: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+                        brain: str | os.PathLike[str] | None = None,
+                        jev: Any = None) -> dict[str, Any]:
     """Check and apply the learning step a turn left in its run directory.
 
     Result ``status``: ``fehlt`` (no file), ``ungueltig``, ``nichts``, ``angewendet``,
-    ``vorhanden`` (already in effect), ``abgewiesen`` (valid but not applied, with reason)
-    or ``vorschlag`` (change of a world or library skill: own copy plus proposal ticket).
+    ``vorhanden`` (already in effect), ``abgewiesen`` (valid but not applied, with reason),
+    ``vorschlag`` (change of a world or library skill: own copy plus proposal ticket) or
+    ``vorgeschlagen`` (``anweisung``: the file stays unchanged, a proposal ticket with the diff
+    goes to the reviewer and the change applies only on acceptance).
     Every outcome except ``fehlt`` is written once to the agent history; a repeated call
     for the same run and file returns the stored outcome.
+
+    ``jev``: optional callable ``jev(zustand, bezug)`` of the Jev shadow mode (agents_jev, Stelle E).
+    It gets a new ``lehre`` before the transaction, must return at once and has no effect on the
+    outcome; any error it raises is ignored.
     """
     root = ad.world_path(str(root))
     ad.valid_id(agent_id, "Agentenkennung")
@@ -1919,6 +2130,9 @@ def apply_learning_step(root: Path, agent_id: str, run_dir: str | os.PathLike[st
         known = ad._read_optional_json(ad._agent_dir(root, agent_id) / "history.json", "Verlauf") or {}
         if not any(entry.get("id") == step_id for entry in known.get("entries") or []):
             brain_outcome = _apply_brain_step(root, agent_id, step, folder.name, date, brain)
+    if jev is not None and not step.get("fehler") and step["art"] == "lehre":
+        # Jev-Schatten (Stelle E, PLAN.md 8.2): vor der Transaktion, ohne Warten und ohne Wirkung (I2, I6).
+        _jev_lehre(root, agent_id, step, step_id, jev)
     with ad.transaction(root):
         ad.read_agent(root, agent_id)
         history = ad._read_optional_json(ad._agent_dir(root, agent_id) / "history.json", "Verlauf") or {}
@@ -1948,7 +2162,13 @@ def apply_learning_step(root: Path, agent_id: str, run_dir: str | os.PathLike[st
             ad._append_history(root, agent_id, stored)
     result = {key: value for key, value in stored.items() if key not in ("actor",)}
     result["agent"] = agent_id
-    if stored.get("status") == "vorschlag":
+    if stored.get("status") == "vorgeschlagen":
+        try:
+            result["vorschlag"] = propose_instruction(root, agent_id, stored["ziel"], step["diff"],
+                                                      reason=stored.get("grund"), expected_version=stored["version"])
+        except AgentsError as exc:
+            result["vorschlag_fehler"] = str(exc)
+    elif stored.get("status") == "vorschlag":
         if stored.get("kopie_von") == "bibliothek" and ad.read_world(root).get("kind") != "global":
             result["vorschlag_fehler"] = ("Bibliotheks%s: eigene Kopie angelegt; "
                                           "der Vorschlag geht über die Welt oder die globale Welt"
@@ -2097,10 +2317,15 @@ def measure_turn(data: bytes | str, harness: str = "claude") -> Optional[dict[st
 
 
 def ticket_kind(ticket: dict[str, Any] | None = None, item_kind: str | None = None) -> str:
-    """Kind a measurement is filed under: the ticket's ``art`` (field or limits), else ``ticket``;
-    for turns without a ticket the delivery kind (``nachricht``, ``rueckmeldung``, ``antwort``)."""
+    """Kind a measurement is filed under: the ticket's `kind` field (tickets3), else its
+    ``limits.art``, else ``ticket``; for turns without a ticket the delivery kind
+    (``nachricht``, ``rueckmeldung``, ``antwort``).  Review turns stay under ``pruefung``
+    no matter which kind the reviewed ticket carries."""
+    if item_kind == "pruefung":
+        return "pruefung"
     if ticket:
-        raw = ticket.get("art") or (ticket.get("limits") or {}).get("art") or "ticket"
+        raw = ticket.get("kind") if ticket.get("kind") in ad.TICKET_KINDS else \
+            (ticket.get("limits") or {}).get("art") or "ticket"
     else:
         raw = item_kind or "sonstiges"
     value = re.sub(r"[^a-z0-9-]+", "-", str(raw).lower()).strip("-")[:64]

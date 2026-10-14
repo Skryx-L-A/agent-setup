@@ -36,7 +36,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
@@ -47,6 +47,7 @@ import agents_data as ad  # noqa: E402
 import agents_freigaben as af  # noqa: E402
 import agents_brain as ab  # noqa: E402
 import agents_gedaechtnis as ag  # noqa: E402
+import agents_jev as aj  # noqa: E402
 import agents_skills as ask  # noqa: E402
 import agents_worktree as aw  # noqa: E402
 import agents_zugaenge as az  # noqa: E402
@@ -58,11 +59,12 @@ from agents_claude import (  # noqa: E402
 )
 from agents_denkstufe import DenkstufeFehler, denkstufe_argumente, registry_laden  # noqa: E402
 from agents_pi import PiZug, pi_befund, pi_werkzeuge  # noqa: E402
-from agents_codex import CodexAnmeldung, CodexZug, codex_eintrag  # noqa: E402
+from agents_codex import CodexAnmeldung, CodexZug, codex_befund, codex_eintrag  # noqa: E402
+from agents_codex_sperre import CodexSperre  # noqa: E402
 from agents_kontingent import RECHECK_S, KontingentQuelle, Startfreigabe  # noqa: E402
 from agents_lauf import LaufFehler, LaunchReceipt, RunController  # noqa: E402
 from agents_wecker import Delivery, WeckerController, WeckerFehler  # noqa: E402
-from agents_modellwahl import abo as modell_abo, ist_fable  # noqa: E402
+from agents_modellwahl import abo as modell_abo, familienmodell, ist_fable  # noqa: E402
 
 WELT_ZUSTAND = {"läuft": "running", "pausiert": "paused", "gestoppt": "stopped"}
 AGENT_ZUSTAND = {"aktiv": "running", "pausiert": "paused", "gestoppt": "stopped", "archiviert": "stopped"}
@@ -85,10 +87,38 @@ GEDAECHTNIS_SITZUNG = "__gedaechtnis__"
 BRAIN_BIN = "brain-bin"
 _MODELL = re.compile(r"claude-[a-z0-9.-]{3,100}\Z")
 _VERSION = 1
+# Ursprung der Codex-Modellanfragen: der lokale Geheimnisfilter (Route `chatgpt`), nicht chatgpt.com.
+# Fail-closed: ohne laufenden Filter liefert der Modellproxy backend_transport_error; ein Direktweg existiert nicht.
+CODEX_ORIGIN = "http://127.0.0.1:8093/chatgpt"
+
+
+_UNSET = object()  # Sentinel: Parameter nicht gesetzt
 
 
 class TraegerFehler(Exception):
     """Abgelehnte Traegerkonfiguration oder -operation."""
+
+
+# Werkzeugliste des Pruefzuges (tickets2): keine Schreibwerkzeuge, Lesen und Bash fuer `git show|diff|log`
+# und den Dienstweg (`ticket.review_result`). Die git-Verwaltung des geprüften Worktrees ist dazu nur
+# lesend eingebunden, also auch ein `git commit` unmöglich.
+PRUEF_WERKZEUGE = ("Read", "Grep", "Glob", "Bash")
+
+
+# Hooks und Pruefkerne, mit denen die Codex-Sperre (agents_codex_sperre) jeden Werkzeugaufruf prueft.
+CODEX_SPERR_DATEIEN = ("skills-sperre.sh", "profil-sperre.sh", "lib/skills_sperre.py", "lib/profil_sperre.py")
+
+
+def _codex_profilgrenze(agent: dict[str, Any], hooks: Optional[Path]) -> Optional[str]:
+    """Grund, warum das Profil eines Codex-Agenten im gesperrten Zug nicht durchsetzbar ist, sonst ``None``.
+
+    Seit 09.10.2026 prueft die Codex-Sperre im Modellproxy jeden Werkzeugaufruf mit denselben Hooks wie den
+    Claude-Zug: Bash-Muster samt Dienstweg, "Bash nicht erlaubt" und die Skillgrenze gelten damit fuer Codex.
+    Fehlen diese Hooks in der Laufzeit, bleibt der Zug aus (fail-closed)."""
+    fehlend = [name for name in CODEX_SPERR_DATEIEN if hooks is None or not (Path(hooks) / name).is_file()]
+    if fehlend:
+        return "Sperr-Hooks fehlen in der Laufzeit (%s), ohne sie gilt keine Profilgrenze" % ", ".join(fehlend)
+    return None
 
 
 def _private_dir(path: Path, label: str) -> Path:
@@ -170,6 +200,8 @@ class TraegerKonfig:
     sperren: bool = True
     codex: Optional[dict[str, Any]] = None
     brain: Optional[dict[str, Any]] = None
+    # Jev-Schattenbetrieb (agents_jev, docs/AGENTS-TRAEGER.md): fehlt oder null heisst aus.
+    jev: Optional[dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         for name in ("world_root", "state_dir", "agents_dir"):
@@ -209,6 +241,16 @@ class TraegerKonfig:
         if self.brain is not None and (not isinstance(self.brain, dict) or set(self.brain) != {"vault"}
                                        or not Path(str(self.brain.get("vault") or "")).is_absolute()):
             raise TraegerFehler("brain braucht genau vault als absoluten Pfad")
+        # Nur die Form wird hier geprueft; eine Nicht-Loopback-URL stoppt den Traeger nicht, sondern
+        # wird je Fall abgewiesen und protokolliert (agents_jev.url_pruefen).
+        if self.jev is not None and (not isinstance(self.jev, dict) or set(self.jev) - aj.KONFIG_FELDER
+                                     or not isinstance(self.jev.get("schatten", False), bool)
+                                     or not isinstance(self.jev.get("dienst_starten", False), bool)
+                                     or ("wb_jev" in self.jev and
+                                         (not isinstance(self.jev["wb_jev"], str) or
+                                          not Path(self.jev["wb_jev"]).is_absolute()))):
+            raise TraegerFehler("jev kennt schatten/dienst_starten (boolesch), url, schwellen, modell "
+                                "und wb_jev (absoluter Pfad)")
         object.__setattr__(self, "tools", tuple(self.tools))
 
     @classmethod
@@ -238,6 +280,7 @@ class TraegerKonfig:
             "pi": dict(self.pi) if self.pi is not None else None, "sperren": self.sperren,
             "codex": dict(self.codex) if self.codex is not None else None,
             "brain": dict(self.brain) if self.brain is not None else None,
+            "jev": dict(self.jev) if self.jev is not None else None,
         }
 
     def orte(self) -> TraegerOrte:
@@ -268,6 +311,9 @@ class TraegerKonfig:
 
     def backend_fuer(self, model: str, harness: str = "claude"):
         from agents_model_proxy import BackendConfig
+        if harness == "codex":
+            return BackendConfig("codex", model, "openai-responses", "cloud", CODEX_ORIGIN,
+                                 self.execution_host, "cloud")
         if harness == "pi":
             # Lokale Inferenz auf demselben Host; der lokale Server bekommt nie eine Abo-Anmeldung.
             return BackendConfig("lokal", model, str(self.pi.get("api") or "openai-completions"), "local",
@@ -291,26 +337,48 @@ def zeitgeber_unit(konfig: TraegerKonfig) -> str:
 
 def _claude_lauf_fabrik(traeger: "WeltTraeger", *, agent_id: str, run_id: str, zug: ClaudeZug,
                         workspace: Path, agent_state: Path, extra_read_paths: tuple[Path, ...] = (),
-                        netz: bool = False, extra_write_paths: tuple[Path, ...] = (),
+                        netz: bool = False, web: bool = False, extra_write_paths: tuple[Path, ...] = (),
                         git_einbindung: Optional[dict[str, Any]] = None, verdeckt: tuple[Path, ...] = (),
                         brain_vault: Optional[Path] = None):
     from agents_claude_lauf import ClaudeLauf, LaufOrte
     k, orte = traeger.konfig, traeger.orte
     lauf_orte = LaufOrte(orte.runs, orte.launcher, orte.output, orte.sockets, orte.turns, orte.runtime)
-    if isinstance(zug, CodexZug):
-        # Trockenlauf: Aufruf und Anmeldeweg sind gebaut, der Modelltransport mit der Codex-Anmeldung nicht.
-        raise TraegerFehler("Codex-Zug ist nur als Trockenlauf gebaut; Modelltransport mit Codex-Anmeldung fehlt")
+    codex = isinstance(zug, CodexZug)
     pi = isinstance(zug, PiZug)
     brain = {key: value for key, value in (("verdeckt", tuple(verdeckt)), ("brain_vault", brain_vault)) if value}
-    return ClaudeLauf(lauf_orte, world_root=k.world_root, agent_id=agent_id, run_id=run_id, workspace=workspace,
-                      agent_state=agent_state, zug=zug, backend=k.backend_fuer(zug.model, "pi" if pi else "claude"),
-                      auth_headers=None if pi else traeger.anmeldequelle.auth_headers, extra_read_paths=extra_read_paths,
+    backend = k.backend_fuer(zug.model, "codex" if codex else "pi" if pi else "claude")
+    sperre = None
+    if codex and zug.sperre:
+        # Codex-Sperre: der Proxy prueft jeden Werkzeugaufruf mit den Hooks des Claude-Zuges, der Zugumgebung und
+        # - auf Linux - in der Dateisystemsicht des laufenden Zuges (Namensraum seines Sandbox-Prozesses).
+        sperre = CodexSperre(orte.runtime / "hooks", zug.extra_env, workspace, session_id=zug.session_id,
+                             protokoll=orte.turns / run_id / "codex-sperre.jsonl")
+        backend = _dc_replace(backend, antwort_pruefung=sperre)
+    lauf = ClaudeLauf(lauf_orte, world_root=k.world_root, agent_id=agent_id, run_id=run_id, workspace=workspace,
+                      agent_state=agent_state, zug=zug, backend=backend,
+                      auth_headers=((lambda: CodexAnmeldung(k.codex["auth"]).auth_headers()) if codex else
+                                    (None if pi else traeger.anmeldequelle.auth_headers)),
+                      extra_read_paths=extra_read_paths,
                       launcher_options=dict(k.launcher, **({"git_einbindung": git_einbindung} if git_einbindung
-                                                           else {})), unit_prefix=k.unit_prefix, netz=netz,
+                                                           else {})), unit_prefix=k.unit_prefix, netz=netz, web=web,
                       extra_write_paths=extra_write_paths, **brain)
+    if sperre is not None and sys.platform.startswith("linux"):
+        def zugprozesse() -> tuple[int, ...]:
+            if lauf.handle is None or lauf.handle.receipt is None or lauf.launcher is None:
+                raise ValueError("Zug laeuft nicht")
+            return lauf.launcher.cgroup_members(lauf.handle.receipt)
+        sperre.namensraum = zugprozesse
+        # Das aeussere bwrap ist der Hauptprozess der Unit (Receipt); sein Kind, das innere bwrap, wird das Ziel.
+        sperre.hauptprozess = lambda: lauf.handle.receipt.pid
+    return lauf
 
 
 PROJEKT_ARBEITSORDNER = "work"
+# Commit im Schatten der Stelle B: Nachricht und Dateiliste aus dem Git-Repo des Projekts, mit Grenzen.
+JEV_COMMIT_FRIST_S = 1.5
+JEV_COMMIT_NACHRICHT = 2000
+JEV_COMMIT_DATEIEN = 200
+_JEV_COMMIT_HASH = re.compile(r"[0-9a-f]{7,64}\Z")
 
 
 def projekt_pfade(world_root: Path) -> tuple[Optional[Path], Optional[Path]]:
@@ -381,9 +449,11 @@ class WeltTraeger:
                  observer_fabrik: Callable[["WeltTraeger"], Any] = _claude_observer,
                  ausgabe: Callable[["WeltTraeger", Any], bytes] = _claude_ausgabe,
                  anmeldequelle: Any = None, kontingentquelle: Any = "konfig",
+                 codex_kontingentquelle: Any = None,
                  zeitgeber: Optional[Callable[[Optional[float]], Any]] = None,
                  clock: Callable[[], float] = time.time, runtime_quelle: Optional[Path] = None,
-                 lokal_frei: Optional[Callable[[str], bool]] = None):
+                 lokal_frei: Optional[Callable[[str], bool]] = None,
+                 jev_optionen: Optional[dict[str, Any]] = None):
         self.konfig = konfig
         self._lokal_frei_pruefer = lokal_frei or _lokal_erreichbar
         self.orte = konfig.orte()
@@ -395,6 +465,10 @@ class WeltTraeger:
         self.kontingentquelle = konfig.kontingentquelle() if kontingentquelle == "konfig" else kontingentquelle
         self._zeitgeber = zeitgeber
         self._clock = clock
+        # Codex-Abo: gemessener Stand aus wb-kontingent; Tests geben eine eigene Quelle, damit das echte
+        # Kontingent des Hosts (GL#30, 13.10.2026: Codex Free erschoepft) keinen Testzug schlafen legt.
+        self.codex_kontingentquelle = codex_kontingentquelle if codex_kontingentquelle is not None else \
+            KontingentQuelle(None, ("wb-kontingent", "zeigen", "--json"), harness="codex", clock=clock)
         self.laeufe: dict[str, Any] = {}
         _private_dir(self.orte.state, "Traegerzustand")
         _private_dir(self.orte.agents, "Agentenbereich")
@@ -402,6 +476,10 @@ class WeltTraeger:
             _private_dir(getattr(self.orte, name), name)
         self.wecker = WeckerController(self.orte.wecker, clock=clock)
         self._runtime_bereitstellen(runtime_quelle or Path(__file__).resolve().parent)
+        # Schalter aus: None, dann kein Aufruf, keine Datei, kein Faden.
+        self._jev_welt: tuple[Optional[int], dict[str, Any]] = (None, {})
+        self.jev = aj.JevSchatten.aus_konfig(konfig.jev, self.orte.state, welt=self._welt_id_oder_none(),
+                                             **(jev_optionen or {}))
 
     # Grundlagen ------------------------------------------------------------------
     def observer(self):
@@ -413,6 +491,12 @@ class WeltTraeger:
     def world_id(self) -> str:
         return ad.read_world(self.root)["id"]
 
+    def _welt_id_oder_none(self) -> Optional[str]:
+        try:
+            return self.world_id()
+        except (ad.AgentsError, OSError, KeyError):
+            return None
+
     def _now(self) -> float:
         return float(self._clock())
 
@@ -421,6 +505,10 @@ class WeltTraeger:
         if self.konfig.sperren:
             # Die Sperr-Hooks laufen im Zug; ihre Dateien und die Hausliste liegen nur lesend in der Laufzeit.
             hooks = Path(quelle).parent / "hooks"
+            if not hooks.is_dir():
+                # Ausgerollt liegt dieses Modul in ~/.local/bin, die Hooks aber in ~/.claude/hooks
+                # (2026-09-18: Start von dort scheiterte mit "Sperrdatei fehlt: ~/.local/hooks/...").
+                hooks = Path.home() / ".claude" / "hooks"
             for rel in SPERR_DATEIEN:
                 source = hooks / rel if not rel.startswith("wb-profil") else Path(quelle) / rel
                 if not source.is_file():
@@ -509,6 +597,11 @@ class WeltTraeger:
             return str((self.konfig.pi["modelle"][name] or {}).get("id") or name)
         if harness == "codex":
             return str(codex_eintrag(self._registry(), name)["modelRef"])
+        family, separator, _effort = name.partition(":")
+        if separator and family in {"opus", "sonnet", "haiku"} and name in self.konfig.modelle:
+            resolved = familienmodell(family, self._registry(), self.konfig.modelle.get(name))
+            if resolved:
+                return resolved if _MODELL.fullmatch(resolved) else None
         name = self.konfig.modelle.get(name, name)
         return name if _MODELL.fullmatch(name) else None
 
@@ -541,13 +634,22 @@ class WeltTraeger:
         return folder / "agents_rpc_client.py"
 
     def _zugumgebung(self, agent_id: str, workspace: Path, run_dir: Path, rpc: Path,
-                     skills: bool) -> list[tuple[str, str]]:
-        """Umgebung nach docs/AGENTS-SPERREN.md plus Zugordner, RPC-Client und Hausliste."""
-        env = ask.profil_umgebung(self.root, agent_id, worktree=workspace, tmp=run_dir)
+                     skills: bool, worktree: Any = _UNSET) -> list[tuple[str, str]]:
+        """Umgebung nach docs/AGENTS-SPERREN.md plus Zugordner, RPC-Client und Hausliste.
+
+        ``worktree`` setzt den Worktree-Pfad fuer die Profil-Sperre (`WB_AGENT_WORKTREE`) ab; ``None``
+        lautet "nicht gesetzt" (Pruefzug: der geprüfte Worktree ist kein Schreib- und Lesewurzel)."""
+        env = ask.profil_umgebung(self.root, agent_id, worktree=workspace if worktree is _UNSET else worktree,
+                                  tmp=run_dir)
         if skills:
             env.update(ask.skills_umgebung(self.root, agent_id))
         env.update({"WB_AGENT_ZUG": str(run_dir), "WB_RPC_CLIENT": str(rpc),
                     "WB_PROFIL_BIN": str(self.orte.runtime / "wb-profil")})
+        if any(not isinstance(env.get(name), str) or not env[name].strip()
+               for name in ("WB_AGENT_ID", "WB_WELT")):
+            raise TraegerFehler(
+                "Agentenzug ohne Bindung: WB_AGENT_ID und WB_WELT muessen beide gesetzt sein; kein Start"
+            )
         return sorted((key, value) for key, value in env.items() if value)
 
     def _sperr_einstellungen(self, zugang: Optional[az.Bereitstellung] = None,
@@ -608,11 +710,14 @@ class WeltTraeger:
         base = _private_dir(self.orte.agents / ad.valid_id(agent_id, "Agentenkennung"), "Agentenordner")
         return _private_dir(base / "work", "Arbeitsordner"), _private_dir(base / "state", "Agentenzustand")
 
-    def arbeitsbaum(self, agent_id: str, arbeitsordner: Path) -> tuple[Optional[aw.Arbeitsbaum], Optional[str]]:
+    def arbeitsbaum(self, agent_id: str, arbeitsordner: Path,
+                    sperren_raeumen: bool = False) -> tuple[Optional[aw.Arbeitsbaum], Optional[str]]:
         """Worktree des Agenten im git-Projekt der Welt (agents_worktree, der Nutzer 16.09.2026).
 
         Ohne git-Projekt ``(None, None)``. Laesst er sich nicht anlegen oder pruefen, laeuft der Zug wie ohne
-        git-Projekt, und der Grund steht als ``worktree_fehler`` im Zug und in der Anweisung."""
+        git-Projekt, und der Grund steht als ``worktree_fehler`` im Zug und in der Anweisung. Das gilt auch fuer
+        einen Traegerhost ohne git-Identitaet: ein Agent committet nie unter eigenem Namen.
+        ``sperren_raeumen`` nur fuer den Worktree des Agenten, dessen Zug gleich startet."""
         try:
             projekt = ask.world_project(self.root)
             if projekt is None or not projekt.is_dir():
@@ -620,7 +725,7 @@ class WeltTraeger:
             projekt = projekt.resolve(strict=True)
             if projekt in (Path("/"), Path.home()):
                 return None, None
-            return aw.bereitstellen(projekt, arbeitsordner, agent_id), None
+            return aw.bereitstellen(projekt, arbeitsordner, agent_id, sperren_raeumen), None
         except Exception as exc:  # noqa: BLE001 - der Zug laeuft ohne Worktree weiter, der Grund bleibt sichtbar
             return None, "%s: %s" % (type(exc).__name__, str(exc)[:200])
 
@@ -653,9 +758,15 @@ class WeltTraeger:
     def _posten(self, world_id: str, agent_id: str) -> list[Posten]:
         items: dict[str, Posten] = {}
         questions = ad.list_questions(self.root)
+        # Agentenantraege und Rechteantraege (rechte-antrag) verlangen vom Empfaenger eine Entscheidung; ihre
+        # Entscheidung erreicht den Antragsteller als Rueckmeldung.
         antraege = {ad.derived_id("antrag", q["id"]): q for q in questions if q.get("kind") == ad.AGENT_REQUEST_KIND}
+        antraege.update({ad.derived_id("rechte-antrag", q["id"]): q for q in questions
+                         if q.get("kind") == ad.RIGHTS_REQUEST_KIND})
         entscheide = {ad.derived_id("antrag-entschieden", q["id"]) for q in questions
                       if q.get("kind") == ad.AGENT_REQUEST_KIND}
+        entscheide |= {ad.derived_id("rechte-antrag-entschieden", q["id"]) for q in questions
+                       if q.get("kind") == ad.RIGHTS_REQUEST_KIND}
         folder = ad._agent_dir(self.root, agent_id) / "postfach"
         for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
             if path.is_symlink():
@@ -672,16 +783,30 @@ class WeltTraeger:
                 delivery = Delivery(delivery_id, world_id, agent_id, "ticket", due,
                                     _inhalt("ticket", ticket_id=data["ticket_id"], postfach_id=postfach_id))
                 items[delivery_id] = Posten(delivery, "ticket", ticket_id=data["ticket_id"], postfach_id=postfach_id)
+            elif data.get("kind") == "ticket-review":
+                # Ein Pruefungsposten (tickets2): derselbe Ticketordner, aber ein Zug ohne Schreibwerkzeuge.
+                delivery = Delivery(delivery_id, world_id, agent_id, "ticket", due,
+                                    _inhalt("pruefung", ticket_id=data["ticket_id"], postfach_id=postfach_id))
+                items[delivery_id] = Posten(delivery, "pruefung", ticket_id=data["ticket_id"],
+                                            postfach_id=postfach_id)
+            elif data.get("kind") == "zyklus-schluss":
+                # Zyklusschluss (tickets3): Zahlen und der Auftrag zum Retro-Eintrag, ohne Antwortpflicht.
+                delivery = Delivery(delivery_id, world_id, agent_id, "fresh_message", due,
+                                    _inhalt("zyklus-schluss", nachricht_id=postfach_id))
+                items[delivery_id] = Posten(delivery, "zyklus-schluss", nachricht_id=postfach_id,
+                                            postfach_id=postfach_id)
             elif data.get("kind") in NACHRICHT_ARTEN and data.get("sender") != agent_id:
                 # Antworten und Ticketergebnisse werden gelesen, verlangen aber keine Gegenantwort;
                 # sonst weckten sich zwei Agenten bis zur Kettengrenze gegenseitig.
                 art = "rueckmeldung" if (data.get("kind") == "ticket-ergebnis" or data.get("subject") == "Antwort"
                                          or postfach_id in entscheide) else "nachricht"
-                # Ein Antrag auf einen neuen Agenten verlangt eine Entscheidung statt einer Antwort.
+                # Ein Antrag (neuer Agent oder Rechte) verlangt eine Entscheidung statt einer Antwort.
                 antrag = antraege.get(postfach_id)
                 frage_id = None
                 if antrag is not None and antrag.get("to") == agent_id and antrag.get("sender") == data.get("sender"):
                     art, frage_id = "antrag", antrag["id"]
+                if self.jev is not None:
+                    self._jev_freigabe(agent_id, data, postfach_id, art)
                 caused_by, chain = self._kette(data.get("sender"), data.get("time"))
                 content = _inhalt(art, nachricht_id=postfach_id, frage_id=frage_id) if frage_id else \
                     _inhalt(art, nachricht_id=postfach_id)
@@ -689,9 +814,9 @@ class WeltTraeger:
                 items[delivery_id] = Posten(delivery, art, nachricht_id=postfach_id, frage_id=frage_id,
                                             postfach_id=postfach_id)
         for question in questions:
-            # Die Entscheidung ueber einen Agentenantrag erreicht den Teamleiter als Direktnachricht.
+            # Die Entscheidung ueber einen Agenten- oder Rechteantrag erreicht den Antragsteller als Direktnachricht.
             if question.get("sender") != agent_id or question.get("state") != "beantwortet" \
-                    or question.get("kind") == ad.AGENT_REQUEST_KIND:
+                    or question.get("kind") in (ad.AGENT_REQUEST_KIND, ad.RIGHTS_REQUEST_KIND):
                 continue
             delivery_id = self._wecker_id(agent_id, "antwort-" + question["id"])
             due = _epoch((question.get("answer") or {}).get("answered_at"), 0.0)
@@ -706,17 +831,141 @@ class WeltTraeger:
             except ValueError:
                 continue
             art = content.get("art")
-            if art in {"fortsetzen", "aufwachen", "nachricht", "rueckmeldung", "antwort", "antrag", "gedaechtnis"}:
+            if art in {"fortsetzen", "aufwachen", "nachricht", "rueckmeldung", "antwort", "antrag",
+                       "gedaechtnis", "pruefung", "zyklus-schluss"}:
                 items[delivery.delivery_id] = Posten(delivery, art, ticket_id=content.get("ticket_id"),
                                                      nachricht_id=content.get("nachricht_id"),
                                                      frage_id=content.get("frage_id"), grund=content.get("grund"))
         ordered = sorted(items.values(), key=lambda item: (item.delivery.due_at, item.delivery.delivery_id))
+        ticket_positions = [index for index, item in enumerate(ordered) if item.art == "ticket"]
+        if ticket_positions:
+            try:
+                order = {item["id"]: index for index, item in enumerate(ad.ready_tickets(self.root))}
+            except (ad.AgentsError, OSError):
+                order = {}
+            if order:
+                tickets = [ordered[index] for index in ticket_positions]
+                total = max(len(order), len(ticket_positions))
+                tickets.sort(key=lambda item: (
+                    order.get(item.ticket_id, total), str(item.ticket_id or "")))
+                for position, item in zip(ticket_positions, tickets):
+                    ordered[position] = item
         vorn = self._gedaechtnis_posten(world_id, agent_id)
         if vorn is None:
             return [item for item in ordered if item.art != "gedaechtnis"]
         # Solange MEMORY.md die Grenze reisst, gibt es fuer diesen Agenten nur "Gedaechtnis kuerzen" (samt Recovery).
         return [vorn] + [item for item in ordered if item.art == "gedaechtnis"
                          and item.delivery.delivery_id != vorn.delivery.delivery_id]
+
+    # Jev-Schattenbetrieb (agents_jev): nur einreichen, nie warten, nie wirken ------------
+    def _jev_lehre(self, zustand: dict[str, Any], bezug: dict[str, Any]) -> None:
+        """Stelle E: ``apply_learning_step`` reicht eine neue Lehre vor seiner Transaktion ein."""
+        if self.jev is not None:
+            self.jev.einreichen("lernschritt", zustand, bezug)
+
+    def _jev_dod(self, agent_id: str, entry: dict[str, Any], ticket: Optional[dict[str, Any]]) -> None:
+        """Stelle B: je Punkt der Welt-DoD ein Fall, sobald der Zug eine neue Ergebnisfassung geschrieben hat."""
+        try:
+            result = (ticket or {}).get("result") or {}
+            revision = int((ticket or {}).get("result_revision") or 0)
+            if not result or result.get("agent") != agent_id or revision <= int(entry.get("revision_before") or 0):
+                return
+            punkte = ad._world_dod(ad.read_world(self.root))
+            if not punkte:
+                return
+            commit = self._jev_commit(result.get("commit"))  # einmal je Zug, nicht je Punkt der DoD
+            for index, punkt in enumerate(punkte):
+                bezug = {"ticket": ticket["id"], "revision": revision, "dod_punkt": index, "zug": entry["run_id"],
+                         "agent": agent_id,
+                         "dod_sha256": hashlib.sha256(punkt.encode("utf-8")).hexdigest()}
+                zustand = {"dod_punkt": punkt,
+                           "ticket": {"id": ticket["id"], "titel": ticket.get("title") or "",
+                                      "ziel": ticket.get("goal") or ""},
+                           "ergebnis_des_bearbeiters": result.get("text") or "",
+                           "commit": commit}
+                self.jev.einreichen("dod", zustand, bezug)
+        except Exception:  # noqa: BLE001 - der Schatten aendert keinen Zug
+            pass
+
+    def _jev_commit(self, commit: Any) -> Optional[dict[str, Any]]:
+        """Commit der Stelle B mit Nachricht und Dateiliste aus dem Git-Repo des Projekts.
+
+        Jeder Fehler (kein Repo, unbekannter Hash, Frist) liefert nur ``{"hash": commit}``."""
+        if not commit:
+            return None
+        nur_hash = {"hash": commit}
+        try:
+            projekt = ask.world_project(self.root)
+            if not isinstance(commit, str) or not _JEV_COMMIT_HASH.match(commit) or aw.git_ordner(projekt) is None:
+                return nur_hash
+            ende = time.monotonic() + JEV_COMMIT_FRIST_S
+            # Feste Umgebung: keine GIT_*-Variablen des Aufrufers, keine globale Konfig, keine Suche ueber das Projekt.
+            umgebung = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin", "GIT_CONFIG_GLOBAL": "/dev/null",
+                        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CEILING_DIRECTORIES": str(projekt.parent),
+                        "GIT_TERMINAL_PROMPT": "0"}
+
+            def git(*args: str) -> bytes:
+                befehl = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", str(projekt),
+                          *args]
+                lauf = subprocess.run(befehl, capture_output=True, timeout=max(ende - time.monotonic(), 0.01),
+                                      env=umgebung, check=True)
+                return lauf.stdout
+
+            ziel = commit + "^{commit}"
+            nachricht = git("show", "-s", "--format=%B", ziel).decode("utf-8", "replace").rstrip("\n")
+            # Merge-Commits: gegen den ersten Elternteil, sonst liefert diff-tree keine Dateien.
+            dateien = git("diff-tree", "--root", "--diff-merges=first-parent", "--no-commit-id", "--name-only", "-r",
+                          "-z", ziel)
+            liste = [name.decode("utf-8", "replace") for name in dateien.split(b"\0") if name]
+            ergebnis = {"hash": commit, "nachricht": nachricht[:JEV_COMMIT_NACHRICHT],
+                        "dateien": liste[:JEV_COMMIT_DATEIEN]}
+            if len(nachricht) > JEV_COMMIT_NACHRICHT:
+                ergebnis["nachricht_gekuerzt"] = True
+            if len(liste) > JEV_COMMIT_DATEIEN:
+                ergebnis.update(dateien_gekuerzt=True, dateien_gesamt=len(liste))
+            return ergebnis
+        except Exception:  # noqa: BLE001 - der Schatten aendert keinen Zug, der Hash bleibt
+            return nur_hash
+
+    def _jev_freigabe(self, agent_id: str, data: dict[str, Any], postfach_id: str, art: str) -> None:
+        """Stelle A: Nachricht eines Agenten an den Hauptagenten, beim Bau des Postens."""
+        try:
+            sender = data.get("sender")
+            bezug = {"nachricht": postfach_id, "absender": sender, "empfaenger": agent_id,
+                     "ticket": data.get("ticket"), "art": art}
+            if not sender or sender in {ad.WORLD_HUMAN} | ad.ORCHESTRATOR_ACTORS or self.jev.bekannt("freigabe", bezug):
+                return
+            # Der Postenbau laeuft in jedem Durchgang: die Weltdatei nur lesen, wenn sie sich geaendert hat.
+            stempel = ad.world_file(self.root).stat().st_mtime_ns
+            if self._jev_welt[0] != stempel:
+                self._jev_welt = (stempel, ad.read_world(self.root))
+            world = self._jev_welt[1]
+            if world.get("hauptagent") != agent_id:
+                return
+            try:
+                absender = ad.read_agent(self.root, sender)
+            except (ad.AgentsError, OSError):
+                return  # kein Agent der Welt (Mensch, Operator): keine Stelle A
+            ticket = None
+            if data.get("ticket"):
+                with contextlib.suppress(ad.AgentsError, OSError):
+                    t = ad.read_ticket(self.root, data["ticket"])
+                    ticket = {"id": t["id"], "titel": t.get("title") or "", "ziel": t.get("goal") or ""}
+            rechte = "Werkzeuge %s" % (", ".join(absender.get("tools") or []) or "keine")
+            if absender.get("bash"):
+                rechte += "; Bash-Muster %s" % ", ".join(str(m) for m in absender["bash"])
+            teamleiter = next((a["id"] for a in ad.list_agents(self.root)
+                               if a.get("stage") == "teamleiter" and a.get("team") == absender.get("team")
+                               and absender.get("team")), None)
+            zustand = {"welt": world.get("name") or world.get("id"), "hauptagent": agent_id,
+                       "teamleiter_werkstatt": teamleiter,
+                       "absender": {"id": sender, "stufe": str(absender.get("stage") or "?").capitalize(),
+                                    "team": absender.get("team"), "spezialgebiet": absender.get("specialty")},
+                       "ticket": ticket, "rechte_des_absenders": rechte,
+                       "nachricht_an_den_hauptagenten": data.get("text") or ""}
+            self.jev.einreichen("freigabe", zustand, bezug)
+        except Exception:  # noqa: BLE001 - der Postenbau haengt nie am Schatten
+            pass
 
     def _gedaechtnis_ueber(self, agent_id: str) -> Optional[dict[str, Any]]:
         try:
@@ -747,6 +996,10 @@ class WeltTraeger:
 
     def _marker(self, art: str, ticket_id: Optional[str] = None, nachricht_id: Optional[str] = None,
                 frage_id: Optional[str] = None, agent_id: Optional[str] = None) -> str:
+        if art == "pruefung" and ticket_id:
+            # Eine Pruefung gilt je Revision: das Marker hängt an result_revision, nicht am Zugfortschritt.
+            ticket = ad.read_ticket(self.root, ticket_id)
+            return "pruefung:%s:%d" % (ticket_id, int(ticket.get("result_revision") or 0))
         if ticket_id:
             ticket = ad.read_ticket(self.root, ticket_id)
             return "%s:%d" % (ticket_id, int(ticket.get("result_revision") or 0))
@@ -760,10 +1013,28 @@ class WeltTraeger:
 
     # Ein Durchgang ---------------------------------------------------------------
     def einmal(self) -> dict[str, Any]:
-        summary: dict[str, Any] = {"gestartet": [], "beendet": [], "aktiv": [], "wartend": [], "ungeklaert": []}
+        summary: dict[str, Any] = {"gestartet": [], "beendet": [], "aktiv": [], "wartend": [],
+                                   "ungeklaert": [], "uebergangen": [], "geweckt": [], "grenzen": [],
+                                   "zyklus": None}
         world = ad.read_world(self.root)
         world_id = world["id"]
+        try:
+            summary["geweckt"] = ad.wake_parked_tickets(self.root, self._now())
+        except (ad.AgentsError, OSError):
+            summary["geweckt"] = []
         self._laeufe_pruefen(world_id, summary)
+        try:
+            # Zyklusschluss (Satz 46) vor der Grenzpruefung: der neue Zyklus traegt frische Grenzen.
+            summary["zyklus"] = ad.cycle_schluss(self.root, self._now())
+        except (ad.AgentsError, OSError):
+            summary["zyklus"] = None
+        try:
+            # Fristpruefung und Rundenzaehler (Saetze 6 und 31): gehobene Grenzen heben auf "braucht dich".
+            laufend = {entry["ticket_id"] for entry in self._zuege_lesen()["runs"].values()
+                       if entry.get("outcome") is None and entry.get("ticket_id")}
+            summary["grenzen"] = ad.enforce_ticket_limits(self.root, self._now(), laufend)
+        except (ad.AgentsError, OSError):
+            summary["grenzen"] = []
         self._zugaenge_aufraeumen()
         busy = {entry["agent"] for entry in self._zuege_lesen()["runs"].values() if entry.get("outcome") is None}
         runs = self.runs()
@@ -775,6 +1046,20 @@ class WeltTraeger:
                 if self._zustellung(world, agent, posten, runs, summary, freigabe_cache):
                     break
         return summary
+
+    def _ticket_verzoegert(self, ticket_id: str) -> Optional[str]:
+        """Grund, warum ein Ticketposten uebergangen wird; die Pausenfaelle bleiben dem Weckervertrag ueber."""
+        try:
+            order = ad.ready_tickets(self.root)
+        except (ad.AgentsError, OSError):
+            return None
+        entry = next((item for item in order if item.get("id") == ticket_id), None)
+        if entry is None or entry.get("ready"):
+            return None
+        reason = entry.get("reason") or "?"
+        if reason in {"welt pausiert", "agent pausiert"}:
+            return None
+        return reason
 
     def _zustellung(self, world: dict[str, Any], agent: dict[str, Any], posten: Posten, runs: RunController,
                     summary: dict[str, Any], freigabe_cache: dict[str, Startfreigabe]) -> bool:
@@ -822,6 +1107,11 @@ class WeltTraeger:
         if active is not None and active.observed_state in {"unclear", "unknown"}:
             summary["wartend"].append(dict(info, reason="ungeklaerter_lauf", run=active.run_id))
             return True
+        if posten.art == "ticket" and posten.ticket_id:
+            verzoegert = self._ticket_verzoegert(posten.ticket_id)
+            if verzoegert:
+                summary["uebergangen"].append(dict(info, ticket=posten.ticket_id, grund=verzoegert))
+                return False
         model = None
         wahl = None
         if posten.art != "aufwachen":
@@ -965,6 +1255,18 @@ class WeltTraeger:
             return warten("belegt", self._now() + BELEGT_ABSTAND_S, {"base_url": str((self.konfig.pi or {}).get("base_url"))},
                           {"modell": (fallback or {}).get("model_profile", {}).get("model"),
                            "grund": fallback_fehlt or "fallback_nicht_bereit"})
+        if harness == "codex" and self.konfig.codex:
+            # Ohne Codex-Eintrag schlaeft der Agent nicht als "anmeldung": der Zugstart endet unten mit einem
+            # sichtbaren Startfehler, der den fehlenden Eintrag nennt.
+            auth = CodexAnmeldung(self.konfig.codex["auth"]).status()
+            if not auth["available"]:
+                return warten("anmeldung", self._now() + RECHECK_S, {"anmeldung": auth.get("reason")},
+                              {"modell": (fallback or {}).get("model_profile", {}).get("model"), "grund": fallback_fehlt})
+            freigabe = self.codex_kontingentquelle.freigabe()
+            if not freigabe.erlaubt:
+                return warten("kontingent", freigabe.naechster_start or self._now() + RECHECK_S,
+                              freigabe.as_dict(),
+                              {"modell": (fallback or {}).get("model_profile", {}).get("model"), "grund": fallback_fehlt})
         if harness == "claude":
             sperre = self._abo_sperre(cache)
             if sperre is not None:
@@ -1015,7 +1317,10 @@ class WeltTraeger:
 
     def _quittierbar(self, posten: Posten, outcome: Optional[str]) -> bool:
         """Postfachnachrichten bleiben offen, solange ihre Bearbeitung noch aussteht."""
-        if posten.art in {"nachricht", "rueckmeldung", "antrag"}:
+        if posten.art in {"nachricht", "rueckmeldung", "antrag", "zyklus-schluss"}:
+            return outcome in {"erfolg", "bereits_erledigt"}
+        if posten.art == "pruefung":
+            # Ein unterbrochener oder fehlgeschlagener Pruefzug bleibt zustellbar; erst die Notiz quittiert.
             return outcome in {"erfolg", "bereits_erledigt"}
         return posten.art == "ticket"
 
@@ -1030,7 +1335,9 @@ class WeltTraeger:
     def _ohne_lauf_quittieren(self, agent_id: str, posten: Posten, claim_id: str, marker: str, outcome: str) -> None:
         self.wecker.resolve(posten.delivery.delivery_id, claim_id, run_id="kein-lauf", progress_marker=marker,
                             outcome=outcome)
-        if self._quittierbar(posten, outcome) or posten.art == "ticket":
+        if self._quittierbar(posten, outcome) or posten.art in {"ticket", "pruefung"}:
+            # Ticket- und Pruefposten, die ohne Zug veraltet sind, werden quittiert; die Datenlage
+            # entscheidet neu (Abnahme, Ruckgabe, fortgesetzte Pruefung mit neuer Zustellung).
             self._quittieren(agent_id, posten.postfach_id)
         if posten.art in {"nachricht", "rueckmeldung", "antrag"} and outcome == "bereits_erledigt" and posten.nachricht_id:
             self._quittieren(agent_id, posten.nachricht_id)
@@ -1049,12 +1356,14 @@ class WeltTraeger:
                    for path in chats.glob("*/%s.json" % reply_id)) if chats.is_dir() else False
 
     def _antrag_belegt(self, frage_id: Optional[str]) -> bool:
+        """Ein Antrag ist erledigt, sobald er nicht mehr offen ist; ein abgelaufener Rechteantrag ebenso."""
         if not frage_id:
             return False
         try:
-            return ad.read_question(self.root, frage_id).get("state") != "offen"
+            frage = ad.read_question(self.root, frage_id)
         except ad.AgentsError:
             return False
+        return frage.get("state") != "offen" or ad.rights_request_expired(frage)
 
     def _prompt(self, world: dict[str, Any], agent: dict[str, Any], posten: Posten, resume: bool,
                 ticket: Optional[dict[str, Any]], nachricht: Optional[dict[str, Any]],
@@ -1079,6 +1388,17 @@ class WeltTraeger:
                 "Goal: %s" % ticket["goal"],
                 "Done when: %s" % ticket["done_criterion"],
             ]
+            punkte = ticket.get("done_items") or []
+            if punkte:
+                lines.append("Done list (the result waits until every point is ticked, exactly in this order):")
+                lines += ["  [%s] %s" % ("x" if item.get("done") else " ", item.get("text")) for item in punkte]
+            dod = [item for item in (world.get("definition_of_done") or []) if isinstance(item, str) and item.strip()]
+            if dod:
+                lines.append("Definition of Done dieser Welt (the approver checks it at the end):")
+                lines += ["- %s" % item for item in dod]
+            hinweise = self._ticket_hinweise(ticket, posten, resume)
+            if hinweise:
+                lines += hinweise
             if "ergebnis-schreiben" in skill:
                 # Ein Skill ersetzt die Erklaerung im Prompt (Plan Abschnitt 14).
                 lines += [
@@ -1095,6 +1415,41 @@ class WeltTraeger:
                     "<<<", "printf '%%s' '%s' | /usr/bin/python3 %s ticket.result" % (payload, rpc), ">>>",
                     "Then reply with a one-line summary.",
                 ]
+            if "zwischenstand-schreiben" in skill:
+                lines += [
+                    "Every turn on this ticket ends with a history entry. If the result is not due yet (work "
+                    "continues, or you are waiting on something), leave a progress note with your skill "
+                    "zwischenstand-schreiben (instructions in %s/SKILL.md):" % skill["zwischenstand-schreiben"]["pfad"],
+                    "<<<", "%s/scripts/zwischenstand-schreiben.py --ticket %s --text \"PROGRESS\"" % (
+                        skill["zwischenstand-schreiben"]["pfad"], ticket["id"]), ">>>",
+                ]
+            else:
+                note_payload = json.dumps({"ticket_id": ticket["id"], "text": "PROGRESS"})
+                lines += [
+                    "Every turn on this ticket ends with a history entry. If the result is not due yet (work "
+                    "continues, or you are waiting on something), leave a progress note before ending the turn by "
+                    "running the command between the markers with the Bash tool, replacing PROGRESS with a short "
+                    "plain-text note without quotes or backslashes:",
+                    "<<<", "printf '%%s' '%s' | /usr/bin/python3 %s ticket.note" % (note_payload, rpc), ">>>",
+                ]
+        elif nachricht is not None and posten.art == "antrag" and posten.frage_id \
+                and ad.read_question(self.root, posten.frage_id).get("kind") == ad.RIGHTS_REQUEST_KIND:
+            antrag = ad.read_question(self.root, posten.frage_id)
+            payload = json.dumps({"request_id": antrag["id"], "accept": True, "note": "NOTE"})
+            lines += [
+                "The agent %s requests a change of its own rights (request %s, open until %s):" % (
+                    antrag.get("agent"), antrag["id"], antrag.get("laeuft_ab")),
+                "---", str(antrag.get("text")),
+                "Requested change: %s" % json.dumps(antrag.get("changes"), ensure_ascii=False),
+                "Rights when requested: %s" % json.dumps(antrag.get("vorher"), ensure_ascii=False),
+                "Reason: %s" % antrag.get("grund"), "---",
+                "Decide exactly once by running the command between the markers with the Bash tool. Keep "
+                "\"accept\": true to grant exactly the requested change or set it to false to decline; replace NOTE "
+                "with a short reason without quotes or backslashes. You cannot change the requested rights; for a "
+                "different change decline and say what you would grant:",
+                "<<<", "printf '%%s' '%s' | /usr/bin/python3 %s agent.rechte_entscheiden" % (payload, rpc), ">>>",
+                "The agent is informed automatically. Then reply with a one-line summary.",
+            ]
         elif nachricht is not None and posten.art == "antrag" and posten.frage_id:
             antrag = ad.read_question(self.root, posten.frage_id)
             payload = json.dumps({"request_id": antrag["id"], "accept": True, "note": "NOTE"})
@@ -1106,6 +1461,13 @@ class WeltTraeger:
                 "without quotes or backslashes:",
                 "<<<", "printf '%%s' '%s' | /usr/bin/python3 %s agent.decide" % (payload, rpc), ">>>",
                 "The team leader is informed automatically. Then reply with a one-line summary.",
+            ]
+        elif nachricht is not None and posten.art == "zyklus-schluss":
+            lines += [
+                "The cycle of this world has closed. The carrier reports:",
+                "---", str(nachricht.get("text")), "---",
+                "Write your retrospective as the learning step at the end of this turn: what stuck, what changes "
+                "(one short sentence, kind lehre). No answer in the channel is required. Reply with a one-line summary.",
             ]
         elif nachricht is not None and posten.art == "rueckmeldung":
             lines += [
@@ -1170,6 +1532,180 @@ class WeltTraeger:
             lines.append("End the turn with your learning step as described in your instructions: write "
                          "%s/%s (art nichts if you learned nothing)." % (run_dir, ask.LEARN_FILE))
         return "\n".join(lines)
+
+    def _pruef_prompt(self, world: dict[str, Any], agent: dict[str, Any], ticket: Optional[dict[str, Any]],
+                      run_dir: Path, rpc: Path, baum: Optional[aw.Arbeitsbaum],
+                      baum_fehler: Optional[str], skills: list[dict[str, Any]]) -> str:
+        """Prompt des Pruefzuges (Plan Saetze 25, 26): Ergebnis, Commit, Fertig-Liste, DoD, Diff lesen,
+        nichts schreiben, Pruefnotiz genau einmal per RPC `ticket.review_result`."""
+        skill = {item["name"]: item for item in skills or []}
+        lines = [
+            'You are the agent "%s" (%s) in the Werkbench world "%s" acting as the reviewer of one ticket.' % (
+                agent["id"], agent["stage"], world["name"]),
+            "Work only inside the review workspace; write nothing anywhere.",
+        ]
+        review = (ticket or {}).get("review") or {}
+        if ticket is not None:
+            lines += [
+                "Ticket %s: %s" % (ticket["id"], ticket["title"]),
+                "Goal: %s" % ticket["goal"],
+                "Done when: %s" % ticket["done_criterion"],
+            ]
+            punkte = ticket.get("done_items") or []
+            if punkte:
+                lines.append("Done list:")
+                lines += ["  [%s] %s" % ("x" if item.get("done") else " ", item.get("text")) for item in punkte]
+            dod = [item for item in (world.get("definition_of_done") or []) if isinstance(item, str) and item.strip()]
+            if dod:
+                lines.append("Definition of Done dieser Welt (the approver checks it):")
+                lines += ["- %s" % item for item in dod]
+            result = ticket.get("result") or {}
+            lines += ["Result under review (revision %s):" % review.get("revision"),
+                      "---", str(result.get("text") or "(kein Ergebnistext)"), "---"]
+            commit = result.get("commit")
+            if baum is not None:
+                lines.append("The change lives in the worktree of the assignee at `%s` (branch %s); this turn's "
+                             "git is pointed at that revision (GIT_DIR), so plain `git show %s` reads the diff "
+                             "from your workspace. Only git show, git diff and git log are allowed."
+                             % (baum.pfad, baum.zweig, commit or "<commit aus dem Ergebnis>"))
+                if commit:
+                    lines.append("Reviewed commit: %s" % commit)
+            elif baum_fehler:
+                lines.append("The worktree of the assignee is not available in this turn (%s); review the result "
+                             "text against the goal." % baum_fehler)
+            elif commit:
+                lines.append("Reviewed commit: %s (not bound as a worktree in this turn); review the result text "
+                             "and the described change against the goal." % commit)
+            else:
+                lines.append("No commit was named; review the result text against the goal and the done list.")
+        payload = json.dumps({"ticket_id": ticket["id"], "text": "NOTE", "verdict": "VERDICT"})
+        lines += [
+            "Your review must not change anything: your tool list has no write tools, and the git metadata of the "
+            "reviewed worktree is read-only. Do not commit, do not rebase, do not edit files.",
+            "Check the change against the goal, the done list and the Definition of Done of the world.",
+            "Submit your review note exactly once by running the command between the markers with the Bash tool, "
+            "replacing NOTE with your short plain-text review without quotes or backslashes and VERDICT with "
+            "`bestanden` (passes) or `maengel` (defects found):",
+            "<<<", "printf '%%s' '%s' | /usr/bin/python3 %s ticket.review_result" % (payload, rpc), ">>>",
+            "Then reply with a one-line summary.",
+        ]
+        if any(item.get("name") == LERNSKRIPT and item.get("datei") for item in skills):
+            lernen = next(item for item in skills if item.get("name") == LERNSKRIPT and item.get("datei"))
+            lines += ["End the turn with your learning step: run your stored script %s exactly once, replacing "
+                      "LESSON and REASON:" % LERNSKRIPT,
+                      "<<<", "python3 %s --art lehre --text \"LESSON\" --grund \"REASON\"" % lernen["datei"], ">>>"]
+        else:
+            lines.append("End the turn with your learning step as described in your instructions: write "
+                         "%s/%s (art nichts if you learned nothing)." % (run_dir, ask.LEARN_FILE))
+        return "\n".join(lines)
+
+    def _ticket_hinweise(self, ticket: dict[str, Any], posten: Posten, resume: bool) -> list[str]:
+        """Was seit dem letzten Zug am Ticket geschah (Plan AGENTS-TICKETS-PLAN Satz 14), hoechstens 6000 Zeichen."""
+        blocks: list[str] = []
+        verlauf = self._ticket_verlauf(ticket["id"])
+        rueckgabe = None
+        for entry in reversed(verlauf):
+            if entry.get("event") == "abgenommen":
+                break
+            if entry.get("event") == "zurueckgegeben":
+                actor = entry.get("actor") or {}
+                note = entry.get("note")
+                if note:
+                    rueckgabe = "Returned by %s: %s" % (actor.get("id") or "?", note)
+                break
+        if rueckgabe:
+            blocks.append(rueckgabe)
+        review = ticket.get("review") or {}
+        if review.get("note"):
+            blocks.append("Review note by %s (%s):\n%s" % (review.get("reviewer") or "?",
+                                                           review.get("verdict") or "?", review["note"]))
+        if (resume or posten.art == "fortsetzen") and isinstance(ticket.get("result"), dict) \
+                and str(ticket["result"].get("text") or "").strip():
+            blocks.append("Stored result from the previous revision:\n%s" % ticket["result"]["text"])
+        zwischen = [entry for entry in verlauf if entry.get("event") == "zwischenstand"]
+        letzter = self._letzter_zwischenstand_aus(verlauf)
+        if letzter:
+            block = "Last progress note:\n%s" % letzter
+            if len(zwischen) > 1:
+                block += "\n(%d ältere Zwischenstände im Verlauf)" % (len(zwischen) - 1)
+            blocks.append(block)
+        for zeile in self._limits_zeilen(ticket.get("limits") or {}):
+            blocks.append(zeile)
+        abhaengigkeiten = []
+        for dep in ticket.get("dependencies") or []:
+            try:
+                stand = ad.read_ticket(self.root, dep).get("state")
+            except (ad.AgentsError, OSError):
+                stand = "unbekannt"
+            abhaengigkeiten.append("Depends on %s (%s)" % (dep, stand))
+        if abhaengigkeiten:
+            blocks.append("\n".join(abhaengigkeiten))
+        meldungen = self._ticket_nachrichten(ticket["id"], verlauf)
+        zeilen = ["From %s at %s: %s" % (m.get("sender") or "?", m.get("time") or "?",
+                                         str(m.get("text") or "").replace("\n", " ")) for m in meldungen]
+        ausgelassen = 0
+        hinweis = None
+        while zeilen:
+            parts = blocks + ([hinweis] if hinweis else []) + zeilen
+            if len("\n".join(parts)) <= 6000:
+                break
+            zeilen.pop(0)
+            ausgelassen += 1
+            hinweis = "(%d ältere Nachrichten ausgelassen)" % ausgelassen
+        if hinweis:
+            blocks.append(hinweis)
+        blocks.extend(zeilen)
+        text = "\n".join(blocks)
+        if len(text) > 6000:
+            text = text[:6000]
+        return text.split("\n")
+
+    def _ticket_verlauf(self, ticket_id: str) -> list[dict[str, Any]]:
+        try:
+            return ad._read_jsonl(ad._ticket_path(self.root, ticket_id) / "verlauf.jsonl", "Ticketverlauf")
+        except (ad.AgentsError, OSError):
+            return []
+
+    def _letzter_zwischenstand_aus(self, verlauf: list[dict[str, Any]]) -> Optional[str]:
+        for entry in reversed(verlauf):
+            if entry.get("event") != "zwischenstand":
+                continue
+            text = entry.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+            rest = {key: value for key, value in entry.items()
+                    if key not in {"id", "time", "event", "actor"}}
+            return json.dumps(rest, ensure_ascii=False, sort_keys=True) if rest else None
+        return None
+
+    def _ticket_nachrichten(self, ticket_id: str,
+                            verlauf: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        verlauf = self._ticket_verlauf(ticket_id) if verlauf is None else verlauf
+        letzter_zug = next((entry.get("time") for entry in reversed(verlauf)
+                            if entry.get("event") == "zug"), None)
+        try:
+            meldungen = [m for m in ad.read_messages(self.root) if m.get("ticket") == ticket_id]
+        except (ad.AgentsError, OSError):
+            return []
+        if letzter_zug:
+            meldungen = [m for m in meldungen if str(m.get("time") or "") >= letzter_zug]
+        return meldungen
+
+    def _limits_zeilen(self, limits: dict[str, Any]) -> list[str]:
+        zeilen: list[str] = []
+        for key in sorted(limits, key=str):
+            value = limits[key]
+            if key == "rueckweg":
+                continue
+            if key == "frist":
+                zeilen.append("Limit Frist: %s" % value)
+            elif key == "runden":
+                zeilen.append("Limit Rundenzahl: höchstens %s" % value)
+            elif key == "daten" and value in (True, "maschine"):
+                zeilen.append("Daten bleiben auf der Maschine")
+            else:
+                zeilen.append("Limit %s: %s" % (key, value))
+        return zeilen
 
     def _anweisung(self, world: dict[str, Any], agent: dict[str, Any], run_dir: Path,
                    verzeichnis: Optional[dict[str, Any]], skills_fehler: Optional[str],
@@ -1266,7 +1802,7 @@ class WeltTraeger:
                       "nichts." % freigaben_fehler]
         if agent["stage"] == "hauptagent":
             draft = {"id": "NAME", "stage": "mitglied", "team": "TEAM", "specialty": "Ein Satz zur Aufgabe",
-                     "model": "sonnet5:high", "tools": ["Read", "Grep", "Glob", "Write", "Edit"], "bash": [],
+                     "model": "sonnet:high", "tools": ["Read", "Grep", "Glob", "Write", "Edit"], "bash": [],
                      "skills": []}
             rechte = {"agent_id": "NAME", "tools": ["Read", "Grep", "Glob", "Write", "Edit"], "bash": ["pytest *"],
                       "skills": ["texte-schreiben"], "web": True}
@@ -1284,7 +1820,9 @@ class WeltTraeger:
                       "false gibt oder nimmt WebFetch und WebSearch. Web gibt es nur mit einem Zugang der Art web, "
                       "`ssh`/`scp`/`rsync`-Muster nur für eingerichtete ssh-Zugänge der Welt; sonst nennt die Antwort "
                       "den Grund. Die Änderung gilt ab dem nächsten Zug des Agenten, steht in seinem Verlauf, und der "
-                      "Mensch erfährt sie als markiertes Ergebnis. Teamleiter beantragen Rechte bei dir." % (
+                      "Mensch erfährt sie als markiertes Ergebnis. Rechteanträge der Agenten deiner Welt kommen als "
+                      "eigener Posten; du entscheidest sie mit `agent.rechte_entscheiden` (`request_id`, `accept`, "
+                      "`note`) und gibst dabei genau die beantragte Änderung frei oder lehnst ab." % (
                           rpc, json.dumps(rechte, ensure_ascii=False), ", ".join(ad.AGENT_TOOLS))]
             # Beispieladresse und gesperrte Adressen aus den Mailkonten des Hosts (mailkonten.json), nie aus dem Code.
             weitergabe = {"agent_id": "NAME", "art": "email",
@@ -1313,6 +1851,20 @@ class WeltTraeger:
                       "Schickt dir ein Agent einen Mailentwurf, den der Umfang des Kontos nicht ohne Rückfrage "
                       "erlaubt, stellst du ihn dem Menschen mit `question.ask` als Frage (Pfad des Entwurfs, "
                       "Empfänger, Absender); gesendet wird erst nach seiner Antwort."]
+        antrag_form = {"changes": {"tools": ["Read", "Grep", "Write"], "bash": ["pytest *"], "skills": ["texte-schreiben"],
+                                   "web": True}, "grund": "Ein Satz, wofür du die Rechte brauchst"}
+        lines += ["", "## Rechte beantragen", "",
+                  "Fehlt dir für deine Aufgabe ein Werkzeug, ein Bash-Muster, ein Skill oder Web, beantragst du die "
+                  "Änderung deiner eigenen Rechte: `/usr/bin/python3 %s agent.rechte_antrag < antrag.json`, Form `%s`. "
+                  "`changes` braucht mindestens ein Feld; die Felder wirken wie beim Setzen (`tools` ersetzt die "
+                  "Werkzeugliste, `bash` ersetzt deine eigenen Muster, `skills` ersetzt die Skills, `web` true oder "
+                  "false), `grund` ist Pflicht. Du beantragst nur deine eigenen Rechte. Der Antrag geht an %s, gilt "
+                  "%d Tage und ändert nichts, bis er entschieden ist; die Entscheidung kommt als Rückmeldung, und "
+                  "neue Rechte gelten ab dem nächsten Zug. Ein unzulässiger oder wirkungsloser Antrag wird sofort "
+                  "mit Grund abgewiesen. Zurückziehen mit `agent.rechte_zurueckziehen` (`request_id`, `note`)." % (
+                      rpc, json.dumps(antrag_form, ensure_ascii=False),
+                      "den Menschen" if agent["stage"] == "hauptagent" else "den Hauptagenten",
+                      ad.RIGHTS_REQUEST_DAYS)]
         lines += ["", "## Zugende", "",
                   "1. Ein Zug endet mit einer Entscheidung: fertig, Weckzeit, Übergabe oder „braucht dich“ über "
                   "den Dienstweg.",
@@ -1326,7 +1878,8 @@ class WeltTraeger:
                   '   - `{"art": "archiv", "zeilen": [1, 2], "neu": ["verdichtete Regel"], "grund": "warum"}` (verschiebt '
                   'die genannten Zeilen aus MEMORY.md nach `lehren.md` im Brain und schreibt MEMORY.md neu; Zeilen nach '
                   'Nummer unter dem Kopf oder mit genauem Text)',
-                  '   - `{"art": "anweisung", "ziel": "AGENTS.md", "diff": "<unified diff, nur ergänzend>", "grund": "warum"}`',
+                  '   - `{"art": "anweisung", "ziel": "AGENTS.md", "diff": "<unified diff, nur ergänzend>", "grund": "warum"}` '
+                  '(nur ein Vorschlag an deinen Prüfer; die Datei ändert sich erst, wenn er ihn übernimmt)',
                   '   - `{"art": "skill", "ziel": "<skillname>", "diff": "<unified diff relativ zum Skill>", "grund": "warum"}`',
                   '   - `{"art": "nichts", "text": "optional"}`, wenn du ausdrücklich nichts gelernt hast.',
                   "   Der Träger prüft und wendet den Lernschritt nach dem Zug an; du änderst diese Dateien nicht selbst."]
@@ -1395,7 +1948,7 @@ class WeltTraeger:
         if brain_im_zug:
             lines.append("Vor der Arbeit: `brain search \"<Thema des Tickets>\" -k 5 --pfad %s/%s` (dein Bereich im "
                          "Brain), dann `--pfad %s/%s` (Projekt) und ohne `--pfad` (ganzes Brain, auch die Welt). Das "
-                         "Brain `%s` ist im Zug nur lesbar (Read, Grep, Glob gehen auch); `90-secrets/` bleibt gesperrt. "
+                         "Brain `%s` ist im Zug nur lesbar (Read, Grep, Glob gehen auch); `secrets/` bleibt gesperrt. "
                          "Geht `brain` nicht, liefert der Dienstweg dasselbe: %s (`bereich` eigen, welt oder alles)."
                          % (vault, eigen, vault, welt, vault, suche))
         else:
@@ -1417,6 +1970,7 @@ class WeltTraeger:
                  model: str, marker: str, wahl: Optional[dict[str, Any]] = None) -> Optional[str]:
         agent_id = agent["id"]
         ticket = nachricht = frage = None
+        pruefung = posten.art == "pruefung"
         if posten.art in {"ticket", "fortsetzen"} and posten.ticket_id:
             ticket = ad.read_ticket(self.root, posten.ticket_id)
             open_states = {"offen", "zurückgegeben"} if posten.art == "ticket" else set()
@@ -1430,6 +1984,13 @@ class WeltTraeger:
                 except ad.AgentsError:
                     self._ohne_lauf_quittieren(agent_id, posten, claim_id, marker, "uebernahme_abgewiesen")
                     return None
+        elif pruefung and posten.ticket_id:
+            # Ein Pruefzug beansprucht nichts: das Ticket bleibt in der Hand des Bearbeiters.
+            ticket = ad.read_ticket(self.root, posten.ticket_id)
+            review = ticket.get("review") or {}
+            if ticket.get("state") != "in Prüfung" or review.get("reviewer") != agent_id:
+                self._ohne_lauf_quittieren(agent_id, posten, claim_id, marker, "pruefung_nicht_aktiv")
+                return None
         elif posten.nachricht_id:
             path = ad._agent_dir(self.root, agent_id) / "postfach" / (posten.nachricht_id + ".json")
             nachricht = ad._read_json(path) if path.is_file() else None
@@ -1453,12 +2014,30 @@ class WeltTraeger:
         run_id = "zug-" + uuid.uuid4().hex[:20]
         workspace, agent_state = self.arbeitsorte(agent_id)
         # Mit git-Projekt ist der eigene Worktree (im privaten Arbeitsordner) das Arbeitsverzeichnis des Zuges.
-        baum, baum_fehler = self.arbeitsbaum(agent_id, workspace)
+        baum, baum_fehler = self.arbeitsbaum(agent_id, workspace, sperren_raeumen=True)
+        # Der Pruefzug (tickets2) liest die Revision des Bearbeiters ueber GIT_DIR: sein Arbeitsverzeichnis
+        # bleibt sein eigener privater Ordner, die git-Verwaltung des geprüften Worktrees ist nur lesend
+        # eingebunden (kein commit, kein rebase), und die Profil-Sperre kennt den geprüften Worktree nicht
+        # als Schreib- oder Lesewurzel.
+        baum_pruefung, pruef_gitdir = None, None
+        if pruefung:
+            baum, baum_fehler = None, None
+            bearbeiter = ticket.get("assignee") if ticket is not None else None
+            if isinstance(bearbeiter, str) and ad.ID_RE.fullmatch(bearbeiter or ""):
+                arbeit_bearbeiter, _zustand_bearbeiter = self.arbeitsorte(bearbeiter)
+                baum_pruefung, baum_fehler = self.arbeitsbaum(bearbeiter, arbeit_bearbeiter)
+                if baum_pruefung is not None:
+                    pruef_gitdir = aw.verwaltung(baum_pruefung.gitdir, baum_pruefung.pfad)
         cwd = baum.pfad if baum is not None else workspace
         # Der Zugordner traegt die Laufkennung: der Lernschritt ist je Zug eindeutig.
         run_dir = agent_state / run_id
         config_dir = run_dir / "claude-config"
-        session_key = posten.ticket_id or (GEDAECHTNIS_SITZUNG if posten.art == "gedaechtnis" else NACHRICHTEN_SITZUNG)
+        if pruefung and posten.ticket_id:
+            # Frischer Pruefkontext: je Revision eine eigene Sitzung, Fortsetzung nur nach Absturz derselben Revision.
+            revision = int((ticket or {}).get("result_revision") or 0)
+            session_key = "pruefung:%s:%d" % (posten.ticket_id, revision)
+        else:
+            session_key = posten.ticket_id or (GEDAECHTNIS_SITZUNG if posten.art == "gedaechtnis" else NACHRICHTEN_SITZUNG)
         session = (self._zuege_lesen()["sessions"].get(agent_id) or {}).get(session_key) or {}
         harness = self.harness(agent)
         # Claude setzt aus einer gesicherten Uebergabe fort, Pi ueber dieselbe Sitzungskennung im Sitzungsordner.
@@ -1478,14 +2057,26 @@ class WeltTraeger:
                                         "modell": (agent.get("model_profile") or {}).get("model"), "harness": harness,
                                         "fallback": False, "grund": None},
                  "config_dir": str(config_dir), "run_dir": str(run_dir), "workspace": str(cwd),
-                 "worktree": str(baum.pfad) if baum is not None else None, "worktree_fehler": baum_fehler,
+                 "worktree": str(baum_pruefung.pfad) if baum_pruefung is not None else (
+                     str(baum.pfad) if baum is not None else None),
+                 "worktree_fehler": baum_fehler,
+                 "worktree_geraeumt": list(baum.geraeumt) if baum is not None and baum.geraeumt else [],
                  "marker_before": marker,
+                 "verlauf_before": len(self._ticket_verlauf(posten.ticket_id)) if posten.ticket_id else 0,
                  "revision_before": int((ticket or {}).get("result_revision") or 0), "started_at": self._now(),
                  "outcome": None}
         with self._zuege() as state:
             state["runs"][run_id] = entry
         try:
             if harness == "codex":
+                grenze = _codex_profilgrenze(agent, self.orte.runtime / "hooks") if self.konfig.sperren else None
+                if grenze:
+                    # Ohne die Hooks der Codex-Sperre gaelte die Profilgrenze still nicht.
+                    self._nachbereiten(world["id"], entry, "profilgrenze",
+                                       "Codex-Sperre nicht bereit: %s; kein Zug gestartet" % grenze, marker)
+                    return None
+                if not self.konfig.codex:
+                    raise TraegerFehler(CODEX_FEHLT)
                 # Anmeldeweg vor jedem Aufbau: ohne Codex-Anmeldung endet der Zug mit `anmeldung`, ohne Start.
                 auth = (self.konfig.codex or {}).get("auth") or str(Path.home() / CODEX_AUTH_VORGABE)
                 anmeldung = CodexAnmeldung(auth).status()
@@ -1504,8 +2095,9 @@ class WeltTraeger:
             turn_dir = _private_dir(self.orte.turns / run_id, "Zugordner des Laufs")
             rpc = self._rpc_bereitstellen(run_dir)
             zugang, zugang_fehler = None, None
-            if harness == "claude" and self.konfig.sperren:
+            if harness == "claude" and self.konfig.sperren and not pruefung:
                 # Zugaenge nur mit Profil-Sperre: ohne sie gaebe es keine Grenze zwischen Agent und Schluessel.
+                # Ein Pruefzug bekommt keine Zugaenge und kein Netz.
                 try:
                     zugang = az.bereitstellen(self.root, turn_dir, werkzeuge=self.orte.runtime)
                 except (ad.AgentsError, OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -1516,9 +2108,12 @@ class WeltTraeger:
             anweisung = turn_dir / "ANWEISUNG.md"
             atomar_schreiben.schreiben(anweisung, self._anweisung(world, agent, run_dir, verzeichnis, skills_fehler,
                                                                   zugang, zugang_fehler, projekt=projekt,
-                                                                  projekt_arbeit=projekt_arbeit, baum=baum,
-                                                                  baum_fehler=baum_fehler, arbeitsordner=workspace,
-                                                                  brain_im_zug=harness == "claude" and self.konfig.sperren),
+                                                                  projekt_arbeit=None if pruefung else projekt_arbeit,
+                                                                  baum=None if pruefung else baum,
+                                                                  baum_fehler=None if pruefung else baum_fehler,
+                                                                  arbeitsordner=workspace,
+                                                                  brain_im_zug=harness == "claude" and self.konfig.sperren
+                                                                  and not pruefung),
                                        modus=0o600, dauerhaft=True)
             agent_dir = ad._agent_dir(self.root, agent_id)
             libraries = [Path(str((verzeichnis or {}).get(key) or "")) for key in ("bibliothek", "skript_bibliothek")]
@@ -1530,16 +2125,42 @@ class WeltTraeger:
                 (zugang.weltdatei,) if zugang is not None else ()) + ((projekt,) if projekt is not None else ()) + (
                 self._freigaben_lesepfad())
             # Mit Worktree ist er Arbeitsverzeichnis und Schreibpfad des Laufs; der private Arbeitsordner darum
-            # bleibt beschreibbar. Das Projekt-Repo bindet der Launcher ueber git_einbindung.
-            write_paths = ((projekt_arbeit,) if projekt_arbeit is not None else ()) + (
-                (workspace,) if baum is not None else ())
+            # bleibt beschreibbar. Das Projekt-Repo bindet der Launcher ueber git_einbindung. Ein Pruefzug
+            # schreibt nirgends: keine Schreibpfade, die git-Verwaltung des geprüften Worktrees nur lesend.
+            write_paths = () if pruefung else (
+                ((projekt_arbeit,) if projekt_arbeit is not None else ()) + ((workspace,) if baum is not None else ()))
             # Brain (16.09.2026): Vault nur lesbar, Geheimordner verdeckt; nur mit Profil-Sperre (sie sperrt beide
             # Geheimordner auch fuer Werkzeuge) und nur fuer den Claude-Harness mit Huelle und Einstellungen.
-            brain = ab.einbindung(self._brain_vault()) if harness == "claude" and self.konfig.sperren else None
+            brain = None if pruefung else (
+                ab.einbindung(self._brain_vault()) if harness == "claude" and self.konfig.sperren else None)
             if brain is not None:
                 read_paths += brain["lese_pfade"]
             env = self._zugumgebung(agent_id, workspace, run_dir, rpc, verzeichnis is not None)
-            prompt = self._prompt(world, agent, posten, resume, ticket, nachricht, frage, run_dir, skills)
+            # Erst nach der Bindungspruefung: ein Zug ohne WB_AGENT_ID/WB_WELT meldet das, gleich ob die
+            # Binary da ist. Aufgeloest wird erst jetzt, damit `latest` auf die aktuelle Version zeigt.
+            claude_binary = codex_binary = None
+            if harness == "claude":
+                claude_binary = os.path.realpath(self.konfig.claude_binary)
+                if not os.path.isabs(claude_binary) or not os.access(claude_binary, os.X_OK):
+                    raise TraegerFehler("Claude-Code-Binary fehlt oder ist nicht ausfuehrbar: %s" % claude_binary)
+            if harness == "codex":
+                codex_binary = os.path.realpath(self.konfig.codex["cli"])
+                if Path(codex_binary).name == "mise" and Path(self.konfig.codex["cli"]).name == "codex":
+                    found = subprocess.run([codex_binary, "which", "codex"], capture_output=True, text=True,
+                                           timeout=10, check=False)
+                    codex_binary = os.path.realpath(found.stdout.strip()) if found.returncode == 0 else ""
+                if not os.path.isabs(codex_binary) or not os.access(codex_binary, os.X_OK):
+                    raise TraegerFehler("Codex-CLI fehlt oder ist nicht ausfuehrbar: %s" % codex_binary)
+            # Git im Zug, gleich welcher Harness (Identitaet des Menschen, Hooks aus, keine Signatur). Der
+            # Pruefzug bekommt nur GIT_DIR auf die geprüfte Revision, deren Verwaltung nur lesend eingebunden
+            # ist. Claude bekommt die Umgebung in seiner Einstellungsdatei, Pi und Codex als `extra_env`.
+            if pruefung:
+                git = {"GIT_DIR": str(pruef_gitdir)} if pruef_gitdir is not None else None
+            else:
+                git = baum.git_umgebung() if baum is not None else None
+            zug_env = tuple(env) + tuple(sorted((git or {}).items()))
+            prompt = self._pruef_prompt(world, agent, ticket, run_dir, rpc, baum_pruefung, baum_fehler, skills) \
+                if pruefung else self._prompt(world, agent, posten, resume, ticket, nachricht, frage, run_dir, skills)
             if harness == "pi":
                 effort, stufe = None, {"harness": "pi", "angefragt": (agent.get("model_profile") or {}).get("effort")}
                 spec = self.konfig.pi["modelle"][str((agent.get("model_profile") or {}).get("model"))] or {}
@@ -1548,36 +2169,54 @@ class WeltTraeger:
                             api=str(self.konfig.pi.get("api") or "openai-completions"),
                             context_window=int(spec.get("context_window") or 16384),
                             tools=pi_werkzeuge(agent.get("tools")), thinking=spec.get("thinking"),
-                            append_system_prompt_file=str(anweisung), extra_env=tuple(env))
+                            append_system_prompt_file=str(anweisung), extra_env=zug_env)
             elif harness == "codex":
                 if not self.konfig.codex:
-                    raise TraegerFehler("Codex-CLI ist in der Traegerkonfiguration nicht eingetragen")
+                    raise TraegerFehler(CODEX_FEHLT)
                 name = str((agent.get("model_profile") or {}).get("model") or "").split(":", 1)[0]
                 effort, stufe = self.denkstufe(agent, name, "codex")
-                zug = CodexZug(str(self.konfig.codex["cli"]), model, prompt, session_id, str(agent_state / "codex"),
-                               effort=effort, append_system_prompt_file=str(anweisung), extra_env=tuple(env))
+                zug = CodexZug(codex_binary, model, prompt, session_id, str(agent_state / "codex"),
+                               effort=effort, append_system_prompt_file=str(anweisung), extra_env=zug_env,
+                               web_enabled=(set(ad.WEB_TOOLS) <= set(agent.get("tools") or ())
+                                            and any(item.get("art") == "web" for item in az.lesen(self.root))),
+                               sperre=bool(self.konfig.sperren))
             else:
                 effort, stufe = self.denkstufe(agent, model)
                 settings = None
                 if self.konfig.sperren:
+                    # Ohne Profil-Sperre gibt es keine Einstellungsdatei; ein Claude-Zug hat dann auch keine
+                    # Git-Umgebung (`extra_env` von ClaudeZug kennt nur die Zugumgebung).
                     settings = turn_dir / "settings.json"
-                    git = baum.git_umgebung(agent_id) if baum is not None else None
                     atomar_schreiben.schreiben(settings, json.dumps(self._sperr_einstellungen(zugang, git, brain),
                                                                     indent=2) + "\n", modus=0o600, dauerhaft=True)
                 tools = tuple(t for t in agent.get("tools") or [] if t in ALLOWED_TOOLS) or self.konfig.tools
-                zug = ClaudeZug(self.konfig.claude_binary, model, prompt, session_id, str(config_dir), resume, tools,
+                if pruefung:
+                    # Der Pruefzug bekommt die Schreibwerkzeuge nie angeboten (harte Werkzeugliste des Harness).
+                    tools = tuple(t for t in PRUEF_WERKZEUGE if t in ALLOWED_TOOLS)
+                zug = ClaudeZug(claude_binary, model, prompt, session_id, str(config_dir), resume, tools,
                                 extra_env=tuple(env), effort=effort, append_system_prompt_file=str(anweisung),
                                 settings_file=str(settings) if settings else None)
             with self._zuege() as state:
                 state["runs"][run_id].update({"denkstufe": stufe, "skills": [item["name"] for item in skills],
                                               "skills_fehler": skills_fehler, "sperren": bool(self.konfig.sperren
-                                                                                             and harness == "claude"),
+                                                                                             and harness in ("claude", "codex")),
                                               "zugaenge": list(zugang.namen) if zugang is not None else [],
                                               "zugaenge_fehler": zugang_fehler})
+            einbindung = None
+            if pruefung and baum_pruefung is not None:
+                # Nur lesend: ohne Schreibanteil kann git im geprüften Repo nichts schreiben.
+                einbindung = dict(baum_pruefung.einbindung(), schreiben=[])
+            elif baum is not None:
+                einbindung = baum.einbindung()
             lauf = self._zug_fabrik(self, agent_id=agent_id, run_id=run_id, zug=zug, workspace=cwd,
                                     agent_state=agent_state, extra_read_paths=read_paths, netz=zugang is not None,
+                                    web=(zug.web_enabled if harness == "codex" else
+                                         harness == "claude" and not pruefung
+                                         and {"WebSearch", "WebFetch"}.issubset(agent.get("tools") or [])
+                                         and zugang is not None
+                                         and any(item.get("art") == "web" for item in zugang.eintraege)),
                                     extra_write_paths=write_paths,
-                                    **({"git_einbindung": baum.einbindung()} if baum is not None else {}),
+                                    **({"git_einbindung": einbindung} if einbindung is not None else {}),
                                     **({"verdeckt": brain["verdeckt"], "brain_vault": brain["vault"]}
                                        if brain is not None else {}))
             self.laeufe[run_id] = lauf
@@ -1651,6 +2290,7 @@ class WeltTraeger:
         counts = proxy.upstream_counts() if proxy is not None else {}
         limit = proxy.upstream_limit() if proxy is not None else None
         shapes = proxy.request_shapes() if proxy is not None and hasattr(proxy, "request_shapes") else {}
+        tool_types = proxy.request_tool_types() if proxy is not None and hasattr(proxy, "request_tool_types") else {}
         if lauf is not None:
             with contextlib.suppress(Exception):  # das Urteil haengt nicht am Kanalabbau
                 lauf.close()
@@ -1660,7 +2300,9 @@ class WeltTraeger:
         receipt = LaunchReceipt.from_dict(record["receipt"]) if record.get("receipt") else None
         data = self._ausgabe(self, receipt) if receipt is not None else b""
         pi = entry.get("harness") == "pi"
-        befund = pi_befund(data, entry["session_id"]) if pi else stream_befund(data, entry["session_id"])
+        codex = entry.get("harness") == "codex"
+        befund = (pi_befund(data, entry["session_id"]) if pi else
+                  codex_befund(data, entry["session_id"]) if codex else stream_befund(data, entry["session_id"]))
         art = entry.get("art", "ticket")
         ticket = ad.read_ticket(self.root, entry["ticket_id"]) if entry.get("ticket_id") else None
         belegt = None
@@ -1668,7 +2310,13 @@ class WeltTraeger:
             belegt = self._antwort_belegt(agent_id, entry["nachricht_id"])
         elif art == "antrag":
             belegt = self._antrag_belegt(entry.get("frage_id"))
-        elif art in {"antwort", "rueckmeldung"}:
+        elif art == "pruefung":
+            # Beleg des Pruefzuges ist die abgegebenen Pruefnotiz desselben Pruefers zu derselben Revision.
+            review = (ticket or {}).get("review") or {}
+            belegt = ((ticket or {}).get("state") == "zur Abnahme"
+                      and review.get("reviewer") == agent_id and review.get("revision") == int(entry["revision_before"])
+                      and bool(str(review.get("note") or "").strip()))
+        elif art in {"antwort", "rueckmeldung", "zyklus-schluss"}:
             belegt = True
         elif art == "gedaechtnis":
             # Beleg des Kuerzungszuges ist ein angewendeter archiv-Lernschritt; der Lernschritt ist je Zug idempotent.
@@ -1689,7 +2337,7 @@ class WeltTraeger:
         # Jede neue Zustellung derselben Sitzung (Fortsetzung, Rueckgabe, Nachricht) setzt sie fort.
         try:
             # Pi fuehrt seine Sitzung selbst im Sitzungsordner des Agenten; nur Claude braucht eine Uebergabe.
-            handoff = None if pi else uebergabe_sichern(
+            handoff = None if pi or codex else uebergabe_sichern(
                 Path(entry["config_dir"]), entry["session_id"], entry["workspace"], self.orte.handoffs,
                 world=world_id, agent=agent_id, run_id=run_id, clock=self._clock)
         except (ClaudeAdapterFehler, OSError, ValueError):
@@ -1704,7 +2352,8 @@ class WeltTraeger:
                     else None)}
             state["runs"][run_id].update({"stream": befund.status, "exit_code": record.get("exit_code"),
                                           "handoff": handoff is not None, "upstream": counts,
-                                          "anfragen_form": shapes, "lernschritt": lernschritt, "messung": messung,
+                                          "anfragen_form": shapes, "anfragen_werkzeugtypen": tool_types,
+                                          "lernschritt": lernschritt, "messung": messung,
                                           "skill_aufrufe": skill_aufrufe,
                                           "api_error_status": befund.api_error_status,
                                           "rate_limit": befund.rate_limit})
@@ -1714,6 +2363,9 @@ class WeltTraeger:
                                     self._marker(art, entry.get("ticket_id"), entry.get("nachricht_id"),
                                                  entry.get("frage_id"), agent_id),
                                     befund=befund, limit=limit)
+        if self.jev is not None:
+            # Jev-Schatten Stelle B: nach dem Urteil und der Quittung, also hinter dem kritischen Pfad.
+            self._jev_dod(agent_id, entry, ticket)
         result = {"run": run_id, "agent": agent_id, "art": art, "ticket": entry.get("ticket_id"),
                   "outcome": outcome, "stream": befund.status, "handoff": handoff is not None,
                   "lernschritt": lernschritt.get("status")}
@@ -1739,7 +2391,7 @@ class WeltTraeger:
         run_dir = entry.get("run_dir") or str(Path(entry["config_dir"]).parent)
         try:
             result = ask.lernschritt_anwenden(self.root, agent_id, run_dir, library=self.konfig.skill_bibliothek,
-                                              brain=self._brain_vault())
+                                              brain=self._brain_vault(), jev=self._jev_lehre if self.jev else None)
         except (ad.AgentsError, OSError, ValueError) as exc:
             return {"status": "fehler", "fehler": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
         keep = {key: result.get(key) for key in ("status", "art", "ziel", "fehler", "vorschlag_fehler", "ueber_grenze")
@@ -1785,6 +2437,9 @@ class WeltTraeger:
         content = None
         if art in {"ticket", "fortsetzen"} and entry.get("ticket_id"):
             content = lambda grund: _inhalt("fortsetzen", ticket_id=entry["ticket_id"], grund=grund)  # noqa: E731
+        elif art == "pruefung" and entry.get("ticket_id"):
+            # Eine unterbrochene oder ohne Notiz beendete Pruefung wird dem Pruefer erneut zugestellt.
+            content = lambda grund: _inhalt("pruefung", ticket_id=entry["ticket_id"], grund=grund)  # noqa: E731
         elif art in {"nachricht", "rueckmeldung"}:
             content = lambda grund: _inhalt(art, nachricht_id=entry["nachricht_id"], grund=grund)  # noqa: E731
         elif art == "antrag":
@@ -1794,8 +2449,10 @@ class WeltTraeger:
             content = lambda grund: _inhalt("antwort", frage_id=entry["frage_id"], grund=grund)  # noqa: E731
         elif art == "gedaechtnis":
             content = lambda grund: _inhalt("gedaechtnis", grund=grund)  # noqa: E731
+        elif art == "zyklus-schluss":
+            content = lambda grund: _inhalt("zyklus-schluss", nachricht_id=entry["nachricht_id"], grund=grund)  # noqa: E731
         if outcome in SCHLAF_URTEILE and content is not None:
-            freigabe = self._freigabe_nach_abweisung(outcome, befund, limit)
+            freigabe = self._freigabe_nach_abweisung(outcome, befund, limit, entry.get("harness"))
             bis = freigabe.naechster_start or (self._now() + RECHECK_S)
             # 429 des Abos mit einem Fallback ausserhalb dieses Abos: sofort mit dem Fallback fortsetzen, das Abo
             # bleibt fuer diesen Agenten bis zum Ende der Sperre vorgemerkt.
@@ -1831,14 +2488,32 @@ class WeltTraeger:
                         postfach_id=entry.get("postfach_id"))
         if self._quittierbar(posten, outcome):
             self._quittieren(agent_id, entry.get("postfach_id"))
+        if art == "pruefung" and outcome not in {"erfolg", "bereits_erledigt"}:
+            # Die Anfrage wird konsumiert; die neue Zustellung (Schlafwecker oder Recovery) traegt den
+            # naechsten Versuch, damit kein veralteter Pruefposten liegen bleibt.
+            self._quittieren(agent_id, entry.get("postfach_id"))
         if art in {"nachricht", "rueckmeldung", "antrag"} and outcome == "erfolg":
             self._quittieren(agent_id, entry["nachricht_id"])
         if entry.get("ticket_id"):
             ad.record_run_outcome(self.root, entry["ticket_id"], run_id, outcome, detail)
+            # Satz 16: ein Ticket-Zug endet mit einem Verlaufseintrag. Bleibt alles aus, schreibt der
+            # Träger selbst den Zwischenstand mit dem Zugausgang; ein berichtender Zug bleibt unberührt.
+            if art in {"ticket", "fortsetzen", "pruefung"}:
+                try:
+                    if not ad.ticket_turn_reported(self.root, entry["ticket_id"],
+                                                   int(entry.get("verlauf_before") or 0), agent_id):
+                        ad.carrier_turn_note(self.root, entry["ticket_id"], run_id, outcome)
+                except (ad.AgentsError, OSError, ValueError):
+                    pass  # der Bericht hängt nicht am Urteil; der Trägergrund bleibt im nächsten Durchgang sichtbar
         return follow
 
-    def _freigabe_nach_abweisung(self, outcome: str, befund: Any, limit: Optional[dict[str, Any]]) -> Startfreigabe:
+    def _freigabe_nach_abweisung(self, outcome: str, befund: Any, limit: Optional[dict[str, Any]],
+                                harness: Optional[str] = None) -> Startfreigabe:
         rate_limit = getattr(befund, "rate_limit", None)
+        if harness == "codex":
+            return self.codex_kontingentquelle.freigabe(rate_limit=rate_limit, proxy_limit=limit,
+                                                        backend_abgewiesen=outcome == "kontingent",
+                                                        anmeldung_fehlt=outcome == "anmeldung")
         if self.kontingentquelle is not None:
             return self.kontingentquelle.freigabe(rate_limit=rate_limit, proxy_limit=limit,
                                                   backend_abgewiesen=outcome == "kontingent",
@@ -1981,7 +2656,10 @@ class WeltTraeger:
                          "letzter_lauf": agents_autostart.letzter_lauf()}
         except (agents_autostart.AutostartFehler, OSError, ValueError) as exc:
             autostart = {"fehler": str(exc)[:200]}
-        return {"world": world_id, "anmeldung": self.anmeldequelle.status(), "kontingentquelle": kontingent,
+        return {"world": world_id, "claude_hinweis": self._claude_versionshinweis(),
+                "anmeldung": self.anmeldequelle.status(), "kontingentquelle": kontingent,
+                "codex": ({"profilgrenze": "codex_sperre" if self.konfig.sperren else "nur_launcher", "anmeldung": CodexAnmeldung(self.konfig.codex["auth"]).status()}
+                          if self.konfig.codex else None),
                 "messungen": messungen, "autostart": autostart,
                 "ungeklaerte_laeufe": ungeklaert, "schlaf": state["schlaf"],
                 "offene_wecker": [dict(item.as_dict(), status=status.status, reason=status.reason)
@@ -1992,6 +2670,18 @@ class WeltTraeger:
                 "letzte_zuege": sorted((entry for entry in state["runs"].values() if entry.get("outcome")),
                                        key=lambda entry: entry.get("ended_at") or 0)[-10:],
                 "agenten": self.zug_stand()}
+
+    def _claude_versionshinweis(self) -> Optional[str]:
+        match = re.fullmatch(r"(.*?/\.local/share/mise/installs/claude)/([^/]+)/claude",
+                             self.konfig.claude_binary)
+        if match is None or match.group(2) == "latest":
+            return None
+        latest = Path(match.group(1)) / "latest" / "claude"
+        current = os.path.realpath(latest)
+        current_match = re.fullmatch(re.escape(match.group(1)) + r"/([^/]+)/claude", current)
+        if current_match is None:
+            return "Claude-Version fest eingetragen: %s, aktuell latest nicht aufloesbar" % match.group(2)
+        return "Claude-Version fest eingetragen: %s, aktuell latest -> %s" % (match.group(2), current_match.group(1))
 
     def zug_stand(self) -> dict[str, dict[str, Any]]:
         """Das Lebenszeichen je Agent fuer die Oberflaeche (Auftrag agentaktiv, docs/AGENTS-OBERFLAECHE.md).
@@ -2123,10 +2813,12 @@ def _iso(zeit: Any) -> Optional[str]:
 
 
 def _zug_art(entry: dict[str, Any]) -> str:
-    """Die Art eines Zuges fuer die Oberflaeche: ``recovery``, ``ticket``, ``frage`` oder ``nachricht``."""
+    """Die Art eines Zuges fuer die Oberflaeche: ``recovery``, ``ticket``, ``pruefung``, ``frage`` oder ``nachricht``."""
     if entry.get("cause") == "recovery":
         return "recovery"
     art = entry.get("art")
+    if art == "pruefung":
+        return "pruefung"
     if art in {"ticket", "fortsetzen"} or (entry.get("ticket_id") and art not in {"nachricht", "rueckmeldung", "antrag", "antwort"}):
         return "ticket"
     if art == "antwort":
@@ -2279,16 +2971,22 @@ ANMELDUNG_VORGABE = ".claude/.credentials.json"
 LIMITS_VORGABE = ".claude/workbench/limits-latest.json"
 CLAUDE_VORGABE = ".local/share/mise/installs/claude/latest/claude"
 CODEX_AUTH_VORGABE = ".codex/auth.json"
+CODEX_FEHLT = ("Codex-CLI ist in der Traegerkonfiguration nicht eingetragen: beim Einrichten lag `codex` nicht im PATH. "
+               "Abhilfe: `agents_traeger.py einrichten --ersetzen` mit codex im PATH oder mit --codex <pfad>")
 REGISTRY_VORGABE = ".claude/workbench/models.json"
 MODELLE_VORGABE = dict(
     [("%s:%s" % (short, effort), name) for short, name in (("opus5", "claude-opus-5"), ("sonnet5", "claude-sonnet-5"))
-     for effort in ("low", "medium", "high", "xhigh")] + [("haiku", "claude-haiku-4-5-20251001")])
+     for effort in ("low", "medium", "high", "xhigh")] + [("haiku", "claude-haiku-4-5-20251001")] +
+    [("%s:%s" % (family, effort), model) for family, model, efforts in (
+        ("opus", "claude-opus-5-5", ("low", "medium", "high", "xhigh")),
+        ("sonnet", "claude-sonnet-5-5", ("low", "medium", "high", "xhigh")),
+        ("haiku", "claude-haiku-5-5", ("medium", "high", "xhigh"))) for effort in efforts])
 
 
 def einrichten(welt: str | os.PathLike[str], zustand: str | os.PathLike[str], agenten: str | os.PathLike[str], *,
                maschine: str = "lokal", claude: Optional[str] = None, ersetzen: bool = False,
                home: Optional[Path] = None, which: Callable[[str], Optional[str]] = shutil.which,
-               autostart: bool = True) -> Path:
+               autostart: bool = True, codex: Optional[str] = None) -> Path:
     """Schreibt ``<welt>/traeger.json`` mit den Vorgaben dieses Hosts; er ist der Traegerhost.
 
     Anmeldung: Setup-Token, Rueckfall auf die Nur-Lese-Anmeldung nur, solange die Tokendatei fehlt.
@@ -2300,11 +2998,16 @@ def einrichten(welt: str | os.PathLike[str], zustand: str | os.PathLike[str], ag
     target = world_root / KONFIGNAME
     if (target.exists() or target.is_symlink()) and not ersetzen:
         raise TraegerFehler("%s existiert bereits; --ersetzen ueberschreibt" % target)
-    binary = claude or os.path.realpath(home / CLAUDE_VORGABE)
+    binary = claude if claude is not None else str(home / CLAUDE_VORGABE)
     if not os.path.isabs(binary) or not os.access(binary, os.X_OK):
         raise TraegerFehler("Claude-Code-Binary nicht ausfuehrbar: %s" % binary)
     systemd = {"systemd_run": which("systemd-run"), "systemctl": which("systemctl")}
-    codex = which("codex")
+    if codex is not None:
+        codex = os.path.abspath(os.path.expanduser(codex))
+        if not os.access(codex, os.X_OK):
+            raise TraegerFehler("Codex-CLI nicht ausfuehrbar: %s" % codex)
+    else:
+        codex = which("codex")
     library = ask.library_path()
     konfig = TraegerKonfig(
         world_root=world_root, state_dir=Path(os.path.abspath(os.path.expanduser(str(zustand)))),
@@ -2318,7 +3021,7 @@ def einrichten(welt: str | os.PathLike[str], zustand: str | os.PathLike[str], ag
         systemd={key: value for key, value in systemd.items() if value} or None,
         skill_bibliothek=str(library) if library.is_dir() else None,
         registry=str(home / REGISTRY_VORGABE) if (home / REGISTRY_VORGABE).is_file() else None,
-        codex={"cli": os.path.realpath(codex), "auth": str(home / CODEX_AUTH_VORGABE)} if codex else None)
+        codex={"cli": codex, "auth": str(home / CODEX_AUTH_VORGABE)} if codex else None)
     data = dict(konfig.as_dict(), maschine=maschine, traeger_modul=os.path.realpath(__file__))
     atomar_schreiben.schreiben(target, json.dumps(data, ensure_ascii=False, indent=2) + "\n", modus=0o600,
                                dauerhaft=True)
@@ -2338,6 +3041,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--agenten", required=True)
     p.add_argument("--maschine", default="lokal")
     p.add_argument("--claude")
+    p.add_argument("--codex", help="Pfad der Codex-CLI, wenn codex nicht im PATH liegt")
     p.add_argument("--ersetzen", action="store_true")
     p.add_argument("--ohne-autostart", action="store_true")
     for name in ("laufen", "wecken", "status", "klaeren", "agent-pausieren", "agent-stoppen", "agent-fortsetzen",
@@ -2360,10 +3064,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         if args.command == "einrichten":
             path = einrichten(args.welt, args.zustand, args.agenten, maschine=args.maschine, claude=args.claude,
-                              ersetzen=args.ersetzen, autostart=not args.ohne_autostart)
+                              ersetzen=args.ersetzen, autostart=not args.ohne_autostart, codex=args.codex)
             konfig = TraegerKonfig.laden(path)
+            warnungen = []
+            if not konfig.codex:
+                # Sonst merkt es erst der erste Codex-Agent dieser Welt, als Startfehler.
+                warnungen.append("codex nicht im PATH: Codex-Agenten dieser Welt koennen nicht starten. "
+                                 "Abhilfe: einrichten --ersetzen mit codex im PATH oder mit --codex <pfad>")
+                print("agents_traeger: WARNUNG: " + warnungen[-1], file=sys.stderr)
             print(json.dumps({"konfig": str(path), "anmeldung": konfig.anmeldequelle().status(),
-                              "kontingentquelle": konfig.kontingentquelle().quelle()}, ensure_ascii=False))
+                              "kontingentquelle": konfig.kontingentquelle().quelle(), "codex": konfig.codex,
+                              "warnungen": warnungen}, ensure_ascii=False))
             return 0
         if args.command == "wecken":
             print(json.dumps({"wecken": wecken(Path(args.konfig))}))
@@ -2376,6 +3087,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             def log(entry: dict[str, Any]) -> None:
                 print(json.dumps(dict(entry, time=time.time()), ensure_ascii=False), flush=True)
             print(json.dumps(traeger.laufen(frist_s=args.frist, log=log), ensure_ascii=False), flush=True)
+            if traeger.jev is not None:
+                # Nach dem Lauf (Sperre frei): offene Schattenfaelle hoechstens eine Frist lang protokollieren.
+                traeger.jev.beenden(aj.NACHLAUF_S)
             return 0
         traeger = WeltTraeger(konfig)
         if args.command == "status" and args.nur_zug:

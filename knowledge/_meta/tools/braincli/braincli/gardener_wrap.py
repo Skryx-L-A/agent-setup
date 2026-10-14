@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 
 from gardener import config
-from gardener.cli import main as gardener_main
 from gardener.runtime import read_last_run
 
 VALID_PHASES = config.PHASES   # linking|consolidate|maintain|ingest|mine|lint|all
@@ -26,21 +25,16 @@ def run(vault: Path, phase: str = "all", dry_run: bool = False,
     """
     if phase not in VALID_PHASES:
         raise ValueError(f"unknown phase {phase!r}, expected one of {VALID_PHASES}")
-    argv = ["--vault", str(vault), "--phase", phase]
-    if dry_run:
-        argv.append("--dry-run")
-    if audit:
-        argv.append("--audit")
-    if verbose:
-        argv.append("--verbose")
-    # Nur fuer die synth-Phase belegt; der Gardener ignoriert sie sonst.
-    if topic:
-        argv += ["--topic", topic]
-    if min_notes is not None:
-        argv += ["--min-notes", str(min_notes)]
-    if budget_minutes is not None:
-        argv += ["--budget-minutes", str(budget_minutes)]
-    return gardener_main(argv)
+    # Brain 5: `brain gardener run` is `brain run --profil gardener` - one
+    # lock, one report (00-sources/brain-run-<id>.md), one commit. The
+    # gardener's own flags go through unchanged.
+    from gardener.lauf import lauf as lauf_mod
+    from gardener.runtime import install_termination_handler
+    install_termination_handler()
+    return lauf_mod.run(vault, profil="gardener", dry_run=dry_run,
+                        gardener_args={"phase": phase, "audit": audit, "verbose": verbose,
+                                       "topic": topic, "min_notes": min_notes,
+                                       "budget_minutes": budget_minutes})
 
 
 def _lock_status() -> dict:
@@ -61,8 +55,9 @@ def _lock_status() -> dict:
 
 
 def _latest_report(vault: Path) -> dict | None:
-    reports = sorted((vault / "00-sources").glob("gardener-report-*.md"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)
+    reports = sorted([*(vault / "00-sources").glob("gardener-report-*.md"),
+                      *(vault / "00-sources").glob("brain-run-*.md")],
+                     key=lambda p: p.stat().st_mtime, reverse=True)
     if not reports:
         return None
     p = reports[0]

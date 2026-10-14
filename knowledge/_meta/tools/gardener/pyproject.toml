@@ -15,7 +15,10 @@ dependencies = []
 schnell = ["numpy>=1.26"]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "pytest>=8",
+    "pyyaml>=6",
+]
 
 [project.scripts]
 gardener = "gardener.cli:main"

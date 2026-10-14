@@ -1,0 +1,147 @@
+/* LISTEN: Sitzungskarten, Welten mit Figuren, Tickets, Meldungen, Status. */
+
+.listen-koerper { padding-top: 4px; }
+.gruppe-notiz { color: var(--gedaempft); font-size: 0.765rem; line-height: 1.4; padding: 0 calc(var(--rand) + 4px) 8px; margin-top: -2px; }
+
+/* --- Sitzungskarte ---------------------------------------------------------- */
+.sitzung {
+  display: flex; flex-direction: column; gap: 3px; width: 100%;
+  padding: 12px 14px 12px 14px; text-align: left; min-height: 44px;
+}
+.sitzung:active { background: var(--wahl); }
+.sitzung.gewaehlt { background: var(--akzent-matt); }
+/* Bei grosser Schrift bricht die Zeit unter den Namen, statt den Namen abzuschneiden. */
+.sitzung-kopf { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; min-width: 0; }
+.sitzung-name {
+  flex: 1 1 9ch; min-width: 0; font-size: 1rem; font-weight: 600; overflow-wrap: anywhere;
+}
+.sitzung-zeit { flex: none; margin-left: auto; font-size: 0.882rem; color: var(--gedaempft); font-variant-numeric: tabular-nums; }
+.sitzung-zeile, .sitzung-modell { padding-left: 20px; }
+.sitzung-zustand { font-size: 0.882rem; font-weight: 500; }
+.sitzung-modell { display: flex; gap: 8px; align-items: baseline; font-size: 0.765rem; color: var(--gedaempft); min-width: 0; }
+.sitzung-modell .harness { font-weight: 600; }
+.sitzung-modell .modell { font-family: var(--mono); font-size: 0.72rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sitzung .marken { padding: 6px 0 0 20px; }
+.sitzung.veraltet .sitzung-name { color: color-mix(in srgb, var(--schrift) 72%, var(--gedaempft)); }
+
+/* --- Welten und Agenten ---------------------------------------------------- */
+.welt-karte { padding: 4px 0 0; overflow: hidden; }
+.welt-karte.veraltet .agentenfigur { opacity: 0.7; }
+.agent-zeile {
+  display: grid; grid-template-columns: 44px 1fr auto 16px; align-items: center; gap: 12px;
+  width: 100%; min-height: 60px; padding: 6px 14px; text-align: left;
+}
+.agent-zeile:active { background: var(--wahl); }
+.agent-zeile > .symbol { color: var(--gedaempft); }
+.agentenfigur { display: block; flex: none; }
+.agent-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.agent-name { font-weight: 600; display: flex; gap: 8px; align-items: baseline; }
+.agent-rolle { font-size: 0.765rem; font-weight: 500; color: var(--gedaempft); }
+.agent-zustand { font-size: 0.882rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.welt-fuss { display: flex; gap: var(--fuge); padding: 8px 10px 10px; }
+.fuss-knopf {
+  flex: 1; display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 12px;
+  border-radius: 10px; background: var(--erhoben); font-weight: 600; font-size: 0.941rem;
+}
+.fuss-knopf .symbol { color: var(--akzent-text); }
+.fuss-zahl { margin-left: auto; font-weight: 500; font-size: 0.765rem; color: var(--gedaempft); }
+
+/* Frage eines Agenten (auch kompakt in der Liste) */
+.frage { display: flex; flex-direction: column; gap: 12px; padding: 14px; }
+.frage-kopf { display: flex; align-items: center; gap: 12px; }
+.frage-wer { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.frage-name { font-weight: 600; }
+.frage-meta { font-size: 0.765rem; color: var(--gedaempft); }
+.frage-text { font-size: 1rem; line-height: 1.4; }
+.frage.kompakt .text-knopf { align-self: flex-start; min-height: 36px; }
+.empfehlung {
+  margin-left: auto; flex: none; font-size: 0.706rem; font-weight: 600; color: var(--akzent-text);
+  padding: 2px 6px; border-radius: 5px; background: var(--akzent-matt);
+}
+
+/* Agentendetail */
+.detail-koerper { display: flex; flex-direction: column; gap: 16px; padding: 4px 0 24px; max-width: 720px; margin: 0 auto; width: 100%; }
+.detail-koerper > .karte, .detail-koerper > .entscheidung-knoepfe, .detail-koerper > .knopf,
+.detail-koerper > .entscheidung, .detail-koerper > .entscheidung-fehler { margin: 0 var(--rand); }
+.detail-koerper > .abschnitt-kopf { padding-bottom: 0; margin-bottom: -8px; }
+.agent-buehne { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 8px var(--rand) 4px; text-align: center; }
+.agent-titel { font-size: 1.65rem; font-weight: 700; margin-top: 4px; }
+.agent-untertitel { color: var(--gedaempft); font-size: 0.882rem; }
+.eigenschaften { margin: 0; padding: 4px 14px; }
+.eigenschaften > div { display: flex; justify-content: space-between; gap: 16px; padding: 11px 0; align-items: baseline; }
+.eigenschaften dt { color: var(--gedaempft); flex: none; }
+.eigenschaften dd { margin: 0; text-align: right; min-width: 0; overflow-wrap: anywhere; }
+.eigenschaften .text-knopf { min-height: 44px; margin: -11px 0; padding: 0; }
+.gespraech { padding: 4px 14px; }
+.gespraech-zeile { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 10px 0; }
+.gespraech-von { font-weight: 600; font-size: 0.882rem; }
+.gespraech-zeile.von-mensch .gespraech-von { color: var(--akzent-text); }
+.gespraech-text { grid-column: 1 / -1; line-height: 1.4; }
+.gespraech-zeit { grid-row: 1; grid-column: 2; font-size: 0.765rem; color: var(--gedaempft); }
+.ticket-zeile { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center; padding: 12px 14px; text-align: left; min-height: 44px; }
+
+/* --- Tickets ---------------------------------------------------------------- */
+.ticket-karte { display: flex; flex-direction: column; gap: 4px; width: 100%; padding: 12px 14px; text-align: left; }
+.ticket-karte:active { background: var(--wahl); }
+.ticket-karte.abgeschlossen { opacity: 0.72; }
+.ticket-kopf { display: flex; align-items: center; gap: 8px; }
+.ticket-id { font-family: var(--mono); font-size: 0.72rem; color: var(--gedaempft); }
+.ticket-zeit { margin-left: auto; font-size: 0.765rem; color: var(--gedaempft); }
+.ticket-titel { font-weight: 600; line-height: 1.3; }
+.ticket-fuss { display: flex; align-items: center; gap: 8px; font-size: 0.82rem; }
+.ticket-bearbeiter { margin-left: auto; color: var(--gedaempft); }
+.ticket-buehne { display: flex; flex-direction: column; gap: 8px; padding: 4px calc(var(--rand) + 4px) 0; }
+.ticket-gross { font-size: 1.5rem; font-weight: 700; line-height: 1.2; }
+.text-karte { padding: 12px 14px; line-height: 1.45; }
+.punkte-liste, .verlauf-liste { list-style: none; margin: 0; padding: 4px 14px; }
+.punkte-liste li { display: flex; gap: 10px; align-items: flex-start; padding: 9px 0; line-height: 1.35; }
+.haken-feld {
+  flex: none; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center;
+  box-shadow: inset 0 0 0 1.5px var(--gedaempft); margin-top: -1px;
+}
+.punkte-liste li.erledigt .haken-feld { background: var(--zustand-fertig); box-shadow: none; color: var(--zustand-fertig-tinte); }
+.haken-feld .symbol path { stroke-width: 2.4; }
+.verlauf-liste li { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 9px 0; }
+.verlauf-was { font-weight: 600; font-size: 0.882rem; }
+.verlauf-text { grid-column: 1 / -1; color: var(--gedaempft); font-size: 0.882rem; line-height: 1.35; }
+.verlauf-zeit { grid-row: 1; grid-column: 2; font-size: 0.765rem; color: var(--gedaempft); }
+
+/* --- Meldungen und Status --------------------------------------------------- */
+.status-karte { margin: 0 var(--rand) 22px; padding: 2px 0; }
+.status-zeile {
+  display: flex; align-items: center; gap: 12px; width: 100%; min-height: 56px; padding: 8px 14px; text-align: left;
+}
+button.status-zeile:active { background: var(--wahl); }
+.status-zeile > .symbol:first-child { color: var(--akzent-text); }
+.status-zeile > .symbol:last-child:not(:first-child) { color: var(--gedaempft); }
+.status-text { flex: 1; display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.status-titel { font-weight: 500; }
+.status-wert { font-size: 0.82rem; color: var(--gedaempft); line-height: 1.3; }
+.meldungen-karte { margin: 0 var(--rand); padding: 2px 0; }
+.meldung {
+  display: grid; grid-template-columns: 14px 1fr; gap: 6px; width: 100%; padding: 10px 14px 10px 8px; text-align: left;
+}
+.meldung:active { background: var(--wahl); }
+.meldung.gewaehlt { background: var(--akzent-matt); }
+.meldung-marke { display: flex; justify-content: center; padding-top: 6px; }
+.ungelesen-punkt { width: 9px; height: 9px; border-radius: 50%; background: var(--akzent); }
+.meldung-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.meldung-kopf { display: flex; gap: 8px; align-items: baseline; }
+.meldung-titel { font-weight: 600; flex: 1; }
+.meldung.ungelesen .meldung-titel { color: var(--schrift); }
+.meldung:not(.ungelesen) .meldung-titel { font-weight: 500; }
+.meldung-zeit { font-size: 0.82rem; color: var(--gedaempft); flex: none; }
+.meldung-inhalt { font-size: 0.941rem; line-height: 1.35; }
+.meldung-fuss { display: flex; align-items: center; gap: 6px; font-size: 0.765rem; color: var(--gedaempft); }
+.meldung-fuss .punkt { width: 8px; height: 8px; }
+.meldung-spiegel { padding-left: 4px; }
+.meldung-buehne { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; padding: 4px calc(var(--rand) + 4px) 4px; }
+.meldung-gross { font-size: 1.4rem; font-weight: 700; line-height: 1.25; }
+.meldung-wann { color: var(--gedaempft); font-size: 0.882rem; }
+.weiter-zeile { display: flex; align-items: center; gap: 12px; padding: 12px 14px; text-align: left; min-height: 56px; }
+.weiter-zeile > .symbol { color: var(--gedaempft); }
+.weiter-text { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.weiter-titel { font-weight: 600; color: var(--akzent-text); }
+.weiter-sub { font-size: 0.765rem; color: var(--gedaempft); }
+.karte.erledigt { margin: 0 var(--rand); padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+.karte.erledigt .hinweis { margin: 0; padding: 0; background: none; }

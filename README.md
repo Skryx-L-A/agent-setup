@@ -22,7 +22,7 @@ The window is an Electron program that drives tmux over its control mode. Everyt
 sessions, worker panes, output, the editor, the chat stage — is a live view on real tmux panes,
 so the same work is reachable from a terminal on the same machine or over SSH from another one.
 On a Mac there is also a native shell around the same core:
-**[agent-workbench-mac](https://github.com/<your-github-user>/agent-workbench-mac)**.
+**[agent-workbench-mac](https://github.com/Skryx-L-A/agent-workbench-mac)**.
 
 It is not tied to one vendor. Claude Code, Codex, aider, opencode and local models via Ollama are
 entries in a JSON registry. A setup with no account at all is a supported path: Ollama plus the
@@ -33,7 +33,7 @@ local worker lane runs entirely on your own hardware.
 The program plus everything that grew around it: the agent rules, the skills, the hooks, the
 knowledge base, the configuration for local workers. If you only want the window and the worker
 machinery and intend to bring your own agent configuration, take
-**[agent-workbench](https://github.com/<your-github-user>/agent-workbench)** instead. Both
+**[agent-workbench](https://github.com/Skryx-L-A/agent-workbench)** instead. Both
 repositories are built from the same private source tree by the same script, so they never drift
 apart.
 
@@ -48,12 +48,12 @@ app/         the workbench itself — Electron main process, preload bridges, re
 extension/   16 modules the app imports rather than duplicates. They started life in a
              VS Code extension and still carry its directory name; there is exactly one copy
              of each, and this is it
-shell/       137 command-line tools and the default configuration files they read:
+shell/       156 command-line tools and the default configuration files they read:
              worker spawners, context guard, model registry, session management, budget and
              quota, cross-machine helpers, local media generation, knowledge-base maintenance.
              shell/linux/ holds the variants that need CUDA instead of Apple Silicon
-claude/      what an agent reads before it starts — two role prompts, 104 rule files,
-             22 skills, 28 hooks, and templates for CLAUDE.md and settings.json
+claude/      what an agent reads before it starts — two role prompts, 107 rule files,
+             22 skills, 29 hooks, and templates for CLAUDE.md and settings.json
 pi/          the configuration for local workers: the two role files the local harness reads,
              its model list, and a template for the instruction file it generates
 knowledge/   an empty knowledge-base skeleton: branch layout, note templates, and the tooling
@@ -81,11 +81,20 @@ INSTALL.md   how to put all of it on your machine
 - **A result protocol.** Every worker writes its outcome to a file, and you wait on the file
   rather than on what the pane looks like. A spinner is not a status.
 - **A model registry.** Harnesses, providers and models are JSON. `wb-state models discover`
-  imports whatever your installed CLIs currently offer, so a model you just pulled shows up on
-  its own.
+  imports whatever your installed CLIs currently offer, probes each new model once, and enables
+  only the ones that answered.
+- **Agent CLIs that stay current.** The window checks the installed harnesses every six hours
+  and updates them, by default; `harnessUpdateAuto` in the settings switches that off.
 - **Hooks that refuse.** A secret on a command line, a `pkill` pattern wide enough to hit
   someone else's process, a commit nobody asked for, a screenshot of a live window — each is
   blocked at the point where it would happen.
+- **A secret filter between harness and model API.** `wb-geheimnis-filter` listens on
+  127.0.0.1, replaces secrets in outgoing requests with stable placeholders and puts the values
+  back into the replies. It needs Python 3.14 or newer, and `install.sh` does not load it.
+- **A board for scarce resources.** `wb-tafel` lets sessions take, queue for and release places
+  such as the GPU, memory or a full test run, so two heavy runs do not start on top of each other.
+- **One tool hub for every harness.** `wb-hub` serves the workbench's tools and prompts to all
+  harnesses as a single MCP endpoint on 127.0.0.1; `install.sh` does not load it either.
 - **A knowledge base skeleton.** Structure, templates and tooling, empty.
 - **The side lanes the agent rules assume.** Local image, speech and video generation, so an agent
   that needs a picture does not reach for a paid API; `brain`, `vault-sync`, `status-freshness`
@@ -109,16 +118,11 @@ memory and the project's own sub-agents. It is a public repository under the sam
 one, and it installs as a Claude Code plugin in two lines:
 
 ```
-/plugin marketplace add <your-github-user>/project-kit
+/plugin marketplace add Skryx-L-A/project-kit
 /plugin install project-kit@project-kit
 ```
 
 Nothing here depends on it, and it does not depend on anything here.
-
-> `<your-github-user>` appears wherever a repository address does. It is a placeholder on purpose:
-> the tool that extracts this repository from a working machine removes account names everywhere,
-> and it cannot tell the account in a public URL from the one on the machine. Put in the account
-> this repository is hosted under — the address bar you cloned from shows it.
 
 ## Requirements
 
@@ -146,9 +150,9 @@ Nothing here depends on it, and it does not depend on anything here.
   `tts` and `stt` need model weights measured in gigabytes. The wrapper tells you the path it
   expects, and the skills that use them work without them and say so —
   [docs/MEDIA.md](docs/MEDIA.md) and [docs/DESIGN.md](docs/DESIGN.md) say what to install.
-- **The two launchd files in `shell/` are real files, not templates.** They come from a working
+- **The launchd files in `shell/` are real files, not templates.** They come from a working
   machine and carry a literal `$HOME`, which launchd does not expand — substitute it before you
-  load either one. The templates that are ready to use are in `docs/services/`, with `__HOME__`
+  load one. The templates that are ready to use are in `docs/services/`, with `__HOME__`
   and `__USER__` to replace.
 - **The registry ships with the harnesses that were actually measured** on macOS and Linux. A
   harness you add yourself needs its ready pattern measured once with `wb-harness-probe` —

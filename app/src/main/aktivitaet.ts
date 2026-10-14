@@ -96,7 +96,7 @@ const FELD_MARKE = '\x1f';
  * Workers -- git kennt seine eigenen Interna (`.git/**`) nicht als
  * Ausschluss, deshalb kommt jeder Pfad hier durch DIESELBE Pruefung wie im
  * Baum und in der Suche. Ohne das haette ein unversionierter
- * `90-secrets`-Ordner (git status meldet ihn als `??`) genau die Auflage aus
+ * `secrets`-Ordner (git status meldet ihn als `??`) genau die Auflage aus
  * 4c.2 verletzt, die der Baum und die Suche einhalten -- gefunden am eigenen
  * Belegbild, nicht vorher bedacht.
  *

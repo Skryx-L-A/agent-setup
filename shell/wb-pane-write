@@ -6,6 +6,13 @@
 #   wb-pane-write einfuegen <pane>            Text auf stdin, ueber load-buffer + paste-buffer -p.
 #   wb-pane-write taste     <pane> <name>     Eine benannte Taste (Enter, Escape, C-c).
 #   wb-pane-write beleg     <pane>            Diagnose: Rolle, Entscheidung, Begruendung.
+#   wb-pane-write frei      <pane>            Frei zum Tippen? Exit 0 = frei, 75 = nicht frei (Grund auf stdout).
+#   [--nur-dialog] vor dem Kommando: nur Dialog/Register pruefen, nicht die Eingabezeile.
+#   [--trotz-dialog] vor `taste Escape|C-c`: ausdruecklicher Abbruch, auch in einen Dialog.
+#   tippen/einfuegen/taste tippen NICHTS in einen nicht freien Pane (Exit 75; Pane fehlt: 1);
+#   mobil-senden antwortet dann 77 {"ok":false,"code":"pane_busy"}.
+#   wb-pane-write mobil-senden <%pane>        Signierter Umschlag auf stdin, Text einfuegen + Enter.
+#   wb-pane-write mobil-taste  <%pane>        Signierter Umschlag auf stdin, die bestaetigte Tastenfolge.
 #
 # Der Server wird ueber -L/--socket oder WB_TMUX_SOCKET gewaehlt; ohne Angabe der
 # umgebende (der von $TMUX). Die Wahl ist ungefaehrlich: Rollenabfrage UND Schreiben
@@ -66,12 +73,25 @@
 # der teure: ein Skript, ein Test, ein Werkzeug oder ein Agent, der einfach tippt.
 set -uo pipefail
 
+# Funktionen, die der Aufrufer per `export -f` mitschickt, wuerde bash beim Start
+# uebernehmen -- und ein Funktionsname geht in der Aufloesung VOR dem gleichnamigen
+# Builtin. Eine geerbte `printf`, `read` oder `kill` koennte so jede Entscheidung dieses
+# Werkzeugs faelschen, auch die Antwort des Pruefprogramms (2026-09-18, Paket 3). Vor der
+# ersten eigenen Definition werden deshalb alle geerbten Funktionen verworfen. Nichts in
+# diesem Haus verlaesst sich darauf, dass dieses Werkzeug eine geerbte Funktion sieht.
+for _f in $(builtin compgen -A function); do builtin unset -f "$_f"; done
+unset _f
+
 ABGELEHNT=77
 
 SOCKET="${WB_TMUX_SOCKET:-}"
+FREI_MODUS=voll
+FREI_TROTZ=0
 while true; do
     case "${1:-}" in
         -L|--socket) SOCKET="${2:?Socketname fehlt nach $1}"; shift 2 ;;
+        --nur-dialog) FREI_MODUS=dialog; shift ;;
+        --trotz-dialog) FREI_TROTZ=1; shift ;;
         *) break ;;
     esac
 done
@@ -126,9 +146,44 @@ mit_frist() {   # <sekunden> <programm> [args...] -- Rueckgabe 124 bei Ablauf, w
     wait "$kind"
 }
 
+# DIE MOBIL-ZWEIGE NEHMEN TMUX VON EINEM FESTEN PFAD (2026-09-18, Paket 10; Haertung
+# Punkt 11 aus Paket 3). Ein untergeschobenes `tmux` vorn im PATH kann keine Zusage des
+# Pruefprogramms erzeugen, wohl aber eine GUELTIG signierte Aktion in ein anderes Pane
+# umleiten. `mobil_ausfuehren` setzt deshalb TM_FEST auf das erste ausfuehrbare tmux aus
+# einer festen Liste (dieselbe Reihenfolge wie der feste PATH des Pruefprogramms); ab
+# dann ruft jede tmux-Zeile dieses Prozesses genau diese Datei, und die Frist laeuft
+# ohne `timeout`/`sleep` aus dem PATH (mit_frist_fest). Die alten Unterbefehle behalten
+# ihren PATH-Aufruf unveraendert. Gibt es keines, ist die Antwort Nein.
+TM_FEST=""
+mit_frist_fest() {   # <sekunden> <programm> [args...] -- wie mit_frist, nur mit festen Hilfsprogrammen
+    local sek="$1" kind i=0 grenze
+    shift
+    grenze=$(( sek * 50 ))
+    "$@" <&0 &
+    kind=$!
+    while kill -0 "$kind" 2>/dev/null; do
+        if [ "$i" -ge "$grenze" ]; then
+            kill -TERM "$kind" 2>/dev/null
+            "$MOBIL_SLEEP" 0.2 >/dev/null 2>&1
+            kill -KILL "$kind" 2>/dev/null
+            wait "$kind" 2>/dev/null
+            return 124
+        fi
+        i=$(( i + 1 ))
+        "$MOBIL_SLEEP" 0.02 >/dev/null 2>&1
+    done
+    wait "$kind"
+}
+
 tm() {
     local rc
-    if [ -n "$SOCKET" ]; then
+    if [ -n "$TM_FEST" ]; then
+        if [ -n "$SOCKET" ]; then
+            mit_frist_fest "$TM_TIMEOUT" "$TM_FEST" -L "$SOCKET" "$@"
+        else
+            mit_frist_fest "$TM_TIMEOUT" "$TM_FEST" "$@"
+        fi
+    elif [ -n "$SOCKET" ]; then
         mit_frist "$TM_TIMEOUT" tmux -L "$SOCKET" "$@"
     else
         mit_frist "$TM_TIMEOUT" tmux "$@"
@@ -321,18 +376,62 @@ EOF
 }
 
 MENSCH_GRUND=""
+echtes_home() {
+    /usr/bin/env -i HOME="$HOME" TMPDIR=/tmp PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+        /usr/bin/python3 -I -B -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null
+}
+
+menschenbeleg_von() {
+    # M2 besteht aus zwei Behauptungen, die wb-mensch selbst gegen seine
+    # wirkliche Ahnenkette prueft. Genau diese beiden duerfen die ansonsten
+    # leere Allowlist passieren; ohne gueltige PID/Form werden sie nicht
+    # weitergereicht. Loader-, Shell- und sonstige Aufruferumgebung bleibt weg.
+    case "${WB_APP_PID:-}" in ''|*[!0-9]*)
+        /usr/bin/env -i HOME="$HOME" TMPDIR=/tmp \
+            PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+            "$1" beleg 2>/dev/null ;;
+        *)
+            if [ "${WB_MENSCH_QUELLE:-}" = oberflaeche ]; then
+                /usr/bin/env -i HOME="$HOME" TMPDIR=/tmp \
+                    PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+                    WB_MENSCH_QUELLE=oberflaeche WB_APP_PID="$WB_APP_PID" \
+                    "$1" beleg 2>/dev/null
+            else
+                /usr/bin/env -i HOME="$HOME" TMPDIR=/tmp \
+                    PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+                    "$1" beleg 2>/dev/null
+            fi ;;
+    esac
+}
+
 ist_mensch() {
-    local beleg
-    if [ -x "$HOME/.local/bin/wb-mensch" ]; then
-        beleg=$("$HOME/.local/bin/wb-mensch" beleg 2>/dev/null)
-    elif command -v wb-mensch >/dev/null 2>&1; then
-        beleg=$(wb-mensch beleg 2>/dev/null)
-    else
-        MENSCH_GRUND="wb-mensch nicht gefunden — ohne Messung gilt: kein Mensch."
+    local heim echt pfad beleg art grund
+    heim="$HOME"
+    echt="$(echtes_home)"
+    [ -n "$echt" ] || {
+        MENSCH_GRUND="echtes Heimatverzeichnis nicht bestimmbar — ohne Messung gilt: kein Mensch."
         return 1
-    fi
-    MENSCH_GRUND="${beleg#*$'\t'}"
-    [ "${beleg%%$'\t'*}" = mensch ]
+    }
+    for pfad in "$heim/.local/bin/wb-mensch" "$echt/.local/bin/wb-mensch"; do
+        if [ ! -x "$pfad" ]; then
+            MENSCH_GRUND="wb-mensch am festen Pfad $pfad nicht gefunden — ohne Messung gilt: kein Mensch."
+            return 1
+        fi
+        beleg="$(menschenbeleg_von "$pfad")"
+        [ "$(printf '%s\n' "$beleg" | wc -l | tr -d ' ')" = 1 ] || {
+            MENSCH_GRUND="wb-mensch am festen Pfad $pfad liefert keinen eindeutigen Beleg."
+            return 1
+        }
+        art="${beleg%%$'\t'*}"
+        grund="${beleg#*$'\t'}"
+        [ "$beleg" != "$art" ] && [ "$art" = mensch ] && [ -n "$grund" ] || {
+            MENSCH_GRUND="${grund:-$art}"
+            return 1
+        }
+        MENSCH_GRUND="$grund"
+        [ "$heim" != "$echt" ] || break
+    done
+    return 0
 }
 
 # --- Rolle des Panes -------------------------------------------------------
@@ -367,7 +466,15 @@ rolle_lesen() {
         return
     fi
     r=$(tm display -p -t "$PANE" '#{@wb_role}' 2>/dev/null) || r=""
-    if [ -n "$ROLLEN_PY" ]; then
+    if [ -n "$ROLLEN_PY" ] && [ -n "$TM_FEST" ]; then
+        # Mobil-Zweig: auch das Register fragt tmux -- dort nur das feste tmux, sonst
+        # nichts aus dem PATH oder der Umgebung des Aufrufers (Serverwahl bleibt: -L,
+        # TMUX, TMUX_TMPDIR).
+        reg=$(/usr/bin/env -i HOME="$HOME" PATH="${TM_FEST%/*}:/usr/bin:/bin" ${TMUX:+TMUX="$TMUX"} \
+                  ${TMUX_TMPDIR:+TMUX_TMPDIR="$TMUX_TMPDIR"} /usr/bin/python3 -I "$ROLLEN_PY" \
+                  ${SOCKET:+-L "$SOCKET"} lesen "$PANE" 2>/dev/null \
+              | awk -F'\t' '$1=="register"{print $2}')
+    elif [ -n "$ROLLEN_PY" ]; then
         if [ -n "$SOCKET" ]; then
             reg=$(/usr/bin/python3 "$ROLLEN_PY" -L "$SOCKET" lesen "$PANE" 2>/dev/null \
                   | awk -F'\t' '$1=="register"{print $2}')
@@ -437,16 +544,607 @@ ablehnen() {
     exit "$ABGELEHNT"
 }
 
+# --- Die dritte Herkunft: ein gekoppeltes Mobilgeraet (2026-09-18) ----------
+#
+# Spezifikation MOBILE-APP-SPEC.md Abschnitt 4.3/4.4, Bauplan Paket 3. Die zwei
+# Unterbefehle `mobil-senden` und `mobil-taste` sind KEIN Umweg um die Regel oben,
+# sondern eine dritte, eigene Herkunft neben Mensch und Guard: ein Geraet, dessen
+# nicht exportierbarer Schluessel den Auftrag signiert hat. Die Entscheidung trifft
+# nicht dieses Werkzeug, sondern das feste Pruefprogramm; dieses Werkzeug schreibt
+# NUR das, was jenes bestaetigt.
+#
+#   wb-pane-write mobil-senden <%pane>   stdin: {"umschlag":{..},"body_b64":".."}
+#   wb-pane-write mobil-taste  <%pane>   stdin: dasselbe; die Tasten liefert das
+#                                        Pruefprogramm, nie der Aufrufer.
+#
+# WAS DAS WERKZEUG SELBST ERMITTELT, nie aus dem Aufrufer uebernimmt: die Aktion (der
+# Unterbefehl), die Maschine (Rechnername, erster Namensteil -- dieselbe Regel wie
+# config.ts `machine`), den tmux-Socketpfad (tmux nennt ihn selbst,
+# `#{socket_path}` DES Servers, mit dem gleich geschrieben wird) und die Pane-Rolle.
+# Das Pane kommt aus argv, ist aber nur ein Vorschlag: das Pruefprogramm prueft, dass
+# der SIGNIERTE Body genau diese Aktion, Maschine, diesen Socket und dieses Pane
+# bindet. Ein umgebogenes Ziel macht die Signatur ungueltig. Ein `erwartet` im Eingabe-
+# JSON wird verworfen und durch die eigenen Werte ersetzt.
+#
+# DAS PRUEFPROGRAMM ist genau $HOME/.local/bin/wb-mobil-pruefen. Kein PATH-Lookup, keine
+# Variable, kein Schalter, kein argv, die den Pfad, die Frist oder das Pruefverhalten
+# aendern. Fehlt es oder antwortet es nicht EXAKT im Vertrag (Nahtstelle Paket 2/3),
+# ist die Antwort Nein. Das gilt auch fuer eine Antwort mit zusaetzlichen Feldern, mit
+# mehreren Zeilen, mit falscher Aktion, mit Exitcode und Inhalt im Widerspruch, mit
+# Tasten ausserhalb der Whitelist oder mit Steuerzeichen im Text.
+#
+# HOME ist hier dieselbe Vertrauensbasis wie bei wb-mensch und context-guard oben: wer
+# HOME umbiegen kann, kann auch dort ein eigenes Pruefprogramm hinlegen. Dagegen hilft in
+# einer Shell als derselbe Benutzer nichts (siehe GRENZE im Kopf); Spezifikation 4.4,
+# letzte Zeile der Tabelle, nennt dieselbe Grenze.
+#
+# LUECKENENTSCHEIDUNGEN (die Spezifikation schweigt dazu):
+#   * Nur Orchestrator-Panes. Die App zeigt und adressiert nur Orchestrator-Sitzungen
+#     (Spezifikation Abschnitt 1); in ein Worker-Pane schreibt jeder ohnehin ueber
+#     `einfuegen`. Ein Pane, das nachweislich kein Orchestrator ist, bekommt die Antwort
+#     stale_target -- BEVOR das Pruefprogramm den Umschlag verbraucht.
+#   * `mobil-senden` = ein Einfuegen (bracketed paste) und EINMAL Enter, denn Abschnitt 3.1
+#     nennt die Aktion "Text einfuegen und einmal bestaetigen". Zwischen beiden liegt
+#     eine feste Pause (Text und Enter nie im selben Atemzug, siehe pi-worker).
+#   * `mobil-taste` schickt die Folge in EINEM send-keys-Aufruf (fuer tmux ein Befehl).
+#   * Der Text darf ausser Zeilenumbruch und Tabulator kein Steuerzeichen tragen (auch
+#     kein ESC, kein C1): ein `ESC [201~` im Text wuerde das Einfuegen vorzeitig beenden,
+#     und der Rest liefe als Tastendruecke -- das waere eine freie Tastenfolge ohne
+#     Whitelist. Der Umschlag ist dann schon verbraucht; der Client sendet neu.
+#   * Groessen: Eingabe hoechstens 1 MiB, Text hoechstens 512 KiB, Tastenfolge 1 bis 64.
+#   * Ausgabe auf stdout: genau eine JSON-Zeile in der Form des Pruefprogramms, aber ohne
+#     Text und Tasten. Exit 0 = geschrieben, 77 = abgelehnt, 2 = Aufruf oder Eingabe
+#     unbrauchbar, 1 = bestaetigt, aber tmux hat das Schreiben nicht ausgefuehrt.
+MOBIL_STDIN_FRIST=10
+MOBIL_PRUEF_FRIST=15
+MOBIL_ENTER_PAUSE=0.3
+
+# Eingabe -> Anfrage an das Pruefprogramm. Argumente: Aktion, Socketpfad, Pane.
+IFS= read -r -d '' MOBIL_PY_BAUEN <<'PYEOF' || true
+import base64, json, socket, sys
+
+def doppelt(paare):
+    d = {}
+    for k, v in paare:
+        if k in d:
+            raise ValueError("doppelter Schluessel")
+        d[k] = v
+    return d
+
+def konstante(c):
+    raise ValueError("keine JSON-Konstante")
+
+aktion, sock, pane = sys.argv[1:4]
+rohe = sys.stdin.buffer.read()
+if not rohe or len(rohe) > 1048576:
+    raise SystemExit(1)
+d = json.loads(rohe.decode("utf-8"), object_pairs_hook=doppelt, parse_constant=konstante)
+if not isinstance(d, dict) or not set(d) <= {"umschlag", "body_b64", "erwartet"}:
+    raise SystemExit(1)
+if not isinstance(d.get("umschlag"), dict):
+    raise SystemExit(1)
+b = d.get("body_b64")
+if not isinstance(b, str) or not b:
+    raise SystemExit(1)
+base64.b64decode(b, validate=True)
+if "erwartet" in d and not isinstance(d["erwartet"], dict):
+    raise SystemExit(1)
+maschine = socket.gethostname().split(".")[0]
+if not maschine or not sock:
+    raise SystemExit(1)
+sys.stdout.write(json.dumps({
+    "umschlag": d["umschlag"],
+    "body_b64": b,
+    "erwartet": {"aktion": aktion, "maschine": maschine, "socket": sock, "pane": pane},
+}, ensure_ascii=True, separators=(",", ":")))
+PYEOF
+
+# Antwort des Pruefprogramms -> gepruefte Zeilen. Argumente: Exitcode, Aktion.
+# Ausgabe (Tab-getrennt): "OK", danach geraet/request_id und text_b64 bzw. je Taste
+# eine "taste"-Zeile; oder "FEHLER<TAB>code"; oder "UNGUELTIG<TAB>grund".
+IFS= read -r -d '' MOBIL_PY_AUSWERTEN <<'PYEOF' || true
+import base64, json, re, sys
+
+CODES = {
+    "bad_request", "unsupported_api_version", "unauthorized_origin", "device_not_paired",
+    "device_revoked", "key_not_found", "invalid_signature", "invalid_envelope",
+    "audience_mismatch", "request_expired", "nonce_replayed", "counter_replayed",
+    "request_id_conflict", "stale_target", "capability_unavailable", "prompt_changed",
+    "pane_busy",
+    "close_rejected_workers_running", "not_found", "rate_limited", "internal_error",
+}
+TASTEN = {"Enter", "Escape", "C-c", "Tab", "Space", "Up", "Down", "Left", "Right"}
+KENNUNG = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+def doppelt(paare):
+    d = {}
+    for k, v in paare:
+        if k in d:
+            raise ValueError("doppelter Schluessel")
+        d[k] = v
+    return d
+
+def konstante(c):
+    raise ValueError("keine JSON-Konstante")
+
+def ungueltig(grund):
+    print("UNGUELTIG\t" + grund)
+    raise SystemExit(0)
+
+rc, aktion = int(sys.argv[1]), sys.argv[2]
+roh = sys.stdin.buffer.read()
+try:
+    text = roh.decode("utf-8")
+except ValueError:
+    ungueltig("kein UTF-8")
+if not text.strip() or "\n" in text or "\r" in text:
+    ungueltig("nicht genau eine Zeile")
+try:
+    d = json.loads(text, object_pairs_hook=doppelt, parse_constant=konstante)
+except ValueError:
+    ungueltig("kein JSON")
+if not isinstance(d, dict) or not isinstance(d.get("ok"), bool):
+    ungueltig("kein Vertragsobjekt")
+
+if d["ok"] is False:
+    if set(d) != {"ok", "code"} or d["code"] not in CODES or rc != 1:
+        ungueltig("Fehlerantwort nicht im Vertrag")
+    print("FEHLER\t" + d["code"])
+    raise SystemExit(0)
+
+nutz = "text_b64" if aktion == "mobil-senden" else "tasten"
+if rc != 0 or set(d) != {"ok", "geraet", "request_id", "aktion", nutz} or d["aktion"] != aktion:
+    ungueltig("Erfolgsantwort nicht im Vertrag")
+for feld in ("geraet", "request_id"):
+    if not isinstance(d[feld], str) or not KENNUNG.match(d[feld]):
+        ungueltig(feld + " nicht im Vertrag")
+
+zeilen = ["OK", "geraet\t" + d["geraet"], "request_id\t" + d["request_id"]]
+if nutz == "text_b64":
+    b = d["text_b64"]
+    if not isinstance(b, str):
+        ungueltig("text_b64 kein Text")
+    try:
+        t = base64.b64decode(b, validate=True).decode("utf-8")
+    except ValueError:
+        ungueltig("text_b64 unbrauchbar")
+    if not t or len(t.encode("utf-8")) > 524288:
+        ungueltig("Text leer oder zu gross")
+    for c in t:
+        o = ord(c)
+        if (o < 0x20 and c not in "\n\t") or o == 0x7F or 0x80 <= o <= 0x9F:
+            ungueltig("Steuerzeichen im Text")
+    zeilen.append("text_b64\t" + b)
+else:
+    tasten = d["tasten"]
+    if not isinstance(tasten, list) or not 1 <= len(tasten) <= 64:
+        ungueltig("tasten unbrauchbar")
+    for k in tasten:
+        if not isinstance(k, str) or k not in TASTEN:
+            ungueltig("Taste ausserhalb der Whitelist")
+        zeilen.append("taste\t" + k)
+print("\n".join(zeilen))
+PYEOF
+
+# Alles, was ueber Ja oder Nein entscheidet, laeuft in einer SAUBEREN Umgebung: das
+# Pruefprogramm und der Python-Interpreter, der seine Antwort liest. Grund (gemessen
+# 2026-09-18): /usr/bin/python3 ist auf macOS eine Xcode-Huelle, die `DEVELOPER_DIR` aus
+# der Umgebung des Aufrufers befolgt und damit ein beliebiges Programm startet; ein
+# Pruefprogramm auf Node laesse sich ueber NODE_OPTIONS/NODE_PATH und ein `#!/usr/bin/env
+# node` ueber PATH unterwandern. `env -i` (absolut) laesst nur HOME und einen festen PATH
+# durch -- das macht die Zusage der Nahtstelle "keine Umgebungsvariable veraendert das
+# Pruefverhalten" von dieser Seite aus wahr. Folge fuer Paket 10/11: das installierte
+# Pruefprogramm muss mit diesem PATH und ohne weitere Variablen lauffaehig sein (ein
+# absoluter Interpreter in der Shebang-Zeile). HOME, TMPDIR und PATH sind die
+# vollstaendige Allowlist fuer jeden verifier subprocess in dieser Datei.
+MOBIL_SAUBER_PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+mobil_python() {   # <programmtext> [argv...]; stdin wird durchgereicht
+    /usr/bin/env -i HOME="$HOME" TMPDIR=/tmp PATH=/usr/bin:/bin /usr/bin/python3 -I -B -c "$@"
+}
+# `head` und `sleep` auf der Entscheidungskette (Eingabe lesen, Frist abwarten) werden
+# aus festen Verzeichnissen genommen, nie aus dem PATH des Aufrufers: `sleep` liefe INNERHALB
+# der Ausgabeerfassung des Pruefprogramms, und ein untergeschobenes `sleep` koennte dort
+# eine Zusage in dessen Ausgabe schreiben. Fehlt eines von beiden, ist die Antwort Nein.
+MOBIL_HEAD=""; MOBIL_SLEEP=""
+for _m in /usr/bin/head /bin/head; do [ -x "$_m" ] && { MOBIL_HEAD="$_m"; break; }; done
+for _m in /bin/sleep /usr/bin/sleep; do [ -x "$_m" ] && { MOBIL_SLEEP="$_m"; break; }; done
+unset _m
+
+# Das Pruefprogramm mit fester Frist -- ohne `timeout` aus dem PATH des Aufrufers: ein
+# untergeschobenes `timeout` koennte das Pruefprogramm gar nicht erst starten und statt
+# seiner eine Zusage ausgeben. Rueckgabe wie das Programm, 124 bei Ablauf.
+mobil_pruefen() {   # <pruefer> <anfrage>; stdout des Pruefprogramms, stderr verworfen
+    local pruefer="$1" anfrage="$2" kind ende=$(( SECONDS + MOBIL_PRUEF_FRIST ))
+    [ -n "$MOBIL_SLEEP" ] || return 125
+    /usr/bin/env -i HOME="$HOME" TMPDIR=/tmp PATH="$MOBIL_SAUBER_PATH" "$pruefer" <<<"$anfrage" 2>/dev/null &
+    kind=$!
+    # Nur das Pruefprogramm schreibt in die Erfassung; alles andere hier gehoert nach /dev/null.
+    while kill -0 "$kind" 2>/dev/null; do
+        if [ "$SECONDS" -ge "$ende" ]; then
+            kill -TERM "$kind" 2>/dev/null
+            "$MOBIL_SLEEP" 0.2 >/dev/null 2>&1
+            kill -KILL "$kind" 2>/dev/null
+            wait "$kind" 2>/dev/null
+            return 124
+        fi
+        "$MOBIL_SLEEP" 0.05 >/dev/null 2>&1
+    done
+    wait "$kind"
+}
+
+mobil_antwort() {   # <exit> <code> -- die eine JSON-Zeile auf stdout, dann Ende
+    local rc="$1" code="$2"
+    printf '{"ok":false,"code":"%s"}\n' "$code"
+    exit "$rc"
+}
+
+mobil_ausfuehren() {   # <aktion> [rest-argv...] -- kehrt nie zurueck
+    local aktion="$1" pruefer tmuxantwort pane_id sock_pfad anfrage antwort rc erg k v
+    local geraet="" request_id="" text_b64="" status="" grund="" n
+    local tasten=()
+    shift
+    # Aufruf: genau `<aktion> <pane>`. Alles weitere waere ein Versuch, dem Werkzeug
+    # ueber argv etwas mitzugeben -- ein Vertrauensflag, einen Pfad.
+    [ "$#" -eq 1 ] || { echo "wb-pane-write: $aktion nimmt genau ein Pane und sonst nichts aus argv." >&2; mobil_antwort 2 bad_request; }
+    case "$PANE" in
+        %|%*[!0-9]*|[!%]*)
+            echo "wb-pane-write: $aktion braucht ein tmux-Pane der Form %<n>, nicht '$PANE'." >&2
+            mobil_antwort 2 bad_request ;;
+    esac
+    # Ohne Eingabe nichts tun -- und nie an einem Terminal auf Text warten.
+    if [ -t 0 ]; then
+        echo "wb-pane-write: $aktion liest den signierten Umschlag von stdin; stdin ist ein Terminal." >&2
+        mobil_antwort 2 bad_request
+    fi
+
+    # 0. tmux von einem festen Pfad (siehe TM_FEST oben), nie aus dem PATH des Aufrufers.
+    [ -n "$MOBIL_SLEEP" ] || { echo "wb-pane-write: $aktion: kein sleep in /bin oder /usr/bin -- Nein." >&2; mobil_antwort 77 capability_unavailable; }
+    for k in /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux /bin/tmux; do
+        if [ -f "$k" ] && [ -x "$k" ]; then TM_FEST="$k"; break; fi
+    done
+    if [ -z "$TM_FEST" ]; then
+        echo "wb-pane-write: ABGELEHNT — $aktion: kein tmux an einem festen Ort (/opt/homebrew/bin, /usr/local/bin, /usr/bin, /bin)." >&2
+        mobil_antwort 77 capability_unavailable
+    fi
+
+    # 1. Ziel und Rolle -- BEVOR irgendetwas verbraucht wird.
+    tmuxantwort=$(tm display-message -p -t "$PANE" "#{pane_id}"$'\t'"#{socket_path}" 2>/dev/null) || tmuxantwort=""
+    IFS=$'\t' read -r pane_id sock_pfad <<<"$tmuxantwort"
+    if [ "${pane_id:-}" != "$PANE" ] || [ -z "${sock_pfad:-}" ]; then
+        echo "wb-pane-write: ABGELEHNT — $aktion: Pane $PANE gibt es auf dem gewaehlten tmux-Server nicht." >&2
+        mobil_antwort 77 stale_target
+    fi
+    rolle_lesen
+    if [ "$ROLLE" != orchestrator ]; then
+        echo "wb-pane-write: ABGELEHNT — $aktion: Pane $PANE ist kein Orchestrator ($ROLLE_QUELLE); die Mobil-Herkunft gilt nur fuer Orchestrator-Panes." >&2
+        mobil_antwort 77 stale_target
+    fi
+
+    # 2. Das feste Pruefprogramm.
+    [ -n "${HOME:-}" ] || { echo "wb-pane-write: ABGELEHNT — $aktion: HOME ist leer, das Pruefprogramm ist nicht auffindbar." >&2; mobil_antwort 77 capability_unavailable; }
+    pruefer="$HOME/.local/bin/wb-mobil-pruefen"
+    if [ ! -f "$pruefer" ] || [ ! -x "$pruefer" ]; then
+        echo "wb-pane-write: ABGELEHNT — $aktion: $pruefer fehlt oder ist nicht ausfuehrbar; ohne Pruefung gilt: Nein." >&2
+        mobil_antwort 77 capability_unavailable
+    fi
+
+    # 3. Eingabe lesen und die Anfrage bauen -- mit den EIGENEN Werten.
+    [ -n "$MOBIL_HEAD" ] || { echo "wb-pane-write: $aktion: kein head in /usr/bin oder /bin -- Nein." >&2; mobil_antwort 77 capability_unavailable; }
+    anfrage=$(mit_frist_fest "$MOBIL_STDIN_FRIST" "$MOBIL_HEAD" -c 1048577 | mobil_python "$MOBIL_PY_BAUEN" "$aktion" "$sock_pfad" "$PANE" 2>/dev/null) || anfrage=""
+    if [ -z "$anfrage" ]; then
+        echo "wb-pane-write: $aktion: stdin ist leer, zu gross oder kein {\"umschlag\":{..},\"body_b64\":\"..\"}." >&2
+        mobil_antwort 2 bad_request
+    fi
+
+    # 4. Pruefen lassen. Stdout des Pruefprogramms wird nie an den Aufrufer
+    # durchgereicht, stderr verworfen: dort koennte Schluessel- oder Signaturmaterial stehen.
+    antwort=$(mobil_pruefen "$pruefer" "$anfrage")
+    rc=$?
+    erg=$(printf '%s' "$antwort" | mobil_python "$MOBIL_PY_AUSWERTEN" "$rc" "$aktion" 2>/dev/null) \
+        || erg=$'UNGUELTIG\tAuswertung fehlgeschlagen'
+    status="${erg%%$'\n'*}"
+    case "$status" in
+        FEHLER$'\t'*)
+            echo "wb-pane-write: ABGELEHNT — $aktion auf Pane $PANE: das Pruefprogramm sagt Nein (${status#*$'\t'})." >&2
+            mobil_antwort 77 "${status#*$'\t'}" ;;
+        OK) : ;;
+        *)
+            grund="${status#*$'\t'}"
+            case "$rc" in 124|137) grund="keine Antwort innerhalb ${MOBIL_PRUEF_FRIST}s" ;; esac
+            echo "wb-pane-write: ABGELEHNT — $aktion auf Pane $PANE: Antwort des Pruefprogramms nicht im Vertrag ($grund); Nein." >&2
+            mobil_antwort 77 internal_error ;;
+    esac
+    while IFS=$'\t' read -r k v; do
+        case "$k" in
+            geraet) geraet="$v" ;;
+            request_id) request_id="$v" ;;
+            text_b64) text_b64="$v" ;;
+            taste) tasten+=("$v") ;;
+        esac
+    done <<<"$erg"
+    erg=""
+
+    # 4b. Erst jetzt: ist der Pane frei? (tipp-sperre, 2026-10-09) Reihenfolge, entschieden:
+    #     Eingabeform (Exit 2) -> Ziel und Rolle (77 stale_target) -> Pruefprogramm
+    #     (verbraucht den Umschlag) -> frei (77 pane_busy) -> schreiben. Das Pruefprogramm
+    #     kennt keinen Pruefen-ohne-Verbrauch-Schritt; die Freiheit eines Panes erfaehrt
+    #     deshalb nur, wer gueltig signiert hat -- nie ein unbelegter Aufrufer. Jedes
+    #     Senden wird neu signiert, der verbrauchte Umschlag kostet also nichts.
+    #     Vorher stand die Pruefung VOR Schritt 0: ein ungueltiges oder verschwundenes
+    #     Pane endete mit 75 "Schirm nicht lesbar" statt 2 bzw. 77 stale_target.
+    #     `mobil-taste` prueft nicht: es beantwortet Dialoge absichtlich.
+    if [ "$aktion" = mobil-senden ]; then
+        grund=$(pane_frei_grund voll)
+        if [ -n "$grund" ]; then
+            echo "wb-pane-write: NICHT FREI — $aktion auf Pane $PANE: $grund. Nichts getippt." >&2
+            case "$grund" in
+                "$FREI_FEHLT"*) mobil_antwort 77 stale_target ;;
+                *) mobil_antwort 77 pane_busy ;;
+            esac
+        fi
+    fi
+
+    # 5. Genau die bestaetigte Aktion ausfuehren, ueber dieselben tmux-Primitive wie
+    # `einfuegen` und `taste` oben (load-buffer + paste-buffer -p, send-keys).
+    case "$aktion" in
+        mobil-senden)
+            n="wbpwm-$$"
+            if ! printf '%s' "$text_b64" \
+                 | mobil_python 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read(), validate=True))' \
+                 | tm load-buffer -b "$n" -; then
+                tm delete-buffer -b "$n" 2>/dev/null
+                echo "wb-pane-write: $aktion: load-buffer fehlgeschlagen." >&2
+                mobil_antwort 1 internal_error
+            fi
+            if ! tm paste-buffer -p -b "$n" -d -t "$PANE"; then
+                tm delete-buffer -b "$n" 2>/dev/null
+                echo "wb-pane-write: $aktion: paste-buffer an $PANE fehlgeschlagen." >&2
+                mobil_antwort 1 internal_error
+            fi
+            "$MOBIL_SLEEP" "$MOBIL_ENTER_PAUSE"
+            tm send-keys -t "$PANE" Enter \
+                || { echo "wb-pane-write: $aktion: Enter an $PANE fehlgeschlagen (der Text steht schon im Pane)." >&2; mobil_antwort 1 internal_error; } ;;
+        mobil-taste)
+            tm send-keys -t "$PANE" "${tasten[@]}" \
+                || { echo "wb-pane-write: $aktion: Tasten an $PANE fehlgeschlagen." >&2; mobil_antwort 1 internal_error; } ;;
+    esac
+    printf '{"ok":true,"geraet":"%s","request_id":"%s","aktion":"%s"}\n' "$geraet" "$request_id" "$aktion"
+    exit 0
+}
+
+# --- Ist der Pane FREI zum Tippen? (2026-10-09) ---------------------------------
+#
+# VORFALL (09.10.2026, Pane %32, WorkbenchOrchestrator, Logs context-guard--...-a0eed0):
+# die Kontextwache tippte um 08:52:53 "/compact" und um 08:54:56 "WEITERARBEITEN",
+# jeweils mit Enter, waehrend im Pane eine AskUserQuestion offen stand. Die Buchstaben
+# verschluckte der Dialog, das Enter bestaetigte die markierte ERSTE Option -- zweimal
+# eine Antwort, die der Nutzer nicht gegeben hatte (Transkript: tool_result 06:52:52Z und
+# 06:54:55Z, jeweils "Nur menschliche Eingaben (Empfohlen)"). Die Wache pruefte vor dem
+# Tippen nur "arbeitet der Pane?"; ein offener Dialog arbeitet nicht.
+#
+# Deshalb prueft dieses Werkzeug -- die eine Stelle, durch die getippt wird -- vor
+# JEDEM Schreiben, ob der Pane frei ist, und tippt sonst NICHTS (Exit 75):
+#   * Dialog offen: Fusszeile eines Auswahl-/Rechte-/Trust-Dialogs ("Enter to select",
+#     "Enter to confirm", "Esc to cancel", "Press enter to confirm", "Tab to amend",
+#     "to navigate") oder ein Auswahlzeiger (❯ › >) direkt vor einer nummerierten
+#     Option. Muster aus echten Panebildern: app/test/fixtures/mobile-dialogs/
+#     (claude 2.1.277/2.1.278 AskUserQuestion und Rechteabfragen, codex 0.146.0
+#     Freigabe) und dem Trust-Dialog aus test-wb-vertrauen; Test test-pane-frei.sh.
+#   * Sitzungsregister ~/.claude/sessions/<pid>.json meldet "status":"waiting" fuer
+#     genau diesen Pane (Feld "tmux" = <session>:@<fenster>.<pane>). Belegt im
+#     Claude-Code-Programm 2.1.295: waitingFor "dialog open" / "input needed" /
+#     "sandbox request" setzen diesen Status.
+#   * (nur Modus voll) die Eingabezeile traegt ungesendeten Text. Erkannt werden die
+#     Eingabezeilen von Claude ('❯') und Codex ('›'); ein Platzhalter ("Press up to
+#     edit queued messages", gedimmter Vorschlag) zaehlt als leer.
+#   * Schirm nicht lesbar (capture-pane bzw. Steuerkanal scheitert): unklar = nicht frei.
+#     Ein LEERER Schirm ist lesbar und zeigt keinen Dialog -- er gilt als frei.
+# Modus "dialog" (nur Dialog + Register) gilt fuer `taste` -- das Enter nach dem
+# eigenen Text muss durch, ein Enter in einen Dialog nie -- und fuer Aufrufer, die
+# ihre Eingabezeile selbst gemessen leeren (pi-worker, Schalter --nur-dialog).
+# `mobil-taste` beantwortet Dialoge absichtlich und prueft darum nicht.
+NICHT_FREI=75
+# Grund-Anfang fuer ein Pane, das es auf dem Server nicht (mehr) gibt.
+FREI_FEHLT="Pane gibt es nicht"
+
+IFS= read -r -d '' FREI_PY <<'PYEOF' || true
+import glob, json, os, re, sys
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+modus, sitzung, pane, home = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+roh = sys.stdin.buffer.read().decode("utf-8", "replace")
+ANSI = re.compile(r"\x1b\[[0-9;?:]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+LEER = " \t "
+zeilen_ansi = roh.replace("\r", "").split("\n")
+zeilen = [ANSI.sub("", z).rstrip(LEER) for z in zeilen_ansi]
+
+def nein(grund):
+    print(grund)
+    sys.exit(0)
+
+# 1. Sitzungsregister (nur tmux-Panes; Feld tmux = "<session>:@<fenster>.<pane>")
+# sitzung: alle Namen der Session-Gruppe des Panes, durch Leerzeichen getrennt -- das
+# Register nennt je nach Client die Basis oder ihre '-view'-Schwester (gesehen: wb-AI-view).
+sitzungen = set(sitzung.split())
+if sitzungen and pane.startswith("%"):
+    for f in glob.glob(os.path.join(home, ".claude", "sessions", "*.json")):
+        try:
+            with open(f, encoding="utf-8") as h:
+                d = json.load(h)
+        except Exception:
+            continue
+        t = str(d.get("tmux") or "")
+        if not (t.endswith("." + pane) and t.split(":", 1)[0] in sitzungen):
+            continue
+        try:
+            os.kill(int(d.get("pid")), 0)
+        except Exception:
+            continue
+        if d.get("status") == "waiting":
+            nein("Sitzungsregister meldet waiting (%s)" % (d.get("waitingFor") or "ohne Grund"))
+
+# 2. Schirm
+inhalt = [i for i, z in enumerate(zeilen) if z.strip(LEER)]
+if not inhalt:
+    sys.exit(0)            # leerer Schirm: kein Dialog, keine Eingabe (nicht lesbar prueft der Aufrufer)
+schwanz = [zeilen[i] for i in inhalt[-20:]]
+FUSS = re.compile(r"Enter to (select|confirm|submit)|Esc to (cancel|exit|go back)|Press enter to confirm"
+                  r"|to navigate|Tab to amend", re.I)
+OPTION = re.compile(r"^[\s│|]*[❯›>]\s*[0-9]+[.)]\s+\S")
+NUMMER = re.compile(r"^[\s│|]*[❯›>]?\s*[0-9]+[.)]\s+\S")
+# Sichtbares Eingabefeld von Claude unten -- Rahmen, '❯'-Zeile, Rahmen, darunter hoechstens zwei
+# Statuszeilen -- heisst: kein Dialog offen. In allen gemessenen Claude-Dialogbildern (2.1.277,
+# 2.1.278, 2.1.292 live, 2.1.296 Vollbild und inline) ersetzt der Dialog das Eingabefeld. Dann
+# zaehlt fuer FUSS/OPTION/EINGERUECKT nur, was UNTER dem Feld steht, nicht der Verlauf darueber:
+# eine Antwort mit "to navigate", "Esc to cancel" oder "> 1." im Text ist kein Dialog (Fehlalarm
+# am arbeitenden Orchestrator, 13.10.). 2.1.29x schreibt den Sitzungsnamen (`claude -n <name>`)
+# in den Rahmen: "────…──── Studium ─". Fixtures: shell/tests/fixtures/panebilder/, Test
+# test-pane-frei.sh Abschnitt I. Eine Optionszeile ("❯ 4. Chat about this" zwischen zwei Rahmen)
+# ist nie das Eingabefeld (Review 14.10., N1). Die Regel ruht auf der Messung "Dialog ersetzt das
+# Feld": bei jeder neuen Claude-Version mit app/test/mobile/dialogs/messen/claude-dialog.sh
+# nachmessen und pruefen, dass kein Dialog UEBER dem Feld steht.
+RAHMEN = re.compile(r"^─{20,}(?: [^─\s](?:[^─]*[^─\s])? ─{1,4})?$")
+EINGABEFELD = re.compile(r"^❯(?:[  ]|$)")
+for k in range(len(inhalt) - 1, max(1, len(inhalt) - 4), -1):
+    feld = zeilen[inhalt[k - 1]]
+    if (RAHMEN.match(zeilen[inhalt[k]]) and EINGABEFELD.match(feld) and not OPTION.search(feld)
+            and RAHMEN.match(zeilen[inhalt[k - 2]])):
+        schwanz = [zeilen[j] for j in inhalt[k + 1:]]
+        break
+for z in schwanz:
+    if FUSS.search(z):
+        nein("Dialog offen: " + z.strip(LEER + "│|")[:80])
+zeiger = [z for z in schwanz if OPTION.search(z)]
+if zeiger and sum(1 for z in schwanz if NUMMER.search(z)) >= 2:
+    nein("Dialog offen: Auswahlliste (" + zeiger[-1].strip(LEER + "│|")[:60] + ")")
+# Eingerueckter Zeiger ohne Nummer: Auswahllisten wie die Erststart-Themenwahl von
+# Claude 2.1.295 (" ❯ ✔ Dark mode", keine Ziffern, keine Fusszeile -- echtes Panebild
+# shell/tests/fixtures/panebilder/claude-2.1.295-erststart.ansi.txt) oder der Trust-Dialog
+# (" ❯ No, exit"). Die Eingabezeile von Claude und Codex steht immer in Spalte 0.
+# Damit der Verlauf nicht mitzaehlt (Copilot zeigt einen abgeschickten Prompt als
+# "  ❯ <text>  21:52" zwischen Balken, test-harness-copilot.sh), braucht der Zeiger eine
+# Nachbarzeile, die als weitere Option darunter oder darueber steht: nur Leerzeichen bis
+# hinter den Zeiger, Text hoechstens zwei Spalten hinter dem Optionstext.
+EINGERUECKT = re.compile(r"^([ \t]+)[❯›]([ \u00a0]+)\S")
+for k, z in enumerate(schwanz):
+    m = EINGERUECKT.search(z)
+    if not m:
+        continue
+    c = len(m.group(1))
+    t = c + 1 + len(m.group(2))
+    for n in schwanz[max(0, k - 2):k] + schwanz[k + 1:k + 3]:
+        einzug = len(n) - len(n.lstrip(LEER))
+        if c < einzug <= t + 2 and n.strip(LEER)[:1] not in "▀▄─━═╌╭╰│┃╻╹":
+            nein("Dialog offen: Auswahlliste (" + z.strip(LEER)[:60] + ")")
+if modus != "voll":
+    sys.exit(0)
+
+# 3. Eingabezeile: letzte Zeile, die mit dem Zeiger von Claude oder Codex beginnt
+EINGABE = re.compile(r"^[❯›](?:[  ]|$)")
+idx = [i for i, z in enumerate(zeilen) if EINGABE.match(z) and not OPTION.search(z)]
+if not idx:
+    sys.exit(0)
+i = idx[-1]
+text = zeilen[i][1:].strip(LEER)
+if not text or text.startswith("Press up to edit queued messages"):
+    sys.exit(0)
+# Gedimmter Text ist ein Platzhalter/Vorschlag, kein getippter Text.
+sichtbar, dim, pos, z = [], False, 0, zeilen_ansi[i]
+for m in re.finditer(r"\x1b\[([0-9;:]*)m|\x1b\[[0-9;?:]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]", z):
+    if not dim:
+        sichtbar.append(z[pos:m.start()])
+    if m.group(0).endswith("m") and m.group(1) is not None:
+        for p in (m.group(1) or "0").replace(":", ";").split(";"):
+            if p in ("", "0", "22"):
+                dim = False
+            elif p == "2":
+                dim = True
+    pos = m.end()
+if not dim:
+    sichtbar.append(z[pos:])
+rest = "".join(sichtbar).lstrip(LEER)
+rest = rest[1:] if rest[:1] in ("❯", "›") else rest
+if not rest.strip(LEER):
+    sys.exit(0)
+nein("ungesendeter Text in der Eingabezeile: " + text[:60])
+PYEOF
+
+frei_python() {   # <programmtext> [argv...]; stdin wird durchgereicht
+    /usr/bin/env -i HOME="$HOME" TMPDIR=/tmp PATH=/usr/bin:/bin /usr/bin/python3 -I -B -c "$@"
+}
+
+# Grund, warum $PANE NICHT frei ist -- leer, wenn frei. <modus>: voll | dialog
+pane_frei_grund() {
+    local modus="$1" bild sitzung="" grund
+    if ist_pty_pane "$PANE"; then
+        bild=$(ctl pane-schirm "$PANE" 2>/dev/null) || { printf 'Schirm nicht lesbar (Steuerkanal)'; return 0; }
+    else
+        if ! bild=$(tm capture-pane -p -e -t "$PANE" 2>/dev/null); then
+            # Ein Pane, das es nicht gibt, ist kein unlesbarer Schirm: die Aufrufer sollen
+            # weiter "Ziel weg" sehen (tippen/einfuegen/taste 1, mobil 77 stale_target).
+            # Antwortet der Server gar nicht (Frist), bleibt es "nicht lesbar". tmux 3.7c
+            # antwortet auf ein fehlendes Ziel mit Exit 0 und leerer Zeile (gemessen).
+            local id rc
+            id=$(tm display-message -p -t "$PANE" '#{pane_id}' 2>/dev/null); rc=$?
+            if [ -z "$id" ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ]; then
+                printf '%s' "$FREI_FEHLT"; return 0
+            fi
+            printf 'Schirm nicht lesbar (capture-pane)'; return 0
+        fi
+        # Alle Sessions der Gruppe des Panes (Basis und '-view'-Schwestern teilen die Panes).
+        local name gruppe eigene
+        eigene=$(tm display-message -p -t "$PANE" '#{session_name}	#{session_group}' 2>/dev/null) || eigene=""
+        sitzung="${eigene%%	*}"
+        gruppe="${eigene#*	}"; [ "$gruppe" = "$eigene" ] && gruppe=""
+        if [ -n "$gruppe" ]; then
+            while IFS='	' read -r name eigene; do
+                [ "$eigene" = "$gruppe" ] && sitzung="$sitzung $name"
+            done < <(tm list-sessions -F '#{session_name}	#{session_group}' 2>/dev/null)
+        fi
+    fi
+    grund=$(printf '%s' "$bild" | frei_python "$FREI_PY" "$modus" "$sitzung" "$PANE" "$HOME" 2>/dev/null) \
+        || grund="Pruefung fehlgeschlagen (python3)"
+    printf '%s' "$grund"
+}
+
+frei_oder_abbrechen() {   # <modus> <aktion>
+    local grund
+    grund=$(pane_frei_grund "$1")
+    [ -z "$grund" ] && return 0
+    case "$grund" in
+        "$FREI_FEHLT"*)
+            echo "wb-pane-write: $2 an $PANE fehlgeschlagen: $grund. Nichts getippt." >&2
+            exit 1 ;;
+    esac
+    echo "wb-pane-write: NICHT FREI — $2 auf Pane $PANE: $grund. Nichts getippt." >&2
+    exit "$NICHT_FREI"
+}
+
 case "$CMD" in
-    darf|tippen|einfuegen|taste|beleg) : ;;
+    darf|tippen|einfuegen|taste|beleg|frei|mobil-senden|mobil-taste) : ;;
     ''|-h|--help)
-        sed -n '2,10p' "$0" >&2
+        sed -n '2,17p' "$0" >&2
         exit 2 ;;
     *)
-        echo "wb-pane-write: unbekanntes Kommando '$CMD' (darf|tippen|einfuegen|taste|beleg)" >&2
+        echo "wb-pane-write: unbekanntes Kommando '$CMD' (darf|frei|tippen|einfuegen|taste|beleg|mobil-senden|mobil-taste)" >&2
         exit 2 ;;
 esac
 [ -n "$PANE" ] || { echo "wb-pane-write: Pane fehlt — 'wb-pane-write $CMD <pane>'" >&2; exit 2; }
+
+# `frei` liest nur und braucht deshalb keine Herkunft. Exit 0 frei, 75 nicht frei
+# (Grund auf stdout). `--nur-dialog` prueft nur Dialog und Sitzungsregister.
+if [ "$CMD" = frei ]; then
+    _grund=$(pane_frei_grund "$FREI_MODUS")
+    [ -z "$_grund" ] && exit 0
+    printf '%s\n' "$_grund"
+    exit "$NICHT_FREI"
+fi
+
+# Die dritte Herkunft laeuft VOR `entscheiden`: dessen Antwort waere fuer ein
+# Mobilgeraet immer Nein. Diese Zweige kehren nie in den Rest des Skripts zurueck.
+case "$CMD" in
+    mobil-senden) mobil_ausfuehren "$CMD" "${@:2}" ;;
+    mobil-taste) mobil_ausfuehren "$CMD" "${@:2}" ;;
+esac
 
 if [ "$CMD" = beleg ]; then
     entscheiden || true
@@ -456,6 +1154,34 @@ if [ "$CMD" = beleg ]; then
 fi
 
 entscheiden || ablehnen "$CMD"
+
+# Eine SCHLAFENDE Sitzung (wb-schlaf, 25.09.2026) erst wecken, dann schreiben -- sonst
+# landet der Text im Warteschirm. Gilt fuer jeden Harness (pi-worker, wb-post, ...).
+case "$CMD" in
+    tippen|einfuegen)
+        if [ -n "$(tm show-options -pqv -t "$PANE" @wb_schlaeft 2>/dev/null)" ] \
+           && [ -x "$HOME/.local/bin/wb-schlaf" ]; then
+            WB_TMUX_SOCKET="${SOCKET:-}" "$HOME/.local/bin/wb-schlaf" wecken "$PANE" --warten 120 >&2 \
+                || echo "wb-pane-write: $PANE schlief und ist nach 120 s noch nicht bereit." >&2
+        fi ;;
+esac
+
+# Erst NACH dem Wecken pruefen: der Warteschirm einer schlafenden Sitzung ist nicht
+# ihr Zustand. Text nur in einen freien Pane, eine Taste nie in einen Dialog.
+case "$CMD" in
+    tippen|einfuegen) frei_oder_abbrechen "$FREI_MODUS" "$CMD" ;;
+    taste)
+        # --trotz-dialog: nur fuer einen ausdruecklichen Abbruch (pi-worker --interrupt).
+        # Escape/C-c brechen einen Dialog ab, sie waehlen keine Option -- Enter nie.
+        if [ "$FREI_TROTZ" = 1 ]; then
+            case "${3:-}" in
+                Escape|C-c) : ;;
+                *) echo "wb-pane-write: --trotz-dialog gilt nur fuer Escape und C-c." >&2; exit 2 ;;
+            esac
+        else
+            frei_oder_abbrechen dialog "$CMD"
+        fi ;;
+esac
 
 case "$CMD" in
     darf)

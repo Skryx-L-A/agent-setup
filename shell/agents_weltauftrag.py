@@ -287,7 +287,11 @@ def anlegen(job: dict[str, Any]) -> dict[str, Any]:
         name = "Global"
     vorhanden = (ablage / "world.json").exists()
     if not vorhanden:
-        ad.create_world(ablage, name, global_world=art == "global", with_main_agent=False)
+        # Der Fernauftrag ist eine ausdrueckliche CLI-Oberflaeche, kein gemessener
+        # Mensch. Die Welt speichert diesen begrenzten Akteur statt ohne Herkunft
+        # angelegt zu werden.
+        ad.create_world(ablage, name, global_world=art == "global", with_main_agent=False,
+                        sender="cli-operator")
     result: dict[str, Any] = {"pfad": str(ablage), "projekt": str(projekt) if projekt else None, "name": name,
                               "vorhanden": vorhanden, "maschine": maschine()}
     if job.get("einrichten") is True:

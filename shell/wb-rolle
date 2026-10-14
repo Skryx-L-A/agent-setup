@@ -92,14 +92,22 @@ ahnen() {
 }
 
 MENSCH_GRUND=""
+# M2 (Oberflaeche als Ahne) braucht WB_MENSCH_QUELLE und WB_APP_PID, und `env -i`
+# loescht beide. Ohne diese Allowlist scheiterte seit dem 21.09. jeder Menschen-Nachweis
+# ueber die Werkbank-App, sichtbar als "'--mensch' abgelehnt" beim Sitzungsstart (Befund 26.09.2026). Beide sind nur
+# Behauptungen, die wb-mensch gegen seine echte Ahnenkette prueft -- dieselbe
+# Allowlist wie in wb-pane-write; alle uebrige Aufruferumgebung bleibt weg.
+M2_UMGEBUNG=()
+if [ "${WB_MENSCH_QUELLE:-}" = oberflaeche ]; then
+  case "${WB_APP_PID:-}" in ''|*[!0-9]*) ;; *) M2_UMGEBUNG=(WB_MENSCH_QUELLE=oberflaeche "WB_APP_PID=$WB_APP_PID") ;; esac
+fi
 ist_mensch() {
     local beleg
     if [ -x "$HOME/.local/bin/wb-mensch" ]; then
-        beleg=$("$HOME/.local/bin/wb-mensch" beleg 2>/dev/null)
-    elif command -v wb-mensch >/dev/null 2>&1; then
-        beleg=$(wb-mensch beleg 2>/dev/null)
+        beleg=$(/usr/bin/env -i HOME="$HOME" TMPDIR=/tmp PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+            ${M2_UMGEBUNG[@]+"${M2_UMGEBUNG[@]}"} "$HOME/.local/bin/wb-mensch" beleg 2>/dev/null)
     else
-        MENSCH_GRUND="wb-mensch nicht gefunden — ohne Messung gilt: kein Mensch."
+        MENSCH_GRUND="wb-mensch am festen Pfad nicht gefunden — ohne Messung gilt: kein Mensch."
         return 1
     fi
     MENSCH_GRUND="${beleg#*$'\t'}"

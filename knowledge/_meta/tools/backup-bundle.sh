@@ -4,7 +4,9 @@ set -euo pipefail
 # Brain 3.0 Knowledge Vault Backup Script
 # Creates a git bundle of all refs + rsyncs LFS objects
 # Retains last 8 weeks, deletes older backups
-# Called via launchd weekly (Sunday 04:00)
+# Called via launchd weekly (Sunday 04:00) -- RETIRED: the LaunchAgent is not loaded since 2026-08-16.
+# Replaced by the daily Forgejo backup on peer (forgejo-backup.timer) plus the my-server standby copy
+# (decision 2026-10-14, 10-global/system-automation-inventory.md). Kept for a manual one-off bundle.
 
 REPO_DIR="$HOME/Knowledge"
 BACKUP_BASE="$HOME/Backups/knowledge-vault"

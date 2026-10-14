@@ -1,0 +1,191 @@
+/* CHAT: Verlauf, Werkzeugaufrufe, Entscheidungen, Composer und Sondertasten. */
+
+.chat-ansicht { background: var(--grund); }
+.chat-ansicht .navleiste { background: var(--grund); }
+.chat-ansicht.gescrollt .navleiste { background: var(--leiste); }
+
+.chat-inhalt { padding-bottom: 12px; }
+.verlauf {
+  display: flex; flex-direction: column; gap: 14px;
+  padding: 8px var(--rand) 8px; max-width: 780px; margin: 0 auto;
+}
+.msg { min-width: 0; }
+.msg.mensch { align-self: flex-end; max-width: 86%; }
+.blase {
+  background: var(--wahl); padding: 9px 14px; border-radius: 18px; line-height: 1.35;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+:root[data-thema='hell'] .blase { background: var(--erhoben); }
+/* Gesendet, im Verlauf noch nicht gefuehrt: dieselbe Spalte wie der Verlauf,
+   die Blase gleich, darunter ein leiser Vermerk. */
+.unterwegs {
+  display: flex; flex-direction: column; gap: 14px;
+  padding: 0 var(--rand); max-width: 780px; margin: 0 auto;
+}
+.unterwegs:empty { display: none; }
+.msg.mensch.ausstehend { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+.msg-vermerk { font-size: 0.706rem; color: var(--gedaempft); padding-right: 6px; }
+.msg.agent { line-height: 1.45; overflow-wrap: anywhere; }
+.msg.system { align-self: center; text-align: center; font-size: 0.765rem; color: var(--gedaempft); padding: 0 24px; }
+.zeitmarke { align-self: center; font-size: 0.706rem; font-weight: 600; color: var(--gedaempft); padding-top: 6px; }
+.neu-trenner {
+  display: flex; align-items: center; gap: 10px; color: var(--akzent-text);
+  font-size: 0.706rem; font-weight: 700;
+}
+.neu-trenner::before, .neu-trenner::after { content: ''; flex: 1; height: 1px; background: var(--akzent-matt); }
+
+/* Markdown des Agenten (chat/markdown.ts erzeugt nur feste, sichere Tags) */
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md pre, .md table, .md blockquote { margin: 0 0 0.6em; }
+.md ul, .md ol { padding-left: 1.3em; }
+.md li { margin: 0.2em 0; }
+.md h1, .md h2, .md h3, .md h4 { font-size: 1rem; font-weight: 700; margin: 0.8em 0 0.3em; }
+.md code { font-family: var(--mono); font-size: 0.84em; background: var(--leiste); padding: 1px 5px; border-radius: 5px; }
+.md pre { background: var(--leiste); border-radius: 10px; padding: 10px 12px; overflow-x: auto; touch-action: pan-x pan-y; }
+.md pre code { background: none; padding: 0; font-size: 0.78rem; line-height: 1.45; }
+.md table { border-collapse: collapse; font-size: 0.82rem; display: block; overflow-x: auto; max-width: 100%; }
+.md th, .md td { padding: 6px 10px; text-align: left; white-space: nowrap; }
+.md th { color: var(--gedaempft); font-weight: 600; }
+.md tr:nth-child(even) td { background: var(--leiste); }
+.md blockquote { padding-left: 12px; color: var(--gedaempft); box-shadow: inset 3px 0 0 var(--linie); }
+
+/* Werkzeugaufruf: eine ruhige Zeile, Ausgabe auf Tipp */
+.msg.werkzeug { align-self: stretch; font-family: var(--mono); font-size: 0.765rem; }
+.wz-kopf {
+  display: flex; align-items: center; gap: 8px; list-style: none; cursor: pointer;
+  min-height: 32px; padding: 6px 10px; border-radius: 8px; background: var(--leiste); color: var(--gedaempft);
+}
+.wz-kopf::-webkit-details-marker { display: none; }
+.werkzeug.ohne-ausgabe .wz-kopf { cursor: default; }
+details.werkzeug > .wz-kopf::after {
+  content: ''; margin-left: auto; flex: none; width: 6px; height: 6px;
+  border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg); transition: transform 0.15s;
+}
+details.werkzeug[open] > .wz-kopf::after { transform: rotate(45deg); }
+.wz-name { color: var(--schrift); font-weight: 600; flex: none; }
+.wz-arg { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wz-ausgabe {
+  margin: 4px 0 0; padding: 10px 12px; border-radius: 8px; background: var(--leiste);
+  color: var(--schrift); font-size: 0.72rem; line-height: 1.45; overflow-x: auto; white-space: pre; touch-action: pan-x pan-y;
+}
+
+/* --- Offene Entscheidungen ------------------------------------------------- */
+.offene { display: flex; flex-direction: column; gap: 10px; padding: 4px var(--rand) 8px; max-width: 780px; margin: 0 auto; }
+.chat-ansicht .entscheidung { background: var(--leiste); }
+.entscheidung { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.entscheidung-kopf { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.entscheidung-kopf h3 { font-size: 1rem; font-weight: 600; flex: 1 1 8em; }
+.entscheidung-zeit { font-size: 0.765rem; color: var(--gedaempft); }
+.entscheidung-wer { font-size: 0.882rem; color: var(--gedaempft); margin-bottom: 6px; }
+.entscheidung-text { line-height: 1.4; overflow-wrap: anywhere; }
+.befehl, .prompt-text {
+  margin: 0; padding: 10px 12px; border-radius: 8px; background: var(--erhoben);
+  font-family: var(--mono); font-size: 0.82rem; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.prompt-text { color: var(--schrift); }
+.entscheidung-knoepfe { display: flex; flex-wrap: wrap; gap: 10px; }
+.entscheidung-knoepfe .knopf { flex: 1 1 7em; min-width: 0; }
+.entscheidung-notiz { font-size: 0.765rem; color: var(--gedaempft); line-height: 1.4; }
+.entscheidung-fehler { font-size: 0.82rem; color: var(--zustand-tot); line-height: 1.35; }
+.optionen { display: flex; flex-direction: column; gap: 8px; }
+.option {
+  display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 10px 14px;
+  border-radius: 10px; background: var(--erhoben); text-align: left; line-height: 1.3;
+}
+.option.vorgewaehlt { box-shadow: inset 0 0 0 1.5px var(--akzent); }
+.option.empfohlen { box-shadow: inset 0 0 0 1.5px var(--akzent-matt); }
+.option:disabled { opacity: 0.5; }
+.option:not(:disabled):active { background: var(--wahl); }
+
+/* --- Dock mit Composer ------------------------------------------------------ */
+.chat-dock {
+  flex: none; position: relative; z-index: 2;
+  padding: 6px max(10px, var(--sicher-rechts)) 8px max(10px, var(--sicher-links));
+  background: var(--grund);
+}
+/* Ohne Tab-Leiste (iPhone im Chat) haelt der Dock selbst Abstand zum Home-Indikator. */
+.rahmen[data-layout='stapel'][data-composer-oben='ja'] .chat-dock { padding-bottom: max(8px, var(--sicher-unten)); }
+:root.tastatur-offen .chat-dock { padding-bottom: 6px !important; }
+.neu-pille {
+  position: absolute; left: 50%; top: -46px; transform: translateX(-50%);
+  min-height: 36px; padding: 0 16px; border-radius: 18px;
+  background: var(--akzent); color: var(--akzent-tinte); font-size: 0.882rem; font-weight: 600;
+  box-shadow: 0 4px 16px var(--schatten);
+}
+.chat-hinweis {
+  display: flex; align-items: center; gap: 10px; padding: 2px 6px 8px; max-width: 780px; margin: 0 auto;
+  font-size: 0.82rem; color: var(--gedaempft); line-height: 1.35;
+}
+/* Eine abgelehnte Sitzungsaktion (z. B. Schliessen bei laufenden Workern): bleibt, bis sie bestaetigt ist. */
+.chat-hinweis.warnung {
+  margin-bottom: 8px; padding: 10px 10px 10px 14px; border-radius: var(--r-karte);
+  background: var(--vorsichtgrund); color: var(--schrift);
+}
+.chat-hinweis > span { flex: 1; }
+.chat-hinweis:empty { display: none; }
+.composer { display: flex; flex-direction: column; gap: 6px; max-width: 780px; margin: 0 auto; }
+.composer-zeile {
+  display: flex; align-items: flex-end; gap: 8px; min-height: 44px;
+  padding: 4px 4px 4px 14px; border-radius: 22px; background: var(--leiste);
+}
+.composer-zeile:focus-within { box-shadow: inset 0 0 0 1.5px var(--akzent-matt); }
+.composer-feld {
+  flex: 1; min-width: 0; border: 0; outline: 0; resize: none; background: transparent;
+  /* Mindestens 16 px, sonst zoomt Safari beim Fokus hinein (Spezifikation 7.3). */
+  font-size: max(16px, 1rem); line-height: 1.3; padding: 7px 0; max-height: 40vh;
+}
+.composer-feld::placeholder { color: var(--gedaempft); }
+.composer-senden {
+  flex: none; width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--akzent); color: var(--akzent-tinte);
+}
+.composer-senden .symbol path { stroke-width: 2.4; }
+.composer-senden:disabled { background: var(--erhoben); color: var(--gedaempft); }
+.composer.sendet .composer-feld { opacity: 0.6; }
+.composer.gesperrt .composer-zeile { opacity: 0.55; }
+.composer-fehler { font-size: 0.82rem; color: var(--zustand-tot); padding: 0 8px; line-height: 1.35; }
+
+/* Sondertasten: klein, gedaempft, getrennt vom Feld */
+.tasten { display: flex; flex-direction: column; gap: 6px; }
+.tasten-haupt, .tasten-mehr { display: flex; align-items: center; gap: 6px; }
+.tasten-mehr { overflow-x: auto; scrollbar-width: none; }
+.tasten-mehr::-webkit-scrollbar { display: none; }
+.taste {
+  flex: none; min-width: 40px; height: 30px; padding: 0 9px; border-radius: 8px;
+  background: transparent; box-shadow: inset 0 0 0 1px var(--linie);
+  color: var(--gedaempft); font-size: 13px; font-weight: 600; display: inline-grid; place-items: center;
+}
+.taste.symboltaste { padding: 0; }
+.taste.symboltaste .symbol path { stroke-width: 2; }
+.taste.umschalter.offen { color: var(--akzent-text); box-shadow: inset 0 0 0 1px var(--akzent-matt); }
+.taste:not(:disabled):active { background: var(--erhoben); }
+.taste:disabled { opacity: 0.4; }
+.tasten-status { margin-left: auto; font-size: 12px; color: var(--gedaempft); }
+
+/* Kanal einer Welt */
+.msg.kanal { display: flex; gap: 10px; align-items: flex-start; }
+.kanal-platz { width: 32px; flex: none; }
+.kanal-blase { background: var(--leiste); border-radius: 14px; padding: 8px 12px; min-width: 0; max-width: 88%; }
+.kanal-kopf { display: flex; gap: 8px; align-items: baseline; margin-bottom: 2px; }
+.kanal-von { font-weight: 600; font-size: 0.882rem; }
+.kanal-zeit { font-size: 0.706rem; color: var(--gedaempft); }
+.kanal-text { line-height: 1.4; overflow-wrap: anywhere; }
+.chat-hinweis .absender-notiz { padding: 0 6px; }
+
+/* Empfaenger ueber dem Composer im Kanal: an wen die Nachricht geht */
+.empfaenger-zeile {
+  display: flex; align-items: center; gap: 8px; padding: 0 6px 6px; max-width: 780px; margin: 0 auto;
+  font-size: 0.882rem; color: var(--gedaempft);
+}
+.empfaenger-knopf {
+  display: inline-flex; align-items: center; gap: 6px; min-height: 36px; max-width: 100%; padding: 0 12px 0 7px;
+  border-radius: 18px; background: var(--leiste); color: var(--schrift); font-weight: 600;
+}
+.empfaenger-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.empfaenger-knopf .symbol { color: var(--gedaempft); }
+.empfaenger-knopf .symbol path { stroke-width: 2.2; }
+.empfaenger-knopf:disabled { opacity: 0.5; }
+.empfaenger-knopf:not(:disabled):active { background: var(--wahl); }
+.frage-zuruecknehmen { align-self: center; }

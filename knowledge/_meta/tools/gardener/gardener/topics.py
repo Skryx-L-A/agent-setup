@@ -37,11 +37,73 @@ AUTO_HEADING = "## Weitere Notes zum Thema (gardener)"
 # damit der Cluster als abgedeckt gilt (siehe _covered).
 COVERED_SHARE = 0.6
 
-# words that never make a topic name (note-type words, dates, vault jargon)
+# Share of the cluster's titles the naming word must appear in (see suggest_name).
+NAME_MIN_SHARE = 0.3
+
+# words that never make a topic name (note-type words, dates, vault jargon).
+# `kern`/`handoff`: file-type names (every project has a `KERN.md`, handoffs are
+# `HANDOFF-*.md`) - the run of 24.09.2026 built `30-topics/kern/` out of 56
+# KERN files, because the all-caps title counts as "capitalised".
 STOPWORDS = {
     "session", "sessions", "note", "notes", "moc", "index", "overview",
     "plan", "brief", "state", "report", "readme", "setup", "brain", "vault",
     "todo", "draft", "info", "check", "checklist", "update", "final",
+    "kern", "handoff", "fallen", "entscheidungen", "entscheidungen-und-fallen",
+    # Allerweltswoerter, die als Themenname nichts benennen (b6-struktur, 2026-09-28): `status` und
+    # `sitzung` stehen in jedem zweiten Titel, `news` und `konto` sind Fachwoerter EINES Projekts
+    # (Nachrichtenlage, Konto B/C), kein Querthema. Personennamen kommen aus 40-people
+    # (`existing_branch_names`), nicht aus einer Liste.
+    "status", "sitzung", "sitzungen", "news", "konto",
+}
+
+# German and English function words (4+ letters, the only length TITLE_WORD_RE
+# sees). Needed because rule b) of is_nameable accepts a word that is
+# capitalised in a title, and a sentence title capitalises its FIRST word
+# whatever it is: "Zwei Kurse in einer Rechnung", "Eine Sperre loescht ihren
+# Gegenbeweis". Run of 24.09.2026: `30-topics/zwei/` (85 links) and
+# `30-topics/eine/` came from exactly that, and `nicht` was proposed with 86
+# notes. A closed word class, so a fixed list is complete enough; nouns never
+# land here.
+FUNCTION_WORDS = {
+    # numerals
+    "eins", "zwei", "drei", "vier", "fuenf", "fünf", "sechs", "sieben", "acht",
+    "neun", "zehn", "zwoelf", "zwölf", "hundert", "erste", "ersten", "erster",
+    "zweite", "zweiten", "dritte", "halb", "halbe", "beide", "beiden",
+    # articles, pronouns, determiners
+    "eine", "einer", "einem", "einen", "eines", "kein", "keine", "keiner",
+    "keinem", "keinen", "keines", "dies", "diese", "dieser", "diesem", "diesen",
+    "dieses", "jede", "jeder", "jedem", "jeden", "jedes", "alle", "allem",
+    "allen", "aller", "alles", "sich", "selbst", "niemand", "nichts", "etwas",
+    "welche", "welcher", "welches", "seine", "seinen", "seiner", "ihre",
+    "ihren", "ihrer", "unser", "unsere", "euch", "deren", "dessen", "andere",
+    "anderen", "anderer", "anderes", "eigene", "eigenen", "eigener", "manche",
+    "viele", "vielen", "wenige", "mehr", "weniger", "meist", "meisten",
+    # prepositions, conjunctions, adverbs, particles
+    "nicht", "noch", "schon", "auch", "doch", "aber", "oder", "sondern",
+    "wenn", "dann", "dass", "weil", "denn", "obwohl", "statt", "anstatt",
+    "ohne", "über", "ueber", "unter", "nach", "durch", "gegen", "zwischen",
+    "wegen", "trotz", "während", "waehrend", "seit", "bevor", "nachdem",
+    "beim", "vom", "zum", "zur", "hinter", "neben", "vorher", "nachher",
+    "immer", "wieder", "erst", "jetzt", "heute", "gestern", "morgen", "hier",
+    "dort", "warum", "wieso", "weshalb", "wann", "wohin", "woher", "womit",
+    "damit", "dabei", "dafür", "dafuer", "davon", "darum", "daher", "also",
+    "ganz", "gleich", "genau", "eben", "kaum", "fast", "sehr", "viel", "wenig",
+    "nur", "bloss", "bloß", "allein", "zuerst", "zuletzt", "endlich", "bereits",
+    "trotzdem", "sonst", "etwa", "rund",
+    # auxiliaries and modal verbs
+    "sind", "wird", "werden", "wurde", "wurden", "worden", "sein", "gewesen",
+    "haben", "hatte", "hatten", "kann", "können", "koennen", "konnte", "muss",
+    "müssen", "muessen", "musste", "soll", "sollen", "sollte", "darf",
+    "dürfen", "duerfen", "will", "wollen", "gibt", "geht", "macht", "bleibt",
+    "steht", "heisst", "heißt",
+    # English
+    "with", "without", "from", "into", "onto", "about", "when", "what",
+    "that", "this", "these", "those", "they", "them", "their", "there",
+    "where", "which", "while", "over", "under", "after", "before", "between",
+    "first", "second", "three", "four", "five", "only", "more", "most",
+    "less", "never", "always", "still", "again", "does", "done", "have",
+    "been", "being", "were", "would", "should", "could", "your", "just",
+    "then", "than", "also", "some", "every", "none", "each", "other",
 }
 
 # Ein Titelwort. Bindestrich-Token bleiben ganz UND werden zerlegt - siehe
@@ -208,8 +270,15 @@ def is_nameable(word: str, titles: list[str],
     if vocabulary and word in vocabulary:
         return True
     for title in titles:
-        for token in TITLE_WORD_RE.findall(title):
-            if token.lower() == word and token[0].isupper():
+        # The first word of a SENTENCE title is capitalised whatever it is
+        # (`Zwei Kurse in einer Rechnung`) - no noun signal there. A short
+        # label title (`Minecraft Server`, at most three words) keeps it.
+        anfang = len(title) - len(title.lstrip(" \t\"'\u201e*#_([-"))
+        satz = len(title.split()) > 3
+        for m in TITLE_WORD_RE.finditer(title):
+            token = m.group(0)
+            if (token.lower() == word and token[0].isupper()
+                    and not (satz and m.start() == anfang)):
                 return True
             if "-" not in token:
                 continue
@@ -217,6 +286,19 @@ def is_nameable(word: str, titles: list[str],
                 if part.lower() == word and len(part) >= 4:
                     return True
     return False
+
+
+def is_taken(word: str, taken: set[str]) -> bool:
+    """`word` names an existing branch or person - itself, in the genitive
+    (`des nutzers`), or as a part of a hyphenated branch name. `claude` is not
+    a folder, but `claude-setup`, `claude-workbench` and `claude-orchestration`
+    are; run of 24.09.2026 built `30-topics/claude/` next to them out of seven
+    loosely related notes, and the g4 measurement then proposed `workbench`
+    (next to `claude-workbench`) and `des nutzers` (`40-people/person-1.md`).
+    A cluster whose best word already names such a thing belongs there."""
+    if word in taken or (word.endswith("s") and word[:-1] in taken):
+        return True
+    return any(word in t.split("-") for t in taken if "-" in t)
 
 
 def suggest_name(cluster: list[Note], taken: set[str],
@@ -239,8 +321,8 @@ def suggest_name(cluster: list[Note], taken: set[str],
     words: dict[str, int] = {}
     for title in titles:
         for w in set(title_words(title)):
-            if w in STOPWORDS:
-                continue        # note-type noise: would drown every title
+            if w in STOPWORDS or w in FUNCTION_WORDS:
+                continue        # note-type noise / filler: would drown every title
             words[w] = words.get(w, 0) + 1
     if not words:
         return None
@@ -254,14 +336,15 @@ def suggest_name(cluster: list[Note], taken: set[str],
     # - both existing topics - would have produced `30-topics/laufende/`, named
     # after an adjective out of a file name.
     top = max(words.values())
-    already = sorted(w for w, c in words.items() if c == top and w in taken)
+    already = sorted(w for w, c in words.items()
+                     if c == top and is_taken(w, taken))
     if already:
         log.info("topics: cluster belongs to the existing topic(s) %s - "
                  "no new page", already)
         return None
 
     candidates = {w: c for w, c in words.items()
-                  if c >= 2 and w not in taken
+                  if c >= 2 and not is_taken(w, taken)
                   and is_nameable(w, titles, vocabulary)}
     if not candidates:
         if words:
@@ -270,6 +353,14 @@ def suggest_name(cluster: list[Note], taken: set[str],
                                              reverse=True)[:5])
         return None
     best = max(candidates.values())
+    if best < NAME_MIN_SHARE * len(titles):
+        # A word in five of 69 titles does not name those 69 notes - it names
+        # five of them. Measured 24.09.2026 on the pre-run vault: `konto`
+        # 5/69, `workbench` 5/34, `test` 2/11 against `etoro` 3/7, `short`
+        # 2/6 and `fehlerform` 5/16 (the old `zwei` was 8/84, `kern` 6/56).
+        log.info("topics: cluster left unnamed - best word covers %d of %d "
+                 "titles", best, len(titles))
+        return None
     front = sorted(w for w, c in candidates.items() if c == best)
     if len(front) > 1:
         log.info("topics: cluster left unnamed - %s are equally common", front)
@@ -311,6 +402,11 @@ def suggest_hubs(hubs: list[Note], notes: list[Note],
         fresh = [n for n in members if n.rel not in assigned]
         if len(fresh) < min_size or _covered(fresh, hubs):
             continue
+        double = project_double(fresh)
+        if double is not None:
+            log.info("topics: cluster of %d notes lies in project %s - it has its own page, "
+                     "no second topic", len(fresh), double)
+            continue
         name = suggest_name(fresh, taken, vocabulary)
         if name is None:
             continue
@@ -320,14 +416,52 @@ def suggest_hubs(hubs: list[Note], notes: list[Note],
     return out
 
 
+_TITLE_LINE_RE = re.compile(r"^title:\s*[\"']?(.+?)[\"']?\s*$", re.MULTILINE)
+
+
+def person_names(vault: Path) -> set[str]:
+    """Stems and every word (4+ letters) of the titles of `40-people/*.md`: `person-1` AND
+    `the user` (title `the user`). Run of 24.09.2026 proposed `30-topics/the user/`
+    because only the stem was known. A hub named after a person is noise."""
+    names: set[str] = set()
+    people = vault / "40-people"
+    if not people.is_dir():
+        return names
+    for p in people.glob("*.md"):
+        names.add(p.stem.lower())
+        try:
+            head = p.read_text(encoding="utf-8", errors="replace")[:1500]
+        except OSError:
+            continue
+        m = _TITLE_LINE_RE.search(head)
+        if m:
+            names |= {w for w in (t.lower() for t in TITLE_WORD_RE.findall(m.group(1)))}
+    return names
+
+
 def existing_branch_names(vault: Path) -> set[str]:
-    """Project and topic folder names: a hub named after one of them is noise."""
+    """Project and topic folder names and person names (`40-people`): a hub named
+    after one of them is noise."""
     names = set()
     for top in ("20-projects", "30-topics"):
         base = vault / top
         if base.is_dir():
             names |= {d.name.lower() for d in base.iterdir() if d.is_dir()}
-    return names
+    return names | person_names(vault)
+
+
+def project_double(cluster: list[Note], share: float = config.TOPIC_PROJECT_DOUBLE_SHARE) -> str | None:
+    """The project whose folder holds at least `share` of the cluster's notes, or None. Such a
+    cluster only doubles that project's own topic page."""
+    counts: dict[str, int] = {}
+    for n in cluster:
+        parts = Path(n.rel).parts
+        if len(parts) >= 3 and parts[0] == "20-projects":
+            counts[parts[1]] = counts.get(parts[1], 0) + 1
+    if not counts or not cluster:
+        return None
+    proj, hit = max(counts.items(), key=lambda kv: kv[1])
+    return proj if hit >= share * len(cluster) else None
 
 
 def run_topics(hubs: list[Note], notes: list[Note],

@@ -3,10 +3,11 @@
 (docs/AGENTS-PLAN.md, Abschnitt 3 "Die Sperre": "ein Hook sperrt fremde
 Skills", und Abschnitt 14 "Sicherungen"; docs/AGENTS-SKILLS.md).
 
-Der Hook greift NUR in einem Agentenzug: WB_AGENT_ID und WB_WELT sind
-gesetzt (der Traeger setzt sie, siehe agents_skills.skills_umgebung). Ohne
-beide gibt es keine Ausgabe. Sind sie gesetzt, aber ungueltig, wird
-verweigert.
+Der Hook greift NUR in einem Agentenzug: WB_AGENT_ZUG markiert den Kontext,
+WB_AGENT_ID und WB_WELT binden ihn (der Traeger setzt alle drei in
+agents_traeger._zugumgebung). Ohne alle drei gibt es keine Ausgabe. Ein
+markierter Zug ohne vollstaendige Bindung sowie gesetzte, aber ungueltige
+Bindungen werden verweigert.
 
 Massgeblich ist <WB_WELT>/agents/<WB_AGENT_ID>/skills.json. Laesst sie sich
 nicht lesen, passt sie nicht zum Agenten oder nennt sie einen Pfad ausserhalb
@@ -320,7 +321,10 @@ def kontext_laden():
     """None ohne Agentenzug; sonst Kontext oder Verweigert."""
     agent = (os.environ.get('WB_AGENT_ID') or '').strip()
     welt = (os.environ.get('WB_WELT') or '').strip()
+    agentenkontext = bool((os.environ.get('WB_AGENT_ZUG') or '').strip())
     if not agent and not welt:
+        if agentenkontext:
+            raise Verweigert('Agentenzug ohne Bindung: WB_AGENT_ID und WB_WELT muessen beide gesetzt sein')
         return None
     if not agent or not welt:
         raise Verweigert('WB_AGENT_ID und WB_WELT muessen beide gesetzt sein')

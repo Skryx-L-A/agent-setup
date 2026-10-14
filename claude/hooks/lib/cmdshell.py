@@ -76,9 +76,11 @@ class HeredocSplit:
     text_subs  -- der Befehl ohne die Ruempfe, die NICHT in einer
                   `$( … )`-Substitution stehen: wer eine Substitution
                   rekursiv prueft, braucht ihren Here-Doc samt Rumpf,
-    bodies     -- je Here-Doc ein dict(body, quoted, prefix, top); prefix ist
-                  der Text des einfachen Befehls bis zum `<<`, also der
-                  Befehl, der den Rumpf auf stdin bekommt,
+    bodies     -- je Here-Doc ein dict(body, quoted, prefix, rest, top);
+                  prefix ist der Text des einfachen Befehls bis zum `<<`,
+                  also der Befehl, der den Rumpf auf stdin bekommt; rest ist
+                  der Text der Zeile hinter dem Operator (ohne Ruempfe) --
+                  dort steht z.B. ein `| bash`, das den Rumpf weiterreicht,
     complete   -- False, wenn ein Here-Doc keinen Abschluss hat.
     """
     def __init__(self, text, text_subs, bodies, complete):
@@ -110,6 +112,13 @@ def heredoc_split(command):
         state['len'] += len(s)
 
     in_single = in_double = False
+    # ANSI-C-Anfuehrung `$'…'` (2026-10-09, Review HR5-1): darin beendet `\'`
+    # die Anfuehrung NICHT. Bis dahin las der Scanner `cat $'x\'<<'EOF'\'`
+    # als Here-Doc, bash aber sieht keinen -- die Zeilen danach liefen als
+    # Befehle, waehrend jeder Guard sie als Rumpf wegschnitt. Seitdem wird
+    # `$'…'` mit Escapes gelesen, und nach einem `$'` bleibt jeder Rumpf
+    # zusaetzlich im Text stehen (raw) und wird so als Befehl mitgeprueft.
+    ansi_c = False
     stack = []          # 'dq' = `$(` in doppelten Anfuehrungszeichen, 'sub', 'paren'
     seg_start = 0       # Beginn des aktuellen einfachen Befehls in out_all
     complete = True
@@ -138,6 +147,14 @@ def heredoc_split(command):
                 continue
             emit(ch)
             i += 1
+            continue
+        if command.startswith("$'", i):
+            ansi_c = True
+            j = i + 2
+            while j < n and command[j] != "'":
+                j += 2 if command[j] == '\\' else 1
+            emit(command[i:j + 1])
+            i = j + 1
             continue
         if ch == "'":
             in_single = True
@@ -178,8 +195,10 @@ def heredoc_split(command):
                 pending.append({'delim': m.group(4),
                                 'quoted': bool(m.group(2) or m.group(3)),
                                 'prefix': ''.join(out_all)[seg_start:],
-                                'top': not stack})
+                                'top': not stack,
+                                'raw': ansi_c})
                 emit(m.group(0))
+                pending[-1]['op_end'] = state['len']
                 i = m.end()
                 continue
             emit('<<')
@@ -191,6 +210,10 @@ def heredoc_split(command):
             seg_start = state['len']
             continue
         elif ch == '\n':
+            if pending:
+                zeile = ''.join(out_all)
+                for p in pending:
+                    p['rest'] = zeile[p.pop('op_end'):]
             emit(ch)
             i += 1
             seg_start = state['len']
@@ -205,20 +228,271 @@ def heredoc_split(command):
                         closed = True
                         break
                     lines.append(line)
-                if not p['top']:
+                if p['raw']:
+                    emit(command[body_start:i])
+                elif not p['top']:
                     out_subs.append(command[body_start:i])
                 complete = complete and closed
                 p['body'] = '\n'.join(lines)
                 bodies.append(p)
             pending = []
+            seg_start = state['len']
             continue
         emit(ch)
         i += 1
     for p in pending:  # `<<X` in der letzten Zeile, ohne Rumpf und Abschluss
         complete = False
+        p['rest'] = ''.join(out_all)[p.pop('op_end'):]
         p['body'] = ''
         bodies.append(p)
     return HeredocSplit(''.join(out_all), ''.join(out_subs), bodies, complete)
+
+
+# Wer liest den Rumpf eines Here-Docs? (2026-10-09, aus wb/guard-heredoc nur
+# die Verschaerfungen) Bis dahin sah testschutz nur `prefix`, den Text VOR dem
+# `<<` -- `cat <<'EOF' |` am Zeilenende oder `cat <<'EOF' > >(bash)` galt als
+# harmloses cat, obwohl eine Shell den Rumpf ausfuehrt.
+HEREDOC_DATA_CONSUMERS = {'cat', 'tee'}
+_HEREDOC_DATA_SUBCOMMANDS = {'git': ('commit', 'tag', 'notes'),
+                             'gh': ('pr', 'issue', 'release', 'api', 'gist')}
+_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+
+
+# Ein Befehlstext, der Befehle umdefiniert, macht jeden Empfaengernamen
+# wertlos: `cat() { bash; }` oder `alias cat=bash` (mit `shopt -s
+# expand_aliases`) laesst `cat <<'EOF'` den Rumpf ausfuehren (Codex-Review
+# 2026-10-09, HR-1..5). Gesucht wird im Text OHNE Here-Doc-Ruempfe und ohne
+# Ruecksicht auf Anfuehrung -- ein Treffer in einem String kostet nur eine
+# zusaetzliche Pruefung.
+_REDEFINE_RE = re.compile(
+    r'[A-Za-z_][A-Za-z0-9_.:+-]*\s*\(\s*\)'      # name() { ...; }
+    r'|(^|[^A-Za-z0-9_.-])(function|alias|shopt|enable|source)([^A-Za-z0-9_.-]|$)'
+    r'|(^|[;&|(){}\s])\.[ \t]+[^\s]'             # . datei
+    r'|\bset[ \t]+(.*[ \t])?[-+]o\b'
+    r'|\bhash[ \t]+(.*[ \t])?-p\b'
+    r'|\bPATH\+?='
+)
+
+
+def may_redefine_commands(text):
+    """True, wenn `text` (ein Befehl ohne Here-Doc-Ruempfe) eine Funktion
+    oder einen Alias definiert, eine Datei einliest (`source`, `.`) oder
+    shopt/set -o/enable/hash -p/PATH= aendert. Dann bedeutet kein
+    Befehlsname mehr sicher, was er sonst bedeutet."""
+    return _REDEFINE_RE.search(text or '') is not None
+
+
+# Here-Doc in einem mehrteiligen Befehl (Betreiberentscheidung 2026-10-09:
+# strenger). Jede Aufzaehlung harmloser Vorlaeufer liess sich umgehen: eine
+# Anweisung VOR dem Here-Doc kann den Empfaenger umdefinieren, ohne dass der
+# Text danach aussieht (`DOT=.; $DOT ./defs.sh`, `.\` mit Fortsetzung,
+# HR2-3/HR2-4), und eine Stufe HINTER ihm bekommt den Rumpf (`cat <<'EOF' |
+# grep …`). Deshalb gilt: hat der Befehl mehr als eine Anweisung oder mehr
+# als eine Pipeline-Stufe, wird jeder Rumpf auch als Befehlstext geprueft.
+# Ausgenommen bleibt allein der Einzelbefehl und `… <<'EOF' | tee <datei>`.
+
+
+# Steht in jeder Ablehnung dieses Falls (testschutz, bash-guard Schritt 8b),
+# damit ein Agent den Ausweg nicht raten muss.
+HEREDOC_MEHRTEILIG_AUSWEG = (
+    "Ein Here-Doc in einem mehrteiligen Befehl wird als Befehl geprueft. "
+    "Ausweg: den Inhalt mit dem Write-Werkzeug in eine Datei schreiben und "
+    "die Datei verwenden, bei Commits `git commit -F <datei>` statt "
+    "`-m \"$(cat <<'EOF' ...)\"`.")
+
+
+def _anweisungs_tokens(command):
+    protected, _subs = _protect_substitutions(command)
+    return tokenize(_quote_aware_prepass(protected))
+
+
+def _tee_datei_stufe(stage):
+    worte = list(stage)
+    if not worte or worte[0] != 'tee':
+        return False
+    return any(w and w[0] != '-' for w in worte[1:])
+
+
+def heredoc_mehrteilig(teile):
+    """True, wenn der Befehl hinter `teile` (aus heredoc_split) mindestens
+    einen Here-Doc traegt und mehrteilig ist: mehr als eine Anweisung (`;`,
+    `&&`, `||`, Zeilenumbruch ausserhalb eines Rumpfs), ein `&` irgendwo,
+    oder eine Pipeline mit mehr als einer Stufe ausser genau `| tee <datei>`.
+    Ein nicht zerlegbarer Text gilt als mehrteilig."""
+    if not teile.bodies:
+        return False
+    toks = _anweisungs_tokens(teile.text)
+    if toks is None:
+        return True
+    if '&' in toks:
+        return True
+    anweisungen = all_statements(teile.text)
+    if not anweisungen or anweisungen[0] is None or len(anweisungen) > 1:
+        return True
+    stufen = split_pipeline(anweisungen[0])
+    if len(stufen) <= 1:
+        return False
+    return not (len(stufen) == 2 and _tee_datei_stufe(stufen[1]))
+
+
+def heredoc_receiver_stages(b):
+    """Die Pipeline-Stufen, die den Rumpf des Here-Docs `b` (aus
+    heredoc_split) lesen: der Befehl vor dem `<<` und jede Stufe, die in
+    derselben Zeile hinter dem Operator per `|` folgt. None, wenn der
+    Empfaenger nicht sicher in dieser Zeile steht: `>(`/`<(` im Kopf
+    (`tee >(bash)`), `|` oder `&` am Zeilenende (die Pipeline geht erst
+    NACH dem Ende-Marker weiter, gemessen mit bash), oder ein nicht
+    zerlegbarer Kopf."""
+    kopf = b['prefix'] + ' ' + b.get('rest', '')
+    if '>(' in kopf or '<(' in kopf:
+        return None
+    if kopf.rstrip().endswith(('|', '&', '\\')) or re.search(r'\|\s*&', kopf):
+        return None
+    anweisungen = all_statements(kopf)
+    if not anweisungen or anweisungen[0] is None:
+        return None
+    return split_pipeline(anweisungen[0])
+
+
+def heredoc_stage_reads_data(stage):
+    """True, wenn diese Stufe ihre Eingabe nur als Daten liest: cat, tee,
+    git commit|tag|notes, gh pr|issue|release|api|gist. Jeder andere,
+    auch unbekannte Befehl: False."""
+    worte = list(stage)
+    while worte and (worte[0] in BLOCK_KEYWORDS or _ASSIGNMENT_RE.match(worte[0])):
+        worte.pop(0)
+    if not worte:
+        return False
+    name, args = worte[0], worte[1:]
+    if name in HEREDOC_DATA_CONSUMERS:
+        return True
+    # git/gh nur nach strikter Positivliste: `git -c core.editor=bash
+    # commit -F - -e` oeffnet trotz -F den Editor, und bash fuehrt die
+    # Nachrichtendatei -- den Rumpf -- aus (guard-heredoc H22-H24).
+    if name == 'git':
+        return _git_daten_stufe(args)
+    if name == 'gh':
+        return _gh_daten_stufe(args)
+    return False
+
+
+# Expansion und Umleitung im Kopf machen die Optionsliste einer git-/gh-
+# Stufe unpruefbar: `--author {\\>,-a}` wird erst in bash zu `> -a`, und ein
+# gequotetes `'>'` als Wert verschluckt in strip_redirections das naechste
+# Token (Review HR5-2/3, 2026-10-09). Dann gilt die Stufe nicht als Daten.
+_KOPF_UNSICHER_RE = re.compile(r'[{}$`*?\[\]<>~]')
+
+
+def heredoc_kopf_unsicher(b):
+    """True, wenn Kopf oder Rest des Here-Docs `b` Expansion oder
+    Umleitung enthalten (ausser dem Here-Doc-Operator selbst)."""
+    kopf = (b['prefix'] + ' ' + b.get('rest', ''))
+    return _KOPF_UNSICHER_RE.search(kopf) is not None
+
+
+def _liest_stdin_option(args, optionen):
+    """True, wenn eine der `optionen` den Wert '-' traegt (`-F -`,
+    `--file=-`, `--body-file -`)."""
+    for k, t in enumerate(args):
+        for o in optionen:
+            if t == o and k + 1 < len(args) and args[k + 1] == '-':
+                return True
+            if o.startswith('--') and t == o + '=-':
+                return True
+            if not o.startswith('--') and t == o + '-':
+                return True
+    return False
+
+
+# git als Datenempfaenger (2026-10-09, Review-Runde 3): `git -c
+# core.editor=bash commit -F - -e <<'EOF'` oeffnet trotz -F den Editor, und
+# bash fuehrt die Nachrichtendatei -- den Rumpf -- als Skript aus. Darum eine
+# strikte Positivliste: `git` OHNE globale Optionen (kein -c, -C,
+# --exec-path, --git-dir, --config-env ...), Unterbefehl genau commit, tag
+# oder `notes add|append`, und nur Optionen, die weder Editor, Hook-Wahl,
+# Template, Trailer-Befehl, Signierprogramm noch Staging ausloesen
+# (nachgelesen in `git help commit|tag|notes`, git 2.5x). Nicht dabei:
+# -e/--edit, -t/--template, -a, -i, -o, -p, --fixup, --squash, -c/-C,
+# --cleanup, --trailer, -S, --amend, Pfade -- und -n/--no-verify: es startet
+# keinen Code, schaltet aber die Repo-Hooks ab, die sonst noch pruefen.
+_GIT_DATEN_FLAGS = {
+    'commit': {'-q', '--quiet', '-s', '--signoff', '--no-signoff',
+               '--allow-empty', '--allow-empty-message', '--no-edit'},
+    'tag': {'-a', '--annotate'},
+    'notes': {'--allow-empty'},
+}
+_GIT_DATEN_WERTE = {'commit': ('--author', '--date')}
+# Positionsargumente: commit keine (das waeren Pfade), tag Name und
+# optional Objekt, notes ein Objekt.
+_GIT_DATEN_POSITIONEN = {'commit': (0, 0), 'tag': (1, 2), 'notes': (0, 1)}
+
+
+def _git_daten_stufe(args):
+    if not args:
+        return False
+    sub, rest = args[0], args[1:]
+    if sub == 'notes':
+        if not rest or rest[0] not in ('add', 'append'):
+            return False
+        rest = rest[1:]
+    if sub not in _GIT_DATEN_FLAGS:
+        return False
+    flags = _GIT_DATEN_FLAGS[sub]
+    werte = _GIT_DATEN_WERTE.get(sub, ())
+    stdin = False
+    positionen = 0
+    k = 0
+    while k < len(rest):
+        t = rest[k]
+        if t in ('-F', '--file'):
+            if k + 1 >= len(rest) or rest[k + 1] != '-':
+                return False
+            stdin = True
+            k += 2
+            continue
+        if t in ('-F-', '--file=-'):
+            stdin = True
+        elif t in flags:
+            pass
+        elif t in werte:
+            if k + 1 >= len(rest):
+                return False
+            k += 2
+            continue
+        elif any(t.startswith(w + '=') for w in werte):
+            pass
+        elif t.startswith('-'):
+            return False
+        else:
+            positionen += 1
+        k += 1
+    mindestens, hoechstens = _GIT_DATEN_POSITIONEN[sub]
+    return stdin and mindestens <= positionen <= hoechstens
+
+
+# gh als Datenempfaenger: nur die genannten Unterbefehle direkt hinter
+# `gh`, und keine Option, die Editor, Browser oder Template ausloest
+# (`gh help pr create`, `gh help api`). Kurzoptionen nur einzeln -- ein
+# Buendel wie `-dw` waere nicht pruefbar. Ein gh-Alias kann keinen
+# eingebauten Befehl verdecken.
+_GH_VERBOTEN = ('--editor', '--web', '--template', '--recover')
+_GH_VERBOTEN_KURZ = {'-e', '-w', '-T'}
+
+
+def _gh_daten_stufe(args):
+    if not args or args[0] not in _HEREDOC_DATA_SUBCOMMANDS['gh']:
+        return False
+    for t in args[1:]:
+        if t in _GH_VERBOTEN_KURZ or (args[0] == 'api' and t == '-t'):
+            return False
+        if any(t == v or t.startswith(v + '=') for v in _GH_VERBOTEN):
+            return False
+        if t.startswith('-') and not t.startswith('--') and len(t) > 2 \
+                and t != '-F-':
+            return False
+    return _liest_stdin_option(args, ('--body-file', '--input', '-F'))
+
+
 
 
 _SUB_PLACEHOLDER = '\x01SUB%d\x01'
@@ -379,6 +653,37 @@ def _quote_aware_prepass(command):
             # also in genau die unaufloesbare Form, die die Guards ohnehin
             # fail-closed behandeln.
             out.append(';')
+            i += 1
+            continue
+        if not in_single and not in_double and ch == '&':
+            # Ein '&' ohne Leerzeichen trennt in bash genauso wie mit:
+            # `true&&git add -A` sind zwei Anweisungen. shlex kennt '&' hier
+            # aber nicht als Satzzeichen (siehe tokenize()), und das Wort
+            # `true&&git` verschluckte den zweiten Befehl -- gemessen
+            # 2026-10-09: `true&&git add -A`, `true&pkill -f wb-` und
+            # `true|&pkill -f wb-` gingen an bash-guard vorbei, die Form mit
+            # Leerzeichen nicht. ';', '|' und '||' trennt shlex schon selbst.
+            # Darum bekommt jedes unquoted '&' hier Leerzeichen -- ausser in
+            # einer Umleitung: `2>&1`, `>&2`, `<&3` ('&' direkt hinter '<'/'>')
+            # und `&>`, `&>>` ('&' direkt vor '>') bleiben ein Wort.
+            if i + 1 < n and command[i + 1] == '&':
+                out.append(' && ')
+                i += 2
+                continue
+            if out and out[-1] in '<>':
+                out.append(ch)
+                i += 1
+                continue
+            if i + 1 < n and command[i + 1] == '>':
+                out.append(ch)
+                i += 1
+                continue
+            if out and out[-1] == '|':
+                # `a |& b` ist eine Pipe, die auch stderr mitnimmt.
+                out.append(' ')
+                i += 1
+                continue
+            out.append(' & ')
             i += 1
             continue
         out.append(ch)

@@ -8,7 +8,7 @@
 #
 # Machine-detecting (Darwin vs Linux). Reports free VRAM, free RAM, running GPU
 # processes, loaded ollama models, and a PROTECTED list of services/processes that
-# must NEVER be stopped (peer: a protected service — RoBERTa Polarschern veto).
+# must NEVER be stopped (peer: a protected service — RoBERTa ProjectX veto).
 #
 # Test hook: CR_ASSUME_NEWS_CLF_ACTIVE=1 forces a protected service into the protected list
 # (for reproducibly exercising run-on's refusal path outside market hours).
@@ -233,7 +233,7 @@ if [ "$OS" = "Linux" ]; then
     [ -n "$GPU_PROCS_JSON" ] || GPU_PROCS_JSON="[]"
   fi
 
-  # PROTECTED: a protected service (RoBERTa Polarschern veto for a machine-bound project)
+  # PROTECTED: a protected service (RoBERTa ProjectX veto for a machine-bound project)
   news_act=""
   if command -v systemctl >/dev/null 2>&1; then
     news_act="$(systemctl --user is-active a protected service 2>/dev/null || true)"
@@ -244,7 +244,7 @@ if [ "$OS" = "Linux" ]; then
     news_pids="$(nvidia-smi --query-compute-apps=pid,process_name,used_memory \
         --format=csv,noheader,nounits 2>/dev/null | awk -F', ' '/news-llm/{print $1}' | paste -sd, - 2>/dev/null || true)"
     PROTECTED_JSON="$(jq -n --arg n a protected service --arg pids "${news_pids:-}" \
-      --arg d "systemd user service a protected service — RoBERTa Polarschern veto for a machine-bound project; ~5.6 GB VRAM resident at market-open; NEVER stop it" \
+      --arg d "systemd user service a protected service — RoBERTa ProjectX veto for a machine-bound project; ~5.6 GB VRAM resident at market-open; NEVER stop it" \
       '[{name:$n, active:true, detail:$d, pids:($pids|split(",")|map(select(length>0)|tonumber?))}]')"
   fi
 

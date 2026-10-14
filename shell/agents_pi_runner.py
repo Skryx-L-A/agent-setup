@@ -56,7 +56,7 @@ def command(config: dict, base_url: str) -> tuple[list[str], dict[str, str]]:
     argv.append(config["prompt"])
     models = {"providers": {"wb-lokal": {
         "baseUrl": base_url, "api": config["api"], "apiKey": PLACEHOLDER_TOKEN,
-        "compat": {"supportsDeveloperRole": False},
+        "compat": {"supportsDeveloperRole": False, "supportsStore": False},
         "models": [{"id": config["model"], "name": config["model"], "contextWindow": config["context_window"]}]}}}
     return argv, dict(env, _WB_MODELS_JSON=json.dumps(models))
 

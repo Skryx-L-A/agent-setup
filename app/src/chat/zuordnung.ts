@@ -48,7 +48,7 @@
 //             NICHTS und sagt genau das.
 //
 // GEMESSEN, warum der mittlere Weg nicht wegzulassen ist: am 12.08. liefen zwei
-// Orchestrator-Sitzungen in /Users/alice/AI (Transcripte 03:59 und 03:48 Uhr).
+// Orchestrator-Sitzungen im selben Arbeitsordner (Transcripte 03:59 und 03:48 Uhr).
 // Der Ordnerweg allein haette beiden Panes dasselbe, juengste Gespraech gezeigt
 // -- einem davon also ein fremdes. Der Vermerk trennt sie, weil er je Pane eine
 // eigene Kennung nennt.

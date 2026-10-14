@@ -1,0 +1,29 @@
+#!/bin/bash
+# wb-mcp-start -- startet einen MCP-Server der Werkbank mit seinen Geheimnissen (Plan 3.3, Spur S5).
+#
+# Gebrauch: wb-mcp-start <server> [weitere Argumente]
+#
+# Die Harness-Konfiguration zeigt nur auf diesen Befehl (command = "wb-mcp-start", args = ["<server>"]).
+# Die Werte aus `geheimnisse` des Eintrags mcp.<server> holt werkzeuge_geheimnis.py zur Laufzeit,
+# setzt sie nur in die Umgebung des Kindprozesses und ersetzt sich per exec durch ihn.
+# Exitcodes: 2 Befund in der Quelle, 3 Geheimnis nicht verfuegbar, 4 Eintrag oder Startbefehl fehlt,
+# 64 Gebrauch. Meldungen nennen Verweise und Variablen, nie Werte.
+#
+# Test-Schalter: WB_WERKZEUGE_SRC (Quelle), WB_SCHLUESSELBUND_CMD (Ersatz fuer security/secret-tool).
+set -uo pipefail
+export PATH="$PATH:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KERN="$SCRIPT_DIR/werkzeuge_geheimnis.py"
+[ -f "$KERN" ] || KERN="$HOME/.local/bin/werkzeuge_geheimnis.py"
+
+if [ $# -lt 1 ]; then
+    echo "Gebrauch: wb-mcp-start <server> [argumente...]" >&2
+    exit 64
+fi
+if [ ! -f "$KERN" ]; then
+    echo "wb-mcp-start: werkzeuge_geheimnis.py nicht gefunden" >&2
+    exit 4
+fi
+
+exec python3 -I "$KERN" start "$@"

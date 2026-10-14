@@ -3,7 +3,13 @@ name = "braincli"
 version = "0.1.0"
 description = "brain: CLI over the Knowledge vault + Gardener (search, gardener run/status, stats)"
 requires-python = ">=3.11"
-dependencies = ["gardener", "rank-bm25>=0.2"]
+dependencies = [
+    "gardener",
+    "mcp>=1.26,<2",
+    "pyyaml>=6.0.3",
+    "rank-bm25>=0.2",
+    "snowballstemmer>=3.0",
+]
 
 [dependency-groups]
 dev = ["pytest>=8"]

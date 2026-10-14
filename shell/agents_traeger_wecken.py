@@ -26,7 +26,8 @@ if __name__ == "__main__":
 import agents_data as ad  # noqa: E402
 
 WECKBEFEHLE = {("ticket", "neu"), ("kanal", "senden"), ("welt", "antwort"), ("agent", "antrag"),
-               ("agent", "antrag-entscheiden")}
+               ("agent", "antrag-entscheiden"), ("agent", "rechte-antrag"), ("agent", "rechte-antrag-entscheiden"),
+               ("agent", "rechte-antrag-zurueckziehen")}
 KONFIGNAME = "traeger.json"
 
 

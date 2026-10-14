@@ -3,6 +3,7 @@
 #
 #   wb-harness-run --model <id> --role worker|orchestrator
 #                  [--effort <e>] [--dir <d>] [--name <n>] [--resume-args '<flags>']
+#                  [--initial-task-file <private-file>]
 #
 # This is the shim that pi-worker/wb-code put into a pane instead of building a
 # command themselves: it asks `wb-state models resolve` for the start line (the
@@ -29,7 +30,7 @@
 # shim as 'claude' next.
 set -uo pipefail
 
-MODEL=""; ROLE="worker"; EFFORT=""; DIR=""; NAME=""; RESUME_ARGS=""
+MODEL=""; ROLE="worker"; EFFORT=""; DIR=""; NAME=""; RESUME_ARGS=""; INITIAL_TASK_FILE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --model)  MODEL="${2:?model id}"; shift 2 ;;
@@ -38,6 +39,7 @@ while [ $# -gt 0 ]; do
     --dir)    DIR="${2:?dir}"; shift 2 ;;
     --name)   NAME="${2:?name}"; shift 2 ;;
     --resume-args) RESUME_ARGS="${2:?flags}"; shift 2 ;;
+    --initial-task-file) INITIAL_TASK_FILE="${2:?file}"; shift 2 ;;
     *) echo "wb-harness-run: unbekannte Option '$1'" >&2; exit 1 ;;
   esac
 done
@@ -98,6 +100,11 @@ while IFS=$'\t' read -r key rest; do
   case "$key" in
     harness) HARNESS="$rest" ;;
     cmd) CMD="$rest" ;;
+    # The resolved model reference, for code inside the harness that starts turns
+    # without the CLI flag: the opencode inbox plugin creates the first session over
+    # the built-in server, and `--model` never reaches that session (opencode.log
+    # 2026-10-01/06: `model=undefined`, then the server default ollama/ornith:9b).
+    model) export WB_HARNESS_MODEL="$rest" ;;
     env)
       VAR="${rest%%$'\t'*}"; VALSPEC="${rest#*$'\t'}"
       case "$VALSPEC" in
@@ -124,6 +131,17 @@ while IFS=$'\t' read -r key rest; do
 done <<<"$RESOLVED"
 
 [ -n "$CMD" ] || { echo "wb-harness-run: resolve lieferte kein Startkommando." >&2; exit 1; }
+
+# An older installed registry may still add `resume --last` on a normal start.
+# It is global to CODEX_HOME, so discard it even when no explicit resume was
+# requested. A pane-specific id is inserted only after validation below.
+if [ "$HARNESS" = codex ]; then
+  CMD="$(/usr/bin/python3 - "$CMD" <<'PY'
+import re, sys
+print(re.sub(r"(?<!\S)resume\s+--last(?=\s|$)", "", sys.argv[1], count=1))
+PY
+)"
+fi
 
 # --resume-args: die Fortsetzen-Flags des Harness, durchgereicht von wb-revive
 # (2026-08-06). Bis heute erreichte sie nichts von aussen, weil dieser Shim seine
@@ -155,12 +173,12 @@ if [ -n "$RESUME_ARGS" ]; then
     # ist stdin schon das Programm selbst, ein zusaetzliches Rohr davor kaeme nie an
     # (gemessen 2026-08-06 -- der Eintrag galt dann als unlesbar und die Flags fielen
     # still weg).
-    NEUCMD="$(/usr/bin/python3 - "$CMD" "$RESUME_ARGS" "$HJSON" <<'PY'
+    NEUCMD="$(/usr/bin/python3 - "$CMD" "$RESUME_ARGS" "$HJSON" "$HARNESS" <<'PY'
 # KEINE Apostrophe in diesem Rumpf: bash 3.2 zaehlt sie auch hier mit, weil das
 # Heredoc in einer Kommandosubstitution steht -- die Datei scheitert dann beim
 # Einlesen mit "unexpected EOF" (gemessen 2026-08-06 mit bash 3.2.57).
 import json, os, re, shlex, sys
-cmd, uebergeben, hjson = sys.argv[1], sys.argv[2], sys.argv[3]
+cmd, uebergeben, hjson, harness = sys.argv[1:]
 try:
     h = json.loads(hjson)
 except Exception:
@@ -173,6 +191,14 @@ except ValueError:
 if not toks:
     sys.exit(2)
 KENNUNG = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+if harness == "codex":
+    if len(toks) != 2 or toks[0] != "resume" or not KENNUNG.fullmatch(toks[1]) or toks[1] == "--last":
+        sys.stderr.write("wb-harness-run: codex braucht eine konkrete Thread-ID.\n")
+        sys.exit(2)
+    # The live registry can still declare resume --last. The safe exact-id
+    # contract takes precedence over that old declaration.
+    res = dict(res, args=["resume", "{resumeId}"])
 
 def passt(vorlage):
     if not vorlage or len(vorlage) != len(toks):
@@ -328,6 +354,40 @@ else:
 os.makedirs(os.path.dirname(ziel) or ".", exist_ok=True)
 with open(ziel, "w", encoding="utf-8") as f:
     f.write(inhalt)
+
+# Der Rollenblock gehoert NIE in einen Commit (Vault-Sitzung, 25.09.2026: im Worktree
+# von ~/Knowledge landete er in der versionierten Vault-Anleitung und musste von Hand
+# verworfen werden). Seit AGENTS.md die eine Anweisungsdatei jedes Projekts ist, trifft
+# das jedes Repo. Deshalb, nur im Projektweg und nur in DIESEM Arbeitsbaum:
+#   versionierte Datei   -> git update-index --skip-worktree (Aenderung unsichtbar fuer add/commit)
+#   unversionierte Datei -> Eintrag in info/exclude des Repos
+if not geteilt:
+    import subprocess
+    def git(*args):
+        return subprocess.run(["git", "-C", os.path.dirname(ziel) or "."] + list(args),
+                              capture_output=True, text=True)
+    if git("rev-parse", "--is-inside-work-tree").stdout.strip() == "true":
+        name = os.path.basename(ziel)
+        if git("ls-files", "--error-unmatch", "--", name).returncode == 0:
+            r = git("update-index", "--skip-worktree", "--", name)
+            if r.returncode != 0:
+                sys.stderr.write("wb-harness-run: WARNUNG -- %s liess sich nicht von Commits "
+                                 "ausnehmen: %s\n" % (ziel, r.stderr.strip()))
+        else:
+            ex = git("rev-parse", "--git-path", "info/exclude").stdout.strip()
+            if ex:
+                ex = os.path.join(os.path.dirname(ziel) or ".", ex) if not os.path.isabs(ex) else ex
+                rel = git("ls-files", "--full-name", "--others", "--", name).stdout.strip() or name
+                muster = "/" + rel
+                vorhanden = open(ex, encoding="utf-8").read().splitlines() if os.path.exists(ex) else []
+                if muster not in vorhanden:
+                    os.makedirs(os.path.dirname(ex), exist_ok=True)
+                    with open(ex, "a", encoding="utf-8") as f:
+                        # info/exclude gilt fuer ALLE Arbeitsbaeume des Repos, auch den
+                        # Hauptbaum. Die Kommentarzeile sagt, woher die Zeile kommt.
+                        f.write("# wb-harness-run: Rollenblock eines Workers -- entfernen, "
+                                "sobald das Projekt %s selbst versioniert\n" % rel)
+                        f.write(muster + "\n")
 print("%s\t%s\t%s" % (ziel, "neu" if neu_angelegt else "ergaenzt",
                       "geteilt" if geteilt else "projekt"))
 PY
@@ -653,6 +713,20 @@ PY
     else
       echo "wb-harness-run: wb-chat-hook-install nicht gefunden — keine Chat-Zuordnung eingetragen." >&2
     fi
+
+    # HOOK-VERTRAUEN FUER codex (09.10.2026, Spur codex-trust). Ein neuer Worktree hat fuer
+    # dieselben Projekt-Hooks einen neuen Schluessel in config.toml und damit den Dialog
+    # "Hooks need review", der den Start (und jede Zustellung) still blockiert. Uebertragen
+    # wird nur das Vertrauen des Hauptbaums auf einen Werkbank-Worktree mit byteidentischer
+    # hooks.json; Begruendung und Grenzen im Kopf von wb-vertrauen-codex. Endet immer mit 0.
+    if [ "$HARNESS" = codex ]; then
+      CXVERTRAUEN=""
+      for kandidat in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/wb-vertrauen-codex" \
+                      "$HOME/.local/bin/wb-vertrauen-codex"; do
+        [ -x "$kandidat" ] && { CXVERTRAUEN="$kandidat"; break; }
+      done
+      [ -n "$CXVERTRAUEN" ] && { "$CXVERTRAUEN" "${DIR:-$PWD}" || true; }
+    fi
   fi
 fi
 
@@ -687,8 +761,169 @@ if [ "$ROLE" = worker ] && [ "$HARNESS" = claude ] && [ -z "${WB_MCP_VOLL:-}" ];
   fi
 fi
 
+# KNAPPE PLUGIN-/MCP-AUSSTATTUNG FUER CODEX-WORKER (2026-09-21).
+#
+# Codex 0.146.0 startet mit normaler des Nutzers Ausstattung je Worker einen privaten
+# Playwright-MCP und die Computer-Use-Helfer. Direkt mit `footprint` gemessen kosten
+# diese Kinder zusammen rund 185 MiB je Worker. `--disable plugins` entfernt genau
+# die plugin-gelieferten MCPs (Playwright, Computer History und CUA), waehrend der
+# geteilte HTTP-MCP basic-memory aus config.toml erreichbar bleibt. Ein kleiner,
+# global konfigurierter node_repl bleibt ebenfalls erhalten; ihn hier per `-c` nur
+# teilweise zu ueberschreiben ist bei 0.146.0 ungueltig ("invalid transport").
+#
+# Orchestratoren bleiben unveraendert. Fuer einen Worker, dessen Auftrag ausdruecklich
+# eine Plugin-Faehigkeit braucht, stellt `WB_MCP_VOLL=1` die volle Ausstattung wieder
+# her -- derselbe Schalter wie beim Claude-Zweig oben. Die Einfuegung steht direkt
+# hinter `exec codex`, also auch vor einem von wb-revive eingefuegten `resume`-
+# Unterbefehl; globale Codex-Flags bleiben dadurch an ihrer gueltigen Stelle.
+if [ "$ROLE" = worker ] && [ "$HARNESS" = codex ]; then
+  # AUTO-MEMORY DER CODEX-WORKER AUS (10.10.2026). Codex 0.162.1 fuehrt unter CODEX_HOME
+  # (~/.codex/memories + memories_1.sqlite) EINE globale Memory fuer alle Sitzungen und legt
+  # beim Start eine Konsolidierungs-Hintergrundarbeit an, die dort schreibt; ein eigenes
+  # Verzeichnis je Worker ist nicht einstellbar, nur das Feature. `--disable memories` ist
+  # `-c features.memories=false` (`codex --disable memories features list` zeigt false);
+  # gemessen an isoliertem CODEX_HOME: ohne den Schalter entstehen memories/ (Git-Repo,
+  # MEMORY.md, memory_summary.md) und ein memory_consolidate_global-Job, mit ihm nichts.
+  # Unabhaengig von WB_MCP_VOLL: der Schalter dient der Trennung, nicht dem Speicherbedarf.
+  # Was ein Worker an Wissen hat, gehoert ins Ergebnis (Rolle Worker).
+  CX_SCHALTER="--disable memories"
+  [ -z "${WB_MCP_VOLL:-}" ] && CX_SCHALTER="--disable plugins $CX_SCHALTER"
+  case "$CMD" in
+    *"exec codex "*) CMD="${CMD/exec codex /exec codex $CX_SCHALTER }" ;;
+    *) echo "wb-harness-run: WARNUNG — Codex-Startzeile unbekannter Form; Plugins und Auto-Memory bleiben aktiviert." >&2 ;;
+  esac
+  [ -n "${WB_MCP_VOLL:-}" ] && echo "wb-harness-run: WB_MCP_VOLL gesetzt — dieser Codex-Worker behaelt Plugins, Browser-MCP und Computer Use." >&2
+fi
+
+# AUTO-MEMORY DER QWEN-WORKER AUS (10.10.2026, qwen 0.25.0 gemessen).
+#
+# Qwen Code legt von sich aus an: eine verwaltete Auto-Memory (Hintergrund-Extraktion nach
+# jedem Zug, Standard AN; Ort ~/.qwen/projects/<git-wurzel>/memory/ und die GLOBALE
+# ~/.qwen/memories/) und die Werkzeuge manage_memory/save_memory (laut Bundle fuer
+# dauerhafte Notizen; das Schreiben selbst wurde nicht ausgeloest, das 1,7B-Testmodell rief
+# sie nie auf). Die Dateien gelten fuer alle spaeteren Sitzungen. Zwei Schalter, beide noetig:
+#  * `--exclude-tools=save_memory --exclude-tools=manage_memory` nimmt die Schreibwerkzeuge
+#    aus der Werkzeugliste (gemessen: stream-json-Init 30 -> 29 Werkzeuge, auch in der `=`-Form;
+#    save_memory steht in 0.25.0 gar nicht in der Liste, manage_memory schon). Mit `=` je Wert,
+#    weil die Option eine Liste ist und sonst ein folgender Text als Wert gelesen wuerde.
+#  * die Hintergrund-Extraktion hat KEIN Kommandozeilenflag und keine Umgebungsvariable,
+#    nur die Einstellung memory.enableManagedAutoMemory/-AutoDream. Die liegt hier in einer
+#    Systemeinstellungsdatei, die QWEN_CODE_SYSTEM_SETTINGS_PATH benennt (hoechster Rang,
+#    ~/.qwen/settings.json und der Arbeitsbaum bleiben unberuehrt; nur Worker, nicht der
+#    Orchestrator). Gemessen: mit ihr entstehen weder memories/ noch memory/ noch
+#    extract-cursor.json. `--bare`/`--safe-mode` schalten sie ebenfalls ab, aber auch die
+#    QWEN.md-Rolle -- unbrauchbar.
+# Die Datei traegt "$version" schon, damit qwen sie nicht umschreibt (Wettlauf zweier Worker).
+if [ "$ROLE" = worker ] && [ "$HARNESS" = qwen ]; then
+  QWEN_WSET="$HOME/.claude/workbench/qwen-worker-settings.json"
+  QWEN_WSET_INHALT='{"memory":{"enableManagedAutoMemory":false,"enableManagedAutoDream":false},"$version":4}'
+  if [ "$(cat "$QWEN_WSET" 2>/dev/null)" != "$QWEN_WSET_INHALT" ]; then
+    mkdir -p "$(dirname "$QWEN_WSET")" 2>/dev/null
+    printf '%s\n' "$QWEN_WSET_INHALT" > "$QWEN_WSET.$$" 2>/dev/null && mv -f "$QWEN_WSET.$$" "$QWEN_WSET" 2>/dev/null \
+      || rm -f "$QWEN_WSET.$$" 2>/dev/null
+  fi
+  if [ -s "$QWEN_WSET" ]; then
+    export QWEN_CODE_SYSTEM_SETTINGS_PATH="$QWEN_WSET"
+  else
+    echo "wb-harness-run: WARNUNG — $QWEN_WSET nicht schreibbar; die Auto-Memory-Extraktion von qwen bleibt an." >&2
+  fi
+  case "$CMD" in
+    *"exec qwen "*) CMD="${CMD/exec qwen /exec qwen --exclude-tools=save_memory --exclude-tools=manage_memory }" ;;
+    *) echo "wb-harness-run: WARNUNG — qwen-Startzeile unbekannter Form; die Memory-Werkzeuge bleiben aktiv." >&2 ;;
+  esac
+fi
+
 # Every workbench pane needs the workbench tools on PATH, otherwise the agent in it
 # cannot call wb-*/claude-worker/pi-worker — same reason wb-code does it for pi.
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+
+# HUB-TOKEN (Werkzeuge zentral, 13.10.2026). codex (bearer_token_env_var), opencode
+# ({env:...}), crush, qwen und nanocoder ($... im Header) holen den Bearer fuer den
+# MCP-Eintrag `werkbank` aus WB_HUB_TOKEN; ohne ihn antwortet der Hub 401. claude
+# (headersHelper) und pi (liest die Datei) brauchen ihn nicht. Welcher Harness ihn
+# braucht, entscheidet `wb-hub token-sicherstellen` aus Quelle und toolAdapter.mcp
+# (Exit 3 = keiner); es legt die Tokendatei auch an, wenn der Hub noch nie lief
+# (launchd/systemd starten ihn erst bei der ersten Verbindung).
+# Der Wert gelangt wie die Provider-Keys oben NUR in die Umgebung dieses Prozesses
+# und damit des Harness: nie in argv, eine tmux-Option, send-keys oder ein Log.
+# Wie jede Umgebungsvariable sieht ihn derselbe Benutzer per `ps eww` (S5-Review).
+# Geht es nicht: Start trotzdem, ohne Variable, eine Hinweiszeile.
+hub_token_setzen() {
+  local hub="$HOME/.local/bin/wb-hub" wert rc
+  [ -x "$hub" ] || return 0
+  wert="$("$hub" token-sicherstellen --harness "$HARNESS" --wert 2>/dev/null)"; rc=$?
+  case "$rc" in
+    0) [ -n "$wert" ] && export WB_HUB_TOKEN="$wert" ;;
+    3) ;;
+    *) echo "wb-harness-run: Hub-Token nicht ermittelt (wb-hub Exit $rc) — $HARNESS startet ohne WB_HUB_TOKEN; Hub-Werkzeuge antworten dann 401." >&2 ;;
+  esac
+}
+hub_token_setzen
+
+# EIN WRAPPER, DER SICH SELBST FINDET (2026-09-18, auf peer gemessen). Omarchy legt
+# fuer jedes ueber `mise` verwaltete Werkzeug einen Wrapper nach ~/.local/bin, und der
+# ruft sein Programm UEBER DEN PATH auf ("mise use -g codex; exec mise x codex --
+# codex \"$@\""). Weil die Zeile darueber ~/.local/bin nach vorn stellt -- die
+# Werkbank-Werkzeuge muessen im Pane erreichbar sein --, findet dieser Wrapper wieder
+# SICH SELBST: eine Endlosschleife, in der der Worker nie startet und nur die
+# Prozessliste waechst. Nach dem Omarchy-Update am 18.09.2026 (mise 2026.9.1 ->
+# 2026.9.9, omarchy 4.0.4, 17:54 laut pacman.log) traf das codex- und
+# opencode-Worker auf peer; dieselbe Wrapper-Form liegt dort fuer ein Dutzend
+# weiterer Werkzeuge (copilot, crush, gemini, grok, ...), die Falle ist also nicht
+# auf zwei Namen beschraenkt.
+#
+# Der Ausweg zeigt AM NAMEN vorbei, nicht am PATH im Ganzen: fuer genau den Befehl
+# DIESES Starts wird ein eigenes Verzeichnis mit EINEM Symlink auf das echte
+# Programm vorangestellt. Das mise-Shim-Verzeichnis einfach nach vorn zu haengen
+# waere ein zweiter Fehler -- es traegt auf peer auch ein `pi`, `gh` und `python`
+# und wuerde die Werkbank-eigenen Werkzeuge gleichen Namens verdecken.
+harness_befehl_absichern() {
+  local name gefunden echt dir
+  # Der Befehl steht in der aufgeloesten Startzeile hinter `exec` ("cd <dir> && exec
+  # codex --model ..."). Faellt das Muster aus, bleibt der Harness-Name die
+  # Rueckfallebene -- bei jedem heute registrierten Harness sind beide gleich.
+  name="$(printf '%s\n' "$CMD" | sed -n 's/.*[[:space:]]exec[[:space:]]\{1,\}\([^[:space:];|&]\{1,\}\).*/\1/p' | head -1)"
+  [ -n "$name" ] || name="$HARNESS"
+  case "$name" in ""|*/*) return 0 ;; esac   # leer oder schon ein Pfad: nichts zu tun
+  gefunden="$(command -v "$name" 2>/dev/null)" || return 0
+  [ -f "$gefunden" ] && [ -r "$gefunden" ] || return 0
+  grep -qsE '(^|[^[:alnum:]])mise[[:space:]]+(x|exec)[[:space:]]' "$gefunden" || return 0
+  command -v mise >/dev/null 2>&1 || return 0
+  echt="$(mise which "$name" 2>/dev/null)" || return 0
+  [ -n "$echt" ] && [ -x "$echt" ] && [ "$echt" != "$gefunden" ] || return 0
+  dir="$HOME/.local/state/wb-harness-bin"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  ln -sfn "$echt" "$dir/$name" 2>/dev/null || return 0
+  PATH="$dir:$PATH"
+  echo "wb-harness-run: '$name' in ~/.local/bin ist ein mise-Wrapper, der sich ueber den PATH selbst faende — gestartet wird stattdessen $echt." >&2
+}
+harness_befehl_absichern
+
+# The first Codex turn must create a thread before `codex queue` can address it.
+# Only the one-shot file path is stored in @wb_cmd. Read it as data into a Bash
+# variable and expand that variable as one positional
+# argument when the resolved command is evaluated. Shell syntax in the prompt is
+# never parsed. The private file remains until @wb_thread identifies this pane.
+# Zusammen mit --resume-args nur bei codex (09.10.2026): pi-worker startet einen Worker,
+# dessen Queue nach einem abgebrochenen Zug pausiert, per `codex resume <thread>` neu und
+# uebergibt den Folgeauftrag als Erstauftrag (`codex resume [OPTIONS] [SESSION_ID]
+# [PROMPT]`). Die Resume-Flags sind oben schon auf genau `resume <id>` geprueft.
+if [ -n "$INITIAL_TASK_FILE" ] && { [ -z "$RESUME_ARGS" ] || [ "$HARNESS" = codex ]; } \
+   && [ -e "$INITIAL_TASK_FILE" ]; then
+  START_STYLE="$("$HOME/.local/bin/wb-state" harness get "$HARNESS" 2>/dev/null \
+    | /usr/bin/python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("initialPrompt", ""))
+except Exception: pass')"
+  [ "$HARNESS" = codex ] && [ "$START_STYLE" = positional ] \
+    && [ -f "$INITIAL_TASK_FILE" ] && [ -r "$INITIAL_TASK_FILE" ] \
+    && [ -s "$INITIAL_TASK_FILE" ] || {
+      echo "wb-harness-run: Codex-Erstauftrag oder Registry-Startfeld ungueltig — kein Start." >&2
+      exit 1
+    }
+  MODE="$(stat -c %a "$INITIAL_TASK_FILE" 2>/dev/null || stat -f %Lp "$INITIAL_TASK_FILE" 2>/dev/null)"
+  [ "$MODE" = 600 ] || { echo "wb-harness-run: Codex-Erstauftrag braucht Mode 0600 — kein Start." >&2; exit 1; }
+  WB_INITIAL_PROMPT="$(cat "$INITIAL_TASK_FILE")" || exit 1
+  CMD="$CMD \"\$WB_INITIAL_PROMPT\""
+fi
 
 eval "$CMD"

@@ -202,6 +202,35 @@ move_pane_to_named() {
   return 0
 }
 
+# break_pane_to_own_tab <pane> -- layout "window" only: give <pane> its own
+# window under the first free tab name (`workers`, `workers-2`, ...). Used when
+# the regular path could not place it: the tab window was never created
+# (`new-window` in wb-workers-window has to start the placeholder process and
+# can fail under fork/PTY pressure, silently) or the join into it failed.
+# break-pane starts no process, so it still works then. Before 13.10.2026 such a
+# pane went to _wbhold and the sweep below put it into `workers` NEXT TO the
+# worker already there -- two workers in one window, exit 0, no message
+# (GL#36, reproduced by failing `new-window -n workers-2` once).
+break_pane_to_own_tab() {
+  local p="$1" n=1 name wid
+  while :; do
+    name="$(tabname "$n")"
+    tmux list-windows -t "=$S" -F '#{window_name}' 2>/dev/null | grep -qxF "$name" || break
+    n=$((n+1))
+  done
+  wid=$(tmux display -p -t "$p" '#{window_id}' 2>/dev/null) || return 1
+  if [ "$(tmux display -p -t "$p" '#{window_panes}' 2>/dev/null)" = 1 ]; then
+    tmux rename-window -t "$wid" "$name" 2>/dev/null || return 1
+  else
+    tmux break-pane -d -s "$p" -n "$name" -t "=$S:" 2>/dev/null || return 1
+    wid=$(tmux display -p -t "$p" '#{window_id}' 2>/dev/null) || return 1
+  fi
+  # global automatic-rename is on; the window must keep the contract name.
+  tmux set-option -w -t "$wid" automatic-rename off 2>/dev/null
+  "$HOME/.local/bin/wb-workers-window" "$S" "$name" >/dev/null 2>&1 || true
+  return 0
+}
+
 LAYOUT=$("$HOME/.local/bin/wb-state" settings get workerLayout 2>/dev/null || true)
 [ -n "$LAYOUT" ] || LAYOUT=split
 
@@ -357,7 +386,8 @@ if [ "$LAYOUT" = "window" ]; then
       fi
       curwin=$(echo "$panes" | awk -F'|' -v p="$p" '$1==p{print $3; exit}')
       [ "$curwin" = "$tgtwin" ] && continue
-      move_pane_to_named "$p" "$tgtwin" || tmux break-pane -d -s "$p" -n "_wbhold" -t "=$S:" 2>/dev/null || true
+      move_pane_to_named "$p" "$tgtwin" || break_pane_to_own_tab "$p" \
+        || tmux break-pane -d -s "$p" -n "_wbhold" -t "=$S:" 2>/dev/null || true
     done
 
     # 3. sidebar pinned left; per-tab: placeholder steps aside once real
@@ -584,6 +614,11 @@ wwin=$(tmux list-windows -t "=$S" -F '#{window_id} #{window_name}' 2>/dev/null \
 STUCK=""
 for p in $(tmux list-panes -a -F '#{session_name} #{window_name} #{pane_id}' 2>/dev/null \
              | awk -v s="$S" '$1==s && $2=="_wbhold"{print $3}'); do
+  # Layout "window": one worker per window, also here (see break_pane_to_own_tab).
+  if [ "$LAYOUT" = "window" ]; then
+    break_pane_to_own_tab "$p" || move_pane_to_workers "$p" || STUCK="$STUCK $p"
+    continue
+  fi
   move_pane_to_workers "$p" || STUCK="$STUCK $p"
 done
 

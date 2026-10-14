@@ -47,6 +47,10 @@
 # exactly the V2 behaviour, claude and pi are built in.
 set -euo pipefail
 
+# Remove inherited loader hooks before the pane shell starts. Human-origin
+# inputs remain present for wb-mensch to verify against the actual ancestry.
+PANE_ENV_PREFIX='/usr/bin/env -u NODE_OPTIONS -u PYTHONPATH -u PYTHONHOME -u BASH_ENV -u ENV -u PERL5OPT -u PERL5LIB -u RUBYOPT -u RUBYLIB -u DYLD_INSERT_LIBRARIES -u DYLD_LIBRARY_PATH -u DYLD_FRAMEWORK_PATH -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_FALLBACK_FRAMEWORK_PATH -u LD_PRELOAD -u LD_LIBRARY_PATH -u LD_AUDIT -u LD_DEBUG'
+
 # The VSCode integrated terminal may inherit $TMUX when VSCode itself was
 # launched from inside a tmux pane; we always attach a fresh client here.
 #
@@ -65,7 +69,39 @@ export WB_EIGENTUEMER_TMUX="${WB_EIGENTUEMER_TMUX:-${TMUX:-}}"
 export WB_EIGENTUEMER_TMUX_PANE="${WB_EIGENTUEMER_TMUX_PANE:-${TMUX_PANE:-}}"
 unset TMUX TMUX_PANE
 
-DIR="$PWD"; RESUME=""; NAME=""; KEY=""; HARNESS=""; MODEL=""; EFFORT=""; FRESH=""
+# Das Heimatverzeichnis aus der Benutzerdatenbank, nicht aus der Umgebung --
+# Begruendung im Kopf von pi-worker ("WO das Pruefprogramm gesucht wird").
+wb_heimatverzeichnis() {
+  local h=""
+  if command -v dscl >/dev/null 2>&1; then
+    h="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+  fi
+  [ -n "$h" ] || h="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
+  printf '%s' "${h:-$HOME}"
+}
+WB_HEIM="$(wb_heimatverzeichnis)"
+# M2 (Oberflaeche als Ahne) braucht WB_MENSCH_QUELLE und WB_APP_PID, und `env -i`
+# loescht beide. Ohne diese Allowlist scheiterte seit dem 21.09. jeder Menschen-Nachweis
+# ueber die Werkbank-App, sichtbar als "'--mensch' abgelehnt" beim Sitzungsstart (Befund 26.09.2026). Beide sind nur
+# Behauptungen, die wb-mensch gegen seine echte Ahnenkette prueft -- dieselbe
+# Allowlist wie in wb-pane-write; alle uebrige Aufruferumgebung bleibt weg.
+M2_UMGEBUNG=()
+if [ "${WB_MENSCH_QUELLE:-}" = oberflaeche ]; then
+  case "${WB_APP_PID:-}" in ''|*[!0-9]*) ;; *) M2_UMGEBUNG=(WB_MENSCH_QUELLE=oberflaeche "WB_APP_PID=$WB_APP_PID") ;; esac
+fi
+mensch_gemessen() {
+  /usr/bin/env -i HOME="$HOME" TMPDIR=/tmp PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+    ${M2_UMGEBUNG[@]+"${M2_UMGEBUNG[@]}"} "$HOME/.local/bin/wb-mensch" pruefen >/dev/null 2>&1 || return 1
+  [ "$HOME" = "$WB_HEIM" ] && return 0
+  if [ ! -x "$WB_HEIM/.local/bin/wb-mensch" ]; then
+    echo "wb-code: HOME zeigt auf '$HOME' statt auf '$WB_HEIM', und dort liegt kein wb-mensch — die Schranke bleibt." >&2
+    return 1
+  fi
+  /usr/bin/env -i HOME="$HOME" TMPDIR=/tmp PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+    ${M2_UMGEBUNG[@]+"${M2_UMGEBUNG[@]}"} "$WB_HEIM/.local/bin/wb-mensch" pruefen >/dev/null 2>&1
+}
+
+DIR="$PWD"; RESUME=""; NAME=""; KEY=""; HARNESS=""; MODEL=""; EFFORT=""; EFFORT_EXPLIZIT=""; FRESH=""
 HARNESS_FLAG=""; MODEL_FLAG=""; MENSCH=""; KONTEXT_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -74,13 +110,21 @@ while [ $# -gt 0 ]; do
     # gegen steuerndes Terminal oder Oberflaeche als geprueften Ahnen). Geprueft
     # wird HIER, beim Einlesen, solange die Herkunft noch messbar ist -- alles
     # weiter unten sieht nur noch ein Ja oder Nein.
+    # WO das Pruefprogramm gesucht wird, entscheidet mit, was es wert ist
+    # (Sicherheits-Review 2026-09-21): ueber "$HOME/.local/bin/" gefunden,
+    # genuegte ein gesetztes HOME mit einer eigenen Attrappe, um den
+    # Menschen-Nachweis und damit den Effort-Deckel auszuhebeln. Deshalb
+    # `mensch_gemessen` -- dieselbe Fassung wie in pi-worker: umgelenktes HOME
+    # bleibt fuer die Testsuiten erlaubt, hebt aber keine Schranke mehr auf,
+    # ohne dass das Pruefprogramm im echten Heimatverzeichnis zustimmt.
     --mensch)
-      if "$HOME/.local/bin/wb-mensch" pruefen; then
+      if mensch_gemessen; then
         MENSCH=1
       else
         {
           echo "wb-code: '--mensch' abgelehnt — dieser Aufruf kommt nicht von einem Menschen."
-          echo "  Erkannt wurde: $("$HOME/.local/bin/wb-mensch" beleg 2>/dev/null | cut -f2-)"
+          echo "  Erkannt wurde: $(/usr/bin/env -i HOME="$HOME" TMPDIR=/tmp PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+            ${M2_UMGEBUNG[@]+"${M2_UMGEBUNG[@]}"} "$HOME/.local/bin/wb-mensch" beleg 2>/dev/null | cut -f2-)"
           echo "  Ohne '--mensch' startet derselbe Aufruf normal; dann greift der Deckel."
           echo "  Diagnose: wb-mensch beleg ; wb-mensch ahnen"
         } >&2
@@ -93,7 +137,7 @@ while [ $# -gt 0 ]; do
     --key) KEY="${2:?session key}"; shift 2 ;;
     --harness) HARNESS="${2:?claude|pi|registrierter Adapter}"; HARNESS_FLAG=1; shift 2 ;;
     --model) MODEL="${2:?model}"; MODEL_FLAG=1; shift 2 ;;
-    --effort) EFFORT="${2:?effort}"; shift 2 ;;
+    --effort) EFFORT="${2:?effort}"; EFFORT_EXPLIZIT=1; shift 2 ;;
     # Kontextfenster fuer einen lokalen Orchestrator (wb-kontext, Auftrag B
     # 2026-08-19, Rangfolge korrigiert im Nachtrag vom selben Tag). Gilt nur,
     # wenn HARNESS am Ende 'pi' ist -- 'auto' bzw. kein Schalter heisst: nach
@@ -104,6 +148,19 @@ while [ $# -gt 0 ]; do
     *) DIR="$1"; shift ;;
   esac
 done
+
+# Der Session-Key wird sowohl Teil eines Pfads unter ~/.pi-workers/sessions als
+# auch Teil des tmux-Sessionnamens. Vor dem ersten mkdir darf er deshalb weder
+# Pfadtrenner noch einen Optionsanfang enthalten.
+if [ -n "$KEY" ]; then
+  case "$KEY" in
+    ''|-*|*[!A-Za-z0-9_-]*)
+      echo "FEHLER: unzulaessiger Session-Key '$KEY'." >&2
+      echo "  Erlaubt sind Buchstaben, Ziffern, '-' und '_' (kein '/', kein '..', kein fuehrendes '-')." >&2
+      echo "  Grund: aus dem Key werden Pfade unter ~/.pi-workers/ gebaut." >&2
+      exit 1 ;;
+  esac
+fi
 [ -d "$DIR" ] || { echo "wb-code: kein Verzeichnis: $DIR" >&2; exit 1; }
 DIR="$(cd "$DIR" && pwd)"
 
@@ -173,6 +230,14 @@ fi
 # FROM the registry entry — the id already says which CLI it belongs to, and having
 # to name both is a trap (the settings harness would silently win and start the
 # wrong CLI). An explicit --harness always wins over this.
+# `--resume <id>` OHNE `--harness` ist eine Claude-Kennung: jeder andere Harness bekommt
+# sein `--harness` vom Aufrufer mit (app/src/main/revive.ts, harnessFlags). Ohne diese
+# Zeile setzte die Einstellung (orchestratorHarness/Model = pi/qwen) den Harness, und das
+# Fortsetzen einer Claude-Sitzung aus der App brach mit "--resume gilt nur fuer den
+# Claude-Harness" ab (Befund 26.09.2026).
+if [ -n "$RESUME" ] && [ -z "$HARNESS_FLAG" ] && [ -z "$MODEL_FLAG" ]; then
+  HARNESS="claude"; HARNESS_FLAG=1
+fi
 [ -n "$MODEL" ] || MODEL="$($HOME/.local/bin/wb-state settings get orchestratorModel || true)"
 if [ -n "$MODEL" ] && [ -z "$HARNESS_FLAG" ]; then
   RH="$($HOME/.local/bin/wb-state models get "$MODEL" --field harness 2>/dev/null || true)"
@@ -189,6 +254,17 @@ fi
 [ -n "$EFFORT" ]  || EFFORT="$($HOME/.local/bin/wb-state settings get orchestratorEffort || true)"
 [ -n "$HARNESS" ] || HARNESS="claude"
 [ -n "$EFFORT" ]  || EFFORT="xhigh"
+# Ein Modell aus den EINSTELLUNGEN, das zu einem anderen Harness gehoert als dem hier
+# gewaehlten, ist keine Wahl fuer diesen Start, sondern die Vorgabe eines anderen Wegs:
+# verwerfen, dann gilt das Vorgabemodell des Harness. Ein ausdrueckliches --model bleibt
+# und wird unten weiterhin hart abgelehnt, wenn es nicht passt.
+if [ -z "$MODEL_FLAG" ] && [ -n "$MODEL" ]; then
+  SMH="$($HOME/.local/bin/wb-state models get "$MODEL" --field harness 2>/dev/null || true)"
+  if [ -n "$SMH" ] && [ "$SMH" != "$HARNESS" ]; then
+    echo "wb-code: Einstellungsmodell '$MODEL' gehoert zu Harness '$SMH' -- '$HARNESS' startet mit seinem Vorgabemodell." >&2
+    MODEL=""
+  fi
+fi
 # Einen unbekannten expliziten Harness zuerst benennen. Sonst meldet eine noch
 # gespeicherte Modellwahl irrefuehrend nur den Harness-/Modell-Mischmasch.
 case "$HARNESS" in
@@ -209,15 +285,30 @@ if [ -n "$MH" ] && [ "$MH" != "$HARNESS" ]; then
 fi
 case "$HARNESS" in
   claude)
-    [ -n "$MODEL" ] || MODEL="claude-opus-5"
+    [ -n "$MODEL" ] || MODEL="opus"
+    # Familiennamen sind Registry-Daten. Vor dem Zustands-Touch und vor dem
+    # eigentlichen CLI-Start wird deshalb die konkrete, aktuell neueste
+    # aktivierte Kennung festgehalten. Ein expliziter versionsgebundener Alias
+    # (opus5, opus55, ...) nimmt denselben Weg und bleibt dadurch fest.
+    RCLAUDE="$($HOME/.local/bin/wb-state models get "$MODEL" --field modelRef 2>/dev/null || true)"
+    [ -n "$RCLAUDE" ] && MODEL="$RCLAUDE"
     ;;
   pi)
     [ -n "$RESUME" ] && { echo "wb-code: --resume gilt nur fuer den Claude-Harness; pi setzt eine Session mit --continue fort." >&2; exit 1; }
     # A claude model id in the settings simply does not exist locally — fall back
     # to the default local coder instead of failing the start.
     case "$MODEL" in
-      ""|claude*) [ -n "$MODEL" ] && echo "wb-code: '$MODEL' ist kein lokales Modell — starte pi mit 'ornith'." >&2
-                  MODEL="ornith" ;;
+      ""|claude*) [ -n "$MODEL" ] && echo "wb-code: '$MODEL' ist kein lokales Modell — starte pi mit 'qwen38'." >&2
+                  MODEL="qwen38" ;;
+    esac
+    # Deleted Mac aliases reuse qwen38's complete Splash and pi-agent context path.
+    case "$MODEL" in
+      ornith|ornith-35b|ornith-35b-*|ornith:35b|ornith:35b-*|ollama/ornith:35b|ollama/ornith:35b-*)
+        echo "ornith:35b ist gelöscht, qwen3.8 übernimmt" >&2
+        MODEL="qwen38" ;;
+      grug|grug-27b|grug-27b-mlx-q4|grug-27b-mlx-*|*/grug-27b-mlx-q4)
+        echo "grug ist gelöscht, qwen3.8 übernimmt" >&2
+        MODEL="qwen38" ;;
     esac
     ;;
   *)
@@ -263,6 +354,21 @@ esac
 # Sitzung aufmachen koennen. Mit `--mensch` faellt er weg -- dann gilt nur noch,
 # was der Harness annimmt. Ein Mensch, der einen Worker-Deckel gesetzt hat,
 # bremst damit also nie sich selbst.
+# QWEN LAEUFT IMMER AUF DER HOECHSTEN STUFE (der Nutzer 2026-09-20), und das gilt
+# auch, wenn qwen3.8 als ORCHESTRATOR in der Werkbank laeuft. Ohne ausdrueckliches
+# --effort gewinnt deshalb fuer ein Splash-Modell die Registry-Vorgabe des Modells
+# (defaultEffort, heute xhigh) und nicht die allgemeine Orchestrator-Einstellung
+# (orchestratorEffort, heute high). Eine ausdrueckliche Stufe schlaegt beides.
+if [ -z "$EFFORT_EXPLIZIT" ] && [ -n "$MODEL" ]; then
+  QPROV="$($HOME/.local/bin/wb-state models get "$MODEL" --field provider 2>/dev/null || true)"
+  if [ "$QPROV" = splash-lokal ]; then
+    QEFF="$($HOME/.local/bin/wb-state models get "$MODEL" --field defaultEffort 2>/dev/null || true)"
+    if [ -n "$QEFF" ] && [ "$QEFF" != "$EFFORT" ]; then
+      echo "wb-code: Denkstufe '$QEFF' aus der Registry-Vorgabe des Modells statt '$EFFORT' — Qwen laeuft immer auf der hoechsten Stufe." >&2
+      EFFORT="$QEFF"
+    fi
+  fi
+fi
 EFF_OUT="$($HOME/.local/bin/wb-state models effort "$MODEL" --harness "$HARNESS" \
              --effort "$EFFORT" --rolle orchestrator ${MENSCH:+--mensch} 2>&1)" || {
   printf '%s\n' "$EFF_OUT" >&2
@@ -391,19 +497,35 @@ prozess_programm() {
   printf '%s\n' "$p"
 }
 
+eigener_tmux_socket() {
+  local sock="$1" dir="${1%/*}"
+  # TMUX_TMPDIR is caller-controlled. Never treat a regular file or symlink in
+  # that directory as a stale tmux socket, even when lsof reports no holder.
+  [ -d "$dir" ] && [ -O "$dir" ] && [ ! -L "$dir" ] &&
+    [ -S "$sock" ] && [ -O "$sock" ] && [ ! -L "$sock" ]
+}
+
 unwedge_server() {
   local msg pid sock i halter anzahl prog
   msg="$(tmux ls 2>&1 >/dev/null || true)"
   case "$msg" in *"server exited unexpectedly"*) ;; *) return 0 ;; esac
   sock="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/default"
   [ -e "$sock" ] || return 0
+  if ! eigener_tmux_socket "$sock"; then
+    echo "wb-code: $sock ist kein eigener tmux-Socket im erwarteten Verzeichnis — nichts angetastet." >&2
+    return 1
+  fi
   if ! command -v lsof >/dev/null 2>&1; then
     echo "wb-code: tmux-Server antwortet nicht — ohne lsof laesst sich aber nicht feststellen, wer $sock haelt. Nichts angetastet." >&2
     exit 1
   fi
   halter="$(lsof -t -- "$sock" 2>/dev/null || true)"
   anzahl="$(printf '%s\n' "$halter" | grep -c '^[0-9][0-9]*$')"
-  if [ "$anzahl" -eq 0 ]; then rm -f "$sock"; return 0; fi
+  if [ "$anzahl" -eq 0 ]; then
+    eigener_tmux_socket "$sock" || { echo "wb-code: Socket vor dem Loeschen veraendert — nichts angetastet." >&2; return 1; }
+    rm -f "$sock"
+    return 0
+  fi
   if [ "$anzahl" -gt 1 ]; then
     echo "wb-code: $sock wird von mehreren Prozessen gehalten ($(printf '%s' "$halter" | tr '\n' ' ')) — nicht angetastet." >&2
     exit 1
@@ -428,6 +550,7 @@ unwedge_server() {
     echo "wb-code: tmux-Server $pid lebt nach kill -9 weiter — der Socket bleibt liegen, sonst laeuft ein Server ohne Socket." >&2
     exit 1
   fi
+  eigener_tmux_socket "$sock" || { echo "wb-code: Socket vor dem Loeschen veraendert — nichts angetastet." >&2; return 1; }
   rm -f "$sock"
 }
 unwedge_server
@@ -514,22 +637,20 @@ ist_mlx_lokal() { case "$1" in mlx-lokal*) return 0 ;; *) return 1 ;; esac; }
 
 if [ "$HARNESS" = "pi" ]; then
   # Local orchestrator (SPEC-V2 section F): same pane contract, other harness.
-  # PIPROVIDER faellt auf ollama zurueck (der bisherige, einzige Weg); grug/qwen38
-  # sind MLX-Modelle und laufen BEIDE ueber den umschaltbaren MLX-Server (Auftrag
-  # A, GEMEINSAME-FAKTEN Punkt 2: "grug und qwen3.8 teilen sich einen
-  # umschaltbaren MLX-Server"). Das Ensure dafuer steht EINMAL weiter unten, im
-  # gemeinsamen Kontext-Block -- hier nur PIPROVIDER/PIMODEL setzen, kein
-  # zweiter, widerspruechlicher Ensure-Aufruf gegen grug-server.
+  # PIPROVIDER defaults to Ollama; qwen38 uses Splash or the explicit MLX path.
+  # Provider-specific ensure calls happen later in the shared context block.
   PIPROVIDER=ollama
   case "$MODEL" in
-    ornith)  PIMODEL="ornith:35b" ;;
     qwen)    PIMODEL="qwen3.6:35b-a3b-coding-nvfp4" ;;
     ornith9) PIMODEL="ornith:9b" ;;
-    grug)
-      PIPROVIDER=mlx-lokal
-      PIMODEL="$HOME/AI/mlx-models/grug-27b-mlx-q4"
-      ;;
     qwen38)
+      # UMGESTELLT AUF SPLASH AM 2026-09-20 (Entscheidung des Nutzers nach eigener
+      # Messung, siehe shell/wb-splash-server und die Messnotiz im Vault). Der
+      # Alias zeigt auf den Splash-Motor; der MLX-Weg bleibt unter 'qwen38mlx'.
+      PIPROVIDER=splash-lokal
+      PIMODEL="incoai/Qwen3.8-27B-Splash"
+      ;;
+    qwen38mlx|qwen38-mlx)
       PIPROVIDER=mlx-lokal
       PIMODEL="$HOME/AI/mlx-models/qwen38-27b-mlx-4bit"
       ;;
@@ -553,6 +674,59 @@ if [ "$HARNESS" = "pi" ]; then
       fi
       ;;
   esac
+  # ── SPLASH-WEG (2026-09-20): eigener Motor, eigene Buchfuehrung ────────────
+  # Splash bringt Entwerfer (DFlash 2), KV-Verwaltung und Kontextgrenze selbst
+  # mit. Fuer ihn gibt es nichts zu waehlen, was die drei Bloecke unten waehlen:
+  # keine Vorhersage-Bauart (sie ist fest eingebaut), keine Kontextstufe (der
+  # Server bekommt eine Obergrenze und teilt selbst zu) und keinen
+  # wb-kontext-Eintrag (der Provider steht fest in ~/.pi/agent/models.json).
+  # Deshalb ueberspringt dieser Zweig sie vollstaendig, statt sie mit
+  # Sonderfaellen zu durchsetzen. Der else-Zweig darunter ist der bisherige
+  # Ablauf, unveraendert -- nur eingeklammert, bewusst ohne Neu-Einrueckung,
+  # damit der Unterschied im Vergleich sichtbar bleibt.
+  if [ "$PIPROVIDER" = splash-lokal ]; then
+    if [ ! -x "$HOME/.local/bin/wb-splash-server" ]; then
+      echo "wb-code: wb-splash-server fehlt — qwen3.8 laeuft seit 2026-09-20 ueber Splash. Kein stiller Rueckfall auf den MLX-Weg; der heisst ausdruecklich 'qwen38mlx'." >&2
+      exit 1
+    fi
+    SPLASH_ID="$($HOME/.local/bin/wb-state models get "$PIMODEL" --field id 2>/dev/null || true)"
+    [ -n "$SPLASH_ID" ] || SPLASH_ID="qwen38-27b"
+    SPLASH_MAX="$($HOME/.local/bin/wb-state models get "$SPLASH_ID" --field contextWindow 2>/dev/null || true)"
+    # Der Orchestrator braucht das volle pi-Fenster. Sein Ensure nennt die
+    # Forderung ausdruecklich; ein kleiner laufender Server darf nur ohne
+    # lebende Splash-Stroeme angehoben werden.
+    SPLASH_KONTEXT_ARGS=(--kontext 262144)
+    SPLASH_FALLBACK=""
+    if SPLASH_IST="$("$HOME/.local/bin/wb-splash-server" ensure "$SPLASH_ID" \
+      "${SPLASH_KONTEXT_ARGS[@]}" --rolle orchestrator --sitzung "$SESSION")"; then
+      SPLASH_RC=0
+    else
+      SPLASH_RC=$?
+    fi
+    if [ "$SPLASH_RC" -eq 3 ] && mensch_gemessen; then
+      case "$SPLASH_IST" in
+        ''|*[!0-9]*) echo "wb-code: laufende Splash-Kante nicht lesbar — kein sicherer pi-Start." >&2; exit 1 ;;
+      esac
+      [ "$SPLASH_IST" -gt 0 ] && [ "$SPLASH_IST" -le 262144 ] || {
+        echo "wb-code: ungueltige Splash-Kante '$SPLASH_IST' — kein sicherer pi-Start." >&2; exit 1;
+      }
+      SPLASH_FALLBACK=1
+      echo "wb-code: WARNUNG — Splash bleibt bei $SPLASH_IST Token; laufende Stroeme verhindern 262144. Pi bekommt fuer DIESE Sitzung $SPLASH_IST und muss frueher kompaktieren." >&2
+    elif [ "$SPLASH_RC" -ne 0 ]; then
+      echo "wb-code: 'wb-splash-server ensure $SPLASH_ID' fehlgeschlagen — kein Start." >&2
+      exit 1
+    fi
+    # Die Registry ist die gemeinsame Zusage an pi und den Server. Fehlt der
+    # Wert, bleibt die bisherige Servervorgabe erhalten statt einen zu erfinden.
+    KSTUFE=131072
+    [ -n "$SPLASH_MAX" ] && KSTUFE="$SPLASH_MAX"
+    [ -n "$SPLASH_FALLBACK" ] && KSTUFE="$SPLASH_IST"
+    KTOUCH=("$DIR" "$SESSION"); [ -n "$KEY" ] && KTOUCH+=(--key "$KEY")
+    KTOUCH+=(--kontext "$KSTUFE")
+    $HOME/.local/bin/wb-state touch "${KTOUCH[@]}" 2>/dev/null \
+      || echo "wb-code: WARNUNG — Kontextstufe nicht in die Zustandsdatei geschrieben." >&2
+    echo "wb-code: Splash bedient '$PIMODEL' (Port 8000), Kontext verwaltet der Server selbst." >&2
+  else
   # ── Multi-Token-Vorhersage (2026-08-20, Vorgaben des Nutzers) ────────────────
   # Der Schalter (an/aus) steht in den Settings ('orchestratorVorhersage');
   # WELCHE Modelle dafuer ueberhaupt in Frage kommen, steht in der REGISTRY
@@ -573,14 +747,11 @@ if [ "$HARNESS" = "pi" ]; then
   # der erste der Liste, sonst die Felder auf oberster Ebene).
   #
   # $MODEL traegt an dieser Stelle noch den ROHEN Aufrufwert (Alias oder
-  # Registry-Kennung) -- der case-Block oben schreibt nur PIMODEL/
-  # PIPROVIDER um, $MODEL selbst nicht. Fuer die beiden Kurzaliase, die
-  # nicht schon selbst die Registry-Kennung sind (qwen38 -> qwen38-27b,
-  # grug -> grug-27b), wird die Kennung hier nachgetragen -- derselbe
+  # Registry-Kennung) -- qwen38 wird hier auf seine Registry-Kennung abgebildet,
+  # bevor dessen Vorhersagefelder gelesen werden.
   # Kunstgriff wie EFFORT_ID in shell/pi-worker fuer denselben Zweck.
   case "$MODEL" in
     qwen38) VORH_ID="qwen38-27b" ;;
-    grug)   VORH_ID="grug-27b" ;;
     *)      VORH_ID="$MODEL" ;;
   esac
   VORH_BAUART=""; VORH_MODELL=""; VORH_GEWICHTE_GB=""; VORH_WEG_LABEL=""; VORH_WEG_WARNUNG=""
@@ -603,7 +774,8 @@ try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-wege = [w for w in (d.get("wege") or []) if isinstance(w, dict) and w.get("id")]
+wege = [w for w in (d.get("wege") or []) if isinstance(w, dict) and w.get("id")
+        and w.get("enabled") is not False]
 # Der Vorgabeweg: wegVorgabe, sonst der erste der Liste, sonst die Felder auf
 # oberster Ebene (der Stand vor dem 21.08.2026, unveraendert gueltig).
 vorgabe = None
@@ -836,6 +1008,7 @@ print("\t".join([
   KPROV="$(printf '%s\n' "$ENSURED" | sed -n 's/^provider=//p')"
   [ -n "$KPROV" ] && PIPROVIDER="$KPROV"
   echo "wb-code: Kontext $KSTUFE Token (Provider $PIPROVIDER)." >&2
+  fi   # Ende des bisherigen (MLX/Ollama-)Weges; der Splash-Zweig oben hat schon alles gesetzt
   # In die Sitzungs-Zustandsdatei schreiben, damit die Oberflaeche die gewaehlte
   # Stufe anzeigen kann (Auftrag B 2026-08-19) -- eigener Aufruf, weil KSTUFE
   # erst hier feststeht, lange nach dem 'touch' oben.
@@ -845,6 +1018,22 @@ print("\t".join([
     || echo "wb-code: WARNUNG — Kontextstufe nicht in die Zustandsdatei geschrieben." >&2
   PISESSDIR="$HOME/.pi-workers/sessions/orch-${KEY:-$(printf '%s' "$DIR" | tr '/' '-')}"
   mkdir -p "$PISESSDIR"
+  PI_AGENT_PREFIX=""
+  if [ "$PIPROVIDER" = splash-lokal ]; then
+    # Pi liest contextWindow aus <agent-dir>/models.json. Eine private Kopie
+    # nur fuer diese Sitzung aendert den globalen 262144-Eintrag nicht; alle
+    # anderen Agentenressourcen bleiben ueber Symlinks am gewohnten Ort.
+    PI_AGENT_DIR="$PISESSDIR/agent"
+    if "$HOME/.local/bin/wb-splash-server" pi-agent-kontext \
+        "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" "$PI_AGENT_DIR" "$PIPROVIDER" "$PIMODEL" "$KSTUFE"; then
+      PI_AGENT_PREFIX="export PI_CODING_AGENT_DIR=$(printf %q "$PI_AGENT_DIR") && "
+    elif mensch_gemessen; then
+      echo "wb-code: WARNUNG — pi-Kante $KSTUFE konnte fuer diese Sitzung nicht angeglichen werden; context_length_exceeded ist moeglich. Repariere ${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/models.json: Provider $PIPROVIDER, Modell $PIMODEL mit contextWindow $KSTUFE eintragen; danach neu starten." >&2
+    else
+      echo "wb-code: sitzungseigene pi-Konfiguration fuer $KSTUFE konnte nicht angelegt werden — pruefe ${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/models.json; Agentenstart abgebrochen." >&2
+      exit 1
+    fi
+  fi
   ROLE="$HOME/.pi/agent/ORCHESTRATOR.md"
   # The role prompt is written by the human/Claude orchestrator, not here. Missing
   # file: start anyway, but say so — a silent role-less orchestrator is worse.
@@ -853,7 +1042,7 @@ print("\t".join([
   # orchestrator cannot spawn workers (claude-worker, pi-worker, wb-*).
   # Run through `bash -lc` like pi-worker does: the user's login shell is zsh,
   # which aborts loudly on the non-matching session glob below.
-  PI_CMD="export PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH && exec pi --provider $(printf %q "$PIPROVIDER") --model $(printf %q "$PIMODEL") --thinking $(printf %q "$EFFORT") --session-dir $(printf %q "$PISESSDIR") \$( ls $(printf %q "$PISESSDIR")/*.json* >/dev/null 2>&1 && echo --continue )"
+  PI_CMD="export PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH && ${PI_AGENT_PREFIX}exec pi --provider $(printf %q "$PIPROVIDER") --model $(printf %q "$PIMODEL") --thinking $(printf %q "$EFFORT") --session-dir $(printf %q "$PISESSDIR") \$( ls $(printf %q "$PISESSDIR")/*.json* >/dev/null 2>&1 && echo --continue )"
   [ -n "$NAME" ] && PI_CMD="$PI_CMD --name $(printf %q "$NAME")"
   [ -f "$ROLE" ] && PI_CMD="$PI_CMD --append-system-prompt $(printf %q "$ROLE")"
   CLAUDE_CMD="bash -lc $(printf %q "$PI_CMD")"
@@ -977,6 +1166,7 @@ else
 fi
 
 # Snapshot the transcripts BEFORE Claude starts — the new one is this session's.
+CLAUDE_CMD="$PANE_ENV_PREFIX $CLAUDE_CMD"
 BEFORE=""
 
 # Aufraeumen bei jedem fruehen Abbruch (2026-08-16, bugjagd shell/niedrig, "kein
@@ -1001,6 +1191,7 @@ fi
 
 tmux new-session -d -s "$SESSION" -c "$DIR" "$CLAUDE_CMD"
 orch=$(tmux list-panes -t "=$SESSION" -F '#{pane_id}' | head -1)
+tmux set -p -t "$orch" @wb_harness "$HARNESS"
 
 # ── Diese Sitzung traegt sich als Benutzer des Modellservers ein (2026-08-21) ─
 # Beim Start gab es diese Sitzung noch nicht: `wb-mlx-server ensure` laeuft
@@ -1041,6 +1232,15 @@ if [ -x "$HOME/.local/bin/wb-rolle" ]; then
 else
   tmux set -p -t "$orch" @wb_role orchestrator
 fi
+# Welcher lokale Motor bedient diesen Pane? pi-worker markiert seine Panes
+# laengst so; hier fehlte es, und daran haengt mehr als eine Anzeige: die
+# Leerlaufwache von wb-splash-server fragt genau diese Markierung, bevor sie
+# einen stillen Server stoppt. Ohne sie galt ein offener Orchestrator als
+# "niemand da", der Server ging aus, und die naechste Anfrage lief ins Leere
+# (Befund des Nutzers 2026-09-21).
+case "${PIPROVIDER:-}" in
+  splash-lokal|mlx-lokal|omlx-lokal) tmux set -p -t "$orch" @wb_lokal_provider "$PIPROVIDER" ;;
+esac
 # Clean, re-executable command for wb-revive / wb-autorevive (pane-died hook).
 tmux set -p -t "$orch" @wb_cmd "$CLAUDE_CMD"
 tmux set -p -t "$orch" remain-on-exit on

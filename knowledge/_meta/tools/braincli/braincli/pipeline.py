@@ -32,8 +32,6 @@ from gardener.grug_client import GRUG_MODEL_PATH
 from gardener.ollama import OllamaClient
 from gardener.runtime import dirty_paths
 
-from . import gardener_wrap
-
 # Gemessen 02.09.2026 (Auftrag "modellwege", 20-Paar-Stichprobe, linking ohne
 # Denken, derselbe MLX-Weg wie heute): 5,78 s je Verknuepfungsurteil. Ein
 # Volllauf urteilt grob ueber 300 bis 600 Paare (die fuenf schlauen Phasen
@@ -204,32 +202,18 @@ def format_preflight_report(p: Preflight) -> str:
 
 
 def run(vault: Path, dry_run: bool, verbose: bool = False,
-       budget_minutes: float | None = None) -> int:
-    """`brain pipeline run`: Trockenlauf prueft nur (siehe `preflight`), sonst
-    die echte Kette - erst `gardener run --phase all`, dann `dream run`. Der
-    Traum startet nur, wenn der Gaertner sauber durchgelaufen ist (Exit 0);
-    ein `partial`-Lauf (Exit 0, aber Modell/Ollama unterwegs ausgefallen)
-    zaehlt hier als "gut genug zum Weitermachen" - nur ein echter Fehler-Exit
-    haelt die Kette an.
+       budget_minutes: float | None = None, json_mode: bool = False) -> int:
+    """`brain pipeline run` = `brain run --profil all` (Brain 5, B4): the
+    gardener's care phases, then the local lessons pipeline, one lock, one
+    report, one commit. `--dry-run` loads no model and writes nothing (see
+    `gardener.lauf.lauf`); the older readiness checks above (`preflight`)
+    stay available for the MLX-based gardener phases.
 
-    `budget_minutes` reicht Auftrag "zeitgrenze" Punkt 6s Gaertner-Schalter
-    durch - der Trockenlauf-Schaetzwert oben (29-58 Minuten, gegen ein
-    45-Minuten-Budget) ist genau der Grund, warum die Kette hier verstellbar
-    sein muss, nicht nur `gardener run` selbst."""
-    if dry_run:
-        result = preflight(vault)
-        print(format_preflight_report(result))
-        return 0 if result.ready else 1
-
-    rc = gardener_wrap.run(vault, phase="all", dry_run=False, verbose=verbose,
-                           budget_minutes=budget_minutes)
-    if rc != 0:
-        print(f"gardener run beendet mit Exit {rc} - der Traum-Lauf startet "
-              "deshalb nicht. `brain gardener status` fuer Details.")
-        return rc
-
-    from gardener.dream.cli import main as dream_main
-    argv = ["run", "--vault", str(vault)]
-    if verbose:
-        argv.append("--verbose")
-    return dream_main(argv)
+    `budget_minutes` bounds the whole run; the gardener gets it as its own
+    budget as before."""
+    from gardener.lauf import lauf as lauf_mod
+    from gardener.runtime import install_termination_handler
+    install_termination_handler()
+    return lauf_mod.run(vault, profil="all", dry_run=dry_run, json_mode=json_mode,
+                        budget_minutes=budget_minutes,
+                        gardener_args={"phase": "all", "verbose": verbose})

@@ -1,19 +1,28 @@
 ---
+# Vorlage für eine Wissensnotiz (type: note oder reference), Schema 4. Für Entscheidung, Falle, System
+# und Begriff gibt es eigene Vorlagen (decision.md, pitfall.md, system.md, term.md), für Sitzungen
+# sessions/, für Personen person.md, für Vorfälle incident.md. Diesen Kommentarblock beim Anlegen löschen.
+id: "{{ulid}}"   # ULID, einmal vergeben, nie ändern. Erzeugen: python3 -c "import time,secrets;A='0123456789ABCDEFGHJKMNPQRSTVWXYZ';v=(int(time.time()*1000)<<80)|secrets.randbits(80);print(''.join(A[(v>>s)&31] for s in range(125,-1,-5)))"
+schema: 4
 title: "{{title}}"
-type: note        # note | decision | reference | session | secret | report | asset | person | incident
-branch: 10-global # 10-global | 20-projects/<project> | 30-topics/<topic>
-tags: []
+type: note        # note | reference (belegte Sachaussage, Messung, Setup) — Arten mit eigener Vorlage: decision | pitfall | system | term | incident | person
+class: knowledge  # source (Sitzung, Rohmaterial: nie umschreiben) | knowledge (umschreibbar) | derived (erzeugt, nie von Hand)
 created: "{{date}}"
-aliases: []       # optional: alternative Namen/Schreibweisen, unter denen die Note gefunden werden soll
+stand: "{{YYYY-MM}}"   # Monat, für den der Inhalt zuletzt geprüft wurde
 beleg: berichtet  # gemessen | berichtet — nur diese zwei Werte; siehe unten
-review-after: "{{YYYY-MM}}"  # optional: Monat, ab dem der Inhalt auf Aktualität geprüft werden sollte
-related: []       # optional: Array von Wikilink-Zielen, z.B. [[note-a]], [[note-b]]
+# optional:
+# branch: 20-projects/<project>   # aus dem Pfad ableitbar, nur nötig wenn der Pfad es nicht sagt
+# tags: []
+# aliases: []       # alternative Namen/Schreibweisen, unter denen die Notiz gefunden werden soll
+# review-after: "{{YYYY-MM}}"   # Monat, ab dem der Inhalt auf Aktualität geprüft werden sollte
+# related: []       # flache Zusatzliste, z.B. ["[[note-a]]"]; ersetzt die typisierten Links im Text nicht
 ---
 
 Für künftige Sessions: <wann diese Note relevant ist>
 
-<!-- Body. Link liberally with typed wikilinks: -->
-<!-- relates-to [[note]] | depends-on [[note]] | supersedes [[note]] | part-of [[note]] | contradicts [[note]] -->
+<!-- Body. Typisierte Wikilinks: relates-to [[note]] | depends-on [[note]] | supersedes [[note]]
+     | part-of [[note]] | contradicts [[note]]. Kein `permalink:` (die Identität ist `id`),
+     keine Claude-Memory-Felder (`name:`, `metadata:`), genau ein Frontmatter-Block. -->
 
 <!-- Recency-Marker: jede wichtige, zeitabhängige Behauptung mit "Stand: YYYY-MM"
      kennzeichnen, damit künftige Sessions das Alter der Info sofort sehen. -->
@@ -22,38 +31,20 @@ Für künftige Sessions: <wann diese Note relevant ist>
      `gemessen` heißt: die zentralen Aussagen beruhen auf Zahlen, die jemand erhoben hat.
      `berichtet` heißt alles andere — gesagt, entschieden, beobachtet, aus einer Quelle
      übernommen. Im Zweifel `berichtet`.
-     Warum als Feld und nicht im Fließtext: als benanntes Feld überlebt die Angabe eine
-     Zusammenfassung deutlich besser (arXiv 2608.06953, 07.08.2026, rund 15 Prozentpunkte).
-     "Gemessen am 06.08." mitten im Satz wird von der dritten Zusammenfassung zu "gilt".
-     Warum nur zwei Werte: ein Feld mit fünf Abstufungen pflegt niemand, und ein
-     ungepflegtes Feld sieht aus wie eine Aussage über die Belegstärke und ist keine.
-     Der Traum füllt es bei seinen eigenen Seiten selbst aus; der Lint fordert es NUR
-     dort ein. Bestehende handgeschriebene Notizen werden nicht nachträglich umgeschrieben. -->
+     Warum als Feld: als benanntes Feld überlebt die Angabe eine Zusammenfassung deutlich
+     besser (arXiv 2608.06953, 07.08.2026, rund 15 Prozentpunkte). "Gemessen am 06.08."
+     mitten im Satz wird von der dritten Zusammenfassung zu "gilt".
+     Warum nur zwei Werte: ein Feld mit fünf Abstufungen pflegt niemand. -->
 
-<!-- Zwei Note-Klassen:
-     - Session-/Quell-Notes (type: session, oder Rohmaterial aus 00-sources): IMMUTABLE
-       Archiv. Nie nachträglich umschreiben — neue Erkenntnisse gehen in eine neue
-       Session-Note oder in eine Themen-Note, die darauf verlinkt.
-     - Themen-/Fakten-Notes (type: note/reference/decision, alles in 10-global und
-       20-projects/<p>/ außer Session-Notes): REWRITE-OVER-APPEND. Bei neuem Wissen
-       den bestehenden Text umschreiben statt anhängen; Widersprüche im Fließtext
-       auflösen (alte Aussage korrigieren/streichen), nicht als Nachtrag stehen lassen. -->
+<!-- Zwei Klassen:
+     - class: source (Sitzungen unter sessions/, Rohmaterial aus 00-sources): unveränderliches
+       Archiv. Nie umschreiben — neue Erkenntnisse gehen in eine neue Notiz, die darauf verlinkt.
+     - class: knowledge (alles andere in 10-global, 20-projects/<p>/, 30-topics, 40-people):
+       REWRITE-OVER-APPEND. Bei neuem Wissen den Text umschreiben statt anhängen; Widersprüche
+       im Fließtext auflösen, nicht als Nachtrag stehen lassen.
+     Der Pre-commit-Lint (git-hooks/notiz_lint.py) warnt bei fehlenden Pflichtfeldern
+     id/schema/class/type, unbekanntem Typ und einer Klasse, die nicht zum Pfad passt. -->
 
-<!-- Spezial-Typen (Brain 3.0, eigene Templates):
-     - type: asset — Stub-Note pro Binärfile in <branch>/_assets/. Siehe _meta/templates/asset-stub.md.
-     - type: person — Mini-CRM für Kontakte. Siehe _meta/templates/person.md.
-     - type: incident — Postmortem (was schiefging/Ursache/Fix/Lehre). Siehe _meta/templates/incident.md.
-     - Themen-Hubs leben in 30-topics/<thema>/MOC.md. Siehe _meta/templates/topic-moc.md. -->
-
-<!-- aliases: [] — alternative Bezeichnungen, unter denen Suche/Gardener diese Note
-     finden soll (z.B. Abkürzungen, frühere Namen).
-     review-after: YYYY-MM — optionaler Monat, ab dem Inhalt geprüft werden sollte
-     (z.B. bei zeitlich befristeten Entscheidungen oder sich schnell ändernden Fakten). -->
-
-<!-- related: [] — OPTIONAL Array expliziter Wikilink-Ziele (z.B. related: ["[[shared-brain]]", "[[peer-remote-access]]"]).
-     Ergänzt, ERSETZT NICHT die typisierten Inline-Wikilinks im Fließtext (relates-to/
-     depends-on/supersedes/part-of/contradicts) — die bleiben Pflicht für Beziehungen,
-     die eine Bedeutung tragen. `related:` ist nur eine flache, maschinenlesbare
-     Zusatzliste für schnelles Auffinden verwandter Notes ohne den Body zu parsen; leer
-     lassen oder weglassen ist genauso gültig wie bei bestehenden 215 Notes ohne dieses
-     Feld. -->
+<!-- Spezial-Typen mit eigener Vorlage:
+     asset (asset-stub.md), person (person.md), incident (incident.md), decision (decision.md),
+     pitfall (pitfall.md), system (system.md), term (term.md). Themen-Hubs: topic-moc.md. -->

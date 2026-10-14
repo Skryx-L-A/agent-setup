@@ -1,0 +1,6 @@
+/* Ein Stilblatt fuer die PWA; esbuild buendelt die Teile zu app.css. */
+@import './basis.css';
+@import './rahmen.css';
+@import './listen.css';
+@import './chat.css';
+@import './formular.css';

@@ -5,6 +5,33 @@
 #   wb-freigabe erteilen [--ttl <sek>] [--schluessel <sha256>] [--index <n>|--alle]
 #                        [--grund <text>] <pane> [grund]  Die wartende Frage freigeben.
 #   wb-freigabe beleg                     Wie dieser Aufruf gemessen wird (Diagnose).
+#   wb-freigabe zurueckziehen [<pane>]    Die EIGENE wartende Frage zuruecknehmen.
+#   wb-freigabe warten <pane> --befehl-datei <pfad> [--cwd <dir>] [--max <sek>]
+#                                         Blockieren, bis ueber GENAU diesen Wortlaut
+#                                         entschieden ist. Erteilt nichts.
+#                                         Exit 0 erteilt, 3 abgelehnt, 4 abgelaufen,
+#                                         5 keine Frage offen, 6 noch offen (erneut rufen).
+#
+# WARTEN (29.09.2026, Vorgabe des Nutzers, woertlich: "wenn ich in zukunft über die
+# workbench freigebe will ich den orchestrator/worker nicht selbst darüber informieren
+# müssen dass ich die freigabe gegeben habe"). Der Rueckfrage-Text des Hooks
+# (hooks/lib/ask_muster.py, deny_text) nennt diesen Aufruf woertlich, mit dem Pane und
+# einer Datei, in die der Hook den Wortlaut gelegt hat. Der Agent beendet seinen Zug
+# nicht mehr, er wartet darin. `warten` LIEST nur: Merker, Freigabedatei, Verlauf. Es
+# misst keine Herkunft, legt keine Freigabe an, loescht keine und verbraucht keine --
+# eine Freigabe erteilt weiterhin nur `erteilen` fuer einen gemessenen Menschen.
+# Geschrieben wird allein eine Anmeldung unter guard-warten/ ("in diesem Pane wartet
+# jemand"), damit `erteilen` weiss, dass es keinen Hinweis mehr schicken muss.
+#
+# ZURUECKZIEHEN (der Nutzer, 25.09.2026, Anlass eine Kundensitzung): eine ueberfluessige
+# Rueckfrage (dort eine `sudo -n true`-Probe) sperrte den Pane fuer jeden anderen
+# Wortlaut, bis sie nach rund fuenf Minuten ablief -- die AELTERE Frage gewinnt
+# (hooks/bash-guard.py), und das mit Grund. `zurueckziehen` loescht den wartenden
+# Merker, ERTEILT aber nichts; ein Fehlgriff faellt also auf die sichere Seite.
+# Ein Agent darf nur die Frage seines eigenen Panes ($TMUX_PANE) zuruecknehmen,
+# ein gemessener Mensch jede. Das Programmfenster bindet jede Freigabe ueber
+# --schluessel an den gelesenen Wortlaut; ein Klick auf eine inzwischen
+# zurueckgezogene Frage erteilt deshalb nichts.
 #
 # `--schluessel` bindet die Freigabe an DEN Eintrag, den der Erteilende gelesen hat:
 # stimmt der Schluessel des wartenden Markers nicht damit ueberein, wird nichts
@@ -28,6 +55,24 @@
 # aendert nichts an der Pruefung oben, wer freigeben darf. Lehnt `wb-pane-write darf`
 # ab (z.B. ein Orchestrator-Pane), bleibt die Freigabe trotzdem gueltig -- der Hinweis
 # unterbleibt dann und die Ausgabezeile "Rueckkanal: ..." sagt, warum.
+#
+# ERSETZT AM 29.09.2026 (Vorgabe des Nutzers, woertlich: "ich will nicht das bei der
+# freigabe automatisch in den pane getippt wird, das kann nachrichten von mir
+# abschneiden oder ungewollt mitsenden, das muss anders passieren, zum beispiel über
+# den kommunikationskanal (oder einem ähnlichen) den die sitzungen untereinander
+# nutzen"). Der Absatz oben ist die Herkunft; er gilt nicht mehr. Seitdem schreibt
+# `erteilen` NIE in einen Pane -- kein Einfuegen, keine Taste, kein `wb-pane-write`.
+# Der Hauptweg ist `warten` (oben): der Agent erfaehrt die Freigabe selbst. Der
+# Rueckkanal ist nur noch fuer einen Agenten da, der NICHT wartet, und nimmt allein
+# einen Weg, der nicht durch die Eingabezeile geht: die Sitzungs-Inbox (`wb-inbox
+# sende`; zugestellt an der Zuggrenze oder sofort, wenn die Sitzung untaetig ist).
+# Seit dem 29.09.2026 (Auftrag inbox-alle) erreicht `wb-inbox` jeden Harness mit
+# belegtem Weg: Claude ueber den Socket, pi und opencode ueber ihre Datei-Inbox-Adapter,
+# codex ueber `codex queue`. Ein Harness ohne Weg (wb-inbox Exit 5) bekommt keine
+# Nachricht; fuer ihn traegt `warten`. Kein Hinweis geht hinaus, wenn die Freigabe beim Senden
+# schon verbraucht ist (der Pane hat den Wortlaut ausgefuehrt) oder der Agent per
+# `warten` davon schon weiss. Die Ausgabezeile "Rueckkanal: ..." sagt jedes Mal,
+# welcher Weg genommen wurde, oder dass keiner genommen wurde, und warum.
 #
 # WARUM ES DIESES WERKZEUG GIBT (Durchsicht 2026-08-07, gemessen)
 # Die Rueckfrage-Stufe haelt an, was weder harmlos noch verboten ist — `sudo`,
@@ -65,20 +110,41 @@ BLOCKS="${AWB_GUARD_BLOCKS_DIR:-$HOME/.pi-workers/guard-blocks}"
 # entsteht dort, wo die Freigabe entsteht -- damit gibt es genau eine Stelle, an
 # der eine gueltige Freigabe erscheint, und genau eine, die es aufschreibt.
 VERLAUF="${AWB_GUARD_LOG:-$HOME/.pi-workers/guard-blocks.log}"
+# Der Verlauf rotiert monatlich (hooks/lib/guard_log.py) und wird nur unter einer Sperre
+# geschrieben. Geschrieben wird deshalb ueber `guard_log.py anhaengen` (Zeile auf stdin);
+# fehlt das Modul, schreiben die Bloecke unten die Zeile wie frueher selbst, ohne Sperre --
+# eine Zeile geht nie verloren. Suchweg wie bei wb-rolle: neben dem Skript im Repo, dann die
+# ausgerollte Kopie. Den Pfad setzt dieses Skript selbst (ein Wert des Aufrufers wird
+# ueberschrieben), und die Bloecke starten das Modul in einem eigenen Prozess, nie in dem,
+# der den Schluessel der Freigaben liest.
+WB_GUARD_LOG_PY=""
+for kandidat in "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/hooks/lib/guard_log.py" \
+                "$HOME/.claude/hooks/lib/guard_log.py"; do
+    [ -f "$kandidat" ] && { WB_GUARD_LOG_PY="$kandidat"; break; }
+done
+export WB_GUARD_LOG_PY
 
 CMD="${1:-liste}"
 
 MENSCH_ART=""
 MENSCH_GRUND=""
+# M2 (Oberflaeche als Ahne) braucht WB_MENSCH_QUELLE und WB_APP_PID, und `env -i`
+# loescht beide. Ohne diese Allowlist scheiterte seit dem 21.09. jeder Menschen-Nachweis
+# ueber die Werkbank-App, sichtbar als "'--mensch' abgelehnt" beim Sitzungsstart (Befund 26.09.2026). Beide sind nur
+# Behauptungen, die wb-mensch gegen seine echte Ahnenkette prueft -- dieselbe
+# Allowlist wie in wb-pane-write; alle uebrige Aufruferumgebung bleibt weg.
+M2_UMGEBUNG=()
+if [ "${WB_MENSCH_QUELLE:-}" = oberflaeche ]; then
+  case "${WB_APP_PID:-}" in ''|*[!0-9]*) ;; *) M2_UMGEBUNG=(WB_MENSCH_QUELLE=oberflaeche "WB_APP_PID=$WB_APP_PID") ;; esac
+fi
 messen() {
     local beleg
     if [ -x "$HOME/.local/bin/wb-mensch" ]; then
-        beleg=$("$HOME/.local/bin/wb-mensch" beleg 2>/dev/null)
-    elif command -v wb-mensch >/dev/null 2>&1; then
-        beleg=$(wb-mensch beleg 2>/dev/null)
+        beleg=$(/usr/bin/env -i HOME="$HOME" TMPDIR=/tmp PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+            ${M2_UMGEBUNG[@]+"${M2_UMGEBUNG[@]}"} "$HOME/.local/bin/wb-mensch" beleg 2>/dev/null)
     else
         MENSCH_ART=agent
-        MENSCH_GRUND="wb-mensch nicht gefunden — ohne Messung gilt: kein Mensch."
+        MENSCH_GRUND="wb-mensch am festen Pfad nicht gefunden — ohne Messung gilt: kein Mensch."
         return 1
     fi
     MENSCH_GRUND="${beleg#*$'\t'}"
@@ -192,9 +258,257 @@ PY
         printf 'art\t%s\ngrund\t%s\nherkunft\t%s\nfreigaben\t%s\n' \
             "$MENSCH_ART" "$MENSCH_GRUND" "$(herkunft_art)" "$GRANTS"
         exit 0 ;;
+    zurueckziehen)
+        ZIEL="${2:-${TMUX_PANE:-}}"
+        if [ -z "$ZIEL" ]; then
+            echo "wb-freigabe: zurueckziehen braucht einen Pane (ohne TMUX_PANE: ausdruecklich nennen)." >&2
+            exit 2
+        fi
+        # Fremder Pane nur fuer einen gemessenen Menschen. Ein Agent ohne TMUX_PANE
+        # kann keinen eigenen Pane belegen und nimmt deshalb nichts zurueck.
+        if [ "$ZIEL" != "${TMUX_PANE:-}" ]; then
+            messen || ablehnen "ein Agent nimmt nur die Frage seines eigenen Panes zurueck (${TMUX_PANE:-kein TMUX_PANE}), nicht die von $ZIEL."
+        fi
+        "$PY" - "$BLOCKS" "$VERLAUF" "$ZIEL" <<'PY'
+import json, os, re, subprocess, sys, time
+def verlauf_anhaengen(pfad, zeile):
+    """Eine Zeile an den Verlauf: ueber guard_log.py (Sperre, Monatsrotation), sonst direkt wie frueher."""
+    helfer = os.environ.get('WB_GUARD_LOG_PY', '')
+    if helfer:
+        try:
+            if subprocess.run([sys.executable, '-I', helfer, 'anhaengen', '--log', pfad], input=zeile.encode('utf-8'),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode == 0:
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    os.makedirs(os.path.dirname(pfad) or '.', exist_ok=True)
+    with open(pfad, 'a', encoding='utf-8') as fh:
+        fh.write(zeile + '\n')
+
+d, verlauf, pane = sys.argv[1], sys.argv[2], sys.argv[3]
+pfad = os.path.join(d, re.sub(r'[^A-Za-z0-9_.-]', '_', pane) + '.json')
+try:
+    with open(pfad, 'r', encoding='utf-8') as fh:
+        merker = json.load(fh)
+except (OSError, ValueError):
+    print('wb-freigabe: fuer %s wartet keine Rueckfrage -- nichts zurueckzunehmen.' % pane)
+    raise SystemExit(0)
+if not isinstance(merker, dict) or merker.get('wartet') is not True:
+    print('wb-freigabe: der Eintrag fuer %s wartet nicht auf eine Freigabe -- nichts zurueckzunehmen.' % pane)
+    raise SystemExit(0)
+try:
+    os.remove(pfad)
+except OSError as e:
+    sys.stderr.write('wb-freigabe: Merker %s liess sich nicht entfernen: %s\n' % (pfad, e))
+    raise SystemExit(1)
+try:
+    verlauf_anhaengen(verlauf, json.dumps({
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'guard': 'muster-zurueckgezogen',
+        'reason': 'Rueckfrage vom Antragsteller zurueckgezogen (%s), nichts erteilt.' % merker.get('muster', ''),
+        'command': str(merker.get('command', ''))[:2000], 'cwd': str(merker.get('cwd', '')),
+        'session_id': str(merker.get('session_id', '')), 'pane': pane,
+    }, ensure_ascii=False))
+except OSError:
+    pass
+print('wb-freigabe: Rueckfrage fuer %s zurueckgezogen, nichts erteilt: %s' % (pane, str(merker.get('command', ''))[:200]))
+PY
+        exit $? ;;
+    warten)
+        # Kein messen(), kein Schluesselanlegen, kein Schreiben in guard-grants: dieser
+        # Zweig darf von JEDEM gerufen werden, auch vom angehaltenen Agenten selbst,
+        # und verleiht deshalb nichts (Negativtest in test-freigabe-warten.sh).
+        shift
+        W_PANE=""; W_DATEI=""; W_CWD="$PWD"; W_MAX=100
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --befehl-datei) W_DATEI="${2:?Pfad fehlt nach --befehl-datei}"; shift 2 ;;
+                --cwd) [ $# -ge 2 ] || { echo "wb-freigabe: nach --cwd fehlt das Verzeichnis." >&2; exit 2; }
+                       W_CWD="$2"; shift 2 ;;
+                --max) W_MAX="${2:?Sekunden fehlen nach --max}"; shift 2 ;;
+                -*) echo "wb-freigabe: warten kennt '$1' nicht." >&2; exit 2 ;;
+                *) [ -z "$W_PANE" ] || { echo "wb-freigabe: warten nimmt genau einen Pane." >&2; exit 2; }
+                   W_PANE="$1"; shift ;;
+            esac
+        done
+        [ -n "$W_PANE" ] || { echo "wb-freigabe: warten braucht einen Pane." >&2; exit 2; }
+        [ -n "$W_DATEI" ] || { echo "wb-freigabe: warten braucht --befehl-datei <pfad> (die Datei nennt der Rueckfrage-Text)." >&2; exit 2; }
+        case "$W_MAX" in ''|*[!0-9]*) echo "wb-freigabe: --max braucht eine Zahl in Sekunden." >&2; exit 2 ;; esac
+        exec "$PY" - "$BLOCKS" "$GRANTS" "$VERLAUF" "$W_PANE" "$W_DATEI" "$W_CWD" "$W_MAX" <<'PY'
+import calendar, hashlib, hmac, json, os, re, sys, time
+
+ERTEILT, ABGELEHNT, ABGELAUFEN, NICHTS_OFFEN, NOCH_OFFEN = 0, 3, 4, 5, 6
+MAX_TTL = 900          # wie ask_muster.MAX_TTL_SEKUNDEN
+OBERGRENZE = 300       # ein Aufruf wartet hoechstens die uebliche Frist einer Frage
+TAKT = 0.5
+
+blocks, grants, verlauf, pane, datei, cwd, max_roh = sys.argv[1:8]
+try:
+    with open(datei, 'r', encoding='utf-8') as fh:
+        command = fh.read()
+    datei_zeit = os.stat(datei).st_mtime
+except OSError as e:
+    sys.stderr.write('wb-freigabe warten: Befehlsdatei nicht lesbar (%s): %s\n' % (datei, e))
+    raise SystemExit(2)
+if not command:
+    sys.stderr.write('wb-freigabe warten: Befehlsdatei %s ist leer.\n' % datei)
+    raise SystemExit(2)
+
+sicher = re.sub(r'[^A-Za-z0-9_.-]', '_', pane)
+merker_pfad = os.path.join(blocks, sicher + '.json')
+schluessel = hashlib.sha256('\x00'.join([pane, cwd, command]).encode('utf-8')).hexdigest()
+freigabe_pfad = os.path.join(grants, schluessel + '.json')
+key_datei = os.path.join(os.path.dirname(os.path.normpath(grants)), '.freigabe-schluessel')
+warten_dir = os.path.join(os.path.dirname(os.path.normpath(blocks)), 'guard-warten')
+anmeldung = os.path.join(warten_dir, sicher + '.warten.json')
+start = time.time()
+frist = start + max(1, min(int(max_roh), OBERGRENZE))
+
+
+def als_zeit(wert):
+    try:
+        return calendar.timegm(time.strptime(str(wert), '%Y-%m-%dT%H:%M:%SZ'))
+    except (ValueError, TypeError):
+        return None
+
+
+def stempel(t):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t))
+
+
+def json_lesen(pfad):
+    try:
+        with open(pfad, 'r', encoding='utf-8') as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def anmelden(ergebnis):
+    # Die EINZIGE Datei, die `warten` schreibt -- ausserhalb von guard-grants.
+    try:
+        os.makedirs(warten_dir, exist_ok=True)
+        tmp = anmeldung + '.%d.tmp' % os.getpid()
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump({'pid': os.getpid(), 'pane': pane, 'schluessel': schluessel,
+                       'start_ts': stempel(start), 'ergebnis': ergebnis,
+                       'ts': stempel(time.time())}, fh)
+        os.replace(tmp, anmeldung)
+    except OSError:
+        pass
+
+
+def freigabe_gilt():
+    """Liegt fuer GENAU diesen Wortlaut eine gueltige Freigabe? Nur lesen --
+    dieselben Pruefungen wie ask_muster.freigabe_einloesen, aber ohne zu
+    loeschen: einloesen tut allein der Hook, beim Wiederholen des Befehls."""
+    e = json_lesen(freigabe_pfad)
+    if e is None:
+        return False
+    if (str(e.get('command', '')) != command or str(e.get('pane', '')) != pane
+            or str(e.get('cwd', '')) != cwd):
+        return False
+    jetzt = time.time()
+    erteilt, ablauf = als_zeit(e.get('granted_ts')), als_zeit(e.get('expires_ts'))
+    if ablauf is None or jetzt > ablauf or erteilt is None or jetzt > erteilt + MAX_TTL:
+        return False
+    h = e.get('herkunft')
+    if not isinstance(h, dict) or h.get('art') not in ('mensch', 'oberflaeche') \
+            or not str(h.get('beleg', '')).strip():
+        return False
+    try:
+        with open(key_datei, 'r', encoding='utf-8') as fh:
+            geheim = fh.read().strip()
+    except OSError:
+        return False
+    if not geheim:
+        return False
+    roh = '\x00'.join([str(e.get('schluessel', '')), pane, cwd, command,
+                       str(e.get('granted_ts', '')), str(e.get('expires_ts', '')),
+                       str(h.get('art', '')), str(h.get('beleg', ''))])
+    erwartet = hmac.new(geheim.encode('utf-8'), roh.encode('utf-8'), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(erwartet, str(h.get('sig', '')))
+
+
+def entscheidung_im_verlauf(seit):
+    """'abgelehnt' / 'zurueckgezogen' fuer diesen Pane und Wortlaut, sonst None."""
+    kurz = command[:2000]
+    try:
+        with open(verlauf, 'r', encoding='utf-8') as fh:
+            zeilen = fh.readlines()
+    except OSError:
+        return None
+    for zeile in reversed(zeilen[-2000:]):
+        try:
+            e = json.loads(zeile)
+        except ValueError:
+            continue
+        if not isinstance(e, dict) or str(e.get('pane', '')) != pane:
+            continue
+        if str(e.get('ts', '')) < seit:
+            break
+        if str(e.get('command', '')) != kurz:
+            continue
+        if e.get('guard') == 'muster-abgelehnt':
+            return 'abgelehnt'
+        if e.get('guard') == 'muster-zurueckgezogen':
+            return 'zurueckgezogen'
+    return None
+
+
+def ende(code, text):
+    anmelden({ERTEILT: 'erteilt', ABGELEHNT: 'abgelehnt', ABGELAUFEN: 'abgelaufen',
+              NICHTS_OFFEN: 'nichts-offen', NOCH_OFFEN: 'noch-offen'}[code])
+    print(text)
+    raise SystemExit(code)
+
+
+# Seit wann zaehlt eine Entscheidung im Verlauf: seit der Hook den Wortlaut abgelegt
+# hat (die Datei entsteht beim Anhalten), eine Sekunde Spiel fuer die Zeitstempel.
+seit = stempel(datei_zeit - 1)
+ablauf_gesehen = None
+ohne_merker = 0
+anmelden(None)
+while True:
+    if freigabe_gilt():
+        ende(ERTEILT, 'wb-freigabe warten: FREIGEGEBEN. Fuehre jetzt DENSELBEN Befehl unveraendert '
+                      'noch einmal aus (Wortlaut in %s).' % datei)
+    was = entscheidung_im_verlauf(seit)
+    if was == 'abgelehnt':
+        ende(ABGELEHNT, 'wb-freigabe warten: ABGELEHNT -- der Befehl bleibt angehalten. Nicht '
+                        'umgehen; ohne ihn weiterarbeiten oder die Lage melden.')
+    if was == 'zurueckgezogen':
+        ende(NICHTS_OFFEN, 'wb-freigabe warten: die Frage wurde zurueckgezogen -- nichts offen, nichts erteilt.')
+    m = json_lesen(merker_pfad)
+    jetzt = time.time()
+    if m is not None and m.get('wartet') is True:
+        ohne_merker = 0
+        ablauf = als_zeit(m.get('expires_ts'))
+        ablauf_gesehen = ablauf
+        if ablauf is None or jetzt > ablauf:
+            ende(ABGELAUFEN, 'wb-freigabe warten: ABGELAUFEN -- ohne Entscheidung verfallen, '
+                             'nichts erteilt.')
+    else:
+        if ablauf_gesehen is not None and jetzt > ablauf_gesehen:
+            ende(ABGELAUFEN, 'wb-freigabe warten: ABGELAUFEN -- ohne Entscheidung verfallen, '
+                             'nichts erteilt.')
+        # Kein Merker, keine Freigabe, keine Entscheidung: zweimal hinsehen (erteilen
+        # legt die Freigabe VOR dem Entfernen des Merkers an, aber ein Lesen kann
+        # zwischen beide fallen), dann ehrlich "nichts offen".
+        ohne_merker += 1
+        if ohne_merker >= 3:
+            ende(NICHTS_OFFEN, 'wb-freigabe warten: fuer %s wartet keine Frage mit diesem Wortlaut '
+                               '-- nichts offen, nichts erteilt.' % pane)
+    if jetzt >= frist:
+        ende(NOCH_OFFEN, 'wb-freigabe warten: noch keine Entscheidung nach %d s -- denselben '
+                         'warten-Aufruf wiederholen.' % int(jetzt - start))
+    time.sleep(TAKT)
+PY
+        ;;
     erteilen) : ;;
-    ''|-h|--help) sed -n '2,7p' "$0" >&2; exit 2 ;;
-    *) echo "wb-freigabe: unbekanntes Kommando '$CMD' (liste|erteilen|beleg)" >&2; exit 2 ;;
+    ''|-h|--help) sed -n '2,13p' "$0" >&2; exit 2 ;;
+    *) echo "wb-freigabe: unbekanntes Kommando '$CMD' (liste|erteilen|beleg|zurueckziehen|warten)" >&2; exit 2 ;;
 esac
 
 shift
@@ -247,41 +561,46 @@ PANE="${1:-}"
 
 # RUECKKANAL (Auftrag 03.09., Wort des Nutzers): wer die Rueckfrage gestellt hat, soll
 # es sofort erfahren, statt zwischen Erteilung und naechstem Versuch im Dunkeln zu
-# stehen oder blind noch einmal zu probieren. Zugestellt wird ausschliesslich ueber
-# `wb-pane-write` -- dieselbe Stelle, die `wb-post` fuer denselben Zweck benutzt, und
-# aus demselben Grund: es ist die EINE Stelle, die entscheidet, wer in einen Pane
-# schreiben darf, ein zweiter Weg daneben waere ein Loch in genau dieser Sicherung.
-# Wie dort wird NIE ein Absende-Taste geschickt (`taste`/Enter) -- der Hinweis bleibt
-# ein Hinweis, kein automatisch abgeschicktes Kommando in einem fremden Chat.
-# Reihenfolge wie bei wb-post/pi-worker: ausdrueckliche Umlenkung, installierte
-# Fassung, Schwesterdatei im Arbeitsbaum (solange es nur dort lebt).
-PANE_WRITE_BIN="${WB_PANE_WRITE:-}"
-if [ -n "$PANE_WRITE_BIN" ] && [ ! -x "$PANE_WRITE_BIN" ]; then
-    echo "wb-freigabe: WB_PANE_WRITE zeigt auf '$PANE_WRITE_BIN' — dort ist nichts Ausfuehrbares." >&2
-    exit 2
-fi
-if [ -z "$PANE_WRITE_BIN" ]; then
-    if [ -x "$HOME/.local/bin/wb-pane-write" ]; then
-        PANE_WRITE_BIN="$HOME/.local/bin/wb-pane-write"
-    else
-        NACHBAR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/wb-pane-write"
-        [ -x "$NACHBAR" ] && PANE_WRITE_BIN="$NACHBAR"
-    fi
+# stehen oder blind noch einmal zu probieren. Bis zum 29.09. ging der Hinweis ueber
+# `wb-pane-write einfuegen` in die Eingabezeile; seit Vorgabe des Nutzers vom 29.09.
+# (Kopfkommentar, "ERSETZT AM 29.09.2026") geht er NIE mehr in den Pane, sondern nur
+# ueber die Sitzungs-Inbox. Reihenfolge wie bei pi-worker: installierte Fassung,
+# sonst die Schwesterdatei im Arbeitsbaum.
+INBOX_BIN=""
+if [ -x "$HOME/.local/bin/wb-inbox" ]; then
+    INBOX_BIN="$HOME/.local/bin/wb-inbox"
+else
+    NACHBAR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/wb-inbox"
+    [ -x "$NACHBAR" ] && INBOX_BIN="$NACHBAR"
 fi
 
 messen || ablehnen "hier ruft kein gemessener Mensch."
 
 ART="$(herkunft_art)"
 "$PY" - "$BLOCKS" "$GRANTS" "$PANE" "$GRUND" "$ART" "$MENSCH_GRUND" "$TTL" "$ERWARTETER_SCHLUESSEL" \
-      "$VERLAUF" "$INDEX" "$ALLE" "$PANE_WRITE_BIN" <<'PY'
+      "$VERLAUF" "$INDEX" "$ALLE" "$INBOX_BIN" <<'PY'
 # Der Zettel wird aus dem MARKER gebaut, den der Hook selbst geschrieben hat --
 # nicht aus dem, was auf der Kommandozeile steht. Damit gilt die Freigabe genau
 # dem Befehl, der wirklich angehalten wurde, und nicht einem aehnlich
 # aussehenden: dieselbe Eigenschaft, die die Freigabe-Ansicht hat.
 import hashlib, hmac, json, os, re, stat, subprocess, sys, time
 
+def verlauf_anhaengen(pfad, zeile):
+    """Eine Zeile an den Verlauf: ueber guard_log.py (Sperre, Monatsrotation), sonst direkt wie frueher."""
+    helfer = os.environ.get('WB_GUARD_LOG_PY', '')
+    if helfer:
+        try:
+            if subprocess.run([sys.executable, '-I', helfer, 'anhaengen', '--log', pfad], input=zeile.encode('utf-8'),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode == 0:
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    os.makedirs(os.path.dirname(pfad) or '.', exist_ok=True)
+    with open(pfad, 'a', encoding='utf-8') as fh:
+        fh.write(zeile + '\n')
+
 (blocks, grants, pane, grund, art, beleg, ttl_roh, erwartet, verlauf,
- index_roh, alle_roh, pane_write_bin) = sys.argv[1:13]
+ index_roh, alle_roh, inbox_bin) = sys.argv[1:13]
 sicher = re.sub(r'[^A-Za-z0-9_.-]', '_', pane)
 pfad = os.path.join(blocks, sicher + '.json')
 try:
@@ -306,34 +625,84 @@ def kuerzen(text, max_len=700, rand=300):
     return '%s\n    ...[%d Zeichen gekuerzt]...\n    %s' % (text[:rand], fehlt, text[-rand:])
 
 
-def hinweis_geben(pane_write_bin, pane, text):
-    # NUR eine Benachrichtigung -- keine zweite Pruefung, wer freigeben darf, und
-    # kein zweiter Weg an `wb-pane-write` vorbei. Ob der Hinweis ankommt, entscheidet
-    # allein `wb-pane-write darf`; lehnt es ab (z.B. ein Orchestrator-Pane), kommt
-    # nichts an, und genau das wird hier gemeldet statt verschwiegen. Wie bei
-    # `wb-post` wird NIE eine Absende-Taste geschickt -- der Hinweis liegt im Pane,
-    # abgeschickt wird nichts.
-    if not pane_write_bin:
-        return 'kein wb-pane-write gefunden -- kein Hinweis in Pane %s geschickt.' % pane
+def rueckkanal(inbox_bin, pane, erteilt, merker_ts, text):
+    """Den Antragsteller benachrichtigen -- NIE ueber seinen Pane (29.09.2026).
+
+    `erteilt`: [(schluessel, command)] der gerade geschriebenen Freigaben. Rueckgabe:
+    die ehrliche Zeile, welcher Weg genommen wurde oder warum keiner. Erteilt nichts
+    und aendert nichts an der Freigabe; scheitert der Hinweis, gilt sie trotzdem."""
+    offen = [(k, c) for k, c in erteilt if os.path.exists(os.path.join(grants, k + '.json'))]
+    if not offen:
+        return ('kein Hinweis -- die Freigabe ist schon verbraucht (der Pane hat den Wortlaut '
+                'inzwischen ausgefuehrt).')
+    # Wartet der Agent per `wb-freigabe warten` auf GENAU diese Frage, weiss er es schon
+    # oder erfaehrt es in weniger als einer Sekunde -- eine zweite Nachricht kaeme spaeter
+    # an als die Freigabe und staende dann als veralteter Hinweis im Gespraech.
+    anm_pfad = os.path.join(os.path.dirname(os.path.normpath(blocks)), 'guard-warten',
+                            sicher + '.warten.json')
     try:
-        d = subprocess.run([pane_write_bin, 'darf', pane], capture_output=True, timeout=10)
+        with open(anm_pfad, 'r', encoding='utf-8') as fh:
+            anm = json.load(fh)
+    except (OSError, ValueError):
+        anm = None
+    if isinstance(anm, dict) and str(anm.get('schluessel', '')) in {k for k, _ in offen} \
+            and str(anm.get('start_ts', '')) >= merker_ts:
+        pid = anm.get('pid')
+        lebt = False
+        if isinstance(pid, int) and pid > 0:
+            try:
+                os.kill(pid, 0)
+                lebt = True
+            except OSError:
+                lebt = False
+        if anm.get('ergebnis') == 'erteilt' or (lebt and anm.get('ergebnis') in (None, 'noch-offen')):
+            return ('kein Hinweis noetig -- der Agent wartet selbst (wb-freigabe warten, PID %s) '
+                    'und erfaehrt die Freigabe direkt.' % pid)
+    if not inbox_bin:
+        return 'kein Hinweis -- wb-inbox nicht gefunden; der Agent erfaehrt es ueber wb-freigabe warten.'
+    try:
+        f = subprocess.run([inbox_bin, 'finde', pane], capture_output=True, timeout=15)
     except (subprocess.TimeoutExpired, OSError) as e:
-        return 'wb-pane-write "darf" antwortete nicht (%s) -- kein Hinweis geschickt.' % e
-    if d.returncode == 77:
-        return ('Hinweis in Pane %s NICHT geschickt (wb-pane-write lehnt ab) -- '
-                'die Freigabe gilt trotzdem, der Agent sieht sie beim naechsten Versuch.' % pane)
-    if d.returncode != 0:
-        return 'wb-pane-write "darf" meldete Fehler (Exit %d) -- kein Hinweis geschickt.' % d.returncode
+        return 'kein Hinweis -- wb-inbox "finde" antwortete nicht (%s).' % e
+    if f.returncode == 5:
+        grund = f.stderr.decode('utf-8', 'replace').strip()[:300]
+        return ('kein Hinweis -- unter Pane %s laeuft ein Harness ohne Weg ausserhalb der '
+                'Eingabezeile (wb-inbox: %s). Der Agent erfaehrt die Freigabe ueber '
+                'wb-freigabe warten oder beim naechsten Versuch. In den Pane wird nie '
+                'geschrieben.' % (pane, grund))
+    if f.returncode != 0:
+        return ('kein Hinweis -- unter Pane %s laeuft keine Claude-Sitzung und kein anderer '
+                'Harness mit Sitzungs-Inbox (wb-inbox finde, Exit %d). Der Agent erfaehrt die '
+                'Freigabe ueber wb-freigabe warten oder beim naechsten Versuch. In den Pane '
+                'wird nie geschrieben.' % (pane, f.returncode))
+    # Unmittelbar vor dem Senden noch einmal: ist die Freigabe inzwischen verbraucht?
+    if not any(os.path.exists(os.path.join(grants, k + '.json')) for k, _ in offen):
+        return 'kein Hinweis -- die Freigabe wurde eben verbraucht (Wortlaut ausgefuehrt).'
     try:
-        e = subprocess.run([pane_write_bin, 'einfuegen', pane], input=text.encode('utf-8'),
-                            capture_output=True, timeout=10)
-    except (subprocess.TimeoutExpired, OSError) as ex:
-        return 'wb-pane-write "einfuegen" antwortete nicht (%s) -- kein Hinweis geschickt.' % ex
-    if e.returncode == 0:
-        return 'Hinweis in Pane %s eingefuegt (ohne Enter).' % pane
-    if e.returncode == 77:
-        return 'Hinweis in Pane %s NICHT geschickt (wb-pane-write lehnt ab).' % pane
-    return 'wb-pane-write "einfuegen" scheiterte (Exit %d).' % e.returncode
+        import tempfile
+        fd, tmp = tempfile.mkstemp(prefix='wb-freigabe-inbox-', suffix='.txt')
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write(text)
+        try:
+            r = subprocess.run([inbox_bin, 'sende', pane, tmp], capture_output=True, timeout=60)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return 'kein Hinweis -- wb-inbox "sende" antwortete nicht (%s).' % e
+    if r.returncode == 0:
+        wo = r.stdout.decode('utf-8', 'replace').strip()
+        return ('Sitzungs-Inbox von Pane %s (%s) -- die Sitzung liest es an ihrer Zuggrenze. '
+                'Nichts in den Pane geschrieben.' % (pane, wo))
+    fehl = r.stderr.decode('utf-8', 'replace').strip()[:200]
+    if r.returncode == 4:
+        return 'kein Hinweis -- Agent-Verkehr ist pausiert (wb-inbox: %s).' % fehl
+    if r.returncode == 5:
+        return ('kein Hinweis -- kein Weg ausserhalb der Eingabezeile (wb-inbox: %s). '
+                'In den Pane wird nie geschrieben.' % fehl)
+    return 'kein Hinweis -- wb-inbox "sende" scheiterte (Exit %d: %s).' % (r.returncode, fehl)
 
 
 primaer_command = str(merker.get('command', ''))
@@ -467,20 +836,18 @@ for e in zu_erteilen:
     # jeder Weg, der eine Freigabe erteilt, seine eigene Fassung davon -- und
     # ein Weg, der es vergisst, waere unsichtbar.
     try:
-        os.makedirs(os.path.dirname(verlauf) or '.', exist_ok=True)
-        with open(verlauf, 'a', encoding='utf-8') as fh:
-            fh.write(json.dumps({
-                'ts': stempel(jetzt), 'guard': 'muster-freigabe',
-                # Die Begruendung ist freiwillig (19.08.). Fehlt sie, sagt die
-                # Zeile das ausdruecklich, statt mit einem Doppelpunkt ins Leere
-                # zu enden -- im Verlauf soll man den Unterschied zwischen "kein
-                # Grund genannt" und "Grund verlorengegangen" noch sehen.
-                'reason': ('Einmal freigegeben (%s): %s' % (merker.get('muster', ''), grund)
-                           if grund else
-                           'Einmal freigegeben (%s), ohne Begruendung.' % merker.get('muster', '')),
-                'command': command[:2000], 'cwd': cwd,
-                'session_id': str(merker.get('session_id', '')), 'pane': pane,
-            }, ensure_ascii=False) + '\n')
+        verlauf_anhaengen(verlauf, json.dumps({
+            'ts': stempel(jetzt), 'guard': 'muster-freigabe',
+            # Die Begruendung ist freiwillig (19.08.). Fehlt sie, sagt die
+            # Zeile das ausdruecklich, statt mit einem Doppelpunkt ins Leere
+            # zu enden -- im Verlauf soll man den Unterschied zwischen "kein
+            # Grund genannt" und "Grund verlorengegangen" noch sehen.
+            'reason': ('Einmal freigegeben (%s): %s' % (merker.get('muster', ''), grund)
+                       if grund else
+                       'Einmal freigegeben (%s), ohne Begruendung.' % merker.get('muster', '')),
+            'command': command[:2000], 'cwd': cwd,
+            'session_id': str(merker.get('session_id', '')), 'pane': pane,
+        }, ensure_ascii=False))
     except OSError:
         # Ein nicht schreibbarer Verlauf haelt die Entscheidung nicht auf; die
         # Freigabedatei selbst ist der wirksame Teil.
@@ -490,32 +857,31 @@ for e in zu_erteilen:
     print('  %s' % kuerzen(command))
     print('  Herkunft: %s (%s)' % (art, kuerzen(beleg, max_len=200, rand=80)))
 
-# RUECKKANAL: der Agent, der die Rueckfrage gestellt hat, erfaehrt es JETZT, im
-# eigenen Pane -- statt erst beim naechsten (blinden) Versuch. Eine Nachricht fuer
-# alle gewaehlten Eintraege zusammen, nicht je Eintrag: ein `--alle` soll den Pane
-# nicht mit mehreren Hinweisen hintereinander bombardieren.
-#
-# IMMER EINE ZEILE, und `einzeilig()` erzwingt das auch dann, wenn der freigegebene
-# Befehl selbst Zeilenumbrueche enthaelt (ein Heredoc, ein mehrzeiliges Skript): ein
-# eingefuegter Text, der einen echten Zeilenumbruch traegt, wuerde in einem Pane, das
-# im RAW-Modus liest (jede interaktive CLI, anders als eine Shell im kanonischen
-# Modus), als Enter ankommen -- genau die Absende-Taste, die dieser Hinweis laut
-# Kopfkommentar nie schickt. Ein zusammenhaengender Fliesstext ohne Zeilenumbruch
-# kann das nicht.
-def einzeilig(text):
-    return ' '.join((text or '').split())
-
-
+# RUECKKANAL: der Agent, der die Rueckfrage gestellt hat, erfaehrt es JETZT -- statt
+# erst beim naechsten (blinden) Versuch. Eine Nachricht fuer alle gewaehlten Eintraege
+# zusammen, nicht je Eintrag. Seit 29.09. nur ueber die Sitzungs-Inbox (siehe
+# rueckkanal()), nie ueber den Pane; der Text darf deshalb auch mehrzeilig sein.
 minuten = max(1, TTL // 60)
-if len(zu_erteilen) == 1:
-    hinweistext = '[wb-freigabe] Freigegeben (%s): %s -- gueltig %d Min., wiederhole den Befehl jetzt.' % (
-        merker.get('muster', '') or '?', kuerzen(zu_erteilen[0]['command'], max_len=300, rand=120), minuten)
-else:
-    teile = ['[%d] %s' % (i, kuerzen(e['command'], max_len=150, rand=60))
-             for i, e in enumerate(zu_erteilen, start=1)]
-    hinweistext = ('[wb-freigabe] %d Befehle freigegeben (%s), gueltig %d Min., wiederhole sie jetzt: %s'
-                   % (len(zu_erteilen), merker.get('muster', '') or '?', minuten, '  '.join(teile)))
-print('Rueckkanal: %s' % hinweis_geben(pane_write_bin, pane, einzeilig(hinweistext)))
+erteilt = []
+for e in zu_erteilen:
+    erteilt.append((hashlib.sha256('\x00'.join([pane, e['cwd'], e['command']]).encode('utf-8')).hexdigest(),
+                    e['command']))
+warten_dir = os.path.join(os.path.dirname(os.path.normpath(blocks)), 'guard-warten')
+zeilen = []
+for i, (k, c) in enumerate(erteilt, start=1):
+    datei = os.path.join(warten_dir, k + '.befehl')
+    zeilen.append('  %s%s%s' % ('[%d] ' % i if len(erteilt) > 1 else '', kuerzen(c, max_len=300, rand=120),
+                                '\n    (Wortlaut in %s)' % datei if os.path.exists(datei) else ''))
+hinweistext = (
+    'Nachricht der Werkbank (wb-freigabe), zugestellt ueber die Sitzungs-Inbox statt ueber '
+    'deine Eingabezeile. Keine fremde Anfrage: ein Mensch (gemessen: %s) hat deine angehaltene '
+    'Rueckfrage freigegeben (%s), gueltig %d Min. fuer EINEN Durchlauf:\n%s\n'
+    'Fuehre %s jetzt unveraendert noch einmal aus. Hast du %s seitdem schon ausgefuehrt, '
+    'ist nichts zu tun.'
+    % (art, merker.get('muster', '') or '?', minuten, '\n'.join(zeilen),
+       'DENSELBEN Befehl' if len(erteilt) == 1 else 'diese Befehle',
+       'ihn' if len(erteilt) == 1 else 'sie'))
+print('Rueckkanal: %s' % rueckkanal(inbox_bin, pane, erteilt, primaer_ts, hinweistext))
 
 # Der Merker wird geloescht, sobald der PRIMAERE Eintrag mit dabei war -- er
 # ist die einzige STEHENDE Frage, die die Ansicht als "offen" fuehrt. Wurde

@@ -462,6 +462,11 @@
         min-width: 0;
         color: var(--gedaempft);
       }
+      #modell-wechsel-zeile select {
+        font: inherit;
+        min-width: 210px;
+        max-width: 360px;
+      }
       input[type='text'] {
         font: inherit;
         background: var(--grund);
@@ -572,6 +577,11 @@
         <div id="fort-grund"></div>
         <button type="button" class="knopf stop" id="beenden-start"></button>
         <button type="button" class="knopf tun" id="fort-start"></button>
+      </div>
+      <div class="reihe" id="modell-wechsel-zeile" style="display: none">
+        <label for="modell-wechsel">Modell dieser laufenden Sitzung</label>
+        <select id="modell-wechsel"></select>
+        <button type="button" class="knopf tun" id="modell-wechsel-start">Modell wechseln</button>
       </div>
     </div>
     <div id="statuszeile"></div>

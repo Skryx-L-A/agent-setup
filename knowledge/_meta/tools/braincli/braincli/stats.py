@@ -83,7 +83,7 @@ def split_orphans_by_layer(notes: list[Note], orphans: list[str]) -> dict[str, l
 
 def _raw_markdown_files(vault: Path) -> list[Path]:
     """Every `.md` file on disk under only the hard structural exclusions
-    (90-secrets, .git, .obsidian, _meta) -- no content-based filtering. The
+    (secrets, .git, .obsidian, _meta) -- no content-based filtering. The
     baseline `notes_excluded_by_reason` measures the search corpus against."""
     exclude_dirs_cf = {d.casefold() for d in config.EXCLUDE_DIRS}
     out: list[Path] = []
@@ -185,7 +185,42 @@ def _latest_vault_commit(vault: Path) -> dt.datetime | None:
     return dt.datetime.fromisoformat(proc.stdout.strip())
 
 
-def index_health(vault: Path, db_path: Path | None = None) -> dict:
+def _index_rows(vault: Path, db_path: Path | None, modell=None, notes=None):
+    """(corpus, rel->key, newest epoch, key function, modell, missing reason)
+    for the index the ACTIVE embedding model searches: gardener.db for
+    embeddinggemma (unchanged), braincli's own per-model index otherwise
+    (einbettung.py; its corpus is the full search corpus incl. MOC.md)."""
+    from . import einbettung
+    modell = modell or einbettung.aktives_modell()
+    if modell.eigener_index and db_path is None:
+        rows, newest_ts, kopf = einbettung.index_zeilen(vault, modell)
+        missing = ""
+        if not rows:
+            pfad = einbettung.index_pfad(vault, modell)
+            missing = (f"kein passender Index fuer {modell.name} ({pfad.name}"
+                       f"{', Kopf passt nicht' if kopf else ' fehlt'}) - Suche faellt auf "
+                       "embeddinggemma zurueck")
+        return (notes if notes else load_search_notes(vault), rows, newest_ts,
+                einbettung.schluessel,
+                modell, missing)
+    db_path = (config.tool_dir_for(vault) / "state" / "gardener.db"
+               if db_path is None else Path(db_path))
+    if db_path.exists():
+        store = Store(db_path, read_only=True)
+        try:
+            rows = dict(store.conn.execute("SELECT rel, hash FROM embeddings").fetchall())
+            newest_ts = store.conn.execute(
+                "SELECT max(updated) FROM embeddings").fetchone()[0]
+        finally:
+            store.close()
+    else:
+        rows, newest_ts = {}, None
+    return (_embed_corpus(vault), rows, newest_ts, embed_cache_key,
+            einbettung.MODELLE["embeddinggemma"], "")
+
+
+def index_health(vault: Path, db_path: Path | None = None, modell=None,
+                 notes=None) -> dict:
     """How far the gardener embedding index (`_meta/tools/gardener/state/
     gardener.db`) has drifted from the vault's current content.
 
@@ -213,25 +248,14 @@ def index_health(vault: Path, db_path: Path | None = None) -> dict:
       sees session gaps of well under a day in normal use, per `git log`),
       but far under both real incidents (13 and 29 days behind respectively).
 
-    Scoped to gardener.db on purpose -- braincli's own supplementary MOC.md
-    cache (`extra_embed.py`, a different machine-local file with its own,
-    much smaller, lifecycle) is not this finding's subject and is left out.
+    Scoped to the index the ACTIVE embedding model searches (einbettung.py,
+    2026-09-24): gardener.db for embeddinggemma -- braincli's supplementary
+    MOC.md cache (`extra_embed.py`) is left out there, as before -- or the
+    model's own index, whose corpus is the search corpus. A missing or
+    mismatching own index is itself a reason (`fix` names the remedy).
     """
-    db_path = (config.tool_dir_for(vault) / "state" / "gardener.db"
-              if db_path is None else Path(db_path))
-    corpus = _embed_corpus(vault)
-    if db_path.exists():
-        store = Store(db_path, read_only=True)
-        try:
-            rows = dict(store.conn.execute("SELECT rel, hash FROM embeddings").fetchall())
-            newest_ts = store.conn.execute(
-                "SELECT max(updated) FROM embeddings").fetchone()[0]
-        finally:
-            store.close()
-    else:
-        rows, newest_ts = {}, None
-
-    stale_rels = [n.rel for n in corpus if rows.get(n.rel) != embed_cache_key(n)]
+    corpus, rows, newest_ts, keyfn, modell, missing = _index_rows(vault, db_path, modell, notes)
+    stale_rels = [n.rel for n in corpus if rows.get(n.rel) != keyfn(n)]
     stale_ratio = (len(stale_rels) / len(corpus)) if corpus else 0.0
 
     newest_vector_at = (dt.datetime.fromtimestamp(newest_ts, tz=dt.timezone.utc)
@@ -242,6 +266,8 @@ def index_health(vault: Path, db_path: Path | None = None) -> dict:
         days_behind = (latest_commit_at - newest_vector_at).total_seconds() / 86400
 
     reasons: list[str] = []
+    if missing:
+        reasons.append(missing)
     if stale_ratio >= INDEX_STALE_RATIO:
         reasons.append(f"{len(stale_rels)}/{len(corpus)} Notizen im Suchindex ohne "
                        f"aktuellen Vektor ({stale_ratio:.0%})")
@@ -259,6 +285,8 @@ def index_health(vault: Path, db_path: Path | None = None) -> dict:
         "days_behind_commit": round(days_behind, 2) if days_behind is not None else None,
         "stale": bool(reasons),
         "reasons": reasons,
+        "embed_model": modell.name,
+        "fix": ("brain index bauen" if modell.eigener_index else "brain index nachbetten"),
     }
 
 

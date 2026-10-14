@@ -24,7 +24,7 @@ gelten in der Auswahl, die die Stufe braucht; bei Widerspruch gilt diese Datei f
 
 - Kein Eingriff außerhalb der Welt: nur Projektordner, eigener Worktree und eigenes
   Agentenverzeichnis sind beschreibbar; das Vault `~/Knowledge` liest jeder Agent über
-  `brain search` (im Zug nur lesbar, `90-secrets/` gesperrt), und jeder Agent schreibt seinen eigenen
+  `brain search` (im Zug nur lesbar, `secrets/` gesperrt), und jeder Agent schreibt seinen eigenen
   Bereich im Brain über den Dienstweg (`brain.notiz`), der Hauptagent zusätzlich das Projekt
   (`20-projects/<projekt>/`); direkt schreibt keiner. Die Profil-Sperre setzt das mechanisch durch
   (Werkzeugliste, Bash-Muster, Weltgrenze, Kontextgrenze).

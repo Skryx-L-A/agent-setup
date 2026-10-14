@@ -73,6 +73,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import sys
 import time
 
@@ -121,7 +122,17 @@ STANDARD_MUSTER = [
      'grund': 'Veroeffentlicht nach aussen -- eine Version draussen laesst sich nicht zurueckziehen.'},
     {'befehl': 'twine', 'unterbefehl': 'upload',
      'grund': 'Veroeffentlicht nach aussen -- eine Version draussen laesst sich nicht zurueckziehen.'},
-    {'befehl': 'gh', 'unterbefehl': 'release', 'muster': r'(^|\s)create(\s|$)',
+    {'befehl': 'gh', 'unterbefehl': 'release', 'muster': r'(^|\s)release\s+(create|upload|edit|delete)(\s|$)',
+     'grund': 'Veroeffentlicht nach aussen -- eine Version draussen laesst sich nicht zurueckziehen.'},
+    {'befehl': 'gh', 'unterbefehl': 'repo', 'muster': r'(^|\s)create\s(.*\s)?--public(\s|=|$)',
+     'grund': 'Legt ein oeffentliches Repository an -- was dort einmal liegt, ist draussen.'},
+    {'befehl': 'gh', 'unterbefehl': 'repo', 'muster': r'(^|\s)repo\s+edit\s(.*\s)?--visibility(\s+|=)public(\s|$)',
+     'grund': 'Macht ein Repository oeffentlich -- was dort liegt, ist danach draussen.'},
+    {'befehl': 'gh', 'unterbefehl': 'pr', 'muster': r'(^|\s)pr\s+merge(\s|$)',
+     'grund': 'Fuehrt einen Pull Request in den Zielzweig zusammen -- sichtbar fuer alle, nicht still zurueckzunehmen.'},
+    {'befehl': 'docker|podman', 'unterbefehl': 'push',
+     'grund': 'Laedt ein Image in eine Registry hoch -- einmal gezogen, laesst es sich nicht zurueckholen.'},
+    {'befehl': 'uv', 'unterbefehl': 'publish',
      'grund': 'Veroeffentlicht nach aussen -- eine Version draussen laesst sich nicht zurueckziehen.'},
     {'befehl': 'launchctl', 'unterbefehl': 'unload|bootout|disable|remove',
      'grund': 'Haelt einen Hintergrunddienst an, der danach nicht von selbst wiederkommt.'},
@@ -168,6 +179,27 @@ def einstellungen_pfad():
     if aus_umgebung:
         return aus_umgebung
     return os.path.join(os.path.expanduser('~'), '.claude', 'workbench', 'settings.json')
+
+
+# Die Eintraege, die nach aussen veroeffentlichen (sichtbar fuer andere, nicht still
+# zurueckzuholen), als (befehl, unterbefehl). Nur sie gelten auch im Text eines gestarteten
+# Skripts (lib/script_guard.py); die uebrigen Muster (chmod -R, sudo, git reset --hard ...)
+# nur beim getippten Befehl. Ein neues Veroeffentlichungsmuster kommt hier mit hinein.
+VEROEFFENTLICHEN = frozenset({
+    ('git', 'push'),                   # nur mit --force-Formen, siehe Muster
+    ('npm|pnpm|yarn|cargo', 'publish'),
+    ('twine', 'upload'),
+    ('uv', 'publish'),
+    ('gh', 'release'),                 # create|upload|edit|delete
+    ('gh', 'repo'),                    # create --public, edit --visibility public
+    ('gh', 'pr'),                      # merge
+    ('docker|podman', 'push'),
+})
+
+
+def ist_veroeffentlichung(eintrag):
+    return isinstance(eintrag, dict) and \
+        (eintrag.get('befehl'), eintrag.get('unterbefehl')) in VEROEFFENTLICHEN
 
 
 def lade_muster(pfad=None):
@@ -731,8 +763,112 @@ def wortlaut_hinweis(freigabe, aktueller_befehl):
     )
 
 
-def deny_text(muster_eintrag, ttl_minuten):
+# --- Warten statt Zugende (29.09.2026) ------------------------------------
+# Vorgabe des Betreibers (2026-09-29, woertlich): "wenn ich in zukunft über die
+# workbench freigebe will ich den orchestrator/worker nicht selbst darüber
+# informieren müssen dass ich die freigabe gegeben habe". Bis dahin sagte der
+# Rueckfrage-Text nur "kurz warten und denselben Befehl noch einmal ausfuehren",
+# und ein Agent beendete daraufhin in der Praxis seinen Zug -- die Freigabe kam
+# dann erst an, wenn jemand im Pane Enter drueckte (gemessen 29.09., Pane %111).
+# Jetzt nennt der Text einen Aufruf, der IM SELBEN ZUG blockiert, bis ein Mensch
+# entschieden hat: `wb-freigabe warten`. Der Aufruf LIEST nur (Marker, Freigabe,
+# Verlauf) und erteilt nichts -- geprueft in shell/tests/test-freigabe-warten.sh.
+#
+# Den Wortlaut legt der Hook selbst in eine Datei, damit weder der warten-Aufruf
+# noch die Wiederholung den Befehl als Shell-Zeichenkette neu zusammensetzen
+# muss: genau dort entstanden bisher die abweichenden Fassungen (08-10-Vorfall,
+# siehe wortlaut_hinweis). Die Ablage liegt NEBEN den Merkern in `guard-warten`,
+# nicht in `guard-grants` -- dorthin hat ein Agent keinen Zugang
+# (bash-guard.py, Guard freigabe-pfad), und der warten-Aufruf darf von keinem
+# Guard angehalten werden.
+WARTEN_VERZEICHNIS_NAME = 'guard-warten'
+
+# Obergrenze EINES warten-Aufrufs. 100 s liegen unter dem kuerzesten ueblichen
+# Werkzeug-Zeitlimit (Claude Code: 120 s Vorgabe); laenger wartet der Agent,
+# indem er denselben Aufruf wiederholt (Exit WARTEN_NOCH_OFFEN).
+WARTEN_STANDARD_SEKUNDEN = 100
+
+# Exit-Codes von `wb-freigabe warten`, einer je Ausgang.
+WARTEN_ERTEILT = 0
+WARTEN_ABGELEHNT = 3
+WARTEN_ABGELAUFEN = 4
+WARTEN_NICHTS_OFFEN = 5
+WARTEN_NOCH_OFFEN = 6
+
+
+def blocks_dir():
+    return (os.environ.get('AWB_GUARD_BLOCKS_DIR')
+            or os.path.join(os.path.expanduser('~'), '.pi-workers', 'guard-blocks'))
+
+
+def warten_verzeichnis():
+    """Neben dem Merker-Ordner; folgt derselben Umleitung (AWB_GUARD_BLOCKS_DIR)."""
+    return os.path.join(os.path.dirname(os.path.normpath(blocks_dir())), WARTEN_VERZEICHNIS_NAME)
+
+
+def wortlaut_ablegen(pane, cwd, command, jetzt=None):
+    """Den angehaltenen Befehl woertlich in eine Datei legen, benannt nach seinem
+    Schluessel. Rueckgabe: der Pfad, oder None, wenn nicht schreibbar (dann nennt
+    der Text den alten Weg). Aeltere Ablagen als einen Tag raeumt derselbe Aufruf
+    weg -- eine Frage lebt hoechstens MAX_TTL_SEKUNDEN."""
+    if not pane:
+        return None
+    d = warten_verzeichnis()
+    pfad = os.path.join(d, schluessel(pane, cwd, command) + '.befehl')
+    try:
+        os.makedirs(d, exist_ok=True)
+        grenze = (jetzt if jetzt is not None else time.time()) - 86400
+        for name in os.listdir(d):
+            alt = os.path.join(d, name)
+            try:
+                if os.stat(alt).st_mtime < grenze:
+                    os.remove(alt)
+            except OSError:
+                pass
+        tmp = pfad + '.%d.tmp' % os.getpid()
+        alt_umask = os.umask(0o077)
+        try:
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                fh.write(command or '')
+        finally:
+            os.umask(alt_umask)
+        os.replace(tmp, pfad)
+    except OSError:
+        return None
+    return pfad
+
+
+def warten_aufruf(pane, cwd, befehl_datei):
+    """Der Aufruf, den der Rueckfrage-Text woertlich nennt."""
+    return 'wb-freigabe warten %s --befehl-datei %s --cwd %s' % (
+        shlex.quote(pane or ''), shlex.quote(befehl_datei), shlex.quote(cwd or ''))
+
+
+def warten_anleitung(pane, cwd, befehl_datei):
+    """Die Zeilen, die dem Agenten sagen, wie er IM SELBEN ZUG wartet."""
+    return (
+        "  Was DU tust: den Zug NICHT beenden, sondern jetzt auf die Entscheidung warten:\n"
+        "    %s\n"
+        "  Das Warten erteilt nichts, es kehrt zurueck, sobald ein Mensch entschieden hat\n"
+        "  (je Aufruf hoechstens %d s; bricht Dein Werkzeug vorher ab, einfach wiederholen).\n"
+        "  Exit 0 = freigegeben: DENSELBEN Befehl unveraendert noch einmal ausfuehren.\n"
+        "  Exit 6 = noch keine Entscheidung: denselben warten-Aufruf wiederholen.\n"
+        "  Exit 3 = abgelehnt, 4 = abgelaufen, 5 = keine Frage mehr offen: nicht umgehen,\n"
+        "  ohne den Befehl weiterarbeiten oder die Lage melden.\n"
+        "  Keine Ausweichloesung bauen, keine Umformulierung -- die Freigabe gilt fuer genau\n"
+        "  diesen Wortlaut in genau diesem Verzeichnis. Der Hook hat ihn dafuer schon\n"
+        "  wortwoertlich in eine Datei geschrieben (--befehl-datei oben); nimm ihn bei\n"
+        "  jedem weiteren Versuch von DORT, statt ihn neu zu tippen.\n"
+        % (warten_aufruf(pane, cwd, befehl_datei), WARTEN_STANDARD_SEKUNDEN)
+    )
+
+
+def deny_text(muster_eintrag, ttl_minuten, warten=None):
     """Der Text, den der angehaltene Worker sieht.
+
+    `warten`: (pane, cwd, befehl_datei) -- dann nennt der Text den warten-Aufruf
+    (seit 29.09.2026). Ohne ihn (kein Pane, Ablage nicht schreibbar) bleibt es
+    beim alten Weg: kurz warten und wiederholen.
 
     Er muss eines leisten: klarmachen, dass hier GEWARTET wird, nicht
     endgueltig abgelehnt. Ein Worker, der eine Ablehnung liest, baut eine
@@ -740,6 +876,20 @@ def deny_text(muster_eintrag, ttl_minuten):
     waere. Genau das hat am 2026-08-04 45 Minuten gekostet.
     """
     grund = muster_eintrag.get('grund') or 'Befehl aus der Musterliste der Einstellungen.'
+    if warten:
+        return (
+            "RUECKFRAGE, keine Ablehnung -- dieser Befehl wartet auf eine einmalige Freigabe.\n"
+            "  Angeschlagener Eintrag: %s\n"
+            "  Warum gefragt wird: %s\n"
+            "  Was jetzt passiert: der Befehl steht ab sofort in der Freigabe-Ansicht der\n"
+            "  Workbench (Abschnitt \"Angehaltene Worker\") und wartet dort auf Annehmen oder\n"
+            "  Ablehnen durch einen Menschen.\n"
+            "%s"
+            "  Die Freigabe gilt fuer EINEN Durchlauf und ist danach verbraucht; ohne\n"
+            "  Entscheidung laeuft sie nach rund %d Minuten von selbst ab.\n"
+            "  Angehalten von bash-guard-muster."
+            % (eintrag_label(muster_eintrag), grund, warten_anleitung(*warten), ttl_minuten)
+        )
     return (
         "RUECKFRAGE, keine Ablehnung -- dieser Befehl wartet auf eine einmalige Freigabe.\n"
         "  Angeschlagener Eintrag: %s\n"

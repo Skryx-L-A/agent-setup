@@ -18,6 +18,13 @@ ist noetig, weil git beim Loeschen eines Refs (``CHERRY_PICK_HEAD``, ``AUTO_MERG
 anlegt; ohne schreibbaren ``.git``-Ordner blieb ein Rebase mit ``CHERRY_PICK_HEAD`` haengen. Was ein Zug dort
 neu anlegt, sieht der Mensch nie.
 
+Jeder Zug bekommt dieselbe Git-Umgebung, gleich welcher Harness (``Arbeitsbaum.git_umgebung``): abgeschaltete
+Hooks, kein Editor, keine Signatur und die Identitaet des Menschen vom Traegerhost. Claude bekommt sie als
+``env`` seiner Einstellungsdatei, Pi und Codex als ``extra_env`` ihres Zuges (``git_env_erlaubt`` grenzt die
+GIT_*-Namen ein). Ohne Identitaet auf dem Host gibt es keinen Worktree: ein Agent committet nie unter eigenem
+Namen. Vor einem Zug raeumt der Traeger die Sperrdateien weg, die ein abgebrochener Zug desselben Agenten
+hinterlassen hat (``sperrdateien_raeumen``); sonst scheitert jedes spaetere ``git add`` an ``index.lock``.
+
 Der Traeger fuehrt git nur mit ``-C <projekt>`` aus, nie im Worktree: der Worktree und sein Verwaltungsordner
 sind fuer den Agenten beschreibbar, und git liest dort Dateien, die Programme starten koennten. Einzige Ausnahme
 ist die Pruefung auf ungesicherte Aenderungen beim Aufraeumen, nach Pruefung der Verwaltungsdateien und mit
@@ -52,8 +59,19 @@ OBJEKTE_LESEN = ("objects/pack", "objects/info")
 GIT_EINSTELLUNGEN = (("core.hooksPath", "/dev/null"), ("core.fsmonitor", "false"), ("core.editor", "false"),
                      ("sequence.editor", "false"), ("gc.auto", "0"), ("maintenance.auto", "false"),
                      ("commit.gpgSign", "false"))
+# Die einzigen GIT_*-Namen, die ein Zug aus dem Traeger bekommt (Pi und Codex reichen sie als ``extra_env``
+# durch, Claude als ``env`` seiner Einstellungsdatei). Alles andere bleibt draussen: ``GIT_SSH_COMMAND`` oder
+# ``GIT_WORK_TREE`` wuerden aus der Identitaet einen Ausfuehrungs- oder Umlenkungsweg machen.
+GIT_UMGEBUNG_FEST = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_COUNT", "GIT_DIR")
+_GIT_ZAEHLER = re.compile(r"GIT_CONFIG_(KEY|VALUE)_(0|[1-9][0-9]{0,2})\Z")
 _GIT_FRIST_S = 60
 _KLEIN = 4096
+_STEUERZEICHEN = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def git_env_erlaubt(name: str) -> bool:
+    """Darf der Traeger diese GIT_*-Variable in einen Zug geben? (Harness-Pruefung von ``extra_env``.)"""
+    return name in GIT_UMGEBUNG_FEST or bool(_GIT_ZAEHLER.fullmatch(name))
 
 
 class WorktreeFehler(ad.AgentsError):
@@ -138,6 +156,46 @@ def _worktrees(projekt: Path) -> list[dict[str, Any]]:
     return eintraege
 
 
+def identitaet(projekt: Path) -> tuple[str, str]:
+    """Name und Adresse fuer Commits im Zug: die git-Identitaet des Menschen auf dem Traegerhost.
+
+    Hausregel: ein Agent committet nie unter eigenem Namen. Gelesen wird die Konfiguration, die git im Projekt
+    des Traegerhosts sieht (Projekt, Benutzer, System). Hat der Host keine, gibt es keine Identitaet und damit
+    keinen Worktree; der Grund steht als ``worktree_fehler`` im Zug."""
+    werte = []
+    for feld in ("user.name", "user.email"):
+        wert = _git(projekt, "config", "--get", feld, pruefen=False).stdout.strip()
+        if not wert or _STEUERZEICHEN.search(wert) or len(wert) > 256:
+            raise WorktreeFehler("Der Traegerhost hat keine brauchbare git-Identitaet (%s); ein Agent committet "
+                                 "nie unter eigenem Namen" % feld)
+        werte.append(wert)
+    return werte[0], werte[1]
+
+
+def sperrdateien_raeumen(gitdir: Path, admin: Path, zweig_name: str) -> tuple[str, ...]:
+    """Loescht liegengebliebene Sperrdateien des Agenten vor seinem naechsten Zug; nennt die geloeschten.
+
+    Der Verwaltungsordner und ``refs/heads/agent`` sind im Zug beschreibbar: ein abgebrochener Zug (Sofortstopp,
+    Zeitlimit) laesst ``index.lock`` oder die Sperre des eigenen Zweigs zurueck, und jeder spaetere ``git add``
+    desselben Agenten scheitert daran. Geraeumt wird nur zwischen zwei Zuegen dieses Agenten und nur, was allein
+    ihm gehoert: die ``*.lock`` seines Verwaltungsordners und die Sperre seines eigenen Zweigs. ``packed-refs.lock``
+    und jede andere Sperre des Projekt-Repos bleiben liegen; sie koennen dem Menschen gehoeren."""
+    geraeumt = []
+    kandidaten = [eintrag for eintrag in sorted(admin.iterdir()) if eintrag.name.endswith(".lock")]
+    kandidaten.append(gitdir / "refs" / "heads" / (zweig_name + ".lock"))
+    for pfad in kandidaten:
+        if not pfad.is_symlink() and pfad.is_dir():
+            continue
+        try:
+            pfad.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise WorktreeFehler("Sperrdatei %s bleibt liegen: %s" % (pfad, exc)) from exc
+        geraeumt.append(str(pfad))
+    return tuple(geraeumt)
+
+
 @dataclass(frozen=True)
 class Arbeitsbaum:
     projekt: Path
@@ -147,6 +205,8 @@ class Arbeitsbaum:
     admin: Path
     basis: Optional[str]
     neu: bool
+    identitaet: tuple[str, str]
+    geraeumt: tuple[str, ...] = ()
 
     def einbindung(self) -> dict[str, Any]:
         """Einbindung fuer den Launcher (``agents_linux.LinuxLauncher``, ``git_einbindung``)."""
@@ -155,15 +215,13 @@ class Arbeitsbaum:
                      self.gitdir / "logs" / "refs" / "heads" / "agent"]
         return {"gitdir": str(self.gitdir), "lesen": [str(p) for p in lesen], "schreiben": [str(p) for p in schreiben]}
 
-    def git_umgebung(self, agent_id: str) -> dict[str, str]:
-        """Umgebung fuer Bash im Zug (Einstellungsdatei ``env``): Git-Einstellungen und Identitaet.
+    def git_umgebung(self) -> dict[str, str]:
+        """Git-Umgebung des Zuges, gleich welcher Harness: Einstellungen und Identitaet.
 
-        Die Identitaet ist die des Projekts (Hausregel: Commits mit der Identitaet des Menschen); fehlt sie,
-        steht die Agentenkennung da. Welcher Agent committet hat, zeigt der Zweig."""
-        name = _git(self.projekt, "config", "--get", "user.name", pruefen=False).stdout.strip() or agent_id
-        email = _git(self.projekt, "config", "--get", "user.email", pruefen=False).stdout.strip() \
-            or "%s@agents.werkbank.invalid" % agent_id
-        paare = GIT_EINSTELLUNGEN + (("user.name", name), ("user.email", email))
+        Claude bekommt sie als ``env`` seiner Einstellungsdatei, Pi und Codex als ``extra_env`` ihres Zuges.
+        Die Identitaet ist die des Menschen auf dem Traegerhost (Hausregel); welcher Agent committet hat, zeigt
+        der Zweig ``agent/<id>``."""
+        paare = GIT_EINSTELLUNGEN + (("user.name", self.identitaet[0]), ("user.email", self.identitaet[1]))
         env = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_COUNT": str(len(paare))}
         for index, (key, value) in enumerate(paare):
             env["GIT_CONFIG_KEY_%d" % index] = key
@@ -171,12 +229,18 @@ class Arbeitsbaum:
         return env
 
 
-def bereitstellen(projekt: Optional[Path], arbeitsordner: Path, agent_id: str) -> Optional[Arbeitsbaum]:
-    """Worktree des Agenten anlegen oder wiederverwenden; None ohne git-Projekt."""
+def bereitstellen(projekt: Optional[Path], arbeitsordner: Path, agent_id: str,
+                  sperren_raeumen: bool = False) -> Optional[Arbeitsbaum]:
+    """Worktree des Agenten anlegen oder wiederverwenden; None ohne git-Projekt.
+
+    ``sperren_raeumen`` gilt nur fuer den eigenen naechsten Zug eines Agenten (dann laeuft keiner seiner Zuege):
+    liegengebliebene Sperrdateien seines Worktrees verschwinden. Der Nachschlag fremder Worktrees (Pruefzug)
+    laesst sie liegen, weil der Bearbeiter gerade arbeiten kann."""
     gitdir = git_ordner(projekt)
     if gitdir is None:
         return None
     projekt = gitdir.parent
+    person = identitaet(projekt)
     name = zweig(agent_id)
     pfad = Path(arbeitsordner).resolve(strict=True) / agent_id
     basis, neu = hauptzweig(projekt), False
@@ -202,7 +266,8 @@ def bereitstellen(projekt: Optional[Path], arbeitsordner: Path, agent_id: str) -
         ordner.mkdir(parents=True, exist_ok=True)
         if ordner.is_symlink() or os.path.realpath(ordner) != str(ordner):
             raise WorktreeFehler("%s ist kein echter Ordner" % ordner)
-    return Arbeitsbaum(projekt, gitdir, pfad, name, admin, basis, neu)
+    geraeumt = sperrdateien_raeumen(gitdir, admin, name) if sperren_raeumen and not neu else ()
+    return Arbeitsbaum(projekt, gitdir, pfad, name, admin, basis, neu, person, geraeumt)
 
 
 # Aufraeumen ------------------------------------------------------------------------

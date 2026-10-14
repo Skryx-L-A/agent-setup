@@ -895,3 +895,106 @@ Grenzen, wo keine Prüfung möglich ist:
 
 Beleg: `tests/test-profil-sperre.sh`, eigene Kopien der Hooks und von
 `wb-profil` samt Hausliste, eigenes HOME, eigene Welt.
+
+## Gestartete Skripte werden mitgeprüft (2026-09-26)
+
+Bis heute sah `bash-guard.py` nur den getippten Befehlstext. `bash publish.sh`
+oder `./x.sh` liefen deshalb ohne Ablehnung und ohne Rückfrage durch, auch
+wenn im Skript `gh release create`, `rm -rf` eines Live-Ordners, ein
+Kill-Muster oder ein Agenten-Trailer im Commit stand. Am 2026-09-26 lief so
+ein GitHub-Release ohne die Frage an den Menschen.
+
+Jetzt lesen drei harte Guards und die Veröffentlichungsmuster der
+Rückfrage-Stufe auch ein lokales Skript, das der Befehl startet: `bash x.sh`, `sh x.sh`, `zsh x.sh`,
+`./x.sh`, `source x.sh`, `. x.sh` und `bash < x.sh`. Geprüft werden reguläre
+Textdateien bis 256 KiB mit wörtlichem Pfad, gegen das `cwd` des Hooks
+aufgelöst, eine Ebene tief. Die Antwort nennt Skript und Zeile.
+
+Im Skript laufen nur `commit-trailer`, `kill-pattern` und `push-gate`
+(`SKRIPT_GUARDS` in `lib/script_guard.py`) sowie die Rückfrage-Muster aus
+`VEROEFFENTLICHEN` in `lib/ask_muster.py` (Veröffentlichen und Force-Push; ein
+neues Veröffentlichungsmuster gehört dort mit hinein). `rolle`, `git-add`,
+`freigabe-pfad`, `secrets`, `snapshot`, `pane-write`, `screencapture` und die
+lokalen Rückfragen wie `chmod -R` oder `sudo` bleiben beim getippten Befehl.
+Grund, gemessen am 2026-09-26: mit allen Guards waren 52 der 379 Testsuiten
+dieses Repos (`hooks/tests`, `shell/tests`) über `bash <suite>` nicht mehr
+startbar, weil sie in Temp-Repos `git add -A` rufen, auf eigenem Socket
+`@wb_role` setzen oder die geschützten Ablagen als Testdaten nennen. Mit der
+Auswahl sind es 0, auch mit Worker-Rolle. Der Trailer wird im Skript Befehl
+für Befehl geprüft und nur dort, wo wirklich `git commit` läuft; Testdaten in
+einem Argument zählen nicht. Eine
+Freigabe bindet an den Befehl plus einen SHA-256 des Skripttexts, gilt also
+nicht mehr, sobald das Skript geändert wird. Eine Variable als Ziel von
+`rm`, `mv`, `>` oder `kill` und ein Befehlsname, der erst zur Laufzeit
+feststeht, sind im Skript nicht entscheidbar und zählen dort nicht. Skripte,
+die nicht gelesen werden sollen, stehen als Globs in
+`${XDG_CONFIG_HOME:-~/.config}/agent-workbench/skript-ausnahmen.conf`. Diese
+Liste pflegt ein Mensch: sie gehört zu den geschützten Ablagen, `freigabe-pfad`
+lehnt jeden getippten Bash-Zugriff ab, `bash-guard-live-config.sh` jedes Write
+und Edit. Ein Skript, das die Liste schreibt, wird nicht angehalten, weil
+`freigabe-pfad` im Skript nicht läuft. Der
+Code steht in `lib/script_guard.py`, die Einhängepunkte in `main()` von
+`bash-guard.py` (Probelauf `main(probe_input)` ohne Marker, Verlauf,
+Freigabeverbrauch oder Ausgabe).
+
+Neu in `STANDARD_MUSTER` und gleichlautend in `VORGABE_ASK_MUSTER`
+(`app/src/main/einstellungen.ts`): `gh release upload|edit|delete` (der
+Eintrag für `gh release create` wurde erweitert), `gh repo create ... --public`,
+`gh repo edit ... --visibility public`, `gh pr merge`, `docker|podman push` und
+`uv publish`. `gh release create`, `git push --force`, `npm|pnpm|yarn|cargo
+publish` und `twine upload` wurden getippt schon gefragt. Frei bleiben
+`gh release view|list|download`, `gh pr view|list`, `docker pull|build` und
+`git push` ohne Force.
+
+Gemessen (Median aus 21 Läufen, warm, Stand mit Guard-Auswahl): getippter
+Befehl 32,5 ms vorher, 34,3 ms nachher; ein harmloses Skript mit 200 Zeilen
+32,5 ms vorher, 54,2 ms nachher; mit Rückfrage in Zeile 200 64,9 ms, mit
+Ablehnung in Zeile 200 128,1 ms (Bisektion nach der Zeile).
+
+Beleg: `tests/test-script-guard.sh`, eigenes HOME, eigene Marker, eigener
+Verlauf, kein tmux. Grenze wie zuvor: was ein Interpreter wie `python3`
+intern ausführt, sieht der Hook nicht.
+
+## Einspiel-Hook für die Claude-Datei-Inbox (2026-10-11, Auftrag tafel-meldung-ohne-dialog)
+
+`inbox-einspielen.sh` läuft bei `PostToolUse` (jedes Werkzeug) und `UserPromptSubmit`. Claude Code
+hält eine Socket-Nachricht an, deren Absender keinen passenden Rechtemodus bezeugt, und fragt den
+Menschen ("Held peer message"). Gemessen am 10./11.10.: genau das traf die Störungsmeldungen des
+Tafel-Wächters an den Orchestrator. `wb-inbox sende` legt eine Tafel-Meldung, die es nicht
+wahrheitsgemäß bezeugen kann, deshalb in `<inbox>/claude/<session_id>/neu/` ab (Abschnitt
+TAFEL-MELDUNGEN in `shell/wb-inbox`). Der Hook schreibt bei jedem Lauf
+`<inbox>/claude/<session_id>/hook` — ohne diesen Beleg aus dem laufenden Prozess wählt wb-inbox
+den Weg nicht —, verschiebt fertige Meldungen nach `zugestellt/` und gibt sie als
+`additionalContext` zurück, gekennzeichnet als Information ohne Befugnis. Er endet immer mit
+Exit 0, gibt ohne Meldung nichts aus und löscht `zugestellt/`-Dateien nach sieben Tagen.
+`<inbox>` ist `$WB_INBOX_DIR`, sonst `~/.claude/workbench/inbox`.
+
+Registrierung in `inbox-einspielen.settings-snippet.json`, nicht ausgerollt: beide Einträge werden
+als WEITERE Elemente an `hooks.PostToolUse` und `hooks.UserPromptSubmit` der lebenden Einstellungen
+angehängt (Aufruf `bash "$HOME/.claude/hooks/inbox-einspielen.sh"`, `"timeout": 5`). Test:
+`shell/tests/test-inbox-tafel-meldung.sh`.
+
+## Freigabe-Pfad: Annehmen und Ablehnen von Antraegen (2026-10-14)
+
+Der Hook `freigabe-pfad` (`bash-guard.py`) sperrt eine Annahme auf dem Weg, den ein Agent
+nehmen kann: `entscheiden <antrag> approve`, `chat-klick freigabe-ja` und die Menuepunkte
+`Freigeben` bzw. `Freigabe erlauben` (`hauptmenue`), ebenso `awbmac-ctl` mit `approve`,
+`Freigeben`, `freigabe-ja` oder `Freigabe erlauben`, sobald der Befehl den Mac-Steuersocket
+`mac-lauf/awbmac.sock` erreicht oder dort nicht lesbar ist. Ablehnen (`reject`) und
+Lesezugriffe bleiben auf diesem Weg frei; Testsockets ebenso.
+
+Die eigentliche Herkunftspruefung liegt in `shell/wb-decide` (Abschnitt HERKUNFT, 13.10. und
+14.10.2026), nicht im Hook. Der Hook ist nur die erste Schranke. Regel:
+
+- Annehmen: nur ein Orchestrator-Pane (`@wb_role orchestrator`) oder ein gemessener Mensch
+  (`wb-mensch pruefen`). Ein Worker-Pane wird mit Exit 3 abgewiesen, auch bei seinem eigenen Antrag.
+- Ablehnen: ein Worker darf NUR seinen eigenen Antrag ablehnen, also den, dessen Feld `parent`
+  gleich seinem gemessenen `@wb_worker` ist (Exit 3 bei fremdem Antrag oder Worker ohne Namen).
+  Orchestrator und gemessener Mensch dürfen jeden Antrag ablehnen. Ohne gemessene Herkunft
+  (Pane ohne Rolle, verwaister Prozess, Steuerkanal ohne Klick) wird auch Ablehnen mit Exit 3
+  abgewiesen.
+- Die Oberfläche der App setzt bei einem echten Klick die Menschenherkunft (WB_MENSCH_QUELLE,
+  WB_APP_PID), auch beim Ablehnen; der Steuerkanal ohne Klick trägt sie nicht.
+
+Tests: `shell/tests/test-wb-decide-herkunft.sh` (23 Fälle; die Ablehnungsfälle 3b, 3c, 3e, 8c
+sind gegen den Stand c3c85991 rot).

@@ -138,7 +138,16 @@ out=$(
   # sind nicht durch Auslagern kuerzbar, und eine Grenze, die man nicht erreichen kann,
   # wird nach zwei Wochen ueberlesen. Sie werden separat ausgewiesen, damit die Zahl
   # trotzdem sichtbar bleibt.
-  for pair in "$HOME/.claude/CLAUDE.md:$CAP_CLAUDE" "$HOME/.claude/roles/orchestrator.md:$CAP_ORCH"; do
+  # Hausregeln: seit 25.09.2026 ~/.claude/AGENTS.md, bis zur Umstellung CLAUDE.md --
+  # gemessen wird die Datei, die den Hauskopf traegt.
+  REGELDATEI="$HOME/.claude/AGENTS.md"
+  if ! head -c 4096 "$REGELDATEI" 2>/dev/null | grep -q "^# Werkbank: gemeinsame Regeln"; then
+    if head -c 4096 "$HOME/.claude/CLAUDE.md" 2>/dev/null | grep -q "^# Werkbank: gemeinsame Regeln" \
+       || { [ -f "$HOME/.claude/CLAUDE.md" ] && [ ! -f "$REGELDATEI" ]; }; then
+      REGELDATEI="$HOME/.claude/CLAUDE.md"
+    fi
+  fi
+  for pair in "$REGELDATEI:$CAP_CLAUDE" "$HOME/.claude/roles/orchestrator.md:$CAP_ORCH"; do
     f="${pair%:*}"; cap="${pair##*:}"
     [ -f "$f" ] || continue
     n=$(wc -c < "$f" | tr -d ' ')

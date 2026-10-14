@@ -159,7 +159,7 @@ stillschweigend übergangen — Reparatur ist ein eigener Task, kein Sessionende
   umschreiben, Widersprüche auflösen, Recency-Marker `Stand: YYYY-MM` setzen) —
   nicht nur anhängen. Typische Kandidaten: local-audio-models, Architektur-Notes,
   Projekt-MOCs/overviews.
-- Niemals Secrets außerhalb `90-secrets/`; `90-secrets/` niemals committen/syncen.
+- Niemals Secrets außerhalb `secrets/`; `secrets/` niemals committen/syncen.
 - **Widerspruchsprüfung — nur noch einreihen, nicht mehr scannen (geändert 2026-08-04):**
   `brain contradict --queue-add <geänderte-Notiz-Pfade>` — hängt die in dieser
   Session geschriebenen/geänderten Notizen dedupliziert an

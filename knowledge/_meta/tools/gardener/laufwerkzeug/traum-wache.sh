@@ -1,4 +1,11 @@
 #!/bin/bash
+# ABGELOEST (Pruefbericht 14.10.2026, Befund 24): Altwerkzeug des Traum-Volllaufs vom
+# August 2026. Es sucht `lauf-*.log`, die kein Skript mehr schreibt (der Lauf heisst seit
+# Brain 5 `brain run`, sein Zustand steht in state/brain-run-last.json und dream.db), und
+# nutzt macOS-Befehle mit festen Pfaden (`date -j`, `date -v`, `gtimeout`, $HOME).
+# Stillstands- und Budgetalarm koennen deshalb nie ausloesen; der letzte Lauf mit Logs war
+# der 19.08. Nicht mehr verwenden; nicht geloescht, weil test-traum-wache.sh und die
+# Herkunft der Lehren unten daran haengen.
 # Wache fuer den Traum-Volllauf: haelt an, bevor der Rechner stirbt, und weckt
 # den Orchestrator bei allem, was nicht nach normalem Betrieb aussieht.
 #

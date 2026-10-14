@@ -1,0 +1,11 @@
+[Unit]
+Description=Brain: nightly recovery of missed embeddings on peer
+
+[Timer]
+OnCalendar=*-*-* 02:15:00
+Persistent=false
+AccuracySec=5min
+Unit=brain-nachbetten-peer.service
+
+[Install]
+WantedBy=timers.target

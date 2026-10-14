@@ -5,7 +5,7 @@
 # NICHT REGISTRIERT: Logik seit 2026-08-05 direkt in bash-guard.py neu geschrieben
 #        (dessen PreToolUse/Bash-Sammelpunkt) -- diese Datei traegt nur noch die
 #        Original-Begruendung, kein Eintrag in settings.json zeigt hierher.
-# Warum: Stehende Regel (CLAUDE.md, Standing rules): Commits laufen auf dem
+# Warum: Stehende Regel (~/.claude/AGENTS.md, Schutz und Verifikation): Commits laufen auf dem
 #        Git-Handle des Repo-Besitzers, englische Nachricht, nie ein Claude-
 #        Co-Author-Trailer — sie ueberschreibt ausdruecklich die Voreinstellung
 #        des Harness, der solche Trailer von sich aus anhaengt. Bis 2026-08-03
@@ -39,7 +39,7 @@ printf '%s' "$cmd" | grep -qE '(^|[;&|()[:space:]])git([[:space:]]+-[^[:space:]]
 if printf '%s' "$cmd" | grep -qiE 'Co-Authored-By:[[:space:]]*Claude|Generated with \[?Claude Code|noreply@anthropic\.com|Claude-Session:[[:space:]]*https'; then
   cat <<'EOF' >&2
 git commit mit Claude-Trailer abgelehnt.
-  Stehende Regel (CLAUDE.md, Standing rules): Commits laufen auf dem Git-Handle
+  Stehende Regel (~/.claude/AGENTS.md, Schutz und Verifikation): Commits laufen auf dem Git-Handle
   des Repo-Besitzers, die Nachricht ist englisch, und ein Claude-Co-Author-
   Trailer kommt NIE hinein — diese Regel ueberschreibt die Voreinstellung des
   Harness.

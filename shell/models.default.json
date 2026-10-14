@@ -74,7 +74,17 @@
     "              wurde; ohne sie schreibt wb-harness-run den Hook trotzdem und meldet laut,",
     "              dass codex ihn nicht ausfuehren wird.",
     "Die Kontextwache liest aus diesem Block; sie zieht ihn nur heran, wenn via",
-    "'sessionFile' ist UND sie den Formatnamen kennt (context-guard, SESS_FORMATE)."
+    "'sessionFile' ist UND sie den Formatnamen kennt (context-guard, SESS_FORMATE).",
+    "",
+    "inbox (2026-09-29, Auftrag inbox-alle): wie `wb-inbox sende` eine laufende Sitzung",
+    "erreicht, OHNE ihre Eingabezeile. weg 'claude-socket' | 'datei' | 'codex-queue' | ''",
+    "(leer: kein Weg, dann ist grund Pflicht). 'datei' ist das harnessunabhaengige Protokoll",
+    "(Kopf von shell/wb-inbox, Abschnitt DATEI-INBOX); einrichten {quelle, ziel} nennt den",
+    "Adapter unter shell/inbox/ und den Ort, an dem der Harness ihn laedt. prozess (nur",
+    "codex-queue) ist ein regulaerer Ausdruck auf die Befehlszeile. probe {datum, beleg}.",
+    "Es wird nie ersatzweise getippt: ohne Weg endet `sende` mit Exit 5 und nennt grund.",
+    "initialPrompt 'positional' (codex): der erste Auftrag steht als letztes CLI-Argument;",
+    "wb-harness-run liest ihn einmal aus einer privaten Datei, bevor codex queue nutzbar ist."
   ],
   "providers": [
     {
@@ -95,6 +105,23 @@
       "label": "llama.cpp (llama-server, lokal)",
       "kind": "local",
       "baseUrl": "http://127.0.0.1:8080/v1",
+      "discover": {
+        "source": "files",
+        "machines": [
+          "mac"
+        ],
+        "labelFromRef": "basename",
+        "roots": [
+          {
+            "path": "~/AI/gguf-models",
+            "glob": "**/*.gguf",
+            "kind": "file",
+            "ref": "absolute",
+            "excludePattern": "(?i)(^|/)(mtp|draft|entwurf)(/|[-_])"
+          }
+        ],
+        "notes": "Rein lesende GGUF-Inventur. Entwurfsgewichte werden ausgeschlossen; ohne registrierten Runner wird nichts als startbares Modell materialisiert."
+      },
       "notes": "Lokal, kein Key. Fuer GGUF-Modelle, die Ollama nicht in der gewuenschten Quantisierung faehrt. ACHTUNG seit 2026-08-13: 127.0.0.1:8080 haelt launchd fuer wb-modell-proxy — ein llama-server kann diesen Port nicht mehr selbst binden. Wer llama.cpp wieder faehrt, gibt ihm einen eigenen Backendport und einen Eintrag in ~/.config/wb-modell-proxy/backends.json (Vorbild: der grug-Eintrag)."
     },
     {
@@ -102,7 +129,54 @@
       "label": "MLX (mlx_lm.server, lokal)",
       "kind": "local",
       "baseUrl": "http://127.0.0.1:8080/v1",
+      "defaultRunner": "pi",
+      "discover": {
+        "source": "files",
+        "machines": [
+          "mac"
+        ],
+        "labelFromRef": "basename",
+        "roots": [
+          {
+            "path": "~/AI/mlx-models",
+            "glob": "*",
+            "kind": "dir",
+            "marker": "config.json",
+            "ref": "absolute",
+            "excludePattern": "(?i)(oq4e|oq6e)",
+            "markerExcludePattern": "\"model_type\"\\s*:\\s*\"qwen3_5_mtp\"|DFlash2DraftModel|Qwen3DSparkModel"
+          }
+        ],
+        "notes": "Modellverzeichnisse mit config.json; reine MTP-/DFlash-/DSpark-Entwerfer sind keine eigenstaendigen Hauptmodelle."
+      },
       "notes": "Lokal, kein Key. Bedarfsweise gestartet ueber wb-mlx-server (grug-server ist seit 2026-08-19 nur noch ein duenner Vorspann darauf) (kein LaunchAgent fuer den Modellserver selbst, siehe regeln/lokale-modelle.md) — teilt sich den Port mit llamacpp, nie beide gleichzeitig laufen lassen. Seit 2026-08-13 liegt hinter 127.0.0.1:8080 nicht mehr mlx_lm.server selbst, sondern wb-modell-proxy: launchd haelt den Socket, der Proxy startet grug-server bei der ersten Anfrage (Backend 8081) und stoppt ihn nach 20 Minuten Leerlauf. Die Adresse hier bleibt deshalb richtig."
+    },
+    {
+      "id": "splash-lokal",
+      "label": "Splash (splash serve, lokal)",
+      "kind": "local",
+      "baseUrl": "http://127.0.0.1:8001/v1",
+      "defaultRunner": "pi",
+      "discover": {
+        "source": "files",
+        "machines": [
+          "mac"
+        ],
+        "roots": [
+          {
+            "path": "~/Library/Application Support/Splash/models",
+            "glob": "*/*",
+            "kind": "dir",
+            "ref": "relative"
+          }
+        ],
+        "endpoint": {
+          "url": "http://127.0.0.1:8000/v1/models",
+          "jsonPath": "data[].id"
+        },
+        "notes": "Vereinigt installierte Splash-Pakete mit der read-only Modellliste eines bereits laufenden Servers; startet oder laedt nichts."
+      },
+      "notes": "Bedarfsweiser Splash-Server (Port 8000) über wb-splash-server ensure/stop. Eigener Motor von Inco AI für Apple Silicon, spekulatives Dekodieren (DFlash 2) fest eingebaut. Seit Splash 1.3 (10.10.2026) laedt Splash das MLX-Modell der Familie aus dem Hugging-Face-Cache (Feld splashModel, z.B. mlx-community/Qwen3.8-27B-4bit) statt eines eigenen Pakets; modelRef bleibt der API-Name. NUR Mac. Seit 2026-09-20 der Vorgabeweg für qwen38; gemessen auf dem M5 Pro: 1,3-2,8x mehr Token je Sekunde als der MLX-Weg, vier Stroeme 108 statt 39 Tok/s, gecachter 12K-Kontext 0,22 s statt 54,6 s bis zum ersten Token (30-topics/lokale-modelle/2026-09-20-splash-gemessen.md)."
     },
     {
       "id": "openai",
@@ -358,6 +432,24 @@
       "label": "oMLX (omlx serve, lokal)",
       "kind": "local",
       "baseUrl": "http://127.0.0.1:8079/v1",
+      "defaultRunner": "pi",
+      "discover": {
+        "source": "files",
+        "machines": [
+          "mac"
+        ],
+        "labelFromRef": "basename",
+        "roots": [
+          {
+            "path": "~/.omlx/models",
+            "glob": "*/*",
+            "kind": "dir",
+            "marker": "config.json",
+            "ref": "absolute"
+          }
+        ],
+        "notes": "oMLX-Modellverzeichnisse mit config.json; rein lesend und ohne Serverstart."
+      },
       "notes": "Bedarfsweiser oMLX-Server (Port 8079, Proxy davor) ueber wb-omlx-server ensure/stop. Backend lauscht auf 8078. Fuer Modelle im oMLX-Format (oQ4e/oQ6e, eingebauter MTP-Kopf), die mlx_lm/mlx_vlm.server nicht laden. Getrennt von mlx-lokal, damit ein Fehler die uebrige lokale Flotte nicht trifft."
     }
   ],
@@ -365,9 +457,58 @@
     {
       "id": "claude",
       "label": "Claude Code",
-      "orchestratorDefaultModel": "claude-opus-5",
+      "orchestratorDefaultModel": "opus",
       "builtin": true,
       "command": "~/.local/bin/claude",
+      "modelFamilyAliases": [
+        {
+          "aliases": [
+            "opus",
+            "claude-opus"
+          ],
+          "idPattern": "^claude-opus-(?P<version>[0-9]+(?:-[0-9]+)*)$"
+        },
+        {
+          "aliases": [
+            "sonnet",
+            "claude-sonnet"
+          ],
+          "idPattern": "^claude-sonnet-(?P<version>[0-9]+(?:-[0-9]+)*)$"
+        },
+        {
+          "aliases": [
+            "haiku",
+            "claude-haiku"
+          ],
+          "idPattern": "^claude-haiku-(?P<version>[0-9]+(?:-[0-9]+)*)$"
+        },
+        {
+          "aliases": [
+            "fable",
+            "claude-fable"
+          ],
+          "idPattern": "^claude-fable-(?P<version>[0-9]+(?:-[0-9]+)*)$",
+          "locked": "Fable nur auf ausdrueckliche Anweisung vom Nutzer (seit 2026-09-23 nicht eingesetzt: Opus 5.5 schlaegt Fable 5.1)."
+        }
+      ],
+      "discover": {
+        "source": "binary-strings",
+        "pattern": "(?P<id>claude-(?P<family>opus|sonnet|haiku|fable)-(?P<version>[0-9]+(?:-[0-9]+)*)(?:\\[1m\\])?)",
+        "labelPattern": "{familyTitle} {versionDots} - ",
+        "labelPatterns": [
+          "id:\"{id}(?:-[0-9]{8})?\",name:\"{familyTitle} {versionDots}\"(?![^{}]*section:\"deprecated\")"
+        ],
+        "variantLabelPattern": "{familyTitle} {versionDots} with 1M context",
+        "variantLabelPatterns": [
+          "id:\"{idBase}(?:-[0-9]{8})?\",name:\"{familyTitle} {versionDots}\"(?![^{}]*section:\"deprecated\")"
+        ],
+        "idPrefix": "",
+        "provider": "claude-subscription",
+        "contextWindowBySuffix": {
+          "[1m]": 1000000
+        },
+        "notes": "Liest nur die Stringtabelle der installierten Binary; eine Kennung gilt erst zusammen mit ihrem Modellwaehler-Label. Zwei Labelformen: alt (\"Opus 4.8 - ...\", aeltere Binaries) und strukturiert (model_selector_config: id:\"claude-x\",name:\"Sonnet 5.5\", section main/overflow; section deprecated zaehlt nicht). display_name taugt NICHT als Wache: die interne Modelltabelle fuehrt es auch fuer nicht angebotene Modelle (Sonnet 4.5, Opus 4)."
+      },
       "args": [
         "--model",
         "{model}"
@@ -408,6 +549,12 @@
         ],
         "probe": "revive-only"
       },
+      "modelSwitch": {
+        "command": "/model {model}",
+        "updateRequiredPattern": "(?i)update required|aktualisierung erforderlich",
+        "versionGate": true,
+        "notes": "Gemessen mit Claude Code: der Slash-Befehl wechselt in einer laufenden Sitzung; kennt die laufende Version das Modell noch nicht, meldet sie update required. Dann wird derselbe Pane ueber den vorhandenen Resume-Vertrag neu gestartet."
+      },
       "readyPattern": "❯|░|●",
       "promptPattern": "^❯",
       "compactCommand": "/compact",
@@ -437,9 +584,34 @@
         }
       },
       "instructionFiles": [
-        "~/.claude/CLAUDE.md",
-        "<project>/CLAUDE.md"
+        "~/.claude/AGENTS.md",
+        "<project>/AGENTS.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.claude.json",
+          "format": "json-pfad",
+          "pfad": "mcpServers",
+          "form": "claude"
+        },
+        "hooks": {
+          "weg": "plugin-werkbank",
+          "ziel": "~/.claude/werkbank-marktplatz/werkbank/hooks/hooks.json"
+        },
+        "prompts": {
+          "weg": "plugin-werkbank",
+          "ziel": "~/.claude/werkbank-marktplatz/werkbank/commands/"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.claude/settings.json"
+        },
+        "rechte": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.claude/settings.json",
+          "pfad": "permissions"
+        }
+      },
       "supportsPaste": true,
       "altScreen": true,
       "probe": "produktiv gemessen (Ready-Muster seit V1 im Einsatz)",
@@ -451,6 +623,30 @@
         "modellQuelle": "registry:models[harness=claude] -- die eingebauten Aliase haiku45|sonnet5|opus5|opus48|fable5",
         "nutzungQuelle": "datei:~/.claude/workbench/limits-latest.json (five_hour_pct, seven_day_pct, five_hour_resets_at), von der Statusleiste geschrieben -- kostenlos und aktuell",
         "notiz": "Kein Tarifname in einer lokalen Datei, deshalb bleibt plan leer. Erschoepft, sobald eines der beiden Fenster 100 % erreicht; faellt_zurueck_am kommt aus five_hour_resets_at."
+      },
+      "inbox": {
+        "weg": "claude-socket",
+        "probe": {
+          "datum": "2026-08-20",
+          "beleg": "Socket-Inbox der Sitzung (~/.claude/sessions/<pid>.json, peerToken), gemessen mit haiku-4.5 auf eigenem tmux-Socket; Einzelheiten im Kopf von shell/wb-inbox."
+        }
+      },
+      "modelProbe": {
+        "command": [
+          "{command}",
+          "-p",
+          "--model",
+          "{ref}",
+          "--no-session-persistence",
+          "--setting-sources",
+          "",
+          "--strict-mcp-config",
+          "--disable-slash-commands",
+          "Antworte nur mit dem Wort ok."
+        ],
+        "expect": "\\bok\\b",
+        "timeoutSeconds": 180,
+        "notes": "Ein kurzer Aufruf im Abo vor dem Eintrag eines entdeckten Modells (Auftrag modell-auto, 2026-10-10). --setting-sources leer: keine Hooks und keine Startdateien, damit der Aufruf klein bleibt."
       }
     },
     {
@@ -458,9 +654,10 @@
       "label": "pi (lokale Modelle)",
       "builtin": true,
       "command": "pi",
+      "modelSwitch": null,
       "args": [
         "--provider",
-        "ollama",
+        "{provider}",
         "--model",
         "{model}",
         "--session-dir",
@@ -522,6 +719,34 @@
         }
       },
       "effortInSpawnSpelling": false,
+      "toolAdapter": {
+        "mcp": {
+          "weg": "pi-erweiterung",
+          "ziel": "~/.pi/agent/extensions/wb-hub.ts",
+          "quelle": "pi-wb-hub.ts"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "pi-Ereignisse laufen nur ueber Extensions; der Adapter schreibt dafuer keine Hook-Datei (Plan 2.3, Tabelle Abschnitt 2)"
+        },
+        "prompts": {
+          "ziel": "~/.pi/agent/prompts/",
+          "format": "markdown-dir"
+        },
+        "plugins": {
+          "weg": "dateien",
+          "ziel": "~/.pi/agent/extensions/",
+          "dateien": [
+            "wb-inbox.ts",
+            "brain-kontext.ts",
+            "wb-hub.ts"
+          ]
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "pi-Rechte laufen je Aufruf ueber das Registry-Flag --tools, kein Konfigurationsziel (Plan Abschnitt 2 Tabelle)"
+        }
+      },
       "instructionFiles": [
         "~/.pi/agent/RULES.md"
       ],
@@ -542,13 +767,26 @@
         "modellQuelle": "befehl:ollama list",
         "nutzungQuelle": "befehl:ollama ps | befehl:check-resources",
         "notiz": "Kein Kontingent im Sinne von Credits -- Verfuegbarkeit haengt an Ollama-Katalog und freiem RAM, nicht an einem Anbieter-Limit. Eingebaut, Modell-Discover ueber `ollama list` bereits im discover-Block verdrahtet -- kontingent.modellQuelle deckt sich damit."
+      },
+      "inbox": {
+        "weg": "datei",
+        "einrichten": {
+          "quelle": "pi-wb-inbox.ts",
+          "ziel": "~/.pi/agent/extensions/wb-inbox.ts"
+        },
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "gemessen 2026-09-29 (Auftrag inbox-alle), eigenes HOME, tmux -L inboxprobe, pi 0.87.1 mit -e shell/inbox/pi-wb-inbox.ts und OpenAI-kompatiblem Stub: untaetig geweckt (Antwort nach 0,2 s), Nachricht waehrend eines 8-s-Zuges als followUp an der Zuggrenze, halb getippter Text blieb in der Eingabezeile, Abmeldung beim Beenden."
+        }
       }
     },
     {
       "id": "codex",
       "label": "OpenAI Codex CLI",
-      "orchestratorDefaultModel": "codex-gpt-5-6-sol",
+      "initialPrompt": "positional",
+      "orchestratorDefaultModel": "codex-sol",
       "command": "codex",
+      "modelSwitch": null,
       "args": [
         "--model",
         "{model}",
@@ -588,9 +826,9 @@
       "resume": {
         "args": [
           "resume",
-          "--last"
+          "{resumeId}"
         ],
-        "probe": "session-dir"
+        "probe": "revive-only"
       },
       "sessionDir": "~/.codex/sessions",
       "readyPattern": "^› [^0-9]",
@@ -634,6 +872,28 @@
         "~/.codex/AGENTS.md",
         "<project>/AGENTS.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.codex/config.toml",
+          "format": "toml-marker"
+        },
+        "hooks": {
+          "weg": "wb-chat-hook-install",
+          "ziel": "~/.codex/hooks.json"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-Ordner im Binary belegt (S0, Plan-Nachtrag 13:45)"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.codex/config.toml"
+        },
+        "rechte": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.codex/config.toml"
+        }
+      },
       "supportsPaste": true,
       "altScreen": true,
       "notes": "Erste Welle. /compact stammt aus Issues des offiziellen Repos, nicht aus der Doku (mittlere Konfidenz); eine CTX-Anzeige gibt es entgegen derselben Quelle nicht, siehe probe. Anbietergebunden: eigene Base-URL ist NICHT belegt. ENTFERNT 2026-08-09: promptIgnore (eine Alternation aus sieben gemessenen Platzhaltern der leeren Eingabezeile) trug seit 2026-08-06 nichts mehr bei, sobald pi-worker die Eingabezeile VOR dem Einfuegen merkt und hinterher wortlos dagegen haelt (derselbe Vergleich faengt JEDEN Platzhalter, nicht nur die gelisteten sieben) -- der Eintrag war ausdruecklich ein Pflaster fuer die Zeit vor diesem Vergleich. Nachgeprueft von Hand (eigener tmux-Socket, echtes codex-cli 0.146.0, echtes Modell codex-gpt5): die Eingabezeile zeigte vorher den Platzhalter 'Find and fix a bug in @filename', nach dem Einfuegen unseren Text -- der Vergleich unterscheidet beides ohne promptIgnore einwandfrei, genau das Verhalten, auf das sich die Entfernung stuetzt. NICHT abschliessend gemessen werden konnte die volle Zustellung bis zur Antwort: zwei NEUE, von diesem Eintrag unabhaengige Befunde blockierten den Lauf danach -- codex-cli zeigt inzwischen NACH der Verzeichnis-Vertrauensfrage einen zweiten Dialog ('Hooks need review', bislang weder in trustStore noch in readyPattern beruecksichtigt), und der ChatGPT-Abo-Token dieses codex-gpt5-Kontos war zum Messzeitpunkt abgelaufen ('token_expired' / 'refresh token was already used'). Beides gehoert nicht zu diesem Feld und steht deshalb nur hier vermerkt, nicht behoben. Die Vertrauensfrage beim ersten Start in einem Verzeichnis beantwortet codex NICHT ueber promptIgnore: sie steht in ~/.codex/config.toml als [projects.\"<pfad>\"] trust_level = \"trusted\", mit dem AUFGELOESTEN Pfad (auf macOS /private/var/... statt /var/...). Ein frischer Worktree steht dort nicht, der Dialog kommt, das readyPattern trifft ihn richtigerweise nicht — der Spawn scheitert dann sichtbar nach 60s, statt den Auftrag zu verlieren. Seit 2026-08-08 traegt wb-harness-run das Arbeitsverzeichnis vor dem Start selbst ein (trustStore, style toml-section); der Dialog erscheint dann gar nicht erst, und der Satz davor beschreibt, was ohne diesen Eintrag passiert. NACHTRAG 2026-09-12: ChatGPT Plus ist angemeldet. Die Effort-Map bildet low..max ab; Agenten bleiben durch den Modell-Deckel gebunden, Menschen duerfen die vom Harness angebotenen Stufen waehlen.",
@@ -655,12 +915,71 @@
         "modellQuelle": "datei:~/.codex/models_cache.json (models[].slug, gefiltert auf visibility=list) -- KEINE Tarif-Gating-Angabe enthalten, anders als bei Copilot",
         "nutzungQuelle": "datei:~/.codex/sessions/*/*/*/rollout-*.jsonl (payload.rate_limits, in der Praxis leer) + payload.task_complete.error.codex_error_info='usage_limit_exceeded' als Erschoepft-Signal; bildschirm:/status zeigt Monatsbalken",
         "notiz": "'codex login status' ist als Angemeldet-Nachweis nachweislich unzuverlaessig (sagt auch bei totem Token 'Logged in'). Verlaesslich: exp-Feld im access_token-JWT selbst dekodieren. Konto war am 2026-08-10 13:03 UTC weiterhin erschoepft, Rueckfall 27.08.2026 23:59 (Zeitzone in der Meldung nicht benannt, wb-kontingent liest sie als Pacific -- die spaeteste Lesart)."
+      },
+      "inbox": {
+        "weg": "codex-queue",
+        "prozess": "(^|/)codex( |$)",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "gemessen 2026-09-29 (Auftrag inbox-alle), eigenes HOME, tmux -L inboxprobe, codex-cli 0.157.1, gpt-5.6-luna low: `codex queue --thread <uuid> --message` weckte die untaetige TUI, reihte waehrend `sleep 8` zwei Nachrichten in Reihenfolge ein, halb getippter Text blieb stehen. Grenze: Thread erst nach dem ersten Zug; --no-daemon nicht erreichbar."
+        }
+      },
+      "modelFamilyAliases": [
+        {
+          "aliases": [
+            "codex-sol"
+          ],
+          "idPattern": "^codex-gpt-(?P<version>[0-9]+(?:-[0-9]+)*)-sol$"
+        },
+        {
+          "aliases": [
+            "codex-luna"
+          ],
+          "idPattern": "^codex-gpt-(?P<version>[0-9]+(?:-[0-9]+)*)-luna$"
+        },
+        {
+          "aliases": [
+            "codex-terra"
+          ],
+          "idPattern": "^codex-gpt-(?P<version>[0-9]+(?:-[0-9]+)*)-terra$"
+        },
+        {
+          "aliases": [
+            "codex-astra"
+          ],
+          "idPattern": "^codex-gpt-(?P<version>[0-9]+(?:-[0-9]+)*)-astra$",
+          "locked": "Astra nur auf ausdrueckliche Anweisung vom Nutzer; gilt fuer jedes kuenftige Astra-Modell."
+        },
+        {
+          "aliases": [
+            "codex-reserve"
+          ],
+          "idPattern": "^codex-gpt-(?:(?P<version>[0-9]+(?:-[0-9]+)*)-)?reserve$",
+          "locked": "gpt-reserve wird nie eingesetzt (der Nutzer)."
+        }
+      ],
+      "modelProbe": {
+        "command": [
+          "{command}",
+          "exec",
+          "--skip-git-repo-check",
+          "--ephemeral",
+          "--sandbox",
+          "read-only",
+          "-m",
+          "{ref}",
+          "Antworte nur mit dem Wort ok."
+        ],
+        "expect": "\\bok\\b",
+        "timeoutSeconds": 180,
+        "notes": "Ein kurzer Aufruf im ChatGPT-Abo vor dem Eintrag eines entdeckten Modells (Auftrag modell-auto, 2026-10-10). Gemessen 10.10.: gpt-6.1-luna lehnt der Server ab ('not supported when using Codex with a ChatGPT account')."
       }
     },
     {
       "id": "aider",
       "label": "aider-chat",
       "command": "aider",
+      "modelSwitch": null,
       "args": [
         "--model",
         "{model}"
@@ -725,6 +1044,28 @@
         }
       },
       "contextProbe": "gemessen 2026-08-08 mit aider 0.86.2 + ollama/qwen3:1.7b auf eigenem Socket, eigenem HOME und eigenem Repo. Angezeigt wird die Auslastung nirgends (siehe probe), aufgeschrieben schon: aider fuehrt im ARBEITSVERZEICHNIS die Datei .aider.chat.history.md und legt nach jedem Zug eine Zeile '> Tokens: 760 sent, 388 received.' hinein — 'sent' ist die Zahl, die in das Fenster gegangen ist. Einen Nenner traegt die Datei NICHT; er kommt aus contextWindow des Modells in der Registry, und fehlt er, liefert die fuenfte Quelle nichts, statt zu raten. Gelesen wird nur der Abschnitt nach dem letzten Kopf '# aider chat started at ': die Datei wird ueber Sitzungen hinweg ANGEHAENGT (im selben Arbeitsbaum also auch nach einem Neustart), und die 90 % der Vorsitzung waeren fuer die neue eine Falschmeldung. Vor dem ersten abgeschlossenen Zug gibt es keine Zahl — dann bleibt der Pane bis zur ersten Antwort blind, was ehrlicher ist als eine Null. Bekannte Grenze: zwei aider im SELBEN Verzeichnis schreiben in dieselbe Datei, dann gilt der jeweils letzte Zug fuer beide Panes.",
+      "toolAdapter": {
+        "mcp": {
+          "weg": "leer",
+          "grund": "kein MCP-Client; Zugriff ueber CLI wb-hub call geplant (Hub-Spur H3)"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "aider kennt keinen Harness-Hook. Der einzige Hook ist der git-pre-commit, der nicht zu den Werkbank-Ereignissen gehoert (Plan 2.3)"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "aider hat keinen Befehls- oder Prompt-Ordner (Inventur)"
+        },
+        "plugins": {
+          "weg": "leer",
+          "grund": "aider hat keine Plugin- oder Extension-Schnittstelle (Inventur, Plan 2.3)"
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "aider hat keine Rechte-Datei und kein Rechte-Flag in der Registry (Inventur)"
+        }
+      },
       "instructionFiles": [],
       "supportsPaste": true,
       "altScreen": false,
@@ -742,12 +1083,21 @@
         "modellQuelle": "befehl:ollama list",
         "nutzungQuelle": "befehl:ollama ps | befehl:check-resources",
         "notiz": "Kein Kontingent im Sinne von Credits -- Verfuegbarkeit haengt an Ollama-Katalog und freiem RAM, nicht an einem Anbieter-Limit. modelRef traegt LiteLLM-Praefix 'ollama/<name>'; Rohname fuer den ollama-list-Abgleich ist der Teil nach dem Schraegstrich."
+      },
+      "inbox": {
+        "weg": "",
+        "grund": "Kein Kanal in eine laufende Sitzung. --message/--message-file beenden aider nach der Antwort; --watch-files loest nur ueber AI!-Kommentare in Projektdateien aus (aendert Dateien des Menschen).",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; aider --help und aider/watch.py gelesen (0.86.2)."
+        }
       }
     },
     {
       "id": "opencode",
       "label": "opencode",
       "command": "opencode",
+      "modelSwitch": null,
       "args": [
         "--model",
         "{model}"
@@ -809,6 +1159,31 @@
         "~/.config/opencode/AGENTS.md",
         "<project>/AGENTS.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.config/opencode/opencode.json",
+          "format": "json-pfad",
+          "pfad": "mcp",
+          "form": "opencode"
+        },
+        "hooks": {
+          "weg": "plugin-bruecke",
+          "ziel": "~/.config/opencode/plugin/wb-hooks.ts"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "zu messen (S0)"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.config/opencode/plugin/"
+        },
+        "rechte": {
+          "ziel": "~/.config/opencode/opencode.json",
+          "format": "json-pfad",
+          "pfad": "permission"
+        }
+      },
       "supportsPaste": true,
       "altScreen": true,
       "notes": "Erste Welle: 75+ Provider, /compact plus Auto-Kompaktierung bestaetigt. Thinking-Budget nur ueber die Konfiguration, kein CLI-Flag — deshalb effort style 'none'. MODELLWAHL, gemessen 2026-08-08 mit 1.18.14/1.18.15 gegen zwei eigene OpenAI-kompatible Stub-Server: --model kommt an, solange die Referenz aufloesbar ist — die Statuszeile im Kasten nannte das bestellte Modell, und der POST /v1/chat/completions traf den Port des bestellten Providers mit dem bestellten Modellnamen; auch dann, wenn das Modell im Backend gar nicht existiert (die Deklaration in opencode.json genuegt), und auch gegen einen im selben HOME zuletzt benutzten anderen Provider. ABER: laesst sich die Referenz NICHT aufloesen, ersetzt opencode sie STILL durch ein eigenes Cloud-Modell — 'ollama/ornith:9b' ohne passenden Provider-Eintrag startete als 'Big Pickle · OpenCode Zen', ohne Fehler, nur mit einem Tipp '/connect'. Und: steht --continue in derselben Zeile, gewinnt das Modell der fortgesetzten Sitzung, --model wird verworfen (bestellt beta/beta-1, gelaufen ist alpha/alpha-1). Bis zum 2026-08-06 haengte 'models resolve' --continue an JEDEN Spawn, weil der resume-Block noch kein probe trug — daher der Befund vom 06.08. Ein unerreichbarer, aber KONFIGURIERTER Provider faellt dagegen nicht still zurueck, sondern zeigt 'Cannot connect to API ... [retrying]'. Nachpruefbar ist das immer an derselben Stelle: die unterste Kastenzeile nennt Modell UND Provider.",
@@ -833,12 +1208,24 @@
         "modellQuelle": "befehl:opencode models (Provider-praefixierte Liste; opencode/*-free evtl. ohne Login nutzbar, NICHT geprueft)",
         "nutzungQuelle": "befehl:opencode auth list (zaehlt Credentials direkt, 0 gemessen 2026-08-10) -- beste Angemeldet-Quelle aller sieben Harnesses",
         "notiz": "Auf dieser Werkbank ausschliesslich lokaler Ollama-Provider in ~/.config/opencode/opencode.json konfiguriert, kein opencode-Zen-Login, kein API-Key. Harness unterstuetzt beides (Abo + API-Key), nur nicht eingerichtet."
+      },
+      "inbox": {
+        "weg": "datei",
+        "einrichten": {
+          "quelle": "opencode-wb-inbox.ts",
+          "ziel": "~/.config/opencode/plugin/wb-inbox.ts"
+        },
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "gemessen 2026-09-29 (Auftrag inbox-alle), eigenes HOME, tmux -L inboxprobe, opencode 1.18.32 mit Plugin shell/inbox/opencode-wb-inbox.ts und Stub: frische TUI ohne Sitzung bekam eine neue Sitzung und wechselte zu ihr (tui.session.select), Nachricht waehrend eines 8-s-Zuges kam nach session.idle, halb getippter Text blieb stehen."
+        }
       }
     },
     {
       "id": "agy",
       "label": "Antigravity CLI (Google)",
       "command": "agy",
+      "modelSwitch": null,
       "args": [
         "--model",
         "{model}"
@@ -912,6 +1299,28 @@
       "instructionFiles": [
         "~/.antigravity/AGENTS.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "weg": "leer",
+          "grund": "zu messen (S0)"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "kein Hook-Mechanismus laut --help"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "zu messen (S0)"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.gemini/config/plugins/"
+        },
+        "rechte": {
+          "weg": "registry-flag",
+          "grund": "Registry-Flag"
+        }
+      },
       "supportsPaste": true,
       "notes": "Loest die Gemini CLI ab: Google hat sie zum 2026-06-18 fuer Einzelnutzer abgekuendigt (offizielle Doku antigravity.google/docs/cli). In Go geschrieben, Flags fast deckungsgleich mit Claude Code (--model, --effort low|medium|high, --dangerously-skip-permissions, --continue, --print). Anmeldung liegt im macOS-Schluesselbund und wird mit der Antigravity-App geteilt — wer dort angemeldet ist, ist es hier auch (stiller Login). Ueber SSH gibt es einen Geraetecode-Fluss. Kein --append-system-prompt: die Rolle muss ueber die Instruktionsdatei kommen.",
       "promptPattern": "^>",
@@ -931,12 +1340,21 @@
         "modellQuelle": "befehl:BROWSER=/usr/bin/true agy models (Tab-getrennte Liste, 11 Eintraege gemessen 2026-08-10)",
         "nutzungQuelle": "nicht-kostenlos-ermittelbar (durchsucht: history.jsonl, cache/*.json, transcript*.jsonl, log/cli-*.log -- keine Zahl gefunden)",
         "notiz": "Kein login/whoami/status-Unterbefehl in agy --help. Angemeldet nur ueber macOS-Schluesselbund-Eintrag 'antigravity' (mdat) UND Logzeile 'applyAuthResult: email=..., authMethod=consumer' in ~/.gemini/antigravity-cli/log/cli-*.log verlaesslich pruefbar; wb-kontingent liest die Logzeile, nicht den Schluesselbund (der wuerde ein Kennwortfenster oeffnen koennen). Erschoepft-Wortlaut noch nie beobachtet, keine bekannte Fundstelle."
+      },
+      "inbox": {
+        "weg": "",
+        "grund": "Kein lokaler Kanal in die interaktive Sitzung gefunden: --remote-control spricht einen Hintergrund-Daemon mit unbekannter Gegenstelle, --input-format stream-json gilt nur im Druckmodus -p.",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; agy --help, agy remote-control start --help (1.2.13)."
+        }
       }
     },
     {
       "id": "goose",
       "label": "goose (Block)",
       "command": "goose",
+      "modelSwitch": null,
       "args": [
         "session"
       ],
@@ -944,7 +1362,7 @@
       "env": {
         "GOOSE_PROVIDER": "ollama",
         "GOOSE_MODEL": "{model}",
-        "OLLAMA_HOST": "{baseUrl:ollama}",
+        "OLLAMA_HOST": "http://127.0.0.1:8093/ollama",
         "GOOSE_MODE": "auto",
         "GOOSE_TELEMETRY_OFF": "1",
         "GOOSE_DISABLE_KEYRING": "1",
@@ -999,6 +1417,28 @@
         "~/.config/goose/.goosehints",
         "<project>/.goosehints"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.config/goose/config.yaml",
+          "format": "yaml-marker",
+          "pfad": "extensions"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "kein Hook-Mechanismus laut --help"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
+        },
+        "plugins": {
+          "weg": "nur-pruefen"
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "keine Rechte-Konfiguration laut --help"
+        }
+      },
       "supportsPaste": true,
       "altScreen": false,
       "probe": "gemessen 2026-08-08 mit goose 1.45.0 (brew-Formel block-goose-cli; die Formel 'goose' aus homebrew-core ist ein Datenbank-Migrationswerkzeug und NICHT dieser Agent) auf eigenem tmux-Socket, umgelenktem HOME, Modell ollama/qwen3:1.7b. READY: die Eingabezeile beginnt am Zeilenanfang mit '>', deshalb readyPattern '^>'. Gemessen wurden die drei Zustaende: LEER steht dort '> Enter to send · Ctrl+J newline', GETIPPT '> auftrag: pruefe die tests', und WAEHREND DER ANTWORT bleibt die abgeschickte Zeile als '> auftrag: pruefe die tests' stehen, waehrend darunter eine Spinner-Zeile laeuft ('◐  Waddling to conclusions...  (Ctrl+C to interrupt)'). Das Muster trifft alle drei. Die TUI erschien im ersten Abtastschritt (0,4 s, Modell schon geladen) samt Eingabezeile — sie ist also nicht frueher da als die Eingabebereitschaft. Der Spinner-TEXT wechselt von Zug zu Zug (gemessen: 'Waddling to conclusions...', 'Compiling wisdom...'), taugt also fuer kein Muster. Das ASCII-Bild der Gans in Zeile 1 traegt zwar ein '>', aber eingerueckt ('    __( O)>'), und wird vom verankerten Muster richtigerweise nicht getroffen. ERSTSTART: goose zeigt ohne Zutun einen Telemetrie-Dialog ('Share anonymous usage data to help improve goose?') und wartet auf die Antwort — das readyPattern trifft ihn nicht, der Spawn wuerde also sichtbar scheitern. Beantwortet wird er vorher durch GOOSE_TELEMETRY_OFF=1 (die eigene Konfigurationshilfe von goose nennt genau diese Variable als Vorrang vor der Einstellung). Eine VERTRAUENSFRAGE fuer ein neues Verzeichnis stellt goose nicht — in einem frisch angelegten, leeren Arbeitsverzeichnis kam die Eingabezeile ohne jede Rueckfrage; ein trustStore-Block ist fuer goose deshalb nicht noetig, und das ist ein Messergebnis und keine Auslassung.",
@@ -1016,17 +1456,26 @@
         "modellQuelle": "befehl:ollama list",
         "nutzungQuelle": "befehl:ollama ps | befehl:check-resources",
         "notiz": "Kein Kontingent im Sinne von Credits -- Verfuegbarkeit haengt an Ollama-Katalog und freiem RAM, nicht an einem Anbieter-Limit. GOOSE_PROVIDER fest auf 'ollama' -- dieser Eintrag gilt ausschliesslich fuer lokale Modelle, ein Cloud-Anbieter braeuchte einen zweiten Harness-Eintrag."
+      },
+      "inbox": {
+        "weg": "",
+        "grund": "goose serve/acp sind eigene Betriebsarten ohne TUI; dass eine laufende goose session von aussen ansprechbar ist, ist nicht belegt.",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; goose --help, goose serve --help (1.52.0)."
+        }
       }
     },
     {
       "id": "crush",
       "label": "Crush (Charmbracelet)",
       "command": "crush",
+      "modelSwitch": null,
       "args": [],
       "cwdMode": "cd",
       "env": {
         "WB_CRUSH_MODEL": "{model}",
-        "WB_CRUSH_BASE_URL": "{baseUrl:ollama}",
+        "WB_CRUSH_BASE_URL": "http://127.0.0.1:8093/ollama",
         "WB_CRUSH_PROVIDER_TYPE": "ollama",
         "WB_CRUSH_CONTEXT_WINDOW": "131072",
         "CRUSH_DISABLE_METRICS": "1",
@@ -1055,7 +1504,7 @@
         ],
         "probe": "revive-only"
       },
-      "readyPattern": "ctrl\\+l models",
+      "readyPattern": "ctrl\\+l models|ctrl\\+p commands",
       "promptPattern": "^ +[Y>]",
       "promptIgnore": "^ +[Y>] +(Yolo mode!|Ready\\?)",
       "compactCommand": "/summarize",
@@ -1081,6 +1530,30 @@
         "~/.config/crush/CRUSH.md",
         "<project>/CRUSH.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.config/crush/crush.json",
+          "format": "json-pfad",
+          "pfad": "mcp",
+          "form": "crush"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "kein Hook-Mechanismus laut --help"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
+        },
+        "plugins": {
+          "weg": "leer",
+          "grund": "kein Plugin-Mechanismus laut --help"
+        },
+        "rechte": {
+          "weg": "registry-flag",
+          "grund": "Registry-Flag -y/--yolo"
+        }
+      },
       "supportsPaste": true,
       "altScreen": true,
       "probe": "gemessen 2026-08-08 mit crush v0.88.1 (Tap charmbracelet/tap) auf eigenem tmux-Socket, umgelenktem HOME, Modell ollama/qwen3:1.7b. READY: die Fusszeile traegt 'ctrl+l models', und zwar in allen drei gemessenen Zustaenden — leer ('/ or ctrl+p commands • ctrl+l models • ctrl+j newline • ctrl+c quit • ctrl+g more'), getippt (das '/ or ' faellt weg, sobald Text in der Box steht) und waehrend der Antwort ('esc cancel • tab focus chat • …'). Der gemeinsame Teil ist 'ctrl+l models', und darauf zeigt das Muster. Der Startablauf wurde in 0,4-s-Schritten abgetastet: bis 0,4 s leerer Bildschirm, bei 0,8 s die vollstaendige TUI samt Fusszeile — sie ist also nicht frueher da als die Eingabebereitschaft. WARUM NICHT DIE EINGABEZEILE als Ready-Muster: sie beginnt je nach Autonomie mit einem anderen Zeichen ('  Y  ' mit --yolo, '   > ' ohne, beides gemessen), und mit '>' traefe ein verankertes Muster ausserdem den Modellwaehler (siehe unten). PROMPT: '^ +[Y>]' trifft genau diese Eingabezeile; die Zeilen darunter ( ':::', ':::', Fusszeile) treffen es nicht, und die Absende-Pruefung in pi-worker nimmt die LETZTE Treffer-Zeile — anders als bei opencode gibt es hier also keine Statuszeile unterhalb der Box, die das Muster mitnimmt. Die leere Box traegt einen Platzhalter ('Yolo mode!' mit --yolo, 'Ready?' ohne); vier Starts hintereinander zeigten denselben Wortlaut, er rotiert also nicht wie bei codex. Beide stehen in promptIgnore. OHNE KONFIGURIERTES MODELL startet crush NICHT still ein Ersatzmodell, sondern bleibt im Modellwaehler stehen ('To start, let's choose a provider and model.' mit der Zeile '> Find your fave' und der Fusszeile '↑/↓ choose • enter confirm'). Das readyPattern trifft diesen Bildschirm nicht (gemessen: kein Treffer auf 'ctrl+l models'), der Spawn scheitert also nach 60 s sichtbar, statt den Auftrag an ein fremdes Modell zu geben — der Unterschied zu opencode, das in derselben Lage stillschweigend sein eigenes Cloud-Modell nimmt. Eine VERTRAUENSFRAGE stellt crush nicht; es vermerkt das Verzeichnis nur in ~/.local/share/crush/projects.json. Ein trustStore-Block ist also nicht noetig, gemessen und nicht ausgelassen.",
@@ -1107,12 +1580,21 @@
         "modellQuelle": "befehl:ollama list",
         "nutzungQuelle": "befehl:ollama ps | befehl:check-resources",
         "notiz": "Kein Kontingent im Sinne von Credits -- Verfuegbarkeit haengt an Ollama-Katalog und freiem RAM, nicht an einem Anbieter-Limit. Ohne shell/crushrc.default (-> ~/.config/crush/crushrc) bleibt crush im Modellwaehler stehen; die Modellwahl kommt aus dieser Datei, nicht aus einem Flag."
+      },
+      "inbox": {
+        "weg": "",
+        "grund": "Die TUI spricht laut Binaer-Strings mit einem Server (/v1/.../messages/user, prompts/queued), die Registry-Probe vom 2026-08-11 fand neben der TUI aber keinen Server. Kandidat, noch nicht gemessen.",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; crush --help und strings (v0.96.1)."
+        }
       }
     },
     {
       "id": "qwen",
       "label": "Qwen Code",
       "command": "qwen",
+      "modelSwitch": null,
       "args": [
         "-m",
         "{model}"
@@ -1150,7 +1632,7 @@
       },
       "readyPattern": "^\\* ",
       "promptPattern": "^\\*",
-      "promptIgnore": "^\\* +Type your message or @path/to/file",
+      "promptIgnore": "^\\* +(Type your message or @path/to/file|Nachricht eingeben oder @Pfad/zur/Datei)",
       "probe": "gemessen 2026-08-08 mit qwen 0.21.8 (Qwen Code, Fork des Gemini-CLI), eigener tmux-Socket, umgelenktes HOME, Modell ollama/qwen3:1.7b ueber die OpenAI-kompatible Schnittstelle von Ollama. READY: Die Eingabezeile beginnt am Zeilenanfang mit einem Stern und mindestens einem Leerzeichen. Alle DREI Zustaende wurden abgegriffen und tragen ihn: leer ('*   Type your message or @path/to/file'), getippt ('* schreibe das Wort BEREIT und sonst nichts') und waehrend der Antwort — dort steht der Platzhalter wieder da, weil Qwen Code waehrend eines laufenden Zuges weiter Eingaben annimmt und sie in die Warteschlange stellt ('Enter to steer, Ctrl+Q to queue'). Der Platzhalter selbst taugt deshalb NICHT als Muster: er verschwindet beim Tippen, genau der opencode-Fehler. Gemessen wurde er ausserdem auf Rotation — ueber sechs Abgriffe in neun Sekunden und ueber vier unabhaengige Starts hinweg war es immer derselbe Wortlaut, anders als bei codex. PROMPT: '^\\*' trifft die Eingabezeile, und keine andere Zeile faengt am Zeilenanfang mit einem Stern an — der Verlauf ist um zwei Leerzeichen eingerueckt ('  > <auftrag>'), die Fusszeilen ebenso. Der Platzhalter steht zusaetzlich als promptIgnore da, damit die Absende-Pruefung ihn nicht fuer haengenden Text haelt; sollte sich sein Wortlaut aendern, faengt der Vergleich mit der Eingabezeile von vorher (INBOX_VORHER in pi-worker) denselben Fall ab. VERTRAUENSFRAGE: keine. Ein Erststart in einem frischen Verzeichnis mit leerem HOME ging ohne jeden Dialog direkt in die TUI; Qwen Code hat zwar den trustedFolders-Mechanismus des Gemini-CLI geerbt (Datei ~/.qwen/trustedFolders.json), er haengt aber an der Einstellung security.folderTrust, und die steht im ausgelieferten Zustand auf false (im Bundle nachgelesen: 'folderTrust = settings.security?.folderTrust?.enabled ?? false'). Deshalb KEIN trustStore-Block — wird die Einstellung eines Tages eingeschaltet, gehoert hier einer im Stil json-array hin.",
       "compactCommand": "/compress",
       "contextPattern": "Context ([0-9]{1,3})% used",
@@ -1176,6 +1658,31 @@
       "instructionFiles": [
         "<project>/QWEN.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.qwen/settings.json",
+          "format": "json-pfad",
+          "pfad": "mcpServers",
+          "form": "qwen"
+        },
+        "hooks": {
+          "ziel": "~/.qwen/settings.json",
+          "format": "json-pfad",
+          "pfad": "hooks"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "zu messen (S0)"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.qwen/extensions/"
+        },
+        "rechte": {
+          "weg": "registry-flag",
+          "grund": "--allowed-mcp-server-names per Flag in der Registry"
+        }
+      },
       "supportsPaste": true,
       "altScreen": true,
       "notes": "Zweite Welle, 2026-08-08. ROLLEN-WEG GEMESSEN, nicht aus der Doku uebernommen: In ein Wegwerf-Arbeitsverzeichnis wurde eine QWEN.md mit einem frei erfundenen Losungswort gelegt und danach danach gefragt; Qwen Code antwortete mit genau diesem Wort. Der Rollen-Generator in wb-harness-run schreibt deshalb nach <arbeitsverzeichnis>/QWEN.md (systemPrompt.projectPath), und weil jeder Worker seinen eigenen Arbeitsbaum bekommt, hat jeder seine eigene Datei. Ein geteilter Weg im Heimatverzeichnis ist bewusst NICHT eingetragen: gemessen wurde nur der Projektweg. ANBIETER: Dieser Harness ist auf Ollama festgenagelt (env OPENAI_BASE_URL = {baseUrl:ollama}/v1, OPENAI_API_KEY = 'ollama' als Platzhalter, OPENAI_MODEL = {model}, QWEN_DEFAULT_AUTH_TYPE = openai). OPENAI_MODEL steht dort NICHT doppelt zu '-m', sondern weil es tragend ist: gemessen 2026-08-08 an zwei gleichzeitig gestarteten Panes mit identischem Rest — ohne die Variable zeigt Qwen Code den Erststart-Dialog 'Connect a Provider' und kommt nie zur Eingabezeile (der erste Spawn-Versuch scheiterte genau daran), mit ihr startet dieselbe Zeile durch. Die drei OPENAI_-Variablen zaehlen fuer Qwen Code zusammen als EINE vollstaendige Anmeldung; fehlt eine, gilt keine. Das ist eine Entscheidung und keine Nachlaessigkeit: hinterlegt ist auf dieser Maschine genau ein Anbieter-Schluessel (openrouter), und env gilt je HARNESS und nicht je Modell — ein {secret:...} an dieser Stelle wuerde jedem LOKALEN Spawn einen Cloud-Schluessel in die Umgebung legen. Wer Qwen Code an einen Cloud-Anbieter haengen will, legt einen zweiten Harness-Eintrag mit eigenem env an. Solange hier {baseUrl:ollama} steht, redet auch ein Modell, das einen anderen Provider traegt, mit Ollama — es sind deshalb nur ollama-Modelle registriert. EFFORT: keine Stufe. Weder --help noch das Bundle kennen ein Reasoning-Effort-Flag; die Stufe steckt beim lokalen Betrieb im Modell. FORTSETZEN: '-c' setzt die letzte Unterhaltung DIESES Verzeichnisses fort, gemessen an drei Starts hintereinander — mit einem Kennwort im ersten, danach ein Start ohne '-c' (leer) und einer mit '-c' (der erste Auftrag stand wieder da). Deshalb probe 'revive-only': beim ersten Spawn wird nichts angehaengt, sonst erbt jeder neue Worker die Unterhaltung seines Vorgaengers — genau der Fehler, den opencode hatte. AUTONOMIE: '--approval-mode yolo'; '--yolo'/'-y' tut dasselbe, laesst sich aber laut Bundle nicht mit --approval-mode zusammen benutzen. BROWSER=/usr/bin/true steht daneben wie bei aider, damit ein Erststart-Dialog kein Fenster aufreisst. /compress als compactCommand stammt aus dem Bundle (109 Fundstellen, Text 'compress chat history'), nicht aus einer eigenen Messung — mittlere Konfidenz, wie /compact bei codex.",
@@ -1192,96 +1699,21 @@
         "modellQuelle": "befehl:ollama list",
         "nutzungQuelle": "befehl:ollama ps | befehl:check-resources",
         "notiz": "Kein Kontingent im Sinne von Credits -- Verfuegbarkeit haengt an Ollama-Katalog und freiem RAM, nicht an einem Anbieter-Limit. env fest auf Ollama genagelt (OPENAI_BASE_URL={baseUrl:ollama}/v1) -- kein Cloud-Pfad in diesem Eintrag."
-      }
-    },
-    {
-      "id": "kimi",
-      "label": "Kimi CLI (Moonshot)",
-      "command": "kimi",
-      "args": [
-        "-m",
-        "{model}"
-      ],
-      "cwdMode": "cd",
-      "env": {
-        "BROWSER": "/usr/bin/true"
       },
-      "effort": {
-        "style": "none",
-        "args": [],
-        "map": {}
-      },
-      "systemPrompt": {
-        "style": "file",
-        "projectPath": "AGENTS.md",
-        "worker": "~/.claude/roles/agent.md",
-        "orchestrator": "~/.claude/roles/orchestrator.md"
-      },
-      "autonomy": {
-        "args": [
-          "--yolo",
-          "--afk"
-        ]
-      },
-      "resume": {
-        "args": [
-          "--continue"
-        ],
-        "probe": "revive-only"
-      },
-      "readyPattern": "^── input ─",
-      "promptPattern": null,
-      "promptIgnore": null,
-      "probe": "gemessen 2026-08-08 mit kimi 1.49.0 (uv tool install --python 3.13 kimi-cli), eigener tmux-Socket, umgelenktes HOME, Modell qwen3:1.7b ueber einen openai_legacy-Provider auf Ollama. READY: Die Eingabebox ist ein Kasten mit der beschrifteten Oberkante '── input ─────…'. Diese Zeile steht in allen DREI abgegriffenen Zustaenden da — leere Box, getippter Text, laufende Antwort (waehrend der Antwort dreht daneben ein Mondphasen-Zeichen, die Kastenkante bleibt). Sie erscheint erst mit der TUI und trifft den leeren Startbildschirm nicht. PROMPT: kein Muster, und das ist ein Messergebnis, kein Versaeumnis. Die Eingabezeile ist die Zeile UNTER der Oberkante und traegt kein einziges Zeichen, an dem sie zu erkennen waere: leer ist sie vollstaendig leer, getippt steht dort ' ABCDEF' — ein Leerzeichen, dann der Text. Die Absende-Pruefung in pi-worker braucht aber ein Muster, das (a) die Eingabezeile trifft und (b) mit '<muster>[[:space:]]+[^[:space:]]' anschlaegt, solange Text drinsteht. Ein Muster auf die Kastenkante erfuellt (a), nie (b) — es meldete jeden Auftrag sofort als abgeschickt, auch einen haengenden. Ein Muster auf 'ein Leerzeichen, dann etwas' erfuellt (b) nicht, weil nur EIN Leerzeichen davorsteht, und traefe ausserdem halb Bildschirm. Beides waere schlechter als die ehrliche Auskunft 'Submission NICHT verifizierbar' — dieselbe Lage wie bei opencode. VERTRAUENSFRAGE: keine. Erststart in einem frischen Verzeichnis mit leerem HOME ging ohne Dialog in die TUI; ein trustStore-Block ist nicht noetig.",
-      "compactCommand": "/compact",
-      "contextPattern": "context: ([0-9]{1,3})\\.[0-9]+%",
-      "contextProbe": "gemessen 2026-08-08, dieselbe Sitzung. Die UNTERSTE Zeile der TUI traegt rechtsbuendig 'context: 0.0% (0/262.1k)' und nach dem ersten Zug 'context: 4.0% (10.6k/262.1k)'. Kimi CLI zeigt die Auslastung damit als einziger der bisher gemessenen Harnesses SOFORT, schon vor dem ersten Auftrag — kein blindes Fenster wie bei qwen und aider. Zwei Quellen der Kontextwache greifen hier uebereinander, und das ist Absicht: Die erste Quelle (Zahlenpaar '<verbraucht>/<fenster>') trifft '(10.6k/262.1k)' bereits von selbst und rechnet daraus dieselbe Zahl; contextPattern ist die zweite Sicherung, falls der Pane so schmal wird, dass die Klammer abgeschnitten wird. Das Muster faengt den Vorkommateil, weil der Vertrag der vierten Quelle in der ersten Gruppe eine ganze Zahl verlangt. Die Zeile steht am unteren Rand des Panes, also im Fenster der letzten fuenf Zeilen, das die Wache liest.",
-      "session": {
-        "via": "",
-        "grund": "ungemessen, kein Beispiel auf dieser Maschine. Die Notiz vom 08.08. nennt ~/.kimi/sessions/<verzeichnis-hash>/<sitzungs-uuid> als Ablage, am 11.08. lag unter dem echten HOME keine vor, und ob dort Rolle und Text stehen, ist nie geprueft worden. 'kimi acp' und 'kimi export' gibt es, beides ist kein Nebenkanal zum laufenden TUI.",
-        "ort": null,
-        "format": null,
-        "maxAgeSec": null,
-        "zuordnung": "",
-        "live": false,
-        "eingabe": "pane",
-        "zeigtNicht": [
-          "freigabedialog",
-          "kontextauslastung",
-          "arbeits-anzeige"
-        ],
+      "inbox": {
+        "weg": "",
+        "grund": "Nur ein Stop-Hook (decision block) am Zugende, der keine untaetige Sitzung weckt; qwen serve ist ein eigener Daemon, die TUI ist kein Client davon.",
         "probe": {
-          "datum": "2026-08-11",
-          "beleg": "unter dem echten HOME gesucht, kein Treffer (Bericht chatansicht); Unterbefehle am Hilfetext von kimi 1.49.0 belegt (Bericht pluginweg). Die Kontextwache braucht die Datei nicht: kimi zeigt 'context: 4.0% (10.6k/262.1k)' selbst an (gemessen 08.08.)."
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; qwen --help, qwen serve --help (0.24.6)."
         }
-      },
-      "instructionFiles": [
-        "<project>/AGENTS.md",
-        "<project>/.kimi/AGENTS.md"
-      ],
-      "supportsPaste": true,
-      "altScreen": false,
-      "notes": "Zweite Welle, 2026-08-08. Installiert mit 'uv tool install --python 3.13 kimi-cli'; das Binary landet in ~/.local/bin und wird hier BLOSS als 'kimi' eingetragen, wie aider und agy auch — ein Eintrag mit '~/.local/bin/kimi' loest sich in einem umgelenkten HOME auf dessen Wegwerf-Verzeichnis auf, und der Startbarkeits-Test schlaegt dann fehl, obwohl das Werkzeug da ist. ROLLEN-WEG GEMESSEN: In ein Wegwerf-Arbeitsverzeichnis wurde eine AGENTS.md mit einem frei erfundenen Losungswort gelegt und danach gefragt; Kimi antwortete mit genau diesem Wort. Der eingebaute Standard-Agent zieht die Datei ueber die Variable ${KIMI_AGENTS_MD} in seinen System-Prompt (Doku: zusammengefuehrt vom Projektwurzelverzeichnis bis zum Arbeitsverzeichnis, einschliesslich .kimi/AGENTS.md). Der Rollen-Generator in wb-harness-run schreibt deshalb nach <arbeitsverzeichnis>/AGENTS.md. ACHTUNG BEIM ZUSAMMENLEBEN: agy, codex und opencode benutzen DIESELBE Datei. Zwei Worker verschiedener Rolle im selben Verzeichnis lehnt der Generator ohnehin ab; zwei Worker gleicher Rolle auf verschiedenen Harnesses ueberschreiben einander denselben Block mit demselben Inhalt, was folgenlos ist. VORAUSSETZUNG, die dieser Eintrag NICHT selbst herstellt: Kimi kennt nur Modelle, die in ~/.kimi/config.toml deklariert sind — '-m' nimmt den SCHLUESSEL aus dem Abschnitt [models.<schluessel>], nicht den Namen des Modells beim Anbieter. Fehlt der Schluessel, startet Kimi gar nicht erst mit diesem Modell. Die modelRef der registrierten Eintraege ist deshalb der Konfigurationsschluessel. Anders als opencode faellt Kimi dabei NICHT still auf ein Cloud-Modell zurueck. Der lokale Weg braucht in dieser Datei einen Provider vom Typ openai_legacy auf http://localhost:11434/v1 mit einem beliebigen Platzhalter als api_key. Bewusst KEIN env-Block mit OPENAI_BASE_URL/OPENAI_API_KEY hier: diese beiden Variablen ueberschreiben laut Doku JEDEN openai_legacy-Provider dieser Datei, ein spaeterer Cloud-Provider wuerde also stillschweigend auf Ollama umgebogen. EFFORT: keine Stufe. Kimi kennt nur '--thinking/--no-thinking', einen Schalter und keine Leiter; die Zuordnung low/medium/high liesse sich nur erfinden, weil bei einem Wechsel das FLAG wechselt und nicht sein Wert — das kann effort.args nicht ausdruecken. FORTSETZEN: '--continue' setzt die letzte Sitzung DIESES Arbeitsverzeichnisses fort, gemessen an drei Starts hintereinander (Kennwort im ersten, Start ohne Flag leer bei 'context: 0.0%', Start mit Flag mit wiedergespieltem Verlauf bei 'context: 4.1%'). Deshalb probe 'revive-only'. AUTONOMIE: '--yolo' genehmigt alle Aktionen, '--afk' beantwortet zusaetzlich AskUserQuestion selbsttaetig — ohne das haelt ein Worker an einer Rueckfrage an, die niemand liest. BROWSER=/usr/bin/true steht daneben wie bei aider. Sitzungen liegen unter ~/.kimi/sessions/<verzeichnis-hash>/<sitzungs-uuid>; ein contextSession-Eintrag ist nicht noetig, weil die Anzeige die Zahlen selbst nennt. KEIN discover-BLOCK, und das ist Absicht: KEIN automatischer Abruf. Kimi hat keinen Befehl, der Modelle auflistet, und seine Modellnamen sind ohnehin keine Anbieter-Namen, sondern die frei gewaehlten Schluessel aus ~/.kimi/config.toml — eine Quelle wie 'ollama list' wuerde Referenzen erzeugen, die es in dieser Datei nicht gibt und mit denen Kimi nicht startet. Die Eintraege bleiben deshalb von Hand kuratiert und muessen zu den Abschnitten [models.<schluessel>] passen. Ein Block mit source 'none' waere schlimmer als keiner — gemessen 2026-08-08 mit 'wb-state models discover --dry-run': jeder Lauf meldete dann 'kimi: FEHLER — unbekannte discover.source', also einen Fehlschlag, wo gar nichts abzurufen ist. Ohne den Block wird kimi schlicht nicht gefragt, genau wie claude.",
-      "configFiles": [
-        {
-          "source": "kimi-config.default.toml",
-          "target": "~/.kimi/config.toml",
-          "required": true,
-          "why": "kimi loest ohne diese Datei kein Modell auf."
-        }
-      ],
-      "kontingent": {
-        "art": "lokal",
-        "planQuelle": "",
-        "modellQuelle": "",
-        "nutzungQuelle": "datei:~/.kimi/config.toml (nur [providers.ollama], kein Moonshot-Zugangsdatensatz irgendwo unter ~/.kimi)",
-        "notiz": "kimi login/logout existieren (OAuth-Weg zu einem echten Moonshot-Konto), auf dieser Werkbank aber nicht ausgefuehrt. Kein Status-Unterbefehl vorhanden -- die Angemeldet-Pruefung stuetzt sich auf die Abwesenheit einer Zugangsdaten-Datei, deren Fundort nach einem Login nicht bekannt ist. modelRef ist hier ein selbstgewaehlter Konfigurationsschluessel ('ollama-ornith-9b'), der erst in config.toml auf 'ornith:9b' zeigt -- er wird deshalb NICHT gegen 'ollama list' gehalten."
       }
     },
     {
       "id": "gptme",
       "label": "gptme (Erik Bjareholt)",
       "command": "gptme",
+      "modelSwitch": null,
       "args": [
         "--name",
         "{name}",
@@ -1345,6 +1777,28 @@
         "~/.config/gptme/AGENTS.md",
         "<project>/AGENTS.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "weg": "leer",
+          "grund": "zu messen (S0)"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "kein Hook-Mechanismus laut --help"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
+        },
+        "plugins": {
+          "weg": "leer",
+          "grund": "kein Plugin-Mechanismus bestaetigt"
+        },
+        "rechte": {
+          "weg": "registry-flag",
+          "grund": "Registry-Flag -t/--tools"
+        }
+      },
       "supportsPaste": true,
       "altScreen": false,
       "probe": "gemessen 2026-08-08 mit gptme 0.32.1 (uv tool install gptme) auf eigenem tmux-Socket, umgelenktem HOME, Modell local/qwen3:1.7b ueber Ollama. gptme ist KEINE Vollbild-TUI, sondern eine Zeilen-Oberflaeche: der Verlauf wird fortlaufend in den Bildschirm geschrieben, und die Eingabezeile ist die Zeile 'User:'. READY: das Muster '^User:' trifft die drei gemessenen Zustaende — LEER steht dort genau 'User:' ohne Platzhalter, GETIPPT 'User: auftrag: pruefe die tests', und WAEHREND DER ANTWORT bleibt eben diese Zeile als Teil des Verlaufs stehen, waehrend darunter 'Assistant:' und der Text erscheinen. ERSTSTART in 0,4-s-Schritten abgetastet: bis 0,4 s stehen nur die sieben Meldezeilen ('Using model: local/qwen3:1.7b', 'Using logdir: …', 'Using workspace: …'), ab 0,8 s die Zeile 'User:'. Das Muster trifft also nicht frueher als die Eingabebereitschaft. DIE STARTAUSWAHL, die den Eintrag praegt: ohne --name zeigt gptme zuerst eine Auswahlliste ('New conversation or load previous?' mit den Punkten 'New conversation' und 'Load more') und wartet darauf, dass jemand auswaehlt — ein Auftrag, der dort hineingetippt wird, ist verloren. Gemessen und dann in der Quelle bestaetigt: die Liste erscheint genau dann, wenn der Name 'random' ist, also nicht uebergeben wurde. Deshalb steht '--name {name}' fest in args, und deshalb ist das kein Beiwerk, sondern die Bedingung dafuer, dass dieser Harness ueberhaupt spawnbar ist. Eine VERTRAUENSFRAGE fuer ein neues Verzeichnis stellt gptme nicht, und einen Anmelde- oder Telemetriedialog auch nicht: im leeren HOME legt es wortlos seine config.toml an und zeigt die Eingabezeile. Ein trustStore-Block ist deshalb nicht noetig, und das ist gemessen und nicht ausgelassen. GRENZE DER ABSENDE-PRUEFUNG, die man kennen muss: weil der abgeschickte Auftrag als 'User: <text>' im Verlauf STEHEN BLEIBT, ist die letzte Treffer-Zeile waehrend der ganzen Antwort weiterhin eine Zeile mit Text. Die Pruefung in pi-worker meldet 'abgeschickt' deshalb erst, wenn die Antwort durch ist und eine frische, leere 'User:'-Zeile darunter steht. Dauert die Antwort laenger als die 45 s Frist, endet der Spawn im dritten Ausgang ('Submission NICHT verifiziert, der Pane arbeitet aber') — eine ehrliche Meldung, kein Fehlschlag, und es wird kein zweites Enter getippt. Falsch herum irren kann die Pruefung nicht: ein wirklich haengender Auftrag sieht genauso aus und wird nie als abgeschickt gemeldet.",
@@ -1363,12 +1817,21 @@
         "modellQuelle": "befehl:ollama list",
         "nutzungQuelle": "befehl:ollama ps | befehl:check-resources",
         "notiz": "Kein Kontingent im Sinne von Credits -- Verfuegbarkeit haengt an Ollama-Katalog und freiem RAM, nicht an einem Anbieter-Limit. modelRef traegt Praefix 'local/<name>' (gptme-eigene Schreibweise fuer den OpenAI-kompatiblen Ollama-Endpunkt)."
+      },
+      "inbox": {
+        "weg": "",
+        "grund": "`gptme chats send` reiht fuer den naechsten Zug ein, weckt laut Quelltext (chat.py _drain_external_prompt_queue) aber keine untaetige Sitzung — eine Nachricht an eine wartende Sitzung laege bis zur naechsten Menschen-Eingabe. Kandidat fuer einen Teilweg, nicht gebaut.",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; gptme chats send --help, gptme/prompt_queue.py (0.34.0)."
+        }
       }
     },
     {
       "id": "copilot",
       "label": "GitHub Copilot CLI (eigener Anbieter, lokal)",
       "command": "copilot",
+      "modelSwitch": null,
       "args": [],
       "cwdMode": "cd",
       "env": {
@@ -1435,6 +1898,30 @@
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.copilot/mcp-config.json",
+          "format": "json-pfad",
+          "pfad": "mcpServers",
+          "form": "copilot"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "kein Hook-Mechanismus laut --help"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.copilot/installed-plugins/"
+        },
+        "rechte": {
+          "weg": "registry-flag",
+          "grund": "Registry-Flag --allow-all-tools; ~/.copilot/config.json ist ungueltiges JSON: nicht anfassen, melden"
+        }
+      },
       "supportsPaste": true,
       "altScreen": true,
       "probe": "gemessen 2026-08-08 mit GitHub Copilot CLI 1.0.78 (npm i -g @github/copilot) auf eigenem tmux-Socket, umgelenktem HOME, Modell qwen3:1.7b ueber Ollama. OHNE GITHUB-ABO, und das ist der Kern dieses Eintrags: die CLI kann einen EIGENEN Modell-Anbieter fahren (COPILOT_PROVIDER_BASE_URL, in ihrer eigenen Hilfe ausdruecklich mit Ollama als Beispiel), und dann faellt die GitHub-Anmeldung weg — 'GitHub authentication is not required', und mit COPILOT_OFFLINE=true unterbleibt jeder Netzzugriff. Gemessen wurde genau so: kein Anmeldebildschirm, keine Geraetecode-Aufforderung, kein Browser, sondern die Eingabezeile. Ein Abo wurde weder benutzt noch geprueft (Naeheres in notes). READY: die Eingabebox wird mit einem schweren senkrechten Strich am Zeilenanfang gezeichnet, deshalb readyPattern '^┃'. Gemessen wurden die drei Zustaende: LEER steht dort '┃' allein, GETIPPT '┃ wie lautet das Kennwort dieses Arbeitsverzeichnisses? …', und WAEHREND DER ANTWORT ist die Box wieder leer ('┃'), waehrend die Fusszeile auf ' ● Working esc interrupt' wechselt. Das Muster trifft alle drei. WARUM NICHT DIE FUSSZEILE: sie wechselt mit dem Zustand ('/ commands · ? help · tab next tab' im Ruhezustand, '@ files · # issues' beim Tippen, '● Working esc interrupt' waehrend der Antwort) — ein Muster darauf traefe je nach Zustand oder nicht. ERSTSTART in 0,4-s-Schritten abgetastet: bis 1,6 s Banner und Meldungen, ab 2,0 s die Eingabebox. Das Muster trifft also nicht frueher als die Eingabebereitschaft, und es trifft vor allem KEINEN der beiden Erststart-Dialoge (nachgemessen an den aufgezeichneten Bildschirmen: '┃' am Zeilenanfang kommt dort nicht vor, die Dialoge sind mit leichten Rahmenzeichen gezeichnet). ZWEI DIALOGE haelt der Erststart bereit, und beide muessen VORHER beantwortet sein, sonst tippt ein Spawn seinen Auftrag in eine Ja-Nein-Frage. Erstens die VERTRAUENSFRAGE ('Do you trust the files in this folder?' mit den Punkten Yes / Yes, and remember this folder for future sessions / No) — sie faellt in jedem neuen Verzeichnis an, also bei jedem Worker, und wird ueber trustStore beantwortet (siehe dort). Zweitens die TERMINAL-EINRICHTUNG ('Set up terminal for multi-line input support … Would you like to add this key binding to your terminal configuration?'), die eine Tastenbelegung in die VS-Code-Konfiguration schreiben will. Sie liess sich NICHT durch Leeren von TERM_PROGRAM und VSCODE_GIT_IPC_HANDLE abstellen (gemessen: der Dialog kam trotzdem, die CLI erkennt VS Code notfalls an der Prozess-Ahnenreihe). Abgestellt wird sie durch COPILOT_SETUP_TERMINAL=false, gemessen an zwei Laeufen: mit gesetztem Vertrauen erschien danach unmittelbar die Eingabezeile, ohne Vertrauen genau ein Dialog statt zweier.",
@@ -1452,6 +1939,14 @@
         "modellQuelle": "befehl:ollama list",
         "nutzungQuelle": "befehl:ollama ps | befehl:check-resources",
         "notiz": "Kein Kontingent im Sinne von Credits -- Verfuegbarkeit haengt an Ollama-Katalog und freiem RAM, nicht an einem Anbieter-Limit. GENAU dieser Eintrag (nicht copilot-cloud) traegt COPILOT_OFFLINE=true und die vier COPILOT_PROVIDER_*-Variablen -- das ist die Abgrenzung zur Cloud-Spur."
+      },
+      "inbox": {
+        "weg": "",
+        "grund": "Hooks und --extension-sdk-path vorhanden, Ereignisnamen und Einspeise-API nicht belegt (Binaer gepackt); --remote laeuft ueber GitHub-Server, kein lokaler Kanal.",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; copilot --help, copilot help config (1.0.89)."
+        }
       }
     },
     {
@@ -1521,6 +2016,28 @@
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "weg": "leer",
+          "grund": "Cloud-Harness ohne lokale Werkzeugkonfiguration"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "Cloud-Harness ohne lokale Werkzeugkonfiguration"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "Cloud-Harness ohne lokale Werkzeugkonfiguration"
+        },
+        "plugins": {
+          "weg": "leer",
+          "grund": "Cloud-Harness ohne lokale Werkzeugkonfiguration"
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "Cloud-Harness ohne lokale Werkzeugkonfiguration"
+        }
+      },
       "supportsPaste": true,
       "altScreen": true,
       "probe": "gemessen 2026-08-10 mit GitHub Copilot CLI 1.0.78, ZWEITER Harness-Eintrag fuer dieselbe Binary: 'copilot' loggt seit heute per 'copilot login' als <your-github-user> ein (Geraetecode-Anmeldung, vom Auftraggeber selbst durchgefuehrt und mit einem echten 'copilot -p' verifiziert), waehrend der bestehende Eintrag 'copilot' denselben Befehl weiterhin ausschliesslich gegen einen eigenen Ollama-Anbieter faehrt (COPILOT_PROVIDER_*, COPILOT_OFFLINE=true). env gehoert dem Harness, nicht dem Modell — dieser Eintrag setzt deshalb GENAU DAS NICHT: keine COPILOT_PROVIDER_*-Variablen, kein COPILOT_OFFLINE, damit greift die eingebaute GitHub-Anmeldung. GEMESSEN, NICHT NEU: readyPattern/promptPattern sind dieselbe Eingabebox wie beim lokalen Eintrag ('^┃') — heute am echten HOME, eigenem tmux-Socket (wbcopilotcloud-*) und einem Wegwerf-Arbeitsverzeichnis erneut in LEER ('┃' allein) und GETIPPT ('┃ schreibe das Wort BEREIT und sonst nichts') bestaetigt, OHNE abzusenden: nach dem Tippen wurde der Text zeichenweise wieder geloescht und mit '/exit' beendet, nie ein Enter auf den Auftragstext. Beleg fuer 'kein Cloud-Zug dabei': ~/.copilot/session-store.db (assistant_usage_events) trug vorher wie nachher exakt 4 Zeilen, alle mit Zeitstempel 14:19-14:20 UTC aus dem Verifikationslauf des Auftraggebers — keine neue Zeile durch diese Messung. WAEHREND DER ANTWORT wurde NICHT erneut gemessen (dafuer waere ein echter, bezahlter Zug noetig gewesen); uebernommen vom lokalen Eintrag, weil es dieselbe Box/dasselbe Terminal-Rendering ist. VERTRAUENSFRAGE: exakt derselbe Dialog wie lokal ('Confirm folder trust' / '❯ 1. Yes'), heute am frischen Wegwerfverzeichnis erneut ausgeloest und mit Option 1 (sitzungsweise, NICHT 'remember') bestaetigt — die echte trustedFolders-Liste in ~/.copilot/config.json wurde dadurch nicht dauerhaft veraendert, trustStore-Feld unveraendert vom lokalen Eintrag uebernommen, weil derselbe Mechanismus/dieselbe Datei gilt.",
@@ -1534,6 +2051,14 @@
         "modellQuelle": "bildschirm:copilot-CLI /model-Waehler (26 Eintraege: 'Auto' plus 25 benannte Modelle, die der Free-Plan alle sperrt) -- registriert ist deshalb NUR 'auto'",
         "nutzungQuelle": "datei:~/.copilot/session-store.db, Tabelle assistant_usage_events, Feld total_nano_aiu (Summe/1e9 = verbrauchte AIC) -- nur lesend geoeffnet",
         "notiz": "planFest/planFestStand sind die einzige Abweichung vom Vertragsschema und stehen hier auf ausdrueckliche Anweisung des Auftrags: der Plan steht NUR als Bildschirmtext im Modellwaehler, ist also nicht kostenlos wiederholbar automatisierbar, und wird deshalb einmal gemessen und datiert hinterlegt statt bei jedem Lauf neu geraten. Die GRENZE des Free-Plans nennt keine lokale Datei -- sie bleibt leer, und ohne Grenze gibt es kein belegbares 'erschoepft'."
+      },
+      "inbox": {
+        "weg": "",
+        "grund": "Laeuft in der Cloud; kein lokaler Kanal in die Sitzung.",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; wie copilot."
+        }
       }
     },
     {
@@ -1608,6 +2133,30 @@
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.config/nanocoder/.mcp.json",
+          "format": "json-pfad",
+          "pfad": "mcpServers",
+          "form": "nanocoder"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "kein Hook-Mechanismus laut --help"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
+        },
+        "plugins": {
+          "weg": "leer",
+          "grund": "kein Plugin-Mechanismus laut --help"
+        },
+        "rechte": {
+          "weg": "nur-pruefen",
+          "grund": "trustStore nur pruefen"
+        }
+      },
       "supportsPaste": true,
       "altScreen": false,
       "probe": "gemessen 2026-08-08 mit Nanocoder 1.29.0 (npm i -g @nanocollective/nanocoder — der Paketname hat KEINEN Bindestrich in 'nanocollective') auf eigenem tmux-Socket mit PID im Namen, umgelenktem HOME, Modelle ornith:9b und qwen3:1.7b ueber Ollama. OHNE KONFIGURATION laeuft die CLI in einen Einrichtungs-Assistenten ('Provider Wizard — Where would you like to create your configuration?') und ein Spawn bliebe dort stehen; umgangen wird er ueber NANOCODER_PROVIDERS, das die Anbieterliste als JSON entgegennimmt und Vorrang vor Projekt- und Globalkonfiguration hat. Der Anbietername in diesem JSON und der Wert von --provider muessen uebereinstimmen (hier 'ollama'), und die Modellreferenz muss in der models-Liste desselben Eintrags stehen — die eigene Hilfe sagt zu --model ausdruecklich 'must be available for the provider'. Deshalb traegt die Liste genau {model} und nichts sonst. READY: die Eingabebox ist dreizeilig und jede ihrer Zeilen beginnt mit einem schweren senkrechten Strich, deshalb readyPattern '^┃'. Gemessen wurden die drei Zustaende. LEER: die drei Zeilen lauten '┃', '┃ > / commands, ! bash, ↑/↓ history', '┃' — die mittlere traegt einen PLATZHALTER, keinen Text. GETIPPT: dieselbe Box, die mittlere Zeile lautet '┃ wie lautet das Kennwort dieses Arbeitsverzeichnisses? antworte nur mit dem Wort.'. WAEHREND DER ANTWORT: die Box ist wieder auf dem Platzhalter, und darunter kommt eine VIERTE Zeile mit demselben Strich dazu: '┃ ⠧ Press Esc to cancel · ctrl-o expand tool results'. Das Muster trifft alle drei Zustaende. ERSTSTART in 0,4-s-Schritten abgetastet: bei 0,4 s ist der Bildschirm noch vollstaendig leer, ab 0,8 s steht die Box da. Das Muster trifft also nicht frueher als die Eingabebereitschaft, und es trifft die VERTRAUENSFRAGE nicht: die ist mit leichten Rahmenzeichen gezeichnet ('│', U+2502), die Eingabebox mit dem schweren Strich ('┃', U+2503) — zwei verschiedene Zeichen, nachgemessen an den aufgezeichneten Bildschirmen. DIE VERTRAUENSFRAGE ('Security Warning / Do you trust the files in this folder?' mit 'Yes, proceed' und 'No, exit') faellt in JEDEM neuen Verzeichnis an, also bei jedem Worker, und wird ueber trustStore beantwortet (siehe dort). Einen zweiten Erststart-Dialog gibt es nicht, und einen Anmelde- oder Telemetriedialog auch nicht: mit NANOCODER_PROVIDERS im Ruecken zeigt die CLI im leeren HOME nach der Vertrauensfrage unmittelbar die Eingabebox. WARUM promptPattern NICHT '^┃' IST, obwohl readyPattern es ist: die Absende-Pruefung nimmt die LETZTE Zeile, auf die das Muster passt. Mit '^┃' waere das die untere Randzeile der Box — die ist immer leer, und die Pruefung meldete jeden Auftrag sofort als abgeschickt, auch einen haengenden. Das ist derselbe Fehler, den opencode mit seiner zweiten Zeile ausgeloest hat. '^┃[^┃]*[^[:space:]]' verlangt hinter dem Strich mindestens ein Zeichen, das kein Leerzeichen ist, und trifft damit nur die Textzeile; die Randzeilen ('┃' allein, ohne nachlaufende Leerzeichen — tmux schneidet sie ab) fallen heraus. Nachgerechnet mit der Pruefung, die pi-worker wirklich fuehrt (grep -qE \"<muster>[[:space:]]+[^[:space:]]\"): auf '┃ wie lautet das Kennwort …' trifft sie, der getippte Text gilt also richtig als 'haengt noch'. promptIgnore faengt die beiden Zeilen, die wie haengender Text aussehen, aber das Gegenteil bedeuten: den Platzhalter der leeren Box und die Spinner-Zeile waehrend der Antwort. Ohne die zweite Ausnahme tippte pi-worker waehrend jeder laufenden Antwort Enter nach.",
@@ -1633,12 +2182,21 @@
         "modellQuelle": "befehl:ollama list",
         "nutzungQuelle": "befehl:ollama ps | befehl:check-resources",
         "notiz": "Kein Kontingent im Sinne von Credits -- Verfuegbarkeit haengt an Ollama-Katalog und freiem RAM, nicht an einem Anbieter-Limit. Ohne shell/nanocoder-agents.config.default.json (-> ~/.config/nanocoder/agents.config.json) faellt der Rollen-Weg bei kleinen Modellen (<=4B, Tune-Profil 'nano') still weg."
+      },
+      "inbox": {
+        "weg": "",
+        "grund": "Kein Kanal gefunden; --acp ist JSON-RPC ueber stdin/stdout fuer Editoren, nicht fuer eine laufende TUI.",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; nanocoder --help (1.29.0)."
+        }
       }
     },
     {
       "id": "cline",
       "label": "Cline CLI (clite, eigener Anbieter, lokal)",
       "command": "clite",
+      "modelSwitch": null,
       "args": [
         "--data-dir",
         "{sessionDir}",
@@ -1714,6 +2272,28 @@
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "weg": "leer",
+          "grund": "zu messen (S0)"
+        },
+        "hooks": {
+          "weg": "hooks-dir",
+          "ziel": "~/.cline/hooks/"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.cline/plugins/"
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "keine Rechte-Konfiguration laut --help"
+        }
+      },
       "supportsPaste": true,
       "altScreen": true,
       "probe": "gemessen 2026-08-08 mit Cline CLI 0.0.13 (npm i -g @cline/cli) auf eigenem tmux-Socket mit PID im Namen, umgelenktem HOME, Modelle ornith:9b und qwen3:1.7b ueber Ollama. DER BEFEHL HEISST NICHT 'cline': das Paket @cline/cli liefert genau EIN Programm, und das heisst 'clite' (package.json, Feld bin). Wer 'cline' eintraegt, bekommt 'command not found'. OHNE GITHUB- ODER CLINE-KONTO, und das ist der Kern dieses Eintrags: die CLI kann einen eigenen OpenAI-kompatiblen Anbieter fahren, und dann faellt jede Anmeldung weg. Eingerichtet wird er EINMAL ueber 'clite auth openai -b <url>/v1 -m <modell> -k <platzhalter>'; der Anbieter heisst danach 'openai-native' (die Ausgabe sagt es selbst: 'Provider configured: openai-native'). Die Basis-URL laesst sich NUR so setzen — 'clite auth ollama -b …' lehnt ab mit 'base URL is only supported for OpenAI and OpenAI-compatible providers', der eingebaute ollama-Anbieter nimmt also keine. Deshalb liegt die Bruecke von der Registry zur CLI in einer Datei: shell/cline-providers.default.json gehoert nach ~/.cline-wb/settings/providers.json, also in den Ordner, den '--data-dir {sessionDir}' bestellt (WARUM nicht der voreingestellte Ort: siehe notes, das ist gemessen). Das MODELL steht darin auch, wird aber je Start von -m ueberschrieben — nachgemessen mit zwei Startzeilen: mit '-m qwen3:1.7b' nannte die Fusszeile 'qwen3:1.7b (0) $0.0000', mit '-m ornith:9b' entsprechend. READY: die Eingabezeile beginnt mit einem Groesser-Zeichen, deshalb readyPattern '^[[:space:]]*>[[:space:]]'. Fuehrende Leerzeichen sind Pflicht im Muster und kein Schoenheitsfehler: die Oberflaeche zeichnet den Startbildschirm ZENTRIERT (gemessen: die Eingabezeile begann in einem 200 Spalten breiten Pane bei Spalte 69) und rueckt erst nach dem ersten Auftrag nach links (dann Spalte 2). Ein Muster mit '^>' traefe keinen der beiden Zustaende. Die drei Zustaende, alle gemessen: LEER steht dort '> What can I do for you?' — ein PLATZHALTER, kein Text; GETIPPT '> wie lautet das Kennwort dieses Arbeitsverzeichnisses? antwor' und die Fortsetzung bricht OHNE Groesser-Zeichen in die naechste Zeile um; WAEHREND DER ANTWORT ist die Box wieder leer und zeigt einen ANDEREN Platzhalter, '> Ask anything...'. DASS DER PLATZHALTER WECHSELT, ist die Falle dieses Harness und derselbe Fehler wie bei codex. Es sind genau drei, aus dem Programm selbst gelesen und nicht geraten: 'What can I do for you?' auf dem Startbildschirm, 'Ask anything...' im laufenden Gespraech, 'Plan something...' im Plan-Modus. Alle drei stehen in promptIgnore. Ohne sie haelt die Absende-Pruefung von pi-worker die leere Box fuer haengenden Text und tippt Enter nach. WARUM promptPattern OHNE das Leerzeichen am Ende steht: die Pruefung haengt '[[:space:]]+[^[:space:]]' an das Muster. Endete das Muster selbst auf einem Leerzeichen, verlangte sie ein ZWEITES und traefe nie — das ist der Fehler, an dem goose gescheitert ist. EINEN VERTRAUENSDIALOG stellt die CLI nicht, und einen Anmeldedialog auch nicht, solange der eigene Anbieter eingerichtet ist: im frischen HOME kam sie unmittelbar mit der Oberflaeche hoch. Ein trustStore-Block ist deshalb nicht noetig, und das ist gemessen.",
@@ -1743,6 +2323,14 @@
         "modellQuelle": "",
         "nutzungQuelle": "datei:~/.cline-wb/settings/providers.json (einziger Eintrag 'openai-native' mit Platzhalter-Key gegen Ollama, kein 'cline'- oder 'openai'-Provider)",
         "notiz": "CLI unterstuetzt eigenes Abo ('Sign in with Cline'), ChatGPT-Pass-through und API-Key -- auf dieser Werkbank ist NICHTS davon eingerichtet, nur ein selbstgebauter schluessel-loser Provider gegen lokales Ollama. 'clite auth'/'clite config' brauchen ein echtes TTY, liessen sich nicht kostenlos abfragen."
+      },
+      "inbox": {
+        "weg": "",
+        "grund": "cline hub hat RPC session.send_input, ob eine TUI-Sitzung ueber den Hub laeuft, ist nicht belegt (README: --zen schliesst --tui aus). Kandidat, nicht gemessen.",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; cline --help, README (3.0.65)."
+        }
       }
     },
     {
@@ -1811,6 +2399,28 @@
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "weg": "leer",
+          "grund": "mcp-Befehl vorhanden, Konfigurationsformat zu messen (S0); bis dahin leer"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "kein Hook-Mechanismus laut --help"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
+        },
+        "plugins": {
+          "weg": "leer",
+          "grund": "kein Plugin-Mechanismus laut --help"
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "keine Rechte-Konfiguration laut --help"
+        }
+      },
       "supportsPaste": true,
       "altScreen": true,
       "probe": "gemessen 2026-08-08 mit OpenHands CLI v1.16.0 / SDK v1.21.0 auf eigenem tmux-Socket mit PID im Namen, umgelenktem HOME, Modell ornith:9b ueber Ollama. OHNE DOCKER, und das war die Frage: die Oberflaeche startet und arbeitet ohne jeden Container — Docker braucht nur der Unterbefehl 'serve' (die grafische Oberflaeche im Browser), und der wird hier nicht benutzt. Auf dieser Maschine ist Docker nicht einmal installiert ('docker' nicht gefunden), und die CLI kam trotzdem hoch, beantwortete einen Auftrag und meldete '▶ Loaded: 7 tools, system prompt'. DAS PAKET HEISST 'openhands', NICHT 'openhands-ai': 'uv tool install openhands-ai' laeuft durch und bricht am Ende ab mit 'No executables are provided by package openhands-ai; removing tool'. 'uv tool install openhands' liefert die beiden Programme 'openhands' und 'openhands-acp'. ZWEI FLAGS ENTSCHEIDEN ueber den Erststart, und beide muessen dran sein. Ohne '--override-with-envs' ignoriert die CLI die LLM_-Variablen und oeffnet einen EINRICHTUNGS-DIALOG ueber dem Bildschirm ('LLM Model:' mit einer Auswahlliste, 'API Key:' mit einem Eingabefeld, darunter 'Save / Cancel') — gemessen, und ein Spawn bliebe darin stehen. MIT dem Flag meldet sie 'All set up!' und 'Initialized conversation <id>' und zeigt die Eingabezeile. '--always-approve' ist die Autonomie. READY: NICHT die Eingabebox, sondern die unterste Tastenzeile. Der Grund ist gemessen: der Einrichtungs-Dialog liegt als Fenster UEBER dem normalen Bildschirm, und die Eingabebox samt ihrem Rahmen ist daneben weiterhin sichtbar — ein Muster auf die Box traefe also mitten im Dialog und der Auftrag verschwaende in einem Eingabefeld fuer einen Schluessel. Genau der Fehler, an dem agy gescheitert ist. Die Tastenzeile dagegen WECHSELT mit dem Zustand: im Dialog steht dort '^c Exit  esc Cancel', im normalen Betrieb '^a Select all  ^x Open external editor  ^l Toggle single/multi-line input …'. Deshalb readyPattern '\\^a Select all'. Nachgemessen an allen aufgezeichneten Bildschirmen: die Zeile steht im LEEREN, im GETIPPTEN und im ARBEITENDEN Zustand da und im Dialog nicht. Die drei Zustaende der Eingabebox selbst, ebenfalls gemessen: LEER '│ Type your message, @mention a file, or / for commands' — ein Platzhalter; GETIPPT '│ wie lautet das Kennwort dieses Arbeitsverzeichnisses? antworte nur mit dem Wort.'; WAEHREND DER ANTWORT wieder der Platzhalter, und darueber eine Zeile '⠧ Working (4s • ESC: pause)'. promptPattern '^[[:space:]]*│' trifft nur die Textzeile der Box (Ober- und Unterkante sind mit '╭' und '╰' gezeichnet, nicht mit '│'), und die Pruefung von pi-worker erkennt den getippten Text damit richtig als 'haengt noch'. promptIgnore faengt den Platzhalter. EINEN VERTRAUENSDIALOG stellt die CLI nicht, und einen Anmeldedialog auch nicht (die Anmeldung 'openhands login' gilt der Cloud und wird hier nicht benutzt) — im frischen HOME kam nach den beiden Flags unmittelbar die Oberflaeche. Ein trustStore-Block ist deshalb nicht noetig, und das ist gemessen. FORTSETZEN GEMESSEN 2026-09-05 (Auftrag fortsetzen): echter pi-worker-Spawn (openhands-ornith-9b, Auftrag 'Merke dir das Merkwort ZIRBELKIEFER') auf eigenem tmux-Socket wbtest-fortsetzen-<pid> mit umgelenktem HOME (auch in der tmux-Serverumgebung, siehe notes), Antwort 'Gemerkt: ZIRBELKIEFER', Sitzung 49b6aa9c… unter <HOME>/.openhands/conversations/. Dann ZWEI Neustarts ueber den echten Revive-Weg (wb-harness-run --resume-args '--resume --last', Startzeile 'openhands --resume --last --always-approve --override-with-envs'): (1) nach sauberem /exit und (2) nach kill -9 des Python-Prozesses. Beide Male 'Initialized conversation 49b6aa9c…' (dieselbe Kennung, keine neue), und die Frage 'Welches Merkwort habe ich dir genannt?' bzw. 'Nenne mir nochmals das Merkwort' wurde mit genau 'ZIRBELKIEFER' beantwortet; ctx sprang nach der ersten Antwort auf 17.7K (Verlauf geladen). Ohne die Flags legte derselbe Weg eine neue Unterhaltung an (7357559a…), also traegt das Flag und nicht der Zufall.",
@@ -1829,6 +2439,14 @@
         "modellQuelle": "befehl:ollama list",
         "nutzungQuelle": "befehl:ollama ps | befehl:check-resources",
         "notiz": "Kein Kontingent im Sinne von Credits -- Verfuegbarkeit haengt an Ollama-Katalog und freiem RAM, nicht an einem Anbieter-Limit. modelRef roh, Anbieter-Praefix 'openai/' steht fest in env.LLM_MODEL und nicht im modelRef selbst."
+      },
+      "inbox": {
+        "weg": "",
+        "grund": "Nur ein Stop-Hook am Zugende, der selbst erzeugten Text liefert; serve/web/acp sind eigene Betriebsarten.",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; openhands/sdk/hooks/conversation_hooks.py (SDK 1.21.0)."
+        }
       }
     },
     {
@@ -1901,6 +2519,28 @@
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
+      "toolAdapter": {
+        "mcp": {
+          "weg": "leer",
+          "grund": "mcp-Befehl vorhanden, Konfigurationsformat zu messen (S0); bis dahin leer"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "kein Hook-Mechanismus laut --help"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
+        },
+        "plugins": {
+          "weg": "leer",
+          "grund": "nur zsh-Plugin, kein Harness-Plugin"
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "keine Rechte-Konfiguration laut --help"
+        }
+      },
       "supportsPaste": true,
       "altScreen": false,
       "probe": "gemessen 2026-08-09 mit Forge CLI 2.13.21 (npm i -g @antinomyhq/forge, Befehl 'forge' — das npm-Postinstall-Skript install.js waehlt nur die passende Plattform-Binaerdatei aus einem bereits mitgelieferten Satz aus und wurde von npm wegen 'allow-scripts' uebersprungen; 'forge --version' lief trotzdem sofort, das Skript wurde vorher gelesen und enthaelt nur Plattformerkennung, keinen Netzzugriff). Gemessen auf eigenem tmux-Socket mit PID im Namen, umgelenktem HOME, Modell ornith:9b ueber Ollama. KEIN CLI-FLAG FUER DAS MODELL: anders als bei allen 15 bisherigen Harnesses gibt es kein '-m/--model'; die Modellwahl ist ZUSTANDSBEHAFTET ueber 'forge config set model <anbieter> <modell>' in ~/.forge/.forge.toml, global fuer die ganze Maschine und NICHT je Prozess. Deshalb ist 'command' hier '/bin/sh' und 'args' ein '-c'-Einzeiler, der den Zustand vor jedem Start explizit auf das bestellte Modell UND die bestellte Denkstufe setzt und danach 'exec forge' aufruft — ohne dieses Vorschalten wuerde ein zweiter, gleichzeitig gestarteter Worker mit einem anderen Modell den ersten stillschweigend umschalten (gemessen: das Umschalten wirkt sofort und maschinenweit). ANBIETER 'ollama' ist ein EIGENER, ohne jeden Schluessel funktionierender Provider-Typ von Forge selbst (in 'forge provider list' unter OLLAMA gelistet, neben OpenAI, Anthropic, OpenRouter, LM_Studio, Llama.cpp und rund 30 weiteren) — 'forge config set model ollama {model}' fragt NUR beim ALLERERSTEN Mal interaktiv nach OLLAMA_SSL_SCHEME/OLLAMA_HOST/OLLAMA_PORT/API-Key (Menue- bzw. Texteingaben, mit Enter fuer den Vorgabewert 'http' und leerer Eingabe fuer 'kein Schluessel' beantwortet); danach steht der Anbieter in ~/.forge/.credentials.json und jeder weitere Aufruf laeuft ohne Rueckfrage durch — siehe configFiles. READY: die Eingabezeile ist EINZEILIG und beginnt mit einem Nerd-Font-Symbol aus dem Private-Use-Bereich (U+F013E, UTF-8 vierbyte-kodiert; kein Rahmen, kein Platzhaltertext dahinter — im LEEREN Zustand steht dort NUR das Symbol, sonst nichts), deshalb readyPattern '^e'. Nachgerechnet mit demselben grep -E, den pi-worker benutzt: das Muster trifft die Zeile in allen DREI gemessenen Zustaenden (leer: nur das Symbol; getippt: Symbol + Leerzeichen + Text, auch mehrzeilig eingefuegter Text bleibt auf der ERSTEN Zeile hinter dem Symbol und die Folgezeilen tragen KEIN Symbol, siehe promptPattern-Anmerkung; waehrend der Antwort: wieder nur das Symbol, waehrend darueber '⠏ Forging/Contemplating/Processing NNs · Ctrl+C to interrupt' steht) — und es trifft NICHT den Bannerbildschirm beim Start (Initialisierung dauert unter 0,2 s, in 0,1-s-Schritten abgetastet: bei 0,1 s noch kein Symbol, ab 0,2 s durchgehend da) und NICHT die beiden Erststart-Dialoge von 'forge provider login'/'forge config set model' (Menueauswahl mit '❯'/'▌' bzw. Textfragen '? Enter …' — ein voellig anderes, nicht-Symbol-basiertes Layout, nachgemessen an den aufgezeichneten Bildschirmen dieser beiden Dialoge). promptPattern ist DASSELBE Muster wie readyPattern: die Absende-Pruefung von pi-worker nimmt die LETZTE Zeile, auf die es passt, und weil nur die ERSTE Zeile eines mehrzeiligen Einfuegens das Symbol traegt, waehlt 'grep -E … | tail -1' bei getipptem Text richtig genau diese eine Zeile — anders als bei nanocoder (wo '^┃' allein die leere Randzeile getroffen haette) gibt es hier keine zweite, tiefere Zeile mit demselben Anfangszeichen, also auch keine Notwendigkeit fuer ein engeres Muster oder promptIgnore. KEIN VERTRAUENSDIALOG: ein foellig neues, nie gesehenes Arbeitsverzeichnis startete ohne jede Rueckfrage direkt in die Eingabezeile (gemessen). KEINE FREIGABE-RUECKFRAGEN: ein Auftrag, der ausdruecklich ein Werkzeug zum Anlegen einer Datei verlangte, wurde OHNE jede Bestaetigung ausgefuehrt (Datei stand danach mit dem verlangten Inhalt da) — Forge ist also von Haus aus autonom, autonomy.args bleibt leer und es gibt keinen erkennbaren Gegenschalter in der Hilfe ('-r/--restricted' steht zwar in einer aelteren README-Fassung, taucht aber in 'forge --help' 2.13.21 nicht mehr auf; 'restricted = false' als Konfigurationswert wurde nicht angetastet, weil seine Wirkung nicht gemessen ist).",
@@ -1926,6 +2566,14 @@
         "modellQuelle": "befehl:forge list model --porcelain (nur ollama-Modelle bei aktueller Konfiguration)",
         "nutzungQuelle": "datei:~/.forge/.credentials.json (einziger Eintrag 'ollama', kein 'forge_services')",
         "notiz": "forge provider list zeigt ~30 eingebaute Provider-Typen inkl. eines eigenen gehosteten Kontos 'forge_services' (api.forgecode.dev) -- auf dieser Werkbank ist NICHTS davon eingerichtet, nur Ollama. 'forge info'/'forge config' brauchen ein echtes TTY."
+      },
+      "inbox": {
+        "weg": "",
+        "grund": "Nur Start-Argumente (-e, --conversation-id), kein Kanal in eine laufende Sitzung.",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; forge --help (2.13.21)."
+        }
       }
     },
     {
@@ -1987,6 +2635,28 @@
           "beleg": "selbst gemessen mit jcode v0.72.0, eigener tmux-Socket, eigenes HOME und eigenes TMPDIR, Start wie beim echten Spawn (jcode -p ollama -m qwen3:1.7b, JCODE_NO_TELEMETRY=1, JCODE_NO_MENUBAR=1). Waehrend das TUI im Pane zeichnete (alternate_on=1 vor UND nach der Anfrage), lief daneben ein eigener Prozess 'jcode --provider ollama --model qwen3:1.7b serve' und hielt die Sockets jcode.sock und jcode-debug.sock unter TMPDIR. Die Anfrage 'jcode debug --socket <TMPDIR>/jcode.sock sessions' antwortete mit einer JSON-Liste der laufenden Sitzungen: session_id, status 'ready', is_processing, model, provider, token_usage und swarm_id (das Arbeitsverzeichnis) — daher die Zuordnung ueber cwd. OHNE JCODE_DEBUG_CONTROL=1 lehnt derselbe Aufruf ab ('Debug control is disabled'). Damit ist jcode nach opencode der ZWEITE gemessene Fall 'Server neben dem TUI'. NEBENBEFUND, der in einen Test gehoert: der TUI-Start registriert einen launchd-Dienst com.jcode.hotkey in der echten Benutzer-Domaene, auch bei umgelenktem HOME. Sein Anwendungslog ~/.jcode/logs/jcode-*.log bleibt, was es war: ein Betriebslog ohne Rolle und Text (11.08. geprueft)."
         }
       },
+      "toolAdapter": {
+        "mcp": {
+          "weg": "leer",
+          "grund": "kein MCP-Client; Zugriff ueber CLI wb-hub call geplant (Hub-Spur H3)"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "jcode hat keinen Hook-Mechanismus laut --help (Inventur, Plan 2.3)"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "jcode hat keinen Befehls- oder Prompt-Ordner laut --help (Inventur)"
+        },
+        "plugins": {
+          "weg": "leer",
+          "grund": "jcode hat keine Plugin-Schnittstelle laut --help (Inventur, Plan 2.3)"
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "jcode-Rechte laufen je Aufruf ueber das Registry-Flag --tools, kein Konfigurationsziel (Plan Abschnitt 2 Tabelle)"
+        }
+      },
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
@@ -2007,6 +2677,14 @@
         "modellQuelle": "",
         "nutzungQuelle": "befehl:jcode usage ('No connected providers') + befehl:jcode auth status (nennt je Provider die Pruefmethode selbst: presence check / timestamp check / composite probe)",
         "notiz": "Bestes Beispiel aller sieben Harnesses fuer verlaessliche Status-Abfrage -- eigens gebaute Befehle statt interpretierter Bildschirmtexte. Auf dieser Werkbank aktuell nur lokales Ollama ueber -p ollama, kein Login. jcode ist Client/Server: nach einem Testlauf per pgrep bestaetigen, dass kein Hintergrundprozess zurueckbleibt."
+      },
+      "inbox": {
+        "weg": "",
+        "grund": "Kandidaten: `jcode transcript --mode send` (die Modi insert/append/replace deuten auf die Eingabezeile) und `jcode debug message` (braucht JCODE_DEBUG_CONTROL=1). Nicht gemessen: der TUI-Start registriert einen launchd-Dienst (com.jcode.hotkey), eine Messung veraendert die Live-Umgebung.",
+        "probe": {
+          "datum": "2026-09-29",
+          "beleg": "nicht gemessen; jcode transcript --help, jcode debug --help (0.72.0)."
+        }
       }
     }
   ],
@@ -2051,6 +2729,42 @@
       "contextWindow": 1000000
     },
     {
+      "id": "claude-opus-5-5",
+      "label": "Claude Opus 5.5",
+      "alias": "opus55",
+      "harness": "claude",
+      "provider": "claude-subscription",
+      "modelRef": "claude-opus-5-5",
+      "discoveredVersion": "2.1.280",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "xhigh",
+      "machines": [
+        "mac",
+        "peer"
+      ],
+      "workerClass": [
+        {
+          "class": "reasoning",
+          "effort": "xhigh",
+          "goodFor": "Komplexe Alltagsarbeit, mehrstufiges Debugging und Architektur."
+        },
+        {
+          "class": "review",
+          "effort": "high",
+          "goodFor": "Unabhaengiger Reviewer-Pass ueber fremde Arbeit."
+        }
+      ],
+      "goodFor": "Komplexe Alltagsarbeit, mehrstufiges Debugging und Architektur.",
+      "notFor": "Mechanische Kleinarbeit.",
+      "enabled": true,
+      "contextWindow": 200000,
+      "notes": "Mit Claude Code 2.1.280 lokal im Modellwaehler belegt. Die explizite [1m]-Variante wird separat automatisch entdeckt."
+    },
+    {
       "id": "claude-sonnet-5",
       "label": "Claude Sonnet 5",
       "alias": "sonnet5",
@@ -2085,6 +2799,42 @@
       "contextWindow": 1000000
     },
     {
+      "id": "claude-haiku-5-5",
+      "label": "Haiku 5.5",
+      "harness": "claude",
+      "provider": "claude-subscription",
+      "modelRef": "claude-haiku-5-5",
+      "roles": [
+        "worker"
+      ],
+      "machines": [
+        "mac",
+        "peer"
+      ],
+      "enabled": true,
+      "supportsEffort": true,
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "maxEffort": "high",
+      "defaultEffort": "medium",
+      "alias": "haiku55",
+      "contextWindow": 1000000,
+      "goodFor": "Mechanisch, eng und pruefbar: Rename, Config-Tweak, Format, Zusammenfassen, Klassifizieren, Logauszug, Nachschlagen im Repo.",
+      "notFor": "Mehrdatei-Coding, mehrstufige Terminalarbeit, Recherche mit Belegpflicht; nie unter Effort medium (frueher Abbruch, fertig ohne Pruefung).",
+      "workerClass": [
+        {
+          "class": "mechanisch",
+          "effort": "medium",
+          "goodFor": "Rename, Config-Tweak, Format, Zusammenfassen, ein offensichtlicher Fix; Auftrag verlangt echte Pruefung vor fertig."
+        }
+      ]
+    },
+    {
       "id": "claude-haiku-4-5",
       "label": "Claude Haiku 4.5",
       "alias": "haiku45",
@@ -2109,7 +2859,7 @@
         }
       ],
       "goodFor": "Rename, Config-Tweak, Format, ein offensichtlicher Fix.",
-      "notFor": "Alles mit Ambiguitaet; nur 200K Kontext.",
+      "notFor": "Abgeloest durch Haiku 5.5 (2026-10-09, regeln/vergabe.md 3a); nicht mehr spawnen. Alles mit Ambiguitaet; nur 200K Kontext.",
       "enabled": true
     },
     {
@@ -2159,8 +2909,8 @@
       ],
       "workerClass": [],
       "goodFor": "Nur auf ausdrueckliche des Nutzers Anweisung (Fable-Sperre 2026-07-12; Ausnahme fuer kundengerichtet-visuell am 2026-07-29 aufgehoben).",
-      "notFor": "Standard-Coding, Internes, Visuelles fuer den Nutzer selbst — UND seit 2026-07-29 auch kundengerichtete visuelle Deliverables (dafuer jetzt opus5:xhigh).",
-      "enabled": true,
+      "notFor": "Seit 2026-09-23 gar nicht mehr (der Nutzer: Opus 5.5 schlaegt Fable 5.1; Websites an opus:high).",
+      "enabled": false,
       "contextWindow": 1000000,
       "notes": "ABGELOEST 2026-09-02: Fable 5 durch Fable 5.1 ersetzt (Anweisung des Nutzers, 'Fable 5 soll nicht mehr verwendet werden'). Der alte Alias fable5 ist mit dem Wechsel ENTFALLEN -- die Registry kennt keine Zweitaliase, nur fable51 loest auf (nachgemessen 2026-09-05: 'wb-state models resolve fable5' meldet 'nicht registriert'). FABLE-SPERRE und Effort-Deckel high gelten unveraendert. | "
     },
@@ -2189,9 +2939,10 @@
           "goodFor": "Token-freier lokaler Coder; Bulk, Inventur, DSGVO, Overnight. Nicht mehr Default (siehe qwen3.8)."
         }
       ],
-      "goodFor": "Token-freier lokaler Coder, 256K Kontext NUR ueber pi (gemessen 2026-08-15: ollama-Variante 'ornith:35b-256k' mit eingebranntem num_ctx=262144, 100% GPU, kein Spill; die globale Ollama-Vorgabe bleibt 65536 fuer alle anderen Programme, siehe regeln/lokale-modelle.md): Bulk, Inventur, DSGVO-kritische Arbeit und Overnight-Laeufe. Daten verlassen die Maschine nie. Seit 2026-08-11 nicht mehr Default-Coder — den Rang hielt zwischenzeitlich 'grug' (gemessen schneller im Einzelstrom und in der Nebenlaeufigkeit, siehe regeln/lokale-modelle.md und [[messung-2026-08-11-lokale-coder-grug-kat-ornith]]), seit 2026-08-19 traegt ihn qwen3.8 (Entscheidung des Nutzers, eigene Messung steht noch aus). ornith bleibt bestehen und waehlbar.",
+      "goodFor": "Token-freier lokaler Coder, 256K Kontext NUR ueber pi (gemessen 2026-08-15: ollama-Variante 'ornith:35b-256k' mit eingebranntem num_ctx=262144, 100% GPU, kein Spill; die globale Ollama-Vorgabe bleibt 65536 fuer alle anderen Programme, siehe regeln/lokale-modelle.md): Bulk, Inventur, DSGVO-kritische Arbeit und Overnight-Laeufe. Daten verlassen die Maschine nie. Seit 2026-08-11 nicht mehr Default-Coder — den Rang hielt zwischenzeitlich 'grug' (gemessen schneller im Einzelstrom und in der Nebenlaeufigkeit, siehe regeln/lokale-modelle.md und [[messung-2026-08-11-lokale-coder-grug-kat-ornith]]), seit 2026-08-19 traegt ihn qwen3.8 (Entscheidung des Nutzers, eigene Messung steht noch aus). ornith-35b ist abgeschaltet; ornith9 bleibt waehlbar. Der Ersatz fuer lokale Arbeit ist qwen38 ueber Splash.",
       "notFor": "Latenzkritisches — laeuft langsamer als jede Cloud-Spur.",
-      "enabled": true,
+      "enabled": false,
+      "disabledReason": "Modell am 30.09.2026 gelöscht (Speicher)",
       "supportsEffort": true,
       "notes": "pi reicht --thinking an ornith weiter, deshalb supportsEffort=true trotz lokalem Provider."
     },
@@ -2219,17 +2970,74 @@
           "goodFor": "Token-freier lokaler Coder (MLX 4bit); Bulk, Inventur, DSGVO, Overnight. Nicht mehr Default (siehe qwen3.8)."
         }
       ],
-      "goodFor": "Token-freier lokaler Coder (MLX 4bit), weiterhin waehlbar -- Default-Rang seit 2026-08-19 bei qwen3.8 (Entscheidung des Nutzers; dieselbe Bauform, eigene Durchsatzmessung steht dort noch aus). Bis 2026-08-19 Default-Coder, dicht, hybride Attention (qwen3_5), 128K Kontext seit 2026-08-15 (errechnet aus KV-Bedarf, NICHT lastgetestet -- Kernel-Panik-Historie bei GPU-Speichermangel, siehe regeln/lokale-modelle.md), winziger KV-Bedarf (0,0625 MiB/Token, drei von vier Lagen rekurrent). Gemessen (dod-judge/pruef3, 50 Faelle): 17,7 Tok/s im Einzelstrom, Nebenlaeufigkeitskurve 14,8/21,1/28,1/28,1/23,9 Tok/s bei 1/2/4/8/16 gleichzeitigen Anfragen, Trefferquote 49/50. Schlaegt Ollama (15,3 Tok/s, serialisiert: 7,5/7,0/6,8 bei steigender Last) und llama.cpp (14,1 Tok/s, 45/50 Trefferquote) auf beiden Achsen. Details: [[messung-2026-08-11-lokale-coder-grug-kat-ornith]].",
+      "goodFor": "Geloeschtes Mac-Modell, abgeschaltet. Ersatz fuer lokale Coding-Arbeit ist qwen38 ueber Splash; der MLX-Weg bleibt ausdruecklich qwen38mlx. (Entscheidung des Nutzers; dieselbe Bauform, eigene Durchsatzmessung steht dort noch aus). Bis 2026-08-19 Default-Coder, dicht, hybride Attention (qwen3_5), 128K Kontext seit 2026-08-15 (errechnet aus KV-Bedarf, NICHT lastgetestet -- Kernel-Panik-Historie bei GPU-Speichermangel, siehe regeln/lokale-modelle.md), winziger KV-Bedarf (0,0625 MiB/Token, drei von vier Lagen rekurrent). Gemessen (dod-judge/pruef3, 50 Faelle): 17,7 Tok/s im Einzelstrom, Nebenlaeufigkeitskurve 14,8/21,1/28,1/28,1/23,9 Tok/s bei 1/2/4/8/16 gleichzeitigen Anfragen, Trefferquote 49/50. Schlaegt Ollama (15,3 Tok/s, serialisiert: 7,5/7,0/6,8 bei steigender Last) und llama.cpp (14,1 Tok/s, 45/50 Trefferquote) auf beiden Achsen. Details: [[messung-2026-08-11-lokale-coder-grug-kat-ornith]].",
       "notFor": "Latenzkritisches — laeuft langsamer als jede Cloud-Spur. Braucht vor dem Start 20 GB freien Speicher (grug-server ensure prueft das) und laeuft nicht dauerhaft — bewusst kein LaunchAgent, damit Bild-/Videoerzeugung denselben Speicher weiter bekommt.",
-      "enabled": true,
+      "enabled": false,
+      "disabledReason": "Modell am 30.09.2026 gelöscht (Speicher)",
       "supportsEffort": true,
-      "notes": "Server bedarfsweise ueber grug-server, seit 2026-08-19 ein duenner Vorspann auf wb-mlx-server ensure grug (shell/wb-mlx-server -- ein Server fuer mehrere MLX-Modelle, grug und qwen3.8 teilen sich Port 8081, immer nur eines geladen), gestartet via wb-nohup auf Port 8081; davor sitzt seit 2026-08-13 wb-modell-proxy auf 8080, der bei der ersten Anfrage selbst hochfaehrt und nach 20 Minuten Leerlauf das tatsaechlich laufende Modell wieder stoppt. pi-worker ruft grug-server ensure automatisch auf, wenn 'grug' gewaehlt wird, und bricht ab, wenn der Server nicht bereit wird. supportsEffort=true, weil pi --thinking als eigenen CLI-Schalter annimmt -- GEMESSEN 2026-08-19 (an qwen38-27b, selber Provider mlx-lokal): pi gibt --thinking NICHT als chat_template_kwargs/reasoning_effort an den Server weiter, der Anfragekoerper im DEBUG-Log von mlx_lm.server enthaelt dieses Feld nicht. Ob grugs eigene Chat-Vorlage ohne gesetzten Wert ebenfalls eine teure Vorgabe waehlt wie bei qwen3.8 (dort xhigh, siehe qwen38-27b), ist fuer grug NICHT gemessen. Nur auf dem Mac installiert (MLX/Metal, unified memory) — nicht auf peer (CUDA).",
+      "notes": "Server bedarfsweise ueber grug-server, seit 2026-08-19 ein duenner Vorspann auf wb-mlx-server ensure grug (shell/wb-mlx-server -- ein Server fuer mehrere MLX-Modelle, der Legacy-grug-Weg ist deaktiviert; qwen38mlx bleibt ein eigener MLX-Weg), gestartet via wb-nohup auf Port 8081; davor sitzt seit 2026-08-13 wb-modell-proxy auf 8080, der bei der ersten Anfrage selbst hochfaehrt und nach 20 Minuten Leerlauf das tatsaechlich laufende Modell wieder stoppt. Der fruehere grug-Startweg ist deaktiviert; das Kuerzel grug wird auf qwen38 ueber Splash umgelenkt. supportsEffort=true, weil pi --thinking als eigenen CLI-Schalter annimmt -- GEMESSEN 2026-08-19 (an qwen38-27b, selber Provider mlx-lokal): pi gibt --thinking NICHT als chat_template_kwargs/reasoning_effort an den Server weiter, der Anfragekoerper im DEBUG-Log von mlx_lm.server enthaelt dieses Feld nicht. Ob grugs eigene Chat-Vorlage ohne gesetzten Wert ebenfalls eine teure Vorgabe waehlt wie bei qwen3.8 (dort xhigh, siehe qwen38-27b), ist fuer grug NICHT gemessen. Nur auf dem Mac installiert (MLX/Metal, unified memory) — nicht auf peer (CUDA).",
       "gewichteGb": 14.09
     },
     {
       "id": "qwen38-27b",
-      "label": "qwen3.8-27b Basis (lokal, MLX 4bit, MTP-Kopf an)",
+      "label": "qwen3.8-27b Basis (lokal, Splash, DFlash-2-Entwerfer)",
       "alias": "qwen38",
+      "harness": "pi",
+      "provider": "splash-lokal",
+      "modelRef": "incoai/Qwen3.8-27B-Splash",
+      "splashModel": "mlx-community/Qwen3.8-27B-4bit",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "xhigh",
+      "contextWindow": 262144,
+      "machines": [
+        "mac"
+      ],
+      "gewichteGb": 16.2,
+      "chatTemplateArgs": {
+        "reasoning_effort": "high"
+      },
+      "workerClass": [
+        {
+          "class": "bulk",
+          "effort": "medium",
+          "goodFor": "Token-frei; Bulk, Inventur, DSGVO, Overnight."
+        },
+        {
+          "class": "mechanisch",
+          "effort": "medium",
+          "goodFor": "Umbenennungen, Formatierung, Mehrdatei-Muster -- token-frei statt Kontingent."
+        },
+        {
+          "class": "coding-kurz",
+          "effort": "high",
+          "goodFor": "ERSTE WAHL fuer kurze, klar umrissene Coding-Auftraege (der Nutzer, 2026-08-27: 'immer wenn moeglich Qwen3.8 lokal nehmen, wenn es fuer eine Aufgabe gut genug ist, und sonst erst auf ein Cloud-Modell zugreifen'). Einordnung: Artificial Analysis gibt dem Modell Intelligence-Index 52,0 gegenueber 63,1 fuer Claude Opus 5 und 57,5 fuer glm-5.3-flash -- fremde Messung, von uns nicht nachgemessen."
+        },
+        {
+          "class": "recherche",
+          "effort": "medium",
+          "goodFor": "Auslesen und Vorsortieren, wo die Daten die Maschine nicht verlassen sollen."
+        }
+      ],
+      "goodFor": "KONTEXT: Vorgabe 131072 (Empfehlung), 64K die Stufe darunter, 32K nur fuer Mini-Aufgaben; das volle Fenster 262144 ist erlaubt und gemessen lauffaehig (191.361 Token in 958 s) — `pi-worker --kontext 262144 <name> qwen38 ...`. EFFORT: immer die hoechste Stufe (xhigh), ohne ausdrueckliche Angabe setzt sie der Start selbst. VORGABE-EFFORT xhigh (der Nutzer 2026-09-20: 'die Regel fuer Qwen ist, dass Effort-Level immer auf dem hoechsten steht'). VORGABEWEG SEIT 2026-09-20 (Entscheidung des Nutzers nach eigener Messung): laeuft über Splash, nicht mehr über MLX. Gemessen auf dem M5 Pro, Netzbetrieb: kurze Aufgaben 33,1 -> 76,4 Tok/s, lange Eingabe 24,0 -> 63,1 Tok/s, vier Stroeme 38,6 -> 108,3 Tok/s gesamt, gecachter 12K-Kontext 0,22 s statt 54,6 s bis zum ersten Token. SIEHT: nimmt Bild UND Video auf (config.json fuehrt vision_config, image_token_id, video_token_id). Damit kann das lokale Modell etwas, das Claude Opus nicht kann -- bei visuellen Aufgaben also erst recht hier anfangen. VORGABE-MODELL für Worker (der Nutzer, 2026-08-27): erst pruefen, ob Qwen3.8 lokal für die Aufgabe reicht; ein Cloud-Modell kommt erst, wenn es das nicht tut. Token-frei, kein Kontingent, kein Datenabfluss -- der Punkt wiegt schwer, seit am 25.08. beim Vermessen freier Cloud-Modelle echte Projektdaten abgeflossen sind. Token-freier Default-Coder seit 2026-08-19 (Entscheidung des Nutzers, siehe GEMEINSAME-FAKTEN.md / Auftrag A-C 'lokales Modell als Orchestrator + waehlbares Kontextfenster'), Ersatz fuer geloeschte Mac-Coder grug und ornith:35b; Standardweg ist Splash. Dieselbe Bauform wie grug-27b-mlx-q4 (config.json: model_type qwen3_5, Qwen3_5ForConditionalGeneration, 4bit/group_size 64, 64 Lagen, full_attention_interval 4 -- 16 volle Attention-Lagen, num_key_value_heads 4, head_dim 256) -- also derselbe KV-Bedarf je Token (0,0625 MiB, angenommen aus der Architektur, nicht lastgetestet, siehe wb-belegung kv liste 'qwen38-27b-mlx-4bit'). 262144 Kontext-Token nativ (max_position_embeddings). Gewichte rund 16,05 GB (drei safetensors-Dateien). GEMESSEN am echten Gardener-Extraktionspfad (dieselben 15 Einheiten, vier gleichzeitige Buendel, 2026-08-15/16, Laeufe unter ~/Knowledge/_meta/messungen/strecken/modellvergleich/laeufe/2026-08-15-*.json, siehe gardener/dream/config.py Zeilen 388-414): mit Denkstufe 'low' (Gardeners gewaehlte Einstellung) 129 gefundene Aussagen bei 62,2 s/Einheit, 36,7 Tok/s, Ablehnungsquote des Zitattors nur 19,4 % (gegen 31,1 % bei grug); mit Denken aus 99 Aussagen bei 29,5 s/Einheit, 37,0 Tok/s, Ablehnungsquote 31,7 %. Rechengeschwindigkeit praktisch gleich wie grug (37 Tok/s) -- qwen3.8 findet WENIGER Aussagen, ist aber je gefundener Aussage deutlich belastbarer, und langsamer je Einheit, weil es mit Denkstufe 'low' mehr schreibt. Gardener wechselte deshalb am 16.08.2026 von grug auf qwen3.8 (mit reasoning_effort='low') als Extraktionsmodell.",
+      "notFor": "Latenzkritisches -- laeuft langsamer als jede Cloud-Spur (Erwartung, nicht eigens gemessen). Braucht vor dem Start 20 GB freien Speicher (wb-mlx-server ensure prueft das) und laeuft nicht dauerhaft -- bewusst kein LaunchAgent, damit Bild-/Videoerzeugung denselben Speicher weiter bekommt. DENKSTUFEN-FALLE (GEMESSEN 2026-08-19, siehe gardener/dream/config.py Zeilen 415-420): ohne gesetzten reasoning_effort waehlt Qwen3.8s eigene Chat-Vorlage xhigh, und eine einzelne Anfrage kann dann ueber 28 Minuten statt rund einer Minute brauchen. pi gibt --thinking NICHT an den Server weiter (gemessen: der Anfragekoerper im DEBUG-Log von mlx_lm.server enthaelt kein chat_template_kwargs/reasoning_effort-Feld) -- wb-mlx-server setzt deshalb serverseitig chatTemplateArgs={\"reasoning_effort\":\"low\"} aus diesem Registry-Eintrag (--chat-template-args beim Start von mlx_lm.server), unabhaengig davon, was der Aufrufer schickt. Nicht fuer lange mehrstufige Arbeit mit Zweideutigkeit und nicht fuer Design-Deliverables; dort bleibt ein grosses Cloud-Modell die richtige Wahl. Und nie neben einem zweiten grossen Modell starten: 48 GB gemeinsamer Speicher, vorher check-resources.",
+      "enabled": true,
+      "supportsEffort": true,
+      "notes": "Server bedarfsweise über 'wb-splash-server ensure qwen38' (shell/wb-splash-server, Port 8000). Splash bringt Entwerfer (DFlash 2), KV-Verwaltung und Kontextgrenze selbst mit: es gibt KEINEN Vorhersageweg zu wählen und keine Kontextstufe zu buchen. Speicher: die Gewichte liegen speicherabgebildet vor, waehrend einer Anfrage belegt der Motor einen gemessenen festen Arbeitssatz von rund 14,6 GiB (unabhaengig von der Promptlaenge, gemessen 2026-09-20). MLX-Rückfall: qwen38-27b-mlx. NUR MAC -- auf peer gibt es Splash nicht.",
+      "buendelung": {
+        "motor": "vllm-metal",
+        "venv": "$HOME/.venv-vllm-metal",
+        "metalFraktion": 0.5,
+        "umschlagpunktStroeme": 2,
+        "herkunft": "Zweiter Motor neben MTPLX, Entscheidung des Nutzers vom 20.08.2026: MTPLX bleibt der Standard fuer den einzelnen Strom, vllm-metal uebernimmt, sobald mehrere lokale Worker gleichzeitig laufen. GEMESSEN (Worker 'nebenlauf', 2026-08-20, qwen38-27b-mlx-4bit, 200 Token je Anfrage, temperature 0, Denkstufe low, --max-model-len 2048, VLLM_METAL_MEMORY_FRACTION=0.5; Gesamtdurchsatz Tok/s): 17,22 / 32,63 / 53,81 / 59,44 / 66,68 bei 1 / 2 / 4 / 8 / 16 Stroemen, gegen 16,44 / 30,49 / 51,99 / 54,56 / 63,52 bei mlx_lm.server -- auf JEDER Stufe vorn, auch im Einzelstrom. MTPLX bleibt intern seriell (31,5 / 31,3 / 30,2 bei 1 / 2 / 4) und ist unter zwei Stroemen mit Abstand schneller; der Umschlagpunkt liegt rechnerisch bei 1,89 Stroemen und damit ganzzahlig bei zwei, wo vllm-metal mit 32,63 gegen 31,3 Tok/s gesamt und 16,32 gegen 15,65 je Worker auf beiden Achsen vorn liegt (Herleitung im Quelltext bei VLLM_UMSCHLAGPUNKT_STROEME in shell/wb-mlx-server). FALLE, die in derselben Tabelle steht: bei ZWOELF Stroemen faellt der Durchsatz auf 52,89 zurueck, unter die 59,44 bei acht, bevor er bei sechzehn auf 66,68 springt -- derselbe Knick wie bei mlx_lm.server (50,51 bei zwoelf). Der Deckel (--max-num-seqs) rastet deshalb auf acht bzw. sechzehn ein und liegt nie dazwischen. KEINE VORHERSAGE ueber diesen Motor: MTP ist dort nur fuer Gemma4 gebaut, ein Entwurfsmodell wird bei gemischten Lagentypen abgewiesen (draft_model_proposer.py:585-614, und die ganze Qwen3.5/3.6/3.8-Familie ist hybrid), und n-Gramm stirbt beim ersten Dekodierschritt mit 'NotImplementedError: Speculative decode verification is not supported for hybrid GDN models on Metal yet.' -- deshalb ein eigenes Feld neben 'vorhersage' und nicht darin. GUETE ist fuer diesen Wechsel ausdruecklich NICHT gemessen und das ist keine Luecke: es sind dieselben Gewichte ueber denselben MLX-Kern, gierig dekodiert; nur die Schicht darueber und damit die Geschwindigkeit aendert sich. SPEICHER: VLLM_METAL_MEMORY_FRACTION bezieht sich auf Metals max_recommended_working_set_size (42,0 GiB), NICHT auf die 48 GiB der Maschine -- mit 0,5 blieb der ganze Prozess gemessen unter 21 GiB. wb-belegung bucht genau dieses Budget (--metal-fraktion). WARNUNG: der Motor setzt beim Start 'Set Metal wired_limit to 42.0 GB', auch bei kleiner Fraktion -- genau der Hebel aus der Kernel-Panik vom 11.08.; wer die Fraktion erhoeht, muss das wissen. NACHGEMESSEN am 21.08.2026 (Worker 'motor', beide Motoren selbst gefahren, je ein frisch gestarteter Server ueber wb-mlx-server ensure, --kontext 2048, 200 Token je Anfrage, temperature 0): MTPLX 28,63 / 30,57 / 29,65 gegen vllm-metal 17,25 / 32,59 / 54,47 Tok/s bei 1 / 2 / 4 Stroemen -- derselbe Schnittpunkt (1,87 statt 1,89), dieselbe Schwelle bei zwei, und bei vier Stroemen fast das Doppelte."
+      }
+    },
+    {
+      "id": "qwen38-27b-mlx",
+      "label": "qwen3.8-27b Rückfallweg (lokal, MLX 4bit, MTP-Kopf)",
       "harness": "pi",
       "provider": "mlx-lokal",
       "modelRef": "$HOME/AI/mlx-models/qwen38-27b-mlx-4bit",
@@ -2238,18 +3046,18 @@
         "orchestrator"
       ],
       "maxEffort": "xhigh",
-      "defaultEffort": "medium",
+      "defaultEffort": "xhigh",
       "contextWindow": 262144,
       "machines": [
         "mac"
       ],
       "gewichteGb": 14.95,
       "chatTemplateArgs": {
-        "reasoning_effort": "low"
+        "reasoning_effort": "high"
       },
       "vorhersage": {
         "bauart": "entwerfer",
-        "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-MTP-4bit",
+        "modell": "$HOME/AI/mlx-models/qwen38-27b-mlx-4bit-mtp/mtp",
         "gewichteGb": 0.25,
         "herkunft": "STAND 2026-08-31: DER VORGABEWEG IST 'mtp-kopf', NICHT MTPLX. Wer nur diesen Herkunftstext liest, landet beim falschen Motor -- genau das ist am 31.08.2026 einem Orchestrator passiert, weil hier bis dahin 'Vorgabe/Standardwahl bleibt MTPLX Speed 4bit' stand. Massgeblich ist 'wegVorgabe' (= mtp-kopf) und die Vergleichstabelle in regeln/orchestrierung.md: der reine 247-MB-Kopf als separater Entwerfer, gefahren von mlx_vlm.server mit --draft-kind mtp --draft-block-size 3, ueber echte Worker gemessen mit 19,1/20,3 Tok/s kalt/warm und 256/245 s Wanduhr. MTPLX hat die hoehere Rate (22,3/22,8), braucht aber rund doppelt so viele Token fuer dieselbe Aufgabe und ist in der Wanduhr langsamer (394/315 s), bei 19,83 statt 0,25 GB Zusatzgewicht. NEBENLAEUFIGKEIT, GEMESSEN 2026-09-01 und ANDERS ALS EINEN TAG ZUVOR NOTIERT: der MTP-Kopf traegt mehrere Stroeme, ABER NUR OHNE KV-QUANTISIERUNG. Mit --kv-bits enden zwei gleichzeitige Anfragen in HTTP 500 ('tuple' object has no attribute 'shape', speculative_verifier.py:1269), weil die gebuendelte Aufmerksamkeit in language.py:827 an 'hasattr(cache, bits)' aussteigt und der Rueckfall dahinter quantisierte Keys nicht kennt. Weder --quantized-kv-start noch getrennte Key/Value-Bits helfen -- die Pruefung haengt am TYP des Caches. OHNE --kv-bits laeuft es bis vier Stroeme. Gemessen ueber wb-mlx-server (300 Token je Strom, gleiche Laenge erzwungen): 1 Strom 25,0 Tok/s, 2 Stroeme 41,6 gesamt / 20,8 je Strom -- also +66 Prozent, und je Strom faellt es kaum. Direkt am Server, zweiter Messsatz: 1: 20,2  2: 32,1  3: 31,2  4: 30,8 gesamt. Der Gewinn sitzt bei ZWEI; darueber bleibt die Gesamtrate stehen, und ab drei ist die Buendelung ohne Vorhersage besser (51,5). REGEL (der Nutzer, 01.09.2026): bei EINEM Strom bleibt die Quantisierung an, bei MEHREREN faellt sie weg -- wb-mlx-server macht das selbst und bucht den doppelten KV-Bedarf (0,0625 statt 0,0332 MiB/Token). -- Historie ab hier: Endgueltiger Sieger, gemessen 2026-08-20 (Worker 'nebenlauf', alle vier Kandidaten fertig gemessen, ruhige Maschine, temperature 0): MTPLX Speed 4bit ueber den eigenstaendigen mtplx-Motor (--scheduler-mode serial) liefert 31,5 Tok/s kurz / 35,8 Tok/s warm bei 4737 Prompt-Token und haelt dabei den Hausgrundwert bei der Guete (48/50 auf pruef3, in 392 statt 718 Sekunden) -- schneller UND gleich gut. Schlaegt DSpark-DimInfer (15,3 kalt/30,3 warm), DFlash2 (12,5/29,5) und den Betrieb ganz ohne Vorhersage (11,1/17,2). Die 8-Bit-Guetefassung (Qwen3.8-27B-MTPLX-Optimized-Quality, $HOME/AI/mlx-models/Qwen3.8-27B-MTPLX-Optimized-Quality) bringt KEINE messbare Guete gegenueber der 4-Bit-Fassung (dieselben 48/50), dafuer 8,6 GiB mehr Speicher (30,2 statt 21,6 GiB) und deutlich weniger Tempo (23,0 statt 31,5 Tok/s kurz, 24,9 statt 35,8 Tok/s warm). Entscheidung des Nutzers (2026-08-20): sie bleibt trotzdem als zweite, ausdruecklich waehlbare Moeglichkeit erhalten -- Vorgabe/Standardwahl bleibt MTPLX Speed 4bit, wer stattdessen die Quality-Fassung will, setzt 'vorhersage.modell' auf den Optimized-Quality-Pfad und kennt dann den Preis. Buendelung UND Vorhersage gibt es fuer dieses Modell architekturbedingt nicht (mtp_batch scheitert nach sieben erfuellten Bedingungen an QwenRowOwnedRouterConfigError) -- wb-mlx-server klemmt --parallel deshalb fest auf 1 fuer diesen Motor, bei beiden Koerpern.",
         "wegVorgabe": "mtp-kopf",
@@ -2259,6 +3067,8 @@
             "label": "MTPLX Speed 4bit (eingebauter Kopf)",
             "bauart": "eingebaut",
             "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-MTPLX-Optimized-Speed",
+            "enabled": false,
+            "disabledReason": "Modell am 30.09.2026 gelöscht (Speicher)",
             "gewichteGb": 19.83,
             "herkunft": "Vorgabeweg. GEMESSEN 2026-08-20 (Worker 'nebenlauf', ruhige Maschine, temperature 0, 4737 Prompt-Token): 31,5 Tok/s kalt / 35,8 warm, Guete 48/50 auf pruef3 -- der schnellste Weg UND einer der beiden mit gemessener Guete. Vergleichswert ohne jede Vorhersage, gemessen im selben Lauf: 11,1 Tok/s kalt / 17,2 warm. Der Koerper traegt den Vorhersage-Kopf selbst und ERSETZT den schlichten Koerper beim Start; Buendelung gibt es ueber den mtplx-Motor architekturbedingt nicht (--parallel bleibt fest 1)."
           },
@@ -2267,6 +3077,8 @@
             "label": "DFlash2 (externer Entwerfer)",
             "bauart": "entwerfer",
             "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-DFlash2",
+            "enabled": false,
+            "disabledReason": "Modell am 30.09.2026 gelöscht (Speicher)",
             "gewichteGb": 3.58,
             "herkunft": "Zweiter Weg, Wahl des Nutzers vom 21.08.2026 ('ich will mich entscheiden koennen'). GEMESSEN 2026-08-20 (Worker 'nebenlauf'): 12,5 Tok/s kalt / 29,5 warm, Trefferquote 98 % auf pruef3 -- die BESTE Guete der vier Kandidaten, aber deutlich langsamer als MTPLX. Vergleichswert ohne jede Vorhersage, gemessen im selben Lauf: 11,1 Tok/s kalt / 17,2 warm. Der Entwerfer laeuft ueber mlx-dspark NEBEN dem Zielmodell, sein Gewicht kommt also zum Ziel hinzu (3,58 GiB, gemessen am safetensors dieses Ordners am 21.08.2026, Worker 'vorhersagewahl'). Die config.json traegt 'dflash_config' -- wb-mlx-server setzt deshalb '--mode dflash'.",
             "draftKind": "dflash"
@@ -2276,13 +3088,15 @@
             "label": "DSpark-DimInfer (externer Entwerfer)",
             "bauart": "entwerfer",
             "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-DSpark-DimInfer",
+            "enabled": false,
+            "disabledReason": "Modell am 30.09.2026 gelöscht (Speicher)",
             "gewichteGb": 3.46,
             "herkunft": "Dritter Weg, Wahl des Nutzers vom 21.08.2026. GEMESSEN 2026-08-20 (Worker 'nebenlauf'): 15,3 Tok/s kalt / 30,3 warm -- schneller als DFlash2, aber die GUETE IST FUER DIESEN KOERPER NICHT GEMESSEN, weder auf pruef3 noch sonstwo. Wer ihn waehlt, waehlt eine ungepruefte Trefferquote. Vergleichswert ohne jede Vorhersage, gemessen im selben Lauf: 11,1 Tok/s kalt / 17,2 warm. Der Entwerfer laeuft ueber mlx-dspark NEBEN dem Zielmodell, sein Gewicht kommt also zum Ziel hinzu (3,46 GiB, gemessen am safetensors dieses Ordners am 21.08.2026, Worker 'vorhersagewahl'). Die config.json traegt die DeepSpec-Felder oben -- mlx-dsparks eigene Erkennung greift, kein '--mode'."
           },
           {
             "id": "mtp-kopf",
             "bauart": "entwerfer",
-            "modell": "$HOME/AI/mlx-models/Qwen3.8-27B-MTP-4bit",
+            "modell": "$HOME/AI/mlx-models/qwen38-27b-mlx-4bit-mtp/mtp",
             "gewichteGb": 0.25,
             "motor": null,
             "herkunft": "VORGABEWEG seit 2026-08-27. Der reine MTP-Kopf aus den Qwen3.8-Gewichten (config.json: model_type qwen3_5_mtp, 247 MB) als SEPARATER Entwerfer zum gewoehnlichen Modellkoerper -- im Unterschied zum Weg 'mtplx', der einen eigenen 20-GB-Koerper mit eingebautem Kopf laedt. GEMESSEN ueber echte Worker (nicht am Server allein): 19,1 Tok/s kalt / 20,3 warm, Wanduhr 256 s kalt / 245 s warm -- der schnellste Weg zum fertigen Ergebnis bei 0,25 GB Zusatzgewicht. Die Vergleichstabelle aller vier Wege steht in regeln/orchestrierung.md. NEBENLAEUFIGKEIT, GEMESSEN 2026-09-01 und ANDERS ALS EINEN TAG ZUVOR NOTIERT: der MTP-Kopf traegt mehrere Stroeme, ABER NUR OHNE KV-QUANTISIERUNG. Mit --kv-bits enden zwei gleichzeitige Anfragen in HTTP 500 ('tuple' object has no attribute 'shape', speculative_verifier.py:1269), weil die gebuendelte Aufmerksamkeit in language.py:827 an 'hasattr(cache, bits)' aussteigt und der Rueckfall dahinter quantisierte Keys nicht kennt. Weder --quantized-kv-start noch getrennte Key/Value-Bits helfen -- die Pruefung haengt am TYP des Caches. OHNE --kv-bits laeuft es bis vier Stroeme. Gemessen ueber wb-mlx-server (300 Token je Strom, gleiche Laenge erzwungen): 1 Strom 25,0 Tok/s, 2 Stroeme 41,6 gesamt / 20,8 je Strom -- also +66 Prozent, und je Strom faellt es kaum. Direkt am Server, zweiter Messsatz: 1: 20,2  2: 32,1  3: 31,2  4: 30,8 gesamt. Der Gewinn sitzt bei ZWEI; darueber bleibt die Gesamtrate stehen, und ab drei ist die Buendelung ohne Vorhersage besser (51,5). REGEL (der Nutzer, 01.09.2026): bei EINEM Strom bleibt die Quantisierung an, bei MEHREREN faellt sie weg -- wb-mlx-server macht das selbst und bucht den doppelten KV-Bedarf (0,0625 statt 0,0332 MiB/Token). ",
@@ -2315,11 +3129,11 @@
           "goodFor": "Auslesen und Vorsortieren, wo die Daten die Maschine nicht verlassen sollen."
         }
       ],
-      "goodFor": "SIEHT: nimmt Bild UND Video auf (config.json fuehrt vision_config, image_token_id, video_token_id). Damit kann das lokale Modell etwas, das Claude Opus nicht kann -- bei visuellen Aufgaben also erst recht hier anfangen. VORGABE-MODELL fuer Worker (der Nutzer, 2026-08-27): erst pruefen, ob Qwen3.8 lokal fuer die Aufgabe reicht; ein Cloud-Modell kommt erst, wenn es das nicht tut. Token-frei, kein Kontingent, kein Datenabfluss -- der Punkt wiegt schwer, seit am 25.08. beim Vermessen freier Cloud-Modelle echte Projektdaten abgeflossen sind. Token-freier Default-Coder seit 2026-08-19 (Entscheidung des Nutzers, siehe GEMEINSAME-FAKTEN.md / Auftrag A-C 'lokales Modell als Orchestrator + waehlbares Kontextfenster'), Nachfolger von grug (grug bleibt vollstaendig erhalten und waehlbar). Dieselbe Bauform wie grug-27b-mlx-q4 (config.json: model_type qwen3_5, Qwen3_5ForConditionalGeneration, 4bit/group_size 64, 64 Lagen, full_attention_interval 4 -- 16 volle Attention-Lagen, num_key_value_heads 4, head_dim 256) -- also derselbe KV-Bedarf je Token (0,0625 MiB, angenommen aus der Architektur, nicht lastgetestet, siehe wb-belegung kv liste 'qwen38-27b-mlx-4bit'). 262144 Kontext-Token nativ (max_position_embeddings). Gewichte rund 16,05 GB (drei safetensors-Dateien). GEMESSEN am echten Gardener-Extraktionspfad (dieselben 15 Einheiten, vier gleichzeitige Buendel, 2026-08-15/16, Laeufe unter ~/Knowledge/_meta/messungen/strecken/modellvergleich/laeufe/2026-08-15-*.json, siehe gardener/dream/config.py Zeilen 388-414): mit Denkstufe 'low' (Gardeners gewaehlte Einstellung) 129 gefundene Aussagen bei 62,2 s/Einheit, 36,7 Tok/s, Ablehnungsquote des Zitattors nur 19,4 % (gegen 31,1 % bei grug); mit Denken aus 99 Aussagen bei 29,5 s/Einheit, 37,0 Tok/s, Ablehnungsquote 31,7 %. Rechengeschwindigkeit praktisch gleich wie grug (37 Tok/s) -- qwen3.8 findet WENIGER Aussagen, ist aber je gefundener Aussage deutlich belastbarer, und langsamer je Einheit, weil es mit Denkstufe 'low' mehr schreibt. Gardener wechselte deshalb am 16.08.2026 von grug auf qwen3.8 (mit reasoning_effort='low') als Extraktionsmodell.",
+      "goodFor": "RUECKFALLWEG seit 2026-09-20: gleicher Modellstand wie qwen38, aber über den alten MLX-Server (wb-mlx-server, Port 8081, Vorgabeweg mtp-kopf). Nur nehmen, wenn Splash ausfaellt oder ein Vergleich gemessen werden soll. SIEHT: nimmt Bild UND Video auf (config.json fuehrt vision_config, image_token_id, video_token_id). Damit kann das lokale Modell etwas, das Claude Opus nicht kann -- bei visuellen Aufgaben also erst recht hier anfangen. VORGABE-MODELL für Worker (der Nutzer, 2026-08-27): erst pruefen, ob Qwen3.8 lokal für die Aufgabe reicht; ein Cloud-Modell kommt erst, wenn es das nicht tut. Token-frei, kein Kontingent, kein Datenabfluss -- der Punkt wiegt schwer, seit am 25.08. beim Vermessen freier Cloud-Modelle echte Projektdaten abgeflossen sind. Token-freier Default-Coder seit 2026-08-19 (Entscheidung des Nutzers, siehe GEMEINSAME-FAKTEN.md / Auftrag A-C 'lokales Modell als Orchestrator + waehlbares Kontextfenster'), Ersatz fuer geloeschte Mac-Coder grug und ornith:35b; Standardweg ist Splash. Dieselbe Bauform wie grug-27b-mlx-q4 (config.json: model_type qwen3_5, Qwen3_5ForConditionalGeneration, 4bit/group_size 64, 64 Lagen, full_attention_interval 4 -- 16 volle Attention-Lagen, num_key_value_heads 4, head_dim 256) -- also derselbe KV-Bedarf je Token (0,0625 MiB, angenommen aus der Architektur, nicht lastgetestet, siehe wb-belegung kv liste 'qwen38-27b-mlx-4bit'). 262144 Kontext-Token nativ (max_position_embeddings). Gewichte rund 16,05 GB (drei safetensors-Dateien). GEMESSEN am echten Gardener-Extraktionspfad (dieselben 15 Einheiten, vier gleichzeitige Buendel, 2026-08-15/16, Laeufe unter ~/Knowledge/_meta/messungen/strecken/modellvergleich/laeufe/2026-08-15-*.json, siehe gardener/dream/config.py Zeilen 388-414): mit Denkstufe 'low' (Gardeners gewaehlte Einstellung) 129 gefundene Aussagen bei 62,2 s/Einheit, 36,7 Tok/s, Ablehnungsquote des Zitattors nur 19,4 % (gegen 31,1 % bei grug); mit Denken aus 99 Aussagen bei 29,5 s/Einheit, 37,0 Tok/s, Ablehnungsquote 31,7 %. Rechengeschwindigkeit praktisch gleich wie grug (37 Tok/s) -- qwen3.8 findet WENIGER Aussagen, ist aber je gefundener Aussage deutlich belastbarer, und langsamer je Einheit, weil es mit Denkstufe 'low' mehr schreibt. Gardener wechselte deshalb am 16.08.2026 von grug auf qwen3.8 (mit reasoning_effort='low') als Extraktionsmodell.",
       "notFor": "Latenzkritisches -- laeuft langsamer als jede Cloud-Spur (Erwartung, nicht eigens gemessen). Braucht vor dem Start 20 GB freien Speicher (wb-mlx-server ensure prueft das) und laeuft nicht dauerhaft -- bewusst kein LaunchAgent, damit Bild-/Videoerzeugung denselben Speicher weiter bekommt. DENKSTUFEN-FALLE (GEMESSEN 2026-08-19, siehe gardener/dream/config.py Zeilen 415-420): ohne gesetzten reasoning_effort waehlt Qwen3.8s eigene Chat-Vorlage xhigh, und eine einzelne Anfrage kann dann ueber 28 Minuten statt rund einer Minute brauchen. pi gibt --thinking NICHT an den Server weiter (gemessen: der Anfragekoerper im DEBUG-Log von mlx_lm.server enthaelt kein chat_template_kwargs/reasoning_effort-Feld) -- wb-mlx-server setzt deshalb serverseitig chatTemplateArgs={\"reasoning_effort\":\"low\"} aus diesem Registry-Eintrag (--chat-template-args beim Start von mlx_lm.server), unabhaengig davon, was der Aufrufer schickt. Nicht fuer lange mehrstufige Arbeit mit Zweideutigkeit und nicht fuer Design-Deliverables; dort bleibt ein grosses Cloud-Modell die richtige Wahl. Und nie neben einem zweiten grossen Modell starten: 48 GB gemeinsamer Speicher, vorher check-resources.",
       "enabled": true,
       "supportsEffort": true,
-      "notes": "Server bedarfsweise ueber wb-mlx-server ensure qwen38 (shell/wb-mlx-server, Nachfolger von grug-server -- ein Server fuer mehrere MLX-Modelle, grug und qwen3.8 teilen sich Port 8081, immer nur eines geladen), gestartet via wb-nohup; davor sitzt wb-modell-proxy auf 8080, der bei der ersten Anfrage selbst hochfaehrt und nach 20 Minuten Leerlauf wieder stoppt. supportsEffort=true, weil pi --thinking als eigenen CLI-Schalter annimmt -- GEMESSEN 2026-08-19: pi gibt --thinking NICHT als chat_template_kwargs/reasoning_effort an den mlx-lokal-Provider weiter (Anfragekoerper im DEBUG-Log von mlx_lm.server ohne dieses Feld). Die Denkintensitaet dieses Modells wird deshalb ausschliesslich ueber den Server-Start gesteuert, siehe chatTemplateArgs und die Denkstufen-Falle in notFor. Nur auf dem Mac installiert (MLX/Metal, unified memory) -- nicht auf peer (CUDA).",
+      "notes": "Server bedarfsweise über wb-mlx-server ensure qwen38 (shell/wb-mlx-server, Nachfolger von grug-server -- ein Server für mehrere MLX-Modelle, der Legacy-grug-Weg ist deaktiviert; qwen38mlx bleibt ein eigener MLX-Weg), gestartet via wb-nohup; davor sitzt wb-modell-proxy auf 8080, der bei der ersten Anfrage selbst hochfaehrt und nach 20 Minuten Leerlauf wieder stoppt. supportsEffort=true, weil pi --thinking als eigenen CLI-Schalter annimmt -- GEMESSEN 2026-08-19: pi gibt --thinking NICHT als chat_template_kwargs/reasoning_effort an den mlx-lokal-Provider weiter (Anfragekoerper im DEBUG-Log von mlx_lm.server ohne dieses Feld). Die Denkintensitaet dieses Modells wird deshalb ausschliesslich über den Server-Start gesteuert, siehe chatTemplateArgs und die Denkstufen-Falle in notFor. Nur auf dem Mac installiert (MLX/Metal, unified memory) -- nicht auf peer (CUDA).",
       "buendelung": {
         "motor": "vllm-metal",
         "venv": "$HOME/.venv-vllm-metal",
@@ -2457,8 +3271,8 @@
         }
       ],
       "goodFor": "Sehr schnelle, kurze Coding-Auftraege mit klarer Spezifikation. Eigener Codex-Spark-Kontingenttopf: zuerst fuer passende Text-Coding-Kleinarbeit pruefen, damit das allgemeine Codex-Kontingent frei bleibt.",
-      "notFor": "Lange, mehrstufige oder mehrdeutige Aufgaben; reine Texteingabe, daher keine Bildpruefung, Bildbearbeitung oder Computer-Use-Aufgabe mit sichtbarem Zustand.",
-      "enabled": true,
+      "notFor": "Von OpenAI am 2026-09-14 eingestellt (learn.chatgpt.com/docs/models); Ersatz codex-gpt-6-luna:low.",
+      "enabled": false,
       "notes": "Seit 2026-09-12 fuer Menschen voll waehlbar und fuer Agenten als schnelle Coding-Spur vorgesehen.",
       "updated": "2026-09-12T00:00:00Z"
     },
@@ -2668,7 +3482,8 @@
       ],
       "goodFor": "Mechanische Mehrdatei-Edits mit Git-Integration, token-frei ueber Ollama: Umbenennungen, Formatierung, wiederkehrende Muster ueber viele Dateien. Zeilen-REPL statt Vollbild-TUI, deshalb die robusteste Pane-Erkennung.",
       "notFor": "Recherche (kann kein Web), und alles, was Werkzeuge ausser Datei-Edits braucht.",
-      "enabled": true,
+      "enabled": false,
+      "disabledReason": "Modell am 30.09.2026 gelöscht (Speicher)",
       "notes": "modelRef in LiteLLM-Schreibweise (ollama/<id>), ungeprueft."
     },
     {
@@ -2840,6 +3655,187 @@
       "notes": "Seit 2026-09-12 Teil der kuratierten GPT-Worker-Auswahl. Kontingent ueber wb-kontingent."
     },
     {
+      "id": "codex-gpt-6-sol",
+      "label": "GPT-6 Sol",
+      "harness": "codex",
+      "provider": "chatgpt",
+      "modelRef": "gpt-6-sol",
+      "contextWindow": 272000,
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "medium",
+      "machines": [
+        "mac",
+        "peer"
+      ],
+      "workerClass": [
+        {
+          "class": "reasoning",
+          "effort": "xhigh",
+          "goodFor": "Lange oder mehrstufige GPT-Arbeit, Debugging und Ambiguitaet."
+        },
+        {
+          "class": "review",
+          "effort": "high",
+          "goodFor": "Unabhaengiger Gegenpass ueber Arbeit einer anderen Modellfamilie."
+        },
+        {
+          "class": "visuell",
+          "effort": "xhigh",
+          "goodFor": "Komplexe sichtbare Deliverables, Art Direction und visuelle Entscheidungen mit Bildpruefung."
+        },
+        {
+          "class": "bild",
+          "effort": "high",
+          "goodFor": "Anspruchsvolle Bildgenerierung oder Bildbearbeitung mit Komposition, Typografie, Referenzen und iterativer Sichtpruefung ueber das GPT-Bildwerkzeug."
+        },
+        {
+          "class": "computer",
+          "effort": "high",
+          "goodFor": "Mehrstufige Bedienung von Browsern und Apps mit sichtbarer Zustandspruefung, sofern Computer Use im Harness vorhanden ist."
+        },
+        {
+          "class": "recherche",
+          "effort": "high",
+          "goodFor": "Schwierige Recherche mit Synthese, widerspruechlichen Quellen oder fachlichem Urteil."
+        }
+      ],
+      "goodFor": "Vorgabemodell, sobald ein Mensch OpenAI Codex CLI als Orchestrator waehlt; lange und anspruchsvolle GPT-Arbeit, Recherche-Synthese, visuelle Leitung, Bildarbeit und mehrstufiges Computer Use.",
+      "notFor": "Kurze Routinearbeit, fuer die Spark, Luna oder Terra genuegen.",
+      "enabled": true,
+      "notes": "Nachfolger von codex-gpt-5-6-sol; ab Codex-CLI 0.156 verfügbar (geprüft 2026-09-23, Antwort ok). der Nutzer 2026-09-23: GPT-6 Sol und Luna statt 5.6 verwenden.",
+      "updated": "2026-09-23T00:00:00Z",
+      "nativeContextWindow": 1050000
+    },
+    {
+      "id": "codex-gpt-6-1-sol",
+      "label": "GPT-6.1 Sol",
+      "harness": "codex",
+      "provider": "chatgpt",
+      "modelRef": "gpt-6.1-sol",
+      "contextWindow": 272000,
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "medium",
+      "machines": [
+        "mac",
+        "peer"
+      ],
+      "workerClass": [
+        {
+          "class": "reasoning",
+          "effort": "xhigh",
+          "goodFor": "Lange oder mehrstufige GPT-Arbeit, Debugging und Ambiguitaet."
+        },
+        {
+          "class": "review",
+          "effort": "high",
+          "goodFor": "Unabhaengiger Gegenpass ueber Arbeit einer anderen Modellfamilie."
+        },
+        {
+          "class": "visuell",
+          "effort": "xhigh",
+          "goodFor": "Komplexe sichtbare Deliverables, Art Direction und visuelle Entscheidungen mit Bildpruefung."
+        },
+        {
+          "class": "bild",
+          "effort": "high",
+          "goodFor": "Anspruchsvolle Bildgenerierung oder Bildbearbeitung mit Komposition, Typografie, Referenzen und iterativer Sichtpruefung ueber das GPT-Bildwerkzeug."
+        },
+        {
+          "class": "computer",
+          "effort": "high",
+          "goodFor": "Mehrstufige Bedienung von Browsern und Apps mit sichtbarer Zustandspruefung, sofern Computer Use im Harness vorhanden ist."
+        },
+        {
+          "class": "recherche",
+          "effort": "high",
+          "goodFor": "Schwierige Recherche mit Synthese, widerspruechlichen Quellen oder fachlichem Urteil."
+        }
+      ],
+      "goodFor": "Vorgabemodell, sobald ein Mensch OpenAI Codex CLI als Orchestrator waehlt; lange und anspruchsvolle GPT-Arbeit, Recherche-Synthese, visuelle Leitung, Bildarbeit und mehrstufiges Computer Use.",
+      "notFor": "Kurze Routinearbeit, fuer die Spark, Luna oder Terra genuegen.",
+      "enabled": true,
+      "notes": "Seit 2026-10-10 (Vorab-Eintrag, WorkbenchOrchestrator): Nachfolger von codex-gpt-6-sol. Braucht codex-cli >= 0.162.1 (unter 0.157.1 fehlt das Modell im Katalog); am 10.10. mit einer Probe-Installation per codex exec -m gpt-6.1-sol geprueft (Antwort ok). Kontingent ueber wb-kontingent.",
+      "updated": "2026-10-10T00:00:00Z",
+      "nativeContextWindow": 1050000
+    },
+    {
+      "id": "codex-gpt-6-luna",
+      "label": "GPT-6 Luna",
+      "harness": "codex",
+      "provider": "chatgpt",
+      "modelRef": "gpt-6-luna",
+      "contextWindow": 272000,
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "medium",
+      "machines": [
+        "mac",
+        "peer"
+      ],
+      "workerClass": [
+        {
+          "class": "coding-kurz",
+          "effort": "medium",
+          "goodFor": "Schnelle, klar umrissene Coding-Auftraege und Terminal-Automatisierung."
+        },
+        {
+          "class": "bulk",
+          "effort": "low",
+          "goodFor": "Cloud-Bulk, Extraktion und Klassifikation, wenn lokal nicht reicht und das Codex-Kontingent Luft hat."
+        },
+        {
+          "class": "recherche",
+          "effort": "medium",
+          "goodFor": "Breite Websuche, Seiten auslesen und Material vorsortieren; Quellenpflicht bleibt."
+        },
+        {
+          "class": "bild",
+          "effort": "medium",
+          "goodFor": "Klare Bildgenerierung oder Bildbearbeitung ueber das GPT-Bildwerkzeug; die Bildengine erzeugt die Pixel, Luna steuert den einfachen Auftrag sparsam."
+        }
+      ],
+      "goodFor": "Schnelle und volumenstarke Arbeit: kurze Coding-Auftraege, Extraktion, Recherche-Vorsortierung und klar beschriebene GPT-Bildauftraege. Nimmt Text und Bilder auf und kann Websuche, Dateisuche, Bildgenerierung, Code-Interpreter, Shell, Skills und Computer Use nutzen, sofern das jeweilige Werkzeug im Harness vorhanden ist.",
+      "notFor": "Tiefe Ambiguitaet, schwierige visuelle Leitung, lange Architekturarbeit oder anspruchsvoller Computer-Use-Ablauf.",
+      "enabled": true,
+      "notes": "Nachfolger von codex-gpt-5-6-luna; ab Codex-CLI 0.156 verfügbar (geprüft 2026-09-23, Antwort ok). der Nutzer 2026-09-23: GPT-6 Sol und Luna statt 5.6 verwenden.",
+      "updated": "2026-09-23T00:00:00Z",
+      "nativeContextWindow": 1050000
+    },
+    {
       "id": "goose-ornith-9b",
       "label": "goose + Ornith 9B (lokal)",
       "harness": "goose",
@@ -2991,57 +3987,6 @@
       "notFor": "Alles, was mehr als einen Schritt Ueberlegung braucht.",
       "enabled": true,
       "notes": "Messmodell des Harness-Eintrags. Bewusst klein gehalten, damit eine Probe nicht auf ein Modell wartet, das erst geladen werden muss."
-    },
-    {
-      "id": "kimi-ornith-9b",
-      "label": "Kimi CLI + Ornith 9B (lokal)",
-      "harness": "kimi",
-      "provider": "ollama",
-      "modelRef": "ollama-ornith-9b",
-      "contextWindow": 262144,
-      "roles": [
-        "worker"
-      ],
-      "supportsEffort": false,
-      "defaultEffort": "medium",
-      "machines": [
-        "mac",
-        "peer"
-      ],
-      "workerClass": [
-        "mechanisch",
-        "coding-kurz"
-      ],
-      "dataStaysLocal": true,
-      "goodFor": "Gemessen 2026-08-08 mit einem echten Spawn: nimmt seine Rolle aus AGENTS.md im Arbeitsverzeichnis an, zeigt die Kontextauslastung ab dem ersten Bildschirm. Bleibt lokal, token-frei. ⚠ Die Absendung eines Auftrags ist NICHT belegbar (kein promptPattern moeglich, siehe harness.probe) — meldet pi-worker 'Submission NICHT verifizierbar', ist das dieser Harness und kein Fehler.",
-      "notFor": "Alles, was Urteilsvermoegen braucht. ⚠ Setzt voraus, dass ~/.kimi/config.toml einen Abschnitt [models.ollama-ornith-9b] auf einem openai_legacy-Provider gegen Ollama traegt — ohne ihn startet Kimi mit diesem Modell nicht.",
-      "enabled": true,
-      "notes": "modelRef ist der SCHLUESSEL aus ~/.kimi/config.toml, nicht der Ollama-Name — Kimi loest Modelle ausschliesslich ueber diese Datei auf."
-    },
-    {
-      "id": "kimi-qwen3-1-7b",
-      "label": "Kimi CLI + Qwen3 1.7B (lokal, klein)",
-      "harness": "kimi",
-      "provider": "ollama",
-      "modelRef": "ollama-qwen3-1-7b",
-      "contextWindow": 262144,
-      "roles": [
-        "worker"
-      ],
-      "supportsEffort": false,
-      "defaultEffort": "low",
-      "machines": [
-        "mac",
-        "peer"
-      ],
-      "workerClass": [
-        "mechanisch"
-      ],
-      "dataStaysLocal": true,
-      "goodFor": "Das Modell, an dem Kimi CLI am 2026-08-08 vermessen wurde: laedt in Sekunden. Kandidat fuer wb-harness-probe. ⚠ Absendung nicht belegbar, siehe kimi-ornith-9b.",
-      "notFor": "Alles, was mehr als einen Schritt Ueberlegung braucht. Setzt denselben Abschnitt in ~/.kimi/config.toml voraus, hier [models.ollama-qwen3-1-7b].",
-      "enabled": true,
-      "notes": "Messmodell des Harness-Eintrags."
     },
     {
       "id": "gptme-qwen3-1-7b",
@@ -3396,6 +4341,85 @@
       "notFor": "Alles, was eine Wiederbelebung braucht: resume ist null, weil '--resume' ohne ID eine interaktive Auswahlliste oeffnet statt die letzte Sitzung dieses Verzeichnisses zu laden. ⚠ Ein WIRKLICH frisches $HOME zeigt einmalig einen Erststart-Onboarding-Dialog ('Log in to OpenAI? Yes/No'), der kein Escape von der Werkbank bekommt — der allererste Spawn auf einer neuen Maschine kann daran haengen bleiben, jeder Spawn danach (derselbe Server laeuft weiter) nicht mehr. ⚠ Installation und Betrieb hinterlassen macOS-weite Nebenwirkungen (globaler Hotkey-Dienst, Menuleisten-Symbol, PATH-Zeilen in Shell-rc-Dateien) — siehe harness.notes.",
       "enabled": true,
       "notes": "modelRef ist der ROHE Ollama-Name. contextWindow 262144 ist die Kontextlaenge, die das Modell selbst angibt ('ollama show ornith:9b') und dient hier nur der Einordnung fuer einen Menschen — die Kontextwache liest die fertige Prozentzahl direkt aus der Fusszeile. SPAWN-BELEG und Prozess-Hygiene-Befund (Server-Prozess ueberlebt das Schliessen des Panes) im Ergebnisbericht dieser Runde."
+    }
+  ],
+  "entscheider": [
+    {
+      "id": "jev-attrappe",
+      "label": "Jev-Attrappe (deterministisch, kein Modell)",
+      "runner": "dienst/backends/attrappe/run.py",
+      "gewichteGb": 0,
+      "machines": [
+        "mac",
+        "peer"
+      ],
+      "enabled": true,
+      "nurTest": true,
+      "vorgabe": false,
+      "notes": "Lokaler Entscheidungsdienst wb-jev (jev/dienst/README.md, Protokoll jev/dienst/BACKEND.md). Diese Liste ist KEINE Worker-Modellliste: wb-state models liest sie nicht, die Eintraege sind Backends fuer POST /v1/systemone. Die Attrappe beantwortet Fragen aus einem Hash des Inhalts, ohne inhaltliche Bedeutung; nur fuer Tests und zum Ausprobieren der Schnittstelle, nie als Vorgabe. Echte Backends kommen aus der Spur jev-kandidaten (jev/kandidaten/<name>/run.py) mit gemessenem gewichteGb."
+    },
+    {
+      "id": "decider-4b",
+      "label": "Decider-4B v2.1 Q4_K_M (Mapika, Apache-2.0), llama.cpp Metal (mac) / CUDA (peer)",
+      "runner": "kandidaten/decider-4b/run.py",
+      "python": "~/.local/share/jev-venvs/decider/bin/python",
+      "gewichteGb": 4.0,
+      "machines": [
+        "mac",
+        "peer"
+      ],
+      "enabled": true,
+      "vorgabe": true,
+      "startFristS": 120,
+      "anfrageFristS": 120,
+      "warteFristS": 120,
+      "sperrfenster": [
+        {
+          "von": "14:55",
+          "bis": "15:20",
+          "machines": [
+            "peer"
+          ],
+          "grund": "kronos-signals 15:05 rechnet auf cuda:0 ohne CPU-Rueckfall"
+        }
+      ],
+      "minFreiVramGib": 6,
+      "runnerArgs": {
+        "peer": [
+          "--n-ctx",
+          "8192"
+        ]
+      },
+      "notes": "Gemessen 2026-10-09 (jev-kandidaten): Fragesatz anon Test 0,728 (Jev 0,739), de 0,723, p50 ~200 ms, Laden 3,5 s. gewichteGb 4,0 = gemessene Prozess-Spitze phys_footprint 1,32 GiB + GGUF-Datei 2,7 GB (2,52 GiB), die llama.cpp per mmap abbildet und phys_footprint nicht zaehlt, aufgerundet. Gewichte im HF-Cache (Mapika/decider-4b-GGUF@b79f09d9). Viele Fragen auf langem Zustand ohne --prefix-cache langsam (31 Fragen x 15k Token = 559 s). Vorgabe erst nach Rauchtest (Management-Entscheidung 09.10.). peer gemessen 11.10. (RTX 4070 SUPER, Bericht jev-peer-machbarkeit): 5,0-5,3 GB VRAM (Kontext 8k 5 084 MiB, 16k 5 340 MiB), Latenz p95 unter 80 ms, Laden 3-4,5 s; venv mit llama-cpp-python CUDA unter demselben Pfad ~/.local/share/jev-venvs/decider. Auf peer nur bei Bedarf: Sperrfenster 14:55-15:20 (Kronos braucht bis 2,8 GB VRAM auf cuda:0 und faellt bei vollem Speicher nicht auf die CPU zurueck), Start nur bei mindestens 6 GiB freiem GPU-Speicher, Kontext dort 8192 (der Mac behaelt 16384: lange Zustaende bis etwa 15k Token). Qualitaet auf peer nur dev-Split: deutlich schwaecher als Jev-1.13, nur fuer den Schatten (Protokoll), nicht zum Ablehnen."
+    },
+    {
+      "id": "h2o-lightning-4b",
+      "label": "H2O-Lightning-4B v1.1 (h2oai, Apache-2.0), transformers MPS bf16, Originalshim",
+      "runner": "kandidaten/h2o-lightning-4b/run.py",
+      "python": "~/.local/share/jev-venvs/h2o/bin/python",
+      "gewichteGb": 14.0,
+      "machines": [
+        "mac"
+      ],
+      "enabled": true,
+      "vorgabe": false,
+      "startFristS": 180,
+      "anfrageFristS": 120,
+      "warteFristS": 120,
+      "notes": "Zweitmeinung, keine Vorgabe. Gemessen 2026-10-09: anon Test 0,696, orig 0,707, de 0,723, p50 ~700 ms. gewichteGb 14,0 = gemessene Prozess-Spitze phys_footprint 13,6 GiB (bf16-Gewichte 9,1 GB + fp32-Ausgabematrix 2,5 GB + Laufzeit). Ein Segfault in 3 Ladevorgaengen (gleichzeitige MPS-Forwards aus dem Shim-Threadpool vermutet, seither Lock)."
+    },
+    {
+      "id": "quyet-medium",
+      "label": "Quyet-1.0-Medium (chinhnc, Apache-2.0) - gesperrt",
+      "runner": "kandidaten/quyet/run.py",
+      "python": "~/.local/share/jev-venvs/quyet/bin/python",
+      "gewichteGb": 11.0,
+      "machines": [
+        "mac"
+      ],
+      "enabled": false,
+      "vorgabe": false,
+      "notes": "Gesperrt (Management-Entscheidung 09.10.): auf dem Fragesatz deutlich schwaecher (anon Test 0,630, guard 0,462, en 0,458, ECE roh 0,25) und Zustand hoechstens 6 000 Token. Gemessene Prozess-Spitze 10,5 GiB."
     }
   ]
 }

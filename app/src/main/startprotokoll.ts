@@ -101,3 +101,30 @@ export function kurzfassung(grund: string): string {
   const start = zeilen.find((z) => /kein Start|fehlgeschlagen/.test(z));
   return start ?? zeilen[0] ?? '';
 }
+
+/**
+ * Ein Werkzeug, das sich gar nicht erst starten liess (27.09.2026).
+ *
+ * DER ANLASS. Auf dem Laptop eines zweiten Nutzers fehlte `wb-code` im PATH. `spawn` meldet das
+ * nicht als Rueckgabewert, sondern als ASYNCHRONES 'error'-Ereignis am
+ * Kindprozess -- und ohne Ohr dafuer war es eine unbehandelte Ausnahme: der
+ * Hauptprozess starb ("Error: spawn wb-code ENOENT"), das Fenster verschwand
+ * mit ihm. Ein 'exit' kommt in diesem Fall nie (gemessen: nur 'error' und
+ * 'close'), die Beobachtung des Startprotokolls sieht also nichts davon.
+ *
+ * Hier steht nur der Satz, den der Mensch liest; wer den Fehler abfaengt,
+ * entscheidet selbst, wo er ihn zeigt. `undefined` heisst: kein Startfehler
+ * (etwa ein Abbruch unterwegs) -- dann gilt der gewohnte Weg ueber das Protokoll.
+ */
+export function programmFehlt(bin: string, fehler: { code?: string; message?: string } | undefined): string | undefined {
+  if (!fehler) return undefined;
+  const name = bin.split('/').pop() || bin;
+  if (fehler.code === 'ENOENT') {
+    return `${name} fehlt auf diesem Rechner (nicht gefunden: ${bin}) -- `
+      + 'die Werkbank-Werkzeuge sind hier nicht (vollstaendig) installiert oder nicht im PATH.';
+  }
+  if (fehler.code === 'EACCES') {
+    return `${name} ist auf diesem Rechner nicht ausfuehrbar (${bin}) -- Rechte pruefen.`;
+  }
+  return `${name} liess sich nicht starten: ${fehler.message ?? fehler.code ?? 'unbekannter Fehler'}`;
+}

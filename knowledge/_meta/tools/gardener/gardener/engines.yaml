@@ -1,0 +1,16 @@
+{
+  "engines": [
+    {"name": "peer-ollama", "kind": "ollama", "base_url": "http://127.0.0.1:11434", "ssh_tunnel": "peer", "model": "llama3.2:1b", "machine": "peer", "capabilities": {"logprobs": true, "json_schema": true, "max_parallel": 4}},
+    {"name": "mac-ollama", "kind": "ollama", "base_url": "http://localhost:11434", "model": "llama3.2:1b", "machine": "mac", "capabilities": {"logprobs": true, "json_schema": true, "max_parallel": 2}},
+    {"name": "mac-splash", "kind": "openai", "base_url": "http://localhost:8000/v1", "model": "incoai/Qwen3.8-27B-Splash", "machine": "mac", "capabilities": {"logprobs": false, "json_schema": true, "max_parallel": 2, "no_think": {"reasoning_effort": "none"}}},
+    {"name": "llamacpp", "kind": "openai", "base_url": "http://localhost:8081/v1", "model": "local", "machine": "local", "capabilities": {"logprobs": false, "json_schema": true, "max_parallel": 1}}
+  ],
+  "stufen": {
+    "extraktion": {"engine": "peer-ollama", "modelle": ["gemma4:12b", "qwen3.5:9b"], "optionen": {"temperature": 0, "num_ctx": 8192}, "max_tokens": 2048, "timeout": 600, "nebenlaeufig": 2},
+    "paarurteil": {"engine": "peer-ollama", "modelle": ["gemma4:12b"], "schwelle": 0.65, "gleich_cos": 0.62, "timeout": 120},
+    "projektwahl": {"engine": "peer-ollama", "modelle": ["gemma4:12b"], "optionen": {"num_ctx": 8192}, "timeout": 120},
+    "einbettung": {"engine": "peer-ollama", "modelle": ["embeddinggemma"], "timeout": 120},
+    "pruefen": {"engine": "peer-ollama", "modelle": ["gemma4:12b"], "frage": "art", "gewichte": "pruefen-gewichte.json", "schwelle": 0.522, "optionen": {"num_ctx": 4096}, "timeout": 120},
+    "grossmodell": {"engine": "mac-splash", "modelle": ["incoai/Qwen3.8-27B-Splash"], "max_tokens": 2048, "timeout": 900}
+  }
+}

@@ -1,8 +1,8 @@
 {
-  "lastChangelogVersion": "0.84.2",
+  "lastChangelogVersion": "0.87.1",
   "theme": "dark",
-  "defaultProvider": "ollama",
-  "defaultModel": "ornith:35b-256k",
+  "defaultProvider": "splash-lokal",
+  "defaultModel": "incoai/Qwen3.8-27B-Splash",
   "enabledModels": [
     "mlx-lokal/$HOME/AI/mlx-models/grug-27b-mlx-q4",
     "ollama/ornith:35b-256k",
@@ -11,8 +11,9 @@
     "ollama/qwen3.6:35b-a3b-coding-nvfp4-256k",
     "ollama/qwen3.6:27b-coding-nvfp4-256k"
   ],
-  "hideThinkingBlock": true,
+  "hideThinkingBlock": false,
   "defaultProjectTrust": "always",
   "outputPad": 1,
-  "autocompleteMaxVisible": 20
+  "autocompleteMaxVisible": 20,
+  "tuiMode": "regular"
 }

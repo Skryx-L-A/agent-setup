@@ -52,6 +52,8 @@ export const DE: Record<string, string> = {
   // WOHER die Zuordnung kommt. Die drei Wege sind nicht gleich gut, und die
   // Ansicht sagt das -- ein Gespraech aus dem Rueckfall sieht sonst genauso
   // sicher aus wie eins, das der Harness selbst zugeordnet hat.
+  'herkunft.register': 'Sitzung im Register',
+  'herkunft.register.titel': 'Claude nennt in seinem eigenen Register die Sitzung dieses Prozesses. Eindeutig.',
   'herkunft.hook': 'Sitzung gemeldet',
   'herkunft.hook.titel': 'Das Programm im Pane hat seine Sitzungskennung selbst gemeldet. Eindeutig.',
   'herkunft.vermerk': 'Sitzung vermerkt',
@@ -107,6 +109,8 @@ export const EN: Record<string, string> = {
   'bruecke.arbeitet': 'working',
   'bruecke.ruhig': 'waiting',
 
+  'herkunft.register': 'session in registry',
+  'herkunft.register.titel': 'Claude’s own registry names the session of this process. Unambiguous.',
   'herkunft.hook': 'session reported',
   'herkunft.hook.titel': 'The program in this pane reported its own session id. Unambiguous.',
   'herkunft.vermerk': 'session on record',

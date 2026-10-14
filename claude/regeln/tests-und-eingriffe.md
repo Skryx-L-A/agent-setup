@@ -12,7 +12,15 @@ Für Prüfbedarf gilt immer `~/.claude/regeln/verifikation.md`: keine automatisc
 Vor einem nötigen Test die einschlägigen Isolationsregeln lesen: eigenes Testverzeichnis,
 eigene Sockets/Ports, keine Nutzersitzung oder Nutzerfenster, keine fremden Prozesse.
 Vor Push nach main ist eine vollständige Suite erforderlich; ein bestandener Lauf für
-denselben relevanten Stand genügt. Routineänderungen erzeugen keine Pflichtprüfschleife.
+denselben relevanten Stand genügt. Dieser Gesamtlauf muss vollständig grün sein: kein roter,
+kein übersprungener Test; „einzeln grün" ersetzt das nicht. Tests werden nicht gelöscht oder
+abgeschaltet, um grün zu werden; die Ursache wird behoben, ein fehlerhafter Test darf
+berichtigt werden (der Nutzer, 2026-09-20). Routineänderungen erzeugen keine Pflichtprüfschleife.
+Während eines Gesamtlaufs committet keine Sitzung in den geprüften Arbeitsbaum, auch keine Doku oder
+Standdatei: Ein Test prüft, dass der echte Baum unberührt bleibt (2026-10-09, Gesamtlauf rot durch
+einen SESSION-STATE-Commit einer anderen Sitzung). Seit 2026-10-09 trägt sich `run-all.sh`
+selbst auf der Tafel ein (Plätze mac-suite und hauptbaum:<repo>); der Commit-Hook bricht dann Commits
+von Agenten in diesen Baum ab, Orchestratoren brauchen `wb-tafel trotzdem`, der Mensch wird gewarnt.
 
 ## Abschnitte
 

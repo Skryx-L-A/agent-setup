@@ -32,7 +32,9 @@ zeilen=$(( $(wc -l < "$TABELLE") - 1 ))
 # drei Tage ist. Danach ist der Hinweis Rauschen -- der Stand bleibt ueber
 # `wb-autoresearch stand` abrufbar. Ein LAUFENDER Lauf wird immer gemeldet.
 if [ -z "$laeuft" ]; then
-  alter=$(( $(date +%s) - $(stat -f %m "$TABELLE" 2>/dev/null || stat -c %Y "$TABELLE") ))
+  # GNU stat zuerst: unter Linux gelingt `stat -f %m` (Dateisystem-Status, mehrzeilig) und
+  # liefert keine Zahl; BSD-stat kennt -c nicht und faellt auf -f %m zurueck.
+  alter=$(( $(date +%s) - $(stat -c %Y "$TABELLE" 2>/dev/null || stat -f %m "$TABELLE") ))
   [ "$alter" -gt $((3*86400)) ] && exit 0
 fi
 

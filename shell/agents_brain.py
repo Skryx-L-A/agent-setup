@@ -17,7 +17,7 @@ alles Weitere liegt im Brain, und Agenten lesen das Brain mit.
   eigenen Bereich) oder ueber den Dienstweg ``suche``. Die Stichwortsuche hier braucht nur die
   Standardbibliothek und ist der Rueckfall, wenn das Werkzeug des Vaults nicht laeuft.
 
-``90-secrets/`` und ``.secrets-sync/`` sind fuer jede Operation gesperrt; die Suche uebergeht sie.
+``secrets/`` und ``.secrets-sync/`` sind fuer jede Operation gesperrt; die Suche uebergeht sie.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import argparse
 import contextlib
 import datetime as _dt
 import fcntl
+import importlib.util
 import json
 import math
 import os
@@ -43,7 +44,7 @@ if __name__ == "__main__":
 
 import agents_data as ad  # noqa: E402
 
-GEHEIM = ("90-secrets", ".secrets-sync")
+GEHEIM = ("secrets", ".secrets-sync")
 AGENTEN_ORDNER = "agenten"
 LEHREN = "lehren"
 GLOBAL_ZWEIG = "10-global"
@@ -72,6 +73,50 @@ GEHEIMNIS_MUSTER = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"), re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), re.compile(r"\bsk-[A-Za-z0-9]{32,}"),
 )
+# Dazu die gemeinsame Musterliste des Hauses (hooks/lib/geheimnis_inhalt.py): Provider-Formen, die diese
+# schmale Liste nicht kennt (GOCSPX-, ASIA, hf_, gsk_ ...), und die generische Zuweisung mit Entropie.
+# Aus der Datei geladen, nicht nachgebaut: Quellbaum neben shell/ zuerst, sonst die ausgerollte Kopie
+# unter ~/.claude/hooks/lib (wie wb-gruppe). VEREINIGUNG mit GEHEIMNIS_MUSTER, nie Ersatz.
+# AUSFALL (2026-10-10): fehlt die Datei oder ist sie unbrauchbar, gilt allein GEHEIMNIS_MUSTER -- genau
+# das heutige Verhalten. Notizen abzulehnen, nur weil die Lib auf einer Maschine nicht ausgerollt ist
+# (Fernwelten auf peer), wuerde jeden Agenten dort am Schreiben hindern; die schmale Liste bleibt der Boden.
+_GEHEIMNIS_LIB: list = []
+
+
+def geheimnis_lib() -> Any:
+    if not _GEHEIMNIS_LIB:
+        modul = None
+        hier = Path(__file__).resolve().parent
+        for kandidat in (hier.parent / "hooks" / "lib" / "geheimnis_inhalt.py",
+                         Path.home() / ".claude" / "hooks" / "lib" / "geheimnis_inhalt.py"):
+            if not kandidat.is_file():
+                continue
+            try:
+                spec = importlib.util.spec_from_file_location("agents_brain_geheimnis_inhalt", kandidat)
+                kand = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(kand)
+                if kand.PATTERNS and callable(kand.treffer):
+                    modul = kand
+                    break
+            except Exception:
+                continue
+        _GEHEIMNIS_LIB.append(modul)
+    return _GEHEIMNIS_LIB[0]
+
+
+def _lib_treffer(text: str) -> Optional[str]:
+    """Name der ersten Regel der gemeinsamen Liste, die in ``text`` trifft; sonst None. Nie der Wert."""
+    lib = geheimnis_lib()
+    if lib is None:
+        return None
+    try:
+        for _zeile, regel, _wert, _ent in lib.treffer(text, True, frozenset(), True):
+            return regel
+    except Exception:
+        return None
+    return None
+
+
 ZUG_MARKE = "<!-- wb-zug: %s -->"
 TOKEN_RE = re.compile(r"[\w']+", re.UNICODE)
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -253,6 +298,9 @@ def _text_pruefen(text: Any, label: str = "Text") -> str:
         if muster.search(text):
             raise BrainFehler("%s sieht nach einem Zugangsschluessel aus; Geheimnisse gehoeren nie ins Brain, "
                               "hoechstens ein Hinweis, wo sie liegen" % label)
+    if _lib_treffer(text) is not None:
+        raise BrainFehler("%s sieht nach einem Zugangsschluessel aus; Geheimnisse gehoeren nie ins Brain, "
+                          "hoechstens ein Hinweis, wo sie liegen" % label)
     return text
 
 

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agents_claude import ClaudeAdapterFehler, StreamBefund, ZUG_UMGEBUNG
+from agents_worktree import git_env_erlaubt
 
 RUNNER = "agents_pi_runner.py"
 PI_TOOLS = frozenset({"bash", "read", "write", "edit", "grep", "find", "ls"})
@@ -74,7 +75,10 @@ class PiZug:
         if self.append_system_prompt_file is not None and not Path(self.append_system_prompt_file).is_absolute():
             raise ClaudeAdapterFehler("Anweisungsdatei des Zuges braucht einen absoluten Pfad")
         for name, value in self.extra_env:
-            if name not in ZUG_UMGEBUNG or not isinstance(value, str) or "\x00" in value or len(value) > 4096:
+            # Neben der Zugumgebung nur die Git-Namen des Traegers: mit ihnen committet ein Pi-Zug im Worktree
+            # unter der Identitaet des Menschen (docs/AGENTS-TRAEGER.md, "Worktree je Agent").
+            if (name not in ZUG_UMGEBUNG and not git_env_erlaubt(name)) or not isinstance(value, str) \
+                    or "\x00" in value or len(value) > 4096:
                 raise ClaudeAdapterFehler("extra_env enthaelt eine nicht freigegebene Variable")
 
     def lese_pfade(self) -> tuple[Path, ...]:

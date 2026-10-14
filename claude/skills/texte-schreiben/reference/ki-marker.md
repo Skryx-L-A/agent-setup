@@ -326,7 +326,7 @@ aufzuzählen, liest sich wie ein zweiter Bewerbungsversuch und verschiebt den Zw
 - **Vorher:** „Am Interesse hat sich nichts geändert. Der Stack, den ihr fahrt, ist der, in
   dem ich täglich arbeite: n8n läuft bei mir selbst gehostet mit vier ausgerollten Workflows,
   Claude Code ist meine Arbeitsumgebung, und was ich an Agenten-Orchestrierung gebaut habe,
-  liegt offen unter github.com/<your-github-user>/agent-workbench."
+  liegt offen unter github.com/Skryx-L-A/agent-workbench."
 - **Nachher:** „Mein Interesse ist unverändert – ich würde wirklich gern bei euch anfangen.
   Falls euch für die Entscheidung noch etwas von mir fehlt, sagt einfach Bescheid, ich
   schicke es sofort."
@@ -365,7 +365,7 @@ wiederholt nichts, was in der Bewerbung schon stand.
 
 **5 · Der Betreff aus dem fremden Verlauf (27.08.2026, Ansage des Nutzers: „nie wieder so einen
 Betreff").** Eine Antwort im Verlauf erbt technisch die Message-ID, nicht die Betreffzeile.
-Wer den internen Betreff des Absenders stehen lässt, verschickt dessen Aktenzeichen: Eine Firma
+Wer den internen Betreff des Absenders stehen lässt, verschickt dessen Aktenzeichen: Firma-X
 hatte die Gesprächseinladung unter „AW: Neue Bewerbung eingetroffen" verschickt, einer
 Hausbetreffzeile aus dem Bewerbermanagement. Zurückgeschickt liest sie sich, als hätte
 niemand hingesehen.
@@ -379,7 +379,7 @@ dann, wenn er den Vorgang wirklich benennt – etwa der eigene Bewerbungsbetreff
 trägt. Das Threading hängt an `In-Reply-To`, ein geänderter Betreff bricht den Verlauf nicht.
 
 **Und die Auflösung desselben Tages – so gilt es (Entscheidung des Nutzers, sie hebt die Regel
-oben auf):** Bei der Firma ist am Ende die Betreffzeile der Personalabteilung stehen geblieben, „AW: Neue Bewerbung
+oben auf):** Bei Firma-X ist am Ende Person As Betreffzeile stehen geblieben, „AW: Neue Bewerbung
 eingetroffen". Beide Gegenvorschläge – ein freier Betreff und ein „AW:" mit umbenanntem
 Vorgang – hat er verworfen. Der Grund liegt beim Empfänger und nicht beim Text: Im Postfach
 soll die Mail sichtbar an derselben Zeile hängen wie alles andere in diesem Vorgang.
@@ -395,7 +395,7 @@ klingt gestelzt und trifft die Wärme nicht, die gemeint war.
 
 - **Vorher:** „danke für die Einladung, sie hat mich gefreut."
 - **Nachher:** „vielen Dank für die Einladung." – und die Freude einmal, am stärksten Platz:
-  „Auf das Gespräch mit dir und Carsten Rietzschel freue ich mich sehr."
+  „Auf das Gespräch mit dir und Person B Rietzschel freue ich mich sehr."
 
 **Regel:** Freude wird einmal ausgedrückt, nicht zweimal, und sie steht dort, wo sie einem
 konkreten Gegenüber gilt – meist am Schluss. Sie wird nur geschrieben, wenn der Nutzer sie
@@ -419,13 +419,13 @@ so nicht wirklich in eine Bewerbungsemail").** Wer im letzten Satz die Namen all
 aufzählt, zeigt vor allem, dass er die Einladung genau gelesen hat. Es klingt bemüht und
 verschiebt den Schluss von der Sache auf eine Namensliste.
 
-- **Vorher:** „Auf das Gespräch mit dir und Carsten Rietzschel freue ich mich sehr."
+- **Vorher:** „Auf das Gespräch mit dir und Person B Rietzschel freue ich mich sehr."
 - **Nachher:** „Auf das Gespräch mit euch freue ich mich."
 
 **Regel:** Der Schlusssatz einer Bewerbungsmail bleibt schlicht. Namen stehen in der Anrede,
 nicht im Abschluss; die Steigerung („sehr") entfällt, wenn der Nutzer sie nicht selbst gesagt hat.
 
-**9 · Nichts zurückspiegeln, was der Empfänger selbst geschrieben hat (28.08.2026, Streichungen des Nutzers an der Bestätigungsmail an eine Firma).** Eine Bestätigung wiederholt gern den Termin,
+**9 · Nichts zurückspiegeln, was der Empfänger selbst geschrieben hat (28.08.2026, Streichungen des Nutzers an der Bestätigungsmail an Firma-X).** Eine Bestätigung wiederholt gern den Termin,
 den die Gegenseite gerade bestätigt hat, und zählt nach, worauf sie geantwortet hat. Beides sagt
 dem Empfänger nur, was er selbst eine Stunde vorher geschrieben hat. Es verlängert die Mail und
 wirkt wie ein Protokoll.
@@ -585,12 +585,145 @@ anrede und verabschiedung, nur info was drin ist").** Der Entwurf war als Brief 
 „Hallo zusammen", einem Einleitungssatz und „Liebe Grüße". Bei einer Mail, deren Zweck die
 Anhänge sind, liest der Empfänger nur, was drin ist.
 
-- **Vorher:** „Hallo zusammen, anbei meine Unterlagen von der Hochschule fürs
+- **Vorher:** „Hallo zusammen, anbei meine Unterlagen von der Hochschule X fürs
   Wintersemester 2026/27: – Studienbescheinigung … Liebe Grüße, der Nutzer"
-- **Nachher:** „Unterlagen der Hochschule, Wintersemester 2026/27: – Studienbescheinigung:
+- **Nachher:** „Unterlagen der Hochschule X, Wintersemester 2026/27: – Studienbescheinigung:
   Nachweis der Immatrikulation, Informatik B.Sc., 1. Fachsemester, gültig vom 1. Oktober 2026
   bis 31. März 2027 – …"
 
 **Regel:** Geht eine Mail an den Nutzer selbst oder an die Familie und trägt vor allem Anhänge,
 entfallen Anrede, Einleitung und Grußformel. Der Text sagt je Anhang in einer Zeile, was drin
 steht und wofür er gilt.
+
+### 18.09.2026 — Nicht ansagen, was der Leser ohnehin sieht
+
+**Sein Einwand:** „Unter jeder steht ein Link, der die Verbindung direkt auf bahn.de öffnet. -- weg das sieht er ja!"
+
+In der Mail an Person B (Firma-X) mit vier Bahnverbindungen, unter jeder ein bahn.de-Link, stand
+im Einleitungssatz eine Ankündigung der Links.
+
+- **Vorher:** „Hier die Verbindungen, jeweils für die ganze Strecke Stadt-A Hbf – Ort-B. Unter jeder steht ein Link, der die Verbindung direkt auf bahn.de öffnet."
+- **Nachher:** „Hier die Verbindungen, jeweils für die ganze Strecke Stadt-A Hbf – Ort-B."
+
+Modelle beschreiben gern den Aufbau des eigenen Textes („Unten finden Sie …", „Im Folgenden …",
+„Unter jeder steht …"). Der Empfänger sieht Links, Listen und Anhänge selbst.
+
+**Regel:** Keine Sätze, die Form oder Aufbau der Nachricht erklären. Ein Hinweis bleibt nur, wenn
+er etwas sagt, das man nicht sieht, etwa dass ein Link abläuft.
+
+### 21.09.2026 — Eine Rückfrage ist eine Frage, keine Begründung
+
+**Sein Einwand:** „Mail 1 ist mir zu lang, sehr viel unnötiges drin das eh klar ist oder unnötig"
+
+In der Mail an Person A (Firma-X) standen fünf Rückfragen. Jede war mit Herleitung, Paragrafenzitat
+und Begründung ausgepolstert – gegenüber einer Empfängerin, die die eigenen Unterlagen kennt.
+
+- **Vorher:** „Zur Ausstattung im Homeoffice eine Grundsatzfrage. In der Richtlinie stehen Laptop
+  und Headset als Standard, Bildschirm, Docking Station, Maus und Tastatur auf Anfrage. Bekommen
+  Werkstudenten diese Sachen auch, oder ist das den Vollzeitkollegen vorbehalten? Wenn es geht,
+  würde ich Bildschirm, Dock, Tastatur und Maus gern anfragen – privates Zubehör darf ich laut
+  § 4.1 ja nicht verwenden."
+- **Nachher:** „Bekommen Werkstudenten außer Laptop und Headset auch Bildschirm, Dock, Tastatur
+  und Maus? Falls ja, würde ich sie gern anfragen."
+
+Weggefallen sind drei Sorten Füllung: die Ankündigung der Frage („eine Grundsatzfrage"), die
+Nacherzählung dessen, was in den Unterlagen des Empfängers steht, und die Rechtfertigung der
+eigenen Bitte per Paragrafenzitat. Ein Paragraf gehört nur hinein, wenn der Empfänger ihn
+nachschlagen soll – etwa bei einem Widerspruch zwischen zwei Dokumenten.
+
+**Regel:** In einer Rückfragemail steht pro Punkt die Frage und höchstens ein Satz Kontext, den
+der Empfänger nicht selbst hat. Keine Ankündigung der Frage, keine Wiedergabe der eigenen
+Unterlagen des Empfängers, keine Begründung, warum man fragen darf.
+
+### 21.09.2026 — Beim Kürzen fällt die Frage weg, nicht die Füllung
+
+**Seine Einwände (vier auf einmal, an derselben Mail an Person A/Firma-X):**
+
+1. „hier war es vorher besser, die frage nach der eigenen wahl ist ganz weg, also selbst wenn es
+   eine option ist sagt sie es nicht weil nicht gefragt wurde"
+2. „was soll das, sie hat die tickets geburcht und weiß wann ich fahre!"
+3. „nur wegen spätem checkin fragen, der rest weg"
+4. „das netter Vormulieren"
+
+Die vier zeigen dieselbe Kürzungsfehler-Familie und eine Tonlagenfrage.
+
+**Zu 1 – die Substanz gekürzt statt der Füllung.** Beim Straffen verschwand aus „Bei der
+Distribution richte ich mich nach eurem Standard-Image – falls ihr die Wahl lasst, sag gern
+Bescheid" der zweite Halbsatz. Damit war die einzige echte Frage des Absatzes weg und übrig
+blieb eine Unterwerfungsgeste. Wer kürzt, streicht Begründungen und Ankündigungen, niemals die
+Frage oder das Angebot.
+
+**Zu 2 – dem Empfänger sagen, was er selbst veranlasst hat.** „Ich fahre am 30.09." an die
+Person, die die Fahrkarte für den 30.09. gebucht hat. Verwandt mit dem Fall vom 18.09., aber
+eine Stufe schlimmer: dort wurde die Form des eigenen Textes erklärt, hier das Handeln des
+Empfängers.
+
+**Zu 3 – zwei Fragen in einem Punkt, von denen nur eine gewollt ist.** Die Zahlungsfrage zum
+Hotel war sachlich richtig, aber der Nutzer wollte sie nicht stellen. Beim Bündeln mehrerer
+Rückfragen pro Absatz gehört jede einzeln zur Freigabe, nicht der Absatz als Paket.
+
+**Zu 4 – ein Widerspruch wird nicht als Mangel vorgetragen.** Vorher las sich der Punkt wie
+eine Beanstandung.
+
+- **Vorher:** „Reisezeit: Im Zusatzvertrag Homeoffice steht unter § 2, dass Reisezeit
+  Arbeitszeit ist, in der Vereinbarung zum mobilen Arbeiten unter 3.3 das Gegenteil. Welche
+  Regelung gilt? Sobald ich das weiß, schicke ich den großen Umschlag zurück."
+- **Nachher:** „Beim Durchlesen bin ich über eine Kleinigkeit gestolpert. Im Zusatzvertrag
+  Homeoffice steht unter § 2, dass Reisezeit als Arbeitszeit erfasst wird, in der Vereinbarung
+  zum mobilen Arbeiten unter 3.3 steht es andersherum. Magst du mir sagen, was für mich gilt?
+  Dann schicke ich den großen Umschlag gleich zurück."
+
+Geändert sind drei Dinge: ein Vorspann, der den Fund als Kleinigkeit einordnet statt als Fehler;
+„steht es andersherum" statt „das Gegenteil"; und „Magst du mir sagen" statt der nackten Frage –
+das ist die Wendung, die die Empfängerin selbst benutzt.
+
+**Regel:** Beim Kürzen bleibt jede Frage stehen; gestrichen wird nur, was den Empfänger etwas
+lehrt, das er schon weiß. Keine Angabe wiederholen, die der Empfänger selbst veranlasst hat.
+Mehrere Fragen in einem Absatz einzeln freigeben lassen. Wer auf einen Widerspruch in fremden
+Unterlagen hinweist, ordnet ihn zuerst als Kleinigkeit ein und übernimmt die Höflichkeitsform
+des Empfängers.
+
+### 21.09.2026 — Eine Pflicht wird nicht als Gefälligkeit verkauft
+
+**Sein Einwand:** „Mail 2 klingt, als würde ich Ihnen einen Gefallen tun. Dabei ist es von mir
+gefordert, dass ich das sage."
+
+Die Mitteilung einer Nebentätigkeit an den Arbeitgeber ist in seinem Vertrag unter § 7.1
+vorgeschrieben. Der Entwurf stellte sie als freiwillige Offenheit dar.
+
+- **Vorher:** „eine Sache möchte ich euch von mir aus sagen, bevor ich anfange. […] Mir ist
+  wichtig, dass ihr das wisst und nicht später davon erfahrt."
+- **Nachher:** „Nach § 7.1 muss ich euch weitere Tätigkeiten melden, deshalb hier meine."
+
+„von mir aus", „möchte ich euch sagen" und „mir ist wichtig, dass ihr das wisst" machen aus
+einer geschuldeten Meldung eine Geste. Das wirkt anbiedernd und legt nebenbei nahe, der
+Absender hätte auch schweigen können.
+
+**Regel:** Steht eine Mitteilung in einer Pflicht, wird die Pflicht genannt und die Sache
+gemeldet. Keine Formeln, die Freiwilligkeit oder Großzügigkeit behaupten. Das gilt auch für
+Selbstverständlichkeiten im selben Zug – eine Zusicherung, Betriebsgeheimnisse zu wahren, wirkt
+neben einer Pflichtmeldung wie eine Rechtfertigung und entfällt.
+
+### 22.09.2026 — Eine Bestätigung braucht keinen Punkt pro Punkt
+
+**Sein Einwand:** „nichts zu ubuntu. Hallo Person A, dann rufe ich im Hotel an. Bildschirme würde
+ich gerne nehmen, alles weitere nehme ich dann am 1.10 mit. -- eher so, aber formuliere das
+etwas netter"
+
+Person A hatte vier Punkte beantwortet. Der Entwurf quittierte jeden einzeln, auch die, zu denen
+es nichts zu sagen gab („Ubuntu passt", „Danke auch für die Rückmeldung zur Nebentätigkeit").
+
+- **Vorher:** „Ubuntu passt. / Im Hotel rufe ich selbst an und melde mich, wenn der späte
+  Check-in geklärt ist. / Bei den Bildschirmen würde ich gern beide nehmen, wenn das geht. Maus
+  und Tastatur nehme ich am 01.10. aus dem Office mit. / Danke auch für die Rückmeldung zur
+  Nebentätigkeit."
+- **Nachher:** „danke dir. Im Hotel rufe ich selbst an und sage Bescheid, sobald der Check-in
+  geklärt ist. / Die Bildschirme nehme ich gern, alles Weitere dann am 01.10."
+
+Wer eine Antwortmail beantwortet, quittiert nur, was eine Handlung auslöst. Ein „danke dir" am
+Anfang deckt alles ab, was der Empfänger einfach nur mitgeteilt hat. Und Aufzählungen aus der
+Gegenseite werden nicht einzeln nachgesprochen — „alles Weitere" fasst Maus, Tastatur und
+Rucksack zusammen, ohne dass etwas verloren geht.
+
+**Regel:** Auf eine Antwort antwortet man nur dort, wo es etwas zu entscheiden oder zu tun gibt.
+Erledigte Punkte bekommen keinen eigenen Satz, der Dank steht einmal am Anfang.

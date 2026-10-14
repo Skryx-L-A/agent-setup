@@ -75,6 +75,65 @@ GEMEINSAM mit einem tatsaechlich gemessenen `secondary_window.used_percent`
 gesetzt (wie `plan`/`plan_quelle`) -- sonst haetten sie faelschlich einen
 Endpunkt-Beleg fuer eine in Wahrheit ungemessene Zahl getragen.
 
+CLINE-PASS-KONTINGENT UEBER DIE CLINE-API (2026-09-16, Auftrag des Nutzers
+"Kontingent-Sammler fuer Cline Pass"): Cline Pass haelt sein Kontingent nur
+serverseitig vor -- lokal gibt es nichts zu lesen. DIE SPUR HAENGT AM PROVIDER
+(Korrektur aus der Abnahme, dritte Runde): 'cline-pass' ist in der Registry
+ein PROVIDER, kein Harness -- cline-Pass-Modelle werden ueber opencode
+gefahren, und Harness-Eintraege steuern das Spawnen. Fuehrt die Registry
+diesen Provider, legt auffrischen() eine Spur unter demselben Namen im Stand
+an (zusaetzlich zu den Harness-Eintraegen); --harness cline-pass trifft sie,
+ein Filter auf einen anderen Harness erhebt sie nicht neu und wirft sie nicht
+weg. `pruefen <harness> <modell>` loest zu dem Modell dessen PROVIDER auf und
+wendet das Urteil dieser Spur zusaetzlich an (erschoepft sperrt, KNAPP warnt).
+Der Sammler (sammle_cline_pass) fuellt nur den lokalen Teil (Modelle, art);
+das Kontingent selbst misst
+ausschliesslich der AKTIVE Endpunkt, aufgerufen NUR aus `auffrischen` (die
+explizite Aktion) und NIE aus einem Test (WB_CLINE_USAGE_DATEI liest eine
+Fixture statt Netz) -- aus demselben Grund wie beim Codex-Endpunkt oben: sonst
+zoege ihn der implizite Auto-Refresh aus zustand_frisch()/pruefen vor jedem
+Spawn mit. Drei Aufrufe, alle mit `Authorization: Bearer <key>`, Zeitgrenze 10s:
+  GET https://api.cline.bot/api/v1/users/me/plan
+  GET https://api.cline.bot/api/v1/users/me          (liefert data.id, Form usr-...)
+  GET https://api.cline.bot/api/v1/users/<userId>/usages?limit=200&cursor=<nextToken>
+Der Key kommt in derselben Kette, die wb-harness-run benutzt (SPEC-V3 A.1):
+macOS-Schluesselbund (Dienst 'cline-api-key'), dann
+~/.secrets-sync/api-keys/cline-pass (nur bei restriktivem Mode 600/400,
+wie in wb-harness-run), dann die
+Umgebungsvariable CLINE_API_KEY. Der Wert erscheint NUR im Authorization-Header
+-- nie in einer Ausgabe, einem Log oder einer Datei.
+Die Antwort kennt DREI rollende Fenster (5 Stunden, 7 Tage, 30 Tage), je mit
+eigenem Cap unter data.plan.entitlements.cline_pass.inferenceCapThreshold
+(last5Hours/last7days/last30daysUsageCostUSDPerUser). Die Einheit von costUsd
+und der Caps ist 1e-8 US-Dollar (Beleg im Kommentar an CLINE_EINHEIT_USD) --
+gerechnet und gesperrt wird trotzdem NUR mit dem Anteil am Cap in Prozent,
+verbraucht_prozent = 100 * summe(costUsd im Fenster) / cap_des_fensters; der
+Dollarwert dient nur der lesbaren Anzeige. Erlaubte Linie (KORREKTUR aus der
+Abnahme, 16.09.2026): das 5-Stunden-Fenster hat KEINE Tagesrate -- der Cap ist
+dort harte Sperre, erschoepft ab 100 Prozent. Beim 7-Tage- und beim 30-Tage-
+Fenster gilt eine TAGESRATE: der 7-Tage-Cap traegt cap/7, der 30-Tage-Cap
+cap/30 pro Tag, und KNAPP heisst, dass die Summe der letzten 24 Stunden ueber
+diesem Tagesanteil liegt. (Die erste Fassung leitete die Linie aus dem Alter
+des aeltesten Eintrags im Fenster ab -- falsch, denn ein ROLLENDES Fenster
+hat keinen Fensteranfang, an dem ein Anteil verstreichen koennte; ein
+2 Stunden altes Abo mit 0.558 von 25 USD meldete dauerhaft KNAPP.) Die Spur
+gilt als erschoepft, wenn irgendein Fenster 100 Prozent erreicht, und als
+knapp, wenn die letzte-24-Stunden-Summe ueber dem Tagesanteil liegt. KNAPP
+erscheint in `--knapp` und sperrt seit 2026-10-07 in `pruefen` (Exit 7): die
+Vergaberegel (regeln/vergabe.md Rang 3, Stand 2026-09-18) sagt "alle drei
+Fenster unter dem Tagesanteil; bei knapp faellt die Spur aus", und `pruefen`
+meldete bis dahin trotzdem 0. KNAPP ist gemessen (Summe der letzten 24 Stunden
+gegen den Cap), kein Raten -- Grundregel 1 bleibt gewahrt. Die Marke steht am
+Anfang des hinweis ("KNAPP: ..."), weil der Vertrag fuer neue Eintragsfelder
+gesperrt ist (test-kontingent.sh -- 1 erzwingt die Feldmenge); gelesen wird nur
+dieser feste, vom Sammler geschriebene Anfang.
+Jeder Fehler (kein Key, kein Netz, 401, Timeout 10s, unbrauchbare Antwort)
+ergibt einen Eintrag ohne Urteil mit gesetztem hinweis -- nie einen Absturz,
+nie ein erfundenes 'frei'. Testhaken: `WB_CLINE_USAGE_URL` (API-Basis
+ueberschreiben), `WB_CLINE_USAGE_DATEI` (Fixture-Datei mit den Schluesseln
+"plan"/"me"/"seiten" statt eines Netzaufrufs -- der einzige Weg, mit dem ein
+Test diese Antwort betreten darf).
+
 GRUNDREGEL: das Messen kostet nichts. Gelesen werden ausschliesslich lokale
 Zustands- und Konfigurationsdateien, ein lokaler Katalog (`ollama list`) und eine
 lokale Datenbank (~/.copilot/session-store.db, nur lesend geoeffnet). KEIN
@@ -96,6 +155,8 @@ Rueckgabewerte von `pruefen`:
   6  Harness auf dieser Maschine nicht installiert
   4  lokales Modell nicht in Ollama vorhanden
   5  nachweislich nicht angemeldet (Abo-Spur ohne gueltiges Zeugnis)
+  7  Spur KNAPP gemessen (letzte 24 Stunden ueber dem Tagesanteil eines Fensters) --
+     seit 2026-10-07, regeln/vergabe.md Rang 3: "bei knapp faellt die Spur aus"
   2  Aufruffehler (falsche Argumente)
 """
 import argparse
@@ -110,6 +171,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 
 HOME = os.environ.get("HOME") or os.path.expanduser("~")
@@ -217,8 +279,9 @@ def registry():
 
 def kblock(h):
     """Der `kontingent`-Block eines Harness-Eintrags. Er sagt, WO man nachsieht --
-    die Werte selbst stehen nie dort, die veralten."""
-    b = h.get("kontingent")
+    die Werte selbst stehen nie dort, die veralten. h=None (Provider-Spur ohne
+    Harness-Eintrag) ergibt einen leeren Block."""
+    b = (h or {}).get("kontingent")
     return b if isinstance(b, dict) else {}
 
 
@@ -477,6 +540,24 @@ def _zahl_oder_none(wert):
     return wert if isinstance(wert, (int, float)) and not isinstance(wert, bool) else None
 
 
+def codex_fenster_tage(sekunden):
+    """Fensterlaenge in Tagen als Text ("7", "30"), None wenn unbrauchbar."""
+    if not isinstance(sekunden, (int, float)) or isinstance(sekunden, bool) or sekunden <= 0:
+        return None
+    tage = sekunden / 86400.0
+    return "%d" % round(tage) if abs(tage - round(tage)) < 1e-6 else "%.1f" % tage
+
+
+def codex_fenster_einheit(sekunden):
+    """Beschriftung des langen Codex-Fensters aus limit_window_seconds.
+    7 Tage heissen wie bisher "Wochenfenster", jede andere Laenge "Zeitfenster
+    (rollend, N Tage)"; ohne Laenge der alte Wochentext (Rueckfall nur dafuer)."""
+    tage = codex_fenster_tage(sekunden)
+    if tage is None or tage == "7":
+        return "Wochenfenster (rollend, 7 Tage)"
+    return "Zeitfenster (rollend, %s Tage)" % tage
+
+
 def codex_usage_anwenden(e, antwort):
     """Traegt die Endpunkt-Antwort in den (von sammle_codex schon gefuellten)
     Eintrag ein -- ueberschreibt nur, was der Endpunkt sicherer beantwortet
@@ -531,7 +612,7 @@ def codex_usage_anwenden(e, antwort):
             k["verbraucht"] = verbraucht
             k["grenze"] = 100
             k["rest"] = max(0, 100 - verbraucht)
-            k["einheit"] = "Wochenfenster (rollend, 7 Tage)"
+            k["einheit"] = codex_fenster_einheit(sekundaer.get("limit_window_seconds"))
             k["quelle"] = quelle
         if sekundaer.get("reset_at") is not None:
             k["faellt_zurueck_am"] = rueckfall_iso(sekundaer)
@@ -551,7 +632,8 @@ def codex_usage_anwenden(e, antwort):
             e["erschoepft"] = False
 
         e["hinweis"] = (e.get("hinweis") or "").rstrip() + \
-            " Kontingent-Endpunkt erreichbar: 7-Tage-Fenster %s%%, 5-Stunden-Fenster %s%% (Plan: %s)." % (
+            " Kontingent-Endpunkt erreichbar: %s-Tage-Fenster %s%%, 5-Stunden-Fenster %s%% (Plan: %s)." % (
+                codex_fenster_tage(sekundaer.get("limit_window_seconds")) or "7",
                 verbraucht if isinstance(verbraucht, (int, float)) else "?",
                 kurz_verbraucht if isinstance(kurz_verbraucht, (int, float)) else "?",
                 plan or "?")
@@ -619,6 +701,336 @@ def codex_verlauf_schreiben(e, fenster_meta=None):
     except OSError:
         return False
     return True
+
+
+# ── cline-pass: der aktive Kontingent-Endpunkt, nur aus 'auffrischen' ────────────
+# Siehe Kopfkommentar "CLINE-PASS-KONTINGENT UEBER DIE CLINE-API". Die
+# Einheit von costUsd (und der drei Caps) ist 1e-8 US-Dollar -- belegt am
+# 16.09.2026 durch Gegenrechnung: 15 Verbrauchseintraege summieren sich auf
+# 1999317 Einheiten, und opencode zeigt fuer dieselben Aufrufe 0,02 Dollar
+# (1999317 * 1e-8 = 0.01999...). Die Caps entsprechen damit 10/25/50 Dollar
+# (5 Stunden/7 Tage/30 Tage). Gerechnet und gesperrt wird trotzdem nur mit dem
+# ANTEIL AM CAP in Prozent -- die Einheit ist ein Server-Fakt, den Cline aendern
+# koennte, ohne dass es lokal auffiele; der Dollarwert ist nur Anzeige.
+CLINE_API_BASIS_DEFAULT = "https://api.cline.bot/api/v1"
+CLINE_EINHEIT_USD = 1e-8   # eine costUsd-Einheit in Dollar (Beleg oben)
+CLINE_SEITEN_OBERGRENSE = 50
+CLINE_LIMIT = 200          # Seitengroesse; deckt 30 Tage Nutzung locker ab
+
+
+def cline_schluessel():
+    """Der Cline-API-Key, oder None. Dieselbe Kette wie wb-harness-run
+    (SPEC-V3 A.1): macOS-Schluesselbund (Dienst 'cline-api-key'), dann
+    ~/.secrets-sync/api-keys/cline-pass (nur bei restriktivem Mode 600/400,
+    genau wie in wb-harness-run -- eine weltlesbare Key-Datei wird nicht
+    gelesen), dann die Umgebungsvariable CLINE_API_KEY. Der Wert verlaesst
+    diese Funktion nur in den Authorization-Header -- nie in eine Ausgabe,
+    einen Log oder eine Datei."""
+    if shutil.which("security"):
+        try:
+            r = subprocess.run(["security", "find-generic-password",
+                                "-s", "cline-api-key", "-w"],
+                               capture_output=True, text=True, timeout=10)
+            wert = (r.stdout or "").strip()
+            if r.returncode == 0 and wert:
+                return wert
+        except Exception:
+            pass
+    pfad = hp("~/.secrets-sync/api-keys/cline-pass")
+    if os.path.isfile(pfad):
+        try:
+            if (os.stat(pfad).st_mode & 0o777) in (0o600, 0o400):
+                with open(pfad, "r", encoding="utf-8") as f:
+                    wert = f.readline().strip()
+                if wert:
+                    return wert
+        except OSError:
+            pass
+    wert = (os.environ.get("CLINE_API_KEY") or "").strip()
+    return wert or None
+
+
+def cline_usage_abrufen(schluessel):
+    """Plan, Nutzerkennung und Verbrauchsseiten in EINEM Zug. Rueckgabe
+    (daten, fehler): daten ist None bei JEDEM Fehler (kein Netz, 401, Timeout
+    10s, kaputtes JSON, unerwartete Form), fehler nennt den Grund kurz fuer
+    den hinweis. daten = {"plan": <obj>, "me": <obj>, "seiten": [<usages-
+    Antworten>], "vollstaendig": bool}.
+
+    Mit WB_CLINE_USAGE_DATEI kommt alles aus der Fixture-Datei statt aus dem
+    Netz (Schluessel "plan"/"me"/"seiten") -- der einzige Weg, mit dem ein
+    Test den Endpunkt betritt. Paginierung: das Folgetoken steht in
+    data.nextToken, der ANFRAGE-Parameter heisst aber 'cursor' (gemessen
+    16.09.2026: nextToken ALS Parameter liefert stumm Seite 1 mit DEMSELBEN
+    Token zurueck -- ein nextToken-Loop waere endlos). Geblaettert wird,
+    solange ein nextToken da ist und der aelteste gelesene Eintrag juenger
+    als 30 Tage ist; die Seiten-Obergrenze faengt den Rest. Bei jedem
+    vorzeitigen Abbruch gilt der Verbrauch als unvollstaendig gelesen -- es
+    wird dann bewusst KEIN Urteil gefaellt, statt ein zu kleines Prozent
+    als 'frei' auszugeben."""
+    datei = os.environ.get("WB_CLINE_USAGE_DATEI")
+    if datei:
+        fix = lies_json(datei)
+        if not isinstance(fix, dict):
+            return None, "Fixture-Datei %s nicht lesbar" % datei
+        seiten, voll = [], False
+        for seite in (fix.get("seiten") or []):
+            if not isinstance(seite, dict):
+                continue
+            seiten.append(seite)
+            # dieselbe Antwortform wie im Netz: das Folgetoken liegt unter data
+            token = ((seite.get("data") or {}).get("nextToken")) or ""
+            if not token:
+                voll = True
+                break
+        return ({"plan": fix.get("plan"), "me": fix.get("me"),
+                 "seiten": seiten, "vollstaendig": voll}, "")
+    if not schluessel:
+        return None, ("kein API-Key (Schluesselbund 'cline-api-key', "
+                      "~/.secrets-sync/api-keys/cline-pass, CLINE_API_KEY alle leer)")
+    if not _netz_erlaubt():
+        return None, "Netzzugriff gesperrt (WB_KONTINGENT_KEIN_NETZ)"
+    basis = (os.environ.get("WB_CLINE_USAGE_URL") or CLINE_API_BASIS_DEFAULT).rstrip("/")
+
+    def hole(url):
+        anfrage = urllib.request.Request(
+            url, headers={"Authorization": "Bearer %s" % schluessel,
+                          "Accept": "application/json"})
+        with urllib.request.urlopen(anfrage, timeout=10) as antwort:
+            d = json.loads(antwort.read().decode("utf-8", "replace"))
+        if not isinstance(d, dict):
+            raise ValueError("Antwort ist kein JSON-Objekt")
+        return d
+
+    try:
+        plan = hole(basis + "/users/me/plan")
+        me = hole(basis + "/users/me")
+        uid = ((me.get("data") or {}).get("id"))
+        if not isinstance(uid, str) or not uid.startswith("usr-"):
+            raise ValueError("keine Nutzerkennung (data.id, Form 'usr-...')")
+        grenze = jetzt() - datetime.timedelta(seconds=30 * 86400)
+        seiten, token, gesehene, voll = [], "", set(), False
+        for _ in range(CLINE_SEITEN_OBERGRENSE):
+            pfad = "/users/%s/usages?limit=%d" % (urllib.parse.quote(uid, safe=""),
+                                                  CLINE_LIMIT)
+            if token:
+                pfad += "&cursor=" + urllib.parse.quote(token, safe="")
+            seite = hole(basis + pfad)
+            seiten.append(seite)
+            zeiten = [t for t in (cline_zeit((it or {}).get("createdAt"))
+                                  for it in ((seite.get("data") or {}).get("items") or []))
+                      if t]
+            if zeiten and min(zeiten) < grenze:
+                voll = True   # 30 Tage zusammen -- mehr braucht kein Fenster
+                break
+            token = ((seite.get("data") or {}).get("nextToken")) or ""
+            if not token:
+                voll = True
+                break
+            if token in gesehene:
+                break   # ein endloser Loop waere schlimmer als eine Luecke: kein Urteil
+            gesehene.add(token)
+        return ({"plan": plan, "me": me, "seiten": seiten, "vollstaendig": voll}, "")
+    except Exception as ex:
+        code = getattr(ex, "code", None)
+        return None, ("HTTP %s" % code) if code is not None else \
+            ("%s: %s" % (type(ex).__name__, ex))
+
+
+CLINE_FENSTER = [   # (Cap-Feld, Fensterlaenge in Sekunden, Bezeichnung, Tage je Tagesanteil oder None)
+    # Das 5-Stunden-Fenster ist eine HARTE SPERRE (rollend, erschoepft ab 100
+    # Prozent, ohne Tagesrate) -- die beiden grossen Fenster messen gegen ihren
+    # TAGESANTEIL (Korrektur aus der Abnahme 2026-09-16, siehe unten).
+    ("last5HoursUsageCostUSDPerUser", 5 * 3600, "5-Stunden-Fenster", None),
+    ("last7daysUsageCostUSDPerUser", 7 * 86400, "7-Tage-Fenster", 7),
+    ("last30daysUsageCostUSDPerUser", 30 * 86400, "30-Tage-Fenster", 30),
+]
+
+CLINE_CREATED_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(?:Z|[+-]\d{2}:?\d{2})?$")
+
+
+def cline_zeit(text):
+    """createdAt der Cline-API als UTC-datetime, oder None. DAS SYSTEM-PYTHON
+    IST 3.9.6 (Nachtrag 2026-09-16): fromisoformat wirft auf eine VARIABLE
+    Zahl Nachkommastellen ('2026-09-16T19:33:29.21631Z', fuenf Stellen) ein
+    'ValueError: Invalid isoformat string' -- deshalb: Sekundenanteil per
+    Regex abtrennen, Bruchteil mit Nullen auf sechs Stellen auffuellen, per
+    strptime lesen und mit tzinfo=timezone.utc setzen. Die API antwortet in
+    UTC ('Z'); ein abweichender Offset wird ebenfalls als UTC gelesen (die
+    Fenster rollen ab 'jetzt', ein Offset um Minuten ist egal)."""
+    m = CLINE_CREATED_RE.match((text or "").strip())
+    if not m:
+        return None
+    basis, fract = m.group(1), (m.group(2) or "")[:6].ljust(6, "0")
+    try:
+        return datetime.datetime.strptime(
+            "%s.%s" % (basis, fract),
+            "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+
+
+def cline_usage_anwenden(e, antworten):
+    """Traegt die drei Endpunkt-Antworten in den von sammle_cline_pass
+    vorbereiteten Eintrag ein und baut das Urteil. Rueckgabe True, wenn ein
+    Urteil gefallen ist. Gerechnet wird NUR in Prozent des Caps
+    (verbraucht_prozent = 100 * summe(costUsd im Fenster) / cap_des_fensters)
+    -- die Einheit von costUsd (1e-8 USD, Beleg oben) ist ein Server-Fakt,
+    den Cline aendern koennte, ohne dass es lokal auffiele; der Dollarwert
+    dient nur der lesbaren Anzeige. KNAPP-Linie (Korrektur aus der Abnahme,
+    16.09.2026): TAGESRATE -- der 7-Tage-Cap traegt cap/7, der 30-Tage-Cap
+    cap/30 pro Tag; KNAPP, wenn die Summe der letzten 24 Stunden ueber dem
+    Tagesanteil liegt. (Die erste Fassung leitete die Linie aus dem Alter des
+    aeltesten Eintrags im Fenster ab -- falsch bei einem ROLLENDEN Fenster:
+    es gibt keinen Fensteranfang, an dem ein Anteil verstreichen koennte, und
+    ein 2 Stunden altes Abo mit 0.558 von 25 USD waere dauerhaft KNAPP.)
+    Beim 5-Stunden-Fenster KEINE Tagesrate (dort ist der Cap harte Sperre,
+    erschoepft ab 100 Prozent). Steht komplett hinter einem Fehlerfang (wie
+    codex_usage_anwenden, Befund zu d321f3e): eine Antwort in unerwarteter
+    Form zaehlt wie ein unerreichbarer Endpunkt -- der Eintrag bleibt ohne
+    Urteil, hinweis sagt es, nichts stuerzt ab."""
+    try:
+        plan_data = ((antworten.get("plan") or {}).get("data") or {})
+        planinfo = (plan_data.get("plan") or {})
+        ent = ((planinfo.get("entitlements") or {}).get("cline_pass") or {})
+        caps = (ent.get("inferenceCapThreshold") or {})
+        uid = ((antworten.get("me") or {}).get("data") or {}).get("id")
+        if not isinstance(uid, str) or not uid.startswith("usr-"):
+            raise ValueError("keine brauchbare Nutzerkennung (data.id, 'usr-...')")
+        if not antworten.get("vollstaendig"):
+            raise ValueError("Verbrauch nur teilweise gelesen (Seiten-Obergrenze oder "
+                             "endlos scheinendes nextToken) -- Prozentangaben wuerden "
+                             "zuwenig abdecken")
+        eintraege = []
+        for seite in (antworten.get("seiten") or []):
+            for it in ((seite.get("data") or {}).get("items") or []):
+                if not isinstance(it, dict):
+                    continue
+                ts = cline_zeit(it.get("createdAt") or "")
+                if ts is not None:
+                    eintraege.append((ts, _zahl_oder_none(it.get("costUsd"))))
+        jetzt_ = jetzt()
+        # Die Tagesrate misst den Verbrauch der LETZTEN 24 STUNDEN gegen den
+        # Tagesanteil des jeweiligen Fensters (cap/7 bzw. cap/30). Dieselbe
+        # 24-Stunden-Summe dient beiden Fenstern; nur der Anteil unterscheidet
+        # sich. Alles in costUsd-Einheiten, Anzeige in Dollar (CLINE_EINHEIT_USD).
+        summe_24h = sum((k or 0.0) for ts, k in eintraege
+                        if (jetzt_ - ts).total_seconds() <= 24 * 3600)
+        fenster_stat = []
+        for feld, laenge_s, name, tage in CLINE_FENSTER:
+            cap = _zahl_oder_none(caps.get(feld))
+            im_fenster = [(ts, k or 0.0) for ts, k in eintraege
+                          if (jetzt_ - ts).total_seconds() <= laenge_s]
+            verbraucht = sum(k for _, k in im_fenster)
+            prozent = (100.0 * verbraucht / cap) \
+                if isinstance(cap, (int, float)) and cap > 0 else None
+            # Tagesanteil (nur 7d/30d): der Cap verteilt sich gleichmaessig auf
+            # die Tage des Fensters. Ohne messbaren Cap keine Linie -- unbekannt
+            # sperrt nie (Grundregel 1).
+            tagesanteil = (cap / float(tage)) \
+                if tage and isinstance(cap, (int, float)) and cap > 0 else None
+            fenster_stat.append((name, prozent, verbraucht, cap, tagesanteil))
+        if not any(f[1] is not None for f in fenster_stat):
+            raise ValueError("kein Fenster mit gemessenem Verbrauch (Caps fehlen)")
+
+        quelle = os.environ.get("WB_CLINE_USAGE_URL") or CLINE_API_BASIS_DEFAULT
+        name = planinfo.get("displayName")
+        if name:
+            e["plan"] = name
+            e["plan_quelle"] = "netz:%s/users/me/plan (data.plan.displayName)" % quelle
+        e["angemeldet"] = True   # beide authentifizierten Aufrufe sind durchgegangen
+
+        mittel, kurz = fenster_stat[1], fenster_stat[0]
+        if mittel[1] is not None:
+            # einheit/quelle nur GEMEINSAM mit dem gemessenen Wert (codex-Lehre)
+            k = e["kontingent"]
+            k["art"] = "zeitfenster"
+            k["verbraucht"] = round(mittel[1], 4)
+            k["grenze"] = 100
+            k["rest"] = max(0.0, 100.0 - mittel[1])
+            k["einheit"] = ("Prozent des 7-Tage-Fensters (Cap = %.2f USD)"
+                            % (mittel[3] * CLINE_EINHEIT_USD))
+            k["quelle"] = ("netz:%s/users/%s/usages, summiert gegen inferenceCapThreshold"
+                           % (quelle, uid))
+        if kurz[1] is not None:
+            fk = e["fenster_kurz"]
+            fk["verbraucht"] = round(kurz[1], 4)
+            fk["rest"] = max(0.0, 100.0 - kurz[1])
+
+        # Urteil: erschoepft, wenn irgendein Fenster 100 Prozent erreicht; knapp,
+        # wenn die letzte-24-Stunden-Summe ueber dem Tagesanteil eines grossen
+        # Fensters liegt. "KNAPP: " steht bewusst am ANFANG des hinweis
+        # (Kopfkommentar): der Vertrag kennt kein Feld dafuer, und
+        # cmd_knapp/cmd_pruefen lesen genau diesen festen Anfang fuer die
+        # Warnzeile -- NIEMALS fuer eine Sperre (nur ein NACHWEIS sperrt, und
+        # der bleibt an `erschoepft` haengen).
+        voll = [f for f in fenster_stat if f[1] is not None and f[1] >= 100.0]
+        ueber = [f for f in fenster_stat if f[4] is not None and summe_24h > f[4]]
+        if voll:
+            e["erschoepft"] = True
+        elif all(f[1] is not None for f in fenster_stat):
+            e["erschoepft"] = False   # alle drei Fenster gemessen, keins voll
+        # sonst: nicht alle Fenster messbar -- kein Urteil (erschoepft bleibt None)
+
+        def anteil(f):
+            text = "%s: %.1f%% (%.3f von %.2f USD)" % (
+                f[0], f[1], f[2] * CLINE_EINHEIT_USD, f[3] * CLINE_EINHEIT_USD)
+            if f[4] is not None:
+                text += ", letzte 24 Stunden %.3f von %.3f USD Tagesanteil" % (
+                    summe_24h * CLINE_EINHEIT_USD, f[4] * CLINE_EINHEIT_USD)
+            return text
+
+        gemessen = [f for f in fenster_stat if f[1] is not None]
+        teile = []
+        if voll:
+            teile.append("ERSCHOEPFT: " + ", ".join(
+                "%s bei %.1f%%" % (f[0], f[1]) for f in voll) + ".")
+        elif ueber:
+            teile.append("KNAPP: " + ", ".join(
+                "%s letzte 24 Stunden %.3f USD ueber dem Tagesanteil (%.3f USD)"
+                % (f[0], summe_24h * CLINE_EINHEIT_USD, f[4] * CLINE_EINHEIT_USD)
+                for f in ueber) + ".")
+        elif all(f[1] is not None for f in fenster_stat):
+            teile.append("frei:")
+        else:
+            teile.append("OFFEN: nicht alle Fenster messbar.")
+        if gemessen:
+            teile.append("; ".join(anteil(f) for f in gemessen) + ".")
+        e["hinweis"] = " ".join(teile)
+        return True
+    except Exception as ex:
+        e["hinweis"] = (e.get("hinweis") or "").rstrip() + \
+            " Cline-Endpunkt antwortete in unerwarteter Form (%s: %s) -- kein Urteil." % (
+                type(ex).__name__, ex)
+        return False
+
+
+def sammle_cline_pass(h, ctx):
+    """Der LOKALE Teil der Spur cline-pass: Modelle und die Erklaerung, warum
+    ohne 'auffrischen' kein Urteil moeglich ist. Die Spur haengt am PROVIDER
+    'cline-pass' (kein Harness, gefahren wird ueber opencode); auffrischen()
+    legt sie an und ruft diesen Sammler mit h=None -- die Modelle kommen dann
+    aus ctx (alle Modelle mit provider=cline-pass). Das Kontingent haelt Cline
+    Pass nur serverseitig vor; der Sammler selbst RUFT NICHTS (Grundregel:
+    das Messen kostet nichts -- der implizite Auto-Refresh aus pruefen darf
+    keinen Netzaufruf vor einen Spawn setzen). Der aktive Endpunkt laeuft
+    nur in cmd_auffrischen und traegt sein Ergebnis mit cline_usage_anwenden
+    nach; siehe Kopfkommentar "CLINE-PASS-KONTINGENT UEBER DIE CLINE-API".
+    Ohne gemessenen Stand bleibt alles 'unbekannt' und sperrt nie."""
+    e = leerer_eintrag("abo")
+    kb = kblock(h)
+    e["modelle_nutzbar"] = [m.get("modelRef") or m.get("id") for m in ctx["eigene_modelle"]]
+    e["modelle_quelle"] = kb.get("modellQuelle") or "registry:models[provider=cline-pass]"
+    if not cline_schluessel():
+        e["hinweis"] = ("Kein Cline-API-Key (Schluesselbund 'cline-api-key', "
+                        "~/.secrets-sync/api-keys/cline-pass, CLINE_API_KEY alle leer) -- "
+                        "nichts ermittelbar, kein Urteil.")
+    else:
+        e["hinweis"] = ("Kontingent haelt Cline Pass nur serverseitig vor; messbar nur "
+                        "per 'wb-kontingent auffrischen' (aktiver Endpunkt) -- ohne den "
+                        "bleibt das Urteil offen.")
+    return e
 
 
 # ── claude: die Statusleiste schreibt die Zahlen laengst ────────────────────────
@@ -806,6 +1218,7 @@ SAMMLER = {
     "claude": sammle_claude,
     "copilot-cloud": sammle_copilot_cloud,
     "agy": sammle_agy,
+    "cline-pass": sammle_cline_pass,
 }
 
 
@@ -870,6 +1283,22 @@ def auffrischen(nur_harness=None):
         if nur_harness and h["id"] != nur_harness:
             continue
         eintraege[h["id"]] = sammle(h, modelle, providers)
+    # PROVIDER-SPUR cline-pass (Korrektur aus der Abnahme, dritte Runde): die
+    # Cline-Grenze haengt am PROVIDER 'cline-pass', NICHT an einem Harness --
+    # cline-Pass-Modelle werden ueber opencode gefahren, und Harness-Eintraege
+    # steuern das Spawnen. Fuehrt die Registry diesen Provider, steht die Spur
+    # unter demselben Namen im Stand und wird von sammle_cline_pass gefuellt
+    # (der aktive Endpunkt folgt in cmd_auffrischen). --harness cline-pass
+    # trifft sie; ein Filter auf einen anderen Harness erhebt sie nicht neu
+    # und wirft sie nicht weg (sie bleibt aus dem alten Stand stehen).
+    if any(isinstance(p, dict) and p.get("id") == "cline-pass" for p in providers):
+        if not nur_harness or nur_harness == "cline-pass":
+            cline_ctx = {"eigene_modelle": [m for m in modelle
+                                            if isinstance(m, dict)
+                                            and m.get("provider") == "cline-pass"
+                                            and m.get("enabled") is not False],
+                         "providers": providers}
+            eintraege["cline-pass"] = sammle_cline_pass(None, cline_ctx)
     # Beobachtungen und Zaehler sind keine Sammler-Ausgabe -- ein Refresh der
     # Harnesses darf sie nie wegwerfen, sonst verliert `pruefen agy` seinen
     # einzigen Nachweis beim naechsten Auffrischen wieder.
@@ -1186,6 +1615,24 @@ def cmd_auffrischen(args):
                 " Kontingent-Endpunkt (%s) nicht erreichbar -- alter Weg (JWT/Sitzungsdateien) gilt weiter." % (
                     os.environ.get("WB_CODEX_USAGE_URL") or CODEX_USAGE_URL_DEFAULT)
         schreibe_zustand(daten)
+    # cline-pass-Kontingent (2026-09-16): derselbe Aufbau wie der Codex-Endpunkt
+    # oben -- drei aktive Aufrufe (plan, users/me, usages mit Paginierung),
+    # NUR hier (die explizite Aktion) und NIE aus sammle_cline_pass, sonst
+    # zoege der implizite Auto-Refresh aus pruefen einen Netzaufruf vor jeden
+    # Spawn. Die Spur haengt am PROVIDER (siehe auffrischen); sie wird nur
+    # gemessen, wenn dieser Lauf sie auch NEU ERHOBEN hat -- ein --harness-
+    # Filter auf einen anderen Harness lasst den alten Stand unverarbeitet
+    # stehen (Abnahme, dritte Runde). Schluessel nie ausgeben; Fehler setzen
+    # nur den hinweis.
+    cline_eintrag = daten.get("harnesses", {}).get("cline-pass")
+    if cline_eintrag is not None and (args.harness is None or args.harness == "cline-pass"):
+        cline_antwort, cline_fehler = cline_usage_abrufen(cline_schluessel())
+        if cline_antwort is None:
+            cline_eintrag["hinweis"] = (cline_eintrag.get("hinweis") or "").rstrip() + \
+                " Cline-Kontingent nicht messbar (%s) -- kein Urteil." % cline_fehler
+        else:
+            cline_usage_anwenden(cline_eintrag, cline_antwort)
+        schreibe_zustand(daten)
     # Luecke 2d (2026-08-27): hoechstens einmal am Tag den Rang des OpenRouter-
     # Schluessels pruefen (50 vs. 1000 kostenlose Anfragen) -- die einzige
     # Ausnahme von 'kein Netzzugriff', siehe openrouter_rang_pruefen(). Bewusst
@@ -1218,6 +1665,13 @@ def cmd_auffrischen(args):
     return 0
 
 
+def _kurz(wert):
+    # Anzeige: Zahlen auf zwei Nachkommastellen, ohne nachlaufende Nullen; alles andere wortgetreu.
+    if isinstance(wert, float):
+        return ("%.2f" % wert).rstrip("0").rstrip(".")
+    return str(wert)
+
+
 def _lesbar(iso_zeit):
     return iso_zeit[:16].replace("T", " ") if iso_zeit else "unbekannt"
 
@@ -1246,7 +1700,11 @@ def _zeile(hid, e, beob=None):
     elif e.get("angemeldet") is False and e.get("art") == "abo":
         zustand = "NICHT ANGEMELDET"
     elif e.get("erschoepft") is False:
-        zustand = "frei"
+        # KNAPP-Marke (2026-09-16, cline-pass): eine Spur, deren letzte 24
+        # Stunden ueber dem Tagesanteil liegen, ist NICHT 'frei' -- dieselbe
+        # feste Marke, die --knapp und pruefen lesen. Reine Anzeige, sperrt nichts.
+        zustand = "KNAPP (gesperrt)" \
+            if (e.get("hinweis") or "").startswith("KNAPP:") else "frei"
     elif e.get("art") == "lokal":
         # 'unbekannt' waere hier irrefuehrend: erschoepfen kann sich eine lokale
         # Spur nicht, die einzige Frage ist der Katalog -- und die ist beantwortet.
@@ -1256,13 +1714,27 @@ def _zeile(hid, e, beob=None):
         zustand = "unbekannt"
     rest = ""
     if k.get("rest") is not None:
-        rest = "%s %s" % (k["rest"], k.get("einheit") or "")
+        # Befund 2026-10-07: die Spalte zeigte "99.99220864 Prozent des 7-Tage-Fensters"
+        # -- das ist der REST, gelesen wurde es als Verbrauch am Deckel. Deshalb benannt
+        # und mit dem Verbrauch daneben.
+        rest = "Rest %s %s" % (_kurz(k["rest"]), k.get("einheit") or "")
+        if k.get("verbraucht") is not None:
+            rest += ", verbraucht %s" % _kurz(k["verbraucht"])
     elif k.get("verbraucht") is not None:
         rest = "%s %s verbraucht" % (k["verbraucht"], k.get("einheit") or "")
     elif k.get("art") == "keins":
         rest = "kein Kontingent"
     return "%-15s %-9s %-14s %-27s %s" % (
-        hid, e.get("art") or "?", e.get("plan") or "-", zustand, rest)
+        hid, _anzeige_art(hid, e), e.get("plan") or "-", zustand, rest)
+
+
+def _anzeige_art(hid, e):
+    """Die ART-Spalte von 'zeigen'. Codex mit gemessenem Plan free ist ein kostenloses
+    Kontingent (Rang 2, wie 'spur'); das Feld 'art' im Stand bleibt die Registry-Art,
+    weil 'pruefen' daran die Anmeldepruefung haengt."""
+    if hid == "codex" and str(e.get("plan") or "").strip().lower() == "free":
+        return "kostenlos"
+    return e.get("art") or "?"
 
 
 def cmd_zeigen(args):
@@ -1311,6 +1783,10 @@ def cmd_zeigen(args):
     print("%-15s %-9s %-14s %-27s %s" % ("HARNESS", "ART", "PLAN", "ZUSTAND", "KONTINGENT"))
     for hid in sorted(z["harnesses"]):
         print(_zeile(hid, z["harnesses"][hid], beobachtung_wirksam(z, hid)))
+    if any(" unbekannt " in _zeile(hid, z["harnesses"][hid], beobachtung_wirksam(z, hid))
+           for hid in z["harnesses"]):
+        print("Hinweis: 'unbekannt' heisst nicht gemessen, nicht frei -- vor einer Vergabe "
+              "'wb-kontingent auffrischen' ausfuehren.")
     zz = (z.get("zaehler") or {}).get("openrouter-frei") or {}
     if zz.get("tag") == _heutiger_tag_utc():
         verbraucht = zz.get("verbraucht") or 0
@@ -1346,6 +1822,82 @@ def _finde_modell(kennung, harness_id):
         if m.get("harness") == harness_id and (m.get("modelRef") or "") == kennung:
             return kennung
     return kennung
+
+
+def _provider_von_modell(kennung, harness_id):
+    """Die Provider-Kennung des genannten Modells (dieselbe Suche wie in
+    _finde_modell: erst per Registry-id, dann per modelRef unter diesem
+    Harness), oder None. pi-worker ruft 'pruefen <harness> <modell>' -- an
+    der Provider-Kennung haengt die Spur, deren Kontingent fuer dieses Modell
+    gilt (Korrektur aus der Abnahme, dritte Runde)."""
+    _, modelle, _ = registry()
+    for m in modelle:
+        if isinstance(m, dict) and m.get("id") == kennung:
+            return m.get("provider") or None
+    for m in modelle:
+        if isinstance(m, dict) and m.get("harness") == harness_id \
+                and (m.get("modelRef") or "") == kennung:
+            return m.get("provider") or None
+    return None
+
+
+def _modell_eintrag(kennung, harness_id):
+    """Registry-Eintrag fuer Modell-ID oder modelRef, soweit eindeutig.
+
+    Der Spawn kennt je nach Startweg eine Registry-ID oder den rohen modelRef.
+    Die Einordnung einer Spur muss deshalb dieselbe Aufloesung benutzen wie
+    pruefen(), statt eine zweite Modellliste im Starter zu pflegen.
+    """
+    _, modelle, _ = registry()
+    for m in modelle:
+        if isinstance(m, dict) and m.get("id") == kennung:
+            return m
+    for m in modelle:
+        if isinstance(m, dict) and m.get("harness") == harness_id \
+                and (m.get("modelRef") or "") == kennung:
+            return m
+    return None
+
+
+def codex_plan_frei():
+    """True, wenn der zuletzt gemessene Codex-Plan "free" ist (nur lesen, kein Netz)."""
+    z = lies_zustand() or {}
+    e = (z.get("harnesses") or {}).get("codex")
+    return isinstance(e, dict) and str(e.get("plan") or "").strip().lower() == "free"
+
+
+def cmd_spur(args):
+    """Druckt ``spur<TAB>klasse`` fuer den Worker-Starter.
+
+    Kostenlose Spuren sind absichtlich gemeinsame Kontingente. Alles andere
+    bleibt eine Abo-Spur, ausser die Registry belegt ein lokales Modell.
+    """
+    harnesses, _, providers = registry()
+    m = _modell_eintrag(args.modell, args.harness) if args.modell else None
+    harness = (m or {}).get("harness") or args.harness
+    provider = (m or {}).get("provider") or ""
+    model_ref = (m or {}).get("modelRef") or args.modell or ""
+    h = next((x for x in harnesses if x.get("id") == harness), None)
+    art = (kblock(h).get("art") or "").lower()
+
+    if harness == "agy":
+        spur, klasse = "agy", "kostenlos"
+    elif harness == "codex" and codex_plan_frei():
+        # Codex Free ist ein kostenloses Kontingent (Rang 2, regeln/vergabe.md),
+        # kein Abo: der Plan kommt aus den gemessenen Daten, nicht aus der Registry.
+        spur, klasse = "codex", "kostenlos"
+    elif provider == "openrouter" and model_ref.endswith(":free"):
+        spur, klasse = "openrouter-frei", "kostenlos"
+    elif harness == "copilot-cloud" or provider == "github-copilot":
+        spur, klasse = "copilot-cloud", "kostenlos"
+    elif provider_kind(provider, providers) == "local" or art == "lokal":
+        spur, klasse = harness or provider or "lokal", "lokal"
+    else:
+        # Cline Pass haengt als Abo-Spur am Provider, alle anderen an ihrem
+        # Harness. Die Registry bleibt damit die einzige Zuordnungstabelle.
+        spur, klasse = (provider if provider == "cline-pass" else harness), "abo"
+    print("%s\t%s" % (spur or "unbekannt", klasse))
+    return 0
 
 
 def cmd_pruefen(args):
@@ -1417,6 +1969,31 @@ def cmd_pruefen(args):
               % (args.harness, e.get("hinweis") or ""), file=sys.stderr)
         return 5
 
+    # PROVIDER-SPUR (Korrektur aus der Abnahme, dritte Runde): pi-worker ruft
+    # 'pruefen <harness> <modell>' -- bei einem Modell, das ueber einen
+    # PROVIDER mit eigener Spur im Stand faehrt (bei Cline Pass die Spur
+    # 'cline-pass', gefahren wird ueber opencode), haengt das Kontingent an
+    # dieser Spur, nicht am Harness. Allgemein ueber die Provider-Kennung:
+    # fuehrt der Provider eine eigene Spur im Stand, wird deren Urteil ZUSAETZLICH
+    # angewendet -- erschoepft sperrt wie eine erschoepfte Spur (Exit 3),
+    # KNAPP sperrt seit 2026-10-07 mit Exit 7. Der Harness-Eintrag selbst bleibt unberuehrt.
+    if args.modell:
+        provider_id = _provider_von_modell(args.modell, args.harness)
+        spur = (z.get("harnesses") or {}).get(provider_id) if provider_id else None
+        if isinstance(spur, dict) and spur.get("erschoepft") is True:
+            k = spur.get("kontingent") or {}
+            print("wb-kontingent: Modell '%s' faehrt ueber die Spur '%s', die nachweislich "
+                  "erschoepft ist -- kein Start. Wieder frei ab: %s. Beleg: %s"
+                  % (args.modell, provider_id, k.get("faellt_zurueck_am") or "unbekannt",
+                     k.get("quelle") or "?"), file=sys.stderr)
+            return 3
+        if isinstance(spur, dict) and (spur.get("hinweis") or "").startswith("KNAPP:"):
+            print("wb-kontingent: Modell '%s' faehrt ueber die Spur '%s', deren letzte 24 "
+                  "Stunden ueber dem Tagesanteil liegen (knapp) -- kein Start, die Spur faellt "
+                  "laut Vergaberegel aus: %s" % (args.modell, provider_id, spur["hinweis"]),
+                  file=sys.stderr)
+            return 7
+
     if args.modell:
         ref = _finde_modell(args.modell, args.harness)
         if ref in (e.get("modelle_gesperrt") or []):
@@ -1432,6 +2009,15 @@ def cmd_pruefen(args):
             if frei is not None and frei < 4096:
                 print("wb-kontingent: WARNUNG -- nur %d MiB frei; ein grosses lokales Modell "
                       "verdraengt hier moeglicherweise ein anderes." % frei, file=sys.stderr)
+    # KNAPP (2026-09-16 als Warnung, seit 2026-10-07 Sperre): die letzte-24-Stunden-
+    # Summe ueber dem Tagesanteil, aber nicht erschoepft -- dieselbe feste Marke, die
+    # `--knapp` ausgibt. Die Vergaberegel (regeln/vergabe.md Rang 3) laesst die Spur
+    # dann ausfallen; als blosse Warnung meldete `pruefen` Exit 0 und galt als frei.
+    if (e.get("hinweis") or "").startswith("KNAPP:"):
+        print("wb-kontingent: Harness '%s' verbraucht in den letzten 24 Stunden mehr als "
+              "den Tagesanteil (knapp) -- kein Start, die Spur faellt laut Vergaberegel aus: %s"
+              % (args.harness, e["hinweis"]), file=sys.stderr)
+        return 7
     return 0
 
 
@@ -1498,6 +2084,19 @@ def cmd_knapp(args):
             continue
         k = e.get("kontingent") or {}
         print("%s: erschoepft, wieder ab %s" % (hid, _lesbar(k.get("faellt_zurueck_am"))))
+    # KNAPP (2026-09-16, cline-pass): letzte-24-Stunden-Summe ueber dem
+    # Tagesanteil, ohne erschoepft zu sein. Der Sammler traegt sein Urteil als
+    # feste Marke am ANFANG des hinweis ein ("KNAPP: ..."), weil der Vertrag
+    # fuer neue Eintragsfelder gesperrt ist (test-kontingent.sh -- 1 erzwingt
+    # die Feldmenge). Gelesen wird hier nur dieser feste, vom Sammler
+    # geschriebene Anfang -- fuer die Warnzeile, nie fuer eine Sperre
+    # (Grundregel 1: nur ein NACHWEIS sperrt, und der bleibt an `erschoepft`
+    # haengen).
+    for hid, e in sorted((z.get("harnesses") or {}).items()):
+        if hid in beobachtet_schon or e.get("erschoepft") is True:
+            continue
+        if (e.get("hinweis") or "").startswith("KNAPP:"):
+            print("%s: %s" % (hid, e["hinweis"]))
     zz = (z.get("zaehler") or {}).get("openrouter-frei") or {}
     grenze = zz.get("grenze")
     if zz.get("tag") == _heutiger_tag_utc() and grenze:
@@ -1589,7 +2188,9 @@ def freier_speicher_mib():
 
 def main():
     ap = argparse.ArgumentParser(prog="wb-kontingent", add_help=True,
-                                 description="Plan, nutzbare Modelle und Restkontingent je Harness.")
+                                 description=("Plan, nutzbare Modelle und Restkontingent je Harness. "
+                                              "'unbekannt' heisst nicht gemessen, nicht frei: vor einer "
+                                              "Vergabe 'wb-kontingent auffrischen' ausfuehren."))
     # Top-level statt Unterbefehl, weil der SessionStart-Hook genau diesen einen
     # Aufruf macht ('wb-kontingent --knapp') und keinen Unterbefehl parsen muss.
     ap.add_argument("--knapp", action="store_true",
@@ -1611,6 +2212,11 @@ def main():
     p.add_argument("harness")
     p.add_argument("modell", nargs="?")
     p.set_defaults(fn=cmd_pruefen)
+
+    p = sub.add_parser("spur", help="Registry-Spur fuer einen Worker bestimmen (intern: Spur<TAB>Klasse)")
+    p.add_argument("harness")
+    p.add_argument("modell", nargs="?")
+    p.set_defaults(fn=cmd_spur)
 
     p = sub.add_parser("pfad", help="Pfad der Zustandsdatei")
     p.set_defaults(fn=lambda a: (print(STATE_FILE), 0)[1])

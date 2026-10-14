@@ -24,9 +24,8 @@
 #   wb-state settings get <key>                print the setting (empty = unset)
 #   wb-state settings set <key> <value> [--grund '<warum>']
 #                                               write it (read-modify-write); --grund ist
-#                                               nur fuer orchestratorPermissionMode Pflicht
-#                                               (siehe unten), jeder andere Schluessel
-#                                               ignoriert es
+#                                               beim Anheben von Permission-Modi Pflicht
+#                                               (siehe unten), andere Schluessel ignorieren es
 #   wb-state settings valid                    Exit 0: Datei fehlt oder ist gueltiges JSON;
 #                                               Exit 1: Datei ist da, aber kaputt. Nur fuer
 #                                               Aufrufer, die den Unterschied zur leisen
@@ -51,6 +50,12 @@
 #            der Orchestrator startet -- braucht wb-mensch UND --grund. Sonst waere dieser
 #            Schluessel selbst der Weg, auf dem sich ein Agent die Berechtigungsabfrage
 #            seines eigenen Orchestrators abschaltet.
+#   wb-state settings set workerSkipPermissions true --grund '<warum>'
+#            (2026-09-29) -- nur das ANHEBEN von false auf true braucht denselben
+#            Menschenbeleg. Die Vorgabe ist true; erneutes Setzen auf true lockert
+#            nichts, und SENKEN auf false darf jeder. Claude-Worker behalten ihren
+#            autonomen Startweg. Agent und Mensch teilen jedoch die UID: direktes
+#            Bearbeiten von settings.json umgeht beide wb-state-Schreibpruefungen.
 #
 # V3 (SPEC-V3-MODELS section B) — the model/harness/provider REGISTRY:
 #   wb-state models list [--role worker|orchestrator] [--machine mac|peer]
@@ -71,8 +76,15 @@
 #                                               in die gepflegte Registry ein und entfernt
 #                                               contextSession im selben Zug (2026-08-11,
 #                                               SPEC-V4 6.3 Punkt 2)
+#   wb-state models probe [<id> ...] [--json] [--dry-run] [--timeout <s>]
+#                                               one short real call per model waiting
+#                                               for it (probe.status offen|abgelehnt);
+#                                               passed -> enabled, rejected -> reason
+#                                               and date, asked again next run
+#   wb-state models families [--json]           family aliases, current target, lock
 #   wb-state models discover [--all | <harnessId|providerId> ...]
-#            [--if-stale] [--dry-run] [--json] [--force] [--no-network] [--allow-empty]
+#            [--if-stale] [--dry-run] [--json] [--force] [--no-network]
+#            [--allow-empty] [--allow-shrink]
 #                                               auto-detect installed models per harness'
 #                                               'discover' block (ollama/CLI/file source)
 #                                               AND per provider's 'discover' block
@@ -91,6 +103,8 @@
 #                                               wirklich entfernen; ohne den Schalter
 #                                               gilt die leere Antwort als Ausfall und
 #                                               es wird nichts geloescht
+#                                               --allow-shrink bestaetigt fuer diesen
+#                                               Lauf einen Teilrueckgang unter 50 %
 #   wb-state models catalog [--json]            per provider with a catalog: size, free
 #                                               count, balance + fetch time, key present?,
 #                                               how many registered — read-only, no network
@@ -647,8 +661,10 @@ import json, sys
 # JSON must never be an error — the default wins. Unknown keys print nothing.
 DEFAULTS = {
     "orchestratorHarness": "claude",
-    "orchestratorModel": "claude-opus-5",
+    "orchestratorModel": "opus",
     "orchestratorEffort": "xhigh",
+    "harnessUpdateAuto": True,
+    "harnessUpdateIntervalHours": 6,
     "workerLayout": "split",
     # 2026-08-11: workerModel/workerEffort stehen NICHT mehr im Einstellungsmenue.
     # Der Orchestrator nennt Modell und Denkstufe in jedem Spawn-Befehl selbst;
@@ -705,6 +721,11 @@ DEFAULTS = {
     # 13 ist der bisherige Wert, der Bereich 8 bis 32 (darunter ist nichts mehr
     # zu lesen, darueber passt keine brauchbare Zahl Spalten mehr ins Fenster).
     "terminalFontSize": 13,
+    # Bilder je Sekunde der Agentenfiguren und ihrer Ringe in der Mac-Fassung
+    # (09.10.2026, Auftrag figur-uhr). Nur die Figuren, nicht der Rest der App.
+    # 30 ist der bisherige Wert; der Nutzer entscheidet nach der Messung bei 30,
+    # 20 und 15, ob er sinkt. Zweite Stelle: VORGABEN in einstellungen.ts.
+    "figurenBildrate": 30,
     # Wieviele Zeilen EINE Rad-Rasterung bewegt. Stand seit dem 06.08. nur im
     # Programm, obwohl der Schreibweg fuer die geteilte Datei hier liegt -- ein
     # `wb-state settings get terminalScrollLines` antwortete deshalb leer, wo es
@@ -712,6 +733,10 @@ DEFAULTS = {
     # app/src/main/einstellungen.ts.
     "terminalScrollLines": 3,
     "maxWorkers": 8,
+    # 2026-09-25 (der Nutzer): untaetige Sitzungen jedes Harness nach so vielen Minuten
+    # schlafen legen (shell/wb-schlaf); 0 schaltet ab. 60 = Lebensdauer des
+    # Prompt-Caches, danach kostet das Fortsetzen keine zusaetzlichen Token.
+    "schlafNachMinuten": 60,
     # How many worker panes one `workers` tab holds before wb-grid opens
     # `workers-2`, `workers-3`, ... 0 = unlimited (one tab, no cap). 6 is
     # measured (2 MINW=80 columns x 3 rows of >=17 readable rows on the
@@ -743,6 +768,7 @@ DEFAULTS = {
     # dieser Vorgabe: VORGABEN in app/src/main/einstellungen.ts -- wer sie
     # aendert, aendert beide (shell/tests/test-vorgaben-paritaet.sh vergleicht).
     "closeSessionOnWindowClose": False,
+    "mobileServer": False,
     # Netzabruf der Anbieter-Kataloge (OpenRouter & Co). An = Vorgabe; aus heisst NUR,
     # dass nicht mehr von selbst ins Netz gegangen wird — die lokalen Quellen (ollama,
     # CLI-Listen, Dateien) laufen weiter automatisch, und der Knopf in den Einstellungen
@@ -755,11 +781,11 @@ DEFAULTS = {
     # Schnelloeffner, Inhaltssuche), fragt DIESE Liste.
     #
     # Verzeichnisse werden AUSGELASSEN, nicht nur ihr Inhalt verborgen: '.ssh'
-    # und '90-secrets' stehen deshalb hier und nicht in den Mustern. Die uebrigen
+    # und 'secrets' stehen deshalb hier und nicht in den Mustern. Die uebrigen
     # Eintraege sind Ballast (node_modules & Co) und ersparen jeder Ansicht ihre
     # eigene Liste.
     "secretExcludeDirs": [
-        "90-secrets", ".ssh", ".gnupg",
+        "secrets", ".ssh", ".gnupg",
         "node_modules", ".git", "dist", "build", "__pycache__", ".venv", "venv",
         ".mypy_cache", ".pytest_cache", ".next", ".turbo", "target",
     ],
@@ -1012,9 +1038,8 @@ PY
         ;;
       set)
         KEY="${1:?key}"; VALUE="${2?value}"; shift 2
-        # --grund ist bisher fuer genau EINEN Schluessel Pflicht
-        # (orchestratorPermissionMode, Anheben auf bypassPermissions, 2026-08-16) --
-        # jeder andere Schluessel liest ihn ein und ignoriert ihn dann einfach.
+        # --grund ist beim Anheben von orchestratorPermissionMode und
+        # workerSkipPermissions Pflicht; andere Schluessel ignorieren ihn.
         GRUND=""
         while [ $# -gt 0 ]; do
           case "$1" in
@@ -1033,7 +1058,7 @@ PY
         fi
         [ -n "$ACTOR" ] || ACTOR="-"
         /usr/bin/python3 - "$SETTINGS" "$KEY" "$VALUE" "$LOCKDIR" "$ACTOR" "$HOME/.local/state/wb-settings-changes.log" "$GRUND" <<'PY'
-import json, os, re, shutil, subprocess, sys, tempfile, time, datetime
+import json, os, pwd, re, shutil, stat, subprocess, sys, tempfile, time, datetime
 file, key, value, lockdir, actor, changelog, grund = sys.argv[1:8]
 os.makedirs(os.path.dirname(file), exist_ok=True)
 
@@ -1061,6 +1086,43 @@ def drop_stale(path):
         os.rmdir(path)
     except OSError:
         shutil.rmtree(path, ignore_errors=True)
+
+def test_setup_proof():
+    """The same runner-owned proof shape as agents_data._test_setup_proof()."""
+    raw_path = os.environ.get("WB_TEST_AUFBAU_BELEG")
+    raw_home = os.environ.get("HOME")
+    if not raw_path or not raw_home:
+        return False, "WB_TEST_AUFBAU_BELEG oder HOME fehlt"
+    if not os.path.isabs(raw_path) or not os.path.isabs(raw_home):
+        return False, "Aufbau-Beleg und HOME muessen absolute Pfade sein"
+    try:
+        home_real = os.path.realpath(raw_home)
+        path_real = os.path.realpath(raw_path)
+        if os.path.islink(raw_path) or path_real == home_real \
+                or os.path.commonpath((home_real, path_real)) != home_real:
+            return False, "Aufbau-Beleg muss symlinkfrei unter dem Prozess-HOME liegen"
+        home_info = os.stat(home_real)
+        if not stat.S_ISDIR(home_info.st_mode) or home_info.st_uid != os.getuid() \
+                or stat.S_IMODE(home_info.st_mode) != 0o700:
+            return False, "Prozess-HOME fuer Aufbau muss dem Benutzer gehoeren und Modus 0700 haben"
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(raw_path, flags)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                return False, "Aufbau-Beleg muss eine eigene regulaere Datei sein"
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                return False, "Aufbau-Beleg muss Modus 0600 haben"
+            if info.st_size < 32 or info.st_size > 4096:
+                return False, "Aufbau-Beleg hat keine gueltige Laenge"
+            content = os.read(descriptor, 4097)
+        finally:
+            os.close(descriptor)
+    except (OSError, ValueError) as exc:
+        return False, "Aufbau-Beleg ist nicht sicher lesbar (%s)" % type(exc).__name__
+    if len(content) != info.st_size:
+        return False, "Aufbau-Beleg ist nicht vollstaendig lesbar"
+    return True, "privater Test-Aufbaubeleg"
 
 start = time.time()
 while True:
@@ -1135,7 +1197,9 @@ try:
     NUM = {"workerPollSeconds": (1, 3600), "guardOrchWarnPct": (1, 99),
            "guardWorkerWarnPct": (1, 99), "minWorkerPaneWidth": (20, 1000),
            "maxWorkers": (1, 64), "maxWorkerPanesPerTab": (0, 64),
-           "stallMinutes": (1, 120), "terminalFontSize": (8, 32)}
+           "stallMinutes": (1, 120), "terminalFontSize": (8, 32),
+           "figurenBildrate": (10, 60),
+           "harnessUpdateIntervalHours": (1, 168), "schlafNachMinuten": (0, 10080)}
     ENUM = {"workerLayout": ["split", "window"],
             # 2026-09-04: woran ein Worker-Pane haengt. Derselbe Grund wie bei
             # workerZustellung darunter -- ein Tippfehler wuerde still auf die
@@ -1170,7 +1234,8 @@ try:
                                            "manual", "dontAsk", "plan"],
             "orchestratorHarness": None}          # free, but must be a string
     BOOL = ("terminalStartMaximized", "contextGuardAutostart", "modelDiscoveryAuto",
-            "closeSessionOnWindowClose", "workerWorktrees", "workerSkipPermissions",
+            "harnessUpdateAuto",
+            "closeSessionOnWindowClose", "mobileServer", "workerWorktrees", "workerSkipPermissions",
             "guardMeldetWorkerStatus", "orchestratorVorhersage", "workerVorhersage",
             "agentsBlattVorschau")
     LIST = ("secretExcludeDirs", "secretExcludePatterns", "remoteMachines", "remoteMachinesPausiert")
@@ -1273,7 +1338,7 @@ try:
         # durch einen Tippfehler, der als Zeichenkette durchgeht.
         if not isinstance(parsed, list) or not all(isinstance(x, str) for x in parsed):
             sys.stderr.write("wb-state: FEHLER — '%s' ist eine JSON-Liste von Zeichenketten "
-                             "(z. B. '[\"90-secrets\",\".ssh\"]'), '%s' wird nicht "
+                             "(z. B. '[\"secrets\",\".ssh\"]'), '%s' wird nicht "
                              "gespeichert.\n" % (key, value))
             sys.exit(1)
     elif key in NUM:
@@ -1293,25 +1358,46 @@ try:
             sys.stderr.write("wb-state: FEHLER — '%s' kennt nur %s, '%s' wird nicht "
                              "gespeichert.\n" % (key, "|".join(ENUM[key]), value))
             sys.exit(1)
-    if key == "orchestratorPermissionMode" and parsed == "bypassPermissions":
-        # Die vierte Sicherung (siehe Kopf dieser Datei, "Was ein MENSCH lockert").
-        # bypassPermissions bleibt hart hinterlegt (muss zur DEFAULTS-Zeile weiter
-        # oben in dieser Datei passen): SENKEN (jeder andere der sechs Werte, auch
-        # WEG von bypassPermissions) geht immer und ohne Grund; nur das ANHEBEN auf
-        # die staerkste Stufe ist gesperrt. Ein unset Schluessel gilt als bereits
-        # bypassPermissions (das ist die Vorgabe) -- ihn zum ersten Mal explizit auf
-        # denselben Wert zu setzen ist keine Lockerung.
-        vorher = cfg.get(key) or "bypassPermissions"
-        if vorher != "bypassPermissions":
+    hebt_permission_an = (key == "orchestratorPermissionMode" and parsed == "bypassPermissions") \
+        or (key == "workerSkipPermissions" and parsed is True)
+    if hebt_permission_an:
+        # Beide Vorgaben sind bereits die lockere Stufe. Ein unset Schluessel
+        # gilt daher als true/bypassPermissions; nur ein gespeichertes Absenken
+        # und anschliessendes Anheben braucht den Menschen mit Grund.
+        zielwert = "bypassPermissions" if key == "orchestratorPermissionMode" else True
+        bezeichnung = ("orchestratorPermissionMode auf 'bypassPermissions'"
+                       if key == "orchestratorPermissionMode"
+                       else "workerSkipPermissions auf 'true'")
+        vorher = cfg.get(key, zielwert)
+        if vorher != zielwert:
             if not (grund or "").strip():
                 sys.stderr.write(
-                    "wb-state: FEHLER — orchestratorPermissionMode auf 'bypassPermissions' "
+                    "wb-state: FEHLER — %s "
                     "anheben braucht --grund '<warum>'. Ein Deckel ohne Grund liest sich "
-                    "spaeter wie eine technische Grenze. Nichts gespeichert.\n")
+                    "spaeter wie eine technische Grenze. Nichts gespeichert.\n" % bezeichnung)
                 sys.exit(1)
-            wb_mensch = os.path.expanduser("~/.local/bin/wb-mensch")
+            echtes_home = pwd.getpwuid(os.getuid()).pw_dir
+            echte_settings = os.path.join(
+                echtes_home, ".claude", "workbench", "settings.json")
+            umgelenkt = os.path.realpath(file) != os.path.realpath(echte_settings)
+            beleg_ok, beleg_grund = test_setup_proof() if umgelenkt else (False, "nicht noetig")
+            test_home = os.path.realpath(os.environ.get("HOME") or "")
+            test_settings = os.path.join(test_home, ".claude", "workbench", "settings.json")
             try:
-                mensch = subprocess.run([wb_mensch, "pruefen"]).returncode == 0
+                if not echtes_home:
+                    raise RuntimeError("Heimatverzeichnis nicht bestimmbar")
+                # Ein gueltiger Runner-Beleg darf im privaten Test-HOME die
+                # dort installierte, unveraenderte Messsonde auswaehlen. Er
+                # ersetzt die Menschenmessung nicht. Ohne gueltigen Beleg
+                # bleibt die Sonde im echten Benutzer-HOME massgeblich.
+                probe_home = test_home if beleg_ok and umgelenkt else echtes_home
+                probe_env = {"HOME": probe_home,
+                             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                             "TMPDIR": "/tmp"}
+                probe_env.update({k: os.environ[k] for k in ("WB_MENSCH_QUELLE", "WB_APP_PID")
+                                  if k in os.environ})
+                wb_mensch = os.path.join(probe_home, ".local/bin/wb-mensch")
+                mensch = subprocess.run([wb_mensch, "pruefen"], env=probe_env).returncode == 0
             except Exception as e:
                 sys.stderr.write(
                     "wb-state: FEHLER — wb-mensch ist nicht aufrufbar (%s) — im Zweifel gilt: "
@@ -1321,17 +1407,27 @@ try:
                 beleg = ""
                 try:
                     beleg = subprocess.run([wb_mensch, "beleg"], capture_output=True,
-                                           text=True).stdout.strip()
+                                           text=True, env=probe_env).stdout.strip()
                 except Exception:
                     pass
                 sys.stderr.write(
-                    "wb-state: FEHLER — orchestratorPermissionMode auf 'bypassPermissions' "
+                    "wb-state: FEHLER — %s "
                     "anheben darf nur ein MENSCH.\n"
                     "  Erkannt wurde: %s\n"
                     "  Ein Mensch handelt am Terminal oder in der Oberflaeche der Werkbank; "
                     "aus einem Worker- oder Orchestrator-Pane heraus geht es nicht.\n"
-                    "  Diagnose: wb-mensch beleg ; wb-mensch ahnen\n" % (beleg or "kein Beleg"))
+                    "  Diagnose: wb-mensch beleg ; wb-mensch ahnen\n"
+                    % (bezeichnung, beleg or "kein Beleg"))
                 sys.exit(1)
+            if umgelenkt:
+                if not beleg_ok or os.path.realpath(file) != os.path.realpath(test_settings):
+                    sys.stderr.write(
+                        "wb-state: FEHLER — nur die Einstellung in der echten Benutzer-Home "
+                        "darf %s anheben. "
+                        "Im privaten Test-HOME ist dafuer ein gueltiger, vom Testrunner "
+                        "ausgestellter WB_TEST_AUFBAU_BELEG noetig (%s). Nichts gespeichert.\n"
+                        % (bezeichnung, beleg_grund))
+                    sys.exit(1)
     old = cfg.get(key, "<unset>")
     cfg[key] = parsed
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(file))
@@ -1459,8 +1555,13 @@ def mensch_oder_ende():
     wb-mensch direkt -- dieselbe Messung, derselbe Text."""
     import os
     wb = os.path.expanduser("~/.local/bin/wb-mensch")
+    probe_env = {"HOME": os.environ.get("HOME", ""),
+                 "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                 "TMPDIR": "/tmp"}
+    probe_env.update({k: os.environ[k] for k in ("WB_MENSCH_QUELLE", "WB_APP_PID")
+                      if k in os.environ})
     try:
-        r = subprocess.run([wb, "pruefen"])
+        r = subprocess.run([wb, "pruefen"], env=probe_env)
         ok = r.returncode == 0
     except Exception as e:
         die("FEHLER: wb-mensch ist nicht aufrufbar (%s) — im Zweifel gilt: kein Mensch, "
@@ -1469,7 +1570,8 @@ def mensch_oder_ende():
         return
     beleg = ""
     try:
-        beleg = subprocess.run([wb, "beleg"], capture_output=True, text=True).stdout.strip()
+        beleg = subprocess.run([wb, "beleg"], capture_output=True, text=True,
+                               env=probe_env).stdout.strip()
     except Exception:
         pass
     die("FEHLER: '%s %s' lockert eine Sicherung — das darf nur ein MENSCH." % (CMD, SUB),
@@ -1692,7 +1794,7 @@ PY
     if [ "$CMD" = harness ]; then
       SUB="harness-${1:?get}"; shift
     else
-      SUB="${1:?list|get|resolve|table|check|add|set|remove|discover|catalog}"; shift
+      SUB="${1:?list|get|resolve|table|check|add|set|remove|discover|catalog|probe|families}"; shift
     fi
     # Who is changing the registry? Same reasoning as the settings change log: the
     # file is shared state, so every write is traceable to a pane.
@@ -1736,11 +1838,11 @@ PY
     else
       CHANGELOGFILE="$HOME/.local/state/wb-models-changes.log"
     fi
-    /usr/bin/python3 - "$MODELSFILE" "$LOCKDIR" "$ACTOR" "$CHANGELOGFILE" "$STDINFILE" "$SUB" ${@+"$@"} <<'PY'
+    /usr/bin/python3 - "$MODELSFILE" "$LOCKDIR" "$ACTOR" "$CHANGELOGFILE" "$STDINFILE" "$SUB" "$0" ${@+"$@"} <<'PY'
 import datetime, fcntl, glob, json, os, platform, re, shlex, shutil, subprocess, sys, tempfile, time
 
-MODELS_FILE, LOCKDIR, ACTOR, CHANGELOG, STDIN_FILE, SUB = sys.argv[1:7]
-ARGV = sys.argv[7:]
+MODELS_FILE, LOCKDIR, ACTOR, CHANGELOG, STDIN_FILE, SUB, SCRIPT = sys.argv[1:8]
+ARGV = sys.argv[8:]
 
 def stdin_text(what):
     """Payload of a `-` argument. The shell already read stdin into STDIN_FILE —
@@ -1856,6 +1958,12 @@ RESERVED = set("""qwen qwen38 ornith ornith9 grug default -
 claude claude-sonnet claude-sonnet5 claude-haiku claude-haiku45 claude-fable
 claude-fable5 claude-fable51 claude-opus5 claude-opus48 claude-opus
 haiku45 sonnet5 opus5 opus48 fable5 fable51 haiku sonnet opus fable""".split())
+RESERVED_ALIAS_OWNERS = {
+    "qwen38": "qwen38-27b", "ornith": "qwen38-27b", "ornith9": "ornith-9b",
+    "grug": "qwen38-27b", "haiku45": "claude-haiku-4-5",
+    "sonnet5": "claude-sonnet-5", "opus5": "claude-opus-5",
+    "opus48": "claude-opus-4-8", "fable51": "claude-fable-5-1",
+}
 
 def die(msg, *rest):
     sys.stderr.write(msg + "\n")
@@ -1875,12 +1983,64 @@ SECRET_PREFIXES = ("sk-", "sk_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github
 PLACEHOLDER_PREFIXES = ("{", "@keychain:", "@file:", "@env:", "http://", "https://",
                         "~/", "/", "^", "$")
 
+# The shared pattern list of the house, loaded from the file (not copied): repo version next to
+# shell/ first, else the rolled-out copy under ~/.claude/hooks/lib -- the order wb-gruppe uses.
+# FAILURE MODE (2026-10-10): if the file is missing or unusable, only the prefix logic and the
+# blob test below apply -- exactly today's behaviour. Refusing every registry write on a machine
+# without the file would turn a missing rollout into an outage of the registry that every
+# launcher reads; the prefix list stays the floor.
+_GEHEIMNIS_LIB = []
+
+def geheimnis_lib():
+    if not _GEHEIMNIS_LIB:
+        modul = None
+        hier = os.path.dirname(os.path.realpath(SCRIPT))
+        for kandidat in (os.path.join(hier, "..", "hooks", "lib", "geheimnis_inhalt.py"),
+                         os.path.join(HOME, ".claude", "hooks", "lib", "geheimnis_inhalt.py")):
+            if not os.path.isfile(kandidat):
+                continue
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("wb_state_geheimnis_inhalt", kandidat)
+                kand = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(kand)
+                if kand.PATTERNS and callable(kand.treffer):
+                    modul = kand
+                    break
+            except Exception:
+                continue
+        _GEHEIMNIS_LIB.append(modul)
+    return _GEHEIMNIS_LIB[0]
+
+def lib_erkennt(t):
+    """True if the shared list finds a provider key in `t`. A bare value carries no keyword, so
+    the keyword-bound entropy rule (generisch) is off; the provider patterns are not."""
+    lib = geheimnis_lib()
+    if lib is None:
+        return False
+    try:
+        return any(True for _ in lib.treffer(t, False, frozenset(), False))
+    except Exception:
+        return False
+
 def looks_like_secret(v):
     if not isinstance(v, str):
         return False
     t = v.strip()
-    if len(t) < 12 or t.startswith(PLACEHOLDER_PREFIXES):
+    if len(t) < 12:
         return False
+    if t.startswith(PLACEHOLDER_PREFIXES):
+        # A path, a URL or a placeholder is not a key as a whole -- but it can CARRY one
+        # (`https://host/v1?key=<key>`, `/dir/<key>`, `https://user:<key>@host`). The shared
+        # list's provider forms (never the keyword-bound entropy rule) are checked here too.
+        # Measured 2026-10-10 against what could coincide: 3.4 million file and directory names
+        # (~/AI, the vault without secrets, ~/.claude, ~/.cache, ~/.pi-workers, ~/.local/share,
+        # node_modules, Homebrew Cellar), the default and the live registry (178 and 188 values with
+        # such a prefix) and 19585 such strings in shell/tests: 0 hits. The patterns demand the full
+        # length of a key behind a prefix that is not glued to a letter, so `/opt/disk-images/x`,
+        # `~/models/sk-learn` or `/x/ghp_notes.md` carry nothing. A kebab-case directory literally
+        # named `sk-` plus 20 more key characters would be refused -- the one known coincidence.
+        return lib_erkennt(t)
     # A catalog auth VALUE TEMPLATE ('Bearer {key}', discover.auth.value) carries the
     # literal token '{key}' -- the real secret is substituted in only at fetch time and
     # never stored here. Same category as {secret:<provider>}: a placeholder syntax the
@@ -1890,6 +2050,11 @@ def looks_like_secret(v):
     if "{key}" in t:
         return False
     if t.startswith(SECRET_PREFIXES):
+        return True
+    # The house-wide pattern list (hooks/lib/geheimnis_inhalt.py): provider forms the prefix
+    # list above does not know, and a key in the MIDDLE of a value (`key=GOCSPX-...`), which a
+    # prefix test never sees. Union with the prefix logic, never a replacement.
+    if lib_erkennt(t):
         return True
     # generic high-entropy blob: long, and nothing but key characters, with both
     # letters and digits. Model ids ('claude-sonnet-5', 'ollama/ornith:9b') are too
@@ -2016,10 +2181,17 @@ BUILTIN_HARNESSES = [
      # die Absende-Verifikation einen haengenden Prompt, obwohl die Nachricht angekommen
      # IST — gemessen 2026-07-29 beim Nachreichen eines Auftrags an einen laufenden Worker.
      "promptIgnore": "^❯ Press up to edit queued messages",
-     "contextPattern": None, "supportsPaste": True},
+     "contextPattern": None, "supportsPaste": True,
+     # Werkzeug-Adapter (werkzeuge/1), gleich dem claude-Eintrag in models.default.json.
+     "toolAdapter": {
+         "mcp": {"ziel": "~/.claude.json", "format": "json-pfad", "pfad": "mcpServers", "form": "claude"},
+         "hooks": {"weg": "plugin-werkbank", "ziel": "~/.claude/werkbank-marktplatz/werkbank/hooks/hooks.json"},
+         "prompts": {"weg": "plugin-werkbank", "ziel": "~/.claude/werkbank-marktplatz/werkbank/commands/"},
+         "plugins": {"weg": "nur-pruefen", "ziel": "~/.claude/settings.json"},
+         "rechte": {"weg": "nur-pruefen", "ziel": "~/.claude/settings.json", "pfad": "permissions"}}},
     {"id": "pi", "label": "pi (lokale Modelle)", "builtin": True,
      "command": "pi",
-     "args": ["--provider", "ollama", "--model", "{model}", "--session-dir", "{sessionDir}"],
+     "args": ["--provider", "{provider}", "--model", "{model}", "--session-dir", "{sessionDir}"],
      "cwdMode": "cd", "env": {"OLLAMA_HOST": "{baseUrl:ollama}"},
      # Gemessen an `pi --help`: "--thinking <level>  Set thinking level: off,
      # minimal, low, medium, high, xhigh, max". `off` und `minimal` bleiben
@@ -2037,7 +2209,14 @@ BUILTIN_HARNESSES = [
      "sessionDir": "~/.pi-workers/sessions/{name}",
      "readyPattern": "❯|░|●", "promptPattern": "^❯", "compactCommand": None,
      "promptIgnore": "^❯ Press up to edit queued messages",
-     "contextPattern": None, "supportsPaste": True},
+     "contextPattern": None, "supportsPaste": True,
+     # Werkzeug-Adapter (werkzeuge/1), gleich dem pi-Eintrag in models.default.json.
+     "toolAdapter": {
+         "mcp": {"weg": "pi-erweiterung", "ziel": "~/.pi/agent/extensions/wb-hub.ts", "quelle": "pi-wb-hub.ts"},
+         "hooks": {"weg": "leer", "grund": "pi-Ereignisse laufen nur ueber Extensions; der Adapter schreibt dafuer keine Hook-Datei (Plan 2.3, Tabelle Abschnitt 2)"},
+         "prompts": {"ziel": "~/.pi/agent/prompts/", "format": "markdown-dir"},
+         "plugins": {"weg": "dateien", "ziel": "~/.pi/agent/extensions/", "dateien": ["wb-inbox.ts", "brain-kontext.ts", "wb-hub.ts"]},
+         "rechte": {"weg": "leer", "grund": "pi-Rechte laufen je Aufruf ueber das Registry-Flag --tools, kein Konfigurationsziel (Plan Abschnitt 2 Tabelle)"}}},
 ]
 
 def load_raw():
@@ -2065,7 +2244,8 @@ def merge(raw, key, builtins):
         i = e["id"]
         if i not in out:
             order.append(i); out[i] = e; continue
-        missing = [k for k in base[i] if k not in e]
+        # toolAdapter ist nicht startkritisch und fehlt in aelteren Registries; still ergaenzt.
+        missing = [k for k in base[i] if k not in e and k != "toolAdapter"]
         merged = dict(base[i]); merged.update(e)
         out[i] = merged
         if missing:
@@ -2100,6 +2280,107 @@ def opts(argv, names, flags=()):
 def byalias(lst, a):
     return next((e for e in lst if e.get("alias") == a), None)
 
+_TEMPLATE_HARNESSES = None
+
+def template_harnesses():
+    """Harness entries of the shipped models.default.json next to this tool (cached)."""
+    global _TEMPLATE_HARNESSES
+    if _TEMPLATE_HARNESSES is None:
+        path = os.path.join(os.path.dirname(os.path.realpath(SCRIPT)), "models.default.json")
+        try:
+            data = json.load(open(path))
+            lst = data.get("harnesses", []) if isinstance(data, dict) else []
+        except (OSError, ValueError):
+            lst = []
+        _TEMPLATE_HARNESSES = [h for h in lst if isinstance(h, dict) and h.get("id")]
+    return _TEMPLATE_HARNESSES
+
+def family_specs(h):
+    """Family alias specs of a harness: the registry's own, completed by the shipment.
+
+    A family the registry does not name yet comes from models.default.json, and a
+    'locked' reason there always applies (2026-10-10, Auftrag modell-auto: a ban is
+    registry data per family, so a future astra or Fable model stays locked even
+    before anyone rolls the new field into the live registry).  The shipment can
+    only add families and locks, never unlock or reroute one the registry defines.
+    """
+    own = [dict(spec) for spec in (h.get("modelFamilyAliases") or []) if isinstance(spec, dict)]
+    shipped = next((t for t in template_harnesses() if t.get("id") == h.get("id")), {})
+    for tspec in shipped.get("modelFamilyAliases") or []:
+        if not isinstance(tspec, dict):
+            continue
+        taliases = set(tspec.get("aliases") or [])
+        match = next((spec for spec in own if taliases & set(spec.get("aliases") or [])), None)
+        if match is None:
+            own.append(dict(tspec))
+        elif tspec.get("locked") and not match.get("locked"):
+            match["locked"] = tspec["locked"]
+    return own
+
+def family_members(h, spec, models=None):
+    """(version tuple, model) for every registry model of the family, any state."""
+    try:
+        pattern = re.compile(spec.get("idPattern") or "")
+    except re.error:
+        return []
+    out = []
+    for m in (MODELS if models is None else models):
+        if not isinstance(m, dict) or m.get("harness") != h.get("id"):
+            continue
+        match = pattern.fullmatch(m.get("id") or "")
+        if not match:
+            continue
+        raw = match.groupdict().get("version") or ""
+        if not re.fullmatch(r"[0-9]+(?:-[0-9]+)*", raw):
+            continue
+        out.append((tuple(int(part) for part in raw.split("-")), m))
+    return out
+
+def harness_probe(h):
+    """The harness's modelProbe block; the shipment supplies it when the registry has none."""
+    own = h.get("modelProbe")
+    if isinstance(own, dict):
+        return own
+    shipped = next((t for t in template_harnesses() if t.get("id") == h.get("id")), {})
+    return shipped.get("modelProbe") if isinstance(shipped.get("modelProbe"), dict) else {}
+
+def byfamilyalias(a, error_unavailable=False):
+    """Resolve a family alias to its newest enabled, usable model.
+
+    The harness owns the alias and the id pattern.  The only code-level contract
+    is that the pattern exposes a named ``version`` group whose dash-separated
+    components are integers.  Variant ids such as ``...-1m`` therefore do not
+    become a newer family generation unless the registry explicitly gives them
+    a numeric version match. A rejected or open probe disqualifies a member
+    when its harness supports probes. Missing probe metadata remains usable for
+    pre-existing/template models. Older eligible members remain valid fallbacks.
+    """
+    known_alias = False
+    for h in HARNESSES:
+        for spec in family_specs(h):
+            if a not in (spec.get("aliases") or []):
+                continue
+            known_alias = True
+            members = family_members(h, spec)
+            needs_probe = bool(harness_probe(h))
+            eligible = []
+            for version, model in members:
+                probe = model.get("probe")
+                probe_status = probe.get("status") if isinstance(probe, dict) else None
+                if (model.get("enabled") is not False
+                        and (not needs_probe or probe_status not in PROBE_RETRY)):
+                    eligible.append((version, model))
+            if eligible:
+                return max(eligible, key=lambda item: item[0])[1]
+    if known_alias and error_unavailable:
+        die("FEHLER: Familienalias '%s': keins verfügbar (kein verfügbares "
+            "aktiviertes Familienmitglied)." % a)
+    return None
+
+def find_model(mid):
+    return (byid(MODELS, mid) or byalias(MODELS, mid)
+            or byfamilyalias(mid, error_unavailable=True))
+
 def aehnliche_ids(mid, grenze=6):
     # Was der Suchende vermutlich gemeint hat, statt aller Kennungen. Die volle
     # Liste ist inzwischen ueber 40 KB lang; sie wird in jeder Vorschau
@@ -2122,6 +2403,10 @@ def aehnliche_ids(mid, grenze=6):
         namen.setdefault(flach(kennung), beschriftung)
         if alias:
             namen.setdefault(flach(alias), beschriftung)
+    for h in HARNESSES:
+        for spec in family_specs(h):
+            for alias in (spec.get("aliases") or []):
+                namen.setdefault(flach(alias), "%s (Familienalias)" % alias)
 
     treffer, gesehen = [], set()
     for schluessel in list(namen):
@@ -2141,7 +2426,7 @@ def need_model(mid):
     # Registry steht und pi-worker ihn versteht. Ein Agent, der der Regel folgt
     # und den Deckel bei wb-state erfragt, las das als "gibt es nicht" und
     # nahm ein anderes Modell.
-    m = byid(MODELS, mid) or byalias(MODELS, mid)
+    m = find_model(mid)
     if not m:
         nah = aehnliche_ids(mid)
         hinweise = ["In den Settings unter 'Modelle & Harnesses' hinzufuegen,",
@@ -2307,8 +2592,13 @@ def mensch_belegt(flag):
     if not flag:
         return False
     wb = os.path.join(HOME, ".local", "bin", "wb-mensch")
+    probe_env = {"HOME": HOME,
+                 "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                 "TMPDIR": "/tmp"}
+    probe_env.update({k: os.environ[k] for k in ("WB_MENSCH_QUELLE", "WB_APP_PID")
+                      if k in os.environ})
     try:
-        ok = subprocess.run([wb, "pruefen"]).returncode == 0
+        ok = subprocess.run([wb, "pruefen"], env=probe_env).returncode == 0
     except Exception as e:
         sys.stderr.write("wb-state: '--mensch' nicht pruefbar (%s) — es gilt der Deckel.\n" % e)
         return False
@@ -2316,7 +2606,8 @@ def mensch_belegt(flag):
         return True
     beleg = ""
     try:
-        beleg = subprocess.run([wb, "beleg"], capture_output=True, text=True).stdout.strip()
+        beleg = subprocess.run([wb, "beleg"], capture_output=True, text=True,
+                               env=probe_env).stdout.strip()
     except Exception:
         pass
     sys.stderr.write(
@@ -2414,6 +2705,15 @@ def subst(s, ctx, where):
             "Kommando-Argument landen (Prozessliste), nur in einer Umgebungsvariablen." % (where, s))
     return out
 
+def contains_template_placeholder(value, placeholder):
+    if isinstance(value, str):
+        return placeholder in value
+    if isinstance(value, dict):
+        return any(contains_template_placeholder(v, placeholder) for v in value.values())
+    if isinstance(value, list):
+        return any(contains_template_placeholder(v, placeholder) for v in value)
+    return False
+
 def cmd_resolve():
     # --probe is for wb-harness-probe ALONE: it lifts exactly the two gates that
     # make an unmeasured adapter unstartable (ready pattern, missing key), because
@@ -2454,7 +2754,11 @@ def cmd_resolve():
     if not h:
         die("FEHLER: Harness '%s' von Modell '%s' ist nicht registriert."
             % (m.get("harness"), m["id"]))
-    prov = byid(PROVIDERS, m.get("provider") or "")
+    provider = m.get("provider") or ""
+    if not provider and contains_template_placeholder(h, "{provider}"):
+        die("FEHLER: Modell '%s' hat kein Feld 'provider', das Harness '%s' benoetigt es."
+            % (m["id"], h["id"]))
+    prov = byid(PROVIDERS, provider)
     if not prov:
         die("FEHLER: Provider '%s' von Modell '%s' ist nicht registriert."
             % (m.get("provider"), m["id"]))
@@ -2545,7 +2849,8 @@ def cmd_resolve():
     ctx = {"model": m.get("modelRef") or m["id"],
            "effort": ((h.get("effort") or {}).get("map") or {}).get(eff, eff),
            "workdir": vals["dir"] or os.getcwd(),
-           "name": vals["name"] or m["id"]}
+           "name": vals["name"] or m["id"],
+           "provider": provider}
     if h.get("sessionDir"):
         ctx["sessionDir"] = ex(subst(h["sessionDir"], ctx, "sessionDir"))
     # Die Fenstergroesse DIESES Modells, fuer eine CLI, die ihren Nenner selbst nicht
@@ -3112,14 +3417,24 @@ def validate(kind, e, cfg):
                     % (v, e.get("harness")),
                     "Angenommen: " + " ".join(erlaubt),
                     "Ein Modell darf die Stufenliste seines Harness nur einschraenken.")
-        # `alias` documents the spelling the SPAWNER already understands on its fast
-        # path. Anything else would put a spelling into the routing table that fails
-        # when typed — the registry does not resolve aliases itself.
-        if e.get("alias") and e["alias"] not in RESERVED:
-            die("FEHLER: alias '%s' ist kein eingebauter Alias — nur die kennt der schnelle "
-                "Pfad von pi-worker/claude-worker." % e["alias"],
-                "Eingebaut: " + " ".join(sorted(RESERVED)),
-                "Ohne alias zeigt die Tabelle die id '%s'." % i)
+        # The built-in names keep their fast path and RESERVED keeps preventing a
+        # model id from shadowing them.  Every other alias is registry data: get,
+        # resolve and the generic pi-worker/claude-worker path all call need_model(),
+        # which resolves ids first and aliases second.  Refuse ambiguous data here
+        # instead of letting lookup order silently choose a different model.
+        alias = e.get("alias")
+        if alias is not None:
+            if not isinstance(alias, str) or not alias or alias.strip() != alias or " " in alias or ":" in alias:
+                die("FEHLER: alias fehlt, enthaelt Leerzeichen oder einen Doppelpunkt.")
+            if alias in RESERVED and RESERVED_ALIAS_OWNERS.get(alias) != i:
+                die("FEHLER: alias '%s' ist als eingebauter schneller Name reserviert." % alias,
+                    "Neue Aliase duerfen Daten sein, aber keinen eingebauten Namen uebernehmen.")
+            for other in (cfg.get("models") or []):
+                if not isinstance(other, dict) or other.get("id") == i:
+                    continue
+                if other.get("id") == alias or other.get("alias") == alias:
+                    die("FEHLER: alias '%s' kollidiert mit Modell '%s'." %
+                        (alias, other.get("id")))
         for cls, eff, _g in worker_rows(e):
             if cls not in CLASSES:
                 die("FEHLER: workerClass '%s' ungueltig." % cls, "Gueltig: " + " ".join(CLASSES))
@@ -3146,6 +3461,57 @@ def validate(kind, e, cfg):
     elif kind == "harness":
         if not e.get("command"):
             die("FEHLER: Harness '%s' braucht ein 'command'." % i)
+        switch = e.get("modelSwitch")
+        if switch is not None:
+            if not isinstance(switch, dict):
+                die("FEHLER: modelSwitch von Harness '%s' ist null oder ein Objekt." % i)
+            if not isinstance(switch.get("command"), str) or "{model}" not in switch["command"]:
+                die("FEHLER: modelSwitch.command von Harness '%s' braucht {model}." % i)
+            if not isinstance(e.get("promptPattern"), str) or not e.get("promptPattern"):
+                die("FEHLER: modelSwitch von Harness '%s' braucht promptPattern als Busy-Sperre." % i)
+            if "versionGate" in switch and not isinstance(switch["versionGate"], bool):
+                die("FEHLER: modelSwitch.versionGate von Harness '%s' muss boolesch sein." % i)
+            try:
+                re.compile(switch.get("updateRequiredPattern") or "")
+            except re.error as err:
+                die("FEHLER: modelSwitch.updateRequiredPattern von Harness '%s' ist ungueltig (%s)."
+                    % (i, err))
+        families = e.get("modelFamilyAliases") or []
+        if not isinstance(families, list):
+            die("FEHLER: modelFamilyAliases von Harness '%s' ist eine Liste." % i)
+        seen_family_aliases = set()
+        for family in families:
+            if not isinstance(family, dict):
+                die("FEHLER: modelFamilyAliases von Harness '%s' enthaelt kein Objekt." % i)
+            aliases = family.get("aliases")
+            pattern = family.get("idPattern")
+            if (not isinstance(aliases, list) or not aliases
+                    or not all(isinstance(a, str) and a and a.strip() == a
+                               and " " not in a and ":" not in a for a in aliases)):
+                die("FEHLER: jeder Familienalias von Harness '%s' braucht eine Liste "
+                    "gueltiger aliases." % i)
+            for alias in aliases:
+                if alias in seen_family_aliases:
+                    die("FEHLER: Familienalias '%s' ist in Harness '%s' doppelt." % (alias, i))
+                seen_family_aliases.add(alias)
+                for model in (cfg.get("models") or []):
+                    if isinstance(model, dict) and (model.get("id") == alias or model.get("alias") == alias):
+                        die("FEHLER: Familienalias '%s' kollidiert mit Modell '%s'."
+                            % (alias, model.get("id")))
+            if not isinstance(pattern, str) or not pattern:
+                die("FEHLER: Familienalias von Harness '%s' braucht idPattern." % i)
+            try:
+                compiled = re.compile(pattern)
+            except re.error as err:
+                die("FEHLER: idPattern eines Familienalias von Harness '%s' ist ungueltig (%s)."
+                    % (i, err))
+            locked = family.get("locked")
+            if locked is not None and (not isinstance(locked, str) or not locked.strip()):
+                die("FEHLER: locked eines Familienalias von Harness '%s' ist ein Satz "
+                    "(Grund der Sperre)." % i)
+            if "version" not in compiled.groupindex:
+                die("FEHLER: idPattern eines Familienalias von Harness '%s' braucht die "
+                    "benannte Gruppe 'version'." % i)
     elif kind == "provider":
         if (e.get("kind") or "cloud") not in ("cloud", "local", "subscription"):
             die("FEHLER: provider kind '%s' ungueltig (cloud|local|subscription)." % e.get("kind"))
@@ -3302,7 +3668,8 @@ def cmd_migrate_session():
 # words: "automatisch importieren, wo der CLI seine Modelle selbst nennt". No
 # network access happens here, only local commands/files the machine already has.
 MANAGED_FIELDS = ["label", "provider", "modelRef", "roles", "efforts", "maxEffort",
-                  "defaultEffort", "machines", "supportsEffort", "discoveredAt"]
+                  "defaultEffort", "machines", "supportsEffort", "contextWindow",
+                  "discoveredAt", "discoveredVersion"]
 # discoveredAt refreshes on EVERY successful run by design (it is a last-seen
 # marker) — comparing it would report every untouched entry as "updated" forever,
 # since it never equals the previous run's value. It is still written like any
@@ -3386,6 +3753,158 @@ def discover_command_lines(command, timeout, separator=None):
         refs.append(t)
     return refs, None
 
+def resolve_harness_binary(path, timeout):
+    """Resolve a harness command path to the file that actually carries the code.
+
+    Normally that is os.path.realpath(path).  A mise shim is the exception: the
+    shim is a symlink to the mise program itself (peer: ~/.local/bin/claude ->
+    .../mise/shims/claude -> /usr/bin/mise), so realpath ends at mise and every
+    read of "the binary" reads mise.  Then `mise which <shim name>` names the
+    real file.  Returns (path, None) or (None, error); a failing mise is an error,
+    never a silent fall-back to the mise program.
+    """
+    real = os.path.realpath(path)
+    if os.path.basename(real) != "mise":
+        return real, None
+    # The shim name is the last link of the chain before the mise program.
+    name, cur = os.path.basename(path), path
+    for _ in range(40):
+        if not os.path.islink(cur):
+            break
+        nxt = os.path.join(os.path.dirname(cur), os.readlink(cur))
+        if os.path.basename(nxt) == "mise":
+            break
+        name, cur = os.path.basename(nxt), nxt
+    try:
+        r = subprocess.run([real, "which", name], capture_output=True, text=True,
+                           errors="replace", timeout=timeout)
+    except Exception as e:
+        return None, "'%s' ist ein mise-Shim, 'mise which %s' scheiterte: %s" % (path, name, e)
+    out = (r.stdout or "").strip().splitlines()
+    target = out[0].strip() if out else ""
+    if r.returncode != 0 or not target or not os.path.isfile(target):
+        return None, ("'%s' ist ein mise-Shim, 'mise which %s' lieferte keine Binary "
+                      "(exit %d: %s)." % (path, name, r.returncode,
+                                          ((r.stderr or "") + target).strip()[:200]))
+    return os.path.realpath(target), None
+
+def discover_binary_strings(harness, dc, timeout):
+    """Read model ids embedded in an installed harness without starting it.
+
+    `pattern` selects exact string-table entries.  A named `id` group is used
+    when present, otherwise the whole match is the model ref.  `labelPattern`
+    and `variantLabelPattern` are optional picker-label gates: their placeholders
+    are filled from named groups of `pattern`, so an API/provider id that merely
+    happens to occur in the binary is not enough to register a model.
+    `labelPatterns` / `variantLabelPatterns` are lists of alternative gates next
+    to the single-string fields: one binary generation labels its picker entries
+    differently from the next, and a ref passes when ANY alternative matches.
+    Extra placeholders: {id} (the matched ref) and {idBase} (ref without a
+    trailing [1m]).
+    """
+    configured = dc.get("path") or harness.get("command")
+    if not configured or not isinstance(configured, str):
+        return None, "discover.path und Harness-command fehlen."
+    candidate = ex(configured)
+    path = shutil.which(candidate) or candidate
+    if not os.path.isfile(path):
+        return None, "Binary '%s' nicht gefunden." % configured
+    path, err = resolve_harness_binary(path, min(timeout, 10))
+    if err:
+        return None, err
+    pattern = dc.get("pattern")
+    if not pattern:
+        return None, "discover.pattern fehlt."
+    try:
+        rx = re.compile(pattern, re.MULTILINE)
+    except re.error as e:
+        return None, "discover.pattern ist ungueltig (%s)." % e
+    strings_bin = shutil.which("strings") or "/usr/bin/strings"
+    try:
+        r = subprocess.run([strings_bin, "-n", str(int(dc.get("minLength", 6))), path],
+                           capture_output=True, text=True, errors="replace", timeout=timeout)
+    except Exception as e:
+        return None, str(e)
+    if r.returncode != 0:
+        return None, "strings %s: exit %d (%s)" % (
+            path, r.returncode, (r.stderr or "").strip()[:200])
+
+    def label_regex(template, groups):
+        replacements = dict((k, re.escape(v or "")) for k, v in groups.items())
+        family = groups.get("family") or ""
+        version = groups.get("version") or ""
+        replacements["familyTitle"] = re.escape(family.title())
+        replacements["versionDots"] = re.escape(version.replace("-", "."))
+        ident = groups.get("id") or ""
+        replacements["idBase"] = re.escape(re.sub(r"\[1m\]$", "", ident, flags=re.I))
+        out = template
+        for key, value in replacements.items():
+            out = out.replace("{%s}" % key, value)
+        return out
+
+    def gates(single, several):
+        out = [single] if isinstance(single, str) and single else []
+        if isinstance(several, list):
+            out += [t for t in several if isinstance(t, str) and t]
+        return out
+
+    base_gates = gates(dc.get("labelPattern"), dc.get("labelPatterns"))
+    variant_gates = gates(dc.get("variantLabelPattern"), dc.get("variantLabelPatterns"))
+    verdict = {}
+    refs = []
+    for match in rx.finditer(r.stdout):
+        groups = dict((k, v or "") for k, v in match.groupdict().items())
+        ref = groups.get("id") or (match.group(1) if match.groups() else match.group(0))
+        if not ref:
+            continue
+        if ref not in verdict:
+            templates = variant_gates if ref.lower().endswith("[1m]") else base_gates
+            ok = not templates
+            for template in templates:
+                try:
+                    if re.search(label_regex(template, groups), r.stdout, re.MULTILINE):
+                        ok = True
+                        break
+                except re.error as e:
+                    return None, "discover labelPattern ist ungueltig (%s)." % e
+            verdict[ref] = ok
+        if verdict[ref]:
+            refs.append(ref)
+    return refs, None
+
+def harness_discover_identity(harness):
+    """Stable installed-path/version identity for the --if-stale invalidation."""
+    configured = harness.get("command") or ""
+    candidate = ex(configured)
+    found = shutil.which(candidate) or (candidate if os.path.isfile(candidate) else "")
+    if not found:
+        return {"binary": "", "version": ""}
+    path, err = resolve_harness_binary(found, 5)
+    if err:
+        return {"binary": "", "version": ""}
+    version = ""
+    command = (harness.get("discover") or {}).get("versionCommand")
+    argv = command if isinstance(command, list) and command else [path, "--version"]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            version = ((r.stdout or r.stderr or "").strip().splitlines() or [""])[0][:200]
+    except Exception:
+        pass
+    if not version:
+        try:
+            st = os.stat(path)
+            version = "stat:%d:%d" % (st.st_size, st.st_mtime_ns)
+        except OSError:
+            pass
+    return {"binary": path, "version": version}
+
+def discovered_semver(identity):
+    """Comparable CLI version from an installed-binary identity, or empty."""
+    match = re.search(r"\b(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b",
+                      (identity or {}).get("version") or "")
+    return match.group(1) if match else ""
+
 # Shared by 'file-json' (Vertrag Teil 1) and 'http-json' (Vertrag Teil 2) — both use
 # the SAME 'a[].b' list form, only the data source differs (a local file vs. an HTTP
 # response). Nur diese eine Form, keine allgemeine Pfadsprache.
@@ -3416,6 +3935,79 @@ def discover_file_json(file_path, json_path, filt, timeout):
             continue
         if isinstance(v, str) and v.strip():
             refs.append(v.strip())
+    return refs, None
+
+def discover_files(dc, timeout):
+    """Discover installed local model files/directories without loading them.
+
+    Each root is deliberately small and declarative: `path` plus a glob, a
+    file/directory kind, an optional marker, and the spelling to expose as the
+    modelRef.  Splash may additionally merge the read-only `/v1/models`
+    response of an already running server.  A dead endpoint never invalidates
+    the disk inventory.
+    """
+    roots = dc.get("roots") or []
+    if not isinstance(roots, list) or not roots:
+        return None, "discover.roots fehlt oder ist leer."
+    refs = []
+    readable_roots = 0
+    for root in roots:
+        if not isinstance(root, dict) or not isinstance(root.get("path"), str):
+            return None, "discover.roots enthaelt einen Eintrag ohne path."
+        base = os.path.abspath(ex(root["path"]))
+        if not os.path.isdir(base):
+            continue
+        readable_roots += 1
+        pattern = root.get("glob") or "*"
+        try:
+            exclude = re.compile(root.get("excludePattern") or r"(?!)")
+            marker_exclude = re.compile(root.get("markerExcludePattern") or r"(?!)")
+        except re.error as e:
+            return None, "discover files Regex ist ungueltig (%s)." % e
+        for path in sorted(glob.glob(os.path.join(base, pattern), recursive="**" in pattern)):
+            kind = root.get("kind") or "dir"
+            if (kind == "dir" and not os.path.isdir(path)) or \
+               (kind == "file" and not os.path.isfile(path)):
+                continue
+            marker = root.get("marker")
+            marker_path = os.path.join(path, marker) if marker and kind == "dir" else None
+            if marker and (not marker_path or not os.path.isfile(marker_path)):
+                continue
+            if exclude.search(path):
+                continue
+            if marker_path and root.get("markerExcludePattern"):
+                try:
+                    marker_text = open(marker_path, encoding="utf-8", errors="replace").read()
+                except Exception:
+                    continue
+                if marker_exclude.search(marker_text):
+                    continue
+            mode = root.get("ref") or "absolute"
+            if mode == "relative":
+                ref = os.path.relpath(path, base).replace(os.sep, "/")
+            elif mode == "basename":
+                ref = os.path.basename(path)
+            else:
+                ref = os.path.abspath(path)
+            if ref and ref not in refs:
+                refs.append(ref)
+
+    endpoint = dc.get("endpoint")
+    endpoint_error = None
+    if isinstance(endpoint, dict) and endpoint.get("url"):
+        data, endpoint_error = http_get_json(endpoint["url"], [], min(timeout, 4))
+        if data is not None:
+            pairs, list_error = json_list_field(data, endpoint.get("jsonPath") or "data[].id")
+            if list_error:
+                endpoint_error = list_error
+            else:
+                for _item, value in pairs:
+                    if isinstance(value, str) and value.strip() and value.strip() not in refs:
+                        refs.append(value.strip())
+    if readable_roots == 0:
+        return None, "kein konfiguriertes Modellverzeichnis ist lesbar."
+    # An endpoint is only an extra observation. Disk is the offline contract;
+    # therefore endpoint_error is intentionally non-fatal once a root was read.
     return refs, None
 
 # ── http-json: provider catalogs (Vertrag Teil 2, scratchpad/CONTRACT-katalog.md) ──
@@ -3701,7 +4293,9 @@ def compute_id(dc, hid, model_ref):
     # Slug der FERTIGEN modelRef (nach refTemplate), nicht der rohen Quell-Referenz —
     # 'ollama/ornith:35b' -> 'ollama-ornith-35b' ist das Vertrags-Beispiel woertlich
     # (Vertrag 3), und nur so tragen aider-Referenzen ihr 'ollama/'-Praefix im Slug.
-    idprefix = dc.get("idPrefix") or (hid + "-")
+    # An explicitly empty prefix is meaningful for CLIs whose own model ids
+    # are already globally namespaced (Claude: `claude-opus-5-5`).
+    idprefix = dc["idPrefix"] if "idPrefix" in dc else (hid + "-")
     return idprefix + slug_ref(model_ref)
 
 # Was ein automatisch gefundenes Modell mitbekommt. Shared by build_entry
@@ -3728,19 +4322,100 @@ def derive_efforts(effort_map):
     return {"efforts": keys, "maxEffort": ohne_max[-1],
             "defaultEffort": "medium" if "medium" in keys else keys[0]}
 
-def build_entry(hid, dc, ref, model_ref, mid, now_iso, effort_map, effort_style):
+def nearest_sibling(hid, model_ref, provider, models_list):
+    """Closest existing model of the same harness/provider, curated first on ties."""
+    import difflib
+    candidates = [m for m in models_list if isinstance(m, dict)
+                  and m.get("harness") == hid and m.get("modelRef")]
+    same_provider = [m for m in candidates if m.get("provider") == provider]
+    if same_provider:
+        candidates = same_provider
+    if not candidates:
+        return None
+    return max(candidates, key=lambda m: (
+        difflib.SequenceMatcher(None, model_ref, m.get("modelRef") or "").ratio(),
+        1 if m.get("source") != "auto" else 0))
+
+def family_lock_reason(hid, mid, model_ref, models_list, template_models,
+                       existing_probe=False):
+    """Carry Discover's family ban to new models using declared id patterns."""
+    harness = byid(HARNESSES, hid) or {}
+    for spec in family_specs(harness):
+        if not spec.get("idPattern"):
+            continue
+        try:
+            pattern = re.compile(spec["idPattern"])
+        except re.error:
+            continue
+        # The family pattern names generations; Discover also creates context
+        # variants whose ids end in -1m and whose refs end in [1m].
+        def belongs(model_id, ref):
+            return bool(pattern.fullmatch(re.sub(r"-1m$", "", model_id or "")) or
+                        pattern.fullmatch(re.sub(r"\[1m\]$", "", ref or "", flags=re.I)))
+        if not belongs(mid, model_ref):
+            continue
+        name = (spec.get("aliases") or [mid])[0]
+        # Discover infers a ban for new entries from disabled family members.
+        # An existing entry's probe is the recovery path; only explicit locks
+        # still block it.
+        if existing_probe:
+            if spec.get("locked"):
+                return "Familie %s gesperrt: %s" % (name, spec["locked"])
+            continue
+        # A locked family keeps the reason its existing members already carry;
+        # the lock text only speaks when no member names one.
+        for source in (template_models, models_list):
+            members = [m for m in source if isinstance(m, dict)
+                       and m.get("harness") == hid
+                       and belongs(m.get("id"), m.get("modelRef"))]
+            if not members or any(m.get("enabled") is not False for m in members):
+                continue
+            example = next((m for m in members if m.get("disabledReason")), None) or members[0]
+            reason = (example.get("disabledReason") or spec.get("locked") or
+                      "alle vorhandenen Modelle sind abgeschaltet")
+            return "Familie %s gesperrt: %s" % (name, reason)
+        if spec.get("locked"):
+            return "Familie %s gesperrt: %s" % (name, spec["locked"])
+    return None
+
+def mark_probe_pending(hid, entry, now_iso):
+    """A new model of a harness with a 'modelProbe' block waits disabled for its call.
+
+    2026-10-10 (Auftrag modell-auto): a discovered id is only usable after one short
+    real call answered; `wb-state models probe` runs it and enables the entry.
+    """
+    if harness_probe(byid(HARNESSES, hid) or {}):
+        entry["enabled"] = False
+        entry["probe"] = {"status": "offen", "since": now_iso}
+
+def discover_template_models():
+    # Installed wb-state is normally a symlink into shell/. If the template is
+    # absent, the private registry still supplies family decisions.
+    path = os.path.join(os.path.dirname(os.path.realpath(SCRIPT)), "models.default.json")
+    try:
+        data = json.load(open(path))
+        return data.get("models", []) if isinstance(data, dict) else []
+    except (OSError, ValueError):
+        return []
+
+def build_entry(hid, dc, ref, model_ref, mid, now_iso, effort_map, effort_style,
+                models_list):
     provider = dc.get("provider")
     for prefix, pid in (dc.get("providerByPrefix") or []):
         if model_ref.startswith(prefix):
             provider = pid
             break
-    roles = dc.get("roles") or ["worker", "orchestrator"]
+    sibling = nearest_sibling(hid, model_ref, provider, models_list)
+    if provider is None and sibling:
+        provider = sibling.get("provider")
+    roles = dc.get("roles") or ((sibling or {}).get("roles")) or ["worker", "orchestrator"]
+    machines = dc.get("machines") or ((sibling or {}).get("machines")) or ["mac", "peer"]
     supports = dc.get("supportsEffort")
     if supports is None:
         supports = effort_style != "none"
     entry = {
         "id": mid, "label": ref, "harness": hid, "provider": provider,
-        "modelRef": model_ref, "roles": roles, "machines": ["mac", "peer"],
+        "modelRef": model_ref, "roles": roles, "machines": machines,
         "enabled": True, "source": "auto", "discoveredAt": now_iso,
         "supportsEffort": bool(supports),
     }
@@ -3748,9 +4423,50 @@ def build_entry(hid, dc, ref, model_ref, mid, now_iso, effort_map, effort_style)
         eff = derive_efforts(effort_map)
         if eff:
             entry.update(eff)
+    if sibling and sibling.get("maxEffort"):
+        entry["maxEffort"] = sibling["maxEffort"]
+    for suffix, value in (dc.get("contextWindowBySuffix") or {}).items():
+        if model_ref.endswith(suffix):
+            entry["contextWindow"] = value
+            break
     return entry
 
-def plan_for(hid, dc, refs, models_list, now_iso, effort_map, effort_style):
+# A label set by hand or by the template survives a discover run; only a label
+# that is still what discover itself would have generated follows the new value.
+# The generated forms are the old modelRef, the id, or the basename of the modelRef
+# (labelFromRef=basename, refTemplate prefixes). Applied before the updated-diff,
+# so a kept label is neither overwritten nor reported as an update forever.
+def keep_custom_label(cur, entry):
+    old = cur.get("label")
+    if not old:
+        return
+    mref = cur.get("modelRef") or ""
+    if old in (mref, cur.get("id"), os.path.basename(mref)):
+        return
+    entry["label"] = old
+
+# Felder, die discover selbst nicht kennt (heute: contextWindow ohne [1m]-Endung),
+# nimmt der Eintrag aus der Vorlage, wenn sie dort fuer dieselbe id stehen
+# (2026-10-13). Ohne das loeschte jeder discover-Lauf das contextWindow, das
+# wb-ausrollen eben aus models.default.json nachgetragen hatte, und das naechste
+# Ausrollen setzte es wieder -- ein Pingpong, das jedes Mal als Aenderung zaehlte.
+# Effortfelder kommen nur in einen Eintrag mit supportsEffort, sonst landen sie
+# bei einem Harness ohne Effort-Unterstuetzung (2026-10-13).
+EFFORT_FILL_FIELDS = ("efforts", "maxEffort", "defaultEffort")
+def fill_from_template(entry, mid, template_models):
+    tmpl = next((m for m in template_models
+                 if isinstance(m, dict) and m.get("id") == mid), None)
+    if not tmpl:
+        return
+    for f in DIFF_FIELDS:
+        if f == "discoveredVersion" or f in entry or f not in tmpl:
+            continue
+        if f in EFFORT_FILL_FIELDS and not entry.get("supportsEffort"):
+            continue
+        entry[f] = tmpl[f]
+
+def plan_for(hid, dc, refs, models_list, now_iso, effort_map, effort_style,
+             template_models=(), installed_version=None):
     by_id, curated_pairs = {}, set()
     for m in models_list:
         if not isinstance(m, dict) or not m.get("id"):
@@ -3796,7 +4512,25 @@ def plan_for(hid, dc, refs, models_list, now_iso, effort_map, effort_style):
                             "kuratierten Eintrag — uebersprungen." % (mid, hid, ref))
             continue                                        # Vertrag 4.5
         seen.add(mid)
-        entry = build_entry(hid, dc, ref, model_ref, mid, now_iso, effort_map, effort_style)
+        entry = build_entry(hid, dc, ref, model_ref, mid, now_iso, effort_map, effort_style,
+                            models_list)
+        if cur is not None:
+            keep_custom_label(cur, entry)
+        # Die Version steht VOR dem Vergleich unten im Eintrag (2026-10-13): vorher
+        # setzte der Aufrufer sie erst nach plan_for, jeder bestehende Eintrag
+        # verglich also seine gespeicherte Version mit "keiner" und galt als
+        # geaendert. Jeder Lauf schrieb so rund 600 Zeilen ins Aenderungsprotokoll
+        # (13,5 MB am 13.10.), obwohl sich nur discoveredAt bewegt hatte.
+        if installed_version:
+            entry["discoveredVersion"] = installed_version
+        fill_from_template(entry, mid, template_models)
+        if cur is None:
+            reason = family_lock_reason(hid, mid, model_ref, models_list, template_models)
+            if reason:
+                entry["enabled"] = False
+                entry["disabledReason"] = reason
+            else:
+                mark_probe_pending(hid, entry, now_iso)
         new_entries[mid] = entry
         if cur is None:
             added.append(mid)
@@ -3815,7 +4549,9 @@ def plan_for(hid, dc, refs, models_list, now_iso, effort_map, effort_style):
 # same harness. modelRef is the raw catalog ref itself — no refTemplate/idPrefix
 # override, no providerByPrefix (there is only ever ONE provider per call here); the
 # id form 'aider-openrouter-qwen-qwen3-max' (Vertrag 3) is harness + provider + slug.
-def plan_for_catalog(hid, pid, refs, models_list, now_iso, effort_map, effort_style, roles):
+def plan_for_catalog(hid, pid, refs, models_list, now_iso, effort_map, effort_style, roles,
+                     dc=None, template_models=()):
+    dc = dc or {}
     by_id, curated_pairs = {}, set()
     for m in models_list:
         if not isinstance(m, dict) or not m.get("id"):
@@ -3842,15 +4578,33 @@ def plan_for_catalog(hid, pid, refs, models_list, now_iso, effort_map, effort_st
                             % (mid, hid, pid, ref))
             continue
         seen.add(mid)
-        supports = effort_style != "none"
-        entry = {"id": mid, "label": ref, "harness": hid, "provider": pid,
-                 "modelRef": ref, "roles": roles, "machines": ["mac", "peer"],
+        sibling = nearest_sibling(hid, ref, pid, models_list)
+        supports = dc.get("supportsEffort")
+        if supports is None:
+            supports = effort_style != "none"
+        inherited_roles = roles or ((sibling or {}).get("roles")) or ["worker", "orchestrator"]
+        machines = dc.get("machines") or ((sibling or {}).get("machines")) or ["mac", "peer"]
+        label = os.path.basename(ref) if dc.get("labelFromRef") == "basename" else ref
+        entry = {"id": mid, "label": label, "harness": hid, "provider": pid,
+                 "modelRef": ref, "roles": inherited_roles, "machines": machines,
                  "enabled": True, "source": "auto", "discoveredAt": now_iso,
                  "supportsEffort": bool(supports)}
         if supports:
             eff = derive_efforts(effort_map)
             if eff:
                 entry.update(eff)
+        if sibling and sibling.get("maxEffort"):
+            entry["maxEffort"] = sibling["maxEffort"]
+        if cur is not None:
+            keep_custom_label(cur, entry)
+        fill_from_template(entry, mid, template_models)
+        if cur is None:
+            reason = family_lock_reason(hid, mid, ref, models_list, template_models)
+            if reason:
+                entry["enabled"] = False
+                entry["disabledReason"] = reason
+            else:
+                mark_probe_pending(hid, entry, now_iso)
         new_entries[mid] = entry
         if cur is None:
             added.append(mid)
@@ -3888,6 +4642,22 @@ def empty_answer_guard(tid, refs, plan, allow_empty):
             "nichts entfernt, Entscheidung UNTERBLIEBEN (Ausfall angenommen). Ist die "
             "Liste wirklich leer: 'wb-state models discover %s --allow-empty'."
             % (len(plan["removed"]), tid))
+
+def shrunken_answer_guard(tid, refs, previous_count, allow_empty=False,
+                          allow_shrink=False):
+    """A suspicious source regression must not delete its missing models."""
+    if not isinstance(previous_count, int) or previous_count <= 0:
+        return None
+    if len(refs) == 0 and allow_empty:
+        return None
+    if refs and allow_shrink:
+        return None
+    if len(refs) * 2 >= previous_count:
+        return None
+    return ("Quelle %s lieferte nur %d von zuletzt %d Modellen — stark geschrumpft; "
+            "nichts entfernt, Entscheidung UNTERBLIEBEN (Quellformat pruefen). "
+            "Bei bestaetigtem Teilrueckgang: 'wb-state models discover %s --allow-shrink'."
+            % (tid, len(refs), previous_count, tid))
 
 # Applies a plan (from plan_for OR plan_for_catalog — identical dict shape) to the
 # registry cfg: remove vanished refs, then add/update managed fields. Shared by the
@@ -3935,7 +4705,7 @@ def upsert_provider_field(cfg, pid, field, value):
 
 def cmd_discover():
     _vals, fl, pos = opts(ARGV, [], ["all", "if-stale", "dry-run", "json", "force", "no-network",
-                                     "allow-empty"])
+                                     "allow-empty", "allow-shrink"])
     # Vertrag Teil 2 Abschnitt 5 + Nachtrag (2026-07-29, Extension-Seite): modelDiscoveryAuto
     # gates ONLY the network path (catalog providers below) — ollama/command-lines/
     # file-json are local, cost nothing, never leave the machine, and are never
@@ -3951,11 +4721,16 @@ def cmd_discover():
 
     local_ids = [h["id"] for h in HARNESSES if isinstance(h.get("discover"), dict)]
     catalog_ids = [p["id"] for p in PROVIDERS
-                  if isinstance(p.get("discover"), dict) and p["discover"].get("source") == "http-json"]
+                  if isinstance(p.get("discover"), dict)
+                  and p["discover"].get("source") == "http-json"]
+    files_ids = [p["id"] for p in PROVIDERS
+                 if isinstance(p.get("discover"), dict)
+                 and p["discover"].get("source") == "files"
+                 and MACHINE in (p["discover"].get("machines") or ["mac", "peer"])]
     # Vertrag 1: ohne Argument = --all. Katalog-Anbieter sind darin NUR enthalten,
     # wenn der Netzabruf gerade erlaubt ist — ein --all-Lauf mit modelDiscoveryAuto=
     # false soll still bleiben, nicht fuer jeden Anbieter eine Zeile "steht aus" zeigen.
-    requested = pos if pos else local_ids + (catalog_ids if auto_enabled else [])
+    requested = pos if pos else local_ids + files_ids + (catalog_ids if auto_enabled else [])
 
     STATEFILE = os.path.join(HOME, ".local", "state", "wb-models-discover.json")
     try:
@@ -3964,6 +4739,7 @@ def cmd_discover():
             ttl_state = {}
     except Exception:
         ttl_state = {}
+    template_models = discover_template_models()
 
     now = datetime.datetime.now(datetime.timezone.utc)
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3971,13 +4747,16 @@ def cmd_discover():
     output = {}      # id -> {"added":[],"removed":[],"updated":[],"kept":n,"error":None|str, …}
     to_query_local = []      # (hid, h, dc)
     to_query_catalog = []    # (pid, prov, dc)
+    to_query_files = []      # (pid, prov, dc), local provider inventories
+    local_identity = {}
     for tid in requested:
         h = byid(HARNESSES, tid)
         prov = byid(PROVIDERS, tid)
         is_local = h is not None and isinstance(h.get("discover"), dict)
-        is_catalog = (not is_local) and prov is not None and isinstance(prov.get("discover"), dict) \
-                     and prov["discover"].get("source") == "http-json"
-        if not is_local and not is_catalog:
+        provider_source = ((prov or {}).get("discover") or {}).get("source")
+        is_catalog = (not is_local) and provider_source == "http-json"
+        is_files = (not is_local) and provider_source == "files"
+        if not is_local and not is_catalog and not is_files:
             output[tid] = {"added": [], "removed": [], "updated": [], "kept": 0,
                            "error": "kein discover-Block fuer '%s' (weder Harness noch "
                                     "Anbieter mit Katalog)." % tid}
@@ -3997,7 +4776,14 @@ def cmd_discover():
             output[tid] = {"added": [], "removed": [], "updated": [], "kept": 0, "error": msg}
             continue
         dc = h["discover"] if is_local else prov["discover"]
-        if fl["if-stale"]:
+        if is_files and MACHINE not in (dc.get("machines") or ["mac", "peer"]):
+            output[tid] = {"added": [], "removed": [], "updated": [], "kept": 0,
+                           "error": "lokale Quelle '%s' gilt nicht fuer Maschine '%s'." %
+                                    (tid, MACHINE)}
+            continue
+        if is_local:
+            local_identity[tid] = harness_discover_identity(h)
+        if fl["if-stale"] and not is_files:
             st = ttl_state.get(tid) or {}
             at = st.get("at")
             if at:
@@ -4005,12 +4791,16 @@ def cmd_discover():
                     dt = datetime.datetime.strptime(at, "%Y-%m-%dT%H:%M:%SZ").replace(
                         tzinfo=datetime.timezone.utc)
                     ttl_hours = dc.get("ttlHours", dc.get("cacheHours", 12))
-                    if (now - dt).total_seconds() < float(ttl_hours) * 3600.0:
+                    identity_same = (not is_local) or all(
+                        st.get(k) == v for k, v in local_identity[tid].items())
+                    if identity_same and (now - dt).total_seconds() < float(ttl_hours) * 3600.0:
                         continue        # Vertrag 1: frisch genug, ganz uebersprungen
                 except Exception:
                     pass
         if is_local:
             to_query_local.append((tid, h, dc))
+        elif is_files:
+            to_query_files.append((tid, prov, dc))
         else:
             to_query_catalog.append((tid, prov, dc))
 
@@ -4028,6 +4818,8 @@ def cmd_discover():
         elif source == "file-json":
             refs, err = discover_file_json(dc.get("file"), dc.get("jsonPath"), dc.get("filter"),
                                            DISCOVER_TIMEOUT)
+        elif source == "binary-strings":
+            refs, err = discover_binary_strings(h, dc, DISCOVER_TIMEOUT)
         else:
             refs, err = None, "unbekannte discover.source '%s'." % source
         if refs is not None:
@@ -4041,6 +4833,68 @@ def cmd_discover():
     fetched_catalog = {}
     for pid, prov, dc in to_query_catalog:
         fetched_catalog[pid] = catalog_for_provider(prov, bool(fl["dry-run"]), DISCOVER_TIMEOUT)
+
+    fetched_files = {}
+    for pid, prov, dc in to_query_files:
+        refs, err = discover_files(dc, DISCOVER_TIMEOUT)
+        if refs is not None:
+            refs = list(dict.fromkeys(refs))
+        fetched_files[pid] = (refs, err)
+
+    def files_provider_plans(pid, prov, dc, refs, models_list):
+        configured = dc.get("runners")
+        if configured is None:
+            configured = []
+            if prov.get("defaultRunner"):
+                configured.append(prov["defaultRunner"])
+            configured += [m.get("harness") for m in models_list
+                           if isinstance(m, dict) and m.get("provider") == pid]
+        runners = []
+        for runner in configured:
+            if runner and runner not in runners and byid(HARNESSES, runner):
+                runners.append(runner)
+        if not runners:
+            return None, "kein registrierter Harness faehrt Anbieter '%s'." % pid
+        plans = []
+        for runner in runners:
+            rh = byid(HARNESSES, runner)
+            style = ((rh.get("effort") or {}).get("style")) or "none"
+            emap = ((rh.get("effort") or {}).get("map")) or {}
+            plans.append((runner, plan_for_catalog(
+                runner, pid, refs, models_list, now_iso, emap, style,
+                dc.get("roles"), dc, template_models)))
+        return plans, None
+
+    def files_output_from_plans(pid, refs, plans, models_list, cfg_obj=None, entries_log=None):
+        combined = {"added": [], "removed": [], "updated": [], "kept": 0,
+                    "error": None, "inventory": len(refs)}
+        shrink = shrunken_answer_guard(pid, refs, (ttl_state.get(pid) or {}).get("count"),
+                                       fl["allow-empty"], fl["allow-shrink"])
+        if shrink:
+            sys.stderr.write("wb-state: WARNUNG — %s\n" % shrink)
+            combined["error"] = shrink
+            combined["skippedShrink"] = True
+            combined["kept"] = sum(len(p["removed"]) + len(p["updated"]) + p["kept"]
+                                   for _runner, p in plans)
+            return combined
+        for runner, plan in plans:
+            for w in plan["warnings"]:
+                sys.stderr.write("wb-state: WARNUNG — %s\n" % w)
+            guard = empty_answer_guard("%s/%s" % (pid, runner), refs, plan,
+                                       fl["allow-empty"])
+            if guard:
+                combined["error"] = guard
+                combined["skippedEmpty"] = True
+                combined["kept"] += len(plan["removed"])
+                continue
+            for key in ("added", "removed", "updated"):
+                combined[key] += plan[key]
+            combined["kept"] += plan["kept"]
+            if entries_log is not None and cfg_obj is not None:
+                apply_plan(cfg_obj, models_list, plan, entries_log)
+        for key in ("added", "removed", "updated"):
+            combined[key] = sorted(combined[key])
+        return combined
 
     def do_mutate(cfg):
         # EIN Schreibvorgang fuer den ganzen Lauf (Vertrag 1), aber ein
@@ -4059,22 +4913,48 @@ def cmd_discover():
                 continue
             style = ((h.get("effort") or {}).get("style")) or "none"
             emap = ((h.get("effort") or {}).get("map")) or {}
-            plan = plan_for(hid, dc, refs, models_list, now_iso, emap, style)
+            plan = plan_for(hid, dc, refs, models_list, now_iso, emap, style,
+                            template_models,
+                            discovered_semver(local_identity.get(hid)))
             for w in plan["warnings"]:
                 sys.stderr.write("wb-state: WARNUNG — %s\n" % w)
-            guard = empty_answer_guard(hid, refs, plan, fl["allow-empty"])
+            guard = (empty_answer_guard(hid, refs, plan, fl["allow-empty"]) or
+                     shrunken_answer_guard(hid, refs,
+                                           (ttl_state.get(hid) or {}).get("count"),
+                                           fl["allow-empty"], fl["allow-shrink"]))
             if guard:
+                sys.stderr.write("wb-state: WARNUNG — %s\n" % guard)
                 # Wie der err-Zweig darueber: nichts anwenden, nichts entfernen, und
                 # AUCH KEIN Zeitstempel — ein Ausfall darf die Quelle nicht fuer die
                 # naechsten Stunden als "frisch erkannt" abhaken (--if-stale).
                 output[hid] = {"added": [], "removed": [], "updated": [],
-                               "kept": len(plan["removed"]), "error": guard,
-                               "skippedEmpty": True}
+                               "kept": len(plan["removed"]) + len(plan["updated"]) + plan["kept"],
+                               "error": guard,
+                               "skippedEmpty" if not refs else "skippedShrink": True}
                 continue
             output[hid] = {"added": plan["added"], "removed": plan["removed"],
                            "updated": plan["updated"], "kept": plan["kept"], "error": None}
             apply_plan(cfg, models_list, plan, entries_log)
-            ttl_state[hid] = {"at": now_iso, "count": len(refs)}
+            ttl_state[hid] = {"at": now_iso, "count": len(refs),
+                              **local_identity.get(hid, {})}
+        for pid, prov, dc in to_query_files:
+            refs, err = fetched_files[pid]
+            if err:
+                kept = sum(1 for m in models_list
+                           if isinstance(m, dict) and m.get("provider") == pid
+                           and m.get("source") == "auto")
+                output[pid] = {"added": [], "removed": [], "updated": [],
+                               "kept": kept, "error": err}
+                continue
+            plans, plan_err = files_provider_plans(pid, prov, dc, refs, models_list)
+            if plan_err:
+                output[pid] = {"added": [], "removed": [], "updated": [],
+                               "kept": 0, "error": plan_err, "inventory": len(refs)}
+                continue
+            output[pid] = files_output_from_plans(
+                pid, refs, plans, models_list, cfg, entries_log)
+            if not output[pid].get("error"):
+                ttl_state[pid] = {"at": now_iso, "count": len(refs)}
         for pid, prov, dc in to_query_catalog:
             result = fetched_catalog[pid]
             if result["error"]:
@@ -4112,7 +4992,7 @@ def cmd_discover():
             emap = ((rh.get("effort") or {}).get("map")) or {}
             roles = dc.get("roles") or ["worker", "orchestrator"]
             plan = plan_for_catalog(runner, pid, result["refs"], models_list, now_iso,
-                                    emap, style, roles)
+                                    emap, style, roles, dc, template_models)
             for w in plan["warnings"]:
                 sys.stderr.write("wb-state: WARNUNG — %s\n" % w)
             # Derselbe Ausfall trifft den Katalogpfad ohne jede Formataenderung:
@@ -4120,11 +5000,16 @@ def cmd_discover():
             # zurueck (mode "no-key"). Ein Key, der aus dem Schluesselbund faellt,
             # haette bis heute alle automatischen Eintraege dieses Anbieters
             # entfernt. Das meta-Feld unten nennt weiterhin den echten Grund.
-            guard = empty_answer_guard(pid, result["refs"], plan, fl["allow-empty"])
+            guard = (empty_answer_guard(pid, result["refs"], plan, fl["allow-empty"]) or
+                     shrunken_answer_guard(pid, result["refs"],
+                                           (ttl_state.get(pid) or {}).get("count"),
+                                           fl["allow-empty"], fl["allow-shrink"]))
             if guard:
+                sys.stderr.write("wb-state: WARNUNG — %s\n" % guard)
                 output[pid] = {"added": [], "removed": [], "updated": [],
-                               "kept": len(plan["removed"]), "error": guard,
-                               "skippedEmpty": True, "catalog": result["meta"]}
+                               "kept": len(plan["removed"]) + len(plan["updated"]) + plan["kept"],
+                               "error": guard, "catalog": result["meta"],
+                               "skippedEmpty" if not result["refs"] else "skippedShrink": True}
                 continue
             output[pid] = {"added": plan["added"], "removed": plan["removed"],
                            "updated": plan["updated"], "kept": plan["kept"], "error": None,
@@ -4133,7 +5018,7 @@ def cmd_discover():
             ttl_state[pid] = {"at": now_iso, "count": len(result["refs"])}
         return entries_log
 
-    if not to_query_local and not to_query_catalog:
+    if not to_query_local and not to_query_files and not to_query_catalog:
         pass                                       # alles frisch (--if-stale) oder nichts angefordert
     elif fl["dry-run"]:
         # Vertrag 1: rechnen, ausgeben, NICHTS schreiben — auch keinen Zeitstempel und
@@ -4146,19 +5031,40 @@ def cmd_discover():
                 continue
             style = ((h.get("effort") or {}).get("style")) or "none"
             emap = ((h.get("effort") or {}).get("map")) or {}
-            plan = plan_for(hid, dc, refs, MODELS, now_iso, emap, style)
+            plan = plan_for(hid, dc, refs, MODELS, now_iso, emap, style,
+                            template_models,
+                            discovered_semver(local_identity.get(hid)))
             for w in plan["warnings"]:
                 sys.stderr.write("wb-state: WARNUNG — %s\n" % w)
             # Die Leer-Sperre gilt im Probelauf genauso: --dry-run soll zeigen, was
             # ein echter Lauf taete, und der taete hier nichts.
-            guard = empty_answer_guard(hid, refs, plan, fl["allow-empty"])
+            guard = (empty_answer_guard(hid, refs, plan, fl["allow-empty"]) or
+                     shrunken_answer_guard(hid, refs,
+                                           (ttl_state.get(hid) or {}).get("count"),
+                                           fl["allow-empty"], fl["allow-shrink"]))
             if guard:
+                sys.stderr.write("wb-state: WARNUNG — %s\n" % guard)
                 output[hid] = {"added": [], "removed": [], "updated": [],
-                               "kept": len(plan["removed"]), "error": guard,
-                               "skippedEmpty": True}
+                               "kept": len(plan["removed"]) + len(plan["updated"]) + plan["kept"],
+                               "error": guard,
+                               "skippedEmpty" if not refs else "skippedShrink": True}
                 continue
             output[hid] = {"added": plan["added"], "removed": plan["removed"],
                            "updated": plan["updated"], "kept": plan["kept"], "error": None}
+        for pid, prov, dc in to_query_files:
+            refs, err = fetched_files[pid]
+            if err:
+                kept = sum(1 for m in MODELS
+                           if m.get("provider") == pid and m.get("source") == "auto")
+                output[pid] = {"added": [], "removed": [], "updated": [],
+                               "kept": kept, "error": err}
+                continue
+            plans, plan_err = files_provider_plans(pid, prov, dc, refs, MODELS)
+            if plan_err:
+                output[pid] = {"added": [], "removed": [], "updated": [],
+                               "kept": 0, "error": plan_err, "inventory": len(refs)}
+                continue
+            output[pid] = files_output_from_plans(pid, refs, plans, MODELS)
         for pid, prov, dc in to_query_catalog:
             result = fetched_catalog[pid]
             if result["error"]:
@@ -4176,14 +5082,19 @@ def cmd_discover():
             emap = ((rh.get("effort") or {}).get("map")) or {}
             roles = dc.get("roles") or ["worker", "orchestrator"]
             plan = plan_for_catalog(runner, pid, result["refs"], MODELS, now_iso,
-                                    emap, style, roles)
+                                    emap, style, roles, dc, template_models)
             for w in plan["warnings"]:
                 sys.stderr.write("wb-state: WARNUNG — %s\n" % w)
-            guard = empty_answer_guard(pid, result["refs"], plan, fl["allow-empty"])
+            guard = (empty_answer_guard(pid, result["refs"], plan, fl["allow-empty"]) or
+                     shrunken_answer_guard(pid, result["refs"],
+                                           (ttl_state.get(pid) or {}).get("count"),
+                                           fl["allow-empty"], fl["allow-shrink"]))
             if guard:
+                sys.stderr.write("wb-state: WARNUNG — %s\n" % guard)
                 output[pid] = {"added": [], "removed": [], "updated": [],
-                               "kept": len(plan["removed"]), "error": guard,
-                               "skippedEmpty": True, "catalog": result["meta"]}
+                               "kept": len(plan["removed"]) + len(plan["updated"]) + plan["kept"],
+                               "error": guard, "catalog": result["meta"],
+                               "skippedEmpty" if not result["refs"] else "skippedShrink": True}
                 continue
             output[pid] = {"added": plan["added"], "removed": plan["removed"],
                            "updated": plan["updated"], "kept": plan["kept"], "error": None,
@@ -4292,7 +5203,7 @@ def cmd_effort():
     rolle = vals["rolle"] or "worker"
     if rolle not in ("worker", "orchestrator"):
         die("FEHLER: unbekannte Rolle '%s' (worker|orchestrator)." % rolle)
-    m = byid(MODELS, pos[0])
+    m = find_model(pos[0])
     if m is None and vals["harness"]:
         # OHNE models.json gibt es die eingebauten ADAPTER, aber keine
         # eingebauten MODELLE -- der schnelle Pfad von pi-worker (claude-sonnet5
@@ -4355,11 +5266,138 @@ def cmd_cap_list():
         print("%s\t%s\t%s\t%s" % (mid, e.get("cap") or "-", e.get("gesetzt") or "-",
                                   e.get("grund") or ""))
 
+# ── probe: one short real call before a discovered model is used (2026-10-10,
+# Auftrag modell-auto) ────────────────────────────────────────────────────────────
+# A harness with a 'modelProbe' block {"command": [...], "expect": "<regex>",
+# "timeoutSeconds": n} lets discover enter new ids disabled with probe.status
+# "offen".  This command calls each such model once: an answer matching 'expect'
+# enables it ("bestanden"), anything else keeps it disabled with reason and date
+# ("abgelehnt") -- and the next run asks again. "{command}" is the harness's own
+# command, "{ref}" the modelRef. Explicit family locks always win; inferred family
+# state only blocks new discoveries, so an existing model can be probed to recover.
+PROBE_RETRY = ("offen", "abgelehnt")
+
+def probe_command(h, m):
+    pr = harness_probe(h)
+    cmd = pr.get("command")
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
+        return None
+    out = []
+    for part in cmd:
+        part = part.replace("{command}", ex(h.get("command") or h.get("id") or ""))
+        out.append(part.replace("{ref}", m.get("modelRef") or m.get("id")))
+    return out
+
+def run_probe(argv, expect, timeout):
+    import tempfile
+    work = tempfile.mkdtemp(prefix="wb-modellprobe-")
+    try:
+        p = subprocess.run(argv, cwd=work, stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, "keine Antwort binnen %ds" % timeout
+    except OSError as err:
+        return False, "Aufruf nicht startbar: %s" % err
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if p.returncode == 0 and re.search(expect, p.stdout or "", re.I):
+        return True, None
+    text = [l.strip() for l in ((p.stderr or "") + "\n" + (p.stdout or "")).splitlines() if l.strip()]
+    hint = next((l for l in reversed(text) if re.search(r"error|fehler|not supported|denied|invalid|unknown|unsupported|not found", l, re.I)), None)
+    reason = hint or (text[-1] if text else "keine Ausgabe")
+    if p.returncode != 0:
+        reason = "Exit %d: %s" % (p.returncode, reason)
+    else:
+        reason = "Antwort ohne erwartetes Muster: %s" % reason
+    return False, reason[:300]
+
+def cmd_probe():
+    vals, fl, pos = opts(ARGV, ["timeout"], ["json", "dry-run"])
+    now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    template_models = discover_template_models()
+    if pos:
+        targets = [need_model(x) for x in pos]
+    else:
+        targets = [m for m in MODELS if (m.get("probe") or {}).get("status") in PROBE_RETRY]
+    results, plan = [], {}
+    for m in targets:
+        h = byid(HARNESSES, m.get("harness")) or {}
+        prev = (m.get("probe") or {}).get("status")
+        res = {"id": m["id"], "harness": m.get("harness"), "modelRef": m.get("modelRef"),
+               "previous": prev, "at": now_iso}
+        lock = family_lock_reason(m.get("harness"), m["id"], m.get("modelRef"),
+                                  [x for x in MODELS if x.get("id") != m["id"]],
+                                  template_models, existing_probe=True)
+        argv = probe_command(h, m)
+        if lock:
+            res.update(status="gesperrt", reason=lock)
+        elif argv is None:
+            res.update(status="ohne-probe", reason="Harness %s hat keinen modelProbe-Block." % h.get("id"))
+        elif fl["dry-run"]:
+            res.update(status="wuerde-pruefen", command=argv)
+        else:
+            pr = harness_probe(h)
+            timeout = int(vals["timeout"] or pr.get("timeoutSeconds") or 180)
+            ok, reason = run_probe(argv, pr.get("expect") or r"\bok\b", timeout)
+            res.update(status="bestanden" if ok else "abgelehnt")
+            if reason:
+                res["reason"] = reason
+            plan[m["id"]] = res
+        res["newlyPassed"] = res["status"] == "bestanden" and prev != "bestanden"
+        results.append(res)
+
+    if plan:
+        def mutate(cfg):
+            log = []
+            for e in cfg.get("models") or []:
+                r = plan.get(e.get("id")) if isinstance(e, dict) else None
+                if r is None:
+                    continue
+                old = dict(e)
+                attempts = int((e.get("probe") or {}).get("attempts") or 0) + 1
+                probe = {"status": r["status"], "at": r["at"], "attempts": attempts}
+                if r.get("reason"):
+                    probe["reason"] = r["reason"]
+                e["probe"] = probe
+                e["enabled"] = r["status"] == "bestanden"
+                validate("model", e, cfg)
+                log.append(("model:%s.probe" % e["id"], old.get("probe"), probe))
+            return log
+        write_registry(mutate)
+
+    if fl["json"]:
+        print(json.dumps({"checkedAt": now_iso, "results": results}, ensure_ascii=False))
+        return
+    if not results:
+        print("wb-state: kein Modell wartet auf einen Probeaufruf.")
+    for r in results:
+        print("%s\t%s\t%s" % (r["id"], r["status"], r.get("reason") or ""))
+
+def cmd_families():
+    """Every family alias, where it points now, and its lock (for rules and reports)."""
+    _vals, fl, _pos = opts(ARGV, [], ["json"])
+    rows = []
+    for h in HARNESSES:
+        for spec in family_specs(h):
+            members = sorted(family_members(h, spec), key=lambda item: item[0])
+            target = byfamilyalias((spec.get("aliases") or [""])[0])
+            rows.append({"harness": h["id"], "aliases": spec.get("aliases") or [],
+                         "locked": spec.get("locked"),
+                         "target": target["id"] if target else None,
+                         "members": [m["id"] for _v, m in members]})
+    if fl["json"]:
+        print(json.dumps(rows, ensure_ascii=False))
+        return
+    for r in rows:
+        print("%s\t%s\t%s%s" % (r["harness"], ",".join(r["aliases"]), r["target"] or "-",
+                                 ("\tgesperrt: " + r["locked"]) if r["locked"] else ""))
+
 DISPATCH = {"list": cmd_list, "get": cmd_get, "resolve": cmd_resolve, "table": cmd_table,
             "check": cmd_check, "add": cmd_add, "set": cmd_set, "remove": cmd_remove,
             "harness-get": cmd_harness_get, "discover": cmd_discover, "catalog": cmd_catalog,
             "effort": cmd_effort, "cap": cmd_cap_get, "caps": cmd_cap_list,
-            "migrate-session": cmd_migrate_session}
+            "migrate-session": cmd_migrate_session, "probe": cmd_probe,
+            "families": cmd_families}
 if SUB not in DISPATCH:
     die("FEHLER: unbekanntes Registry-Kommando '%s'." % SUB,
         "Gueltig: " + " ".join(sorted(DISPATCH)))

@@ -26,10 +26,55 @@
  * „[wb-durcharbeiten]", damit niemand ihn für Wort des Nutzers hält.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { execFileSync } from "node:child_process";
 
 const MAX_OHNE_WERKZEUG = 12;
 const PROTOKOLL = ".pi-workers/results/";
 const STOPPWORTE = /^\s*(stop|halt|warte|stopp|pause)\b/i;
+
+/**
+ * NACHTRAG 2026-09-21, nach einem Befund vom Nutzer: „ich habe gerade versucht
+ * den qwen zu stoppen, es geht aber nicht weil sofort ein Wächterprompt zum
+ * weiterarbeiten kommt, das darf nicht passieren."
+ *
+ * Zwei Fehler steckten darin, und beide verletzen dieselbe Hausregel — ein
+ * Werkzeug überstimmt nie einen Menschen.
+ *
+ * ERSTENS kannte diese Erweiterung als Stopp nur ein GETIPPTES Wort. Ein Abbruch
+ * per Escape schickt keine Nachricht: der Zug endet, `agent_settled` feuert, die
+ * letzte Assistentennachricht hat weder Werkzeugaufruf noch DONE — also stieß sie
+ * sofort wieder an. Der Mensch drückte Escape, und das Werkzeug tippte weiter.
+ *
+ * GEMESSEN statt geraten (21.09., eigene Ereignisprobe in einem Worker-Pane,
+ * Protokoll ~/.local/state/wb-ereignisprobe.log): ein abgebrochener Zug liefert
+ * ein `message_end` mit `role: "assistant"` und `stopReason: "aborted"`; das
+ * Ereignis `agent_end` trägt dazu nichts (nur `type` und `messages`), und ein
+ * eigenes Abbruch-Ereignis gibt es nicht. `stopReason` ist also die einzige
+ * verlässliche Spur — genau 1,5 ms später stand im Protokoll der Anstoß dieser
+ * Erweiterung als Nutzer-Nachricht.
+ *
+ * ZWEITENS lief sie überhaupt in einer Orchestrator-Sitzung, weil deren
+ * Auftragstext zufällig den Pfad `.pi-workers/results/` enthielt. Gedacht war sie
+ * für WORKER, die nach dem Ergebnisprotokoll arbeiten. In einem Pane der Rolle
+ * `orchestrator` sitzt ein Mensch; dort bleibt sie ab jetzt stumm, außer er
+ * schaltet sie ausdrücklich ein (`/durcharbeiten an`).
+ */
+const ABGEBROCHEN = "aborted";
+
+/** Rolle des eigenen Panes, einmal beim Laden. Fehler heißt „unbekannt", nie „Worker". */
+function paneRolle(): string {
+  const pane = process.env.TMUX_PANE;
+  if (!pane) return "";
+  try {
+    return execFileSync("tmux", ["show", "-p", "-t", pane, "-v", "@wb_role"], {
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
 const ANSTOSS =
   "[wb-durcharbeiten] Weiter. Du hast den Zug ohne Werkzeugaufruf beendet und der Auftrag " +
   "ist nicht fertig. Arbeite den Auftrag ohne Halt durch: nächster Schritt jetzt ausführen, " +
@@ -39,6 +84,8 @@ export default function (pi: ExtensionAPI) {
   let auftragLaeuft = false;
   let anstoesseOhneWerkzeug = 0;
   let menschHatGestoppt = false;
+  // In einem Orchestrator-Pane von Anfang an stumm; `/durcharbeiten an` hebt das auf.
+  let stummImOrchestrator = paneRolle() === "orchestrator";
   let letzteAssistentin: { text: string; hatteWerkzeug: boolean; done: boolean } | undefined;
 
   const textAus = (content: unknown): string => {
@@ -71,6 +118,14 @@ export default function (pi: ExtensionAPI) {
       const t = textAus(m.content);
       const hatteWerkzeug = Array.isArray(m.content) && m.content.some((c: any) => c?.type === "toolCall");
       const done = /(^|\n)\s*DONE\s*$/.test(t.trimEnd());
+      // Ein abgebrochener Zug ist der Wille eines Menschen, kein steckengebliebenes
+      // Modell. Ab hier kein Anstoss mehr, bis der Mensch selbst wieder schreibt
+      // oder `/durcharbeiten` ruft.
+      if (m.stopReason === ABGEBROCHEN) {
+        menschHatGestoppt = true;
+        letzteAssistentin = { text: t, hatteWerkzeug, done };
+        return;
+      }
       letzteAssistentin = { text: t, hatteWerkzeug, done };
       if (hatteWerkzeug) anstoesseOhneWerkzeug = 0;
       if (done) auftragLaeuft = false;
@@ -78,6 +133,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async (_ev: any, ctx: any) => {
+    if (stummImOrchestrator) return;
     if (!auftragLaeuft || menschHatGestoppt) return;
     if (!ctx.isIdle?.()) return;
     if (ctx.hasPendingMessages?.()) return;
@@ -95,11 +151,21 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("durcharbeiten", {
-    description: "Zeigt, ob wb-durcharbeiten einen Auftrag verfolgt, und setzt den Stopp eines Menschen zurück",
-    handler: async (_args: string, ctx: any) => {
-      menschHatGestoppt = false;
+    description:
+      "Zeigt den Stand; 'an'/'aus' schaltet die Anstoesse in diesem Pane ein oder aus. Ohne Argument wird ein Stopp zurueckgesetzt.",
+    handler: async (args: string, ctx: any) => {
+      const wort = (args || "").trim().toLowerCase();
+      if (wort === "an") {
+        stummImOrchestrator = false;
+        menschHatGestoppt = false;
+      } else if (wort === "aus") {
+        stummImOrchestrator = true;
+      } else {
+        menschHatGestoppt = false;
+      }
       ctx.ui?.notify?.(
-        `wb-durcharbeiten: Auftrag ${auftragLaeuft ? "läuft" : "keiner"}, Anstöße ohne Werkzeug ${anstoesseOhneWerkzeug}/${MAX_OHNE_WERKZEUG}`,
+        `wb-durcharbeiten: ${stummImOrchestrator ? "STUMM (Orchestrator-Pane; '/durcharbeiten an' schaltet ein)" : "aktiv"}, ` +
+          `Auftrag ${auftragLaeuft ? "läuft" : "keiner"}, Anstöße ohne Werkzeug ${anstoesseOhneWerkzeug}/${MAX_OHNE_WERKZEUG}`,
         "info",
       );
     },

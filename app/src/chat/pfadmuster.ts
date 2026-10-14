@@ -15,8 +15,8 @@
 /** Der Ordnername, den claude und qwen aus einem Arbeitsverzeichnis machen. */
 export function cwdSlug(cwd: string): string {
   // GEMESSEN am eigenen Transcript-Ordner (11.08.):
-  // /Users/alice/.pi-workers/worktrees/chatansicht wird zu
-  // -Users-alice--pi-workers-worktrees-chatansicht -- jeder Schraegstrich UND
+  // /Users/me/.pi-workers/worktrees/chatansicht wird zu
+  // -Users-me--pi-workers-worktrees-chatansicht -- jeder Schraegstrich UND
   // jeder Punkt wird zum Strich, der fuehrende Schraegstrich bleibt als Strich
   // stehen (deshalb der doppelte Strich vor 'pi-workers').
   return cwd.replace(/[/.]/g, '-');

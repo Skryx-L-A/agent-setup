@@ -1,12 +1,14 @@
 #!/bin/bash
 # Zweck: verhindert `git add`/`git commit`, die .env-Dateien oder gaengige
-#        Secret-Dateimuster ausserhalb ~/Knowledge/90-secrets/ einschliessen.
+#        Secret-Dateimuster ausserhalb ~/Knowledge/secrets/ einschliessen.
 # Event: PreToolUse, matcher Bash.
 # NICHT REGISTRIERT: Logik seit 2026-08-05 direkt in bash-guard.py neu geschrieben
 #        (dessen PreToolUse/Bash-Sammelpunkt) -- diese Datei traegt nur noch die
 #        Original-Begruendung, kein Eintrag in settings.json zeigt hierher.
+#        Auch die Inhaltspruefung (Abschnitt 3) liegt seit 2026-10-09 in bash-guard.py,
+#        ihr Scanner in lib/geheimnis_inhalt.py (eine Quelle fuer beide).
 # Warum: CLAUDE.md sagt "Never commit a .env (or any secret) to GitHub" und
-#        "Secrets knowledge goes only into 90-secrets/" — bisher reine Prosa-
+#        "Secrets knowledge goes only into secrets/" — bisher reine Prosa-
 #        Regel ohne technische Durchsetzung (siehe research-skills Luecke #1).
 # Fix nach Review 2026-07-28 (M10): alle drei Trigger-Checks verlangten "git"
 #        UNMITTELBAR gefolgt vom Unterbefehl (add/commit) — `git -C <dir> add`
@@ -62,7 +64,7 @@
 #          (guard-secrets-content-exceptions.conf, gleiches Verzeichnis wie
 #          dieses Skript) mit sinnvollen Standardwerten — nicht als
 #          Sonderfall im Code. Sie betrifft NUR Abschnitt 3; die bestehende
-#          90-secrets/-Ausnahme in is_secret_path (Abschnitt 1/2) bleibt
+#          secrets/-Ausnahme in is_secret_path (Abschnitt 1/2) bleibt
 #          unveraendert. Fehlt die Konfigurationsdatei, gilt der sichere
 #          Standard: KEINE Ausnahme (es wird mehr gescannt, nie weniger).
 set -uo pipefail
@@ -171,11 +173,15 @@ is_allowed_env_suffix() {
 
 is_secret_path() {
   local p="$1"
-  # Ausnahme: alles innerhalb 90-secrets/ ist der vorgesehene Ort fuer Secrets.
-  echo "$p" | /usr/bin/grep -Eq '(^|/)90-secrets/' && return 1
+  # Ausnahme: alles innerhalb secrets/ ist der vorgesehene Ort fuer Secrets.
+  echo "$p" | /usr/bin/grep -Eq '(^|/)secrets/' && return 1
   is_allowed_env_suffix "$p" && return 1
   # .env oder .env.<irgendwas ausser example/template/sample>
   if echo "$p" | /usr/bin/grep -Eq '(^|/)\.env($|\.[A-Za-z0-9_-]+$)'; then
+    return 0
+  fi
+  # `*.env` (prod.env, docker.env, ...): Dateiname ENDET auf `.env` (seit 2026-10-09).
+  if echo "$p" | /usr/bin/grep -Eqi '\.env$'; then
     return 0
   fi
   # gaengige Secret-Dateimuster
@@ -215,123 +221,33 @@ is_content_scan_exempt() {
 # und haelt den Scan schnell (siehe Messung im Test-Report).
 CONTENT_SCAN_MAX_BYTES=2000000
 
-# Der eigentliche Scanner laeuft als EIN einziger python3-Prozess fuer ALLE
-# Kandidaten-Dateien zusammen (Batch statt ein Prozess pro Datei) -- Prozess-
-# Start ist der teuerste Teil bei vielen kleinen Dateien, ein Hook der vor
-# JEDEM Bash-Aufruf laeuft darf das nicht x-mal pro Aufruf zahlen.
-#
-# Entropie-Schwelle (ENTROPY_THRESHOLD unten): gemessen an echten Beispielen
-# (Shannon-Entropie in Bit/Zeichen ueber die Zeichenverteilung des Strings
-# selbst, Standardmass wie bei trufflehog/detect-secrets):
-#   UUID v4 mit Bindestrichen (36 Zeichen)      3.391 Bit/Zeichen
-#   UUID v4 ohne Bindestriche (32 Hexziffern)   3.248 Bit/Zeichen
-#   git SHA-1, 39 Hexziffern                    3.821 Bit/Zeichen
-#   zufaelliger 32-Zeichen-Schluessel           5.000 Bit/Zeichen
-#     (gemischte Gross-/Kleinschreibung+Ziffern, aB3xK9mQ7vN2pL5tR8wZ1cF4hJ6yU0sD)
-#   zufaellige 40-Zeichen-Zeichenkette          5.172 Bit/Zeichen
-# Reines Hex (UUID/SHA) hat ein theoretisches Maximum von log2(16) = 4.0
-# Bit/Zeichen -- selbst ein perfekt zufaelliger Hexwert kommt nie darueber.
-# Zufallsschluessel mit groesserem Alphabet (Gross-/Kleinschreibung+Ziffern,
-# ~62 Symbole, log2(62) = 5.95) liegen bei ueblichen Laengen klar darueber.
-# Schwelle 4.3 liegt damit sicher ueber der Hex-Decke UND sicher unter den
-# gemessenen echten Zufallsschluesseln -- kein UUID/git-SHA kann sie je
-# erreichen, ein generischer Zufallsschluessel ueberschreitet sie deutlich.
-ENTROPY_THRESHOLD_COMMENT="siehe Kommentar oben (4.3 Bit/Zeichen)"
-
+# Der eigentliche Scanner (Muster, Entropie-Schwelle 4.3, Fail-closed-Verhalten)
+# steht seit 2026-10-09 NICHT mehr hier, sondern in lib/geheimnis_inhalt.py: die
+# Entscheidungslogik lebt in bash-guard.py, und dort fehlte die Inhaltspruefung
+# (gemessen am Live-Guard: ein Schluessel in config.py ging durch). Beide nutzen
+# jetzt dieselbe Datei, es gibt keine zweite Kopie der Muster. Die Variable
+# CONTENT_SCAN_PY bleibt als `python3 -c`-Programm mit unveraenderter
+# Aufrufform erhalten (Pfade als Argumente, Zeilen FINDING:/ERROR:, Exit 0,
+# FATAL: + Exit 1) -- wer sie aus dieser Datei laedt, bekommt dieselbe Ausgabe wie
+# vorher. Der Scanner laeuft als EIN python3-Prozess fuer alle Kandidaten
+# (Prozessstart ist der teuerste Teil bei vielen kleinen Dateien).
+# Die Heredoc-Zeile mit CONTENT_SCAN_PY unten und ihr Abschluss PYEOF bleiben WORTGLEICH
+# bestehen (der Marker darf in dieser Datei nur ein einziges Mal vorkommen): shell/wb-gruppe laedt den Scanner zur Laufzeit, indem es genau diesen
+# Block aus dieser Datei ausschneidet und ausfuehrt (exec) und danach PATTERNS,
+# GENERIC_ASSIGN, shannon_entropy und ENTROPY_THRESHOLD aus dem Namensraum liest.
+# Der Block holt sie jetzt aus lib/geheimnis_inhalt.py (WB_HOOKS_DIR, sonst die
+# installierte Fassung unter ~/.claude/hooks); fehlt die Datei, schlaegt der Import
+# fehl -- fail-closed, nie ein stilles Durchlassen.
+export WB_HOOKS_DIR="$SCRIPT_DIR"
 read -r -d '' CONTENT_SCAN_PY <<'PYEOF' || true
-import math, re, sys
-from collections import Counter
-
-MAX_BYTES = 2000000
-ENTROPY_THRESHOLD = 4.3
-MIN_GENERIC_LEN = 16
-
-PATTERNS = [
-    ("aws_access_key", re.compile(r'AKIA[0-9A-Z]{16}')),
-    ("github_token", re.compile(r'(?:ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{20,255}')),
-    ("anthropic_key", re.compile(r'sk-ant-[A-Za-z0-9_-]{20,}')),
-    ("openai_key", re.compile(r'sk-(?!ant-)[A-Za-z0-9_-]{20,}')),
-    ("slack_token", re.compile(r'xox[baprs]-[A-Za-z0-9-]{10,48}')),
-    ("google_api_key", re.compile(r'AIza[0-9A-Za-z_-]{35,}')),
-    ("private_key_block", re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')),
-    ("jwt", re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}')),
-    ("stripe_key", re.compile(r'(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}')),
-]
-
-# Keine vordere Wortgrenze: '\b' greift NICHT vor dem S in STRIPE_SECRET, weil der
-# Unterstrich selbst ein Wortzeichen ist -- ein Praefix wie STRIPE_, AZURE_CLIENT_ oder
-# DB_ haette den Fund sonst still verhindert. Gemessen am 17.08.2026 mit einem
-# erfundenen Stripe- und einem Azure-Wert, beide gingen durch. Ein Fehlalarm bleibt
-# unwahrscheinlich, weil zusaetzlich ein Wert von mindestens MIN_GENERIC_LEN Zeichen
-# UND eine Entropie ueber der Schwelle verlangt wird.
-GENERIC_ASSIGN = re.compile(
-    r'(?i)(password|passwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|client[_-]?secret)\b'
-    r'\s*[:=]\s*["\']?([A-Za-z0-9+/_=\-~.]{%d,})["\']?' % MIN_GENERIC_LEN
-)
-
-
-def shannon_entropy(s):
-    if not s:
-        return 0.0
-    counts = Counter(s)
-    length = len(s)
-    return -sum((c / length) * math.log2(c / length) for c in counts.values())
-
-
-def scan_file(path):
-    findings = []
-    try:
-        with open(path, "rb") as f:
-            data = f.read(MAX_BYTES)
-    except Exception as e:
-        return None, "%s: %s" % (path, e)
-
-    if b"\x00" in data:
-        return [], None  # binaer -> uebersprungen, kein Fehler
-
-    text = data.decode("utf-8", errors="replace")
-
-    for name, rx in PATTERNS:
-        m = rx.search(text)
-        if m:
-            line = text.count("\n", 0, m.start()) + 1
-            findings.append("%s: Zeile %d, Muster '%s'" % (path, line, name))
-
-    for m in GENERIC_ASSIGN.finditer(text):
-        value = m.group(2)
-        ent = shannon_entropy(value)
-        if ent >= ENTROPY_THRESHOLD:
-            line = text.count("\n", 0, m.start()) + 1
-            findings.append(
-                "%s: Zeile %d, generische Zuweisung '%s' mit hoher Entropie (%.2f Bit/Zeichen)"
-                % (path, line, m.group(1), ent)
-            )
-
-    return findings, None
-
-
-def main():
-    paths = sys.argv[1:]
-    any_finding = False
-    any_error = False
-    for p in paths:
-        findings, err = scan_file(p)
-        if err is not None:
-            print("ERROR:%s" % err)
-            any_error = True
-            continue
-        for f in findings:
-            print("FINDING:%s" % f)
-            any_finding = True
-    sys.exit(0)
-
-
+import os, sys
+for _basis in (os.environ.get("WB_HOOKS_DIR", ""), os.path.join(os.path.expanduser("~"), ".claude", "hooks")):
+    if _basis and os.path.isfile(os.path.join(_basis, "lib", "geheimnis_inhalt.py")):
+        sys.path.insert(0, os.path.join(_basis, "lib"))
+        break
+from geheimnis_inhalt import PATTERNS, GENERIC_ASSIGN, shannon_entropy, ENTROPY_THRESHOLD, main  # noqa: E402,F401
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("FATAL:%s" % e)
-        sys.exit(1)
+    main()
 PYEOF
 
 run_content_scan() {
@@ -361,7 +277,7 @@ if find_git_invocation "$command" add || echo "$command" | /usr/bin/grep -Eq -- 
       path=$(echo "$line" | /usr/bin/sed -E 's/^.{2} //' | /usr/bin/sed -E 's/.* -> //')
       [ -z "$path" ] && continue
       if is_secret_path "$path"; then
-        deny "git add/commit (breites Staging, Repo: $repo_dir) wuerde eine Secret-/​.env-Datei einschliessen ($path) ausserhalb 90-secrets/. Blockiert von bash-guard-secrets."
+        deny "git add/commit (breites Staging, Repo: $repo_dir) wuerde eine Secret-/​.env-Datei einschliessen ($path) ausserhalb secrets/. Blockiert von bash-guard-secrets."
       fi
       # Abschnitt 3: Inhaltspruefung fuer alles, was die Pfadpruefung
       # passiert hat -- nur wenn die Datei tatsaechlich existiert (bei
@@ -409,7 +325,7 @@ if find_git_invocation "$command" add || echo "$command" | /usr/bin/grep -Eq -- 
       esac
       stripped=${tok%\"}; stripped=${stripped#\"}; stripped=${stripped%\'}; stripped=${stripped#\'}
       if is_secret_path "$stripped"; then
-        deny "git add/commit nennt '$stripped' — sieht nach einer Secret-/.env-Datei ausserhalb 90-secrets/ aus. (git war hier nicht benutzbar, geprueft wurde deshalb nur der Kommandotext.) Blockiert von bash-guard-secrets."
+        deny "git add/commit nennt '$stripped' — sieht nach einer Secret-/.env-Datei ausserhalb secrets/ aus. (git war hier nicht benutzbar, geprueft wurde deshalb nur der Kommandotext.) Blockiert von bash-guard-secrets."
       fi
       # Best-effort Inhaltspruefung: nur wenn der Token tatsaechlich als
       # Datei relativ zu repo_dir existiert (git ist hier unbenutzbar, es

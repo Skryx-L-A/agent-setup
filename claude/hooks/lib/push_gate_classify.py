@@ -92,8 +92,13 @@ def finds_push(command_text, varmap, depth=0):
                     return True
                 continue
 
-            if name in cs.SHELL_INTERPRETERS and len(remaining) >= 2 and remaining[0] == '-c':
-                inner = remaining[1]
+            if name in cs.SHELL_INTERPRETERS:
+                # Jede Option vor dem Befehlstext zaehlt (`-lc`, `-ec`, `-x -c`, `-o pipefail -c`,
+                # `--login -c`, `-euc`); bis 2026-10-10 galt nur ein `-c` an allererster Stelle.
+                # Auch `-n -c` bleibt Treffer: streng, der Push steht getippt im Befehl.
+                hat_c, inner = cs.shell_c_script(remaining)
+                if not hat_c or not inner:
+                    continue
                 if _unresolvable_command_word(inner, varmap):
                     return True
                 if finds_push(inner, varmap, depth + 1):

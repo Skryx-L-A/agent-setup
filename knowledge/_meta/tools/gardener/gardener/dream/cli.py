@@ -71,7 +71,8 @@ from pathlib import Path
 from .. import blocks
 from .. import config as gcfg
 from ..ollama import OllamaClient
-from ..runtime import Deadline, Lock, LockHeldError, git_commit
+from ..runtime import (Deadline, Lock, LockHeldError, commit_by_repo_single,
+                       install_termination_handler)
 from . import apply as apply_mod
 from . import budget as budget_mod
 from . import config as dcfg
@@ -328,13 +329,28 @@ def reconcile_local_call():
     `call_claude_cli`; `grug-server ensure`/`stop` happens in `run_reconcile`
     around this call, not here, since a lazy per-call `ensure` (cheap once
     the server is already up) means a slice with zero divergent pairs never
-    loads the model at all."""
+    loads the model at all.
+
+    Auftrag "p0-schutztore": `ensure_grug_server()` now reports whether THIS
+    call actually started or switched the server (see `mlx_server.ensure`) -
+    a fact `run_reconcile`'s `finally` needs to decide whether it may stop
+    the server again, but this closure is the only place that ever calls
+    `ensure`, and it is called lazily, possibly many times (once per
+    divergent group). The ownership probe itself must run at most once: a
+    server WE started answers a second `ensure_grug_server()` call with
+    `False` (it is now already serving our model), which would look like a
+    guest situation if asked again. `server["owned"]` is therefore latched on
+    the first call and exposed on the closure for `run_reconcile` to read."""
+    server: dict = {"owned": None}
+
     def call(prompt: str) -> dict:
-        extract_mod.ensure_grug_server()
+        if server["owned"] is None:
+            server["owned"] = extract_mod.ensure_grug_server()
         return extract_mod.call_grug(
             prompt, system=dcfg.RECONCILE_SYSTEM_PROMPT,
             timeout=dcfg.RECONCILE_JUDGE_TIMEOUT_SECONDS,
             max_tokens=dcfg.RECONCILE_LOCAL_MAX_TOKENS)
+    call.server = server
     return call
 
 
@@ -361,8 +377,14 @@ def run_reconcile(args, budget=None, lock: bool = True) -> reconcile_mod.Plan:
     real run, so this stays the one place that knows the run is over,
     whether or not a pair ever actually needed the model. Stopping an idle
     server is a documented no-op (Prozess-Hygiene: was gestartet wird, wird
-    auch beendet)."""
+    auch beendet) - but ONLY when this run owns it: Auftrag "p0-schutztore"
+    (pipeline-analyse Abschnitt 0 Punkt 6) names this exact spot as an
+    unconditional stop that could cut off a server a human or a concurrent
+    run is using. `call.server["owned"]` (see `reconcile_local_call`) is the
+    answer; still `None` when no group ever diverged (the server was never
+    even asked for) counts as "not ours", same as an explicit `False`."""
     vault = Path(args.vault).expanduser().resolve()
+    call = None
     with held(dcfg.DREAM_LOCK, enabled=lock):
         claim_store = ClaimStore(dcfg.DREAM_EXTRACT_CLAIMS_DB, read_only=True)
         try:
@@ -385,7 +407,8 @@ def run_reconcile(args, budget=None, lock: bool = True) -> reconcile_mod.Plan:
         finally:
             store.close()
             if not args.no_cloud and not args.dry_run:
-                extract_mod.stop_grug_server()
+                owned = bool(getattr(call, "server", {}).get("owned"))
+                extract_mod.stop_grug_server(owned)
         if not args.dry_run:
             path = reconcile_mod.write_plan(plan, vault)
             log.info("dream: plan at %s", path)
@@ -617,7 +640,7 @@ def run_chain(args, call=None) -> dict:
                 paths += review_mod.own_paths(vault, review)
             if applied is not None:
                 paths += apply_mod.own_paths(vault, applied, applied.run_id)
-            git_commit(vault, f"dream: run {run_id}", paths, dry_run=False)
+            commit_by_repo_single(vault, f"dream: run {run_id}", paths, dry_run=False)
     budget.save(run_id=run_id, dry_run=args.dry_run)
     return {"run_id": run_id, "steps": steps, "stopped": stopped,
             "report": report, "budget": budget.account.to_dict()}
@@ -818,13 +841,17 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(levelname)s %(message)s")
+def _dispatch(args) -> int:
     if args.command == "harvest":
-        result = run_harvest(args)
+        # Wie `run`/`reconcile`/`apply` unter der Traum-Sperre: parallel zu
+        # `brain run` griffen beide auf dieselben `pending`-Einheiten zu
+        # (Befund 19, 14.10.2026).
+        try:
+            with held(dcfg.DREAM_LOCK):
+                result = run_harvest(args)
+        except LockHeldError as e:
+            log.error("%s", e)
+            return 5
         print(format_harvest_report(result, args.dry_run))
         return 3 if result.aborted else 0
     if args.command == "status":
@@ -832,17 +859,30 @@ def main(argv=None) -> int:
         return 0
     if args.command == "extract":
         budget = make_budget(args)
-        result = extract_mod.run_extract(args, budget=budget)
+        try:
+            with held(dcfg.DREAM_LOCK):
+                result = extract_mod.run_extract(args, budget=budget)
+        except LockHeldError as e:
+            log.error("%s", e)
+            return 5
         print(extract_mod.format_extract_report(result, args.dry_run))
         code = finish_budget(budget, "extract", args.dry_run)
         return code or (3 if result.aborted else 0)
     if args.command == "reconcile":
         budget = make_budget(args)
-        plan = run_reconcile(args, budget=budget)
+        try:
+            plan = run_reconcile(args, budget=budget)
+        except LockHeldError as e:
+            log.error("%s", e)
+            return 5
         print(reconcile_mod.format_reconcile_report(plan, args.dry_run))
         return finish_budget(budget, plan.run_id, args.dry_run)
     if args.command == "shadow":
-        changeset = run_shadow(args)
+        try:
+            changeset = run_shadow(args)
+        except LockHeldError as e:
+            log.error("%s", e)
+            return 5
         print(shadow_mod.format_shadow_report(changeset))
         return 0
     if args.command == "run":
@@ -879,6 +919,24 @@ def main(argv=None) -> int:
         # the exit status too, not only in the text a caller may not read.
         return 4 if result.conflicts else 0
     return 2
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(levelname)s %(message)s")
+    # SIGTERM soll denselben sauberen Halt ausloesen wie SIGINT (Auftrag
+    # "p0-schutztore") - `extract`/`review`/der Kettenlauf `run` sind die
+    # langen Laeufe, die das trifft. Vorher fehlte hier zusaetzlich ein
+    # KeyboardInterrupt-Fang ueberhaupt: ein echtes Ctrl-C liess `main()`
+    # mit einem unbehandelten Traceback enden statt sauber 130 zu melden -
+    # anders als `gardener/cli.py`s `main()`, die das schon tat.
+    install_termination_handler()
+    try:
+        return _dispatch(args)
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":

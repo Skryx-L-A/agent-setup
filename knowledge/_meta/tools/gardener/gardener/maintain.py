@@ -4,7 +4,9 @@ plus the generated DECISIONS.md / OPEN-QUESTIONS.md indexes."""
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -135,6 +137,188 @@ def update_mocs(notes: list[Note], writer: VaultWriter) -> list[str]:
     return updated
 
 
+# --- read-heat from transcripts ---------------------------------------------
+# A read is a Read tool call on a vault file, or a shell command that prints
+# one (cat/sed/head/tail/less/bat/awk/rg over a named file), in a Claude Code
+# transcript (config.TRANSCRIPT_DIR) or a Codex session (config.CODEX_SESSION_DIR).
+# Same counting rule as _meta/tools/eval/v2-gaertner/nutzung_transkripte.py.
+_READ_CMD_RE = re.compile(r"\b(cat|sed|head|tail|less|bat|awk|nl)\b")
+_REL_IN_CMD_RE = re.compile(
+    r"(?<![\w/.~])((?:00-sources|10-global|20-projects|30-topics|40-people)/[^\s'\"`|;&)]+\.md)")
+
+
+def _vault_path_re(vault: Path) -> re.Pattern:
+    root = vault.expanduser().resolve()
+    forms = {str(root)}
+    try:
+        forms.add("~/" + root.relative_to(Path.home().resolve()).as_posix())
+        forms.add("/home/" + Path.home().name + "/" + root.relative_to(Path.home().resolve()).as_posix())
+    except ValueError:
+        pass
+    alt = "|".join(re.escape(f) for f in sorted(forms, key=len, reverse=True))
+    return re.compile(r"(?:" + alt + r")/([^\s'\"`|;&)]+\.md)")
+
+
+def _reads_in_call(name: str, arg: str, path_re: re.Pattern) -> list[str]:
+    if name == "Read":
+        m = path_re.search(arg)
+        return [m.group(1)] if m else []
+    if not _READ_CMD_RE.search(arg):
+        return []
+    found = path_re.findall(arg)
+    if path_re.pattern and "Knowledge" in arg:
+        found += _REL_IN_CMD_RE.findall(arg)
+    return found
+
+
+def _transcript_reads(path: Path, path_re: re.Pattern) -> list[tuple[str, str]]:
+    """[(iso timestamp, vault-relative path)] of one transcript file."""
+    out: list[tuple[str, str]] = []
+    try:
+        fh = path.open(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    with fh:
+        for line in fh:
+            if '"tool_use"' not in line and '"CommandExecution"' not in line:
+                continue
+            if ".md" not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = str(obj.get("timestamp") or "")
+            calls: list[tuple[str, str]] = []
+            content = (obj.get("message") or {}).get("content")
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "tool_use":
+                        inp = c.get("input") or {}
+                        calls.append((str(c.get("name")),
+                                      str(inp.get("file_path") or inp.get("command") or "")))
+            item = (obj.get("payload") or {}).get("item") if isinstance(obj.get("payload"), dict) else None
+            if isinstance(item, dict) and item.get("type") == "CommandExecution":
+                cmd = item.get("command")
+                calls.append(("Bash", " ".join(cmd) if isinstance(cmd, list) else str(cmd or "")))
+            for name, arg in calls:
+                for rel in dict.fromkeys(_reads_in_call(name, arg, path_re)):
+                    if not rel.startswith("secrets/"):
+                        out.append((ts, rel))
+    return out
+
+
+def transcript_heat(vault: Path, roots: list[Path] | None = None,
+                    days: int | None = None, cache_path: Path | None = None,
+                    now: dt.datetime | None = None) -> dict[str, list[dt.datetime]]:
+    """{rel: [read timestamps]} from transcripts changed within `days`
+    (default: the cold-note horizon). Parsed files are cached by mtime/size,
+    so a run only reads transcripts that changed since the last one."""
+    roots = roots if roots is not None else [config.TRANSCRIPT_DIR, config.CODEX_SESSION_DIR]
+    days = days if days is not None else max(config.HOT_HEAT_DAYS, config.COLD_MONTHS * 31)
+    now = now or dt.datetime.now()
+    cutoff = (now - dt.timedelta(days=days)).timestamp()
+    cache_path = cache_path or (config.STATE_DIR / config.HEAT_TRANSCRIPT_CACHE)
+    try:
+        cache = json.loads(cache_path.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    path_re = _vault_path_re(vault)
+    fresh: dict = {}
+    heat: dict[str, list[dt.datetime]] = {}
+    for root in roots:
+        if not root or not Path(root).is_dir():
+            continue
+        for dirpath, _dirs, files in os.walk(root, followlinks=False):
+            for name in files:
+                if not name.endswith(".jsonl"):
+                    continue
+                f = Path(dirpath) / name
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                if st.st_mtime < cutoff:
+                    continue
+                key = str(f)
+                hit = cache.get(key)
+                if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+                    reads = hit[2]
+                else:
+                    reads = _transcript_reads(f, path_re)
+                fresh[key] = [st.st_mtime, st.st_size, reads]
+                for ts, rel in reads:
+                    stamp = heat_mod._parse_ts(ts.replace("Z", "+00:00")) if ts else None
+                    if stamp is not None:
+                        heat.setdefault(rel, []).append(stamp)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(fresh))
+    except OSError as e:
+        log.warning("transcript heat cache not written: %s", e)
+    return heat
+
+
+def load_read_heat(vault: Path) -> dict[str, list[dt.datetime]]:
+    """Hook log plus transcripts (config.HEAT_FROM_TRANSCRIPTS). Both see the
+    same reads when the hook fires, so per note and minute the larger of the
+    two counts wins instead of their sum."""
+    heat = heat_mod.load_heat(vault)
+    if not config.HEAT_FROM_TRANSCRIPTS:
+        return heat
+    try:
+        extra = transcript_heat(vault)
+    except Exception as e:  # heat is a ranking hint, never worth a failed run
+        log.warning("transcript heat unavailable: %s", e)
+        return heat
+    for rel, stamps in extra.items():
+        logged: dict[dt.datetime, int] = {}
+        for ts in heat.get(rel, []):
+            m = ts.replace(second=0, microsecond=0)
+            logged[m] = logged.get(m, 0) + 1
+        for ts in stamps:
+            m = ts.replace(second=0, microsecond=0)
+            if logged.get(m, 0) > 0:
+                logged[m] -= 1      # this read is already in the hook log
+            else:
+                heat.setdefault(rel, []).append(ts)
+    return heat
+
+
+# HOT input by origin (2026-10-10, agenten-kanaele measure 1): notes of world agents
+# (`*/agenten/*`, written through a world's carrier that has mail, web and ssh access) and
+# external sources (`00-sources/`) never reach HOT - neither the model input nor the lists.
+# Origin beats wording: a text filter cannot reliably spot injected instructions, the path
+# says who could write. `brain search` still finds these notes.
+def hot_input_ok(rel: str) -> bool:
+    parts = rel.split("/")
+    return parts[0] != "00-sources" and "agenten" not in parts[:-1]
+
+
+# Superseded notes never reach HOT either (13.10.2026, der Nutzer via the WorkbenchOrchestrator, when
+# the chat style was replaced): HOT is loaded at every session start, and a replaced decision there
+# only makes agents think about the change. `brain search` still finds them.
+def hot_note_ok(n: Note) -> bool:
+    return hot_input_ok(n.rel) and str((n.fm or {}).get("status", "")).strip().lower() != "superseded"
+
+
+def origin(vault: Path, rel: str) -> str:
+    """Origin label of a note from its commits, same rule as the recall hook
+    (`hooks/auto-recall-format.py`): Weltagent (an `agents:` commit), Mensch (only authors
+    other than `<your-github-user>`), else Agent (house agents commit as `<your-github-user>`)."""
+    if not hot_input_ok(rel):
+        return "Quelle" if rel.startswith("00-sources/") else "Weltagent"
+    f = vault / rel
+    lines = [z.partition("\t") for z in
+             _git(f.parent, "log", "--format=%an%x09%s", "--", f.name).splitlines() if z.strip()]
+    if any(subject.startswith("agents:") for _, _, subject in lines):
+        return "Weltagent"
+    authors = {a for a, _, _ in lines}
+    if authors and "<your-github-user>" not in authors:
+        return "Mensch (" + ", ".join(sorted(authors)) + ")"
+    return "Agent"
+
+
 def regenerate_hot(notes: list[Note], writer: VaultWriter, client,
                    heat: dict | None = None) -> tuple[bool, list[str], bool]:
     """HOT.md = LLM recent-context summary + read-heat top list + resurfacing.
@@ -152,7 +336,11 @@ def regenerate_hot(notes: list[Note], writer: VaultWriter, client,
     fallback for "client given but not answering"."""
     vault = writer.vault
     heat = heat if heat is not None else heat_mod.load_heat(vault)
-    git_log = _git(vault, "log", "--since=14.days", "--oneline", "--no-merges")[:4000]
+    notes = [n for n in notes if hot_note_ok(n)]
+    git_log = "\n".join(
+        z for z in _git(vault, "log", "--since=14.days", "--oneline", "--no-merges", "--", ".",
+                        ":(exclude)00-sources", ":(glob,exclude)**/agenten/**").splitlines()
+        if not z.partition(" ")[2].startswith("agents:"))[:4000]
     recent = sorted(notes, key=heat_mod.mtime_of, reverse=True)[:10]
     hot_read = heat_mod.hottest(notes, heat, k=5)
     recent_txt = "\n\n".join(f"## {n.title} ({n.rel})\n{n.text[:800]}" for n in recent)
@@ -183,28 +371,129 @@ def regenerate_hot(notes: list[Note], writer: VaultWriter, client,
              summary]
     if hot_read:
         parts.append(f"\n## Meistgelesen ({config.HOT_HEAT_DAYS} Tage)\n" +
-                     "\n".join(f"- [[{n.title}]] ({c}x)" for n, c in hot_read))
+                     "\n".join(f"- [[{n.title}]] ({c}x) [Herkunft: {origin(vault, n.rel)}]"
+                               for n, c in hot_read))
     resurfaced = heat_mod.resurface(notes, heat)
     if resurfaced:
         parts.append("\n## Vergessene Schaetze\n" +
                      "Lange nicht gelesen, aber substanziell - lohnt einen Blick:\n" +
-                     "\n".join(f"- [[{n.title}]] - {first_hook_line(n)}"
+                     "\n".join(f"- [[{n.title}]] [Herkunft: {origin(vault, n.rel)}] - {first_hook_line(n)}"
                                for n in resurfaced))
     writer.write(vault / "HOT.md", "\n".join(parts) + "\n")
     return True, [n.rel for n in resurfaced], degraded
 
 
+# Recency marker rule (Auftrag g4, 24.09.2026): `Stand: JJJJ-MM` is the month of
+# the last CONTENT change - the newest commit whose diff touches more than
+# markers, the gardener's `## Relations` lines and machine-stamped frontmatter.
+# `10-global/shared-brain.md` was rewritten on 23./24.09. and still said
+# `Stand: 2026-07`, because the marker was only ever ADDED, never moved.
+MARKER_LINE_RE = re.compile(r"^Stand:\s*(\d{4}-\d{2})\s*$", re.MULTILINE)
+FM_STAND_RE = re.compile(r"^stand:\s*[\"']?(\d{4}-\d{2})[\"']?\s*$", re.MULTILINE)
+_TRIVIAL_LINE_RE = re.compile(
+    r"^\s*$"                                   # blank
+    r"|^---\s*$"                               # frontmatter fence
+    r"|^Stand:\s*\d{4}-\d{2}\s*$"              # the marker itself
+    r"|^## Relations\s*$"
+    r"|^\s*(?:- )?(?:relates-to|depends-on|supersedes|part-of|contradicts) \[\["
+    r"|^(?:id|schema|permalink|stand|owner):")  # stamped by gate/sync/owner
+
+
+def content_month(repo_file: Path) -> str | None:
+    """`JJJJ-MM` of the newest commit that changed `repo_file` substantively
+    (see _TRIVIAL_LINE_RE), asked in the repo that holds the file - vault
+    root or a mounted space. None when git knows no such commit."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_file.parent), "log", "--format=%x01%as",
+             "-p", "--no-color", "--unified=0", "--no-ext-diff", "--",
+             repo_file.name],
+            capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("git log for %s failed: %s", repo_file, e)
+        return None
+    for chunk in out.split("\x01")[1:]:
+        date, _, diff = chunk.partition("\n")
+        for line in diff.splitlines():
+            if not line or line[0] not in "+-":
+                continue
+            if line.startswith(("+++ ", "--- ")):
+                continue                        # file header, not content
+            if not _TRIVIAL_LINE_RE.match(line[1:]):
+                return date.strip()[:7] or None
+    return None
+
+
+def _last_commit_month(repo_file: Path) -> str | None:
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_file.parent), "log", "-1", "--format=%as",
+             "--", repo_file.name],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out[:7] or None
+
+
+def refresh_marker_text(text: str, month: str) -> str:
+    """Move every OWN marker that is older than `month` forward: the
+    frontmatter field `stand:` and standalone `Stand: JJJJ-MM` lines. Never
+    backwards, never a second marker, prose like "(Stand: 2026-07)" untouched."""
+    fm_end = -1
+    if text.startswith("---\n"):
+        fm_end = text.find("\n---", 4)
+
+    def bump(m: re.Match) -> str:
+        return m.group(0).replace(m.group(1), month) if m.group(1) < month else m.group(0)
+
+    if fm_end > 0:
+        head, tail = text[:fm_end], text[fm_end:]
+        head = FM_STAND_RE.sub(bump, head)
+        tail = MARKER_LINE_RE.sub(bump, tail)
+        return head + tail
+    return MARKER_LINE_RE.sub(bump, text)
+
+
+def _own_markers(text: str) -> list[str]:
+    fm_end = text.find("\n---", 4) if text.startswith("---\n") else -1
+    found = MARKER_LINE_RE.findall(text[max(fm_end, 0):])
+    if fm_end > 0:
+        found += FM_STAND_RE.findall(text[:fm_end])
+    return found
+
+
 def add_recency_markers(notes: list[Note], writer: VaultWriter) -> list[str]:
+    """Adds a missing marker and moves an outdated one (see MARKER_LINE_RE).
+    Returns the rels that changed."""
     added = []
     for n in notes:
         # session notes are an immutable archive (INDEX.md); reports are transient
         if n.ntype in ("session", "report"):
             continue
-        if STAND_RE.search(n.text):
+        # KERN.md is injected into every session start and kept under ~3 000
+        # characters; its dated `## Stand` section already says how current it is
+        if n.path.name == "KERN.md":
             continue
-        date = _git(writer.vault, "log", "-1", "--format=%as", "--", n.rel).strip()
-        month = date[:7] if date else dt.date.today().strftime("%Y-%m")
-        new_text = n.text.rstrip("\n") + f"\n\nStand: {month}\n"
+        own = _own_markers(n.text)
+        if own:
+            oldest_ok = min(own)
+            last = _last_commit_month(n.path)
+            # cheap filter first: without any commit newer than the marker
+            # there is nothing to move
+            if last is None or last <= oldest_ok:
+                continue
+            month = content_month(n.path)
+            if month is None or month <= oldest_ok:
+                continue
+            new_text = refresh_marker_text(n.text, month)
+            if new_text == n.text:
+                continue
+        elif STAND_RE.search(n.text):
+            continue                # a marker in prose only: a human's, leave it
+        else:
+            month = (content_month(n.path) or _last_commit_month(n.path)
+                     or dt.date.today().strftime("%Y-%m"))
+            new_text = n.text.rstrip("\n") + f"\n\nStand: {month}\n"
         if not writer.write(n.path, new_text, expect=n.text):
             continue
         n.text = new_text

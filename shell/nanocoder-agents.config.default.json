@@ -15,7 +15,7 @@
     "Werkzeug-Anleitung der CLI wegwerfen.",
     "",
     "Die Datei ist fuer jedes Modell dieselbe und muss nie erzeugt werden -- gleiche",
-    "Bauart wie shell/crushrc.default und shell/kimi-config.default.toml.",
+    "Bauart wie shell/crushrc.default.",
     "",
     "NICHT INSTALLIERT: gehoert nicht nach ~/.local/bin -- diese Vorlage wird per Definition",
     "nach ~/.config/nanocoder/agents.config.json kopiert (siehe oben)."

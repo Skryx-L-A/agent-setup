@@ -70,8 +70,8 @@ export interface Stand {
 export interface AnsichtHaken {
   /** Der Mensch schickt einen Text ab. */
   aufSenden(text: string): void;
-  /** Der Mensch hat ueber eine Freigabe entschieden. */
-  aufFreigabe(anfrageId: string, erlauben: boolean): void;
+  /** Der Mensch hat ueber eine Freigabe entschieden; `echt` ist `isTrusted` des Klicks. */
+  aufFreigabe(anfrageId: string, erlauben: boolean, echt: boolean): void;
   /** Der Mensch will die Sitzung frisch starten (Befund B3). */
   aufNeustart(): void;
   /** Der Mensch stellt den Freigabemodus um (Luecke 5c). */
@@ -779,10 +779,10 @@ export class Chatansicht {
       const knoepfe = el('div', 'csdk-freigabe-knoepfe');
       const ja = el('button', 'csdk-ja', t('freigabe.erlauben'));
       ja.type = 'button';
-      ja.addEventListener('click', () => this.haken.aufFreigabe(b.anfrageId, true));
+      ja.addEventListener('click', (e) => this.haken.aufFreigabe(b.anfrageId, true, e.isTrusted));
       const nein = el('button', 'csdk-nein', t('freigabe.ablehnen'));
       nein.type = 'button';
-      nein.addEventListener('click', () => this.haken.aufFreigabe(b.anfrageId, false));
+      nein.addEventListener('click', (e) => this.haken.aufFreigabe(b.anfrageId, false, e.isTrusted));
       knoepfe.append(ja, nein);
       kasten.appendChild(knoepfe);
       return kasten;

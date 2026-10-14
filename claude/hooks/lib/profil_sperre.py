@@ -3,9 +3,10 @@
 (docs/AGENTS-PLAN.md, Abschnitt 3 "Die Sperre" und Abschnitt 8 Regel 5 "Kein
 Eingriff ausserhalb der Welt"; docs/AGENTS-SPERREN.md).
 
-Der Hook greift NUR in einem Agentenzug: WB_AGENT_ID und WB_WELT sind gesetzt
-(der Traeger setzt sie, siehe agents_skills.profil_umgebung). Ohne beide keine
-Ausgabe; halbe oder ungueltige Umgebung wird verweigert.
+Der Hook greift NUR in einem Agentenzug: WB_AGENT_ZUG markiert den Kontext,
+WB_AGENT_ID und WB_WELT binden ihn (der Traeger setzt alle drei in
+agents_traeger._zugumgebung). Ohne alle drei keine Ausgabe; ein markierter Zug
+ohne vollstaendige Bindung sowie halbe oder ungueltige Umgebung werden verweigert.
 
 Massgeblich ist <WB_WELT>/agents/<id>/agent.json: Werkzeugliste `tools`,
 Bash-Muster `bash`, Kontextgrenze `context_limit`, Stufe `stage`. Laesst sich
@@ -29,7 +30,7 @@ Vier Pruefungen:
        lesen:     Projektordner, Worktree, Weltablage, Agentenverzeichnis,
                   Skill- und Skriptpfade und beide Bibliotheken aus der
                   Umgebung, das Brain (WB_BRAIN_VAULT, sonst ~/Knowledge;
-                  ohne 90-secrets/ und .secrets-sync/), ~/.local/bin; Programme zusaetzlich
+                  ohne secrets/ und .secrets-sync/), ~/.local/bin; Programme zusaetzlich
                   aus den Systemordnern und den PATH-Ordnern ausserhalb von
                   $HOME;
        schreiben: im Projektordner nur der gemeinsame Ordner work/, dazu
@@ -123,7 +124,7 @@ GESCHUETZT_EIGEN = {'agent.json', 'skills.json', 'history.json', 'runtime.json'}
 GESCHUETZT_UEBERALL = {'freigaben.json', 'traeger.json', 'zugaenge.json', 'mail-versand.jsonl'}
 ZUGANG_PROGRAMME = {'ssh', 'scp', 'rsync'}
 # Brain (16.09.2026): Geheimordner im Vault, fuer jeden Zugriff gesperrt; lesen nur ueber `brain search`.
-BRAIN_GEHEIM = ('90-secrets', '.secrets-sync')
+BRAIN_GEHEIM = ('secrets', '.secrets-sync')
 BRAIN_PROGRAMM = 'brain'
 # Gemeinsamer Ordner des Projekts (agents_traeger.PROJEKT_ARBEITSORDNER); sonst ist das Projekt nur lesbar.
 PROJEKT_ARBEIT = 'work'
@@ -379,7 +380,7 @@ class Profil:
         ausserhalb der Weltgrenze liegt oder geschuetzt ist."""
         if real in HARMLOSE_ZIELE:
             return
-        # casefold: auf einem Dateisystem ohne Gross-/Kleinschreibung ist 90-SECRETS derselbe Ordner.
+        # casefold: auf einem Dateisystem ohne Gross-/Kleinschreibung ist SECRETS derselbe Ordner.
         kandidaten = {real.casefold(), (os.path.normpath(roh) if os.path.isabs(roh) else real).casefold()}
         if any(_unter(k, geheim.casefold()) for k in kandidaten for geheim in self.brain_geheim):
             raise Verweigert("'%s' liegt in einem Geheimordner des Brains; Agenten lesen ihn nie" % roh)
@@ -551,7 +552,10 @@ def profil_laden():
     """None ohne Agentenzug, sonst Profil oder Verweigert."""
     agent = (os.environ.get('WB_AGENT_ID') or '').strip()
     welt = (os.environ.get('WB_WELT') or '').strip()
+    agentenkontext = bool((os.environ.get('WB_AGENT_ZUG') or '').strip())
     if not agent and not welt:
+        if agentenkontext:
+            raise Verweigert('Agentenzug ohne Bindung: WB_AGENT_ID und WB_WELT muessen beide gesetzt sein')
         return None
     if not agent or not welt:
         raise Verweigert('WB_AGENT_ID und WB_WELT muessen beide gesetzt sein')

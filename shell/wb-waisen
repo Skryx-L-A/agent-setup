@@ -409,20 +409,34 @@ lebende_pane_pids() {
   done
 }
 
+# EIN lsof-AUFRUF FUER ALLE KANDIDATEN (13.10.2026, GL#35: test-waisen.sh lief
+# in TIMEOUT nach 300s). Die drei lsof-Helfer unten nehmen eine
+# Komma-Liste von PIDs (`lsof -p 1,2,3`) und geben je PID eine Zeile aus,
+# beginnend mit der PID (Spalte 2 der lsof-Ausgabe). Frueher lief jeder
+# Helfer einmal PRO Kandidat; gemessen ~40ms je lsof-Aufruf, drei Aufrufe
+# plus vier `ps` je Kandidat. Bei 48 fremden verwaisten '-zsh' auf der
+# Maschine (jede ist ein Kandidat der vierten Klasse) kostete ein einziger
+# Lauf so 10,7s statt der 3s Messfenster -- und die Suite ruft wb-waisen
+# 28-mal auf. Ein gebuendelter Aufruf kostet dieselben ~40ms wie einer fuer
+# eine einzelne PID.
+
 # Nur TCP-LISTEN-Ports (fuer die Anzeige) — kein Ausschlussgrund, wenn leer.
+# <pid-liste> -> "pid port1,port2,..." je PID mit mindestens einem Port.
 ports_von() {
   lsof -nP -iTCP -sTCP:LISTEN -a -p "$1" 2>/dev/null \
-    | awk 'NR>1{print $9}' | sed 's/.*://' | sort -un | paste -sd, -
+    | awk 'NR>1{p=$9; sub(/.*:/, "", p); print $2, p}' | sort -k1,1n -k2,2n -u \
+    | awk '$1!=alt{if (alt!="") print alt, l; alt=$1; l=$2; next} {l=l "," $2}
+           END{if (alt!="") print alt, l}'
 }
 
-# ESTABLISHED-Verbindungen -> "N|gegenstelle1,gegenstelle2,...". Das direkte
-# Gegenstueck zu Fund 2: eine offene ESTABLISHED-Verbindung heisst benutzt.
+# ESTABLISHED-Verbindungen -> "pid N gegenstelle1,gegenstelle2,..." je PID
+# mit mindestens einer Verbindung. Das direkte Gegenstueck zu Fund 2: eine
+# offene ESTABLISHED-Verbindung heisst benutzt.
 etablierte_verbindungen_von() {
-  local pid="$1" out n remotes
-  out="$(lsof -nP -iTCP -a -p "$pid" -sTCP:ESTABLISHED 2>/dev/null | awk 'NR>1{print $9}' | sed 's/.*->//')"
-  n="$(printf '%s\n' "$out" | grep -c . || true)"
-  remotes="$(printf '%s\n' "$out" | sort -u | paste -sd, -)"
-  printf '%s|%s' "${n:-0}" "$remotes"
+  lsof -nP -iTCP -a -p "$1" -sTCP:ESTABLISHED 2>/dev/null \
+    | awk 'NR>1{r=$9; sub(/.*->/, "", r); print $2, r}' | sort -k1,1n -k2,2 \
+    | awk '{n[$1]++; if (!(($1, $2) in gesehen)) {gesehen[$1, $2]=1; r[$1]=(r[$1]=="" ? $2 : r[$1] "," $2)}}
+           END{for (p in n) print p, n[p], r[p]}'
 }
 
 # VIERTES BENUTZUNGSSIGNAL (08.09.2026, Gegenlesen-Pflichtpunkt): Kern und
@@ -445,16 +459,19 @@ etablierte_verbindungen_von() {
 # urspruenglichen Listen-Deskriptor). "Gegenstelle vorhanden" heisst hier
 # deshalb: mindestens ein NAME beginnt mit "->", ODER derselbe Pfad taucht
 # mehr als einmal auf.
+#
+# <pid> -> Anzahl der Gegenstellen. <pid-liste> je_pid -> "pid anzahl" je PID
+# mit mindestens einer Gegenstelle (gebuendelter Aufruf, siehe oben).
 unix_verbindungen_von() {
-  local pid="$1"
-  lsof -U -a -p "$pid" 2>/dev/null | awk 'NR>1 {
-    name=$NF
-    if (name ~ /^->/) { peers++; next }
-    zaehler[name]++
+  lsof -U -a -p "$1" 2>/dev/null | awk -v je_pid="${2:-}" 'NR>1 {
+    pid=$2; name=$NF
+    if (name ~ /^->/) { peers[pid]++; next }
+    zaehler[pid, name]++
   }
   END {
-    for (n in zaehler) if (zaehler[n] > 1) peers += zaehler[n]-1
-    print peers+0
+    for (k in zaehler) if (zaehler[k] > 1) { split(k, t, SUBSEP); peers[t[1]] += zaehler[k]-1 }
+    if (je_pid != "") { for (p in peers) print p, peers[p] }
+    else { s=0; for (p in peers) s += peers[p]; print s }
   }'
 }
 
@@ -465,16 +482,6 @@ rss_lesbar() {
   else
     awk -v k="$kb" 'BEGIN{printf "%.0f MB", k/1024}'
   fi
-}
-
-# ps -o time= liefert MM:SS.hh oder H:MM:SS.hh -> Sekunden mit Nachkommastellen.
-zeit_zu_sekunden() {
-  awk -v t="$1" 'BEGIN{
-    n=split(t, a, ":")
-    if (n==2) printf "%.2f", a[1]*60+a[2]
-    else if (n==3) printf "%.2f", a[1]*3600+a[2]*60+a[3]
-    else print "0.00"
-  }'
 }
 
 # Lebt der Pane des Eigentuemers noch? Wichtig: `tmux … display -p -t
@@ -774,40 +781,72 @@ fi
 WAISEN_LINES=""
 UNREG_LINES=""
 if [ -n "$WAISE_TOT_META" ] || [ -n "$UNREG_META" ]; then
-  VORHER=""
-  while IFS='|' read -r pid rest; do
-    [ -n "$pid" ] || continue
-    zt="$(ps -o time= -p "$pid" 2>/dev/null | tr -d ' ')"
-    rs="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
-    VORHER="${VORHER}${pid}|${zt}|${rs}"$'\n'
-  done <<EOF
-$(printf '%s%s' "$WAISE_TOT_META" "$UNREG_META")
-EOF
+  PID_LISTE="$(printf '%s%s' "$WAISE_TOT_META" "$UNREG_META" | awk -F'|' '$1!=""{print $1}' | paste -sd, -)"
+  # Ein ps-Aufruf vor und einer nach dem Schlaf fuer ALLE Kandidaten (siehe
+  # "EIN lsof-AUFRUF FUER ALLE KANDIDATEN" oben); -p mit Komma-Liste waehlt
+  # genau diese PIDs, eine inzwischen beendete fehlt einfach.
+  VORHER="$(ps -o pid=,time=,rss= -p "$PID_LISTE" 2>/dev/null)"
 
   sleep "$SLEEP_SEK"
 
+  NACHHER="$(ps -o pid=,time=,rss= -p "$PID_LISTE" 2>/dev/null)"
+  # MESSUNG: je Kandidat eine Zeile "pid|delta_zeit|cpu_bewegt|delta_rss|
+  # rss_neu|verb_n|verb_remote|verb_u|ports|", in DERSELBEN Reihenfolge wie
+  # PID_LISTE (erst Weg A, dann Weg B) -- alles aus den gebuendelten
+  # Aufrufen. miss_grund unten nimmt je Kandidat die jeweils erste Zeile ab,
+  # ohne Subprozess. Ein Nachschlagen per `${MESSUNG#*"|$pid|"}` waere
+  # quadratisch in Bash (gemessen 19s fuer 500 Kandidaten).
+  MESSUNG="$(
+    {
+      printf '%s\n' "$VORHER" | awk 'NF{print "V", $1, $2, $3}'
+      printf '%s\n' "$NACHHER" | awk 'NF{print "N", $1, $2, $3}'
+      etablierte_verbindungen_von "$PID_LISTE" | awk '{print "E", $1, $2, $3}'
+      unix_verbindungen_von "$PID_LISTE" je_pid | awk '{print "U", $1, $2}'
+      ports_von "$PID_LISTE" | awk '{print "P", $1, $2}'
+      printf '%s\n' "$PID_LISTE" | tr ',' '\n' | awk 'NF{print "K", $1}'
+    } | awk '
+      # ps -o time= liefert MM:SS.hh oder H:MM:SS.hh -> Sekunden.
+      function sek(t,   a, n) {
+        n=split(t, a, ":")
+        if (n==2) return a[1]*60+a[2]
+        if (n==3) return a[1]*3600+a[2]*60+a[3]
+        return 0
+      }
+      $1=="V"{zv[$2]=$3; rv[$2]=$4}
+      $1=="N"{zn[$2]=$3; rn[$2]=$4}
+      $1=="E"{en[$2]=$3; er[$2]=$4}
+      $1=="U"{u[$2]=$3}
+      $1=="P"{po[$2]=$3}
+      $1=="K"{k[++anz]=$2}
+      END{
+        for (i=1; i<=anz; i++) {
+          p=k[i]
+          dz=sprintf("%.2f", sek(zn[p]=="" ? "0:00.00" : zn[p]) - sek(zv[p]=="" ? "0:00.00" : zv[p]))
+          printf "%s|%s|%d|%d|%d|%d|%s|%d|%s|\n", p, dz, (dz+0>0.05), (rn[p]+0)-(rv[p]+0), rn[p]+0, en[p]+0, er[p], u[p]+0, po[p]
+        }
+      }')"$'\n'
+
   # miss_grund <pid> -> setzt GRUND ("benutzt — ..." oder "keine
-  # Anhaltspunkte...") und RSS_NEU. Dieselbe Messung fuer Weg A und Weg B --
-  # sonst kehrt Fund 2 auf dem jeweils ungeprueften Weg zurueck.
+  # Anhaltspunkte..."), RSS_NEU und PORTS. Dieselbe Messung fuer Weg A und
+  # Weg B -- sonst kehrt Fund 2 auf dem jeweils ungeprueften Weg zurueck.
   miss_grund() {
-    local pid="$1" zt_v_zeile zeit_v rss_v zeit_n rss_n verb verb_n verb_remote verb_u delta_zeit delta_rss
-    zt_v_zeile="$(printf '%s\n' "$VORHER" | awk -F'|' -v p="$pid" '$1==p{print;exit}')"
-    IFS='|' read -r _ zeit_v rss_v <<< "$zt_v_zeile"
-    zeit_n="$(ps -o time= -p "$pid" 2>/dev/null | tr -d ' ')"
-    rss_n="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
-    verb="$(etablierte_verbindungen_von "$pid")"
-    IFS='|' read -r verb_n verb_remote <<< "$verb"
-    verb_u="$(unix_verbindungen_von "$pid")"
-    delta_zeit="$(awk -v a="$(zeit_zu_sekunden "${zeit_v:-0:00.00}")" -v b="$(zeit_zu_sekunden "${zeit_n:-0:00.00}")" 'BEGIN{printf "%.2f", b-a}')"
-    delta_rss=$(( ${rss_n:-0} - ${rss_v:-0} ))
-    RSS_NEU="${rss_n:-0}"
+    local pid="$1" zeile mess_pid delta_zeit cpu_bewegt delta_rss verb_n verb_remote verb_u
+    zeile="${MESSUNG%%$'\n'*}"
+    IFS='|' read -r mess_pid delta_zeit cpu_bewegt delta_rss RSS_NEU verb_n verb_remote verb_u PORTS _ <<< "$zeile"
+    if [ "$mess_pid" = "$pid" ]; then
+      MESSUNG="${MESSUNG#*$'\n'}"
+    else
+      # Darf nicht vorkommen (Reihenfolge wie PID_LISTE); dann lieber
+      # "keine Anhaltspunkte" als die Messung eines anderen Prozesses.
+      delta_zeit=0.00 cpu_bewegt=0 delta_rss=0 RSS_NEU=0 verb_n=0 verb_remote="" verb_u=0 PORTS=""
+    fi
     if [ "${verb_n:-0}" -gt 0 ] 2>/dev/null; then
       GRUND="benutzt — $verb_n offene ESTABLISHED-Verbindung(en) von ${verb_remote:-unbekannt}"
     elif [ "${verb_u:-0}" -gt 0 ] 2>/dev/null; then
       GRUND="benutzt — $verb_u offene UNIX-Socket-Verbindung(en) mit Gegenstelle (Kern/App reden nur darueber, siehe unix_verbindungen_von)"
-    elif awk -v d="$delta_zeit" 'BEGIN{exit !(d>0.05)}'; then
+    elif [ "${cpu_bewegt:-0}" = 1 ]; then
       GRUND="benutzt — CPU-Zeit bewegt sich (+${delta_zeit}s in ${SLEEP_SEK}s)"
-    elif [ "$delta_rss" -gt 1024 ] 2>/dev/null; then
+    elif [ "${delta_rss:-0}" -gt 1024 ] 2>/dev/null; then
       GRUND="benutzt — Speicher waechst (+$(rss_lesbar "$delta_rss") in ${SLEEP_SEK}s, vermutlich laedt der Prozess noch)"
     else
       GRUND="keine Anhaltspunkte fuer Benutzung im Messfenster (${SLEEP_SEK}s) — kein automatischer kill-Vorschlag, von Hand pruefen"
@@ -818,12 +857,11 @@ EOF
     while IFS='|' read -r pid rss etime kategorie cmd detail; do
       [ -n "$pid" ] || continue
       miss_grund "$pid"
-      ports="$(ports_von "$pid")"
       case "$GRUND" in
         benutzt*) detail="${detail} — ${GRUND}; kein automatischer kill-Vorschlag" ;;
         *) : ;;   # keine Anhaltspunkte -- Eigentuemer-Beleg bleibt unveraendert, kill bleibt angemessen
       esac
-      WAISEN_LINES="${WAISEN_LINES}${pid}|${RSS_NEU:-$rss}|${etime}|${ports}|${kategorie}|waise|${detail}|${cmd}"$'\n'
+      WAISEN_LINES="${WAISEN_LINES}${pid}|${RSS_NEU:-$rss}|${etime}|${PORTS}|${kategorie}|waise|${detail}|${cmd}"$'\n'
     done <<EOF
 $WAISE_TOT_META
 EOF
@@ -833,8 +871,7 @@ EOF
     while IFS='|' read -r pid rss etime kategorie cmd; do
       [ -n "$pid" ] || continue
       miss_grund "$pid"
-      ports="$(ports_von "$pid")"
-      UNREG_LINES="${UNREG_LINES}${pid}|${RSS_NEU:-$rss}|${etime}|${ports}|${kategorie}|unregistriert|${GRUND}|${cmd}"$'\n'
+      UNREG_LINES="${UNREG_LINES}${pid}|${RSS_NEU:-$rss}|${etime}|${PORTS}|${kategorie}|unregistriert|${GRUND}|${cmd}"$'\n'
     done <<EOF
 $UNREG_META
 EOF

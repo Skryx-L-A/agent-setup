@@ -80,6 +80,12 @@ auszugeben, und genau davor schuetzt wb-mensch.
 ist_worktree() unterscheidet NICHT zwischen einem Worker-Worktree und einem, den
 der Nutzer sich selbst anlegt -- das muss sie auch nicht, solange der Menschenweg
 (Warnung, kein Abbruch) fuer beide offen bleibt.
+
+HUB-DIENST (Spur H2, 2026-10-13): wb-hub laeuft per Socket-Aktivierung (launchd/systemd). Der Hub-Teil
+(_hub_teil) liefert die Einheiten aus -- Mac: die plist rollt der allgemeine Vergleich wie die des
+modell-proxy, dazu der Zustandsordner ~/.local/state/wb-hub (0700); Linux: shell/systemd/wb-hub.* nach
+~/.config/systemd/user -- und LAEDT sie nur mit dem ausdruecklichen Schalter --hub-laden (launchctl
+bootstrap bzw. systemctl --user enable --now wb-hub.socket). Mit --dry-run nennt er die Befehle nur.
 """
 import argparse
 import atomar_schreiben
@@ -89,6 +95,7 @@ import importlib.machinery
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -115,9 +122,52 @@ def _wb_mensch_pfad():
     pi-worker/wb-code auch $HOME um -- os.path.expanduser("~") liest dasselbe
     $HOME wie eine Bash-Zeile "$HOME/..."."""
     p = os.path.join(os.path.expanduser("~"), ".local", "bin", "wb-mensch")
-    if os.access(p, os.X_OK):
-        return p
-    return shutil.which("wb-mensch") or None
+    return p if os.access(p, os.X_OK) else None
+
+
+def _wb_mensch_env():
+    return {"HOME": os.environ.get("HOME", ""),
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "TMPDIR": "/tmp"}
+
+
+def _test_aufrufer_rolle():
+    """Return a runner-declared role only with the private setup proof.
+
+    This is deliberately not a product switch: an environment value by itself
+    is ignored, and without a valid proof the live wb-mensch measurement below
+    remains authoritative.
+    """
+    role = os.environ.get("WB_TEST_AUFRUFER_ROLLE")
+    raw_path = os.environ.get("WB_TEST_AUFBAU_BELEG")
+    raw_home = os.environ.get("HOME")
+    if role not in ("agent", "mensch") or not raw_path or not raw_home:
+        return None
+    if not os.path.isabs(raw_path) or not os.path.isabs(raw_home):
+        return None
+    try:
+        home_real = os.path.realpath(raw_home)
+        path_real = os.path.realpath(raw_path)
+        if os.path.islink(raw_path) or path_real == home_real \
+                or os.path.commonpath((home_real, path_real)) != home_real:
+            return None
+        home_info = os.stat(home_real)
+        if not stat.S_ISDIR(home_info.st_mode) or home_info.st_uid != os.getuid() \
+                or stat.S_IMODE(home_info.st_mode) != 0o700:
+            return None
+        descriptor = os.open(raw_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() \
+                    or stat.S_IMODE(info.st_mode) != 0o600 \
+                    or info.st_size < 32 or info.st_size > 4096:
+                return None
+            content = os.read(descriptor, 4097)
+        finally:
+            os.close(descriptor)
+    except (OSError, ValueError):
+        return None
+    return role if len(content) == info.st_size else None
 
 
 def _ist_mensch():
@@ -125,22 +175,28 @@ def _ist_mensch():
     eigener Kopfkommentar). Faellt wb-mensch aus -- Werkzeug fehlt, Absturz,
     Zeitueberschreitung --, ist die Antwort False: die sichere Seite fuer einen
     Riegel ist "kein Mensch bewiesen", nie "im Zweifel durchlassen"."""
+    test_role = _test_aufrufer_rolle()
+    if test_role is not None:
+        return test_role == "mensch"
     pfad = _wb_mensch_pfad()
     if not pfad:
         return False
     try:
-        return subprocess.run([pfad, "pruefen"], timeout=10).returncode == 0
+        return subprocess.run([pfad, "pruefen"], timeout=10, env=_wb_mensch_env()).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
 
 def _wb_mensch_beleg():
+    test_role = _test_aufrufer_rolle()
+    if test_role is not None:
+        return "private Test-Aufbaubeleg-Rolle '%s'" % test_role
     pfad = _wb_mensch_pfad()
     if not pfad:
         return "wb-mensch nicht gefunden"
     try:
         aus = subprocess.run([pfad, "beleg"], capture_output=True, text=True,
-                             timeout=10).stdout.strip()
+                             timeout=10, env=_wb_mensch_env()).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return "kein Beleg"
     teile = aus.split("\t", 1)
@@ -231,6 +287,110 @@ def _deaktiviert_pfad(name, base):
     return kandidat if os.path.isfile(kandidat) else None
 
 
+HUB_LABEL = "agent-workbench.wb-hub"
+HUB_UNITS = ("wb-hub.socket", "wb-hub.service")
+
+
+def _hub_plattform():
+    """'mac' oder 'linux'. WB_AUSROLLEN_PLATTFORM nur fuer Tests (Sandbox prueft beide Zweige)."""
+    roh = os.environ.get("WB_AUSROLLEN_PLATTFORM")
+    if roh in ("mac", "linux"):
+        return roh
+    return "mac" if sys.platform == "darwin" else "linux"
+
+
+def _hub_befehl(argv, trocken):
+    """Fuehrt einen Dienstbefehl aus; im Trockenlauf nur nennen. -> Exit (0 im Trockenlauf)."""
+    print("    %s%s" % ("(trocken) " if trocken else "$ ", " ".join(argv)))
+    if trocken:
+        return 0
+    try:
+        return subprocess.run(argv, timeout=60).returncode
+    except (OSError, subprocess.SubprocessError) as fehler:
+        print("    Aufruf scheiterte: %s" % fehler, file=sys.stderr)
+        return 1
+
+
+def _hub_teil(repo, base, lauf_id, trocken, laden, ausgerollt):
+    """Hub-Dienst (Spur H2, werkzeug-hub-entwurf 2.4): Einheiten ausliefern, Zustandsordner anlegen und --
+    nur mit ausdruecklichem --hub-laden -- laden.
+
+    Mac: die plist rollt der allgemeine Vergleich (install_map *.plist -> ~/Library/LaunchAgents) wie die
+    des modell-proxy; hier kommt nur der Zustandsordner dazu, den launchd vor dem Start fuers Log braucht.
+    Linux: die Units (shell/systemd/, aus install_map ausgenommen) gehen nach ~/.config/systemd/user.
+    Geladen wird NIE ohne --hub-laden. Rueckgabe: Zahl gescheiterter Dienstbefehle."""
+    plattform = _hub_plattform()
+    shell = os.path.join(repo, "shell")
+    zustand = os.path.join(base, ".local", "state", "wb-hub")
+    geaendert = False
+    fehler = 0
+    if plattform == "mac":
+        quelle = os.path.join(shell, "agent-workbench.wb-hub.plist")
+        ziel = os.path.join(base, "Library", "LaunchAgents", "agent-workbench.wb-hub.plist")
+        if not os.path.isfile(quelle):
+            return 0
+        print("  -- Hub-Dienst (launchd) --")
+        bytes_gleich = False
+        try:
+            with open(quelle, "rb") as q, open(ziel, "rb") as z:
+                bytes_gleich = q.read() == z.read()
+        except OSError:
+            pass
+        geaendert = not bytes_gleich
+        if not trocken:
+            os.makedirs(zustand, mode=0o700, exist_ok=True)
+        print("  Zustandsordner %s%s" % (zustand, " (wuerde angelegt)" if trocken and not os.path.isdir(zustand) else ""))
+        print("  plist %s: %s" % (ziel, "gleich" if bytes_gleich else
+                                  "wird vom allgemeinen Vergleich ausgerollt (oder liegt deaktiviert)"))
+    else:
+        quellen = [(n, os.path.join(shell, "systemd", n)) for n in HUB_UNITS]
+        if not all(os.path.isfile(q) for _, q in quellen):
+            return 0
+        print("  -- Hub-Dienst (systemd --user) --")
+        unitdir = os.path.join(base, ".config", "systemd", "user")
+        if not trocken:
+            os.makedirs(zustand, mode=0o700, exist_ok=True)
+            os.makedirs(unitdir, exist_ok=True)
+        for name, q in quellen:
+            z = os.path.join(unitdir, name)
+            try:
+                with open(q, "rb") as qf, open(z, "rb") as zf:
+                    if qf.read() == zf.read():
+                        print("  %s gleich" % z)
+                        continue
+            except OSError:
+                pass
+            if os.path.exists(z):
+                _schnappschuss(z, base, lauf_id, trocken)
+            _kopieren(q, z, trocken)
+            geaendert = True
+            ausgerollt.append(("shell/systemd/" + name, "nach %s ausgeliefert" % unitdir))
+            print("  shell/systemd/%s %s nach %s" % (name, "wuerde ausgeliefert" if trocken else "ausgeliefert", z))
+    if not laden:
+        print("  Nicht geladen (Schalter --hub-laden fehlt).")
+        return 0
+    print("  Laden (--hub-laden):")
+    if plattform == "mac":
+        domain = "gui/%d" % os.getuid()
+        job = "%s/%s" % (domain, HUB_LABEL)
+        geladen = False
+        if not trocken:
+            geladen = subprocess.run(["launchctl", "print", job], capture_output=True).returncode == 0
+        if geladen and geaendert:
+            fehler += _hub_befehl(["launchctl", "bootout", job], trocken) != 0
+            geladen = False
+        if not geladen:
+            fehler += _hub_befehl(["launchctl", "bootstrap", domain, ziel], trocken) != 0
+        else:
+            print("    schon geladen, plist unveraendert -- nichts zu tun.")
+    else:
+        fehler += _hub_befehl(["systemctl", "--user", "daemon-reload"], trocken) != 0
+        fehler += _hub_befehl(["systemctl", "--user", "enable", "--now", "wb-hub.socket"], trocken) != 0
+        if geaendert:
+            fehler += _hub_befehl(["systemctl", "--user", "restart", "wb-hub.socket"], trocken) != 0
+    return fehler
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
@@ -253,6 +413,9 @@ def main():
                     help="eine plist ausrollen, obwohl sie unter "
                          "wb-launchagents-deaktiviert liegt -- der Deckel gilt dem "
                          "versehentlichen Ausrollen, nicht einem ausdruecklichen Wunsch.")
+    ap.add_argument("--hub-laden", action="store_true",
+                    help="den Hub-Dienst (launchd-Agent bzw. systemd-Socket) auch LADEN; ohne diesen "
+                         "Schalter werden die Einheiten nur ausgeliefert, nie geladen.")
     a = ap.parse_args()
 
     wc = _lade_wb_consistency()
@@ -298,6 +461,54 @@ def main():
         c3 = cfg.get("check3_dangling_refs") or {}
         machine_tool_map = c3.get("machine_tool_map", {})
         current_machine = wc.current_machine_id(c3.get("machine_ids_by_os", {}))
+
+        # Missing *.default.json templates are intentionally omitted by
+        # kopie_vergleiche: they normally belong to setup, not ~/.local/bin.
+        # Two exceptions, each read beside an installed COPY of its tool:
+        # wb-state reads models.default.json to retain shipped family bans, and
+        # wb-tafel (2026-10-09) reads tafel-plaetze.default.json whenever the live
+        # file ~/.claude/workbench/tafel-plaetze.json is missing -- without either
+        # it stops with exit 5. The live file itself is never written here.
+        # werkzeuge.default.json (2026-10-13) is the source wb-werkzeuge and
+        # wb-mcp-start read beside their installed copy; once present, the
+        # ordinary copy comparison keeps it current.
+        for vorlage, werkzeug in (("models.default.json", "wb-state"),
+                                  ("tafel-plaetze.default.json", "wb-tafel"),
+                                  ("werkzeuge.default.json", "wb-werkzeuge")):
+            template = os.path.join(c7["repo_dir"], "shell", vorlage)
+            script_dir = wc._ziel_fuer("shell/" + werkzeug, werkzeug, c7)
+            if script_dir and os.path.isfile(template):
+                installed_template = os.path.join(script_dir, vorlage)
+                if not os.path.exists(installed_template):
+                    _kopieren(template, installed_template, a.dry_run)
+                    ausgerollt.append(("shell/" + vorlage, "Vorlage neben %s installiert" % werkzeug))
+                    print("  shell/%s NEU installiert nach %s" % (vorlage, installed_template))
+
+        # wb-geheimnis-filter-dienst wird als Kopie nach ~/.local/bin gelegt,
+        # benoetigt beim Aufruf dort aber auch seine launchd-Vorlage neben sich.
+        # Die plist gehoert weiterhin zum normalen Installationsziel unter
+        # ~/Library/LaunchAgents; diese zweite Kopie ist nur die Eingabequelle
+        # fuer den Installer. Anders als *.default.json muss sie bei Aenderungen
+        # aktualisiert werden, damit ein kopiertes Werkzeug keinen alten Stand nutzt.
+        plist = os.path.join(c7["repo_dir"], "shell", "agent-workbench.geheimnis-filter.plist")
+        werkzeug_dir = wc._ziel_fuer("shell/wb-geheimnis-filter-dienst",
+                                     "wb-geheimnis-filter-dienst", c7)
+        if werkzeug_dir and os.path.isfile(plist):
+            installed_plist = os.path.join(werkzeug_dir, "agent-workbench.geheimnis-filter.plist")
+            gleicher_inhalt = False
+            try:
+                with open(plist, "rb") as quelle, open(installed_plist, "rb") as ziel:
+                    gleicher_inhalt = quelle.read() == ziel.read()
+            except OSError:
+                pass
+            if not gleicher_inhalt:
+                if os.path.exists(installed_plist):
+                    _schnappschuss(installed_plist, a.base, lauf_id, a.dry_run)
+                _kopieren(plist, installed_plist, a.dry_run)
+                ausgerollt.append(("shell/agent-workbench.geheimnis-filter.plist",
+                                   "Vorlage neben wb-geheimnis-filter-dienst installiert"))
+                print("  shell/agent-workbench.geheimnis-filter.plist NEU installiert nach %s" %
+                      installed_plist)
 
         for fall in wc.kopie_vergleiche(c7, machine_tool_map, current_machine):
             status = fall["status"]
@@ -350,7 +561,33 @@ def main():
                 uebersprungen.append((fall["rel"], richtung, warum))
                 print("  %s UEBERSPRUNGEN (%s: %s) — von Hand pruefen." % (fall["rel"], grund, warum))
 
-    # Konfigurations-Vorlagen fuer fremde Harnesses (crush/kimi/nanocoder/cline/
+    # Git-Hook-Symlinks (git_hook_links in der Konfiguration): install_map kopiert nur
+    # Dateien, die Hook-Namen unter ~/.claude/git-hooks sind aber Links auf _verteiler.
+    # Fehlendes wird angelegt (atomar: Link unter Nebennamen, dann umbenennen); ein
+    # vorhandener Nicht-Link oder Link mit anderem Ziel wird nie angefasst, nur gemeldet.
+    if c7:
+        for fall in wc.git_hook_link_faelle(c7):
+            if fall["status"] == "gleich":
+                continue
+            rel = os.path.relpath(fall["pfad"], a.base)
+            if fall["status"] == "falsch":
+                uebersprungen.append((rel, "hook-link-falsch",
+                                      "kein Symlink auf %s" % fall["ziel"]))
+                print("  %s UEBERSPRUNGEN (hook-link-falsch: kein Symlink auf %s) — von Hand pruefen."
+                      % (rel, fall["ziel"]))
+                continue
+            if not a.dry_run:
+                tmp = "%s.wbtmp-%d" % (fall["pfad"], os.getpid())
+                os.symlink(fall["ziel"], tmp)
+                os.replace(tmp, fall["pfad"])
+            ausgerollt.append((rel, "Symlink auf %s angelegt" % fall["ziel"]))
+            print("  %s NEU verlinkt auf %s" % (rel, fall["ziel"]))
+
+    hub_fehler = 0
+    if c7:
+        hub_fehler = _hub_teil(c7["repo_dir"], a.base, lauf_id, a.dry_run, a.hub_laden, ausgerollt)
+
+    # Konfigurations-Vorlagen fuer fremde Harnesses (crush/nanocoder/cline/
     # forge, siehe check9_harness_konfig in wb-consistency.config.json): dieselbe
     # FEHLT/VERALTET/ABGEWICHEN-Unterscheidung, aber ein ANDERES Werkzeug traegt
     # sie schon (shell/wb-harness-config, eigener Merkposten statt Git-Historie,
@@ -393,6 +630,25 @@ def main():
                     ausgerollt.append((r.get("target", "?"), r.get("detail", "")))
                 else:
                     uebersprungen.append((r.get("target", "?"), status.lower(), r.get("detail", "")))
+
+    # Fehlende Registry-Daten werden aus der Vorlage ausschliesslich additiv
+    # nachgezogen. Der Plan kommt aus wb-consistency: dessen REGISTRY-FEHLT-
+    # Hinweis und dieser Schreibweg benutzen dieselbe Berechnung.
+    if c7:
+        for plan in wc.registry_nachzug_plaene(c7):
+            schnappschuss = None
+            if not a.dry_run:
+                schnappschuss = _schnappschuss(plan["lebend_datei"], a.base, lauf_id, False)
+                modus = stat.S_IMODE(os.stat(plan["lebend_datei"]).st_mode)
+                atomar_schreiben.schreiben(
+                    plan["lebend_datei"],
+                    json.dumps(plan["nachzug"], ensure_ascii=False, indent=2) + "\n",
+                    modus=modus, dauerhaft=True)
+            for pfad_text in plan["ergaenzungen"]:
+                ausgerollt.append(("%s.%s" % (plan["name"], pfad_text),
+                                   "fehlte in der lebenden Registry"))
+                zusatz = " — Schnappschuss: %s" % schnappschuss if schnappschuss else ""
+                print("  NEU in Registry: %s%s" % (pfad_text, zusatz))
 
     # Registry-Abweichungen (registry_vergleiche(), dieselbe Berechnung wie
     # wb-consistencys REGISTRY-ABWEICHUNG-Meldung -- siehe deren Docstring:
@@ -467,7 +723,9 @@ def main():
               "--trotz-deaktivierung aufrufen:")
         for rel, richtung, warum in deaktiviert:
             print("    %-40s %-13s %s" % (rel, richtung, warum))
-    return 1 if uebersprungen else 0
+    if hub_fehler:
+        print("wb-ausrollen: %d Hub-Dienstbefehl(e) gescheitert." % hub_fehler, file=sys.stderr)
+    return 1 if (uebersprungen or hub_fehler) else 0
 
 
 if __name__ == "__main__":

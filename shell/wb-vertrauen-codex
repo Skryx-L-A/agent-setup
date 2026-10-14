@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""wb-vertrauen-codex — uebertraegt das Hook-Vertrauen von codex auf einen Werkbank-Worktree,
+damit der Start nicht am Dialog "Hooks need review" haengenbleibt.
+
+ANLASS (09.10.2026): Ein geweckter codex-Worker blieb im Pane an
+
+    Hooks need review / 1 hook is new or changed. / Hooks can run outside the sandbox
+    after you trust them. / 1. Review hooks  2. Trust all and continue  3. Continue
+    without trusting (hooks won't run)
+
+stehen, und die Zustellung meldete "app-server nicht erreichbar". Gemessen (codex-cli
+0.157.1, isoliertes CODEX_HOME): codex fuehrt das Hook-Vertrauen in ~/.codex/config.toml,
+ein Abschnitt je Hook,
+
+    [hooks.state."<pfad der hooks.json>:<ereignis>:<gruppe>:<index>"]
+    trusted_hash = "sha256:..."
+
+Der Hash gehoert zum Inhalt des Hooks, nicht zum Pfad (derselbe Hook in zwei Ordnern gab
+denselben Hash); der SCHLUESSEL enthaelt den Pfad. Ein neuer Worktree hat deshalb immer
+einen neuen Schluessel und damit den Dialog, auch wenn der Nutzer dieselben Hooks im
+Hauptbaum laengst bestaetigt hat.
+
+KEINE ANHEBUNG DER ERLAUBNIS, sondern eine UEBERTRAGUNG, im selben Sinn wie wb-vertrauen
+(Regel a) fuer Claude. Kopiert wird ein Eintrag nur, wenn ALLES davon gilt:
+
+  1. Das Ziel liegt unter ~/.pi-workers/worktrees und ist ein git-Worktree (der Spawner legt
+     seine Worktrees dort an); sein Hauptbaum ist ein anderer Ordner.
+  2. Ziel und Hauptbaum haben .codex/hooks.json, beides gewoehnliche Dateien (keine Links),
+     und BYTEGLEICH. Aendert ein Worker die Datei, passt nichts mehr -> Dialog bleibt.
+  3. Fuer den Hauptbaum steht in config.toml ein Eintrag mit genau einem Feld
+     (trusted_hash). Ein Eintrag mit weiteren Feldern (etwa ein bewusstes Abschalten) wird
+     nie kopiert.
+
+Fremde Hooks werden so nie blind vertraut: ein Hook, den der Nutzer im Hauptbaum nicht
+bestaetigt hat, hat dort keinen Eintrag und bekommt auch im Worktree keinen. Weicht der
+Hook-Inhalt spaeter ab, passt der Hash nicht mehr, und codex fragt wieder -- diese
+Pruefung bleibt bei codex. Der Hash wird NICHT berechnet (die Bildungsregel ist nicht
+bekannt), nur kopiert.
+
+AUFRUF:  wb-vertrauen-codex <verzeichnis> [--pruefen]
+         --pruefen schreibt nichts und sagt nur, was passieren wuerde.
+Endet immer mit 0: ein Start scheitert nie daran. CODEX_HOME wird beachtet.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import atomar_schreiben
+except ImportError:  # pragma: no cover - nur wenn die Nachbardatei fehlt
+    atomar_schreiben = None
+
+WORKTREE_WURZEL = Path.home() / ".pi-workers" / "worktrees"
+HASH = re.compile(r'^trusted_hash\s*=\s*"(sha256:[0-9a-f]{64})"\s*(#.*)?$')
+KOPF = re.compile(r'^\[hooks\.state\."((?:[^"\\]|\\.)*)"\]\s*(#.*)?$')
+
+
+def melde(text: str) -> None:
+    print(f"wb-vertrauen-codex: {text}", file=sys.stderr)
+
+
+def hauptbaum(verzeichnis: Path) -> Path | None:
+    try:
+        roh = subprocess.run(
+            ["git", "-C", str(verzeichnis), "rev-parse",
+             "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if roh.returncode != 0:
+        return None
+    gemeinsam = Path(roh.stdout.strip())
+    return gemeinsam.parent if gemeinsam.name == ".git" else None
+
+
+def gewoehnliche_datei(pfad: Path) -> bool:
+    return pfad.is_file() and not pfad.is_symlink()
+
+
+def eintraege(text: str) -> list[tuple[str, str]]:
+    """Alle Hook-Eintraege mit genau einem Feld trusted_hash: (Schluessel, Hash)."""
+    treffer: list[tuple[str, str]] = []
+    zeilen = text.splitlines()
+    i = 0
+    while i < len(zeilen):
+        m = KOPF.match(zeilen[i].strip())
+        i += 1
+        if not m:
+            continue
+        try:
+            schluessel = json.loads('"%s"' % m.group(1))
+        except ValueError:
+            continue
+        rumpf = []
+        while i < len(zeilen) and not zeilen[i].lstrip().startswith("["):
+            if zeilen[i].strip() and not zeilen[i].strip().startswith("#"):
+                rumpf.append(zeilen[i].strip())
+            i += 1
+        if len(rumpf) == 1:
+            h = HASH.match(rumpf[0])
+            if h:
+                treffer.append((schluessel, h.group(1)))
+    return treffer
+
+
+def vorhanden(text: str) -> set[str]:
+    """Schluessel, die irgendein [hooks.state.\"...\"]-Abschnitt schon traegt."""
+    menge: set[str] = set()
+    for zeile in text.splitlines():
+        m = KOPF.match(zeile.strip())
+        if m:
+            try:
+                menge.add(json.loads('"%s"' % m.group(1)))
+            except ValueError:
+                pass
+    return menge
+
+
+def main() -> int:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    nur_pruefen = "--pruefen" in sys.argv[1:]
+    if not args:
+        melde("Aufruf: wb-vertrauen-codex <verzeichnis> [--pruefen]")
+        return 0
+    try:
+        ziel = Path(args[0]).expanduser().resolve()
+        wurzel = WORKTREE_WURZEL.resolve()
+    except OSError:
+        melde(f"Verzeichnis nicht aufloesbar: {args[0]} — nichts eingetragen.")
+        return 0
+    if wurzel not in ziel.parents:
+        melde(f"{ziel} liegt nicht unter {wurzel} — kein Werkbank-Worktree, nichts eingetragen.")
+        return 0
+    quelle = hauptbaum(ziel)
+    if quelle is None or quelle == ziel:
+        melde(f"{ziel} ist kein git-Worktree — nichts eingetragen.")
+        return 0
+    quelle = quelle.resolve()
+    hooks_ziel = ziel / ".codex" / "hooks.json"
+    hooks_quelle = quelle / ".codex" / "hooks.json"
+    if not gewoehnliche_datei(hooks_ziel) or not gewoehnliche_datei(hooks_quelle):
+        return 0   # kein Projekt-Hook: nichts zu tun, kein Laerm
+    try:
+        gleich = hooks_ziel.read_bytes() == hooks_quelle.read_bytes()
+    except OSError as e:
+        melde(f"hooks.json nicht lesbar ({e}) — nichts eingetragen.")
+        return 0
+    if not gleich:
+        melde(f"{hooks_ziel} weicht von {hooks_quelle} ab — Hook-Vertrauen wird nicht "
+              f"uebertragen, codex wird fragen.")
+        return 0
+
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    konfig = codex_home / "config.toml"
+    try:
+        alt = konfig.read_text(encoding="utf-8")
+    except OSError as e:
+        melde(f"{konfig} nicht lesbar ({e}) — nichts eingetragen.")
+        return 0
+
+    vorn = str(hooks_quelle) + ":"
+    hinten = str(hooks_ziel) + ":"
+    schon = vorhanden(alt)
+    neu = [(hinten + k[len(vorn):], h) for k, h in eintraege(alt)
+           if k.startswith(vorn) and (hinten + k[len(vorn):]) not in schon]
+    if not neu:
+        if not any(k.startswith(vorn) for k, _ in eintraege(alt)):
+            melde(f"im Hauptbaum {quelle} ist kein Hook bestaetigt — nichts zu uebertragen, "
+                  f"codex wird fragen.")
+        return 0
+    if nur_pruefen:
+        melde(f"wuerde {len(neu)} Hook-Eintrag/Eintraege fuer {ziel} eintragen "
+              f"(Vertrauen uebertragen von {quelle})")
+        return 0
+
+    sperre = Path.home() / ".codex.wb-vertrauen-codex.lock"
+    ende = time.time() + 5.0
+    while True:
+        try:
+            os.mkdir(sperre)
+            break
+        except FileExistsError:
+            if time.time() > ende:
+                melde("Sperre nicht zu bekommen — nichts eingetragen, der Dialog bleibt.")
+                return 0
+            time.sleep(0.1)
+        except OSError:
+            return 0
+    try:
+        try:
+            alt = konfig.read_text(encoding="utf-8")   # frisch: eine TUI kann geschrieben haben
+        except OSError as e:
+            melde(f"{konfig} beim zweiten Lesen unbrauchbar ({e}) — nichts eingetragen.")
+            return 0
+        schon = vorhanden(alt)
+        bloecke = "".join(
+            "\n[hooks.state.%s]\ntrusted_hash = %s\n" % (json.dumps(k, ensure_ascii=False),
+                                                       json.dumps(h))
+            for k, h in neu if k not in schon)
+        if not bloecke:
+            return 0
+        text = (alt if alt.endswith("\n") or not alt else alt + "\n") + bloecke
+        if not all(k in vorhanden(text) for k, _ in neu):
+            melde("der Anhang wird von der eigenen Deutung nicht erkannt — nichts eingetragen.")
+            return 0
+        if atomar_schreiben is not None:
+            atomar_schreiben.schreiben(konfig, text, modus=stat.S_IMODE(konfig.stat().st_mode))
+        else:  # pragma: no cover
+            zwischen = konfig.with_name(".wb-vertrauen-codex.tmp")
+            zwischen.write_text(text, encoding="utf-8")
+            os.replace(zwischen, konfig)
+    finally:
+        try:
+            os.rmdir(sperre)
+        except OSError:
+            pass
+    melde(f"{len(neu)} Hook-Eintrag/Eintraege fuer {ziel} eingetragen "
+          f"(Vertrauen uebertragen von {quelle}, hooks.json byteidentisch).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

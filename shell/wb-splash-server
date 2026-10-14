@@ -1,0 +1,756 @@
+#!/bin/bash
+# wb-splash-server — bedarfsweiser Splash-Server fuer Qwen3.8 auf dem Mac, Port 8000.
+#
+# SEIT SPLASH 1.3 (10.10.2026): Splash laedt keine eigenen Pakete mehr
+# ("incoai/Qwen3.8-27B-Splash ... is a Splash package, which Splash no longer
+# loads; serve the MLX model of its family instead"), sondern das MLX-Modell der
+# Familie aus dem Hugging-Face-Cache plus den DFlash2-Entwerfer der Familie. Der
+# Registry-Name (modelRef) bleibt der API-Name, den pi und der Proxy schicken;
+# geladen wird `splashModel` aus der Registry, ersatzweise die Zuordnung in
+# splash_lademodell(). Der Server meldet den alten Namen ueber
+# --served-model-name/--announce-served-name weiter.
+#
+# WARUM EIGENES WERKZEUG, NICHT wb-mlx-server (gleiche Begruendung wie bei
+# wb-omlx-server): Splash ist ein eigener Motor mit eigenem Paketformat
+# ("splash-packed-q4", bis Splash 1.0); und
+# wb-mlx-server ist ein 4700-Zeilen-Sicherheitswerkzeug mit ineinandergreifenden
+# Pruefungen fuer seine fuenf Motoren. Ein sechster Motor darin haette jede davon
+# angeschnitten. Dieselben Sicherungen stehen hier noch einmal: Speicherpruefung,
+# wb-belegung als Cross-Sitzungs-Sperre, Probeanfrage als Erfolgsbeleg,
+# Leerlauf-Stopp. Eigener Port, eigener Zustand -- ein Fehler hier trifft
+# grug/ornith/qwen38u nicht.
+#
+# WARUM SPLASH DER VORGABEWEG FUER qwen38 IST (gemessen 2026-09-20, Netzbetrieb,
+# powermode 2, ein Motor zur Zeit, gleicher Prompt-Satz, Median aus zwei Runden):
+#   kurze Aufgaben   33,1 -> 76,4 Tok/s (2,3x)   ..  1,3x bis 2,3x je Prompt
+#   lange Eingabe    24,0 -> 63,1 Tok/s (2,6x)
+#   vier Stroeme     38,6 -> 108,3 Tok/s gesamt (2,8x)
+#   gecachter 12K-Kontext, zweiter Lauf: 0,22 s statt 54,6 s bis zum ersten Token
+# Vollstaendige Messung: ~/Knowledge/30-topics/lokale-modelle/2026-09-20-splash-gemessen.md
+#
+# NUR MAC. Splash ist Apple-Silicon-only (Formel: arch arm64, macOS >= 26.4).
+# Auf peer bleibt der dortige Weg unveraendert; dieses Werkzeug lehnt dort ab.
+#
+# KONTEXT (Vorgaben des Nutzers vom 20.09.2026, beide gemessen):
+#   Vorgabe/Empfehlung 131072. "32K ist deutlich zu wenig fuer richtige Aufgaben";
+#   64K ist die naechste Stufe nach unten, 32K nur fuer die allerkleinsten Aufgaben.
+#   Das volle Fenster MUSS verfuegbar sein: `--kontext 262144` ist erlaubt und laeuft
+#   -- gemessen am 20.09. eine Anfrage ueber 191.361 Token, 958 s (Prefill), waehrend
+#   der Anfrage 7,4-9,4 GiB frei von zuvor 26,3 GiB. Die Obergrenze allein kostet
+#   nichts: der Arbeitssatz ist bei 32K, 131K und 256K derselbe, nur eine sehr lange
+#   Anfrage braucht mehr (und vor allem Zeit).
+#   Ein laufender Server mit KLEINERER Obergrenze wird fuer eine groessere Forderung
+#   nur ohne lebende Splash-Panes neu gestartet; sonst scheitert ensure sichtbar.
+#   Gleiches Modell mit kleinerer Forderung behaelt Grenze und Setzer. Der Stand
+#   nennt Rolle, Sitzung, Pane und Zeit des Aufrufs, der die Grenze gesetzt hat.
+#   Blockierte Anhebung liefert Exit 3 und die laufende Kante auf stdout. Nur
+#   wb-code darf damit nach echtem wb-mensch-Nachweis einen Menschen starten;
+#   pi erhaelt dann eine private Sitzungskonfiguration mit dieser Kante.
+#
+# Usage:
+#   wb-splash-server ensure <alias|id> [--frist <minuten>] [--kontext <token>] [--kontext-ausgabe]
+#   wb-splash-server pi-agent-kontext <quelle> <ziel> <provider> <modell> <token>
+#   wb-splash-server probe [--darf] [<alias|id>]   (Updater-Probe, eigener Port, siehe cmd_probe)
+#   wb-splash-server stop
+#   wb-splash-server status
+#
+# Aufgerufen von pi-worker und wb-code (Provider splash-lokal), oder von Hand.
+set -uo pipefail
+
+# Der Port ist 8000 und bleibt es im Betrieb -- der Proxy-Eintrag und die
+# Registry zeigen darauf. Er laesst sich aber fuer einen TEST umstellen, und das
+# ist keine Bequemlichkeit: eine Suite, die gegen den festen Port lief, fragte in
+# Wahrheit den LEBENDEN Server. Am 21.09. war sie deshalb gruen, solange kein
+# Server lief, und rot, sobald Orchestrator des Nutzers einen hielt -- sie mass die
+# Maschine und nicht den Code. Ein eigener Port gibt ihr ihren eigenen Gegenstand.
+PORT="${WB_SPLASH_PORT:-8000}"
+HOSTB=127.0.0.1
+STATEDIR="$HOME/.local/state/wb-splash-server"
+AKTUELL="$STATEDIR/aktuell.json"
+# Ueberlebt den Stopp: welches Modell zuletzt mit welcher Obergrenze lief.
+LETZTER="$STATEDIR/letzter.json"
+IDLE_MIN=20
+FRIST_VORGABE=150
+WBB="$HOME/.local/bin/wb-belegung"
+WBN="$HOME/.local/bin/wb-nohup"
+# Der gemessene Arbeitssatz des Motors in GiB (Splash 1.3, gemessen 10.10.2026,
+# Begruendung bei der Buchung in cmd_ensure). EINE Stelle: cmd_ensure bucht ihn, und
+# `wb-splash-server arbeitssatz` gibt ihn an wb-kontext weiter, das ihn als
+# Gewichte-Zeile von Splash zeigt. Eine zweite Zahl in wb-kontext wuerde still
+# von der Buchung abweichen. Bis Splash 1.0 waren es 14,6 GiB (20.09.2026).
+SPLASH_ARBEITSSATZ_GIB=28.0
+# BUCHUNG NACH KONTEXT (Nachtrag 4, WorkbenchOrchestrator 10.10.2026), dieselbe
+# Rechnung wie fuer jedes andere Modell in wb-belegung: Gewichte plus KV je Token
+# mal angefordertem Kontext. Grundsatz = geladen und untaetig (gemessen 19,6 GiB);
+# der KV-Wert je Token steht als gemessener Eintrag SPLASH_KV_SCHLUESSEL im
+# KV-Register von wb-belegung (`wb-belegung kv liste`), nicht hier.
+# Bis ein Messpunkt bei 262.144 Token die Steigung bestaetigt, bleibt der feste
+# Arbeitssatz oben die Vorgabe: SPLASH_BUCHUNG_NACH_KONTEXT=0.
+SPLASH_GRUNDSATZ_GIB=19.6
+SPLASH_KV_SCHLUESSEL=qwen3.8-27b-splash
+SPLASH_BUCHUNG_NACH_KONTEXT=0
+# Die Argumente fuer `wb-belegung nimm|darf`, eines je Zeile. <kontext> ist die
+# Obergrenze, mit der der Server startet.
+splash_buchung_args() {  # <kontext> <modell-id>
+  if [ "$SPLASH_BUCHUNG_NACH_KONTEXT" = 1 ]; then
+    printf '%s\n' --gewichte-gb "$SPLASH_GRUNDSATZ_GIB" --kontext "$1" --parallel 1 \
+      --modell "$SPLASH_KV_SCHLUESSEL" --kv-quant q8
+  else
+    printf '%s\n' --gewichte-gb "$SPLASH_ARBEITSSATZ_GIB" --nur-gewichte --modell "$2" \
+      --parallel 1 --kv-quant off
+  fi
+}
+# Heimatverzeichnis aus der Benutzerdatenbank, nicht aus der Umgebung; gebraucht
+# fuer die eine Stelle, an der ein Schalter eine Schranke aufhebt. Begruendung
+# im Kopf von pi-worker ("WO das Pruefprogramm gesucht wird").
+wb_heimatverzeichnis() {
+  local h=""
+  if command -v dscl >/dev/null 2>&1; then
+    h="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+  fi
+  [ -n "$h" ] || h="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
+  printf '%s' "${h:-$HOME}"
+}
+WB_HEIM="$(wb_heimatverzeichnis)"
+# M2 (Oberflaeche als Ahne) braucht WB_MENSCH_QUELLE und WB_APP_PID, und `env -i`
+# loescht beide. Ohne diese Allowlist scheiterte seit dem 21.09. jeder Menschen-Nachweis
+# ueber die Werkbank-App, sichtbar als "'--mensch' abgelehnt" beim Sitzungsstart (Befund 26.09.2026). Beide sind nur
+# Behauptungen, die wb-mensch gegen seine echte Ahnenkette prueft -- dieselbe
+# Allowlist wie in wb-pane-write; alle uebrige Aufruferumgebung bleibt weg.
+M2_UMGEBUNG=()
+if [ "${WB_MENSCH_QUELLE:-}" = oberflaeche ]; then
+  case "${WB_APP_PID:-}" in ''|*[!0-9]*) ;; *) M2_UMGEBUNG=(WB_MENSCH_QUELLE=oberflaeche "WB_APP_PID=$WB_APP_PID") ;; esac
+fi
+mensch_gemessen() {
+  /usr/bin/env -i HOME="$HOME" TMPDIR=/tmp PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+    ${M2_UMGEBUNG[@]+"${M2_UMGEBUNG[@]}"} "$HOME/.local/bin/wb-mensch" pruefen >/dev/null 2>&1 || return 1
+  [ "$HOME" = "$WB_HEIM" ] && return 0
+  [ -x "$WB_HEIM/.local/bin/wb-mensch" ] || return 1
+  /usr/bin/env -i HOME="$HOME" TMPDIR=/tmp PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+    ${M2_UMGEBUNG[@]+"${M2_UMGEBUNG[@]}"} "$WB_HEIM/.local/bin/wb-mensch" pruefen >/dev/null 2>&1
+}
+SPLASH="$(command -v splash || echo /opt/homebrew/bin/splash)"
+# Woher Splash 1.3 Modell und Entwerfer liest: der Hugging-Face-Cache. Nur fuer
+# die Vorab-Auskunft "wird erst geladen" -- fehlt etwas, laedt `splash serve` es selbst.
+HFCACHE="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
+mkdir -p "$STATEDIR"
+
+err() { printf '%s\n' "$*" >&2; }
+
+# Ein Sitzungs-Agent-Verzeichnis fuer pi anlegen. Beide Startwege verwenden
+# denselben Helfer; die globale models.json bleibt unveraendert.
+cmd_pi_agent_kontext() {
+  [ "$#" -eq 5 ] || { err 'Usage: wb-splash-server pi-agent-kontext <quelle> <ziel> <provider> <modell> <token>'; return 2; }
+  python3 - "$@" <<'PY'
+import json, os, pathlib, sys, tempfile
+
+src, dst, provider, model, ctx = sys.argv[1:]
+if not ctx.isdecimal() or int(ctx) < 1:
+    raise SystemExit('ungueltige pi-Kontextgrenze')
+src, dst = pathlib.Path(src), pathlib.Path(dst)
+if dst.is_symlink() or src.resolve() == dst.resolve():
+    raise SystemExit('Sitzungs-Agent-Verzeichnis ist kein eigener Pfad')
+with (src / 'models.json').open() as f:
+    data = json.load(f)
+models = data['providers'][provider]['models']
+matches = [entry for entry in models if entry.get('id') == model]
+if len(matches) != 1:
+    raise SystemExit('Splash-Modell im pi-Eintrag nicht eindeutig gefunden')
+matches[0]['contextWindow'] = int(ctx)
+dst.mkdir(mode=0o700, parents=True, exist_ok=True)
+dst.chmod(0o700)
+for child in src.iterdir():
+    if child.name == 'models.json':
+        continue
+    link = dst / child.name
+    if link.is_symlink() and link.resolve() == child.resolve():
+        continue
+    if link.exists() or link.is_symlink():
+        raise SystemExit('Sitzungs-Agent-Eintrag kollidiert: ' + child.name)
+    link.symlink_to(child, target_is_directory=child.is_dir())
+fd, tmp = tempfile.mkstemp(prefix='.models-', dir=dst)
+try:
+    with os.fdopen(fd, 'w') as f:
+        json.dump(data, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, dst / 'models.json')
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
+
+case "$(uname -s)" in
+  Darwin) ;;
+  *) err "wb-splash-server: Splash gibt es nur fuer Apple Silicon — auf dieser Maschine ($(uname -s)) laeuft der bisherige lokale Weg weiter."; exit 2 ;;
+esac
+
+# --- Registry-Aufloesung -----------------------------------------------------
+RES_ID=""; RES_REF=""; RES_LADE=""; RES_GEW=""; RES_CTX=""
+# Welches Modell `splash serve --model` laedt. Splash 1.3 laedt Pakete wie
+# incoai/Qwen3.8-27B-Splash nicht mehr und nennt selbst den Ersatz: das
+# MLX-Modell der Familie. Die Zuordnung hier gilt nur fuer Registries ohne
+# Feld `splashModel` (wb-ausrollen legt neue Felder nicht an).
+splash_lademodell() {  # <modelRef> <splashModel aus der Registry oder leer>
+  if [ -n "$2" ]; then printf '%s' "$2"; return 0; fi
+  case "$1" in
+    incoai/Qwen3.8-27B-Splash) printf '%s' 'mlx-community/Qwen3.8-27B-4bit' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+resolve() {
+  local eingabe="$1"
+  local id; id="$($HOME/.local/bin/wb-state models get "$eingabe" --field id 2>/dev/null)"
+  if [ -z "$id" ]; then
+    err "Modell '$eingabe' ist keine Registry-Kennung/kein Alias."
+    return 1
+  fi
+  local prov; prov="$($HOME/.local/bin/wb-state models get "$id" --field provider 2>/dev/null)"
+  if [ "$prov" != "splash-lokal" ]; then
+    err "Modell '$id' hat Provider '${prov:-?}', nicht 'splash-lokal' — wb-splash-server startet nur Splash-Pakete."
+    return 1
+  fi
+  RES_ID="$id"
+  RES_REF="$($HOME/.local/bin/wb-state models get "$id" --field modelRef 2>/dev/null)"
+  RES_LADE="$(splash_lademodell "$RES_REF" "$($HOME/.local/bin/wb-state models get "$id" --field splashModel 2>/dev/null)")"
+  RES_GEW="$($HOME/.local/bin/wb-state models get "$id" --field gewichteGb 2>/dev/null)"
+  RES_CTX="$($HOME/.local/bin/wb-state models get "$id" --field contextWindow 2>/dev/null)"
+  # modelRef ist hier eine Hugging-Face-Kennung (owner/repo), KEIN Pfad: Splash
+  # laedt und verwaltet das Paket selbst.
+  case "$RES_REF" in
+    */*) ;;
+    *) err "modelRef '$RES_REF' sieht nicht nach einer Hugging-Face-Kennung 'owner/repo' aus."; return 1 ;;
+  esac
+  case "$RES_LADE" in
+    */*) ;;
+    *) err "splashModel '$RES_LADE' sieht nicht nach einer Hugging-Face-Kennung 'owner/repo' aus."; return 1 ;;
+  esac
+  [ -n "$RES_CTX" ] || RES_CTX=32768
+  [ -n "$RES_GEW" ] || RES_GEW=16.2
+  return 0
+}
+
+laeuft_pid() {  # PID dessen, der auf PORT lauscht, sonst leer
+  lsof -nP -iTCP:$PORT -sTCP:LISTEN -t 2>/dev/null | head -1
+}
+
+antwortet() {
+  curl -s -m 4 "http://$HOSTB:$PORT/v1/models" >/dev/null 2>&1
+}
+
+served_ref() {  # welches Modell bedient der laufende Server
+  curl -s -m 4 "http://$HOSTB:$PORT/v1/models" 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); print((d.get("data") or [{}])[0].get("id",""))
+except Exception: print("")' 2>/dev/null
+}
+
+# --- ensure ------------------------------------------------------------------
+cmd_ensure() {
+  local eingabe="" frist="$FRIST_VORGABE" kontext="" rolle="unbekannt" sitzung="unbekannt" pane="unbekannt" setzer_zeit="" kontext_ausgabe=""
+  # Das Modell braucht Speicher: untaetige Sitzungen schlafen legen (wb-schlaf,
+  # 25.09.2026). Im Hintergrund und gedrosselt; ensure wartet nicht darauf.
+  [ -x "$HOME/.local/bin/wb-schlaf" ] \
+    && ( "$HOME/.local/bin/wb-schlaf" runde --gedrosselt 120 >/dev/null 2>&1 & )
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --frist) frist="$2"; shift 2 ;;
+      --kontext) kontext="$2"; shift 2 ;;
+      --kontext-ausgabe) kontext_ausgabe=1; shift ;;
+      --rolle) rolle="$2"; shift 2 ;;
+      --sitzung) sitzung="$2"; shift 2 ;;
+      --pane) pane="$2"; shift 2 ;;
+      *) [ -z "$eingabe" ] && eingabe="$1"; shift ;;
+    esac
+  done
+  # OHNE ANGABE: das zuletzt bediente Modell, ersatzweise die Werkbank-Vorgabe.
+  # Gebraucht fuer die Bedarfsschaltung ueber wb-modell-proxy (2026-09-21):
+  # dessen ensureCmd kann kein Modell mitgeben, weil dort keine Shell laeuft --
+  # dieselbe Bauform wie bei `wb-mlx-server ensure`. Anlass ist des Nutzers
+  # Befund: steht eine lokale Sitzung lange still, stoppt die Leerlaufwache den
+  # Server, und die naechste Anfrage aus Worker oder Orchestrator lief ins
+  # Leere. Nach dieser Aenderung faehrt der Server bei der naechsten Anfrage
+  # wieder hoch, statt einen Fehler zu liefern.
+  # aktuell.json gibt es nur, solange ein Server laeuft; nach einem Stopp
+  # antwortet letzter.json. Beide tragen dieselben zwei Angaben.
+  STANDQUELLE=""
+  [ -s "$AKTUELL" ] && STANDQUELLE="$AKTUELL"
+  [ -z "$STANDQUELLE" ] && [ -s "$LETZTER" ] && STANDQUELLE="$LETZTER"
+  local stand_id="" stand_kontext="" stand_setzer=""
+  if [ -n "$STANDQUELLE" ]; then
+    stand_id="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STANDQUELLE" | head -1)"
+    stand_kontext="$(sed -n 's/.*"kontext"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$STANDQUELLE" | head -1)"
+    stand_setzer="$(python3 - "$STANDQUELLE" <<'PY'
+import json,sys
+try:
+    s=json.load(open(sys.argv[1])).get('setzer',{})
+    print('%s, Sitzung %s, Pane %s, %s' % tuple(s.get(k,'unbekannt') for k in ('rolle','sitzung','pane','zeit')))
+except Exception: print('unbekannt')
+PY
+)"
+  fi
+  if [ -z "$eingabe" ] && [ -n "$stand_id" ]; then
+    eingabe="$stand_id"
+    err "wb-splash-server: ohne Angabe — nehme das zuletzt bediente Modell '$eingabe'."
+  fi
+  if [ -z "$eingabe" ]; then
+    eingabe="$($HOME/.local/bin/wb-state settings get workerModel 2>/dev/null || true)"
+    [ -n "$eingabe" ] && err "wb-splash-server: ohne Angabe und ohne letzten Stand — nehme die Werkbank-Vorgabe '$eingabe'."
+  fi
+  [ -n "$eingabe" ] || { err "kein Modell angegeben, kein letzter Stand, keine Werkbank-Vorgabe."; return 1; }
+  resolve "$eingabe" || return 1
+
+  # Die Obergrenze gehoert zur Sitzung, nicht zur Schreibweise des Aufrufs.
+  # Ein explizites --kontext bleibt immer eine neue Forderung; ohne dieses Flag
+  # darf derselbe Registry-Eintrag beim Wiederanlauf aber nicht von 256K auf die
+  # Vorgabe schrumpfen. Bei einem anderen Modell ist sein alter Wert dagegen
+  # bedeutungslos und die Vorgabe gilt wie bisher.
+  if [ -z "$kontext" ] && [ "$RES_ID" = "$stand_id" ] && [ -n "$stand_kontext" ]; then
+    kontext="$stand_kontext"
+    err "wb-splash-server: fuer '$RES_ID' — uebernehme die zuletzt verlangte Obergrenze $kontext."
+  fi
+  # Der Proxy hat keine Rollen-/Pane-Angabe. Beim Wiederanlauf derselben
+  # Modellgrenze bleibt daher der urspruengliche Setzer erhalten.
+  if [ "$rolle" = unbekannt ] && [ "$RES_ID" = "$stand_id" ] && [ "$kontext" = "$stand_kontext" ] && [ -n "$STANDQUELLE" ]; then
+    local alter_setzer
+    alter_setzer="$(python3 - "$STANDQUELLE" <<'PY'
+import json,sys
+try:
+    s=json.load(open(sys.argv[1])).get('setzer',{})
+    print('\t'.join(s.get(k,'unbekannt') for k in ('rolle','sitzung','pane','zeit')))
+except Exception: print('unbekannt\tunbekannt\tunbekannt\tunbekannt')
+PY
+)"
+    IFS=$'\t' read -r rolle sitzung pane setzer_zeit <<< "$alter_setzer"
+  fi
+
+  [ -x "$SPLASH" ] || { err "splash nicht gefunden ($SPLASH) — 'brew install incoai/tap/splash'."; return 1; }
+
+  # KONTEXTOBERGRENZE FUER DEN SERVER. 131072 ist Vorgabe des Nutzers vom 20.09.2026,
+  # woertlich: "32K ist deutlich zu wenig fuer richtige Aufgaben ... 130K oder mehr.
+  # 64K runtergehen. 32K sollte nur bei den allerkleinsten Mini-Aufgaben genommen
+  # werden." Wer weniger will, sagt es mit --kontext; gedeckelt wird auf den nativen
+  # Max des Modells (256K).
+  #
+  # Die Obergrenze selbst kostet keinen Speicher; erst lange Anfragen tun es. Unter
+  # Splash 1.0 war der Arbeitssatz laengenunabhaengig (20.09.2026); unter Splash 1.3
+  # waechst er mit rund 0,05 MiB je Token im Cache (10.10.2026, siehe die Buchung).
+  local KONTEXT_VORGABE=131072
+  [ -n "$kontext" ] || kontext="$KONTEXT_VORGABE"
+  if [ "$kontext" -gt "$RES_CTX" ] 2>/dev/null; then kontext="$RES_CTX"; fi
+
+  local pid; pid="$(laeuft_pid)"
+  if [ -n "$pid" ]; then
+    local laufref; laufref="$(served_ref)"
+    if [ "$laufref" = "$RES_REF" ]; then
+      # EIN Server bedient alle Worker. Verlangt dieser Aufruf MEHR Kontext, als
+      # der laufende Server als Obergrenze bekommen hat, waere stilles
+      # "nichts zu tun" eine Falle: der Worker startet, und seine lange Anfrage
+      # scheitert spaeter mit HTTP 400. Dann wird neu gestartet -- der Speicherplan
+      # ist gemessen von der Obergrenze unabhaengig (siehe oben), es kostet also
+      # nur den Neustart. Weniger Kontext als der laufende Server hat, aendert
+      # nichts: eine kleinere Obergrenze braucht niemand zu erzwingen.
+      local laufktx=""
+      [ -f "$AKTUELL" ] && laufktx="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("kontext",""))
+except Exception: print("")' "$AKTUELL" 2>/dev/null)"
+      case "$laufktx" in
+        ''|*[!0-9]*) err "wb-splash-server: laufende Kontextgrenze ist nicht belegbar — kein stiller Ensure-Erfolg."; return 1 ;;
+      esac
+      if [ -n "$laufktx" ] && [ "$kontext" -gt "$laufktx" ] 2>/dev/null; then
+        local stroeme
+        stroeme="$(splash_lebende_stroeme)" || { err "wb-splash-server: lebende Splash-Stroeme nicht pruefbar — kein Neustart."; return 1; }
+        if [ -n "$stroeme" ]; then
+          err "wb-splash-server: Obergrenze $laufktx von ${stand_setzer:-unbekannt}; $kontext verlangt, aber lebende Stroeme blockieren den Neustart:"
+          err "$stroeme"
+          # Exit 3 bedeutet nur: derselbe Server antwortet weiter, aber mit
+          # kleinerer Grenze. stdout liefert seine Kante fuer einen gemessenen
+          # Menschen-Start; ein Agent muss auch diesen Exit als Fehler behandeln.
+          printf '%s\n' "$laufktx"
+          return 3
+        fi
+        err "wb-splash-server: laufender Server hat Obergrenze $laufktx von ${stand_setzer:-unbekannt}, verlangt sind $kontext — Neustart ohne lebende Stroeme."
+        cmd_stop || return 1
+        pid=""
+      else
+        err "wb-splash-server: '$RES_REF' laeuft bereits (PID $pid, Kontext ${laufktx:-?}, gesetzt von ${stand_setzer:-unbekannt}); hoehere Grenze bleibt — kein Neustart."
+        if [ -n "$kontext_ausgabe" ]; then echo "$laufktx"; else echo "$RES_REF"; fi
+        return 0
+      fi
+    fi
+    if [ -n "$pid" ]; then
+      err "wb-splash-server: auf Port $PORT laeuft ein anderer/nicht antwortender Server (PID $pid, bedient '${laufref:-?}') — beende ihn zuerst."
+      cmd_stop || return 1
+    fi
+  fi
+
+  if [ ! -d "$HFCACHE/models--$(printf '%s' "$RES_LADE" | sed 's#/#--#g')" ]; then
+    err "wb-splash-server: '$RES_LADE' liegt noch nicht im Hugging-Face-Cache — der erste Start laedt Modell und Entwerfer (rund 20 GB) und dauert entsprechend."
+  fi
+
+  if ! command -v check-resources >/dev/null 2>&1; then
+    err "check-resources nicht gefunden — kein Start ohne Speicherpruefung."; return 1
+  fi
+  local free_mib
+  free_mib="$(check-resources 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["ram"]["free_mib"])' 2>/dev/null)"
+  err "freier Speicher vor dem Start: ${free_mib:-?} MiB (informativ)."
+
+  # BELEGUNG: GEMESSENER ARBEITSSATZ ALS "GEWICHTE", KEIN KV JE STROM.
+  # Splash 1.3 (gemessen 10.10.2026, 18:47-19:00, Netzbetrieb, powermode 2, allein
+  # auf der Maschine; Messgroesse wie am 20.09.: freier Speicher laut check-resources,
+  # Arbeitssatz = frei vor dem Start minus Tiefstwert):
+  #   * Anders als Splash 1.0 verdrahtet 1.3 die Gewichte beim Laden (wired
+  #     9,0 -> 27,4 GiB): geladen und untaetig 19,6 GiB.
+  #   * Vier Stroeme mit je rund 18.000 Token Eingabe: 23,4 GiB.
+  #   * Eine Anfrage mit 162.698 Token: 27,9 GiB. Der Satz waechst mit dem Cache
+  #     (rund 0,05 MiB je Token) und bleibt nach den Anfragen stehen, bis Splash ihn
+  #     nach --idle-release (Vorgabe 10 min) freigibt.
+  # Gebucht wird die gemessene Spitze, 28,0 GiB, mit --nur-gewichte. Fuer volle
+  # 262.144 Token waeren es hochgerechnet rund 33 GiB -- nicht gemessen und deshalb
+  # nicht gebucht. Die Buchung von 1.0 (14,6 GiB, laengenunabhaengig, 20.09.2026)
+  # galt fuer das alte Paketformat.
+  local nimm_out nimm_rc kennung="" BUCHUNG=()
+  while IFS= read -r zeile; do BUCHUNG+=("$zeile"); done < <(splash_buchung_args "$kontext" "$RES_ID")
+  buchen() {
+    nimm_out="$("$WBB" nimm "${BUCHUNG[@]}" \
+      --zweck "splash serve $RES_REF (gemessener Arbeitssatz)" --frist "$frist" 2>&1)"
+    nimm_rc=$?
+  }
+  buchen
+  # Cross-Stack-Raeumung, wie in wb-omlx-server: 48 GB tragen EIN grosses lokales
+  # Modell. Haelt ein MLX- oder oMLX-Server den Speicher, wird er gestoppt und
+  # EINMAL neu gebucht -- sonst scheitert der Wechsel auf Splash an einem Motor,
+  # den niemand mehr braucht.
+  if [ "$nimm_rc" -eq 1 ] && printf '%s' "$nimm_out" | grep -qiE 'wb-mlx-server|mlx|qwen38-27b|Port 808'; then
+    err "wb-splash-server: kein Platz, aber ein MLX-Server haelt den Speicher — stoppe ihn und buche neu."
+    "$HOME/.local/bin/wb-mlx-server" stop >/dev/null 2>&1
+    "$HOME/.local/bin/wb-omlx-server" stop >/dev/null 2>&1
+    sleep 2
+    buchen
+  fi
+  printf '%s\n' "$nimm_out" >&2
+  if [ "$nimm_rc" -ne 0 ]; then
+    # Die Notluke gilt nur fuer einen gemessenen Menschen (Sicherheits-Review
+    # 2026-09-21). Vorher genuegte die gesetzte Variable, um rund 14,6 GiB
+    # ungebucht zu belegen -- und die Cross-Sitzungs-Sperre ist genau die, die
+    # nach der Kernel-Panik vom 2026-08-30 eingebaut wurde, weil zwei Sitzungen
+    # gleichzeitig grosse Modelle luden. Ein Agent soll sie nicht aufheben
+    # koennen; ein Mensch am Terminal darf es weiterhin.
+    if [ "${WB_SPLASH_OHNE_BELEGUNG:-0}" = "1" ] && mensch_gemessen; then
+      err "WARNUNG: wb-belegung scheiterte (Exit $nimm_rc) — WB_SPLASH_OHNE_BELEGUNG=1 von einem gemessenen Menschen, starte ohne Cross-Sitzungs-Sperre."
+    else
+      if [ "${WB_SPLASH_OHNE_BELEGUNG:-0}" = "1" ]; then
+        err "WB_SPLASH_OHNE_BELEGUNG ignoriert — der Schalter gilt nur fuer einen gemessenen Menschen, dieser Aufruf ist keiner."
+      fi
+      err "wb-belegung lehnt ab oder scheiterte (Exit $nimm_rc) — kein Start. Ueberschreiben kann nur ein Mensch am Terminal: WB_SPLASH_OHNE_BELEGUNG=1."
+      return 1
+    fi
+  else
+    kennung="$(printf '%s\n' "$nimm_out" | sed -n 's/.*unter der Kennung \([0-9a-f]\{1,\}\).*/\1/p' | head -1)"
+  fi
+
+  # Start ueber wb-nohup (abgekoppelt, Log unter ~/.local/state/wb-nohup/logs).
+  # --no-webui: der Server ist eine Maschinenschnittstelle, keine Chatseite.
+  # Ein geerbtes SPLASH_API_KEY wuerde Splash absichern, obwohl die lokale
+  # Werkzeugkette keinen Key mitsendet; der anschliessende lokale Aufruf bekaeme
+  # dann immer 401. Deshalb nur diese geerbte Variable vor serve entfernen.
+  local NAME="splash-$(printf '%s' "$RES_REF" | tr '/' '-')"
+  local newpid
+  # Laedt Splash ein anderes Modell als den Registry-Namen, meldet der Server den
+  # Registry-Namen weiter: pi, Proxy und die Probe unten schicken ihn als "model".
+  local NAMENSARGS=()
+  if [ "$RES_LADE" != "$RES_REF" ]; then
+    NAMENSARGS=(--served-model-name "$RES_REF" --announce-served-name)
+  fi
+  newpid="$("$WBN" "$NAME" -- env -u SPLASH_API_KEY "$SPLASH" serve --model "$RES_LADE" \
+    ${NAMENSARGS[@]+"${NAMENSARGS[@]}"} --port "$PORT" --max-context "$kontext" --no-webui)" || {
+    err "wb-nohup konnte 'splash serve' nicht starten — siehe ~/.local/state/wb-nohup/logs/$NAME.log"
+    [ -n "$kennung" ] && "$WBB" gib "$kennung" --fremd >/dev/null 2>&1
+    return 1
+  }
+
+  # Auf Antwortbereitschaft warten. Frist 20 min: der ERSTE Start laedt das
+  # Paket (rund 17 GB) ueber das Netz; ein spaeterer Start laedt nur die
+  # Gewichte (gemessen: 11 s bis "Ready").
+  local i ok=0
+  for i in $(seq 1 600); do
+    if antwortet; then ok=1; break; fi
+    kill -0 "$newpid" 2>/dev/null || { err "splash serve ist beendet, bevor der Port antwortete — siehe ~/.local/state/wb-nohup/logs/$NAME.log"; break; }
+    sleep 2
+  done
+  if [ "$ok" -ne 1 ]; then
+    err "splash serve antwortet nicht auf /v1/models — Start gescheitert."
+    kill "$newpid" 2>/dev/null
+    [ -n "$kennung" ] && "$WBB" gib "$kennung" --fremd >/dev/null 2>&1
+    return 1
+  fi
+
+  # Echte Probeanfrage: Erfolg gilt erst nach einer beantworteten Anfrage.
+  local probe
+  probe="$(curl -s -m 120 "http://$HOSTB:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$RES_REF\",\"messages\":[{\"role\":\"user\",\"content\":\"Sag OK.\"}],\"max_tokens\":16,\"temperature\":0}" 2>/dev/null)"
+  if ! printf '%s' "$probe" | grep -q '"content"'; then
+    err "Probeanfrage an '$RES_REF' scheiterte — Antwort: $(printf '%s' "$probe" | head -c 200)"
+    kill "$newpid" 2>/dev/null
+    [ -n "$kennung" ] && "$WBB" gib "$kennung" --fremd >/dev/null 2>&1
+    return 1
+  fi
+
+  [ -n "$kennung" ] && "$WBB" geladen "$kennung" >/dev/null 2>&1
+  python3 - "$AKTUELL" "$LETZTER" "$RES_ID" "$RES_REF" "$newpid" "${kennung:-}" "$PORT" "$kontext" "$rolle" "$sitzung" "$pane" "$setzer_zeit" <<'PY'
+import json,sys,time
+p,last,i,ref,pid,k,port,ctx,rolle,sitzung,pane,zeit=sys.argv[1:13]
+now=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
+setzer={"rolle":rolle,"sitzung":sitzung,"pane":pane,"zeit":zeit or now}
+stand={"id":i,"ref":ref,"pid":int(pid),"kennung":k,"port":int(port),
+       "kontext":int(ctx),"started":now,"setzer":setzer}
+with open(p,"w") as f: json.dump(stand,f)
+with open(last,"w") as f: json.dump({"id":i,"kontext":int(ctx),"setzer":setzer},f)
+PY
+  # Dieselbe Angabe ein zweites Mal, an einer Stelle, die `stop` NICHT loescht.
+  # Gemessen 2026-09-21: nach einem Stopp lag aktuell.json nicht mehr vor, und
+  # der Wiederanlauf ueber den Proxy fiel von 262144 auf die Vorgabe zurueck --
+  # eine Sitzung haette nach einer Pause stillschweigend ein kleineres Fenster
+  # vorgefunden als vor der Pause.
+
+  ( idlewatch "$newpid" "$NAME" ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+
+  err "wb-splash-server: '$RES_REF' laeuft (PID $newpid, Port $PORT, Kontext $kontext), Probeanfrage ok."
+  if [ -n "$kontext_ausgabe" ]; then echo "$kontext"; else echo "$RES_REF"; fi
+  return 0
+}
+
+# Dieselbe Pane-Markierung wie in splash_panes_leben, mit Identitaet fuer die
+# Absage beim Anheben. Ohne tmux-Server gibt es nach dessen bestehender Regel
+# keine Panes.
+splash_lebende_stroeme() {
+  command -v tmux >/dev/null 2>&1 || return 0
+  local liste
+  liste="$(tmux list-panes -a -F '#{@wb_lokal_provider}|#{pane_dead}|#{@wb_schlaeft}|#{pane_id}|#{session_name}|#{@wb_role}' 2>/dev/null)" || return 0
+  printf '%s\n' "$liste" | awk -F'|' '$1=="splash-lokal" && $2=="0" && $3=="" {print "  " $6 " Pane " $4 " in " $5}'
+}
+
+# Lebt noch ein Pane, der ueber Splash arbeitet? pi-worker und wb-code
+# markieren solche Panes mit @wb_lokal_provider=splash-lokal; ein toter Pane
+# (pane_dead=1) zaehlt nicht. Ohne tmux-Server gibt es auch keine Panes -- dann
+# ist die Antwort ehrlich "nein", und die Wache raeumt wie vorgesehen auf.
+splash_panes_leben() {
+  command -v tmux >/dev/null 2>&1 || return 1
+  # Ein schlafender Pane (wb-schlaf) haelt den Server nicht: schlafen alle, darf die
+  # Leerlaufwache ihn stoppen; das Wecken faehrt ihn ueber den Modell-Proxy wieder hoch.
+  tmux list-panes -a -F '#{@wb_lokal_provider}|#{pane_dead}|#{@wb_schlaeft}' 2>/dev/null \
+    | grep -q '^splash-lokal|0|$'
+}
+
+idlewatch() {
+  local pid="$1" name="$2"
+  local log="$HOME/.local/state/wb-nohup/logs/$name.log"
+  local idle_s=$(( IDLE_MIN * 60 ))
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 60
+    kill -0 "$pid" 2>/dev/null || break
+    local last now age
+    last="$(stat -f %m "$log" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    age=$(( now - last ))
+    if [ "$age" -ge "$idle_s" ]; then
+      # LEERLAUF HEISST NICHT VERLASSEN (Befund des Nutzers 2026-09-21): "wenn die
+      # lokale Sitzung lange steht ... dann kommt ein Fehler und es passiert
+      # nichts und der Worker kann nicht loslegen". Genau das passierte hier --
+      # die Wache stoppte den Server auch dann, wenn ein Pane offen davorsass
+      # und nur gerade nichts tat; dessen naechste Anfrage lief ins Leere.
+      # Solange ein lebender Pane auf Splash zeigt, bleibt der Server stehen.
+      # Ist keiner mehr da, gilt die Wache wie bisher -- kein Prozess laeuft
+      # dauerhaft auf Vorrat.
+      if splash_panes_leben; then
+        err "wb-splash-server: $IDLE_MIN min ohne Anfrage, aber es sitzt noch ein Pane davor — bleibt stehen."
+        continue
+      fi
+      err "wb-splash-server: $IDLE_MIN min Leerlauf und kein Pane mehr davor — stoppe '$name'."
+      cmd_stop
+      break
+    fi
+  done
+}
+
+# --- stop --------------------------------------------------------------------
+cmd_stop() {
+  local pid; pid="$(laeuft_pid)"
+  local kennung=""
+  [ -f "$AKTUELL" ] && kennung="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("kennung",""))' "$AKTUELL" 2>/dev/null)"
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null
+    local i
+    for i in $(seq 1 10); do laeuft_pid | grep -q . || break; sleep 1; done
+    if laeuft_pid | grep -q .; then
+      kill -9 "$(laeuft_pid)" 2>/dev/null; sleep 1
+    fi
+    if laeuft_pid | grep -q .; then
+      err "WARNUNG: Es lauscht weiterhin etwas auf Port $PORT (PID $(laeuft_pid))."
+    else
+      err "wb-splash-server: gestoppt (Port $PORT frei)."
+    fi
+  else
+    err "wb-splash-server: es lief nichts auf Port $PORT."
+  fi
+  if [ -n "$kennung" ]; then
+    "$WBB" gib "$kennung" --fremd >/dev/null 2>&1 || \
+      err "WARNUNG: Belegung $kennung liess sich nicht freigeben — wb-belegung wer / gib $kennung --fremd."
+  fi
+  rm -f "$AKTUELL"
+  return 0
+}
+
+# --- status ------------------------------------------------------------------
+cmd_status() {
+  local pid; pid="$(laeuft_pid)"
+  if [ -n "$pid" ]; then
+    if antwortet; then
+      echo "laeuft: PID $pid, bedient '$(served_ref)', Port $PORT, /v1/models antwortet"
+    else
+      echo "laeuft: PID $pid, Port $PORT, aber /v1/models antwortet NICHT"
+    fi
+    [ -f "$AKTUELL" ] && cat "$AKTUELL" && echo
+  else
+    echo "nicht aktiv (Port $PORT frei)"
+  fi
+}
+
+# --- probe -------------------------------------------------------------------
+# Probe fuer den Updater (wb-harness-update, 10.10.2026): Splash 1.3 lud nach
+# einem automatischen `brew upgrade` das Vorgabemodell nicht mehr, und niemand
+# merkte es, bis qwen38 gebraucht wurde. Die Probe startet die INSTALLIERTE
+# Splash-Fassung mit dem Registry-Modell auf einem eigenen Port, schickt eine
+# echte Chatanfrage und beendet den Server wieder. Sie schreibt keinen Stand
+# (aktuell.json/letzter.json bleiben, wie sie sind) und beruehrt Port 8000 nicht.
+#   wb-splash-server probe [--darf] [<alias|id>]
+# Exit 0 bestanden (mit --darf: eine Probe ist jetzt moeglich), 75 jetzt nicht
+# pruefbar, sonst gescheitert.
+# WANN NICHT (Nachtrag 2, WorkbenchOrchestrator 10.10.2026): die Probe laedt ein
+# 27B-Modell und laeuft auch im automatischen Lauf beim App-Start. Sie laeuft nur,
+# wenn mac-gpu UND mac-ruhe auf der Tafel frei sind und kein fremdes grosses Modell
+# im Speicher liegt -- gemessen (Prozesse, Ollama-Ladungen) und gebucht
+# (wb-belegung). Sonst 75: der Updater merkt vor und aktualisiert nicht.
+PROBE_PORT="${WB_SPLASH_PROBE_PORT:-8009}"
+# Ab dieser Groesse zaehlt eine Ollama-Ladung als grosses Modell. Kleine Dauerlader
+# (embeddinggemma fuer brain warm, 0,6 GiB) blockieren die Probe nicht.
+PROBE_GROSS_MIB="${WB_SPLASH_PROBE_GROSS_MIB:-4096}"
+# Was gegen eine Probe jetzt spricht, eine Zeile je Grund; leer = nichts.
+probe_hindernis() {
+  local TAFEL="$HOME/.local/bin/wb-tafel" platz
+  if [ -x "$TAFEL" ]; then
+    for platz in mac-gpu mac-ruhe; do
+      "$TAFEL" frei "$platz" >/dev/null 2>&1 || echo "Tafel: $platz belegt"
+    done
+  fi
+  # Laufende Modellserver ausser Ollamas eigenen Laeufern (die zaehlen unten nach Groesse).
+  ps -axo command= 2>/dev/null \
+    | grep -E '/Cellar/splash/|mlx_vlm\.server|mlx_lm\.server|omlx serve|vllm serve|llama-server' \
+    | grep -v -e '/Cellar/ollama/' -e 'grep -E' \
+    | awk '{print "Prozess: " substr($0, 1, 100)}' | head -3
+  check-resources 2>/dev/null | /usr/bin/python3 -c '
+import json, sys
+grenze = int(sys.argv[1])
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for m in d.get("ollama_loaded") or []:
+    if int(m.get("size_mib") or 0) >= grenze:
+        print("Ollama: %s (%s MiB) geladen" % (m.get("name"), m.get("size_mib")))
+' "$PROBE_GROSS_MIB"
+  "$WBB" wer 2>/dev/null | sed -n 's/^Offene Belegungen: \([1-9][0-9]*\).*/Belegungsbuch: \1 offen/p'
+}
+cmd_probe() {
+  local darf="" eingabe=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --darf) darf=1; shift ;;
+      *) [ -z "$eingabe" ] && eingabe="$1"; shift ;;
+    esac
+  done
+  resolve "${eingabe:-qwen38}" || return 1
+  [ -x "$SPLASH" ] || { err "splash nicht gefunden ($SPLASH)."; return 1; }
+  if lsof -nP -iTCP:"$PROBE_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
+    err "wb-splash-server probe: Port $PROBE_PORT ist belegt."; return 75
+  fi
+  local hindernis
+  hindernis="$(probe_hindernis)"
+  if [ -n "$hindernis" ]; then
+    err "wb-splash-server probe: jetzt keine Probe — $(printf '%s' "$hindernis" | tr '\n' ';' | sed 's/;$//')"
+    return 75
+  fi
+  local TAFEL="$HOME/.local/bin/wb-tafel"
+  if [ -n "$darf" ]; then
+    local BUCHUNG=()
+    while IFS= read -r zeile; do BUCHUNG+=("$zeile"); done < <(splash_buchung_args 8192 "$RES_ID")
+    "$WBB" darf "${BUCHUNG[@]}" >/dev/null 2>&1 || { err "wb-splash-server probe: wb-belegung lehnt ab."; return 75; }
+    return 0
+  fi
+  local tafel_id=""
+  if [ -x "$TAFEL" ]; then
+    tafel_id="$("$TAFEL" nimm mac-gpu --frist 30m --zweck "wb-splash-server probe: Splash-Update pruefen ($RES_LADE)" 2>&1 \
+      | sed -n 's/^EINGETRAGEN: \([0-9a-z]\{1,\}\) auf.*/\1/p' | head -1)"
+    [ -n "$tafel_id" ] || { err "wb-splash-server probe: mac-gpu nicht frei."; return 75; }
+  fi
+  local nimm_out kennung="" BUCHUNG=()
+  while IFS= read -r zeile; do BUCHUNG+=("$zeile"); done < <(splash_buchung_args 8192 "$RES_ID")
+  nimm_out="$("$WBB" nimm "${BUCHUNG[@]}" --zweck "wb-splash-server probe $RES_LADE" --frist 30 2>&1)" || {
+    err "wb-splash-server probe: wb-belegung lehnt ab."
+    [ -n "$tafel_id" ] && "$TAFEL" gib "$tafel_id" >/dev/null 2>&1
+    return 75
+  }
+  kennung="$(printf '%s\n' "$nimm_out" | sed -n 's/.*unter der Kennung \([0-9a-f]\{1,\}\).*/\1/p' | head -1)"
+  local log="$STATEDIR/probe.log" NAMENSARGS=() pid rc=1 i probe=""
+  [ "$RES_LADE" != "$RES_REF" ] && NAMENSARGS=(--served-model-name "$RES_REF" --announce-served-name)
+  env -u SPLASH_API_KEY "$SPLASH" serve --model "$RES_LADE" ${NAMENSARGS[@]+"${NAMENSARGS[@]}"} \
+    --port "$PROBE_PORT" --max-context 8192 --no-webui >"$log" 2>&1 &
+  pid=$!
+  for i in $(seq 1 600); do
+    curl -s -m 4 "http://$HOSTB:$PROBE_PORT/v1/models" >/dev/null 2>&1 && { rc=0; break; }
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 2
+  done
+  if [ "$rc" -eq 0 ]; then
+    probe="$(curl -s -m 120 "http://$HOSTB:$PROBE_PORT/v1/chat/completions" -H 'Content-Type: application/json' \
+      -d "{\"model\":\"$RES_REF\",\"messages\":[{\"role\":\"user\",\"content\":\"Sag OK.\"}],\"max_tokens\":16,\"temperature\":0}" 2>/dev/null)"
+    printf '%s' "$probe" | grep -q '"content"' || rc=1
+  fi
+  kill "$pid" 2>/dev/null
+  for i in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  kill -9 "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  [ -n "$kennung" ] && "$WBB" gib "$kennung" --fremd >/dev/null 2>&1
+  [ -n "$tafel_id" ] && "$TAFEL" gib "$tafel_id" >/dev/null 2>&1
+  if [ "$rc" -eq 0 ]; then
+    err "wb-splash-server probe: '$RES_LADE' auf $("$SPLASH" --version 2>/dev/null) bestanden."
+    return 0
+  fi
+  err "wb-splash-server probe: '$RES_LADE' gescheitert — $(grep -v '^[[:space:]]*$' "$log" 2>/dev/null | tail -3 | tr '\n' ' ' | head -c 400)${probe:+ Antwort: $(printf '%s' "$probe" | head -c 200)}"
+  return 1
+}
+
+# Testhaken (2026-09-21): mit gesetztem WB_SPLASH_NUR_LADEN wird diese Datei nur
+# gelesen, nicht ausgefuehrt -- so kann eine Suite einzelne Funktionen pruefen
+# (etwa splash_panes_leben), ohne einen Server zu starten oder zwanzig Minuten
+# Leerlauf abzuwarten. Der Haken gibt keine Rechte; er unterdrueckt nur die
+# Befehlsauswertung.
+if [ -n "${WB_SPLASH_NUR_LADEN:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+case "${1:-}" in
+  ensure) shift; cmd_ensure "$@" ;;
+  pi-agent-kontext) shift; cmd_pi_agent_kontext "$@" ;;
+  probe)  shift; cmd_probe "$@" ;;
+  stop)   cmd_stop ;;
+  status) cmd_status ;;
+  arbeitssatz) printf '%s\n' "$SPLASH_ARBEITSSATZ_GIB" ;;
+  buchung) printf '{"nachKontext": %s, "arbeitssatzGib": %s, "grundsatzGib": %s, "kvSchluessel": "%s"}\n' \
+             "$([ "$SPLASH_BUCHUNG_NACH_KONTEXT" = 1 ] && echo true || echo false)" \
+             "$SPLASH_ARBEITSSATZ_GIB" "$SPLASH_GRUNDSATZ_GIB" "$SPLASH_KV_SCHLUESSEL" ;;
+  *) err "Usage: wb-splash-server {ensure <alias|id> [--frist <min>] [--kontext <token>] [--kontext-ausgabe]|pi-agent-kontext <quelle> <ziel> <provider> <modell> <token>|probe [--darf] [<alias|id>]|stop|status|arbeitssatz|buchung}"; exit 2 ;;
+esac

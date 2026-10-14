@@ -1,14 +1,111 @@
 #!/usr/bin/env python3
-"""wb-inbox — einen Auftrag in die Socket-Inbox einer Claude-Code-Sitzung legen,
-statt ihn in ihren Pane zu tippen.
+"""wb-inbox — einen Auftrag an eine laufende Agenten-Sitzung JEDES Harness zustellen,
+ohne ihn in ihren Pane zu tippen.
 
-  wb-inbox [-L <socket>] [--pid <n>] finde <pane-id>       Sitzung zu diesem Pane
+  wb-inbox [-L <socket>] [--pid <n>] finde <pane-id>       Empfaenger zu diesem Pane
   wb-inbox [-L <socket>] [--pid <n>] [--absender <klasse>] sende <pane-id> <datei>
-                                                             Text zustellen
+           [--tafel-halter <sessionId>:<klasse>]             Text zustellen
+  wb-inbox [-L <socket>] [--absender <klasse>] herkunft <pane-id>
+                                                             gemessene Herkunft einer Sendung
+                                                             an diesen Pane (sendet nichts):
+                                                             auftrag|information TAB Klasse
+                                                             TAB Absender-Pane TAB Starter-Pane
+  wb-inbox [-L <socket>] absender-pane                       Pane, unter dem der Aufruf laeuft
+                                                             (gemessen; Exit 1 ohne Pane)
   wb-inbox [-L <socket>] [--pid <n>] status <pane-id>        Zustand laut Register
   wb-inbox [-L <socket>] [--pid <n>] transcript <pane-id>    Pfad der Gespraechsdatei
+  wb-inbox [-L <socket>] codex-queue <pane-id> [--start]     gereihte codex-Nachrichten
+                                                             zaehlen / Queue anstossen
+  wb-inbox [-L <socket>] dialog <pane-id>                    wartet codex auf einen Trust-Dialog?
+                                                             (Exit 0 + Name, sonst Exit 1; liest nur)
+  wb-inbox einrichten <harness> [--home <dir>]               Adapter des Harness installieren
+  wb-inbox wege [--json]                                     Weg je Harness laut Registry
   wb-inbox pause an|aus|status [--base <dir>] [--vorrat <dir>] [--grund <text>] [--json]
                                                              Pausenschalter fuer Agent-Verkehr
+
+EIN WEG FUER JEDEN HARNESS (29.09.2026, Vorgaben des Nutzers woertlich: "ich will nicht
+das bei der freigabe automatisch in den pane getippt wird, das kann nachrichten von mir
+abschneiden oder ungewollt mitsenden" und "der message weg muss für alle harrnesse
+funktionieren"). Bis dahin kannte dieses Werkzeug nur Claude Code. Jetzt waehlt `sende`
+den Weg nach dem, was unter dem Pane WIRKLICH laeuft, in dieser Reihenfolge:
+
+  claude-socket  Claude Code: Unix-Socket der Sitzung (unten, "WAS AM 2026-08-20 ...").
+  datei          Jeder Harness, dessen Prozess sich in der Datei-Inbox angemeldet hat
+                 (Abschnitt DATEI-INBOX). Heute: pi (Erweiterung) und opencode (Plugin).
+                 Ein neuer Harness kommt ohne Codeaenderung dazu: er braucht nur einen
+                 Adapter, der dasselbe Protokoll spricht.
+  codex-queue    codex: `codex queue --thread <id> --message <text>` an den Thread der
+                 TUI im Pane (Abschnitt CODEX).
+
+Welcher Harness welchen Weg hat, steht in der Registry (`inbox`-Block je Harness in
+~/.claude/workbench/models.json, Vorlage shell/models.default.json):
+  weg         'claude-socket' | 'datei' | 'codex-queue' | ''   — leer heisst: kein Weg.
+  grund       Klartext, warum es keinen Weg gibt. Pflicht bei weg ''.
+  prozess     nur codex-queue: regulaerer Ausdruck auf die Befehlszeile des Prozesses.
+  einrichten  nur datei: {quelle, ziel} — Adapterdatei unter shell/inbox/ und der Ort,
+              an dem der Harness sie laedt. `wb-inbox einrichten <harness>` kopiert sie.
+  probe       {datum, beleg}: wann und woran gemessen.
+Fehlt der Block in der Registry, gelten die eingebauten Vorgaben (EINGEBAUT unten) —
+dieselben Werte, die die Vorlage traegt; test-inbox-registry.sh haelt beide gleich.
+
+ES WIRD NIE ERSATZWEISE GETIPPT. Findet `sende` keinen Weg, endet es mit Exit 5 und
+nennt den Grund (Harness ohne Weg, Adapter nicht geladen, codex ohne Thread). Exit 1
+heisst: gar kein Empfaenger unter dem Pane oder ein Transportfehler. Die uebrigen
+Exit-Codes bleiben: 2 Aufruf, 4 zurueckgehalten (Pausenschalter).
+
+DATEI-INBOX (Protokoll, Version 1). <inbox> ist $WB_INBOX_DIR, sonst
+~/.claude/workbench/inbox. Ein Adapter IM Prozess des Harness
+  * legt <inbox>/<pid>.json an (0600, atomar per rename): {version, pid, harness, pane,
+    tmux, cwd, status: idle|busy, seit, transcript?} und haelt `status` aktuell;
+  * holt jede Datei <inbox>/<pid>/neu/*.json ({version, id, text, absender, zeit}) in
+    Namensreihenfolge ab, verschiebt sie nach <inbox>/<pid>/zugestellt/ und gibt den Text
+    ueber die API des Harness als Nutzer-Nachricht in die Sitzung: sofort, wenn sie
+    untaetig ist (das weckt sie), sonst an der naechsten Zuggrenze;
+  * raeumt beim Beenden <pid>.json und <pid>/ ab.
+`sende` akzeptiert eine Anmeldung nur, wenn der Prozess lebt UND unter dem Pane haengt
+(dieselbe Ahnenreihen-Pruefung wie bei Claude, auf dem richtigen tmux-Server, mit
+--pid-Riegel). Anmeldungen toter Prozesse raeumt es weg. Die Nachricht wird unter
+einem Punkt-Namen geschrieben und erst fertig umbenannt, ein Adapter liest also nie
+eine halbe Datei. `sende` wartet danach bis zu WB_INBOX_ABHOLFRIST Sekunden (Vorgabe 3)
+und sagt, ob der Adapter sie schon abgeholt hat. Abgeholt heisst: der Adapter hat sie;
+er gibt sie sofort oder an der naechsten Zuggrenze an die Sitzung. Beantwortet heisst
+es nie.
+
+GEMESSEN 29.09.2026 an den echten Harnesses (eigenes HOME, tmux -L inboxprobe, pi und
+opencode an einem OpenAI-kompatiblen Stub, codex an gpt-5.6-luna low), jeweils ueber
+`wb-inbox sende` selbst: pi 0.87.1 und opencode 1.18.32 untaetig sofort beantwortet,
+waehrend eines 8-s-Zuges die Folgenachricht genau an der Zuggrenze; codex 0.157.1 nach
+einem Startauftrag als Argument ueber `codex queue` beantwortet. In allen drei Panes
+stand halb getippter Text danach unveraendert in der Eingabezeile.
+
+CODEX (gemessen 29.09.2026, codex-cli 0.157.1, eigenes CODEX_HOME, tmux -L inboxprobe,
+gpt-5.6-luna low). Die TUI laeuft seit 0.157 an einem app-server-Daemon unter
+$CODEX_HOME; `codex queue --thread <uuid> --message <text>` legt dort eine Nachricht ab.
+Untaetige Sitzung: der Zug startet sofort. Laufender Zug (`sleep 8`): die Nachricht
+kommt danach, zwei Nachrichten in Reihenfolge. Ein halb getipptes "HALBGETIPPT von
+Mensch" stand danach unveraendert in der Eingabezeile. Den Thread findet `sende` ohne
+Hook: CODEX_HOME und HOME aus der Umgebung des codex-Prozesses unter dem Pane
+(`ps eww`), sein Arbeitsverzeichnis (`lsof -d cwd`), dann in $CODEX_HOME/state_*.sqlite
+die Threads mit diesem cwd und originator codex-tui ohne Elternthread, bevorzugt einer,
+der seit dem Prozessstart benutzt wurde, sonst der juengste (so waehlt `resume --last`).
+Grenzen, jede mit Exit 5: vor dem ersten Zug gibt es keinen Thread; eine TUI mit
+--no-daemon haengt an keinem Daemon; sind seit dem Start zwei Threads im selben
+Verzeichnis benutzt worden, ist das Ziel mehrdeutig und es wird nichts gesendet.
+Eine TUI mit --remote <adresse> bekommt dieselbe Adresse an `codex queue` mit.
+
+GEREIHT IST NICHT AUFGENOMMEN (gemessen 09.10.2026, codex-cli 0.157.1, eigenes CODEX_HOME,
+Responses-Stub). Nach Escape in einem laufenden Zug pausiert Codex die Queue des
+Threads; jede gereihte Nachricht bleibt danach liegen, auch spaetere. `sende` meldet
+deshalb erst Erfolg, wenn der Queue-Eintrag weg ist UND der Text als Nutzer-Nachricht
+im Rollout steht (Frist WB_CODEX_AUFNAHMEFRIST, Vorgabe 25 s: eine TUI ohne Daemon
+holt im Leerlauf nur alle ~10 s ab, gemessen). Steht die Queue, stoesst
+es sie ueber den app-server an (`thread/queue/start`, WebSocket auf
+$CODEX_HOME/app-server-control/app-server-control.sock) -- getippt wird nie. Laeuft ein
+Zug: Exit 6, gereiht, Aufnahme an der Zuggrenze. Sonst Exit 1 "NICHT aufgenommen".
+`codex-queue <pane> [--start]` zaehlt liegengebliebene Nachrichten und stoesst an.
+Ohne app-server und nach turn_aborted: Exit 7, der eigene Eintrag ist aus der Queue
+genommen, stdout "codex-neustart<TAB><thread><TAB><pid>" -- pi-worker startet den Worker
+dann per Thread-ID neu und gibt den Auftrag als Erstauftrag mit.
 
 PAUSENSCHALTER FUER AGENT-VERKEHR (Bau-Schritt 3 des Agents-Features,
 docs/AGENTS-PLAN.md, Abschnitt 4 „Kommunikation zwischen Agenten", Anhang
@@ -21,8 +118,8 @@ zeigt den Stand. `<vorrat>` folgt derselben Regel wie bei `wb-traeger`:
 
 Bei gesetztem Schalter lehnt `sende` eine Nachricht der Agent-Klassen
 `hauptagent` und `companion-agent` ab; `traeger` und `mensch` gehen durch.
-Die Klasse leitet `sende` aus messbarer Herkunft ab, und nur bei gesetztem
-Schalter, weil sie sonst nichts entscheidet: `traeger`, wenn die PID aus
+Die Klasse leitet `sende` aus messbarer Herkunft ab (seit 10.10.2026 bei jeder
+Sendung, weil sie auch die Herkunftszeile traegt, Abschnitt HERKUNFT): `traeger`, wenn die PID aus
 `<vorrat>/.traeger.pid` in der Elternkette des Aufrufers steht und dieser
 Prozess wie `wb-traeger` aussieht; sonst `mensch`, wenn `wb-mensch pruefen`
 es bestätigt; sonst `hauptagent`. `--absender hauptagent|companion-agent|
@@ -86,10 +183,92 @@ Arbeitsverzeichnis, Modell haiku-4.5, drei Laeufe):
     Nachricht trotzdem angehalten, mit der Begruendung "from an unidentified
     session -- The sender did not attest its permission mode, and this session
     bypasses permission prompts". Der auth-Token weist den Absender aus, bezeugt
-    aber keine Berechtigungsstufe. Solange kein Feld dafuer bekannt ist, ist
-    dieser Zustand fuer den Absender nicht von aussen zu erkennen -- und genau
-    deshalb behandelt `pi-worker` einen fehlenden Beleg, den keine Quelle liefern
-    KANN, als "unentschieden" statt als Fehlschlag.
+    aber keine Berechtigungsstufe. Das Feld dafuer ist seit 10.10.2026 bekannt
+    und gemessen (Abschnitt RECHTEMODUS); ohne belegten Modus bleibt es beim
+    Anhalten, und dafuer behandelt `pi-worker` einen fehlenden Beleg weiter als
+    "unentschieden" statt als Fehlschlag.
+
+RECHTEMODUS (gemessen 10.10.2026, Claude Code 2.1.296, eigener tmux -L
+wbtest-rechtemodus-<pid>, Empfaenger mit --dangerously-skip-permissions, ohne
+crossSessionInbound, Zustellung ueber dieses Werkzeug). Claude liest die Klasse
+des Absenders aus einem Umschlag um den Nachrichtentext:
+    <cross-session-message from-mode="bypass">\\n<text>\\n</cross-session-message>
+Die Entscheidung des Empfaengers: traegt die Nachricht einen Modus, wird sie
+zugestellt, wenn er seiner eigenen Klasse gleicht, sonst angehalten
+("mode-mismatch"); ohne Modus haelt eine bypass-Sitzung an ("no-mode-asserted").
+Klassen: "bypass" (bypassPermissions) und "prompting" (alles andere). Gemessen:
+ohne Umschlag angehalten; from-mode="bypass" zugestellt und beantwortet;
+"prompting" angehalten (mode-mismatch); angehalten auch bei unbekanntem Wert
+("bypassPermissions"), anderer Attributreihenfolge, Text nach dem Umschlag und
+einem schliessenden Umschlag-Tag im Text (Claude baut den Umschlag nach und
+verlangt Gleichheit). Ein Gruppen-Text mit Kopfzeile, Umlauten, "<datei>" und
+Schlusszeilenumbruch ging durch. Der Modus ist laut Claude eine Angabe des
+Absenders ("a label, not an identity proof") -- deshalb bezeugt `sende` ihn nur,
+wenn er fuer die WIRKLICH sendende Sitzung belegt ist, und dann wahrheitsgemaess:
+  * Absender ist die naechste Ahnin dieses Aufrufs mit Registereintrag
+    ~/.claude/sessions/<pid>.json, deren pid und procStart zu genau diesem
+    Prozess passen (procStart = `LC_ALL=C TZ=UTC ps -o lstart=`, gemessen);
+  * ihr Transcript ~/.claude/projects/<cwd kodiert>/<sessionId>.jsonl, darin das
+    Feld permissionMode der letzten user-Zeile, die es traegt (Antworten auf
+    Werkzeugaufrufe tragen es nicht, gemessen);
+  * bypassPermissions -> bypass; default, acceptEdits, auto, dontAsk -> prompting;
+    plan (bei Claude je nach Startart beides) und jeder unbekannte Wert -> nichts.
+Ohne belegten Claude-Absender (Shell eines Menschen, anderer Harness, kein
+Transcript, Wert unbekannt) geht der Text ohne Umschlag -- wie bisher, notfalls
+angehalten. Es gibt keine Vorgabe "bypass" und keine Option oder Variable, mit der
+ein Aufrufer einen Modus behaupten kann. Nur der Claude-Socket-Weg bekommt den
+Umschlag. wb-gruppe stellt ueber dieses Werkzeug zu und erbt die Bezeugung.
+
+TAFEL-MELDUNGEN OHNE HELD-DIALOG (11.10.2026, Auftrag tafel-meldung-ohne-dialog). Gemessen am
+10./11.10.: Stoerungsmeldungen des Tafel-Waechters (wb-nohup, kein Claude-Ahne) an einen
+Orchestrator in bypass hielt Claude Code jede an ("from an unidentified session"), sekundengleich
+mit `zugestellt stoerung` im Tafel-Verlauf. Fuer Sendungen mit wb-tafel als gemessenem Ahnen
+(die Datei neben diesem Werkzeug oder ~/.local/bin/wb-tafel, AUSGEFUEHRT, nicht als Wort im
+Befehlstext; dieselbe Pruefung wie in wb-gruppe) gilt deshalb auf dem Claude-Socket-Weg:
+  * Gemessen wird auch der Modus des EMPFAENGERS (sein Transcript, wie beim Absender).
+  * Ein Claude-Absender bezeugt seine Klasse nur, wenn sie der des Empfaengers gleicht.
+  * Ohne Claude-Absender bezeugt `--tafel-halter <sessionId>:<klasse>` die Klasse nur, wenn der
+    Empfaenger genau diese Sitzung ist UND sein gemessener Modus dieselbe Klasse hat. wb-tafel
+    nennt dort den Modus, den es beim `nimm`/`anstellen` an der nehmenden Sitzung gemessen hat:
+    eine Meldung an sich selbst. Ohne wb-tafel als Ahnen wirkt die Option nicht.
+  * Sonst haelte Claude die Nachricht an (bei bypass gemessen; fuer jeden anderen Modus gilt
+    dasselbe, weil ohne Bezeugung nichts belegt ist). Dann legt `sende` sie in die Claude-Datei-Inbox
+    <inbox>/claude/<sessionId>/neu/<id>.json (0600, atomar; Felder wie bei der Datei-Inbox,
+    absender "tafel"), die der Hook hooks/inbox-einspielen.sh beim naechsten Werkzeugaufruf
+    oder Prompt als Kontext einspielt und nach zugestellt/ verschiebt. Den Weg nimmt `sende`
+    nur, wenn der Hook in genau diesem Prozess der Sitzung schon lief (er schreibt bei jedem
+    Lauf <inbox>/claude/<sessionId>/hook; juenger als der Prozessstart). Ohne belegten Hook
+    wird NICHT zugestellt: Exit 5, nichts gesendet (Nachtrag 1, der Nutzer 11.10.: "es soll niemand
+    den Pane versperren"); wb-tafel vermerkt es im Verlauf, die Gruppe tafel hat die Meldung.
+Nie bezeugt eine Tafel-Meldung mehr als den gemessenen Modus des Empfaengers; es gibt keine
+Variable dafuer. Andere Absender aendert das nicht. Ausgabe beginnt mit `weg=claude-socket` bzw.
+`weg=claude-datei`. pi und opencode (Datei-Inbox) und codex (`codex queue`) kennen keinen solchen
+Dialog (gemessen 29.09., Abschnitt GEMESSEN): dort aendert sich nichts.
+
+HERKUNFT (10.10.2026, Kanal-Bestandsaufnahme Massnahme 3, Option B). Bis dahin stand die
+Herkunft einer Zustellung nur im Text: pi-worker schrieb "keine fremde Anfrage: derselbe
+Absender, der diesen Worker gestartet hat" davor, und genau diesen Satz konnte jeder Agent
+mitschicken, waehrend der Empfaenger mit uebersprungenen Rueckfragen laeuft. Seitdem setzt
+`sende` ueber JEDEN Text, auf jedem Weg (Claude-Socket, Datei-Inbox, codex-queue), eine
+gemessene Kopfzeile:
+    [Herkunft laut wb-inbox, gemessen: AUFTRAG. Absender: Hauptagent in Pane %N, ...]
+    [Herkunft laut wb-inbox, gemessen: INFORMATION, kein Auftrag. Absender: ... ]
+AUFTRAG nur, wenn beides gemessen zutrifft:
+  * die Absender-Klasse ist `hauptagent` (dieselbe Klasse wie beim Pausenschalter: kein
+    Traeger, kein Mensch laut `wb-mensch pruefen`, nicht per --absender herabgesetzt);
+  * der Absender-Pane -- der naechste Ahne dieses Aufrufs, der die pane_pid eines Panes
+    auf dem tmux-Server des Empfaengers ist (dieselbe Ahnenkette wie fuer Traeger und
+    Rechtemodus, `aufrufer_ahnen`) -- ist der Pane, den pi-worker beim Start des
+    Empfaengers in dessen Pane-Option @wb_spawner eingetragen hat.
+Alles andere ist INFORMATION, auch ein Mensch, ein Traeger, ein Agent eines anderen Panes
+oder ein Prozess ausserhalb jedes Panes. Keine Variable und keine Option hebt die Klasse an;
+TMUX_PANE zaehlt nicht. Enthaelt der Text selbst eine solche Zeile, sagt eine zweite Zeile,
+dass nur die oberste gemessen ist. Die Datei-Inbox traegt zusaetzlich das Feld
+"herkunft": "auftrag" | "information". Ein Kopf von wb-gruppe bleibt unveraendert unter
+dieser Zeile. `herkunft <pane>` zeigt das Ergebnis, ohne zu senden.
+GRENZE (wie bei wb-mensch): Code unter derselben Benutzerkennung kann die Pane-Option
+@wb_spawner umschreiben oder sich als Kind eines fremden Panes starten. Die Zeile schuetzt
+gegen behauptete Herkunft im Text, nicht gegen Code, der seine Herkunft verwischt.
 
 WAS DIESES WERKZEUG NICHT TUT: Es BEWEIST die Zustellung nicht. Der Socket
 antwortet nicht, und "geschrieben" heisst nie "gelesen". Der Beleg bleibt, wo er
@@ -103,11 +282,37 @@ import datetime
 import glob
 import json
 import os
+import re
+import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
+import time
 
 SESSIONS = os.path.expanduser("~/.claude/sessions")
+
+# Die gemeinsame Datei-Inbox (Abschnitt DATEI-INBOX im Kopf).
+INBOX_DIR = os.environ.get("WB_INBOX_DIR", "") or os.path.expanduser("~/.claude/workbench/inbox")
+
+# Kein Weg ohne Eingabezeile: eindeutig, damit ein Aufrufer ihn von "kein Empfaenger"
+# (1) und "zurueckgehalten" (4) unterscheiden kann.
+EXIT_KEIN_WEG = 5
+
+HIER = os.path.dirname(os.path.realpath(__file__))
+
+# Eingebaute Vorgaben je Harness, falls die Registry keinen `inbox`-Block traegt (etwa
+# eine installierte models.json von vor dem 29.09.2026). Dieselben Werte stehen in
+# shell/models.default.json; test-inbox-registry.sh prueft, dass beide gleich sind.
+EINGEBAUT = {
+    "claude": {"weg": "claude-socket"},
+    "pi": {"weg": "datei",
+           "einrichten": {"quelle": "pi-wb-inbox.ts", "ziel": "~/.pi/agent/extensions/wb-inbox.ts"}},
+    "opencode": {"weg": "datei",
+                 "einrichten": {"quelle": "opencode-wb-inbox.ts",
+                                "ziel": "~/.config/opencode/plugin/wb-inbox.ts"}},
+    "codex": {"weg": "codex-queue", "prozess": r"(^|/)codex( |$)"},
+}
 
 # Der tmux-Server, auf dem eine Pane-Kennung ueberhaupt etwas bedeutet. Leer =
 # der umgebende, also das bisherige Verhalten.
@@ -137,6 +342,29 @@ def _prozess(pid):
     return int(teile[0]), (teile[1] if len(teile) > 1 else "")
 
 
+_AHNEN = None
+
+
+def aufrufer_ahnen(tiefe=64):
+    """[(pid, befehlszeile)] der Ahnen dieses Aufrufs, vom Elternprozess aufwaerts bis vor
+    PID 1 oder bis ps einen Ahnen nicht mehr kennt. Einmal gemessen und dann wiederverwendet:
+    die eine Absender-Ermittlung fuer Traeger, sendende Claude-Sitzung (Rechtemodus) und
+    Absender-Pane (Herkunft) -- keine zweite."""
+    global _AHNEN
+    if _AHNEN is None:
+        kette, pid = [], os.getppid()
+        for _ in range(tiefe):
+            if pid <= 1:
+                break
+            info = _prozess(pid)
+            if info is None:
+                break
+            kette.append((pid, info[1]))
+            pid = info[0]
+        _AHNEN = kette
+    return _AHNEN
+
+
 def aus_traeger(vorrat):
     """Kommt dieser Aufruf vom laufenden Träger dieses Vorrats? Seine PID aus
     `.traeger.pid` muss in der Elternkette stehen, und der Prozess muss nach
@@ -147,24 +375,21 @@ def aus_traeger(vorrat):
             traeger_pid = int(f.read().strip())
     except (OSError, ValueError):
         return False
-    pid = os.getppid()
-    for _ in range(64):
-        if pid <= 1:
-            return False
-        info = _prozess(pid)
-        if info is None:
-            return False
+    for pid, befehl in aufrufer_ahnen():
         if pid == traeger_pid:
-            return "wb-traeger" in info[1]
-        pid = info[0]
+            return "wb-traeger" in befehl
     return False
 
 
 def ist_mensch():
     """`wb-mensch pruefen` entscheidet; fehlt es oder scheitert es, ist es kein Mensch."""
     try:
-        r = subprocess.run(["wb-mensch", "pruefen"], stdin=subprocess.DEVNULL,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        pfad = os.path.join(os.environ.get("HOME", ""), ".local", "bin", "wb-mensch")
+        r = subprocess.run([pfad, "pruefen"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                           env={"HOME": os.environ.get("HOME", ""),
+                                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                                "TMPDIR": "/tmp"})
     except (OSError, subprocess.SubprocessError):
         return False
     return r.returncode == 0
@@ -265,17 +490,352 @@ def peer_token(pid):
     return None
 
 
+# ── Rechtemodus des Absenders (10.10.2026, Abschnitt RECHTEMODUS im Kopf) ──────────
+
+# Claudes Rechtemodi und ihre Klasse, wie Claude Code 2.1.296 sie bildet: nur
+# bypassPermissions ist "bypass". plan zaehlt dort ebenfalls als bypass, wenn die Sitzung
+# mit uebersprungenen Rueckfragen gestartet wurde -- das steht nicht im Transcript, also
+# bezeugt plan nichts. Ein unbekannter Wert bezeugt ebenfalls nichts.
+MODUS_KLASSE = {
+    "bypassPermissions": "bypass",
+    "default": "prompting",
+    "acceptEdits": "prompting",
+    "auto": "prompting",
+    "dontAsk": "prompting",
+}
+UMSCHLAG = "cross-session-message"
+# So weit liest rechtemodus() hoechstens vom Ende des Transcripts zurueck.
+MODUS_LESEGRENZE = 16 * 1024 * 1024
+
+
+def _prozessstart_utc(pid):
+    """Startzeit eines Prozesses in der Form, die Claude als procStart einträgt
+    (gemessen 10.10.2026: `LC_ALL=C TZ=UTC ps -o lstart=`), oder ''."""
+    umg = dict(os.environ, LC_ALL="C", TZ="UTC")
+    try:
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], env=umg,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return " ".join(r.stdout.split()) if r.returncode == 0 else ""
+
+
+def absender_sitzung(tiefe=40):
+    """Der Registereintrag der Claude-Sitzung, aus der dieser Aufruf stammt, oder None.
+
+    Die naechste Ahnin mit einem Eintrag ~/.claude/sessions/<pid>.json gilt. Ihr Eintrag
+    muss zu genau diesem Prozess gehoeren (pid und procStart gleich); sonst None, auch
+    wenn weiter oben noch eine Sitzung laeuft -- die naechste ist die sendende."""
+    for q, _befehl in aufrufer_ahnen()[:tiefe]:
+        pfad = os.path.join(SESSIONS, "%d.json" % q)
+        if os.path.isfile(pfad):
+            try:
+                d = json.load(open(pfad))
+            except Exception:
+                return None
+            if not isinstance(d, dict) or d.get("pid") != q:
+                return None
+            start = d.get("procStart")
+            if not isinstance(start, str) or " ".join(start.split()) != _prozessstart_utc(q):
+                return None
+            return d
+    return None
+
+
+def _letzter_modus(pfad):
+    """permissionMode der letzten user-Zeile, die das Feld traegt (Antworten auf
+    Werkzeugaufrufe tragen es nicht, gemessen), oder der letzten Zeile vom Typ
+    permission-mode, rueckwaerts gelesen; sonst None. Claude Code 2.1.296 schreibt
+    permission-mode-Zeilen beim Start und bei jedem Wechsel (gemessen 11.10.2026 an einer
+    echten Testsitzung: der erste Werkzeugaufruf einer frischen Sitzung fand noch keine
+    user-Zeile mit dem Feld)."""
+    try:
+        f = open(pfad, "rb")
+    except OSError:
+        return None
+    with f:
+        f.seek(0, os.SEEK_END)
+        ende = f.tell()
+        rest = b""
+        gelesen = 0
+        while ende > 0 and gelesen < MODUS_LESEGRENZE:
+            n = min(65536, ende)
+            ende -= n
+            f.seek(ende)
+            block = f.read(n) + rest
+            gelesen += n
+            zeilen = block.split(b"\n")
+            rest = zeilen.pop(0) if ende > 0 else b""
+            for z in reversed(zeilen):
+                if b'"permissionMode"' not in z:
+                    continue
+                try:
+                    d = json.loads(z)
+                except Exception:
+                    continue
+                if isinstance(d, dict) and d.get("type") in ("user", "permission-mode") \
+                        and "permissionMode" in d:
+                    return d["permissionMode"]
+    return None
+
+
+def rechtemodus():
+    """'bypass' | 'prompting' | None -- die Klasse der sendenden Claude-Sitzung, nur
+    wenn sie belegt ist (Abschnitt RECHTEMODUS). Nie eine Vorgabe."""
+    return sitzung_modus(absender_sitzung())
+
+
+def sitzung_modus(d):
+    """'bypass' | 'prompting' | None -- die Klasse der Claude-Sitzung mit dem Registereintrag
+    d, gemessen an ihrem Transcript wie beim Absender (letzte user-Zeile mit permissionMode)."""
+    if not isinstance(d, dict):
+        return None
+    sid = d.get("sessionId")
+    cwd = d.get("cwd")
+    if not isinstance(sid, str) or not re.fullmatch(r"[0-9A-Fa-f-]{8,64}", sid):
+        return None
+    projekte = os.path.expanduser("~/.claude/projects")
+    pfad = ""
+    if isinstance(cwd, str) and cwd:
+        p = os.path.join(projekte, re.sub(r"[^A-Za-z0-9]", "-", cwd), sid + ".jsonl")
+        if os.path.isfile(p):
+            pfad = p
+    if not pfad:
+        treffer = glob.glob(os.path.join(projekte, "*", sid + ".jsonl"))
+        if len(treffer) != 1:
+            return None
+        pfad = treffer[0]
+    modus = _letzter_modus(pfad)
+    return MODUS_KLASSE.get(modus) if isinstance(modus, str) else None
+
+
+# ── Herkunft jeder Zustellung (10.10.2026, Abschnitt HERKUNFT im Kopf) ─────────────
+
+HERKUNFT_MARKE = "Herkunft laut wb-inbox"
+
+
+def absender_pane():
+    """Der Pane auf DEM tmux-Server des Empfaengers, unter dem dieser Aufruf laeuft: der
+    naechste Ahne, der die pane_pid eines Panes ist. '' ohne Treffer (ein Prozess ausserhalb
+    jedes Panes dieses Servers). TMUX_PANE zaehlt nicht -- es ist eine Variable."""
+    befehl = ["tmux"]
+    if TMUX_SOCKET:
+        befehl += ["-L", TMUX_SOCKET]
+    befehl += ["list-panes", "-a", "-F", "#{pane_pid} #{pane_id}"]
+    try:
+        r = subprocess.run(befehl, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if r.returncode != 0:
+        return ""
+    panes = {}
+    for zeile in r.stdout.splitlines():
+        teile = zeile.split()
+        if len(teile) == 2 and teile[0].isdigit() and re.fullmatch(r"%[0-9]+", teile[1]):
+            panes[int(teile[0])] = teile[1]
+    for pid, _befehl in aufrufer_ahnen():
+        if pid in panes:
+            return panes[pid]
+    return ""
+
+
+def herkunft(pane, vorrat):
+    """Die gemessene Herkunft einer Zustellung an `pane`: {klasse, pane, spawner, auftrag}.
+    Auftrag nur, wenn die Klasse 'hauptagent' ist UND der Absender-Pane der Pane ist, den
+    pi-worker beim Start des Empfaengers als dessen Starter eingetragen hat (@wb_spawner).
+    Keine Variable und keine Option des Aufrufers hebt das an; `--absender` setzt nur herab."""
+    klasse = absender_klasse(vorrat)
+    von = absender_pane()
+    spawner = tmux_feld(pane, "#{@wb_spawner}").strip()
+    if not re.fullmatch(r"%[0-9]+", spawner):
+        spawner = ""
+    auftrag = bool(klasse == "hauptagent" and von and spawner and von == spawner and von != pane)
+    return {"klasse": klasse, "pane": von, "spawner": spawner, "auftrag": auftrag}
+
+
+def herkunft_kopf(h, text):
+    """Die sichtbare Kopfzeile ueber dem Text. Ohne spitze Klammern und ohne den
+    Umschlagnamen, damit der Claude-Umschlag gueltig bleibt."""
+    if h["auftrag"]:
+        kopf = ("[%s, gemessen: AUFTRAG. Absender: Hauptagent in Pane %s, dem Pane, der diesen "
+                "Empfaenger gestartet hat.]" % (HERKUNFT_MARKE, h["pane"]))
+    else:
+        if h["klasse"] == "mensch":
+            wer = "Shell eines Menschen (wb-mensch pruefen)"
+        elif h["klasse"] == "traeger":
+            wer = "wb-traeger"
+        elif h["klasse"] == "companion-agent":
+            wer = "Companion-Agent"
+        elif h["pane"]:
+            wer = "ein Agent in Pane %s, nicht dem startenden Pane" % h["pane"]
+        else:
+            wer = "ein Agent ausserhalb jedes Panes dieses tmux-Servers"
+        if h["klasse"] in ("mensch", "traeger", "companion-agent") and h["pane"]:
+            wer += " in Pane %s" % h["pane"]
+        kopf = ("[%s, gemessen: INFORMATION, kein Auftrag. Absender: %s. Gestartet hat diesen "
+                "Empfaenger %s.]" % (HERKUNFT_MARKE, wer,
+                                     "Pane %s" % h["spawner"] if h["spawner"] else "kein eingetragener Pane"))
+    if HERKUNFT_MARKE.lower() in text.lower():
+        kopf += ("\n[Achtung: der Text darunter enthaelt selbst eine Zeile '%s'; nur diese "
+                 "oberste ist gemessen.]" % HERKUNFT_MARKE)
+    return kopf + "\n\n" + text
+
+
+def mit_umschlag(text, klasse):
+    """Der Text im Umschlag, den Claude Code fuer Nachrichten anderer Sitzungen liest,
+    mit from-mode; ohne belegte Klasse unveraendert. Enthaelt der Text selbst den
+    Umschlagnamen, bleibt er ebenfalls unveraendert: Claude wuerde ihn maskieren, der
+    Umschlag gaelte dann nicht (gemessen, Fall d4) -- dann lieber wie bisher."""
+    if klasse not in ("bypass", "prompting"):
+        return text
+    if UMSCHLAG in text.lower():
+        return text
+    return '<%s from-mode="%s">\n%s\n</%s>' % (UMSCHLAG, klasse, text, UMSCHLAG)
+
+
+# ── Systemabsender tafel (11.10.2026, Abschnitt TAFEL-MELDUNGEN im Kopf) ───────────
+
+_INTERPRETER = re.compile(r"^(python[0-9.]*|bash|sh|zsh|dash|ksh)$", re.IGNORECASE)
+
+
+def _ausgefuehrtes_programm(args):
+    """Der Pfad des Programms, das diese Befehlszeile AUSFUEHRT (wie wb-gruppe): argv[0],
+    hinter env und einem Interpreter der Skriptpfad; -c/-m oder Optionen mit Wert: None."""
+    teile = args.split()
+    while teile and (os.path.basename(teile[0]) == "env" or "=" in teile[0].split("/")[0]):
+        teile = teile[1:]
+        while teile and (teile[0].startswith("-") or ("=" in teile[0] and "/" not in teile[0].split("=")[0])):
+            teile = teile[1:]
+    if not teile:
+        return None
+    if not _INTERPRETER.match(os.path.basename(teile[0])):
+        return teile[0]
+    for token in teile[1:]:
+        if token.startswith("-"):
+            if re.fullmatch(r"-[xeuvBEsSIlfn]+", token):
+                continue
+            return None
+        return token
+    return None
+
+
+def aus_tafel():
+    """Ist wb-tafel ein Ahne, der wb-tafel AUSFUEHRT -- die Datei neben diesem Werkzeug oder
+    ~/.local/bin/wb-tafel (realpath)? Gemessen an der Elternkette, nie an einem Argument."""
+    erlaubt = set()
+    for k in (os.path.join(HIER, "wb-tafel"), os.path.expanduser("~/.local/bin/wb-tafel")):
+        if os.path.isfile(k):
+            erlaubt.add(os.path.realpath(k))
+    for _pid, befehl in aufrufer_ahnen():
+        programm = _ausgefuehrtes_programm(befehl)
+        if programm and "/" in programm and os.path.realpath(programm) in erlaubt:
+            return True
+    return False
+
+
+# `--tafel-halter <sessionId>:<klasse>`: wb-tafel nennt den beim `nimm` gemessenen Modus der
+# Sitzung, die den Eintrag nahm. Gilt nur mit wb-tafel als gemessenem Ahnen und nur, wenn der
+# Empfaenger genau diese Sitzung ist und sein eigener gemessener Modus dieselbe Klasse hat.
+TAFEL_HALTER = None
+
+
+def tafel_bezeugung(d, klasse_absender):
+    """('modus', klasse) | ('datei', grund) fuer eine Tafel-Meldung an die Claude-Sitzung d.
+    Bezeugt wird hoechstens die gemessene Klasse des Empfaengers: von einem Claude-Absender nur
+    dessen eigene, gleiche Klasse; ohne Claude-Absender nur ueber einen passenden Halter-Modus.
+    Sonst haelte Claude die Nachricht an -- dann die Claude-Datei-Inbox."""
+    empf = sitzung_modus(d)
+    if empf not in ("bypass", "prompting"):
+        return "datei", "Rechtemodus des Empfaengers nicht messbar"
+    if klasse_absender:
+        if klasse_absender == empf:
+            return "modus", empf
+        return "datei", "Absender-Sitzung %s, Empfaenger %s" % (klasse_absender, empf)
+    if TAFEL_HALTER:
+        sid, _, klasse = TAFEL_HALTER.partition(":")
+        if sid == d.get("sessionId") and klasse == empf:
+            return "modus", empf
+        return "datei", "Halter-Modus passt nicht zur Empfaenger-Sitzung"
+    return "datei", "kein Claude-Absender und kein Halter-Modus"
+
+
+def claude_ordner(sid):
+    return os.path.join(INBOX_DIR, "claude", sid)
+
+
+def claude_hook_aktiv(d):
+    """Hat der Einspiel-Hook in GENAU diesem Prozess der Sitzung schon gelaufen? Er schreibt bei
+    jedem Lauf <inbox>/claude/<sessionId>/hook; zaehlt nur, wenn juenger als der Prozessstart."""
+    sid = d.get("sessionId")
+    if not isinstance(sid, str) or not re.fullmatch(r"[0-9A-Fa-f-]{8,64}", sid):
+        return False
+    try:
+        mtime = os.stat(os.path.join(claude_ordner(sid), "hook")).st_mtime
+    except OSError:
+        return False
+    start = _prozessstart_utc(d.get("pid") or 0)
+    try:
+        t0 = datetime.datetime.strptime(start, "%a %b %d %H:%M:%S %Y").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return False
+    return mtime >= t0 - 1
+
+
+def claude_datei_senden(d, text, h, grund):
+    """Die Meldung in <inbox>/claude/<sessionId>/neu/ ablegen (0600, atomar). Der Hook
+    hooks/inbox-einspielen.sh spielt sie beim naechsten Werkzeugaufruf oder Prompt der
+    Sitzung als Kontext ein und verschiebt sie nach zugestellt/."""
+    neu = os.path.join(claude_ordner(d["sessionId"]), "neu")
+    try:
+        os.makedirs(neu, mode=0o700, exist_ok=True)
+    except OSError as e:
+        fehler("Ordner %s nicht anlegbar: %s" % (neu, e))
+        return 1
+    mid = "%d-%d" % (time.time_ns(), os.getpid())
+    nachricht = {"version": 1, "id": mid, "text": text, "absender": "tafel", "zeit": jetzt_iso(),
+                 "herkunft": "auftrag" if h["auftrag"] else "information"}
+    ziel = os.path.join(neu, mid + ".json")
+    tmp = os.path.join(neu, "." + mid + ".tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(nachricht, ensure_ascii=False))
+        os.rename(tmp, ziel)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        fehler("Schreiben in %s fehlgeschlagen: %s" % (neu, e))
+        return 1
+    sys.stdout.write("weg=claude-datei: in die Datei-Inbox der Claude-Sitzung '%s' (pid %d) gelegt "
+                     "(%s); der Hook spielt sie beim naechsten Werkzeugaufruf ein: %s\n" % (
+                         d.get("name", "?"), d["pid"], grund, ziel))
+    return 0
+
+
 def sitzung_zu_pane(pane):
     """Der Registereintrag der Claude-Sitzung in diesem Pane, oder None.
 
-    Zwei Stufen, und die zweite ist die entscheidende. Erst wird nach der
-    tmux-Adresse im Register vorsortiert -- das ist billig. Dann wird die
-    AHNENREIHE geprueft: der Prozess muss wirklich unter diesem Pane haengen.
+    Zwei Stufen: die Pane-Adresse im Register und die AHNENREIHE. Der Prozess
+    muss wirklich unter diesem Pane auf diesem Server haengen.
     Ohne diese zweite Stufe waere eine Pane-Kennung wie '%0' das Kriterium, und
     '%0' gibt es auf JEDEM tmux-Server, auch auf dem Testserver nebenan und in
     einer fremden Werkbank. Genau diese Verwechslung hat pi-worker schon einmal
     in eine fremde Session spawnen lassen.
+
+    Die Fenster-ID gehoert NICHT zur Pane-Identitaet: `move-pane`/`break-pane`
+    verschiebt einen Pane in ein anderes Fenster, Claude Code schreibt die
+    Adresse im Register nicht nach, und die alte Fenster-ID in der Adresse
+    wuerde den Treffer sonst nach dem Verschieben verlieren (Regression
+    07.10.2026). Die Pane-ID allein ist pro Server eindeutig (kein '@N.'-Anteil
+    zweier Fenster teilt sich eine Pane-ID), der Fenstervergleich traegt also
+    nichts zur Sicherheit bei -- das tut allein die Ahnenreihe unten.
     """
+    if not re.fullmatch(r"%[0-9]+", pane):
+        return None
     pane_pid = tmux_feld(pane, "#{pane_pid}")
     if not pane_pid.isdigit():
         return None
@@ -290,16 +850,20 @@ def sitzung_zu_pane(pane):
         pid = d.get("pid")
         if not isinstance(pid, int) or not lebt(pid):
             continue
+        # Claude records no socket name. Die Pane-ID in der Adresse ist
+        # ausreichend; ancestry from this server's pane_pid proves which
+        # server owns it. Das Fenster davor (und der Sitzungsname, der bei
+        # gruppierten `-view`-Sessions abweichen kann) ist nicht Teil der
+        # Identitaet -- siehe Docstring oben.
+        adresse = str(d.get("tmux") or "")
+        if not adresse.endswith("." + pane) or not adresse.split(":", 1)[0]:
+            continue
         sock = d.get("messagingSocketPath") or ""
         if not sock or not os.path.exists(sock):
             continue
         kandidaten.append(d)
 
-    # Vorsortieren nach der tmux-Adresse, wenn eine dasteht -- sonst muesste die
-    # Ahnenreihe fuer jede lebende Sitzung der Maschine gelaufen werden.
-    kurz = "." + pane
-    vorn = [d for d in kandidaten if str(d.get("tmux") or "").endswith(kurz)]
-    for d in vorn + [d for d in kandidaten if d not in vorn]:
+    for d in kandidaten:
         if NUR_PID and d["pid"] != NUR_PID:
             continue
         if ahnenreihe(d["pid"], pane_pid):
@@ -307,13 +871,803 @@ def sitzung_zu_pane(pane):
     return None
 
 
-def cmd_finde(pane):
-    d = sitzung_zu_pane(pane)
-    if not d:
+# ── Registry ────────────────────────────────────────────────────────────────
+
+
+def registry_harnesses():
+    """{id: harness-eintrag} aus der installierten Registry, sonst aus der Vorlage neben
+    diesem Skript. Kaputt oder fehlend heisst: leer -- die eingebauten Vorgaben tragen."""
+    for pfad in (os.path.expanduser("~/.claude/workbench/models.json"),
+                 os.path.join(HIER, "models.default.json")):
+        try:
+            with open(pfad, encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        liste = d.get("harnesses") if isinstance(d, dict) else None
+        if isinstance(liste, list):
+            return {h["id"]: h for h in liste if isinstance(h, dict) and isinstance(h.get("id"), str)}
+    return {}
+
+
+def inbox_block(hid, harnesses=None):
+    """Der `inbox`-Block eines Harness: Registry vor eingebauter Vorgabe. Unbekannt
+    heisst weg '' mit Grund -- nie geraten."""
+    if harnesses is None:
+        harnesses = registry_harnesses()
+    h = harnesses.get(hid) or {}
+    b = h.get("inbox")
+    if isinstance(b, dict) and "weg" in b:
+        return b
+    if hid in EINGEBAUT:
+        return EINGEBAUT[hid]
+    return {"weg": "", "grund": "fuer diesen Harness ist kein Zustellweg ohne Eingabezeile "
+                                "eingetragen (Registry: harnesses[].inbox)."}
+
+
+# ── Prozesse unter einem Pane ───────────────────────────────────────────────
+
+
+def prozesse_unter(pane_pid):
+    """[(pid, befehlszeile)] aller Nachfahren von pane_pid, pane_pid eingeschlossen."""
+    try:
+        r = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "command="],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    kinder, befehl = {}, {}
+    for zeile in r.stdout.splitlines():
+        teile = zeile.split(None, 2)
+        if len(teile) < 2 or not teile[0].isdigit() or not teile[1].isdigit():
+            continue
+        pid, ppid = int(teile[0]), int(teile[1])
+        befehl[pid] = teile[2] if len(teile) > 2 else ""
+        kinder.setdefault(ppid, []).append(pid)
+    aus, offen = [], [pane_pid]
+    while offen:
+        p = offen.pop(0)
+        if p in befehl or p == pane_pid:
+            aus.append((p, befehl.get(p, "")))
+        offen.extend(kinder.get(p, []))
+    return aus
+
+
+def harness_prozess_im_pane(pane_pid, harnesses):
+    """(Harness, PID) des obersten bekannten Harness-Prozesses im Pane."""
+    namen = {}
+    for hid, e in harnesses.items():
+        c = os.path.basename(str(e.get("command") or ""))
+        if c and c not in ("sh", "bash", "zsh", "env", "node", "python3", "python"):
+            namen.setdefault(c, hid)
+    # prozesse_unter walks breadth first, so the first match has the smallest
+    # distance from pane_pid. Keep its PID: a nested session is not the pane's
+    # recipient merely because its harness name matches a registry entry.
+    for pid, cmd in prozesse_unter(pane_pid):
+        for wort in cmd.split()[:2]:
+            b = os.path.basename(wort)
+            if b in namen:
+                return namen[b], pid
+    return None
+
+
+# ── Datei-Inbox ─────────────────────────────────────────────────────────────
+
+
+def datei_empfaenger(pane, pane_pid):
+    """Die Anmeldung eines Adapters, dessen Prozess unter diesem Pane lebt, oder None.
+    Anmeldungen toter Prozesse werden dabei weggeraeumt, alle, nicht nur bis zum Treffer."""
+    gefunden = None
+    server_sock = tmux_feld(pane, "#{socket_path}")
+    if not server_sock:
+        return None
+    for f in sorted(glob.glob(os.path.join(INBOX_DIR, "*.json"))):
+        name = os.path.basename(f)[:-5]
+        if not name.isdigit():
+            continue
+        try:
+            with open(f, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        pid = d.get("pid") if isinstance(d, dict) else None
+        if not isinstance(pid, int) or pid != int(name):
+            continue
+        if not lebt(pid):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+            shutil.rmtree(os.path.join(INBOX_DIR, name), ignore_errors=True)
+            continue
+        if gefunden or (NUR_PID and pid != NUR_PID):
+            continue
+        if d.get("pane") != pane or str(d.get("tmux") or "").split(",", 1)[0] != server_sock:
+            continue
+        if ahnenreihe(pid, pane_pid):
+            d["_ordner"] = os.path.join(INBOX_DIR, name)
+            gefunden = d
+    return gefunden
+
+
+def datei_senden(d, text, klasse, h=None):
+    neu = os.path.join(d["_ordner"], "neu")
+    if not os.path.isdir(neu):
+        fehler("Inbox-Ordner %s fehlt — der Adapter von pid %d ist angemeldet, aber nicht "
+               "empfangsbereit. Nichts gesendet." % (neu, d["pid"]))
         return 1
-    sys.stdout.write("%d\t%s\t%s\t%s\t%s\n" % (
-        d["pid"], d.get("messagingSocketPath", ""), d.get("name", ""),
-        d.get("status", ""), d.get("sessionId", "")))
+    mid = "%d-%d" % (time.time_ns(), os.getpid())
+    nachricht = {"version": 1, "id": mid, "text": text, "absender": klasse, "zeit": jetzt_iso()}
+    if h is not None:
+        nachricht["herkunft"] = "auftrag" if h["auftrag"] else "information"
+    inhalt = json.dumps(nachricht, ensure_ascii=False)
+    ziel = os.path.join(neu, mid + ".json")
+    tmp = os.path.join(neu, "." + mid + ".tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(inhalt)
+        os.rename(tmp, ziel)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        fehler("Schreiben in %s fehlgeschlagen: %s" % (neu, e))
+        return 1
+    try:
+        frist = float(os.environ.get("WB_INBOX_ABHOLFRIST", "3") or "3")
+    except ValueError:
+        frist = 3.0
+    ende = time.time() + frist
+    while os.path.exists(ziel) and time.time() < ende:
+        time.sleep(0.1)
+    abgeholt = not os.path.exists(ziel)
+    sys.stdout.write("in die Datei-Inbox von '%s' (pid %d) gelegt: %s — %s\n" % (
+        d.get("harness", "?"), d["pid"], ziel,
+        "vom Adapter abgeholt; er gibt sie sofort (untaetig) oder an der naechsten Zuggrenze "
+        "an die Sitzung" if abgeholt
+        else "noch nicht abgeholt (%gs gewartet); der Adapter holt sie an der naechsten "
+             "Zuggrenze oder mit seinem Takt" % frist))
+    return 0
+
+
+# ── codex ───────────────────────────────────────────────────────────────────
+
+
+def _umgebung_von(pid):
+    """Die Umgebung eines eigenen Prozesses laut `ps eww` (nur KEY=wert-Woerter)."""
+    try:
+        r = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    umg = {}
+    for wort in r.stdout.split():
+        m = re.match(r"^([A-Z_][A-Z0-9_]*)=(.*)$", wort)
+        if m:
+            umg[m.group(1)] = m.group(2)
+    return umg
+
+
+def _cwd_von(pid):
+    try:
+        r = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for z in r.stdout.splitlines():
+        if z.startswith("n"):
+            return os.path.realpath(z[1:])
+    return ""
+
+
+def _start_ms(pid):
+    try:
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=5,
+                           env=dict(os.environ, LC_ALL="C", LANG="C"))
+        t = time.mktime(time.strptime(r.stdout.strip(), "%a %b %d %H:%M:%S %Y"))
+        return int(t * 1000)
+    except Exception:
+        return 0
+
+
+def codex_empfaenger(pane_pid, block):
+    """(ziel, grund): ziel ist {pid, thread, codex_home, home, cwd, remote, rollout},
+    grund der Klartext, wenn es keinen Thread gibt. (None, None): kein codex im Pane."""
+    muster = re.compile(block.get("prozess") or EINGEBAUT["codex"]["prozess"])
+    treffer = None
+    for pid, cmd in prozesse_unter(pane_pid):
+        argv = cmd.split()
+        if not argv:
+            continue
+        # Der Befehl selbst oder `node …/codex`: das zweite Wort zaehlt mit.
+        kopf = " ".join(argv[:2]) + " "
+        if not muster.search(kopf):
+            continue
+        if any(w in ("queue", "app-server", "exec", "mcp-server") for w in argv[1:3]):
+            continue
+        treffer = (pid, argv)
+        break
+    if treffer is None:
+        return None, None
+    pid, argv = treffer
+    if "--no-daemon" in argv:
+        return None, ("die codex-TUI unter diesem Pane laeuft mit --no-daemon und haengt an "
+                      "keinem app-server; `codex queue` erreicht sie nicht.")
+    remote = ""
+    if "--remote" in argv:
+        i = argv.index("--remote")
+        remote = argv[i + 1] if i + 1 < len(argv) else ""
+    umg = _umgebung_von(pid)
+    home = umg.get("HOME") or os.path.expanduser("~")
+    codex_home = umg.get("CODEX_HOME") or os.path.join(home, ".codex")
+    cwd = _cwd_von(pid)
+    dbs = sorted(glob.glob(os.path.join(codex_home, "state_*.sqlite")),
+                 key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0))
+    if not dbs or not cwd:
+        return None, ("codex (pid %d) hat noch keinen Thread: %s. Erst nach dem ersten Zug "
+                      "ist die Sitzung adressierbar." % (
+                          pid, "kein Zustandsspeicher unter %s" % codex_home if not dbs
+                          else "Arbeitsverzeichnis nicht lesbar"))
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % dbs[-1], uri=True, timeout=5)
+        zeilen = con.execute(
+            "SELECT id, rollout_path, COALESCE(updated_at_ms, updated_at*1000) FROM threads "
+            "WHERE cwd = ? AND archived = 0 "
+            "AND COALESCE(originator, 'codex-tui') = 'codex-tui' "
+            "AND id NOT IN (SELECT child_thread_id FROM thread_spawn_edges) "
+            "ORDER BY COALESCE(recency_at_ms, updated_at_ms, updated_at*1000) DESC",
+            (cwd,)).fetchall()
+        con.close()
+    except sqlite3.Error as e:
+        return None, "codex-Zustandsspeicher %s nicht lesbar (%s)." % (dbs[-1], e)
+    if not zeilen:
+        return None, ("codex (pid %d) hat in %s noch keinen Thread. Erst nach dem ersten Zug "
+                      "ist die Sitzung adressierbar." % (pid, cwd))
+    seit = _start_ms(pid)
+    frisch = [z for z in zeilen if seit and (z[2] or 0) >= seit - 2000]
+    if len(frisch) > 1:
+        return None, ("seit dem Start von codex (pid %d) wurden %d Threads in %s benutzt (%s); "
+                      "welcher in der TUI steht, ist nicht belegbar. Nichts gesendet." % (
+                          pid, len(frisch), cwd, ", ".join(z[0] for z in frisch[:4])))
+    z = frisch[0] if frisch else zeilen[0]
+    return {"pid": pid, "thread": z[0], "rollout": z[1] or "", "codex_home": codex_home,
+            "home": home, "cwd": cwd, "remote": remote}, None
+
+
+# Gereiht ist nicht aufgenommen (gemessen 09.10.2026, codex-cli 0.157.1, eigenes
+# CODEX_HOME, tmux -L cxint, Responses-Stub statt Modell). `codex queue` legt die
+# Nachricht nur in $CODEX_HOME/queue_*.sqlite (Tabelle queued_items) ab und endet
+# mit 0. Abgeholt wird sie an der naechsten Zuggrenze. Bricht Escape einen laufenden
+# Zug ab (`pi-worker --interrupt`), PAUSIERT Codex die Queue des Threads: die
+# gereihte Nachricht bleibt liegen, und jede spaetere `codex queue`-Nachricht an die
+# jetzt untaetige TUI ebenso -- es gibt keine Zuggrenze mehr. Nach einem Neustart des
+# app-server-Daemons gilt dasselbe ("recovered queues remain paused"). Escape im
+# Leerlauf (einmal oder zweimal) aendert daran nichts.
+#
+# Was die Queue wieder anlaufen laesst, ohne in den Pane zu tippen: der app-server
+# selbst. Die TUI spricht mit ihm ueber einen WebSocket auf
+# $CODEX_HOME/app-server-control/app-server-control.sock (JSON-RPC); dort startet
+# `thread/queue/start {threadId}` die gereihten Nachrichten sofort (gemessen: beide
+# liegengebliebenen Nachrichten liefen, standen im Pane und im Rollout). Waehrend
+# eines laufenden Zuges lehnt der Server mit "thread already has an active or
+# pending turn" ab -- dann holt Codex sie an der Zuggrenze selbst.
+#
+# Belegt ist die Aufnahme erst, wenn der Eintrag aus queued_items verschwunden ist
+# UND der Text als Nutzer-Nachricht neu im Rollout des Threads steht.
+
+EXIT_GEREIHT = 6   # gereiht, Zug laeuft: Aufnahme an der Zuggrenze, noch nicht belegt
+EXIT_PAUSIERT = 7  # Queue nach Abbruch pausiert, kein app-server; eigener Eintrag entfernt
+
+
+def _codex_eintrag_entfernen(codex_home, thread, eintrag):
+    """Den eigenen, nie aufgenommenen Eintrag aus queued_items nehmen. True nur, wenn
+    genau diese Zeile geloescht wurde. Gemessen 09.10.2026 (codex-cli 0.157.1, ohne
+    Daemon): eine per Thread-ID fortgesetzte TUI holt liegengebliebene Eintraege nach
+    ihrem ersten Zug nach -- ohne Entfernen kaeme ein neu uebergebener Auftrag doppelt."""
+    db = _codex_queue_db(codex_home)
+    if not db or not eintrag:
+        return False
+    try:
+        con = sqlite3.connect(db, timeout=5)
+        n = con.execute("DELETE FROM queued_items WHERE id = ? AND thread_id = ?",
+                        (eintrag, thread)).rowcount
+        con.commit()
+        con.close()
+        return n == 1
+    except sqlite3.Error:
+        return False
+
+
+def _codex_queue_db(codex_home):
+    dbs = sorted(glob.glob(os.path.join(codex_home, "queue_*.sqlite")),
+                 key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0))
+    return dbs[-1] if dbs else ""
+
+
+def _codex_gereiht(codex_home, thread, eintrag=None):
+    """Zahl der gereihten Eintraege des Threads (oder 1/0 fuer genau `eintrag`);
+    None, wenn es keinen lesbaren Queue-Speicher gibt."""
+    db = _codex_queue_db(codex_home)
+    if not db:
+        return None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=5)
+        if eintrag:
+            n = con.execute("SELECT COUNT(*) FROM queued_items WHERE id = ?", (eintrag,)).fetchone()[0]
+        else:
+            n = con.execute("SELECT COUNT(*) FROM queued_items WHERE thread_id = ?", (thread,)).fetchone()[0]
+        con.close()
+        return n
+    except sqlite3.Error:
+        return None
+
+
+def _rollout_groesse(pfad):
+    try:
+        return os.path.getsize(pfad)
+    except OSError:
+        return 0
+
+
+def _im_rollout(pfad, ab, text):
+    """Steht `text` ab Byte `ab` als Nutzer-Nachricht im Rollout? Verglichen werden die
+    erste und die letzte nichtleere Zeile; JSON wird gelesen, nicht als Text durchsucht."""
+    zeilen = [z.strip() for z in text.splitlines() if z.strip()]
+    if not pfad or not zeilen:
+        return False
+    try:
+        with open(pfad, "rb") as f:
+            f.seek(ab)
+            neu = f.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    for z in neu.splitlines():
+        try:
+            d = json.loads(z)
+        except ValueError:
+            continue
+        nutz = d.get("payload") if isinstance(d, dict) else None
+        if not isinstance(nutz, dict) or nutz.get("type") != "message" or nutz.get("role") != "user":
+            continue
+        inhalt = " ".join(str(c.get("text", "")) for c in nutz.get("content") or []
+                          if isinstance(c, dict))
+        if zeilen[0] in inhalt and zeilen[-1] in inhalt:
+            return True
+    return False
+
+
+def _codex_zugstand(pfad):
+    """Stand des letzten Zuges laut Rollout: 'laeuft' (task_started ohne Abschluss),
+    'fertig' (task_complete), 'abgebrochen' (turn_aborted) oder None (nicht lesbar).
+    Gemessen 09.10.2026: nach Escape im Zug steht dort turn_aborted/interrupted."""
+    try:
+        with open(pfad, "rb") as f:
+            f.seek(max(0, os.path.getsize(pfad) - 512 * 1024))
+            rest = f.read().decode("utf-8", "replace")
+    except (OSError, TypeError):
+        return None
+    stand = None
+    for z in rest.splitlines():
+        if '"event_msg"' not in z:
+            continue
+        try:
+            t = (json.loads(z).get("payload") or {}).get("type")
+        except ValueError:
+            continue
+        stand = {"task_started": "laeuft", "task_complete": "fertig",
+                 "turn_aborted": "abgebrochen"}.get(t, stand)
+    return stand
+
+
+def _appserver_rpc(sockpfad, methode, params, frist=10):
+    """Ein JSON-RPC-Aufruf am app-server ueber seinen Unix-WebSocket. (ergebnis, fehler)."""
+    import base64
+    import struct
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(frist)
+    try:
+        s.connect(sockpfad)
+        s.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                  b"Connection: Upgrade\r\nSec-WebSocket-Key: " + base64.b64encode(os.urandom(16))
+                  + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        puffer = b""
+        while b"\r\n\r\n" not in puffer:
+            stueck = s.recv(4096)
+            if not stueck:
+                return None, "app-server schloss die Verbindung beim Handshake"
+            puffer += stueck
+        kopf, puffer = puffer.split(b"\r\n\r\n", 1)
+        if b" 101 " not in kopf.split(b"\r\n", 1)[0]:
+            return None, "kein WebSocket am app-server (%s)" % kopf.split(b"\r\n", 1)[0].decode("latin-1")
+
+        def senden(obj):
+            daten = json.dumps(obj).encode()
+            maske = os.urandom(4)
+            n = len(daten)
+            if n < 126:
+                k = bytes([0x81, 0x80 | n])
+            elif n < 65536:
+                k = bytes([0x81, 0xfe]) + struct.pack(">H", n)
+            else:
+                k = bytes([0x81, 0xff]) + struct.pack(">Q", n)
+            s.sendall(k + maske + bytes(b ^ maske[i % 4] for i, b in enumerate(daten)))
+
+        def lesen(n):
+            nonlocal puffer
+            while len(puffer) < n:
+                stueck = s.recv(65536)
+                if not stueck:
+                    raise EOFError
+                puffer += stueck
+            r, puffer = puffer[:n], puffer[n:]
+            return r
+
+        senden({"id": 1, "method": "initialize",
+                "params": {"clientInfo": {"name": "wb_inbox", "title": None, "version": "1"},
+                           "capabilities": {"experimentalApi": True}}})
+        senden({"method": "initialized"})
+        senden({"id": 2, "method": methode, "params": params})
+        while True:
+            a, b = lesen(2)
+            n = b & 0x7f
+            if n == 126:
+                n = struct.unpack(">H", lesen(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", lesen(8))[0]
+            nutz = lesen(n)
+            if a & 0x0f == 8:
+                return None, "app-server schloss die Verbindung"
+            if a & 0x0f != 1:
+                continue
+            try:
+                m = json.loads(nutz)
+            except ValueError:
+                continue
+            if m.get("id") != 2:
+                continue
+            if "error" in m:
+                return None, str((m.get("error") or {}).get("message") or m["error"])
+            return m.get("result"), None
+    except (OSError, EOFError, socket.timeout) as e:
+        return None, "app-server nicht erreichbar (%s)" % e
+    finally:
+        s.close()
+
+
+def _appserver_sock(ziel):
+    remote = ziel.get("remote") or ""
+    if remote.startswith("unix://") and len(remote) > len("unix://"):
+        return remote[len("unix://"):]
+    if remote and remote != "unix://":
+        return ""   # ws:// oder wss:// -- dorthin baut dieses Werkzeug keine Verbindung
+    return os.path.join(ziel["codex_home"], "app-server-control", "app-server-control.sock")
+
+
+def codex_queue_anstossen(ziel):
+    """thread/queue/start fuer den Thread. (gestartet, grund): gestartet ist True,
+    False (laufender Zug) oder None (nicht moeglich, grund sagt warum)."""
+    sock = _appserver_sock(ziel)
+    if not sock:
+        return None, "die TUI haengt an %s; dorthin stoesst wb-inbox nicht an" % ziel.get("remote")
+    _, f = _appserver_rpc(sock, "thread/queue/start", {"threadId": ziel["thread"]})
+    if f is None:
+        return True, ""
+    if "active or pending turn" in f:
+        return False, f
+    return None, f
+
+
+# ── Wartet codex auf eine Vertrauensfrage? ──────────────────────────────────
+#
+# Ein frisch gestarteter oder geweckter codex-Pane kann, bevor die Eingabezeile
+# erscheint, einen Dialog zeigen (gemessen 09.10.2026, codex-cli 0.157.1): "Hooks need
+# review" (neue oder geaenderte Hooks des Projekts) oder "Trust this folder?" (Ordner
+# ohne trust_level). Solange er steht, nimmt die TUI nichts auf, und der Fehler sah
+# bisher aus wie ein toter app-server. Hier wird der sichtbare Pane-Text gelesen --
+# nur gelesen: getippt wird nie, die Entscheidung gehoert dem Menschen.
+CODEX_DIALOGE = (
+    ("Hook-Trust-Dialog",
+     re.compile(r"Hooks need review|hooks? (?:is|are) new or changed|Trust all and continue"
+                r"|Continue without trusting")),
+    ("Ordner-Trust-Dialog",
+     re.compile(r"Trust this folder\?|Trust and continue|Open restricted")),
+)
+
+
+def pane_text(pane):
+    """Der sichtbare Text des Panes, oder '' (kein tmux, Pane weg)."""
+    befehl = ["tmux"]
+    if TMUX_SOCKET:
+        befehl += ["-L", TMUX_SOCKET]
+    befehl += ["capture-pane", "-p", "-t", pane]
+    try:
+        r = subprocess.run(befehl, capture_output=True, text=True, timeout=5,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout if r.returncode == 0 else ""
+
+
+def codex_dialog(pane):
+    """Name des Dialogs, auf den die codex-TUI in diesem Pane wartet, sonst None."""
+    if not pane:
+        return None
+    text = pane_text(pane)
+    for name, muster in CODEX_DIALOGE:
+        if muster.search(text):
+            return name
+    return None
+
+
+def codex_dialog_meldung(name, pane):
+    return ("Codex wartet auf den %s im Pane %s; solange er steht, nimmt die TUI nichts auf. "
+            "Naechster Schritt: im Pane von Hand entscheiden (\"Trust all and continue\" "
+            "oder \"Continue without trusting\", bzw. \"Trust and continue\" beim Ordner), "
+            "danach den Auftrag erneut senden. Nichts gesendet, nichts getippt." % (name, pane))
+
+
+def codex_senden(ziel, text, harnesses, pane=""):
+    # Steht ein Trust-Dialog im Pane, ist jede Reihung vergebens -- vor dem Reihen sagen.
+    dialog = codex_dialog(pane)
+    if dialog:
+        fehler(codex_dialog_meldung(dialog, pane))
+        return 1
+    befehl = str((harnesses.get("codex") or {}).get("command") or "codex")
+    befehl = os.path.expanduser(befehl)
+    argv = [befehl, "queue", "--thread", ziel["thread"], "--message", text]
+    if ziel.get("remote"):
+        argv += ["--remote", ziel["remote"]]
+    umg = dict(os.environ)
+    umg["HOME"] = ziel["home"]
+    umg["CODEX_HOME"] = ziel["codex_home"]
+    rollout_ab = _rollout_groesse(ziel.get("rollout"))
+    try:
+        r = subprocess.run(argv, cwd=ziel["cwd"] or None, env=umg, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        fehler("`codex queue` nicht ausfuehrbar (%s). Nichts gesendet." % e)
+        return 1
+    if r.returncode != 0:
+        fehler("`codex queue` scheiterte (Exit %d): %s" % (
+            r.returncode, (r.stderr or r.stdout).strip()[:300]))
+        return 1
+    m = re.search(r"Queued message (\S+?)\.? for thread", r.stdout)
+    eintrag = m.group(1) if m else ""
+    try:
+        frist = float(os.environ.get("WB_CODEX_AUFNAHMEFRIST", "") or 25)
+    except ValueError:
+        frist = 25.0
+    ende = time.time() + frist
+    anstoss_ab = time.time() + 1.5   # erst der TUI die Chance geben, selbst abzuholen
+    angestossen, zug_laeuft, anstoss_grund = False, False, ""
+    while True:
+        rest = _codex_gereiht(ziel["codex_home"], ziel["thread"], eintrag) if eintrag else None
+        # rest None: kein Queue-Speicher lesbar -- dann zaehlt allein der Rollout.
+        if rest in (0, None) and _im_rollout(ziel.get("rollout"), rollout_ab, text):
+            sys.stdout.write("an codex (pid %d) zugestellt und aufgenommen, Thread %s%s.\n" % (
+                ziel["pid"], ziel["thread"],
+                " (Queue stand still, mit thread/queue/start angestossen)" if angestossen else ""))
+            return 0
+        # Angestossen wird nur eine Queue, in der fuer diesen Thread wirklich etwas liegt.
+        if rest != 0 and not (angestossen or zug_laeuft or anstoss_grund) \
+                and time.time() >= anstoss_ab \
+                and (_codex_gereiht(ziel["codex_home"], ziel["thread"]) or 0) > 0:
+            # Ein einziger Versuch; scheitert er, kann die TUI bis zur Frist noch selbst abholen.
+            ergebnis, anstoss_grund = codex_queue_anstossen(ziel)
+            angestossen = ergebnis is True
+            zug_laeuft = ergebnis is False
+        if time.time() >= ende:
+            break
+        time.sleep(0.3)
+    # Ohne app-server (die TUI startet ihn im eigenen Prozess, so laufen die Werkbank-
+    # Worker: gemessen 09.10.2026, kein app-server-control/ unter ~/.codex) sagt der
+    # Rollout, ob ein Zug laeuft oder der letzte abgebrochen wurde.
+    # Kam der Trust-Dialog erst NACH dem Reihen (Race mit dem Wecken), ist er die Ursache.
+    dialog = codex_dialog(pane)
+    if dialog:
+        fehler("an codex (pid %d) gereiht, NICHT aufgenommen (%ds gewartet): Codex wartet auf den %s "
+               "im Pane %s; solange er steht, nimmt die TUI nichts auf. Eintrag %s liegt in der "
+               "Queue; ob Codex ihn nach der Entscheidung abholt, ist nicht gemessen -- erst mit "
+               "`wb-inbox codex-queue %s` nachsehen, dann nicht doppelt senden. Naechster Schritt: "
+               "im Pane von Hand entscheiden (\"Trust all and continue\" oder \"Continue without "
+               "trusting\", beim Ordner \"Trust and continue\"). Nichts getippt." % (
+                   ziel["pid"], int(frist), dialog, pane, eintrag or "(unbekannt)", pane))
+        return 1
+    zugstand = _codex_zugstand(ziel.get("rollout")) if not (angestossen or zug_laeuft) else None
+    if zugstand == "laeuft":
+        zug_laeuft = True
+    weg = ("Eintrag %s liegt noch in %s" % (eintrag, _codex_queue_db(ziel["codex_home"]))
+           if eintrag and rest else "der Text steht nicht im Rollout %s" % (ziel.get("rollout") or "(unbekannt)"))
+    if zug_laeuft:
+        sys.stdout.write(
+            "an codex (pid %d) gereiht, NOCH NICHT aufgenommen, Thread %s: ein Zug laeuft, Codex "
+            "holt die Nachricht an der Zuggrenze. Wird dieser Zug abgebrochen (Escape, pi-worker "
+            "--interrupt), bleibt sie liegen; dann: wb-inbox codex-queue <pane> --start (nur mit "
+            "app-server), sonst den Worker neu starten.\n" % (
+                ziel["pid"], ziel["thread"]))
+        return EXIT_GEREIHT
+    ohne_server = "nicht erreichbar" in anstoss_grund or "stoesst wb-inbox nicht an" in anstoss_grund
+    if ohne_server:
+        schritt = ("den Worker neu starten -- diese TUI hat keinen erreichbaren app-server, ohne "
+                   "Tippen laesst sich ihre Queue nicht anstossen")
+    else:
+        schritt = "`wb-inbox codex-queue <pane> --start`, sonst den Worker neu starten"
+    teile = ["an codex (pid %d) gereiht, NICHT aufgenommen (%ds gewartet; %s)." % (
+        ziel["pid"], int(frist), weg)]
+    if zugstand == "abgebrochen":
+        teile.append("Der letzte Zug wurde abgebrochen (turn_aborted); danach pausiert Codex die "
+                     "Queue und holt nichts mehr ab.")
+    if anstoss_grund:
+        teile.append("Anstossen mit thread/queue/start: %s." % anstoss_grund)
+    elif angestossen:
+        teile.append("Die Queue lief auch nach thread/queue/start nicht an.")
+    # Pausiert und ohne app-server: der einzige Weg ohne Tippen ist ein Neustart per
+    # Thread-ID mit dem Auftrag als Erstauftrag (pi-worker). Dafuer muss der eigene
+    # Eintrag weg, sonst kaeme er nach dem Neustart ein zweites Mal an.
+    if (ohne_server and not ziel.get("remote") and zugstand == "abgebrochen" and eintrag
+            and _codex_eintrag_entfernen(ziel["codex_home"], ziel["thread"], eintrag)):
+        teile.append("Eigener Eintrag %s aus der Queue genommen. Naechster Schritt: Neustart per "
+                     "Thread %s mit dem Auftrag als Erstauftrag (pi-worker tut das selbst). "
+                     "Nichts getippt." % (eintrag, ziel["thread"]))
+        fehler(" ".join(teile))
+        sys.stdout.write("codex-neustart\t%s\t%d\n" % (ziel["thread"], ziel["pid"]))
+        return EXIT_PAUSIERT
+    teile.append("Naechster Schritt: %s. Nichts getippt." % schritt)
+    fehler(" ".join(teile))
+    return 1
+
+
+def cmd_codex_queue(pane, starten):
+    """Gereihte, noch nicht aufgenommene codex-Nachrichten fuer diesen Pane zaehlen
+    und auf Wunsch mit thread/queue/start anstossen. Ausgabe: <anzahl>\\t<thread>."""
+    e = empfaenger(pane)
+    if not e or e.get("weg") != "codex-queue":
+        fehler("unter Pane %s laeuft keine adressierbare codex-TUI." % pane)
+        return 1
+    ziel = e["ziel"]
+    n = _codex_gereiht(ziel["codex_home"], ziel["thread"])
+    if n is None:
+        fehler("kein lesbarer Queue-Speicher unter %s." % ziel["codex_home"])
+        return 1
+    if starten and n:
+        ergebnis, grund = codex_queue_anstossen(ziel)
+        if ergebnis is not True:
+            fehler("thread/queue/start fuer %s: %s.%s" % (ziel["thread"], grund,
+                   " Ohne app-server (TUI im eigenen Prozess) laesst sich die Queue nicht ohne "
+                   "Tippen anstossen: den Worker neu starten." if "nicht erreichbar" in grund else ""))
+            return EXIT_GEREIHT if ergebnis is False else 1
+    sys.stdout.write("%d\t%s\n" % (n, ziel["thread"]))
+    return 0
+
+
+# ── Empfaenger zu einem Pane ────────────────────────────────────────────────
+
+
+def empfaenger(pane):
+    """Was unter diesem Pane Nachrichten annimmt, als Wörterbuch mit `weg`:
+      claude-socket / datei / codex-queue -- zustellbar;
+      ''  -- ein Harness laeuft, aber ohne Weg (Schluessel `grund`, `harness`);
+    oder None, wenn unter dem Pane gar nichts Bekanntes laeuft."""
+    pane_pid = tmux_feld(pane, "#{pane_pid}")
+    if (not re.fullmatch(r"%[0-9]+", pane) or not pane_pid.isdigit()
+            or tmux_feld(pane, "#{pane_dead}").strip() == "1"):
+        return None
+    pane_pid = int(pane_pid)
+    harnesses = registry_harnesses()
+    markierung = tmux_feld(pane, "#{@wb_harness}").strip()
+    prozess = harness_prozess_im_pane(pane_pid, harnesses)
+    prozess_harness = prozess[0] if prozess else None
+    # If no registered command can be identified, only the pane process itself
+    # is unambiguous. A child below an unknown wrapper may belong to a nested
+    # session of a different harness; in that case fail closed.
+    oberste_pid = prozess[1] if prozess else pane_pid
+    if markierung and prozess_harness and markierung != prozess_harness:
+        return {"weg": "", "harness": markierung,
+                "grund": "Pane-Markierung '%s' und laufender Harness '%s' widersprechen sich. "
+                         "Empfaenger nicht belegbar." % (markierung, prozess_harness)}
+    beobachtet = prozess_harness or markierung
+    d = sitzung_zu_pane(pane)
+    # Der Weg richtet sich nach dem OBERSTEN Harness des Panes (09.10.2026, Vorfall
+    # llm-stabil: ein Codex-Worker hatte eine Claude-Sitzung unter sich, und die
+    # Zustellung an Codex brach mit "Claude-Register-PID ... nicht der oberste
+    # Harness-Prozess" ab). Ist der oberste Harness eindeutig erkannt und nicht
+    # Claude, und hat er einen eigenen Weg, wird ein verschachteltes Claude-Register
+    # uebergangen -- nie beliefert. Ohne erkannten obersten Harness bleibt es beim
+    # Abbruch unten.
+    if (d and d["pid"] != oberste_pid and prozess_harness and prozess_harness != "claude"
+            and (not markierung or markierung == prozess_harness)
+            and inbox_block(prozess_harness, harnesses).get("weg") not in (None, "", "claude-socket")):
+        d = None
+    if d:
+        if d["pid"] != oberste_pid:
+            return {"weg": "", "harness": beobachtet or "claude",
+                    "grund": "Claude-Register-PID %d ist nicht der oberste Harness-Prozess "
+                             "im Pane (PID %d). Empfaenger nicht belegbar." % (
+                                 d["pid"], oberste_pid)}
+        if beobachtet and beobachtet != "claude":
+            return {"weg": "", "harness": beobachtet,
+                    "grund": "Claude-Registertreffer und Harness '%s' im Pane widersprechen sich. "
+                             "Empfaenger nicht belegbar." % beobachtet}
+        return {"weg": "claude-socket", "sitzung": d, "pid": d["pid"],
+                "adresse": d.get("messagingSocketPath", ""), "name": d.get("name", ""),
+                "status": d.get("status", ""), "id": d.get("sessionId", ""), "harness": "claude"}
+    r = datei_empfaenger(pane, pane_pid)
+    if r:
+        if r["pid"] != oberste_pid:
+            return {"weg": "", "harness": beobachtet or str(r.get("harness", "")),
+                    "grund": "Datei-Inbox-PID %d ist nicht der oberste Harness-Prozess "
+                             "im Pane (PID %d). Empfaenger nicht belegbar." % (
+                                 r["pid"], oberste_pid)}
+        if beobachtet and beobachtet != r.get("harness"):
+            return {"weg": "", "harness": beobachtet,
+                    "grund": "Datei-Inbox und Harness im Pane widersprechen sich. Empfaenger nicht belegbar."}
+        return {"weg": "datei", "anmeldung": r, "pid": r["pid"], "adresse": r["_ordner"],
+                "name": str(r.get("harness", "")), "status": str(r.get("status", "")),
+                "id": str(r.get("sitzung", "") or ""), "harness": str(r.get("harness", "")),
+                "transcript": str(r.get("transcript", "") or "")}
+    kandidaten = set(harnesses) | set(EINGEBAUT)
+    for hid in sorted(kandidaten):
+        block = inbox_block(hid, harnesses)
+        if block.get("weg") != "codex-queue":
+            continue
+        ziel, grund = codex_empfaenger(pane_pid, block)
+        if ziel:
+            return {"weg": "codex-queue", "ziel": ziel, "pid": ziel["pid"],
+                    "adresse": ziel["codex_home"], "name": hid, "status": "unbekannt",
+                    "id": ziel["thread"], "harness": hid, "transcript": ziel["rollout"]}
+        if grund:
+            return {"weg": "", "harness": hid, "grund": grund}
+    hid = beobachtet
+    if not hid:
+        return None
+    if tmux_feld(pane, "#{pane_dead}").strip() == "1":
+        return None  # die Option steht noch, der Prozess ist weg
+    block = inbox_block(hid, harnesses)
+    weg = block.get("weg") or ""
+    if weg == "datei":
+        grund = ("der %s-Adapter hat sich nicht in %s angemeldet. `wb-inbox einrichten %s` "
+                 "installiert ihn; er wirkt ab dem naechsten Start von %s." % (
+                     hid, INBOX_DIR, hid, hid))
+    elif weg == "claude-socket":
+        grund = "keine lebende Claude-Sitzung mit Socket im Register %s." % SESSIONS
+    elif weg == "codex-queue":
+        grund = "kein codex-Prozess unter dem Pane gefunden."
+    else:
+        grund = block.get("grund") or "kein Zustellweg ohne Eingabezeile bekannt."
+    return {"weg": "", "harness": hid, "grund": grund}
+
+
+def _kein_empfaenger(pane):
+    fehler("keine lebende Claude-Sitzung und kein anderer Inbox-Empfaenger unter Pane %s "
+           "(Register %s, Datei-Inbox %s%s%s)." % (
+               pane, SESSIONS, INBOX_DIR,
+               ", tmux-Socket %s" % TMUX_SOCKET if TMUX_SOCKET else "",
+               ", nur PID %d" % NUR_PID if NUR_PID else ""))
+
+
+def _kein_weg(pane, e):
+    # Steht codex vor einem Trust-Dialog, hat es oft noch keinen Thread; das ist dann
+    # nicht der Befund, sondern der Dialog.
+    dialog = codex_dialog(pane) if e.get("harness") == "codex" else None
+    if dialog:
+        fehler(codex_dialog_meldung(dialog, pane))
+        return
+    fehler("kein Zustellweg ohne Eingabezeile fuer '%s' unter Pane %s: %s Es wurde NICHT "
+           "ersatzweise getippt." % (e.get("harness") or "?", pane, e.get("grund", "")))
+
+
+def cmd_finde(pane):
+    e = empfaenger(pane)
+    if not e:
+        return 1
+    if not e.get("weg"):
+        _kein_weg(pane, e)
+        return EXIT_KEIN_WEG
+    sys.stdout.write("%d\t%s\t%s\t%s\t%s\t%s\n" % (
+        e["pid"], e.get("adresse", ""), e.get("name", ""), e.get("status", ""),
+        e.get("id", ""), e["weg"]))
     return 0
 
 
@@ -330,25 +1684,111 @@ def cmd_transcript(pane):
     Bewusst NICHT ueber `wb-state worker-transcript`: das braucht einen Eintrag
     im Zustandsdokument der Werkbank, den ein Worker in einem fremden
     Verzeichnis nicht immer hat (gemessen). Hier reicht der Pane.
+
+    Seit 29.09.2026 auch fuer die anderen Wege: pi meldet seine Sitzungsdatei in der
+    Anmeldung, codex fuehrt sie als rollout_path am Thread.
     """
-    d = sitzung_zu_pane(pane)
-    if not d:
+    e = empfaenger(pane)
+    if not e or not e.get("weg"):
         return 1
-    sid = d.get("sessionId")
-    if not sid:
+    if e["weg"] == "claude-socket":
+        sid = e.get("id")
+        if not sid:
+            return 1
+        treffer = glob.glob(os.path.expanduser("~/.claude/projects/*/%s.jsonl" % sid))
+        if not treffer:
+            return 1
+        sys.stdout.write("%s\n" % treffer[0])
+        return 0
+    pfad = e.get("transcript") or ""
+    if not pfad or not os.path.isfile(pfad):
         return 1
-    treffer = glob.glob(os.path.expanduser("~/.claude/projects/*/%s.jsonl" % sid))
-    if not treffer:
-        return 1
-    sys.stdout.write("%s\n" % treffer[0])
+    sys.stdout.write("%s\n" % pfad)
     return 0
 
 
 def cmd_status(pane):
-    d = sitzung_zu_pane(pane)
-    if not d:
+    e = empfaenger(pane)
+    if not e or not e.get("weg"):
         return 1
-    sys.stdout.write("%s\t%s\n" % (d.get("status", ""), d.get("statusUpdatedAt", "")))
+    if e["weg"] == "claude-socket":
+        d = e["sitzung"]
+        sys.stdout.write("%s\t%s\n" % (d.get("status", ""), d.get("statusUpdatedAt", "")))
+        return 0
+    seit = (e.get("anmeldung") or {}).get("seit", "")
+    sys.stdout.write("%s\t%s\n" % (e.get("status", "") or "unbekannt", seit))
+    return 0
+
+
+def cmd_einrichten(rest):
+    """Den Adapter eines Harness an den Ort legen, von dem der Harness ihn laedt.
+    Idempotent; eine fremde Datei am Ziel wird nie ueberschrieben."""
+    if not rest:
+        fehler("Aufruf: wb-inbox einrichten <harness> [--home <dir>]")
+        return 2
+    hid, rest = rest[0], rest[1:]
+    home = None
+    if rest[:1] == ["--home"] and len(rest) == 2:
+        home = os.path.abspath(rest[1])
+    elif rest:
+        fehler("wb-inbox einrichten: unbekanntes Argument '%s'." % rest[0])
+        return 2
+    block = inbox_block(hid)
+    weg = block.get("weg") or ""
+    if weg != "datei":
+        if weg:
+            sys.stdout.write("%s: Weg '%s' braucht keinen Adapter — nichts einzurichten.\n" % (hid, weg))
+            return 0
+        fehler("%s: %s" % (hid, block.get("grund") or "kein Zustellweg eingetragen."))
+        return EXIT_KEIN_WEG
+    e = block.get("einrichten") or {}
+    quelle = os.path.join(HIER, "inbox", str(e.get("quelle") or ""))
+    ziel = str(e.get("ziel") or "")
+    if not e.get("quelle") or not ziel or not os.path.isfile(quelle):
+        fehler("%s: Adapterquelle '%s' oder Ziel fehlt (Registry inbox.einrichten)." % (hid, quelle))
+        return 1
+    if ziel.startswith("~/"):
+        ziel = os.path.join(home or os.path.expanduser("~"), ziel[2:])
+    with open(quelle, encoding="utf-8") as f:
+        inhalt = f.read()
+    if os.path.exists(ziel):
+        try:
+            with open(ziel, encoding="utf-8") as f:
+                alt = f.read()
+        except OSError as ex:
+            fehler("%s nicht lesbar (%s) — nichts geschrieben." % (ziel, ex))
+            return 1
+        if alt == inhalt:
+            sys.stdout.write("%s: Adapter ist aktuell (%s).\n" % (hid, ziel))
+            return 0
+        if "wb-inbox einrichten" not in alt[:600]:
+            fehler("%s: am Ziel %s liegt eine fremde Datei — nichts ueberschrieben." % (hid, ziel))
+            return 1
+    os.makedirs(os.path.dirname(ziel), exist_ok=True)
+    tmp = "%s.wb-inbox.%d.tmp" % (ziel, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(inhalt)
+    os.chmod(tmp, 0o644)
+    os.rename(tmp, ziel)
+    sys.stdout.write("%s: Adapter geschrieben nach %s — wirkt ab dem naechsten Start.\n" % (hid, ziel))
+    return 0
+
+
+def cmd_wege(rest):
+    harnesses = registry_harnesses()
+    ids = list(harnesses) or list(EINGEBAUT)
+    zeilen = []
+    for hid in ids:
+        b = inbox_block(hid, harnesses)
+        quelle = "registry" if isinstance((harnesses.get(hid) or {}).get("inbox"), dict) else (
+            "eingebaut" if hid in EINGEBAUT else "keiner")
+        zeilen.append({"harness": hid, "weg": b.get("weg") or "", "grund": b.get("grund") or "",
+                       "quelle": quelle})
+    if "--json" in rest:
+        sys.stdout.write(json.dumps(zeilen, ensure_ascii=False) + "\n")
+        return 0
+    for z in zeilen:
+        sys.stdout.write("%-14s %-14s %s\n" % (z["harness"], z["weg"] or "-", z["grund"] or z["quelle"]))
     return 0
 
 
@@ -470,10 +1910,11 @@ def cmd_pause(rest):
 def cmd_sende(pane, datei):
     vorrat = vorrat_bestimmen()
     pause = pause_lesen(vorrat)
-    # Die Herkunft wird nur gemessen, wenn sie etwas entscheidet: ps-Kette und
-    # wb-mensch kosten Zeit, und bei offenem Schalter geht jede Klasse durch.
+    # Die Herkunft wird seit 10.10.2026 bei jeder Sendung gemessen: sie steht sichtbar
+    # ueber jedem Text (Abschnitt HERKUNFT), und der Pausenschalter liest dieselbe Klasse.
+    h = herkunft(pane, vorrat)
+    klasse = h["klasse"]
     if pause is not None:
-        klasse = absender_klasse(vorrat)
         if klasse in ABSENDER_GEBLOCKT:
             teile = ["zurückgehalten — Agent-Verkehr ist pausiert (Absender-Klasse '%s')" % klasse]
             if pause.get("seit"):
@@ -482,13 +1923,46 @@ def cmd_sende(pane, datei):
                 teile.append("(%s)" % pause["grund"])
             fehler(" ".join(teile) + ".")
             return 4
-    d = sitzung_zu_pane(pane)
-    if not d:
-        fehler("keine lebende Claude-Sitzung unter Pane %s (Register %s%s%s)."
-               % (pane, SESSIONS,
-                  ", tmux-Socket %s" % TMUX_SOCKET if TMUX_SOCKET else "",
-                  ", nur PID %d" % NUR_PID if NUR_PID else ""))
+    # Eine SCHLAFENDE Sitzung (wb-schlaf, 25.09.2026) hat keinen Socket: erst wecken,
+    # dann zustellen. Gilt fuer jeden Harness; hier ist es der Claude-Weg.
+    if tmux_feld(pane, "#{@wb_schlaeft}").strip():
+        schlaf = os.path.join(os.path.expanduser("~"), ".local", "bin", "wb-schlaf")
+        umg = dict(os.environ)
+        if TMUX_SOCKET:
+            umg["WB_TMUX_SOCKET"] = TMUX_SOCKET
+        try:
+            subprocess.run([schlaf, "wecken", pane, "--warten", "120"], env=umg,
+                           capture_output=True, text=True, timeout=150)
+        except Exception as e:
+            fehler("%s schlief, Wecken gescheitert: %s" % (pane, e))
+            return 1
+    # Welcher Weg? Allein nach dem, was unter dem Pane wirklich laeuft. Die Riegel
+    # oben (Pausenschalter, Absender-Klasse) und in empfaenger() (-L/--socket, --pid,
+    # Ahnenreihe) gelten fuer jeden Weg gleich.
+    e = empfaenger(pane)
+    if not e:
+        _kein_empfaenger(pane)
         return 1
+    if not e.get("weg"):
+        _kein_weg(pane, e)
+        return EXIT_KEIN_WEG
+    if e["weg"] != "claude-socket":
+        try:
+            text = open(datei, encoding="utf-8").read()
+        except Exception as ex:
+            fehler("Auftragsdatei nicht lesbar (%s): %s" % (datei, ex))
+            return 1
+        if not text.strip():
+            fehler("Auftragsdatei ist leer — nichts gesendet.")
+            return 1
+        text = herkunft_kopf(h, text)
+        if e["weg"] == "datei":
+            return datei_senden(e["anmeldung"], text, klasse, h)
+        if e["weg"] == "codex-queue":
+            return codex_senden(e["ziel"], text, registry_harnesses(), pane)
+        fehler("Weg '%s' ist diesem Werkzeug unbekannt — nichts gesendet." % e["weg"])
+        return EXIT_KEIN_WEG
+    d = e["sitzung"]
     pid = d["pid"]
     sock = d["messagingSocketPath"]
     token = peer_token(pid)
@@ -504,6 +1978,25 @@ def cmd_sende(pane, datei):
     if not text.strip():
         fehler("Auftragsdatei ist leer — nichts gesendet.")
         return 1
+    text = herkunft_kopf(h, text)
+
+    # Tafel-Meldung (Abschnitt TAFEL-MELDUNGEN): nie in einen Held-Dialog. Bezeugt wird nur, was
+    # zum gemessenen Modus des Empfaengers passt; sonst die Claude-Datei-Inbox, wenn ihr Hook in
+    # dieser Sitzung belegt laeuft. Ohne belegten Hook bleibt es beim bisherigen Weg.
+    klasse_modus = rechtemodus()
+    if aus_tafel():
+        art, wert = tafel_bezeugung(d, klasse_modus)
+        if art == "modus" and UMSCHLAG not in text.lower():
+            klasse_modus = wert
+        else:
+            grund = wert if art == "datei" else "Umschlagname im Text"
+            if claude_hook_aktiv(d):
+                return claude_datei_senden(d, text, h, grund)
+            # Ohne dialogfreien Weg wird NICHT zugestellt (Nachtrag 1, der Nutzer 11.10.: "es soll
+            # niemand den Pane versperren"); die Tafel vermerkt es im Verlauf und in der Gruppe.
+            fehler("Tafel-Meldung an %s NICHT zugestellt: kein dialogfreier Weg (%s; Einspiel-Hook in "
+                   "dieser Sitzung nicht belegt). Claude haelte sie an." % (pane, grund))
+            return EXIT_KEIN_WEG
 
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
@@ -514,20 +2007,27 @@ def cmd_sende(pane, datei):
                "gestartet und die Adresse tot." % (sock, e))
         return 1
 
-    # Wer haengt wirklich am anderen Ende? Die PID steckt zwar im Socketnamen,
-    # aber ein Name ist keine Messung: ein neu gestarteter Prozess kann eine
-    # alte Adresse geerbt haben. Laesst sich das nicht ablesen (fremdes System),
-    # wird trotzdem gesendet -- aber es wird gesagt.
+    # Wer haengt wirklich am anderen Ende? Ohne Messung keine Zustellung.
     gegen = peer_pid(s)
-    if gegen is not None and gegen != pid:
+    if gegen != pid:
         s.close()
-        fehler("am Socket %s haengt Prozess %d, erwartet war %d — nichts gesendet."
-               % (sock, gegen, pid))
+        fehler("am Socket %s haengt Prozess %s, erwartet war %d — nichts gesendet."
+               % (sock, gegen if gegen is not None else "nicht pruefbar", pid))
+        return 1
+    pane_pid = tmux_feld(pane, "#{pane_pid}")
+    if not pane_pid.isdigit() or not ahnenreihe(pid, int(pane_pid)):
+        s.close()
+        fehler("Sitzung %d ist kein belegter Nachfahre von Pane %s — nichts gesendet." % (pid, pane))
         return 1
 
+    # Rechtemodus der sendenden Sitzung bezeugen, wenn er belegt ist (Abschnitt
+    # RECHTEMODUS im Kopf); sonst geht der Text wie bisher ohne Umschlag.
+    inhalt = mit_umschlag(text, klasse_modus)
+    if inhalt is text:
+        klasse_modus = None
     zeilen = [
         json.dumps({"type": "auth", "token": token}),
-        json.dumps({"type": "user", "message": {"role": "user", "content": text}}),
+        json.dumps({"type": "user", "message": {"role": "user", "content": inhalt}}),
     ]
     try:
         s.sendall(("\n".join(zeilen) + "\n").encode("utf-8"))
@@ -541,14 +2041,16 @@ def cmd_sende(pane, datei):
         except Exception:
             pass
 
-    sys.stdout.write("in die Inbox von '%s' (pid %d%s) geschrieben: %s\n" % (
+    sys.stdout.write("weg=claude-socket: in die Inbox von '%s' (pid %d%s, Herkunft: %s) geschrieben: %s\n" % (
         d.get("name", "?"), pid,
-        "" if gegen is not None else ", Gegenstelle nicht pruefbar", sock))
+        ", Rechtemodus bezeugt: %s" % klasse_modus if klasse_modus else "",
+        "Auftrag" if h["auftrag"] else "Information", sock))
     return 0
 
 
 def main(argv):
     global TMUX_SOCKET, NUR_PID, ABSENDER
+    global TAFEL_HALTER
     while argv and argv[0] in ("-L", "--socket", "--pid", "--absender"):
         if len(argv) < 2:
             fehler("nach %s fehlt der Wert." % argv[0])
@@ -576,12 +2078,45 @@ def main(argv):
         return cmd_status(argv[1])
     if befehl == "transcript" and len(argv) == 2:
         return cmd_transcript(argv[1])
+    if befehl == "sende" and len(argv) == 5 and argv[3] == "--tafel-halter":
+        # Hinten angehaengt, damit Aufrufer-Attrappen mit festen Positionen ($2 Server, $4 Pane,
+        # $5 Datei) unveraendert lesen. Wirkt nur mit wb-tafel als gemessenem Ahnen.
+        if not re.fullmatch(r"[0-9A-Fa-f-]{8,64}:(bypass|prompting)", argv[4]):
+            fehler("--tafel-halter erwartet <sessionId>:bypass|prompting, nicht '%s'." % argv[4])
+            return 2
+        TAFEL_HALTER = argv[4]
+        return cmd_sende(argv[1], argv[2])
     if befehl == "sende" and len(argv) == 3:
         return cmd_sende(argv[1], argv[2])
+    if befehl == "codex-queue" and len(argv) in (2, 3) and argv[2:] in ([], ["--start"]):
+        return cmd_codex_queue(argv[1], argv[2:] == ["--start"])
+    if befehl == "dialog" and len(argv) == 2:
+        name = codex_dialog(argv[1])
+        if not name:
+            return 1
+        sys.stdout.write("%s\n" % name)
+        return 0
+    if befehl == "absender-pane" and len(argv) == 1:
+        von = absender_pane()
+        if not von:
+            return 1
+        sys.stdout.write("%s\n" % von)
+        return 0
+    if befehl == "herkunft" and len(argv) == 2:
+        h = herkunft(argv[1], vorrat_bestimmen())
+        sys.stdout.write("%s\t%s\t%s\t%s\n" % ("auftrag" if h["auftrag"] else "information",
+                                                h["klasse"], h["pane"] or "-", h["spawner"] or "-"))
+        return 0
     if befehl == "pause":
         return cmd_pause(argv[1:])
-    fehler("Aufruf: wb-inbox finde|status|transcript <pane> "
+    if befehl == "einrichten":
+        return cmd_einrichten(argv[1:])
+    if befehl == "wege":
+        return cmd_wege(argv[1:])
+    fehler("Aufruf: wb-inbox finde|status|transcript|dialog <pane> "
            "| wb-inbox [--absender <klasse>] sende <pane> <textdatei> "
+           "| wb-inbox [--absender <klasse>] herkunft <pane> | wb-inbox absender-pane "
+           "| wb-inbox einrichten <harness> [--home <dir>] | wb-inbox wege [--json] "
            "| wb-inbox pause an|aus|status [--base <dir>] [--vorrat <dir>] [--grund <text>] [--json]")
     return 2
 

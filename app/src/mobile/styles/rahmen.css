@@ -1,0 +1,260 @@
+/* RAHMEN, NAVIGATION, TAB-LEISTE, STAPEL UND ZWEISPALTE. */
+
+/* Der Rahmen folgt dem sichtbaren Ausschnitt (visualViewport, geraet.ts):
+   oeffnet sich die Tastatur, schrumpft er, und der Composer sitzt darueber. */
+.rahmen {
+  position: fixed; left: 0; right: 0;
+  top: var(--vv-oben, 0px);
+  height: 100vh;
+  height: 100dvh;
+  height: var(--vv-hoehe, 100dvh);
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--fenster);
+}
+.buehne { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+.rahmen[data-gesperrt='ja'] .buehne,
+.rahmen[data-gesperrt='ja'] .tableiste,
+.rahmen[data-gesperrt='laedt'] .tableiste { display: none; }
+
+/* --- Ansichten im Stapel --------------------------------------------------- */
+.ansicht {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  background: var(--fenster); min-width: 0;
+}
+.ansicht.oben { z-index: 2; }
+.ansicht.geht { z-index: 3; pointer-events: none; }
+.rahmen[data-layout='stapel'] .ansicht.unten:not(.unter-blatt) { visibility: hidden; }
+
+.inhalt {
+  flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  overscroll-behavior-y: contain; -webkit-overflow-scrolling: touch;
+  padding: 0 var(--sicher-rechts) 28px var(--sicher-links);
+}
+
+/* --- Navigationsleiste ----------------------------------------------------- */
+.navleiste {
+  flex: none; position: relative; z-index: 1;
+  display: grid; grid-template-columns: minmax(96px, 1fr) minmax(0, max-content) minmax(96px, 1fr); align-items: center;
+  min-height: calc(var(--nav-hoehe) + var(--sicher-oben));
+  padding: var(--sicher-oben) max(8px, var(--sicher-rechts)) 0 max(8px, var(--sicher-links));
+  background: var(--fenster);
+  transition: background-color 0.2s;
+}
+.ansicht.titel-eingeklappt .navleiste, .ansicht.gescrollt .navleiste { background: var(--leiste); }
+:root[data-thema='hell'] .ansicht.titel-eingeklappt .navleiste,
+:root[data-thema='hell'] .ansicht.gescrollt .navleiste { background: var(--leiste); }
+/* Wird es eng, kuerzt sich die Zurueck-Beschriftung, nie der Titel in der Mitte. */
+.nav-links { display: flex; align-items: center; justify-self: stretch; min-width: 0; overflow: hidden; }
+.nav-rechts { display: flex; align-items: center; justify-content: flex-end; gap: 4px; justify-self: end; }
+.nav-mitte { text-align: center; min-width: 0; padding: 2px 4px; }
+.nav-titel {
+  font-size: 17px; font-weight: 600; line-height: 1.25;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ansicht.mit-grossem-titel .nav-titel { opacity: 0; transition: opacity 0.15s; }
+.ansicht.mit-grossem-titel.titel-eingeklappt .nav-titel { opacity: 1; }
+.nav-unterzeile {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  font-size: 12px; color: var(--gedaempft); white-space: nowrap; overflow: hidden;
+}
+.nav-unterzeile .punkt { width: 8px; height: 8px; }
+.nav-unterzeile .punkt.will { box-shadow: 0 0 0 2px var(--wartet-matt); }
+.nav-maschine { overflow: hidden; text-overflow: ellipsis; }
+.nav-zurueck {
+  display: flex; align-items: center; gap: 0; min-height: 44px; padding: 0 8px 0 0;
+  color: var(--akzent-text); font-size: 17px; max-width: 100%;
+}
+.nav-zurueck .symbol { margin-left: -2px; }
+.nav-zurueck .symbol path { stroke-width: 2.2; }
+.nav-zurueck-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.nav-knopf {
+  width: 44px; height: 44px; display: grid; place-items: center; color: var(--akzent-text); border-radius: 22px;
+}
+.nav-knopf .symbol path { stroke-width: 2; }
+.nav-knopf:disabled, .nav-text-knopf:disabled { opacity: 0.35; }
+.nav-text-knopf { min-height: 44px; padding: 0 8px; color: var(--akzent-text); font-size: 17px; white-space: nowrap; }
+.nav-text-knopf.primaer { font-weight: 600; }
+
+.gross-titel {
+  font-size: 2rem; font-weight: 700; letter-spacing: 0.01em; line-height: 1.2;
+  padding: 0 calc(var(--rand) + 4px) 14px;
+}
+
+/* --- Tab-Leiste (iOS 18: unten, 49 pt ueber dem Home-Indikator) ------------- */
+.tableiste {
+  flex: none; position: relative; z-index: 10;
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  min-height: calc(var(--tab-hoehe) + var(--sicher-unten));
+  padding: 0 max(8px, var(--sicher-rechts)) var(--sicher-unten) max(8px, var(--sicher-links));
+  background: var(--leiste);
+}
+.tab {
+  position: relative;
+  display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
+  gap: 1px; padding-top: 5px; min-height: var(--tab-hoehe);
+  color: var(--gedaempft); font-size: 10px; font-weight: 500; letter-spacing: 0.01em;
+}
+.tab.aktiv { color: var(--akzent-text); }
+.tab-symbol { position: relative; display: block; }
+.tab .symbol path { stroke-width: 1.6; }
+.tab.aktiv .symbol path { fill: color-mix(in srgb, currentColor 22%, transparent); }
+.tab-zahl {
+  position: absolute; top: 2px; left: calc(50% + 5px); min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: 9px; background: var(--zustand-wartet); color: var(--zustand-wartet-tinte);
+  font-size: 12px; font-weight: 600; line-height: 18px; text-align: center;
+  box-shadow: 0 0 0 2px var(--leiste);
+}
+.tab[data-tab='meldungen'] .tab-zahl { background: var(--akzent); color: var(--akzent-tinte); }
+/* Im Chat nimmt der Composer den Platz der Tab-Leiste; mit offener Tastatur verschwindet sie ganz. */
+.rahmen[data-layout='stapel'][data-composer-oben='ja'] .tableiste,
+:root.tastatur-offen .tableiste { display: none; }
+
+/* --- Zweispaltig (iPad, breite Fenster) ------------------------------------ */
+.rahmen[data-layout='geteilt'] .tab { flex-direction: row; justify-content: center; align-items: center; gap: 8px; padding-top: 0; font-size: 13px; }
+.rahmen[data-layout='geteilt'] .tab .symbol { width: 24px; height: 24px; }
+/* Im breiten Fenster steht die Zahl wie in iPadOS hinter der Beschriftung. */
+.rahmen[data-layout='geteilt'] .tab-zahl { position: static; margin-left: 2px; box-shadow: none; }
+.rahmen[data-layout='geteilt'] .buehne > .ansicht.wurzel { right: auto; width: var(--liste-breite); }
+.rahmen[data-layout='geteilt'] .buehne > .ansicht:not(.wurzel):not(.blatt-ansicht) { left: var(--liste-breite); background: var(--grund); }
+.rahmen[data-layout='geteilt'] .buehne > .ansicht:not(.wurzel):not(.blatt-ansicht) .navleiste { background: var(--grund); }
+.rahmen[data-layout='geteilt'] .buehne > .ansicht:not(.wurzel):not(.blatt-ansicht).gescrollt .navleiste { background: var(--leiste); }
+.rahmen[data-layout='geteilt'] .buehne > .ansicht.wurzel { visibility: visible; }
+.rahmen[data-layout='geteilt'] .buehne > .ansicht.unten:not(.wurzel):not(.unter-blatt) { visibility: hidden; }
+.rahmen[data-layout='geteilt'] .buehne > .ansicht[data-tiefe='1'] .nav-zurueck { display: none; }
+.platzhalter-detail { display: none; }
+.rahmen[data-layout='geteilt'] .buehne[data-detail='nein'] .platzhalter-detail {
+  display: flex; position: absolute; top: 0; bottom: 0; right: 0; left: var(--liste-breite);
+  align-items: center; justify-content: center; padding: 32px; background: var(--grund);
+  color: var(--gedaempft); text-align: center; line-height: 1.4;
+}
+.platzhalter-detail p { max-width: 30ch; }
+
+/* --- Blatt (Neue Sitzung): iPhone von unten, iPad als Formblatt ------------- */
+.buehne[data-blatt='ja']::after {
+  content: ''; position: absolute; inset: 0; z-index: 4; background: var(--abdunkeln);
+}
+.ansicht.blatt-ansicht { z-index: 5; box-shadow: 0 -2px 24px var(--schatten); }
+.rahmen[data-layout='stapel'] .ansicht.blatt-ansicht {
+  top: calc(var(--sicher-oben) + 10px); border-radius: 12px 12px 0 0; overflow: hidden;
+}
+.rahmen[data-layout='stapel'] .blatt-ansicht .navleiste { padding-top: 0; min-height: 56px; }
+.rahmen[data-layout='stapel'] .blatt-ansicht .inhalt { padding-bottom: calc(28px + var(--sicher-unten)); }
+.rahmen[data-layout='geteilt'] .ansicht.blatt-ansicht {
+  inset: auto; left: 50%; top: 50%; width: min(560px, 92%); height: min(700px, 90%);
+  transform: translate(-50%, -50%); border-radius: 14px; overflow: hidden;
+}
+.rahmen[data-layout='geteilt'] .blatt-ansicht .navleiste { padding-top: 0; min-height: 56px; }
+.blatt-ansicht .navleiste { background: var(--fenster); }
+
+/* --- Bewegung: iOS-Push und -Pop -------------------------------------------- */
+.rahmen[data-layout='stapel'] .einfahren { animation: einfahren 0.36s cubic-bezier(0.2, 0.8, 0.2, 1); box-shadow: -10px 0 28px var(--schatten); }
+.rahmen[data-layout='stapel'] .wegschieben { animation: wegschieben 0.36s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.rahmen[data-layout='stapel'] .ausfahren { animation: ausfahren 0.3s cubic-bezier(0.3, 0.6, 0.3, 1) forwards; box-shadow: -10px 0 28px var(--schatten); }
+.rahmen[data-layout='stapel'] .hervorkommen { animation: hervorkommen 0.3s cubic-bezier(0.3, 0.6, 0.3, 1); }
+.rahmen[data-layout='geteilt'] .einfahren { animation: einblenden 0.22s ease-out; }
+.rahmen[data-layout='geteilt'] .ausfahren { animation: ausblenden 0.18s ease-in forwards; }
+.rahmen[data-layout='stapel'] .blatt-ein { animation: blatt-hoch 0.38s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.rahmen[data-layout='stapel'] .blatt-aus { animation: blatt-runter 0.3s ease-in forwards; }
+.rahmen[data-layout='geteilt'] .blatt-ein { animation: blatt-auf 0.25s ease-out; }
+.rahmen[data-layout='geteilt'] .blatt-aus { animation: blatt-zu 0.2s ease-in forwards; }
+@keyframes einfahren { from { transform: translateX(100%); } to { transform: none; } }
+@keyframes wegschieben { from { transform: none; visibility: visible; } to { transform: translateX(-30%); visibility: visible; } }
+@keyframes ausfahren { from { transform: none; } to { transform: translateX(100%); } }
+@keyframes hervorkommen { from { transform: translateX(-30%); } to { transform: none; } }
+@keyframes einblenden { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ausblenden { from { opacity: 1; } to { opacity: 0; } }
+@keyframes blatt-hoch { from { transform: translateY(100%); } to { transform: none; } }
+@keyframes blatt-runter { from { transform: none; } to { transform: translateY(100%); } }
+@keyframes blatt-auf { from { opacity: 0; transform: translate(-50%, -46%); } to { opacity: 1; transform: translate(-50%, -50%); } }
+@keyframes blatt-zu { from { opacity: 1; transform: translate(-50%, -50%); } to { opacity: 0; transform: translate(-50%, -46%); } }
+
+/* Nachgebildetes Zurueck-Wischen: nur Home-Bildschirm-App, nur Stapel (rahmen.ts). */
+.wischkante {
+  position: absolute; left: 0; top: calc(var(--nav-hoehe) + var(--sicher-oben)); bottom: 0;
+  width: 16px; z-index: 6; touch-action: none;
+}
+.rahmen[data-layout='geteilt'] .wischkante { display: none; }
+
+/* --- Modale Ebenen: Aktionsblatt und Abfrage -------------------------------- */
+.ebene {
+  position: absolute; inset: 0; z-index: 50; display: flex;
+  background: transparent; transition: background-color 0.2s;
+}
+.ebene.sichtbar { background: var(--abdunkeln); }
+.ebene.geht { background: transparent; }
+.ebene.aktionsblatt { align-items: flex-end; justify-content: center; }
+.aktionsblatt-inhalt {
+  width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 8px;
+  padding: 8px max(8px, var(--sicher-rechts)) calc(8px + var(--sicher-unten)) max(8px, var(--sicher-links));
+  transform: translateY(100%); transition: transform 0.28s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.ebene.sichtbar .aktionsblatt-inhalt { transform: none; }
+.ebene.geht .aktionsblatt-inhalt { transform: translateY(100%); }
+.aktionsgruppe { display: flex; flex-direction: column; gap: 1px; border-radius: 14px; overflow: hidden; }
+.aktionstitel {
+  background: var(--karte); color: var(--gedaempft); font-size: 13px; text-align: center; padding: 14px 16px;
+}
+.aktion {
+  background: var(--karte); min-height: 56px; font-size: 1.18rem; color: var(--akzent-text); text-align: center;
+}
+.aktion.zerstoerend { color: var(--aus); }
+.aktion.abbrechen { border-radius: 14px; font-weight: 600; }
+.ebene.abfrage { align-items: center; justify-content: center; }
+.abfrage-box {
+  width: min(300px, calc(100% - 48px)); background: var(--karte); border-radius: 14px; overflow: hidden;
+  opacity: 0; transform: scale(1.08); transition: opacity 0.2s, transform 0.2s;
+}
+.ebene.sichtbar .abfrage-box { opacity: 1; transform: none; }
+.ebene.geht .abfrage-box { opacity: 0; }
+.abfrage-kopf { padding: 20px 16px 16px; text-align: center; display: flex; flex-direction: column; gap: 6px; }
+.abfrage-titel { font-size: 17px; font-weight: 600; }
+.abfrage-text { font-size: 13px; line-height: 1.35; }
+.abfrage-feld {
+  margin-top: 8px; width: 100%; resize: none; border: 0; border-radius: 8px; padding: 8px 10px;
+  background: var(--erhoben); font-size: max(16px, 1rem); line-height: 1.3;
+}
+.abfrage-knoepfe { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--linie); padding-top: 1px; }
+.abfrage-knopf { background: var(--karte); min-height: 44px; color: var(--akzent-text); font-size: 17px; text-align: center; }
+.abfrage-knopf.ja { font-weight: 600; }
+.abfrage-knopf.zerstoerend { color: var(--aus); }
+.abfrage-knopf:disabled { opacity: 0.4; }
+
+/* --- Formblatt: ein Formular als Blatt -------------------------------------
+ * iPhone: von unten, so hoch wie der Inhalt oder (grosse Stufe) bis unter die
+ * Statusleiste, oben 12 pt gerundet wie „Neue Sitzung“. iPad: mittig als
+ * Formblatt. „Abbrechen“ links, die Handlung rechts. */
+.ebene.formblatt { align-items: flex-end; justify-content: center; }
+.formblatt-box {
+  width: 100%; max-height: calc(100% - var(--sicher-oben) - 10px);
+  display: flex; flex-direction: column; background: var(--fenster);
+  border-radius: 12px 12px 0 0; overflow: hidden; box-shadow: 0 -2px 24px var(--schatten);
+  transform: translateY(100%); transition: transform 0.32s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.ebene.formblatt.gross .formblatt-box { height: calc(100% - var(--sicher-oben) - 10px); }
+.ebene.sichtbar .formblatt-box { transform: none; }
+.ebene.geht .formblatt-box { transform: translateY(100%); }
+.formblatt-kopf {
+  flex: none; display: grid; align-items: center; min-height: 56px;
+  /* Die Seiten wachsen mit ihrer Beschriftung; wird es eng, kuerzt sich der Titel, nie eine Handlung. */
+  grid-template-columns: minmax(max-content, 1fr) minmax(0, max-content) minmax(max-content, 1fr);
+  padding: 0 max(8px, var(--sicher-rechts)) 0 max(8px, var(--sicher-links));
+}
+.formblatt-titel { font-size: 17px; font-weight: 600; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 4px; }
+.formblatt-links { display: flex; min-width: 0; }
+.formblatt-rechts { display: flex; justify-content: flex-end; }
+.formblatt-inhalt {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+  padding: 0 var(--sicher-rechts) var(--sicher-unten) var(--sicher-links);
+}
+:root.tastatur-offen .formblatt-inhalt { padding-bottom: 0; }
+.formblatt-box.sendet .formblatt-inhalt { opacity: 0.6; pointer-events: none; }
+.nav-text-knopf.zerstoerend { color: var(--aus); }
+.rahmen[data-layout='geteilt'] .ebene.formblatt { align-items: center; }
+.rahmen[data-layout='geteilt'] .formblatt-box {
+  width: min(560px, 92%); max-height: min(700px, 90%); border-radius: 14px;
+  opacity: 0; transform: translateY(4%); transition: opacity 0.2s, transform 0.25s ease-out;
+}
+.rahmen[data-layout='geteilt'] .ebene.formblatt.gross .formblatt-box { height: min(700px, 90%); }
+.rahmen[data-layout='geteilt'] .ebene.sichtbar .formblatt-box { opacity: 1; transform: none; }
+.rahmen[data-layout='geteilt'] .ebene.geht .formblatt-box { opacity: 0; }
+.rahmen[data-layout='geteilt'] .formblatt-inhalt { padding-bottom: 0; }

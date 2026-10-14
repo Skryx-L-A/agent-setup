@@ -317,6 +317,75 @@ def natives_maximum(res):
 
 # --------------------------------------------------------------- Gewichte
 
+SPLASH_PROVIDER = "splash-lokal"
+
+
+def splash_buchung():
+    """Wie wb-splash-server bucht ('wb-splash-server buchung'): fester Arbeitssatz
+    oder Grundsatz plus KV je Token. Dieselbe Quelle wie die Buchung beim Start."""
+    _, pfad = splash_arbeitssatz_gib()
+    p = run([pfad, "buchung"], timeout=15)
+    try:
+        d = json.loads(p.stdout)
+    except (ValueError, TypeError):
+        d = {}
+    return d, pfad
+
+
+def splash_kv_eintrag(schluessel):
+    """Der KV-Wert je Token aus dem Register von wb-belegung, eingebaute Eintraege
+    eingeschlossen ('wb-belegung kv liste --json') -- kein eigener Wert hier."""
+    pfad = wb_belegung_pfad()
+    if not pfad:
+        return None
+    p = run([pfad, "kv", "liste", "--json"], timeout=15)
+    try:
+        return (json.loads(p.stdout) or {}).get(schluessel)
+    except (ValueError, TypeError):
+        return None
+
+
+def splash_arbeitssatz_gib():
+    # Splash (Provider splash-lokal) liegt nicht als Verzeichnis voller
+    # safetensors und nicht in 'ollama list'. Splash 1.3 belegt einen gemessenen
+    # Arbeitssatz (geladen 19,6 GiB, Spitze 27,9 GiB bei einer Anfrage mit 162.698
+    # Token; Messung vom 10.10.2026, Begruendung in wb-splash-server bei der
+    # Buchung; bis Splash 1.0 waren es 14,6 GiB). Ohne diese Zeile stand hier
+    # 0,00 GiB Gewichte und ein Bedarf von 2 GiB bei 32k.
+    # Die Zahl hat EINE Quelle: SPLASH_ARBEITSSATZ_GIB in wb-splash-server, dieselbe,
+    # die dort an wb-belegung gebucht wird. Gelesen wird sie ueber dessen Befehl
+    # 'arbeitssatz' -- aus dem Verzeichnis dieser Datei zuerst (so prueft ein
+    # Worktree seinen eigenen Stand), sonst aus ~/.local/bin. Keine Ersatzzahl:
+    # ein stiller Ersatz wuerde genau die Abweichung wieder zulassen, die diese
+    # Funktion schliesst.
+    hier = os.path.dirname(os.path.realpath(__file__))
+    pfad = next((p for p in (os.path.join(hier, "wb-splash-server"),
+                              os.path.join(BIN, "wb-splash-server")) if os.path.isfile(p)), None)
+    if pfad is None:
+        fail("Arbeitssatz von Splash nicht zu ermitteln: wb-splash-server nicht gefunden (weder neben "
+             "wb-kontext noch in %s)." % BIN)
+    p = run([pfad, "arbeitssatz"], timeout=15)
+    try:
+        wert = float(p.stdout.strip())
+    except ValueError:
+        wert = 0.0
+    if p.returncode != 0 or wert <= 0:
+        fail("Arbeitssatz von Splash nicht zu ermitteln: '%s arbeitssatz' lieferte Rueckgabewert %s, "
+             "Ausgabe '%s' (%s). Ist wb-splash-server aktuell ausgerollt?"
+             % (pfad, p.returncode, p.stdout.strip(), p.stderr.strip()[:200]))
+    return wert, pfad
+
+
+def wb_belegung_pfad():
+    """Worktrees pruefen ihren Nachbarn; installiert bleibt der Rueckfall."""
+    explizit = os.environ.get("WB_BELEGUNG", "")
+    if explizit:
+        return explizit if os.access(explizit, os.X_OK) else ""
+    hier = os.path.dirname(os.path.realpath(__file__))
+    return next((p for p in (os.path.join(hier, "wb-belegung"),
+                             os.path.join(BIN, "wb-belegung")) if os.access(p, os.X_OK)), "")
+
+
 def gewichte_gb(res):
     # GiB (/1024**3), nicht dezimales GB (/1e9) -- Pruefer-Befund B13a,
     # 19.08.2026: die fruehere Fassung holte die Groesse dezimal und addierte
@@ -325,6 +394,16 @@ def gewichte_gb(res):
     # aber die angezeigte Zahl war nicht die gerechnete. Der Feldname
     # "gewichteGb" bleibt (Auftrag C baut die Oberflaeche gegen genau dieses
     # Feld), der WERT ist ab jetzt echtes GiB wie der Rest der Rechnung.
+    if res["provider"] == SPLASH_PROVIDER:
+        buchung, bpfad = splash_buchung()
+        if buchung.get("nachKontext"):
+            return float(buchung["grundsatzGib"]), (
+                "Grundsatz des Splash-Motors, geladen und untaetig (gemessen 2026-10-10; Quelle "
+                "SPLASH_GRUNDSATZ_GIB in %s); der Cache kommt je Token dazu" % bpfad)
+        wert, pfad = splash_arbeitssatz_gib()
+        return wert, ("gemessener Arbeitssatz des Splash-Motors, Spitze mit Cache (Splash 1.3, gemessen "
+                      "2026-10-10; Quelle SPLASH_ARBEITSSATZ_GIB in %s, dieselbe Zahl wie die "
+                      "wb-belegung-Buchung)" % pfad)
     if res["provider"] == "mlx-lokal" or os.path.isdir(res["modelRef"]):
         d = res["modelRef"]
         if not os.path.isdir(d):
@@ -606,6 +685,23 @@ def kv_ollama_kunstname(reg, modelref):
 
 
 def kv_mib_pro_token(res):
+    if res["provider"] == SPLASH_PROVIDER:
+        buchung, _ = splash_buchung()
+        if buchung.get("nachKontext"):
+            eintrag = splash_kv_eintrag(buchung.get("kvSchluessel"))
+            if eintrag and isinstance(eintrag.get("mib_je_token"), (int, float)):
+                return float(eintrag["mib_je_token"]), (
+                    "%s (wb-belegung kv, Schluessel '%s')"
+                    % (eintrag.get("herkunft", "?"), buchung.get("kvSchluessel")))
+            fail("Splash bucht nach Kontext, aber wb-belegung kennt den KV-Eintrag '%s' nicht."
+                 % buchung.get("kvSchluessel"))
+        # Fester Arbeitssatz (Vorgabe bis zum Messpunkt bei 262.144 Token): Splash
+        # verwaltet seinen KV-Cache selbst; der gemessene Arbeitssatz (siehe
+        # gewichte_gb) enthaelt ihn. Ein Wert je Token waere eine zweite, erfundene
+        # Rechnung: die Annahme 0,0625 MiB/Token ergaebe bei 256k 16 GiB zusaetzlich,
+        # gemessen wuchs die Belegung bei einer 191.361-Token-Anfrage nur um 2 bis 4 GiB.
+        return 0.0, ("Splash verwaltet den KV-Cache selbst, im Arbeitssatz enthalten -- kein "
+                     "Beitrag je Token (wie die Buchung in wb-splash-server)")
     reg = kv_registry()
     kandidaten = []
     if res["provider"] == "mlx-lokal":
@@ -725,7 +821,7 @@ def denken_vorgabe(res):
     return "low"
 
 
-def plaetze_wirklich(res, tok, gewichte, ohne_sockel=False):
+def plaetze_wirklich(res, tok, gewichte, verfuegbar, ohne_sockel=False, spitze_eins=None):
     # ohne_sockel (Nachtrag 2026-09-08, siehe bereits_geladener_server() oben):
     # laeuft der Server fuer DIESES Modell schon, hat er den Fixkosten-Sockel
     # (ZUSCHLAG_FIXED_GIB in wb-belegung) schon bei seinem eigenen Start
@@ -747,10 +843,11 @@ def plaetze_wirklich(res, tok, gewichte, ohne_sockel=False):
     # dieselbe eine Sequenz". Fuer mlx-lokal (der einzige Provider, bei dem
     # pi-worker ueberhaupt bei wb-belegung bucht -- Ollama-Worker bucht
     # niemand dort) fragt diese Funktion deshalb den echten Waechter direkt,
-    # statt seine Zahlen nachzubilden: EINE Quelle, nicht zwei. Zwei kurze,
-    # ungebuchte `darf`-Anfragen (--abtastungen 1, keine Wartezeit -- schnell,
-    # aber eine einzelne Messung statt wb-belegungs sonst uebliche
-    # Mehrfachmessung; fuer eine reine Auskunftszahl wie 'plaetze' vertretbar)
+    # statt seine Zahlen nachzubilden: EINE Quelle, nicht zwei. `verfuegbar`
+    # kommt aus EINER Vorgabe-Medianmessung am Anfang von berechne(); die
+    # folgenden Einzelproben liefern nur die reine Spitze. So bleibt die
+    # Sicherheitsentscheidung dieselbe wie beim Start, ohne je Stufe drei
+    # Sekunden erneut zu warten.
     # liefern: "verfuegbar_gib" (dieselbe Zahl, unabhaengig von der
     # angefragten Groesse -- min(Grenze A, Grenze B), siehe entscheiden() in
     # wb-belegung) und die Differenz von parallel=2 zu parallel=1 (der reine
@@ -761,7 +858,7 @@ def plaetze_wirklich(res, tok, gewichte, ohne_sockel=False):
     basis = os.path.basename(res["modelRef"].rstrip("/"))
 
     def frage(parallel):
-        cmd = [os.path.join(BIN, "wb-belegung"), "darf",
+        cmd = [wb_belegung_pfad(), "darf",
                "--gewichte-gb", str(gewichte), "--modell", basis,
                "--parallel", str(parallel), "--kontext", str(tok),
                "--abtastungen", "1", "--abstand", "0", "--json"]
@@ -773,17 +870,17 @@ def plaetze_wirklich(res, tok, gewichte, ohne_sockel=False):
         except (json.JSONDecodeError, ValueError):
             return None
 
-    a1, a2 = frage(1), frage(2)
-    if not a1 or not a2 or a1.get("verfuegbar_gib") is None or a2.get("spitze_gib") is None:
+    a1 = {"spitze_gib": spitze_eins} if spitze_eins is not None else frage(1)
+    a2 = frage(2)
+    if not a1 or not a2 or verfuegbar is None or a2.get("spitze_gib") is None:
         return None
-    verfuegbar = a1["verfuegbar_gib"]
     delta = a2["spitze_gib"] - a1["spitze_gib"]
     if delta <= 0:
         return None
     return max(0, int((verfuegbar - a1["spitze_gib"]) // delta) + 1)
 
 
-def bedarf_wirklich(res, tok, gewichte, parallel, ohne_sockel=False):
+def bedarf_wirklich(res, tok, gewichte, parallel, ohne_sockel=False, schnell=False):
     # ohne_sockel (Nachtrag 2026-09-08): siehe plaetze_wirklich() und
     # bereits_geladener_server() oben -- derselbe Grund, hier auf die absolute
     # Spitze statt auf ein Delta wirkend.
@@ -808,10 +905,12 @@ def bedarf_wirklich(res, tok, gewichte, parallel, ohne_sockel=False):
     # Naeherung zurueck (siehe Kommentar dort), mit ihrer Herkunft klar
     # benannt, statt so zu tun, als waere sie dieselbe Zahl.
     basis = os.path.basename(res["modelRef"].rstrip("/"))
-    cmd = [os.path.join(BIN, "wb-belegung"), "darf",
+    cmd = [wb_belegung_pfad(), "darf",
            "--gewichte-gb", str(gewichte), "--modell", basis,
-           "--parallel", str(parallel), "--kontext", str(tok),
-           "--abtastungen", "1", "--abstand", "0", "--json"]
+           "--parallel", str(parallel), "--kontext", str(tok)]
+    if schnell:
+        cmd.append("--nur-spitze")
+    cmd.append("--json")
     if ohne_sockel:
         cmd.append("--ohne-sockel")
     p = run(cmd)
@@ -819,9 +918,11 @@ def bedarf_wirklich(res, tok, gewichte, parallel, ohne_sockel=False):
         antwort = json.loads(p.stdout)
     except (json.JSONDecodeError, ValueError):
         return None
-    if antwort.get("spitze_gib") is None or antwort.get("ja") is None:
+    if antwort.get("spitze_gib") is None:
         return None
-    return antwort["spitze_gib"], bool(antwort["ja"]), antwort.get("grund")
+    return (antwort["spitze_gib"],
+            None if schnell else bool(antwort.get("ja")), antwort.get("grund"),
+            antwort.get("verfuegbar_gib"))
 
 
 def berechne(modell, parallel=None, denken=None, entwerfer_gewichte_gb=0.0,
@@ -983,7 +1084,16 @@ def berechne(modell, parallel=None, denken=None, entwerfer_gewichte_gb=0.0,
     bereits_geladen_info = bereits_geladener_server(
         res, erwuenschter_entwerfer=bool(entwerfer_gewichte_gb) and bauart in ("entwerfer", None))
     stufen = []
-    for tok in stufen_liste(nmax):
+    token_stufen = stufen_liste(nmax)
+    # Der freie Speicher ist fuer alle folgenden Spitzen derselbe Wert. Einmal
+    # mit wb-belegungs Startvorgabe messen; die Stufenabfragen darunter duerfen
+    # dann schnell nur noch ihre reine, messunabhaengige Spitze liefern.
+    median_verfuegbar = None
+    if res["provider"] == "mlx-lokal":
+        median_antwort = bedarf_wirklich(res, token_stufen[0], gewichte, parallel)
+        if median_antwort is not None:
+            median_verfuegbar = median_antwort[3]
+    for tok in token_stufen:
         # NUR DIE STUFE ENTLASTEN, DEREN TOKENZAHL DEM LAUFENDEN KONTEXT
         # ENTSPRICHT (Nachtrag 2026-09-08, Gegenleser-Befund Punkt 4): ein
         # Server bei 32768 Token deckt keine Anfrage bei 65536 ab -- eine
@@ -1021,10 +1131,12 @@ def berechne(modell, parallel=None, denken=None, entwerfer_gewichte_gb=0.0,
         # echten Waechter fragen und dessen Zahl nehmen, wenn er antwortet.
         if res["provider"] == "mlx-lokal":
             echter_bedarf = bedarf_wirklich(res, tok, stufe_gewichte, parallel,
-                                             ohne_sockel=stufe_bereits_geladen)
+                                             ohne_sockel=stufe_bereits_geladen, schnell=True)
             if echter_bedarf is not None:
-                bedarf_gib, passt, wb_belegung_grund = echter_bedarf
-                bedarf_quelle = "wb-belegung darf (spitze_gib, dieselbe Zahl wie beim echten Start)"
+                bedarf_gib, schnell_passt, wb_belegung_grund, _ = echter_bedarf
+                passt = (bedarf_gib <= median_verfuegbar if median_verfuegbar is not None
+                         else passt)
+                bedarf_quelle = "wb-belegung darf (Spitze; gemeinsame Medianmessung wie beim Start)"
                 if stufe_bereits_geladen:
                     bedarf_quelle += " -- %s" % stufe_gw_quelle
         hinweis = None
@@ -1051,9 +1163,17 @@ def berechne(modell, parallel=None, denken=None, entwerfer_gewichte_gb=0.0,
         uebrig = frei_gib_nutzbar - stufe_gewichte
         plaetze_naeherung = max(0, int(uebrig // kv_je_worker_gib)) if kv_je_worker_gib > 0 else 0
         plaetze = plaetze_naeherung
+        if res["provider"] == SPLASH_PROVIDER:
+            # Ein Server mit EINEM festen Arbeitssatz bedient alle Worker (gemessen: 1 bis 8
+            # Stroeme druecken den freien Speicher kaum weiter, 9,3 -> 7,8 GiB). Ohne KV je
+            # Token gibt es keine Teilung durch kv_je_worker_gib; gezaehlt wird der eine
+            # Server, ob sein Arbeitssatz noch in den freien Speicher passt.
+            plaetze = 1 if passt else 0
         if res["provider"] == "mlx-lokal":
-            echte_plaetze = plaetze_wirklich(res, tok, stufe_gewichte,
-                                              ohne_sockel=stufe_bereits_geladen)
+            echte_plaetze = plaetze_wirklich(
+                res, tok, stufe_gewichte, median_verfuegbar,
+                ohne_sockel=stufe_bereits_geladen,
+                spitze_eins=bedarf_gib if parallel == 1 and echter_bedarf is not None else None)
             if echte_plaetze is not None:
                 plaetze = echte_plaetze
         stufen.append({"tokens": tok, "label": label(tok), "bedarfGib": round(bedarf_gib, 2),

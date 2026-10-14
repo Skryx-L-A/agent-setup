@@ -44,6 +44,46 @@ export function leserVorhanden(format: string): boolean {
 
 /** Obergrenze je Nachricht. Ein 400-kB-Werkzeugergebnis ist kein Gespraechsbeitrag. */
 const MAX_TEXT = 8000;
+/** Obergrenze der Argumentvorschau eines Werkzeugaufrufs. */
+const MAX_ARGUMENTE = 500;
+
+/**
+ * DIE STRUKTURIERTEN TEILE EINER WERKZEUGZEILE (Paket 10 der mobilen Werkbank).
+ * Bis heute trug eine Werkzeugzeile nur `art` und Text; wer Name, Argumente und
+ * Ausgabe getrennt zeigen wollte, haette den Anzeigetext zurueckparsen muessen.
+ * Die Leser haben die Teile aber schon in der Hand -- sie reichen sie jetzt mit,
+ * ohne den Text zu aendern, den die Chat-Ansicht bisher bekam. Erfunden wird
+ * nichts: was die Zeile nicht traegt, bleibt leer (ein Aufruf hat noch keine
+ * Ausgabe, ein Ergebnis nennt seine Argumente nicht noch einmal).
+ */
+export interface WerkzeugTeile {
+  name: string;
+  /** Kurze Vorschau der Argumente (hoechstens 500 Zeichen), leer, wenn die Zeile keine traegt. */
+  argumente: string;
+  /** Gekuerzte Ausgabe (wie `text`), leer bei einem Aufruf ohne Ergebnis. */
+  ausgabe: string;
+}
+
+/** Eine Nachricht, wie die Leser sie liefern: `ChatNachricht` plus die Werkzeugteile. */
+export type LeserNachricht = ChatNachricht & { werkzeug?: WerkzeugTeile };
+
+/** Die Werkzeugteile einer Nachricht, falls ihr Leser sie mitgegeben hat. */
+export function werkzeugTeile(n: ChatNachricht): WerkzeugTeile | undefined {
+  const w = (n as LeserNachricht).werkzeug;
+  return w && typeof w.name === 'string' ? w : undefined;
+}
+
+function vorschau(wert: unknown): string {
+  if (wert === undefined || wert === null) return '';
+  let t: string;
+  try {
+    t = typeof wert === 'string' ? wert : JSON.stringify(wert);
+  } catch {
+    return '';
+  }
+  t = t.replace(/\u0000/g, '');
+  return t.length > MAX_ARGUMENTE ? `${t.slice(0, MAX_ARGUMENTE)}…` : t;
+}
 
 function kuerzen(t: string): string {
   // Nullbytes fliegen raus, bevor der Text in die Oberflaeche geht: sie kommen
@@ -84,10 +124,13 @@ function schreibe(
   text: string,
   zeit: number,
   art: ChatNachricht['art'] = 'text',
+  werkzeug?: WerkzeugTeile,
 ): void {
   const t = text.trim();
   if (!t) return;
-  raus.push({ rolle, text: kuerzen(t), zeit, art });
+  const n: LeserNachricht = { rolle, text: kuerzen(t), zeit, art };
+  if (werkzeug) n.werkzeug = werkzeug;
+  raus.push(n);
 }
 
 /**
@@ -107,6 +150,8 @@ function schreibe(
  */
 function claudeTranscript(roh: string): ChatNachricht[] {
   const raus: ChatNachricht[] = [];
+  // tool_use_id -> Name, damit ein Ergebnis sagen kann, wessen Ergebnis es ist.
+  const aufrufe = new Map<string, string>();
   for (const d of zeilenJson(roh)) {
     const typ = d.type;
     if (typ !== 'user' && typ !== 'assistant') continue;
@@ -123,15 +168,19 @@ function claudeTranscript(roh: string): ChatNachricht[] {
       if (!teil || typeof teil !== 'object') continue;
       if (teil.type === 'text') schreibe(raus, rolle, String(teil.text ?? ''), zeit);
       else if (teil.type === 'thinking') schreibe(raus, 'agent', String(teil.thinking ?? ''), zeit, 'denken');
-      else if (teil.type === 'tool_use') schreibe(raus, 'werkzeug', String(teil.name ?? 'Werkzeug'), zeit, 'werkzeug');
-      else if (teil.type === 'tool_result') {
+      else if (teil.type === 'tool_use') {
+        const name = String(teil.name ?? 'Werkzeug');
+        if (typeof teil.id === 'string') aufrufe.set(teil.id, name);
+        schreibe(raus, 'werkzeug', name, zeit, 'werkzeug', { name, argumente: vorschau(teil.input), ausgabe: '' });
+      } else if (teil.type === 'tool_result') {
         const c = teil.content;
         const t = typeof c === 'string'
           ? c
           : Array.isArray(c)
             ? (c as Record<string, unknown>[]).map((x) => String(x?.text ?? '')).join('\n')
             : '';
-        schreibe(raus, 'werkzeug', t, zeit, 'werkzeug');
+        const name = (typeof teil.tool_use_id === 'string' ? aufrufe.get(teil.tool_use_id) : undefined) ?? 'Werkzeug';
+        schreibe(raus, 'werkzeug', t, zeit, 'werkzeug', { name, argumente: '', ausgabe: kuerzen(t.trim()) });
       }
     }
   }
@@ -162,7 +211,10 @@ function piJsonl(roh: string): ChatNachricht[] {
       if (!teil || typeof teil !== 'object') continue;
       if (teil.type === 'text') schreibe(raus, rolle, String(teil.text ?? ''), zeit);
       else if (teil.type === 'thinking') schreibe(raus, 'agent', String(teil.text ?? teil.thinking ?? ''), zeit, 'denken');
-      else if (teil.type === 'toolCall') schreibe(raus, 'werkzeug', String(teil.name ?? teil.toolName ?? 'Werkzeug'), zeit, 'werkzeug');
+      else if (teil.type === 'toolCall') {
+        const name = String(teil.name ?? teil.toolName ?? 'Werkzeug');
+        schreibe(raus, 'werkzeug', name, zeit, 'werkzeug', { name, argumente: vorschau(teil.arguments ?? teil.input), ausgabe: '' });
+      }
     }
   }
   return raus;
@@ -195,7 +247,8 @@ function codexRollout(roh: string): ChatNachricht[] {
       continue;
     }
     if (p.type === 'custom_tool_call') {
-      schreibe(raus, 'werkzeug', String(p.name ?? 'Werkzeug'), zeit, 'werkzeug');
+      const name = String(p.name ?? 'Werkzeug');
+      schreibe(raus, 'werkzeug', name, zeit, 'werkzeug', { name, argumente: vorschau(p.input), ausgabe: '' });
       continue;
     }
     if (p.type !== 'message') continue;

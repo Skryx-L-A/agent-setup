@@ -2,8 +2,9 @@
 # Data-model subcommands share this historical name.  No-argument and legacy
 # pane invocations continue through the original implementation below.
 case "${1:-}" in
-  antrag|antrag-entscheiden)
-    # Ein Antrag weckt den Hauptagenten, eine Entscheidung den Teamleiter: danach den Traeger wecken.
+  antrag|antrag-entscheiden|rechte-antrag|rechte-antrag-entscheiden|rechte-antrag-zurueckziehen)
+    # Ein Antrag weckt den Hauptagenten, eine Entscheidung den Antragsteller, ein Rueckzug erledigt den
+    # Posten des Hauptagenten: danach den Traeger wecken.
     SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
     status=0
     python3 "$SCRIPT_DIR/agents_data.py" agent "$@" || status=$?
@@ -16,7 +17,33 @@ case "${1:-}" in
     SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
     exec python3 "$SCRIPT_DIR/agents_data.py" agent "$@"
     ;;
+  "") ;;
+  *)
+    # Der Pane-Weg liest keine Argumente. Ein unbekannter Unterbefehl ist ein Tippfehler
+    # oder ein Befehl, den diese Fassung noch nicht kennt -- nie ein Auftrag, einen
+    # Agent-Pane zu oeffnen (14.10.2026: `wb-agent rechte-antrag --help` aus einer Suite
+    # oeffnete so vier Panes auf dem Live-Server).
+    echo "wb-agent: unbekannter Unterbefehl '$1' -- kein Agent-Pane geoeffnet." >&2
+    exit 2
+    ;;
 esac
+
+# Nur aus tmux heraus. Ohne $TMUX spricht `tmux` den Standard-Server an, und das ist
+# auf dieser Maschine der LIVE-Server -- ein Test unter `env -i` landete genau dort,
+# ohne $TMUX_PANE dazu in der zuletzt benutzten fremden Session (14.10.2026).
+if [ -z "${TMUX:-}" ]; then
+  echo "wb-agent: nicht in tmux (\$TMUX leer) -- kein Agent-Pane geoeffnet." >&2
+  exit 2
+fi
+# Unter WB_TESTUMGEBUNG=1 nur auf einem Test-Server (Socket wbtest-*).
+if [ "${WB_TESTUMGEBUNG:-}" = 1 ]; then
+  sockel=$(tmux display -p '#{socket_path}' 2>/dev/null || true)
+  case "${sockel##*/}" in
+    wbtest-*) ;;
+    *) echo "wb-agent: WB_TESTUMGEBUNG=1, aber der tmux-Server '${sockel:-?}' ist kein Test-Server -- kein Agent-Pane geoeffnet." >&2
+       exit 2 ;;
+  esac
+fi
 
 # wb-agent — add one Claude agent pane; wb-grid arranges everything afterwards.
 set -u

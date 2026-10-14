@@ -107,9 +107,13 @@ def detect_project(cwd: str, vault: Path, home: Path | None = None) -> tuple[str
         alias = DIR_ALIASES.get(norm)
         if alias in branches:
             return alias, True
-        for bnorm, branch in by_norm.items():
-            if len(bnorm) >= 4 and (norm.startswith(bnorm) or bnorm.startswith(norm)):
-                return branch, True
+        # Mehrere Praefix-Treffer (z. B. `brain` und `brain3`): der naechstliegende Name gewinnt, bei Gleichstand
+        # alphabetisch. Vorher entschied die Reihenfolge einer Menge, also der Hash-Seed des Prozesses (09.10.,
+        # recall-v3-Analyse: dieselbe Eingabe mal mit, mal ohne Einspielung).
+        treffer = [(abs(len(bnorm) - len(norm)), bnorm, branch) for bnorm, branch in by_norm.items()
+                   if len(bnorm) >= 4 and (norm.startswith(bnorm) or bnorm.startswith(norm))]
+        if treffer:
+            return min(treffer)[2], True
 
     in_project = root is not None or (home / "AI") in path.parents
     return None, in_project

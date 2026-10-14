@@ -13,7 +13,10 @@
 #   mcp-shared start|stop|restart
 #   mcp-shared apply      Client-Konfiguration auf die geteilten Server zeigen lassen
 #                         (auch nach einem Plugin-Update nötig — das überschreibt sie)
-#   mcp-shared reap       Helferprozesse ohne lebende Claude-Session beenden
+#   mcp-shared guard-claude
+#                         Playwright-Plugin-Cache unmittelbar vor einem Claude-Start
+#                         nur bei erreichbarem Shared-Server reparieren
+#   mcp-shared reap       Helferprozesse ohne lebenden Harness/Panebezug beenden
 #   mcp-shared reap --dry-run
 #   mcp-shared browser [lokal|browserbase]
 #                         Browserwahl fuer playwright: ohne Argument aktuellen
@@ -24,8 +27,8 @@
 #                         automatisch auf lokal zurueck, damit kein vergessener
 #                         Schalter Minuten verbrennt (2026-09-09).
 #
-# `reap` beendet NUR Prozesse, deren Elternkette keinen lebenden Claude-Prozess mehr
-# enthält, und immer über die konkrete PID — nie über ein Muster (Standing Rule nach
+# `reap` beendet NUR Prozesse, deren Elternkette keinen lebenden Harness und keine
+# lebende tmux-Pane mehr enthält, und immer über die konkrete PID — nie über ein Muster (Standing Rule nach
 # dem Vorfall, bei dem ein pkill-Muster Live-Client des Nutzers beendet hat).
 set -uo pipefail
 
@@ -56,7 +59,7 @@ PW_LABEL=agent-workbench.mcp-playwright
 STATE="${MCP_SHARED_STATE:-$HOME/.local/state/mcp-shared}"
 mkdir -p "$STATE"
 
-port_alive() { /usr/bin/nc -z 127.0.0.1 "$1" >/dev/null 2>&1; }
+port_alive() { "${MCP_SHARED_NC:-/usr/bin/nc}" -z 127.0.0.1 "$1" >/dev/null 2>&1; }
 
 # Browserwahl fuer playwright (siehe Kopf, `mcp-shared browser`). Eine Zeile in
 # cmd_status, mit der Sitzungs-ID sobald eine Browserbase-Sitzung offen ist.
@@ -121,13 +124,14 @@ cmd_status() {
   helpers_report
 }
 
-# Alle lokalen MCP-Helferprozesse mit ihrem Besitzer (= nächster Claude-Vorfahr).
+# Alle lokalen MCP-Helferprozesse mit ihrem Besitzer (= naechster Harness- oder
+# lebender tmux-Pane-Vorfahr).
 helpers_python() {
   # Die Portnummern stehen oben im Skript, der Python-Block ist aber ein
   # QUOTIERTES Here-Dokument und sieht sie nicht -- deshalb ueber die Umgebung.
   MCPS_PORTS="$BM_PORT $PW_PORT $BM_BACKEND_PORT $PW_BACKEND_PORT" \
   /usr/bin/python3 - "$@" <<'PY'
-import subprocess, sys
+import json, os, pathlib, shlex, subprocess, sys
 ps = subprocess.run(['ps','-axo','pid=,ppid=,etime=,rss=,command='],
                     capture_output=True, text=True).stdout
 procs = {}
@@ -138,22 +142,79 @@ for line in ps.splitlines():
     pid, ppid, et, rss, cmd = int(parts[0]), int(parts[1]), parts[2], int(parts[3]), parts[4]
     procs[pid] = (ppid, et, rss, cmd)
 
-def is_claude(cmd):
-    return ('claude.app/Contents/MacOS/claude' in cmd
-            or cmd.startswith('/Users/')  and '/bin/claude ' in cmd
-            or cmd.endswith('/bin/claude'))
+GENERIC_WRAPPERS = {'sh', 'bash', 'zsh', 'env', 'node', 'python', 'python3'}
+HARNESS_COMMANDS = {
+    'claude', 'pi', 'codex', 'aider', 'opencode', 'agy', 'goose', 'crush',
+    'qwen', 'gptme', 'copilot', 'nanocoder', 'cline', 'clite',
+    'openhands', 'forge', 'jcode',
+}
+
+# Die ausgelieferte Registry ist nicht die letzte Wahrheit: Betreiber koennen
+# weitere Harnesses eintragen oder deren Kommando aendern. Nur der konkrete
+# Programmbasename zaehlt; generische Wrapper wie sh/node wuerden sonst beliebige
+# Prozesse zu Harnesses erklaeren.
+try:
+    registry = pathlib.Path.home() / '.claude/workbench/models.json'
+    data = json.loads(registry.read_text(encoding='utf-8'))
+    for harness in data.get('harnesses', []):
+        hid = harness.get('id')
+        command = harness.get('command')
+        for candidate in (hid, command):
+            if not isinstance(candidate, str):
+                continue
+            try:
+                word = shlex.split(candidate)[0]
+            except (ValueError, IndexError):
+                continue
+            base = os.path.basename(os.path.expanduser(word)).removesuffix('.exe')
+            if base and base not in GENERIC_WRAPPERS:
+                HARNESS_COMMANDS.add(base)
+except (OSError, ValueError, TypeError):
+    pass
+
+def executable_basename(cmd):
+    try:
+        word = shlex.split(cmd)[0]
+    except (ValueError, IndexError):
+        return ''
+    return os.path.basename(word).removesuffix('.exe')
+
+def is_harness(cmd):
+    if 'claude.app/Contents/MacOS/claude' in cmd:
+        return True
+    # Der Claude-Updater startet Unteragenten direkt ueber die Versionsdatei,
+    # deren Basename nur eine Versionsnummer ist.
+    if '/.local/share/claude/versions/' in cmd:
+        return True
+    return executable_basename(cmd) in HARNESS_COMMANDS
+
+pane_roots = set()
+try:
+    panes = subprocess.run(
+        ['tmux', 'list-panes', '-a', '-F', '#{pane_pid}\t#{pane_dead}'],
+        capture_output=True, text=True, timeout=3,
+    )
+    if panes.returncode == 0:
+        for line in panes.stdout.splitlines():
+            pid_text, _, dead = line.partition('\t')
+            if dead != '1':
+                try:
+                    pane_roots.add(int(pid_text))
+                except ValueError:
+                    pass
+except (OSError, subprocess.TimeoutExpired):
+    pass
 
 def owner(pid):
     seen = set()
     while pid in procs and pid not in seen:
         seen.add(pid)
         ppid, _, _, cmd = procs[pid]
-        if is_claude(cmd):
+        if pid in pane_roots or is_harness(cmd):
             return pid
         pid = ppid
     return None
 
-import os
 SHARED_PORTS = os.environ.get('MCPS_PORTS', '8766 8767 8776 8777').split()
 
 def is_helper(cmd):
@@ -171,7 +232,7 @@ for pid, (ppid, et, rss, cmd) in procs.items():
     # BIS ZUM 2026-09-04 standen hier nur 8766 und 8767 fest im Text, waehrend die
     # Bedarfsschaltung vom 20.08. den echten Server auf die BACKEND-Ports 8776/8777
     # gelegt hat. Der Backend-Prozess haengt an launchd, hat also nie einen
-    # Claude-Vorfahren -- er wurde damit als "verwaist" gefuehrt, und
+    # Harness-Vorfahren -- er wurde damit als "verwaist" gefuehrt, und
     # `mcp-shared kill-orphans` haette den geteilten Server erschlagen, den dieses
     # Werkzeug gerade schuetzen soll. Die Liste kommt jetzt aus denselben
     # Variablen wie die Konfiguration, damit sie nicht wieder auseinanderlaufen.
@@ -356,15 +417,98 @@ PY
   echo "ihnen mitten in der Arbeit die Werkzeuge wegnehmen."
 }
 
+# Claude aktualisiert Plugins unabhaengig von der Werkbank. Dabei kann die
+# Plugin-eigene Playwright-Konfiguration nach einem erfolgreichen `apply` wieder
+# auf stdio zurueckfallen und jeder neue Claude-Prozess startet erneut einen
+# privaten MCP. Dieser kurze Guard laeuft deshalb im gemeinsamen Claude-Prestart.
+# Er greift nur bei eindeutigem Playwright-stdio und nur, wenn Port 8767 lebt:
+# eine kaputte Shared-Instanz darf einen Start weder blockieren noch ihm den
+# funktionierenden stdio-Rueckfall wegnehmen.
+cmd_guard_claude() {
+  /usr/bin/python3 - <<'PY'
+import json, pathlib, sys
+
+def ist_playwright_stdio(server):
+    if not isinstance(server, dict) or server.get('type') not in (None, 'stdio'):
+        return False
+    teile = [server.get('command') or '']
+    args = server.get('args') or []
+    if isinstance(args, list):
+        teile.extend(str(arg) for arg in args)
+    text = ' '.join(str(teil) for teil in teile)
+    return any(marke in text for marke in (
+        '@playwright/mcp', 'playwright-mcp', 'mcp-playwright-start'))
+
+for pfad in pathlib.Path.home().glob('.claude/plugins/cache/*/playwright/*/.mcp.json'):
+    try:
+        daten = json.loads(pfad.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        continue
+    if ist_playwright_stdio(daten.get('playwright')):
+        sys.exit(10)
+PY
+  local scan_status=$?
+  [ "$scan_status" -eq 0 ] && return 0
+  if [ "$scan_status" -ne 10 ]; then
+    echo "mcp-shared: Playwright-Plugin-Cache konnte nicht geprueft werden; Claude startet unveraendert." >&2
+    return 0
+  fi
+  if ! port_alive "$PW_PORT"; then
+    echo "mcp-shared: Shared-Playwright auf Port $PW_PORT ist nicht erreichbar; stdio bleibt fuer diesen Claude-Start erhalten." >&2
+    return 0
+  fi
+
+  /usr/bin/python3 - "$PW_URL" "$SKRIPT_VERZ" <<'PY'
+import datetime, json, pathlib, shutil, sys
+
+pw_url, skript_verz = sys.argv[1], sys.argv[2]
+sys.path.insert(0, skript_verz)
+import atomar_schreiben
+
+def ist_playwright_stdio(server):
+    if not isinstance(server, dict) or server.get('type') not in (None, 'stdio'):
+        return False
+    teile = [server.get('command') or '']
+    args = server.get('args') or []
+    if isinstance(args, list):
+        teile.extend(str(arg) for arg in args)
+    text = ' '.join(str(teil) for teil in teile)
+    return any(marke in text for marke in (
+        '@playwright/mcp', 'playwright-mcp', 'mcp-playwright-start'))
+
+geaendert = []
+for pfad in sorted(pathlib.Path.home().glob('.claude/plugins/cache/*/playwright/*/.mcp.json')):
+    try:
+        daten = json.loads(pfad.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        continue
+    if not ist_playwright_stdio(daten.get('playwright')):
+        continue
+    stamp = datetime.date.today().strftime('%Y%m%d')
+    sicherung = pathlib.Path.home() / '.local/trash-snapshots' / f'{stamp}-mcp-shared'
+    sicherung.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(pfad, sicherung / f'playwright-{pfad.parent.name}.mcp.json')
+    daten['playwright'] = {'type': 'http', 'url': pw_url}
+    atomar_schreiben.schreiben(
+        pfad, json.dumps(daten, indent=2) + '\n', modus=0o644)
+    geaendert.append(str(pfad))
+
+if geaendert:
+    print('mcp-shared: Playwright-Plugin vor Claude-Start auf Shared HTTP repariert: '
+          + ', '.join(geaendert))
+PY
+}
+
 case "${1:-status}" in
   status)  cmd_status ;;
   start)   cmd_start ;;
   stop)    cmd_stop ;;
   restart) cmd_restart ;;
   apply)   cmd_apply ;;
+  guard-claude) cmd_guard_claude ;;
   ensure)  shift; cmd_ensure "${1:-}" ;;
   halt)    shift; cmd_halt "${1:-}" ;;
   browser) shift; cmd_browser "${1:-}" ;;
   reap)    shift; cmd_reap "${1:-}" ;;
-  *) echo "mcp-shared: unbekanntes Kommando '$1' (status|start|stop|restart|apply|reap|ensure|halt|browser)" >&2; exit 1 ;;
+  *) echo "mcp-shared: unbekanntes Kommando '$1' (status|start|stop|restart|apply|guard-claude|reap|ensure|halt|browser)" >&2; exit 1 ;;
 esac

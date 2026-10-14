@@ -10,13 +10,28 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, frontmatter, identity
+from . import config, frontmatter, identity, protect, spaces
 
 log = logging.getLogger("gardener")
+
+# The gardener-managed `## Relations` section (canonical definition; linking
+# imports it).  Cut from embeddings and from "mentions" checks: links the
+# pipeline wrote itself are not the note's own prose.
+RELATIONS_RE = re.compile(r"^## Relations[ \t]*\n(?:[ \t]*-[^\n]*\n?)*",
+                          re.MULTILINE)
+
+def embed_relations() -> bool:
+    """Rollback switch of the e28 rule: ``BRAIN_EMBED_RELATIONS=1`` embeds the
+    ``## Relations`` section again.  The embedding cache keys carry it (see
+    ``linking.cache_key``), so flipping it re-embeds instead of mixing vectors
+    of both rules in one index."""
+    return os.environ.get("BRAIN_EMBED_RELATIONS", "").strip() == "1"
+
 
 WIKILINK_RE = re.compile(r"\[\[([^\]|#\n]+)")
 TITLE_RE = re.compile(r"^title:\s*(.+?)\s*$", re.MULTILINE)
@@ -56,6 +71,11 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
+# Frontmatter fields that are content and stay in the embedded text (v4);
+# every other field is bookkeeping and never touches a vector.
+EMBED_FM_FIELDS = ("title", "aliases", "tags", "type", "branch", "description")
+
+
 @dataclass
 class Note:
     path: Path          # absolute
@@ -70,6 +90,19 @@ class Note:
     @property
     def content_hash(self) -> str:
         return hashlib.sha256(self.text.encode()).hexdigest()
+
+    @property
+    def body(self) -> str:
+        """The note without its leading frontmatter block(s)."""
+        return frontmatter.split_blocks(self.text)[1]
+
+    @property
+    def embed_hash(self) -> str:
+        """Hash of exactly the text the embedding model sees: the key of every
+        embedding cache (``linking.cache_key``, braincli ``einbettung``).
+        Frontmatter upkeep (id, schema, class, created, status, verified, ...)
+        leaves it unchanged, so it no longer invalidates vectors."""
+        return hashlib.sha256(self.embed_text.encode()).hexdigest()
 
     @property
     def stem_key(self) -> str:
@@ -97,11 +130,41 @@ class Note:
 
     @property
     def embed_text(self) -> str:
-        """Text handed to the embedding model. Notes without aliases keep the
-        historic format so the content-hash cache stays valid."""
+        """Text handed to the embedding model: title, aliases and the note's
+        own prose -- the gardener-managed ``## Relations`` section is cut out.
+        e28 (2026-09-27): the maintenance runs of 24.09. appended Relations to
+        ~780 notes; every touched note's vector changed, and the vector of
+        ``a machine-bound project/2026-09-15-leiteroptimierung`` sank from cosine 0.57 to
+        0.51, where the recall hook cut it (MAX_HITS 3) -- the replay warning
+        e28 was lost.  ``linking.mentions`` cuts the section for the same
+        reason: links the pipeline wrote itself are not the note's prose.
+        ``BRAIN_EMBED_RELATIONS=1`` restores the old behavior (rollback);
+        ``config.EMBED_VERSION`` 3 retired the vectors of the old rule.
+        v4 (b6-embedfm, 2026-09-28): the frontmatter block is cut; the
+        content fields ``EMBED_FM_FIELDS`` -- title, aliases, tags, type,
+        branch, description -- form the head instead.  Bookkeeping fields such
+        as id/schema/class/created/status/verified/review-after change neither
+        the text nor the cache key, so frontmatter upkeep no longer re-embeds
+        the vault.  The head was chosen on blind200 dev (MRR 0.439 against
+        0.424 tags+description only and 0.406 title+aliases only; old rule
+        with the whole frontmatter 0.455, no secured loss on test)."""
+        if embed_relations():
+            text = self.body
+        else:
+            text = RELATIONS_RE.sub("", self.body)
+        head = self.title
         if self.aliases:
-            return f"{self.title}\naliases: {', '.join(self.aliases)}\n\n{self.text}"
-        return f"{self.title}\n\n{self.text}"
+            head += f"\naliases: {', '.join(self.aliases)}"
+        tags = self.fm.get("tags")
+        if tags:
+            tags = tags if isinstance(tags, list) else [tags]
+            head += f"\ntags: {', '.join(str(t) for t in tags)}"
+        for feld in ("type", "branch"):
+            if self.fm.get(feld) and isinstance(self.fm[feld], str):
+                head += f"\n{feld}: {self.fm[feld]}"
+        if self.fm.get("description"):
+            head += f"\n{self.fm['description']}"
+        return f"{head}\n\n{text}"
 
 
 def is_excluded(rel: Path) -> bool:
@@ -136,7 +199,10 @@ def check_writable(vault: Path, path: Path) -> None:
         rel = path.relative_to(vault)
     except ValueError:
         raise UnsafeWriteError(f"outside vault: {path}")
-    if path.suffix != ".md":
+    # One named data file besides Markdown: the per-project trap book the
+    # `brain run` pipeline appends proposals to (own section, see
+    # gardener/lauf/schreiben.py). Any other non-.md name stays refused.
+    if path.suffix != ".md" and path.name not in config.WRITABLE_DATA_FILES:
         raise UnsafeWriteError(f"not markdown: {path}")
     if any(p.casefold() in _EXCLUDE_DIRS_CF or p.startswith(".") for p in rel.parts[:-1]):
         raise UnsafeWriteError(f"excluded directory: {rel}")
@@ -157,6 +223,25 @@ def check_asset_writable(vault: Path, path: Path) -> None:
         raise UnsafeWriteError(f"not an _assets/ target: {rel}")
 
 
+def git_ignored(path: Path) -> bool:
+    """Whether git ignores `path` in the repo that contains it (asked from the
+    file's own directory, so a mounted space answers with its own rules, not
+    the vault root's `.gitignore`, which lists every space as ignored).
+    Outside any repo, or when git cannot answer: False - nothing to protect
+    against, and the other gates still apply."""
+    path = Path(path)
+    parent = path.parent
+    while not parent.exists() and parent != parent.parent:
+        parent = parent.parent
+    try:
+        r = subprocess.run(["git", "-C", str(parent), "check-ignore", "-q",
+                            "--", str(path)],
+                           capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
 class VaultWriter:
     """Single write gate. In dry-run mode it records planned writes instead."""
 
@@ -174,6 +259,74 @@ class VaultWriter:
         # anfassen und melden.
         self.foreign = frozenset(str(p) for p in (foreign or ()))
         self.foreign_skipped: list[str] = []
+        # One cache per writer, i.e. per run (gardener/cli.py builds exactly
+        # one VaultWriter and reuses it across every phase) - see
+        # protect.AuthorCache.
+        self.protect_cache = protect.AuthorCache(self.vault)
+        self.protected_skipped: list[tuple[str, str]] = []  # (rel, reason)
+        # Loaded once per run (like the author cache above): a space's
+        # `schreibbar` flag does not change mid-run, and a run can touch
+        # thousands of paths (S2, brain5-architektur-entwurf.md Abschnitt 4.2).
+        self.space_manifest = spaces.load_manifest(self.vault)
+        # What this writer last put on disk, per rel, AFTER the identity stamp.
+        # A caller keeps the text it asked to write (without `id:`/`schema:`),
+        # so its next `expect=` differs from disk by exactly our own stamp -
+        # see _own_stamp_only. Run of 24.09.2026: 25 notes reported as
+        # "changed on disk mid-run" were nothing but that.
+        self.final_text: dict[str, str] = {}
+        self._local_cache: dict[str, bool] = {}
+
+    def is_local(self, path) -> bool:
+        """True for a file that exists only on this machine and must never be
+        written or linked by the gardener: `IDENTITY.md`, `HANDOFF-*.md`
+        (a handoff between two sessions, not knowledge), and anything git
+        ignores in the repo the file lives in (vault root or a mounted space).
+
+        Run of 24.09.2026: linking appended `relates-to [[AGENTS]]` to the
+        gitignored `IDENTITY.md` and `relates-to [[IDENTITY]]` to `AGENTS.md`
+        (a link that is dead on every other machine); the commit then failed on
+        `git add` of the ignored file and left the index half staged."""
+        p = Path(path)
+        p = p if p.is_absolute() else self.vault / p
+        name = p.name
+        if name == "IDENTITY.md" or name.startswith("HANDOFF-"):
+            return True
+        key = str(p)
+        if key not in self._local_cache:
+            self._local_cache[key] = git_ignored(p)
+        return self._local_cache[key]
+
+    def can_rewrite(self, path, current_text: str) -> bool:
+        """Would `write(path, ..., expect=current_text)` pass the gate?
+        Read-only preview for callers that pay for a model call before they
+        write (linking): a pair whose note cannot be written is not judged."""
+        p = Path(path)
+        p = p if p.is_absolute() else self.vault / p
+        try:
+            rel = p.resolve().relative_to(self.vault.resolve()).as_posix()
+        except ValueError:
+            return False
+        if self._readonly_space(rel) is not None or rel in self.foreign:
+            return False
+        if self.is_local(p):
+            return False
+        return not protect.check(self.vault, rel, current_text,
+                                 self.protect_cache).blocked
+
+    def _own_stamp_only(self, rel: str, current: str | None, expect) -> bool:
+        """Disk differs from `expect` only by the id/schema stamp this writer
+        added itself on its last write of `rel` - no one else touched it."""
+        if current is None or not isinstance(expect, str):
+            return False
+        if self.final_text.get(rel) != current:
+            return False
+        return identity.stamp(expect, keep_id=identity.id_of(current)) == current
+
+    def _readonly_space(self, rel: str) -> str | None:
+        entry = spaces.match_space(rel, self.space_manifest)
+        if entry is not None and entry.get("schreibbar") is False:
+            return str(entry.get("space", "?"))
+        return None
 
     def write(self, path: Path, text: str, expect=NO_CHECK) -> bool:
         """Write `text` to `path`. Returns False when the write was refused.
@@ -196,6 +349,19 @@ class VaultWriter:
         check_writable(self.vault, path)
         path = path if path.is_absolute() else self.vault / path
         rel = path.resolve().relative_to(self.vault.resolve()).as_posix()
+        readonly = self._readonly_space(rel)
+        if readonly is not None:
+            if rel not in {r for r, _ in self.protected_skipped}:
+                self.protected_skipped.append((rel, "protected-readonly-space"))
+                log.warning("skipped %s: space '%s' is schreibbar: false - "
+                            "not writable through the gate", rel, readonly)
+            return False
+        if self.is_local(path):
+            if rel not in {r for r, _ in self.protected_skipped}:
+                self.protected_skipped.append((rel, "protected-local-file"))
+                log.warning("skipped %s: local file (IDENTITY/HANDOFF or "
+                            "gitignored) - not writable through the gate", rel)
+            return False
         if rel in self.foreign:
             if rel not in self.foreign_skipped:
                 self.foreign_skipped.append(rel)
@@ -204,12 +370,24 @@ class VaultWriter:
             return False
         if expect is not NO_CHECK:
             current = read_text(path) if path.exists() else None
-            if current != expect:
+            if current != expect and not self._own_stamp_only(rel, current, expect):
                 self.conflicts.append(rel)
                 log.warning("skipped %s: %s on disk since it was read "
                             "(Obsidian / basic-memory sync?) - not overwriting",
                             rel, "appeared" if expect is None else "changed")
                 return False
+            # A create (expect=None, file did not exist -> current is None)
+            # is never a change to an existing note and is not this gate's
+            # business - see protect.py's module docstring. Only a genuine
+            # rewrite of something already on disk reaches here.
+            if current is not None:
+                verdict = protect.check(self.vault, rel, current,
+                                        self.protect_cache)
+                if verdict.blocked:
+                    self.protected_skipped.append((rel, verdict.reason))
+                    log.warning("skipped %s: %s - not writable through the "
+                                "gate", rel, verdict.reason)
+                    return False
         # Identity is stamped at the gate, not in each writer: a writer that
         # forgets it reopens the hole the Brain 4 migration closed once
         # (see identity.py). The id is taken from whatever is on disk, so a
@@ -223,6 +401,7 @@ class VaultWriter:
             return True
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
+        self.final_text[rel] = text
         self.written.append(rel)
         log.info("wrote %s", rel)
         return True
@@ -237,6 +416,13 @@ class VaultWriter:
         as write(): dry-run only records the plan."""
         check_asset_writable(self.vault, dst)
         rel = dst.resolve().relative_to(self.vault.resolve()).as_posix()
+        readonly = self._readonly_space(rel)
+        if readonly is not None:
+            if rel not in {r for r, _ in self.protected_skipped}:
+                self.protected_skipped.append((rel, "protected-readonly-space"))
+                log.warning("skipped %s: space '%s' is schreibbar: false - "
+                            "not writable through the gate", rel, readonly)
+            return
         if self.dry_run:
             self.planned.append(rel)
             log.info("dry-run: would move %s -> %s", src, rel)

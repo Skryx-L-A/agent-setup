@@ -13,13 +13,21 @@ Keine eigene Modellidentität, Maschine oder Befugnis aus dieser Datei ableiten.
   die neben sinnvoller eigener Arbeit laufen; nicht nach Dateianzahl zerlegen, wenn Entscheidungen
   eng gekoppelt sind. Passenden vorhandenen Kontext wiederverwenden. Regeln des aktuellen Harness
   zur erlaubten Delegation beachten.
-- Vor Modellwahl `~/.claude/regeln/orchestrierung.md` lesen: Fähigkeiten, tatsächliche
+- Vor jedem Worker-Start `~/.claude/regeln/vergabe.md` vollständig lesen (eine Seite: Spur-Reihenfolge,
+  Kontingentmessung, Parallelität); für Einzelfakten `~/.claude/regeln/orchestrierung.md`: Fähigkeiten, tatsächliche
   Verfügbarkeit, Budget, Modell und Effort dort prüfen. Keine festen Modelltabellen aus dieser
   Rolle oder einer alten Sitzung übernehmen. Lokal zuerst, wenn Qualität und Ressourcen reichen;
   keine schwächere Stufe allein wegen eines Limits wählen.
 - Jeder Auftrag nennt Aufgabe, exklusiv zugeteilte Pfade, Fertig-Kriterium und Kontextgrenze.
   Zusätzlich relevante Schutzregeln, konkreten Ergebnisweg und nötige Installation im isolierten
   Worktree nennen. Vor Abzweigen eigene benötigte Änderungen committen; fremde Arbeit nicht einsammeln.
+- **„Worker" heißt Werkbank-Pane (der Nutzer, 2026-09-18).** Verlangt der Auftrag Worker, werden
+  sie mit `pi-worker` oder `claude-worker` als sichtbare Panes gestartet. Native Subagenten des
+  Harness (Agent-/Task-Werkzeug, Workflow) sind kein Ersatz dafür und nur zulässig, wenn der
+  Mensch ausdrücklich „Subagent" sagt oder die Sitzung ohne tmux-Werkbank läuft; dann das melden.
+  Sichtbar heißt auch: eigenes tmux-Fenster nach der Vorgabe `workerLayout=window` (der Nutzer,
+  2026-09-25). Meldet der Spawner „arbeitet unsichtbar“, dem Menschen sagen, wie er das Fenster
+  öffnet (App-Kachel, Worker-Tab oder tmux-Prefix mit Fensternummer); das Layout nicht umstellen.
 - Bei Werkbank-Panes ausschließlich passende Spawner verwenden. Zustellung und Sichtbarkeit
   prüfen; `regeln/worker-panes.md` und `regeln/kontext-guard.md` vorher lesen. Native Subagenten
   über die vorhandenen Status-/Nachrichtenwerkzeuge verfolgen; ihnen keine tmux-Panes erfinden.

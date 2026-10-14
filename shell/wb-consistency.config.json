@@ -3,6 +3,7 @@
   "check1_model_caps": {
     "registry_path": "{BASE}/.claude/workbench/models.json",
     "scan_globs": [
+      "{BASE}/.claude/AGENTS.md",
       "{BASE}/.claude/CLAUDE.md",
       "{BASE}/.claude/roles/*.md",
       "{BASE}/.claude/regeln/*.md",
@@ -12,7 +13,7 @@
       "{REPO}/extension/src/settings.ts"
     ],
     "exclude_substrings": [
-      "/90-secrets/"
+      "/secrets/"
     ],
     "extra_model_name_variants": {
       "opus5": [
@@ -50,6 +51,7 @@
   },
   "check2_generated_blocks": {
     "scan_globs": [
+      "{BASE}/.claude/AGENTS.md",
       "{BASE}/.claude/CLAUDE.md",
       "{BASE}/.claude/roles/*.md",
       "{BASE}/.claude/regeln/*.md",
@@ -57,12 +59,13 @@
       "{BASE}/Knowledge/**/*.md"
     ],
     "exclude_substrings": [
-      "/90-secrets/"
+      "/secrets/"
     ],
     "session_load_groups": [
       {
-        "name": "claude-session (CLAUDE.md + aktive roles/*.md werden in jeder Claude-Session zusammen geladen)",
+        "name": "claude-session (AGENTS.md bzw. bis zur Umstellung CLAUDE.md + aktive roles/*.md werden in jeder Claude-Session zusammen geladen)",
         "files": [
+          "{BASE}/.claude/AGENTS.md",
           "{BASE}/.claude/CLAUDE.md",
           "{BASE}/.claude/roles/*.md"
         ]
@@ -79,6 +82,7 @@
   },
   "check3_dangling_refs": {
     "scan_globs": [
+      "{BASE}/.claude/AGENTS.md",
       "{BASE}/.claude/CLAUDE.md",
       "{BASE}/.claude/roles/*.md",
       "{BASE}/.claude/regeln/*.md"
@@ -98,6 +102,8 @@
       "/usr/local/sbin"
     ],
     "registry_path": "{BASE}/.claude/workbench/models.json",
+    "_comment_template_registry_path": "Befund 2026-10-10: die Familien-Aliase (codex-sol, codex-astra ...) stehen in der Auslieferung models.default.json; wb-state ergaenzt die lebende Registry damit. Ohne diesen Pfad meldete check3 sie in regeln/vergabe.md als VERWEIS-INS-LEERE.",
+    "template_registry_path": "{REPO}/shell/models.default.json",
     "cross_machine_marker": "peer",
     "_comment_machine_map": "Befund 2026-08-04: Regeldateien sind zwischen Mac und peer geteilt (wortgleich), die Werkzeuge unter ~/.local/bin sind es NICHT. machine_ids_by_os erkennt die laufende Maschine rein lokal (kein SSH, kein Netz) -- Darwin/Linux ist bereits die Unterscheidung, die shell/wb-sync-setup selbst benutzt (SELF=mac bei Darwin, sonst peer). machine_tool_map ordnet Werkzeuge einer der beiden IDs zu: fehlt eines auf der ihm zugeordneten Maschine, bleibt das ein harter Fehler (VERWEIS-INS-LEERE); fehlt es auf der jeweils ANDEREN, ist das erwartet (severity=expected, eigene Meldung VERWEIS-ANDERE-MASCHINE, zaehlt nirgends als Fehler). Das alte cross_machine_marker-Raten oben bleibt als Fallback fuer jedes Werkzeug, das hier noch nicht gelistet ist -- es wird durch die Karte ERGAENZT, nicht ersetzt.",
     "machine_ids_by_os": {
@@ -233,6 +239,7 @@
   "check4_skill_vs_rules": {
     "skills_glob": "{BASE}/.claude/skills/*/SKILL.md",
     "rule_text_globs": [
+      "{BASE}/.claude/AGENTS.md",
       "{BASE}/.claude/CLAUDE.md",
       "{BASE}/.claude/roles/*.md"
     ],
@@ -266,6 +273,7 @@
         "truth_pattern": "OLLAMA_CONTEXT_LENGTH</key>\\s*\\n\\s*<string>(\\d+)</string>",
         "claim_files": [
           "{BASE}/.claude/regeln/lokale-modelle.md",
+          "{BASE}/.claude/AGENTS.md",
           "{BASE}/.claude/CLAUDE.md"
         ],
         "claim_pattern": "OLLAMA_CONTEXT_LENGTH=(\\d+)",
@@ -322,6 +330,13 @@
   },
   "check7_kopien": {
     "_comment": "Auseinandergelaufene Kopien. install_map leitet den Zielort aus dem VERZEICHNIS ab, nicht aus einer Paarliste -- verglichen wird, was dort schon liegt. Eine Datei, die nur im Repo lebt, traegt ihre Begruendung selbst ('NICHT INSTALLIERT: <warum>' in den ersten 40 Zeilen), nicht eine Liste hier. marker_patterns/identifier_pattern sind das Vokabular der Sorte C: sie stehen in dieser DATEI und nicht im Quelltext, weil ein Erkenner sonst auf seine eigene Beschreibung passt und sich selbst meldet -- derselbe Weg wie bei den Secret-Mustern.",
+    "_comment_install_exclude_dirs": "Auftrag 2026-09-29: der Vergleich geht jetzt rekursiv in jeden Unterordner eines install_map-Verzeichnisses (Anlass shell/inbox/ -- wb-inbox sucht seine Adapter bereits unter ~/.local/bin/inbox/*.ts, der Vergleich kannte den Ort vorher nicht). Eine PAUSCHALE Rekursion ohne Ausnahme haette Nebenwirkungen: jeder Name hier ist ein Unterordner von shell/, der aus einem eigenen, dokumentierten Grund NIE nach ~/.local/bin ausgerollt wird -- 'tests' (Testdateien, sollen nie installiert werden), 'linux' (Linux-Varianten einzelner Werkzeuge, werden ueber _linux_gegenstueck gegen ihr Mac-Gegenstueck verglichen, nicht als eigenes Ziel), 'messungen' (Messskripte, keine CLI-Werkzeuge), 'systemd' (Unit-Dateien fuer peer, kein ~/.local/bin-Ziel). Ein neuer Unterordner (wie inbox/ es war) braucht KEINEN Eintrag hier, um mitgenommen zu werden -- nur ein Unterordner, der bewusst NICHT ausgerollt werden soll, braucht einen, mit Begruendung wie oben.",
+    "install_exclude_dirs": [
+      "tests",
+      "linux",
+      "messungen",
+      "systemd"
+    ],
     "repo_dir": "{REPO}",
     "install_map": [
       [
@@ -344,8 +359,57 @@
       [
         "hooks/",
         "{BASE}/.claude/hooks"
+      ],
+      [
+        "pi-extensions/",
+        "{BASE}/.pi/agent/extensions"
+      ],
+      [
+        "claude/git-hooks/",
+        "{BASE}/.claude/git-hooks",
+        "_verteiler"
+      ],
+      [
+        "claude/",
+        "{BASE}/.claude",
+        "statusline-command.sh"
+      ],
+      [
+        "jev/dienst/",
+        "{BASE}/.local/share/wb-jev/dienst"
+      ],
+      [
+        "jev/kandidaten/",
+        "{BASE}/.local/share/wb-jev/kandidaten",
+        "*.py"
       ]
     ],
+    "_comment_install_map_jev": "Auftrag jev-dienst 2026-10-09: wb-jev (shell/) startet jev/dienst/server.py und die Runner seiner Backends aus ~/.local/share/wb-jev (jev/dienst/BACKEND.md). Aus jev/kandidaten/ werden nur *.py-Dateien ausgerollt: dort liegen auch Messdaten und Ergebnisse der Spur jev-kandidaten, die nie nach ~/.local gehoeren; Gewichte laedt ein Runner aus seinem eigenen festen Ort.",
+    "_comment_git_hook_links": "Auftrag git-hooks-repo 2026-10-09: ~/.claude/git-hooks/_verteiler ist der globale Git-Hook-Verteiler (core.hooksPath), Quelle claude/git-hooks/_verteiler. Git ruft einen Hook unter SEINEM Namen auf, deshalb ist jeder Hook-Name ein Symlink auf _verteiler (der Verteiler liest seinen Namen aus $0). install_map kopiert nur Dateien; die Links legt wb-ausrollen anhand dieser Liste an und wb-consistency prueft sie. Ein vorhandener Nicht-Link oder ein Link mit anderem Ziel wird gemeldet, nie ueberschrieben.",
+    "git_hook_links": {
+      "verzeichnis": "{BASE}/.claude/git-hooks",
+      "ziel": "_verteiler",
+      "namen": [
+        "applypatch-msg",
+        "commit-msg",
+        "post-applypatch",
+        "post-checkout",
+        "post-commit",
+        "post-index-change",
+        "post-merge",
+        "post-rewrite",
+        "pre-applypatch",
+        "pre-auto-gc",
+        "pre-commit",
+        "pre-merge-commit",
+        "pre-push",
+        "pre-rebase",
+        "prepare-commit-msg",
+        "push-to-checkout",
+        "sendemail-validate"
+      ]
+    },
+    "_comment_install_map_claude": "Auftrag limit-messung 2026-10-07: ~/.claude/statusline-command.sh (einziger Schreiber von limits.jsonl/limits-latest.json) lag unversioniert und auf Mac und peer in zwei Fassungen. Quelle ist jetzt claude/statusline-command.sh. Das Muster begrenzt den Eintrag auf genau diese Datei -- ohne es waere jede kuenftige Datei unter claude/ ein Ausrollziel direkt in ~/.claude.",
     "exclude_substrings": [
       "__pycache__",
       "/.git/",
@@ -435,6 +499,14 @@
         "bekannt_zusatz_praefixe": [
           "shell/linux/"
         ],
+        "bauprodukte": [
+          {
+            "_comment": "Werkzeuge, die gebaut und nicht als Datei aus dem Repo kopiert werden. Bekannt ist ein Name nur, wenn seine QUELLE per `git ls-files` versioniert ist (Code, nicht diese Liste -- siehe _bauprodukte_bekannt); das Installierte wird gegen den Bau verglichen (BAUPRODUKT-VERALTET). Anlass 2026-09-29: wb-mobil-pruefen galt als EIGEN-NICHT-IM-REPO, obwohl seine Quelle versioniert ist.",
+            "name": "wb-mobil-pruefen",
+            "quelle": "app/src/main/mobile/auth/pruefen-cli.ts",
+            "bau": "app/dist/bin/wb-mobil-pruefen"
+          }
+        ],
         "nachbar_repos": [
           {
             "_comment": "Namen, die es hier in .local/bin gibt, aber die per `git ls-files` (Code, nicht diese Liste) in einem ANDEREN eigenen Repo versioniert sind, sind kein Befund -- eigene Kategorie EIGEN-ANDERES-REPO statt EIGEN-NICHT-IM-REPO. Ein Eintrag hier ist nur ein Kandidat: zaehlt nur, was `git -C repo ls-files` bei diesem Lauf wirklich liefert (siehe _nachbar_bekannt im Code, 2026-08-17).",
@@ -446,7 +518,7 @@
           },
           {
             "repo": "{BASE}/AI/project-kit",
-            "github": "<your-github-user>/project-kit",
+            "github": "Skryx-L-A/project-kit",
             "install_subdirs": [
               "bin/"
             ]
@@ -463,7 +535,7 @@
           {
             "_comment": "lokaler Ordnername ist a project, das Repo dahinter heisst another service -- deshalb repo != github hier.",
             "repo": "{BASE}/AI/a project",
-            "github": "<your-github-user>/another service",
+            "github": "Skryx-L-A/quassel",
             "install_subdirs": [
               "bin/"
             ]
@@ -481,14 +553,15 @@
     ],
     "registry_paare": [
       {
-        "_comment": "Sorte E (2026-08-20): inhaltlicher Vergleich statt Byte-Diff -- Anlass: shell/models.default.json trug 'bleibt als zweite, waehlbare Moeglichkeit', die lebende Registry noch das GEGENTEIL ('faellt aus der Wahl'), unbemerkt bis von Hand nachgezogen. id_felder bestimmt, woran ein Listeneintrag WIEDERERKANNT wird (id > name > class, der erste vorhandene UND eindeutige gewinnt); ein Feld, das nur auf einer Seite steht, ist erlaubt (unbekannte Schluessel duerfen ueberleben) und kein Fund. KEINE veraltet/eigenmaechtig-Unterscheidung wie bei Sorte A -- die Registry wird nachweislich in BEIDEN Richtungen gepflegt (contextWindow-Werte gemessen: die lebende Fassung war mehrfach die NEUERE, nicht die Vorlage), eine erzwungene Richtung haette dort die falsche Seite beschuldigt.",
+        "_comment": "Sorte E (2026-08-20, Nachzug 2026-09-30): inhaltlicher Vergleich statt Byte-Diff. id_felder bestimmt, woran ein Listeneintrag WIEDERERKANNT wird (id > name > class, der erste vorhandene UND eindeutige gewinnt). Fehlende Vorlage-Schluessel, -Eintraege und -Felder werden als REGISTRY-FEHLT gemeldet und von wb-ausrollen additiv eingesetzt; nur lebende Daten ueberleben. Bestehende, abweichende Werte bleiben REGISTRY-ABWEICHUNG und werden nie automatisch ueberschrieben, weil die lebende Registry nachweislich auch vorauslaufen kann.",
         "name": "models.json",
         "vorlage": "{REPO}/shell/models.default.json",
         "echt": "{BASE}/.claude/workbench/models.json",
         "listen_felder": [
           "models",
           "providers",
-          "harnesses"
+          "harnesses",
+          "entscheider"
         ],
         "id_felder": [
           "id",
@@ -513,7 +586,7 @@
     "live_session_prefix": "wb-"
   },
   "check9_harness_konfig": {
-    "_comment": "Konfigurations-Vorlagen fuer fremde Harnesses (crush, kimi, nanocoder, cline, forge -- die *.default.*-Dateien direkt unter shell/, deren Ziel NICHT ~/.local/bin ist). Ihr Vorlage-Ziel-Paar steht bereits maschinenlesbar in der Registry (configFiles je Harness-Eintrag, SPEC-V3-MODELS A.2) und wird bereits von shell/wb-harness-config verglichen -- EIGENER Merkposten (~/.local/state/wb-harness-config.json, Pruefsumme statt Git-Historie), weil das Ziel oft gar nicht in einem Repo liegt. Dieser Check erfindet die Unterscheidung nicht neu: er ruft wb-harness-config als EIGENEN Prozess mit umgelenktem HOME/WB_HARNESS_CONFIG_SRC auf (nie ein Import in denselben Interpreter -- ein Testlauf mit --base darf nie das echte HOME des aufrufenden Prozesses sehen) und uebersetzt dessen Befunde in Findings. wb-ausrollen ruft aus demselben Grund 'wb-harness-config apply' auf, statt die Kopierlogik ein zweites Mal zu schreiben.",
+    "_comment": "Konfigurations-Vorlagen fuer fremde Harnesses (crush, nanocoder, cline, forge -- die *.default.*-Dateien direkt unter shell/, deren Ziel NICHT ~/.local/bin ist). Ihr Vorlage-Ziel-Paar steht bereits maschinenlesbar in der Registry (configFiles je Harness-Eintrag, SPEC-V3-MODELS A.2) und wird bereits von shell/wb-harness-config verglichen -- EIGENER Merkposten (~/.local/state/wb-harness-config.json, Pruefsumme statt Git-Historie), weil das Ziel oft gar nicht in einem Repo liegt. Dieser Check erfindet die Unterscheidung nicht neu: er ruft wb-harness-config als EIGENEN Prozess mit umgelenktem HOME/WB_HARNESS_CONFIG_SRC auf (nie ein Import in denselben Interpreter -- ein Testlauf mit --base darf nie das echte HOME des aufrufenden Prozesses sehen) und uebersetzt dessen Befunde in Findings. wb-ausrollen ruft aus demselben Grund 'wb-harness-config apply' auf, statt die Kopierlogik ein zweites Mal zu schreiben.",
     "skript": "{REPO}/shell/wb-harness-config",
     "quelle_verzeichnis": "{REPO}/shell"
   },
@@ -548,5 +621,32 @@
     "_comment": "Check 12 (2026-08-22): installiert UND im Repo bekannt heisst noch nicht AKTIV -- nur ein Eintrag unter 'hooks' in settings.json macht eine Datei zu einem echten Claude-Code-Hook. hooks_dir ist bewusst nur die OBERSTE Ebene: hooks/lib/ und hooks/tests/ liegen woanders (siehe install_map) und sind keine direkt registrierbaren Hooks. Eine Datei, deren Logik anderswo aufgegangen ist (siehe hooks/bash-guard.py, PreToolUse/Bash-Sammelpunkt seit 2026-08-05), traegt das selbst: 'NICHT REGISTRIERT: <Begruendung>' in den ersten 40 Zeilen.",
     "hooks_dir": "{BASE}/.claude/hooks",
     "settings_datei": "{BASE}/.claude/settings.json"
+  },
+  "check13_hookspath_lokal": {
+    "_comment": "Check 13 (2026-10-10): ein LOKALES core.hooksPath in einem Repo unter ~/AI, das vom globalen abweicht UND auf einen Ordner zeigt, den es nicht gibt, schlaegt das globale -- dort laeuft dann gar kein Git-Hook (gemessen: Mac ~/AI/a machine-bound project, peer ~/AI/a machine-bound project und ~/AI/myproject zeigten auf $HOME/..., von der anderen Maschine mitgebracht). Nur HINWEIS, nie Fehler, nie eine Aenderung. 'ausnahmen' nimmt bewusst gesetzte lokale Ziele aus: je Eintrag {\"repo\": \"<Ordnername unter ~/AI>\", \"ziel\": \"<Wert von core.hooksPath>\", \"grund\": \"<Satz>\"}; 'ziel' darf fehlen (dann gilt jedes Ziel dieses Repos).",
+    "repo_globs": [
+      "{BASE}/AI/*"
+    ],
+    "ausnahmen": []
+  },
+  "check14_shebang_maschinenfest": {
+    "_comment": "Check 14 (2026-10-11): ein Maschinenpfad im Shebang (Homebrew, /usr/local, Heimatordner, venv) eines Werkzeugs unter shell/ -- wb-ausrollen legt es unveraendert auf jede Maschine, dort scheitert es mit 'bad interpreter' (gemessen: wb-geheimnis-filter auf peer). Erlaubt: /bin, /usr/bin, env. Nur oberste Ebene von shell/ (Testhelfer unter shell/tests werden mit explizitem Interpreter gerufen). 'ausnahmen': {\"datei\", \"grund\"}.",
+    "globs": [
+      "{REPO}/shell/*"
+    ],
+    "ausnahmen": [
+      {
+        "datei": "peer-shot",
+        "grund": "nur auf peer installiert (Wayland-Screenshot), Interpreter ist das dortige peer-shot-py3"
+      },
+      {
+        "datei": "rerank",
+        "grund": "nur Mac: nutzt das venv unter ~/AI/audio-tools"
+      }
+    ]
+  },
+  "check15_werkzeuge": {
+    "_comment": "Check 15 (2026-10-13): Befunde von wb-werkzeuge status --json (Quelle shell/werkzeuge.default.json, Schema werkzeuge/1) als Findings. Wie check9 ruft der Check das Werkzeug als EIGENEN Prozess auf; WB_WERKZEUGE_BIN ueberschreibt den Pfad fuer Tests. Ohne diesen Schluessel bleibt der Check still.",
+    "skript": "{REPO}/shell/wb-werkzeuge"
   }
 }

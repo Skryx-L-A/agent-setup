@@ -45,7 +45,9 @@ if not auffaellig:
 jetzt = time.time()
 for e in auffaellig:
     alter = int((jetzt - float(e.get("seit", jetzt))) / 60)
-    halter = (e.get("halter") or {}).get("sitzung") or "unbekannt"
+    h = e.get("halter") or {}
+    halter = ("Unit %s" % h.get("unit")) if h.get("halter_art") == "unit" and h.get("unit") \
+        else (h.get("sitzung") or "unbekannt")
     print("Belegung %s: %s, %s GiB, seit %d min, Halter %s -- %s"
           % (e.get("id", "?"),
              "UEBERFAELLIG" if e.get("_zustand") == "ueberfaellig" else "TOT",

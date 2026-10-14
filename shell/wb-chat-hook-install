@@ -1,6 +1,6 @@
 #!/bin/bash
-# wb-chat-hook-install — installiert den SessionStart-Hook, der die
-# Chat-Ansicht einer Sitzung ihrem tmux-Pane zuordnet (SPEC-V4 6.3 Punkt 4).
+# wb-chat-hook-install — gemeinsame Vorbereitung unmittelbar vor einem
+# Harness-Start: Claude-MCP-Guard und SessionStart-Chat-Zuordnung.
 #
 #   wb-chat-hook-install <harness-id>
 #
@@ -29,6 +29,29 @@
 # lesbaren Registry-Eintrag tut nichts (Exit 0).
 set -uo pipefail
 HARNESS="${1:?wb-chat-hook-install: Harness-Id fehlt}"
+
+# Alle drei Claude-Startwege (wb-code, direkter pi-worker-Zweig und
+# wb-harness-run) laufen hier durch. Deshalb sitzt der Schutz gegen ein vom
+# Plugin-Update zurueckgesetztes Playwright-stdio genau hier und nicht dreimal in
+# den Aufrufern. Er ist absichtlich best effort: fehlt mcp-shared oder ist der
+# Shared-Server gestoppt, startet Claude mit seiner vorhandenen Konfiguration.
+if [ "$HARNESS" = "claude" ]; then
+    MCP_SHARED_WERKZEUG=""
+    if [ "${WB_MCP_SHARED+x}" = "x" ]; then
+        [ -x "$WB_MCP_SHARED" ] && MCP_SHARED_WERKZEUG="$WB_MCP_SHARED"
+    else
+        for kandidat in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/mcp-shared" \
+                        "$HOME/.local/bin/mcp-shared"; do
+            [ -x "$kandidat" ] && { MCP_SHARED_WERKZEUG="$kandidat"; break; }
+        done
+    fi
+    if [ -n "$MCP_SHARED_WERKZEUG" ]; then
+        "$MCP_SHARED_WERKZEUG" guard-claude || \
+          echo "wb-chat-hook-install: mcp-shared-Guard fehlgeschlagen; Claude startet mit der vorhandenen MCP-Konfiguration." >&2
+    else
+        echo "wb-chat-hook-install: mcp-shared fehlt; Claude startet mit der vorhandenen MCP-Konfiguration." >&2
+    fi
+fi
 
 HJSON2="$("$HOME/.local/bin/wb-state" harness get "$HARNESS" 2>/dev/null || true)"
 # ERST PRUEFEN, DANN ANLEGEN (11.08., Befund der Nachlese): frueher stand die
@@ -105,6 +128,72 @@ if isinstance(d, dict):
 ' 2>/dev/null)
 [ -n "$sid" ] || exit 0
 t=$(command -v tmux 2>/dev/null) || exit 0
+#
+# NUR DER HARNESS, DER DEN PANE BESITZT, DARF SEINE KENNUNG ANHAENGEN (13.10.).
+# Ein claude -p, das IN einem Pane laeuft (Nachtest, Werkzeug), erbt $TMUX_PANE und
+# ueberschrieb sonst die Zuordnung des Orchestrators mit seiner Wegwerf-Sitzung.
+# Geprueft wird die Elternkette dieses Hooks bis zu #{pane_pid}: der erste
+# Agent-Prozess darueber (Erkennung siehe unten, ueber das erste Wort von args) ist der
+# Harness dieses Hooks. Er schreibt,
+# wenn er der Pane-Prozess selbst ist (exec-Wrapper = dieselbe PID) oder wenn
+# zwischen ihm und dem Pane-Prozess (diesen eingeschlossen) kein weiterer
+# Agent-Prozess steht (Pane-Prozess = Shell oder Wrapper ohne exec).
+# Laesst sich pane_pid nicht erfragen, gilt wie bisher: schreiben. Erreicht die
+# Kette pane_pid nicht, gehoert der Hook nicht zu diesem Pane: nichts schreiben.
+pp=$("$t" display-message -p -t "$TMUX_PANE" "#{pane_pid}" 2>/dev/null)
+case "$pp" in
+  ""|*[!0-9]*) ;;
+  *)
+    p=$(ps -o ppid= -p "$$" 2>/dev/null | tr -d " ")
+    erster=""
+    enam=""
+    vorher=""
+    n=0
+    ok=nein
+    while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$n" -lt 40 ]; do
+      n=$((n + 1))
+      # ARGS STATT COMM: unter Linux ist comm auf 15 Zeichen gekuerzt und nennt bei einem
+      # node-Start nur "node". Das erste Wort von args ist der Startpfad (macOS und Linux).
+      # Agent ist: Basename claude oder codex; der volle Versionspfad
+      # .../claude/versions/<v>; oder node/nodejs, dessen zweites Wort auf claude bzw.
+      # codex zeigt (.../claude-code/cli.js, .../@openai/codex/bin/codex.js, .../bin/codex).
+      a=$(ps -o args= -p "$p" 2>/dev/null)
+      a=${a# }
+      w1=${a%% *}
+      r=${a#"$w1"}
+      r=${r# }
+      w2=${r%% *}
+      c=""
+      knode=""
+      case "$w1" in
+        */claude/versions/*) c=claude ;;
+        *)
+          case "${w1##*/}" in
+            claude|codex) c=${w1##*/} ;;
+            node|nodejs)
+              case "$w2" in
+                */claude-code/*|*/@anthropic-ai/claude*|*/claude|*/claude.js) c=claude; knode=ja ;;
+                */@openai/codex/*|*/codex|*/codex.js) c=codex; knode=ja ;;
+              esac ;;
+          esac ;;
+      esac
+      case "$c" in
+        claude|codex)
+          if [ -z "$erster" ]; then erster=$p; enam=$c
+          elif [ "$p" != "$erster" ]; then
+            # Der node-Starter von codex (node .../codex.js) ist der ELTERN-Prozess des
+            # nativen codex: derselbe Agent, kein verschachtelter. Sonst: verschachtelt.
+            if [ "$knode" = ja ] && [ "$vorher" = "$erster" ] && [ "$c" = "$enam" ]; then erster=$p
+            else exit 0
+            fi
+          fi ;;
+      esac
+      if [ "$p" = "$pp" ]; then ok=ja; break; fi
+      vorher=$p
+      p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " ")
+    done
+    [ "$ok" = ja ] || exit 0 ;;
+esac
 "$t" set-option -p -t "$TMUX_PANE" @wb_chat_session "$sid" >/dev/null 2>&1
 exit 0
 SH

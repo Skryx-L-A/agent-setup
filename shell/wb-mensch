@@ -3,7 +3,9 @@
 #
 #   wb-mensch pruefen         Exit 0 = Mensch, 1 = Agent. Ohne Ausgabe.
 #   wb-mensch beleg           <mensch|agent> TAB <Begruendung>   (immer Exit 0)
-#   wb-mensch ahnen           Die geprueften Ahnen, eine Zeile je Prozess (Diagnose)
+#   wb-mensch ahnen           Die geprueften Ahnen, eine Zeile je Prozess (Diagnose);
+#                             reisst die Lese ab, lautet die letzte Zeile
+#                             "UNVOLLSTAENDIG <grund>" (Exit bleibt 0)
 #
 # WARUM ES DIESES WERKZEUG GIBT
 # Drei Sicherungen in dieser Werkbank duerfen nur von einem Menschen gelockert
@@ -31,7 +33,17 @@
 #       direkter Ahne, und ein Agent kann seinen eigenen Elternprozess nicht
 #       austauschen.
 #   A3  Ein Ahnen-PID ist die pane_pid eines tmux-Panes mit
-#       @wb_role=worker|orchestrator.
+#       @wb_role=worker|orchestrator. Die lokalen tmux-Sockets werden aus den
+#       eigenen Socketverzeichnissen ermittelt; TMUX/TMUX_PANE sind dafuer
+#       nicht noetig und koennen A3 durch `env -u` nicht ausschalten.
+#   A2b Die Ahnenreihe, auf der A2, A3 und M2 stehen, ist nicht vollstaendig
+#       messbar. Regulaer endet sie an PID <= 1 (launchd, systemd, init; auch
+#       wenn dieser Prozess selbst PID 1 eines PID-Namensraums ist, den A5 auf
+#       Linux ohnehin ablehnt) oder an ppid 0. Scheitert `ps` vorher an einem
+#       Ahnen, liefert es nichts oder keine numerische ppid, bleibt offen, ob
+#       weiter oben ein Harness, ein Agenten-Pane oder ueber der Oberflaeche ein
+#       Agent steht -- vorher brach die Lese still ab, und M1 oder M2 meldeten
+#       einen Menschen. Die Antwort ist dann Nein, vor M1 und M2, ohne Schalter.
 #   A4  Eine SSH-Sitzung, deren Gegenstelle DIESE MASCHINE SELBST ist. Gemessen
 #       2026-08-06 vom Nutzer, und es war ein Loch: ein Agent verbindet sich per
 #       `ssh -tt $(tailscale ip -4)` mit dem eigenen Rechner, sshd gibt ihm einen
@@ -40,25 +52,76 @@
 #       kein Pane darueber. M1 sah daraufhin einen Menschen und sagte es woertlich:
 #       "mensch  Steuerndes Terminal vorhanden, kein Agent in der Ahnenreihe (M1)".
 #       Eine Schleife ueber die eigene Maschine ist aber nie ein Mensch, sondern nur
-#       ein Umweg. Die Gegenstelle steht in SSH_CONNECTION (erste Adresse) und wird
-#       gegen die GEMESSENEN eigenen Adressen gehalten -- ifconfig/ip, dazu
-#       `tailscale ip` und ausdruecklich die Rueckschleife. Nichts davon ist fest
-#       verdrahtet: eine Adressliste im Quelltext waere an dem Tag falsch, an dem
-#       sich eine Adresse aendert, und zwar still und in die gefaehrliche Richtung.
+#       ein Umweg. Die Gegenstelle wird GEMESSEN (seit 2026-10-09): aus dem utmp-Eintrag,
+#       den der SSH-Server fuer das steuernde Terminal schreibt, und nur wenn dessen PID
+#       ein root-eigener Server-Ahne ist oder dessen Kind (Einzelheiten und Messungen an
+#       ssh_auf_sich_selbst). SSH_CONNECTION aus der Umgebung zaehlt nicht mehr, in keine
+#       Richtung: vorher kam ein Agent mit `exec env SSH_CONNECTION=<fremd> …` in der
+#       Schleife als Mensch durch (gemessen auf peer). Die Adresse wird gegen die
+#       GEMESSENEN eigenen Adressen gehalten -- ifconfig/ip, dazu `tailscale ip` aus
+#       festem Pfad und ausdruecklich die Rueckschleife. Nichts davon ist fest verdrahtet: eine
+#       Adressliste im Quelltext waere an dem Tag falsch, an dem sich eine Adresse
+#       aendert, und zwar still und in die gefaehrliche Richtung.
 #
-#       Eine SSH-Sitzung von einer ANDEREN Maschine bleibt vorerst wie bisher. Das
-#       ist eine Vertrauensfrage, die der Nutzer noch entscheidet; sie steht als
-#       offener Punkt 2 in IPHONE-FERNBEDIENUNG-PLAN.md.
+#       Eine SSH-Sitzung von einer ANDEREN Maschine mit Pseudoterminal gilt weiter als
+#       Mensch (M1), auf peer ueber sshd ebenso wie auf dem Mac ueber Tailscale SSH. Das
+#       ist eine Vertrauensfrage, die der Nutzer noch entscheidet; sie steht als offener
+#       Punkt 2 in IPHONE-FERNBEDIENUNG-PLAN.md. Ein Agent mit Schluessel fuer die andere
+#       Maschine kommt auf diesem Weg ebenfalls durch (auch als Umweg ueber `ssh -L`).
+#   A5  (nur Linux) Der pruefende Prozess laeuft NICHT im Anfangs-Benutzer- oder
+#       -PID-Namensraum des Kernels. Gemessen 2026-10-10 auf peer in einer echten
+#       SSH-Schleife: `unshare --user --map-root-user --pid --fork --mount-proc
+#       wb-mensch beleg` ergab M1 -- im neuen PID-Namensraum ist wb-mensch selbst PID 1,
+#       sshd, Harness und Pane sind unsichtbar, das Terminal bleibt. Verglichen wird
+#       /proc/self/ns/{user,pid} gegen die festen Anfangs-Inodes des Kernels
+#       (PROC_USER_INIT_INO 4026531837, PROC_PID_INIT_INO 4026531836), nicht gegen
+#       PID 1: /proc/1/ns/* ist fuer normale Benutzer nicht lesbar (peer: "Permission
+#       denied", gemessen 2026-10-10). Laesst sich die Lage nicht messen, ist die
+#       Antwort ebenfalls Nein. Nur auf macOS (`uname -s` = Darwin, dort gibt es keine
+#       solchen Namensraeume) entfaellt die Pruefung; entschieden wird ueber die
+#       Plattform, nicht ueber ein fehlendes /proc, das sich verbergen liesse.
+#       Die echten Menschenwege laufen im Anfangsraum (peer, gemessen 2026-10-10):
+#       SSH-Login, tmux-Panes, der Electron-Hauptprozess der Werkbank und seine
+#       Kinder. Einen eigenen Namensraum hat dort nur der Renderer-Sandkasten, der
+#       wb-mensch nie aufruft.
 #
 # POSITIVPRUEFUNG (eine muss zutreffen -> Mensch):
 #   M1  Ein steuerndes Terminal. Gemessen: die Shell des Bash-Werkzeugs hat
 #       KEINES (`tty` sagt "not a tty", `ps -o tty=` zeigt "??"). Ein Mensch am
 #       Terminal hat immer eines.
 #   M2  Die Oberflaeche: WB_MENSCH_QUELLE=oberflaeche zusammen mit WB_APP_PID.
-#       Die Variablen allein zaehlen NICHT -- die PID muss ein echter Ahne
-#       dieses Prozesses sein UND wie das Werkbank-Programm aussehen. Ein Agent
-#       kann beide Variablen setzen; er kann sich nicht unter den
-#       Electron-Hauptprozess haengen.
+#       Die Variablen allein zaehlen NICHT. Die PID X muss ein echter Ahne dieses
+#       Prozesses sein, und X muss der Kern der ECHTEN Werkbank sein:
+#         - das ausgefuehrte Programm von X (Mac: proc_pidpath, Linux:
+#           /proc/X/exe) ist genau <kernordner>/node_modules/electron/dist/
+#           Electron.app/Contents/MacOS/Electron bzw. .../dist/electron, mit
+#           <kernordner> aus der festen Liste M2_KERN_ORDNER; auf Linux zusaetzlich
+#           cwd von X = <kernordner> und erstes Argument ".";
+#         - der Elternprozess P von X ist auf dem Mac die installierte App
+#           (M2_APP_MAC), auf Linux `systemd --user` (M2_ELTERN_LINUX); P ist
+#           Kind von PID 1 und nicht spaeter gestartet als X.
+#       "~/" in diesen Listen ist das Heimatverzeichnis aus der Benutzerdatenbank,
+#       nie $HOME: das setzt der Aufrufer.
+#       Bis 2026-10-14 reichte ein Ahne, dessen Kommandoname wie "electron"
+#       aussah. Ein abgekoppelter Agent unter einem selbst gebauten Programm
+#       namens "Electron" bekam damit M2 (Review mensch-review, Fund 2, gemessen).
+#       Auch der volle Pfad aus `ps -o comm=` taugt auf dem Mac nicht: er ist
+#       argv[0], frei waehlbar per `exec -a` oder Symlink (gemessen 2026-10-14:
+#       comm "/fake/argv0/Electron", proc_pidpath "/bin/sleep").
+#       Dev-Buendel (mac/build/Werkbank.app), Worktree- und Test-Kerne sind
+#       damit bewusst KEIN Menschen-Nachweis. Die Tests pruefen eine Kopie, in der
+#       nur diese Konstanten auf Attrappen umgeschrieben sind; es gibt keinen
+#       Schalter und keine Datei, die das installierte Werkzeug lockert.
+#       Auf peer ist das ausgefuehrte Programm von `systemd --user` fuer den
+#       Benutzer nicht lesbar (Permission denied, gemessen 2026-10-14); dort
+#       zaehlt ersatzweise dessen Kommandozeile mit derselben UID. Das schwaecht
+#       nichts: `systemd-run --user` startet ohnehin jedes Programm unter dem
+#       echten `systemd --user`, die Last liegt auf der Pruefung von X.
+#       Startet der Nutzer die App auf peer aus einem eigenen Terminal, ist P die
+#       Shell und M2 greift NICHT; dort traegt M1, solange der Kern das
+#       steuernde Terminal an wb-mensch vererbt. Eine Elternkette bis zu einem
+#       Terminal-Emulator oder login als Ersatz waere so faelschbar wie M1
+#       selbst (siehe GRENZE) und ist deshalb bewusst nicht eingebaut.
 #
 # GRENZE, offen benannt: gegen einen Agenten, der seine Herkunft AKTIV verwischt
 # (Umgebung leeren, `setsid`, ein eigenes Pseudoterminal aufmachen), schuetzt das
@@ -66,11 +129,62 @@
 # Abgewehrt wird der reale Fall: ein Agent, der das Merkmal in der Dokumentation
 # oder im Code liest und es einfach mitschickt.
 #
-# Fuer A4 ist eine Ecke dieser Grenze allerdings geschlossen: SSH_CONNECTION selbst
-# zu loeschen nuetzt nichts, weil dann A4b greift -- steht sshd in der Ahnenreihe und
-# laesst sich die Gegenstelle NICHT bestimmen, ist die Antwort Nein. Ein Agent kann
-# seine Umgebung leeren, aber nicht den sshd aus seiner Elternkette entfernen.
+# Fuer M2 gilt dieselbe Grenze in anderer Form: M2 bindet an die echten
+# Programmdateien, nicht an das, was darin laeuft. Derselbe Benutzer kann die
+# Dateien im Kernordner aendern, und er kann das echte Electron-Programm selbst
+# mit eigenem Code starten (NODE_OPTIONS, ELECTRON_RUN_AS_NODE, --inspect), auf
+# dem Mac auch die installierte App mit eigener Umgebung (`open --env`), auf
+# Linux ueber `systemd-run --user`. Das schliesst dieser Fix nicht; dafuer
+# braeuchte es abgeschaltete Electron-Fuses im Kern-Electron und einen
+# Kernstart, der die Umgebung leert.
+# Auch die Elternpruefung haengt an einem Pfad, den derselbe Benutzer
+# beschreiben kann: /Applications ist root:admin 775, und <user> ist admin
+# (gemessen 2026-10-14, Review herkunft2-review Fund 1). Eine eigene
+# Programmdatei unter einem Listenpfad besteht P und kann das echte Kern-
+# Electron mit beliebigem Code als Kind starten; dagegen helfen auch Fuses
+# nicht. Schliessen liesse sich das nur, wenn P root gehoert und nicht
+# benutzerbeschreibbar ist, oder ueber eine Code-Signatur. Ein Eintrag unter
+# ~/Applications stand bis 2026-10-14 in der Liste und ist gestrichen: die App
+# liegt dort nicht, und der Ordner ist ohne jedes Recht anlegbar.
+#
+# Fuer A4 ist eine Ecke dieser Grenze allerdings geschlossen (A4b): steht ein
+# Fernzugangs-Server (sshd, tailscaled, mosh-server) in der Ahnenreihe und laesst sich
+# die Gegenstelle NICHT messen, ist die Antwort Nein. Dasselbe gilt, wenn die Ahnenreihe
+# vor ihrem regulaeren Ende abreisst oder die eigenen Adressen nur die Rueckschleife
+# ergeben: eine halbe Messung ist keine Messung. Ein Agent kann seine Umgebung
+# leeren oder faelschen und ein eigenes Pseudoterminal samt utmp-Eintrag anlegen, aber
+# er kann in die echte utmp-Datei keinen Eintrag unter der PID eines root-Prozesses
+# schreiben (auch utempter traegt immer seine eigene PID ein).
+#
+# Den Server aus der Elternkette entfernen kann er dagegen auf Linux, sobald
+# unprivilegierte Benutzer-Namensraeume erlaubt sind (kernel.unprivileged_userns_clone=1).
+# Gemessen 2026-10-10 auf peer in einer echten SSH-Schleife auf die eigene Maschine:
+# `unshare --user --map-root-user --pid --fork --mount-proc wb-mensch beleg` ergab
+# "mensch ... (M1)". Im neuen PID-Namensraum ist wb-mensch selbst PID 1, sshd ist nicht
+# mehr zu sehen, das Terminal bleibt. Mit eigenem Mount-Namensraum lassen sich ausserdem
+# /proc, die utmp-Datei und ps ueberblenden. Das ist AKTIVES Verwischen und gehoert zur
+# GRENZE oben; SSH braucht es dafuer nicht einmal. Auf macOS gibt es keine solchen
+# Namensraeume. Seit A5 (2026-10-10) ergibt der Namensraum selbst Nein; offen bleibt nur
+# die aufwendigere Form, die in einem eigenen Mount-Namensraum auch /proc ueberblendet.
 set -uo pipefail
+
+# Fester Suchpfad VOR dem ersten Kommando. Die Aufrufer reichen einen PATH mit
+# /opt/homebrew/bin und /usr/local/bin durch, und beide gehoeren auf dem Mac dem
+# Benutzer selbst (drwxrwxr-x <user> admin, gemessen 2026-10-10). Ein Agent legt dort
+# ein eigenes `ps` ab, das Ahnen versteckt und ein Terminal meldet, und schon ist er
+# ein Mensch. Alles, was dieses Werkzeug aufruft (ps, grep, awk, sort, tr, ifconfig,
+# ip, env, id, stat, perl, python3, uname, readlink), liegt auf dem Mac und auf peer in diesen vier
+# root-eigenen Verzeichnissen (gemessen 2026-10-10). tmux kommt aus tmux_fest,
+# tailscale aus festen Pfaden (eigene_adressen).
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+# M2: die ECHTE Werkbank (Kopf, M2). Feste Listen, keine Umgebung, keine Datei.
+# "~/" ist das Heimatverzeichnis aus der Benutzerdatenbank (pwd), nicht $HOME.
+# Die Tests schreiben genau diese Zeilen in einer KOPIE auf Attrappen um.
+M2_KERN_ORDNER=('~/AI/claude-workbench/app')
+M2_APP_MAC=('/Applications/Werkbank.app/Contents/MacOS/Werkbank')
+M2_ELTERN_LINUX=('/usr/lib/systemd/systemd')
 
 CMD="${1:-pruefen}"
 
@@ -92,7 +206,10 @@ for h in (d.get("harnesses") or []):
 PY
 }
 
-# Ahnenreihe, innerster Prozess zuerst: "<pid> <kommando-basename>".
+# Ahnenreihe, innerster Prozess zuerst: "<pid> <kommando-basename>". Reisst die
+# Lese vor ihrem regulaeren Ende (PID <= 1 oder ppid 0) ab, ist die letzte Zeile
+# "UNVOLLSTAENDIG <grund>" (A2b). Eine Markierung im Strom statt eines Status:
+# die Aufrufer lesen ueber `$(…)`, und eine dort gesetzte Variable kaeme nie an.
 ahnen() {
     local pid=${1:-$$} zeile ppid comm
     # `read` statt Parameter-Expansion: `ps -o ppid=` polstert die Spalte LINKS
@@ -102,109 +219,362 @@ ahnen() {
     # fuehrende Trenner und laesst den REST der Zeile im zweiten Feld, also
     # bleiben Kommandonamen mit Leerzeichen ganz.
     while [ "$pid" -gt 1 ] 2>/dev/null; do
-        zeile=$(ps -o ppid=,comm= -p "$pid" 2>/dev/null) || return 0
-        [ -n "$zeile" ] || return 0
+        zeile=$(ps -o ppid=,comm= -p "$pid" 2>/dev/null) \
+            || { printf 'UNVOLLSTAENDIG ps scheiterte an PID %s\n' "$pid"; return 0; }
+        [ -n "$zeile" ] \
+            || { printf 'UNVOLLSTAENDIG ps lieferte nichts fuer PID %s\n' "$pid"; return 0; }
         read -r ppid comm <<<"$zeile"
         printf '%s %s\n' "$pid" "${comm##*/}"
-        case "${ppid:-}" in ''|*[!0-9]*) return 0 ;; esac
+        case "${ppid:-}" in
+            ''|*[!0-9]*) printf 'UNVOLLSTAENDIG keine ppid fuer PID %s\n' "$pid"; return 0 ;;
+        esac
         pid=$ppid
     done
+}
+
+# Liest die Ahnenreihe EINMAL fuer A2, A3 und M2: AHNEN = die Zeilen "<pid> <name>",
+# AHNEN_LUECKE = der Grund eines Abbruchs, leer bei regulaerem Ende.
+AHNEN=""
+AHNEN_LUECKE=""
+ahnen_lesen() {
+    local aus zeile
+    aus=$(ahnen)
+    AHNEN=""
+    AHNEN_LUECKE=""
+    while IFS= read -r zeile; do
+        case "$zeile" in
+            "UNVOLLSTAENDIG "*) AHNEN_LUECKE=${zeile#UNVOLLSTAENDIG } ;;
+            ?*) AHNEN="$AHNEN$zeile"$'\n' ;;
+        esac
+    done <<<"$aus"
+}
+
+# Das tmux-Binary kommt aus einer festen Systemliste, nicht aus einem vom
+# Aufrufer steuerbaren Suchpfad. Auf Apple Silicon liegt es regulaer in
+# /opt/homebrew/bin, auf Intel-Macs und vielen Linux-Systemen unter /usr/local
+# bzw. /usr/bin.
+tmux_fest() {
+    local kandidat
+    for kandidat in /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux /bin/tmux; do
+        [ -x "$kandidat" ] && { printf '%s\n' "$kandidat"; return 0; }
+    done
+    return 1
+}
+
+# Eigene lokale tmux-Sockets, auch wenn TMUX/TMUX_PANE absichtlich fehlen.
+# Der TMUX-Wert ist nur ein zusaetzlicher Hinweis; jede gefundene Karte wird
+# unten gegen die wirkliche Ahnenkette geprueft. Ein erfundener Socket oder
+# Pane-Name ist deshalb kein Menschen- oder Agentenbeleg.
+tmux_sockets() {
+    local uid socket dir eigentuemer
+    uid=$(/usr/bin/id -u 2>/dev/null) || return 1
+    if [ -n "${TMUX:-}" ]; then
+        socket=${TMUX%%,*}
+        if [ -S "$socket" ]; then
+            eigentuemer=$(/usr/bin/stat -c '%u' "$socket" 2>/dev/null \
+                || /usr/bin/stat -f '%u' "$socket" 2>/dev/null || true)
+            if [ "$eigentuemer" = "$uid" ]; then
+                printf '%s\n' "$socket"
+            fi
+        fi
+    fi
+    # Auf macOS ist /tmp ein Verweis auf /private/tmp: ohne diesen Abgleich stand
+    # jeder Socket zweimal in der Liste. Verglichen wird der physische Pfad; ein
+    # Verzeichnis wird nur uebersprungen, wenn es DASSELBE ist wie ein schon
+    # durchsuchtes, es geht also kein Socket verloren.
+    # `stat -c` zuerst: GNU `stat -f '%u' DIR` liest '%u' als zweite DATEI, druckt die
+    # Dateisystem-Angaben von DIR auf stdout und scheitert -- der Rueckfall haengte dann
+    # "1000" an diesen Text, kein Eigentuemer passte, und A3 fand auf Linux nie einen
+    # Socket (gemessen 2026-10-09 auf peer). BSD-stat kennt -c nicht und schweigt auf stdout.
+    local physisch gesehen=" "
+    for dir in "/private/tmp/tmux-$uid" "/tmp/tmux-$uid" "${TMPDIR:-/tmp}/tmux-$uid"; do
+        [ -d "$dir" ] || continue
+        eigentuemer=$(/usr/bin/stat -c '%u' "$dir" 2>/dev/null \
+            || /usr/bin/stat -f '%u' "$dir" 2>/dev/null || true)
+        [ "$eigentuemer" = "$uid" ] || continue
+        physisch=$(CDPATH= cd -P "$dir" 2>/dev/null && pwd -P) || physisch=$dir
+        case "$gesehen" in *" $physisch "*) continue ;; esac
+        gesehen="$gesehen$physisch "
+        for socket in "$dir"/*; do
+            [ -S "$socket" ] || continue
+            printf '%s\n' "$socket"
+        done
+    done
+}
+
+# Tote Sockets vorab aussortieren: EIN Prozess versucht je Socket ein connect().
+# Vorher startete jeder Socket einen eigenen `tmux list-panes`, tote eingeschlossen;
+# mit 152 liegengebliebenen Sockets dauerte ein `wb-pane-write` 4 bis 5 s
+# (nacht-rot2, 2026-09-30, per Trace).
+#
+# Tot ist ein Socket NUR, wenn connect() mit ECONNREFUSED (niemand lauscht) oder
+# ENOENT (Datei weg) scheitert. Genau dann scheitert auch der tmux-Client selbst
+# ("no server running"), und die Schleife unten haette den Socket ohnehin
+# uebersprungen -- die Pruefung wird dadurch fuer keinen lebenden Server milder.
+# Jeder andere Ausgang (Verbindung steht, EAGAIN/EINPROGRESS bei vollem Rueckstau,
+# EACCES, ein zu langer Pfad, ein Fehler von perl selbst) laesst den Socket drin:
+# im Zweifel fragt tmux ihn ab wie bisher. Nicht blockierend, damit ein voller
+# Rueckstau unter Linux diese Pruefung nicht anhaelt.
+# perl mit festem Pfad und `env -i`: PERL5OPT/PERL5LIB des Aufrufers duerfen hier
+# keinen Code einschleusen. Fehlt perl, bleiben alle Sockets drin.
+lebende_sockets() {
+    local sockets=() socket
+    while IFS= read -r socket; do
+        [ -n "$socket" ] && sockets+=("$socket")
+    done
+    [ "${#sockets[@]}" -gt 0 ] || return 0
+    local lebend
+    if [ -x /usr/bin/perl ] && lebend=$(/usr/bin/env -i /usr/bin/perl -e '
+        use strict; use Socket; use Fcntl; use Errno;
+        my $aus = "";
+        for my $p (@ARGV) {
+            if (length($p) > 100) { $aus .= "$p\n"; next }
+            my $s;
+            unless (socket($s, PF_UNIX, SOCK_STREAM, 0)) { $aus .= "$p\n"; next }
+            my $f = fcntl($s, F_GETFL, 0);
+            fcntl($s, F_SETFL, $f | O_NONBLOCK) if defined $f;
+            my $ok = connect($s, pack_sockaddr_un($p));
+            $aus .= "$p\n" if $ok || !($!{ECONNREFUSED} || $!{ENOENT});
+            close($s);
+        }
+        print $aus;' -- "${sockets[@]}" 2>/dev/null); then
+        [ -n "$lebend" ] && printf '%s\n' "$lebend"
+        return 0
+    fi
+    printf '%s\n' "${sockets[@]}"
 }
 
 # Startet dieser Prozess unter einem Pane, der als Agent markiert ist? Geprueft
 # wird ueber die pane_pid, nicht ueber $TMUX_PANE: die Variable ist eine
 # Behauptung, die Prozesstabelle ist es nicht.
 agenten_pane() {
-    command -v tmux >/dev/null 2>&1 || return 1
-    local karte
-    karte=$(tmux list-panes -a -F '#{pane_pid} #{@wb_role}' 2>/dev/null) || return 1
+    local tmux_bin socket karte alle_karten=""
+    tmux_bin=$(tmux_fest) || return 1
+    while IFS= read -r socket; do
+        [ -n "$socket" ] || continue
+        karte=$("$tmux_bin" -S "$socket" list-panes -a \
+            -F '#{pane_pid} #{@wb_role}' 2>/dev/null) || continue
+        [ -n "$karte" ] || continue
+        alle_karten="${alle_karten}${alle_karten:+
+}${karte}"
+    done < <(tmux_sockets | lebende_sockets)
+    karte=$alle_karten
     [ -n "$karte" ] || return 1
     local pid
     while read -r pid _; do
+        [ -n "$pid" ] || continue
         printf '%s\n' "$karte" | awk -v p="$pid" '$1==p && ($2=="worker" || $2=="orchestrator"){f=1} END{exit !f}' \
             && return 0
-    done < <(ahnen)
+    done <<<"$AHNEN"
     return 1
 }
 
 # Alle Adressen, unter denen DIESE Maschine erreichbar ist -- gemessen, nie verdrahtet.
-# Drei Quellen, weil keine allein reicht: `ifconfig` deckt macOS und BSD ab, `ip -o addr`
-# Linux (Peer-Rechner), und `tailscale ip` fragt den Dienst selbst. Die Rueckschleife steht
-# ausserdem ausdruecklich drin und nicht nur, weil sie zufaellig in jeder Schnittstellen-
-# liste auftaucht: sie ist der Fall, den man zuerst probiert.
+# Zwei Schnittstellen-Quellen, weil keine allein reicht: `ifconfig` deckt macOS und BSD
+# ab, `ip -o addr` Linux (peer). Ausgabe je Zeile "<schnittstelle> <adresse>". Die
+# Rueckschleife steht ausserdem ausdruecklich drin und nicht nur, weil sie zufaellig in
+# jeder Schnittstellenliste auftaucht: sie ist der Fall, den man zuerst probiert.
+#
+# `tailscale ip` nur ueber feste root-eigene Pfade (peer: /usr/bin/tailscale). Auf dem
+# Mac liegt der Client allein in /opt/homebrew/bin und wird darum nicht gefragt; das
+# kostet nichts, weil die Tailscale-Adresse auch an der Schnittstelle steht (gemessen
+# 2026-10-10: Mac utun0 <mac-ip> in ifconfig, peer tailscale0 <peer-ip> in ip).
+#
+# Exit 1, wenn keine Schnittstellen-Quelle eine Adresse ausserhalb der Rueckschleife
+# geliefert hat: dann ist die Liste unvollstaendig, und ein Selbst-SSH ueber die LAN-
+# oder Tailscale-Adresse saehe wie eine fremde Gegenstelle aus.
 eigene_adressen() {
-    printf '%s\n%s\n' 127.0.0.1 ::1
-    ifconfig 2>/dev/null | awk '$1=="inet" || $1=="inet6" { print $2 }'
-    ip -o addr show 2>/dev/null | awk '{ for (i=1;i<=NF;i++) if ($i=="inet" || $i=="inet6") print $(i+1) }'
-    command -v tailscale >/dev/null 2>&1 && tailscale ip 2>/dev/null
+    local schnitt
+    schnitt=$(
+        ifconfig 2>/dev/null | awk '/^[^ \t]/ { s = $1; sub(/:$/, "", s) }
+                                    $1=="inet" || $1=="inet6" { print s, $2 }'
+        ip -o addr show 2>/dev/null | awk '{ for (i=3;i<NF;i++) if ($i=="inet" || $i=="inet6") print $2, $(i+1) }'
+    )
+    printf 'lo 127.0.0.1\nlo ::1\n'
+    [ -n "$schnitt" ] && printf '%s\n' "$schnitt"
+    local ts
+    for ts in /usr/bin/tailscale /usr/sbin/tailscale; do
+        [ -x "$ts" ] || continue
+        "$ts" ip 2>/dev/null | awk 'NF { print "tailscale", $1 }'
+        break
+    done
+    printf '%s\n' "$schnitt" | awk '$1 !~ /^lo[0-9]*$/ && $2 != "" { f = 1 } END { exit !f }'
+}
+
+# Fernzugangs-Server in der Ahnenreihe. sshd heisst je nach Fassung `sshd`,
+# `sshd-session` oder `sshd-auth`; `ps -o comm=` liefert dabei auf macOS den vollen
+# Prozesstitel ("sshd-session: <user> [priv]", gemessen 2026-08-06), daher der Praefix.
+# `tailscaled` ist der Server von Tailscale SSH: auf dem Mac kommt eine Anmeldung von
+# peer als tailscaled (root) -> /usr/bin/login -h <gegenstelle> -> zsh, ganz ohne sshd
+# (gemessen 2026-10-09). `mosh-server` loest sich nach dem Start von seinem sshd und
+# haengt danach unter launchd/systemd (gemessen 2026-10-09 auf dem Mac); bis dahin
+# fing nur die geerbte Umgebungsvariable die Schleife `mosh 127.0.0.1` ab.
+fernzugang_name() {
+    case "$1" in
+        sshd|sshd:*|sshd\ *|sshd-session*|sshd-auth*|tailscaled|mosh-server|mosh-server\ *) return 0 ;;
+    esac
+    return 1
+}
+
+# A4: die Gegenstelle dieser Fernsitzung ist diese Maschine selbst -- oder sie ist
+# nicht messbar (A4b). GRUND_SSH traegt die Begruendung.
+#
+# WOHER DIE GEGENSTELLE KOMMT (2026-10-09, gemessen auf peer und dem Mac)
+# Nicht aus SSH_CONNECTION. Die Variable setzt jeder Aufrufer, wie er will, und sie
+# aendert das Ergebnis hier in keine Richtung mehr. Geprueft und verworfen wurde auch
+# /proc/<pid>/environ der Login-Shell, die sshd startet: die Datei ist fuer denselben
+# Benutzer lesbar (die von sshd-session selbst nicht, der Prozess ist nicht dumpbar),
+# aber `ssh host 'exec env SSH_CONNECTION=… prog'` ersetzt das Programm unter
+# DERSELBEN PID, und /proc zeigt danach die neue, frei gewaehlte Umgebung. Ptrace
+# braucht es dafuer gar nicht (Yama ptrace_scope=1 auf peer haelt nur fremde Ahnen ab).
+#
+# Gelesen wird stattdessen der utmp-Eintrag, den der SSH-Server beim Anmelden fuer das
+# Pseudoterminal schreibt: Zeile = das steuernde Terminal dieses Prozesses, Host = die
+# Gegenstelle, die der Server selbst am Socket gemessen hat. Der Eintrag zaehlt nur,
+# wenn seine PID ein Ahne ist, der root gehoert und ein Fernzugangs-Server ist, oder
+# das direkte Kind eines solchen Ahnen. Gemessen:
+#   peer  sshd-session (root, Monitor) -> sshd-session (<user>) -> bash; ut_pid = Monitor
+#   Mac   sshd-session [priv] (root) -> sshd-session (<user>) -> zsh; ut_pid = Kind
+#   Mac   tailscaled (root) -> login (root) -> zsh; ut_pid = login
+# Die Bindung ist noetig: auf peer darf jeder Benutzer ueber /usr/lib/utempter/utempter
+# (setgid utmp, so schreibt tmux seine Eintraege) einen Eintrag mit FREI GEWAEHLTEM Host
+# fuer ein eigenes Pseudoterminal anlegen -- gemessen 2026-10-09 mit Host 9.9.9.9. Die
+# PID darin ist aber immer der eigene Prozess des Aufrufers, nie ein root-Ahne.
+# Laesst sich so kein Eintrag finden (kein steuerndes Terminal, ein selbst geoeffnetes
+# Pseudoterminal, ein sshd ohne root, mosh), ist die Antwort Nein (A4b).
+GRUND_SSH=""
+ssh_auf_sich_selbst() {
+    local pid=$$ zeile ppid uid comm luecke=""
+    local -a pids=() uids=() namen=()
+    # Regulaer endet die Reihe an PID 1 (launchd, systemd, init eines PID-Namensraums)
+    # oder an ppid 0 (ein Prozess, dessen Elternteil ausserhalb des eigenen
+    # Namensraums liegt). Jeder andere Abbruch -- ps scheitert, liefert nichts oder
+    # eine nicht numerische ppid -- laesst offen, ob weiter oben ein Fernzugangs-Server
+    # steht. Vorher galt das still als "kein Server", und M1 nahm das SSH-pty als
+    # Menschen (Codex-Gegenlesung 2026-10-10).
+    while [ "$pid" -gt 1 ] 2>/dev/null; do
+        zeile=$(ps -o ppid=,uid=,comm= -p "$pid" 2>/dev/null) \
+            || { luecke="ps scheiterte an PID $pid"; break; }
+        [ -n "$zeile" ] || { luecke="ps lieferte nichts fuer PID $pid"; break; }
+        read -r ppid uid comm <<<"$zeile"
+        pids+=("$pid"); uids+=("$uid"); namen+=("${comm##*/}")
+        case "${ppid:-}" in ''|*[!0-9]*) luecke="keine ppid fuer PID $pid"; break ;; esac
+        [ "$ppid" -eq 0 ] && break
+        pid=$ppid
+    done
+    if [ -n "$luecke" ]; then
+        GRUND_SSH="Ahnenreihe nicht vollstaendig messbar ($luecke) -- ob ein Fernzugangs-Server darueber steht, bleibt offen (A4b)."
+        return 0
+    fi
+    local i fern=0 erlaubt=()
+    for i in "${!pids[@]}"; do
+        fernzugang_name "${namen[$i]}" || continue
+        fern=1
+        if [ "${uids[$i]}" = 0 ]; then
+            erlaubt+=("${pids[$i]}")
+            [ "$i" -gt 0 ] && erlaubt+=("${pids[$((i-1))]}")
+        fi
+    done
+    [ "$fern" = 1 ] || return 1
+    if [ "${#erlaubt[@]}" -eq 0 ]; then
+        GRUND_SSH="Fernsitzung ohne root-eigenen SSH-Server in der Ahnenreihe -- die Gegenstelle ist nicht messbar (A4b)."
+        return 0
+    fi
+    local tty
+    tty=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')
+    case "$tty" in ''|'?'|'??'|*[!A-Za-z0-9/]*)
+        GRUND_SSH="Fernsitzung ohne steuerndes Terminal -- die Gegenstelle ist nicht messbar (A4b)."
+        return 0 ;;
+    esac
+    local adressen befund
+    if ! adressen=$(eigene_adressen); then
+        GRUND_SSH="Fernsitzung, aber weder ifconfig noch ip lieferten eine eigene Adresse ausserhalb der Rueckschleife -- die eigenen Adressen sind nicht vollstaendig messbar (A4b)."
+        return 0
+    fi
+    befund=$(printf '%s\n' "$adressen" | /usr/bin/env -i /usr/bin/python3 -I -S -c '
+import ctypes, ipaddress, sys
+line, erlaubt = sys.argv[1], {int(p) for p in sys.argv[2:]}
+c = ctypes
+class TV(c.Structure):
+    _fields_ = [("s", c.c_long), ("u", c.c_int32)]
+if sys.platform == "darwin":
+    class U(c.Structure):
+        _fields_ = [("user", c.c_char * 256), ("id", c.c_char * 4), ("line", c.c_char * 32),
+                    ("pid", c.c_int32), ("type", c.c_short), ("tv", TV), ("host", c.c_char * 256)]
+    libc = c.CDLL("/usr/lib/libSystem.B.dylib")
+elif sys.platform.startswith("linux"):
+    class U(c.Structure):
+        _fields_ = [("type", c.c_short), ("pid", c.c_int32), ("line", c.c_char * 32),
+                    ("id", c.c_char * 4), ("user", c.c_char * 32), ("host", c.c_char * 256)]
+    libc = c.CDLL("libc.so.6")
+else:
+    print("UNKLAR Plattform ohne utmp-Lesung"); sys.exit(0)
+libc.getutxent.restype = c.POINTER(U)
+hosts = set()
+libc.setutxent()
+while True:
+    p = libc.getutxent()
+    if not p:
+        break
+    u = p.contents
+    if u.type == 7 and u.line.decode(errors="replace") == line and u.pid in erlaubt:
+        hosts.add(u.host.decode(errors="replace").strip())
+libc.endutxent()
+def ip(text):
+    a = ipaddress.ip_address(text.split("/")[0].split("%")[0])
+    return a.ipv4_mapped if a.version == 6 and a.ipv4_mapped else a
+if len(hosts) != 1:
+    print("UNKLAR %d passende utmp-Eintraege fuer %s" % (len(hosts), line)); sys.exit(0)
+host = hosts.pop()
+try:
+    peer = ip(host)
+except ValueError:
+    print("UNKLAR utmp-Host %r ist keine Adresse" % host[:80]); sys.exit(0)
+for zeile in sys.stdin:
+    try:
+        if ip(zeile.split()[-1]) == peer:
+            print("EIGEN %s" % peer); sys.exit(0)
+    except (ValueError, IndexError):
+        pass
+print("FREMD %s" % peer)
+' "$tty" "${erlaubt[@]}" 2>/dev/null)
+    case "$befund" in
+        "FREMD "*) return 1 ;;
+        "EIGEN "*)
+            GRUND_SSH="SSH-Sitzung auf DIESE Maschine selbst -- die Gegenstelle ${befund#EIGEN } ist eine eigene Adresse (A4)."
+            return 0 ;;
+        "UNKLAR "*)
+            GRUND_SSH="Fernsitzung, aber die Gegenstelle ist nicht messbar: ${befund#UNKLAR } (A4b)."
+            return 0 ;;
+    esac
+    GRUND_SSH="Fernsitzung, aber die utmp-Lesung lieferte kein Ergebnis (A4b)."
     return 0
 }
 
-# Adressen vergleichbar machen: Linux haengt die Praefixlaenge an (10.0.0.5/24), IPv6
-# traegt oft einen Gueltigkeitsbereich (fe80::1%en0), und ein IPv4-Ziel erscheint ueber
-# eine IPv6-Fassung als ::ffff:127.0.0.1. Ohne diese drei Schnitte verglichen man
-# Zeichenketten, die dieselbe Maschine meinen und trotzdem verschieden aussehen.
-adresse_normal() {
-    local a="${1%%/*}"
-    a="${a%%\%*}"
-    # Nur die PUNKT-Schreibweise wird zurueckgeschnitten (::ffff:127.0.0.1 -> 127.0.0.1),
-    # und der Schnitt geht bis zum LETZTEN Doppelpunkt. `${a#*:*:}` waere hier falsch:
-    # bei '::ffff:127.0.0.1' passt '*:*:' schon auf die beiden fuehrenden Doppelpunkte,
-    # uebrig blieb 'ffff:127.0.0.1' und der Vergleich ging ins Leere (gemessen
-    # 2026-08-06, der Fall fiel in der eigenen Suite durch).
-    # Die seltene Hex-Fassung (::ffff:7f00:1) bleibt absichtlich unangetastet: sie
-    # sauber zurueckzurechnen waere mehr Code als Nutzen, und sshd meldet sie nicht.
-    case "$a" in
-        ::ffff:*.*.*.*|::FFFF:*.*.*.*) a="${a##*:}" ;;
+# A5: laeuft dieser Prozess ausserhalb der Anfangs-Namensraeume? GRUND_NS traegt die
+# Begruendung. Exit 0 = nicht Mensch.
+GRUND_NS=""
+fremder_namensraum() {
+    local plattform user_ns pid_ns
+    plattform=$(/usr/bin/uname -s 2>/dev/null) || plattform=""
+    case "$plattform" in
+        Darwin) return 1 ;;
+        Linux)  ;;
+        *)
+            GRUND_NS="Plattform '${plattform:-unbekannt}' ohne Namensraum-Messung -- die Ahnenreihe ist nicht als vollstaendig belegt (A5)."
+            return 0 ;;
     esac
-    printf '%s' "$a" | tr 'A-F' 'a-f'
-}
-
-# Steht sshd in der Ahnenreihe? Auf macOS heisst der Sitzungsprozess seit einiger Zeit
-# `sshd-session`, frueher und auf Linux `sshd` -- beides zaehlt. Gematcht wird mit
-# Praefix und nicht auf den nackten Namen: `ps -o comm=` liefert hier nicht "sshd",
-# sondern den vollen Prozesstitel. Gemessen 2026-08-06 in einer echten Sitzung:
-#   19442 sshd-session: <user>@ttys004
-#   19422 sshd-session: <user> [priv]
-# Ein exakter Vergleich griff deshalb nie, und A4b lief still ins Leere -- die Probe
-# mit geloeschtem SSH_CONNECTION meldete weiterhin "mensch".
-sshd_ist_ahne() {
-    local pid name
-    while read -r pid name; do
-        case "$name" in sshd|sshd:*|sshd\ *|sshd-session*|sshd-auth*) return 0 ;; esac
-    done < <(ahnen)
-    return 1
-}
-
-# A4: die Gegenstelle dieser SSH-Sitzung ist diese Maschine selbst.
-# GRUND_SSH traegt die Begruendung, damit die Meldung sagt, WELCHE Adresse es war.
-GRUND_SSH=""
-ssh_auf_sich_selbst() {
-    local peer eigen
-    if [ -z "${SSH_CONNECTION:-}" ]; then
-        # Kein SSH im Spiel -> A4 sagt nichts. Aber: sitzt ein sshd in der Ahnenreihe
-        # und ist die Variable trotzdem weg, laesst sich die Gegenstelle nicht messen --
-        # und ein Zweifelsfall ist hier ein Nein (A4b). Genau ueber diese Luecke ginge
-        # sonst derselbe Weg noch einmal, nur mit einem `unset` davor.
-        if sshd_ist_ahne; then
-            GRUND_SSH="SSH-Sitzung (sshd in der Ahnenreihe), aber SSH_CONNECTION fehlt -- die Gegenstelle ist nicht messbar (A4b)."
-            return 0
-        fi
+    user_ns=$(readlink /proc/self/ns/user 2>/dev/null) || user_ns=""
+    pid_ns=$(readlink /proc/self/ns/pid 2>/dev/null) || pid_ns=""
+    if [ "$user_ns" = "user:[4026531837]" ] && [ "$pid_ns" = "pid:[4026531836]" ]; then
         return 1
     fi
-    peer=$(adresse_normal "${SSH_CONNECTION%% *}")
-    if [ -z "$peer" ]; then
-        GRUND_SSH="SSH_CONNECTION ist gesetzt, enthaelt aber keine lesbare Gegenstelle (A4b)."
-        return 0
+    if [ -z "$user_ns" ] || [ -z "$pid_ns" ]; then
+        GRUND_NS="Namensraum nicht messbar (/proc/self/ns fehlt oder ist nicht lesbar) -- die Ahnenreihe ist nicht als vollstaendig belegt (A5)."
+    else
+        GRUND_NS="Prozess laeuft in einem eigenen Benutzer- oder PID-Namensraum ($user_ns, $pid_ns) -- die Ahnenreihe ist nicht vollstaendig sichtbar (A5)."
     fi
-    while read -r eigen; do
-        [ -n "$eigen" ] || continue
-        if [ "$(adresse_normal "$eigen")" = "$peer" ]; then
-            GRUND_SSH="SSH-Sitzung auf DIESE Maschine selbst -- die Gegenstelle $peer ist eine eigene Adresse (A4)."
-            return 0
-        fi
-    done < <(eigene_adressen)
-    return 1
+    return 0
 }
 
 hat_terminal() {
@@ -218,15 +588,144 @@ hat_terminal() {
     [ -n "$t" ] && [ "$t" != "??" ] && [ "$t" != "?" ]
 }
 
-# Die Oberflaeche als Ahne. WB_APP_PID ist eine BEHAUPTUNG und wird geprueft:
-# die PID muss in der eigenen Ahnenreihe stehen und wie das Werkbank-Programm
-# heissen. Ohne beides zaehlt sie nicht.
+# Die Oberflaeche als Ahne (M2, Regel im Kopf). WB_APP_PID ist eine BEHAUPTUNG und
+# wird geprueft: die PID muss in der eigenen Ahnenreihe stehen und der Kern der
+# echten Werkbank unter ihrem echten Elternprozess sein. GRUND_M2 sagt, woran es
+# scheiterte, leer ohne M2-Angaben.
+#
+# Gemessen wird am Kernel, nicht an `ps -o comm=` (argv[0], frei waehlbar): Mac
+# proc_pidpath und proc_pidinfo(PROC_PIDTBSDINFO), Linux /proc/<pid>/{exe,cwd,
+# cmdline,status,stat}. python3 mit festem Pfad, `env -i` und -I -S wie in A4.
+GRUND_M2=""
 oberflaeche_ist_ahne() {
+    GRUND_M2=""
     [ "${WB_MENSCH_QUELLE:-}" = oberflaeche ] || return 1
-    local app="${WB_APP_PID:-}"
-    case "$app" in ''|*[!0-9]*) return 1 ;; esac
-    ahnen | awk -v p="$app" '$1==p{print $2; f=1} END{exit !f}' \
-        | grep -qiE 'electron|agent-workbench|Agent Workbench|Claude Workbench'
+    local app="${WB_APP_PID:-}" befund
+    case "$app" in
+        ''|*[!0-9]*) GRUND_M2="WB_APP_PID '${app:0:20}' ist keine PID."; return 1 ;;
+    esac
+    if ! printf '%s' "$AHNEN" | awk -v p="$app" '$1==p{f=1} END{exit !f}'; then
+        GRUND_M2="WB_APP_PID=$app steht nicht in der Ahnenreihe."; return 1
+    fi
+    befund=$(/usr/bin/env -i /usr/bin/python3 -I -S -c '
+import os, pwd, sys
+app = int(sys.argv[1])
+listen, cur = {}, None
+for a in sys.argv[2:]:
+    if a.startswith("--"):
+        cur = listen.setdefault(a[2:], [])
+    else:
+        cur.append(a)
+heim = pwd.getpwuid(os.getuid()).pw_dir
+def pfad(p):
+    p = heim + p[1:] if p.startswith("~/") else p
+    return {p, os.path.realpath(p)}
+def nein(text):
+    print("NEIN " + text); sys.exit(0)
+if sys.platform == "darwin":
+    import ctypes
+    lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+    class Bsd(ctypes.Structure):
+        _fields_ = [("flags", ctypes.c_uint32), ("status", ctypes.c_uint32),
+                    ("xstatus", ctypes.c_uint32), ("pid", ctypes.c_uint32),
+                    ("ppid", ctypes.c_uint32), ("ids", ctypes.c_uint32 * 7),
+                    ("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32),
+                    ("rest", ctypes.c_uint32 * 5), ("nice", ctypes.c_int32),
+                    ("sec", ctypes.c_uint64), ("usec", ctypes.c_uint64)]
+    def exe(pid):
+        b = ctypes.create_string_buffer(4096)
+        return b.value.decode(errors="replace") if lib.proc_pidpath(pid, b, 4096) > 0 else None
+    def info(pid):
+        i = Bsd()
+        if lib.proc_pidinfo(pid, 3, 0, ctypes.byref(i), ctypes.sizeof(i)) != ctypes.sizeof(i):
+            return None
+        return i.ppid, (i.sec, i.usec)
+    x_exe = exe(app)
+    soll = set()
+    for k in listen.get("kern", []):
+        soll |= pfad(k + "/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron")
+    if x_exe not in soll:
+        nein("WB_APP_PID=%d fuehrt %r aus, nicht das Kern-Electron der Werkbank." % (app, x_exe))
+    xi = info(app)
+    if xi is None:
+        nein("Prozessdaten von WB_APP_PID=%d nicht lesbar." % app)
+    p = xi[0]
+    p_exe = exe(p)
+    eltern = set()
+    for e in listen.get("app", []):
+        eltern |= pfad(e)
+    if p_exe not in eltern:
+        nein("Elternprozess %d des Kerns ist %r, nicht die installierte Werkbank-App." % (p, p_exe))
+    pi = info(p)
+    if pi is None:
+        nein("Prozessdaten des Elternprozesses %d nicht lesbar." % p)
+elif sys.platform.startswith("linux"):
+    def lies(pid, was):
+        try:
+            with open("/proc/%d/%s" % (pid, was), "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+    def link(pid, was):
+        try:
+            return os.readlink("/proc/%d/%s" % (pid, was))
+        except OSError:
+            return None
+    def info(pid):
+        st, stat = lies(pid, "status"), lies(pid, "stat")
+        if st is None or stat is None:
+            return None
+        werte = dict(z.split(":", 1) for z in st.decode(errors="replace").splitlines() if ":" in z)
+        try:
+            ppid = int(werte["PPid"].strip())
+            uid = int(werte["Uid"].split()[0])
+            start = int(stat.decode(errors="replace").rsplit(")", 1)[1].split()[19])
+        except (KeyError, ValueError, IndexError):
+            return None
+        return ppid, start, uid
+    x_exe, x_cwd = link(app, "exe"), link(app, "cwd")
+    argv = (lies(app, "cmdline") or b"").split(b"\0")
+    treffer = None
+    for k in listen.get("kern", []):
+        if x_exe in pfad(k + "/node_modules/electron/dist/electron"):
+            treffer = k
+    if treffer is None:
+        nein("WB_APP_PID=%d fuehrt %r aus, nicht das Kern-Electron der Werkbank." % (app, x_exe))
+    if x_cwd not in pfad(treffer):
+        nein("Arbeitsordner von WB_APP_PID=%d ist %r, nicht der Kernordner." % (app, x_cwd))
+    if len(argv) < 2 or argv[1] != b".":
+        nein("WB_APP_PID=%d wurde nicht mit \".\" als erstem Argument gestartet." % app)
+    xi = info(app)
+    if xi is None:
+        nein("Prozessdaten von WB_APP_PID=%d nicht lesbar." % app)
+    p = xi[0]
+    pi = info(p)
+    if pi is None:
+        nein("Prozessdaten des Elternprozesses %d nicht lesbar." % p)
+    eltern = set()
+    for e in listen.get("eltern", []):
+        eltern |= pfad(e)
+    p_argv = (lies(p, "cmdline") or b"").split(b"\0")
+    p_exe = link(p, "exe")
+    # systemd --user ist nicht dumpbar: exe ist fuer den Benutzer nicht lesbar
+    # (peer, gemessen 2026-10-14). Dann zaehlen Kommandozeile und UID.
+    p_bild = p_exe if p_exe is not None else p_argv[0].decode(errors="replace")
+    if p_bild not in eltern or b"--user" not in p_argv[1:] or pi[2] != os.getuid():
+        nein("Elternprozess %d des Kerns ist %r, nicht systemd --user dieses Benutzers." % (p, p_bild))
+else:
+    nein("Plattform ohne M2-Messung.")
+if pi[0] != 1:
+    nein("Elternprozess %d des Kerns ist kein Kind von PID 1 (ppid %d)." % (p, pi[0]))
+if pi[1] > xi[1]:
+    nein("Elternprozess %d ist spaeter gestartet als der Kern %d." % (p, app))
+print("JA")
+' "$app" --kern "${M2_KERN_ORDNER[@]}" --app "${M2_APP_MAC[@]}" --eltern "${M2_ELTERN_LINUX[@]}" 2>/dev/null)
+    case "$befund" in
+        JA) return 0 ;;
+        "NEIN "*) GRUND_M2="${befund#NEIN }" ;;
+        *) GRUND_M2="Die Pruefung des Kerns lieferte kein Ergebnis." ;;
+    esac
+    return 1
 }
 
 klassifizieren() {   # setzt ART und GRUND
@@ -237,15 +736,25 @@ klassifizieren() {   # setzt ART und GRUND
         fi
     done
     kom=$(harness_kommandos | sort -u)
+    ahnen_lesen
     local pid name
     while read -r pid name; do
         [ -n "$name" ] || continue
-        if printf '%s\n' "$kom" | grep -qxF "$name"; then
+        if printf '%s\n' "$kom" | grep -qxF -e "$name"; then
             ART=agent; GRUND="Harness '$name' (PID $pid) steht in der Ahnenreihe (A2)."; return
         fi
-    done < <(ahnen)
+    done <<<"$AHNEN"
     if agenten_pane; then
         ART=agent; GRUND="Ein Ahne dieses Prozesses ist der Prozess eines tmux-Panes mit @wb_role=worker|orchestrator (A3)."; return
+    fi
+    # VOR A5, M1 und M2: was A2 und A3 ueber der Bruchstelle nicht sehen konnten, ist
+    # nicht abwesend, sondern ungeprueft.
+    if [ -n "$AHNEN_LUECKE" ]; then
+        ART=agent; GRUND="Ahnenreihe nicht vollstaendig messbar ($AHNEN_LUECKE) -- ob ein Agent darueber steht, bleibt offen (A2b)."; return
+    fi
+    # VOR A4, M1 und M2: in einem fremden Namensraum sieht ps weder sshd noch Harness.
+    if fremder_namensraum; then
+        ART=agent; GRUND="$GRUND_NS"; return
     fi
     # VOR M1, und genau deshalb wirksam: die Schleife ueber die eigene Maschine liefert
     # ja gerade das steuernde Terminal, an dem M1 sonst einen Menschen erkennt.
@@ -260,6 +769,9 @@ klassifizieren() {   # setzt ART und GRUND
     fi
     ART=agent
     GRUND="Kein Nachweis fuer einen Menschen: weder ein steuerndes Terminal (M1) noch die Oberflaeche als Ahne (M2)."
+    # Die Oberflaeche zeigt diesen Text ("Freigabe nicht als Mensch erkannt: ..."); ohne
+    # den Grund von M2 saehe der Mensch nicht, WARUM sein Klick nicht zaehlte.
+    [ -n "$GRUND_M2" ] && GRUND="$GRUND M2 scheiterte: $GRUND_M2"
 }
 
 case "$CMD" in

@@ -54,7 +54,7 @@ Two categories, two mechanisms, on purpose:
 - **Code and notes**: git. The knowledge base is a private repository; both machines clone it.
 - **Secrets and machine-local state**: never git. Syncthing peer-to-peer between the two
   machines, so an API key never reaches a hosting provider. Folders: the knowledge base's
-  `90-secrets/` and a small `~/.secrets-sync/` holding API keys as mode-600 files.
+  `secrets/` and a small `~/.secrets-sync/` holding API keys as mode-600 files.
 
 ## Sessions on the other machine
 

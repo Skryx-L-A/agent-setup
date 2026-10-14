@@ -87,6 +87,12 @@ export interface HarnessResume {
   probe?: string;
 }
 
+export interface HarnessModelSwitch {
+  command: string;
+  updateRequiredPattern?: string;
+  versionGate?: boolean;
+}
+
 export type HarnessDiscoverSource = 'ollama' | 'command-lines' | 'file-json';
 
 export interface HarnessDiscoverFilter {
@@ -128,6 +134,8 @@ export interface RegistryHarness {
   systemPrompt?: HarnessSystemPrompt;
   autonomy?: HarnessAutonomy;
   resume?: HarnessResume;
+  /** Measured in-process model change; absent/null means deliberately unsupported. */
+  modelSwitch?: HarnessModelSwitch;
   discover?: HarnessDiscover;
   sessionDir?: string;
   readyPattern?: string;
@@ -540,6 +548,10 @@ function validateHarness(raw: unknown): RegistryHarness | undefined {
   if (!id || !label || !command) {
     return undefined;
   }
+  const switchRaw = typeof r.modelSwitch === 'object' && r.modelSwitch !== null
+    ? r.modelSwitch as Record<string, unknown>
+    : null;
+  const switchCommand = switchRaw ? asString(switchRaw.command) : undefined;
   return {
     id,
     label,
@@ -552,6 +564,11 @@ function validateHarness(raw: unknown): RegistryHarness | undefined {
     systemPrompt: validateSystemPrompt(r.systemPrompt),
     autonomy: validateAutonomy(r.autonomy),
     resume: validateResume(r.resume),
+    modelSwitch: switchCommand ? {
+      command: switchCommand,
+      updateRequiredPattern: asString(switchRaw?.updateRequiredPattern),
+      versionGate: typeof switchRaw?.versionGate === 'boolean' ? switchRaw.versionGate : undefined,
+    } : undefined,
     discover: validateDiscover(r.discover),
     sessionDir: asString(r.sessionDir),
     readyPattern: asString(r.readyPattern),
@@ -772,6 +789,7 @@ export const BUILTIN_HARNESSES: readonly RegistryHarness[] = [
   {
     id: 'claude', label: HARNESS_LABEL.claude, command: 'claude', builtin: true,
     readyPattern: '❯|░|●', promptPattern: '^❯', compactCommand: '/compact',
+    modelSwitch: { command: '/model {model}', updateRequiredPattern: '(?i)update required|aktualisierung erforderlich', versionGate: true },
     effort: { style: 'arg', args: ['--effort', '{effort}'] },
   },
   {
@@ -806,13 +824,15 @@ const CLAUDE_NOT_FOR: Record<string, string> = {
 };
 
 const PI_GOOD_FOR: Record<string, string> = {
-  ornith: 'Lokaler Default-Coder für Bulk/Inventur/Overnight-Arbeit, token-frei.',
+  qwen38: 'Lokaler Standard-Coder über Splash; pi-Agent-Kontext und Serverkante werden je Rolle gesetzt.',
+  ornith: 'Veralteter Alias; startet als Ersatz qwen3.8 über Splash.',
   qwen: 'Zweitmeinung lokal, token-frei.',
   ornith9: 'Günstiger lokaler Bulk-Lauf, kleineres Modell.',
 };
 
 const PI_NOT_FOR: Record<string, string> = {
-  ornith: 'Harte Architektur-Entscheidungen.',
+  qwen38: 'Harte Architektur-Entscheidungen.',
+  ornith: 'Alias für qwen3.8; Ornith 35B ist gelöscht.',
   qwen: 'Kundengerichtete Deliverables.',
   ornith9: 'Komplexe Coding-Tasks.',
 };
@@ -841,8 +861,8 @@ export const BUILTIN_MODELS: readonly RegistryModel[] = [
     id,
     label: PI_MODEL_LABEL[id],
     harness: 'pi',
-    provider: 'ollama',
-    modelRef: id,
+    provider: id === 'qwen38' || id === 'ornith' ? 'splash-lokal' : 'ollama',
+    modelRef: id === 'qwen38' || id === 'ornith' ? 'incoai/Qwen3.8-27B-Splash' : id,
     roles: ['worker', 'orchestrator'],
     efforts: [...EFFORTS],
     maxEffort: 'xhigh',

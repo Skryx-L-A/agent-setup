@@ -1,14 +1,37 @@
 // Bauskript. esbuild statt tsc, weil der Renderer xterm.js mitbuendeln muss und
 // tsc dafuer einen zweiten Buendler braeuchte. Typen prueft `npm run typecheck`.
 import { build } from 'esbuild';
-import { cpSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, renameSync } from 'node:fs';
+import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const out = join(root, 'dist');
 
 const common = { bundle: true, platform: 'node', target: 'node20', sourcemap: false, logLevel: 'info' };
+
+// DIE BUILDKENNUNG DER MOBILEN WERKBANK (Paket 10, Spezifikation 8.1/10.12).
+// Server (main.js) und PWA tragen dieselbe Kennung; weicht sie ab, bleibt die
+// App lesend. Sie ist ein Inhaltshash ueber alles, was die mobile API und ihre
+// Huelle ausmacht -- reproduzierbar, ohne Uhrzeit: derselbe Quellstand ergibt
+// dieselbe Kennung, jede Aenderung an Vertrag, Server oder PWA eine neue.
+function dateienUnter(ordner) {
+  const liste = [];
+  for (const name of readdirSync(ordner).sort()) {
+    const pfad = join(ordner, name);
+    if (statSync(pfad).isDirectory()) liste.push(...dateienUnter(pfad));
+    else liste.push(pfad);
+  }
+  return liste;
+}
+const mobilHash = createHash('sha256');
+for (const teil of ['src/mobile', 'src/mobile-shared', 'src/main/mobile']) {
+  for (const datei of dateienUnter(join(root, teil))) {
+    mobilHash.update(relative(root, datei)).update('\0').update(readFileSync(datei)).update('\0');
+  }
+}
+const mobilBuild = `m-${mobilHash.digest('hex').slice(0, 12)}`;
 
 // ATOMARER SCHREIBWEG (Auftrag 2026-08-19, Betriebsfehler: viele native
 // JS-Fehlerfenster waehrend eines parallelen Testlaufs, ausgeloest durch
@@ -60,6 +83,7 @@ await buildAtomic({
   // 'pty' steht (pty.ts, `ladePty`). `@xterm/headless` ist reines JavaScript
   // und faehrt gebuendelt mit.
   external: ['electron', 'node-pty'],
+  define: { __AWB_MOBILE_BUILD__: JSON.stringify(mobilBuild) },
 });
 
 await buildAtomic({
@@ -287,6 +311,15 @@ await buildAtomic({
   outfile: join(out, 'test/startprotokoll.mjs'),
 });
 
+// Der Mantel-Socket einzeln (27.09.2026): ob listen() einen fremden, lebenden
+// Socket liegen laesst, wird gegen echte Sockets in einem eigenen Ordner geprueft.
+await buildAtomic({
+  ...common,
+  format: 'esm',
+  entryPoints: [join(root, 'src/main/mantel.ts')],
+  outfile: join(out, 'test/mantel.mjs'),
+});
+
 // Der Oberflaechen-Zustand einzeln (16.08.): `ui.set()` schreibt ui.json bei
 // JEDEM Aufruf (writeFileSync + renameSync). Was ein einzelner Aufruf kostet,
 // gehoert gemessen und nicht geschaetzt -- daran haengt, warum das Ziehen der
@@ -328,6 +361,16 @@ await buildAtomic({
   format: 'esm',
   entryPoints: [join(root, 'src/main/remote.ts')],
   outfile: join(out, 'test/remote.mjs'),
+});
+
+// Die Gast-Tor-Quelle (27.09.2026): Quellen, Aufrufe und das Lesen der
+// Tor-Antworten sind rein und werden ohne Electron geprueft
+// (shell/tests/test-app-gasttor.sh).
+await buildAtomic({
+  ...common,
+  format: 'esm',
+  entryPoints: [join(root, 'src/main/gasttor.ts')],
+  outfile: join(out, 'test/gasttor.mjs'),
 });
 
 // Der Absturz-Hinweis (05.09.), aus demselben Grund: `absturzText` und
@@ -742,6 +785,94 @@ for (const fenster of ['renderer', 'einstellungen', 'sitzung', 'verbrauch', 'ers
   mkdirSync(join(out, fenster), { recursive: true });
   cpSync(join(root, `src/${fenster}/index.html`), join(out, `${fenster}/index.html`));
   cpSync(join(out, 'thema/tokens.css'), join(out, `${fenster}/tokens.css`));
+}
+
+// --- DIE MOBILE WERKBANK: dist/mobile und dist/bin/wb-mobil-pruefen (Paket 10) ---
+//
+// Vorlage ist app/test/mobile/ui/bauen.mjs, mit drei Unterschieden: die
+// signierende HTTP-Quelle statt der Attrappe (`__AWB_MOBILE_ATTRAPPE__` false,
+// der Attrappen-Zweig faellt aus dem Buendel), gehashte Dateinamen fuer JS und
+// CSS samt Service Worker mit genau dieser Huellenliste, und KEIN
+// `pruefung/validierung.mjs` -- das ist ein Werkzeug der E2E, nicht der App.
+// Die Origins bleiben als Platzhalter in index.html; der Server setzt sie beim
+// Ausliefern aus seiner Konfiguration ein (main/mobile/kern.ts).
+{
+  const quelle = join(root, 'src/mobile');
+  const ziel = join(out, 'mobile');
+  const neu = `${ziel}.neu-${process.pid}`;
+  rmSync(neu, { recursive: true, force: true });
+  mkdirSync(join(neu, 'icons'), { recursive: true });
+  const mitHash = (name, inhalt) => {
+    const punkt = name.lastIndexOf('.');
+    const datei = `${name.slice(0, punkt)}.${createHash('sha256').update(inhalt).digest('hex').slice(0, 10)}${name.slice(punkt)}`;
+    writeFileSync(join(neu, datei), inhalt);
+    return datei;
+  };
+  const js = await build({
+    entryPoints: [join(quelle, 'app.ts')], bundle: true, format: 'esm', platform: 'browser', target: ['safari16'],
+    sourcemap: false, logLevel: 'warning', write: false, minify: true, outfile: join(neu, 'app.js'),
+    define: { __AWB_MOBILE_ATTRAPPE__: 'false', __AWB_MOBILE_BUILD__: JSON.stringify(mobilBuild) },
+  });
+  const css = await build({
+    entryPoints: [join(quelle, 'styles/app.css')], bundle: true, target: ['safari16'], logLevel: 'warning', write: false,
+    outfile: join(neu, 'app.css'),
+  });
+  const appJs = mitHash('app.js', js.outputFiles[0].contents);
+  const appCss = mitHash('app.css', css.outputFiles[0].contents);
+  const tokensCss = mitHash('tokens.css', readFileSync(join(out, 'thema/tokens.css')));
+  const html = readFileSync(join(quelle, 'index.html'), 'utf8')
+    .replace('href="tokens.css"', `href="${tokensCss}"`)
+    .replace('href="app.css"', `href="${appCss}"`)
+    .replace('src="app.js"', `src="${appJs}"`);
+  if (!html.includes(appJs) || !html.includes(appCss) || !html.includes(tokensCss)) throw new Error('mobile index.html: Verweise nicht ersetzt');
+  writeFileSync(join(neu, 'index.html'), html);
+  cpSync(join(quelle, 'manifest.webmanifest'), join(neu, 'manifest.webmanifest'));
+  cpSync(join(quelle, 'icons'), join(neu, 'icons'), { recursive: true });
+  const huelle = ['./', 'index.html', appJs, appCss, tokensCss, 'manifest.webmanifest',
+    ...readdirSync(join(neu, 'icons')).sort().map((d) => `icons/${d}`)];
+  const sw = await build({
+    entryPoints: [join(quelle, 'sw.ts')], bundle: true, format: 'iife', platform: 'browser', target: ['safari16'],
+    logLevel: 'warning', write: false, outfile: join(neu, 'sw.js'),
+    banner: { js: `self.__AWB_MOBILE_SW_MANIFEST__ = ${JSON.stringify({ cacheName: `awb-mobile-${mobilBuild}`, shellAssets: huelle })};` },
+  });
+  writeFileSync(join(neu, 'sw.js'), sw.outputFiles[0].contents);
+  writeFileSync(join(neu, 'build.json'), `${JSON.stringify({ build: mobilBuild, huelle }, null, 2)}\n`);
+  // Ganzer Ordner auf einmal: der laufende Server liest seine Liste beim Start.
+  // Parallele Baeue (run-all baut in vielen Suiten gleichzeitig) duerfen sich
+  // nicht stoeren: `rm` und dann `rename` scheiterte mit ENOTEMPTY, sobald ein
+  // anderer Bau dazwischen seinen Ordner einsetzte. Deshalb den alten Ordner
+  // erst unter eigenem Namen beiseite nehmen und bei ENOTEMPTY/EEXIST erneut
+  // versuchen; derselbe Quellstand ergibt denselben Inhalt.
+  for (let versuch = 0; ; versuch += 1) {
+    const alt = `${ziel}.alt-${process.pid}-${versuch}`;
+    try { renameSync(ziel, alt); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    try {
+      renameSync(neu, ziel);
+      rmSync(alt, { recursive: true, force: true });
+      break;
+    } catch (e) {
+      rmSync(alt, { recursive: true, force: true });
+      if ((e.code !== 'ENOTEMPTY' && e.code !== 'EEXIST') || versuch >= 50) throw e;
+    }
+  }
+  process.stdout.write(`mobile: dist/mobile ${mobilBuild} (${appJs})\n`);
+
+  // wb-mobil-pruefen: das Pruefprogramm hinter `wb-pane-write mobil-*` (Paket 2/3).
+  // `wb-pane-write` startet es mit `env -i HOME=… PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`
+  // -- also mit ABSOLUTEM Interpreter in der ersten Zeile, ohne nvm-PATH. Gewaehlt
+  // wird der erste vorhandene in derselben Reihenfolge wie dieser PATH, sonst der
+  // Node, der gerade baut. Installiert wird hier nichts (~/.local/bin ist Paket 11).
+  const knoten = ['/opt/homebrew/bin/node', '/usr/local/bin/node', '/usr/bin/node'].find((p) => existsSync(p)) ?? process.execPath;
+  const pruefen = await build({
+    ...common, logLevel: 'warning', format: 'cjs', write: false, entryPoints: [join(root, 'src/main/mobile/auth/pruefen-cli.ts')],
+    outfile: join(out, 'bin/wb-mobil-pruefen'), banner: { js: `#!${knoten}` },
+  });
+  mkdirSync(join(out, 'bin'), { recursive: true });
+  const bin = join(out, 'bin/wb-mobil-pruefen');
+  const tmpBin = `${bin}.tmp-${process.pid}`;
+  writeFileSync(tmpBin, pruefen.outputFiles[0].contents);
+  chmodSync(tmpBin, 0o755);
+  renameSync(tmpBin, bin);
 }
 
 // EIN BAU UNTER EINER LAUFENDEN APP WIRD GESAGT (16.08.).

@@ -26,7 +26,11 @@ from agents_lauf import StartSpec
 
 
 PLACEHOLDER_TOKEN = "wb-agents-placeholder"
-ANTHROPIC_ORIGIN = "https://api.anthropic.com"
+# Ursprung der Modellanfragen: der lokale Geheimnisfilter (wb-geheimnis-filter, Route `anthropic`), nicht
+# api.anthropic.com. Fail-closed: laeuft der Filter nicht, scheitert der Zug mit backend_transport_error; einen
+# Direktweg gibt es nicht. ENABLE_TOOL_SEARCH braucht der Zug nicht: mit den acht festen Werkzeugen ohne MCP ist der
+# Grundkontext mit und ohne gleich (gemessen 11.10.2026, 2.1.296, haiku: je 7 684 Token).
+ANTHROPIC_ORIGIN = "http://127.0.0.1:8093/anthropic"
 RUNNER = "agents_claude_runner.py"
 RUNTIME_MODULES = (
     RUNNER, "agents_pi_runner.py", "agents_codex_runner.py", "agents_model_bridge.py", "agents_rpc_client.py", "agents_controller.py",

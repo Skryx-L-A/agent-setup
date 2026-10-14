@@ -1,0 +1,20 @@
+{
+  "name": "Werkbank",
+  "short_name": "Werkbank",
+  "description": "Orchestratoren, Agents und Meldungen der Werkbank auf iPhone und iPad.",
+  "lang": "de",
+  "dir": "ltr",
+  "id": "./",
+  "start_url": "./#/sitzungen",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0d10",
+  "theme_color": "#0b0d10",
+  "icons": [
+    { "src": "icons/icon-180.png", "sizes": "180x180", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

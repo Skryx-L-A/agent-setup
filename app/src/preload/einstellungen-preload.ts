@@ -70,4 +70,13 @@ contextBridge.exposeInMainWorld('awbEinstellungen', {
   kontextStufen: (modellId: string) => ipcRenderer.invoke('awb:kontext-stufen', modellId),
   erststartZeigen: (echt: boolean) =>
     ipcRenderer.send('awb:bedienung', { aktion: echt ? 'erststart-zeigen' : 'erststart-bauen', wert: null }),
+  // ZEHNTER BIS ZWOELFTER WEG (Paket 10, mobile Werkbank), wieder bewusst SCHMAL:
+  //   mobilStand()        Lesen: laeuft der Server, welche Geraete sind gekoppelt. Nie ein Code.
+  //   mobilKoppeln()      Kopplung starten; die Echtheit des Klicks reist mit, der
+  //                       Hauptprozess prueft sie und zusaetzlich `wb-mensch`.
+  //   mobilWiderrufen()   ein Geraet widerrufen; dieselben zwei Bedingungen.
+  // Der Steuerkanal hat fuer die beiden Handlungen keinen Befehl.
+  mobilStand: () => ipcRenderer.invoke('awb:mobil-stand'),
+  mobilKoppeln: (echt: boolean) => ipcRenderer.invoke('awb:mobil-koppeln', echt === true),
+  mobilWiderrufen: (deviceId: string, echt: boolean) => ipcRenderer.invoke('awb:mobil-widerrufen', deviceId, echt === true),
 });

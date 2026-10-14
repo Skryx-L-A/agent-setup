@@ -110,6 +110,7 @@ export const DE: Record<string, string> = {
   'gruppe.aussehen.thema': 'Hell und dunkel',
   'gruppe.aussehen.terminal': 'Schrift und Rollen',
   'gruppe.aussehen.panes': 'Wie die Worker im Fenster liegen',
+  'gruppe.aussehen.figuren': 'Agentenfiguren',
   'gruppe.aussehen.sprache': 'Sprache und Ansicht',
   'gruppe.programm.dateien': 'Wo was liegt',
   'gruppe.programm.abweichungen': 'Was bei dir anders ist',
@@ -216,6 +217,7 @@ export const DE: Record<string, string> = {
   'wort.einheit.punkt': 'Punkt',
   'wort.einheit.zeilen': 'Zeilen',
   'wort.einheit.spalten': 'Spalten',
+  'wort.einheit.bilderJeSekunde': 'Bilder/s',
   'wort.einstellungen': 'Einstellungen',
 
   'feld.closeSessionOnWindowClose.name': 'Terminal mit dem Fenster beenden',
@@ -325,7 +327,7 @@ export const DE: Record<string, string> = {
   'guard.secrets.wirkung':
     'Hält jeden Befehl an, der einen Schlüssel, ein Zertifikat oder den Geheimnis-Ordner anfasst.',
   'guard.secrets.info':
-    'Deckt ~/Knowledge/90-secrets, ~/.ssh und die üblichen Zugangsdaten-Dateien ab – dieselbe Liste, die '
+    'Deckt ~/Knowledge/secrets, ~/.ssh und die üblichen Zugangsdaten-Dateien ab – dieselbe Liste, die '
     + 'auch die Ordneransicht auslässt. Aus heißt: ein Agent kann diese Dateien lesen, kopieren und in eine '
     + 'Ausgabe schreiben, ohne dass jemand gefragt wird.',
   'guard.git-add.name': 'Alles auf einmal vormerken',
@@ -416,6 +418,12 @@ export const DE: Record<string, string> = {
   'spalte.modelle': 'Modelle',
   'spalte.hier': 'Auf dieser Maschine',
   'spalte.anmeldung': 'Anmeldung',
+  'spalte.installiert': 'Installiert',
+  'spalte.neueste': 'Neueste',
+  'spalte.zuletztGeprueft': 'Zuletzt geprüft',
+  'wort.nochNichtGeprueft': 'noch nicht geprüft',
+  'wort.stunden': 'Stunden',
+  'wort.minuten': 'Minuten',
   'spalte.chat': 'Chat-Ansicht',
   'spalte.modell': 'Modell',
   'spalte.deckel': 'Deckel',
@@ -492,6 +500,20 @@ export const DE: Record<string, string> = {
     + 'bedienbar. Diese Einstellung war bis zum 11.08. nur in der VS-Code-Erweiterung erreichbar, obwohl '
     + 'wb-state sie längst liest.',
   'feld.modelDiscoveryAuto.etikett': 'sofort',
+
+  'feld.harnessUpdateAuto.name': 'Agenten-Programme automatisch aktuell halten',
+  'feld.harnessUpdateAuto.wirkung':
+    'An: Die Werkbank prüft und aktualisiert die installierten Harness-CLIs selbstständig.',
+  'feld.harnessUpdateAuto.info':
+    'Aus verhindert bereits die Katalogabfrage und damit jeden automatischen Netzzugriff. Updates, die einen '
+    + 'laufenden Prozess gefährden könnten, werden vorgemerkt und erst ohne lebende Sitzung ausgeführt.',
+  'feld.harnessUpdateAuto.etikett': 'beim nächsten Prüflauf',
+  'feld.harnessUpdateIntervalHours.name': 'Abstand der Harness-Prüfung',
+  'feld.harnessUpdateIntervalHours.wirkung':
+    'Nach dem verzögerten Start prüft die Werkbank in diesem Stundenabstand erneut.',
+  'feld.harnessUpdateIntervalHours.info':
+    'Der Abstand gilt zwischen zwei Läufen. Eine Sperrdatei verhindert, dass zwei Werkbank-Instanzen gleichzeitig aktualisieren.',
+  'feld.harnessUpdateIntervalHours.etikett': 'nach dem nächsten Prüflauf',
 
   'feld.orchestratorVorhersage.name': 'Multi-Token-Vorhersage für den Orchestrator',
   'feld.orchestratorVorhersage.wirkung':
@@ -589,6 +611,28 @@ export const DE: Record<string, string> = {
     'Der Name bleibt in „Rechner, die mitarbeiten“ eingetragen – der Schalter ist umkehrbar, ohne die '
     + 'Adresse neu einzutippen. Eine pausierte Maschine gilt nicht als „nicht erreichbar“: das sind zwei '
     + 'verschiedene Zustände.',
+  // Die mobile Werkbank (Paket 10): Server, Kopplung und Geräte -- nur hier am Mac.
+  'gruppe.maschinen.mobil': 'Mobilgerät',
+  'feld.mobileServer.name': 'Mobile Werkbank',
+  'feld.mobileServer.wirkung':
+    'Startet den Server für die Werkbank-App auf iPhone und iPad (127.0.0.1, dahinter tailscale serve). '
+    + 'Aus: keine Verbindung vom Telefon, gekoppelte Geräte bleiben gespeichert.',
+  'feld.mobileServer.info':
+    'Jede Anfrage des Telefons ist mit dem Schlüssel eines gekoppelten Geräts signiert; ohne Signatur nimmt der Server '
+    + 'nichts an, auch nicht von diesem Rechner. Koppeln und Widerrufen gehen nur hier mit einem echten Klick. '
+    + 'Adressen und Port stehen in der Programmkonfiguration (mobileOrigins, mobileOrigin, mobilePort).',
+  'mobil.stand.aus': 'Aus.',
+  'mobil.stand.laeuft': 'Läuft auf 127.0.0.1:{port} für {origin}.',
+  'mobil.stand.fehler': 'Nicht gestartet: {grund}',
+  'mobil.koppeln': 'Gerät koppeln',
+  'mobil.code': 'Code am Telefon eingeben: {code}',
+  'mobil.codeAblauf': 'Gilt bis {zeit} Uhr, höchstens fünf Versuche. Der Code steht nur hier, nirgends sonst.',
+  'mobil.codeAbgelaufen': 'Der Code ist abgelaufen. Für ein weiteres Gerät erneut koppeln.',
+  'mobil.ausblenden': 'Ausblenden',
+  'mobil.geraeteLeer': 'Noch kein Gerät gekoppelt.',
+  'mobil.geraetAktiv': 'gekoppelt am {datum}',
+  'mobil.geraetWiderrufen': 'widerrufen am {datum}',
+  'mobil.widerrufen': 'Widerrufen',
   'satz.eigeneMaschine':
     'Diese Maschine – sie steht immer in der Liste und lässt sich nicht entfernen.',
   'satz.fremdeMaschine': 'Erreicht über ssh {name} – der Name ist zugleich der SSH-Alias.',
@@ -609,6 +653,17 @@ export const DE: Record<string, string> = {
     + 'wieder Platz. Gezählt werden Worker-Panes, keine Subagenten. Die Zahl gehört der Maschine und nicht '
     + 'der Sitzung: was ein 48-GB-Rechner trägt, trägt ein kleinerer nicht.',
   'feld.maxWorkers.etikett': 'sofort',
+  'feld.schlafNachMinuten.name': 'Untätige Sitzungen schlafen legen nach',
+  'feld.schlafNachMinuten.wirkung':
+    'Eine Sitzung, die so lange nichts tut, gibt ihren Speicher frei; ein Klick auf ihre Kachel, eine Taste '
+    + 'oder ein neuer Auftrag weckt sie, und die Unterhaltung geht weiter. 0 schaltet das ab.',
+  'feld.schlafNachMinuten.info':
+    'Gilt für jeden Harness, der seine Unterhaltung fortsetzen kann (Claude, pi, Codex, opencode …); '
+    + 'einer ohne diesen Weg bleibt wach. Untätig heißt: Inhalt unverändert, kein laufender '
+    + 'Werkzeugaufruf, keine Rechenlast. 60 Minuten sind die Lebensdauer des Prompt-Caches – danach '
+    + 'kostet das Aufwecken keine zusätzlichen Token. Eine Nachricht einer anderen Claude-Sitzung '
+    + 'erreicht eine schlafende nicht; dafür vorher wb-schlaf wecken.',
+  'feld.schlafNachMinuten.etikett': 'bei der nächsten Runde',
 
   'feld.defaultWorkerMachine.name': 'Wo ein Worker läuft, wenn nichts gesagt wird',
   'feld.defaultWorkerMachine.wirkung':
@@ -871,6 +926,17 @@ export const DE: Record<string, string> = {
     + 'Jetzt zählt nur diese Zahl: eine Rasterung bewegt so viele Zeilen. Ein Trackpad-Wisch sammelt seine '
     + 'Bruchteile auf, und ein einzelnes Ereignis bewegt nie mehr als sechs Zeilen. Erlaubt sind 1 bis 20.',
   'feld.terminalScrollLines.etikett': 'sofort',
+
+  'feld.figurenBildrate.name': 'Bildrate der Agentenfiguren',
+  'feld.figurenBildrate.wirkung':
+    'Nur die Agentenfiguren und ihre Ringe; weniger Bilder je Sekunde sparen Rechenzeit.',
+  'feld.figurenBildrate.info':
+    'Alle Figuren im Tab „Agents“ laufen auf einer gemeinsamen Uhr, und jedes Bild kostet Rechenzeit. '
+    + 'Gemessen am 09.10. mit zehn Figuren: etwa 9 % CPU bei 30 Bildern je Sekunde, 6 % bei 20 und 5 % '
+    + 'bei 15. Ist kein Fenster der Werkbank zu sehen, steht die Uhr ganz still. Die Änderung wirkt ohne '
+    + 'Neustart; Terminal, Chat und die übrige Oberfläche bleiben unberührt. Erlaubt sind 10 bis 60, '
+    + 'die Vorgabe ist 30; ein Wert außerhalb wird abgelehnt und der alte bleibt stehen.',
+  'feld.figurenBildrate.etikett': 'sofort',
 
   'feld.minWorkerPaneWidth.name': 'Schmalster Worker-Pane',
   'feld.minWorkerPaneWidth.wirkung':
@@ -1184,6 +1250,7 @@ export const DE: Record<string, string> = {
   'bezeichnung.secretExcludePatterns': 'Dateinamen, die keine Ansicht zeigt',
   'bezeichnung.terminalFontSize': 'Schriftgröße im Terminal',
   'bezeichnung.terminalScrollLines': 'Zeilen je Rad-Rasterung',
+  'bezeichnung.figurenBildrate': 'Bildrate der Agentenfiguren',
   'bezeichnung.logPaths': 'Protokoll-Pfade (nur Anzeige)',
   'bezeichnung.effortCaps': 'Gesetzte Effort-Deckel',
   'bezeichnung.guards': 'Abgeschaltete Sicherungen',
@@ -1276,6 +1343,7 @@ export const EN: Record<string, string> = {
   'gruppe.aussehen.thema': 'Light and dark',
   'gruppe.aussehen.terminal': 'Font and scrolling',
   'gruppe.aussehen.panes': 'How workers sit in the window',
+  'gruppe.aussehen.figuren': 'Agent figures',
   'gruppe.aussehen.sprache': 'Language and view',
   'gruppe.programm.dateien': 'What lives where',
   'gruppe.programm.abweichungen': 'What differs on your machine',
@@ -1376,6 +1444,7 @@ export const EN: Record<string, string> = {
   'wort.einheit.punkt': 'pt',
   'wort.einheit.zeilen': 'lines',
   'wort.einheit.spalten': 'columns',
+  'wort.einheit.bilderJeSekunde': 'frames/s',
   'wort.einstellungen': 'Settings',
 
   'feld.closeSessionOnWindowClose.name': 'Close the terminal with the window',
@@ -1483,7 +1552,7 @@ export const EN: Record<string, string> = {
   'guard.secrets.wirkung':
     'Holds any command that touches a key, a certificate, or the secrets folder.',
   'guard.secrets.info':
-    'Covers ~/Knowledge/90-secrets, ~/.ssh, and the usual credential files -- the same list the folder '
+    'Covers ~/Knowledge/secrets, ~/.ssh, and the usual credential files -- the same list the folder '
     + 'view also skips. Off means: an agent can read, copy, and write these files into an output without '
     + 'anyone being asked.',
   'guard.git-add.name': 'Staging everything at once',
@@ -1574,6 +1643,12 @@ export const EN: Record<string, string> = {
   'spalte.modelle': 'Models',
   'spalte.hier': 'On this machine',
   'spalte.anmeldung': 'Sign-in',
+  'spalte.installiert': 'Installed',
+  'spalte.neueste': 'Latest',
+  'spalte.zuletztGeprueft': 'Last checked',
+  'wort.nochNichtGeprueft': 'not checked yet',
+  'wort.stunden': 'hours',
+  'wort.minuten': 'minutes',
   'spalte.chat': 'Chat view',
   'spalte.modell': 'Model',
   'spalte.deckel': 'Cap',
@@ -1644,6 +1719,20 @@ export const EN: Record<string, string> = {
     + 'button always stays usable. Until 11.08. this setting was only reachable in the VS Code extension, '
     + 'even though wb-state has long read it.',
   'feld.modelDiscoveryAuto.etikett': 'immediately',
+
+  'feld.harnessUpdateAuto.name': 'Keep agent programs up to date automatically',
+  'feld.harnessUpdateAuto.wirkung':
+    'On: the workbench checks and updates the installed harness CLIs on its own.',
+  'feld.harnessUpdateAuto.info':
+    'Off prevents even the catalog lookup and therefore all automatic network access. Updates that could endanger a running '
+    + 'process are queued and only applied when no live session remains.',
+  'feld.harnessUpdateAuto.etikett': 'on the next check',
+  'feld.harnessUpdateIntervalHours.name': 'Harness check interval',
+  'feld.harnessUpdateIntervalHours.wirkung':
+    'After the delayed startup check, the workbench checks again at this interval in hours.',
+  'feld.harnessUpdateIntervalHours.info':
+    'The interval runs between checks. A lock file prevents two workbench instances from updating at the same time.',
+  'feld.harnessUpdateIntervalHours.etikett': 'after the next check',
 
   'feld.orchestratorVorhersage.name': 'Multi-token prediction for the orchestrator',
   'feld.orchestratorVorhersage.wirkung':
@@ -1727,6 +1816,28 @@ export const EN: Record<string, string> = {
     + 'The list stays empty until someone adds an entry: an SSH target is real network access and must '
     + 'never fire on its own. The check button asks exactly once (ssh <name> true).',
   'feld.remoteMachines.etikett': 'immediately',
+  // The mobile workbench (package 10): server, pairing and devices -- only here on the Mac.
+  'gruppe.maschinen.mobil': 'Mobile device',
+  'feld.mobileServer.name': 'Mobile workbench',
+  'feld.mobileServer.wirkung':
+    'Starts the server for the workbench app on iPhone and iPad (127.0.0.1, behind tailscale serve). '
+    + 'Off: no connection from the phone; paired devices stay stored.',
+  'feld.mobileServer.info':
+    'Every request from the phone is signed with the key of a paired device; without a signature the server accepts '
+    + 'nothing, not even from this computer. Pairing and revoking only work here with a real click. '
+    + 'Addresses and port live in the program configuration (mobileOrigins, mobileOrigin, mobilePort).',
+  'mobil.stand.aus': 'Off.',
+  'mobil.stand.laeuft': 'Running on 127.0.0.1:{port} for {origin}.',
+  'mobil.stand.fehler': 'Not started: {grund}',
+  'mobil.koppeln': 'Pair device',
+  'mobil.code': 'Enter this code on the phone: {code}',
+  'mobil.codeAblauf': 'Valid until {zeit}, at most five attempts. The code appears only here.',
+  'mobil.codeAbgelaufen': 'The code has expired. Pair again for another device.',
+  'mobil.ausblenden': 'Hide',
+  'mobil.geraeteLeer': 'No device paired yet.',
+  'mobil.geraetAktiv': 'paired on {datum}',
+  'mobil.geraetWiderrufen': 'revoked on {datum}',
+  'mobil.widerrufen': 'Revoke',
   'feld.remoteMachinesPausiert.name': 'Paused machines',
   'feld.remoteMachinesPausiert.wirkung':
     'The sessions on a paused machine keep running there undisturbed -- pausing only affects this '
@@ -1755,6 +1866,16 @@ export const EN: Record<string, string> = {
     + 'What is counted is worker panes, not subagents. This number belongs to the machine, not the '
     + 'session: what a 48 GB machine carries, a smaller one does not.',
   'feld.maxWorkers.etikett': 'immediately',
+  'feld.schlafNachMinuten.name': 'Put idle sessions to sleep after',
+  'feld.schlafNachMinuten.wirkung':
+    'A session that does nothing for this long releases its memory; a click on its tile, a key or a new '
+    + 'task wakes it and the conversation continues. 0 turns this off.',
+  'feld.schlafNachMinuten.info':
+    'Applies to every harness that can resume its conversation (Claude, pi, Codex, opencode …); one '
+    + 'without that stays awake. Idle means: content unchanged, no running tool call, no CPU load. '
+    + '60 minutes is the prompt cache lifetime – after that, waking costs no extra tokens. A message '
+    + 'from another Claude session does not reach a sleeping one; run wb-schlaf wecken first.',
+  'feld.schlafNachMinuten.etikett': 'at the next round',
 
   'feld.defaultWorkerMachine.name': 'Where a worker runs when nothing is said',
   'feld.defaultWorkerMachine.wirkung':
@@ -2011,6 +2132,17 @@ export const EN: Record<string, string> = {
     + 'of it. Now only this number counts: one notch moves this many lines. A trackpad swipe accumulates '
     + 'its fractions, and a single event never moves more than six lines. 1 to 20 is allowed.',
   'feld.terminalScrollLines.etikett': 'immediately',
+
+  'feld.figurenBildrate.name': 'Agent figure frame rate',
+  'feld.figurenBildrate.wirkung':
+    'Only the agent figures and their rings; fewer frames per second save computing time.',
+  'feld.figurenBildrate.info':
+    'All figures in the "Agents" tab run on one shared clock, and every frame costs computing time. '
+    + 'Measured on 9 October with ten figures: about 9 % CPU at 30 frames per second, 6 % at 20 and 5 % '
+    + 'at 15. While no Workbench window is visible, the clock stops entirely. The change takes effect '
+    + 'without a restart; terminal, chat and the rest of the interface stay untouched. Allowed are 10 to 60, '
+    + 'the default is 30; a value outside is rejected and the old one stays.',
+  'feld.figurenBildrate.etikett': 'immediately',
 
   'feld.minWorkerPaneWidth.name': 'Narrowest worker pane',
   'feld.minWorkerPaneWidth.wirkung':
@@ -2288,6 +2420,7 @@ export const EN: Record<string, string> = {
   'bezeichnung.secretExcludePatterns': 'Filenames no view shows',
   'bezeichnung.terminalFontSize': 'Terminal font size',
   'bezeichnung.terminalScrollLines': 'Lines per scroll notch',
+  'bezeichnung.figurenBildrate': 'Agent figure frame rate',
   'bezeichnung.logPaths': 'Log paths (display only)',
   'bezeichnung.effortCaps': 'Set effort caps',
   'bezeichnung.guards': 'Switched-off safeguards',

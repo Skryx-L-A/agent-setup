@@ -33,11 +33,25 @@ class ConsolidateResult:
     merged: list[tuple[str, str]] = field(default_factory=list)
     queued: list[tuple[str, str, str]] = field(default_factory=list)
     distinct: list[tuple[str, str]] = field(default_factory=list)
+    candidates: int = 0
+    filtered: int = 0
+    judge_calls: int = 0
+
+
+def eligible_note(note: Note) -> bool:
+    """Exclude generated pages and asset descriptions before pair scoring."""
+    return (note.ntype not in ("session", "asset", "report")
+            and note.fm.get("class") != "derived"
+            and "sessions" not in note.path.parts
+            and not note.path.name.endswith((".pdf.md", ".png.md", ".jpg.md",
+                                             ".jpeg.md", ".webp.md", ".mp4.md",
+                                             ".mp3.md", ".wav.md")))
 
 
 def merge_candidates(notes: list[Note], vectors: dict[str, list[float]],
                      min_sim: float = config.MERGE_MIN_SIMILARITY,
                      ) -> list[tuple[Note, Note, float]]:
+    notes = [n for n in notes if n.rel in vectors and eligible_note(n)]
     out = []
     for i, a in enumerate(notes):
         for b in notes[i + 1:]:
@@ -61,6 +75,8 @@ def run_consolidation(notes: list[Note], vectors: dict[str, list[float]],
     result = ConsolidateResult()
     queue = queue or ReviewQueue(writer)
     candidates = merge_candidates(notes, vectors)
+    result.candidates = len(candidates)
+    result.filtered = sum(not eligible_note(n) for n in notes)
     for i, (a, b, sim) in enumerate(candidates):
         if deadline is not None and deadline.expired(
                 "consolidate", done=i, total=len(candidates)):
@@ -76,6 +92,7 @@ def run_consolidation(notes: list[Note], vectors: dict[str, list[float]],
             f"Cosine similarity: {sim:.2f}. Merge, review, or distinct?"
         )
         verdict = client.judge(MERGE_SYSTEM, prompt)
+        result.judge_calls += 1
         if not verdict:
             # transient judge failure: skip WITHOUT queueing/blocking, retry next run
             log.warning("judge failed for %s / %s - skipping", a.rel, b.rel)

@@ -28,7 +28,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fernAufruf, mitMaschinenLocale } from './pfad';
 import { wbCodeKenntKontext as kenntKontext, KONTEXT_PROBE_ARGS } from './kontext';
-import { startBefund, kurzfassung } from './startprotokoll';
+import { startBefund, kurzfassung, programmFehlt } from './startprotokoll';
 
 export interface BefehlsUmgebung {
   sessionsDir: string;
@@ -429,6 +429,25 @@ export function plane(nachricht: Record<string, unknown>, u: BefehlsUmgebung): P
           : `orchestratorPermissionMode auf '${wert}' setzen.`,
         aufruf,
         daten: { value: wert },
+      };
+    }
+
+    case 'worker-skip-permissions-set': {
+      const wert = nachricht.value;
+      if (typeof wert !== 'boolean') {
+        return { art: 'abgelehnt', command, beschreibung: '', grund: 'workerSkipPermissions ist true oder false.' };
+      }
+      const grund = String(nachricht.grund ?? '').trim();
+      const hebtAn = wert && einstellung(u.settingsFile, 'workerSkipPermissions') === false;
+      if (hebtAn && !grund) {
+        return { art: 'abgelehnt', command, beschreibung: '', grund: 'workerSkipPermissions anheben braucht einen Grund. Nichts geschrieben.' };
+      }
+      const aufruf = [u.wbStateBin, 'settings', 'set', 'workerSkipPermissions', String(wert)];
+      if (hebtAn) aufruf.push('--grund', grund);
+      return {
+        art: 'bestaetigen', command,
+        beschreibung: `workerSkipPermissions auf '${wert}' setzen.`,
+        aufruf, daten: { value: wert },
       };
     }
 
@@ -1013,6 +1032,9 @@ export async function fuehreAus(plan: Plan, u: BefehlsUmgebung, mensch = false):
   if (r.error && (r.error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
     return { ok: false, ausgabe: `Die andere Maschine hat in ${(zeitlimit ?? 0) / 1000} Sekunden nicht geantwortet.` };
   }
+  // Ein fehlendes Werkzeug war hier bisher "Fehlercode null" (27.09.2026, Erststart eines
+  // zweiten Nutzers) -- jetzt steht da, welches Programm fehlt.
+  if (r.error) return { ok: false, ausgabe: programmFehlt(bin, r.error as NodeJS.ErrnoException)! };
   const ausgabe = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim();
   return { ok: r.status === 0, ausgabe: ausgabe || (r.status === 0 ? 'erledigt' : `Fehlercode ${r.status}`) };
 }

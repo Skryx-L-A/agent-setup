@@ -19,13 +19,13 @@ from typing import Any, Callable, Optional
 import agents_data as ad
 import agents_zugaenge as az
 from agents_claude import (
-    ClaudeAdapterFehler, ClaudeZug, StreamBefund, ZugUrteil, ausgabe_lesen, start_spec,
+    ANTHROPIC_ORIGIN, ClaudeAdapterFehler, ClaudeZug, StreamBefund, ZugUrteil, ausgabe_lesen, start_spec,
     stream_befund, zug_schreiben, zug_urteil,
 )
 from agents_controller import AgentController
 from agents_controller_endpoint import ControllerEndpoint
-from agents_lauf import LaunchReceipt, RunController, RunHandle
-from agents_linux import LinuxLauncher, SocketBinding
+from agents_lauf import LaunchReceipt, RunController, RunHandle, StartSpec
+from agents_linux import LinuxLauncher, LinuxLauncherFehler, SocketBinding
 from agents_model_proxy import AgentsModelProxy, BackendConfig, ProxyBinding
 
 
@@ -47,14 +47,37 @@ class ClaudeZugLauncher(LinuxLauncher):
     Checkpoint waehrend des Zuges wird weiterhin abgewiesen.
     """
 
+    BINDUNGEN = ("WB_AGENT_ID", "WB_WELT")
+    PROZESSUMGEBUNG = (*BINDUNGEN, "WB_AGENT_ZUG")
+
+    def __init__(self, *args, allowed_env_names=(), **kwargs):
+        erlaubt = tuple(dict.fromkeys((*allowed_env_names, *self.PROZESSUMGEBUNG)))
+        super().__init__(*args, allowed_env_names=erlaubt, **kwargs)
+
+    @staticmethod
+    def zugbindung_pruefen(extra_env) -> None:
+        """Jeder Agentenzug braucht die beiden controllerseitigen Bindungen."""
+        try:
+            env = dict(extra_env)
+        except (TypeError, ValueError):
+            env = {}
+        if any(not isinstance(env.get(name), str) or not env[name].strip()
+               for name in ClaudeZugLauncher.BINDUNGEN):
+            raise LinuxLauncherFehler(
+                "Agentenzug ohne Bindung: WB_AGENT_ID und WB_WELT muessen beide gesetzt sein; kein Start"
+            )
+
+    def _validate_spec(self, spec: StartSpec) -> None:
+        super()._validate_spec(spec)
+        self.zugbindung_pruefen(spec.env)
+
     def request_pause(self, receipt: LaunchReceipt) -> None:
         self._require_live(receipt)
 
 
 def anthropic_backend(model: str, execution_host: str) -> BackendConfig:
-    """Cloudbackend ohne feste Header; die Anmeldung kommt je Anfrage aus der Quelle."""
-    return BackendConfig("anthropic", model, "anthropic-messages", "cloud", "https://api.anthropic.com",
-                         execution_host, "cloud")
+    """Cloudbackend ohne feste Header; die Anmeldung kommt je Anfrage aus der Quelle, der Weg geht ueber den Filter."""
+    return BackendConfig("anthropic", model, "anthropic-messages", "cloud", ANTHROPIC_ORIGIN, execution_host, "cloud")
 
 
 @dataclass(frozen=True)
@@ -76,7 +99,7 @@ class ClaudeLauf:
                  workspace: Path, agent_state: Path, zug: ClaudeZug, backend: BackendConfig,
                  auth_headers: Optional[Callable[[], tuple[tuple[str, str], ...]]],
                  extra_read_paths: tuple[Path, ...] = (), launcher_options: Optional[dict[str, Any]] = None,
-                 unit_prefix: str = "wb-agents-linux-claude-", netz: bool = False,
+                 unit_prefix: str = "wb-agents-linux-claude-", netz: bool = False, web: bool = False,
                  extra_write_paths: tuple[Path, ...] = (), verdeckt: tuple[Path, ...] = (),
                  brain_vault: Optional[Path] = None):
         self.orte = orte
@@ -103,6 +126,9 @@ class ClaudeLauf:
         self.unit_prefix = unit_prefix
         # Netz nur fuer einen Zug mit bereitgestellten Zugaengen (agents_zugaenge); sonst bleibt es getrennt.
         self.netz = bool(netz)
+        if type(web) is not bool:
+            raise ClaudeAdapterFehler("Web-Bindung muss boolesch sein")
+        self.web = web
         if backend.model != zug.model:
             raise ClaudeAdapterFehler("Backend und Zug nennen verschiedene Modelle")
         self.proxy: Optional[AgentsModelProxy] = None
@@ -128,13 +154,18 @@ class ClaudeLauf:
     def start(self) -> RunHandle:
         if self.handle is not None:
             raise ClaudeAdapterFehler("Zug wurde bereits gestartet")
+        # Vor Modellproxy, Controllerkanal und systemd/bwrap: ein ungebundener
+        # Zug erzeugt keinerlei Launcherressourcen und wird vom Traeger als
+        # Startfehler mit den bestehenden Fallback-/Recovery-Regeln verbucht.
+        ClaudeZugLauncher.zugbindung_pruefen(self.zug.extra_env)
         for path, label in ((self.orte.controller, "Controllerordner"), (self.orte.turns, "Zugordner"),
                             (self.orte.output, "Ausgabeordner"), (self.orte.launcher_state, "Launcherordner")):
             _private_dir(path, label)
         run_dir = _private_dir(self.orte.controller / self.run_id, "Laufsocketordner")
         turn_dir = _private_dir(self.orte.turns / self.run_id, "Zugordner des Laufs")
         turn_file = zug_schreiben(self.zug, turn_dir)
-        binding = ProxyBinding(self.world_id, self.agent_id, self.run_id, self.backend.provider, self.zug.model)
+        binding = ProxyBinding(self.world_id, self.agent_id, self.run_id, self.backend.provider, self.zug.model,
+                               web=self.web)
         try:
             self.proxy = AgentsModelProxy(
                 binding, self.backend, run_dir / "model.sock", run_dir,
@@ -152,6 +183,9 @@ class ClaudeLauf:
                 output_dir=self.orte.output, unit_prefix=self.unit_prefix, network=self.netz,
                 **dict(self.launcher_options, **({"verdeckt": self.verdeckt} if self.verdeckt else {})))
             spec = start_spec(self.orte.runtime, turn_file, self.workspace, self.zug.runner)
+            env = dict(self.zug.extra_env)
+            spec = StartSpec(spec.argv, spec.cwd, tuple((name, env[name]) for name in
+                                                        ClaudeZugLauncher.PROZESSUMGEBUNG if env.get(name)))
             self.handle = self.controller(self.launcher).start(self.world_id, self.agent_id, self.run_id, spec)
             return self.handle
         except BaseException:

@@ -183,7 +183,7 @@ dann als eigene, ungezählte Kategorie EIGEN-ANDERES-REPO statt als Fund.
   `~/AI/machine-sync/bin/…` und gehören zum Repository
   `<your-github-user>/machine-sync`.
 - `project-kit` ist ein Symlink auf `~/AI/project-kit/bin/project-kit` und
-  gehört zum Repository `<your-github-user>/project-kit`.
+  gehört zum Repository `Skryx-L-A/project-kit`.
 - `unreal-editor` startet den Unreal Editor für ein Projekt namens
   „a project"; inhaltlich gehört es zu `<your-github-user>/a project`, aber
   `git -C ~/AI/a project ls-files` führt die Datei nicht — sie ist dort
@@ -195,7 +195,7 @@ dann als eigene, ungezählte Kategorie EIGEN-ANDERES-REPO statt als Fund.
 - `another service-ctl`, `another service-pill`, `another service-type` und `another serviced` gehören zum
   Sprach- und Hotkey-Werkzeug „another service". Der lokale Ordner heißt
   `~/AI/a project`, sein Git-Fernverweis zeigt aber auf das Repository
-  `<your-github-user>/another service`.
+  `Skryx-L-A/quassel`.
 - `launch-odysseus.sh` startet ein Projekt namens „Odysseus", das im
   Wissens-Tresor unter `20-projects/odysseus` dokumentiert ist. Das
   Anwendungsverzeichnis, auf das das Skript fest verweist

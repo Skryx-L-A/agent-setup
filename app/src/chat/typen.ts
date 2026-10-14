@@ -28,7 +28,7 @@ export type Zuordnung = 'cwd' | 'pid' | 'hook' | 'serverId' | '';
  * hier sagt, welcher Weg tatsaechlich getragen hat -- der vorgesehene oder
  * einer der beiden Rueckfaelle. Leer = es gibt keine Zuordnung.
  */
-export type Herkunft = 'hook' | 'vermerk' | 'pid' | 'ordner' | '';
+export type Herkunft = 'register' | 'hook' | 'vermerk' | 'pid' | 'ordner' | '';
 
 /**
  * Was die Ansicht aus dem Protokoll NICHT bekommt und deshalb aus der

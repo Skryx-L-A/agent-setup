@@ -56,7 +56,18 @@
 # der Sperre statt — wer als Zweiter kommt, sieht den bereits wiederbelebten Pane leben
 # und laesst ihn in Ruhe.
 #
-# Usage: wb-revive [--force [--yes]] [<pane-id>]
+# Usage: wb-revive [--force [--yes]] [--model <id>] [--effort <level>]
+#                  [--tmux-socket <name>] [--trocken] [--resume-id <id>] [<pane-id>]
+#
+# --trocken (2026-09-25, fuer wb-schlaf): nichts neu starten, nur den Befehl
+# berechnen, mit dem dieser Pane seine Unterhaltung fortsetzen wuerde. Ausgabe
+# drei Zeilen "befehl\t...", "grund\t...", "harness\t...". Erlaubt auch fuer einen
+# LEBENDEN Pane, weil nichts beendet wird. wb-schlaf legt eine Sitzung nur dann
+# schlafen, wenn es diesen Befehl vorher kennt.
+# --resume-id <id>: die Kennung ist schon bekannt (bei claude aus dem
+# Sitzungsregister ~/.claude/sessions, genau DIESER Pane). Ein im Startbefehl
+# stehendes --resume/--continue wird dann durch diese Kennung ersetzt, statt den
+# Startbefehl unveraendert zu nehmen.
 # Exit:  0 respawned   3 pane still alive, nothing done   2 usage/unknown pane
 #        4 eine andere Wiederbelebung dieses Panes laeuft gerade
 #
@@ -66,10 +77,22 @@ set -euo pipefail
 pane=""
 force=0
 confirmed=0
+switch_model=""
+switch_effort=""
+tmux_socket=""
+trocken=0
+bind_only=0
+resume_override=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --force)   force=1 ;;
     --yes|-y)  confirmed=1 ;;
+    --model)   [ $# -ge 2 ] || { echo "wb-revive: --model braucht einen Wert" >&2; exit 2; }; switch_model="$2"; shift ;;
+    --effort)  [ $# -ge 2 ] || { echo "wb-revive: --effort braucht einen Wert" >&2; exit 2; }; switch_effort="$2"; shift ;;
+    --tmux-socket) [ $# -ge 2 ] || { echo "wb-revive: --tmux-socket braucht einen Wert" >&2; exit 2; }; tmux_socket="$2"; shift ;;
+    --trocken) trocken=1 ;;
+    --bind-only) bind_only=1 ;;
+    --resume-id) [ $# -ge 2 ] || { echo "wb-revive: --resume-id braucht einen Wert" >&2; exit 2; }; resume_override="$2"; shift ;;
     -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
     -*)        printf 'wb-revive: unknown option %s\n' "$1" >&2; exit 2 ;;
     *)         [ -z "$pane" ] && pane="$1" ;;
@@ -77,6 +100,13 @@ while [ $# -gt 0 ]; do
   shift
 done
 pane="${pane:-${TMUX_PANE:?no pane}}"
+tmux() {
+  if [ -n "$tmux_socket" ]; then
+    command tmux -L "$tmux_socket" "$@"
+  else
+    command tmux "$@"
+  fi
+}
 
 # THE liveness guard — the one place that decides whether a respawn may happen.
 # Called immediately before the single respawn-pane below; nothing respawns
@@ -145,7 +175,25 @@ pane_harness() {   # <startbefehl> -> harness-id oder leer
 }
 
 cmd=$(tmux show-options -pqv -t "$pane" @wb_cmd 2>/dev/null || true)
-[[ -z "$cmd" ]] && cmd=$(tmux display-message -p -t "$pane" '#{pane_start_command}')
+if [[ -z "$cmd" ]]; then
+  cmd=$(tmux display-message -p -t "$pane" '#{pane_start_command}')
+  # tmux (3.7c) gibt #{pane_start_command} in seiner eigenen Argument-Form aus: ein Pane,
+  # der mit EINEM Befehlstext gestartet wurde, liefert ihn in Anfuehrungszeichen
+  # ("exec claude --settings '{\"a\":1}' ..."). Unveraendert an respawn-pane gegeben,
+  # sucht die Shell ein einziges Wort als Befehl und der Pane stirbt sofort mit
+  # Status 127 (14.10.2026, wz-absturzbeleg Lauf 1 und 2: Pane ohne @wb_cmd). Ein
+  # einzelnes Argument wird deshalb entpackt; mehrere bleiben in Shell-Form.
+  cmd="$(/usr/bin/python3 - "$cmd" <<'PYQ'
+import shlex, sys
+c = sys.argv[1]
+try:
+    t = shlex.split(c)
+except ValueError:
+    t = []
+print(t[0] if len(t) == 1 and t[0] != c else c)
+PYQ
+)"
+fi
 
 if [[ -z "$cmd" ]]; then
   tmux display-message -t "$pane" "wb-revive: kein Startbefehl am Pane, nichts zu tun"
@@ -164,6 +212,153 @@ if [[ -z "$hid" && -z "$prole" ]]; then
   exit 0
 fi
 
+# The first prompt contains the unique result path for this worker. Match that
+# marker in a Codex rollout, not a timestamp or the newest thread in a shared
+# cwd. This also recovers a thread created just before pi-worker or the TUI died.
+if [ "$hid" = codex ]; then
+  bound="$(tmux show-options -pqv -t "$pane" @wb_thread 2>/dev/null || true)"
+  bound_source="@wb_thread"
+  bound_found=0
+  initial="$(/usr/bin/python3 - "$cmd" <<'PY'
+import shlex, sys
+try:
+    a = shlex.split(sys.argv[1])
+    if '--initial-task-file' not in a:
+        a = shlex.split(next(x for x in a if 'wb-harness-run' in x))
+    i = a.index('--initial-task-file')
+    print(a[i + 1])
+except (ValueError, IndexError, StopIteration):
+    pass
+PY
+)"
+  if [ -z "$bound" ] && [ -n "$initial" ] && [ -f "$initial" ]; then
+    bound_source="Codex-Zustandsspeicher"
+    codex_home="$(tmux show-options -pqv -t "$pane" @wb_codex_home 2>/dev/null || true)"
+    codex_home="${codex_home:-${CODEX_HOME:-$HOME/.codex}}"
+    bound="$(/usr/bin/python3 - "$initial" "$codex_home" "$cmd" <<'PY'
+import glob, os, re, shlex, sqlite3, sys
+task, home, cmd = sys.argv[1:]
+try:
+    a = shlex.split(cmd)
+    if '--dir' not in a:
+        a = shlex.split(next(x for x in a if 'wb-harness-run' in x))
+    cwd = a[a.index('--dir') + 1]
+    marker = os.path.basename(task)[1:].removesuffix('.codex-start.txt') + '.md'
+    if not marker.endswith('.md') or marker == '.md':
+        raise ValueError('invalid marker')
+    matches = set()
+    for db in glob.glob(os.path.join(home, 'state_*.sqlite')):
+        con = sqlite3.connect('file:%s?mode=ro' % db, uri=True, timeout=2)
+        try:
+            rows = con.execute('SELECT id, rollout_path FROM threads WHERE cwd IN (?, ?, ?)',
+                               (cwd, os.path.normpath(cwd), os.path.realpath(cwd)))
+            for thread, rollout in rows:
+                if not re.fullmatch(r'[A-Za-z0-9._-]{1,128}', thread or '') or not rollout:
+                    continue
+                try:
+                    with open(rollout, 'rb') as f:
+                        if marker.encode() in f.read():
+                            matches.add(thread)
+                except OSError:
+                    pass
+        finally:
+            con.close()
+    if len(matches) == 1:
+        print(matches.pop())
+except (OSError, ValueError, IndexError, StopIteration, sqlite3.Error):
+    pass
+PY
+)"
+    if [ -n "$bound" ]; then bound_found=1; fi
+  fi
+  if [[ -n "$bound" && ! "$bound" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+    echo "wb-revive: ${bound_source} ungültig, wird nicht benutzt." >&2
+    tmux display-message -t "$pane" "wb-revive: ${bound_source} ungültig, wird nicht benutzt." 2>/dev/null || true
+    bound=""
+  fi
+  if [ "$bound_found" -eq 1 ] && [ -n "$bound" ] && [ "$trocken" -eq 0 ]; then
+    tmux set -p -t "$pane" @wb_thread "$bound"
+  fi
+  if [ -n "$bound" ] && [ "$trocken" -eq 0 ] && [ -n "$initial" ] && [ -f "$initial" ]; then
+    rm -f "$initial" || { echo "wb-revive: gebundener Codex-Auftrag konnte nicht entfernt werden." >&2; exit 1; }
+  fi
+fi
+if [ "$bind_only" -eq 1 ]; then
+  [ -n "${bound:-}" ]
+  exit $?
+fi
+
+# KEINE FREMDE LEBENDE UNTERHALTUNG (14.10.2026, Vorgabe des WorkbenchOrchestrators).
+# Eine claude-Kennung, die laut Sitzungsregister (~/.claude/sessions/<pid>.json,
+# Feld sessionId) einem LEBENDEN claude-Prozess gehoert, der nicht der Prozess dieses
+# Panes ist, wird nie eingesetzt -- weder als --resume-id, noch aus der Zustandsdatei,
+# noch als --resume im gespeicherten Startbefehl. Zwei Prozesse auf einer Unterhaltung
+# schreiben beide in deren Transkript; am 14.10. uebernahmen die Kopien ausserdem die
+# Remote-Control-Verbindung des Orchestrators. Ohne eigene Kennung startet ein
+# claude-Pane FRISCH, ohne --resume und ohne das ratende fallbackArgs '--continue'
+# (das nimmt die juengste Unterhaltung im Verzeichnis, also oft genau die fremde).
+fremde_sitzung() {  # <kennung> -> PID des fremden lebenden Besitzers auf stdout, sonst nichts
+  /usr/bin/python3 - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions" "$1" "$2" <<'PYF'
+import json, os, subprocess, sys
+ordner, kennung, pane_pid = sys.argv[1], sys.argv[2], sys.argv[3]
+def ps(feld, pid):
+    r = subprocess.run(["ps", "-o", feld + "=", "-p", str(pid)], capture_output=True, text=True)
+    return r.stdout.strip()
+def lstart(pid):
+    r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                       env=dict(os.environ, LC_ALL="C", TZ="UTC"))
+    return " ".join(r.stdout.split())
+def im_pane(pid):
+    # Der Pane-Prozess selbst oder eines seiner Kinder darf die Kennung tragen.
+    if not pane_pid.isdigit():
+        return False
+    for _ in range(64):
+        if pid == int(pane_pid):
+            return True
+        eltern = ps("ppid", pid)
+        if not eltern.isdigit() or int(eltern) <= 1:
+            return False
+        pid = int(eltern)
+    return False
+try:
+    namen = sorted(os.listdir(ordner))
+except OSError:
+    namen = []
+for n in namen:
+    if not n.endswith(".json"):
+        continue
+    try:
+        d = json.load(open(os.path.join(ordner, n)))
+        pid = int(d.get("pid"))
+    except Exception:
+        continue
+    if d.get("sessionId") != kennung:
+        continue
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        continue
+    except PermissionError:
+        pass
+    if ps("stat", pid).startswith("Z") or not ps("stat", pid):   # Zombie oder schon weg
+        continue
+    # Lebt GENAU der eingetragene Prozess? Mit procStart (Claude traegt es ein,
+    # `LC_ALL=C TZ=UTC ps -o lstart=`, wie wb-inbox) entscheidet die Startzeit: eine
+    # wiederverwendete PID ist kein Besitzer, ein node-gestarteter Besitzer ohne
+    # "claude" in der Befehlszeile schon (Review-Fund F2, 14.10.). Nur ohne procStart
+    # (aeltere Eintraege) bleibt der Rueckfall auf "claude" in der Befehlszeile.
+    start = d.get("procStart")
+    if isinstance(start, str) and start.strip():
+        if " ".join(start.split()) != lstart(pid):
+            continue
+    elif "claude" not in ps("command", pid):
+        continue
+    if im_pane(pid):
+        continue
+    print(pid)
+    break
+PYF
+}
 # Resolve THIS pane's own conversation (2026-08-05). `--continue` resumes
 # whichever conversation was last active in the pane's cwd -- with several
 # sessions per folder (the normal case here, not the exception, see
@@ -173,16 +368,169 @@ fi
 # app/src/main/revive.ts uses the same field for the UI's own resume button).
 # Same STATEDIR path as wb-state/wb-doctor/wb-session-delete -- one truth, not
 # a second guess at the same folder. Anything short of a clean match (no
-# state dir, no matching file, unreadable JSON, no id) falls back to the old
-# --continue behaviour: an unattended revive with the second-best
-# conversation beats no revive at all.
+# state dir, no matching file, unreadable JSON, no id) fell back to --continue
+# until 14.10.2026; a claude pane now starts fresh instead (see "KEINE FREMDE
+# LEBENDE UNTERHALTUNG" below).
+#
+# NUR FUER DEN ORCHESTRATOR (14.10.2026). Die Zustandsdatei beschreibt die Unterhaltung
+# des Orchestrator-Panes, nicht die der Session. Bis heute bekam JEDER Pane der Session
+# deren claudeSessionId: am 14.10. 00:06 setzte wb-autorevive vier Agent-Panes in der
+# IOS-Session mit `--resume 071f597e-…` neu auf -- der laufenden Unterhaltung des
+# IOS-Orchestrators (Pane %35). Ein anderer Pane nimmt seine eigene Kennung
+# (@wb_chat_session, vom Chat-Hook IM Harness-Prozess gesetzt, also diesem Pane
+# eindeutig zugeordnet) oder keine.
 sess="$(tmux display -p -t "$pane" '#{session_name}' 2>/dev/null || true)"
 STATEDIR="$HOME/.claude/workbench/sessions"
+#
+# REIHENFOLGE FUER CLAUDE (14.10.2026, Review-Fund F1 des WorkbenchOrchestrators):
+#   1. --resume-id (weiter unten, $resume_override)
+#   2. Claudes Register der toten pane_pid (an genau diesen Prozess gebunden)
+#   3. @wb_chat_session NUR, wenn sie mit der Zustandsdatei uebereinstimmt oder es
+#      keine (eigene, nicht fremd belegte) Zustandsdatei-Kennung gibt
+#   4. die Zustandsdatei (nur Orchestrator oder Pane ohne Rolle)
+#   5. sonst frisch mit lauter Warnung
+# Warum die Option nicht zuerst: Der Chat-Hook setzt sie bei JEDEM SessionStart im
+# Pane, bis zum Hook-Filter "NUR DER HARNESS, DER DEN PANE BESITZT" auch fuer ein
+# verschachteltes `claude -p`. Dessen Wegwerf-Kennung blieb an Orchestrator-Panes
+# stehen; ein abgestuerzter Orchestrator kaeme damit in der falschen Unterhaltung zurueck.
 resume_id=""
-if [[ -n "$sess" ]]; then
-  resume_id="$(/usr/bin/python3 - "$STATEDIR" "$sess" <<'PY'
-import json, os, sys
-statedir, sess = sys.argv[1], sys.argv[2]
+resume_eigen=""
+resume_quelle=""
+if [ "$hid" = claude ]; then
+  resume_eigen="$(tmux show-options -pqv -t "$pane" @wb_chat_session 2>/dev/null || true)"
+fi
+
+# DAS REGISTER DER ALTEN PANE-PID (14.10.2026, Bedingung des WorkbenchOrchestrators:
+# ein Orchestrator, der nach einem Absturz frisch zurueckkommt, verliert des Nutzers
+# Gespraech). Claude legt je Prozess ~/.claude/sessions/<pid>.json an (pid, sessionId,
+# cwd, tmux, ...). Nach SIGKILL bleibt die Datei einige Sekunden liegen (gemessen
+# 14.10., wz-absturzbeleg: da nach 5 s, weg nach 30 s; vermutlich raeumt eine andere
+# claude-Instanz sie ab). wb-autorevive laeuft im pane-died-Hook sofort und findet sie
+# meist; spaeter (Taste, App) fehlt sie, dann greifen Option und Zustandsdatei. Die
+# tote Pane-PID ist genau dieser Prozess: tmux behaelt #{pane_pid} eines toten Panes (remain-on-exit),
+# und die Werkbank startet claude per exec im Pane (gemessen 14.10.: Register-PID ==
+# pane_pid bei 27 von 27 lebenden claude-Panes). Genommen wird die Kennung NUR, wenn
+#   (a) der Pane tot ist und diese PID nicht mehr lebt,
+#   (b) das cwd der Registerdatei zum Pane passt (--dir, Start- oder letzter Pfad),
+#       und ein gesetztes Feld tmux denselben Pane nennt,
+#   (c) die Kennung keiner anderen lebenden claude-PID gehoert (fremde_sitzung).
+register_grund=""
+if [[ -z "$resume_id" && "$hid" = claude ]]; then
+  r_pid="$(tmux display -p -t "$pane" '#{pane_pid}' 2>/dev/null || true)"
+  r_dead="$(tmux display -p -t "$pane" '#{pane_dead}' 2>/dev/null || true)"
+  if [[ "$r_dead" = 1 && "$r_pid" =~ ^[0-9]+$ ]]; then
+    r_out="$(/usr/bin/python3 - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions" "$r_pid" "$pane" "$cmd" \
+      "$(tmux display -p -t "$pane" '#{pane_start_path}' 2>/dev/null || true)" \
+      "$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)" <<'PYR'
+import json, os, re, shlex, subprocess, sys
+ordner, pid, pane, cmd = sys.argv[1:5]
+def lebt(pid, proc_start):
+    # Lebt GENAU der Prozess, den die Registerdatei meint? Ein Zombie zaehlt als tot
+    # (kill -0 trifft ihn noch), eine wiederverwendete PID auch: Claude traegt procStart
+    # als `LC_ALL=C TZ=UTC ps -o lstart=` ein (gemessen 10.10., wie wb-inbox).
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    umg = dict(os.environ, LC_ALL="C", TZ="UTC")
+    def ps(feld):
+        try:
+            r = subprocess.run(["ps", "-o", feld + "=", "-p", str(pid)], env=umg,
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return " ".join(r.stdout.split()) if r.returncode == 0 else ""
+    stat = ps("stat")
+    if stat == "" or (stat or "").startswith("Z"):
+        return False
+    if isinstance(proc_start, str) and proc_start.strip():
+        start = ps("lstart")
+        if start is not None and start != " ".join(proc_start.split()):
+            return False
+    return True
+pfade = [p for p in sys.argv[5:] if p]
+try:
+    toks = shlex.split(cmd)
+    for i, t in enumerate(toks):
+        if t == "--dir" and i + 1 < len(toks):
+            pfade.append(toks[i + 1])
+        elif t.startswith("--dir="):
+            pfade.append(t[6:])
+except ValueError:
+    pass
+datei = os.path.join(ordner, pid + ".json")
+if not os.path.isfile(datei):
+    sys.exit(0)
+def grund(t):
+    print("why\t" + t)
+    sys.exit(0)
+try:
+    d = json.load(open(datei))
+except Exception:
+    grund("Registerdatei der alten Pane-PID %s unlesbar" % pid)
+if str(d.get("pid")) != pid:
+    grund("Registerdatei der alten Pane-PID %s nennt eine andere PID" % pid)
+if lebt(int(pid), d.get("procStart")):
+    grund("alte Pane-PID %s lebt noch" % pid)
+kennung = d.get("sessionId") or ""
+if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", kennung):
+    grund("Registerdatei der alten Pane-PID %s ohne gueltige sessionId" % pid)
+def norm(p):
+    return os.path.realpath(os.path.expanduser(p))
+cwd = d.get("cwd") or ""
+if not cwd or norm(cwd) not in {norm(p) for p in pfade}:
+    grund("cwd der Registerdatei (PID %s) passt nicht zum Pane" % pid)
+t = d.get("tmux") or ""
+if t and t.rsplit(".", 1)[-1] != pane:
+    grund("Registerdatei der PID %s gehoert zu einem anderen Pane" % pid)
+print("id\t" + kennung)
+PYR
+)"
+    while IFS=$'\t' read -r tag val; do
+      case "$tag" in
+        id)  r_id="$val" ;;
+        why) register_grund="$val" ;;
+      esac
+    done <<<"$r_out"
+    if [[ -n "${r_id:-}" ]]; then
+      besitzer="$(fremde_sitzung "$r_id" "$r_pid")"
+      if [[ -n "$besitzer" ]]; then
+        register_grund="Kennung ${r_id} aus dem Register gehoert der lebenden Sitzung PID ${besitzer}"
+      else
+        resume_id="$r_id"
+        resume_quelle="Claude-Register der alten Pane-PID ${r_pid}"
+      fi
+    fi
+  fi
+fi
+# Die Zustandsdatei (nur Orchestrator oder Pane ohne Rolle). Sie nennt nur den Namen der
+# tmux-Session, nicht den Server: eine gleichnamige Session auf einem anderen Server
+# (Testserver mit Session "t", gemessen 14.10., wz-absturzbeleg) bekam sonst die
+# claudeSessionId einer fremden Unterhaltung. Deshalb muss auch ihr Feld dir, wenn es
+# gesetzt ist (wb-state schreibt es immer), zum Pane passen (--dir, Start- oder letzter
+# Pfad), wie beim Register.
+zustand_id=""
+if [[ -n "$sess" && ( "$prole" = orchestrator || -z "$prole" ) ]]; then
+  zustand_id="$(/usr/bin/python3 - "$STATEDIR" "$sess" "$cmd" \
+    "$(tmux display -p -t "$pane" '#{pane_start_path}' 2>/dev/null || true)" \
+    "$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)" <<'PY'
+import json, os, shlex, sys
+statedir, sess, cmd = sys.argv[1:4]
+pfade = [p for p in sys.argv[4:] if p]
+try:
+    toks = shlex.split(cmd)
+    for i, t in enumerate(toks):
+        if t == "--dir" and i + 1 < len(toks):
+            pfade.append(toks[i + 1])
+        elif t.startswith("--dir="):
+            pfade.append(t[6:])
+except ValueError:
+    pass
+def norm(p):
+    return os.path.realpath(os.path.expanduser(p))
+pfade = {norm(p) for p in pfade}
 try:
     names = os.listdir(statedir)
 except OSError:
@@ -196,11 +544,139 @@ for fn in sorted(names):
         continue
     if st.get("tmuxSession") == sess:
         csid = st.get("claudeSessionId")
-        if csid:
+        d = st.get("dir") or ""
+        # Ohne Feld dir (aeltere Dateien) bleibt es beim Namensvergleich.
+        if csid and (not d or norm(d) in pfade):
             print(csid)
         break
 PY
 )"
+fi
+if [[ "$hid" != claude ]]; then
+  [[ -z "$resume_id" ]] && resume_id="$zustand_id"
+elif [[ -z "$resume_id" ]]; then
+  # Schritt 3 und 4 der Reihenfolge oben. Eine Zustandsdatei-Kennung, die einer anderen
+  # LEBENDEN Sitzung gehoert, zaehlt beim Vergleich als fehlend; gibt es dann auch keine
+  # Option, wird sie trotzdem eingesetzt und weiter unten laut abgelehnt.
+  zustand_fremd=""
+  [[ -n "$zustand_id" ]] && zustand_fremd="$(fremde_sitzung "$zustand_id" "$(tmux display -p -t "$pane" '#{pane_pid}' 2>/dev/null || true)")"
+  if [[ -n "$resume_eigen" && ( -z "$zustand_id" || -n "$zustand_fremd" || "$resume_eigen" = "$zustand_id" ) ]]; then
+    resume_id="$resume_eigen"
+    resume_quelle="@wb_chat_session"
+  elif [[ -n "$zustand_id" ]]; then
+    resume_id="$zustand_id"
+    resume_quelle="Zustandsdatei der Session ${sess}"
+    if [[ -n "$resume_eigen" ]]; then
+      echo "wb-revive: $pane: @wb_chat_session ${resume_eigen} weicht von der Zustandsdatei ab -- Zustandsdatei gewinnt." >&2
+      resume_quelle="${resume_quelle}; @wb_chat_session ${resume_eigen} verworfen"
+    fi
+  fi
+elif [[ -n "$resume_eigen" && "$resume_eigen" != "$resume_id" ]]; then
+  echo "wb-revive: $pane: @wb_chat_session ${resume_eigen} weicht vom Register ab -- Register gewinnt." >&2
+  resume_quelle="${resume_quelle}; @wb_chat_session ${resume_eigen} verworfen"
+fi
+
+# LETZTER EIGENER WEG FUER CLAUDE: das Transkript im Zeitfenster des Panes (14.10.2026,
+# Review-Fund F4). Claudes Register verschwindet 5 bis 30 s nach einem SIGKILL (gemessen,
+# wz-absturzbeleg); eine spaetere Wiederbelebung (Taste, App) findet es nicht mehr. Das
+# alte fallbackArgs `--continue` nimmt die JUENGSTE Unterhaltung im cwd -- am 14.10. die
+# eines anderen lebenden Panes. Genommen wird deshalb nur ein Transkript
+# ~/.claude/projects/<cwd kodiert>/<id>.jsonl, das als EINZIGES im Verzeichnis zwischen
+# dem Start des Panes (@wb_started, von pi-worker gesetzt) und seinem Tod
+# (pane_dead_time) angelegt wurde -- dasselbe Zeitfenster wie wb-resume-id fuer andere
+# Harnesses. Zwei Treffer oder kein Startzeitpunkt: nicht raten, frisch mit Warnung.
+# Ein einziger Treffer gilt nur mit Beleg: sein Transkript nennt einen Ergebnispfad
+# dieses Panes (auftraege.tsv von pi-worker), und seine Kennung steht nicht in der
+# Registerdatei einer anderen PID. Sonst frisch mit Warnung (N1, Review testleck2).
+if [[ -z "$resume_id" && "$hid" = claude ]]; then
+  t_started="$(tmux show-options -pqv -t "$pane" @wb_started 2>/dev/null || true)"
+  t_dead="$(tmux display -p -t "$pane" '#{pane_dead_time}' 2>/dev/null || true)"
+  t_path="$(tmux display -p -t "$pane" '#{pane_start_path}' 2>/dev/null || true)"
+  [[ -z "$t_path" ]] && t_path="$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)"
+  if [[ "$t_started" =~ ^[0-9]+$ && "$t_dead" =~ ^[0-9]+$ && "$t_dead" != 0 && -n "$t_path" ]]; then
+    # Bindung (14.10., N1): pi-worker schreibt den Ergebnispfad dieses Auftrags in den
+    # Erstauftrag und in auftraege.tsv (Spalte 2, Pane in Spalte 3). Ein Treffer gilt nur,
+    # wenn sein Transkript einen dieser Pfade enthaelt. Dazu: Kennungen aus den
+    # Registerdateien anderer PIDs (lebend oder tot) gelten als fremd.
+    t_pid="$(tmux display -p -t "$pane" '#{pane_pid}' 2>/dev/null || true)"
+    t_worker="$(tmux show-options -pqv -t "$pane" @wb_worker 2>/dev/null || true)"
+    t_buch=""
+    [[ "$t_worker" =~ ^[A-Za-z0-9._-]{1,128}$ ]] && t_buch="$HOME/.pi-workers/results/$t_worker/auftraege.tsv"
+    t_out="$(/usr/bin/python3 - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" "$t_path" "$cmd" "$t_started" "$t_dead" \
+      "$pane" "$t_pid" "$t_buch" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions" <<'PYT'
+import glob, json, os, re, shlex, sys
+wurzel, pfad, cmd, start, tod = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+pane, pane_pid, buch, sessdir = sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9]
+try:
+    toks = shlex.split(cmd)
+    for i, t in enumerate(toks):
+        if t == "--dir" and i + 1 < len(toks):
+            pfad = toks[i + 1]
+        elif t.startswith("--dir="):
+            pfad = t[6:]
+except ValueError:
+    pass
+# Ergebnispfade dieses Panes aus dem Auftragsbuch von pi-worker (nur Pfad-Bytes, nie Inhalt).
+pfade = set()
+try:
+    with open(buch, encoding="utf-8", errors="replace") as h:
+        for zeile in h:
+            feld = zeile.rstrip("\n").split("\t")
+            if len(feld) >= 3 and feld[2] == pane and feld[1]:
+                pfade.add(feld[1].encode())
+except OSError:
+    pass
+# Kennungen aus Registerdateien anderer PIDs (lebend oder tot) sind fremd.
+fremd = {}
+for f in glob.glob(os.path.join(sessdir, "*.json")):
+    try:
+        with open(f, encoding="utf-8") as h:
+            d = json.load(h)
+    except (OSError, ValueError):
+        continue
+    sid = d.get("sessionId") if isinstance(d, dict) else None
+    if isinstance(sid, str) and str(d.get("pid", "")) != pane_pid:
+        fremd[sid] = str(d.get("pid", ""))
+ordner = os.path.join(wurzel, re.sub(r"[^A-Za-z0-9-]", "-", os.path.realpath(os.path.expanduser(pfad))))
+treffer = []
+for f in glob.glob(os.path.join(ordner, "*.jsonl")):
+    try:
+        st = os.stat(f)
+    except OSError:
+        continue
+    geboren = getattr(st, "st_birthtime", st.st_mtime)
+    if start - 2 <= geboren <= tod + 2:
+        treffer.append(f)
+if len(treffer) > 1:
+    print("why\t%d Transkripte im Zeitfenster des Panes, nicht geraten" % len(treffer))
+elif len(treffer) == 1:
+    f = treffer[0]
+    sid = os.path.basename(f)[:-6]
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", sid):
+        pass
+    elif sid in fremd:
+        print("why\tEinziges Transkript im Zeitfenster gehoert PID %s (Register), nicht fortgesetzt" % fremd[sid])
+    elif not pfade:
+        print("why\tKein Ergebnispfad dieses Panes in auftraege.tsv, Transkript im Zeitfenster nicht fortgesetzt")
+    else:
+        try:
+            with open(f, "rb") as h:
+                inhalt = h.read()
+        except OSError:
+            inhalt = b""
+        if any(p in inhalt for p in pfade):
+            print("id\t" + sid)
+        else:
+            print("why\tEinziges Transkript im Zeitfenster enthaelt keinen Ergebnispfad dieses Panes, nicht fortgesetzt")
+PYT
+)"
+    while IFS=$'\t' read -r tag val; do
+      case "$tag" in
+        id)  resume_id="$val"; resume_quelle="einziges Transkript im Zeitfenster des Panes" ;;
+        why) register_grund="${register_grund:+$register_grund; }$val" ;;
+      esac
+    done <<<"$t_out"
+  fi
 fi
 
 # Der Weg zurueck steht in der Registry, nicht hier (2026-08-06). Bis heute stand an
@@ -238,6 +714,45 @@ print(base or "-", shlex.join(str(a) for a in args) if args else "")
   fi
 fi
 
+# A model switch reuses this script's one guarded respawn path.  Rewrite only
+# the clean @wb_cmd, before resume arguments are added; the rewritten clean
+# command is stored back below so every later revive keeps the selected model.
+if [[ -n "$switch_model" ]]; then
+  [[ -n "$hid" && -n "$hjson" ]] || { echo "wb-revive: Harness des Panes ist unbekannt — Modell nicht geaendert." >&2; exit 2; }
+  state="$HOME/.local/bin/wb-state"
+  [[ -x "$state" ]] || state="$(command -v wb-state 2>/dev/null || true)"
+  [[ -n "$state" ]] || { echo "wb-revive: wb-state fehlt — Modell nicht geaendert." >&2; exit 2; }
+  target_harness="$($state models get "$switch_model" --field harness 2>/dev/null || true)"
+  target_ref="$($state models get "$switch_model" --field modelRef 2>/dev/null || true)"
+  target_id="$($state models get "$switch_model" --field id 2>/dev/null || true)"
+  [[ -n "$target_ref" && "$target_harness" = "$hid" ]] || {
+    echo "wb-revive: Modell '$switch_model' gehoert nicht zum Harness '$hid' — nichts getan." >&2; exit 2;
+  }
+  if [[ -n "$switch_effort" ]]; then
+    "$state" models effort "$target_id" --liste 2>/dev/null | tr ' ' '\n' | grep -Fxq "$switch_effort" || {
+      echo "wb-revive: Denkstufe '$switch_effort' gilt nicht fuer '$target_id' — nichts getan." >&2; exit 2;
+    }
+  fi
+  rewritten="$(/usr/bin/python3 - "$cmd" "$target_ref" "$switch_effort" <<'PY'
+import re, shlex, sys
+cmd, model, effort = sys.argv[1:]
+pattern = r"(?<!\S)--model(?:=|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s\"']+)"
+replacement = '--model ' + shlex.quote(model)
+new, count = re.subn(pattern, replacement, cmd, count=1)
+if count != 1:
+    sys.exit(1)
+if effort:
+    ep = r"(?<!\S)--effort(?:=|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s\"']+)"
+    er = '--effort ' + shlex.quote(effort)
+    new, n = re.subn(ep, er, new, count=1)
+    if n == 0:
+        new += ' ' + er
+print(new)
+PY
+)" || { echo "wb-revive: Startbefehl hat keinen eindeutigen --model-Schalter — nichts getan." >&2; exit 2; }
+  cmd="$rewritten"
+fi
+
 # DIE KENNUNG JE HARNESS (2026-09-05). Bis heute loeste {resumeId} nur fuer claude auf,
 # ueber die Zustandsdatei oben. cline, forge und jcode koennen ihre Unterhaltung
 # ebenfalls fortsetzen (gemessen am 04.09. und 05.09.: `clite --id`, `forge
@@ -257,7 +772,6 @@ fi
 # Sitzung Sekunden nach dem Start an; jede spaetere in demselben Verzeichnis gehoert
 # einem spaeteren Pane. Ohne @wb_started zaehlt nur ein EINDEUTIGER Treffer im
 # Verzeichnis; bei zweien wird nicht geraten, dann greift fallbackArgs wie bisher.
-resume_quelle=""
 behalte_why=""
 if [[ -z "$resume_id" && -n "$hjson" && -n "$hid" ]]; then
   # Das Arbeitsverzeichnis: --dir aus der Startzeile (so hat wb-harness-run es
@@ -301,6 +815,115 @@ fi
 # real session id needs and nothing a shell would act on. The file is ours,
 # but this path runs unattended, and a state file is not a place to trust
 # blindly. Anything else falls back to --continue.
+if [[ -n "$resume_override" ]]; then
+  resume_id="$resume_override"
+  resume_quelle="Sitzungsregister"
+  # Ein --resume/--continue im Startbefehl zeigte sonst den Zweig "setzt selbst fort"
+  # an -- mit womoeglich einer anderen Kennung. Mit bekannter Kennung wird er entfernt.
+  cmd="$(/usr/bin/python3 - "$cmd" <<'PYS'
+import re, sys
+c = sys.argv[1]
+c = re.sub(r"(?<!\S)(?:--resume|-r)(?:=|\s+)[A-Za-z0-9._-]+", "", c)
+c = re.sub(r"(?<!\S)--continue(?!\S)", "", c)
+print(re.sub(r"  +", " ", c))
+PYS
+)"
+fi
+
+claude_ohne_kennung=""
+frisch_laut=""
+if [ "$hid" = claude ]; then
+  pane_pid="$(tmux display -p -t "$pane" '#{pane_pid}' 2>/dev/null || true)"
+  fremd_grund=""
+  if [[ -n "$resume_id" ]]; then
+    besitzer="$(fremde_sitzung "$resume_id" "$pane_pid")"
+    if [[ -n "$besitzer" ]]; then
+      fremd_grund="Kennung ${resume_id} gehoert der lebenden Sitzung PID ${besitzer}"
+      resume_id=""
+    fi
+  fi
+  # GIBT ES DIE UNTERHALTUNG UEBERHAUPT? (14.10.2026, Vorgabe des WorkbenchOrchestrators)
+  # Claude legt das Transkript ~/.claude/projects/<cwd kodiert>/<id>.jsonl erst mit der
+  # ersten Nachricht an. Stirbt ein Pane davor, endet `claude --resume <id>` sofort mit
+  # "No conversation found with session ID" (Status 1, gemessen 14.10. am echten claude)
+  # -- der Pane kaeme tot zurueck. Ohne Transkript im Verzeichnis des Panes (--dir,
+  # Start- oder letzter Pfad) startet er deshalb frisch, laut, mit Quelle und Grund.
+  ohne_transkript=""
+  if [[ -n "$resume_id" ]]; then
+    if ! /usr/bin/python3 - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" "$resume_id" "$cmd" \
+        "$(tmux display -p -t "$pane" '#{pane_start_path}' 2>/dev/null || true)" \
+        "$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true)" <<'PYX'
+import os, re, shlex, sys
+wurzel, kennung, cmd = sys.argv[1:4]
+pfade = [p for p in sys.argv[4:] if p]
+try:
+    toks = shlex.split(cmd)
+    for i, t in enumerate(toks):
+        if t == "--dir" and i + 1 < len(toks):
+            pfade.append(toks[i + 1])
+        elif t.startswith("--dir="):
+            pfade.append(t[6:])
+except ValueError:
+    pass
+kandidaten = set()
+for p in pfade:
+    p = os.path.expanduser(p)
+    for q in (p, os.path.realpath(p)):
+        kandidaten.add(re.sub(r"[^A-Za-z0-9-]", "-", q))
+sys.exit(0 if any(os.path.isfile(os.path.join(wurzel, k, kennung + ".jsonl")) for k in kandidaten) else 1)
+PYX
+    then
+      ohne_transkript="Kennung ${resume_id}${resume_quelle:+ (ueber ${resume_quelle})} hat kein Transkript im Verzeichnis des Panes -- --resume endete sofort mit 'No conversation found'"
+      echo "wb-revive: WARNUNG $pane: ${ohne_transkript}." >&2
+      resume_id=""
+    fi
+  fi
+  cmd_id="$(/usr/bin/python3 - "$cmd" <<'PYI'
+import re, sys
+m = re.search(r"(?<!\S)(?:--resume|-r)(?:=|\s+)['\"]?([A-Za-z0-9._-]+)", sys.argv[1])
+print(m.group(1) if m else "")
+PYI
+)"
+  if [[ -n "$cmd_id" ]]; then
+    besitzer="$(fremde_sitzung "$cmd_id" "$pane_pid")"
+    if [[ -n "$besitzer" ]]; then
+      fremd_grund="${fremd_grund:+$fremd_grund; }--resume ${cmd_id} im Startbefehl gehoert der lebenden Sitzung PID ${besitzer}"
+      cmd="$(/usr/bin/python3 - "$cmd" <<'PYS'
+import re, sys
+c = re.sub(r"(?<!\S)(?:--resume|-r)(?:=|\s+)['\"]?[A-Za-z0-9._-]+['\"]?", "", sys.argv[1])
+print(re.sub(r"  +", " ", c).strip())
+PYS
+)"
+    fi
+  fi
+  if [[ -z "$resume_id" ]]; then
+    claude_ohne_kennung="${fremd_grund:-${ohne_transkript:-keine eigene Kennung (weder @wb_chat_session noch Claude-Register der alten Pane-PID noch Orchestrator-Zustand)}}"
+    [[ -n "$fremd_grund" && -n "$ohne_transkript" ]] && claude_ohne_kennung="${claude_ohne_kennung}; ${ohne_transkript}"
+    [[ -n "$register_grund" ]] && claude_ohne_kennung="${claude_ohne_kennung}; Register: ${register_grund}"
+  fi
+  if [[ -n "$fremd_grund" ]]; then
+    tmux display-message -t "$pane" "wb-revive: fremde Unterhaltung abgelehnt (${fremd_grund})" 2>/dev/null || true
+    echo "wb-revive: WARNUNG $pane: fremde Unterhaltung nicht uebernommen -- ${fremd_grund}." >&2
+  fi
+fi
+
+if [ "$hid" = codex ]; then
+  resume_id="${bound:-}"
+  # The installed registry may still say resume --last. Never use it for a
+  # worker: a known thread gets its exact id; otherwise start without resume.
+  if [ -n "$resume_id" ]; then
+    resume_args="resume $resume_id"
+    resume_why="Codex-Thread am Pane gebunden"
+  else
+    resume_args=""
+    if [ -n "${initial:-}" ] && [ -f "$initial" ]; then
+      resume_why="noch kein Codex-Thread; Erstauftrag wird erneut gestartet"
+    else
+      resume_why="kein Codex-Thread und kein Erstauftrag; frischer Start ohne Auftrag"
+    fi
+  fi
+fi
+
 if [[ -n "$resume_id" && ! "$resume_id" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
   tmux display-message -t "$pane" "wb-revive: unplausible session id, falling back to --continue" 2>/dev/null || true
   resume_id=""
@@ -313,7 +936,7 @@ if [[ "$cmd" == *"--continue"* || "$cmd" == *"--resume"* || "$cmd" == *"--restor
   resume_why="der Startbefehl setzt selbst fort"
 elif [[ -z "$resume_args" ]]; then
   newcmd="$cmd"
-  resume_why="Harness '${hid:-unbekannt}' kennt kein Fortsetzen — der Pane kommt OHNE Unterhaltung zurueck"
+  [ "$hid" = codex ] || resume_why="Harness '${hid:-unbekannt}' kennt kein Fortsetzen — der Pane kommt OHNE Unterhaltung zurueck"
 else
   # {resumeId} aufloesen. Ohne plausible Kennung greift fallbackArgs; gibt es auch das
   # nicht, wird NICHT geraten — dann kommt der Pane leer zurueck und sagt es.
@@ -329,7 +952,12 @@ print(shlex.join(str(a) for a in res) if res else "")
       # $resume_why traegt hier den Grund aus der Kennungssuche, wenn es einen gab.
       kgrund="${resume_why:+ (${resume_why})}"
       behalte_why=1   # der Grund ist die Kennungssuche, nicht das blosse Fortsetzen
-      if [[ -n "$fb" ]]; then
+      if [[ -n "$claude_ohne_kennung" ]]; then
+        # Siehe "KEINE FREMDE LEBENDE UNTERHALTUNG": nicht raten, frisch starten.
+        resume_args=""
+        resume_why="frischer Start ohne Fortsetzen: ${claude_ohne_kennung}"
+        frisch_laut=1
+      elif [[ -n "$fb" ]]; then
         resume_args="$fb"
         resume_why="ohne Sitzungskennung${kgrund}, deshalb ${fb}"
       else
@@ -378,6 +1006,11 @@ PY
 fi
 
 # Sperre zuerst, Lebend-Pruefung darin: siehe die Begruendung im Kopf.
+if [ "$trocken" -eq 1 ]; then
+  printf 'befehl\t%s\ngrund\t%s\nharness\t%s\n' "$newcmd" "$resume_why" "${hid:-}"
+  exit 0
+fi
+
 SPERRE=""
 sperre_frei() { [ -n "$SPERRE" ] && rmdir "$SPERRE" 2>/dev/null; SPERRE=""; }
 SPERRE_MAX_S=120   # aelter heisst: der Halter ist gestorben, die Marke wird uebernommen
@@ -404,9 +1037,24 @@ respawn_sperre() {
   trap sperre_frei EXIT
 }
 
+# LAUT, wenn ein claude-Pane frisch und damit OHNE seine Unterhaltung zurueckkommt
+# (14.10.2026): stderr (wb-autorevive schreibt es ins Log), Statuszeile und eine rote
+# Zeile im Pane selbst. Die Zeile kommt aus einem printf vor dem eigentlichen Befehl;
+# `exec <shell> -c` danach haelt die PID-Kette wie ohne Warnung (die Shell ersetzt sich,
+# der Befehl laeuft wie sonst), damit das Register der naechsten Wiederbelebung wieder
+# unter #{pane_pid} liegt. Gespeichert wird weiter nur das saubere @wb_cmd.
+startcmd="$newcmd"
+if [[ -n "$frisch_laut" ]]; then
+  warnung="WARNUNG wb-revive: ${pane} startet FRISCH, die bisherige Unterhaltung ist NICHT fortgesetzt -- ${claude_ohne_kennung}"
+  echo "wb-revive: ${warnung}" >&2
+  hshell="$(tmux show -gv default-shell 2>/dev/null || true)"
+  [[ -x "$hshell" ]] || hshell=/bin/sh
+  startcmd="printf '\\n\\033[1;37;41m %s \\033[0m\\n\\n' $(printf %q "$warnung"); exec $(printf %q "$hshell") -c $(printf %q "$newcmd")"
+fi
+
 respawn_sperre
 guard_live
-tmux respawn-pane -k -t "$pane" "$newcmd"
+tmux respawn-pane -k -t "$pane" "$startcmd"
 # Re-assert the CLEAN @wb_cmd so the next revive still has a good source
 # (respawn-pane overwrites pane_start_command with the --continue variant).
 tmux set -p -t "$pane" @wb_cmd "$cmd"
@@ -421,5 +1069,9 @@ tmux set -p -t "$pane" @wb_cmd "$cmd"
 # Ein stiller Neuanfang, der aussieht wie eine Wiederbelebung, ist schlechter als ein
 # ehrliches "dieser Harness kann es nicht". Deshalb steht in der Meldung IMMER, was mit
 # der Unterhaltung passiert ist — in der Statuszeile und auf stdout.
-tmux display-message -t "$pane" "wb-revive [${hid:-?}]: ${resume_why}"
+if [[ -n "$frisch_laut" ]]; then
+  tmux display-message -d 15000 -t "$pane" "!!! ${warnung} !!!" 2>/dev/null || tmux display-message -t "$pane" "!!! ${warnung} !!!"
+else
+  tmux display-message -t "$pane" "wb-revive [${hid:-?}]: ${resume_why}"
+fi
 echo "wb-revive: $pane neu gestartet (Harness ${hid:-unbekannt}) — ${resume_why}."

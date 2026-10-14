@@ -1,8 +1,14 @@
 ---
+# Vorlage für einen von Hand kuratierten THEMEN-HUB in 30-topics/<thema>/MOC.md (querliegendes Thema,
+# das kein Projekt ist). Erzeugte Themenseiten (class: derived) schreibt der Gärtner selbst, nie von Hand.
+id: "{{ulid}}"   # ULID, einmal vergeben, nie ändern (Erzeugung: siehe note.md)
+schema: 4
 title: "{{topic}} MOC"
 type: note
-branch: 30-topics/{{topic}}
-permalink: main/30-topics/{{topic}}/moc
+class: knowledge
+created: "{{date}}"
+stand: "{{YYYY-MM}}"
+beleg: berichtet     # gemessen | berichtet
 ---
 
 Für künftige Sessions: <wann dieser Hub relevant ist>. Stand: {{YYYY-MM}}.

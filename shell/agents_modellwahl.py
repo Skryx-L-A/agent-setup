@@ -14,10 +14,43 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
 REGISTRY_VORGABE = Path.home() / ".claude" / "workbench" / "models.json"
+FAMILIEN_FALLBACK = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
+                     "haiku": "claude-haiku-5-5"}
+
+
+def familienmodell(familie: str, registry: Optional[dict[str, Any]], fallback: Optional[str] = None) -> Optional[str]:
+    """Resolve a Claude family alias to its newest enabled numeric version."""
+    if registry is not None:
+        specs = []
+        for harness in registry.get("harnesses", []) if isinstance(registry.get("harnesses"), list) else []:
+            if isinstance(harness, dict) and harness.get("id") == "claude":
+                specs.extend(harness.get("modelFamilyAliases") or [])
+        for spec in specs:
+            if not isinstance(spec, dict) or familie not in (spec.get("aliases") or []):
+                continue
+            try:
+                pattern = re.compile(spec.get("idPattern") or "")
+            except re.error:
+                continue
+            candidates = []
+            for item in registry.get("models", []):
+                if not isinstance(item, dict) or item.get("harness") != "claude" or item.get("enabled") is False:
+                    continue
+                match = pattern.fullmatch(str(item.get("id") or ""))
+                raw = match.groupdict().get("version") if match else None
+                if not raw or not re.fullmatch(r"[0-9]+(?:-[0-9]+)*", raw):
+                    continue
+                candidates.append((tuple(int(part) for part in raw.split("-")), item))
+            if candidates:
+                item = max(candidates, key=lambda candidate: candidate[0])[1]
+                return str(item.get("modelRef") or item.get("id"))
+            break
+    return fallback or FAMILIEN_FALLBACK.get(familie)
 
 
 def ist_fable(name: Any) -> bool:
@@ -69,11 +102,17 @@ def modelle(konfig: dict[str, Any], registry: Optional[dict[str, Any]] = None) -
         if ist_fable(kennung):
             return
         item: dict[str, Any] = {"id": kennung, "harness": harness, "verfuegbar": grund is None}
+        if harness == "codex":
+            item["profilgrenze"] = "nur_launcher"
         if grund is not None:
             item["grund"] = grund
         raus.append(item)
 
     for name, ziel in sorted((konfig.get("modelle") or {}).items()):
+        familie, trennzeichen, stufe = str(name).partition(":")
+        if trennzeichen and ((familie in {"opus", "sonnet"} and stufe in {"low", "medium", "high", "xhigh"})
+                             or (familie == "haiku" and stufe in {"medium", "high", "xhigh"})):
+            continue
         if ist_fable(ziel):
             continue
         grund = None
@@ -86,15 +125,43 @@ def modelle(konfig: dict[str, Any], registry: Optional[dict[str, Any]] = None) -
             elif not _maschine_passt(zeile, host, registry):
                 grund = "nicht_fuer_diese_maschine"
         eintrag(str(name), "claude", grund)
+    family_efforts = {"opus": ("low", "medium", "high", "xhigh"),
+                      "sonnet": ("low", "medium", "high", "xhigh"),
+                      "haiku": ("medium", "high", "xhigh")}
+    configured = konfig.get("modelle") or {}
+    for familie, efforts in family_efforts.items():
+        for effort in efforts:
+            alias = "%s:%s" % (familie, effort)
+            fallback = configured.get(alias) or FAMILIEN_FALLBACK[familie]
+            ziel = familienmodell(familie, registry, fallback)
+            if not ziel:
+                continue
+            grund = None
+            if registry is not None:
+                zeile = _registry_claude(registry, ziel)
+                if zeile is None:
+                    grund = "nicht_in_registry"
+                elif zeile.get("enabled") is False:
+                    grund = "in_registry_abgeschaltet"
+                elif not _maschine_passt(zeile, host, registry):
+                    grund = "nicht_fuer_diese_maschine"
+            item = {"id": alias, "modell": ziel, "harness": "claude", "verfuegbar": grund is None}
+            if grund is not None:
+                item["grund"] = grund
+            raus.append(item)
     pi = konfig.get("pi")
     if isinstance(pi, dict):
         for name in sorted((pi.get("modelle") or {})):
             eintrag(str(name), "pi", None)
     if isinstance(konfig.get("codex"), dict) and registry is not None:
+        from agents_codex import CodexAnmeldung
+        auth = CodexAnmeldung(konfig["codex"]["auth"]).status()
         for item in registry["models"]:
             if isinstance(item, dict) and item.get("harness") == "codex" and isinstance(item.get("id"), str) \
                     and isinstance(item.get("modelRef"), str):
-                grund = "in_registry_abgeschaltet" if item.get("enabled") is False else "codex_nur_trockenlauf"
+                grund = ("in_registry_abgeschaltet" if item.get("enabled") is False else
+                         "nicht_fuer_diese_maschine" if not _maschine_passt(item, host, registry) else
+                         "Anmeldung fehlt" if not auth["available"] else None)
                 eintrag(item["id"], "codex", grund)
     return raus
 
@@ -108,4 +175,4 @@ def welt_modelle(root: str | os.PathLike[str]) -> Optional[list[dict[str, Any]]]
     return modelle(konfig, registry_lesen(konfig))
 
 
-__all__ = ["abo", "ist_fable", "modelle", "registry_lesen", "welt_modelle"]
+__all__ = ["abo", "familienmodell", "ist_fable", "modelle", "registry_lesen", "welt_modelle"]

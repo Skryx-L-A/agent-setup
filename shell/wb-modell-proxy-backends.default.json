@@ -70,6 +70,19 @@
       "healthPath": "/api/tags",
       "ensureTimeoutSeconds": 90,
       "stopTimeoutSeconds": 30
+    },
+    "8001": {
+      "name": "splash",
+      "socketName": "splash",
+      "backendHost": "127.0.0.1",
+      "backendPort": 8000,
+      "ensureCmd": "wb-splash-server ensure",
+      "stopCmd": "wb-splash-server stop",
+      "idleMinutes": 600,
+      "healthPath": "/health",
+      "ensureTimeoutSeconds": 300,
+      "stopTimeoutSeconds": 120,
+      "_warum_lange": "Der Splash-Server wird NICHT vom Proxy weggeraeumt: das macht die Leerlaufwache in wb-splash-server, und die fragt zuerst, ob noch ein Pane davorsitzt. Ein Stopp durch den Proxy wuerde einem offenen Orchestrator mit grossem Fenster den KV-Cache wegnehmen -- der Wiederanlauf kostet dann nicht 20 s, sondern das erneute Vorrechnen des ganzen Verlaufs (gemessen: 191k Token = 958 s). Deshalb hier eine Frist, die im Alltag nie greift (2026-09-21)."
     }
   }
 }

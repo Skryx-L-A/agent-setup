@@ -24,7 +24,7 @@ Four properties this module exists for:
    ever logged, never the matched text.
 3. **Only hunk, today's target text and the citations go out.** Never the
    corpus, never a whole note body that no hunk touches. A target under an
-   excluded branch - `90-secrets/` above all - is refused HERE by `gate_hunk`,
+   excluded branch - `secrets/` above all - is refused HERE by `gate_hunk`,
    using `gardener.config.EXCLUDE_DIRS`. That the corpus loader already keeps
    such a target from ever being routed is true and was the only thing
    standing behind this promise until 2026-08-10; a property this module
@@ -278,7 +278,7 @@ def excluded_branch(rel: str) -> str | None:
     """The excluded top-level branch a target sits in, or None.
 
     `gardener.config.EXCLUDE_DIRS` is the one list for what the vault-reading
-    side must never touch, and `90-secrets` is the entry this is about. The
+    side must never touch, and `secrets` is the entry this is about. The
     corpus loader keeps such a target from ever being routed, so nothing can
     reach this today - but the reviewer's own docstring promises the property,
     and a promise belongs where it is made (reported 2026-08-10).
@@ -1232,8 +1232,8 @@ def run_review(vault: Path, changeset_path: Path, call, *,
     `commit=False` heisst wie bei `apply`: eine Ebene darueber committet schon
     (der Kettenlauf tut das ueber `review.own_paths`), und zwei Commits je Lauf
     waeren Rauschen."""
-    from ..runtime import git_commit as _git_commit
-    git_commit_fn = git_commit_fn or _git_commit
+    from ..runtime import commit_by_repo_single as _commit_by_repo_single
+    git_commit_fn = git_commit_fn or _commit_by_repo_single
     vault = Path(vault)
     run_id, hunks = shadow_mod.load_changeset(Path(changeset_path))
     if limit:

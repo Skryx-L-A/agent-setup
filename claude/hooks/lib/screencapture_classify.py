@@ -123,8 +123,10 @@ def scan(command_text, varmap, depth=0):
                     return r
                 continue
 
-            if name in cs.SHELL_INTERPRETERS and len(remaining) >= 2 and remaining[0] == '-c':
-                inner = remaining[1]
+            # Jede Option vor dem Befehlstext zaehlt (`-lc`, `-ec`, `-x -c`, `--login -c`); bis
+            # 2026-10-11 galt nur ein `-c` an erster Stelle. Ohne -c laeuft die Schleife wie bisher weiter.
+            hat_c, inner = cs.shell_c_script(remaining) if name in cs.SHELL_INTERPRETERS else (False, None)
+            if hat_c and inner:
                 if 'screencapture' not in inner:
                     continue
                 if _unresolvable([inner]):

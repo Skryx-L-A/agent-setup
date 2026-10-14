@@ -6,7 +6,7 @@
 // Platte, `leseSessions` hat sie auch gelesen und richtig als 'stopped'
 // gefuehrt. Nur sah alice sie nicht: `sichtbare()` blendet beendete
 // Sitzungen aus (A12, `showStopped` steht in seiner ui.json auf false), und
-// uebrig blieb genau eine -- Polarschern auf peer, deren tmux den Absturz
+// uebrig blieb genau eine -- ProjectX auf peer, deren tmux den Absturz
 // ueberlebt hatte. Der Fortsetzen-Knopf haengt an derselben Liste, also war
 // auch er weg.
 //

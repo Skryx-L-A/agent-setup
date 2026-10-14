@@ -12,7 +12,7 @@ dieser Anleitung. Bei echter Unklarheit (nicht: fehlende Kreativität) markiere 
 Zeile im Result als offen — nicht raten.
 
 Verboten: `git commit`, `git push`, `git add`. Nur Datei-Operationen im Vault.
-Vault-Root: `~/Knowledge`. Niemals `90-secrets/` lesen, schreiben oder referenzieren.
+Vault-Root: `~/Knowledge`. Niemals `secrets/` lesen, schreiben oder referenzieren.
 
 KEIN Cap: alles Substanzielle aus dem Manifest wird abgearbeitet, keine Auswahl treffen.
 
@@ -23,7 +23,7 @@ Format der Zeile: `<Entity-Name>: <was ist neu>` (+ optional Zielbranch).
 1. Suche eine bestehende Note; ergänze die exakte Suche nur bei unklarem Treffer:
    - `brain search "<Entity-Name> <was ist neu>" -k 5` findet die Note auch dann, wenn sie
      die Entity beschreibt, ohne sie wörtlich zu nennen.
-   - `rg -il "<Entity-Name>" ~/Knowledge --glob '!90-secrets/**'` für die wörtliche Nennung.
+   - `rg -il "<Entity-Name>" ~/Knowledge --glob '!secrets/**'` für die wörtliche Nennung.
    Prüfe auch `aliases:` im Frontmatter der Treffer (Entity-Name kann Alias sein).
 2. **Treffer gefunden** → Note öffnen, **rewrite-over-append**:
    - Bestehenden Fließtext so umschreiben, dass die neue Information eingearbeitet ist.
@@ -33,7 +33,7 @@ Format der Zeile: `<Entity-Name>: <was ist neu>` (+ optional Zielbranch).
    - Frontmatter `type`/`branch` unverändert lassen, außer die Manifest-Zeile nennt
      explizit einen neuen Zielbranch — dann Note per `mv` in den neuen Branch-Ordner
      verschieben und `branch:` im Frontmatter anpassen.
-3. **Kein Treffer** → neue Note aus `~/Knowledge/templates/note.md` anlegen:
+3. **Kein Treffer** → neue Note aus `~/Knowledge/_meta/templates/note.md` anlegen:
    - Zielordner = Zielbranch aus Manifest (`10-global/`, `20-projects/<projekt>/`,
      `30-topics/<topic>/`). Fehlt der Branch im Manifest, nimm den plausibelsten
      bestehenden Projekt-/Topic-Ordner (Namensabgleich); bei echter Unklarheit im
@@ -46,6 +46,9 @@ Format der Zeile: `<Entity-Name>: <was ist neu>` (+ optional Zielbranch).
    aktualisierten) Note ergänzen, falls sie dort noch nicht verlinkt ist. Existiert
    keine MOC für den Branch, Note trotzdem anlegen/updaten, MOC-Verlinkung im
    Result als offen vermerken.
+5. **Entscheidung oder wiederholbarer Fehler eines Projekts** → zusätzlich eine Zeile in
+   `20-projects/<p>/KERN.md` („Gilt" bzw. „Nie wieder", mit Wikilink auf die Note);
+   abgelöste KERN-Zeilen streichen. Format und Grenze (~3.000 Zeichen): `~/Knowledge/AGENTS.md`.
 
 ## 2. Pro File-Zeile
 

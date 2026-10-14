@@ -435,14 +435,15 @@ export function initFreigabenView(): void {
     // Der Pfad des Antrags ist hier die stabile Kennung -- ueber ihn wird auch
     // entschieden. Die Begruendung ist freiwillig (19.08.), wie beim Block.
     feldBinden(eingabe, ergebnis, r.path);
-    const entscheiden = (aktion: 'approve' | 'reject'): void => {
+    // `echt` ist `isTrusted` des Klicks: nur ein wirklicher Klick nimmt an (13.10.2026).
+    const entscheiden = (aktion: 'approve' | 'reject', echt: boolean): void => {
       const grund = eingabe.value.trim();
-      window.awbBridge.bedienung('freigaben-entscheiden', { path: r.path, action: aktion, reason: grund });
+      window.awbBridge.bedienung('freigaben-entscheiden', { path: r.path, action: aktion, reason: grund, echt });
       ergebnisSetzen(ergebnis, r.path,
         aktion === 'approve' ? t('panel.freigaben.angenommenLaedt') : t('panel.freigaben.abgelehntLaedt'));
     };
-    el.querySelector('.fg-btn-an')!.addEventListener('click', () => entscheiden('approve'));
-    el.querySelector('.fg-btn-ab')!.addEventListener('click', () => entscheiden('reject'));
+    el.querySelector('.fg-btn-an')!.addEventListener('click', (e) => entscheiden('approve', e.isTrusted));
+    el.querySelector('.fg-btn-ab')!.addEventListener('click', (e) => entscheiden('reject', e.isTrusted));
     return el;
   }
 

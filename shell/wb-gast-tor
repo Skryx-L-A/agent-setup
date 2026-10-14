@@ -1,0 +1,898 @@
+#!/usr/bin/env python3
+# wb-gast-tor — Zwangsbefehl fuer einen Gast-Schluessel im authorized_keys des Werkbank-Kontos.
+#
+#   authorized_keys (eine Zeile, Beispiel):
+#     restrict,pty,command="/usr/local/bin/wb-gast-tor --person ein mitnutzer --projekt /home/<user>/AI/a machine-bound project" ssh-ed25519 AAAA... ein mitnutzer
+#
+# Der Gast bekommt KEINE Shell. sshd startet immer dieses Skript; was der Gast verlangt hat,
+# steht in $SSH_ORIGINAL_COMMAND und wird hier gegen eine feste Liste geprueft:
+#
+#   liste [--json]                      Sitzungen und Panes, die der Gast sehen darf
+#   anhaengen <sitzung> [<pane>]        Sitzung ansehen und in EINEN Pane schreiben (braucht ssh -t)
+#   schreiben <sitzung|pane> <text>     Text + Enter in einen Pane (ohne Terminal, fuer Skripte)
+#   vorschau <sitzung> [<pane>] [--zeilen N] [--json]
+#                                       NUR LESEN: der sichtbare Schirm eines Panes als reiner Text
+#                                       (capture-pane ohne Farben, Steuerzeichen entfernt, Groesse
+#                                       begrenzt); mit --json und ohne Pane alle Panes der Sitzung --
+#                                       fuer die Kacheln der Werkbank-App
+#   neu [<projekt>] [--harness H] [--model M] [--effort E] [--name N]
+#                                       neue Sitzung ueber wb-code, markiert mit WB_PERSON
+#   schliessen <sitzung> [--endgueltig] eine SELBST gestartete Sitzung schliessen (wb-session-close),
+#                                       mit --endgueltig auch aus der Sitzungsliste (wb-session-delete)
+#   git-upload-pack <repo>              Klon/fetch eines freigegebenen Projekts
+#   git-receive-pack <repo>             Push, nur Zweige <person>/* (eigener pre-receive-Hook)
+#   hilfe
+#
+# WELCHE SITZUNGEN DER GAST SIEHT: eine Sitzung, deren Startordner (#{session_path}) in einem
+# freigegebenen Projektordner liegt (--projekt, mehrfach moeglich), oder die er selbst ueber
+# `neu` gestartet hat (Sitzungsoption @wb_person). Alles andere -- Vault-Sitzungen, `main`,
+# `wb-orch` -- existiert fuer ihn nicht, auch nicht in Fehlermeldungen.
+#
+# WARUM DAS ANHAENGEN KEIN `tmux attach` IST. Ein gewoehnlicher tmux-Client ist eine Shell mit
+# Umweg: Prefix + `:` oeffnet die Befehlszeile, dort laeuft `run-shell` oder `new-window`.
+# Das Tor trennt deshalb Sehen und Schreiben:
+#   * SEHEN: ein tmux-Client im Modus read-only an einer eigenen, gruppierten Sicht-Sitzung.
+#     Diese Sicht bekommt `prefix None`, `prefix2 None`, `key-table` auf eine leere Tabelle
+#     und `mouse off` -- Sitzungsoptionen NUR der Sicht, Sitzungen des Nutzers und seine
+#     tmux-Konfiguration bleiben unberuehrt. Tasten des Gastes erreichen diesen Client nie;
+#     er bekommt nur Antworten des Terminals auf seine eigenen Anfragen (Farben, Geraeteattribute).
+#   * SCHREIBEN: die Tasten gehen roh per `load-buffer` + `paste-buffer -r` in genau den einen
+#     gewaehlten Pane. Das geht an allen tmux-Tastenbelegungen vorbei. Laeuft in dem Pane eine
+#     Shell, ein Editor oder ein anderes Programm mit eigener Shell-Escape-Taste, verweigert das
+#     Tor die Eingabe (siehe VERBOTENE_PROGRAMME).
+#   Ctrl-] trennt.
+#
+# WAS DAS TOR NICHT VERHINDERN KANN (steht so auch im Ergebnis des Auftrags): im Pane laeuft ein
+# Agent als dieses Konto. Was der Gast dem Agenten auftraegt (`!`-Befehle in Claude Code,
+# "lies Datei X"), fuehrt der Agent mit allen Rechten des Kontos aus. Die Markierung WB_PERSON
+# sagt dem Agenten, wer vor ihm sitzt; sie ist eine Anweisung, keine Rechtegrenze.
+#
+# Jede Nutzung landet als JSON-Zeile in ~/.local/state/wb-gast-tor/<person>.log.
+# Die Konfiguration steht ausschliesslich in der command=-Zeile: der Gast kann weder Argumente
+# noch Umgebungsvariablen setzen (restrict, PermitUserEnvironment no).
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import re
+import secrets
+import select
+import shlex
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+SHELLS = {'bash', 'sh', 'zsh', 'fish', 'dash', 'ksh', 'tcsh', 'csh', 'nu', 'xonsh', 'elvish'}
+# Programme, aus denen ein Tastendruck eine Shell oeffnet. Kein Vollstaendigkeitsanspruch --
+# gegen einen Agenten, der auf Zuruf Befehle ausfuehrt, hilft ohnehin keine Liste (Kopf).
+VERBOTENE_PROGRAMME = SHELLS | {
+    'vi', 'vim', 'nvim', 'view', 'emacs', 'nano', 'less', 'more', 'most', 'man', 'python',
+    'python3', 'ipython', 'perl', 'ruby', 'irb', 'lua', 'ssh', 'sudo', 'su', 'doas', 'tmux',
+    'screen', 'yazi', 'ranger', 'mc', 'lf', 'nnn', 'htop', 'top', 'btop', 'git', 'gdb', 'watch',
+}
+LEERE_TASTENTABELLE = 'wb-gast-leer'
+TRENNTASTE = 0x1d  # Ctrl-]
+
+NAME_RE = re.compile(r'^[A-Za-z0-9_.:=+-]{1,120}$')
+PANE_RE = re.compile(r'^%[0-9]{1,6}$')
+HARNESS_RE = re.compile(r'^[a-z0-9._-]{1,40}$')
+MODEL_RE = re.compile(r'^[A-Za-z0-9._:/@+-]{1,80}$')
+EFFORT_RE = re.compile(r'^[a-z]{1,12}$')
+ANZEIGENAME_RE = re.compile(r'^[\w .,:()/+-]{1,60}$')
+# Grenzen der Vorschau: so viele Zeilen je Pane, so viele Zeichen je Zeile, so viele Panes je Aufruf.
+VORSCHAU_ZEILEN_VORGABE = 60
+VORSCHAU_ZEILEN_MAX = 200
+VORSCHAU_BREITE_MAX = 400
+VORSCHAU_PANES_MAX = 16
+# Alles unter 0x20 ausser Tabulator, dazu DEL und die C1-Steuerzeichen: nichts davon darf als
+# Terminalbefehl beim Gast ankommen (capture-pane ohne -e liefert ohnehin keine Farbfolgen).
+VORSCHAU_STEUERZEICHEN = re.compile('[\x00-\x08\x0a-\x1f\x7f-\x9f]')
+
+
+class Abgelehnt(Exception):
+    pass
+
+
+def jetzt():
+    return datetime.datetime.now().astimezone().isoformat(timespec='seconds')
+
+
+class Tor:
+    def __init__(self, person, projekte, home, log_datei, tmux_bin, wb_bin, hook_dir, env_basis):
+        self.person = person
+        self.projekte = [os.path.realpath(p) for p in projekte]
+        self.home = home
+        self.log_datei = log_datei
+        self.tmux_bin = tmux_bin
+        self.wb_bin = wb_bin
+        self.hook_dir = hook_dir
+        self.env = env_basis
+        self.push_praefix = f'refs/heads/{person}/'
+
+    # ------------------------------------------------------------------ Protokoll
+    def log(self, aktion, **felder):
+        zeile = {
+            'zeit': jetzt(), 'person': self.person, 'aktion': aktion,
+            'von': (os.environ.get('SSH_CLIENT', '').split() or [''])[0],
+        }
+        zeile.update(felder)
+        try:
+            os.makedirs(os.path.dirname(self.log_datei), mode=0o700, exist_ok=True)
+            fd = os.open(self.log_datei, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(zeile, ensure_ascii=False) + '\n')
+        except OSError as e:
+            print(f'wb-gast-tor: Protokoll nicht schreibbar ({e}) -- Aufruf abgelehnt.', file=sys.stderr)
+            raise SystemExit(70)
+
+    # ---------------------------------------------------------------------- tmux
+    def tmux(self, *args, eingabe=None, pruefen=True):
+        r = subprocess.run([self.tmux_bin, *args], input=eingabe, capture_output=True,
+                           env=self.env, timeout=10)
+        if pruefen and r.returncode != 0:
+            raise Abgelehnt(f'tmux {args[0]} fehlgeschlagen: {r.stderr.decode(errors="replace").strip()}')
+        return r.stdout.decode(errors='replace')
+
+    def im_projekt(self, pfad):
+        if not pfad:
+            return False
+        echt = os.path.realpath(pfad)
+        return any(echt == p or echt.startswith(p + os.sep) for p in self.projekte)
+
+    def sitzungen(self):
+        """Alle Basis-Sitzungen, die der Gast sehen darf (Sichten und Gruppen-Schwestern nicht)."""
+        fmt = '\t'.join(['#{session_name}', '#{session_path}', '#{session_group}', '#{@wb_person}',
+                         '#{session_attached}', '#{session_created}', '#{session_windows}'])
+        roh = self.tmux('list-sessions', '-F', fmt, pruefen=False)
+        out = []
+        for zeile in roh.splitlines():
+            teile = zeile.split('\t')
+            if len(teile) != 7:
+                continue
+            name, pfad, gruppe, person, angehaengt, erstellt, fenster = teile
+            if name.endswith('-view') or (gruppe and gruppe != name):
+                continue
+            eigene = person == self.person
+            if not (eigene or self.im_projekt(pfad)):
+                continue
+            out.append({'sitzung': name, 'ordner': pfad, 'gast': eigene,
+                        'angehaengt': int(angehaengt or 0), 'erstellt': int(erstellt or 0),
+                        'fenster': int(fenster or 0)})
+        return out
+
+    def panes(self, sitzung):
+        fmt = '\t'.join(['#{pane_id}', '#{window_id}', '#{window_index}', '#{pane_index}',
+                         '#{@wb_role}', '#{pane_title}', '#{pane_current_command}', '#{pane_dead}',
+                         '#{pane_active}', '#{window_active}'])
+        roh = self.tmux('list-panes', '-s', '-t', f'={sitzung}', '-F', fmt, pruefen=False)
+        out = []
+        for zeile in roh.splitlines():
+            t = zeile.split('\t')
+            if len(t) != 10:
+                continue
+            out.append({'pane': t[0], 'fenster_id': t[1], 'fenster': int(t[2] or 0), 'index': int(t[3] or 0),
+                        'rolle': t[4], 'titel': t[5], 'programm': t[6], 'tot': t[7] == '1',
+                        'aktiv': t[8] == '1' and t[9] == '1'})
+        return out
+
+    def erlaubte_sitzung(self, name):
+        if not NAME_RE.match(name or ''):
+            raise Abgelehnt('Diese Sitzung gibt es nicht oder sie ist nicht freigegeben.')
+        for s in self.sitzungen():
+            if s['sitzung'] == name:
+                return s
+        raise Abgelehnt('Diese Sitzung gibt es nicht oder sie ist nicht freigegeben.')
+
+    def ziel_pane(self, sitzung, pane=None):
+        panes = [p for p in self.panes(sitzung) if not p['tot']]
+        if pane:
+            if not PANE_RE.match(pane):
+                raise Abgelehnt(f'"{pane}" ist keine Pane-Kennung (Form %12).')
+            for p in panes:
+                if p['pane'] == pane:
+                    return p
+            raise Abgelehnt(f'Pane {pane} gehoert nicht zu {sitzung}.')
+        for p in panes:
+            if p['rolle'] == 'orchestrator':
+                return p
+        for p in panes:
+            if p['aktiv']:
+                return p
+        if panes:
+            return panes[0]
+        raise Abgelehnt(f'{sitzung} hat keinen lebenden Pane.')
+
+    def eingabe_erlaubt(self, pane_id):
+        roh = self.tmux('display-message', '-p', '-t', pane_id, '#{pane_current_command}\t#{pane_dead}',
+                        pruefen=False).strip()
+        if not roh:
+            return False, 'Der Pane existiert nicht mehr.'
+        programm, _, tot = roh.partition('\t')
+        if tot == '1':
+            return False, 'Der Pane ist beendet.'
+        if os.path.basename(programm).lower() in VERBOTENE_PROGRAMME:
+            return False, f'Im Pane laeuft "{programm}" -- dorthin schreibt das Tor nicht.'
+        return True, ''
+
+    def frei(self, pane_id):
+        """`schreiben` schickt Text UND Enter, ohne dass der Gast den Schirm sieht. In eine
+        offene Frage oder Rechteabfrage waehlte dieses Enter die markierte Option (Vorfall
+        09.10.2026). Dieselbe Pruefung wie ueberall: `wb-pane-write frei`; unklar = nein.
+        `anhaengen` bleibt ungeprueft -- dort tippt der Gast selbst und sieht den Schirm."""
+        # Fundort: neben dem Tor selbst, dann im Werkzeugordner (--wb-bin, gesetzt vom
+        # Betreiber, nicht vom Gast), dann ~/.local/bin. Keine Umgebungsvariable: der Gast
+        # darf sich die Pruefung nicht aussuchen. Fehlt sie ueberall: nicht frei.
+        orte = [os.path.dirname(os.path.realpath(__file__)), self.wb_bin,
+                os.path.join(os.path.expanduser('~'), '.local', 'bin')]
+        pw = next((p for p in (os.path.join(o, 'wb-pane-write') for o in orte if o)
+                   if os.path.isfile(p) and os.access(p, os.X_OK)), None)
+        if not pw:
+            return False, 'wb-pane-write fehlt -- ob der Pane frei ist, laesst sich nicht pruefen.'
+        try:
+            r = subprocess.run([pw, 'frei', pane_id], capture_output=True, env=self.env, timeout=20)
+        except Exception:
+            return False, 'Pruefung, ob der Pane frei ist, ohne Antwort.'
+        if r.returncode == 0:
+            return True, ''
+        grund = r.stdout.decode(errors='replace').strip() or f'Pruefung rc {r.returncode}'
+        return False, f'Pane {pane_id} ist nicht frei ({grund}) -- nichts geschrieben.'
+
+    def roh_schreiben(self, pane_id, daten):
+        puffer = f'wb-gast-{os.getpid()}'
+        self.tmux('load-buffer', '-b', puffer, '-', ';', 'paste-buffer', '-d', '-r', '-b', puffer,
+                  '-t', pane_id, eingabe=daten)
+
+    # ---------------------------------------------------------------- Befehle
+    def cmd_hilfe(self, _args):
+        print(__doc_hilfe__.replace('<person>', self.person))
+        return 0
+
+    def cmd_liste(self, args):
+        als_json = '--json' in args
+        if [a for a in args if a != '--json']:
+            raise Abgelehnt('liste kennt nur --json.')
+        daten = []
+        for s in self.sitzungen():
+            s = dict(s)
+            s['panes'] = [{k: p[k] for k in ('pane', 'fenster', 'rolle', 'titel', 'programm', 'tot')}
+                          for p in self.panes(s['sitzung'])]
+            daten.append(s)
+        self.log('liste', anzahl=len(daten))
+        if als_json:
+            print(json.dumps({'person': self.person, 'projekte': self.projekte, 'sitzungen': daten},
+                             ensure_ascii=False))
+            return 0
+        if not daten:
+            print('Keine freigegebenen Sitzungen.')
+        for s in daten:
+            marke = ' [eigene]' if s['gast'] else ''
+            print(f"{s['sitzung']}{marke}  ({s['ordner']}, {s['angehaengt']} angehaengt)")
+            for p in s['panes']:
+                zustand = 'beendet' if p['tot'] else p['programm']
+                print(f"   {p['pane']:>5}  {p['rolle'] or '-':<12} {zustand:<14} {p['titel']}")
+        return 0
+
+    def cmd_schreiben(self, args):
+        if len(args) < 2:
+            raise Abgelehnt('schreiben <sitzung|pane> <text>')
+        ziel, text = args[0], ' '.join(args[1:])
+        if PANE_RE.match(ziel):
+            sitzung = None
+            for s in self.sitzungen():
+                if any(p['pane'] == ziel for p in self.panes(s['sitzung'])):
+                    sitzung = s['sitzung']
+                    break
+            if not sitzung:
+                raise Abgelehnt(f'Pane {ziel} liegt in keiner freigegebenen Sitzung.')
+            pane = self.ziel_pane(sitzung, ziel)
+        else:
+            sitzung = self.erlaubte_sitzung(ziel)['sitzung']
+            pane = self.ziel_pane(sitzung)
+        ok, grund = self.eingabe_erlaubt(pane['pane'])
+        if not ok:
+            raise Abgelehnt(grund)
+        ok, grund = self.frei(pane['pane'])
+        if not ok:
+            raise Abgelehnt(grund)
+        self.roh_schreiben(pane['pane'], text.encode())
+        time.sleep(0.3)
+        self.roh_schreiben(pane['pane'], b'\r')
+        self.log('schreiben', sitzung=sitzung, pane=pane['pane'], zeichen=len(text))
+        print(f'{len(text)} Zeichen an {sitzung} {pane["pane"]}.')
+        return 0
+
+    def cmd_vorschau(self, args):
+        """Nur lesen: der sichtbare Schirm freigegebener Panes, ohne Farben und Steuerzeichen."""
+        p = argparse.ArgumentParser(prog='vorschau', add_help=False)
+        p.add_argument('sitzung')
+        p.add_argument('pane', nargs='?')
+        p.add_argument('--zeilen', default=str(VORSCHAU_ZEILEN_VORGABE))
+        p.add_argument('--json', action='store_true')
+        try:
+            a = p.parse_args(args)
+        except SystemExit:
+            raise Abgelehnt('vorschau <sitzung> [<pane>] [--zeilen N] [--json]')
+        if not re.fullmatch(r'[0-9]{1,4}', a.zeilen) or int(a.zeilen) < 1:
+            raise Abgelehnt('--zeilen braucht eine Zahl ab 1.')
+        zeilen = min(int(a.zeilen), VORSCHAU_ZEILEN_MAX)
+        sitzung = self.erlaubte_sitzung(a.sitzung)['sitzung']
+        if a.pane:
+            ziele = [self.ziel_pane(sitzung, a.pane)]
+        elif a.json:
+            ziele = [x for x in self.panes(sitzung) if not x['tot']][:VORSCHAU_PANES_MAX]
+        else:
+            ziele = [self.ziel_pane(sitzung)]
+        daten = []
+        for z in ziele:
+            groesse = self.tmux('display-message', '-p', '-t', z['pane'], '#{pane_width}\t#{pane_height}',
+                                pruefen=False).strip().split('\t')
+            roh = self.tmux('capture-pane', '-p', '-t', z['pane'], pruefen=False)
+            text = [VORSCHAU_STEUERZEICHEN.sub('', r)[:VORSCHAU_BREITE_MAX] for r in roh.split('\n')]
+            # Leere Zeilen unter dem letzten Inhalt zaehlen nicht: `--zeilen N` meint die letzten N
+            # Zeilen MIT Inhalt, sonst zeigte eine kleine Kachel eines kaum beschriebenen Panes nichts.
+            while text and not text[-1].strip():
+                text.pop()
+            daten.append({'pane': z['pane'], 'rolle': z['rolle'], 'programm': z['programm'],
+                          'breite': int(groesse[0]) if groesse[0].isdigit() else 0,
+                          'hoehe': int(groesse[-1]) if groesse[-1].isdigit() else 0,
+                          'text': '\n'.join(text[-zeilen:])})
+        self.log('vorschau', sitzung=sitzung, panes=[d['pane'] for d in daten], zeilen=zeilen)
+        if a.json:
+            print(json.dumps({'sitzung': sitzung, 'panes': daten}, ensure_ascii=False))
+        else:
+            print(daten[0]['text'] if daten else '')
+        return 0
+
+    def cmd_neu(self, args):
+        p = argparse.ArgumentParser(prog='neu', add_help=False)
+        p.add_argument('projekt', nargs='?')
+        p.add_argument('--harness')
+        p.add_argument('--model')
+        p.add_argument('--effort')
+        p.add_argument('--name')
+        try:
+            a = p.parse_args(args)
+        except SystemExit:
+            raise Abgelehnt('neu [<projekt>] [--harness H] [--model M] [--effort E] [--name N]')
+        ordner = self.projekt_ordner(a.projekt)
+        wb_args = [ordner]
+        for wert, schalter, muster in ((a.harness, '--harness', HARNESS_RE), (a.model, '--model', MODEL_RE),
+                                       (a.effort, '--effort', EFFORT_RE), (a.name, '--name', ANZEIGENAME_RE)):
+            if wert is None:
+                continue
+            if not muster.match(wert):
+                raise Abgelehnt(f'{schalter}: unzulaessiger Wert.')
+            wb_args += [schalter, wert]
+        # sessionKey im Werkbank-Format (6 Hex-Zeichen, sonst verweigern wb-session-delete und
+        # die Oberflaeche die Sitzung); wem sie gehoert, sagen @wb_person und WB_PERSON.
+        schluessel = secrets.token_hex(3)
+        wb_args += ['--key', schluessel]
+        if a.name is None:
+            wb_args += ['--name', f'{self.person} {schluessel}']
+        # Ohne eigenen Schluessel nimmt wb-code die Standard-Sitzung des Ordners -- die des
+        # Kontoinhabers. Der Schluessel oben verhindert, dass `neu` je an eine fremde Sitzung haengt.
+        self.update_environment_sichern()
+        env = dict(self.env, WB_PERSON=self.person)
+        env.pop('TMUX', None)
+        env.pop('TMUX_PANE', None)
+        r = subprocess.run([os.path.join(self.wb_bin, 'wb-code'), *wb_args], stdin=subprocess.DEVNULL,
+                           capture_output=True, env=env, cwd=ordner, timeout=180, start_new_session=True)
+        fehler = r.stderr.decode(errors='replace')
+        m = re.search(r'SITZUNG-STEHT (\S+)', fehler)
+        if not m:
+            self.log('neu', ergebnis='fehlgeschlagen', projekt=ordner, rc=r.returncode)
+            letzte = [z for z in fehler.splitlines() if z.strip()][-3:]
+            raise Abgelehnt('wb-code hat keine Sitzung gemeldet: ' + ' | '.join(letzte))
+        sitzung = m.group(1)
+        self.tmux('set-option', '-t', f'={sitzung}:', '@wb_person', self.person)
+        self.tmux('set-environment', '-t', f'={sitzung}', 'WB_PERSON', self.person)
+        self.log('neu', ergebnis='ok', projekt=ordner, sitzung=sitzung,
+                 harness=a.harness or '', model=a.model or '', effort=a.effort or '')
+        print(sitzung)
+        return 0
+
+    def update_environment_sichern(self):
+        """WB_PERSON in die Liste der Variablen, die tmux beim Anlegen einer Sitzung vom
+        startenden Client uebernimmt. Nur so hat schon der ERSTE Prozess der neuen Sitzung
+        (der Agent) die Markierung -- setzte das Tor sie erst hinterher, liefe der
+        SessionStart-Hook des Agenten womoeglich schon ohne sie. Fuer Sitzungen des
+        Kontoinhabers aendert das nichts: sein Client hat kein WB_PERSON."""
+        liste = self.tmux('show-options', '-gv', 'update-environment', pruefen=False).split()
+        if 'WB_PERSON' not in liste:
+            self.tmux('set-option', '-ga', 'update-environment', 'WB_PERSON')
+
+    def projekt_ordner(self, angabe):
+        if not self.projekte:
+            raise Abgelehnt('Fuer diesen Gast ist kein Projekt freigegeben.')
+        if not angabe:
+            return self.projekte[0]
+        for p in self.projekte:
+            if angabe in (p, os.path.basename(p)) or os.path.realpath(os.path.expanduser(angabe)) == p:
+                return p
+        raise Abgelehnt(f'Projekt "{angabe}" ist nicht freigegeben. Frei: '
+                        + ', '.join(os.path.basename(p) for p in self.projekte))
+
+    def cmd_schliessen(self, args):
+        endgueltig = '--endgueltig' in args
+        args = [x for x in args if x != '--endgueltig']
+        if len(args) != 1:
+            raise Abgelehnt('schliessen <sitzung> [--endgueltig]')
+        s = self.erlaubte_sitzung(args[0])
+        if not s['gast']:
+            raise Abgelehnt('Schliessen darf der Gast nur Sitzungen, die er selbst gestartet hat.')
+        if endgueltig:
+            # Schliessen UND aus der Sitzungsliste des Kontos nehmen (Zustandsdatei, Verlauf),
+            # ueber dasselbe Werkzeug wie der Loeschknopf der Werkbank, mit dessen Sicherung.
+            schluessel = s['sitzung'].rsplit('-', 1)[-1]
+            if not re.fullmatch(r'[0-9a-f]{6}', schluessel):
+                raise Abgelehnt('Diese Sitzung hat keinen loeschbaren Schluessel.')
+            befehl = [os.path.join(self.wb_bin, 'wb-session-delete'), '--dir', s['ordner'], '--key', schluessel,
+                      '--yes', '--force']
+        else:
+            befehl = [os.path.join(self.wb_bin, 'wb-session-close'), '--with-workers', s['sitzung']]
+        r = subprocess.run(befehl, stdin=subprocess.DEVNULL, capture_output=True, env=self.env, timeout=60)
+        self.log('schliessen', sitzung=s['sitzung'], endgueltig=endgueltig, rc=r.returncode)
+        sys.stdout.write(r.stdout.decode(errors='replace'))
+        sys.stderr.write(r.stderr.decode(errors='replace'))
+        return r.returncode
+
+    # ------------------------------------------------------------------ git
+    def repo_pfad(self, angabe):
+        if not angabe:
+            raise Abgelehnt('Repository fehlt.')
+        pfad = angabe
+        if pfad.startswith('~/'):
+            pfad = os.path.join(self.home, pfad[2:])
+        elif not pfad.startswith('/'):
+            pfad = os.path.join(self.home, pfad)
+        pfad = pfad.rstrip('/')
+        if pfad.endswith('/.git'):
+            pfad = pfad[:-5]
+        echt = os.path.realpath(pfad)
+        if echt not in self.projekte:
+            raise Abgelehnt('Dieses Repository ist nicht freigegeben.')
+        return echt
+
+    def cmd_upload_pack(self, args):
+        if len(args) != 1:
+            raise Abgelehnt('git-upload-pack <repo>')
+        repo = self.repo_pfad(args[0])
+        self.log('git-upload-pack', repo=repo)
+        env = dict(self.env)
+        if os.environ.get('GIT_PROTOCOL'):
+            env['GIT_PROTOCOL'] = os.environ['GIT_PROTOCOL']
+        os.execvpe('git', ['git', '-c', 'uploadpack.allowAnySHA1InWant=false', 'upload-pack', repo], env)
+
+    def cmd_receive_pack(self, args):
+        if len(args) != 1:
+            raise Abgelehnt('git-receive-pack <repo>')
+        repo = self.repo_pfad(args[0])
+        hook = os.path.join(self.hook_dir or '', 'pre-receive')
+        # Ein nicht ausfuehrbarer Hook wird von git STILL uebergangen -- dann waere jeder Zweig offen.
+        if not self.hook_dir or not os.path.isfile(hook) or not os.access(hook, os.X_OK):
+            raise Abgelehnt('Push ist nicht eingerichtet (Hook fehlt).')
+        self.log('git-receive-pack', repo=repo)
+        env = dict(self.env, WB_GAST_PERSON=self.person, WB_GAST_LOG=self.log_datei)
+        if os.environ.get('GIT_PROTOCOL'):
+            env['GIT_PROTOCOL'] = os.environ['GIT_PROTOCOL']
+        # core.hooksPath per -c: fuer diesen einen Aufruf gilt NUR der Gast-Hook, das Repo und
+        # seine eigenen Hooks bleiben unveraendert.
+        # updateInstead: ein ausdruecklicher Direkt-Push auf den ausgecheckten main (Push-Option
+        # `direkt`, der Nutzer 27.09.2026) aktualisiert den Arbeitsbaum nur, wenn dort nichts
+        # Ungesichertes liegt; sonst lehnt git ab. Ob main ueberhaupt erlaubt ist, entscheidet der Hook.
+        os.execvpe('git', ['git', '-c', f'core.hooksPath={self.hook_dir}', '-c', 'receive.fsckObjects=true',
+                           '-c', 'receive.denyCurrentBranch=updateInstead', '-c', 'receive.denyDeleteCurrent=refuse',
+                           '-c', 'receive.advertisePushOptions=true',
+                           'receive-pack', repo], env)
+
+    # --------------------------------------------------------------- anhaengen
+    def cmd_anhaengen(self, args):
+        if not 1 <= len(args) <= 2:
+            raise Abgelehnt('anhaengen <sitzung> [<pane>]')
+        s = self.erlaubte_sitzung(args[0])
+        if not (os.isatty(0) and os.isatty(1)):
+            raise Abgelehnt('anhaengen braucht ein Terminal: ssh -t ... anhaengen <sitzung>')
+        pane = self.ziel_pane(s['sitzung'], args[1] if len(args) == 2 else None)
+        ok, grund = self.eingabe_erlaubt(pane['pane'])
+        if not ok:
+            raise Abgelehnt(grund)
+        sicht = f'gast-{self.person}-{os.getpid()}-view'
+        self.tmux('new-session', '-d', '-t', f'={s["sitzung"]}', '-s', sicht)
+        try:
+            # detach-on-destroy ZUERST: auf peer steht es global auf off. Verschwaende die Sicht
+            # (Basis geschlossen, letztes Fenster zu), wanderte der Client sonst in IRGENDEINE
+            # andere Sitzung des Servers -- auch in eine, die der Gast nie sehen darf.
+            for opt, wert in (('detach-on-destroy', 'on'), ('prefix', 'None'), ('prefix2', 'None'),
+                              ('key-table', LEERE_TASTENTABELLE), ('mouse', 'off'), ('status', 'on'),
+                              ('status-right', f' Gast {self.person}: Eingabe an {pane["pane"].replace("%", "%%")} | Ctrl-] trennt '),
+                              ('status-right-length', '80')):
+                self.tmux('set-option', '-t', f'={sicht}:', opt, wert)
+            self.tmux('select-window', '-t', f'={sicht}:{pane["fenster_id"]}', pruefen=False)
+            self.log('anhaengen', sitzung=s['sitzung'], pane=pane['pane'])
+            ergebnis = Relay(self, sicht, pane['pane']).laufen()
+            self.log('getrennt', sitzung=s['sitzung'], pane=pane['pane'], grund=ergebnis)
+            print(f'\r\nwb-gast-tor: getrennt ({ergebnis}).\r')
+        finally:
+            self.tmux('kill-session', '-t', f'={sicht}', pruefen=False)
+        return 0
+
+
+class Relay:
+    """Sehen ueber einen read-only-Client in einem eigenen pty, Schreiben roh in einen Pane."""
+
+    def __init__(self, tor, sicht, pane_id):
+        self.tor = tor
+        self.sicht = sicht
+        self.pane = pane_id
+        self.letzte_pruefung = 0.0
+
+    def fenstergroesse(self, fd):
+        try:
+            return fcntl.ioctl(fd, termios.TIOCGWINSZ, b'\0' * 8)
+        except OSError:
+            return struct.pack('HHHH', 24, 80, 0, 0)
+
+    def laufen(self):
+        import pty
+        groesse = self.fenstergroesse(0)
+        pid, master = pty.fork()
+        if pid == 0:
+            fcntl.ioctl(0, termios.TIOCSWINSZ, groesse)
+            env = dict(self.tor.env)
+            env['TERM'] = os.environ.get('TERM', 'xterm-256color')
+            os.execvpe(self.tor.tmux_bin, [self.tor.tmux_bin, 'attach-session', '-f', 'read-only,ignore-size',
+                                           '-t', f'={self.sicht}'], env)
+        fcntl.ioctl(master, termios.TIOCSWINSZ, groesse)
+
+        def groesse_folgen(*_):
+            try:
+                fcntl.ioctl(master, termios.TIOCSWINSZ, self.fenstergroesse(0))
+                os.kill(pid, signal.SIGWINCH)
+            except OSError:
+                pass
+
+        signal.signal(signal.SIGWINCH, groesse_folgen)
+        alt = termios.tcgetattr(0)
+        tty.setraw(0)
+        grund = 'Client beendet'
+        rest = b''
+        angehaengt = False
+
+        def verbindung_weg(*_):
+            raise Abgelehnt('Verbindung beendet')
+
+        signal.signal(signal.SIGHUP, verbindung_weg)
+        signal.signal(signal.SIGTERM, verbindung_weg)
+        try:
+            while True:
+                bereit, _, _ = select.select([0, master], [], [], 0.05 if rest else 1.0)
+                if master in bereit:
+                    try:
+                        daten = os.read(master, 65536)
+                    except OSError:
+                        daten = b''
+                    if not daten:
+                        break
+                    os.write(1, daten)
+                    if not angehaengt:
+                        # Erst JETZT haengt der Client: vorher haette tmux die Sicht sofort
+                        # wieder abgeraeumt. Danach verschwindet sie auch dann von selbst,
+                        # wenn dieses Skript hart endet und `finally` nicht mehr laeuft.
+                        angehaengt = True
+                        self.tor.tmux('set-option', '-t', f'={self.sicht}:', 'destroy-unattached', 'on',
+                                      pruefen=False)
+                if 0 in bereit:
+                    daten = os.read(0, 4096)
+                    if not daten:
+                        grund = 'Verbindung zu'
+                        break
+                    rest += daten
+                elif rest:
+                    # 50 ms nichts nachgekommen: ein angefangenes ESC war ein echter Tastendruck.
+                    rest = self.weiterleiten(rest, master, ende=True)
+                    continue
+                if rest:
+                    if TRENNTASTE in rest:
+                        vorher = rest[:rest.index(TRENNTASTE)]
+                        if vorher:
+                            self.weiterleiten(vorher, master, ende=True)
+                        grund = 'Ctrl-]'
+                        break
+                    rest = self.weiterleiten(rest, master, ende=False)
+                if time.monotonic() - self.letzte_pruefung > 2:
+                    ok, text = self.eingabe_pruefen()
+                    if not ok:
+                        grund = text
+                        break
+                    if angehaengt and not self.client_in_sicht(pid):
+                        grund = 'Sicht verlassen'
+                        break
+        except Abgelehnt as e:
+            grund = str(e)
+        finally:
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            self.client_beenden(pid, master)
+            termios.tcsetattr(0, termios.TCSADRAIN, alt)
+        return grund
+
+    def client_beenden(self, pid, master):
+        """Die Sicht abbauen und den Client dabei weiterlesen: er schreibt beim Ende noch das
+        Zuruecksetzen des Terminals (Alternativbild verlassen, Cursor zeigen). Liest keiner
+        mit, bleibt er an einem vollen pty haengen."""
+        self.tor.tmux('detach-client', '-s', f'={self.sicht}', pruefen=False)
+        self.tor.tmux('kill-session', '-t', f'={self.sicht}', pruefen=False)
+        frist = time.monotonic() + 3
+        while time.monotonic() < frist:
+            fertig, _ = os.waitpid(pid, os.WNOHANG)
+            if fertig:
+                break
+            bereit, _, _ = select.select([master], [], [], 0.1)
+            if bereit:
+                try:
+                    daten = os.read(master, 65536)
+                    if daten:
+                        os.write(1, daten)
+                except OSError:
+                    pass
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+        os.close(master)
+
+    def client_in_sicht(self, pid):
+        """Zweite Sicherung zu detach-on-destroy: haengt unser Client an einer anderen
+        Sitzung als der eigenen Sicht, endet das Anhaengen sofort."""
+        roh = self.tor.tmux('list-clients', '-F', '#{client_pid}\t#{session_name}', pruefen=False)
+        for zeile in roh.splitlines():
+            cpid, _, sitzung = zeile.partition('\t')
+            if cpid == str(pid):
+                return sitzung == self.sicht
+        return False
+
+    def eingabe_pruefen(self):
+        self.letzte_pruefung = time.monotonic()
+        return self.tor.eingabe_erlaubt(self.pane)
+
+    def weiterleiten(self, daten, master, ende):
+        """Teilt die Eingabe in Terminal-Antworten (an den Sicht-Client) und Tasten (an den Pane).
+        Gibt einen unvollstaendigen Rest zurueck, solange `ende` falsch ist."""
+        tasten = bytearray()
+        i = 0
+        while i < len(daten):
+            if daten[i] != 0x1b:
+                tasten.append(daten[i])
+                i += 1
+                continue
+            art, laenge = antwort_folge(daten, i)
+            if art == 'unvollstaendig' and not ende:
+                self.tasten_senden(bytes(tasten))
+                return daten[i:]
+            if art == 'antwort':
+                self.tasten_senden(bytes(tasten))
+                tasten = bytearray()
+                os.write(master, daten[i:i + laenge])
+            elif art == 'verwerfen':
+                pass
+            else:
+                tasten += daten[i:i + max(laenge, 1)]
+                laenge = max(laenge, 1)
+            i += laenge
+        self.tasten_senden(bytes(tasten))
+        return b''
+
+    def tasten_senden(self, tasten):
+        if not tasten:
+            return
+        if time.monotonic() - self.letzte_pruefung > 1:
+            ok, grund = self.eingabe_pruefen()
+            if not ok:
+                raise Abgelehnt(grund)
+        self.tor.roh_schreiben(self.pane, tasten)
+
+
+def antwort_folge(d, i):
+    """Klassifiziert die ESC-Folge ab d[i]. Rueckgabe (art, laenge):
+    'antwort'   -- Antwort des Terminals auf eine Anfrage des tmux-Clients (geht an den Client),
+    'verwerfen' -- Fokus-/Mausmeldung, gehoert niemandem,
+    'taste'     -- alles andere, geht als Tastendruck an den Pane,
+    'unvollstaendig' -- die Folge ist im Puffer noch nicht zu Ende."""
+    if i + 1 >= len(d):
+        return 'unvollstaendig', 1
+    c = d[i + 1]
+    if c in (0x5d, 0x50, 0x5f):  # OSC ], DCS P, APC _
+        j = i + 2
+        while j < len(d):
+            if d[j] == 0x07:
+                return antwort_oder_taste(d, i, j + 1)
+            if d[j] == 0x1b and j + 1 < len(d) and d[j + 1] == 0x5c:
+                return antwort_oder_taste(d, i, j + 2)
+            if d[j] == 0x1b and j + 1 >= len(d):
+                return 'unvollstaendig', j - i
+            if j - i > 1024:
+                return 'taste', 2
+            j += 1
+        return 'unvollstaendig', len(d) - i
+    if c == 0x5b:  # CSI
+        j = i + 2
+        while j < len(d) and not 0x40 <= d[j] <= 0x7e:
+            j += 1
+        if j >= len(d):
+            return ('unvollstaendig', len(d) - i) if len(d) - i < 64 else ('taste', 2)
+        param = d[i + 2:j]
+        final = d[j]
+        laenge = j + 1 - i
+        if final in (0x49, 0x4f) and not param:  # Fokus rein/raus
+            return 'verwerfen', laenge
+        if param.startswith(b'<') and final in (0x4d, 0x6d):  # SGR-Maus
+            return 'verwerfen', laenge
+        if final == 0x63 and param[:1] in (b'?', b'>', b'='):  # Geraeteattribute
+            return 'antwort', laenge
+        if final == 0x79 and param.startswith(b'?') and param.endswith(b'$'):  # DECRPM
+            return 'antwort', laenge
+        if final == 0x75 and param.startswith(b'?'):  # Tastatur-Protokoll-Meldung
+            return 'antwort', laenge
+        if final == 0x52 and re.fullmatch(rb'[0-9]{1,4};[0-9]{1,4}', param) and param != b'1;2':
+            return 'antwort', laenge  # Cursorposition (ESC[1;2R waere Shift-F3)
+        if final == 0x6e and re.fullmatch(rb'\?[0-9;]*', param):
+            return 'antwort', laenge
+        return 'taste', laenge
+    return 'taste', 1
+
+
+def antwort_oder_taste(d, i, ende):
+    inhalt = d[i + 2:ende]
+    # Eine Antwort enthaelt nur druckbare Zeichen und ihren Abschluss. Steuerzeichen darin
+    # waeren Tasten im Gewand einer Antwort -- sie gehen dann an den Pane, nie an den Client.
+    koerper = inhalt[:-1] if inhalt.endswith(b'\x07') else inhalt[:-2]
+    if len(koerper) <= 512 and all(0x20 <= b <= 0x7e for b in koerper):
+        return 'antwort', ende - i
+    return 'taste', ende - i
+
+
+__doc_hilfe__ = """wb-gast-tor -- Zugang fuer <person> (keine Shell).
+  liste [--json]
+  anhaengen <sitzung> [<pane>]          (ssh -t; Ctrl-] trennt)
+  schreiben <sitzung|pane> <text>
+  vorschau <sitzung> [<pane>] [--zeilen N] [--json]   (nur lesen)
+  neu [<projekt>] [--harness H] [--model M] [--effort E] [--name N]
+  schliessen <sitzung> [--endgueltig]   (nur selbst gestartete)
+  git clone <host>:AI/a machine-bound project        (git-upload-pack / git-receive-pack, Push nur <person>/*)"""
+
+
+DIREKT_ZWEIG = 'refs/heads/main'
+
+
+def _push_optionen():
+    try:
+        n = int(os.environ.get('GIT_PUSH_OPTION_COUNT', '0') or 0)
+    except ValueError:
+        n = 0
+    return {os.environ.get(f'GIT_PUSH_OPTION_{i}', '') for i in range(min(n, 32))}
+
+
+def pre_receive(person, log_datei):
+    """Als pre-receive-Hook: Zweige <person>/* frei; main nur ausdruecklich (Push-Option
+    `direkt`, der Nutzer 27.09.2026), nur als Fast-Forward und nie loeschen."""
+    praefix = f'refs/heads/{person}/'
+    direkt = 'direkt' in _push_optionen()
+    abgelehnt = []
+    angenommen = []
+    gruende = []
+    for zeile in sys.stdin:
+        teile = zeile.split()
+        if len(teile) != 3:
+            continue
+        alt, neu, ref = teile
+        if ref.startswith(praefix) and re.fullmatch(r'refs/heads/[A-Za-z0-9._/-]+', ref) and '..' not in ref:
+            angenommen.append(ref)
+        elif ref == DIREKT_ZWEIG and direkt:
+            if set(neu) == {'0'}:
+                abgelehnt.append(ref); gruende.append('main loeschen ist nie erlaubt')
+            elif set(alt) != {'0'} and subprocess.run(['git', 'merge-base', '--is-ancestor', alt, neu],
+                                                   capture_output=True).returncode != 0:
+                abgelehnt.append(ref); gruende.append('main nur als Fast-Forward (vorher git pull peer main)')
+            else:
+                angenommen.append(ref)
+        else:
+            abgelehnt.append(ref)
+            if ref == DIREKT_ZWEIG:
+                gruende.append('direkt auf main nur ausdruecklich: git push -o direkt peer HEAD:main')
+    eintrag = {'zeit': jetzt(), 'person': person, 'aktion': 'push', 'direkt': direkt,
+               'angenommen': angenommen, 'abgelehnt': abgelehnt}
+    try:
+        fd = os.open(log_datei, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(eintrag, ensure_ascii=False) + '\n')
+    except OSError:
+        pass
+    if abgelehnt:
+        print(f'wb-gast-tor: Push nur auf Zweige {person}/* erlaubt (main nur ausdruecklich). Abgelehnt: '
+              + ', '.join(abgelehnt) + ('. ' + '; '.join(gruende) if gruende else ''), file=sys.stderr)
+        return 1
+    return 0
+
+
+def main():
+    if os.path.basename(sys.argv[0]) == 'pre-receive' or sys.argv[1:2] == ['--pre-receive']:
+        person = os.environ.get('WB_GAST_PERSON', '')
+        if not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', person):
+            print('wb-gast-tor: pre-receive ohne Gast-Kennung -- abgelehnt.', file=sys.stderr)
+            return 1
+        return pre_receive(person, os.environ.get('WB_GAST_LOG', os.devnull))
+
+    ap = argparse.ArgumentParser(prog='wb-gast-tor')
+    ap.add_argument('--person', required=True)
+    ap.add_argument('--projekt', action='append', default=[])
+    ap.add_argument('--log')
+    ap.add_argument('--hook-dir', default='/usr/local/lib/wb-gast-tor/hooks')
+    ap.add_argument('--tmux', default='tmux')
+    ap.add_argument('--wb-bin')
+    a = ap.parse_args()
+    if not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', a.person):
+        print('wb-gast-tor: ungueltige --person.', file=sys.stderr)
+        return 64
+    home = os.path.expanduser('~')
+    wb_bin = a.wb_bin or os.path.join(home, '.local', 'bin')
+    # Eine feste, schmale Umgebung fuer alles, was das Tor startet. Nichts aus der ssh-Sitzung
+    # wird durchgereicht ausser TERM (fuer die Anzeige) und GIT_PROTOCOL (fuer git).
+    env = {
+        'HOME': home, 'USER': os.environ.get('USER', ''), 'LOGNAME': os.environ.get('LOGNAME', ''),
+        'PATH': f'{wb_bin}:{home}/.local/bin:/usr/local/bin:/usr/bin:/bin',
+        'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'SHELL': '/bin/bash',
+    }
+    for k in ('XDG_RUNTIME_DIR', 'TMUX_TMPDIR'):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    if 'XDG_RUNTIME_DIR' not in env and os.path.isdir(f'/run/user/{os.getuid()}'):
+        env['XDG_RUNTIME_DIR'] = f'/run/user/{os.getuid()}'
+    log_datei = a.log or os.path.join(home, '.local', 'state', 'wb-gast-tor', f'{a.person}.log')
+    tor = Tor(a.person, a.projekt, home, log_datei, a.tmux, wb_bin, a.hook_dir, env)
+
+    roh = os.environ.get('SSH_ORIGINAL_COMMAND', '')
+    try:
+        teile = shlex.split(roh)
+    except ValueError:
+        tor.log('abgelehnt', befehl=roh[:200], grund='nicht zerlegbar')
+        print('wb-gast-tor: Befehl nicht zerlegbar.', file=sys.stderr)
+        return 64
+    befehle = {
+        'hilfe': tor.cmd_hilfe, 'help': tor.cmd_hilfe,
+        'liste': tor.cmd_liste, 'list': tor.cmd_liste,
+        'anhaengen': tor.cmd_anhaengen, 'attach': tor.cmd_anhaengen,
+        'schreiben': tor.cmd_schreiben, 'send': tor.cmd_schreiben,
+        'vorschau': tor.cmd_vorschau, 'preview': tor.cmd_vorschau,
+        'neu': tor.cmd_neu, 'new': tor.cmd_neu,
+        'schliessen': tor.cmd_schliessen, 'close': tor.cmd_schliessen,
+        'git-upload-pack': tor.cmd_upload_pack,
+        'git-receive-pack': tor.cmd_receive_pack,
+    }
+    if not teile:
+        teile = ['hilfe']
+    fn = befehle.get(teile[0])
+    if not fn:
+        tor.log('abgelehnt', befehl=roh[:200], grund='unbekannter Befehl')
+        print(f'wb-gast-tor: "{teile[0]}" ist hier nicht erlaubt. `hilfe` zeigt, was geht.', file=sys.stderr)
+        return 64
+    try:
+        return fn(teile[1:])
+    except Abgelehnt as e:
+        tor.log('abgelehnt', befehl=roh[:200], grund=str(e))
+        print(f'wb-gast-tor: {e}', file=sys.stderr)
+        return 1
+    except subprocess.TimeoutExpired:
+        tor.log('abgelehnt', befehl=roh[:200], grund='Zeitueberschreitung')
+        print('wb-gast-tor: Zeitueberschreitung.', file=sys.stderr)
+        return 75
+
+
+if __name__ == '__main__':
+    sys.exit(main())

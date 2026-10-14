@@ -1,5 +1,5 @@
 #!/bin/bash
-# grug-server — duenner Vorspann fuer grug-27b auf wb-mlx-server (mlx_lm.server,
+# grug-server — Kompatibilitaetsvorspann auf wb-mlx-server (mlx_lm.server,
 # Port 8081 ueber den Server, 8080 ueber wb-modell-proxy davor).
 #
 # UMGEBAUT 2026-08-19 (Auftrag A, Entscheidung des Nutzers: grug und qwen3.8
@@ -10,39 +10,35 @@
 # generische Ensure/Stop/Status mit Probeanfrage -- lebt jetzt in
 # shell/wb-mlx-server, UNVERAENDERT scharf, nur nicht mehr grug-spezifisch
 # hartkodiert (Gewichte/Kontext kommen dort aus der Registry). Diese Datei
-# tut nur noch zwei Dinge: (1) den Pfad zu grug-27b GENAUSO aufloesen wie
-# bisher (siehe MODEL_PATH unten -- das bleibt unveraendert, weil
-# gardener/grug_client.py GRUG_MODEL_PATH UNABHAENGIG liest und Server,
-# Client und Belegung sonst auseinanderlaufen koennten, siehe die Begruendung
-# dort), und (2) das Ergebnis unveraendert (als absoluter PFAD, nicht als
-# Alias "grug") an `wb-mlx-server ensure|stop|status` weiterreichen. pi-worker
+# tut nur noch zwei Dinge: (1) den Pfad aus der Gardener-Konfiguration
+# aufloesen und bei einem Konfigurationsfehler auf Qwen3.8-MLX zurueckfallen
+# (siehe MODEL_PATH unten; GRUG_MODEL_PATH bleibt als ausdruecklicher Override,
+# damit Client, Server und Belegung gemeinsam umgestellt werden koennen), und
+# (2) das Ergebnis als absoluten PFAD, nicht als Alias, an
+# `wb-mlx-server ensure|stop|status` weiterreichen. pi-worker
 # (Zeile ~307), der Modell-Proxy und lauf-fenster.sh rufen weiterhin
 # `grug-server ensure|stop|status` auf und merken vom Umbau nichts; jeder
 # bisherige Schalter (--frist, GRUG_SERVER_DECODE_PARALLEL,
 # GRUG_SERVER_PROMPT_PARALLEL, GRUG_SERVER_OHNE_BELEGUNG) wirkt unveraendert,
 # nur uebersetzt auf die Namen, die wb-mlx-server versteht.
 #
-# Modellwahl (2026-08-11, Messung des Nutzers, siehe regeln/lokale-modelle.md
-# Abschnitt "Das Kleinere darf gewinnen"): MLX 4bit schlug Ollama und
-# llama.cpp auf beiden Achsen -- Einzeldurchsatz (17,7 Tok/s) UND
-# Nebenlaeufigkeit (14,8/21,1/28,1/28,1/23,9 Tok/s bei 1/2/4/8/16 Anfragen,
-# Trefferquote 49/50). Ollama serialisiert fuer diese Architektur komplett,
-# llama.cpp liegt unter MLX und trifft nur 45/50. grug ist seit 2026-08-19
-# nicht mehr die Vorgabe fuer lokale Arbeit (das ist jetzt qwen3.8, dieselbe
-# Bauform, eigene Messung steht aus) -- grug bleibt vollstaendig erhalten und
-# waehlbar, diese Messung bleibt seine Grundlage.
+# Das fruehere grug-Modell wurde am 30.09.2026 geloescht. Dieser Wrapper
+# bleibt fuer bestehende Aufrufer erhalten; bei nicht lesbarer Konfiguration
+# verwendet er das vorhandene qwen38-27b-mlx-4bit.
 #
 # Usage (unveraendert):
-#   grug-server ensure    startet grug falls noetig, wartet mit Frist auf
+#   grug-server ensure    startet das konfigurierte Modell oder bei
+#                         Konfigurationsfehler den Qwen3.8-MLX-Rueckfall, wartet
+#                         mit Frist auf
 #                         Antwortbereitschaft, meldet Erfolg erst nach einer
 #                         echten Probeanfrage. Laeuft es schon, tut es nichts
 #                         (Frist wird nachgezogen). Laeuft STATTDESSEN ein
 #                         anderes MLX-Modell (z.B. qwen3.8), wird es zuerst
 #                         sauber beendet -- das ist jetzt Aufgabe von
 #                         wb-mlx-server, siehe dort.
-#   grug-server stop      beendet den Server, aber NUR wenn es grug ist, das
-#                         gerade laeuft (sonst Fehler statt eines falschen
-#                         Beendens -- siehe wb-mlx-server stop [<modell>]).
+#   grug-server stop      beendet das konfigurierte bzw. ersatzweise Qwen3.8-
+#                         Modell, aber nur wenn genau dieses laeuft (sonst
+#                         Fehler statt eines falschen Beendens).
 #   grug-server status    sagt, ob (irgendein MLX-Modell ueber diesen Server)
 #                         laeuft, seit wann, mit wie viel Speicher.
 #
@@ -64,6 +60,11 @@
 # im Speicher zu halten wuerde Bild- und Videoerzeugung blockieren, die auf
 # dieser Maschine denselben Speicher braucht. Gilt unveraendert fuer
 # wb-mlx-server darunter.
+#
+# Fallback bei Fehler der Konfigurationsabfrage: qwen38-27b-mlx-4bit. Ein Fehler
+# beim anschliessenden Resolve/Start wird von wb-mlx-server mit konkreter
+# Fehlermeldung abgebrochen; es gibt keinen zweiten Versuch mit dem geloeschten
+# grug-Pfad.
 #
 # GRUG_SERVER_OHNE_BELEGUNG=1 ist die einzige Umgehung der Cross-Sitzungs-
 # Sperre, und sie ist bewusst laut (siehe wb-mlx-server fuer die volle
@@ -88,7 +89,7 @@ _konfig_modell() {
     2>/dev/null
 }
 MODEL_PATH="${GRUG_MODEL_PATH:-$(_konfig_modell)}"
-MODEL_PATH="${MODEL_PATH:-$HOME/AI/mlx-models/grug-27b-mlx-q4}"
+MODEL_PATH="${MODEL_PATH:-$HOME/AI/mlx-models/qwen38-27b-mlx-4bit}"
 
 # GRUG_SERVER_*-Namen bleiben fuer Aufrufer bestehen (lauf-fenster.sh,
 # pi-worker), werden hier auf die generischen WB_MLX_SERVER_*-Namen

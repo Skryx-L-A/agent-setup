@@ -125,6 +125,33 @@ def kopf(a):
     return " ".join(a.split()[:3]).lower()
 
 
+def ist_mcp_helfer(a):
+    """Lokale MCP-/Plugin-Helfer anhand ihres Startbefehls erkennen."""
+    k = kopf(a)
+    return any(kennung in k for kennung in (
+        "mcp", "@playwright", "node_repl", "cua_node",
+        "skycomputeruseclient", "computer-history",
+    ))
+
+
+def ist_werkbank_app(a):
+    """Den nativen App-Prozess erkennen, ohne Argumenttexte mitzuwerten."""
+    return bool(re.match(
+        r"^/Applications/(?:Werkbank|Agent Workbench)\.app/Contents/MacOS/"
+        r"(?:Werkbank|Agent Workbench)(?:\s|$)",
+        a,
+        re.IGNORECASE,
+    )) or "agent-workbench-bin" in kopf(a)
+
+
+def ist_dauerdienst(a):
+    k = kopf(a)
+    return any(kennung in k for kennung in (
+        "wb-modell-proxy", "ollama serve", "basic_memory",
+        "basic-memory", "whisper-server",
+    ))
+
+
 def nachkommen(pid, kinder, gesehen=None):
     gesehen = gesehen if gesehen is not None else set()
     if pid in gesehen:
@@ -380,22 +407,29 @@ def erheben():
     # andere, was in einem Pane arbeitet (Testlaeufe, Skripte, Hilfsprozesse).
     for wurzel in panes:
         for pid in nachkommen(wurzel, kinder):
-            k = kopf(args.get(pid, ""))
-            if "mcp" in k or "@playwright" in k:
+            a = args.get(pid, "")
+            k = kopf(a)
+            if ist_mcp_helfer(a):
                 eintragen("mcp", pid)
-            elif re.search(r"(^|/)(claude|pi|codex|opencode|crush|nanocoder|kimi)\b", k):
+            elif re.search(r"(^|/)(claude|pi|codex|opencode|crush|nanocoder)\b", k):
                 eintragen("sitzungen", pid)
             else:
                 eintragen("arbeit", pid)
 
+    # Der heutige native Prozess heisst Werkbank. Seine Node-, Electron-,
+    # GPU- und Netzwerk-Helfer tragen den Namen nicht verlaesslich selbst;
+    # deshalb wird der ganze Prozessbaum des App-Starts zugeordnet.
+    for wurzel, a in args.items():
+        if ist_werkbank_app(a):
+            for pid in nachkommen(wurzel, kinder):
+                eintragen("app", pid)
+
     for pid, a in args.items():
         k = kopf(a)
-        if "agent workbench.app" in k or "agent-workbench-bin" in k:
-            eintragen("app", pid)
+        if ist_dauerdienst(a):
+            eintragen("dienste", pid)
         elif "context-guard" in k or re.search(r"/wb-[a-z-]+\b", k):
             eintragen("waechter", pid)
-        elif "ollama serve" in k or "basic_memory" in k or "basic-memory" in k:
-            eintragen("dienste", pid)
 
     gesamt = sum(p["mib"] for p in posten.values())
     maschine = sum(mem.values())

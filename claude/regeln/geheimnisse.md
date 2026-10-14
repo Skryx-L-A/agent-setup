@@ -13,7 +13,7 @@ setzen (2026-07-29)" steht seither im Wortlaut in `regeln/kontext-guard.md`, Abs
 „Sentinel". Auf peer stand sie bis zum 2026-09-05 zusätzlich noch hier.
 
 Unberührt bleiben in CLAUDE.md: kein `.env` und kein Geheimnis zu GitHub oder einem
-Online-Anbieter, `90-secrets/` nur lokal (mit der Syncthing-Ausnahme von 2026-08-25, seit 2026-09-10 auch für eingetragene
+Online-Anbieter, `secrets/` nur lokal (mit der Syncthing-Ausnahme von 2026-08-25, seit 2026-09-10 auch für eingetragene
 Agent-Server), keine
 vollständigen Geheimnisse in Logs oder Chat ohne Freigabe.
 
@@ -35,15 +35,20 @@ vollständigen Geheimnisse in Logs oder Chat ohne Freigabe.
   Verbesserungsvorschlag oder Schwachstellen-Eingeständnis. Dass private Daten existieren, darf
   gesagt werden; das Wie und Wo nicht. Vor dem Versand danach greppen.
 
+- **Öffentliche Repos nur mit Handle (der Nutzer, 2026-10-02):** kein Klarname, kein lokaler
+  Nutzername, keine private E-Mail, kein Hostname — auch nicht in Commit-Autoren, LICENSE-Kopf,
+  Testdaten oder mitgelieferten Binärdateien. Vom Handle `<your-github-user>` abgeleitete Kennungen sind
+  erlaubt. Lizenztexte von der Originalquelle kopieren, nicht aus eigenen Repos.
+
 ## Syncthing-Secrets-Kanal (Wortlaut, ausgelagert aus CLAUDE.md am 2026-09-10)
 
-Der etablierte P2P-Syncthing-Kanal zwischen den Maschinen mac-m5 und Peer-Rechner darf `90-secrets/` und
+Der etablierte P2P-Syncthing-Kanal zwischen den Maschinen mac-m5 und Peer-Rechner darf `secrets/` und
 `.secrets-sync/` synchronisieren – verschlüsselt, kein Online-Provider, ausdrückliche des Nutzers
 Entscheidung vom 2026-08-25. Seit 2026-09-10 gilt derselbe Kanal auch für Server, die in den
-Werkbank-Einstellungen als Maschine für Agents eingetragen sind (Hetzner, ltfserver), damit
+Werkbank-Einstellungen als Maschine für Agents eingetragen sind (Hetzner, my-server), damit
 Hauptagenten dort ohne den Laptop laufen können (Entscheidung des Nutzers in der grill-me-Runde zum
 Agents-Plan, `docs/AGENTS-PLAN.md`, Abschnitt 10, Punkt 21). Der Agents-Plan engt das für Server
 ein: je Server ein eigener Ordner `.secrets-sync/<server>/` mit einem Token aus `claude
-setup-token` und einem Deploy-Schlüssel je Repo; `90-secrets/` bleibt auf Mac und peer, außer
+setup-token` und einem Deploy-Schlüssel je Repo; `secrets/` bleibt auf Mac und peer, außer
 der Nutzer will es ausdrücklich. Das „never synced / pro Maschine getrennt" gilt für alle anderen
 Kanäle unverändert weiter.

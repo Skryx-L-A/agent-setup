@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# wb-tafel-dienst -- einen Dienstlauf (systemd-Timer, launchd-Job) ueber die Belegungstafel anmelden.
+#
+#   wb-tafel-dienst --platz <platz> --frist <dauer> --warte <dauer> --zweck "<satz>" --name <name>
+#                   [--art <schluessel>] [--nachholen <dauer>] [--versuche <n>] [--einheit <unit>]
+#                   -- <lauf> [argumente …]
+#
+# Anlass (Auftrag tafel-peer, 11.10.2026): wb-testsuite.timer startete So 04:00 auf peer den Gesamtlauf,
+# obwohl peer-ruhe gehalten wurde; die Tafel konnte ihn nur als "unangemeldet" zwangseintragen. Timer und
+# Zeitplan bleiben (der Nutzer 22.08.: peer behaelt seine Timer); der Dienst meldet sich stattdessen an:
+#
+#   1. `wb-tafel nimm <platz> --anstellen --warte <dauer>`: ist der Platz frei oder wird er innerhalb der
+#      Wartezeit frei (auch nach einer Ruhe-Messung), traegt die Tafel den Lauf ein. Die Wartezeit steht
+#      als "angestellt" und "aus-schlange (Wartezeit um)" im Verlauf der Tafel.
+#   2. Eingetragen: der Lauf startet MIT dem Eintrag (Umgebung RUN_ALL_TAFEL_EINTRAG=<id>, die
+#      shell/tests/run-all.sh als --tafel-eintrag liest und per `wb-tafel binden` an sich nimmt); danach
+#      gibt dieses Skript ihn ab, falls der Lauf es nicht selbst tat. Exit-Code = Exit-Code des Laufs.
+#   3. Nicht frei bis zur Frist: der Lauf wird VERSCHOBEN, nicht ohne Spur uebersprungen. Eine Zeile mit
+#      Halter und Grund geht ins Journal (logger -t wb-tafel-dienst) und nach stdout, ein EINMALIGER
+#      Zeitgeber `systemd-run --user --on-active=<nachholen>` startet die Einheit noch einmal (kein neuer
+#      Dauer-Zeitgeber; Persistent=true des Timers holt nur verpasste Termine nach, nie einen verschobenen
+#      Lauf). Exit 75 (EX_TEMPFAIL): die Einheit setzt SuccessExitStatus=75, ein geplantes Verschieben
+#      ist kein Fehler. Nach <versuche> Versuchen (Vorgabe 4) gibt es auf: Journal-Zeile, Exit 69
+#      (EX_UNAVAILABLE), die Einheit steht dann als gescheitert da; der naechste regulaere Termin bleibt.
+#   4. Antwortet die Tafel nicht sauber (wb-tafel fehlt, Exit 2/3/4): Warnung, der Lauf startet wie vor
+#      dieser Anmeldung ohne Eintrag (run-all.sh meldet sich dann selbst). Die Tafel ist Absprache,
+#      keine Voraussetzung fuer den Wochenlauf.
+#
+# Umgebung (fuer Tests): WB_TAFEL (Pfad von wb-tafel, Vorgabe ~/.local/bin/wb-tafel),
+# WB_TAFEL_DIENST_STATE (Zaehler der Versuche, Vorgabe ~/.local/state/wb-tafel-dienst),
+# WB_TAFEL_DIENST_SYSTEMD_RUN (Vorgabe systemd-run), WB_TAFEL_DIENST_LOGGER (Vorgabe logger).
+set -u
+
+TAFEL="${WB_TAFEL:-$HOME/.local/bin/wb-tafel}"
+STATE="${WB_TAFEL_DIENST_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/wb-tafel-dienst}"
+SYSTEMD_RUN="${WB_TAFEL_DIENST_SYSTEMD_RUN:-systemd-run}"
+LOGGER="${WB_TAFEL_DIENST_LOGGER:-logger}"
+
+PLATZ="" FRIST="" WARTE="" ZWECK="" NAME="" ART="" NACHHOLEN="60m" VERSUCHE=4 EINHEIT=""
+
+verwendung() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//' >&2; }
+abbruch() { echo "wb-tafel-dienst: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --platz)     PLATZ="${2:-}"; shift 2 ;;
+    --frist)     FRIST="${2:-}"; shift 2 ;;
+    --warte)     WARTE="${2:-}"; shift 2 ;;
+    --zweck)     ZWECK="${2:-}"; shift 2 ;;
+    --name)      NAME="${2:-}"; shift 2 ;;
+    --art)       ART="${2:-}"; shift 2 ;;
+    --nachholen) NACHHOLEN="${2:-}"; shift 2 ;;
+    --versuche)  VERSUCHE="${2:-}"; shift 2 ;;
+    --einheit)   EINHEIT="${2:-}"; shift 2 ;;
+    --)          shift; break ;;
+    -h|--help)   verwendung; exit 0 ;;
+    *)           abbruch "unbekannte Option '$1' (der Lauf folgt nach --)" ;;
+  esac
+done
+[ -n "$PLATZ" ] && [ -n "$FRIST" ] && [ -n "$WARTE" ] && [ -n "$ZWECK" ] && [ -n "$NAME" ] \
+  || abbruch "--platz, --frist, --warte, --zweck und --name sind Pflicht"
+[ $# -gt 0 ] || abbruch "kein Lauf nach --"
+case "$VERSUCHE" in ''|*[!0-9]*|0) abbruch "--versuche braucht eine Zahl ab 1" ;; esac
+[ -n "$EINHEIT" ] || EINHEIT="$NAME.service"
+
+meldung() {   # stdout (Dienstprotokoll) und Journal
+  echo "wb-tafel-dienst: $*"
+  command -v "$LOGGER" >/dev/null 2>&1 && "$LOGGER" -t wb-tafel-dienst -p user.notice -- "$NAME: $*" 2>/dev/null
+  return 0
+}
+
+ZAEHLER="$STATE/$NAME.versuche"
+
+if [ ! -x "$TAFEL" ]; then
+  meldung "WARNUNG -- $TAFEL fehlt, $NAME startet ohne Eintrag"
+  exec "$@"
+fi
+
+# Ohne --pid und ohne $(...): der Halter ist, wer der Tafel gemessen erscheint -- unter systemd die Unit
+# (Platz endet mit der Unit), sonst der Aufrufer dieses Skripts. Mit --pid $$ waere der Eintrag an dieses
+# Skript gebunden, und der Lauf (run-all.sh, ein Nachfahr) duerfte ihn nicht per `binden` uebernehmen
+# (Exit 4, gemessen in test-wb-tafel-dienst.sh).
+nimm=("$TAFEL" nimm "$PLATZ" --frist "$FRIST" --zweck "$ZWECK" --anstellen --warte "$WARTE")
+[ -n "$ART" ] && nimm+=(--art "$ART")
+ausdatei="$(mktemp "${TMPDIR:-/tmp}/wb-tafel-dienst.XXXXXX")" || ausdatei=/dev/null
+"${nimm[@]}" > "$ausdatei" 2>&1; rc=$?
+aus="$(cat "$ausdatei" 2>/dev/null)"; rm -f "$ausdatei"
+kennung="$(printf '%s\n' "$aus" | grep -oE '(EINGETRAGEN|NACHGETRAGEN): t[0-9a-f]+' | head -1 | awk '{print $2}')"
+
+if [ "$rc" = 0 ] && [ -n "$kennung" ]; then
+  rm -f "$ZAEHLER"
+  meldung "$PLATZ genommen ($kennung), $NAME startet"
+  RUN_ALL_TAFEL_EINTRAG="$kennung" "$@"; lauf_rc=$?
+  # run-all.sh gibt seinen uebernommenen Eintrag selbst ab; jeder andere Lauf nicht.
+  "$TAFEL" gib "$kennung" >/dev/null 2>&1 || true
+  exit "$lauf_rc"
+fi
+
+if [ "$rc" != 1 ]; then
+  meldung "WARNUNG -- wb-tafel nimm $PLATZ antwortet nicht sauber (Exit $rc), $NAME startet ohne Eintrag: $(printf '%s' "$aus" | tail -n 2 | tr '\n' ' ')"
+  exec "$@"
+fi
+
+# Belegt bis zur Frist: verschieben, mit Spur.
+grund="$(printf '%s\n' "$aus" | sed -n 's/^BELEGT: //p' | head -1)"
+halter="$(printf '%s\n' "$aus" | sed -n '2p' | sed 's/^ *//')"
+mkdir -p "$STATE" 2>/dev/null
+n=$(( $(cat "$ZAEHLER" 2>/dev/null || echo 0) + 1 ))
+if [ "$n" -ge "$VERSUCHE" ]; then
+  rm -f "$ZAEHLER"
+  meldung "AUFGEGEBEN -- $PLATZ blieb in $n Versuchen belegt (zuletzt: $grund; $halter). $NAME laeuft erst wieder zum regulaeren Termin des Timers"
+  exit 69
+fi
+echo "$n" > "$ZAEHLER"
+if XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+   "$SYSTEMD_RUN" --user --quiet --on-active="$NACHHOLEN" --timer-property=AccuracySec=1s \
+     --unit="$NAME-nachholen" --description="$NAME: verschobener Lauf" \
+     systemctl --user start --no-block "$EINHEIT" >/dev/null 2>&1; then
+  meldung "VERSCHOBEN -- $PLATZ war $WARTE lang belegt ($grund; $halter). Versuch $n von $VERSUCHE, naechster in $NACHHOLEN (einmaliger Zeitgeber $NAME-nachholen)"
+else
+  rm -f "$ZAEHLER"
+  meldung "VERSCHOBEN, ABER KEIN NEUER VERSUCH GEPLANT -- $PLATZ war $WARTE lang belegt ($grund; $halter), systemd-run scheiterte. $NAME laeuft erst wieder zum regulaeren Termin des Timers"
+  exit 69
+fi
+exit 75

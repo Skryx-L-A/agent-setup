@@ -30,8 +30,12 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import dataclasses
+import json
+import os
+import shutil
 
-from .grug_client import GRUG_MODEL_PATH
+from .grug_client import GRUG_MODEL_PATH, MLX_ENGINE, SPLASH_ENGINE, JudgeEngine
 
 log = logging.getLogger("gardener")
 
@@ -81,8 +85,88 @@ def already_serving(timeout: float = STATUS_TIMEOUT) -> bool:
     out. Raises `MlxServerError` if the query itself fails, same as
     `_status()` - a dry run must not guess "not running" from a probe that
     could not even ask."""
+    if engine_name() == "splash":
+        return _splash_status(timeout) is not None
     pid, model = _status(timeout)
     return pid is not None and model == GRUG_MODEL_PATH
+
+
+# -- Motorwahl (Auftrag g4, 24.09.2026) ---------------------------------------
+# Vorgabe ist Splash, sobald `wb-splash-server` da ist: qwen3.8-27B laeuft auf
+# dem Mac seit dem 20.09.2026 dort (regeln/lokale-modelle.md). Der Gaertner
+# startete bis hierher trotzdem seinen eigenen MLX-Server - ein zweites
+# 27B-Modell neben dem laufenden Splash. `GARDENER_JUDGE_ENGINE=mlx` holt den
+# alten Weg zurueck (Vergleichsmessung, Splash kaputt).
+_active: JudgeEngine | None = None
+
+
+def engine_name() -> str:
+    wahl = os.environ.get("GARDENER_JUDGE_ENGINE", "").strip().lower()
+    if wahl in ("splash", "mlx"):
+        return wahl
+    return "splash" if shutil.which("wb-splash-server") else "mlx"
+
+
+def active_engine() -> JudgeEngine:
+    """Der Motor, gegen den die schlauen Phasen dieses Laufs urteilen - nach
+    `ensure()` mit dem vom Server gemeldeten Fenster."""
+    if _active is not None:
+        return _active
+    return SPLASH_ENGINE if engine_name() == "splash" else MLX_ENGINE
+
+
+def _splash_status(timeout: float = STATUS_TIMEOUT) -> dict | None:
+    """JSON-Zeile aus `wb-splash-server status`, None wenn nichts laeuft."""
+    try:
+        proc = subprocess.run(["wb-splash-server", "status"], capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise MlxServerError(f"wb-splash-server status failed: {e}") from e
+    # Ausgabe (Exit immer 0): "laeuft: PID n, bedient '...', Port 8000,
+    # /v1/models antwortet" plus JSON-Zeile, oder "nicht aktiv (...)", oder
+    # "laeuft: ..., aber /v1/models antwortet NICHT" (haengt - fuer den
+    # Richter so gut wie nicht da; ensure startet ihn dann neu).
+    erste = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+    if proc.returncode != 0 or not erste.startswith("laeuft:") \
+            or "antwortet NICHT" in erste:
+        return None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                pass
+    return {}
+
+
+def _ensure_splash(timeout: float) -> bool:
+    global _active
+    vorher = _splash_status()
+    owned = vorher is None
+    if owned:
+        try:
+            proc = subprocess.run(["wb-splash-server", "ensure", "qwen38"],
+                                  capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise MlxServerError(f"wb-splash-server ensure failed: {e}") from e
+        if proc.returncode != 0:
+            raise MlxServerError(
+                "wb-splash-server ensure failed: "
+                f"{(proc.stderr or proc.stdout).strip()[-500:]}")
+    stand = _splash_status() or {}
+    kontext = stand.get("kontext")
+    _active = dataclasses.replace(
+        SPLASH_ENGINE, context_window=int(kontext) if isinstance(kontext, int)
+        and kontext > 0 else SPLASH_ENGINE.context_window)
+    if owned:
+        log.info("judge: splash started for this run (kontext %s)",
+                 _active.context_window)
+    else:
+        log.info("judge: splash already serving (PID %s, kontext %s) - guest, "
+                 "this run will not stop it", stand.get("pid"),
+                 _active.context_window)
+    return owned
 
 
 def ensure(timeout: float = ENSURE_TIMEOUT) -> bool:
@@ -97,7 +181,14 @@ def ensure(timeout: float = ENSURE_TIMEOUT) -> bool:
 
     Raises `MlxServerError` if provisioning itself fails, before any smart
     phase runs - see the module and class docstrings for why that must stay
-    visibly distinct from a server dying mid-run."""
+    visibly distinct from a server dying mid-run.
+
+    Auftrag g4: dispatches on `engine_name()` - Splash (default where
+    `wb-splash-server` exists) or the MLX `grug-server` path below."""
+    global _active
+    if engine_name() == "splash":
+        return _ensure_splash(timeout)
+    _active = MLX_ENGINE
     pre_pid, pre_model = _status()
     owned = not (pre_pid is not None and pre_model == GRUG_MODEL_PATH)
     try:
@@ -123,6 +214,10 @@ def release(owned: bool, timeout: float = STOP_TIMEOUT) -> None:
     (Prozess-Hygiene: was gestartet wird, wird auch beendet - aber nur, was
     dieser Lauf selbst gestartet hat)."""
     if not owned:
+        return
+    if engine_name() == "splash":
+        subprocess.run(["wb-splash-server", "stop"], capture_output=True,
+                       text=True, timeout=timeout)
         return
     subprocess.run(["grug-server", "stop"], capture_output=True, text=True,
                    timeout=timeout)

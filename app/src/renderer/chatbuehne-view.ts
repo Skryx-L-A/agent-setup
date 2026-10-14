@@ -26,7 +26,7 @@ import { chatPfadHaken } from './chatdatei';
 export interface ChatBruecke {
   daten(seit: number): Promise<(Stand & { id: string }) | null>;
   senden(text: string): Promise<boolean>;
-  freigabe(anfrageId: string, erlauben: boolean): Promise<boolean>;
+  freigabe(anfrageId: string, erlauben: boolean, echt: boolean): Promise<boolean>;
   neustart(): Promise<boolean>;
   /** Den Freigabemodus zur Laufzeit umstellen (Luecke 5c). */
   modus(modus: string): Promise<boolean>;
@@ -245,8 +245,8 @@ export class Chatbuehne {
       aufSenden: (text) => {
         void this.bruecke?.senden(text);
       },
-      aufFreigabe: (anfrageId, erlauben) => {
-        void this.bruecke?.freigabe(anfrageId, erlauben);
+      aufFreigabe: (anfrageId, erlauben, echt) => {
+        void this.bruecke?.freigabe(anfrageId, erlauben, echt);
       },
       aufNeustart: () => {
         void this.bruecke?.neustart();

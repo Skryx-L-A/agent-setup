@@ -40,6 +40,7 @@ import {
 } from './paneflaeche';
 import { initFreigabenView, freigabenUiState } from './freigaben-view';
 import { figurenFarbenNeu } from './agentenfigur';
+import { figurenBildrateSetzen } from './agentenfigur';
 import { initWeltenView, weltenAnzeigen, weltenAufgaben, weltenSichtbar, weltenUiState, weltenSpracheGesetzt } from './welten-view';
 import { initAktivitaetView, aktivitaetUiState } from './aktivitaet-view';
 import { initOrdnerView, ordnerUiState } from './ordner-view';
@@ -146,6 +147,8 @@ interface Model {
   schriftgroesse: number;
   /** Zeilen je Rad-Rasterung, aus den Einstellungen (06.08.). */
   scrollZeilen: number;
+  /** Bilder je Sekunde der Agentenfiguren, aus den Einstellungen (09.10.2026). */
+  figurenBildrate?: number;
   streamPane: string;
   mayArrange: boolean;
   chats?: {
@@ -624,7 +627,7 @@ const ZUSATZ_AB = 200;
  * DIE UNTERZEILE SAGT, WAS DIESE ZEILE VON DEN ANDEREN UNTERSCHEIDET
  * (05.09.2026, Electron-Befund 3 und Regelbruch 10).
  *
- * Sie trug bis heute an JEDER Zeile „n Worker · MacBook-Pro-von-alice". Der
+ * Sie trug bis heute an JEDER Zeile „n Worker · Arbeitsrechner". Der
  * Maschinenname war damit in jeder Zeile derselbe, kostete bei 232 Bildpunkten
  * Leistenbreite die ganze verfuegbare Breite und wurde trotzdem abgeschnitten.
  * Er steht deshalb nur noch da, wo er wirklich etwas unterscheidet: auf einer
@@ -904,7 +907,7 @@ function entscheiden(f: OffeneFreigabe, aktion: 'approve' | 'reject', grund: str
       schluessel: f.schluessel, action: aktion, reason: grund, echt,
     });
   } else {
-    window.awbBridge.bedienung('freigaben-entscheiden', { path: f.pfad, action: aktion, reason: grund });
+    window.awbBridge.bedienung('freigaben-entscheiden', { path: f.pfad, action: aktion, reason: grund, echt });
   }
   notiz(aktion === 'approve' ? t('freigabe.erteilt', { name: f.wer }) : t('freigabe.abgelehnt', { name: f.wer }));
 }
@@ -2408,7 +2411,9 @@ initPaneflaeche({
   aufLage(p) {
     // WELCHE PANES WIRKLICH GEZEICHNET SIND. Daran haengt der Umschalter im
     // Inhaltskopf: er zeigt, was zu sehen ist, nicht was gemerkt wurde.
-    gezeichnetePanes = p.panes.map((b) => b.paneId).filter(Boolean);
+    // Ein Gast-Terminal (pty) steht fuer einen echten Pane der fernen Sitzung; zaehlen muss dieser,
+    // sonst hielte der Umschalter den Orchestrator fuer einen Worker (bob, 27.09.2026).
+    gezeichnetePanes = p.panes.map((b) => b.stehtFuer || b.paneId).filter(Boolean);
     auskunft.groesse = `${p.cols}x${p.rows}`;
     auskunft.ansicht = p.art === 'tab'
       ? `Tab mit ${p.panes.length} Panes${p.fehlend?.length ? `, ${p.fehlend.length} fehlen` : ''}`
@@ -2512,6 +2517,7 @@ window.awbBridge.onModel((m) => {
   modell = m;
   setzeSchrift(m.schriftgroesse);
   setzeScroll(m.scrollZeilen);
+  figurenBildrateSetzen(m.figurenBildrate);
   // Was auf der Flaeche liegt, entscheidet der Hauptprozess -- hier wird es nur
   // ausgefuehrt. Zuerst, damit der Baum darunter schon den neuen Stand zeichnet.
   chatbuehne.nachModell(

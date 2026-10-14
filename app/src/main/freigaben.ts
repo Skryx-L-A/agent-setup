@@ -15,10 +15,12 @@
 //                        Sessionmodell (sessions.ts) -- nichts hier wird
 //                        geraten. Eine Markerdatei, deren Pane nicht mehr
 //                        lebt, ist hinfaellig und wird aufgeraeumt.
+import { guardAnnahmeErlaubt, menschlicherAbsender, type Herkunftsbeleg } from './herkunft';
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, existsSync, unlinkSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, existsSync, statSync, unlinkSync, type Stats } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { panesHinweisOderFrisch } from './sessions';
 import type { SessionInfo } from './sessions';
 
@@ -103,7 +105,28 @@ export function decideRequest(
   action: 'approve' | 'reject',
   reason: string,
   wbDecideBin: string,
+  // HERKUNFT (13.10.2026 Annehmen, 14.10.2026 auch Ablehnen). Ohne Beleg gilt der
+  // Aufruf als Steuerkanal. Annehmen und Ablehnen gehen dann NUR mit einem echten
+  // Klick in einer Oberflaeche dieses Kerns oder einem geprueften Mobilbeleg; ohne
+  // Beleg gibt es hier eine Absage und KEIN wb-decide. Der Kern-Prozess hat nicht
+  // selbst eine Herkunft: liegt er unter einem Orchestrator-Pane (Test oder Start aus
+  // dem Pane), wuerde wb-decide ihn als Orchestrator messen. Der Hauptagent
+  // entscheidet direkt mit wb-decide. Mit Beleg misst wb-decide noch einmal (wb-mensch
+  // M2): dafuer traegt nur ein solcher Aufruf WB_MENSCH_QUELLE und WB_APP_PID.
+  beleg: Herkunftsbeleg = { art: 'steuerkanal' },
+  appPid: number = process.pid,
 ): DecideResult {
+  const mensch = menschlicherAbsender(beleg);
+  if (!mensch) {
+    return {
+      ok: false,
+      output: (action === 'approve'
+        ? 'Annehmen geht nur mit einem echten Klick in diesem Fenster.'
+        : 'Ablehnen geht nur mit einem echten Klick in diesem Fenster.')
+        + ' Ein Skript oder der Steuerkanal kann einen Antrag nicht entscheiden -- der'
+        + ' Orchestrator entscheidet in seinem Pane mit `wb-decide`.',
+    };
+  }
   const home = dirname(dirname(requestsDir));
   // FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden): ein externes
   // Werkzeug ohne `timeout` kann den Hauptprozess unbegrenzt anhalten, wenn es
@@ -112,7 +135,13 @@ export function decideRequest(
   // Hauses (schluesselbund.ts).
   const r = spawnSync(wbDecideBin, [reqPath, action, reason], {
     encoding: 'utf8',
-    env: { ...process.env, HOME: home },
+    env: {
+      ...process.env,
+      HOME: home,
+      // `undefined` laesst Node weg: eine geerbte Angabe darf ohne Klick nicht mitreisen.
+      WB_MENSCH_QUELLE: mensch ? 'oberflaeche' : undefined,
+      WB_APP_PID: mensch ? String(appPid) : undefined,
+    },
     timeout: 10_000,
   });
   if (r.error || r.signal) {
@@ -358,13 +387,43 @@ export interface GuardLogGruppe {
  * Nur die letzten `limitZeilen` werden gelesen -- die Datei waechst nur an,
  * und ein Verlauf ueber Monate soll ein Programm nicht komplett einlesen.
  */
-export function readGuardLog(pfad: string, limitZeilen = 5000): GuardLogGruppe[] {
+export function readGuardLog(pfad: string, limitZeilen = 5000, jetztMs: number = Date.now()): GuardLogGruppe[] {
+  let stand: Stats;
+  try {
+    stand = statSync(pfad);
+  } catch {
+    return [];
+  }
+  // NUR DER AKTUELLE MONAT (Entscheidung alice, 09.10.2026): aeltere Monate liegen als
+  // guard-blocks.YYYY-MM.log.gz neben der Datei (hooks/lib/guard_log.py). Eine Datei, die
+  // noch Eintraege eines aelteren Monats traegt (die Rotation geschieht beim naechsten
+  // Schreiben), zeigt sie trotzdem nicht. Zeilen ohne lesbaren Zeitstempel bleiben.
+  const jetzt = new Date(jetztMs);
+  const monatAb = Date.UTC(jetzt.getUTCFullYear(), jetzt.getUTCMonth(), 1);
+  // ZWISCHENSPEICHER (09.10.2026, Auftrag perf-kern): der Kern rief das im 2-s-Takt und las die
+  // ganze Datei (2,3 MB) jedes Mal neu. Unveraendert (mtime, Groesse), gleiches Limit und gleicher
+  // Monat heisst: gleiches Ergebnis.
+  const hit = guardLogZwischenspeicher.get(pfad);
+  if (hit && hit.mtimeMs === stand.mtimeMs && hit.size === stand.size
+      && hit.limit === limitZeilen && hit.monatAb === monatAb) {
+    return hit.gruppen;
+  }
   let roh = '';
   try {
     roh = readFileSync(pfad, 'utf8');
   } catch {
     return [];
   }
+  const gruppen = gruppiereGuardLog(roh, limitZeilen, monatAb);
+  guardLogZwischenspeicher.set(pfad, { mtimeMs: stand.mtimeMs, size: stand.size, limit: limitZeilen, monatAb, gruppen });
+  return gruppen;
+}
+
+const guardLogZwischenspeicher = new Map<string, {
+  mtimeMs: number; size: number; limit: number; monatAb: number; gruppen: GuardLogGruppe[];
+}>();
+
+function gruppiereGuardLog(roh: string, limitZeilen: number, monatAb: number): GuardLogGruppe[] {
   const zeilen = roh.split('\n').filter((z) => z.trim()).slice(-limitZeilen);
   const gruppen = new Map<string, GuardLogGruppe>();
   for (const zeile of zeilen) {
@@ -380,6 +439,7 @@ export function readGuardLog(pfad: string, limitZeilen = 5000): GuardLogGruppe[]
     const schluessel = `${guard} ${reason}`;
     const zeit = Date.parse(String(obj.ts ?? ''));
     const ms = Number.isFinite(zeit) ? zeit : 0;
+    if (ms && ms < monatAb) continue;
     const bestehend = gruppen.get(schluessel);
     if (!bestehend) {
       gruppen.set(schluessel, { guard, reason, anzahl: 1, ersteMs: ms, letzteMs: ms, letzterBefehl: String(obj.command ?? '') });
@@ -427,22 +487,52 @@ function zeitstempel(ms: number): string {
  * erteilte Freigabe, die nie eingeloest wurde, unsichtbar.
  */
 function verlaufAnhaengen(logFile: string, guard: string, reason: string, eintrag: GuardBlockEntry): void {
+  const zeile = JSON.stringify({
+    ts: zeitstempel(Date.now()),
+    guard,
+    reason,
+    command: eintrag.command.slice(0, 2000),
+    cwd: eintrag.cwd,
+    session_id: eintrag.sessionId,
+    pane: eintrag.pane,
+  });
   try {
+    if (verlaufUeberHelfer(logFile, zeile)) return;
     const d = dirname(logFile);
     if (d) mkdirSync(d, { recursive: true });
-    appendFileSync(logFile, `${JSON.stringify({
-      ts: zeitstempel(Date.now()),
-      guard,
-      reason,
-      command: eintrag.command.slice(0, 2000),
-      cwd: eintrag.cwd,
-      session_id: eintrag.sessionId,
-      pane: eintrag.pane,
-    })}\n`);
+    appendFileSync(logFile, `${zeile}\n`);
   } catch {
     // Ein nicht schreibbarer Verlauf haelt die Entscheidung nicht auf; die
     // Freigabedatei selbst ist der wirksame Teil.
   }
+}
+
+/**
+ * DIE SPERRE DES VERLAUFS (09.10.2026, Auftrag perf-aufgaben). `guard-blocks.log` rotiert monatlich
+ * (hooks/lib/guard_log.py); die Schreiber halten dabei `flock` auf `<log>.lock`, damit keine Zeile in
+ * eine Datei faellt, die gerade umbenannt und gelesen wird. Node hat kein `flock` -- und eine eigene
+ * Sperrdatei mit anderem Protokoll sperrte den Python-Schreiber nicht aus. Deshalb schreibt der Kern
+ * ueber denselben Weg wie der Hook: ein kleiner Python-Aufruf (`guard_log.py anhaengen`), die Zeile
+ * auf stdin. Der Kern schreibt hier selten (ein Klick), ein Start kostet etwa 30 ms.
+ * Nie eine Zeile verlieren: fehlt die Datei oder scheitert der Aufruf, schreibt der Aufrufer
+ * die Zeile wie bisher selbst (dann deckt nur die Gnadenfrist der Rotation, 0,2 s).
+ */
+function verlaufUeberHelfer(logFile: string, zeile: string): boolean {
+  const helfer = guardLogHelfer();
+  if (!helfer) return false;
+  const l = spawnSync(process.env.AWB_PYTHON ?? 'python3', ['-I', helfer, 'anhaengen', '--log', logFile],
+    { input: zeile, encoding: 'utf8', timeout: 10_000, stdio: ['pipe', 'ignore', 'ignore'] });
+  return l.status === 0;
+}
+
+/** `guard_log.py`: AWB_GUARD_LOG_PY, sonst neben diesem Programm im Repo (hooks/lib), sonst die ausgerollte Kopie. */
+export function guardLogHelfer(): string | null {
+  const kandidaten = [
+    process.env.AWB_GUARD_LOG_PY ?? '',
+    typeof __dirname === 'string' ? resolve(__dirname, '..', '..', '..', 'hooks', 'lib', 'guard_log.py') : '',
+    join(homedir(), '.claude', 'hooks', 'lib', 'guard_log.py'),
+  ];
+  return kandidaten.find((k) => k && existsSync(k)) ?? null;
 }
 
 export interface FreigabeErgebnis {
@@ -488,14 +578,30 @@ export function freigabeErteilen(
     logFile: string;
     appPid: number;
   },
-  mensch: boolean,
+  // Paket 10: der typisierte Herkunftsbeleg (herkunft.ts). Das Boolean bleibt als
+  // bisherige Form gleichbedeutend mit einem Klick in der Oberflaeche (`true` =
+  // isTrusted), damit kein Aufrufer seine Bedeutung aendert.
+  mensch: boolean | Herkunftsbeleg,
 ): FreigabeErgebnis {
   if (!eintrag.wartet) return { ok: false, output: 'Dieser Eintrag wartet nicht auf eine Freigabe.' };
+  const beleg: Herkunftsbeleg = typeof mensch === 'boolean' ? { art: 'oberflaeche', echt: mensch } : mensch;
+  if (beleg.art === 'mobilgeraet') {
+    // Die Geraetesignatur ist im Kern geprueft, reicht aber nicht bis
+    // `wb-freigabe`, das die Herkunft selbst ueber die Ahnenreihe misst. Bis es
+    // einen Mobilbeleg selbst pruefen kann, bleibt Annehmen per Mobil gesperrt.
+    ablehnungVermerken(umgebung.logFile, eintrag, beleg);
+    return {
+      ok: false,
+      output: 'Annehmen per Mobilgeraet ist gesperrt: der Geraetebeleg reicht nicht bis wb-freigabe. '
+        + 'Ablehnen geht; annehmen am Rechner.',
+    };
+  }
   // Die Begruendung ist FREIWILLIG (19.08.): sie stand hier als Pflicht, obwohl
   // sie nie das war, was eine Freigabe traegt -- das ist die gemessene Herkunft
   // drei Zeilen weiter. Ein Satz Text hat nie jemanden aufgehalten, der ihn
   // hinschreiben wollte.
-  if (!mensch) {
+  if (!guardAnnahmeErlaubt(beleg)) {
+    ablehnungVermerken(umgebung.logFile, eintrag, beleg);
     return {
       ok: false,
       output: 'Freigeben geht nur mit einem echten Klick in diesem Fenster. '
@@ -549,6 +655,25 @@ export function freigabeErteilen(
 }
 
 /**
+ * EINE ABGEWIESENE ANNAHME STEHT IM VERLAUF (13.10.2026). Bis dahin kehrte
+ * `freigabeErteilen` ohne Nachweis vor jedem Verlaufseintrag zurueck, und der
+ * Text erreichte nur die Buehne (`melde()`): ein Versuch, ueber den Steuerkanal
+ * freizugeben, hinterliess keine Spur. Die Zeile nennt nur die Herkunftsart --
+ * keinen Befehl, kein Verzeichnis, keine Begruendung des Aufrufers, denn genau
+ * dieser Aufrufer ist hier nicht vertrauenswuerdig; Pane und Sitzung genuegen
+ * zur Zuordnung.
+ */
+function ablehnungVermerken(logFile: string, eintrag: GuardBlockEntry, beleg: Herkunftsbeleg): void {
+  const art = beleg.art === 'oberflaeche' ? 'Oberflaeche ohne echten Klick' : beleg.art;
+  verlaufAnhaengen(
+    logFile,
+    'muster-freigabe-fehlgeschlagen',
+    `Freigeben abgewiesen: kein echter Klick (Herkunft: ${art}).`,
+    { ...eintrag, command: '', cwd: '' },
+  );
+}
+
+/**
  * Ablehnen: keine Freigabedatei, nur der Marker weg und eine Zeile im Verlauf.
  * Der Worker sieht dieselbe Ablehnung wie vorher, sobald er es erneut
  * versucht -- er bekommt also keine neue Auskunft, aber die Ansicht bleibt
@@ -578,4 +703,106 @@ export function freigabeVerweigern(
     // schon weg
   }
   return { ok: true, output: 'Abgelehnt -- der Befehl bleibt angehalten.' };
+}
+
+/**
+ * NUR BEI AENDERUNG SENDEN (09.10.2026, Auftrag werkbank-cpu). `awb:freigaben`
+ * ging im 2-s-Takt hinaus, auch ohne Aenderung, und traegt den gruppierten
+ * Verlauf (`guardLog`) mit: gemessen 1,21 MB JSON bei 788 Gruppen. Der
+ * Mac-Mantel las das alle zwei Sekunden ein und hing im Leerlauf bei ~60 % CPU.
+ * Beide Empfaenger verwarfen eine gleiche Nutzlast ohnehin (freigaben-view.ts,
+ * KernVerbindung.swift). `vergessen()` gehoert an jede Stelle, an der ein neuer
+ * Empfaenger dazukommt: der naechste Takt schickt ihm dann den vollen Stand --
+ * so spaet, wie er ihn vorher auch bekam.
+ */
+export class NurBeiAenderung {
+  private zuletzt: string | null = null;
+  private seitMs = 0;
+
+  /**
+   * @param form  Bildet den Wert auf die Form ab, die verglichen wird (siehe
+   *              `modellVergleichsform`). Ohne Angabe wird der Wert selbst verglichen.
+   * @param auffrischenMs  Hoechstens so lange bleibt ein gleicher Wert ungesendet; danach geht
+   *              er trotzdem hinaus. Ohne Angabe: nie. Das Netz unter jedem Vergleich, der
+   *              ein Feld absichtlich ausnimmt -- eine Anzeige kann so hoechstens diese Zeit
+   *              veraltet sein, nie einfrieren.
+   */
+  constructor(private readonly form?: (wert: unknown) => unknown, private readonly auffrischenMs = 0,
+    private readonly jetzt: () => number = Date.now) {}
+
+  private text(wert: unknown): string {
+    return JSON.stringify(this.form ? this.form(wert) : wert);
+  }
+
+  /** true, wenn sich `wert` gegenueber dem zuletzt gemeldeten geaendert hat (und merkt ihn). */
+  geaendert(wert: unknown): boolean {
+    const text = this.text(wert);
+    const jetzt = this.jetzt();
+    if (text === this.zuletzt && !(this.auffrischenMs > 0 && jetzt - this.seitMs >= this.auffrischenMs)) return false;
+    this.zuletzt = text;
+    this.seitMs = jetzt;
+    return true;
+  }
+
+  /** `wert` ging ausserhalb des Filters hinaus (erzwungenes Senden): der Empfaenger hat ihn. */
+  merken(wert: unknown): void {
+    this.zuletzt = this.text(wert);
+    this.seitMs = this.jetzt();
+  }
+
+  vergessen(): void {
+    this.zuletzt = null;
+  }
+}
+
+/**
+ * Die Vergleichsform von `awb:model` (09.10.2026, Auftrag perf-kern). Gemessen im Leerlauf:
+ * 192 KB je Nachricht alle 2 s, und von Takt zu Takt aendern sich nur Felder, die allein
+ * die Zeit weiterzaehlt -- ein roher Vergleich faende jedes Mal einen Unterschied.
+ *   * `maschinen[].alter` (Sekunden seit der letzten Antwort) zaehlt als die Stufe, die die
+ *     Empfaenger zeigen: -1 | "gerade eben" (<60 s) | auf Minuten gerundet
+ *     (fuss-status.ts `alterKurz`, Modell.swift `alterText`).
+ *   * `workers[].idleSeconds` wird nur bei `state==='stalled'` angezeigt (renderer.ts
+ *     `zustandText`, Modell.swift `dauerKurz`) und zaehlt dort als Sekunden (<60) oder
+ *     abgerundete Minuten; sonst faellt es aus dem Vergleich.
+ *   * `workers[].contextTokens` zaehlt als die gezeigte Stufe (k-gerundet, ab 1 Mio. M mit einer Stelle);
+ *     `contextPercent` bleibt exakt.
+ *   * `sessions[].revive.reason` traegt das Alter der Unterhaltung („ist 12 min alt und traegt“, revive.ts
+ *     `fortsetzenHinweis`); die Zahl wandert jede Minute und bleibt aussen vor -- ob der Hinweis da ist,
+ *     zaehlt weiter. Die Zahl kommt mit der naechsten Auffrischung (hoechstens 30 s spaeter).
+ *   * `workers[].cpu` (ps-Mittel, driftet jeden Takt) zeigt kein Empfaenger an: ausgenommen.
+ * Alles andere -- auch eine Stufe, die kippt -- ist eine Aenderung und geht hinaus.
+ */
+export function modellVergleichsform(m: unknown): unknown {
+  if (!m || typeof m !== 'object') return m;
+  const o = m as Record<string, unknown>;
+  const stufe = (alter: unknown) => (typeof alter !== 'number' || alter < 0 ? -1 : alter < 60 ? 0 : Math.round(alter / 60));
+  // Die Tokenzahl, wie die Empfaenger sie zeigen (renderer.ts / Modell.swift): roh bis 999, dann auf k
+  // gerundet, ab einer Million eine Nachkommastelle in M. Ein wachsendes Transcript aendert sie sonst
+  // bei jeder Zeile.
+  const tokenStufe = (t: unknown) => (typeof t !== 'number' || t <= 0 ? 0
+    : t < 1000 ? t : t < 1_000_000 ? `${Math.round(t / 1000)}k` : `${(t / 1_000_000).toFixed(1)}M`);
+  const arbeiter = (w: Record<string, unknown>) => {
+    const { cpu: _cpu, idleSeconds, ...rest } = w;
+    const r = 'contextTokens' in rest ? { ...rest, contextTokens: tokenStufe(rest.contextTokens) } : rest;
+    if (w.state !== 'stalled' || typeof idleSeconds !== 'number') return r;
+    return { ...r, idleSeconds: idleSeconds < 0 ? -1 : idleSeconds < 60 ? idleSeconds : `m${Math.floor(idleSeconds / 60)}` };
+  };
+  return {
+    ...o,
+    maschinen: Array.isArray(o.maschinen)
+      ? o.maschinen.map((x: Record<string, unknown>) => ({ ...x, alter: stufe(x.alter) }))
+      : o.maschinen,
+    sessions: Array.isArray(o.sessions)
+      ? o.sessions.map((s: Record<string, unknown>) => {
+        const mitWorkern = Array.isArray(s.workers)
+          ? { ...s, workers: s.workers.map((w: Record<string, unknown>) => arbeiter(w)) }
+          : s;
+        const rev = s.revive as Record<string, unknown> | undefined;
+        return rev && typeof rev.reason === 'string'
+          ? { ...mitWorkern, revive: { ...rev, reason: rev.reason.replace(/ist .{1,20}? alt und traegt/, 'ist # alt und traegt') } }
+          : mitWorkern;
+      })
+      : o.sessions,
+  };
 }

@@ -15,6 +15,9 @@ Abschnitt „GPT-Orchestrator und GPT-Worker“. Historische Kontingente, Modell
 Nur-Luna/Terra-Aussagen sind keine aktuelle Verfügbarkeit. Native Subagenten über ihre
 Werkzeuge koordinieren; tmux-Verfahren nur für Werkbank-Panes. Keine Pflicht zu einem
 Reviewer allein wegen Delegation oder Mehrstufigkeit. Rechte-/Geld-/Produktionsgates bleiben.
+**Vor jedem Worker-Start zuerst `regeln/vergabe.md` vollständig lesen** (2026-09-18): dort stehen
+Worker-Begriff, Messung der Kontingente, feste Spur-Reihenfolge und Parallelität (kostenlose
+Spur höchstens ein Worker, Abos beliebig viele). Die Abschnitte unten liefern Einzelfakten.
 
 ## Abschnitte
 
@@ -40,6 +43,7 @@ Reviewer allein wegen Delegation oder Mehrstufigkeit. Rechte-/Geld-/Produktionsg
 - [Die Standardwahl bei OpenRouter: drei statt vierhundert (2026-08-27)](references/orchestrierung/19.md)
 - [Erst die Fähigkeit, dann Intelligenz und Preis (2026-08-27)](references/orchestrierung/20.md)
 - [Werkbank-Aufgaben (Agents-Feature, seit 2026-09-10)](references/orchestrierung/21.md)
+- [Cline Pass steht vor den beiden Abos (2026-09-16)](references/orchestrierung/22.md)
 
 Erhaltungsnachweis: `references/orchestrierung/manifest.json` enthält Reihenfolge und SHA-256
 aller Abschnitte; ihre Verkettung ergibt die vollständige vorherige Datei.

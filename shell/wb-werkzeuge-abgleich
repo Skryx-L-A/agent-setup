@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+# wb-werkzeuge-abgleich -- vergleicht den Befund von `wb-werkzeuge status --json` auf
+# dieser Maschine mit dem der anderen Maschine (Vorgabe peer, per SSH) und meldet nur
+# Abweichungen, die die Quelle nicht durch `maschinen` erklaert. Schreibt nichts.
+#
+# Exit: 0 keine unerklaerte Abweichung, 1 mindestens eine, 2 ein Befund fehlt oder ist
+# unlesbar oder beide Befunde stammen von derselben Maschine (dann gibt es nichts zu
+# vergleichen).
+#
+# Umlenkung (Tests und andere Pfade): WB_WERKZEUGE_BIN (lokales Werkzeug, Vorgabe neben
+# diesem Skript), WB_WERKZEUGE_SSH (SSH-Befehl, Vorgabe "ssh -o BatchMode=yes"),
+# WB_WERKZEUGE_SRC (Quelle, Vorgabe werkzeuge.default.json neben diesem Skript).
+# BatchMode, damit ssh nie nach einem Passwort fragt und keinen Dialog beim Menschen
+# auslöst.
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+HIER = os.path.dirname(os.path.abspath(__file__))
+TIMEOUT = 60
+
+
+class Abbruch(Exception):
+    pass
+
+
+def befund_holen(argv, woher):
+    """Fuehrt `<argv> status --json` aus. Gibt den Befund als dict zurueck oder bricht ab."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT)
+        befund = json.loads(p.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise Abbruch("%s: status --json liess sich nicht lesen (%s)" % (woher, exc))
+    if not isinstance(befund, dict) or not befund.get("maschine"):
+        raise Abbruch("%s: status --json lieferte kein Befund-Objekt mit 'maschine'" % woher)
+    return befund
+
+
+def quelle_laden():
+    pfad = os.environ.get("WB_WERKZEUGE_SRC") or os.path.join(HIER, "werkzeuge.default.json")
+    try:
+        with open(pfad, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as exc:
+        raise Abbruch("Quelle %s ist nicht lesbar (%s)" % (pfad, exc))
+
+
+def erlaubte_maschinen(quelle, art, harness, name):
+    """Maschinen, auf denen der Eintrag laut Quelle gelten soll. None heisst: alle."""
+    if art in ("mcp", "hooks", "prompts"):
+        eintrag = (quelle.get(art) or {}).get(name)
+        if isinstance(eintrag, dict) and eintrag.get("maschinen"):
+            return set(eintrag["maschinen"])
+        return None
+    if art == "plugins":
+        gruppe = (quelle.get("plugins") or {}).get(harness) or {}
+        kurz = name.split("@")[0]
+        for maschine, feld in (("mac", "nur_mac"), ("peer", "nur_peer")):
+            if any(p.split("@")[0] == kurz for p in gruppe.get(feld) or []):
+                return {maschine}
+    return None
+
+
+def abgleichen(quelle, lokal, fern):
+    """Liefert die unerklaerten Abweichungen als Liste von (Eintrag, Text)."""
+    namen = [lokal["maschine"], fern["maschine"]]
+    if namen[0] == namen[1]:
+        raise Abbruch("beide Befunde stammen von derselben Maschine (%s) -- nichts zu vergleichen"
+                      % namen[0])
+    stand = {namen[0]: {}, namen[1]: {}}
+    for maschine, befund in ((namen[0], lokal), (namen[1], fern)):
+        for e in befund.get("eintraege") or []:
+            stand[maschine][(e.get("harness"), e.get("art"), e.get("name"))] = e.get("zustand")
+    abweichungen = []
+    for key in sorted(set(stand[namen[0]]) | set(stand[namen[1]]), key=str):
+        zustaende = {m: stand[m].get(key, "NICHT-VORHANDEN") for m in namen}
+        if zustaende[namen[0]] == zustaende[namen[1]]:
+            continue
+        harness, art, name = key
+        erlaubt = erlaubte_maschinen(quelle, art, harness, name or "")
+        gilt = [m for m in namen if erlaubt is None or m in erlaubt]
+        nicht_gilt = [m for m in namen if m not in gilt]
+        if any(zustaende[m] == "NICHT-VORHANDEN" for m in gilt):
+            grund = "fehlt auf %s" % ", ".join(m for m in gilt if zustaende[m] == "NICHT-VORHANDEN")
+        elif any(zustaende[m] != "NICHT-VORHANDEN" for m in nicht_gilt):
+            grund = "steht auf %s, die Quelle nennt diese Maschine nicht" % ", ".join(
+                m for m in nicht_gilt if zustaende[m] != "NICHT-VORHANDEN")
+        elif len(gilt) == 2:
+            grund = "Zustand weicht ab"
+        else:
+            continue
+        text = "%s / %s" % (zustaende[namen[0]], zustaende[namen[1]])
+        abweichungen.append(("%s %s %s" % (harness, art, name),
+                             "%s: %s, %s: %s -- %s" % (namen[0], zustaende[namen[0]],
+                                                       namen[1], zustaende[namen[1]], grund)))
+    return namen, abweichungen
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--maschine", default="peer",
+                    help="Maschine, deren Befund per SSH geholt wird (Vorgabe: peer)")
+    args = ap.parse_args()
+    try:
+        lokal_bin = os.environ.get("WB_WERKZEUGE_BIN") or os.path.join(HIER, "wb-werkzeuge")
+        lokal = befund_holen([lokal_bin, "status", "--json"], "lokal")
+        ssh = shlex.split(os.environ.get("WB_WERKZEUGE_SSH", "ssh -o BatchMode=yes"))
+        fern = befund_holen(ssh + [args.maschine, "wb-werkzeuge", "status", "--json"],
+                            "ssh %s" % args.maschine)
+        namen, abweichungen = abgleichen(quelle_laden(), lokal, fern)
+    except Abbruch as exc:
+        print("wb-werkzeuge-abgleich: %s" % exc, file=sys.stderr)
+        return 2
+    for eintrag, text in abweichungen:
+        print("[WERKZEUG-ABGLEICH] %s: %s -- durch maschinen der Quelle nicht erklaert" % (eintrag, text))
+    if not abweichungen:
+        print("wb-werkzeuge-abgleich: sauber -- keine unerklaerte Abweichung zwischen %s und %s."
+              % (namen[0], namen[1]))
+        return 0
+    print("wb-werkzeuge-abgleich: %d unerklaerte Abweichung(en) zwischen %s und %s."
+          % (len(abweichungen), namen[0], namen[1]))
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

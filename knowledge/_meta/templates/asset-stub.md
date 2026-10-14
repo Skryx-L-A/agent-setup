@@ -1,11 +1,17 @@
 ---
+# Vorlage für den STUB einer Binärdatei in <branch>/_assets/ (Graph-Node, über den die Datei auffindbar
+# ist). Regeln: Vault Git-LFS Policy. Kommentarblock beim Anlegen löschen.
+id: "{{ulid}}"   # ULID, einmal vergeben, nie ändern (Erzeugung: siehe note.md)
+schema: 4
 title: "{{title}}"
 type: asset
-branch: 10-global   # 10-global | 20-projects/<project> | 30-topics/<topic>
+class: knowledge
 path: _assets/{{filename}}   # relativ zum Branch-Ordner
 mime: "{{mime-type}}"          # z.B. application/pdf, image/png
 source: "{{herkunft}}"         # woher die Datei kommt (URL, wer sie geschickt hat, Export-Quelle)
 created: "{{date}}"
+stand: "{{YYYY-MM}}"
+beleg: berichtet     # gemessen | berichtet
 ---
 
 Für künftige Sessions: <wann diese Datei geöffnet werden sollte>

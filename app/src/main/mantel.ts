@@ -37,7 +37,7 @@
 //
 // DER SOCKET ENTSTEHT NUR AUF VERLANGEN (AWB_MANTEL_SOCKET). Ohne die
 // Variable laeuft die Electron-Fassung unveraendert: kein Server, keine Datei.
-import { createServer, Server, Socket } from 'node:net';
+import { connect, createServer, Server, Socket } from 'node:net';
 import { chmodSync, existsSync, mkdirSync, statSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -49,6 +49,26 @@ export interface MantelAnschluss {
   invoke(kanal: string, args: unknown[]): Promise<unknown>;
   /** Ein Mantel hat sich angemeldet -- Zeit, ihm den Anfangszustand zu schicken. */
   verbunden(): void;
+}
+
+/**
+ * Ob eine vorhandene Socket-Datei niemandem mehr gehoert. Nur ein abgewiesener
+ * Verbindungsversuch (ECONNREFUSED) oder eine inzwischen fehlende Datei (ENOENT)
+ * gilt als verwaist; eine Antwort, eine Zeitueberschreitung oder jeder andere
+ * Fehler heisst: nicht anfassen.
+ */
+export function socketVerwaist(pfad: string, fristMs = 300): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = connect(pfad);
+    const fertig = (verwaist: boolean) => {
+      clearTimeout(uhr);
+      sock.destroy();
+      resolve(verwaist);
+    };
+    const uhr = setTimeout(() => fertig(false), fristMs);
+    sock.once('connect', () => fertig(false));
+    sock.once('error', (e: NodeJS.ErrnoException) => fertig(e.code === 'ECONNREFUSED' || e.code === 'ENOENT'));
+  });
 }
 
 export class MantelKanal {
@@ -75,6 +95,12 @@ export class MantelKanal {
       }
       // Der Kern haelt genau EINEN Mantel-Socket, und er wird beim Start gesetzt:
       // eine liegengebliebene Datei gehoert einem Kern, den es nicht mehr gibt.
+      // ERST FRAGEN, DANN LOESCHEN (27.09.2026): ein Test-Kern mit geerbtem
+      // AWB_MANTEL_SOCKET loeschte den Socket des laufenden Kerns. Antwortet dort
+      // jemand, bleibt die Datei liegen; verwaist ist sie nur bei ECONNREFUSED/ENOENT.
+      if (!(await socketVerwaist(this.pfad))) {
+        throw new Error(`Mantel-Socket gehoert einem laufenden Kern: ${this.pfad} -- Test mit AWB_* aus der Live-Umgebung?`);
+      }
       unlinkSync(this.pfad);
     }
     const server = createServer((sock) => this.bedienen(sock));

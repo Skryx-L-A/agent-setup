@@ -51,6 +51,10 @@ def command(config: dict) -> tuple[list[str], dict[str, str]]:
     }
     for name, value in config.get("extra_env") or []:
         env[name] = value
+    # Kein Prozess ueberlebt den Zug (WorkbenchOrchestrator, 10.10.2026): ohne Hintergrundaufgaben bietet das
+    # Bash-Werkzeug `run_in_background` nicht an, gemessen an 2.1.295. Mit dem Parameter setzte `claude -p` den Zug
+    # nach der Hintergrundmeldung mit zweitem init/result fort; stream_befund wertete das als `unclear`.
+    env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
     argv = [
         config["claude_binary"], "-p", "--output-format", "stream-json", "--verbose",
         "--model", model,

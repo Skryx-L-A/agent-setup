@@ -1,0 +1,699 @@
+#!/bin/bash
+# wb-jev — lokaler Jev-kompatibler Entscheidungsdienst fuer Agenten und Projekte.
+#
+# Jev-artige Modelle ("System One", https://docs.typesafe.ai) beantworten
+# typisierte Fragen (noul, choice, score) zu einem Zustand mit kalibrierten
+# Wahrscheinlichkeiten. Dieses Werkzeug startet und befragt den lokalen Dienst
+# jev/dienst/server.py, der dasselbe Wire-Format spricht (POST /v1/systemone),
+# nur auf 127.0.0.1 lauscht und sein Backend (einen Runner der Spur
+# jev-kandidaten) aus der Registry nimmt: models.json, Liste "entscheider".
+# Protokoll fuer Backends: jev/dienst/BACKEND.md, Nutzung: jev/dienst/README.md.
+#
+# Usage:
+#   wb-jev frage <zustand-datei> <fragen-datei> [--backend <id>] [--modell <name>]
+#         Stellt die Fragen, startet den Dienst bei Bedarf (Vorgabe-Backend) und
+#         schreibt die Jev-Antwort als JSON auf stdout. Zustand: *.json wird als
+#         JSON gelesen, jede andere Datei als Text; "-" liest stdin. Fragen: eine
+#         JSON-Map typisierter Fragen (oder ein Objekt mit "questions").
+#   wb-jev ensure [--backend <id>] [--frist <minuten>]
+#         Startet den Dienst, falls er nicht laeuft; stdout: Basis-URL.
+#   wb-jev status   JSON zum laufenden Dienst (mit dem naechsten Sperrfenster); Exit 1, wenn keiner laeuft.
+#   wb-jev stop     Beendet Dienst und Backend, gibt die Belegung frei.
+#   wb-jev backends Die Entscheider aus der Registry (JSON).
+#   wb-jev lauf <fragen.jsonl> <antworten.jsonl> [--backend <id>] [--split dev|test|all] [--max <n>]
+#         Messlauf: jede Frage des Satzes (jev/FORMAT.md 5.1) an den Dienst, Antworten
+#         als FORMAT.md 5.2 angehaengt; Auswertung mit jev/messen.py.
+#
+# Exit: 0 ok, 1 Fehler/Ablehnung, 2 Aufruf falsch, 3 laeuft bereits mit einem
+# anderen Backend (erst `wb-jev stop`, damit niemand einem anderen Projekt das
+# Backend unter den Fuessen wechselt).
+#
+# Sicherungen wie bei wb-splash-server: Speicher ueber wb-belegung (Gewichte aus
+# der Registry, ohne Buchung kein Start), Start ueber wb-nohup (Eigentuemer),
+# Leerlaufwache im Dienst (Vorgabe 20 min, dann beendet er sich samt Backend und
+# Belegung), Erfolg erst nach beantworteter /health-Probe.
+#
+# Optionale Registry-Felder je Backend (jev/dienst/README.md): sperrfenster (kein Start
+# und kein Betrieb in diesen Ortszeiten der Maschine), minFreiVramGib (kein Start bei
+# weniger freiem GPU-Speicher, nur wo nvidia-smi vorhanden ist), runnerArgs (Argumente
+# des Runners je Maschine). Nur fuer Tests: WB_JEV_JETZT=HH:MM[:SS], WB_JEV_NVIDIA_SMI=<pfad>,
+# WB_JEV_MASCHINE=mac|peer.
+#
+# Port 8095 (Vorgabe). WB_JEV_PORT stellt ihn um; 0 heisst: freien Port waehlen,
+# der tatsaechliche steht in der Standdatei. Tests benutzen immer 0 oder einen
+# eigenen Port, nie 8095 (Regel "fester Port", 2026-08-16).
+set -uo pipefail
+
+PORT="${WB_JEV_PORT:-8095}"
+HOSTB=127.0.0.1
+STATEDIR="$HOME/.local/state/wb-jev"
+AKTUELL="$STATEDIR/aktuell.json"
+LETZTER="$STATEDIR/letzter.json"
+SPERRE="$STATEDIR/sperre"
+WBB="$HOME/.local/bin/wb-belegung"
+WBN="$HOME/.local/bin/wb-nohup"
+LEERLAUF_S="${WB_JEV_LEERLAUF_S:-1200}"
+FRIST_VORGABE=150
+SYSTEMD_RUN="${WB_JEV_SYSTEMD_RUN:-systemd-run}"
+SYSTEMCTL="${WB_JEV_SYSTEMCTL:-systemctl}"
+
+err() { printf 'wb-jev: %s\n' "$*" >&2; }
+
+# Wurzel mit dienst/ und kandidaten/: ausgerollt ~/.local/share/wb-jev, im Repo
+# der Ordner jev/ neben shell/ (so laeuft das Werkzeug auch ungerollt aus dem
+# Baum, etwa in Tests).
+SELBST="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKRIPT="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+if [ -n "${WB_JEV_HEIM:-}" ]; then
+  HEIM="$WB_JEV_HEIM"
+elif [ -f "$SELBST/../jev/dienst/server.py" ]; then
+  HEIM="$(cd "$SELBST/../jev" && pwd)"
+else
+  HEIM="$HOME/.local/share/wb-jev"
+fi
+SERVER="$HEIM/dienst/server.py"
+
+# Registry: die lebende zuerst. Fehlt ihr die Liste "entscheider" (noch nicht
+# nachgezogen), gilt laut die Vorlage neben dem Werkzeug -- mit Hinweis, denn
+# genau das ist die Falle "wb-ausrollen legt neue Registry-Schluessel nicht an".
+REGISTRY="${WB_JEV_REGISTRY:-$HOME/.claude/workbench/models.json}"
+VORLAGE="${WB_JEV_VORLAGE:-$SELBST/models.default.json}"
+
+maschine() {
+  [ -n "${WB_JEV_MASCHINE:-}" ] && { echo "$WB_JEV_MASCHINE"; return; }
+  case "$(uname -s)" in
+    Darwin) echo mac ;;
+    Linux) echo peer ;;
+    *) uname -s ;;
+  esac
+}
+
+# Liest den Eintrag und gibt TSV aus: id runner python gewichteGb startFristS anfrageFristS warteFristS
+# sperrfenster(JSON, nur die dieser Maschine) minFreiVramGib runnerArgs(JSON, nur die dieser Maschine).
+# Kein Feld ist leer (read mit Tab als Trenner verschluckt leere Felder).
+# Ablehnungen kommen als Text auf stderr mit Exit 1.
+backend_aufloesen() {
+  python3 -B - "$REGISTRY" "$VORLAGE" "$HEIM" "$(maschine)" "${1:-}" "$(dirname "$SERVER")" <<'PY'
+import json, os, sys
+reg, vorlage, heim, maschine, wunsch, dienstdir = sys.argv[1:]
+def lade(p):
+    try:
+        with open(p) as f:
+            d = json.load(f)
+        return d.get("entscheider") if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+liste = lade(reg)
+if liste is None:
+    liste = lade(vorlage)
+    if liste is None:
+        sys.exit("wb-jev: keine Liste 'entscheider' in %s oder %s — Registry nachziehen (wb-ausrollen)." % (reg, vorlage))
+    sys.stderr.write("wb-jev: Hinweis — %s kennt 'entscheider' noch nicht; nehme die Vorlage %s. "
+                     "wb-ausrollen zieht den Schluessel nach.\n" % (reg, vorlage))
+eintraege = [e for e in liste if isinstance(e, dict) and e.get("id")]
+if wunsch:
+    e = next((x for x in eintraege if x["id"] == wunsch), None)
+    if e is None:
+        sys.exit("wb-jev: Backend '%s' steht nicht in der Registry. Vorhanden: %s"
+                 % (wunsch, " ".join(x["id"] for x in eintraege) or "keins"))
+else:
+    vorgaben = [x for x in eintraege if x.get("vorgabe") and not x.get("nurTest") and x.get("enabled", True)]
+    if not vorgaben:
+        sys.exit("wb-jev: kein Vorgabe-Backend registriert (Feld 'vorgabe'). Ein echtes Backend kommt aus "
+                 "jev-kandidaten; zum Ausprobieren ausdruecklich: --backend jev-attrappe.")
+    if len(vorgaben) > 1:
+        sys.exit("wb-jev: mehrere Vorgabe-Backends (%s) — genau eins darf 'vorgabe' tragen."
+                 % " ".join(x["id"] for x in vorgaben))
+    e = vorgaben[0]
+if e.get("enabled", True) is False:
+    sys.exit("wb-jev: Backend '%s' ist gesperrt (enabled: false)%s." % (e["id"], (": " + e["disabledReason"]) if e.get("disabledReason") else ""))
+m = e.get("machines")
+if m and maschine not in m:
+    sys.exit("wb-jev: Backend '%s' ist fuer %s registriert, nicht fuer %s." % (e["id"], "/".join(m), maschine))
+if "gewichteGb" not in e or isinstance(e["gewichteGb"], bool) or not isinstance(e["gewichteGb"], (int, float)) or e["gewichteGb"] < 0:
+    sys.exit("wb-jev: Backend '%s' nennt keinen Speicherbedarf (gewichteGb) — ohne Buchung kein Start." % e["id"])
+sys.path.insert(0, dienstdir)
+try:
+    import sperre
+    fenster = sperre.pruefe_fenster(e.get("sperrfenster"), "sperrfenster")
+    vram = sperre.pruefe_vram(e.get("minFreiVramGib"), "minFreiVramGib")
+    rargs = sperre.pruefe_runner_args(e.get("runnerArgs"), "runnerArgs")
+except ImportError as x:
+    sys.exit("wb-jev: sperre.py fehlt neben dem Dienst (%s) — jev/dienst ist nicht vollstaendig ausgerollt." % dienstdir)
+except ValueError as x:
+    sys.exit("wb-jev: Backend '%s': ungueltiges Registry-Feld — %s. Kein Start." % (e["id"], x))
+runner = e.get("runner") or ""
+pfad = runner if os.path.isabs(runner) else os.path.join(heim, runner)
+if not runner or not os.path.isfile(pfad):
+    sys.exit("wb-jev: Runner fuer '%s' fehlt (%s)." % (e["id"], pfad or "kein Feld runner"))
+py = os.path.expanduser(e.get("python") or "python3")
+print("\t".join(str(x) for x in (e["id"], pfad, py, e["gewichteGb"],
+                                  e.get("startFristS", 600), e.get("anfrageFristS", 120),
+                                  e.get("warteFristS", 120),
+                                  json.dumps(sperre.fuer_maschine(fenster, maschine), separators=(",", ":")),
+                                  "%g" % vram,
+                                  json.dumps(rargs.get(maschine, []), separators=(",", ":")))))
+PY
+}
+
+# Standfeld lesen (leer, wenn die Datei fehlt oder kaputt ist).
+standfeld() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get(sys.argv[2], "")
+    print("" if v is None else v)
+except Exception:
+    print("")
+PY
+}
+
+gesund() {  # gesund <port>: /health antwortet mit status ok
+  curl -s -m 3 "http://$HOSTB:$1/health" 2>/dev/null | grep -q '"status": "ok"'
+}
+
+port_belegt() {  # lauscht dort schon etwas?
+  python3 - "$1" <<'PY'
+import socket, sys
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+}
+
+# Laeuft ein Dienst aus unserer Standdatei? Toten Stand raeumen.
+laufend() {
+  [ -s "$AKTUELL" ] || return 1
+  local pid port
+  pid="$(standfeld "$AKTUELL" pid)"; port="$(standfeld "$AKTUELL" port)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ -n "$port" ] && gesund "$port"; then
+    return 0
+  fi
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    return 2   # Prozess lebt, antwortet aber nicht (noch nicht oder nicht mehr)
+  fi
+  local kennung; kennung="$(standfeld "$AKTUELL" kennung)"
+  [ -n "$kennung" ] && [ -x "$WBB" ] && "$WBB" gib "$kennung" --fremd >/dev/null 2>&1
+  rm -f "$AKTUELL"
+  return 1
+}
+
+# Ortszeit gegen Sperrfenster. fenster_pruefen json '<liste>' | stand: Exit 0 = ausserhalb (oder
+# keine Fenster), Exit 10 = innerhalb, Meldung auf stdout. Die Rechnung steht in jev/dienst/sperre.py,
+# dieselbe wie in der Wache des Dienstes.
+fenster_pruefen() {
+  python3 -B - "$(dirname "$SERVER")" "$1" "${2:-}" "$AKTUELL" <<'PY'
+import json, sys
+dienstdir, art, roh, stand = sys.argv[1:]
+sys.path.insert(0, dienstdir)
+import sperre
+try:
+    if art == "stand":
+        roh = json.dumps(json.load(open(stand)).get("sperrfenster") or [])
+    fenster = json.loads(roh)
+    uhr = sperre.Uhr()
+except (OSError, ValueError, TypeError) as e:
+    sys.exit("wb-jev: Sperrfenster nicht lesbar: %s" % e)
+jetzt = uhr.jetzt()
+f = sperre.aktuelles(fenster, jetzt)
+if f is None:
+    sys.exit(0)
+print("%s: Ortszeit %02d:%02d:%02d liegt im Fenster, frueheste Freigabe %s."
+      % (sperre.beschreibe(f), jetzt // 3600, jetzt % 3600 // 60, jetzt % 60, f["bis"]))
+sys.exit(10)
+PY
+}
+
+# Freier GPU-Speicher gegen minFreiVramGib. Exit 0 = genug frei oder keine Pruefung (kein nvidia-smi,
+# kein Mindestwert); sonst Meldung auf stderr und Exit 1. Karte 0 ist die, auf die cuda:0 zeigt.
+# nvidia-smi ist da, antwortet aber nicht: kein Start (die Karte ist nicht verlaesslich messbar).
+vram_pruefen() {
+  [ "$(python3 -c 'import sys; print(1 if float(sys.argv[1]) > 0 else 0)' "$1")" = 1 ] || return 0
+  python3 -B - "$1" "${WB_JEV_NVIDIA_SMI+gesetzt}" "${WB_JEV_NVIDIA_SMI:-}" <<'PY'
+import shutil, subprocess, sys
+gib, gesetzt, pfad = float(sys.argv[1]), sys.argv[2], sys.argv[3]
+smi = pfad if gesetzt else shutil.which("nvidia-smi")
+if not smi or not shutil.which(smi):
+    sys.exit(0)                      # kein nvidia-smi (Mac): keine Pruefung
+try:
+    r = subprocess.run([smi, "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                       capture_output=True, text=True, timeout=20)
+    frei = int(r.stdout.strip().splitlines()[0].strip())
+    if r.returncode != 0:
+        raise ValueError("Exit %d" % r.returncode)
+except (OSError, ValueError, IndexError, subprocess.TimeoutExpired) as e:
+    sys.stderr.write("wb-jev: nvidia-smi (%s) liefert keinen freien GPU-Speicher (%s) — kein Start.\n" % (smi, e))
+    sys.exit(1)
+if frei < gib * 1024:
+    sys.stderr.write("wb-jev: GPU-Speicher: %d MiB (%.2f GiB) frei, %g GiB verlangt (minFreiVramGib) — kein Start.\n"
+                     % (frei, frei / 1024, gib))
+    sys.exit(1)
+PY
+}
+
+sperre_nehmen() {
+  mkdir -p "$STATEDIR"
+  local i
+  for i in $(seq 1 150); do
+    if mkdir "$SPERRE" 2>/dev/null; then
+      echo $$ > "$SPERRE/pid"
+      return 0
+    fi
+    local halter; halter="$(cat "$SPERRE/pid" 2>/dev/null)"
+    if [ -n "$halter" ] && ! kill -0 "$halter" 2>/dev/null; then
+      rm -rf "$SPERRE"; continue
+    fi
+    sleep 0.2
+  done
+  # Lange Starts (Modell laedt) halten die Sperre laenger als 30 s; dann ehrlich sagen.
+  err "ein anderer Start haelt die Sperre ($SPERRE, PID ${halter:-?}) — spaeter erneut versuchen."
+  return 1
+}
+sperre_geben() { [ -d "$SPERRE" ] && [ "$(cat "$SPERRE/pid" 2>/dev/null)" = "$$" ] && rm -rf "$SPERRE"; return 0; }
+
+# Der Unit-Befehl bucht im eigenen cgroup und ersetzt seine MainPID durch den Server.
+# Interner Einstieg; die Serverargumente wurden bereits von ensure aufgeloest.
+cmd_unit_start() {
+  local gew="$1" frist="$2" id="$3"; shift 3
+  exec >>"$STATEDIR/unit.log" 2>&1
+  local kennung=""
+  belegung_nehmen "$gew" "$frist" "$id" || return 1
+  [ -n "$kennung" ] && set -- "$@" --belegung "$kennung" --wbb "$WBB"
+  exec "$@"
+}
+
+belegung_nehmen() {
+  local gew="$1" frist="$2" id="$3"
+  if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)' "$gew"; then
+    [ -x "$WBB" ] || { err "wb-belegung fehlt ($WBB) — ohne Speicherbuchung kein Start von '$id' (${gew} GiB)."; return 1; }
+    local aus rc
+    aus="$("$WBB" nimm --gewichte-gb "$gew" --nur-gewichte --modell "$id" --parallel 1 --kv-quant off \
+      --zweck "wb-jev Entscheider $id" --frist "$frist" 2>&1)"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+      printf '%s\n' "$aus" >&2
+      err "Speicher fuer '$id' (${gew} GiB) nicht frei — wb-belegung lehnt ab (Exit $rc). Kein Start."
+      return 1
+    fi
+    kennung="$(printf '%s\n' "$aus" | sed -n 's/.*unter der Kennung \([0-9a-f]\{1,\}\).*/\1/p' | head -1)"
+    [ -n "$kennung" ] || { printf '%s\n' "$aus" >&2; err "wb-belegung nannte keine Kennung — kein Start."; return 1; }
+  fi
+}
+
+startweg() {
+  case "${WB_JEV_STARTWEG:-}" in
+    nohup|unit) echo "$WB_JEV_STARTWEG"; return ;;
+    '') ;;
+    *) err "WB_JEV_STARTWEG nimmt nohup oder unit (nur fuer Tests)."; return 2 ;;
+  esac
+  if [ "$(maschine)" = peer ] &&
+     ! { [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; } &&
+     ! { [ -n "${WB_EIGENTUEMER_TMUX:-}" ] && [ -n "${WB_EIGENTUEMER_TMUX_PANE:-}" ]; } &&
+     [ -z "${WB_EIGENTUEMER_LAUNCHD:-}" ] && [ -z "${WB_EIGENTUEMER_WERKBANK:-}" ] &&
+     command -v "$SYSTEMD_RUN" >/dev/null 2>&1; then
+    echo unit
+  else
+    echo nohup
+  fi
+}
+
+systemctl_user() {
+  python3 - "$SYSTEMCTL" "$@" <<'PYCTL'
+import subprocess, sys
+try:
+    sys.exit(subprocess.run([sys.argv[1], "--user", *sys.argv[2:]], timeout=10).returncode)
+except (OSError, subprocess.TimeoutExpired) as e:
+    sys.exit("wb-jev: systemctl: %s" % e)
+PYCTL
+}
+
+cmd_ensure() {
+  local wunsch="" frist="$FRIST_VORGABE"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --backend) [ $# -ge 2 ] || { err "--backend braucht einen Namen"; return 2; }; wunsch="$2"; shift 2 ;;
+      --frist) [ $# -ge 2 ] || { err "--frist braucht Minuten"; return 2; }; frist="$2"; shift 2 ;;
+      *) err "unbekannte Angabe '$1'"; return 2 ;;
+    esac
+  done
+  [ -f "$SERVER" ] || { err "Dienst fehlt ($SERVER) — jev/dienst ist nicht ausgerollt."; return 1; }
+  sperre_nehmen || return 1
+  trap sperre_geben EXIT
+  local rc
+  ensure_gesperrt "$wunsch" "$frist"; rc=$?
+  sperre_geben
+  trap - EXIT
+  return $rc
+}
+
+ensure_gesperrt() {
+  local wunsch="$1" frist="$2" zustand=0
+  laufend; zustand=$?
+  if [ "$zustand" -eq 2 ]; then
+    err "der Dienst (PID $(standfeld "$AKTUELL" pid)) lebt, antwortet aber nicht auf /health — 'wb-jev stop' und neu starten."
+    return 1
+  fi
+  if [ "$zustand" -eq 0 ]; then
+    local lauf; lauf="$(standfeld "$AKTUELL" backend)"
+    if [ -n "$wunsch" ] && [ "$wunsch" != "$lauf" ]; then
+      err "laeuft bereits mit Backend '$lauf'; '$wunsch' verlangt. Erst 'wb-jev stop' (andere Nutzer pruefen: wb-jev status)."
+      return 3
+    fi
+    local meldung
+    meldung="$(fenster_pruefen stand)"; local frc=$?
+    if [ "$frc" -eq 10 ]; then
+      err "$meldung Der Dienst laeuft noch und wird beendet."
+      cmd_stop
+      return 1
+    fi
+    echo "http://$HOSTB:$(standfeld "$AKTUELL" port)"
+    return 0
+  fi
+
+  local zeile
+  zeile="$(backend_aufloesen "$wunsch")" || return 1
+  local id runner py gew startfrist anfragefrist wartefrist fenster minvram runnerargs
+  IFS=$'\t' read -r id runner py gew startfrist anfragefrist wartefrist fenster minvram runnerargs <<< "$zeile"
+
+  # Sperrfenster und GPU-Speicher vor jeder Buchung: bei Ablehnung bleibt nichts haengen.
+  local meldung
+  meldung="$(fenster_pruefen json "$fenster")"; local frc=$?
+  if [ "$frc" -eq 10 ]; then
+    err "kein Start von '$id' — $meldung"
+    return 1
+  elif [ "$frc" -ne 0 ]; then
+    [ -n "$meldung" ] && err "$meldung"
+    return 1
+  fi
+  vram_pruefen "$minvram" || return 1
+
+  if [ "$PORT" != 0 ] && port_belegt "$PORT"; then
+    err "auf $HOSTB:$PORT lauscht bereits etwas, das nicht dieser Dienst ist — kein Start. (WB_JEV_PORT stellt den Port um.)"
+    return 1
+  fi
+
+  local kennung="" weg unit="" logfile
+  weg="$(startweg)" || return $?
+  if [ "$weg" = nohup ]; then
+    belegung_nehmen "$gew" "$frist" "$id" || return 1
+    [ -x "$WBN" ] || { err "wb-nohup fehlt ($WBN) — kein Start ohne Eigentuemer."; [ -n "$kennung" ] && "$WBB" gib "$kennung" --fremd >/dev/null 2>&1; return 1; }
+    logfile="$HOME/.local/state/wb-nohup/logs/wb-jev.log"
+  else
+    command -v "$SYSTEMD_RUN" >/dev/null 2>&1 && command -v "$SYSTEMCTL" >/dev/null 2>&1 || {
+      err "systemd-run/systemctl fuer User-Unit fehlen — kein Start."; return 1;
+    }
+    case "$PORT" in ''|*[!0-9]*) err "ungueltiger Port '$PORT'"; return 2 ;; esac
+    unit="wb-jev-$PORT.service"
+    [ "$PORT" = 0 ] && unit="wb-jev-0-$$-$RANDOM.service"
+    logfile="$STATEDIR/unit.log"
+    : > "$logfile"
+  fi
+  mkdir -p "$STATEDIR"; rm -f "$AKTUELL"
+  local args=(python3 "$SERVER" --port "$PORT" --host "$HOSTB" --stand "$AKTUELL" --backend-name "$id"
+              --runner "$runner" --python "$py" --leerlauf-s "$LEERLAUF_S"
+              --start-frist-s "$startfrist" --anfrage-frist-s "$anfragefrist" --warte-frist-s "$wartefrist"
+              --sperrfenster "$fenster" --runner-args "$runnerargs")
+  [ -n "$kennung" ] && args+=(--belegung "$kennung" --wbb "$WBB")
+  local newpid=""
+  if [ "$weg" = unit ]; then
+    # env -i entfernt auch die im User-Manager gespeicherte Umgebung. Nur die
+    # fuer diesen Dienst benoetigten Werte gehen an Buchung und Server.
+    local umgebung=("HOME=$HOME" "PATH=$PATH" "WB_JEV_HEIM=$HEIM") name
+    for name in LANG TZ WB_JEV_JETZT JEV_ATTRAPPE_MODUS; do
+      [ -n "${!name:-}" ] && umgebung+=("$name=${!name}")
+    done
+    "$SYSTEMD_RUN" --user --unit "$unit" --collect --quiet --property=Type=exec \
+      --working-directory "$HEIM" /usr/bin/env -i "${umgebung[@]}" \
+      /bin/bash "$SKRIPT" _unit-start "$gew" "$frist" "$id" "${args[@]}" || {
+        err "systemd-run konnte '$unit' nicht starten."; return 1;
+      }
+  else
+    newpid="$("$WBN" wb-jev -- "${args[@]}")" || {
+      err "wb-nohup konnte den Dienst nicht starten — Log: $logfile"
+      [ -n "$kennung" ] && "$WBB" gib "$kennung" --fremd >/dev/null 2>&1
+      return 1
+    }
+    newpid="$(printf '%s' "$newpid" | tail -1 | tr -dc '0-9')"
+  fi
+
+  local warte_s i ok=0 port=""
+  warte_s="$(python3 -c 'import sys; print(int(float(sys.argv[1])) + 15)' "$startfrist")"
+  for i in $(seq 1 $(( warte_s * 5 ))); do
+    if [ "$weg" = unit ]; then
+      newpid="$(standfeld "$AKTUELL" pid)"
+      systemctl_user is-active --quiet "$unit" >/dev/null 2>&1 || break
+    fi
+    if [ -s "$AKTUELL" ] && [ -n "$newpid" ] && [ "$(standfeld "$AKTUELL" pid)" = "$newpid" ]; then
+      port="$(standfeld "$AKTUELL" port)"
+      gesund "$port" && { ok=1; break; }
+    fi
+    [ -n "$newpid" ] && ! kill -0 "$newpid" 2>/dev/null && break
+    sleep 0.2
+  done
+  if [ "$ok" -ne 1 ]; then
+    err "Dienst mit Backend '$id' kam nicht hoch — Log: $logfile"
+    tail -5 "$logfile" 2>/dev/null | sed 's/^/  /' >&2
+    [ "$weg" = unit ] && systemctl_user stop "$unit"
+    [ -n "$newpid" ] && kill "$newpid" 2>/dev/null
+    [ -n "$kennung" ] && "$WBB" gib "$kennung" --fremd >/dev/null 2>&1
+    rm -f "$AKTUELL"
+    return 1
+  fi
+  kennung="$(standfeld "$AKTUELL" kennung)"
+  local geladen_args=(geladen "$kennung" --pid "$newpid")
+  [ "$weg" = nohup ] && geladen_args+=(--prozess-haelt)
+  [ -n "$kennung" ] && "$WBB" "${geladen_args[@]}" >/dev/null 2>&1
+  python3 - "$AKTUELL" "$newpid" "$weg" "$unit" <<'PYSTAND'
+import json, os, sys, tempfile
+pfad, pid, weg, unit = sys.argv[1:]
+try:
+    d = json.load(open(pfad))
+    if d.get("pid") == int(pid):
+        d.update(startweg=weg, unit=unit)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(pfad), prefix=".startweg-")
+        with os.fdopen(fd, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, pfad)
+except (OSError, ValueError):
+    pass
+PYSTAND
+  python3 -c 'import json,sys,time; json.dump({"backend":sys.argv[2],"zeit":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())},open(sys.argv[1],"w"))' "$LETZTER" "$id"
+  err "Dienst laeuft: Backend '$id', PID $newpid, $HOSTB:$port, Leerlauf ${LEERLAUF_S} s."
+  echo "http://$HOSTB:$port"
+}
+
+cmd_stop() {
+  if [ ! -s "$AKTUELL" ]; then
+    err "es lief kein Dienst."
+    return 0
+  fi
+  local pid kennung unit
+  unit="$(standfeld "$AKTUELL" unit)"
+  pid="$(standfeld "$AKTUELL" pid)"; kennung="$(standfeld "$AKTUELL" kennung)"
+  if [ -n "$unit" ]; then
+    systemctl_user stop "$unit" || { err "Unit '$unit' konnte nicht gestoppt werden."; return 1; }
+  fi
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null
+    local i
+    for i in $(seq 1 75); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+    if kill -0 "$pid" 2>/dev/null; then
+      local bpid; bpid="$(standfeld "$AKTUELL" backend_pid)"
+      kill -9 "$pid" 2>/dev/null
+      [ -n "$bpid" ] && kill -9 "$bpid" 2>/dev/null
+      sleep 0.5
+    fi
+    kill -0 "$pid" 2>/dev/null && { err "WARNUNG: Dienst PID $pid laeuft weiter."; return 1; }
+  fi
+  [ -n "$kennung" ] && [ -x "$WBB" ] && "$WBB" gib "$kennung" --fremd >/dev/null 2>&1
+  rm -f "$AKTUELL"
+  err "gestoppt."
+  return 0
+}
+
+cmd_status() {
+  local zustand=0
+  laufend; zustand=$?
+  if [ "$zustand" -eq 1 ]; then
+    echo '{"laeuft": false}'
+    return 1
+  fi
+  local port; port="$(standfeld "$AKTUELL" port)"
+  python3 -B - "$AKTUELL" "$zustand" "$(curl -s -m 3 "http://$HOSTB:$port/health" 2>/dev/null)" "$(dirname "$SERVER")" <<'PY'
+import json, sys
+stand = json.load(open(sys.argv[1]))
+try:
+    gesundheit = json.loads(sys.argv[3])
+except ValueError:
+    gesundheit = None
+naechstes = None
+try:
+    sys.path.insert(0, sys.argv[4])
+    import sperre
+    n = sperre.naechstes(stand.get("sperrfenster") or [], sperre.Uhr().jetzt())
+    if n:
+        naechstes = dict(n[0], beginnt_in_s=int(n[1]))
+except (ImportError, ValueError, TypeError):
+    pass
+print(json.dumps({"laeuft": True, "antwortet": sys.argv[2] == "0",
+                  "url": "http://127.0.0.1:%s" % stand.get("port"),
+                  "naechstes_sperrfenster": naechstes,
+                  "startweg": stand.get("startweg", "nohup"), "unit": stand.get("unit", ""),
+                  "stand": stand, "health": gesundheit}, ensure_ascii=False))
+PY
+  return 0
+}
+
+cmd_backends() {
+  python3 - "$REGISTRY" "$VORLAGE" <<'PY'
+import json, sys
+for p in sys.argv[1:]:
+    try:
+        d = json.load(open(p))
+    except (OSError, ValueError):
+        continue
+    if isinstance(d, dict) and isinstance(d.get("entscheider"), list):
+        print(json.dumps({"quelle": p, "entscheider": d["entscheider"]}, ensure_ascii=False, indent=2))
+        sys.exit(0)
+sys.exit("wb-jev: keine Liste 'entscheider' gefunden.")
+PY
+}
+
+cmd_frage() {
+  local zustand="" fragen="" wunsch="" modell="jev-latest"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --backend) [ $# -ge 2 ] || { err "--backend braucht einen Namen"; return 2; }; wunsch="$2"; shift 2 ;;
+      --modell) [ $# -ge 2 ] || { err "--modell braucht einen Namen"; return 2; }; modell="$2"; shift 2 ;;
+      *) if [ -z "$zustand" ]; then zustand="$1"; elif [ -z "$fragen" ]; then fragen="$1";
+         else err "zu viele Angaben ('$1')"; return 2; fi; shift ;;
+    esac
+  done
+  [ -n "$zustand" ] && [ -n "$fragen" ] || { err "Usage: wb-jev frage <zustand-datei> <fragen-datei> [--backend <id>]"; return 2; }
+  [ "$zustand" = - ] || [ -f "$zustand" ] || { err "Zustandsdatei fehlt: $zustand"; return 2; }
+  [ -f "$fragen" ] || { err "Fragendatei fehlt: $fragen"; return 2; }
+  # stdin gehoert gleich dem Python-Skript (Heredoc); den Zustand vorher sichern.
+  local stdin_datei=""
+  if [ "$zustand" = - ]; then
+    stdin_datei="$(mktemp "${TMPDIR:-/tmp}/wb-jev-zustand.XXXXXX")" || return 1
+    cat > "$stdin_datei"
+  fi
+  local url
+  if [ -n "$wunsch" ]; then url="$(cmd_ensure --backend "$wunsch")"; else url="$(cmd_ensure)"; fi || return $?
+  [ -n "$url" ] || { [ -n "$stdin_datei" ] && rm -f "$stdin_datei"; return 1; }
+  local rc
+  python3 - "$url" "$zustand" "$fragen" "$modell" "$stdin_datei" <<'PY'
+import json, sys, urllib.error, urllib.request
+url, zpfad, fpfad, modell, stdin_datei = sys.argv[1:]
+try:
+    if zpfad == "-":
+        roh = open(stdin_datei, encoding="utf-8").read()
+        try:
+            state = json.loads(roh)
+        except ValueError:
+            state = roh
+    elif zpfad.endswith(".json"):
+        state = json.load(open(zpfad))
+    else:
+        state = open(zpfad, encoding="utf-8").read()
+    fragen = json.load(open(fpfad))
+except (OSError, ValueError) as e:
+    sys.exit("wb-jev: Eingabe nicht lesbar: %s" % e)
+if isinstance(fragen, dict) and isinstance(fragen.get("questions"), dict):
+    fragen = fragen["questions"]
+daten = json.dumps({"model": modell, "state": state, "questions": fragen}, ensure_ascii=False).encode()
+req = urllib.request.Request(url + "/v1/systemone", data=daten, headers={"Content-Type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=900) as r:
+        sys.stdout.write(r.read().decode() + "\n")
+except urllib.error.HTTPError as e:
+    sys.stdout.write(e.read().decode() + "\n")
+    sys.stderr.write("wb-jev: Dienst antwortete HTTP %d\n" % e.code)
+    sys.exit(1)
+except (urllib.error.URLError, OSError) as e:
+    sys.exit("wb-jev: Dienst nicht erreichbar: %s" % e)
+PY
+  rc=$?
+  [ -n "$stdin_datei" ] && rm -f "$stdin_datei"
+  return $rc
+}
+
+# Messlauf gegen den lokalen Dienst: Fragesatz (jev/FORMAT.md 5.1) rein, Antwortdatei
+# (5.2) raus, Zeile fuer Zeile angehaengt. Bereits beantwortete ids werden
+# uebersprungen (Wiederaufnahme wie jev/referenz/lauf.py). Auswertung danach mit
+# `python3 jev/messen.py --fragen <fragen.jsonl> <antworten.jsonl>`.
+cmd_lauf() {
+  local fragen="" aus="" wunsch="" split=all max=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --backend) [ $# -ge 2 ] || { err "--backend braucht einen Namen"; return 2; }; wunsch="$2"; shift 2 ;;
+      --split) [ $# -ge 2 ] || { err "--split braucht dev|test|all"; return 2; }; split="$2"; shift 2 ;;
+      --max) [ $# -ge 2 ] || { err "--max braucht eine Zahl"; return 2; }; max="$2"; shift 2 ;;
+      *) if [ -z "$fragen" ]; then fragen="$1"; elif [ -z "$aus" ]; then aus="$1";
+         else err "zu viele Angaben ('$1')"; return 2; fi; shift ;;
+    esac
+  done
+  [ -n "$fragen" ] && [ -n "$aus" ] || { err "Usage: wb-jev lauf <fragen.jsonl> <antworten.jsonl> [--backend <id>] [--split dev|test|all] [--max <n>]"; return 2; }
+  [ -f "$fragen" ] || { err "Fragesatz fehlt: $fragen"; return 2; }
+  case "$split" in all|dev|test) ;; *) err "--split nimmt dev, test oder all"; return 2 ;; esac
+  case "$max" in ''|*[!0-9]*) err "--max nimmt eine ganze Zahl"; return 2 ;; esac
+  local url
+  if [ -n "$wunsch" ]; then url="$(cmd_ensure --backend "$wunsch")"; else url="$(cmd_ensure)"; fi || return $?
+  [ -n "$url" ] || return 1
+  python3 - "$url" "$fragen" "$aus" "$split" "$max" <<'PY'
+import json, os, sys, time, urllib.error, urllib.request
+url, fpfad, apfad, split, maxn = sys.argv[1:]
+maxn = int(maxn)
+fertig = set()
+if os.path.exists(apfad):
+    for zeile in open(apfad, encoding="utf-8"):
+        if zeile.strip():
+            fertig.add(json.loads(zeile)["id"])
+n = fehler = 0
+with open(fpfad, encoding="utf-8") as fe, open(apfad, "a", encoding="utf-8") as fa:
+    for zeile in fe:
+        if not zeile.strip():
+            continue
+        f = json.loads(zeile)
+        if f["id"] in fertig or (split != "all" and f.get("split") != split):
+            continue
+        if maxn and n >= maxn:
+            break
+        daten = json.dumps(f["request"], ensure_ascii=False).encode()
+        req = urllib.request.Request(url + "/v1/systemone", data=daten, headers={"Content-Type": "application/json"})
+        t0 = time.perf_counter()
+        satz = {"id": f["id"], "model": None, "answer": None, "latency_ms": 0, "usage": None, "error": None}
+        try:
+            with urllib.request.urlopen(req, timeout=900) as r:
+                d = json.loads(r.read())
+            satz.update(model=d.get("model"), answer=(d.get("answers") or {}).get("q"), usage=d.get("usage"))
+            if satz["answer"] is None:
+                satz["error"] = "keine Antwort unter answers.q"
+        except urllib.error.HTTPError as e:
+            satz["error"] = "HTTP %d" % e.code
+        except (urllib.error.URLError, OSError) as e:
+            satz["error"] = type(e).__name__
+        satz["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+        fehler += satz["error"] is not None
+        fa.write(json.dumps(satz, ensure_ascii=False) + "\n")
+        fa.flush()
+        n += 1
+sys.stderr.write("wb-jev: %d Fragen beantwortet (%d Fehlerzeilen, %d schon vorhanden) -> %s\n" % (n, fehler, len(fertig), apfad))
+PY
+}
+
+case "${1:-}" in
+  frage) shift; cmd_frage "$@" ;;
+  lauf) shift; cmd_lauf "$@" ;;
+  ensure) shift; cmd_ensure "$@" ;;
+  _unit-start) shift; cmd_unit_start "$@" ;;
+  status) cmd_status ;;
+  stop) cmd_stop ;;
+  backends) cmd_backends ;;
+  -h|--help|help) sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  *) err "Usage: wb-jev {frage <zustand> <fragen> [--backend <id>]|ensure [--backend <id>] [--frist <min>]|lauf <fragen.jsonl> <antworten.jsonl>|status|stop|backends}"; exit 2 ;;
+esac

@@ -38,8 +38,8 @@
 # davon, WESSEN Spiegel das ist: eine automatische Ansage/ein Kontext-Guard-Poll nahm
 # blind ALLE Sessions der Zielmaschine und baute sie in die zufaellig gerade angehaengte
 # lokale Session — auch wenn die beiden nichts miteinander zu tun hatten. Befund: des Nutzers
-# Mac-Session `wb-AI` bekam einen Spiegel von peers `wb-Polarschern-379b75` (fremd), und
-# umgekehrt zeigte `wb-Polarschern-379b75` auf peer ZWEI fremde Mac-Spiegel gleichzeitig.
+# Mac-Session `wb-AI` bekam einen Spiegel von peers `wb-ProjectX-379b75` (fremd), und
+# umgekehrt zeigte `wb-ProjectX-379b75` auf peer ZWEI fremde Mac-Spiegel gleichzeitig.
 #
 # Wer eine entfernte Session per `wb-ssh-worker` erst entstehen laesst, setzt dort jetzt
 # eine tmux-SESSION-Option `@wb_owner` = "<eigene-maschine>:<eigene-lokale-session>". Beim
@@ -619,7 +619,7 @@ alle_spiegel() {
 # wb-*-Session" —, fehlt hier ABSICHTLICH (2026-08-13, gemessen). Dieses Werkzeug wird von
 # der anderen Maschine per ssh aufgerufen; dort gibt es kein `$TMUX_PANE` und keinen
 # Menschen, der die Wahl trifft. Auf peer lief genau eine wb-*-Session, des Nutzers
-# Polarschern-Orchestrator, und sie war NICHT angehaengt — die Regel „sonst die einzige"
+# ProjectX-Orchestrator, und sie war NICHT angehaengt — die Regel „sonst die einzige"
 # haette also einen fremden Pane mitten in seine laufende Arbeit gesetzt, ausgeloest von
 # einem Spawn auf dem Mac. Ein Spiegel existiert, damit ihn jemand sieht; hat sich niemand
 # angehaengt, gibt es nichts zu spiegeln, und dann wird das gesagt statt geraten.

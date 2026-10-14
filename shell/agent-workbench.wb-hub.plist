@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-workbench.wb-hub: launchd haelt den Lausch-Socket 127.0.0.1:8790, der Hub (ein MCP-Endpunkt fuer alle
+  Harnesses, shell/wb-hub) startet erst bei der ersten Verbindung. Entwurf: werkzeug-hub-entwurf 2.4.
+
+  Wie bei agent-workbench.modell-proxy steht hier KEIN RunAtLoad und KEIN KeepAlive: im Leerlauf laeuft null Prozess.
+  `wb-hub serve` mit der Option socket-aktiviert holt den Deskriptor mit launch_activate_socket("wb-hub") ab. Der
+  Schluessel im Sockets-Dict unten MUSS "wb-hub" heissen (wb_hub_dienst.LAUNCHD_NAME). Nach hub.idleMinutes
+  ohne Anfrage und ohne laufendes Backend beendet sich der Hub selbst (Exit 0); launchd schaerft den Socket
+  wieder an, die naechste Verbindung startet alles von vorn. Alte Sitzungs-IDs sind dann ungueltig (404), der
+  Client meldet sich mit initialize neu an.
+
+  Bindung nur an 127.0.0.1 (Schutz 2.7): der Hub lehnt einen anders gebundenen Socket ab.
+
+  Installation (der Nutzer selbst, nicht automatisch geladen): wb-ausrollen legt diese Datei nach
+  ~/Library/LaunchAgents/agent-workbench.wb-hub.plist (geladen wird nichts). Laden ausdruecklich mit
+  `wb-ausrollen` mit dem Schalter hub-laden, von Hand mit
+  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/agent-workbench.wb-hub.plist`.
+  Voraussetzung: wb-hub, wb_hub_kern.py, wb_hub_dienst.py, werkzeuge_kern.py, wb-mcp-start und
+  werkzeuge.default.json liegen in ~/.local/bin.
+  Abschalten: `launchctl bootout gui/$(id -u)/agent-workbench.wb-hub`.
+
+  ExitTimeOut: nach SIGTERM beendet der Hub noch seine Backends (stdio-Kinder); 5 s (Vorgabe) waeren zu knapp.
+  ThrottleInterval bleibt bei der Vorgabe (10 s, Schutz gegen eine Startschleife).
+  Das Verzeichnis ~/.local/state/wb-hub muss vor dem Laden existieren (launchd oeffnet das Log vor dem Start);
+  wb-ausrollen legt es mit Modus 0700 an.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>agent-workbench.wb-hub</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/.local/bin/wb-hub</string>
+    <string>serve</string>
+    <string>--socket-aktiviert</string>
+  </array>
+  <key>Sockets</key>
+  <dict>
+    <key>wb-hub</key>
+    <dict>
+      <key>SockNodeName</key><string>127.0.0.1</string>
+      <key>SockServiceName</key><string>8790</string>
+      <key>SockType</key><string>stream</string>
+      <key>SockFamily</key><string>IPv4</string>
+    </dict>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>ExitTimeOut</key><integer>30</integer>
+  <key>StandardOutPath</key><string>$HOME/.local/state/wb-hub/launchd.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.local/state/wb-hub/launchd.log</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>

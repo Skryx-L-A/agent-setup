@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""wb-modelle — neue Modelle entdecken, pruefen, eintragen und melden.
+
+  wb-modelle entdecken [<harness|anbieter> ...] [--json] [--ohne-meldung]
+  wb-modelle status [--json]
+
+`entdecken` baut keine eigene Entdeckung, sondern schliesst die vorhandene an
+(Auftrag modell-auto, 2026-10-10):
+  1. `wb-state models discover --if-stale` liest die Kataloge der Harnesses
+     (codex models_cache.json, Claude-Binary, Ollama, Splash/MLX-Dateien und bei
+     erlaubtem Netz OpenRouter). Neue IDs eines Harness mit modelProbe-Block
+     landen abgeschaltet mit probe.status "offen"; eine Familiensperre (Astra,
+     Fable, Reserve) haelt sie ohne Aufruf gesperrt.
+  2. `wb-state models probe` ruft jedes wartende Modell einmal kurz auf.
+     Bestanden: eingeschaltet, die Familien-Aliase ruecken nach. Abgelehnt:
+     Grund und Datum stehen am Eintrag, der naechste Lauf fragt erneut.
+  3. Jedes neu bestandene Modell geht als Art info an die Gruppe leitung
+     (`wb-gruppe schreib leitung`). Scheitert die Zustellung, bleibt die Meldung
+     im Zustand stehen und wird beim naechsten Lauf erneut versucht. Die
+     Vault-Zeile steht im Zustand unter "vaultZeilen"; ablegen tut der
+     Orchestrator.
+
+Der 6-h-Updater (wb-harness-update anwenden) ruft `entdecken` am Ende jedes
+Laufs; einen eigenen Zeitgeber hat dieses Werkzeug nicht.
+
+Zustand: ~/.local/state/wb-modelle.json (WB_MODELLE_STATE_FILE).
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+GRUPPE = os.environ.get("WB_MODELLE_GRUPPE", "leitung")
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def state_file() -> Path:
+    override = os.environ.get("WB_MODELLE_STATE_FILE")
+    return Path(override).expanduser() if override else Path.home() / ".local" / "state" / "wb-modelle.json"
+
+
+def read_state() -> dict[str, Any]:
+    try:
+        data = json.loads(state_file().read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(data: dict[str, Any]) -> None:
+    path = state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(name, path)
+    finally:
+        try:
+            os.unlink(name)
+        except FileNotFoundError:
+            pass
+
+
+def run(argv: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(argv, 127, "", str(exc))
+
+
+def json_of(p: subprocess.CompletedProcess[str]) -> Any:
+    try:
+        return json.loads(p.stdout)
+    except (ValueError, TypeError):
+        return None
+
+
+def tail(p: subprocess.CompletedProcess[str]) -> str:
+    text = (p.stderr or p.stdout or "").strip().splitlines()
+    return (text[-1] if text else f"Exit {p.returncode}")[:300]
+
+
+def aliases_for(families: list[dict[str, Any]], model_id: str) -> list[str]:
+    out: list[str] = []
+    for row in families or []:
+        if isinstance(row, dict) and row.get("target") == model_id:
+            out.extend(row.get("aliases") or [])
+    return out
+
+
+def meldung(r: dict[str, Any], aliases: list[str]) -> str:
+    text = (f"Neues Modell geprueft und eingetragen: {r['id']} "
+            f"(Harness {r.get('harness')}, Kennung {r.get('modelRef')}), Probeaufruf bestanden {r.get('at')}.")
+    if aliases:
+        text += " Familienalias " + ", ".join(aliases) + " zeigt jetzt darauf."
+    return text + " Quelle: wb-modelle entdecken."
+
+
+def vault_zeile(r: dict[str, Any], aliases: list[str]) -> str:
+    tag = str(r.get("at") or now())[:10]
+    zeile = f"- {tag}: {r['id']} ({r.get('harness')}, `{r.get('modelRef')}`) automatisch entdeckt, per Probeaufruf geprueft und eingetragen"
+    return zeile + (f"; Alias {', '.join(aliases)}." if aliases else ".")
+
+
+def senden(text: str) -> tuple[bool, str]:
+    p = run(["wb-gruppe", "schreib", GRUPPE, "--art", "info", text], timeout=60)
+    return p.returncode == 0, ("" if p.returncode == 0 else tail(p))
+
+
+def entdecken(targets: list[str], melden: bool) -> dict[str, Any]:
+    state = read_state()
+    report: dict[str, Any] = {"checkedAt": now(), "fehler": []}
+
+    discover = run(["wb-state", "models", "discover", *targets, "--if-stale", "--json"], timeout=600)
+    report["discover"] = json_of(discover)
+    if discover.returncode != 0 and report["discover"] is None:
+        report["fehler"].append("discover: " + tail(discover))
+
+    probe = run(["wb-state", "models", "probe", "--json"], timeout=3600)
+    results = (json_of(probe) or {}).get("results") if probe.returncode == 0 else None
+    if results is None:
+        report["fehler"].append("probe: " + tail(probe))
+        results = []
+    report["probe"] = results
+
+    families = json_of(run(["wb-state", "models", "families", "--json"], timeout=60)) or []
+    ausstehend = [m for m in state.get("ausstehend") or [] if isinstance(m, dict) and m.get("text")]
+    vault = list(state.get("vaultZeilen") or [])
+    for r in results:
+        if not r.get("newlyPassed"):
+            continue
+        aliases = aliases_for(families, r["id"])
+        ausstehend.append({"id": r["id"], "text": meldung(r, aliases), "seit": report["checkedAt"]})
+        vault.append(vault_zeile(r, aliases))
+
+    gemeldet, offen = [], []
+    for m in ausstehend:
+        if not melden:
+            offen.append(m)
+            continue
+        ok, detail = senden(m["text"])
+        if ok:
+            gemeldet.append(m["id"])
+        else:
+            m["letzterFehler"] = detail
+            offen.append(m)
+    report["gemeldet"] = gemeldet
+    report["ausstehend"] = offen
+
+    abgelehnt = dict(state.get("abgelehnt") or {})
+    for r in results:
+        if r.get("status") == "abgelehnt":
+            abgelehnt[r["id"]] = {"grund": r.get("reason"), "am": r.get("at")}
+        elif r.get("status") == "bestanden":
+            abgelehnt.pop(r["id"], None)
+    report["abgelehnt"] = abgelehnt
+    report["vaultZeilen"] = vault
+
+    write_state({"checkedAt": report["checkedAt"], "ausstehend": offen, "abgelehnt": abgelehnt,
+                 "vaultZeilen": vault, "letzteProbe": results, "fehler": report["fehler"]})
+    return report
+
+
+def zeigen(report: dict[str, Any]) -> None:
+    for r in report.get("probe") or []:
+        print(f"{r.get('id')}\t{r.get('status')}\t{r.get('reason') or ''}")
+    if not report.get("probe"):
+        print("wb-modelle: kein neues Modell zu pruefen.")
+    for mid in report.get("gemeldet") or []:
+        print(f"gemeldet an {GRUPPE}: {mid}")
+    for m in report.get("ausstehend") or []:
+        print(f"Meldung ausstehend: {m.get('id')} ({m.get('letzterFehler') or 'nicht gesendet'})")
+    for f in report.get("fehler") or []:
+        print("FEHLER: " + f, file=sys.stderr)
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] not in ("entdecken", "status"):
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    cmd, rest = argv[0], argv[1:]
+    as_json = "--json" in rest
+    if cmd == "status":
+        data = read_state()
+        print(json.dumps(data, ensure_ascii=False, indent=None if as_json else 2))
+        return 0
+    targets = [x for x in rest if not x.startswith("--")]
+    report = entdecken(targets, "--ohne-meldung" not in rest)
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False))
+    else:
+        zeigen(report)
+    return 1 if report["fehler"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -22,8 +22,18 @@ WB_KONTINGENT="$HOME/.local/bin/wb-kontingent"
 [ -x "$WB_KONTINGENT" ] || exit 0
 
 AUSGABE="$("$WB_KONTINGENT" --knapp 2>/dev/null)" || exit 0
-[ -n "$AUSGABE" ] || exit 0
+[ -n "$AUSGABE" ] && {
+  printf '%s\n' "$AUSGABE"
+  printf 'Voller Stand und die Herkunft jeder Zahl: wb-kontingent\n'
+}
 
-printf '%s\n' "$AUSGABE"
-printf 'Voller Stand und die Herkunft jeder Zahl: wb-kontingent\n'
+# Ein unbekannter Stand ist kein Freibetrag. Der Hook misst weiterhin nichts und
+# bleibt bei vollstaendig bekanntem, freiem Stand still; nur diese Lage bekommt
+# den klaren Handlungs-Hinweis fuer die naechste Vergabe.
+STAND="$("$WB_KONTINGENT" zeigen 2>/dev/null)" || exit 0
+case "$STAND" in
+  *unbekannt*)
+    printf 'Kontingent-Hinweis: "unbekannt" heisst nicht frei, sondern nicht gemessen. Vor der Vergabe: wb-kontingent auffrischen\n'
+    ;;
+esac
 exit 0

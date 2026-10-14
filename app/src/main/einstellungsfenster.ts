@@ -83,6 +83,7 @@ import { protokollListe } from './protokolle';
 import { chatQuellen, type ChatQuelle } from './chatschalter';
 import { umlaute } from '../gemeinsam/umlaute';
 import type { UiState } from './uistate';
+import { harnessVersionenLesen } from './harnessupdate';
 
 export { chatQuellen, type ChatQuelle };
 
@@ -94,6 +95,12 @@ export interface HarnessSicht {
   modelle: number;
   /** V11: Hat sein Binary auf DIESER Maschine? */
   binaer: boolean;
+  installedVersion: string;
+  latestVersion: string;
+  lastChecked: string;
+  updateStatus: string;
+  /** Registry carries a measured same-session model switch contract. */
+  modelSwitch: boolean;
   /** Modell, das beim bewussten Wechsel auf diesen Harness vorausgewaehlt wird. */
   orchestratorDefaultModel?: string;
 }
@@ -623,6 +630,7 @@ export function einstellungsDaten(q: DatenQuellen, ui: UiState): EinstellungsDat
   const registry = parseModelsRegistry(registryRaw);
 
   const harnessListe = effectiveHarnesses(registry);
+  const versionen = harnessVersionenLesen();
   const binaer: Record<string, boolean> = {};
   for (const h of harnessListe) binaer[h.id] = harnessBinaerVorhanden(h.command ?? '');
 
@@ -641,6 +649,11 @@ export function einstellungsDaten(q: DatenQuellen, ui: UiState): EinstellungsDat
     label: umlaute(h.label),
     modelle: proHarness.get(h.id) ?? 0,
     binaer: binaer[h.id] === true,
+    installedVersion: versionen[h.id]?.installed ?? '',
+    latestVersion: versionen[h.id]?.latest ?? '',
+    lastChecked: versionen[h.id]?.checkedAt ?? '',
+    updateStatus: versionen[h.id]?.status ?? '',
+    modelSwitch: !!h.modelSwitch?.command,
     orchestratorDefaultModel: typeof h.orchestratorDefaultModel === 'string'
       ? h.orchestratorDefaultModel
       : undefined,

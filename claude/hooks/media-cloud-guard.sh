@@ -9,15 +9,17 @@
 # Warum: LOCAL-FIRST-Media-Regel ("website/landing-page images ... never a
 #        paid cloud model/connector") gilt fuer Orchestrator UND jeden Worker,
 #        ist aber nirgends technisch erzwungen — nur Prosa in CLAUDE.md.
-# Blockliste: ~/.claude/hooks/media-cloud-domains.txt (separat, leicht
-#        pflegbar ohne diesen Hook neu zu schreiben).
+# Blockliste: media-cloud-domains.txt NEBEN diesem Skript (Rueckfall
+#        $HOME/.claude/hooks); fehlt sie, warnt der Guard laut.
 # Policy: reines Warnen, kein Deny — die Liste veraltet schnell und manche
 #        Cloud-Aufrufe sind bewusst genehmigte Ausnahmen (z.B. creative-media-
 #        Skill nutzt Higgsfield gezielt); ein Hard-Block waere hier falsch.
 set -uo pipefail
 
-domains_file="$HOME/.claude/hooks/media-cloud-domains.txt"
-[ -f "$domains_file" ] || exit 0
+# Liste neben dem eigenen Skript; Rueckfall auf $HOME/.claude/hooks nur, wenn dort keine liegt.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+domains_file="$script_dir/media-cloud-domains.txt"
+[ -f "$domains_file" ] || domains_file="$HOME/.claude/hooks/media-cloud-domains.txt"
 
 input=$(cat)
 tool_name=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null)
@@ -63,6 +65,21 @@ case "$tool_name" in
     ;;
 esac
 [ -z "$haystack" ] && exit 0
+
+# Fehlende/leere/unlesbare Liste: laut warnen (kein Block), nicht still erlauben.
+if ! grep -qv -e '^[[:space:]]*$' -e '^#' "$domains_file" 2>/dev/null; then
+  reason="media-cloud-guard: KEINE Domainliste (media-cloud-domains.txt fehlt, ist leer oder unlesbar) -- Cloud-Media-Aufrufe werden NICHT erkannt. Liste neben media-cloud-guard.sh ablegen. Reine Warnung, kein Block."
+  jq -n --arg reason "$reason" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "allow",
+      permissionDecisionReason: $reason,
+      additionalContext: $reason
+    },
+    systemMessage: $reason
+  }'
+  exit 0
+fi
 
 hit=""
 while IFS= read -r domain; do

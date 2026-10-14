@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# wb-brain-zeile <verzeichnis> [<verzeichnis> ...]
+#
+# Prints the vault sentence that pi-worker puts in front of every task's
+# [Protokoll] instruction. Default: workers must run `brain search` before their
+# first change (Vault-Messung 24.09.2026: Claude-Worker suchten nur in 9 % der
+# Faelle von selbst).
+#
+# Exception (der Nutzer, 25.09.2026, reason: a kit for a company laptop): a project that must
+# stay free of private data -- e.g. a kit that ends up on a company laptop -- must
+# not pull anything from the private vault ~/Knowledge. Such a project carries a
+# file named `.wb-ohne-brain` in its directory or in any parent up to (but not
+# including) $HOME. Then the sentence FORBIDS the vault instead of requiring it;
+# a plain omission would leave the general rule in CLAUDE.md ("Vor nichttrivialer
+# Arbeit brain search") in force.
+#
+# Every given directory is checked, because a worker may run in a worktree
+# (~/.pi-workers/worktrees/<name>) whose parents are not the project's: pi-worker
+# passes the original project directory AND the working directory. A tracked
+# marker also appears inside the worktree; an untracked one only in the original.
+set -u
+
+MARKE=".wb-ohne-brain"
+
+ohne_brain() {
+  local d heim
+  heim="$(cd "$HOME" 2>/dev/null && pwd -P)" || heim="$HOME"
+  for d in "$@"; do
+    [ -n "$d" ] || continue
+    d="$(cd "$d" 2>/dev/null && pwd -P)" || continue
+    while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "$heim" ]; do
+      [ -e "$d/$MARKE" ] && return 0
+      d="$(dirname "$d")"
+    done
+  done
+  return 1
+}
+
+if ohne_brain "$@"; then
+  printf '%s' "Dieses Projekt ist vom privaten Vault getrennt (Datei $MARKE): KEIN brain search, nichts aus ~/Knowledge lesen oder in Projektdateien übernehmen — auch wenn eine allgemeine Regel es verlangt."
+else
+  printf '%s' "Vor der ersten Änderung: brain search \"<Thema des Auftrags>\" -k 5 und passende Treffer lesen."
+fi

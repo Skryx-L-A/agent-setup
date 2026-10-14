@@ -512,12 +512,13 @@ export function parseSessionList(raw: string): { lebende: Map<string, boolean>; 
 export function parseProcTable(raw: string): Map<number, ProcRow> {
   const tabelle = new Map<number, ProcRow>();
   for (const zeile of raw.split('\n')) {
-    const m = zeile.match(/^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+([\d:-]+)\s+(.*)$/);
+    // macOS ps localizes pcpu (for example "0,0" with LANG=de_DE.UTF-8).
+    const m = zeile.match(/^\s*(\d+)\s+(\d+)\s+([\d.,]+)\s+([\d:-]+)\s+(.*)$/);
     if (!m) continue;
     tabelle.set(Number(m[1]), {
       pid: Number(m[1]),
       ppid: Number(m[2]),
-      cpu: Number(m[3]) || 0,
+      cpu: Number(m[3].replace(',', '.')) || 0,
       ageSeconds: etimeSekunden(m[4]),
       args: m[5],
     });

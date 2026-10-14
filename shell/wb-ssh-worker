@@ -86,6 +86,10 @@ TASK_B64=$(printf '%s' "$TASK" | base64 | tr -d '\n')
 # (see the delivery check below).
 REMOTE_SCRIPT=$(cat <<'REMOTE'
 set -u
+# Eine nicht-interaktive ssh-Shell traegt nur den Systempfad (gemessen 2026-09-19 auf peer:
+# /usr/local/bin:/usr/bin:/bin). Die Harness-Programme liegen aber unter ~/.local/bin bzw. in
+# den mise-Shims; ohne sie meldet die Registry "Binary 'codex' ... nicht installiert".
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/opt/homebrew/bin:$PATH"
 SESS="$1"; WIN="$2"; NAME="$3"; MODEL="$4"; WORKDIR="$5"; KIND="$6"; TASK_B64="$7"; OWNER="${8:-}"
 TASK=$(printf '%s' "$TASK_B64" | base64 -d 2>/dev/null || printf '%s' "$TASK_B64" | base64 -D)
 

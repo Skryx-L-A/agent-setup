@@ -49,11 +49,12 @@ export const HARNESS_LABEL: Record<(typeof HARNESSES)[number], string> = {
   pi: 'pi (lokal)',
 };
 
-/** pi model aliases; wb-code/pi-worker resolve them to the Ollama ids. */
-export const PI_MODELS = ['ornith', 'qwen', 'ornith9'] as const;
+/** pi model aliases; wb-code/pi-worker resolve them to registered providers. */
+export const PI_MODELS = ['qwen38', 'ornith', 'qwen', 'ornith9'] as const;
 
 export const PI_MODEL_LABEL: Record<string, string> = {
-  ornith: 'ornith — ornith:35b (Default-Coder)',
+  qwen38: 'qwen38 — Qwen3.8 (Splash)',
+  ornith: 'ornith — gelöscht; qwen3.8 übernimmt',
   qwen: 'qwen — qwen3.6:35b-a3b-coding-nvfp4',
   ornith9: 'ornith9 — ornith:9b (günstig)',
 };
@@ -100,7 +101,7 @@ export function isModelForHarness(harness: Harness, model: unknown): model is st
 }
 
 export function defaultModelFor(harness: Harness): string {
-  return harness === 'pi' ? 'ornith' : DEFAULT_SETTINGS.orchestratorModel;
+  return harness === 'pi' ? 'qwen38' : DEFAULT_SETTINGS.orchestratorModel;
 }
 
 /** UI wording: Claude Code calls it effort, pi calls it thinking level. */

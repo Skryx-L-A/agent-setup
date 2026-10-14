@@ -1,5 +1,5 @@
 // Die Ordneransicht (4c.2): der Projektordner der aktiven Session, sonst das
-// Eigenheimverzeichnis. `~/Knowledge/90-secrets/` und `~/.ssh/` sind
+// Eigenheimverzeichnis. `~/Knowledge/secrets/` und `~/.ssh/` sind
 // AUSGELASSEN, nicht nur verborgen -- das entscheidet main/folder.ts, diese
 // Datei zeichnet nur, was sie bekommt.
 //

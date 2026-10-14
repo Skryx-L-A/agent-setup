@@ -186,8 +186,11 @@ def _check_single(name, remaining, stage, resolved_stages, pos, varmap, depth):
             )
         return scan_for_danger(inner, varmap, depth + 1)
 
-    if name in cs.SHELL_INTERPRETERS and len(remaining) >= 2 and remaining[0] == '-c':
-        inner = remaining[1]
+    # Jede Option vor dem Befehlstext zaehlt (`-lc`, `-ec`, `-x -c`, `-o pipefail -c`, `--login -c`,
+    # `-euc`); bis 2026-10-11 galt nur ein `-c` an allererster Stelle. Eine Shell ohne -c faellt
+    # wie bisher durch (kein Zweig darunter trifft ein Shell-Wort).
+    hat_c, inner = cs.shell_c_script(remaining) if name in cs.SHELL_INTERPRETERS else (False, None)
+    if hat_c and inner:
         if _unresolvable_command_word(inner, varmap):
             return (
                 "%s -c mit einem Skripttext, in dem das auszufuehrende KOMMANDO selbst aus einer "

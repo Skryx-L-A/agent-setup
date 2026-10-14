@@ -70,6 +70,13 @@ export interface PtyAuftrag {
   /** 'worker' oder 'orchestrator'; wb-pane-write entscheidet daran. */
   rolle?: string;
   wiederaufnahme?: PtyWiederaufnahme;
+  /**
+   * NICHT MERKEN (27.09.2026): ein Terminal, das nach einem Neustart NICHT
+   * wiederkommen soll -- das Anhaengen an eine Gast-Tor-Sitzung (gasttor.ts)
+   * ist eine Ansicht, kein Worker; ein Neustart startete sonst von selbst eine
+   * ssh-Verbindung.
+   */
+  fluechtig?: boolean;
 }
 
 export interface PtyStand {
@@ -372,7 +379,7 @@ export class PtyVerwaltung extends EventEmitter {
     const daten = {
       version: 1,
       geschrieben: new Date().toISOString(),
-      panes: [...this.panes.values()].map((e) => ({ auftrag: e.auftrag, lebte: e.lebt })),
+      panes: [...this.panes.values()].filter((e) => !e.auftrag.fluechtig).map((e) => ({ auftrag: e.auftrag, lebte: e.lebt })),
     };
     try {
       mkdirSync(dirname(this.merkDatei), { recursive: true });

@@ -649,6 +649,58 @@ running_guard_pid() {   # <slug> <orch-pane> [--jeder-pane] -> PID des laufenden
     printf '%s' "$pid"
 }
 
+running_guard_pid_alter_slug() { # <pane> [--jeder-pane] -> Guard mit gleichem Socket, aber altem Session-Slug
+    local want="$1" modus="${2:-}" socket prefix pf pid args stored_start live_start
+    socket="$(tmux display -p -t "$want" '#{socket_path}' 2>/dev/null || true)"
+    [ -n "$socket" ] || return 1
+    prefix="$(printf '%s' "$socket" | tr -c 'a-zA-Z0-9' '-')"
+    for pf in "$STATE_BASE"/"$prefix"*.pid; do
+        [ -f "$pf" ] || continue
+        pid="$(head -1 "$pf" 2>/dev/null | tr -dc '0-9')"
+        [ -n "$pid" ] && [ "$pid" != "$$" ] && kill -0 "$pid" 2>/dev/null || continue
+        stored_start="$(sed -n '2p' "$pf" 2>/dev/null)"
+        live_start="$(process_starttime "$pid")"
+        [ -n "$stored_start" ] && [ "$stored_start" = "$live_start" ] || continue
+        args="$(ps -p "$pid" -o args= 2>/dev/null)"
+        if [ "$modus" = --jeder-pane ]; then
+            guard_ist_guard "$args" || continue
+        else
+            guard_args_match "$args" "$want" || continue
+        fi
+        printf '%s' "$pid"
+        return 0
+    done
+    return 1
+}
+
+# Die PID-Merkdatei ist der schnelle, atomare Normalweg. Sie kann aber fehlen,
+# wenn ein Guard aus einer aelteren Fassung oder direkt mit --auto gestartet
+# wurde. --ensure darf dann nicht daraus schliessen, es gebe keinen Guard: die
+# Prozessliste prueft ausschliesslich echte context-guard-Kommandos fuer GENAU
+# diesen Pane und stellt die Merkdatei wieder her. Das ist absichtlich kein
+# pgrep-Muster, denn Rollen-Prompts koennen die Woerter "context-guard --auto"
+# als Daten enthalten.
+guard_pid_vom_system() { # <pane> -> lebende Guard-PID fuer exakt diesen Pane und tmux-Socket
+    local want="$1" pid args wanted_socket umgebung
+    wanted_socket="$(tmux display -p -t "$want" '#{socket_path}' 2>/dev/null || true)"
+    [ -n "$wanted_socket" ] || return 1
+    while read -r pid args; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        [ "$pid" != "$$" ] || continue
+        kill -0 "$pid" 2>/dev/null || continue
+        guard_args_match "$args" "$want" || continue
+        # Pane-IDs sind nur je Server eindeutig. `ps eww` bleibt intern und
+        # wird auf das eine TMUX=Merkmal eingeengt; ein Treffer auf %3 eines
+        # fremden Test- oder Live-Sockets darf die eigene Wache nie blockieren.
+        umgebung="$(LC_ALL=C ps -eww -p "$pid" -o command= 2>/dev/null || \
+                    LC_ALL=C ps eww -p "$pid" -o command= 2>/dev/null || true)"
+        case "$umgebung" in *"TMUX=$wanted_socket"*) ;; *) continue ;; esac
+        printf '%s' "$pid"
+        return 0
+    done < <(LC_ALL=C ps -ax -o pid= -o args= 2>/dev/null)
+    return 1
+}
+
 if [[ "${1:-}" == "--ensure" ]]; then
     shift
     REF="${1:-${TMUX_PANE:-}}"
@@ -712,6 +764,24 @@ if [[ "${1:-}" == "--ensure" ]]; then
         GPID="$(running_guard_pid "$ENSURE_SLUG" "$ORCH_P" --jeder-pane)"
     else
         GPID="$(running_guard_pid "$ENSURE_SLUG" "$ORCH_P")"
+    fi
+    if [ -z "$GPID" ]; then
+        if [ "$ENSURE_MODE" = workers-only ]; then
+            GPID="$(running_guard_pid_alter_slug "$ORCH_P" --jeder-pane)"
+        else
+            GPID="$(running_guard_pid_alter_slug "$ORCH_P")"
+        fi
+    fi
+    if [ -z "$GPID" ]; then
+        GPID="$(guard_pid_vom_system "$ORCH_P")"
+    fi
+    if [ -n "$GPID" ]; then
+        # Der gefundene Prozess hat die vollstaendige Programm/PID-Pruefung
+        # bestanden; dieselbe zweite Zeile wie der Starter verhindert eine
+        # spaetere PID-Wiederverwendung in running_guard_pid(). Ein alter Slug
+        # wird damit beim ersten --ensure auf den stabilen Basis-Slug geheilt.
+        printf '%s\n%s\n' "$GPID" "$(process_starttime "$GPID")" \
+            > "$(guard_pidfile "$ENSURE_SLUG")" 2>/dev/null || true
     fi
     if [ -n "$GPID" ]; then
         [ "$locked" = 1 ] && rmdir "$LOCK" 2>/dev/null
@@ -887,6 +957,18 @@ mkdir -p "$DONE_DIR" 2>/dev/null || true
 # die Anschluss-Pruefung im Worker-Block weiter unten.
 ANSCHLUSS_DIR="$STATE_BASE/$GUARD_SLUG.kompakt-anschluss"
 mkdir -p "$ANSCHLUSS_DIR" 2>/dev/null || true
+# Mahnung ohne eigene Kompaktierung (2026-09-18, Vorfall mobil-spec/codex, Session
+# wb-AI-b310aa-1d39e0): eine Datei pro gemahntem Worker, Inhalt = der Zeitpunkt der
+# Mahnung in Sekunden seit 1970. Sie existiert, weil zwischen Schritt 1 (Uebergabe
+# anfordern) und Schritt 2 (selbst kompaktieren) ein Dritter eingreifen kann: ein
+# Harness, der sich SELBST kompaktiert (codex tut das eingebaut). Dann faellt die
+# Auslastung, ohne dass diese Wache je getippt hat -- der alte Code lief in den
+# Rearm-Zweig, loeschte `warned`, schrieb nie einen ANSCHLUSS_DIR-Merker (den gibt es
+# nur nach EIGENER Kompaktierung) und liess den Worker mit fertiger Uebergabe fuer
+# immer stehen. Ueberlebt einen Neustart der Wache wie DONE_DIR und ANSCHLUSS_DIR,
+# aus demselben Grund: verankert ueber GUARD_SLUG, nicht ueber die PID.
+MAHNUNG_DIR="$STATE_BASE/$GUARD_SLUG.mahnung"
+mkdir -p "$MAHNUNG_DIR" 2>/dev/null || true
 
 # Sperre gegen wb-close (2026-08-22, Auftrag "Fertigmeldung: der Rest-Laerm...",
 # Sperre gebaut): Die "frisch nachpruefen"-Stelle in check_worker_results() (siehe
@@ -1020,6 +1102,11 @@ backfill_done_markers() {
         [ -f "$DONE_DIR/$(sanitize_name "$name")" ] && continue
         resfile="$HOME/.pi-workers/results/$name/latest.md"
         [ -s "$resfile" ] || continue
+        # Ein laufender Worker ist nicht "schon vor dem Guard-Start fertig" (2026-09-18,
+        # gleiche Begruendung wie in check_worker_results): latest.md kann waehrend der
+        # Laufzeit auf den Platzhalter ".laufend.md" zeigen. Eine Vormerkung darauf
+        # wuerde die spaetere echte Fertigmeldung stillschweigend verschlucken.
+        case "$(readlink "$resfile" 2>/dev/null)" in *.laufend.md) continue ;; esac
         # -L: stat der ZIELDATEI, nicht des Symlinks — latest.md zeigt auf die
         # Ergebnisdatei, und deren Zeitstempel ist der, der zaehlt.
         # Reihenfolge GNU vor BSD, wie in mtime() weiter oben: bei GNU ist `-f`
@@ -1257,6 +1344,26 @@ COMPACT_SETTLE="${COMPACT_SETTLE:-120}"   # hands off this long right after typi
 # Kompaktierung von der ersten fern, statt sie fuer immer zu verbieten.
 KOMPAKT_WIRKUNG_MIN="${KOMPAKT_WIRKUNG_MIN:-10}"    # Punkte, die die Last fallen MUSS, damit die Kompaktierung als wirksam gilt
 KOMPAKT_KARENZ_POLLS="${KOMPAKT_KARENZ_POLLS:-2}"   # Polls, die zwischen einer wirkungslosen Kompaktierung und der Freigabe liegen
+# Wie lange die Notbremse auf einen nicht freien Pane (offener Dialog, ungesendeter Text)
+# wartet, bevor sie den Menschen ein zweites Mal mahnt; gewartet wird Poll fuer Poll,
+# getippt wird erst, wenn er frei ist (2026-10-09).
+TIPP_SPERRE_FRIST="${TIPP_SPERRE_FRIST:-600}"
+ANSCHLUSS_FREI_FRIST="${ANSCHLUSS_FREI_FRIST:-60}"   # Wartezeit fuer WEITERARBEITEN nach /compact
+KOMPAKT_ANKUNFT_S="${KOMPAKT_ANKUNFT_S:-15}"         # so lange wird auf die Kompaktierungsanzeige gewartet
+KOMPAKT_ANKUNFT_RE="${KOMPAKT_ANKUNFT_RE:-Compacting|compacting|Summariz}"
+KOMPAKT_MAX_VERSUCHE="${KOMPAKT_MAX_VERSUCHE:-3}"     # Fehlversuche je Zyklus, danach nur noch Meldung an den Menschen
+kompakt_versuche=0
+kompakt_angekommen=1
+tipp_sperre_seit=""
+tipp_sperre_gemahnt=0
+# Verfallsfrist der Mahnung (2026-09-18, siehe MAHNUNG_DIR oben). Sie begrenzt, wie
+# lange nach einer Mahnung ein Abfall der Auslastung noch als "der Worker hat sich
+# selbst kompaktiert und wartet auf den Anschluss" gelesen werden darf. Ohne Frist
+# koennte ein Worker, der nach der Selbstkompaktierung normal weiterarbeitet und
+# Stunden spaeter fertig still dasteht, noch einen Anschluss-Prompt bekommen und
+# seine schon abgelieferte Arbeit erneut beginnen. 1800 s ist grosszuegig ueber dem
+# gemessenen Abstand des Vorfalls (Mahnung 17:40, Uebergabe 17:45).
+MAHNUNG_MAX_ALTER_S="${MAHNUNG_MAX_ALTER_S:-1800}"
 # BUSY detection decides whether it is safe to type at all, so it errs towards "busy".
 # 'esc to interrupt' alone was NOT enough: on 2026-07-25 the guard typed /compact into a
 # pane that was mid-turn and only showed its spinner line ("✽ Flibbertigibbeting… (18m ·
@@ -1816,6 +1923,57 @@ session_load() {   # <pane> -> "<percent> session" oder nichts  (setzt harness_i
     echo "$pct session"
 }
 
+# Codex legt die Rollout-Datei schon beim Start an, schreibt token_count aber erst
+# nach dem ersten abgeschlossenen Modellzug.  In diesem kurzen, eindeutigen Zustand
+# ist "BLIND" eine falsche Diagnose: der Leser und der Pfad sind vorhanden, nur die
+# erste Messung ist noch nicht entstanden.  Mehrere passende Dateien bleiben
+# absichtlich NICHT hier: das ist wirklich mehrdeutig und muss weiterhin BLIND
+# bleiben, statt eine fremde Zahl zu verwenden.
+codex_erste_messung_wartet() {  # setzt harness_info voraus; <pane>
+    local pane="$1" cwd
+    [[ "$HID" == "codex" && -n "$HSESS" ]] || return 1
+    cwd=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null) || return 1
+    [[ -n "$cwd" ]] || return 1
+    /usr/bin/python3 - "$HSESS" "$cwd" <<'PY'
+import glob, json, os, sys, time
+try:
+    spec = json.loads(sys.argv[1])
+    path = os.path.expanduser(spec.get("ort") or "")
+    cwd = os.path.realpath(sys.argv[2])
+    age = int(spec.get("maxAgeSec") or 43200)
+except Exception:
+    sys.exit(1)
+cands = []
+for f in glob.glob(path):
+    try:
+        if time.time() - os.path.getmtime(f) > age:
+            continue
+        with open(f, "rb") as fh:
+            meta = json.loads(fh.readline().decode("utf-8", "replace"))
+            fh.seek(max(fh.tell(), os.path.getsize(f) - 400000))
+            rest = fh.read()
+        if meta.get("type") != "session_meta":
+            continue
+        if os.path.realpath((meta.get("payload") or {}).get("cwd") or "") != cwd:
+            continue
+        cands.append(rest)
+    except Exception:
+        continue
+if len(cands) != 1:
+    sys.exit(1)
+for raw in reversed(cands[0].splitlines()):
+    try:
+        p = json.loads(raw.decode("utf-8", "replace")).get("payload") or {}
+        info = p.get("info")
+        if p.get("type") == "token_count" and isinstance(info, dict) and \
+           (info.get("last_token_usage") or {}).get("total_tokens") and info.get("model_context_window"):
+            sys.exit(1)
+    except Exception:
+        continue
+sys.exit(0)
+PY
+}
+
 read_load() { # pane [name] -> "<percent> <exact|bar|transcript|registry|session|none>"; -1 when nothing is readable
     local cap tail5 pair num den bar filled t sedx wname="${2:-}"
     cap=$(tmux capture-pane -p -t "$1" 2>/dev/null) || cap=""
@@ -1882,13 +2040,35 @@ read_load() { # pane [name] -> "<percent> <exact|bar|transcript|registry|session
     #    Bezahlt wird das nur fuer Panes, die ohne sie ohnehin blind waeren.
     t=$(session_load "$1")
     [[ -n "$t" ]] && { echo "$t"; return; }
+    codex_erste_messung_wartet "$1" && { echo "-2 session-wartet"; return; }
     echo "-1 none"
+}
+
+# Die Zustandslisten unten enthalten Pane-IDs als durch Leerzeichen getrennte
+# Elemente.  Ein einfacher Teilzeichenvergleich ist hier falsch: %1 ist kein
+# Mitglied einer Liste, die nur %174 enthaelt.  Alle drei Operationen bleiben
+# an dieser Stelle, damit neue Listen nicht wieder eine eigene, unsichere
+# Zeichenkettenvariante erfinden.
+liste_hat() {   # <liste> <element>
+    local liste="$1" element="$2" eintrag
+    for eintrag in $liste; do [[ "$eintrag" == "$element" ]] && return 0; done
+    return 1
+}
+liste_mit() {   # <liste> <element> -> Liste, ohne Duplikat
+    local liste="$1" element="$2"
+    liste_hat "$liste" "$element" && { printf '%s' "$liste"; return; }
+    printf '%s %s' "$liste" "$element"
+}
+liste_ohne() {  # <liste> <element> -> Liste ohne genau dieses Element
+    local liste="$1" element="$2" eintrag aus=""
+    for eintrag in $liste; do [[ "$eintrag" == "$element" ]] || aus="$aus $eintrag"; done
+    printf '%s' "$aus"
 }
 
 announce_blind() {   # say it ONCE per pane instead of silently never warning
     local pane="$1" label="$2" is_worker="${3:-0}" msg tpath groesse laeuft
-    [[ "$blind" == *" $pane"* ]] && return
-    [[ "$kein_agent" == *" $pane"* ]] && return
+    liste_hat "$blind" "$pane" && return
+    liste_hat "$kein_agent" "$pane" && return
     # KEIN AGENT, KEINE FRAGE (2026-08-26). Zwei Bedingungen zusammen, nicht eine:
     # der Vordergrundprozess ist eine nackte Schale UND der Startbefehl gehoert zu
     # keinem bekannten Harness. Die zweite haelt den Fall offen, in dem eine CLI
@@ -1901,7 +2081,7 @@ announce_blind() {   # say it ONCE per pane instead of silently never warning
     harness_info "$pane"
     if [[ "$laeuft" =~ ^(bash|zsh|sh|fish|dash|ksh)$ ]] && [[ -z "$HID" ]]; then
         echo "$(date +%H:%M) $label ($pane): kein Agenten-Pane (Vordergrundprozess '$laeuft', kein bekannter Harness) — keine Kontextmessung, und das ist kein Mangel. Einmalig gemeldet, danach uebergangen."
-        kein_agent="$kein_agent $pane"
+        kein_agent="$(liste_mit "$kein_agent" "$pane")"
         return
     fi
     # DIE GROESSE WIRD GEMESSEN, NICHT GERATEN (2026-08-26). Hier stand bis heute
@@ -1975,7 +2155,14 @@ announce_blind() {   # say it ONCE per pane instead of silently never warning
         msg="$msg Harness '$HID' hat eine lesbare Sitzungsquelle (session), aber das Modell dieses Panes kein contextWindow in der Registry — ohne Nenner wird aus der Tokenzahl KEINE Prozentzahl geraten. contextWindow am Modell nachtragen."
     fi
     echo "$msg"
-    blind="$blind $pane"
+    blind="$(liste_mit "$blind" "$pane")"
+}
+
+announce_session_wartet() {  # Codex-Datei ist eindeutig, aber erster token_count fehlt noch
+    local pane="$1" label="$2"
+    liste_hat "$wartet_session" "$pane" && return
+    echo "$(date +%H:%M) $label ($pane): Codex-Rollout eindeutig gefunden, wartet aber noch auf die erste token_count-Messung — wird bei jedem Poll erneut gelesen; keine BLIND-Meldung."
+    wartet_session="$(liste_mit "$wartet_session" "$pane")"
 }
 
 # JEDER Tastendruck dieses Guards geht durch wb-pane-write (2026-08-06). Der Guard
@@ -2045,6 +2232,49 @@ schreib_taste() {  # <pane> <tastenname>
     mit_frist "$PANE_WRITE_TIMEOUT" "$PANE_WRITE" taste "$1" "$2"
     rc=$?
     schreib_abbruch "$rc" "wb-pane-write taste $1 $2"
+}
+
+# --- Frei zum Tippen? (2026-10-09) ---------------------------------------------------
+# VORFALL 09.10.2026, Pane %32 (Log ...-a0eed0): diese Wache tippte "/compact"
+# (08:52:53, Notbremse 80 %) und "WEITERARBEITEN" (08:54:56) samt Enter in einen Pane, in
+# dem eine AskUserQuestion offen stand. Der Dialog verschluckte die Buchstaben, das Enter
+# waehlte die markierte erste Option -- zweimal eine Antwort, die niemand gegeben hatte,
+# und die Kompaktierung fand nie statt (80 % -> 80 %, "WIRKUNGSLOS"). Geprueft wurde
+# vorher nur BUSY_RE; ein offener Dialog arbeitet nicht und kam deshalb durch.
+# Seitdem fragt jede Tippstelle dieser Datei VORHER `wb-pane-write frei` -- dieselbe
+# Pruefung, die wb-pane-write vor jedem Schreiben selbst noch einmal macht. Nicht frei
+# heisst: nichts tippen, im Log sagen warum, beim naechsten Poll erneut pruefen.
+TIPP_SPERRE_GRUND=""
+_TIPP_SPERRE_GELOGGT=""
+pane_frei_grund() {   # <pane> [--nur-dialog] -> Grund auf stdout, leer = frei
+    local out rc
+    [ -x "$PANE_WRITE" ] || { printf 'wb-pane-write fehlt'; return 0; }
+    out=$(mit_frist "$PANE_WRITE_TIMEOUT" "$PANE_WRITE" ${2:+"$2"} frei "$1" 2>/dev/null </dev/null)
+    rc=$?
+    (( rc == 0 )) && return 0
+    schreib_abbruch "$rc" "wb-pane-write frei $1" || true
+    [[ -n "$out" ]] || out="Pruefung ohne Antwort (rc $rc) -- unklar heisst nicht frei"
+    printf '%s' "$out"
+}
+nicht_frei() {   # <pane> -> 0 wenn NICHT frei (Grund in TIPP_SPERRE_GRUND); loggt je Pane+Grund einmal
+    TIPP_SPERRE_GRUND="$(pane_frei_grund "$1")"
+    if [[ -z "$TIPP_SPERRE_GRUND" ]]; then
+        _TIPP_SPERRE_GELOGGT=""
+        return 1
+    fi
+    if [[ "$_TIPP_SPERRE_GELOGGT" != "$1 $TIPP_SPERRE_GRUND" ]]; then
+        echo "$(date +%H:%M) context-guard: $1 ist NICHT frei zum Tippen ($TIPP_SPERRE_GRUND) -- nichts getippt, kein Enter; der naechste Poll prueft erneut." >&2
+        _TIPP_SPERRE_GELOGGT="$1 $TIPP_SPERRE_GRUND"
+    fi
+    return 0
+}
+
+# Dem Menschen sagen, dass die Notbremse wegen eines offenen Dialogs nicht greift --
+# nie stillschweigend. Ins Orchestrator-Protokoll (das liest er) und als kurze
+# Statuszeile in seinem tmux-Client; getippt wird dabei nichts.
+mensch_melden() {   # <pane> <text>
+    log_orch_notify "$2"
+    tmux display-message -d 15000 -t "$1" "context-guard: $2" 2>/dev/null || true
 }
 
 # --- Absende-Pruefung ---------------------------------------------------------------
@@ -2130,9 +2360,10 @@ absenden_verifizieren() {   # <pane> [nachhilfe=1] -> 0: Eingabezeile frei, Wart
 nudge() {     # never interrupt a turn or a compaction (for /compact + orchestrator actions)
     local pane="$1" msg="$2"
     tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && return 1
+    nicht_frei "$pane" && return 1
     schreib_text "$pane" "$msg" || return 1
     sleep 1
-    schreib_taste "$pane" Enter
+    schreib_taste "$pane" Enter || return 1
     return 0
 }
 
@@ -2162,6 +2393,7 @@ nudge() {     # never interrupt a turn or a compaction (for /compact + orchestra
 nudge_verifiziert() {
     local pane="$1" msg="$2"
     tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && return 1
+    nicht_frei "$pane" && return 1
     schreib_text "$pane" "$msg" || return 1
     sleep 1
     schreib_taste "$pane" Enter
@@ -2182,6 +2414,7 @@ nudge_verifiziert() {
 nudge_kompakt_einmalig() {
     local pane="$1" msg="$2"
     tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && return 2
+    nicht_frei "$pane" && return 2
     schreib_text "$pane" "$msg" || return 2
     sleep 1
     schreib_taste "$pane" Enter
@@ -2200,6 +2433,7 @@ nudge_kompakt_einmalig() {
 pane_wartet_leer() {   # <pane> -> 0: wirklich idle, 1: Dialog/Zug/Warteschlange/haengender Text
     local pane="$1" cap inbox
     [[ -n "$(pane_dialog_question "$pane")" ]] && return 1
+    nicht_frei "$pane" && return 1
     cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null)
     printf '%s\n' "$cap" | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && return 1
     inbox=$(printf '%s\n' "$cap" | grep -E "$GUARD_PROMPT_RE" | tail -1)
@@ -2216,6 +2450,7 @@ pane_wartet_leer() {   # <pane> -> 0: wirklich idle, 1: Dialog/Zug/Warteschlange
 # not the command).
 nudge_queue() {
     local pane="$1" msg="$2"
+    nicht_frei "$pane" && return 1
     schreib_text "$pane" "$msg" || return 1
     sleep 1
     schreib_taste "$pane" Enter
@@ -2241,6 +2476,73 @@ handoff_candidates() {   # pane name -> ein oder zwei Kandidatpfade, cwd zuerst
     cwd=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
     [[ -n "$cwd" ]] && printf '%s/HANDOFF-%s.md\n' "$cwd" "$name"
     [[ "$cwd" != "$PROJECT" ]] && printf '%s/HANDOFF-%s.md\n' "$PROJECT" "$name"
+}
+
+# Der Anschluss-Prompt selbst -- WORTGLEICH fuer beide Wege (eigene Kompaktierung und
+# Selbstkompaktierung des Harness). Ein Worker darf nicht daran erkennen koennen, wer
+# kompaktiert hat; er soll seine Uebergabe lesen und weiterarbeiten.
+anschluss_text() {   # <handoff-pfad>
+    printf 'Weiter nach der Kompaktierung: lies %s vollstaendig und fuehre den darin genannten naechsten Schritt aus; Ergebnisdatei wie im Auftrag.' "$1"
+}
+
+# Anschluss nach der SELBSTkompaktierung eines Workers (2026-09-18, Vorfall mobil-spec,
+# Harness codex, Session wb-AI-b310aa-1d39e0). Ablauf dort: 17:40 Mahnung (Schritt 1),
+# 17:4x kompaktierte codex sich SELBST (Eintrag "type":"compacted" im Rollout, Last
+# danach 19 %), 17:45 schrieb der Worker seine Uebergabe und blieb wie angewiesen
+# stehen. Die Wache sah nur noch eine niedrige Auslastung, lief in den Rearm-Zweig und
+# tippte nie einen Anschluss -- der Merker dafuer entsteht ausschliesslich nach der
+# EIGENEN Kompaktierung. Der Worker stand still, bis der Nutzer es bemerkte.
+#
+# Diese Funktion schliesst genau diese Luecke und NUR sie. Getippt wird, wenn ALLES
+# zutrifft: gemahnt (MAHNUNG_DIR), Auslastung unter die Rearm-Schwelle gefallen (der
+# Aufrufer), Uebergabe NACH der Mahnung geschrieben, Pane wirklich leer wartend. Sonst
+# wird nichts getippt -- ein Worker, der nach der Selbstkompaktierung von allein
+# weiterarbeitet, bleibt unangetastet. Genau EINMAL, auch ueber einen Neustart der
+# Wache hinweg: der Merker wird VERBRAUCHT, bevor getippt wird (dieselbe Regel wie bei
+# nudge_kompakt_einmalig und beim Anschluss nach eigener Kompaktierung).
+# Die Datei "<merker>.still" haelt nur den Logzeilen-Laerm klein: Bedingungen, die
+# einen weiteren Poll lang unerfuellt bleiben duerfen, werden EINMAL gemeldet.
+selbst_anschluss() {   # <pane> <name> <pct>
+    local pane="$1" name="$2" pct="$3"
+    local datei="$MAHNUNG_DIR/$(sanitize_name "$name")" mahn_zeit alter cand handoff
+    [[ -f "$datei" ]] || return 0
+    # `eingreifen: false` heisst: gemahnt wird, getippt nie. Dann ist der Merker
+    # gegenstandslos -- er wuerde sonst nur bis zum Verfall liegenbleiben.
+    if ! (( WACHE_WORKER_EINGRIFF )); then rm -f "$datei" "$datei.still"; return 0; fi
+    mahn_zeit="$(tr -dc '0-9' < "$datei" 2>/dev/null)"
+    [[ -n "$mahn_zeit" ]] || mahn_zeit=0
+    alter=$(( $(date +%s) - mahn_zeit ))
+    if (( mahn_zeit <= 0 )) || (( alter > MAHNUNG_MAX_ALTER_S )); then
+        rm -f "$datei" "$datei.still"
+        echo "$(date +%H:%M) $name ($pane): Auslastung faellt auf ${pct}%, die Mahnung ist aber ${alter}s alt (Frist ${MAHNUNG_MAX_ALTER_S}s) -- kein Anschluss getippt."
+        return 0
+    fi
+    if ! pane_wartet_leer "$pane"; then
+        if [[ ! -f "$datei.still" ]]; then
+            echo "$(date +%H:%M) $name ($pane): ${pct}% ohne eigene Kompaktierung, aber der Pane arbeitet -- kein Anschluss getippt."
+            : > "$datei.still"
+        fi
+        return 0
+    fi
+    handoff=""
+    while IFS= read -r cand; do
+        # NACH der Mahnung geschrieben, nicht irgendwann: eine alte Uebergabe aus einer
+        # frueheren Runde beschreibt einen Stand, den der Worker laengst hinter sich hat.
+        [[ -f "$cand" ]] && [ "$(mtime "$cand")" -ge "$mahn_zeit" ] && { handoff="$cand"; break; }
+    done < <(handoff_candidates "$pane" "$name")
+    if [[ -z "$handoff" ]]; then
+        if [[ ! -f "$datei.still" ]]; then
+            echo "$(date +%H:%M) $name ($pane): ${pct}% ohne eigene Kompaktierung, aber keine Uebergabe nach der Mahnung -- kein Anschluss getippt."
+            : > "$datei.still"
+        fi
+        return 0
+    fi
+    rm -f "$datei" "$datei.still"    # verbraucht, VOR dem Tippversuch -- nie ein zweiter Anschluss
+    if nudge_verifiziert "$pane" "$(anschluss_text "$handoff")"; then
+        echo "$(date +%H:%M) $name ($pane) -> resumed (Anschluss nach Selbstkompaktierung, ${pct}%, $handoff)"
+    else
+        echo "$(date +%H:%M) $name ($pane): Anschluss NICHT verifiziert nach Selbstkompaktierung -- Pane steht moeglicherweise leer und ohne Auftrag. Selbst pruefen: tmux capture-pane -p -t $pane"
+    fi
 }
 
 record_known_worker() {   # name -> appends to KNOWN_WORKERS_FILE once, deduped
@@ -2354,6 +2656,16 @@ check_worker_results() {
             ziel="$(readlink "$resfile" 2>/dev/null)"
             [ -n "$ziel" ] || ziel="$resfile"
             case "$ziel" in /*) ;; *) ziel="$(dirname "$resfile")/$ziel" ;; esac
+            # PLATZHALTER IST KEIN ERGEBNIS (2026-09-18, Befund der Session
+            # wb-AI-b310aa-1d39e0): pi-worker biegt latest.md WAEHREND der Laufzeit auf
+            # ".laufend.md" (siehe pi-worker, $PLATZHALTER) -- eine nicht leere Datei,
+            # die "-s" anstandslos passiert. Gemessen: "17:38 worker mobil-spec fertig",
+            # eine Minute nach dem Spawn, waehrend der Worker anfing zu arbeiten. Das
+            # echte Ergebnis meldet spaeter zwar noch (andere Kennung), aber bis dahin
+            # steht im Protokoll -- und bei eingeschaltetem guardMeldetWorkerStatus im
+            # Orchestrator-Pane -- eine Fertigmeldung auf einen Platzhalter. wb-result
+            # kennt diese Unterscheidung seit jeher (dortiges 'case *.laufend.md').
+            case "$ziel" in */.laufend.md) continue ;; esac
             ident="$ziel@$(stat -L -c %Y "$resfile" 2>/dev/null || stat -L -f %m "$resfile" 2>/dev/null || echo 0)"
             # KEINE Handlungsanweisung (2026-08-05). Hier stand bis heute
             # "... lies es und schliesse den Pane mit `wb-close <name>`, wenn er
@@ -2385,6 +2697,8 @@ check_worker_results() {
                 "test -s $RFILE && printf '%s@%s' \"\$(readlink $RFILE 2>/dev/null || echo $RFILE)\" \"\$(stat -L -c %Y $RFILE 2>/dev/null || stat -L -f %m $RFILE 2>/dev/null || echo 0)\"" 2>/dev/null)"
             [ -n "$ident" ] || continue
             ziel="${ident%@*}"   # fuer die Altbestands-Pruefung unten, siehe dort
+            # Derselbe Platzhalter-Fall wie im lokalen Zweig oben, gleiche Begruendung.
+            case "$ziel" in */.laufend.md) continue ;; esac
             # Ebenfalls ohne Aufforderung zum Schliessen. Der Lese-Hinweis bleibt:
             # bei einem fernen Worker liegt die Datei auf der anderen Maschine und
             # ist ohne wb-result gar nicht erreichbar -- und dass sie da ist, hat
@@ -2564,7 +2878,7 @@ check_remote_view() {
     # mit einem Worker, unabhaengig davon, ob sie ueberhaupt etwas mit der anderen
     # Maschine zu tun hat. Ohne die Bremse holte er blind ALLE Sessions der anderen
     # Maschine in die zufaellig gerade angehaengte lokale Session (Befund 27.08.: zwei
-    # fremde Mac-Sessions landeten so im Worker-Tab von peers Polarschern-Session).
+    # fremde Mac-Sessions landeten so im Worker-Tab von peers ProjectX-Session).
     ( "$rv" --quiet --owned-only >/dev/null 2>&1 || true ) &
 }
 
@@ -2639,6 +2953,10 @@ kompakt_karenz=0
 kompakt_vorher=-1
 kompakt_nachher=-1
 blind=""     # panes we cannot read at all -- announced once, never silently ignored
+# Eindeutiger Codex-Rollout vor seinem ersten abgeschlossenen Modellzug. Das ist
+# keine Messung und wird deshalb nicht als 0 % ausgegeben; die Wache liest ihn
+# weiter und nennt ihn auch nicht faelschlich BLIND.
+wartet_session=""
 
 # --- HERZSCHLAG UND WIEDERHOLTE BLIND-MELDUNG (2026-08-26) ---------------------------
 # Beides gegen dieselbe Schwaeche: Schweigen im Protokoll ist zweideutig. Eine Wache,
@@ -2658,7 +2976,7 @@ POLL_NR=0
 BLIND_WIEDERHOLUNG="${BLIND_WIEDERHOLUNG:-30}"   # alle N Polls erneut melden (0 = nie)
 
 # Panes, bei denen die Frage nach dem Kontext gar nicht gestellt gehoert (2026-08-26,
-# Einwand von Polarschern). Der Mac-Spiegel %5 ist eine nackte `bash` in einem
+# Einwand von ProjectX). Der Mac-Spiegel %5 ist eine nackte `bash` in einem
 # ssh-Aufruf; sie hat keine Statuszeile und wird nie eine haben. Die -- richtige --
 # wiederholte Blindheitsmeldung waere ausgerechnet dort am lautesten, wo sie nichts
 # bedeutet, und genau so gewoehnt man sich das Hinsehen ab. Diese Liste wird deshalb
@@ -2683,17 +3001,37 @@ compact_orchestrator() {   # $1 = reason (log only), $2 = optionaler weiterer Se
     local vorher_pct vorher_src
     read -r vorher_pct vorher_src <<<"$(read_load "$ORCH")"
     if [[ -z "$HCOMPACT" ]]; then
-        if [[ "$nocompact" != *" $ORCH"* ]]; then
+        if ! liste_hat "$nocompact" "$ORCH"; then
             echo "$(date +%H:%M) orchestrator ($ORCH): Harness '${HID:-unbekannt}' kennt kein Kompaktieren (compactCommand leer) — NICHT getippt ($reason). Der Kontext muss von Hand entlastet werden."
             log_orch_notify "Harness '${HID:-unbekannt}' kann nicht kompaktieren ($reason)"
-            nocompact="$nocompact $ORCH"
+            nocompact="$(liste_mit "$nocompact" "$ORCH")"
         fi
         return 1
     fi
     nudge_kompakt_einmalig "$ORCH" "$HCOMPACT Behalte: SESSION-STATE.md im Projekt ist der Live-Zustand (Ziele, gemessener Stand, geloeste Kernbugs, Prozessregeln, laufende Worker mit Pane-IDs, naechste Schritte) — sie ueberlebt die Kompaktierung und wird danach ZUERST gelesen. Ebenso GOALS.md (verbindliche Ziele), QUALITY.md (Pruefkatalog, Abnahme am Auge), PERF-STATE.md (alle gemessenen Sackgassen — nicht wiederholen). Worker-Status NIE am Pane-Text ablesen, sondern auf die Ergebnisdatei warten."
     local sendestatus=$?
     if (( sendestatus == 2 )); then
-        return 1                           # Pane war busy, nichts getippt -- naechster Poll darf es erneut versuchen
+        # Nicht frei (offener Dialog, ungesendeter Text, Register "waiting"): nichts
+        # getippt. Der naechste Poll versucht es erneut -- und der Mensch erfaehrt es
+        # sofort und nach TIPP_SPERRE_FRIST noch einmal, statt dass die Notbremse
+        # stillschweigend nicht greift (2026-10-09).
+        if [[ -n "$TIPP_SPERRE_GRUND" ]]; then
+            local jetzt; jetzt=$(date +%s)
+            if [[ -z "$tipp_sperre_seit" ]]; then
+                tipp_sperre_seit=$jetzt; tipp_sperre_gemahnt=0
+                echo "$(date +%H:%M) orchestrator ($ORCH): Kompaktierung ($reason) WARTET -- Pane nicht frei: $TIPP_SPERRE_GRUND. Nichts getippt; erneuter Versuch bei jedem Poll."
+                mensch_melden "$ORCH" "Notbremse ($reason) wartet: Pane $ORCH nicht frei ($TIPP_SPERRE_GRUND). Bitte Dialog beantworten oder Eingabe leeren."
+            elif (( ! tipp_sperre_gemahnt && jetzt - tipp_sperre_seit >= TIPP_SPERRE_FRIST )); then
+                tipp_sperre_gemahnt=1
+                echo "$(date +%H:%M) orchestrator ($ORCH): Kompaktierung ($reason) seit $(( jetzt - tipp_sperre_seit ))s blockiert -- Pane weiter nicht frei: $TIPP_SPERRE_GRUND."
+                mensch_melden "$ORCH" "Notbremse ($reason) seit $(( (jetzt - tipp_sperre_seit) / 60 )) min blockiert: Pane $ORCH nicht frei ($TIPP_SPERRE_GRUND)."
+            fi
+        fi
+        return 1                           # Pane war busy oder nicht frei, nichts getippt -- naechster Poll darf es erneut versuchen
+    fi
+    if [[ -n "$tipp_sperre_seit" ]]; then
+        echo "$(date +%H:%M) orchestrator ($ORCH): Pane wieder frei nach $(( $(date +%s) - tipp_sperre_seit ))s -- Kompaktierung getippt."
+        tipp_sperre_seit=""; tipp_sperre_gemahnt=0
     fi
     # GETIPPT, unabhaengig davon, ob verifiziert (Befund 2026-08-19, siehe
     # nudge_kompakt_einmalig): $ORCH gilt ab hier als "diesen Zyklus versucht",
@@ -2702,37 +3040,93 @@ compact_orchestrator() {   # $1 = reason (log only), $2 = optionaler weiterer Se
     # NIE ein zweites Mal in DIESEM Zyklus abschicken, sonst wirft die zweite
     # Kompaktierung genau den Kontext weg, den die erste (falls sie doch
     # ankam) gerade erst gerettet hat.
-    compacted="$compacted $ORCH"
-    if (( sendestatus != 0 )); then
-        return 1                           # geloggt hat nudge_kompakt_einmalig schon
+    compacted="$(liste_mit "$compacted" "$ORCH")"
+    kompakt_versuche=$(( kompakt_versuche + 1 ))
+    # ANKUNFT BELEGEN (2026-10-09, Nachtrag b): am 09.10. stand nach dem Enter eine leere
+    # Eingabezeile im Pane -- nicht weil /compact lief, sondern weil das Enter eine offene
+    # Frage beantwortet hatte. "Eingabezeile leer" allein beweist also nichts. Angekommen
+    # ist der Befehl erst, wenn die Kompaktierungsanzeige erscheint (oder, hinterher, die
+    # Last faellt). Unklar heisst: nicht angekommen.
+    local angekommen=0 w=0 beleg="" nachher_pct=-1 nachher_src="" wirksam=0 p_jetzt q_jetzt
+    if (( sendestatus == 0 )); then
+        while (( w < KOMPAKT_ANKUNFT_S )); do
+            if tmux capture-pane -p -t "$ORCH" 2>/dev/null | grep -qE "$KOMPAKT_ANKUNFT_RE"; then
+                angekommen=1; beleg="Kompaktierungsanzeige nach ${w}s"; break
+            fi
+            # Ein Harness ohne Anzeige: der Lastabfall selbst belegt die Ankunft -- und
+            # die Wirkung, gemessen JETZT, bevor neue Arbeit die Last wieder hebt.
+            read -r p_jetzt q_jetzt <<<"$(read_load "$ORCH")"
+            if (( vorher_pct >= 0 && p_jetzt >= 0 && p_jetzt <= vorher_pct - KOMPAKT_WIRKUNG_MIN )); then
+                angekommen=1; wirksam=1; nachher_pct=$p_jetzt; nachher_src=$q_jetzt
+                beleg="Last gefallen nach ${w}s"; break
+            fi
+            sleep 1; w=$(( w + 1 ))
+        done
+        echo "$(date +%H:%M) orchestrator ($ORCH) -> $HCOMPACT typed ($reason), Last vorher ${vorher_pct}% (${vorher_src}), Versuch ${kompakt_versuche}/${KOMPAKT_MAX_VERSUCHE}, ${beleg:-NICHT als Befehl angekommen}"
     fi
-    echo "$(date +%H:%M) orchestrator ($ORCH) -> $HCOMPACT typed ($reason)"
-    log_orch_notify "orchestrator /compact getippt ($reason)"
-    sleep "$COMPACT_SETTLE"                # hands off while it compacts
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        tmux capture-pane -p -t "$ORCH" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" || break
-        sleep 30
-    done
+    if (( angekommen )); then
+        log_orch_notify "orchestrator /compact getippt ($reason)"
+        if (( ! wirksam )); then
+            sleep "$COMPACT_SETTLE"                # hands off while it compacts
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+                tmux capture-pane -p -t "$ORCH" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" || break
+                sleep 30
+            done
+        fi
+    else
+        echo "$(date +%H:%M) orchestrator ($ORCH): $HCOMPACT ($reason) NICHT als Befehl angekommen -- weder Kompaktierungsanzeige noch Lastabfall binnen ${KOMPAKT_ANKUNFT_S}s (Absenden $( (( sendestatus == 0 )) && echo verifiziert || echo 'nicht verifiziert')), Last vorher ${vorher_pct}% (${vorher_src}), Versuch ${kompakt_versuche}/${KOMPAKT_MAX_VERSUCHE}."
+    fi
     # NACHMESSEN (2026-08-28): erst jetzt, nach COMPACT_SETTLE und der Busy-Schleife,
     # steht ein Ergebnis auf dem Schirm. Verglichen wird gegen die Last von vor dem
     # Tippen; beide muessen lesbar sein, sonst wird nichts behauptet.
-    local nachher_pct nachher_src
-    read -r nachher_pct nachher_src <<<"$(read_load "$ORCH")"
-    if (( vorher_pct >= 0 && nachher_pct >= 0 && nachher_pct > vorher_pct - KOMPAKT_WIRKUNG_MIN )); then
+    if (( wirksam )); then
+        echo "$(date +%H:%M) orchestrator ($ORCH): Kompaktierung wirksam — Last ${vorher_pct}% -> ${nachher_pct}% (${nachher_src})."
+    else
+        read -r nachher_pct nachher_src <<<"$(read_load "$ORCH")"
+        if (( vorher_pct >= 0 && nachher_pct >= 0 && nachher_pct <= vorher_pct - KOMPAKT_WIRKUNG_MIN )); then
+            wirksam=1
+            echo "$(date +%H:%M) orchestrator ($ORCH): Kompaktierung wirksam — Last ${vorher_pct}% -> ${nachher_pct}% (${nachher_src})."
+        elif (( angekommen )) && ! (( vorher_pct >= 0 && nachher_pct >= 0 )); then
+            wirksam=1                          # angekommen, aber nicht messbar: verbraucht, wie bisher
+            echo "$(date +%H:%M) orchestrator ($ORCH): Wirksamkeit der Kompaktierung NICHT messbar (vorher ${vorher_pct}%, nachher ${nachher_pct}%) — der Zyklus bleibt verbraucht, wie bisher."
+        fi
+    fi
+    if (( ! wirksam )); then
+        # WIRKUNGSLOS ODER NICHT ANGEKOMMEN (Nachtrag c): Sentinel und Warnung bleiben
+        # stehen -- der Versuch hat nichts gerettet und darf den Zyklus nicht verbrauchen.
+        # Kein WEITERARBEITEN (es gab keine Kompaktierung, nach der weiterzuarbeiten
+        # waere). Nach der Karenz greifen Sentinel bzw. Notbremse erneut, aber nur in
+        # einem freien Moment (nudge_kompakt_einmalig prueft "frei"); nach
+        # KOMPAKT_MAX_VERSUCHE Fehlversuchen erfaehrt es der Mensch, und es bleibt dabei.
         kompakt_wirkungslos="$ORCH"
         kompakt_karenz="$KOMPAKT_KARENZ_POLLS"
         kompakt_vorher="$vorher_pct"
         kompakt_nachher="$nachher_pct"
-        echo "$(date +%H:%M) orchestrator ($ORCH): Kompaktierung WIRKUNGSLOS — Last vorher ${vorher_pct}% (${vorher_src}), nachher ${nachher_pct}% (${nachher_src}), erwartet war ein Abfall von mindestens ${KOMPAKT_WIRKUNG_MIN} Punkten. Ohne Freigabe waere der Zyklus jetzt tot (neu scharf erst unter $(( ORCH_PCT - ORCH_REARM_GAP ))%). Karenz: ${KOMPAKT_KARENZ_POLLS} Polls, danach ist ein zweiter Versuch erlaubt."
-        log_orch_notify "Kompaktierung wirkungslos (${vorher_pct}% -> ${nachher_pct}%), Zyklus wird nach ${KOMPAKT_KARENZ_POLLS} Polls wieder freigegeben"
-    elif (( vorher_pct >= 0 && nachher_pct >= 0 )); then
-        echo "$(date +%H:%M) orchestrator ($ORCH): Kompaktierung wirksam — Last ${vorher_pct}% -> ${nachher_pct}% (${nachher_src})."
-    else
-        echo "$(date +%H:%M) orchestrator ($ORCH): Wirksamkeit der Kompaktierung NICHT messbar (vorher ${vorher_pct}%, nachher ${nachher_pct}%) — der Zyklus bleibt verbraucht, wie bisher."
+        kompakt_angekommen=$angekommen
+        echo "$(date +%H:%M) orchestrator ($ORCH): Kompaktierung WIRKUNGSLOS — Last vorher ${vorher_pct}% (${vorher_src}), nachher ${nachher_pct}% (${nachher_src}), erwartet war ein Abfall von mindestens ${KOMPAKT_WIRKUNG_MIN} Punkten$( (( angekommen )) || echo '; der Befehl kam nicht als Befehl an'). Sentinel und Warnung bleiben stehen. Karenz: ${KOMPAKT_KARENZ_POLLS} Polls, danach erneuter Versuch im naechsten freien Moment (Versuch ${kompakt_versuche}/${KOMPAKT_MAX_VERSUCHE})."
+        log_orch_notify "Kompaktierung wirkungslos (${vorher_pct}% -> ${nachher_pct}%, Versuch ${kompakt_versuche}/${KOMPAKT_MAX_VERSUCHE})"
+        if (( kompakt_versuche >= KOMPAKT_MAX_VERSUCHE )); then
+            echo "$(date +%H:%M) orchestrator ($ORCH): Kompaktierung ENDGUELTIG gescheitert nach ${kompakt_versuche} Versuchen -- kein weiterer automatischer Versuch in diesem Zyklus."
+            mensch_melden "$ORCH" "Kompaktierung von $ORCH endgueltig gescheitert (${kompakt_versuche} Versuche, Last ${nachher_pct}%). Bitte selbst /compact ausfuehren."
+        fi
+        return 1
     fi
+    kompakt_versuche=0
+    kompakt_wirkungslos=""
     rm -f "$SENTINEL"                      # cycle is armed again for the next rise
     [[ -n "$extra_sentinel" ]] && rm -f "$extra_sentinel"   # 2026-09-10: nur entfernt, wenn dieser Aufruf ihn selbst konsumiert hat (siehe Aufrufer)
-    warned="${warned/ $ORCH/}"
+    warned="$(liste_ohne "$warned" "$ORCH")"
+    # Ist der Pane nach der Kompaktierung nicht frei (ein Dialog ging auf, jemand tippt),
+    # wird hoechstens ANSCHLUSS_FREI_FRIST Sekunden gewartet und nie hineingetippt.
+    local frei_warte=0
+    while nicht_frei "$ORCH" && (( frei_warte < ANSCHLUSS_FREI_FRIST )); do
+        sleep 10; frei_warte=$(( frei_warte + 10 ))
+    done
+    if [[ -n "$TIPP_SPERRE_GRUND" ]]; then
+        echo "$(date +%H:%M) orchestrator ($ORCH): WEITERARBEITEN NICHT getippt -- Pane nach ${frei_warte}s weiter nicht frei ($TIPP_SPERRE_GRUND)."
+        mensch_melden "$ORCH" "WEITERARBEITEN nach /compact nicht getippt: Pane $ORCH nicht frei ($TIPP_SPERRE_GRUND)."
+        return 0
+    fi
     # Die Kette Handoff-Aufforderung -> $HCOMPACT -> WEITERARBEITEN laeuft in dieser
     # Reihenfolge und jede Stufe loggt ihr eigenes Ergebnis (2026-08-12): die
     # WEITERARBEITEN-Zeile "-> resumed" stand hier bis heute UNBEDINGT im Protokoll,
@@ -2910,8 +3304,10 @@ while true; do
         check_dialog_block "$pane" "$name"
 
         read -r pct src <<<"$(read_load "$pane" "$name")"
+        if (( pct == -2 )); then announce_session_wartet "$pane" "$name"; continue; fi
         if (( pct < 0 )); then announce_blind "$pane" "$name" 1; continue; fi
-        blind="${blind/ $pane/}"
+        blind="$(liste_ohne "$blind" "$pane")"
+        wartet_session="$(liste_ohne "$wartet_session" "$pane")"
 
         # Anschluss nach dem Kompaktieren (2026-09-03, siehe ANSCHLUSS_DIR/Vorfall
         # wache2/neubau oben): laeuft UNABHAENGIG von der Warn-/Kompaktier-Verzweigung
@@ -2931,9 +3327,13 @@ while true; do
                     [[ -f "$cand" ]] && { anschluss_handoff="$cand"; break; }
                 done < <(handoff_candidates "$pane" "$name")
                 rm -f "$anschluss_datei"    # verbraucht, VOR dem Tippversuch -- nie ein zweiter Anschluss
+                # Die eigene Kompaktierung hat den Anschluss uebernommen: der
+                # Mahnungs-Merker (Selbstkompaktierung) darf danach nicht noch einmal
+                # denselben Prompt tippen.
+                rm -f "$MAHNUNG_DIR/$(sanitize_name "$name")" "$MAHNUNG_DIR/$(sanitize_name "$name").still"
                 if [[ -z "$anschluss_handoff" ]]; then
                     echo "$(date +%H:%M) $name ($pane): kein Anschluss getippt -- nach dem Abfall von ${anschluss_vorher}% auf ${pct}% liegt keine Uebergabedatei mehr da."
-                elif nudge_verifiziert "$pane" "Weiter nach der Kompaktierung: lies $anschluss_handoff vollstaendig und fuehre den darin genannten naechsten Schritt aus; Ergebnisdatei wie im Auftrag."; then
+                elif nudge_verifiziert "$pane" "$(anschluss_text "$anschluss_handoff")"; then
                     echo "$(date +%H:%M) $name ($pane) -> resumed (Anschluss nach Kompaktierung, ${anschluss_vorher}% -> ${pct}%)"
                 else
                     echo "$(date +%H:%M) $name ($pane): Anschluss NICHT verifiziert nach Kompaktierung -- Pane steht moeglicherweise leer und ohne Auftrag. Selbst pruefen: tmux capture-pane -p -t $pane"
@@ -2942,8 +3342,16 @@ while true; do
         fi
 
         if (( pct < WARN_PCT - WORKER_REARM_GAP )); then
-            warned="${warned/ $pane/}"          # load dropped: re-arm for the next cycle
-            compacted="${compacted/ $pane/}"
+            # VOR dem Rearm (2026-09-18, Vorfall mobil-spec/codex): faellt die Last nach
+            # einer Mahnung, OHNE dass diese Wache kompaktiert hat, hat der Harness sich
+            # selbst kompaktiert -- und ein Worker, der seine Uebergabe geschrieben hat
+            # und wie angewiesen stehengeblieben ist, wartet hier auf einen Anschluss,
+            # den frueher niemand tippte. selbst_anschluss() prueft alle Bedingungen
+            # selbst und tippt genau einmal; danach ist der Zyklus wie bisher wieder
+            # scharf.
+            selbst_anschluss "$pane" "$name" "$pct"
+            warned="$(liste_ohne "$warned" "$pane")"          # load dropped: re-arm for the next cycle
+            compacted="$(liste_ohne "$compacted" "$pane")"
             continue
         fi
 
@@ -2951,7 +3359,7 @@ while true; do
         # typed into the input box, and the agent inside the pane has no hands for that. It will
         # cheerfully announce "Jetzt /compact" and then sit there forever. So we only ask for the
         # handoff here, and do the compaction ourselves in step 2.
-        if (( pct >= WARN_PCT )) && [[ "$warned" != *" $pane"* ]]; then
+        if (( pct >= WARN_PCT )) && ! liste_hat "$warned" "$pane"; then
             # Vollstaendiger Pfad statt "im Projektverzeichnis" (2026-08-19): das stimmte
             # seit dem Umzug in eigene Worktrees nicht mehr und liess die Uebergabe an
             # einer Stelle suchen, an der sie nie erschien. Erster Kandidat = der Ort, den
@@ -2960,7 +3368,14 @@ while true; do
             [[ -n "$handoff_target" ]] || handoff_target="$PROJECT/HANDOFF-${name}.md"
             if nudge_queue "$pane" "KONTEXT-WARNUNG (automatisch): Du stehst bei ~${pct}% Kontext. Ein voller Worker scheitert nicht — er wird STILL SCHLECHTER (vergisst Invarianten, wiederholt geloeste Fehler, widerspricht seinen eigenen Messungen). Schreibe JETZT eine VOLLSTAENDIGE UEBERGABE nach ${handoff_target}: Auftrag, Architektur, Vertraege/Invarianten, alle Fallstricke und NULL-RESULTATE (die sind das wertvollste Wissen — sie verhindern, dass jemand deine Sackgassen erneut durchmisst), offene Punkte, naechster konkreter Schritt. Danach NUR kurz melden, was du persistiert hast, und STEHENBLEIBEN. Tippe KEINEN Kompaktierbefehl — das kannst du nicht selbst, ich mache es fuer dich, sobald deine Uebergabe steht."; then
                 echo "$(date +%H:%M) $name ($pane) at ${pct}% -> handoff requested ($handoff_target)"
-                warned="$warned $pane"
+                warned="$(liste_mit "$warned" "$pane")"
+                # Zeitpunkt der Mahnung auf Platte (2026-09-18, siehe MAHNUNG_DIR):
+                # `warned` lebt nur in diesem Prozess und sagt ausserdem nicht, WANN
+                # gemahnt wurde -- beides braucht selbst_anschluss(), um eine Uebergabe
+                # von NACH der Mahnung von einer alten zu unterscheiden und um nach
+                # einem Neustart der Wache weiterzuwissen.
+                printf '%s\n' "$(date +%s)" > "$MAHNUNG_DIR/$(sanitize_name "$name")" 2>/dev/null || true
+                rm -f "$MAHNUNG_DIR/$(sanitize_name "$name").still"
             fi
             continue
         fi
@@ -2972,7 +3387,7 @@ while true; do
         # kompaktiert wird nicht. Der Worker bekommt seine Warnung und entscheidet
         # selbst -- gewollt fuer den, der nicht will, dass ihm eine fremde Hand
         # etwas in die Eingabezeile tippt.
-        if [[ "$warned" == *" $pane"* ]] && [[ "$compacted" != *" $pane"* ]]; then
+        if liste_hat "$warned" "$pane" && ! liste_hat "$compacted" "$pane"; then
             (( WACHE_WORKER_EINGRIFF )) || continue
             tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10 | grep -qE "$BUSY_RE" && continue
             # Beide Kandidaten pruefen, nicht nur PROJECT (2026-08-19, siehe handoff_candidates
@@ -2988,9 +3403,9 @@ while true; do
             # der Datei, auch wenn dieser Harness nicht kompaktieren kann.
             harness_info "$pane"
             if [[ -z "$HCOMPACT" ]]; then
-                if [[ "$nocompact" != *" $pane"* ]]; then
+                if ! liste_hat "$nocompact" "$pane"; then
                     echo "$(date +%H:%M) $name ($pane): Harness '${HID:-unbekannt}' kennt kein Kompaktieren — Uebergabe steht in $found_handoff, kompaktiert wird NICHT."
-                    nocompact="$nocompact $pane"
+                    nocompact="$(liste_mit "$nocompact" "$pane")"
                 fi
                 continue
             fi
@@ -3011,8 +3426,12 @@ while true; do
             # jeden weiteren Poll, ob die Auslastung WIRKLICH gefallen ist, und tippt den
             # Anschluss dann selbst -- verifiziert oder nicht spielt hier keine Rolle mehr.
             if (( kompaktstatus != 2 )); then
-                compacted="$compacted $pane"          # getippt, unabhaengig von der Verifikation -- kein zweiter Versuch
+                compacted="$(liste_mit "$compacted" "$pane")"          # getippt, unabhaengig von der Verifikation -- kein zweiter Versuch
                 printf '%s\n' "$pct" > "$ANSCHLUSS_DIR/$(sanitize_name "$name")" 2>/dev/null || true
+                # Ab hier gehoert der Anschluss der eigenen Kompaktierung (ANSCHLUSS_DIR).
+                # Der Mahnungs-Merker hat seine Aufgabe erfuellt und muss weg, sonst
+                # tippen beide Wege denselben Prompt.
+                rm -f "$MAHNUNG_DIR/$(sanitize_name "$name")" "$MAHNUNG_DIR/$(sanitize_name "$name").still"
             fi
             if (( kompaktstatus == 0 )); then
                 echo "$(date +%H:%M) $name ($pane) -> $HCOMPACT typed (handoff persisted)"
@@ -3053,8 +3472,10 @@ while true; do
         if [[ -n "$kompakt_wirkungslos" ]] && [[ "$kompakt_wirkungslos" == "$ORCH" ]]; then
             if (( kompakt_karenz > 0 )); then
                 kompakt_karenz=$(( kompakt_karenz - 1 ))
+            elif (( kompakt_versuche >= KOMPAKT_MAX_VERSUCHE )); then
+                :   # endgueltig gescheitert und gemeldet -- bleibt gesperrt bis zum Rearm
             else
-                compacted="${compacted/ $ORCH/}"
+                compacted="$(liste_ohne "$compacted" "$ORCH")"
                 echo "$(date +%H:%M) orchestrator ($ORCH): Karenz abgelaufen — Zyklus nach der wirkungslosen Kompaktierung (${kompakt_vorher}% -> ${kompakt_nachher}%) wieder freigegeben."
                 log_orch_notify "Zyklus nach wirkungsloser Kompaktierung wieder freigegeben"
                 # Und der Mensch/Orchestrator erfaehrt, WARUM gleich wieder gemahnt
@@ -3068,7 +3489,8 @@ while true; do
                 # wird trotzdem freigegeben, genau wie bisher (ein ausbleibender Hinweis
                 # ist kein Grund, den Zyklus laenger zu sperren als die Karenz es vorsieht)
                 # -- nur die Ursache eines Fehlschlags bleibt jetzt nicht mehr stumm.
-                nudge "$ORCH" "KONTEXT-HINWEIS (automatisch): Die Kompaktierung von eben hat kaum Kontext befreit — Last vorher ${kompakt_vorher}%, danach ${kompakt_nachher}%. Ein zweites Kompaktieren allein wird daran nichts aendern; typischerweise haengt es an dauerhaft gehaltenem Material (angeheftete Dateien, sehr grosse Anhaenge, ein langer Systemteil). Sieh nach, was sich davon loesen laesst. Ich gebe den Zyklus jetzt wieder frei und melde mich normal weiter." >/dev/null \
+                (( kompakt_angekommen )) && nudge "$ORCH" "KONTEXT-HINWEIS (automatisch): Die Kompaktierung von eben hat kaum Kontext befreit — Last vorher ${kompakt_vorher}%, danach ${kompakt_nachher}%. Ein zweites Kompaktieren allein wird daran nichts aendern; typischerweise haengt es an dauerhaft gehaltenem Material (angeheftete Dateien, sehr grosse Anhaenge, ein langer Systemteil). Sieh nach, was sich davon loesen laesst. Ich gebe den Zyklus jetzt wieder frei und melde mich normal weiter." >/dev/null \
+                    || (( ! kompakt_angekommen )) \
                     || echo "$(date +%H:%M) context-guard: Hinweis an $ORCH (Karenz abgelaufen) NICHT zugestellt — Pane war busy oder das Schreiben schlug fehl. Der Zyklus wird trotzdem freigegeben, siehe naechsten Poll." >&2
                 kompakt_wirkungslos=""   # einmal freigeben, einmal sagen -- nicht bei jedem Poll erneut
                 kompakt_karenz=0
@@ -3102,24 +3524,24 @@ while true; do
         # mtime dort liegt (genau das war das Wettrennen). Ohne eigene Warnung wird
         # er sichtbar ignoriert und NIE geloescht, denn er koennte dem anderen Guard
         # gehoeren, der ihn noch nicht abgeholt hat.
-        if [[ -f "$SENTINEL_OLD" ]] && [[ "$warned" != *" $ORCH"* ]]; then
+        if [[ -f "$SENTINEL_OLD" ]] && ! liste_hat "$warned" "$ORCH"; then
             echo "$(date +%H:%M) orchestrator ($ORCH): alter geteilter Sentinel ($SENTINEL_OLD) ohne eigene Warnung dieses Guards — ignoriert, NICHT geloescht."
         fi
         sentinel_hit=""
         if [[ -f "$SENTINEL" ]]; then
             sentinel_hit="$SENTINEL"
-        elif [[ -f "$SENTINEL_OLD" ]] && [[ "$warned" == *" $ORCH"* ]]; then
+        elif [[ -f "$SENTINEL_OLD" ]] && liste_hat "$warned" "$ORCH"; then
             sentinel_hit="$SENTINEL_OLD"
         fi
         # `eingreifen: false` nimmt der Wache die HAND, nicht die Stimme: gemahnt
         # wird weiter (der Zweig unten), aber weder ein Sentinel noch die Notbremse
         # tippen dann noch `/compact` in die Sitzung. Der Sentinel bleibt liegen und
         # wird beim naechsten Einschalten wieder aufgegriffen.
-        if [[ -n "$sentinel_hit" ]] && [[ "$compacted" != *" $ORCH"* ]] && (( WACHE_ORCH_EINGRIFF )); then
+        if [[ -n "$sentinel_hit" ]] && ! liste_hat "$compacted" "$ORCH" && (( WACHE_ORCH_EINGRIFF )); then
             # Sentinel zaehlt nur nach eigener Warnung (2026-09-10, siehe Befund oben):
             # eine Datei allein ist kein Signal, das SIGNAL ist "ich habe $ORCH selbst
             # gewarnt und $ORCH hat mir geantwortet".
-            if [[ "$warned" == *" $ORCH"* ]]; then
+            if liste_hat "$warned" "$ORCH"; then
                 if [[ "$sentinel_hit" == "$SENTINEL_OLD" ]]; then
                     compact_orchestrator "Sentinel $sentinel_hit" "$SENTINEL_OLD"
                 else
@@ -3128,13 +3550,17 @@ while true; do
             else
                 echo "$(date +%H:%M) orchestrator ($ORCH): Sentinel ohne eigene Warnung — ignoriert."
             fi
+        elif (( pct == -2 )); then
+            announce_session_wartet "$ORCH" "orchestrator"
         elif (( pct < 0 )); then
             announce_blind "$ORCH" "orchestrator"
         else
-            blind="${blind/ $ORCH/}"
+            blind="$(liste_ohne "$blind" "$ORCH")"
+            wartet_session="$(liste_ohne "$wartet_session" "$ORCH")"
             if (( pct < ORCH_PCT - ORCH_REARM_GAP )); then
-                warned="${warned/ $ORCH/}"
-                compacted="${compacted/ $ORCH/}"
+                warned="$(liste_ohne "$warned" "$ORCH")"
+                compacted="$(liste_ohne "$compacted" "$ORCH")"
+                kompakt_versuche=0; kompakt_wirkungslos=""; kompakt_karenz=0
             # Warn-before-compact is an ORDER invariant, not just a threshold floor
             # (Reviewer-Befund 1, round 2): ORCH_COMPACT_PCT >= ORCH_PCT only keeps the
             # brake from firing BELOW the warn threshold -- at guardOrchWarnPct > 80 both
@@ -3147,13 +3573,13 @@ while true; do
             # ORCH_PCT+1 floor: a floor makes the brake unreachable at guardOrchWarnPct=99,
             # an order swap does not, and pushing compaction one extra poll later (at most
             # one POLL interval) is an accepted cost, not a bug.
-            elif (( pct >= ORCH_WARN_EFF )) && [[ "$warned" != *" $ORCH"* ]]; then
+            elif (( pct >= ORCH_WARN_EFF )) && ! liste_hat "$warned" "$ORCH"; then
                 if nudge "$ORCH" "KONTEXT-WARNUNG (automatisch): Dein eigener Kontext liegt bei ~${pct}%. BEVOR der Harness dich komprimiert, sichere das Wissen — eine Zusammenfassung verliert genau die Details, die niemand als wichtig markiert hat: (1) SESSION-STATE.md im Projekt aktualisieren (Ziele, gemessener Stand, geloeste Kernbugs, Prozessregeln, laufende Worker mit Pane-IDs, naechste Schritte). (2) Vault-Notiz im Projekt-Branch aktualisieren und committen (~/Knowledge). (3) Kontext ALLER Worker pruefen und die ueber 80% zu einer Uebergabe und danach zur Kompaktierung schicken (welcher Befehl das ist, haengt am Harness des Workers). (4) WENN das erledigt ist, sofort 'touch ${SENTINEL}' ausfuehren — daran erkenne ich, dass Dein Wissen gesichert ist, und kompaktiere Dich SOFORT (statt auf 80% zu warten); danach bekommst Du automatisch einen Weiterarbeiten-Prompt. Bis dahin normal weiterarbeiten."; then
                     echo "$(date +%H:%M) orchestrator ($ORCH) at ${pct}% (${src}) -> brain+state update requested, warte auf $SENTINEL"
                     log_orch_notify "KONTEXT-WARNUNG bei ${pct}% (${src})"
-                    warned="$warned $ORCH"
+                    warned="$(liste_mit "$warned" "$ORCH")"
                 fi
-            elif (( pct >= ORCH_COMPACT_PCT )) && [[ "$compacted" != *" $ORCH"* ]] \
+            elif (( pct >= ORCH_COMPACT_PCT )) && ! liste_hat "$compacted" "$ORCH" \
                  && (( WACHE_ORCH_EINGRIFF )); then
                 # Emergency brake: only reachable once this pane is already in "warned"
                 # (the warn branch above re-checks and skips once that's true), so the

@@ -16,8 +16,9 @@
 // Codex (`codex exec`) hat keinen Schalter ohne Werkzeuge; dort gilt die
 // schreibgeschuetzte Sandbox im selben leeren Ordner.
 //
-// DIE MODELLWAHL. `sonnet5:high` ist die Vorgabe, `codex-gpt-5-6-terra:high`
-// die zweite Wahl. Kennung, Harness und Modellname kommen aus
+// DIE MODELLWAHL. Seit 2026-10-12 sind das Familien-Aliase: Terra wird nicht
+// mehr vergeben; „größer, Spezifikation klar“ nutzt Codex Luna, danach Sol.
+// Kennung, Harness und Modellname kommen aus
 // `wb-state models get`, der Deckel der Denkstufe aus `wb-state models cap`;
 // liegt die gewuenschte Stufe darueber, gilt der Deckel. Fable nie.
 //
@@ -29,7 +30,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-export const ENTWURF_MODELLE = ['sonnet5:high', 'codex-gpt-5-6-terra:high'] as const;
+export const ENTWURF_MODELLE = ['sonnet:high', 'codex-luna:high'] as const;
 export const ENTWURF_FELDER = ['id', 'stage', 'team', 'specialty', 'model', 'effort', 'fallback_model', 'fallback_effort',
   'machine', 'tools', 'bash', 'skills', 'context_limit', 'figure', 'instructions', 'template'] as const;
 export const AGENT_WERKZEUGE = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'];
@@ -77,7 +78,7 @@ export function modelleAusTabelle(text: string): ModellZeile[] {
 export interface ModellWahl { wahl: string; kennung: string; harness: string; ref: string; stufe: string; deckel: string; hinweis: string }
 
 /**
- * `sonnet5:high` -> Registry-Eintrag und Deckel. `eintrag` ist die Ausgabe von
+ * `sonnet:high` -> Registry-Eintrag und Deckel. `eintrag` ist die Ausgabe von
  * `wb-state models get <alias>`, `deckel` die von `wb-state models cap <id> --json`.
  */
 export function modellWaehlen(wahl: string, eintrag: unknown, deckel: unknown): ModellWahl | { fehler: string } {
@@ -148,7 +149,7 @@ export function feldRegeln(quelle: string, maschine = 'peer'): string[] {
     `- "stage": "mitglied" oder "teamleiter" ("hauptagent" nur, wenn die Welt keinen hat und ${quelle} ihn verlangt).`,
     '- "team": Name eines bestehenden Teams oder ein neuer kurzer Teamname in Kleinbuchstaben; Pflicht für teamleiter.',
     '- "specialty": das Spezialgebiet in genau einem deutschen Satz, der mit einem Verb beginnt, ohne Pronomen (z. B. "Prüft Änderungen …", nie "Er prüft …").',
-    '- "model" und "fallback_model": Kennungen aus der Modellliste unten, mit Denkstufe als Suffix, z. B. "sonnet5:high". Lokal, wo es reicht; Claude oder Codex für schwere Arbeit. Nie Fable.',
+    '- "model" und "fallback_model": Kennungen aus der Modellliste unten, mit Denkstufe als Suffix, z. B. "sonnet:high". Lokal, wo es reicht; Claude oder Codex für schwere Arbeit. Nie Fable.',
     `- "machine": "${maschine || 'peer'}" als Vorgabe (die Trägermaschine der Welt); "mac" nur, wenn die Arbeit am Mac sein muss.`,
     `- "tools": Liste aus ${AGENT_WERKZEUGE.join(', ')}; so wenig wie möglich. Wer nur liest, bekommt kein Write und kein Edit.`,
     '- "bash": nur wenn "Bash" in tools steht: eng gefasste Befehlsmuster wie "git status" oder "npm test". Nie git push, rm -rf, kill, Mail-Versand oder wb-state.',

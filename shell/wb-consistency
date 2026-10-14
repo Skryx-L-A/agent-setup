@@ -17,8 +17,10 @@ current_machine_id().
 """
 import argparse
 import ast
+import copy
 import csv
 import difflib
+import filecmp
 import fnmatch
 import glob as globmod
 import hashlib
@@ -694,21 +696,46 @@ def tool_exists(name, tool_dirs, skill_dirs, registry_ids, search_path=None):
     return shutil.which(name, path=search_path) is not None
 
 
-def load_registry_identifiers(registry_path):
+def load_registry_identifiers(registry_path, *weitere_pfade):
     """Model ids/aliases/modelRefs referenced in prose (e.g. `claude-opus-5`)
     are data identifiers, not filesystem tools -- don't flag them as
-    dangling refs just because they aren't in PATH."""
+    dangling refs just because they aren't in PATH.
+
+    Dazu gehoeren die Familien-Aliase der Harnesses (`modelFamilyAliases[].aliases`,
+    z. B. `codex-sol`, `codex-astra`; seit 2026-10-10, Auftrag modell-auto). wb-state
+    ergaenzt die Familien der lebenden Registry um die der Auslieferung
+    (models.default.json), deshalb liest diese Funktion beide: Ohne die Auslieferung
+    meldete wb-consistency die Aliase in regeln/vergabe.md als VERWEIS-INS-LEERE."""
     ids = set()
-    try:
-        with open(registry_path) as f:
-            registry = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return ids
-    for m in registry.get("models", []):
-        for key in ("id", "alias", "modelRef"):
-            v = m.get(key)
-            if v:
-                ids.add(v)
+    for pfad in (registry_path,) + weitere_pfade:
+        if not pfad:
+            continue
+        try:
+            with open(pfad) as f:
+                registry = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(registry, dict):
+            continue
+        for m in registry.get("models", []):
+            if not isinstance(m, dict):
+                continue
+            for key in ("id", "alias", "modelRef"):
+                v = m.get(key)
+                if v:
+                    ids.add(v)
+        harnesses = registry.get("harnesses") or []
+        if isinstance(harnesses, dict):
+            harnesses = list(harnesses.values())
+        for h in harnesses:
+            if not isinstance(h, dict):
+                continue
+            for spec in h.get("modelFamilyAliases") or []:
+                if not isinstance(spec, dict):
+                    continue
+                for a in spec.get("aliases") or []:
+                    if isinstance(a, str) and a:
+                        ids.add(a)
     return ids
 
 
@@ -752,7 +779,11 @@ def check3_dangling_refs(cfg, base):
     files = expand_globs(c3["scan_globs"])
     tool_dirs = list(c3.get("tool_dirs", []))
     skill_dirs = list(c3.get("skill_dirs", []))
-    registry_ids = load_registry_identifiers(c3["registry_path"]) if c3.get("registry_path") else set()
+    # Auslieferung aus der Konfiguration ({REPO}) und, wie wb-state sie liest, neben diesem
+    # Werkzeug (ausgerollte Kopie unter ~/.local/bin hat keinen Baum ueber sich).
+    registry_ids = load_registry_identifiers(
+        c3.get("registry_path"), c3.get("template_registry_path"),
+        os.path.join(os.path.dirname(os.path.realpath(__file__)), "models.default.json"))
     extra_path_dirs = list(c3.get("extra_path_dirs", []))
     search_path = build_search_path(extra_path_dirs)
     marker = c3.get("cross_machine_marker", "peer")
@@ -943,7 +974,8 @@ def _check_must_not_exceed_provider_aware(cf, pcfg, claim, base_truth, truth_fil
     Ein contextWindow-Wert in einer models.json-artigen Datei gehoert zu GENAU
     einem Provider-Block (baseUrl) und optional einem Modell-Eintrag (id) --
     beide stehen in derselben Datei vor dem jeweiligen Wert. Zwei Faelle:
-      * Provider ist nicht Ollama (baseUrl traegt nicht 'ollama_baseurl_marker',
+      * Provider ist nicht Ollama (baseUrl traegt weder 'ollama_baseurl_marker'
+        noch den lokalen Dienst-Endpunkt 127.0.0.1:8093/ollama[/v1],
         z.B. mlx-lokal auf 8080 statt 11434): Check 5 gilt fuer diesen Provider
         gar nicht -- eigene Konfigurationsdatei fuer ein anderes lokales
         Backend, keine Ollama-plist-Vorgabe. Ergebnis: ein HINWEIS, keine
@@ -1032,7 +1064,12 @@ def _check_must_not_exceed_provider_aware(cf, pcfg, claim, base_truth, truth_fil
         tag = current_id
         current_id = None
 
-        if current_baseurl is None or marker not in current_baseurl:
+        # Dienstfilter ist derselbe lokale Ollama, mit einem Routenpraefix statt
+        # dessen Port. Exakt diesen Endpunkt erkennen, keine fremde /ollama-URL.
+        filter_ollama = current_baseurl in (
+            'http://127.0.0.1:8093/ollama', 'http://127.0.0.1:8093/ollama/',
+            'http://127.0.0.1:8093/ollama/v1', 'http://127.0.0.1:8093/ollama/v1/')
+        if current_baseurl is None or (marker not in current_baseurl and not filter_ollama):
             nicht_ollama.setdefault(current_baseurl, []).append((i, claimed, tag))
             continue
 
@@ -1798,76 +1835,123 @@ def kopie_vergleiche(c7, machine_tool_map=None, current_machine=None):
     worktree = ist_worktree(repo_dir)
     gesehen = set()
     faelle = []
+    # Unterordner-Regel (Auftrag 2026-09-29, Anlass shell/inbox/): eine Datei in
+    # einem Unterordner eines install_map-Verzeichnisses gehoert genauso zum
+    # Ausrollen wie eine direkt darin -- `wb-inbox einrichten` sucht Adapter
+    # bereits unter `~/.local/bin/inbox/*.ts`, und wb-ausrollen/wb-consistency
+    # kannten diesen Ort bisher nicht (os.listdir statt os.walk, keine
+    # Rekursion). Eine PAUSCHALE Rekursion in JEDEN Unterordner haette
+    # Nebenwirkungen: shell/tests/ darf nie ausgerollt werden, shell/linux/
+    # traegt Linux-Varianten, die ueber ihren eigenen Mechanismus verglichen
+    # werden (_linux_gegenstueck), nicht ein zweites Mal als eigenes
+    # Installationsziel, und shell/messungen/ sowie shell/systemd/ sind keine
+    # ~/.local/bin-Werkzeuge (systemd-Units, Messskripte). Deshalb: rekursiv,
+    # mit einer expliziten, kommentierten Ausschlussliste
+    # (install_exclude_dirs) statt einer Erlaubnisliste -- ein neuer
+    # Unterordner (wie inbox/) wird automatisch mitgenommen, ohne dass die
+    # Konfiguration ihn kennen muss.
+    ausschluss_dirs = set(c7.get("install_exclude_dirs", ()))
     for prefix, ziel_unbenutzt in [(e[0], e[1]) for e in c7["install_map"]]:
         wurzel = os.path.join(repo_dir, prefix)
         if not os.path.isdir(wurzel):
             continue
-        for name in sorted(os.listdir(wurzel)):
-            repo_datei = os.path.join(wurzel, name)
-            if not os.path.isfile(repo_datei):
-                continue
-            if any(ex in repo_datei for ex in c7.get("exclude_substrings", ())):
-                continue
-            rel = os.path.join(prefix, name)
-            if rel in gesehen:
-                continue
-            gesehen.add(rel)
-            ziel = _ziel_fuer(rel, name, c7)
-            if ziel is None:
-                continue
-            inst_datei = os.path.join(ziel, name)
-            if not os.path.exists(inst_datei):
-                # Eine Datei auf `.default.json` ist per NAMEN eine Vorlage: sie wird
-                # beim Einrichten an ihren Zielort kopiert und gehoert nie nach
-                # ~/.local/bin. Das ist ein strukturelles Merkmal, keine Ausnahmeliste
-                # -- eine Liste haette gepflegt werden muessen, der Namensteil pflegt
-                # sich selbst. Aufgenommen 18.08., nachdem drei solche Vorlagen als
-                # Befund erschienen und JSON keine Kommentarzeile fuer die Begruendung
-                # traegt.
-                if rel.endswith(".default.json"):
+        for aktuelles_verz, unterverz, dateien in os.walk(wurzel):
+            unterverz[:] = sorted(d for d in unterverz if d not in ausschluss_dirs)
+            for name in sorted(dateien):
+                repo_datei = os.path.join(aktuelles_verz, name)
+                if not os.path.isfile(repo_datei):
                     continue
-                # Traegt die Datei ihre Begruendung selbst? Dann ist sie kein Befund.
-                kopf = "\n".join(read_lines(repo_datei)[:40])
-                if NICHT_INSTALLIERT_RE.search(kopf):
+                if any(ex in repo_datei for ex in c7.get("exclude_substrings", ())):
                     continue
-                zugewiesen = tool_machine.get(name.lower())
-                if zugewiesen is not None and current_machine is not None \
-                        and zugewiesen != current_machine:
-                    faelle.append({"status": "andere_maschine", "rel": rel,
-                                   "zugewiesen": zugewiesen, "hier": current_machine})
+                sub_rel = os.path.relpath(repo_datei, wurzel)
+                rel = os.path.join(prefix, sub_rel)
+                if rel in gesehen:
                     continue
-                faelle.append({"status": "fehlt", "rel": rel, "repo_datei": repo_datei,
-                               "inst_datei": inst_datei, "ziel": ziel})
-                continue
-            vergleich_datei, vergleich_rel = repo_datei, rel
-            gegenstueck = _linux_gegenstueck(rel, name, c7)
-            if gegenstueck:
-                vergleich_datei, vergleich_rel = gegenstueck
-            if open(vergleich_datei, "rb").read() == open(inst_datei, "rb").read():
-                faelle.append({"status": "gleich", "rel": vergleich_rel})
-                continue
-            richtung, warum = _installiert_richtung(vergleich_datei, inst_datei, repo_dir)
-            # Ein Worktree deployt nach ~/.local_bin/~/.claude/hooks NIE (Konvention
-            # seit 04.08., siehe betriebslauf.sh/betriebslauf2.sh is_worktree()) --
-            # "eigenmaechtig"/"unklar" ist dort keine Aussage ueber die installierte
-            # Kopie, sondern nur darueber, dass DIESER Baum sie nicht kennt. Die
-            # richtige, in run-all.sh bereits laengst bewiesene Antwort ist nicht
-            # "still nichts sagen", sondern die Behauptung selbst umbenennen: nicht
-            # laenger "eigenmaechtig veraendert", sondern "aus diesem Baum nicht
-            # entscheidbar". Betrifft NUR richtung, nie status "fehlt"/"gleich"/
-            # "andere_maschine" -- die bleiben wahre Aussagen, unabhaengig davon,
-            # von wo aus verglichen wird.
-            if worktree and richtung in ("eigenmaechtig", "unklar"):
-                richtung = "worktree_unpruefbar"
-                warum = ("dieser Baum ist ein git-Worktree, kein Hauptbaum -- von hier "
-                         "wird nie nach ~/.local/bin/~/.claude/hooks ausgerollt, und "
-                         "seine eigene Branch-Historie kennt nicht jeden Stand, den der "
-                         "Hauptbaum inzwischen dorthin gebracht hat. Ob die installierte "
-                         "Kopie wirklich eigenmaechtig ist, laesst sich von hier aus "
-                         "nicht sagen -- das muss gegen den Hauptbaum laufen.")
-            faelle.append({"status": "verschieden", "rel": vergleich_rel,
-                           "repo_datei": vergleich_datei, "inst_datei": inst_datei,
-                           "richtung": richtung, "warum": warum})
+                gesehen.add(rel)
+                ziel = _ziel_fuer(rel, name, c7)
+                if ziel is None:
+                    continue
+                inst_datei = os.path.join(ziel, sub_rel)
+                if not os.path.exists(inst_datei):
+                    # Eine Datei auf `.default.json` ist per NAMEN eine Vorlage: sie wird
+                    # beim Einrichten an ihren Zielort kopiert und gehoert nie nach
+                    # ~/.local/bin. Das ist ein strukturelles Merkmal, keine Ausnahmeliste
+                    # -- eine Liste haette gepflegt werden muessen, der Namensteil pflegt
+                    # sich selbst. Aufgenommen 18.08., nachdem drei solche Vorlagen als
+                    # Befund erschienen und JSON keine Kommentarzeile fuer die Begruendung
+                    # traegt.
+                    if rel.endswith(".default.json"):
+                        continue
+                    # Traegt die Datei ihre Begruendung selbst? Dann ist sie kein Befund.
+                    kopf = "\n".join(read_lines(repo_datei)[:40])
+                    if NICHT_INSTALLIERT_RE.search(kopf):
+                        continue
+                    zugewiesen = tool_machine.get(name.lower())
+                    if zugewiesen is not None and current_machine is not None \
+                            and zugewiesen != current_machine:
+                        faelle.append({"status": "andere_maschine", "rel": rel,
+                                       "zugewiesen": zugewiesen, "hier": current_machine})
+                        continue
+                    faelle.append({"status": "fehlt", "rel": rel, "repo_datei": repo_datei,
+                                   "inst_datei": inst_datei, "ziel": ziel})
+                    continue
+                vergleich_datei, vergleich_rel = repo_datei, rel
+                gegenstueck = _linux_gegenstueck(rel, name, c7)
+                if gegenstueck:
+                    vergleich_datei, vergleich_rel = gegenstueck
+                if open(vergleich_datei, "rb").read() == open(inst_datei, "rb").read():
+                    faelle.append({"status": "gleich", "rel": vergleich_rel})
+                    continue
+                richtung, warum = _installiert_richtung(vergleich_datei, inst_datei, repo_dir)
+                # Ein Worktree deployt nach ~/.local_bin/~/.claude/hooks NIE (Konvention
+                # seit 04.08., siehe betriebslauf.sh/betriebslauf2.sh is_worktree()) --
+                # "eigenmaechtig"/"unklar" ist dort keine Aussage ueber die installierte
+                # Kopie, sondern nur darueber, dass DIESER Baum sie nicht kennt. Die
+                # richtige, in run-all.sh bereits laengst bewiesene Antwort ist nicht
+                # "still nichts sagen", sondern die Behauptung selbst umbenennen: nicht
+                # laenger "eigenmaechtig veraendert", sondern "aus diesem Baum nicht
+                # entscheidbar". Betrifft NUR richtung, nie status "fehlt"/"gleich"/
+                # "andere_maschine" -- die bleiben wahre Aussagen, unabhaengig davon,
+                # von wo aus verglichen wird.
+                if worktree and richtung in ("eigenmaechtig", "unklar"):
+                    richtung = "worktree_unpruefbar"
+                    warum = ("dieser Baum ist ein git-Worktree, kein Hauptbaum -- von hier "
+                             "wird nie nach ~/.local/bin/~/.claude/hooks ausgerollt, und "
+                             "seine eigene Branch-Historie kennt nicht jeden Stand, den der "
+                             "Hauptbaum inzwischen dorthin gebracht hat. Ob die installierte "
+                             "Kopie wirklich eigenmaechtig ist, laesst sich von hier aus "
+                             "nicht sagen -- das muss gegen den Hauptbaum laufen.")
+                faelle.append({"status": "verschieden", "rel": vergleich_rel,
+                               "repo_datei": vergleich_datei, "inst_datei": inst_datei,
+                               "richtung": richtung, "warum": warum})
+    return faelle
+
+
+def git_hook_link_faelle(c7):
+    """Ein Fall je Hook-Name aus `git_hook_links`: 'gleich' (Symlink auf den Verteiler),
+    'fehlt' (nichts unter dem Namen) oder 'falsch' (Nicht-Link oder Link mit anderem
+    Ziel). Leer, solange der Verteiler selbst noch nicht installiert ist -- dann ist
+    KOPIE-NUR-REPO die erste Meldung, und ein Link auf nichts waere sinnlos.
+
+    EINE Berechnung fuer wb-consistency (Meldung) und wb-ausrollen (Handlung), wie bei
+    kopie_vergleiche(). install_map kopiert nur Dateien; Git ruft einen Hook aber unter
+    seinem eigenen Namen auf, und der Verteiler liest diesen Namen aus $0."""
+    cfg = c7.get("git_hook_links")
+    if not cfg:
+        return []
+    verz, ziel = cfg["verzeichnis"], cfg["ziel"]
+    if not os.path.isfile(os.path.join(verz, ziel)):
+        return []
+    faelle = []
+    for name in cfg["namen"]:
+        pfad = os.path.join(verz, name)
+        if os.path.islink(pfad):
+            status = "gleich" if os.readlink(pfad) == ziel else "falsch"
+        elif os.path.lexists(pfad):
+            status = "falsch"
+        else:
+            status = "fehlt"
+        faelle.append({"status": status, "name": name, "pfad": pfad, "ziel": ziel})
     return faelle
 
 
@@ -2205,6 +2289,38 @@ def _nachbar_bekannt(nachbar_repos):
     return bekannt
 
 
+def _bauprodukte_bekannt(repo_dir, bauprodukte):
+    """name -> (quelle, bau) fuer Werkzeuge, die nicht als Datei im Repo
+    liegen, sondern GEBAUT werden -- aber nur, wenn ihre Quelle per
+    `git ls-files` WIRKLICH versioniert ist (dieselbe Beweispflicht wie bei
+    _nachbar_bekannt: kein Eintrag wird geraten, jeder muss sich bei jedem Lauf
+    neu beweisen).
+
+    ANLASS (29.09.2026): `wb-mobil-pruefen` ist ein Buendel aus
+    app/src/main/mobile/auth/pruefen-cli.ts, gebaut nach app/dist/bin (von git
+    ignoriert) und von deploy/mobile/ausrollen.sh nach ~/.local/bin gelegt.
+    Sorte D kannte nur Dateinamen aus den install_map-Verzeichnissen und meldete
+    es deshalb als EIGEN-NICHT-IM-REPO, obwohl seine Quelle versioniert ist.
+    Ein Vermerk 'NICHT VERSIONIERT' waere falsch gewesen; ein Praefix app/dist/
+    haette nur das Bauprodukt gekannt, nicht seine Herkunft."""
+    bekannt = {}
+    if not bauprodukte:
+        return bekannt
+    try:
+        r = subprocess.run(["git", "-C", repo_dir, "ls-files"],
+                           capture_output=True, text=True, timeout=20)
+    except Exception:
+        return bekannt
+    if r.returncode != 0:
+        return bekannt
+    versioniert = set(r.stdout.splitlines())
+    for eintrag in bauprodukte:
+        name, quelle, bau = eintrag.get("name"), eintrag.get("quelle"), eintrag.get("bau")
+        if name and quelle and bau and quelle in versioniert:
+            bekannt[name] = (quelle, bau)
+    return bekannt
+
+
 def _sorte_d(c7, findings, base):
     """Ein Fund-Ort war bis 2026-08-22 fest auf EINEN Block angelegt
     (`.local/bin`) -- `fremd_pruefung` ist deshalb jetzt eine LISTE von
@@ -2243,9 +2359,30 @@ def _sorte_d_block(c7, d, findings, base):
         if os.path.isdir(wurzel):
             bekannt.update(os.listdir(wurzel))
     nachbar_bekannt = _nachbar_bekannt(d.get("nachbar_repos", []))
+    bauprodukte = _bauprodukte_bekannt(c7["repo_dir"], d.get("bauprodukte", []))
     for name in sorted(os.listdir(ziel)):
         pfad = os.path.join(ziel, name)
         if name in bekannt or not os.path.isfile(pfad):
+            continue
+        if name in bauprodukte:
+            # Die Herkunft ist bewiesen (versionierte Quelle). Uebrig bleibt
+            # dieselbe Frage wie bei Sorte A: stimmt das Installierte mit dem
+            # ueberein, was aus dem Repo entsteht? Ohne Bau laesst sich das
+            # nicht sagen -- dann ein Hinweis, kein Fehler.
+            quelle, bau = bauprodukte[name]
+            bau_pfad = os.path.join(c7["repo_dir"], bau)
+            if not os.path.isfile(bau_pfad):
+                findings.append(Finding(
+                    "BAUPRODUKT-UNGEBAUT", os.path.relpath(pfad, base), 1,
+                    "gebaut aus %s, aber %s fehlt" % (quelle, bau),
+                    "Herkunft versioniert, Vergleich mit dem Installierten erst nach dem Bau moeglich.",
+                    severity="hint"))
+            elif not filecmp.cmp(bau_pfad, pfad, shallow=False):
+                findings.append(Finding(
+                    "BAUPRODUKT-VERALTET", os.path.relpath(pfad, base), 1,
+                    "weicht vom Bau %s ab (Quelle %s)" % (bau, quelle),
+                    "Das installierte Werkzeug entspricht nicht dem aktuellen Bau -- erneut ausrollen.",
+                    severity="error"))
             continue
         if any(ex in pfad for ex in c7.get("exclude_substrings", ())):
             continue
@@ -2394,9 +2531,10 @@ def registry_vergleiche(c7):
         lebend_wert   Wert in der lebenden Registry
         vorlage_datei / lebend_datei   die beiden Pfade
 
-    Was ABSICHTLICH kein Fund ist: ein Eintrag, den die lebende Registry noch
-    gar nicht kennt (noch nicht uebernommen), ein Feld, das es nur in der
-    Vorlage gibt, und alles, was in der Positivliste steht.
+    Was ABSICHTLICH kein Abweichungs-Fund ist: ein Eintrag oder Feld, den bzw.
+    das die lebende Registry noch nicht kennt. Diese Faelle liefert
+    registry_nachzug_plaene() getrennt als REGISTRY-FEHLT: Sie koennen sicher
+    additiv uebernommen werden, ohne eine lebende Entscheidung zu ersetzen.
     """
     faelle = []
     for paar in c7.get("registry_paare", []):
@@ -2450,7 +2588,107 @@ def registry_vergleiche(c7):
     return faelle
 
 
+def _registry_ergaenze(vorlage, lebend, id_felder, pfad, ergaenzungen):
+    """Ergaenze *lebend* nur an fehlenden Schluesseln/Eintraegen aus *vorlage*.
+
+    Listen werden nur dann einzeln zusammengefuehrt, wenn ihre Objekte eine
+    eindeutige Kennung haben. Eine nicht identifizierbare Liste bleibt lebend
+    unveraendert: Ein blindes Anhängen koennte dort einen Wert verdoppeln oder
+    seine Reihenfolge als Bedeutung fehlinterpretieren.
+    """
+    if isinstance(vorlage, dict) and isinstance(lebend, dict):
+        for schluessel, vorlage_wert in vorlage.items():
+            zielpfad = pfad + (schluessel,)
+            if schluessel not in lebend:
+                lebend[schluessel] = copy.deepcopy(vorlage_wert)
+                ergaenzungen.append(_registry_pfad_text(zielpfad))
+            else:
+                _registry_ergaenze(vorlage_wert, lebend[schluessel], id_felder,
+                                    zielpfad, ergaenzungen)
+        return
+    if isinstance(vorlage, list) and isinstance(lebend, list):
+        id_feld = _registry_id_feld(vorlage, id_felder)
+        if not id_feld:
+            return
+        lebend_nach_id = {
+            str(e.get(id_feld)): e for e in lebend
+            if isinstance(e, dict) and id_feld in e
+        }
+        for vorlage_eintrag in vorlage:
+            if not isinstance(vorlage_eintrag, dict):
+                continue
+            eintrag_id = str(vorlage_eintrag[id_feld])
+            zielpfad = pfad + ("[%s=%s]" % (id_feld, eintrag_id),)
+            lebend_eintrag = lebend_nach_id.get(eintrag_id)
+            if lebend_eintrag is None:
+                lebend.append(copy.deepcopy(vorlage_eintrag))
+                ergaenzungen.append(_registry_pfad_text(zielpfad))
+            else:
+                _registry_ergaenze(vorlage_eintrag, lebend_eintrag, id_felder,
+                                    zielpfad, ergaenzungen)
+
+
+def _registry_pfad_text(pfad):
+    """`models[id=x].feld`, ohne einen Punkt vor einer Listenkennung."""
+    text = ""
+    for teil in pfad:
+        if teil.startswith("["):
+            text += teil
+        elif text:
+            text += "." + teil
+        else:
+            text = teil
+    return text
+
+
+def registry_nachzug_plaene(c7):
+    """Additive Registry-Nachzuege je Paar, ohne den Dateistand zu schreiben.
+
+    Jeder Plan traegt eine Kopie der neuen Registry und die einzeln meldbaren
+    Ergaenzungen. `wb-consistency` macht daraus Hinweise; `wb-ausrollen`
+    schreibt genau diese Kopie nach einem Schnappschuss. Damit kann kein
+    Meldeweg andere fehlende Daten sehen als der schreibende Weg.
+    """
+    plaene = []
+    for paar in c7.get("registry_paare", []):
+        vorlage_datei = paar.get("vorlage", "")
+        lebend_datei = paar.get("echt", "")
+        if not (os.path.isfile(vorlage_datei) and os.path.isfile(lebend_datei)):
+            continue
+        try:
+            with open(vorlage_datei) as f:
+                vorlage = json.load(f)
+            with open(lebend_datei) as f:
+                lebend = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(vorlage, dict) or not isinstance(lebend, dict):
+            continue
+        nachzug = copy.deepcopy(lebend)
+        ergaenzungen = []
+        _registry_ergaenze(vorlage, nachzug,
+                            paar.get("id_felder") or list(REGISTRY_ID_VORGABE),
+                            (), ergaenzungen)
+        if ergaenzungen:
+            plaene.append({
+                "name": paar.get("name", os.path.basename(lebend_datei)),
+                "vorlage_datei": vorlage_datei,
+                "lebend_datei": lebend_datei,
+                "ergaenzungen": ergaenzungen,
+                "nachzug": nachzug,
+            })
+    return plaene
+
+
 def _sorte_e(c7, findings):
+    for plan in registry_nachzug_plaene(c7):
+        for pfad_text in plan["ergaenzungen"]:
+            findings.append(Finding(
+                "REGISTRY-FEHLT", "%s.%s" % (plan["name"], pfad_text), 1,
+                "Vorlage enthaelt einen in der lebenden Registry fehlenden Eintrag",
+                "Additiv aus %s nachziehen: `wb-ausrollen` setzt nur diesen fehlenden "
+                "Wert ein und laesst alle vorhandenen lebenden Werte unveraendert."
+                % os.path.basename(plan["vorlage_datei"]), severity="hint"))
     for fall in registry_vergleiche(c7):
         pfad_text = "%s.%s[%s=%s].%s" % (
             fall["name"], fall["liste"], fall["schluessel"], fall["eintrag_id"], fall["feld"])
@@ -2481,6 +2719,19 @@ def check7_kopien(cfg, base):
     machine_tool_map = c3.get("machine_tool_map", {})
     current_machine = current_machine_id(c3.get("machine_ids_by_os", {}))
     _sorte_a(c7, findings, machine_tool_map, current_machine)
+    for fall in git_hook_link_faelle(c7):
+        if fall["status"] == "fehlt":
+            findings.append(Finding(
+                "HOOK-LINK-FEHLT", fall["pfad"], 1,
+                "Git-Hook %s ruft den Verteiler auf" % fall["name"],
+                "unter dem Namen liegt nichts -- `wb-ausrollen` legt den Symlink auf %s an."
+                % fall["ziel"], severity="hint"))
+        elif fall["status"] == "falsch":
+            findings.append(Finding(
+                "HOOK-LINK-FALSCH", fall["pfad"], 1,
+                "Git-Hook %s ist ein Symlink auf %s" % (fall["name"], fall["ziel"]),
+                "dort liegt etwas anderes (Datei oder Link mit anderem Ziel) -- von Hand "
+                "pruefen, wb-ausrollen ueberschreibt es nicht."))
     _sorte_b(c7, findings)
     _sorte_c(c7, findings)
     _sorte_d(c7, findings, base)
@@ -2805,6 +3056,139 @@ def _docstring_zeilen(path, lines):
     return treffer
 
 
+_HEREDOC_RE = re.compile(r"<<-?\s*[\"']?(\w+)[\"']?")
+
+
+def _heredoc_rumpf(lines, i):
+    """Die Zeilennummern (0-basiert) des Here-Dokuments, das in Zeile i beginnt."""
+    m = _HEREDOC_RE.search(_ohne_kommentar(lines[i]))
+    if not m:
+        return []
+    rumpf = []
+    for j in range(i + 1, len(lines)):
+        if lines[j].strip() == m.group(1):
+            break
+        rumpf.append(j)
+    return rumpf
+
+
+def _pfad_schirm_zeilen(lines):
+    """Zeilennummern (1-basiert), deren nackte `tmux`-Aufrufe ein PATH-Schirm der
+    ganzen Datei auf den Testsocket legt (Nachtrag 2026-10-13).
+
+    Der Schirm in _huellen_sammeln zaehlt nur, wenn PATH im SELBEN Befehl steht.
+    Viele Suiten stellen das Schirmverzeichnis aber einmal vor die eigene PATH
+    (`export PATH="$BIN:$PATH"`) und rufen danach `tmux` nackt -- sie selbst und
+    ihre Attrappen. Gezaehlt wird das nur, wenn BEIDES belegt ist:
+      1. die Datei schreibt ein Skript `<dir>/tmux`, dessen exec-Zeile -L oder -S
+         an einen anderen tmux weitergibt, und
+      2. eine Zeile ausserhalb jedes Here-Dokuments stellt GENAU dieses <dir> an
+         den Anfang von PATH (PATH=, export PATH=).
+    Gedeckt sind nur die Zeilen NACH Schirm und PATH-Zeile, und nur bis zur
+    naechsten PATH-Zuweisung, die nicht mit dem Schirm beginnt. Was davor steht
+    (auch der Rumpf einer frueher definierten Funktion), bleibt gemeldet."""
+    in_heredoc = set()
+    for i in range(len(lines)):
+        if i not in in_heredoc:
+            in_heredoc.update(_heredoc_rumpf(lines, i))
+    schirme = {}        # Verzeichnisvariable -> Zeile (0-basiert), in der der Schirm entsteht
+    for i, zeile in enumerate(lines):
+        if i in in_heredoc:
+            continue
+        roh = _ohne_kommentar(zeile)
+        m = re.search(r">\s*[\"']?\$\{?(\w+)\}?/tmux[\"']?(?:\s|$)", roh)
+        if not m:
+            continue
+        rumpf = [lines[j] for j in _heredoc_rumpf(lines, i)] or [roh]
+        for z in rumpf:
+            e = re.match(r"\s*exec\s+(\S+)(.*)$", z)
+            if not e:
+                continue
+            ziel = e.group(1).strip("\"'")
+            if ziel.lstrip("$").strip("{}").startswith(m.group(1)):
+                continue        # ruft sich selbst, kein anderer tmux
+            if (ziel.rsplit("/", 1)[-1] == "tmux" or ziel.startswith("$")) \
+                    and _SOCKET_FLAGGE.search(e.group(2)):
+                schirme.setdefault(m.group(1), i)
+                break
+    gedeckt = set()
+    for name, ab in schirme.items():
+        anfang = re.compile(r"[\"']?\$\{?%s\}?(?:[:\"']|$)" % re.escape(name))
+        aktiv = lokal = False
+        for i in range(len(lines)):
+            roh = _ohne_kommentar(lines[i])
+            # Eine Zeile, die PATH irgendwo anders setzt (`PATH=/usr/bin tmux ...`,
+            # `env -i PATH=...`), ist nie gedeckt.
+            fremd = any(not anfang.match(w) for w in re.findall(r"\bPATH=(\S*)", roh))
+            z = re.match(r"\s*(?:export\s+)?PATH=(\S*)\s*$", roh)
+            if i in in_heredoc:
+                # Ein Here-Dokument ist eine Attrappe: sie erbt die PATH, bis sie
+                # selbst eine setzt. Das aendert nichts ausserhalb.
+                if i - 1 not in in_heredoc:
+                    lokal = aktiv
+                if z:
+                    lokal = bool(anfang.match(z.group(1)))
+                elif lokal and not fremd:
+                    gedeckt.add(i + 1)
+                continue
+            if z:
+                aktiv = i > ab and bool(anfang.match(z.group(1)))
+                continue
+            if aktiv and not fremd:
+                gedeckt.add(i + 1)
+    return gedeckt
+
+
+def _nur_text(roh, befehl):
+    """Steht JEDES Vorkommen dieses Befehls in einer Zeichenkette, die selbst Text
+    bleibt? `_in_anfuehrung` sieht nur die Anfuehrungszeichen; `"$(tmux display)"`
+    ist aber ein echter Aufruf, nur in Anfuehrung. Hier zaehlt die innerste offene
+    Klammer: ein Anfuehrungszeichen ja, eine Kommandosubstitution nein. `\\$(` in
+    doppelten Anfuehrungszeichen ist Text."""
+    def text_an(pos):
+        stapel, i = [], 0
+        while i < pos:
+            c, oben = roh[i], (stapel[-1] if stapel else None)
+            if oben == "'":
+                if c == "'":
+                    stapel.pop()
+            elif c == "\\":
+                i += 1
+            elif roh.startswith("$(", i):
+                stapel.append("(")
+                i += 1
+            elif c == "`":
+                if oben == "`":
+                    stapel.pop()
+                else:
+                    stapel.append("`")
+            elif oben == '"':
+                if c == '"':
+                    stapel.pop()
+            elif c == "'":
+                stapel.append("'")
+            elif c == '"':
+                stapel.append('"')
+            elif c == ")" and oben == "(":
+                stapel.pop()
+            i += 1
+        return bool(stapel) and stapel[-1] in ("'", '"')
+    stellen = [m.start() for m in re.finditer(re.escape(befehl), roh)]
+    return bool(stellen) and all(text_an(p) for p in stellen)
+
+
+# Der zweite Satz im Kopf, schwaecher als LIVE-SOCKET ABSICHTLICH: die Datei sagt,
+# dass ihre tmux-Befehle in Zeichenketten Text sind (Meldungen, Pruefdaten fuer einen
+# Guard). Er stillt nur Treffer, die _nur_text als Text erkennt -- nie einen Aufruf.
+TEXT_ABSICHT_RE = re.compile(r"Standard-Server\s+bleibt\s+unber(?:ue|ü)hrt", re.I)
+
+
+def _kopfkommentar(lines):
+    """Die Kommentarzeilen der ersten 40 Zeilen als ein Text (Saetze brechen um)."""
+    return " ".join(z.strip().lstrip("#").strip() for z in lines[:40]
+                    if z.strip().startswith("#"))
+
+
 # Der eine Weg, eine Datei stillzulegen -- und zwar SCHRIFTLICH, in ihr selbst.
 # Dieselbe Bauart wie 'NICHT INSTALLIERT:' in check7: keine Ausnahmeliste in einer
 # Konfiguration, die niemand mehr liest, sondern ein Satz im Kopf der Datei, den der
@@ -2831,7 +3215,15 @@ def check8_test_socket(cfg, base):
         # Maschine, unabhaengig davon, auf welchem tmux-Server ihr Pane haengt.
         # Was hier trennt, ist ein umgelenktes HOME -- und nur das. Eine Suite,
         # die die Inbox anfasst, ohne HOME zu setzen, kann den Menschen treffen.
-        ganz = "\n".join(lines)
+        # Nur ausserhalb von Kommentaren gesucht (Nachtrag 2026-09-29, Befund am
+        # gemergten Stand von wb/inbox-ausrollen): eine Suite, die "wb-inbox" nur
+        # in ihrem Kopfkommentar ERWAEHNT (z.B. warum eine Aenderung noetig war),
+        # BENUTZT die Sitzungs-Inbox nicht -- der Vorfall vom 20.08. betrifft
+        # einen echten Aufruf, keine Prosa. `_ohne_kommentar` ist dieselbe
+        # Kommentar-Erkennung wie beim Rest dieser Datei (ausserhalb von
+        # Anfuehrungszeichen, nach einem Rautezeichen am Zeilenanfang oder nach
+        # einem Leerzeichen), keine zweite, eigene.
+        ganz = "\n".join(_ohne_kommentar(z) for z in lines)
         if re.search(r"\bwb-inbox\b", ganz) or ".claude/sessions" in ganz:
             # Die gesourcten Helfer zaehlen mit: eine Suite, die ihren Aufbau aus
             # lib-zustellbett.sh holt, setzt HOME dort und nicht bei sich selbst.
@@ -2866,6 +3258,8 @@ def check8_test_socket(cfg, base):
             continue
         sicher, aliasse, rumpfzeilen, schirme = _huellen_sammeln(lines)
         textzeilen = _docstring_zeilen(path, lines)
+        schirmzeilen = _pfad_schirm_zeilen(lines)
+        text_erklaert = bool(TEXT_ABSICHT_RE.search(_kopfkommentar(lines)))
         for nr, zeile in enumerate(lines, 1):
             if nr in rumpfzeilen or nr in textzeilen:
                 continue
@@ -2888,6 +3282,10 @@ def check8_test_socket(cfg, base):
                         "untergeschoben. Ein Test gehoert auf einen eigenen Socket "
                         "(tmux -L wbtest-<name>-$$).",
                         severity="error"))
+                elif nr in schirmzeilen:
+                    continue    # PATH-Schirm der Datei legt den Aufruf auf den Testsocket
+                elif zitiert and text_erklaert and _nur_text(_ohne_kommentar(zeile), befehl):
+                    continue    # Text in einer Zeichenkette, im Kopf als solcher erklaert
                 else:
                     findings.append(Finding(
                         "TEST-SOCKET-OFFEN", path, nr,
@@ -2907,9 +3305,9 @@ def check8_test_socket(cfg, base):
 # --------------------------------------------------------------------------
 # Check 9 -- Konfigurations-Vorlagen fuer fremde Harnesses (2026-08-20)
 # --------------------------------------------------------------------------
-# crush/kimi/nanocoder/cline/forge brauchen je eine Datei AUSSERHALB von
+# crush/nanocoder/cline/forge brauchen je eine Datei AUSSERHALB von
 # ~/.local/bin, sonst startet ihr Worker nicht (~/.config/crush/crushrc,
-# ~/.kimi/config.toml, ...). Das Vorlage-Ziel-Paar dafuer steht bereits in der
+# ~/.config/crush/crushrc, ...). Das Vorlage-Ziel-Paar dafuer steht bereits in der
 # Registry (configFiles je Harness-Eintrag) und wird bereits von
 # shell/wb-harness-config verglichen, mit einem EIGENEN Merkposten statt
 # Git-Historie (das Ziel liegt oft gar nicht in einem Repo). Dieser Check
@@ -3128,6 +3526,16 @@ def check11_pipefail_erstglied(cfg, base):
 # den Marker unten in ihrem eigenen Kopf, derselbe Aufbau wie NICHT
 # VERSIONIERT/NICHT INSTALLIERT: eine Ausnahme traegt ihre Begruendung an
 # der Datei selbst, nicht in einer gepflegten Liste hier.
+def _hook_kommandos(hooks):
+    """Alle 'command'-Eintraege einer hooks-Aufteilung (settings.json oder hooks.json)."""
+    kommandos = []
+    for eintraege in (hooks or {}).values():
+        for eintrag in eintraege:
+            for h in (eintrag.get("hooks") or []):
+                kommandos.append(h.get("command") or "")
+    return kommandos
+
+
 def check12_hook_registrierung(cfg, base):
     c12 = cfg.get("check12_hook_registrierung")
     if not c12:
@@ -3146,11 +3554,19 @@ def check12_hook_registrierung(cfg, base):
             "liess sich nicht lesen/parsen (%s) -- Registrierungspruefung uebersprungen, "
             "damit ein kaputtes settings.json nicht jeden Hook faelschlich als fehlend "
             "meldet." % exc, severity="hint")]
-    kommandos = []
-    for eintraege in (settings.get("hooks") or {}).values():
-        for eintrag in eintraege:
-            for h in (eintrag.get("hooks") or []):
-                kommandos.append(h.get("command") or "")
+    kommandos = _hook_kommandos(settings.get("hooks"))
+    # Plugin-Hooks des Werkbank-Marktplatzes (seit 2026-10-13): dieselbe Form wie
+    # settings.json. Fehlt die Datei, bleibt die Pruefung wie bisher.
+    plugin_muster = os.path.join(os.path.dirname(hooks_dir), "werkbank-marktplatz",
+                                 "*", "hooks", "hooks.json")
+    for plugin_pfad in sorted(globmod.glob(plugin_muster)):
+        try:
+            with open(plugin_pfad, encoding="utf-8") as f:
+                plugin = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(plugin, dict):
+            kommandos += _hook_kommandos(plugin.get("hooks"))
     kommando_text = "\n".join(kommandos)
     findings = []
     for name in sorted(os.listdir(hooks_dir)):
@@ -3169,6 +3585,115 @@ def check12_hook_registrierung(cfg, base):
             "aber nicht aktiv. Entweder in settings.json eintragen, oder falls die Logik "
             "anderswo aufgegangen ist, in den ersten 40 Zeilen selbst vermerken: "
             "'NICHT REGISTRIERT: <Begruendung>'.", severity="error"))
+    return findings
+
+
+# --------------------------------------------------------------------------
+# Check 13 -- lokales core.hooksPath ins Leere (2026-10-10)
+# --------------------------------------------------------------------------
+# Anlass: Mac ~/AI/a machine-bound project sowie peer ~/AI/a machine-bound project und ~/AI/myproject trugen ein
+# LOKALES core.hooksPath auf $HOME/... -- einen Pfad, den es auf der jeweiligen
+# Maschine nicht gibt (Kopie des Repos von der anderen Maschine). Git findet dort keinen
+# Hook und sagt nichts: das lokale Setting schlaegt das globale, also laeuft in diesem Repo
+# gar kein Commit-/Push-Hook, ohne dass irgendetwas rot wird.
+# Immer HINWEIS, nie Fehler und es wird nie etwas geaendert: ein bewusst gesetztes lokales
+# Ziel steht in der Ausnahmeliste der Konfiguration (check13_hookspath_lokal.ausnahmen).
+
+def _git_config_wert(args, env=None):
+    try:
+        r = subprocess.run(["git"] + args, capture_output=True, text=True,
+                           timeout=10, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    wert = r.stdout.strip()
+    return wert or None
+
+
+def _hookspath_aufloesen(wert, repo):
+    wert = os.path.expanduser(wert)
+    if not os.path.isabs(wert):
+        wert = os.path.join(repo, wert)   # git: relativ zum Arbeitsbaum, in dem der Hook laeuft
+    return os.path.normpath(wert)
+
+
+def check13_hookspath_lokal(cfg, base):
+    c13 = cfg.get("check13_hookspath_lokal")
+    if not c13:
+        return []
+    ausnahmen = c13.get("ausnahmen") or []
+    glob_muster = c13.get("repo_globs") or []
+    global_wert = _git_config_wert(["config", "--global", "--get", "core.hooksPath"])
+    global_aufgeloest = _hookspath_aufloesen(global_wert, base) if global_wert else None
+    findings = []
+    repos = []
+    for muster in glob_muster:
+        repos += sorted(globmod.glob(muster))
+    for repo in repos:
+        if not os.path.exists(os.path.join(repo, ".git")):
+            continue
+        lokal = _git_config_wert(["-C", repo, "config", "--local", "--get", "core.hooksPath"])
+        if not lokal:
+            continue
+        ziel = _hookspath_aufloesen(lokal, repo)
+        if global_aufgeloest and ziel == global_aufgeloest:
+            continue
+        if os.path.isdir(ziel):
+            continue
+        if any(a.get("repo") == os.path.basename(repo) and a.get("ziel") in (None, lokal, ziel)
+               for a in ausnahmen):
+            continue
+        findings.append(Finding(
+            "HOOKSPATH-LOKAL-INS-LEERE", os.path.relpath(repo, base), 0,
+            "lokales core.hooksPath = %s (globales: %s)" % (lokal, global_wert or "keines"),
+            "das Ziel %s existiert nicht -- das lokale Setting schlaegt das globale, in diesem "
+            "Repo laeuft deshalb gar kein Git-Hook. Meist ein von der anderen Maschine "
+            "mitgebrachter Pfad. Pruefen und von Hand entfernen (git -C <repo> config --local "
+            "--unset core.hooksPath); bewusst gesetzte Ziele in check13_hookspath_lokal."
+            "ausnahmen eintragen. Dieser Check aendert nichts." % ziel,
+            severity="hint"))
+    return findings
+
+
+# --------------------------------------------------------------------------
+# Check 14 -- Maschinenpfad im Shebang eines ausgerollten Werkzeugs (2026-10-11)
+# --------------------------------------------------------------------------
+# Anlass: `wb-geheimnis-filter` trug `#!/opt/homebrew/bin/python3` und lief auf
+# peer nicht ("bad interpreter"): keine Zaehler, keine Diagnose, der Dienst selbst
+# lief weiter -- der Fehler zeigte sich erst beim Bedienen. wb-ausrollen kopiert
+# `shell/*` unveraendert nach ~/.local/bin, auf jede Maschine dieselbe Datei.
+# Erlaubt sind Interpreter, die es auf Mac UND Linux gibt (/bin, /usr/bin) oder
+# `env`; Homebrew, /usr/local, /opt, ein Heimatordner oder ein venv sind
+# maschinenfest. Ein Werkzeug, das bewusst nur auf einer Maschine laeuft, steht in
+# `ausnahmen` ({"datei": "<Name unter shell/>", "grund": "<Satz>"}).
+SHEBANG_ERLAUBT = ("/bin/", "/usr/bin/")
+
+
+def check14_shebang_maschinenfest(cfg, base):
+    c14 = cfg.get("check14_shebang_maschinenfest")
+    if not c14:
+        return []
+    ausnahmen = {a.get("datei") for a in c14.get("ausnahmen") or []}
+    findings = []
+    for path in expand_globs(c14["globs"], c14.get("exclude_substrings", ())):
+        if os.path.basename(path) in ausnahmen:
+            continue
+        lines = read_lines(path)
+        if not lines or not lines[0].startswith("#!"):
+            continue
+        teile = lines[0][2:].split()
+        if not teile or teile[0].startswith(SHEBANG_ERLAUBT):
+            continue
+        findings.append(Finding(
+            "SHEBANG-MASCHINENFEST", os.path.relpath(path, base), 1,
+            "Shebang %s" % teile[0],
+            "dieser Interpreterpfad gibt es nur auf einer Maschine; wb-ausrollen legt die "
+            "Datei unveraendert auf jede Maschine, dort scheitert sie mit 'bad interpreter'. "
+            "`#!/usr/bin/env python3` (oder `#!/bin/sh` mit Interpreter-Suche, Vorbild "
+            "wb-geheimnis-filter) nehmen; bewusst einmaschinig: in "
+            "check14_shebang_maschinenfest.ausnahmen eintragen.",
+            severity="error"))
     return findings
 
 
@@ -3192,6 +3717,97 @@ def check9_harness_konfig(cfg, base):
             check_name, r.get("target") or r.get("source") or "?", 1,
             "%s-Konfiguration (Vorlage: %s)" % (r.get("harness", "?"), r.get("source", "?")),
             "%s -- %s" % (r.get("detail", ""), hinweis), severity=severity))
+    return findings
+
+
+# --------------------------------------------------------------------------
+# Check 15 -- Werkzeug-Quelle gegen den Befund von wb-werkzeuge (2026-10-13)
+# --------------------------------------------------------------------------
+# Wie Check 9: die Entscheidung, was FEHLT, VERALTET oder ABGEWICHEN heisst, trifft
+# wb-werkzeuge selbst (Quelle shell/werkzeuge.default.json, Schema werkzeuge/1). Dieser
+# Check ruft `wb-werkzeuge status --json` als EIGENEN Prozess auf und uebersetzt nur die
+# Befunde in Findings. Er schreibt nichts.
+#
+# Schweregrade: FEHLT, VERALTET, ABGEWICHEN, ZIEL-UNLESBAR und OFFEN sind Hinweise;
+# sie zaehlen nicht als Fehler. Ein Geheimniswert in der Quelle, eine ungueltige Quelle
+# und ein leerer Weg ohne Grund sind Fehler. Fehlt das Werkzeug selbst, ist das ein
+# Hinweis, und die Pruefung ueberspringt. Der Pfad steht in check15_werkzeuge.skript
+# (Konfiguration, {REPO}); WB_WERKZEUGE_BIN ueberschreibt ihn (Tests). Ohne den
+# Konfigurationsschluessel bleibt der Check still, wie die anderen Checks.
+
+WERKZEUG_ZUORDNUNG = {
+    "FEHLT": ("WERKZEUG-FEHLT", "hint", "'wb-werkzeuge apply' legt sie an."),
+    "VERALTET": ("WERKZEUG-VERALTET", "hint", "'wb-werkzeuge apply' rollt sie gefahrlos aus."),
+    "ABGEWICHEN": ("WERKZEUG-ABGEWICHEN", "hint",
+                   "von Hand nachsehen, dann 'wb-werkzeuge apply --force <harness> <eintrag>' "
+                   "(sichert vorher) oder die Aenderung in die Quelle uebernehmen."),
+    "ZIEL-UNLESBAR": ("WERKZEUG-ZIEL-UNLESBAR", "hint",
+                      "die Zieldatei hat kein gueltiges Format; der Adapter hat sie unberuehrt "
+                      "gelassen."),
+    "OFFEN": ("WERKZEUG-OFFEN", "hint",
+              "eine offene Entscheidung haelt den Eintrag aus 'apply' heraus."),
+}
+
+
+def _werkzeug_status(c15, base):
+    """Ruft `wb-werkzeuge status --json` als eigenen Prozess mit HOME=base auf. Gibt
+    (befund, pfad) zurueck; befund ist None, wenn das Werkzeug fehlt, scheitert oder kein
+    JSON-Objekt liefert."""
+    skript = os.environ.get("WB_WERKZEUGE_BIN") or c15.get("skript", "")
+    env = dict(os.environ)
+    env["HOME"] = base
+    try:
+        p = subprocess.run([skript, "status", "--json"], capture_output=True, text=True,
+                           timeout=30, env=env)
+        befund = json.loads(p.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None, skript
+    return (befund if isinstance(befund, dict) else None), skript
+
+
+def check15_werkzeuge(cfg, base):
+    c15 = cfg.get("check15_werkzeuge")
+    if not c15:
+        return []
+    befund, skript = _werkzeug_status(c15, base)
+    if befund is None:
+        return [Finding(
+            "WERKZEUGE-STATUS-FEHLT", skript, 0,
+            "wb-werkzeuge status --json ist aufrufbar und liefert JSON",
+            "liess sich nicht aufrufen, ist nicht ausfuehrbar oder lieferte kein lesbares "
+            "JSON-Objekt -- Werkzeugpruefung uebersprungen.", severity="hint")]
+    findings = []
+    for f in befund.get("fehler") or []:
+        code = f.get("code") or "?"
+        findings.append(Finding(
+            "WERKZEUG-%s" % code, f.get("eintrag") or skript, 0,
+            "Quelle hat den Befund %s (%s)" % (code, f.get("text") or "ohne Text"),
+            "Verweise statt Werte: Geheimnisse gehoeren in den Schluesselbund "
+            "(schluesselbund:<dienst>/<konto>) oder in den Filter (filter:<name>). Die "
+            "Ausgabe nennt keinen Wert.", severity="error"))
+    for e in befund.get("eintraege") or []:
+        zustand = e.get("zustand")
+        name = "%s %s %s" % (e.get("harness", "?"), e.get("art", "?"), e.get("name", "?"))
+        ort = e.get("ziel") or skript
+        grund = e.get("grund") or "kein Grund im Befund"
+        if zustand == "GLEICH":
+            continue
+        if zustand == "LEER":
+            if not e.get("grund"):
+                findings.append(Finding(
+                    "WERKZEUG-LEER-OHNE-GRUND", ort, 0, "%s ist leer, ohne Grund" % name,
+                    "ein leerer Weg braucht einen Grund, sonst ist nicht erkennbar, ob er "
+                    "absichtlich leer ist.", severity="error"))
+            continue
+        if zustand in WERKZEUG_ZUORDNUNG:
+            check_name, severity, hinweis = WERKZEUG_ZUORDNUNG[zustand]
+            findings.append(Finding(check_name, ort, 1, "%s (%s)" % (name, zustand),
+                                    "%s -- %s" % (grund, hinweis), severity=severity))
+        else:
+            findings.append(Finding(
+                "WERKZEUG-UNBEKANNT", ort, 1, "%s (%s)" % (name, zustand),
+                "unbekannter Zustand im Befund, die Werkzeugpruefung kennt ihn nicht.",
+                severity="hint"))
     return findings
 
 
@@ -3240,6 +3856,9 @@ def main():
     all_findings += check10_pane_quellen(cfg, args.base)
     all_findings += check11_pipefail_erstglied(cfg, args.base)
     all_findings += check12_hook_registrierung(cfg, args.base)
+    all_findings += check13_hookspath_lokal(cfg, args.base)
+    all_findings += check14_shebang_maschinenfest(cfg, args.base)
+    all_findings += check15_werkzeuge(cfg, args.base)
 
     if not args.quiet:
         for f in all_findings:

@@ -66,8 +66,11 @@ contextBridge.exposeInMainWorld('awbSitzung', {
   ) => ipcRenderer.invoke('awb:sitz-neu-wahl', name, machine, fernPfad, wahl, echt === true),
   fernPruefen: (machine: string, pfad: string) => ipcRenderer.invoke('awb:sitz-fern-pruefen', machine, pfad),
   fortsetzen: (id: string, echt: boolean) => ipcRenderer.invoke('awb:sitz-fortsetzen', id, echt === true),
+  modellWechseln: (id: string, modell: string, effort: string, echt: boolean) =>
+    ipcRenderer.invoke('awb:sitz-modell-wechsel', id, modell, effort, echt === true),
   beenden: (id: string, echt: boolean) => ipcRenderer.invoke('awb:sitz-beenden', id, echt === true),
   onDaten: (fn: (d: unknown) => void) => ipcRenderer.on('awb:sitz-daten-neu', (_e, d) => fn(d)),
+  onWahl: (fn: (d: unknown) => void) => ipcRenderer.on('awb:sitz-wahl-neu', (_e, d) => fn(d)),
   // Ein Start, der SPAETER scheitert (21.08.2026): `neu`/`neuMitWahl` antworten,
   // sobald `wb-code` abgeschickt ist -- der Grund fuer einen Fehlschlag entsteht
   // erst Sekunden danach und braucht deshalb einen eigenen Weg zurueck. Ohne ihn

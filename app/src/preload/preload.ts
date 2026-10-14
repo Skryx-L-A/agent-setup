@@ -146,7 +146,7 @@ contextBridge.exposeInMainWorld('awbBridge', {
 // Fuenf Wege hinaus und einer herein, mehr nicht:
 //   daten(seit)                 den Stand ab einem Takt -- 0 heisst „alles"
 //   senden(text)                eine Nachricht des Menschen an die Sitzung
-//   freigabe(anfrageId, ja)     die Antwort auf eine wartende Freigabefrage
+//   freigabe(anfrageId, ja, echt) die Antwort auf eine wartende Freigabefrage (`echt` = isTrusted)
 //   neustart()                  nach einem Fehlstart frisch beginnen
 //   bereit(id)                  das erste Zeichnen melden, fuer den Steuerkanal
 //   onStand(fn)                 jeder neue Stand der Sitzung, nur das Geaenderte
@@ -160,8 +160,8 @@ contextBridge.exposeInMainWorld('awbChat', {
   // (Befund B1). Ohne diese Zahl ginge bei jedem Token der volle Stand hinaus.
   daten: (seit: number) => ipcRenderer.invoke('awb:chat-daten', Number(seit) || 0),
   senden: (text: string) => ipcRenderer.invoke('awb:chat-senden', String(text)),
-  freigabe: (anfrageId: string, erlauben: boolean) =>
-    ipcRenderer.invoke('awb:chat-freigabe', String(anfrageId), erlauben === true),
+  freigabe: (anfrageId: string, erlauben: boolean, echt: boolean) =>
+    ipcRenderer.invoke('awb:chat-freigabe', String(anfrageId), erlauben === true, echt === true),
   // Frisch starten nach einem Fehlstart auf einer verschwundenen
   // Unterhaltung (Befund B3).
   neustart: () => ipcRenderer.invoke('awb:chat-neustart'),

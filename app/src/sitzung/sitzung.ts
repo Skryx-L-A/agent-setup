@@ -107,6 +107,8 @@ interface WahlModell {
   /** Laeuft hier auf der Maschine -- nur dann gibt es ein Kontextfenster zu waehlen. */
   lokal: boolean;
   startbar: boolean;
+  /** Dieser Harness hat einen gemessenen modelSwitch-Vertrag. */
+  wechselbar: boolean;
 }
 interface WahlDaten {
   harnesses: WahlHarness[];
@@ -143,8 +145,10 @@ declare global {
       neuMitWahl(name: string, machine: string, fernPfad: string, wahl: Wahl, echt: boolean): Promise<Antwort>;
       fernPruefen(machine: string, pfad: string): Promise<{ ok: boolean; meldung: string }>;
       fortsetzen(id: string, echt: boolean): Promise<Antwort>;
+      modellWechseln(id: string, modell: string, effort: string, echt: boolean): Promise<Antwort>;
       beenden(id: string, echt: boolean): Promise<Antwort>;
       onDaten(fn: (d: Daten) => void): void;
+      onWahl(fn: (d: WahlDaten) => void): void;
       onStartfehler(fn: (p: { ort: string; kurz: string; grund: string; protokoll: string }) => void): void;
       bereit(): void;
     };
@@ -241,6 +245,8 @@ let wahlVersucht = false;
 const wahl: Wahl = { harness: '', model: '', effort: '', kontext: 0 };
 /** Der Suchtext der Modellliste, aus demselben Grund gemerkt wie `nameWert`. */
 let wahlSuche = '';
+/** Ziel fuer den Wechsel einer bereits laufenden Sitzung. */
+let wechselModell = '';
 /** Die Kontextstufen je Modell-Kennung, geholt auf Abruf. */
 const kontextStand: Record<string, KontextAntwort> = {};
 const kontextLaeuft = new Set<string>();
@@ -250,6 +256,9 @@ const statusEl = document.getElementById('statuszeile') as HTMLElement;
 const grundEl = document.getElementById('fort-grund') as HTMLElement;
 const fortKnopf = document.getElementById('fort-start') as HTMLButtonElement;
 const beendenKnopf = document.getElementById('beenden-start') as HTMLButtonElement;
+const wechselZeile = document.getElementById('modell-wechsel-zeile') as HTMLElement;
+const wechselAuswahl = document.getElementById('modell-wechsel') as HTMLSelectElement;
+const wechselKnopf = document.getElementById('modell-wechsel-start') as HTMLButtonElement;
 const neuKnopf = document.getElementById('neu-start') as HTMLButtonElement;
 const neuChatKnopf = document.getElementById('neu-chat') as HTMLButtonElement;
 const neuWahlKnopf = document.getElementById('neu-wahl') as HTMLButtonElement;
@@ -837,6 +846,22 @@ function zeichne(): void {
   // KANN, soll das auch zeigen, statt es erst nach dem Klick zu sagen.
   const laeuftGerade = !!gewaehlt && (gewaehlt.state === 'running' || gewaehlt.state === 'attention');
   beendenKnopf.disabled = beschaeftigt || !laeuftGerade;
+  const wechselbar = !!gewaehlt && laeuftGerade && gewaehlt.machine === daten.machine;
+  wechselZeile.style.display = wechselbar ? 'flex' : 'none';
+  if (wechselbar && !wahlDaten) wahlHolen();
+  const modelle = wechselbar && wahlDaten
+    ? wahlDaten.modelle.filter((m) => m.harness === gewaehlt.harness && m.startbar && m.wechselbar)
+    : [];
+  if (!modelle.some((m) => m.id === wechselModell)) {
+    wechselModell = modelle.some((m) => m.id === gewaehlt?.model) ? (gewaehlt?.model ?? '') : (modelle[0]?.id ?? '');
+  }
+  wechselAuswahl.textContent = '';
+  for (const m of modelle) {
+    const o = document.createElement('option');
+    o.value = m.id; o.textContent = `${m.label} · ${m.id}`; o.selected = m.id === wechselModell;
+    wechselAuswahl.appendChild(o);
+  }
+  wechselKnopf.disabled = beschaeftigt || !wechselModell || wechselModell === gewaehlt?.model;
   neuKnopf.disabled = beschaeftigt;
   // BEFUND 19.08.: Der Chat-Knopf blieb waehrend eines laufenden Starts
   // anklickbar, obwohl `neueChatSitzung()` ihn mit `if (beschaeftigt) return`
@@ -1039,6 +1064,21 @@ async function sitzungBeenden(id: string, echt: boolean): Promise<void> {
   }
 }
 
+async function modellWechseln(id: string, echt: boolean): Promise<void> {
+  if (beschaeftigt || !id || !wechselModell) return;
+  beschaeftigt = true;
+  zeichne();
+  try {
+    const a = await window.awbSitzung.modellWechseln(id, wechselModell, '', echt);
+    melde(a.command ? `${a.meldung}\n${a.command}` : a.meldung, a.ok ? 'gut' : 'fehler');
+  } catch (e) {
+    melde(String((e as Error).message ?? e), 'fehler');
+  } finally {
+    beschaeftigt = false;
+    zeichne();
+  }
+}
+
 nameFeld.addEventListener('input', () => {
   nameWert = nameFeld.value;
 });
@@ -1069,6 +1109,8 @@ neuWahlKnopf.addEventListener('click', () => {
 fernPruefenKnopf.addEventListener('click', () => void fernPruefen());
 fortKnopf.addEventListener('click', (ereignis) => void setzeFort(gewaehlteSitzung, ereignis.isTrusted));
 beendenKnopf.addEventListener('click', (ereignis) => void sitzungBeenden(gewaehlteSitzung, ereignis.isTrusted));
+wechselAuswahl.addEventListener('change', () => { wechselModell = wechselAuswahl.value; zeichne(); });
+wechselKnopf.addEventListener('click', (ereignis) => void modellWechseln(gewaehlteSitzung, ereignis.isTrusted));
 
 // --- Anlauf -----------------------------------------------------------------
 
@@ -1145,6 +1187,19 @@ window.awbSitzung.onDaten((d) => {
   // Eine Sitzung, die es nicht mehr gibt, bleibt nicht gewaehlt -- sonst zeigte
   // die Fusszeile einen Grund zu einer Zeile, die niemand mehr sieht.
   if (gewaehlteSitzung && !d.sitzungen.some((s) => s.id === gewaehlteSitzung)) gewaehlteSitzung = '';
+  zeichne();
+});
+
+// Registry/settings changed while this already-open window was alive. Keep a
+// deliberate in-window choice, but replace the option inventory immediately.
+window.awbSitzung.onWahl((d) => {
+  wahlDaten = d;
+  wahlFehler = '';
+  wahlVersucht = true;
+  if (!wahl.harness) wahl.harness = d.einstellung.harness;
+  if (!wahl.model) wahl.model = d.einstellung.model;
+  if (!wahl.effort) wahl.effort = d.einstellung.effort;
+  if (!wahl.kontext) wahl.kontext = d.einstellung.kontext;
   zeichne();
 });
 

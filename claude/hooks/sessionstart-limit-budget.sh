@@ -26,8 +26,15 @@ set -uo pipefail
 WB_BUDGET="$HOME/.local/bin/wb-budget"
 [ -x "$WB_BUDGET" ] || exit 0
 
-# --knapp gibt genau eine Zeile aus und endet mit 1, wenn nichts messbar ist.
-ZEILE="$("$WB_BUDGET" --limit --knapp 2>/dev/null)" || exit 0
+# --knapp gibt genau eine Zeile aus und endet mit 1, wenn nichts messbar ist. Exit 3 heisst:
+# das juengste gemessene Fenster ist abgelaufen -- dann steht in der Zeile genau das, und sie
+# wird ausgegeben (2026-10-07: vorher rechnete --limit mit der Zahl der Vorwoche weiter,
+# "85 %, Dienstag, Tag 7 von 7" am 29.09. auf der zweiten Maschine). Die Zeile traegt ihr Messdatum ("Stand
+# TT.MM. HH:MM"), damit eine beim Fortsetzen wieder eingespielte alte Ausgabe als alt
+# erkennbar ist.
+ZEILE="$("$WB_BUDGET" --limit --knapp 2>/dev/null)"
+RC=$?
+case "$RC" in 0|3) ;; *) exit 0 ;; esac
 [ -n "$ZEILE" ] || exit 0
 
 printf '%s\n' "$ZEILE"

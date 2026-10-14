@@ -16,6 +16,7 @@ import argparse
 import datetime as dt
 import logging
 import sys
+import time
 from pathlib import Path
 
 from . import (audit as audit_mod, config, consolidate, ingest as ingest_mod,
@@ -27,9 +28,9 @@ from .grug_client import GrugJudgeClient
 from .heat import load_heat
 from .ollama import OllamaClient, OllamaError, OllamaUnavailable
 from .queue import ReviewQueue
-from .runtime import (Deadline, Lock, LockHeldError, dirty_paths,
-                      foreign_changes, git_commit, record_attempt,
-                      setup_logging, write_last_run)
+from .runtime import (Deadline, Lock, LockHeldError, commit_by_repo, dirty_paths,
+                      foreign_changes, install_termination_handler,
+                      record_attempt, setup_logging, write_last_run)
 from .store import Store
 from .vault import VaultWriter, load_notes
 
@@ -50,6 +51,29 @@ SMART_PHASES = {"linking", "consolidate", "maintain", "synth", "mine"}
 EMBED_ONLY_PHASE = "embed"
 
 
+def _refresh_moc_layer(vault: Path, client) -> None:
+    """Keep braincli's MOC search layer (extra-embeddings.db) in step with the
+    gardener's own index (Auftrag g5, 24.09.2026: it stood at 20.08., because
+    only the retired `brain-maintain` built it). braincli is a sibling tool; a
+    gardener installed without it logs and moves on."""
+    try:
+        from braincli import extra_embed
+    except ImportError as e:
+        log.warning("MOC-Suchschicht nicht erneuert (braincli fehlt): %s", e)
+        return
+    try:
+        status = extra_embed.build(vault, client=client)
+    except OllamaUnavailable:
+        raise
+    except Exception as e:  # a side store never costs the run
+        log.warning("MOC-Suchschicht nicht erneuert: %s", e)
+        return
+    counts: dict[str, int] = {}
+    for s in status.values():
+        counts[s.split(":")[0]] = counts.get(s.split(":")[0], 0) + 1
+    log.info("MOC-Suchschicht: %s", counts)
+
+
 def wants(phase: str, name: str) -> bool:
     return phase in ("all", name)
 
@@ -63,6 +87,8 @@ DEADLINE_PHASE_LABELS = {
     "sidecar": "Sidecars (sidecar)",
     "mine": "Transcript-Mining (mine)",
     "contradict": "Widerspruchspruefung (contradict)",
+    "synth": "Themen-Synthese (synth)",
+    "maintain": "HOT.md-Zusammenfassung (maintain)",
 }
 # Phasen, deren Ergebnis von einer verkuerzten embed-Phase mitbetroffen ist -
 # sie arbeiten auf `embedded` (nur was tatsaechlich einen Vektor bekam), nicht
@@ -99,6 +125,10 @@ def build_report(link_res, cons_res, maint_res, topic_res, ingest_res, mine_res,
         f"Merges: {len(cons_res.merged)} | Review-Queue: {len(cons_res.queued)} | "
         f"Orphans in Queue: {len(maint_res.orphans_queued)} | "
         f"Lint-Findings: {len(findings)}", "",
+        f"Link-Kandidaten mit Hub verworfen: {link_res.hub_filtered}",
+        f"Link-Kandidaten wegen Zeitbudget offen: {link_res.remaining}",
+        f"Consolidate-Kandidaten: {cons_res.candidates} | ausgeschlossene Notizen: "
+        f"{cons_res.filtered} | Richteraufrufe: {cons_res.judge_calls}", "",
         "## Neue Links",
     ]
     lines += [f"- {a} <-> {b} ({t})" for a, b, t in link_res.added] or ["- keine"]
@@ -154,6 +184,14 @@ def build_report(link_res, cons_res, maint_res, topic_res, ingest_res, mine_res,
                   f"{', '.join(synth_res.skipped_hand_written) or 'keine'}",
                   f"- Zeilen verworfen (ohne Quelle): {synth_res.lines_dropped_no_link}",
                   f"- Zeilen verworfen (toter Wikilink): {synth_res.lines_dropped_dead_link}",
+                  f"- Richter ohne Antwort (Seite unveraendert, naechster Lauf): "
+                  f"{', '.join(synth_res.judge_failed) or 'keine'}",
+                  f"- neue Cluster ohne belegten Fakt (nicht angelegt): "
+                  f"{', '.join(synth_res.skipped_empty_new) or 'keine'}",
+                  f"- Zeitbudget, nicht mehr bearbeitet: "
+                  f"{', '.join(synth_res.deadline_left) or 'keine'}",
+                  f"- Transportfehler, naechster Lauf: "
+                  f"{', '.join(synth_res.retry_left) or 'keine'}",
                   f"- Zeilen verworfen (Projektstand, gehoert in die STATUS-Notiz): "
                   f"{synth_res.lines_dropped_status}"]
     if owner_res is not None:
@@ -270,7 +308,12 @@ def run(args) -> int:
     # Urteils-/Schreib-Stellen. `contradict` (brain contradict) ist ebenso
     # klassifiziert, aber sein Client wird ausserhalb dieses Tools in
     # braincli konstruiert - siehe config.py bei CONTRADICT_TOP_K.
-    smart = GrugJudgeClient()
+    # Auftrag g4 (24.09.2026): auf Splash denkt Qwen ohne Vorgabe auf `xhigh`
+    # - ein Themenseiten-Urteil lief so in finish_reason=length (19 943
+    # Zeichen Denken) oder in die 300-s-Grenze. `low` gemessen an einer
+    # Themenseite (9 Quellen): 46 s, deutsche, belegte Fakten; `none` 21 s,
+    # gleich viele Fakten, aber englisch und ungenauer bei Zahlen.
+    smart = GrugJudgeClient(reasoning_effort=config.SMART_REASONING_EFFORT)
     # NACHTRAG 2 (02.09.2026), gemessen an der 20-Paar-Stichprobe dieses
     # Auftrags: fuer linking stimmen die Urteile mit und ohne Denken in 19
     # von 20 Faellen ueberein, der eine Unterschied ist eine ausgelassene
@@ -349,7 +392,7 @@ def run(args) -> int:
         # nichts einzustellen hat, was er nicht selbst geschrieben hat.
         writer = VaultWriter(vault, dry_run=args.dry_run,
                              foreign=dirty_paths(vault))
-        queue = ReviewQueue(writer)
+        queue = ReviewQueue(writer, gepuffert=True)   # one write, see flush() below
 
         link_res = linking.LinkResult()
         cons_res = consolidate.ConsolidateResult()
@@ -404,7 +447,7 @@ def run(args) -> int:
             if res is not None:
                 sidecar_res = res
 
-        heat = load_heat(vault)
+        heat = maintain.load_read_heat(vault)
         vectors: dict[str, list[float]] = {}
         embedded = []
         hubs = topics.load_hubs(vault)
@@ -415,6 +458,8 @@ def run(args) -> int:
             # deadline may have cut embedding short: only fully embedded notes
             # take part in similarity-based stages
             embedded = [n for n in notes if n.rel in vectors]
+            if not args.dry_run and not ollama_dead:
+                _guard("embed", lambda: _refresh_moc_layer(vault, client))
 
         if phase == EMBED_ONLY_PHASE:
             # Hier ist Schluss: kein Bericht, kein Commit - der Lauf hat
@@ -443,6 +488,7 @@ def run(args) -> int:
                 record_attempt(config.STATE_DIR, attempt)
             log.info("done: gardener[embed]: %d/%d Vektoren im Index (log: %s)",
                      len(vectors), len(notes) + len(hubs), logfile)
+            queue.flush()
             return 0
 
         # Auftrag "startklar" (03.09.2026): the gardener never provisioned
@@ -484,6 +530,13 @@ def run(args) -> int:
                     log.error("mlx server could not be provisioned for this run "
                               "- the phases that need it are skipped, the rest "
                               "of the run still runs: %s", e)
+                # Auftrag g4: der Richter spricht mit dem Motor, den ensure()
+                # bereitgestellt hat (Splash oder MLX), nicht fest mit :8080.
+                engine = mlx_server.active_engine()
+                for c in (smart, smart_linking):
+                    c.engine = engine
+                log.info("judge engine: %s (%s, parallel %d)", engine.name,
+                         engine.base_url, engine.parallel)
 
         def _smart_guard(name: str, fn):
             """Like `_guard`, but for the phases that need the MLX server
@@ -496,8 +549,13 @@ def run(args) -> int:
             return _guard(name, fn)
 
         if wants(phase, "linking"):
+            # linking may use at most this share of what is left; the rest
+            # belongs to consolidate/maintain/synth (see Deadline.share)
+            link_deadline = deadline.share(config.LINKING_BUDGET_SHARE)
+            link_deadline.end = min(link_deadline.end,
+                                    time.monotonic() + config.LINKING_BUDGET_MAX_SECONDS)
             res = _smart_guard("linking", lambda: linking.run_linking(
-                embedded, vectors, store, smart_linking, writer, deadline))
+                embedded, vectors, store, smart_linking, writer, link_deadline))
             if res is not None:
                 link_res = res
         if wants(phase, "consolidate"):
@@ -517,18 +575,27 @@ def run(args) -> int:
             # skips straight to the degraded listing rather than burning a
             # doomed HTTP timeout first. A dry run (Nachtrag Punkt 5) gets
             # the same None: it must call no model either.
+            # An exhausted budget also means no model call here: the HOT.md
+            # summary is the one call that may take minutes, the listing is
+            # instant (run of 24.09.2026: 10 minutes of timeouts past budget).
+            hot_client = (None if (mlx_start_failed or args.dry_run
+                                   or deadline.expired("maintain"))
+                          else smart)
             maint_res = maintain.run_maintenance(
-                notes, writer, None if (mlx_start_failed or args.dry_run)
-                else smart, queue, heat)
+                notes, writer, hot_client, queue, heat)
             topic_res = topics.run_topics(hubs, embedded, vectors, writer, queue)
         if wants(phase, "synth"):
             contra_store = ContradictionStore(vault / config.CONTRADICTIONS_FILE)
             res = _smart_guard("synth", lambda: synth_mod.run_synth(
                 vault, embedded, hubs, vectors, writer, smart, contra_store,
-                min_sources=args.min_notes, only_topic=args.topic))
+                min_sources=args.min_notes, only_topic=args.topic,
+                deadline=deadline))
             if res is not None:
                 synth_res = res
-        if wants(phase, "mine"):
+        # `mine` ist seit Brain 5 nicht mehr Teil von `all` (BRAIN5-PIPELINE
+        # Leitentscheidung 8): die Lehren aus Transkripten gewinnt `brain run
+        # --profil lehren`. Ausdruecklich angefordert laeuft es noch.
+        if phase == "mine":
             res = _smart_guard("mine", lambda: mine_mod.run_mining(
                 vault, notes, writer, smart, store, deadline))
             if res is not None:
@@ -541,6 +608,7 @@ def run(args) -> int:
             lint_mod.queue_findings(findings, queue)
             audit_rel = audit_mod.run_audit(notes, writer, findings=findings,
                                             heat=heat)
+        queue.flush()
 
         # `smart`/`smart_linking`s Fehlschlaege sind toleriert-lokale
         # Ausfaelle genau wie `client`s - alle drei zaehlen hier zusammen,
@@ -555,7 +623,12 @@ def run(args) -> int:
                               owner_res, ollama_dead, ollama_skipped,
                               mlx_start_failed, mlx_skipped, deadline.stops,
                               budget_override_minutes, mlx_dry_run_status)
-        report_rel = f"00-sources/gardener-report-{dt.date.today().isoformat()}.md"
+        # `brain run` sammelt Bericht und geschriebene Pfade ein und macht
+        # daraus EINEN Bericht und EINEN Commit (BRAIN5-PIPELINE B4); der
+        # Gaertner schreibt dann weder Bericht noch Commit selbst.
+        sammel = getattr(args, "sammel", None)
+        report_rel = (sammel.get("report_rel") if sammel is not None and sammel.get("report_rel")
+                      else f"00-sources/gardener-report-{dt.date.today().isoformat()}.md")
         # Wer parallel im Vault arbeitet, soll im Bericht stehen - und deshalb
         # muss die Liste VOR dem Schreiben feststehen. Eigen ist, was der
         # Writer angefasst hat, dazu der Bericht selbst; alles andere ist
@@ -573,7 +646,9 @@ def run(args) -> int:
                        f"arbeitet: {len(writer.foreign_skipped)}\n"
                        + "\n".join(f"  {p}" for p in
                                    writer.foreign_skipped[:20]) + "\n")
-        if args.dry_run:
+        if sammel is not None:
+            pass        # the caller writes the one report
+        elif args.dry_run:
             # never write into the vault on a dry-run: the report goes to the
             # (gitignored) log dir and to stdout
             (config.LOG_DIR / Path(report_rel).name).write_text(report)
@@ -593,8 +668,25 @@ def run(args) -> int:
                f"{len(synth_res.written)} topic pages, "
                f"{len(owner_res.stamped)} owners")
         # Eingestellt wird, was DIESER Lauf geschrieben hat - `writer.written`
-        # ist die Liste, die der VaultWriter ohnehin fuehrt.
-        commit = git_commit(vault, msg, writer.written, dry_run=args.dry_run)
+        # ist die Liste, die der VaultWriter ohnehin fuehrt. `commit_by_repo`
+        # gruppiert dabei nach dem naechsten `.git` (S2): eingehaengte Spaces
+        # committen in ihr eigenes Repo, nicht ins Wurzel-Repo, das sie ohnehin
+        # per `.gitignore` gar nicht sieht.
+        commit_failed = ""
+        if sammel is not None:
+            sammel.update(report=report, written=list(writer.written), msg=msg,
+                          conflicts=sorted(set(writer.conflicts)),
+                          protected=list(writer.protected_skipped))
+        else:
+            # Befund 12 (14.10.2026): ein gescheiterter Commit (index.lock,
+            # Hook) darf nicht als Erfolg gelten - die Dateien blieben sonst
+            # uncommittet und im naechsten Lauf als fremd liegen.
+            commit_failed = "; ".join(
+                f"{c.repo or '.'}: {c.error}"
+                for c in commit_by_repo(vault, msg, writer.written, dry_run=args.dry_run)
+                if c.error)
+            if commit_failed:
+                log.error("commit failed: %s", commit_failed)
         if not args.dry_run:
             finished = dt.datetime.now().isoformat(timespec="seconds")
             attempt = {"started": started, "finished": finished, "phase": phase,
@@ -621,7 +713,13 @@ def run(args) -> int:
                 # oben - sonst sieht ein spaeterer Blick auf state/ einen
                 # unvollstaendigen Lauf als ganz normalen Erfolg an.
                 attempt["deadline_stops"] = deadline.stops
-            if ollama_dead or mlx_start_failed or deadline.stops:
+            if commit_failed:
+                # Wie ein Teillauf: nur der letzte VERSUCH, nie der letzte
+                # ERFOLG - der alte Erfolg bleibt unangetastet stehen.
+                attempt["status"] = "commit_failed"
+                attempt["detail"] = commit_failed
+                record_attempt(config.STATE_DIR, attempt)
+            elif ollama_dead or mlx_start_failed or deadline.stops:
                 # Point 1, 2026-09-02: a run that only got through because
                 # several model-dependent phases sat out is not "the last
                 # SUCCESS" (see runtime.record_attempt's docstring) - only
@@ -656,7 +754,7 @@ def run(args) -> int:
                         "overwritten: %s", len(set(writer.conflicts)),
                         ", ".join(sorted(set(writer.conflicts))))
         log.info("done: %s (log: %s)", msg, logfile)
-        return 0
+        return 1 if commit_failed else 0
     except OllamaError as e:
         log.error("ollama failure mid-run: %s - aborting", e)
         if not args.dry_run:
@@ -677,13 +775,19 @@ def run(args) -> int:
                 "phase": phase, "status": "error", "detail": str(e)})
         raise
     finally:
-        if store is not None:
-            store.close()
-        # Nur der Server, den DIESER Lauf tatsaechlich provisioniert hat
-        # (mlx_owned bleibt False, wenn `ensure()` nie erfolgreich war -
-        # weder ausgelassen noch fehlgeschlagen) - siehe mlx_server.py.
-        mlx_server.release(mlx_owned)
-        lock.release()
+        # Die Sperre wird immer freigegeben, auch wenn eines der Aufraeumen
+        # davor eine Ausnahme wirft (Befund 12, 14.10.2026).
+        try:
+            if store is not None:
+                store.close()
+        finally:
+            try:
+                # Nur der Server, den DIESER Lauf tatsaechlich provisioniert hat
+                # (mlx_owned bleibt False, wenn `ensure()` nie erfolgreich war -
+                # weder ausgelassen noch fehlgeschlagen) - siehe mlx_server.py.
+                mlx_server.release(mlx_owned)
+            finally:
+                lock.release()
 
 
 def main(argv=None) -> int:
@@ -692,7 +796,8 @@ def main(argv=None) -> int:
     p.add_argument("--phase", choices=list(config.PHASES), default="all",
                    help="run a single phase instead of the full pass")
     p.add_argument("--dry-run", action="store_true",
-                   help="report only: no vault writes, no state writes, no commits")
+                   help="report only: no vault writes, no state writes, no commits "
+                        "(the log file and the report go to the gitignored logs/ dir)")
     p.add_argument("--once", action="store_true",
                    help="explicit single run (default behavior; for clarity)")
     p.add_argument("--audit", action="store_true",
@@ -712,6 +817,9 @@ def main(argv=None) -> int:
     # Zustand an den Vault binden, BEVOR Logfile, Lock oder Store aufgemacht
     # werden - siehe config.bind_vault.
     config.bind_vault(args.vault)
+    # SIGTERM soll denselben sauberen Halt ausloesen wie SIGINT (Auftrag
+    # "p0-schutztore") - siehe runtime.install_termination_handler.
+    install_termination_handler()
     try:
         return run(args)
     except KeyboardInterrupt:

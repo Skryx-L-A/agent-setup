@@ -4,23 +4,108 @@
 #   gpu-slot gib   <wer>   -> gibt frei, nur der Besitzer darf
 #   gpu-slot wer           -> zeigt den Besitzer oder "frei"
 #   gpu-slot warte <wer> [sekunden]  -> wartet mit Deadline, nimmt dann
+#
+# Seit 2026-10-09 eine duenne Huelle um die Belegungstafel (wb-tafel, Platz mac-gpu auf
+# macOS, peer-gpu auf Linux). Aufruf, Ausgabe und Exitcodes bleiben wie bei der alten
+# mkdir-Sperre. Was die Tafel dazugibt: der Platz haengt am Pane des Aufrufers (stirbt er,
+# verfaellt der Platz), er hat eine Frist (GPU_SLOT_FRIST, Vorgabe 12h, mit Mahnung ueber
+# wb-inbox), `warte` steht in der Warteschlange der Tafel, und `wb-tafel` zeigt ihn mit allen
+# anderen Plaetzen. <wer> steht im Zweck ("gpu-slot: <wer>"); `gib <wer>` gibt nur den Eintrag
+# mit diesem Namen frei, und die Tafel prueft zusaetzlich, dass der Aufrufer Halter, sein
+# Orchestrator oder der Mensch ist (ohne Pane: jeder, wie vorher).
+# Fehlt wb-tafel (etwa vor dem Ausrollen), arbeitet die alte Sperre unveraendert weiter; eine
+# noch bestehende alte Sperre gilt auch in der Tafel-Fassung als belegt.
 L="$HOME/.pi-workers/gpu-slot.lock"
+FRIST="${GPU_SLOT_FRIST:-12h}"
+T="${GPU_SLOT_TAFEL:-}"
+if [ -z "$T" ]; then
+  T="$(command -v wb-tafel 2>/dev/null)"
+  [ -n "$T" ] || { [ -x "$HOME/.local/bin/wb-tafel" ] && T="$HOME/.local/bin/wb-tafel"; }
+fi
+[ -n "$T" ] && [ -x "$T" ] || T=""
+P="${GPU_SLOT_PLATZ:-}"
+[ -n "$P" ] || case "$(uname -s)" in Linux) P="peer-gpu" ;; *) P="mac-gpu" ;; esac
+
+alt() {   # die alte mkdir-Sperre, unveraendert
+  case "$1" in
+    nimm)
+      if mkdir "$L" 2>/dev/null; then echo "$2" > "$L/wer"; date +%s > "$L/seit"; echo "Platz genommen von $2"; exit 0
+      else echo "BELEGT von $(cat "$L/wer" 2>/dev/null) seit $(( ($(date +%s) - $(cat "$L/seit" 2>/dev/null || echo 0)) / 60 )) min"; exit 1; fi ;;
+    gib)
+      [ -d "$L" ] || { echo "war frei"; exit 0; }
+      o=$(cat "$L/wer" 2>/dev/null)
+      [ "$o" = "$2" ] || { echo "FEHLER: Platz gehoert $o, nicht $2"; exit 1; }
+      rm -rf "$L"; echo "Platz freigegeben von $2"; exit 0 ;;
+    wer) [ -d "$L" ] && cat "$L/wer" || echo "frei" ;;
+    warte)
+      d=${3:-3600}; e=$(( $(date +%s) + d ))
+      while [ $(date +%s) -lt $e ]; do
+        if mkdir "$L" 2>/dev/null; then echo "$2" > "$L/wer"; date +%s > "$L/seit"; echo "Platz genommen von $2"; exit 0; fi
+        sleep 20
+      done
+      echo "Deadline: Platz blieb belegt von $(cat "$L/wer" 2>/dev/null)"; exit 1 ;;
+    *) echo "gpu-slot nimm|gib|wer|warte <wer> [sekunden]"; exit 2 ;;
+  esac
+}
+
+[ -n "$T" ] || alt "$@"
+
+# Halter des Platzes, je Zeile: <eintrag> TAB <wer> TAB <minuten seit>. Fremde Eintraege (direkt
+# ueber wb-tafel genommen) zeigen Halter und Zweck; belegt ohne Eintrag (etwa weil mac-ruhe
+# schwere Plaetze sperrt) zeigt den Grund.
+halter() {
+  "$T" frei "$P" --json 2>/dev/null | python3 -c '
+import json, sys, time
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for e in d.get("halter") or []:
+    z = e.get("zweck") or ""
+    wer = z[len("gpu-slot: "):] if z.startswith("gpu-slot: ") else "%s (%s)" % (e.get("halter_text", "?"), z)
+    print("%s\t%s\t%d" % (e.get("id", ""), wer, int((time.time() - float(e.get("seit") or time.time())) / 60)))
+if not d.get("frei") and not d.get("halter"):
+    print("-\t%s\t0" % (d.get("grund") or "?"))
+'
+}
+erster_wer() { halter | head -1 | cut -f2; }
+alt_belegt() {   # eine noch bestehende alte Sperre zaehlt als belegt
+  [ -d "$L" ] || return 1
+  echo "BELEGT von $(cat "$L/wer" 2>/dev/null) seit $(( ($(date +%s) - $(cat "$L/seit" 2>/dev/null || echo 0)) / 60 )) min"
+}
+
 case "$1" in
   nimm)
-    if mkdir "$L" 2>/dev/null; then echo "$2" > "$L/wer"; date +%s > "$L/seit"; echo "Platz genommen von $2"; exit 0
-    else echo "BELEGT von $(cat "$L/wer" 2>/dev/null) seit $(( ($(date +%s) - $(cat "$L/seit" 2>/dev/null || echo 0)) / 60 )) min"; exit 1; fi ;;
+    alt_belegt && exit 1
+    aus="$("$T" nimm "$P" --frist "$FRIST" --zweck "gpu-slot: $2" 2>&1)"; rc=$?
+    case $rc in
+      0) echo "Platz genommen von $2"; exit 0 ;;
+      1) z="$(halter | head -1)"
+         echo "BELEGT von $(printf '%s' "$z" | cut -f2) seit $(printf '%s' "$z" | cut -f3) min"; exit 1 ;;
+      *) echo "FEHLER: wb-tafel nimm $P (Exit $rc): $(printf '%s\n' "$aus" | tail -1)"; exit 1 ;;
+    esac ;;
   gib)
-    [ -d "$L" ] || { echo "war frei"; exit 0; }
-    o=$(cat "$L/wer" 2>/dev/null)
-    [ "$o" = "$2" ] || { echo "FEHLER: Platz gehoert $o, nicht $2"; exit 1; }
-    rm -rf "$L"; echo "Platz freigegeben von $2"; exit 0 ;;
-  wer) [ -d "$L" ] && cat "$L/wer" || echo "frei" ;;
+    if [ -d "$L" ] && [ "$(cat "$L/wer" 2>/dev/null)" = "$2" ]; then rm -rf "$L"; echo "Platz freigegeben von $2"; exit 0; fi
+    liste="$(halter)"
+    if [ -z "$liste" ]; then
+      [ -d "$L" ] && { echo "FEHLER: Platz gehoert $(cat "$L/wer" 2>/dev/null), nicht $2"; exit 1; }
+      echo "war frei"; exit 0
+    fi
+    id="$(printf '%s\n' "$liste" | awk -F '\t' -v w="$2" '$2==w && $1!="-" {print $1; exit}')"
+    [ -n "$id" ] || { echo "FEHLER: Platz gehoert $(printf '%s\n' "$liste" | head -1 | cut -f2), nicht $2"; exit 1; }
+    aus="$("$T" gib "$id" 2>&1)"; rc=$?
+    [ $rc = 0 ] && { echo "Platz freigegeben von $2"; exit 0; }
+    echo "FEHLER: Platz gehoert $2 in einer anderen Sitzung -- wb-tafel gib (Exit $rc): $(printf '%s\n' "$aus" | tail -1)"; exit 1 ;;
+  wer)
+    [ -d "$L" ] && { cat "$L/wer"; exit 0; }
+    w="$(erster_wer)"; [ -n "$w" ] && echo "$w" || echo "frei" ;;
   warte)
     d=${3:-3600}; e=$(( $(date +%s) + d ))
-    while [ $(date +%s) -lt $e ]; do
-      if mkdir "$L" 2>/dev/null; then echo "$2" > "$L/wer"; date +%s > "$L/seit"; echo "Platz genommen von $2"; exit 0; fi
-      sleep 20
-    done
-    echo "Deadline: Platz blieb belegt von $(cat "$L/wer" 2>/dev/null)"; exit 1 ;;
+    while [ -d "$L" ] && [ $(date +%s) -lt $e ]; do sleep 20; done
+    rest=$(( e - $(date +%s) )); [ $rest -ge 1 ] || rest=1
+    if [ -d "$L" ]; then echo "Deadline: Platz blieb belegt von $(cat "$L/wer" 2>/dev/null)"; exit 1; fi
+    "$T" nimm "$P" --frist "$FRIST" --zweck "gpu-slot: $2" --warte "${rest}s" >/dev/null 2>&1; rc=$?
+    [ $rc = 0 ] && { echo "Platz genommen von $2"; exit 0; }
+    echo "Deadline: Platz blieb belegt von $(erster_wer)"; exit 1 ;;
   *) echo "gpu-slot nimm|gib|wer|warte <wer> [sekunden]"; exit 2 ;;
 esac

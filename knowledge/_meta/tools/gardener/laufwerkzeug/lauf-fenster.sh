@@ -17,7 +17,7 @@
 set -u
 
 FRIST=${1:?Frist als HH:MM, z.B. 12:00}
-WERK=$HOME/Knowledge/_meta/tools/gardener
+WERK="${BRAIN_VAULT:-$HOME/Knowledge}/_meta/tools/gardener"
 LAUFDIR=$HOME/AI/traum-lauf
 LOG="$LAUFDIR/fenster-$(date +%Y%m%d-%H%M).log"
 STAND="$LAUFDIR/STAND.md"

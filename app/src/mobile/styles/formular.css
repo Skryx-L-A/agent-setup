@@ -1,0 +1,113 @@
+/* FORMULARE: Neue Sitzung, Kopplung, Formblaetter der Agents. Felder mindestens 16 px (kein Fokus-Zoom). */
+
+.formular {
+  display: flex; flex-direction: column; gap: 20px; padding: 8px var(--rand) 24px;
+  max-width: 620px; margin: 0 auto; width: 100%;
+}
+.formular-gruppe { display: flex; flex-direction: column; gap: 6px; }
+.formular-titel { font-size: 0.882rem; font-weight: 600; color: var(--gedaempft); padding: 0 4px; }
+.formular-hilfe { font-size: 0.765rem; color: var(--gedaempft); padding: 0 4px; }
+.formular-fehler { color: var(--zustand-tot); font-size: 0.882rem; line-height: 1.35; padding: 0 4px; }
+.formular-erfolg { color: var(--zustand-fertig); font-size: 0.882rem; font-weight: 600; padding: 0 4px; }
+.formular .formular-notiz, .formular .absender-notiz { padding: 0 4px; }
+.feldkarte { padding: 0 14px; }
+.feld {
+  width: 100%; min-height: 48px; border: 0; outline: 0; background: transparent;
+  font-size: max(16px, 1rem);
+}
+.feld[inputmode='url'] { font-family: var(--mono); font-size: max(16px, 0.9rem); }
+.feld::placeholder { color: var(--gedaempft); opacity: 0.8; }
+.feldkarte:focus-within { box-shadow: inset 0 0 0 1.5px var(--akzent-matt); }
+
+.segmente { display: flex; gap: 2px; padding: 3px; border-radius: 10px; background: var(--erhoben); }
+.segment { flex: 1; position: relative; }
+.segment input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.segment span {
+  display: flex; align-items: center; justify-content: center; min-height: 36px; padding: 4px 8px;
+  border-radius: 8px; font-size: 0.882rem; font-weight: 600; color: var(--gedaempft); text-align: center;
+}
+.segment input:checked + span { background: var(--akzent-matt); color: var(--akzent-text); }
+.segment input:disabled + span { opacity: 0.4; }
+.segment input:focus-visible + span { outline: 2px solid var(--akzent); outline-offset: 1px; }
+
+.vorschlaege { display: flex; flex-wrap: wrap; gap: 6px; }
+.vorschlag {
+  max-width: 100%; min-height: 32px; padding: 4px 10px; border-radius: 8px; background: var(--erhoben);
+  font-family: var(--mono); font-size: 0.72rem; color: var(--gedaempft);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.auswahl-liste { display: flex; flex-direction: column; padding: 2px 0; }
+.auswahl { display: flex; align-items: center; gap: 12px; min-height: 52px; padding: 6px 14px; cursor: pointer; }
+.auswahl input {
+  appearance: none; -webkit-appearance: none; flex: none; width: 22px; height: 22px; margin: 0;
+  border-radius: 50%; box-shadow: inset 0 0 0 2px var(--gedaempft);
+}
+.auswahl input:checked { background: var(--akzent); box-shadow: inset 0 0 0 5px var(--karte), 0 0 0 2px var(--akzent); }
+.auswahl-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.auswahl-id { font-family: var(--mono); font-size: 0.72rem; color: var(--gedaempft); }
+.auswahl-name { line-height: 1.25; overflow-wrap: anywhere; }
+.auswahl-zusatz { font-size: 0.765rem; color: var(--gedaempft); line-height: 1.3; }
+/* Auswahllisten der Blaetter: Bild vorn, Markierung am Ende der Zeile wie in den iOS-Einstellungen. */
+.auswahl.wahl .auswahl-text { flex: 1; }
+.wahl-symbol { flex: none; width: 30px; height: 30px; display: grid; place-items: center; border-radius: 8px; background: var(--erhoben); color: var(--gedaempft); }
+.auswahl canvas { flex: none; }
+.auswahl:has(input:disabled) { cursor: default; }
+.auswahl:has(input:disabled) .auswahl-name, .auswahl:has(input:disabled) canvas { opacity: 0.45; }
+.auswahl input:disabled { opacity: 0.35; }
+.auswahl input:focus-visible { outline: 2px solid var(--akzent); outline-offset: 2px; }
+/* Gruppenkopf in einer Auswahl (etwa „Agenten“ und „Teams“), wie ein Abschnittskopf der iOS-Listen. */
+.auswahl-gruppe {
+  padding: 12px 14px 4px; font-size: 0.765rem; font-weight: 600; letter-spacing: 0.02em;
+  color: var(--gedaempft); text-transform: uppercase;
+}
+.auswahl-gruppe:not(:first-child) { margin-top: 6px; border-top: 1px solid var(--linie); }
+
+.feld.mehrzeilig { display: block; resize: none; min-height: 88px; padding: 13px 0; line-height: 1.35; }
+.feld.zeit { color: var(--akzent-text); -webkit-appearance: none; appearance: none; text-align: left; }
+
+/* Schalter (iOS-Switch) und darunter aufklappender Inhalt */
+.schalter-karte { display: flex; flex-direction: column; }
+.schalter-zeile { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 52px; padding: 6px 14px; cursor: pointer; }
+.schalter {
+  --knauf: var(--schrift);
+  appearance: none; -webkit-appearance: none; flex: none; position: relative; margin: 0; cursor: pointer;
+  width: 51px; height: 31px; border-radius: 16px; background: var(--erhoben); box-shadow: inset 0 0 0 1px var(--linie);
+  transition: background-color 0.2s;
+}
+:root[data-thema='hell'] .schalter { --knauf: var(--grund); }
+.schalter::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 27px; height: 27px; border-radius: 50%;
+  background: var(--knauf); box-shadow: 0 2px 4px var(--schatten); transition: transform 0.2s;
+}
+.schalter:checked { background: var(--akzent); box-shadow: none; }
+.schalter:checked::after { transform: translateX(20px); }
+.schalter:focus-visible { outline: 2px solid var(--akzent); outline-offset: 2px; }
+.schalter-inhalt { padding: 0 14px 8px; }
+.schalter-karte + .schalter-karte { margin-top: var(--fuge); }
+
+/* Stepper: Zahl mit Minus und Plus */
+.stepper { display: flex; align-items: center; gap: 2px; min-height: 48px; margin-right: -8px; }
+.stepper-text { flex: 1; color: var(--gedaempft); }
+.stepper-wert { min-width: 2.4em; text-align: center; font-size: 1.06rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stepper-knopf { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 10px; color: var(--akzent-text); background: var(--erhoben); }
+.stepper-knopf .symbol path { stroke-width: 2.2; }
+.stepper-knopf:not(:disabled):active { background: var(--wahl); }
+.stepper-knopf:disabled { opacity: 0.35; }
+
+/* --- Kopplung -------------------------------------------------------------- */
+.kopplung-ansicht.vollbild { position: absolute; inset: 0; z-index: 40; }
+.kopplung-formular { padding-top: 0; }
+.schritte { list-style: none; counter-reset: schritt; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
+.schritte li { counter-increment: schritt; display: flex; gap: 12px; align-items: flex-start; line-height: 1.4; }
+.schritte li::before {
+  content: counter(schritt); flex: none; width: 26px; height: 26px; border-radius: 50%;
+  display: grid; place-items: center; font-size: 0.82rem; font-weight: 700;
+  background: var(--akzent-matt); color: var(--akzent-text);
+}
+.code-karte { padding: 0 8px; }
+.code-feld {
+  width: 100%; min-height: 64px; border: 0; outline: 0; background: transparent; text-align: center;
+  font-family: var(--mono); font-size: 30px; font-weight: 600; letter-spacing: 0.42em; padding-left: 0.42em;
+  font-variant-numeric: tabular-nums;
+}
+.code-feld::placeholder { color: var(--gedaempft); opacity: 0.35; }

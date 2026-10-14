@@ -1,0 +1,51 @@
+#!/bin/sh
+# post-commit / post-merge / post-rewrite: geaenderte Notizen neu einbetten (b6-einbett, 2026-09-28).
+# Blockiert nie und bleibt schnell (Wegwerf-Repo gemessen: unter 100 ms): legt nur eine Marke ab und
+# startet, wenn noch kein Lauf wartet, `braincli.nachbetten` losgeloest. Der Lauf entprellt (mehrere
+# Commits = ein Lauf), prueft Ollama und Akku, bettet nur Veraltetes ein und endet.
+# Ablauf: braincli/nachbetten.py. Gilt fuer den Kern und die Space-Repos (20-projects/<p>/.git); die
+# Vault-Wurzel ist der Ordner, der braincli traegt UND ein .venv hat - ein Kern-Worktree (kein .venv)
+# macht nichts. Abschalter: BRAIN_NACHBETTEN=0. Installation: git-hooks/install-nachbetten.sh.
+# Dieselbe Datei dient unter den Namen post-merge und post-rewrite (Symlinks; post-rewrite bekommt
+# Zeilen auf stdin, die hier niemand braucht).
+name="${0##*/}"
+
+nachbetten() {
+  [ "${BRAIN_NACHBETTEN:-1}" = "0" ] && return 0
+  d="$top"
+  vault=""
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    if [ -f "$d/_meta/tools/braincli/braincli/nachbetten.py" ]; then vault="$d"; break; fi
+    d="${d%/*}"
+  done
+  [ -n "$vault" ] || return 0
+  tool="$vault/_meta/tools/braincli"
+  py="${BRAIN_NACHBETTEN_PYTHON:-$tool/.venv/bin/python}"
+  [ -x "$py" ] || return 0
+  state="$tool/state"
+  mkdir -p "$state" 2>/dev/null || return 0
+  # Erst die Marke, dann die Pid pruefen: Der Lauf entfernt seine Pid-Datei und schaut DANACH
+  # noch einmal nach der Marke, so geht kein Commit zwischen zwei Laeufen verloren.
+  : > "$state/nachbetten.dirty" 2>/dev/null || return 0
+  pid="$(cat "$state/nachbetten.pid" 2>/dev/null)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then return 0; fi
+  # git setzt GIT_DIR/GIT_INDEX_FILE fuer Hooks; der Lauf fragt selbst git und braucht sie nicht.
+  ( cd "$tool" && exec env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_PREFIX \
+      "$py" -m braincli.nachbetten --vault "$vault" \
+      </dev/null >/dev/null 2>>"$state/nachbetten.log" ) </dev/null >/dev/null 2>&1 &
+  return 0
+}
+
+# Git LFS: die Hooks, die `git lfs install` schrieb, ersetzt dieser hier. Danach, damit der Lauf
+# sofort startet; nur wo das Repo LFS nutzt (wie der globale Verteiler).
+lfs() {
+  case "$name" in post-commit|post-merge) ;; *) return 0 ;; esac
+  command -v git-lfs >/dev/null 2>&1 || return 0
+  grep -qs 'filter=lfs' "${top:-.}/.gitattributes" || return 0
+  git lfs "$name" "$@" || true
+}
+
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+nachbetten
+lfs "$@"
+exit 0

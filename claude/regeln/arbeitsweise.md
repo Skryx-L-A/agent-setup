@@ -10,6 +10,10 @@ Stand der Gliederung: 2026-09-12. Vor der Handlung die passenden Abschnitte unte
 keine Volllektüre aller Referenzen. Die bisherigen Inhalte sind wortgetreu ausgelagert;
 neuere ausdrückliche Entscheidungen ersetzen ältere abweichende Absätze.
 Für Prüfbedarf gilt immer `~/.claude/regeln/verifikation.md`: keine automatische Doppelprüfung.
+**Text, der gesperrte Befehle nur erwähnt** (z. B. „nie git add -A“ in einer Notiz), wird mit dem
+Write-/Edit-Werkzeug geschrieben, nicht per `echo`/Heredoc in der Shell: der bash-guard liest auch
+Anführungszeichen und Heredoc-Körper als Befehl, weil `bash -c`/`eval`/`ssh` sie ausführen. Eine
+Daten-Ausnahme dafür wurde am 2026-10-09 nach fünf Review-Runden mit jeweils neuen Umgehungen verworfen.
 
 ## Abschnitte
 

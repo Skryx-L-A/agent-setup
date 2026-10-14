@@ -10,17 +10,21 @@ import {
 } from 'electron';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { readFileSync, statSync, mkdirSync, openSync, closeSync, existsSync } from 'node:fs';
-import { homedir, userInfo } from 'node:os';
+import { homedir, hostname, userInfo } from 'node:os';
+import { createHash } from 'node:crypto';
 import { join, relative, dirname, basename } from 'node:path';
 import { loadConfig, Config } from './config';
-import { MantelKanal } from './mantel';
+import { MantelKanal, socketVerwaist } from './mantel';
 import { fernAufruf, findetWerkzeug, pfadHerrichten } from './pfad';
 import { Ergebnis, ErgebnisWaechter } from './results';
 import { TmuxControl, PaneInfo, WindowInfo, assertSessionName, assertPaneId } from './tmux';
 import { ControlChannel, ControlRequest } from './control';
 import { captureWindow } from './shot';
 import { leseSessions, SessionInfo, panesHinweisOderFrisch, fremdeSpiegelPanes } from './sessions';
-import { RemotePoller } from './remote';
+import { RemotePoller, type RemoteSnapshot } from './remote';
+import {
+  gastArgv, parseGastListe, parseGastVorschau, vorschauInhalt, istEigeneGastSitzung, type GastQuelle,
+} from './gasttor';
 import { ampelFuerMaschine, parseRepoStand, repoStandLokal, AmpelStand, RepoStand } from './ampel';
 import { BudgetPoller } from './budget';
 import { AufgabenQuelle, aufgabenOptionenAusUmgebung } from './aufgaben';
@@ -47,7 +51,7 @@ import { DE as TEXTE_DE, EN as TEXTE_EN } from '../einstellungen/texte';
 import { DE as SITZ_TEXTE_DE, EN as SITZ_TEXTE_EN } from '../sitzung/texte';
 import { DE as ERST_TEXTE_DE, EN as ERST_TEXTE_EN } from '../erststart/texte';
 import { DE as VERB_TEXTE_DE, EN as VERB_TEXTE_EN } from '../verbrauch/texte';
-import { startBefund, kurzfassung } from './startprotokoll';
+import { startBefund, kurzfassung, programmFehlt } from './startprotokoll';
 import { Sitzungsfenster, sitzungsZeilen, type SitzungsDaten } from './sitzungsfenster';
 import { Chatbuehne } from './chatbuehne';
 import { Chatwache } from './chatwache';
@@ -63,7 +67,7 @@ import { listFiles, readFileSafe, writeFileSafe, sendSelectionToOrchestrator, st
 // Die Chat-Ansicht (SPEC-V4 Abschnitt 6) haengt mit genau diesen zwei Namen am
 // Hauptprozess: die Anfrage wird aus dem Sessionmodell gebaut, der Stand daraus
 // gelesen. Alles Weitere steht in chatquelle.ts und app/src/chat/.
-import { anfrageFuerPane, chatFaehigkeit, chatStand } from './chatquelle';
+import { anfrageFuerPane, chatFaehigkeit, chatStand, mobileUebersteuerung } from './chatquelle';
 import { oeffnungBestimmen, pfadeAufloesen } from './chatpfade';
 // Die Aufloesungsregel der Chat-Ansicht steht an EINER Stelle (chat/ansichtsregel.ts)
 // und wird hier fuer den Menuepunkt gefragt -- dieselbe Funktion, die auch
@@ -73,21 +77,39 @@ import { listDir, isExcluded, EintragInfo } from './folder';
 import { leseAktivitaet, leseInhalt, leseDiffFuerEintrag, leseAuftragFuerErgebnis, AktivitaetEintrag } from './aktivitaet';
 import { sucheInhalt, Treffer } from './suche';
 import { protokollListe, protokollLesen } from './protokolle';
-import { readGuardLog, GuardLogGruppe } from './freigaben';
+import { readGuardLog, GuardLogGruppe, NurBeiAenderung, modellVergleichsform } from './freigaben';
 // Die mittlere Stufe (Muster-Erkennung riskanter Befehle): erteilen und
 // verweigern liegen in freigaben.ts, hier steht nur die Verdrahtung.
 import { freigabeErteilen, freigabeVerweigern, type FreigabeErgebnis } from './freigaben';
 import { startDateiWaechter, type DateiWaechterHandle } from './dateiwaechter';
 import {
   zahlAus, schalterAus, maschinenliste, maschinenAktiv, maschinenPausiert, sprache, erststartErledigt, chatAnsicht, chatAnsichtVorgabe,
-  alleEinstellungen, systemSpracheSetzen, workerTransport,
+  alleEinstellungen, systemSpracheSetzen, workerTransport, mobilServerAn,
 } from './einstellungen';
 // Farben durchreichen (11.08.): das Einstellungsfenster wendet Thema und
 // Zustandsfarben schon auf sich selbst an (einstellungen.ts, `themaAnwenden`);
 // die uebrigen Fenster ziehen ueber diese eine Stelle nach. Die Kontrastrechnung
 // steht in thema.ts, ohne 'electron' -- hier wird nur noch `nativeTheme` angereicht.
 import { themaPayload } from './thema';
+import type { Herkunftsbeleg } from './herkunft';
+// DIE MOBILE WERKBANK (Paket 10): ein Baustein, der die Pakete 2 bis 8 zusammensetzt;
+// hier stehen nur die Kernfunktionen, die er bekommt, und sein Lebenslauf.
+import { claudeAufnahme, claudeEingabeRiegel, mobilDialogeRegistrieren, mobilDienstBauen, mobilTastenSenden, paneWriteUeber, type MobilDialogRouten, type MobilDienst, type MobilEingabeRiegel } from './mobile/kern';
+import { mobilAblehnung } from './mobile/adapters/chat';
+import { ergebnisDateiZaehlen } from './mobile/push/dringend';
+import type { MobileRouteRequest } from './mobile/http/server';
+import type { MobileSessionRecord } from './mobile/adapters/sessions';
+import { MobileAuthError } from './mobile/auth/auth';
+// Paket 6: die gemessenen Harnessdialoge. `dialogs/index.ts` ist der eine
+// Einstieg (Claude und OpenCode); `claude.ts` liefert zusaetzlich den Leser, mit
+// dem der Takt einen offenen Dialog erkennt, ohne eine Sitzung aufzuloesen.
+import { createDialogHandlers, MEASURED_DIALOG_CAPABILITIES } from './mobile/dialogs';
+import type { AllDialogsForMobile } from './mobile/dialogs';
+import { parseClaudeDialog } from './mobile/dialogs/claude';
+import type { ClaudePaneSnapshot } from './mobile/dialogs/claude';
+import type { MobileDialogSession, OpenCodeDialogConnection } from './mobile/dialogs/opencode';
 import { schluesselSetzenFuerAnbieter, schluesselStatusAlle } from './schluesselbund';
+import { HarnessUpdateScheduler } from './harnessupdate';
 
 // KEIN FENSTER FUER EINEN FEHLER, DEN NIEMAND ERWARTET HAT (Auftrag 2026-08-19).
 //
@@ -412,7 +434,41 @@ const remotePoller = new RemotePoller({
   relHygieneStatus: relative(homedir(), config.hygieneStatusFile),
   relAbsturzLog: relative(homedir(), join(config.stateDir, ABSTURZ_FERN_LOG_NAME)),
 });
+// GAST-TOR-QUELLEN (27.09.2026, gasttor.ts): ferne Sitzungen, die nur ueber
+// `wb-gast-tor` erreichbar sind. Ein zweiter Poller derselben Bauart, aber mit
+// `liste --json` statt Fernskript. Ein Name, den schon die Maschinenliste oder
+// diese Maschine traegt, faellt heraus -- eine Kennung darf nicht zwei Wege haben.
+const gastQuellen: GastQuelle[] = config.gastQuellen.filter((q) => {
+  const doppelt = q.name === config.machine || config.remoteMachines.includes(q.name);
+  if (doppelt) process.stderr.write(`Gast-Quelle '${q.name}' uebergangen: der Name ist schon eine Maschine\n`);
+  return !doppelt;
+});
+for (const f of config.gastQuellenFehler) process.stderr.write(`Gast-Quelle verworfen: ${f}\n`);
+function gastQuelleVon(machine: string): GastQuelle | undefined {
+  return machine ? gastQuellen.find((q) => q.name === machine) : undefined;
+}
+const gastPoller = new RemotePoller({
+  hosts: gastQuellen.map((q) => q.name),
+  intervalMs: config.remotePollMs,
+  timeoutMs: config.remoteTimeoutMs,
+  relSessionsDir: '',
+  relTestsuiteStatus: '',
+  relHygieneStatus: '',
+  befehlFuer: (h) => gastArgv(gastQuelleVon(h)!, ['liste', '--json'], { sshBin: config.gastSshBin }),
+  auswerten: parseGastListe,
+});
+/** Alle fernen Staende: Maschinen UND Gast-Quellen -- fuer Leiste, Erreichbarkeit und Spur. */
+function fernStaende(): RemoteSnapshot[] {
+  return [...remotePoller.snapshots(), ...gastPoller.snapshots()];
+}
 const budgetPoller = new BudgetPoller({ intervalMs: config.budgetPollMs, timeoutMs: config.budgetTimeoutMs, bin: config.budgetBin });
+const harnessUpdateScheduler = new HarnessUpdateScheduler({
+  settingsFile: config.settingsFile,
+  melden: (text) => melde(text),
+  aktualisiert: () => anFenster(
+    einstellungsfenster.aktuell(), 'awb:ein-daten-neu', () => einstellungenDatenJetzt(),
+  ),
+});
 // DER TAB „AGENTS" (aufgaben.ts, welten.ts): eigener Kanal `awb:aufgaben` mit den
 // Welten und der Fusszeile des Traegers, im Zwei-Sekunden-Takt, solange eine
 // Oberflaeche ihn zeigt; die Handlungen als `welt:<handlung> <JSON>` -- beides
@@ -420,10 +476,17 @@ const budgetPoller = new BudgetPoller({ intervalMs: config.budgetPollMs, timeout
 const aufgabenQuelle = new AufgabenQuelle({
   ...aufgabenOptionenAusUmgebung(process.env, homedir(), config),
   sitzungen: () => sessions,
-  aufNeu: (p) => anOberflaeche('awb:aufgaben', p),
+  aufNeu: (p, geaendert) => {
+    anOberflaeche('awb:aufgaben', p);
+    // Der Herzschlag und das erzwungene Senden sind keine Aenderung: ein Mobilgeraet holt sonst alle 30 s den ganzen Stand neu.
+    if (geaendert) mobil?.agentsGeaendert();
+  },
 });
 ipc.handle('awb:aufgaben-daten', () => aufgabenQuelle.aktuell());
-ipc.handle('awb:aufgabe', (_e, befehl: unknown, opt: unknown) => aufgabenQuelle.ausfuehren(String(befehl ?? ''), 'oberflaeche', opt));
+// Der Beleg entsteht HIER aus `opt.echt` (isTrusted des Klicks); was der Renderer sonst in
+// `opt` mitschickt, kann keinen Mobilbeleg vortaeuschen (herkunft.ts, WeakSet).
+ipc.handle('awb:aufgabe', (_e, befehl: unknown, opt: unknown) => aufgabenQuelle.ausfuehren(String(befehl ?? ''),
+  { art: 'oberflaeche', echt: (opt as { echt?: unknown } | null)?.echt === true }, opt));
 // Ob eine Oberflaeche die Ansicht zeigt: dann taktet der Kern schnell, sonst langsam (Befund M4).
 ipc.on('awb:aufgaben-sichtbar', (_e, an: unknown) => aufgabenQuelle.sichtbarSetzen(an === true));
 // Auftrag agentsform (16.09.2026): „Neue Welt in einem Projektordner" waehlt den Ordner im Dialog des
@@ -665,9 +728,25 @@ let rendererReady = false;
 let sessions: SessionInfo[] = [];
 /** V20: die Freigabe-Ansicht, aus denselben Zustandsdateien wie alles andere. */
 let freigaben: { requests: RequestEntry[]; guardBlocks: GuardBlockEntry[]; guardLog: GuardLogGruppe[] } = { requests: [], guardBlocks: [], guardLog: [] };
+/** `awb:freigaben` nur bei Aenderung -- siehe `NurBeiAenderung` in freigaben.ts. */
+const freigabenGesendet = new NurBeiAenderung();
+/**
+ * `awb:model` aus dem 2-s-Takt nur bei Aenderung (09.10.2026, Auftrag perf-kern): gemessen 192 KB
+ * je Nachricht, von denen sich im Leerlauf nur Zeitzaehler aenderten. Verglichen wird die Form aus
+ * `modellVergleichsform`; spaetestens nach 30 s geht der Stand trotzdem hinaus. Nur der Takt filtert --
+ * jeder andere Aufrufer von `modellSenden()` sendet wie bisher und merkt sich den Stand.
+ */
+const MODELL_AUFFRISCHEN_MS = 30_000;
+const modellGesendet = new NurBeiAenderung(modellVergleichsform, MODELL_AUFFRISCHEN_MS);
+/** Der mobile Dienst (Paket 10), solange er laeuft; `mobilSchalten()` setzt ihn. */
+let mobil: MobilDienst | null = null;
 let streamPane = '';
 /** Zuletzt vom Renderer gemeldete Zeichenflaeche in Spalten und Zeilen. */
 let flaeche: { cols: number; rows: number } | null = null;
+// The surface reports terminal cells after subtracting gaps of its current
+// free tile grid. Keep that grid's width so the next capacity calculation can
+// account for the gap before deciding whether another column fits.
+let freieTabSpalten = 1;
 /**
  * Steht rechts ein Blatt des Inspektors offen? Der Renderer meldet es, sobald
  * es sich aendert. Gebraucht in `kapazitaet()`: ein offenes Blatt nimmt der
@@ -858,6 +937,10 @@ function neuerWaechter(): { p: Promise<void>; melden: () => void } {
 let waechter = neuerWaechter();
 ipc.on('awb:ready', () => {
   rendererReady = true;
+  freigabenGesendet.vergessen();
+  modellGesendet.vergessen();
+  // Ein frisch geladener Renderer bekommt den Stand der Agents gleich, nicht erst mit dem naechsten Herzschlag.
+  aufgabenQuelle.erzwingen();
   waechter.melden();
 });
 
@@ -961,7 +1044,7 @@ async function rendererZurueck(frist = RENDERER_RUECKKEHR_MS): Promise<void> {
  */
 function erreichbareMaschinen(): string[] {
   const extra = (process.env.AWB_REACHABLE ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-  const fern = remotePoller.snapshots().filter((s) => s.reachable).map((s) => s.machine);
+  const fern = fernStaende().filter((s) => s.reachable).map((s) => s.machine);
   return [config.machine, ...extra, ...fern];
 }
 
@@ -1043,7 +1126,7 @@ function modellLesen(): SessionInfo[] {
     stallSeconds: stallSekundenJetzt(),
     guardBlocksDir: config.guardBlocksDir,
     modelsFile: config.modelsFile,
-    remoteSnapshots: remotePoller.snapshots(),
+    remoteSnapshots: fernStaende(),
     verlorene: lebensspur.verlorene(),
   });
   tmuxBefundMelden({ ausfuehrbar: befund.tmuxAusfuehrbar, fehler: befund.tmuxFehler });
@@ -1059,7 +1142,7 @@ function modellLesen(): SessionInfo[] {
   // (erster Takt, die SSH-Antwort ist noch unterwegs), ist ausdruecklich NICHT
   // einsehbar; sonst faellt jede ferne Sitzung schon im ersten Takt aus der
   // Spur und ein ferner Verlust liesse sich nie mehr melden.
-  const fernErreichbar = new Map(remotePoller.snapshots().map((s) => [s.machine, s.reachable]));
+  const fernErreichbar = new Map(fernStaende().map((s) => [s.machine, s.reachable]));
   const verloreneJetzt = lebensspur.durchgang(befund.sessions, (maschine) => (
     !maschine || maschine === config.machine
       ? befund.tmuxAusfuehrbar
@@ -1076,6 +1159,8 @@ function modellLesen(): SessionInfo[] {
       meldungsEinstellungen(config.settingsFile),
       STANDARD_WEGE,
     );
+    // Derselbe Waechter, ein weiterer Sendeweg (Spezifikation 6: `session.lost`).
+    if (verlorene) mobil?.melden('session.lost', mobilId(verlorene), 'verloren');
   });
   // DAS AUFRAEUMEN DER SITZUNGS-UEBERSTEUERUNGEN (12.08.): eine Sitzung, die es
   // nicht mehr gibt, nimmt ihren Eintrag in ui.json mit. Geschrieben wird nur,
@@ -1136,6 +1221,22 @@ function befehlsUmgebung(): BefehlsUmgebung {
     // wenn `wb-code` abbrach.
     startVerlauf: (phase, info) => startVerlaufEintragen(phase, info),
   };
+}
+
+/**
+ * A local, detached inventory pass when the application core starts. It is
+ * intentionally the same public command used by wb-code and harness updates:
+ * no model is contacted, and --if-stale makes ordinary starts cheap while the
+ * wb-state identity check still notices a replaced CLI immediately.
+ */
+function modellDiscoveryStarten(): void {
+  const kind = spawn(
+    befehlsUmgebung().wbStateBin,
+    ['models', 'discover', '--all', '--if-stale'],
+    { detached: true, stdio: 'ignore' },
+  );
+  kind.once('error', (e) => process.stderr.write(`Modell-Discover nicht gestartet: ${e.message}\n`));
+  kind.unref();
 }
 
 /**
@@ -1233,6 +1334,50 @@ async function planSofort(plan: Plan): Promise<void> {
 }
 
 /**
+ * DIE MENSCHENPROBE MIT GRUND (14.10.2026). `wb-mensch pruefen` entscheidet wie
+ * bisher; lehnt es ab, holt `wb-mensch beleg` den Grund, damit der Mensch sieht,
+ * WARUM sein Klick nicht zaehlte ("Freigabe nicht als Mensch erkannt: <Grund>"),
+ * statt still den Deckel zu bekommen. Seit M2 an die echte Werkbank gebunden ist
+ * (Kern-Electron im festen Kernordner unter der installierten App bzw. systemd
+ * --user), faellt M2 etwa fuer ein Dev-Buendel oder einen Worktree-Kern weg --
+ * gewollt, aber nie unsichtbar. Die Oberflaeche verhindert dadurch keinen Start,
+ * sie warnt.
+ *
+ * `abgeloest`: das Kind laeuft mit `detached: true`, also in einer neuen Sitzung
+ * OHNE steuerndes Terminal. Belegt die Probe den Menschen nur ueber M1 (die App
+ * wurde aus einem Terminal gestartet, etwa auf peer), sieht `wb-code` im Kind
+ * kein Terminal mehr und braeche ab; dann geht `--mensch` nicht mit, und es wird
+ * gesagt. Liefert `beleg` nichts Lesbares (Attrappen der Suiten), bleibt es beim
+ * Ergebnis von `pruefen`.
+ */
+function menschProbe(abgeloest: boolean): { ok: boolean; grund: string } {
+  const env = { ...process.env, WB_MENSCH_QUELLE: 'oberflaeche', WB_APP_PID: String(process.pid) };
+  const probe = spawnSync(config.wbMenschBin, ['pruefen'], { env, timeout: 5000 });
+  const beleg = (): string[] => {
+    const b = spawnSync(config.wbMenschBin, ['beleg'], { env, timeout: 5000, encoding: 'utf8' });
+    const zeile = String(b.stdout ?? '').split('\n')[0] ?? '';
+    const tab = zeile.indexOf('\t');
+    return tab < 0 ? [zeile.trim(), ''] : [zeile.slice(0, tab), zeile.slice(tab + 1).trim()];
+  };
+  if (probe.status === 0) {
+    if (!abgeloest) return { ok: true, grund: '' };
+    const [art, grund] = beleg();
+    if (art === 'mensch' && grund.includes('(M1)')) {
+      return { ok: false, grund: 'nur das steuernde Terminal belegt den Menschen (M1), und der abgeloeste Start hat keines;'
+        + ' die Oberflaeche (M2) gilt nur fuer die installierte Werkbank.' };
+    }
+    return { ok: true, grund: '' };
+  }
+  const [art, grund] = beleg();
+  return { ok: false, grund: (art === 'agent' && grund) ? grund : (probe.error ? `wb-mensch nicht ausfuehrbar (${probe.error.message})` : 'wb-mensch lieferte keinen Grund') };
+}
+
+/** Der sichtbare Satz zu einer abgelehnten Menschenprobe. */
+function menschNichtErkannt(grund: string): string {
+  return `Freigabe nicht als Mensch erkannt: ${grund}`;
+}
+
+/**
  * V14: startet eine wirklich tote Session neu (Knopf statt Handarbeit mit
  * `wb-code --resume`). Prueft GEGEN DEN AKTUELLEN Stand, nicht gegen das, was
  * die Oberflaeche im Klickmoment zeigte -- ein Klick, der Sekunden vorher
@@ -1245,6 +1390,9 @@ async function planSofort(plan: Plan): Promise<void> {
 function sessionWiederherstellen(id: string, mensch = false): { command: string; conversation: string; conversationReason: string } {
   const s = sessions.find((x) => x.id === id);
   if (!s) throw new Error(`unbekannte Session: ${id}`);
+  if (gastQuelleVon(s.machine)) {
+    throw new Error(`„${s.name}“ liegt hinter dem Gast-Tor von ${s.machine} -- Fortsetzen gibt es dort nicht; eine neue Sitzung startet „Neue Sitzung“.`);
+  }
   if (!darfWiederherstellen(s)) throw new Error(`Session '${s.name}' ist nicht (mehr) im Zustand 'stopped' -- keine Wiederherstellung.`);
   // Ob das `wb-code`, das gleich laeuft, `--kontext` kennt -- oertlich das
   // eigene, fern das der Zielmaschine, ueber denselben ssh-Weg wie beim
@@ -1285,17 +1433,17 @@ function sessionWiederherstellen(id: string, mensch = false): { command: string;
   // Wiederholen, das daran scheitert, waere schlimmer als der Deckel.
   const menschUmgebungR: Record<string, string> = {};
   const cmdArgs = [...cmd.args];
+  let menschHinweisR = '';
   if (mensch && s.machine === config.machine) {
-    const probeUmgebung = {
-      ...process.env,
-      WB_MENSCH_QUELLE: 'oberflaeche',
-      WB_APP_PID: String(process.pid),
-    };
-    const probe = spawnSync(config.wbMenschBin, ['pruefen'], { env: probeUmgebung, timeout: 5000 });
-    if (probe.status === 0) {
+    const probe = menschProbe(true);
+    if (probe.ok) {
       cmdArgs.push('--mensch');
       menschUmgebungR.WB_MENSCH_QUELLE = 'oberflaeche';
       menschUmgebungR.WB_APP_PID = String(process.pid);
+    } else {
+      // Bis 14.10. still: das Fortsetzen lief ohne `--mensch`, und niemand sah warum.
+      menschHinweisR = `${menschNichtErkannt(probe.grund)} -- fuer dieses Fortsetzen gilt der Effort-Deckel.`;
+      process.stderr.write(`revive '${s.name}': ${menschHinweisR}\n`);
     }
   }
   const startUmgebung = { ...process.env, WB_EIGENTUEMER_WERKBANK: String(process.pid), ...menschUmgebungR };
@@ -1309,6 +1457,7 @@ function sessionWiederherstellen(id: string, mensch = false): { command: string;
   } catch (e) {
     process.stderr.write(`Fortsetzen: kein Protokoll moeglich (${(e as Error).message}) -- Start ohne Mitschrift.\n`);
     kind = spawn(cmd.bin, cmdArgs, { stdio: 'ignore', detached: true, env: startUmgebung });
+    startFehlerOhr(kind, s.dir, startKey, s.sessionKey);
     kind.once('exit', () => { laufendeStarts.delete(startKey); });
   }
   kind.unref();
@@ -1317,7 +1466,10 @@ function sessionWiederherstellen(id: string, mensch = false): { command: string;
   // zurueckkommt, darf er nicht erst am Pane merken.
   process.stderr.write(`revive '${s.name}' (Harness ${s.harness}): ${cmd.conversationReason}\n`);
   // cmdArgs statt cmd.args: was gemeldet wird, muss das sein, was wirklich lief -- mit --mensch, wenn es mitging.
-  return { command: `${cmd.bin} ${cmdArgs.join(' ')}`, conversation: cmd.conversation, conversationReason: cmd.conversationReason };
+  return {
+    command: `${cmd.bin} ${cmdArgs.join(' ')}`, conversation: cmd.conversation,
+    conversationReason: menschHinweisR ? `${cmd.conversationReason}\n\n${menschHinweisR}` : cmd.conversationReason,
+  };
 }
 
 /**
@@ -1554,6 +1706,15 @@ function neuerSitzungsschluessel(dir: string, machine: string): { key: string; f
  */
 function fernOrdnerPruefen(machine: string, pfad: string): { ok: boolean; meldung: string } {
   const ziel = (pfad || '').trim();
+  if (gastQuelleVon(machine)) {
+    // Das Tor prueft keine Pfade, es kennt nur freigegebene Projekte -- dieselbe
+    // Antwort, die `neu` spaeter gaebe, hier vorweg.
+    const frei = gastPoller.snapshots().find((x) => x.machine === machine)?.gast?.projekte ?? [];
+    const passt = !ziel || frei.some((p) => p === ziel || basename(p) === ziel);
+    return passt
+      ? { ok: true, meldung: `Freigegeben auf '${machine}': ${ziel || frei[0] || '(erstes Projekt)'}` }
+      : { ok: false, meldung: `Auf '${machine}' ist nur freigegeben: ${frei.map((p) => basename(p)).join(', ') || '(noch keine Antwort des Tors)'}` };
+  }
   if (!ziel.startsWith('/')) {
     return { ok: false, meldung: `Auf '${machine}' wird ein absoluter Pfad gebraucht: ${ziel || '(leer)'}` };
   }
@@ -1615,6 +1776,27 @@ function harmlosesArgument(wert: string): boolean {
  * das scheitert ohne Terminal immer. Entschieden wird an der Marke im
  * Protokoll, siehe startprotokoll.ts.
  */
+function startFehlerOhr(
+  kind: ReturnType<typeof spawn>,
+  ort: string,
+  schluessel: string,
+  sitzungsSchluessel: string,
+  protokollPfad = '',
+): void {
+  // EIN FEHLENDES PROGRAMM BEENDET NIE DEN HAUPTPROZESS (27.09.2026, Laptop eines
+  // zweiten Nutzers: "Error: spawn wb-code ENOENT" als uncaughtException). 'exit' kommt
+  // in diesem Fall nicht, also raeumt dieses Ohr den laufenden Start selbst ab
+  // und sagt im Sitzungsfenster, was fehlt.
+  kind.once('error', (fehler: NodeJS.ErrnoException) => {
+    laufendeStarts.delete(schluessel);
+    const satz = programmFehlt(kind.spawnfile || 'wb-code', fehler) ?? fehler.message;
+    gescheiterteStarts.set(schluessel, {
+      key: sitzungsSchluessel, kurz: satz, protokoll: protokollPfad, zeit: Date.now(),
+    });
+    startFehlschlagMelden({ ort, kurz: satz, grund: satz, protokoll: protokollPfad });
+  });
+}
+
 function startGrundBeobachten(
   kind: ReturnType<typeof spawn>,
   protokollPfad: string,
@@ -1622,6 +1804,7 @@ function startGrundBeobachten(
   schluessel: string,
   sitzungsSchluessel: string,
 ): void {
+  startFehlerOhr(kind, ort, schluessel, sitzungsSchluessel, protokollPfad);
   kind.once('exit', () => {
     // Der Startvorgang ist beendet, wie auch immer er ausging: die Zeile in der
     // Liste soll ab jetzt nicht mehr „startet" sagen.
@@ -1741,6 +1924,8 @@ function sessionAnlegen(
   wahl?: SitzungsWahl,
   mensch = false,
 ): { gestartet: boolean; meldung: string; command: string } {
+  const gq = gastQuelleVon(machine);
+  if (gq) return gastSitzungAnlegen(gq, dir, name, wahl);
   const pfad = (dir || '').trim();
   if (!pfad) throw new Error('Feld dir fehlt');
   const fern = machine !== config.machine;
@@ -1893,14 +2078,10 @@ function sessionAnlegen(
   // anderen Maschine, und dieses Programm ist dort kein Vorfahre von irgendwas.
   const menschUmgebung: Record<string, string> = {};
   let menschBeleg = '';
+  let menschGrund = '';
   if (mensch && !fern) {
-    const probeUmgebung = {
-      ...process.env,
-      WB_MENSCH_QUELLE: 'oberflaeche',
-      WB_APP_PID: String(process.pid),
-    };
-    const probe = spawnSync(config.wbMenschBin, ['pruefen'], { env: probeUmgebung, timeout: 5000 });
-    if (probe.status === 0) {
+    const probe = menschProbe(true);
+    if (probe.ok) {
       args.push('--mensch');
       menschUmgebung.WB_MENSCH_QUELLE = 'oberflaeche';
       menschUmgebung.WB_APP_PID = String(process.pid);
@@ -1909,6 +2090,8 @@ function sessionAnlegen(
       // Kein Abbruch: ohne das Flag startet derselbe Aufruf normal, dann greift der Deckel.
       // Gesagt wird es trotzdem, sonst bekaeme er still weniger, als er gewaehlt hat.
       menschBeleg = 'kein-mensch';
+      menschGrund = probe.grund;
+      process.stderr.write(`Sitzungsstart in ${ort}: ${menschNichtErkannt(menschGrund)}\n`);
     }
   }
   let bin: string; let kindArgs: string[];
@@ -1917,6 +2100,17 @@ function sessionAnlegen(
     bin = b; kindArgs = rest;
   } else {
     bin = config.wbCodeBin; kindArgs = args;
+    // VORHER GEFRAGT, NICHT ERST AM ABSTURZ GEMERKT (27.09.2026): fehlt das
+    // Werkzeug hier, sagt es die Antwort sofort -- das Ohr in startFehlerOhr
+    // bleibt fuer den Fall, dass es zwischen Probe und Start verschwindet.
+    if (!(bin.includes('/') ? existsSync(bin) : findetWerkzeug(bin))) {
+      laufendeStarts.delete(startKey);
+      gestarteteOrdner.delete(schutzSchluessel);
+      const satz = programmFehlt(bin, { code: 'ENOENT' })!;
+      process.stderr.write(`Sitzungsstart in ${ort} GESCHEITERT -- ${satz}\n`);
+      anFenster(sitzungsfenster.aktuell(), 'awb:sitz-startfehler', { ort, kurz: satz, grund: satz, protokoll: '' });
+      return { gestartet: false, meldung: satz, command: '' };
+    }
   }
   // NICHT MEHR `stdio: 'ignore'` (21.08.2026). Genau daran ist des Nutzers
   // 256k-Sitzung unsichtbar gescheitert: `wb-code` schrieb den vollstaendigen
@@ -1962,6 +2156,7 @@ function sessionAnlegen(
     // anlegen, startet die Sitzung wie bisher -- nur eben wieder stumm.
     process.stderr.write(`Sitzungsstart: kein Protokoll moeglich (${(e as Error).message}) -- Start ohne Mitschrift.\n`);
     kind = spawn(bin, kindArgs, { stdio: 'ignore', detached: true, env: startUmgebung });
+    startFehlerOhr(kind, ort0, startKey, key);
     // Ohne Protokoll gibt es keinen Grund zu zeigen -- dass der Start VORBEI
     // ist, laesst sich trotzdem sagen, und die Zeile darf nicht ewig „startet"
     // behaupten.
@@ -1980,8 +2175,8 @@ function sessionAnlegen(
     // Auch das wird gesagt und nicht verschwiegen: sonst liefe die Sitzung mit einer
     // niedrigeren Denkstufe, als im Fenster stand, und niemand wuesste warum.
     + (menschBeleg === 'kein-mensch'
-      ? ' Der Klick zaehlte NICHT als Mensch (wb-mensch hat die Probe abgelehnt) --'
-        + ' fuer diesen Start gilt deshalb der Effort-Deckel. Diagnose: wb-mensch beleg.'
+      ? ` ${menschNichtErkannt(menschGrund)} -- fuer diesen Start gilt deshalb der Effort-Deckel.`
+        + ' Diagnose: wb-mensch beleg.'
       : '');
   return { gestartet: true, meldung, command: `${bin} ${kindArgs.join(' ')}` };
 }
@@ -1995,7 +2190,7 @@ function freigabenAktualisieren(): void {
     // nicht nur der Momentanwert des laufenden Blocks (das ist guardBlocks).
     guardLog: readGuardLog(config.guardLogFile),
   };
-  anOberflaeche('awb:freigaben', freigaben);
+  if (freigabenGesendet.geaendert(freigaben)) anOberflaeche('awb:freigaben', freigaben);
   // Benachrichtigung 'freigabeWartet': beide Quellen zaehlen (Antrag UND
   // wartende Rueckfrage), ueber eigene Vorsilben getrennt, damit derselbe
   // Schluessel nie aus zwei verschiedenen Anlaessen kommen kann.
@@ -2003,9 +2198,12 @@ function freigabenAktualisieren(): void {
     ...freigaben.requests.map((r) => `antrag:${r.path}`),
     ...freigaben.guardBlocks.filter((b) => b.wartet).map((b) => `rueckfrage:${b.schluessel || b.path}`),
   ];
-  meldungFreigabe.neue(wartendeSchluessel).forEach(() => {
+  meldungFreigabe.neue(wartendeSchluessel).forEach((schluessel) => {
     melden('freigabeWartet', 'Eine Freigabe wartet auf Entscheidung.', meldungsEinstellungen(config.settingsFile), STANDARD_WEGE);
+    // `command.blocked`: das Ziel ist ein Hash des Schluessels -- kein Pfad und kein Befehl verlaesst den Kern.
+    mobil?.melden('command.blocked', createHash('sha256').update(schluessel).digest('hex').slice(0, 24), schluessel);
   });
+  mobil?.freigabenGesehen(wartendeSchluessel);
 }
 
 /**
@@ -2018,14 +2216,16 @@ function musterEntscheiden(
   schluessel: string,
   aktion: 'approve' | 'reject',
   grund: string,
-  mensch = false,
+  // Der typisierte Herkunftsbeleg (herkunft.ts); ohne Angabe ein Weg ohne Nachweis.
+  beleg: Herkunftsbeleg = { art: 'steuerkanal' },
 ): FreigabeErgebnis {
   freigabenAktualisieren();
   const eintrag = freigaben.guardBlocks.find((b) => b.wartet && b.schluessel === schluessel);
   if (!eintrag) return { ok: false, output: 'Kein wartender Eintrag mit diesem Schluessel -- schon entschieden oder abgelaufen.' };
-  // `mensch` kommt aus `isTrusted` im Fenster und wird hier NICHT nachgebessert:
-  // die Vorgabe ist `false`, also gilt jeder Weg, der nichts sagt (Steuerkanal,
-  // ein Skript), als Agent. Ablehnen darf jeder -- es nimmt nichts weg.
+  // Der Beleg kommt aus `isTrusted` im Fenster (oder vom Mobile-Server) und wird
+  // hier NICHT nachgebessert: die Vorgabe ist der Steuerkanal, also gilt jeder
+  // Weg, der nichts sagt, als Agent. Ablehnen darf jeder -- es nimmt nichts weg.
+  // Annehmen entscheidet freigabeErteilen() am Beleg (ein Mobilbeleg: gesperrt).
   const ergebnis = aktion === 'approve'
     ? freigabeErteilen(eintrag, grund, config.askGrantTtlSeconds, {
       bin: config.wbFreigabeBin,
@@ -2033,7 +2233,7 @@ function musterEntscheiden(
       blocksDir: config.guardBlocksDir,
       logFile: config.guardLogFile,
       appPid: process.pid,
-    }, mensch)
+    }, beleg)
     : freigabeVerweigern(config.guardLogFile, eintrag, grund);
   freigabenAktualisieren();
   return ergebnis;
@@ -2188,6 +2388,17 @@ function ergebnissePruefen(): Ergebnis[] {
     gemeldeteErgebnisse.push(e);
     anOberflaeche('awb:ergebnis', e);
     melden('workerFertig', `Worker '${e.name}' ist fertig.`, meldungsEinstellungen(config.settingsFile), STANDARD_WEGE);
+    const traeger = sessions.find((s) => s.workers.some((w) => w.name === e.name));
+    // Zustandsabdruck ist die Ergebnisdatei selbst (ErgebnisWaechter meldet je Datei einmal).
+    // Fuer die feste Regel (mobile/push/dringend.ts) nur GEZAEHLT: Ergebnisstatus,
+    // offene Fragen an alice und die anderen laufenden Worker der Sitzung --
+    // kein Inhalt der Ergebnisdatei verlaesst diese Stelle.
+    if (traeger && mobil) {
+      mobil.melden('worker.done', mobilId(traeger), `${e.name}:${e.path}:${e.mtimeMs}`, {
+        ergebnis: ergebnisDateiZaehlen(e.path),
+        andereLaufend: traeger.workers.filter((w) => w.name !== e.name && w.state === 'running').length,
+      });
+    }
   }
   if (gemeldeteErgebnisse.length > 50) gemeldeteErgebnisse.splice(0, gemeldeteErgebnisse.length - 50);
   return neu;
@@ -2473,19 +2684,31 @@ function eigeneFensterJeWorker(): boolean {
  * Eine Ursache, zwei sichtbare Folgen.
  *
  * Gerechnet wird jetzt mit der Flaeche, die der Renderer zuletzt gemeldet hat —
- * derselbe Ausdruck, aus dem zehn Zeilen weiter unten die Kachelgroesse folgt.
+ * fuer freie Kacheln mit der Fugenreserve aus dem aktuellen Raster.
  * `attachState` bleibt als Rueckfall dahinter, damit ein Aufruf VOR der ersten
  * Meldung des Renderers (kopfloser Start, Tests) dieselbe Zahl bekommt wie
  * bisher.
  */
-function kapazitaet(): {
+function kapazitaet(frei = eigeneFensterJeWorker()): {
   perRow: number; perColumn: number; perTab: number; cappedBySetting: boolean; tabs: number; workerCount: number;
   spalten: number; zeilen: number;
 } {
   const cols = flaeche?.cols ?? attachState?.cols ?? config.ownedCols;
   const rows = flaeche?.rows ?? attachState?.rows ?? config.ownedRows;
+  const minCols = mindestbreiteFuerRechnung();
+  // With free tiles, the Mac surface subtracts a 4-point gap for every
+  // boundary before reporting `flaeche`. Near the width threshold, a one-column
+  // grid can report 160 cells and a two-column grid 159. Using either report
+  // directly for floor(cols / minCols) toggles between both grids forever.
+  // Budget one terminal cell per boundary, including boundaries of a proposed
+  // wider grid. Adding the boundaries already present in the reported grid
+  // makes the decision independent of the current shape. It also lets a real
+  // window enlargement cross the threshold without a timer or sticky layout.
+  const perRow = frei
+    ? Math.max(1, Math.floor((cols + Math.max(1, freieTabSpalten)) / (minCols + 1)))
+    : Math.max(1, Math.floor(cols / minCols));
   const k = capacity({
-    cols, rows, minCols: mindestbreiteFuerRechnung(), minRows: config.minPaneRows, maxPerTab: maxProTabJetzt(),
+    cols: perRow * minCols, rows, minCols, minRows: config.minPaneRows, maxPerTab: maxProTabJetzt(),
   });
   const s = gewaehlte();
   // Subagenten sind hier bewusst nicht dabei (V19).
@@ -2576,7 +2799,7 @@ function maschinenStand(sichtbar: SessionInfo[]): {
   alter: number; fehler: string; sitzungen: number; worker: number; pausiert: boolean;
 }[] {
   const jetzt = Date.now();
-  const schnappschuesse = new Map(remotePoller.snapshots().map((x) => [x.machine, x]));
+  const schnappschuesse = new Map(fernStaende().map((x) => [x.machine, x]));
   // EINE PAUSIERTE MASCHINE BLEIBT SICHTBAR (05.09.2026). Sie faellt aus der
   // Hostliste des Abrufs -- das ist ihre ganze Wirkung --, und damit waere sie
   // aus der Statusleiste verschwunden. Verschwinden hiesse aber, dass der
@@ -2591,7 +2814,7 @@ function maschinenStand(sichtbar: SessionInfo[]): {
   // Maschine ans Ende der Leiste, sobald man sie pausiert -- der Schalter
   // waere dann nicht mehr da, wo er eben noch war. Ein Name, den nur der
   // Abruf kennt (Testlauf mit AWB_REMOTE_MACHINES), haengt hinten an.
-  const fern = [...remotePoller.hostliste(), ...pausiert];
+  const fern = [...remotePoller.hostliste(), ...pausiert, ...gastPoller.hostliste()];
   const namen = [
     config.machine,
     ...eingetragen.filter((n) => fern.includes(n)),
@@ -2617,7 +2840,8 @@ function maschinenStand(sichtbar: SessionInfo[]): {
   });
 }
 
-function modellSenden(): void {
+/** @param nurBeiAenderung Nur der Kern-Takt setzt es: dann geht das Modell nur hinaus, wenn es sich geaendert hat. */
+function modellSenden(nurBeiAenderung = false): void {
   const z = ui.get();
   const s = gewaehlte();
   // EINMAL gefiltert und sortiert, danach zweimal benutzt: als `sessions` und
@@ -2625,7 +2849,7 @@ function modellSenden(): void {
   // `sichtbare()` zu rufen hiesse, zwei Listen zu haben, die nur zufaellig
   // dieselbe sind.
   const sichtbar = sichtbare(sessions);
-  anOberflaeche('awb:model', {
+  const modell = {
     sessions: mitReviveVorschau(sichtbar),
     all: sessions.length,
     ui: z,
@@ -2642,6 +2866,8 @@ function modellSenden(): void {
     // Dieselbe Bauart und derselbe Grund: die Zahl gehoert dem Menschen, wird
     // im Takt nachgelesen und wirkt sofort.
     scrollZeilen: zahlAus('terminalScrollLines', 1, 20, config.settingsFile),
+    // Bildrate der Agentenfiguren im Mac-Mantel (FigurUhr.swift), ebenso im Takt nachgelesen.
+    figurenBildrate: zahlAus('figurenBildrate', 10, 60, config.settingsFile),
     // `agentsBlattVorschau` stand hier bis zum 14.09.2026: der Schalter fuer das
     // Aufgaben-Blatt aus Fassung 26. Seit der Tab „Agents" die Welten zeigt
     // (Auftrag agentsui Nr. 6), gibt es nichts mehr freizuschalten; die
@@ -2723,7 +2949,13 @@ function modellSenden(): void {
     // eigenen Session immer, bei einer uebernommenen nur ohne fremden Client.
     mayArrange: s ? mayArrange(s) || (!!tmux && fremdeClients === 0) : false,
     fremdeClients,
-  });
+  };
+  if (nurBeiAenderung) {
+    if (!modellGesendet.geaendert(modell)) return;
+  } else {
+    modellGesendet.merken(modell);
+  }
+  anOberflaeche('awb:model', modell);
 }
 
 // --- tmux ------------------------------------------------------------------
@@ -2781,6 +3013,92 @@ function verbindungVerloren(maschine: string, grund: string): void {
 }
 
 /**
+ * DER WIEDERANLAUF EINES OERTLICHEN STEUERKANALS (11.10.2026, kern-steuerkanal).
+ *
+ * Reisst der `tmux -C` einer Sitzung auf DIESER Maschine ab -- beendet,
+ * umgebracht, Schreibweg zu --, laeuft die Sitzung in aller Regel weiter. Der
+ * Kern haengt sich dann selbst wieder an: wenige Versuche mit wachsendem
+ * Abstand, jeder im Kernlog und in der Oberflaeche gemeldet. Wer in der
+ * Zwischenzeit selbst anhaengt (ein Klick, ein reload), hat Vorrang: jedes
+ * `attachTmux` bricht den geplanten Versuch ab.
+ *
+ * Fern gilt das nicht: dort reisst eine LEITUNG, und `verbindungVerloren`
+ * raeumt die Buehne ehrlich ab, statt still nachzuwaehlen.
+ */
+const WIEDERANLAUF_ABSTAENDE_MS = (process.env.AWB_WIEDERANLAUF_MS ?? '500,1500,4000,10000')
+  .split(',').map((z) => Number(z)).filter((z) => Number.isFinite(z) && z >= 0);
+let wiederanlauf: { session: string; versuch: number; uhr: NodeJS.Timeout } | null = null;
+/** Laeuft gerade ein Anhaengen, das der Wiederanlauf selbst bestellt hat? */
+let imWiederanlauf = false;
+
+function wiederanlaufAbbrechen(): void {
+  if (imWiederanlauf) return;
+  if (wiederanlauf) clearTimeout(wiederanlauf.uhr);
+  wiederanlauf = null;
+}
+
+/** Ist diese Sitzung nach dem Modell bekannt tot? Unbekannt heisst: versuchen. */
+function sitzungBekanntTot(name: string): boolean {
+  const treffer = sessions.filter((s) => s.tmuxSession === name && (!s.machine || s.machine === config.machine));
+  return treffer.length > 0 && treffer.every((s) => !s.alive);
+}
+
+function steuerkanalAbgerissen(t: TmuxControl, sessionName: string, grund: string): void {
+  if (tmux !== t) return;
+  t.removeAllListeners();
+  // Wegwerfen, nicht abloesen: der Steuerclient ist weg oder unbrauchbar, es
+  // gibt niemanden, der ein Zurueckstellen beantworten wuerde.
+  t.aufgeben();
+  tmux = null;
+  ausgabeBuendel.abgeben();
+  darfGedaechtnisLeeren();
+  process.stderr.write(`Steuerkanal zu ${sessionName} abgerissen: ${grund}\n`);
+  attachError = `Steuerkanal abgerissen (${grund}) – verbinde neu`;
+  melde(`Die Verbindung zur Sitzung ist abgerissen (${grund}). Der Kern verbindet sich neu.`);
+  modellSenden();
+  wiederanlaufPlanen(sessionName, 1, grund);
+}
+
+function wiederanlaufPlanen(sessionName: string, versuch: number, grund: string): void {
+  if (wiederanlauf) clearTimeout(wiederanlauf.uhr);
+  wiederanlauf = null;
+  const anzahl = WIEDERANLAUF_ABSTAENDE_MS.length;
+  if (versuch > anzahl || sitzungBekanntTot(sessionName)) {
+    const warum = sitzungBekanntTot(sessionName) ? 'die Sitzung laeuft nicht mehr' : `${anzahl} Versuche gescheitert`;
+    attachError = `Steuerkanal zu ${sessionName} nicht wieder verbunden (${warum}): ${grund}`;
+    process.stderr.write(`${attachError}\n`);
+    melde(`Die Sitzung ließ sich nicht wieder verbinden (${warum}). Ein Klick auf die Sitzung versucht es erneut.`);
+    modellSenden();
+    return;
+  }
+  const uhr = setTimeout(() => {
+    void (async () => {
+      if (wiederanlauf?.uhr !== uhr) return;
+      wiederanlauf = null;
+      // Hat inzwischen jemand anderes angehaengt, ist nichts zu tun.
+      if (tmux) return;
+      process.stderr.write(`Steuerkanal: Wiederanlauf ${versuch}/${anzahl} zu ${sessionName}\n`);
+      imWiederanlauf = true;
+      try {
+        await attachTmux(sessionName, '').catch(() => undefined);
+      } finally {
+        imWiederanlauf = false;
+      }
+      if (tmux && !attachError) {
+        process.stderr.write(`Steuerkanal zu ${sessionName} wieder verbunden (Versuch ${versuch})\n`);
+        melde('Die Sitzung ist wieder verbunden.', 4000);
+        modellSenden();
+        return;
+      }
+      // Ein Klick waehrend des Versuchs hat einen eigenen Weg genommen.
+      if (wiederanlauf || tmux) return;
+      wiederanlaufPlanen(sessionName, versuch + 1, attachError ?? grund);
+    })();
+  }, WIEDERANLAUF_ABSTAENDE_MS[versuch - 1]);
+  wiederanlauf = { session: sessionName, versuch, uhr };
+}
+
+/**
  * @param maschine Leer = die Sitzung laeuft hier. Sonst der SSH-Alias der
  *                 Maschine, der sie gehoert; der Steuerkanal geht dann ueber
  *                 `fernAufruf` dorthin (tmux.ts).
@@ -2803,6 +3121,9 @@ function verbindungVerloren(maschine: string, grund: string): void {
  */
 let anhaengenLaeuft: Promise<void> = Promise.resolve();
 function attachTmux(sessionName: string, maschine = ''): Promise<void> {
+  // Wer anhaengt, hat entschieden: ein geplanter Wiederanlauf nach einem
+  // Abriss tritt dahinter zurueck (siehe `wiederanlaufPlanen`).
+  wiederanlaufAbbrechen();
   const dran = anhaengenLaeuft.then(() => attachTmuxJetzt(sessionName, maschine));
   // Die Reihe darf an einem Fehlschlag nicht abreissen: der Aufrufer bekommt
   // ihn, die Reihe laeuft weiter.
@@ -2811,6 +3132,8 @@ function attachTmux(sessionName: string, maschine = ''): Promise<void> {
 }
 
 async function attachTmuxJetzt(sessionName: string, maschine = ''): Promise<void> {
+  // Ein Terminal einer Gast-Tor-Sitzung endet mit jedem anderen Anhaengen.
+  gastBeenden();
   if (tmux) {
     // Erst die Zuhoerer weg, dann abloesen: das Abloesen feuert 'closed', und
     // der Zuhoerer aus dem vorigen Durchlauf haette sonst gerade den Fehler
@@ -2900,8 +3223,18 @@ async function attachTmuxJetzt(sessionName: string, maschine = ''): Promise<void
       // sagt die Leiste schon. Fern ist es die LEITUNG, die endet, waehrend die
       // Sitzung drueben weiterlaeuft; das ist ein anderer Satz und ein anderer
       // Umgang damit.
+      //
+      // UND OERTLICH WIRD NEU VERBUNDEN (11.10.2026, kern-steuerkanal). Bis
+      // dahin stand hier nur `attachError = 'Steuerclient beendet'`: die
+      // Sitzung lief weiter, der Kern hielt einen toten Kanal als `tmux`, und
+      // das Fenster blieb leer, bis jemand von Hand eine Sitzung waehlte --
+      // gemessen nach dem Neustart um 03:56 („Schreibweg gestoert", danach
+      // „write after end"). Lebt die Sitzung noch, haengt der Kern sich
+      // selbst wieder an, begrenzt und mit Meldung.
       if (!maschine) {
-        attachError = 'Steuerclient beendet';
+        if (tmux !== t) return; // eine abgeloeste Verbindung raeumt nichts mehr weg
+        const grund = signal ? `tmux -C endete durch ${signal}` : (t.fehlertext() || `tmux -C beendet mit Code ${code}`);
+        steuerkanalAbgerissen(t, sessionName, grund);
         return;
       }
       if (tmux !== t) return; // eine abgeloeste Verbindung raeumt nichts mehr weg
@@ -2932,7 +3265,15 @@ async function attachTmuxJetzt(sessionName: string, maschine = ''): Promise<void
     // Zeichnung schreibt (test-app-fenster-umbruch-naht.sh). Gezeichnet wird
     // deshalb in der Groesse, die tmux gerade hat; die eine richtige Zahl
     // kommt gleich darauf vom Renderer.
-    if (flaeche && streamPane) await paneZeigen(streamPane, false, false);
+    // Scheitert NUR dieses Zeichnen, bleibt der Kanal stehen (11.10.2026): er
+    // ist angehaengt und lebt, und die naechste Flaechenmeldung zeichnet neu.
+    // Vorher fiel ein Fehler hier in das `catch` unten, das `t` abloeste,
+    // waehrend `tmux` weiter auf genau diesen abgeloesten Kanal zeigte --
+    // verbunden-aber-leer. Ist der Kanal dabei gerissen, sagt das 'closed'.
+    if (flaeche && streamPane) {
+      await paneZeigen(streamPane, false, false).catch((e) =>
+        process.stderr.write(`Pane ${streamPane} beim Anhaengen nicht gezeichnet: ${(e as Error).message}\n`));
+    }
     if (maschine) {
       // DER UNTERSCHIED WIRD GESAGT, nicht versteckt. Er ist echt: jede Taste
       // und jedes Zeichen Ausgabe laeuft ueber die Leitung, und die kann enden.
@@ -2943,6 +3284,9 @@ async function attachTmuxJetzt(sessionName: string, maschine = ''): Promise<void
     attachError = maschine
       ? `Das Terminal der Sitzung auf ${maschine} ließ sich nicht öffnen: ${(e as Error).message}`
       : (e as Error).message;
+    // Nie einen abgeloesten Kanal als den gueltigen stehen lassen.
+    if (tmux === t) tmux = null;
+    t.removeAllListeners();
     await t.detach();
     if (maschine) {
       // Kein Bild der VORIGEN Sitzung stehenlassen -- es gehoert nicht zu der,
@@ -2966,11 +3310,54 @@ async function attachTmuxJetzt(sessionName: string, maschine = ''): Promise<void
  * Der Pane bekommt dabei die Groesse der Zeichenflaeche -- beim Wechsel zwischen
  * Orchestrator und Worker aendert sie sich, also wird jedes Mal neu gesetzt.
  */
-async function paneZeigen(paneId: string, zoomen = true, groesseSetzen = true): Promise<void> {
+function paneZeigen(paneId: string, zoomen = true, groesseSetzen = true): Promise<void> {
+  return nacheinander(() => paneZeigenJetzt(paneId, zoomen, groesseSetzen));
+}
+
+/**
+ * EINE ZEICHNUNG ZUR ZEIT, IN DER REIHENFOLGE DER ANFORDERUNGEN (14.10.2026,
+ * GL#43: test-app-tab-zweifenster.sh nur unter Last rot).
+ *
+ * DER BEFUND. Fall "7 Worker, ZWEI Fenster (6 + 1)": die Kacheln %1-%6 lagen
+ * auf 480 px, ihre Terminals blieben 20 s lang auf 96 Spalten = 720 px -- der
+ * Groesse aus dem Fall davor, sechs Worker in EINEM Fenster. `tabZeigen` und
+ * `paneZeigen` liefen bis heute nebeneinander: show-tab, der Flaechen-Durchgang
+ * (`flaecheSetzen`), der Abgleich (`lageAbgleichen`) und die Rueckblick-Uhr
+ * starteten je einen eigenen Lauf, und jeder stellt das Fenster mit einer
+ * Kette von tmux-Aufrufen. Eine Neuzeichnung der ALTEN Ansicht, die noch
+ * unterwegs war, als show-tab A,B kam, hat auf ihrem Weg ohne Kachel mehr
+ * Aufrufe vor dem `resize-window` (`aufteilungSetzen`, `leseFensterLage`) --
+ * ihre Fenstergroesse landete NACH der des neuen Aufrufs. Der neue las die
+ * Lage danach und zeichnete die fremden 96 Spalten; `lageAbgleichen` verglich
+ * "gezeichnet" gegen tmux, fand beides gleich und tat nichts mehr. Die
+ * Groesse, die die Kacheln verlangten, war damit verloren.
+ *
+ * Deshalb laufen alle Zeichnungen in EINER Kette: eine beginnt erst, wenn die
+ * vorige fertig ist, und die zuletzt angeforderte stellt zuletzt. Neuzeichnungen
+ * "der aktuellen Ansicht" lesen `ansicht` erst, wenn sie dran sind (siehe
+ * `ansichtZeichnen`, `flaecheSetzen`) -- eine Neuzeichnung, die vor einem
+ * show-tab angefordert wurde und danach dran ist, zeichnet dann die NEUE
+ * Ansicht und nicht die, die bei ihrer Anforderung galt. Haengen kann die
+ * Kette nicht: jeder tmux-Aufruf hat seine Frist (tmux.ts, BEFEHL_FRIST_MS),
+ * und ein Fehlschlag gibt die Kette fuer den naechsten frei.
+ *
+ * Aufrufe INNERHALB einer Zeichnung gehen an die `...Jetzt`-Fassungen, nie an
+ * die Kette -- sonst wartete eine Zeichnung auf sich selbst.
+ */
+let zeichenKette: Promise<unknown> = Promise.resolve();
+function nacheinander<T>(lauf: () => Promise<T>): Promise<T> {
+  const dran = zeichenKette.then(lauf, lauf);
+  zeichenKette = dran.catch(() => undefined);
+  return dran;
+}
+
+async function paneZeigenJetzt(paneId: string, zoomen = true, groesseSetzen = true): Promise<void> {
   if (PtyVerwaltung.istPty(paneId)) return ptyPaneZeigen(paneId);
+  if (gastAnsicht && !tmux) return gastPaneZeigen(paneId);
   if (!tmux) throw new Error('nicht angehaengt');
   streamPane = paneId;
   ansicht = { art: 'pane', pane: paneId };
+  freieTabSpalten = 1;
   // Ein einzelner Worker wird GEZOOMT gezeigt: nur so fuellt er die Flaeche,
   // auch wenn er im Fenster als eine Zeile von zweiundfuenfzig daliegt.
   //
@@ -3065,13 +3452,17 @@ async function ptyPaneZeigen(paneId: string): Promise<void> {
   if (!historieGesendet.has(paneId)) historieGesendet.add(paneId);
   gezeichneteLage = [{ paneId, cols, rows }];
   zuletztGezeichnet = Date.now();
+  // Gast-Tor: dieses Terminal zeigt einen echten Pane der fernen Sitzung (den gewaehlten oder,
+  // ohne Wahl, deren Orchestrator). Der Renderer braucht ihn, damit der Umschalter stimmt.
+  const g = gastAnsicht && gastAnsicht.pty === paneId ? gastAnsicht : null;
+  const stehtFuer = g ? (g.pane || modellLesen().find((x) => x.id === g.id)?.orchestratorPane || '') : '';
   lageSenden({
     art: 'pane',
     vorgegeben: flaecheVorgegeben,
     cols,
     rows,
     aktiv: paneId,
-    panes: [{ paneId, x: 0, y: 0, cols, rows }],
+    panes: [{ paneId, x: 0, y: 0, cols, rows, ...(stehtFuer ? { stehtFuer } : {}) }],
     inhalt: { [paneId]: inhalt },
     historie,
     maus: { [paneId]: { an: false, sgr: true } },
@@ -3120,10 +3511,15 @@ async function historieHolen(paneId: string, gezeigt: string[]): Promise<Record<
  * fehlt. Beide wollen dasselbe, und zwei Fassungen davon liefen frueher oder
  * spaeter auseinander.
  */
-async function ansichtZeichnen(): Promise<void> {
-  if (!tmux) return;
-  if (ansicht.art === 'tab') await tabZeigen(ansicht.panes);
-  else if (streamPane) await paneZeigen(streamPane, false);
+function ansichtZeichnen(): Promise<void> {
+  // `ansicht` wird gelesen, wenn die Zeichnung DRAN ist, nicht beim Anfordern
+  // (siehe `nacheinander`): sonst zoege eine Neuzeichnung, die hinter einem
+  // show-tab wartet, danach die alte Ansicht wieder hoch.
+  return nacheinander(async () => {
+    if (!tmux) return;
+    if (ansicht.art === 'tab') await tabZeigenJetzt(ansicht.panes);
+    else if (streamPane) await paneZeigenJetzt(streamPane, false);
+  });
 }
 
 /**
@@ -3170,7 +3566,12 @@ ipc.on('awb:rueckblick-fehlt', (_e, n: { paneId: string }) => {
  * hat. Das ist die Ansicht, die ein Klick auf einen Tab bringt; ein Klick auf
  * einen einzelnen Worker fuehrt weiter zu paneZeigen().
  */
-async function tabZeigen(paneIds: string[]): Promise<void> {
+function tabZeigen(paneIds: string[]): Promise<void> {
+  return nacheinander(() => tabZeigenJetzt(paneIds));
+}
+
+async function tabZeigenJetzt(paneIds: string[]): Promise<void> {
+  if (gastAnsicht && !tmux) return gastTabZeigen(paneIds);
   if (!tmux) throw new Error('nicht angehaengt');
   const erster = paneIds[0];
   if (!erster) return;
@@ -3181,7 +3582,6 @@ async function tabZeigen(paneIds: string[]): Promise<void> {
   // Zahl der Tabs bestimmt (capacity.ts). Zwei Regeln nebeneinander waeren
   // zwei Wahrheiten: die Leiste rechts verspraeche vier Panes je Tab, und die
   // Buehne legte sie anders hin.
-  const kap = kapazitaet();
   const flaecheJetzt = flaeche ?? { cols: config.ownedCols, rows: config.ownedRows };
 
   // Die Panes eines Tabs stammen aus VERSCHIEDENEN tmux-Fenstern: ein Worker
@@ -3239,6 +3639,7 @@ async function tabZeigen(paneIds: string[]): Promise<void> {
   const frei =
     fensterDerAnforderung.size > 1 &&
     [...fensterDerAnforderung].every((w) => alle.filter((p) => p.windowId === w).length === 1);
+  const kap = kapazitaet(frei);
   // Das Raster: frei gewaehlt, wo tmux nichts anzuordnen hat, sonst genau das,
   // das tmux zu dieser Zahl von Panes auch BAUT (gitterFuer/tiledRaster).
   // Vorher stand hier `min(perRow, anzahl)` Spalten und `ceil(anzahl / spalten)`
@@ -3404,6 +3805,7 @@ async function tabZeigen(paneIds: string[]): Promise<void> {
       maus[p.paneId] = await tmux.mausFlags(p.paneId).catch(() => ({ an: false, sgr: true }));
     }
     gezeichneteLage = gezeigt.map((p) => ({ paneId: p.paneId, cols: p.cols, rows: p.rows }));
+    freieTabSpalten = frei ? spalten : 1;
     zuletztGezeichnet = Date.now();
     lageSenden({
       art: 'tab',
@@ -3656,12 +4058,33 @@ function neueWorkerPanes(): string[] {
     .map((w) => w.paneId);
 }
 async function lageAbgleichen(): Promise<void> {
-  if (!tmux || !gezeichneteLage.length || gleichtAb) return;
+  if (!tmux || !gezeichneteLage.length) return;
+  // NACHZIEHEN STATT VERWERFEN (14.10.2026, GL#43): laeuft schon ein Abgleich,
+  // hat er den Stand womoeglich VOR diesem Anlass gelesen -- verworfen waere
+  // die Aenderung verloren. Also einmal nach hinten geschoben.
+  if (gleichtAb) {
+    lageSpaeter(ABKLINGZEIT_MS);
+    return;
+  }
   if (Date.now() - zuletztGezeichnet < ABKLINGZEIT_MS) {
     lageSpaeter(ABKLINGZEIT_MS - (Date.now() - zuletztGezeichnet) + 50);
     return;
   }
   gleichtAb = true;
+  // IN DER ZEICHENKETTE (14.10.2026, GL#43, siehe `nacheinander`). Lief der
+  // Abgleich MITTEN in einem show-tab, war `ansicht` schon die neue,
+  // `gezeichneteLage` noch die alte -- gemessen mit einer Spur unter Last: der
+  // Abgleich warf den von Anfang an fehlenden %99999 aus der Ansicht und
+  // zeichnete verschraenkt mit dem show-tab; beide lasen 178x50, beide
+  // schrieben, und der show-tab zeichnete die Groesse des Abgleichs. In der
+  // Kette sieht der Abgleich nur Staende, in denen beide zueinander gehoeren.
+  await nacheinander(() => lageAbgleichenJetzt()).finally(() => {
+    gleichtAb = false;
+  });
+}
+
+async function lageAbgleichenJetzt(): Promise<void> {
+  if (!tmux || !gezeichneteLage.length) return;
   try {
     const jetzt = await tmux.listPanes().catch(() => []);
     const stand = new Map(jetzt.map((p) => [p.paneId, `${p.width}x${p.height}`]));
@@ -3681,11 +4104,16 @@ async function lageAbgleichen(): Promise<void> {
     // verschwindet, ist schlimmer als einer, der schlecht sitzt"). Verschwindet
     // er, WAEHREND man zusieht, folgt die Ansicht -- dass er weg ist, sagt die
     // Leiste rechts, die ihn dann unter "Fertig" fuehrt.
+    //
+    // NUR, WAS GEZEICHNET WAR, KANN VERSCHWINDEN (14.10.2026). Ein Pane, der
+    // schon beim Oeffnen fehlte, steht in keiner gezeichneten Lage -- er ist
+    // die Kachel mit Grund von oben und bleibt in der Ansicht.
+    const warGezeichnet = new Set(gezeichneteLage.map((p) => p.paneId));
     const verschwunden = ansicht.art === 'tab'
-      ? ansicht.panes.filter((id) => !stand.has(id))
+      ? ansicht.panes.filter((id) => warGezeichnet.has(id) && !stand.has(id))
       : [];
     if (verschwunden.length && ansicht.art === 'tab') {
-      const bleibt = ansicht.panes.filter((id) => stand.has(id));
+      const bleibt = ansicht.panes.filter((id) => !verschwunden.includes(id));
       // Bleibt keiner uebrig, wird nichts umgeschrieben: dann ist die Ansicht
       // als Ganzes gegenstandslos, und die Kacheln mit Grund sind das einzige,
       // was ueberhaupt noch etwas sagt.
@@ -3706,11 +4134,11 @@ async function lageAbgleichen(): Promise<void> {
       ansicht = { art: 'tab', panes: [...ansicht.panes, ...dazu] };
     }
     if (!anders && !verschwunden.length && !dazu.length) return;
-    await ansichtZeichnen();
+    // Schon in der Kette: die `...Jetzt`-Fassungen, nicht `ansichtZeichnen`.
+    if (ansicht.art === 'tab') await tabZeigenJetzt(ansicht.panes);
+    else if (streamPane) await paneZeigenJetzt(streamPane, false);
   } catch (e) {
     process.stderr.write(`Aufteilung nicht nachgezogen: ${(e as Error).message}\n`);
-  } finally {
-    gleichtAb = false;
   }
 }
 
@@ -3867,7 +4295,7 @@ async function flaecheSetzen(cols: number, rows: number, vorgegeben = false): Pr
           // Augenblick des Anhaengens hinweg, und tmux bekam sie 45 ms spaeter
           // als ersten von zwei Umbruechen zugestellt -- acht von acht Laeufen
           // rot. Mit dieser Reihenfolge faellt sie da, wo sie hingehoert.
-          if (!tmux || !streamPane) {
+          if ((!tmux && !gastAnsicht) || !streamPane) {
             flaechenWunsch = null;
             continue;
           }
@@ -3887,8 +4315,13 @@ async function flaecheSetzen(cols: number, rows: number, vorgegeben = false): Pr
           // aktiven Pane zurueck auf den, den WIR zeichnen. Wer eine
           // Einzelansicht waehlt, bekommt seinen Zoom weiterhin (paneZeigen aus
           // 'show-pane'), und der bleibt ueber jede Flaechenaenderung stehen.
-          if (ansicht.art === 'tab') await tabZeigen(ansicht.panes);
-          else await paneZeigen(streamPane, false);
+          //
+          // In der Kette und mit der Ansicht von DANN, wenn die Zeichnung dran
+          // ist (siehe `nacheinander`, GL#43).
+          await nacheinander(async () => {
+            if (ansicht.art === 'tab') await tabZeigenJetzt(ansicht.panes);
+            else if (streamPane) await paneZeigenJetzt(streamPane, false);
+          });
         }
       } finally {
         flaechenLaeuft = false;
@@ -4048,8 +4481,14 @@ ipc.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) => {
         modellSenden();
         break;
       case 'freigaben-entscheiden': {
-        const w = wert as { path: string; action: 'approve' | 'reject'; reason: string };
-        decideRequest(config.requestsDir, w.path, w.action, w.reason, config.wbDecideBin);
+        // `echt` wie bei 'muster-entscheiden': nur ein wirklicher Klick nimmt
+        // einen Antrag an (13.10.2026). Der Mac-Mantel setzt es nur fuer Knopf
+        // und Kuerzel, nie fuer seinen Steuerkanal. Ablehnen braucht seit 14.10.2026
+        // (69444a4e) ebenfalls einen echten Klick; ohne ihn scheitert decideRequest.
+        const w = wert as { path: string; action: 'approve' | 'reject'; reason: string; echt?: boolean };
+        const erg = decideRequest(config.requestsDir, String(w.path ?? ''), w.action, String(w.reason ?? ''),
+          config.wbDecideBin, { art: 'oberflaeche', echt: w.echt === true });
+        if (!erg.ok) melde(erg.output.trim());
         freigabenAktualisieren();
         break;
       }
@@ -4057,7 +4496,8 @@ ipc.on('awb:bedienung', (_e, nachricht: { aktion: string; wert: unknown }) => {
         // `echt` traegt `isTrusted` aus dem Fenster -- nur ein wirklicher Klick
         // gibt frei. Ein `el.click()` traegt false und kommt damit nicht durch.
         const w = wert as { schluessel: string; action: 'approve' | 'reject'; reason: string; echt?: boolean };
-        const erg = musterEntscheiden(String(w.schluessel ?? ''), w.action, String(w.reason ?? ''), w.echt === true);
+        const erg = musterEntscheiden(String(w.schluessel ?? ''), w.action, String(w.reason ?? ''),
+          { art: 'oberflaeche', echt: w.echt === true });
         // Scheitert es, sagt das Fenster es (05.09.2026): die Leiste meldet
         // "erteilt", sobald der Knopf gedrueckt ist -- lief `wb-freigabe`
         // dann ins Leere, stand der Eintrag weiter da, und nirgends stand
@@ -4735,14 +5175,16 @@ ipc.on('awb:sitz-bereit', () => {
  */
 function grundFuerMaschine(machine: string): string {
   if (machine === config.machine) return tmuxBefund.fehler;
-  return remotePoller.snapshots().find((s) => s.machine === machine)?.formatFehler ?? '';
+  return fernStaende().find((s) => s.machine === machine)?.formatFehler ?? '';
 }
 
 function sitzungsDatenJetzt(): SitzungsDaten {
   sessions = modellLesen();
   return {
     machine: config.machine,
-    remoteMachines: config.remoteMachines,
+    // Die Gast-Quellen stehen mit in der Maschinenwahl: „Neue Sitzung" auf peer
+    // laeuft dann ueber `neu` des Tors (gastSitzungAnlegen).
+    remoteMachines: [...config.remoteMachines, ...gastPoller.hostliste()],
     sprache: sprache(config.settingsFile),
     // ALLE bekannten Sitzungen, nicht `sichtbare()`: der Haken fuer beendete
     // Sitzungen (A12) gehoert der Leiste. Ein Fenster, das gerade die
@@ -5219,6 +5661,8 @@ async function menuePunktAusfuehren(
   // und deshalb liefen alle Griffe hier gegen einen tmux-Namen und einen Pfad,
   // die es auf diesem Rechner nicht gibt.
   const fern = !!s.machine && s.machine !== config.machine;
+  const gq = gastQuelleVon(s.machine);
+  if (gq) return gastMenuePunkt(gq, s, punkt, vorlage.rueckfrage && !bestaetigt, echt);
 
   // Die zwei Punkte OHNE `wb-*`-Werkzeug: einer zeigt nur etwas an, der andere
   // fragt erst im Fenster nach einem Namen.
@@ -5600,7 +6044,7 @@ ipc.handle('awb:sitz-neu', async (_e, name: string, machine: string, fernPfad: s
   let pfad: string;
   if (ziel !== config.machine) {
     pfad = String(fernPfad ?? '').trim();
-    if (!pfad) {
+    if (!pfad && !gastQuelleVon(ziel)) {
       return { ok: false, meldung: `Erst einen Ordner auf '${ziel}' eintragen.`, command: '' };
     }
   } else {
@@ -5639,7 +6083,7 @@ ipc.handle(
     let pfad: string;
     if (ziel !== config.machine) {
       pfad = String(fernPfad ?? '').trim();
-      if (!pfad) {
+      if (!pfad && !gastQuelleVon(ziel)) {
         return { ok: false, meldung: `Erst einen Ordner auf '${ziel}' eintragen.`, command: '' };
       }
     } else {
@@ -5685,7 +6129,7 @@ ipc.handle(
  * Quelle wie im Einstellungsfenster und im Erststart, damit es über Modelle,
  * Programme und Stufen genau EINE Auskunft gibt.
  */
-ipc.handle('awb:sitz-wahl-daten', () => {
+function sitzWahlDatenJetzt(): unknown {
   const d = einstellungenDatenJetzt() as EinstellungsDaten;
   return {
     harnesses: d.harnesses.map((h) => ({ id: h.id, label: h.label, binaer: h.binaer })),
@@ -5696,6 +6140,7 @@ ipc.handle('awb:sitz-wahl-daten', () => {
       harnessLabel: m.harnessLabel,
       lokal: m.lokal,
       startbar: m.startbar,
+      wechselbar: d.harnesses.find((h) => h.id === m.harness)?.modelSwitch === true,
       deckelRegistry: m.deckelRegistry,
     })),
     harnessStufen: d.harnessStufen,
@@ -5715,7 +6160,9 @@ ipc.handle('awb:sitz-wahl-daten', () => {
       kontext: Number(d.settings.orchestratorKontext ?? 0),
     },
   };
-});
+}
+
+ipc.handle('awb:sitz-wahl-daten', () => sitzWahlDatenJetzt());
 
 /**
  * DER ZWEITE KNOPF: eine Chat-Sitzung (12.08.).
@@ -5782,8 +6229,18 @@ ipc.handle('awb:chat-daten', (e, seit: number) =>
 ipc.handle('awb:chat-senden', (e, text: string) =>
   chatbuehne.senden(chatIdVon(e), String(text ?? '')));
 
-ipc.handle('awb:chat-freigabe', (e, anfrageId: string, erlauben: boolean) =>
-  chatbuehne.freigabe(chatIdVon(e), String(anfrageId ?? ''), erlauben === true));
+// ERLAUBEN NUR MIT ECHTEM KLICK (13.10.2026, Folge zum Steuerkanal-Fix): `echt`
+// traegt `isTrusted` (Electron) bzw. den Knopf/das Kuerzel des Mac-Mantels; der
+// Steuerkanal setzt es nie. Ohne echten Klick bleibt die Frage offen -- Ablehnen
+// darf jeder, es nimmt nichts weg.
+ipc.handle('awb:chat-freigabe', (e, anfrageId: string, erlauben: boolean, echt?: boolean) => {
+  if (erlauben === true && echt !== true) {
+    melde('Erlauben geht nur mit einem echten Klick in diesem Fenster. Ein Skript oder der '
+      + 'Steuerkanal kann die Werkzeug-Rueckfrage nicht selbst beantworten; Ablehnen geht.');
+    return false;
+  }
+  return chatbuehne.freigabe(chatIdVon(e), String(anfrageId ?? ''), erlauben === true);
+});
 
 // Frisch starten, nachdem ein `--resume` auf eine verschwundene Unterhaltung
 // gescheitert ist (Befund B3, 12.08.).
@@ -5884,6 +6341,52 @@ ipc.handle('awb:sitz-fortsetzen', (_e, id: string, echt: boolean) => {
 });
 
 /**
+ * Modell einer LAUFENDEN lokalen Orchestrator-Sitzung wechseln. Der Kern
+ * ermittelt die Version des tatsaechlich laufenden Prozesses; Slash-/Restart-
+ * Entscheidung, Prompt-Sperre und same-pane Resume bleiben im Shell-Kern.
+ */
+ipc.handle('awb:sitz-modell-wechsel', (_e, id: string, modell: string, effort: string, echt: boolean) => {
+  const kennung = String(id ?? '');
+  const zielModell = String(modell ?? '');
+  const zielEffort = String(effort ?? '');
+  sessions = modellLesen();
+  const s = sessions.find((x) => x.id === kennung);
+  if (!s || !s.alive || (s.machine && s.machine !== config.machine)) {
+    return { ok: false, meldung: 'Nur eine laufende Sitzung auf dieser Maschine kann ihr Modell wechseln.', command: '' };
+  }
+  if (!/^%[0-9]+$/.test(s.orchestratorPane)) {
+    return { ok: false, meldung: 'Der Orchestrator-Pane ist nicht eindeutig; nichts geaendert.', command: '' };
+  }
+  // Ein synthetischer Renderer-Klick darf keinen laufenden Prozess ersetzen.
+  // Tests bekommen ausschliesslich ueber ihre eigene Attrappe einen Weg hinein.
+  if (echt !== true && !process.env.AWB_WB_MODEL_SWITCH) {
+    return { ok: false, meldung: 'Der Modellwechsel braucht einen echten Klick.', command: '' };
+  }
+  const d = sitzWahlDatenJetzt() as { modelle?: Array<{ id?: string; harness?: string; startbar?: boolean }> };
+  const ziel = d.modelle?.find((m) => m.id === zielModell && m.harness === s.harness && m.startbar !== false);
+  if (!ziel) return { ok: false, meldung: 'Das Zielmodell ist fuer diesen Harness nicht startbar.', command: '' };
+  const anfrage = anfrageFuerPane(s.orchestratorPane, sessions, config.tmuxSocket);
+  const version = mobilLaufendeVersion(anfrage?.pid ?? 0);
+  const bin = process.env.AWB_WB_MODEL_SWITCH ?? 'wb-model-switch';
+  const args = ['--pane', s.orchestratorPane, '--model', zielModell];
+  if (zielEffort) args.push('--effort', zielEffort);
+  if (config.tmuxSocket) args.push('--tmux-socket', config.tmuxSocket);
+  if (version) args.push('--process-version', version);
+  const r = spawnSync(bin, args, { encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' });
+  let antwort: { ok?: boolean; meldung?: string; command?: string } = {};
+  try { antwort = JSON.parse(String(r.stdout ?? '').trim().split('\n').at(-1) ?? '{}') as typeof antwort; } catch { /* unten ehrliche Fehlermeldung */ }
+  if (r.status !== 0 || antwort.ok !== true) {
+    const meldung = antwort.meldung || String(r.stderr ?? '').trim() || (r.signal
+      ? 'Der Modellwechsel hat die Zeitgrenze erreicht; Zustand bitte im Pane pruefen.'
+      : `Der Modellwechsel ist fehlgeschlagen (Status ${r.status ?? '?'}).`);
+    return { ok: false, meldung, command: '' };
+  }
+  sessions = modellLesen();
+  sitzungsfensterAuffrischen();
+  return { ok: true, meldung: antwort.meldung ?? 'Modell gewechselt.', command: antwort.command ?? '' };
+});
+
+/**
  * „Beenden" je Zeile (11.08., Bauteil 4 -- ergaenzt zur urspruenglichen
  * Aufgabe). WIRD DURCH `menuePunktAusfuehren('schliessen')` AUSGEFUEHRT --
  * derselbe Griff, den das Kontextmenue der Leiste schon hat, samt seiner
@@ -5941,6 +6444,288 @@ async function uiText(): Promise<unknown> {
   return (await win.webContents.executeJavaScript('window.__awb.uiState()')) as unknown;
 }
 
+// --- Gast-Tor-Sitzungen (27.09.2026, gasttor.ts) ---------------------------
+//
+// Eine Sitzung hinter `wb-gast-tor` hat keinen Steuerkanal: das Tor gibt weder
+// `bash -s` noch `tmux -C` frei. Auf der Buehne steht deshalb ein Terminal
+// (node-pty) mit `ssh -t <alias> anhaengen <sitzung> [<pane>]` -- dieselbe
+// Ansicht, die `wb-gast anhaengen` im Terminal zeigt, samt Statuszeile des Tors
+// und Ctrl-] zum Trennen. Die Kacheln (Tab-Ansicht) kommen aus `vorschau`, als
+// reiner Text im Takt nachgeholt; getippt wird dort nicht, ein Klick auf eine
+// Kachel haengt an genau diesen Pane an.
+
+interface GastAnsicht {
+  /** SessionInfo.id der gezeigten Sitzung. */
+  id: string;
+  maschine: string;
+  sitzung: string;
+  /** Der Pane, an den `anhaengen` ging ('' = Wahl des Tors). */
+  pane: string;
+  /** Die pty-Kennung des Terminals ('' = keins, z. B. waehrend der Kacheln). */
+  pty: string;
+  /** Die Panes der Kachelansicht, solange sie gezeigt wird. */
+  tab: string[];
+  uhr: NodeJS.Timeout | null;
+}
+let gastAnsicht: GastAnsicht | null = null;
+/** Kachel-Nachholtakt: `vorschau` ist ein ssh-Aufruf und eine Protokollzeile drueben -- nicht oefter. */
+const GAST_VORSCHAU_MS = 3000;
+
+function gastBeenden(): void {
+  const g = gastAnsicht;
+  if (!g) return;
+  gastAnsicht = null;
+  if (g.uhr) clearInterval(g.uhr);
+  // Das Ende des ssh-Kindes schliesst drueben die Verbindung; das Tor raeumt
+  // seine Sicht-Sitzung dann selbst ab (SIGHUP, shell/wb-gast-tor `Relay`).
+  if (g.pty) ptyPanes?.beenden(g.pty);
+}
+
+/** Einen Tor-Befehl ausfuehren, mit Frist und ohne den Hauptprozess anzuhalten. */
+function gastBefehl(
+  q: GastQuelle, teile: string[], zeitMs = config.remoteTimeoutMs + 4000,
+): Promise<{ ok: boolean; ausgabe: string; fehler: string }> {
+  return new Promise((fertig) => {
+    const argv = gastArgv(q, teile, { sshBin: config.gastSshBin });
+    let aus = '';
+    let err = '';
+    let vorbei = false;
+    const ende = (r: { ok: boolean; ausgabe: string; fehler: string }) => {
+      if (vorbei) return;
+      vorbei = true;
+      clearTimeout(frist);
+      fertig(r);
+    };
+    let kind: ReturnType<typeof spawn>;
+    try {
+      kind = spawn(argv[0], argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      fertig({ ok: false, ausgabe: '', fehler: `ssh liess sich nicht starten: ${(e as Error).message}` });
+      return;
+    }
+    const frist = setTimeout(() => {
+      kind.kill('SIGKILL');
+      ende({ ok: false, ausgabe: aus, fehler: `keine Antwort von ${q.name} in ${Math.round(zeitMs / 1000)} s` });
+    }, zeitMs);
+    kind.stdout?.on('data', (d: Buffer) => { if (aus.length < 4_000_000) aus += d.toString('utf8'); });
+    kind.stderr?.on('data', (d: Buffer) => { if (err.length < 20_000) err += d.toString('utf8'); });
+    kind.on('error', (e) => ende({ ok: false, ausgabe: aus, fehler: e.message }));
+    kind.on('close', (code) => {
+      const grund = err.trim().split('\n').filter(Boolean).pop() ?? '';
+      ende({ ok: code === 0, ausgabe: aus, fehler: code === 0 ? '' : (grund || `ssh beendet mit Code ${code}`) });
+    });
+  });
+}
+
+/** Das Terminal einer Gast-Sitzung auf die Buehne legen (ersetzt jede andere Ansicht). */
+async function gastAnhaengen(s: SessionInfo, pane: string): Promise<void> {
+  const q = gastQuelleVon(s.machine);
+  if (!q) throw new Error(`'${s.machine}' ist keine Gast-Quelle`);
+  if (tmux) {
+    tmux.removeAllListeners();
+    await tmux.detach();
+    tmux = null;
+    ausgabeBuendel.abgeben();
+    darfGedaechtnisLeeren();
+  }
+  gastBeenden();
+  attachState = null;
+  attachMaschine = s.machine;
+  attachError = null;
+  gezeichneteLage = [];
+  const cols = flaeche?.cols ?? config.ownedCols;
+  const rows = flaeche?.rows ?? config.ownedRows;
+  const argv = gastArgv(q, ['anhaengen', s.tmuxSession, ...(pane ? [pane] : [])], {
+    terminal: true, sshBin: config.gastSshBin,
+  });
+  const v = ptyVerwaltung();
+  const id = v.starten({
+    name: `gast:${s.machine}:${s.tmuxSession}`,
+    befehl: argv[0],
+    args: argv.slice(1),
+    cwd: homedir(),
+    env: { TERM: 'xterm-256color' },
+    cols,
+    rows,
+    rolle: 'gast',
+    fluechtig: true,
+  });
+  gastAnsicht = { id: s.id, maschine: s.machine, sitzung: s.tmuxSession, pane, pty: id, tab: [], uhr: null };
+  const beiEnde = (paneId: string, code: number) => {
+    if (paneId !== id) return;
+    v.off('ende', beiEnde);
+    if (gastAnsicht?.pty !== id) return;
+    // Das letzte Bild bleibt stehen -- darin steht, warum (etwa „getrennt
+    // (Ctrl-])" oder die Ablehnung des Tors). Ein Klick auf die Sitzung haengt neu an.
+    attachError = `Verbindung zu ${s.machine} beendet (Code ${code}). Ein Klick auf die Sitzung hängt neu an.`;
+    melde(attachError);
+    modellSenden();
+  };
+  v.on('ende', beiEnde);
+  anOberflaeche('awb:session', {
+    session: s.tmuxSession, cols, rows, sizePolicy: '', windows: [], panes: [],
+    activePane: '', initialContent: '',
+  });
+  await ptyPaneZeigen(id);
+  process.stderr.write(`Gast-Sitzung angehaengt: ${s.id} (${argv.slice(-1)[0]}) als ${id}\n`);
+  melde(`Terminal von ${s.machine} über das Gast-Tor – Tastendrücke gehen nur an den gewählten Pane, Ctrl-] trennt.`);
+}
+
+/** Ein einzelner Pane einer Gast-Sitzung: dasselbe Terminal, sonst neu anhaengen. */
+async function gastPaneZeigen(paneId: string): Promise<void> {
+  const g = gastAnsicht;
+  if (!g) throw new Error('keine Gast-Sitzung auf der Buehne');
+  if (g.uhr) clearInterval(g.uhr);
+  g.uhr = null;
+  g.tab = [];
+  const s = modellLesen().find((x) => x.id === g.id);
+  if (!s) throw new Error(`Diese Sitzung gibt es nicht mehr: ${g.id}`);
+  const gleich = paneId === g.pane || (!g.pane && paneId === s.orchestratorPane);
+  if (gleich && g.pty && ptyPanes?.standVon(g.pty)?.lebt) {
+    await ptyPaneZeigen(g.pty);
+    return;
+  }
+  await gastAnhaengen(s, paneId);
+}
+
+/**
+ * Die Kachelansicht einer Gast-Sitzung: je Pane der sichtbare Schirm aus
+ * `vorschau --json`, beschnitten auf seine Kachel, alle GAST_VORSCHAU_MS neu.
+ * Das Terminal der Sitzung endet dabei nicht -- es steht nur nicht auf der
+ * Buehne; ein Klick zurueck auf den Orchestrator zeigt es wieder.
+ */
+async function gastTabZeigen(paneIds: string[]): Promise<void> {
+  const g = gastAnsicht;
+  if (!g) throw new Error('keine Gast-Sitzung auf der Buehne');
+  const q = gastQuelleVon(g.maschine);
+  if (!q || !paneIds.length) return;
+  ansicht = { art: 'tab', panes: paneIds };
+  streamPane = paneIds[0];
+  g.tab = paneIds;
+  const zeichnen = async (): Promise<void> => {
+    if (gastAnsicht !== g || g.tab !== paneIds) return;
+    const kap = kapazitaet();
+    const flaecheJetzt = flaeche ?? { cols: config.ownedCols, rows: config.ownedRows };
+    const gitter = gitterFrei(paneIds.length, kap.perRow, kap.perColumn);
+    const kacheln = kachelZellen(paneIds.length, gitter.spalten, true, flaecheJetzt);
+    const zeilen = Math.max(...kacheln.map((k) => k.rows), 1);
+    const r = await gastBefehl(q, ['vorschau', g.sitzung, '--json', '--zeilen', String(Math.min(zeilen, 200))]);
+    if (gastAnsicht !== g || g.tab !== paneIds) return;
+    let schirme = new Map<string, string>();
+    let fehler = r.ok ? '' : r.fehler;
+    if (r.ok) {
+      try {
+        schirme = new Map(parseGastVorschau(r.ausgabe).map((p) => [p.pane, p.text]));
+      } catch (e) {
+        fehler = (e as Error).message;
+      }
+    }
+    // Zwei Zeilen weniger als die Kachel: ihre Kopfzeile (22 px) liegt ueber dem Schirm, und
+    // ein zu hoher Schirm wird oben beschnitten (paneflaeche.ts, `ueberhang`) --
+    // gemessen am Selbstfoto, die erste Zeile verschwand unter dem Kopf.
+    const panes = paneIds.map((paneId, i) => ({
+      paneId, x: 0, y: 0, cols: kacheln[i]?.cols ?? 40, rows: Math.max(3, (kacheln[i]?.rows ?? 10) - 2),
+    }));
+    const inhalt: Record<string, string> = {};
+    for (const b of panes) {
+      const text = schirme.get(b.paneId) ?? (fehler ? `Keine Vorschau: ${fehler}` : 'Pane nicht mehr da.');
+      const zeilenText = text.split('\n').slice(-b.rows).map((z) => z.slice(0, b.cols)).join('\n');
+      inhalt[b.paneId] = vorschauInhalt(zeilenText);
+    }
+    gezeichneteLage = panes.map((b) => ({ paneId: b.paneId, cols: b.cols, rows: b.rows }));
+    zuletztGezeichnet = Date.now();
+    lageSenden({
+      art: 'tab',
+      vorgegeben: flaecheVorgegeben,
+      cols: flaecheJetzt.cols,
+      rows: flaecheJetzt.rows,
+      aktiv: paneIds[0],
+      panes,
+      inhalt,
+      historie: {},
+      maus: Object.fromEntries(paneIds.map((id) => [id, { an: false, sgr: true }])),
+      spalten: gitter.spalten,
+      frei: true,
+      fehlend: [],
+    });
+  };
+  if (g.uhr) clearInterval(g.uhr);
+  g.uhr = setInterval(() => { void zeichnen().catch(() => undefined); }, GAST_VORSCHAU_MS);
+  await zeichnen();
+}
+
+/** Die Menuepunkte einer Gast-Sitzung: nur, was das Tor kennt. */
+async function gastMenuePunkt(
+  q: GastQuelle, s: SessionInfo, punkt: string, fragen: boolean, echt: boolean,
+): Promise<{ ok: boolean; meldung: string; aufruf: string }> {
+  if (punkt !== 'schliessen' && punkt !== 'loeschen') {
+    return {
+      ok: false,
+      meldung: `„${s.name}“ liegt hinter dem Gast-Tor von ${q.name}: dort gibt es nur Ansehen, Schreiben, `
+        + 'Neue Sitzung und das Schließen eigener Sitzungen.',
+      aufruf: '',
+    };
+  }
+  if (!istEigeneGastSitzung(gastPoller.snapshots().find((x) => x.machine === q.name), s.tmuxSession)) {
+    return { ok: false, meldung: `„${s.name}“ ist keine eigene Sitzung -- schließen darf das Gast-Tor nur selbst gestartete.`, aufruf: '' };
+  }
+  const teile = ['schliessen', s.tmuxSession, ...(punkt === 'loeschen' ? ['--endgueltig'] : [])];
+  const aufruf = `ssh ${q.ssh} ${teile.join(' ')}`;
+  if (punkt === 'loeschen' && fragen) {
+    const ja = await rueckfrage(`„${s.name}“ endgültig löschen?`,
+      `Das Gast-Tor auf ${q.name} schließt die Sitzung und nimmt sie aus der Sitzungsliste (mit Sicherung drüben).`, echt);
+    if (!ja) return { ok: false, meldung: 'Abgebrochen -- es wurde nichts geloescht.', aufruf };
+  }
+  const gezeigt = gastAnsicht?.id === s.id;
+  if (gezeigt) gastBeenden();
+  const r = await gastBefehl(q, teile, 90_000);
+  process.stderr.write(`Gast-Menue '${punkt}' auf '${s.name}': ok=${r.ok} ${r.fehler}\n`);
+  gastPoller.auffrischen();
+  if (gezeigt && r.ok) {
+    void weiterOhneDieSitzung(s.id).catch((e) =>
+      process.stderr.write(`nach dem Schliessen nicht weitergeschaltet: ${(e as Error).message}\n`));
+  }
+  modellSenden();
+  sitzungsfensterAuffrischen();
+  return { ok: r.ok, meldung: r.ok ? (r.ausgabe.trim() || `geschlossen: ${s.tmuxSession}`) : r.fehler, aufruf };
+}
+
+/** Laufende Starts je Gast-Quelle -- ein Doppelklick startet nicht zweimal. */
+const gastStarts = new Set<string>();
+
+/**
+ * „Neue Sitzung" auf einer Gast-Quelle: `neu [<projekt>] [--harness …]` des
+ * Tors. Das dauert so lange wie `wb-code` drueben (bis `SITZUNG-STEHT`) und
+ * laeuft deshalb im Hintergrund; das Ergebnis kommt als Meldung, die Sitzung
+ * mit dem naechsten Abruf in die Leiste.
+ */
+function gastSitzungAnlegen(
+  q: GastQuelle, dir: string, name: string, wahl?: SitzungsWahl,
+): { gestartet: boolean; meldung: string; command: string } {
+  const projekt = (dir || '').trim();
+  const teile = ['neu', ...(projekt ? [projekt] : [])];
+  const sauber = name.trim();
+  if (sauber) {
+    if (!/^[A-Za-z0-9 _.-]{1,60}$/.test(sauber)) throw new Error('Name enthaelt Zeichen, die hier nicht vorgesehen sind');
+    teile.push('--name', sauber);
+  }
+  if (wahl?.harness) teile.push('--harness', wahl.harness);
+  if (wahl?.model) teile.push('--model', wahl.model);
+  if (wahl?.effort) teile.push('--effort', wahl.effort);
+  const command = `ssh ${q.ssh} ${teile.join(' ')}`;
+  if (gastStarts.has(q.name)) return { gestartet: false, meldung: 'Wird schon gestartet -- einen Augenblick.', command };
+  gastStarts.add(q.name);
+  void gastBefehl(q, teile, 200_000).then((r) => {
+    gastStarts.delete(q.name);
+    const sitzung = r.ausgabe.trim().split('\n').pop() ?? '';
+    process.stderr.write(`Gast-Start auf ${q.name}: ok=${r.ok} ${r.ok ? sitzung : r.fehler}\n`);
+    melde(r.ok ? `Neue Sitzung auf ${q.name}: ${sitzung}` : `Start auf ${q.name} abgelehnt: ${r.fehler}`);
+    gastPoller.auffrischen();
+    sitzungsfensterAuffrischen();
+  });
+  return { gestartet: true, meldung: `Start über das Gast-Tor von ${q.name} läuft …`, command };
+}
+
 /**
  * EINE SITZUNG WAEHLEN -- auch eine auf der anderen Maschine (10.08.).
  *
@@ -5970,10 +6755,34 @@ async function sessionWaehlen(kennung: string): Promise<SessionInfo | null> {
   // weiter, sie ist nur nicht mehr zu sehen.
   chatbuehne.verbergen();
   chatWerkstattGezeigt = '';
-  ui.set({ selected: treffer.id, workerTab: 0 });
+  // EINE GAST-TOR-SITZUNG (27.09.2026): kein `tmux -C`, sondern ein Terminal
+  // mit `ssh -t <alias> anhaengen` auf der Buehne (gastAnhaengen).
+  if (gastQuelleVon(treffer.machine)) {
+    ui.set({ selected: treffer.id, workerTab: 0 });
+    const g = gastAnsicht;
+    const lebt = !!g && g.id === treffer.id && !!g.pty && !!ptyVerwaltung().standVon(g.pty)?.lebt;
+    if (!lebt) await gastAnhaengen(treffer, treffer.orchestratorPane);
+    else await ptyPaneZeigen(g!.pty);
+    modellSenden();
+    return treffer;
+  }
+  gastBeenden();
   const fern = treffer.machine && treffer.machine !== config.machine ? treffer.machine : '';
-  if (treffer.alive) await attachTmux(treffer.tmuxSession, fern);
-  else {
+  const schonAngehaengt = ui.get().selected === treffer.id
+    && tmux !== null
+    && attachError === null
+    && attachState?.session === treffer.tmuxSession
+    && attachMaschine === fern;
+  ui.set({ selected: treffer.id, workerTab: 0 });
+  // Ein zweiter Klick auf dieselbe bereits gezeichnete Sitzung ist eine
+  // idempotente Auswahl, kein erneutes Anhaengen. Sonst loest der Klick den
+  // lebenden Steuerclient ab, waehrend die Oberflaeche gerade ihre
+  // `show-tab`-Bedienung fuer genau diese Sitzung schickt: `write after end`,
+  // danach `nicht angehaengt`. Bei einem echten Fehler bleibt der Wiederanlauf
+  // offen, weil dann `attachError` gesetzt bzw. `tmux` leer ist.
+  if (treffer.alive) {
+    if (!schonAngehaengt) await attachTmux(treffer.tmuxSession, fern);
+  } else {
     // Erst die Zuhoerer weg, dann abloesen -- sonst setzt das 'closed' des
     // sterbenden Steuerclients gleich wieder einen Fehler ueber unseren Satz
     // (dieselbe Reihenfolge und derselbe Grund wie in `attachTmux`).
@@ -6219,6 +7028,15 @@ async function handle(req: ControlRequest): Promise<unknown> {
         // Die Maschinenliste, mit der der Poller gerade arbeitet -- damit eine
         // Aenderung ohne Neustart messbar ist.
         remoteHosts: remotePoller.hostliste(),
+        // Gast-Tor-Quellen (27.09.2026): welche abgefragt werden, welche
+        // verworfen wurden, und was gerade auf der Buehne steht.
+        gastQuellen: gastPoller.hostliste(),
+        gastQuellenFehler: config.gastQuellenFehler,
+        gast: gastAnsicht
+          ? { id: gastAnsicht.id, maschine: gastAnsicht.maschine, sitzung: gastAnsicht.sitzung,
+            pane: gastAnsicht.pane, pty: gastAnsicht.pty, tab: gastAnsicht.tab,
+            lebt: !!gastAnsicht.pty && !!ptyPanes?.standVon(gastAnsicht.pty)?.lebt }
+          : null,
         session: attachState?.session ?? '',
         sizePolicy: attachState?.sizePolicy ?? '',
         // B2: ob tmux unseren Steuerclient aus der Groessenrechnung genommen
@@ -7591,8 +8409,12 @@ async function handle(req: ControlRequest): Promise<unknown> {
       // `reason` ist FREIWILLIG (19.08.) -- derselbe Schritt wie im Fenster und
       // in `wb-decide`. Ein fehlendes Feld ist hier kein Fehler mehr, sondern
       // eine leere Begruendung.
+      // Ueber den Steuerkanal kommt KEIN gemessener Mensch (13.10.2026): Annehmen
+      // endet in `decideRequest` mit einer Absage, die hier geworfen wird wie bei
+      // 'muster-entscheiden'. Der Orchestrator entscheidet mit `wb-decide` direkt.
       const ergebnis = decideRequest(config.requestsDir, pfad, aktion, grund, config.wbDecideBin);
       freigabenAktualisieren();
+      if (!ergebnis.ok) throw new Error(ergebnis.output.trim());
       return ergebnis;
     }
 
@@ -7624,7 +8446,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
     }
 
     case 'neue-session': {
-      const r = sessionAnlegen(String(req.dir ?? ''), String(req.name ?? ''));
+      const r = sessionAnlegen(String(req.dir ?? ''), String(req.name ?? ''), req.machine ? String(req.machine) : config.machine);
       if (r.gestartet) nachStartNachlesen();
       return r;
     }
@@ -7658,6 +8480,15 @@ async function handle(req: ControlRequest): Promise<unknown> {
       return { pfad };
     }
 
+    // Die mobile Werkbank (Paket 10): NUR lesen -- ob der Server laeuft, auf
+    // welchem Port, welche Geraete gekoppelt sind. Kopplung starten und Geraete
+    // widerrufen gibt es auf diesem Kanal ABSICHTLICH nicht (Spezifikation 4.1):
+    // sie gehen nur ueber den lokalen Mensch-Weg (awb:mobil-koppeln/-widerrufen).
+    case 'mobil-stand': {
+      await mobilWechsel;
+      return mobilStand();
+    }
+
     // Der Tab "Agents" (aufgaben.ts, welten.ts): der Stand und eine Handlung
     // `welt:<handlung> <JSON>`. Ueber diesen Weg spricht per Bauart ein Skript --
     // welten.ts schreibt es als `cli-operator` (Herkunft 'steuerkanal').
@@ -7669,7 +8500,7 @@ async function handle(req: ControlRequest): Promise<unknown> {
     case 'aufgabe': {
       const befehl = String(req.befehl ?? '');
       if (!befehl) throw new Error('Feld befehl fehlt');
-      return aufgabenQuelle.ausfuehren(befehl, 'steuerkanal', { bestaetigt: req.bestaetigt === true, echt: false });
+      return aufgabenQuelle.ausfuehren(befehl, { art: 'steuerkanal' }, { bestaetigt: req.bestaetigt === true });
     }
 
     // Die Sichtbarkeit der Ansicht lesen und (fuer Pruefungen) setzen.
@@ -8024,6 +8855,7 @@ function notausgangScharfstellen(ms: number): void {
   try {
     mkdirSync(dirname(protokoll), { recursive: true });
     const wache = spawn('/bin/sh', ['-c', skript], { detached: true, stdio: 'ignore' });
+    wache.once('error', (e) => process.stderr.write(`Beenden: kein Notausgang moeglich (${e.message}).\n`));
     wache.unref();
   } catch (e) {
     // Ohne Wachhund bleibt es beim bisherigen Verhalten -- das ist auf dieser
@@ -8032,14 +8864,606 @@ function notausgangScharfstellen(ms: number): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// DIE MOBILE WERKBANK IM KERN (Paket 10, Spezifikation 2.1).
+//
+// Der Server laeuft in DIESEM Prozess -- in der Electron-Fassung wie im Kern
+// des Mac-Mantels -- und nur, wenn `mobileServer` in settings.json auf true
+// steht (Vorgabe aus). Er bindet 127.0.0.1:<mobilePort>; `tailscale serve`
+// terminiert davor HTTPS. Ein belegter Port nimmt nur den mobilen Dienst weg,
+// nie den Kern, und es wird kein Ersatzport gewaehlt (Spezifikation 2.1).
+//
+// Die Bruecke unten reicht den Adaptern ausschliesslich vorhandene
+// Kernfunktionen: modellLesen/sichtbare, sessionAnlegen, sessionWieder-
+// herstellen, menuePunktAusfuehren('schliessen'), anfrageFuerPane/chatStand,
+// readRequests/readGuardBlocks/decideRequest/musterEntscheiden,
+// einstellungenDatenJetzt, themaPayload und die AufgabenQuelle.
+// ---------------------------------------------------------------------------
+
+// Buildkennung: dieselbe, die in die PWA eingebaut wird (build.mjs). Weichen sie
+// ab, bleibt die App lesend (Spezifikation 10.12).
+declare const __AWB_MOBILE_BUILD__: string | undefined;
+const MOBIL_BUILD = typeof __AWB_MOBILE_BUILD__ === 'string' ? __AWB_MOBILE_BUILD__ : 'ungebaut';
+
+/**
+ * Die Maschine im signierten Pane-Body: erster Namensteil des Rechnernamens,
+ * Gross-/Kleinschreibung unveraendert -- genau das, was `wb-pane-write` selbst
+ * ermittelt (`socket.gethostname()`), NICHT `config.machine`: das darf ueber
+ * AWB_MACHINE abweichen, und dann lehnte das Werkzeug jede Nachricht ab.
+ */
+const MOBIL_PANE_MASCHINE = hostname().split('.')[0];
+
+/** Wie der Server gerade steht -- fuer Einstellungsfenster, Mantel und Steuerkanal. */
+let mobilLage: { an: boolean; laeuft: boolean; port: number; fehler: string } = { an: false, laeuft: false, port: 0, fehler: '' };
+let mobilWechsel: Promise<void> = Promise.resolve();
+
+/** `#{socket_path}` des tmux-Servers dieser Werkbank, einmal erfragt und gemerkt. */
+let mobilSocketPfad = '';
+function tmuxSocketPfad(pane: string): string {
+  if (mobilSocketPfad) return mobilSocketPfad;
+  const r = spawnSync('tmux', [...(config.tmuxSocket ? ['-L', config.tmuxSocket] : []), 'display-message', '-p', '-t', pane, '#{socket_path}'],
+    { encoding: 'utf8', timeout: 2000 });
+  const pfad = r.status === 0 ? String(r.stdout ?? '').trim() : '';
+  if (pfad.startsWith('/')) mobilSocketPfad = pfad;
+  return pfad.startsWith('/') ? pfad : '';
+}
+
+/** Die globale Kennung `{maschine}:{sitzung}` (Spezifikation 2.3); ferne Sitzungen tragen sie schon. */
+function mobilId(s: SessionInfo): string {
+  return !s.machine || s.machine === config.machine ? `${config.machine}:${s.id}` : s.id;
+}
+
+function mobilSitzung(s: SessionInfo, regungen?: ReadonlyMap<string, string>): MobileSessionRecord {
+  const lokal = !s.machine || s.machine === config.machine;
+  const pane = /^%[0-9]+$/.test(s.orchestratorPane) ? s.orchestratorPane : '';
+  const socket = lokal && s.alive && pane ? tmuxSocketPfad(pane) : '';
+  return {
+    id: mobilId(s), name: s.name, machine: s.machine || config.machine, harness: s.harness, model: s.model,
+    state: s.state, lastActive: s.lastActive, workers: s.workers.map((w) => ({ state: w.state })),
+    pendingApprovals: s.pendingApprovals,
+    binding: socket ? { maschine: MOBIL_PANE_MASCHINE, socket, pane } : null,
+    // Nur der Takt reicht die Regungen mit (fuer `chat.changed`); Adapteraufrufe brauchen sie nicht.
+    ...(regungen && lokal && pane ? { chatRegung: regungen.get(pane) ?? '' } : {}),
+  };
+}
+
+function mobilFrisch(): MobileSessionRecord[] {
+  sessions = modellLesen();
+  return sichtbare(sessions).map((s) => mobilSitzung(s));
+}
+
+function mobilSitzungAus(id: string): SessionInfo {
+  const s = sessions.find((x) => mobilId(x) === id);
+  if (!s) throw new MobileAuthError('stale_target', 'session is no longer current');
+  return s;
+}
+
+// --- HARNESSDIALOGE IM KERN (Paket 6, Verdrahtung) --------------------------
+//
+// Was hier steht, sind die drei Nahtstellen, die die gemessenen Adapter von der
+// Werkbank erwarten, und sonst nichts: eine frische Pane-Aufnahme samt der
+// Version des LAUFENDEN Prozesses, die Verbindung eines laufenden
+// OpenCode-Servers und der eine signierte `mobil-taste`-Aufruf. Die Erkennung
+// selbst, die Optionen und die Tastenfolgen gehoeren den Adaptern; hier wird
+// nichts davon nachgebaut.
+
+/** `wb-pane-write` -- eine Stelle fuer Nachricht, Sondertaste und Knopfantwort. */
+const mobilPaneWrite = paneWriteUeber(config.wbPaneWriteBin);
+
+/** Eine Protokollzeile des mobilen Kerns in den stderr des Kerns. */
+const mobilProtokoll = (zeile: string): void => { process.stderr.write(`Mobil: ${zeile}\n`); };
+
+/** Eine frische Aufnahme des sichtbaren Panes; ANSI bleibt drin, der Adapter raeumt es weg. */
+function mobilPaneText(pane: string): string {
+  const r = spawnSync('tmux', [...(config.tmuxSocket ? ['-L', config.tmuxSocket] : []), 'capture-pane', '-p', '-t', pane], {
+    encoding: 'utf8', timeout: 2000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+  });
+  return r.status === 0 ? String(r.stdout ?? '') : '';
+}
+
+/**
+ * DIE VERSION DES IM PANE LAUFENDEN PROZESSES, nicht die der zuletzt
+ * installierten Datei (Paket 6b, OPEN 5). Gemessen am 2026-09-20 auf dem Mac:
+ * `~/.local/bin/claude` ist ein Symlink auf `~/.local/share/claude/versions/<v>`,
+ * und `lsof -d txt` nennt fuer einen laufenden Pane-Prozess genau die Datei, die
+ * er geoeffnet hat -- dort stand 2.1.270, waehrend der Symlink schon auf 2.1.278
+ * zeigte. Aus diesem Pfad kommt die Version deshalb ohne jeden Programmstart.
+ * Nur wenn der Pfad keine Version traegt, wird `<datei> --version` gefragt, und
+ * auch das nur, wenn die Datei AELTER ist als der Prozess -- sonst koennte ein
+ * Update dazwischengekommen sein und die Antwort waere eine andere Version als
+ * die laufende. Bleibt beides ohne Ergebnis, ist die Antwort leer, und der
+ * Adapter schliesst fail closed (`capability_unavailable`).
+ */
+const mobilVersionen = new Map<number, { version: string; gemessen: number }>();
+const MOBIL_VERSION_FRIST_MS = 300_000;
+
+function mobilLaufendeVersion(pid: number): string {
+  if (!pid) return '';
+  const gemerkt = mobilVersionen.get(pid);
+  if (gemerkt && Date.now() - gemerkt.gemessen < MOBIL_VERSION_FRIST_MS) return gemerkt.version;
+  const version = mobilVersionMessen(pid);
+  if (mobilVersionen.size > 64) mobilVersionen.clear();
+  mobilVersionen.set(pid, { version, gemessen: Date.now() });
+  return version;
+}
+
+/** `lsof` von einem festen Ort: macOS legt es nach /usr/sbin, Linux nach /usr/bin. */
+const MOBIL_LSOF = ['/usr/sbin/lsof', '/usr/bin/lsof', '/bin/lsof'].find((pfad) => existsSync(pfad)) ?? '';
+
+function mobilVersionMessen(pid: number): string {
+  if (!MOBIL_LSOF) return '';
+  const lsof = spawnSync(MOBIL_LSOF, ['-a', '-p', String(pid), '-d', 'txt', '-Fn'], {
+    encoding: 'utf8', timeout: 3000, killSignal: 'SIGKILL',
+  });
+  if (lsof.status !== 0) return '';
+  const pfade = String(lsof.stdout ?? '').split('\n').filter((z) => z.startsWith('n/')).map((z) => z.slice(1));
+  for (const pfad of pfade) {
+    const treffer = /\/versions\/(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/.exec(pfad);
+    if (treffer) return treffer[1];
+  }
+  const datei = pfade[0] ?? '';
+  if (!datei || !mobilDateiAelterAlsProzess(datei, pid)) return '';
+  const probe = spawnSync(datei, ['--version'], { encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL' });
+  if (probe.status !== 0) return '';
+  const version = /(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/.exec(String(probe.stdout ?? ''));
+  return version ? version[1] : '';
+}
+
+/** Ist die Programmdatei aelter als der Prozess? Nur dann beschreibt sie ihn. */
+function mobilDateiAelterAlsProzess(datei: string, pid: number): boolean {
+  const r = spawnSync('/bin/ps', ['-p', String(pid), '-o', 'etime='], { encoding: 'utf8', timeout: 2000, killSignal: 'SIGKILL' });
+  const roh = String(r.stdout ?? '').trim();
+  const teile = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(roh);
+  if (r.status !== 0 || !teile) return false;
+  const sekunden = Number(teile[1] ?? 0) * 86400 + Number(teile[2] ?? 0) * 3600 + Number(teile[3]) * 60 + Number(teile[4]);
+  try {
+    return statSync(datei).mtimeMs < Date.now() - sekunden * 1000;
+  } catch {
+    return false;
+  }
+}
+
+/** Die Sitzung im frisch gelesenen Modell, nur lokal und lebendig. */
+function mobilLokalePaneSitzung(sitzung: MobileDialogSession): { s: SessionInfo; pane: string } | null {
+  const s = sessions.find((x) => mobilId(x) === sitzung.id);
+  if (!s || !s.alive || (s.machine && s.machine !== config.machine)) return null;
+  const pane = /^%[0-9]+$/.test(s.orchestratorPane) ? s.orchestratorPane : '';
+  return pane ? { s, pane } : null;
+}
+
+/**
+ * Die Messung eines Claude-Panes, Version und Aufnahme getrennt (leer heisst: nicht gemessen).
+ * `null` nur, wenn die Sitzung kein lokales Pane hat. Der Riegel braucht die Trennung fuer den Grund.
+ */
+function mobilClaudeMessung(sitzung: MobileDialogSession): ClaudePaneSnapshot | null {
+  const ziel = mobilLokalePaneSitzung(sitzung);
+  if (!ziel) return null;
+  const anfrage = anfrageFuerPane(ziel.pane, sessions, config.tmuxSocket);
+  return { version: mobilLaufendeVersion(anfrage?.pid ?? 0), pane: ziel.pane, text: mobilPaneText(ziel.pane) };
+}
+
+/** Paket 6b: frische Aufnahme, Pane-ID und laufende CLI-Version fuer den Claude-Adapter. */
+function mobilClaudePane(sitzung: MobileDialogSession): ClaudePaneSnapshot | null {
+  return claudeAufnahme(mobilClaudeMessung(sitzung));
+}
+
+/**
+ * Paket 6: die Verbindung zum OpenCode-Server DIESES Panes. Port und Sitzungs-ID
+ * kommen aus derselben vorhandenen Kernfunktion, die auch die Chatansicht
+ * benutzt (`chatStand()` nennt die Quelle `http://127.0.0.1:<port>/api/session/<id>`);
+ * das Kennwort ist `OPENCODE_SERVER_PASSWORD` aus der Umgebung DIESES Kerns --
+ * dieselbe Umgebung, die der Kern an den gestarteten Harness vererbt. Es steht
+ * nirgends in Bootstrap, API, Ereignisstrom oder Protokoll; es geht nur als
+ * Basic-Auth an 127.0.0.1. Fehlt es, ist die Verbindung null und die Route
+ * antwortet `capability_unavailable`.
+ */
+async function mobilOpenCode(sitzung: MobileDialogSession): Promise<OpenCodeDialogConnection | null> {
+  const passwort = process.env.OPENCODE_SERVER_PASSWORD ?? '';
+  const ziel = mobilLokalePaneSitzung(sitzung);
+  if (!passwort || !ziel) return null;
+  const anfrage = anfrageFuerPane(ziel.pane, sessions, config.tmuxSocket);
+  if (!anfrage) return null;
+  const stand = await chatStand(anfrage, { modelsFile: config.modelsFile, settingsFile: config.settingsFile, uebersteuerung: null });
+  const quelle = /^(http:\/\/127\.0\.0\.1:[0-9]+)\/api\/session\/(ses_[A-Za-z0-9]+)$/.exec(stand.quelle);
+  const version = mobilLaufendeVersion(anfrage.pid);
+  if (!stand.moeglich || !quelle || !version) return null;
+  return { origin: quelle[1], version, sessionID: quelle[2], username: 'opencode', password: passwort };
+}
+
+/** Die vom Adapter abgeleitete Folge, autorisiert durch den signierten Umschlag der Antwort. */
+async function mobilTasten(call: { session: MobileDialogSession; pane: string; keys: readonly string[]; request: MobileRouteRequest }): Promise<void> {
+  const ziel = mobilLokalePaneSitzung(call.session);
+  if (!ziel) {
+    mobilAblehnung(mobilProtokoll, call.session.id, call.pane, 'stale_target', 'kein Orchestrator-Pane mehr');
+    throw new MobileAuthError('stale_target', 'session no longer has this orchestrator pane');
+  }
+  if (ziel.pane !== call.pane) {
+    mobilAblehnung(mobilProtokoll, call.session.id, ziel.pane, 'stale_target', 'Bindung nicht am jetzigen Orchestrator-Pane');
+    throw new MobileAuthError('stale_target', 'session no longer has this orchestrator pane');
+  }
+  const socket = tmuxSocketPfad(ziel.pane);
+  if (!socket) {
+    mobilAblehnung(mobilProtokoll, call.session.id, ziel.pane, 'stale_target', 'tmux-Socket nicht ermittelbar');
+    throw new MobileAuthError('stale_target', 'the tmux socket path of this pane is unavailable');
+  }
+  await mobilTastenSenden({
+    envelope: call.request.envelope,
+    rawBody: call.request.rawBody,
+    bindung: { maschine: MOBIL_PANE_MASCHINE, socket, pane: ziel.pane },
+    tasten: call.keys,
+    socketName: config.tmuxSocket,
+    paneWrite: mobilPaneWrite,
+    protokoll: mobilProtokoll,
+    sitzung: call.session.id,
+  });
+}
+
+const mobilDialogQuelle: AllDialogsForMobile = {
+  localMachine: config.machine,
+  fresh: mobilFrisch,
+  claudePane: mobilClaudePane,
+  openCode: mobilOpenCode,
+  sendKeys: mobilTasten,
+};
+
+/** Gemessen: eine Nachricht bei offenem Claude-Dialog beantwortet den Dialog; Riegel mit Grund in kern.ts. */
+async function mobilEingabeGesperrt(id: string): Promise<MobilEingabeRiegel> {
+  return claudeEingabeRiegel(mobilDialogQuelle, mobilClaudeMessung, id);
+}
+
+/**
+ * Die eine Registrierung beim Kernstart (Paket 6b, Aufgabe 3). Ohne sie bleiben
+ * die Prompt-Routen `capability_unavailable`. `MEASURED_DIALOG_CAPABILITIES`
+ * kommt aus `dialogs/index.ts` -- die Zusammenfassung ueber alle Adapter, nicht
+ * die eines einzelnen.
+ */
+function mobilDialogRouten(quelle: AllDialogsForMobile): MobilDialogRouten {
+  const routen = createDialogHandlers(quelle);
+  return {
+    'GET /sessions/:id/prompt': routen['GET /sessions/:id/prompt']!,
+    'POST /sessions/:id/prompt-answer': routen['POST /sessions/:id/prompt-answer']!,
+  };
+}
+
+function mobilDialogeAnmelden(): void {
+  const gemessen = (Object.keys(MEASURED_DIALOG_CAPABILITIES) as (keyof typeof MEASURED_DIALOG_CAPABILITIES)[])
+    .filter((name) => MEASURED_DIALOG_CAPABILITIES[name]);
+  mobilDialogeRegistrieren({
+    faehigkeiten: gemessen,
+    handlers: mobilDialogRouten(mobilDialogQuelle),
+    // Nur Claude antwortet ueber Pane-Tasten; OpenCode hat seinen eigenen HTTP-Weg.
+    tastenHarnesse: ['claude'],
+    probeRouten: (aufzeichnen) => {
+      // EINE Aufnahme und EIN Modellstand je Vorschau: Fingerprint und
+      // Tastenfolgen stammen damit aus demselben Bildschirm, und die Vorschau
+      // kostet nicht je Option einen weiteren `modellLesen()`. Gesendet wird
+      // dabei nichts; der wirkliche Antwortweg liest beides frisch.
+      const einmal = new Map<string, ClaudePaneSnapshot | null>();
+      let stand: readonly MobileSessionRecord[] | null = null;
+      return mobilDialogRouten({
+        ...mobilDialogQuelle,
+        fresh: () => (stand ??= mobilFrisch()),
+        claudePane: (sitzung) => {
+          if (!einmal.has(sitzung.id)) einmal.set(sitzung.id, mobilClaudePane(sitzung));
+          return einmal.get(sitzung.id) ?? null;
+        },
+        sendKeys: async (call) => { aufzeichnen(call.keys); },
+      });
+    },
+    eingabeGesperrt: mobilEingabeGesperrt,
+  });
+}
+
+function mobilDienstErzeugen(): MobilDienst {
+  return mobilDienstBauen({
+    port: config.mobilePort,
+    origins: config.mobileOrigins,
+    origin: config.mobileOrigin,
+    betreiber: config.mobileOperator,
+    machine: config.machine,
+    serverBuild: MOBIL_BUILD,
+    pushVerzeichnis: join(config.stateDir, 'mobile'),
+    vapidDatei: config.mobileVapidFile,
+    huellenVerzeichnis: join(__dirname, '..', 'mobile'),
+    ...(process.platform === 'darwin' ? { replikation: { maschinen: config.remoteMachines, werkzeugVerzeichnis: join(__dirname, '..', '..', '..', 'deploy', 'mobile') } } : {}),
+  }, {
+    protokoll: mobilProtokoll,
+    sitzungen: {
+      fresh: mobilFrisch,
+      dataAgeMs: (r) => {
+        if (r.machine === config.machine) return 0;
+        const schnapp = fernStaende().find((x) => x.machine === r.machine);
+        return schnapp ? Math.max(0, Date.now() - schnapp.fetchedAt) : 0;
+      },
+      start: async (e) => {
+        let r: { gestartet: boolean; meldung: string };
+        try {
+          // `mensch = false`: der Geraetebeleg reicht nicht bis `wb-code --mensch`
+          // (herkunft.ts); es gilt der Effort-Deckel fuer Nicht-Menschen.
+          r = sessionAnlegen(e.directory, e.name, e.machine, { harness: e.harness, model: e.model }, false);
+        } catch (fehler) {
+          throw new MobileAuthError('bad_request', (fehler as Error).message);
+        }
+        if (!r.gestartet) throw new MobileAuthError('stale_target', r.meldung);
+        nachStartNachlesen();
+        const neu = mobilFrisch().find((x) => x.machine === e.machine && sessions.find((s) => mobilId(s) === x.id)?.dir === e.directory);
+        return neu ?? { id: `${e.machine}:${basename(e.directory)}`, name: e.name, machine: e.machine, harness: e.harness, model: e.model,
+          state: 'stopped', lastActive: new Date().toISOString(), workers: [], pendingApprovals: 0, binding: null };
+      },
+      resume: async (id) => {
+        const s = mobilSitzungAus(id);
+        try {
+          sessionWiederherstellen(s.id, false);
+        } catch (fehler) {
+          throw new MobileAuthError('stale_target', (fehler as Error).message);
+        }
+        nachStartNachlesen();
+        return mobilSitzung(s);
+      },
+      close: async (id) => {
+        const s = mobilSitzungAus(id);
+        const r = await menuePunktAusfuehren(s.id, 'schliessen', false, true);
+        // `wb-session-close` verweigert mit laufenden Workern (shell/wb-session-close,
+        // "… laufende Worker — verweigert"); einen Erzwingen-Weg bietet Mobil nicht an.
+        return { ok: r.ok, workersRunning: !r.ok && /laufende Worker/.test(r.meldung), message: r.meldung };
+      },
+    },
+    chat: {
+      fresh: mobilFrisch,
+      chatStand: async (r) => {
+        const s = mobilSitzungAus(r.id);
+        const anfrage = anfrageFuerPane(s.orchestratorPane, sessions, config.tmuxSocket);
+        if (!anfrage) return null;
+        return chatStand(anfrage, {
+          modelsFile: config.modelsFile, settingsFile: config.settingsFile,
+          uebersteuerung: mobileUebersteuerung(anfrage.rolle),
+        });
+      },
+      paneWrite: mobilPaneWrite,
+      protokoll: mobilProtokoll,
+      socketName: () => config.tmuxSocket,
+      orchestratorPane: (r) => sessions.find((s) => mobilId(s) === r.id)?.orchestratorPane ?? '',
+    },
+    freigaben: {
+      list: () => ({
+        requests: readRequests(config.requestsDir).map((q) => ({ path: q.path, parent: q.parent, childName: q.childName, task: q.task, ts: q.ts })),
+        guards: readGuardBlocks(config.guardBlocksDir, sessions, config.tmuxSocket).map((b) => ({
+          path: b.path, schluessel: b.schluessel, workerName: b.workerName, reason: b.reason, musterGrund: b.musterGrund, ts: b.ts, wartet: b.wartet,
+          sessionId: b.sessionId ? (b.machine && b.machine !== config.machine ? `${b.machine}:${b.sessionId}` : `${config.machine}:${b.sessionId}`) : '',
+        })),
+      }),
+      decideRequest: async (eintrag, entscheidung, grund, beleg) => {
+        const r = decideRequest(config.requestsDir, eintrag.path, entscheidung, grund, config.wbDecideBin, beleg);
+        freigabenAktualisieren();
+        return { ok: r.ok, message: r.output };
+      },
+      // Nur Ablehnen erreicht diesen Weg (approvals.ts); Ablehnen braucht keinen Nachweis.
+      decideGuard: async (eintrag, entscheidung, grund) => {
+        const r = musterEntscheiden(eintrag.schluessel, entscheidung, grund, { art: 'steuerkanal' });
+        return { ok: r.ok, message: r.output };
+      },
+    },
+    optionen: {
+      sessionOptions: () => {
+        const d = einstellungenDatenJetzt() as EinstellungsDaten;
+        const fern = remotePoller.snapshots();
+        return {
+          ordner: [...new Set(sessions.filter((s) => !s.machine || s.machine === config.machine).map((s) => s.dir).filter((x) => x.startsWith('/')))],
+          maschinen: [
+            { id: config.machine, name: config.machine, erreichbar: true },
+            ...fern.map((m) => ({ id: m.machine, name: m.machine, erreichbar: m.reachable })),
+          ],
+          harnesses: d.harnesses.map((h) => ({
+            id: h.id, name: h.label,
+            modelle: d.orchestratorModelle.filter((m) => m.harness === h.id && m.startbar !== false).map((m) => ({ id: m.id, name: m.label })),
+          })),
+        };
+      },
+      theme: () => {
+        const t = themaPayload(nativeTheme.shouldUseDarkColors, config.settingsFile, systemAkzentfarbeLesen());
+        return { thema: t.thema, wirksam: t.wirksam, akzent: t.akzent, akzentText: t.akzentText, accent: t.akzent };
+      },
+    },
+    agents: aufgabenQuelle,
+  });
+}
+
+/** Die Adresse des Dienstes und warum er nicht laeuft -- ohne je einen Code zu nennen. */
+function mobilStand(): Record<string, unknown> {
+  return {
+    ...mobilLage,
+    origin: config.mobileOrigin,
+    origins: config.mobileOrigins,
+    betreiberGesetzt: !!config.mobileOperator,
+    push: !!config.mobileVapidFile,
+    build: MOBIL_BUILD,
+    geraete: mobil?.geraete() ?? [],
+  };
+}
+
+/**
+ * Den Dienst nach der Einstellung ein- oder ausschalten. Aufgerufen beim Start
+ * und wenn sich settings.json aendert (derselbe Dateiwaechter wie fuer das
+ * Einstellungsfenster). Nacheinander, nie zweimal gleichzeitig.
+ */
+function mobilSchalten(): Promise<void> {
+  mobilWechsel = mobilWechsel.then(async () => {
+    const an = mobilServerAn(config.settingsFile) && !shuttingDown;
+    mobilLage = { ...mobilLage, an };
+    if (!an) {
+      if (mobil) {
+        const alt = mobil;
+        mobil = null;
+        await mitFrist(alt.stop(), 2000, 'Mobilen Server stoppen');
+        process.stderr.write('Mobil: Server gestoppt.\n');
+      }
+      mobilLage = { an, laeuft: false, port: 0, fehler: '' };
+      return;
+    }
+    if (mobil) return;
+    const fehlt = !config.mobileOrigins.length ? 'mobileOrigins fehlt in der Konfiguration'
+      : !config.mobileOrigin ? 'mobileOrigin fehlt in der Konfiguration'
+        : !config.mobileOrigins.includes(config.mobileOrigin) ? 'mobileOrigin steht nicht in mobileOrigins' : '';
+    if (fehlt) {
+      mobilLage = { an, laeuft: false, port: 0, fehler: fehlt };
+      process.stderr.write(`Mobil: Server nicht gestartet -- ${fehlt}.\n`);
+      return;
+    }
+    const dienst = mobilDienstErzeugen();
+    try {
+      const { port } = await dienst.start();
+      mobil = dienst;
+      mobilLage = { an, laeuft: true, port, fehler: '' };
+      process.stderr.write(`Mobil: Server auf 127.0.0.1:${port} fuer ${config.mobileOrigin}\n`);
+      const regungen = mobilRegungen();
+      mobil.sitzungenGesehen(sichtbare(sessions).map((s) => mobilSitzung(s, regungen)));
+    } catch (fehler) {
+      // Ein belegter Port nimmt nur den mobilen Dienst weg, nicht den Kern.
+      mobilLage = { an, laeuft: false, port: 0, fehler: (fehler as Error).message };
+      process.stderr.write(`Mobil: Server nicht gestartet -- ${(fehler as Error).message}\n`);
+    }
+  }).catch((fehler: unknown) => {
+    process.stderr.write(`Mobil: Schalten fehlgeschlagen -- ${(fehler as Error).message}\n`);
+  });
+  return mobilWechsel;
+}
+
+/**
+ * DER LOKALE MENSCH-WEG FUER KOPPLUNG UND WIDERRUF (Spezifikation 4.1 Punkt 2).
+ * Erreichbar nur ueber IPC -- das Einstellungsfenster oder den Mantel der
+ * Mac-Fassung --, nie ueber den Steuerkanal oder die mobile API. Zwei
+ * Bedingungen, beide noetig, wie bei `freigabeErteilen()`:
+ *   1. `echt`: der Klick traegt isTrusted (im Fenster geprueft) bzw. kommt aus
+ *      der nativen Oberflaeche ueber den Mantel-Socket mit Handschlag-Token;
+ *   2. `wb-mensch pruefen` bestaetigt die Oberflaechen-Ahnenreihe dieses Kerns.
+ */
+function mobilMenschGeprueft(echt: boolean): string {
+  if (!echt) return 'Nur mit einem echten Klick in der Werkbank am Mac -- nicht über Steuerkanal oder Skript.';
+  const probe = menschProbe(false);
+  return probe.ok ? '' : `${menschNichtErkannt(probe.grund)} -- Kopplung und Widerruf gehen nur am Mac.`;
+}
+
+ipc.handle('awb:mobil-stand', () => mobilStand());
+ipc.handle('awb:mobil-koppeln', (_e, echt: unknown) => {
+  const grund = mobilMenschGeprueft(echt === true);
+  if (grund) return { ok: false, meldung: grund };
+  if (!mobil) return { ok: false, meldung: mobilLage.fehler || 'Der mobile Server läuft nicht (Einstellung „Mobilgerät“).' };
+  try {
+    const start = mobil.koppelnStarten();
+    // Der Code geht NUR an die Oberflaeche, die ihn anzeigt -- kein Protokoll, keine Datei.
+    return { ok: true, code: start.pairing_code, ablauf: start.expires_at, origin: config.mobileOrigin };
+  } catch (fehler) {
+    return { ok: false, meldung: fehler instanceof MobileAuthError && fehler.message.includes('operator')
+      ? 'mobileOperator fehlt in der Konfiguration: ohne Tailscale-Anmeldung gibt es keine Kopplung.' : (fehler as Error).message };
+  }
+});
+ipc.handle('awb:mobil-widerrufen', (_e, deviceId: unknown, echt: unknown) => {
+  const grund = mobilMenschGeprueft(echt === true);
+  if (grund) return { ok: false, meldung: grund };
+  if (!mobil) return { ok: false, meldung: 'Der mobile Server läuft nicht.' };
+  const ok = mobil.widerrufen(String(deviceId ?? ''));
+  return { ok, meldung: ok ? 'Gerät widerrufen.' : 'Unbekanntes oder schon widerrufenes Gerät.' };
+});
+
+/** Takt des Kerns: Sitzungswechsel als Ereignis, stockende lokale Worker als Meldung. */
+const meldungWorkerStockt = new NeuheitsFilter();
+/** Welche lokale Claude-Sitzung zuletzt einen Dialog auf dem Bildschirm hatte. */
+const mobilDialogStand = new Map<string, boolean>();
+/** Der zuletzt gesehene Regungsstempel je Pane -- die Sparbremse des Takts. */
+const mobilPaneRegung = new Map<string, string>();
+
+/**
+ * Ein Aufruf statt einer Aufnahme je Pane: tmux nennt die Aktivitaetszeit des
+ * Fensters. Nur wo sie sich seit dem letzten Takt geaendert hat, lohnt eine
+ * neue `capture-pane`-Aufnahme -- ein Dialog erscheint nie ohne Ausgabe.
+ */
+function mobilRegungen(): Map<string, string> {
+  const r = spawnSync('tmux', [...(config.tmuxSocket ? ['-L', config.tmuxSocket] : []), 'list-panes', '-a', '-F', '#{pane_id}\t#{window_activity}'], {
+    encoding: 'utf8', timeout: 2000, killSignal: 'SIGKILL',
+  });
+  const karte = new Map<string, string>();
+  if (r.status !== 0) return karte;
+  for (const zeile of String(r.stdout ?? '').split('\n')) {
+    const [pane, stempel] = zeile.split('\t');
+    if (pane) karte.set(pane, stempel ?? '');
+  }
+  return karte;
+}
+
+/**
+ * `orchestrator.waiting` (Spezifikation 6) und `prompt.changed` (3.2): gemeldet
+ * wird der WECHSEL, also der Moment, in dem ein Dialog erscheint oder
+ * verschwindet. Gelesen wird dafuer eine Pane-Aufnahme je lokaler,
+ * lebender Claude-Sitzung -- derselbe Leser, den auch der Adapter benutzt, aber
+ * ohne Versionspruefung: fuer „hier wartet ein Dialog" genuegt die Form des
+ * Bildschirms, und ein nicht gemessener Dialog wartet genauso.
+ */
+function mobilDialogeImTakt(dienst: MobilDienst, sichtbar: readonly SessionInfo[], regungenImTakt?: ReadonlyMap<string, string>): void {
+  const kandidaten = sichtbar.filter((s) => (!s.machine || s.machine === config.machine) && s.alive && s.harness === 'claude'
+    && /^%[0-9]+$/.test(s.orchestratorPane));
+  if (!kandidaten.length) {
+    mobilDialogStand.clear();
+    mobilPaneRegung.clear();
+    return;
+  }
+  const regungen = regungenImTakt ?? mobilRegungen();
+  const jetzt = new Set<string>();
+  for (const s of kandidaten) {
+    const pane = s.orchestratorPane;
+    const id = mobilId(s);
+    jetzt.add(id);
+    const stempel = regungen.get(pane) ?? '';
+    // Nichts ist passiert und der Stand ist bekannt: keine Aufnahme.
+    if (stempel && stempel === mobilPaneRegung.get(pane) && mobilDialogStand.has(id)) continue;
+    const text = mobilPaneText(pane);
+    if (!text) continue;
+    mobilPaneRegung.set(pane, stempel);
+    const offen = parseClaudeDialog(text).state !== 'none';
+    const vorher = mobilDialogStand.get(id);
+    mobilDialogStand.set(id, offen);
+    // Der erste Blick auf einen leeren Bildschirm ist keine Aenderung; ein
+    // Dialog, der beim Start schon wartet, sehr wohl.
+    if (offen === vorher || (vorher === undefined && !offen)) continue;
+    dienst.events.publish('prompt.changed', [id]);
+    if (offen) dienst.melden('orchestrator.waiting', id, 'dialog');
+  }
+  for (const id of [...mobilDialogStand.keys()]) if (!jetzt.has(id)) mobilDialogStand.delete(id);
+  const panes = new Set(kandidaten.map((s) => s.orchestratorPane));
+  for (const pane of [...mobilPaneRegung.keys()]) if (!panes.has(pane)) mobilPaneRegung.delete(pane);
+}
+
+function mobilTakt(): void {
+  if (!mobil) return;
+  const sichtbar = sichtbare(sessions);
+  // EIN tmux-Aufruf je Takt fuer beide Fragen: waechst ein Chat (`chat.changed`),
+  // und hat sich ein Dialog geoeffnet oder geschlossen (`prompt.changed`).
+  const regungen = mobilRegungen();
+  mobil.sitzungenGesehen(sichtbar.map((s) => mobilSitzung(s, regungen)));
+  mobilDialogeImTakt(mobil, sichtbar, regungen);
+  // `worker.stalled`: nur lokale Worker; fuer Spiegel ist der Zustand nicht gemessen (Spezifikation 6).
+  const stockend = sessions.filter((s) => !s.machine || s.machine === config.machine)
+    .flatMap((s) => s.workers.filter((w) => w.state === 'stalled').map((w) => ({ s, w, schluessel: `${s.id}/${w.name}` })));
+  const neu = new Set(meldungWorkerStockt.neue(stockend.map((x) => x.schluessel)));
+  for (const x of stockend) if (neu.has(x.schluessel)) mobil.melden('worker.stalled', mobilId(x.s), x.schluessel);
+}
+
 let shuttingDown = false;
 async function shutdown(code: number): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   if (uhr) clearInterval(uhr);
   remotePoller.stop();
+  gastPoller.stop();
+  gastBeenden();
   budgetPoller.stop();
+  harnessUpdateScheduler.stop();
   aufgabenQuelle.stop();
+  // Der mobile Server geht mit dem Kern (Spezifikation 2.1): offene SSE-Stroeme werden getrennt.
+  if (mobil) {
+    const alt = mobil;
+    mobil = null;
+    await mitFrist(alt.stop(), 2000, 'Mobilen Server stoppen');
+  }
   // Was diese App gestartet hat, beendet sie auch -- und wartet darauf, dass
   // es wirklich weg ist (Befund B5, 12.08.). Ohne das `await` lief
   // `app.exit()` in aller Regel frueher als das Nachfassen nach zwei
@@ -8307,13 +9731,91 @@ async function hauptfensterAufbauen(): Promise<void> {
   await win.loadFile(join(__dirname, '..', 'renderer', 'index.html'));
 }
 
+/**
+ * Wartet, bis am Mantel-Socket niemand mehr antwortet (Frist
+ * `AWB_MANTEL_WARTE_MS`, Vorgabe 15 s). true: frei, false: belegt geblieben.
+ */
+async function mantelSocketFreiAbwarten(pfad: string): Promise<boolean> {
+  const bis = Date.now() + (Number(process.env.AWB_MANTEL_WARTE_MS) || 15000);
+  let gemeldet = false;
+  for (;;) {
+    if (!existsSync(pfad) || await socketVerwaist(pfad)) return true;
+    if (Date.now() >= bis) return false;
+    if (!gemeldet) {
+      process.stderr.write(`Mantel-Socket ${pfad} ist noch belegt -- warte, ob der Vorbesitzer geht.\n`);
+      gemeldet = true;
+    }
+    await new Promise<void>((r) => { setTimeout(r, 500); });
+  }
+}
+
+/**
+ * DER KERN GEHT MIT SEINER APP (11.10.2026, kern-steuerkanal, gemessen).
+ *
+ * Die Mac-App startet ihren Kern als eigenes Kind (Kernstart.swift) und raeumt
+ * ihn in `applicationWillTerminate` ab. Stuerzt sie ab, laeuft dieser Code nie:
+ * der Kern blieb als Waise stehen, hielt den Mantel-Socket und seinen `tmux -C`
+ * an der Sitzung -- und die neu gestartete App traf an diesem Socket den alten
+ * Kern, der ihren neuen Token abwies. Gemessen auf a4ed8089: sechs von sechs
+ * Neustarts nach SIGKILL der App blieben „nicht verbunden", die Waisen
+ * sammelten sich (sieben Kerne nach sechs Starts). Genau Befund des Nutzers.
+ *
+ * Gewacht wird nur, wenn der Elternprozess beim Start die Werkbank-App ist
+ * (`…/Contents/MacOS/Werkbank`) oder `AWB_ELTERN_WACHE=1` es verlangt -- ein
+ * Kern aus `mac/bin/starten` oder aus einer Pruefung hat einen anderen Eltern-
+ * prozess und bleibt, wie er ist. Stirbt der Elternprozess, wechselt
+ * `process.ppid` (gemessen: auf 1), und der Kern geht seinen geordneten Weg.
+ */
+function elternWacheStarten(): void {
+  if (!config.mantelSocket) return;
+  const eltern = process.ppid;
+  let wachen = process.env.AWB_ELTERN_WACHE === '1';
+  if (!wachen && process.platform === 'darwin' && eltern > 1) {
+    const r = spawnSync('/bin/ps', ['-o', 'comm=', '-p', String(eltern)], { encoding: 'utf8', timeout: 2000, killSignal: 'SIGKILL' });
+    wachen = /\/Contents\/MacOS\/Werkbank$/.test((r.stdout || '').trim());
+  }
+  if (!wachen || eltern <= 1) return;
+  process.stderr.write(`Elternwache: der Kern geht mit seiner App (PID ${eltern}).\n`);
+  const uhr = setInterval(() => {
+    if (process.ppid === eltern) return;
+    clearInterval(uhr);
+    process.stderr.write(`Elternwache: die App (PID ${eltern}) ist weg -- der Kern beendet sich.\n`);
+    void shutdown(0);
+  }, 1000);
+  uhr.unref();
+}
+
 app.whenReady().then(async () => {
+  // EIN KERN JE MANTEL-SOCKET (11.10.2026, kern-steuerkanal). Startet die
+  // Mac-App ein zweites Mal (um 04:23 gemessen: zweite Instanz neben der
+  // laufenden), startet sie auch einen zweiten Kern auf DENSELBEN
+  // Laufverzeichnis-Pfad. Der bekam seinen Mantel-Socket nie (er gehoert dem
+  // laufenden Kern), lief aber trotzdem weiter: hing einen zweiten `tmux -C`
+  // an die Sitzung des Menschen, nahm Groessen und Lebensspur mit -- und
+  // blieb nach einem Absturz seiner App als Waise stehen. Deshalb hier ZUERST,
+  // vor jeder Wirkung nach aussen: antwortet am Mantel-Socket schon ein Kern,
+  // geht dieser sofort wieder, ohne etwas anzufassen.
+  //
+  // ABER ERST NACH EINER KURZEN FRIST (11.10.2026, gemessen). Der haeufigste
+  // Vorbesitzer ist kein lebender Zwilling, sondern der Kern einer eben
+  // abgestuerzten App: er geht von selbst (`elternWacheStarten`), braucht
+  // dafuer aber ein, zwei Sekunden. Ein Neustart ueber das Dock kommt oft
+  // schneller -- dann wartet dieser Kern, bis der Socket frei ist, statt die
+  // neue App ohne Kern stehen zu lassen.
+  if (config.mantelSocket && existsSync(config.mantelSocket) && !(await mantelSocketFreiAbwarten(config.mantelSocket))) {
+    process.stderr.write(`Mantel-Socket ${config.mantelSocket} gehoert schon einem laufenden Kern -- `
+      + 'dieser zweite Kern beendet sich, ohne anzuhaengen.\n');
+    app.exit(3);
+    return;
+  }
+  elternWacheStarten();
   // DIE SPRACHE DES SYSTEMS, bevor irgendein Fenster entsteht (03.09.2026).
   // Ohne Einstellung fiel die Oberflaeche bisher auf Englisch, und der erste
   // Blick auf ein frisches Programm war englisch, obwohl der Mac auf Deutsch
   // steht. `app.getLocale()` gibt es erst nach `whenReady`; die Einstellung
   // schlaegt diesen Wert weiterhin (einstellungen.ts, `sprache`).
   systemSpracheSetzen(app.getLocale());
+  modellDiscoveryStarten();
   // DAS FENSTER ZUERST. Frueher stand der Steuerkanal davor, und ein belegter
   // Socket liess `listen()` scheitern, BEVOR ueberhaupt ein Fenster entstand --
   // die Ablehnung flog ungefangen aus diesem then(), der Prozess lief weiter,
@@ -8491,6 +9993,7 @@ app.whenReady().then(async () => {
           mantel?.push('awb:kanal', { pfad: config.controlSocket, fehler: kanalFehler });
           modellSenden();
           mantel?.push('awb:aufgaben', aufgabenQuelle.aktuell());
+          freigabenGesendet.vergessen();
           if (attachState) {
             const active = attachState.panes.find((p) => p.paneId === streamPane) ?? attachState.panes[0];
             mantel?.push('awb:session', {
@@ -8535,8 +10038,14 @@ app.whenReady().then(async () => {
   }
 
   remotePoller.start();
+  gastPoller.start();
   budgetPoller.start();
   aufgabenQuelle.start();
+  // Nach geladener Konfiguration, in beiden Betriebsarten (Spezifikation 2.1).
+  // Die gemessenen Harnessdialoge zuerst: die Registrierung gilt modulweit und
+  // damit auch fuer einen Server, den der Schalter spaeter neu aufbaut.
+  mobilDialogeAnmelden();
+  void mobilSchalten();
   // Reste-Auftrag, Punkt 3: die Seiten frischen sich auf, wenn ihre Datei sich
   // von aussen aendert -- gemeldet wird nur die betroffene Seite; ob wirklich
   // neu gezeichnet wird, entscheidet allein der Renderer (aufDateiAendern).
@@ -8554,6 +10063,9 @@ app.whenReady().then(async () => {
       // wird immer die ganze Seite: dieses Fenster haelt keinen Entwurf, den
       // eine Auffrischung zerstoeren koennte.
       anFenster(einstellungsfenster.aktuell(), 'awb:ein-daten-neu', () => einstellungenDatenJetzt());
+      if (seite === 'einstellungen') {
+        anFenster(sitzungsfenster.aktuell(), 'awb:sitz-wahl-neu', () => sitzWahlDatenJetzt());
+      }
       // Das SITZUNGSFENSTER aus demselben Grund, nur an der anderen Datei: seine
       // Liste IST der Inhalt von ~/.claude/workbench/sessions/, und die schreibt
       // `wb-code` von aussen. Ein eingetippter Name ueberlebt die Auffrischung
@@ -8562,7 +10074,11 @@ app.whenReady().then(async () => {
       // Farben durchreichen: `thema` und `zustandsfarben` stehen in derselben
       // Datei -- eine Aenderung im Einstellungsfenster faellt hier unter
       // 'einstellungen' und erreicht die uebrigen Fenster ueber denselben Weg.
-      if (seite === 'einstellungen') themaSenden();
+      if (seite === 'einstellungen') {
+        themaSenden();
+        // `mobileServer` steht in derselben Datei: ein Umschalten wirkt ohne Neustart.
+        void mobilSchalten();
+      }
     },
   });
   sessions = modellLesen();
@@ -8571,7 +10087,17 @@ app.whenReady().then(async () => {
   // Der Befund gehoert VOR das Anhaengen gelesen: `modellLesen` hat ihn gerade
   // gesetzt, und attachTmux kann ihn nicht mehr aendern.
   startAnhaengenNachholen = !tmuxBefund.ausfuehrbar;
-  await attachTmux(start?.alive ? start.tmuxSession : config.session);
+  const startSitzung = start?.alive ? start.tmuxSession : config.session;
+  await attachTmux(startSitzung);
+  // Scheitert das Anhaengen beim Start an einer laufenden Sitzung -- etwa weil
+  // tmux unter der Last eines Neustarts nach einem Absturz nicht in seiner
+  // Frist antwortet --, bleibt die Buehne nicht leer: derselbe begrenzte
+  // Wiederanlauf wie nach einem Abriss (11.10.2026, kern-steuerkanal).
+  // `startAnhaengenNachholen` deckt den anderen Fall (tmux fehlt ganz).
+  if (!tmux && attachError && startSitzung && !startAnhaengenNachholen) {
+    process.stderr.write(`Steuerkanal: Anhaengen beim Start gescheitert (${attachError})\n`);
+    wiederanlaufPlanen(startSitzung, 1, attachError);
+  }
   if (start) ui.set({ selected: start.id });
   modellSenden();
   freigabenAktualisieren();
@@ -8642,9 +10168,10 @@ app.whenReady().then(async () => {
             }
           }
         }
-        modellSenden();
+        modellSenden(true);
         freigabenAktualisieren();
         ergebnissePruefen();
+        mobilTakt();
         budgetMeldungPruefen();
         // Die Kontextwache der Chat-Sitzungen (15.08.). Sie haengt an diesem
         // Takt und nicht an einer eigenen Uhr: ihre Fristen und die Anzeige
@@ -8659,6 +10186,10 @@ app.whenReady().then(async () => {
   // still vermerkt (results.ts), und ein Ergebnis, das gerade eben entstanden
   // ist, meldet sich ohne Wartezeit.
   ergebnissePruefen();
+  // Nicht im kritischen Startpfad: der erste Lauf wartet zwanzig Sekunden.
+  // Danach liest der Scheduler das aktuelle Intervall erneut; die Sperrdatei
+  // des Shell-Werkzeugs verhindert parallel laufende App-Instanzen.
+  harnessUpdateScheduler.start();
 
   // Sichtbar startet das Fenster nur, wenn ein MENSCH es ausdruecklich
   // verlangt. Kein Automatismus fuehrt hierher.

@@ -32,7 +32,7 @@
 //
 // Gemessen auf dieser Maschine, in genau der Umgebung des Finder-Starts
 // (`env -i HOME=… PATH=/usr/bin:/bin:/usr/sbin:/sbin`): der Aufruf braucht
-// 18 ms und liefert `/Users/alice/.local/bin:/opt/homebrew/bin:…` -- beide
+// 18 ms und liefert `$HOME/.local/bin:/opt/homebrew/bin:…` -- beide
 // Orte, die gefehlt haben.
 //
 // ANGEHAENGT, NIE VORANGESTELLT. Der geerbte PATH behaelt seine Reihenfolge
@@ -91,9 +91,9 @@
 // `LC_CTYPE`: LC_ALL ueberstimmt LC_CTYPE, und ein geerbtes `LC_ALL=C` haette
 // die Ergaenzung sonst wirkungslos gemacht.
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 /**
  * Die Marke, an der die Zeilen aus der Ausgabe der Anmelde-Shell erkannt
@@ -229,13 +229,40 @@ export function spracheHerrichten(env: NodeJS.ProcessEnv, ausShell: Record<strin
  * ausfaellt -- `~/.local/bin` ist der Ort, an dem in diesem Haus jedes
  * `wb-*`-Werkzeug liegt, auf dem Mac wie auf Peer.
  *
- * `homedir()` statt eines geschriebenen Pfades: `/Users/alice` gaebe es auf
+ * `homedir()` statt eines geschriebenen Pfades: ein Mac-Heimatpfad gaebe es auf
  * Peer nicht, und ein Paket, das an einem Benutzernamen haengt, laeuft nur bei
  * genau einem Menschen.
  */
 function heimatOrte(env: NodeJS.ProcessEnv): string[] {
   const heim = env.HOME ?? homedir();
   return [join(heim, '.local', 'bin'), join(heim, 'bin')].filter((p) => existsSync(p));
+}
+
+/**
+ * DER ORDNER DER HARNESS-SYMLINKS GEHOERT NICHT IN DEN PATH DER WERKBANK (11.10.).
+ *
+ * `shell/wb-harness-run` stellt `~/.local/state/wb-harness-bin` vor den PATH
+ * eines Harness-Starts (Symlinks wie `codex` oder `opencode` direkt auf die
+ * echten Programme, gegen die Wrapper-Schleife). Wird eine Werkbank aus so
+ * einem Pane gestartet, erbt sie diesen PATH -- und der Harness-Updater, den der
+ * Kern startet, fand auf peer die Symlinks statt der mise-Shims und
+ * aktualisierte codex, copilot und crush ueber npm/brew statt ueber mise.
+ *
+ * Entfernt wird jeder Eintrag, dessen realpath dem des Ordners entspricht
+ * (auch mit `~/` am Anfang oder Schraegstrich am Ende); sonst bleibt der PATH
+ * unveraendert. Ein Harness-Start INNERHALB der Werkbank stellt den Ordner
+ * weiter selbst voran.
+ */
+export function harnessBinEntfernen(eintraege: string[], env: NodeJS.ProcessEnv = process.env): string[] {
+  const heim = env.HOME ?? homedir();
+  const echt = (p: string): string => {
+    try { return realpathSync(p); } catch { return resolve(p); }
+  };
+  const ziel = echt(join(heim, '.local', 'state', 'wb-harness-bin'));
+  return eintraege.filter((p) => {
+    const voll = p === '~' ? heim : p.startsWith('~/') ? join(heim, p.slice(2)) : p;
+    return echt(voll) !== ziel;
+  });
 }
 
 /**
@@ -275,12 +302,12 @@ export function pfadZusammenfuehren(geerbt: string[], ...weitere: string[][]): {
  * an der Shell, und ohne sie waere die Nachstellung eine andere Baustelle.
  */
 export function pfadHerrichten(env: NodeJS.ProcessEnv = process.env): PfadBefund {
-  const geerbt = zerlegen(env.PATH ?? '');
+  const geerbt = harnessBinEntfernen(zerlegen(env.PATH ?? ''), env);
   const ohneShell = env.AWB_PFAD_ANMELDESHELL === '0';
   const shellBefund = ohneShell
     ? { werte: {} as Record<string, string>, shell: '', fehler: 'per AWB_PFAD_ANMELDESHELL=0 abgeschaltet' }
     : anmeldeShellUmgebung(env);
-  const ausShell = shellBefund.werte.PATH ? zerlegen(shellBefund.werte.PATH) : [];
+  const ausShell = shellBefund.werte.PATH ? harnessBinEntfernen(zerlegen(shellBefund.werte.PATH), env) : [];
   const { pfad, dazu } = pfadZusammenfuehren(geerbt, ausShell, heimatOrte(env));
   env.PATH = pfad;
   const locale = spracheHerrichten(env, shellBefund.werte);

@@ -301,6 +301,8 @@ export class TmuxControl extends EventEmitter {
   private blockId = '';
   private pending: Pending[] = [];
   private closed = false;
+  /** Ob 'closed' schon hinausging -- es gibt genau ein Ende je Kanal. */
+  private endeGemeldet = false;
   // Ausgabe, die zwischen dem Anhaengen und dem ersten gezeichneten Bild
   // ankommt, darf weder verlorengehen noch doppelt erscheinen. Sie wird
   // deshalb gesammelt und mit einer laufenden Nummer versehen: verworfen wird
@@ -498,8 +500,24 @@ export class TmuxControl extends EventEmitter {
     // Hauptprozess -- das Fenster ginge an einem beendeten tmux zugrunde. WAS
     // nicht ankam, sagt der Rueckruf in `command()`; hier steht nur, dass es
     // den Kanal getroffen hat.
-    this.proc.stdin.on('error', (fehler: NodeJS.ErrnoException) => {
-      process.stderr.write(`Steuerkanal: Schreibweg gestoert (${fehler.code ?? fehler.message})\n`);
+    //
+    // UND EIN GESTOERTER SCHREIBWEG IST EIN ENDE (11.10.2026, kern-steuerkanal).
+    // Bis dahin stand hier nur die Zeile im Protokoll: der Kanal galt weiter als
+    // offen, jeder folgende Befehl scheiterte einzeln, und niemand verband neu.
+    // Jetzt meldet er sich wie ein beendeter Steuerclient ('closed'), und der
+    // Prozess wird mitgenommen -- ein tmux -C, dem niemand mehr schreiben kann,
+    // ist nicht mehr zu gebrauchen.
+    const proc = this.proc;
+    proc.stdin.on('error', (fehler: NodeJS.ErrnoException) => {
+      const grund = `Schreibweg gestoert (${fehler.code ?? fehler.message})`;
+      process.stderr.write(`Steuerkanal: ${grund}\n`);
+      this.letzterFehlertext = grund;
+      this.endeMelden(null, null, grund);
+      try {
+        proc.kill('SIGTERM');
+      } catch {
+        // Schon weg.
+      }
     });
     this.proc.stdout.on('data', (b: Buffer) => this.feed(b));
     this.proc.stderr.on('data', (b: Buffer) => {
@@ -511,19 +529,19 @@ export class TmuxControl extends EventEmitter {
       if (zeile) this.letzterFehlertext = zeile;
       this.emit('stderr', text);
     });
+    // Laesst sich der Steuerclient gar nicht starten (tmux/ssh fehlt), kommt nur
+    // 'error' und kein 'exit' -- ohne dieses Ohr eine unbehandelte Ausnahme im
+    // Hauptprozess (27.09.2026). Behandelt wie ein sofortiges Ende.
+    this.proc.on('error', (fehler: NodeJS.ErrnoException) => {
+      this.letzterFehlertext = `${argv[0]} liess sich nicht starten (${fehler.code ?? fehler.message})`;
+      this.endeMelden(null, null, this.letzterFehlertext);
+    });
     this.proc.on('exit', (code, signal) => {
-      this.closed = true;
-      const err = new Error(`Steuerclient beendet (${code})`);
-      while (this.pending.length) {
-        const p = this.pending.shift()!;
-        if (p.uhr) clearTimeout(p.uhr);
-        p.reject(err);
-      }
       // Das SIGNAL gehoert dazu, nicht nur der Rueckgabewert: wird der
       // ssh-Prozess umgebracht -- weil das Netz ihn mitreisst, weil jemand
       // aufraeumt --, ist `code` null, und „beendet mit Code null" waere ein
       // Satz, aus dem niemand etwas ablesen kann.
-      this.emit('closed', code, signal);
+      this.endeMelden(code, signal, `Steuerclient beendet (${code})`);
     });
 
     // Auf %session-changed warten, damit der erste unangeforderte %begin/%end-
@@ -1680,7 +1698,12 @@ export class TmuxControl extends EventEmitter {
    * dafuer stehen assertPaneId und assertSessionName (B4).
    */
   command(cmd: string, atEnd?: () => void): Promise<string[]> {
-    if (!this.proc || this.closed) return Promise.reject(new Error('Steuerclient nicht verbunden'));
+    // Ein geschlossener oder beendeter Schreibweg gilt als nicht verbunden:
+    // ein `write` darauf kaeme sonst als ERR_STREAM_WRITE_AFTER_END zurueck
+    // (gemessen am Kernlog vom 11.10., 03:56), und zwar erst asynchron.
+    if (!this.proc || this.closed || this.proc.stdin.writableEnded || this.proc.stdin.destroyed) {
+      return Promise.reject(new Error('Steuerclient nicht verbunden'));
+    }
     if (/[\r\n]/.test(cmd)) return Promise.reject(new Error('Befehl enthaelt einen Zeilenumbruch'));
     return new Promise<string[]>((resolve, reject) => {
       const eintrag: Pending = { resolve, reject, atEnd };
@@ -1866,6 +1889,25 @@ export class TmuxControl extends EventEmitter {
     this.emit('notification', line);
   }
 
+  /**
+   * Das EINE Ende dieses Kanals: offene Befehle bekommen ihre Absage, und
+   * 'closed' geht genau einmal hinaus -- gleich, ob der Prozess endete, sich
+   * nicht starten liess oder sein Schreibweg riss. Ein zweites 'closed' liesse
+   * den Hauptprozess zweimal neu verbinden.
+   */
+  private endeMelden(code: number | null, signal: NodeJS.Signals | null, grund: string): void {
+    this.closed = true;
+    const err = new Error(grund);
+    while (this.pending.length) {
+      const p = this.pending.shift()!;
+      if (p.uhr) clearTimeout(p.uhr);
+      p.reject(err);
+    }
+    if (this.endeGemeldet) return;
+    this.endeGemeldet = true;
+    this.emit('closed', code, signal);
+  }
+
   /** Loest den Steuerclient. Die tmux-Session laeuft weiter (V4-Grundlage). */
   /**
    * Den Kanal WEGWERFEN, ohne tmux noch etwas zu fragen.
@@ -1919,6 +1961,11 @@ export class TmuxControl extends EventEmitter {
       this.zustandZurueck().catch(() => undefined),
       new Promise<void>((r) => { setTimeout(r, this.maschine ? 4000 : 2000); }),
     ]);
+    // AB HIER NIMMT DER KANAL NICHTS MEHR AN (11.10.2026). Ein Befehl, der
+    // waehrend des Abloesens kommt -- eine Flaechenmeldung, die `paneZeigen`
+    // ausloest --, bekam vorher den Schreibweg nach `stdin.end()` zu fassen:
+    // „write after end" im Kernlog. Jetzt bekommt er sofort „nicht verbunden".
+    this.closed = true;
     await new Promise<void>((resolve) => {
       const done = setTimeout(() => {
         p.kill('SIGTERM');

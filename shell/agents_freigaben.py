@@ -30,7 +30,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import smtplib
 import ssl
 import subprocess
@@ -431,17 +430,26 @@ def _kanal(root: Path, absender: str, text: str) -> None:
 # Mensch -------------------------------------------------------------------------------------------
 def mensch_messen(runner: Callable[..., Any] = subprocess.run) -> tuple[str, str]:
     """Herkunft des Aufrufers ueber wb-mensch (wie wb-freigabe): ("mensch"|"agent", Begruendung)."""
-    kandidat = Path.home() / ".local" / "bin" / "wb-mensch"
-    programm = str(kandidat) if os.access(kandidat, os.X_OK) else shutil.which("wb-mensch")
-    if not programm:
-        return "agent", "wb-mensch nicht gefunden — ohne Messung gilt: kein Mensch."
-    try:
-        ergebnis = runner([programm, "beleg"], capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return "agent", "wb-mensch nicht ausfuehrbar (%s)" % type(exc).__name__
-    zeile = (ergebnis.stdout or "").strip().splitlines()[-1:] or [""]
-    art, _, grund = zeile[0].partition("\t")
-    return ("mensch" if art == "mensch" else "agent"), grund.strip()[:300]
+    paths = ad._trusted_wb_mensch_paths()
+    if not paths:
+        return "agent", "das echte Heimatverzeichnis ist nicht bestimmbar"
+    gruende = []
+    for path in paths:
+        if not path.is_file() or not os.access(path, os.X_OK):
+            return "agent", "wb-mensch am festen Pfad %s fehlt" % path
+        try:
+            ergebnis = runner([str(path), "beleg"], capture_output=True, text=True, timeout=10,
+                              check=False, env=ad._human_probe_env())
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "agent", "wb-mensch nicht ausfuehrbar (%s)" % type(exc).__name__
+        zeilen = (ergebnis.stdout or "").splitlines()
+        if len(zeilen) != 1 or "\t" not in zeilen[0]:
+            return "agent", "wb-mensch liefert keinen gueltigen Beleg"
+        art, grund = zeilen[0].split("\t", 1)
+        if art != "mensch" or not grund.strip():
+            return "agent", grund.strip()[:300] or art
+        gruende.append(grund.strip()[:300])
+    return "mensch", "; ".join(gruende)
 
 
 def _beleg(bestaetigt: bool, wortlaut: Optional[str], messung: Optional[tuple[str, str]]) -> dict[str, Any]:
@@ -548,6 +556,10 @@ def _hauptagent(root: Path, sender: str, rolle: Optional[str], was: str) -> dict
     if actor.get("role") != "hauptagent":
         raise FreigabeFehler("%s darf nur der Hauptagent der Welt; ein %s fragt ihn" % (
             was, ad._STAGE_WORDS.get(actor.get("role"), actor.get("role"))))
+    try:
+        actor = ad._require_governance_actor(root, sender, rolle, ("hauptagent",))
+    except ad.AgentsError as exc:
+        raise FreigabeFehler(str(exc)) from None
     return actor
 
 

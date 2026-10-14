@@ -2,7 +2,8 @@
 
 Dead wikilinks, stale `Stand:` markers, expired `review-after:` TTLs, orphans,
 dead asset paths, MOC completeness, oversized notes and duplicate frontmatter
-blocks (Basic-Memory prepends its own). Findings land in the health report; the
+blocks (Basic-Memory prepends its own) and Schema-4 violations (`schema.py`: mandatory
+fields, type vocabulary, class against path; new notes counted apart from the stock). Findings land in the health report; the
 actionable ones additionally in the review-queue.
 """
 from __future__ import annotations
@@ -13,8 +14,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, frontmatter
-from .audit import dead_links, stale_claims
+from . import config, frontmatter, schema
+from .audit import dead_links, fuzzy_key, memory_target_keys, stale_claims, stale_months_for
 from .heat import cold_notes
 from .ingest import asset_file
 from .maintain import find_orphans
@@ -28,6 +29,19 @@ MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 # kinds that are worth bothering der Nutzer with directly. cold-note is NOT in
 # here: maintenance queues those (capped), the report lists them all.
 QUEUE_KINDS = ("dead-asset-path", "review-after-expired")
+
+# Pruefstatus kanonischer Seiten (b6-verifikation, Guru-/Notion-Prinzip): kanonisch sind Notizen
+# mit `type: system|decision|pitfall|term` und alle KERN.md/STATUS.md. `brain pruefen` setzt
+# `verified`/`verified-by`/`review-after`; hier wird der Bestand gezaehlt und die faelligen Seiten
+# landen gedeckelt in der Review-Queue. Die Suche liest das Signal bewusst noch nicht (erst nach
+# gepaarter Messung).
+KANONISCH_TYPEN = frozenset({"system", "decision", "pitfall", "term"})
+KANONISCH_DATEIEN = frozenset({"KERN.md", "STATUS.md"})
+PRUEF_KIND = "pruefung-faellig"
+PRUEF_WOCHENLIMIT = 10
+PRUEF_MONATE = 3
+_VERIFIED_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_QUEUE_ZEILE_RE = re.compile(r"^- (\d{4}-\d{2}-\d{2}): Lint \[" + re.escape(PRUEF_KIND) + r"\]", re.M)
 
 
 @dataclass(frozen=True)
@@ -55,6 +69,58 @@ def expired_reviews(notes: list[Note], today: dt.date | None = None) -> list[Fin
             out.append(Finding("review-after-expired", n.rel,
                                f"review-after: {raw} ist erreicht/ueberschritten"))
     return out
+
+
+def ist_kanonisch(n: Note) -> bool:
+    parts = Path(n.rel).parts
+    if config.STAGING_DIR in parts[:1] or "sessions" in parts:
+        return False
+    if n.ntype == "session":
+        return False
+    return n.ntype in KANONISCH_TYPEN or parts[-1] in KANONISCH_DATEIEN
+
+
+def _review_faellig(raw: str, today: dt.date) -> bool:
+    """`review-after` ist erreicht: Monat (`JJJJ-MM`, Vault-Konvention) oder Tag (`JJJJ-MM-TT`)."""
+    raw = raw.strip()
+    idx = _month_index(raw)
+    if idx is not None:
+        return idx <= today.year * 12 + today.month
+    try:
+        return dt.date.fromisoformat(raw) <= today
+    except ValueError:
+        return False
+
+
+def pruef_status(notes: list[Note], today: dt.date | None = None) -> dict:
+    """Bestand des Pruefstatus. `verifiziert` = gueltiges `verified`-Datum UND `review-after`
+    nicht erreicht (abgelaufene Seiten verlieren das Haekchen, Notion-Prinzip); `faellig` =
+    `review-after` erreicht; `nie` = kein gueltiges `verified`. Listen sind Pfade, sortiert."""
+    today = today or dt.date.today()
+    kanon = sorted((n for n in notes if ist_kanonisch(n)), key=lambda n: n.rel)
+    faellig, nie, gueltig = [], [], []
+    for n in kanon:
+        verified = _VERIFIED_RE.match(str(n.fm.get("verified") or "").strip()) is not None
+        due = _review_faellig(str(n.fm.get("review-after") or ""), today)
+        if due:
+            faellig.append(n.rel)
+        if not verified:
+            nie.append(n.rel)
+        elif not due:
+            gueltig.append(n.rel)
+    return {"kanonisch": len(kanon), "verifiziert": len(gueltig), "faellig": faellig, "nie": nie}
+
+
+def pruefung_faellig(notes: list[Note], today: dt.date | None = None) -> list[Finding]:
+    """Kanonische Seiten mit erreichtem `review-after`, aelteste Frist zuerst."""
+    today = today or dt.date.today()
+    rows = []
+    for n in notes:
+        raw = str(n.fm.get("review-after") or "").strip()
+        if ist_kanonisch(n) and _review_faellig(raw, today):
+            rows.append((raw, n.rel))
+    return [Finding(PRUEF_KIND, rel, f"review-after: {raw} erreicht - `brain pruefen {rel}`")
+            for raw, rel in sorted(rows)]
 
 
 def dead_asset_paths(vault: Path, notes: list[Note]) -> list[Finding]:
@@ -175,17 +241,40 @@ def missing_beleg(notes: list[Note]) -> list[Finding]:
     return out
 
 
+def schema_findings(notes: list[Note], stichtag: str = schema.STICHTAG) -> list[Finding]:
+    """Schema-4-Verstoesse, je Notiz ein Befund: `schema-neu` (created ab Stichtag) getrennt von
+    `schema-bestand`, damit der Altbestand die neuen Verstoesse nicht zudeckt. Doppelte
+    Frontmatter-Bloecke meldet `duplicate_frontmatter` schon, sie zaehlen hier nicht doppelt."""
+    out = []
+    for n in notes:
+        if not schema.im_geltungsbereich(n.rel):
+            continue
+        befunde = [b for b in schema.pruefe(n.rel, n.text) if b.kind != "mehrfach-frontmatter"]
+        if befunde:
+            kind = "schema-neu" if schema.ist_neu(n.text, stichtag) else "schema-bestand"
+            out.append(Finding(kind, n.rel, "; ".join(b.detail for b in befunde)))
+    return out
+
+
 def run_lint(vault: Path, notes: list[Note], heat: dict | None = None,
              today: dt.date | None = None) -> list[Finding]:
     today = today or dt.date.today()
     findings: list[Finding] = []
-    findings += [Finding("dead-link", rel, f"[[{target}]] zeigt ins Leere")
-                 for rel, target in dead_links(notes, vault)]
+    memory = memory_target_keys()
+    for rel, target in dead_links(notes, vault):
+        mem = memory.get(fuzzy_key(target))
+        if mem:
+            findings.append(Finding("memory-ziel", rel,
+                                    f"[[{target}]] liegt im Claude-Auto-Memory: "
+                                    f"{mem.replace(str(Path.home()), '~')}"))
+        else:
+            findings.append(Finding("dead-link", rel, f"[[{target}]] zeigt ins Leere"))
+    months = {n.rel: stale_months_for(n) for n in notes}
     findings += [Finding("stale-stand", rel,
-                         f"Stand: {stamp} ist aelter als "
-                         f"{config.STALE_MARKER_MONTHS} Monate")
+                         f"Stand: {stamp} ist aelter als {months[rel]} Monate")
                  for rel, stamp in stale_claims(notes, today=today)]
     findings += expired_reviews(notes, today)
+    findings += pruefung_faellig(notes, today)
     findings += [Finding("orphan", n.rel, "keine Links ein/aus")
                  for n in find_orphans(notes)]
     findings += dead_asset_paths(vault, notes)
@@ -194,6 +283,7 @@ def run_lint(vault: Path, notes: list[Note], heat: dict | None = None,
     findings += oversized(notes)
     findings += duplicate_frontmatter(notes)
     findings += missing_beleg(notes)
+    findings += schema_findings(notes)
     findings += [Finding("cold-note", n.rel,
                          f"seit >{config.COLD_MONTHS} Monaten nicht gelesen")
                  for n in cold_notes(notes, heat or {})]
@@ -203,8 +293,23 @@ def run_lint(vault: Path, notes: list[Note], heat: dict | None = None,
 def queue_findings(findings: list[Finding], queue: ReviewQueue,
                    today: dt.date | None = None) -> list[Finding]:
     queued = []
+    today = today or dt.date.today()
+    # Kanonische Seiten laufen ueber den gedeckelten Pruefweg, nicht doppelt ueber die TTL-Meldung.
+    pruef_rels = {f.rel for f in findings if f.kind == PRUEF_KIND}
+    seit = today - dt.timedelta(days=7)
+    diese_woche = sum(1 for m in _QUEUE_ZEILE_RE.finditer(queue.existing)
+                      if dt.date.fromisoformat(m.group(1)) > seit)
     for f in findings:
+        if f.kind == PRUEF_KIND:
+            if diese_woche >= PRUEF_WOCHENLIMIT:
+                continue
+            if queue.add(f"Lint [{f.kind}] {f.rel}: {f.detail}", today=today):
+                queued.append(f)
+                diese_woche += 1
+            continue
         if f.kind not in QUEUE_KINDS:
+            continue
+        if f.kind == "review-after-expired" and f.rel in pruef_rels:
             continue
         if queue.add(f"Lint [{f.kind}] {f.rel}: {f.detail}",
                      key=f"Lint [{f.kind}] {f.rel}", today=today):

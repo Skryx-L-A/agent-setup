@@ -1,0 +1,10 @@
+[Unit]
+Description=Brain: missed embeddings on peer, without judge phases
+After=network-online.target ollama.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/brain/brain-nachbetten-peer.sh
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=6min

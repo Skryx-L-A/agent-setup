@@ -56,7 +56,7 @@ _DANGEROUS_ENV = frozenset({
 })
 _SECRET_PARTS = frozenset({
     ".aws", ".config", ".docker", ".gnupg", ".kube", ".secrets-sync", ".ssh",
-    "90-secrets", ".env",
+    "secrets", ".env",
 })
 # Nur mit freigegebenem Netz (Zugaenge einer Welt): Namensaufloesung und Zertifikate des Hosts, nur lesend.
 _NETZ_DATEIEN = ("/etc/resolv.conf", "/etc/hosts", "/etc/host.conf", "/etc/gai.conf", "/etc/ssl",
@@ -266,7 +266,7 @@ class LinuxLauncher:
         return tuple(result)
 
     def _verdeckt(self, values: Iterable[str | os.PathLike[str]]) -> tuple[Path, ...]:
-        """Ordner in einem Nur-Lese-Pfad, ueber die ein leeres tmpfs gelegt wird (Brain: ``90-secrets``).
+        """Ordner in einem Nur-Lese-Pfad, ueber die ein leeres tmpfs gelegt wird (Brain: ``secrets``).
 
         Der Pfad bleibt woertlich (er muss nicht existieren); sein Elternordner liegt kanonisch in einem
         Nur-Lese-Pfad und in keinem Schreibpfad. Ob er existiert, prueft erst der Start."""

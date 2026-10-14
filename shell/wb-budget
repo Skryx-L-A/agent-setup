@@ -157,15 +157,65 @@ if [ "${1:-}" = "--limit" ]; then
     exit 1
   fi
   python3 - "$WORKBENCH_LIMITS" "${2:-}" <<'PY'
-import json, sys, time, datetime
+import json, sys, time, datetime, os
 
 pfad = sys.argv[1]
 knapp = sys.argv[2] == "--knapp" if len(sys.argv) > 2 else False
+# WB_LIMIT_JETZT ist ein Testhaken und sonst nichts: die Tagesindex-Rechnung laesst sich
+# ohne steuerbares "jetzt" nur an dem einen Wochentag pruefen, an dem die Suite gerade
+# laeuft -- und der Fehler, den diese Rechnung behebt, war ein Wochentagsfehler. Im Betrieb
+# ist die Variable nie gesetzt und die Zeile faellt auf die echte Uhr zurueck.
+jetzt = float(os.environ.get("WB_LIMIT_JETZT") or time.time())
 
-letzter = None
+def deckel_pct(jetzt):
+    """Befristeter Deckel des Claude-Wochenlimits (der Nutzer 11.10.2026: bis Mo 12.10. 14:00
+    hoechstens 95 %). Datei ~/.claude/workbench/limit-deckel.json {"pct": 95, "bis_epoch": ...};
+    nach bis_epoch, ohne Datei oder bei kaputtem Inhalt: kein Deckel (100)."""
+    try:
+        with open(os.path.expanduser("~/.claude/workbench/limit-deckel.json")) as f:
+            d = json.load(f)
+        if jetzt < float(d["bis_epoch"]):
+            return float(d["pct"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return 100.0
+
+
+def epoch_aus(wert):
+    # Epochenzahl (auch als Zeichenkette) oder ISO-Zeitstempel; Unlesbares bleibt None.
+    if wert is None or isinstance(wert, bool):
+        return None
+    if isinstance(wert, (int, float)):
+        return float(wert)
+    s = str(wert).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    try:
+        return datetime.datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith("Z") else s).timestamp()
+    except ValueError:
+        return None
+
+
+# WELCHE ZEILE ZAEHLT (Befund 2026-09-30, peer; nachgelesen 2026-10-07 auf Mac und peer):
+# limits.jsonl ist KEIN Zeitstrahl eines Werts, sondern das Durcheinander aller Sitzungen.
+# Jede Sitzung rendert ihre Statuszeile mit dem Stand IHRER letzten API-Antwort -- eine
+# Sitzung, die seit Stunden ruht, schreibt beim naechsten Rendern einen alten, niedrigeren
+# Wert, und eine frisch gestartete Sitzung rendert zuerst mit unvollstaendiger Nutzlast
+# (five_hour fehlt, seven_day alt: 20 statt 51). Die Fassung davor nahm die LETZTE Zeile in
+# Dateireihenfolge; zwei Aufrufe im Abstand von 21 s ergaben 20,0 und 51,0 %.
+# Innerhalb EINES Fensters (gleiches seven_day_resets_at) kann der verbrauchte Anteil nur
+# steigen. Jede niedrigere Zahl im selben Fenster ist deshalb ein veralteter Sitzungsstand,
+# und der HOECHSTWERT des juengsten Fensters ist der Stand -- zugleich die sichere Richtung.
+# Ein Fenster, dessen Reset schon vorbei ist, hat keinen Stand fuer heute: die Fassung davor
+# rechnete dann mit der Zahl der Vorwoche und Tag 7 von 7 ("85 %, Dienstag, Tag 7", 29.09.).
+eintraege = []
 try:
     with open(pfad) as f:
-        for zeile in f:
+        for nr, zeile in enumerate(f):
             zeile = zeile.strip()
             if not zeile:
                 continue
@@ -173,64 +223,110 @@ try:
                 d = json.loads(zeile)
             except Exception:
                 continue
-            if d.get("seven_day_pct") is not None and d.get("seven_day_resets_at"):
-                letzter = d
+            if not isinstance(d, dict):
+                continue
+            pct = d.get("seven_day_pct")
+            if pct is None or isinstance(pct, bool):
+                continue
+            try:
+                pct = float(pct)
+            except (TypeError, ValueError):
+                continue
+            reset_ep = epoch_aus(d.get("seven_day_resets_at"))
+            if reset_ep is None:
+                continue
+            ts_ep = epoch_aus(d.get("ts"))
+            eintraege.append({"reset": reset_ep, "pct": pct, "ts": d.get("ts", ""),
+                              "ts_ep": ts_ep, "nr": nr})
 except FileNotFoundError:
     print("wb-budget --limit: %s fehlt -- kein Limitstand messbar." % pfad, file=sys.stderr)
     raise SystemExit(1)
 
-if letzter is None:
+if not eintraege:
     print("wb-budget --limit: kein Eintrag mit seven_day_pct UND seven_day_resets_at in %s."
           % pfad, file=sys.stderr)
     raise SystemExit(1)
 
-verbraucht = float(letzter["seven_day_pct"])
-reset = float(letzter["seven_day_resets_at"])
+reset = max(e["reset"] for e in eintraege)
+im_fenster = [e for e in eintraege if e["reset"] == reset]
+verbraucht = max(e["pct"] for e in im_fenster)
+# Zeitliche Reihenfolge nach ts, bei fehlendem ts nach Dateireihenfolge.
+reihenfolge = lambda e: (e["ts_ep"] if e["ts_ep"] is not None else float("-inf"), e["nr"])
+traeger = max((e for e in im_fenster if e["pct"] == verbraucht), key=reihenfolge)
+juengster = max(im_fenster, key=reihenfolge)
 start = reset - 7 * 86400
+abgelaufen = jetzt >= reset
+rc = 0
 
 # Kalendertage in LOKALER Zeit: das Fenster beginnt Montag 14:00, Rechnung des Nutzers zaehlt
 # aber Kalendertage (Montag = 1 ... Samstag = 6), nicht 24-Stunden-Bloecke ab 14 Uhr. Der
 # Unterschied ist keine Rundung: am Samstagmorgen sind 4,5 der 7 Fenstertage verstrichen
 # (64 %), waehrend das Tagesbudget bei 6/7 steht (86 %).
 lok = datetime.datetime.now().astimezone().tzinfo
-# WB_LIMIT_JETZT ist ein Testhaken und sonst nichts: die Tagesindex-Rechnung laesst sich
-# ohne steuerbares "jetzt" nur an dem einen Wochentag pruefen, an dem die Suite gerade
-# laeuft -- und der Fehler, den diese Rechnung behebt, war ein Wochentagsfehler. Im Betrieb
-# ist die Variable nie gesetzt und die Zeile faellt auf die echte Uhr zurueck.
-import os
-jetzt = float(os.environ.get("WB_LIMIT_JETZT") or time.time())
 tag_start = datetime.datetime.fromtimestamp(start, lok).date()
 tag_heute = datetime.datetime.fromtimestamp(jetzt, lok).date()
 tagesindex = (tag_heute - tag_start).days + 1
 tagesindex = max(1, min(7, tagesindex))
-erlaubt = min(100.0, tagesindex * 100.0 / 7.0)
+erlaubt = min(100.0, tagesindex * 100.0 / 7.0, deckel_pct(jetzt))
 luft = erlaubt - verbraucht
 
 wochentag = ["Montag", "Dienstag", "Mittwoch", "Donnerstag",
              "Freitag", "Samstag", "Sonntag"][tag_heute.weekday()]
-stand = datetime.datetime.fromtimestamp(float(letzter.get("ts_epoch", time.time())), lok) \
-    if letzter.get("ts_epoch") else None
-gemessen = letzter.get("ts", "")
+gemessen = traeger["ts"]
+# Stand mit Datum in der Zeile: ein Kontext, der eine alte Hook-Ausgabe wieder einspielt
+# (Fortsetzen einer Sitzung vom Vortag), traegt sonst eine Zahl ohne erkennbares Alter.
+if traeger["ts_ep"] is not None:
+    stand_text = datetime.datetime.fromtimestamp(traeger["ts_ep"], lok).strftime("%d.%m. %H:%M")
+    alter_min = max(0, int((jetzt - traeger["ts_ep"]) // 60))
+    alter_text = "vor %d min" % alter_min if alter_min < 120 else "vor %.1f h" % (alter_min / 60.0)
+else:
+    stand_text, alter_text = "unbekannt", "Alter unbekannt"
+reset_text = datetime.datetime.fromtimestamp(reset, lok).strftime("%a %d.%m. %H:%M")
+
+if abgelaufen:
+    # Kein Stand aus dem laufenden Fenster: sagen, nicht rechnen. Exit 3 unterscheidet das
+    # vom fehlenden Log (1); der SessionStart-Hook gibt die Zeile trotzdem aus.
+    rc = 3
+    kein_stand = ("Wochenlimit: KEIN frischer Stand -- das juengste gemessene Fenster endete "
+                  "%s (dort zuletzt %.0f%%, Stand %s). Erst die naechste Statuszeile einer "
+                  "Claude-Sitzung misst das laufende Fenster." % (reset_text, verbraucht, stand_text))
 
 if knapp:
-    print("Wochenlimit: %.0f%% verbraucht, bis heute Abend erlaubt %.0f%% (%s, Tag %d von 7) -- "
-          "%s %.0f Punkte." % (verbraucht, erlaubt, wochentag, tagesindex,
-                               "Luft" if luft >= 0 else "DARUEBER um",
-                               abs(luft)))
+    if abgelaufen:
+        print(kein_stand)
+    else:
+        print("Wochenlimit: %.0f%% verbraucht, bis heute Abend erlaubt %.0f%% (%s, Tag %d von 7) -- "
+              "%s %.0f Punkte. Stand %s." % (verbraucht, erlaubt, wochentag, tagesindex,
+                                             "Luft" if luft >= 0 else "DARUEBER um",
+                                             abs(luft), stand_text))
+        if deckel_pct(jetzt) < 100.0:
+            print("DECKEL bis Mo 12.10. 14:00: hoechstens %.0f %% (der Nutzer, strikt) -- keine Claude-Worker, "
+                  "keine selbststaendige Claude-Arbeit, nur auf Eingabe des Nutzers." % deckel_pct(jetzt))
 else:
     print("== Wochenlimit: Tagesbudget ==")
-    print("  Fenster:      %s bis %s (Montag 14:00 bis Montag 14:00)"
-          % (datetime.datetime.fromtimestamp(start, lok).strftime("%a %d.%m. %H:%M"),
-             datetime.datetime.fromtimestamp(reset, lok).strftime("%a %d.%m. %H:%M")))
-    print("  Heute:        %s = Tag %d von 7" % (wochentag, tagesindex))
-    print("  erlaubt:      %.1f %%  (Tag %d x 100/7, gilt bis heute 24:00)" % (erlaubt, tagesindex))
-    print("  verbraucht:   %.1f %%  (seven_day_pct, gemessen %s)" % (verbraucht, gemessen))
-    if luft >= 0:
-        print("  Luft:         %.1f Punkte -- NICHT knapp. Nicht vorsorglich sparen." % luft)
+    if abgelaufen:
+        print("  " + kein_stand)
     else:
-        print("  DARUEBER um:  %.1f Punkte -- jetzt drosseln: Worker lokal oder Aufgabe wartet."
-              % abs(luft))
-
+        print("  Fenster:      %s bis %s (Montag 14:00 bis Montag 14:00)"
+              % (datetime.datetime.fromtimestamp(start, lok).strftime("%a %d.%m. %H:%M"), reset_text))
+        print("  Heute:        %s = Tag %d von 7" % (wochentag, tagesindex))
+        print("  erlaubt:      %.1f %%  (Tag %d x 100/7, gilt bis heute 24:00)" % (erlaubt, tagesindex))
+        print("  verbraucht:   %.1f %%  (seven_day_pct, gemessen %s, %s; Hoechstwert aus %d "
+              "Statuszeilen dieses Fensters in %s)"
+              % (verbraucht, gemessen, alter_text, len(im_fenster), pfad))
+        if juengster["pct"] < verbraucht:
+            print("  nicht gewertet: juengste Zeile %.1f %% (%s) -- veralteter Stand einer "
+                  "anderen Sitzung, im selben Fenster sinkt der Verbrauch nie."
+                  % (juengster["pct"], juengster["ts"]))
+        if deckel_pct(jetzt) < 100.0:
+            print("  DECKEL:       befristet %.0f %% (limit-deckel.json, der Nutzer) -- strikt: keine "
+                  "Claude-Worker, Claude nur auf Eingabe des Nutzers. Luft %.1f Punkte."
+                  % (deckel_pct(jetzt), luft))
+        elif luft >= 0:
+            print("  Luft:         %.1f Punkte -- NICHT knapp. Nicht vorsorglich sparen." % luft)
+        else:
+            print("  DARUEBER um:  %.1f Punkte -- jetzt drosseln: Worker lokal oder Aufgabe wartet."
+                  % abs(luft))
     # ChatGPT Plus (Codex) -- Nachtrag 2026-09-10 (der Nutzer: "das chatgpt limit
     # soll auch getrackt werden wie das claude limit, achte darauf das es
     # vielleicht anders aufgebaut ist als das von claude"). Anders als Claudes
@@ -304,10 +400,13 @@ else:
             return ("  %s: verbraucht %.1f %%, Fensterlaenge unlesbar -- "
                     "keine Tageslinie moeglich (gemessen %s)."
                     % (bezeichnung, verbraucht, gemessen))
-        if window_s != 7 * 86400:
-            return ("  %s: verbraucht %.1f %%, Fensterlaenge %.0f s -- "
-                    "Tageslinie nur fuer 7-Tage-Fenster moeglich (gemessen %s)."
-                    % (bezeichnung, verbraucht, window_s, gemessen))
+        # Fensterlaenge aus window_s (Nachtrag 2026-10-13: Codex Free meldet 30 Tage).
+        # Ganze Tage: Kalendertagelinie wie beim 7-Tage-Fenster, Tag 1 = Starttag.
+        # Gebrochene Tage: verstrichener Anteil des Fensters. Reine Anzeige; fuer
+        # Free (Rang 2) sperrt die Linie nie, nur Erschoepfung.
+        tage_exakt = window_s / 86400.0
+        ganze_tage = abs(tage_exakt - round(tage_exakt)) < 1e-6 and round(tage_exakt) >= 1
+        tage_text = "%d" % round(tage_exakt) if ganze_tage else "%.1f" % tage_exakt
         start = reset_epoch - window_s
         # Ohne tzinfo waehlt fromtimestamp fuer JEDEN Zeitstempel die damals
         # geltende Ortszeit. Ein heute festgestellter UTC-Offset verschiebt den
@@ -323,21 +422,37 @@ else:
             return ("  %s: verbraucht %.1f %%, Fenster endete %s -- "
                     "keine Tageslinie moeglich (gemessen %s)."
                     % (bezeichnung, verbraucht, resets_at_wert, gemessen))
-        tagesindex = min(7, tagesindex)
-        erlaubt = min(100.0, tagesindex * 100.0 / 7.0)
+        if ganze_tage:
+            n = round(tage_exakt)
+            tagesindex = min(n, tagesindex)
+            erlaubt = min(100.0, tagesindex * 100.0 / n)
+            tag_text = "Kalendertag %d von %d" % (tagesindex, n)
+        else:
+            erlaubt = min(100.0, (jetzt - start) * 100.0 / window_s)
+            tag_text = "verstrichener Anteil von %s Tagen" % tage_text
         luft = erlaubt - verbraucht
-        return ("  %s: verbraucht %.1f %%, erlaubt %.1f %% (Kalendertag %d von 7) -- "
+        return ("  %s: verbraucht %.1f %%, erlaubt %.1f %% (%s) -- "
                 "%s %.1f Punkte  (gemessen %s)"
-                % (bezeichnung, verbraucht, erlaubt, tagesindex,
+                % (bezeichnung, verbraucht, erlaubt, tag_text,
                    "Luft" if luft >= 0 else "DARUEBER um", abs(luft), gemessen))
 
-    print("== ChatGPT Plus (Codex) ==")
+    # Plan und Fensterlaenge kommen aus den Daten (Zeile der Verlaufsdatei), nicht aus
+    # einer festen Annahme: "plus" -> "ChatGPT Plus", "free" -> "ChatGPT Free".
+    codex_plan = str((codex_letzter or {}).get("plan") or "").strip()
+    codex_plan_name = codex_plan.capitalize() if codex_plan else "Plus"
+    print("== ChatGPT %s (Codex) ==" % codex_plan_name)
+    if codex_plan.lower() == "free":
+        print("  Kostenloses Kontingent (Rang 2): die Linie ist nur Anzeige, gesperrt wird erst bei Erschoepfung.")
     if codex_letzter is None:
         print(NICHT_GEMESSEN)
     else:
         c_gemessen = codex_letzter.get("ts", "?")
+        c_fenster = codex_sieben_tage_fensterlaenge(codex_letzter.get("seven_day_window_s"))
+        c_tage = ("%d" % round(c_fenster / 86400.0)
+                  if c_fenster and abs(c_fenster / 86400.0 - round(c_fenster / 86400.0)) < 1e-6
+                  else ("%.1f" % (c_fenster / 86400.0) if c_fenster else "?"))
         zeile7 = codex_fenster_zeile(
-            "7-Tage-Fenster (rollend)", codex_letzter.get("seven_day_pct"),
+            "%s-Tage-Fenster (rollend)" % c_tage, codex_letzter.get("seven_day_pct"),
             codex_letzter.get("seven_day_resets_at"), c_gemessen, wochenbudget=True,
             window_wert=codex_letzter.get("seven_day_window_s"))
         if zeile7 is None:
@@ -351,6 +466,7 @@ else:
                 codex_letzter.get("five_hour_resets_at"), c_gemessen)
             if zeile5 is not None:
                 print(zeile5)
+raise SystemExit(rc)
 PY
   exit $?
 fi
@@ -387,8 +503,10 @@ fi
 #   Liste, nur peer) ueber "ssh <maschine> 'PATH=$HOME/.local/bin:$PATH wb-budget --json'"
 #   ab -- mit BatchMode=yes und ConnectTimeout=5, insgesamt mit einer Frist von 20 s je
 #   Maschine. Der PATH wird im ssh-Befehl gesetzt, weil er in nicht-interaktiven
-#   Sitzungen fehlt. Zurueck kommt der JUENGSTE Messwert (groesztes ts; die Tageslinien-
-#   Rechnung laeuft auf ihm), dazu maschinen_gelesen (Namen der erfolgreichen
+#   Sitzungen fehlt. Zurueck kommt wie beim lokalen Leser das juengste Fenster
+#   (groesztes seven_day_resets_at), darin der HOECHSTE Wert (bis 2026-10-07: das groeszte
+#   ts, also die Maschine, deren Sitzung zuletzt gerendert hatte, auch mit altem Stand);
+#   five_hour ebenso je 5h-Fenster. Die Tageslinien-Rechnung laeuft darauf, dazu maschinen_gelesen (Namen der erfolgreichen
 #   Fernmaschinen) und maschinen_fehlgeschlagen (Objekte mit name und Grund; ein
 #   unlesbarer lokaler Stand steht ebenfalls dort, unter dem Hostnamen). Scheitern alle
 #   Quellen, kommen fehler/quelle samt der beiden Listen mit Exit 3.
@@ -431,6 +549,19 @@ alle = os.environ.get("WB_JSON_ALLE") == "1"
 # WB_LIMIT_JETZT ist derselbe Testhaken wie bei --limit (dort erklaert): im Betrieb nie
 # gesetzt, in der Suite steuert er das "jetzt" von Tageslinie und Alter.
 jetzt = float(os.environ.get("WB_LIMIT_JETZT") or time.time())
+
+def deckel_pct(jetzt):
+    """Befristeter Deckel des Claude-Wochenlimits (der Nutzer 11.10.2026: bis Mo 12.10. 14:00
+    hoechstens 95 %). Datei ~/.claude/workbench/limit-deckel.json {"pct": 95, "bis_epoch": ...};
+    nach bis_epoch, ohne Datei oder bei kaputtem Inhalt: kein Deckel (100)."""
+    try:
+        with open(os.path.expanduser("~/.claude/workbench/limit-deckel.json")) as f:
+            d = json.load(f)
+        if jetzt < float(d["bis_epoch"]):
+            return float(d["pct"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return 100.0
 
 
 def epoch_aus_wert(wert):
@@ -502,18 +633,87 @@ def stand_aus_objekt(d, quellenpfad, maschine):
     }
 
 
+def stand_aus_log(pfad):
+    # Derselbe Befund wie bei --limit (dort erklaert): limits-latest.json ist die Zeile der
+    # Sitzung, die ZULETZT gerendert hat -- auch einer ruhenden mit altem Stand. Das Log
+    # daneben traegt alle Sitzungen; im juengsten Fenster zaehlt der Hoechstwert, denn im
+    # selben Fenster sinkt der Verbrauch nie. Fuer five_hour gilt dasselbe je 5h-Fenster,
+    # aber nur, solange dieses Fenster noch laeuft.
+    try:
+        with open(pfad) as f:
+            zeilen = f.readlines()
+    except Exception:
+        return None
+    sieben, fuenf = [], []
+    for nr, zeile in enumerate(zeilen):
+        try:
+            d = json.loads(zeile)
+        except Exception:
+            continue
+        if not isinstance(d, dict):
+            continue
+        ts_ep = epoch_aus_wert(d.get("ts"))
+        if ts_ep is None:
+            continue
+        sd = d.get("seven_day_pct")
+        sd_ep = epoch_aus_wert(d.get("seven_day_resets_at"))
+        if isinstance(sd, (int, float)) and not isinstance(sd, bool) and sd_ep is not None:
+            sieben.append((sd_ep, float(sd), ts_ep, nr, d))
+        fh = d.get("five_hour_pct")
+        fh_ep = epoch_aus_wert(d.get("five_hour_resets_at"))
+        if isinstance(fh, (int, float)) and not isinstance(fh, bool) and fh_ep is not None:
+            fuenf.append((fh_ep, float(fh)))
+    if not sieben:
+        return None
+    reset = max(e[0] for e in sieben)
+    bester = max((e for e in sieben if e[0] == reset), key=lambda e: (e[1], e[2], e[3]))
+    obj = {"ts": bester[4].get("ts"), "seven_day_pct": bester[1],
+           "seven_day_resets_at": bester[4].get("seven_day_resets_at"),
+           "five_hour_pct": None, "five_hour_resets_at": None}
+    if fuenf:
+        f_reset = max(e[0] for e in fuenf)
+        if f_reset > jetzt:
+            obj["five_hour_pct"] = max(e[1] for e in fuenf if e[0] == f_reset)
+            obj["five_hour_resets_at"] = f_reset
+    return stand_aus_objekt(obj, pfad, socket.gethostname())
+
+
 def lies_lokal(pfad):
+    grund = None
     try:
         with open(pfad) as f:
             d = json.load(f)
+        s = stand_aus_objekt(d, pfad, socket.gethostname())
+        if s is None:
+            grund = "kein brauchbarer Stand"
     except FileNotFoundError:
-        return None, "Datei fehlt"
+        s, grund = None, "Datei fehlt"
     except Exception:
-        return None, "unlesbar"
-    s = stand_aus_objekt(d, pfad, socket.gethostname())
-    if s is None:
-        return None, "kein brauchbarer Stand"
-    return s, None
+        s, grund = None, "unlesbar"
+    aus_log = stand_aus_log(os.path.join(os.path.dirname(pfad), "limits.jsonl"))
+    kandidaten = [k for k in (s, aus_log) if k is not None]
+    if not kandidaten:
+        return None, grund
+    return waehle(kandidaten), None
+
+
+def waehle(kandidaten):
+    # Juengeres Fenster vor hoeherem Wert vor juengerer Messung -- fuer die lokale
+    # Momentaufnahme gegen das Log genauso wie (seit 2026-10-07) zwischen Maschinen
+    # desselben Kontos: eine Maschine, deren Sitzung zuletzt mit altem Stand gerendert hat,
+    # hat die juengste Zeile, aber nicht den Stand.
+    sieger = dict(max(kandidaten, key=lambda k: (k["seven_day_resets_at_epoch"], k["seven_day_pct"],
+                                                 k["ts_epoch"])))
+    # five_hour getrennt: der hoehere Wert desselben 5h-Fensters, ein laufendes vor keinem.
+    for k in kandidaten:
+        if k["five_hour_pct"] is None:
+            continue
+        if sieger["five_hour_pct"] is None or (
+                k["five_hour_resets_at_epoch"] == sieger["five_hour_resets_at_epoch"]
+                and k["five_hour_pct"] > sieger["five_hour_pct"]):
+            for feld in ("five_hour_pct", "five_hour_resets_at", "five_hour_resets_at_epoch"):
+                sieger[feld] = k[feld]
+    return sieger
 
 
 def tageslinie(reset_ep):
@@ -524,7 +724,7 @@ def tageslinie(reset_ep):
     tag_start = datetime.datetime.fromtimestamp(start, lok).date()
     tag_heute = datetime.datetime.fromtimestamp(jetzt, lok).date()
     tagesindex = max(1, min(7, (tag_heute - tag_start).days + 1))
-    return min(100.0, tagesindex * 100.0 / 7.0)
+    return min(100.0, tagesindex * 100.0 / 7.0, deckel_pct(jetzt))
 
 
 def bericht(stamm):
@@ -543,6 +743,9 @@ def bericht(stamm):
         "erlaubt_pct": round(erlaubt, 4),
         "luft": round(erlaubt - verbraucht, 4),
         "tageslimit_erreicht": verbraucht > erlaubt,
+        # Reset schon vorbei: die Zahl gehoert zur Vorwoche, die Tageslinie oben ist dann
+        # nur die Klammer bei Tag 7 und kein Stand fuer heute.
+        "fenster_abgelaufen": jetzt >= stamm["seven_day_resets_at_epoch"],
         "fuenf_stunden_erreicht": fh is not None and fh >= 100,
         "quelle": stamm["quelle"],
         "maschine": stamm["maschine"],
@@ -566,7 +769,7 @@ if not alle:
         raise SystemExit(3)
     ende(bericht(stand))
 
-# --- --alle-maschinen: der juengste Messwert von hier und allen Fernmaschinen. ---------------
+# --- --alle-maschinen: der Stand des juengsten Fensters von hier und allen Fernmaschinen. ---
 maschinen = []
 try:
     with open(settings_pfad) as f:
@@ -630,8 +833,7 @@ if not kandidaten:
     }))
     raise SystemExit(3)
 
-sieger = max(kandidaten, key=lambda k: k["ts_epoch"])
-obj = bericht(sieger)
+obj = bericht(waehle(kandidaten))
 obj["maschinen_gelesen"] = gelesen
 obj["maschinen_fehlgeschlagen"] = fehl
 ende(obj)
@@ -2081,7 +2283,6 @@ OHNE_QUELLE = {
              "abgeschaltet) und ein Preis-Cache. Faehigkeit unbelegt, nicht widerlegt.",
     "crush": "Nur Konfigurationsdateien gefunden, keine Sitzung mit Inhalt.",
     "qwen": "Nur Konfigurationsdateien gefunden, keine Sitzung mit Inhalt.",
-    "kimi": "Nur Konfigurationsdateien gefunden, keine Sitzung mit Inhalt.",
     "gptme": "Sitzungsordner vorhanden, aber leer.",
     "cline": "Nur eine Startmeldung im Log, keine Sitzung mit Inhalt.",
     "goose": "Nur Konfigurationsdateien gefunden, keine Sitzung mit Inhalt.",
@@ -2320,7 +2521,10 @@ import json, os, sys, time
 CACHE = sys.argv[1]
 HOME = os.path.expanduser("~")
 WURZEL = os.path.join(HOME, ".claude", "projects")
-JETZT = time.time()
+# WB_BUDGET_JETZT (Epoch-Sekunden) gibt Tests eine feste Uhr: in den ersten 15 Minuten
+# des UTC-Tags faellt die Zeile "bisher heute" weg, und ein Test um 02:00 Sommerzeit
+# fand sie nicht (GL#28, 2026-10-13). Ohne die Variable gilt die echte Uhr.
+JETZT = float(os.environ.get("WB_BUDGET_JETZT") or time.time())
 FENSTER_TAGE = 8
 # Etwas mehr als das Fenster: der Bericht schaut hoechstens 7 Tage zurueck, der
 # Zwischenspeicher haelt 10 -- so kostet ein Lauf kurz nach Mitternacht keinen kalten Start.

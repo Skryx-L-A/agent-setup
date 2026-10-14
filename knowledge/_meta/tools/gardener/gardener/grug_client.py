@@ -1,4 +1,6 @@
-"""HTTP-Client fuer grug-27b unter mlx_lm.server (Port 8080, `grug-server ensure`).
+"""HTTP-Client fuer den lokalen MLX-Richter unter mlx_lm.server (Port 8080, `grug-server ensure`).
+Der Name ist historisch: bedient wird `dream.config.DREAM_LOCAL_MODEL_PATH` (qwen3.8, `qwen38-27b-mlx-4bit`);
+grug-27b ist seit 30.09.2026 vom Mac geloescht (regeln/lokale-modelle.md). Vorgabe-Motor ist Splash.
 
 Gleicher Rueckgabe-Umschlag wie `dream.extract.call_claude_cli` / historisch
 `call_ollama` ("result" traegt den rohen Antworttext als String, "usage" die
@@ -19,6 +21,7 @@ erfinden - siehe `regeln/messungen.md`: ein Messwerkzeug gehoert ins Repo.
 from __future__ import annotations
 
 import concurrent.futures
+import dataclasses
 import json
 import logging
 import os
@@ -182,6 +185,44 @@ GRUG_MIN_MAX_TOKENS = 2048
 GRUG_HEALTH_TIMEOUT = 5.0
 
 
+# -- Motor des Richters (Auftrag g4, 24.09.2026) -----------------------------
+# Seit dem 20.09.2026 laeuft qwen3.8-27B auf dem Mac ueber Splash (Port 8000,
+# `wb-splash-server`), nicht mehr ueber MLX. Der Gaertner startete trotzdem
+# seinen eigenen MLX-Server auf 8080 - zwei 27B-Modelle zugleich neben dem
+# laufenden Splash, gegen "ein Modell zur Zeit", und auf dem langsameren Motor
+# (gemessen 20.09.: Splash 2,6x bei langer Eingabe, 2,8x bei vier Stroemen).
+# Lauf vom 24.09.2026: 2,5 h, davon rund 1 h 50 min in 300-s-Zeitueberschreitungen.
+@dataclasses.dataclass(frozen=True)
+class JudgeEngine:
+    name: str                    # "splash" | "mlx"
+    base_url: str
+    model: str
+    # Bekanntes Fenster des laufenden Servers; None = beim Server fragen
+    # (MLX: /health effective_context_limit).
+    context_window: int | None
+    # Wie dieser Server "nicht denken" versteht: MLX (mlx_vlm.server) nimmt
+    # `enable_thinking` auf oberster Ebene, Splash `reasoning_effort` (seine
+    # Chat-Vorlage bildet "none" auf enable_thinking=False ab;
+    # `chat_template_kwargs` liest Splash gar nicht).
+    effort_field: str            # "enable_thinking" | "reasoning_effort"
+    parallel: int = 1
+
+
+MLX_ENGINE = JudgeEngine("mlx", GRUG_BASE_URL, GRUG_MODEL_PATH, None,
+                         "enable_thinking", GRUG_JUDGE_PARALLEL)
+SPLASH_ENGINE = JudgeEngine(
+    "splash",
+    os.environ.get("GARDENER_SPLASH_URL", "http://127.0.0.1:8000"),
+    os.environ.get("GARDENER_SPLASH_MODEL", "incoai/Qwen3.8-27B-Splash"),
+    int(os.environ.get("GARDENER_SPLASH_CONTEXT", "131072")),
+    "reasoning_effort",
+    # Splash buendelt gleichzeitige Anfragen (gemessen 20.09.: vier Stroeme
+    # 108 Tok/s gesamt gegen 40 einzeln); der MLX-Absturz bei zwei Stroemen
+    # (DEFEKT 2 unten) betrifft mlx_vlm.server, nicht Splash.
+    int(os.environ.get("GARDENER_SPLASH_PARALLEL", "4")),
+)
+
+
 def _estimate_tokens(text: str) -> int:
     """Zeichen-Schaetzung, absichtlich nach OBEN gerundet: eine ueberschaetzte
     Prompt-Groesse verschenkt hoechstens etwas Antwortbudget, eine
@@ -211,6 +252,38 @@ def _server_context_window(timeout: float = GRUG_HEALTH_TIMEOUT) -> int | None:
     return None
 
 
+# „Wort" - deutsches Oeffnungszeichen, ASCII-Schlusszeichen: Qwen schreibt das
+# mitten in einen JSON-String und beendet ihn damit. Messlauf vom 24.09.2026
+# (g4): 13 von 13 Themenseiten als "non-JSON" verworfen. Eine erzwungene
+# JSON-Grammatik (Splash `response_format`) hilft nicht - mit Denken laeuft
+# das Modell danach in endlosen Leerraum bis finish_reason=length (gemessen).
+_GERMAN_QUOTE_RE = re.compile(r'\u201e([^"\u201c\u201e\n]{0,200})"')
+
+
+def repair_quotes(text: str) -> str:
+    """`„Wort"` -> `„Wort\u201c`, sonst nichts."""
+    return _GERMAN_QUOTE_RE.sub("\u201e\\1\u201c", text)
+
+
+def first_json_object(text: str) -> dict | None:
+    """The first complete JSON object in `text`, ignoring what precedes it
+    (blank lines, a ```json fence) and what follows it (a closing fence, or a
+    stray extra `}` - g4 measurement 24.09.2026: 6 of 13 topic pages failed on
+    exactly that). Tried as given and with repaired German quotes."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    decoder = json.JSONDecoder()
+    for kandidat in (text[start:], repair_quotes(text[start:])):
+        try:
+            obj, _end = decoder.raw_decode(kandidat)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
 class GrugCallError(Exception):
     pass
 
@@ -222,7 +295,10 @@ def call_grug(prompt: str, *, system: str, max_tokens: int | None = None,
               timeout: float = 300.0, temperature: float = 0.0,
               template_kwargs: dict | None = None,
               enable_thinking: bool | None = None,
+              reasoning_effort: str | None = None,
+              engine: JudgeEngine | None = None,
               _selbstkorrektur_erlaubt: bool = True) -> dict:
+    engine = engine or MLX_ENGINE
     berechnet = max_tokens is None
     if berechnet:
         prompt_tokens_est = _estimate_tokens(system) + _estimate_tokens(prompt)
@@ -232,15 +308,17 @@ def call_grug(prompt: str, *, system: str, max_tokens: int | None = None,
         # GRUG_CONTEXT_WINDOW bleibt dabei die harte Obergrenze - ein Server,
         # der (fehlerhaft) mehr als sein Modell traegt meldet, darf trotzdem
         # nie mehr Budget bekommen, als das Modell tatsaechlich hat.
-        fenster = _server_context_window()
+        fenster = engine.context_window or _server_context_window()
         if fenster is None:
             fenster = GRUG_CONTEXT_WINDOW_FALLBACK
         fenster = min(fenster, GRUG_CONTEXT_WINDOW)
         max_tokens = max(GRUG_MIN_MAX_TOKENS,
                          fenster - prompt_tokens_est - GRUG_MAX_TOKENS_SAFETY)
     kwargs = GRUG_TEMPLATE_KWARGS if template_kwargs is None else template_kwargs
+    if engine.effort_field == "reasoning_effort":
+        kwargs = {}     # Splash liest chat_template_kwargs nicht, siehe JudgeEngine
     rumpf = {
-        "model": GRUG_MODEL_PATH,
+        "model": engine.model,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
@@ -248,7 +326,13 @@ def call_grug(prompt: str, *, system: str, max_tokens: int | None = None,
     }
     if kwargs:
         rumpf["chat_template_kwargs"] = kwargs
-    if enable_thinking is not None:
+    if engine.effort_field == "reasoning_effort":
+        # Splash: eine Stufe statt eines Schalters. enable_thinking=False
+        # heisst hier "none"; ohne beides entscheidet die Vorlage (xhigh).
+        stufe = reasoning_effort or ("none" if enable_thinking is False else None)
+        if stufe:
+            rumpf["reasoning_effort"] = stufe
+    elif enable_thinking is not None:
         # NACHTRAG 2 (02.09.2026): `enable_thinking` ist auf dem heute
         # laufenden Server (mlx_vlm.server) ein TOP-LEVEL Anfragefeld, kein
         # `chat_template_kwargs`-Eintrag - siehe die "LUECKE"-Erklaerung oben
@@ -258,7 +342,7 @@ def call_grug(prompt: str, *, system: str, max_tokens: int | None = None,
         rumpf["enable_thinking"] = enable_thinking
     body = json.dumps(rumpf).encode("utf-8")
     req = urllib.request.Request(
-        GRUG_BASE_URL + "/v1/chat/completions", data=body,
+        engine.base_url + "/v1/chat/completions", data=body,
         headers={"Content-Type": "application/json"})
     t0 = time.monotonic()
     try:
@@ -287,6 +371,7 @@ def call_grug(prompt: str, *, system: str, max_tokens: int | None = None,
                             timeout=timeout, temperature=temperature,
                             template_kwargs=template_kwargs,
                             enable_thinking=enable_thinking,
+                            reasoning_effort=reasoning_effort, engine=engine,
                             _selbstkorrektur_erlaubt=False)
         raise GrugCallError(f"transport: HTTP {e.code}: {fehlertext[:200]}") from e
     except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -311,7 +396,8 @@ def call_grug(prompt: str, *, system: str, max_tokens: int | None = None,
         raise GrugCallError(f"empty choices: {data}")
     message = choices[0].get("message") or {}
     content = message.get("content")
-    reasoning = message.get("reasoning") or ""
+    # Splash nennt das Feld OpenAI-artig `reasoning_content`
+    reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
     finish_reason = choices[0].get("finish_reason")
     usage = data.get("usage") or {}
     if finish_reason == "length":
@@ -337,7 +423,7 @@ def call_grug(prompt: str, *, system: str, max_tokens: int | None = None,
                   "output_tokens": usage.get("completion_tokens", 0)},
         "total_cost_usd": 0.0,
         "duration_s": duration_s,
-        "backend": "local-grug",
+        "backend": "local-grug" if engine.name == "mlx" else f"local-{engine.name}",
     }
 
 
@@ -391,27 +477,44 @@ class GrugJudgeClient:
 
     RETRIES = 1
     MAX_CONSECUTIVE_FAILURES = 5
+    # Eine Zeitueberschreitung kostet den ganzen Timeout (300 s). Lauf vom
+    # 24.09.2026: je Urteil Versuch + Wiederholung = 10 min, fuenf in Folge
+    # erlaubt = bis zu 50 min, bevor der Kreisunterbrecher griff. Nach einer
+    # Zeitueberschreitung wird deshalb nicht wiederholt, und schon zwei in
+    # Folge gelten als "der Server antwortet nicht".
+    MAX_CONSECUTIVE_TIMEOUTS = 2
 
-    def __init__(self, *, enable_thinking: bool | None = None):
+    def __init__(self, *, enable_thinking: bool | None = None,
+                 reasoning_effort: str | None = None,
+                 engine: JudgeEngine | None = None):
         self.failures = 0            # consecutive transport/judge failures
+        self.timeouts = 0            # consecutive timeouts
         self.transient_failures = 0  # total, for the report
         self._lock = threading.Lock()
         self.enable_thinking = enable_thinking
+        # nur Splash: Denkstufe ("none".."xhigh"); None = Vorlage entscheidet
+        self.reasoning_effort = reasoning_effort
+        self.engine = engine or MLX_ENGINE
 
     def judge(self, system: str, prompt: str) -> dict:
         for attempt in range(self.RETRIES + 1):
             try:
                 envelope = call_grug(prompt, system=system, temperature=0.0,
-                                     enable_thinking=self.enable_thinking)
+                                     enable_thinking=self.enable_thinking,
+                                     reasoning_effort=self.reasoning_effort,
+                                     engine=self.engine)
             except GrugCallError as e:
-                if attempt < self.RETRIES:
+                zeit = "timed out" in str(e)
+                if attempt < self.RETRIES and not zeit:
                     log.warning("smart judge failed (%s) - retrying once", e)
                     continue
                 with self._lock:
                     self.failures += 1
                     self.transient_failures += 1
+                    self.timeouts = self.timeouts + 1 if zeit else 0
                     stand = self.failures
-                    tot = stand >= self.MAX_CONSECUTIVE_FAILURES
+                    tot = (stand >= self.MAX_CONSECUTIVE_FAILURES
+                           or self.timeouts >= self.MAX_CONSECUTIVE_TIMEOUTS)
                 if tot:
                     raise OllamaUnavailable(
                         f"{stand} consecutive smart-judge failures "
@@ -422,22 +525,24 @@ class GrugJudgeClient:
                 return {}
             with self._lock:
                 self.failures = 0
+                self.timeouts = 0
             content = envelope["result"]
             try:
                 return json.loads(content)
             except json.JSONDecodeError:
-                m = re.search(r"\{.*\}", content, re.DOTALL)
-                if m:
-                    try:
-                        return json.loads(m.group(0))
-                    except json.JSONDecodeError:
-                        pass
+                verdict = first_json_object(content)
+                if verdict is not None:
+                    return verdict
             log.warning("smart judge returned non-JSON: %.200s", content)
+            # the whole answer, once, for the diagnosis (g4: the first 200
+            # characters looked like valid JSON every time)
+            log.info("smart judge non-JSON, full answer (%d chars): %r",
+                     len(content), content[:20000])
             return {}
         return {}
 
     def judge_many(self, pairs: list[tuple[str, str]], *,
-                  parallel: int = GRUG_JUDGE_PARALLEL) -> list[dict]:
+                  parallel: int | None = None) -> list[dict]:
         """Urteilt ueber `pairs` (Liste von `(system, prompt)`) mit bis zu
         `parallel` gleichzeitigen Stroemen. Die ZURUECKGEGEBENE Liste steht in
         derselben Reihenfolge wie `pairs`, unabhaengig davon, welcher Strom
@@ -451,6 +556,8 @@ class GrugJudgeClient:
         geworfen - dann fuer den ganzen Rest, wie im seriellen Fall auch, weil
         `judge_many` selbst keine neuen Anfragen mehr startet, sobald eine
         davon die Ausnahme wirft."""
+        if parallel is None:
+            parallel = self.engine.parallel
         if parallel <= 1 or len(pairs) <= 1:
             return [self.judge(system, prompt) for system, prompt in pairs]
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
