@@ -5,6 +5,11 @@ ohne ihn in ihren Pane zu tippen.
   wb-inbox [-L <socket>] [--pid <n>] finde <pane-id>       Empfaenger zu diesem Pane
   wb-inbox [-L <socket>] [--pid <n>] [--absender <klasse>] sende <pane-id> <datei>
            [--tafel-halter <sessionId>:<klasse>]             Text zustellen
+  wb-inbox --wache-mahnung [--nur-weckend] [-L <socket>] sende <pane-id> <datei>
+                                                             Mahnung der Wache (context-guard als Ahne):
+                                                             Wache-Regel, Exit 8 ohne nutzbaren Weg;
+                                                             --nur-weckend: nur ueber einen Weg, der eine
+                                                             untaetige Sitzung weckt
   wb-inbox [-L <socket>] [--absender <klasse>] herkunft <pane-id>
                                                              gemessene Herkunft einer Sendung
                                                              an diesen Pane (sendet nichts):
@@ -51,7 +56,9 @@ dieselben Werte, die die Vorlage traegt; test-inbox-registry.sh haelt beide glei
 ES WIRD NIE ERSATZWEISE GETIPPT. Findet `sende` keinen Weg, endet es mit Exit 5 und
 nennt den Grund (Harness ohne Weg, Adapter nicht geladen, codex ohne Thread). Exit 1
 heisst: gar kein Empfaenger unter dem Pane oder ein Transportfehler. Die uebrigen
-Exit-Codes bleiben: 2 Aufruf, 4 zurueckgehalten (Pausenschalter).
+Exit-Codes bleiben: 2 Aufruf, 4 zurueckgehalten (Pausenschalter), 6 codex hat gereiht (Aufnahme an
+der Zuggrenze), 7 codex-Queue pausiert, 8 "heute kein nutzbarer Weg" (nur fuer die Wache, siehe DIE
+WACHE; nichts gesendet, kein Fehler).
 
 DATEI-INBOX (Protokoll, Version 1). <inbox> ist $WB_INBOX_DIR, sonst
 ~/.claude/workbench/inbox. Ein Adapter IM Prozess des Harness
@@ -270,6 +277,20 @@ GRENZE (wie bei wb-mensch): Code unter derselben Benutzerkennung kann die Pane-O
 @wb_spawner umschreiben oder sich als Kind eines fremden Panes starten. Die Zeile schuetzt
 gegen behauptete Herkunft im Text, nicht gegen Code, der seine Herkunft verwischt.
 
+DIE WACHE (16.10.2026, Auftrag wz-guardinbox): context-guard stellt seine Text-Mahnungen
+(KONTEXT-WARNUNG, Fertigmeldung, ...) ueber dieses Werkzeug zu statt sie zu tippen. Er hat keinen
+Claude-Ahnen und kann seinen Rechtemodus nicht bezeugen; an einen bypass-Empfaenger haelte Claude
+jede Mahnung mit einem Dialog an. Fuer Sendungen mit `--wache-mahnung` UND context-guard als gemessenem Ahnen
+(die Datei neben diesem Werkzeug oder ~/.local/bin/context-guard, AUSGEFUEHRT, nicht als Wort im
+Befehlstext) gilt deshalb auf dem Claude-Weg eine eigene Regel: bezeugbarer Modus (Socket), sonst Claude-Datei-
+Inbox bei belegtem Hook, sonst Exit 8 (kein nutzbarer Weg, nichts gesendet; die Tafel hat dafuer
+Exit 5). Die Datei traegt absender "wache". Ohne `--wache-mahnung` (so sendet check_netzwache) gilt
+auch mit context-guard als Ahnen der bisherige Weg. `--nur-weckend` (vor dem Unterbefehl) verlangt einen Weg,
+der eine untaetige Sitzung weckt: die Claude-Datei-Inbox zaehlt dann nicht, es endet mit Exit 8.
+Wecken tun der bezeugte Claude-Socket, die Datei-Adapter von pi und opencode (sofort, wenn die
+Sitzung untaetig ist) und codex-queue (Kopf, Abschnitte DATEI-INBOX und CODEX). Andere Harnesses aendert
+das nicht.
+
 WAS DIESES WERKZEUG NICHT TUT: Es BEWEIST die Zustellung nicht. Der Socket
 antwortet nicht, und "geschrieben" heisst nie "gelesen". Der Beleg bleibt, wo er
 schon war -- der Auftragsmarker taucht im Pane wieder auf (das prueft `pi-worker`
@@ -298,6 +319,22 @@ INBOX_DIR = os.environ.get("WB_INBOX_DIR", "") or os.path.expanduser("~/.claude/
 # Kein Weg ohne Eingabezeile: eindeutig, damit ein Aufrufer ihn von "kein Empfaenger"
 # (1) und "zurueckgehalten" (4) unterscheiden kann.
 EXIT_KEIN_WEG = 5
+
+# Nur fuer Sendungen der Wache (context-guard): es gibt heute keinen nutzbaren dialogfreien (bzw.
+# bei --nur-weckend: keinen weckenden) Weg zu dieser Claude-Sitzung -- weder bezeugbarer Modus noch
+# belegter Einspiel-Hook. Das ist KEIN Zustellfehler: nichts wurde gesendet, und der Aufrufer darf
+# auf seinen bisherigen Weg zurueckgehen. Die Tafel behaelt fuer denselben Fall Exit 5.
+EXIT_KEIN_NUTZBARER_WEG = 8
+
+# `--nur-weckend` (vor dem Unterbefehl): die Sendung muss eine untaetige Sitzung wecken. Die
+# Claude-Datei-Inbox weckt nicht (der Hook spielt erst beim naechsten Werkzeugaufruf oder Prompt ein).
+NUR_WECKEND = False
+
+# `--wache-mahnung` (vor dem Unterbefehl): nur die Mahnungen und Weckrufe der Wache, die
+# inbox_zustellen in context-guard ausloest, wollen die Wache-Regel (bezeugbar, sonst Datei-Inbox
+# mit Hook, sonst Exit 8). Jede andere Sendung aus dem Guard (Netzwache) bleibt wie auf main:
+# ohne diese Option gilt auch mit context-guard als Ahnen nur der bisherige Weg.
+WACHE_MAHNUNG = False
 
 HIER = os.path.dirname(os.path.realpath(__file__))
 
@@ -720,11 +757,12 @@ def _ausgefuehrtes_programm(args):
     return None
 
 
-def aus_tafel():
-    """Ist wb-tafel ein Ahne, der wb-tafel AUSFUEHRT -- die Datei neben diesem Werkzeug oder
-    ~/.local/bin/wb-tafel (realpath)? Gemessen an der Elternkette, nie an einem Argument."""
+def _ahne_fuehrt_aus(name):
+    """Ist `name` (wb-tafel, context-guard) ein Ahne, der dieses Programm AUSFUEHRT -- die Datei
+    neben diesem Werkzeug oder ~/.local/bin/<name> (realpath)? Gemessen an der Elternkette,
+    nie an einem Argument."""
     erlaubt = set()
-    for k in (os.path.join(HIER, "wb-tafel"), os.path.expanduser("~/.local/bin/wb-tafel")):
+    for k in (os.path.join(HIER, name), os.path.expanduser("~/.local/bin/" + name)):
         if os.path.isfile(k):
             erlaubt.add(os.path.realpath(k))
     for _pid, befehl in aufrufer_ahnen():
@@ -732,6 +770,18 @@ def aus_tafel():
         if programm and "/" in programm and os.path.realpath(programm) in erlaubt:
             return True
     return False
+
+
+def aus_tafel():
+    """Ist wb-tafel ein Ahne, der wb-tafel AUSFUEHRT? Siehe _ahne_fuehrt_aus."""
+    return _ahne_fuehrt_aus("wb-tafel")
+
+
+def aus_wache():
+    """Ist context-guard ein Ahne, der context-guard AUSFUEHRT? Die Wache sendet ihre
+    Text-Mahnungen (16.10.2026) ueber dieses Werkzeug; sie hat keinen Claude-Ahnen und kann ihren
+    Rechtemodus nicht bezeugen, genau wie der Tafel-Waechter."""
+    return _ahne_fuehrt_aus("context-guard")
 
 
 # `--tafel-halter <sessionId>:<klasse>`: wb-tafel nennt den beim `nimm` gemessenen Modus der
@@ -783,7 +833,7 @@ def claude_hook_aktiv(d):
     return mtime >= t0 - 1
 
 
-def claude_datei_senden(d, text, h, grund):
+def claude_datei_senden(d, text, h, grund, absender="tafel"):
     """Die Meldung in <inbox>/claude/<sessionId>/neu/ ablegen (0600, atomar). Der Hook
     hooks/inbox-einspielen.sh spielt sie beim naechsten Werkzeugaufruf oder Prompt der
     Sitzung als Kontext ein und verschiebt sie nach zugestellt/."""
@@ -794,7 +844,7 @@ def claude_datei_senden(d, text, h, grund):
         fehler("Ordner %s nicht anlegbar: %s" % (neu, e))
         return 1
     mid = "%d-%d" % (time.time_ns(), os.getpid())
-    nachricht = {"version": 1, "id": mid, "text": text, "absender": "tafel", "zeit": jetzt_iso(),
+    nachricht = {"version": 1, "id": mid, "text": text, "absender": absender, "zeit": jetzt_iso(),
                  "herkunft": "auftrag" if h["auftrag"] else "information"}
     ziel = os.path.join(neu, mid + ".json")
     tmp = os.path.join(neu, "." + mid + ".tmp")
@@ -1984,19 +2034,27 @@ def cmd_sende(pane, datei):
     # zum gemessenen Modus des Empfaengers passt; sonst die Claude-Datei-Inbox, wenn ihr Hook in
     # dieser Sitzung belegt laeuft. Ohne belegten Hook bleibt es beim bisherigen Weg.
     klasse_modus = rechtemodus()
-    if aus_tafel():
+    # Dieselbe Regel fuer die Wache (context-guard, 16.10.2026): ihre Mahnungen an eine Claude-
+    # Sitzung duerfen nie in einen Held-Dialog laufen, und sie kann ihren Modus nicht bezeugen.
+    system = "tafel" if aus_tafel() else ("wache" if WACHE_MAHNUNG and aus_wache() else None)
+    if system:
         art, wert = tafel_bezeugung(d, klasse_modus)
         if art == "modus" and UMSCHLAG not in text.lower():
             klasse_modus = wert
         else:
             grund = wert if art == "datei" else "Umschlagname im Text"
+            if system == "wache" and NUR_WECKEND:
+                fehler("Wache-Meldung an %s NICHT gesendet: kein weckender Weg (%s; die Claude-Datei-Inbox "
+                       "weckt keine untaetige Sitzung)." % (pane, grund))
+                return EXIT_KEIN_NUTZBARER_WEG
             if claude_hook_aktiv(d):
-                return claude_datei_senden(d, text, h, grund)
+                return claude_datei_senden(d, text, h, grund, system)
             # Ohne dialogfreien Weg wird NICHT zugestellt (Nachtrag 1, der Nutzer 11.10.: "es soll
-            # niemand den Pane versperren"); die Tafel vermerkt es im Verlauf und in der Gruppe.
-            fehler("Tafel-Meldung an %s NICHT zugestellt: kein dialogfreier Weg (%s; Einspiel-Hook in "
-                   "dieser Sitzung nicht belegt). Claude haelte sie an." % (pane, grund))
-            return EXIT_KEIN_WEG
+            # niemand den Pane versperren"); die Tafel vermerkt es im Verlauf und in der Gruppe,
+            # die Wache im Protokoll und in der Statuszeile des Menschen.
+            fehler("%s-Meldung an %s NICHT zugestellt: kein dialogfreier Weg (%s; Einspiel-Hook in "
+                   "dieser Sitzung nicht belegt). Claude haelte sie an." % (system.capitalize(), pane, grund))
+            return EXIT_KEIN_NUTZBARER_WEG if system == "wache" else EXIT_KEIN_WEG
 
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
@@ -2050,7 +2108,13 @@ def cmd_sende(pane, datei):
 
 def main(argv):
     global TMUX_SOCKET, NUR_PID, ABSENDER
-    global TAFEL_HALTER
+    global TAFEL_HALTER, NUR_WECKEND, WACHE_MAHNUNG
+    while argv and argv[0] in ("--nur-weckend", "--wache-mahnung"):
+        if argv[0] == "--nur-weckend":
+            NUR_WECKEND = True
+        else:
+            WACHE_MAHNUNG = True
+        argv = argv[1:]
     while argv and argv[0] in ("-L", "--socket", "--pid", "--absender"):
         if len(argv) < 2:
             fehler("nach %s fehlt der Wert." % argv[0])

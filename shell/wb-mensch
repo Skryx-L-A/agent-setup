@@ -93,10 +93,49 @@
 #       Die Variablen allein zaehlen NICHT. Die PID X muss ein echter Ahne dieses
 #       Prozesses sein, und X muss der Kern der ECHTEN Werkbank sein:
 #         - das ausgefuehrte Programm von X (Mac: proc_pidpath, Linux:
-#           /proc/X/exe) ist genau <kernordner>/node_modules/electron/dist/
-#           Electron.app/Contents/MacOS/Electron bzw. .../dist/electron, mit
-#           <kernordner> aus der festen Liste M2_KERN_ORDNER; auf Linux zusaetzlich
-#           cwd von X = <kernordner> und erstes Argument ".";
+#           /proc/X/exe) ist genau das KERN-ELECTRON <kernordner>/kern-electron/
+#           Electron.app/Contents/MacOS/Electron bzw. .../kern-electron/electron,
+#           mit <kernordner> aus der festen Liste M2_KERN_ORDNER. Das Kern-Electron
+#           ist eine Kopie von node_modules/electron mit abgeschalteten Fuses
+#           (RunAsNode, NODE_OPTIONS, --inspect; app/tools/kern-electron.mjs). Es
+#           laedt den Ordner aus seinem ersten Argument; dass es der Kern ist,
+#           bindet die Argumentpruefung unten (ein Verweis resources/app im
+#           Buendel bestand `codesign --verify --strict` nicht, Ausrollfund
+#           2026-10-14);
+#         - X lief von genau diesem Pfad an (Mac: exec-Pfad aus KERN_PROCARGS2,
+#           Linux: /proc/X/exe), fuehrt dieselbe Datei aus (Geraet/Inode: Mac
+#           apple[] executable_file, Linux stat /proc/X/exe), und die Datei hat
+#           genau einen Namen. Ein Hardlink ist sonst nicht zu erkennen:
+#           proc_pidpath meldet den zuletzt aufgeloesten Namen einer Datei, ein
+#           ueber einen Link gestarteter Prozess heisst nach `cat <echter Pfad>`
+#           wie das Original (gemessen 2026-10-14);
+#         - Argumente und Arbeitsordner des Kernstarts: Mac `<kernordner>
+#           --headless` und cwd = <kernordner> (Kernstart.swift), Linux `. --show`
+#           (seit Electron 42 in /proc auch `--show .`, beide genau so) und cwd =
+#           <kernordner> (shell/linux/agent-workbench);
+#         - Linux zusaetzlich: die Umgebung von X (/proc/X/environ) enthaelt nur
+#           HOME (= Benutzerdatenbank), USER, LOGNAME, SHELL, PATH (fest) und die
+#           Liste M2_UMGEBUNG_LINUX. `systemd-run --user` gibt jedem Programm
+#           dasselbe Elternteil; LD_PRELOAD, GTK_MODULES & Co. faengt erst das.
+#           Ist /proc/X/environ ganz NUL (Electron 42, setproctitle), pruefen
+#           stattdessen die ausfuehrbaren Abbildungen in /proc/X/maps (im Kernordner
+#           nur die Dateien der Electron-dist aus KERN_DATEIEN_LINUX mit einem Namen,
+#           sonst root-eigen, Ordnerkette nicht schreibbar; docs/AGENTS-RECHTE.md);
+#         - Mac zusaetzlich, fuer App UND Kern-Electron: die Datei ist samt aller
+#           Ordner darueber nicht vom Benutzer beschreibbar ODER der laufende
+#           Prozess erfuellt die Code-Anforderung M2_ANFORDERUNG_MAC (`codesign
+#           --verify -R=<anforderung> <pid>`, Signierzertifikat mit Blatt e3b67e...).
+#           Heute traegt nur die Signatur: /Applications ist root:admin 775, und
+#           <user> ist admin. Die Umgebung von X prueft der Mac nicht: die
+#           geprueft echte App startet den Kern nur mit der Positivliste
+#           (Kernstart.swift, installierter Betrieb);
+#         - Den Kern aus node_modules/electron (die App vor dem 14.10.) nimmt
+#           M2 nicht mehr an, unter keiner App. Ein Uebergang dafuer stand vom
+#           14.10. abends bis zum Ausrollen hier; er hatte kein zeitliches Ende,
+#           und ein Downgrade auf eine signierte alte App hielt ihn offen
+#           (review-fusesfix F1). Nach einem erneuten mac/bin/installieren ist
+#           M2 bis zum Neustart der App nein: codesign lehnt laufende Prozesse
+#           ab, deren Datei ersetzt ist (gemessen 14.10.);
 #         - der Elternprozess P von X ist auf dem Mac die installierte App
 #           (M2_APP_MAC), auf Linux `systemd --user` (M2_ELTERN_LINUX); P ist
 #           Kind von PID 1 und nicht spaeter gestartet als X.
@@ -130,22 +169,24 @@
 # oder im Code liest und es einfach mitschickt.
 #
 # Fuer M2 gilt dieselbe Grenze in anderer Form: M2 bindet an die echten
-# Programmdateien, nicht an das, was darin laeuft. Derselbe Benutzer kann die
-# Dateien im Kernordner aendern, und er kann das echte Electron-Programm selbst
-# mit eigenem Code starten (NODE_OPTIONS, ELECTRON_RUN_AS_NODE, --inspect), auf
-# dem Mac auch die installierte App mit eigener Umgebung (`open --env`), auf
-# Linux ueber `systemd-run --user`. Das schliesst dieser Fix nicht; dafuer
-# braeuchte es abgeschaltete Electron-Fuses im Kern-Electron und einen
-# Kernstart, der die Umgebung leert.
-# Auch die Elternpruefung haengt an einem Pfad, den derselbe Benutzer
-# beschreiben kann: /Applications ist root:admin 775, und <user> ist admin
-# (gemessen 2026-10-14, Review herkunft2-review Fund 1). Eine eigene
-# Programmdatei unter einem Listenpfad besteht P und kann das echte Kern-
-# Electron mit beliebigem Code als Kind starten; dagegen helfen auch Fuses
-# nicht. Schliessen liesse sich das nur, wenn P root gehoert und nicht
-# benutzerbeschreibbar ist, oder ueber eine Code-Signatur. Ein Eintrag unter
-# ~/Applications stand bis 2026-10-14 in der Liste und ist gestrichen: die App
-# liegt dort nicht, und der Ordner ist ohne jedes Recht anlegbar.
+# Programmdateien, nicht an alles, was darin laeuft. Seit 2026-10-14 nimmt das
+# Kern-Electron keinen fremden Code ueber ELECTRON_RUN_AS_NODE, NODE_OPTIONS,
+# --inspect oder einen fremden App-Ordner mehr an, die installierte Mac-App
+# startet es mit geleerter Umgebung (ein `open --env` erreicht den Kern nicht
+# mehr), und auf Linux prueft M2 Umgebung und Argumente des Kerns selbst.
+# Offen bleibt, was derselbe Benutzer an DATEIEN aendern kann: den Kernordner
+# (dist/, node_modules, Einstellungen, ~/.local/bin, aus dem der Kern Werkzeuge
+# startet), das Kern-Electron selbst und auf dem Mac auch die App. Eine
+# Signatur bindet App und Kern-Electron an das Signierzertifikat (Blatt e3b67e...,
+# laut codesign "Local Dev"); dessen
+# Schluessel liegt aber im Schluesselbund desselben Benutzers, und mac/bin/
+# signieren benutzt ihn ohne Rueckfrage. Wer also App oder Kern-Electron
+# austauscht UND neu signiert, besteht M2 weiter. Schliessen liesse sich das nur
+# mit einer App, die root gehoert und in einem nicht vom Benutzer beschreibbaren
+# Ordner liegt (/Applications ist root:admin 775, <user> ist admin, gemessen
+# 2026-10-14), oder mit einem Schluessel ausserhalb seiner Reichweite. Ein Eintrag
+# unter ~/Applications stand bis 2026-10-14 in der Liste und ist gestrichen: die
+# App liegt dort nicht, und der Ordner ist ohne jedes Recht anlegbar.
 #
 # Fuer A4 ist eine Ecke dieser Grenze allerdings geschlossen (A4b): steht ein
 # Fernzugangs-Server (sshd, tailscaled, mosh-server) in der Ahnenreihe und laesst sich
@@ -185,6 +226,14 @@ export PATH
 M2_KERN_ORDNER=('~/AI/claude-workbench/app')
 M2_APP_MAC=('/Applications/Werkbank.app/Contents/MacOS/Werkbank')
 M2_ELTERN_LINUX=('/usr/lib/systemd/systemd')
+# Mac: Code-Anforderung an App und Kern-Electron, wenn deren Datei vom Benutzer
+# beschreibbar ist (gemessen 14.10.: /Applications/Werkbank.app gehoert <user>). Das
+# Blatt des Signierzertifikats (mac/bin/signieren; codesign meldet "Local Dev"),
+# abgelesen an der installierten App.
+M2_ANFORDERUNG_MAC=('certificate leaf = H"e3b67e6589a3cae7a97412b5625e3863a0c4a50e"')
+# Linux: Variablen, die der Kern neben HOME, USER, LOGNAME, SHELL und PATH tragen darf
+# (shell/linux/agent-workbench setzt genau diese Umgebung).
+M2_UMGEBUNG_LINUX=(DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR XDG_SESSION_TYPE XDG_SESSION_DESKTOP XDG_CURRENT_DESKTOP XDG_SESSION_ID XDG_SEAT DESKTOP_SESSION DBUS_SESSION_BUS_ADDRESS LANG LANGUAGE LC_ALL LC_CTYPE LC_MESSAGES LC_NUMERIC LC_TIME LC_COLLATE LC_MONETARY SSH_AUTH_SOCK)
 
 CMD="${1:-pruefen}"
 
@@ -640,12 +689,89 @@ if sys.platform == "darwin":
         if lib.proc_pidinfo(pid, 3, 0, ctypes.byref(i), ctypes.sizeof(i)) != ctypes.sizeof(i):
             return None
         return i.ppid, (i.sec, i.usec)
+    def procargs(pid):
+        # KERN_PROCARGS2: exec-Pfad wie beim execve, argv, Umgebung, apple[]. Fuer
+        # Plattform-Programme bleibt die Umgebung leer; das Kern-Electron ist keines.
+        libc = ctypes.CDLL("/usr/lib/libc.dylib")
+        mib = (ctypes.c_int * 3)(1, 49, pid)
+        n = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 3, None, ctypes.byref(n), None, 0) != 0:
+            return None
+        b = ctypes.create_string_buffer(n.value)
+        if libc.sysctl(mib, 3, b, ctypes.byref(n), None, 0) != 0:
+            return None
+        roh = b.raw[:n.value]
+        argc = int.from_bytes(roh[:4], sys.byteorder)
+        rest = roh[4:]
+        i = rest.find(b"\0")
+        teile = rest[i:].lstrip(b"\0").split(b"\0")
+        return rest[:i], teile[:argc], teile[argc:]
+    def cwd(pid):
+        b = ctypes.create_string_buffer(2352)
+        if lib.proc_pidinfo(pid, 9, 0, b, 2352) != 2352:
+            return None
+        return b.raw[152:1176].split(b"\0")[0].decode(errors="replace")
+    def beschreibbar(datei):
+        # Die Datei oder ein Ordner darueber ist fuer diesen Benutzer schreibbar
+        # (dann laesst sie sich austauschen oder umbenennen).
+        d = datei
+        while True:
+            if os.access(d, os.W_OK):
+                return True
+            if d == "/":
+                return False
+            d = os.path.dirname(d)
+    def anforderung(pid):
+        import subprocess
+        for a in listen.get("anforderung", []):
+            if subprocess.call(["/usr/bin/codesign", "--verify", "-R=" + a, str(pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+                return True
+        return False
+    def gebunden(pid, datei, was):
+        # Unbeschreibbar ODER Signatur (Kopf, M2): eine eigene Datei unter einem
+        # Listenpfad soll nicht reichen.
+        if not beschreibbar(datei) or anforderung(pid):
+            return
+        nein("%s %d ist vom Benutzer austauschbar (%s) und erfuellt die Code-Anforderung nicht." % (was, pid, datei))
     x_exe = exe(app)
-    soll = set()
+    soll, treffer = set(), None
     for k in listen.get("kern", []):
-        soll |= pfad(k + "/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron")
-    if x_exe not in soll:
+        s = pfad(k + "/kern-electron/Electron.app/Contents/MacOS/Electron")
+        if x_exe in s:
+            treffer, soll = k, s
+    if treffer is None:
         nein("WB_APP_PID=%d fuehrt %r aus, nicht das Kern-Electron der Werkbank." % (app, x_exe))
+    pa = procargs(app)
+    if pa is None:
+        nein("Startdaten von WB_APP_PID=%d nicht lesbar." % app)
+    x_start, x_argv, x_apple = pa
+    # Hardlinks: proc_pidpath meldet den zuletzt aufgeloesten Namen (gemessen
+    # 14.10.), der exec-Pfad den Namen beim Start; die Datei selbst zaehlt ueber
+    # Geraet und Inode, und sie darf keinen zweiten Namen haben.
+    if x_start.decode(errors="replace") not in soll:
+        nein("WB_APP_PID=%d wurde als %r gestartet, nicht ueber den Pfad des Kern-Electron." % (app, x_start))
+    try:
+        st = os.stat(x_exe)
+    except OSError:
+        nein("Kern-Electron %r nicht lesbar." % x_exe)
+    datei = [a for a in x_apple if a.startswith(b"executable_file=")]
+    try:
+        fsid, ino = [int(t, 16) for t in datei[0].split(b"=", 1)[1].split(b",")]
+    except (IndexError, ValueError):
+        nein("Programmdatei von WB_APP_PID=%d nicht messbar." % app)
+    if ino != st.st_ino or (fsid & 0xffffffff) != (st.st_dev & 0xffffffff):
+        nein("WB_APP_PID=%d fuehrt eine andere Datei aus als %r (Geraet/Inode)." % (app, x_exe))
+    if st.st_nlink != 1:
+        nein("Das Kern-Electron %r hat %d Namen (Hardlink)." % (x_exe, st.st_nlink))
+    # Das Kern-Electron laedt, welchen Ordner das erste Argument nennt (default_app);
+    # deshalb muss es genau der Kernordner aus der festen Liste sein.
+    if len(x_argv) != 3 or x_argv[1].decode(errors="replace") not in pfad(treffer) \
+            or x_argv[2] != b"--headless":
+        nein("WB_APP_PID=%d hat nicht die Argumente des Kernstarts (<kernordner> --headless)." % app)
+    if cwd(app) not in pfad(treffer):
+        nein("Arbeitsordner von WB_APP_PID=%d ist nicht der Kernordner." % app)
+    gebunden(app, x_exe, "Das Kern-Electron")
     xi = info(app)
     if xi is None:
         nein("Prozessdaten von WB_APP_PID=%d nicht lesbar." % app)
@@ -656,6 +782,12 @@ if sys.platform == "darwin":
         eltern |= pfad(e)
     if p_exe not in eltern:
         nein("Elternprozess %d des Kerns ist %r, nicht die installierte Werkbank-App." % (p, p_exe))
+    try:
+        if os.stat(p_exe).st_nlink != 1:
+            nein("Die App %r hat mehrere Namen (Hardlink)." % p_exe)
+    except OSError:
+        nein("Die App %r ist nicht lesbar." % p_exe)
+    gebunden(p, p_exe, "Die App")
     pi = info(p)
     if pi is None:
         nein("Prozessdaten des Elternprozesses %d nicht lesbar." % p)
@@ -685,16 +817,115 @@ elif sys.platform.startswith("linux"):
         return ppid, start, uid
     x_exe, x_cwd = link(app, "exe"), link(app, "cwd")
     argv = (lies(app, "cmdline") or b"").split(b"\0")
+    if argv and argv[-1] == b"":
+        argv.pop()
     treffer = None
     for k in listen.get("kern", []):
-        if x_exe in pfad(k + "/node_modules/electron/dist/electron"):
+        if x_exe in pfad(k + "/kern-electron/electron"):
             treffer = k
     if treffer is None:
         nein("WB_APP_PID=%d fuehrt %r aus, nicht das Kern-Electron der Werkbank." % (app, x_exe))
+    # /proc/X/exe nennt den Namen beim Start; Geraet/Inode und ein einziger Name
+    # schliessen zusaetzlich einen Hardlink aus.
+    try:
+        st, sx = os.stat(x_exe), os.stat("/proc/%d/exe" % app)
+    except OSError:
+        nein("Programmdatei von WB_APP_PID=%d nicht messbar." % app)
+    if (st.st_dev, st.st_ino) != (sx.st_dev, sx.st_ino):
+        nein("WB_APP_PID=%d fuehrt eine andere Datei aus als %r (Geraet/Inode)." % (app, x_exe))
+    if st.st_nlink != 1:
+        nein("Das Kern-Electron %r hat %d Namen (Hardlink)." % (x_exe, st.st_nlink))
     if x_cwd not in pfad(treffer):
         nein("Arbeitsordner von WB_APP_PID=%d ist %r, nicht der Kernordner." % (app, x_cwd))
-    if len(argv) < 2 or argv[1] != b".":
-        nein("WB_APP_PID=%d wurde nicht mit \".\" als erstem Argument gestartet." % app)
+    # Electron/Chromium 42 schreibt die Befehlszeile unter Linux um (setproctitle): Schalter
+    # zuerst, und alles als EINE Zeile mit Leerzeichen und nur einem NUL am Ende, also
+    # "<kern-electron> --show .\0" statt "<kern-electron>\0.\0--show\0" (gemessen auf peer,
+    # 2026-10-16, od -c /proc/X/cmdline). Erlaubt sind genau die getrennte Form `. --show`
+    # bzw. `--show .` und genau diese Zeilenform mit dem Pfad des Kern-Electron davor,
+    # sonst nichts. Chromium schreibt die Zeile aus den tatsaechlichen Schaltern und
+    # Argumenten; ein gefaelschtes argv[0] ("<kern> --show ." ohne echte Argumente) laesst
+    # den Kern ohne Kernordner starten, Programm, Inode, Arbeitsordner, Umgebung und
+    # systemd-Elternteil prueft der Rest dieser Pruefung trotzdem.
+    if len(argv) == 1 and b" " in argv[0]:
+        zeilen = {(p + rest).encode() for p in pfad(treffer + "/kern-electron/electron")
+                  for rest in (" --show .", " . --show")}
+        if argv[0] not in zeilen:
+            nein("WB_APP_PID=%d hat nicht die Argumente des Desktop-Starts (. --show) "
+                 "in der Zeilenform von Electron." % app)
+        argv = [argv[0], b".", b"--show"]
+    if b"." not in argv[1:3]:
+        nein("WB_APP_PID=%d wurde nicht mit \".\" als erstem Argument (oder nach --show) gestartet." % app)
+    if argv[1:] not in ([b".", b"--show"], [b"--show", b"."]):
+        nein("WB_APP_PID=%d hat nicht die Argumente des Desktop-Starts (. --show)." % app)
+    # systemd-run --user gibt jedem Programm dieses Elternteil; die Umgebung des
+    # Kerns ist deshalb Teil der Pruefung (LD_PRELOAD, NODE_OPTIONS, GTK_MODULES ...).
+    erlaubt = set(listen.get("umgebung", [])) | {"HOME", "USER", "LOGNAME", "SHELL", "PATH"}
+    roh = lies(app, "environ")
+    if roh is None:
+        nein("Umgebung von WB_APP_PID=%d nicht lesbar." % app)
+    if roh and not roh.strip(b"\0"):
+        # Electron 42 (Chromium setproctitle) nullt den Umgebungsbereich: /proc/X/environ
+        # ist dann nur NUL (gemessen peer 2026-10-16, 374 Bytes). Ersatz NUR in diesem Fall
+        # (Entscheidung WorkbenchOrchestrator 16.10.): jede ausfuehrbare Abbildung in
+        # /proc/X/maps liegt im Kern-Electron-Ordner oder ist eine root-eigene Datei, deren
+        # Ordnerkette bis / root-eigen und weder gruppen- noch weltschreibbar ist. Das faengt
+        # eigenen Code ueber LD_PRELOAD, LD_LIBRARY_PATH, GTK_MODULES, GIO_EXTRA_MODULES.
+        # HOME und PATH sind so von aussen nicht pruefbar (Restgrenze, dokumentiert).
+        kordner = {os.path.realpath(p) + "/" for p in pfad(treffer + "/kern-electron")}
+        # Im Kernordner zaehlen nur die Dateien der Electron-dist (gemessen peer 16.10.,
+        # Electron 42), direkt im Ordner und mit genau einem Namen. Der Ordner ist vom
+        # Benutzer beschreibbar; ohne Liste ginge ein LD_PRELOAD auf eine dort abgelegte
+        # .so durch (Befund WorkbenchOrchestrator 16.10.). app/tools/kern-electron.mjs
+        # liest diese Zeile und bricht den Bau laut ab, wenn die dist eine Bibliothek
+        # mitbringt, die hier fehlt (Electron-Update).
+        KERN_DATEIEN_LINUX = ("electron", "libEGL.so", "libGLESv2.so", "libffmpeg.so", "libvk_swiftshader.so", "libvulkan.so.1")
+        def root_sicher(d):
+            while True:
+                try:
+                    s = os.stat(d)
+                except OSError:
+                    return False
+                if s.st_uid != 0 or s.st_mode & 0o022:
+                    return False
+                if d == "/":
+                    return True
+                d = os.path.dirname(d)
+        karte = lies(app, "maps")
+        if not karte:
+            nein("Abbildungen von WB_APP_PID=%d nicht lesbar (Umgebung geloescht)." % app)
+        for zeile in karte.decode(errors="replace").splitlines():
+            teile_ = zeile.split(None, 5)
+            if len(teile_) < 5 or "x" not in teile_[1]:
+                continue
+            ziel = teile_[5] if len(teile_) == 6 else ""
+            if ziel in ("", "[vdso]", "[vsyscall]", "[anon:v8]"):
+                continue
+            if ziel.endswith(" (deleted)") or not ziel.startswith("/"):
+                nein("WB_APP_PID=%d hat ausfuehrbaren Speicher %r (geloescht oder ohne Datei)." % (app, ziel[:120]))
+            echt = os.path.realpath(ziel)
+            im_kern = [echt[len(k):] for k in kordner if echt.startswith(k)]
+            if im_kern:
+                try:
+                    sk = os.stat(echt)
+                except OSError:
+                    sk = None
+                if im_kern[0] not in KERN_DATEIEN_LINUX or sk is None or sk.st_nlink != 1:
+                    nein("WB_APP_PID=%d laedt %r aus dem Kern-Electron-Ordner; das ist keine Datei "
+                         "der Electron-dist mit genau einem Namen (Umgebung geloescht)." % (app, ziel[:120]))
+                continue
+            if not root_sicher(echt):
+                nein("WB_APP_PID=%d laedt %r, nicht root-eigen oder beschreibbar (Umgebung geloescht)." % (app, ziel[:120]))
+    else:
+        umg = {}
+        for z in roh.split(b"\0"):
+            if b"=" in z:
+                k, v = z.split(b"=", 1)
+                umg[k.decode(errors="replace")] = v.decode(errors="replace")
+        fremd = sorted(set(umg) - erlaubt)
+        if fremd:
+            nein("Umgebung von WB_APP_PID=%d enthaelt %s (nicht in der Positivliste)." % (app, ", ".join(fremd)[:200]))
+        if umg.get("HOME") != heim or umg.get("PATH") != "/usr/local/bin:/usr/bin:/bin":
+            nein("HOME oder PATH von WB_APP_PID=%d weichen vom Desktop-Start ab." % app)
     xi = info(app)
     if xi is None:
         nein("Prozessdaten von WB_APP_PID=%d nicht lesbar." % app)
@@ -719,7 +950,8 @@ if pi[0] != 1:
 if pi[1] > xi[1]:
     nein("Elternprozess %d ist spaeter gestartet als der Kern %d." % (p, app))
 print("JA")
-' "$app" --kern "${M2_KERN_ORDNER[@]}" --app "${M2_APP_MAC[@]}" --eltern "${M2_ELTERN_LINUX[@]}" 2>/dev/null)
+' "$app" --kern "${M2_KERN_ORDNER[@]}" --app "${M2_APP_MAC[@]}" --eltern "${M2_ELTERN_LINUX[@]}" \
+        --anforderung "${M2_ANFORDERUNG_MAC[@]}" --umgebung "${M2_UMGEBUNG_LINUX[@]}" 2>/dev/null)
     case "$befund" in
         JA) return 0 ;;
         "NEIN "*) GRUND_M2="${befund#NEIN }" ;;

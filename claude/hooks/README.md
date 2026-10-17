@@ -998,3 +998,7 @@ Die eigentliche Herkunftspruefung liegt in `shell/wb-decide` (Abschnitt HERKUNFT
 
 Tests: `shell/tests/test-wb-decide-herkunft.sh` (23 Fälle; die Ablehnungsfälle 3b, 3c, 3e, 8c
 sind gegen den Stand c3c85991 rot).
+
+## Mobil-Pfad: Geräteregister der Mobil-App (2026-10-14, Auftrag wz-mobilguard)
+
+`mobil-pfad` (`bash-guard.py`, Abschnitt 3e, ohne Schalter) sperrt jeden getippten Zugriff auf `~/.claude/workbench/mobile/` und den Aufruf `geraete-replizieren registry`; `bash-guard-live-config.sh` sperrt Write, Edit, MultiEdit, NotebookEdit, Read, Grep und Glob dort (wirksam nur für die Werkzeuge im Matcher). Begründung und Grenzen im Kopfkommentar von 3e; Test: `tests/test-mobil-pfad.sh`.

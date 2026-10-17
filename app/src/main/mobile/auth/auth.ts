@@ -1,7 +1,7 @@
-import { createHash, createPublicKey, randomBytes, timingSafeEqual, verify } from 'node:crypto';
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash, createHmac, createPublicKey, randomBytes, timingSafeEqual, verify } from 'node:crypto';
+import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { MOBILE_API_PREFIX, MOBILE_API_VERSION } from '../../../mobile-shared/vertrag';
 import type { JsonObject, JsonValue, MobileApiErrorCode, RequestEnvelope, SignedRequestEnvelope } from '../../../mobile-shared/vertrag';
 import { CanonicalizationError, canonicalAudience, canonicalSignatureText, pairingProofBodyText } from '../../../mobile-shared/kanonisch';
@@ -9,6 +9,33 @@ import { validateRequestEnvelope } from '../../../mobile-shared/validierung';
 import { acquireMobileAuthLock, MobileStateLockError } from './schloss';
 
 const STATE_FILE = 'auth-state.json';
+/**
+ * DIE GERAETELISTE IST SIGNIERT (Review 14.10.2026, F2). Bis dahin galt jeder Eintrag in
+ * auth-state.json, der die richtige Form hatte: ein Agent konnte ein eigenes Schluesselpaar
+ * als „Handy“ eintragen und sich damit Guard-Freigaben und Antragsentscheidungen erteilen.
+ * Jetzt traegt jeder Eintrag `sig`, einen HMAC-SHA256 mit dem Freigabe-Schluessel der
+ * Maschine (~/.pi-workers/.freigabe-schluessel, derselbe, der die Guard-Freigaben signiert
+ * und den der Guard vor Agenten schuetzt) ueber Kennung, Schluessel, Betreiber, Kopplungszeit
+ * und Widerrufsstand. Ein Eintrag ohne gueltige Signatur gilt als nicht gekoppelt.
+ * Signiert wird NUR beim Koppeln und Widerrufen im Kern (und beim Import der Replikation
+ * auf der Gegenseite, deploy/mobile/geraete-replizieren.mjs). Bestandsgeraete werden NICHT
+ * nachsigniert: sonst wuerde ein schon eingeschleustes Geraet geadelt. Sie brauchen eine
+ * neue Kopplung am Mac; bis dahin antwortet jede ihrer Anfragen `device_not_paired`, und
+ * der Kern meldet beim Start, wie viele Geraete das betrifft.
+ * Die Origins (`audiences`) sind nicht signiert: sie erweitert der Replikationsweg je Host,
+ * und eine zusaetzliche Origin hilft niemandem ohne den privaten Schluessel des Geraets.
+ * GRENZE: Wer den Freigabe-Schluessel lesen kann, kann signieren -- dieselbe Grenze wie bei
+ * den Guard-Freigaben. Eine aeltere, gueltig signierte Fassung eines Eintrags (vor einem
+ * Widerruf) laesst sich wieder einspielen; dagegen hilft nur der Widerruf durch Neukoppeln
+ * mit neuem Schluessel und der Guard-Schutz des Ordners (wz-mobilguard).
+ */
+const GERAET_SIGNATUR_KONTEXT = 'awb-mobile-device-v1';
+export const FREIGABE_SCHLUESSEL_NAME = '.freigabe-schluessel';
+/** Schluessel eines Authenticators mit eigenem (Test-)Verzeichnis: liegt darin, nie der echte. */
+const EIGENER_SCHLUESSEL_NAME = '.geraete-schluessel';
+/** Verlauf der angenommenen Handlungen je Geraet (F4): ohne Werte, eine Vorgaengerdatei. */
+export const GERAETE_VERLAUF = 'geraete-verlauf.log';
+const MAX_VERLAUF_BYTES = 512 * 1024;
 const PAIRING_TTL_MS = 2 * 60 * 1000;
 const REQUEST_TTL_MS = 60 * 1000;
 const RESERVATION_TTL_MS = 30 * 1000;
@@ -94,6 +121,41 @@ export interface DeviceRecord {
   readonly status: 'active' | 'revoked';
   readonly paired_at: number;
   readonly revoked_at?: number;
+  /** HMAC ueber `geraetSignaturText` mit dem Freigabe-Schluessel dieser Maschine (F2). */
+  readonly sig?: string;
+}
+
+/** Der signierte Text eines Geraeteeintrags; dieselbe Zeichenkette bildet geraete-replizieren.mjs. */
+export function geraetSignaturText(device: Pick<DeviceRecord, 'device_id' | 'key_id' | 'public_jwk' | 'operator_identity' | 'paired_at' | 'status' | 'revoked_at'>): string {
+  const jwk = device.public_jwk as Record<string, unknown>;
+  return [GERAET_SIGNATUR_KONTEXT, device.device_id, device.key_id, String(jwk.kty ?? ''), String(jwk.crv ?? ''), String(jwk.x ?? ''),
+    String(jwk.y ?? ''), device.operator_identity, String(device.paired_at), device.status,
+    device.revoked_at === undefined ? '' : String(device.revoked_at)].join('\0');
+}
+
+export function geraetSignatur(device: Parameters<typeof geraetSignaturText>[0], geheim: string): string {
+  return createHmac('sha256', Buffer.from(geheim, 'utf8')).update(geraetSignaturText(device), 'utf8').digest('hex');
+}
+
+/**
+ * Wo der Schluessel zu einem Zustandsordner liegt -- abgeleitet aus dessen Pfad, damit Kern,
+ * Pruefprogramm und Replikationsimport (geraete-replizieren.mjs, dieselbe Regel) denselben
+ * finden, gleich mit welchem $HOME sie laufen: `<heim>/.claude/workbench/mobile` hat den
+ * Freigabe-Schluessel `<heim>/.pi-workers/.freigabe-schluessel` (den wb-freigabe anlegt);
+ * jeder andere Ordner (Tests) einen eigenen darin, nie den echten.
+ */
+export function geraeteSchluesselDatei(stateDirectory: string): string {
+  const ordner = resolve(stateDirectory);
+  const heim = dirname(dirname(dirname(ordner)));
+  return ordner === join(heim, '.claude', 'workbench', 'mobile') && heim !== dirname(heim)
+    ? join(heim, '.pi-workers', FREIGABE_SCHLUESSEL_NAME)
+    : join(ordner, EIGENER_SCHLUESSEL_NAME);
+}
+
+/** Die Art einer Anfrage fuer den Verlauf: Methode und Routenvorlage, Kennungen als `*`. */
+export function anfrageArt(method: string, path: string): string {
+  const teile = path.split('?')[0].split('/').map((teil) => /^[a-z][a-z_-]{0,40}$/.test(teil) || /^v[0-9]{1,3}$/.test(teil) || teil === '' ? teil : '*');
+  return `${method.toUpperCase().slice(0, 8)} ${teile.join('/').slice(0, 160)}`;
 }
 
 export interface AuthenticatedRequest {
@@ -159,6 +221,8 @@ interface RequestRecord {
   expires_at: number;
   /** Das Ergebnisjournal: Reservierung, Zustand und Ergebnis liegen in EINEM Datensatz. */
   result?: JournalErgebnis;
+  /** Methode und Routenvorlage ohne Kennungen (F4); der Schluessel des Records nennt das Geraet. */
+  art?: string;
 }
 
 interface State {
@@ -277,9 +341,73 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
 
 export class MobileAuthenticator {
   readonly stateDirectory: string;
+  /** Der Freigabe-Schluessel, mit dem die Geraeteeintraege signiert sind (F2). */
+  readonly signaturSchluessel: string;
 
-  constructor(stateDirectory = join(homedir(), '.claude', 'workbench', 'mobile')) {
-    this.stateDirectory = stateDirectory;
+  /**
+   * Ohne Angabe: der echte Ort (~/.claude/workbench/mobile). Der Schluessel folgt dem
+   * Zustandsordner, nicht dem $HOME des Prozesses: `geraeteSchluesselDatei`.
+   */
+  constructor(stateDirectory?: string, signaturSchluessel?: string) {
+    this.stateDirectory = stateDirectory ?? join(homedir(), '.claude', 'workbench', 'mobile');
+    this.signaturSchluessel = signaturSchluessel ?? geraeteSchluesselDatei(this.stateDirectory);
+  }
+
+  /** Der Schluessel, oder null. `anlegen` nur beim Koppeln/Widerrufen (wie wb-freigabe: 64 Hex, 0600). */
+  private geheim(anlegen: boolean): string | null {
+    try {
+      const wert = readFileSync(this.signaturSchluessel, 'utf8').trim();
+      if (wert) return wert;
+    } catch {
+      // fehlt oder unlesbar
+    }
+    if (!anlegen) return null;
+    mkdirSync(dirname(this.signaturSchluessel), { recursive: true, mode: 0o700 });
+    const neu = randomBytes(32).toString('hex');
+    try {
+      const descriptor = openSync(this.signaturSchluessel, 'wx', 0o600);
+      try { writeFileSync(descriptor, `${neu}\n`, 'utf8'); } finally { closeSync(descriptor); }
+      return neu;
+    } catch {
+      // Ein anderer Prozess war schneller: dessen Schluessel gilt.
+      const wert = readFileSync(this.signaturSchluessel, 'utf8').trim();
+      if (!wert) throw new MobileAuthError('internal_error', 'device signing key is unavailable');
+      return wert;
+    }
+  }
+
+  private signieren(device: MutableDeviceRecord): void {
+    const geheim = this.geheim(true);
+    if (!geheim) throw new MobileAuthError('internal_error', 'device signing key is unavailable');
+    (device as { sig?: string }).sig = geraetSignatur(device, geheim);
+  }
+
+  private geraetGilt(device: MutableDeviceRecord, geheim: string | null): boolean {
+    if (!geheim || typeof device.sig !== 'string' || !/^[a-f0-9]{64}$/.test(device.sig)) return false;
+    return timingSafeEqual(Buffer.from(device.sig, 'hex'), Buffer.from(geraetSignatur(device, geheim), 'hex'));
+  }
+
+  /**
+   * Aktive Geraete ohne gueltige Signatur dieser Maschine (Bestand von vor dem 14.10.2026
+   * oder eingeschleust). Der Kern meldet die Zahl beim Start; Abhilfe ist Neukoppeln.
+   */
+  ungueltigeGeraete(): readonly { device_id: string; device_name: string }[] {
+    const geheim = this.geheim(false);
+    return this.withState((state) => Object.values(state.devices)
+      .filter((device) => device.status === 'active' && !this.geraetGilt(device, geheim))
+      .map((device) => ({ device_id: device.device_id, device_name: device.device_name })), false);
+  }
+
+  /** Eine angenommene Handlung ins Geraeteverlauf (F4); scheitert das Schreiben, gilt die Handlung trotzdem. */
+  private verlaufAnhaengen(eintrag: Record<string, string | number>): void {
+    const pfad = join(this.stateDirectory, GERAETE_VERLAUF);
+    try {
+      if (existsSync(pfad) && statSync(pfad).size > MAX_VERLAUF_BYTES) renameSync(pfad, `${pfad}.1`);
+      appendFileSync(pfad, `${JSON.stringify(eintrag)}\n`, { encoding: 'utf8', mode: 0o600 });
+      chmodSync(pfad, 0o600);
+    } catch {
+      // Der Verlauf ist Nachvollziehbarkeit, nicht Bedingung.
+    }
   }
 
   startPairing(options: PairingStartOptions): PairingStart {
@@ -344,6 +472,7 @@ export class MobileAuthenticator {
         status: 'active',
         paired_at: now,
       };
+      this.signieren(device);
       state.devices[device.device_id] = device;
       pairing.status = 'complete';
       return device;
@@ -356,6 +485,8 @@ export class MobileAuthenticator {
       if (!device || device.status === 'revoked') return false;
       device.status = 'revoked';
       device.revoked_at = now;
+      // Ohne Schluessel bleibt der Eintrag unsigniert und gilt damit ohnehin nicht mehr.
+      try { this.signieren(device); } catch { delete (device as { sig?: string }).sig; }
       return true;
     });
   }
@@ -372,7 +503,12 @@ export class MobileAuthenticator {
   }
 
   devices(): readonly DeviceRecord[] {
-    return this.withState((state) => Object.values(state.devices).map((device) => ({ ...device })));
+    // Ohne `sig`: die Signatur ist Sache dieser Klasse, nie der Anzeige.
+    return this.withState((state) => Object.values(state.devices).map((device) => {
+      const kopie: MutableDeviceRecord & { sig?: string } = { ...device };
+      delete kopie.sig;
+      return kopie;
+    }));
   }
 
   verifyAndReserve(envelope: SignedRequestEnvelope, options: VerifyRequestOptions): AuthenticatedRequest {
@@ -387,6 +523,7 @@ export class MobileAuthenticator {
         state: 'reserved',
         reserved_at: checked.now,
         expires_at: checked.now + RESERVATION_TTL_MS,
+        art: anfrageArt(envelope.method, envelope.path),
       };
       const floor = counterFloor(state, key, requests);
       requests.push(record);
@@ -439,6 +576,7 @@ export class MobileAuthenticator {
   private checkAgainstState(state: State, envelope: SignedRequestEnvelope, checked: { audience: string; fingerprint: string }): { device: MutableDeviceRecord; key: string; requests: RequestRecord[] } {
     const device = state.devices[envelope.device_id];
     if (!device) throw new MobileAuthError('device_not_paired', 'device is not paired');
+    if (!this.geraetGilt(device, this.geheim(false))) throw new MobileAuthError('device_not_paired', 'device record is not signed on this machine; pair again');
     if (device.status === 'revoked') throw new MobileAuthError('device_revoked', 'device is revoked');
     if (device.key_id !== envelope.key_id) throw new MobileAuthError('key_not_found', 'key is not registered for this device');
     if (!device.audiences.includes(checked.audience)) throw new MobileAuthError('audience_mismatch', 'audience is not registered for this device');
@@ -482,6 +620,11 @@ export class MobileAuthenticator {
       }
       record.state = 'consumed';
       journalSetzen(record, ergebnis);
+      // Wer was angenommen hat (F4): nur Handlungen, kein Lesen; ohne Body, ohne Werte.
+      if (record.art && !record.art.startsWith('GET ')) {
+        this.verlaufAnhaengen({ ts: new Date(now).toISOString(), geraet: request.device_id, request_id: request.request_id,
+          art: record.art, ergebnis: ergebnis ? (istJournalFehler(ergebnis) ? ergebnis.code : ergebnis.status) : 'angenommen' });
+      }
     });
   }
 

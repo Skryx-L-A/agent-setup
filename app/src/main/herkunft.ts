@@ -25,16 +25,20 @@
 //     Signatur ueber genau diese Handlung und damit mindestens so stark.
 //     Spezifikation 3.1: „erhaelt den Absender mensch erst, wenn WeltenQuelle ...
 //     einen verifizierten Herkunftsbeleg akzeptiert" -- das tut sie hiermit.
-//   * Guard-Annahme (angehaltener Bash-Befehl): NEIN. Eine gueltige Freigabe
-//     entsteht nur in `wb-freigabe`, und das misst die Herkunft selbst ueber die
-//     Ahnenreihe (`wb-mensch`, WB_MENSCH_QUELLE=oberflaeche). Der Mobilbeleg
-//     reicht nicht bis dorthin; Spezifikation 4.3 verlangt, dass „dasselbe
-//     Belegobjekt ... bis freigabeErteilen() und wb-freigabe reichen" muss. Bis
-//     `wb-freigabe` einen Mobilbeleg selbst pruefen kann, bleibt die Annahme per
-//     Mobil gesperrt (fail closed); Ablehnen geht wie bisher ohne Nachweis.
+//   * Guard-Annahme (angehaltener Bash-Befehl) und Worker-Antraege: JA, aber
+//     nicht auf das Wort des Kerns (14.10.2026, Entscheidung des Nutzers „Annahme
+//     am Handy und Guard angleichen: ja"). Eine gueltige Freigabe entsteht nur in
+//     `wb-freigabe`, eine Antragsentscheidung nur in `wb-decide`. Beide pruefen
+//     den Geraetebeleg selbst: der Beleg traegt dazu den signierten Umschlag und
+//     den Body (`nachweis`), die Pruefstelle laesst `wb-mobil-pruefen` die
+//     Signatur gegen die Kopplungsliste pruefen, an Eintrag und Entscheidung
+//     binden und den Umschlag verbrauchen (Ablauf 60 s, Nonce, Zaehler). Ohne
+//     Nachweis bleibt Annehmen per Mobil gesperrt (fail closed). Spezifikation
+//     4.3: „dasselbe Belegobjekt ... bis freigabeErteilen() und wb-freigabe".
 //   * Sitzungsstart mit `--mensch` (Effort-Deckel): NEIN, aus demselben Grund --
 //     `wb-code` misst den Menschen ueber `wb-mensch`, nicht ueber diesen Beleg.
 import type { AuthenticatedRequest } from './mobile/auth/auth';
+import type { SignedRequestEnvelope } from '../mobile-shared/vertrag';
 
 export type Herkunft = 'oberflaeche' | 'steuerkanal';
 
@@ -44,7 +48,18 @@ export type Herkunftsbeleg =
   /** Steuerkanal, Skript, alles ohne Nachweis. */
   | { readonly art: 'steuerkanal' }
   /** Ein vom Mobile-HTTP-Server gepruefter, signierter Umschlag eines gekoppelten Geraets. */
-  | { readonly art: 'mobilgeraet'; readonly anfrage: AuthenticatedRequest };
+  | { readonly art: 'mobilgeraet'; readonly anfrage: AuthenticatedRequest; readonly nachweis?: MobilNachweis };
+
+/**
+ * Was eine Pruefstelle ausserhalb des Kerns selbst nachpruefen kann: der signierte
+ * Umschlag und genau die Bytes, deren Hash er traegt. Kein Geheimnis -- ohne den
+ * privaten Schluessel des Geraets laesst sich daraus keine andere Handlung bauen,
+ * und der Umschlag gilt nur einmal.
+ */
+export interface MobilNachweis {
+  readonly umschlag: SignedRequestEnvelope;
+  readonly body: Buffer;
+}
 
 const verifizierteMobilanfragen = new WeakSet<AuthenticatedRequest>();
 
@@ -58,8 +73,14 @@ export function mobilanfrageBelegen(anfrage: AuthenticatedRequest): Authenticate
 }
 
 /** Der Beleg fuer eine gepruefte Mobilanfrage; ein ungeprueftes Objekt ergibt keinen Mobilbeleg. */
-export function mobilBeleg(anfrage: AuthenticatedRequest): Herkunftsbeleg {
-  return verifizierteMobilanfragen.has(anfrage) ? { art: 'mobilgeraet', anfrage } : { art: 'steuerkanal' };
+export function mobilBeleg(anfrage: AuthenticatedRequest, nachweis?: MobilNachweis): Herkunftsbeleg {
+  if (!verifizierteMobilanfragen.has(anfrage)) return { art: 'steuerkanal' };
+  return nachweis ? { art: 'mobilgeraet', anfrage, nachweis } : { art: 'mobilgeraet', anfrage };
+}
+
+/** Der weiterreichbare Nachweis eines geprueften Mobilbelegs, sonst null. */
+export function mobilNachweis(beleg: Herkunftsbeleg): MobilNachweis | null {
+  return beleg.art === 'mobilgeraet' && istVerifizierterMobilbeleg(beleg) && beleg.nachweis ? beleg.nachweis : null;
 }
 
 /** Die bisherige Paarform, unveraendert gedeutet. */
@@ -83,8 +104,9 @@ export function menschlicherAbsender(beleg: Herkunftsbeleg): boolean {
 }
 
 /**
- * Ob eine Guard-Annahme den Weg zu `wb-freigabe` gehen darf. Nur der echte
- * Klick in dieser Oberflaeche -- der Mobilbeleg reicht nicht bis `wb-freigabe`.
+ * Ob eine Guard-Annahme den Weg ueber den Menschen-Nachweis (M2) zu `wb-freigabe`
+ * gehen darf: nur der echte Klick in dieser Oberflaeche. Ein Mobilbeleg geht einen
+ * eigenen Weg (`wb-freigabe --mobilbeleg`, siehe freigaben.ts `freigabeErteilen`).
  */
 export function guardAnnahmeErlaubt(beleg: Herkunftsbeleg): boolean {
   return beleg.art === 'oberflaeche' && beleg.echt;

@@ -10,18 +10,42 @@
 # ~/AI/claude-workbench/app. Fehlt das Bauergebnis, wird einmal gebaut.
 set -euo pipefail
 
-wurzel="$HOME/AI/claude-workbench/app"
+# DER KERN STARTET FEST (14.10.2026, Menschen-Nachweis M2 in shell/wb-mensch). M2 nimmt
+# auf peer einen Klick als menschlich, wenn er aus dem Kern-Electron unter
+# `systemd --user` kommt. Weil `systemd-run --user` jedem dasselbe Elternteil gibt,
+# prueft wb-mensch am Kern selbst: Programm (Kern-Electron mit abgeschalteten Fuses,
+# app/tools/kern-electron.mjs), Arbeitsordner, Argumente `. --show` und eine Umgebung
+# NUR aus der Positivliste unten. Deshalb hier: kein "$@", Umgebung geleert, und das
+# Heimatverzeichnis aus der Benutzerdatenbank statt $HOME.
+heim="$(getent passwd "$(id -u)" | cut -d: -f6)"
+wurzel="$heim/AI/claude-workbench/app"
 cd "$wurzel"
 
 if [ ! -f dist/main/main.js ]; then
   npm run build >/dev/null
 fi
+if [ ! -x kern-electron/electron ]; then
+  node tools/kern-electron.mjs >/dev/null
+fi
 
 # Schon offen? Dann nicht ein zweites Mal starten -- ein zweiter Hauptprozess
-# faende den Steuersocket belegt.
-if pgrep -f "$wurzel/node_modules/electron/dist/electron .*--show" >/dev/null 2>&1; then
+# faende den Steuersocket belegt. Electron 42 schreibt die Befehlszeile unter Linux
+# Schalter-zuerst um (`--show .`, gemessen auf peer 2026-10-16); beide Reihenfolgen zaehlen.
+if pgrep -f "^$wurzel/kern-electron/electron (\\. --show|--show \\.)( |\$)" >/dev/null 2>&1; then
   echo "Agent Workbench laeuft bereits." >&2
   exit 0
 fi
 
-exec ./node_modules/electron/dist/electron . --show "$@"
+# Positivliste: Anzeige, Sitzungsbus, Sprache, Agent-Socket. Dieselbe Liste steht in
+# shell/wb-mensch (M2_UMGEBUNG_LINUX); nichts, was Code laden kann (LD_*, NODE_*,
+# ELECTRON_*, GTK_MODULES, GTK_PATH, GIO_EXTRA_MODULES).
+behalten=(DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR XDG_SESSION_TYPE XDG_SESSION_DESKTOP
+          XDG_CURRENT_DESKTOP XDG_SESSION_ID XDG_SEAT DESKTOP_SESSION DBUS_SESSION_BUS_ADDRESS
+          LANG LANGUAGE LC_ALL LC_CTYPE LC_MESSAGES LC_NUMERIC LC_TIME LC_COLLATE LC_MONETARY
+          SSH_AUTH_SOCK)
+umgebung=(HOME="$heim" USER="$(id -un)" LOGNAME="$(id -un)" SHELL="$(getent passwd "$(id -u)" | cut -d: -f7)"
+          PATH=/usr/local/bin:/usr/bin:/bin)
+for v in "${behalten[@]}"; do
+  [ -n "${!v+x}" ] && umgebung+=("$v=${!v}")
+done
+exec /usr/bin/env -i "${umgebung[@]}" "$wurzel/kern-electron/electron" . --show

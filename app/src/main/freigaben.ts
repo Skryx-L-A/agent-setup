@@ -15,7 +15,7 @@
 //                        Sessionmodell (sessions.ts) -- nichts hier wird
 //                        geraten. Eine Markerdatei, deren Pane nicht mehr
 //                        lebt, ist hinfaellig und wird aufgeraeumt.
-import { guardAnnahmeErlaubt, menschlicherAbsender, type Herkunftsbeleg } from './herkunft';
+import { guardAnnahmeErlaubt, menschlicherAbsender, mobilNachweis, type Herkunftsbeleg, type MobilNachweis } from './herkunft';
 import { spawnSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, existsSync, statSync, unlinkSync, type Stats } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -31,6 +31,8 @@ import type { SessionInfo } from './sessions';
 
 export interface RequestEntry {
   path: string;
+  /** SHA-256 der gelesenen Dateibytes (Kennung am Handy, Review 14.10.2026, F3). */
+  inhaltSha256: string;
   ts: string;
   parent: string;
   parentModel: string;
@@ -60,9 +62,11 @@ export function readRequests(requestsDir: string): RequestEntry[] {
     if (vorhanden.has(`${d}.decision`)) continue;
     const pfad = join(requestsDir, d);
     try {
-      const r = JSON.parse(readFileSync(pfad, 'utf8')) as Record<string, unknown>;
+      const roh = readFileSync(pfad);
+      const r = JSON.parse(roh.toString('utf8')) as Record<string, unknown>;
       raus.push({
         path: pfad,
+        inhaltSha256: createHash('sha256').update(roh).digest('hex'),
         ts: String(r.ts ?? ''),
         parent: String(r.parent ?? ''),
         parentModel: String(r.parent_model ?? ''),
@@ -128,6 +132,27 @@ export function decideRequest(
     };
   }
   const home = dirname(dirname(requestsDir));
+  // DER GERAETEBELEG BIS WB-DECIDE (14.10.2026): ein Mobilbeleg geht nicht mehr ueber
+  // M2 (der Kern buergt), sondern traegt den signierten Umschlag samt Body zu
+  // `wb-decide --mobilbeleg`, das ihn ueber `wb-mobil-pruefen` selbst prueft, an diesen
+  // Antrag und diese Entscheidung bindet und verbraucht. Ohne Nachweis: keine Entscheidung.
+  if (beleg.art === 'mobilgeraet') {
+    const nachweis = mobilNachweis(beleg);
+    if (!nachweis) {
+      return { ok: false, output: 'Entscheiden per Mobilgeraet braucht den signierten Geraetebeleg; er fehlt. Nichts entschieden.' };
+    }
+    const m = spawnSync(wbDecideBin, ['--mobilbeleg', reqPath, action, reason], {
+      encoding: 'utf8',
+      input: nachweisText(nachweis),
+      // Kein WB_MENSCH_QUELLE/WB_APP_PID: hier traegt der Geraetebeleg, nicht der Kern.
+      env: { ...process.env, HOME: home, WB_MENSCH_QUELLE: undefined, WB_APP_PID: undefined },
+      timeout: 15_000,
+    });
+    if (m.error || m.signal) {
+      process.stderr.write(`decideRequest(${wbDecideBin} --mobilbeleg): ${m.signal ? 'nach 15000ms abgebrochen' : m.error?.message}\n`);
+    }
+    return { ok: m.status === 0, output: `${m.stdout ?? ''}${m.stderr ?? ''}` };
+  }
   // FRIST (2026-08-20, dieselbe Fehlerklasse wie beim Beenden): ein externes
   // Werkzeug ohne `timeout` kann den Hauptprozess unbegrenzt anhalten, wenn es
   // haengt -- auch wenn `wb-decide` heute schnell ist, ist das keine Zusage
@@ -149,6 +174,11 @@ export function decideRequest(
   }
   const output = `${r.stdout ?? ''}${r.stderr ?? ''}`;
   return { ok: r.status === 0, output };
+}
+
+/** Der Nachweis als stdin-Zeile der Pruefstellen: `{"umschlag":{..},"body_b64":".."}`. */
+function nachweisText(nachweis: MobilNachweis): string {
+  return `${JSON.stringify({ umschlag: nachweis.umschlag, body_b64: nachweis.body.toString('base64') })}\n`;
 }
 
 export interface GuardBlockEntry {
@@ -585,16 +615,48 @@ export function freigabeErteilen(
 ): FreigabeErgebnis {
   if (!eintrag.wartet) return { ok: false, output: 'Dieser Eintrag wartet nicht auf eine Freigabe.' };
   const beleg: Herkunftsbeleg = typeof mensch === 'boolean' ? { art: 'oberflaeche', echt: mensch } : mensch;
+  const ttl = Math.max(1, Math.min(900, Math.floor(ttlSekunden)));
+  const schluessel = freigabeSchluessel(eintrag.pane, eintrag.cwd, eintrag.command);
   if (beleg.art === 'mobilgeraet') {
-    // Die Geraetesignatur ist im Kern geprueft, reicht aber nicht bis
-    // `wb-freigabe`, das die Herkunft selbst ueber die Ahnenreihe misst. Bis es
-    // einen Mobilbeleg selbst pruefen kann, bleibt Annehmen per Mobil gesperrt.
-    ablehnungVermerken(umgebung.logFile, eintrag, beleg);
-    return {
-      ok: false,
-      output: 'Annehmen per Mobilgeraet ist gesperrt: der Geraetebeleg reicht nicht bis wb-freigabe. '
-        + 'Ablehnen geht; annehmen am Rechner.',
-    };
+    // DER GERAETEBELEG BIS WB-FREIGABE (14.10.2026, Entscheidung des Nutzers „Annahme am
+    // Handy und Guard angleichen: ja"). Die Geraetesignatur ist im Kern geprueft; das
+    // genuegt nicht. `wb-freigabe --mobilbeleg` laesst den Umschlag ueber
+    // `wb-mobil-pruefen` selbst pruefen, an genau diesen Schluessel binden und
+    // verbrauchen -- derselbe Weg wie beim Antrag (`wb-decide --mobilbeleg`).
+    const nachweis = mobilNachweis(beleg);
+    if (!nachweis) {
+      ablehnungVermerken(umgebung.logFile, eintrag, beleg);
+      return { ok: false, output: 'Annehmen per Mobilgeraet braucht den signierten Geraetebeleg; er fehlt. Nichts erteilt.' };
+    }
+    const m = spawnSync(
+      umgebung.bin,
+      ['erteilen', '--ttl', String(ttl), '--schluessel', schluessel, '--grund', reason, '--mobilbeleg', eintrag.pane],
+      {
+        encoding: 'utf8',
+        input: nachweisText(nachweis),
+        env: {
+          ...process.env,
+          AWB_GUARD_GRANTS_DIR: umgebung.grantsDir,
+          AWB_GUARD_BLOCKS_DIR: umgebung.blocksDir,
+          AWB_GUARD_LOG: umgebung.logFile,
+          // Kein M2: hier traegt der Geraetebeleg, nicht der Kern als Ahne.
+          WB_MENSCH_QUELLE: undefined,
+          WB_APP_PID: undefined,
+        },
+        timeout: 15_000,
+      },
+    );
+    const ausgabe = `${m.stdout ?? ''}${m.stderr ?? ''}`.trim();
+    if (m.error || m.status !== 0) {
+      // 77: wb-freigabe hat die Absage selbst in den Verlauf geschrieben (ohne Werte).
+      if (m.error || m.status !== 77) {
+        verlaufAnhaengen(umgebung.logFile, 'muster-freigabe-fehlgeschlagen',
+          `Freigeben per Mobilgeraet gescheitert (${m.error ? 'nicht aufrufbar' : `Code ${m.status}`}).`,
+          { ...eintrag, command: '', cwd: '' });
+      }
+      return { ok: false, output: m.error ? `\`${umgebung.bin}\` liess sich nicht aufrufen: ${m.error.message}` : (ausgabe || `\`${umgebung.bin}\` endete mit Code ${m.status}.`) };
+    }
+    return { ok: true, output: ausgabe || `Freigegeben fuer einen Durchlauf, gueltig ${Math.round(ttl / 60)} Min.` };
   }
   // Die Begruendung ist FREIWILLIG (19.08.): sie stand hier als Pflicht, obwohl
   // sie nie das war, was eine Freigabe traegt -- das ist die gemessene Herkunft
@@ -610,8 +672,6 @@ export function freigabeErteilen(
         + `${eintrag.pane} "<grund>"\`.`,
     };
   }
-  const ttl = Math.max(1, Math.min(900, Math.floor(ttlSekunden)));
-  const schluessel = freigabeSchluessel(eintrag.pane, eintrag.cwd, eintrag.command);
   const r = spawnSync(
     umgebung.bin,
     // Die Begruendung geht als SCHALTER hinaus, nicht als Stellungsargument

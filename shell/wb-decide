@@ -1,7 +1,10 @@
 #!/bin/bash
 # wb-decide — the ORCHESTRATOR decides a worker's request for a sub-worker.
 #
-#   wb-decide <antrags-datei> approve|reject [begruendung]
+#   wb-decide [--mobilbeleg] <antrags-datei> approve|reject [begruendung]
+#
+# --mobilbeleg: the signed device proof of a paired phone on stdin (see HERKUNFT PER
+# MOBILGERAET below) instead of measuring the calling pane or human.
 #
 # Writes <antrag>.decision, updates the decision column of
 # ~/.pi-workers/requests/log.tsv and, on approve, prints the ready-to-run spawn
@@ -12,9 +15,39 @@
 # too (14.10.2026), with one exception: a worker may reject its OWN request.
 set -u
 
+# DIE XCODE-HUELLE (14.10.2026, Review handyguard2 N1, gemessen): /usr/bin/python3 ist auf
+# macOS kein Python, sondern der xcrun-Shim. Er startet $DEVELOPER_DIR/usr/bin/xcrun, und
+# `-I` hilft dagegen nicht, weil das echte Python gar nicht erst startet. Ein Worker tippte
+# `DEVELOPER_DIR=<eigener Ordner> wb-decide <antrag> approve`, sein eigenes xcrun gab fuer
+# die Herkunftsmessung "orchestrator" aus -> Exit 0, angenommen. Deshalb zwei Linien, Gurt
+# und Hosentraeger:
+#   1. Hier vorweg werden DEVELOPER_DIR, SDKROOT und TOOLCHAINS (die drei Variablen, nach
+#      denen xcrun sein Werkzeug sucht) geloescht. Das gilt fuer jeden Prozess, den dieses
+#      Skript startet (auch wb-mensch und das Pruefprogramm), und fuer einen Python-Aufruf,
+#      der kuenftig ohne py_rein hinzukommt.
+#   2. Jeder Python-Aufruf laeuft ueber py_rein: `env -i` mit Positivliste (nur ein fester
+#      PATH; was der Code braucht, kommt als Argument oder auf stdin), `-I` (kein
+#      PYTHONPATH/PYTHONHOME/PYTHONSTARTUP, kein Skriptordner), `-S` (kein site), `-X utf8`
+#      (UTF-8 ohne LANG). Vorbild wb-mensch (`/usr/bin/env -i /usr/bin/python3 -I -S`).
+# Auf Linux gibt es keinen Shim; dort deckt dieselbe Zeile die Python-Variablen ab.
+unset DEVELOPER_DIR SDKROOT TOOLCHAINS
+PY_PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+py_rein() { /usr/bin/env -i PATH="$PY_PATH" /usr/bin/python3 -I -S -X utf8 "$@"; }
+
+MOBILBELEG=0
+if [ "${1:-}" = --mobilbeleg ]; then MOBILBELEG=1; shift; fi
 REQ="${1:?Antrags-Datei}"; ACTION="${2:?approve|reject}"; shift 2
 REASON="$*"
 LOG="$HOME/.pi-workers/requests/log.tsv"
+# Die Heimat laut Benutzerdatenbank, NIE aus $HOME (Review 14.10.2026, F1): mit --mobilbeleg
+# kommen Pruefprogramm, Kopplungsliste und Verlauf von hier. Ein umgelenktes HOME brachte
+# sonst ein eigenes Pruefprogramm mit, das jeden Beleg annahm. Testnaht: nur eine KOPIE mit
+# umgeschriebener Zeile (shell/tests/test-mobil-geraetebeleg.sh), nie ein Schalter.
+WB_MOBIL_HEIM="$(py_rein -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')"
+if [ "$MOBILBELEG" = 1 ]; then
+  [ -n "$WB_MOBIL_HEIM" ] && [ -d "$WB_MOBIL_HEIM" ] || { echo "wb-decide: Heimatverzeichnis laut Benutzerdatenbank nicht lesbar -- nichts entschieden." >&2; exit 3; }
+  LOG="$WB_MOBIL_HEIM/.pi-workers/requests/log.tsv"
+fi
 
 [ -f "$REQ" ] || { echo "wb-decide: Antrag nicht gefunden: $REQ" >&2; exit 2; }
 case "$ACTION" in approve|reject) ;; *) echo "wb-decide: '$ACTION' ist weder approve noch reject." >&2; exit 2 ;; esac
@@ -34,15 +67,20 @@ fi
 # Werkzeugs stirbt daran (Befund 2026-08-15, nachgestellt mit kaputtem JSON: ".decision:
 # approved" lag auf der Platte, waehrend das Skript an einer nicht gesetzten Variablen
 # abbrach; die Logzeile blieb 'pending', und den Spawn-Befehl bekam nie jemand zu sehen).
-FELDER="$(/usr/bin/python3 - "$REQ" <<'PY'
-import json, shlex, sys
+FELDER="$(py_rein - "$REQ" <<'PY'
+import hashlib, json, shlex, sys
 try:
-    r = json.load(open(sys.argv[1]))
+    # Einmal lesen: dieselben Bytes tragen die Felder unten UND den Inhaltshash, an den ein
+    # Geraetebeleg gebunden ist (Review 14.10.2026, F3).
+    with open(sys.argv[1], "rb") as fh:
+        roh = fh.read()
+    r = json.loads(roh.decode("utf-8"))
     if not isinstance(r, dict):
         raise ValueError("kein JSON-Objekt")
 except Exception as e:
     sys.stderr.write("%s\n" % e)
     sys.exit(1)
+print("R_INHALT_SHA256=%s" % hashlib.sha256(roh).hexdigest())
 for k in ("ts", "parent", "child_name", "child_model", "child_effort", "dir", "task"):
     print("R_%s=%s" % (k.upper(), shlex.quote(str(r.get(k) or ""))))
 print("R_FILES=%s" % shlex.quote(", ".join(r.get("files") or [])))
@@ -82,10 +120,23 @@ done
 #     Kern setzt WB_MENSCH_QUELLE/WB_APP_PID nur nach einem echten Klick).
 # GRENZE wie bei wb-mensch: Code, der seine Herkunft aktiv verwischt (etwa ein neues
 # tmux-Fenster ohne Rolle aufmacht), wird hier nicht erkannt.
+# Was die Messung frueher aus der Umgebung las, kommt seit py_rein (14.10.2026) als Argument,
+# mit denselben Werten: die zwei Orte von rollen.py, AWB_ROLLEN_DIR und HOME (daraus bildet
+# rollen.verzeichnis() das Register), TMUX und TMPDIR (nur Kandidaten fuer Sockets; jeder wird
+# an der uid geprueft). `ps` und `tmux` (in rollen.py) kommen aus dem festen PATH von py_rein,
+# nicht mehr aus dem PATH des Aufrufers.
 wb_herkunft() {
-  /usr/bin/python3 - "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/hooks/lib" \
-    "$HOME/.claude/hooks/lib" <<'PY'
+  py_rein - "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/hooks/lib" \
+    "$HOME/.claude/hooks/lib" "${AWB_ROLLEN_DIR:-}" "${HOME:-}" "${TMUX:-}" "${TMPDIR-/tmp}" <<'PY'
 import json, os, pwd, re, socket, subprocess, sys
+
+LIBS = sys.argv[1:3]
+AUFRUFER_TMUX, AUFRUFER_TMPDIR = sys.argv[5], sys.argv[6]
+# rollen.verzeichnis() liest AWB_ROLLEN_DIR, sonst ~ (HOME); beides kommt jetzt als Argument.
+if sys.argv[3]:
+    os.environ["AWB_ROLLEN_DIR"] = sys.argv[3]
+if sys.argv[4]:
+    os.environ["HOME"] = sys.argv[4]
 
 # FESTE ORTE (die Testnaht: eine KOPIE dieses Skripts, in der genau diese zwei Zeilen
 # umgeschrieben sind; shell/tests/lib-decide-kopie.sh. Das installierte Werkzeug hat keinen
@@ -105,10 +156,10 @@ def tmux_fest():
 def sockets():
     uid = os.getuid()
     raus, gesehen = [], set()
-    t = os.environ.get("TMUX", "").split(",")[0]
+    t = AUFRUFER_TMUX.split(",")[0]
     kandidaten = [t] if t else []
     for d in ("%s/tmux-%d" % (WB_SOCKET_BASIS, uid), "/private/tmp/tmux-%d" % uid, "/tmp/tmux-%d" % uid,
-              os.path.join(os.environ.get("TMPDIR", "/tmp"), "tmux-%d" % uid)):
+              os.path.join(AUFRUFER_TMPDIR, "tmux-%d" % uid)):
         try:
             if os.stat(d).st_uid != uid:
                 continue
@@ -200,7 +251,7 @@ if not kette:
     sys.exit(0)
 
 def registriert_von(sock, pane):
-    for lib in sys.argv[1:]:
+    for lib in LIBS:
         if os.path.isfile(os.path.join(lib, "rollen.py")):
             sys.path.insert(0, lib)
             try:
@@ -237,11 +288,102 @@ PY
 #     "parent", von wb-request aus dem Pane des Antragstellers geschrieben) ist.
 #   * Orchestrator-Pane: darf jeden Antrag ablehnen.
 #   * Sonst (Pane ohne Rolle, kein Pane) nur mit gemessenem Menschen (wb-mensch pruefen).
+# HERKUNFT PER MOBILGERAET (14.10.2026, Entscheidung des Nutzers „Annahme am Handy und Guard
+# angleichen: ja"). Bis dahin entschied der Kern einen Antrag vom Handy, indem er sich ueber
+# wb-mensch M2 als Oberflaeche messen liess: der Kern buergte, der Geraetebeleg selbst kam
+# hier nie an. Jetzt reicht er den signierten Umschlag samt Body auf stdin weiter
+# ({"umschlag":{..},"body_b64":".."}), und das feste Pruefprogramm
+# <Heimat laut Benutzerdatenbank>/.local/bin/wb-mobil-pruefen prueft ihn selbst: Signatur gegen den registrierten
+# Schluessel eines gekoppelten, nicht widerrufenen Geraets, Audience, Bodyhash, Zeitfenster
+# 60 s, Nonce/Zaehler/Request-ID; gebunden an Pfad (Kennung aus GENAU diesem Antragspfad
+# und dem SHA-256 der oben gelesenen Bytes, F3) und Entscheidung. Dabei wird der Umschlag verbraucht -- ein zweiter Versuch scheitert.
+# Das ist derselbe Weg wie `wb-freigabe erteilen --mobilbeleg`: beide Pruefstellen nehmen
+# eine Handy-Entscheidung gleich an. Ein ungueltiger Beleg faellt NICHT auf die Messung
+# unten zurueck, sondern endet mit Exit 3; die Zeile nennt nur den Code, keine Werte.
+mobil_belegen() {
+  /usr/bin/head -c 1048577 | py_rein -c '
+import json, os, subprocess, sys, time
+heim, antrag, inhalt, entscheidung = sys.argv[1:5]
+pruefer = os.path.join(heim, ".local", "bin", "wb-mobil-pruefen")
+verlauf = os.path.join(heim, ".pi-workers", "requests", "mobil-verlauf.log")
+eingabe = None
+
+def kennung(wert):
+    wert = str(wert or "")
+    return wert if len(wert) <= 64 and all(c.isalnum() or c in "-_" for c in wert) else "ungueltig"
+
+def protokoll(ergebnis, code, geraet, rid):
+    # Verlauf ohne Werte (Review 14.10.2026, F4): Zeit, Ergebnis, Code, Geraet, request_id,
+    # Entscheidung -- kein Antragspfad, kein Grund, kein Inhalt. Bei einer Absage ist das
+    # Geraet nur behauptet (aus dem ungeprueften Umschlag). Rotation: eine Vorgaengerdatei.
+    zeile = json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "werkzeug": "wb-decide",
+                        "ergebnis": ergebnis, "code": code, "entscheidung": entscheidung,
+                        ("geraet" if ergebnis == "angenommen" else "geraet_behauptet"): kennung(geraet),
+                        "request_id": kennung(rid)})
+    try:
+        os.makedirs(os.path.dirname(verlauf), exist_ok=True)
+        if os.path.exists(verlauf) and os.path.getsize(verlauf) > 1048576:
+            os.replace(verlauf, verlauf + ".1")
+        fd = os.open(verlauf, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(zeile + "\n")
+    except OSError:
+        pass
+
+def nein(code):
+    u = eingabe.get("umschlag") if isinstance(eingabe, dict) and isinstance(eingabe.get("umschlag"), dict) else {}
+    protokoll("abgesagt", code, u.get("device_id"), u.get("request_id"))
+    print("FEHLER\t%s" % code)
+    raise SystemExit(0)
+roh = sys.stdin.buffer.read()
+try:
+    eingabe = json.loads(roh.decode("utf-8")) if len(roh) <= 1048576 else None
+except (UnicodeDecodeError, ValueError):
+    eingabe = None
+if not isinstance(eingabe, dict) or sorted(eingabe) != ["body_b64", "umschlag"] \
+        or not isinstance(eingabe["umschlag"], dict) or not isinstance(eingabe["body_b64"], str):
+    nein("bad_request")
+if not (os.path.isfile(pruefer) and os.access(pruefer, os.X_OK)):
+    nein("capability_unavailable")
+anfrage = json.dumps({"umschlag": eingabe["umschlag"], "body_b64": eingabe["body_b64"],
+                      "erwartet": {"aktion": "antrag-entscheiden", "antrag": antrag, "inhalt_sha256": inhalt,
+                                   "entscheidung": entscheidung}})
+umgebung = {"HOME": heim, "TMPDIR": "/tmp", "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}
+try:
+    r = subprocess.run([pruefer], input=anfrage.encode("utf-8"), capture_output=True, env=umgebung, timeout=15)
+    antwort = json.loads(r.stdout.decode("utf-8").strip().splitlines()[-1])
+except (OSError, subprocess.SubprocessError, IndexError, UnicodeDecodeError, ValueError):
+    nein("internal_error")
+if not isinstance(antwort, dict):
+    nein("internal_error")
+if r.returncode == 0 and antwort.get("ok") is True and antwort.get("aktion") == "antrag-entscheiden":
+    geraet = str(antwort.get("geraet", ""))
+    if geraet and "\t" not in geraet and "\n" not in geraet:
+        protokoll("angenommen", "ok", geraet, antwort.get("request_id"))
+        print("OK\t%s" % geraet)
+        raise SystemExit(0)
+code = str(antwort.get("code", "")) if antwort.get("ok") is False else ""
+nein(code if code.replace("_", "").isalpha() and len(code) <= 40 else "internal_error")
+' "$WB_MOBIL_HEIM" "$REQ" "$R_INHALT_SHA256" "$ACTION" 2>/dev/null || printf 'FEHLER\tinternal_error\n'
+}
+
+if [ "$MOBILBELEG" = 1 ]; then
+  M_ERG="$(mobil_belegen)"
+  case "$M_ERG" in
+    OK$'\t'*) H_KLASSE=mobilgeraet ;;
+    *)
+      echo "wb-decide: ABGELEHNT — Entscheiden per Mobilgeraet ohne gueltigen Geraetebeleg (${M_ERG#FEHLER$'\t'}). Nichts geschrieben." >&2
+      exit 3 ;;
+  esac
+else
 HERKUNFT="$(wb_herkunft 2>/dev/null)" || HERKUNFT=""
 H_KLASSE="${HERKUNFT%%	*}"; H_REST="${HERKUNFT#*	}"
 H_PANE="${H_REST%%	*}"; H_NAME="${H_REST#*	}"
 H_WO="${H_PANE}${H_NAME:+ $H_NAME}"; [ "$H_PANE" = "-" ] && H_WO=""
-if [ "$ACTION" = approve ]; then
+fi
+if [ "$H_KLASSE" = mobilgeraet ]; then
+  : # Der Geraetebeleg ist oben geprueft, gebunden und verbraucht.
+elif [ "$ACTION" = approve ]; then
   case "$H_KLASSE" in
     orchestrator) ;;
     worker)
@@ -284,7 +426,7 @@ fi
 
 # decision column (7) of the matching row — matched on ts + parent, which is unique.
 if [ -f "$LOG" ]; then
-  /usr/bin/python3 - "$LOG" "$R_TS" "$R_PARENT" "$ACTION" <<'PY'
+  py_rein - "$LOG" "$R_TS" "$R_PARENT" "$ACTION" <<'PY'
 import os, sys, tempfile, fcntl
 log, ts, parent, action = sys.argv[1:5]
 lock = open(log + ".lock", "w")

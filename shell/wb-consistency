@@ -1924,6 +1924,50 @@ def kopie_vergleiche(c7, machine_tool_map=None, current_machine=None):
                 faelle.append({"status": "verschieden", "rel": vergleich_rel,
                                "repo_datei": vergleich_datei, "inst_datei": inst_datei,
                                "richtung": richtung, "warum": warum})
+    faelle.extend(_linux_nur_faelle(c7, worktree))
+    return faelle
+
+
+def _linux_nur_faelle(c7, worktree):
+    """Werkzeuge, die es NUR unter shell/linux/ gibt (ohne Mac-Gegenstueck in shell/).
+
+    Die Unterordner-Regel nimmt shell/linux/ aus dem Durchlauf (install_exclude_dirs),
+    und _linux_gegenstueck greift nur, wenn es shell/<name> gibt. Eine Datei, die nur
+    unter shell/linux/ liegt, wurde deshalb nie ausgerollt und nie verglichen -- Anlass
+    16.10.2026: auf peer blieb der alte agent-workbench-Launcher vom 24.08. liegen, die
+    Desktop-Datei startete ihn, und wb-consistency meldete 0 Abweichungen.
+
+    Die Liste steht in check7_kopien.linux_nur_kopien (Konfiguration, kein Sonderweg im
+    Code): je Eintrag {repo, ziel, grund}. Es gibt sie nur auf der Linux-Maschine laut
+    linux_variante; auf dem Mac liefert die Funktion nichts -- kein Fall, kein Befund.
+    Die Faelle haben dieselbe Gestalt wie die aus kopie_vergleiche, damit
+    wb-consistency (Meldung) und wb-ausrollen (Handlung) sie ohne Sonderbehandlung lesen."""
+    eintraege = c7.get("linux_nur_kopien")
+    lv = c7.get("linux_variante")
+    if not eintraege or not lv:
+        return []
+    if current_machine_id(lv.get("machine_ids_by_os", {})) != lv.get("linux_machine_id", "peer"):
+        return []
+    faelle = []
+    for e in eintraege:
+        rel, inst_datei = e["repo"], e["ziel"]
+        repo_datei = os.path.join(c7["repo_dir"], rel)
+        if not os.path.isfile(repo_datei):
+            continue
+        if not os.path.exists(inst_datei):
+            faelle.append({"status": "fehlt", "rel": rel, "repo_datei": repo_datei,
+                           "inst_datei": inst_datei, "ziel": os.path.dirname(inst_datei)})
+            continue
+        if open(repo_datei, "rb").read() == open(inst_datei, "rb").read():
+            faelle.append({"status": "gleich", "rel": rel})
+            continue
+        richtung, warum = _installiert_richtung(repo_datei, inst_datei, c7["repo_dir"])
+        if worktree and richtung in ("eigenmaechtig", "unklar"):
+            richtung = "worktree_unpruefbar"
+            warum = ("dieser Baum ist ein git-Worktree, kein Hauptbaum -- ob die installierte "
+                     "Kopie wirklich eigenmaechtig ist, laesst sich von hier aus nicht sagen.")
+        faelle.append({"status": "verschieden", "rel": rel, "repo_datei": repo_datei,
+                       "inst_datei": inst_datei, "richtung": richtung, "warum": warum})
     return faelle
 
 
@@ -3772,7 +3816,8 @@ def check9_harness_konfig(cfg, base):
 # Befunde in Findings. Er schreibt nichts.
 #
 # Schweregrade: FEHLT, VERALTET, ABGEWICHEN, ZIEL-UNLESBAR und OFFEN sind Hinweise;
-# sie zaehlen nicht als Fehler. Ein Geheimniswert in der Quelle, eine ungueltige Quelle
+# sie zaehlen nicht als Fehler. OFFEN mit Grund "ungemessen..." (Registry-Zelle weg leer ohne
+# gemessen-Feld) meldet sich als eigener Hinweis HARNESS-UNGEMESSEN. Ein Geheimniswert in der Quelle, eine ungueltige Quelle
 # und ein leerer Weg ohne Grund sind Fehler. Fehlt das Werkzeug selbst, ist das ein
 # Hinweis, und die Pruefung ueberspringt. Der Pfad steht in check15_werkzeuge.skript
 # (Konfiguration, {REPO}); WB_WERKZEUGE_BIN ueberschreibt ihn (Tests). Ohne den
@@ -3841,6 +3886,24 @@ def check15_werkzeuge(cfg, base):
                     "WERKZEUG-LEER-OHNE-GRUND", ort, 0, "%s ist leer, ohne Grund" % name,
                     "ein leerer Weg braucht einen Grund, sonst ist nicht erkennbar, ob er "
                     "absichtlich leer ist.", severity="error"))
+            continue
+        if zustand == "OFFEN" and grund.startswith("ungemessen"):
+            # Zelle mit weg "leer" ohne gemessen-Feld: die Faehigkeit des Harness wurde nie belegt
+            # (13.10.: 21 "leer"-Zellen der Gruppe B waren falsch). Hinweis, damit ein neuer Harness
+            # nicht still leer bleibt.
+            findings.append(Finding(
+                "HARNESS-UNGEMESSEN", ort, 1, "%s (ungemessen)" % name,
+                "%s -- Faehigkeit messen (help, doku, binary, probe, quelle) und in der Registry "
+                "das Feld gemessen \"<Datum>/<Methode>\" samt beleg eintragen." % grund,
+                severity="hint"))
+            continue
+        if zustand == "ZIEL-UNLESBAR" and grund.startswith("QUELLDATEI-FEHLT"):
+            # Datei oder Ordner, den die Quelle nennt (etwa werkbank-stil/), fehlt neben ihr: Befund je
+            # Eintrag, die uebrige Quelle gilt weiter (Ausfallschutz 13.10.). Keine Zieldatei betroffen.
+            findings.append(Finding(
+                "WERKZEUG-QUELLDATEI-FEHLT", ort, 1, "%s (Quelldatei fehlt)" % name,
+                "%s -- die Datei neben werkzeuge.default.json ausliefern (wb-ausrollen, auf peer "
+                "wb-sync-setup)." % grund, severity="hint"))
             continue
         if zustand in WERKZEUG_ZUORDNUNG:
             check_name, severity, hinweis = WERKZEUG_ZUORDNUNG[zustand]

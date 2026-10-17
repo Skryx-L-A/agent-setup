@@ -78,10 +78,98 @@ pfad_geschuetzt() {   # <datei>
   return 1
 }
 
+# Das Geraeteregister der Mobil-App (2026-10-14, Auftrag wz-mobilguard), wie
+# `mobil-pfad` in bash-guard.py. Der Kern liest auth-state.json bei jeder
+# Pruefung von Platte; ein dort eingetragenes Geraet spricht fuer den Menschen.
+# Verglichen wird das aufgeloeste Ziel (Symlinks, APFS-Schreibweise) in
+# Kleinschrift, damit ~/.claude/Workbench/MOBILE oder ein Link dorthin nicht
+# vorbeigeht.
+MOBIL_HINWEIS="Das Geraeteregister der Mobil-App (~/.claude/workbench/mobile/) fuehrt allein der Kern der Werkbank; ein Telefon koppelt ein Mensch am Mac (Kopplung mit Code). Ein selbst eingetragenes Geraet spraeche fuer den Menschen, deshalb liest und schreibt ein Agent dort nichts. Blockiert von mobil-pfad"
+# Forkarm gebaut (gemessen 14.10.: mit tr/sed/basename je Aufruf 55 ms statt
+# 19 ms je Write): Vergleich ohne Gross/Klein ueber nocasematch, Pfadzerlegung
+# mit Parameterexpansion; aufgeloest (ein Fork) nur bei Symlink oder "..".
+MOBIL="$HOME/.claude/workbench/mobile"
+aufgeloest() {   # <pfad>: Symlinks des laengsten vorhandenen Anfangs aufgeloest
+  local p="$1" rest=""
+  case "$p" in /*) ;; *) p="${cwd:-$PWD}/$p" ;; esac
+  if [ -e "$p" ] && realpath "$p" 2>/dev/null; then return 0; fi
+  while [ ! -d "$p" ] && [ -n "$p" ] && [ "$p" != / ]; do
+    rest="/${p##*/}$rest"
+    p="${p%/*}"
+  done
+  [ -n "$p" ] || p=/
+  printf '%s%s' "$(cd "$p" 2>/dev/null && pwd -P || printf '%s' "$p")" "$rest"
+}
+hat_symlink() {   # <pfad>: liegt auf dem Weg ein Symlink? Nur Builtins, kein Fork.
+  local p="$1"
+  while [ -n "$p" ] && [ "$p" != / ]; do
+    [ -L "$p" ] && return 0
+    p="${p%/*}"
+  done
+  return 1
+}
+mobil_geschuetzt() {   # <datei>
+  local ziel="$1" m rc=1 real="$MOBIL"
+  case "$ziel" in /*) ;; *) ziel="${cwd:-$PWD}/$ziel" ;; esac
+  # Muster ueber Variablen: Bash 3.2 laesst sonst den Rueckstrich im Ersatz stehen.
+  local zz='//' pp='/./'
+  while [[ "$ziel" == *//* ]]; do ziel="${ziel//$zz//}"; done
+  while [[ "$ziel" == */./* ]]; do ziel="${ziel//$pp//}"; done
+  # Der Normalfall (kein Symlink, kein ..) kommt ohne Fork aus.
+  if [[ "$ziel" == */../* || "$ziel" == */.. ]] || hat_symlink "$ziel"; then
+    ziel=$(aufgeloest "$ziel")
+  fi
+  if hat_symlink "$MOBIL"; then
+    real=$(aufgeloest "$MOBIL")
+  fi
+  shopt -s nocasematch
+  for m in "$MOBIL" "$real"; do
+    case "$ziel" in
+      "$m"|"$m"/*) rc=0 ;;
+    esac
+  done
+  shopt -u nocasematch
+  return $rc
+}
+
 case "$tool_name" in
-  Write|Edit)
-    file_path=$(printf '%s' "$input" | jq -r '.tool_input.file_path // empty' 2>/dev/null) || exit 0
+  Read|Grep|Glob|NotebookRead)
+    # Nur wirksam, wenn der Matcher diese Werkzeuge einschliesst (lebende
+    # Einstellungen; bisher Write|Edit). Lesen: Zaehler, Nonces, Journal.
+    if [ "$tool_name" = Glob ]; then
+      # Bei Glob ist das Muster selbst ein Pfad (`~/.claude/workbench/mobile/*`).
+      muster=$(printf '%s' "$input" | jq -r '.tool_input.pattern // empty' 2>/dev/null) || muster=""
+      shopt -s nocasematch
+      case "$muster" in
+        *workbench/mobile*) deny "$MOBIL_HINWEIS ($tool_name mit Muster $muster)." ;;
+      esac
+      shopt -u nocasematch
+    fi
+    file_path=$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.path // empty' 2>/dev/null) || exit 0
     [ -z "$file_path" ] && exit 0
+    case "$file_path" in "~"|"~/"*) file_path="$HOME${file_path#\~}" ;; esac
+    if mobil_geschuetzt "$file_path"; then
+      deny "$MOBIL_HINWEIS ($tool_name auf $file_path)."
+    fi
+    # Der Freigabe-Schluessel signiert seit 14.10. auch die Geraeteliste;
+    # lesend gesperrt wie im Bash-Zweig von freigabe-pfad.
+    if pfad_geschuetzt "$file_path"; then
+      deny "Der Pfad liegt in einer geschuetzten Ablage ($file_path); ein Agent liest dort nichts. Blockiert von freigabe-pfad ($tool_name)."
+    fi
+    # Grep/Glob ueber ~/.claude/workbench steigen ins Register hinab.
+    if [ "$tool_name" = Grep ] || [ "$tool_name" = Glob ]; then
+      if mobil_geschuetzt "${file_path%/}/mobile"; then
+        deny "$MOBIL_HINWEIS ($tool_name ueber den Elternordner $file_path)."
+      fi
+    fi
+    ;;
+  Write|Edit|MultiEdit|NotebookEdit)
+    file_path=$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null) || exit 0
+    [ -z "$file_path" ] && exit 0
+    case "$file_path" in "~"|"~/"*) file_path="$HOME${file_path#\~}" ;; esac
+    if mobil_geschuetzt "$file_path"; then
+      deny "$MOBIL_HINWEIS ($tool_name auf $file_path)."
+    fi
     if pfad_geschuetzt "$file_path"; then
       deny "Der Pfad liegt in einer geschuetzten Ablage ($file_path). Freigaben erteilt ein Mensch — im Programmfenster oder mit \`wb-freigabe erteilen <pane> <grund>\`; das Rollenregister fuehrt \`wb-rolle\`. Beide messen die Herkunft, statt sie zu glauben. Blockiert von freigabe-pfad (Write/Edit)."
     fi

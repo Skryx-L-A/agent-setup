@@ -108,8 +108,11 @@ def ereignis_teilen(s):
 def hooks_json(q, reg):
     """hooks/hooks.json: je Ereignis Gruppen je Matcher (Reihenfolge der Quelle)."""
     gruppen = {}
-    for _name, e in _fuer_claude(q, reg, "hooks"):
-        eintrag = {"type": "command", "command": e["befehl"]}
+    for name, e in _fuer_claude(q, reg, "hooks"):
+        befehl, fehler = hook_befehl(name, e)
+        if fehler:
+            continue
+        eintrag = {"type": "command", "command": befehl}
         if e.get("timeout") is not None:
             eintrag["timeout"] = e["timeout"]
         for s in e["ereignisse"]:
@@ -122,7 +125,67 @@ def hooks_json(q, reg):
                     g = {"matcher": matcher, "hooks": []}
                 liste.append(g)
             g["hooks"].append(dict(eintrag))
+    for ereignis, eintrag in anweisungs_hooks(q, reg):
+        liste = gruppen.setdefault(ereignis, [])
+        g = next((x for x in liste if "matcher" not in x), None)
+        if g is None:
+            g = {"hooks": []}
+            liste.append(g)
+        g["hooks"].append(eintrag)
     return {"description": KOPF, "hooks": gruppen}
+
+
+# befehl "intern:env-entfernen": der Adapter erzeugt den Befehl aus der Liste env_entfernen der Quelle.
+# Claude spielt CLAUDE_ENV_FILE (nur bei SessionStart gesetzt) vor jedem Bash-Aufruf ein, auch im
+# Hintergrund, in Subagenten und nach resume/compact/clear (gemessen 14.10., claude 2.1.296). Der
+# Claude-Prozess selbst behaelt die settings-env (Filter-Proxy fuer den Modellverkehr), seine Bash-Kinder
+# (git, npm, curl, swift ...) nicht. Ohne CLAUDE_ENV_FILE endet der Hook mit 0 ohne Wirkung.
+ENV_ENTFERNEN = "intern:env-entfernen"
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def hook_befehl(name, e):
+    """-> (befehl, None) oder (None, Fehlertext). Gewoehnliche Hooks tragen befehl aus der Quelle."""
+    if e.get("befehl") != ENV_ENTFERNEN:
+        return e["befehl"], None
+    namen = e.get("env_entfernen")
+    if not (isinstance(namen, list) and namen and all(isinstance(n, str) and ENV_NAME.fullmatch(n) for n in namen)):
+        return None, ("HOOK-UNGUELTIG hooks.%s: %s braucht env_entfernen als nichtleere Liste von "
+                      "Variablennamen" % (name, ENV_ENTFERNEN))
+    return ("[ -z \"${CLAUDE_ENV_FILE:-}\" ] || printf 'unset %s\\n' >> \"$CLAUDE_ENV_FILE\"; exit 0"
+            % " ".join(namen)), None
+
+
+def hook_fehler(q, reg):
+    return [f for f in (hook_befehl(n, e)[1] for n, e in _fuer_claude(q, reg, "hooks")) if f]
+
+
+def anweisung_befehl(name, teil, hook=None):
+    """Hook-Befehl, der eine Anweisung ueber wb-anweisung einspielt. Fehlt wb-anweisung im PATH,
+    bleibt die Ausgabe leer und der Hook endet mit 0 (er darf keine Sitzung stoeren)."""
+    befehl = "wb-anweisung %s %s" % (name, teil)
+    if hook:
+        befehl += " --claude-hook %s" % hook
+    return "command -v wb-anweisung >/dev/null 2>&1 && %s || true" % befehl
+
+
+def anweisungs_hooks(q, reg):
+    """[(ereignis, hook-eintrag)] aus dem Abschnitt anweisungen: Anlass sitzungsstart -> SessionStart
+    (jede source, auch compact) gibt den volltext als additionalContext aus, Anlass nachricht ->
+    UserPromptSubmit die erinnerung als additionalContext. Den Takt (jede N-te
+    Nachricht je session_id) zaehlt wb-anweisung aus der Hook-Eingabe; der Text steht nie im Plugin."""
+    out = []
+    for name, e in _fuer_claude(q, reg, "anweisungen"):
+        if not ERZEUGT_NAME.match(name):
+            continue
+        anlaesse = e.get("anlaesse") or list(kern.ANLAESSE)
+        if "sitzungsstart" in anlaesse:
+            out.append(("SessionStart", {"type": "command", "timeout": 10, "command": anweisung_befehl(
+                name, "volltext", "SessionStart")}))
+        if "nachricht" in anlaesse and e.get("erinnerung"):
+            out.append(("UserPromptSubmit", {"type": "command", "timeout": 10, "command": anweisung_befehl(
+                name, "erinnerung", "UserPromptSubmit")}))
+    return out
 
 
 def prompt_dateien(q, reg):
@@ -133,7 +196,8 @@ def prompt_dateien(q, reg):
         if not ERZEUGT_NAME.match(name):
             fehler.append("PROMPT-NAME-UNGUELTIG prompts.%s: nur Buchstaben, Ziffern, _ und -" % name)
             continue
-        datei = kern.pfad_aufloesen(e.get("datei", ""))
+        # datei wie bei den uebrigen Harnesses (werkzeuge_dateien): ~ und absolut gelten, sonst relativ zur Quelle.
+        datei = kern._datei_da(e.get("datei", ""), kern.quellordner())
         try:
             with open(datei, encoding="utf-8", newline="") as f:
                 out["%s/commands/%s.md" % (PLUGIN, name)] = f.read()
@@ -149,6 +213,7 @@ def soll_dateien(q, reg):
         "%s/hooks/hooks.json" % PLUGIN: _json_text(hooks_json(q, reg)),
     }
     prompts, fehler = prompt_dateien(q, reg)
+    fehler = hook_fehler(q, reg) + fehler
     inhalt.update(prompts)
     # Die Version folgt dem Inhalt: Claude haelt Plugins nach Version im Cache, eine
     # unveraenderte Nummer wuerde neue Hooks oder Befehle nie nachladen.
@@ -325,10 +390,13 @@ def _matcher_norm(m):
 def hook_triple(q, reg):
     """{(ereignis, matcher-normalisiert, befehl)} -- was das Plugin traegt."""
     s = set()
-    for _n, e in _fuer_claude(q, reg, "hooks"):
+    for n, e in _fuer_claude(q, reg, "hooks"):
+        befehl = hook_befehl(n, e)[0]
+        if befehl is None:
+            continue
         for ev in e["ereignisse"]:
             ereignis, matcher = ereignis_teilen(ev)
-            s.add((ereignis, _matcher_norm(matcher), e["befehl"]))
+            s.add((ereignis, _matcher_norm(matcher), befehl))
     return s
 
 
@@ -652,8 +720,43 @@ def _bewerten(roh, q, reg, state, nur_harness=None, nur_art=None):
                      ziel="%s/%s" % (MARKTPLATZ, rel))
             for k in ("wert", "pfad", "datei"):
                 x.pop(k, None)
+        elif (x["harness"] == "claude" and x["art"] == "anweisungen" and x["zustand"] == "OFFEN"
+                and not ((q.get(x["art"]) or {}).get(x["name"]) or {}).get("status")):
+            x = _plugin_zustand(x, q, reg)
+        elif (x["harness"] == "claude" and x["art"] == "hooks" and x["zustand"] == "OFFEN"
+                and not ((q.get("hooks") or {}).get(x["name"]) or {}).get("status")):
+            x = _hooks_aus_plugin(x, q, reg)
         aus.append(x)
     return aus
+
+
+def _plugin_zustand(x, q, reg):
+    """Zustand einer Anweisung im Werkbank-Plugin: ihre Hooks stehen in hooks/hooks.json."""
+    return _aus_plugin_hooks(x, q, reg, "Plugin-hooks.json (SessionStart/UserPromptSubmit)",
+                             "wirkt, sobald das Plugin werkbank in Claude aktiviert ist (E4)")
+
+
+def _hooks_aus_plugin(x, q, reg):
+    """Die Quelle-Hooks erreichen Claude ueber hooks/hooks.json des Werkbank-Plugins (wie .mcp.json).
+    Der Zustand der Datei gilt fuer jeden Hook; geschrieben wird sie mit `apply claude --plugin`."""
+    return _aus_plugin_hooks(x, q, reg, "Plugin-hooks.json", None)
+
+
+def _aus_plugin_hooks(x, q, reg, was, grund_gleich):
+    """Gemeinsamer Teil: Zustand von hooks/hooks.json im Plugin, uebertragen auf den Eintrag x
+    (Hooks der Quelle und Anweisungen stehen in derselben Datei)."""
+    rel = "%s/hooks/hooks.json" % PLUGIN
+    aktionen, _ = bewerten(q, reg, kern.pfad_aufloesen(MARKTPLATZ))
+    z = next((a[0] for a in aktionen if a[1] == rel), "NEU")
+    grund = {"NEU": "%s fehlt: wb-werkzeuge apply claude --plugin" % was,
+             "VERALTET": "%s veraltet: wb-werkzeuge apply claude --plugin" % was,
+             "ABGEWICHEN": "%s von Hand geaendert (bleibt stehen)" % was,
+             "FREMD": "%s nicht von der Werkbank erzeugt (bleibt stehen)" % was,
+             "GLEICH": grund_gleich}.get(z)
+    x = dict(x, zustand=ZUSTAND_AUS_PLUGIN.get(z, "OFFEN"), grund=grund, ziel="%s/%s" % (MARKTPLATZ, rel))
+    for k in ("wert", "pfad", "datei"):
+        x.pop(k, None)
+    return x
 
 
 def registrieren():

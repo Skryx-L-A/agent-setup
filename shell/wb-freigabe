@@ -3,7 +3,9 @@
 #
 #   wb-freigabe liste                     Was gerade auf eine Entscheidung wartet.
 #   wb-freigabe erteilen [--ttl <sek>] [--schluessel <sha256>] [--index <n>|--alle]
-#                        [--grund <text>] <pane> [grund]  Die wartende Frage freigeben.
+#                        [--grund <text>] [--mobilbeleg] <pane> [grund]
+#                                         Die wartende Frage freigeben. --mobilbeleg: der
+#                                         signierte Geraetebeleg auf stdin statt wb-mensch.
 #   wb-freigabe beleg                     Wie dieser Aufruf gemessen wird (Diagnose).
 #   wb-freigabe zurueckziehen [<pane>]    Die EIGENE wartende Frage zuruecknehmen.
 #   wb-freigabe warten <pane> --befehl-datei <pfad> [--cwd <dir>] [--max <sek>]
@@ -96,15 +98,45 @@
 # Erteilen durch einen gemessenen Menschen. Ein Agent kommt an ihn nicht heran, ohne
 # einen Befehl auszufuehren, den die Hook-Kette ablehnt (Guard `freigabe-pfad`).
 #
+# DER GERAETEBELEG (14.10.2026, Entscheidung des Nutzers „Annahme am Handy und Guard
+# angleichen: ja"). Ein gekoppeltes Mobilgeraet ist kein Terminal und kein Ahne; wb-mensch
+# kann es nicht messen. Mit `--mobilbeleg` (nur zusammen mit `--schluessel`) liest
+# `erteilen` stattdessen auf stdin {"umschlag":{..},"body_b64":".."}: den signierten
+# Umschlag, mit dem das Geraet GENAU diese Entscheidung angefragt hat. Geprueft wird er
+# nicht hier und nicht im Kern, sondern vom festen Pruefprogramm
+# <Heimat>/.local/bin/wb-mobil-pruefen (dasselbe wie hinter `wb-pane-write mobil-*`): Signatur
+# gegen den registrierten Schluessel eines gekoppelten, nicht widerrufenen Geraets,
+# Audience, Bodyhash, Zeitfenster 60 s, Nonce/Zaehler/Request-ID -- und gebunden an Pfad
+# (Kennung aus diesem Schluessel) und Body {"decision":"approve"}. Das Pruefprogramm
+# verbraucht den Umschlag dabei: ein zweiter Versuch mit demselben Beleg scheitert. Ohne
+# gueltigen Beleg: Exit 77 und eine Verlaufszeile ohne Werte (kein Befehl, kein Grund).
+# Der Kern (freigaben.ts) und `wb-decide --mobilbeleg` gehen denselben Weg.
+#
 # GRENZE, offen benannt (wie in wb-mensch): Als derselbe Benutzer gibt es kein
 # Versteck, das gegen einen Agenten haelt, der seine Spuren aktiv verwischt. Was hier
 # faellt, ist der gemessene Fall — der Zettel, den sich ein Agent selbst hinlegt.
 set -uo pipefail
 
+# DIE XCODE-HUELLE (14.10.2026, Review handyguard2 N1, gemessen): /usr/bin/python3 ist auf
+# macOS der xcrun-Shim und startet $DEVELOPER_DIR/usr/bin/xcrun; `-I` hilft nicht, weil das
+# echte Python gar nicht startet. Mit `DEVELOPER_DIR=<eigener Ordner>` vor dem Befehl gab ein
+# eigenes xcrun fuer den Geraetebeleg "OK" aus, und `erteilen --mobilbeleg` schrieb eine
+# Freigabe. Zwei Linien wie in wb-decide: hier vorweg DEVELOPER_DIR, SDKROOT und TOOLCHAINS
+# loeschen (gilt fuer jedes Kind, auch wb-mensch, wb-inbox, das Pruefprogramm), und jeder
+# Python-Aufruf laeuft mit PY_REIN (unten, sobald WB_GUARD_LOG_PY feststeht): `env -i` mit
+# Positivliste, `-I -S -X utf8`. Vorbild wb-mensch.
+unset DEVELOPER_DIR SDKROOT TOOLCHAINS
+PY_PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
 ABGELEHNT=77
-PY=/usr/bin/python3
 
 GRANTS="${AWB_GUARD_GRANTS_DIR:-$HOME/.pi-workers/guard-grants}"
+# Die Heimat laut Benutzerdatenbank, NIE aus $HOME (Review 14.10.2026, F1). `erteilen
+# --mobilbeleg` nimmt Pruefprogramm, Kopplungsliste, Freigaben, Merker, Schluessel und Verlauf
+# nur von hier und beachtet AWB_GUARD_* nicht: sonst brachte ein umgelenktes HOME ein eigenes
+# Pruefprogramm mit, und AWB_GUARD_GRANTS_DIR lenkte den echten Schluessel auf eine Freigabe
+# mit art=mensch. Testnaht: nur eine KOPIE mit umgeschriebener Zeile, nie ein Schalter.
+WB_MOBIL_HEIM="$(/usr/bin/env -i PATH="$PY_PATH" /usr/bin/python3 -I -S -X utf8 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')"
 BLOCKS="${AWB_GUARD_BLOCKS_DIR:-$HOME/.pi-workers/guard-blocks}"
 # Derselbe Verlauf, den Hook und Programm schreiben (AWB_GUARD_LOG). Die Zeile
 # entsteht dort, wo die Freigabe entsteht -- damit gibt es genau eine Stelle, an
@@ -123,6 +155,12 @@ for kandidat in "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/ho
     [ -f "$kandidat" ] && { WB_GUARD_LOG_PY="$kandidat"; break; }
 done
 export WB_GUARD_LOG_PY
+# Die Positivliste jedes Python-Aufrufs: fester PATH, HOME des Aufrufers (wie bisher; jeder
+# Pfad, der zaehlt, kommt als Argument, mit --mobilbeleg aus der Heimat laut
+# Benutzerdatenbank) und WB_GUARD_LOG_PY (von diesem Skript gesetzt, siehe oben). Die
+# Aufruferumgebung, die wb-inbox im Rueckkanal braucht, bekommt `erteilen` auf fd 3.
+PY_REIN=(/usr/bin/env -i "PATH=$PY_PATH" "HOME=$HOME" "WB_GUARD_LOG_PY=$WB_GUARD_LOG_PY"
+         /usr/bin/python3 -I -S -X utf8)
 
 CMD="${1:-liste}"
 
@@ -174,7 +212,7 @@ ablehnen() {
 
 case "$CMD" in
     liste)
-        "$PY" - "$BLOCKS" "$VERLAUF" <<'PY'
+        "${PY_REIN[@]}" - "$BLOCKS" "$VERLAUF" <<'PY'
 import json, os, sys
 
 def kuerzen(text, max_len=700, rand=300):
@@ -269,7 +307,7 @@ PY
         if [ "$ZIEL" != "${TMUX_PANE:-}" ]; then
             messen || ablehnen "ein Agent nimmt nur die Frage seines eigenen Panes zurueck (${TMUX_PANE:-kein TMUX_PANE}), nicht die von $ZIEL."
         fi
-        "$PY" - "$BLOCKS" "$VERLAUF" "$ZIEL" <<'PY'
+        "${PY_REIN[@]}" - "$BLOCKS" "$VERLAUF" "$ZIEL" <<'PY'
 import json, os, re, subprocess, sys, time
 def verlauf_anhaengen(pfad, zeile):
     """Eine Zeile an den Verlauf: ueber guard_log.py (Sperre, Monatsrotation), sonst direkt wie frueher."""
@@ -334,7 +372,7 @@ PY
         [ -n "$W_PANE" ] || { echo "wb-freigabe: warten braucht einen Pane." >&2; exit 2; }
         [ -n "$W_DATEI" ] || { echo "wb-freigabe: warten braucht --befehl-datei <pfad> (die Datei nennt der Rueckfrage-Text)." >&2; exit 2; }
         case "$W_MAX" in ''|*[!0-9]*) echo "wb-freigabe: --max braucht eine Zahl in Sekunden." >&2; exit 2 ;; esac
-        exec "$PY" - "$BLOCKS" "$GRANTS" "$VERLAUF" "$W_PANE" "$W_DATEI" "$W_CWD" "$W_MAX" <<'PY'
+        exec "${PY_REIN[@]}" - "$BLOCKS" "$GRANTS" "$VERLAUF" "$W_PANE" "$W_DATEI" "$W_CWD" "$W_MAX" <<'PY'
 import calendar, hashlib, hmac, json, os, re, sys, time
 
 ERTEILT, ABGELEHNT, ABGELAUFEN, NICHTS_OFFEN, NOCH_OFFEN = 0, 3, 4, 5, 6
@@ -528,6 +566,7 @@ GRUND=""
 # leer" von "gar nicht gesagt"; ohne das wuerde die Zeile weiter unten den
 # Schalterwert mit dem leeren $2 ueberschreiben.
 GRUND_GESETZT=0
+MOBILBELEG=0
 while true; do
     case "${1:-}" in
         --ttl) TTL="${2:?Sekunden fehlen nach --ttl}"; shift 2 ;;
@@ -539,6 +578,7 @@ while true; do
             [ $# -ge 2 ] || { echo "wb-freigabe: nach --grund fehlt der Text (leer ist erlaubt: --grund '')." >&2; exit 2; }
             GRUND="$2"; GRUND_GESETZT=1; shift 2 ;;
         --alle) ALLE=1; shift ;;
+        --mobilbeleg) MOBILBELEG=1; shift ;;
         *) break ;;
     esac
 done
@@ -574,11 +614,95 @@ else
     [ -x "$NACHBAR" ] && INBOX_BIN="$NACHBAR"
 fi
 
-messen || ablehnen "hier ruft kein gemessener Mensch."
+# Der Geraetebeleg (Kopf, "DER GERAETEBELEG"): eine Python-Stelle liest stdin, laesst
+# wb-mobil-pruefen pruefen und schreibt bei einer Absage die Verlaufszeile ohne Werte.
+# Ausgabe: "OK<TAB><geraet><TAB><request_id>" oder "FEHLER<TAB><code>".
+mobil_belegen() {
+    local pruefer="$WB_MOBIL_HEIM/.local/bin/wb-mobil-pruefen" erg
+    erg=$(/usr/bin/head -c 1048577 | "${PY_REIN[@]}" -c '
+import base64, json, os, subprocess, sys, time
+pruefer, schluessel, pane, verlauf, heim = sys.argv[1:6]
+eingabe = None
 
-ART="$(herkunft_art)"
-"$PY" - "$BLOCKS" "$GRANTS" "$PANE" "$GRUND" "$ART" "$MENSCH_GRUND" "$TTL" "$ERWARTETER_SCHLUESSEL" \
-      "$VERLAUF" "$INDEX" "$ALLE" "$INBOX_BIN" <<'PY'
+def kennung(wert):
+    wert = str(wert or "")
+    return wert if len(wert) <= 64 and all(c.isalnum() or c in "-_" for c in wert) else "ungueltig"
+
+def absage(code):
+    # Ohne Werte (kein Befehl, kein Verzeichnis, kein Grund); Geraet und request_id stehen da,
+    # wie der UNGEPRUEFTE Umschlag sie behauptet (Review 14.10.2026, F4).
+    u = eingabe.get("umschlag") if isinstance(eingabe, dict) and isinstance(eingabe.get("umschlag"), dict) else {}
+    zeile = json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "guard": "muster-freigabe-fehlgeschlagen",
+        "reason": "Freigeben abgewiesen: Geraetebeleg ungueltig (Herkunft: mobilgeraet, %s)." % code,
+        "command": "", "cwd": "", "session_id": "", "pane": pane, "code": code,
+        "geraet_behauptet": kennung(u.get("device_id")), "request_id": kennung(u.get("request_id"))}, ensure_ascii=False)
+    helfer = os.environ.get("WB_GUARD_LOG_PY", "")
+    geschrieben = False
+    if helfer:
+        try:
+            geschrieben = subprocess.run([sys.executable, "-I", helfer, "anhaengen", "--log", verlauf],
+                input=zeile.encode("utf-8"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=10).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            geschrieben = False
+    if not geschrieben:
+        try:
+            os.makedirs(os.path.dirname(verlauf) or ".", exist_ok=True)
+            with open(verlauf, "a", encoding="utf-8") as fh:
+                fh.write(zeile + "\n")
+        except OSError:
+            pass
+    print("FEHLER\t%s" % code)
+    raise SystemExit(0)
+
+roh = sys.stdin.buffer.read()
+try:
+    eingabe = json.loads(roh.decode("utf-8")) if len(roh) <= 1048576 else None
+except (UnicodeDecodeError, ValueError):
+    eingabe = None
+if not isinstance(eingabe, dict) or sorted(eingabe) != ["body_b64", "umschlag"]         or not isinstance(eingabe["umschlag"], dict) or not isinstance(eingabe["body_b64"], str):
+    absage("bad_request")
+if not (os.path.isfile(pruefer) and os.access(pruefer, os.X_OK)):
+    absage("capability_unavailable")
+anfrage = json.dumps({"umschlag": eingabe["umschlag"], "body_b64": eingabe["body_b64"],
+                      "erwartet": {"aktion": "guard-freigabe", "schluessel": schluessel}})
+umgebung = {"HOME": heim, "TMPDIR": "/tmp", "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}
+try:
+    r = subprocess.run([pruefer], input=anfrage.encode("utf-8"), capture_output=True, env=umgebung, timeout=15)
+except (OSError, subprocess.SubprocessError):
+    absage("internal_error")
+try:
+    antwort = json.loads(r.stdout.decode("utf-8").strip().splitlines()[-1])
+except (IndexError, UnicodeDecodeError, ValueError):
+    antwort = None
+if not isinstance(antwort, dict):
+    absage("internal_error")
+if r.returncode == 0 and antwort.get("ok") is True and antwort.get("aktion") == "guard-freigabe":
+    geraet, rid = str(antwort.get("geraet", "")), str(antwort.get("request_id", ""))
+    if geraet and rid and "\t" not in geraet + rid and "\n" not in geraet + rid:
+        print("OK\t%s\t%s" % (geraet, rid))
+        raise SystemExit(0)
+code = str(antwort.get("code", "")) if antwort.get("ok") is False else ""
+absage(code if code.replace("_", "").isalpha() and len(code) <= 40 else "internal_error")
+' "$pruefer" "$ERWARTETER_SCHLUESSEL" "$PANE" "$VERLAUF" "$WB_MOBIL_HEIM" 2>/dev/null) || erg=$'FEHLER\tinternal_error'
+    case "$erg" in
+        OK$'\t'*)
+            local rest="${erg#OK$'\t'}"
+            MENSCH_ART=mensch
+            MENSCH_GRUND="Mobilgeraet ${rest%%$'\t'*}: signierter Geraetebeleg, geprueft und verbraucht von wb-mobil-pruefen (Anfrage ${rest#*$'\t'})"
+            return 0 ;;
+        *)
+            MENSCH_ART=agent
+            MENSCH_GRUND="Geraetebeleg ungueltig (${erg#FEHLER$'\t'})"
+            return 1 ;;
+    esac
+}
+
+# Der Python-Teil von `erteilen` als Funktion: `--mobilbeleg` ruft ihn zweimal, zuerst nur
+# pruefend (letztes Argument 1, F5), dann wirklich erteilend.
+erteilen_py() {
+"${PY_REIN[@]}" - "$@" <<'PY'
 # Der Zettel wird aus dem MARKER gebaut, den der Hook selbst geschrieben hat --
 # nicht aus dem, was auf der Kommandozeile steht. Damit gilt die Freigabe genau
 # dem Befehl, der wirklich angehalten wurde, und nicht einem aehnlich
@@ -601,6 +725,7 @@ def verlauf_anhaengen(pfad, zeile):
 
 (blocks, grants, pane, grund, art, beleg, ttl_roh, erwartet, verlauf,
  index_roh, alle_roh, inbox_bin) = sys.argv[1:13]
+nur_pruefen = sys.argv[13] if len(sys.argv) > 13 else ''
 sicher = re.sub(r'[^A-Za-z0-9_.-]', '_', pane)
 pfad = os.path.join(blocks, sicher + '.json')
 try:
@@ -623,6 +748,25 @@ def kuerzen(text, max_len=700, rand=300):
         return text
     fehlt = len(text) - 2 * rand
     return '%s\n    ...[%d Zeichen gekuerzt]...\n    %s' % (text[:rand], fehlt, text[-rand:])
+
+
+def aufrufer_umgebung():
+    """Die Umgebung des Aufrufers fuer wb-inbox, wie vor PY_REIN geerbt (14.10.2026): der
+    Shellteil legt sie mit `env -0` auf fd 3, nur beim erteilenden Aufruf mit wb-inbox.
+    Sie geht nur an wb-inbox, nie an eine Entscheidung hier; DEVELOPER_DIR, SDKROOT und
+    TOOLCHAINS hat das Skript vorher geloescht."""
+    try:
+        with os.fdopen(3, 'rb') as fh:
+            roh = fh.read()
+    except OSError:
+        return None
+    umg = {}
+    for eintrag in roh.split(b'\0'):
+        if b'=' in eintrag:
+            k, v = eintrag.split(b'=', 1)
+            if k:
+                umg[os.fsdecode(k)] = os.fsdecode(v)
+    return umg
 
 
 def rueckkanal(inbox_bin, pane, erteilt, merker_ts, text):
@@ -660,8 +804,9 @@ def rueckkanal(inbox_bin, pane, erteilt, merker_ts, text):
                     'und erfaehrt die Freigabe direkt.' % pid)
     if not inbox_bin:
         return 'kein Hinweis -- wb-inbox nicht gefunden; der Agent erfaehrt es ueber wb-freigabe warten.'
+    umg = aufrufer_umgebung()
     try:
-        f = subprocess.run([inbox_bin, 'finde', pane], capture_output=True, timeout=15)
+        f = subprocess.run([inbox_bin, 'finde', pane], capture_output=True, timeout=15, env=umg)
     except (subprocess.TimeoutExpired, OSError) as e:
         return 'kein Hinweis -- wb-inbox "finde" antwortete nicht (%s).' % e
     if f.returncode == 5:
@@ -680,11 +825,12 @@ def rueckkanal(inbox_bin, pane, erteilt, merker_ts, text):
         return 'kein Hinweis -- die Freigabe wurde eben verbraucht (Wortlaut ausgefuehrt).'
     try:
         import tempfile
-        fd, tmp = tempfile.mkstemp(prefix='wb-freigabe-inbox-', suffix='.txt')
+        fd, tmp = tempfile.mkstemp(prefix='wb-freigabe-inbox-', suffix='.txt',
+                                   dir=(umg or {}).get('TMPDIR') or None)
         with os.fdopen(fd, 'w', encoding='utf-8') as fh:
             fh.write(text)
         try:
-            r = subprocess.run([inbox_bin, 'sende', pane, tmp], capture_output=True, timeout=60)
+            r = subprocess.run([inbox_bin, 'sende', pane, tmp], capture_output=True, timeout=60, env=umg)
         finally:
             try:
                 os.remove(tmp)
@@ -768,6 +914,17 @@ if len(eintraege) > 1 and index is None and not alle:
 
 zu_erteilen = eintraege if alle else [eintraege[(index or 1) - 1]]
 
+# NUR PRUEFEN (Review 14.10.2026, F5): `--mobilbeleg` laesst den Eintrag zuerst hier pruefen
+# (Merker wartet, eindeutig, Schluessel passt) und verbraucht den Geraetebeleg erst danach --
+# sonst ging ein gueltiger Beleg an einem veralteten oder mehrdeutigen Eintrag verloren.
+if nur_pruefen == '1':
+    for e in zu_erteilen:
+        if erwartet and erwartet != hashlib.sha256('\x00'.join([pane, e['cwd'], e['command']]).encode('utf-8')).hexdigest():
+            sys.stderr.write('wb-freigabe: der Eintrag, der freigegeben werden sollte, ist nicht mehr der, '
+                             'der jetzt vorliegt. Nichts erteilt, der Geraetebeleg ist unverbraucht.\n')
+            raise SystemExit(1)
+    raise SystemExit(0)
+
 # Obergrenze wie im Hook (ask_muster.MAX_TTL_SEKUNDEN): eine Freigabe mit langer
 # Frist waere der Freibrief, den diese Stufe nicht sein darf.
 try:
@@ -847,6 +1004,8 @@ for e in zu_erteilen:
                        'Einmal freigegeben (%s), ohne Begruendung.' % merker.get('muster', '')),
             'command': command[:2000], 'cwd': cwd,
             'session_id': str(merker.get('session_id', '')), 'pane': pane,
+            # Wer erteilt hat (F4): bei einem Mobilgeraet stehen hier Geraet und request_id.
+            'herkunft': '%s: %s' % (art, beleg[:300]),
         }, ensure_ascii=False))
     except OSError:
         # Ein nicht schreibbarer Verlauf haelt die Entscheidung nicht auf; die
@@ -894,4 +1053,27 @@ if any(e['ist_primaer'] for e in zu_erteilen):
     except OSError:
         pass
 PY
+}
+
+if [ "$MOBILBELEG" = 1 ]; then
+    # Nur gebunden an einen gelesenen Eintrag: ohne --schluessel wuesste das Pruefprogramm
+    # nicht, welcher Entscheidung der Beleg gelten muss. Mehrere Wortlaute gibt es per Mobil nicht.
+    if [ -z "$ERWARTETER_SCHLUESSEL" ] || [ -n "$INDEX" ] || [ "$ALLE" = 1 ]; then
+        echo "wb-freigabe: --mobilbeleg verlangt --schluessel und schliesst --index/--alle aus." >&2; exit 2
+    fi
+    case "$ERWARTETER_SCHLUESSEL" in *[!0-9a-f]*) echo "wb-freigabe: --schluessel ist kein SHA-256." >&2; exit 2 ;; esac
+    [ "${#ERWARTETER_SCHLUESSEL}" = 64 ] || { echo "wb-freigabe: --schluessel ist kein SHA-256." >&2; exit 2; }
+    [ -n "$WB_MOBIL_HEIM" ] && [ -d "$WB_MOBIL_HEIM" ] || { echo "wb-freigabe: Heimatverzeichnis laut Benutzerdatenbank nicht lesbar." >&2; exit "$ABGELEHNT"; }
+    GRANTS="$WB_MOBIL_HEIM/.pi-workers/guard-grants"
+    BLOCKS="$WB_MOBIL_HEIM/.pi-workers/guard-blocks"
+    VERLAUF="$WB_MOBIL_HEIM/.pi-workers/guard-blocks.log"
+    erteilen_py "$BLOCKS" "$GRANTS" "$PANE" "" "" "" "$TTL" "$ERWARTETER_SCHLUESSEL" "$VERLAUF" "" "" "" 1 || exit $?
+    mobil_belegen || ablehnen "der Geraetebeleg traegt nicht (Verlaufszeile geschrieben)."
+else
+    messen || ablehnen "hier ruft kein gemessener Mensch."
+fi
+
+ART="$(herkunft_art)"
+erteilen_py "$BLOCKS" "$GRANTS" "$PANE" "$GRUND" "$ART" "$MENSCH_GRUND" "$TTL" "$ERWARTETER_SCHLUESSEL" \
+      "$VERLAUF" "$INDEX" "$ALLE" "$INBOX_BIN" 3< <(/usr/bin/env -0)
 exit $?

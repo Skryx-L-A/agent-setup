@@ -154,6 +154,17 @@ FILES=(
   ".local/bin/wb-mcp-start" ".local/bin/wb-werkzeuge-abgleich"
   ".local/bin/wb-hub" ".local/bin/wb_hub_kern.py" ".local/bin/wb_hub_cli.py"
   ".local/bin/atomar_schreiben.py"
+  # Die Stilregel (anweisungen.stil, skills.kurz-und-knackig; P2 13.10.): die Textdateien liegen neben
+  # werkzeuge.default.json, wb-anweisung spielt sie ein, werkzeuge_anweisungen.py bewertet sie.
+  ".local/bin/wb-anweisung" ".local/bin/werkzeuge_anweisungen.py"
+  ".local/bin/werkbank-stil/erinnerung.txt" ".local/bin/werkbank-stil/kurz-und-knackig/SKILL.md"
+  # W2 (14.10.): wb-werkzeuge importiert werkzeuge_dateien.py (Dateiwege: pi-Extensions, Prompts,
+  # gptme/goose-Bloecke) und werkzeuge_hookbruecke.py; die Dateiwege kopieren die .ts-Quellen und
+  # werkbank-prompts/ von HIER in die Harness-Ordner, wb-hook-bruecke ist der Befehl, den die
+  # geschriebenen Hook-Eintraege rufen. Auf dem Mac nimmt wb-ausrollen sie ueber install_map mit.
+  ".local/bin/werkzeuge_dateien.py" ".local/bin/werkzeuge_hookbruecke.py" ".local/bin/wb-hook-bruecke"
+  ".local/bin/pi-wb-hub.ts" ".local/bin/pi-wb-hooks.ts" ".local/bin/opencode-wb-hooks.ts"
+  ".local/bin/pi-wb-anweisung.ts" ".local/bin/werkbank-prompts/budget.md"
   ".local/bin/crushrc.default"
   # NICHT hier: wb-shot (macOS `screencapture` plus Swift-Helfer, im Skript selbst als
   # MAC-ONLY vermerkt), <ein eigenes Mailwerkzeug> (macOS-spezifischer Versandweg),
@@ -395,7 +406,25 @@ for f in "${REPORT_ONLY[@]}"; do
   fi
 done
 
-n=$(( ${#diffs[@]} + ${#missing[@]} + ${#remote_only_todo[@]} ))
+# Werkbank-Skills (skills.<name>.quelle in werkzeuge.default.json, Review wz-integ2 M1): auf dem
+# Ziel muss ~/.claude/skills/<name> ein Link auf den Skill-Ordner neben der installierten Quelle
+# sein. Der Schreiber ist dort `wb-werkzeuge skills-anlegen` (dieselbe Logik wie wb-ausrollen hier);
+# eine fremde Fassung (auf peer lag eine lange) kommt dabei in dessen Snapshot und wird ersetzt
+# (Entscheidung WorkbenchOrchestrator 13.10.; nie ohne Snapshot, der Ersatz wird mit Snapshot-Pfad
+# gemeldet). Ein Ziel ohne diesen Befehl (alte Fassung) liefert nichts; nach dem Uebertragen der neuen
+# Fassung laeuft er unten trotzdem. Fehler und unerwartete Ausgabe (etwa ein Traceback) bleiben
+# sichtbar (Review wz-integ3, Fund 5): stderr wird mitgelesen, nur GLEICH-Zeilen entfallen.
+skill_plan="$(ssh_other '[ ! -x "$HOME/.local/bin/wb-werkzeuge" ] || "$HOME/.local/bin/wb-werkzeuge" skills-anlegen --dry-run' 2>&1 \
+  | grep -vE '^(GLEICH  |keine Werkbank-Skills)' || true)"
+skill_todo=0
+if [ -n "$skill_plan" ]; then
+  echo
+  echo "Werkbank-Skills dort (Link in ~/.claude/skills; Stand vor dem Uebertragen):"
+  while IFS= read -r zeile; do echo "  SKILL dort   ${zeile#WUERDE ANGELEGT  }"; done <<<"$skill_plan"
+  skill_todo=1
+fi
+
+n=$(( ${#diffs[@]} + ${#missing[@]} + ${#remote_only_todo[@]} + skill_todo ))
 echo
 if [ "$n" -eq 0 ]; then
   echo "Nichts zu tun."
@@ -472,9 +501,17 @@ for e in ${remote_only_todo[@]+"${remote_only_todo[@]}"}; do
   ssh_other "chmod 755 \$HOME/$zielpfad" 2>/dev/null
   echo "  ok  $zielpfad  (nur dorthin, aus $quelle)"
 done
+# Skill-Links zuletzt: erst jetzt liegen Quelle und Skill-Ordner in ihrer neuen Fassung drueben.
+skill_aus="$(ssh_other '[ ! -x "$HOME/.local/bin/wb-werkzeuge" ] || "$HOME/.local/bin/wb-werkzeuge" skills-anlegen' 2>&1)"
+skill_rc=$?
+skill_aus="$(printf '%s\n' "$skill_aus" | grep -vE '^(GLEICH  |keine Werkbank-Skills|$)' || true)"
+[ -n "$skill_aus" ] && while IFS= read -r zeile; do echo "  skill  $zeile"; done <<<"$skill_aus"
+[ "$skill_rc" -eq 0 ] || echo "  FEHLER  Werkbank-Skills auf $OTHER: skills-anlegen Exit $skill_rc (Zeilen oben)"
 echo
 [ -n "$SNAP" ] && echo "Alte Fassungen gesichert nach $OTHER:$SNAP"
 echo "Uebertragen. NICHT automatisch angeglichen: settings.json, AGENTS.md und CLAUDE.md —"
 echo "die tragen maschinenabhaengige Teile und wollen von Hand nachgezogen werden."
 echo "Haben sich die Rollen geaendert: auf $OTHER danach 'wb-instructions sync' laufen lassen"
-echo "(die Rollen sind seine Quelle; er erzeugt daraus die Einstiegsdateien der Harnesses)."
+echo "(die Rollen sind seine Quelle; er erzeugt daraus die Einstiegsdateien der Harnesses);"
+echo "wb-ausrollen auf $OTHER erledigt das als festen Schritt."
+[ "$skill_rc" -eq 0 ] || exit 1

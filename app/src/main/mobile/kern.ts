@@ -461,8 +461,8 @@ export function mobilDienstBauen(konfig: MobilKonfig, quellen: MobilKernQuellen)
       'prompt.answer.opencode': gemessen.has('prompt.answer.opencode'),
       'prompt.answer.pi': gemessen.has('prompt.answer.pi'),
       'approvals.request.decide': true,
-      // Der Geraetebeleg reicht nicht bis wb-freigabe (herkunft.ts): Annehmen bleibt am Rechner.
-      'approvals.guard.approve': false,
+      // Der Geraetebeleg reicht bis wb-freigabe (14.10.2026, herkunft.ts): es prueft ihn selbst.
+      'approvals.guard.approve': true,
       'approvals.guard.reject': true,
       'sessions.create': true,
       // WeltenQuelle nimmt den gepruefte Geraetebeleg als menschlichen Absender an (herkunft.ts).
@@ -640,6 +640,16 @@ export function mobilDienstBauen(konfig: MobilKonfig, quellen: MobilKernQuellen)
         const r = await server.start();
         dialogHoerer.add(faehigkeitGeaendert);
         replik?.starten();
+        // Geraete ohne gueltige Signatur dieser Maschine (auth.ts, Review 14.10.2026, F2) werden
+        // nicht still nachsigniert: sie brauchen eine neue Kopplung. Laut, damit niemand raetselt.
+        try {
+          const ungueltig = authenticator.ungueltigeGeraete();
+          if (ungueltig.length) {
+            protokoll(`Mobil: ${ungueltig.length} gekoppelte(s) Geraet(e) ohne gueltige Signatur dieser Maschine (${ungueltig.map((g) => g.device_name || g.device_id).join(', ')}) -- jede ihrer Anfragen wird abgewiesen. Abhilfe: am Mac neu koppeln und den alten Eintrag widerrufen.`);
+          }
+        } catch (fehler) {
+          protokoll(`Mobil: Geraeteliste nicht pruefbar: ${(fehler as Error).message}`);
+        }
         return r;
       } catch (fehler) {
         server = null;

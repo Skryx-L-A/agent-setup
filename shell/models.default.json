@@ -587,31 +587,6 @@
         "~/.claude/AGENTS.md",
         "<project>/AGENTS.md"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "ziel": "~/.claude.json",
-          "format": "json-pfad",
-          "pfad": "mcpServers",
-          "form": "claude"
-        },
-        "hooks": {
-          "weg": "plugin-werkbank",
-          "ziel": "~/.claude/werkbank-marktplatz/werkbank/hooks/hooks.json"
-        },
-        "prompts": {
-          "weg": "plugin-werkbank",
-          "ziel": "~/.claude/werkbank-marktplatz/werkbank/commands/"
-        },
-        "plugins": {
-          "weg": "nur-pruefen",
-          "ziel": "~/.claude/settings.json"
-        },
-        "rechte": {
-          "weg": "nur-pruefen",
-          "ziel": "~/.claude/settings.json",
-          "pfad": "permissions"
-        }
-      },
       "supportsPaste": true,
       "altScreen": true,
       "probe": "produktiv gemessen (Ready-Muster seit V1 im Einsatz)",
@@ -647,7 +622,57 @@
         "expect": "\\bok\\b",
         "timeoutSeconds": 180,
         "notes": "Ein kurzer Aufruf im Abo vor dem Eintrag eines entdeckten Modells (Auftrag modell-auto, 2026-10-10). --setting-sources leer: keine Hooks und keine Startdateien, damit der Aufruf klein bleibt."
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.claude.json",
+          "format": "json-pfad",
+          "pfad": "mcpServers",
+          "form": "claude",
+          "gemessen": "2026-10-13/help",
+          "beleg": "claude --help: --mcp-config; wb-werkzeuge status claude mcp werkbank GLEICH"
+        },
+        "hooks": {
+          "weg": "plugin-werkbank",
+          "ziel": "~/.claude/werkbank-marktplatz/werkbank/hooks/hooks.json",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "werkbank-marktplatz/werkbank/hooks/hooks.json (4 Ereignisse, 6 Befehle)"
+        },
+        "prompts": {
+          "weg": "plugin-werkbank",
+          "ziel": "~/.claude/werkbank-marktplatz/werkbank/commands/",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "~/.claude/commands/budget.md von Hand; Plugin ohne commands/"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.claude/settings.json",
+          "gemessen": "2026-10-13/help",
+          "beleg": "claude plugin list; enabledPlugins in settings.json"
+        },
+        "rechte": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.claude/settings.json",
+          "pfad": "permissions",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "settings.json permissions.allow; defaultMode acceptEdits"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.claude/skills",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "~/.claude/skills = Quelle (wb-instructions sync_skill_links)"
+        },
+        "anweisungen": {
+          "weg": "plugin-werkbank",
+          "ziel": "~/.claude/werkbank-marktplatz/werkbank/",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "~/.claude/AGENTS.md Verweis; Rolle per --append-system-prompt"
+        }
+      },
+      "skillRoots": [
+        "~/.claude/skills"
+      ]
     },
     {
       "id": "pi",
@@ -719,36 +744,8 @@
         }
       },
       "effortInSpawnSpelling": false,
-      "toolAdapter": {
-        "mcp": {
-          "weg": "pi-erweiterung",
-          "ziel": "~/.pi/agent/extensions/wb-hub.ts",
-          "quelle": "pi-wb-hub.ts"
-        },
-        "hooks": {
-          "weg": "leer",
-          "grund": "pi-Ereignisse laufen nur ueber Extensions; der Adapter schreibt dafuer keine Hook-Datei (Plan 2.3, Tabelle Abschnitt 2)"
-        },
-        "prompts": {
-          "ziel": "~/.pi/agent/prompts/",
-          "format": "markdown-dir"
-        },
-        "plugins": {
-          "weg": "dateien",
-          "ziel": "~/.pi/agent/extensions/",
-          "dateien": [
-            "wb-inbox.ts",
-            "brain-kontext.ts",
-            "wb-hub.ts"
-          ]
-        },
-        "rechte": {
-          "weg": "leer",
-          "grund": "pi-Rechte laufen je Aufruf ueber das Registry-Flag --tools, kein Konfigurationsziel (Plan Abschnitt 2 Tabelle)"
-        }
-      },
       "instructionFiles": [
-        "~/.pi/agent/RULES.md"
+        "~/.pi/agent/AGENTS.md"
       ],
       "supportsPaste": true,
       "altScreen": false,
@@ -778,7 +775,122 @@
           "datum": "2026-09-29",
           "beleg": "gemessen 2026-09-29 (Auftrag inbox-alle), eigenes HOME, tmux -L inboxprobe, pi 0.87.1 mit -e shell/inbox/pi-wb-inbox.ts und OpenAI-kompatiblem Stub: untaetig geweckt (Antwort nach 0,2 s), Nachricht waehrend eines 8-s-Zuges als followUp an der Zuggrenze, halb getippter Text blieb in der Eingabezeile, Abmeldung beim Beenden."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "weg": "pi-erweiterung",
+          "ziel": "~/.pi/agent/extensions/wb-hub.ts",
+          "quelle": "pi-wb-hub.ts",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "wb-hub.ts registerTool je Hub-Werkzeug; pi --help ohne MCP-Client"
+        },
+        "hooks": {
+          "weg": "pi-erweiterung",
+          "ziel": "~/.pi/agent/extensions/wb-hooks.ts",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "pi docs/extensions.md: pi.on() tool_call, tool_result, before_agent_start, turn_end, session_start",
+          "quelle": "pi-wb-hooks.ts",
+          "bruecke": {
+            "ereignisse": {
+              "PreToolUse": "tool_call",
+              "PostToolUse": "tool_result",
+              "UserPromptSubmit": "before_agent_start",
+              "Stop": "agent_end"
+            },
+            "eingabe": {
+              "tool_name": "toolName",
+              "tool_input": "input",
+              "cwd": "cwd",
+              "session_id": "sessionId",
+              "prompt": "prompt"
+            },
+            "werkzeuge": {
+              "bash": "Bash",
+              "read": "Read",
+              "grep": "Grep",
+              "find": "Glob",
+              "write": {
+                "name": "Write",
+                "argumente": {
+                  "path": "file_path"
+                }
+              },
+              "edit": {
+                "name": "Edit",
+                "argumente": {
+                  "path": "file_path"
+                }
+              }
+            },
+            "antwort": {
+              "blockieren": {
+                "json": {
+                  "hookSpecificOutput": {
+                    "hookEventName": "{ereignis}",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "{grund}"
+                  }
+                }
+              },
+              "kontext": {
+                "json": {
+                  "hookSpecificOutput": {
+                    "hookEventName": "{ereignis}",
+                    "additionalContext": "{kontext}"
+                  }
+                }
+              }
+            },
+            "gemessen": "2026-10-14/quelle",
+            "beleg": "pi dist/core/extensions/types.d.ts: ToolCallEvent {toolName, input}, ToolCallEventResult {block, reason}, BeforeAgentStartEvent.prompt; Extension shell/pi-wb-hooks.ts reicht die Nutzlast an wb-hook-bruecke"
+          }
+        },
+        "prompts": {
+          "ziel": "~/.pi/agent/prompts/",
+          "format": "markdown-dir",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "pi docs/prompt-templates.md:9 ~/.pi/agent/prompts/*.md"
+        },
+        "plugins": {
+          "weg": "dateien",
+          "ziel": "~/.pi/agent/extensions/",
+          "dateien": [
+            "wb-inbox.ts",
+            "brain-kontext.ts",
+            "wb-hub.ts"
+          ],
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "~/.pi/agent/extensions/ 5 Dateien; pi install/list/remove"
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "pi-Rechte laufen je Aufruf ueber das Registry-Flag --tools, kein Konfigurationsziel (Plan Abschnitt 2 Tabelle)",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "pi docs/security.md:3 keine Rueckfrage je Werkzeugaufruf; nur --tools/--exclude-tools/--no-tools"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.agents/skills",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "pi docs/skills.md:61 ~/.agents/skills/"
+        },
+        "anweisungen": {
+          "weg": "datei",
+          "ziel": "~/.pi/agent/AGENTS.md",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "pi docs/configuration.md:17-19 liest AGENTS.md/CLAUDE.md im Agent-Ordner; RULES.md hat keinen Leser",
+          "erinnerung": {
+            "weg": "pi-erweiterung",
+            "ziel": "~/.pi/agent/extensions/wb-anweisung.ts",
+            "quelle": "pi-wb-anweisung.ts",
+            "gemessen": "2026-10-14/doku",
+            "beleg": "pi docs/extensions.md + dist/core/extensions/types.d.ts:917 before_agent_start darf message {customType, content, display} liefern; sessionManager.getSessionId()"
+          }
+        }
+      },
+      "skillRoots": [
+        "~/.agents/skills"
+      ]
     },
     {
       "id": "codex",
@@ -872,28 +984,6 @@
         "~/.codex/AGENTS.md",
         "<project>/AGENTS.md"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "ziel": "~/.codex/config.toml",
-          "format": "toml-marker"
-        },
-        "hooks": {
-          "weg": "wb-chat-hook-install",
-          "ziel": "~/.codex/hooks.json"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "kein Prompt-Ordner im Binary belegt (S0, Plan-Nachtrag 13:45)"
-        },
-        "plugins": {
-          "weg": "nur-pruefen",
-          "ziel": "~/.codex/config.toml"
-        },
-        "rechte": {
-          "weg": "nur-pruefen",
-          "ziel": "~/.codex/config.toml"
-        }
-      },
       "supportsPaste": true,
       "altScreen": true,
       "notes": "Erste Welle. /compact stammt aus Issues des offiziellen Repos, nicht aus der Doku (mittlere Konfidenz); eine CTX-Anzeige gibt es entgegen derselben Quelle nicht, siehe probe. Anbietergebunden: eigene Base-URL ist NICHT belegt. ENTFERNT 2026-08-09: promptIgnore (eine Alternation aus sieben gemessenen Platzhaltern der leeren Eingabezeile) trug seit 2026-08-06 nichts mehr bei, sobald pi-worker die Eingabezeile VOR dem Einfuegen merkt und hinterher wortlos dagegen haelt (derselbe Vergleich faengt JEDEN Platzhalter, nicht nur die gelisteten sieben) -- der Eintrag war ausdruecklich ein Pflaster fuer die Zeit vor diesem Vergleich. Nachgeprueft von Hand (eigener tmux-Socket, echtes codex-cli 0.146.0, echtes Modell codex-gpt5): die Eingabezeile zeigte vorher den Platzhalter 'Find and fix a bug in @filename', nach dem Einfuegen unseren Text -- der Vergleich unterscheidet beides ohne promptIgnore einwandfrei, genau das Verhalten, auf das sich die Entfernung stuetzt. NICHT abschliessend gemessen werden konnte die volle Zustellung bis zur Antwort: zwei NEUE, von diesem Eintrag unabhaengige Befunde blockierten den Lauf danach -- codex-cli zeigt inzwischen NACH der Verzeichnis-Vertrauensfrage einen zweiten Dialog ('Hooks need review', bislang weder in trustStore noch in readyPattern beruecksichtigt), und der ChatGPT-Abo-Token dieses codex-gpt5-Kontos war zum Messzeitpunkt abgelaufen ('token_expired' / 'refresh token was already used'). Beides gehoert nicht zu diesem Feld und steht deshalb nur hier vermerkt, nicht behoben. Die Vertrauensfrage beim ersten Start in einem Verzeichnis beantwortet codex NICHT ueber promptIgnore: sie steht in ~/.codex/config.toml als [projects.\"<pfad>\"] trust_level = \"trusted\", mit dem AUFGELOESTEN Pfad (auf macOS /private/var/... statt /var/...). Ein frischer Worktree steht dort nicht, der Dialog kommt, das readyPattern trifft ihn richtigerweise nicht — der Spawn scheitert dann sichtbar nach 60s, statt den Auftrag zu verlieren. Seit 2026-08-08 traegt wb-harness-run das Arbeitsverzeichnis vor dem Start selbst ein (trustStore, style toml-section); der Dialog erscheint dann gar nicht erst, und der Satz davor beschreibt, was ohne diesen Eintrag passiert. NACHTRAG 2026-09-12: ChatGPT Plus ist angemeldet. Die Effort-Map bildet low..max ab; Agenten bleiben durch den Modell-Deckel gebunden, Menschen duerfen die vom Harness angebotenen Stufen waehlen.",
@@ -973,7 +1063,55 @@
         "expect": "\\bok\\b",
         "timeoutSeconds": 180,
         "notes": "Ein kurzer Aufruf im ChatGPT-Abo vor dem Eintrag eines entdeckten Modells (Auftrag modell-auto, 2026-10-10). Gemessen 10.10.: gpt-6.1-luna lehnt der Server ab ('not supported when using Codex with a ChatGPT account')."
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.codex/config.toml",
+          "format": "toml-marker",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/probe",
+          "beleg": "codex mcp add werkbank -- wb-hub stdio --harness codex im Test-HOME schreibt [mcp_servers.werkbank] command/args, codex mcp list liest ihn (enabled); die http-Form braucht bearer_token_env_var WB_HUB_TOKEN, ausserhalb wb-harness-run leer (401)"
+        },
+        "hooks": {
+          "weg": "wb-chat-hook-install",
+          "ziel": "~/.codex/hooks.json",
+          "gemessen": "2026-10-13/help",
+          "beleg": "codex features list: hooks stable; ~/.codex/hooks.json"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-Ordner im Binary belegt (S0, Plan-Nachtrag 13:45)",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "kein ~/.codex/prompts, kein codex/prompts im Binary; migrated-command-skills"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.codex/config.toml",
+          "gemessen": "2026-10-13/help",
+          "beleg": "codex plugin add/list/marketplace; config.toml [plugins.*]"
+        },
+        "rechte": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.codex/config.toml",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "config.toml approval_policy, sandbox_mode"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.codex/skills",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "Binary-Text: $CODEX_HOME/skills bzw. ~/.codex/skills; ~/.agents/skills kein Treffer"
+        },
+        "anweisungen": {
+          "weg": "datei",
+          "ziel": "~/.codex/AGENTS.md",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "~/.codex/AGENTS.md generiert; Rolle per -c developer_instructions"
+        }
+      },
+      "skillRoots": [
+        "~/.codex/skills"
+      ]
     },
     {
       "id": "aider",
@@ -1004,6 +1142,7 @@
       "systemPrompt": {
         "style": "flag-path",
         "flag": "--read",
+        "path": "~/.aider/CONVENTIONS.md",
         "worker": "~/.claude/roles/agent.md",
         "orchestrator": "~/.claude/roles/orchestrator.md"
       },
@@ -1047,23 +1186,45 @@
       "toolAdapter": {
         "mcp": {
           "weg": "leer",
-          "grund": "kein MCP-Client; Zugriff ueber CLI wb-hub call geplant (Hub-Spur H3)"
+          "grund": "kein MCP-Client; Zugriff ueber CLI wb-hub call geplant (Hub-Spur H3)",
+          "gemessen": "2026-10-13/help",
+          "beleg": "aider --help ohne MCP; kein mcp im Paket"
         },
         "hooks": {
           "weg": "leer",
-          "grund": "aider kennt keinen Harness-Hook. Der einzige Hook ist der git-pre-commit, der nicht zu den Werkbank-Ereignissen gehoert (Plan 2.3)"
+          "grund": "aider kennt keinen Harness-Hook. Der einzige Hook ist der git-pre-commit, der nicht zu den Werkbank-Ereignissen gehoert (Plan 2.3)",
+          "gemessen": "2026-10-13/help",
+          "beleg": "aider --help: nur --git-commit-verify und --notifications-command"
         },
         "prompts": {
           "weg": "leer",
-          "grund": "aider hat keinen Befehls- oder Prompt-Ordner (Inventur)"
+          "grund": "aider hat keinen Befehls- oder Prompt-Ordner (Inventur)",
+          "gemessen": "2026-10-13/help",
+          "beleg": "aider --help: nur --load <datei> (Startskript)"
         },
         "plugins": {
           "weg": "leer",
-          "grund": "aider hat keine Plugin- oder Extension-Schnittstelle (Inventur, Plan 2.3)"
+          "grund": "aider hat keine Plugin- oder Extension-Schnittstelle (Inventur, Plan 2.3)",
+          "gemessen": "2026-10-13/help",
+          "beleg": "aider --help ohne Plugin"
         },
         "rechte": {
           "weg": "leer",
-          "grund": "aider hat keine Rechte-Datei und kein Rechte-Flag in der Registry (Inventur)"
+          "grund": "aider hat keine Rechte-Datei und kein Rechte-Flag in der Registry (Inventur)",
+          "gemessen": "2026-10-13/help",
+          "beleg": "aider --help ohne Rechte-Flag"
+        },
+        "skills": {
+          "weg": "leer",
+          "grund": "noch nicht gemessen (P4/P5)",
+          "gemessen": "2026-10-13/help",
+          "beleg": "aider --help ohne Skill"
+        },
+        "anweisungen": {
+          "weg": "datei",
+          "ziel": "~/.aider/CONVENTIONS.md",
+          "gemessen": "2026-10-14/quelle",
+          "beleg": "wb-harness-run haengt --read ~/.aider/CONVENTIONS.md an (systemPrompt.path); ~/.aider.conf.yml bleibt unberuehrt, ohne wb-harness-run liest aider die Datei nicht"
         }
       },
       "instructionFiles": [],
@@ -1159,31 +1320,6 @@
         "~/.config/opencode/AGENTS.md",
         "<project>/AGENTS.md"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "ziel": "~/.config/opencode/opencode.json",
-          "format": "json-pfad",
-          "pfad": "mcp",
-          "form": "opencode"
-        },
-        "hooks": {
-          "weg": "plugin-bruecke",
-          "ziel": "~/.config/opencode/plugin/wb-hooks.ts"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "zu messen (S0)"
-        },
-        "plugins": {
-          "weg": "nur-pruefen",
-          "ziel": "~/.config/opencode/plugin/"
-        },
-        "rechte": {
-          "ziel": "~/.config/opencode/opencode.json",
-          "format": "json-pfad",
-          "pfad": "permission"
-        }
-      },
       "supportsPaste": true,
       "altScreen": true,
       "notes": "Erste Welle: 75+ Provider, /compact plus Auto-Kompaktierung bestaetigt. Thinking-Budget nur ueber die Konfiguration, kein CLI-Flag — deshalb effort style 'none'. MODELLWAHL, gemessen 2026-08-08 mit 1.18.14/1.18.15 gegen zwei eigene OpenAI-kompatible Stub-Server: --model kommt an, solange die Referenz aufloesbar ist — die Statuszeile im Kasten nannte das bestellte Modell, und der POST /v1/chat/completions traf den Port des bestellten Providers mit dem bestellten Modellnamen; auch dann, wenn das Modell im Backend gar nicht existiert (die Deklaration in opencode.json genuegt), und auch gegen einen im selben HOME zuletzt benutzten anderen Provider. ABER: laesst sich die Referenz NICHT aufloesen, ersetzt opencode sie STILL durch ein eigenes Cloud-Modell — 'ollama/ornith:9b' ohne passenden Provider-Eintrag startete als 'Big Pickle · OpenCode Zen', ohne Fehler, nur mit einem Tipp '/connect'. Und: steht --continue in derselben Zeile, gewinnt das Modell der fortgesetzten Sitzung, --model wird verworfen (bestellt beta/beta-1, gelaufen ist alpha/alpha-1). Bis zum 2026-08-06 haengte 'models resolve' --continue an JEDEN Spawn, weil der resume-Block noch kein probe trug — daher der Befund vom 06.08. Ein unerreichbarer, aber KONFIGURIERTER Provider faellt dagegen nicht still zurueck, sondern zeigt 'Cannot connect to API ... [retrying]'. Nachpruefbar ist das immer an derselben Stelle: die unterste Kastenzeile nennt Modell UND Provider.",
@@ -1219,7 +1355,144 @@
           "datum": "2026-09-29",
           "beleg": "gemessen 2026-09-29 (Auftrag inbox-alle), eigenes HOME, tmux -L inboxprobe, opencode 1.18.32 mit Plugin shell/inbox/opencode-wb-inbox.ts und Stub: frische TUI ohne Sitzung bekam eine neue Sitzung und wechselte zu ihr (tui.session.select), Nachricht waehrend eines 8-s-Zuges kam nach session.idle, halb getippter Text blieb stehen."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.config/opencode/opencode.json",
+          "format": "json-pfad",
+          "pfad": "mcp",
+          "form": "opencode",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/doku",
+          "beleg": "opencode mcp type local (Binary-Doku, 13.10.): command-Liste; stdio-Bruecke wb-hub statt remote+Bearer {env:WB_HUB_TOKEN} (ausserhalb wb-harness-run leer, 401)"
+        },
+        "hooks": {
+          "weg": "plugin-bruecke",
+          "ziel": "~/.config/opencode/plugin/wb-hooks.ts",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "Binary-Doku: Plugin-Ereignisse tool.execute.before/after, permission.ask; Patch-Werkzeug: opencode 1.19 Binary: Werkzeug apply_patch mit Argument patchText (strings, Review W2 F1, 14.10.)",
+          "quelle": "opencode-wb-hooks.ts",
+          "bruecke": {
+            "ereignisse": {
+              "PreToolUse": "PreToolUse",
+              "PostToolUse": "PostToolUse",
+              "UserPromptSubmit": "UserPromptSubmit",
+              "Stop": "Stop"
+            },
+            "eingabe": "gleich",
+            "werkzeuge": {
+              "bash": "Bash",
+              "edit": {
+                "name": "Edit",
+                "argumente": {
+                  "filePath": "file_path",
+                  "oldString": "old_string",
+                  "newString": "new_string"
+                }
+              },
+              "write": {
+                "name": "Write",
+                "argumente": {
+                  "filePath": "file_path",
+                  "oldString": "old_string",
+                  "newString": "new_string"
+                }
+              },
+              "read": {
+                "name": "Read",
+                "argumente": {
+                  "filePath": "file_path",
+                  "oldString": "old_string",
+                  "newString": "new_string"
+                }
+              },
+              "grep": "Grep",
+              "glob": "Glob",
+              "patch": {
+                "name": "Edit",
+                "patch": [
+                  "patchText"
+                ]
+              },
+              "apply_patch": {
+                "name": "Edit",
+                "patch": [
+                  "patchText"
+                ]
+              },
+              "multiedit": {
+                "name": "MultiEdit",
+                "argumente": {
+                  "filePath": "file_path",
+                  "oldString": "old_string",
+                  "newString": "new_string"
+                }
+              },
+              "webfetch": "WebFetch",
+              "task": "Task",
+              "skill": "Skill",
+              "todowrite": "TodoWrite",
+              "list": "LS"
+            },
+            "antwort": {
+              "blockieren": {
+                "json": {
+                  "hookSpecificOutput": {
+                    "hookEventName": "{ereignis}",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "{grund}"
+                  }
+                }
+              },
+              "kontext": {
+                "json": {
+                  "hookSpecificOutput": {
+                    "hookEventName": "{ereignis}",
+                    "additionalContext": "{kontext}"
+                  }
+                }
+              }
+            },
+            "gemessen": "2026-10-14/quelle",
+            "beleg": "shell/opencode-wb-hooks.ts baut die Claude-Nutzlast (tool.execute.before/after, chat.message, session.idle) mit nativem Werkzeugnamen; Namen wie dort NAMEN"
+          },
+          "alte_tabelle": "~/.config/opencode/wb-hooks.json"
+        },
+        "prompts": {
+          "ziel": "~/.config/opencode/command/",
+          "format": "markdown-dir",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "Binary-Doku: Global commands ~/.config/opencode/command(s)/<name>.md"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.config/opencode/plugin/",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "~/.config/opencode/plugin/ mit brain-kontext.ts, wb-inbox.ts"
+        },
+        "rechte": {
+          "ziel": "~/.config/opencode/opencode.json",
+          "format": "json-pfad",
+          "pfad": "permission",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "Binary-Doku: opencode.json permission (edit/bash allow|ask|deny)"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.agents/skills",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "Binary-Doku: External skills ~/.claude/skills, ~/.agents/skills"
+        },
+        "anweisungen": {
+          "weg": "datei",
+          "ziel": "~/.config/opencode/AGENTS.md",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "~/.config/opencode/AGENTS.md generiert"
+        }
+      },
+      "skillRoots": [
+        "~/.agents/skills"
+      ]
     },
     {
       "id": "agy",
@@ -1245,7 +1518,6 @@
       },
       "systemPrompt": {
         "style": "file",
-        "path": "~/.antigravity/AGENTS.md",
         "projectPath": "AGENTS.md",
         "worker": "~/.claude/roles/agent.md",
         "orchestrator": "~/.claude/roles/orchestrator.md"
@@ -1299,28 +1571,6 @@
       "instructionFiles": [
         "~/.antigravity/AGENTS.md"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "weg": "leer",
-          "grund": "zu messen (S0)"
-        },
-        "hooks": {
-          "weg": "leer",
-          "grund": "kein Hook-Mechanismus laut --help"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "zu messen (S0)"
-        },
-        "plugins": {
-          "weg": "nur-pruefen",
-          "ziel": "~/.gemini/config/plugins/"
-        },
-        "rechte": {
-          "weg": "registry-flag",
-          "grund": "Registry-Flag"
-        }
-      },
       "supportsPaste": true,
       "notes": "Loest die Gemini CLI ab: Google hat sie zum 2026-06-18 fuer Einzelnutzer abgekuendigt (offizielle Doku antigravity.google/docs/cli). In Go geschrieben, Flags fast deckungsgleich mit Claude Code (--model, --effort low|medium|high, --dangerously-skip-permissions, --continue, --print). Anmeldung liegt im macOS-Schluesselbund und wird mit der Antigravity-App geteilt — wer dort angemeldet ist, ist es hier auch (stiller Login). Ueber SSH gibt es einen Geraetecode-Fluss. Kein --append-system-prompt: die Rolle muss ueber die Instruktionsdatei kommen.",
       "promptPattern": "^>",
@@ -1348,7 +1598,57 @@
           "datum": "2026-09-29",
           "beleg": "nicht gemessen; agy --help, agy remote-control start --help (1.2.13)."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.gemini/config/mcp_config.json",
+          "format": "json-pfad",
+          "pfad": "mcpServers",
+          "form": "agy",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/probe",
+          "beleg": "agy mcp add werkbank -- wb-hub stdio --harness agy im Test-HOME schreibt mcpServers.werkbank {command,args,disabled:false}; agy mcp list liest den von wb-werkzeuge geschriebenen Eintrag (stdio, enabled); http-Probe 13.10. legte den Header im Klartext ab, deshalb stdio"
+        },
+        "hooks": {
+          "weg": "hooks-bruecke",
+          "ziel": "~/.gemini/config/hooks.json",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "Binary-Doku: Lifecycle Hooks (hooks.json) SessionStart, PreToolUse, PostToolUse, PreInvocation"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "zu messen (S0)",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "Binary-Doku: nur Skills, Workflows ausgemustert; --disable-slash-commands"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.gemini/config/plugins/",
+          "gemessen": "2026-10-13/help",
+          "beleg": "agy plugin list/install/import gemini|claude/validate; 9 Pakete"
+        },
+        "rechte": {
+          "weg": "registry-flag",
+          "grund": "Registry-Flag",
+          "gemessen": "2026-10-13/help",
+          "beleg": "agy --dangerously-skip-permissions, --mode, --sandbox"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.gemini/config/skills",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "Binary-Doku: skills/<name>/SKILL.md unter ~/.gemini/config/ und .agents/"
+        },
+        "anweisungen": {
+          "weg": "datei",
+          "ziel": "~/.antigravity/AGENTS.md",
+          "gemessen": "2026-10-14/herleitung",
+          "beleg": "Herleitung, nicht gemessen (Quota erschoepft bis 15.10. 21:34): agy liest Regeln unter ~/.gemini/config/ (rules/, AGENTS.md, GEMINI.md); Leseort ~/.antigravity/AGENTS.md ungeprueft, Zelle bleibt OFFEN bis eine Probe ~/.gemini/config/AGENTS.md belegt"
+        }
+      },
+      "skillRoots": [
+        "~/.gemini/config/skills"
+      ]
     },
     {
       "id": "goose",
@@ -1417,28 +1717,6 @@
         "~/.config/goose/.goosehints",
         "<project>/.goosehints"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "ziel": "~/.config/goose/config.yaml",
-          "format": "yaml-marker",
-          "pfad": "extensions"
-        },
-        "hooks": {
-          "weg": "leer",
-          "grund": "kein Hook-Mechanismus laut --help"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
-        },
-        "plugins": {
-          "weg": "nur-pruefen"
-        },
-        "rechte": {
-          "weg": "leer",
-          "grund": "keine Rechte-Konfiguration laut --help"
-        }
-      },
       "supportsPaste": true,
       "altScreen": false,
       "probe": "gemessen 2026-08-08 mit goose 1.45.0 (brew-Formel block-goose-cli; die Formel 'goose' aus homebrew-core ist ein Datenbank-Migrationswerkzeug und NICHT dieser Agent) auf eigenem tmux-Socket, umgelenktem HOME, Modell ollama/qwen3:1.7b. READY: die Eingabezeile beginnt am Zeilenanfang mit '>', deshalb readyPattern '^>'. Gemessen wurden die drei Zustaende: LEER steht dort '> Enter to send · Ctrl+J newline', GETIPPT '> auftrag: pruefe die tests', und WAEHREND DER ANTWORT bleibt die abgeschickte Zeile als '> auftrag: pruefe die tests' stehen, waehrend darunter eine Spinner-Zeile laeuft ('◐  Waddling to conclusions...  (Ctrl+C to interrupt)'). Das Muster trifft alle drei. Die TUI erschien im ersten Abtastschritt (0,4 s, Modell schon geladen) samt Eingabezeile — sie ist also nicht frueher da als die Eingabebereitschaft. Der Spinner-TEXT wechselt von Zug zu Zug (gemessen: 'Waddling to conclusions...', 'Compiling wisdom...'), taugt also fuer kein Muster. Das ASCII-Bild der Gans in Zeile 1 traegt zwar ein '>', aber eingerueckt ('    __( O)>'), und wird vom verankerten Muster richtigerweise nicht getroffen. ERSTSTART: goose zeigt ohne Zutun einen Telemetrie-Dialog ('Share anonymous usage data to help improve goose?') und wartet auf die Antwort — das readyPattern trifft ihn nicht, der Spawn wuerde also sichtbar scheitern. Beantwortet wird er vorher durch GOOSE_TELEMETRY_OFF=1 (die eigene Konfigurationshilfe von goose nennt genau diese Variable als Vorrang vor der Einstellung). Eine VERTRAUENSFRAGE fuer ein neues Verzeichnis stellt goose nicht — in einem frisch angelegten, leeren Arbeitsverzeichnis kam die Eingabezeile ohne jede Rueckfrage; ein trustStore-Block ist fuer goose deshalb nicht noetig, und das ist ein Messergebnis und keine Auslassung.",
@@ -1464,7 +1742,56 @@
           "datum": "2026-09-29",
           "beleg": "nicht gemessen; goose --help, goose serve --help (1.52.0)."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.config/goose/config.yaml",
+          "format": "yaml-marker",
+          "pfad": "extensions",
+          "form": "goose",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/probe",
+          "beleg": "goose info -v im Test-HOME liest extensions.werkbank {enabled,type:stdio,name,description,cmd,args,envs,timeout} aus config.yaml; Starten der Erweiterung nur mit Modellzug (offen)"
+        },
+        "hooks": {
+          "weg": "plugin-werkbank",
+          "ziel": "~/.agents/plugins/werkbank/hooks/hooks.json",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "Binary-Festtext: Loaded plugin hooks, hooks/hooks.json; Format nicht gemessen"
+        },
+        "prompts": {
+          "weg": "recipe-dir",
+          "ziel": "~/.config/goose/recipes/",
+          "gemessen": "2026-10-14/probe",
+          "beleg": "goose recipe list im Test-HOME listet ~/.config/goose/recipes/<name>.yaml (version/title/description/prompt), goose recipe validate gruen"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "gemessen": "2026-10-13/help",
+          "beleg": "goose plugin install <git-url>; ~/.agents/plugins/*/skills"
+        },
+        "rechte": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.config/goose/permission.yaml",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "Binary: permission.yaml, Modi auto/approve/smart_approve; Registry setzt GOOSE_MODE=auto"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.agents/skills",
+          "gemessen": "2026-10-13/probe",
+          "beleg": "goose skills list im Test-HOME: vier Wurzeln gelistet, darunter ~/.agents/skills"
+        },
+        "anweisungen": {
+          "weg": "datei",
+          "ziel": "~/.config/goose/.goosehints",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "~/.config/goose/.goosehints generiert"
+        }
+      },
+      "skillRoots": [
+        "~/.agents/skills"
+      ]
     },
     {
       "id": "crush",
@@ -1530,30 +1857,6 @@
         "~/.config/crush/CRUSH.md",
         "<project>/CRUSH.md"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "ziel": "~/.config/crush/crush.json",
-          "format": "json-pfad",
-          "pfad": "mcp",
-          "form": "crush"
-        },
-        "hooks": {
-          "weg": "leer",
-          "grund": "kein Hook-Mechanismus laut --help"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
-        },
-        "plugins": {
-          "weg": "leer",
-          "grund": "kein Plugin-Mechanismus laut --help"
-        },
-        "rechte": {
-          "weg": "registry-flag",
-          "grund": "Registry-Flag -y/--yolo"
-        }
-      },
       "supportsPaste": true,
       "altScreen": true,
       "probe": "gemessen 2026-08-08 mit crush v0.88.1 (Tap charmbracelet/tap) auf eigenem tmux-Socket, umgelenktem HOME, Modell ollama/qwen3:1.7b. READY: die Fusszeile traegt 'ctrl+l models', und zwar in allen drei gemessenen Zustaenden — leer ('/ or ctrl+p commands • ctrl+l models • ctrl+j newline • ctrl+c quit • ctrl+g more'), getippt (das '/ or ' faellt weg, sobald Text in der Box steht) und waehrend der Antwort ('esc cancel • tab focus chat • …'). Der gemeinsame Teil ist 'ctrl+l models', und darauf zeigt das Muster. Der Startablauf wurde in 0,4-s-Schritten abgetastet: bis 0,4 s leerer Bildschirm, bei 0,8 s die vollstaendige TUI samt Fusszeile — sie ist also nicht frueher da als die Eingabebereitschaft. WARUM NICHT DIE EINGABEZEILE als Ready-Muster: sie beginnt je nach Autonomie mit einem anderen Zeichen ('  Y  ' mit --yolo, '   > ' ohne, beides gemessen), und mit '>' traefe ein verankertes Muster ausserdem den Modellwaehler (siehe unten). PROMPT: '^ +[Y>]' trifft genau diese Eingabezeile; die Zeilen darunter ( ':::', ':::', Fusszeile) treffen es nicht, und die Absende-Pruefung in pi-worker nimmt die LETZTE Treffer-Zeile — anders als bei opencode gibt es hier also keine Statuszeile unterhalb der Box, die das Muster mitnimmt. Die leere Box traegt einen Platzhalter ('Yolo mode!' mit --yolo, 'Ready?' ohne); vier Starts hintereinander zeigten denselben Wortlaut, er rotiert also nicht wie bei codex. Beide stehen in promptIgnore. OHNE KONFIGURIERTES MODELL startet crush NICHT still ein Ersatzmodell, sondern bleibt im Modellwaehler stehen ('To start, let's choose a provider and model.' mit der Zeile '> Find your fave' und der Fusszeile '↑/↓ choose • enter confirm'). Das readyPattern trifft diesen Bildschirm nicht (gemessen: kein Treffer auf 'ctrl+l models'), der Spawn scheitert also nach 60 s sichtbar, statt den Auftrag an ein fremdes Modell zu geben — der Unterschied zu opencode, das in derselben Lage stillschweigend sein eigenes Cloud-Modell nimmt. Eine VERTRAUENSFRAGE stellt crush nicht; es vermerkt das Verzeichnis nur in ~/.local/share/crush/projects.json. Ein trustStore-Block ist also nicht noetig, gemessen und nicht ausgelassen.",
@@ -1588,7 +1891,101 @@
           "datum": "2026-09-29",
           "beleg": "nicht gemessen; crush --help und strings (v0.96.1)."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.config/crush/crush.json",
+          "format": "json-pfad",
+          "pfad": "mcp",
+          "form": "crush",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/binary",
+          "beleg": "crush schema/Binary: mcp.<n>.type stdio|http, command, args (S0 13.10.); stdio-Bruecke statt http+Bearer $WB_HUB_TOKEN (ausserhalb wb-harness-run leer, 401)"
+        },
+        "hooks": {
+          "weg": "json-pfad",
+          "ziel": "~/.config/crush/crush.json",
+          "pfad": "hooks",
+          "gemessen": "2026-10-13/probe",
+          "beleg": "crush schema: hooks (Ereignis -> name, matcher, command, timeout); Nutzlast ungemessen",
+          "bruecke": {
+            "ereignisse": {
+              "PreToolUse": "PreToolUse"
+            },
+            "eingabe": "gleich",
+            "werkzeuge": {
+              "bash": "Bash",
+              "write": "Write",
+              "edit": "Edit",
+              "multiedit": "MultiEdit",
+              "view": "Read",
+              "grep": "Grep",
+              "glob": "Glob",
+              "ls": "LS"
+            },
+            "antwort": {
+              "blockieren": {
+                "json": {
+                  "hookSpecificOutput": {
+                    "hookEventName": "{ereignis}",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "{grund}"
+                  }
+                }
+              },
+              "kontext": {
+                "json": {
+                  "hookSpecificOutput": {
+                    "hookEventName": "{ereignis}",
+                    "additionalContext": "{kontext}"
+                  }
+                }
+              }
+            },
+            "eintrag": {
+              "name": "werkbank-{name}",
+              "matcher": "",
+              "command": "{befehl}",
+              "timeout": "{timeout}"
+            },
+            "gemessen": "2026-10-14/probe",
+            "beleg": "Probe 14.10. 03:27: crush run im Test-HOME mit Stub-Provider (openai-compat): nur PreToolUse feuerte (PostToolUse/UserPromptSubmit/Stop eingetragen, nicht gefeuert), Nutzlast {event, session_id, cwd, tool_name (nativ: bash), tool_input}; Matcher ist ein Go-Regex ('*' ist ungueltig und bricht den Start ab, leer = alle); Werkzeuge agent, bash, edit, multiedit, view, write, glob, grep, ls, fetch, download, lsp_*, todos. Antwortform: siehe e2e"
+          }
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-/Slash-Mechanismus laut --help",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "crush README (Cellar 0.98.1): kein Befehlsordner"
+        },
+        "plugins": {
+          "weg": "leer",
+          "grund": "kein Plugin-Mechanismus laut --help",
+          "gemessen": "2026-10-13/probe",
+          "beleg": "crush schema: kein Plugin-Schluessel"
+        },
+        "rechte": {
+          "weg": "registry-flag",
+          "grund": "Registry-Flag -y/--yolo",
+          "gemessen": "2026-10-13/probe",
+          "beleg": "crush schema: permissions.allowed_tools; Registry nutzt Flag --yolo"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.agents/skills",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "crush README: Skill-Wurzeln ~/.agents/skills, ~/.claude/skills, ~/.config/crush/skills"
+        },
+        "anweisungen": {
+          "weg": "datei",
+          "ziel": "~/.config/crush/CRUSH.md",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "~/.config/crush/CRUSH.md generiert"
+        }
+      },
+      "skillRoots": [
+        "~/.agents/skills"
+      ]
     },
     {
       "id": "qwen",
@@ -1614,6 +2011,7 @@
       },
       "systemPrompt": {
         "style": "file",
+        "path": "~/.qwen/QWEN.md",
         "projectPath": "QWEN.md",
         "worker": "~/.claude/roles/agent.md",
         "orchestrator": "~/.claude/roles/orchestrator.md"
@@ -1658,31 +2056,6 @@
       "instructionFiles": [
         "<project>/QWEN.md"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "ziel": "~/.qwen/settings.json",
-          "format": "json-pfad",
-          "pfad": "mcpServers",
-          "form": "qwen"
-        },
-        "hooks": {
-          "ziel": "~/.qwen/settings.json",
-          "format": "json-pfad",
-          "pfad": "hooks"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "zu messen (S0)"
-        },
-        "plugins": {
-          "weg": "nur-pruefen",
-          "ziel": "~/.qwen/extensions/"
-        },
-        "rechte": {
-          "weg": "registry-flag",
-          "grund": "--allowed-mcp-server-names per Flag in der Registry"
-        }
-      },
       "supportsPaste": true,
       "altScreen": true,
       "notes": "Zweite Welle, 2026-08-08. ROLLEN-WEG GEMESSEN, nicht aus der Doku uebernommen: In ein Wegwerf-Arbeitsverzeichnis wurde eine QWEN.md mit einem frei erfundenen Losungswort gelegt und danach danach gefragt; Qwen Code antwortete mit genau diesem Wort. Der Rollen-Generator in wb-harness-run schreibt deshalb nach <arbeitsverzeichnis>/QWEN.md (systemPrompt.projectPath), und weil jeder Worker seinen eigenen Arbeitsbaum bekommt, hat jeder seine eigene Datei. Ein geteilter Weg im Heimatverzeichnis ist bewusst NICHT eingetragen: gemessen wurde nur der Projektweg. ANBIETER: Dieser Harness ist auf Ollama festgenagelt (env OPENAI_BASE_URL = {baseUrl:ollama}/v1, OPENAI_API_KEY = 'ollama' als Platzhalter, OPENAI_MODEL = {model}, QWEN_DEFAULT_AUTH_TYPE = openai). OPENAI_MODEL steht dort NICHT doppelt zu '-m', sondern weil es tragend ist: gemessen 2026-08-08 an zwei gleichzeitig gestarteten Panes mit identischem Rest — ohne die Variable zeigt Qwen Code den Erststart-Dialog 'Connect a Provider' und kommt nie zur Eingabezeile (der erste Spawn-Versuch scheiterte genau daran), mit ihr startet dieselbe Zeile durch. Die drei OPENAI_-Variablen zaehlen fuer Qwen Code zusammen als EINE vollstaendige Anmeldung; fehlt eine, gilt keine. Das ist eine Entscheidung und keine Nachlaessigkeit: hinterlegt ist auf dieser Maschine genau ein Anbieter-Schluessel (openrouter), und env gilt je HARNESS und nicht je Modell — ein {secret:...} an dieser Stelle wuerde jedem LOKALEN Spawn einen Cloud-Schluessel in die Umgebung legen. Wer Qwen Code an einen Cloud-Anbieter haengen will, legt einen zweiten Harness-Eintrag mit eigenem env an. Solange hier {baseUrl:ollama} steht, redet auch ein Modell, das einen anderen Provider traegt, mit Ollama — es sind deshalb nur ollama-Modelle registriert. EFFORT: keine Stufe. Weder --help noch das Bundle kennen ein Reasoning-Effort-Flag; die Stufe steckt beim lokalen Betrieb im Modell. FORTSETZEN: '-c' setzt die letzte Unterhaltung DIESES Verzeichnisses fort, gemessen an drei Starts hintereinander — mit einem Kennwort im ersten, danach ein Start ohne '-c' (leer) und einer mit '-c' (der erste Auftrag stand wieder da). Deshalb probe 'revive-only': beim ersten Spawn wird nichts angehaengt, sonst erbt jeder neue Worker die Unterhaltung seines Vorgaengers — genau der Fehler, den opencode hatte. AUTONOMIE: '--approval-mode yolo'; '--yolo'/'-y' tut dasselbe, laesst sich aber laut Bundle nicht mit --approval-mode zusammen benutzen. BROWSER=/usr/bin/true steht daneben wie bei aider, damit ein Erststart-Dialog kein Fenster aufreisst. /compress als compactCommand stammt aus dem Bundle (109 Fundstellen, Text 'compress chat history'), nicht aus einer eigenen Messung — mittlere Konfidenz, wie /compact bei codex.",
@@ -1707,7 +2080,110 @@
           "datum": "2026-09-29",
           "beleg": "nicht gemessen; qwen --help, qwen serve --help (0.24.6)."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.qwen/settings.json",
+          "format": "json-pfad",
+          "pfad": "mcpServers",
+          "form": "qwen",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/doku",
+          "beleg": "qwen settings.md/mcp.md: mcpServers.<n> command+args (stdio), qwen mcp add -t stdio; stdio-Bruecke statt httpUrl+Bearer $WB_HUB_TOKEN (ausserhalb wb-harness-run leer, 401)"
+        },
+        "hooks": {
+          "ziel": "~/.qwen/settings.json",
+          "format": "json-pfad",
+          "pfad": "hooks",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "qwen features/hooks.md:363-391: 22 Ereignisse in settings.json hooks",
+          "bruecke": {
+            "ereignisse": {
+              "PreToolUse": "PreToolUse",
+              "PostToolUse": "PostToolUse",
+              "UserPromptSubmit": "UserPromptSubmit",
+              "Stop": "Stop"
+            },
+            "eingabe": "gleich",
+            "werkzeuge": {
+              "run_shell_command": "Bash",
+              "write_file": "Write",
+              "edit": "Edit",
+              "replace": "Edit",
+              "notebook_edit": "NotebookEdit",
+              "read_file": "Read",
+              "read_many_files": "Read",
+              "grep_search": "Grep",
+              "glob": "Glob",
+              "skill": "Skill"
+            },
+            "antwort": {
+              "blockieren": {
+                "json": {
+                  "hookSpecificOutput": {
+                    "hookEventName": "{ereignis}",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "{grund}"
+                  }
+                }
+              },
+              "kontext": {
+                "json": {
+                  "hookSpecificOutput": {
+                    "hookEventName": "{ereignis}",
+                    "additionalContext": "{kontext}"
+                  }
+                }
+              }
+            },
+            "eintrag": {
+              "matcher": "*",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "{befehl}",
+                  "timeout": "{timeout}"
+                }
+              ]
+            },
+            "gemessen": "2026-10-14/probe",
+            "beleg": "Probe 14.10. 03:13: qwen im Test-HOME mit Stub-Modell (fixtures/hook-bruecke/probe-lauf.sh), Hooks schreiben stdin mit: PreToolUse/PostToolUse/UserPromptSubmit/Stop/SessionStart in Claude-Form (session_id, transcript_path, cwd, hook_event_name, tool_name=Laufzeit-ID run_shell_command, tool_input, tool_response); angebotene Werkzeuge edit, glob, grep_search, notebook_edit, read_file, run_shell_command, skill, write_file. Doku: features/hooks.md:71-96, 514-516, 551-563"
+          }
+        },
+        "prompts": {
+          "ziel": "~/.qwen/commands/",
+          "format": "markdown-dir",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "qwen features/commands.md:549 ~/.qwen/commands/*.md"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.qwen/extensions/",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "qwen extensions; ~/.qwen/extensions/"
+        },
+        "rechte": {
+          "weg": "registry-flag",
+          "grund": "--allowed-mcp-server-names per Flag in der Registry",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "qwen settings.md permissions.allow/deny/ask; Registry-Flag --approval-mode"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.qwen/skills",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "qwen features/skills.md:72,267 nur ~/.qwen/skills/"
+        },
+        "anweisungen": {
+          "weg": "datei",
+          "ziel": "~/.qwen/QWEN.md",
+          "gemessen": "2026-10-14/doku",
+          "beleg": "qwen settings.md:964 Kontextdatei ~/.qwen/QWEN.md (global); wb-instructions schreibt sie (systemPrompt.path)"
+        }
+      },
+      "skillRoots": [
+        "~/.qwen/skills"
+      ]
     },
     {
       "id": "gptme",
@@ -1777,28 +2253,6 @@
         "~/.config/gptme/AGENTS.md",
         "<project>/AGENTS.md"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "weg": "leer",
-          "grund": "zu messen (S0)"
-        },
-        "hooks": {
-          "weg": "leer",
-          "grund": "kein Hook-Mechanismus laut --help"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
-        },
-        "plugins": {
-          "weg": "leer",
-          "grund": "kein Plugin-Mechanismus bestaetigt"
-        },
-        "rechte": {
-          "weg": "registry-flag",
-          "grund": "Registry-Flag -t/--tools"
-        }
-      },
       "supportsPaste": true,
       "altScreen": false,
       "probe": "gemessen 2026-08-08 mit gptme 0.32.1 (uv tool install gptme) auf eigenem tmux-Socket, umgelenktem HOME, Modell local/qwen3:1.7b ueber Ollama. gptme ist KEINE Vollbild-TUI, sondern eine Zeilen-Oberflaeche: der Verlauf wird fortlaufend in den Bildschirm geschrieben, und die Eingabezeile ist die Zeile 'User:'. READY: das Muster '^User:' trifft die drei gemessenen Zustaende — LEER steht dort genau 'User:' ohne Platzhalter, GETIPPT 'User: auftrag: pruefe die tests', und WAEHREND DER ANTWORT bleibt eben diese Zeile als Teil des Verlaufs stehen, waehrend darunter 'Assistant:' und der Text erscheinen. ERSTSTART in 0,4-s-Schritten abgetastet: bis 0,4 s stehen nur die sieben Meldezeilen ('Using model: local/qwen3:1.7b', 'Using logdir: …', 'Using workspace: …'), ab 0,8 s die Zeile 'User:'. Das Muster trifft also nicht frueher als die Eingabebereitschaft. DIE STARTAUSWAHL, die den Eintrag praegt: ohne --name zeigt gptme zuerst eine Auswahlliste ('New conversation or load previous?' mit den Punkten 'New conversation' und 'Load more') und wartet darauf, dass jemand auswaehlt — ein Auftrag, der dort hineingetippt wird, ist verloren. Gemessen und dann in der Quelle bestaetigt: die Liste erscheint genau dann, wenn der Name 'random' ist, also nicht uebergeben wurde. Deshalb steht '--name {name}' fest in args, und deshalb ist das kein Beiwerk, sondern die Bedingung dafuer, dass dieser Harness ueberhaupt spawnbar ist. Eine VERTRAUENSFRAGE fuer ein neues Verzeichnis stellt gptme nicht, und einen Anmelde- oder Telemetriedialog auch nicht: im leeren HOME legt es wortlos seine config.toml an und zeigt die Eingabezeile. Ein trustStore-Block ist deshalb nicht noetig, und das ist gemessen und nicht ausgelassen. GRENZE DER ABSENDE-PRUEFUNG, die man kennen muss: weil der abgeschickte Auftrag als 'User: <text>' im Verlauf STEHEN BLEIBT, ist die letzte Treffer-Zeile waehrend der ganzen Antwort weiterhin eine Zeile mit Text. Die Pruefung in pi-worker meldet 'abgeschickt' deshalb erst, wenn die Antwort durch ist und eine frische, leere 'User:'-Zeile darunter steht. Dauert die Antwort laenger als die 45 s Frist, endet der Spawn im dritten Ausgang ('Submission NICHT verifiziert, der Pane arbeitet aber') — eine ehrliche Meldung, kein Fehlschlag, und es wird kein zweites Enter getippt. Falsch herum irren kann die Pruefung nicht: ein wirklich haengender Auftrag sieht genauso aus und wird nie als abgeschickt gemeldet.",
@@ -1825,7 +2279,57 @@
           "datum": "2026-09-29",
           "beleg": "nicht gemessen; gptme chats send --help, gptme/prompt_queue.py (0.34.0)."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.config/gptme/config.toml",
+          "format": "toml-marker",
+          "pfad": "mcp",
+          "form": "gptme",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/quelle",
+          "beleg": "gptme config/models.py MCPConfig.from_dict: [mcp] enabled (Vorgabe false), [[mcp.servers]] name/command/args; gptme.config.user.load_user_config (Python des uv-Tools, Test-HOME) liest den von wb-werkzeuge geschriebenen Block als MCPConfig(enabled=True, servers=[werkbank stdio]); kein Umgebungsverweis fuer headers, deshalb stdio-Bruecke"
+        },
+        "hooks": {
+          "weg": "toml-marker",
+          "ziel": "~/.config/gptme/config.toml",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "gptme plugins/__init__.py: Hooks nur als Python-Plugin, config.toml [plugins] paths/enabled"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-/Slash-Mechanismus laut --help",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "gptme plugins/__init__.py: commands/ = future"
+        },
+        "plugins": {
+          "weg": "toml-marker",
+          "ziel": "~/.config/gptme/config.toml",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "gptme plugins/__init__.py: Ordner-Plugins ueber config.toml [plugins]"
+        },
+        "rechte": {
+          "weg": "registry-flag",
+          "grund": "Registry-Flag -t/--tools",
+          "gemessen": "2026-10-13/help",
+          "beleg": "gptme -t/--tools"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.agents/skills",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "gptme lessons/index.py:104-167 liest ~/.agents/skills und ~/.claude/skills; lessons-Werkzeug im Start ungeprueft"
+        },
+        "anweisungen": {
+          "weg": "datei",
+          "ziel": "~/.config/gptme/AGENTS.md",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "~/.config/gptme/AGENTS.md generiert"
+        }
+      },
+      "skillRoots": [
+        "~/.agents/skills"
+      ]
     },
     {
       "id": "copilot",
@@ -1851,6 +2355,7 @@
       },
       "systemPrompt": {
         "style": "file",
+        "path": "~/.copilot/copilot-instructions.md",
         "projectPath": "AGENTS.md",
         "worker": "~/.claude/roles/agent.md",
         "orchestrator": "~/.claude/roles/orchestrator.md"
@@ -1898,30 +2403,6 @@
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "ziel": "~/.copilot/mcp-config.json",
-          "format": "json-pfad",
-          "pfad": "mcpServers",
-          "form": "copilot"
-        },
-        "hooks": {
-          "weg": "leer",
-          "grund": "kein Hook-Mechanismus laut --help"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
-        },
-        "plugins": {
-          "weg": "nur-pruefen",
-          "ziel": "~/.copilot/installed-plugins/"
-        },
-        "rechte": {
-          "weg": "registry-flag",
-          "grund": "Registry-Flag --allow-all-tools; ~/.copilot/config.json ist ungueltiges JSON: nicht anfassen, melden"
-        }
-      },
       "supportsPaste": true,
       "altScreen": true,
       "probe": "gemessen 2026-08-08 mit GitHub Copilot CLI 1.0.78 (npm i -g @github/copilot) auf eigenem tmux-Socket, umgelenktem HOME, Modell qwen3:1.7b ueber Ollama. OHNE GITHUB-ABO, und das ist der Kern dieses Eintrags: die CLI kann einen EIGENEN Modell-Anbieter fahren (COPILOT_PROVIDER_BASE_URL, in ihrer eigenen Hilfe ausdruecklich mit Ollama als Beispiel), und dann faellt die GitHub-Anmeldung weg — 'GitHub authentication is not required', und mit COPILOT_OFFLINE=true unterbleibt jeder Netzzugriff. Gemessen wurde genau so: kein Anmeldebildschirm, keine Geraetecode-Aufforderung, kein Browser, sondern die Eingabezeile. Ein Abo wurde weder benutzt noch geprueft (Naeheres in notes). READY: die Eingabebox wird mit einem schweren senkrechten Strich am Zeilenanfang gezeichnet, deshalb readyPattern '^┃'. Gemessen wurden die drei Zustaende: LEER steht dort '┃' allein, GETIPPT '┃ wie lautet das Kennwort dieses Arbeitsverzeichnisses? …', und WAEHREND DER ANTWORT ist die Box wieder leer ('┃'), waehrend die Fusszeile auf ' ● Working esc interrupt' wechselt. Das Muster trifft alle drei. WARUM NICHT DIE FUSSZEILE: sie wechselt mit dem Zustand ('/ commands · ? help · tab next tab' im Ruhezustand, '@ files · # issues' beim Tippen, '● Working esc interrupt' waehrend der Antwort) — ein Muster darauf traefe je nach Zustand oder nicht. ERSTSTART in 0,4-s-Schritten abgetastet: bis 1,6 s Banner und Meldungen, ab 2,0 s die Eingabebox. Das Muster trifft also nicht frueher als die Eingabebereitschaft, und es trifft vor allem KEINEN der beiden Erststart-Dialoge (nachgemessen an den aufgezeichneten Bildschirmen: '┃' am Zeilenanfang kommt dort nicht vor, die Dialoge sind mit leichten Rahmenzeichen gezeichnet). ZWEI DIALOGE haelt der Erststart bereit, und beide muessen VORHER beantwortet sein, sonst tippt ein Spawn seinen Auftrag in eine Ja-Nein-Frage. Erstens die VERTRAUENSFRAGE ('Do you trust the files in this folder?' mit den Punkten Yes / Yes, and remember this folder for future sessions / No) — sie faellt in jedem neuen Verzeichnis an, also bei jedem Worker, und wird ueber trustStore beantwortet (siehe dort). Zweitens die TERMINAL-EINRICHTUNG ('Set up terminal for multi-line input support … Would you like to add this key binding to your terminal configuration?'), die eine Tastenbelegung in die VS-Code-Konfiguration schreiben will. Sie liess sich NICHT durch Leeren von TERM_PROGRAM und VSCODE_GIT_IPC_HANDLE abstellen (gemessen: der Dialog kam trotzdem, die CLI erkennt VS Code notfalls an der Prozess-Ahnenreihe). Abgestellt wird sie durch COPILOT_SETUP_TERMINAL=false, gemessen an zwei Laeufen: mit gesetztem Vertrauen erschien danach unmittelbar die Eingabezeile, ohne Vertrauen genau ein Dialog statt zweier.",
@@ -1947,7 +2428,154 @@
           "datum": "2026-09-29",
           "beleg": "nicht gemessen; copilot --help, copilot help config (1.0.89)."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.copilot/mcp-config.json",
+          "format": "json-pfad",
+          "pfad": "mcpServers",
+          "form": "copilot",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/probe",
+          "beleg": "copilot mcp add werkbank -- wb-hub stdio --harness copilot im Test-HOME schreibt ~/.copilot/mcp-config.json mcpServers.werkbank {type:local,command,args,tools:[*]}; copilot mcp get liest den von wb-werkzeuge geschriebenen Eintrag (Type local, Status Enabled)"
+        },
+        "hooks": {
+          "weg": "json-pfad",
+          "ziel": "~/.copilot/settings.json",
+          "pfad": "hooks",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "copilot help config: hooks in settings.json; Paket-changelog preToolUse/postToolUse",
+          "bruecke": {
+            "ereignisse": {
+              "PreToolUse": "PreToolUse",
+              "PostToolUse": "PostToolUse",
+              "UserPromptSubmit": "UserPromptSubmit",
+              "Stop": "Stop"
+            },
+            "eingabe": "gleich",
+            "werkzeuge": {
+              "Bash": "Bash",
+              "Write": {
+                "name": "Write",
+                "argumente": {
+                  "path": "file_path",
+                  "file_text": "content",
+                  "old_str": "old_string",
+                  "new_str": "new_string"
+                }
+              },
+              "Edit": {
+                "name": "Edit",
+                "argumente": {
+                  "path": "file_path",
+                  "file_text": "content",
+                  "old_str": "old_string",
+                  "new_str": "new_string"
+                }
+              },
+              "Read": {
+                "name": "Read",
+                "argumente": {
+                  "path": "file_path",
+                  "file_text": "content",
+                  "old_str": "old_string",
+                  "new_str": "new_string"
+                }
+              },
+              "bash": "Bash",
+              "create": {
+                "name": "Write",
+                "argumente": {
+                  "path": "file_path",
+                  "file_text": "content",
+                  "old_str": "old_string",
+                  "new_str": "new_string"
+                }
+              },
+              "edit": {
+                "name": "Edit",
+                "argumente": {
+                  "path": "file_path",
+                  "file_text": "content",
+                  "old_str": "old_string",
+                  "new_str": "new_string"
+                }
+              },
+              "view": {
+                "name": "Read",
+                "argumente": {
+                  "path": "file_path",
+                  "file_text": "content",
+                  "old_str": "old_string",
+                  "new_str": "new_string"
+                }
+              },
+              "grep": "Grep",
+              "glob": "Glob",
+              "skill": "Skill"
+            },
+            "antwort": {
+              "blockieren": {
+                "json": {
+                  "hookSpecificOutput": {
+                    "hookEventName": "{ereignis}",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "{grund}"
+                  }
+                }
+              },
+              "kontext": {
+                "json": {
+                  "hookSpecificOutput": {
+                    "hookEventName": "{ereignis}",
+                    "additionalContext": "{kontext}"
+                  }
+                }
+              }
+            },
+            "eintrag": {
+              "type": "command",
+              "bash": "{befehl}",
+              "timeoutSec": "{timeout}"
+            },
+            "gemessen": "2026-10-14/probe",
+            "beleg": "Probe 14.10. 03:16: copilot -p im Test-HOME mit BYOK-Stub (copilot help providers: COPILOT_PROVIDER_BASE_URL, keine GitHub-Anmeldung). settings.json hooks mit Claude-Namen (PreToolUse, PostToolUse, UserPromptSubmit, Stop) feuern mit Claude-Nutzlast (hook_event_name, session_id, cwd, tool_name Bash, tool_input Objekt, transcript_path bei Stop); die camelCase-Namen (preToolUse ...) feuern daneben mit {sessionId, toolName bash, toolArgs als Objekt}. Eintrag {type, bash, timeoutSec}. Argumentnamen von create/edit unter Claude-Namen: siehe e2e-Probe"
+          }
+        },
+        "prompts": {
+          "weg": "plugin-werkbank",
+          "ziel": "~/.copilot/installed-plugins/",
+          "gemessen": "2026-10-13/doku",
+          "beleg": "Paket-changelog 1.0.96: Plugin-Verzeichnis commands/; Laden eines Claude-Plugins ungemessen"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.copilot/installed-plugins/",
+          "gemessen": "2026-10-13/help",
+          "beleg": "copilot plugin --help: Plugins buendeln Skills, Agents, Hooks, MCP"
+        },
+        "rechte": {
+          "weg": "registry-flag",
+          "grund": "Registry-Flag --allow-all-tools; ~/.copilot/config.json ist JSONC (Registry jsonc:true), kein Defekt, nicht anfassen",
+          "gemessen": "2026-10-13/help",
+          "beleg": "copilot --allow-all; config.json JSONC"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.agents/skills",
+          "gemessen": "2026-10-13/probe",
+          "beleg": "copilot skill --help: ~/.copilot/skills/ oder ~/.agents/skills/; skill list im Test-HOME"
+        },
+        "anweisungen": {
+          "weg": "datei",
+          "ziel": "~/.copilot/copilot-instructions.md",
+          "gemessen": "2026-10-13/probe",
+          "beleg": "copilot instruction list im Test-HOME liest ~/.copilot/copilot-instructions.md; wb-instructions schreibt sie (systemPrompt.path)"
+        }
+      },
+      "skillRoots": [
+        "~/.agents/skills"
+      ]
     },
     {
       "id": "copilot-cloud",
@@ -1968,6 +2596,7 @@
       },
       "systemPrompt": {
         "style": "file",
+        "path": "~/.copilot/copilot-instructions.md",
         "projectPath": "AGENTS.md",
         "worker": "~/.claude/roles/agent.md",
         "orchestrator": "~/.claude/roles/orchestrator.md"
@@ -2016,28 +2645,6 @@
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "weg": "leer",
-          "grund": "Cloud-Harness ohne lokale Werkzeugkonfiguration"
-        },
-        "hooks": {
-          "weg": "leer",
-          "grund": "Cloud-Harness ohne lokale Werkzeugkonfiguration"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "Cloud-Harness ohne lokale Werkzeugkonfiguration"
-        },
-        "plugins": {
-          "weg": "leer",
-          "grund": "Cloud-Harness ohne lokale Werkzeugkonfiguration"
-        },
-        "rechte": {
-          "weg": "leer",
-          "grund": "Cloud-Harness ohne lokale Werkzeugkonfiguration"
-        }
-      },
       "supportsPaste": true,
       "altScreen": true,
       "probe": "gemessen 2026-08-10 mit GitHub Copilot CLI 1.0.78, ZWEITER Harness-Eintrag fuer dieselbe Binary: 'copilot' loggt seit heute per 'copilot login' als <your-github-user> ein (Geraetecode-Anmeldung, vom Auftraggeber selbst durchgefuehrt und mit einem echten 'copilot -p' verifiziert), waehrend der bestehende Eintrag 'copilot' denselben Befehl weiterhin ausschliesslich gegen einen eigenen Ollama-Anbieter faehrt (COPILOT_PROVIDER_*, COPILOT_OFFLINE=true). env gehoert dem Harness, nicht dem Modell — dieser Eintrag setzt deshalb GENAU DAS NICHT: keine COPILOT_PROVIDER_*-Variablen, kein COPILOT_OFFLINE, damit greift die eingebaute GitHub-Anmeldung. GEMESSEN, NICHT NEU: readyPattern/promptPattern sind dieselbe Eingabebox wie beim lokalen Eintrag ('^┃') — heute am echten HOME, eigenem tmux-Socket (wbcopilotcloud-*) und einem Wegwerf-Arbeitsverzeichnis erneut in LEER ('┃' allein) und GETIPPT ('┃ schreibe das Wort BEREIT und sonst nichts') bestaetigt, OHNE abzusenden: nach dem Tippen wurde der Text zeichenweise wieder geloescht und mit '/exit' beendet, nie ein Enter auf den Auftragstext. Beleg fuer 'kein Cloud-Zug dabei': ~/.copilot/session-store.db (assistant_usage_events) trug vorher wie nachher exakt 4 Zeilen, alle mit Zeitstempel 14:19-14:20 UTC aus dem Verifikationslauf des Auftraggebers — keine neue Zeile durch diese Messung. WAEHREND DER ANTWORT wurde NICHT erneut gemessen (dafuer waere ein echter, bezahlter Zug noetig gewesen); uebernommen vom lokalen Eintrag, weil es dieselbe Box/dasselbe Terminal-Rendering ist. VERTRAUENSFRAGE: exakt derselbe Dialog wie lokal ('Confirm folder trust' / '❯ 1. Yes'), heute am frischen Wegwerfverzeichnis erneut ausgeloest und mit Option 1 (sitzungsweise, NICHT 'remember') bestaetigt — die echte trustedFolders-Liste in ~/.copilot/config.json wurde dadurch nicht dauerhaft veraendert, trustStore-Feld unveraendert vom lokalen Eintrag uebernommen, weil derselbe Mechanismus/dieselbe Datei gilt.",
@@ -2059,7 +2666,47 @@
           "datum": "2026-09-29",
           "beleg": "nicht gemessen; wie copilot."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "wie": "copilot",
+          "gemessen": "2026-10-14/quelle",
+          "beleg": "command: copilot, gleiches ~/.copilot (Registry): derselbe Eintrag werkbank in mcp-config.json wie bei copilot; Sitzungsprobe offen"
+        },
+        "hooks": {
+          "wie": "copilot",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "command: copilot, gleiches ~/.copilot (Registry); Sitzungsprobe offen"
+        },
+        "prompts": {
+          "wie": "copilot",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "command: copilot, gleiches ~/.copilot (Registry); Sitzungsprobe offen"
+        },
+        "plugins": {
+          "wie": "copilot",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "command: copilot, gleiches ~/.copilot (Registry); Sitzungsprobe offen"
+        },
+        "rechte": {
+          "wie": "copilot",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "command: copilot, gleiches ~/.copilot (Registry); Sitzungsprobe offen"
+        },
+        "skills": {
+          "wie": "copilot",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "command: copilot, gleiches ~/.copilot (Registry); Sitzungsprobe offen"
+        },
+        "anweisungen": {
+          "wie": "copilot",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "command: copilot, gleiches ~/.copilot (Registry); Sitzungsprobe offen"
+        }
+      },
+      "skillRoots": [
+        "~/.agents/skills"
+      ]
     },
     {
       "id": "nanocoder",
@@ -2138,23 +2785,46 @@
           "ziel": "~/.config/nanocoder/.mcp.json",
           "format": "json-pfad",
           "pfad": "mcpServers",
-          "form": "nanocoder"
+          "form": "nanocoder",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/quelle",
+          "beleg": "nanocoder config/mcp-config-loader.js: transport stdio|websocket|http, command, args; NANOCODER_CONFIG_DIR vom Startweg gesetzt; stdio-Bruecke statt http+Bearer $WB_HUB_TOKEN (ausserhalb wb-harness-run leer, 401)"
         },
         "hooks": {
           "weg": "leer",
-          "grund": "kein Hook-Mechanismus laut --help"
+          "grund": "kein Hook-Mechanismus laut --help",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "nanocoder dist: kein PreToolUse/hooks.json; dist/events nur file.changed/cron"
         },
         "prompts": {
-          "weg": "leer",
-          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
+          "weg": "markdown-dir",
+          "ziel": "~/.config/nanocoder/commands/",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "nanocoder custom-commands/loader.js:26 <config>/commands/*.md"
         },
         "plugins": {
           "weg": "leer",
-          "grund": "kein Plugin-Mechanismus laut --help"
+          "grund": "kein Plugin-Mechanismus laut --help",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "nanocoder dist: kein Plugin-System"
         },
         "rechte": {
           "weg": "nur-pruefen",
-          "grund": "trustStore nur pruefen"
+          "grund": "trustStore nur pruefen",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "nanocoder config/index.js:261 alwaysAllow"
+        },
+        "skills": {
+          "weg": "leer",
+          "grund": "noch nicht gemessen (P4/P5)",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "nanocoder dist: kein SKILL.md, eigene Buendel (commands/agents/tools)"
+        },
+        "anweisungen": {
+          "weg": "leer",
+          "grund": "kein globaler Anweisungspfad: nanocoder liest nur AGENTS.md im Arbeitsverzeichnis",
+          "gemessen": "2026-10-14/quelle",
+          "beleg": "nanocoder dist/utils/prompt-builder.js:97 join(process.cwd(), AGENTS.md); Rolle per Rollen-Generator in wb-harness-run"
         }
       },
       "supportsPaste": true,
@@ -2272,28 +2942,6 @@
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "weg": "leer",
-          "grund": "zu messen (S0)"
-        },
-        "hooks": {
-          "weg": "hooks-dir",
-          "ziel": "~/.cline/hooks/"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
-        },
-        "plugins": {
-          "weg": "nur-pruefen",
-          "ziel": "~/.cline/plugins/"
-        },
-        "rechte": {
-          "weg": "leer",
-          "grund": "keine Rechte-Konfiguration laut --help"
-        }
-      },
       "supportsPaste": true,
       "altScreen": true,
       "probe": "gemessen 2026-08-08 mit Cline CLI 0.0.13 (npm i -g @cline/cli) auf eigenem tmux-Socket mit PID im Namen, umgelenktem HOME, Modelle ornith:9b und qwen3:1.7b ueber Ollama. DER BEFEHL HEISST NICHT 'cline': das Paket @cline/cli liefert genau EIN Programm, und das heisst 'clite' (package.json, Feld bin). Wer 'cline' eintraegt, bekommt 'command not found'. OHNE GITHUB- ODER CLINE-KONTO, und das ist der Kern dieses Eintrags: die CLI kann einen eigenen OpenAI-kompatiblen Anbieter fahren, und dann faellt jede Anmeldung weg. Eingerichtet wird er EINMAL ueber 'clite auth openai -b <url>/v1 -m <modell> -k <platzhalter>'; der Anbieter heisst danach 'openai-native' (die Ausgabe sagt es selbst: 'Provider configured: openai-native'). Die Basis-URL laesst sich NUR so setzen — 'clite auth ollama -b …' lehnt ab mit 'base URL is only supported for OpenAI and OpenAI-compatible providers', der eingebaute ollama-Anbieter nimmt also keine. Deshalb liegt die Bruecke von der Registry zur CLI in einer Datei: shell/cline-providers.default.json gehoert nach ~/.cline-wb/settings/providers.json, also in den Ordner, den '--data-dir {sessionDir}' bestellt (WARUM nicht der voreingestellte Ort: siehe notes, das ist gemessen). Das MODELL steht darin auch, wird aber je Start von -m ueberschrieben — nachgemessen mit zwei Startzeilen: mit '-m qwen3:1.7b' nannte die Fusszeile 'qwen3:1.7b (0) $0.0000', mit '-m ornith:9b' entsprechend. READY: die Eingabezeile beginnt mit einem Groesser-Zeichen, deshalb readyPattern '^[[:space:]]*>[[:space:]]'. Fuehrende Leerzeichen sind Pflicht im Muster und kein Schoenheitsfehler: die Oberflaeche zeichnet den Startbildschirm ZENTRIERT (gemessen: die Eingabezeile begann in einem 200 Spalten breiten Pane bei Spalte 69) und rueckt erst nach dem ersten Auftrag nach links (dann Spalte 2). Ein Muster mit '^>' traefe keinen der beiden Zustaende. Die drei Zustaende, alle gemessen: LEER steht dort '> What can I do for you?' — ein PLATZHALTER, kein Text; GETIPPT '> wie lautet das Kennwort dieses Arbeitsverzeichnisses? antwor' und die Fortsetzung bricht OHNE Groesser-Zeichen in die naechste Zeile um; WAEHREND DER ANTWORT ist die Box wieder leer und zeigt einen ANDEREN Platzhalter, '> Ask anything...'. DASS DER PLATZHALTER WECHSELT, ist die Falle dieses Harness und derselbe Fehler wie bei codex. Es sind genau drei, aus dem Programm selbst gelesen und nicht geraten: 'What can I do for you?' auf dem Startbildschirm, 'Ask anything...' im laufenden Gespraech, 'Plan something...' im Plan-Modus. Alle drei stehen in promptIgnore. Ohne sie haelt die Absende-Pruefung von pi-worker die leere Box fuer haengenden Text und tippt Enter nach. WARUM promptPattern OHNE das Leerzeichen am Ende steht: die Pruefung haengt '[[:space:]]+[^[:space:]]' an das Muster. Endete das Muster selbst auf einem Leerzeichen, verlangte sie ein ZWEITES und traefe nie — das ist der Fehler, an dem goose gescheitert ist. EINEN VERTRAUENSDIALOG stellt die CLI nicht, und einen Anmeldedialog auch nicht, solange der eigene Anbieter eingerichtet ist: im frischen HOME kam sie unmittelbar mit der Oberflaeche hoch. Ein trustStore-Block ist deshalb nicht noetig, und das ist gemessen.",
@@ -2331,7 +2979,119 @@
           "datum": "2026-09-29",
           "beleg": "nicht gemessen; cline --help, README (3.0.65)."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.cline-wb/settings/cline_mcp_settings.json",
+          "format": "json-pfad",
+          "pfad": "mcpServers",
+          "form": "cline",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/probe",
+          "beleg": "@cline/core resolveMcpServerRegistrations (node, Test-HOME) liest mcpServers.werkbank {type:stdio,command,args,disabled:false}; Pfad <CLINE_DATA_DIR>/settings/cline_mcp_settings.json (shared/dist/db), Datenordner ~/.cline-wb aus dem Werkbank-Start"
+        },
+        "hooks": {
+          "weg": "hooks-dir",
+          "ziel": "~/.cline/hooks/",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "clite-Binary: zehn Ereignisse, Verzeichnisse <config>/hooks, --hooks-dir; Patch-Werkzeug: clite-Binary: apply_patch, Argument input bzw. patch (strings 14.10., nicht eindeutig: die Bruecke nimmt das erste vorhandene, sonst jeden Text mit Patch-Kopf)",
+          "bruecke": {
+            "ereignisse": {
+              "PreToolUse": "PreToolUse",
+              "PostToolUse": "PostToolUse",
+              "UserPromptSubmit": "UserPromptSubmit"
+            },
+            "eingabe": {
+              "tool_name": [
+                "tool_call.name",
+                "tool_result.name"
+              ],
+              "tool_input": [
+                "tool_call.input",
+                "tool_result.input"
+              ],
+              "tool_response": "tool_result.output",
+              "prompt": "userPromptSubmit.prompt",
+              "session_id": "taskId",
+              "cwd": "workspaceRoots.0"
+            },
+            "werkzeuge": {
+              "run_commands": {
+                "name": "Bash",
+                "verketten": {
+                  "commands": "command"
+                }
+              },
+              "read_files": "Read",
+              "apply_patch": {
+                "name": "Edit",
+                "patch": [
+                  "input",
+                  "patch"
+                ]
+              },
+              "search_codebase": "Grep",
+              "skills": "Skill"
+            },
+            "antwort": {
+              "blockieren": {
+                "json": {
+                  "cancel": true,
+                  "errorMessage": "{grund}"
+                }
+              },
+              "kontext": {
+                "json": {
+                  "cancel": false,
+                  "contextModification": "{kontext}"
+                }
+              },
+              "erlauben": {
+                "json": {
+                  "cancel": false
+                }
+              }
+            },
+            "datei": "#!/bin/bash\n# Werkbank-Hook-Bruecke (geschrieben von wb-werkzeuge apply, Quelle: werkzeuge.default.json)\nexec {befehl}\n",
+            "dateiname": "{ereignis_nativ}",
+            "gemessen": "2026-10-14/probe",
+            "beleg": "Probe 14.10. 03:27: clite (Cline CLI) im Test-HOME, Stub-Modell ueber die Responses-API, Hook-Dateien ~/.cline/hooks/<Ereignis>: PreToolUse {taskId, workspaceRoots, hookName tool_call, tool_call {id, name, input (Objekt)}, preToolUse {toolName, parameters (Werte als JSON-Text)}}, PostToolUse {hookName tool_result, tool_result {name, input, output}}, TaskStart (hookName agent_start); UserPromptSubmit feuerte bei einem Aufruf mit Prompt-Argument nicht; Werkzeuge run_commands {commands: [..]}, read_files, apply_patch, search_codebase, skills, fetch_web_content, ask_question, spawn_agent, team_*. Antwortform: siehe e2e"
+          }
+        },
+        "prompts": {
+          "weg": "markdown-dir",
+          "ziel": "~/Documents/Cline/Workflows/",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "clite-Binary: Workflows .clinerules/workflows, Documents/Cline/Workflows"
+        },
+        "plugins": {
+          "weg": "nur-pruefen",
+          "ziel": "~/.cline/plugins/",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "clite-Binary: .cline/plugins, ~/.cline/plugins (.js/.ts)"
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "keine Rechte-Konfiguration laut --help",
+          "gemessen": "2026-10-13/help",
+          "beleg": "clite --help ohne Rechte-Konfiguration"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.agents/skills",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "clite-Binary: global <config>/skills und ~/.agents/skills (Herleitung)"
+        },
+        "anweisungen": {
+          "weg": "leer",
+          "grund": "globaler Regelordner ~/.cline/rules im Binary genannt, Lesen und Dateiform nicht per Probe belegt (clite config braucht ein TTY, kein Modellzug erlaubt); Text kommt nur ueber AGENTS.md im Arbeitsverzeichnis",
+          "gemessen": "2026-10-14/herleitung",
+          "beleg": "clite-Binary kennt ~/.cline/rules und Documents/Cline/Rules (Gruppe B 13.10.); ein Router dort stuende ungelesen und der Rollenblock liesse den Volltext weg"
+        }
+      },
+      "skillRoots": [
+        "~/.agents/skills"
+      ]
     },
     {
       "id": "openhands",
@@ -2356,6 +3116,7 @@
       },
       "systemPrompt": {
         "style": "file",
+        "path": "~/.openhands/skills/werkbank-anweisungen.md",
         "projectPath": "AGENTS.md",
         "worker": "~/.claude/roles/agent.md",
         "orchestrator": "~/.claude/roles/orchestrator.md"
@@ -2399,28 +3160,6 @@
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "weg": "leer",
-          "grund": "mcp-Befehl vorhanden, Konfigurationsformat zu messen (S0); bis dahin leer"
-        },
-        "hooks": {
-          "weg": "leer",
-          "grund": "kein Hook-Mechanismus laut --help"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
-        },
-        "plugins": {
-          "weg": "leer",
-          "grund": "kein Plugin-Mechanismus laut --help"
-        },
-        "rechte": {
-          "weg": "leer",
-          "grund": "keine Rechte-Konfiguration laut --help"
-        }
-      },
       "supportsPaste": true,
       "altScreen": true,
       "probe": "gemessen 2026-08-08 mit OpenHands CLI v1.16.0 / SDK v1.21.0 auf eigenem tmux-Socket mit PID im Namen, umgelenktem HOME, Modell ornith:9b ueber Ollama. OHNE DOCKER, und das war die Frage: die Oberflaeche startet und arbeitet ohne jeden Container — Docker braucht nur der Unterbefehl 'serve' (die grafische Oberflaeche im Browser), und der wird hier nicht benutzt. Auf dieser Maschine ist Docker nicht einmal installiert ('docker' nicht gefunden), und die CLI kam trotzdem hoch, beantwortete einen Auftrag und meldete '▶ Loaded: 7 tools, system prompt'. DAS PAKET HEISST 'openhands', NICHT 'openhands-ai': 'uv tool install openhands-ai' laeuft durch und bricht am Ende ab mit 'No executables are provided by package openhands-ai; removing tool'. 'uv tool install openhands' liefert die beiden Programme 'openhands' und 'openhands-acp'. ZWEI FLAGS ENTSCHEIDEN ueber den Erststart, und beide muessen dran sein. Ohne '--override-with-envs' ignoriert die CLI die LLM_-Variablen und oeffnet einen EINRICHTUNGS-DIALOG ueber dem Bildschirm ('LLM Model:' mit einer Auswahlliste, 'API Key:' mit einem Eingabefeld, darunter 'Save / Cancel') — gemessen, und ein Spawn bliebe darin stehen. MIT dem Flag meldet sie 'All set up!' und 'Initialized conversation <id>' und zeigt die Eingabezeile. '--always-approve' ist die Autonomie. READY: NICHT die Eingabebox, sondern die unterste Tastenzeile. Der Grund ist gemessen: der Einrichtungs-Dialog liegt als Fenster UEBER dem normalen Bildschirm, und die Eingabebox samt ihrem Rahmen ist daneben weiterhin sichtbar — ein Muster auf die Box traefe also mitten im Dialog und der Auftrag verschwaende in einem Eingabefeld fuer einen Schluessel. Genau der Fehler, an dem agy gescheitert ist. Die Tastenzeile dagegen WECHSELT mit dem Zustand: im Dialog steht dort '^c Exit  esc Cancel', im normalen Betrieb '^a Select all  ^x Open external editor  ^l Toggle single/multi-line input …'. Deshalb readyPattern '\\^a Select all'. Nachgemessen an allen aufgezeichneten Bildschirmen: die Zeile steht im LEEREN, im GETIPPTEN und im ARBEITENDEN Zustand da und im Dialog nicht. Die drei Zustaende der Eingabebox selbst, ebenfalls gemessen: LEER '│ Type your message, @mention a file, or / for commands' — ein Platzhalter; GETIPPT '│ wie lautet das Kennwort dieses Arbeitsverzeichnisses? antworte nur mit dem Wort.'; WAEHREND DER ANTWORT wieder der Platzhalter, und darueber eine Zeile '⠧ Working (4s • ESC: pause)'. promptPattern '^[[:space:]]*│' trifft nur die Textzeile der Box (Ober- und Unterkante sind mit '╭' und '╰' gezeichnet, nicht mit '│'), und die Pruefung von pi-worker erkennt den getippten Text damit richtig als 'haengt noch'. promptIgnore faengt den Platzhalter. EINEN VERTRAUENSDIALOG stellt die CLI nicht, und einen Anmeldedialog auch nicht (die Anmeldung 'openhands login' gilt der Cloud und wird hier nicht benutzt) — im frischen HOME kam nach den beiden Flags unmittelbar die Oberflaeche. Ein trustStore-Block ist deshalb nicht noetig, und das ist gemessen. FORTSETZEN GEMESSEN 2026-09-05 (Auftrag fortsetzen): echter pi-worker-Spawn (openhands-ornith-9b, Auftrag 'Merke dir das Merkwort ZIRBELKIEFER') auf eigenem tmux-Socket wbtest-fortsetzen-<pid> mit umgelenktem HOME (auch in der tmux-Serverumgebung, siehe notes), Antwort 'Gemerkt: ZIRBELKIEFER', Sitzung 49b6aa9c… unter <HOME>/.openhands/conversations/. Dann ZWEI Neustarts ueber den echten Revive-Weg (wb-harness-run --resume-args '--resume --last', Startzeile 'openhands --resume --last --always-approve --override-with-envs'): (1) nach sauberem /exit und (2) nach kill -9 des Python-Prozesses. Beide Male 'Initialized conversation 49b6aa9c…' (dieselbe Kennung, keine neue), und die Frage 'Welches Merkwort habe ich dir genannt?' bzw. 'Nenne mir nochmals das Merkwort' wurde mit genau 'ZIRBELKIEFER' beantwortet; ctx sprang nach der ersten Antwort auf 17.7K (Verlauf geladen). Ohne die Flags legte derselbe Weg eine neue Unterhaltung an (7357559a…), also traegt das Flag und nicht der Zufall.",
@@ -2447,7 +3186,127 @@
           "datum": "2026-09-29",
           "beleg": "nicht gemessen; openhands/sdk/hooks/conversation_hooks.py (SDK 1.21.0)."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.openhands/mcp.json",
+          "format": "json-pfad",
+          "pfad": "mcpServers",
+          "form": "openhands",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/probe",
+          "beleg": "openhands mcp add werkbank --transport stdio wb-hub -- stdio --harness openhands im Test-HOME schreibt ~/.openhands/mcp.json mcpServers.werkbank {command,args,env,transport:stdio,enabled}; openhands mcp list/get liest den von wb-werkzeuge geschriebenen Minimaleintrag (Transport stdio, enabled); openhands_cli/locations.py:37"
+        },
+        "hooks": {
+          "weg": "json-pfad",
+          "ziel": "~/.openhands/hooks.json",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "openhands_cli/setup.py:141, sdk/hooks/config.py:27-36: sechs snake_case-Ereignisse; Patch-Werkzeug: openhands/tools/apply_patch/definition.py: Argument patch (required), Format *** Begin Patch / Add|Update|Delete File / Move to (core.py)",
+          "bruecke": {
+            "ereignisse": {
+              "PreToolUse": "pre_tool_use",
+              "PostToolUse": "post_tool_use",
+              "UserPromptSubmit": "user_prompt_submit",
+              "Stop": "stop"
+            },
+            "eingabe": {
+              "tool_name": "tool_name",
+              "tool_input": "tool_input",
+              "tool_response": "tool_response",
+              "prompt": "message",
+              "session_id": "session_id",
+              "cwd": "working_dir"
+            },
+            "werkzeuge": {
+              "terminal": {
+                "name": "Bash"
+              },
+              "file_editor": {
+                "name": "Edit",
+                "argumente": {
+                  "path": "file_path",
+                  "file_text": "content",
+                  "old_str": "old_string",
+                  "new_str": "new_string"
+                },
+                "nach_feld": "command",
+                "namen": {
+                  "create": "Write",
+                  "view": "Read"
+                }
+              },
+              "apply_patch": {
+                "name": "Edit",
+                "patch": [
+                  "patch"
+                ]
+              },
+              "glob": "Glob",
+              "grep": "Grep",
+              "invoke_skill": "Skill"
+            },
+            "antwort": {
+              "blockieren": {
+                "json": {
+                  "decision": "deny",
+                  "reason": "{grund}"
+                }
+              },
+              "UserPromptSubmit": {
+                "kontext": {
+                  "json": {
+                    "additionalContext": "{kontext}"
+                  }
+                }
+              }
+            },
+            "eintrag": {
+              "matcher": "*",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "{befehl}",
+                  "timeout": "{timeout}"
+                }
+              ]
+            },
+            "gemessen": "2026-10-14/probe",
+            "beleg": "Probe 14.10. 03:22: openhands --headless im Test-HOME mit Stub-Modell, ~/.openhands/hooks.json: pre_tool_use/post_tool_use/user_prompt_submit/stop/session_start feuern mit {event_type, tool_name terminal, tool_input (action.model_dump: command, is_input, timeout, reset, kind), tool_response, message, session_id, working_dir, metadata}; angebotene Werkzeuge terminal, file_editor, task_tracker, task, finish, think, invoke_skill. Antwort: executor.py:235-270 (Exit 2 oder decision deny blockiert, additionalContext nur bei user_prompt_submit), openhands-sdk 1.21.0"
+          },
+          "pfad": ""
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "kein Prompt-/Slash-Mechanismus laut --help",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "openhands_sdk skills/__init__.py: kein Befehlsordner"
+        },
+        "plugins": {
+          "weg": "leer",
+          "grund": "kein Plugin-Mechanismus laut --help"
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "keine Rechte-Konfiguration laut --help",
+          "gemessen": "2026-10-13/help",
+          "beleg": "openhands --help ohne Rechte-Konfiguration"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.openhands/skills",
+          "gemessen": "2026-10-13/quelle",
+          "beleg": "openhands_sdk skills/__init__.py:9-10 ~/.openhands/skills"
+        },
+        "anweisungen": {
+          "weg": "datei",
+          "ziel": "~/.openhands/skills/werkbank-anweisungen.md",
+          "gemessen": "2026-10-14/probe",
+          "beleg": "openhands.sdk.skills.load_user_skills im Test-HOME: ~/.openhands/skills/*.md ohne triggers wird immer geladen (trigger None); openhands_cli agent_store.py:418 load_user_skills=True"
+        }
+      },
+      "skillRoots": [
+        "~/.openhands/skills"
+      ]
     },
     {
       "id": "forge",
@@ -2519,28 +3378,6 @@
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
-      "toolAdapter": {
-        "mcp": {
-          "weg": "leer",
-          "grund": "mcp-Befehl vorhanden, Konfigurationsformat zu messen (S0); bis dahin leer"
-        },
-        "hooks": {
-          "weg": "leer",
-          "grund": "kein Hook-Mechanismus laut --help"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "kein Prompt-/Slash-Mechanismus laut --help"
-        },
-        "plugins": {
-          "weg": "leer",
-          "grund": "nur zsh-Plugin, kein Harness-Plugin"
-        },
-        "rechte": {
-          "weg": "leer",
-          "grund": "keine Rechte-Konfiguration laut --help"
-        }
-      },
       "supportsPaste": true,
       "altScreen": false,
       "probe": "gemessen 2026-08-09 mit Forge CLI 2.13.21 (npm i -g @antinomyhq/forge, Befehl 'forge' — das npm-Postinstall-Skript install.js waehlt nur die passende Plattform-Binaerdatei aus einem bereits mitgelieferten Satz aus und wurde von npm wegen 'allow-scripts' uebersprungen; 'forge --version' lief trotzdem sofort, das Skript wurde vorher gelesen und enthaelt nur Plattformerkennung, keinen Netzzugriff). Gemessen auf eigenem tmux-Socket mit PID im Namen, umgelenktem HOME, Modell ornith:9b ueber Ollama. KEIN CLI-FLAG FUER DAS MODELL: anders als bei allen 15 bisherigen Harnesses gibt es kein '-m/--model'; die Modellwahl ist ZUSTANDSBEHAFTET ueber 'forge config set model <anbieter> <modell>' in ~/.forge/.forge.toml, global fuer die ganze Maschine und NICHT je Prozess. Deshalb ist 'command' hier '/bin/sh' und 'args' ein '-c'-Einzeiler, der den Zustand vor jedem Start explizit auf das bestellte Modell UND die bestellte Denkstufe setzt und danach 'exec forge' aufruft — ohne dieses Vorschalten wuerde ein zweiter, gleichzeitig gestarteter Worker mit einem anderen Modell den ersten stillschweigend umschalten (gemessen: das Umschalten wirkt sofort und maschinenweit). ANBIETER 'ollama' ist ein EIGENER, ohne jeden Schluessel funktionierender Provider-Typ von Forge selbst (in 'forge provider list' unter OLLAMA gelistet, neben OpenAI, Anthropic, OpenRouter, LM_Studio, Llama.cpp und rund 30 weiteren) — 'forge config set model ollama {model}' fragt NUR beim ALLERERSTEN Mal interaktiv nach OLLAMA_SSL_SCHEME/OLLAMA_HOST/OLLAMA_PORT/API-Key (Menue- bzw. Texteingaben, mit Enter fuer den Vorgabewert 'http' und leerer Eingabe fuer 'kein Schluessel' beantwortet); danach steht der Anbieter in ~/.forge/.credentials.json und jeder weitere Aufruf laeuft ohne Rueckfrage durch — siehe configFiles. READY: die Eingabezeile ist EINZEILIG und beginnt mit einem Nerd-Font-Symbol aus dem Private-Use-Bereich (U+F013E, UTF-8 vierbyte-kodiert; kein Rahmen, kein Platzhaltertext dahinter — im LEEREN Zustand steht dort NUR das Symbol, sonst nichts), deshalb readyPattern '^e'. Nachgerechnet mit demselben grep -E, den pi-worker benutzt: das Muster trifft die Zeile in allen DREI gemessenen Zustaenden (leer: nur das Symbol; getippt: Symbol + Leerzeichen + Text, auch mehrzeilig eingefuegter Text bleibt auf der ERSTEN Zeile hinter dem Symbol und die Folgezeilen tragen KEIN Symbol, siehe promptPattern-Anmerkung; waehrend der Antwort: wieder nur das Symbol, waehrend darueber '⠏ Forging/Contemplating/Processing NNs · Ctrl+C to interrupt' steht) — und es trifft NICHT den Bannerbildschirm beim Start (Initialisierung dauert unter 0,2 s, in 0,1-s-Schritten abgetastet: bei 0,1 s noch kein Symbol, ab 0,2 s durchgehend da) und NICHT die beiden Erststart-Dialoge von 'forge provider login'/'forge config set model' (Menueauswahl mit '❯'/'▌' bzw. Textfragen '? Enter …' — ein voellig anderes, nicht-Symbol-basiertes Layout, nachgemessen an den aufgezeichneten Bildschirmen dieser beiden Dialoge). promptPattern ist DASSELBE Muster wie readyPattern: die Absende-Pruefung von pi-worker nimmt die LETZTE Zeile, auf die es passt, und weil nur die ERSTE Zeile eines mehrzeiligen Einfuegens das Symbol traegt, waehlt 'grep -E … | tail -1' bei getipptem Text richtig genau diese eine Zeile — anders als bei nanocoder (wo '^┃' allein die leere Randzeile getroffen haette) gibt es hier keine zweite, tiefere Zeile mit demselben Anfangszeichen, also auch keine Notwendigkeit fuer ein engeres Muster oder promptIgnore. KEIN VERTRAUENSDIALOG: ein foellig neues, nie gesehenes Arbeitsverzeichnis startete ohne jede Rueckfrage direkt in die Eingabezeile (gemessen). KEINE FREIGABE-RUECKFRAGEN: ein Auftrag, der ausdruecklich ein Werkzeug zum Anlegen einer Datei verlangte, wurde OHNE jede Bestaetigung ausgefuehrt (Datei stand danach mit dem verlangten Inhalt da) — Forge ist also von Haus aus autonom, autonomy.args bleibt leer und es gibt keinen erkennbaren Gegenschalter in der Hilfe ('-r/--restricted' steht zwar in einer aelteren README-Fassung, taucht aber in 'forge --help' 2.13.21 nicht mehr auf; 'restricted = false' als Konfigurationswert wurde nicht angetastet, weil seine Wirkung nicht gemessen ist).",
@@ -2574,7 +3411,55 @@
           "datum": "2026-09-29",
           "beleg": "nicht gemessen; forge --help (2.13.21)."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.forge/.mcp.json",
+          "format": "json-pfad",
+          "pfad": "mcpServers",
+          "form": "forge",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/probe",
+          "beleg": "forge mcp import -s user mit mcpServers.werkbank {command,args} im Test-HOME schreibt ~/.forge/.mcp.json {command,args,disable:false}"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "kein Hook-Mechanismus laut --help",
+          "gemessen": "2026-10-13/help",
+          "beleg": "forge --help ohne Hook-Befehl"
+        },
+        "prompts": {
+          "weg": "markdown-dir",
+          "ziel": "~/.forge/commands/",
+          "gemessen": "2026-10-14/probe",
+          "beleg": "forge cmd list im Test-HOME listet ~/.forge/commands/<name>.md als CUSTOM; ohne Frontmatter-Feld name bleibt der Name leer (Quelle traegt name und description)"
+        },
+        "plugins": {
+          "weg": "leer",
+          "grund": "nur zsh-Plugin, kein Harness-Plugin",
+          "gemessen": "2026-10-13/help",
+          "beleg": "forge README: nur zsh-Plugin"
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "keine Rechte-Konfiguration laut --help"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.agents/skills",
+          "gemessen": "2026-10-13/probe",
+          "beleg": "forge list skill im Test-HOME: ~/.agents/skills/probe-agents gelistet (~/.claude/skills nicht)"
+        },
+        "anweisungen": {
+          "weg": "leer",
+          "grund": "kein globaler Anweisungspfad belegt: forge kennt custom_rules in forge.yaml (Arbeitsordner) und AGENTS.md im Projekt",
+          "gemessen": "2026-10-14/doku",
+          "beleg": "forge README: custom_rules in forge.yaml; kein globaler Ort in README und forge --help"
+        }
+      },
+      "skillRoots": [
+        "~/.agents/skills"
+      ]
     },
     {
       "id": "jcode",
@@ -2635,28 +3520,6 @@
           "beleg": "selbst gemessen mit jcode v0.72.0, eigener tmux-Socket, eigenes HOME und eigenes TMPDIR, Start wie beim echten Spawn (jcode -p ollama -m qwen3:1.7b, JCODE_NO_TELEMETRY=1, JCODE_NO_MENUBAR=1). Waehrend das TUI im Pane zeichnete (alternate_on=1 vor UND nach der Anfrage), lief daneben ein eigener Prozess 'jcode --provider ollama --model qwen3:1.7b serve' und hielt die Sockets jcode.sock und jcode-debug.sock unter TMPDIR. Die Anfrage 'jcode debug --socket <TMPDIR>/jcode.sock sessions' antwortete mit einer JSON-Liste der laufenden Sitzungen: session_id, status 'ready', is_processing, model, provider, token_usage und swarm_id (das Arbeitsverzeichnis) — daher die Zuordnung ueber cwd. OHNE JCODE_DEBUG_CONTROL=1 lehnt derselbe Aufruf ab ('Debug control is disabled'). Damit ist jcode nach opencode der ZWEITE gemessene Fall 'Server neben dem TUI'. NEBENBEFUND, der in einen Test gehoert: der TUI-Start registriert einen launchd-Dienst com.jcode.hotkey in der echten Benutzer-Domaene, auch bei umgelenktem HOME. Sein Anwendungslog ~/.jcode/logs/jcode-*.log bleibt, was es war: ein Betriebslog ohne Rolle und Text (11.08. geprueft)."
         }
       },
-      "toolAdapter": {
-        "mcp": {
-          "weg": "leer",
-          "grund": "kein MCP-Client; Zugriff ueber CLI wb-hub call geplant (Hub-Spur H3)"
-        },
-        "hooks": {
-          "weg": "leer",
-          "grund": "jcode hat keinen Hook-Mechanismus laut --help (Inventur, Plan 2.3)"
-        },
-        "prompts": {
-          "weg": "leer",
-          "grund": "jcode hat keinen Befehls- oder Prompt-Ordner laut --help (Inventur)"
-        },
-        "plugins": {
-          "weg": "leer",
-          "grund": "jcode hat keine Plugin-Schnittstelle laut --help (Inventur, Plan 2.3)"
-        },
-        "rechte": {
-          "weg": "leer",
-          "grund": "jcode-Rechte laufen je Aufruf ueber das Registry-Flag --tools, kein Konfigurationsziel (Plan Abschnitt 2 Tabelle)"
-        }
-      },
       "instructionFiles": [
         "<project>/AGENTS.md"
       ],
@@ -2685,7 +3548,57 @@
           "datum": "2026-09-29",
           "beleg": "nicht gemessen; jcode transcript --help, jcode debug --help (0.72.0)."
         }
-      }
+      },
+      "toolAdapter": {
+        "mcp": {
+          "ziel": "~/.jcode/mcp.json",
+          "format": "json-pfad",
+          "pfad": "mcpServers",
+          "form": "jcode",
+          "hub": "stdio",
+          "gemessen": "2026-10-14/doku",
+          "beleg": "jcode-README (github.com/1jehuang/jcode, 14.10. gelesen): ~/.jcode/mcp.json, Schluessel mcpServers (kanonisch) oder servers, je Server command/args/env/shared/timeout_secs, nur stdio; Binary-Text 13.10. nennt dieselben Pfade. Probe mit Sitzung offen"
+        },
+        "hooks": {
+          "weg": "leer",
+          "grund": "jcode hat keinen Hook-Mechanismus laut --help (Inventur, Plan 2.3)",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "kein Treffer im Binary-Text ausser Telemetrie (nur nichts gefunden)"
+        },
+        "prompts": {
+          "weg": "leer",
+          "grund": "jcode hat keinen Befehls- oder Prompt-Ordner laut --help (Inventur)",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "kein Treffer im Binary-Text, --help ohne command (nur nichts gefunden)"
+        },
+        "plugins": {
+          "weg": "leer",
+          "grund": "jcode hat keine Plugin-Schnittstelle laut --help (Inventur, Plan 2.3)",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "kein Treffer im Binary-Text, --help ohne plugin (nur nichts gefunden)"
+        },
+        "rechte": {
+          "weg": "leer",
+          "grund": "jcode-Rechte laufen je Aufruf ueber das Registry-Flag --tools, kein Konfigurationsziel (Plan Abschnitt 2 Tabelle)",
+          "gemessen": "2026-10-13/help",
+          "beleg": "jcode --tools Allowlist je Aufruf; jcode permissions betrifft nur ambient"
+        },
+        "skills": {
+          "weg": "ordner-verweis",
+          "ziel": "~/.jcode/skills",
+          "gemessen": "2026-10-13/binary",
+          "beleg": "Binary-Text: Add skills under ~/.jcode/skills/<name>/SKILL.md"
+        },
+        "anweisungen": {
+          "weg": "leer",
+          "grund": "jcode liest global nur ~/AGENTS.md, und die bleibt bewusst weg (25.09.: jeder Harness in ~ liest sie); kein anderer Ort unter ~/.jcode. Der Text kommt ueber AGENTS.md im Arbeitsverzeichnis (Rollenblock)",
+          "gemessen": "2026-10-14/binary",
+          "beleg": "jcode 0.72.0 strings: Global Instructions (~/AGENTS.md), kein Ort unter ~/.jcode"
+        }
+      },
+      "skillRoots": [
+        "~/.jcode/skills"
+      ]
     }
   ],
   "models": [

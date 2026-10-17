@@ -1843,6 +1843,71 @@ fi
 # An installed registry can predate initialPrompt: then the first turn must use
 # the measured paste path, since wb-harness-run correctly rejects a start file
 # without an explicit positional contract.
+# Anweisungen mit Anlass worker-auftrag (Werkzeug-Quelle, Abschnitt anweisungen; zuerst die
+# Stilregel kurz-und-knackig, der Nutzer 13.10.): direkt vor der [Protokoll]-Zeile (die bleibt die
+# letzte). Ohne wb-anweisung oder ohne passende Anweisung bleibt der Auftrag wie bisher.
+# VOLLTEXT GENAU EINMAL (der Nutzer: wenig Tokens; Review wz-integ2, D; robust nach Review wz-integ3):
+# Der Auftrag traegt nur die Erinnerung, wenn der Volltext NACHWEISLICH beim Start ankommt:
+#  - Router-Datei (systemPrompt.path, pi: ~/.pi/agent/AGENTS.md) existiert und enthaelt den Volltext
+#    (Anlass sitzungsstart, so wie wb-instructions sync ihn schreibt; ein wb-rolle-Block zaehlt nicht),
+#  - sonst ein Datei-Harness (style file): wb-harness-run setzt den Volltext dann in den Rollenblock,
+#  - claude: das Werkbank-Plugin ist aktiv (enabledPlugins in ~/.claude/settings.json, nur gelesen) und
+#    sein hooks.json spielt den Volltext per SessionStart ein.
+# Sonst (aider, Router ohne Volltext, claude ohne Plugin ...) die Zeile mit dem Pfad zum Lesen.
+volltext_beim_start() {
+  local voll
+  voll="$("$HOME/.local/bin/wb-anweisung" --anlass sitzungsstart --harness "$KIND" volltext 2>/dev/null)" || voll=""
+  "$HOME/.local/bin/wb-state" harness get "$KIND" 2>/dev/null | WB_VOLL="$voll" /usr/bin/python3 -c 'import json,os,re,sys
+try:
+    h = json.load(sys.stdin)
+except Exception:
+    h = {}
+def lies(p):
+    try:
+        with open(os.path.expanduser(p), encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+voll = os.environ.get("WB_VOLL", "").strip("\n")
+sp = h.get("systemPrompt") or {}
+hid = h.get("id")
+router = "~/.pi/agent/AGENTS.md" if hid in ("pi", "pi-llamacpp") else sp.get("path")
+if hid in ("agy",):
+    router = None   # Leseort unbelegt (werkzeuge_anweisungen NICHT_BELEGT): Rollenblock statt Router
+if router and voll:
+    text = lies(router)
+    if text is not None:
+        text = re.sub(r"<!-- wb-rolle (\w+) anfang -->.*?<!-- wb-rolle \1 ende -->\n?", "", text, flags=re.S)
+        if voll in text:
+            print("ja"); sys.exit(0)
+if sp.get("style") == "file":
+    print("ja"); sys.exit(0)
+if hid == "claude":
+    try:
+        st = json.loads(lies("~/.claude/settings.json") or "{}")
+    except ValueError:
+        st = {}
+    an = isinstance(st, dict) and isinstance(st.get("enabledPlugins"), dict) \
+        and st["enabledPlugins"].get("werkbank@werkbank") is True
+    hooks = lies("~/.claude/werkbank-marktplatz/werkbank/hooks/hooks.json") or ""
+    if an and "volltext --claude-hook SessionStart" in hooks:
+        print("ja"); sys.exit(0)
+print("nein")' 2>/dev/null
+}
+stil_zeile_holen() {
+  local beim_start
+  beim_start="$(volltext_beim_start)"
+  if [ "$beim_start" = ja ]; then
+    STIL_ZEILE="$("$HOME/.local/bin/wb-anweisung" --anlass worker-auftrag --harness "$KIND" erinnerung 2>/dev/null \
+      | tr '\n' ' ' | sed 's/  */ /g; s/ $//')" || STIL_ZEILE=""
+    [ -n "$STIL_ZEILE" ] && STIL_ZEILE="[Anweisung — immer befolgen, Volltext steht in deinen Startanweisungen] $STIL_ZEILE"
+  else
+    STIL_ZEILE="$("$HOME/.local/bin/wb-anweisung" --anlass worker-auftrag --harness "$KIND" \
+      --auftragszeile 2>/dev/null)" || STIL_ZEILE=""
+  fi
+  return 0
+}
+
 CODEX_ERSTAUFTRAG=""
 CODEX_ERSTAUFTRAG_TIPPEN=""
 if [ "$KIND" = codex ] && [ -n "$TASK" ] \
@@ -1869,7 +1934,10 @@ except Exception: pass')"
     fi
     BRAIN_ZEILE="$("$HOME/.local/bin/wb-brain-zeile" "$ORIG_WORKDIR" "$WORKDIR" 2>/dev/null)" || BRAIN_ZEILE=""
     [ -n "$BRAIN_ZEILE" ] || BRAIN_ZEILE='Vor der ersten Änderung: brain search "<Thema des Auftrags>" -k 5 und passende Treffer lesen.'
-    MSG="${VORSPANN}$TASK_FUER_MSG
+    stil_zeile_holen
+    MSG="${VORSPANN}$TASK_FUER_MSG${STIL_ZEILE:+
+
+$STIL_ZEILE}
 
 [Protokoll — immer befolgen] $BRAIN_ZEILE Schreibe dein vollständiges Endergebnis als Markdown in die Datei $RES (WHAT/HOW-verified/OPEN). Antworte danach im Chat, letzte Zeile exakt: DONE"
     CODEX_START_DATEI="$RESDIR/.$TS.codex-start.txt"
@@ -2834,8 +2902,11 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
 BRAIN_ZEILE="$("$HOME/.local/bin/wb-brain-zeile" "$ORIG_WORKDIR" "$WORKDIR" 2>/dev/null)" \
   || BRAIN_ZEILE=""
 [ -n "$BRAIN_ZEILE" ] || BRAIN_ZEILE='Vor der ersten Änderung: brain search "<Thema des Auftrags>" -k 5 und passende Treffer lesen.'
+stil_zeile_holen
 
-MSG="${VORSPANN}$TASK_FUER_MSG
+MSG="${VORSPANN}$TASK_FUER_MSG${STIL_ZEILE:+
+
+$STIL_ZEILE}
 
 [Protokoll — immer befolgen] $BRAIN_ZEILE Schreibe dein vollständiges Endergebnis als Markdown in die Datei $RES (WHAT/HOW-verified/OPEN). Antworte danach im Chat, letzte Zeile exakt: DONE"
 

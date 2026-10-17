@@ -17,14 +17,14 @@ import type { MobileDialogSession } from './opencode';
  *   - Bash and Edit permission dialogs with exactly Yes / <persistent> / No, and (measured
  *     2.1.296) Bash with Yes / <persistent> / Yes, and switch to auto mode / No
  * 2.1.296 was measured in the fullscreen renderer (`"tui": "fullscreen"`) and inline.
- * 2.1.299 was measured in the fullscreen renderer; every dialog drew as in 2.1.296.
+ * 2.1.299 and 2.1.300 were measured in the fullscreen renderer; every dialog drew as in 2.1.296.
  * Not offered although measurable: the free-text row "Type something.", "Chat about
  * this", multi-select, the middle permission option (it claims a persistent or
  * session-wide grant whose scope was not proven) and the auto-mode option (it changes
  * the permission mode of the whole session).
  */
 
-export const CLAUDE_MEASURED_VERSIONS = Object.freeze(['2.1.277', '2.1.278', '2.1.296', '2.1.299'] as const);
+export const CLAUDE_MEASURED_VERSIONS = Object.freeze(['2.1.277', '2.1.278', '2.1.296', '2.1.299', '2.1.300'] as const);
 type ClaudeMeasuredVersion = (typeof CLAUDE_MEASURED_VERSIONS)[number];
 const ACCEPTED_VERSION_STRINGS = new Map<string, ClaudeMeasuredVersion>(
   CLAUDE_MEASURED_VERSIONS.flatMap((version) => [[version, version], [`${version} (Claude Code)`, version]]),

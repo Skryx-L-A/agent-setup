@@ -1,7 +1,7 @@
 {
   "schema": "werkzeuge/1",
   "_comment": [
-    "Eine Quelle fuer die Werkzeuge der Werkbank (MCP, Hooks, Prompts, Plugins, Rechte). Gelesen von wb-werkzeuge,",
+    "Eine Quelle fuer die Werkzeuge der Werkbank (MCP, Hooks, Prompts, Plugins, Rechte, Skills, Anweisungen). Gelesen von wb-werkzeuge,",
     "Plan: _recherche/werkzeug-plan-2026-10-13.md. Geheimnisse nur als Verweis (schluesselbund:<dienst>/<konto>",
     "oder filter:<name>), nie als Wert. harnesses: Liste oder alle-mit-mcp / alle-mit-prompts / alle-mit-hooks",
     "(aufgeloest ueber toolAdapter.<art> in models.default.json). maschinen filtert nach mac|peer.",
@@ -95,6 +95,27 @@
     }
   },
   "hooks": {
+    "bash-ohne-filterproxy": {
+      "ereignisse": [
+        "SessionStart"
+      ],
+      "befehl": "intern:env-entfernen",
+      "env_entfernen": [
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        "NO_PROXY"
+      ],
+      "timeout": 5,
+      "harnesses": [
+        "claude"
+      ],
+      "maschinen": [
+        "mac",
+        "peer"
+      ],
+      "zweck": "Bash-Kinder von Claude erben den Geheimnisfilter-Proxy aus der settings-env nicht (WO 13.10.): der Adapter schreibt 'unset <env_entfernen>' in CLAUDE_ENV_FILE; der Claude-Prozess selbst bleibt auf dem Proxy. Messung 14.10. (claude 2.1.296): wirkt fuer Vordergrund-, Hintergrund- und Subagenten-Bash, nach resume/compact/clear; claude -p aus so einer Bash liest die settings-env selbst und geht wieder ueber den Filter. Der Filter schuetzt den Kontext der Claude-Sitzung; Bash-Kinder, die selbst Modelle rufen (SDK-Skripte), gehen am Filter vorbei. opencode und pi laufen ueber ihre eigene Konfiguration auf die /anthropic-Route und bleiben gefiltert."
+    },
     "inbox-einspielen": {
       "ereignisse": [
         "PostToolUse:*",
@@ -189,7 +210,51 @@
       ]
     }
   },
-  "prompts": {},
+  "prompts": {
+    "budget": {
+      "datei": "werkbank-prompts/budget.md",
+      "harnesses": "alle-mit-prompts",
+      "maschinen": [
+        "mac",
+        "peer"
+      ],
+      "zweck": "Verbrauchsanzeige /budget (bisher nur ~/.claude/commands/budget.md von Hand): jeder Harness mit Prompt-Weg (alle-mit-prompts); claude ueber das Werkbank-Plugin, copilot bleibt OFFEN bis sein Plugin-Weg gemessen ist"
+    }
+  },
   "plugins": {},
-  "rechte": {}
+  "rechte": {},
+  "skills": {
+    "kurz-und-knackig": {
+      "quelle": "werkbank-stil/kurz-und-knackig",
+      "harnesses": "alle",
+      "maschinen": [
+        "mac",
+        "peer"
+      ],
+      "zweck": "Stilregel als Skill im Katalog jedes Harness (der Nutzer 13.10.; Volltext wie anweisungen.stil)"
+    }
+  },
+  "anweisungen": {
+    "stil": {
+      "volltext": "werkbank-stil/kurz-und-knackig/SKILL.md",
+      "erinnerung": "werkbank-stil/erinnerung.txt",
+      "harnesses": "alle",
+      "maschinen": [
+        "mac",
+        "peer"
+      ],
+      "anlaesse": [
+        "sitzungsstart",
+        "nachricht",
+        "worker-auftrag"
+      ],
+      "takt": {
+        "nachricht": {
+          "alle": 3
+        },
+        "nach_kompaktierung": true
+      },
+      "zweck": "Stilregel kurz-und-knackig fuer jeden Harness und jedes Modell (der Nutzer 13.10. 20:52Z/20:56Z): Volltext am Sitzungsbeginn und im Worker-Auftrag, Erinnerung je Nachricht, wo der Harness das kann; Ausgabe ueber wb-anweisung"
+    }
+  }
 }

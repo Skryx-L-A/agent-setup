@@ -21,6 +21,7 @@ import http.client
 import json
 import os
 import socket
+import stat
 import sys
 import time
 import urllib.parse
@@ -62,6 +63,26 @@ def token_lesen():
         except (OSError, ValueError):
             return None
     return t or None
+
+
+def token_ordner_fehler(pfad=None):
+    """-> Grund oder None. Die Tokendatei entsteht nur in einem eigenen Ordner: kein Symlink, eigener
+    Nutzer, keine Gruppen-/Weltschreibrechte (sonst koennte ein anderer sie tauschen oder mitlesen).
+    Fehlt der Ordner, wird er hier mit 0700 angelegt und danach ebenso geprueft."""
+    ordner = os.path.dirname(os.path.abspath(pfad or token_pfad()))
+    try:
+        if not os.path.lexists(ordner):
+            os.makedirs(ordner, mode=0o700, exist_ok=True)
+        st = os.lstat(ordner)
+    except OSError as e:
+        return "Ordner %s nicht anlegbar (%s)" % (ordner, type(e).__name__)
+    if not stat.S_ISDIR(st.st_mode):
+        return "%s ist kein Ordner (Symlink?)" % ordner
+    if st.st_uid != os.getuid():
+        return "Ordner %s gehoert einem anderen Nutzer" % ordner
+    if st.st_mode & 0o022:
+        return "Ordner %s ist fuer Gruppe/Welt beschreibbar" % ordner
+    return None
 
 
 def port():
@@ -115,6 +136,18 @@ class Sitzung:
         self.harness = harness
         self.port = port()
         self.token = token_lesen()
+        if not self.token:
+            # Harnesses mit der Registry-Zelle hub "stdio" haben keinen wb-harness-run-Schritt, der die
+            # Datei vorher anlegt (token-sicherstellen antwortet dort Exit 3): die Bruecke legt sie wie der
+            # Hub selbst an (wb_hub_kern.token_laden, O_EXCL, 0600), damit ein erster Aufruf vor dem ersten
+            # Hub-Start (launchd startet ihn erst bei der Verbindung) nicht an der fehlenden Datei scheitert.
+            fehler = token_ordner_fehler()
+            if fehler:
+                raise HubFehler("Tokendatei nicht angelegt: " + fehler)
+            try:
+                self.token = wb_hub_kern.token_laden()
+            except (SystemExit, OSError):
+                self.token = None
         if not self.token:
             raise HubFehler("keine Tokendatei; Hub nie gestartet oder WB_HUB_TOKEN_DATEI falsch")
         self.sid = None
@@ -196,8 +229,8 @@ def token_variable_noetig(harness):
         if harness not in werkzeuge_kern.harnesses_aufloesen(e.get("harnesses", []), "mcp", reg):
             continue
         if harness == werkzeuge_codex.HARNESS:
-            return True
-        if werkzeuge_familie.HUB_VAR in json.dumps(werkzeuge_kern.mcp_wert(e, ad.get("form"))):
+            return not werkzeuge_familie.ist_stdio_zelle(ad)
+        if werkzeuge_familie.HUB_VAR in json.dumps(werkzeuge_kern.mcp_wert(e, ad.get("form"), ad)):
             return True
     return False
 
@@ -220,6 +253,10 @@ def token_sicherstellen(argv):
         except (werkzeuge_kern.FehlerInQuelle, ImportError) as e:
             print("wb-hub: Quelle oder Adapter unlesbar, Bedarf fuer %s unbekannt: %s" % (harness, e), file=sys.stderr)
             return 1
+    fehler = token_ordner_fehler()
+    if fehler:
+        print("wb-hub: Tokendatei nicht angelegt: " + fehler, file=sys.stderr)
+        return 1
     t = None
     for _ in range(3):     # ein gleichzeitig anlegender Prozess hat die Datei evtl. noch leer
         try:

@@ -1728,6 +1728,279 @@ def check_freigabe_pfad(command):
 
 
 # ===========================================================================
+# 3e. mobil-pfad (2026-10-14, Auftrag wz-mobilguard) -- das Geraeteregister
+#     der Mobil-App
+# ===========================================================================
+# Zweck: Kein Agent traegt ein eigenes Geraet in ~/.claude/workbench/mobile/
+#        ein. BEFUND (Review handyguard F2, Nachweis
+#        app/test/mobile/review/geraet-eingeschleust.test.ts): der Kern liest
+#        auth-state.json bei jeder Pruefung von Platte (auth.ts readState) und
+#        nimmt ein dort eingetragenes P-256-Geraet als Mobilgeraet = Mensch an:
+#        Worker-Antraege annehmen, mobil-senden in den Orchestrator-Pane, agents
+#        mit Absender mensch. Gekoppelt wird nur ueber den Kern mit Code und
+#        gemessenem Menschen; ein Agent hat in dem Ordner nichts zu suchen.
+# Policy: DENY fuer jeden getippten Zugriff, auch lesend (Zaehler, Nonces,
+#        Journal), wie freigabe-pfad. Erkannt werden: jede Schreibweise des
+#        Ordners (absolut, ~, $HOME, ${HOME}, Variablen der Zeile, Gross/Klein,
+#        Anfuehrungszeichen, doppelte Schraegstriche, Symlink-Ziel), der
+#        Elternweg (~/.claude bzw. ~/.claude/workbench zusammen mit `mobile`
+#        oder `auth-state`, oder mit mv/ln/rm/cp/rsync/find/chmod/chown/tar/
+#        ditto/install, die den Elternordner umhaengen oder kopieren) und ein
+#        Arbeitsverzeichnis im oder ueber dem Ordner. Die App (Kern) schreibt
+#        weiter dort: sie laeuft nicht durch die Hooks.
+# GRENZE: Was ein Skript oder Interpreter erst zur Laufzeit zusammensetzt
+#        (`bash x.sh`, ein Pfad aus Teilstuecken in python -c), sieht der Hook
+#        nicht -- wie bei freigabe-pfad. Die Abhilfe dafuer gehoert in den Kern
+#        (MAC ueber die Geraeteeintraege, Auftrag wz-handyguard2).
+# Kein Schalter, aus demselben Grund wie bei 3c.
+
+MOBIL_HINWEIS = (
+    "Das Geraeteregister der Mobil-App (~/.claude/workbench/mobile/) fuehrt allein der "
+    "Kern der Werkbank; ein Telefon koppelt ein Mensch am Mac (Kopplung mit Code). Ein "
+    "selbst eingetragenes Geraet spraeche fuer den Menschen, deshalb liest und schreibt "
+    "ein Agent dort nichts, auch nicht ueber den Elternordner. Blockiert von mobil-pfad."
+)
+
+_MOBIL_WORT = re.compile(r'(?<![a-z0-9_.-])(?:mobile|auth-state)(?![a-z0-9_-])')
+# Befehle, die den Elternordner als Ganzes umhaengen, verlinken, loeschen,
+# kopieren oder durchgehen; mit ihm als Operand erreichen sie das Register.
+_MOBIL_UMHAENGEN = {'mv', 'ln', 'rm', 'rmdir', 'cp', 'rsync', 'find', 'chmod', 'chown',
+                    'tar', 'ditto', 'install'}
+_PFAD_ENDE = r'/?(?=$|[\s;&|()<>])'
+
+
+def _mobil_orte():
+    """(Ordner, Elternordner) in Kleinschrift, je mit dem Symlink-Ziel, falls es abweicht."""
+    heim = os.path.expanduser('~')
+    claude = os.path.join(heim, '.claude')
+    wb = os.path.join(claude, 'workbench')
+    mobil = os.path.join(wb, 'mobile')
+    ordner, eltern = {mobil.lower()}, {wb.lower(), claude.lower()}
+    for p, ziel in ((mobil, ordner), (wb, eltern), (claude, eltern)):
+        try:
+            ziel.add(os.path.realpath(p).lower())
+        except Exception:
+            pass
+    return heim, ordner, eltern
+
+
+def _mobil_normal(text, heim):
+    t = re.sub(r'[\'"\\]', '', text)
+    for form in ('${HOME}', '$HOME'):
+        t = t.replace(form, heim)
+    t = re.sub(r'(^|[\s=:;&|(<>])~(?=/|$|[\s;&|()<>])', lambda m: m.group(1) + heim, t)
+    t = re.sub(r'/+', '/', t.lower())
+    while '/./' in t:
+        t = t.replace('/./', '/')
+    return t
+
+
+def _ist_elternordner(wort, eltern):
+    w = wort.rstrip('/')
+    return w in eltern or w in ('.claude', '.claude/workbench', 'workbench') \
+        or w.endswith('/.claude') or w.endswith('/.claude/workbench')
+
+
+# Zweite Tuer (Nachtrag 14.10., wz-handyguard OPEN 3): Seit die Geraeteliste
+# signiert ist, prueft der Kern jeden Eintrag gegen den Freigabe-Schluessel.
+# `geraete-replizieren.mjs registry` signiert aber jeden Eintrag seiner
+# Quelldatei neu -- ein Agent, der es mit einer eigenen Quelle ruft, bekaeme
+# ein gueltig signiertes Fremdgeraet, ohne den Schluessel je zu sehen. Der
+# Replikationsdienst (Kern, replik-gegenseite.sh) laeuft nicht durch die Hooks.
+# Gesperrt ist jeder getippte Aufruf eines Programms namens geraete-replizieren*
+# (direkt oder ueber node/bun/deno) mit dem Unterbefehl registry; `audience`
+# und `abos` bleiben frei, sie signieren nichts.
+_REPLIK_NAME = 'geraete-replizieren'
+_REPLIK_INTERPRETER = {'node', 'nodejs', 'bun', 'deno'}
+
+
+def _replik_registry(stage, varmap):
+    name, i, rest = cmdshell.resolve_command(stage, varmap)
+    if not name:
+        return False
+    args = [cmdshell.resolve_vars(t, varmap).strip('\'"') for t in rest]
+    if name in cmdshell.SHELL_INTERPRETERS:
+        hat_c, skript = cmdshell.shell_c_script(args)
+        return bool(hat_c and skript and check_mobil_replik(skript))
+    if name in _REPLIK_INTERPRETER:
+        # Optionen des Interpreters ueberspringen; das erste Wort ist das Skript.
+        while args and args[0].startswith('-'):
+            args = args[1:]
+        if not args:
+            return False
+        name, args = args[0].split('/')[-1], args[1:]
+    return name.startswith(_REPLIK_NAME) and 'registry' in args
+
+
+def check_mobil_replik(command):
+    if not command or _REPLIK_NAME not in command:
+        return None
+    command = cmdshell.strip_heredocs(command)
+    if _REPLIK_NAME not in command:
+        return None
+    stmts = cmdshell.all_statements(command)
+    if stmts == [None]:
+        if re.search(r'(?<![a-z0-9_-])registry(?![a-z0-9_-])', command):
+            return ("Befehl nicht zerlegbar, nennt aber geraete-replizieren mit registry. %s"
+                    % MOBIL_HINWEIS)
+        return None
+    prefixes = cmdshell.assignment_prefixes(stmts)
+    for idx, stmt in enumerate(stmts):
+        if not stmt:
+            continue
+        varmap = prefixes[idx] if idx < len(prefixes) else {}
+        for stage in cmdshell.split_pipeline(cmdshell.strip_redirections(stmt)):
+            if _replik_registry(stage, varmap):
+                return ("`geraete-replizieren registry` signiert jeden Eintrag seiner Quelle mit dem "
+                        "Freigabe-Schluessel neu; das ruft nur der Replikationsdienst des Kerns. %s"
+                        % MOBIL_HINWEIS)
+    return None
+
+
+def check_mobil_pfad(command, cwd=''):
+    replik = check_mobil_replik(command)
+    if replik:
+        return replik
+    heim, ordner, eltern = _mobil_orte()
+    wb_eltern = [e for e in eltern if not e.endswith('/.claude')]
+    ort = ''
+    if cwd:
+        try:
+            ort = os.path.realpath(cwd).lower()
+        except Exception:
+            ort = cwd.lower()
+        if any(ort == o or ort.startswith(o + '/') for o in ordner):
+            return "Das Arbeitsverzeichnis liegt im Geraeteregister (%s). %s" % (cwd, MOBIL_HINWEIS)
+    if not command:
+        return None
+    command = cmdshell.strip_heredocs(command)
+    texte = [command]
+    # Variablen der Zeile eingesetzt (`D=~/.claude/workbench; echo > $D/mobile/x`).
+    stmts = cmdshell.all_statements(command)
+    if stmts != [None]:
+        prefixes = cmdshell.assignment_prefixes(stmts)
+        for idx, stmt in enumerate(stmts):
+            if not stmt:
+                continue
+            varmap = prefixes[idx] if idx < len(prefixes) else {}
+            texte.append(' '.join(cmdshell.resolve_vars(t, varmap) for t in stmt))
+            # Der Elternordner selbst als Operand: `mv ~/.claude/workbench ~/w`,
+            # `ln -s ~/.claude c`. Ein `cd ~/.claude && cp a b` bleibt frei.
+            for stage in cmdshell.split_pipeline(cmdshell.strip_redirections(stmt)):
+                name, _i, rest = cmdshell.resolve_command(stage, varmap)
+                if name not in _MOBIL_UMHAENGEN:
+                    continue
+                for tok in rest:
+                    w = _mobil_normal(cmdshell.resolve_vars(tok, varmap), heim)
+                    if _ist_elternordner(w, eltern) or (w.rstrip('/') in ('.', '..') and ort in eltern):
+                        return ("`%s` fasst den Elternordner des Geraeteregisters als Ganzes an (%s). %s"
+                                % (name, tok, MOBIL_HINWEIS))
+    for roh in texte:
+        t = _mobil_normal(roh, heim)
+        if re.search(r'(?<![a-z0-9_.-])workbench/mobile(?![a-z0-9_.-])', t) or \
+                any(o in t for o in ordner if not o.endswith('/workbench/mobile')):
+            return "Der Befehl nennt das Geraeteregister. %s" % MOBIL_HINWEIS
+        # ~/.claude/workbench in jeder Schreibweise plus `mobile`/`auth-state`:
+        # `cd ~/.claude/workbench && cat > mobile/auth-state.json`.
+        if (any(re.search(re.escape(e) + _PFAD_ENDE, t) for e in wb_eltern)
+                or re.search(r'(?<![a-z0-9_.-])(?:\.claude/)?workbench' + _PFAD_ENDE, t)) \
+                and _MOBIL_WORT.search(t):
+            return ("Der Befehl erreicht das Geraeteregister ueber den Elternordner "
+                    "~/.claude/workbench. %s" % MOBIL_HINWEIS)
+    if ort in wb_eltern and _MOBIL_WORT.search(command.lower()):
+        return ("Das Arbeitsverzeichnis (%s) ist der Elternordner des Geraeteregisters. %s"
+                % (cwd, MOBIL_HINWEIS))
+    return None
+
+
+# ===========================================================================
+# 3f. xcode-umlenkung (14.10.2026, Review handyguard2 N1) -- DEVELOPER_DIR,
+#     SDKROOT und TOOLCHAINS vor einem Werkbank-Werkzeug
+# ===========================================================================
+# Zweck: /usr/bin/python3 ist auf macOS der xcrun-Shim und startet
+#        $DEVELOPER_DIR/usr/bin/xcrun. BEFUND (gemessen): `DEVELOPER_DIR=<eigener
+#        Ordner> wb-decide <antrag> approve` aus einem Worker-Pane -- das eigene
+#        xcrun gab fuer die Herkunftsmessung "orchestrator" aus, Exit 0,
+#        angenommen; ebenso der Geraetebeleg von wb-decide/wb-freigabe. Die erste
+#        Linie steht in den Werkzeugen (unset + `env -i ... python3 -I -S`). Diese
+#        hier ist die zweite, vor allem fuer Werkzeuge mit `#!/usr/bin/env python3`
+#        (wb-inbox, wb-tafel, ...): steht /usr/bin/python3 vorn im PATH, ist dort
+#        schon der Interpreter ersetzt, bevor eine Zeile des Werkzeugs laeuft.
+# Policy: DENY, wenn der Befehl
+#        (a) eine der drei Variablen setzt oder weiterreicht (Praefix, env,
+#            export, declare/typeset -x, launchctl setenv, ${VAR:=..}) UND ein
+#            Werkbank-Werkzeug nennt (wb-*, pi-worker, claude-worker, agents_*,
+#            context-guard, awbmac-ctl), oder
+#        (b) DEVELOPER_DIR auf etwas anderes setzt als die festen Entwicklerordner
+#            (Xcode.app, Xcode-beta.app, CommandLineTools) -- auch ohne Werkzeug,
+#            weil ein Skript oder eine spaetere Stufe es weitertragen kann.
+#        Eine Sperre fuer JEDEN Befehl mit diesen Variablen waere zu breit: Builds
+#        mit `DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer` (ttsapp)
+#        sind gewollt; ein fester Entwicklerordner ist keine Umlenkung auf Code des
+#        Agenten. SDKROOT und TOOLCHAINS zaehlen nur zusammen mit einem Werkzeug
+#        (SDKROOT lenkte python3 nicht um, gemessen; TOOLCHAINS braucht eine
+#        Toolchain unter ~/Library/Developer).
+# GRENZE: Was ein Skript oder Interpreter erst zur Laufzeit setzt (`bash x.sh`,
+#        os.environ in python -c), sieht der Hook nicht -- dafuer die erste Linie.
+#        `unset` dieser Variablen ist frei.
+# Kein Schalter, aus demselben Grund wie bei 3c.
+
+XCODE_HINWEIS = (
+    "/usr/bin/python3 ist auf macOS der xcrun-Shim und folgt DEVELOPER_DIR (auch SDKROOT "
+    "und TOOLCHAINS lenken xcrun): ein eigener Ordner davor ersetzt den Interpreter, der in "
+    "den Werkbank-Werkzeugen Herkunft, Freigaben und Rollen misst (Befund 14.10.2026). "
+    "Werkbank-Werkzeuge laufen ohne diese Variablen; ein Build mit einem echten "
+    "Entwicklerordner (/Applications/Xcode.app/Contents/Developer, "
+    "/Applications/Xcode-beta.app/Contents/Developer, /Library/Developer/CommandLineTools) "
+    "bleibt frei, solange er kein Werkbank-Werkzeug ruft. Blockiert von xcode-umlenkung."
+)
+XCODE_ENTWICKLERORDNER = {'/Applications/Xcode.app/Contents/Developer',
+                          '/Applications/Xcode-beta.app/Contents/Developer',
+                          '/Library/Developer/CommandLineTools'}
+_XCODE_VAR = r'(?:DEVELOPER_DIR|SDKROOT|TOOLCHAINS)'
+# Die Formen, die eine der Variablen setzen oder in die Umgebung heben: VAR=.. (Praefix, env,
+# export/declare/local mit Wert), ${VAR:=..}, export/declare/typeset/readonly/local VAR ohne
+# Wert, launchctl setenv VAR, printf -v VAR, read .. VAR. Eine blosse Erwaehnung (grep, echo,
+# $VAR) setzt nichts.
+_XCODE_SETZT = re.compile(
+    r'(?<![\w$])(?<!\$\{)' + _XCODE_VAR + r'\+?='
+    r'|\$\{' + _XCODE_VAR + r':?[=]'
+    r'|(?<![\w-])(?:export|declare|typeset|readonly|local)(?![\w-])[^;&|\n]*?(?<![\w$])(?<!\$\{)'
+    + _XCODE_VAR + r'(?!\w)'
+    r'|(?<![\w-])setenv\s+' + _XCODE_VAR + r'(?!\w)'
+    r'|(?<![\w-])printf\s+-v\s*' + _XCODE_VAR + r'(?!\w)'
+    r'|(?<![\w-])read(?![\w-])[^;&|\n]*?(?<![\w$])' + _XCODE_VAR + r'(?!\w)')
+_XCODE_UNSET = re.compile(r'(?<![\w-])unset(?:\s+-v)?(?:\s+' + _XCODE_VAR + r'(?!\w))+')
+_XCODE_DEVDIR_WERT = re.compile(
+    r'(?:(?<![\w$])(?<!\$\{)DEVELOPER_DIR\+?=|(?<![\w-])setenv\s+DEVELOPER_DIR\s+)'
+    r'("[^"]*"|\'[^\']*\'|[^\s;&|()<>]*)')
+_WB_WERKZEUG = re.compile(
+    r'(?<![\w.-])(?:wb-[a-z0-9][\w-]*|pi-worker|claude-worker|agents_\w+|context-guard|awbmac-ctl)(?![\w-])')
+
+
+def check_xcode_umlenkung(command):
+    if not command:
+        return None
+    # Der Rumpf eines Here-Dokuments ist Text; laeuft er als Skript, prueft ihn 8b eigens.
+    text = _XCODE_UNSET.sub(' ', cmdshell.strip_heredocs(command))
+    if not _XCODE_SETZT.search(text):
+        return None
+    if _WB_WERKZEUG.search(text):
+        return ("Der Befehl setzt DEVELOPER_DIR, SDKROOT oder TOOLCHAINS und ruft ein "
+                "Werkbank-Werkzeug. %s" % XCODE_HINWEIS)
+    for m in _XCODE_DEVDIR_WERT.finditer(text):
+        wert = m.group(1)
+        if wert[:1] in ('"', "'"):
+            wert = wert[1:-1]
+        if not wert:
+            continue   # `export DEVELOPER_DIR` allein: der Wert steht (wenn) an anderer Stelle
+        if '$' in wert or '`' in wert or wert.rstrip('/') not in XCODE_ENTWICKLERORDNER:
+            return ("Der Befehl setzt DEVELOPER_DIR auf %s, keinen der festen "
+                    "Entwicklerordner. %s" % (wert[:200], XCODE_HINWEIS))
+    return None
+
+
+# ===========================================================================
 # 3. push-gate-worker.sh (Klassifikation importiert, Rollen-Check + Deny-Text
 #    hier -- die waren im Original auch nicht Teil des lib-Moduls)
 # ===========================================================================
@@ -2269,13 +2542,15 @@ def main(probe_input=None, rumpf_input=None):
         print_deny(pw_reason)
         return 0
 
-    # 3c/3c2/3d. rolle, worker-name und freigabe-pfad -- ohne Schalter (Begruendung oben).
+    # 3c/3c2/3d/3e. rolle, worker-name, freigabe-pfad und mobil-pfad -- ohne Schalter (Begruendung oben).
     #        Sie stehen VOR dem Push-Gate, weil sie dessen Grundlage schuetzen:
     #        wer die Rollenquelle umschreiben darf, hat das Push-Verbot schon
     #        beantwortet, bevor es gefragt wird.
     for name, pruefung in (('rolle', check_rollen_option),
                            ('worker-name', check_worker_option),
-                           ('freigabe-pfad', check_freigabe_pfad)):
+                           ('freigabe-pfad', check_freigabe_pfad),
+                           ('mobil-pfad', lambda c: check_mobil_pfad(c, cwd)),
+                           ('xcode-umlenkung', check_xcode_umlenkung)):
         reason = pruefung(command) if laeuft(name) else None
         if reason:
             merken(name, reason)

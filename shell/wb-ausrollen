@@ -391,6 +391,82 @@ def _hub_teil(repo, base, lauf_id, trocken, laden, ausgerollt):
     return fehler
 
 
+def _skills_teil(wc, c7, base, trocken, ausgerollt):
+    """Werkbank-Skills der Quelle (skills.<name>.quelle, etwa kurz-und-knackig; Review wz-integ2 M1):
+    <base>/.claude/skills/<name> wird ein Link auf den Skill-Ordner neben der INSTALLIERTEN
+    werkzeuge.default.json, eine vorhandene andere Fassung kommt vorher in den Snapshot. Die Logik
+    steht einmal in werkzeuge_kern.skills_anlegen (wb-werkzeuge skills-anlegen), dieselbe, die
+    wb-sync-setup auf peer aufruft; hier nur der Aufruf mit HOME=<base>. Gelesen wird die Quelle des
+    Repos (im Trockenlauf ist die installierte noch nicht da), verlinkt wird auf die installierte.
+    Danach verteilt `wb-instructions sync` den Skill in die uebrigen skillRoots (_anweisungen_teil,
+    im selben Lauf). Im Trockenlauf prueft --pruef-ordner die SKILL.md in der Repo-Quelle, damit ein
+    fehlender Skill schon dort als FEHLER erscheint.
+    -> 1 bei Fehler, sonst 0 (faerbt den Exit wie ein gescheiterter Dienstbefehl)."""
+    shell = os.path.join(c7["repo_dir"], "shell")
+    bin_dir = wc._ziel_fuer("shell/wb-werkzeuge", "wb-werkzeuge", c7)
+    werkzeug = os.path.join(shell, "wb-werkzeuge")
+    if not bin_dir or not os.path.isfile(werkzeug):
+        return 0
+    env = dict(os.environ, HOME=base, WB_WERKZEUGE_SRC=shell)
+    env.pop("WB_WERKZEUGE_REGISTRY", None)
+    argv = [sys.executable, werkzeug, "skills-anlegen", "--ordner", bin_dir] + (
+        ["--dry-run", "--pruef-ordner", shell] if trocken else [])
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=env)
+    except (OSError, subprocess.SubprocessError) as fehler:
+        print("  Skills: wb-werkzeuge skills-anlegen nicht aufrufbar: %s" % fehler, file=sys.stderr)
+        return 1
+    for zeile in p.stdout.splitlines():
+        if zeile.startswith(("ANGELEGT", "WUERDE ANGELEGT")):
+            ausgerollt.append((zeile.split(": ", 1)[0].split()[-1], "Skill-Link"))
+            print("  %s" % zeile)
+        elif zeile.startswith("FEHLER"):
+            print("  %s" % zeile, file=sys.stderr)
+    if p.returncode not in (0, 1) and p.stderr.strip():
+        print("  Skills: %s" % p.stderr.strip(), file=sys.stderr)
+    return 0 if p.returncode == 0 else 1
+
+
+def _anweisungen_teil(wc, c7, base, trocken, ausgerollt):
+    """Fester Schritt nach Dateien, Skills und Registry (Review wz-integ3, Fund 1): `wb-instructions sync`
+    schreibt den Volltext in die Router-Dateien der Harnesses (systemPrompt.path, pi: ~/.pi/agent/AGENTS.md)
+    und verteilt die Werkbank-Skills in die uebrigen skillRoots. Ohne ihn fehlte der Volltext dort bis zu
+    einem Handlauf; pi-worker und wb-harness-run pruefen die Router-Datei und fallen dann auf Lesezeile bzw.
+    Rollenblock zurueck. Gleich auf Mac und peer (beide rollen mit wb-ausrollen aus). Im Trockenlauf die
+    Repo-Fassung mit --dry-run (nichts geschrieben), sonst die installierte. Konflikte (Handaenderung in
+    einer erzeugten Datei) ueberschreibt wb-instructions nie; sie faerben den Exit.
+    -> 1 bei Fehler, sonst 0."""
+    repo_tool = os.path.join(c7["repo_dir"], "shell", "wb-instructions")
+    bin_dir = wc._ziel_fuer("shell/wb-instructions", "wb-instructions", c7)
+    inst_tool = os.path.join(bin_dir, "wb-instructions") if bin_dir else None
+    tool = repo_tool if trocken or not (inst_tool and os.path.isfile(inst_tool)) else inst_tool
+    if not os.path.isfile(tool):
+        return 0
+    print()
+    print("  -- Anweisungen der Harnesses (wb-instructions sync%s) --" % (" --dry-run" if trocken else ""))
+    if not os.path.isfile(os.path.join(base, ".claude", "CLAUDE.md")):
+        print("  Anweisungen: entfaellt, %s/.claude/CLAUDE.md fehlt (keine Quelle)" % base)
+        return 0
+    env = dict(os.environ, HOME=base)
+    env.pop("WB_WERKZEUGE_REGISTRY", None)
+    try:
+        p = subprocess.run([sys.executable, tool, "sync"] + (["--dry-run"] if trocken else []),
+                           capture_output=True, text=True, timeout=120, env=env)
+    except (OSError, subprocess.SubprocessError) as fehler:
+        print("  Anweisungen: wb-instructions nicht aufrufbar: %s" % fehler, file=sys.stderr)
+        return 1
+    for zeile in p.stdout.splitlines():
+        teile = zeile.split()
+        if len(teile) < 3 or teile[0] == "HARNESS/ZIEL" or teile[1] in ("unchanged", "role-injection", "gesperrt"):
+            continue
+        ausgerollt.append((teile[-1], "wb-instructions sync: %s" % teile[1]))
+        print("  %s%s" % ("WUERDE " if trocken else "", zeile))
+    if p.returncode != 0:
+        print("  Anweisungen: wb-instructions sync Exit %d: %s" % (p.returncode, p.stderr.strip()), file=sys.stderr)
+        return 1
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
@@ -596,9 +672,10 @@ def main():
             print(zeile)
             print("wb-ausrollen: WARNUNG --" + zeile[1:], file=sys.stderr)
 
-    hub_fehler = 0
+    hub_fehler = skill_fehler = 0
     if c7:
         hub_fehler = _hub_teil(c7["repo_dir"], a.base, lauf_id, a.dry_run, a.hub_laden, ausgerollt)
+        skill_fehler = _skills_teil(wc, c7, a.base, a.dry_run, ausgerollt)
 
     # Konfigurations-Vorlagen fuer fremde Harnesses (crush/nanocoder/cline/
     # forge, siehe check9_harness_konfig in wb-consistency.config.json): dieselbe
@@ -685,6 +762,10 @@ def main():
             print("  %s UEBERSPRUNGEN (registry-abweichung: %s) — von Hand pruefen."
                   % (pfad_text, warum))
 
+    # Anweisungen erst jetzt: Dateien (wb-instructions, wb-anweisung), Skill-Links und die Registry-
+    # Ergaenzungen stehen, und genau daraus erzeugt wb-instructions die Router-Dateien.
+    anweisungs_fehler = _anweisungen_teil(wc, c7, a.base, a.dry_run, ausgerollt) if c7 else 0
+
     # Fremd-Kopien (Sorte D, wb-consistency: fremd_kopien_befunde()) -- installiert,
     # aber nirgends im Repo bekannt. Anlass (2026-08-22): posttooluse-agent-reach-
     # skin.sh und sessionstart-limit-budget.sh lagen beide monatelang nur unter
@@ -738,7 +819,12 @@ def main():
             print("    %-40s %-13s %s" % (rel, richtung, warum))
     if hub_fehler:
         print("wb-ausrollen: %d Hub-Dienstbefehl(e) gescheitert." % hub_fehler, file=sys.stderr)
-    return 1 if (uebersprungen or hub_fehler) else 0
+    if skill_fehler:
+        print("wb-ausrollen: Werkbank-Skills nicht vollstaendig angelegt (siehe FEHLER oben).", file=sys.stderr)
+    if anweisungs_fehler:
+        print("wb-ausrollen: wb-instructions sync nicht sauber (siehe oben); Router-Dateien ohne Volltext "
+              "fallen in pi-worker auf die Lesezeile zurueck.", file=sys.stderr)
+    return 1 if (uebersprungen or hub_fehler or skill_fehler or anweisungs_fehler) else 0
 
 
 if __name__ == "__main__":

@@ -96,6 +96,14 @@ mit `wb-gruppe zustellung <name>`). Es gibt keinen Dauerjob: jeder spaetere Aufr
 alle 30 s je Mitglied (WB_GRUPPE_NACHLIEFER_PAUSE), bis zu 10 Nachrichten gesammelt, 7 Tage lang. Wer selbst
 nachliest (`lies --neu`), braucht keine Nachlieferung. WB_GRUPPE_NICHT_NACHLIEFERN=1 schaltet sie ab.
 
+PANE-DOPPELUNG: Ein Pane gehoert in einer Gruppe nur einem Mitglied. `dazu` und `auto` legen dafuer keinen
+zweiten Namen an (Meldung); ein Pane bekommt eine Nachricht hoechstens einmal, auch wenn zwei Mitglieder
+auf ihn zeigen. TOTE MITGLIEDER (gebundener Pane weg oder neue pane_pid, nicht ueber den Namen aufloesbar):
+beim Schreiben werden sie uebersprungen; in team-Gruppen werden sie ausgetragen (Zustellprotokoll, Art
+austrag), wenn der Name auf keinen lebenden Pane zeigt. Zeigt er auf mehrere lebende Panes (mehrdeutig),
+wird nur markiert. In leitung wird immer nur markiert (`wb-gruppe zustellung` zeigt "tot:"), bis sie
+wieder einen Pane haben.
+
 ZUSTELLUNG nur ueber `~/.local/bin/wb-inbox sende <pane> <datei>`. Dieses Werkzeug tippt nie
 in einen Pane. Der Pausenschalter von wb-inbox gilt unveraendert (wb-inbox misst die
 Absenderklasse selbst; Exit 4 = zurueckgehalten). Modi je Mitglied:
@@ -783,6 +791,17 @@ def mitglied_eintrag(name, modus, von, pane=None):
     return eintrag
 
 
+def doppelgaenger(daten, sitzung, eintrag):
+    """Name eines anderen Mitglieds, das schon an genau diesen Pane gebunden ist (Nummer und pane_pid),
+    sonst None. Ein Pane hat in einer Gruppe nur einen Mitgliedsnamen."""
+    if not eintrag.get("pane"):
+        return None
+    for k, i in sorted(daten["mitglieder"].items()):
+        if k != sitzung and i.get("pane") == eintrag["pane"] and i.get("pane_pid") == eintrag.get("pane_pid"):
+            return k
+    return None
+
+
 def orchestrator_vorrang(treffer):
     """Aus mehreren Panes mit demselben Namen den einen Orchestrator-Pane waehlen (streng wie
     ist_orchestrator_pane: keine Quelle sagt worker, mindestens eine sagt orchestrator). Sonst None.
@@ -792,7 +811,7 @@ def orchestrator_vorrang(treffer):
     return orchs[0] if len(orchs) == 1 else None
 
 
-def zielpanes(namen, gruppe, erneuert=None):
+def zielpanes(namen, gruppe, erneuert=None, mehrdeutig=None):
     """{name: pane oder Grund} fuer die Zustellung. Name aus dem lebenden Pane gemessen.
 
     Reihenfolge: 0. der gebundene Pane (gespeicherte Pane-Nummer UND gleiche pane_pid, lebt);
@@ -801,7 +820,9 @@ def zielpanes(namen, gruppe, erneuert=None):
     Gruppe den Mitgliedsnamen traegt; 3. genau ein Pane, dessen tmux-Sitzung oder Gruppe so heisst.
     Bei mehreren Treffern (Name oder Sitzung) gewinnt der eine Orchestrator-Pane, sonst bleibt es
     'mehrdeutig'. Ein Pane, der nur die gespeicherte Pane-Nummer, aber keinen passenden Namen hat, gilt
-    nicht. `erneuert` (dict) bekommt {name: neue pane_pid}, wenn Fall 2 mit anderer pane_pid griff."""
+    nicht. `erneuert` (dict) bekommt {name: neue pane_pid}, wenn Fall 2 mit anderer pane_pid griff.
+    `mehrdeutig` (dict) bekommt {name: [pane, ...]}, wenn der Name auf mehrere lebende Panes zeigt und
+    kein Orchestrator-Vorrang entscheidet."""
     tabelle, register, liste = prozesstabelle(), claude_register(), panes()
     nach_name, schwach, nach_alias = {}, {}, {}
     for p in liste:
@@ -841,6 +862,8 @@ def zielpanes(namen, gruppe, erneuert=None):
             vorrang = orchestrator_vorrang(kandidaten)
             ergebnis[name] = vorrang["pane"] if vorrang else \
                 "mehrdeutig: %d Panes heissen '%s'" % (len(kandidaten), name)
+            if not vorrang and mehrdeutig is not None:
+                mehrdeutig[name] = [p["pane"] for p in kandidaten]
         else:
             ergebnis[name] = "kein lebender Pane mit diesem Namen"
     return ergebnis
@@ -906,25 +929,40 @@ def zustellen(gruppe, n):
         grund = faellig(name, info, n, eigene.get(name, set()))
         if grund:
             due[name] = grund
-    if not due:
+    gebunden = [k for k, i in sorted(gruppe["mitglieder"].items())
+                if i.get("pane") and k not in (MENSCH, TAFEL)]
+    if not due and not gebunden:
         return []
-    erneuert = {}
-    ziele = zielpanes(sorted(due), gruppe, erneuert)
+    erneuert, mehrdeutig = {}, {}
+    ziele = zielpanes(sorted(set(due) | set(gebunden)), gruppe, erneuert, mehrdeutig)
     if erneuert:
         try:
             pane_nachtragen(gruppe["name"], erneuert)
         except (Abbruch, OSError, ValueError):
             pass
-    ergebnisse = []
+    austraege = tote_behandeln(gruppe["name"], gebunden, ziele, mehrdeutig)
+    for k, _ in austraege:
+        due.pop(k, None)
+    ergebnisse = [(k, text, True) for k, text in austraege]
+    if not due:
+        return ergebnisse
+    # Ein Pane bekommt diese Nachricht hoechstens einmal, auch wenn zwei Mitglieder auf ihn zeigen.
+    bereits = protokoll_zugestellt(gruppe["name"]).get(n["nr"], set())
+    ausgang = []
     for name, grund in sorted(due.items()):
         pane = ziele.get(name, "")
         if not str(pane).startswith("%"):
-            ergebnisse.append((name, "nicht zugestellt (%s)" % pane, False))
+            ausgang.append((name, "nicht zugestellt (%s)" % pane, False))
+            continue
+        if pane in bereits:
+            ausgang.append((name, "schon an %s zugestellt (anderes Mitglied im selben Pane)" % pane, True))
             continue
         ok, was = inbox_senden(pane, zustelltext(gruppe["name"], n, grund))
-        ergebnisse.append((name, was + ("" if not ok or "gereiht" in was else " (%s)" % grund), ok))
-    zustellung_festhalten(gruppe["name"], n["nr"], [(m, z, ok, ziele.get(m)) for m, z, ok in ergebnisse])
-    return ergebnisse
+        if ok:
+            bereits.add(pane)
+        ausgang.append((name, was + ("" if not ok or "gereiht" in was else " (%s)" % grund), ok))
+    zustellung_festhalten(gruppe["name"], n["nr"], [(m, z, ok, ziele.get(m)) for m, z, ok in ausgang])
+    return ergebnisse + ausgang
 
 
 # ── Zustellprotokoll und Vorrat (Nachlieferung an zurueckkehrende Mitglieder) ───────
@@ -975,6 +1013,77 @@ def zustellung_festhalten(name, nr, ergebnisse):
                 json_schreiben(offen_pfad(name), offen)
     except (Abbruch, OSError, ValueError):
         pass
+
+
+def protokoll_zugestellt(name):
+    """{nr: set(pane)}: wohin Nachrichten schon erfolgreich zugestellt wurden (zustellungen.jsonl).
+    Grundlage der Dedublizierung je (Pane, Nachrichten-Nr). Nachlieferungen fuehren alle Nummern in 'nrs'."""
+    ergebnis = {}
+    pfad = os.path.join(gruppen_ordner(name), "zustellungen.jsonl")
+    if not os.path.isfile(pfad):
+        return ergebnis
+    with open(pfad, encoding="utf-8") as s:
+        for zeile in s:
+            try:
+                e = json.loads(zeile)
+            except ValueError:
+                continue
+            if not e.get("ok") or not str(e.get("pane") or "").startswith("%"):
+                continue
+            for nr in e.get("nrs") or ([e["nr"]] if e.get("nr") is not None else []):
+                ergebnis.setdefault(int(nr), set()).add(e["pane"])
+    return ergebnis
+
+
+def tote_behandeln(name, gebunden, ziele, mehrdeutig=None):
+    """Gebundene Mitglieder, deren Pane nicht mehr lebt (Nummer weg oder pane_pid anders) und die ueber
+    ihren Namen nicht zustellbar sind. Aus team-Gruppen werden sie nur ausgetragen (Zustellprotokoll:
+    Zeile Art austrag), wenn der Name auf KEINEN lebenden Pane zeigt. Zeigt er auf mehrere lebende Panes
+    (mehrdeutig), wird nur markiert: nicht raten, nicht austragen. Sonst markieren (tot_seit), weil
+    Orchestratoren per Neustart zurueckkommen und ihre offenen Nachrichten dann nachgeliefert werden.
+    Wieder lebende Mitglieder verlieren die Markierung. Rueckgabe: [(mitglied, text)] der Austraege."""
+    mehrdeutig = mehrdeutig or {}
+    lebende = {p["pane"]: p["pane_pid"] for p in panes()}
+    austraege = []
+    with Sperre():
+        daten = gruppe_lesen(name)
+        geaendert = False
+        for k in gebunden:
+            info = daten["mitglieder"].get(k)
+            if not info or not info.get("pane"):
+                continue
+            lebt = lebende.get(info["pane"]) == info.get("pane_pid") or str(ziele.get(k, "")).startswith("%")
+            if lebt:
+                if "tot_seit" in info:
+                    info.pop("tot_seit", None)
+                    info.pop("tot_grund", None)
+                    geaendert = True
+                continue
+            if k in mehrdeutig:
+                grund = "mehrdeutig: %s" % " ".join(mehrdeutig[k])
+                info["tot_grund"] = grund
+                if "tot_seit" not in info:
+                    info["tot_seit"] = iso()
+                geaendert = True
+                continue
+            grund = "Pane %s (pid %s) lebt nicht mehr" % (info["pane"], info.get("pane_pid"))
+            if name.startswith("team-"):
+                del daten["mitglieder"][k]
+                austraege.append((k, "%s aus %s ausgetragen: %s" % (k, name, grund)))
+                geaendert = True
+            elif "tot_seit" not in info:
+                info["tot_seit"] = iso()
+                info["tot_grund"] = grund
+                geaendert = True
+        if geaendert:
+            gruppe_schreiben(daten)
+        if austraege:
+            pfad = os.path.join(gruppen_ordner(name), "zustellungen.jsonl")
+            alt = open(pfad, encoding="utf-8").read().splitlines() if os.path.isfile(pfad) else []
+            neu = [json.dumps({"mitglied": k, "pane": None, "ok": True, "art": "austrag", "was": text,
+                               "zeit": iso()}, ensure_ascii=False, sort_keys=True) for k, text in austraege]
+            atomar_schreiben.schreiben(pfad, "\n".join((alt + neu)[-PROTOKOLL_ZEILEN:]) + "\n", 0o600, dauerhaft=False)
+    return austraege
 
 
 def nachliefer_pause():
@@ -1029,16 +1138,24 @@ def nachliefern():
         if not faellig:
             continue
         ziele = zielpanes(faellig, daten)
+        bereits = protokoll_zugestellt(name)
         ergebnisse = []
         for m in faellig:
             pane = ziele.get(m, "")
             if not str(pane).startswith("%"):
                 continue
             nrs = sorted(offen[m]["nrs"])[-NACHLIEFER_MAX:]
-            liste = nachricht_nach_nr(name, nrs)
+            zu_senden = [n for n in nrs if pane not in bereits.get(n, set())]
+            if not zu_senden:  # schon an diesen Pane zugestellt (anderes Mitglied): nur den Vorrat raeumen
+                ergebnisse.append((m, "schon an %s zugestellt" % pane, True, pane, nrs))
+                continue
+            liste = nachricht_nach_nr(name, zu_senden)
             if not liste:
                 continue
             ok, was = inbox_senden(pane, nachliefertext(name, m, liste))
+            if ok:
+                for n in zu_senden:
+                    bereits.setdefault(n, set()).add(pane)
             ergebnisse.append((m, was, ok, pane, nrs))
             meldungen.append("Nachlieferung %s an %s: %s" % (name, m, was))
         if not ergebnisse:
@@ -1207,6 +1324,10 @@ def cmd_dazu(argv):
     with Sperre():
         daten = gruppe_lesen(name)
         neu = sitzung not in daten["mitglieder"]
+        doppel = doppelgaenger(daten, sitzung, eintrag) if neu else None
+        if doppel:
+            print("%s ist schon als %s an Pane %s gebunden; kein neues Mitglied in %s." % (sitzung, doppel, eintrag["pane"], name))
+            return 0
         daten["mitglieder"][sitzung] = eintrag
         gruppe_schreiben(daten)
         if neu:
@@ -1470,15 +1591,31 @@ def cmd_auto(argv):
         if not os.path.exists(os.path.join(gruppen_ordner(name), "gruppe.json")):
             neue_gruppe(name, zweck, wer, system=system)
         daten = gruppe_lesen(name)
-        neu = []
+        neu, gebunden_neu = [], []
+        lebende = {q["pane"]: q["pane_pid"] for q in panes()}
+        # Ungebundene Mitglieder, deren Zustellziel schon ein Orchestrator-Pane ist, binden statt einen
+        # Doppelgaenger unter dem Sitzungsnamen anzulegen (14.10.: Firma-X und wb-PraktikumNebenStudium beide an %0).
+        ungebunden = [k for k, i in daten["mitglieder"].items() if not i.get("pane") and k not in (MENSCH, TAFEL)]
+        ziel_ungebunden = zielpanes(ungebunden, daten) if ungebunden else {}
         for m, p in orchs:
-            gebunden = [k for k, i in daten["mitglieder"].items()
-                        if i.get("pane") == p["pane"] and i.get("pane_pid") == p["pane_pid"]]
-            if gebunden:  # der Pane ist schon Mitglied, auch unter anderem Namen (Sitzungsname/Anzeigename)
+            belegt = [k for k, i in daten["mitglieder"].items()
+                      if i.get("pane") == p["pane"] and i.get("pane_pid") == p["pane_pid"]]
+            if belegt:  # der Pane ist schon Mitglied, auch unter anderem Namen (Sitzungsname/Anzeigename)
+                continue
+            passend = [k for k in ungebunden if ziel_ungebunden.get(k) == p["pane"] and not daten["mitglieder"][k].get("pane")]
+            if passend:
+                k = passend[0]
+                daten["mitglieder"][k]["pane"], daten["mitglieder"][k]["pane_pid"] = p["pane"], p["pane_pid"]
+                gebunden_neu.append("%s an %s" % (k, p["pane"]))
                 continue
             if m in daten["mitglieder"]:
-                if not daten["mitglieder"][m].get("pane"):  # bestehendes Mitglied nachtraeglich binden
-                    daten["mitglieder"][m]["pane"], daten["mitglieder"][m]["pane_pid"] = p["pane"], p["pane_pid"]
+                info = daten["mitglieder"][m]
+                if not info.get("pane") or lebende.get(info["pane"]) != info.get("pane_pid"):
+                    # bestehendes Mitglied ohne lebende Bindung auf den Orchestrator-Pane setzen
+                    info["pane"], info["pane_pid"] = p["pane"], p["pane_pid"]
+                    info.pop("tot_seit", None)
+                    info.pop("tot_grund", None)
+                    gebunden_neu.append("%s an %s" % (m, p["pane"]))
                 continue
             daten["mitglieder"][m] = mitglied_eintrag(m, modus, wer["name"], p["pane"])
             zeiger_setzen(name, m, daten["letzte_nr"])
@@ -1490,8 +1627,9 @@ def cmd_auto(argv):
         if name == "tafel" and wer["name"] in daten["mitglieder"] and wer["name"] != MENSCH:
             daten["mitglieder"][wer["name"]]["modus"] = modus
         gruppe_schreiben(daten)
-    print("Gruppe %s: %d Mitglieder%s." % (name, len(daten["mitglieder"]),
-                                          ("; neu: " + ", ".join(neu)) if neu else ", keine neuen"))
+    print("Gruppe %s: %d Mitglieder%s%s." % (name, len(daten["mitglieder"]),
+                                            ("; neu: " + ", ".join(neu)) if neu else ", keine neuen",
+                                            ("; gebunden: " + ", ".join(gebunden_neu)) if gebunden_neu else ""))
     return 0
 
 
@@ -1567,10 +1705,14 @@ def cmd_team(argv):
             raise Abbruch(EXIT_AUFRUF, "Aufruf: wb-gruppe team [dazu|weg <sitzung> [--pane %N]]")
         sitzung = gueltige_sitzung(pos[1])
         if pos[0] == "dazu":
+            eintrag = mitglied_eintrag(sitzung, "erwaehnt", wer["name"], werte.get("--pane") or pane_binden(sitzung))
+            doppel = doppelgaenger(daten, sitzung, eintrag) if sitzung not in daten["mitglieder"] else None
+            if doppel:
+                print("%s ist schon als %s an Pane %s gebunden; kein neues Mitglied in %s." % (sitzung, doppel, eintrag["pane"], name))
+                return 0
             if sitzung not in daten["mitglieder"]:
                 zeiger_setzen(name, sitzung, daten["letzte_nr"])
-            daten["mitglieder"][sitzung] = mitglied_eintrag(sitzung, "erwaehnt", wer["name"],
-                                                            werte.get("--pane") or pane_binden(sitzung))
+            daten["mitglieder"][sitzung] = eintrag
             gruppe_schreiben(daten)
             print("%s ist in %s (Modus erwaehnt)." % (sitzung, name))
         else:
@@ -1792,9 +1934,13 @@ def cmd_zustellung(argv):
         return 0
     print("Gruppe %s: %d Zustellversuch(e) gezeigt, %d Mitglied(er) mit offenen Nachrichten" % (name, len(zeilen), len(offen)))
     for z in zeilen:
-        print("  #%s %s %-30s %-5s %s" % (z.get("nr"), z.get("zeit", "")[:19], z.get("mitglied"), "ok" if z.get("ok") else "FEHL", z.get("was")))
+        print("  #%s %s %-30s %-5s %s" % (z.get("nr") or "-", z.get("zeit", "")[:19], z.get("mitglied"),
+                                          "ok" if z.get("ok") else "FEHL", z.get("was")))
     for m, e in sorted(offen.items()):
         print("  offen: %s Nr. %s seit %s (%s)" % (m, ",".join(str(x) for x in e.get("nrs", [])), e.get("seit"), e.get("grund")))
+    for m, i in sorted(gruppe_lesen(name)["mitglieder"].items()):
+        if i.get("tot_seit"):
+            print("  tot: %s seit %s (%s)" % (m, i["tot_seit"], i.get("tot_grund", "")))
     return 0
 
 

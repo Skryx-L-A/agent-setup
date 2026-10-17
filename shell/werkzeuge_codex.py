@@ -47,8 +47,18 @@ def hub_url(q):
     return "http://127.0.0.1:%d/mcp?harness=codex" % int(port)
 
 
-def mcp_block(url):
+def mcp_block(url, stdio=None):
+    """Der Block fuer den Hub-Eintrag. Mit `stdio` = (befehl, args) (Registry toolAdapter.mcp.hub = "stdio")
+    die tokenfreie Bruecke `wb-hub stdio`, sonst HTTP mit Bearer aus WB_HUB_TOKEN."""
+    if stdio:
+        return '[mcp_servers.%s]\ncommand = %s\nargs = %s' % (HUB_NAME, json.dumps(stdio[0]), json.dumps(stdio[1]))
     return '[mcp_servers.%s]\nurl = "%s"\nbearer_token_env_var = "%s"' % (HUB_NAME, url, HUB_TOKEN_VAR)
+
+
+def stdio_von(ad):
+    """(befehl, args) der Bruecke, wenn die Registry-Zelle hub "stdio" verlangt, sonst None."""
+    import werkzeuge_familie
+    return werkzeuge_familie.stdio_befehl(HARNESS) if werkzeuge_familie.ist_stdio_zelle(ad) else None
 
 
 # ---------------------------------------------------------------- TOML ohne Bibliothek
@@ -167,8 +177,10 @@ def _basis(harness, art, name, ziel, zustand, grund=None):
 def _mcp_eintrag(ad, state, url):
     r = _basis(HARNESS, "mcp", HUB_NAME, ad["ziel"], "OFFEN")
     r["_codex"] = "mcp"
-    wert = {"url": url, "bearer_token_env_var": HUB_TOKEN_VAR}
+    stdio = stdio_von(ad)
+    wert = {"command": stdio[0], "args": stdio[1]} if stdio else {"url": url, "bearer_token_env_var": HUB_TOKEN_VAR}
     r["wert"], r["datei"] = wert, kern.pfad_aufloesen(ad["ziel"])
+    r["block"] = mcp_block(url, stdio)
     try:
         text = _datei_lesen(r["datei"])
         if text is not None:
@@ -199,7 +211,7 @@ def _mcp_eintrag(ad, state, url):
         r["hand"] = True
         return r
     r["aktuell_sha"] = kern._wert_sha(aktuell)
-    if aktuell.strip("\n") == mcp_block(url):
+    if aktuell.strip("\n") == r["block"]:
         r["zustand"] = "GLEICH"
         return r
     rec = state["eintraege"].get(kern.state_schluessel(HARNESS, "mcp", HUB_NAME))
@@ -343,7 +355,11 @@ def _bewerten(roh, q, reg, state, nur_harness=None, nur_art=None):
         aus.append(_mcp_eintrag(mcp_ad, state, hub_url(q)))
     if (nur_art in (None, "prompts") and (not nur_harness or HARNESS in nur_harness)
             and isinstance(prompt_ad, dict) and prompt_ad.get("weg") == "leer"):
-        aus.append(_basis(HARNESS, "prompts", HUB_NAME, None, "LEER", PROMPTS_GRUND))
+        # LEER nur mit Messfeld; ohne gemessen ist "leer" ein ungemessener Stand (wie im Kern)
+        if prompt_ad.get("gemessen"):
+            aus.append(_basis(HARNESS, "prompts", HUB_NAME, None, "LEER", PROMPTS_GRUND))
+        else:
+            aus.append(_basis(HARNESS, "prompts", HUB_NAME, None, "OFFEN", kern.UNGEMESSEN_GRUND))
     aus.sort(key=lambda x: kern.ARTEN.index(x["art"]))
     return aus
 
@@ -351,7 +367,7 @@ def _bewerten(roh, q, reg, state, nur_harness=None, nur_art=None):
 # ---------------------------------------------------------------- schreiben
 
 def _mcp_schreiben(x, snapshots, state):
-    block = mcp_block(x["wert"]["url"])
+    block = x["block"]
     snap = kern.markerblock_schreiben(x["datei"], HARNESS, "mcp", HUB_NAME, block,
                                       pruefer=toml_pruefen, snapshots=snapshots)
     state["eintraege"][kern.state_schluessel(HARNESS, "mcp", HUB_NAME)] = {

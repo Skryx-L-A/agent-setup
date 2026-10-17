@@ -126,6 +126,19 @@ ein Faelscher wird hoechstens nicht gemeldet; Programme der Plattform wie /bin/s
 Umgebung nicht -- darum zaehlt fuer eine Shell unter einem TEST-tmux-Server (Socket -L wbtest-*)
 dessen Umgebung: der Server erbt sie vom startenden Client, Auftrag kennung-electron Nachtrag 2,
 2026-10-11; jeder andere tmux-Server nie), und Muster aus 'stoerung_ausnahmen'.
+Dauerwache (Auftrag tafel-kontextwache, 2026-10-14): Die Werkbank-Wache context-guard (Befehl
+`bash ~/.local/bin/context-guard --auto %<pane>`, je Workbench-Session ein Prozess) wird mit einem
+laengeren Fenster beurteilt, 120 s Mittel statt 20 s ('stoerung_dauerwache_s'); CPU-Schwelle und
+Zwei-Drittel-Regel bleiben. Messung 14.10.2026, 18:29 bis 18:35, lesend ueber die Tafel
+(mac-worker-schwer), je 240 s im Takt 5 s, 11 Wachen: Mittel 0,003 bis 0,086 Kerne. Die Wache des
+Hauptagenten (%33): 20,75 s CPU in 240 s, 5 von 48 Abstaenden ueber 0,5 Kerne, als kurze Spitzen von
+1 bis 2 Abstaenden (0,50 bis 0,84), nie drei von vier Abstaenden eines 20-s-Fensters. Gemessen
+wurde der Wachprozess selbst; seine Kinder (tmux-Aufrufe, sleep) waren zu kurz fuer den 5-s-Takt
+und gingen nur als beendete Kinder in die Summe ein. Eine dauerhafte Last ueber 0,5 Kerne bleibt
+gemeldet: der Mittelwert ueber 120 s muss erreicht werden. Erkannt wird am Dateinamen context-guard unter ~/.local/bin oder shell/
+(Pfad im ersten oder zweiten Wort der Befehlszeile), nicht an einer Umgebungsvariable. Grenze: ein
+fremder Prozess dieses Namens unter diesen Pfaden bekommt ebenfalls das lange Fenster; eine Ausnahme
+von der Last gibt es nicht.
 Dann: Meldung an den Halter (Fenster von-bis, Programm, Last, Herkunft), an den Pane des
 Verursachers, wenn belegt (Elternkette oder wb-nohup; ein Pane mit gleichem Arbeitsordner wird nur
 als Vermutung genannt; ein abgeloester Lauf ohne wb-nohup-Registrierung wird, wenn belegbar, als
@@ -254,10 +267,12 @@ WAECHTER_TAKT_S = 2.0        # der Waechter sieht so oft nach, ob Eintrag und Pr
 ERLAUBNIS_S = 120            # Einmal-Erlaubnis 'trotzdem' (Commit in einen gehaltenen Hauptbaum)
 EXIT_WARNEN = 6              # pruefe-commit: Commit darf, Warnung zeigen
 # Stoerungen waehrend eines exklusiven Platzes (Auftrag tafel-waechter, 2026-10-10), je Platz
-# ueberschreibbar ('stoerung_cpu', 'stoerung_ram_mib', 'stoerung_dauer_s', 'stoerung_takt_s'):
+# ueberschreibbar ('stoerung_cpu', 'stoerung_ram_mib', 'stoerung_dauer_s', 'stoerung_dauerwache_s',
+# 'stoerung_takt_s'):
 STOERUNG_CPU = 0.5           # Kerne, Mittel ueber die Mindestdauer (Begruendung im Kopf, STOERUNGEN)
 STOERUNG_RAM_MIB = 1024      # Speicherzuwachs eines Laufs gegenueber seinem ersten Messwert
 STOERUNG_DAUER_S = 20.0      # so lange muss die Last mindestens anhalten
+STOERUNG_DAUERWACHE_DAUER_S = 120.0  # dasselbe fuer eine Werkbank-Dauerwache (context-guard, Kopf)
 STOERUNG_TAKT_S = 5.0        # Abstand der Abtastungen (eine Prozesstabelle, ~40 ms)
 STOERUNG_ANTEIL = 2.0 / 3    # so viele Abtastabstaende im Fenster muessen selbst ueber der CPU-Schwelle liegen
 ARTEN = ("exklusiv", "zaehlend", "menge", "zustaendigkeit")
@@ -446,6 +461,8 @@ def platz_aus_def(cfg, name, d):
             "stoerung_cpu": float(d.get("stoerung_cpu", cfg.get("stoerung_cpu", STOERUNG_CPU))),
             "stoerung_ram_mib": float(d.get("stoerung_ram_mib", cfg.get("stoerung_ram_mib", STOERUNG_RAM_MIB))),
             "stoerung_dauer_s": float(d.get("stoerung_dauer_s", cfg.get("stoerung_dauer_s", STOERUNG_DAUER_S))),
+            "stoerung_dauerwache_s": float(d.get("stoerung_dauerwache_s", cfg.get(
+                "stoerung_dauerwache_s", STOERUNG_DAUERWACHE_DAUER_S))),
             "stoerung_takt_s": float(d.get("stoerung_takt_s", cfg.get("stoerung_takt_s", STOERUNG_TAKT_S))),
             "stoerung_ausnahmen": [m for m in (d.get("stoerung_ausnahmen") or cfg.get("stoerung_ausnahmen") or [])
                                    if isinstance(m, str) and m]}
@@ -3049,8 +3066,25 @@ SYSTEM_ORTE = ("/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/", "/Library/",
                "/usr/lib/", "/lib/systemd/", "/usr/lib/systemd/")
 
 
+# Interpreter aus den Entwicklerwerkzeugen (Xcode, CommandLineTools; Auftrag tafel-python-shim, 2026-10-14).
+# /usr/bin/python3 ist auf dem Mac ein Shim nach .../Python.app/Contents/MacOS/Python im Xcode-Paket;
+# ohne diese Ausnahme wuerde ein abgeloester Python-Lauf als App ausgenommen und nie gemeldet.
+ENTWICKLER_ORTE = ("/Applications/Xcode.app/", "/Applications/Xcode-", "/Library/Developer/CommandLineTools/")
+INTERPRETER_NAMEN = re.compile(r"^(python[0-9.]*|Python|perl[0-9.]*|ruby[0-9.]*|node|bash|zsh|sh)$")
+
+
+def ist_entwickler_interpreter(programm):
+    """Das ausgefuehrte Programm ist ein Interpreter (Name aus INTERPRETER_NAMEN) unter einem
+    Entwicklerpfad. Erkannt am Programmpfad der Befehlszeile (argv[0] wie ps ihn zeigt), nicht an
+    Umgebungsvariablen. Grenze wie bei allen Pfadpruefungen hier: ein Prozess kann seinen argv[0] selbst
+    setzen; wer das tut, wird hoechstens nicht gemeldet."""
+    return programm.startswith(ENTWICKLER_ORTE) and bool(INTERPRETER_NAMEN.match(os.path.basename(programm)))
+
+
 def ist_systemprozess(befehl):
     erstes = (befehl or "").split(" ")[0]
+    if ist_entwickler_interpreter(erstes):
+        return False        # ein Lauf, kein App-Programm: Python.app im Xcode-Paket bleibt Fremdlast
     # Login-Shells ("-zsh") ohne Terminal sind Reste, kein Lauf; `nohup bash skript.sh` dagegen schon.
     return (erstes.startswith(SYSTEM_ORTE) or ".app/Contents/" in (befehl or "") or erstes.startswith("-")
             or os.path.basename(erstes) in ("launchd", "tmux", "systemd", "login"))
@@ -3226,6 +3260,15 @@ def umgebung_kennungen(pid):
         kennungen += [k for k in m.group(1).split(",") if k]
     return kennungen
 
+def ist_dauerwache(befehl):
+    """Eine Werkbank-Dauerwache (Auftrag tafel-kontextwache, 2026-10-14): der Wachprozess context-guard,
+    erkannt am Dateinamen unter den ersten beiden Wortern der Befehlszeile, und nur wenn sein Pfad
+    ~/.local/bin oder dem Repo-Ordner shell/ angehoert. Kein Umgebungswert entscheidet darueber."""
+    for wort in (befehl or "").split()[:2]:
+        if os.path.basename(wort) == "context-guard" and os.path.dirname(wort).endswith(("/.local/bin", "/shell")):
+            return True
+    return False
+
 
 class Abtaster:
     """Merkt sich je Lauf (Wurzel eines Prozessbaums) CPU-Zeit und Speicher ueber die Zeit.
@@ -3321,9 +3364,10 @@ class Abtaster:
                 self.basis[wurzel] = speicher if self.erster_lauf else 0
             reihe = self.verlauf[wurzel]
             reihe.append((t, cpu, speicher))
-            while len(reihe) > 2 and reihe[1][0] <= t - p["stoerung_dauer_s"]:
+            dauer = p["stoerung_dauerwache_s"] if ist_dauerwache(befehl) else p["stoerung_dauer_s"]
+            while len(reihe) > 2 and reihe[1][0] <= t - dauer:
                 reihe.pop(0)
-            urteil = self.urteil(wurzel, reihe, t)
+            urteil = self.urteil(wurzel, reihe, t, dauer)
             # Erst fuer einen Lauf, der sonst gemeldet wuerde: die Umgebung zu lesen kostet je Mitglied ein ps.
             if urteil and (wurzel in self.kennung_ok or self.kennung_deckt(
                     list(dict.fromkeys([wurzel, mitglieder[groesster]] + mitglieder)), z, tab, kette)):
@@ -3409,13 +3453,13 @@ class Abtaster:
                 return bool(x) and start is not None and start >= float(x.get("seit") or 0) - 1
         return False
 
-    def urteil(self, wurzel, reihe, t):
-        """Schwer: ueber mindestens stoerung_dauer_s im Mittel ueber der CPU-Schwelle und in
-        mindestens STOERUNG_ANTEIL der Abtastabstaende selbst darueber -- oder der Speicher liegt
-        die ganze Dauer ueber um stoerung_ram_mib ueber dem ersten Messwert. Eine kurze Spitze
-        reicht nie."""
+    def urteil(self, wurzel, reihe, t, dauer):
+        """Schwer: ueber mindestens <dauer> (stoerung_dauer_s, bei einer Dauerwache
+        stoerung_dauerwache_s) im Mittel ueber der CPU-Schwelle und in mindestens STOERUNG_ANTEIL der
+        Abtastabstaende selbst darueber -- oder der Speicher liegt die ganze Dauer ueber um
+        stoerung_ram_mib ueber dem ersten Messwert. Eine kurze Spitze reicht nie."""
         p = self.p
-        if len(reihe) < 2 or t - reihe[0][0] < p["stoerung_dauer_s"]:
+        if len(reihe) < 2 or t - reihe[0][0] < dauer:
             return None
         t0, c0, _s0 = reihe[0]
         mittel = max(0.0, reihe[-1][1] - c0) / max(1e-6, t - t0)
@@ -3428,7 +3472,7 @@ class Abtaster:
             return None
         return {"cpu": round(mittel, 2), "zuwachs_mib": int(max(zuwachs) / 1048576),
                 "grund": "CPU" if cpu_schwer else "Speicher", "seit": self.erstmals.get(wurzel, t0),
-                "dauer_s": p["stoerung_dauer_s"]}
+                "dauer_s": dauer}
 
 
 def verursacher(f):

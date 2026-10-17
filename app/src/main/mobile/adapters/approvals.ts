@@ -1,12 +1,14 @@
 import { createHash } from 'node:crypto';
 import { validateDecisionBody } from '../../../mobile-shared/validierung';
-import type { Approval, JsonValue } from '../../../mobile-shared/vertrag';
-import { MobileAuthError } from '../auth/auth';
+import type { Approval, JsonValue, SignedRequestEnvelope } from '../../../mobile-shared/vertrag';
+import { MobileAuthError, type AuthenticatedRequest } from '../auth/auth';
 import type { MobileRouteHandlers } from '../http/server';
 import { mobilBeleg, type Herkunftsbeleg } from '../../herkunft';
 
 export interface MobileRequestApproval {
   readonly path: string;
+  /** SHA-256 der Antragsbytes; die Kennung bindet Pfad UND Inhalt (Review 14.10.2026, F3). */
+  readonly inhaltSha256: string;
   readonly parent: string;
   readonly childName: string;
   readonly task: string;
@@ -35,17 +37,21 @@ export interface ApprovalsForMobile {
     | { readonly requests: readonly MobileRequestApproval[]; readonly guards: readonly MobileGuardApproval[] };
   /** `decideRequest()` — freigaben.ts:100. */
   decideRequest(entry: MobileRequestApproval, decision: 'approve' | 'reject', reason: string, origin: Herkunftsbeleg): Promise<{ readonly ok: boolean; readonly message: string }>;
-  /** `musterEntscheiden()` — main.ts:2017; false until typed proof reaches wb-freigabe. */
-  decideGuard(entry: MobileGuardApproval, decision: 'approve' | 'reject', reason: string, human: false): Promise<{ readonly ok: boolean; readonly message: string }>;
+  /**
+   * `musterEntscheiden()` — main.ts. Annehmen traegt den Mobilbeleg samt Nachweis
+   * (signierter Umschlag + Body), den `wb-freigabe --mobilbeleg` selbst prueft (14.10.2026).
+   */
+  decideGuard(entry: MobileGuardApproval, decision: 'approve' | 'reject', reason: string, origin: Herkunftsbeleg): Promise<{ readonly ok: boolean; readonly message: string }>;
 }
 
 const id = (kind: string, value: string): string => `${kind}:${createHash('sha256').update(value).digest('hex')}`;
+/** Die Kennung eines Antrags: dieselbe Zeichenkette hasht `wb-mobil-pruefen` (pruefen-cli.ts). */
+const requestId = (entry: MobileRequestApproval): string => id('request', `${entry.path}\0${entry.inhaltSha256}`);
 const time = (value: string): number => Number.isFinite(Date.parse(value)) ? Date.parse(value) : 0;
-const unavailable = (message: string): never => { throw new MobileAuthError('capability_unavailable', message); };
 const stale = (message: string): never => { throw new MobileAuthError('stale_target', message); };
 
 function approvalForRequest(entry: MobileRequestApproval): Approval {
-  return { id: id('request', entry.path), kind: 'request', source: 'authoritative', session_id: null,
+  return { id: requestId(entry), kind: 'request', source: 'authoritative', session_id: null,
     summary: `${entry.parent} requested worker ${entry.childName}: ${entry.task}`, created_at: time(entry.ts) };
 }
 
@@ -54,6 +60,12 @@ function approvalForGuard(entry: MobileGuardApproval): Approval {
     session_id: /^[^:]+:.+$/.test(entry.sessionId) ? entry.sessionId as `${string}:${string}` : null,
     summary: entry.musterGrund || entry.reason || `blocked command for ${entry.workerName}`,
     created_at: time(entry.ts) };
+}
+
+/** The device origin with its verifiable proof (envelope + exact body bytes). */
+function mobileOrigin(request: { readonly device?: AuthenticatedRequest; readonly envelope?: SignedRequestEnvelope; readonly rawBody: Buffer }): Herkunftsbeleg {
+  if (!request.device) return { art: 'steuerkanal' };
+  return mobilBeleg(request.device, request.envelope ? { umschlag: request.envelope, body: request.rawBody } : undefined);
 }
 
 export function createApprovalHandlers(source: ApprovalsForMobile): Pick<MobileRouteHandlers,
@@ -67,11 +79,13 @@ export function createApprovalHandlers(source: ApprovalsForMobile): Pick<MobileR
       const body = validateDecisionBody(request.body);
       if (!body.ok) throw new MobileAuthError('bad_request', body.error);
       const snapshot = await source.list();
-      const entry = snapshot.requests.find((item) => id('request', item.path) === request.params.id);
+      const entry = snapshot.requests.find((item) => requestId(item) === request.params.id);
       if (!entry) return stale('worker request is no longer current');
       // The origin travels with the decision (13.10.2026): only a verified device
       // counts as a human for approving; anything else is refused in the core.
-      const origin: Herkunftsbeleg = request.device ? mobilBeleg(request.device) : { art: 'steuerkanal' };
+      // Since 14.10.2026 it carries the signed envelope and body, which wb-decide
+      // verifies and consumes itself (--mobilbeleg) instead of trusting the core.
+      const origin = mobileOrigin(request);
       const result = await source.decideRequest(entry, body.value.decision, body.value.reason, origin);
       if (!result.ok) stale(result.message || 'worker request could not be decided');
       return { data: { decided_at: Date.now() } as unknown as JsonValue };
@@ -79,14 +93,13 @@ export function createApprovalHandlers(source: ApprovalsForMobile): Pick<MobileR
     'POST /approvals/guards/:id/decision': async (request) => {
       const body = validateDecisionBody(request.body);
       if (!body.ok) throw new MobileAuthError('bad_request', body.error);
-      if (body.value.decision === 'approve') {
-        unavailable('guard approval requires a typed mobile origin proof at wb-freigabe');
-      }
       const snapshot = await source.list();
       const entry = snapshot.guards.find((item) => item.wartet && id('guard', item.schluessel || item.path) === request.params.id);
       if (!entry) return stale('guard block is no longer current');
-      const result = await source.decideGuard(entry, 'reject', body.value.reason, false);
-      if (!result.ok) stale(result.message || 'guard block could not be rejected');
+      // Approving goes to wb-freigabe, which checks the device proof itself (14.10.2026);
+      // rejecting needs no proof, as before.
+      const result = await source.decideGuard(entry, body.value.decision, body.value.reason, mobileOrigin(request));
+      if (!result.ok) stale(result.message || `guard block could not be ${body.value.decision === 'approve' ? 'approved' : 'rejected'}`);
       return { data: { decided_at: Date.now() } as unknown as JsonValue };
     },
   };

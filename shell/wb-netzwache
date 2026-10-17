@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""wb-netzwache -- entscheidet, ob ein Worker nach einem Netzausfall ein "weiter" braucht.
+
+  wb-netzwache pruefe <pane> [<name>] [--transkript <datei>] [-L <socket>]
+      Eine Entscheidung je Aufruf, genau eine Zeile auf stdout (Felder durch TAB), Exit 0:
+        nichts  <grund>                      kein Handlungsbedarf (oder nicht zustaendig)
+        warte   <grund>                      Netzfehler am Zugende, aber DNS noch weg
+        weiter  <schluessel> <text>          Fortsetzung per `wb-inbox sende` zustellen, dann `gesendet` aufrufen
+        melden  <schluessel> <pane> <text>   Obergrenze erreicht: Information an <pane>
+  wb-netzwache gesendet <name> <schluessel>   eine Fortsetzung verbuchen
+  wb-netzwache gemeldet <name> <schluessel>   die Meldung an den startenden Pane verbuchen
+
+Anlass (14.10.2026 15:11, WLAN-Verlust 14:45-14:52): der Geheimnisfilter wartete seine
+DNS-Frist ab und lieferte "502 Anbieter nicht erreichbar"; Claude Code gab nach eigenen
+Wiederholungen auf, drei Worker standen mitten im Auftrag still. Diese Wache erkennt solche
+Worker, wartet bis die Namensaufloesung wieder geht und schickt EIN "weiter".
+
+WARUM DIES DER EINFACHSTE PASSENDE MECHANISMUS IST. context-guard laeuft ohnehin je
+Sitzung, sieht jeden Worker-Pane (@wb_worker), kennt dessen Transkript, weiss ueber
+pane_wartet_leer()/wb-pane-write, ob getippt werden darf, und stellt dort schon die Mahnung
+(seit 16.10.2026 ueber wb-inbox, wo es einen Weg gibt), tippt den Anschluss nach dem Kompaktieren
+und meldet die Fertigmeldung. Ein Stop-Hook scheidet aus: am
+Zugende durch API-Fehler (gemessen, Abschnitt GEMESSEN unten), und
+ein Hook, der auf DNS wartet, haelte die Sitzung an. Ein eigener Dauerjob waere ein
+zweiter Poll-Prozess neben dem vorhandenen. Dieses Werkzeug haelt nur die Entscheidung;
+zugestellt wird vom Guard.
+
+WIE DIE FORTSETZUNG ZUGESTELLT WIRD. Ueber `wb-inbox sende` in die Sitzungs-Inbox des
+Worker-Panes, nicht durch Tippen (Hausregel: nie send-keys in fremde Panes; Tippen friert Panes
+ein und kann mit einem halb getippten Text kollidieren). Die gemessene Herkunft ist INFORMATION:
+die Herkunft "AUFTRAG" gibt es nur fuer einen Prozess unterhalb des startenden Panes
+(@wb_spawner), eine Wache dorthin zu haengen waere eine behauptete Herkunft. Der Text enthaelt
+deshalb nur die Fortsetzung des schon erteilten Auftrags, keine neue Anweisung. Als zugestellt
+zaehlt nur `weg=claude-socket`; jede andere Antwort gilt als nicht zugestellt. Die Meldung an
+den startenden Pane nach der Obergrenze geht ebenfalls ueber wb-inbox.
+
+WER ZUSTAENDIG IST. Nur Panes mit @wb_role=worker und gesetztem @wb_worker. Jeder andere
+Pane (Orchestrator, Hauptagent) nur mit der Pane-Option @wb_netzwache=ja (Vorgabe: aus).
+
+WORAN ES ERKANNT WIRD (Harness-Beleg, nicht Bildschirmtext). Der letzte bedeutsame Eintrag
+im Transkript ist ein Assistenten-Eintrag mit isApiErrorMessage=true (gemessen 14.10.2026,
+Claude Code 2.1.299: error="server_error", apiErrorStatus=502, model "<synthetic>", Text
+"API Error: 502 Anbieter nicht erreichbar ..."). system/attachment/queue-Eintraege dahinter
+zaehlen nicht; ein spaeterer user- oder normaler Assistenten-Eintrag heisst: nicht mehr
+gestrandet. Rate-Limits (error=rate_limit, 429, usage limit, resets ...) und Anmelde-,
+Abrechnungs- und Anfragefehler sind NICHT gemeint.
+
+GEMESSEN 14.10.2026, Claude Code 2.1.299 (eigenes HOME, Attrappen-Server auf Loopback, der jede
+Anfrage mit 502 beantwortet, `claude -p`, CLAUDE_CODE_MAX_RETRIES=1; Hooks SessionStart,
+UserPromptSubmit, SessionEnd, Stop, StopFailure registriert): Zugende durch API-Fehler schreibt
+(1) je Wiederholung einen Eintrag type=system, subtype=api_error (retryAttempt/maxRetries) und
+(2) nach der letzten Wiederholung den Assistenten-Eintrag isApiErrorMessage=true, error=
+server_error, apiErrorStatus=502, Ausgabe terminal_reason=api_error. Es feuerten SessionStart,
+UserPromptSubmit und SessionEnd, WEDER Stop NOCH StopFailure. Ein Hook-Weg faellt damit aus
+(nur -p gemessen, nicht die interaktive TUI; fuer die Wache egal, sie liest das Transkript).
+Die system/api_error-Eintraege sind Zwischenstand der eingebauten Wiederholungen (ohne Begrenzung
+10 Anfragen ueber mehr als 150 s) und zaehlen nicht: erst der Assistenten-Eintrag macht den Worker
+gestrandet.
+
+ANDERE HARNESSES (NICHT gemessen, nur beschrieben). Diese Wache liest ausschliesslich Claude-
+Transkripte; fuer pi, codex und opencode liefert transkript_pfad() keinen Claude-Pfad, sie bleiben
+unberuehrt. Erkennen wuerde man dort am jeweiligen Sitzungsprotokoll, nicht am Bildschirm: pi an
+der Sitzungsdatei, die seine Datei-Inbox-Anmeldung meldet (`wb-inbox transcript <pane>`), letzte
+Assistenten-Nachricht mit stopReason "error"; codex am Rollout (rollout_path am Thread, auch
+`wb-inbox transcript`), letzter Zug mit Fehler- oder turn_aborted-Ereignis; opencode an der letzten
+Nachricht mit error.name "APIError". Das "weiter" ginge bei pi/opencode ueber die Datei-Inbox
+(wb-inbox sende, dort INFORMATION) und bei codex ueber `codex queue`. Gebaut ist das nicht: die
+Formate sind hier nicht gemessen, und die Erkennung am Bildschirmtext allein ist ausgeschlossen.
+
+GRENZEN. Hoechstens 3 Fortsetzungen je Worker in 3600 s; jeder Fehlereintrag wird nur einmal
+bedient (Schluessel = uuid des Eintrags). Fehlereintraege aelter als WB_NETZWACHE_MAXALTER
+(Vorgabe 7200 s) werden nicht angefasst. Die Verlaufszeile traegt keine Werte aus dem
+Fehlertext. Kein Dauerjob, keine Konfigurationsaenderung.
+
+TESTVARIABLEN (nur mit WB_TESTUMGEBUNG=1): WB_NETZWACHE_DNS=ok|fail steuert die DNS-Pruefung,
+WB_NETZWACHE_JETZT=<epoch> die Uhr, WB_NETZWACHE_TRANSKRIPT=<datei> das Transkript. Unabhaengig davon: WB_NETZWACHE_STATE (Zustandsordner,
+Vorgabe ~/.local/state/wb-netzwache), WB_NETZWACHE_HOST (Vorgabe api.anthropic.com),
+WB_NETZWACHE_DNSFRIST (Vorgabe 5 s), WB_NETZWACHE_MAXALTER, WB_NETZWACHE_OBERGRENZE (3),
+WB_TMUX_SOCKET.
+"""
+
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+SCHWANZ_BYTES = 262144
+STUNDE = 3600
+
+# Eintragsarten, die nichts darueber sagen, ob der Zug weiterging.
+EGAL = {"system", "attachment", "queue-operation", "permission-mode", "file-history-snapshot",
+        "last-prompt", "ai-title", "summary", "custom-title", "agent-name", "atis-latch",
+        "progress", "pr-link", "mode"}
+
+# Kein Netz-/Serverfehler, auch wenn der Text ihnen aehnelt.
+LIMIT_MUSTER = re.compile(
+    r"(?i)(?<!\d)429(?!\d)|rate[\s_-]?limit|usage[\s_-]?limit|resets?\s+(?:at\s+)?\d|quota")
+KEIN_NETZ_FEHLER = {"rate_limit", "authentication_failed", "billing_error", "invalid_request",
+                    "oauth_org_not_allowed", "max_output_tokens"}
+KEIN_NETZ_STATUS = {400, 401, 402, 403, 404, 413, 422, 429}
+NETZ_MUSTER = re.compile(
+    r"(?i)unable to connect|connection (?:error|refused|reset|closed|lost)|econn|etimedout|"
+    r"enotfound|eai_again|fetch failed|socket hang up|network|timed? ?out|nicht erreichbar|"
+    r"getaddrinfo|dns|bad gateway|service unavailable|gateway time-?out|overloaded")
+
+
+def jetzt():
+    if os.environ.get("WB_TESTUMGEBUNG") == "1" and os.environ.get("WB_NETZWACHE_JETZT"):
+        try:
+            return float(os.environ["WB_NETZWACHE_JETZT"])
+        except ValueError:
+            pass
+    return time.time()
+
+
+def zustandsordner():
+    return os.environ.get("WB_NETZWACHE_STATE") or os.path.expanduser("~/.local/state/wb-netzwache")
+
+
+def kennung(name):
+    return re.sub(r"[^A-Za-z0-9]", "-", name or "") or "ohne-name"
+
+
+def zustand_pfad(name):
+    return os.path.join(zustandsordner(), kennung(name) + ".json")
+
+
+def zustand_lesen(name):
+    try:
+        with open(zustand_pfad(name)) as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def zustand_schreiben(name, d):
+    ordner = zustandsordner()
+    os.makedirs(ordner, exist_ok=True)
+    pfad = zustand_pfad(name)
+    tmp = "%s.%d.tmp" % (pfad, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(d, f)
+    os.replace(tmp, pfad)
+
+
+# ------------------------------------------------------------------ tmux ----
+def tmux(args):
+    befehl = ["tmux"]
+    sock = os.environ.get("WB_TMUX_SOCKET", "")
+    if sock:
+        befehl += ["-L", sock]
+    try:
+        r = subprocess.run(befehl + args, stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def pane_option(pane, option):
+    v = tmux(["show-options", "-pqv", "-t", pane, option])
+    return v or ""
+
+
+def zustaendig(pane):
+    """(ja, grund). Worker-Pane der Werkbank, oder Opt-in ueber @wb_netzwache=ja."""
+    if tmux(["display", "-p", "-t", pane, "#{pane_id}"]) is None:
+        return False, "Pane nicht lesbar"
+    if pane_option(pane, "@wb_netzwache") == "ja":
+        return True, "Opt-in"
+    if pane_option(pane, "@wb_role") == "worker" and pane_option(pane, "@wb_worker"):
+        return True, "Worker"
+    return False, "kein Worker-Pane und kein Opt-in (@wb_netzwache)"
+
+
+# ------------------------------------------------------------ Transkript ----
+def transkript_pfad(pane, name, vorgabe):
+    if vorgabe:
+        return vorgabe
+    if os.environ.get("WB_TESTUMGEBUNG") == "1" and os.environ.get("WB_NETZWACHE_TRANSKRIPT"):
+        return os.environ["WB_NETZWACHE_TRANSKRIPT"]
+    home = os.path.expanduser("~")
+    if name:
+        for werkzeug in (os.path.join(home, ".local/bin/wb-state"),):
+            if os.access(werkzeug, os.X_OK):
+                try:
+                    r = subprocess.run([werkzeug, "worker-transcript", name], stdin=subprocess.DEVNULL,
+                                       capture_output=True, text=True, timeout=10)
+                except (OSError, subprocess.SubprocessError):
+                    continue
+                p = r.stdout.strip()
+                if r.returncode == 0 and p:
+                    return p
+    wi = os.path.join(home, ".local/bin/wb-inbox")
+    if os.access(wi, os.X_OK):
+        try:
+            r = subprocess.run([wi, "transcript", pane], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=10,
+                               env=dict(os.environ))
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        p = r.stdout.strip().splitlines()
+        if r.returncode == 0 and p and os.path.isfile(p[-1]):
+            return p[-1]
+    return ""
+
+
+def schwanz(pfad):
+    try:
+        groesse = os.path.getsize(pfad)
+        with open(pfad, "rb") as f:
+            start = max(0, groesse - SCHWANZ_BYTES)
+            f.seek(start)
+            daten = f.read()
+    except OSError:
+        return []
+    zeilen = daten.splitlines()
+    if start > 0 and len(zeilen) > 1:
+        zeilen = zeilen[1:]
+    return [z for z in zeilen if z.strip()]
+
+
+def eintrag_text(e):
+    m = e.get("message")
+    inhalt = m.get("content") if isinstance(m, dict) else e.get("content")
+    teile = []
+    if isinstance(inhalt, str):
+        teile.append(inhalt)
+    elif isinstance(inhalt, list):
+        for t in inhalt:
+            if isinstance(t, dict) and isinstance(t.get("text"), str):
+                teile.append(t["text"])
+    return "\n".join(teile)
+
+
+def letzter_eintrag(pfad):
+    """Der letzte bedeutsame Eintrag (user oder assistant, nicht Nebenkette) oder None."""
+    for zeile in reversed(schwanz(pfad)):
+        try:
+            e = json.loads(zeile)
+        except ValueError:
+            continue
+        if not isinstance(e, dict) or e.get("isSidechain") is True:
+            continue
+        art = e.get("type")
+        if art in EGAL or art not in ("user", "assistant"):
+            continue
+        return e
+    return None
+
+
+def netzfehler(e):
+    """(ist_netzfehler, grund) fuer einen Assistenten-Eintrag."""
+    if not isinstance(e, dict) or e.get("type") != "assistant":
+        return False, "letzter Eintrag ist kein Assistenten-Eintrag"
+    text = eintrag_text(e)
+    if not (e.get("isApiErrorMessage") is True or text.strip().startswith("API Error")):
+        return False, "letzter Eintrag ist kein API-Fehler"
+    status = e.get("apiErrorStatus")
+    art = e.get("error")
+    if LIMIT_MUSTER.search(text) or art == "rate_limit" or status == 429:
+        return False, "Rate-Limit, eigener Weg"
+    if art in KEIN_NETZ_FEHLER or (isinstance(status, int) and status in KEIN_NETZ_STATUS):
+        return False, "API-Fehler ohne Netzbezug"
+    if (isinstance(status, int) and 500 <= status <= 599) or art == "server_error" \
+            or NETZ_MUSTER.search(text):
+        return True, "Netz- oder Serverfehler"
+    return False, "API-Fehler ohne Netzbezug"
+
+
+def eintrag_zeit(e):
+    z = e.get("timestamp")
+    if not isinstance(z, str):
+        return None
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(z.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+# ------------------------------------------------------------------- DNS ----
+def dns_geht():
+    if os.environ.get("WB_TESTUMGEBUNG") == "1" and os.environ.get("WB_NETZWACHE_DNS"):
+        return os.environ["WB_NETZWACHE_DNS"] == "ok"
+    host = os.environ.get("WB_NETZWACHE_HOST") or "api.anthropic.com"
+    try:
+        frist = float(os.environ.get("WB_NETZWACHE_DNSFRIST") or 5)
+    except ValueError:
+        frist = 5.0
+    ergebnis = []
+
+    def lauf():
+        try:
+            ergebnis.append(bool(socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)))
+        except OSError:
+            ergebnis.append(False)
+
+    t = threading.Thread(target=lauf, daemon=True)
+    t.start()
+    t.join(frist)
+    return bool(ergebnis and ergebnis[0])
+
+
+# ------------------------------------------------------------- Entscheidung --
+def obergrenze():
+    try:
+        return max(1, int(os.environ.get("WB_NETZWACHE_OBERGRENZE") or 3))
+    except ValueError:
+        return 3
+
+
+def maxalter():
+    try:
+        return float(os.environ.get("WB_NETZWACHE_MAXALTER") or 7200)
+    except ValueError:
+        return 7200.0
+
+
+def pruefe(pane, name, transkript):
+    ja, grund = zustaendig(pane)
+    if not ja:
+        return ["nichts", grund]
+    pfad = transkript_pfad(pane, name, transkript)
+    if not pfad or not os.path.isfile(pfad):
+        return ["nichts", "kein Claude-Transkript fuer diesen Pane"]
+    e = letzter_eintrag(pfad)
+    ist, grund = netzfehler(e)
+    if not ist:
+        return ["nichts", grund]
+    schluessel = str(e.get("uuid") or e.get("timestamp") or "")
+    if not schluessel:
+        return ["nichts", "Fehlereintrag ohne Kennung"]
+    z = eintrag_zeit(e)
+    nun = jetzt()
+    if z is not None and nun - z > maxalter():
+        return ["nichts", "Fehlereintrag zu alt"]
+    st = zustand_lesen(name or pane)
+    if st.get("fehler") == schluessel:
+        return ["nichts", "dieser Fehler ist schon bedient"]
+    if not dns_geht():
+        return ["warte", "Namensaufloesung geht noch nicht"]
+    fruehere = [t for t in st.get("gesendet", []) if isinstance(t, (int, float)) and nun - t < STUNDE]
+    if len(fruehere) >= obergrenze():
+        if st.get("gemeldet") == schluessel:
+            return ["nichts", "Obergrenze erreicht, schon gemeldet"]
+        spawner = pane_option(pane, "@wb_spawner") or "-"
+        text = ("Netzwache: der Worker %s (Pane %s) steht nach einem API-Fehler still. Ich habe in der "
+                "letzten Stunde schon %d Fortsetzungen geschickt und schicke keine weitere. Bitte "
+                "ansehen." % (name or "?", pane, len(fruehere)))
+        return ["melden", schluessel, spawner, text]
+    return ["weiter", schluessel,
+            "[Netzwache] Das Netz ist wieder da. Setze deinen bisherigen Auftrag dort fort, wo er "
+            "abgebrochen ist; kein neuer Auftrag."]
+
+
+def verbuchen(name, schluessel, feld):
+    st = zustand_lesen(name)
+    if feld == "gesendet":
+        nun = jetzt()
+        st["gesendet"] = [t for t in st.get("gesendet", [])
+                          if isinstance(t, (int, float)) and nun - t < STUNDE] + [nun]
+        st["fehler"] = schluessel
+    else:
+        st["gemeldet"] = schluessel
+        st["fehler"] = schluessel
+    zustand_schreiben(name, st)
+
+
+def main(argv):
+    socket_name = None
+    rest = []
+    i = 0
+    transkript = ""
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-L", "--socket") and i + 1 < len(argv):
+            socket_name = argv[i + 1]
+            i += 2
+        elif a == "--transkript" and i + 1 < len(argv):
+            transkript = argv[i + 1]
+            i += 2
+        else:
+            rest.append(a)
+            i += 1
+    if socket_name:
+        os.environ["WB_TMUX_SOCKET"] = socket_name
+    if len(rest) >= 2 and rest[0] == "pruefe":
+        pane = rest[1]
+        name = rest[2] if len(rest) > 2 else ""
+        try:
+            antwort = pruefe(pane, name, transkript)
+        except Exception as exc:  # die Wache darf den Guard nie stoeren
+            antwort = ["nichts", "Fehler in der Netzwache: %s" % type(exc).__name__]
+        print("\t".join(x.replace("\t", " ").replace("\n", " ") for x in antwort))
+        return 0
+    if len(rest) == 3 and rest[0] in ("gesendet", "gemeldet"):
+        verbuchen(rest[1], rest[2], rest[0])
+        return 0
+    sys.stderr.write("Aufruf: wb-netzwache pruefe <pane> [<name>] [--transkript <datei>] "
+                     "| gesendet|gemeldet <name> <schluessel>\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

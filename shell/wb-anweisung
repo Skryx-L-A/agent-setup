@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""wb-anweisung -- gibt eine Anweisung der Werkzeug-Quelle (Abschnitt `anweisungen` in
+werkzeuge.default.json) als Text aus. Jeder Einspielweg nutzt diesen einen Befehl: Claude-Hooks
+im Werkbank-Plugin, wb-instructions, die opencode-Bruecke, die pi-Extension und die Spawner.
+
+  wb-anweisung <name> volltext|erinnerung [--claude-hook <Ereignis>]
+  wb-anweisung --anlass <anlass> [--harness <id>] volltext|erinnerung [--claude-hook <Ereignis>]
+  wb-anweisung --pfad <name> volltext|erinnerung        nur den aufgeloesten Dateipfad
+  wb-anweisung --anlass worker-auftrag [--harness <id>] --auftragszeile
+                                                        je Anweisung eine Zeile fuer einen Auftrag:
+                                                        Erinnerung plus Verweis auf den Volltext
+
+Mit --anlass werden alle Anweisungen ausgegeben, die diesen Anlass (sitzungsstart, nachricht,
+worker-auftrag) tragen und auf dieser Maschine (und, mit --harness, fuer diesen Harness) gelten,
+getrennt durch eine Leerzeile. Der volltext verliert einen fuehrenden YAML-Kopf (--- ... ---),
+damit eine SKILL.md zugleich Skill und Anweisung sein kann.
+
+--claude-hook <Ereignis> verpackt die Ausgabe als Claude-Hook-JSON
+({"hookSpecificOutput": {"hookEventName": ..., "additionalContext": ...}}); ohne Text keine Ausgabe.
+Dabei liest es die Hook-Eingabe (JSON auf stdin): session_id fuer den Takt, bei SessionStart source.
+
+TAKT (Feld `takt` der Anweisung): `takt.nachricht.alle` = N gibt die erinnerung nur bei jeder N-ten
+Nachricht einer Sitzung aus (Vorgabe 1 = jede); gezaehlt wird je Sitzungskennung (session_id aus der
+Hook-Eingabe oder --sitzung <id>) in ~/.local/state/wb-anweisung/takt.json (0600). Ohne Kennung gilt
+jede Nachricht. `takt.nach_kompaktierung` false unterdrueckt den volltext bei SessionStart mit
+source compact (Vorgabe true: Volltext bei jedem SessionStart).
+
+Kein Netz; einziger Zustand ist der Taktzaehler. Exit immer 0: fehlt Quelle, Eintrag oder Datei, bleibt stdout leer und
+eine Hinweiszeile geht nach stderr (ein Hook oder Spawner darf daran nie scheitern).
+"""
+import json
+import os
+import sys
+
+TEILE = ("volltext", "erinnerung")
+TAKT_SITZUNGEN = 200   # so viele Sitzungen behaelt der Zaehler je Anweisung
+
+
+def takt_alle(e):
+    t = e.get("takt") if isinstance(e.get("takt"), dict) else {}
+    n = (t.get("nachricht") or {}).get("alle", 1) if isinstance(t.get("nachricht"), dict) else 1
+    return n if isinstance(n, int) and not isinstance(n, bool) and n >= 1 else 1
+
+
+def nach_kompaktierung(e):
+    t = e.get("takt") if isinstance(e.get("takt"), dict) else {}
+    return t.get("nach_kompaktierung", True) is not False
+
+
+def takt_faellig(name, e, sitzung):
+    """Zaehlt die Nachricht dieser Sitzung und sagt, ob die erinnerung jetzt dran ist (jede N-te)."""
+    n = takt_alle(e)
+    if n <= 1 or not sitzung:
+        return True
+    ordner = os.path.join(os.environ.get("HOME") or os.path.expanduser("~"), ".local", "state", "wb-anweisung")
+    pfad = os.path.join(ordner, "takt.json")
+    try:
+        with open(pfad, encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            d = {}
+    except (OSError, ValueError):
+        d = {}
+    je = d.get(name) if isinstance(d.get(name), dict) else {}
+    zahl = (je.pop(str(sitzung), 0) if isinstance(je.get(str(sitzung), 0), int) else 0) + 1
+    je[str(sitzung)] = zahl            # zuletzt benutzte Sitzung steht hinten
+    while len(je) > TAKT_SITZUNGEN:
+        je.pop(next(iter(je)))
+    d[name] = je
+    try:
+        os.makedirs(ordner, mode=0o700, exist_ok=True)
+        tmp = "%s.%d.tmp" % (pfad, os.getpid())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        os.replace(tmp, pfad)
+    except OSError:
+        hinweis("Taktzaehler nicht schreibbar, Erinnerung bei jeder Nachricht")
+        return True
+    return zahl % n == 0
+
+
+def hook_eingabe():
+    """Hook-Eingabe (JSON auf stdin) oder {}; liest nur, wenn stdin kein Terminal ist."""
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return {}
+        d = json.loads(sys.stdin.read() or "{}")
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def hinweis(text):
+    sys.stderr.write("wb-anweisung: %s\n" % text)
+
+
+def ohne_kopf(text):
+    """Entfernt einen fuehrenden YAML-Kopf (---\\n...\\n---\\n) und Leerzeilen danach."""
+    if not text.startswith("---\n"):
+        return text
+    ende = text.find("\n---\n", 4)
+    if ende < 0:
+        return text
+    return text[ende + 5:].lstrip("\n")
+
+
+def lesen(kern, ordner, name, e, teil, nur_pfad=False):
+    rel = e.get(teil)
+    if not isinstance(rel, str) or not rel.strip():
+        if teil == "volltext":
+            hinweis("anweisungen.%s: kein %s in der Quelle" % (name, teil))
+        return ""
+    p = kern._datei_da(rel, ordner)
+    if nur_pfad:
+        return p + "\n"
+    try:
+        with open(p, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        hinweis("anweisungen.%s: %s nicht lesbar (%s)" % (name, teil, p))
+        return ""
+    if teil == "volltext":
+        text = ohne_kopf(text)
+    return text if text.endswith("\n") or not text else text + "\n"
+
+
+def auftragszeile(kern, ordner, name, e):
+    """Eine Zeile fuer einen Worker-Auftrag: die Erinnerung und der Pfad des Volltexts (ein Auftrag
+    wird in einen Pane getippt; der Volltext steht deshalb als Verweis, nicht als Text darin)."""
+    pfad = lesen(kern, ordner, name, e, "volltext", nur_pfad=True).strip()
+    if not pfad or not os.path.isfile(pfad):
+        hinweis("anweisungen.%s: volltext fehlt, keine Auftragszeile" % name)
+        return ""
+    kurz = " ".join(lesen(kern, ordner, name, e, "erinnerung").split())
+    return "[Anweisung %s — immer befolgen] %sVolltext vor der ersten Antwort lesen: %s\n" % (
+        name, kurz + " " if kurz else "", pfad)
+
+
+def gilt(kern, e, harness, reg_holen):
+    m = kern.maschine()
+    if m not in e.get("maschinen", [m]):
+        return False
+    if harness is None:
+        return True
+    reg = reg_holen()
+    if reg is None:
+        return True
+    return harness in kern.harnesses_aufloesen(e.get("harnesses", []), "anweisungen", reg)
+
+
+def ausgeben(text, hook):
+    if not text:
+        return
+    if hook:
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": hook, "additionalContext": text.rstrip("\n")}}, ensure_ascii=False))
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(text)
+
+
+def main(argv):
+    args = list(argv[1:])
+    anlass = harness = hook = sitzung = None
+    nur_pfad = zeile = False
+    rest = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--anlass", "--harness", "--claude-hook", "--sitzung") and i + 1 < len(args):
+            if a == "--sitzung":
+                sitzung = args[i + 1]
+            elif a == "--anlass":
+                anlass = args[i + 1]
+            elif a == "--harness":
+                harness = args[i + 1]
+            else:
+                hook = args[i + 1]
+            i += 2
+            continue
+        if a == "--pfad":
+            nur_pfad = True
+        elif a == "--auftragszeile":
+            zeile = True
+            rest.append("volltext")
+        elif a in ("-h", "--help"):
+            sys.stdout.write(__doc__)
+            return 0
+        else:
+            rest.append(a)
+        i += 1
+    teil = rest[-1] if rest else None
+    if teil not in TEILE or (anlass is None and len(rest) != 2) or (anlass is not None and len(rest) != 1):
+        hinweis("Aufruf: wb-anweisung <name> volltext|erinnerung  oder  --anlass <anlass> volltext|erinnerung")
+        return 0
+
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    try:
+        import werkzeuge_kern as kern
+        ordner = kern.quellordner()
+        with open(os.path.join(ordner, "werkzeuge.default.json"), encoding="utf-8") as f:
+            q = json.load(f)
+        abschnitt = q.get("anweisungen") or {}
+        if not isinstance(abschnitt, dict):
+            raise ValueError("anweisungen ist kein Objekt")
+    except Exception as ex:  # Quelle fehlt/kaputt: Hinweis statt Absturz
+        hinweis("Quelle nicht lesbar (%s)" % (getattr(ex, "args", [""])[0] if ex.args else type(ex).__name__))
+        return 0
+
+    quelle_ereignis = None
+    if hook:
+        ein = hook_eingabe()
+        sitzung = sitzung or ein.get("session_id")
+        quelle_ereignis = ein.get("source")
+
+    def text_fuer(name, e):
+        if teil == "erinnerung" and not nur_pfad and not takt_faellig(name, e, sitzung):
+            return ""
+        if (teil == "volltext" and hook == "SessionStart" and quelle_ereignis == "compact"
+                and not nach_kompaktierung(e)):
+            return ""
+        return lesen(kern, ordner, name, e, teil, nur_pfad)
+
+    reg_cache = []
+
+    def reg_holen():
+        if not reg_cache:
+            try:
+                with open(kern.registry_pfad(ordner), encoding="utf-8") as f:
+                    reg_cache.append(json.load(f))
+            except Exception:
+                hinweis("Registry nicht lesbar, Harness-Filter entfaellt")
+                reg_cache.append(None)
+        return reg_cache[0]
+
+    if anlass is None:
+        name = rest[0]
+        e = abschnitt.get(name)
+        if not isinstance(e, dict):
+            hinweis("anweisungen.%s steht nicht in der Quelle" % name)
+            return 0
+        ausgeben(text_fuer(name, e), hook)
+        return 0
+
+    stuecke = []
+    for name, e in abschnitt.items():
+        if not isinstance(e, dict) or anlass not in (e.get("anlaesse") or []):
+            continue
+        if not gilt(kern, e, harness, reg_holen):
+            continue
+        if zeile:
+            t = auftragszeile(kern, ordner, name, e)
+        else:
+            t = text_fuer(name, e)
+        if t:
+            stuecke.append(t)
+    ausgeben(("" if nur_pfad or zeile else "\n").join(stuecke), hook)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except Exception as ex:  # nie einen Hook oder Spawner abbrechen
+        hinweis("unerwarteter Fehler: %s" % type(ex).__name__)
+        sys.exit(0)

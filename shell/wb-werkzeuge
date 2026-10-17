@@ -4,6 +4,7 @@ Harnesses schreiben, ohne Fremdes anzufassen. Befehle und Vertrag: werkzeuge_ker
 die Adapter tragen sich ueber werkzeuge_kern.adapter_registrieren in die Haken des Kerns ein."""
 import sys
 
+import werkzeuge_anweisungen
 import werkzeuge_claude
 import werkzeuge_codex
 import werkzeuge_dateien
@@ -14,6 +15,7 @@ werkzeuge_claude.registrieren()
 werkzeuge_codex.registrieren()
 werkzeuge_familie.registrieren()
 werkzeuge_dateien.registrieren()
+werkzeuge_anweisungen.registrieren()
 
 if __name__ == "__main__":
     sys.exit(werkzeuge_kern.main(sys.argv))

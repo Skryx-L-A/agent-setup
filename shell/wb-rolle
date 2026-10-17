@@ -40,6 +40,11 @@
 # der seine Herkunft aktiv verwischt, schuetzt auch das nicht. Abgewehrt wird der
 # gemessene Fall — der eine erlaubte Befehl, der bisher genuegte.
 set -uo pipefail
+# Die Variablen, nach denen der xcrun-Shim /usr/bin/python3 sein Programm sucht (Review
+# handyguard2 N1, 14.10.2026; Begruendung in wb-decide): ein Register, das "kein Eintrag"
+# sagt, erlaubte sonst das Setzen einer fremden Rolle. Das Register laeuft zusaetzlich unter
+# `env -i` (register unten).
+unset DEVELOPER_DIR SDKROOT TOOLCHAINS
 
 ABGELEHNT=77
 
@@ -69,12 +74,13 @@ for kandidat in "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/ho
 done
 [ -n "$ROLLEN_PY" ] || { echo "wb-rolle: hooks/lib/rollen.py nicht gefunden — ohne Register wird nichts gesetzt." >&2; exit 1; }
 
+# Positivliste mit denselben Werten wie bisher, die rollen.py liest: HOME und AWB_ROLLEN_DIR
+# (Registerordner), PATH (tmux; dieselbe Quelle wie die tmux-Aufrufe dieses Skripts) und die
+# Serverwahl (TMUX, TMUX_TMPDIR). Dazu -I -S wie in wb-mensch.
 register() {
-    if [ -n "$SOCKET" ]; then
-        /usr/bin/python3 "$ROLLEN_PY" -L "$SOCKET" "$@"
-    else
-        /usr/bin/python3 "$ROLLEN_PY" "$@"
-    fi
+    /usr/bin/env -i HOME="$HOME" PATH="$PATH" ${TMUX:+TMUX="$TMUX"} \
+        ${TMUX_TMPDIR:+TMUX_TMPDIR="$TMUX_TMPDIR"} ${AWB_ROLLEN_DIR:+AWB_ROLLEN_DIR="$AWB_ROLLEN_DIR"} \
+        /usr/bin/python3 -I -S "$ROLLEN_PY" ${SOCKET:+-L "$SOCKET"} "$@"
 }
 
 # --- Herkunft messen (gleiche Bauart wie wb-pane-write) --------------------

@@ -37,15 +37,29 @@ import atomar_schreiben
 SCHEMA_QUELLE = "werkzeuge/1"
 SCHEMA_STATUS = "werkzeuge-status/1"
 SCHEMA_STATE = "werkzeuge-state/1"
-ARTEN = ("mcp", "hooks", "prompts", "plugins", "rechte")
-SCHLUESSELWORTE = {"alle-mit-mcp": "mcp", "alle-mit-prompts": "prompts", "alle-mit-hooks": "hooks"}
+ARTEN = ("mcp", "hooks", "prompts", "plugins", "rechte", "skills", "anweisungen")
+SCHLUESSELWORTE = {"alle-mit-mcp": "mcp", "alle-mit-prompts": "prompts", "alle-mit-hooks": "hooks",
+                   "alle-mit-skills": "skills", "alle-mit-anweisungen": "anweisungen",
+                   "alle-mit-rechte": "rechte"}
+# Anlaesse, zu denen eine Anweisung (volltext/erinnerung) einem Harness zugestellt wird.
+ANLAESSE = ("sitzungsstart", "nachricht", "worker-auftrag")
 # Eintraege, die kein Adapter schreibt (leere Harness-Menge): Wissen bleibt in der Quelle, `grund` sagt warum.
 # nur-traeger: der Agenten-Traeger registriert den Hook selbst je Claude-Zug (eigene turn-settings.json).
 OHNE_HARNESS = ("nur-traeger",)
+# alle: jeder Harness der Registry, auch kuenftige (Stilregel, der Nutzer 13.10.); ohne toolAdapter-Bedingung.
+ALLE = "alle"
 VERWEIS_PRAEFIXE = ("schluesselbund:", "filter:")
 HUB_NAME = "werkbank"            # Name des einen Hub-Eintrags in mcp (Hub-Entwurf 5.1)
 HUB_FELDER = ("port", "idleMinutes", "maschinen")
 BEFUND_ZUSTAENDE = ("FEHLT", "VERALTET", "ABGEWICHEN")
+# Messdatum je Registry-Zelle: gemessen "<JJJJ-MM-TT>/<Methode>", dazu `beleg` (kurz). Ohne Feld ist eine
+# Zelle mit weg "leer" ein ungemessener Stand, kein geprueftes Merkmal (Luecken-Messung 13.10.).
+GEMESSEN_MUSTER = re.compile(r"^\d{4}-\d{2}-\d{2}/(help|doku|binary|probe|quelle|herleitung)$")
+UNGEMESSEN_GRUND = "ungemessen: weg leer ohne gemessen-Feld, Faehigkeit des Harness nicht belegt"
+# Fehlt eine Datei oder ein Ordner, den skills/anweisungen nennen (etwa werkbank-stil/ neben einer
+# installierten Quelle), gilt das nur dem Eintrag: Befund je Eintrag, die Quelle bleibt gueltig
+# (Ausfallschutz 13.10.; sonst fielen wb-werkzeuge und wb-hub ganz aus). Strukturfehler bleiben QUELLE-UNGUELTIG.
+QUELLDATEI_FEHLT = "QUELLDATEI-FEHLT"
 
 
 class FehlerInQuelle(Exception):
@@ -191,12 +205,92 @@ def _hub_pruefen(q, fehler):
         ung("hub", "hoechstens ein mcp-Eintrag mit token hub (gefunden: %d)" % len(hub_eintraege))
 
 
-def quelle_pruefen(q):
-    """Gibt die Fehlerliste zurueck (leer = gueltig). Werte unter geheimnisse nie im Text."""
+def _datei_da(pfad, ordner):
+    """Pfad einer Quelldatei: ~ und absolut gelten, sonst relativ zum Ordner der Quelle."""
+    p = pfad_aufloesen(pfad)
+    if not os.path.isabs(p) and ordner:
+        p = os.path.join(ordner, p)
+    return p
+
+
+def _skills_pruefen(ref, e, ung, fehlt, ordner, aktiv):
+    """skills.<name>: genau eine von `quelle` (Ordner mit SKILL.md) oder `alle-unter` (Ordner voller Skill-Ordner)."""
+    q, alle = e.get("quelle"), e.get("alle-unter")
+    if (q is None) == (alle is None):
+        ung(ref, "skills braucht genau eines von quelle oder alle-unter")
+        return
+    feld = "quelle" if q is not None else "alle-unter"
+    wert = e[feld]
+    if not (isinstance(wert, str) and wert.strip()):
+        ung(ref, "%s muss ein Pfad sein" % feld)
+        return
+    if ordner is None or not aktiv:
+        return
+    p = _datei_da(wert, ordner)
+    if not os.path.isdir(p):
+        fehlt(ref, "%s: Ordner nicht vorhanden" % feld)
+    elif feld == "quelle" and not os.path.isfile(os.path.join(p, "SKILL.md")):
+        fehlt(ref, "quelle: SKILL.md fehlt im Skill-Ordner")
+
+
+def _anweisungen_pruefen(ref, e, ung, fehlt, ordner, aktiv):
+    """anweisungen.<name>: volltext (Datei), optional erinnerung (Datei) und anlaesse."""
+    for feld in ("volltext", "erinnerung"):
+        w = e.get(feld)
+        if w is None:
+            if feld == "volltext":
+                ung(ref, "anweisungen brauchen volltext")
+            continue
+        if not (isinstance(w, str) and w.strip()):
+            ung(ref, "%s muss ein Dateipfad sein" % feld)
+        elif ordner is not None and aktiv and not os.path.isfile(_datei_da(w, ordner)):
+            fehlt(ref, "%s: Datei nicht vorhanden" % feld)
+    an = e.get("anlaesse")
+    if an is not None:
+        if not (isinstance(an, list) and an and all(isinstance(x, str) for x in an)):
+            ung(ref, "anlaesse muss eine nichtleere Liste sein")
+        else:
+            for x in an:
+                if x not in ANLAESSE:
+                    ung(ref, "unbekannter Anlass %r (erlaubt: %s)" % (x, ", ".join(ANLAESSE)))
+    # takt (P2, WO 13.10.): nachricht.alle = N (jede N-te Nachricht, >= 1), nach_kompaktierung bool
+    t = e.get("takt")
+    if t is not None:
+        n = (t.get("nachricht") or {}).get("alle", 1) if isinstance(t, dict) and isinstance(
+            t.get("nachricht", {}), dict) else None
+        if not isinstance(t, dict) or not isinstance(n, int) or isinstance(n, bool) or n < 1 \
+                or not isinstance(t.get("nach_kompaktierung", True), bool):
+            ung(ref, "takt: {nachricht: {alle: N>=1}, nach_kompaktierung: true|false} erwartet")
+
+
+def _rechte_pruefen(ref, e, ung):
+    """rechte.<name>: erlauben/verbieten sind Listen von Mustern (neutral); mindestens eine nichtleer."""
+    gesetzt, kaputt = False, False
+    for feld in ("erlauben", "verbieten"):
+        w = e.get(feld)
+        if w is None:
+            continue
+        if not (isinstance(w, list) and all(isinstance(x, str) and x.strip() for x in w)):
+            ung(ref, "%s muss eine Liste von Mustern sein" % feld)
+            kaputt = True
+        elif w:
+            gesetzt = True
+    if not gesetzt and not kaputt:
+        ung(ref, "rechte braucht erlauben oder verbieten (nichtleer)")
+
+
+def quelle_pruefen(q, ordner=None):
+    """Gibt die Fehlerliste zurueck (leer = gueltig). Werte unter geheimnisse nie im Text.
+    ordner: Ordner der Quelle; nur mit ihm prueft sie, ob Skill-Ordner und Anweisungsdateien da sind
+    (und nur fuer Eintraege, die auf dieser Maschine gelten). Eine fehlende Datei meldet sie als
+    QUELLDATEI-FEHLT; laden() macht daraus einen Befund je Eintrag statt eines Quellfehlers."""
     fehler = []
 
     def ung(eintrag, text):
         fehler.append({"code": "QUELLE-UNGUELTIG", "eintrag": eintrag, "text": text})
+
+    def fehlt(eintrag, text):
+        fehler.append({"code": QUELLDATEI_FEHLT, "eintrag": eintrag, "text": text})
 
     if not isinstance(q, dict):
         return [{"code": "QUELLE-UNGUELTIG", "eintrag": "quelle", "text": "Wurzel ist kein Objekt"}]
@@ -226,16 +320,27 @@ def quelle_pruefen(q):
                             fehler.append({"code": "GEHEIMNIS-IN-QUELLE", "eintrag": ref,
                                            "text": "geheimnisse.%s ist kein Verweis "
                                                    "(schluesselbund:<dienst>/<konto> oder filter:<name>)" % var})
+            zw = e.get("zweck")
+            if zw is not None and not isinstance(zw, str):
+                ung(ref, "zweck muss ein Text sein")
             h = e.get("harnesses")
-            if h is not None and not ((isinstance(h, str) and (h in SCHLUESSELWORTE or h in OHNE_HARNESS)) or
+            if h is not None and not ((isinstance(h, str) and (h in SCHLUESSELWORTE or h in OHNE_HARNESS or h == ALLE)) or
                                       (isinstance(h, list) and all(isinstance(x, str) for x in h))):
-                ung(ref, "harnesses: Liste, alle-mit-mcp/-prompts/-hooks oder %s erwartet" % "/".join(OHNE_HARNESS))
+                ung(ref, "harnesses: Liste, %s, %s oder %s erwartet" % (
+                    ALLE, "/".join(sorted(SCHLUESSELWORTE)), "/".join(OHNE_HARNESS)))
             m = e.get("maschinen")
             if m is not None and not (isinstance(m, list) and all(isinstance(x, str) for x in m)):
                 ung(ref, "maschinen muss eine Liste sein")
             st = e.get("status")
             if st is not None and not (isinstance(st, str) and st.startswith("offen-")):
                 ung(ref, "status muss offen-<E> sein")
+            aktiv = not isinstance(m, list) or maschine() in m
+            if art == "skills":
+                _skills_pruefen(ref, e, ung, fehlt, ordner, aktiv)
+            elif art == "anweisungen":
+                _anweisungen_pruefen(ref, e, ung, fehlt, ordner, aktiv)
+            elif art == "rechte":
+                _rechte_pruefen(ref, e, ung)
             if art == "hooks":
                 ev = e.get("ereignisse")
                 if not (isinstance(ev, list) and ev and all(isinstance(x, str) for x in ev)):
@@ -278,15 +383,43 @@ def quelle_pruefen(q):
     return fehler
 
 
+def _registry_zellen_pruefen(reg):
+    """gemessen-Muster, skillRoots und `wie`-Verweise der Registry; die Zellen selbst bleiben frei."""
+    fehler = []
+    ids = [x.get("id") for x in reg["harnesses"]]
+
+    def ung(eintrag, text):
+        fehler.append({"code": "QUELLE-UNGUELTIG", "eintrag": eintrag, "text": text})
+
+    for x in reg["harnesses"]:
+        sr = x.get("skillRoots")
+        if sr is not None and not (isinstance(sr, list) and all(isinstance(w, str) and w.startswith("~/") for w in sr)):
+            ung("registry.%s.skillRoots" % x.get("id"), "skillRoots muss eine Liste von ~/-Pfaden sein")
+        for art, z in (x.get("toolAdapter") or {}).items():
+            ref = "registry.%s.toolAdapter.%s" % (x.get("id"), art)
+            if not isinstance(z, dict):
+                continue
+            if "gemessen" in z and not (isinstance(z["gemessen"], str) and GEMESSEN_MUSTER.match(z["gemessen"])):
+                ung(ref, "gemessen muss <JJJJ-MM-TT>/<help|doku|binary|probe|quelle|herleitung> sein")
+            if "wie" in z and (z["wie"] not in ids or z["wie"] == x.get("id")):
+                ung(ref, "wie verweist auf einen unbekannten oder den eigenen Harness")
+    return fehler
+
+
 def laden():
-    """-> (quelle, registry). Wirft FehlerInQuelle mit allen Befunden."""
+    """-> (quelle, registry). Wirft FehlerInQuelle mit allen Strukturfehlern. Fehlende Quelldateien
+    stehen danach in quelldatei_befunde(q); die Eintraege selbst bleiben in der Quelle."""
     ordner = quellordner()
     q = _json_laden(os.path.join(ordner, "werkzeuge.default.json"), "quelle")
-    fehler = quelle_pruefen(q)
+    fehler = quelle_pruefen(q, ordner)
+    dateien = [f for f in fehler if f["code"] == QUELLDATEI_FEHLT]
+    fehler = [f for f in fehler if f["code"] != QUELLDATEI_FEHLT]
     reg = _json_laden(registry_pfad(ordner), "registry")
     if not isinstance(reg, dict) or not isinstance(reg.get("harnesses"), list):
         fehler.append({"code": "QUELLE-UNGUELTIG", "eintrag": "registry", "text": "harnesses fehlt"})
         reg = {"harnesses": []}
+    if not fehler:
+        fehler.extend(_registry_zellen_pruefen(reg))
     if not fehler:
         ids = [h.get("id") for h in reg["harnesses"]]
         for art in ARTEN:
@@ -298,7 +431,35 @@ def laden():
                                        "text": "unbekannter Harness %r" % x})
     if fehler:
         raise FehlerInQuelle(fehler)
+    _QUELLDATEI_BEFUNDE[id(q)] = (q, dateien)
     return q, reg
+
+
+# Befunde je Quelle aus laden(), ueber die Kennung des geladenen Objekts (die Quelle selbst bleibt
+# unveraendert, Adapter und Hub sehen kein Zusatzfeld). Der Verweis auf q haelt die Kennung fest.
+_QUELLDATEI_BEFUNDE = {}
+
+
+def quelldatei_befunde(q):
+    """[{code, eintrag, text}] der fehlenden Quelldateien einer mit laden() geladenen Quelle."""
+    paar = _QUELLDATEI_BEFUNDE.get(id(q))
+    return list(paar[1]) if paar and paar[0] is q else []
+
+
+def _quelldatei_zeilen(q, nur_art):
+    """Eine Statuszeile je Eintrag mit fehlender Quelldatei: ZIEL-UNLESBAR, der Grund nennt den Code
+    und das Feld (keine Werte). Harness "-": der Eintrag gilt allen seinen Harnesses."""
+    je_eintrag = {}
+    for f in quelldatei_befunde(q):
+        je_eintrag.setdefault(f["eintrag"], []).append(f["text"])
+    aus = []
+    for eintrag, texte in je_eintrag.items():
+        art, _, name = eintrag.partition(".")
+        if nur_art and art != nur_art:
+            continue
+        aus.append({"harness": "-", "art": art, "name": name, "ziel": None, "zustand": "ZIEL-UNLESBAR",
+                    "grund": "%s: %s (nur dieser Eintrag, die uebrige Quelle gilt)" % (QUELLDATEI_FEHLT, "; ".join(texte))})
+    return aus
 
 
 # ---------------------------------------------------------------- Statusdatei
@@ -513,8 +674,8 @@ HAKEN = {
     # zustaendig(argv) -> bool, main(argv) -> Exit: eigene Befehle/Flags eines Adapters (vor dem Kern gefragt)
     "zustaendig": "zustaendig(argv) -> bool",
     "main": "main(argv) -> Exitcode",
-    # mcp_wert(e, form) -> Wert | None (Form bekannt, aber nicht schreibbar) | WEITER
-    "mcp_wert": "mcp_wert(e, form) -> Wert | None | WEITER",
+    # mcp_wert(e, form, ad) -> Wert | None (Form bekannt, aber nicht schreibbar) | WEITER; ad = Registry-Zelle
+    "mcp_wert": "mcp_wert(e, form, ad) -> Wert | None | WEITER",
     # eintrag(r, art, name, e, harness, ad, state) -> r: Nachbearbeitung eines Kern-Eintrags (z. B. Grund)
     "eintrag": "eintrag(r, art, name, e, harness, ad, state) -> r",
     # bewerten(eintraege, q, reg, state, nur_harness, nur_art) -> eintraege: ergaenzt/ersetzt Eintraege
@@ -543,11 +704,11 @@ def _haken(art):
 
 # ---------------------------------------------------------------- Bewerten
 
-def mcp_wert(e, form):
+def mcp_wert(e, form, ad=None):
     """Die native Form eines MCP-Eintrags je Harness-Formfamilie: erst die Adapter-Haken,
-    dann die Formen des Kerns."""
+    dann die Formen des Kerns. `ad` ist die Registry-Zelle toolAdapter.mcp (Feld `hub`: http|stdio)."""
     for haken in _haken("mcp_wert"):
-        w = haken(e, form)
+        w = haken(e, form, ad)
         if w is not WEITER:
             return w
     return _mcp_wert_kern(e, form)
@@ -573,17 +734,41 @@ def _mcp_wert_kern(e, form):
     return None
 
 
+def zelle(reg, harness, art):
+    """toolAdapter.<art> des Harness. `wie: <harness>` verweist auf die Zelle eines anderen Harness
+    (copilot-cloud ist dasselbe Programm mit denselben Dateien wie copilot); das Messfeld der
+    eigenen Zelle bleibt erhalten."""
+    by_id = {x.get("id"): x for x in reg["harnesses"]}
+    z = ((by_id.get(harness) or {}).get("toolAdapter") or {}).get(art)
+    if isinstance(z, dict) and z.get("wie") in by_id and z["wie"] != harness:
+        fremd = ((by_id[z["wie"]].get("toolAdapter") or {}).get(art))
+        if isinstance(fremd, dict) and "wie" not in fremd:
+            z = dict(fremd, **{k: z[k] for k in ("gemessen", "beleg") if k in z})
+    return z
+
+
+def skill_wurzeln(reg, harness):
+    """Die Skill-Wurzeln, die der Harness selbst liest (Registry skillRoots, gemessen)."""
+    for x in reg["harnesses"]:
+        if x.get("id") == harness:
+            r = x.get("skillRoots")
+            return [w for w in r if isinstance(w, str)] if isinstance(r, list) else []
+    return []
+
+
 def harnesses_aufloesen(h, art, reg):
     harnesses = reg["harnesses"]
     if isinstance(h, list):
         return list(h)
     if h in OHNE_HARNESS:
         return []
+    if h == ALLE:
+        return [x["id"] for x in harnesses]
     if h in SCHLUESSELWORTE:
         a = SCHLUESSELWORTE[h]
         return [x["id"] for x in harnesses
-                if isinstance(x.get("toolAdapter", {}).get(a), dict)
-                and x["toolAdapter"][a].get("weg") != "leer"]
+                if isinstance(zelle(reg, x.get("id"), a), dict)
+                and zelle(reg, x.get("id"), a).get("weg") != "leer"]
     return []
 
 
@@ -599,14 +784,32 @@ def bewerten(q, reg, state, nur_harness=None, nur_art=None):
     if roh:
         eintraege = [roh[k] if (k := (x["harness"], x["art"], x["name"])) in roh and x["zustand"] == "OFFEN"
                      else x for x in eintraege]
-    return eintraege
+    return eintraege + _ungemessen(eintraege, reg, nur_harness, nur_art) + _quelldatei_zeilen(q, nur_art)
+
+
+def _ungemessen(eintraege, reg, nur_harness, nur_art):
+    """Eine Zeile je Zelle mit weg "leer" und ohne gemessen-Feld, fuer die kein Quelleintrag eine Zeile
+    liefert: sonst bliebe ein kuenftiger Harness still leer (wb-consistency: HARNESS-UNGEMESSEN)."""
+    vorhanden = {(x["harness"], x["art"]) for x in eintraege}
+    aus = []
+    for x in reg["harnesses"]:
+        if nur_harness and x.get("id") not in nur_harness:
+            continue
+        for art in ARTEN:
+            if nur_art and art != nur_art:
+                continue
+            z = zelle(reg, x.get("id"), art)
+            if (isinstance(z, dict) and z.get("weg") == "leer" and not z.get("gemessen")
+                    and (x.get("id"), art) not in vorhanden):
+                aus.append({"harness": x["id"], "art": art, "name": "-", "ziel": None,
+                            "zustand": "OFFEN", "grund": UNGEMESSEN_GRUND})
+    return aus
 
 
 def _bewerten_kern(q, reg, state, nur_harness=None, nur_art=None):
     """Die json-pfad-Eintraege des Kerns (mit mcp_wert- und eintrag-Haken). Jeder Eintrag: harness,
     art, name, ziel, zustand, grund plus interne Felder (wert, pfad, datei) fuer apply/adopt."""
     m = maschine()
-    adapter_von = {x["id"]: x.get("toolAdapter") for x in reg["harnesses"]}
     ergebnis = []
     for art in ARTEN:
         if nur_art and art != nur_art:
@@ -617,8 +820,10 @@ def _bewerten_kern(q, reg, state, nur_harness=None, nur_art=None):
             for harness in harnesses_aufloesen(e.get("harnesses", []), art, reg):
                 if nur_harness and harness not in nur_harness:
                     continue
-                ergebnis.append(_eintrag(art, name, e, harness, (adapter_von.get(harness) or {}).get(art),
-                                         state))
+                ad = zelle(reg, harness, art)
+                if art == "skills" and isinstance(ad, dict) and skill_wurzeln(reg, harness):
+                    ad = dict(ad, _wurzeln=skill_wurzeln(reg, harness))
+                ergebnis.append(_eintrag(art, name, e, harness, ad, state))
     return ergebnis
 
 
@@ -643,12 +848,18 @@ def _eintrag_kern(art, name, e, harness, ad, state):
         r["grund"] = "kein toolAdapter.%s in der Registry" % art
         return r
     if ad.get("weg") == "leer":
+        if not ad.get("gemessen"):
+            r["zustand"], r["ziel"], r["grund"] = "OFFEN", None, UNGEMESSEN_GRUND
+            return r
         r["zustand"], r["ziel"], r["grund"] = "LEER", None, ad.get("grund")
         return r
+    if art == "skills" and ad.get("weg") == "ordner-verweis":
+        return _skills_status(r, e, ad)
     if ad.get("format") != "json-pfad" or art != "mcp":
-        r["grund"] = "Adapter %s fuer %s folgt (andere Spur)" % (ad.get("format") or ad.get("weg"), art)
+        r["grund"] = "Adapter %s fuer %s folgt (%s)" % (ad.get("format") or ad.get("weg"), art,
+                                                        "W2" if ad.get("gemessen") else "andere Spur")
         return r
-    wert = mcp_wert(e, ad.get("form"))
+    wert = mcp_wert(e, ad.get("form"), ad)
     if wert is None:
         r["grund"] = "form %r unbekannt" % ad.get("form")
         return r
@@ -675,6 +886,53 @@ def _eintrag_kern(art, name, e, harness, ad, state):
         r["zustand"] = "ABGEWICHEN"
         r["grund"] = "von Hand geaendert" if rec else "Handeintrag, nicht von der Werkbank geschrieben"
     return r
+
+
+def _skills_status(r, e, ad):
+    """skills mit Weg ordner-verweis: in JEDER Skill-Wurzel des Harness (Registry skillRoots, sonst das
+    Ziel der Zelle) muss je Skill ein Eintrag stehen, der (ueber realpath) auf den Skill-Ordner der Quelle
+    zeigt. Symlink oder derselbe Ordner zaehlt als GLEICH. Nur lesend; geschrieben werden die Links von
+    `wb-instructions sync` (sync_skill_links)."""
+    try:
+        ordner = quellordner()
+    except FehlerInQuelle:
+        ordner = None
+    wurzeln = ad.get("_wurzeln") or [ad["ziel"]]
+    r["ziel"] = ", ".join(wurzeln)
+    rang = {"GLEICH": 0, "FEHLT": 1, "ABGEWICHEN": 2, "ZIEL-UNLESBAR": 3}
+    erg = [(w,) + _skills_wurzel(e, ordner, w) for w in wurzeln]
+    zustand = max((x[1] for x in erg), key=lambda z: rang.get(z, 1))
+    r["zustand"] = zustand
+    gruende = [x[2] if len(wurzeln) == 1 else "%s: %s" % (x[0], x[2]) for x in erg if x[1] != "GLEICH" and x[2]]
+    if gruende:
+        r["grund"] = "; ".join(gruende)
+    return r
+
+
+def _skills_wurzel(e, ordner, wurzel):
+    """-> (zustand, grund) fuer eine Skill-Wurzel."""
+    ziel = pfad_aufloesen(wurzel)
+    if os.path.lexists(ziel) and not os.path.isdir(ziel):
+        return "ZIEL-UNLESBAR", "Zielordner ist kein Ordner"
+    if e.get("alle-unter") is not None:
+        quelle = _datei_da(e["alle-unter"], ordner)
+        try:
+            skills = sorted(n for n in os.listdir(quelle) if os.path.isfile(os.path.join(quelle, n, "SKILL.md")))
+        except OSError:
+            return "OFFEN", "Quellordner nicht lesbar"
+        if os.path.realpath(quelle) == os.path.realpath(ziel):
+            return "GLEICH", None
+        paare = [(os.path.join(quelle, n), os.path.join(ziel, n)) for n in skills]
+    else:
+        quelle = _datei_da(e["quelle"], ordner).rstrip("/")
+        paare = [(quelle, os.path.join(ziel, os.path.basename(quelle)))]
+    fehlt = [z for _, z in paare if not os.path.lexists(z)]
+    anders = [z for q, z in paare if os.path.lexists(z) and os.path.realpath(z) != os.path.realpath(q)]
+    if anders:
+        return "ABGEWICHEN", "%d von %d zeigen woandershin" % (len(anders), len(paare))
+    if fehlt:
+        return "FEHLT", ("%d von %d fehlen" % (len(fehlt), len(paare))) if len(paare) > 1 else None
+    return "GLEICH", None
 
 
 def _oeffentlich(eintraege):
@@ -719,6 +977,12 @@ def anwenden(q, reg, nur_harness=None, nur_art=None, force=None):
     snapshots, zeilen, nach_datei = Snapshots(), [], {}
     for x in eintraege:
         z = x["zustand"]
+        if "wert" not in x:   # Eintrag ohne schreibbaren Wert (skills-Ordnerverweis): apply folgt in P4/P5
+            if z in ("FEHLT", "VERALTET", "ABGEWICHEN"):
+                zeilen.append("OFFEN  %s %s.%s: apply fuer diese Art folgt, nichts geschrieben%s" % (
+                    x["harness"], x["art"], x["name"],
+                    " (Skill-Links: wb-werkzeuge skills-anlegen, dann wb-instructions sync)" if x["art"] == "skills" else ""))
+            continue
         ist_force = force is not None and force[0] == x["harness"] and force[1] in (x["name"],
                                                                                      "%s.%s" % (x["art"], x["name"]))
         if z in ("FEHLT", "VERALTET") or (z == "ABGEWICHEN" and ist_force):
@@ -779,19 +1043,98 @@ def _tabelle(eintraege):
 def _plan_zeilen(eintraege):
     out = []
     for x in eintraege:
-        if x["zustand"] in ("FEHLT", "VERALTET"):
+        if x["zustand"] in ("FEHLT", "VERALTET") and "wert" not in x:
+            out.append("? %s.%s [%s]: apply fuer diese Art folgt" % (x["art"], x["name"], x["harness"]))
+        elif x["zustand"] in ("FEHLT", "VERALTET"):
             out.append("%s %s.%s in %s [%s]: %s" % ("+" if x["zustand"] == "FEHLT" else "~", x["art"], x["name"],
                                                      x["ziel"], x["harness"],
                                                      json.dumps(x["wert"], sort_keys=True, ensure_ascii=False)))
     return out or ["nichts zu schreiben"]
 
 
+# ---------------------------------------------------------------- Skill-Schreiber (Quell-Wurzel)
+
+# Die Wurzel, aus der `wb-instructions sync` (sync_skill_links) die Skills in alle uebrigen
+# skillRoots verlinkt (dort SRC_SKILLS_DIR). Ein Werkbank-Skill aus der Quelle (skills.<name>.quelle)
+# liegt hier als Link auf seinen Ordner neben der installierten werkzeuge.default.json; danach
+# verteilt sync_skill_links ihn wie jeden anderen Skill (Review wz-integ2, M1).
+QUELL_SKILLWURZEL = "~/.claude/skills"
+
+
+def skills_anlegen(q, ordner, trocken=False, pruef_ordner=None):
+    """Legt je skills.<name> mit `quelle` (diese Maschine) <QUELL_SKILLWURZEL>/<basename> als Link auf
+    <ordner>/<quelle> an. Kriterium: nie ohne Snapshot ueberschrieben, Ersatz wird gemeldet. Steht dort
+    etwas anderes (fremde Fassung, anderer Link), kommt es vorher nach
+    ~/.local/trash-snapshots/<Datum>-skill-<name>/ (verschoben, nicht geloescht); die Zeile nennt den
+    Snapshot-Pfad. Der Name gehoert der Werkbank (Entscheidung WorkbenchOrchestrator 13.10.).
+    Fehlt <quelle>/SKILL.md, ist das auch im Trockenlauf ein FEHLER (Review wz-integ3, Fund 4); geprueft
+    wird unter pruef_ordner, wenn gesetzt (wb-ausrollen: Repo-Quelle, die installierte fehlt im
+    Trockenlauf noch), sonst unter ordner. Ein Dateifehler (Snapshot, Link) wird als FEHLER gemeldet,
+    nicht als Traceback (Fund 5). -> (zeilen, fehler)"""
+    m = maschine()
+    wurzel = pfad_aufloesen(QUELL_SKILLWURZEL)
+    zeilen, fehler = [], 0
+    for name, e in sorted((q.get("skills") or {}).items()):
+        if not isinstance(e, dict) or e.get("quelle") is None or m not in e.get("maschinen", [m]):
+            continue
+        quelle = _datei_da(e["quelle"], ordner).rstrip("/")
+        ziel = os.path.join(wurzel, os.path.basename(quelle))
+        pruef = _datei_da(e["quelle"], pruef_ordner).rstrip("/") if pruef_ordner else quelle
+        if not os.path.isfile(os.path.join(pruef, "SKILL.md")):
+            # auch vor GLEICH: ein Link auf eine verschwundene Quelle ist kein gueltiger Skill
+            zeilen.append("FEHLER  skills.%s: %s/SKILL.md fehlt, kein Link %s" % (
+                name, pruef, "wuerde angelegt" if trocken else "angelegt"))
+            fehler += 1
+            continue
+        if os.path.lexists(ziel) and os.path.realpath(ziel) == os.path.realpath(quelle):
+            zeilen.append("GLEICH  skills.%s: %s" % (name, ziel))
+            continue
+        snap = None
+        if os.path.lexists(ziel):
+            basis = os.path.join(home(), ".local", "trash-snapshots",
+                                 "%s-skill-%s" % (datetime.date.today().isoformat(), name), os.path.basename(ziel))
+            snap, n = basis, 1
+            while os.path.lexists(snap):
+                snap, n = "%s.%d" % (basis, n), n + 1
+        vorsatz = "WUERDE " if trocken else ""
+        zeile = "%sANGELEGT  skills.%s: %s -> %s%s" % (
+            vorsatz, name, ziel, quelle, " (ERSETZT, alte Fassung im Snapshot %s)" % snap if snap else "")
+        if trocken:
+            zeilen.append(zeile)
+            continue
+        tmp = "%s.wbtmp-%d" % (ziel, os.getpid())
+        try:
+            os.makedirs(wurzel, exist_ok=True)
+            if snap:
+                os.makedirs(os.path.dirname(snap), exist_ok=True)
+                shutil.move(ziel, snap)
+            os.symlink(quelle, tmp, target_is_directory=True)
+            os.replace(tmp, ziel)
+        except (OSError, shutil.Error) as ex:
+            if os.path.lexists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            stand = ("alte Fassung liegt im Snapshot %s, %s fehlt jetzt" % (snap, ziel)
+                     if snap and os.path.lexists(snap) and not os.path.lexists(ziel)
+                     else "%s unveraendert" % ziel)
+            zeilen.append("FEHLER  skills.%s: %s (%s: %s)" % (name, stand, type(ex).__name__, ex))
+            fehler += 1
+            continue
+        zeilen.append(zeile)
+    return zeilen, fehler
+
 USAGE = """wb-werkzeuge status [<harness>...] [--json] [--nur <art>]
 wb-werkzeuge check [<harness>...]              Exit 0 sauber, 1 Befund, 2 Fehler in der Quelle
 wb-werkzeuge plan [<harness>...]               zeigt, was apply schreiben wuerde
 wb-werkzeuge apply [<harness>...]              schreibt FEHLT und VERALTET (mit Snapshot); Exit 1, wenn etwas stehen blieb
 wb-werkzeuge apply --force <harness> <eintrag> ueberschreibt ABGEWICHEN (mit Snapshot)
-wb-werkzeuge adopt <harness> <eintrag>         uebernimmt einen Handeintrag in die Statusdatei"""
+wb-werkzeuge adopt <harness> <eintrag>         uebernimmt einen Handeintrag in die Statusdatei
+wb-werkzeuge skills-anlegen [--dry-run] [--ordner DIR] [--pruef-ordner DIR]
+                                               legt die Werkbank-Skills der Quelle in ~/.claude/skills an
+                                               (Link; ersetzt nie ohne Snapshot und meldet den Ersatz);
+                                               fehlende SKILL.md ist auch im Trockenlauf FEHLER; Exit 1 bei Fehler"""
 
 
 def _optionen(args):
@@ -812,6 +1155,28 @@ def _optionen(args):
     return json_aus, nur, force, rest
 
 
+def _skills_anlegen_main(args):
+    trocken, werte = "--dry-run" in args, {}
+    for opt in ("--ordner", "--pruef-ordner"):
+        if opt in args:
+            i = args.index(opt)
+            werte[opt] = args[i + 1] if i + 1 < len(args) else None
+            if not werte[opt]:
+                print("wb-werkzeuge: skills-anlegen %s DIR" % opt, file=sys.stderr)
+                return 2
+    ordner = werte.get("--ordner")
+    try:
+        q, _ = laden()
+        ordner = ordner or quellordner()
+    except FehlerInQuelle as ex:
+        for f in ex.fehler:
+            print("FEHLER %s %s: %s" % (f["code"], f["eintrag"], f["text"]), file=sys.stderr)
+        return 2
+    zeilen, fehler = skills_anlegen(q, ordner, trocken, werte.get("--pruef-ordner"))
+    print("\n".join(zeilen) or "keine Werkbank-Skills fuer diese Maschine")
+    return 1 if fehler else 0
+
+
 def main(argv):
     for a in ADAPTER:
         if a.get("zustaendig") and a.get("main") and a["zustaendig"](argv):
@@ -820,6 +1185,8 @@ def main(argv):
         print(USAGE)
         return 0 if len(argv) >= 2 else 2
     befehl = argv[1]
+    if befehl == "skills-anlegen":
+        return _skills_anlegen_main(argv[2:])
     json_aus, nur_art, force, rest = _optionen(argv[2:])
     if befehl not in ("status", "check", "plan", "apply", "adopt"):
         print("wb-werkzeuge: unbekannter Befehl %r\n%s" % (befehl, USAGE), file=sys.stderr)
@@ -866,6 +1233,7 @@ def main(argv):
         print(json.dumps(status_dokument(eintraege, []), ensure_ascii=False))
     else:
         print("\n".join(_tabelle(eintraege)) or "keine Eintraege fuer diese Maschine")
-    if befehl == "check" and any(x["zustand"] in BEFUND_ZUSTAENDE for x in eintraege):
+    if befehl == "check" and (any(x["zustand"] in BEFUND_ZUSTAENDE for x in eintraege)
+                              or quelldatei_befunde(q)):
         return 1
     return 0

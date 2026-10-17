@@ -316,6 +316,34 @@ if not os.path.exists(quelle):
     sys.exit(1)
 text = open(quelle, encoding="utf-8", errors="replace").read()
 
+# Anweisungen mit Anlass sitzungsstart (Werkzeug-Quelle, zuerst die Stilregel kurz-und-knackig,
+# der Nutzer 13.10.) stehen im Rollenblock hinter der Rolle: Datei-Harnesses lesen ihn beim Start.
+# Ohne wb-anweisung oder ohne Text bleibt der Block wie bisher; ein Fehler stoppt keinen Start.
+# VOLLTEXT GENAU EINMAL (Review wz-integ2, D; robust nach Review wz-integ3): Der Rollenblock laesst den
+# Volltext nur weg, wenn die Router-Datei (systemPrompt.path, von wb-instructions sync geschrieben)
+# existiert und ihn nachweislich traegt (ein wb-rolle-Block darin zaehlt nicht). Sonst steht er hier;
+# pi-worker prueft dieselbe Bedingung fuer die Zeile im Auftrag.
+import subprocess
+anw = ""
+try:
+    anw = subprocess.run([os.path.join(os.environ.get("HOME", ""), ".local", "bin", "wb-anweisung"),
+                          "--anlass", "sitzungsstart", "--harness", str(h.get("id") or ""), "volltext"],
+                         capture_output=True, text=True, timeout=10).stdout.strip("\n")
+except Exception:
+    anw = ""
+# agy: Leseort des Routers unbelegt (werkzeuge_anweisungen NICHT_BELEGT, Review wz-integ3 Fund 2),
+# deshalb zaehlt seine Router-Datei nicht; der Volltext steht im Rollenblock.
+if anw and sp.get("path") and h.get("id") not in ("agy",):
+    try:
+        router = open(os.path.expanduser(sp["path"]), encoding="utf-8", errors="replace").read()
+    except OSError:
+        router = ""
+    router = re.sub(r"<!-- wb-rolle (\w+) anfang -->.*?<!-- wb-rolle \1 ende -->\n?", "", router, flags=re.S)
+    if anw in router:
+        anw = ""
+if anw:
+    text = text.rstrip("\n") + "\n\n" + anw + "\n"
+
 projekt = sp.get("projectPath")
 if projekt:
     ziel = os.path.join(workdir, projekt)
@@ -833,15 +861,46 @@ if [ "$ROLE" = worker ] && [ "$HARNESS" = qwen ]; then
   esac
 fi
 
+# ROUTER-DATEI ALS ZWEITES --read (W2c, 14.10.2026). Ein Harness mit Stil flag-path liest keine eigene
+# Anweisungsdatei (aider: kein globaler Ort, ~/.aider.conf.yml hat keine read:-Zeile und gehoert
+# der Nutzer). Traegt seine Registry-Zelle systemPrompt.path die Router-Datei (aider:
+# ~/.aider/CONVENTIONS.md, von wb-instructions sync geschrieben), haengt der Start sie mit demselben
+# Flag wie die Rolle an. Dort steht der Volltext genau einmal (pi-worker stil_zeile_holen zaehlt
+# systemPrompt.path). Fehlt die Datei, bleibt der Start wie bisher. Gewaehlt statt `read:` in
+# ~/.aider.conf.yml: die Datei bleibt unberuehrt, der Weg haengt nur an der Registry.
+# KEINE Apostrophe im Rumpf (bash 3.2).
+if [ -n "$HARNESS" ]; then
+  ROUTER_LESEN="$("$HOME/.local/bin/wb-state" harness get "$HARNESS" 2>/dev/null \
+    | /usr/bin/python3 -c 'import json, os, sys
+try:
+    h = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+sp = h.get("systemPrompt") or {}
+pfad = os.path.expanduser(sp.get("path") or "")
+if sp.get("style") == "flag-path" and sp.get("flag") and pfad and os.path.isfile(pfad):
+    print("%s\t%s\t%s" % (os.path.basename(h.get("command") or ""), sp["flag"], pfad))' 2>/dev/null)" || ROUTER_LESEN=""
+  if [ -n "$ROUTER_LESEN" ]; then
+    RL_PROG="${ROUTER_LESEN%%$'\t'*}"; RL_REST="${ROUTER_LESEN#*$'\t'}"
+    RL_FLAG="${RL_REST%%$'\t'*}"; RL_PFAD="${RL_REST#*$'\t'}"
+    case "$CMD" in
+      *"exec $RL_PROG "*) CMD="${CMD/exec $RL_PROG /exec $RL_PROG $RL_FLAG $(printf %q "$RL_PFAD") }" ;;
+    esac
+  fi
+fi
+
 # Every workbench pane needs the workbench tools on PATH, otherwise the agent in it
 # cannot call wb-*/claude-worker/pi-worker — same reason wb-code does it for pi.
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
 
-# HUB-TOKEN (Werkzeuge zentral, 13.10.2026). codex (bearer_token_env_var), opencode
-# ({env:...}), crush, qwen und nanocoder ($... im Header) holen den Bearer fuer den
-# MCP-Eintrag `werkbank` aus WB_HUB_TOKEN; ohne ihn antwortet der Hub 401. claude
-# (headersHelper) und pi (liest die Datei) brauchen ihn nicht. Welcher Harness ihn
-# braucht, entscheidet `wb-hub token-sicherstellen` aus Quelle und toolAdapter.mcp
+# HUB-TOKEN (Werkzeuge zentral, 13.10.2026). Ein Harness, dessen MCP-Eintrag `werkbank` per HTTP
+# arbeitet (codex: bearer_token_env_var, opencode: {env:...}, crush/qwen/nanocoder: $... im Header),
+# holt den Bearer aus WB_HUB_TOKEN; ohne ihn antwortet der Hub 401. Seit W2a (14.10.) schreibt die
+# Registry (toolAdapter.mcp.hub = "stdio") fuer jeden Harness mit stdio-MCP die Bruecke
+# `wb-hub stdio --harness <form>` statt HTTP: sie liest die Tokendatei selbst, die Variable
+# entfaellt (token-sicherstellen antwortet dann Exit 3). claude (headersHelper) und pi (liest die
+# Datei) brauchten sie nie. Welcher Harness sie noch braucht, entscheidet
+# `wb-hub token-sicherstellen` aus Quelle und toolAdapter.mcp
 # (Exit 3 = keiner); es legt die Tokendatei auch an, wenn der Hub noch nie lief
 # (launchd/systemd starten ihn erst bei der ersten Verbindung).
 # Der Wert gelangt wie die Provider-Keys oben NUR in die Umgebung dieses Prozesses

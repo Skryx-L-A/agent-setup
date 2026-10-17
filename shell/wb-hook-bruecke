@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""wb-hook-bruecke <harness> <ereignis> [<hook>] -- uebersetzt die Hook-Nutzlast eines Harness in die
+Claude-Form, ruft die Hook-Befehle der Quelle (werkzeuge.default.json, Abschnitt hooks) und gibt die
+Antwort in der Form des Harness zurueck. Zuordnung je Harness: Registry toolAdapter.hooks.bruecke.
+Vertrag, Schutzregeln (fail-closed fuer PreToolUse) und Adapter: werkzeuge_hookbruecke.py."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import werkzeuge_hookbruecke  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(werkzeuge_hookbruecke.main(sys.argv))

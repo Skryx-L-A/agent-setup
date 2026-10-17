@@ -32,6 +32,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { MobileAuthenticator } from './auth/auth';
 
 export const VORMERKUNG = 'peer-replikation-offen.json';
 const SCHLOSS = 'peer-replikation.lock';
@@ -89,6 +90,21 @@ const sha256 = (daten: Buffer | string): string => createHash('sha256').update(d
 export function geraeteStand(authState: Buffer): string {
   const devices = (JSON.parse(authState.toString('utf8')) as { devices?: Record<string, { device_id: string; status: string }> }).devices ?? {};
   return sha256(Object.values(devices).map((g) => `${g.device_id}:${g.status}`).sort().join('\n'));
+}
+
+/**
+ * Was zur Gegenstelle geht (Review 14.10.2026, F2): die Kopplungsliste OHNE aktive Geraete,
+ * deren Signatur hier nicht gilt. Die Gegenseite signiert jeden uebernommenen Eintrag mit
+ * ihrem eigenen Schluessel neu (geraete-replizieren.mjs); ein hier eingeschleustes Geraet
+ * darf dort deshalb gar nicht erst ankommen.
+ */
+export function replikQuelle(authVerzeichnis: string): Buffer {
+  const roh = readFileSync(join(authVerzeichnis, 'auth-state.json'));
+  const ungueltig = new Set(new MobileAuthenticator(authVerzeichnis).ungueltigeGeraete().map((g) => g.device_id));
+  if (!ungueltig.size) return roh;
+  const zustand = JSON.parse(roh.toString('utf8')) as { devices: Record<string, unknown> };
+  for (const id of ungueltig) delete zustand.devices[id];
+  return Buffer.from(`${JSON.stringify(zustand)}\n`, 'utf8');
 }
 
 /**
@@ -279,7 +295,7 @@ export function replikationBauen(konfig: ReplikKonfig): Replikation {
       let daten: Buffer | null = null;
       let skript = '';
       try {
-        daten = readFileSync(join(konfig.authVerzeichnis, 'auth-state.json'));
+        daten = replikQuelle(konfig.authVerzeichnis);
         geraeteStand(daten);
         const b64 = (n: string): string => readFileSync(join(konfig.werkzeugVerzeichnis, n)).toString('base64');
         skript = `WB_GR_B64='${b64('geraete-replizieren.mjs')}'\nWB_AS_B64='${b64('auth-schloss.mjs')}'\n`

@@ -42,7 +42,11 @@
 # Befristeter Deckel des Claude-Wochenlimits (der Nutzer 11.10.2026: bis Mo 12.10. 14:00 hoechstens
 # 95 %): solange ~/.claude/workbench/limit-deckel.json gilt, startet kein Claude-Worker. Nach
 # bis_epoch laeuft die Sperre von selbst aus. Arbeit geht an codex-worker oder pi-worker.
-if /usr/bin/python3 -c 'import json,os,sys,time
+# `env -i` (nur HOME, derselbe Wert) und -I -S: /usr/bin/python3 ist auf macOS der xcrun-Shim
+# und folgte sonst DEVELOPER_DIR/SDKROOT/TOOLCHAINS des Aufrufers (Review handyguard2 N1,
+# 14.10.2026) -- ein eigenes xcrun haette die Sperre verneint. Die Umgebung des Starts selbst
+# bleibt unberuehrt.
+if /usr/bin/env -i HOME="$HOME" /usr/bin/python3 -I -S -c 'import json,os,sys,time
 d=json.load(open(os.path.expanduser("~/.claude/workbench/limit-deckel.json")))
 sys.exit(0 if time.time() < float(d["bis_epoch"]) else 1)' 2>/dev/null; then
   echo "claude-worker: GESPERRT -- befristeter Deckel des Claude-Wochenlimits (limit-deckel.json, der Nutzer 11.10.); Worker an Codex oder lokal vergeben." >&2

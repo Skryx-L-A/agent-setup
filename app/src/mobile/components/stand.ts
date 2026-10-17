@@ -167,6 +167,8 @@ export function freigabenTeilErsetzen(alt: readonly Approval[], neu: readonly Ap
  * Telefon nur einen englischen, nichtssagenden Fehler.
  */
 export const FEHLER_IN_WORTEN: Readonly<Partial<Record<ApiError['code'], string>>> = {
+  // Seit 14.10.2026 signiert der Mac jede Kopplung; aeltere Kopplungen gelten nicht mehr.
+  device_not_paired: 'Dieses Gerät ist am Mac nicht (mehr) gültig gekoppelt. Kopple es neu: am Mac in der Werkbank Einstellungen, Maschinen, Mobilgerät, „Gerät koppeln“; hier unter Gerät „Neu koppeln“.',
   pane_busy: 'Die Sitzung nimmt gerade keine Eingabe an. Ein Dialog wartet auf Antwort, oder in ihrem Eingabefeld steht noch Text. Antworte zuerst dort, dann sende noch einmal.',
 };
 

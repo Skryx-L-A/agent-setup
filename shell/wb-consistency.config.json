@@ -74,7 +74,7 @@
         "name": "pi-session (~/.pi/agent/*.md werden in jeder pi-Session zusammen geladen)",
         "files": [
           "{BASE}/.pi/agent/ORCHESTRATOR.md",
-          "{BASE}/.pi/agent/RULES.md",
+          "{BASE}/.pi/agent/AGENTS.md",
           "{BASE}/.pi/agent/WORKER.md"
         ]
       }
@@ -336,6 +336,14 @@
       "linux",
       "messungen",
       "systemd"
+    ],
+    "_comment_linux_nur_kopien": "Werkzeuge, die es NUR unter shell/linux/ gibt (kein Mac-Gegenstueck in shell/). install_exclude_dirs nimmt shell/linux/ aus dem Durchlauf, und linux_variante greift nur, wenn shell/<name> existiert -- so eine Datei wurde nie ausgerollt und nie verglichen. Anlass 16.10.2026: auf peer blieb der alte agent-workbench-Launcher vom 24.08. liegen (node_modules/electron, ohne env -i), die Desktop-Datei startete ihn, wb-consistency meldete 0 Abweichungen. Gilt nur auf der Linux-Maschine laut linux_variante, auf dem Mac nie. Je Eintrag: repo (relativ zum Repo), ziel (installierter Pfad), grund.",
+    "linux_nur_kopien": [
+      {
+        "repo": "shell/linux/agent-workbench",
+        "ziel": "{BASE}/.local/bin/agent-workbench",
+        "grund": "Programmsymbol-Launcher auf Linux; startet das Kern-Electron mit env -i (Positivliste), die .desktop-Datei zeigt darauf"
+      }
     ],
     "_comment_root_kopien": "Kopien, die einem anderen Konto gehoeren (root) und die weder wb-ausrollen noch ein Agent schreiben darf. wb-consistency meldet KOPIE-ROOT-VERALTET (error), wb-ausrollen nennt den sudo-Befehl und endet mit Exit 1; ausgefuehrt wird nichts. Fehlt das Ziel auf einer Maschine, ist das kein Befund. Anlass 14.10.2026 (fi-b): /usr/local/bin/wb-gast-tor auf peer stand seit 27.09. still.",
     "root_kopien": [

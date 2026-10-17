@@ -303,6 +303,25 @@ const PANE_WRITE_ROUTES: ReadonlySet<RouteName | 'GET /events'> = new Set<RouteN
   'POST /sessions/:id/keys',
 ]);
 
+/**
+ * Mobile Entscheidungen, deren Pruefstelle (`wb-decide --mobilbeleg`, `wb-freigabe
+ * erteilen --mobilbeleg`) den Umschlag ueber `wb-mobil-pruefen` selbst beansprucht
+ * (14.10.2026). Ein Antrag geht in beiden Richtungen an `wb-decide`; beim Guard nur das
+ * Annehmen an `wb-freigabe` -- das Ablehnen bleibt im Kern und reserviert hier wie bisher.
+ * Der Body ist an dieser Stelle noch ungeprueft; er waehlt nur, WER verbraucht. Geprueft
+ * wird in beiden Faellen vollstaendig, und das Werkzeug bindet die Entscheidung erneut.
+ */
+function pruefstelleVerbraucht(route: string, rawBody: Buffer): boolean {
+  if (route === 'POST /approvals/requests/:id/decision') return true;
+  if (route !== 'POST /approvals/guards/:id/decision') return false;
+  try {
+    const body = JSON.parse(rawBody.toString('utf8')) as { decision?: unknown } | null;
+    return typeof body === 'object' && body !== null && body.decision === 'approve';
+  } catch {
+    return false;
+  }
+}
+
 /** Routen, bei denen erst die Zusammensetzung (Harness der Sitzung) das entscheidet. */
 const VIELLEICHT_PANE_WRITE: ReadonlySet<RouteName | 'GET /events'> = new Set<RouteName | 'GET /events'>([
   'POST /sessions/:id/prompt-answer',
@@ -546,7 +565,7 @@ export function createMobileHttpServer(options: MobileHttpServerOptions): Mobile
       // unten bleibt davon unberuehrt.
       const vielleichtPaneWrite = VIELLEICHT_PANE_WRITE.has(matched.route);
       if (vielleichtPaneWrite) options.authenticator.verify(envelope, { audience, body: rawBody });
-      const fremdVerbraucht = PANE_WRITE_ROUTES.has(matched.route)
+      const fremdVerbraucht = PANE_WRITE_ROUTES.has(matched.route) || pruefstelleVerbraucht(matched.route, rawBody)
         || (vielleichtPaneWrite
           && (await options.paneWriteRoute?.(matched.route as RouteName, { params: matched.params, rawBody })) === true);
       if (fremdVerbraucht) {

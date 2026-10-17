@@ -143,6 +143,14 @@
 # scheme both a shell script and the extension's Node process can take without a
 # fragile dependency (2026-08-04, see the lock's own comment below for why).
 set -euo pipefail
+# Die Lockerungen (Guards, Rechtemodus) haengen an einem gemessenen Menschen, und die Messung
+# laeuft in den Python-Bloecken unten. /usr/bin/python3 ist auf macOS der xcrun-Shim und folgt
+# DEVELOPER_DIR (auch SDKROOT/TOOLCHAINS lenken xcrun; Review handyguard2 N1, 14.10.2026): ein
+# eigener Ordner davor ersetzte den ganzen Block samt Messung. Deshalb vorweg loeschen, und
+# jeder Block laeuft mit -I (kein PYTHONPATH/PYTHONHOME, kein Modul aus dem Arbeitsordner).
+# Kein `env -i` hier: die Bloecke lesen HOME, AWB_SETTINGS_FILE und die Testnaehte bewusst aus
+# der Umgebung; die Menschenmessung selbst ruft wb-mensch schon mit eigener Positivliste.
+unset DEVELOPER_DIR SDKROOT TOOLCHAINS
 
 STATEDIR="$HOME/.claude/workbench/sessions"
 LOCKDIR="$HOME/.claude/workbench/locks"
@@ -186,7 +194,7 @@ worker_file() {
   if [ -n "$sess" ]; then
     for f in "$STATEDIR"/*.json; do
       [ -e "$f" ] || continue
-      if /usr/bin/python3 -c 'import json,sys
+      if /usr/bin/python3 -I -c 'import json,sys
 try: sys.exit(0 if json.load(open(sys.argv[1])).get("tmuxSession")==sys.argv[2] else 1)
 except Exception: sys.exit(1)' "$f" "$sess"; then
         printf '%s' "$f"; return 0
@@ -203,7 +211,7 @@ except Exception: sys.exit(1)' "$f" "$sess"; then
     # check reports it instead of guessing.
     f="$(own_file "$dir")"
     if [ -e "$f" ]; then
-      owner=$(/usr/bin/python3 -c 'import json,sys
+      owner=$(/usr/bin/python3 -I -c 'import json,sys
 try: print(json.load(open(sys.argv[1])).get("tmuxSession") or "")
 except Exception: pass' "$f" 2>/dev/null || true)
       if [ -z "$owner" ] || [ "$owner" = "$sess" ]; then
@@ -254,7 +262,7 @@ case "$CMD" in
     parse_opts "$@"
     FILE="$(own_file "$(pos 1)" "$OPT_KEY")"
     [ -e "$FILE" ] || exit 0
-    /usr/bin/python3 -c 'import json,sys
+    /usr/bin/python3 -I -c 'import json,sys
 try: print(json.load(open(sys.argv[1])).get("tmuxSession") or "")
 except Exception: pass' "$FILE"
     ;;
@@ -266,7 +274,7 @@ except Exception: pass' "$FILE"
     parse_opts "$@"
     FILE="$(own_file "$(pos 1)" "$OPT_KEY")"
     [ -e "$FILE" ] || exit 0
-    /usr/bin/python3 -c 'import json,sys
+    /usr/bin/python3 -I -c 'import json,sys
 try: print(json.load(open(sys.argv[1])).get("claudeSessionId") or "")
 except Exception: pass' "$FILE"
     ;;
@@ -287,7 +295,7 @@ except Exception: pass' "$FILE"
   # oben schon fuer die Worker. Gelesen wird nur.
   by-tmux)
     SESS="${1:?tmux session}"
-    /usr/bin/python3 - "$STATEDIR" "$SESS" <<'PY'
+    /usr/bin/python3 -I - "$STATEDIR" "$SESS" <<'PY'
 import json, os, sys
 statedir, sess = sys.argv[1:3]
 for fn in sorted(os.listdir(statedir)):
@@ -306,7 +314,7 @@ PY
 
   list)
     DIR="${1:?dir}"
-    /usr/bin/python3 - "$STATEDIR" "$(slug "$DIR")" "$DIR" <<'PY'
+    /usr/bin/python3 -I - "$STATEDIR" "$(slug "$DIR")" "$DIR" <<'PY'
 import json, os, sys
 statedir, slug, dir_ = sys.argv[1:4]
 rows = []
@@ -340,7 +348,7 @@ PY
 
   new-key)
     DIR="${1:?dir}"
-    /usr/bin/python3 - "$STATEDIR" "$(slug "$DIR")" <<'PY'
+    /usr/bin/python3 -I - "$STATEDIR" "$(slug "$DIR")" <<'PY'
 import os, secrets, sys
 statedir, slug = sys.argv[1:3]
 while True:
@@ -357,7 +365,7 @@ PY
     [ -n "$DIR" ] || { echo "wb-state touch: dir fehlt" >&2; exit 1; }
     [ -n "$SESS" ] || { echo "wb-state touch: tmux session fehlt" >&2; exit 1; }
     FILE="$(own_file "$DIR" "$OPT_KEY")"
-    /usr/bin/python3 - "$FILE" "$DIR" "$SESS" "$LOCKDIR" "$OPT_NAME" "$OPT_KEY" "$OPT_HARNESS" "$OPT_MODEL" "$OPT_CSESS" "$OPT_KONTEXT" <<'PY'
+    /usr/bin/python3 -I - "$FILE" "$DIR" "$SESS" "$LOCKDIR" "$OPT_NAME" "$OPT_KEY" "$OPT_HARNESS" "$OPT_MODEL" "$OPT_CSESS" "$OPT_KONTEXT" <<'PY'
 import json, os, sys, tempfile, datetime, fcntl
 file, dir_, sess, lockdir, name, key, harness, model, csess, kontext = sys.argv[1:11]
 lock = open(os.path.join(lockdir, os.path.basename(file) + ".lock"), "w")
@@ -428,7 +436,7 @@ PY
       echo "WARNUNG: wb-state add-worker: kein Zustandsdokument fuer Worker '$NAME' (dir='$DIR', session='${SESS:-unbekannt}') gefunden — Worker fehlt in der Workbench-Sidebar." >&2
       exit 0
     fi
-    /usr/bin/python3 - "$FILE" "$NAME" "$KIND" "$MODEL" "$DIR" "$LOCKDIR" "$OPT_MACHINE" "$OPT_CSESS" "$OPT_KONTEXT" <<'PY'
+    /usr/bin/python3 -I - "$FILE" "$NAME" "$KIND" "$MODEL" "$DIR" "$LOCKDIR" "$OPT_MACHINE" "$OPT_CSESS" "$OPT_KONTEXT" <<'PY'
 import json, os, sys, tempfile, datetime, fcntl
 file, name, kind, model, dir_, lockdir, machine, csess, kontext = sys.argv[1:10]
 lock = open(os.path.join(lockdir, os.path.basename(file) + ".lock"), "w")
@@ -510,7 +518,7 @@ PY
     [ -n "$NAME" ] || { echo "wb-state remove-worker: name fehlt" >&2; exit 1; }
     FILE="$(worker_file "$DIR" "$SESS")"
     [ -e "$FILE" ] || exit 0
-    /usr/bin/python3 - "$FILE" "$NAME" "$LOCKDIR" <<'PY'
+    /usr/bin/python3 -I - "$FILE" "$NAME" "$LOCKDIR" <<'PY'
 import json, os, sys, tempfile, datetime, fcntl
 file, name, lockdir = sys.argv[1:4]
 lock = open(os.path.join(lockdir, os.path.basename(file) + ".lock"), "w")
@@ -539,7 +547,7 @@ PY
     # Which model does worker <name> run with? Empty = unknown. Used by wb-request
     # to find out the applicant's own model without asking a model.
     WNAME="${1:?worker name}"
-    /usr/bin/python3 - "$STATEDIR" "$WNAME" <<'PY'
+    /usr/bin/python3 -I - "$STATEDIR" "$WNAME" <<'PY'
 import json, os, sys
 statedir, name = sys.argv[1:3]
 best = None
@@ -563,7 +571,7 @@ PY
     # Which machine does worker <name> run on? Empty = local (or unknown).
     # Used by wb-result so the orchestrator does not have to remember it.
     WNAME="${1:?worker name}"
-    /usr/bin/python3 - "$STATEDIR" "$WNAME" <<'PY'
+    /usr/bin/python3 -I - "$STATEDIR" "$WNAME" <<'PY'
 import json, os, sys
 statedir, name = sys.argv[1:3]
 best = None
@@ -595,7 +603,7 @@ PY
     # found yet). pi-worker reads this back before a REUSE call to add-worker, so
     # that call does not overwrite the id with nothing.
     WNAME="${1:?worker name}"
-    /usr/bin/python3 - "$STATEDIR" "$WNAME" claudeSessionId <<'PY'
+    /usr/bin/python3 -I - "$STATEDIR" "$WNAME" claudeSessionId <<'PY'
 import json, os, sys
 statedir, name, field = sys.argv[1:4]
 best = None
@@ -622,7 +630,7 @@ PY
     # cannot otherwise measure (SPEC-V2 B). Slug algorithm matches wb-code's
     # transcript_dir() and pi-worker's own copy exactly (`tr -c 'a-zA-Z0-9' '-'`).
     WNAME="${1:?worker name}"
-    /usr/bin/python3 - "$STATEDIR" "$WNAME" "$HOME" <<'PY'
+    /usr/bin/python3 -I - "$STATEDIR" "$WNAME" "$HOME" <<'PY'
 import json, os, re, sys
 statedir, name, home = sys.argv[1:4]
 best = None
@@ -655,7 +663,7 @@ PY
       # vergleicht sie hierueber. Rein lesend.
       get|defaults)
         if [ "$SUB" = defaults ]; then KEY="__alle__"; else KEY="${1:?key}"; fi
-        /usr/bin/python3 - "$SETTINGS" "$KEY" <<'PY'
+        /usr/bin/python3 -I - "$SETTINGS" "$KEY" <<'PY'
 import json, sys
 # Built-in defaults (SPEC-V2 section A). A missing file, a missing key or broken
 # JSON must never be an error — the default wins. Unknown keys print nothing.
@@ -1057,7 +1065,7 @@ PY
           [ -n "$ACTOR" ] || ACTOR=$(tmux display -p -t "$TMUX_PANE" '#{pane_title}' 2>/dev/null || true)
         fi
         [ -n "$ACTOR" ] || ACTOR="-"
-        /usr/bin/python3 - "$SETTINGS" "$KEY" "$VALUE" "$LOCKDIR" "$ACTOR" "$HOME/.local/state/wb-settings-changes.log" "$GRUND" <<'PY'
+        /usr/bin/python3 -I - "$SETTINGS" "$KEY" "$VALUE" "$LOCKDIR" "$ACTOR" "$HOME/.local/state/wb-settings-changes.log" "$GRUND" <<'PY'
 import json, os, pwd, re, shutil, stat, subprocess, sys, tempfile, time, datetime
 file, key, value, lockdir, actor, changelog, grund = sys.argv[1:8]
 os.makedirs(os.path.dirname(file), exist_ok=True)
@@ -1457,7 +1465,7 @@ PY
         # sich darauf. shell/wb-code braucht 2026-08-16 fuer orchestratorPermissionMode
         # aber genau die Unterscheidung: eine kaputte Datei darf --permission-mode
         # NICHT einfach mit der Vorgabe ueberdecken.
-        /usr/bin/python3 - "$SETTINGS" <<'PY'
+        /usr/bin/python3 -I - "$SETTINGS" <<'PY'
 import json, sys
 file = sys.argv[1]
 try:
@@ -1511,7 +1519,7 @@ PY
     ALT=$("$0" settings get "$SKEY" 2>/dev/null)
     [ -n "$ALT" ] || ALT='{}'
 
-    /usr/bin/python3 - "$CMD" "$SUB" "$ALT" "$0" ${@+"$@"} <<'PY'
+    /usr/bin/python3 -I - "$CMD" "$SUB" "$ALT" "$0" ${@+"$@"} <<'PY'
 import json, subprocess, sys
 
 CMD, SUB, ALT, SELF = sys.argv[1:5]
@@ -1838,7 +1846,7 @@ PY
     else
       CHANGELOGFILE="$HOME/.local/state/wb-models-changes.log"
     fi
-    /usr/bin/python3 - "$MODELSFILE" "$LOCKDIR" "$ACTOR" "$CHANGELOGFILE" "$STDINFILE" "$SUB" "$0" ${@+"$@"} <<'PY'
+    /usr/bin/python3 -I - "$MODELSFILE" "$LOCKDIR" "$ACTOR" "$CHANGELOGFILE" "$STDINFILE" "$SUB" "$0" ${@+"$@"} <<'PY'
 import datetime, fcntl, glob, json, os, platform, re, shlex, shutil, subprocess, sys, tempfile, time
 
 MODELS_FILE, LOCKDIR, ACTOR, CHANGELOG, STDIN_FILE, SUB, SCRIPT = sys.argv[1:8]
@@ -2184,11 +2192,14 @@ BUILTIN_HARNESSES = [
      "contextPattern": None, "supportsPaste": True,
      # Werkzeug-Adapter (werkzeuge/1), gleich dem claude-Eintrag in models.default.json.
      "toolAdapter": {
-         "mcp": {"ziel": "~/.claude.json", "format": "json-pfad", "pfad": "mcpServers", "form": "claude"},
-         "hooks": {"weg": "plugin-werkbank", "ziel": "~/.claude/werkbank-marktplatz/werkbank/hooks/hooks.json"},
-         "prompts": {"weg": "plugin-werkbank", "ziel": "~/.claude/werkbank-marktplatz/werkbank/commands/"},
-         "plugins": {"weg": "nur-pruefen", "ziel": "~/.claude/settings.json"},
-         "rechte": {"weg": "nur-pruefen", "ziel": "~/.claude/settings.json", "pfad": "permissions"}}},
+         "mcp": {"ziel": "~/.claude.json", "format": "json-pfad", "pfad": "mcpServers", "form": "claude", "gemessen": "2026-10-13/help", "beleg": "claude --help: --mcp-config; wb-werkzeuge status claude mcp werkbank GLEICH"},
+         "hooks": {"weg": "plugin-werkbank", "ziel": "~/.claude/werkbank-marktplatz/werkbank/hooks/hooks.json", "gemessen": "2026-10-13/quelle", "beleg": "werkbank-marktplatz/werkbank/hooks/hooks.json (4 Ereignisse, 6 Befehle)"},
+         "prompts": {"weg": "plugin-werkbank", "ziel": "~/.claude/werkbank-marktplatz/werkbank/commands/", "gemessen": "2026-10-13/quelle", "beleg": "~/.claude/commands/budget.md von Hand; Plugin ohne commands/"},
+         "plugins": {"weg": "nur-pruefen", "ziel": "~/.claude/settings.json", "gemessen": "2026-10-13/help", "beleg": "claude plugin list; enabledPlugins in settings.json"},
+         "rechte": {"weg": "nur-pruefen", "ziel": "~/.claude/settings.json", "pfad": "permissions", "gemessen": "2026-10-13/quelle", "beleg": "settings.json permissions.allow; defaultMode acceptEdits"},
+         "skills": {"weg": "ordner-verweis", "ziel": "~/.claude/skills", "gemessen": "2026-10-13/quelle", "beleg": "~/.claude/skills = Quelle (wb-instructions sync_skill_links)"},
+         "anweisungen": {"weg": "plugin-werkbank", "ziel": "~/.claude/werkbank-marktplatz/werkbank/", "gemessen": "2026-10-13/quelle", "beleg": "~/.claude/AGENTS.md Verweis; Rolle per --append-system-prompt"}},
+     "skillRoots": ["~/.claude/skills"]},
     {"id": "pi", "label": "pi (lokale Modelle)", "builtin": True,
      "command": "pi",
      "args": ["--provider", "{provider}", "--model", "{model}", "--session-dir", "{sessionDir}"],
@@ -2212,11 +2223,14 @@ BUILTIN_HARNESSES = [
      "contextPattern": None, "supportsPaste": True,
      # Werkzeug-Adapter (werkzeuge/1), gleich dem pi-Eintrag in models.default.json.
      "toolAdapter": {
-         "mcp": {"weg": "pi-erweiterung", "ziel": "~/.pi/agent/extensions/wb-hub.ts", "quelle": "pi-wb-hub.ts"},
-         "hooks": {"weg": "leer", "grund": "pi-Ereignisse laufen nur ueber Extensions; der Adapter schreibt dafuer keine Hook-Datei (Plan 2.3, Tabelle Abschnitt 2)"},
-         "prompts": {"ziel": "~/.pi/agent/prompts/", "format": "markdown-dir"},
-         "plugins": {"weg": "dateien", "ziel": "~/.pi/agent/extensions/", "dateien": ["wb-inbox.ts", "brain-kontext.ts", "wb-hub.ts"]},
-         "rechte": {"weg": "leer", "grund": "pi-Rechte laufen je Aufruf ueber das Registry-Flag --tools, kein Konfigurationsziel (Plan Abschnitt 2 Tabelle)"}}},
+         "mcp": {"weg": "pi-erweiterung", "ziel": "~/.pi/agent/extensions/wb-hub.ts", "quelle": "pi-wb-hub.ts", "gemessen": "2026-10-13/quelle", "beleg": "wb-hub.ts registerTool je Hub-Werkzeug; pi --help ohne MCP-Client"},
+         "hooks": {"weg": "pi-erweiterung", "ziel": "~/.pi/agent/extensions/wb-hooks.ts", "gemessen": "2026-10-13/doku", "beleg": "pi docs/extensions.md: pi.on() tool_call, tool_result, before_agent_start, turn_end, session_start", "quelle": "pi-wb-hooks.ts", "bruecke": {"ereignisse": {"PreToolUse": "tool_call", "PostToolUse": "tool_result", "UserPromptSubmit": "before_agent_start", "Stop": "agent_end"}, "eingabe": {"tool_name": "toolName", "tool_input": "input", "cwd": "cwd", "session_id": "sessionId", "prompt": "prompt"}, "werkzeuge": {"bash": "Bash", "read": "Read", "grep": "Grep", "find": "Glob", "write": {"name": "Write", "argumente": {"path": "file_path"}}, "edit": {"name": "Edit", "argumente": {"path": "file_path"}}}, "antwort": {"blockieren": {"json": {"hookSpecificOutput": {"hookEventName": "{ereignis}", "permissionDecision": "deny", "permissionDecisionReason": "{grund}"}}}, "kontext": {"json": {"hookSpecificOutput": {"hookEventName": "{ereignis}", "additionalContext": "{kontext}"}}}}, "gemessen": "2026-10-14/quelle", "beleg": "pi dist/core/extensions/types.d.ts: ToolCallEvent {toolName, input}, ToolCallEventResult {block, reason}, BeforeAgentStartEvent.prompt; Extension shell/pi-wb-hooks.ts reicht die Nutzlast an wb-hook-bruecke"}},
+         "prompts": {"ziel": "~/.pi/agent/prompts/", "format": "markdown-dir", "gemessen": "2026-10-13/doku", "beleg": "pi docs/prompt-templates.md:9 ~/.pi/agent/prompts/*.md"},
+         "plugins": {"weg": "dateien", "ziel": "~/.pi/agent/extensions/", "dateien": ["wb-inbox.ts", "brain-kontext.ts", "wb-hub.ts"], "gemessen": "2026-10-13/quelle", "beleg": "~/.pi/agent/extensions/ 5 Dateien; pi install/list/remove"},
+         "rechte": {"weg": "leer", "grund": "pi-Rechte laufen je Aufruf ueber das Registry-Flag --tools, kein Konfigurationsziel (Plan Abschnitt 2 Tabelle)", "gemessen": "2026-10-13/doku", "beleg": "pi docs/security.md:3 keine Rueckfrage je Werkzeugaufruf; nur --tools/--exclude-tools/--no-tools"},
+         "skills": {"weg": "ordner-verweis", "ziel": "~/.agents/skills", "gemessen": "2026-10-13/doku", "beleg": "pi docs/skills.md:61 ~/.agents/skills/"},
+         "anweisungen": {"weg": "datei", "ziel": "~/.pi/agent/AGENTS.md", "gemessen": "2026-10-13/doku", "beleg": "pi docs/configuration.md:17-19 liest AGENTS.md/CLAUDE.md im Agent-Ordner; RULES.md hat keinen Leser", "erinnerung": {"weg": "pi-erweiterung", "ziel": "~/.pi/agent/extensions/wb-anweisung.ts", "quelle": "pi-wb-anweisung.ts", "gemessen": "2026-10-14/doku", "beleg": "pi docs/extensions.md + dist/core/extensions/types.d.ts:917 before_agent_start darf message {customType, content, display} liefern; sessionManager.getSessionId()"}}},
+     "skillRoots": ["~/.agents/skills"]},
 ]
 
 def load_raw():
@@ -2244,8 +2258,8 @@ def merge(raw, key, builtins):
         i = e["id"]
         if i not in out:
             order.append(i); out[i] = e; continue
-        # toolAdapter ist nicht startkritisch und fehlt in aelteren Registries; still ergaenzt.
-        missing = [k for k in base[i] if k not in e and k != "toolAdapter"]
+        # toolAdapter und skillRoots sind nicht startkritisch und fehlen in aelteren Registries; still ergaenzt.
+        missing = [k for k in base[i] if k not in e and k not in ("toolAdapter", "skillRoots")]
         merged = dict(base[i]); merged.update(e)
         out[i] = merged
         if missing:

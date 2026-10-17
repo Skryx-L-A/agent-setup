@@ -124,7 +124,7 @@ HARNESSES = [
                       "sie muss mit `--read ~/.aider/CONVENTIONS.md` oder in `.aider.conf.yml` eingebunden werden.",
     },
     {
-        "id": "pi", "label": "pi (lokaler Harness)", "target": "~/.pi/agent/RULES.md",
+        "id": "pi", "label": "pi (lokaler Harness)", "target": "~/.pi/agent/AGENTS.md",
         "compact": "/compact",
         "compact_note": "bestehende Konvention dieser Workbench, wie bei Claude Code.",
         "extra_note": "Ergaenzt (ueberschreibt NICHT) die bereits handgepflegten ~/.pi/agent/WORKER.md und "
@@ -705,6 +705,15 @@ def sync_routing_markers(dry_run, day_tag, force, report):
 # main
 # ---------------------------------------------------------------------------
 
+# pi liest im Agent-Ordner AGENTS.md (docs/configuration.md:17); die fruehere Zieldatei
+# RULES.md hat keinen Leser (0 Treffer in dist, 13.10.). Router und bundle schreiben AGENTS.md.
+PI_ZIEL = "~/.pi/agent/AGENTS.md"
+# ~/AGENTS.md schreibt die Werkbank nie (am 25.09. bewusst geloescht): jeder Harness, der in ~ startet,
+# liest sie als Projektdatei. jcode kennt global nur diesen Ort (Binary 0.72.0, "Global Instructions
+# (~/AGENTS.md)"); er bekommt den Text ueber AGENTS.md im Arbeitsverzeichnis (Review wz-integ2, J).
+GESPERRTE_ZIELE = {"~/AGENTS.md": "wird von jedem Harness in ~ gelesen, bleibt bewusst weg (25.09.)"}
+
+
 def router_harnesses():
     """Read adapter paths from the same registry used by the launcher.
 
@@ -727,7 +736,8 @@ def router_harnesses():
         if h["id"] == "claude":
             target = None  # canonical source, never overwrite with its own router
         if h["id"] in ("pi", "pi-llamacpp"):
-            target = "~/.pi/agent/RULES.md"
+            # Die alte RULES.md bleibt stehen, bis jemand sie entfernt.
+            target = PI_ZIEL
         if not target and h["id"] != "claude":
             legacy = HARNESS_BY_ID.get(h["id"], {}).get("target")
             if legacy and os.path.isfile(hp(legacy)):
@@ -736,7 +746,29 @@ def router_harnesses():
     return result
 
 
+def anweisungen_text(harness_id):
+    """Volltext der Anweisungen mit Anlass sitzungsstart fuer diesen Harness (Werkzeug-Quelle,
+    Abschnitt anweisungen; zuerst die Stilregel kurz-und-knackig, der Nutzer 13.10.), ueber
+    wb-anweisung neben diesem Skript, sonst ~/.local/bin. Leer, wenn es fehlt oder nichts gilt."""
+    for befehl in (os.path.join(os.path.dirname(os.path.realpath(__file__)), "wb-anweisung"),
+                   hp("~/.local/bin/wb-anweisung")):
+        if not os.path.isfile(befehl):
+            continue
+        try:
+            r = subprocess.run([befehl, "--anlass", "sitzungsstart", "--harness", harness_id, "volltext"],
+                               capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        return r.stdout.strip("\n")
+    return ""
+
+
 def render_router(harness):
+    anw = anweisungen_text(harness["id"])
+    return _render_router_kern(harness) + ("\n" + anw + "\n" if anw else "")
+
+
+def _render_router_kern(harness):
     return _mit_regeldatei(
         "# Werkbank: gemeinsame Anweisungen\n\n"
         "Diese Regeln gelten fuer jeden Harness und jedes Modell. Lies vor der ersten\n"
@@ -764,6 +796,35 @@ def render_router(harness):
     )
 
 
+def skill_roots():
+    """Every skill root the harnesses read themselves: the two historical mirrors plus the
+    `skillRoots` of each harness in the live registry and in the shipped models.default.json
+    (measured per harness, 13.10.2026). The source (~/.claude/skills) is never filled with links to
+    itself. Order: historical roots first, then registry order; duplicates (by real path) once."""
+    roots = [AGENT_SKILLS_DIR, hp("~/.agents/skills")]
+    for path in (hp("~/.claude/workbench/models.json"),
+                 os.path.join(os.path.dirname(os.path.realpath(__file__)), "models.default.json")):
+        try:
+            entries = json.loads(read_text(path)).get("harnesses", [])
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(entries, dict):
+            entries = list(entries.values())
+        for h in entries if isinstance(entries, list) else []:
+            declared = h.get("skillRoots") if isinstance(h, dict) else None
+            for r in declared if isinstance(declared, list) else []:
+                if isinstance(r, str) and r.startswith("~/"):
+                    roots.append(hp(r))
+    seen = {os.path.realpath(SRC_SKILLS_DIR)}
+    out = []
+    for root in roots:
+        key = os.path.realpath(root)
+        if key not in seen:
+            seen.add(key)
+            out.append(root)
+    return out
+
+
 def sync_skill_links(skills, args, day_tag, report):
     """Native discovery requires YAML at byte zero and all relative assets present.
 
@@ -771,7 +832,7 @@ def sync_skill_links(skills, args, day_tag, report):
     adoption is explicit and snapshots the complete directory before replacing it.
     """
     conflicts = 0
-    for root in (AGENT_SKILLS_DIR, hp("~/.agents/skills")):
+    for root in skill_roots():
         for skill in skills:
             source = os.path.realpath(skill["dir"])
             target = os.path.join(root, skill["name"])
@@ -835,6 +896,9 @@ def sync_router(args):
             report.append((h["id"], "role-injection", h["systemPrompt"].get("projectPath", "via launcher")))
             continue
         target = hp(h["target"])
+        if target in {hp(z) for z in GESPERRTE_ZIELE}:
+            report.append((h["id"], "gesperrt", target))
+            continue
         if target in seen:
             continue
         seen.add(target)

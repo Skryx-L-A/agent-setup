@@ -110,6 +110,12 @@ import type { ClaudePaneSnapshot } from './mobile/dialogs/claude';
 import type { MobileDialogSession, OpenCodeDialogConnection } from './mobile/dialogs/opencode';
 import { schluesselSetzenFuerAnbieter, schluesselStatusAlle } from './schluesselbund';
 import { HarnessUpdateScheduler } from './harnessupdate';
+import { startsperre } from './selbstpruefung';
+
+// STARTSPERRE ZUERST (16.10.2026, selbstpruefung.ts): Der Desktop-Kern auf Linux
+// prueft seine Umgebung und endet bei Abweichung, bevor irgendetwas angelegt wird.
+// Kein importiertes Modul legt beim Laden Zustand an; dies ist die erste Anweisung.
+startsperre(app, dialog, userInfo().homedir);
 
 // DER MANTEL-ZUGANG VERLAESST DIE UMGEBUNG ALS ERSTES (13.10.2026, Auftrag
 // wz-mantel; config.ts, `mantelZugangEntnehmen`): vor jedem Kindstart, auch vor
@@ -9231,7 +9237,7 @@ function mobilDienstErzeugen(): MobilDienst {
     },
     freigaben: {
       list: () => ({
-        requests: readRequests(config.requestsDir).map((q) => ({ path: q.path, parent: q.parent, childName: q.childName, task: q.task, ts: q.ts })),
+        requests: readRequests(config.requestsDir).map((q) => ({ path: q.path, inhaltSha256: q.inhaltSha256, parent: q.parent, childName: q.childName, task: q.task, ts: q.ts })),
         guards: readGuardBlocks(config.guardBlocksDir, sessions, config.tmuxSocket).map((b) => ({
           path: b.path, schluessel: b.schluessel, workerName: b.workerName, reason: b.reason, musterGrund: b.musterGrund, ts: b.ts, wartet: b.wartet,
           sessionId: b.sessionId ? (b.machine && b.machine !== config.machine ? `${b.machine}:${b.sessionId}` : `${config.machine}:${b.sessionId}`) : '',
@@ -9242,9 +9248,9 @@ function mobilDienstErzeugen(): MobilDienst {
         freigabenAktualisieren();
         return { ok: r.ok, message: r.output };
       },
-      // Nur Ablehnen erreicht diesen Weg (approvals.ts); Ablehnen braucht keinen Nachweis.
-      decideGuard: async (eintrag, entscheidung, grund) => {
-        const r = musterEntscheiden(eintrag.schluessel, entscheidung, grund, { art: 'steuerkanal' });
+      // Annehmen traegt den Mobilbeleg samt Nachweis; wb-freigabe prueft ihn selbst (14.10.2026).
+      decideGuard: async (eintrag, entscheidung, grund, beleg) => {
+        const r = musterEntscheiden(eintrag.schluessel, entscheidung, grund, beleg);
         return { ok: r.ok, message: r.output };
       },
     },

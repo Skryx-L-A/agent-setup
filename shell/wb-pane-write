@@ -81,6 +81,10 @@ set -uo pipefail
 # diesem Haus verlaesst sich darauf, dass dieses Werkzeug eine geerbte Funktion sieht.
 for _f in $(builtin compgen -A function); do builtin unset -f "$_f"; done
 unset _f
+# Ebenso vorweg: die Variablen, nach denen der xcrun-Shim /usr/bin/python3 sein Programm
+# sucht (14.10.2026, Review handyguard2 N1; Begruendung in wb-decide). Jeder Python-Aufruf
+# auf der Entscheidungskette laeuft zusaetzlich unter `env -i`.
+unset DEVELOPER_DIR SDKROOT TOOLCHAINS
 
 ABGELEHNT=77
 
@@ -475,13 +479,14 @@ rolle_lesen() {
                   ${SOCKET:+-L "$SOCKET"} lesen "$PANE" 2>/dev/null \
               | awk -F'\t' '$1=="register"{print $2}')
     elif [ -n "$ROLLEN_PY" ]; then
-        if [ -n "$SOCKET" ]; then
-            reg=$(/usr/bin/python3 "$ROLLEN_PY" -L "$SOCKET" lesen "$PANE" 2>/dev/null \
-                  | awk -F'\t' '$1=="register"{print $2}')
-        else
-            reg=$(/usr/bin/python3 "$ROLLEN_PY" lesen "$PANE" 2>/dev/null \
-                  | awk -F'\t' '$1=="register"{print $2}')
-        fi
+        # Auch hier ohne Xcode-Huelle (14.10.2026, Review handyguard2 N1): ein Register, das
+        # "worker" sagt, oeffnet einen Pane ohne @wb_role, und /usr/bin/python3 folgt sonst
+        # DEVELOPER_DIR. Positivliste mit denselben Werten wie bisher: HOME, PATH (dieselbe
+        # Quelle wie `tm` in diesem Zweig), Serverwahl (TMUX, TMUX_TMPDIR) und AWB_ROLLEN_DIR.
+        reg=$(/usr/bin/env -i HOME="$HOME" PATH="$PATH" ${TMUX:+TMUX="$TMUX"} \
+                  ${TMUX_TMPDIR:+TMUX_TMPDIR="$TMUX_TMPDIR"} ${AWB_ROLLEN_DIR:+AWB_ROLLEN_DIR="$AWB_ROLLEN_DIR"} \
+                  /usr/bin/python3 -I -S "$ROLLEN_PY" ${SOCKET:+-L "$SOCKET"} lesen "$PANE" 2>/dev/null \
+              | awk -F'\t' '$1=="register"{print $2}')
     fi
     if [ "$reg" = orchestrator ]; then
         ROLLE=orchestrator

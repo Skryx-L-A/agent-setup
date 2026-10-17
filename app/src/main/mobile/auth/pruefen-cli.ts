@@ -1,14 +1,29 @@
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { MobileAuthError, MobileAuthenticator } from './auth';
-import { ALLOWED_SPECIAL_KEYS, MAX_MOBILE_KEY_SEQUENCE } from '../../../mobile-shared/vertrag';
+import { ALLOWED_SPECIAL_KEYS, MAX_MOBILE_KEY_SEQUENCE, MOBILE_API_PREFIX } from '../../../mobile-shared/vertrag';
 import type { SignedRequestEnvelope } from '../../../mobile-shared/vertrag';
+import { canonicalPath } from '../../../mobile-shared/kanonisch';
 
-type Expected = {
+type PaneExpected = {
   aktion: 'mobil-senden' | 'mobil-taste';
   maschine: string;
   socket: string;
   pane: string;
 };
+
+/**
+ * DER GERAETEBELEG AN DER PRUEFSTELLE (14.10.2026, Entscheidung des Nutzers „Annahme am
+ * Handy und Guard angleichen: ja"). `wb-freigabe erteilen --mobilbeleg` und
+ * `wb-decide --mobilbeleg` lassen den signierten Umschlag der Entscheidung hier selbst
+ * pruefen und verbrauchen, statt dem Kern zu glauben. Gebunden wird an das, was das
+ * Geraet unterschrieben hat: Methode, Pfad (er traegt die Kennung des Eintrags, wie
+ * adapters/approvals.ts sie bildet) und den Entscheidungsbody. Die Pruefstelle nennt
+ * ihre Erwartung selbst; passt sie nicht, wird nichts verbraucht.
+ */
+type GuardExpected = { aktion: 'guard-freigabe'; schluessel: string };
+type AntragExpected = { aktion: 'antrag-entscheiden'; antrag: string; inhalt_sha256: string; entscheidung: 'approve' | 'reject' };
+type Expected = PaneExpected | GuardExpected | AntragExpected;
 
 type CliInput = {
   umschlag: SignedRequestEnvelope;
@@ -30,6 +45,17 @@ function parseInput(value: unknown): CliInput {
   if (!isObject(value) || !exactKeys(value, ['body_b64', 'erwartet', 'umschlag']) || !isObject(value.umschlag)
     || typeof value.body_b64 !== 'string' || !isObject(value.erwartet)) failure('bad_request');
   const expected = value.erwartet;
+  if (expected.aktion === 'guard-freigabe') {
+    if (!exactKeys(expected, ['aktion', 'schluessel']) || typeof expected.schluessel !== 'string'
+      || !/^[a-f0-9]{64}$/.test(expected.schluessel)) failure('bad_request');
+    return { umschlag: value.umschlag as unknown as SignedRequestEnvelope, body_b64: value.body_b64, erwartet: expected as GuardExpected };
+  }
+  if (expected.aktion === 'antrag-entscheiden') {
+    if (!exactKeys(expected, ['aktion', 'antrag', 'entscheidung', 'inhalt_sha256']) || typeof expected.antrag !== 'string' || !expected.antrag
+      || typeof expected.inhalt_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(expected.inhalt_sha256)
+      || (expected.entscheidung !== 'approve' && expected.entscheidung !== 'reject')) failure('bad_request');
+    return { umschlag: value.umschlag as unknown as SignedRequestEnvelope, body_b64: value.body_b64, erwartet: expected as AntragExpected };
+  }
   if (!exactKeys(expected, ['aktion', 'maschine', 'pane', 'socket']) || (expected.aktion !== 'mobil-senden' && expected.aktion !== 'mobil-taste')
     || typeof expected.maschine !== 'string' || !expected.maschine || typeof expected.socket !== 'string' || !expected.socket
     || typeof expected.pane !== 'string' || !/^%(0|[1-9][0-9]*)$/.test(expected.pane)) failure('bad_request');
@@ -47,7 +73,41 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
   return keys.length === expected.length && keys.every((key, index) => key === expected[index]);
 }
 
-function bindBody(body: Buffer, expected: Expected): { text_b64?: string; tasten?: string[] } {
+/**
+ * Dieselbe Kennung wie adapters/approvals.ts `id()`: Art und SHA-256 des Schluessels bzw.
+ * eines Antrags (Pfad, NUL, SHA-256 der Dateibytes; Review 14.10.2026, F3: ein Antrag, der
+ * nach der Anzeige am Handy umgeschrieben wird, traegt eine andere Kennung).
+ */
+function eintragsKennung(art: 'guard' | 'request', wert: string): string {
+  return `${art}:${createHash('sha256').update(wert).digest('hex')}`;
+}
+
+/** Bindet Methode, Pfad und Body einer mobilen Entscheidung an die Erwartung der Pruefstelle. */
+function bindDecision(envelope: SignedRequestEnvelope, body: Buffer, expected: GuardExpected | AntragExpected): void {
+  const pfad = expected.aktion === 'guard-freigabe'
+    ? `${MOBILE_API_PREFIX}/approvals/guards/${encodeURIComponent(eintragsKennung('guard', expected.schluessel))}/decision`
+    : `${MOBILE_API_PREFIX}/approvals/requests/${encodeURIComponent(eintragsKennung('request', `${expected.antrag}\0${expected.inhalt_sha256}`))}/decision`;
+  let gebunden = false;
+  try {
+    gebunden = typeof envelope.method === 'string' && envelope.method.toUpperCase() === 'POST'
+      && typeof envelope.path === 'string' && canonicalPath(envelope.path) === canonicalPath(pfad)
+      && Array.isArray(envelope.query) && envelope.query.length === 0;
+  } catch {
+    gebunden = false;
+  }
+  if (!gebunden) failure('stale_target');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString('utf8'));
+  } catch {
+    failure('bad_request');
+  }
+  if (!isObject(parsed) || !exactKeys(parsed, ['decision', 'reason']) || typeof parsed.reason !== 'string') failure('bad_request');
+  const verlangt = expected.aktion === 'guard-freigabe' ? 'approve' : expected.entscheidung;
+  if (parsed.decision !== verlangt) failure('stale_target');
+}
+
+function bindBody(body: Buffer, expected: PaneExpected): { text_b64?: string; tasten?: string[] } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body.toString('utf8'));
@@ -78,7 +138,10 @@ export function main(): number {
     const input = parseInput(JSON.parse(raw));
     const body = strictBase64(input.body_b64);
     if (!body) failure('bad_request');
-    const output = bindBody(body, input.erwartet);
+    const erwartet = input.erwartet;
+    const output = erwartet.aktion === 'guard-freigabe' || erwartet.aktion === 'antrag-entscheiden'
+      ? (bindDecision(input.umschlag, body, erwartet), {})
+      : bindBody(body, erwartet);
     const authenticator = new MobileAuthenticator();
     const request = authenticator.verifyAndReserve(input.umschlag, { audience: input.umschlag.audience, body });
     try {
