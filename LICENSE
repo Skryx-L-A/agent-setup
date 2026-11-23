@@ -14,6 +14,8 @@ Licensed Work:        The software in the repository that contains this License
                       version. The Licensed Work is (c) 2026 Skryx-L-A.
                       Third-party parts listed in NOTICE.md, if present, are not
                       part of the Licensed Work and keep their own licenses.
+                      Folders that NOTICE.md, if present, names as not covered
+                      by this License are not part of the Licensed Work either.
 
 Additional Use Grant: You may make production use of the Licensed Work,
                       including commercial use, use within an organization, use

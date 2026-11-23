@@ -14,7 +14,8 @@ in Deutschland; Impressum mit Name und Anschrift: https://prontea.de/impressum
 Version, die der Lizenzgeber unter dieser Lizenz bereitstellt. Jeder Commit, der mit Zustimmung des
 Lizenzgebers auf einem Zweig dieses Repositorys veröffentlicht wird, ist eine Version. Das
 lizenzierte Werk ist (c) 2026 Skryx-L-A. Fremde Bestandteile, die in NOTICE.md aufgeführt sind,
-gehören nicht zum lizenzierten Werk und behalten ihre eigenen Lizenzen.
+gehören nicht zum lizenzierten Werk und behalten ihre eigenen Lizenzen. Ordner, die NOTICE.md, falls
+vorhanden, als nicht von dieser Lizenz erfasst nennt, gehören ebenfalls nicht zum lizenzierten Werk.
 
 **Zusätzliche Nutzungserlaubnis:** Sie dürfen das lizenzierte Werk produktiv nutzen, auch
 kommerziell, innerhalb einer Organisation, für bezahlte Arbeit, die Sie mit seiner Hilfe erledigen,
