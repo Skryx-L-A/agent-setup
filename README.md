@@ -1,3 +1,7 @@
+This repository is no longer maintained. The agent workbench and setup instructions now live at https://github.com/Skryx-L-A/agent-workbench.
+
+Dieses Repository wird nicht mehr gepflegt. Die Werkbank und die Einrichtungsanleitung liegen jetzt unter https://github.com/Skryx-L-A/agent-workbench.
+
 <img src="assets/werkbank.svg" width="88" align="left" alt="Workbench icon">
 
 # agent-setup
@@ -201,17 +205,24 @@ the steps is a reasonable way to do it, and it is how the setup is meant to spre
 
 ## License
 
-Source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+Source-available under the [Business Source License 1.1](LICENSE) with an additional use grant.
+Each version also becomes available under the Apache License 2.0 two years after it is first
+published.
 
-- **Free to use** for personal and other noncommercial purposes, for study and
-  research, by educational, public and nonprofit institutions, and by individuals
-  for their own work, including professional work as freelancer or employee.
-  Organizations may evaluate the software for 60 days. Details:
-  [ADDITIONAL-PERMISSIONS.md](ADDITIONAL-PERMISSIONS.md).
-- **Commercial license required** for use by an organization, such as rolling it
-  out to staff, operating it for others or building it into a product or service:
-  [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
-- Versions up to the tag `last-agpl` remain available under AGPL-3.0-only.
+- **Free to use for everyone**, including companies: at work, in production, within an
+  organization and for paid work you do with its help.
+- **Free to pass on to your customers**, also adapted to a customer and also for payment.
+  Setting it up, hosting, operating, supporting and teaching it for customers is free for
+  everyone, also for payment.
+- **Partner agreement required** only for offering it to more than one customer under your own
+  product name or built into a product under another name; without one, such an offering may not
+  be run or hosted, and its customers may not use it in production. Offers to more than one
+  customer state "based on agent-workbench by Skryx-L-A". Details:
+  [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md), German reading version of the license:
+  [LICENSE-de.md](LICENSE-de.md).
+- Earlier versions keep their license: up to the tag `last-agpl` they
+  remain available under AGPL-3.0-only, up to the tag `last-polyform` under PolyForm
+  Noncommercial 1.0.0 with additional permissions.
 
 Contributions: see [CONTRIBUTING.md](CONTRIBUTING.md).
 

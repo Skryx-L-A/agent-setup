@@ -1,8 +1,7 @@
 # Third-party notices
 
-The [PolyForm Noncommercial License 1.0.0](LICENSE) and the
-[additional permissions](ADDITIONAL-PERMISSIONS.md) cover only the licensor's own
-work in this repository. The following parts come from third parties and remain
+The [Business Source License 1.1](LICENSE) covers only the licensor's own work in
+this repository. The following parts come from third parties and remain
 under their own licenses. The license texts sit next to the files.
 
 | Part | Path | Origin | License |

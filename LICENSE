@@ -1,75 +1,271 @@
-Required Notice: Copyright Skryx-L-A (https://github.com/Skryx-L-A)
+License text copyright © 2017 MariaDB Corporation Ab, All Rights Reserved.
+"Business Source License" is a trademark of MariaDB Corporation Ab.
 
-# PolyForm Noncommercial License 1.0.0
+Parameters
 
-<https://polyformproject.org/licenses/noncommercial/1.0.0>
+Licensor:             Skryx-L-A (https://github.com/Skryx-L-A), trading as
+                      Prontea, sole proprietorship in Germany; legal notice with
+                      name and address: https://prontea.de/impressum
 
-## Acceptance
+Licensed Work:        The software in the repository that contains this License
+                      file, in each version that the Licensor makes available
+                      under this License. Each commit that is published on a
+                      branch of that repository with the Licensor's consent is a
+                      version. The Licensed Work is (c) 2026 Skryx-L-A.
+                      Third-party parts listed in NOTICE.md, if present, are not
+                      part of the Licensed Work and keep their own licenses.
 
-In order to get any license under these terms, you must agree to them as both strict obligations and conditions to all your licenses.
+Additional Use Grant: You may make production use of the Licensed Work,
+                      including commercial use, use within an organization, use
+                      for paid work that You do with the help of the Licensed
+                      Work, and use for services that You provide to others for
+                      payment, such as installing, setting up, configuring,
+                      adapting, extending, hosting, operating, supporting or
+                      maintaining the Licensed Work, or training people to use
+                      it. You may pass on copies and modified versions of the
+                      Licensed Work to Your customers, also for payment and also
+                      adapted to a customer, and a customer who receives such a
+                      copy or version may use it in production under this grant.
+                      All of this is subject to the one exception below. This
+                      grant does not limit the rights granted in the Terms
+                      below. "You" means the individual or entity exercising
+                      rights under this License.
 
-## Copyright License
+                      Exception (Product Offerings). This grant does not cover
+                      (a) running, hosting or operating the Licensed Work or a
+                      derivative work of it as part of a Product Offering, or
+                      (b) production use of a copy, modification or derivative
+                      work of the Licensed Work that was delivered to You,
+                      installed for You or made available to You as part of a
+                      Product Offering, including a copy that the Product
+                      Offering obtains from another source, such as the
+                      Licensor's repository, and installs or sets up. A copy
+                      that You obtain Yourself from the Licensor's repository
+                      and use without the Product Offering is not affected.
+                      Production use of any copy of the Licensed Work together
+                      with a Product Offering that makes it show its users
+                      another product name, or that is offered with it as one
+                      solution under another name, is covered by (b). Neither
+                      (a) nor (b) applies to a Product Offering of the Licensor
+                      or of a Partner for that Product Offering.
 
-The licensor grants you a copyright license for the software to do everything you might do with the software that would otherwise infringe the licensor's copyright in it for any permitted purpose.  However, you may only distribute the software according to [Distribution License](#distribution-license) and make changes or new works based on the software according to [Changes and New Works License](#changes-and-new-works-license).
+                      Definitions. "Product Offering" means a product, software
+                      package, device or service that is offered to more than
+                      one customer for payment or any other commercial benefit,
+                      including a benefit from a related paid contract but not
+                      voluntary donations or sponsorships that do not depend on
+                      receiving the offering, and that (i) includes or installs
+                      the Licensed Work or a derivative work of it, or (ii) lets
+                      customers use the functionality of the Licensed Work or a
+                      derivative work of it running on systems operated by or
+                      for the provider, such as a hosted or managed service,
+                      unless both of the following are true:
+                      (1) the Licensed Work is presented to customers under the
+                          Name of the Licensed Work as its main name, alone or
+                          followed by a separate reference to the provider, the
+                          customer's own name or branding, or a plain
+                          description of what the provider adds (for example
+                          "<Name>, hosted by <provider>", "<Name> for
+                          <customer>" or "<Name> with <provider> skills"); it
+                          shows its users no product name other than such a
+                          combination or the customer's own name or branding;
+                          and it is not built into another product, software
+                          package, device or hosted service that is presented
+                          under another name; and
+                      (2) the Attribution is given.
+                      A package, plugin or installer that is offered to
+                      customers and includes or installs the Licensed Work
+                      counts as a software package into which it is built,
+                      unless the package itself is presented under the Name of
+                      the Licensed Work as described in (1).
+                      Adding an edition, tier or quality label such as "Pro",
+                      "Enterprise", "Plus" or "Official" to the Name, or merging
+                      the Name with the provider's name into one product name,
+                      is presenting it under another name, unless the Licensor
+                      allows it in text form. As long as the Licensed Work
+                      itself is presented as described in (1), it does not
+                      matter under which name a contract or service for
+                      installing, setting up, configuring, adapting, supporting,
+                      maintaining or operating it, or for training people to use
+                      it, is sold, nor through which store, marketplace or
+                      catalog an offering is sold, nor on which hardware made by
+                      a third party the provider sets it up. This does not apply
+                      to a hosted service through which customers use the
+                      Licensed Work: such a service is presented under another
+                      name unless its own name is a combination allowed in (1).
+                      A hosted service is one in which the Licensed Work runs on
+                      systems that the provider owns or rents for itself;
+                      operating it on systems of the customer, or on systems
+                      rented in the customer's name or on the customer's
+                      account, is not hosting under this sentence. The name of a
+                      hosted service is the name under which customers access
+                      and see it, such as on its sign-in page or in its app; the
+                      name of a contract for it does not count. The service may
+                      show each customer's users that customer's own name or
+                      branding as in (1). Results that You produce with the help
+                      of the Licensed Work and deliver to customers, such as
+                      text, code, analyses or advice, do not by themselves make
+                      an offering a Product Offering.
+                      An offering made for a single customer for that customer's
+                      own use is not a Product Offering if it is not offered in
+                      substantially the same form to other customers. Showing
+                      that customer's own name or branding in it is allowed and
+                      does not by itself make offerings to different customers
+                      different in form. Offerings of You and of every
+                      organization that controls, is controlled by or is under
+                      common control with You count together when determining
+                      whether an offering is made to more than one customer and
+                      whether it is offered in substantially the same form to
+                      other customers. If You run or host the Licensed Work for
+                      a single customer who told You in text form that it is for
+                      that customer's own use, You may rely on that statement.
+                      Whether an offering is a Product Offering is determined
+                      separately for each customer as of the day that customer
+                      ordered it. An offering that was not a Product Offering
+                      for a customer on that day remains so for that customer,
+                      including continued hosting, operation and updates for
+                      that customer.
+                      Tools, plugins and integrations that work with the
+                      Licensed Work but neither include nor install any part of
+                      it are not Product Offerings, unless they make the
+                      Licensed Work show its users another product name, or are
+                      offered together with the Licensed Work as one solution
+                      under another name.
 
-## Distribution License
+                      "Name of the Licensed Work" means a name under which the
+                      Licensor publishes the Licensed Work, such as the name of
+                      its repository or the product name stated in the README of
+                      that repository, or a name under which the Licensor
+                      published the Licensed Work before, as far as that name
+                      does not contain a trademark of a third party. You may use
+                      that name to present and describe the Licensed Work as
+                      described in this grant, but not to suggest that the
+                      Licensor endorses You or Your offering, or that You are a
+                      Partner.
 
-The licensor grants you an additional copyright license to distribute copies of the software.  Your license to distribute covers distributing the software with changes and new works permitted by [Changes and New Works License](#changes-and-new-works-license).
+                      "Attribution" means that a copy of this License
+                      accompanies each copy of the Licensed Work as required by
+                      the Terms below, and that the offer, the order form or the
+                      documentation given to customers states that the offering
+                      is based on the Licensed Work by the Licensor, for
+                      example: "based on <Name> by Skryx-L-A".
 
-## Notices
+                      "Customer" means a person or organization to which an
+                      offering is made or that receives it. An offering made to
+                      the public or to an open group of persons is offered to
+                      more than one customer. An organization includes every
+                      legal entity or partnership that controls, is controlled
+                      by or is under common control with it; the organization of
+                      a public authority is limited to that authority and the
+                      entities it controls. "Control" means direct or indirect
+                      ownership of more than 50 % of the voting rights, or the
+                      power to direct the management. Use by a natural person
+                      who works for an organization under its direction, as an
+                      employee, officer or temporary agency worker, is use by
+                      that organization.
 
-You must ensure that anyone who gets a copy of any part of the software from you also gets a copy of these terms or the URL for them above, as well as copies of any plain-text lines beginning with `Required Notice:` that the licensor provided with the software.  For example:
+                      "Partner" means a person or organization that holds a
+                      partner agreement in text form with the Licensor covering
+                      the Product Offering in question. The Licensor lists the
+                      current Partners that have agreed to be listed in
+                      COMMERCIAL-LICENSE.md on the main branch of
+                      https://github.com/Skryx-L-A/agent-workbench, or at
+                      another location that the Licensor names there. If a
+                      provider was listed there, or the Licensor confirmed in
+                      text form that it was a Partner, when You ordered the
+                      Product Offering, You may rely on that for that Product
+                      Offering. This covers the versions You received while the
+                      provider was a Partner, not versions You receive
+                      afterwards.
 
-> Required Notice: Copyright Yoyodyne, Inc. (http://example.com)
+                      Earlier versions. Every earlier version of the Licensed
+                      Work that the Licensor made available under the Business
+                      Source License 1.1 may also be used under this Additional
+                      Use Grant, at the user's choice, in addition to the
+                      Additional Use Grant of that version. Its Change Date does
+                      not change.
 
-## Changes and New Works License
+Change Date:          For each version of the Licensed Work, the second
+                      anniversary of the day on which that version first became
+                      publicly available in the Licensor's repository.
 
-The licensor grants you an additional copyright license to make changes and new works based on the software for any permitted purpose.
+Change License:       Apache License, Version 2.0
 
-## Patent License
+For information about partner agreements or other licensing arrangements for
+the Licensed Work, please contact licensing@prontea.de. See also
+COMMERCIAL-LICENSE.md.
 
-The licensor grants you a patent license for the software that covers patent claims the licensor can license, or becomes able to license, that you would infringe by using the software.
+Notice
 
-## Noncommercial Purposes
+The Business Source License (this document, or the “License”) is not an Open
+Source license. However, the Licensed Work will eventually be made available
+under an Open Source License, as stated in this License.
 
-Any noncommercial purpose is a permitted purpose.
+Business Source License 1.1
 
-## Personal Uses
+Terms
 
-Personal use for research, experiment, and testing for the benefit of public knowledge, personal study, private entertainment, hobby projects, amateur pursuits, or religious observance, without any anticipated commercial application, is use for a permitted purpose.
+The Licensor hereby grants you the right to copy, modify, create derivative
+works, redistribute, and make non-production use of the Licensed Work. The
+Licensor may make an Additional Use Grant, above, permitting limited
+production use.
 
-## Noncommercial Organizations
+Effective on the Change Date, or the fourth anniversary of the first publicly
+available distribution of a specific version of the Licensed Work under this
+License, whichever comes first, the Licensor hereby grants you rights under
+the terms of the Change License, and the rights granted in the paragraph
+above terminate.
 
-Use by any charitable organization, educational institution, public research organization, public safety or health organization, environmental protection organization, or government institution is use for a permitted purpose regardless of the source of funding or obligations resulting from the funding.
+If your use of the Licensed Work does not comply with the requirements
+currently in effect as described in this License, you must purchase a
+commercial license from the Licensor, its affiliated entities, or authorized
+resellers, or you must refrain from using the Licensed Work.
 
-## Fair Use
+All copies of the original and modified Licensed Work, and derivative works
+of the Licensed Work, are subject to this License. This License applies
+separately for each version of the Licensed Work and the Change Date may vary
+for each version of the Licensed Work released by Licensor.
 
-You may have "fair use" rights for the software under the law. These terms do not limit them.
+You must conspicuously display this License on each original or modified copy
+of the Licensed Work. If you receive the Licensed Work in original or
+modified form from a third party, the terms and conditions set forth in this
+License apply to your use of that work.
 
-## No Other Rights
+Any use of the Licensed Work in violation of this License will automatically
+terminate your rights under this License for the current and all other
+versions of the Licensed Work.
 
-These terms do not allow you to sublicense or transfer any of your licenses to anyone else, or prevent the licensor from granting licenses to anyone else.  These terms do not imply any other licenses.
+This License does not grant you any right in any trademark or logo of
+Licensor or its affiliates (provided that you may use a trademark or logo of
+Licensor as expressly required by this License).
 
-## Patent Defense
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSED WORK IS PROVIDED ON
+AN “AS IS” BASIS. LICENSOR HEREBY DISCLAIMS ALL WARRANTIES AND CONDITIONS,
+EXPRESS OR IMPLIED, INCLUDING (WITHOUT LIMITATION) WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, AND
+TITLE.
 
-If you make any written claim that the software infringes or contributes to infringement of any patent, your patent license for the software granted under these terms ends immediately. If your company makes such a claim, your patent license ends immediately for work on behalf of your company.
+MariaDB hereby grants you permission to use this License’s text to license
+your works, and to refer to it using the trademark “Business Source License”,
+as long as you comply with the Covenants of Licensor below.
 
-## Violations
+Covenants of Licensor
 
-The first time you are notified in writing that you have violated any of these terms, or done anything with the software not covered by your licenses, your licenses can nonetheless continue if you come into full compliance with these terms, and take practical steps to correct past violations, within 32 days of receiving notice.  Otherwise, all your licenses end immediately.
+In consideration of the right to use this License’s text and the “Business
+Source License” name and trademark, Licensor covenants to MariaDB, and to all
+other recipients of the licensed work to be provided by Licensor:
 
-## No Liability
+1. To specify as the Change License the GPL Version 2.0 or any later version,
+   or a license that is compatible with GPL Version 2.0 or a later version,
+   where “compatible” means that software provided under the Change License can
+   be included in a program with software provided under GPL Version 2.0 or a
+   later version. Licensor may specify additional Change Licenses without
+   limitation.
 
-***As far as the law allows, the software comes as is, without any warranty or condition, and the licensor will not be liable to you for any damages arising out of these terms or the use or nature of the software, under any kind of legal claim.***
+2. To either: (a) specify an additional grant of rights to use that does not
+   impose any additional restriction on the right granted in this License, as
+   the Additional Use Grant; or (b) insert the text “None”.
 
-## Definitions
+3. To specify a Change Date.
 
-The **licensor** is the individual or entity offering these terms, and the **software** is the software the licensor makes available under these terms.
-
-**You** refers to the individual or entity agreeing to these terms.
-
-**Your company** is any legal entity, sole proprietorship, or other kind of organization that you work for, plus all organizations that have control over, are under the control of, or are under common control with that organization.  **Control** means ownership of substantially all the assets of an entity, or the power to direct its management and policies by vote, contract, or otherwise.  Control can be direct or indirect.
-
-**Your licenses** are all the licenses granted to you for the software under these terms.
-
-**Use** means anything you do with the software requiring one of your licenses.
+4. Not to modify this License in any other way.
